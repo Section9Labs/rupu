@@ -65,6 +65,18 @@ struct SessionDto {
     /// Stored crew/role codename; absent on legacy sessions (derived on read).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     codename: Option<String>,
+    /// The customer the session's directory was assigned to as of its latest
+    /// turn (`session.json`'s `customer`), tri-state
+    /// ([`crate::customers::RecordedField`]). Not serialized from here: the
+    /// scan writes the attributed `customer` + `customer_derived` (`null` =
+    /// no customer, so a coordinator can tell "no customer" from a peer too
+    /// old to report one), or neither when the attribution can't be read.
+    #[serde(
+        default,
+        deserialize_with = "rupu_transcript::recorded::deserialize",
+        skip_serializing
+    )]
+    customer: crate::customers::RecordedField,
     /// The recorded turns — read for [`session_usage`], never serialized
     /// (the list/detail wire shape is unchanged; `/api/sessions/:id/runs`
     /// serves the turns). Parsed leniently: an unexpected shape reads as no
@@ -135,11 +147,26 @@ fn ensure_usage_block(detail: &mut serde_json::Value, pricing: &rupu_config::Pri
         Err(_) => return,
     };
     // The remote's transcripts are not on this machine: price the token
-    // totals it reported.
-    if let Ok(u) = serde_json::to_value(session_usage_from_totals(&dto, pricing)) {
+    // totals it reported. A session with a customer is priced by THAT PEER's
+    // customer layer, which this coordinator does not have: the global
+    // rates here may be wrong, and the body says so.
+    let mut usage = session_usage_from_totals(&dto, pricing);
+    if map
+        .get("customer")
+        .and_then(|c| c.as_str())
+        .is_some_and(|c| !c.is_empty())
+    {
+        usage.pricing_error = Some(PEER_CUSTOMER_PRICING.to_string());
+    }
+    if let Ok(u) = serde_json::to_value(usage) {
         map.insert("usage".to_string(), u);
     }
 }
+
+/// `pricing_error` on a remote session priced here at the coordinator's
+/// global rates although it has a customer (its peer's pricing for that
+/// customer isn't available here).
+const PEER_CUSTOMER_PRICING: &str = "the peer's customer pricing isn't available here";
 
 /// Try to load and parse `session.json` inside `dir` for list scanning.
 /// Returns `None` when the file is absent or fails to parse (with a warning).
@@ -186,43 +213,119 @@ fn session_turn_transcripts<'a>(
     (labeled, missing)
 }
 
+use crate::customers::PriceKey;
+
+/// The [`PriceKey`] of one turn of `dto` (`transcript` = its own transcript;
+/// `None` for a turn whose transcript is gone, or the session's own
+/// totals): what the turn's `RunStart` recorded; for a legacy one, the
+/// session's customer, else the workspace's current assignment — the rule
+/// the agent-run rows and rollups use. `fail_closed`: an unreadable
+/// assignment is an error; otherwise the turn is `Unknown`.
+fn turn_price_key(
+    lookup: &mut crate::customers::CustomerLookup,
+    dto: &SessionDto,
+    transcript: Option<&std::path::Path>,
+    fail_closed: bool,
+) -> Result<PriceKey, ApiError> {
+    use crate::customers::Recorded;
+    let head = transcript
+        .map(crate::usage_sources::head_of)
+        .unwrap_or_default();
+    let (field, _) = crate::customers::session_turn_customer(&head.customer, &dto.customer);
+    let ws = if head.workspace_id.is_empty() {
+        dto.workspace_id.as_str()
+    } else {
+        head.workspace_id.as_str()
+    };
+    let recorded = Recorded::of(&field);
+    if recorded.is_legacy() && ws.is_empty() {
+        return Ok(PriceKey::Customer(None));
+    }
+    if fail_closed {
+        Ok(PriceKey::Customer(lookup.attribute(recorded, ws)?.slug))
+    } else {
+        Ok(lookup
+            .attribute_for_listing(recorded, ws)
+            .map_or(PriceKey::Unknown, |w| PriceKey::Customer(w.slug)))
+    }
+}
+
 /// Token + cost summary for a local session: the live fold of every turn's
 /// transcript plus its dispatch sub-runs ([`crate::usage::transcripts_usage`]),
 /// so a turn still in flight counts as it streams — `session.json`'s own
-/// totals only move when a turn ends. A turn whose transcript is gone (e.g.
-/// archived) contributes the totals recorded for that turn, priced at the
-/// session's model; a session with no recorded turns at all falls back to
-/// [`session_usage_from_totals`]. `runs` stays 1 (one session).
+/// totals only move when a turn ends. Each turn is priced at ITS OWN
+/// attribution (`key_of`, see [`turn_price_key`]) — not the session's latest
+/// customer — the same rule the rollups use. A turn whose transcript is gone
+/// (e.g. archived) contributes the totals recorded for that turn, priced at
+/// the session's model; a session with no recorded turns at all falls back
+/// to [`session_usage_from_totals`]. `runs` stays 1 (one session). Work priced
+/// at the global rates for an unknown customer, or a customer whose layer
+/// does not resolve, carries `pricing_error`.
 fn session_usage(
     dto: &SessionDto,
     run_store: &rupu_orchestrator::runs::RunStore,
-    pricing: &rupu_config::PricingConfig,
-) -> crate::usage::UsageSummary {
-    if dto.runs.is_empty() {
-        return session_usage_from_totals(dto, pricing);
+    prices: &mut dyn crate::customers::PriceBook,
+    key_of: &mut dyn FnMut(Option<&std::path::Path>) -> Result<PriceKey, ApiError>,
+) -> Result<crate::usage::UsageSummary, ApiError> {
+    fn priced(
+        prices: &mut dyn crate::customers::PriceBook,
+        key: &PriceKey,
+        f: impl FnOnce(&rupu_config::PricingConfig) -> crate::usage::UsageSummary,
+    ) -> crate::usage::UsageSummary {
+        let mut u = f(prices.pricing_for(key.slug()));
+        u.pricing_error = key.pricing_error(prices);
+        u
     }
-    let (labeled, missing) = session_turn_transcripts(&dto.runs, run_store);
-    let u = crate::usage::transcripts_usage(&labeled);
-    let mut rows = u.rows.clone();
-    rows.extend(
-        missing
-            .into_iter()
-            .filter(|r| r.total_tokens_in + r.total_tokens_out + r.total_tokens_cached > 0)
-            .map(|r| rupu_transcript::UsageRow {
-                provider: dto.provider_name.clone(),
-                model: dto.model.clone(),
-                agent: dto.agent_name.clone(),
-                input_tokens: r.total_tokens_in,
-                output_tokens: r.total_tokens_out,
-                cached_tokens: r.total_tokens_cached,
-                runs: 1,
-                ..rupu_transcript::UsageRow::default()
-            }),
+    if dto.runs.is_empty() {
+        let key = key_of(None)?;
+        return Ok(priced(prices, &key, |p| session_usage_from_totals(dto, p)));
+    }
+    type Group = (
+        Vec<(String, std::path::PathBuf)>,
+        Vec<rupu_transcript::UsageRow>,
     );
-    let mut summary = crate::usage::summarize(&rows, pricing);
-    summary.partial = u.partial;
+    let mut groups: std::collections::BTreeMap<PriceKey, Group> = Default::default();
+    for r in &dto.runs {
+        match r.transcript_path.as_deref().filter(|t| !t.is_empty()) {
+            Some(tp) if std::path::Path::new(tp).is_file() => {
+                let tp = std::path::Path::new(tp);
+                let key = key_of(Some(tp))?;
+                groups.entry(key).or_default().0.extend(
+                    crate::usage_sources::with_dispatch_children(run_store, &r.run_id, tp),
+                );
+            }
+            _ if r.total_tokens_in + r.total_tokens_out + r.total_tokens_cached > 0 => {
+                let key = key_of(None)?;
+                groups
+                    .entry(key)
+                    .or_default()
+                    .1
+                    .push(rupu_transcript::UsageRow {
+                        provider: dto.provider_name.clone(),
+                        model: dto.model.clone(),
+                        agent: dto.agent_name.clone(),
+                        input_tokens: r.total_tokens_in,
+                        output_tokens: r.total_tokens_out,
+                        cached_tokens: r.total_tokens_cached,
+                        runs: 1,
+                        ..rupu_transcript::UsageRow::default()
+                    });
+            }
+            _ => {}
+        }
+    }
+    let mut summaries = Vec::with_capacity(groups.len());
+    for (key, (labeled, missing)) in groups {
+        let u = crate::usage::transcripts_usage(&labeled);
+        let mut rows = u.rows.clone();
+        rows.extend(missing);
+        let mut summary = priced(prices, &key, |p| crate::usage::summarize(&rows, p));
+        summary.partial = u.partial;
+        summaries.push(summary);
+    }
+    let mut summary = crate::usage::rollup(summaries.into_iter());
     summary.runs = 1;
-    summary
+    Ok(summary)
 }
 
 /// Token + cost summary from a session's own token totals, priced at its
@@ -256,6 +359,7 @@ fn session_usage_from_totals(
         cost_usd,
         runs: 1,
         partial: false,
+        pricing_error: None,
     }
 }
 
@@ -263,31 +367,68 @@ fn session_usage_from_totals(
 #[derive(Clone, Copy)]
 pub(crate) struct SessionScan<'a> {
     /// `Some` → each session gets a `usage` block ([`session_usage`], which
-    /// folds its turns' transcripts); `None` → no usage is computed at all,
+    /// folds its turns' transcripts), priced with the pricing of the customer
+    /// the session is attributed to; `None` → no usage is computed at all,
     /// for callers that only count or list sessions.
-    pub(crate) pricing: Option<&'a rupu_config::PricingConfig>,
+    pub(crate) pricing: Option<&'a crate::customers::CustomerPricing>,
     /// `Some(w)` → only sessions whose `workspace_id == w`, filtered BEFORE
     /// any usage is folded.
     pub(crate) workspace: Option<&'a str>,
+    /// `true` (a customer filter, a count or a rollup) → an assignment that
+    /// cannot be read fails the scan; `false` (an unfiltered list) → that
+    /// session carries no customer keys (one warning per workspace).
+    pub(crate) fail_closed: bool,
+}
+
+/// A session's customer: the one `session.json` recorded (a slug, or `null`
+/// = none), else — a session that predates customers — its workspace's
+/// CURRENT assignment (`derived`). An assignment that cannot be read is an
+/// error when `fail_closed`, else `None` (the customer can't be known).
+fn session_customer(
+    lookup: &mut crate::customers::CustomerLookup,
+    dto: &SessionDto,
+    fail_closed: bool,
+) -> Result<Option<crate::customers::Attribution>, ApiError> {
+    let recorded = crate::customers::Recorded::of(&dto.customer);
+    if recorded.is_legacy() && dto.workspace_id.is_empty() {
+        return Ok(Some(crate::customers::Attribution {
+            slug: None,
+            derived: false,
+        }));
+    }
+    if fail_closed {
+        lookup.attribute(recorded, &dto.workspace_id).map(Some)
+    } else {
+        Ok(lookup.attribute_for_listing(recorded, &dto.workspace_id))
+    }
+}
+
+/// What a scan attributes and prices with — one per request.
+struct ScanCtx<'a> {
+    lookup: crate::customers::CustomerLookup,
+    prices: Option<crate::customers::PricingMemo<'a>>,
 }
 
 /// Scan `<root>` for `<id>/session.json` entries. Assigns `scope` to
-/// each successfully parsed session and pushes it onto `out`.
+/// each successfully parsed session, attributes it to its customer
+/// (`customer` + `customer_derived`; neither when the attribution can't be
+/// read and the scan is not `fail_closed`) and pushes it onto `out`.
 fn scan_session_dir(
     root: &std::path::Path,
     scope: &str,
     run_store: &rupu_orchestrator::runs::RunStore,
     scan: SessionScan<'_>,
+    ctx: &mut ScanCtx<'_>,
     out: &mut Vec<serde_json::Value>,
-) {
+) -> Result<(), ApiError> {
     if !root.is_dir() {
-        return;
+        return Ok(());
     }
     let entries = match std::fs::read_dir(root) {
         Ok(e) => e,
         Err(e) => {
             tracing::warn!(dir = %root.display(), error = %e, "failed to read session directory");
-            return;
+            return Ok(());
         }
     };
     for entry in entries.filter_map(|e| e.ok()) {
@@ -301,9 +442,17 @@ fn scan_session_dir(
         if scan.workspace.is_some_and(|w| dto.workspace_id != w) {
             continue;
         }
-        let usage = scan
-            .pricing
-            .map(|pricing| session_usage(&dto, run_store, pricing));
+        let who = session_customer(&mut ctx.lookup, &dto, scan.fail_closed)?;
+        // Each turn priced at its own attribution (R8).
+        let usage = match ctx.prices.as_mut() {
+            None => None,
+            Some(prices) => {
+                let lookup = &mut ctx.lookup;
+                Some(session_usage(&dto, run_store, prices, &mut |tp| {
+                    turn_price_key(lookup, &dto, tp, scan.fail_closed)
+                })?)
+            }
+        };
         match serde_json::to_value(&dto) {
             Ok(mut val) => {
                 if let serde_json::Value::Object(ref mut map) = val {
@@ -313,6 +462,13 @@ fn scan_session_dir(
                     );
                     if let Some(Ok(u)) = usage.map(|u| serde_json::to_value(&u)) {
                         map.insert("usage".to_string(), u);
+                    }
+                    if let Some(who) = &who {
+                        map.insert("customer".to_string(), serde_json::json!(who.slug));
+                        map.insert(
+                            "customer_derived".to_string(),
+                            serde_json::json!(who.derived),
+                        );
                     }
                 }
                 crate::codename::inject_codename(&mut val, &dto.session_id, Some(&dto.agent_name));
@@ -327,21 +483,26 @@ fn scan_session_dir(
             }
         }
     }
+    Ok(())
 }
 
-/// Collect all sessions from both active and archive dirs, each priced.
-/// Each entry has an injected `"scope"` key (`"active"` or `"archived"`).
-/// Blocking IO (every session's turn transcripts are folded) — call from
-/// `spawn_blocking`.
+/// Collect all sessions from both active and archive dirs, each attributed
+/// to its customer and priced with that customer's pricing. Each entry has
+/// an injected `"scope"` key (`"active"` or `"archived"`). `fail_closed`: an
+/// assignment that cannot be read fails the call; else that session carries
+/// no customer keys. Blocking IO (every session's turn transcripts are
+/// folded) — call from `spawn_blocking`.
 pub(crate) fn collect_sessions(
     global_dir: &std::path::Path,
-    pricing: &rupu_config::PricingConfig,
-) -> Vec<serde_json::Value> {
+    pricing: &crate::customers::CustomerPricing,
+    fail_closed: bool,
+) -> Result<Vec<serde_json::Value>, ApiError> {
     collect_sessions_with(
         global_dir,
         SessionScan {
             pricing: Some(pricing),
             workspace: None,
+            fail_closed,
         },
     )
 }
@@ -351,25 +512,33 @@ pub(crate) fn collect_sessions(
 pub(crate) fn collect_sessions_with(
     global_dir: &std::path::Path,
     scan: SessionScan<'_>,
-) -> Vec<serde_json::Value> {
+) -> Result<Vec<serde_json::Value>, ApiError> {
     // Session turns' dispatch sub-runs live in the global run store.
     let run_store = rupu_orchestrator::runs::RunStore::new(global_dir.join("runs"));
+    let mut ctx = ScanCtx {
+        lookup: crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(
+            global_dir,
+        )),
+        prices: scan.pricing.map(crate::customers::PricingMemo::new),
+    };
     let mut sessions = Vec::new();
     scan_session_dir(
         &global_dir.join("sessions"),
         "active",
         &run_store,
         scan,
+        &mut ctx,
         &mut sessions,
-    );
+    )?;
     scan_session_dir(
         &global_dir.join("sessions-archive"),
         "archived",
         &run_store,
         scan,
+        &mut ctx,
         &mut sessions,
-    );
-    sessions
+    )?;
+    Ok(sessions)
 }
 
 #[derive(Deserialize)]
@@ -392,6 +561,9 @@ struct SessionsQuery {
     since: Option<String>,
     #[serde(default)]
     until: Option<String>,
+    /// `?customer=<slug>|none` — see `list_sessions`.
+    #[serde(default)]
+    customer: Option<String>,
 }
 
 impl SessionsQuery {
@@ -411,21 +583,40 @@ struct SessionHostQuery {
     host: Option<String>,
 }
 
+/// `GET /api/sessions[?host=<id>][&customer=<slug>|none]`
+///
+/// `?customer=` keeps the sessions attributed to that customer (recorded on
+/// `session.json` — a slug or `null` — else, for a session that predates
+/// customers, the workspace's current assignment — `customer_derived`;
+/// `none` = no customer). Unfiltered, a session whose workspace assignment
+/// can't be read is listed without customer keys; under a filter that fails
+/// the request (500). Each session is priced with its
+/// customer's pricing. Local sessions are filtered
+/// before they are paged. A remote host's sessions are filtered on the
+/// coordinator by their `customer` key; a remote whose rows carry none is too
+/// old to say — 501 on `?host=<it>`, skipped on the fan-out and named in the
+/// `X-Rupu-Hosts-Without-Customer` header. A bad slug is a 400.
 async fn list_sessions(
     State(s): State<AppState>,
     Query(q): Query<SessionsQuery>,
-) -> ApiResult<Json<Vec<serde_json::Value>>> {
+) -> ApiResult<(axum::http::HeaderMap, Json<Vec<serde_json::Value>>)> {
     let host = q.host.as_deref().unwrap_or("all");
+    let filter = crate::customers::CustomerFilter::parse(q.customer.as_deref())?;
 
     // ── Single remote host ─────────────────────────────────────────────────────
     if host != "local" && host != "all" {
         let conn = crate::api::runs::resolve_host(&s, host)?;
         // Structured session listing — works for SSH hosts (which can't serve
         // the generic `proxy_get_json` GET) by shelling `rupu session list`.
-        let mut rows = conn
+        let rows = conn
             .list_sessions(q.scope.as_deref())
             .await
             .map_err(crate::api::runs::host_list_error)?;
+        let mut rows = match &filter {
+            None => rows,
+            Some(f) => crate::customers::filter_remote_rows(rows, f)
+                .ok_or_else(|| crate::customers::customers_unsupported(host))?,
+        };
         // Newest-first before paging: the connector returns the host's whole
         // list in CLI / mirror order, and the web's per-host merge relies on
         // each host's pages arriving ordered by `updated_at`.
@@ -434,30 +625,43 @@ async fn list_sessions(
             offset: q.offset,
             limit: q.limit,
         };
-        return Ok(Json(
-            crate::pagination::paginate(rows, &page)
-                .into_iter()
-                .map(|mut row| {
-                    row["host_id"] = serde_json::json!(host);
-                    crate::codename::inject_codename_row(
-                        &mut row,
-                        "session_id",
-                        Some("agent_name"),
-                    );
-                    row
-                })
-                .collect(),
+        return Ok((
+            axum::http::HeaderMap::new(),
+            Json(
+                crate::pagination::paginate(rows, &page)
+                    .into_iter()
+                    .map(|mut row| {
+                        row["host_id"] = serde_json::json!(host);
+                        crate::codename::inject_codename_row(
+                            &mut row,
+                            "session_id",
+                            Some("agent_name"),
+                        );
+                        row
+                    })
+                    .collect(),
+            ),
         ));
     }
 
     // ── Collect local sessions ─────────────────────────────────────────────────
-    // Blocking IO (every session's turn transcripts are folded for usage).
+    // Blocking IO (every session's turn transcripts are folded for usage, and
+    // each workspace's assignment is read once).
     let local_sessions = {
         let global = s.global_dir.clone();
-        let pricing = s.pricing.clone();
-        tokio::task::spawn_blocking(move || collect_sessions(&global, &pricing))
-            .await
-            .map_err(|e| ApiError::internal(e.to_string()))?
+        let pricing = std::sync::Arc::clone(&s.customer_pricing);
+        let filter = filter.clone();
+        tokio::task::spawn_blocking(move || {
+            // Unfiltered: an unreadable assignment omits that session's
+            // customer keys; under a filter it fails the request.
+            let mut sessions = collect_sessions(&global, &pricing, filter.is_some())?;
+            if let Some(f) = &filter {
+                sessions.retain(|v| f.matches(v["customer"].as_str()));
+            }
+            Ok::<_, ApiError>(sessions)
+        })
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))??
     };
 
     let page = crate::pagination::PageQuery {
@@ -484,7 +688,7 @@ async fn list_sessions(
                 v
             })
             .collect();
-        return Ok(Json(paged));
+        return Ok((axum::http::HeaderMap::new(), Json(paged)));
     }
 
     // ── Fan-out path (host == "all") ───────────────────────────────────────────
@@ -496,7 +700,8 @@ async fn list_sessions(
         })
         .collect();
 
-    let mut all_values = fan_out_sessions(&s.hosts, q.scope.as_deref(), local_values).await;
+    let (mut all_values, without_customer) =
+        fan_out_sessions(&s.hosts, q.scope.as_deref(), local_values, filter.as_ref()).await;
 
     // Sort newest-first by updated_at (most recently active sessions first).
     sort_values_newest_first(&mut all_values, "updated_at");
@@ -511,7 +716,10 @@ async fn list_sessions(
     let range = q.range();
     all_values.retain(|v| range.contains_str(v.get("created_at").and_then(|x| x.as_str())));
 
-    Ok(Json(crate::pagination::paginate(all_values, &page)))
+    Ok((
+        crate::customers::hosts_without_customer_header(&without_customer),
+        Json(crate::pagination::paginate(all_values, &page)),
+    ))
 }
 
 async fn get_session(
@@ -551,14 +759,26 @@ async fn get_session(
         None => return Err(ApiError::not_found(format!("session {id} not found"))),
     };
 
-    // Folding the turns' transcripts is blocking IO.
-    let usage = {
+    // Attributed exactly as the list scan does (an unreadable assignment
+    // omits the customer keys rather than fail the page), and each turn
+    // priced at its own customer's pricing — so the detail matches its list
+    // row. Folding the turns' transcripts is blocking IO.
+    let (who, usage) = {
         let dto = dto.clone();
         let store = std::sync::Arc::clone(&s.run_store);
-        let pricing = s.pricing.clone();
-        tokio::task::spawn_blocking(move || session_usage(&dto, &store, &pricing))
-            .await
-            .map_err(|e| ApiError::internal(e.to_string()))?
+        let global = s.global_dir.clone();
+        let pricing = std::sync::Arc::clone(&s.customer_pricing);
+        crate::api::runs::blocking(move || {
+            let mut lookup =
+                crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
+            let mut prices = crate::customers::PricingMemo::new(&pricing);
+            let who = session_customer(&mut lookup, &dto, false)?;
+            let usage = session_usage(&dto, &store, &mut prices, &mut |tp| {
+                turn_price_key(&mut lookup, &dto, tp, false)
+            })?;
+            Ok((who, usage))
+        })
+        .await?
     };
     let mut val = serde_json::to_value(&dto).map_err(|e| ApiError::internal(e.to_string()))?;
     if let serde_json::Value::Object(ref mut map) = val {
@@ -568,6 +788,13 @@ async fn get_session(
         );
         if let Ok(u) = serde_json::to_value(&usage) {
             map.insert("usage".to_string(), u);
+        }
+        if let Some(who) = &who {
+            map.insert("customer".to_string(), serde_json::json!(who.slug));
+            map.insert(
+                "customer_derived".to_string(),
+                serde_json::json!(who.derived),
+            );
         }
     }
     crate::codename::inject_codename(&mut val, &dto.session_id, Some(&dto.agent_name));
@@ -1001,6 +1228,7 @@ mod tests {
                 host: Some("host_fake".into()),
                 since: None,
                 until: None,
+                customer: None,
             }),
         )
         .await
@@ -1027,8 +1255,25 @@ mod tests {
         assert_eq!(usage["total_tokens"], 30, "priced from in + out");
     }
 
+    #[test]
+    fn ensure_usage_block_flags_a_remote_session_with_a_customer() {
+        let mut with = serde_json::json!({
+            "session_id": "s1", "total_tokens_in": 10, "customer": "acme",
+        });
+        ensure_usage_block(&mut with, &rupu_config::PricingConfig::default());
+        assert_eq!(with["usage"]["pricing_error"], PEER_CUSTOMER_PRICING);
+        let mut without = serde_json::json!({
+            "session_id": "s1", "total_tokens_in": 10, "customer": null,
+        });
+        ensure_usage_block(&mut without, &rupu_config::PricingConfig::default());
+        assert!(without["usage"].get("pricing_error").is_none(), "{without}");
+    }
+
     /// An HTTP remote already priced its own session with its own config.
     /// Re-pricing it here would silently overwrite that with ours.
+    /// A remote session with a customer is priced at the coordinator's
+    /// global rates — flagged, since the peer's customer pricing isn't
+    /// available here (M5); one without a customer is not flagged.
     #[test]
     fn ensure_usage_block_leaves_an_already_priced_body_alone() {
         let mut detail = serde_json::json!({
@@ -1062,7 +1307,11 @@ mod tests {
             }
             std::fs::write(dir.join("session.json"), j.to_string()).unwrap();
         }
-        let rows = collect_sessions(tmp.path(), &rupu_config::PricingConfig::default());
+        let pricing = crate::customers::CustomerPricing::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
+        let rows = collect_sessions(tmp.path(), &pricing, true).unwrap();
         let by = |id: &str| {
             rows.iter()
                 .find(|r| r["session_id"] == id)
@@ -1100,11 +1349,97 @@ mod tests {
             workspace_id: "w".into(),
             codename: None,
             runs: Vec::new(),
+            customer: None,
         };
         let u = session_usage_from_totals(&dto, &rupu_config::PricingConfig::default());
         assert_eq!(u.input_tokens, 1_000_000);
         assert!(u.priced);
         assert!((u.cost_usd.unwrap() - 3.0).abs() < 1e-9);
+    }
+
+    /// A session row's `customer` is the one `session.json` recorded — a
+    /// slug, or `null` (kept none even when its project is assigned now) —
+    /// else, for a session that predates customers, its workspace's current
+    /// assignment (derived). A row with none says `null` (never omits the
+    /// key), so a coordinator can tell "no customer" from a peer too old to
+    /// report one. Unfiltered, a session whose assignment can't be read is
+    /// listed WITHOUT the keys; fail-closed (a filter), the scan errors.
+    #[test]
+    fn session_rows_carry_the_recorded_customer_or_null() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path();
+        let store = rupu_workspace::CustomerStore::new(global);
+        store
+            .create(
+                "acme",
+                &rupu_workspace::NewCustomer {
+                    name: "Acme".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        std::fs::create_dir_all(global.join("workspaces")).unwrap();
+        std::fs::write(global.join("workspaces/ws_acme.customer"), "acme\n").unwrap();
+        let root = global.join("sessions");
+        for (id, extra) in [
+            (
+                "ses_slug",
+                serde_json::json!({"customer": "acme", "workspace_id": "ws_none"}),
+            ),
+            (
+                "ses_null",
+                serde_json::json!({"customer": null, "workspace_id": "ws_acme"}),
+            ),
+            ("ses_legacy", serde_json::json!({"workspace_id": "ws_acme"})),
+            (
+                "ses_legacy_none",
+                serde_json::json!({"workspace_id": "ws_none"}),
+            ),
+        ] {
+            let dir = root.join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut j = serde_json::json!({"session_id": id, "agent_name": "a"});
+            for (k, v) in extra.as_object().unwrap() {
+                j[k] = v.clone();
+            }
+            std::fs::write(dir.join("session.json"), j.to_string()).unwrap();
+        }
+        let pricing = crate::customers::CustomerPricing::new(
+            global.to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
+        let rows = collect_sessions(global, &pricing, true).unwrap();
+        let by = |rows: &[serde_json::Value], id: &str| {
+            rows.iter()
+                .find(|r| r["session_id"] == id)
+                .cloned()
+                .unwrap()
+        };
+        let keys = |v: &serde_json::Value| (v["customer"].clone(), v["customer_derived"].clone());
+        use serde_json::json;
+        assert_eq!(keys(&by(&rows, "ses_slug")), (json!("acme"), json!(false)));
+        assert_eq!(keys(&by(&rows, "ses_null")), (json!(null), json!(false)));
+        assert_eq!(keys(&by(&rows, "ses_legacy")), (json!("acme"), json!(true)));
+        let none = by(&rows, "ses_legacy_none");
+        assert!(none.as_object().unwrap().contains_key("customer"));
+        assert_eq!(keys(&none), (json!(null), json!(false)));
+
+        // An unreadable assignment: listed without the keys when unfiltered…
+        std::fs::remove_file(global.join("workspaces/ws_acme.customer")).unwrap();
+        std::fs::create_dir(global.join("workspaces/ws_acme.customer")).unwrap();
+        let rows = collect_sessions(global, &pricing, false).unwrap();
+        let legacy = by(&rows, "ses_legacy");
+        assert!(
+            !legacy.as_object().unwrap().contains_key("customer"),
+            "{legacy}"
+        );
+        assert!(!legacy.as_object().unwrap().contains_key("customer_derived"));
+        // …a recorded none needs no sidecar…
+        assert_eq!(keys(&by(&rows, "ses_null")), (json!(null), json!(false)));
+        // …and fail-closed (a filter) is a 500 naming the workspace.
+        let err = collect_sessions(global, &pricing, true).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.1.contains("ws_acme"), "{}", err.1);
     }
 
     /// A `runs` field of an unexpected shape never fails the session parse
@@ -1139,6 +1474,7 @@ mod tests {
                 mode: rupu_transcript::RunMode::Ask,
                 schema: None,
                 system_prompt: None,
+                customer: None,
             },
             rupu_transcript::Event::Usage {
                 provider: "anthropic".into(),
@@ -1184,9 +1520,16 @@ mod tests {
                 entry("run_gone", &tmp.path().join("archived.jsonl"), 900),
                 entry("run_live", &live, 0),
             ],
+            customer: None,
         };
         let store = rupu_orchestrator::runs::RunStore::new(tmp.path().join("runs"));
-        let u = session_usage(&dto, &store, &rupu_config::PricingConfig::default());
+        let u = session_usage(
+            &dto,
+            &store,
+            &mut crate::customers::FlatPricing(&rupu_config::PricingConfig::default()),
+            &mut |_| Ok(PriceKey::Customer(None)),
+        )
+        .unwrap();
         assert_eq!(u.input_tokens, 970);
         assert_eq!(u.output_tokens, 7);
         assert_eq!(u.runs, 1);
@@ -1611,7 +1954,7 @@ mod tests {
             rupu_config::PricingConfig::default(),
         );
 
-        let Json(rows) = list_sessions(
+        let (_, Json(rows)) = list_sessions(
             State(s),
             Query(SessionsQuery {
                 offset: None,
@@ -1620,6 +1963,7 @@ mod tests {
                 host: Some("local".into()),
                 since: Some("2026-08-05T00:00:00Z".into()),
                 until: Some("2026-08-15T00:00:00Z".into()),
+                customer: None,
             }),
         )
         .await
@@ -1681,18 +2025,19 @@ mod tests {
                     host: Some("local".into()),
                     since: None,
                     until: None,
+                    customer: None,
                 }),
             )
         };
-        let Json(all) = page(0, 20).await.expect("ok");
+        let (_, Json(all)) = page(0, 20).await.expect("ok");
         assert_eq!(
             session_ids(&all),
             ["sess_c", "sess_e", "sess_a", "sess_d", "sess_b"]
         );
         // Sorted BEFORE paging: page 0 is the newest two, page 1 the next.
-        let Json(p0) = page(0, 2).await.expect("ok");
+        let (_, Json(p0)) = page(0, 2).await.expect("ok");
         assert_eq!(session_ids(&p0), ["sess_c", "sess_e"]);
-        let Json(p1) = page(2, 2).await.expect("ok");
+        let (_, Json(p1)) = page(2, 2).await.expect("ok");
         assert_eq!(session_ids(&p1), ["sess_a", "sess_d"]);
     }
 
@@ -1719,12 +2064,13 @@ mod tests {
                     host: Some("host_fake".into()),
                     since: None,
                     until: None,
+                    customer: None,
                 }),
             )
         };
-        let Json(p0) = page(0, 2).await.expect("ok");
+        let (_, Json(p0)) = page(0, 2).await.expect("ok");
         assert_eq!(session_ids(&p0), ["sess_c", "sess_a"]);
-        let Json(p1) = page(2, 2).await.expect("ok");
+        let (_, Json(p1)) = page(2, 2).await.expect("ok");
         assert_eq!(session_ids(&p1), ["sess_d", "sess_b"]);
         assert!(p0.iter().all(|r| r["host_id"] == "host_fake"));
     }
@@ -1739,7 +2085,7 @@ mod tests {
             rupu_config::PricingConfig::default(),
         );
 
-        let Json(rows) = list_sessions(
+        let (_, Json(rows)) = list_sessions(
             State(s),
             Query(SessionsQuery {
                 offset: None,
@@ -1748,6 +2094,7 @@ mod tests {
                 host: Some("local".into()),
                 since: None,
                 until: Some("not-a-timestamp".into()),
+                customer: None,
             }),
         )
         .await

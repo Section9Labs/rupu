@@ -28,6 +28,7 @@ import { MemoryRouter } from 'react-router-dom';
 import { api, type AutoflowDefRow } from '../lib/api';
 
 import AutoflowsDefs from './AutoflowsDefs';
+import { withCustomerScope } from '../lib/customerScopeTestUtils';
 
 afterEach(() => {
   cleanup();
@@ -51,7 +52,7 @@ describe('AutoflowsDefs — scope-aware toggle', () => {
 
     render(
       <MemoryRouter initialEntries={['/build/autoflows']}>
-        <AutoflowsDefs />
+        {withCustomerScope(<AutoflowsDefs />)}
       </MemoryRouter>,
     );
     await waitFor(() => expect(screen.getByText('issue-triage')).toBeInTheDocument());
@@ -83,7 +84,7 @@ describe('AutoflowsDefs — scope-aware toggle', () => {
 
     render(
       <MemoryRouter initialEntries={['/build/autoflows']}>
-        <AutoflowsDefs />
+        {withCustomerScope(<AutoflowsDefs />)}
       </MemoryRouter>,
     );
     await waitFor(() => expect(screen.getByText('issue-triage')).toBeInTheDocument());
@@ -104,7 +105,7 @@ describe('AutoflowsDefs — scope-aware toggle', () => {
 
     render(
       <MemoryRouter initialEntries={['/build/autoflows']}>
-        <AutoflowsDefs />
+        {withCustomerScope(<AutoflowsDefs />)}
       </MemoryRouter>,
     );
     await waitFor(() => expect(screen.getByText('nightly-sweep')).toBeInTheDocument());

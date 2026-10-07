@@ -47,6 +47,8 @@ import { layoutGraph, type Pos } from '../lib/graphLayout';
 import { absoluteTime } from '../lib/time';
 import { formatTokens, formatCost } from '../lib/usage';
 import { CrewChip } from '../components/codename/CrewChip';
+import { RunCustomerChip } from '../components/customers/RunCustomer';
+import { PricingErrorMark } from '../components/customers/PricingErrorMark';
 import { AgentName } from '../components/codename/AgentName';
 import {
   SubrunIdentityContext,
@@ -837,6 +839,7 @@ export default function RunDetail() {
                 <CrewChip crew={parseCodename(run.codename).crew} derived={run.codename_derived} />
               )}
               <StatusPill status={effectiveStatus} />
+              <RunCustomerChip customer={run.customer} derived={run.customer_derived} />
               {host && host !== 'local' && (
                 <span className="rounded bg-info-bg px-1.5 py-0.5 text-note font-medium text-info ring-1 ring-info/30 font-mono">
                   {host}
@@ -870,7 +873,8 @@ export default function RunDetail() {
                   <span className="text-ink-mute">total</span> {displayUsage.partial ? '≥' : ''}
                   {formatTokens(displayUsage.total_tokens)}
                 </span>
-                <span className="font-medium text-ink">
+                <span className="inline-flex items-center gap-1 font-medium text-ink">
+                  <PricingErrorMark error={displayUsage.pricing_error} />
                   {formatCost(displayUsage.cost_usd)}{displayUsage.cost_usd !== null && !displayUsage.priced ? '*' : ''}
                 </span>
               </div>

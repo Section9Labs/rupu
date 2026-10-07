@@ -118,6 +118,10 @@ export default function ProjectUsageTimeline({ wsId }: { wsId: string }) {
   const totalTokens = breakdown.reduce((acc, r) => acc + r.total_tokens, 0);
   const totalRuns = new Set(runs.map((r) => r.run_id)).size;
   const anyUnpriced = breakdown.some((r) => !r.priced);
+  // Any row priced at the global rates (its customer's layer doesn't resolve)
+  // makes the headline cost unreliable — the same first-row rule
+  // `buildTimeline` / `aggregateRuns` use for a bucket or a table row.
+  const pricingError = runs.find((r) => r.pricing_error)?.pricing_error;
 
   return (
     <div className="space-y-4">
@@ -144,6 +148,7 @@ export default function ProjectUsageTimeline({ wsId }: { wsId: string }) {
         pending={isPending}
         headline={{
           costLabel: formatCost(sawPriced ? totalCost : null),
+          pricingError,
           subLabel: `${formatTokens(totalTokens)} tokens · ${totalRuns} runs${
             anyUnpriced ? ' · partial' : ''
           }`,

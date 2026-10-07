@@ -13,6 +13,10 @@ pub struct AppState {
     pub workspace_dir: PathBuf,
     pub run_store: Arc<RunStore>,
     pub pricing: rupu_config::PricingConfig,
+    /// Pricing per customer (global + that customer's layer), cached per slug
+    /// and re-validated by the config files' mtimes — what customer rollups
+    /// price a run with (plan ruling 9).
+    pub customer_pricing: Arc<crate::customers::CustomerPricing>,
     /// The resolved global config snapshot, reloaded after a config write so
     /// newly-started runs see updated values. Read via `config.read()`.
     pub config: Arc<RwLock<rupu_config::Config>>,
@@ -122,12 +126,16 @@ impl AppState {
         let store = rupu_workspace::HostStore {
             root: global_dir.join("hosts"),
         };
+        let customer_pricing = Arc::new(crate::customers::CustomerPricing::new(
+            global_dir.clone(),
+            pricing.clone(),
+        ));
         let hosts = Arc::new(
             crate::host::registry::HostRegistry::new(store, Arc::new(local)).with_tunnel_deps(
                 Arc::clone(&node_registry),
                 Arc::clone(&node_mirror),
                 Arc::clone(&run_store),
-                pricing.clone(),
+                Arc::clone(&customer_pricing),
             ),
         );
 
@@ -138,6 +146,7 @@ impl AppState {
             workspace_dir,
             run_store,
             pricing,
+            customer_pricing,
             config,
             launcher: None,
             session_sender: None,
@@ -278,7 +287,7 @@ impl AppState {
     /// until fixed.
     fn resolve_global_config(global_dir: &std::path::Path) -> rupu_config::Config {
         let path = global_dir.join("config.toml");
-        match rupu_config::resolve(Some(&path), None) {
+        match rupu_config::resolve(rupu_config::LayerPaths::global_only(&path)) {
             Ok(r) => r.config,
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "failed to resolve global config; using defaults");

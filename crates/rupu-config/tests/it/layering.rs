@@ -1,4 +1,4 @@
-use rupu_config::layer_files;
+use rupu_config::{layer_files, LayerPaths};
 use std::io::Write;
 use tempfile::NamedTempFile;
 
@@ -21,7 +21,7 @@ default_model = "claude-sonnet-4-6"
 default_model = "claude-opus-4-7"
 "#,
     );
-    let cfg = layer_files(Some(g.path()), Some(p.path())).unwrap();
+    let cfg = layer_files(LayerPaths::new(Some(g.path()), None, Some(p.path()))).unwrap();
     assert_eq!(cfg.default_provider.as_deref(), Some("anthropic"));
     assert_eq!(cfg.default_model.as_deref(), Some("claude-opus-4-7"));
 }
@@ -41,7 +41,7 @@ env_allowlist = ["A", "B"]
 timeout_secs = 30
 "#,
     );
-    let cfg = layer_files(Some(g.path()), Some(p.path())).unwrap();
+    let cfg = layer_files(LayerPaths::new(Some(g.path()), None, Some(p.path()))).unwrap();
     assert_eq!(cfg.bash.timeout_secs, Some(30));
     // env_allowlist preserved from global because project didn't set it
     assert_eq!(cfg.bash.env_allowlist, Some(vec!["A".into(), "B".into()]));
@@ -61,21 +61,21 @@ env_allowlist = ["A", "B", "C"]
 env_allowlist = ["X"]
 "#,
     );
-    let cfg = layer_files(Some(g.path()), Some(p.path())).unwrap();
+    let cfg = layer_files(LayerPaths::new(Some(g.path()), None, Some(p.path()))).unwrap();
     // Critical: arrays REPLACE, never concat — so user can subtract
     assert_eq!(cfg.bash.env_allowlist, Some(vec!["X".into()]));
 }
 
 #[test]
 fn missing_files_yield_empty_config() {
-    let cfg = layer_files(None, None).unwrap();
+    let cfg = layer_files(LayerPaths::default()).unwrap();
     assert_eq!(cfg.default_provider, None);
 }
 
 #[test]
 fn only_global_works() {
     let g = tmp_with(r#"default_provider = "openai""#);
-    let cfg = layer_files(Some(g.path()), None).unwrap();
+    let cfg = layer_files(LayerPaths::global_only(g.path())).unwrap();
     assert_eq!(cfg.default_provider.as_deref(), Some("openai"));
 }
 
@@ -84,7 +84,7 @@ fn directory_passed_as_config_returns_error() {
     // A directory at the path is NOT NotFound (it exists, just isn't a file).
     // The error should surface to the caller rather than silently defaulting.
     let dir = tempfile::tempdir().unwrap();
-    let result = layer_files(Some(dir.path()), None);
+    let result = layer_files(LayerPaths::global_only(dir.path()));
     assert!(
         result.is_err(),
         "passing a directory as a config file path must error, got: {:?}",
@@ -118,7 +118,7 @@ strict_templates = false
 max_active = 3
 "#,
     );
-    let cfg = layer_files(Some(g.path()), Some(p.path())).unwrap();
+    let cfg = layer_files(LayerPaths::new(Some(g.path()), None, Some(p.path()))).unwrap();
     assert_eq!(cfg.autoflow.enabled, Some(true));
     assert_eq!(
         cfg.autoflow.repo.as_deref(),
@@ -140,23 +140,26 @@ fn agentiflow_block_round_trips_through_the_layered_loader() {
     let g = tmp_with("[agentiflow]\nserve_interval_secs = 120\nreaper_enabled = false\n");
     let p = tmp_with("[agentiflow]\nserve_interval_secs = 15\n");
 
-    let global_only = rupu_config::layer_files_locked(Some(g.path()), None).unwrap();
+    let global_only =
+        rupu_config::layer_files_locked(LayerPaths::new(Some(g.path()), None, None)).unwrap();
     assert_eq!(global_only.agentiflow.serve_interval_secs, 120);
     assert!(!global_only.agentiflow.reaper_enabled);
     assert!(global_only.agentiflow.serve_enabled);
 
-    let layered = rupu_config::layer_files_locked(Some(g.path()), Some(p.path())).unwrap();
+    let layered =
+        rupu_config::layer_files_locked(LayerPaths::new(Some(g.path()), None, Some(p.path())))
+            .unwrap();
     assert_eq!(layered.agentiflow.serve_interval_secs, 15);
     // untouched by the project, kept from the global layer
     assert!(!layered.agentiflow.reaper_enabled);
 
-    let neither = rupu_config::layer_files_locked(None, None).unwrap();
+    let neither = rupu_config::layer_files_locked(LayerPaths::new(None, None, None)).unwrap();
     assert_eq!(neither.agentiflow, rupu_config::AgentiflowConfig::default());
 }
 
 #[test]
 fn agentiflow_unknown_key_fails_the_layered_loader() {
     let g = tmp_with("[agentiflow]\nserve_intervall_secs = 15\n");
-    assert!(rupu_config::layer_files_locked(Some(g.path()), None).is_err());
-    assert!(layer_files(Some(g.path()), None).is_err());
+    assert!(rupu_config::layer_files_locked(LayerPaths::new(Some(g.path()), None, None)).is_err());
+    assert!(layer_files(LayerPaths::new(Some(g.path()), None, None)).is_err());
 }

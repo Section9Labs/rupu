@@ -43,9 +43,20 @@
 // re-read on the 60 s remote poll while the notice stands; when it answers, new
 // hosts are added as `loading` and fetched, and the notice clears. `error` is
 // set only when every known host has failed.
+//
+// Customer scope (customers Plan 2B): `customer` (a slug or `none`) filters
+// every host's `/api/usage` to that customer's work. It is part of the refetch
+// identity — changing it behaves like a window change. Aggregates are
+// local-only under a filter: a remote host answers 501, which the engine
+// records as `unavailable` (shown as such in the host strip, never counted).
+// Under a filter a host's 501 is authoritative `unavailable` (never a stale
+// `(stale)` / `offline`), and a filter change reseeds every host.
+// `data.hostsWithoutCustomer` is the union of the current answers'
+// `hosts_without_customer`. A failed scoped request calls `onScopeRejected`
+// with the error, so the page can clear a scope the backend rejected (400).
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { api, apiErrorMessage, type UsageResponse, type UsageWindow } from '../api';
+import { api, apiErrorMessage, type CustomerScope, type UsageResponse, type UsageWindow } from '../api';
 import type { HostFreshnessEntry } from '../../components/dashboard/HostFreshnessStrip';
 import type { HostSeed } from '../perHost/types';
 import { FETCH_TIMEOUT_MS } from '../perHost/engine';
@@ -69,7 +80,7 @@ interface HostUsage {
 }
 
 export interface UseUsageDataResult {
-  data: (MergedUsage & { excluded: string[] }) | null;
+  data: (MergedUsage & { excluded: string[]; hostsWithoutCustomer: string[] }) | null;
   hosts: HostFreshnessEntry[];
   /** Every known host failed for the current window. */
   error: Error | null;
@@ -89,7 +100,19 @@ const seedOf = (h: HostSeed): HostUsage => ({
   receivedAt: null,
 });
 
-export function useUsageData(usageWindow: UsageWindow, windowKey: string, windowSource: 'user' | 'tick'): UseUsageDataResult {
+export function useUsageData(
+  usageWindow: UsageWindow,
+  windowIdentity: string,
+  windowSource: 'user' | 'tick',
+  customer?: CustomerScope,
+  onScopeRejected?: (e: unknown) => void,
+): UseUsageDataResult {
+  // What the answers are keyed by: the window, and the customer filter when there is one.
+  const windowKey = customer ? `${windowIdentity}|customer=${customer}` : windowIdentity;
+  const customerRef = useRef(customer);
+  customerRef.current = customer;
+  const onScopeRejectedRef = useRef(onScopeRejected);
+  onScopeRejectedRef.current = onScopeRejected;
   const [hosts, setHosts] = useState<HostUsage[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
   const noticeRef = useRef(notice);
@@ -136,7 +159,12 @@ export function useUsageData(usageWindow: UsageWindow, windowKey: string, window
       clearTimeout(timer);
       if (controllersRef.current.get(hostId) === controller) controllersRef.current.delete(hostId);
     };
-    Promise.race([api.getUsage(windowRef.current, 'model', hostId, controller.signal), timeout]).then(
+    // The customer filter is passed only when set, so an unscoped call is exactly the old one.
+    const scoped = customerRef.current;
+    const request = scoped
+      ? api.getUsage(windowRef.current, 'model', hostId, controller.signal, scoped)
+      : api.getUsage(windowRef.current, 'model', hostId, controller.signal);
+    Promise.race([request, timeout]).then(
       (resp) => {
         if (disposedRef.current || seqRef.current.get(hostId) !== seq) return;
         settled();
@@ -153,11 +181,28 @@ export function useUsageData(usageWindow: UsageWindow, windowKey: string, window
         // First check, always: an aborted or superseded request must never mark its host offline.
         if (disposedRef.current || seqRef.current.get(hostId) !== seq) return;
         settled();
+        if (scoped) onScopeRejectedRef.current?.(e);
         const f = classifyFailure(e);
         if (f.kind === 'gone' && hostId !== 'local') {
           // The host is no longer registered: drop it, as the list engine does. Local is never
           // dropped; it falls through and shows as offline.
           setHosts((prev) => prev.filter((h) => h.hostId !== hostId));
+          return;
+        }
+        if (scoped && f.kind === 'unavailable') {
+          // Under a customer filter a 501 is the host's answer, not a blip: its totals can't be
+          // filtered (or it can't say whose its runs are). Authoritative `unavailable`, with no
+          // stale figure kept, and — like every unavailable host — not polled again until the
+          // filter changes.
+          update((h) => ({
+            ...h,
+            state: 'unavailable',
+            response: null,
+            windowKey: null,
+            failedKey: null,
+            reason: f.reason,
+            receivedAt: null,
+          }));
           return;
         }
         update((h) =>
@@ -235,12 +280,22 @@ export function useUsageData(usageWindow: UsageWindow, windowKey: string, window
     );
   };
 
-  // A user window change (preset button, drag-select, clear): every host, now.
+  // A user window change (preset button, drag-select, clear): every host, now. A different
+  // customer filter is a different question altogether: every host is reseeded first, so no
+  // answer (or failure) for the old filter stands in for the new one — a host the old filter
+  // could count may be unavailable under the new one, and must not read as `(stale)`.
   const firstKey = useRef(true);
+  const lastCustomer = useRef(customer);
   useEffect(() => {
     if (firstKey.current) {
       firstKey.current = false;
       return;
+    }
+    if (lastCustomer.current !== customer) {
+      lastCustomer.current = customer;
+      setHosts((prev) =>
+        prev.map((h) => seedOf({ id: h.hostId, name: h.name, transport_kind: h.transportKind })),
+      );
     }
     fetchWhere(() => true);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on the window identity only
@@ -289,7 +344,9 @@ export function useUsageData(usageWindow: UsageWindow, windowKey: string, window
     const excluded = hosts
       .filter((h) => !current(h))
       .map((h) => `${h.name} (${h.state === 'ok' ? (staleFailed(h) ? 'stale' : 'loading') : h.state})`);
-    return { ...mergeUsage(ok.map((h) => h.response as UsageResponse)), excluded };
+    const responses = ok.map((h) => h.response as UsageResponse);
+    const hostsWithoutCustomer = [...new Set(responses.flatMap((r) => r.hosts_without_customer ?? []))].sort();
+    return { ...mergeUsage(responses), excluded, hostsWithoutCustomer };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `current`/`staleFailed` close over windowKey
   }, [hosts, windowKey]);
 

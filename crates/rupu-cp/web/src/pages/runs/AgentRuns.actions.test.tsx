@@ -25,6 +25,7 @@ import { api, ApiError } from '../../lib/api';
 import type { AgentRunRow } from '../../lib/api';
 import { REG_LOCAL, REG_PROD, callsFor, onlyHost } from '../../lib/perHost/testUtils';
 import AgentRuns from './AgentRuns';
+import { withCustomerScope } from '../../lib/customerScopeTestUtils';
 
 afterEach(() => {
   cleanup();
@@ -80,7 +81,7 @@ function stubDeps() {
 function renderPage() {
   return render(
     <MemoryRouter>
-      <AgentRuns />
+      {withCustomerScope(<AgentRuns />)}
     </MemoryRouter>,
   );
 }

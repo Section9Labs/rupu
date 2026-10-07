@@ -5,6 +5,15 @@
 // are shortcuts that toggle a `severity:<x>` token in that query; their counts
 // come from the response's severity facets. The table's Project / Target
 // columns show each finding's owning project · target.
+//
+// Customer scope (customers Plan 2B): the list follows the global scope
+// (`useScopedList`), or — embedded in a customer's Findings tab — a fixed
+// `customer` prop, which also drops the page header and padding. Either limits
+// it to the findings of that customer's projects (`GET /api/findings?customer=`,
+// applied before `q`; the facets and tiles count only the kept findings).
+// Findings are the coordinator's own records, keyed on each project's current
+// assignment, so no host is ever left out here. A scope the backend rejects
+// (400) is cleared with a notice.
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
@@ -14,6 +23,7 @@ import {
   apiErrorMessage,
   type FindingOut,
   type FindingRecord,
+  type CustomerScope,
   type FindingsResponse,
   type FindingsSummary,
   type TagAcrossResult,
@@ -31,6 +41,7 @@ import { QueryBar } from '../components/query/QueryBar';
 import { EmptyState } from '../components/ui/EmptyState';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
 import { Spinner } from '../components/ui/Spinner';
+import { useScopedList } from '../lib/useScopedList';
 
 const SEVS: Severity[] = ['critical', 'high', 'medium', 'low', 'info'];
 
@@ -79,7 +90,8 @@ function withSeverity(q: string, sev: Severity | null): string {
   return [...kept, ...(sev ? [`severity:${sev}`] : [])].join(' ');
 }
 
-export default function Findings() {
+export default function Findings({ customer: fixedCustomer }: { customer?: string } = {}) {
+  const { customer, embedded, guard } = useScopedList(fixedCustomer, []);
   const [params, setParams] = useSearchParams();
   const q = params.get('q') ?? '';
   // Other params (e.g. the Security tab) ride along untouched.
@@ -101,8 +113,8 @@ export default function Findings() {
   // Each answer and error is kept with the query it answers: the page shows
   // rows, tiles and the export only for the query in the URL, never an
   // earlier one's while the next loads or after the server rejects it.
-  const [answer, setAnswer] = useState<{ q: string; resp: FindingsResponse } | null>(null);
-  const [failure, setFailure] = useState<{ q: string; message: string } | null>(null);
+  const [answer, setAnswer] = useState<{ q: string; customer: CustomerScope; resp: FindingsResponse } | null>(null);
+  const [failure, setFailure] = useState<{ q: string; customer: CustomerScope; message: string } | null>(null);
   // Facets describe the scope before `q`, so the last answer's keep serving
   // the bar's suggestions while the next query loads or after it fails.
   const [facets, setFacets] = useState<FindingsResponse['facets'] | undefined>(undefined);
@@ -118,12 +130,14 @@ export default function Findings() {
   // doesn't put its result line on the new list.
   const currentQ = useRef(q);
   currentQ.current = q;
+  const currentCustomer = useRef(customer);
+  currentCustomer.current = customer;
 
-  // A new query is a new list: nothing carries over from the old one.
+  // A new query or customer scope is a new list: nothing carries over from the old one.
   useEffect(() => {
     setSelected(new Set());
     setBulkNote(null);
-  }, [q]);
+  }, [q, customer]);
 
   useEffect(() => {
     // A query that doesn't parse never reaches the server; the page shows why
@@ -135,26 +149,30 @@ export default function Findings() {
     }
     let cancelled = false;
     setFailure(null);
-    (q ? api.getFindings({ q }) : api.getFindings())
+    // Called with no argument when unfiltered, as the page always did; a
+    // customer scope rides with `q` and a 400 for it clears the scope (`guard`).
+    const opts = { ...(q ? { q } : {}), ...(customer ? { customer } : {}) };
+    const req = customer ? guard(api.getFindings(opts)) : q ? api.getFindings(opts) : api.getFindings();
+    req
       .then((resp) => {
         if (cancelled) return;
-        setAnswer({ q, resp });
+        setAnswer({ q, customer, resp });
         setFacets(resp.facets);
         setSettled(true);
       })
       .catch((e: unknown) => {
         if (cancelled) return;
         setAnswer(null);
-        setFailure({ q, message: apiErrorMessage(e) });
+        setFailure({ q, customer, message: apiErrorMessage(e) });
         setSettled(true);
       });
     return () => {
       cancelled = true;
     };
-  }, [q, localError, reload]);
+  }, [q, localError, reload, customer, guard]);
 
-  const data = !localError && answer?.q === q ? answer.resp : null;
-  const error = !localError && failure?.q === q ? failure.message : null;
+  const data = !localError && answer?.q === q && answer.customer === customer ? answer.resp : null;
+  const error = !localError && failure?.q === q && failure.customer === customer ? failure.message : null;
 
   const tileSummary: FindingsSummary = useMemo(() => {
     const counts = Object.fromEntries((data?.facets?.severity ?? []).map((v) => [v.value, v.count]));
@@ -229,6 +247,7 @@ export default function Findings() {
   // since the list loaded, so they read as gone and the rest go on.
   const applyBulk = async (mode: 'add' | 'remove', tag: string) => {
     const forQ = q;
+    const forCustomer = customer;
     const rows = selectedRows;
     const ids = [...new Set(rows.map((f) => f.id))];
     const change = mode === 'add' ? { add: [tag] } : { remove: [tag] };
@@ -259,7 +278,7 @@ export default function Findings() {
         }
       : merged;
     const sentKeys = new Set(rows.filter((f) => sent.has(f.id)).map(rowKey));
-    if (currentQ.current === forQ) setBulkNote(summary);
+    if (currentQ.current === forQ && currentCustomer.current === forCustomer) setBulkNote(summary);
     setSelected((prev) => new Set([...prev].filter((k) => !sentKeys.has(k))));
     setReload((n) => n + 1);
     return summary;
@@ -271,7 +290,8 @@ export default function Findings() {
   const noneAtAll = !q && data !== null && tileSummary.total === 0 && data.findings.length === 0;
 
   return (
-    <div className="p-8">
+    <div className={embedded ? undefined : 'p-8'}>
+      {!embedded && (
       <header className="mb-6">
         <h1 className="text-2xl font-semibold text-ink">Findings</h1>
         <p className="mt-1 text-sm text-ink-dim">
@@ -279,6 +299,7 @@ export default function Findings() {
           <code className="font-mono text-note">severity&gt;=high tag:needs-poc</code> — press / to focus.
         </p>
       </header>
+      )}
 
       {error && <ErrorBanner className="mb-4">{error}</ErrorBanner>}
 
@@ -289,7 +310,13 @@ export default function Findings() {
       ) : noneAtAll ? (
         <EmptyState
           title="No findings"
-          hint="Run an assessment workflow to start recording findings across your projects."
+          hint={
+            customer === 'none'
+              ? 'No project without a customer has recorded a finding yet.'
+              : customer
+                ? 'None of this customer’s projects has recorded a finding yet.'
+                : 'Run an assessment workflow to start recording findings across your projects.'
+          }
         />
       ) : (
         <div className="space-y-6">

@@ -203,6 +203,11 @@ pub struct DefaultStepFactory {
     /// `Arc` in (`rupu-cli`'s `netflow_sink::net_capture`). `None` (tests)
     /// means no capture.
     pub net_capture: Option<Arc<dyn rupu_netflow::SubprocessCapture>>,
+    /// The customer this run is attributed to — the CLI resolves it once,
+    /// at launch (`ConfigPaths.customer_slug`), or a resume reads it off the
+    /// run's `RunRecord`. Recorded on the run (`StepFactory::customer`) and
+    /// set on every step's `ToolContext`. `None` = no customer.
+    pub customer: Option<String>,
 }
 
 /// Resolve a step's agent spec from a `load_agent` result. On success the
@@ -546,6 +551,7 @@ impl StepFactory for DefaultStepFactory {
                 netflow_sink: tool_netflow_sink,
                 net_capture: self.net_capture.clone(),
                 tool_call_id: None,
+                customer: self.customer.clone(),
             },
             user_message: rendered_prompt,
             initial_messages: Vec::new(),
@@ -602,6 +608,10 @@ impl StepFactory for DefaultStepFactory {
 
     fn permission_mode(&self) -> Option<&str> {
         Some(self.mode_str.as_str())
+    }
+
+    fn customer(&self) -> Option<&str> {
+        self.customer.as_deref()
     }
 }
 
@@ -1337,6 +1347,7 @@ steps:
     fn factory(global: std::path::PathBuf) -> DefaultStepFactory {
         let limits_ctx = hermetic_limits_ctx(&global);
         DefaultStepFactory {
+            customer: None,
             workflow: Workflow::parse(WF).expect("workflow must parse"),
             global,
             project_root: None,
@@ -1966,6 +1977,32 @@ steps:
         );
     }
 
+    // `#[serial]`: reaches the provider factory, like the test above.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn the_customer_reaches_every_step_tool_context() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        write_agent(tmp.path());
+        let mut f = factory(tmp.path().to_path_buf());
+        assert_eq!(StepFactory::customer(&f), None);
+        f.customer = Some("acme".to_string());
+        assert_eq!(StepFactory::customer(&f), Some("acme"));
+
+        let opts = f
+            .build_opts_for_step(
+                "unrestricted",
+                "ag",
+                "prompt".to_string(),
+                "run1".to_string(),
+                "ws1".to_string(),
+                tmp.path().to_path_buf(),
+                tmp.path().join("transcript_customer.jsonl"),
+                None,
+            )
+            .await;
+        assert_eq!(opts.tool_context.customer.as_deref(), Some("acme"));
+    }
+
     /// Read a transcript JSONL's `tool_audit` lines back as raw
     /// `serde_json::Value`s (adjacently-tagged `{"type":...,"data":{...}}`
     /// shape) so tests can assert on fields without depending on
@@ -2099,6 +2136,7 @@ steps:
         let tmp = assert_fs::TempDir::new().unwrap();
         write_agent(tmp.path());
         let f = DefaultStepFactory {
+            customer: None,
             workflow: crate::workflow::Workflow::parse(WF_UNGRANTED).expect("parses"),
             global: tmp.path().to_path_buf(),
             project_root: None,
@@ -2163,6 +2201,7 @@ steps:
         let tmp = assert_fs::TempDir::new().unwrap();
         write_agent(tmp.path());
         let f = DefaultStepFactory {
+            customer: None,
             workflow: crate::workflow::Workflow::parse(WF_UNGRANTED).expect("parses"),
             global: tmp.path().to_path_buf(),
             project_root: None,
@@ -2251,6 +2290,7 @@ steps:
         )
         .unwrap();
         let f = DefaultStepFactory {
+            customer: None,
             workflow: crate::workflow::Workflow::parse(WF_WILDCARD).expect("parses"),
             global: tmp.path().to_path_buf(),
             project_root: None,
@@ -2456,6 +2496,7 @@ steps:
         };
 
         let mut f = DefaultStepFactory {
+            customer: None,
             workflow: Workflow::parse(WF).expect("workflow must parse"),
             global: tmp.path().to_path_buf(),
             project_root: None,
@@ -2532,6 +2573,7 @@ steps:
 
     fn limits_factory(tmp: &std::path::Path) -> DefaultStepFactory {
         DefaultStepFactory {
+            customer: None,
             workflow: Workflow::parse(WF_LIMITS).expect("workflow must parse"),
             global: tmp.to_path_buf(),
             project_root: None,

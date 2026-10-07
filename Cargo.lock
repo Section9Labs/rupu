@@ -4742,6 +4742,7 @@ name = "rupu-config"
 version = "0.82.0"
 dependencies = [
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "toml",
@@ -4793,6 +4794,7 @@ dependencies = [
  "reqwest-middleware",
  "rupu-agent",
  "rupu-ast",
+ "rupu-auth",
  "rupu-codename",
  "rupu-config",
  "rupu-coverage",
@@ -4800,6 +4802,7 @@ dependencies = [
  "rupu-mcp",
  "rupu-netflow",
  "rupu-orchestrator",
+ "rupu-providers",
  "rupu-runtime",
  "rupu-scm",
  "rupu-transcript",
@@ -5129,6 +5132,7 @@ dependencies = [
  "ignore",
  "predicates",
  "rand 0.8.6",
+ "rupu-config",
  "rupu-runtime",
  "serde",
  "serde_json",

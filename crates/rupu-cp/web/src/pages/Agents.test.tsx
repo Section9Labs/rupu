@@ -22,6 +22,7 @@ vi.mock('../components/charts/UsageBarChart', () => ({
 }));
 
 import Agents from './Agents';
+import { scopedEntry, withCustomerScope } from '../lib/customerScopeTestUtils';
 
 afterEach(() => {
   cleanup();
@@ -50,7 +51,7 @@ describe('Agents scope column', () => {
 
     render(
       <MemoryRouter initialEntries={['/agents']}>
-        <Agents />
+        {withCustomerScope(<Agents />)}
       </MemoryRouter>,
     );
 
@@ -58,5 +59,36 @@ describe('Agents scope column', () => {
 
     expect(screen.getByText('global')).toBeInTheDocument();
     expect(screen.getByText('my-project')).toBeInTheDocument();
+  });
+});
+
+describe('Agents cost column', () => {
+  it('marks an agent whose spend was priced at the global rates', async () => {
+    vi.spyOn(api, 'getAgents').mockResolvedValue([
+      { ...SCOPE_ROWS[0], usage: { ...USAGE, cost_usd: 1.2, pricing_error: 'acme layer broken' } },
+      SCOPE_ROWS[1],
+    ]);
+    render(
+      <MemoryRouter initialEntries={['/agents']}>
+        {withCustomerScope(<Agents />)}
+      </MemoryRouter>,
+    );
+    expect(await screen.findByRole('img', { name: 'Pricing unavailable: acme layer broken', hidden: true })).toBeInTheDocument();
+    expect(screen.getAllByRole('img', { name: /^Pricing unavailable/, hidden: true })).toHaveLength(1);
+  });
+});
+
+describe('Agents under a customer scope', () => {
+  it('says the run counts and spend are not filtered by the customer scope', async () => {
+    vi.spyOn(api, 'getAgents').mockResolvedValue(SCOPE_ROWS);
+
+    render(
+      <MemoryRouter initialEntries={[scopedEntry('acme', '/agents')]}>
+        {withCustomerScope(<Agents />)}
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText('reviewer')).toBeInTheDocument());
+    expect(screen.getByRole('note')).toHaveTextContent('Run counts and spend here cover every customer.');
   });
 });

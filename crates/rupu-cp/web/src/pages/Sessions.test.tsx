@@ -12,6 +12,7 @@ import { api } from '../lib/api';
 import type { SessionSummary } from '../lib/api';
 import { REG_LOCAL, REG_PROD, callsFor, onlyHost } from '../lib/perHost/testUtils';
 import Sessions from './Sessions';
+import { scopedEntry, withCustomerScope } from '../lib/customerScopeTestUtils';
 
 function LocationProbe() {
   const loc = useLocation();
@@ -43,7 +44,7 @@ function stubDeps() {
 function renderPage() {
   return render(
     <MemoryRouter>
-      <Sessions />
+      {withCustomerScope(<Sessions />)}
     </MemoryRouter>,
   );
 }
@@ -350,7 +351,7 @@ describe('Sessions — whole-row navigation (rowHref)', () => {
 
     render(
       <MemoryRouter>
-        <Sessions />
+        {withCustomerScope(<Sessions />)}
         <LocationProbe />
       </MemoryRouter>,
     );
@@ -372,7 +373,7 @@ describe('Sessions — whole-row navigation (rowHref)', () => {
 
     render(
       <MemoryRouter>
-        <Sessions />
+        {withCustomerScope(<Sessions />)}
         <LocationProbe />
       </MemoryRouter>,
     );
@@ -480,5 +481,41 @@ describe('Sessions — Find while a host is still loading', () => {
 
     await waitFor(() => expect(screen.getByText('No matches yet · Waiting on prod…')).toBeInTheDocument());
     expect(screen.getAllByText(/waiting on prod/i)).toHaveLength(1);
+  });
+});
+
+describe('Sessions — the global customer scope', () => {
+  it('passes customer: "acme" on every per-host request and names hosts the header lists', async () => {
+    stubDeps();
+    const spy = vi.spyOn(api, 'getSessions').mockImplementation((p) => {
+      if (p?.host === 'local') p.onHostsWithoutCustomer?.(['worker-7']);
+      return Promise.resolve([]);
+    });
+    render(
+      <MemoryRouter initialEntries={[scopedEntry('acme')]}>
+        {withCustomerScope(<Sessions />)}
+      </MemoryRouter>,
+    );
+    for (const host of ['local', 'host_prod']) {
+      await waitFor(() => expect(callsFor(spy, host).length).toBeGreaterThan(0));
+      expect(callsFor(spy, host)[0][0]).toEqual(expect.objectContaining({ customer: 'acme', scope: 'active' }));
+    }
+    expect(await screen.findByTestId('hosts-without-customer')).toHaveTextContent(/^worker-7 runs an older rupu/);
+  });
+
+  it('marks a session cost priced at the wrong rates', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getSessions').mockImplementation(
+      onlyHost('host_prod', [
+        {
+          ...REMOTE_SESSION,
+          usage: { input_tokens: 1, output_tokens: 1, cached_tokens: 0, total_tokens: 2, cost_usd: 1, priced: true, runs: 1, pricing_error: 'globex layer broken' },
+        },
+      ]),
+    );
+    renderPage();
+    await waitFor(() => expect(screen.getByText('host_prod')).toBeInTheDocument());
+    // The row-link cells are aria-hidden (mouse-only), so find the mark by its tooltip.
+    expect(screen.getAllByTitle('globex layer broken').length).toBeGreaterThan(0);
   });
 });

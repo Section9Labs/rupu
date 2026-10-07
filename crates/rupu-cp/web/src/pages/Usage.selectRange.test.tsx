@@ -25,6 +25,7 @@ vi.mock('../components/dashboard/UsageTimelineStacked', () => ({
 // Imported AFTER the mock so it (transitively, via UsageTimeline) picks up
 // the mocked chart.
 import Usage from './Usage';
+import { withCustomerScope } from '../lib/customerScopeTestUtils';
 
 const FIXED_NOW = new Date('2026-07-16T12:00:00.000Z').getTime();
 
@@ -79,7 +80,7 @@ function mockAll() {
 function renderUsage() {
   return render(
     <MemoryRouter>
-      <Usage />
+      {withCustomerScope(<Usage />)}
     </MemoryRouter>,
   );
 }

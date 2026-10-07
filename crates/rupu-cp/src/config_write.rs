@@ -154,7 +154,10 @@ pub fn apply_form_patch(
 /// (never throws, degrades to a harmless failed `getPath` lookup) because it
 /// only ever renders a UI field — see that function's doc comment. Never
 /// silently drop a bogus segment either way; on the write side, refuse.
-fn split_dotted_key(dotted: &str) -> Result<Vec<String>, ConfigWriteError> {
+///
+/// Also used by `rupu customer show` to walk provenance keys — one decoder,
+/// not a fifth lockstep site.
+pub fn split_dotted_key(dotted: &str) -> Result<Vec<String>, ConfigWriteError> {
     let mut segments = Vec::new();
     let mut chars = dotted.chars().peekable();
     loop {

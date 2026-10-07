@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 /// `workspace`.
 fn seed_run(id: &str, workspace: &std::path::Path) -> RunRecord {
     RunRecord {
+        customer: None,
         id: id.into(),
         workflow_name: "test-workflow".into(),
         status: RunStatus::Completed,

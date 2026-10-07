@@ -286,6 +286,7 @@ async fn a_no_ui_run_whose_runner_panics_returns_the_panic_and_persists_the_meta
     let ctx = rupu_cli::cmd::workflow::ExplicitWorkflowRunContext {
         project_root: Some(project.clone()),
         workspace_path: project.clone(),
+        customer_dir: None,
         workspace_id: "ws_no_ui".into(),
         inputs: Vec::new(),
         mode: "bypass".into(),

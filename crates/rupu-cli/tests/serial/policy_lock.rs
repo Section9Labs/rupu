@@ -131,7 +131,12 @@ fn layer_files_locked_keeps_the_locked_global_value() {
     .unwrap();
     std::fs::write(&project, "permission_mode = \"bypass\"\n").unwrap();
 
-    let cfg = rupu_config::layer_files_locked(Some(&global), Some(&project)).unwrap();
+    let cfg = rupu_config::layer_files_locked(rupu_config::LayerPaths::new(
+        Some(&global),
+        None,
+        Some(&project),
+    ))
+    .unwrap();
     assert_eq!(cfg.permission_mode.as_deref(), Some("readonly"));
 }
 
@@ -162,7 +167,12 @@ fn layer_files_locked_keeps_a_locked_global_ui_editor() {
     .unwrap();
     std::fs::write(&project, "[ui]\neditor = \"project-editor\"\n").unwrap();
 
-    let cfg = rupu_config::layer_files_locked(Some(&global), Some(&project)).unwrap();
+    let cfg = rupu_config::layer_files_locked(rupu_config::LayerPaths::new(
+        Some(&global),
+        None,
+        Some(&project),
+    ))
+    .unwrap();
     assert_eq!(
         cfg.ui.editor.as_deref(),
         Some("locked-editor"),

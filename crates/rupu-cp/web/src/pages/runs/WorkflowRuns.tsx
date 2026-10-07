@@ -17,6 +17,16 @@
 // FilterBar's search slot narrows the loaded rows client-side, live per
 // keystroke, over workflow name / run id / host id — composing with (not
 // replacing) the lifecycle/trigger pills above it.
+//
+// Customer scope (customers Plan 2B): the list follows the global scope
+// (`useScopedList`), or — embedded in a customer's Runs tab — a fixed
+// `customer` prop, which also drops the page header and padding. Either way the
+// filter goes through the same per-host engine (`?customer=<slug>`), so a
+// remote host that can't filter (501) shows as an unavailable slice, and
+// `HostsWithoutCustomerBanner` names it along with the hosts the
+// `X-Rupu-Hosts-Without-Customer` header lists. The archived listing has no
+// customer filter, so while scoped there is no Archived state; a one-line
+// hint says so. A scope the backend rejects (400) is cleared with a notice.
 
 import { useCallback, useState } from 'react';
 import { RefreshCw } from 'lucide-react';
@@ -42,6 +52,11 @@ import { durationBetween, relativeTime } from '../../lib/time';
 import { formatTokens, formatCost } from '../../lib/usage';
 import { formatDuration } from '../../lib/duration';
 import { shortId } from '../../lib/shortId';
+import { runHref } from '../../lib/runs';
+import { useRunCustomers, withCustomerColumn } from '../../components/customers/RunCustomer';
+import { PricingErrorMark } from '../../components/customers/PricingErrorMark';
+import { HostsWithoutCustomerBanner } from '../../components/customers/HostsWithoutCustomerBanner';
+import { useScopedList } from '../../lib/useScopedList';
 
 type Tab = 'active' | 'completed' | 'failed';
 /** The lifecycle FilterPills group's value space: the three tabs plus the
@@ -56,6 +71,8 @@ const LIFECYCLE_OPTIONS: FilterPillOption[] = [
   { value: 'failed', label: 'Failed / Rejected' },
   { value: 'archived', label: 'Archived' },
 ];
+/** While scoped to a customer: the archive has no customer filter. */
+const SCOPED_LIFECYCLE_OPTIONS = LIFECYCLE_OPTIONS.filter((o) => o.value !== 'archived');
 
 type TriggerFilter = 'all' | 'manual' | 'cron' | 'event';
 
@@ -86,22 +103,17 @@ function TriggerChip({ trigger }: { trigger: string }) {
   );
 }
 
-/** Build the detail link for a run, including ?host= for remote runs. */
-function runHref(r: RunListRow): string {
-  const hid = r.host_id;
-  if (hid && hid !== 'local') {
-    return `/runs/${encodeURIComponent(r.id)}?host=${encodeURIComponent(hid)}`;
-  }
-  return `/runs/${encodeURIComponent(r.id)}`;
-}
-
-export default function WorkflowRuns() {
+export default function WorkflowRuns({ customer: fixedCustomer }: { customer?: string } = {}) {
   const [tab, setTab] = useState<Tab>('active');
-  const [archived, setArchived] = useState(false);
+  const [archivedPicked, setArchived] = useState(false);
   const [filter, setFilter] = useState<TriggerFilter>('all');
   // All hosts by default: local paints at once, each remote merges in as it
   // answers (usePerHostPagedList). A picked host lists only that host.
   const [hostFilter, setHostFilter] = useState<string>(ALL_HOSTS);
+  const scoped = useScopedList(fixedCustomer, [tab, hostFilter]);
+  const { customer, embedded } = scoped;
+  // The archived listing can't be filtered by customer: no Archived state while scoped.
+  const archived = archivedPicked && !customer;
   // Row-action (archive/restore/delete) failures — kept separate from the
   // list-fetch error the hook owns, but shown in the same banner.
   const [actionError, setActionError] = useState<string | null>(null);
@@ -114,9 +126,20 @@ export default function WorkflowRuns() {
         // Any page beyond the first returns empty so the host settles.
         return offset === 0 ? api.getArchivedRuns('workflow') : Promise.resolve([]);
       }
-      return api.getWorkflowRuns({ lifecycle: tab, offset, limit, host, signal });
+      if (!customer) return api.getWorkflowRuns({ lifecycle: tab, offset, limit, host, signal });
+      return scoped.guard(
+        api.getWorkflowRuns({
+          lifecycle: tab,
+          offset,
+          limit,
+          host,
+          signal,
+          customer,
+          onHostsWithoutCustomer: scoped.reportHosts(host, offset),
+        }),
+      );
     },
-    [archived, tab],
+    [archived, tab, customer, scoped.guard, scoped.reportHosts],
   );
 
   const { rows, slices, loading, error, hasMore, sentinelRef, refresh, refreshHost, removeRow, retryPaging, ended } =
@@ -126,7 +149,7 @@ export default function WorkflowRuns() {
       fetch: fetchRows,
       timeField: 'started_at',
       idField: 'id',
-      deps: [archived, tab],
+      deps: [archived, tab, customer],
       poll: !archived && tab === 'active',
     });
 
@@ -249,7 +272,12 @@ export default function WorkflowRuns() {
     ),
   };
 
-  const columns: Column<RunListRow>[] = [...WORKFLOW_RUN_COLUMNS, actionColumn];
+  // The Customer column resolves slugs (archived customers load on first need).
+  const customers = useRunCustomers(!customer && !archived ? rows.map((r) => r.customer) : []);
+  const columns: Column<RunListRow>[] = [
+    ...withCustomerColumn(WORKFLOW_RUN_COLUMNS, customers, rows, !customer && !archived),
+    actionColumn,
+  ];
   // A fresh action error (e.g. this click's Archive/Delete refusal) must win
   // over a stale fetch error from an earlier load — never the other way
   // around, or the operator sees the wrong banner for what just happened.
@@ -267,12 +295,14 @@ export default function WorkflowRuns() {
     !archived && <PerHostFooter sentinelRef={sentinelRef} text={text} slices={slices} onRetry={retryPaging} />;
 
   return (
-    <div className="p-8">
-      <header className="flex items-center justify-between mb-6">
-        <div>
-          <h1 className="text-2xl font-semibold text-ink">Workflow Runs</h1>
-          <p className="mt-1 text-sm text-ink-dim">Workflow executions across this control plane.</p>
-        </div>
+    <div className={embedded ? undefined : 'p-8'}>
+      <header className={cn('flex items-center justify-between', embedded ? 'mb-3 justify-end' : 'mb-6')}>
+        {!embedded && (
+          <div>
+            <h1 className="text-2xl font-semibold text-ink">Workflow Runs</h1>
+            <p className="mt-1 text-sm text-ink-dim">Workflow executions across this control plane.</p>
+          </div>
+        )}
         <Button variant="secondary" onClick={() => refresh()} className="gap-1.5">
           <RefreshCw size={12} className={cn(loading && 'animate-spin')} />
           Refresh
@@ -283,7 +313,11 @@ export default function WorkflowRuns() {
         <FilterBar
           filters={
             <>
-              <FilterPills options={LIFECYCLE_OPTIONS} value={lifecycleValue} onChange={handleLifecycleChange} />
+              <FilterPills
+                options={customer ? SCOPED_LIFECYCLE_OPTIONS : LIFECYCLE_OPTIONS}
+                value={lifecycleValue}
+                onChange={handleLifecycleChange}
+              />
               {!archived && (
                 <FilterPills
                   options={TRIGGER_OPTIONS}
@@ -317,6 +351,18 @@ export default function WorkflowRuns() {
         />
       </div>
       {!archived && <PerHostStrip slices={slices} />}
+      {customer && (
+        <>
+          <HostsWithoutCustomerBanner
+            className="mb-4"
+            hosts={slices.map((sl) => ({ id: sl.hostId, name: sl.name, state: sl.state, reason: sl.reason }))}
+            without={scoped.hostsWithoutCustomer}
+          />
+          <p className="mb-4 text-note text-ink-mute">
+            Archived runs aren’t listed here — the archive can’t be filtered by customer.
+          </p>
+        </>
+      )}
 
       {bannerError && <ErrorBanner className="mb-4">{bannerError}</ErrorBanner>}
 
@@ -340,7 +386,11 @@ export default function WorkflowRuns() {
           hint={
             missing
               ? `Not included: ${missing}.`
-              : 'Workflow runs will appear here once you dispatch one from the CLI, the desktop app, or a scheduled trigger.'
+              : customer === 'none'
+                ? 'No workflow runs without a customer yet.'
+                : customer
+                  ? 'No workflow runs are attributed to this customer yet.'
+                  : 'Workflow runs will appear here once you dispatch one from the CLI, the desktop app, or a scheduled trigger.'
           }
         />
       ) : visible.length === 0 ? (
@@ -475,7 +525,12 @@ const WORKFLOW_RUN_COLUMNS: Column<RunListRow>[] = [
     fit: true,
     sortable: true,
     sortValue: (r) => r.usage.cost_usd,
-    render: (r) => <span className="text-ink font-medium">{formatCost(r.usage.cost_usd)}</span>,
+    render: (r) => (
+      <span className="inline-flex items-center justify-end gap-1 text-ink font-medium">
+        <PricingErrorMark error={r.usage.pricing_error} />
+        {formatCost(r.usage.cost_usd)}
+      </span>
+    ),
   },
   {
     key: 'turns',

@@ -8,6 +8,7 @@ pub mod codename;
 pub mod codename_legacy;
 pub mod codename_palette;
 pub mod config_write;
+pub mod customers;
 pub mod definition_generator;
 pub mod embed;
 pub mod error;
@@ -123,7 +124,7 @@ fn load_pricing(global_dir: &Path) -> PricingConfig {
     if !config_path.exists() {
         return PricingConfig::default();
     }
-    match rupu_config::layer_files(Some(&config_path), None) {
+    match rupu_config::layer_files(rupu_config::LayerPaths::global_only(&config_path)) {
         Ok(cfg) => cfg.pricing,
         Err(e) => {
             tracing::warn!(path = %config_path.display(), error = %e, "failed to load [pricing]; using builtin prices only");
@@ -275,7 +276,7 @@ pub async fn serve_on(listener: tokio::net::TcpListener, opts: ServeOpts) -> any
             std::sync::Arc::clone(&app_state.node_registry),
             std::sync::Arc::clone(&app_state.node_mirror),
             std::sync::Arc::clone(&app_state.run_store),
-            app_state.pricing.clone(),
+            std::sync::Arc::clone(&app_state.customer_pricing),
         );
     let app_state = app_state.with_hosts(std::sync::Arc::new(registry));
 

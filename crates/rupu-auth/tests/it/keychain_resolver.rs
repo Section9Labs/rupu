@@ -1588,3 +1588,43 @@ async fn an_undeclared_oauth_credential_gets_a_refresher_from_its_kind() {
         "persisted under the undeclared name: {saved}"
     );
 }
+
+/// `has_credential_named`: stored api-key, stored SSO or the env var make an
+/// account present; an unreadable store is an error, not "absent".
+#[tokio::test]
+#[serial]
+async fn has_credential_named_reads_the_store_and_reports_an_unreadable_one() {
+    let _env = EnvVarGuard::unset("RUPU_GH_ACME_API_KEY");
+    let _env2 = EnvVarGuard::unset("RUPU_GH_SSO_API_KEY");
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("auth.json");
+    let r = KeychainResolver::at(&path);
+
+    // No file at all: absent, not an error.
+    assert!(!r.has_credential_named("gh-acme").unwrap());
+
+    r.store_named("gh-acme", AuthMode::ApiKey, &StoredCredential::api_key("k"))
+        .await
+        .unwrap();
+    assert!(r.has_credential_named("gh-acme").unwrap());
+    assert!(!r.has_credential_named("gh-other").unwrap());
+
+    let sso = StoredCredential {
+        credentials: rupu_providers::auth::AuthCredentials::OAuth {
+            access: "a".into(),
+            refresh: "r".into(),
+            expires: 1,
+            extra: Default::default(),
+        },
+        refresh_token: Some("r".into()),
+        expires_at: None,
+    };
+    r.store_named("gh-sso", AuthMode::Sso, &sso).await.unwrap();
+    assert!(r.has_credential_named("gh-sso").unwrap());
+
+    let _set = EnvVarGuard::set("RUPU_GH_ENV_API_KEY", "x");
+    assert!(r.has_credential_named("gh-env").unwrap());
+
+    std::fs::write(&path, "{ not json").unwrap();
+    assert!(r.has_credential_named("gh-other").is_err());
+}

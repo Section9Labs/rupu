@@ -28,6 +28,7 @@ vi.mock('../components/CodeEditor', () => ({
 }));
 
 import Workflows from './Workflows';
+import { scopedEntry, withCustomerScope } from '../lib/customerScopeTestUtils';
 
 const USAGE = {
   input_tokens: 0,
@@ -55,7 +56,7 @@ describe('Workflows scope column', () => {
 
     render(
       <MemoryRouter initialEntries={['/workflows']}>
-        <Workflows />
+        {withCustomerScope(<Workflows />)}
       </MemoryRouter>,
     );
 
@@ -63,5 +64,52 @@ describe('Workflows scope column', () => {
 
     expect(screen.getByText('global')).toBeInTheDocument();
     expect(screen.getByText('my-project')).toBeInTheDocument();
+  });
+});
+
+describe('Workflows cost column', () => {
+  it('marks a workflow whose spend was priced at the global rates', async () => {
+    vi.spyOn(api, 'getWorkflows').mockResolvedValue([
+      { ...ROWS[0], usage: { ...USAGE, cost_usd: 1.2, pricing_error: 'acme layer broken' } },
+      ROWS[1],
+    ]);
+    render(
+      <MemoryRouter initialEntries={['/workflows']}>
+        {withCustomerScope(<Workflows />)}
+      </MemoryRouter>,
+    );
+    expect(await screen.findByRole('img', { name: 'Pricing unavailable: acme layer broken', hidden: true })).toBeInTheDocument();
+    expect(screen.getAllByRole('img', { name: /^Pricing unavailable/, hidden: true })).toHaveLength(1);
+  });
+});
+
+describe('Workflows under a customer scope', () => {
+  const NOTE = 'Run counts and spend here cover every customer.';
+
+  it('says the run counts and spend are not filtered by the customer scope', async () => {
+    vi.spyOn(api, 'getWorkflows').mockResolvedValue(ROWS);
+
+    render(
+      <MemoryRouter initialEntries={[scopedEntry('acme', '/workflows')]}>
+        {withCustomerScope(<Workflows />)}
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText('nightly-sweep')).toBeInTheDocument());
+    expect(screen.getByRole('note')).toHaveTextContent(NOTE);
+  });
+
+  it('shows no note when unscoped', async () => {
+    vi.spyOn(api, 'getWorkflows').mockResolvedValue(ROWS);
+
+    render(
+      <MemoryRouter initialEntries={['/workflows']}>
+        {withCustomerScope(<Workflows />)}
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText('nightly-sweep')).toBeInTheDocument());
+    expect(screen.queryByText(NOTE)).toBeNull();
+    expect(screen.queryByRole('note')).toBeNull();
   });
 });

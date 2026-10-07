@@ -164,6 +164,7 @@ pub fn build_summary(
         findings_open,
         fleet,
         captured_at: now,
+        hosts_without_customer: Vec::new(),
     }
 }
 
@@ -290,6 +291,7 @@ mod tests {
     /// fixture must set every field.
     fn rec(id: &str, status: rupu_orchestrator::runs::RunStatus, mins_ago: i64) -> RunRecord {
         RunRecord {
+            customer: None,
             id: id.to_string(),
             workflow_name: "wf".to_string(),
             status,

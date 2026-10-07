@@ -476,7 +476,8 @@ async fn list(
     // `cmd/workflow.rs` / `cmd/cron.rs`, which is fine to swallow — a
     // wrong pager/theme default has no correctness stakes.)
     let global_cfg_path = global.join("config.toml");
-    let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), None).map_err(|e| {
+    let layers = rupu_config::LayerPaths::global_only(&global_cfg_path);
+    let cfg = rupu_config::layer_files_locked(layers).map_err(|e| {
         tracing::warn!(
             path = %global_cfg_path.display(),
             error = %e,
@@ -500,9 +501,21 @@ async fn list(
     all.sort_by_key(|r| std::cmp::Reverse(r.started_at));
     all.truncate(limit);
 
+    // Each row carries its customer — recorded, else (a run that predates
+    // customers) its workspace's current assignment — and is priced with
+    // that customer's pricing (global + its layer), so a coordinator shelling
+    // this command can filter by customer and sees the CP's figures. A
+    // workspace whose assignment cannot be read does not fail the listing:
+    // its rows omit the customer keys (one warning per workspace on stderr).
+    let mut customers =
+        rupu_cp::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
+    let customer_pricing = rupu_cp::customers::CustomerPricing::new(global.clone(), cfg.pricing);
+    let mut prices = rupu_cp::customers::PricingMemo::new(&customer_pricing);
     let rows: Vec<rupu_cp::api::runs::RunListRow> = all
         .iter()
-        .map(|r| rupu_cp::api::runs::RunListRow::with_usage(r, &store, &cfg.pricing))
+        .map(|r| {
+            rupu_cp::api::runs::RunListRow::for_listing(r, &store, &mut customers, &mut prices)
+        })
         .collect();
 
     let report = RunListReport {
@@ -561,7 +574,8 @@ async fn show(
     // right here, then the full id flows downstream.
     let run_id = crate::cmd::workflow::resolve_run_fragment(&store, &run_id)?;
     let global_cfg_path = global.join("config.toml");
-    let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), None).map_err(|e| {
+    let layers = rupu_config::LayerPaths::global_only(&global_cfg_path);
+    let cfg = rupu_config::layer_files_locked(layers).map_err(|e| {
         tracing::warn!(
             path = %global_cfg_path.display(),
             error = %e,
@@ -579,8 +593,15 @@ async fn show(
     // the result, so byte-identical output here is what keeps the remote
     // path in sync with the local `mirror_get_run` path (both call
     // `query_run_detail`).
-    let item = rupu_cp::api::runs::query_run_detail(&store, &run_id, &cfg.pricing)
-        .map_err(|e| anyhow::anyhow!("run {run_id}: {e}"))?;
+    // Priced at the run's attributed customer, exactly as `run list` (and
+    // the CP's own detail) prices it.
+    let mut customers =
+        rupu_cp::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
+    let customer_pricing = rupu_cp::customers::CustomerPricing::new(global.clone(), cfg.pricing);
+    let mut prices = rupu_cp::customers::PricingMemo::new(&customer_pricing);
+    let item =
+        rupu_cp::api::runs::query_run_detail(&store, &run_id, &mut prices, Some(&mut customers))
+            .map_err(|e| anyhow::anyhow!("run {run_id}: {e}"))?;
 
     match global_format.unwrap_or(crate::output::formats::OutputFormat::Table) {
         crate::output::formats::OutputFormat::Json => {
@@ -639,10 +660,9 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     let project_agents_parent = project_root.as_ref().map(|p| p.join(".rupu"));
     let spec = load_agent(&global, project_agents_parent.as_deref(), &args.agent)?;
 
-    // Resolve config (global + project).
-    let global_cfg_path = global.join("config.toml");
-    let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
-    let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), project_cfg_path.as_deref())?;
+    // Resolve config (global + customer + project).
+    let cfg_paths = paths::config_paths(&global, project_root.as_deref(), &pwd)?;
+    let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
     let prefs = UiPrefs::resolve(&cfg.ui, false, None, None, args.view);
 
     // Resolve permission mode.
@@ -1061,6 +1081,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             Some(coverage_stream.clone()),
             cfg.providers.clone(),
             cfg.recovery.clone(),
+            cfg_paths.customer_slug.clone(),
         );
         dispatcher.set_namer(rupu_codename::SharedNamer::open_or_init(
             runs_root.join(&run_id).join("codenames.json"),
@@ -1104,6 +1125,8 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             netflow_sink: Some(netflow_sink.clone()),
             net_capture: Some(net_capture),
             tool_call_id: None,
+            // The customer the config above was layered with.
+            customer: cfg_paths.customer_slug.clone(),
         };
 
         let backend_id = "local_checkout".to_string();
@@ -1459,6 +1482,10 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                 loop_progress: Default::default(),
                 gate_decisions: Vec::new(),
                 codename: Some(codename.crew.clone()),
+                // The customer this run's config was layered with — recorded
+                // even when none (`null`), so a later assignment of the
+                // project never re-attributes it.
+                customer: Some(cfg_paths.customer_slug.clone()),
             };
             match store.create(rec, "") {
                 Ok(_) => {}
@@ -1472,6 +1499,9 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                             loaded.final_output = final_output;
                             loaded.error_message = error_message;
                             loaded.cause = cause;
+                            // A stub (a tunnel mirror's, or a reused id)
+                            // knows no customer; this run does.
+                            loaded.customer = Some(cfg_paths.customer_slug.clone());
                             // Under the run lock, on the blocking pool: a cancel
                             // that landed since the load is kept.
                             match store
@@ -2222,6 +2252,7 @@ mod tests {
         finished_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> rupu_cp::api::runs::RunListRow {
         let rec = rupu_orchestrator::RunRecord {
+            customer: None,
             id: "run_01".into(),
             workflow_name: "nightly".into(),
             status: rupu_orchestrator::RunStatus::Completed,

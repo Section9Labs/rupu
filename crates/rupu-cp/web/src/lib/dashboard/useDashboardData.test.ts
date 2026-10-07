@@ -251,6 +251,24 @@ describe('useDashboardData', () => {
     expect(getDashboard).toHaveBeenCalledTimes(2);
   });
 
+  it('a host that answers again clears its own failure from `error`', async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST]);
+    vi.spyOn(api, 'getDashboard')
+      .mockRejectedValueOnce(new Error('boom'))
+      .mockResolvedValueOnce(summary());
+    vi.spyOn(api, 'subscribeEvents').mockReturnValue(() => {});
+
+    const { result } = renderHook(() => useDashboardData('30d'));
+    await waitFor(() => expect(result.current.error?.message).toBe('boom'));
+
+    await act(async () => {
+      result.current.refresh();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(result.current.hosts[0]?.state).toBe('ok'));
+    expect(result.current.error).toBeNull();
+  });
+
   it('SSE arrival triggers a debounced refetch of ?host=local only, never a remote host', async () => {
     vi.useFakeTimers();
     vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST, SSH_HOST]);

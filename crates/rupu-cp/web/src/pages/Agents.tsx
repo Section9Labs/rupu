@@ -12,6 +12,8 @@ import AgentLauncherSheet from '../components/AgentLauncherSheet';
 import { Button } from '../components/ui/Button';
 import { EmptyState } from '../components/ui/EmptyState';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
+import { UnscopedNote } from '../components/customers/UnscopedNote';
+import { PricingErrorMark } from '../components/customers/PricingErrorMark';
 import { Spinner } from '../components/ui/Spinner';
 import { ScopeChip } from '../components/ScopeChip';
 import { formatTokens, formatCost } from '../lib/usage';
@@ -130,6 +132,8 @@ export default function Agents() {
       </header>
 
       {bannerError && <ErrorBanner className="mb-4">{bannerError}</ErrorBanner>}
+
+      <UnscopedNote className="mb-4">Run counts and spend here cover every customer.</UnscopedNote>
 
       {agents === null ? (
         <div className="py-16 flex items-center justify-center">
@@ -322,7 +326,10 @@ const AGENT_BASE_COLUMNS: Column<AgentSummary>[] = [
     sortable: true,
     sortValue: (a) => a.usage?.cost_usd ?? null,
     render: (a) => (
-      <span className="text-ink font-medium">{a.usage ? formatCost(a.usage.cost_usd) : '—'}</span>
+      <span className="inline-flex items-center justify-end gap-1 text-ink font-medium">
+        <PricingErrorMark error={a.usage?.pricing_error} />
+        {a.usage ? formatCost(a.usage.cost_usd) : '—'}
+      </span>
     ),
   },
   {

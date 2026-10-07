@@ -9,6 +9,7 @@ import { MemoryRouter } from 'react-router-dom';
 import { api, type SessionSummary } from '../lib/api';
 import { REG_LOCAL } from '../lib/perHost/testUtils';
 import Sessions from './Sessions';
+import { withCustomerScope } from '../lib/customerScopeTestUtils';
 
 afterEach(() => {
   cleanup();
@@ -41,7 +42,7 @@ function stubHosts() {
 function renderPage() {
   return render(
     <MemoryRouter>
-      <Sessions />
+      {withCustomerScope(<Sessions />)}
     </MemoryRouter>,
   );
 }

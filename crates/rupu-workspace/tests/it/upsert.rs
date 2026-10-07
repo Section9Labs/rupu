@@ -50,3 +50,42 @@ fn second_upsert_updates_last_run_at() {
         "last_run_at should advance"
     );
 }
+
+/// Every launch upserts its workspace, so runs of one project write the same
+/// record concurrently. Each write must land whole: afterwards there is
+/// exactly one record for the path and it parses.
+#[test]
+fn concurrent_upserts_of_one_project_never_tear_the_record() {
+    let store_dir = assert_fs::TempDir::new().unwrap();
+    let project = assert_fs::TempDir::new().unwrap();
+    let store = WorkspaceStore {
+        root: store_dir.path().to_path_buf(),
+    };
+    let first = upsert(&store, project.path()).unwrap();
+
+    let handles: Vec<_> = (0..16)
+        .map(|_| {
+            let store = store.clone();
+            let path = project.path().to_path_buf();
+            std::thread::spawn(move || {
+                for _ in 0..20 {
+                    upsert(&store, &path).unwrap();
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let records = store.list().unwrap();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].id, first.id);
+    assert!(store.load(&first.id).unwrap().is_some());
+    let leftovers: Vec<_> = std::fs::read_dir(store_dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| !n.ends_with(".toml"))
+        .collect();
+    assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+}

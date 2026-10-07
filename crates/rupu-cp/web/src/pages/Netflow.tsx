@@ -12,6 +12,7 @@
 // render; scope comes from the route and only narrows the data.
 
 import NetflowExplorer from '../components/netflow/explorer/NetflowExplorer';
+import { UnscopedNote } from '../components/customers/UnscopedNote';
 
 export default function Netflow() {
   return (
@@ -23,6 +24,7 @@ export default function Netflow() {
           narrows the data.
         </p>
       </header>
+      <UnscopedNote className="mb-4">Flows here cover every customer.</UnscopedNote>
       <NetflowExplorer scope="global" />
     </div>
   );

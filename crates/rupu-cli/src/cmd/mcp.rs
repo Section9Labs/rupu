@@ -44,9 +44,8 @@ async fn serve_inner(args: ServeArgs) -> anyhow::Result<()> {
     paths::ensure_dir(&global)?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
-    let global_cfg = global.join("config.toml");
-    let project_cfg = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
-    let cfg = rupu_config::layer_files_locked(Some(&global_cfg), project_cfg.as_deref())?;
+    let cfg_paths = paths::config_paths(&global, project_root.as_deref(), &pwd)?;
+    let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
 
     // `resolver_for`, not a bare `KeychainResolver::new()` — see
     // `crate::accounts`'s doc and `cmd/issues.rs`'s identical fix

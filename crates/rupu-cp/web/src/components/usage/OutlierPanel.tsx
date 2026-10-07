@@ -23,6 +23,7 @@
 
 import { Link } from 'react-router-dom';
 import type { OutlierRun } from '../../lib/api';
+import { PricingErrorMark } from '../customers/PricingErrorMark';
 
 export type { OutlierRun };
 
@@ -99,7 +100,10 @@ export function OutlierPanel({
             <span className={`text-xs text-ink-mute ${excluded ? 'opacity-50' : ''}`}>
               {o.run_id}
             </span>
-            <span className={`ml-auto tabular-nums text-ink ${excluded ? 'opacity-50' : ''}`}>
+            <span
+              className={`ml-auto inline-flex items-center gap-1 tabular-nums text-ink ${excluded ? 'opacity-50' : ''}`}
+            >
+              <PricingErrorMark error={o.pricing_error} />
               ${o.cost_usd.toFixed(2)}
             </span>
             <span

@@ -230,6 +230,7 @@ fn write_mirrored_transcript(path: &Path, run_id: &str) {
         mode: RunMode::Bypass,
         schema: None,
         system_prompt: None,
+        customer: None,
     })
     .unwrap();
     for (input, output) in [(7u32, 3u32), (5, 2)] {

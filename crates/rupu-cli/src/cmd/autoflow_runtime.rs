@@ -196,12 +196,16 @@ pub(crate) async fn tick_with_options(
             root: paths::autoflow_claims_dir(&global),
         };
         let wake_store = WakeStore::new(paths::autoflow_wakes_dir(&global));
+        // Repos left out this cycle because their config failed to load;
+        // each becomes a `cycle_failed` event naming the repo.
+        let mut config_skips = Vec::new();
         let cleaned = legacy::cleanup_terminal_claims(
             &global,
             &repo_store,
             &claim_store,
             chrono::Utc::now(),
             options.repo_filter.as_deref(),
+            &mut config_skips,
         )?;
         if cleaned > 0 {
             cycle_record.events.push(AutoflowCycleEvent {
@@ -210,10 +214,16 @@ pub(crate) async fn tick_with_options(
                 ..Default::default()
             });
         }
-        let mut discovered = legacy::discover_tick_autoflows(&global, &repo_store)?;
+        let mut discovered =
+            legacy::discover_tick_autoflows_reporting(&global, &repo_store, &mut config_skips)?;
         if let Some(repo_filter) = options.repo_filter.as_deref() {
             discovered.retain(|resolved| resolved.repo_ref == repo_filter);
         }
+        push_repo_config_skip_events(
+            &mut cycle_record.events,
+            &config_skips,
+            options.repo_filter.as_deref(),
+        );
 
         let mut report = TickReport {
             workflow_count: discovered.len(),
@@ -753,6 +763,30 @@ fn cycle_mode(options: &TickOptions) -> AutoflowCycleMode {
     match options.worker.as_ref().map(|worker| worker.kind) {
         Some(WorkerKind::AutoflowServe) => AutoflowCycleMode::Serve,
         _ => AutoflowCycleMode::Tick,
+    }
+}
+
+/// One `cycle_failed` event per repo the cycle left out because its config
+/// failed to load (repos outside `repo_filter` are not this cycle's
+/// business, so they are not reported).
+fn push_repo_config_skip_events(
+    events: &mut Vec<AutoflowCycleEvent>,
+    skips: &[legacy::RepoConfigSkip],
+    repo_filter: Option<&str>,
+) {
+    for skip in skips {
+        if repo_filter.is_some_and(|repo| repo != skip.repo_ref) {
+            continue;
+        }
+        events.push(AutoflowCycleEvent {
+            kind: AutoflowCycleEventKind::CycleFailed,
+            repo_ref: Some(skip.repo_ref.clone()),
+            detail: Some(format!(
+                "repo skipped this cycle: its config failed to load: {}",
+                skip.error
+            )),
+            ..Default::default()
+        });
     }
 }
 
@@ -1372,6 +1406,7 @@ mod tests {
         run_store
             .create(
                 RunRecord {
+                    customer: None,
                     id: "run_123".into(),
                     workflow_name: "storefront-feature-delivery".into(),
                     status: RunStatus::Completed,
@@ -1433,6 +1468,7 @@ mod tests {
                 schema: None,
                 system_prompt: None,
                 codename: None,
+                customer: None,
             })
             .unwrap();
         writer
@@ -1602,5 +1638,40 @@ mod tests {
                     .as_deref()
                     .is_some_and(|detail| detail.contains("Add cart drawer"))
         }));
+    }
+
+    #[test]
+    fn repo_config_skips_become_cycle_failed_events_honouring_the_repo_filter() {
+        let skips = vec![
+            legacy::RepoConfigSkip {
+                repo_ref: "github:acme/bad".into(),
+                error: "customer `acme` does not exist".into(),
+            },
+            legacy::RepoConfigSkip {
+                repo_ref: "github:acme/other".into(),
+                error: "parse config.toml".into(),
+            },
+        ];
+
+        let mut events = Vec::new();
+        push_repo_config_skip_events(&mut events, &skips, None);
+        assert_eq!(events.len(), 2);
+        for (event, skip) in events.iter().zip(&skips) {
+            assert!(matches!(event.kind, AutoflowCycleEventKind::CycleFailed));
+            assert_eq!(event.repo_ref.as_deref(), Some(skip.repo_ref.as_str()));
+            let detail = event.detail.as_deref().unwrap();
+            assert!(detail.contains("config failed to load"), "{detail}");
+            assert!(detail.contains(&skip.error), "{detail}");
+        }
+
+        // A cycle filtered to one repo reports only that repo's skip.
+        let mut events = Vec::new();
+        push_repo_config_skip_events(&mut events, &skips, Some("github:acme/other"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].repo_ref.as_deref(), Some("github:acme/other"));
+
+        let mut events = Vec::new();
+        push_repo_config_skip_events(&mut events, &skips, Some("github:acme/healthy"));
+        assert!(events.is_empty());
     }
 }

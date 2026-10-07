@@ -20,9 +20,10 @@ impl DefinitionGenerator for RuntimeDefinitionGenerator {
         // `gen_provider_config` below) so the SAME config also builds the
         // resolver: a declared account's SSO credential must be reachable
         // from the CP's "generate a definition" button too.
-        let gen_cfg =
-            rupu_config::layer_files_locked(Some(&self.global_dir.join("config.toml")), None)
-                .unwrap_or_default();
+        let gen_cfg = rupu_config::layer_files_locked(rupu_config::LayerPaths::global_only(
+            &self.global_dir.join("config.toml"),
+        ))
+        .unwrap_or_default();
         let resolver = crate::accounts::resolver_for(&gen_cfg);
         let (provider, model) = match (req.provider, req.model) {
             (Some(p), Some(m)) => (p, m),
@@ -98,9 +99,10 @@ impl DefinitionGenerator for RuntimeDefinitionGenerator {
         // Mirrors `generate` above: build the resolver from this same
         // config so a declared account's SSO credential (not just the
         // bare `DEFAULT_GEN_MODELS` vendor names) is reflected here too.
-        let gen_cfg =
-            rupu_config::layer_files_locked(Some(&self.global_dir.join("config.toml")), None)
-                .unwrap_or_default();
+        let gen_cfg = rupu_config::layer_files_locked(rupu_config::LayerPaths::global_only(
+            &self.global_dir.join("config.toml"),
+        ))
+        .unwrap_or_default();
         let resolver = crate::accounts::resolver_for(&gen_cfg);
         let default = rupu_orchestrator::pick_default_gen_model(&resolver).await;
         let mut out = Vec::new();

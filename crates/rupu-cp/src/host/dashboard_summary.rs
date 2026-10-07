@@ -191,6 +191,12 @@ pub struct DashboardSummary {
     /// strip — a host 30s stale must not render as "live". Never synthesized
     /// at the aggregation layer; always set by the connector that read it.
     pub captured_at: DateTime<Utc>,
+    /// Under a customer filter: the hosts some of whose runs were left out
+    /// because their customer can't be known here (legacy mirrored worker
+    /// runs) — never counted as "no customer". Empty (and absent on the
+    /// wire) otherwise; unioned across hosts by the dashboard merge.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts_without_customer: Vec<String>,
 }
 
 #[cfg(test)]
@@ -342,6 +348,7 @@ mod tests {
             findings_open: Some(0),
             fleet: FleetCounts::default(),
             captured_at: chrono::Utc::now(),
+            hosts_without_customer: Vec::new(),
         };
         let v = serde_json::to_value(&s).unwrap();
         assert!(
@@ -361,6 +368,7 @@ mod tests {
             findings_open: None,
             fleet: FleetCounts::default(),
             captured_at: chrono::Utc::now(),
+            hosts_without_customer: Vec::new(),
         };
         let v = serde_json::to_value(&s).unwrap();
         assert!(
@@ -408,6 +416,7 @@ mod tests {
             findings_open: Some(3),
             fleet: FleetCounts::default(),
             captured_at: chrono::Utc::now(),
+            hosts_without_customer: Vec::new(),
         };
         let v = serde_json::to_value(&s).unwrap();
         let back: DashboardSummary = serde_json::from_value(v).unwrap();

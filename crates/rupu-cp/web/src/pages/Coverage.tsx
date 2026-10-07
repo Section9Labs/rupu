@@ -14,6 +14,7 @@ import { ErrorBanner } from '../components/ui/ErrorBanner';
 import { Spinner } from '../components/ui/Spinner';
 import { cn } from '../lib/cn';
 import { useInfiniteScroll } from '../lib/useInfiniteScroll';
+import { UnscopedNote } from '../components/customers/UnscopedNote';
 
 const STEP = 20;
 
@@ -85,6 +86,10 @@ export default function Coverage() {
           been recorded per target, and how many findings were raised.
         </p>
       </header>
+
+      <UnscopedNote className="mb-4">
+        Coverage can’t be filtered by customer — it shows every customer’s projects.
+      </UnscopedNote>
 
       {error && <ErrorBanner className="mb-4">{error}</ErrorBanner>}
 

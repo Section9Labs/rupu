@@ -9,7 +9,7 @@ pub struct RuntimeModelCatalog {
 impl RuntimeModelCatalog {
     fn config(&self) -> Result<(rupu_config::Config, PathBuf), ModelCatalogError> {
         let cfg_path = self.global_dir.join("config.toml");
-        let cfg = rupu_config::layer_files_locked(Some(&cfg_path), None)
+        let cfg = rupu_config::layer_files_locked(rupu_config::LayerPaths::global_only(&cfg_path))
             .map_err(|e| ModelCatalogError::Backend(e.to_string()))?;
         Ok((cfg, cfg_path))
     }

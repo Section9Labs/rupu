@@ -35,9 +35,20 @@
 // applies — this hook just applies it at the same seam where it already has
 // the per-host summaries in hand, rather than threading extra return values
 // through the pure merge function.
+//
+// Customer scope (customers Plan 2B): `customer` (a slug or `none`) filters
+// every host's `/api/dashboard` to that customer's work; it is part of the
+// refetch identity, like `range`. Aggregates are local-only under a filter: a
+// remote host answers 501, recorded `unavailable` with its reason (the page's
+// `HostsWithoutCustomerBanner` names it) — a host state, never a page `error`,
+// and not polled again under that filter. `error` is the newest standing
+// per-host failure: a host that answers again clears its own. `hostsWithoutCustomer` is the union
+// of the answering hosts' `hosts_without_customer`. A 400 for a scoped request
+// is the backend rejecting the scope: `onScopeRejected(error)` is called so the
+// page can clear it. Unscoped, every request is exactly the old one.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, type DashboardRange, type DashboardSummary } from '../api';
+import { api, ApiError, apiErrorMessage, type CustomerScope, type DashboardRange, type DashboardSummary } from '../api';
 import { mergeSummaries, reportsAnyFleetNull } from './mergeSummaries';
 
 /** Burst window. An autoflow cycle firing 12 runs must cost ONE refetch. */
@@ -107,7 +118,11 @@ export type MergedDashboard = DashboardSummary & {
   fleet_partial: boolean;
 };
 
-export function useDashboardData(range: DashboardRange) {
+export function useDashboardData(
+  range: DashboardRange,
+  customer?: CustomerScope,
+  onScopeRejected?: (e: unknown) => void,
+) {
   const [hosts, setHosts] = useState<DashboardHostState[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);
@@ -116,6 +131,21 @@ export function useDashboardData(range: DashboardRange) {
   // just because `range` changed identity or a render happened.
   const rangeRef = useRef(range);
   rangeRef.current = range;
+  const customerRef = useRef(customer);
+  customerRef.current = customer;
+  const onScopeRejectedRef = useRef(onScopeRejected);
+  onScopeRejectedRef.current = onScopeRejected;
+  // The latest failure per host. `error` is the newest standing one, so a
+  // host that answers again clears its own failure (and only its own).
+  const failuresRef = useRef(new Map<string, Error>());
+  const publishError = useCallback(() => {
+    const standing = [...failuresRef.current.values()];
+    setError(standing.length > 0 ? standing[standing.length - 1] : null);
+  }, []);
+  // Hosts that answered 501 under the current customer filter: their answer
+  // is "can't filter", so the poll does not ask them again until the filter
+  // (or range) changes and the bootstrap clears this.
+  const scopedUnavailableRef = useRef(new Set<string>());
   const hostIdsRef = useRef<string[]>([]);
   // Bumped on every bootstrap (mount + range change) so a fetch started by a
   // PREVIOUS bootstrap that resolves late can recognize it is stale and
@@ -123,7 +153,12 @@ export function useDashboardData(range: DashboardRange) {
   const genRef = useRef(0);
 
   const fetchOneHost = useCallback((hostId: string, gen: number) => {
-    api.getDashboard(rangeRef.current, hostId).then(
+    const scoped = customerRef.current;
+    // The customer is passed only when set, so an unscoped call is exactly the old one.
+    const request = scoped
+      ? api.getDashboard(rangeRef.current, hostId, scoped)
+      : api.getDashboard(rangeRef.current, hostId);
+    request.then(
       (resp) => {
         if (genRef.current !== gen) return; // superseded by a newer bootstrap
         // A resolved promise is NOT proof of health: the server answers a
@@ -157,28 +192,48 @@ export function useDashboardData(range: DashboardRange) {
             return { ...h, state: 'ok', summary: resp, reason: null };
           }),
         );
+        if (failuresRef.current.delete(hostId)) publishError();
       },
       (e: unknown) => {
         if (genRef.current !== gen) return;
-        const err = e instanceof Error ? e : new Error(String(e));
+        if (scoped) onScopeRejectedRef.current?.(e);
+        // The server's own message (`{"error": …}` parsed), not the raw body.
+        const reason = apiErrorMessage(e);
+        if (scoped && e instanceof ApiError && e.status === 501) {
+          // Under a customer filter a remote's 501 is its answer — its totals
+          // are summed remotely and can't be filtered — so it is a host state
+          // (named by the page's banner), not a page error, and no stale
+          // figure for the old filter stands in for it.
+          scopedUnavailableRef.current.add(hostId);
+          setHosts((prev) =>
+            prev.map((h) => (h.hostId === hostId ? { ...h, state: 'unavailable', summary: undefined, reason } : h)),
+          );
+          if (failuresRef.current.delete(hostId)) publishError();
+          return;
+        }
+        const err = e instanceof ApiError ? new Error(reason) : e instanceof Error ? e : new Error(String(e));
         setHosts((prev) =>
           prev.map((h) => {
             if (h.hostId !== hostId) return h;
             // Stale-on-error: a host that already has data keeps showing it
             // rather than flipping to `unavailable` — a 10s-old number beats
             // an empty tile. Only a host that never had data flips state.
-            if (h.state === 'ok') return { ...h, reason: err.message };
-            return { ...h, state: 'unavailable', reason: err.message };
+            if (h.state === 'ok') return { ...h, reason };
+            return { ...h, state: 'unavailable', reason };
           }),
         );
-        setError(err);
+        failuresRef.current.delete(hostId); // re-insert: it is now the newest
+        failuresRef.current.set(hostId, err);
+        publishError();
       },
     );
-  }, []);
+  }, [publishError]);
 
   const refreshAllHosts = useCallback(() => {
     const gen = genRef.current;
-    for (const id of hostIdsRef.current) fetchOneHost(id, gen);
+    for (const id of hostIdsRef.current) {
+      if (!scopedUnavailableRef.current.has(id)) fetchOneHost(id, gen);
+    }
   }, [fetchOneHost]);
 
   const refreshLocalOnly = useCallback(() => {
@@ -188,12 +243,14 @@ export function useDashboardData(range: DashboardRange) {
   // Bootstrap: list registered hosts (a cheap, probe-free store read — see
   // `getRegisteredHosts`'s doc comment), seed a `loading` slice per host so
   // the freshness strip can render immediately, THEN fire every host's
-  // `getDashboard` independently. Re-runs when `range` changes.
+  // `getDashboard` independently. Re-runs when `range` or `customer` changes.
   useEffect(() => {
     genRef.current += 1;
     const gen = genRef.current;
     setLoading(true);
     setError(null);
+    failuresRef.current.clear();
+    scopedUnavailableRef.current.clear();
     setHosts([]);
     hostIdsRef.current = [];
 
@@ -222,7 +279,7 @@ export function useDashboardData(range: DashboardRange) {
         setLoading(false);
       },
     );
-  }, [range, fetchOneHost]);
+  }, [range, customer, fetchOneHost]);
 
   // SSE invalidation (local-only) + visibility-gated reconciling poll (every
   // host). Stable across renders — `fetchOneHost`/`refreshLocalOnly`/
@@ -276,5 +333,12 @@ export function useDashboardData(range: DashboardRange) {
     return { ...merged, findings_partial, cycles_partial, fleet_partial };
   }, [okSummaries]);
 
-  return { data, hosts, loading, error, refresh: refreshAllHosts };
+  // Under a filter: hosts some of whose (legacy, mirrored) runs the answering
+  // hosts left out because their customer can't be known.
+  const hostsWithoutCustomer = useMemo(
+    () => [...new Set(okSummaries.flatMap((s) => s.hosts_without_customer ?? []))].sort(),
+    [okSummaries],
+  );
+
+  return { data, hosts, loading, error, refresh: refreshAllHosts, hostsWithoutCustomer };
 }

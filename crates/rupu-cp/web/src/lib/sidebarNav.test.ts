@@ -13,11 +13,24 @@ it('has a Security group with Coverage, Network and Findings', () => {
   expect(security.items.map((i) => i.to)).toEqual(['/coverage', '/netflow', '/findings']);
 });
 
-it('has a top-level Live Events leaf right after Projects', () => {
+it('has a top-level Customers leaf right after Projects', () => {
   const projectsIndex = sidebarNav.findIndex(
     (s) => s.kind === 'leaf' && s.item.to === '/projects',
   );
-  const nextSection = sidebarNav[projectsIndex + 1];
+  const next = sidebarNav[projectsIndex + 1];
+  expect(next.kind).toBe('leaf');
+  if (next.kind === 'leaf') {
+    expect(next.item.to).toBe('/customers');
+    expect(next.item.label).toBe('Customers');
+    expect(next.item.enabled).toBe(true);
+  }
+});
+
+it('has a top-level Live Events leaf right after Customers', () => {
+  const customersIndex = sidebarNav.findIndex(
+    (s) => s.kind === 'leaf' && s.item.to === '/customers',
+  );
+  const nextSection = sidebarNav[customersIndex + 1];
   expect(nextSection.kind).toBe('leaf');
   if (nextSection.kind === 'leaf') {
     expect(nextSection.item.to).toBe('/events');
@@ -40,9 +53,9 @@ it('routes are unchanged (Coverage/Findings paths still present exactly once eac
 });
 
 describe('sidebarNavV2', () => {
-  it('has exactly the seven v2 destinations in order', () => {
+  it('has exactly the eight v2 destinations in order', () => {
     expect(sidebarNavV2.map((l) => l.to)).toEqual([
-      '/overview', '/activity', '/projects', '/security', '/library', '/fleet', '/usage',
+      '/overview', '/activity', '/projects', '/customers', '/security', '/library', '/fleet', '/usage',
     ]);
   });
   it('pins settings separately', () => {

@@ -587,6 +587,21 @@ pub trait HostConnector: Send + Sync {
         Err(HostConnectorError::Unsupported("dashboard summary".into()))
     }
 
+    /// [`Self::dashboard_summary`] narrowed to one customer's work (plan
+    /// ruling 5). Only the local host implements it: a remote host's summary
+    /// arrives already summed, so the default — every remote transport — is
+    /// `Unsupported`, which callers render as a 501 / "unavailable", never as
+    /// zero.
+    async fn dashboard_summary_for_customer(
+        &self,
+        _range: crate::host::dashboard_summary::DashboardRange,
+        _customer: &crate::customers::CustomerFilter,
+    ) -> Result<crate::host::dashboard_summary::DashboardSummary, HostConnectorError> {
+        Err(HostConnectorError::Unsupported(
+            "dashboard summary by customer".into(),
+        ))
+    }
+
     /// Stage a packed workspace on the host; returns the remote working dir.
     ///
     /// `payload` is a wire-encoded [`rupu_workspace::Payload`] (see
@@ -823,11 +838,32 @@ pub(crate) async fn blocking_host<T: Send + 'static>(
 ///
 /// Shared by [`TunnelHostConnector`] and the upcoming `SshHostConnector` — both
 /// read from the same mirror; only the `worker_id` they scope to differs.
+///
+/// Customers: a mirrored run's workspace lives on the worker, not in this
+/// coordinator's store, so its customer cannot be derived here — only what
+/// the run RECORDED is reported. A run that recorded a customer carries it
+/// (`customer_derived: false`); one that recorded "no customer" (an explicit
+/// `null` in its `run.json`) carries `customer: null` and is filterable
+/// (`?customer=none`); a LEGACY worker run (no key: it predates customers)
+/// OMITS the `customer`/`customer_derived` keys, so under a customer filter
+/// such a host answers 501 / is named in `X-Rupu-Hosts-Without-Customer`
+/// rather than being counted as "none".
+///
+/// What a mirrored run records is the WORKER's own resolution: a placed unit
+/// of a coordinator's `acme` run resolves its customer on the worker, from
+/// the worker's own customers and assignments, until customers Plan 3 ships
+/// the coordinator's layer to placed units. Until then each peer has its own
+/// customer namespace — a peer's `acme` is that peer's customer, which may or
+/// may not be the coordinator's `acme`.
+///
+/// Rows are priced with the coordinator's [`crate::customers::CustomerPricing`]
+/// at the customer the run recorded (a legacy run: global rates, flagged
+/// `pricing_error`) — the same price its detail, graph and live usage show.
 pub(crate) fn mirror_list_runs(
     run_store: &RunStore,
     worker_id: &str,
     params: &RunListQuery,
-    pricing: &rupu_config::PricingConfig,
+    pricing: &crate::customers::CustomerPricing,
 ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
     let workflow_only = params.kind == RunKind::Workflow;
     let rows = crate::api::runs::query_run_rows(
@@ -837,12 +873,17 @@ pub(crate) fn mirror_list_runs(
         params.lifecycle.as_deref(),
         workflow_only,
         Some(worker_id),
-        pricing,
+        // Priced like the same run everywhere else: its recorded customer's
+        // pricing (the coordinator's layer); a legacy run as unknown.
+        &mut crate::customers::PricingMemo::new(pricing),
         // No since/until on `RunListQuery` yet — see `LocalHostConnector::
         // list_runs`'s matching call site for why this is deferred.
         &crate::pagination::DateRangeQuery::default(),
+        // A mirrored remote run's workspace is not in this coordinator's
+        // store, so only the customer the run recorded is reported.
+        crate::api::runs::RowCustomers::default(),
     )
-    .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
+    .map_err(crate::api::runs::RunRowsError::into_host)?;
 
     rows.iter()
         .map(|r| serde_json::to_value(r).map_err(|e| HostConnectorError::Invalid(e.to_string())))
@@ -858,11 +899,20 @@ pub(crate) fn mirror_get_run(
     run_store: &RunStore,
     worker_id: &str,
     run_id: &str,
-    pricing: &rupu_config::PricingConfig,
+    pricing: &crate::customers::CustomerPricing,
 ) -> Result<serde_json::Value, HostConnectorError> {
     check_mirror_run(run_store, worker_id, run_id)?;
-    crate::api::runs::query_run_detail(run_store, run_id, pricing)
-        .map_err(|e| HostConnectorError::Invalid(e.to_string()))
+    // A mirrored run is priced by what it recorded only (no lookup: its
+    // workspace's assignment lives on the worker) — at the coordinator's
+    // pricing for that customer, exactly as its list row, graph and live
+    // usage price it.
+    crate::api::runs::query_run_detail(
+        run_store,
+        run_id,
+        &mut crate::customers::PricingMemo::new(pricing),
+        None,
+    )
+    .map_err(|e| HostConnectorError::Invalid(e.to_string()))
 }
 
 /// `Ok` when `run_id` is in the mirror and `worker_id` ran it, else
@@ -1180,6 +1230,80 @@ mod off_runtime_tests {
             .unwrap();
 
         assert_eq!(got, serde_json::json!({ "events": [], "summary": null }));
+    }
+
+    /// A mirrored run that recorded a customer carries it; one that recorded
+    /// "no customer" (`null`) carries `customer: null` and is filterable; a
+    /// legacy run (no key) omits the key, so a customer filter reads the
+    /// host as unable to say (501) instead of counting the run as "no
+    /// customer".
+    #[test]
+    fn mirror_rows_omit_the_customer_a_worker_run_never_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        // `None` = legacy (no key); `Some(None)` = recorded `null`.
+        let seed = |id: &str, customer: Option<Option<&str>>| {
+            let mut v = serde_json::json!({
+                "id": id,
+                "workflow_name": "wf",
+                "status": "completed",
+                "inputs": {},
+                "workspace_id": "ws_remote",
+                "workspace_path": "/tmp/proj",
+                "transcript_dir": "/tmp/proj/.rupu/transcripts",
+                "started_at": "2026-10-06T00:00:00Z",
+                "worker_id": "node_1",
+            });
+            if let Some(c) = customer {
+                v["customer"] = serde_json::json!(c);
+            }
+            store
+                .create(serde_json::from_value(v).unwrap(), "name: wf\n")
+                .unwrap();
+        };
+        seed("run_acme", Some(Some("acme")));
+        seed("run_none", Some(None));
+        let params = RunListQuery {
+            kind: RunKind::All,
+            offset: 0,
+            limit: 50,
+            lifecycle: None,
+        };
+        let pricing =
+            crate::customers::CustomerPricing::flat(rupu_config::PricingConfig::default());
+        let none = crate::customers::CustomerFilter::Unassigned;
+        let acme = crate::customers::CustomerFilter::Slug("acme".into());
+
+        // Only recorded runs (a slug and an explicit null): filtered normally.
+        let rows = mirror_list_runs(&store, "node_1", &params, &pricing).unwrap();
+        let row = |rows: &[serde_json::Value], id: &str| {
+            rows.iter().find(|r| r["id"] == id).unwrap().clone()
+        };
+        assert_eq!(row(&rows, "run_acme")["customer"], "acme");
+        assert_eq!(row(&rows, "run_acme")["customer_derived"], false);
+        let recorded_none = row(&rows, "run_none");
+        assert!(recorded_none.as_object().unwrap().contains_key("customer"));
+        assert!(recorded_none["customer"].is_null());
+        assert_eq!(recorded_none["customer_derived"], false);
+        let ids = |rows: Option<Vec<serde_json::Value>>| {
+            rows.map(|r| r.iter().map(|v| v["id"].clone()).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            ids(crate::customers::filter_remote_rows(rows.clone(), &acme)),
+            Some(vec![serde_json::json!("run_acme")])
+        );
+        assert_eq!(
+            ids(crate::customers::filter_remote_rows(rows, &none)),
+            Some(vec![serde_json::json!("run_none")])
+        );
+
+        // A legacy run: no key, so the host can't be filtered (501).
+        seed("run_legacy", None);
+        let rows = mirror_list_runs(&store, "node_1", &params, &pricing).unwrap();
+        let legacy = rows.iter().find(|r| r["id"] == "run_legacy").unwrap();
+        assert!(!legacy.as_object().unwrap().contains_key("customer"));
+        assert!(!legacy.as_object().unwrap().contains_key("customer_derived"));
+        assert!(crate::customers::filter_remote_rows(rows, &none).is_none());
     }
 
     /// `stream_run_events` on a mirror-backed connector (SSH, tunnel,

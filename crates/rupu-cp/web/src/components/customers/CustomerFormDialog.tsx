@@ -1,0 +1,306 @@
+// CustomerFormDialog — create / edit a customer. Rendered by its owner only
+// while open (so every opening starts clean); the owner returns focus to its
+// trigger on close. Modal via DialogFrame: Escape / Cancel / overlay click
+// close, Tab is trapped, the first field is focused on open.
+//
+// Closing (Escape, overlay click, Cancel) is ignored while a save is in flight;
+// with unsaved edits it asks "Discard changes?" first (real buttons, inline).
+//
+// Create: Name (required), Slug (auto-suggested from the name until edited;
+// `^[a-z0-9][a-z0-9-]{0,62}$`, and `none` is reserved — it is the filter's
+// "no customer"), Contact, Notes, Color (`#rrggbb`, empty = derived from the
+// slug). Edit: no slug (it is the customer's identity). A 409 (slug taken) and
+// the API's other 400s are shown inline; success reloads the scope's customer
+// list and calls `onSaved`.
+
+import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
+import { api, apiErrorMessage, ApiError, type CustomerDto, type NewCustomerBody } from '../../lib/api';
+import { useCustomerScope } from '../../lib/customerScope';
+import { Button } from '../ui/Button';
+import { ErrorBanner } from '../ui/ErrorBanner';
+import { CustomerDot } from './CustomerDot';
+import { DialogFrame } from './DialogFrame';
+
+export interface CustomerFormDialogProps {
+  mode: 'create' | 'edit';
+  /** The customer being edited (edit mode). */
+  initial?: CustomerDto;
+  onSaved: (customer: CustomerDto) => void;
+  onClose: () => void;
+}
+
+const SLUG_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
+const COLOR_RE = /^#[0-9a-fA-F]{6}$/;
+const RESERVED_SLUG = 'none';
+
+/** Lowercase, runs of non-alphanumerics → `-`, trimmed, ≤ 63 chars. */
+export function suggestSlug(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 63)
+    .replace(/-+$/g, '');
+}
+
+function slugProblem(slug: string): string | null {
+  if (slug === '') return null; // empty is "not filled in yet", not an error to show
+  if (slug === RESERVED_SLUG) return '“none” is reserved — it’s the filter’s “no customer”.';
+  if (!SLUG_RE.test(slug)) {
+    return 'Use lowercase letters, digits and dashes, starting with a letter or digit (up to 63 characters).';
+  }
+  return null;
+}
+
+const fieldCls =
+  'w-full rounded-md border border-border bg-panel px-2.5 py-1.5 text-lead text-ink placeholder:text-ink-mute focus:border-brand-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60 aria-[invalid=true]:border-err';
+const labelCls = 'mb-1 block text-ui font-semibold uppercase tracking-wide text-ink-dim';
+const hintCls = 'mt-1 text-note text-ink-mute';
+const errCls = 'mt-1 text-note text-err';
+
+export function CustomerFormDialog({ mode, initial, onSaved, onClose }: CustomerFormDialogProps) {
+  const { reload } = useCustomerScope();
+  const create = mode === 'create';
+  const fieldId = useId();
+  const firstRef = useRef<HTMLInputElement>(null);
+
+  const [name, setName] = useState(initial?.name ?? '');
+  const [slug, setSlug] = useState('');
+  const [slugTouched, setSlugTouched] = useState(false);
+  const [contact, setContact] = useState(initial?.contact ?? '');
+  const [notes, setNotes] = useState(initial?.notes ?? '');
+  const [color, setColor] = useState(initial?.color ?? '');
+  const [busy, setBusy] = useState(false);
+  // Server-reported problems, cleared as the field they name is edited.
+  const [slugServerError, setSlugServerError] = useState<string | null>(null);
+  const [colorServerError, setColorServerError] = useState<string | null>(null);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [confirmingDiscard, setConfirmingDiscard] = useState(false);
+  const confirmRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    firstRef.current?.focus();
+  }, []);
+
+  const dirty =
+    name !== (initial?.name ?? '') ||
+    contact !== (initial?.contact ?? '') ||
+    notes !== (initial?.notes ?? '') ||
+    color !== (initial?.color ?? '') ||
+    (create && slugTouched && slug !== '');
+
+  // Every way of closing goes through here.
+  function requestClose() {
+    if (busy) return;
+    if (dirty) setConfirmingDiscard(true);
+    else onClose();
+  }
+  useEffect(() => {
+    if (confirmingDiscard) confirmRef.current?.querySelector('button')?.focus();
+  }, [confirmingDiscard]);
+
+  function onName(v: string) {
+    setName(v);
+    if (create && !slugTouched) {
+      setSlug(suggestSlug(v));
+      setSlugServerError(null);
+    }
+  }
+
+  const trimmedName = name.trim();
+  const slugError = create ? (slugServerError ?? slugProblem(slug)) : null;
+  const colorTrim = color.trim();
+  const colorError =
+    colorServerError ?? (colorTrim !== '' && !COLOR_RE.test(colorTrim) ? 'Use the form #rrggbb, e.g. #336699.' : null);
+  const valid =
+    trimmedName !== '' && colorError === null && (!create || (slug !== '' && slugProblem(slug) === null));
+
+  async function onSubmit(e: FormEvent) {
+    e.preventDefault();
+    if (busy || !valid) return;
+    setBusy(true);
+    setFormError(null);
+    try {
+      let saved: CustomerDto;
+      if (create) {
+        const body: NewCustomerBody = { slug, name: trimmedName };
+        if (notes.trim()) body.notes = notes.trim();
+        if (contact.trim()) body.contact = contact.trim();
+        if (colorTrim) body.color = colorTrim.toLowerCase();
+        saved = await api.createCustomer(body);
+      } else {
+        // `""` clears a field; the API leaves absent fields alone.
+        saved = await api.updateCustomer(initial!.slug, {
+          name: trimmedName,
+          notes: notes.trim(),
+          contact: contact.trim(),
+          color: colorTrim.toLowerCase(),
+        });
+      }
+      reload();
+      onSaved(saved);
+    } catch (err: unknown) {
+      const msg = apiErrorMessage(err);
+      const status = err instanceof ApiError ? err.status : 0;
+      if (create && (status === 409 || (status === 400 && /slug/i.test(msg)))) setSlugServerError(msg);
+      else if (status === 400 && /colou?r/i.test(msg)) setColorServerError(msg);
+      else setFormError(msg);
+      setBusy(false);
+    }
+  }
+
+  return (
+    <DialogFrame
+      title={create ? 'New customer' : `Edit ${initial?.name ?? 'customer'}`}
+      onRequestClose={requestClose}
+      // Escape on the "Discard changes?" prompt means "keep editing".
+      onEscape={() => (confirmingDiscard ? setConfirmingDiscard(false) : requestClose())}
+      overlayTestId="customer-form-overlay"
+    >
+        <form onSubmit={onSubmit} className="mt-4 space-y-4" noValidate>
+          <div>
+            <label htmlFor={`${fieldId}-name`} className={labelCls}>
+              Name <span aria-hidden>*</span>
+            </label>
+            <input
+              id={`${fieldId}-name`}
+              ref={firstRef}
+              type="text"
+              required
+              value={name}
+              onChange={(e) => onName(e.target.value)}
+              disabled={busy}
+              className={fieldCls}
+            />
+          </div>
+
+          {create && (
+            <div>
+              <label htmlFor={`${fieldId}-slug`} className={labelCls}>
+                Slug <span aria-hidden>*</span>
+              </label>
+              <input
+                id={`${fieldId}-slug`}
+                type="text"
+                value={slug}
+                onChange={(e) => {
+                  setSlug(e.target.value);
+                  setSlugTouched(true);
+                  setSlugServerError(null);
+                }}
+                disabled={busy}
+                spellCheck={false}
+                aria-invalid={slugError ? true : undefined}
+                aria-describedby={`${fieldId}-slug-msg`}
+                className={`${fieldCls} font-mono`}
+              />
+              {slugError ? (
+                <p id={`${fieldId}-slug-msg`} className={errCls}>
+                  {slugError}
+                </p>
+              ) : (
+                <p id={`${fieldId}-slug-msg`} className={hintCls}>
+                  The customer’s permanent id — used in URLs and on the command line.
+                </p>
+              )}
+            </div>
+          )}
+
+          <div>
+            <label htmlFor={`${fieldId}-contact`} className={labelCls}>
+              Contact
+            </label>
+            <input
+              id={`${fieldId}-contact`}
+              type="text"
+              value={contact}
+              onChange={(e) => setContact(e.target.value)}
+              disabled={busy}
+              className={fieldCls}
+            />
+          </div>
+
+          <div>
+            <label htmlFor={`${fieldId}-notes`} className={labelCls}>
+              Notes
+            </label>
+            <textarea
+              id={`${fieldId}-notes`}
+              rows={3}
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+              disabled={busy}
+              className={fieldCls}
+            />
+          </div>
+
+          <div>
+            <label htmlFor={`${fieldId}-color`} className={labelCls}>
+              Color
+            </label>
+            <div className="flex items-center gap-2">
+              <span
+                className="inline-flex h-6 w-6 items-center justify-center rounded border border-border"
+                aria-hidden
+              >
+                {COLOR_RE.test(colorTrim) ? (
+                  <CustomerDot tint={{ light: colorTrim, dark: colorTrim }} size={12} />
+                ) : initial ? (
+                  // Edit: the tint the server derived for this customer.
+                  <CustomerDot tint={initial.tint} size={12} />
+                ) : (
+                  // Create: the tint is derived server-side from the slug, so
+                  // there is nothing to preview yet.
+                  <span data-neutral-dot className="inline-block h-3 w-3 rounded-full bg-border" />
+                )}
+              </span>
+              <input
+                id={`${fieldId}-color`}
+                type="text"
+                value={color}
+                onChange={(e) => {
+                  setColor(e.target.value);
+                  setColorServerError(null);
+                }}
+                placeholder="#rrggbb"
+                disabled={busy}
+                spellCheck={false}
+                aria-invalid={colorError ? true : undefined}
+                className={`${fieldCls} font-mono`}
+              />
+            </div>
+            {colorError ? (
+              <p className={errCls}>{colorError}</p>
+            ) : (
+              colorTrim === '' && <p className={hintCls}>Empty — derived from the slug.</p>
+            )}
+          </div>
+
+          {formError && <ErrorBanner>{formError}</ErrorBanner>}
+
+          {confirmingDiscard ? (
+            <div ref={confirmRef} role="alertdialog" aria-label="Discard changes?" className="flex items-center justify-end gap-2">
+              <span className="mr-auto text-ui font-medium text-ink">Discard changes?</span>
+              <Button variant="secondary" onClick={() => setConfirmingDiscard(false)}>
+                Keep editing
+              </Button>
+              <Button variant="danger" onClick={onClose}>
+                Discard
+              </Button>
+            </div>
+          ) : (
+            <div className="flex items-center justify-end gap-2">
+              <Button variant="secondary" onClick={requestClose} disabled={busy}>
+                Cancel
+              </Button>
+              <Button type="submit" disabled={busy || !valid}>
+                {create ? 'Create customer' : 'Save'}
+              </Button>
+            </div>
+          )}
+        </form>
+    </DialogFrame>
+  );
+}
+
+export default CustomerFormDialog;

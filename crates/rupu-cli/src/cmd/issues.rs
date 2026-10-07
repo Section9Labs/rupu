@@ -499,9 +499,8 @@ async fn build_registry() -> anyhow::Result<(
     if let Err(err) = crate::cmd::repos::auto_track_checkout(&global, &pwd) {
         warn!(path = %pwd.display(), error = %err, "failed to auto-track checkout");
     }
-    let global_cfg = global.join("config.toml");
-    let project_cfg = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
-    let cfg = rupu_config::layer_files_locked(Some(&global_cfg), project_cfg.as_deref())?;
+    let cfg_paths = paths::config_paths(&global, project_root.as_deref(), &pwd)?;
+    let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
     // `resolver_for`, not a bare `KeychainResolver::new()`: this is
     // exactly the seam `accounts::account_specs`' `[scm.*]` union closes
     // (arc progress ledger, Ruling 7) — a declared `[scm.gh-work]`

@@ -21,6 +21,7 @@ function project(ws: string, name: string, extra: Partial<ProjectRow> = {}): Pro
     ws_id: ws, name, path: `/repos/${name}`, repo_remote: null, branch: 'main',
     repo_home_url: null, created_at: '2026-01-01T00:00:00Z', last_run_at: null,
     usage: {} as unknown as ProjectRow['usage'], run_count: 0, last_active: null,
+    customer: null,
     ...extra,
   };
 }

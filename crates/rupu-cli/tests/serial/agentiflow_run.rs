@@ -624,3 +624,66 @@ async fn detach_with_bad_wall_clock_fails_loudly() {
         "a failed start left a run directory behind"
     );
 }
+
+
+/// A project assigned to a customer runs its agentiflow under that customer:
+/// the launch resolves the customer layer like `rupu run` and every lead
+/// round's transcript records it (`run_start.customer`).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_customers_project_records_the_customer_on_every_lead_round() {
+    let _guard = ENV_LOCK.lock().await;
+    let fx = fixture(2);
+    let project = fx.project.to_str().unwrap().to_string();
+    fx.rupu(
+        LEAD_ROUND,
+        &["customer", "create", "acme", "--name", "Acme Corp"],
+    )
+    .assert()
+    .success();
+    fx.rupu(
+        LEAD_ROUND,
+        &["customer", "assign", "acme", "--project", &project],
+    )
+    .assert()
+    .success();
+
+    let run = json_stdout(&mut fx.rupu(
+        LEAD_ROUND,
+        &["--format", "json", "agentiflow", "run", "acme"],
+    ));
+    let dir = fx.run_dir(run["id"].as_str().unwrap());
+    for round in ["lead/transcript.r0.jsonl", "lead/transcript.r1.jsonl"] {
+        let head = rupu_transcript::JsonlReader::head(dir.join(round)).unwrap();
+        assert_eq!(head.customer, Some(Some("acme".to_string())), "{round}");
+    }
+}
+
+/// A dangling assignment (the customer was deleted out from under it) fails
+/// the launch, as `rupu run` does, instead of quietly running on global config.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dangling_customer_refuses_the_launch() {
+    let _guard = ENV_LOCK.lock().await;
+    let fx = fixture(1);
+    let project = fx.project.to_str().unwrap().to_string();
+    fx.rupu(
+        LEAD_ROUND,
+        &["customer", "create", "acme", "--name", "Acme"],
+    )
+    .assert()
+    .success();
+    fx.rupu(
+        LEAD_ROUND,
+        &["customer", "assign", "acme", "--project", &project],
+    )
+    .assert()
+    .success();
+    std::fs::remove_dir_all(fx.global.join("customers/acme")).unwrap();
+
+    let out = fx
+        .rupu(LEAD_ROUND, &["agentiflow", "run", "acme"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("acme"), "{stderr}");
+}

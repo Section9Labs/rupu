@@ -1269,7 +1269,9 @@ async fn connect_pull_capable_node(
         registry,
         Arc::new(rupu_cp::node::NodeMirror::new(Arc::clone(&run_store))),
         run_store,
-        rupu_config::PricingConfig::default(),
+        std::sync::Arc::new(rupu_cp::customers::CustomerPricing::flat(
+            rupu_config::PricingConfig::default(),
+        )),
     );
     (ws, connector)
 }
@@ -1472,7 +1474,9 @@ mod tunnel_connector {
             registry,
             mirror,
             Arc::clone(&run_store),
-            rupu_config::PricingConfig::default(),
+            std::sync::Arc::new(rupu_cp::customers::CustomerPricing::flat(
+                rupu_config::PricingConfig::default(),
+            )),
         );
         (conn, rx, run_store)
     }
@@ -1549,7 +1553,9 @@ mod tunnel_connector {
             registry,
             mirror,
             run_store,
-            rupu_config::PricingConfig::default(),
+            std::sync::Arc::new(rupu_cp::customers::CustomerPricing::flat(
+                rupu_config::PricingConfig::default(),
+            )),
         );
 
         let req = make_launch_req("some-wf");
@@ -1610,7 +1616,9 @@ mod tunnel_connector {
             registry,
             mirror,
             Arc::clone(&run_store),
-            rupu_config::PricingConfig::default(),
+            std::sync::Arc::new(rupu_cp::customers::CustomerPricing::flat(
+                rupu_config::PricingConfig::default(),
+            )),
         );
 
         let params = RunListQuery {
@@ -1650,7 +1658,9 @@ mod tunnel_connector {
             Arc::new(NodeRegistry::new()),
             Arc::new(NodeMirror::new(Arc::clone(&run_store))),
             run_store,
-            rupu_config::PricingConfig::default(),
+            std::sync::Arc::new(rupu_cp::customers::CustomerPricing::flat(
+                rupu_config::PricingConfig::default(),
+            )),
         );
         let info = conn.info().await.expect("info should succeed");
         assert!(
@@ -1763,7 +1773,9 @@ mod tunnel_connector {
             registry,
             mirror,
             run_store,
-            rupu_config::PricingConfig::default(),
+            std::sync::Arc::new(rupu_cp::customers::CustomerPricing::flat(
+                rupu_config::PricingConfig::default(),
+            )),
         );
 
         let a = conn.approve_run("run_01ABC", "").await;
@@ -1824,7 +1836,9 @@ mod tunnel_connector {
             registry,
             mirror,
             Arc::clone(&run_store),
-            rupu_config::PricingConfig::default(),
+            std::sync::Arc::new(rupu_cp::customers::CustomerPricing::flat(
+                rupu_config::PricingConfig::default(),
+            )),
         );
         (conn, rx, run_store, node_conn)
     }
@@ -2171,7 +2185,9 @@ mod tunnel_connector {
             Arc::new(NodeRegistry::new()),
             Arc::new(NodeMirror::new(Arc::clone(&run_store))),
             run_store,
-            rupu_config::PricingConfig::default(),
+            std::sync::Arc::new(rupu_cp::customers::CustomerPricing::flat(
+                rupu_config::PricingConfig::default(),
+            )),
         );
         let err = conn
             .pull_finding_artifact(&"ab".repeat(32), &dir.path().join("x"), 6)
@@ -2203,6 +2219,7 @@ fn mirrored_awaiting_run_is_not_pending_resume() {
     // status = AwaitingApproval, awaiting_step_id set, and — crucially —
     // resume_requested_at = None (no marker).
     let rec = RunRecord {
+        customer: None,
         id: "run_node_1".to_string(),
         workflow_name: "gate-workflow".to_string(),
         status: RunStatus::AwaitingApproval,
@@ -2272,6 +2289,7 @@ fn mirrored_awaiting_run_is_not_pending_resume_ssh_host() {
     // Construct a RunRecord in AwaitingApproval attributed to an SSH host.
     // Crucially resume_requested_at = None (no marker).
     let rec = RunRecord {
+        customer: None,
         id: "run_ssh_1".to_string(),
         workflow_name: "gate-workflow".to_string(),
         status: RunStatus::AwaitingApproval,
@@ -2336,6 +2354,7 @@ fn mirrored_awaiting_run_is_not_pending_resume_bucket_host() {
     // Construct a RunRecord in AwaitingApproval attributed to a Bucket host.
     // Crucially resume_requested_at = None (no marker).
     let rec = RunRecord {
+        customer: None,
         id: "run_bucket_1".to_string(),
         workflow_name: "gate-workflow".to_string(),
         status: RunStatus::AwaitingApproval,

@@ -17,16 +17,25 @@
 //  - The Raw tab edits `raw_project` (this workspace's own file), not the
 //    merged/global text.
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Cpu, DollarSign, FileCode, GitBranch, Server, SlidersHorizontal, Workflow } from 'lucide-react';
 import { api, ApiError, type ConfigView } from '../../lib/api';
 import { TabBar, TabButton } from '../TabBar';
 import { Button } from '../ui/Button';
+import { LayerErrorBanner } from '../settings/LayerErrorBanner';
 import { getPath, GeneralTab, ProvidersTab, AutoflowTab, ScmTab, PricingTab, CpFieldTab, RawTab } from '../ConfigEditor';
 
 type ProjectConfigSubTab = 'general' | 'providers' | 'autoflow' | 'scm' | 'pricing' | 'cp' | 'raw';
 
-export default function ProjectConfigTab({ wsId }: { wsId: string }) {
+export default function ProjectConfigTab({
+  wsId,
+  reloadKey,
+}: {
+  wsId: string;
+  /** Changing it re-reads the view (keeping staged edits) — e.g. after the
+   *  project's customer changed, which changes its provenance and locks. */
+  reloadKey?: unknown;
+}) {
   const [configView, setConfigView] = useState<ConfigView | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [pendingPatch, setPendingPatch] = useState<Record<string, unknown>>({});
@@ -63,6 +72,14 @@ export default function ProjectConfigTab({ wsId }: { wsId: string }) {
     // when the project itself changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wsId]);
+
+  const seenReloadKey = useRef(reloadKey);
+  useEffect(() => {
+    if (Object.is(seenReloadKey.current, reloadKey)) return;
+    seenReloadKey.current = reloadKey;
+    void reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reloadKey]);
 
   // Keys enforced by the GLOBAL policy lock — derived straight from
   // provenance (no local toggle state to keep in sync; this view can't set
@@ -181,6 +198,18 @@ export default function ProjectConfigTab({ wsId }: { wsId: string }) {
         </div>
       </div>
 
+      {configView.layer_error && (
+        <LayerErrorBanner
+          message={configView.layer_error}
+          kept={configView.layer_error_kept}
+          customerName={configView.customer?.name}
+          hint={
+            configView.layer_error_kept === 'global_customer' || !configView.customer
+              ? 'Fix it in the Raw tab.'
+              : "Fix it in the Raw tab (this project) or the customer's Config tab."
+          }
+        />
+      )}
       {readOnly && (
         <div className="rounded-lg border border-warn/30 bg-warn-bg px-4 py-3 text-sm text-warn">
           This is a read-only deploy — editing config requires <code className="font-mono">rupu cp serve</code>.

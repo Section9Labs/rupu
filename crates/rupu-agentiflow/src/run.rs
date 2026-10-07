@@ -260,6 +260,11 @@ pub struct RunAgentiflowOpts {
     /// the CLI passes `None` when the generating provider has no credential or
     /// cannot be built synchronously (Anthropic OAuth).
     pub generation: Option<crate::lead::GenerationCapability>,
+    /// The customer this run belongs to (`rupu customer`), resolved by the
+    /// launch site from the workspace's assignment
+    /// (`rupu_workspace::config_paths(..).customer_slug`) -- never inferred
+    /// here. The lead's transcripts record it. `None` ⇒ no customer.
+    pub customer: Option<String>,
     /// The layered `[pricing]` config (with its `provider_kinds` attached): what
     /// prices the ledgers' tokens for `budget.usd`. A model with no price here
     /// (or in the built-in table) counts as `$0`; when the LEAD's own model is
@@ -591,6 +596,7 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
         run_id: id,
         unit_launcher,
         generation,
+        customer,
         pricing,
     } = opts;
 
@@ -848,6 +854,7 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 findings_engagement: Some(findings_engagement),
                 extra_tools,
                 collectors,
+                customer,
                 usage_ledger: Some(rupu_orchestrator::usage_ledger::UsageLedger::open(
                     lead_usage,
                 )),
@@ -1027,6 +1034,7 @@ mod tests {
             run_id: id.into(),
             unit_launcher: None,
             generation: None,
+            customer: None,
             pricing: PricingConfig::default(),
         }
     }

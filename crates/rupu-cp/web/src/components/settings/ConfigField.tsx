@@ -7,7 +7,7 @@
 // relies on, and the `onChange` / `onToggleLock` call shapes are unchanged
 // from the pre-redesign `ConfigField`.
 
-import type { ReactNode } from 'react';
+import { createContext, useContext, type ReactNode } from 'react';
 import type { KeyProvenance } from '../../lib/api';
 import { cn } from '../../lib/cn';
 import { Chip } from '../ui/Chip';
@@ -19,6 +19,8 @@ import { Lock, Unlock } from 'lucide-react';
 
 export const SOURCE_CLASS: Record<KeyProvenance['source'], string> = {
   global: 'bg-info-bg text-info ring-info/30',
+  // A customer layer sits between global and project (customers spec §2).
+  customer: 'bg-brand-50 text-brand-700 border-brand-100 ring-brand-100',
   project: 'bg-ok-bg text-ok ring-ok/30',
   default: 'bg-surface text-ink-mute ring-border',
 };
@@ -31,6 +33,50 @@ function ProvenanceBadge({ source }: { source: KeyProvenance['source'] }) {
     </Chip>
   );
 }
+
+/** Lock-owner chip — which layer's `[policy].lock` pins a key. A customer's
+ *  own lock is brand-tinted (it is the layer being edited); a global lock is
+ *  a warning (the customer can't change it). */
+export function LockOwnerChip({ owner }: { owner: 'customer' | 'global' }) {
+  return owner === 'customer' ? (
+    <Chip className="gap-1 border-brand-100 bg-brand-50 text-brand-700 ring-brand-100">
+      <Lock size={10} aria-hidden="true" />
+      locked by customer
+    </Chip>
+  ) : (
+    <Chip className="gap-1 bg-warn-bg text-warn ring-warn/30">
+      <Lock size={10} aria-hidden="true" />
+      locked by global policy
+    </Chip>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Layer context — the customer Config tab edits a layer BETWEEN global and
+// project, so a field has three states a global/project form never shows:
+// inherited (read-only until overridden), customer-owned (editable, with a
+// "Lock for projects" switch) and pinned by the global policy (read-only).
+// A context rather than a prop so the shared per-tab bodies stay untouched.
+// ---------------------------------------------------------------------------
+
+export interface ConfigLayerContextValue {
+  /** The customer's display name ("Override for Acme Corp"). */
+  name: string;
+  /** Whether an unsaved edit for this key is staged (an override in flight). */
+  isStaged: (key: string) => boolean;
+  /** Stage this key's current inherited value as the customer's own. */
+  onOverride: (key: string) => void;
+  /** Optional line under a field's input (e.g. where a named account lives). */
+  note?: (key: string) => ReactNode;
+  /** Lock switches are inert (a lock write is in flight, or the layer is broken). */
+  lockDisabled?: boolean;
+  /** Override buttons are inert (the layer is broken). */
+  overrideDisabled?: boolean;
+  /** Why they are inert — shown as the control's tooltip. */
+  disabledReason?: string;
+}
+
+export const ConfigLayerContext = createContext<ConfigLayerContextValue | null>(null);
 
 // ---------------------------------------------------------------------------
 // Lock affordances
@@ -73,15 +119,52 @@ function LockToggle({
 
 /** Compact "enforced by global policy" note for the project Config tab's
  *  read-only rendering of a globally-locked key (no input, no toggle). */
-function LockedReadOnlyNote() {
+function LockedReadOnlyNote({ owner = 'global' }: { owner?: 'customer' | 'global' }) {
+  const text = owner === 'customer' ? 'enforced by customer policy' : 'enforced by global policy';
   return (
     <span
       className="mt-6 inline-flex shrink-0 items-center gap-1 rounded-md border border-border bg-surface px-2 py-1 text-note text-ink-dim"
-      title="Enforced by global policy — cannot be overridden per-project"
+      title={`${text[0].toUpperCase()}${text.slice(1)} — cannot be overridden per-project`}
     >
       <Lock size={11} aria-hidden="true" />
-      enforced by global policy
+      {text}
     </span>
+  );
+}
+
+/** The customer layer's "Lock for projects" switch — a key locked here can't
+ *  be overridden by a project's own `.rupu/config.toml`. */
+function LockForProjects({
+  dottedKey,
+  locked,
+  onToggleLock,
+  disabled,
+  title,
+}: {
+  dottedKey: string;
+  locked: boolean;
+  onToggleLock: (key: string) => void;
+  disabled?: boolean;
+  title?: string;
+}) {
+  const id = `${dottedKey}--lock`;
+  return (
+    <div className="mt-6 flex shrink-0 items-center gap-2">
+      <input
+        id={id}
+        type="checkbox"
+        role="switch"
+        aria-label={`Lock ${dottedKey} for projects`}
+        checked={locked}
+        disabled={disabled}
+        title={title}
+        onChange={() => onToggleLock(dottedKey)}
+        className={toggleInputCls}
+      />
+      <label htmlFor={id} className="text-note text-ink-dim">
+        Lock for projects
+      </label>
+    </div>
   );
 }
 
@@ -150,24 +233,59 @@ export function ConfigField({
 }: ConfigFieldProps) {
   const id = dottedKey;
   const source = provenance?.source ?? 'default';
-  const readOnlyLocked = Boolean(lockedReadOnly) && locked;
+  const layer = useContext(ConfigLayerContext);
+
+  // Customer layer: which layer's lock pins this key decides who may edit it.
+  const globalPinned = layer !== null && Boolean(provenance?.locked) && provenance?.locked_by === 'global';
+  const customerLocked = layer !== null && locked && !globalPinned;
+  // An inherited (global-sourced) value is read-only until overridden — default-
+  // sourced keys are unset, so there is nothing to inherit and they stay editable.
+  const inherited = layer !== null && !globalPinned && source === 'global' && !layer.isStaged(dottedKey);
+  // The lock switch only makes sense next to a value the customer layer owns.
+  const customerOwned =
+    layer !== null && !globalPinned && !inherited && (source === 'customer' || locked || layer.isStaged(dottedKey));
+
+  const readOnlyLocked = globalPinned || (layer === null && Boolean(lockedReadOnly) && locked);
+  const readOnlyValue = readOnlyLocked || inherited;
+  const lockOwner = provenance?.locked_by === 'customer' ? 'customer' : 'global';
 
   return (
     <div className="flex items-start gap-3 py-3 first:pt-0 last:pb-0">
       <div className="min-w-0 flex-1">
         <div className="flex flex-wrap items-center gap-2">
-          <label htmlFor={readOnlyLocked ? undefined : id} className={labelCls}>
+          <label htmlFor={readOnlyValue ? undefined : id} className={labelCls}>
             {label}
           </label>
           <ProvenanceBadge source={source} />
+          {globalPinned && <LockOwnerChip owner="global" />}
+          {customerLocked && <LockOwnerChip owner="customer" />}
         </div>
         {help && <p className="mt-0.5 text-note text-ink-mute">{help}</p>}
+        {globalPinned && (
+          <p className="mt-0.5 text-note text-warn">
+            The global [policy].lock pins this — a customer can&apos;t change it.
+          </p>
+        )}
 
         <div className="mt-1.5">
-          {readOnlyLocked ? (
-            <p id={id} className="text-sm text-ink">
-              {value == null || value === '' ? '—' : String(value)}
-            </p>
+          {readOnlyValue ? (
+            <div className="flex flex-wrap items-center gap-3">
+              <p id={id} className="text-sm text-ink">
+                {value == null || value === '' ? '—' : String(value)}
+              </p>
+              {inherited && layer && (
+                <button
+                  type="button"
+                  aria-label={`Override ${dottedKey} for ${layer.name}`}
+                  onClick={() => layer.onOverride(dottedKey)}
+                  disabled={layer.overrideDisabled}
+                  title={layer.overrideDisabled ? layer.disabledReason : undefined}
+                  className="rounded-md border border-border bg-panel px-2 py-0.5 text-note font-medium text-brand-700 hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  Override for {layer.name}
+                </button>
+              )}
+            </div>
           ) : kind === 'boolean' ? (
             <input
               id={id}
@@ -207,11 +325,24 @@ export function ConfigField({
               className={fieldCls}
             />
           )}
+          {layer?.note?.(dottedKey)}
         </div>
       </div>
 
-      {readOnlyLocked ? (
-        <LockedReadOnlyNote />
+      {globalPinned ? null : readOnlyLocked ? (
+        <LockedReadOnlyNote owner={lockOwner} />
+      ) : layer !== null ? (
+        // A key in the customer's lock list always gets its switch (so it can be
+        // unlocked), whatever layer its value comes from.
+        (customerOwned || customerLocked) && onToggleLock ? (
+          <LockForProjects
+            dottedKey={dottedKey}
+            locked={customerLocked}
+            onToggleLock={onToggleLock}
+            disabled={layer.lockDisabled}
+            title={layer.lockDisabled ? layer.disabledReason : undefined}
+          />
+        ) : null
       ) : onToggleLock ? (
         <LockToggle dottedKey={dottedKey} locked={locked} onToggleLock={onToggleLock} />
       ) : null}

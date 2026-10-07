@@ -35,6 +35,7 @@ fn write_transcript_started_at(
         schema: None,
         system_prompt: None,
         codename: None,
+        customer: None,
     })
     .unwrap();
     w.write(&Event::RunComplete {
@@ -71,6 +72,7 @@ fn write_transcript(
         schema: None,
         system_prompt: None,
         codename: None,
+        customer: None,
     })
     .unwrap();
     w.write(&Event::RunComplete {
@@ -105,6 +107,7 @@ fn write_transcript_with_assistant(
         schema: None,
         system_prompt: None,
         codename: None,
+        customer: None,
     })
     .unwrap();
     w.write(&Event::AssistantMessage {

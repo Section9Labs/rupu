@@ -88,6 +88,7 @@ impl Fixture {
             schema: None,
             system_prompt: None,
             codename: None,
+            customer: None,
         })
         .unwrap();
         w.write(&TranscriptEvent::UserMessage {

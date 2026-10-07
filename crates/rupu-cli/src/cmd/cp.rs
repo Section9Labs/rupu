@@ -100,8 +100,10 @@ pub async fn handle(action: Action) -> ExitCode {
             // rather than one built from a config-less `KeychainResolver::new()`.
             let (cp_runtime_cfg, netflow_cfg, agentiflow_cfg, autoflow_resolver_accounts) = {
                 let global_cfg_path = global_dir.join("config.toml");
-                let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), None)
-                    .unwrap_or_default();
+                let cfg = rupu_config::layer_files_locked(rupu_config::LayerPaths::global_only(
+                    &global_cfg_path,
+                ))
+                .unwrap_or_default();
                 let accounts = crate::accounts::account_specs(&cfg);
                 (cfg.cp, cfg.netflow, cfg.agentiflow, accounts)
             };
@@ -405,7 +407,8 @@ pub async fn handle(action: Action) -> ExitCode {
             // `accounts.rs` yet inert everywhere `cp serve` runs.
             let scm_cfg = {
                 let global_cfg = global_dir.join("config.toml");
-                rupu_config::layer_files_locked(Some(&global_cfg), None).unwrap_or_default()
+                rupu_config::layer_files_locked(rupu_config::LayerPaths::global_only(&global_cfg))
+                    .unwrap_or_default()
             };
             let scm_resolver = Arc::new(crate::accounts::resolver_for(&scm_cfg));
             let scm_registry = Arc::new(
@@ -1966,6 +1969,7 @@ mod tests {
         use rupu_orchestrator::runs::AwaitingGate;
         let now = chrono::Utc::now();
         let mut rec = rupu_orchestrator::RunRecord {
+            customer: None,
             id: id.into(),
             workflow_name: "g".into(),
             status: RunStatus::AwaitingApproval,
@@ -2397,6 +2401,7 @@ mod tests {
         let now = chrono::Utc::now();
         let since = now - chrono::Duration::seconds(120);
         let mut rec = rupu_orchestrator::RunRecord {
+            customer: None,
             id: "run_sweep_multi_gate".into(),
             workflow_name: "g".into(),
             status: RunStatus::AwaitingApproval,
@@ -2520,6 +2525,7 @@ mod tests {
         let now = chrono::Utc::now();
         let since = now - chrono::Duration::seconds(120);
         let mut rec = rupu_orchestrator::RunRecord {
+            customer: None,
             id: "run_sweep_mixed_policy".into(),
             workflow_name: "g".into(),
             status: RunStatus::AwaitingApproval,
@@ -3815,6 +3821,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let rec = rupu_orchestrator::RunRecord {
+            customer: None,
             id: "run_sweep_sole_gate".into(),
             workflow_name: "g".into(),
             status: RunStatus::AwaitingApproval,
@@ -3909,6 +3916,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let rec = rupu_orchestrator::RunRecord {
+            customer: None,
             id: "run_sweep_spawn_fail".into(),
             workflow_name: "g".into(),
             status: RunStatus::AwaitingApproval,
@@ -4232,6 +4240,7 @@ mod tests {
         use rupu_orchestrator::runs::AwaitingGate;
         let now = chrono::Utc::now();
         let mut rec = rupu_orchestrator::RunRecord {
+            customer: None,
             id: id.into(),
             workflow_name: "g".into(),
             status: RunStatus::AwaitingApproval,

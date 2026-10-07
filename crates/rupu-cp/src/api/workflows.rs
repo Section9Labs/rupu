@@ -363,13 +363,20 @@ async fn list_workflows(State(s): State<AppState>) -> ApiResult<Json<Vec<Workflo
     // different repos. See the doc comment on `WorkflowDto::usage`.
     // The usage fold runs on the blocking pool; a failed fold leaves the rows
     // without usage rather than failing the list.
+    // Each run priced at its attributed customer, as its run-list row is.
     let store = std::sync::Arc::clone(&s.run_store);
-    let pricing = s.pricing.clone();
+    let global = s.global_dir.clone();
+    let pricing = std::sync::Arc::clone(&s.customer_pricing);
     let rollups = crate::usage::usage_blocking(
         "workflow rollups",
         move || {
             let runs = store.list().unwrap_or_default();
-            crate::usage::rollup_by(&store, &runs, &pricing, |r| Some(r.workflow_name.clone()))
+            let mut lookup =
+                crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
+            let mut prices = crate::customers::PricingMemo::new(&pricing);
+            crate::usage::rollup_by(&store, &runs, &mut lookup, &mut prices, |r| {
+                Some(r.workflow_name.clone())
+            })
         },
         std::collections::BTreeMap::new,
     )
@@ -425,7 +432,8 @@ async fn load_detail(s: &AppState, name: &str) -> ApiResult<Json<serde_json::Val
         crate::usage::summarize_runs_blocking(
             std::sync::Arc::clone(&s.run_store),
             run_ids,
-            s.pricing.clone(),
+            s.global_dir.clone(),
+            std::sync::Arc::clone(&s.customer_pricing),
         )
         .await
         .into_iter(),
@@ -656,7 +664,7 @@ struct LaunchBody {
 /// silently proceeding without an override under a non-default `$RUPU_HOME`.
 /// Applies here to [`resolve_workflow_scoped_explicit`] instead of the agent
 /// resolver.
-fn resolve_launch_scope(
+pub(crate) fn resolve_launch_scope(
     s: &AppState,
     name: &str,
     scope_kind: Option<&str>,
@@ -2271,6 +2279,7 @@ mod tests {
         workspace_id: &str,
     ) -> rupu_orchestrator::RunRecord {
         rupu_orchestrator::RunRecord {
+            customer: None,
             id: id.into(),
             workflow_name: workflow_name.into(),
             status: rupu_orchestrator::RunStatus::Completed,

@@ -17,6 +17,8 @@ vi.mock('../components/charts/UsageBarChart', () => ({
 }));
 
 import Projects from './Projects';
+import { scopedEntry, withCustomerScope } from '../lib/customerScopeTestUtils';
+import { UNKNOWN_CUSTOMER_TITLE } from '../components/customers/CustomerChip';
 
 const USAGE = {
   input_tokens: 0,
@@ -36,6 +38,7 @@ const ROWS: ProjectRow[] = [
     created_at: '2026-07-01T00:00:00Z',
     usage: USAGE,
     run_count: 4,
+    customer: null,
   },
 ];
 
@@ -47,7 +50,7 @@ afterEach(() => {
 function renderPage() {
   return render(
     <MemoryRouter initialEntries={['/projects']}>
-      <Projects />
+      {withCustomerScope(<Projects />)}
     </MemoryRouter>,
   );
 }
@@ -91,6 +94,33 @@ describe('Projects — table rules', () => {
     expect(subjectCell?.querySelector('[title="my-project"]')).toBeInTheDocument();
   });
 
+  it('the name never wraps and the path truncates with the full path on hover', async () => {
+    const long = '/Users/matt/Code/Oracle/some/very/deep/workspace/directory/my-project';
+    vi.spyOn(api, 'getProjects').mockResolvedValue([{ ...ROWS[0], path: long }]);
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText('my-project')).toBeInTheDocument());
+
+    expect(screen.getByText('my-project').className).toMatch(/whitespace-nowrap/);
+    const path = screen.getByTitle(long);
+    expect(path).toHaveTextContent(long);
+    expect(path.className).toMatch(/truncate/);
+    expect(path.className).toMatch(/max-w-\[12rem\]/);
+    expect(path.className).not.toMatch(/max-w-xs/);
+    // The name cell keeps a floor so long paths can't squeeze it to an ellipsis.
+    expect(screen.getByText('my-project').closest('td')?.className).toMatch(/min-w-\[9rem\]/);
+  });
+
+  it('a long repo remote truncates with the full remote on hover', async () => {
+    const remote = 'https://github.com/some-very-long-org-name/some-very-long-repository-name.git';
+    vi.spyOn(api, 'getProjects').mockResolvedValue([{ ...ROWS[0], repo_remote: remote }]);
+    renderPage();
+
+    const chip = await screen.findByTitle(remote);
+    expect(chip.className).toMatch(/max-w-\[13rem\]/);
+    expect(chip.querySelector('.truncate')).toHaveTextContent(remote);
+  });
+
   it('the Runs column is a fit (nowrap) column', async () => {
     vi.spyOn(api, 'getProjects').mockResolvedValue(ROWS);
     const { container } = renderPage();
@@ -101,5 +131,59 @@ describe('Projects — table rules', () => {
       th.textContent?.includes('Runs'),
     );
     expect(runsHeader?.className).toMatch(/whitespace-nowrap/);
+  });
+});
+
+describe('Projects — customer scope and column', () => {
+  const ROW_BASE = ROWS[0];
+  const MIXED: ProjectRow[] = [
+    {
+      ...ROW_BASE,
+      ws_id: 'ws-a',
+      name: 'acme-api',
+      customer: { slug: 'acme', name: 'Acme', tint: { light: '#2255aa', dark: '#88aaee' }, archived: false },
+      usage: { ...USAGE, cost_usd: 2, pricing_error: 'acme layer broken' },
+    },
+    { ...ROW_BASE, ws_id: 'ws-b', name: 'loose-tool', customer: null },
+    // The CP can't say whose this is: the key is absent.
+    (({ customer: _omit, ...rest }) => ({ ...rest, ws_id: 'ws-c', name: 'mystery' }))(ROW_BASE) as ProjectRow,
+  ];
+
+  it('shows the CUSTOMER column with all three states and marks a mispriced cost', async () => {
+    vi.spyOn(api, 'getProjects').mockResolvedValue(MIXED);
+    renderPage();
+    await screen.findAllByText('acme-api');
+    expect(screen.getAllByRole('columnheader').map((h) => h.textContent)).toContain('Customer');
+    expect(screen.getAllByText('Acme').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('No customer').length).toBeGreaterThan(0);
+    const unknown = screen.getAllByText('Unknown customer');
+    expect(unknown[0]).toHaveAttribute('title', UNKNOWN_CUSTOMER_TITLE);
+    expect(screen.getAllByTitle('acme layer broken').length).toBeGreaterThan(0);
+  });
+
+  it('passes the global scope as customer, and none for Unassigned', async () => {
+    const spy = vi.spyOn(api, 'getProjects').mockResolvedValue([]);
+    render(
+      <MemoryRouter initialEntries={[scopedEntry('acme', '/projects')]}>
+        {withCustomerScope(<Projects />)}
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(spy).toHaveBeenCalledWith({ customer: 'acme' }));
+    expect(await screen.findByText('No project is assigned to this customer yet.')).toBeInTheDocument();
+    cleanup();
+    spy.mockClear();
+    render(
+      <MemoryRouter initialEntries={[scopedEntry('none', '/projects')]}>
+        {withCustomerScope(<Projects />)}
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(spy).toHaveBeenCalledWith({ customer: 'none' }));
+  });
+
+  it('unscoped, it calls getProjects with no argument, as before', async () => {
+    const spy = vi.spyOn(api, 'getProjects').mockResolvedValue(ROWS);
+    renderPage();
+    await waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
+    expect(spy.mock.calls[0]).toEqual([]);
   });
 });

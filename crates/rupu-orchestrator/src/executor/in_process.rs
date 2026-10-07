@@ -255,6 +255,7 @@ impl WorkflowExecutor for InProcessExecutor {
                     records.insert(
                         id.clone(),
                         RunRecord {
+                            customer: None,
                             id: id.clone(),
                             workflow_name: wf_name,
                             status: RunStatus::Running,

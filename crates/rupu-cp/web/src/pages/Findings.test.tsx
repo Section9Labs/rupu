@@ -11,11 +11,12 @@ import { MemoryRouter, useNavigate } from 'react-router-dom';
 import { api, ApiError, type FindingOut, type FindingsResponse, type TagAcrossResult } from '../lib/api';
 
 import Findings from './Findings';
+import { scopedEntry, withCustomerScope } from '../lib/customerScopeTestUtils';
 
 function renderPage(entry = '/findings') {
   return render(
     <MemoryRouter initialEntries={[entry]}>
-      <Findings />
+      {withCustomerScope(<Findings />)}
     </MemoryRouter>,
   );
 }
@@ -186,7 +187,7 @@ describe('Findings — query bar', () => {
     render(
       <MemoryRouter initialEntries={['/security?tab=findings&q=tag%3Aa']}>
         <Go />
-        <Findings />
+        {withCustomerScope(<Findings />)}
       </MemoryRouter>,
     );
     await waitFor(() => expect(screen.getByText(FINDING.summary)).toBeInTheDocument());
@@ -209,7 +210,7 @@ describe('Findings — query bar', () => {
     render(
       <MemoryRouter initialEntries={['/security?tab=findings&q=tag%3Aa']}>
         <Go />
-        <Findings />
+        {withCustomerScope(<Findings />)}
       </MemoryRouter>,
     );
     expect(await screen.findByText('server said no')).toBeInTheDocument();
@@ -235,7 +236,7 @@ describe('Findings — query bar', () => {
     return render(
       <MemoryRouter initialEntries={[`/security?tab=findings&q=${encodeURIComponent(start)}`]}>
         <Nav />
-        <Findings />
+        {withCustomerScope(<Findings />)}
       </MemoryRouter>,
     );
   }
@@ -380,6 +381,37 @@ describe('Findings — export report', () => {
   });
 });
 
+describe('Findings — the global customer scope', () => {
+  it('fetches the scoped customer’s findings', async () => {
+    const spy = vi.spyOn(api, 'getFindings').mockResolvedValue(resp([FINDING]));
+    render(
+      <MemoryRouter initialEntries={[scopedEntry('acme', '/findings')]}>
+        {withCustomerScope(<Findings />)}
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(spy).toHaveBeenCalledWith({ customer: 'acme' }));
+    // Not embedded: the page keeps its own heading under a global scope.
+    expect(screen.getByRole('heading', { name: 'Findings' })).toBeInTheDocument();
+  });
+
+  it('a query under a customer scope sends both', async () => {
+    const spy = vi.spyOn(api, 'getFindings').mockResolvedValue(resp([FINDING]));
+    render(
+      <MemoryRouter initialEntries={['/findings?q=severity%3Ahigh&customer=acme']}>
+        {withCustomerScope(<Findings />)}
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(spy).toHaveBeenCalledWith({ q: 'severity:high', customer: 'acme' }));
+  });
+
+  it('unscoped, it calls getFindings with no argument, as before', async () => {
+    const spy = vi.spyOn(api, 'getFindings').mockResolvedValue(resp([FINDING]));
+    renderPage();
+    await waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
+    expect(spy.mock.calls[0]).toEqual([]);
+  });
+});
+
 describe('Findings — bulk tagging', () => {
   const A: FindingOut = { ...FINDING, id: 'fa', summary: 'Alpha issue' };
   const B: FindingOut = { ...FINDING, id: 'fb', summary: 'Beta issue' };
@@ -496,7 +528,7 @@ describe('Findings — bulk tagging', () => {
     render(
       <MemoryRouter initialEntries={['/findings?q=tag%3Aa']}>
         <Nav />
-        <Findings />
+        {withCustomerScope(<Findings />)}
       </MemoryRouter>,
     );
     await waitFor(() => expect(screen.getByText('Alpha issue')).toBeInTheDocument());
@@ -578,7 +610,7 @@ describe('Findings — bulk tagging', () => {
     render(
       <MemoryRouter initialEntries={['/security?tab=findings&q=tag%3Aa']}>
         <Nav />
-        <Findings />
+        {withCustomerScope(<Findings />)}
       </MemoryRouter>,
     );
     await waitFor(() => expect(screen.getByText('Alpha issue')).toBeInTheDocument());

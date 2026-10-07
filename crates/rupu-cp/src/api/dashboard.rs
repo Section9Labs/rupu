@@ -57,6 +57,46 @@ struct HostFreshness {
     reason: Option<String>,
 }
 
+/// The freshness entry for a host whose summary failed (`Internal` under a
+/// customer filter is handled by the caller — it fails the request).
+///
+/// - `Unsupported` → `unavailable`, "needs a newer rupu";
+/// - `Invalid` → `unavailable` with the host's own reason: it answered but
+///   could not produce the data (its rupu failed — e.g. an unreadable
+///   assignment on the remote), the same 501 "unavailable" `host_list_error`
+///   gives the run lists — never "offline", which reads as a host that is
+///   down;
+/// - anything else → `offline` with the error.
+fn failed_freshness(
+    host_id: String,
+    name: String,
+    transport_kind: String,
+    e: HostConnectorError,
+) -> HostFreshness {
+    let (state, reason) = match e {
+        HostConnectorError::Unsupported(_) => (
+            "unavailable",
+            "host does not report dashboard data (needs a newer rupu)".to_string(),
+        ),
+        HostConnectorError::Invalid(reason) => {
+            tracing::warn!(host_id = %host_id, error = %reason, "dashboard_summary unavailable");
+            ("unavailable", reason)
+        }
+        e => {
+            tracing::warn!(host_id = %host_id, error = %e, "dashboard_summary failed");
+            ("offline", e.to_string())
+        }
+    };
+    HostFreshness {
+        host_id,
+        name,
+        transport_kind,
+        state,
+        captured_at: None,
+        reason: Some(reason),
+    }
+}
+
 /// The dashboard payload: one aggregate summary plus per-host reporting state.
 ///
 /// `summary` is `#[serde(flatten)]`ed, so the wire form carries `DashboardSummary`'s
@@ -94,12 +134,28 @@ struct DashboardResponse {
 struct DashboardQuery {
     range: Option<String>,
     host: Option<String>,
+    /// `?customer=<slug>|none` — see `get_dashboard`.
+    customer: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
 // Handler
 // ---------------------------------------------------------------------------
 
+/// `GET /api/dashboard[?range=][&host=<id>][&customer=<slug>|none]`.
+///
+/// `?customer=` narrows the LOCAL host's contribution to that customer's work
+/// (`none` = no customer): runs by attribution (recorded, else the
+/// workspace's current assignment), `findings_open` by the customer's
+/// projects (current assignment), autoflow cycles by the projects of the
+/// repos they touched (a cycle no project resolves for is left out). The
+/// `fleet` counts are not run-scoped and stay unfiltered. A remote host's
+/// summary arrives already summed and cannot be filtered (plan ruling 5):
+/// `?host=<remote>` with `customer` is a 501, and the fan-out reports each
+/// remote host `unavailable` (never counted). Under a filter, an assignment
+/// the local host cannot read fails the request (500) — unlike
+/// `/api/usage`, which keeps its per-host contract and marks the local host
+/// `offline` with that reason. A bad slug is a 400.
 async fn get_dashboard(
     State(s): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<DashboardQuery>,
@@ -110,6 +166,7 @@ async fn get_dashboard(
             ApiError::bad_request(format!("unknown range {r:?}; expected 7d | 30d | all"))
         })?,
     };
+    let customer = crate::customers::CustomerFilter::parse(q.customer.as_deref())?;
 
     // Which hosts to ask: one named host, or every registered host.
     // `HostRegistry` has no per-id lookup (`list_hosts()` is the only
@@ -123,6 +180,9 @@ async fn get_dashboard(
                 .into_iter()
                 .find(|h| h.id == id)
                 .ok_or_else(|| ApiError::not_found(format!("unknown host {id}")))?;
+            if customer.is_some() && found.id != "local" {
+                return Err(crate::customers::remote_aggregate_unsupported(id));
+            }
             vec![found]
         }
         None => s.hosts.list_hosts(),
@@ -133,12 +193,28 @@ async fn get_dashboard(
         let host_id = h.id.clone();
         let name = h.name.clone();
         let (transport_kind, _base_url) = transport_fields(&h.transport);
+        let customer = customer.clone();
         async move {
+            if customer.is_some() && host_id != "local" {
+                // A remote summary arrives summed: it can't be filtered by
+                // customer here (ruling 5). Say so; never count it.
+                return Ok((
+                    HostFreshness {
+                        reason: Some(crate::customers::remote_aggregate_reason(&host_id)),
+                        host_id,
+                        name,
+                        transport_kind,
+                        state: "unavailable",
+                        captured_at: None,
+                    },
+                    None,
+                ));
+            }
             let conn = match registry.resolve(&host_id) {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(host_id = %host_id, error = %e, "dashboard: could not resolve host connector");
-                    return (
+                    return Ok((
                         HostFreshness {
                             host_id,
                             name,
@@ -148,10 +224,14 @@ async fn get_dashboard(
                             reason: Some(e.to_string()),
                         },
                         None,
-                    );
+                    ));
                 }
             };
-            match conn.dashboard_summary(range).await {
+            let summary = match &customer {
+                None => conn.dashboard_summary(range).await,
+                Some(f) => conn.dashboard_summary_for_customer(range, f).await,
+            };
+            Ok(match summary {
                 Ok(sum) => {
                     (
                         HostFreshness {
@@ -165,38 +245,23 @@ async fn get_dashboard(
                         Some(sum),
                     )
                 }
-                Err(HostConnectorError::Unsupported(_)) => (
-                    HostFreshness {
-                        host_id,
-                        name,
-                        transport_kind,
-                        state: "unavailable",
-                        captured_at: None,
-                        reason: Some(
-                            "host does not report dashboard data (needs a newer rupu)".into(),
-                        ),
-                    },
+                // The local host could not read a customer assignment: fail
+                // the request rather than count its work as no customer's.
+                Err(HostConnectorError::Internal(e)) if customer.is_some() => {
+                    return Err(ApiError::internal(e));
+                }
+                Err(e) => (
+                    failed_freshness(host_id, name, transport_kind, e),
                     None,
                 ),
-                Err(e) => {
-                    tracing::warn!(host_id = %host_id, error = %e, "dashboard_summary failed");
-                    (
-                        HostFreshness {
-                            host_id,
-                            name,
-                            transport_kind,
-                            state: "offline",
-                            captured_at: None,
-                            reason: Some(e.to_string()),
-                        },
-                        None,
-                    )
-                }
-            }
+            })
         }
     });
 
-    let results = futures_util::future::join_all(futs).await;
+    let results = futures_util::future::join_all(futs)
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, ApiError>>()?;
 
     // Split into per-host freshness (always kept) and the summaries that
     // actually reported (fed to the pure merge below). A non-reporting host
@@ -264,7 +329,13 @@ fn merge_dashboard_summaries(
     // falls back to `now` when no host reported at all.
     let mut oldest_captured_at: Option<DateTime<Utc>> = None;
 
+    let mut hosts_without_customer: Vec<String> = Vec::new();
     for sum in reported {
+        for h in &sum.hosts_without_customer {
+            if !hosts_without_customer.contains(h) {
+                hosts_without_customer.push(h.clone());
+            }
+        }
         oldest_captured_at = Some(match oldest_captured_at {
             Some(oldest) => oldest.min(sum.captured_at),
             None => sum.captured_at,
@@ -408,6 +479,7 @@ fn merge_dashboard_summaries(
             findings_open,
             fleet,
             captured_at: oldest_captured_at.unwrap_or(now),
+            hosts_without_customer,
         },
         findings_partial,
         cycles_partial,
@@ -449,6 +521,7 @@ mod merge_tests {
             findings_open: None,
             fleet: FleetCounts::default(),
             captured_at,
+            hosts_without_customer: Vec::new(),
         }
     }
 
@@ -828,5 +901,24 @@ mod merge_tests {
             !cycles_partial,
             "same rule for cycles_partial — nothing to be partial about with zero reporting hosts"
         );
+    }
+
+    /// A host that answered but failed (`Invalid`) is "unavailable" with its
+    /// reason — like the run lists' 501 — never "offline"; only a host that
+    /// can't be reached is "offline".
+    #[test]
+    fn a_failed_summary_is_unavailable_unless_the_host_is_down() {
+        let f = |e| failed_freshness("h".into(), "H".into(), "ssh".into(), e);
+        let invalid = f(HostConnectorError::Invalid(
+            "the customer assignment of workspace ws_1 cannot be read".into(),
+        ));
+        assert_eq!(invalid.state, "unavailable");
+        assert!(invalid.reason.as_deref().unwrap().contains("ws_1"));
+        let old = f(HostConnectorError::Unsupported("run list".into()));
+        assert_eq!(old.state, "unavailable");
+        assert!(old.reason.as_deref().unwrap().contains("newer rupu"));
+        let down = f(HostConnectorError::Unreachable("connection refused".into()));
+        assert_eq!(down.state, "offline");
+        assert!(down.captured_at.is_none());
     }
 }

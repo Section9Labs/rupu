@@ -73,6 +73,12 @@ pub struct FindingOut {
     /// crew derived from `declared_by.run_id` for a legacy finding.
     pub codename: String,
     pub codename_derived: bool,
+    /// The customer the finding's project is CURRENTLY assigned to (findings
+    /// record none; plan ruling 6). Always serialized (`null` = no customer)
+    /// so a coordinator can tell "no customer" from a peer too old to say.
+    /// Set by the list and detail handlers; `None` from
+    /// [`collect_all_findings`].
+    pub customer: Option<String>,
     #[serde(flatten)]
     pub record: FindingRecord,
 }
@@ -181,6 +187,9 @@ pub struct FindingsQuery {
     pub workflow: Option<String>,
     /// Keep only findings whose `declared_by.run_id` matches.
     pub run_id: Option<String>,
+    /// `?customer=<slug>|none` — keep only findings whose project is
+    /// currently assigned to that customer (`none` = to no customer).
+    pub customer: Option<String>,
     /// A findings query (`severity>=high tag:needs-poc ...`), applied after
     /// the `ws_id` / `workflow` / `run_id` scope. A bad one is a 400.
     pub q: Option<String>,
@@ -325,11 +334,20 @@ fn project_name(path: &str) -> String {
 /// pushed to `tags_unavailable` (id + project name).
 fn each_ledger(
     global_dir: &std::path::Path,
-    mut f: impl FnMut(&rupu_workspace::Workspace, &str, CoveragePaths, Vec<FindingRecord>),
+    f: impl FnMut(&rupu_workspace::Workspace, &str, CoveragePaths, Vec<FindingRecord>),
     tags_unavailable: &mut Vec<TagsUnavailable>,
 ) {
     let workspaces = store_for(global_dir).list().unwrap_or_default();
-    for w in &workspaces {
+    each_ledger_in(&workspaces, f, tags_unavailable);
+}
+
+/// [`each_ledger`] over the given workspaces only.
+fn each_ledger_in(
+    workspaces: &[rupu_workspace::Workspace],
+    mut f: impl FnMut(&rupu_workspace::Workspace, &str, CoveragePaths, Vec<FindingRecord>),
+    tags_unavailable: &mut Vec<TagsUnavailable>,
+) {
+    for w in workspaces {
         let wp = std::path::Path::new(&w.path);
         let targets = match discover_targets(wp) {
             Ok(t) => t,
@@ -372,6 +390,26 @@ fn each_ledger(
             f(w, &t.target_id, paths, records);
         }
     }
+}
+
+/// Finding counts per workspace id, over `workspaces` only — the same walk
+/// (and the same tolerance) as [`collect_all_findings`], without building
+/// the per-finding DTOs. Every finding counts as open, exactly as
+/// `count_open_findings` (`host/local.rs`) counts them.
+pub(crate) fn count_findings_by_workspace(
+    workspaces: &[rupu_workspace::Workspace],
+) -> HashMap<String, u64> {
+    let mut out: HashMap<String, u64> = HashMap::new();
+    // Tags don't change a count, so an unreadable tag log is irrelevant here.
+    let mut tags_unavailable = Vec::new();
+    each_ledger_in(
+        workspaces,
+        |w, _, _, records| {
+            *out.entry(w.id.clone()).or_default() += records.len() as u64;
+        },
+        &mut tags_unavailable,
+    );
+    out
 }
 
 /// Collect every finding across every registered workspace's coverage
@@ -429,6 +467,7 @@ pub fn collect_all_findings_reporting(
                     workflow_name: None,
                     permalink,
                     report_summary: None,
+                    customer: None,
                     record,
                 });
             }
@@ -687,6 +726,11 @@ fn select_findings(
 /// Tolerant by design: a workspace whose path is gone, or a target whose
 /// `findings.jsonl` is absent/unreadable, is skipped with a `warn!` rather than
 /// failing the whole request. A missing registry yields an empty response.
+///
+/// Each row carries `customer`: its project's CURRENT assignment (findings
+/// record no customer; plan ruling 6). `?customer=<slug>|none` keeps the
+/// findings of that customer's projects (the summary counts only those); a
+/// bad slug is a 400, and an assignment that cannot be read fails the request.
 async fn list_findings(
     State(s): State<AppState>,
     Query(q): Query<FindingsQuery>,
@@ -706,6 +750,18 @@ async fn list_findings(
             .into_response()
     })?;
     let (mut out, tags_unavailable) = collect_all_findings_reporting(&s.global_dir);
+    let filter = crate::customers::CustomerFilter::parse(q.customer.as_deref())
+        .map_err(IntoResponse::into_response)?;
+    let mut lookup =
+        crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&s.global_dir));
+    for f in &mut out {
+        f.customer = lookup
+            .assigned(&f.ws_id)
+            .map_err(IntoResponse::into_response)?;
+    }
+    if let Some(filter) = &filter {
+        out.retain(|f| filter.matches(f.customer.as_deref()));
+    }
 
     // Join `declared_by.run_id → workflow_name` once, for both the
     // `workflow` scope and `q`'s `workflow:` key. A run the store can't load
@@ -828,6 +884,9 @@ async fn get_finding(
         .map_err(|e| ApiError::internal(e.to_string()))?;
     let mut finding =
         found.ok_or_else(|| ApiError::not_found(format!("finding {id} not found")))?;
+    finding.customer =
+        crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&s.global_dir))
+            .assigned(&finding.ws_id)?;
     if let Ok(run) = s.run_store.load(&finding.record.declared_by.run_id) {
         finding.workflow_name = Some(run.workflow_name);
     }
@@ -2045,6 +2104,7 @@ mod tests {
             workflow_name: workflow_name.map(|s| s.to_string()),
             permalink: None,
             report_summary: None,
+            customer: None,
             record: FindingRecord {
                 id: id.to_string(),
                 file_path: Some("src/a.rs".to_string()),
@@ -4244,6 +4304,7 @@ mod tests {
     fn run_record(id: &str, workflow: &str) -> rupu_orchestrator::runs::RunRecord {
         use rupu_orchestrator::runs::{RunRecord, RunStatus};
         RunRecord {
+            customer: None,
             id: id.into(),
             workflow_name: workflow.into(),
             codename: None,

@@ -28,6 +28,7 @@ mod placed_step_e2e;
 mod remote_coverage_ingest;
 mod recovery;
 mod remote_findings_profile;
+mod run_customer;
 mod run_step_workflow;
 mod runner_events;
 mod templates;

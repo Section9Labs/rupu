@@ -31,7 +31,7 @@ use serde::Serialize;
 use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[derive(Subcommand, Debug)]
@@ -212,6 +212,14 @@ struct TranscriptListRow {
     status: String,
     total_tokens: u64,
     started_at: String,
+    /// The customer the run is attributed to — `customer` (the one its
+    /// `run_start` recorded, else its workspace's current assignment) and
+    /// `customer_derived` — serialized whenever known (`customer: null` = no
+    /// customer), so a coordinator listing this host over SSH can tell "no
+    /// customer" from an older rupu. `None` (an assignment that could not be
+    /// read) omits both keys.
+    #[serde(flatten)]
+    customer: Option<rupu_cp::customers::RowCustomer>,
 }
 
 #[derive(Serialize)]
@@ -1788,6 +1796,7 @@ async fn list(
         status: RunStatus,
         total_tokens: u64,
         started_at: chrono::DateTime<chrono::Utc>,
+        customer: Option<rupu_cp::customers::Attribution>,
     }
 
     // Pass 1 — sort keys only.
@@ -1811,10 +1820,10 @@ async fn list(
     // transcripts and netflow ledgers under the same `run_<ulid>.jsonl`
     // naming; those are skipped quietly here, and only a genuine read
     // failure (permissions, a bad mount) is worth an operator's attention.
-    let mut heads: Vec<(TranscriptScope, &PathBuf, chrono::DateTime<chrono::Utc>)> = Vec::new();
+    let mut heads: Vec<(TranscriptScope, &PathBuf, rupu_transcript::RunHead)> = Vec::new();
     for (scope, path) in &paths_to_scan {
         match JsonlReader::head(path) {
-            Ok(head) => heads.push((*scope, path, head.started_at)),
+            Ok(head) => heads.push((*scope, path, head)),
             Err(rupu_transcript::ReadError::NotAnAgentTranscript { first_tag }) => {
                 tracing::debug!(
                     path = %path.display(),
@@ -1830,14 +1839,42 @@ async fn list(
     let total_matched = heads.len();
 
     // Sort newest first, then keep only what will actually be rendered.
-    heads.sort_by_key(|(_, _, started_at)| Reverse(*started_at));
+    heads.sort_by_key(|(_, _, head)| Reverse(head.started_at));
     heads.truncate(limit);
+
+    // Each row's customer: recorded on `run_start` (a slug or `null`); for a
+    // transcript that predates customers, a session turn's session customer
+    // (derived), else its workspace's current assignment (derived). A
+    // workspace whose assignment cannot be read does not fail the listing:
+    // its rows omit the customer keys (one warning per workspace on
+    // stderr), never claiming "no customer".
+    let mut customers =
+        rupu_cp::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
+    let mut session_customers: std::collections::HashMap<
+        String,
+        Option<rupu_transcript::RecordedField>,
+    > = std::collections::HashMap::new();
 
     // Pass 2 — full summaries, for the surviving rows only.
     let mut rows: Vec<Row> = Vec::new();
-    for (scope, path, _) in &heads {
+    for (scope, path, head) in &heads {
+        let (field, inherited) = match &head.customer {
+            Some(_) => (head.customer.clone(), false),
+            // Legacy: only now (and only for the rows shown) look up whether
+            // it is a session turn, via its meta sidecar.
+            None => match legacy_turn_session_customer(&global, path, &mut session_customers) {
+                Some(session) => {
+                    rupu_cp::customers::session_turn_customer(&head.customer, &session)
+                }
+                None => (None, false),
+            },
+        };
+        let customer = customers
+            .attribute_for_listing(rupu_transcript::Recorded::of(&field), &head.workspace_id)
+            .map(|who| who.inherited(inherited));
         match JsonlReader::summary(path) {
             Ok(s) => rows.push(Row {
+                customer,
                 run_id: s.run_id,
                 codename: s.codename,
                 scope: *scope,
@@ -1871,12 +1908,8 @@ async fn list(
 
     // Resolve UI prefs the same way other list commands do — config +
     // env + flag — so the table honors NO_COLOR / `[ui].color = "never"`.
-    let cfg = {
-        let global_cfg = global.join("config.toml");
-        let project_cfg = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
-        // UI prefs only — lock does not apply (I-7)
-        rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref()).unwrap_or_default()
-    };
+    // UI prefs only — lock does not apply (I-7)
+    let cfg = paths::load_config_for_display(&global, project_root.as_deref(), &pwd, false);
     let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None, None)
         .with_table_flags(absolute, all_columns);
     let report_rows: Vec<TranscriptListRow> = rows
@@ -1898,6 +1931,7 @@ async fn list(
             },
             total_tokens: row.total_tokens,
             started_at: row.started_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+            customer: row.customer.clone().map(Into::into),
         })
         .collect();
     let csv_rows: Vec<TranscriptListCsvRow> = report_rows
@@ -1944,6 +1978,28 @@ async fn list(
     Ok(())
 }
 
+/// The session customer a transcript inherits when it is a session turn
+/// whose `run_start` predates customers: its meta sidecar names the session,
+/// whose record holds the customer (memoized per session). `None` when the
+/// transcript is not a session turn or the session can't be read.
+fn legacy_turn_session_customer(
+    global: &Path,
+    transcript: &Path,
+    cache: &mut std::collections::HashMap<String, Option<rupu_transcript::RecordedField>>,
+) -> Option<rupu_transcript::RecordedField> {
+    let dir = transcript.parent()?;
+    let stem = transcript.file_stem()?.to_str()?;
+    let meta = crate::standalone_run_metadata::read_metadata(
+        &crate::standalone_run_metadata::metadata_path_for_run(dir, stem),
+    )
+    .ok()?;
+    let session_id = meta.session_id?;
+    cache
+        .entry(session_id.clone())
+        .or_insert_with(|| crate::cmd::session::recorded_session_customer(global, &session_id))
+        .clone()
+}
+
 async fn show(
     run_id: &str,
     view: Option<LiveViewMode>,
@@ -1958,13 +2014,7 @@ async fn show(
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
     // UI prefs only — lock does not apply (I-7)
-    let cfg = rupu_config::layer_files(
-        Some(&global.join("config.toml")),
-        project_root
-            .as_deref()
-            .map(|root| root.join(".rupu/config.toml"))
-            .as_deref(),
-    )?;
+    let cfg = paths::load_config_for_display(&global, project_root.as_deref(), &pwd, false);
     let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, pager_flag, view);
     let mut events = Vec::new();
     let mut raw_events = Vec::new();
@@ -2106,11 +2156,8 @@ fn prune_ui_prefs() -> anyhow::Result<crate::cmd::ui::UiPrefs> {
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
-    let global_cfg = global.join("config.toml");
-    let project_cfg = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
     // UI prefs only — lock does not apply (I-7)
-    let cfg =
-        rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref()).unwrap_or_default();
+    let cfg = paths::load_config_for_display(&global, project_root.as_deref(), &pwd, false);
     Ok(crate::cmd::ui::UiPrefs::resolve(
         &cfg.ui, false, None, None, None,
     ))
@@ -2553,7 +2600,7 @@ fn prune_cutoff(
         value.to_string()
     } else {
         let path = global.join("config.toml");
-        let cfg = rupu_config::layer_files_locked(Some(&path), None)?;
+        let cfg = rupu_config::layer_files_locked(rupu_config::LayerPaths::global_only(&path))?;
         cfg.storage
             .archived_transcript_retention
             .unwrap_or_else(|| "30d".to_string())
@@ -2635,6 +2682,7 @@ mod tests {
                 schema: None,
                 system_prompt: None,
                 codename: Some(codename.into()),
+                customer: None,
             };
             std::fs::write(&tp, format!("{}\n", serde_json::to_string(&start).unwrap())).unwrap();
             tp
@@ -2955,7 +3003,38 @@ mod tests {
             status: status.to_string(),
             total_tokens: 1_200,
             started_at: started_at.to_string(),
+            customer: Some(rupu_cp::customers::RowCustomer::default()),
         }
+    }
+
+    /// `--format json` rows always carry `customer` (`null` = none) and
+    /// `customer_derived` — what an SSH coordinator filters by.
+    #[test]
+    fn transcript_list_json_rows_carry_the_customer_keys() {
+        let mut row = transcript_row_for_test(
+            "run_1",
+            "active",
+            None,
+            "reviewer",
+            "completed",
+            "2026-07-30 13:00:00",
+        );
+        let v = serde_json::to_value(&row).unwrap();
+        assert!(v.as_object().unwrap().contains_key("customer"));
+        assert!(v["customer"].is_null());
+        assert_eq!(v["customer_derived"], false);
+        row.customer = Some(rupu_cp::customers::RowCustomer {
+            customer: Some("acme".into()),
+            customer_derived: true,
+        });
+        let v = serde_json::to_value(&row).unwrap();
+        assert_eq!(v["customer"], "acme");
+        assert_eq!(v["customer_derived"], true);
+        // Unattributable (its assignment could not be read): no keys at all.
+        row.customer = None;
+        let v = serde_json::to_value(&row).unwrap();
+        assert!(!v.as_object().unwrap().contains_key("customer"));
+        assert!(!v.as_object().unwrap().contains_key("customer_derived"));
     }
 
     #[test]

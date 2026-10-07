@@ -130,6 +130,11 @@ pub enum Cmd {
         #[command(subcommand)]
         action: cmd::config::Action,
     },
+    /// Customers: group projects under a customer with its own config layer.
+    Customer {
+        #[command(subcommand)]
+        action: cmd::customer::Action,
+    },
     /// Manage UI themes and palette imports.
     Ui {
         #[command(subcommand)]
@@ -260,12 +265,17 @@ pub enum Cmd {
 /// (the dashboard), so BOTH must be listed — a `resume` left on stderr was
 /// the "bars hopping" corruption. `workflow approve` / `reject` only drive
 /// the headless `crate::resume` primitives (line printers), so they stay on
-/// stderr. The exhaustive unit test below pins this set.
+/// stderr. The exhaustive unit test below pins this set. `run list` and
+/// `run show` are headless queries (JSON / tables on stdout, warnings on
+/// stderr — e.g. a customer assignment `run list` could not read), so they
+/// stay on stderr too.
 fn owns_live_terminal(cmd: &Cmd) -> bool {
+    if let Cmd::Run { argv } = cmd {
+        return !matches!(argv.first().map(String::as_str), Some("list" | "show"));
+    }
     matches!(
         cmd,
-        Cmd::Run { .. }
-            | Cmd::Watch(_)
+        Cmd::Watch(_)
             | Cmd::Session {
                 action: cmd::session::Action::Start(_)
                     | cmd::session::Action::Send(_)
@@ -431,6 +441,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
             cmd::transcript::handle(action, cli.format, cli.absolute, cli.all_columns).await
         }
         Cmd::Config { action } => cmd::config::handle(action).await,
+        Cmd::Customer { action } => cmd::customer::handle(action, cli.format).await,
         Cmd::Ui { action } => cmd::ui::handle(action, cli.format).await,
         Cmd::Cleanup(args) => cmd::cleanup::handle(args, cli.format).await,
         Cmd::Auth { action } => cmd::auth::handle(action, cli.format).await,
@@ -499,6 +510,7 @@ fn ensure_output_format_supported(
             format,
             &[output::formats::OutputFormat::Table],
         ),
+        Cmd::Customer { action } => cmd::customer::ensure_output_format(action, format),
         Cmd::Ui { action } => cmd::ui::ensure_output_format(action, format),
         Cmd::Cleanup(_) => cmd::cleanup::ensure_output_format(format),
         Cmd::Auth { action } => cmd::auth::ensure_output_format(action, format),
@@ -641,6 +653,11 @@ mod arg_parse_tests {
             "workflow reject is headless"
         );
         assert!(!owns(&["rupu", "workflow", "list"]), "workflow list");
+        assert!(
+            !owns(&["rupu", "run", "list"]),
+            "run list is a headless query"
+        );
+        assert!(!owns(&["rupu", "run", "show", "run_01ABC"]), "run show");
     }
 
     #[test]

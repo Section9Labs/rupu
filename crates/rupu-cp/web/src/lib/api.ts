@@ -66,7 +66,9 @@ export function apiErrorMessage(e: unknown): string {
 // Core fetch wrapper
 // ---------------------------------------------------------------------------
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+/** The typed-fetch core: the parsed JSON body plus the response headers
+ *  (absent on a test double that gives none). */
+async function fetchJson<T>(path: string, init?: RequestInit): Promise<{ body: T; headers: Headers | undefined }> {
   const res = await fetch(path, {
     credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json' },
@@ -76,10 +78,47 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     const text = await res.text().catch(() => res.statusText);
     throw new ApiError(res.status, text || res.statusText, text);
   }
-  if (res.status === 204) return undefined as T;
+  if (res.status === 204) return { body: undefined as T, headers: res.headers };
   const text = await res.text();
-  if (!text) return undefined as T;
-  return JSON.parse(text) as T;
+  return { body: text ? (JSON.parse(text) as T) : (undefined as T), headers: res.headers };
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  return (await fetchJson<T>(path, init)).body;
+}
+
+/** The response header a customer-filtered fan-out (and a local listing that
+ *  holds mirrored legacy runs) sets, naming — comma-separated host ids — the
+ *  hosts it left out because it can't say whose some of their runs are
+ *  (docs/cp-customers-api.md, "Remote hosts"). */
+export const HOSTS_WITHOUT_CUSTOMER_HEADER = 'X-Rupu-Hosts-Without-Customer';
+
+/** Parse the `X-Rupu-Hosts-Without-Customer` value: comma-separated host ids,
+ *  blanks dropped; `[]` when the header is absent. */
+export function parseHostsWithoutCustomer(value: string | null | undefined): string[] {
+  if (!value) return [];
+  return value
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/** A sink for the hosts a scoped request's `X-Rupu-Hosts-Without-Customer`
+ *  header names (`[]` when it names none). */
+export type HostsWithoutCustomerSink = (hostIds: string[]) => void;
+
+/** `request<T>`, also handing the `X-Rupu-Hosts-Without-Customer` header to
+ *  `onHosts` when the caller asked for it (the scoped list methods). A failed
+ *  request reports nothing. */
+async function requestMaybeReportingHosts<T>(
+  path: string,
+  init: RequestInit | undefined,
+  onHosts: HostsWithoutCustomerSink | undefined,
+): Promise<T> {
+  if (!onHosts) return request<T>(path, init);
+  const { body, headers } = await fetchJson<T>(path, init);
+  onHosts(parseHostsWithoutCustomer(headers?.get(HOSTS_WITHOUT_CUSTOMER_HEADER)));
+  return body;
 }
 
 /** The bytes of a finding-report export response. A non-2xx throws an
@@ -133,6 +172,13 @@ export interface RunRecord {
   workspace_id?: string;
   workspace_path?: string;
   transcript_dir?: string;
+  /** The customer the run is attributed to (as list rows report it): the one
+   *  it recorded, else (`customer_derived: true`) its project's CURRENT
+   *  assignment; `null` = no customer. ABSENT when it can't be known (an
+   *  unreadable assignment, a peer too old to report it) — never read absence
+   *  as "no customer". */
+  customer?: string | null;
+  customer_derived?: boolean;
   error_message?: string | null;
   /**
    * The FULL set of currently-parked gates (Task 5b-2b, spec §7). Absent or
@@ -450,6 +496,12 @@ export interface RunListRow {
   turns: number;
   duration_ms?: number | null;
   usage: UsageSummary;
+  /** The customer the run is attributed to: the one it recorded, else
+   *  (`customer_derived: true`) its project's CURRENT assignment; `null` = no
+   *  customer. Absent ONLY on rows from a peer too old to report customers —
+   *  never read absence as "no customer". */
+  customer?: string | null;
+  customer_derived?: boolean;
   /** Originating host id — `"local"` for runs on this CP; a remote host id
    *  for proxied runs. Absent on older server versions (treat as `"local"`). */
   host_id?: string;
@@ -712,6 +764,12 @@ export interface AgentRunRow {
   turns: number;
   duration_ms?: number | null;
   usage: UsageSummary;
+  /** The customer the run is attributed to: the one it recorded, else
+   *  (`customer_derived: true`) its project's CURRENT assignment; `null` = no
+   *  customer. Absent ONLY on rows from a peer too old to report customers —
+   *  never read absence as "no customer". */
+  customer?: string | null;
+  customer_derived?: boolean;
   /** Originating host id — `"local"` for local runs; a remote host id for
    *  proxied runs. Absent on older server versions (treat as `"local"`). */
   host_id?: string;
@@ -854,6 +912,9 @@ export interface FleetCounts {
  * arrays. Mirrors `DashboardSummary` in `rupu-cp/src/host/dashboard_summary.rs`.
  */
 export interface DashboardSummary {
+  /** Under a customer filter: hosts some of whose (legacy, mirrored) runs were
+   *  left out because their customer can't be known. Absent when empty. */
+  hosts_without_customer?: string[];
   active: ActiveCounts;
   /** The single longest-running run, or absent when nothing is running.
    *  The server omits this key entirely when `None` (`skip_serializing_if`),
@@ -933,6 +994,9 @@ export interface UsageResponse extends UsageOverview {
  * out across hosts the way `/api/usage` does.
  */
 export interface OutlierRun {
+  /** Set when this run was priced at the global rates (its customer's layer
+   *  does not resolve, or its customer is unknown) — its ratio may be wrong. */
+  pricing_error?: string;
   run_id: string;
   /** What produced the run: an orchestrator `workflow` run, a standalone
    *  `agent` run, or a `session` turn. Absent on servers that predate
@@ -1287,6 +1351,12 @@ export interface SessionSummary {
   total_tokens_cached?: number;
   usage?: UsageSummary;
   last_error?: string | null;
+  /** The customer the session is attributed to: the one it recorded, else
+   *  (`customer_derived: true`) its project's CURRENT assignment; `null` = no
+   *  customer. Absent ONLY on rows from a peer too old to report customers —
+   *  never read absence as "no customer". */
+  customer?: string | null;
+  customer_derived?: boolean;
   /** Originating host id — `"local"` for local sessions; a remote host id for
    *  proxied sessions. Absent on older server versions (treat as `"local"`). */
   host_id?: string;
@@ -1502,6 +1572,9 @@ export interface FindingOut extends FindingRecord {
   project: string;
   target_id: string;
   workflow_name?: string | null;
+  /** The customer the finding's project is CURRENTLY assigned to (findings
+   *  record none); `null` = no customer. */
+  customer?: string | null;
 }
 
 /** Finding detail with evidence status — response from `GET /api/findings/:id`. */
@@ -1741,13 +1814,15 @@ export interface RunDiff {
 // ---------------------------------------------------------------------------
 
 /** Provenance source for one resolved config key — mirrors `rupu_config::KeySource`. */
-export type KeySource = 'global' | 'project' | 'default';
+export type KeySource = 'global' | 'customer' | 'project' | 'default';
 
 /** Mirrors `rupu_config::KeyProvenance` — where a resolved key's value came
  *  from, and whether it is enforced by the global `[policy].lock` list. */
 export interface KeyProvenance {
   source: KeySource;
   locked: boolean;
+  /** Which layer's `[policy].lock` names this key (absent when unlocked). */
+  locked_by?: 'global' | 'customer';
 }
 
 /** Runtime status block on `GET /api/config` — no secret VALUE is ever
@@ -1771,6 +1846,21 @@ export interface ConfigView {
   provenance: Record<string, KeyProvenance>;
   raw_global: string;
   raw_project: string | null;
+  /** The customer layer's raw TOML (`?customer=`, or the project's customer);
+   *  `null` when there is no customer or its layer has no file yet. */
+  raw_customer?: string | null;
+  /** The customer in play: the `?customer=` one, or the project's. */
+  customer?: CustomerRef | null;
+  /** The customer layer's `[policy].lock`, as written. */
+  customer_lock?: string[];
+  /** Set when a layer is malformed. The raw text is still served so the
+   *  editor can fix it, and `effective` comes from the layers that still
+   *  resolve — `layer_error_kept` says which. */
+  layer_error?: string | null;
+  /** With `layer_error`: `global_customer` when only the project layer is
+   *  broken and its customer's layer still resolves; `global` otherwise (a
+   *  broken customer layer drops the project layer too). */
+  layer_error_kept?: 'global' | 'global_customer';
   cp: Record<string, unknown>;
   status: ConfigRuntimeStatus;
 }
@@ -1867,6 +1957,167 @@ export interface RefreshOutcome {
 }
 
 // ---------------------------------------------------------------------------
+// Customers
+// ---------------------------------------------------------------------------
+
+/** A customer's tint: its explicit color, else derived from the slug. */
+export interface TintDto {
+  light: string;
+  dark: string;
+}
+
+/** What a row shows about its customer. */
+export interface CustomerRef {
+  slug: string;
+  name: string;
+  tint: TintDto;
+  archived: boolean;
+}
+
+/** `GET /api/customers/:slug` → `customer`, and the body of the writes. */
+export interface CustomerDto {
+  slug: string;
+  name: string;
+  notes: string | null;
+  contact: string | null;
+  /** The explicit color, when one was set (else `tint` is derived). */
+  color: string | null;
+  tint: TintDto;
+  archived: boolean;
+  created_at: string;
+}
+
+export interface CustomerRollup {
+  projects: number;
+  run_count: number;
+  usage: UsageSummary;
+  findings_open: number;
+  last_active: string | null;
+  /** Hosts whose (legacy, mirrored) runs were left out because their customer
+   *  can't be known. Absent when empty. */
+  hosts_without_customer?: string[];
+}
+
+/** The provider account a customer's runs default to. */
+export interface DefaultAccount {
+  account: string;
+  locked_by: 'global' | 'customer' | null;
+  /** True when the value is the global one. */
+  inherited: boolean;
+}
+
+/** A row of `GET /api/customers`. */
+export interface CustomerRow extends CustomerDto {
+  rollup: CustomerRollup;
+  default_account: DefaultAccount | null;
+  /** Set when the customer's config layer does not resolve. */
+  layer_error?: string | null;
+}
+
+/** `GET /api/customers/:slug`. */
+export interface CustomerDetail {
+  customer: CustomerDto;
+  rollup: CustomerRollup;
+  projects: ProjectRow[];
+  default_account: DefaultAccount | null;
+  layer_error: string | null;
+  /** The customer's `config.toml` as the CP resolves it (home shown as `~`). */
+  config_path: string;
+}
+
+/** The `customer` list param: a slug, `'none'` (work with no customer), or
+ *  `null`/absent (all customers — the param is omitted). */
+export type CustomerScope = string | 'none' | null;
+
+export interface NewCustomerBody {
+  slug: string;
+  name: string;
+  notes?: string;
+  contact?: string;
+  color?: string;
+}
+
+/** Absent fields stay; `''` clears `notes` / `contact` / `color`. */
+export interface CustomerPatch {
+  name?: string;
+  notes?: string;
+  contact?: string;
+  color?: string;
+}
+
+/** The body of a 409 from `DELETE /api/customers/:slug` (parse `ApiError.body`). */
+export interface CustomerConflict {
+  error: string;
+  projects: { ws_id: string; path: string }[];
+}
+
+/** The conflict a `DELETE /api/customers/:slug` 409 carries (the projects
+ *  still assigned), parsed from the `ApiError`'s raw body; `null` for any
+ *  other error, a non-JSON body, or a body without a `projects` array.
+ *  Malformed project entries are dropped. */
+export function parseCustomerConflict(e: unknown): CustomerConflict | null {
+  if (!(e instanceof ApiError) || e.status !== 409) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(e.body);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object') return null;
+  const obj = parsed as Record<string, unknown>;
+  if (!Array.isArray(obj.projects)) return null;
+  const projects = obj.projects.flatMap((p: unknown) => {
+    if (!p || typeof p !== 'object') return [];
+    const { ws_id, path } = p as Record<string, unknown>;
+    return typeof ws_id === 'string' && typeof path === 'string' ? [{ ws_id, path }] : [];
+  });
+  return { error: typeof obj.error === 'string' ? obj.error : '', projects };
+}
+
+/** Append `customer=<slug|none>` to a list query — only when scoped. */
+function setCustomer(q: URLSearchParams, customer?: CustomerScope): void {
+  if (customer) q.set('customer', customer);
+}
+
+// ---------------------------------------------------------------------------
+// Launch preview
+// ---------------------------------------------------------------------------
+
+/** `POST /api/launch/preview` — exactly one of `workflow` / `agent`. */
+export interface PreviewBody {
+  workflow?: string;
+  agent?: string;
+  working_dir?: string;
+  /** Same selector as the launch bodies; exclusive with `working_dir`. */
+  scope_kind?: string;
+  scope_id?: string;
+  host?: string;
+}
+
+/** One account a run would authenticate as. */
+export interface ManifestEntry {
+  role: 'provider' | 'fallback' | 'scm';
+  account: string;
+  /** The vendor the account authenticates against, when known. */
+  kind: string | null;
+  /** The agent's `auth:` (`api-key` / `sso`) on its provider entry and on a
+   *  fallback hop on that same provider, else `null`. */
+  auth_mode?: string | null;
+  /** The agent(s) using it (provider/fallback); empty for scm. */
+  agents: string[];
+  /** Where the choice came from, e.g. "customer default · locked". */
+  source: string;
+}
+
+export interface PreviewResponse {
+  customer: CustomerRef | null;
+  accounts: ManifestEntry[];
+  warnings: string[];
+  /** Echoed when a non-local host was named. */
+  host?: string;
+}
+
+// ---------------------------------------------------------------------------
 // Projects
 // ---------------------------------------------------------------------------
 
@@ -1884,6 +2135,9 @@ export interface ProjectRow {
   usage: UsageSummary;
   run_count: number;
   last_active?: string | null;
+  /** The project's current customer; `null` = none. ABSENT when the CP can't
+   *  say (never read absence as "no customer"). */
+  customer?: CustomerRef | null;
 }
 
 export interface ProjectDetail {
@@ -2069,15 +2323,30 @@ function subscribeSharedFirehose(sub: FirehoseSubscriber): () => void {
 // ---------------------------------------------------------------------------
 
 export const api = {
+  // --- Launch preview ---
+  /** The customer and the provider / fallback / SCM accounts a launch from
+   *  this directory would use. 409 when the launch itself would fail (a
+   *  project assigned to a customer that no longer exists). */
+  launchPreview(body: PreviewBody, signal?: AbortSignal): Promise<PreviewResponse> {
+    return request<PreviewResponse>('/api/launch/preview', {
+      method: 'POST',
+      body: JSON.stringify(body),
+      signal,
+    });
+  },
+
   // --- Dashboard ---
   /**
    * `range` selects the trend window; `host` (optional) scopes the fan-out to
    * one registered host id instead of every host — used to paint the local
    * host first and merge remotes in as they answer.
    */
-  getDashboard(range: DashboardRange = '30d', host?: string): Promise<DashboardResponse> {
+  getDashboard(range: DashboardRange = '30d', host?: string, customer?: CustomerScope): Promise<DashboardResponse> {
     const hostQs = host ? `&host=${encodeURIComponent(host)}` : '';
-    return request<DashboardResponse>(`/api/dashboard?range=${range}${hostQs}`);
+    const q = new URLSearchParams();
+    setCustomer(q, customer);
+    const customerQs = q.toString() ? `&${q.toString()}` : '';
+    return request<DashboardResponse>(`/api/dashboard?range=${range}${hostQs}${customerQs}`);
   },
 
   // --- Usage ---
@@ -2094,14 +2363,22 @@ export const api = {
     pivot: Pivot = 'model',
     host?: string,
     signal?: AbortSignal,
+    customer?: CustomerScope,
   ): Promise<UsageResponse> {
     const q = new URLSearchParams({ since: win.since, until: win.until, group_by: pivot });
     if (host) q.set('host', host);
+    setCustomer(q, customer);
     return request<UsageResponse>(`/api/usage?${q.toString()}`, { signal });
   },
   /** Per-bucket usage timeline (chronological). `bucket` defaults to `day`. */
-  getUsageTimeline(opts?: { since?: string; until?: string; bucket?: 'day' | 'week' }): Promise<UsageTimelineBucket[]> {
+  getUsageTimeline(opts?: {
+    since?: string;
+    until?: string;
+    bucket?: 'day' | 'week';
+    customer?: CustomerScope;
+  }): Promise<UsageTimelineBucket[]> {
     const q = new URLSearchParams();
+    setCustomer(q, opts?.customer);
     if (opts?.since) q.set('since', opts.since);
     if (opts?.until) q.set('until', opts.until);
     if (opts?.bucket) q.set('bucket', opts.bucket);
@@ -2114,9 +2391,18 @@ export const api = {
    * on `rupu-cp/src/api/usage_outliers.rs`), so this accepts single-host
    * results and does not take a `host` param.
    */
-  getUsageOutliers(win: UsageWindow = presetWindow('30d')): Promise<OutlierRun[]> {
+  getUsageOutliers(
+    win: UsageWindow = presetWindow('30d'),
+    customer?: CustomerScope,
+    onHostsWithoutCustomer?: HostsWithoutCustomerSink,
+  ): Promise<OutlierRun[]> {
     const q = new URLSearchParams({ since: win.since, until: win.until });
-    return request<OutlierRun[]>(`/api/usage/outliers?${q.toString()}`);
+    setCustomer(q, customer);
+    return requestMaybeReportingHosts<OutlierRun[]>(
+      `/api/usage/outliers?${q.toString()}`,
+      undefined,
+      onHostsWithoutCustomer,
+    );
   },
   /**
    * Flat per-`(run × model)` usage rows — the finest grain the `/usage`
@@ -2125,20 +2411,41 @@ export const api = {
    * hosts, so this takes no `host` param. `workspaceId` (optional) scopes to
    * one project's runs — what the Projects page's usage tab uses.
    */
-  getUsageRuns(win: UsageWindow = presetWindow('30d'), workspaceId?: string): Promise<UsageRunRow[]> {
+  getUsageRuns(
+    win: UsageWindow = presetWindow('30d'),
+    workspaceId?: string,
+    customer?: CustomerScope,
+    onHostsWithoutCustomer?: HostsWithoutCustomerSink,
+  ): Promise<UsageRunRow[]> {
     const q = new URLSearchParams({ since: win.since, until: win.until });
     if (workspaceId) q.set('workspace_id', workspaceId);
-    return request<UsageRunRow[]>(`/api/usage/runs?${q.toString()}`);
+    setCustomer(q, customer);
+    return requestMaybeReportingHosts<UsageRunRow[]>(
+      `/api/usage/runs?${q.toString()}`,
+      undefined,
+      onHostsWithoutCustomer,
+    );
   },
 
   // --- Runs ---
-  getRuns(params?: ListParams & Cancellable & { host?: string }): Promise<RunListRow[]> {
+  getRuns(
+    params?: ListParams & Cancellable & {
+      host?: string;
+      customer?: CustomerScope;
+      onHostsWithoutCustomer?: HostsWithoutCustomerSink;
+    },
+  ): Promise<RunListRow[]> {
     const q = new URLSearchParams();
     if (params?.offset != null) q.set('offset', String(params.offset));
     if (params?.limit != null) q.set('limit', String(params.limit));
     if (params?.host) q.set('host', params.host);
+    setCustomer(q, params?.customer);
     const qs = q.toString();
-    return request<RunListRow[]>(`/api/runs${qs ? `?${qs}` : ''}`, { signal: params?.signal });
+    return requestMaybeReportingHosts<RunListRow[]>(
+      `/api/runs${qs ? `?${qs}` : ''}`,
+      { signal: params?.signal },
+      params?.onHostsWithoutCustomer,
+    );
   },
   getRun(id: string, opts?: { host?: string }): Promise<{ run: RunRecord; steps: StepResultRecord[]; usage: UsageSummary }> {
     const qs = opts?.host ? `?host=${encodeURIComponent(opts.host)}` : '';
@@ -2327,15 +2634,26 @@ export const api = {
     return request<SessionRunRow[]>(`/api/sessions/${encodeURIComponent(id)}/runs${qs}`);
   },
   getWorkflowRuns(
-    params?: ListParams & Cancellable & { lifecycle?: 'active' | 'completed' | 'failed'; host?: string },
+    params?: ListParams & Cancellable & {
+      lifecycle?: 'active' | 'completed' | 'failed';
+      host?: string;
+      customer?: CustomerScope;
+      /** Receives the `X-Rupu-Hosts-Without-Customer` header's host ids. */
+      onHostsWithoutCustomer?: HostsWithoutCustomerSink;
+    },
   ): Promise<RunListRow[]> {
     const q = new URLSearchParams();
     if (params?.offset != null) q.set('offset', String(params.offset));
     if (params?.limit != null) q.set('limit', String(params.limit));
     if (params?.lifecycle) q.set('lifecycle', params.lifecycle);
     if (params?.host) q.set('host', params.host);
+    setCustomer(q, params?.customer);
     const qs = q.toString();
-    return request<RunListRow[]>(`/api/runs/workflows${qs ? `?${qs}` : ''}`, { signal: params?.signal });
+    return requestMaybeReportingHosts<RunListRow[]>(
+      `/api/runs/workflows${qs ? `?${qs}` : ''}`,
+      { signal: params?.signal },
+      params?.onHostsWithoutCustomer,
+    );
   },
   getAutoflowRuns(params?: ListParams & Cancellable & { host?: string }): Promise<AutoflowCycleRow[]> {
     const q = new URLSearchParams();
@@ -2372,15 +2690,26 @@ export const api = {
     });
   },
   getAgentRuns(
-    params?: ListParams & Cancellable & { lifecycle?: 'active' | 'completed' | 'failed'; host?: string },
+    params?: ListParams & Cancellable & {
+      lifecycle?: 'active' | 'completed' | 'failed';
+      host?: string;
+      customer?: CustomerScope;
+      /** Receives the `X-Rupu-Hosts-Without-Customer` header's host ids. */
+      onHostsWithoutCustomer?: HostsWithoutCustomerSink;
+    },
   ): Promise<AgentRunRow[]> {
     const q = new URLSearchParams();
     if (params?.offset != null) q.set('offset', String(params.offset));
     if (params?.limit != null) q.set('limit', String(params.limit));
     if (params?.lifecycle) q.set('lifecycle', params.lifecycle);
     if (params?.host) q.set('host', params.host);
+    setCustomer(q, params?.customer);
     const qs = q.toString();
-    return request<AgentRunRow[]>(`/api/runs/agents${qs ? `?${qs}` : ''}`, { signal: params?.signal });
+    return requestMaybeReportingHosts<AgentRunRow[]>(
+      `/api/runs/agents${qs ? `?${qs}` : ''}`,
+      { signal: params?.signal },
+      params?.onHostsWithoutCustomer,
+    );
   },
   getAutoflowDefs(): Promise<AutoflowDefRow[]> {
     return request<AutoflowDefRow[]>('/api/autoflows');
@@ -2602,14 +2931,27 @@ export const api = {
   },
 
   // --- Sessions ---
-  getSessions(params?: ListParams & Cancellable & { scope?: 'active' | 'archived'; host?: string }): Promise<SessionSummary[]> {
+  getSessions(
+    params?: ListParams & Cancellable & {
+      scope?: 'active' | 'archived';
+      host?: string;
+      customer?: CustomerScope;
+      /** Receives the `X-Rupu-Hosts-Without-Customer` header's host ids. */
+      onHostsWithoutCustomer?: HostsWithoutCustomerSink;
+    },
+  ): Promise<SessionSummary[]> {
     const q = new URLSearchParams();
     if (params?.offset != null) q.set('offset', String(params.offset));
     if (params?.limit != null) q.set('limit', String(params.limit));
     if (params?.scope) q.set('scope', params.scope);
     if (params?.host) q.set('host', params.host);
+    setCustomer(q, params?.customer);
     const qs = q.toString();
-    return request<SessionSummary[]>(`/api/sessions${qs ? `?${qs}` : ''}`, { signal: params?.signal });
+    return requestMaybeReportingHosts<SessionSummary[]>(
+      `/api/sessions${qs ? `?${qs}` : ''}`,
+      { signal: params?.signal },
+      params?.onHostsWithoutCustomer,
+    );
   },
   getSession(id: string, opts?: { host?: string }): Promise<SessionSummary> {
     const qs = opts?.host ? `?host=${encodeURIComponent(opts.host)}` : '';
@@ -2752,8 +3094,15 @@ export const api = {
   },
 
   // --- Findings ---
-  getFindings(opts?: { wsId?: string; workflow?: string; runId?: string; q?: string }): Promise<FindingsResponse> {
+  getFindings(opts?: {
+    wsId?: string;
+    workflow?: string;
+    runId?: string;
+    customer?: CustomerScope;
+    q?: string;
+  }): Promise<FindingsResponse> {
     const q = new URLSearchParams();
+    setCustomer(q, opts?.customer);
     if (opts?.wsId) q.set('ws_id', opts.wsId);
     if (opts?.workflow) q.set('workflow', opts.workflow);
     if (opts?.runId) q.set('run_id', opts.runId);
@@ -2900,8 +3249,11 @@ export const api = {
 
   // --- Projects ---
 
-  getProjects(): Promise<ProjectRow[]> {
-    return request<ProjectRow[]>('/api/projects');
+  getProjects(opts?: { customer?: CustomerScope }): Promise<ProjectRow[]> {
+    const q = new URLSearchParams();
+    setCustomer(q, opts?.customer);
+    const qs = q.toString();
+    return request<ProjectRow[]>(`/api/projects${qs ? `?${qs}` : ''}`);
   },
   getProject(wsId: string): Promise<ProjectDetail> {
     return request<ProjectDetail>(`/api/projects/${encodeURIComponent(wsId)}`);
@@ -2987,6 +3339,66 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify(body),
     });
+  },
+
+  /** The customer layer's config view (`GET /api/config?customer=`). */
+  getCustomerConfig(slug: string): Promise<ConfigView> {
+    return request<ConfigView>(`/api/config?customer=${encodeURIComponent(slug)}`);
+  },
+  /** Persist a customer-layer config edit (`{ raw }` or `{ patch }`). 400 when
+   *  the layer breaks the merged config or sets a globally locked key. */
+  async putCustomerConfig(slug: string, body: ConfigWriteBody): Promise<void> {
+    await request<unknown>(`/api/config/customer/${encodeURIComponent(slug)}`, {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    });
+  },
+
+  // --- Customers ---
+
+  getCustomers(opts?: { archived?: boolean; range?: DashboardRange }): Promise<CustomerRow[]> {
+    const q = new URLSearchParams();
+    if (opts?.archived) q.set('archived', '1');
+    if (opts?.range) q.set('range', opts.range);
+    const qs = q.toString();
+    return request<CustomerRow[]>(`/api/customers${qs ? `?${qs}` : ''}`);
+  },
+  getCustomer(slug: string, range?: DashboardRange): Promise<CustomerDetail> {
+    const qs = range ? `?range=${range}` : '';
+    return request<CustomerDetail>(`/api/customers/${encodeURIComponent(slug)}${qs}`);
+  },
+  createCustomer(body: NewCustomerBody): Promise<CustomerDto> {
+    return request<CustomerDto>('/api/customers', { method: 'POST', body: JSON.stringify(body) });
+  },
+  updateCustomer(slug: string, patch: CustomerPatch): Promise<CustomerDto> {
+    return request<CustomerDto>(`/api/customers/${encodeURIComponent(slug)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    });
+  },
+  archiveCustomer(slug: string, archived: boolean): Promise<CustomerDto> {
+    return request<CustomerDto>(
+      `/api/customers/${encodeURIComponent(slug)}/${archived ? 'archive' : 'unarchive'}`,
+      { method: 'POST' },
+    );
+  },
+  /** 409 while projects are assigned: an `ApiError` whose `body` parses as a `CustomerConflict`. */
+  deleteCustomer(slug: string): Promise<void> {
+    return request<void>(`/api/customers/${encodeURIComponent(slug)}`, { method: 'DELETE' });
+  },
+  /** Replaces any earlier assignment. 409 when the customer is archived. */
+  assignProject(slug: string, wsId: string): Promise<ProjectRow> {
+    return request<ProjectRow>(
+      `/api/customers/${encodeURIComponent(slug)}/projects/${encodeURIComponent(wsId)}`,
+      { method: 'PUT' },
+    );
+  },
+  /** 404 when the project is not assigned to `slug`. */
+  unassignProject(slug: string, wsId: string): Promise<void> {
+    return request<void>(
+      `/api/customers/${encodeURIComponent(slug)}/projects/${encodeURIComponent(wsId)}`,
+      { method: 'DELETE' },
+    );
   },
 
   // --- Repos ---

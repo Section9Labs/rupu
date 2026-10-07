@@ -29,6 +29,7 @@ vi.mock('../components/CodeEditor', () => ({
 }));
 
 import Workflows from './Workflows';
+import { withCustomerScope } from '../lib/customerScopeTestUtils';
 
 function LocationProbe() {
   const loc = useLocation();
@@ -60,7 +61,7 @@ describe('Workflows — whole-row navigation (rowHref)', () => {
 
     render(
       <MemoryRouter initialEntries={['/workflows']}>
-        <Workflows />
+        {withCustomerScope(<Workflows />)}
       </MemoryRouter>,
     );
 
@@ -80,7 +81,7 @@ describe('Workflows — whole-row navigation (rowHref)', () => {
 
     render(
       <MemoryRouter initialEntries={['/workflows']}>
-        <Workflows />
+        {withCustomerScope(<Workflows />)}
         <LocationProbe />
       </MemoryRouter>,
     );

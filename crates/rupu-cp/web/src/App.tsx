@@ -3,6 +3,7 @@ import { BrowserRouter, Navigate, Route, Routes, useLocation } from 'react-route
 import { ErrorBoundary } from './components/ErrorBoundary';
 import Layout from './components/Layout';
 import { Spinner } from './components/ui/Spinner';
+import { CustomerScopeProvider } from './lib/customerScope';
 import { getShell, type ShellVersion } from './lib/shell';
 
 // All page-level routes are lazy-loaded so each page lands in its own chunk
@@ -34,6 +35,8 @@ const WorkflowRuns      = React.lazy(() => import('./pages/runs/WorkflowRuns'));
 const AutoflowRuns      = React.lazy(() => import('./pages/runs/AutoflowRuns'));
 const Projects          = React.lazy(() => import('./pages/Projects'));
 const ProjectDetail     = React.lazy(() => import('./pages/ProjectDetail'));
+const Customers         = React.lazy(() => import('./pages/customers/Customers'));
+const CustomerDetail    = React.lazy(() => import('./pages/customers/CustomerDetail'));
 const ProjectDefinitions = React.lazy(() => import('./pages/ProjectDefinitions'));
 const RunTranscript     = React.lazy(() => import('./pages/RunTranscript'));
 
@@ -146,6 +149,9 @@ export function AppRoutes({ shell }: { shell: ShellVersion }) {
         <Route path="/projects/:wsId/config" element={page(<ProjectDetail tab="config" />)} />
         <Route path="/projects/:wsId/definitions" element={page(<ProjectDefinitions />)} />
         <Route path="/projects/:wsId" element={page(<ProjectDetail tab="overview" />)} />
+        <Route path="/customers" element={page(<Customers />)} />
+        <Route path="/customers/:slug" element={page(<CustomerDetail />)} />
+        <Route path="/customers/:slug/:tab" element={page(<CustomerDetail />)} />
       </Route>
     </Routes>
   );
@@ -155,9 +161,11 @@ export default function App() {
   const shell = getShell();
   return (
     <BrowserRouter>
-      <ErrorBoundary>
-        <AppRoutes shell={shell} />
-      </ErrorBoundary>
+      <CustomerScopeProvider>
+        <ErrorBoundary>
+          <AppRoutes shell={shell} />
+        </ErrorBoundary>
+      </CustomerScopeProvider>
     </BrowserRouter>
   );
 }

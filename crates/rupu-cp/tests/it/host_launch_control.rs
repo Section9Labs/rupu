@@ -505,6 +505,7 @@ async fn archive_run_with_remote_host_does_not_touch_local_run_store() {
 
 fn local_terminal_record(id: &str) -> rupu_orchestrator::RunRecord {
     rupu_orchestrator::RunRecord {
+        customer: None,
         id: id.into(),
         workflow_name: "wf".into(),
         status: rupu_orchestrator::RunStatus::Completed,

@@ -9,6 +9,7 @@ import SortableTable, { type Column } from '../components/lists/SortableTable';
 import { SectionHeader } from '../components/lists/SectionHeader';
 import { StatusPill } from '../components/StatusPill';
 import { relativeTime } from '../lib/time';
+import { runHref } from '../lib/runs';
 import { HostStatusBadge } from '../components/ui/HostStatusBadge';
 import type { HostTransportKind } from '../lib/api';
 
@@ -27,16 +28,6 @@ const TRANSPORT_LABEL: Record<HostTransportKind, string> = {
 // ---------------------------------------------------------------------------
 // Run columns (minimal — matches WorkflowRuns column shape)
 // ---------------------------------------------------------------------------
-
-/** Build the detail link for a run on this host, including ?host= when the
- *  run's own host_id isn't local (mirrors WorkflowRuns.tsx's `runHref`). */
-function runHref(r: RunListRow): string {
-  const hid = r.host_id;
-  if (hid && hid !== 'local') {
-    return `/runs/${encodeURIComponent(r.id)}?host=${encodeURIComponent(hid)}`;
-  }
-  return `/runs/${encodeURIComponent(r.id)}`;
-}
 
 const RUN_COLUMNS: Column<RunListRow>[] = [
   {
