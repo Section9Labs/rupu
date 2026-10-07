@@ -60,7 +60,7 @@ describe('InlineFindingCard — full-profile report tabs', () => {
     view(FULL);
     expect(spy).not.toHaveBeenCalled();
     fireEvent.click(header());
-    await waitFor(() => expect(spy).toHaveBeenCalledWith('f-full'));
+    await waitFor(() => expect(spy).toHaveBeenCalledWith('f-full', 'ws_1'));
     expect(spy).toHaveBeenCalledTimes(1);
   });
 
@@ -159,7 +159,7 @@ describe('InlineFindingCard — full-profile report tabs', () => {
     view(FULL);
     fireEvent.click(header());
     await screen.findByRole('tablist');
-    expect(screen.getByRole('link', { name: /Open full report/ })).toHaveAttribute('href', '/findings/f-full');
+    expect(screen.getByRole('link', { name: /Open full report/ })).toHaveAttribute('href', '/findings/f-full?ws_id=ws_1');
   });
 
   it('shows a visible message when the detail fetch fails', async () => {
@@ -205,11 +205,11 @@ describe('InlineFindingCard — full-profile report tabs', () => {
       <MemoryRouter><InlineFindingCard finding={A} stale={false} /></MemoryRouter>,
     );
     fireEvent.click(screen.getByRole('button', { name: /Finding A/ }));
-    expect(spy).toHaveBeenCalledWith('f-a');
+    expect(spy).toHaveBeenCalledWith('f-a', 'ws_1');
 
     // Re-point the same card instance (still expanded) at B before A resolves.
     rerender(<MemoryRouter><InlineFindingCard finding={B} stale={false} /></MemoryRouter>);
-    expect(spy).toHaveBeenCalledWith('f-b');
+    expect(spy).toHaveBeenCalledWith('f-b', 'ws_1');
     expect(screen.getByRole('status')).toBeInTheDocument();
 
     // A's response lands late: B's card must not show A's content.
@@ -219,7 +219,7 @@ describe('InlineFindingCard — full-profile report tabs', () => {
     expect(screen.queryByText(/ALPHA root cause text/)).toBeNull();
     expect(screen.queryByRole('tablist')).toBeNull();
     expect(screen.getByRole('status')).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: /Open full report/ })).toHaveAttribute('href', '/findings/f-b');
+    expect(screen.getByRole('link', { name: /Open full report/ })).toHaveAttribute('href', '/findings/f-b?ws_id=ws_1');
 
     // B's own response then renders normally.
     await act(async () => {
@@ -284,10 +284,10 @@ describe('InlineFindingCard — evidence blocks in the Evidence tab', () => {
     // Claims first, then blocks.
     expect(claim.compareDocumentPosition(text) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     const img = container.querySelector('img')!;
-    expect(img).toHaveAttribute('src', findingArtifactUrl('f-full', sha));
+    expect(img).toHaveAttribute('src', findingArtifactUrl('f-full', sha, 'ws_1'));
     expect(img).toHaveClass('max-h-48');
     expect(img).not.toHaveClass('max-h-[32rem]');
-    expect(screen.getByRole('link', { name: 'Download' })).toHaveAttribute('href', findingArtifactUrl('f-full', sha));
+    expect(screen.getByRole('link', { name: 'Download' })).toHaveAttribute('href', findingArtifactUrl('f-full', sha, 'ws_1'));
   });
 
   it('never fetches a remote-host image block until it is clicked', async () => {
@@ -298,7 +298,7 @@ describe('InlineFindingCard — evidence blocks in the Evidence tab', () => {
     expect(container.querySelector('img')).toBeNull();
     expect(fetchSpy).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole('button', { name: /Load image \(from host gizmo-box\)/ }));
-    expect(container.querySelector('img')).toHaveAttribute('src', findingArtifactUrl('f-full', sha));
+    expect(container.querySelector('img')).toHaveAttribute('src', findingArtifactUrl('f-full', sha, 'ws_1'));
   });
 
   it('shows blocks without an empty-claims note when the report has blocks but no claims', async () => {

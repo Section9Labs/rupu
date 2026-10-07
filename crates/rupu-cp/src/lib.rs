@@ -4,6 +4,7 @@
 
 pub mod agent_launcher;
 pub mod api;
+pub mod auth;
 pub mod codename;
 pub mod codename_legacy;
 pub mod codename_palette;
@@ -20,6 +21,7 @@ pub mod netflow_index;
 pub mod net;
 pub mod node;
 pub mod pagination;
+pub mod path_guard;
 pub mod repos;
 pub mod server;
 pub mod session_mutator;
@@ -42,7 +44,8 @@ use tracing::info;
 
 pub struct ServeOpts {
     pub bind: SocketAddr,
-    /// If set, require `Authorization: Bearer <token>` on `/api/*` routes.
+    /// If set, `/api/*` requires this token: a bearer header, or the browser
+    /// cookie the printed `?token=` link sets (see [`auth`]).
     pub token: Option<String>,
     pub global_dir: PathBuf,
     /// Open the served URL in the default browser on startup (best-effort, and
@@ -321,10 +324,17 @@ pub async fn serve_on(listener: tokio::net::TcpListener, opts: ServeOpts) -> any
         });
     }
 
+    let token = opts.token.clone();
     let app = server::router(app_state, opts.token);
 
     let addr = listener.local_addr()?;
-    let url = click_url(addr);
+    // With a token, the printed (and opened) link carries it once: the first
+    // page load trades it for the browser's token cookie and drops it from
+    // the address bar (`auth::bootstrap_cookie`).
+    let url = match &token {
+        Some(t) => auth::bootstrap_url(&click_url(addr), t),
+        None => click_url(addr),
+    };
     // Always surface the URL prominently — independent of RUST_LOG / tracing.
     println!("\n  ➜  rupu Control Plane  →  {url}\n");
     info!("rupu cp serving on {url}");

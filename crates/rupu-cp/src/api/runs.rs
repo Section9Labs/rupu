@@ -188,6 +188,7 @@ async fn approve_run(
     Query(q): Query<RunControlQuery>,
     body: Option<Json<ApproveBody>>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    validate_id(&id)?;
     let host = q.host.as_deref().unwrap_or("local");
     if host != "local" {
         let conn = resolve_host(&s, host)?;
@@ -247,6 +248,7 @@ async fn reject_run(
     Query(q): Query<RunControlQuery>,
     Json(body): Json<RejectBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    validate_id(&id)?;
     let host = q.host.as_deref().unwrap_or("local");
     if host != "local" {
         let conn = resolve_host(&s, host)?;
@@ -308,6 +310,7 @@ async fn cancel_run(
     Query(q): Query<RunControlQuery>,
     body: Option<Json<CancelBody>>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    validate_id(&id)?;
     let host = q.host.as_deref().unwrap_or("local");
     if host != "local" {
         let conn = resolve_host(&s, host)?;
@@ -366,6 +369,7 @@ async fn pause_run(
     Path(id): Path<String>,
     Query(q): Query<RunControlQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    validate_id(&id)?;
     let host = q.host.as_deref().unwrap_or("local");
     if host != "local" {
         let conn = resolve_host(&s, host)?;
@@ -426,6 +430,7 @@ async fn resume_run(
     Path(id): Path<String>,
     Query(q): Query<RunControlQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    validate_id(&id)?;
     s.launcher
         .as_ref()
         .ok_or_else(|| ApiError::not_available("resuming a paused run requires `rupu cp serve`"))?;

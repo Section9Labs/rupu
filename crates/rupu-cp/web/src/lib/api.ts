@@ -3319,8 +3319,10 @@ export const api = {
     const qs = q.toString();
     return request<FindingsResponse>(`/api/findings${qs ? `?${qs}` : ''}`);
   },
-  getFinding(id: string): Promise<FindingDetail> {
-    return request<FindingDetail>(`/api/findings/${encodeURIComponent(id)}`);
+  /** `wsId` picks the workspace when the id exists in several (the CP
+   *  answers 409 for an ambiguous id without it). */
+  getFinding(id: string, wsId?: string | null): Promise<FindingDetail> {
+    return request<FindingDetail>(`/api/findings/${encodeURIComponent(id)}${wsQuery(wsId, '?')}`);
   },
   tagFindings(findingIds: string[], change: { add?: string[]; remove?: string[] }): Promise<TagAcrossResult> {
     return request<TagAcrossResult>('/api/findings/tags', {
@@ -3362,9 +3364,9 @@ export const api = {
   async downloadFindingExport(
     id: string,
     format: FindingExportFormat,
-    opts?: { signal?: AbortSignal },
+    opts?: { signal?: AbortSignal; wsId?: string | null },
   ): Promise<Blob> {
-    const res = await fetch(findingExportUrl(id, format), {
+    const res = await fetch(findingExportUrl(id, format, opts?.wsId), {
       credentials: 'same-origin',
       signal: opts?.signal,
     });
@@ -3697,12 +3699,17 @@ export const api = {
   },
 };
 
-export function findingArtifactUrl(id: string, sha256: string): string {
-  return `/api/findings/${encodeURIComponent(id)}/artifacts/${encodeURIComponent(sha256)}`;
+/** `?ws_id=` (or `&ws_id=`) for the finding-id routes, or `''`. */
+function wsQuery(wsId: string | null | undefined, sep: '?' | '&'): string {
+  return wsId ? `${sep}ws_id=${encodeURIComponent(wsId)}` : '';
+}
+
+export function findingArtifactUrl(id: string, sha256: string, wsId?: string | null): string {
+  return `/api/findings/${encodeURIComponent(id)}/artifacts/${encodeURIComponent(sha256)}${wsQuery(wsId, '?')}`;
 }
 
 /** Download link for one finding's report (`GET /api/findings/:id/export`),
  *  served as an attachment. */
-export function findingExportUrl(id: string, format: FindingExportFormat): string {
-  return `/api/findings/${encodeURIComponent(id)}/export?format=${format}`;
+export function findingExportUrl(id: string, format: FindingExportFormat, wsId?: string | null): string {
+  return `/api/findings/${encodeURIComponent(id)}/export?format=${format}${wsQuery(wsId, '&')}`;
 }

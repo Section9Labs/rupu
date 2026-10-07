@@ -862,13 +862,82 @@ async fn tags_in_use(
     Ok(Json(counts))
 }
 
-/// Find one finding by id across every registered workspace. Synchronous and
-/// potentially slow (it reads every coverage ledger): async callers must run
-/// it under `spawn_blocking`.
-fn find_finding(global: &std::path::Path, id: &str) -> Option<FindingOut> {
-    collect_all_findings(global)
-        .into_iter()
-        .find(|f| f.record.id == id)
+/// Why a finding id did not name exactly one finding.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FindingLookup {
+    NotFound,
+    /// The id exists in several workspaces (ids are only unique within one);
+    /// these are their `ws_id`s, sorted.
+    Ambiguous(Vec<String>),
+}
+
+impl FindingLookup {
+    fn into_api(self, id: &str) -> ApiError {
+        match self {
+            FindingLookup::NotFound => ApiError::not_found(format!("finding {id} not found")),
+            FindingLookup::Ambiguous(ws) => ApiError::conflict(format!(
+                "finding {id} exists in {} workspaces ({}); pass ?ws_id= to pick one",
+                ws.len(),
+                ws.join(", ")
+            )),
+        }
+    }
+}
+
+/// The one finding `id` names among `all`, narrowed to workspace `ws_id`
+/// when given. Finding ids are unique within a workspace, not across them,
+/// so an id found in several workspaces with no `ws_id` is
+/// [`FindingLookup::Ambiguous`] — never "the first match".
+pub fn pick_finding(
+    all: Vec<FindingOut>,
+    id: &str,
+    ws_id: Option<&str>,
+) -> Result<FindingOut, FindingLookup> {
+    let ws = owning_workspace(&all, id, ws_id)?;
+    all.into_iter()
+        .find(|f| f.record.id == id && f.ws_id == ws)
+        .ok_or(FindingLookup::NotFound)
+}
+
+/// The one workspace whose finding `id` names (see [`pick_finding`]).
+fn owning_workspace(
+    all: &[FindingOut],
+    id: &str,
+    ws_id: Option<&str>,
+) -> Result<String, FindingLookup> {
+    let mut ws: Vec<&str> = all
+        .iter()
+        .filter(|f| f.record.id == id && ws_id.is_none_or(|w| f.ws_id == w))
+        .map(|f| f.ws_id.as_str())
+        .collect();
+    ws.sort_unstable();
+    ws.dedup();
+    match ws.as_slice() {
+        [] => Err(FindingLookup::NotFound),
+        [one] => Ok(one.to_string()),
+        _ => Err(FindingLookup::Ambiguous(
+            ws.into_iter().map(str::to_string).collect(),
+        )),
+    }
+}
+
+/// Find one finding by id across every registered workspace (or in
+/// `ws_id`'s). Synchronous and potentially slow (it reads every coverage
+/// ledger): async callers must run it under `spawn_blocking`.
+fn find_finding(
+    global: &std::path::Path,
+    id: &str,
+    ws_id: Option<&str>,
+) -> Result<FindingOut, ApiError> {
+    pick_finding(collect_all_findings(global), id, ws_id).map_err(|e| e.into_api(id))
+}
+
+/// `?ws_id=` on the single-finding routes: which workspace's finding `:id`
+/// means when the id exists in more than one.
+#[derive(Debug, Default, Deserialize)]
+struct FindingWsQuery {
+    #[serde(default)]
+    ws_id: Option<String>,
 }
 
 /// `GET /api/findings/:id` — the full finding (report body included) plus a
@@ -876,14 +945,15 @@ fn find_finding(global: &std::path::Path, id: &str) -> Option<FindingOut> {
 async fn get_finding(
     State(s): State<AppState>,
     Path(id): Path<String>,
+    Query(wq): Query<FindingWsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let global = s.global_dir.clone();
     let id_for_lookup = id.clone();
-    let found = tokio::task::spawn_blocking(move || find_finding(&global, &id_for_lookup))
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-    let mut finding =
-        found.ok_or_else(|| ApiError::not_found(format!("finding {id} not found")))?;
+    let mut finding = tokio::task::spawn_blocking(move || {
+        find_finding(&global, &id_for_lookup, wq.ws_id.as_deref())
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))??;
     finding.customer =
         crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&s.global_dir))
             .assigned(&finding.ws_id)?;
@@ -1073,6 +1143,7 @@ fn open_verified(
 async fn get_artifact(
     State(s): State<AppState>,
     Path((id, sha)): Path<(String, String)>,
+    Query(wq): Query<FindingWsQuery>,
 ) -> Result<Response, ApiError> {
     let store = ArtifactStore::new(s.global_dir.join("findings").join("artifacts"));
     let blob = store.blob_path_checked(&sha).ok_or_else(|| {
@@ -1080,10 +1151,11 @@ async fn get_artifact(
     })?;
     let global = s.global_dir.clone();
     let id_for_lookup = id.clone();
-    let finding = tokio::task::spawn_blocking(move || find_finding(&global, &id_for_lookup))
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?
-        .ok_or_else(|| ApiError::not_found(format!("finding {id} not found")))?;
+    let finding = tokio::task::spawn_blocking(move || {
+        find_finding(&global, &id_for_lookup, wq.ws_id.as_deref())
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))??;
     let artifact = finding
         .record
         .report
@@ -1551,6 +1623,9 @@ const MAX_EXPORT_TITLE_CHARS: usize = 200;
 #[derive(Debug, Deserialize)]
 struct ExportQuery {
     format: Option<String>,
+    /// Single-finding export only: see [`FindingWsQuery`].
+    #[serde(default)]
+    ws_id: Option<String>,
 }
 
 /// Body of `POST /api/findings/export`. Unknown fields are refused: a
@@ -1597,6 +1672,9 @@ pub enum ReportError {
     /// The selection matched no finding (or the named finding does not exist).
     #[error("{0}")]
     NotFound(String),
+    /// A single-finding export whose id exists in several workspaces.
+    #[error("finding {id} exists in {} workspaces ({}); name one", ws_ids.len(), ws_ids.join(", "))]
+    Ambiguous { id: String, ws_ids: Vec<String> },
     #[error(transparent)]
     Render(#[from] ExportError),
     #[error("{0}")]
@@ -1607,6 +1685,7 @@ impl From<ReportError> for ApiError {
     fn from(e: ReportError) -> Self {
         match e {
             ReportError::NotFound(msg) => ApiError::not_found(msg),
+            ReportError::Ambiguous { id, ws_ids } => FindingLookup::Ambiguous(ws_ids).into_api(&id),
             ReportError::Render(e) => export_error(e),
             ReportError::Internal(msg) => ApiError::internal(msg),
         }
@@ -1810,19 +1889,29 @@ fn with_local_blobs<T>(global: &std::path::Path, render: impl FnOnce(Blobs<'_>) 
 
 /// One finding rendered as a stand-alone report, numbered within its own
 /// project (so it carries the number it has in the project's full report).
+/// `ws_id` picks the workspace when the id exists in more than one
+/// ([`ReportError::Ambiguous`] without it).
 pub fn export_finding_report(
     global: &std::path::Path,
     runs: &RunStore,
     id: &str,
+    ws_id: Option<&str>,
     prefix: &str,
     fmt: Format,
 ) -> Result<ExportedReport, ReportError> {
     let all = collect_all_findings(global);
-    let ws_id = all
-        .iter()
-        .find(|f| f.record.id == id)
-        .map(|f| f.ws_id.clone())
-        .ok_or_else(|| ReportError::NotFound(format!("finding {id} not found")))?;
+    let ws_id = match owning_workspace(&all, id, ws_id) {
+        Ok(ws) => ws,
+        Err(FindingLookup::NotFound) => {
+            return Err(ReportError::NotFound(format!("finding {id} not found")))
+        }
+        Err(FindingLookup::Ambiguous(ws)) => {
+            return Err(ReportError::Ambiguous {
+                id: id.to_string(),
+                ws_ids: ws,
+            })
+        }
+    };
     // Numbers are per project: number only the finding's own.
     let project: Vec<ExportInput> = all
         .into_iter()
@@ -1888,7 +1977,7 @@ async fn export_finding(
     let slot = render_slot(&PDF_RENDERS, fmt).await?;
     let download = tokio::task::spawn_blocking(move || {
         let _slot = slot;
-        export_finding_report(&global, &runs, &id, &prefix, fmt)
+        export_finding_report(&global, &runs, &id, q.ws_id.as_deref(), &prefix, fmt)
     })
     .await
     .map_err(|e| ApiError::internal(e.to_string()))??;
@@ -4879,7 +4968,8 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         seed_workspace_findings(tmp.path(), &[full_record("fnd_a")]);
         let runs = RunStore::new(tmp.path().join("runs"));
-        let missing = export_finding_report(tmp.path(), &runs, "fnd_zzz", "SEC", Format::Markdown);
+        let missing =
+            export_finding_report(tmp.path(), &runs, "fnd_zzz", None, "SEC", Format::Markdown);
         assert!(matches!(missing, Err(ReportError::NotFound(m)) if m.contains("fnd_zzz")));
         let nothing = export_project_report(
             tmp.path(),
@@ -4894,8 +4984,8 @@ mod tests {
             Format::Markdown,
         );
         assert!(matches!(nothing, Err(ReportError::NotFound(_))));
-        let ok =
-            export_finding_report(tmp.path(), &runs, "fnd_a", "SEC", Format::Markdown).unwrap();
+        let ok = export_finding_report(tmp.path(), &runs, "fnd_a", None, "SEC", Format::Markdown)
+            .unwrap();
         assert!(ok.name.ends_with(".md"));
         assert!(String::from_utf8(ok.bytes).unwrap().contains("SEC-001"));
     }
@@ -4932,7 +5022,7 @@ mod tests {
         seed_workspace_findings(tmp.path(), &[rec]);
         let runs = RunStore::new(tmp.path().join("runs"));
 
-        let html = export_finding_report(tmp.path(), &runs, "fnd_img", "SEC", Format::Html)
+        let html = export_finding_report(tmp.path(), &runs, "fnd_img", None, "SEC", Format::Html)
             .unwrap()
             .bytes;
         let html = String::from_utf8(html).unwrap();
@@ -4947,7 +5037,7 @@ mod tests {
         );
         assert!(html.contains("not embedded: the file is on host"), "{html}");
 
-        let md = export_finding_report(tmp.path(), &runs, "fnd_img", "SEC", Format::Markdown)
+        let md = export_finding_report(tmp.path(), &runs, "fnd_img", None, "SEC", Format::Markdown)
             .unwrap()
             .bytes;
         let md = String::from_utf8(md).unwrap();

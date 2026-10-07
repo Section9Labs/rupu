@@ -740,3 +740,50 @@ async fn a_remote_image_block_downloads_end_to_end() {
     assert_eq!(resp.bytes().await.unwrap().as_ref(), body.as_slice());
     assert_eq!(std::fs::read(stored(coord.path(), &sha)).unwrap(), body);
 }
+
+/// Finding ids are unique within a workspace, not across them: an id two
+/// workspaces share is a 409 naming both on every id-keyed route until the
+/// request picks one with `?ws_id=` — never "the first match".
+#[tokio::test]
+async fn an_id_two_workspaces_share_needs_ws_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let global = tmp.path().join("g");
+    let (ws_a, ws_b) = (tmp.path().join("a"), tmp.path().join("b"));
+    register_workspace(&global, "ws_a", &ws_a);
+    register_workspace(&global, "ws_b", &ws_b);
+    let body = b"print('a')\n";
+    let sha = sha_of(body);
+    let mut copied = artifact(&sha, body.len() as u64, ArtifactKind::Text, None);
+    copied.stored = Some(ArtifactStorage::Copied);
+    store_blob(&global, &sha, body);
+    write_finding(&ws_a, "fnd_dup", copied.clone());
+    write_finding(&ws_b, "fnd_dup", copied);
+    let addr = serve(state(&global)).await;
+    let get =
+        |path: String| async move { reqwest::get(format!("http://{addr}{path}")).await.unwrap() };
+
+    for path in [
+        "/api/findings/fnd_dup".to_string(),
+        format!("/api/findings/fnd_dup/artifacts/{sha}"),
+        "/api/findings/fnd_dup/export?format=md".to_string(),
+    ] {
+        let resp = get(path.clone()).await;
+        assert_eq!(resp.status(), 409, "{path}");
+        let v: serde_json::Value = resp.json().await.unwrap();
+        let msg = v["error"].as_str().unwrap();
+        assert!(msg.contains("ws_a") && msg.contains("ws_b"), "{msg}");
+    }
+
+    let resp = get("/api/findings/fnd_dup?ws_id=ws_b".into()).await;
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["ws_id"], "ws_b");
+    let resp = get(format!("/api/findings/fnd_dup/artifacts/{sha}?ws_id=ws_a")).await;
+    assert_eq!(resp.status(), 200);
+    let resp = get("/api/findings/fnd_dup/export?format=md&ws_id=ws_a".into()).await;
+    assert_eq!(resp.status(), 200);
+
+    // A ws_id that holds no such finding is a plain 404.
+    let resp = get("/api/findings/fnd_dup?ws_id=ws_zz".into()).await;
+    assert_eq!(resp.status(), 404);
+}

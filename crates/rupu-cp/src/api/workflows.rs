@@ -453,6 +453,7 @@ async fn get_workflow(
     State(s): State<AppState>,
     Path(name): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    fs_safety::validate_stem(&name)?;
     load_detail(&s, &name).await
 }
 
@@ -724,6 +725,7 @@ async fn launch_run(
     Path(name): Path<String>,
     body: Option<Json<LaunchBody>>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    fs_safety::validate_stem(&name)?;
     let mut b = body.map(|j| j.0).unwrap_or_default();
     let host = b.host.as_deref().unwrap_or("local").to_string();
 

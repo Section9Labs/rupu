@@ -2,6 +2,7 @@ import { useState, type ReactNode } from 'react';
 import { findingArtifactUrl } from '../../../lib/api';
 import { formatBytes, type ArtifactRef, type DisasmLine, type EvidenceBlock } from '../../../lib/findingReport';
 import Markdown from '../../transcript/Markdown';
+import { useFindingWorkspace } from '../../../lib/findingWorkspace';
 
 /** An address for display. The CP's exact `0x…` string wins; a bare number
  *  above 2^53 was already rounded by JSON.parse, so it is marked imprecise
@@ -44,8 +45,9 @@ function isRecorded(artifact: ArtifactRef): boolean {
 const UNRECORDED_NOTE = 'file not recorded by rupu (finding predates file verification)';
 
 function DownloadLink({ findingId, artifact }: { findingId: string; artifact: ArtifactRef }) {
+  const wsId = useFindingWorkspace();
   return (
-    <a href={findingArtifactUrl(findingId, artifact.sha256)} download className="text-brand-700 hover:underline">
+    <a href={findingArtifactUrl(findingId, artifact.sha256, wsId)} download className="text-brand-700 hover:underline">
       Download
     </a>
   );
@@ -90,7 +92,8 @@ function ImageBlock({ findingId, artifact, caption, density }: { findingId: stri
 function RecordedImage({ findingId, artifact, caption, density }: { findingId: string; artifact: ArtifactRef; caption?: string; density: Density }) {
   const [show, setShow] = useState(!artifact.host);
   const [broken, setBroken] = useState(false);
-  const url = findingArtifactUrl(findingId, artifact.sha256);
+  const wsId = useFindingWorkspace();
+  const url = findingArtifactUrl(findingId, artifact.sha256, wsId);
   return (
     <figure className="overflow-hidden rounded-md border border-border bg-panel">
       <div className="px-3 py-2">

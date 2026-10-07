@@ -32,6 +32,7 @@ mod models_api;
 mod netflow_api;
 mod netflow_explorer;
 mod node_tunnel;
+mod path_safety;
 mod projects;
 mod run_graph;
 mod run_observation;

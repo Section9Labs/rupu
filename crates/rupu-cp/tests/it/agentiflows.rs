@@ -296,14 +296,12 @@ async fn detail_404s_an_unknown_or_unsafe_id() {
     let tmp = tempfile::tempdir().unwrap();
     seed(tmp.path());
     let addr = spawn_server(tmp.path()).await;
-    for id in [
-        "af_missing",
-        "run_01J9ZQ3K4M5N6P7Q8R9S0T1V2W",
-        "af_..%2Fx",
-        "af_a%20b",
-        "..",
-    ] {
+    for id in ["af_missing", "run_01J9ZQ3K4M5N6P7Q8R9S0T1V2W", "af_a%20b"] {
         let (status, _) = get(addr, &format!("/api/agentiflows/{id}")).await;
         assert_eq!(status, 404, "{id}");
     }
+    // An encoded separator never reaches the handler: the router-level path
+    // guard refuses it (`rupu_cp::path_guard`).
+    let (status, _) = get(addr, "/api/agentiflows/af_..%2Fx").await;
+    assert_eq!(status, 400);
 }

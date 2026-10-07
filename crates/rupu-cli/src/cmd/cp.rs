@@ -29,9 +29,12 @@ pub enum Action {
         /// Address to bind. Defaults to 127.0.0.1:7878.
         #[arg(long, default_value = "127.0.0.1:7878")]
         bind: SocketAddr,
-        /// Optional bearer token. If set, `/api/*` requires
-        /// `Authorization: Bearer <token>` (the web UI and `/healthz` remain
-        /// open on localhost).
+        /// Optional access token. If set, every `/api/*` call needs it, as
+        /// `Authorization: Bearer <token>` or the browser's token cookie.
+        /// The printed (and auto-opened) URL carries `?token=<token>`; opening
+        /// it signs that browser in (cookie set, token dropped from the URL).
+        /// `/healthz` and the page shell stay open; the UI shows no data until
+        /// the browser is signed in.
         #[arg(long)]
         token: Option<String>,
         /// Do not open the served URL in a browser on startup. By default the

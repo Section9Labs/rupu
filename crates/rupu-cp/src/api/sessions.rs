@@ -727,6 +727,7 @@ async fn get_session(
     Path(id): Path<String>,
     Query(q): Query<SessionHostQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    crate::api::runs::validate_id(&id)?;
     // ── Remote proxy ───────────────────────────────────────────────────────────
     if let Some(host) = q.host.as_deref().filter(|h| *h != "local") {
         let conn = crate::api::runs::resolve_host(&s, host)?;
@@ -836,6 +837,7 @@ async fn get_session_usage_timeline(
     Path(id): Path<String>,
     Query(q): Query<SessionHostQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    crate::api::runs::validate_id(&id)?;
     // ── Remote proxy ───────────────────────────────────────────────────────────
     if let Some(host) = q.host.as_deref().filter(|h| *h != "local") {
         let conn = crate::api::runs::resolve_host(&s, host)?;
@@ -973,6 +975,7 @@ async fn get_session_runs(
     Path(id): Path<String>,
     Query(q): Query<SessionHostQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    crate::api::runs::validate_id(&id)?;
     // ── Remote proxy ───────────────────────────────────────────────────────────
     if let Some(host) = q.host.as_deref().filter(|h| *h != "local") {
         let conn = crate::api::runs::resolve_host(&s, host)?;
@@ -1046,6 +1049,7 @@ async fn send_session(
     Query(q): Query<SendQuery>,
     Json(body): Json<SendBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    crate::api::runs::validate_id(&id)?;
     let prompt = body.prompt.trim().to_string();
     if prompt.is_empty() {
         return Err(ApiError::bad_request("prompt is empty"));

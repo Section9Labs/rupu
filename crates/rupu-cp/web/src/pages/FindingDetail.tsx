@@ -4,7 +4,8 @@
 // its rationale. Section bodies live in components/findings/report/.
 
 import { useEffect, useRef, useState } from 'react';
-import { Link, useParams } from 'react-router-dom';
+import { Link, useParams, useSearchParams } from 'react-router-dom';
+import { FindingWorkspace } from '../lib/findingWorkspace';
 import { api, apiErrorMessage, type FindingDetail as Detail, type FindingExportFormat } from '../lib/api';
 import { saveBlob } from '../lib/download';
 import { completeness, UNREADABLE_REPORT_NOTE } from '../lib/findingReport';
@@ -46,7 +47,7 @@ const EXPORT_FORMATS: [FindingExportFormat, string][] = [['md', 'Markdown'], ['h
  *  export (`GET /api/findings/:id/export`) rather than link to it, so a failure
  *  (404, or 501 when this build has no PDF support) reads as a message here
  *  instead of saving the JSON error body as the "report". */
-function ExportLinks({ id }: { id: string }) {
+function ExportLinks({ id, wsId }: { id: string; wsId?: string }) {
   const [busy, setBusy] = useState<FindingExportFormat | null>(null);
   const [error, setError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -61,7 +62,7 @@ function ExportLinks({ id }: { id: string }) {
     setBusy(fmt);
     setError(null);
     try {
-      const blob = await api.downloadFindingExport(id, fmt, { signal: controller.signal });
+      const blob = await api.downloadFindingExport(id, fmt, { signal: controller.signal, wsId });
       if (controller.signal.aborted) return;
       saveBlob(blob, `${id}.${fmt}`);
     } catch (e: unknown) {
@@ -91,11 +92,11 @@ function ExportLinks({ id }: { id: string }) {
 }
 
 /** The top row of both layouts: back to the list, and the export links. */
-function TopBar({ id }: { id: string }) {
+function TopBar({ id, wsId }: { id: string; wsId?: string }) {
   return (
     <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
       <BackLink />
-      <ExportLinks id={id} />
+      <ExportLinks id={id} wsId={wsId} />
     </div>
   );
 }
@@ -203,6 +204,9 @@ function TagsSection({ detail }: { detail: Detail }) {
 
 export default function FindingDetail() {
   const { id = '' } = useParams();
+  // Which workspace's `id` this is, when the link knew (ids repeat across
+  // workspaces; without it an ambiguous id is the CP's 409 message).
+  const wsParam = useSearchParams()[0].get('ws_id');
   const [detail, setDetail] = useState<Detail | null>(null);
   const [error, setError] = useState<string | null>(null);
   // The finding the route shows now: a refetch answering for an earlier one is dropped.
@@ -213,16 +217,16 @@ export default function FindingDetail() {
     let live = true;
     setDetail(null);
     setError(null);
-    api.getFinding(id).then(
+    api.getFinding(id, wsParam).then(
       (d) => { if (live) setDetail(d); },
       (e: unknown) => { if (live) setError(apiErrorMessage(e)); },
     );
     return () => { live = false; };
-  }, [id]);
+  }, [id, wsParam]);
 
   const refetch = async () => {
     const forId = id;
-    const d = await api.getFinding(forId);
+    const d = await api.getFinding(forId, wsParam);
     if (currentId.current === forId) setDetail(d);
   };
   const patchTags = (tags: string[]) => {
@@ -237,8 +241,9 @@ export default function FindingDetail() {
 
   if (!report) {
     return (
+      <FindingWorkspace.Provider value={detail.ws_id}>
       <div className="mx-auto max-w-4xl space-y-6 p-8">
-        <TopBar id={detail.id} />
+        <TopBar id={detail.id} wsId={detail.ws_id} />
         <h1 className="text-2xl font-semibold text-ink">{detail.summary}</h1>
         <FindingTags detail={detail} onChanged={refetch} onSaved={patchTags} />
         <p className="text-ui text-ink-mute">
@@ -250,6 +255,7 @@ export default function FindingDetail() {
         <TagsSection detail={detail} />
         <Provenance detail={detail} />
       </div>
+      </FindingWorkspace.Provider>
     );
   }
 
@@ -260,6 +266,7 @@ export default function FindingDetail() {
   const hasBlocks = (report.blocks?.length ?? 0) > 0;
   const rail = RAIL.filter(([anchor]) => (anchor !== 's-artifacts' || hasArtifacts) && (anchor !== 's-blocks' || hasBlocks));
   return (
+    <FindingWorkspace.Provider value={detail.ws_id}>
     <div className="grid gap-8 p-8 lg:grid-cols-[13rem_minmax(0,1fr)]">
       <nav aria-label="Report sections" className="hidden self-start lg:sticky lg:top-4 lg:block">
         <div className="mb-3 rounded-md border border-border bg-panel p-3">
@@ -274,7 +281,7 @@ export default function FindingDetail() {
         </ul>
       </nav>
       <article className="min-w-0 max-w-4xl space-y-7">
-        <TopBar id={detail.id} />
+        <TopBar id={detail.id} wsId={detail.ws_id} />
         <ReportHeader finding={detail} report={report} />
         <FindingTags detail={detail} onChanged={refetch} onSaved={patchTags} />
         {/* The rail (and its meter) only shows from `lg` up; below that this
@@ -303,5 +310,6 @@ export default function FindingDetail() {
         <Provenance detail={detail} />
       </article>
     </div>
+    </FindingWorkspace.Provider>
   );
 }

@@ -72,7 +72,14 @@ impl WorkspaceStore {
         self.root.join(format!("{id}.customer"))
     }
 
+    /// The record for `id`, or `None` when there is none. An id that is not
+    /// a workspace id (`[A-Za-z0-9_-]+`, see
+    /// [`crate::customers::validate_ws_id`]) names no record: it is never
+    /// joined onto the store directory, so `../x` cannot read a file outside it.
     pub fn load(&self, id: &str) -> Result<Option<Workspace>, StoreError> {
+        if crate::customers::validate_ws_id(id).is_err() {
+            return Ok(None);
+        }
         let path = self.record_path(id);
         if !path.exists() {
             return Ok(None);
