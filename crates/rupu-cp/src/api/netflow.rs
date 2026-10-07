@@ -2003,25 +2003,42 @@ pub(crate) fn build_explorer_response(
     }
 }
 
-/// [`build_explorer_response`] for a global/project scope served from the
-/// netflow index: the whole-history views (histogram, topology node
-/// universe, dropped total) come from tier-1 summaries of every scope file;
-/// the windowed views read rows only from files overlapping the resolved
-/// window. Files are visited in `files` order and rows in file order — the
-/// same order the direct read produces — so order-dependent details (a
-/// timeline lane's org attribution) are identical.
-pub(crate) fn indexed_explorer(
+/// One scope ledger's tier-1 summary: `(ledger id, path, summary)`.
+pub(crate) type ScopeSummary = (String, PathBuf, Arc<crate::netflow_index::LedgerSummary>);
+
+/// Tier-1 summaries of a scope's ledgers, in `files` order (a file gone
+/// since it was listed is skipped). Taken ONCE per request: every
+/// whole-history figure of the response — and, for the global scope, the
+/// ledger ids its run metadata is built for — comes from this one snapshot.
+pub(crate) fn scope_summaries(
     index: &NetflowIndex,
     files: &[(String, PathBuf)],
+) -> Vec<ScopeSummary> {
+    files
+        .iter()
+        .filter_map(|(id, p)| index.summary(p).map(|s| (id.clone(), p.clone(), s)))
+        .collect()
+}
+
+/// [`build_explorer_response`] for a global/project scope served from the
+/// netflow index: the whole-history views (histogram, topology node
+/// universe, dropped total) come from the tier-1 `summaries` of every scope
+/// file ([`scope_summaries`]); the windowed views read rows only from files
+/// overlapping the resolved window. Files are visited in `summaries` order
+/// and rows in file order — the same order the direct read produces — so
+/// order-dependent details (a timeline lane's org attribution) are
+/// identical. Rows are read after the summaries were taken: a flow appended
+/// in between still adds its workflow / origin / org to the node universe
+/// (first-wins, so nothing changes when nothing raced), so no link can name
+/// a node the response lacks.
+pub(crate) fn indexed_explorer(
+    index: &NetflowIndex,
+    summaries: &[ScopeSummary],
     meta: &RunMetaIndex,
     table: Option<&AsnTable>,
     range: &rupu_netflow::ledger::TimeRange,
     filters: &ExplorerFilters,
 ) -> ExplorerResponse {
-    let summaries: Vec<(&str, &StdPath, Arc<crate::netflow_index::LedgerSummary>)> = files
-        .iter()
-        .filter_map(|(id, p)| index.summary(p).map(|s| (id.as_str(), p.as_path(), s)))
-        .collect();
     let dropped = summaries.iter().map(|(_, _, s)| s.dropped).sum();
     let histogram = explorer::histogram_from_points(
         summaries
@@ -2031,7 +2048,7 @@ pub(crate) fn indexed_explorer(
     );
 
     let mut universe = explorer::SankeyUniverse::default();
-    for (id, _, s) in &summaries {
+    for (id, _, s) in summaries {
         if s.flow_count == 0 {
             continue;
         }
@@ -2056,13 +2073,20 @@ pub(crate) fn indexed_explorer(
         to: Some(to),
     };
     let mut tagged = Vec::new();
-    for (id, path, s) in &summaries {
+    for (id, path, s) in summaries {
         if s.overlaps(&rows_window) {
             let (flows, _) = index.flows_in_range(path, &rows_window);
-            tagged.extend(flows.into_iter().map(|f| (id.to_string(), f)));
+            tagged.extend(flows.into_iter().map(|f| (id.clone(), f)));
         }
     }
     let windowed = to_explorer_flows(tagged, meta, table);
+    // A flow appended since `summaries` were taken is in the rows but not in
+    // the summaries: give it its nodes (first-wins — a no-op otherwise).
+    for f in &windowed {
+        universe.add_workflow(f.workflow.as_deref());
+        universe.add_origin_key(f.origin_key());
+        universe.add_org(f.asn.as_ref());
+    }
 
     let timeline =
         explorer::timeline_view(&windowed, from, to, filters, &meta.spans, EXPLORER_BUCKETS);
@@ -2110,9 +2134,16 @@ async fn get_netflow_explorer(
         let resp = run_blocking(move || {
             let meta = project_run_meta(&store, &workspace);
             let files = project_ledger_files(&meta, &workspace, &global_dir);
+            let summaries = scope_summaries(&index, &files);
             let table = load_asn_table(&cache);
-            let mut resp =
-                indexed_explorer(&index, &files, &meta, table.as_deref(), &range, &filters);
+            let mut resp = indexed_explorer(
+                &index,
+                &summaries,
+                &meta,
+                table.as_deref(),
+                &range,
+                &filters,
+            );
             resp.incomplete = scope_gap_from_workers(&meta);
             resp
         })
@@ -2127,15 +2158,22 @@ async fn get_netflow_explorer(
         let resp = run_blocking(move || {
             let files = global_ledger_files(&global_dir);
             index.sweep_missing();
-            let ledger_ids = files
+            let summaries = scope_summaries(&index, &files);
+            let ledger_ids = summaries
                 .iter()
-                .filter(|(_, p)| index.summary(p).is_some_and(|s| s.flow_count > 0))
-                .map(|(id, _)| id.clone())
+                .filter(|(_, _, s)| s.flow_count > 0)
+                .map(|(id, _, _)| id.clone())
                 .collect();
             let meta = global_run_meta_cached(&meta_cache, &global_dir, &store, &ledger_ids);
             let table = load_asn_table(&cache);
-            let mut resp =
-                indexed_explorer(&index, &files, &meta, table.as_deref(), &range, &filters);
+            let mut resp = indexed_explorer(
+                &index,
+                &summaries,
+                &meta,
+                table.as_deref(),
+                &range,
+                &filters,
+            );
             resp.incomplete = scope_gap_from_workers(&meta);
             resp
         })
@@ -2980,7 +3018,9 @@ mod tests {
                     let flows = to_explorer_flows(tagged, &meta, Some(&table));
                     let want =
                         build_explorer_response(&flows, dropped, &meta.spans, true, range, filters);
-                    let got = indexed_explorer(&index, &files, &meta, Some(&table), range, filters);
+                    let summaries = scope_summaries(&index, &files);
+                    let got =
+                        indexed_explorer(&index, &summaries, &meta, Some(&table), range, filters);
                     assert_eq!(
                         serde_json::to_value(&got).unwrap(),
                         serde_json::to_value(&want).unwrap(),
@@ -2991,9 +3031,10 @@ mod tests {
         }
         // The fixture exercises what it claims: AS64500 carries the label of
         // its first flow (ORG-BETA), not of its lowest IP.
+        let index = NetflowIndex::new(u64::MAX);
         let got = indexed_explorer(
-            &NetflowIndex::new(u64::MAX),
-            &files,
+            &index,
+            &scope_summaries(&index, &files),
             &meta,
             Some(&table),
             &rupu_netflow::ledger::TimeRange::unbounded(),
@@ -3001,6 +3042,93 @@ mod tests {
         );
         let org = got.sankey.orgs.iter().find(|n| n.id == "as64500").unwrap();
         assert_eq!(org.label, "ORG-BETA");
+    }
+
+    /// A flow appended between the summaries and the row read (a live
+    /// ledger) must not yield a sankey link to a node the response lacks:
+    /// its origin and org join the node universe from the rows.
+    #[test]
+    fn a_flow_appended_after_the_summaries_still_has_its_nodes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("netflow");
+        let path = ledger(
+            &dir,
+            "run_a",
+            &[
+                at(
+                    with_peer(flow(FlowId::new(), None, "a.com"), Some("1.0.0.1"), true),
+                    100,
+                ),
+                at(
+                    with_peer(flow(FlowId::new(), None, "a.com"), Some("1.0.0.2"), true),
+                    300,
+                ),
+            ],
+            0,
+        );
+        let files = ledger_files_in_dir(&dir);
+        let table = asn_table();
+        let meta = RunMetaIndex::default();
+        let index = NetflowIndex::new(u64::MAX);
+        let summaries = scope_summaries(&index, &files);
+
+        // Appended after the snapshot, inside the resolved window: a NEW
+        // origin and a NEW org.
+        let late = FlowRecord {
+            ctx: FlowCtx {
+                origin: Origin::Scm("github".into()),
+                ..flow(FlowId::new(), None, "late.com").ctx
+            },
+            ..at(
+                with_peer(flow(FlowId::new(), None, "late.com"), Some("2.0.0.1"), true),
+                200,
+            )
+        };
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(
+            &mut f,
+            format!(
+                "{}\n",
+                serde_json::to_string(&rupu_netflow::record::LedgerLine::Flow(Box::new(late)))
+                    .unwrap()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        drop(f);
+
+        let resp = indexed_explorer(
+            &index,
+            &summaries,
+            &meta,
+            Some(&table),
+            &rupu_netflow::ledger::TimeRange::unbounded(),
+            &ExplorerFilters::default(),
+        );
+        let ids = |nodes: &[explorer::NodeAgg]| -> std::collections::HashSet<String> {
+            nodes.iter().map(|n| n.id.clone()).collect()
+        };
+        let (workflows, origins, orgs) = (
+            ids(&resp.sankey.workflows),
+            ids(&resp.sankey.origins),
+            ids(&resp.sankey.orgs),
+        );
+        assert!(resp
+            .sankey
+            .origin_org
+            .iter()
+            .any(|l| l.from == "scm:github"));
+        for l in &resp.sankey.wf_origin {
+            assert!(workflows.contains(&l.from), "{l:?} not in {workflows:?}");
+            assert!(origins.contains(&l.to), "{l:?} not in {origins:?}");
+        }
+        for l in &resp.sankey.origin_org {
+            assert!(origins.contains(&l.from), "{l:?} not in {origins:?}");
+            assert!(orgs.contains(&l.to), "{l:?} not in {orgs:?}");
+        }
     }
 
     /// Spec §3.6 for the flows lists: identical JSON through the index
