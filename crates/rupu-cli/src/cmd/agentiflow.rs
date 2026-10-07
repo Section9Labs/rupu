@@ -125,6 +125,24 @@ pub enum Action {
         #[arg(long)]
         now: bool,
     },
+    /// Watch an agentiflow run: its event log and its lead's current round.
+    ///
+    /// Prints the run's `events.jsonl` (everything so far, then each line as it
+    /// lands) and the lead's transcript for the round in progress, moving on to
+    /// the next round's transcript as it starts. By default it follows the run
+    /// until it ends (a goal met, a budget, a stop, a failure) and then prints
+    /// why it stopped. `--no-follow` (`--once`) prints what the run has
+    /// recorded so far and returns. Attaching to a run that already finished
+    /// shows its log and returns at once. Ctrl-C leaves the run going.
+    Attach {
+        /// Run id (`af_...`): the full id, the compact form `list` prints, or
+        /// a unique prefix / suffix of it.
+        id: String,
+        /// Print what the run has recorded so far and return, instead of
+        /// following it until it ends.
+        #[arg(long = "no-follow", visible_alias = "once", action = clap::ArgAction::SetFalse)]
+        follow: bool,
+    },
     /// Supervise agentiflow runs: reap the ones whose coordinator died.
     ///
     /// A coordinator that is killed (SIGKILL, a crash, the machine going down)
@@ -155,6 +173,7 @@ pub async fn handle(
         Action::Status { id } => status_cmd(&id, global_format),
         Action::Send { id, message, now } => send_cmd(&id, &message, now),
         Action::Stop { id, now } => stop_cmd(&id, now).await,
+        Action::Attach { id, follow } => attach_cmd(&id, follow).await,
         Action::Serve => serve_cmd().await,
     };
     match result {
@@ -171,6 +190,7 @@ pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Re
         Action::Status { .. } => ("agentiflow status", output_report::TABLE_JSON),
         Action::Send { .. } => ("agentiflow send", output_report::TABLE_ONLY),
         Action::Stop { .. } => ("agentiflow stop", output_report::TABLE_ONLY),
+        Action::Attach { .. } => ("agentiflow attach", output_report::TABLE_ONLY),
         Action::Serve => ("agentiflow serve", output_report::TABLE_ONLY),
     };
     formats::ensure_supported(command_name, format, supported)
@@ -1448,6 +1468,346 @@ async fn stop_cmd(fragment: &str, now: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// ---- `attach` ---------------------------------------------------------------
+
+/// How often `attach` looks at the run again. Pure filesystem polling, at the
+/// cadence `session attach` uses.
+const ATTACH_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How long `attach` keeps looking, once the record has gone terminal, for the
+/// run's own `run_stopped` event. A run that finishes on its own writes that
+/// event before it finalizes the record, but `finalize_failed` (the reaper, a
+/// hard stop) writes the record first, so the line can land just after.
+const ATTACH_STOPPED_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Consecutive unreadable-record polls before `attach` gives up (5s). The record
+/// is rewritten in place round by round, so a single bad read is a race with a
+/// writer, not a missing run.
+const ATTACH_MAX_RECORD_FAILURES: u32 = 50;
+
+/// The complete lines a file has gained since the last [`LineTail::drain`]. A
+/// line still being written (no newline yet) waits for the next call, and a
+/// file that shrank (rewritten from the start) is read again from the top.
+struct LineTail {
+    path: std::path::PathBuf,
+    offset: u64,
+}
+
+impl LineTail {
+    fn new(path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            offset: 0,
+        }
+    }
+
+    fn drain(&mut self) -> Vec<String> {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let Ok(mut file) = std::fs::File::open(&self.path) else {
+            return Vec::new();
+        };
+        let Ok(len) = file.metadata().map(|m| m.len()) else {
+            return Vec::new();
+        };
+        if len < self.offset {
+            self.offset = 0;
+        }
+        if len <= self.offset || file.seek(SeekFrom::Start(self.offset)).is_err() {
+            return Vec::new();
+        }
+        let mut bytes = Vec::new();
+        if file.read_to_end(&mut bytes).is_err() {
+            return Vec::new();
+        }
+        let mut lines = Vec::new();
+        for line in bytes.split_inclusive(|&b| b == b'\n') {
+            if !line.ends_with(b"\n") {
+                break;
+            }
+            self.offset += line.len() as u64;
+            let text = String::from_utf8_lossy(&line[..line.len() - 1]);
+            if !text.trim().is_empty() {
+                lines.push(text.into_owned());
+            }
+        }
+        lines
+    }
+}
+
+/// The lead's transcript for the round in progress, following the run from round
+/// to round. The runner writes each round to its own `lead/transcript.r<N>.jsonl`.
+struct LeadTail {
+    dir: std::path::PathBuf,
+    /// The round being followed, once there is one.
+    round: Option<u32>,
+    tailer: Option<crate::output::TranscriptTailer>,
+}
+
+impl LeadTail {
+    fn new(lead_dir: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            dir: lead_dir.into(),
+            round: None,
+            tailer: None,
+        }
+    }
+
+    fn path(&self, round: u32) -> std::path::PathBuf {
+        self.dir.join(format!("transcript.r{round}.jsonl"))
+    }
+
+    /// The highest round that has a transcript yet.
+    fn latest_round(&self) -> Option<u32> {
+        std::fs::read_dir(&self.dir)
+            .ok()?
+            .filter_map(Result::ok)
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter_map(|name| {
+                name.strip_prefix("transcript.r")?
+                    .strip_suffix(".jsonl")?
+                    .parse::<u32>()
+                    .ok()
+            })
+            .max()
+    }
+
+    /// Everything new, as `(round, event)` in order. The first call starts at the
+    /// latest round's first line (a round in progress is shown whole). Once a
+    /// later round has a transcript the one being followed is finished, so its
+    /// last lines are drained before moving on, and every round in between is
+    /// read through, never skipped.
+    fn drain(&mut self) -> Vec<(u32, rupu_transcript::Event)> {
+        // Listed BEFORE the drain: a round that already has a successor is
+        // complete, so draining it now cannot miss its tail.
+        let latest = self.latest_round();
+        let mut out = Vec::new();
+        if let (Some(round), Some(tailer)) = (self.round, self.tailer.as_mut()) {
+            out.extend(tailer.drain().into_iter().map(|e| (round, e)));
+        }
+        let Some(latest) = latest else {
+            return out;
+        };
+        let next = self.round.map_or(latest, |r| r + 1);
+        for round in next..=latest {
+            let mut tailer = crate::output::TranscriptTailer::new(self.path(round));
+            out.extend(tailer.drain().into_iter().map(|e| (round, e)));
+            self.round = Some(round);
+            self.tailer = Some(tailer);
+        }
+        out
+    }
+}
+
+/// The first line of `text`, cut to a length one terminal line can hold.
+fn snippet(text: &str) -> String {
+    const MAX: usize = 160;
+    let first = text.lines().next().unwrap_or("").trim();
+    let mut cut: String = first.chars().take(MAX).collect();
+    if cut.len() < first.len() || text.lines().nth(1).is_some() {
+        cut.push('…');
+    }
+    cut
+}
+
+/// One `events.jsonl` line, as a line of text. A kind this does not know (a
+/// newer writer's) is shown as written.
+fn event_text(raw: &str, parsed: Option<&serde_json::Value>) -> String {
+    let Some(v) = parsed else {
+        return raw.to_string();
+    };
+    let s = |key: &str| v.get(key).and_then(|x| x.as_str());
+    let n = |key: &str| v.get(key).and_then(|x| x.as_u64());
+    match s("kind") {
+        Some("run_started") => format!(
+            "run started: {} ({} goal(s))",
+            s("name").unwrap_or("?"),
+            n("goals").unwrap_or(0)
+        ),
+        Some("round") => format!(
+            "round {} finished: {}  budget {}  goals {}/{}  steering {}{}",
+            n("round").unwrap_or(0),
+            s("outcome").unwrap_or("?"),
+            s("budget").unwrap_or("?"),
+            n("goals_met").unwrap_or(0),
+            n("goals_total").unwrap_or(0),
+            n("steering").unwrap_or(0),
+            s("error")
+                .map(|e| format!("  error: {e}"))
+                .unwrap_or_default(),
+        ),
+        Some("run_stopped") => format!(
+            "run stopped: {}{}",
+            s("stop_reason").unwrap_or("?"),
+            s("detail")
+                .map(|d| format!("  ({})", snippet(d)))
+                .unwrap_or_default()
+        ),
+        _ => raw.to_string(),
+    }
+}
+
+/// One lead transcript event, as a line of text; `None` for the many that are
+/// bookkeeping (turn markers, usage, audits, flows).
+fn transcript_text(event: &rupu_transcript::Event) -> Option<String> {
+    use rupu_transcript::Event;
+    Some(match event {
+        Event::UserMessage { content } => format!("user: {}", snippet(content)),
+        Event::AssistantMessage { content, .. } => format!("assistant: {}", snippet(content)),
+        Event::ToolCall { tool, input, .. } => {
+            format!("tool {tool}: {}", snippet(&input.to_string()))
+        }
+        Event::ToolResult {
+            output,
+            error,
+            duration_ms,
+            ..
+        } => match error {
+            Some(e) => format!("tool error ({duration_ms}ms): {}", snippet(e)),
+            None => format!("tool result ({duration_ms}ms): {}", snippet(output)),
+        },
+        Event::RunComplete { status, error, .. } => {
+            let status = format!("{status:?}").to_lowercase();
+            let why = error
+                .as_deref()
+                .map(|e| format!(" ({e})"))
+                .unwrap_or_default();
+            format!("round ended: {status}{why}")
+        }
+        _ => return None,
+    })
+}
+
+/// The closing line: the run's id and where it stands.
+fn attach_footer(id: &str, record: &AgentiflowRecord) -> String {
+    format!(
+        "{id} {}{}",
+        record.status,
+        record
+            .stop_reason
+            .as_deref()
+            .map(|s| format!("  (stopped: {s})"))
+            .unwrap_or_default()
+    )
+}
+
+/// What to tell an operator watching a run whose coordinator is gone: nothing
+/// else will end the run until the orphan sweep records it as failed.
+fn orphan_notice(record: &AgentiflowRecord) -> Option<String> {
+    let pid = record.runner_pid?;
+    (!rupu_agentiflow::pid_is_running(pid)).then(|| {
+        format!(
+            "coordinator pid {pid} is not running; the run is orphaned and stays `running` until \
+             `rupu agentiflow serve` (or `rupu cp serve`) records it as failed"
+        )
+    })
+}
+
+/// Print what a run has recorded since the last call: its event log, then its
+/// lead's transcript. Returns whether a `run_stopped` event was among them.
+fn print_new(
+    events: &mut LineTail,
+    lead: &mut LeadTail,
+    out: &mut impl std::io::Write,
+) -> std::io::Result<bool> {
+    let mut stopped = false;
+    for raw in events.drain() {
+        let parsed = serde_json::from_str::<serde_json::Value>(&raw).ok();
+        stopped |= parsed
+            .as_ref()
+            .and_then(|v| v.get("kind"))
+            .and_then(|k| k.as_str())
+            == Some("run_stopped");
+        writeln!(out, "[events]  {}", event_text(&raw, parsed.as_ref()))?;
+    }
+    for (round, event) in lead.drain() {
+        if let Some(text) = transcript_text(&event) {
+            writeln!(out, "[lead r{round}]  {text}")?;
+        }
+    }
+    out.flush()?;
+    Ok(stopped)
+}
+
+/// Watch the run in `run_dir`: see the module-level `Attach` docs. With `follow`
+/// it returns once the run is over (its record is no longer `running` and its
+/// `run_stopped` event, or the grace for it, has been printed); without, after
+/// one look.
+fn attach_run(
+    run_dir: &Path,
+    id: &str,
+    follow: bool,
+    poll: std::time::Duration,
+    out: &mut impl std::io::Write,
+) -> anyhow::Result<()> {
+    let mut events = LineTail::new(run_dir.join("events.jsonl"));
+    let mut lead = LeadTail::new(run_dir.join("lead"));
+    let mut saw_stopped = false;
+    let mut over_since: Option<std::time::Instant> = None;
+    let mut warned_orphan = false;
+    let mut failures = 0u32;
+    loop {
+        // The record BEFORE the log: a run that finishes on its own writes its
+        // events first, so a terminal record read now means the drain below
+        // sees them all.
+        let record = AgentiflowRecord::read(run_dir);
+        saw_stopped |= print_new(&mut events, &mut lead, out)?;
+        let record = match record {
+            Ok(record) => {
+                failures = 0;
+                record
+            }
+            Err(e) => {
+                failures += 1;
+                if !follow || failures >= ATTACH_MAX_RECORD_FAILURES {
+                    return Err(anyhow::Error::new(e).context(format!(
+                        "read {}",
+                        run_dir.join("agentiflow.json").display()
+                    )));
+                }
+                std::thread::sleep(poll);
+                continue;
+            }
+        };
+        if !follow {
+            writeln!(out, "{}", attach_footer(id, &record))?;
+            return Ok(());
+        }
+        if record.status != "running" {
+            let since = *over_since.get_or_insert_with(std::time::Instant::now);
+            if saw_stopped || since.elapsed() >= ATTACH_STOPPED_GRACE {
+                writeln!(out, "{}", attach_footer(id, &record))?;
+                return Ok(());
+            }
+        } else if !warned_orphan {
+            if let Some(notice) = orphan_notice(&record) {
+                warned_orphan = true;
+                writeln!(out, "[note]  {notice}")?;
+                out.flush()?;
+            }
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+async fn attach_cmd(fragment: &str, follow: bool) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    // Resolved up front, so an unknown id fails the way `status` / `stop` do.
+    let (id, run_dir, _) = load_run(&global, fragment)?;
+    // A poll loop of blocking reads and sleeps: off the async runtime, as
+    // `session attach` does.
+    tokio::task::spawn_blocking(move || {
+        attach_run(
+            &run_dir,
+            &id,
+            follow,
+            ATTACH_POLL,
+            &mut std::io::stdout().lock(),
+        )
+    })
+    .await
+    .context("the attach task did not finish")?
+}
+
 /// What `agentiflow serve` does for a given `[agentiflow]` config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServePlan {
@@ -2104,6 +2464,314 @@ mod tests {
         assert!(ensure_output_format(&stop, OutputFormat::Json).is_err());
         let stop_now = parse(["rupu", "agentiflow", "stop", "af_01ABC", "--now"]);
         assert!(matches!(stop_now, Action::Stop { now: true, .. }));
+    }
+
+    // ---- attach --------------------------------------------------------------
+
+    #[test]
+    fn attach_follows_by_default_and_no_follow_or_once_turns_that_off() {
+        let followed = parse(["rupu", "agentiflow", "attach", "af_01ABC"]);
+        match &followed {
+            Action::Attach { id, follow } => {
+                assert_eq!(id, "af_01ABC");
+                assert!(follow, "attach follows the run unless told not to");
+            }
+            other => panic!("expected `attach`, got {other:?}"),
+        }
+        for flag in ["--no-follow", "--once"] {
+            let one_shot = parse(["rupu", "agentiflow", "attach", "af_01ABC", flag]);
+            assert!(
+                matches!(one_shot, Action::Attach { follow: false, .. }),
+                "{flag}"
+            );
+        }
+        // A viewer: a table (plain text) command only.
+        assert!(ensure_output_format(&followed, OutputFormat::Table).is_ok());
+        assert!(ensure_output_format(&followed, OutputFormat::Json).is_err());
+    }
+
+    fn append(path: &Path, text: &str) {
+        use std::io::Write as _;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        f.write_all(text.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn a_line_tail_returns_each_complete_line_once_and_waits_out_a_partial_one() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("events.jsonl");
+        let mut tail = LineTail::new(&path);
+        assert!(tail.drain().is_empty(), "a file that does not exist yet");
+
+        append(&path, "one\ntwo\npart");
+        assert_eq!(tail.drain(), ["one", "two"]);
+        assert!(tail.drain().is_empty(), "nothing is returned twice");
+        // The writer finishes the line (and adds a blank one).
+        append(&path, "ial\n\nthree\n");
+        assert_eq!(tail.drain(), ["partial", "three"]);
+
+        // A file rewritten from the top (shorter than what was read) is read
+        // from the top again.
+        std::fs::write(&path, "fresh\n").unwrap();
+        assert_eq!(tail.drain(), ["fresh"]);
+    }
+
+    fn transcript_line(event: &rupu_transcript::Event) -> String {
+        format!("{}\n", serde_json::to_string(event).unwrap())
+    }
+
+    fn assistant(text: &str) -> rupu_transcript::Event {
+        rupu_transcript::Event::AssistantMessage {
+            content: text.into(),
+            thinking: None,
+        }
+    }
+
+    fn texts(drained: &[(u32, rupu_transcript::Event)]) -> Vec<(u32, String)> {
+        drained
+            .iter()
+            .filter_map(|(r, e)| transcript_text(e).map(|t| (*r, t)))
+            .collect()
+    }
+
+    #[test]
+    fn a_lead_tail_starts_at_the_current_round_and_follows_the_rollover_without_skipping() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lead = tmp.path().join("lead");
+        let r = |n: u32| lead.join(format!("transcript.r{n}.jsonl"));
+        let mut tail = LeadTail::new(&lead);
+        assert!(tail.drain().is_empty(), "no round has started");
+
+        // Attached mid-run, at round 1: the earlier round is history, not shown.
+        append(&r(0), &transcript_line(&assistant("round zero")));
+        append(&r(1), &transcript_line(&assistant("one, first")));
+        assert_eq!(texts(&tail.drain()), [(1, "assistant: one, first".into())]);
+
+        // More of the same round arrives.
+        append(&r(1), &transcript_line(&assistant("one, second")));
+        assert_eq!(texts(&tail.drain()), [(1, "assistant: one, second".into())]);
+        assert!(tail.drain().is_empty());
+
+        // Round 1 writes its last line, then rounds 2 AND 3 both start before
+        // the next look: round 1 is finished off, round 2 is read through, and
+        // round 3 becomes the one followed.
+        append(&r(1), &transcript_line(&assistant("one, last")));
+        append(&r(2), &transcript_line(&assistant("two")));
+        append(&r(3), &transcript_line(&assistant("three")));
+        assert_eq!(
+            texts(&tail.drain()),
+            [
+                (1, "assistant: one, last".into()),
+                (2, "assistant: two".into()),
+                (3, "assistant: three".into()),
+            ]
+        );
+        append(&r(3), &transcript_line(&assistant("three, more")));
+        assert_eq!(texts(&tail.drain()), [(3, "assistant: three, more".into())]);
+    }
+
+    #[test]
+    fn events_and_transcript_events_read_as_one_line_each() {
+        let line = |raw: &str| {
+            let v = serde_json::from_str::<serde_json::Value>(raw).ok();
+            event_text(raw, v.as_ref())
+        };
+        assert_eq!(
+            line(r#"{"kind":"run_started","name":"acme","goals":2}"#),
+            "run started: acme (2 goal(s))"
+        );
+        assert_eq!(
+            line(
+                r#"{"kind":"round","round":3,"outcome":"yielded","budget":"soft","goals_met":1,"goals_total":2,"steering":1}"#
+            ),
+            "round 3 finished: yielded  budget soft  goals 1/2  steering 1"
+        );
+        assert!(
+            line(r#"{"kind":"round","round":4,"outcome":"error","error":"boom"}"#)
+                .ends_with("error: boom")
+        );
+        assert_eq!(
+            line(
+                r#"{"kind":"run_stopped","stop_reason":"ceiling","detail":"round ceiling reached"}"#
+            ),
+            "run stopped: ceiling  (round ceiling reached)"
+        );
+        // A kind from a newer writer, and a line that is not JSON, come through as written.
+        assert_eq!(line(r#"{"kind":"future"}"#), r#"{"kind":"future"}"#);
+        assert_eq!(line("not json"), "not json");
+
+        use rupu_transcript::Event;
+        assert_eq!(
+            transcript_text(&Event::UserMessage {
+                content: "Operator steering:\n- focus on auth".into()
+            })
+            .unwrap(),
+            "user: Operator steering:…"
+        );
+        assert_eq!(
+            transcript_text(&Event::ToolCall {
+                call_id: "c".into(),
+                tool: "bash".into(),
+                input: serde_json::json!({"command": "ls"}),
+            })
+            .unwrap(),
+            r#"tool bash: {"command":"ls"}"#
+        );
+        assert_eq!(
+            transcript_text(&Event::RunComplete {
+                run_id: "r".into(),
+                status: rupu_transcript::RunStatus::Aborted,
+                total_tokens: 0,
+                duration_ms: 0,
+                error: Some("paused".into()),
+                outcome: None,
+            })
+            .unwrap(),
+            "round ended: aborted (paused)"
+        );
+        assert!(transcript_text(&Event::TurnStart { turn_idx: 0 }).is_none());
+        // A long line is cut to fit one terminal line.
+        let long = transcript_text(&assistant(&"x".repeat(500))).unwrap();
+        assert!(long.chars().count() < 180, "{long}");
+        assert!(long.ends_with('…'));
+    }
+
+    const FAST: std::time::Duration = std::time::Duration::from_millis(10);
+
+    fn attached(run_dir: &Path, id: &str, follow: bool) -> (anyhow::Result<()>, String) {
+        let mut out = Vec::new();
+        let result = attach_run(run_dir, id, follow, FAST, &mut out);
+        (result, String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn attaching_to_a_finished_run_prints_its_log_and_why_it_stopped_and_returns() {
+        let tmp = seeded_global();
+        let run_dir = agentiflow_dir(tmp.path()).join("af_01OLDER");
+        append(
+            &run_dir.join("events.jsonl"),
+            concat!(
+                "{\"kind\":\"run_started\",\"name\":\"acme\",\"goals\":2}\n",
+                "{\"kind\":\"run_stopped\",\"stop_reason\":\"goals_met\",\"detail\":\"all met\"}\n",
+            ),
+        );
+        append(
+            &run_dir.join("lead/transcript.r0.jsonl"),
+            &transcript_line(&assistant("all done")),
+        );
+        let started = std::time::Instant::now();
+        let (result, out) = attached(&run_dir, "af_01OLDER", true);
+        result.unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "a finished run does not make attach wait"
+        );
+        assert_eq!(
+            out.lines().collect::<Vec<_>>(),
+            [
+                "[events]  run started: acme (2 goal(s))",
+                "[events]  run stopped: goals_met  (all met)",
+                "[lead r0]  assistant: all done",
+                "af_01OLDER completed  (stopped: goals_met)",
+            ]
+        );
+    }
+
+    #[test]
+    fn attach_once_prints_what_there_is_and_returns_while_the_run_is_going() {
+        let tmp = seeded_global();
+        let run_dir = agentiflow_dir(tmp.path()).join("af_01NEWER");
+        append(
+            &run_dir.join("events.jsonl"),
+            "{\"kind\":\"run_started\",\"name\":\"acme\",\"goals\":2}\n",
+        );
+        let (result, out) = attached(&run_dir, "af_01NEWER", false);
+        result.unwrap();
+        assert!(out.contains("[events]  run started: acme"), "{out}");
+        assert_eq!(out.lines().last(), Some("af_01NEWER running"), "{out}");
+    }
+
+    #[test]
+    fn attach_follows_a_run_until_its_record_goes_terminal_and_then_exits() {
+        let tmp = seeded_global();
+        let g = tmp.path().to_path_buf();
+        let run_dir = agentiflow_dir(&g).join("af_01NEWER");
+        append(
+            &run_dir.join("events.jsonl"),
+            "{\"kind\":\"run_started\",\"name\":\"acme\",\"goals\":2}\n",
+        );
+        // The run ends a moment later: its last round, its stop event, then
+        // (as a run that finishes on its own does) the final record.
+        let writer = {
+            let (g, run_dir) = (g.clone(), run_dir.clone());
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                append(
+                    &run_dir.join("lead/transcript.r0.jsonl"),
+                    &transcript_line(&assistant("wrapping up")),
+                );
+                append(
+                    &run_dir.join("events.jsonl"),
+                    "{\"kind\":\"run_stopped\",\"stop_reason\":\"ceiling\",\"detail\":\"done\"}\n",
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                edit_record(&g, "af_01NEWER", |r| {
+                    r.status = "completed".into();
+                    r.stop_reason = Some("ceiling".into());
+                });
+            })
+        };
+        let (result, out) = attached(&run_dir, "af_01NEWER", true);
+        writer.join().unwrap();
+        result.unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "[events]  run started: acme (2 goal(s))", "{out}");
+        assert!(out.contains("[lead r0]  assistant: wrapping up"), "{out}");
+        assert!(out.contains("run stopped: ceiling"), "{out}");
+        assert_eq!(
+            lines.last(),
+            Some(&"af_01NEWER completed  (stopped: ceiling)"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn attach_to_a_run_with_an_unreadable_record_says_so_instead_of_hanging() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let run_dir = agentiflow_dir(tmp.path()).join("af_x");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        // One look (`--no-follow`) fails at once.
+        let (result, _) = attached(&run_dir, "af_x", false);
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(msg.contains("agentiflow.json"), "{msg}");
+    }
+
+    #[test]
+    fn a_run_whose_coordinator_is_gone_is_called_out_while_attach_waits() {
+        let tmp = seeded_global();
+        let g = tmp.path();
+        let record = AgentiflowRecord::read(&agentiflow_dir(g).join("af_01NEWER")).unwrap();
+        assert!(orphan_notice(&record).is_none(), "no pid recorded");
+
+        // A pid that is not running.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        let mut orphaned = record.clone();
+        orphaned.runner_pid = Some(dead);
+        let notice = orphan_notice(&orphaned).expect("a dead coordinator is noticed");
+        assert!(notice.contains(&format!("pid {dead}")), "{notice}");
+        assert!(notice.contains("rupu agentiflow serve"), "{notice}");
+
+        // This process is alive.
+        let mut live = record;
+        live.runner_pid = Some(std::process::id());
+        assert!(orphan_notice(&live).is_none());
     }
 
     // ---- list / status over a seeded `<global>/agentiflows/` ----------------
