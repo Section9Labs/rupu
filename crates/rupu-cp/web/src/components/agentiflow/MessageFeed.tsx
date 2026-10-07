@@ -3,8 +3,8 @@
 // first. This is the agentiflow "message inbox" — what the agents are saying to
 // one another. Reads `GET /api/agentiflows/:id/messages`; polls while live.
 
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { RefreshCw, Megaphone } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { RefreshCw, Megaphone, Send } from 'lucide-react';
 import { api, apiErrorMessage, type AgentiflowBoardPost } from '../../lib/api';
 import { Badge, type BadgeTone } from '../ui/Badge';
 import { Button } from '../ui/Button';
@@ -63,6 +63,66 @@ function MsgRow({ m }: { m: Msg }) {
   );
 }
 
+/** Operator → lead steering: the `rupu agentiflow send` channel, in the UI.
+ *  Shown only while the run is live (a finished lead never drains the queue). */
+function SteeringBox({ id, onSent }: { id: string; onSent: () => void }) {
+  const [draft, setDraft] = useState('');
+  const [sending, setSending] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function send(now: boolean) {
+    const message = draft.trim();
+    if (!message) return;
+    setSending(true);
+    setErr(null);
+    setNote(null);
+    try {
+      await api.steerAgentiflow(id, { message, now });
+      setDraft('');
+      setNote(now ? 'Sent — the lead picks it up mid-round.' : 'Queued — the lead reads it at the next round boundary.');
+      onSent();
+    } catch (e) {
+      setErr(apiErrorMessage(e));
+    } finally {
+      setSending(false);
+    }
+  }
+
+  return (
+    <div className="mb-3 rounded-xl border border-border bg-panel p-3 shadow-card">
+      <div className="mb-1.5 flex items-center gap-1.5 text-note font-medium text-ink-dim">
+        <Megaphone size={12} className="text-brand-500" />
+        Steer the lead
+      </div>
+      <div className="flex items-center gap-2">
+        <input
+          className="min-w-0 flex-1 rounded-lg border border-border bg-bg px-3 py-1.5 text-sm text-ink placeholder:text-ink-mute"
+          placeholder="Tell the lead what to focus on, re-scope, or prioritize…"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+              e.preventDefault();
+              void send(false);
+            }
+          }}
+          disabled={sending}
+        />
+        <Button variant="secondary" onClick={() => void send(true)} disabled={sending || !draft.trim()} title="Deliver mid-round (interrupt)">
+          Now
+        </Button>
+        <Button onClick={() => void send(false)} disabled={sending || !draft.trim()} className="gap-1.5">
+          <Send size={12} />
+          Send
+        </Button>
+      </div>
+      {note && <div className="mt-1.5 text-meta text-ok">{note}</div>}
+      {err && <div className="mt-1.5 text-meta text-err">{err}</div>}
+    </div>
+  );
+}
+
 export default function MessageFeed({ id, live }: { id: string; live?: boolean }) {
   const [msgs, setMsgs] = useState<Msg[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -113,37 +173,45 @@ export default function MessageFeed({ id, live }: { id: string; live?: boolean }
     return () => clearInterval(t);
   }, [live, load]);
 
+  let body: ReactNode;
   if (msgs === null && loading) {
-    return (
+    body = (
       <div className="py-10 flex items-center justify-center">
         <Spinner label="Loading messages…" />
       </div>
     );
-  }
-  if (error) return <ErrorBanner>{error}</ErrorBanner>;
-  if (!msgs || msgs.length === 0) {
-    return (
+  } else if (error) {
+    body = <ErrorBanner>{error}</ErrorBanner>;
+  } else if (!msgs || msgs.length === 0) {
+    body = (
       <EmptyState
         title="No messages yet"
         hint="The fleet posts here as it coordinates — the lead's directives and the agents' observations to each other. A single-agent round may never post."
       />
     );
+  } else {
+    body = (
+      <div>
+        <div className="mb-2 flex items-center justify-between">
+          <span className="text-note tabular-nums text-ink-dim">{msgs.length} messages</span>
+          <Button variant="secondary" onClick={() => load(false)} className="gap-1.5">
+            <RefreshCw size={12} className={cn(loading && 'animate-spin')} />
+            Refresh
+          </Button>
+        </div>
+        <div className="rounded-xl border border-border bg-panel px-3 shadow-card">
+          {msgs.map((m, i) => (
+            <MsgRow key={`${m.channel}-${i}`} m={m} />
+          ))}
+        </div>
+      </div>
+    );
   }
 
   return (
     <div>
-      <div className="mb-2 flex items-center justify-between">
-        <span className="text-note tabular-nums text-ink-dim">{msgs.length} messages</span>
-        <Button variant="secondary" onClick={() => load(false)} className="gap-1.5">
-          <RefreshCw size={12} className={cn(loading && 'animate-spin')} />
-          Refresh
-        </Button>
-      </div>
-      <div className="rounded-xl border border-border bg-panel px-3 shadow-card">
-        {msgs.map((m, i) => (
-          <MsgRow key={`${m.channel}-${i}`} m={m} />
-        ))}
-      </div>
+      {live && <SteeringBox id={id} onSent={() => load(true)} />}
+      {body}
     </div>
   );
 }

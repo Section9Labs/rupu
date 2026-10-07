@@ -190,9 +190,14 @@ export default function AssetInventory({
     );
   }
 
+  // An asset id is globally unique (kind + locator), so the same asset served
+  // from two registry entries that point at one path (the duplicate-workspace
+  // bug) is a true duplicate — collapse by id before display.
+  const unique = Array.from(new Map(assets.map((a) => [a.id, a])).values());
+
   // Group by project (workspace) for display.
   const byProject = new Map<string, AssetRow[]>();
-  for (const a of assets) {
+  for (const a of unique) {
     const key = a.project || a.ws_id;
     (byProject.get(key) ?? byProject.set(key, []).get(key)!).push(a);
   }
@@ -202,7 +207,7 @@ export default function AssetInventory({
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <span className="text-note tabular-nums text-ink-dim">
-          {assets.length} assets across {projects.length} {projects.length === 1 ? 'project' : 'projects'}
+          {unique.length} assets across {projects.length} {projects.length === 1 ? 'project' : 'projects'}
         </span>
         <Button variant="secondary" onClick={() => load()} className="gap-1.5">
           <RefreshCw size={12} className={cn(loading && 'animate-spin')} />

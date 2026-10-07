@@ -2861,6 +2861,15 @@ export const api = {
     return request<AgentiflowMessages>(`/api/agentiflows/${encodeURIComponent(id)}/messages`, { signal: opts?.signal });
   },
 
+  /** Queue a steering message for the lead (the `rupu agentiflow send` channel).
+   *  `now` asks for mid-round delivery; `stop` winds the run down after it. */
+  async steerAgentiflow(id: string, body: { message: string; now?: boolean; stop?: boolean }): Promise<void> {
+    await request(`/api/agentiflows/${encodeURIComponent(id)}/steer`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+  },
+
   /** Engagement assets (hosts/services/sites/routes/files). Optionally scoped
    *  to one workspace / coverage target. */
   async getAssets(opts?: { ws_id?: string; target?: string } & Cancellable): Promise<AssetRow[]> {

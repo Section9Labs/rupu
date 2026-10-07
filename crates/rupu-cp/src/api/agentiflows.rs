@@ -26,13 +26,14 @@ use crate::{
 };
 use axum::{
     extract::{Path, State},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use chrono::{DateTime, Utc};
 use rupu_agentiflow::{
     agentiflow_dir, pid_is_running, units_on_disk, AgentiflowDef, AgentiflowRecord, Budget,
-    CoverageTarget, Goal, GoalTarget, Pool, RoundConfig, UnitOnDisk, UnitStatus,
+    CoverageTarget, Goal, GoalTarget, OperatorMessage, OperatorQueue, Pool, RoundConfig, UnitOnDisk,
+    UnitStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -50,6 +51,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/agentiflows", get(list_agentiflows))
         .route("/api/agentiflows/:id", get(get_agentiflow))
         .route("/api/agentiflows/:id/messages", get(get_agentiflow_messages))
+        .route("/api/agentiflows/:id/steer", post(steer_agentiflow))
 }
 
 // ---------------------------------------------------------------------------
@@ -685,6 +687,67 @@ async fn get_agentiflow_messages(
         posts: read_jsonl(board.join("posts.jsonl")),
         directives: read_jsonl(board.join("directives.jsonl")),
     }))
+}
+
+/// `POST /api/agentiflows/:id/steer` — queue an operator steering message for
+/// the lead, the same channel `rupu agentiflow send` writes. The lead drains
+/// the queue at the next round boundary (`now: true` also asks for a mid-round
+/// interrupt). Refused (409) when the run is not `running`, since a finished
+/// lead never drains it.
+#[derive(Deserialize)]
+struct SteerRequest {
+    message: String,
+    /// `send --now`: ask for mid-round delivery, not just the round boundary.
+    #[serde(default)]
+    now: bool,
+    /// Ask the envelope to wind the run down after this message.
+    #[serde(default)]
+    stop: bool,
+}
+
+#[derive(Serialize)]
+struct SteerResponse {
+    queued: bool,
+}
+
+async fn steer_agentiflow(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<SteerRequest>,
+) -> ApiResult<Json<SteerResponse>> {
+    if !valid_run_id(&id) {
+        return Err(ApiError::not_found(format!("no agentiflow run `{id}`")));
+    }
+    let body = req.message.trim().to_string();
+    if body.is_empty() {
+        return Err(ApiError::bad_request("steering message is empty"));
+    }
+    let run_dir = agentiflow_dir(&s.global_dir).join(&id);
+    if !run_dir.is_dir() {
+        return Err(ApiError::not_found(format!("no agentiflow run `{id}`")));
+    }
+    // The lead only drains steering while the run is active — refuse otherwise
+    // rather than silently queue a message nothing will ever read.
+    let status = std::fs::read_to_string(run_dir.join("agentiflow.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|v| v.get("status").and_then(|st| st.as_str()).map(String::from));
+    if status.as_deref() != Some("running") {
+        return Err(ApiError::conflict(format!(
+            "agentiflow `{id}` is not running ({}) — it cannot take a steering message",
+            status.as_deref().unwrap_or("unknown"),
+        )));
+    }
+    let msg = OperatorMessage {
+        ts: Utc::now().to_rfc3339(),
+        body,
+        stop: req.stop,
+        interrupt: req.now,
+    };
+    OperatorQueue::new(&run_dir)
+        .enqueue(&msg)
+        .map_err(|e| ApiError::internal(format!("could not queue steering message: {e}")))?;
+    Ok(Json(SteerResponse { queued: true }))
 }
 
 #[cfg(test)]
