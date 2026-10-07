@@ -182,7 +182,10 @@ steps:
             load_workflow(&global, None, "both").unwrap().name,
             "two-step"
         );
-        assert_eq!(load_workflow(&global, None, "only-yml").unwrap().name, "foo");
+        assert_eq!(
+            load_workflow(&global, None, "only-yml").unwrap().name,
+            "foo"
+        );
     }
 
     #[test]
