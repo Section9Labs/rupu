@@ -6,7 +6,9 @@
 //!
 //! ```text
 //! <global>/agentiflows/<id>/
-//!   agentiflow.json            AgentiflowRecord, rewritten atomically (tmp + rename)
+//!   agentiflow.json            AgentiflowRecord, rewritten atomically (tmp + rename):
+//!                              written `running` at start, refreshed with the live spend
+//!                              as each round ends, and finalized at the stop
 //!   agentiflow.yaml            the definition this run was started from (written once, atomically)
 //!   events.jsonl               append-only event log (shape below)
 //!   usage.jsonl                the lead's usage ledger (one row per LLM call; metered
@@ -44,11 +46,13 @@
 //! - `round`: written when a lead round FINISHES. `round` (zero-based index),
 //!   `budget` (`ok` / `soft` / `hard:<dimension>`), `converge` (bool),
 //!   `goals_met` / `goals_total` (as the round began), `steering` (messages
-//!   delivered), `outcome` (`yielded` / `turn_budget_hit` / `error`), and
-//!   `error` when the outcome is `error`
+//!   delivered), `outcome` (`yielded` / `turn_budget_hit` / `error`), `error`
+//!   when the outcome is `error`, and `spent_usd` / `spent_tokens` (the run's
+//!   cumulative metered spend as the round ended: the lead's ledger plus every
+//!   launched unit's; see "Budget enforcement" on [`run_agentiflow`])
 //! - `run_stopped`: `stop_reason` (a stable code, see [`AgentiflowRecord`]),
 //!   `detail` (human text), `rounds`, `goals` (`id` / `met` / `current` /
-//!   `target`), `summary`
+//!   `target`), `summary`, and the final `spent_usd` / `spent_tokens`
 //!
 //! The log is deliberately local and minimal: a best-effort append. A failed
 //! append is logged (`tracing::warn!`) and never stops the run; the durable
@@ -112,6 +116,14 @@ pub struct GoalStatus {
 /// `stop_reason` is a stable snake_case code: `goals_met`,
 /// `coverage_reached`, `budget_exhausted:<dimension>`, `operator_stop`,
 /// `ceiling`; for a `failed` run it is `error: <message>`.
+///
+/// `spent_usd` / `spent_tokens` are the run's metered spend (the same meter
+/// `budget.usd` / `budget.tokens` are enforced against): refreshed as each
+/// round ends, so a `running` record shows the spend as of the last finished
+/// round, and final once the run has stopped. `spent_usd` is `None` until the
+/// run has metered anything, and on a record written before metering existed;
+/// a model with no price counts as `$0` in it. Both default when absent, so
+/// older records still parse.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentiflowRecord {
     pub id: String,
@@ -126,6 +138,13 @@ pub struct AgentiflowRecord {
     pub ended_at: Option<DateTime<Utc>>,
     /// Human codename; minted by the daemon (Plan 4), `None` before then.
     pub codename: Option<String>,
+    /// USD spent so far, priced through the layered `[pricing]` config. `None`
+    /// until the run has metered (and on records that predate it).
+    #[serde(default)]
+    pub spent_usd: Option<f64>,
+    /// Billable (input + output) tokens spent so far.
+    #[serde(default)]
+    pub spent_tokens: u64,
 }
 
 impl AgentiflowRecord {
@@ -390,15 +409,49 @@ fn budget_label(b: &BudgetStage) -> String {
     }
 }
 
-/// Wraps the real lead driver to write a `round` event as each round ends.
-/// The envelope owns the round loop and has no hook of its own, so the event
-/// is recorded at the one seam every round passes through.
+/// What a run has spent, as the budget meter reads it right now.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Spend {
+    usd: f64,
+    tokens: u64,
+}
+
+impl Spend {
+    /// Read the meter. Infallible by construction: the ledger fold skips
+    /// whatever it cannot read, so recording spend can never fail a round or
+    /// the run.
+    fn read(usage: &dyn UsageSource) -> Self {
+        Self {
+            usd: usage.spent_usd(),
+            tokens: usage.spent_tokens(),
+        }
+    }
+
+    /// Stamp this spend onto `record`.
+    fn stamp(self, record: &mut AgentiflowRecord) {
+        record.spent_usd = Some(self.usd);
+        record.spent_tokens = self.tokens;
+    }
+}
+
+/// Wraps the real lead driver to write a `round` event, and refresh the
+/// record's spend, as each round ends. The envelope owns the round loop and
+/// has no hook of its own, so both are recorded at the one seam every round
+/// passes through.
 struct RecordingLead<'a> {
     inner: RunAgentLeadDriver,
     events: &'a EventLog,
     now: &'a (dyn Fn() -> DateTime<Utc> + Send + Sync),
     /// Published as each round begins, for the lead's `budget.status` tool.
     round: Arc<AtomicU32>,
+    /// The meter the envelope enforces the budget against: read as each round
+    /// ends for the `round` event and the record.
+    usage: Arc<dyn UsageSource>,
+    /// The run's own copy of its record (still `running`), refreshed with the
+    /// live spend after each round so `rupu agentiflow status` can show it
+    /// while the run is going.
+    record: AgentiflowRecord,
+    run_dir: &'a Path,
 }
 
 impl LeadDriver for RecordingLead<'_> {
@@ -411,6 +464,7 @@ impl LeadDriver for RecordingLead<'_> {
             RoundOutcome::TurnBudgetHit => ("turn_budget_hit", None),
             RoundOutcome::Error(e) => ("error", Some(e.as_str())),
         };
+        let spend = Spend::read(&*self.usage);
         let mut fields = json!({
             "round": ctx.round,
             "budget": budget_label(&d.budget),
@@ -419,11 +473,22 @@ impl LeadDriver for RecordingLead<'_> {
             "goals_total": d.goals.len(),
             "steering": d.steering.len(),
             "outcome": outcome,
+            "spent_usd": spend.usd,
+            "spent_tokens": spend.tokens,
         });
         if let (Some(e), Some(obj)) = (error, fields.as_object_mut()) {
             obj.insert("error".into(), Value::String(e.to_string()));
         }
         self.events.emit((self.now)(), "round", fields);
+        // Best-effort, like the event: the final record carries the totals.
+        spend.stamp(&mut self.record);
+        if let Err(e) = self.record.write(self.run_dir) {
+            tracing::warn!(
+                id = %self.record.id,
+                error = %e,
+                "could not refresh the agentiflow record's spend"
+            );
+        }
         out
     }
 }
@@ -441,7 +506,8 @@ impl LeadDriver for RecordingLead<'_> {
 ///    a `running` [`AgentiflowRecord`], and runs the envelope over the pooled
 ///    evidence scope with a [`RunAgentLeadDriver`] lead.
 /// 4. On a stop, writes the final record (`completed`, with the stop reason,
-///    round count and goal statuses) and returns the [`EnvelopeOutcome`].
+///    round count, goal statuses and the final spend) and returns the
+///    [`EnvelopeOutcome`].
 ///
 /// # Threading
 ///
@@ -475,6 +541,12 @@ impl LeadDriver for RecordingLead<'_> {
 /// The lead's `budget.status` tool reads the same meter, enforced budget and
 /// clock the envelope does (see [`BudgetProbe`]), so it reports exactly what
 /// the next round's check will act on.
+///
+/// That meter is also what the run persists: each finished round carries the
+/// cumulative `spent_usd` / `spent_tokens` on its `round` event and stamps them
+/// on the `running` record (so `rupu agentiflow status` shows live spend), and
+/// the `run_stopped` event and the final record carry the totals. Reading the
+/// meter never fails a round or the run.
 pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, AgentiflowError> {
     let RunAgentiflowOpts {
         def,
@@ -575,6 +647,8 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 started_at: started,
                 ended_at: None,
                 codename: None,
+                spent_usd: None,
+                spent_tokens: 0,
             };
             record.write(&run_dir)?;
 
@@ -755,6 +829,9 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 events: &events,
                 now: &*now,
                 round,
+                usage: usage.clone() as Arc<dyn UsageSource>,
+                record: record.clone(),
+                run_dir: &run_dir,
             };
 
             events.emit(
@@ -776,6 +853,8 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
             drop(lead);
             let ended = now();
             let goals = goal_statuses(&outcome);
+            // The final spend, read once the units are wound down.
+            let spend = Spend::read(&*usage);
             events.emit(
                 ended,
                 "run_stopped",
@@ -785,9 +864,12 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                     "rounds": outcome.rounds,
                     "goals": goals,
                     "summary": outcome.summary,
+                    "spent_usd": spend.usd,
+                    "spent_tokens": spend.tokens,
                 }),
             );
 
+            spend.stamp(&mut record);
             record.status = "completed".into();
             record.stop_reason = Some(stop_code(&outcome.stop));
             record.rounds = outcome.rounds;
@@ -999,7 +1081,27 @@ mod tests {
             started_at: started(),
             ended_at: Some(started() + chrono::Duration::minutes(5)),
             codename: None,
+            spent_usd: Some(0.0042),
+            spent_tokens: 12_345,
         }
+    }
+
+    #[test]
+    fn a_record_written_before_spend_was_recorded_still_parses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run = tmp.path().join("run");
+        // Exactly what an older build wrote: no `spent_*` keys at all.
+        let mut old = serde_json::to_value(sample_record()).unwrap();
+        let obj = old.as_object_mut().unwrap();
+        assert!(obj.remove("spent_usd").is_some());
+        assert!(obj.remove("spent_tokens").is_some());
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join(RECORD_FILE), serde_json::to_vec(&old).unwrap()).unwrap();
+
+        let rec = AgentiflowRecord::read(&run).unwrap();
+        assert_eq!(rec.spent_usd, None);
+        assert_eq!(rec.spent_tokens, 0);
+        assert_eq!(rec.rounds, 3, "the rest of the record is intact");
     }
 
     #[test]
@@ -1013,6 +1115,10 @@ mod tests {
         // The trigger is persisted in its snake_case wire form.
         let raw = std::fs::read_to_string(run.join(RECORD_FILE)).unwrap();
         assert!(raw.contains("\"agentiflow\""), "{raw}");
+        // ...and so is the spend.
+        let json: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(json["spent_usd"], 0.0042, "{raw}");
+        assert_eq!(json["spent_tokens"], 12_345, "{raw}");
     }
 
     #[test]
@@ -1430,6 +1536,106 @@ mod tests {
             }
         );
         assert_eq!(out.rounds, 1, "round 0 ran, then its spend tripped the cap");
+    }
+
+    // ---- persisted spend ------------------------------------------------------
+
+    /// [`one_turn_factory`], also noting what the ON-DISK record says each time
+    /// a round builds its provider. The provider is built as a round starts,
+    /// so the record it sees is the one the previous round left.
+    fn spend_watching_factory(
+        run_dir: PathBuf,
+        seen: Arc<std::sync::Mutex<Vec<AgentiflowRecord>>>,
+    ) -> ProviderFactory {
+        let mut inner = one_turn_factory();
+        Box::new(move || {
+            seen.lock()
+                .unwrap()
+                .push(AgentiflowRecord::read(&run_dir).unwrap());
+            inner()
+        })
+    }
+
+    fn close(got: f64, want: f64) -> bool {
+        (got - want).abs() < 1e-12
+    }
+
+    /// Each round of the one-turn test lead bills 1 in + 1 out at $1 / Mtok:
+    /// 2 tokens and 2e-6 USD per round, cumulative.
+    #[test]
+    fn spend_is_recorded_per_round_in_the_events_and_on_the_running_record() {
+        let fx = fixture();
+        let id = "af_spend";
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let def = operator_only("round: { ceiling: { rounds: 3 } }");
+        let mut o = opts(&fx, def, id);
+        o.pricing = mock_pricing();
+        o.make_provider = spend_watching_factory(run_dir(&fx, id), seen.clone());
+        let out = run_agentiflow(o).unwrap();
+        assert_eq!(out.rounds, 3);
+
+        // The `round` events carry the cumulative spend as each round ended...
+        let evs = events(&fx, id);
+        let rounds: Vec<&Value> = evs.iter().filter(|e| e["kind"] == "round").collect();
+        assert_eq!(rounds.len(), 3, "{evs:?}");
+        for (i, r) in rounds.iter().enumerate() {
+            let n = (i as u64 + 1) * 2;
+            assert_eq!(r["spent_tokens"], n, "round {i}: {r}");
+            assert!(
+                close(r["spent_usd"].as_f64().unwrap(), n as f64 * 1e-6),
+                "round {i}: {r}"
+            );
+        }
+        // ...and `run_stopped` carries the totals.
+        let stopped = evs.last().unwrap();
+        assert_eq!(stopped["kind"], "run_stopped");
+        assert_eq!(stopped["spent_tokens"], 6, "{stopped}");
+        assert!(close(stopped["spent_usd"].as_f64().unwrap(), 6e-6));
+
+        // Live: while the run was going, each round found the record `running`
+        // with the spend the previous round had left (none metered before round 0).
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        assert!(seen.iter().all(|r| r.status == "running"));
+        assert_eq!((seen[0].spent_usd, seen[0].spent_tokens), (None, 0));
+        assert_eq!(seen[1].spent_tokens, 2);
+        assert!(close(seen[1].spent_usd.unwrap(), 2e-6));
+        assert_eq!(seen[2].spent_tokens, 4);
+        assert!(close(seen[2].spent_usd.unwrap(), 4e-6));
+
+        // The final record is the totals.
+        let rec = AgentiflowRecord::read(&run_dir(&fx, id)).unwrap();
+        assert_eq!(rec.status, "completed");
+        assert_eq!(rec.spent_tokens, 6);
+        assert!(close(rec.spent_usd.unwrap(), 6e-6));
+    }
+
+    #[test]
+    fn a_run_that_never_ran_the_lead_records_zero_spend_not_none() {
+        let fx = fixture();
+        let id = "af_spend_zero";
+        seed_finding(&fx, id);
+        run_agentiflow(opts(&fx, def_with(""), id)).unwrap();
+
+        // Metered, and nothing was spent: `Some(0)`, so a reader can tell it
+        // from a record that predates metering.
+        let rec = AgentiflowRecord::read(&run_dir(&fx, id)).unwrap();
+        assert_eq!((rec.spent_usd, rec.spent_tokens), (Some(0.0), 0));
+        let stopped = events(&fx, id).pop().unwrap();
+        assert_eq!(stopped["spent_tokens"], 0, "{stopped}");
+        assert_eq!(stopped["spent_usd"], 0.0, "{stopped}");
+    }
+
+    #[test]
+    fn an_unpriced_model_still_records_its_tokens_and_zero_usd() {
+        let fx = fixture();
+        let id = "af_spend_unpriced";
+        // No `[pricing]` for `mock` / `mock-1`: tokens count, usd reads $0.
+        let def = operator_only("round: { ceiling: { rounds: 2 } }");
+        run_agentiflow(opts(&fx, def, id)).unwrap();
+        let rec = AgentiflowRecord::read(&run_dir(&fx, id)).unwrap();
+        assert_eq!(rec.spent_tokens, 4);
+        assert_eq!(rec.spent_usd, Some(0.0));
     }
 
     #[test]
