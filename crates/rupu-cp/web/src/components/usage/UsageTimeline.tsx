@@ -20,7 +20,8 @@
 // breakdown table (Task U4) without a second, duplicate fetch.
 
 import { useEffect, useMemo, useState } from 'react';
-import { api, type Pivot, type UsageRunRow, type UsageWindow } from '../../lib/api';
+import { api, type CustomerScope, type Pivot, type UsageRunRow, type UsageWindow } from '../../lib/api';
+import { PricingErrorMark } from '../customers/PricingErrorMark';
 import { buildTimeline, type TimelineFilter } from '../../lib/usage/buildTimeline';
 import UsageTimelineStacked, { type UsageMetric } from '../dashboard/UsageTimelineStacked';
 import { Spinner } from '../ui/Spinner';
@@ -29,6 +30,7 @@ const METRICS: UsageMetric[] = ['cost', 'tokens'];
 
 export default function UsageTimeline({
   workspaceId,
+  customer,
   usageWindow,
   pivot,
   metric,
@@ -46,6 +48,8 @@ export default function UsageTimeline({
   /** Scopes the fetch to one project's runs. Omitted on `/usage` — all
    *  local runs. */
   workspaceId?: string;
+  /** Scopes the fetch to one customer's work (`?customer=<slug>|none`). */
+  customer?: CustomerScope;
   /** The `{since, until}` window driving every fetch below — a preset
    *  (7d/30d/all) is just a window ending "now" (see `presetWindow`); a
    *  drag-selected custom window (Task W3, via `onSelectRange` below) is the
@@ -59,7 +63,7 @@ export default function UsageTimeline({
   excludedCount: number;
   onReset: () => void;
   hosts?: { host_id: string; name: string }[];
-  headline: { costLabel: string; subLabel: string };
+  headline: { costLabel: string; subLabel: string; pricingError?: string };
   onRunsLoaded?: (rows: UsageRunRow[]) => void;
   /**
    * Marquee drag-select (Task W3) — pure passthrough to
@@ -118,7 +122,12 @@ export default function UsageTimeline({
     // assertion like `toHaveBeenCalledWith(usageWindow)` — matching how
     // `/usage` itself called `getUsageRuns` before this component existed —
     // still matches.
-    (workspaceId ? api.getUsageRuns(usageWindow, workspaceId) : api.getUsageRuns(usageWindow))
+    (customer
+      ? api.getUsageRuns(usageWindow, workspaceId, customer)
+      : workspaceId
+        ? api.getUsageRuns(usageWindow, workspaceId)
+        : api.getUsageRuns(usageWindow)
+    )
       .then((rows) => {
         if (cancelled) return;
         setRuns(rows);
@@ -140,7 +149,7 @@ export default function UsageTimeline({
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- onRunsLoaded is a caller-supplied callback, not a re-fetch trigger; `usageWindow` itself is intentionally omitted in favor of its primitive fields (see doc comment above).
-  }, [usageWindow.since, usageWindow.until, workspaceId]);
+  }, [usageWindow.since, usageWindow.until, workspaceId, customer]);
 
   const isInitialLoad = runs === null;
   const timeline = useMemo(() => buildTimeline(runs ?? [], pivot, filter, 'day'), [runs, pivot, filter]);
@@ -160,8 +169,9 @@ export default function UsageTimeline({
                 once the graph has already painted once (see `isUpdating`). */}
             {isUpdating && <Spinner size="sm" label="updating" />}
           </h2>
-          <p className="mt-0.5 text-2xl font-semibold tabular-nums text-ink">
+          <p className="mt-0.5 inline-flex items-center gap-1.5 text-2xl font-semibold tabular-nums text-ink">
             {headline.costLabel}
+            <PricingErrorMark error={headline.pricingError} />
           </p>
           <p className="text-xs text-ink-mute">{headline.subLabel}</p>
         </div>

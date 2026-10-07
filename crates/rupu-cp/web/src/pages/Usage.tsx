@@ -46,6 +46,12 @@
 // `workspaceId`, instead of forking it. Pivot/metric/the exclusion filter
 // stay OWNED here (not inside `UsageTimeline`) because this page shares all
 // three with the breakdown table and outlier panel below.
+//
+// Customer scope (customers Plan 2B): `customer` (a slug) scopes every fetch
+// to that customer's work (`?customer=`) and renders the page embedded, without
+// its title. Aggregates are local-only under a filter, so a remote host answers
+// 501 and shows as unavailable in the host strip rather than being counted.
+// The customer detail's Usage tab mounts it this way.
 
 import { useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react';
 import {
@@ -81,7 +87,8 @@ function toggleInSet(set: Set<string>, key: string): Set<string> {
   return next;
 }
 
-export default function Usage() {
+export default function Usage({ customer }: { customer?: string } = {}) {
+  const embedded = customer !== undefined;
   const [range, setRange] = useState<DashboardRange>('30d');
   // The `{since, until}` window driving every usage fetch below (Task W2) —
   // `range` is kept alongside purely for the 7/30/All button highlighting.
@@ -104,7 +111,7 @@ export default function Usage() {
   // identity is the preset (its `until` ticks every 30s without changing what
   // the operator is looking at); a custom window's is its exact bounds.
   const windowKey = isCustomWindow ? `${usageWindow.since}|${usageWindow.until}` : `preset:${range}`;
-  const { data: current, hosts, error, notice } = useUsageData(usageWindow, windowKey, windowSource);
+  const { data: current, hosts, error, notice } = useUsageData(usageWindow, windowKey, windowSource, customer);
   // `current` is null from a user window change until the first host answers for
   // the NEW window (the hook never mixes an old window's figures into a new
   // one). Keep the last good headline on screen meanwhile, as the page did when
@@ -185,8 +192,7 @@ export default function Usage() {
   // stable (same primitive-deps pattern as `UsageTimeline`'s own effect).
   useEffect(() => {
     let cancelled = false;
-    api
-      .getUsageOutliers(usageWindow)
+    (customer ? api.getUsageOutliers(usageWindow, customer) : api.getUsageOutliers(usageWindow))
       .then((rows) => {
         if (!cancelled) setOutliers(rows);
       })
@@ -198,7 +204,7 @@ export default function Usage() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed off usageWindow's primitive fields, not the object itself; see comment above.
-  }, [usageWindow.since, usageWindow.until]);
+  }, [usageWindow.since, usageWindow.until, customer]);
 
   // Live refresh: a preset window ends at "now", so its `until` goes stale the
   // moment it is built — new runs (and a still-running run's growing usage)
@@ -249,10 +255,10 @@ export default function Usage() {
   const breakdown = useMemo(() => aggregateRuns(runs, pivot), [runs, pivot]);
 
   return (
-    <div className="space-y-4 p-4">
+    <div className={embedded ? 'space-y-4' : 'space-y-4 p-4'}>
       <header className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="text-lg font-semibold text-ink">Usage</h1>
+          {!embedded && <h1 className="text-lg font-semibold text-ink">Usage</h1>}
           {hosts.length > 0 && (
             <div className="mt-1">
               <HostFreshnessStrip hosts={hosts} />
@@ -306,6 +312,7 @@ export default function Usage() {
               which is why it's passed in rather than computed inside that
               component (see its doc comment). */}
           <UsageTimeline
+            customer={customer}
             usageWindow={usageWindow}
             pivot={pivot}
             metric={metric}
@@ -320,6 +327,7 @@ export default function Usage() {
             hosts={hosts}
             headline={{
               costLabel: formatCost(data.summary.cost_usd),
+              pricingError: data.summary.pricing_error,
               subLabel: `${formatTokens(data.summary.total_tokens)} tokens · ${data.summary.runs} runs${
                 !data.summary.priced ? ' · partial (see banner above)' : ''
               }${data.excluded.length ? ` · excludes ${data.excluded.join(', ')}` : ''}`,

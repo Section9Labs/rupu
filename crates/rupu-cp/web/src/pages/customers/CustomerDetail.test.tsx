@@ -7,10 +7,14 @@ import {
   api,
   ApiError,
   type CustomerDetail as CustomerDetailDto,
+  type AgentRunRow,
   type CustomerScope,
+  type FindingOut,
   type ProjectRow,
   type RunListRow,
+  type UsageResponse,
 } from '../../lib/api';
+import { REG_LOCAL, REG_PROD, callsFor, onlyHost } from '../../lib/perHost/testUtils';
 import * as scopeLib from '../../lib/customerScope';
 import CustomerDetail from './CustomerDetail';
 
@@ -83,6 +87,21 @@ let setScope: ReturnType<typeof vi.fn<(n: CustomerScope) => void>>;
 let reload: ReturnType<typeof vi.fn<() => void>>;
 let getCustomer: ReturnType<typeof vi.spyOn>;
 let getRuns: ReturnType<typeof vi.spyOn>;
+let getWorkflowRuns: ReturnType<typeof vi.spyOn>;
+let getAgentRuns: ReturnType<typeof vi.spyOn>;
+let getFindings: ReturnType<typeof vi.spyOn>;
+let getUsage: ReturnType<typeof vi.spyOn>;
+let getUsageRuns: ReturnType<typeof vi.spyOn>;
+let getUsageOutliers: ReturnType<typeof vi.spyOn>;
+
+const USAGE_RESPONSE: UsageResponse = {
+  summary: { ...USAGE, cost_usd: 7.5, priced: true, runs: 4, total_tokens: 1500 },
+  breakdown: [],
+  unpriced: { models: [], rows: 0 },
+  hosts: [
+    { host_id: 'local', name: 'Local', transport_kind: 'local', state: 'ok', captured_at: '2026-10-05T00:00:00Z', reason: null },
+  ],
+};
 
 function Where() {
   const l = useLocation();
@@ -117,6 +136,17 @@ beforeEach(() => {
   });
   getCustomer = vi.spyOn(api, 'getCustomer').mockResolvedValue(detail());
   getRuns = vi.spyOn(api, 'getRuns').mockResolvedValue([RUN]);
+  // The Runs / Findings / Usage tabs embed the CP's own tables and charts.
+  vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL]);
+  getWorkflowRuns = vi.spyOn(api, 'getWorkflowRuns').mockResolvedValue([RUN]);
+  getAgentRuns = vi.spyOn(api, 'getAgentRuns').mockResolvedValue([]);
+  getFindings = vi.spyOn(api, 'getFindings').mockResolvedValue({
+    findings: [],
+    summary: { total: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0 },
+  });
+  getUsage = vi.spyOn(api, 'getUsage').mockResolvedValue(USAGE_RESPONSE);
+  getUsageRuns = vi.spyOn(api, 'getUsageRuns').mockResolvedValue([]);
+  getUsageOutliers = vi.spyOn(api, 'getUsageOutliers').mockResolvedValue([]);
 });
 afterEach(() => {
   cleanup();
@@ -243,14 +273,6 @@ describe('CustomerDetail tabs', () => {
     ] as const) {
       fireEvent.click(screen.getByRole('button', { name }));
       expect(screen.getByTestId('where')).toHaveTextContent(`/customers/acme/${path}`);
-    }
-  });
-
-  it('the Usage tab tiles say their range', async () => {
-    mount('/customers/acme/usage');
-    await screen.findByRole('heading', { level: 1, name: 'Acme Corp' });
-    for (const id of ['usage-cost', 'usage-input', 'usage-output', 'usage-cached']) {
-      expect(tile(id)).toHaveTextContent('· 30d');
     }
   });
 
@@ -414,5 +436,134 @@ describe('CustomerDetail delete', () => {
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     await waitFor(() => expect(getCustomer.mock.calls.length).toBeGreaterThan(before));
     expect(reload).toHaveBeenCalled();
+  });
+});
+
+const AGENT_ROW: AgentRunRow = {
+  run_id: 'agent_1',
+  agent: 'reviewer',
+  status: 'completed',
+  started_at: '2026-10-05T00:00:00Z',
+  source: 'standalone',
+  usage: USAGE,
+  customer: 'acme',
+  host_id: 'local',
+} as unknown as AgentRunRow;
+
+const FINDING = {
+  codename: 'cobalt-harbor/heron#1',
+  codename_derived: false,
+  id: 'f1',
+  scope: null,
+  summary: 'SQL injection in login',
+  severity: 'high',
+  evidence: { rationale: '' },
+  declared_by: null,
+  declared_at: '2026-07-01T00:00:00Z',
+  ws_id: 'a',
+  project: 'proj-a',
+  target_id: 'src/login.rs',
+  customer: 'acme',
+} as FindingOut;
+
+describe('CustomerDetail Runs tab', () => {
+  it('lists the customer\'s workflow runs through the per-host engine', async () => {
+    mount('/customers/acme/runs');
+    expect(await screen.findByText('nightly-review')).toBeInTheDocument();
+    expect(getWorkflowRuns).toHaveBeenCalledWith(
+      expect.objectContaining({ customer: 'acme', host: 'local', lifecycle: 'active' }),
+    );
+    // Embedded: the page's own heading and the Archived state are not here.
+    expect(screen.queryByRole('heading', { name: 'Workflow Runs' })).not.toBeInTheDocument();
+    expect(screen.queryByText('Archived')).not.toBeInTheDocument();
+  });
+
+  it('the Agents toggle lists agent runs with the same customer', async () => {
+    getAgentRuns.mockResolvedValue([AGENT_ROW]);
+    mount('/customers/acme/runs');
+    await screen.findByText('nightly-review');
+    fireEvent.click(screen.getByRole('button', { name: 'Agents' }));
+    await waitFor(() =>
+      expect(getAgentRuns).toHaveBeenCalledWith(expect.objectContaining({ customer: 'acme', host: 'local' })),
+    );
+    expect(await screen.findByText('reviewer')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Workflows' }));
+    expect(await screen.findByText('nightly-review')).toBeInTheDocument();
+  });
+
+  it('a remote host that cannot filter by customer shows as not included, never as zero', async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL, REG_PROD]);
+    getWorkflowRuns.mockImplementation((p?: { host?: string }) =>
+      p?.host === 'host_prod'
+        ? Promise.reject(new ApiError(501, "host can't report a customer for every run", ''))
+        : onlyHost('local', [RUN])(p),
+    );
+    mount('/customers/acme/runs');
+    expect(await screen.findByText('nightly-review')).toBeInTheDocument();
+    expect(await screen.findByText(/not included: prod/)).toBeInTheDocument();
+    expect(callsFor(getWorkflowRuns, 'host_prod')[0][0]).toEqual(expect.objectContaining({ customer: 'acme' }));
+  });
+
+  it('marks a run whose cost was priced at the global rates', async () => {
+    getWorkflowRuns.mockResolvedValue([{ ...RUN, usage: { ...USAGE, cost_usd: 1, pricing_error: 'acme layer broken' } }]);
+    mount('/customers/acme/runs');
+    await screen.findByText('nightly-review');
+    // The row-link cells are aria-hidden (mouse-only), so find the mark by its tooltip.
+    expect(screen.getAllByTitle('acme layer broken').length).toBeGreaterThan(0);
+  });
+});
+
+describe('CustomerDetail Findings tab', () => {
+  it('loads the findings of the customer\'s projects', async () => {
+    getFindings.mockResolvedValue({
+      findings: [FINDING],
+      summary: { total: 1, critical: 0, high: 1, medium: 0, low: 0, info: 0 },
+    });
+    mount('/customers/acme/findings');
+    expect(await screen.findByText('SQL injection in login')).toBeInTheDocument();
+    expect(getFindings).toHaveBeenCalledWith({ customer: 'acme' });
+    expect(screen.queryByRole('heading', { name: 'Findings' })).not.toBeInTheDocument();
+  });
+
+  it('says so when none of its projects has a finding', async () => {
+    mount('/customers/acme/findings');
+    expect(await screen.findByText('No findings')).toBeInTheDocument();
+    expect(getFindings).toHaveBeenCalledWith({ customer: 'acme' });
+  });
+});
+
+describe('CustomerDetail Usage tab', () => {
+  it('fetches every usage source with the customer', async () => {
+    mount('/customers/acme/usage');
+    await waitFor(() =>
+      expect(getUsage).toHaveBeenCalledWith(expect.anything(), 'model', 'local', expect.any(AbortSignal), 'acme'),
+    );
+    await waitFor(() => expect(getUsageRuns).toHaveBeenCalledWith(expect.anything(), undefined, 'acme'));
+    await waitFor(() => expect(getUsageOutliers).toHaveBeenCalledWith(expect.anything(), 'acme'));
+    expect(await screen.findByText('$7.50')).toBeInTheDocument();
+    expect(screen.getByText(/Breakdown by/)).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Usage' })).not.toBeInTheDocument();
+  });
+
+  it('a remote host answers 501 under the filter and shows as unavailable, not counted', async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL, REG_PROD]);
+    getUsage.mockImplementation((_w: unknown, _p: unknown, host?: string) =>
+      host === 'host_prod'
+        ? Promise.reject(new ApiError(501, 'a remote host cannot filter aggregates by customer', ''))
+        : Promise.resolve(USAGE_RESPONSE),
+    );
+    mount('/customers/acme/usage');
+    expect(await screen.findByText('$7.50')).toBeInTheDocument();
+    expect(await screen.findByText(/excludes prod \(unavailable\)/)).toBeInTheDocument();
+  });
+
+  it('marks a headline cost priced at the global rates', async () => {
+    getUsage.mockResolvedValue({
+      ...USAGE_RESPONSE,
+      summary: { ...USAGE_RESPONSE.summary, pricing_error: 'acme layer broken' },
+    });
+    mount('/customers/acme/usage');
+    await screen.findByText('$7.50');
+    expect(screen.getByRole('img', { name: /Pricing unavailable: acme layer broken/ })).toBeInTheDocument();
   });
 });

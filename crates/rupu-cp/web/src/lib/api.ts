@@ -2314,8 +2314,9 @@ export const api = {
    * on `rupu-cp/src/api/usage_outliers.rs`), so this accepts single-host
    * results and does not take a `host` param.
    */
-  getUsageOutliers(win: UsageWindow = presetWindow('30d')): Promise<OutlierRun[]> {
+  getUsageOutliers(win: UsageWindow = presetWindow('30d'), customer?: CustomerScope): Promise<OutlierRun[]> {
     const q = new URLSearchParams({ since: win.since, until: win.until });
+    setCustomer(q, customer);
     return request<OutlierRun[]>(`/api/usage/outliers?${q.toString()}`);
   },
   /**

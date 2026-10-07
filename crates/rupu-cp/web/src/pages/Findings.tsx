@@ -4,6 +4,11 @@
 // filters narrow it further (all client-side, combined with the severity
 // filter — the metric tiles keep the unfiltered totals). The table's Project /
 // Target columns show each finding's owning project · target.
+//
+// Customer scope (customers Plan 2B): `customer` limits the list to the
+// findings of that customer's projects (`GET /api/findings?customer=`; the
+// summary counts only the kept findings) and renders it embedded, without the
+// page header and padding. The customer detail's Findings tab mounts it so.
 
 import { useEffect, useMemo, useState } from 'react';
 import { api, normFindingSeverity, type FindingOut, type FindingsSummary } from '../lib/api';
@@ -29,7 +34,8 @@ const PROFILE_OPTIONS: { value: ProfileFilter; label: string }[] = [
 
 const EMPTY_SUMMARY: FindingsSummary = { total: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0 };
 
-export default function Findings() {
+export default function Findings({ customer }: { customer?: string } = {}) {
+  const embedded = customer !== undefined;
   const [findings, setFindings] = useState<FindingOut[] | null>(null);
   const [summary, setSummary] = useState<FindingsSummary>(EMPTY_SUMMARY);
   const [error, setError] = useState<string | null>(null);
@@ -40,8 +46,8 @@ export default function Findings() {
 
   useEffect(() => {
     let cancelled = false;
-    api
-      .getFindings()
+    // Called with no argument when unscoped, as the page always did.
+    (customer ? api.getFindings({ customer }) : api.getFindings())
       .then((data) => {
         if (cancelled) return;
         setFindings(data.findings);
@@ -54,7 +60,7 @@ export default function Findings() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [customer]);
 
   const all = findings ?? [];
 
@@ -95,14 +101,16 @@ export default function Findings() {
     : 'No findings match the current filters.';
 
   return (
-    <div className="p-8">
-      <header className="mb-6">
-        <h1 className="text-2xl font-semibold text-ink">Findings</h1>
-        <p className="mt-1 text-sm text-ink-dim">
-          Every finding raised across all registered projects, ordered by severity. Click a metric
-          tile to filter the list.
-        </p>
-      </header>
+    <div className={embedded ? undefined : 'p-8'}>
+      {!embedded && (
+        <header className="mb-6">
+          <h1 className="text-2xl font-semibold text-ink">Findings</h1>
+          <p className="mt-1 text-sm text-ink-dim">
+            Every finding raised across all registered projects, ordered by severity. Click a metric
+            tile to filter the list.
+          </p>
+        </header>
+      )}
 
       {error && <ErrorBanner className="mb-4">{error}</ErrorBanner>}
 
@@ -113,7 +121,11 @@ export default function Findings() {
       ) : all.length === 0 ? (
         <EmptyState
           title="No findings"
-          hint="Run an assessment workflow to start recording findings across your projects."
+          hint={
+            embedded
+              ? 'None of this customer’s projects has recorded a finding yet.'
+              : 'Run an assessment workflow to start recording findings across your projects.'
+          }
         />
       ) : (
         <div className="space-y-6">

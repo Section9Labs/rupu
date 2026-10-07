@@ -18,6 +18,10 @@ describe('rollupSummaries (port of usage::rollup)', () => {
     expect(rollupSummaries([sum(), sum({ priced: false })]).priced).toBe(false);
     expect(rollupSummaries([sum(), sum({ partial: true })]).partial).toBe(true);
   });
+  it('carries a pricing_error through, and adds none when no host has one', () => {
+    expect(rollupSummaries([sum(), sum({ pricing_error: 'acme layer broken' })]).pricing_error).toBe('acme layer broken');
+    expect(rollupSummaries([sum(), sum()])).not.toHaveProperty('pricing_error');
+  });
   it('an empty rollup is priced, unpartial and costless (Rust parity)', () => {
     expect(rollupSummaries([])).toMatchObject({ priced: true, partial: false, cost_usd: null, runs: 0 });
   });

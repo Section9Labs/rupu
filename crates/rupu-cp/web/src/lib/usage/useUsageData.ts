@@ -43,9 +43,15 @@
 // re-read on the 60 s remote poll while the notice stands; when it answers, new
 // hosts are added as `loading` and fetched, and the notice clears. `error` is
 // set only when every known host has failed.
+//
+// Customer scope (customers Plan 2B): `customer` (a slug or `none`) filters
+// every host's `/api/usage` to that customer's work. It is part of the refetch
+// identity — changing it behaves like a window change. Aggregates are
+// local-only under a filter: a remote host answers 501, which the engine
+// records as `unavailable` (shown as such in the host strip, never counted).
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { api, apiErrorMessage, type UsageResponse, type UsageWindow } from '../api';
+import { api, apiErrorMessage, type CustomerScope, type UsageResponse, type UsageWindow } from '../api';
 import type { HostFreshnessEntry } from '../../components/dashboard/HostFreshnessStrip';
 import type { HostSeed } from '../perHost/types';
 import { FETCH_TIMEOUT_MS } from '../perHost/engine';
@@ -89,7 +95,16 @@ const seedOf = (h: HostSeed): HostUsage => ({
   receivedAt: null,
 });
 
-export function useUsageData(usageWindow: UsageWindow, windowKey: string, windowSource: 'user' | 'tick'): UseUsageDataResult {
+export function useUsageData(
+  usageWindow: UsageWindow,
+  windowIdentity: string,
+  windowSource: 'user' | 'tick',
+  customer?: CustomerScope,
+): UseUsageDataResult {
+  // What the answers are keyed by: the window, and the customer filter when there is one.
+  const windowKey = customer ? `${windowIdentity}|customer=${customer}` : windowIdentity;
+  const customerRef = useRef(customer);
+  customerRef.current = customer;
   const [hosts, setHosts] = useState<HostUsage[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
   const noticeRef = useRef(notice);
@@ -136,7 +151,11 @@ export function useUsageData(usageWindow: UsageWindow, windowKey: string, window
       clearTimeout(timer);
       if (controllersRef.current.get(hostId) === controller) controllersRef.current.delete(hostId);
     };
-    Promise.race([api.getUsage(windowRef.current, 'model', hostId, controller.signal), timeout]).then(
+    // The customer filter is passed only when set, so an unscoped call is exactly the old one.
+    const request = customerRef.current
+      ? api.getUsage(windowRef.current, 'model', hostId, controller.signal, customerRef.current)
+      : api.getUsage(windowRef.current, 'model', hostId, controller.signal);
+    Promise.race([request, timeout]).then(
       (resp) => {
         if (disposedRef.current || seqRef.current.get(hostId) !== seq) return;
         settled();

@@ -17,6 +17,13 @@
 // FilterBar's search slot narrows the loaded rows client-side, live per
 // keystroke, over workflow name / run id / host id — composing with (not
 // replacing) the lifecycle/trigger pills above it.
+//
+// Customer scope (customers Plan 2B): `customer` fixes the list to one
+// customer's runs (`?customer=<slug>`, through the same per-host engine, so a
+// remote host that can't filter — 501 — shows as an unavailable slice) and
+// renders it embedded: no page header or padding, and no Archived state (the
+// archived listing has no customer filter). The customer detail's Runs tab
+// mounts it this way.
 
 import { useCallback, useState } from 'react';
 import { RefreshCw } from 'lucide-react';
@@ -43,6 +50,7 @@ import { formatTokens, formatCost } from '../../lib/usage';
 import { formatDuration } from '../../lib/duration';
 import { shortId } from '../../lib/shortId';
 import { runHref } from '../../lib/runs';
+import { PricingErrorMark } from '../../components/customers/PricingErrorMark';
 
 type Tab = 'active' | 'completed' | 'failed';
 /** The lifecycle FilterPills group's value space: the three tabs plus the
@@ -87,7 +95,8 @@ function TriggerChip({ trigger }: { trigger: string }) {
   );
 }
 
-export default function WorkflowRuns() {
+export default function WorkflowRuns({ customer }: { customer?: string } = {}) {
+  const embedded = customer !== undefined;
   const [tab, setTab] = useState<Tab>('active');
   const [archived, setArchived] = useState(false);
   const [filter, setFilter] = useState<TriggerFilter>('all');
@@ -106,9 +115,9 @@ export default function WorkflowRuns() {
         // Any page beyond the first returns empty so the host settles.
         return offset === 0 ? api.getArchivedRuns('workflow') : Promise.resolve([]);
       }
-      return api.getWorkflowRuns({ lifecycle: tab, offset, limit, host, signal });
+      return api.getWorkflowRuns({ lifecycle: tab, offset, limit, host, signal, ...(customer ? { customer } : {}) });
     },
-    [archived, tab],
+    [archived, tab, customer],
   );
 
   const { rows, slices, loading, error, hasMore, sentinelRef, refresh, refreshHost, removeRow, retryPaging, ended } =
@@ -118,7 +127,7 @@ export default function WorkflowRuns() {
       fetch: fetchRows,
       timeField: 'started_at',
       idField: 'id',
-      deps: [archived, tab],
+      deps: [archived, tab, customer],
       poll: !archived && tab === 'active',
     });
 
@@ -259,12 +268,14 @@ export default function WorkflowRuns() {
     !archived && <PerHostFooter sentinelRef={sentinelRef} text={text} slices={slices} onRetry={retryPaging} />;
 
   return (
-    <div className="p-8">
-      <header className="flex items-center justify-between mb-6">
-        <div>
-          <h1 className="text-2xl font-semibold text-ink">Workflow Runs</h1>
-          <p className="mt-1 text-sm text-ink-dim">Workflow executions across this control plane.</p>
-        </div>
+    <div className={embedded ? undefined : 'p-8'}>
+      <header className={cn('flex items-center justify-between', embedded ? 'mb-3 justify-end' : 'mb-6')}>
+        {!embedded && (
+          <div>
+            <h1 className="text-2xl font-semibold text-ink">Workflow Runs</h1>
+            <p className="mt-1 text-sm text-ink-dim">Workflow executions across this control plane.</p>
+          </div>
+        )}
         <Button variant="secondary" onClick={() => refresh()} className="gap-1.5">
           <RefreshCw size={12} className={cn(loading && 'animate-spin')} />
           Refresh
@@ -275,7 +286,7 @@ export default function WorkflowRuns() {
         <FilterBar
           filters={
             <>
-              <FilterPills options={LIFECYCLE_OPTIONS} value={lifecycleValue} onChange={handleLifecycleChange} />
+              <FilterPills options={embedded ? LIFECYCLE_OPTIONS.filter((o) => o.value !== 'archived') : LIFECYCLE_OPTIONS} value={lifecycleValue} onChange={handleLifecycleChange} />
               {!archived && (
                 <FilterPills
                   options={TRIGGER_OPTIONS}
@@ -332,7 +343,9 @@ export default function WorkflowRuns() {
           hint={
             missing
               ? `Not included: ${missing}.`
-              : 'Workflow runs will appear here once you dispatch one from the CLI, the desktop app, or a scheduled trigger.'
+              : embedded
+                ? 'No workflow runs are attributed to this customer yet.'
+                : 'Workflow runs will appear here once you dispatch one from the CLI, the desktop app, or a scheduled trigger.'
           }
         />
       ) : visible.length === 0 ? (
@@ -467,7 +480,12 @@ const WORKFLOW_RUN_COLUMNS: Column<RunListRow>[] = [
     fit: true,
     sortable: true,
     sortValue: (r) => r.usage.cost_usd,
-    render: (r) => <span className="text-ink font-medium">{formatCost(r.usage.cost_usd)}</span>,
+    render: (r) => (
+      <span className="inline-flex items-center justify-end gap-1 text-ink font-medium">
+        <PricingErrorMark error={r.usage.pricing_error} />
+        {formatCost(r.usage.cost_usd)}
+      </span>
+    ),
   },
   {
     key: 'turns',

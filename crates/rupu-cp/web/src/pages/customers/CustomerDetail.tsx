@@ -4,10 +4,11 @@
 // bar: Overview (cost by project + recent runs), Projects (the assigned
 // projects, Assign / Unassign), Runs, Findings, Usage and Config.
 //
-// Runs / Findings / Usage / Config show what this page can say honestly from
-// the detail rollup and a local runs query; Task 6 (per-host run tables,
-// findings list, usage charts) and Task 8 (the config-layer editor) replace
-// their bodies.
+// Runs, Findings and Usage embed the CP's own Workflow/Agent Runs tables,
+// Findings table and Usage page, each scoped with `customer=<slug>` (remote
+// hosts that can't filter show as unavailable, never as zero). Config shows
+// what this page can say from the detail; Task 8 (the config-layer editor)
+// replaces its body.
 
 import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
@@ -54,8 +55,11 @@ import { CustomerFormDialog } from '../../components/customers/CustomerFormDialo
 import { PricingErrorMark } from '../../components/customers/PricingErrorMark';
 import { AssignProjectDialog } from '../../components/customers/AssignProjectDialog';
 import { DialogFrame } from '../../components/customers/DialogFrame';
+import { CustomerRunsTab } from '../../components/customers/CustomerRunsTab';
 import { StatTile } from '../../components/customers/StatTile';
 import { PROJECT_COLUMNS } from '../Projects';
+import Findings from '../Findings';
+import Usage from '../Usage';
 
 export type CustomerTab = 'overview' | 'projects' | 'runs' | 'findings' | 'usage' | 'config';
 
@@ -388,9 +392,9 @@ export default function CustomerDetail() {
           }}
         />
       )}
-      {tab === 'runs' && <RecentRuns slug={c.slug} limit={50} title="Latest runs" />}
-      {tab === 'findings' && <FindingsSummary detail={detail} />}
-      {tab === 'usage' && <UsageSummaryTab detail={detail} rangeLabel={rangeLabel} />}
+      {tab === 'runs' && <CustomerRunsTab slug={c.slug} />}
+      {tab === 'findings' && <Findings key={c.slug} customer={c.slug} />}
+      {tab === 'usage' && <Usage key={c.slug} customer={c.slug} />}
       {tab === 'config' && <ConfigSummary detail={detail} />}
 
       {editing && (
@@ -849,65 +853,6 @@ function RecentRuns({ slug, limit, title }: { slug: string; limit: number; title
           ))}
         </ListCard>
       )}
-    </section>
-  );
-}
-
-function FindingsSummary({ detail }: { detail: CustomerDetailDto }) {
-  const { rollup, projects, customer } = detail;
-  return (
-    <section className="space-y-3">
-      <p className="text-ui text-ink-dim">
-        <span className={rollup.findings_open > 0 ? 'font-semibold text-err' : 'font-semibold text-ink'}>
-          {rollup.findings_open} open {rollup.findings_open === 1 ? 'finding' : 'findings'}
-        </span>{' '}
-        across {customer.name}’s projects. Each project’s findings:
-      </p>
-      {projects.length === 0 ? (
-        <EmptyState title="No projects yet" hint="Findings follow the projects assigned to this customer." />
-      ) : (
-        <ListCard>
-          {projects.map((p) => (
-            <Link
-              key={p.ws_id}
-              to={`/projects/${encodeURIComponent(p.ws_id)}/findings`}
-              className="flex items-center gap-4 px-4 py-3 hover:bg-surface-hover transition-colors"
-            >
-              <span className="min-w-0 flex-1">
-                <span className="block truncate text-sm font-medium text-ink">{p.name}</span>
-                <span className="block truncate font-mono text-note text-ink-mute">{p.path}</span>
-              </span>
-              <span className="text-note font-medium text-brand-600">findings →</span>
-            </Link>
-          ))}
-        </ListCard>
-      )}
-    </section>
-  );
-}
-
-function UsageSummaryTab({ detail, rangeLabel }: { detail: CustomerDetailDto; rangeLabel: string }) {
-  const u = detail.rollup.usage;
-  return (
-    <section className="space-y-4">
-      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
-        <StatTile
-          id="usage-cost"
-          label={`Cost · ${rangeLabel}`}
-          value={
-            <span className="inline-flex items-center gap-1.5">
-              {formatCost(u.cost_usd)}
-              <PricingErrorMark error={u.pricing_error} />
-            </span>
-          }
-          sub={u.priced ? undefined : 'some models have no price'}
-          subTone="warn"
-        />
-        <StatTile id="usage-input" label={`Input tokens · ${rangeLabel}`} value={formatTokens(u.input_tokens)} />
-        <StatTile id="usage-output" label={`Output tokens · ${rangeLabel}`} value={formatTokens(u.output_tokens)} />
-        <StatTile id="usage-cached" label={`Cached tokens · ${rangeLabel}`} value={formatTokens(u.cached_tokens)} />
-      </div>
-      <CostByProject projects={detail.projects} />
     </section>
   );
 }

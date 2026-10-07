@@ -18,6 +18,12 @@
 // merged row before this page ever sees it — the Source pill filters that
 // single merged row's `source` field, it does not need to dedupe anything
 // itself.
+//
+// Customer scope (customers Plan 2B): `customer` fixes the list to one
+// customer's runs (`?customer=<slug>`, through the same per-host engine, so a
+// remote host that can't filter — 501 — shows as an unavailable slice) and
+// renders it embedded, without the page header and padding. The customer
+// detail's Runs tab mounts it this way.
 
 import { useCallback, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
@@ -45,6 +51,7 @@ import { formatDuration } from '../../lib/duration';
 import { usePerHostPagedList, type PerHostFetchParams } from '../../lib/perHost/usePerHostPagedList';
 import { PerHostFooter, PerHostStrip, perHostFooterText } from '../../components/lists/PerHostStatus';
 import { noHostAnswered, notIncluded, waitingLabel } from '../../lib/perHost/status';
+import { PricingErrorMark } from '../../components/customers/PricingErrorMark';
 
 type Tab = 'active' | 'completed' | 'failed';
 
@@ -103,7 +110,8 @@ function confirmLivenessOverride(runId: string, e: ApiError): boolean {
   );
 }
 
-export default function AgentRuns() {
+export default function AgentRuns({ customer }: { customer?: string } = {}) {
+  const embedded = customer !== undefined;
   const [tab, setTab] = useState<Tab>('active');
   // Default 'standalone' — an agent-runs read is a standalone invocation by
   // default; session-bound runs live on the Sessions page instead (operator
@@ -119,8 +127,8 @@ export default function AgentRuns() {
 
   const fetchRows = useCallback(
     ({ host, offset, limit, signal }: PerHostFetchParams) =>
-      api.getAgentRuns({ lifecycle: tab, offset, limit, host, signal }),
-    [tab],
+      api.getAgentRuns({ lifecycle: tab, offset, limit, host, signal, ...(customer ? { customer } : {}) }),
+    [tab, customer],
   );
   const { rows, slices, loading, error, hasMore, sentinelRef, refresh, refreshHost, removeRow, retryPaging, ended } =
     usePerHostPagedList<AgentRunRow>({
@@ -128,7 +136,7 @@ export default function AgentRuns() {
       fetch: fetchRows,
       timeField: 'started_at',
       idField: 'run_id',
-      deps: [tab],
+      deps: [tab, customer],
       poll: tab === 'active',
     });
 
@@ -301,12 +309,14 @@ export default function AgentRuns() {
   );
 
   return (
-    <div className="p-8">
-      <header className="flex items-center justify-between mb-6">
-        <div>
-          <h1 className="text-2xl font-semibold text-ink">Agent Runs</h1>
-          <p className="mt-1 text-sm text-ink-dim">Standalone and session-bound agent invocations.</p>
-        </div>
+    <div className={embedded ? undefined : 'p-8'}>
+      <header className={cn('flex items-center justify-between', embedded ? 'mb-3 justify-end' : 'mb-6')}>
+        {!embedded && (
+          <div>
+            <h1 className="text-2xl font-semibold text-ink">Agent Runs</h1>
+            <p className="mt-1 text-sm text-ink-dim">Standalone and session-bound agent invocations.</p>
+          </div>
+        )}
         <Button variant="secondary" onClick={() => refresh()} className="gap-1.5">
           <RefreshCw size={12} className={cn(loading && 'animate-spin')} />
           Refresh
@@ -365,7 +375,9 @@ export default function AgentRuns() {
             hint={
               missing
                 ? `Not included: ${missing}.`
-                : 'Standalone and session-bound agent invocations will appear here once they run.'
+                : embedded
+                  ? 'No agent runs are attributed to this customer yet.'
+                  : 'Standalone and session-bound agent invocations will appear here once they run.'
             }
           />
         ) : visible.length === 0 ? (
@@ -608,7 +620,12 @@ const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
     align: 'right',
     sortable: true,
     sortValue: (r) => r.usage.cost_usd,
-    render: (r) => <span className="text-ink font-medium">{formatCost(r.usage.cost_usd)}</span>,
+    render: (r) => (
+      <span className="inline-flex items-center justify-end gap-1 text-ink font-medium">
+        <PricingErrorMark error={r.usage.pricing_error} />
+        {formatCost(r.usage.cost_usd)}
+      </span>
+    ),
   },
   {
     key: 'turns',
