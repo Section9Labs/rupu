@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, render, renderHook, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { api, type CustomerRow } from './api';
 import {
@@ -156,6 +156,58 @@ describe('CustomerScopeProvider', () => {
     expect(screen.getByTestId('notice').textContent).toBe('');
   });
 
+  it('rejectScope clears the scope, persists, and sets the notice', async () => {
+    window.localStorage.setItem(CUSTOMER_SCOPE_KEY, 'acme');
+    mount();
+    await waitFor(() => expect(screen.getByTestId('customer').textContent).toBe('acme'));
+    act(() => ctx.rejectScope('Unknown customer “acme”'));
+    expect(screen.getByTestId('scope').textContent).toBe('null');
+    expect(screen.getByTestId('notice').textContent).toBe('Unknown customer “acme”');
+    expect(window.localStorage.getItem(CUSTOMER_SCOPE_KEY)).toBeNull();
+    // A later explicit choice dismisses the notice.
+    act(() => ctx.setScope('globex'));
+    expect(screen.getByTestId('notice').textContent).toBe('');
+  });
+
+  it('setScope resolves the row for a scope picked after mount', async () => {
+    mount();
+    await waitFor(() => expect(screen.getByTestId('customers').textContent).toBe('acme,globex'));
+    act(() => ctx.setScope('globex'));
+    expect(screen.getByTestId('customer').textContent).toBe('globex');
+  });
+
+  it('setScope(next, row) uses the supplied row without a lookup', async () => {
+    mount();
+    await waitFor(() => expect(screen.getByTestId('customers').textContent).toBe('acme,globex'));
+    const spy = api.getCustomers as unknown as ReturnType<typeof vi.fn>;
+    spy.mockClear();
+    act(() => ctx.setScope('old', row('old', true)));
+    expect(screen.getByTestId('customer').textContent).toBe('old');
+    await act(async () => {});
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it('setScope to an archived slug looks it up among archived customers', async () => {
+    mount();
+    await waitFor(() => expect(screen.getByTestId('customers').textContent).toBe('acme,globex'));
+    (api.getCustomers as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+      async (opts?: { archived?: boolean }) =>
+        opts?.archived ? [row('acme'), row('old', true)] : [row('acme'), row('globex')],
+    );
+    act(() => ctx.setScope('old'));
+    await waitFor(() => expect(screen.getByTestId('customer').textContent).toBe('old'));
+    expect(screen.getByTestId('notice').textContent).toBe('');
+  });
+
+  it('a failed reload keeps the rows already loaded', async () => {
+    mount();
+    await waitFor(() => expect(screen.getByTestId('customers').textContent).toBe('acme,globex'));
+    (api.getCustomers as unknown as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('boom'));
+    act(() => ctx.reload());
+    await act(async () => {});
+    expect(screen.getByTestId('customers').textContent).toBe('acme,globex');
+  });
+
   it('reload() refetches the list', async () => {
     mount();
     await waitFor(() => expect(screen.getByTestId('customers').textContent).toBe('acme,globex'));
@@ -175,8 +227,16 @@ describe('CustomerScopeProvider', () => {
 
 describe('useCustomerScope outside a provider', () => {
   it('throws a clear error', () => {
-    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
-    expect(() => render(<Probe />)).toThrow(/CustomerScopeProvider/);
-    spy.mockRestore();
+    // Suppress React's dev console.error and jsdom's uncaught-error report
+    // (same pattern as components/v2/shellState.test.tsx).
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const onWindowError = (e: ErrorEvent) => e.preventDefault();
+    window.addEventListener('error', onWindowError);
+    try {
+      expect(() => renderHook(() => useCustomerScope())).toThrow(/CustomerScopeProvider/);
+    } finally {
+      window.removeEventListener('error', onWindowError);
+      errorSpy.mockRestore();
+    }
   });
 });

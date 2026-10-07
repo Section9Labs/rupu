@@ -12,7 +12,6 @@ import {
   useContext,
   useEffect,
   useMemo,
-  useRef,
   useState,
   type ReactNode,
 } from 'react';
@@ -24,12 +23,19 @@ export const CUSTOMER_SCOPE_KEY = 'rupu.cp.customer';
 export interface CustomerScopeValue {
   /** null = all customers. */
   scope: CustomerScope;
-  /** The scoped customer's row (null for all / none / not loaded). */
+  /** The scoped customer's row (null for all / none / not yet resolved). */
   customer: CustomerRow | null;
   /** Active customers (archived ones are loaded on demand by the picker). */
   customers: CustomerRow[];
-  setScope(next: CustomerScope): void;
-  /** Refetch the list — after create / rename / archive / delete. */
+  /** Change the scope. Pass `row` when the caller already has the customer's
+   *  row (the picker); otherwise it is resolved from the loaded list, or — for
+   *  a slug not in the active list — looked up among archived customers. */
+  setScope(next: CustomerScope, row?: CustomerRow): void;
+  /** Clear a scope the backend rejected and show `message` as a one-line
+   *  notice. Pages call this on a 400 from a request carrying the scope. */
+  rejectScope(message: string): void;
+  /** Refetch the list — after create / rename / archive / delete. A failed
+   *  refetch keeps the rows already loaded. */
   reload(): void;
   /** e.g. "Customer “acme” no longer exists — showing all customers." */
   notice: string | null;
@@ -64,75 +70,83 @@ export function CustomerScopeProvider({ children }: { children: ReactNode }): JS
     return initial;
   });
   const [customers, setCustomers] = useState<CustomerRow[]>([]);
-  const [archivedHit, setArchivedHit] = useState<CustomerRow | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  // A scoped customer that is not in the active list: picked by the caller, or
+  // found among the archived customers.
+  const [extra, setExtra] = useState<CustomerRow | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [nonce, setNonce] = useState(0);
-  // The latest scope, read by the load effect without re-triggering it.
-  const scopeRef = useRef(scope);
-  scopeRef.current = scope;
 
-  const setScope = useCallback((next: CustomerScope) => {
+  const setScope = useCallback((next: CustomerScope, row?: CustomerRow) => {
     persist(next);
     setNotice(null);
+    setExtra(row ?? null);
     setScopeState(next);
+  }, []);
+  const rejectScope = useCallback((message: string) => {
+    persist(null);
+    setExtra(null);
+    setScopeState(null);
+    setNotice(message);
   }, []);
   const reload = useCallback(() => setNonce((n) => n + 1), []);
 
+  // Load the active list (mount + reload()).
   useEffect(() => {
     let cancelled = false;
-    (async () => {
-      let rows: CustomerRow[];
-      try {
-        rows = await api.getCustomers();
-      } catch {
-        // Keep the scope: pages still pass it and the backend validates it.
-        if (!cancelled) setCustomers([]);
-        return;
-      }
-      if (cancelled) return;
-      setCustomers(rows);
-
-      const current = scopeRef.current;
-      if (current === null || current === 'none' || rows.some((c) => c.slug === current)) {
-        setArchivedHit(null);
-        return;
-      }
-      // Not active: it may be archived (still a valid scope), else it is gone.
-      let hit: CustomerRow | null = null;
-      try {
-        const all = await api.getCustomers({ archived: true });
-        hit = all.find((c) => c.slug === current) ?? null;
-      } catch {
-        if (!cancelled) setArchivedHit(null);
-        return; // can't tell — keep the scope
-      }
-      if (cancelled || scopeRef.current !== current) return;
-      if (hit) {
-        setArchivedHit(hit);
-      } else {
-        setArchivedHit(null);
-        persist(null);
-        setScopeState(null);
-        setNotice(`Customer “${current}” no longer exists — showing all customers.`);
-      }
-    })();
+    api.getCustomers().then(
+      (rows) => {
+        if (cancelled) return;
+        setCustomers(rows);
+        setLoaded(true);
+      },
+      () => {
+        // Keep the scope and any rows already loaded: pages still pass the
+        // scope and the backend validates it.
+      },
+    );
     return () => {
       cancelled = true;
     };
   }, [nonce]);
 
+  // Resolve a slug scope that the active list does not hold: it may be an
+  // archived customer (still a valid scope), else it no longer exists.
+  useEffect(() => {
+    if (scope === null || scope === 'none') {
+      setExtra(null);
+      return;
+    }
+    if (!loaded) return;
+    if (customers.some((c) => c.slug === scope) || extra?.slug === scope) return;
+    let cancelled = false;
+    api.getCustomers({ archived: true }).then(
+      (all) => {
+        if (cancelled) return;
+        const hit = all.find((c) => c.slug === scope) ?? null;
+        if (hit) setExtra(hit);
+        else rejectScope(`Customer “${scope}” no longer exists — showing all customers.`);
+      },
+      () => {
+        // Can't tell — keep the scope.
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [scope, customers, loaded, extra, rejectScope]);
+
   const customer = useMemo(
     () =>
       scope === null || scope === 'none'
         ? null
-        : (customers.find((c) => c.slug === scope) ??
-          (archivedHit?.slug === scope ? archivedHit : null)),
-    [scope, customers, archivedHit],
+        : (customers.find((c) => c.slug === scope) ?? (extra?.slug === scope ? extra : null)),
+    [scope, customers, extra],
   );
 
   const value = useMemo<CustomerScopeValue>(
-    () => ({ scope, customer, customers, setScope, reload, notice }),
-    [scope, customer, customers, setScope, reload, notice],
+    () => ({ scope, customer, customers, setScope, rejectScope, reload, notice }),
+    [scope, customer, customers, setScope, rejectScope, reload, notice],
   );
   return <CustomerScopeContext.Provider value={value}>{children}</CustomerScopeContext.Provider>;
 }

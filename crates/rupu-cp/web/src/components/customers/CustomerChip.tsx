@@ -14,7 +14,9 @@ export const DERIVED_CUSTOMER_TITLE = "Attributed from the project's current cus
  *                         ABSENT, i.e. the host/record can't say. Never render
  *                         an absent key as "No customer".
  * `derived` marks an attribution taken from the project's current customer.
- * `onRemove` adds a "Clear customer scope" × (the top-bar scope chip).
+ * `onRemove` adds a "Clear customer scope" × (the top-bar scope chip) to the
+ * customer and "No customer" pills (scope `'none'`); `unknown` never has one.
+ * Archived / derived pills use muted tokens (not opacity, which fails contrast).
  */
 export function CustomerChip({
   customer,
@@ -45,31 +47,41 @@ export function CustomerChip({
 
   if (!customer) {
     return (
-      <span className={cn(base, 'border-dashed border-line text-ink-dim')}>No customer</span>
+      <span className={cn(base, 'border-dashed border-line text-ink-dim')}>
+        No customer
+        {onRemove && <RemoveButton onRemove={onRemove} size={size} />}
+      </span>
     );
   }
 
+  const muted = customer.archived || derived;
   return (
     <span
       title={derived ? DERIVED_CUSTOMER_TITLE : undefined}
       className={cn(
         base,
-        'border-brand-100 bg-brand-50 text-brand-700',
-        (customer.archived || derived) && 'opacity-60',
+        muted
+          ? 'border-line bg-surface text-ink-dim'
+          : 'border-brand-100 bg-brand-50 text-brand-700',
       )}
     >
       <CustomerDot tint={customer.tint} size={size === 'sm' ? 6 : 8} />
       <span>{customer.name}</span>
-      {onRemove && (
-        <button
-          type="button"
-          aria-label="Clear customer scope"
-          onClick={onRemove}
-          className="-mr-0.5 inline-flex items-center rounded-full p-0.5 hover:bg-brand-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
-        >
-          <X size={size === 'sm' ? 10 : 12} aria-hidden />
-        </button>
-      )}
+      {customer.archived && <span className="text-ink-mute">(archived)</span>}
+      {onRemove && <RemoveButton onRemove={onRemove} size={size} />}
     </span>
+  );
+}
+
+function RemoveButton({ onRemove, size }: { onRemove: () => void; size: 'sm' | 'md' }) {
+  return (
+    <button
+      type="button"
+      aria-label="Clear customer scope"
+      onClick={onRemove}
+      className="-mr-0.5 inline-flex items-center rounded-full p-0.5 hover:bg-brand-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
+    >
+      <X size={size === 'sm' ? 10 : 12} aria-hidden />
+    </button>
   );
 }

@@ -72,7 +72,10 @@ describe('CustomerChip', () => {
 
   it('shows archived customers muted', () => {
     const { container } = render(<CustomerChip customer={{ ...acme, archived: true }} />);
-    expect((container.firstElementChild as HTMLElement).className).toContain('opacity-60');
+    const el = container.firstElementChild as HTMLElement;
+    expect(el.className).toContain('text-ink-dim');
+    expect(el.className).not.toContain('opacity');
+    expect(screen.getByText('(archived)')).toBeTruthy();
   });
 
   it('× calls onRemove and is labelled', () => {
@@ -80,6 +83,25 @@ describe('CustomerChip', () => {
     render(<CustomerChip customer={acme} onRemove={onRemove} />);
     fireEvent.click(screen.getByRole('button', { name: 'Clear customer scope' }));
     expect(onRemove).toHaveBeenCalledTimes(1);
+  });
+
+  it('× also renders on the "No customer" pill (scope none)', () => {
+    const onRemove = vi.fn();
+    render(<CustomerChip customer={null} onRemove={onRemove} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Clear customer scope' }));
+    expect(onRemove).toHaveBeenCalledTimes(1);
+  });
+
+  it('the unknown state never renders a ×', () => {
+    render(<CustomerChip customer={null} unknown onRemove={() => {}} />);
+    expect(screen.queryByRole('button')).toBeNull();
+  });
+
+  it('derived is muted without opacity', () => {
+    const { container } = render(<CustomerChip customer={acme} derived />);
+    const el = container.firstElementChild as HTMLElement;
+    expect(el.className).toContain('text-ink-dim');
+    expect(el.className).not.toContain('opacity');
   });
 
   it('renders no × without onRemove', () => {
