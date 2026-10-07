@@ -3,6 +3,9 @@
 // trigger on close. Modal: Escape / Cancel / overlay click close, Tab is
 // trapped, the first field is focused on open.
 //
+// Closing (Escape, overlay click, Cancel) is ignored while a save is in flight;
+// with unsaved edits it asks "Discard changes?" first (real buttons, inline).
+//
 // Create: Name (required), Slug (auto-suggested from the name until edited;
 // `^[a-z0-9][a-z0-9-]{0,62}$`, and `none` is reserved — it is the filter's
 // "no customer"), Contact, Notes, Color (`#rrggbb`, empty = derived from the
@@ -73,20 +76,43 @@ export function CustomerFormDialog({ mode, initial, onSaved, onClose }: Customer
   const [slugServerError, setSlugServerError] = useState<string | null>(null);
   const [colorServerError, setColorServerError] = useState<string | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
+  const [confirmingDiscard, setConfirmingDiscard] = useState(false);
+  const confirmRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     firstRef.current?.focus();
   }, []);
 
-  const closeRef = useRef(onClose);
-  closeRef.current = onClose;
+  const dirty =
+    name !== (initial?.name ?? '') ||
+    contact !== (initial?.contact ?? '') ||
+    notes !== (initial?.notes ?? '') ||
+    color !== (initial?.color ?? '') ||
+    (create && slugTouched && slug !== '');
+
+  // Every way of closing goes through here.
+  function requestClose() {
+    if (busy) return;
+    if (dirty) setConfirmingDiscard(true);
+    else onClose();
+  }
+  const requestCloseRef = useRef(requestClose);
+  requestCloseRef.current = requestClose;
+  const confirmingRef = useRef(false);
+  confirmingRef.current = confirmingDiscard;
   useEffect(() => {
     function onKey(e: globalThis.KeyboardEvent) {
-      if (e.key === 'Escape') closeRef.current();
+      if (e.key !== 'Escape') return;
+      // Escape on the "Discard changes?" prompt means "keep editing".
+      if (confirmingRef.current) setConfirmingDiscard(false);
+      else requestCloseRef.current();
     }
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
   }, []);
+  useEffect(() => {
+    if (confirmingDiscard) confirmRef.current?.querySelector('button')?.focus();
+  }, [confirmingDiscard]);
 
   function trapTab(e: KeyboardEvent<HTMLDivElement>) {
     if (e.key !== 'Tab' || !panelRef.current) return;
@@ -159,7 +185,7 @@ export function CustomerFormDialog({ mode, initial, onSaved, onClose }: Customer
       data-testid="customer-form-overlay"
       className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/30 p-4 pt-[8vh]"
       onMouseDown={(e) => {
-        if (e.target === e.currentTarget) onClose();
+        if (e.target === e.currentTarget) requestClose();
       }}
     >
       <div
@@ -262,11 +288,13 @@ export function CustomerFormDialog({ mode, initial, onSaved, onClose }: Customer
               >
                 {COLOR_RE.test(colorTrim) ? (
                   <CustomerDot tint={{ light: colorTrim, dark: colorTrim }} size={12} />
+                ) : initial ? (
+                  // Edit: the tint the server derived for this customer.
+                  <CustomerDot tint={initial.tint} size={12} />
                 ) : (
-                  <CustomerDot
-                    tint={initial?.tint ?? { light: 'transparent', dark: 'transparent' }}
-                    size={12}
-                  />
+                  // Create: the tint is derived server-side from the slug, so
+                  // there is nothing to preview yet.
+                  <span data-neutral-dot className="inline-block h-3 w-3 rounded-full bg-border" />
                 )}
               </span>
               <input
@@ -293,14 +321,26 @@ export function CustomerFormDialog({ mode, initial, onSaved, onClose }: Customer
 
           {formError && <ErrorBanner>{formError}</ErrorBanner>}
 
-          <div className="flex items-center justify-end gap-2">
-            <Button variant="secondary" onClick={onClose}>
-              Cancel
-            </Button>
-            <Button type="submit" disabled={busy || !valid}>
-              {create ? 'Create customer' : 'Save'}
-            </Button>
-          </div>
+          {confirmingDiscard ? (
+            <div ref={confirmRef} role="alertdialog" aria-label="Discard changes?" className="flex items-center justify-end gap-2">
+              <span className="mr-auto text-ui font-medium text-ink">Discard changes?</span>
+              <Button variant="secondary" onClick={() => setConfirmingDiscard(false)}>
+                Keep editing
+              </Button>
+              <Button variant="danger" onClick={onClose}>
+                Discard
+              </Button>
+            </div>
+          ) : (
+            <div className="flex items-center justify-end gap-2">
+              <Button variant="secondary" onClick={requestClose} disabled={busy}>
+                Cancel
+              </Button>
+              <Button type="submit" disabled={busy || !valid}>
+                {create ? 'Create customer' : 'Save'}
+              </Button>
+            </div>
+          )}
         </form>
       </div>
     </div>

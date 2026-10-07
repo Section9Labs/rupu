@@ -145,7 +145,7 @@ describe('Customers page', () => {
     expect(within(rows[1]).getByText('Globex')).toBeInTheDocument();
     expect(within(rows[2]).getByText('Initech')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /Acme Corp/ })).toHaveAttribute('href', '/customers/acme');
-    expect(getCustomers).toHaveBeenCalledWith({ archived: false, range: '30d' });
+    expect(getCustomers).toHaveBeenCalledWith({ archived: true, range: '30d' });
   });
 
   it('default account: lock when locked, "inherits global", layer error note', async () => {
@@ -174,6 +174,7 @@ describe('Customers page', () => {
     await screen.findByText('Acme Corp');
     const tile = (id: string) => screen.getByTestId(`tile-${id}`);
     expect(within(tile('customers')).getByText('3')).toBeInTheDocument();
+    expect(within(tile('customers')).getByText('0 archived')).toBeInTheDocument();
     expect(within(tile('assigned')).getByText('5 / 8')).toBeInTheDocument();
     expect(within(tile('assigned')).getByText('2 unassigned')).toBeInTheDocument();
     expect(within(tile('cost')).getByText('$40.00')).toBeInTheDocument();
@@ -182,28 +183,35 @@ describe('Customers page', () => {
     expect(within(tile('findings')).getByText('across 1 customer')).toBeInTheDocument();
   });
 
-  it('segmented Archived refetches with archived: true and lists only archived rows', async () => {
+  it('status views are derived from one list: no refetch, archived count on Active', async () => {
     const OLD = row({ slug: 'old', name: 'Old Co', archived: true });
-    getCustomers.mockImplementation(async (o?: { archived?: boolean }) =>
-      o?.archived ? [ACME, OLD] : [ACME],
-    );
+    getCustomers.mockResolvedValue([ACME, OLD]);
     mount();
     await screen.findByText('Acme Corp');
+    expect(screen.queryByText('Old Co')).toBeNull();
+    expect(within(screen.getByTestId('tile-customers')).getByText('1 archived')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Archived' }));
-    await screen.findByText('Old Co');
-    expect(getCustomers).toHaveBeenLastCalledWith({ archived: true, range: '30d' });
+    expect(screen.getByText('Old Co')).toBeInTheDocument();
     expect(screen.queryByText('Acme Corp')).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: 'All' }));
-    await screen.findByText('Acme Corp');
+    expect(screen.getByText('Acme Corp')).toBeInTheDocument();
     expect(screen.getByText('Old Co')).toBeInTheDocument();
+    expect(getCustomers).toHaveBeenCalledTimes(1);
   });
 
-  it('range refetches with range', async () => {
+  it('range refetches with range, showing loading instead of stale rows', async () => {
     mount();
     await screen.findByText('Acme Corp');
+    let resolve!: (r: CustomerRow[]) => void;
+    getCustomers.mockReturnValue(new Promise((r) => (resolve = r)));
     fireEvent.click(screen.getByRole('button', { name: '7d' }));
-    await waitFor(() => expect(getCustomers).toHaveBeenLastCalledWith({ archived: false, range: '7d' }));
+    expect(getCustomers).toHaveBeenLastCalledWith({ archived: true, range: '7d' });
+    expect(screen.queryByText('Acme Corp')).toBeNull();
+    expect(screen.getByText('Loading customers…')).toBeInTheDocument();
+    resolve([GLOBEX]);
     await screen.findByText('Cost · 7d');
+    expect(screen.getByText('Globex')).toBeInTheDocument();
+    expect(screen.queryByText('Acme Corp')).toBeNull();
   });
 
   it('filter narrows rows by name or slug', async () => {
@@ -214,6 +222,8 @@ describe('Customers page', () => {
     expect(screen.getByText('Globex')).toBeInTheDocument();
     fireEvent.change(screen.getByPlaceholderText('Filter customers…'), { target: { value: 'zzz' } });
     expect(screen.getByText(/No customers match/)).toBeInTheDocument();
+    // The unassigned footer stays even with no table.
+    expect(screen.getByRole('link', { name: /Review unassigned/ })).toBeInTheDocument();
   });
 
   it('footer counts unassigned projects and its link sets scope none', async () => {

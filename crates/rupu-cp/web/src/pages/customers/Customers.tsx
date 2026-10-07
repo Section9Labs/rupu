@@ -46,7 +46,6 @@ function Tile({
   value,
   sub,
   warn,
-  children,
 }: {
   id: string;
   label: string;
@@ -54,14 +53,12 @@ function Tile({
   sub?: React.ReactNode;
   /** `sub` is a warning (e.g. unassigned projects). */
   warn?: boolean;
-  children?: React.ReactNode;
 }) {
   return (
     <div data-testid={`tile-${id}`} className="bg-panel border border-border rounded-xl shadow-card px-4 py-3">
       <p className="text-[9px] font-semibold uppercase tracking-widest text-ink-mute mb-1">{label}</p>
       <p className="text-2xl font-bold text-ink tabular-nums leading-none">{value}</p>
       {sub && <p className={warn ? 'mt-1 text-note text-warn' : 'mt-1 text-note text-ink-dim'}>{sub}</p>}
-      {children}
     </div>
   );
 }
@@ -185,31 +182,41 @@ export default function Customers() {
   const [range, setRange] = useState<DashboardRange>('30d');
   const [query, setQuery] = useState('');
   const [rows, setRows] = useState<CustomerRow[] | null>(null);
+  // True from the start of a fetch until it settles — rows from another range
+  // are never shown while the next ones load.
+  const [loading, setLoading] = useState(true);
+  const [loadedOnce, setLoadedOnce] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [projects, setProjects] = useState<ProjectRow[] | null>(null);
   const [reloadNonce, setReloadNonce] = useState(0);
   const [creating, setCreating] = useState(false);
   const headerRef = useRef<HTMLElement>(null);
 
-  // `archived=1` returns active AND archived customers; the Archived view
-  // narrows to the archived ones client-side.
+  // One fetch per range: `archived=1` returns active AND archived customers,
+  // and the Active / Archived / All views are derived from that list.
   useEffect(() => {
     let cancelled = false;
     setError(null);
-    api.getCustomers({ archived: status !== 'active', range }).then(
+    setLoading(true);
+    api.getCustomers({ archived: true, range }).then(
       (data) => {
-        if (!cancelled) setRows(data);
+        if (cancelled) return;
+        setRows(data);
+        setLoading(false);
+        setLoadedOnce(true);
       },
       (e: unknown) => {
         if (cancelled) return;
         setRows(null);
         setError(apiErrorMessage(e));
+        setLoading(false);
+        setLoadedOnce(true);
       },
     );
     return () => {
       cancelled = true;
     };
-  }, [status, range, reloadNonce]);
+  }, [range, reloadNonce]);
 
   // Totals for the "projects assigned" tile and the footer. Best effort: a
   // failure leaves the tile at "—" rather than blocking the page.
@@ -229,9 +236,14 @@ export default function Customers() {
   }, [reloadNonce]);
 
   const scoped = useMemo(
-    () => (rows ?? []).filter((r) => (status === 'archived' ? r.archived : true)),
+    () =>
+      (rows ?? []).filter((r) =>
+        status === 'all' ? true : status === 'archived' ? r.archived : !r.archived,
+      ),
     [rows, status],
   );
+  const archivedTotal = (rows ?? []).filter((r) => r.archived).length;
+  const activeTotal = (rows ?? []).length - archivedTotal;
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return scoped;
@@ -239,8 +251,6 @@ export default function Customers() {
   }, [scoped, query]);
 
   const stats = useMemo(() => {
-    const active = scoped.filter((r) => !r.archived);
-    const archivedN = scoped.length - active.length;
     const totalCost = scoped.reduce((s, r) => s + costOf(r), 0);
     const top = scoped.reduce<CustomerRow | null>((t, r) => (t === null || costOf(r) > costOf(t) ? r : t), null);
     const anyCost = scoped.some((r) => r.rollup.usage.cost_usd !== null);
@@ -248,7 +258,7 @@ export default function Customers() {
     const withFindings = scoped.filter((r) => r.rollup.findings_open > 0).length;
     const findings = scoped.reduce((s, r) => s + r.rollup.findings_open, 0);
     const hosts = [...new Set(scoped.flatMap((r) => r.rollup.hosts_without_customer ?? []))].sort();
-    return { active: active.length, archivedN, totalCost, top, anyCost, priceError, withFindings, findings, hosts };
+    return { totalCost, top, anyCost, priceError, withFindings, findings, hosts };
   }, [scoped]);
 
   // null `customer` = no customer; an ABSENT key can't say, so it is neither.
@@ -263,8 +273,6 @@ export default function Customers() {
     // Hand focus back to the trigger once the dialog is gone.
     setTimeout(() => headerRef.current?.querySelector('button')?.focus(), 0);
   }
-
-  const noCustomersAtAll = rows !== null && scoped.length === 0 && status !== 'archived' && query.trim() === '';
 
   return (
     <div className="p-8">
@@ -282,20 +290,47 @@ export default function Customers() {
 
       {error && <ErrorBanner className="mb-4">{error}</ErrorBanner>}
 
-      {rows === null && !error && (
+      {loadedOnce && (
+        <div className="mb-3 flex flex-wrap items-center gap-3">
+          <div className="w-64">
+            <SearchInput
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Filter customers…"
+              aria-label="Filter customers"
+            />
+          </div>
+          <Segmented
+            ariaLabel="Customer status"
+            size="sm"
+            options={STATUS_OPTIONS}
+            value={status}
+            onChange={(v) => setStatus(v as StatusView)}
+          />
+          <Segmented
+            ariaLabel="Range"
+            size="sm"
+            options={RANGE_OPTIONS}
+            value={range}
+            onChange={(v) => setRange(v as DashboardRange)}
+          />
+        </div>
+      )}
+
+      {loading && (
         <div className="py-16 flex items-center justify-center">
           <Spinner label="Loading customers…" />
         </div>
       )}
 
-      {rows !== null && (
+      {!loading && rows !== null && (
         <>
           <div className="mb-4 grid grid-cols-2 gap-3 lg:grid-cols-4">
             <Tile
               id="customers"
               label="Customers"
-              value={stats.active}
-              sub={status === 'active' ? undefined : `${stats.archivedN} archived`}
+              value={activeTotal}
+              sub={`${archivedTotal} archived`}
             />
             <Tile
               id="assigned"
@@ -327,32 +362,7 @@ export default function Customers() {
             />
           </div>
 
-          <div className="mb-3 flex flex-wrap items-center gap-3">
-            <div className="w-64">
-              <SearchInput
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder="Filter customers…"
-                aria-label="Filter customers"
-              />
-            </div>
-            <Segmented
-              ariaLabel="Customer status"
-              size="sm"
-              options={STATUS_OPTIONS}
-              value={status}
-              onChange={(v) => setStatus(v as StatusView)}
-            />
-            <Segmented
-              ariaLabel="Range"
-              size="sm"
-              options={RANGE_OPTIONS}
-              value={range}
-              onChange={(v) => setRange(v as DashboardRange)}
-            />
-          </div>
-
-          {noCustomersAtAll ? (
+          {rows.length === 0 ? (
             <EmptyState
               title="No customers yet"
               hint="Create a customer, then assign projects to it to give them their own config layer, accounts and spend."
@@ -360,7 +370,13 @@ export default function Customers() {
             />
           ) : visible.length === 0 ? (
             <EmptyState
-              title={query.trim() ? 'No customers match the filter' : 'No archived customers'}
+              title={
+                query.trim()
+                  ? 'No customers match the filter'
+                  : status === 'archived'
+                    ? 'No archived customers'
+                    : 'No active customers'
+              }
             />
           ) : (
             <SortableTable<CustomerRow>
@@ -368,23 +384,6 @@ export default function Customers() {
               rows={visible}
               rowKey={(r) => r.slug}
               initialSort={{ key: 'last_active', dir: 'desc' }}
-              footer={
-                unassigned > 0 ? (
-                  <div className="flex items-center justify-between gap-3">
-                    <span className="text-ink-dim">
-                      {unassigned} {unassigned === 1 ? 'project has' : 'projects have'} no customer — they run on
-                      the global config.
-                    </span>
-                    <Link
-                      to="/projects?customer=none"
-                      onClick={() => setScope('none')}
-                      className="font-medium text-brand-600 hover:text-brand-700 hover:underline"
-                    >
-                      Review unassigned →
-                    </Link>
-                  </div>
-                ) : undefined
-              }
             />
           )}
 
@@ -395,6 +394,24 @@ export default function Customers() {
             </p>
           )}
         </>
+      )}
+
+      {/* Whatever the table shows (or doesn't), the projects no customer owns
+          stay one click away. */}
+      {!loading && unassigned > 0 && (
+        <div className="mt-3 flex items-center justify-between gap-3 rounded-xl border border-border bg-panel px-4 py-2.5 text-note">
+          <span className="text-ink-dim">
+            {unassigned} {unassigned === 1 ? 'project has' : 'projects have'} no customer — they run on the
+            global config.
+          </span>
+          <Link
+            to="/projects?customer=none"
+            onClick={() => setScope('none')}
+            className="font-medium text-brand-600 hover:text-brand-700 hover:underline"
+          >
+            Review unassigned →
+          </Link>
+        </div>
       )}
 
       {creating && (

@@ -127,10 +127,54 @@ describe('CustomerFormDialog', () => {
     expect(reload).toHaveBeenCalled();
   });
 
-  it('Escape and Cancel close', () => {
+  it('Escape and Cancel close a pristine form', () => {
     const { onClose } = renderCreate();
     fireEvent.keyDown(document, { key: 'Escape' });
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
     expect(onClose).toHaveBeenCalledTimes(2);
+  });
+
+  it('a dirty form asks "Discard changes?" before Escape / overlay / Cancel close it', () => {
+    const { onClose } = renderCreate();
+    fireEvent.change(name(), { target: { value: 'Acme' } });
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByText('Discard changes?')).toBeInTheDocument();
+    // Escape on the prompt keeps editing.
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.queryByText('Discard changes?')).toBeNull();
+    expect(name().value).toBe('Acme');
+    // Overlay click and Cancel ask again.
+    fireEvent.mouseDown(screen.getByTestId('customer-form-overlay'));
+    expect(screen.getByText('Discard changes?')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Keep editing' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(onClose).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Discard' }));
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores Escape and overlay clicks while saving', async () => {
+    let resolve!: (d: CustomerDto) => void;
+    vi.spyOn(api, 'createCustomer').mockReturnValue(new Promise((r) => (resolve = r)));
+    const { onClose, onSaved } = renderCreate();
+    fireEvent.change(name(), { target: { value: 'Acme' } });
+    fireEvent.click(submit());
+    await waitFor(() => expect(submit()).toBeDisabled());
+    fireEvent.keyDown(document, { key: 'Escape' });
+    fireEvent.mouseDown(screen.getByTestId('customer-form-overlay'));
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.queryByText('Discard changes?')).toBeNull();
+    resolve(DTO);
+    await waitFor(() => expect(onSaved).toHaveBeenCalled());
+  });
+
+  it('create with an empty color shows a neutral dot and "derived from the slug"', () => {
+    const { container } = render(
+      <CustomerFormDialog mode="create" onSaved={vi.fn()} onClose={vi.fn()} />,
+    );
+    expect(container.querySelector('[data-neutral-dot]')).not.toBeNull();
+    expect(container.querySelector('[data-customer-dot]')).toBeNull();
+    expect(screen.getByText(/derived from the slug/)).toBeInTheDocument();
   });
 });
