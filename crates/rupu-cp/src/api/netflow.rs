@@ -91,6 +91,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/netflow", get(get_global_netflow))
         .route("/api/netflow/graph", get(get_netflow_graph))
         .route("/api/netflow/explorer", get(get_netflow_explorer))
+        .route("/api/netflow/index", get(get_netflow_index))
 }
 
 /// Run `f` — a synchronous ledger/transcript/ASN-table read — on the tokio
@@ -335,6 +336,25 @@ fn index_for(s: &AppState) -> Arc<NetflowIndex> {
     s.netflow_index
         .set_budget_bytes(mb.saturating_mul(1024 * 1024));
     Arc::clone(&s.netflow_index)
+}
+
+/// `GET /api/netflow/index` — the netflow index's size, budget and
+/// evictions (spec §3.5). API only.
+async fn get_netflow_index(
+    State(state): State<AppState>,
+) -> Json<crate::netflow_index::IndexStatus> {
+    Json(index_for(&state).status())
+}
+
+/// Read every local ledger into the index once, so the first Network page
+/// load does not pay for opening every file. Returns the file count.
+pub(crate) fn prewarm_netflow_index(index: &NetflowIndex, global_dir: &StdPath) -> usize {
+    let files = global_ledger_files(global_dir);
+    for (_, path) in &files {
+        index.summary(path);
+    }
+    index.sweep_missing_now();
+    files.len()
 }
 
 /// Process-wide cache for the parsed ASN table, keyed on the on-disk file's
