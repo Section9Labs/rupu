@@ -4396,6 +4396,7 @@ pub(crate) async fn pause_with_store(
                 )
             }
             PauseError::NotFound(_) => anyhow::anyhow!("load run record: {e}"),
+            PauseError::NotPausable(_) => anyhow::anyhow!("cannot pause run {run_id}: {e}"),
             PauseError::Store(_) => anyhow::anyhow!("pause run: {e}"),
         })?;
     // Deliver the pause to the detached runner process via the marker.

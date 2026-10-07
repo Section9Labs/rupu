@@ -2006,7 +2006,16 @@ async fn run_agent_inner(
             //
             // `None` means "no agent allowlist" → register everything,
             // matching the prior unrestricted behavior.
+            //
+            // The `findings.*` MCP tools are never offered: this in-process
+            // dispatcher has no run/findings context, so every call would be
+            // refused and burn a turn. Agents record, query and tag findings
+            // through the `report_finding` / `query_findings` / `tag_findings`
+            // builtins instead (registered above when coverage is on).
             for spec in rupu_mcp::tool_catalog() {
+                if !mcp_tool_offered_to_agents(spec.name) {
+                    continue;
+                }
                 let allowed = match &opts.agent_tools {
                     None => true,
                     Some(list) => mcp_tool_name_matches_allowlist(spec.name, list),
@@ -3411,6 +3420,13 @@ fn parse_file_edit_kind(s: &str) -> FileEditKind {
 /// `tools:` list don't appear in the MCP catalog, so they correctly
 /// don't match anything here — they're registered separately by
 /// `default_tool_registry`.
+/// Whether an MCP catalog tool is offered to an agent run at all. The
+/// `findings.*` tools need a run context the agent's in-process dispatcher
+/// never has; agents use the findings builtins instead.
+fn mcp_tool_offered_to_agents(name: &str) -> bool {
+    !name.starts_with("findings.")
+}
+
 fn mcp_tool_name_matches_allowlist(name: &str, allowlist: &[String]) -> bool {
     allowlist.iter().any(|entry| {
         if entry == "*" || entry == name {

@@ -5,3 +5,4 @@
 //! `tests/it/test_layout.rs` enforces this.
 
 mod reaper;
+mod round_prompt_scope;

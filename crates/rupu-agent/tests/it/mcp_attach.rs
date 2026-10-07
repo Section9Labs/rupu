@@ -12,8 +12,9 @@ use std::sync::Arc;
 /// at the type level. This verifies the field wiring compiles and is accepted
 /// by run_agent without panicking. We use a CapturingMockProvider to confirm
 /// the MCP tool names actually appear in the outbound LlmRequest.tools list.
-#[tokio::test]
-async fn mcp_registry_attaches_tools_to_run() {
+/// Run one scripted turn with an MCP registry attached and return the tool
+/// names the provider was offered.
+async fn offered_tools(agent_tools: Option<Vec<String>>) -> Vec<String> {
     let provider = CapturingMockProvider::new(vec![ScriptedTurn::AssistantText {
         text: "done".into(),
         stop: StopReason::EndTurn,
@@ -29,7 +30,7 @@ async fn mcp_registry_attaches_tools_to_run() {
         extra_tools: Vec::new(),
         agent_name: "mcp-test".into(),
         agent_system_prompt: "test".into(),
-        agent_tools: None,
+        agent_tools,
         provider: Box::new(provider),
         provider_name: "mock".into(),
         model: "mock-1".into(),
@@ -74,7 +75,13 @@ async fn mcp_registry_attaches_tools_to_run() {
 
     let requests = captured.lock().unwrap();
     assert_eq!(requests.len(), 1, "expected exactly one request");
-    let tool_names: Vec<&str> = requests[0].tools.iter().map(|t| t.name.as_str()).collect();
+    requests[0].tools.iter().map(|t| t.name.clone()).collect()
+}
+
+#[tokio::test]
+async fn mcp_registry_attaches_tools_to_run() {
+    let names = offered_tools(None).await;
+    let tool_names: Vec<&str> = names.iter().map(String::as_str).collect();
 
     // All builtins plus all MCP tools should be present.
     assert!(
@@ -97,13 +104,40 @@ async fn mcp_registry_attaches_tools_to_run() {
         tool_names.contains(&"issues.list"),
         "MCP tool issues.list should be present: {tool_names:?}"
     );
+    // The findings MCP trio needs a run context the agent's in-process
+    // dispatcher never has, so it is never offered — even under `tools: ["*"]`
+    // (here: no allowlist at all). Agents use the findings builtins.
+    for name in ["findings.record", "findings.query", "findings.tag"] {
+        assert!(
+            !tool_names.contains(&name),
+            "{name} must not be offered to an agent: {tool_names:?}"
+        );
+    }
     // Total must be 9 builtins (6 v0 + ast_grep + dispatch_agent + dispatch_agents_parallel)
-    // + 21 MCP tools = 30. The findings MCP trio is `findings.query`,
-    // `findings.record` and `findings.tag`.
+    // + the 18 native SCM MCP tools = 27.
     assert_eq!(
         tool_names.len(),
-        30,
-        "expected 9 builtins + 21 MCP tools; got {} tools: {tool_names:?}",
+        27,
+        "expected 9 builtins + 18 MCP tools; got {} tools: {tool_names:?}",
         tool_names.len()
+    );
+}
+
+/// A `tools: ["*"]` agent (every stock-fleet agent) gets the SCM MCP tools but
+/// never the `findings.*` ones: the agent's in-process dispatcher has no run
+/// context for them, so offering them only burns turns on refusals.
+#[tokio::test]
+async fn wildcard_agent_is_not_offered_findings_mcp_tools() {
+    let names = offered_tools(Some(vec!["*".to_string()])).await;
+    assert!(names.iter().any(|n| n == "scm.repos.list"), "{names:?}");
+    assert!(
+        !names.iter().any(|n| n.starts_with("findings.")),
+        "findings.* MCP tools leaked to a wildcard agent: {names:?}"
+    );
+    // An explicit `findings.*` grant doesn't bring them back either.
+    let names = offered_tools(Some(vec!["findings.*".to_string()])).await;
+    assert!(
+        !names.iter().any(|n| n.starts_with("findings.")),
+        "{names:?}"
     );
 }

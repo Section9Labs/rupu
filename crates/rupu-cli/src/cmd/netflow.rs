@@ -42,19 +42,19 @@ pub struct PruneArgs {
     /// Retention cutoff, e.g. `30d`, `12h`, or `1w`. Must be positive —
     /// `0s` or a negative value is rejected, not treated as "everything".
     /// Defaults to `30d` (mirrors `transcript prune`'s own fallback) when
-    /// omitted. A ledger is matched by file mtime, NOT by asking whether
-    /// its owning run has actually finished, so a run that has been idle
-    /// (no outbound calls) longer than this cutoff can still be pruned
-    /// mid-run — this command cannot tell "idle" from "finished". Run
-    /// `--dry-run` first if you're unsure. Anything modified in roughly
-    /// the last hour is never eligible regardless of what you pass here.
+    /// omitted. A ledger is matched by file mtime, but a ledger whose run
+    /// is still live is never deleted however old it is: a workflow run
+    /// that is not finished (and whose recorded runner pid, if any, is
+    /// alive) protects its own, its steps', its fan-out units' and its
+    /// sub-agents' ledgers, and a standalone `rupu run` whose process is
+    /// alive protects its own and its sub-agents'. Such ledgers are
+    /// listed as `skipped_live`. Anything modified in roughly the last
+    /// hour is never eligible regardless of what you pass here.
     #[arg(long, value_name = "DURATION")]
     pub older_than: Option<String>,
     /// Preview deletions without removing files. Always cheap to run
     /// first — the default (no flag) deletes immediately, same as
-    /// `transcript prune`. Recommended before any cutoff shorter than a
-    /// day, since this command cannot distinguish an idle run from a
-    /// finished one (see `--older-than`'s own help).
+    /// `transcript prune`.
     #[arg(long)]
     pub dry_run: bool,
 }
@@ -435,6 +435,9 @@ async fn prune(
         candidates.push(("global", global_netflow));
     }
 
+    // Every ledger id a still-live run owns: never pruned, however old.
+    let live = live_ledger_ids(&global, project_root.as_deref());
+
     let mut rows = Vec::new();
     // Two DIFFERENT failure shapes, both non-silent: `failures` is a
     // per-file removal failure (we identified the file, selected it,
@@ -455,7 +458,7 @@ async fn prune(
         // from disk. Record the failure and keep going; every
         // already-known outcome still reaches the report and the exit
         // code still goes non-zero (see below).
-        let entries = match prune_ledgers(&dir, older_than, args.dry_run) {
+        let entries = match prune_ledgers(&dir, older_than, args.dry_run, &live) {
             Ok(entries) => entries,
             Err(e) => {
                 scan_failures.push(format!("{} ({e})", dir.display()));
@@ -468,6 +471,7 @@ async fn prune(
                     failures.push(format!("{} ({err})", entry.path.display()));
                     format!("failed: {err}")
                 }
+                None if entry.skipped_live => "skipped_live".to_string(),
                 None if args.dry_run => "would_delete".to_string(),
                 None => "deleted".to_string(),
             };
@@ -579,6 +583,89 @@ pub(crate) struct PrunedLedger {
     /// for a dry run (nothing is ever attempted) and for a real prune
     /// that succeeded.
     pub error: Option<String>,
+    /// Old enough to prune, but its run is still live (see
+    /// [`live_ledger_ids`]): kept, never deleted, `bytes` not reclaimed.
+    pub skipped_live: bool,
+}
+
+/// Every netflow ledger id (the ledger's file stem) owned by a run that is
+/// still live, so `prune` never deletes a live run's audit trail however
+/// long it has been idle:
+///
+/// - a workflow run in the global or project-local `RunStore` that is not
+///   terminal — `Paused`/`AwaitingApproval` included, since a resume keeps
+///   appending to the same ledgers — unless it is `Running`/`Pending` with
+///   a recorded runner pid that is dead (an orphan the reaper will
+///   finalize). Its id expands to its steps', fan-out units' and
+///   sub-agents' ids ([`rupu_cp::api::netflow::run_and_unit_ids`]);
+/// - a standalone `rupu run` whose `<run_id>.meta.json` (project or global
+///   transcripts dir) records a pid that is alive — the run writes its
+///   `run.json` only when it ends, so the metadata pid is its one liveness
+///   signal — plus its sub-agents' ids. Metadata without a pid (written
+///   before the field existed) carries no signal and protects nothing.
+///
+/// Unreadable stores and metadata files are skipped: a run this cannot see
+/// is judged by age alone, exactly as before this check existed.
+pub(crate) fn live_ledger_ids(
+    global: &Path,
+    project_root: Option<&Path>,
+) -> std::collections::HashSet<String> {
+    use rupu_orchestrator::{RunStatus, RunStore};
+    let mut live = std::collections::HashSet::new();
+    let global_store = RunStore::new(global.join("runs"));
+
+    let mut stores = vec![RunStore::new(global.join("runs"))];
+    if let Some(root) = project_root {
+        let local = root.join(".rupu").join("runs");
+        let same =
+            std::fs::canonicalize(&local).ok() == std::fs::canonicalize(global.join("runs")).ok();
+        if local.is_dir() && !same {
+            stores.push(RunStore::new(local));
+        }
+    }
+    for store in &stores {
+        for rec in store.list().unwrap_or_default() {
+            let orphaned = matches!(rec.status, RunStatus::Running | RunStatus::Pending)
+                && rec
+                    .runner_pid
+                    .is_some_and(|pid| !rupu_orchestrator::runs::pid_is_running(pid));
+            if rec.status.is_terminal() || orphaned {
+                continue;
+            }
+            live.extend(rupu_cp::api::netflow::run_and_unit_ids(store, &rec.id));
+        }
+    }
+
+    let mut transcript_dirs = vec![global.join("transcripts")];
+    if let Some(root) = project_root {
+        transcript_dirs.push(root.join(".rupu").join("transcripts"));
+    }
+    for dir in transcript_dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_meta = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".meta.json"));
+            if !is_meta {
+                continue;
+            }
+            let Ok(meta) = crate::standalone_run_metadata::read_metadata(&path) else {
+                continue;
+            };
+            if meta
+                .pid
+                .is_some_and(rupu_orchestrator::runs::pid_is_running)
+            {
+                live.extend(global_store.sub_run_ids_recursive(&meta.run_id));
+                live.insert(meta.run_id);
+            }
+        }
+    }
+    live
 }
 
 /// Delete (or, in dry-run mode, merely report) every per-run netflow
@@ -603,35 +690,22 @@ pub(crate) struct PrunedLedger {
 /// itself, never walks through to delete its target, and its own size
 /// is never counted as reclaimed (see `PrunedLedger::bytes`'s doc).
 ///
-/// # Liveness: why this is mtime-only, and the recency floor
+/// # Liveness: live runs are skipped, then mtime, then the recency floor
 ///
-/// This function has no access to any run store. A ledger's filename
-/// is a run (or workflow-step / fan-out unit) id, and those ids are
-/// minted and tracked across THREE separate, differently-shaped
-/// stores — the workflow `RunStore`, standalone run metadata
-/// (pid-based), and sessions — with no single cheap lookup that covers
-/// all three from a bare filename (see `rupu-cp`'s
-/// `run_and_unit_ids`/`resolve_ledger_paths` for how much machinery
-/// answering that question for ONE known parent run already needs).
-/// Building that here would make `rupu-cli`'s thin dispatcher reach
-/// into orchestrator/session internals just to prune files, and would
-/// still miss ids that live in stores this crate cannot enumerate from
-/// a directory listing alone.
+/// A ledger's filename is a run (or workflow-step / fan-out unit /
+/// sub-agent) id. Ids owned by a run that is still live — the set the
+/// caller builds once with [`live_ledger_ids`] and passes as `live` — are
+/// never deleted, however old their mtime: an idle-but-live run (a long
+/// tool call, a run parked at a gate) keeps its audit trail. They come
+/// back as `skipped_live` rows so the operator sees what was kept and why.
 ///
-/// mtime is the proxy instead, and it is a sound one for any
-/// `--older-than` cutoff longer than a run can plausibly stay alive:
-/// the ledger file is created (mtime = now) the instant a run's
-/// netflow sink is constructed (`NetflowWriterHandle::spawn`'s
-/// `OpenOptions::create(true)`), at or before the run's very first
-/// unit of work, and every subsequent flow record bumps it again. A
-/// run that is still `Running`/`Pending` therefore has a ledger no
-/// older than "how long this run has been alive" — comfortably inside
-/// the `30d` default. A caller passing a much shorter `--older-than`
-/// than any real run could plausibly still be going widens that
-/// window and takes on the corresponding risk knowingly (documented on
-/// the flag's own `--help` text — read it there, not just here).
+/// For every other ledger, mtime is the age: the file is created the
+/// instant a run's netflow sink is constructed and every flow record
+/// bumps it again. A run [`live_ledger_ids`] cannot see (an unreadable
+/// store, or a standalone run whose metadata predates the recorded pid)
+/// is judged by age alone.
 ///
-/// `MIN_LEDGER_AGE` is the UNCONDITIONAL backstop for that risk: no
+/// `MIN_LEDGER_AGE` is the UNCONDITIONAL backstop under both: no
 /// matter what `older_than` (or `parse_retention_duration`'s own
 /// positivity check) allows through, a file modified more recently
 /// than this floor is never eligible. This is what makes `--older-than
@@ -642,13 +716,7 @@ pub(crate) struct PrunedLedger {
 /// exact instant getting deleted out from under its writer, silently,
 /// because the writer's own open file descriptor survives the unlink
 /// on POSIX) is structurally impossible, not just discouraged by
-/// documentation. It does NOT fully solve the general "idle gap"
-/// problem a `--older-than 1h`/`1d` cutoff still has against a live but
-/// quiet run — no floor short enough to be useful for real pruning
-/// could — that residual risk is the one the `--older-than`/`--dry-run`
-/// help text asks an operator to reason about themselves; the floor's
-/// job is only to make the worst, silent, instantaneous case
-/// impossible regardless of input.
+/// documentation — even for a run the live check cannot see.
 ///
 /// When age cannot even be read (a platform without mtime support),
 /// the file is left alone rather than guessed at — over-retention over
@@ -685,6 +753,7 @@ pub(crate) fn prune_ledgers(
     dir: &Path,
     older_than: chrono::Duration,
     dry_run: bool,
+    live: &std::collections::HashSet<String>,
 ) -> anyhow::Result<Vec<PrunedLedger>> {
     let now = chrono::Utc::now();
     // See `MIN_LEDGER_AGE`'s doc section above: the effective cutoff
@@ -706,6 +775,7 @@ pub(crate) fn prune_ledgers(
                     path: dir.to_path_buf(),
                     bytes: 0,
                     modified_at: None,
+                    skipped_live: false,
                     error: Some(format!("could not read a directory entry: {e}")),
                 });
                 continue;
@@ -741,6 +811,7 @@ pub(crate) fn prune_ledgers(
                     path,
                     bytes: 0,
                     modified_at: None,
+                    skipped_live: false,
                     error: Some(e.to_string()),
                 });
                 continue;
@@ -770,12 +841,26 @@ pub(crate) fn prune_ledgers(
             .unwrap_or(false);
         let bytes = if is_symlink { 0 } else { metadata.len() };
 
+        // Old enough, but its run is still live: keep it, and say so.
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if live.contains(stem) {
+            out.push(PrunedLedger {
+                path,
+                bytes: 0,
+                modified_at: Some(modified_at),
+                error: None,
+                skipped_live: true,
+            });
+            continue;
+        }
+
         if dry_run {
             out.push(PrunedLedger {
                 path,
                 bytes,
                 modified_at: Some(modified_at),
                 error: None,
+                skipped_live: false,
             });
             continue;
         }
@@ -786,12 +871,14 @@ pub(crate) fn prune_ledgers(
                 bytes,
                 modified_at: Some(modified_at),
                 error: None,
+                skipped_live: false,
             }),
             Err(e) => out.push(PrunedLedger {
                 path,
                 bytes,
                 modified_at: Some(modified_at),
                 error: Some(e.to_string()),
+                skipped_live: false,
             }),
         }
     }
@@ -1001,7 +1088,8 @@ mod tests {
         std::fs::write(&new, "{}\n").unwrap();
         backdate(&old, 40);
 
-        let removed = prune_ledgers(dir, chrono::Duration::days(30), false).unwrap();
+        let removed =
+            prune_ledgers(dir, chrono::Duration::days(30), false, &Default::default()).unwrap();
 
         assert_eq!(removed.len(), 1);
         assert!(!old.exists(), "the stale ledger is gone");
@@ -1016,7 +1104,8 @@ mod tests {
         std::fs::write(&old, "{}\n").unwrap();
         backdate(&old, 40);
 
-        let removed = prune_ledgers(dir, chrono::Duration::days(30), true).unwrap();
+        let removed =
+            prune_ledgers(dir, chrono::Duration::days(30), true, &Default::default()).unwrap();
 
         assert_eq!(removed.len(), 1, "still reported");
         assert!(old.exists(), "but not deleted");
@@ -1032,7 +1121,8 @@ mod tests {
         std::fs::create_dir_all(dir.join("archive")).unwrap();
         backdate(&dir.join(".gitignore"), 40);
 
-        let removed = prune_ledgers(dir, chrono::Duration::days(30), false).unwrap();
+        let removed =
+            prune_ledgers(dir, chrono::Duration::days(30), false, &Default::default()).unwrap();
 
         assert!(removed.is_empty());
         assert!(dir.join(".gitignore").exists());
@@ -1050,7 +1140,8 @@ mod tests {
         std::fs::write(&legacy, "{}\n").unwrap();
         backdate(&legacy, 400);
 
-        let removed = prune_ledgers(dir, chrono::Duration::days(30), false).unwrap();
+        let removed =
+            prune_ledgers(dir, chrono::Duration::days(30), false, &Default::default()).unwrap();
 
         assert!(removed.is_empty());
         assert!(legacy.exists(), "the legacy ledger is never pruned");
@@ -1069,7 +1160,8 @@ mod tests {
         std::fs::write(&recent, "{}\n").unwrap();
         backdate(&recent, 29);
 
-        let removed = prune_ledgers(dir, chrono::Duration::days(30), false).unwrap();
+        let removed =
+            prune_ledgers(dir, chrono::Duration::days(30), false, &Default::default()).unwrap();
 
         assert!(removed.is_empty(), "29 days old must survive a 30d cutoff");
         assert!(recent.exists());
@@ -1083,7 +1175,8 @@ mod tests {
         std::fs::write(&old, "0123456789").unwrap();
         backdate(&old, 40);
 
-        let removed = prune_ledgers(dir, chrono::Duration::days(30), false).unwrap();
+        let removed =
+            prune_ledgers(dir, chrono::Duration::days(30), false, &Default::default()).unwrap();
 
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0].bytes, 10);
@@ -1100,7 +1193,12 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let missing = tmp.path().join("does-not-exist");
 
-        let result = prune_ledgers(&missing, chrono::Duration::days(30), false);
+        let result = prune_ledgers(
+            &missing,
+            chrono::Duration::days(30),
+            false,
+            &Default::default(),
+        );
 
         assert!(result.is_err());
     }
@@ -1137,7 +1235,7 @@ mod tests {
         locked.set_mode(0o555);
         std::fs::set_permissions(dir, locked).unwrap();
 
-        let result = prune_ledgers(dir, chrono::Duration::days(30), false);
+        let result = prune_ledgers(dir, chrono::Duration::days(30), false, &Default::default());
 
         // Restore before any assertion can early-return / panic, so the
         // TempDir's own cleanup on drop never fails.
@@ -1171,7 +1269,13 @@ mod tests {
         let fresh = dir.join("run-fresh.jsonl");
         std::fs::write(&fresh, "{}\n").unwrap();
 
-        let removed = prune_ledgers(dir, chrono::Duration::seconds(1), false).unwrap();
+        let removed = prune_ledgers(
+            dir,
+            chrono::Duration::seconds(1),
+            false,
+            &Default::default(),
+        )
+        .unwrap();
 
         assert!(
             removed.is_empty(),
@@ -1192,7 +1296,8 @@ mod tests {
         std::fs::write(&old, "{}\n").unwrap();
         backdate(&old, 40);
 
-        let removed = prune_ledgers(dir, chrono::Duration::days(30), false).unwrap();
+        let removed =
+            prune_ledgers(dir, chrono::Duration::days(30), false, &Default::default()).unwrap();
 
         assert_eq!(removed.len(), 1);
         assert!(!old.exists());
@@ -1216,20 +1321,22 @@ mod tests {
         backdate(&old_a, 40);
         backdate(&old_b, 35);
 
-        let mut previewed: Vec<_> = prune_ledgers(dir, chrono::Duration::days(30), true)
-            .unwrap()
-            .into_iter()
-            .map(|p| p.path)
-            .collect();
+        let mut previewed: Vec<_> =
+            prune_ledgers(dir, chrono::Duration::days(30), true, &Default::default())
+                .unwrap()
+                .into_iter()
+                .map(|p| p.path)
+                .collect();
         previewed.sort();
 
         // Dry run touched nothing, so the same two files are still
         // there to select for real.
-        let mut removed: Vec<_> = prune_ledgers(dir, chrono::Duration::days(30), false)
-            .unwrap()
-            .into_iter()
-            .map(|p| p.path)
-            .collect();
+        let mut removed: Vec<_> =
+            prune_ledgers(dir, chrono::Duration::days(30), false, &Default::default())
+                .unwrap()
+                .into_iter()
+                .map(|p| p.path)
+                .collect();
         removed.sort();
 
         assert_eq!(previewed, vec![old_a.clone(), old_b.clone()]);
@@ -1254,7 +1361,8 @@ mod tests {
         let link = dir.join("run-link.jsonl");
         symlink(&target, &link).unwrap();
 
-        let removed = prune_ledgers(dir, chrono::Duration::days(30), false).unwrap();
+        let removed =
+            prune_ledgers(dir, chrono::Duration::days(30), false, &Default::default()).unwrap();
 
         assert_eq!(removed.len(), 1);
         assert_eq!(
@@ -1304,7 +1412,7 @@ mod tests {
         locked.set_mode(0o600); // read+write, no execute/search
         std::fs::set_permissions(dir, locked).unwrap();
 
-        let result = prune_ledgers(dir, chrono::Duration::days(30), false);
+        let result = prune_ledgers(dir, chrono::Duration::days(30), false, &Default::default());
 
         // Restore before any assertion can early-return / panic, so
         // the TempDir's own cleanup on drop never fails.

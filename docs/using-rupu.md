@@ -192,6 +192,10 @@ by giving them scope, not by editing the agent.
 rupu run review-diff "check staged changes for bugs and missing tests"
 ```
 
+`rupu run pause <run-id>` / `rupu run resume <run-id>` act on workflow runs only. A standalone
+agent run has no pause boundary, so pausing one is refused with an error rather than marking it
+paused while the agent keeps going.
+
 ### Run an agent against a PR target
 
 ```sh
@@ -431,6 +435,11 @@ detail is shown: `focused` keeps run summaries only, `compact` adds run metadata
 expands the retained transcript content inline under each recent run. Use `--no-color`, `--pager`,
 or `--no-pager` to override the configured UI preferences for a single invocation. Structured
 `json` output is unchanged.
+
+In an interactive session the status header ends with a context gauge, `ctx 52K/200K 26%`: the
+last turn's prompt size against the model's input limit, and the percentage, which changes color
+as it nears the session's compaction threshold and again once it reaches it. It appears once the input limit is
+known and a turn has completed.
 
 ### Inspect an issue snapshot
 
@@ -820,9 +829,12 @@ Netflow ledger retention:
 - has **no `[storage]` config key of its own** — it does not read
   `archived_transcript_retention`/`archived_session_retention`, or any other retention
   default. When `--older-than` is omitted it falls back to a hardcoded `30d`.
-- a ledger is matched by file mtime, not by asking whether its owning run has actually
-  finished — a run that has been idle (no outbound calls) longer than the cutoff can still be
-  pruned mid-run. If you are not sure everything in scope has finished, run `--dry-run` first.
+- a ledger is matched by file mtime, but a ledger whose run is still live is never deleted,
+  however long the run has been idle: a workflow run that hasn't finished (paused and
+  awaiting-approval runs included, unless it is `running`/`pending` with a dead recorded runner
+  pid) keeps its own, its steps', its fan-out units' and its sub-agents' ledgers, and a
+  standalone `rupu run` whose process is alive keeps its own and its sub-agents'. These rows
+  report `skipped_live`.
 - regardless of `--older-than`, anything modified in roughly the last hour is never eligible —
   a fixed one-hour floor, not configurable, that exists specifically to keep a very short or
   mistaken cutoff from deleting a ledger a run is actively writing to right now
@@ -1243,6 +1255,10 @@ tools: [scm.*, issues.*]
 
 Keep reviewer agents read-only even if their `tools:` list names writable SCM tools; `permissionMode: readonly` will block writes.
 
+The `findings.*` MCP tools are never offered to an agent, even under `tools: ["*"]`: they need the
+run context only workflow `action:` steps have. Agents record, query and tag
+findings with the `report_finding`, `query_findings` and `tag_findings` builtins.
+
 ---
 
 ## Triggers and long-running automation
@@ -1434,8 +1450,9 @@ verifying a sha256 checksum before an atomic in-place binary swap with a backup 
 a passive "update available" notice. The notice goes to stderr, is read from a local
 cache (refreshed in the background at most once a day, never blocking the command), and
 is printed only when stderr is a terminal and no `--format` other than `table` is given (never by
-`rupu update` itself). Setting `RUPU_NO_UPDATE_CHECK` (to any value)
-turns it off for that process, as `[update].check = false` does.
+`rupu update` itself). Setting `RUPU_NO_UPDATE_CHECK` to anything other than empty, `0`
+or `false` turns it off for that process, as `[update].check = false` does (so
+`RUPU_NO_UPDATE_CHECK=0` leaves it on).
 
 ---
 

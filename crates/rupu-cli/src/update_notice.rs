@@ -8,7 +8,8 @@
 use std::io::IsTerminal as _;
 
 /// Gate for the passive notice: on by default, suppressed for non-TTY,
-/// structured output, config `check=false`, or `RUPU_NO_UPDATE_CHECK`.
+/// structured output, config `check=false`, or `RUPU_NO_UPDATE_CHECK` set to
+/// anything but empty / `0` / `false` ([`env_disables_check`]).
 pub fn should_check(
     cfg_check: Option<bool>,
     env_disabled: bool,
@@ -19,6 +20,19 @@ pub fn should_check(
         return false;
     }
     cfg_check.unwrap_or(true)
+}
+
+/// Whether a `RUPU_NO_UPDATE_CHECK` value disables the notice. Unset,
+/// empty, `0` and `false` (any case) mean "not set", so
+/// `RUPU_NO_UPDATE_CHECK=0` keeps the notice on; any other value disables it.
+pub fn env_disables_check(value: Option<&std::ffi::OsStr>) -> bool {
+    match value.map(|v| v.to_string_lossy()) {
+        None => false,
+        Some(v) => {
+            let v = v.trim();
+            !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false"))
+        }
+    }
 }
 
 /// Print the cached notice (if any, and if newer than `current`), then
@@ -34,7 +48,7 @@ pub fn maybe_print(
     is_tty: bool,
     structured_output: bool,
 ) {
-    let env_disabled = std::env::var_os("RUPU_NO_UPDATE_CHECK").is_some();
+    let env_disabled = env_disables_check(std::env::var_os("RUPU_NO_UPDATE_CHECK").as_deref());
     if !should_check(cfg_check, env_disabled, is_tty, structured_output) {
         return;
     }

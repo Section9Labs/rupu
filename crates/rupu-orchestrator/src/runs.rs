@@ -4011,6 +4011,13 @@ impl RunStore {
             RunStoreError::NotFound(s) => PauseError::NotFound(s),
             other => PauseError::Store(other.to_string()),
         })?;
+        // A standalone agent run (`rupu run <agent>`, recorded as
+        // `agent:<name>`) has no pause boundary: its runner never polls the
+        // pause marker, so flipping it to `Paused` would only lie while the
+        // agent keeps running. Refuse before touching the record.
+        if record.workflow_name.starts_with(AGENT_RUN_PREFIX) {
+            return Err(PauseError::NotPausable(record.workflow_name));
+        }
         match record.status {
             RunStatus::Completed
             | RunStatus::Failed
@@ -4177,9 +4184,20 @@ pub enum PauseError {
     NotRunning(RunStatus),
     #[error("run not found: {0}")]
     NotFound(String),
+    /// The run is a standalone agent run (`agent:<name>`), not a workflow
+    /// run: it has no pause boundary to stop at.
+    #[error(
+        "`{0}` is a standalone agent run, which has no pause boundary; \
+         only workflow runs can be paused"
+    )]
+    NotPausable(String),
     #[error("store: {0}")]
     Store(String),
 }
+
+/// `RunRecord::workflow_name` prefix of a standalone agent run
+/// (`rupu run <agent>` records `agent:<name>`).
+pub const AGENT_RUN_PREFIX: &str = "agent:";
 
 /// A store failure inside a locked pause (including a
 /// [`RunStore::blocking`] task that did not complete) is reported as this

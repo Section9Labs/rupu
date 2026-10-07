@@ -227,11 +227,13 @@ fn fleet_pair(args: &Args) -> anyhow::Result<Option<(&Path, &str)>> {
 /// connector shells out to).
 #[derive(Debug, PartialEq, Eq)]
 pub enum RunAction {
-    /// Cooperatively pause a running standalone-agent or workflow run at
-    /// its next safe boundary. Delegates to the exact same primitive as
+    /// Cooperatively pause a running workflow run at its next safe
+    /// boundary. Delegates to the exact same primitive as
     /// `rupu workflow pause <run_id>` ([`crate::cmd::workflow::pause`]:
     /// `RunStore::pause` + the pause marker) — resume with
-    /// `rupu run resume <run_id>` (or `rupu workflow resume`).
+    /// `rupu run resume <run_id>` (or `rupu workflow resume`). A standalone
+    /// agent run (`agent:<name>`) has no pause boundary and is refused with
+    /// `PauseError::NotPausable`.
     Pause {
         /// Full run id (`run_<ULID>`) as printed by `rupu run` / `rupu
         /// workflow run`.
@@ -1451,7 +1453,11 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                 .and_then(|f| f.cause.as_deref().cloned());
             let rec = rupu_orchestrator::RunRecord {
                 id: run_id.clone(),
-                workflow_name: format!("agent:{}", spec.name),
+                workflow_name: format!(
+                    "{}{}",
+                    rupu_orchestrator::AGENT_RUN_PREFIX,
+                    spec.name
+                ),
                 status,
                 inputs: std::collections::BTreeMap::new(),
                 event: None,

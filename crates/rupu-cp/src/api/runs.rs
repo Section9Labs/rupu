@@ -341,6 +341,7 @@ async fn cancel_run(
 /// - `NotFound` → 404
 /// - `AlreadyTerminal` / `NotRunning` → 409 (the run isn't in a state that
 ///   can be cooperatively paused)
+/// - `NotPausable` → 409 (a standalone agent run has no pause boundary)
 /// - `Store` → 500
 fn map_pause_err(id: &str, e: PauseError) -> ApiError {
     match e {
@@ -348,6 +349,7 @@ fn map_pause_err(id: &str, e: PauseError) -> ApiError {
         PauseError::AlreadyTerminal(_) | PauseError::NotRunning(_) => {
             ApiError::conflict(format!("run {id} is not running"))
         }
+        e @ PauseError::NotPausable(_) => ApiError::conflict(format!("run {id}: {e}")),
         PauseError::Store(msg) => ApiError::internal(msg),
     }
 }

@@ -46,7 +46,7 @@ pub use runner::{
 pub use runs::{
     ApprovalDecision, ApprovalError, FindingRecord, GateDecision, GateVerdict, ItemResultRecord,
     RunRecord, RunStatus, RunStore, RunStoreError, RunnerClaim, RunnerFinish, RunnerGuard,
-    StepKind, StepResultRecord, UnitCheckpoint,
+    StepKind, StepResultRecord, UnitCheckpoint, AGENT_RUN_PREFIX,
 };
 pub use step_factory::DefaultStepFactory;
 pub use templates::{

@@ -6626,12 +6626,7 @@ fn session_context_gauge(
     state: &SessionInteractiveState,
 ) -> Option<String> {
     let window = session.effective_context_window()? as u64;
-    let last_input = state.last_turn_input_tokens;
-    if last_input == 0 || window == 0 {
-        return None;
-    }
-    let pct = (last_input * 100).saturating_div(window);
-    Some(format!("{pct}%"))
+    crate::output::fmt::context_gauge_text(state.last_turn_input_tokens, window)
 }
 
 /// Palette color for the context gauge percentage.

@@ -175,10 +175,13 @@ registered project.
 `rupu netflow prune` deletes ledgers older than `--older-than` (default `30d`)
 from the current project's `.rupu/netflow/` and the global `~/.rupu/netflow/`.
 It goes by file modification time, never touches a file modified in the last
-hour, and rejects a zero or negative cutoff. Because it cannot tell an idle run
-from a finished one, a long-idle run's ledger can be pruned while the run is
-still going; use `--dry-run` first with short cutoffs. It supports
-`--format json|csv`.
+hour, and rejects a zero or negative cutoff. A ledger whose run is still live is
+never deleted, however long it has been idle: an unfinished workflow run (paused
+and awaiting-approval included, unless it is `running`/`pending` with a dead
+recorded runner pid) keeps its own, its steps', its fan-out units' and its
+sub-agents' ledgers, and a standalone `rupu run` whose process is alive keeps its
+own and its sub-agents'. Those rows report `skipped_live`. `--dry-run` previews.
+It supports `--format json|csv`.
 
 Nothing deletes ledgers automatically.
 

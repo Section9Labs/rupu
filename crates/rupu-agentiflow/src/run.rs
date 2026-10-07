@@ -842,6 +842,7 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 run_id: id.clone(),
                 transcript_path: run_dir.join("lead").join("transcript.jsonl"),
                 objective: mission_objective(&def),
+                scope: def.scope.clone(),
                 goals: def.goals.clone(),
                 workspace_id: format!("ws_{}", target_id(&workspace, "workspace")),
                 workspace_path: workspace.clone(),

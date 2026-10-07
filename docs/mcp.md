@@ -64,12 +64,12 @@ The 18 SCM and issue tools are described one by one in
 findings ledger, so they need to know which workspace, run and model to
 attribute to. Only a workflow `action:` step supplies that (for example
 `action: findings.record` or a `for_each` over `findings.query` with
-`all: true`; see `docs/workflow-format.md` and `docs/coverage.md`). Everywhere
-else — `rupu mcp serve`, and an agent's own tool calls — the three tools are
-still listed but refuse every call with an "unavailable: … started without run
-context" error rather than writing to a guessed location. An agent records and
-queries findings through its own builtins instead: `report_finding`,
-`query_findings` and `tag_findings`.
+`all: true`; see `docs/workflow-format.md` and `docs/coverage.md`). Under
+`rupu mcp serve` the three tools are still listed but refuse every call with an
+"unavailable: … started without run context" error rather than writing to a
+guessed location. Agents are never offered them (see [Permissions](#permissions));
+an agent records and queries findings through its own builtins instead:
+`report_finding`, `query_findings` and `tag_findings`.
 
 ## Permissions
 
@@ -81,6 +81,13 @@ the MCP ecosystem; rupu does NOT prompt from the server.
 For `rupu run` invocations from the CLI, the agent's frontmatter `tools:`
 list and the `--mode` flag enforce per-tool gating; the MCP server enforces
 both.
+
+An agent is never offered the `findings.record` / `findings.query` /
+`findings.tag` tools, whatever its `tools:` list says (`["*"]` included): its
+in-process MCP server has no run context to record or read findings against,
+so every call would be refused. Agents use the `report_finding`,
+`query_findings` and `tag_findings` builtins; the `findings.*` MCP tools serve
+workflow `action:` steps.
 
 ## Troubleshooting
 

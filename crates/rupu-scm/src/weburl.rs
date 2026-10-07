@@ -1,6 +1,10 @@
 //! Pure git-remote-URL parsing and web permalink construction. No IO, no
 //! async. Turns a `Workspace.repo_remote` (raw `git remote get-url origin`
-//! output) plus a branch + file + line range into a github/gitlab blob URL.
+//! output) plus a ref (branch or commit) + file + line range into a
+//! github/gitlab blob URL. github.com and gitlab.com are always known;
+//! self-hosted instances (GitHub Enterprise, self-managed GitLab) are known
+//! through [`WebHosts::from_scm`], built from each `[scm.<account>]`'s
+//! `base_url`.
 
 use crate::platform::Platform;
 
@@ -12,11 +16,61 @@ pub struct RepoWeb {
     pub repo: String,
 }
 
-fn platform_for_host(host: &str) -> Option<Platform> {
+/// Self-hosted SCM web hosts (host → platform), beyond the always-known
+/// github.com / gitlab.com.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WebHosts(Vec<(String, Platform)>);
+
+impl WebHosts {
+    /// The hosts named by every `[scm.<account>]` with a `base_url`, under
+    /// the account's platform (`kind`, else the account name — the same
+    /// rule the registry uses). `https://git.acme.internal/api/v3` names
+    /// `git.acme.internal`. An account whose kind isn't github/gitlab, or
+    /// whose `base_url` has no host, is skipped.
+    pub fn from_scm(scm: &rupu_config::ScmSection) -> Self {
+        let mut hosts = Vec::new();
+        for (name, cfg) in &scm.platforms {
+            let kind = cfg
+                .kind
+                .as_deref()
+                .and_then(|k| k.parse::<Platform>().ok())
+                .or_else(|| name.parse::<Platform>().ok());
+            let (Some(kind), Some(url)) = (kind, cfg.base_url.as_deref()) else {
+                continue;
+            };
+            if let Some(host) = url_host(url) {
+                if !hosts.iter().any(|(h, _): &(String, Platform)| h == &host) {
+                    hosts.push((host, kind));
+                }
+            }
+        }
+        Self(hosts)
+    }
+
+    fn platform_for(&self, host: &str) -> Option<Platform> {
+        let host = host.to_ascii_lowercase();
+        self.0.iter().find(|(h, _)| *h == host).map(|(_, p)| *p)
+    }
+}
+
+/// The lower-cased host of a URL (`scheme://[user@]host[:port]/...`), port
+/// dropped. `None` when there is no host.
+fn url_host(url: &str) -> Option<String> {
+    let rest = url.trim().split_once("://").map(|(_, r)| r)?;
+    let authority = rest.split('/').next().unwrap_or("");
+    let authority = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
+    let host = authority.split(':').next().unwrap_or("");
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+fn platform_for_host(host: &str, extra: &WebHosts) -> Option<Platform> {
     match host {
         "github.com" => Some(Platform::Github),
         "gitlab.com" => Some(Platform::Gitlab),
-        _ => None,
+        other => extra.platform_for(other),
     }
 }
 
@@ -25,6 +79,11 @@ fn platform_for_host(host: &str) -> Option<Platform> {
 /// `ssh://git@host/owner/repo.git`. Owner may contain `/` (GitLab groups);
 /// the last path segment is the repo. Unknown hosts → `None`.
 pub fn parse_repo_remote(remote: &str) -> Option<RepoWeb> {
+    parse_repo_remote_with(remote, &WebHosts::default())
+}
+
+/// [`parse_repo_remote`], also knowing the self-hosted `hosts`.
+pub fn parse_repo_remote_with(remote: &str, hosts: &WebHosts) -> Option<RepoWeb> {
     let remote = remote.trim();
     if remote.is_empty() {
         return None;
@@ -39,6 +98,12 @@ pub fn parse_repo_remote(remote: &str) -> Option<RepoWeb> {
         // scheme URL: [user@]host/owner/.../repo
         let rest = rest.split_once('@').map(|(_, r)| r).unwrap_or(rest);
         let (host, path) = rest.split_once('/')?;
+        // An ssh port (`ssh://git@host:2222/...`) is not the web port.
+        let host = if remote.starts_with("ssh://") {
+            host.split(':').next().unwrap_or(host)
+        } else {
+            host
+        };
         (host.to_string(), path.to_string())
     } else {
         // scp style: git@host:owner/.../repo
@@ -47,7 +112,7 @@ pub fn parse_repo_remote(remote: &str) -> Option<RepoWeb> {
         (host.to_string(), path.to_string())
     };
 
-    let platform = platform_for_host(&host)?;
+    let platform = platform_for_host(&host, hosts)?;
     let path = path.trim_matches('/');
     let path = path.strip_suffix(".git").unwrap_or(path);
     let (owner, repo) = path.rsplit_once('/')?;
@@ -71,8 +136,9 @@ impl RepoWeb {
         }
     }
 
-    /// Web blob URL to a file (optionally a line range). Platform-specific
-    /// path prefix and line-fragment syntax:
+    /// Web blob URL to a file (optionally a line range) at `branch` — a
+    /// branch name or a commit sha; the URL is only pinned when it is a
+    /// commit. Platform-specific path prefix and line-fragment syntax:
     ///   GitHub: `/blob/<branch>/<path>#L<a>-L<b>`
     ///   GitLab: `/-/blob/<branch>/<path>#L<a>-<b>`
     pub fn blob_url(&self, branch: &str, path: &str, line_range: Option<[u32; 2]>) -> String {
@@ -105,7 +171,18 @@ pub fn repo_permalink(
     path: &str,
     line_range: Option<[u32; 2]>,
 ) -> Option<String> {
-    let rw = parse_repo_remote(remote)?;
+    repo_permalink_with(remote, branch, path, line_range, &WebHosts::default())
+}
+
+/// [`repo_permalink`], also knowing the self-hosted `hosts`.
+pub fn repo_permalink_with(
+    remote: &str,
+    branch: Option<&str>,
+    path: &str,
+    line_range: Option<[u32; 2]>,
+    hosts: &WebHosts,
+) -> Option<String> {
+    let rw = parse_repo_remote_with(remote, hosts)?;
     Some(rw.blob_url(branch.unwrap_or("main"), path, line_range))
 }
 
