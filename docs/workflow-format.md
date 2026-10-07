@@ -763,6 +763,11 @@ Behavior:
 - `for_each:` renders to a list of items
 - if the rendered text starts with `[`, `rupu` parses it as a JSON / YAML array
 - otherwise, `rupu` treats each non-empty line as one item
+- to fan out over a list of objects from another step, render it with
+  `| tojson` — e.g. every finding a query matches:
+  `for_each: "{{ (steps.tagged.output | fromjson).rows | tojson }}"` after an
+  `action: findings.query` step with `all: true` (see
+  [Querying findings](coverage.md#querying-findings))
 
 Per-item template variables:
 

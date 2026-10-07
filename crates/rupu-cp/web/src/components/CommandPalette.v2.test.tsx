@@ -31,6 +31,8 @@ function mockEmptyApi() {
   vi.spyOn(api, 'getProjects').mockResolvedValue([]);
   vi.spyOn(api, 'getCoverage').mockResolvedValue([]);
   vi.spyOn(api, 'getFindings').mockResolvedValue({
+    facets: {},
+    tags_unavailable: [],
     findings: [],
     summary: { total: 0, by_severity: {} } as never,
   });
@@ -132,6 +134,8 @@ describe('CommandPalette v2', () => {
       declared_at: '2026-08-01T00:00:00Z',
     };
     vi.spyOn(api, 'getFindings').mockResolvedValue({
+      facets: {},
+      tags_unavailable: [],
       findings: [finding],
       summary: { total: 1, by_severity: {} } as never,
     });

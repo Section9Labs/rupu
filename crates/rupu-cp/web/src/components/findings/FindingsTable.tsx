@@ -1,6 +1,6 @@
 // Shared findings list rendered as a SortableTable. Used by the global Findings
 // page, the per-project Findings tab, and the coverage-detail Overview. Columns:
-// Severity | Summary | Report | File:Line | CWE | Concern | Agent, plus Project |
+// Severity | Summary | Tags | Report | File:Line | CWE | Concern | Agent, plus Project |
 // Target when `showProvenance` is set (the cross-project / project-scoped
 // variants). Each row expands (via `renderDetail`) to its evidence panel — or,
 // for a full-profile finding, to the triage card summarising its structured report.
@@ -16,14 +16,23 @@ import {
   type FindingOut,
   type FindingRecord,
 } from '../../lib/api';
+import { cn } from '../../lib/cn';
 import { cweFromFinding, cweRef } from '../../lib/cwe';
 import { codeHref } from '../../lib/findingReport';
 import SeverityChip from '../coverage/SeverityChip';
-import SortableTable, { type Column } from '../lists/SortableTable';
+import SortableTable, { type Column, type RowSelection } from '../lists/SortableTable';
 import { AgentName } from '../codename/AgentName';
 import { FindingEvidence } from './FindingEvidence';
 import TriageCard from './TriageCard';
 import { findingCodename } from './findingCodename';
+
+/** Floor for the Summary (subject) column's width. */
+export const SUMMARY_MIN_W = 'min-w-[16rem]';
+/** Long `fit` cells (paths, ids) truncate with an ellipsis instead of forcing
+ *  the column — and the table — wider; the full value rides in `title`. */
+export const LONG_CELL = 'block max-w-[16rem] truncate';
+/** The agent cell: a codename chip plus a label, clipped (title on the chip). */
+export const AGENT_CELL = 'block max-w-[14rem] truncate';
 
 function location(f: FindingRecord): string {
   const parts: string[] = [];
@@ -36,6 +45,7 @@ export function FindingsTable({
   findings,
   showProvenance = false,
   wsId,
+  selection,
 }: {
   findings: FindingRecord[];
   /** Render Project / Target columns. Only set when `findings` are `FindingOut`
@@ -47,6 +57,8 @@ export function FindingsTable({
    *  use their own `ws_id` instead. When resolved alongside `file_path` +
    *  `line_range`, the location cell deep-links into that project's Code tab. */
   wsId?: string;
+  /** Leading checkbox column (bulk tagging). */
+  selection?: RowSelection<FindingRecord>;
 }) {
   const navigate = useNavigate();
 
@@ -65,10 +77,40 @@ export function FindingsTable({
       key: 'summary',
       header: 'Summary',
       subject: true,
+      // The subject column only gets leftover width (`max-w-0`); with several
+      // wide `fit` columns that was ~0px. A floor keeps it readable.
+      width: SUMMARY_MIN_W,
       sortable: true,
       sortValue: (f) => f.summary,
       titleValue: (f) => f.summary,
       render: (f) => <span className="text-ink leading-snug">{f.summary}</span>,
+    },
+    {
+      key: 'tags',
+      header: 'Tags',
+      fit: true,
+      render: (f) => {
+        const tags = f.tags ?? [];
+        if (tags.length === 0) return null;
+        return (
+          <span className="flex items-center gap-1">
+            {tags.slice(0, 2).map((t) => (
+              <span
+                key={t}
+                title={t}
+                className="max-w-[10rem] truncate rounded bg-surface px-1.5 py-0.5 font-mono text-note text-ink ring-1 ring-border"
+              >
+                {t}
+              </span>
+            ))}
+            {tags.length > 2 && (
+              <span title={tags.join(', ')} className="text-note text-ink-mute">
+                +{tags.length - 2}
+              </span>
+            )}
+          </span>
+        );
+      },
     },
     {
       key: 'report',
@@ -110,13 +152,18 @@ export function FindingsTable({
             <button
               type="button"
               onClick={() => navigate(codeHref(rowWsId, f.file_path!, f.line_range![0]))}
-              className="font-mono text-note break-all text-brand-700 hover:underline"
+              title={loc}
+              className={cn(LONG_CELL, 'font-mono text-note text-brand-700 hover:underline')}
             >
               {loc}
             </button>
           );
         }
-        return <span className="font-mono text-note text-ink-mute break-all">{loc}</span>;
+        return (
+          <span title={loc} className={cn(LONG_CELL, 'font-mono text-note text-ink-mute')}>
+            {loc}
+          </span>
+        );
       },
     },
     {
@@ -148,7 +195,9 @@ export function FindingsTable({
       sortValue: (f) => f.concern_id ?? null,
       render: (f) =>
         f.concern_id ? (
-          <span className="font-mono text-note text-ink-mute break-all">{f.concern_id}</span>
+          <span title={f.concern_id} className={cn(LONG_CELL, 'font-mono text-note text-ink-mute')}>
+            {f.concern_id}
+          </span>
         ) : (
           <span className="text-ink-mute">—</span>
         ),
@@ -162,7 +211,7 @@ export function FindingsTable({
       render: (f) => {
         const n = findingCodename(f);
         return n ? (
-          <span className="text-note">
+          <span className={cn(AGENT_CELL, 'text-note')}>
             <AgentName
               codename={n.codename}
               agent={n.agent}
@@ -192,7 +241,10 @@ export function FindingsTable({
         header: 'Target',
         fit: true,
         render: (f) => (
-          <span className="font-mono text-note text-ink-mute break-all">
+          <span
+            title={(f as FindingOut).target_id || undefined}
+            className={cn(LONG_CELL, 'font-mono text-note text-ink-mute')}
+          >
             {(f as FindingOut).target_id || '—'}
           </span>
         ),
@@ -209,6 +261,7 @@ export function FindingsTable({
           ? `${(f as FindingOut).ws_id}/${(f as FindingOut).target_id}/${f.id}`
           : f.id
       }
+      selection={selection}
       renderDetail={(f) =>
         f.profile === 'full' && f.report_summary ? (
           <TriageCard finding={f} />

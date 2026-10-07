@@ -4575,6 +4575,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "rupu-agent",
+ "rupu-config",
  "rupu-coverage",
  "rupu-fleet",
  "rupu-orchestrator",

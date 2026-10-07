@@ -346,6 +346,19 @@ pub enum FactoryError {
     NotWiredInV0(String),
     #[error("provider construction failed: {0}")]
     Other(String),
+    /// [`build_provider_from_credential`] refused to build `provider`: its
+    /// credential is an Anthropic OAuth session, and building that client
+    /// includes an awaited network round trip
+    /// (`AnthropicClient::bootstrap_oauth_session`) that a synchronous
+    /// constructor cannot perform. Never a half-built client — the caller
+    /// detects this variant and uses the async [`build_for_provider_with_config`]
+    /// (or disables the path that needs a sync build).
+    #[error(
+        "provider {provider} authenticates with Anthropic OAuth, whose session \
+         bootstrap is asynchronous: it cannot be built synchronously (build it \
+         through the async provider factory, or use an API key)"
+    )]
+    RequiresAsyncBootstrap { provider: String },
 }
 
 /// Build a provider for `name`. Reads credentials from `resolver`
@@ -400,11 +413,8 @@ pub async fn build_for_provider_with_config(
     config: &ProviderConfig,
     sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
 ) -> Result<(rupu_providers::AuthMode, Box<dyn LlmProvider>), FactoryError> {
-    if let Ok(json) = std::env::var("RUPU_MOCK_PROVIDER_SCRIPT") {
-        return Ok((
-            rupu_providers::AuthMode::ApiKey,
-            build_mock_from_script(&json, model)?,
-        ));
+    if let Some(mock) = mock_provider_from_env(model) {
+        return mock.map(|p| (rupu_providers::AuthMode::ApiKey, p));
     }
     let (mode, creds) =
         resolver
@@ -429,17 +439,118 @@ pub async fn build_for_provider_with_config(
         rupu_providers::auth::AuthCredentials::OAuth { .. } => resolver.oauth_refresher(name, kind),
         rupu_providers::auth::AuthCredentials::ApiKey { .. } => None,
     };
-    let client = match kind {
-        "anthropic" => {
-            build_anthropic(creds, model, config, &tuning, refresher, sink.clone()).await?
+    // Anthropic is the one vendor whose construction awaits: an OAuth session
+    // is bootstrapped (`build_anthropic`). Every other kind is the same
+    // synchronous construction `build_provider_from_credential` uses.
+    let client = if kind == "anthropic" {
+        build_anthropic(creds, model, config, &tuning, refresher, sink.clone()).await?
+    } else {
+        build_client_without_bootstrap(name, kind, creds, model, config, &tuning, refresher, sink)?
+    };
+    Ok((mode, decorate(client, name, kind, &tuning)))
+}
+
+/// Build a provider SYNCHRONOUSLY from an already-resolved credential.
+///
+/// This is [`build_for_provider_with_config`] minus its two awaits: the
+/// caller has already done the credential fetch (`resolver.get`) and hands the
+/// result in as `auth_mode` + `credential` (plus the `refresher` the resolver
+/// gave for it, `CredentialResolver::oauth_refresher`), and the Anthropic OAuth
+/// session bootstrap is NOT performed. It exists for call sites that run inside
+/// a current-thread runtime, where `block_on` / `block_in_place` panic.
+///
+/// - `RUPU_MOCK_PROVIDER_SCRIPT` is honored exactly as in the async builder
+///   (returns the mock, `AuthMode::ApiKey`).
+/// - An Anthropic OAuth credential (an `OAuth` credential, or an API-key
+///   string with the `sk-ant-oat` OAuth prefix — which `AuthMethod::detect`
+///   treats as OAuth) returns [`FactoryError::RequiresAsyncBootstrap`]: the
+///   async builder awaits `bootstrap_oauth_session` for those, and a sync
+///   constructor can neither await it nor skip it silently. Anthropic API keys
+///   and every other vendor build normally.
+/// - `refresher` is only handed to an OAuth credential's client, as in the
+///   async builder.
+pub fn build_provider_from_credential(
+    name: &str,
+    model: &str,
+    auth_mode: rupu_providers::AuthMode,
+    credential: &rupu_providers::auth::AuthCredentials,
+    refresher: Option<OAuthRefresherHandle>,
+    config: &ProviderConfig,
+    sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
+) -> Result<(rupu_providers::AuthMode, Box<dyn LlmProvider>), FactoryError> {
+    if let Some(mock) = mock_provider_from_env(model) {
+        return mock.map(|p| (rupu_providers::AuthMode::ApiKey, p));
+    }
+    let kind = config.kind.as_deref().unwrap_or(name);
+    if kind == "anthropic" && anthropic_auth_is_oauth(credential) {
+        return Err(FactoryError::RequiresAsyncBootstrap {
+            provider: name.to_string(),
+        });
+    }
+    let tuning = config
+        .tuning
+        .clone()
+        .unwrap_or_else(|| rupu_providers::ProviderTuning::for_provider(kind));
+    let refresher = match credential {
+        rupu_providers::auth::AuthCredentials::OAuth { .. } => refresher,
+        rupu_providers::auth::AuthCredentials::ApiKey { .. } => None,
+    };
+    let client = build_client_without_bootstrap(
+        name,
+        kind,
+        credential.clone(),
+        model,
+        config,
+        &tuning,
+        refresher,
+        sink,
+    )?;
+    Ok((auth_mode, decorate(client, name, kind, &tuning)))
+}
+
+/// The `RUPU_MOCK_PROVIDER_SCRIPT` test seam, shared by the async and sync
+/// builders: `Some(result)` when the env var is set (the mock is built for
+/// `model`; both builders pair it with `AuthMode::ApiKey`), `None` otherwise.
+fn mock_provider_from_env(model: &str) -> Option<Result<Box<dyn LlmProvider>, FactoryError>> {
+    let json = std::env::var("RUPU_MOCK_PROVIDER_SCRIPT").ok()?;
+    Some(build_mock_from_script(&json, model))
+}
+
+/// Whether an Anthropic client built from `creds` authenticates with OAuth —
+/// i.e. whether `build_anthropic` would await `bootstrap_oauth_session`. This
+/// follows `AuthCredentials::into_anthropic_auth_method`, NOT just the
+/// credential's variant: an `ApiKey` whose string has the `sk-ant-oat` prefix
+/// is detected as an OAuth token and bootstraps too.
+fn anthropic_auth_is_oauth(creds: &rupu_providers::auth::AuthCredentials) -> bool {
+    match creds {
+        rupu_providers::auth::AuthCredentials::OAuth { .. } => true,
+        rupu_providers::auth::AuthCredentials::ApiKey { key } => {
+            rupu_providers::auth::AuthMethod::detect(key).is_oauth()
         }
-        "openai" | "openai_codex" | "codex" => {
-            build_openai(creds, model, &tuning, refresher, sink.clone()).await?
-        }
-        "gemini" | "google_gemini" => {
-            build_gemini(creds, model, &tuning, refresher, sink.clone()).await?
-        }
-        "copilot" | "github_copilot" => build_copilot(creds, model, &tuning, sink.clone()).await?,
+    }
+}
+
+/// The synchronous part of building the vendor client for `kind`: everything
+/// the async builder does after `resolver.get`, except
+/// `bootstrap_oauth_session` (see [`build_anthropic`], which adds it). The
+/// `"anthropic"` arm is therefore only correct for a caller that has ruled out
+/// (or separately handled) an OAuth session — the sync builder rules it out.
+#[allow(clippy::too_many_arguments)]
+fn build_client_without_bootstrap(
+    name: &str,
+    kind: &str,
+    creds: rupu_providers::auth::AuthCredentials,
+    model: &str,
+    config: &ProviderConfig,
+    tuning: &rupu_providers::ProviderTuning,
+    refresher: Option<OAuthRefresherHandle>,
+    sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
+) -> Result<Box<dyn LlmProvider>, FactoryError> {
+    Ok(match kind {
+        "anthropic" => Box::new(assemble_anthropic(creds, config, tuning, refresher, sink)),
+        "openai" | "openai_codex" | "codex" => build_openai(creds, model, tuning, refresher, sink)?,
+        "gemini" | "google_gemini" => build_gemini(creds, model, tuning, refresher, sink)?,
+        "copilot" | "github_copilot" => build_copilot(creds, model, tuning, sink)?,
         "local" => return Err(FactoryError::NotWiredInV0("local".to_string())),
         _ => {
             if let Some(params) = &config.openai_compatible {
@@ -454,16 +565,15 @@ pub async fn build_for_provider_with_config(
                         &params.default_model,
                         params.models.clone(),
                         params.stream,
-                        sink.clone(),
+                        sink,
                     )
-                    .with_tuning(&tuning),
+                    .with_tuning(tuning),
                 ) as Box<dyn LlmProvider>
             } else {
                 return Err(FactoryError::UnknownProvider(name.to_string()));
             }
         }
-    };
-    Ok((mode, decorate(client, name, kind, &tuning)))
+    })
 }
 
 /// Apply the tuning decorators that make `max_retries` and `max_concurrency`
@@ -591,16 +701,18 @@ fn resolve_anthropic_prompt_cache(
 
 /// The credential store's refresher for an OAuth client (see
 /// `rupu_auth::CredentialResolver::oauth_refresher`).
-type OAuthRefresherHandle = std::sync::Arc<dyn rupu_providers::credential_writes::OAuthRefresher>;
+pub type OAuthRefresherHandle =
+    std::sync::Arc<dyn rupu_providers::credential_writes::OAuthRefresher>;
 
-async fn build_anthropic(
+/// The Anthropic client for `creds`, fully configured but NOT bootstrapped:
+/// the synchronous part of [`build_anthropic`].
+fn assemble_anthropic(
     creds: rupu_providers::auth::AuthCredentials,
-    _model: &str,
     config: &ProviderConfig,
     tuning: &rupu_providers::ProviderTuning,
     refresher: Option<OAuthRefresherHandle>,
     sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
-) -> Result<Box<dyn LlmProvider>, FactoryError> {
+) -> rupu_providers::anthropic::AnthropicClient {
     // Convert the resolved credential into an Anthropic AuthMethod so OAuth
     // tokens travel via `Authorization: Bearer …` and API keys via
     // `x-api-key`. The earlier shape pulled `access` out of the OAuth variant
@@ -633,15 +745,30 @@ async fn build_anthropic(
     if let Some(enabled) = config.anthropic_oauth_system_prefix {
         client = client.with_oauth_system_prefix(enabled);
     }
+    client
+}
+
+async fn build_anthropic(
+    creds: rupu_providers::auth::AuthCredentials,
+    _model: &str,
+    config: &ProviderConfig,
+    tuning: &rupu_providers::ProviderTuning,
+    refresher: Option<OAuthRefresherHandle>,
+    sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
+) -> Result<Box<dyn LlmProvider>, FactoryError> {
+    let client = assemble_anthropic(creds, config, tuning, refresher, sink);
     // Best-effort: register the OAuth session with Anthropic's bootstrap
     // endpoint before the first message lands. Mirrors what the reference
     // Claude Code client does on startup; appears to pre-warm the
-    // OAuth-quota router. No-op on api-key clients.
+    // OAuth-quota router. No-op on api-key clients. This is the one
+    // construction step that awaits, which is why
+    // `build_provider_from_credential` refuses an OAuth Anthropic credential
+    // instead of building it.
     client.bootstrap_oauth_session().await;
     Ok(Box::new(client))
 }
 
-async fn build_openai(
+fn build_openai(
     creds: rupu_providers::auth::AuthCredentials,
     _model: &str,
     tuning: &rupu_providers::ProviderTuning,
@@ -655,7 +782,7 @@ async fn build_openai(
     Ok(Box::new(client))
 }
 
-async fn build_gemini(
+fn build_gemini(
     creds: rupu_providers::auth::AuthCredentials,
     _model: &str,
     tuning: &rupu_providers::ProviderTuning,
@@ -684,7 +811,7 @@ async fn build_gemini(
     Ok(Box::new(client))
 }
 
-async fn build_copilot(
+fn build_copilot(
     creds: rupu_providers::auth::AuthCredentials,
     _model: &str,
     tuning: &rupu_providers::ProviderTuning,
@@ -1742,5 +1869,265 @@ mod named_account_dispatch_tests {
             "gh-work",
             &declared("gh-work", "github")
         ));
+    }
+}
+
+/// `build_provider_from_credential` is the synchronous tail of
+/// `build_for_provider_with_config`: for every credential it accepts it must
+/// hand back exactly what the async builder hands back for the same inputs,
+/// and for the one it cannot build (Anthropic OAuth, whose session bootstrap
+/// awaits) it must say so with `RequiresAsyncBootstrap`. The env-mutating
+/// checks (the mock seam, the bootstrap request itself) live in
+/// `tests/it/sync_provider_build.rs`, which serializes them; this module only
+/// removes the mock var, as its siblings do.
+#[cfg(test)]
+mod sync_build_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use rupu_providers::auth::AuthCredentials;
+    use rupu_providers::AuthMode;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    /// Hands back one fixed credential for any account name.
+    struct FixedResolver {
+        mode: AuthMode,
+        creds: AuthCredentials,
+    }
+
+    #[async_trait]
+    impl rupu_auth::CredentialResolver for FixedResolver {
+        async fn get(
+            &self,
+            _provider: &str,
+            _hint: Option<AuthMode>,
+        ) -> anyhow::Result<(AuthMode, AuthCredentials)> {
+            Ok((self.mode, self.creds.clone()))
+        }
+
+        async fn refresh(
+            &self,
+            _provider: &str,
+            _mode: AuthMode,
+        ) -> anyhow::Result<AuthCredentials> {
+            unreachable!("tests never refresh")
+        }
+    }
+
+    fn api_key(key: &str) -> AuthCredentials {
+        AuthCredentials::ApiKey {
+            key: key.to_string(),
+        }
+    }
+
+    fn oauth(access: &str) -> AuthCredentials {
+        AuthCredentials::OAuth {
+            access: access.to_string(),
+            refresh: "refresh".to_string(),
+            expires: 0,
+            extra: Default::default(),
+        }
+    }
+
+    fn sink() -> Arc<dyn rupu_netflow::FlowSink> {
+        Arc::new(rupu_netflow::NullSink)
+    }
+
+    fn sync_build(
+        name: &str,
+        mode: AuthMode,
+        creds: &AuthCredentials,
+        config: &ProviderConfig,
+    ) -> Result<(AuthMode, Box<dyn LlmProvider>), FactoryError> {
+        build_provider_from_credential(name, "some-model", mode, creds, None, config, sink())
+    }
+
+    fn declared(name: &str, kind: &str) -> BTreeMap<String, rupu_config::ProviderConfig> {
+        let mut m = BTreeMap::new();
+        m.insert(
+            name.to_string(),
+            rupu_config::ProviderConfig {
+                kind: Some(kind.to_string()),
+                ..Default::default()
+            },
+        );
+        m
+    }
+
+    /// Same inputs, both builders: the sync one must report the same
+    /// `AuthMode` and the same provider id as the async one.
+    #[tokio::test]
+    async fn sync_build_matches_the_async_build_for_api_key_credentials() {
+        let _guard = ENV_LOCK.lock().await;
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        let mut oracle = BTreeMap::new();
+        oracle.insert(
+            "oracle".to_string(),
+            rupu_config::ProviderConfig {
+                kind: Some("openai-compatible".into()),
+                base_url: Some("http://127.0.0.1:9".into()),
+                default_model: Some("glm".into()),
+                ..Default::default()
+            },
+        );
+        let cases: Vec<(&str, ProviderConfig, rupu_providers::ProviderId)> = vec![
+            (
+                "anthropic",
+                ProviderConfig::default(),
+                rupu_providers::ProviderId::Anthropic,
+            ),
+            (
+                "openai",
+                ProviderConfig::default(),
+                rupu_providers::ProviderId::OpenaiCodex,
+            ),
+            (
+                "gemini",
+                ProviderConfig::default(),
+                rupu_providers::ProviderId::GoogleGeminiCli,
+            ),
+            (
+                "copilot",
+                ProviderConfig::default(),
+                rupu_providers::ProviderId::GithubCopilot,
+            ),
+            (
+                "anthropic-work",
+                ProviderConfig {
+                    kind: resolve_kind("anthropic-work", &declared("anthropic-work", "anthropic")),
+                    ..Default::default()
+                },
+                rupu_providers::ProviderId::Anthropic,
+            ),
+            (
+                "oracle",
+                ProviderConfig {
+                    kind: resolve_kind("oracle", &oracle),
+                    openai_compatible: openai_compatible_params("oracle", &oracle),
+                    ..Default::default()
+                },
+                rupu_providers::ProviderId::OpenaiCompatible,
+            ),
+        ];
+        for (name, config, want_id) in cases {
+            let resolver = FixedResolver {
+                mode: AuthMode::ApiKey,
+                creds: api_key("sk-ant-test"),
+            };
+            let (async_mode, async_p) = build_for_provider_with_config(
+                name,
+                "some-model",
+                None,
+                &resolver,
+                &config,
+                sink(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{name}: async build failed: {e}"));
+            let (sync_mode, sync_p) = sync_build(name, resolver.mode, &resolver.creds, &config)
+                .unwrap_or_else(|e| panic!("{name}: sync build failed: {e}"));
+            assert_eq!(sync_mode, async_mode, "{name}: AuthMode");
+            assert_eq!(sync_p.provider_id(), async_p.provider_id(), "{name}: id");
+            assert_eq!(sync_p.provider_id(), want_id, "{name}: expected id");
+            assert_eq!(
+                sync_p.default_model(),
+                async_p.default_model(),
+                "{name}: default model"
+            );
+        }
+    }
+
+    /// A non-Anthropic OAuth credential builds synchronously (only Anthropic's
+    /// client bootstraps), and the mode the caller resolved comes back
+    /// untouched.
+    #[test]
+    fn sync_build_returns_the_resolved_auth_mode() {
+        let _guard = ENV_LOCK.blocking_lock();
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        let (mode, p) = sync_build(
+            "openai",
+            AuthMode::Sso,
+            &oauth("tok"),
+            &ProviderConfig::default(),
+        )
+        .unwrap_or_else(|e| panic!("openai oauth must build synchronously: {e}"));
+        assert_eq!(mode, AuthMode::Sso);
+        assert_eq!(p.provider_id(), rupu_providers::ProviderId::OpenaiCodex);
+    }
+
+    /// The one combination the sync builder refuses: Anthropic + OAuth. A
+    /// named account of the anthropic kind refuses too (dispatch is by kind),
+    /// and so does an `ApiKey` string with the OAuth-token prefix, which
+    /// `AuthMethod::detect` treats as OAuth and the async builder bootstraps.
+    #[test]
+    fn anthropic_oauth_requires_async_bootstrap() {
+        let _guard = ENV_LOCK.blocking_lock();
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        let named = ProviderConfig {
+            kind: resolve_kind("anthropic-work", &declared("anthropic-work", "anthropic")),
+            ..Default::default()
+        };
+        let cases = [
+            (
+                "anthropic",
+                oauth("sk-ant-oat01-x"),
+                ProviderConfig::default(),
+            ),
+            ("anthropic-work", oauth("sk-ant-oat01-x"), named),
+            (
+                "anthropic",
+                api_key("sk-ant-oat01-looks-like-oauth"),
+                ProviderConfig::default(),
+            ),
+        ];
+        for (name, creds, config) in cases {
+            let Err(err) = sync_build(name, AuthMode::Sso, &creds, &config) else {
+                panic!("{name}: an Anthropic OAuth credential must not build synchronously");
+            };
+            match err {
+                FactoryError::RequiresAsyncBootstrap { provider } => {
+                    assert_eq!(provider, name);
+                }
+                other => panic!("{name}: expected RequiresAsyncBootstrap, got: {other}"),
+            }
+        }
+        // Names the remedy.
+        let msg = FactoryError::RequiresAsyncBootstrap {
+            provider: "anthropic".into(),
+        }
+        .to_string();
+        assert!(
+            msg.contains("anthropic") && msg.contains("API key"),
+            "{msg}"
+        );
+    }
+
+    /// The refusals the async builder gives for a name it cannot dispatch are
+    /// the sync builder's too.
+    #[test]
+    fn sync_build_keeps_the_async_builders_dispatch_errors() {
+        let _guard = ENV_LOCK.blocking_lock();
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        let creds = api_key("k");
+        let unknown = sync_build(
+            "typo-provider",
+            AuthMode::ApiKey,
+            &creds,
+            &ProviderConfig::default(),
+        );
+        assert!(matches!(
+            unknown,
+            Err(FactoryError::UnknownProvider(ref n)) if n == "typo-provider"
+        ));
+        let local = sync_build(
+            "local",
+            AuthMode::ApiKey,
+            &creds,
+            &ProviderConfig::default(),
+        );
+        assert!(matches!(local, Err(FactoryError::NotWiredInV0(_))));
     }
 }

@@ -1548,6 +1548,8 @@ export interface FindingRecord {
   profile?: 'full' | 'summary';
   report_summary?: ReportSummary | null;
   report?: FindingReport | null;
+  /** The finding's tags (normalized, sorted); absent on rows from an older server. */
+  tags?: string[];
 }
 
 /** Severity rollup for a set of findings — matches the `GET /api/findings`
@@ -1578,13 +1580,33 @@ export interface FindingOut extends FindingRecord {
 /** Finding detail with evidence status — response from `GET /api/findings/:id`. */
 export interface FindingDetail extends FindingOut {
   evidence_status: ClaimState[];
+  /** The finding's tag changes, oldest first. */
+  tag_history: TagEvent[];
+  /** false when the project's tag log couldn't be read: tags are read-only. */
+  tags_editable: boolean;
 }
+
+export type TagActor =
+  | { kind: 'agent'; run_id: string; model: string; surface: string; codename?: string; agent?: string; provider?: string }
+  | { kind: 'operator'; user: string; via: 'cli' | 'cp' };
+export interface TagEvent { id: string; finding_id: string; op: 'add' | 'remove'; tag: string; by: TagActor; at: string }
+export interface TagOutcome { finding_id: string; before: string[]; after: string[] }
+export interface WorkspaceTagResult { ws_id: string; outcomes?: TagOutcome[]; error?: string }
+export interface TagAcrossResult { workspaces: WorkspaceTagResult[]; unknown: string[] }
+export interface TagCount { tag: string; count: number }
 
 /** Response from `GET /api/findings` — the severity-sorted cross-project
  *  findings list plus the severity rollup. */
 export interface FindingsResponse {
   findings: FindingOut[];
   summary: FindingsSummary;
+  /** Values in use per query field (`severity` always lists all five,
+   *  critical first), with counts — what the query bar suggests. */
+  facets: Record<string, { value: string; count: number }[]>;
+  /** Workspaces whose tag log couldn't be read — tag filters may miss their
+   *  findings. `project` is the workspace's project name (as `FindingOut.project`),
+   *  present even when none of its rows is in the answer. */
+  tags_unavailable: { ws_id: string; project: string }[];
 }
 
 /** A finding-report export format — `?format=` on the per-finding endpoint and
@@ -3077,17 +3099,29 @@ export const api = {
     workflow?: string;
     runId?: string;
     customer?: CustomerScope;
+    q?: string;
   }): Promise<FindingsResponse> {
     const q = new URLSearchParams();
     setCustomer(q, opts?.customer);
     if (opts?.wsId) q.set('ws_id', opts.wsId);
     if (opts?.workflow) q.set('workflow', opts.workflow);
     if (opts?.runId) q.set('run_id', opts.runId);
+    if (opts?.q) q.set('q', opts.q);
     const qs = q.toString();
     return request<FindingsResponse>(`/api/findings${qs ? `?${qs}` : ''}`);
   },
   getFinding(id: string): Promise<FindingDetail> {
     return request<FindingDetail>(`/api/findings/${encodeURIComponent(id)}`);
+  },
+  tagFindings(findingIds: string[], change: { add?: string[]; remove?: string[] }): Promise<TagAcrossResult> {
+    return request<TagAcrossResult>('/api/findings/tags', {
+      method: 'POST',
+      body: JSON.stringify({ finding_ids: findingIds, add: change.add ?? [], remove: change.remove ?? [] }),
+    });
+  },
+  getTagsInUse(opts?: { wsId?: string }): Promise<TagCount[]> {
+    const qs = opts?.wsId ? `?ws_id=${encodeURIComponent(opts.wsId)}` : '';
+    return request<TagCount[]>(`/api/findings/tags${qs}`);
   },
   /**
    * Render a project report over the findings `body` selects

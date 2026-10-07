@@ -117,12 +117,12 @@ fn tag_then_filter_by_tag_and_untagged() {
     assert!(ok(&out).contains("fnd_a: (none) → class:sqli, needs-poc"));
 
     let out = rupu(tmp.path())
-        .args(["findings", "list", "--tag", "class:sqli", "--ids-only"])
+        .args(["findings", "list", "--ids-only", "tag:class:sqli"])
         .output()
         .unwrap();
     assert_eq!(ok(&out), "fnd_a\n");
     let out = rupu(tmp.path())
-        .args(["findings", "list", "--untagged", "--ids-only"])
+        .args(["findings", "list", "--ids-only", "-has:tags"])
         .output()
         .unwrap();
     assert_eq!(ok(&out), "fnd_b\n");
@@ -139,7 +139,7 @@ fn ids_can_be_piped_on_stdin() {
         .unwrap();
     ok(&out);
     let out = rupu(tmp.path())
-        .args(["findings", "list", "--tag", "triaged", "--ids-only"])
+        .args(["findings", "list", "--ids-only", "tag:triaged"])
         .output()
         .unwrap();
     assert_eq!(ok(&out), "fnd_a\nfnd_b\n");
@@ -156,7 +156,7 @@ fn an_unknown_id_fails_but_known_ones_are_tagged() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("fnd_nope"));
     let out = rupu(tmp.path())
-        .args(["findings", "list", "--tag", "x", "--ids-only"])
+        .args(["findings", "list", "--ids-only", "tag:x"])
         .output()
         .unwrap();
     assert_eq!(ok(&out), "fnd_a\n");
@@ -271,4 +271,59 @@ fn an_invalid_tag_is_a_usage_error() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("invalid tag"));
+}
+
+#[test]
+fn list_takes_a_query_with_severity_comparison_and_negation() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_one(tmp.path());
+    ok(&rupu(tmp.path())
+        .args(["findings", "tag", "fnd_b", "--add", "noise"])
+        .output()
+        .unwrap());
+    let out = rupu(tmp.path())
+        .args(["findings", "list", "--ids-only", "severity>=low -tag:noise"])
+        .output()
+        .unwrap();
+    assert_eq!(ok(&out), "fnd_a\n");
+    let out = rupu(tmp.path())
+        .args([
+            "findings",
+            "list",
+            "--ids-only",
+            "project:repo",
+            "severity:high",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(ok(&out), "fnd_a\n");
+}
+
+#[test]
+fn a_bad_query_is_a_clear_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_one(tmp.path());
+    let out = rupu(tmp.path())
+        .args(["findings", "list", "sevrity:high"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown key `sevrity`"));
+}
+
+#[test]
+fn a_flag_after_the_query_words_is_refused_not_misparsed() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_one(tmp.path());
+    let out = rupu(tmp.path())
+        .args(["findings", "list", "tag:x", "--ids-only"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("put flags"), "{stderr}");
+    assert!(
+        stderr.contains("`--ids-only` looks like a flag"),
+        "{stderr}"
+    );
 }

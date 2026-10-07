@@ -32,11 +32,17 @@ import Netflow from './Netflow';
 import { MemoryRouter } from 'react-router-dom';
 import { scopedEntry, withCustomerScope } from '../lib/customerScopeTestUtils';
 
+const NOW = new Date('2026-10-06T12:00:00Z');
+const DAY = { from: '2026-10-05T12:00:00.000Z' };
+
 afterEach(() => {
+  vi.useRealTimers();
   cleanup();
 });
 
 beforeEach(() => {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(NOW);
   fetchGlobalNetflow.mockReset();
   fetchNetflowExplorer.mockReset();
   fetchGlobalNetflow.mockResolvedValue(emptyFlowsResponse());
@@ -47,9 +53,9 @@ describe('Netflow global page', () => {
   it('fetches global scope by omitting the scope param entirely', async () => {
     render(<Netflow />);
     await waitFor(() =>
-      expect(fetchNetflowExplorer).toHaveBeenCalledWith(undefined, undefined, undefined),
+      expect(fetchNetflowExplorer).toHaveBeenCalledWith(undefined, DAY, undefined),
     );
-    expect(fetchGlobalNetflow).toHaveBeenCalledWith(undefined, undefined);
+    expect(fetchGlobalNetflow).toHaveBeenCalledWith(DAY, undefined);
   });
 
   it('renders the table once loaded, with Run/Workflow attribution columns at this scope', async () => {

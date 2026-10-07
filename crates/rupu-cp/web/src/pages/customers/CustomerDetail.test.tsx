@@ -144,6 +144,8 @@ beforeEach(() => {
   getFindings = vi.spyOn(api, 'getFindings').mockResolvedValue({
     findings: [],
     summary: { total: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0 },
+    facets: {},
+    tags_unavailable: [],
   });
   getUsage = vi.spyOn(api, 'getUsage').mockResolvedValue(USAGE_RESPONSE);
   getUsageRuns = vi.spyOn(api, 'getUsageRuns').mockResolvedValue([]);

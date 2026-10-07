@@ -80,6 +80,21 @@ pub fn collect_delta(scratch_dir: &Path, baseline: &Baseline) -> Result<Delta, S
     }
 }
 
+/// The directory a delta's paths are relative to when [`apply_deltas`] applies
+/// it to `workspace_path`: the workspace itself in tar mode, the enclosing
+/// repository's working directory in git mode (a git workspace can be a
+/// subdirectory of its repo, and a patch names repo-relative paths).
+pub fn delta_root(workspace_path: &Path, mode: SyncMode) -> Result<PathBuf, SyncError> {
+    match mode {
+        SyncMode::Tar => Ok(workspace_path.to_path_buf()),
+        SyncMode::Git => git2::Repository::discover(workspace_path)
+            .map_err(git_err)?
+            .workdir()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| SyncError::Git("bare repo has no workdir".into())),
+    }
+}
+
 pub fn apply_deltas(workspace_path: &Path, deltas: &[Delta]) -> Result<(), SyncError> {
     if deltas.is_empty() {
         return Ok(());
@@ -159,7 +174,78 @@ pub(crate) fn excluded_from_delta(rel: &str) -> bool {
         .starts_with(DELTA_EXCLUDED_PREFIX)
 }
 
+/// The workspace's finding-tag log (`rupu_coverage::TAG_LOG_FILE` under
+/// `.rupu/coverage/`; `rupu-cli` pins the two in lockstep) and its lock. A
+/// delta must never write either: the log is append-only and workspace-wide,
+/// so a unit's copy written over the coordinator's would erase every tag
+/// change made there while the unit ran, and the lock is held by its inode.
+/// [`Delta::take_tag_log`] hands the log's lines to the caller to merge.
+pub const TAG_LOG_PATH: &str = ".rupu/coverage/finding_tags.jsonl";
+const TAG_LOG_LOCK_PATH: &str = ".rupu/coverage/finding_tags.jsonl.lock";
+
+fn is_tag_log_file(rel: &str) -> bool {
+    let rel = rel.strip_prefix("./").unwrap_or(rel);
+    rel == TAG_LOG_PATH || rel == TAG_LOG_LOCK_PATH
+}
+
 impl Delta {
+    /// This delta without the finding-tag log and its lock (see
+    /// [`TAG_LOG_PATH`]), plus the log lines it carried: the unit's whole copy
+    /// in tar mode, the lines its patch adds in git mode (the log is
+    /// append-only). `None` when the delta does not touch the log. The caller
+    /// merges those lines by event id (`rupu_coverage::merge_tag_log_copies`),
+    /// into the log under [`delta_root`];
+    /// a deletion of the log is dropped, never applied.
+    pub fn take_tag_log(&self) -> Result<(Delta, Option<Vec<u8>>), SyncError> {
+        if !self
+            .changed
+            .iter()
+            .chain(&self.deleted)
+            .any(|p| is_tag_log_file(p))
+        {
+            return Ok((self.clone(), None));
+        }
+        let keep = |paths: &[String]| -> Vec<String> {
+            paths
+                .iter()
+                .filter(|p| !is_tag_log_file(p))
+                .cloned()
+                .collect()
+        };
+        let (bytes, log) = match self.mode {
+            SyncMode::Tar => tar_take_tag_log(&self.bytes)?,
+            SyncMode::Git if self.bytes.is_empty() => (Vec::new(), None),
+            SyncMode::Git => {
+                let diff = git2::Diff::from_buffer(&self.bytes).map_err(git_err)?;
+                let mut added: Vec<u8> = Vec::new();
+                let mut touched = false;
+                diff.print(git2::DiffFormat::Patch, |d, _h, line| {
+                    if delta_rel_path(&d).as_deref() == Some(TAG_LOG_PATH) {
+                        touched = true;
+                        if line.origin() == '+' {
+                            added.extend_from_slice(line.content());
+                        }
+                    }
+                    true
+                })
+                .map_err(git_err)?;
+                (
+                    render_patch(&diff, &is_tag_log_file)?,
+                    touched.then_some(added),
+                )
+            }
+        };
+        Ok((
+            Delta {
+                mode: self.mode,
+                changed: keep(&self.changed),
+                deleted: keep(&self.deleted),
+                bytes,
+            },
+            log,
+        ))
+    }
+
     /// This delta without its `.rupu/coverage/` entries (see
     /// [`excluded_from_delta`]): changes and deletions, in the path lists and
     /// in the payload (tar entries; git file patches, re-printed from the
@@ -180,7 +266,7 @@ impl Delta {
             SyncMode::Git if self.bytes.is_empty() => Vec::new(),
             SyncMode::Git => {
                 let diff = git2::Diff::from_buffer(&self.bytes).map_err(git_err)?;
-                render_patch(&diff, true)?
+                render_patch(&diff, &excluded_from_delta)?
             }
         };
         Ok(Delta {
@@ -190,6 +276,33 @@ impl Delta {
             bytes,
         })
     }
+}
+
+/// Re-pack a tar delta's archive without the tag log and its lock, returning
+/// the log's content when the archive carried it (see [`Delta::take_tag_log`]).
+fn tar_take_tag_log(bytes: &[u8]) -> Result<(Vec<u8>, Option<Vec<u8>>), SyncError> {
+    let mut buf = Vec::new();
+    let mut log = None;
+    {
+        let mut builder = tar::Builder::new(&mut buf);
+        let mut ar = tar::Archive::new(bytes);
+        for entry in ar.entries()? {
+            let mut entry = entry?;
+            let rel = entry.path()?.to_string_lossy().replace('\\', "/");
+            if is_tag_log_file(&rel) {
+                if rel.strip_prefix("./").unwrap_or(&rel) == TAG_LOG_PATH {
+                    let mut content = Vec::new();
+                    std::io::Read::read_to_end(&mut entry, &mut content)?;
+                    log = Some(content);
+                }
+                continue;
+            }
+            let mut header = entry.header().clone();
+            builder.append_data(&mut header, &rel, &mut entry)?;
+        }
+        builder.finish()?;
+    }
+    Ok((buf, log))
 }
 
 /// Re-pack a tar delta's archive without its coverage entries. Each kept
@@ -437,14 +550,15 @@ fn delta_rel_path(d: &git2::DiffDelta<'_>) -> Option<String> {
         .map(|p| p.to_string_lossy().replace('\\', "/"))
 }
 
-/// Render `diff` as a unified patch, leaving out the coverage file deltas
-/// when `drop_coverage` (see [`Delta::without_coverage`]). For +/-/context
-/// lines, libgit2's `line.content()` omits the leading marker, so prepend
-/// `line.origin()`; file/hunk-header lines already carry their full text.
-fn render_patch(diff: &git2::Diff<'_>, drop_coverage: bool) -> Result<Vec<u8>, SyncError> {
+/// Render `diff` as a unified patch, leaving out the file deltas whose path
+/// `drop` matches (see [`Delta::without_coverage`], [`Delta::take_tag_log`]).
+/// For +/-/context lines, libgit2's `line.content()` omits the leading marker,
+/// so prepend `line.origin()`; file/hunk-header lines already carry their full
+/// text.
+fn render_patch(diff: &git2::Diff<'_>, drop: &dyn Fn(&str) -> bool) -> Result<Vec<u8>, SyncError> {
     let mut patch: Vec<u8> = Vec::new();
     diff.print(git2::DiffFormat::Patch, |d, _h, line| {
-        if drop_coverage && delta_rel_path(&d).is_some_and(|p| excluded_from_delta(&p)) {
+        if delta_rel_path(&d).is_some_and(|p| drop(&p)) {
             return true;
         }
         if matches!(line.origin(), '+' | '-' | ' ') {
@@ -498,7 +612,7 @@ fn collect_delta_git(scratch_dir: &Path, baseline: &Baseline) -> Result<Delta, S
             }
         }
     }
-    let patch = render_patch(&diff, false)?;
+    let patch = render_patch(&diff, &|_| false)?;
     changed.sort();
     deleted.sort();
     Ok(Delta {
@@ -793,6 +907,76 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tar_take_tag_log_returns_the_units_copy_and_never_writes_it() {
+        let ws = tempfile::tempdir().unwrap();
+        write(ws.path(), TAG_LOG_PATH, "e1\n");
+        let payload = pack_tar(ws.path()).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let baseline = stage_tar(&payload, scratch.path()).unwrap();
+        write(scratch.path(), TAG_LOG_PATH, "e1\ne2\n");
+        write(scratch.path(), TAG_LOG_LOCK_PATH, "");
+        write(scratch.path(), "b.txt", "b");
+        write(scratch.path(), ".rupu/coverage/t1/findings.jsonl", "{}\n");
+        let delta = collect_delta_tar(scratch.path(), &baseline).unwrap();
+
+        let (rest, log) = delta.take_tag_log().unwrap();
+        assert_eq!(log.as_deref(), Some(&b"e1\ne2\n"[..]));
+        assert_eq!(
+            rest.changed,
+            vec![
+                ".rupu/coverage/t1/findings.jsonl".to_string(),
+                "b.txt".to_string()
+            ]
+        );
+        let mut archived: Vec<String> = tar::Archive::new(rest.bytes.as_slice())
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+        archived.sort();
+        assert_eq!(archived, rest.changed, "the archive matches the list");
+
+        // The coordinator's log gained an event while the unit ran.
+        write(ws.path(), TAG_LOG_PATH, "e1\ne3\n");
+        apply_deltas(ws.path(), &[rest]).unwrap();
+        assert_eq!(
+            fs::read_to_string(ws.path().join(TAG_LOG_PATH)).unwrap(),
+            "e1\ne3\n"
+        );
+        assert!(!ws.path().join(TAG_LOG_LOCK_PATH).exists());
+        assert_eq!(fs::read_to_string(ws.path().join("b.txt")).unwrap(), "b");
+    }
+
+    #[test]
+    fn take_tag_log_drops_a_deletion_and_passes_an_untouched_delta_through() {
+        let ws = tempfile::tempdir().unwrap();
+        write(ws.path(), TAG_LOG_PATH, "e1\n");
+        let payload = pack_tar(ws.path()).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let baseline = stage_tar(&payload, scratch.path()).unwrap();
+        write(scratch.path(), "b.txt", "b");
+        let untouched = collect_delta_tar(scratch.path(), &baseline).unwrap();
+        let (same, log) = untouched.take_tag_log().unwrap();
+        assert_eq!(log, None);
+        assert_eq!(
+            (same.changed, same.bytes),
+            (untouched.changed, untouched.bytes)
+        );
+
+        fs::remove_file(scratch.path().join(TAG_LOG_PATH)).unwrap();
+        let deleting = collect_delta_tar(scratch.path(), &baseline).unwrap();
+        assert_eq!(deleting.deleted, vec![TAG_LOG_PATH.to_string()]);
+        let (rest, log) = deleting.take_tag_log().unwrap();
+        assert_eq!(log, None);
+        assert!(rest.deleted.is_empty());
+        apply_deltas(ws.path(), &[rest]).unwrap();
+        assert_eq!(
+            fs::read_to_string(ws.path().join(TAG_LOG_PATH)).unwrap(),
+            "e1\n"
+        );
+    }
+
     /// The strip removes exactly `.rupu/coverage/` at the workspace root —
     /// changes AND deletions, from the lists and from the archive — and
     /// keeps everything else, including look-alikes.
@@ -1072,6 +1256,97 @@ mod git_sync_tests {
             fs::read_to_string(ws.path().join(".rupu/coverage/t1/findings.jsonl")).unwrap(),
             "{\"x\":1}\n"
         );
+    }
+
+    /// The tag log never travels as a file in git mode either: its added lines
+    /// come out for a merge, and the rest of the patch applies without it.
+    #[test]
+    fn git_take_tag_log_returns_the_added_lines_and_leaves_the_log_alone() {
+        let ws = tempfile::tempdir().unwrap();
+        git_init(ws.path());
+        write(ws.path(), TAG_LOG_PATH, "{\"id\":\"e1\"}\n");
+        let payload = pack(ws.path()).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let baseline = stage(&payload, scratch.path()).unwrap();
+        write(
+            scratch.path(),
+            TAG_LOG_PATH,
+            "{\"id\":\"e1\"}\n{\"id\":\"e2\"}\n",
+        );
+        write(scratch.path(), TAG_LOG_LOCK_PATH, "");
+        write(scratch.path(), "a.txt", "line1\nline2 edited\nline3\n");
+        let delta = collect_delta(scratch.path(), &baseline).unwrap();
+        assert!(delta.changed.contains(&TAG_LOG_PATH.to_string()));
+
+        let (rest, log) = delta.take_tag_log().unwrap();
+        assert_eq!(log.as_deref(), Some(&b"{\"id\":\"e2\"}\n"[..]));
+        assert_eq!(rest.changed, vec!["a.txt".to_string()]);
+        assert!(!String::from_utf8_lossy(&rest.bytes).contains("finding_tags"));
+
+        // The coordinator's log gained an event while the unit ran.
+        write(
+            ws.path(),
+            TAG_LOG_PATH,
+            "{\"id\":\"e1\"}\n{\"id\":\"e3\"}\n",
+        );
+        apply_deltas(ws.path(), &[rest]).unwrap();
+        let read = |rel: &str| fs::read_to_string(ws.path().join(rel)).unwrap();
+        assert_eq!(read("a.txt"), "line1\nline2 edited\nline3\n");
+        assert_eq!(read(TAG_LOG_PATH), "{\"id\":\"e1\"}\n{\"id\":\"e3\"}\n");
+    }
+
+    /// A tag log the unit created from scratch (untracked on the coordinator)
+    /// comes out whole, and the coordinator still gets no file.
+    #[test]
+    fn git_take_tag_log_returns_a_log_the_unit_created() {
+        let ws = tempfile::tempdir().unwrap();
+        git_init(ws.path());
+        let payload = pack(ws.path()).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let baseline = stage(&payload, scratch.path()).unwrap();
+        write(scratch.path(), TAG_LOG_PATH, "{\"id\":\"e1\"}\n");
+        write(scratch.path(), "c.txt", "c\n");
+        let delta = collect_delta(scratch.path(), &baseline).unwrap();
+
+        let (rest, log) = delta.take_tag_log().unwrap();
+        assert_eq!(log.as_deref(), Some(&b"{\"id\":\"e1\"}\n"[..]));
+        assert_eq!(rest.changed, vec!["c.txt".to_string()]);
+        apply_deltas(ws.path(), &[rest]).unwrap();
+        assert!(!ws.path().join(TAG_LOG_PATH).exists());
+        assert_eq!(fs::read_to_string(ws.path().join("c.txt")).unwrap(), "c\n");
+    }
+
+    /// A delta that only touched the lock carries no log, and no lock either.
+    #[test]
+    fn take_tag_log_drops_a_lock_only_change() {
+        let ws = tempfile::tempdir().unwrap();
+        let payload = pack_tar(ws.path()).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let baseline = stage_tar(&payload, scratch.path()).unwrap();
+        write(scratch.path(), TAG_LOG_LOCK_PATH, "");
+        let delta = collect_delta_tar(scratch.path(), &baseline).unwrap();
+        assert_eq!(delta.changed, vec![TAG_LOG_LOCK_PATH.to_string()]);
+        let (rest, log) = delta.take_tag_log().unwrap();
+        assert_eq!(log, None);
+        assert!(rest.changed.is_empty());
+        apply_deltas(ws.path(), &[rest]).unwrap();
+        assert!(!ws.path().join(TAG_LOG_LOCK_PATH).exists());
+    }
+
+    /// A git patch names repo-relative paths, so a workspace inside a repo
+    /// subdirectory has the repo's working directory as its delta root.
+    #[test]
+    fn delta_root_is_the_repo_workdir_in_git_mode() {
+        let repo = tempfile::tempdir().unwrap();
+        git_init(repo.path());
+        let sub = repo.path().join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        let canon = |p: &Path| fs::canonicalize(p).unwrap();
+        assert_eq!(
+            canon(&delta_root(&sub, SyncMode::Git).unwrap()),
+            canon(repo.path())
+        );
+        assert_eq!(delta_root(&sub, SyncMode::Tar).unwrap(), sub);
     }
 
     /// Git-mode strip: the patch is re-printed without the root

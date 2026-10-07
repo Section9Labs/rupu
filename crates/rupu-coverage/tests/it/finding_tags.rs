@@ -1,7 +1,9 @@
 //! `ledger::tags::apply`: the one writer of a workspace's finding-tag log.
 
 use chrono::Utc;
-use rupu_coverage::ledger::tags::{apply, ingest_tag_events, TagChange, TagError, TagOutcome};
+use rupu_coverage::ledger::tags::{
+    apply, ingest_tag_events, merge_tag_log_copies, TagChange, TagError, TagLogMerge, TagOutcome,
+};
 use rupu_coverage::{
     append_record, parse_tags, read_tag_events, read_workspace_findings, Attribution,
     CoveragePaths, FindingEvidence, FindingProfile, FindingRecord, FindingScope, Ledger,
@@ -401,4 +403,48 @@ fn a_finding_already_over_the_cap_can_still_shrink_but_never_grow() {
     assert_eq!(out[0].before.len(), 34);
     assert_eq!(out[0].after.len(), 32);
     assert_eq!(tags_of(ws.path(), "fnd_a").len(), 32);
+}
+
+#[test]
+fn merging_a_units_copy_of_the_log_keeps_events_written_meanwhile() {
+    let ws = tempfile::TempDir::new().unwrap();
+    seed(ws.path());
+    let log = TagLog::for_workspace(ws.path());
+    // Both copies start from the log as it was at dispatch.
+    apply(&log, &change(&["fnd_a"], &["shared"], &[]), &by()).unwrap();
+    let at_dispatch = std::fs::read(&log.path).unwrap();
+
+    // The unit tags on its copy (another workspace) ...
+    let unit_ws = tempfile::TempDir::new().unwrap();
+    seed(unit_ws.path());
+    let unit_log = TagLog::for_workspace(unit_ws.path());
+    std::fs::write(&unit_log.path, &at_dispatch).unwrap();
+    apply(&unit_log, &change(&["fnd_b"], &["from-unit"], &[]), &by()).unwrap();
+    let mut unit_copy = std::fs::read(&unit_log.path).unwrap();
+    unit_copy.extend_from_slice(b"{not an event}\n\n");
+
+    // ... while an operator tags on the coordinator.
+    apply(&log, &change(&["fnd_a"], &["from-operator"], &[]), &by()).unwrap();
+
+    let merged = merge_tag_log_copies(&log, &[&unit_copy]).unwrap();
+    assert_eq!(
+        merged,
+        TagLogMerge {
+            appended: 1,
+            duplicates: 1,
+            unreadable: 1
+        }
+    );
+    assert_eq!(tags_of(ws.path(), "fnd_a"), ["from-operator", "shared"]);
+    assert_eq!(tags_of(ws.path(), "fnd_b"), ["from-unit"]);
+    // Merging the same copy again changes nothing.
+    assert_eq!(
+        merge_tag_log_copies(&log, &[&unit_copy, &unit_copy]).unwrap(),
+        TagLogMerge {
+            appended: 0,
+            duplicates: 4,
+            unreadable: 2
+        },
+        "merging copies again, twice in one pass, adds nothing"
+    );
 }

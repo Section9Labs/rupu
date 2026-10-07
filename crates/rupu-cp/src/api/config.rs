@@ -1497,7 +1497,7 @@ input_per_mtok = 5.0
             .0;
         assert!(view.layer_error.is_some());
         assert_eq!(view.layer_error_kept, Some(KeptLayers::GlobalCustomer));
-        let json = serde_json::to_value(&view.layer_error_kept).unwrap();
+        let json = serde_json::to_value(view.layer_error_kept).unwrap();
         assert_eq!(json, "global_customer");
         assert_eq!(view.effective["default_model"], "acme-model");
         let prov = serde_json::to_value(view.provenance.get("default_model").unwrap()).unwrap();

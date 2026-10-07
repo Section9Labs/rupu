@@ -552,6 +552,53 @@ pub fn ingest_tag_events(log: &TagLog, events: Vec<TagEvent>) -> Result<(usize, 
     })
 }
 
+/// What [`merge_tag_log_copies`] did with the copies' events.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TagLogMerge {
+    /// Events `log` did not hold, now appended.
+    pub appended: usize,
+    /// Events `log` already held, or an earlier copy carried (by id).
+    pub duplicates: usize,
+    /// Lines this rupu version could not read; not merged.
+    pub unreadable: usize,
+}
+
+/// Merge `copies` — the bytes of other copies of a workspace's tag log, such
+/// as the ones remote units' workspace deltas carry — into `log` by event id
+/// ([`ingest_tag_events`]), in one locked pass that reads `log` once. The log
+/// is append-only and every event has a unique id, so this union is exact,
+/// and unlike writing a copy over the file it keeps the events `log` gained
+/// meanwhile.
+pub fn merge_tag_log_copies<C: AsRef<[u8]>>(
+    log: &TagLog,
+    copies: &[C],
+) -> Result<TagLogMerge, TagError> {
+    let mut unreadable = 0usize;
+    let events: Vec<TagEvent> = copies
+        .iter()
+        .flat_map(|c| c.as_ref().split(|b| *b == b'\n'))
+        .filter(|l| !l.iter().all(u8::is_ascii_whitespace))
+        .filter_map(|l| {
+            match std::str::from_utf8(l)
+                .ok()
+                .and_then(|l| serde_json::from_str::<TagEvent>(l).ok())
+            {
+                Some(e) => Some(e),
+                None => {
+                    unreadable += 1;
+                    None
+                }
+            }
+        })
+        .collect();
+    let (appended, duplicates) = ingest_tag_events(log, events)?;
+    Ok(TagLogMerge {
+        appended,
+        duplicates,
+        unreadable,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

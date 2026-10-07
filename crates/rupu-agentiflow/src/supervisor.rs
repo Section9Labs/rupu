@@ -163,6 +163,29 @@ impl FleetSupervisor {
         candidates
     }
 
+    /// The run directories of every unit this supervisor has launched, oldest
+    /// first: `<global>/runs/<unit_id>`. A unit is a standalone `rupu run`
+    /// under `global` (`RUPU_HOME`), so its ledgers (`usage.jsonl`) live there.
+    ///
+    /// The supervisor records each id the moment `dispatch` gets it back from
+    /// the launcher, whichever launcher that is, so the answer covers finished
+    /// units too (their spend still counts) and a dispatch that failed to spawn
+    /// adds nothing. A directory may not exist yet (the unit has not written
+    /// anything); readers treat a missing file as empty.
+    pub fn launched_unit_run_dirs(&self, global: &Path) -> Vec<PathBuf> {
+        let mut ids: Vec<String> = self
+            .lock()
+            .keys()
+            .filter(|id| is_safe_unit_id(id))
+            .cloned()
+            .collect();
+        // Ids are ULIDs, so lexical order is launch order.
+        ids.sort();
+        ids.into_iter()
+            .map(|id| global.join("runs").join(id))
+            .collect()
+    }
+
     fn lock(&self) -> MutexGuard<'_, HashMap<String, UnitRec>> {
         self.units.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -170,11 +193,7 @@ impl FleetSupervisor {
     /// Best-effort mirror of `rec` to `units/<id>/unit.json` (tmp + rename).
     fn write_unit_json(&self, id: &str, rec: &UnitRec) {
         // The id is a path component; only ever write for a plain run id.
-        if id.is_empty()
-            || !id
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-        {
+        if !is_safe_unit_id(id) {
             tracing::warn!(
                 unit = id,
                 "refusing to write unit.json for an unsafe unit id"
@@ -194,6 +213,14 @@ impl FleetSupervisor {
             tracing::warn!(unit = id, error = %e, "could not write unit.json");
         }
     }
+}
+
+/// Whether `id` is a plain run id, safe to use as a single path component.
+fn is_safe_unit_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 fn status_json(status: &UnitStatus) -> serde_json::Value {
@@ -472,6 +499,52 @@ mod tests {
         assert!(sup2.live_ids().is_empty());
         sup2.terminate_all();
         assert!(done.terminated().is_empty());
+    }
+
+    #[test]
+    fn launched_unit_run_dirs_lists_every_dispatched_unit_under_global_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        // Every unit finishes at once; a finished unit's spend is still spend,
+        // so it stays in the list.
+        let launcher = Arc::new(MockUnitLauncher::scripted(vec![UnitStatus::Done(
+            UnitOutcome {
+                output: "x".into(),
+                success: true,
+            },
+        )]));
+        let sup = FleetSupervisor::new(launcher, dir.path().to_path_buf());
+        assert!(sup.launched_unit_run_dirs(global.path()).is_empty());
+
+        let a = sup.dispatch(spec("a#1")).unwrap();
+        assert!(sup.status(&a).is_terminal());
+        let b = sup.dispatch(spec("b#1")).unwrap();
+        assert!(sup.status(&b).is_terminal());
+
+        let mut want = vec![
+            global.path().join("runs").join(&a),
+            global.path().join("runs").join(&b),
+        ];
+        want.sort();
+        assert_eq!(sup.launched_unit_run_dirs(global.path()), want);
+    }
+
+    #[test]
+    fn a_failed_spawn_adds_no_launched_unit_dir() {
+        struct Refusing;
+        impl UnitLauncher for Refusing {
+            fn spawn(&self, _: &UnitSpec, _: &Path) -> Result<UnitId, UnitError> {
+                Err(UnitError::Spawn("no such agent".into()))
+            }
+            fn poll(&self, _: &UnitId, _: &Path) -> UnitStatus {
+                UnitStatus::Pending
+            }
+            fn terminate(&self, _: &UnitId) {}
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let sup = FleetSupervisor::new(Arc::new(Refusing), dir.path().to_path_buf());
+        sup.dispatch(spec("recon#1")).unwrap_err();
+        assert!(sup.launched_unit_run_dirs(dir.path()).is_empty());
     }
 
     #[test]

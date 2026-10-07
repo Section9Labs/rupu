@@ -71,6 +71,8 @@ const DETAIL: ProjectDetailType = {
 };
 
 const FINDINGS: FindingsResponse = {
+  facets: {},
+  tags_unavailable: [],
   findings: [
     {
     codename: 'cobalt-harbor/heron#1', codename_derived: false,
