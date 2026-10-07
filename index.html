@@ -72,19 +72,64 @@
         <p>Compose agents into multi-step workflows — fan-out, parallel panels, review loops, conditional branches, human gates, and direct connector calls.</p>
       </article>
       <article class="card reveal">
+        <div class="ic" aria-hidden="true">&#10035;</div>
+        <h3>Agentiflows</h3>
+        <p>Give a lead agent measurable goals, a budget, and a pool of agents and workflows. It dispatches units, generates new workflows, and coordinates the fleet over a shared board &mdash; until the goals are provably met or the budget says stop.</p>
+      </article>
+      <article class="card reveal">
         <div class="ic" aria-hidden="true">&#8734;</div>
         <h3>Visual editor</h3>
-        <p>Build workflows on a drag-and-drop canvas that stays in lock-step with the YAML — with live validation and expression autocomplete.</p>
+        <p>Build workflows on a drag-and-drop canvas that stays in lock-step with the YAML &mdash; with live validation and expression autocomplete.</p>
       </article>
       <article class="card reveal">
         <div class="ic" aria-hidden="true">&#9635;</div>
         <h3>Control plane</h3>
-        <p>Launch, watch, and approve runs from one place. Live graphs, transcripts, token spend, and findings across every host.</p>
+        <p>Launch, watch, steer, and approve runs from one place. Live graphs, transcripts, per-run token spend, and findings across every host.</p>
       </article>
       <article class="card reveal">
         <div class="ic" aria-hidden="true">&#9738;</div>
         <h3>Netflow</h3>
-        <p>See where your agents reach. Every outbound call rupu makes is captured, ASN-enriched, and drawn as a live egress topology.</p>
+        <p>See where your agents reach. Every outbound call &mdash; including the sockets <code class="inline">bash</code> commands open, observed passively with no proxy or root &mdash; is captured, ASN-enriched, and drawn as a live egress topology.</p>
+      </article>
+    </div>
+  </section>
+
+  <!-- ── Built for real work ───────────────────────────── -->
+  <section class="wrap">
+    <div class="cap-head">
+      <p class="eyebrow reveal">Built for real work</p>
+      <p class="lede reveal">Runs you can <span class="accent">trust, resume, and bill.</span></p>
+    </div>
+    <div class="cards">
+      <article class="card reveal">
+        <div class="ic" aria-hidden="true">&#9888;</div>
+        <h3>Structured findings</h3>
+        <p>Findings carry full reports &mdash; evidence, root cause, proof-of-concept. Tag and filter them with one query language, then export to Markdown, HTML, or PDF.</p>
+      </article>
+      <article class="card reveal">
+        <div class="ic" aria-hidden="true">&#8635;</div>
+        <h3>Recovery</h3>
+        <p>Every provider reply is classified. Failures climb a fallback ladder &mdash; retry, then your <code class="inline">fallbacks:</code> chain &mdash; and a resumed workflow continues interrupted work instead of starting it over.</p>
+      </article>
+      <article class="card reveal">
+        <div class="ic" aria-hidden="true">&#9670;</div>
+        <h3>Customers</h3>
+        <p>Assign projects to customers with their own config layer. Runs record who they were for; filter runs, findings, and usage by customer and price spend per customer.</p>
+      </article>
+      <article class="card reveal">
+        <div class="ic" aria-hidden="true">&#9878;</div>
+        <h3>Multi-account</h3>
+        <p>Named provider and SCM accounts side by side &mdash; several Anthropic keys, a GitHub org and a GitLab group &mdash; with rules that pick the right one per run.</p>
+      </article>
+      <article class="card reveal">
+        <div class="ic" aria-hidden="true">&#9636;</div>
+        <h3>Usage &amp; limits</h3>
+        <p>A live per-run usage ledger counts every token, prompt-cache hits included. Each model&rsquo;s context and output limits are discovered from the provider, not guessed.</p>
+      </article>
+      <article class="card reveal">
+        <div class="ic" aria-hidden="true">&#9783;</div>
+        <h3>Live view &amp; codenames</h3>
+        <p>Workflows run in a live three-pane terminal dashboard &mdash; status, the run&rsquo;s graph, and a focused event feed. Every run, unit, and sub-agent gets a memorable codename like <code class="inline">cobalt-harbor/heron</code>.</p>
       </article>
     </div>
   </section>
@@ -157,11 +202,12 @@
       </div>
       <div class="stack-col reveal">
         <h3>Automation</h3>
-        <p class="blurb">Manual, scheduled, or event-driven — autonomously.</p>
+        <p class="blurb">Manual, scheduled, event-driven, or goal-directed — autonomously.</p>
         <div class="chips">
           <span class="chip">Cron</span>
           <span class="chip">Webhooks</span>
           <span class="chip">Autoflows</span>
+          <span class="chip accent">Agentiflows</span>
         </div>
       </div>
       <div class="stack-col reveal">
@@ -173,6 +219,8 @@
           <span class="chip">Approvals</span>
           <span class="chip accent">Multi-host</span>
           <span class="chip accent">Netflow</span>
+          <span class="chip">Findings</span>
+          <span class="chip">Customers</span>
         </div>
       </div>
       <div class="stack-col reveal">

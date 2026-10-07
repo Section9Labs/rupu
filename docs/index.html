@@ -25,9 +25,11 @@
     <a class="item" href="/docs/workflows.html">Workflows</a>
     <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
     <div class="grp">Platform</div>
     <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item" href="/docs/reliability.html">Recovery &amp; reliability</a>
     <a class="item" href="/docs/integrations.html">Integrations</a>
     <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
     <a class="item" href="/docs/triggers.html">Triggers</a>
@@ -35,6 +37,8 @@
     <a class="item" href="/docs/multi-host.html">Multi-host</a>
     <a class="item" href="/docs/netflow.html">Netflow</a>
     <a class="item" href="/docs/coverage.html">Coverage</a>
+    <a class="item" href="/docs/findings.html">Findings</a>
+    <a class="item" href="/docs/customers.html">Customers</a>
     <div class="grp">More</div>
     <a class="item" href="/docs/examples/">Examples</a>
     <a class="item" href="/#download">Download</a>
@@ -44,7 +48,7 @@
 
   <main class="docs-main">
     <h1>rupu documentation</h1>
-    <p class="intro">rupu is an agentic code-development platform. You describe the work; agents and workflows do it — from the terminal, autonomously on triggers, or from a visual control plane.</p>
+    <p class="intro">rupu is an agentic code-development platform. You describe the work; agents and workflows do it — from the terminal, autonomously on triggers, as a goal-directed fleet, or from a visual control plane.</p>
 
     <div class="callout"><strong>Don't code it, rupu it.</strong> Define agents as plain Markdown, compose them into workflows, run them by hand or on triggers, and review everything with full transcripts and approvals.</div>
 
@@ -181,7 +185,7 @@ rupu auth login
 rupu run code-reviewer --prompt "Review the diff on this branch"</pre>
     <p>Everything rupu does is recorded as a JSONL transcript you can inspect with <code class="inline">rupu transcript</code>.</p>
 
-    <h2>The four building blocks</h2>
+    <h2>The building blocks</h2>
     <p>Read these in order — each builds on the last.</p>
     <div class="doc-grid">
       <a class="card" href="/docs/agents.html">
@@ -199,12 +203,43 @@ rupu run code-reviewer --prompt "Review the diff on this branch"</pre>
         <h3>Autoflows &#8594;</h3>
         <p>Workflows that run themselves — fired by cron or SCM events, claiming issues and opening PRs autonomously.</p>
       </a>
+      <a class="card" href="/docs/agentiflows.html">
+        <div class="ic" aria-hidden="true">&#10035;</div>
+        <h3>Agentiflows &#8594;</h3>
+        <p>Goal-directed fleets — a lead agent coordinates agent and workflow units over a shared board until measurable goals are met or the budget runs out.</p>
+      </a>
       <a class="card" href="/docs/sessions.html">
         <div class="ic" aria-hidden="true">&#9636;</div>
         <h3>Sessions &#8594;</h3>
         <p>Long-lived, interactive agent conversations — in the terminal or live in the web control plane.</p>
       </a>
     </div>
+
+    <h2>Running it for real</h2>
+    <p>Once agents are doing real work, these are the pieces that make their output reviewable, recoverable and accountable.</p>
+    <div class="doc-grid">
+      <a class="card" href="/docs/findings.html">
+        <div class="ic" aria-hidden="true">&#9888;</div>
+        <h3>Findings &#8594;</h3>
+        <p>Structured finding reports with evidence, tags and a one-line query language, exported to Markdown, HTML or PDF.</p>
+      </a>
+      <a class="card" href="/docs/reliability.html">
+        <div class="ic" aria-hidden="true">&#8635;</div>
+        <h3>Reliability &#8594;</h3>
+        <p>Classified provider outcomes, a fallback ladder across models and providers, and resume that continues interrupted work.</p>
+      </a>
+      <a class="card" href="/docs/customers.html">
+        <div class="ic" aria-hidden="true">&#9670;</div>
+        <h3>Customers &#8594;</h3>
+        <p>Per-customer config layers, run attribution, and runs, findings and usage filtered and priced by customer.</p>
+      </a>
+      <a class="card" href="/docs/providers.html">
+        <div class="ic" aria-hidden="true">&#9878;</div>
+        <h3>Providers &amp; accounts &#8594;</h3>
+        <p>Multiple named provider and SCM accounts, model limits discovered from the provider, and a live per-run usage ledger.</p>
+      </a>
+    </div>
+    <p>Along the way: every run, unit and sub-agent gets a human codename, <code class="inline">rupu workflow run</code> shows a three-pane live view, and <a class="link" href="/docs/netflow.html">Netflow</a> now captures the connections <code class="inline">bash</code> commands open, too.</p>
 
     <h2>Then go further</h2>
     <ul>
@@ -213,8 +248,8 @@ rupu run code-reviewer --prompt "Review the diff on this branch"</pre>
     </ul>
 
     <div class="doc-nav">
-      <span></span>
-      <a href="/docs/quickstart.html">Quickstart &#8594;</a>
+      <a href="/docs/quickstart.html">&#8592; Quickstart</a>
+      <a href="/docs/agents.html">Agents &#8594;</a>
     </div>
   </main>
 </div>

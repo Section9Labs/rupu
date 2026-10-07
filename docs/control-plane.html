@@ -11,7 +11,7 @@
 <body>
 <div class="docs-shell">
 
-  <!-- ════ SHARED SIDEBAR — copy verbatim; set .active on THIS page's item ════ -->
+  <!-- ════ SHARED SIDEBAR (copy verbatim into every docs page; set .active) ════ -->
   <aside class="docs-side">
     <a class="brand" href="/" aria-label="rupu home">
       <span class="mark" aria-hidden="true">&#8734;</span>
@@ -25,9 +25,11 @@
     <a class="item" href="/docs/workflows.html">Workflows</a>
     <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
     <div class="grp">Platform</div>
     <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item" href="/docs/reliability.html">Recovery &amp; reliability</a>
     <a class="item" href="/docs/integrations.html">Integrations</a>
     <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
     <a class="item" href="/docs/triggers.html">Triggers</a>
@@ -35,6 +37,8 @@
     <a class="item" href="/docs/multi-host.html">Multi-host</a>
     <a class="item" href="/docs/netflow.html">Netflow</a>
     <a class="item" href="/docs/coverage.html">Coverage</a>
+    <a class="item" href="/docs/findings.html">Findings</a>
+    <a class="item" href="/docs/customers.html">Customers</a>
     <div class="grp">More</div>
     <a class="item" href="/docs/examples/">Examples</a>
     <a class="item" href="/#download">Download</a>
@@ -127,22 +131,56 @@ $ rupu cp <span class="k">serve</span> <span class="v">--bind</span> <span class
       </li>
       <li>
         <strong>Runs.</strong> A list of every run, and a live run view that
-        paints the workflow as a <strong>left&#8594;right graph</strong> with each
-        step's status updating in place, plus a streaming transcript of the
-        focused step as it works.
+        paints the workflow's real graph — a <code class="inline">split:</code>
+        forks and a <code class="inline">join:</code> merges, rather than everything
+        flattening into one line — with each step's status updating in place, plus
+        a streaming transcript of the focused step, unit or sub-agent as it works.
+        Runs, steps, units and sub-agents carry their
+        <a class="link" href="/docs/workflows.html">codenames</a>, tinted per crew.
       </li>
       <li>
-        <strong>Live Events.</strong> A merged, real-time event timeline across
-        everything on the host (streamed over server-sent events).
+        <strong>Live Events.</strong> A full-screen wall for everything happening
+        across the host: a vitals strip (active runs, runs awaiting you, findings by
+        severity, events per minute, errors), a searchable, newest-first stream that
+        merges the live event firehose with newly filed findings — each card with
+        the run, step and codename it came from — and a roster with one card per
+        project showing what it's doing right now. A source that fails to load
+        reads as idle, never as made-up activity.
       </li>
       <li>
         <strong>Sessions.</strong> Every <a class="link" href="/docs/sessions.html">session</a>,
         with its transcript streaming token-by-token.
       </li>
       <li>
+        <strong>Usage.</strong> Spend over time, pivoted by model, provider, agent,
+        workflow, host or project, with an outlier panel for runs that cost far more
+        than their workflow usually does and a banner that counts unpriced spend
+        instead of hiding it. Usage comes from a per-run ledger written as tokens are
+        spent, so in-flight steps, retried fan-out units, sub-agents and
+        compaction calls all count, and a running run's or session's totals move
+        while you watch.
+      </li>
+      <li>
         <strong>Coverage &amp; Findings.</strong> The
         <a class="link" href="/docs/coverage.html">coverage</a> status of each
-        project and the findings filed against it, read from the coverage ledger.
+        project and the findings filed against it, read from the coverage ledger
+        (see <em>Findings</em> below).
+      </li>
+      <li>
+        <strong>Agentiflows.</strong> A list of
+        <a class="link" href="/docs/agentiflows.html">agentiflow</a> runs and a
+        detail page with <em>Flow</em>, <em>Assets</em>, <em>Findings</em>,
+        <em>Messages</em>, <em>Transcript</em> and <em>Events</em> tabs: the goals and
+        budget, the units the lead dispatched, the asset inventory the fleet built,
+        the run's findings across every sub-run, and the message board the agents
+        talk on. While the run is live, a steering box on the Messages tab sends
+        the lead a message, the same channel as <code class="inline">rupu agentiflow send</code>.
+        A <strong>Security &#8594; Assets</strong> page shows the asset inventory
+        across every project.
+      </li>
+      <li>
+        <strong>Network.</strong> The <a class="link" href="/docs/netflow.html">netflow</a>
+        explorer at run, project and global scope.
       </li>
     </ul>
     <p>
@@ -151,6 +189,55 @@ $ rupu cp <span class="k">serve</span> <span class="v">--bind</span> <span class
       started stream straight from the executor; runs started elsewhere (the CLI,
       a cron trigger, an autoflow) are tailed from their on-disk event log — so
       the same live view works no matter what kicked the run off.
+    </p>
+
+    <h3>Transcripts</h3>
+    <p>
+      The transcript view renders every event a run records, in the order it
+      happened: the seed prompt, each turn's thinking in position (not hoisted to
+      the top), replies, tool calls and their audits, gate pauses and decisions,
+      notices, context compaction, and the outcome and recovery events written
+      when a reply needed recovering. Turns are grouped, each with its own token
+      count. A line the viewer doesn't recognise is shown as raw data with an
+      <em>unparsed</em> badge rather than dropped, so a transcript from a newer rupu
+      never silently loses content.
+    </p>
+
+    <h3>Findings</h3>
+    <p>
+      Each finding has its own page at <code class="inline">/findings/&lt;id&gt;</code>.
+      A finding recorded as a full report opens with a section rail (description,
+      impact, location, root cause, call chain, evidence, proof-of-concept
+      artifacts, replication, remediation, patch, CI/CD and regression commands,
+      references), a ledger of ownership and risk fields, and a completeness meter
+      (<code class="inline">n/11</code>) that names the gaps. Every evidence claim
+      carries a badge saying whether the file still matches what the agent saw
+      (<em>current</em>, <em>changed</em>, <em>missing</em>), and the artifact browser
+      previews text and images and pulls a remote host's artifacts on first view.
+      Reports export to Markdown, HTML or PDF.
+    </p>
+    <p>
+      The findings tables triage in place: expand a row for root cause, attack
+      path, owner and completeness; filter with a one-line query bar
+      (<code class="inline">severity&gt;=high tag:needs-poc -tag:false-positive "sql injection"</code>)
+      that suggests keys and values as you type and flags a bad token inline; and
+      tag findings one at a time from a finding's page or in bulk from a table
+      selection, with every change kept in a per-project tag history. See
+      <a class="link" href="/docs/findings.html">Findings</a> for the report
+      format, the query language and tagging.
+    </p>
+
+    <h3>Many hosts, loaded host by host</h3>
+    <p>
+      With <a class="link" href="/docs/multi-host.html">remote hosts</a>
+      registered, the Activity tables, the Usage headline and the &#8984;K palette's
+      runs and sessions ask each host on its own and merge the answers as they
+      arrive. A fast host paints at once; a slow one fills in when it answers; an
+      unreachable one is marked <em>offline</em> (or <em>unavailable</em> when its
+      rupu is too old to answer) without holding back the rest. A per-host
+      freshness strip shows who has answered. Pages that read history are served
+      from in-process caches that are re-checked against the files on every
+      request, so opening a page doesn't re-read every run ever recorded.
     </p>
 
     <h2>Control</h2>
@@ -164,10 +251,12 @@ $ rupu cp <span class="k">serve</span> <span class="v">--bind</span> <span class
       </li>
       <li>
         <strong>Approve &amp; reject gated steps.</strong> When a run pauses at a
-        gate awaiting approval, approve or reject it in place. Approve marks the
-        run for resume; a background resume worker inside
+        gate awaiting approval, approve or reject it in place — per gate, when a
+        graph workflow has several parked at once. Approve marks the run for
+        resume; a background resume worker inside
         <code class="inline">rupu cp serve</code> claims the marked run and
-        finishes the gate.
+        finishes the gate. A resume requested from the browser never retries a
+        run that finished in the meantime.
       </li>
       <li>
         <strong>Drive sessions.</strong> Send a prompt to a live session and
@@ -257,13 +346,6 @@ $ rupu cp <span class="k">serve</span> <span class="v">--bind</span> <span class
       pulses, a gate awaiting you glows amber, and a failure still reads as a
       failure. Watching a run and editing it look like the same thing.
     </p>
-    <div class="callout">
-      <strong>Opt in while it settles.</strong> The Flow Designer and the matching
-      run-graph visuals ship behind one switch —
-      <code class="inline">[cp]</code>'s
-      <code class="inline">workflow_editor_ui = "next"</code> in your config (the
-      default is <code class="inline">"classic"</code>, today's editor).
-    </div>
     <p>
       Every expression field — a step's <code class="inline">prompt</code>,
       <code class="inline">when</code>, a branch's
@@ -288,7 +370,7 @@ $ rupu cp <span class="k">serve</span> <span class="v">--bind</span> <span class
       <code class="inline">~/.rupu/config.toml</code>, and a <strong>Config</strong>
       tab on each Project detail view writes that project's
       <code class="inline">.rupu/config.toml</code>. Config is layered
-      <strong>global &rarr; project &rarr; env</strong>, and the control plane
+      <strong>global &rarr; customer &rarr; project &rarr; env</strong>, and the control plane
       shows the <strong>effective</strong> value for every key together with its
       <strong>provenance</strong> — which layer won.
     </p>
@@ -323,15 +405,41 @@ max_workspace_bytes = <span class="v">104857600</span></pre>
       <code class="inline">.rupu/</code> (no path traversal), and writes require
       the full <code class="inline">rupu cp serve</code> runtime.
     </p>
+    <p>
+      <strong>Models.</strong> Settings has a <em>Models</em> tab listing every
+      model each configured provider offers, with its input limit, output cap and
+      where each number came from (your
+      <code class="inline">[[providers.X.models]]</code> entry or the provider's
+      own model list, cached for an hour). <em>Refetch</em> pulls a fresh list from
+      one provider or all of them. Runs resolve their limits from the same
+      catalog — an agent's own pins win — so the context gauge and compaction use
+      the numbers you see here.
+    </p>
+
+    <h2>Customers</h2>
+    <p>
+      If you work for several clients, a <strong>customer</strong> scope picker in
+      the header narrows the whole UI to one of them — <em>all</em>,
+      <em>no customer</em>, or a named customer. Runs, sessions, workflows, agents,
+      findings, projects and usage follow it, and the choice is remembered in the
+      browser. A page that can't be filtered says so rather than quietly showing
+      everything. The Customers page manages customers and their project
+      assignments, shows per-customer rollups priced with that customer's own
+      pricing, and edits each customer's config layer. Before a launch, the
+      launcher shows which customer the run will be attributed to and which
+      provider, fallback and SCM accounts it will authenticate as — resolved
+      exactly the way the launch itself resolves them. See
+      <a class="link" href="/docs/customers.html">Customers</a>.
+    </p>
 
     <h2>Multi-host</h2>
     <p>
       One control plane can drive rupu running on <strong>other machines</strong>,
-      not just the one it's on. Register a remote host (any machine running
-      <code class="inline">rupu cp serve</code>) and the central CP federates to it
-      over HTTP — launch runs, agents, and sessions on a chosen host, observe and
-      control them, all from one browser, with a <strong>Fleet &rarr; Hosts</strong>
-      surface and host filtering on run lists. See <a class="link" href="/docs/multi-host.html">Multi-host</a>
+      not just the one it's on. Register a remote host — over HTTP, SSH, a
+      dial-home tunnel, or an object-store bucket — and launch runs, agents, and
+      sessions on a chosen host, observe and control them, all from one browser,
+      with a <strong>Fleet &rarr; Hosts</strong> surface and host filtering on run
+      lists. See <a class="link" href="/docs/multi-host.html">Multi-host</a>
       for setup and the transport roadmap.
     </p>
 

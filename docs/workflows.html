@@ -11,7 +11,7 @@
 <body>
 <div class="docs-shell">
 
-  <!-- ════ SHARED SIDEBAR — copy verbatim; set .active on THIS page's item ════ -->
+  <!-- ════ SHARED SIDEBAR (copy verbatim into every docs page; set .active) ════ -->
   <aside class="docs-side">
     <a class="brand" href="/" aria-label="rupu home">
       <span class="mark" aria-hidden="true">&#8734;</span>
@@ -25,9 +25,11 @@
     <a class="item active" href="/docs/workflows.html">Workflows</a>
     <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
     <div class="grp">Platform</div>
     <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item" href="/docs/reliability.html">Recovery &amp; reliability</a>
     <a class="item" href="/docs/integrations.html">Integrations</a>
     <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
     <a class="item" href="/docs/triggers.html">Triggers</a>
@@ -35,6 +37,8 @@
     <a class="item" href="/docs/multi-host.html">Multi-host</a>
     <a class="item" href="/docs/netflow.html">Netflow</a>
     <a class="item" href="/docs/coverage.html">Coverage</a>
+    <a class="item" href="/docs/findings.html">Findings</a>
+    <a class="item" href="/docs/customers.html">Customers</a>
     <div class="grp">More</div>
     <a class="item" href="/docs/examples/">Examples</a>
     <a class="item" href="/#download">Download</a>
@@ -60,6 +64,7 @@
       <li>fan many specialist agents out over the same subject with <code class="inline">parallel:</code>;</li>
       <li>run structured review panels with an optional fix loop using <code class="inline">panel:</code>;</li>
       <li>route down one of two arms with <code class="inline">branch:</code>;</li>
+      <li>run as a graph instead of a list — fork concurrent tracks with <code class="inline">split:</code>, gather them with <code class="inline">join:</code>, wire edges with <code class="inline">next:</code> / <code class="inline">depends_on:</code>, and repeat a subgraph with bounded <code class="inline">loops:</code>;</li>
       <li>call an SCM, issue-tracker, or CI tool directly — no agent, no tokens — with <code class="inline">action:</code>;</li>
       <li>pause for a human gate with <code class="inline">approval:</code>, and notify or clean up around it;</li>
       <li>start manually, on cron, or from an event trigger.</li>
@@ -182,6 +187,7 @@
         <tr><td><code>continue_on_error</code></td><td>all</td><td>Tolerate failure and keep going; inherits the workflow default.</td></tr>
         <tr><td><code>max_parallel</code></td><td><code>for_each</code>, <code>parallel</code>, <code>panel</code></td><td>Concurrency cap (at least 1).</td></tr>
         <tr><td><code>approval</code></td><td>all</td><td>Human pause before the step dispatches (checked after <code class="inline">when:</code>). On a step with no other shape it becomes a gate node of its own.</td></tr>
+        <tr><td><code>findings_profile</code></td><td>agent steps, <code>action: findings.record</code></td><td><code class="inline">full</code> (a complete structured report, the default) or <code class="inline">summary</code> — the contract this step's <a class="link" href="/docs/coverage.html">findings</a> are recorded under. <code class="inline">defaults.findings_profile</code> sets it for the whole workflow.</td></tr>
       </tbody>
     </table>
     <p>
@@ -388,6 +394,19 @@
       <code class="inline">notify</code> and <code class="inline">on_reject</code> is validated at parse time with
       the same rules as any other action or step.
     </p>
+    <p>
+      <strong>Gate decisions are path-scoped.</strong> In a graph workflow several gates can be parked at once —
+      one per branch of a <code class="inline">split:</code>, say. Each decision applies only to its own gate:
+      approving releases just the path behind that gate, and rejecting prunes only the steps reachable solely
+      through it (running that gate's <code class="inline">on_reject</code> chain) while sibling paths carry on.
+      Name the gate with <code class="inline">--gate &lt;step-id&gt;</code> once more than one is parked; the run
+      stays <code class="inline">awaiting_approval</code> until every gate is resolved. Exactly one runner applies
+      decisions: one recorded while the run is still executing elsewhere is handed to that runner, so an approve
+      from the CLI and one from the control plane can never resume the same run twice.
+    </p>
+    <pre class="code"><span class="c"># two gates parked on parallel paths — decide each one</span>
+rupu workflow approve run_01JC2X… <span class="v">--gate</span> <span class="s">ship_api</span>
+rupu workflow reject  run_01JC2X… <span class="v">--gate</span> <span class="s">ship_web</span> <span class="v">--reason</span> <span class="s">"bundle size regression"</span></pre>
 
     <h3>The <code class="inline">panel:</code> gate loop</h3>
     <p>
@@ -539,6 +558,88 @@ rupu workflow run investigate-then-fix --input prompt=<span class="s">"NPE on em
       <code class="inline">rupu workflow approve &lt;run-id&gt;</code> or reject with
       <code class="inline">rupu workflow reject &lt;run-id&gt; --reason "..."</code>.
     </p>
+    <table>
+      <thead><tr><th>Flag</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><code>--input key=value</code></td><td>A declared input (repeatable).</td></tr>
+        <tr><td><code>--file &lt;path&gt;</code></td><td>Run a workflow straight from a YAML file instead of resolving a name from the catalog — handy for a draft or a generated workflow. The file is not added to the catalog. Takes the place of the name, and can't be combined with a positional run target.</td></tr>
+        <tr><td><code>--mode ask|bypass|readonly</code></td><td>Permission mode for every step. Pass <code class="inline">readonly</code> explicitly to deny <code class="inline">bash</code> and file writes — <code class="inline">ask</code> can't prompt mid-run, so it behaves like <code class="inline">bypass</code>.</td></tr>
+        <tr><td><code>--engagement-profile &lt;id&gt;</code></td><td>The engagement profile(s) every step's findings are validated against — <code class="inline">network</code>, <code class="inline">binary</code>, or a composite such as <code class="inline">pentest</code>. Repeatable or comma-separated; omitted means the default code path. See <a class="link" href="/docs/coverage.html">Coverage</a>.</td></tr>
+        <tr><td><code>--plain</code></td><td>Use the line printer instead of the live view (below).</td></tr>
+        <tr><td><code>--run-id &lt;id&gt;</code></td><td>Pre-assign the run id, so a caller can reference the run before it starts.</td></tr>
+      </tbody>
+    </table>
+    <pre class="code"><span class="c"># run a draft without installing it, against a network engagement</span>
+rupu workflow run <span class="v">--file</span> <span class="s">./drafts/edge-sweep.yaml</span> \
+  <span class="v">--engagement-profile</span> <span class="s">network</span> \
+  <span class="v">--input</span> scope=<span class="s">"10.20.0.0/24"</span> <span class="v">--mode</span> <span class="s">readonly</span></pre>
+
+    <h3>The live view</h3>
+    <p>
+      In a terminal, <code class="inline">rupu workflow run</code> and <code class="inline">rupu workflow resume</code>
+      open a three-pane dashboard that reads as a workflow and keeps the whole run visible at once. A header carries
+      the workflow, its codename, elapsed time and live meters (tokens, cost when the model is priced, findings and
+      coverage when there are any); the body is split into three panes:
+    </p>
+    <ul>
+      <li><strong>Structure</strong> — the workflow as a DAG drawn with rails: forks for <code class="inline">split:</code> and <code class="inline">parallel:</code>, merges for <code class="inline">join:</code>, nested members for loops and panels, one glyph per step kind. A <code class="inline">for_each</code> step shows a density line (done / running / failed / waiting) and its live units. Settled steps fold into summary rows so a large run fits; running and parked steps never fold.</li>
+      <li><strong>Stream</strong> — the transcript of whatever is selected: a step, or after drilling in, one fan-out unit or sub-agent. Tool calls, thinking, replies and findings, as they happen. With nothing selected it follows the active step.</li>
+      <li><strong>Firehose</strong> — every agent in the run merged into one feed, each line tagged with its codename and, for placed work, its host. It is always on screen; an idle run shows <em>waiting for activity…</em> rather than an empty box.</li>
+    </ul>
+    <pre class="code"> nightly-audit · slate-meadow · ◐ 4m12s · ⇡182k ⇣21k $0.94 · ⚑3
+ ─ structure ──────────────┬─ stream · kestrel#12 ───────────────────
+  ● collect ······· ✓ 18s  │ ▸ read_file  src/auth/session.rs
+  ⊞ review · 31/48 ◐       │ ◇ thinking   "the token compare is not…"
+    ✓29 ◐4 ✗2 ○13  ⚑3      │ ⚑ HIGH       timing-unsafe token compare
+  ⏸ merge_gate · gate      ├─ live · 4 active ───────────────────────
+  ○ summarize              │ kestrel#9   ▸ grep  "unwrap()"
+                           │ kestrel#12  ⚑ HIGH  timing-unsafe compare
+ tab pane · ↑↓ move · enter drill · ← back · / filter · Esc pause · q quit</pre>
+    <table>
+      <thead><tr><th>Key</th><th>Action</th></tr></thead>
+      <tbody>
+        <tr><td><code>tab</code> / <code>shift-tab</code></td><td>Move focus between the structure, stream and firehose panes.</td></tr>
+        <tr><td><code>↑↓</code> / <code>j k</code></td><td>Move the selection (structure) or scroll (stream, firehose); <code class="inline">PgUp</code> / <code class="inline">PgDn</code> page.</td></tr>
+        <tr><td><code>enter</code> / <code>→</code></td><td>Drill in — a step to its fan-out units, a unit to its sub-agents.</td></tr>
+        <tr><td><code>←</code> / <code>backspace</code></td><td>Back out a level.</td></tr>
+        <tr><td><code>a</code></td><td>Release a manual selection and follow the run again. On a parked gate, <code class="inline">a</code> approves and <code class="inline">r</code> rejects in place; <code class="inline">v</code> shows the findings behind it.</td></tr>
+        <tr><td><code>/</code></td><td>Filter a fan-out's unit list by status.</td></tr>
+        <tr><td><code>Esc</code></td><td>Pause the run at its next safe boundary (resumable).</td></tr>
+        <tr><td><code>q</code> / <code>Ctrl-C</code></td><td>Leave the view without pausing; the run keeps going.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      In a narrow terminal the panes stack and <code class="inline">tab</code> cycles which one is shown. Pass
+      <code class="inline">--plain</code> (or set <code class="inline">RUPU_LIVE_VIEW=0</code>) for the line printer;
+      output that isn't a terminal always gets it. Either way the run ends with one completion summary built from the
+      run's own records.
+    </p>
+
+    <h3>Codenames</h3>
+    <p>
+      Every run, step, fan-out unit and sub-agent gets a short human codename next to its id. The run is a
+      <em>crew</em> (<code class="inline">slate-meadow</code>); each agent in it is a <em>role</em> named after an
+      animal, numbered when there can be several (<code class="inline">slate-meadow/kestrel#12</code> is the twelfth
+      unit of a fan-out, and <code class="inline">…/kestrel#12&gt;wren#1</code> a sub-agent it dispatched). The same
+      agent keeps the same role word across runs, so a name you recognise tells you which specialist did the work.
+      Names are minted once and stored, and they appear in the live view, <code class="inline">rupu workflow runs</code>,
+      transcripts, findings and the <a class="link" href="/docs/control-plane.html">control plane</a>. The
+      <code class="inline">rupu workflow</code> commands that take a run id also accept its crew name
+      (<code class="inline">rupu workflow show-run slate-meadow</code>); if two recent runs share it, the newest wins
+      and rupu says so.
+    </p>
+
+    <h3>Pause, resume and recover</h3>
+    <p>
+      <code class="inline">rupu workflow pause &lt;run-id&gt;</code> stops a run at its next safe boundary and
+      <code class="inline">rupu workflow cancel &lt;run-id&gt;</code> stops it outright.
+      <code class="inline">rupu workflow resume &lt;run-id&gt;</code> takes a paused, failed, cancelled or rejected run
+      back and re-runs only what didn't finish — and an agent that was cut off mid-flight (killed, crashed, out of
+      memory) is <strong>continued from its transcript</strong> rather than started over. If its answer had in fact
+      finished, that answer is reused with no model call. Pass <code class="inline">--restart-interrupted</code> to
+      start interrupted steps over from their prompts instead. See
+      <a class="link" href="/docs/reliability.html">Reliability</a> for the full recovery model.
+    </p>
     <div class="callout">
       <strong>Build it visually.</strong> Workflows can also be authored in the rupu control plane, where a
       drag-and-drop graph and the underlying YAML stay in sync — edit either side and the other follows.
@@ -547,7 +648,7 @@ rupu workflow run investigate-then-fix --input prompt=<span class="s">"NPE on em
     <!-- prev / next footer nav -->
     <div class="doc-nav">
       <a href="/docs/agents.html">&#8592; Agents</a>
-      <a href="/docs/autoflows.html">Autoflows &#8594;</a>
+      <a href="/docs/workflow-reference.html">Authoring reference &#8594;</a>
     </div>
   </main>
 </div>
