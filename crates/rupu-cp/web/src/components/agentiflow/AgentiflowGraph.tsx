@@ -5,12 +5,20 @@
 // next one. It is the live-events timeline and the run graph fused into one, and
 // it grows — taller per round, wider per branch — as the run unfolds.
 //
-// Pure over `GET /api/agentiflows/:id` (events + units + lead_transcripts): the
-// geometry is computed once per render, so a `running` run's poll just redraws a
-// taller spine. Colors come from the real codename palette — the spine is tinted
-// by the run's own crew (the lead), each branch by its unit's crew.
+// Recursion: a dispatched WORKFLOW unit is itself a full workflow run, so it is
+// not a leaf. Expanding it unfolds its own flow DOWNWARD — the workflow's steps,
+// indented one level off the unit, hanging from a crew-tinted sub-spine — so the
+// path keeps flowing into the workflow instead of dead-ending at a single line.
+// Sub-flows start collapsed and lazy-load `GET /api/runs/:id/graph` on expand,
+// so a 160-unit engagement never drags in 160 sub-graphs it isn't showing.
+//
+// Pure over `GET /api/agentiflows/:id` (events + units + lead_transcripts) plus
+// the per-unit sub-graph cache: the geometry is computed once per render, so a
+// `running` run's poll just redraws a taller spine. Colors come from the real
+// codename palette — the spine is tinted by the run's own crew (the lead), each
+// branch and each nested sub-spine by its unit's crew.
 
-import { useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { ChevronRight, ChevronDown } from 'lucide-react';
 import { AgentName } from '../codename/AgentName';
@@ -21,7 +29,8 @@ import { parseCodename, crewTint } from '../../lib/codename';
 import { unitPillStatus, budgetStateTone, stopReasonTone, STOP_TONE_TEXT, formatSpendUsd, formatSpendTokens, STOP_TONE_BADGE } from '../../lib/agentiflow';
 import { cn } from '../../lib/cn';
 import { relativeTime, absoluteTime } from '../../lib/time';
-import type { AgentiflowDetail, AgentiflowUnit, AgentiflowEvent } from '../../lib/api';
+import { api } from '../../lib/api';
+import type { AgentiflowDetail, AgentiflowUnit, AgentiflowEvent, RunGraphResponse, StepNodeDto } from '../../lib/api';
 
 // Gutter geometry (px). The spine lives at SPINE_X, each round's branch lane at
 // BRANCH_X, and row content starts at CARD_X — everything left of it is drawn in
@@ -33,21 +42,65 @@ const HEADER_H = 50; // a start / round / stop spine row
 const ROW_H = 46; // a unit branch row
 const PULSE_H = 34; // the "running…" tail
 const NODE_R = 6;
+// Nested sub-flow geometry (a workflow unit's own steps, one level deeper).
+const SUB_INDENT = 20; // how far the sub-spine sits in from the unit card's left
+const SUB_ROW_H = 30; // a nested step row
+const SUB_TOP_GAP = 4; // breathing room between the unit card and its sub-flow
 
 type Palette = ReturnType<typeof palette>;
 function palette(mode: 'light' | 'dark') {
   return mode === 'dark'
-    ? { lane: '#3a3a40', mute: '#71717a', err: '#f87171', ok: '#4ade80', brand: '#a78bfa' }
-    : { lane: '#d4d4d8', mute: '#a1a1aa', err: '#dc2626', ok: '#16a34a', brand: '#7c3aed' };
+    ? { lane: '#3a3a40', mute: '#71717a', err: '#f87171', ok: '#4ade80', warn: '#fbbf24', brand: '#a78bfa' }
+    : { lane: '#d4d4d8', mute: '#a1a1aa', err: '#dc2626', ok: '#16a34a', warn: '#d97706', brand: '#7c3aed' };
+}
+
+/** A nested step's live state, folded from the sub-run's step_results. */
+type NestState = 'done' | 'failed' | 'running' | 'awaiting' | 'pending' | 'skipped';
+
+const NEST_VIS: Record<NestState, { glyph: string; label: string; key: keyof Omit<Palette, 'lane'> }> = {
+  done: { glyph: '✓', label: 'done', key: 'ok' },
+  failed: { glyph: '✕', label: 'failed', key: 'err' },
+  running: { glyph: '⟳', label: 'running', key: 'brand' },
+  awaiting: { glyph: '⏸', label: 'awaiting', key: 'warn' },
+  pending: { glyph: '•', label: 'pending', key: 'mute' },
+  skipped: { glyph: '⤼', label: 'skipped', key: 'mute' },
+};
+
+/** One nested step row inside an expanded workflow unit. */
+interface SubStepRow {
+  id: string;
+  kind: StepNodeDto['kind'];
+  agent?: string | null;
+  codename?: string;
+  codenameDerived?: boolean;
+  state: NestState;
+}
+
+/** The sub-flow that hangs off an expanded workflow unit. */
+interface SubFlow {
+  state: 'loading' | 'error' | 'loaded';
+  error?: string;
+  tint: string; // the unit's crew tint — the sub-spine's colour
+  steps: SubStepRow[]; // empty for loading / error
+}
+
+/** Cache entry for a workflow unit's fetched run graph. */
+interface SubCache {
+  state: 'loading' | 'error' | 'loaded';
+  graph?: RunGraphResponse;
+  error?: string;
 }
 
 interface UnitNode {
   unit: AgentiflowUnit;
-  cy: number; // branch-row center y
+  cy: number; // branch-row (card) center y
   tint: string; // crew tint (or mute)
   dotFill: string | null; // null = hollow (pending)
   dotRing: string | null; // colored ring (failed)
   pulse: boolean; // running
+  blockTop: number; // top of the unit's block (card + any sub-flow)
+  blockHeight: number; // ROW_H, plus the sub-flow when expanded
+  sub?: SubFlow; // present only for an expanded workflow unit
 }
 
 interface SpineNode {
@@ -79,6 +132,44 @@ function spur(x0: number, y0: number, x1: number, y1: number): string {
   return `M ${x0} ${y0} C ${mx} ${y0}, ${mx} ${y1}, ${x1} ${y1}`;
 }
 
+/** A workflow unit's step state, folded from the sub-run's step_results. */
+function deriveStepState(stepId: string, results: Map<string, { success?: boolean; skipped?: boolean }>): NestState {
+  const r = results.get(stepId);
+  if (!r) return 'pending'; // no terminal record for this step yet
+  if (r.skipped) return 'skipped';
+  if (r.success === true) return 'done';
+  if (r.success === false) return 'failed';
+  return 'running'; // has a record but no verdict → in flight
+}
+
+/** Build the sub-flow descriptor from a cache entry (or a loading/error stub). */
+function toSubFlow(cache: SubCache | undefined, tint: string): SubFlow {
+  if (!cache || cache.state === 'loading') return { state: 'loading', tint, steps: [] };
+  if (cache.state === 'error') return { state: 'error', error: cache.error, tint, steps: [] };
+  const g = cache.graph!;
+  const results = new Map<string, { success?: boolean; skipped?: boolean }>();
+  // A step's own codename rides on its step_result; agent/provider/model (and a
+  // codename for records that predate it) come from the folded step_identities.
+  const cnByStep = new Map<string, { codename: string; derived?: boolean }>();
+  for (const r of g.step_results ?? []) {
+    results.set(r.step_id, { success: r.success, skipped: r.skipped });
+    if (r.codename) cnByStep.set(r.step_id, { codename: r.codename, derived: r.codename_derived });
+  }
+  const steps: SubStepRow[] = (g.workflow?.steps ?? []).map((s) => {
+    const sid = g.step_identities?.[s.id];
+    const cn = cnByStep.get(s.id) ?? (sid?.codename ? { codename: sid.codename, derived: sid.codename_derived } : undefined);
+    return {
+      id: s.id,
+      kind: s.kind,
+      agent: sid?.agent ?? s.agent ?? undefined,
+      codename: cn?.codename,
+      codenameDerived: cn?.derived,
+      state: deriveStepState(s.id, results),
+    };
+  });
+  return { state: 'loaded', tint, steps };
+}
+
 export default function AgentiflowGraph({ detail }: { detail: AgentiflowDetail }) {
   const mode = useThemeMode();
   const pal = palette(mode);
@@ -93,10 +184,35 @@ export default function AgentiflowGraph({ detail }: { detail: AgentiflowDetail }
   const toggleRound = (round: number, currentlyExpanded: boolean) =>
     setExpandedOverride((o) => ({ ...o, [round]: !currentlyExpanded }));
 
+  // Per-workflow-unit recursion. A unit is expanded only after the operator
+  // opens it; opening lazy-fetches its run graph into `subCache` (keyed by the
+  // unit's run id, so it survives the detail poll and is fetched once).
+  const [expandedUnits, setExpandedUnits] = useState<Record<string, boolean>>({});
+  const [subCache, setSubCache] = useState<Record<string, SubCache>>({});
+
+  const loadSub = useCallback((unitId: string) => {
+    setSubCache((c) => (c[unitId]?.state === 'loaded' ? c : { ...c, [unitId]: { state: 'loading' } }));
+    api.getRunGraph(unitId).then(
+      (graph) => setSubCache((c) => ({ ...c, [unitId]: { state: 'loaded', graph } })),
+      (e: unknown) => setSubCache((c) => ({ ...c, [unitId]: { state: 'error', error: e instanceof Error ? e.message : String(e) } })),
+    );
+  }, []);
+
+  const toggleUnit = useCallback(
+    (unitId: string) => {
+      setExpandedUnits((prev) => {
+        const next = !prev[unitId];
+        if (next) loadSub(unitId);
+        return { ...prev, [unitId]: next };
+      });
+    },
+    [loadSub],
+  );
+
   const { nodes, totalH } = useMemo(
-    () => build(detail, mode, pal, expandedOverride),
-    // detail identity + mode + the collapse overrides drive the geometry.
-    [detail, mode, expandedOverride], // eslint-disable-line react-hooks/exhaustive-deps
+    () => build(detail, mode, pal, expandedOverride, expandedUnits, subCache),
+    // detail identity + mode + the collapse/expand state drive the geometry.
+    [detail, mode, expandedOverride, expandedUnits, subCache], // eslint-disable-line react-hooks/exhaustive-deps
   );
 
   const lastY = nodes.length ? nodes[nodes.length - 1].nodeY : 0;
@@ -194,10 +310,18 @@ export default function AgentiflowGraph({ detail }: { detail: AgentiflowDetail }
           n.units.map((u) => (
             <div
               key={`unit-${u.unit.unit_id}`}
-              className="absolute flex items-center"
-              style={{ top: u.cy - ROW_H / 2, left: CARD_X, right: 0, height: ROW_H }}
+              className="absolute"
+              style={{ top: u.blockTop, left: CARD_X, right: 0, height: u.blockHeight }}
             >
-              <UnitCard unit={u.unit} />
+              <div className="flex items-center" style={{ height: ROW_H }}>
+                <UnitCard
+                  unit={u.unit}
+                  expandable={u.unit.kind === 'workflow'}
+                  expanded={!!expandedUnits[u.unit.unit_id]}
+                  onToggle={() => toggleUnit(u.unit.unit_id)}
+                />
+              </div>
+              {u.sub && <SubFlowRows sub={u.sub} pal={pal} />}
             </div>
           )),
         )}
@@ -220,6 +344,8 @@ function build(
   mode: 'light' | 'dark',
   pal: Palette,
   override: Record<number, boolean>,
+  expandedUnits: Record<string, boolean>,
+  subCache: Record<string, SubCache>,
 ): { nodes: SpineNode[]; totalH: number } {
   const { record, events, units, lead_transcripts } = detail;
   const running = record.status === 'running';
@@ -258,16 +384,28 @@ function build(
     -1,
   );
 
-  const toUnitNode = (u: AgentiflowUnit, cy: number): UnitNode => {
+  // How tall a sub-flow is: one row per step (min one, so loading / error /
+  // empty still reserve a line), plus the gap above it.
+  const subHeight = (sub: SubFlow): number => {
+    const rows = sub.state === 'loaded' ? Math.max(sub.steps.length, 1) : 1;
+    return SUB_TOP_GAP + rows * SUB_ROW_H;
+  };
+
+  const toUnitNode = (u: AgentiflowUnit, blockTop: number): UnitNode => {
     const tint = crewTint(parseCodename(u.codename).crew, mode) ?? pal.mute;
     const st = unitPillStatus(u);
+    const expanded = u.kind === 'workflow' && !!expandedUnits[u.unit_id];
+    const sub = expanded ? toSubFlow(subCache[u.unit_id], tint) : undefined;
     return {
       unit: u,
-      cy,
+      cy: blockTop + ROW_H / 2,
       tint,
       dotFill: st === 'failed' ? null : st === 'pending' ? null : tint,
       dotRing: st === 'failed' ? pal.err : null,
       pulse: st === 'running',
+      blockTop,
+      blockHeight: ROW_H + (sub ? subHeight(sub) : 0),
+      sub,
     };
   };
 
@@ -289,8 +427,18 @@ function build(
     // unless the operator expanded one. A round with no units never "collapses".
     const expanded = us.length === 0 ? true : r in override ? override[r] : r === maxRound;
     const top = y;
-    const unitNodes = expanded ? us.map((u, i) => toUnitNode(u, top + HEADER_H + i * ROW_H + ROW_H / 2)) : [];
-    const bodyH = unitNodes.length * ROW_H;
+    // Lay the round's units out one block under another — a block is the unit
+    // card plus, for an expanded workflow unit, its nested sub-flow.
+    let by = top + HEADER_H;
+    const unitNodes: UnitNode[] = [];
+    if (expanded) {
+      for (const u of us) {
+        const node = toUnitNode(u, by);
+        unitNodes.push(node);
+        by += node.blockHeight;
+      }
+    }
+    const bodyH = by - (top + HEADER_H);
     nodes.push({
       kind: 'round',
       key: `round-${r}`,
@@ -444,9 +592,30 @@ function RowHead({
   );
 }
 
-function UnitCard({ unit }: { unit: AgentiflowUnit }) {
+function UnitCard({
+  unit,
+  expandable,
+  expanded,
+  onToggle,
+}: {
+  unit: AgentiflowUnit;
+  expandable: boolean;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
   return (
     <div className="flex min-w-0 flex-1 items-center gap-x-2.5 gap-y-1 rounded-lg border border-border bg-surface/60 px-2.5 py-1.5">
+      {expandable && (
+        <button
+          type="button"
+          onClick={onToggle}
+          className="-ml-1 inline-flex shrink-0 items-center rounded text-ink-mute hover:text-ink"
+          aria-label={expanded ? `Collapse ${unit.codename} flow` : `Expand ${unit.codename} flow`}
+          title={expanded ? 'Collapse flow' : 'Expand flow'}
+        >
+          {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+        </button>
+      )}
       <AgentName codename={unit.codename} agent={unit.agent ?? undefined} derived={unit.codename_derived} showCrew />
       <Badge tone="neutral" ring>
         {unit.kind}
@@ -456,8 +625,8 @@ function UnitCard({ unit }: { unit: AgentiflowUnit }) {
       <span className="ml-auto flex shrink-0 items-center gap-2.5 text-meta text-ink-mute">
         {unit.started_at && <span title={absoluteTime(unit.started_at)}>{relativeTime(unit.started_at)}</span>}
         {unit.kind === 'workflow' ? (
-          // A dispatched workflow IS a full workflow run — drill into its own
-          // DAG (the standard run graph) rather than a single transcript.
+          // A dispatched workflow IS a full workflow run. Expand it inline to
+          // see its flow here, or open the full DAG on its own run page.
           <Link
             to={`/runs/${encodeURIComponent(unit.unit_id)}`}
             className="font-medium text-brand-600 hover:text-brand-700 hover:underline"
@@ -475,6 +644,66 @@ function UnitCard({ unit }: { unit: AgentiflowUnit }) {
             </Link>
           )
         )}
+      </span>
+    </div>
+  );
+}
+
+/** The nested sub-flow: a crew-tinted sub-spine with one row per workflow step,
+ *  indented a level off the unit card. Lives entirely in HTML (the SVG gutter
+ *  only draws the lead spine + round branches) so the main graph is untouched. */
+function SubFlowRows({ sub, pal }: { sub: SubFlow; pal: Palette }) {
+  const rows = sub.state === 'loaded' ? Math.max(sub.steps.length, 1) : 1;
+  const height = rows * SUB_ROW_H;
+  return (
+    <div className="relative" style={{ marginTop: SUB_TOP_GAP, marginLeft: SUB_INDENT, height }}>
+      {/* the sub-spine */}
+      <div className="absolute top-0 bottom-0" style={{ left: 0, width: 2, background: sub.tint, opacity: 0.55 }} />
+      {sub.state === 'loading' && <SubNote pal={pal} text="loading flow…" tint={sub.tint} />}
+      {sub.state === 'error' && <SubNote pal={pal} text="couldn't load this flow" tint={pal.err} tone={pal.err} />}
+      {sub.state === 'loaded' && sub.steps.length === 0 && <SubNote pal={pal} text="no steps recorded" tint={sub.tint} />}
+      {sub.state === 'loaded' &&
+        sub.steps.map((s, i) => <SubStep key={`${s.id}-${i}`} step={s} top={i * SUB_ROW_H} pal={pal} />)}
+    </div>
+  );
+}
+
+function SubNote({ text, tint, tone, pal }: { text: string; tint: string; tone?: string; pal: Palette }) {
+  return (
+    <div className="absolute flex items-center" style={{ top: 0, left: 0, right: 0, height: SUB_ROW_H, paddingLeft: 16 }}>
+      <span className="absolute" style={{ left: -4, top: SUB_ROW_H / 2 - 3.5, width: 7, height: 7, borderRadius: 9999, background: tint, opacity: 0.6 }} />
+      <span className="text-meta" style={{ color: tone ?? pal.mute }}>
+        {text}
+      </span>
+    </div>
+  );
+}
+
+function SubStep({ step, top, pal }: { step: SubStepRow; top: number; pal: Palette }) {
+  const vis = NEST_VIS[step.state];
+  const color = pal[vis.key];
+  return (
+    <div className="absolute flex items-center gap-x-2 gap-y-1" style={{ top, left: 0, right: 0, height: SUB_ROW_H, paddingLeft: 16 }}>
+      {/* node on the sub-spine */}
+      <span
+        className={cn('absolute', step.state === 'running' && 'animate-pulse')}
+        style={{ left: -4, top: SUB_ROW_H / 2 - 3.5, width: 7, height: 7, borderRadius: 9999, background: color }}
+        aria-hidden
+      />
+      <span className="truncate text-note font-medium text-ink">{step.id}</span>
+      {step.kind !== 'step' && (
+        <Badge tone="neutral" ring>
+          {step.kind}
+        </Badge>
+      )}
+      {step.codename ? (
+        <AgentName codename={step.codename} agent={step.agent ?? undefined} derived={step.codenameDerived} />
+      ) : (
+        step.agent && <span className="truncate font-mono text-meta text-ink-mute">{step.agent}</span>
+      )}
+      <span className="ml-auto flex shrink-0 items-center gap-1 text-meta" style={{ color }}>
+        <span aria-hidden>{vis.glyph}</span>
+        {vis.label}
       </span>
     </div>
   );
