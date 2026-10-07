@@ -5,6 +5,15 @@ import { useRef, useState } from 'react';
 import { apiErrorMessage } from '../../../lib/api';
 import { TagInput, type TagSuggestion } from './TagInput';
 
+/** What a change that was saved still has to say. A change that rejects was
+ *  not saved: its error shows and an add keeps its typed text. One that
+ *  resolves was saved (an add's input closes); `error` is a part of it that
+ *  failed, `note` anything else worth saying (e.g. the page couldn't refresh). */
+export interface TagChangeReport {
+  note?: string;
+  error?: string;
+}
+
 export function TagEditor({
   tags,
   suggestions,
@@ -15,24 +24,28 @@ export function TagEditor({
   tags: string[];
   suggestions: TagSuggestion[];
   disabledReason?: string | null;
-  onAdd: (tag: string) => Promise<void>;
-  onRemove: (tag: string) => Promise<void>;
+  onAdd: (tag: string) => Promise<void | TagChangeReport>;
+  onRemove: (tag: string) => Promise<void | TagChangeReport>;
 }) {
   const [adding, setAdding] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
 
   // A ref as well as state: a second submit in the same tick must see the first.
   const inFlight = useRef(false);
 
   /** Runs one change; false when it failed (the error is shown) or another is in flight. */
-  const run = async (f: () => Promise<void>): Promise<boolean> => {
+  const run = async (f: () => Promise<void | TagChangeReport>): Promise<boolean> => {
     if (inFlight.current) return false;
     inFlight.current = true;
     setBusy(true);
     setError(null);
+    setNote(null);
     try {
-      await f();
+      const r = await f();
+      setError(r?.error ?? null);
+      setNote(r?.note ?? null);
       return true;
     } catch (e: unknown) {
       setError(apiErrorMessage(e));
@@ -77,8 +90,9 @@ export function TagEditor({
           onCancel={() => setAdding(false)}
           onSubmit={(t) =>
             run(async () => {
-              await onAdd(t);
+              const r = await onAdd(t);
               setAdding(false);
+              return r;
             })
           }
         />
@@ -96,6 +110,11 @@ export function TagEditor({
       {error && (
         <p role="alert" className="w-full text-note text-err">
           {error}
+        </p>
+      )}
+      {note && (
+        <p role="status" className="w-full text-note text-ink-dim">
+          {note}
         </p>
       )}
     </div>

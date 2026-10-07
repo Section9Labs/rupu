@@ -49,6 +49,27 @@ describe('TagEditor', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('too many tags');
     expect(screen.getByRole('combobox', { name: 'Add tag' })).toHaveValue('triaged');
   });
+  it('closes the input and shows a note when a saved add has one', async () => {
+    const onAdd = vi.fn().mockResolvedValue({ note: "Saved, but the page couldn't refresh: offline" });
+    render(<TagEditor tags={[]} suggestions={[]} onAdd={onAdd} onRemove={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: 'tag' }));
+    const box = screen.getByRole('combobox', { name: 'Add tag' });
+    fireEvent.change(box, { target: { value: 'triaged' } });
+    fireEvent.keyDown(box, { key: 'Enter' });
+    expect(await screen.findByRole('status')).toHaveTextContent("Saved, but the page couldn't refresh: offline");
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.queryByRole('combobox', { name: 'Add tag' })).toBeNull();
+  });
+  it("shows a saved add's partial error and still closes the input", async () => {
+    const onAdd = vi.fn().mockResolvedValue({ error: "other's tags couldn't be changed: locked." });
+    render(<TagEditor tags={[]} suggestions={[]} onAdd={onAdd} onRemove={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: 'tag' }));
+    const box = screen.getByRole('combobox', { name: 'Add tag' });
+    fireEvent.change(box, { target: { value: 'triaged' } });
+    fireEvent.keyDown(box, { key: 'Enter' });
+    expect(await screen.findByRole('alert')).toHaveTextContent("other's tags couldn't be changed: locked.");
+    expect(screen.queryByRole('combobox', { name: 'Add tag' })).toBeNull();
+  });
   it('ignores a repeat submit while onAdd is pending', async () => {
     let resolve!: () => void;
     const onAdd = vi.fn().mockImplementation(() => new Promise<void>((r) => { resolve = r; }));

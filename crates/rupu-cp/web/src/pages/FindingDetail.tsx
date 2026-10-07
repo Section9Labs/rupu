@@ -22,10 +22,10 @@ import CrossReferences from '../components/findings/report/CrossReferences';
 import { Button } from '../components/ui/Button';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
 import { Spinner } from '../components/ui/Spinner';
-import { TagEditor } from '../components/findings/tags/TagEditor';
+import { TagEditor, type TagChangeReport } from '../components/findings/tags/TagEditor';
 import { TagHistory } from '../components/findings/tags/TagHistory';
 import type { TagSuggestion } from '../components/findings/tags/TagInput';
-import { summarizeTagResult } from '../components/findings/tags/tagResult';
+import { changedOutcomes, summarizeTagResult } from '../components/findings/tags/tagResult';
 
 const RAIL: [string, string][] = [
   ['s-desc', 'Description'], ['s-impact', 'Impact'], ['s-loc', 'Location'], ['s-root', 'Root cause'],
@@ -131,9 +131,20 @@ function Provenance({ detail }: { detail: Detail }) {
 }
 
 /** The editable tag row plus the suggestions it needs. Changes go through
- *  `POST /api/findings/tags`; any per-workspace error or unknown id is a
- *  thrown error the editor shows, otherwise the page refetches the finding. */
-function FindingTags({ detail, onChanged }: { detail: Detail; onChanged: () => Promise<void> }) {
+ *  `POST /api/findings/tags`. Only a failed POST, or an answer that changed
+ *  nothing and names an error (a workspace error or an unknown id), is a failed
+ *  change. Once anything changed the write is committed: the page refetches
+ *  the finding, a failed refetch is a note (the chips take the write's own
+ *  `after`), and a partial error still shows. */
+function FindingTags({
+  detail,
+  onChanged,
+  onSaved,
+}: {
+  detail: Detail;
+  onChanged: () => Promise<void>;
+  onSaved: (tags: string[]) => void;
+}) {
   const [suggestions, setSuggestions] = useState<TagSuggestion[]>([]);
   useEffect(() => {
     let live = true;
@@ -143,11 +154,23 @@ function FindingTags({ detail, onChanged }: { detail: Detail; onChanged: () => P
     );
     return () => { live = false; };
   }, [detail.ws_id]);
-  const change = async (mode: 'add' | 'remove', tag: string) => {
+  const change = async (mode: 'add' | 'remove', tag: string): Promise<TagChangeReport> => {
     const r = await api.tagFindings([detail.id], mode === 'add' ? { add: [tag] } : { remove: [tag] });
-    const s = summarizeTagResult(r, mode, () => detail.project || detail.ws_id);
-    if (!s.ok) throw new Error(s.message);
-    await onChanged();
+    const s = summarizeTagResult(r, mode, (ws) => (ws === detail.ws_id && detail.project) || ws);
+    const changed = changedOutcomes(r);
+    if (changed.length === 0) {
+      if (!s.ok) throw new Error(s.message);
+      return {};
+    }
+    const report: TagChangeReport = s.ok ? {} : { error: s.message };
+    try {
+      await onChanged();
+    } catch (e: unknown) {
+      const mine = changed.find((o) => o.finding_id === detail.id);
+      if (mine) onSaved(mine.after);
+      report.note = `Saved, but the page couldn't refresh: ${apiErrorMessage(e)}`;
+    }
+    return report;
   };
   return (
     <TagEditor
@@ -177,8 +200,11 @@ export default function FindingDetail() {
   const { id = '' } = useParams();
   const [detail, setDetail] = useState<Detail | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The finding the route shows now: a refetch answering for an earlier one is dropped.
+  const currentId = useRef(id);
 
   useEffect(() => {
+    currentId.current = id;
     let live = true;
     setDetail(null);
     setError(null);
@@ -189,7 +215,15 @@ export default function FindingDetail() {
     return () => { live = false; };
   }, [id]);
 
-  const refetch = async () => setDetail(await api.getFinding(id));
+  const refetch = async () => {
+    const forId = id;
+    const d = await api.getFinding(forId);
+    if (currentId.current === forId) setDetail(d);
+  };
+  const patchTags = (tags: string[]) => {
+    const forId = id;
+    setDetail((d) => (d && currentId.current === forId ? { ...d, tags } : d));
+  };
 
   if (error) return <div className="p-8"><ErrorBanner>{error}</ErrorBanner></div>;
   if (!detail) return <div className="p-8"><Spinner label="Loading finding" /></div>;
@@ -201,7 +235,7 @@ export default function FindingDetail() {
       <div className="mx-auto max-w-4xl space-y-6 p-8">
         <TopBar id={detail.id} />
         <h1 className="text-2xl font-semibold text-ink">{detail.summary}</h1>
-        <FindingTags detail={detail} onChanged={refetch} />
+        <FindingTags detail={detail} onChanged={refetch} onSaved={patchTags} />
         <p className="text-ui text-ink-mute">
           {detail.profile === 'full'
             ? UNREADABLE_REPORT_NOTE
@@ -237,7 +271,7 @@ export default function FindingDetail() {
       <article className="min-w-0 max-w-4xl space-y-7">
         <TopBar id={detail.id} />
         <ReportHeader finding={detail} report={report} />
-        <FindingTags detail={detail} onChanged={refetch} />
+        <FindingTags detail={detail} onChanged={refetch} onSaved={patchTags} />
         {/* The rail (and its meter) only shows from `lg` up; below that this
             compact line carries the completeness instead. */}
         <p data-testid="completeness-compact" className="text-note text-ink-mute lg:hidden">
