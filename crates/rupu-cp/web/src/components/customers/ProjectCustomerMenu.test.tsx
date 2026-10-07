@@ -46,8 +46,28 @@ function Harness({ initial }: { initial: CustomerRef | null | undefined }) {
   return <ProjectCustomerMenu wsId="ws1" customer={c} onChange={setC} />;
 }
 
-function mount(initial: CustomerRef | null | undefined, customers = [ACME, GLOBEX, INITECH]) {
+/** The project's own config view: `default_provider` from `source`. */
+function projectView(source: 'global' | 'customer' | 'project', value = 'anthropic-personal', locked = false): ConfigView {
+  return {
+    effective: { default_provider: value },
+    provenance: { default_provider: { source, locked, ...(locked ? { locked_by: 'customer' } : {}) } },
+    raw_global: '',
+    raw_project: null,
+  } as unknown as ConfigView;
+}
+
+function mount(
+  initial: CustomerRef | null | undefined,
+  customers = [ACME, GLOBEX, INITECH],
+  project: ConfigView | Error = projectView('global', 'anthropic-main'),
+) {
   vi.spyOn(api, 'getCustomers').mockResolvedValue(customers);
+  if (!vi.isMockFunction(api.getConfig)) {
+    vi.spyOn(api, 'getConfig').mockImplementation(async () => {
+      if (project instanceof Error) throw project;
+      return project;
+    });
+  }
   const utils = render(<MemoryRouter>{withCustomerScope(<Harness initial={initial} />, { customers })}</MemoryRouter>);
   return utils;
 }
@@ -83,15 +103,57 @@ describe('ProjectCustomerMenu', () => {
   it('previews the account switch on focus, with its tag', async () => {
     mount(null);
     await open();
+    await waitFor(() => expect(api.getConfig).toHaveBeenCalledWith('ws1'));
     fireEvent.focus(await screen.findByRole('menuitemradio', { name: /Acme/ }));
+    // A locked key: the project can't override it.
     expect(
-      screen.getByText(/Assigning to Acme switches this project’s runs to anthropic-acme \(locked\)/),
+      screen.getByText(
+        'Assigning to Acme: new runs use anthropic-acme (locked by Acme, so the project can’t override it). An agent that names its own provider still uses it. Runs already finished keep their history.',
+      ),
     ).toBeInTheDocument();
-    expect(screen.getByText(/Runs already finished keep their history/)).toBeInTheDocument();
     fireEvent.focus(screen.getByRole('menuitemradio', { name: /Globex/ }));
-    expect(screen.getByText(/anthropic-main \(inherits global\)/)).toBeInTheDocument();
+    // Unlocked, and the project's own config doesn't set default_provider.
+    expect(
+      await screen.findByText(
+        'Assigning to Globex: new runs default to anthropic-main (inherits global). An agent that names its own provider still uses it. Runs already finished keep their history.',
+      ),
+    ).toBeInTheDocument();
     fireEvent.focus(screen.getByRole('menuitemradio', { name: /Initech/ }));
-    expect(screen.getByText(/anthropic-initech \(customer default\)/)).toBeInTheDocument();
+    expect(screen.getByText(/new runs default to anthropic-initech \(customer default\)\./)).toBeInTheDocument();
+  });
+
+  it('says the project keeps its own account when its config sets default_provider and the customer does not lock it', async () => {
+    mount(null, [ACME, GLOBEX, INITECH], projectView('project', 'anthropic-personal'));
+    await open();
+    await waitFor(() => expect(api.getConfig).toHaveBeenCalledWith('ws1'));
+    fireEvent.focus(await screen.findByRole('menuitemradio', { name: /Initech/ }));
+    expect(
+      await screen.findByText(
+        /its default account is anthropic-initech \(customer default\), but this project’s own config sets default_provider = anthropic-personal, so new runs keep that\./,
+      ),
+    ).toBeInTheDocument();
+    // A lock still wins over the project's own value.
+    fireEvent.focus(screen.getByRole('menuitemradio', { name: /Acme/ }));
+    expect(screen.getByText(/new runs use anthropic-acme \(locked by Acme, so the project can’t override it\)/)).toBeInTheDocument();
+  });
+
+  it('hedges when it cannot tell whether the project sets default_provider', async () => {
+    mount(null, [ACME, GLOBEX, INITECH], new Error('boom'));
+    await open();
+    fireEvent.focus(await screen.findByRole('menuitemradio', { name: /Initech/ }));
+    expect(
+      screen.getByText(
+        'Assigning to Initech: new runs default to anthropic-initech (customer default) unless this project’s own config sets default_provider. An agent that names its own provider still uses it. Runs already finished keep their history.',
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it('hedges when a lock above the project could hide its own value', async () => {
+    mount(ref(GLOBEX), [ACME, GLOBEX, INITECH], projectView('customer', 'anthropic-main', true));
+    await open();
+    await waitFor(() => expect(api.getConfig).toHaveBeenCalledWith('ws1'));
+    fireEvent.focus(await screen.findByRole('menuitemradio', { name: /Initech/ }));
+    expect(screen.getByText(/unless this project’s own config sets default_provider/)).toBeInTheDocument();
   });
 
   it('adds SCM routing to the preview only when the customer layer sets scm.rules', async () => {
@@ -107,7 +169,7 @@ describe('ProjectCustomerMenu', () => {
     mount(null);
     await open();
     fireEvent.focus(await screen.findByRole('menuitemradio', { name: /Acme/ }));
-    expect(await screen.findByText(/and routes acme-corp\/\* repos to github-acme/)).toBeInTheDocument();
+    expect(await screen.findByText(/, and its SCM rules route acme-corp\/\* repos to github-acme\./)).toBeInTheDocument();
     expect(spy).toHaveBeenCalledWith('acme');
     fireEvent.focus(screen.getByRole('menuitemradio', { name: /Globex/ }));
     await waitFor(() => expect(spy).toHaveBeenCalledWith('globex'));

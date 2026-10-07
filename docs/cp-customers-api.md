@@ -304,9 +304,13 @@ zero. The banner never shows unscoped.
   customer layer; on a project's Config tab, the global config plus the
   customer's layer when only the project's own layer is broken.
 - **Project header** (`ProjectCustomerMenu`): the project's customer chip and an
-  "Assign to customer" menu (active customers, with the account the project's
-  runs would switch to, and "Unassign"). The Projects table has a customer
-  column.
+  "Assign to customer" menu (active customers with their default account, and
+  "Unassign"). Focusing a customer previews the effect: a key the customer (or
+  global) locks is what new runs use and the project can't override it; an
+  unlocked default applies unless the project's own config sets
+  `default_provider` (read from the project's config view, and said when it
+  does); an agent that names its own provider keeps it either way. The Projects
+  table has a customer column.
 - **Runs**: the workflow-run and agent-run lists carry a customer column, and
   run detail a customer chip (`CustomerChip`); a derived attribution
   (`customer_derived`) and a row that can't say (no `customer` key) are marked

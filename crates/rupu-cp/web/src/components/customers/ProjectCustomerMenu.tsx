@@ -6,8 +6,11 @@
 // ACTIVE customers (dot, name, mono default account), then "Unassign" (when
 // assigned) and "New customer…" (creates, then assigns). Focusing or hovering
 // a customer shows what the assignment would change, built from its
-// `default_account` and — read lazily from `getCustomerConfig`, and only when
-// the customer's own layer sets `scm.rules` — its SCM routing. Picking assigns
+// `default_account`, whether the project's own config sets `default_provider`
+// (read lazily from `getConfig(project)` when the menu opens; the project layer
+// sits above the customer's, so it wins unless the customer locks the key)
+// and — read lazily from `getCustomerConfig`, and only when the customer's own
+// layer sets `scm.rules` — its SCM routing. Picking assigns
 // at once (the PUT replaces any earlier assignment); a refusal (409 archived,
 // 404, …) is shown inline and nothing changes. "Already unassigned" (404) is
 // not a failure: the chip is reconciled. Escape closes and returns focus to
@@ -70,28 +73,56 @@ function customerScmRoutes(view: ConfigView): ScmRoute[] {
 }
 
 function accountTag(a: NonNullable<CustomerRow['default_account']>): string {
-  if (a.locked_by) return 'locked';
   return a.inherited ? 'inherits global' : 'customer default';
 }
 
-/** What assigning the project to `c` changes — a pure function of the row and
- *  (when loaded) its SCM routes. */
-export function assignPreview(c: CustomerRow, routes: ScmRoute[]): string {
+/** Whether the project's own `.rupu/config.toml` sets `default_provider`:
+ *  `{ sets: true, value }`, `{ sets: false }`, or `null` when that can't be
+ *  told (not loaded yet, a layer that doesn't parse, or a lock above the
+ *  project that would hide its value). */
+export type ProjectDefault = { sets: true; value: string } | { sets: false } | null;
+
+export function projectDefaultOf(view: ConfigView): ProjectDefault {
+  if (view.layer_error) return null;
+  const p = view.provenance?.default_provider;
+  if (p?.source === 'project') {
+    const value = view.effective?.default_provider;
+    return typeof value === 'string' && value !== '' ? { sets: true, value } : null;
+  }
+  // A lock masks the project's own value: it may set the key underneath.
+  if (p?.locked) return null;
+  return { sets: false };
+}
+
+/** What assigning the project to `c` changes — a pure function of the row,
+ *  whether the project's own config sets `default_provider` and (when loaded)
+ *  the customer's SCM routes. */
+export function assignPreview(c: CustomerRow, routes: ScmRoute[], project: ProjectDefault = null): string {
   const history = 'Runs already finished keep their history.';
   if (c.layer_error) {
     return `${c.name}’s config layer doesn’t resolve (${c.layer_error}) — runs in this project would fail until it is fixed. ${history}`;
   }
   const a = c.default_account;
-  let text = a
-    ? `Assigning to ${c.name} switches this project’s runs to ${a.account} (${accountTag(a)})`
-    : `Assigning to ${c.name} switches this project’s runs to its config layer`;
+  let text: string;
+  if (!a) {
+    text = `Assigning to ${c.name}: neither its layer nor the global config sets a default account`;
+  } else if (a.locked_by) {
+    const by = a.locked_by === 'global' ? 'the global config' : c.name;
+    text = `Assigning to ${c.name}: new runs use ${a.account} (locked by ${by}, so the project can’t override it)`;
+  } else if (project?.sets) {
+    text = `Assigning to ${c.name}: its default account is ${a.account} (${accountTag(a)}), but this project’s own config sets default_provider = ${project.value}, so new runs keep that`;
+  } else if (project && !project.sets) {
+    text = `Assigning to ${c.name}: new runs default to ${a.account} (${accountTag(a)})`;
+  } else {
+    text = `Assigning to ${c.name}: new runs default to ${a.account} (${accountTag(a)}) unless this project’s own config sets default_provider`;
+  }
   if (routes.length > 0) {
     const list = routes
       .map((r) => `${r.owner.endsWith('*') ? r.owner : `${r.owner}/*`} repos to ${r.account}`)
       .join(', ');
-    text += ` and routes ${list}`;
+    text += `, and its SCM rules route ${list}`;
   }
-  return `${text}. ${history}`;
+  return `${text}. An agent that names its own provider still uses it. ${history}`;
 }
 
 export function ProjectCustomerMenu({ wsId, customer, onChange }: ProjectCustomerMenuProps) {
@@ -106,6 +137,9 @@ export function ProjectCustomerMenu({ wsId, customer, onChange }: ProjectCustome
   const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const requested = useRef(new Set<string>());
+  // The project's own `default_provider` (see `projectDefaultOf`), read when
+  // the menu opens; `null` until then or when it can't be read.
+  const [projectDefault, setProjectDefault] = useState<ProjectDefault>(null);
   const menuId = useId();
   const noteId = useId();
 
@@ -121,6 +155,25 @@ export function ProjectCustomerMenu({ wsId, customer, onChange }: ProjectCustome
     setPreviewSlug(null);
     if (returnFocus) triggerRef.current?.focus();
   }
+
+  // Opening re-reads whether the project's own config sets default_provider
+  // (it may have changed since the last open).
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    setProjectDefault(null);
+    api.getConfig(wsId).then(
+      (view) => {
+        if (!cancelled) setProjectDefault(projectDefaultOf(view));
+      },
+      () => {
+        // Can't tell — the preview hedges.
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [open, wsId]);
 
   // Opening focuses the current customer (else the first item).
   useEffect(() => {
@@ -161,7 +214,9 @@ export function ProjectCustomerMenu({ wsId, customer, onChange }: ProjectCustome
   // The shown preview follows the focused customer and picks up its SCM
   // routes when they arrive.
   const previewRow = customers.find((c) => c.slug === previewSlug);
-  const previewText = previewRow ? assignPreview(previewRow, configs[previewRow.slug] ?? []) : null;
+  const previewText = previewRow
+    ? assignPreview(previewRow, configs[previewRow.slug] ?? [], projectDefault)
+    : null;
 
   function focusCustomer(c: CustomerRow) {
     setPreviewSlug(c.slug);
