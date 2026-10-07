@@ -4,12 +4,14 @@
 // are mounted; spacer rows above and below stand in for the rest, sized
 // from each row's measured height (estimated until measured), so page
 // height, scrollbar and scroll position match a fully rendered table.
-// Scroll is observed on the document in the capture phase, which catches
+// Row heights are tracked by one ResizeObserver (so spacers follow real
+// heights, including after a width-only resize re-wraps rows); rows not yet
+// measured use the average measured height. Scroll is observed on the document in the capture phase, which catches
 // whichever ancestor actually scrolls.
 
-import { useEffect, useRef, useState } from 'react';
+import { useLayoutEffect, useRef, useState } from 'react';
 
-/** Row height assumed before a row has been measured (and in jsdom). */
+/** Row height assumed before any row has been measured (and in jsdom). */
 export const ESTIMATED_ROW_PX = 41;
 /** Rows mounted beyond the viewport on each side. */
 export const OVERSCAN_ROWS = 20;
@@ -17,9 +19,17 @@ export const OVERSCAN_ROWS = 20;
 export function useWindowVirtualRows(keys: string[], enabled: boolean) {
   const bodyRef = useRef<HTMLTableSectionElement | null>(null);
   const heights = useRef(new Map<string, number>());
+  const elements = useRef(new Map<string, HTMLTableRowElement>());
+  const targetKeys = useRef(new WeakMap<Element, string>());
+  const observer = useRef<ResizeObserver | null>(null);
+  const refCallbacks = useRef(new Map<string, (el: HTMLTableRowElement | null) => void>());
   const [viewport, setViewport] = useState({ top: 0, height: 0 });
+  // Bumped when a measured height actually changed, to re-size the spacers.
+  const [, setMeasureVersion] = useState(0);
 
-  useEffect(() => {
+  // Layout effect: the first above-threshold paint already has the full
+  // visible window (no extra frame showing only overscan rows).
+  useLayoutEffect(() => {
     if (!enabled) return;
     const update = () => {
       const el = bodyRef.current;
@@ -37,17 +47,66 @@ export function useWindowVirtualRows(keys: string[], enabled: boolean) {
     };
   }, [enabled]);
 
-  const measure = (key: string) => (el: HTMLTableRowElement | null) => {
-    if (!el) return;
-    const h = el.getBoundingClientRect().height;
-    if (h > 0) heights.current.set(key, h);
+  // One observer per enabled hook. Row ref callbacks run before this effect
+  // on first mount, so it also adopts every row already registered.
+  useLayoutEffect(() => {
+    if (!enabled || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver((entries) => {
+      let changed = false;
+      for (const entry of entries) {
+        const key = targetKeys.current.get(entry.target);
+        if (key === undefined) continue;
+        const h = entry.borderBoxSize?.[0]?.blockSize ?? entry.target.getBoundingClientRect().height;
+        if (!(h > 0)) continue;
+        const prev = heights.current.get(key);
+        if (prev === undefined || Math.abs(prev - h) > 0.01) {
+          heights.current.set(key, h);
+          changed = true;
+        }
+      }
+      if (changed) setMeasureVersion((v) => v + 1);
+    });
+    observer.current = ro;
+    for (const el of elements.current.values()) ro.observe(el);
+    return () => {
+      ro.disconnect();
+      observer.current = null;
+    };
+  }, [enabled]);
+
+  // Stable per key, so React does not detach/reattach row refs every render.
+  const measure = (key: string) => {
+    let cb = refCallbacks.current.get(key);
+    if (!cb) {
+      cb = (el) => {
+        const prev = elements.current.get(key);
+        if (prev && prev !== el) {
+          observer.current?.unobserve(prev);
+          elements.current.delete(key);
+        }
+        if (!el) return;
+        elements.current.set(key, el);
+        targetKeys.current.set(el, key);
+        if (observer.current) {
+          observer.current.observe(el);
+        } else if (typeof ResizeObserver === 'undefined') {
+          const h = el.getBoundingClientRect().height;
+          if (h > 0) heights.current.set(key, h);
+        }
+      };
+      refCallbacks.current.set(key, cb);
+    }
+    return cb;
   };
 
   if (!enabled) {
     return { bodyRef, start: 0, end: keys.length, topPx: 0, bottomPx: 0, measure };
   }
 
-  const h = (k: string) => heights.current.get(k) ?? ESTIMATED_ROW_PX;
+  let sum = 0;
+  for (const v of heights.current.values()) sum += v;
+  const avg = heights.current.size > 0 ? sum / heights.current.size : ESTIMATED_ROW_PX;
+  const h = (k: string) => heights.current.get(k) ?? avg;
   const visTop = Math.max(0, viewport.top);
   const visBottom = viewport.top + viewport.height;
   let first = 0;

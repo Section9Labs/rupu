@@ -323,4 +323,38 @@ describe('SortableTable virtualization', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Sort by N' }));
     expect(mounted(container)[0].textContent).toContain('r999'); // n = 1, ascending
   });
+  it('re-sizes the spacers from observed row heights, without a scroll event', async () => {
+    const observed = new Set<Element>();
+    let fire: ((entries: unknown[]) => void) | undefined;
+    class FakeResizeObserver {
+      constructor(cb: (entries: unknown[]) => void) {
+        fire = cb;
+      }
+      observe(el: Element) {
+        observed.add(el);
+      }
+      unobserve(el: Element) {
+        observed.delete(el);
+      }
+      disconnect() {
+        observed.clear();
+      }
+    }
+    vi.stubGlobal('ResizeObserver', FakeResizeObserver);
+    try {
+      const { container } = render(
+        <SortableTable columns={columns} rows={rows(1000)} rowKey={(r) => r.id} virtualize={{ threshold: 500 }} />,
+      );
+      expect(observed.size).toBe(mounted(container).length);
+      await act(async () => {
+        fire?.(Array.from(observed).map((target) => ({ target, borderBoxSize: [{ blockSize: 60 }] })));
+      });
+      const n = mounted(container).length;
+      expect(n).toBeLessThan(Math.ceil(window.innerHeight / ESTIMATED_ROW_PX) + OVERSCAN_ROWS);
+      expect(n).toBe(Math.ceil(window.innerHeight / 60) + OVERSCAN_ROWS);
+      expect(spacers(container)[0].style.height).toBe(`${(1000 - n) * 60}px`);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });
