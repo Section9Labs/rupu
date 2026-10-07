@@ -218,34 +218,38 @@ export function NetflowExplorer({ scope, projectId, runId, initialWindow }: Netf
   const filtersActive = !filtersAreEmpty(filters);
   const updating =
     (explorerRefreshing && explorer !== null) || (flowsRefreshing && flows !== null);
+  // Nothing of the aggregates yet: their section is the loading line alone,
+  // exactly as before (a picker here would remount — losing an open custom
+  // edit — when the aggregates arrive).
+  const explorerLoading = explorer === null && !explorerError;
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-end gap-3">
-        {updating && (
-          <p role="status" className="text-note text-ink-mute">
-            Updating…
-          </p>
-        )}
-        {explorer && flows && (
-          <CoveragePopover
-            scope={scope}
-            droppedTotal={explorer.dropped_total}
-            capture={flows.capture}
-          />
-        )}
-      </div>
-      {explorerError || explorer === null ? (
-        // The picker stays reachable before the aggregates arrive and on
-        // their error — changing the window is the retry affordance.
-        <div className="space-y-3">
-          <TimeRangePicker value={range} onChange={changeRange} />
-          {explorerError ? (
-            <p className="text-sm text-err">{explorerError}</p>
-          ) : (
-            <p className="text-sm text-ink-dim">Loading network flows…</p>
+      {(updating || (explorer && flows)) && (
+        <div className="flex items-center justify-end gap-3">
+          {updating && (
+            <p role="status" className="text-note text-ink-mute">
+              Updating…
+            </p>
+          )}
+          {explorer && flows && (
+            <CoveragePopover
+              scope={scope}
+              droppedTotal={explorer.dropped_total}
+              capture={flows.capture}
+            />
           )}
         </div>
+      )}
+      {explorerError ? (
+        // The picker stays reachable on an aggregates error — changing the
+        // window is the retry affordance.
+        <div className="space-y-3">
+          <TimeRangePicker value={range} onChange={changeRange} />
+          <p className="text-sm text-err">{explorerError}</p>
+        </div>
+      ) : explorer === null ? (
+        <p className="text-sm text-ink-dim">Loading network flows…</p>
       ) : (
         <>
           <ActivityStrip
@@ -308,7 +312,8 @@ export function NetflowExplorer({ scope, projectId, runId, initialWindow }: Netf
       {flowsError ? (
         <p className="text-sm text-err">{flowsError}</p>
       ) : flows === null ? (
-        <p className="text-sm text-ink-dim">Loading network flows…</p>
+        // One loading line while neither section has arrived, as before.
+        !explorerLoading && <p className="text-sm text-ink-dim">Loading network flows…</p>
       ) : (
         <NetflowTable
           flows={flows.flows}

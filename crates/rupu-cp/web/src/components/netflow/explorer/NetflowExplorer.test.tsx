@@ -179,8 +179,21 @@ describe('NetflowExplorer', () => {
     render(<NetflowExplorer scope="global" />);
     await screen.findByText('api.anthropic.com');
     expect(screen.queryByText('Workflows')).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: '24h' })).toBeInTheDocument();
     expect(screen.getByText(/loading network flows/i)).toBeInTheDocument();
+    // The aggregates' loading state is only the loading line, as before —
+    // no picker that would remount (losing an open custom edit) when the
+    // aggregates arrive.
+    expect(screen.queryByRole('button', { name: '24h' })).not.toBeInTheDocument();
+  });
+
+  it('before either response arrives, renders only the loading line (no header row)', () => {
+    fetchNetflowExplorer.mockReturnValue(new Promise(() => {}));
+    fetchGlobalNetflow.mockReturnValue(new Promise(() => {}));
+    const { container } = render(<NetflowExplorer scope="global" />);
+    const root = container.firstElementChild as HTMLElement;
+    expect(Array.from(root.children).map((c) => c.outerHTML)).toEqual([
+      '<p class="text-sm text-ink-dim">Loading network flows…</p>',
+    ]);
   });
 
   it('an explorer error leaves the picker and the table usable', async () => {
