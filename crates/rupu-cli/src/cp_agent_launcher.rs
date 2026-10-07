@@ -1,10 +1,10 @@
 //! `cp serve` adapter for rupu-cp's `AgentLauncher`. Spawns a detached
 //! `rupu run <agent> …` child per request (own process group + null stdio).
 use rupu_cp::agent_launcher::{AgentLaunchError, AgentLaunchRequest, AgentLauncher};
-use std::path::PathBuf;
-use std::process::Stdio;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
+use std::process::Stdio;
 
 pub struct SubprocessAgentLauncher {
     pub exe: PathBuf,
@@ -12,7 +12,7 @@ pub struct SubprocessAgentLauncher {
 
 /// Build the argv (after the executable) for a `rupu run` invocation.
 ///
-/// Order: `run <agent> [<target>] --run-id <id> [--mode m] [--findings-profile f] [--prompt <p>] [--tmp]`.
+/// Order: `run <agent> [<target>] --run-id <id> [--mode m] [--findings-profile f] [--engagement-profile e]… [--prompt <p>] [--tmp]`.
 /// The prompt is always passed via `--prompt` (never positionally) so it cannot
 /// be mis-parsed as a RunTarget when no target is present.
 /// `--tmp` is added when a target is present so a repo/PR clone lands in an
@@ -31,6 +31,10 @@ pub(crate) fn build_agent_argv(req: &AgentLaunchRequest, run_id: &str) -> Vec<St
     if let Some(f) = req.findings_profile {
         argv.push("--findings-profile".to_string());
         argv.push(f.as_str().to_string());
+    }
+    for id in &req.engagement_profiles {
+        argv.push("--engagement-profile".to_string());
+        argv.push(id.clone());
     }
     if let Some(p) = &req.prompt {
         argv.push("--prompt".to_string());
@@ -60,7 +64,8 @@ impl AgentLauncher for SubprocessAgentLauncher {
         }
         #[cfg(unix)]
         cmd.process_group(0); // own process group; detaches from cp-serve's
-        cmd.spawn().map_err(|e| AgentLaunchError::Spawn(e.to_string()))?;
+        cmd.spawn()
+            .map_err(|e| AgentLaunchError::Spawn(e.to_string()))?;
         Ok(run_id)
     }
 }
@@ -81,6 +86,7 @@ mod tests {
             working_dir: None,
             run_id: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         };
         let argv = build_agent_argv(&req, "run_X");
         assert_eq!(
@@ -101,6 +107,40 @@ mod tests {
     }
 
     #[test]
+    fn argv_carries_the_engagement_profiles() {
+        let req = AgentLaunchRequest {
+            agent: "recon".into(),
+            prompt: Some("enumerate".into()),
+            mode: None,
+            target: None,
+            working_dir: None,
+            run_id: None,
+            findings_profile: None,
+            engagement_profiles: vec!["network".into(), "web".into()],
+            codename: None,
+        };
+        let argv = build_agent_argv(&req, "run_X");
+        assert_eq!(
+            argv,
+            vec![
+                "run",
+                "recon",
+                "--run-id",
+                "run_X",
+                "--engagement-profile",
+                "network",
+                "--engagement-profile",
+                "web",
+                "--prompt",
+                "enumerate"
+            ]
+        );
+        // The argv must round-trip through the real `rupu run` parser.
+        let args = crate::cmd::run::parse_launch_args(argv[1..].to_vec()).unwrap();
+        assert_eq!(args.engagement_profiles, ["network", "web"]);
+    }
+
+    #[test]
     fn argv_carries_the_findings_profile() {
         let req = AgentLaunchRequest {
             agent: "sec".into(),
@@ -110,6 +150,7 @@ mod tests {
             working_dir: None,
             run_id: None,
             findings_profile: Some(rupu_coverage::FindingProfile::Summary),
+            engagement_profiles: Vec::new(),
             codename: None,
         };
         let argv = build_agent_argv(&req, "run_X");
@@ -145,6 +186,7 @@ mod tests {
             working_dir: None,
             run_id: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         };
         assert_eq!(
             build_agent_argv(&req, "run_X"),
@@ -163,10 +205,18 @@ mod tests {
             working_dir: None,
             run_id: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         };
         assert_eq!(
             build_agent_argv(&req, "run_X"),
-            vec!["run", "triage", "--run-id", "run_X", "--prompt", "do a security audit"]
+            vec![
+                "run",
+                "triage",
+                "--run-id",
+                "run_X",
+                "--prompt",
+                "do a security audit"
+            ]
         );
     }
 }

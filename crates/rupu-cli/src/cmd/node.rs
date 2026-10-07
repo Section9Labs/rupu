@@ -871,10 +871,18 @@ fn spawn_run(exe: &Path, run_id: &str, spec: &RunSpec) -> anyhow::Result<tokio::
 /// Refuse a spec whose fields `build_argv` could not honour, rather than
 /// launch without them. `findings_profile` is an agent-run flag; `rupu
 /// workflow run` resolves profiles per step from the workflow file.
+/// `engagement_profiles` is likewise only ever sent for an agent run (a
+/// placed workflow unit), and a workflow spec has no argv slot for it.
 fn check_spec(spec: &RunSpec) -> anyhow::Result<()> {
     if spec.kind == RunSpecKind::Workflow && spec.findings_profile.is_some() {
         anyhow::bail!(
             "run spec for workflow `{}` carries a findings_profile, which applies to agent runs only",
+            spec.name
+        );
+    }
+    if spec.kind == RunSpecKind::Workflow && !spec.engagement_profiles.is_empty() {
+        anyhow::bail!(
+            "run spec for workflow `{}` carries engagement_profiles, which apply to agent runs only",
             spec.name
         );
     }
@@ -885,11 +893,12 @@ fn check_spec(spec: &RunSpec) -> anyhow::Result<()> {
 /// or `rupu run` invocation dispatched by the node agent.
 ///
 /// Workflow: `workflow run <name> [<target>] --run-id <id> --plain [--input k=v]… [--mode m]`
-/// Agent:    `run <name> [<target>] --run-id <id> [--mode m] [--findings-profile f] [--prompt p] [--tmp (if target)]`
+/// Agent:    `run <name> [<target>] --run-id <id> [--mode m] [--findings-profile f] [--engagement-profile e]… [--prompt p] [--tmp (if target)]`
 ///
 /// Flag names are verified against the clap definitions in `cmd/workflow.rs`
 /// (`--run-id`, `--plain`, `--input`, `--mode`) and `cmd/run.rs`
-/// (`--run-id`, `--mode`, `--findings-profile`, `--prompt`, `--tmp`).
+/// (`--run-id`, `--mode`, `--findings-profile`, `--engagement-profile`,
+/// `--prompt`, `--tmp`).
 pub(crate) fn build_argv(run_id: &str, spec: &RunSpec) -> Vec<String> {
     match spec.kind {
         RunSpecKind::Workflow => {
@@ -924,6 +933,10 @@ pub(crate) fn build_argv(run_id: &str, spec: &RunSpec) -> Vec<String> {
             if let Some(f) = spec.findings_profile {
                 argv.push("--findings-profile".to_string());
                 argv.push(f.as_str().to_string());
+            }
+            for id in &spec.engagement_profiles {
+                argv.push("--engagement-profile".to_string());
+                argv.push(id.clone());
             }
             if let Some(p) = &spec.prompt {
                 argv.push("--prompt".to_string());
@@ -2911,6 +2924,7 @@ mod tests {
             mode: None,
             target: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         })
         .unwrap()
     }
@@ -3617,6 +3631,7 @@ mod tests {
             mode: Some("bypass".to_string()),
             target: Some("github:o/r".to_string()),
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         };
         let argv = build_argv("run_X", &spec);
         assert_eq!(
@@ -3649,6 +3664,7 @@ mod tests {
             mode: None,
             target: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         };
         let argv = build_argv("run_Y", &spec);
         assert_eq!(
@@ -3667,6 +3683,7 @@ mod tests {
             mode: Some("bypass".to_string()),
             target: Some("github:o/r".to_string()),
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         };
         let argv = build_argv("run_Z", &spec);
         assert_eq!(
@@ -3696,6 +3713,7 @@ mod tests {
             mode: None,
             target: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         };
         let argv = build_argv("run_W", &spec);
         assert_eq!(argv, vec!["run", "check", "--run-id", "run_W"]);
@@ -3711,6 +3729,7 @@ mod tests {
             mode: None,
             target: None,
             findings_profile: Some(rupu_coverage::FindingProfile::Summary),
+            engagement_profiles: Vec::new(),
         };
         let argv = build_argv("run_P", &spec);
         assert_eq!(
@@ -3736,6 +3755,56 @@ mod tests {
     }
 
     #[test]
+    fn build_argv_agent_carries_the_engagement_profiles() {
+        let spec = RunSpec {
+            kind: RunSpecKind::Agent,
+            name: "recon".to_string(),
+            inputs: BTreeMap::new(),
+            prompt: Some("enumerate".to_string()),
+            mode: None,
+            target: None,
+            findings_profile: None,
+            engagement_profiles: vec!["network".into(), "web".into()],
+        };
+        let argv = build_argv("run_E", &spec);
+        assert_eq!(
+            argv,
+            vec![
+                "run",
+                "recon",
+                "--run-id",
+                "run_E",
+                "--engagement-profile",
+                "network",
+                "--engagement-profile",
+                "web",
+                "--prompt",
+                "enumerate"
+            ]
+        );
+        // Round-trips through the real `rupu run` parser.
+        let args = crate::cmd::run::parse_launch_args(argv[1..].to_vec()).unwrap();
+        assert_eq!(args.engagement_profiles, ["network", "web"]);
+        check_spec(&spec).expect("an agent spec may carry an engagement");
+    }
+
+    #[test]
+    fn a_workflow_spec_carrying_engagement_profiles_is_refused() {
+        let spec = RunSpec {
+            kind: RunSpecKind::Workflow,
+            name: "audit".to_string(),
+            inputs: BTreeMap::new(),
+            prompt: None,
+            mode: None,
+            target: None,
+            findings_profile: None,
+            engagement_profiles: vec!["network".into()],
+        };
+        let err = check_spec(&spec).unwrap_err().to_string();
+        assert!(err.contains("agent runs only"), "{err}");
+    }
+
+    #[test]
     fn a_workflow_spec_carrying_a_findings_profile_is_refused() {
         let spec = RunSpec {
             kind: RunSpecKind::Workflow,
@@ -3745,6 +3814,7 @@ mod tests {
             mode: None,
             target: None,
             findings_profile: Some(rupu_coverage::FindingProfile::Full),
+            engagement_profiles: Vec::new(),
         };
         let err = check_spec(&spec).unwrap_err().to_string();
         assert!(err.contains("agent runs only"), "{err}");
@@ -4749,7 +4819,10 @@ mod tests {
         assert_eq!(info.rupu_version, env!("CARGO_PKG_VERSION"));
         assert_eq!(
             info.capabilities,
-            vec![rupu_cp::node::protocol::CAP_AGENT_FINDINGS_PROFILE.to_string()]
+            vec![
+                rupu_cp::node::protocol::CAP_AGENT_FINDINGS_PROFILE.to_string(),
+                rupu_cp::node::protocol::CAP_AGENT_ENGAGEMENT_PROFILE.to_string(),
+            ]
         );
     }
 
@@ -4794,6 +4867,7 @@ mod tests {
                     mode: None,
                     target: None,
                     findings_profile: None,
+                    engagement_profiles: Vec::new(),
                 },
             }))
             .await

@@ -85,10 +85,11 @@ was examined, separately from any findings about it.
 | Surface | How | Notes |
 |---------|-----|-------|
 | `rupu run` | `--engagement-profile <id>` | Alias `--engagement-profiles`. Repeat the flag or pass a comma-separated list. Sub-agents started with `dispatch_agent` inherit the selection. |
-| `rupu workflow run` | `--engagement-profile <id>` | Applies to every agent step. The selection is **not** recorded on the run, so `rupu workflow resume` and an approve-resume carry on without it, on the `code` path. |
+| `rupu workflow run` | `--engagement-profile <id>` | Applies to every agent step and to `action: findings.record` steps. The selection is recorded on the run (`engagement_profiles` in `run.json`), so `rupu workflow resume`, `workflow approve` and a gate approved in the control plane continue under it. A recorded profile that no longer resolves fails the resume. |
 | Agentiflows | `engagement_profiles:` in the definition (required) | rupu validates the definition against the profiles, and passes the set to the lead and to every unit it launches (as `--engagement-profile`). See [agentiflows.md](agentiflows.md#4-engagement-profiles). |
-| Sessions, autoflows, CP launches | — | These don't accept a selection and always run on the `code` path. The control plane shows the profiles an agentiflow ran with, but nothing launched from it takes one. |
-| Remote workflow units (`host:` / `distribute:`) | — | The selection doesn't reach the host, which runs the unit on the `code` path. |
+| CP agent launch API | `engagement_profiles: [..]` in the `POST /api/agents/:name/run` body | Passed to `rupu run --engagement-profile`, locally or on the chosen host (see the remote row). The web launcher doesn't offer it. |
+| Sessions, autoflows | — | These don't accept a selection and always run on the `code` path. |
+| Remote workflow units (`host:` / `distribute:`) | inherited from `rupu workflow run` | The ids travel to the host as `rupu run --engagement-profile`, on every transport. A host must advertise `agent.engagement_profile` (HTTP `/api/host/info` `features`, tunnel `Hello`, bucket worker marker); otherwise the launch is refused, never run on the `code` path. An SSH remote too old for the flag rejects it and the launch fails. The host resolves the ids against its own profiles, so install a custom profile there too. |
 | `rupu coverage rerun` | — | Replays on the `code` path. The original run's selection isn't recorded. |
 
 ```bash
@@ -205,7 +206,9 @@ Two tools write assets. Both write to the target's asset ledger,
 
 ### `report_finding` with an `asset`
 
-When an engagement is active, `report_finding` takes an optional `asset`:
+When an engagement is active, `report_finding` takes an optional `asset`. So does
+the MCP `findings.record` tool that a workflow `action:` step calls, with the same
+schema and handling:
 
 ```json
 {
@@ -241,8 +244,7 @@ active, `asset` is ignored. When an engagement is active but the finding has no
 `asset`, the finding is recorded on the plain path without a completeness
 check.
 
-The MCP `findings.record` tool doesn't accept `asset` yet. It always records on
-the native code path. `rupu findings import` records no asset either.
+`rupu findings import` records no asset.
 
 ### `asset_mark`
 

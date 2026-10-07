@@ -110,9 +110,7 @@ async fn mirror_new_results(
                     mirror
                         .append(run_id, host_id, file.clone(), line)
                         .await
-                        .with_context(|| {
-                            format!("mirror.append {file:?} line for run {run_id}")
-                        })?;
+                        .with_context(|| format!("mirror.append {file:?} line for run {run_id}"))?;
                 }
             }
         }
@@ -277,6 +275,7 @@ mod tests {
                     mode: None,
                     target: None,
                     findings_profile: None,
+                    engagement_profiles: Vec::new(),
                 },
             )
             .await
@@ -329,6 +328,7 @@ mod tests {
                     mode: None,
                     target: None,
                     findings_profile: None,
+                    engagement_profiles: Vec::new(),
                 },
             )
             .await
@@ -397,7 +397,10 @@ mod tests {
             classify_key("coverage.0001.jsonl"),
             Some(ArtifactFile::Coverage)
         ));
-        assert!(matches!(classify_key("run.json"), Some(ArtifactFile::RunJson)));
+        assert!(matches!(
+            classify_key("run.json"),
+            Some(ArtifactFile::RunJson)
+        ));
         assert!(classify_key("finished").is_none());
         assert!(classify_key("unknown.txt").is_none());
         assert!(classify_key("").is_none());

@@ -17,7 +17,7 @@ use crate::{
         RunListQuery, MAX_WORKSPACE_BYTES,
     },
     launcher::LaunchRequest,
-    node::protocol::CAP_AGENT_FINDINGS_PROFILE,
+    node::protocol::{CAP_AGENT_ENGAGEMENT_PROFILE, CAP_AGENT_FINDINGS_PROFILE},
     session_sender::SendMessageRequest,
     session_starter::SessionStartRequest,
 };
@@ -296,13 +296,27 @@ impl HostConnector for HttpHostConnector {
             )
             .await?;
         }
-        let body = serde_json::json!({
+        if !req.engagement_profiles.is_empty() {
+            self.require_feature(
+                CAP_AGENT_ENGAGEMENT_PROFILE,
+                &format!(
+                    "this run cannot run under the `{}` engagement profile(s)",
+                    req.engagement_profiles.join(",")
+                ),
+            )
+            .await?;
+        }
+        let mut body = serde_json::json!({
             "prompt": req.prompt,
             "mode": req.mode,
             "target": req.target,
             "working_dir": req.working_dir,
             "findings_profile": req.findings_profile,
         });
+        // Only when set: a body without an engagement stays what it was.
+        if !req.engagement_profiles.is_empty() {
+            body["engagement_profiles"] = serde_json::json!(req.engagement_profiles);
+        }
         let resp = self
             .send(
                 self.client

@@ -29,7 +29,8 @@ use crate::{
     launcher::LaunchRequest,
     node::{
         protocol::{
-            Frame, RunSpec, RunSpecKind, CAP_AGENT_FINDINGS_PROFILE, CAP_FINDINGS_ARTIFACT_PULL,
+            Frame, RunSpec, RunSpecKind, CAP_AGENT_ENGAGEMENT_PROFILE, CAP_AGENT_FINDINGS_PROFILE,
+            CAP_FINDINGS_ARTIFACT_PULL,
         },
         NodeMirror, NodeRegistry,
     },
@@ -104,10 +105,7 @@ impl TunnelHostConnector {
     /// [`HostConnectorError::Unreachable`] with a descriptive message.
     fn live_conn(&self) -> Result<Arc<crate::node::NodeConn>, HostConnectorError> {
         self.registry.get(&self.node_id).ok_or_else(|| {
-            HostConnectorError::Unreachable(format!(
-                "node {} is not connected",
-                self.node_id
-            ))
+            HostConnectorError::Unreachable(format!("node {} is not connected", self.node_id))
         })
     }
 }
@@ -135,6 +133,7 @@ impl HostConnector for TunnelHostConnector {
             mode: req.mode.clone(),
             target: req.target.clone(),
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         };
 
         // Verify the node is reachable BEFORE creating the mirror run.
@@ -182,6 +181,7 @@ impl HostConnector for TunnelHostConnector {
             mode: req.mode.clone(),
             target: req.target.clone(),
             findings_profile: req.findings_profile,
+            engagement_profiles: req.engagement_profiles.clone(),
         };
 
         // Verify the node is reachable BEFORE creating the mirror run.
@@ -202,6 +202,18 @@ impl HostConnector for TunnelHostConnector {
                     conn.rupu_version().unwrap_or("unknown version"),
                 )));
             }
+        }
+        // Same for `RunSpec.engagement_profiles`: an older node would run the
+        // agent on the `code` path.
+        if !req.engagement_profiles.is_empty() && !conn.supports(CAP_AGENT_ENGAGEMENT_PROFILE) {
+            return Err(HostConnectorError::Unsupported(format!(
+                "node {} (rupu {}) does not support engagement profiles on agent \
+                 launches, so this run cannot run under the `{}` engagement \
+                 profile(s); upgrade rupu on that node",
+                self.node_id,
+                conn.rupu_version().unwrap_or("unknown version"),
+                req.engagement_profiles.join(","),
+            )));
         }
 
         self.mirror
@@ -233,10 +245,7 @@ impl HostConnector for TunnelHostConnector {
         Ok(run_id)
     }
 
-    async fn start_session(
-        &self,
-        _req: SessionStartRequest,
-    ) -> Result<String, HostConnectorError> {
+    async fn start_session(&self, _req: SessionStartRequest) -> Result<String, HostConnectorError> {
         Err(HostConnectorError::Invalid(
             "sessions not supported over tunnel (slice 2)".into(),
         ))
@@ -438,17 +447,11 @@ impl HostConnector for TunnelHostConnector {
         }
     }
 
-    async fn stream_run_events(
-        &self,
-        run_id: &str,
-    ) -> Result<EventByteStream, HostConnectorError> {
+    async fn stream_run_events(&self, run_id: &str) -> Result<EventByteStream, HostConnectorError> {
         mirror_stream_run_events(&self.run_store, &self.node_id, run_id).await
     }
 
-    async fn get_transcript(
-        &self,
-        path: &str,
-    ) -> Result<serde_json::Value, HostConnectorError> {
+    async fn get_transcript(&self, path: &str) -> Result<serde_json::Value, HostConnectorError> {
         read_transcript_file(path).await
     }
 

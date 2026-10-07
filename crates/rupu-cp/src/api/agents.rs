@@ -863,6 +863,30 @@ struct AgentRunBody {
     /// unknown value is a handler-controlled 400.
     #[serde(default)]
     findings_profile: Option<String>,
+    /// Optional engagement profile ids — `rupu run --engagement-profile`,
+    /// one flag per id; absent/empty = the `code` path. The launched `rupu
+    /// run` resolves them (an unknown id fails that run). Honoured on both
+    /// the local and the remote-proxy path, where a peer that does not
+    /// advertise `agent.engagement_profile` refuses the launch.
+    #[serde(default)]
+    engagement_profiles: Vec<String>,
+}
+
+/// Trim an engagement selection; a blank id is a 400, never a silent
+/// `code`-path fallback.
+fn parse_engagement_profiles(raw: Vec<String>) -> Result<Vec<String>, ApiError> {
+    raw.into_iter()
+        .map(|id| {
+            let id = id.trim().to_string();
+            if id.is_empty() {
+                Err(ApiError::bad_request(
+                    "engagement_profiles: a profile id must not be blank",
+                ))
+            } else {
+                Ok(id)
+            }
+        })
+        .collect()
 }
 
 fn parse_findings_profile(
@@ -879,6 +903,7 @@ async fn run_agent_with(
     launcher: Arc<dyn AgentLauncher>,
 ) -> Result<String, ApiError> {
     let findings_profile = parse_findings_profile(body.findings_profile.as_deref())?;
+    let engagement_profiles = parse_engagement_profiles(body.engagement_profiles)?;
     let req = AgentLaunchRequest {
         codename: None,
         agent: name.to_string(),
@@ -888,6 +913,7 @@ async fn run_agent_with(
         working_dir: body.working_dir,
         run_id: None,
         findings_profile,
+        engagement_profiles,
     };
     launcher.launch(req).await.map_err(|e| match e {
         AgentLaunchError::Invalid(m) => ApiError::bad_request(m),
@@ -1019,6 +1045,7 @@ async fn run_agent(
         // function's doc comment. The request proceeds exactly as it would
         // with no scope fields at all.
         let findings_profile = parse_findings_profile(b.findings_profile.as_deref())?;
+        let engagement_profiles = parse_engagement_profiles(b.engagement_profiles)?;
         let conn = crate::api::runs::resolve_host(&s, &host)?;
         let req = AgentLaunchRequest {
             codename: None,
@@ -1029,11 +1056,13 @@ async fn run_agent(
             working_dir: b.working_dir,
             run_id: None,
             findings_profile,
+            engagement_profiles,
         };
         let run_id = conn.launch_agent(req).await.map_err(|e| match e {
             HostConnectorError::NotFound(m) => ApiError::not_found(m),
             HostConnectorError::Invalid(m) => ApiError::bad_request(m),
-            // e.g. the host can't honour `findings_profile` — refused, not failed.
+            // e.g. the host can't honour `findings_profile` or
+            // `engagement_profiles` — refused, not failed.
             HostConnectorError::Unsupported(m) => ApiError::not_available(m),
             other => ApiError::internal(other.to_string()),
         })?;
@@ -1266,6 +1295,7 @@ mod tests {
             scope_kind: None,
             scope_id: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         };
         let run_id = run_agent_with("triage", body, mock.clone())
             .await
@@ -1308,6 +1338,38 @@ mod tests {
             .expect_err("unknown profile must be refused");
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
         assert!(err.1.contains("`full` or `summary`"), "{}", err.1);
+        assert!(mock.last.lock().unwrap().is_none(), "nothing launched");
+    }
+
+    #[tokio::test]
+    async fn run_agent_forwards_the_engagement_profiles() {
+        let mock = Arc::new(MockAgent {
+            last: Mutex::new(None),
+        });
+        let body: AgentRunBody = serde_json::from_value(
+            serde_json::json!({ "engagement_profiles": [" network ", "web"] }),
+        )
+        .unwrap();
+        run_agent_with("recon", body, mock.clone())
+            .await
+            .expect("ok");
+        let got = mock.last.lock().unwrap().clone().unwrap();
+        assert_eq!(got.engagement_profiles, ["network", "web"]);
+    }
+
+    #[tokio::test]
+    async fn run_agent_rejects_a_blank_engagement_profile_before_launching() {
+        let mock = Arc::new(MockAgent {
+            last: Mutex::new(None),
+        });
+        let body = AgentRunBody {
+            engagement_profiles: vec!["network".into(), "  ".into()],
+            ..AgentRunBody::default()
+        };
+        let err = run_agent_with("recon", body, mock.clone())
+            .await
+            .expect_err("a blank id must be refused");
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
         assert!(mock.last.lock().unwrap().is_none(), "nothing launched");
     }
 
@@ -1369,6 +1431,7 @@ mod tests {
             scope_kind: Some("project".into()),
             scope_id: Some("ws_a".into()),
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         };
         let _ = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -1407,6 +1470,7 @@ mod tests {
             scope_kind: None,
             scope_id: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         };
         let _ = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -1446,6 +1510,7 @@ mod tests {
             scope_kind: Some("project".into()),
             scope_id: Some("ws_a".into()),
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         };
         let err = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -1489,6 +1554,7 @@ mod tests {
             scope_kind: Some("project".into()),
             scope_id: Some("ws_unknown_locally".into()),
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         };
         let resp = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -1540,6 +1606,7 @@ mod tests {
             scope_kind: Some("global".into()),
             scope_id: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         };
         let _ = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -1582,6 +1649,7 @@ mod tests {
             scope_kind: Some("global".into()),
             scope_id: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         };
         let err = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -1612,6 +1680,7 @@ mod tests {
             scope_kind: Some("bogus".into()),
             scope_id: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         };
         let err = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -1643,6 +1712,7 @@ mod tests {
             scope_kind: Some("project".into()),
             scope_id: Some("ws_missing".into()),
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         };
         let err = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await

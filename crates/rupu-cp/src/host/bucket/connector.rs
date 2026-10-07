@@ -24,7 +24,9 @@ use crate::{
     },
     launcher::LaunchRequest,
     node::{
-        protocol::{RunSpec, RunSpecKind, CAP_AGENT_FINDINGS_PROFILE},
+        protocol::{
+            RunSpec, RunSpecKind, CAP_AGENT_ENGAGEMENT_PROFILE, CAP_AGENT_FINDINGS_PROFILE,
+        },
         NodeMirror,
     },
     session_sender::SendMessageRequest,
@@ -84,8 +86,8 @@ impl BucketHostConnector {
         // put_control_envelope calls cannot race to the same seq number
         // (len() would give both N; the second put would silently overwrite).
         let seq = existing.iter().map(|(s, _)| *s + 1).max().unwrap_or(0);
-        let bytes =
-            serde_json::to_vec(&envelope).map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
+        let bytes = serde_json::to_vec(&envelope)
+            .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
         self.bucket
             .put_control(run_id, seq, &bytes)
             .await
@@ -174,6 +176,7 @@ impl HostConnector for BucketHostConnector {
             mode: req.mode.clone(),
             target: req.target.clone(),
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         };
 
         self.mirror
@@ -205,6 +208,16 @@ impl HostConnector for BucketHostConnector {
             )
             .await?;
         }
+        if !req.engagement_profiles.is_empty() {
+            self.require_worker_capability(
+                CAP_AGENT_ENGAGEMENT_PROFILE,
+                &format!(
+                    "this run cannot run under the `{}` engagement profile(s)",
+                    req.engagement_profiles.join(",")
+                ),
+            )
+            .await?;
+        }
 
         let run_id = format!("run_{}", Ulid::new());
 
@@ -216,6 +229,7 @@ impl HostConnector for BucketHostConnector {
             mode: req.mode.clone(),
             target: req.target.clone(),
             findings_profile: req.findings_profile,
+            engagement_profiles: req.engagement_profiles.clone(),
         };
 
         self.mirror
@@ -238,10 +252,7 @@ impl HostConnector for BucketHostConnector {
         Ok(run_id)
     }
 
-    async fn start_session(
-        &self,
-        _req: SessionStartRequest,
-    ) -> Result<String, HostConnectorError> {
+    async fn start_session(&self, _req: SessionStartRequest) -> Result<String, HostConnectorError> {
         Err(HostConnectorError::Invalid(
             "sessions not supported over bucket (slice 2b)".into(),
         ))
@@ -358,17 +369,11 @@ impl HostConnector for BucketHostConnector {
             })
     }
 
-    async fn stream_run_events(
-        &self,
-        run_id: &str,
-    ) -> Result<EventByteStream, HostConnectorError> {
+    async fn stream_run_events(&self, run_id: &str) -> Result<EventByteStream, HostConnectorError> {
         mirror_stream_run_events(&self.run_store, &self.host_id, run_id).await
     }
 
-    async fn get_transcript(
-        &self,
-        path: &str,
-    ) -> Result<serde_json::Value, HostConnectorError> {
+    async fn get_transcript(&self, path: &str) -> Result<serde_json::Value, HostConnectorError> {
         read_transcript_file(path).await
     }
 
@@ -480,6 +485,7 @@ mod tests {
                 working_dir: None,
                 run_id: None,
                 findings_profile: None,
+                engagement_profiles: Vec::new(),
             })
             .await
             .unwrap();
@@ -491,10 +497,7 @@ mod tests {
             Some("agent"),
             "job envelope kind must be 'agent'"
         );
-        assert_eq!(
-            spec.get("name").and_then(|v| v.as_str()),
-            Some("my-agent")
-        );
+        assert_eq!(spec.get("name").and_then(|v| v.as_str()), Some("my-agent"));
     }
 
     #[tokio::test]
@@ -517,6 +520,7 @@ mod tests {
             working_dir: None,
             run_id: None,
             findings_profile: profile,
+            engagement_profiles: Vec::new(),
             codename: None,
         }
     }
@@ -549,6 +553,45 @@ mod tests {
             spec.findings_profile,
             Some(rupu_coverage::FindingProfile::Summary)
         );
+    }
+
+    fn engaged_req(ids: &[&str]) -> AgentLaunchRequest {
+        let mut req = profile_req(None);
+        req.engagement_profiles = ids.iter().map(|s| s.to_string()).collect();
+        req
+    }
+
+    #[tokio::test]
+    async fn launch_agent_carries_the_engagement_to_a_capable_worker() {
+        let (conn, _run_store, bucket, _tmp) = make_conn();
+        put_worker(&bucket, "node_a", &[CAP_AGENT_ENGAGEMENT_PROFILE]).await;
+
+        let run_id = conn.launch_agent(engaged_req(&["network"])).await.unwrap();
+
+        let spec: RunSpec =
+            serde_json::from_slice(&bucket.get_job(&run_id).await.unwrap()).unwrap();
+        assert_eq!(spec.engagement_profiles, ["network"]);
+    }
+
+    #[tokio::test]
+    async fn launch_agent_refuses_an_engagement_when_a_worker_lacks_support() {
+        let (conn, run_store, bucket, _tmp) = make_conn();
+        put_worker(&bucket, "node_new", &[CAP_AGENT_ENGAGEMENT_PROFILE]).await;
+        // Advertises the findings profile, but predates engagements.
+        put_worker(&bucket, "node_mid", &[CAP_AGENT_FINDINGS_PROFILE]).await;
+
+        let err = conn
+            .launch_agent(engaged_req(&["network"]))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Unsupported(m)
+                if m.contains("node_mid") && m.contains("`network`")),
+            "{err:?}"
+        );
+        // Refused before anything was written: no job, no orphaned mirror run.
+        assert!(bucket.list_jobs().await.unwrap().is_empty());
+        assert!(run_store.list().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -698,7 +741,10 @@ mod tests {
         assert_eq!(controls.len(), 1);
         let env: ControlEnvelope = serde_json::from_slice(&controls[0].1).unwrap();
         assert_eq!(env.kind, "approve");
-        assert!(env.mode.is_none(), "empty mode string must be stored as None");
+        assert!(
+            env.mode.is_none(),
+            "empty mode string must be stored as None"
+        );
     }
 
     #[tokio::test]
@@ -852,10 +898,7 @@ mod tests {
         ) -> Result<(), BucketError> {
             unimplemented!("FailingBucket::put_result")
         }
-        async fn list_results(
-            &self,
-            _run_id: &str,
-        ) -> Result<Vec<(String, Vec<u8>)>, BucketError> {
+        async fn list_results(&self, _run_id: &str) -> Result<Vec<(String, Vec<u8>)>, BucketError> {
             unimplemented!("FailingBucket::list_results")
         }
         async fn put_finished(&self, _run_id: &str, _status: &str) -> Result<(), BucketError> {
