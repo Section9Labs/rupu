@@ -11,7 +11,7 @@
 <body>
 <div class="docs-shell">
 
-  <!-- ════ SHARED SIDEBAR — copy verbatim; set .active on THIS page's item ════ -->
+  <!-- ════ SHARED SIDEBAR (copy verbatim into every docs page; set .active) ════ -->
   <aside class="docs-side">
     <a class="brand" href="/" aria-label="rupu home">
       <span class="mark" aria-hidden="true">&#8734;</span>
@@ -25,9 +25,11 @@
     <a class="item" href="/docs/workflows.html">Workflows</a>
     <a class="item active" href="/docs/workflow-reference.html">Authoring reference</a>
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
     <div class="grp">Platform</div>
     <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item" href="/docs/reliability.html">Recovery &amp; reliability</a>
     <a class="item" href="/docs/integrations.html">Integrations</a>
     <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
     <a class="item" href="/docs/triggers.html">Triggers</a>
@@ -35,6 +37,8 @@
     <a class="item" href="/docs/multi-host.html">Multi-host</a>
     <a class="item" href="/docs/netflow.html">Netflow</a>
     <a class="item" href="/docs/coverage.html">Coverage</a>
+    <a class="item" href="/docs/findings.html">Findings</a>
+    <a class="item" href="/docs/customers.html">Customers</a>
     <div class="grp">More</div>
     <a class="item" href="/docs/examples/">Examples</a>
     <a class="item" href="/#download">Download</a>
@@ -72,12 +76,14 @@
         <tr><td><code>description</code></td><td>string</td><td>no</td><td>none</td><td>Human-readable summary. Surfaced in listings; ignored by the runtime.</td></tr>
         <tr><td><code>trigger</code></td><td>object</td><td>no</td><td><code class="inline">on: manual</code></td><td>How the workflow starts &mdash; <code class="inline">manual</code>, <code class="inline">cron</code>, or <code class="inline">event</code>. See <a class="link" href="/docs/triggers.html">Triggers</a>.</td></tr>
         <tr><td><code>inputs</code></td><td>map&lt;string, InputDef&gt;</td><td>no</td><td><code class="inline">{}</code></td><td>Typed runtime inputs, validated before the first step dispatches.</td></tr>
-        <tr><td><code>defaults</code></td><td>object</td><td>no</td><td><code class="inline">{}</code></td><td>Per-workflow defaults inherited by every step (<code class="inline">continue_on_error</code>, <code class="inline">workspace</code>).</td></tr>
+        <tr><td><code>defaults</code></td><td>object</td><td>no</td><td><code class="inline">{}</code></td><td>Per-workflow defaults inherited by every step (<code class="inline">continue_on_error</code>, <code class="inline">workspace</code>, <code class="inline">findings_profile</code>).</td></tr>
         <tr><td><code>steps</code></td><td>array&lt;Step&gt;</td><td>yes</td><td>&mdash;</td><td>The ordered step list. An empty array is a parse error.</td></tr>
         <tr><td><code>contracts</code></td><td>object</td><td>no</td><td><code class="inline">{}</code></td><td>Named machine-readable workflow outputs under <code class="inline">contracts.outputs.&lt;name&gt;</code>, validated against a stored schema.</td></tr>
         <tr><td><code>autoflow</code></td><td>object</td><td>no</td><td>none</td><td>Autonomous-ownership metadata consumed by <code class="inline">rupu autoflow</code>. See <a class="link" href="/docs/autoflows.html">Autoflows</a>.</td></tr>
         <tr><td><code>notifyIssue</code></td><td>bool</td><td>no</td><td><code class="inline">false</code></td><td>When true <em>and</em> the run target resolves to an issue, rupu auto-comments on the issue at run start and at terminal state. Note the camelCase spelling &mdash; it is the literal YAML key.</td></tr>
         <tr><td><code>concerns</code></td><td>list</td><td>no</td><td>none</td><td>Coverage catalog for the whole run. When present it overrides each step agent's own <code class="inline">concerns:</code> so every step shares one ledger. See <a class="link" href="/docs/coverage.html">Coverage</a>.</td></tr>
+        <tr><td><code>loops</code></td><td>map&lt;string, LoopDef&gt;</td><td>no</td><td><code class="inline">{}</code></td><td>Named, bounded loops over a subgraph of existing steps. See <a class="link" href="#graph">Graph orchestration</a>.</td></tr>
+        <tr><td><code>max_concurrency</code></td><td>integer</td><td>no</td><td>unbounded</td><td>Cap on how many nodes a graph workflow runs at once, across the whole graph. Must be &#8805; 1. Ignored by a plain chain workflow.</td></tr>
       </tbody>
     </table>
 
@@ -128,6 +134,7 @@
       <tbody>
         <tr><td><code>continue_on_error</code></td><td>bool</td><td>Every step inherits this unless it sets its own <code class="inline">continue_on_error</code>.</td></tr>
         <tr><td><code>workspace</code></td><td><code>sync</code> | <code>none</code></td><td>Default workspace mode for remote steps. A step's own <code class="inline">workspace:</code> wins. Absent means <code class="inline">none</code> (self-contained).</td></tr>
+        <tr><td><code>findings_profile</code></td><td><code>full</code> | <code>summary</code></td><td>The contract findings are recorded under, for every step that runs an agent and every <code class="inline">action: findings.record</code> step. A step's own <code class="inline">findings_profile</code> wins. See <a class="link" href="#findings-profile">Findings profile</a>.</td></tr>
       </tbody>
     </table>
 
@@ -256,6 +263,11 @@
         <tr><td>approval gate</td><td><code>approval</code> alone</td><td>no</td><td>Pauses the run for a human decision, with notify and reject-cleanup hooks.</td></tr>
       </tbody>
     </table>
+    <p>
+      Two more step forms do no work of their own: a <code class="inline">split:</code> node forks into named
+      concurrent tracks and a <code class="inline">join:</code> node is a barrier that gathers them. They are pure
+      routing and belong to <a class="link" href="#graph">Graph orchestration</a> below.
+    </p>
 
     <h3>Linear step</h3>
     <p>
@@ -632,6 +644,23 @@
       <code class="inline">human</code> or <code class="inline">auto</code>. The convenience shortcut
       <code class="inline">steps.&lt;id&gt;.decision</code> exposes the decision string directly.
     </p>
+    <p>
+      <strong>Several gates at once.</strong> In a graph workflow more than one gate can park in the same wave.
+      Decisions are path-scoped: approving a gate releases only the path behind it; rejecting one prunes only what
+      is reachable solely through it and runs its <code class="inline">on_reject</code> chain, while sibling paths keep
+      going (a reject in a plain chain workflow still ends the run). Target a gate with
+      <code class="inline">rupu workflow approve|reject &lt;run-id&gt; --gate &lt;step-id&gt;</code> &mdash; required once
+      more than one is parked. The run stays <code class="inline">awaiting_approval</code> until every gate is resolved,
+      and a still-parked sibling does not re-fire its <code class="inline">notify:</code> hooks. A decision is recorded
+      under the run lock and applied by exactly one runner, wherever it was made.
+    </p>
+    <p>
+      <strong>Timeouts need <code class="inline">rupu cp serve</code>.</strong>
+      <code class="inline">timeout_seconds</code> / <code class="inline">on_timeout</code> are acted on by the control
+      plane's background gate sweep (<code class="inline">[cp].gate_sweep_enabled</code>, default on, every
+      <code class="inline">[cp].gate_sweep_interval_secs</code> = 60). Without it, an expired gate simply stays parked
+      until someone decides it.
+    </p>
     <pre class="code">  - <span class="k">id</span>: <span class="v">merge_gate</span>
     <span class="k">approval</span>:
       <span class="k">prompt</span>: <span class="s">|</span>
@@ -717,8 +746,79 @@
         <tr><td><code>workspace</code></td><td><code>sync</code> | <code>none</code></td><td>remote steps</td><td>Ship the coordinator's workspace to the host and bring changed files back. <code class="inline">sync</code> is rejected on a purely local step &mdash; it requires <code class="inline">host:</code> or <code class="inline">distribute:</code>. Overrides <code class="inline">defaults.workspace</code>.</td></tr>
         <tr><td><code>approval</code></td><td>object</td><td>all</td><td>Alone on a step it is a gate node; alongside <code class="inline">agent</code>+<code class="inline">prompt</code> it is the legacy inline pause. See above.</td></tr>
         <tr><td><code>contract</code></td><td>object</td><td>agent steps</td><td><code class="inline">{ emits: &lt;schema-name&gt;, format: json|yaml }</code>. Authoring metadata; must agree with any workflow-level <code class="inline">contracts.outputs</code> entry pointing at this step.</td></tr>
+        <tr><td><code>findings_profile</code></td><td><code>full</code> | <code>summary</code></td><td>agent steps, <code>action: findings.record</code></td><td>The findings contract for this step. Overrides <code class="inline">defaults.findings_profile</code>. A parse error on a step that runs no agent, and on any action other than <code class="inline">findings.record</code>.</td></tr>
+        <tr><td><code>next</code></td><td>array&lt;string&gt;</td><td>all</td><td>Successor step ids. Using it makes the workflow a graph; see below.</td></tr>
+        <tr><td><code>depends_on</code></td><td>array&lt;string&gt;</td><td>all</td><td>Predecessor step ids &mdash; the inverse of <code class="inline">next</code>. <code class="inline">a.next: [b]</code> and <code class="inline">b.depends_on: [a]</code> describe the same edge.</td></tr>
       </tbody>
     </table>
+
+    <h3 id="findings-profile">Findings profile</h3>
+    <p>
+      Steps that record <a class="link" href="/docs/coverage.html">findings</a> do so under one of two contracts:
+      <code class="inline">full</code>, a complete structured report (the built-in default), or
+      <code class="inline">summary</code>, the lightweight summary / severity / rationale record. The profile resolves
+      most-specific first: the step's <code class="inline">findings_profile</code>, then
+      <code class="inline">defaults.findings_profile</code>, then the agent's <code class="inline">findingsProfile</code>
+      frontmatter, then <code class="inline">full</code>.
+    </p>
+    <pre class="code"><span class="k">defaults</span>:
+  <span class="k">findings_profile</span>: <span class="v">full</span>          <span class="c"># every agent step records complete reports...</span>
+<span class="k">steps</span>:
+  - <span class="k">id</span>: <span class="v">sweep</span>
+    <span class="k">agent</span>: <span class="v">quick-scanner</span>
+    <span class="k">prompt</span>: <span class="s">"Skim &#123;&#123; inputs.path &#125;&#125; for hard-coded secrets."</span>
+    <span class="k">findings_profile</span>: <span class="v">summary</span>     <span class="c"># ...except this cheap first pass</span></pre>
+    <ul>
+      <li><code class="inline">parallel:</code> sub-steps inherit their parent's profile and can't set their own.</li>
+      <li>An <code class="inline">action: findings.record</code> step checks its <code class="inline">with:</code> keys against the profile at parse time: <code class="inline">full</code> needs <code class="inline">scope</code> and <code class="inline">report</code>; <code class="inline">summary</code> needs <code class="inline">scope</code>, <code class="inline">summary</code>, <code class="inline">severity</code> and <code class="inline">rationale</code>.</li>
+      <li>Remote steps launch each unit with the resolved profile. A host that can't honour it refuses the launch &mdash; the unit never runs under a different profile.</li>
+    </ul>
+
+    <h2 id="graph">Graph orchestration</h2>
+    <p>
+      By default steps run in declaration order. A workflow becomes an explicit <strong>graph</strong> &mdash; scheduled
+      by node readiness instead of list order &mdash; as soon as any step uses <code class="inline">next:</code>,
+      <code class="inline">depends_on:</code>, <code class="inline">split:</code> or <code class="inline">join:</code>, or
+      the workflow declares <code class="inline">loops:</code>. Edges from <code class="inline">&#123;&#123; steps.X.* &#125;&#125;</code>
+      template references count too, and the whole edge set must be acyclic.
+    </p>
+    <pre class="code"><span class="k">max_concurrency</span>: <span class="v">4</span>                  <span class="c"># whole-graph cap (optional)</span>
+<span class="k">steps</span>:
+  - <span class="k">id</span>: <span class="v">recon</span>
+    <span class="k">split</span>: [<span class="v">api</span>, <span class="v">web</span>, <span class="v">infra</span>]        <span class="c"># three concurrent tracks</span>
+  - <span class="k">id</span>: <span class="v">api</span>
+    <span class="k">agent</span>: <span class="v">api-reviewer</span>
+    <span class="k">prompt</span>: <span class="s">"Review the API surface."</span>
+    <span class="k">next</span>: [<span class="v">gathered</span>]
+  - <span class="k">id</span>: <span class="v">web</span>
+    <span class="k">agent</span>: <span class="v">web-reviewer</span>
+    <span class="k">prompt</span>: <span class="s">"Review the web client."</span>
+    <span class="k">next</span>: [<span class="v">gathered</span>]
+  - <span class="k">id</span>: <span class="v">infra</span>
+    <span class="k">agent</span>: <span class="v">infra-reviewer</span>
+    <span class="k">prompt</span>: <span class="s">"Review the deploy config."</span>
+    <span class="k">next</span>: [<span class="v">gathered</span>]
+  - <span class="k">id</span>: <span class="v">gathered</span>
+    <span class="k">join</span>: { <span class="k">wait</span>: { <span class="k">count</span>: <span class="v">2</span> } }    <span class="c"># all (default) | any | { count: N }</span>
+  - <span class="k">id</span>: <span class="v">report</span>
+    <span class="k">agent</span>: <span class="v">writer</span>
+    <span class="k">prompt</span>: <span class="s">"Summarize &#123;&#123; steps.gathered.results | length &#125;&#125; reviews."</span>
+    <span class="k">depends_on</span>: [<span class="v">gathered</span>]</pre>
+    <table>
+      <thead><tr><th>Construct</th><th>Meaning &amp; rule</th></tr></thead>
+      <tbody>
+        <tr><td><code>split: [ids]</code></td><td>Fans out into independent concurrent tracks, named by step id. Pure routing &mdash; no <code class="inline">agent</code>, <code class="inline">action</code>, fan-out, <code class="inline">branch</code> or <code class="inline">approval</code> of its own.</td></tr>
+        <tr><td><code>join: { wait }</code></td><td>A barrier. <code class="inline">wait</code> is <code class="inline">all</code> (default), <code class="inline">any</code>, or <code class="inline">{ count: N }</code>; the gathered outputs are <code class="inline">steps.&lt;id&gt;.results</code>. Needs at least one inbound edge, and <code class="inline">count</code> can't exceed the paths that feed it. Two tracks that both point at an ordinary step already wait for each other &mdash; reach for <code class="inline">join:</code> when you want <code class="inline">any</code> / <code class="inline">count</code> or a dedicated barrier.</td></tr>
+        <tr><td><code>loops.&lt;name&gt;</code></td><td><code class="inline">nodes</code> (&#8805; 2 existing steps, each in at most one loop), <code class="inline">until</code> (expression evaluated after each iteration), <code class="inline">max_iterations</code> (&#8805; 1), and <code class="inline">on_max</code>: <code class="inline">fail</code> (default) or <code class="inline">proceed</code> with the last iteration's outputs. Progress is <code class="inline">loops.&lt;name&gt;.iteration</code> / <code class="inline">.converged</code>.</td></tr>
+        <tr><td><code>max_concurrency</code></td><td>Whole-graph cap, distinct from a fan-out step's own <code class="inline">max_parallel</code>. Unset is unbounded. The machine's own concurrency ceiling still applies on top &mdash; see <a class="link" href="/docs/multi-host.html">Multi-host</a>.</td></tr>
+      </tbody>
+    </table>
+    <pre class="code"><span class="k">loops</span>:
+  <span class="k">refine</span>:
+    <span class="k">nodes</span>: [<span class="v">draft</span>, <span class="v">critique</span>]
+    <span class="k">until</span>: <span class="s">"&#123;&#123; 'APPROVED' in steps.critique.output &#125;&#125;"</span>
+    <span class="k">max_iterations</span>: <span class="v">3</span>
+    <span class="k">on_max</span>: <span class="v">proceed</span></pre>
 
     <h2>The action catalog</h2>
     <p>
@@ -742,11 +842,15 @@
         <tr><td><code>scm.prs.create</code></td><td>write</td><td><code>owner</code>, <code>repo</code>, <code>title</code>, <code>body</code>, <code>head</code>, <code>base</code></td><td>Open a pull/merge request. Optional <code class="inline">draft</code>.</td></tr>
         <tr><td><code>issues.list</code></td><td>read</td><td><code>project</code></td><td>List issues. Optional <code class="inline">state</code>, <code class="inline">labels</code>, <code class="inline">author</code>, <code class="inline">limit</code>.</td></tr>
         <tr><td><code>issues.get</code></td><td>read</td><td><code>project</code>, <code>number</code></td><td>Fetch one issue: title, body, state, labels, author, timestamps.</td></tr>
+        <tr><td><code>issues.comments</code></td><td>read</td><td><code>project</code>, <code>number</code></td><td>Read an issue's comment thread, oldest first, with each commenter's role on the repo where the tracker exposes one. Optional <code class="inline">limit</code> (default 100).</td></tr>
         <tr><td><code>issues.comment</code></td><td>write</td><td><code>project</code>, <code>number</code>, <code>body</code></td><td>Post a comment on an issue.</td></tr>
         <tr><td><code>issues.create</code></td><td>write</td><td><code>project</code>, <code>title</code>, <code>body</code></td><td>Open a new issue. Optional <code class="inline">labels</code>.</td></tr>
         <tr><td><code>issues.update_state</code></td><td>write</td><td><code>project</code>, <code>number</code>, <code>state</code></td><td>Transition an issue to <code class="inline">open</code> or <code class="inline">closed</code>.</td></tr>
         <tr><td><code>github.workflows_dispatch</code></td><td>write</td><td><code>owner</code>, <code>repo</code>, <code>workflow</code>, <code>ref</code></td><td>Trigger a GitHub Actions run. The workflow file must declare <code class="inline">on: workflow_dispatch:</code>. Optional <code class="inline">inputs</code>.</td></tr>
         <tr><td><code>gitlab.pipeline_trigger</code></td><td>write</td><td><code>owner</code>, <code>repo</code>, <code>ref</code></td><td>Trigger a GitLab CI pipeline against a branch or tag. Optional <code class="inline">variables</code>.</td></tr>
+        <tr><td><code>findings.record</code></td><td>write</td><td><code>scope</code> (+ per profile)</td><td>Record a finding in the project's ledger. Under <code class="inline">full</code> send a <code class="inline">report</code>; under <code class="inline">summary</code> send <code class="inline">summary</code>, <code class="inline">severity</code>, <code class="inline">rationale</code>. See <a class="link" href="#findings-profile">Findings profile</a>.</td></tr>
+        <tr><td><code>findings.query</code></td><td>read</td><td>&mdash;</td><td>The project's findings matching a one-line query <code class="inline">q</code> (e.g. <code class="inline">severity&gt;=high tag:needs-poc</code>). <code class="inline">all: true</code> returns every match unpaged &mdash; made for a <code class="inline">for_each</code> over the rows.</td></tr>
+        <tr><td><code>findings.tag</code></td><td>write</td><td><code>finding_ids</code></td><td>Add or remove tags (<code class="inline">add</code>, <code class="inline">remove</code>) on one or more of the project's findings.</td></tr>
       </tbody>
     </table>
     <p>Three things to know about <code class="inline">with:</code>:</p>
@@ -855,6 +959,14 @@
       <li><code class="inline">auto_approve</code>, <code class="inline">on_timeout</code>, <code class="inline">notify</code>, and <code class="inline">on_reject</code> are rejected on the legacy inline approval option &mdash; drop the <code class="inline">agent</code>/<code class="inline">prompt</code> to make it a gate node.</li>
       <li><code class="inline">on_reject</code> entries must be plain agent or action steps &mdash; no nested gate, fan-out, panel, or branch &mdash; and may not set <code class="inline">host:</code> or <code class="inline">when:</code>.</li>
       <li><code class="inline">action:</code> must name a tool that exists in the catalog; <code class="inline">with:</code> must be a mapping whose keys are all schema properties, with every required property present. Gate <code class="inline">notify</code> entries are validated by the same rules.</li>
+    </ul>
+    <p><strong>Graph and findings profile</strong></p>
+    <ul>
+      <li>Every <code class="inline">next</code> / <code class="inline">depends_on</code> / <code class="inline">split</code> target must name a real step, and a step can't point at itself.</li>
+      <li>The full edge set &mdash; control edges plus the data edges implied by template references &mdash; must be acyclic.</li>
+      <li><code class="inline">split:</code> and <code class="inline">join:</code> nodes may not carry <code class="inline">agent</code>, <code class="inline">action</code>, <code class="inline">for_each</code>, <code class="inline">parallel</code>, <code class="inline">panel</code>, <code class="inline">branch</code> or <code class="inline">approval</code>. A <code class="inline">join:</code> needs an inbound edge; <code class="inline">wait.count</code> can't exceed its inbound paths.</li>
+      <li><code class="inline">loops.*.nodes</code> must name &#8805; 2 existing steps, none in two loops; <code class="inline">max_iterations</code> and <code class="inline">max_concurrency</code> must be &#8805; 1.</li>
+      <li><code class="inline">findings_profile</code> is rejected on a step that runs no agent (<code class="inline">branch</code>, gate, <code class="inline">run</code>, <code class="inline">split</code>, <code class="inline">join</code>) and on any action other than <code class="inline">findings.record</code>, whose <code class="inline">with:</code> keys must match the resolved profile.</li>
     </ul>
     <p><strong>Templates and contracts</strong></p>
     <ul>
@@ -973,7 +1085,10 @@
 rupu workflow show review-and-ship
 rupu workflow run review-and-ship \
   --input title=<span class="s">"empty-cart NPE"</span> \
-  --input diff=<span class="s">"$(git diff origin/main)"</span></pre>
+  --input diff=<span class="s">"$(git diff origin/main)"</span>
+
+<span class="c"># or run a file that isn't in the catalog yet</span>
+rupu workflow run <span class="v">--file</span> <span class="s">./review-and-ship.yaml</span> --input title=<span class="s">"empty-cart NPE"</span></pre>
 
     <!-- prev / next footer nav -->
     <div class="doc-nav">

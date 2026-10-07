@@ -11,7 +11,7 @@
 <body>
 <div class="docs-shell">
 
-  <!-- ════ SHARED SIDEBAR — copy verbatim; set .active on THIS page's item ════ -->
+  <!-- ════ SHARED SIDEBAR (copy verbatim into every docs page; set .active) ════ -->
   <aside class="docs-side">
     <a class="brand" href="/" aria-label="rupu home">
       <span class="mark" aria-hidden="true">&#8734;</span>
@@ -25,9 +25,11 @@
     <a class="item" href="/docs/workflows.html">Workflows</a>
     <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
     <div class="grp">Platform</div>
     <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item" href="/docs/reliability.html">Recovery &amp; reliability</a>
     <a class="item" href="/docs/integrations.html">Integrations</a>
     <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
     <a class="item" href="/docs/triggers.html">Triggers</a>
@@ -35,6 +37,8 @@
     <a class="item active" href="/docs/multi-host.html">Multi-host</a>
     <a class="item" href="/docs/netflow.html">Netflow</a>
     <a class="item" href="/docs/coverage.html">Coverage</a>
+    <a class="item" href="/docs/findings.html">Findings</a>
+    <a class="item" href="/docs/customers.html">Customers</a>
     <div class="grp">More</div>
     <a class="item" href="/docs/examples/">Examples</a>
     <a class="item" href="/#download">Download</a>
@@ -233,6 +237,24 @@ host_01J9ZB3KQ8M2T0V4W6X8Y1A3C5</pre>
       destination can be a <code class="inline">~/.ssh/config</code> alias,
       ProxyJump / ControlMaster / keys all come for free from your SSH config.
     </div>
+    <p>
+      <strong>Transcripts stream back on demand.</strong> Every step, fan-out unit
+      and agent run that executes on an SSH host — a whole workflow launched there,
+      or a single <code class="inline">host:</code> / <code class="inline">distribute:</code>
+      unit of a local workflow — shows its transcript in the central CP, live while
+      it runs and complete afterwards. The mirror is <em>lazy</em>: no SSH session
+      is opened for a transcript nobody is looking at. Opening one starts a single
+      shared <code class="inline">tail -F</code> for that file, however many
+      viewers have it open, and it is stopped when the last one leaves. When the run
+      finishes, one batched pull copies every transcript (and the run's usage and
+      coverage streams) to the coordinator, so they stay readable and counted in
+      usage even after the host goes offline or is removed. A transcript the
+      coordinator couldn't finish collecting is labelled <em>partial</em>, never
+      silently cut short. Launches on the remote are detached with
+      <code class="inline">setsid</code> where it exists, else
+      <code class="inline">nohup</code>, so they survive the SSH session on Linux
+      and macOS alike.
+    </p>
 
     <h3>Tunnel (dial-home)</h3>
     <p>
@@ -266,7 +288,7 @@ $ rupu node <span class="v">--cp-url</span> <span class="s">wss://cp.example.com
       verifies an inbound node connection against the hash without ever keeping
       the secret on disk. Tunnel-node runs are mirrored as first-class,
       host-attributed runs in the central store, so they observe and control
-      exactly like local runs (launch, cancel, approve / reject / resume).
+      exactly like local runs (launch, cancel, approve / reject).
     </div>
 
     <h3>Bucket (pull / dead-drop)</h3>
@@ -379,10 +401,28 @@ removed host_01J9Z4W7Q0X8Y6V5K3M2N1P0R8</pre>
         transport that host uses (queued in the bucket for dead-drop hosts).
       </li>
       <li>
+        <strong>Resume a paused run.</strong> Resume works on HTTP hosts (the
+        host's own resume worker runs it) and on SSH hosts, where one SSH command
+        checks the remote's features and runs
+        <code class="inline">rupu workflow resume --if-unfinished</code> — so a run
+        that finished since you asked is refused instead of retried. The CP only
+        asks a host to resume a run it sees as <code class="inline">paused</code>.
+        Tunnel and bucket hosts have no resume path yet.
+      </li>
+      <li>
+        <strong>Loaded host by host.</strong> The Activity tables, the Usage
+        headline and the &#8984;K palette ask each host independently and merge the
+        answers as they arrive, so one slow SSH host never holds the page. SSH
+        listings share a short single-flight cache (cleared by any change you make),
+        which keeps an open, polling table from hammering your hosts.
+      </li>
+      <li>
         <strong>Graceful degradation.</strong> When a host is unreachable, the
-        run-list fan-out tolerates it per-host: that host shows an offline marker
-        and the rest of the page stays intact. Launch or control against an
-        offline host returns a clear error, and live streams auto-reconnect.
+        run-list fan-out tolerates it per-host: that host shows an
+        <em>offline</em> marker (or <em>unavailable</em> when it's reachable but
+        runs a rupu too old to answer) and the rest of the page stays intact.
+        Launch or control against an offline host returns a clear error, and live
+        streams auto-reconnect.
       </li>
     </ul>
     <div class="callout">
@@ -468,6 +508,91 @@ removed host_01J9Z4W7Q0X8Y6V5K3M2N1P0R8</pre>
     <span class="k">prompt</span>: <span class="s">"Apply the migration across the crate."</span></pre>
     <p>See <a class="link" href="/docs/workflows.html">Workflows</a> for the full step format.</p>
 
+    <h3>Local concurrency and host memory</h3>
+    <p>
+      A wide fan-out or a <code class="inline">split:</code> graph can ask for far
+      more concurrent agents than a machine can hold — each one keeps a
+      conversation in memory and spawns tool subprocesses. Every rupu process
+      therefore runs local agent jobs through an <strong>admission gate</strong>
+      with two layers, whatever a workflow's <code class="inline">max_parallel:</code>
+      or <code class="inline">max_concurrency:</code> says:
+    </p>
+    <table>
+      <thead><tr><th>Key (<code>[runtime]</code>)</th><th>Default</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><code>max_concurrent_jobs</code></td><td><code>clamp(RAM_GB / 4, 4, 128)</code></td><td>Hard ceiling on local agent jobs running at once. Env: <code class="inline">RUPU_MAX_CONCURRENT_JOBS</code>.</td></tr>
+        <tr><td><code>min_free_memory_mb</code></td><td><code>max(10% of RAM, 4096)</code></td><td>A new job waits until this much memory is available, read from <code class="inline">/proc/meminfo</code> (Linux) or <code class="inline">vm_stat</code> (macOS). A job held 60 s goes ahead anyway, so a machine whose memory never recovers still makes progress. <code class="inline">0</code> turns the watchdog off. Env: <code class="inline">RUPU_MIN_FREE_MEMORY_MB</code>.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      A throttled step gets a run warning, so a slow fan-out explains itself.
+      Remote units are <strong>not</strong> counted against the coordinator's gate:
+      they spend the remote host's memory, and that host's own gate bounds them.
+    </p>
+
+    <h2>Findings from remote hosts</h2>
+    <p>
+      A remote unit's <a class="link" href="/docs/coverage.html">coverage</a> and
+      <a class="link" href="/docs/findings.html">findings</a> come home through the
+      run's <strong>coverage stream</strong> — the same lines the unit appends to its
+      own ledger, mirrored as it runs. The coordinator merges each unit's stream into
+      the local workspace (re-keyed to the run's scope, de-duplicated, tags routed to
+      the workspace tag log) before the unit's <code class="inline">workspace: sync</code>
+      delta applies. Every transport carries it:
+    </p>
+    <table>
+      <thead><tr><th>Transport</th><th>Coverage stream</th><th>Artifact pull (on first view)</th></tr></thead>
+      <tbody>
+        <tr><td><strong>HTTP</strong></td><td><code>GET /api/runs/:id/coverage</code> on the host</td><td><code>GET /api/findings/artifacts/:sha256</code> on the host</td></tr>
+        <tr><td><strong>SSH</strong></td><td>Tailed live; fetched complete in the terminal pull</td><td>One SSH call running the host's hidden <code class="inline">rupu __findings artifact</code></td></tr>
+        <tr><td><strong>Tunnel</strong></td><td>Mirrored over the tunnel like the run's other files</td><td>Streamed over the tunnel (the node must be online)</td></tr>
+        <tr><td><strong>Bucket</strong></td><td>Numbered <code class="inline">coverage.NNNN.jsonl</code> results, read in order</td><td>Read from <code class="inline">artifacts/&lt;sha256&gt;</code>, uploaded by the worker before it marks the run finished</td></tr>
+      </tbody>
+    </table>
+    <p>
+      A finding's artifacts (proof-of-concept files, evidence images) stay on the
+      host that recorded them until someone opens them; the first view pulls the
+      blob, checks its size and SHA-256 against what was recorded, and keeps it in
+      the coordinator's store. Concurrent first views share one pull, and a blob
+      over the coordinator's own <code class="inline">[findings].artifact_max_bytes</code>
+      is refused without contacting the host. Anything that can't be had — host
+      offline, blob missing, host too old — is reported as unavailable with the
+      reason, and the next view tries again.
+    </p>
+    <div class="callout">
+      <strong>A late or partial stream never fails the unit.</strong> If a stream
+      can't be delivered, can't be merged, or may be incomplete, the step gets a
+      warning and the unit's synced workspace delta keeps its own copy of the
+      coverage files as a fallback. Only a complete stream that merged cleanly
+      replaces it.
+    </div>
+
+    <h2>Feature advertisement</h2>
+    <p>
+      Hosts in a fleet don't all run the same rupu. Rather than guess from version
+      numbers, each host <strong>advertises the features it supports</strong>, and
+      the coordinator only asks for what's advertised: HTTP hosts list them in
+      <code class="inline">/api/host/info</code>, tunnel nodes send them in their
+      hello, bucket workers write a marker file in the bucket, and an SSH host
+      answers the hidden <code class="inline">rupu __features</code> (an older one
+      prints nothing, which reads as no features).
+    </p>
+    <table>
+      <thead><tr><th>Feature</th><th>Lets the coordinator…</th></tr></thead>
+      <tbody>
+        <tr><td><code>agent.findings_profile</code></td><td>Launch a unit with a step's <code class="inline">findings_profile</code>. A host without it refuses the launch rather than run the unit under a different profile.</td></tr>
+        <tr><td><code>run.coverage_stream</code></td><td>Read a remote unit's coverage stream (HTTP).</td></tr>
+        <tr><td><code>findings.artifact_blob</code> / <code>findings.artifact_pull</code></td><td>Pull a finding's artifact from the host (HTTP / tunnel).</td></tr>
+        <tr><td><code>workflow.resume_if_unfinished</code></td><td>Resume a run with the guard that refuses a run that finished since the request.</td></tr>
+        <tr><td><code>run.list</code></td><td>Tell a failing run listing on a current host (an error worth showing) from an old host that can't list runs at all.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      The rule is never to drop a request silently: a feature the peer didn't
+      advertise is refused with an explanation, or the request falls back to the
+      older form and says so in the log.
+    </p>
+
     <h2>Choosing a transport</h2>
     <p>
       All five transports satisfy the same port, so pick by how the host can be
@@ -514,8 +639,16 @@ removed host_01J9Z4W7Q0X8Y6V5K3M2N1P0R8</pre>
           <td><strong>Capability-based scheduling</strong> — picking the host for a run automatically from its advertised backends and capabilities.</td>
         </tr>
         <tr>
+          <td>Live transcripts for tunnel and bucket hosts</td>
+          <td>The lazy transcript mirror SSH hosts use, for the other two mirrored transports. The connector hooks it needs are defined; tunnel and bucket haven't implemented them yet.</td>
+        </tr>
+        <tr>
+          <td>Resume on tunnel and bucket hosts</td>
+          <td>A resume path for paused runs on the two transports that don't have one today.</td>
+        </tr>
+        <tr>
           <td>Remote sessions over the tunnel</td>
-          <td>Interactive, long-lived <strong>sessions</strong> dispatched to a tunnel node (a persistent session worker + reconnect-stable mapping). Today's tunnel covers workflow / agent runs and approve / reject / resume; sessions are deferred.</td>
+          <td>Interactive, long-lived <strong>sessions</strong> dispatched to a tunnel node (a persistent session worker + reconnect-stable mapping). Today's tunnel covers workflow / agent runs and approve / reject; sessions are deferred.</td>
         </tr>
         <tr>
           <td>mTLS hardening</td>
@@ -527,7 +660,7 @@ removed host_01J9Z4W7Q0X8Y6V5K3M2N1P0R8</pre>
     <!-- prev / next footer nav -->
     <div class="doc-nav">
       <a href="/docs/control-plane.html">&#8592; Control plane</a>
-      <a href="/docs/coverage.html">Coverage &#8594;</a>
+      <a href="/docs/netflow.html">Netflow &#8594;</a>
     </div>
   </main>
 </div>

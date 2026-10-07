@@ -11,7 +11,7 @@
 <body>
 <div class="docs-shell">
 
-  <!-- ════ SHARED SIDEBAR — copy verbatim; set .active on THIS page's item ════ -->
+  <!-- ════ SHARED SIDEBAR (copy verbatim into every docs page; set .active) ════ -->
   <aside class="docs-side">
     <a class="brand" href="/" aria-label="rupu home">
       <span class="mark" aria-hidden="true">&#8734;</span>
@@ -25,9 +25,11 @@
     <a class="item" href="/docs/workflows.html">Workflows</a>
     <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
     <a class="item active" href="/docs/sessions.html">Sessions</a>
     <div class="grp">Platform</div>
     <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item" href="/docs/reliability.html">Recovery &amp; reliability</a>
     <a class="item" href="/docs/integrations.html">Integrations</a>
     <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
     <a class="item" href="/docs/triggers.html">Triggers</a>
@@ -35,6 +37,8 @@
     <a class="item" href="/docs/multi-host.html">Multi-host</a>
     <a class="item" href="/docs/netflow.html">Netflow</a>
     <a class="item" href="/docs/coverage.html">Coverage</a>
+    <a class="item" href="/docs/findings.html">Findings</a>
+    <a class="item" href="/docs/customers.html">Customers</a>
     <div class="grp">More</div>
     <a class="item" href="/docs/examples/">Examples</a>
     <a class="item" href="/#download">Download</a>
@@ -107,6 +111,7 @@
         <tr><td><code>attach &lt;session-id&gt;</code></td><td>Attach to the current or last run in a session (the live view).</td></tr>
         <tr><td><code>list</code></td><td>List sessions (<code>--all</code>, <code>--archived</code>).</td></tr>
         <tr><td><code>show &lt;session-id&gt;</code></td><td>Show session details and transcript.</td></tr>
+        <tr><td><code>usage-timeline &lt;session-id&gt;</code></td><td>Per-turn token series across every run the session recorded (table, JSON or CSV).</td></tr>
         <tr><td><code>stop &lt;session-id&gt;</code></td><td>Stop an active session worker.</td></tr>
         <tr><td><code>compact &lt;session-id&gt;</code></td><td>Summarize older turns now to reclaim context window (<code>--window</code>).</td></tr>
         <tr><td><code>archive &lt;session-id&gt;</code></td><td>Archive an inactive session and its owned transcripts.</td></tr>
@@ -155,7 +160,7 @@ $ rupu session <span class="k">list</span></pre>
       Slash commands are the control surface of a live session —
       <code class="inline">/help</code>, <code class="inline">/status</code>,
       <code class="inline">/history</code>, <code class="inline">/transcript</code>,
-      <code class="inline">/runs</code>, <code class="inline">/cancel</code>,
+      <code class="inline">/runs</code>, <code class="inline">/coverage</code>, <code class="inline">/cancel</code>,
       <code class="inline">/compact</code>, <code class="inline">/stop</code>,
       <code class="inline">/detach</code>, and <code class="inline">/quit</code>,
       plus routed roots that reach the rest of the CLI
@@ -199,12 +204,42 @@ $ rupu session <span class="k">list</span></pre>
       <code class="inline">rupu session stop</code> shuts the worker down.
     </p>
     <div class="callout">
-      <strong>Note.</strong> Because the worker is a long-lived daemon, replacing
-      the <code class="inline">rupu</code> binary does <em>not</em> update an
-      already-running session. To pick up new code, stop the session
-      (<code class="inline">rupu session stop &lt;id&gt;</code>) and send again,
-      which starts a fresh worker.
+      <strong>Upgrades take effect on the next turn.</strong> The worker records
+      which <code class="inline">rupu</code> binary started it. When you install a
+      newer build, the next <code class="inline">send</code> notices, prints
+      <code class="inline">&#8635; restarting session worker onto the updated rupu binary</code>,
+      and carries on in a fresh worker with the conversation intact &mdash; no
+      manual <code class="inline">rupu session stop</code> needed.
     </div>
+
+    <h2>When a turn fails</h2>
+    <p>
+      A turn can fail &mdash; the provider refuses, the context window overflows,
+      the recovery ladder runs out. The session does not lose the turn: its prompt
+      and any tool work that completed before the failure stay in the
+      conversation, so your next <code class="inline">send</code> picks up from
+      exactly where it stopped instead of re-asking from scratch. The session's
+      last error names the classified outcome and, when there is one, the hint
+      for what to try next (another model, another provider). Recovery and
+      fallbacks are covered on <a class="link" href="/docs/reliability.html">Reliability</a>.
+    </p>
+
+    <h2>Codenames and attribution</h2>
+    <p>
+      Each session gets one human codename for its whole life &mdash; a crew plus
+      the agent's role, such as <code class="inline">copper-lantern/heron</code>.
+      Turns are numbered, never renamed, so the name in
+      <code class="inline">rupu session list</code>, the transcript and the
+      control plane is the same on turn one and turn forty.
+    </p>
+    <p>
+      If the directory you started the session in is assigned to a
+      <a class="link" href="/docs/customers.html">customer</a>, every turn runs
+      under that customer's config layer and is attributed to it for usage and
+      pricing. The customer is looked up again on each turn, so reassigning the
+      project mid-session applies from the next turn on, while each transcript
+      keeps the customer it actually ran under.
+    </p>
 
     <h2>Sessions in the control plane</h2>
     <p>
@@ -212,6 +247,8 @@ $ rupu session <span class="k">list</span></pre>
       a turn starts, and the transcript streams back token-by-token with a
       "working…" indicator while it's in flight, per-turn errors surfaced inline,
       and final status, tokens, and any failure shown the moment the turn ends.
+      The usage header refreshes while a turn is still running, and the
+      session list can be scoped to one customer.
       This is the same session surface as the CLI — the same on-disk sessions,
       transcripts, and worker — just presented as a turn-by-turn chat in the
       browser instead of the terminal.
@@ -229,7 +266,7 @@ $ rupu session <span class="k">list</span></pre>
 
     <!-- prev / next footer nav -->
     <div class="doc-nav">
-      <a href="/docs/autoflows.html">&#8592; Autoflows</a>
+      <a href="/docs/agentiflows.html">&#8592; Agentiflows</a>
       <a href="/docs/providers.html">Providers &amp; Auth &#8594;</a>
     </div>
   </main>

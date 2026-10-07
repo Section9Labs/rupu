@@ -11,7 +11,7 @@
 <body>
 <div class="docs-shell">
 
-  <!-- ════ SHARED SIDEBAR — copy verbatim; set .active on THIS page's item ════ -->
+  <!-- ════ SHARED SIDEBAR (copy verbatim into every docs page; set .active) ════ -->
   <aside class="docs-side">
     <a class="brand" href="/" aria-label="rupu home">
       <span class="mark" aria-hidden="true">&#8734;</span>
@@ -25,9 +25,11 @@
     <a class="item" href="/docs/workflows.html">Workflows</a>
     <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
     <div class="grp">Platform</div>
     <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item" href="/docs/reliability.html">Recovery &amp; reliability</a>
     <a class="item" href="/docs/integrations.html">Integrations</a>
     <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
     <a class="item" href="/docs/triggers.html">Triggers</a>
@@ -35,6 +37,8 @@
     <a class="item" href="/docs/multi-host.html">Multi-host</a>
     <a class="item" href="/docs/netflow.html">Netflow</a>
     <a class="item active" href="/docs/coverage.html">Coverage</a>
+    <a class="item" href="/docs/findings.html">Findings</a>
+    <a class="item" href="/docs/customers.html">Customers</a>
     <div class="grp">More</div>
     <a class="item" href="/docs/examples/">Examples</a>
     <a class="item" href="/#download">Download</a>
@@ -93,7 +97,8 @@
         <tr><td><strong>Target</strong></td><td>The unit of accumulation &mdash; one per <code>(workspace, scope_name)</code>. Runs against the same target merge into one record.</td></tr>
         <tr><td><strong>Concern</strong></td><td>A single criterion the agent assesses against (e.g. an OWASP or CWE entry), drawn from the effective catalog.</td></tr>
         <tr><td><strong>Assertion</strong></td><td>A <code>(concern, file)</code> verdict with evidence: <code>clean</code>, <code>finding</code>, <code>examined</code>, or <code>not_applicable</code>.</td></tr>
-        <tr><td><strong>Finding</strong></td><td>A reported issue, with severity, location, and remediation.</td></tr>
+        <tr><td><strong>Finding</strong></td><td>A reported issue &mdash; under the default <code>full</code> profile, a complete structured report (see <a class="link" href="/docs/findings.html">Findings</a>).</td></tr>
+        <tr><td><strong>Asset</strong></td><td>Under an <a class="link" href="#engagement-profiles">engagement profile</a>, the thing a finding is about (a host, a service, a route, a binary function&hellip;), with how deeply it was examined.</td></tr>
         <tr><td><strong>Ledger</strong></td><td>The append-only JSONL files that make up a target&rsquo;s record (below). Every row carries <code>run_id</code> + <code>model</code> + <code>surface</code> attribution.</td></tr>
       </tbody>
     </table>
@@ -106,8 +111,11 @@
         <tr><td><code>findings.jsonl</code></td><td>every reported issue</td></tr>
         <tr><td><code>catalog.yaml</code></td><td>the effective concern catalog, snapshotted at run start</td></tr>
         <tr><td><code>runs.jsonl</code></td><td>one manifest per run (its defining inputs, for replay)</td></tr>
+        <tr><td><code>assets.jsonl</code></td><td>the engagement asset ledger (only under an engagement profile)</td></tr>
+        <tr><td><code>findings.jsonl.lock</code></td><td>empty; the lock every writer of <code>findings.jsonl</code> takes</td></tr>
       </tbody>
     </table>
+    <p>One file sits a level up, in <code class="inline">&lt;workspace&gt;/.rupu/coverage/</code> itself, because it spans every target: <code class="inline">finding_tags.jsonl</code>, the workspace&rsquo;s log of finding tag add/remove events (see <a class="link" href="/docs/findings.html#tagging-findings">tagging findings</a>).</p>
     <p>That per-row <code class="inline">run_id</code> + <code class="inline">model</code> + <code class="inline">surface</code> attribution is what makes cross-run and cross-model analysis possible.</p>
 
     <h2>Declaring coverage</h2>
@@ -145,12 +153,13 @@ web-security-default    api-security-default</pre>
       <thead><tr><th>Tool</th><th>Purpose</th></tr></thead>
       <tbody>
         <tr><td><code>coverage_mark</code></td><td>record a <code>(concern, file)</code> verdict + evidence</td></tr>
-        <tr><td><code>report_finding</code></td><td>record an issue (severity, location, remediation)</td></tr>
+        <tr><td><code>report_finding</code></td><td>record an issue &mdash; a complete <code>report</code> under the <code>full</code> profile (default), or <code>summary</code> / <code>severity</code> / <code>evidence</code> under <code>summary</code>; see <a class="link" href="/docs/findings.html">Findings</a></td></tr>
         <tr><td><code>coverage_remaining</code></td><td>list in-scope files still lacking an assertion</td></tr>
         <tr><td><code>coverage_status</code></td><td>summary of assessed-vs-gap progress</td></tr>
         <tr><td><code>coverage_concerns_search</code> / <code>coverage_concerns_detail</code></td><td>search / fetch full bodies for index-mode catalogs</td></tr>
       </tbody>
     </table>
+    <p>Two more tools are <strong>not</strong> injected; grant them explicitly in the agent&rsquo;s <code class="inline">tools:</code>: <code class="inline">query_findings</code> (list the workspace&rsquo;s findings matching a <a class="link" href="/docs/findings.html#querying-findings">findings query</a>) and <code class="inline">tag_findings</code> (add or remove tags). Under an active engagement profile, <code class="inline">asset_mark</code> is offered as well (below).</p>
 
     <h2>Running &amp; auditing</h2>
     <p>All inspection commands take the global <code class="inline">--format table|json|csv</code> flag (<code class="inline">table</code> is the default; structured commands support <code class="inline">table</code>/<code class="inline">json</code>, tabular ones also <code class="inline">csv</code>).</p>
@@ -167,7 +176,8 @@ web-security-default    api-security-default</pre>
     <pre class="code"><span class="k">rupu coverage audit</span> <span class="v">a1b2c3d4e5f6</span>          <span class="c"># human report</span>
 <span class="k">rupu</span> --format json <span class="k">coverage audit</span> <span class="v">a1b2c3d4e5f6</span>   <span class="c"># machine-readable</span>
 <span class="k">rupu</span> --format csv  <span class="k">coverage runs</span>  <span class="v">a1b2c3d4e5f6</span></pre>
-    <p><code class="inline">audit</code> surfaces per-concern coverage, gaps, cross-model attribution, and serendipitous findings; the underlying findings and verdicts come straight from the target&rsquo;s ledger. Because coverage is surface-uniform, runs dispatched through the control plane accumulate into the same target and show up in the same audit.</p>
+    <p><code class="inline">audit</code> surfaces per-concern coverage, gaps, cross-model attribution, and serendipitous findings; the underlying findings and verdicts come straight from the target&rsquo;s ledger. Because coverage is surface-uniform, runs dispatched through the control plane accumulate into the same target and show up in the same audit. Findings themselves have their own command, <code class="inline">rupu findings</code> (list, query, tag, export, import) &mdash; see <a class="link" href="/docs/findings.html">Findings</a>.</p>
+    <p><strong>Remote units.</strong> Every <code class="inline">rupu run</code> also streams its coverage (runs, file touches, assertions, findings, assets, tags) to <code class="inline">runs/&lt;run_id&gt;/coverage.jsonl</code>. When a workflow unit runs on a remote host (<code class="inline">host:</code> / <code class="inline">distribute:</code>), that stream is delivered to the coordinator when the unit ends &mdash; on every transport &mdash; and merged under the coordinator&rsquo;s own targets, so remote work shows up in the same audit. A stream that didn&rsquo;t arrive or may be incomplete raises a step warning rather than failing the unit.</p>
 
     <h3>The rerun &rarr; diff loop</h3>
     <p>Model output varies run-to-run &mdash; sometimes usefully (different angles surface different bugs), but you could never evaluate <em>the combination</em> for completeness. Now you can:</p>
@@ -181,9 +191,47 @@ web-security-default    api-security-default</pre>
     <h3>Determinism</h3>
     <p>Everything the harness controls about what the model sees &mdash; concern ordering, the catalog snapshot, and the live file list &mdash; is byte-stable and independent of the order catalog inputs are declared in. That makes the model the <em>only</em> source of run-to-run variance, which is exactly what <code class="inline">diff</code> measures. The harness does <strong>not</strong> claim byte-identical model output: prompt <em>construction</em> is deterministic; sampling is not.</p>
 
+    <h2 id="engagement-profiles">Engagement profiles</h2>
+    <p>A finding is about an <strong>asset</strong>, and an asset has a <strong>kind</strong>. Code (<code class="inline">file</code> / <code class="inline">function</code>) is one kind; a binary <code class="inline">function@address</code>, a network <code class="inline">host</code> / <code class="inline">service</code>, a cloud <code class="inline">resource</code> and a web <code class="inline">route</code> are others. An <strong>engagement profile</strong> is a pure-data TOML package that declares a domain&rsquo;s asset kinds and their locator coordinates, the evidence blocks and taxonomies it uses, a completeness checklist, and a coverage depth ladder. Adding a new kind of engagement is authoring a profile, not writing code.</p>
+    <div class="callout"><strong>Not a sandbox.</strong> A profile governs how a finding is <em>validated and routed</em>; it does not run, gate or scope tools. Agents reach binaries, hosts and services with bash and whatever tooling they like; rupu records and validates the resulting findings, not the traffic.</div>
+
+    <h3>Selecting a profile</h3>
+    <pre class="code"><span class="k">rupu run</span> --engagement-profile binary  <span class="s">my-agent</span> <span class="s">"reverse this blob"</span>
+<span class="k">rupu run</span> --engagement-profile network <span class="s">my-agent</span> <span class="s">"assess the staging subnet"</span>
+<span class="k">rupu run</span> --engagement-profile network,web <span class="s">my-agent</span> <span class="s">"..."</span>   <span class="c"># repeatable or comma-separated</span>
+<span class="k">rupu run</span> --engagement-profiles pentest <span class="s">my-agent</span> <span class="s">"..."</span>       <span class="c"># a composite = network + web</span></pre>
+    <p>No selection is the native <code class="inline">code</code> path, unchanged. A finding whose asset kind no active profile owns, or an unknown profile id, is a loud error &mdash; never a silent default.</p>
+
+    <h3>Built-in catalog</h3>
+    <pre class="code">code   binary   firmware   network   web   api   cloud   sca
+iac    secrets  container  redteam   threat-model
+<span class="c"># composites</span>
+mobile  = binary + web + MASVS
+pentest = network + web</pre>
+    <p>A composite activates each member as its own routing target, so a <code class="inline">pentest</code> run files a <code class="inline">network:service</code> finding and a <code class="inline">web:route</code> finding side by side, each validated against its own profile. Override or add profiles by dropping a <code class="inline">*.toml</code> under <code class="inline">~/.rupu/profiles/</code> (global) or <code class="inline">.rupu/profiles/</code> (project); later sources win by id (built-in &lt; global &lt; project). A profile that fails to parse fails the launch rather than running under the wrong rules.</p>
+    <pre class="code"><span class="c"># an excerpt of the built-in network profile</span>
+<span class="k">id</span> = <span class="s">"network"</span>
+<span class="k">evidence_blocks</span> = [<span class="s">"text"</span>, <span class="s">"table"</span>, <span class="s">"scan_output"</span>, <span class="s">"http_exchange"</span>, <span class="s">"pcap_ref"</span>]
+
+[[<span class="k">asset_kinds</span>]]
+<span class="k">id</span> = <span class="s">"service"</span>
+<span class="k">parent</span> = <span class="s">"host"</span>
+<span class="k">coordinates</span> = [<span class="s">"host"</span>, <span class="s">"port"</span>]
+
+[[<span class="k">completeness</span>]]
+<span class="k">id</span> = <span class="s">"service_identified"</span>
+<span class="k">required</span> = <span class="v">true</span>
+<span class="k">satisfied_when</span> = { <span class="k">all</span> = [ { <span class="k">locator_has_coordinate</span> = <span class="s">"host"</span> }, { <span class="k">locator_has_coordinate</span> = <span class="s">"port"</span> } ] }
+
+[<span class="k">coverage</span>]
+<span class="k">depth_ladder</span> = [<span class="s">"discovered"</span>, <span class="s">"enumerated"</span>, <span class="s">"tested"</span>, <span class="s">"exploited"</span>]</pre>
+
+    <h3>The asset ledger</h3>
+    <p>Under an active engagement, <code class="inline">report_finding</code> (and <code class="inline">findings.record</code>) take an optional <code class="inline">asset { kind, coordinates }</code>. The kind routes the finding to its owning profile, that profile&rsquo;s <strong>required completeness checks</strong> must pass (e.g. <code class="inline">network</code> requires the service pinned to a host and port), and the asset is stamped into the target&rsquo;s asset ledger, <code class="inline">assets.jsonl</code>. The <code class="inline">asset_mark</code> tool &mdash; offered only under an active engagement &mdash; records how deeply an asset was examined along its profile&rsquo;s depth ladder. Depth is <strong>monotonic</strong>: a shallower mark after a deeper one keeps the deeper rung.</p>
+
     <div class="doc-nav">
-      <a href="/docs/multi-host.html">&#8592; Multi-host</a>
-      <a href="/docs/examples/">Examples &#8594;</a>
+      <a href="/docs/netflow.html">&#8592; Netflow</a>
+      <a href="/docs/findings.html">Findings &#8594;</a>
     </div>
   </main>
 </div>
