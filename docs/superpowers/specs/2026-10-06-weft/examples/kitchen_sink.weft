@@ -1,0 +1,263 @@
+// The legacy kitchen-sink (examples/legacy/kitchen-sink.yaml) in weft.
+// Parity corpus entry #1: the tests at the bottom pin the legacy behaviour.
+
+/// Triage a security issue, investigate in parallel, patch in a loop with a
+/// nested review loop, sign off, open a PR, report an outcome to the owner.
+machine kitchen_sink
+version "1"
+uses agentic
+
+import "./lib/autoflow.weft"                   // Outcome, OutcomeStatus
+
+enum Severity { low, medium, high, critical }
+
+type Triage {
+  actionable: bool
+  files:      list<string>
+  summary:    string
+}
+
+type Audit {
+  suspicious: bool
+  pattern?:   string
+  severity:   Severity
+  notes:      string
+}
+
+type Finding {
+  severity: Severity
+  title:    string
+  body?:    string
+  source?:  string
+}
+
+type Findings { findings: list<Finding> }
+
+type Review {
+  resolved: bool
+  findings: list<Finding>
+  subject:  string
+}
+
+input {
+  /// Repository as owner/name.
+  repo:           string
+  /// Issue number to work on.
+  issue:          int
+  max_files:      int      = 8
+  dry_run:        bool     = false
+  severity_floor: Severity = high
+}
+
+output report : Outcome
+
+trigger manual
+trigger on github.issue.labeled if "security" in event.issue.labels
+  with { repo: event.repo.full_name, issue: event.issue.number }
+
+defaults {
+  on_error fail
+  findings full
+  retry    2x on provider.transient, backoff exp(10s)
+}
+
+limits {
+  concurrency 6
+  wall_clock  12h
+}
+
+on start {
+  tool issues.comment(project: repo, number: issue, body: "🤖 rupu picked this up.")
+}
+
+finally {
+  tool issues.comment(project: repo, number: issue, body: "🤖 run finished: {{ run.outcome }}")
+}
+
+flow {
+  // ── intake ───────────────────────────────────────────────────────────
+  fetch = tool issues.get(project: repo, number: issue)
+
+  triage = agent @security-triager -> Triage (tools: [issues.get, issues.comments], findings: summary) """
+    Issue: {{ fetch.title }}
+    {{ fetch.body | truncate(8000) }}
+
+    Decide whether this is actionable and which files are involved.
+  """
+    timeout 20m
+    retry   2x on agent.output_invalid, backoff fixed(0s)
+
+  if not triage.actionable {
+    tool issues.comment(project: repo, number: issue, body: "Not actionable: {{ triage.summary }}")
+    end not_actionable with { status: complete, summary: "not actionable: {{ triage.summary }}" }
+  }
+
+  // ── investigate: three tracks, continue as soon as any two finish ────
+  investigate = fork (join: 2, losers: cancel, branch_error: continue) {
+    files {
+      audit_ok = approve "Audit {{ triage.files.size() }} files on the fleet?"
+      note "fleet audit approved by {{ audit_ok.by | join(", ") }}"
+      audits = map file in triage.files.take(max_files) (concurrency: 4, key: file, item_error: continue,
+                                                         until: results.any(r => r?.audit.severity == critical)) {
+        audit = agent @code-auditor -> Audit """
+          Audit {{ file }} ({{ index + 1 }}/{{ count }}) for:
+          {{ triage.summary }}
+        """
+        hits = if audit.suspicious and audit.pattern != null {
+          run `rg -n {audit.pattern} {file}` (parse: lines)
+        }
+        yield { file: file, audit: audit, hits: hits }
+      }
+        place distribute(["w1", "w2"], workspace: sync)
+      yield audits
+    }
+
+    deps {
+      run `cargo audit --json` -> json (parse: json, ok_exit: [0, 1])
+        timeout 5m
+        retry   3x on timeout, backoff fixed(30s)
+    }
+
+    history {
+      fork (concurrency: 2) {
+        historian { agent @git-historian "When was the vulnerable code introduced? {{ triage.summary }}" }
+        modeler   { agent @threat-modeler "Model the attack surface: {{ triage.summary }}" }
+      }
+    }
+  }
+
+  // ── patch → test → review; the review loop is nested inside ──────────
+  refine = loop (max: 3, until: ok(verify) and review.resolved, exhausted: continue) {
+    patch = agent @patcher """
+      Iteration {{ loop.iteration }}.
+      Evidence: {{ investigate | tojson | truncate(20000) }}
+      Previous test output: {{ prev.verify?.stderr ?? "(first pass)" | truncate(4000) }}
+      Unresolved review findings: {{ prev.review?.findings ?? [] | tojson }}
+    """
+      place   host("worker-1", workspace: sync)
+      timeout 30m
+
+    verify = run `cargo test --workspace`
+      timeout  20m
+      on_error continue
+
+    review = panel_review(subject: patch, panelists: [@security-reviewer, @maintainability-reviewer],
+                    floor: severity_floor)
+  }
+
+  // ── sign-off ─────────────────────────────────────────────────────────
+  sign_off = approve "Ship the fix for #{{ issue }}? Blocking findings left: {{ review.findings.size() }}" (
+      skip_if:   dry_run,
+      quorum:    1,
+      approvers: collaborators - author,
+      form:      { base: string = "main" },
+      notify:    tool issues.comment(project: repo, number: issue, body: "Fix ready — awaiting sign-off."))
+    after 24h keep_waiting {
+      tool issues.comment(project: repo, number: issue, body: "⏰ sign-off still pending")
+    }
+    after 72h raise approval.timeout
+    catch approval.rejected | approval.timeout as e {
+      tool issues.comment(project: repo, number: issue, body: "Sign-off {{ e.type }}; patch discarded.")
+      end rejected with { status: blocked, summary: "sign-off {{ e.type }}", reason: e.message }
+    }
+
+  // ── ship ─────────────────────────────────────────────────────────────
+  pr = if not dry_run {
+    tool scm.prs.create(owner: repo.split("/")[0], repo: repo.split("/")[1],
+                        title: "security: fix #{{ issue }}",
+                        body:  patch,
+                        head:  "rupu/sec-{{ issue }}",
+                        base:  sign_off.form.base)
+      retry 5x on tool.transient, backoff exp(5s, max: 2m)
+      catch tool.conflict { goto refine }
+  }
+
+  report = agent @reporter -> Outcome """
+    Summarise this run as an Outcome.
+    PR: {{ pr?.url ?? "(dry run — no PR)" }}
+    Tests green: {{ ok(verify) }}; review resolved: {{ review.resolved }}
+  """
+}
+
+/// Panel review with a fix loop. Replaces the legacy `panel:` + `gate:` step kind.
+flow panel_review(subject: string, panelists: list<Agent>, floor: Severity,
+                  fix_with: Agent = @finding-fixer, max: int = 3) -> Review {
+  var current = subject
+  var blocking : list<Finding> = []
+
+  loop (max: max, exhausted: continue) {
+    found = map reviewer in panelists (concurrency: panelists.size()) {
+      r = agent reviewer -> Findings "Review this change:\n{{ current | truncate(30000) }}"
+      yield r.findings.map(f => f.with(source: string(reviewer)))
+    }
+    blocking = found.flatten().filter(f => f.severity >= floor)
+    if blocking.is_empty() { break }
+    if loop.iteration < max {
+      fixed = agent fix_with """
+        Fix these findings, then restate the full, revised subject:
+        {% for f in blocking %}- [{{ f.severity }}] {{ f.title }} ({{ f.source }})
+        {% end %}
+        ---
+        {{ current | truncate(30000) }}
+      """
+      current = fixed
+    }
+  }
+
+  yield { resolved: blocking.is_empty(), findings: blocking, subject: current }
+}
+
+// ── parity tests ─────────────────────────────────────────────────────────
+
+test "non-actionable issues are closed out" {
+  given input { repo: "acme/widget", issue: 7 }
+  mock tool issues.get          returns { title: "typo", body: "docs typo" }
+  mock tool issues.comment      returns {}
+  mock agent @security-triager  returns { actionable: false, files: [], summary: "docs typo" }
+
+  expect tool issues.comment called with { body: contains("Not actionable") }
+  expect end not_actionable
+}
+
+test "happy path opens a PR" {
+  given input { repo: "acme/widget", issue: 9 }
+  mock tool issues.get         returns { title: "overflow", body: "…" }
+  mock tool issues.comment     returns {}
+  mock agent @security-triager returns { actionable: true, files: ["src/a.rs"], summary: "overflow" }
+  mock approve *               returns { by: ["alice"], at: time("2026-10-06T09:00:00Z"), form: { base: "main" } }
+  mock agent @code-auditor     returns { suspicious: false, severity: low, notes: "ok" }
+  mock run `cargo audit --json` returns { exit_code: 0, stdout: "{}", stderr: "", duration: 1s }
+  mock agent @git-historian    returns "introduced in v1.2"
+  mock agent @threat-modeler   returns "network-facing"
+  mock agent @patcher          returns "patch v1"
+  mock run `cargo test --workspace` returns { exit_code: 0, stdout: "ok", stderr: "", duration: 30s }
+  mock agent @security-reviewer        returns { findings: [] }
+  mock agent @maintainability-reviewer returns { findings: [] }
+  mock tool scm.prs.create     returns { number: 41, url: "https://github.com/acme/widget/pull/41" }
+  mock agent @reporter         returns { status: "complete", summary: "fixed", pr_url: "https://github.com/acme/widget/pull/41" }
+
+  expect tool scm.prs.create called 1 times with { base: "main" }
+  expect end completed
+}
+
+test "sign-off times out into rejection" {
+  given input { repo: "acme/widget", issue: 11 }
+  mock tool issues.get         returns { title: "overflow", body: "…" }
+  mock tool issues.comment     returns {}
+  mock agent @security-triager returns { actionable: true, files: ["src/a.rs"], summary: "overflow" }
+  mock agent @code-auditor     returns { suspicious: false, severity: low, notes: "ok" }
+  mock run *                   returns { exit_code: 0, stdout: "{}", stderr: "", duration: 1s }
+  mock agent @git-historian    returns "introduced in v1.2"
+  mock agent @threat-modeler   returns "network-facing"
+  mock agent @patcher          returns "patch v1"
+  mock agent @security-reviewer        returns { findings: [] }
+  mock agent @maintainability-reviewer returns { findings: [] }
+  // approvals are left unmocked: the audit approval is answered, the sign-off is not
+  send approval.approve { id: "investigate.files.audit_ok", by: "alice", form: {} }
+
+  expect waiting at sign_off
+  advance 24h
+  expect tool issues.comment called with { body: contains("still pending") }
+  advance 48h
+  expect end rejected
+}

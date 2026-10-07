@@ -1,0 +1,223 @@
+# ─────────────────────────────────────────────────────────────────────────
+# LEGACY kitchen-sink — today's rupu workflow format (rupu 0.82).
+#
+# A fake "security fix pipeline" that deliberately exercises every current
+# workflow feature, so the new-language version (02-*.weft.yaml) can be
+# checked against it line by line. Validates with the real parser:
+#   rupu workflow show kitchen-sink
+#
+# Features exercised (→ marker in comments):
+#   trigger:event+filter · inputs (string/int/bool/enum, required, default)
+#   defaults · contracts.outputs · notifyIssue · max_concurrency · autoflow
+#   action: · run: (parse json, allow_exit_codes, timeout) · linear agent
+#   actions: narrowing · findings_profile · when: · contract: · branch:
+#   split: / join:{count} · for_each (max_parallel, distribute, workspace,
+#   inline approval, continue_on_error) · parallel: · host: · loops:
+#   (until, max_iterations, on_max, feedback edge) · panel: + gate fix loop
+#   gate node (auto_approve, timeout, on_timeout, notify, on_reject)
+#   next: / depends_on: · template refs (fromjson, item, loop.*, loops.*)
+# ─────────────────────────────────────────────────────────────────────────
+name: kitchen-sink
+description: Triage a security issue, investigate in parallel, patch in a loop, review, sign off, open a PR.
+
+trigger:                                   # → trigger: event + filter
+  on: event
+  event: github.issue.labeled
+  filter: "{{ 'security' in event.issue.labels }}"
+
+inputs:                                    # → typed inputs
+  repo:
+    type: string
+    required: true
+  max_files:
+    type: int
+    default: 8
+  dry_run:
+    type: bool
+    default: false
+  severity_floor:
+    type: string
+    default: high
+    enum: [low, medium, high, critical]
+
+defaults:                                  # → workflow defaults
+  continue_on_error: false
+  findings_profile: full
+
+notifyIssue: true                          # → issue comments at start/end
+max_concurrency: 6                         # → global DAG concurrency cap
+
+autoflow:                                  # → autoflow ownership block
+  enabled: true
+  entity: issue
+  priority: 50
+  selector:
+    states: [open]
+    labels_all: [security]
+    labels_none: [blocked]
+    authors_from: collaborators
+  wake_on: [github.issue.labeled, github.issue.commented]
+  reconcile_every: "30m"
+  claim: { key: issue, ttl: "4h" }
+  workspace: { strategy: worktree, branch: "rupu/sec-{{ issue.number }}" }
+  outcome: { output: result }
+
+contracts:                                 # → named, schema-checked output
+  outputs:
+    result:
+      from_step: report
+      format: json
+      schema: autoflow_outcome_v1
+
+loops:                                     # → bounded subgraph loop
+  refine:
+    nodes: [patch, verify]
+    until: "{{ steps.verify.success }}"
+    max_iterations: 3
+    on_max: proceed
+
+steps:
+  # ── intake ─────────────────────────────────────────────────────────────
+  - id: fetch                              # → action: connector step
+    action: issues.get
+    with:
+      project: "{{ inputs.repo }}"
+      number: "{{ event.issue.number }}"
+    next: [triage]
+
+  - id: triage                             # → linear agent + actions narrowing
+    agent: security-triager
+    actions: [issues.get, issues.comments]
+    findings_profile: summary
+    contract: { emits: triage_v1, format: json }
+    prompt: |
+      Issue: {{ (steps.fetch.output | fromjson).title }}
+      {{ (steps.fetch.output | fromjson).body }}
+      Reply JSON: {"actionable": bool, "files": [paths], "summary": str}
+    next: [check]
+
+  - id: check                              # → branch: (DAG mode = reachability prune)
+    branch:
+      condition: "{{ (steps.triage.output | fromjson).actionable }}"
+      then: [fanout]
+      else: [close_out]
+
+  # ── investigate: 3 concurrent tracks, continue when any 2 finish ───────
+  - id: fanout                             # → split:
+    split: [recon_files, recon_deps, recon_history]
+
+  - id: recon_files                        # → for_each fan-out, placed
+    agent: code-auditor
+    for_each: "{{ (steps.triage.output | fromjson).files | tojson }}"
+    max_parallel: 4
+    continue_on_error: true
+    distribute: { hosts: [w1, w2] }
+    workspace: sync
+    approval:                              # → inline approval
+      required: true
+      prompt: "Audit {{ (steps.triage.output | fromjson).files | length }} files on the fleet?"
+    prompt: |
+      Audit {{ item }} ({{ loop.index }}/{{ loop.length }}) for the issue:
+      {{ (steps.triage.output | fromjson).summary }}
+    next: [gather]
+
+  - id: recon_deps                         # → run: deterministic command
+    run:
+      cmd: cargo
+      args: ["audit", "--json"]
+      parse: json
+      timeout_seconds: 300
+      allow_exit_codes: [0, 1]
+    next: [gather]
+
+  - id: recon_history                      # → parallel: specialists
+    max_parallel: 2
+    parallel:
+      - id: historian
+        agent: git-historian
+        prompt: "When was the vulnerable code introduced? {{ (steps.triage.output | fromjson).summary }}"
+      - id: modeler
+        agent: threat-modeler
+        prompt: "Model the attack surface: {{ (steps.triage.output | fromjson).summary }}"
+    next: [gather]
+
+  - id: gather                             # → join: { count }
+    join: { wait: { count: 2 } }
+    next: [patch]
+
+  # ── patch/verify loop (loops.refine) ───────────────────────────────────
+  - id: patch                              # → host: placement + loop feedback
+    agent: patcher
+    host: worker-1
+    workspace: sync
+    prompt: |
+      Iteration {{ loops.refine.iteration }}. Evidence: {{ steps.gather.results | tojson }}
+      Previous test output (empty on first pass): {{ steps.verify.stderr }}
+    next: [verify]
+
+  - id: verify                             # → run: + exit-code gating
+    run:
+      cmd: cargo
+      args: ["test", "--workspace"]
+      timeout_seconds: 1200
+    continue_on_error: true
+    next: [review]
+
+  # ── review panel with fix loop ─────────────────────────────────────────
+  - id: review                             # → panel: + gate
+    panel:
+      panelists: [security-reviewer, maintainability-reviewer]
+      subject: "{{ steps.patch.output }}"
+      max_parallel: 2
+      gate:
+        until_no_findings_at_severity_or_above: high
+        fix_with: finding-fixer
+        max_iterations: 3
+    next: [sign_off]
+
+  - id: sign_off                           # → gate node (full feature set)
+    approval:
+      prompt: "Ship the fix for #{{ event.issue.number }}? Max severity left: {{ steps.review.max_severity }}"
+      timeout_seconds: 259200
+      on_timeout: reject
+      auto_approve: "{{ inputs.dry_run }}"
+      notify:
+        - action: issues.comment
+          with:
+            project: "{{ inputs.repo }}"
+            number: "{{ event.issue.number }}"
+            body: "Fix ready — awaiting sign-off."
+      on_reject:
+        - id: rollback_note
+          action: issues.comment
+          with:
+            project: "{{ inputs.repo }}"
+            number: "{{ event.issue.number }}"
+            body: "Sign-off rejected; patch discarded."
+    next: [open_pr]
+
+  - id: open_pr                            # → action: + when:
+    when: "{{ not inputs.dry_run }}"
+    action: scm.prs.create
+    with:
+      owner: acme
+      repo: widget
+      title: "security: fix #{{ event.issue.number }}"
+      body: "{{ steps.patch.output }}"
+      head: "rupu/sec-{{ event.issue.number }}"
+      base: main
+    next: [report]
+
+  - id: close_out                          # → the branch's else arm
+    action: issues.comment
+    with:
+      project: "{{ inputs.repo }}"
+      number: "{{ event.issue.number }}"
+      body: "Not actionable: {{ (steps.triage.output | fromjson).summary }}"
+
+  - id: report                             # → depends_on:, contract source
+    agent: reporter
+    depends_on: [open_pr]
+    prompt: |
+      Emit autoflow_outcome_v1 JSON. PR: {{ steps.open_pr.output }}
+      Loop converged: {{ loops.refine.converged }}; review resolved: {{ steps.review.resolved }}

@@ -1,0 +1,122 @@
+// An autoflow, written as what it really is: a long-lived, entity-scoped
+// state machine. Replaces the `autoflow:` block on the legacy kitchen-sink
+// and the implicit ClaimStatus logic in rupu's autoflow tick.
+
+/// Owns one security issue from "labeled security" until it is closed or released.
+machine security_issue_owner
+version "1"
+uses agentic
+
+import "./lib/autoflow.weft"                    // Outcome, OutcomeStatus, Dispatch
+
+instance per issue keyed entity.ref {
+  select {
+    states       [open]
+    labels_all   [security]
+    labels_none  [blocked]
+    authors_from collaborators
+    on_skip      skip
+  }
+  priority  50
+  yield     unless in [working, blocked]
+  lease     4h, renew while active
+  inbox     queue
+  debounce  2m
+  workspace worktree, branch "rupu/sec-{{ entity.number }}"
+  retain    7d
+}
+
+var attempts    = 0
+var cycles      = 0
+var retry_after : duration = 10m
+var last_error  : Error?   = null
+var dispatches  = 0
+
+limits { wall_clock 90d }
+
+// Handlers active in every state.
+on github.issue.closed                                 -> released
+on github.issue.unlabeled if event.label == "security" -> released
+on operator.release                                    -> released
+
+/// Run the work machine; route on its outcome.
+initial state working {
+  entry { cycles = cycles + 1 }
+  do call machine kitchen_sink(repo: entity.repo, issue: entity.number)
+
+  on done if output.status == complete                          -> complete
+  on done if output.status == retry                             -> backoff {
+    attempts    = attempts + 1
+    retry_after = output.retry_after ?? 10m
+  }
+  on done if output.status == await_external                    -> awaiting_external
+  on done if output.status == dispatch and output.dispatch != null -> dispatching(output.dispatch)
+  on done if output.status == blocked                           -> blocked { last_error = null }
+  on done                                                       -> watching
+  on failure as e                                               -> blocked { last_error = e }
+}
+
+/// Idle until something happens on the issue, or the reconcile interval elapses.
+state watching {
+  on github.issue.commented -> working
+  on github.issue.labeled   -> working
+  after 30m                 -> working
+  if cycles >= 100          -> rolling_over         // bound the journal
+}
+
+/// Retry after the delay the work machine asked for; give up after 5 attempts.
+state backoff {
+  if attempts > 5   -> blocked
+  after retry_after -> working
+}
+
+/// Waiting on something outside rupu, typically a human merging the PR.
+state awaiting_external {
+  on github.pr.merged -> complete
+  on github.pr.closed -> working
+  after 7d            -> blocked
+}
+
+/// Hand the issue to another machine, then resume watching.
+state dispatching(d: Dispatch) {
+  entry { dispatches = dispatches + 1 }
+  do call machine (d.workflow)(d.inputs)
+  on done         -> watching
+  on failure as e -> blocked { last_error = e }
+}
+
+/// Needs a human. Reminds daily; resumes on operator.repair.
+state blocked {
+  on operator.repair -> working { attempts = 0 }
+  after 24h -> blocked (reenter) {
+    tool issues.comment(project: entity.repo, number: entity.number,
+                        body: "rupu is blocked: {{ last_error?.message ?? "see the run log" }}")
+  }
+}
+
+/// Continue-as-new: fresh journal, same key, newest definition.
+state rolling_over {
+  flow { restart with { attempts: attempts, retry_after: retry_after } at watching }
+}
+
+final state complete
+final state released
+
+test "retry outcome backs off then re-runs" {
+  given entity { ref: "github:acme/widget#3", repo: "acme/widget", number: 3, labels: ["security"], state: "open" }
+  mock call machine kitchen_sink returns sequence [
+    { status: "retry", summary: "flaky CI", retry_after: 1h },
+    { status: "complete", summary: "fixed" } ]
+
+  expect in_state "backoff"
+  advance 1h
+  expect end complete
+}
+
+test "closing the issue releases ownership from any state" {
+  given entity { ref: "github:acme/widget#4", repo: "acme/widget", number: 4, labels: ["security"], state: "open" }
+  mock call machine kitchen_sink returns { status: "ongoing", summary: "waiting" }
+  expect in_state "watching"
+  send github.issue.closed { issue: { number: 4, ref: "github:acme/widget#4" } }
+  expect end released
+}
