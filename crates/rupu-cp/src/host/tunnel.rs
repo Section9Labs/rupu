@@ -448,7 +448,15 @@ impl HostConnector for TunnelHostConnector {
     }
 
     async fn stream_run_events(&self, run_id: &str) -> Result<EventByteStream, HostConnectorError> {
-        mirror_stream_run_events(&self.run_store, &self.node_id, run_id).await
+        self.stream_run_events_after(run_id, 0).await
+    }
+
+    async fn stream_run_events_after(
+        &self,
+        run_id: &str,
+        after: u64,
+    ) -> Result<EventByteStream, HostConnectorError> {
+        mirror_stream_run_events(&self.run_store, &self.node_id, run_id, after).await
     }
 
     async fn get_transcript(&self, path: &str) -> Result<serde_json::Value, HostConnectorError> {

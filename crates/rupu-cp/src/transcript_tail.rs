@@ -92,6 +92,52 @@ impl Stream for TranscriptTail {
     }
 }
 
+/// One item of a resumable transcript stream ([`sequenced`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum TranscriptFrame {
+    /// The `id`-th event of the transcript (1-based).
+    Event { id: u64, event: Box<Event> },
+    /// The transcript reached its `run_complete`; the stream ends after this.
+    End,
+}
+
+/// Number `events` (a transcript, from its first line) and resume after
+/// event `after` (a client's `Last-Event-ID`): events up to it are read but
+/// not passed on. After a `run_complete` event one [`TranscriptFrame::End`]
+/// follows and the stream ends — a run writes nothing after it. A reconnect
+/// whose resume point is past the end gets the end at once.
+pub fn sequenced(
+    events: impl Stream<Item = Event>,
+    after: u64,
+) -> impl Stream<Item = TranscriptFrame> {
+    use futures_util::StreamExt as _;
+    let state = (Box::pin(events), 0u64, false, false);
+    futures_util::stream::unfold(state, move |(mut events, mut seq, end_next, done)| async move {
+        if done {
+            return None;
+        }
+        if end_next {
+            return Some((TranscriptFrame::End, (events, seq, false, true)));
+        }
+        loop {
+            let ev = events.next().await?;
+            seq += 1;
+            let last = matches!(ev, Event::RunComplete { .. });
+            if seq <= after {
+                if last {
+                    return Some((TranscriptFrame::End, (events, seq, false, true)));
+                }
+                continue;
+            }
+            let frame = TranscriptFrame::Event {
+                id: seq,
+                event: Box::new(ev),
+            };
+            return Some((frame, (events, seq, last, false)));
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

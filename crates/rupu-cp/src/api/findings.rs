@@ -851,6 +851,18 @@ async fn list_findings(
     Ok(Json(resp))
 }
 
+/// A [`rupu_coverage::TagError`] as an API error: the tag log failing to
+/// write (`Io` / `Encode`) is this server's fault, a 500; everything else is
+/// a bad change, a 400.
+fn tag_error(e: rupu_coverage::TagError) -> ApiError {
+    match e {
+        rupu_coverage::TagError::Io(_) | rupu_coverage::TagError::Encode(_) => {
+            ApiError::internal(e.to_string())
+        }
+        other => ApiError::bad_request(other.to_string()),
+    }
+}
+
 /// At most this many findings per `POST /api/findings/tags`.
 const MAX_TAG_BATCH: usize = 1000;
 
@@ -910,9 +922,7 @@ async fn tag_findings(
     }
     .into_change()
     .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    change
-        .check()
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    change.check().map_err(tag_error)?;
     let global = s.global_dir.clone();
     let by = rupu_coverage::TagActor::operator(rupu_coverage::OperatorSurface::Cp);
     let result = tokio::task::spawn_blocking(move || {
@@ -920,7 +930,7 @@ async fn tag_findings(
     })
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?
-    .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    .map_err(tag_error)?;
     if result.workspaces.is_empty() {
         return Err(ApiError::not_found(format!(
             "unknown finding id(s): {}",
@@ -2316,6 +2326,16 @@ mod tests {
         let mut f = finding(id, severity, declared_at);
         f.record.declared_by = attribution_run(run_id);
         f
+    }
+
+    #[test]
+    fn a_tag_log_write_failure_is_a_500_a_bad_change_a_400() {
+        let io = tag_error(rupu_coverage::TagError::Io(std::io::Error::other(
+            "disk full",
+        )));
+        assert_eq!(io.0, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        let bad = tag_error(rupu_coverage::TagError::EmptyChange);
+        assert_eq!(bad.0, axum::http::StatusCode::BAD_REQUEST);
     }
 
     #[test]

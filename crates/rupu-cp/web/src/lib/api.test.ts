@@ -913,7 +913,35 @@ class FakeEventSource {
   emitMessage(data: unknown): void {
     this.onmessage?.({ data: JSON.stringify(data) });
   }
+
+  listeners: Record<string, (() => void)[]> = {};
+
+  addEventListener(type: string, fn: () => void): void {
+    (this.listeners[type] ??= []).push(fn);
+  }
+
+  emitNamed(type: string): void {
+    this.listeners[type]?.forEach((fn) => fn());
+  }
 }
+
+describe('one-run streams', () => {
+  it('close on the server\'s `end` event, so the browser never reconnects to a finished run', async () => {
+    vi.stubGlobal('EventSource', FakeEventSource);
+    FakeEventSource.instances = [];
+    const { api } = await import('./api');
+    api.subscribeRunLog('run_1', () => {});
+    api.subscribeEvents(() => {}, { run: 'run_1' });
+    api.subscribeTranscript('/t.jsonl', () => {});
+    expect(FakeEventSource.instances).toHaveLength(3);
+    for (const es of FakeEventSource.instances) {
+      expect(es.closed).toBe(false);
+      es.emitNamed('end');
+      expect(es.closed).toBe(true);
+    }
+    vi.unstubAllGlobals();
+  });
+});
 
 describe('subscribeEvents shared firehose', () => {
   beforeEach(() => {

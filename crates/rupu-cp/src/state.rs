@@ -20,6 +20,11 @@ pub struct AppState {
     /// The resolved global config snapshot, reloaded after a config write so
     /// newly-started runs see updated values. Read via `config.read()`.
     pub config: Arc<RwLock<rupu_config::Config>>,
+    /// The global config as it was when this process started: what the
+    /// start-time-only settings (`rupu cp serve`'s background loops) still
+    /// run with. `PUT /api/config/global` compares against it to say which
+    /// saved changes need a restart.
+    pub boot_config: Arc<rupu_config::Config>,
     /// Optional run-launcher port. Defaults to `None`; rupu-cli's `cp serve`
     /// installs a subprocess-spawning adapter via [`AppState::with_launcher`].
     pub launcher: Option<Arc<dyn crate::launcher::RunLauncher>>,
@@ -139,7 +144,9 @@ impl AppState {
             ),
         );
 
-        let config = Arc::new(RwLock::new(Self::resolve_global_config(&global_dir)));
+        let boot = Self::resolve_global_config(&global_dir);
+        let boot_config = Arc::new(boot.clone());
+        let config = Arc::new(RwLock::new(boot));
 
         Self {
             global_dir,
@@ -148,6 +155,7 @@ impl AppState {
             pricing,
             customer_pricing,
             config,
+            boot_config,
             launcher: None,
             session_sender: None,
             repos: None,

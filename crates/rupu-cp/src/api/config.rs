@@ -229,9 +229,51 @@ async fn write_atomic_blocking(path: PathBuf, contents: String) -> ApiResult<()>
         .map_err(|e| ApiError::internal(e.to_string()))
 }
 
+/// The global keys `rupu cp serve` reads once, at start (its background
+/// loops: whether each runs, and how often). A saved change to one of them
+/// applies only after a restart.
+pub(crate) fn restart_required(
+    boot: &rupu_config::Config,
+    now: &rupu_config::Config,
+) -> Vec<String> {
+    let (b, n) = (&boot.cp, &now.cp);
+    [
+        (
+            "cp.autoflow_reconcile_enabled",
+            b.autoflow_reconcile_enabled != n.autoflow_reconcile_enabled,
+        ),
+        (
+            "cp.autoflow_reconcile_interval_secs",
+            b.autoflow_reconcile_interval_secs != n.autoflow_reconcile_interval_secs,
+        ),
+        (
+            "cp.cron_tick_enabled",
+            b.cron_tick_enabled != n.cron_tick_enabled,
+        ),
+        (
+            "cp.cron_tick_interval_secs",
+            b.cron_tick_interval_secs != n.cron_tick_interval_secs,
+        ),
+        (
+            "cp.gate_sweep_enabled",
+            b.gate_sweep_enabled != n.gate_sweep_enabled,
+        ),
+        (
+            "cp.gate_sweep_interval_secs",
+            b.gate_sweep_interval_secs != n.gate_sweep_interval_secs,
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, changed)| *changed)
+    .map(|(k, _)| k.to_string())
+    .collect()
+}
+
 /// `PUT /api/config/global` — persist a global config edit, then reload
 /// `AppState.config` so already-running handlers observe the update without
-/// a process restart.
+/// a process restart. `restart_required` lists the start-time-only keys
+/// ([`restart_required`]) whose saved value now differs from the one this
+/// process started with — set, they take effect only after a restart.
 async fn put_global(
     State(s): State<AppState>,
     Json(body): Json<ConfigWriteBody>,
@@ -242,8 +284,13 @@ async fn put_global(
     let cand = candidate_toml(&body, &existing)?;
     write_atomic_blocking(path, cand).await?;
     s.reload_config();
+    let pending = s
+        .config
+        .read()
+        .map(|now| restart_required(&s.boot_config, &now))
+        .unwrap_or_default();
     Ok(Json(
-        serde_json::json!({ "ok": true, "restart_required": [] }),
+        serde_json::json!({ "ok": true, "restart_required": pending }),
     ))
 }
 

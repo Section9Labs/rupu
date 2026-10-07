@@ -385,8 +385,11 @@ fn read_events_counting_unparsed(
 /// Validation runs first and is the SAME security boundary as the static
 /// [`get_transcript`] endpoint (400 on an invalid / out-of-root path). On
 /// success, opens a [`TranscriptTail`] and maps each parsed
-/// [`rupu_transcript::Event`] to an SSE `data:` line of JSON; the connection
-/// stays open, emitting events as the transcript grows.
+/// [`rupu_transcript::Event`] to an SSE `data:` line of JSON with its position
+/// in the file as `id:`, emitting events as the transcript grows. A
+/// reconnect's `Last-Event-ID` resumes after that event, and after
+/// `run_complete` an `end` event closes the stream
+/// ([`crate::transcript_tail::sequenced`]).
 ///
 /// With `?host=<remote-id>`: the same lazy-cache plan as [`get_transcript`],
 /// except an incomplete cache is fed by [`HostConnector::ensure_transcript_feed`]
@@ -398,7 +401,15 @@ fn read_events_counting_unparsed(
 /// (typically a 400, since a genuinely remote path is never local).
 ///
 /// [`TranscriptTail`]: crate::transcript_tail::TranscriptTail
-async fn stream_transcript(State(s): State<AppState>, Query(q): Query<PathQ>) -> Response {
+async fn stream_transcript(
+    State(s): State<AppState>,
+    Query(q): Query<PathQ>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    // Events are numbered (`id:`) from the transcript's first line; a
+    // reconnect's `Last-Event-ID` resumes after it, and the stream ends with
+    // an `end` event after `run_complete` (`transcript_tail::sequenced`).
+    let after = crate::sse::last_event_id(&headers);
     let host_id = q.host.as_deref().unwrap_or("local");
     // Held for the SSE stream's lifetime (moved into the map closure below).
     let mut guard: Option<FeedGuard> = None;
@@ -456,10 +467,17 @@ async fn stream_transcript(State(s): State<AppState>, Query(q): Query<PathQ>) ->
         Ok(t) => t,
         Err(e) => return ApiError::internal(e.to_string()).into_response(),
     };
-    let stream = hold_while_streaming(tail, guard).map(|ev| {
-        let sse = SseEvent::default()
-            .json_data(&ev)
-            .unwrap_or_else(|_| SseEvent::default().comment("event serialize error"));
+    let frames = crate::transcript_tail::sequenced(tail, after);
+    let stream = hold_while_streaming(frames, guard).map(|frame| {
+        let sse = match frame {
+            crate::transcript_tail::TranscriptFrame::Event { id, event } => SseEvent::default()
+                .id(id.to_string())
+                .json_data(&event)
+                .unwrap_or_else(|_| SseEvent::default().comment("event serialize error")),
+            crate::transcript_tail::TranscriptFrame::End => {
+                SseEvent::default().event("end").data("{}")
+            }
+        };
         Ok::<_, Infallible>(sse)
     });
     Sse::new(stream)

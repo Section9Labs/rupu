@@ -3396,6 +3396,7 @@ export const api = {
     const qs = opts?.host ? `?host=${encodeURIComponent(opts.host)}` : '';
     const es = new EventSource(`/api/runs/${encodeURIComponent(id)}/log${qs}`);
     es.onmessage = (m) => onEvent(JSON.parse(m.data) as RunEvent);
+    closeOnEnd(es);
     if (onError) es.onerror = onError;
     return () => es.close();
   },
@@ -3461,6 +3462,7 @@ export const api = {
     if (opts?.host) q.set('host', opts.host);
     const es = new EventSource(`/api/events/stream?${q.toString()}`);
     es.onmessage = (m) => onEvent(JSON.parse(m.data) as RunEvent);
+    closeOnEnd(es);
     if (onError) es.onerror = onError;
     if (onOpen) es.onopen = () => onOpen();
     return () => es.close();
@@ -3671,6 +3673,7 @@ export const api = {
     if (opts?.run) url += `&run=${encodeURIComponent(opts.run)}`;
     const es = new EventSource(url);
     es.onmessage = (m) => onEvent(JSON.parse(m.data) as TranscriptEvent);
+    closeOnEnd(es);
     if (onError) es.onerror = onError;
     return () => es.close();
   },
@@ -3706,6 +3709,14 @@ export const api = {
     return request<AstResponse>(url);
   },
 };
+
+/** A one-run or transcript stream ends with a named `end` event once there
+ *  is nothing more to send; close on it, or the browser would reconnect (and
+ *  be told "end" again) forever. A reconnect after a dropped connection
+ *  sends `Last-Event-ID` itself, and the server resumes after it. */
+function closeOnEnd(es: EventSource): void {
+  es.addEventListener('end', () => es.close());
+}
 
 /** `?ws_id=` (or `&ws_id=`) for the finding-id routes, or `''`. */
 function wsQuery(wsId: string | null | undefined, sep: '?' | '&'): string {

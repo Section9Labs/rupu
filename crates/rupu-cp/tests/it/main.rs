@@ -10,6 +10,7 @@ mod auth;
 mod autoflows;
 mod bucket_e2e;
 mod common;
+mod config_api;
 mod coverage;
 mod customer_filter;
 mod customers;

@@ -132,8 +132,10 @@ Three endpoints stream `text/event-stream`:
 | `GET /api/runs/:id/log` | One run's step events. |
 | `GET /api/transcript/stream?path=…` | One transcript's events. |
 
-Every frame is an unnamed `data:` line carrying one JSON event (no `event:` or
-`id:` fields):
+Every frame is an unnamed `data:` line carrying one JSON event. On the one-run
+and transcript streams it also carries an `id:` — the event's 1-based position
+in its file — and the stream ends with a named `end` event (see below). The
+firehose has neither.
 
 - Run streams carry `rupu_orchestrator::executor::Event`, internally tagged:
   `{"type": "step_started", ...}`.
@@ -141,24 +143,39 @@ Every frame is an unnamed `data:` line carrying one JSON event (no `event:` or
   `{"type": "...", "data": {...}}` (see [`transcript-schema.md`](transcript-schema.md)).
 
 ```
+id: 2
 data: {"type":"step_started","run_id":"01JEXAMPLE...","step_id":"triage",...}
 
 : keep-alive
+
+id: 9
+data: {"type":"run_completed",...}
+
+event: end
+data: {}
 ```
 
 Behaviour worth knowing:
 
-- **Replay on connect.** A stream sends the file's whole history from the start,
-  then tails it (polled every 250 ms). Reconnecting replays it again;
-  `Last-Event-ID` is not supported. De-duplicate on the client if you reconnect.
+- **Replay, then resume.** A stream sends the file's history from the start,
+  then tails it (polled every 250 ms). A one-run or transcript stream honours
+  `Last-Event-ID`: it resumes after that event instead of replaying it.
+  Browsers' `EventSource` sends the header on its own when it reconnects.
 - **Keep-alive** is a comment line every 15 s.
-- **Streams don't end** when the run does; close them yourself.
+- **Ending.** A one-run stream ends once the run is over: after a
+  `run_completed` / `run_failed` event, if the run's record is terminal (a gate
+  park or a pause is not), one `event: end` frame follows and the connection
+  closes. A transcript stream ends the same way after `run_complete`. Close
+  your `EventSource` on `end`, or it will reconnect and get `end` again. A
+  reconnect at or past the end gets just the `end`. The firehose never ends.
 - **Firehose scope.** The firehose follows runs in the run store — workflows and
   autoflows. Standalone agent runs and session turns never appear on it.
   It attaches to active runs at start, then to any new run id it sees (checked
   once a second), and drops a run's tail 30 s after it finishes.
-- **Remote hosts.** With `host=<remote>`, the remote's stream is passed through
-  unchanged; `/api/events/stream` then requires `run`.
+- **Remote hosts.** With `host=<remote>`, the remote's run stream is passed
+  through; `/api/events/stream` then requires `run`. `Last-Event-ID` reaches
+  it: a mirror-backed host (SSH, tunnel, bucket) resumes from the
+  coordinator's mirror, and an HTTP host gets the header forwarded.
 - Sessions and run lists have no stream; the UI polls them.
 
 ```sh
@@ -293,7 +310,7 @@ Query language, tags and report export are covered in depth in
 | GET | `/api/findings/:id/export` | One finding as a report file. | `format=md\|html\|pdf` (required), `ws_id`. 400 bad format; 501 PDF in a build without the `pdf` feature; 404; 409 ambiguous id, as above. |
 | POST | `/api/findings/export` | Several findings as one report. | Body `ExportBody`: `format` (required), `title`, `ids`, `ws_id`, `run_id`, `min_severity`, `owner`, `cwe`, `include_summaries`, `split`. Returns `text/markdown`, `text/html`, `application/pdf`, or `application/zip` when `split`; always an attachment with `nosniff`. 404 when nothing matches. |
 | GET | `/api/findings/tags` | Tags in use, most used first. | Query: `ws_id`. |
-| POST | `/api/findings/tags` | Add / remove tags on many findings. | Body `{finding_ids, add, remove}` — each id tagged in every workspace that holds it — or `{findings: [{ws_id, id}], add, remove}` — each finding tagged only in its own workspace (what the web sends). Exactly one of `finding_ids` / `findings`; at most 1000. Atomic per workspace; response `TagAcrossResult {workspaces, unknown}`. 404 only when *every* finding is unknown. Recorded as `via: cp`. |
+| POST | `/api/findings/tags` | Add / remove tags on many findings. | Body `{finding_ids, add, remove}` — each id tagged in every workspace that holds it — or `{findings: [{ws_id, id}], add, remove}` — each finding tagged only in its own workspace (what the web sends). Exactly one of `finding_ids` / `findings`; at most 1000. Atomic per workspace; response `TagAcrossResult {workspaces, unknown}` — a workspace whose tag log couldn't be written carries its `error` there. 400 for a bad change (empty, conflicting, too many tags); 500 if writing the tag log fails outright. 404 only when *every* finding is unknown. Recorded as `via: cp`. |
 | GET | `/api/findings/:id/artifacts/:sha256` | An artifact or evidence-block file the finding references. | `ws_id`; 409 for an ambiguous id, as above. Text inline as `text/plain`, raster images inline as `image/*`, everything else as an attachment; always `nosniff` + `Content-Security-Policy: sandbox`. 404 if the finding doesn't reference it; 409 if a referenced workspace file changed since it was recorded; a remote artifact is pulled from its host on first view, and a failed pull is 404 `{"unavailable": reason}`. |
 | GET | `/api/findings/artifacts/:sha256` | **Host-internal.** Raw blob from this host's artifact store. | Used by a coordinator pulling a remote unit's artifact (`findings.artifact_blob` feature). Not finding-scoped. 404 if not in the store. |
 
@@ -396,7 +413,7 @@ and pulls back the diff. The web UI never calls these.
 | Method | Path | Purpose | Notes |
 |--------|------|---------|-------|
 | GET | `/api/config` | Effective config with per-key provenance and each layer's raw TOML (`ConfigView`). | `project` (ws id) or `customer` (slug), not both. Includes `status {bind, token_set, restart_required_keys}` — the token itself is never returned. A malformed layer is 200 with `layer_error`. |
-| PUT | `/api/config/global` | Write the global config. | Body `ConfigWriteBody {raw?, patch?}`. 400 invalid TOML. Validated, backed up, written atomically. |
+| PUT | `/api/config/global` | Write the global config. | Body `ConfigWriteBody {raw?, patch?}`. 400 invalid TOML. Validated, backed up, written atomically. Response `{ok, restart_required}`: the start-time-only keys (`cp.{autoflow_reconcile,cron_tick,gate_sweep}_{enabled,interval_secs}` — `cp serve`'s background loops) whose saved value now differs from the one the server started with; they apply after a restart. Everything else applies at once. |
 | PUT | `/api/config/customer/:slug` | Write a customer's layer. | 400 for a globally locked key or a layer that doesn't validate on top of global. |
 | PUT | `/api/config/project/:id` | Write a project's `.rupu/config.toml`. | 400 for a locked key or a project whose `.rupu/` is the global dir. |
 | PUT | `/api/config/policy` | Set the global `[policy].lock`. | Body `{lock: [...]}`. |
