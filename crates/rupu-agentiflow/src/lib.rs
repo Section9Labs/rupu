@@ -14,6 +14,7 @@ mod goal;
 mod lead;
 mod operator;
 mod proc;
+pub mod reaper;
 mod roster;
 mod run;
 mod status_tools;
@@ -47,7 +48,11 @@ pub use lead::{
     ProviderFactory, RunAgentLeadDriver,
 };
 pub use operator::{OperatorMessage, OperatorQueue};
-pub use proc::{pid_is_running, terminate_pid};
+pub use proc::{kill_group, pid_is_running, terminate_group, terminate_pid};
+pub use reaper::{
+    finalize_failed, hard_stop, hard_stop_with, reap_orphaned_agentiflows,
+    reap_orphaned_agentiflows_with, HardStopGrace, HardStopOutcome, ReapSummary,
+};
 pub use roster::{roster_collector, roster_tools, RosterCollector, RosterCtx};
 pub use run::{
     agentiflow_dir, new_run_id, run_agentiflow, AgentiflowRecord, GoalStatus, LeadInputs,
@@ -55,9 +60,10 @@ pub use run::{
 };
 pub use status_tools::{status_tools, BudgetProbe};
 pub use subprocess::SubprocessUnitLauncher;
-pub use supervisor::FleetSupervisor;
+pub use supervisor::{units_on_disk, FleetSupervisor, UnitOnDisk};
 pub use tools::{fleet_tools, FleetToolCtx};
 pub use unit::{
-    MockUnitLauncher, UnitError, UnitId, UnitKind, UnitLauncher, UnitOutcome, UnitSpec, UnitStatus,
+    MockUnitLauncher, Spawned, UnitError, UnitId, UnitKind, UnitLauncher, UnitOutcome, UnitSpec,
+    UnitStatus,
 };
 pub use usage::{fold_tokens, LedgerUsageSource, TokenTotals, Tokens};

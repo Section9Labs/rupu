@@ -627,6 +627,7 @@ mod tests {
                 ts: "2026-10-04T12:00:00Z".into(),
                 body: "wrap it up".into(),
                 stop: true,
+                interrupt: false,
             })
             .unwrap();
         let mut lead = MockLead { rounds: 0 };
@@ -705,6 +706,7 @@ mod tests {
                 ts: "2026-10-04T12:00:00Z".into(),
                 body: "focus on 10.0.0.1".into(),
                 stop: false,
+                interrupt: false,
             })
             .unwrap();
         let mut lead = CapturingLead::default();
@@ -745,6 +747,7 @@ mod tests {
                 ts: "2026-10-04T12:00:00Z".into(),
                 body: "stop".into(),
                 stop: true,
+                interrupt: false,
             })
             .unwrap();
         let out = env.run(&mut MockLead { rounds: 0 }, &NO_SPEND, &fixed());
@@ -764,6 +767,7 @@ mod tests {
                 ts: "2026-10-04T12:00:00Z".into(),
                 body: "stop".into(),
                 stop: true,
+                interrupt: false,
             })
             .unwrap();
         let usage = FixedUsage {

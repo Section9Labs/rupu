@@ -65,6 +65,8 @@ pub struct Config {
     #[serde(default)]
     pub cp: crate::policy_config::CpConfig,
     #[serde(default)]
+    pub agentiflow: crate::policy_config::AgentiflowConfig,
+    #[serde(default)]
     pub netflow: NetflowConfig,
     #[serde(default)]
     pub update: crate::update_config::UpdateConfig,

@@ -8,11 +8,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 /// One operator steering message. `stop` asks the envelope to wind down.
+/// `interrupt` (`send --now`) asks for delivery mid-round rather than at the
+/// next round boundary. It is `#[serde(default)]` so a steering file written
+/// before the field existed still parses (as `false`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperatorMessage {
     pub ts: String,
     pub body: String,
     pub stop: bool,
+    #[serde(default)]
+    pub interrupt: bool,
 }
 
 /// Process-local tiebreaker so two enqueues in the same nanosecond never collide.
@@ -55,6 +60,30 @@ impl OperatorQueue {
             serde_json::to_vec(msg).map_err(std::io::Error::other)?,
         )?;
         std::fs::rename(&tmp, dir.join(format!("{name}.json")))
+    }
+
+    /// Whether any queued message asks for a mid-round interrupt
+    /// (`interrupt == true`), read WITHOUT removing a single file.
+    ///
+    /// This is the lead driver's watcher's question, asked every few hundred
+    /// milliseconds while a round runs. It must stay non-destructive: the
+    /// message is still delivered authoritatively by the envelope's
+    /// [`drain`](Self::drain) at the next round boundary, which is the only
+    /// reader that ever removes a file. A missing directory, an unreadable
+    /// file and an unparseable file all read as "no interrupt" (a torn file is
+    /// `drain`'s to skip and delete), never an error.
+    pub fn peek_interrupt(&self) -> bool {
+        let Ok(rd) = std::fs::read_dir(self.dir()) else {
+            return false;
+        };
+        rd.filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "json"))
+            .any(|path| {
+                std::fs::read(&path)
+                    .ok()
+                    .and_then(|raw| serde_json::from_slice::<OperatorMessage>(&raw).ok())
+                    .is_some_and(|msg| msg.interrupt)
+            })
     }
 
     /// Read every queued message oldest-first and remove it. A file that
@@ -103,12 +132,14 @@ mod tests {
             ts: "t1".into(),
             body: "focus auth".into(),
             stop: false,
+            interrupt: false,
         })
         .unwrap();
         q.enqueue(&OperatorMessage {
             ts: "t2".into(),
             body: "wrap up".into(),
             stop: true,
+            interrupt: false,
         })
         .unwrap();
         let msgs = q.drain().unwrap();
@@ -127,6 +158,7 @@ mod tests {
                 ts: i.to_string(),
                 body: String::new(),
                 stop: false,
+                interrupt: false,
             })
             .unwrap();
         }
@@ -142,6 +174,7 @@ mod tests {
             ts: "ok".into(),
             body: "b".into(),
             stop: false,
+            interrupt: false,
         })
         .unwrap();
         std::fs::write(
@@ -155,5 +188,105 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].ts, "ok");
         assert!(q.drain().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_message_written_before_interrupt_existed_parses_as_not_interrupting() {
+        let old = br#"{"ts":"t","body":"focus auth","stop":false}"#;
+        let msg: OperatorMessage = serde_json::from_slice(old).unwrap();
+        assert!(!msg.interrupt);
+        assert_eq!(msg.body, "focus auth");
+    }
+
+    #[test]
+    fn interrupt_round_trips_through_the_queue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let q = OperatorQueue::new(tmp.path());
+        q.enqueue(&OperatorMessage {
+            ts: "t".into(),
+            body: "now".into(),
+            stop: false,
+            interrupt: true,
+        })
+        .unwrap();
+        q.enqueue(&OperatorMessage {
+            ts: "t".into(),
+            body: "later".into(),
+            stop: false,
+            interrupt: false,
+        })
+        .unwrap();
+        let msgs = q.drain().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert!(msgs[0].interrupt && !msgs[1].interrupt);
+    }
+
+    fn msg(body: &str, interrupt: bool) -> OperatorMessage {
+        OperatorMessage {
+            ts: "t".into(),
+            body: body.into(),
+            stop: false,
+            interrupt,
+        }
+    }
+
+    #[test]
+    fn peek_interrupt_sees_an_interrupt_message_and_removes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let q = OperatorQueue::new(tmp.path());
+        q.enqueue(&msg("later", false)).unwrap();
+        q.enqueue(&msg("now", true)).unwrap();
+        // Repeated peeks keep answering true: nothing was consumed...
+        assert!(q.peek_interrupt());
+        assert!(q.peek_interrupt());
+        // ...so the boundary drain still delivers BOTH messages, once.
+        let msgs = q.drain().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert!(msgs.iter().any(|m| m.interrupt && m.body == "now"));
+        // Once drained, there is nothing left to interrupt for.
+        assert!(!q.peek_interrupt());
+    }
+
+    #[test]
+    fn peek_interrupt_is_false_without_an_interrupt_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let q = OperatorQueue::new(tmp.path());
+        // No steering directory at all.
+        assert!(!q.peek_interrupt());
+        // Ordinary (and stop) messages do not interrupt.
+        q.enqueue(&msg("later", false)).unwrap();
+        q.enqueue(&OperatorMessage {
+            stop: true,
+            ..msg("wrap up", false)
+        })
+        .unwrap();
+        assert!(!q.peek_interrupt());
+        assert_eq!(q.drain().unwrap().len(), 2, "peek never consumed them");
+    }
+
+    #[test]
+    fn peek_interrupt_skips_junk_and_still_finds_a_real_interrupt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let q = OperatorQueue::new(tmp.path());
+        let steering = tmp.path().join("steering");
+        std::fs::create_dir_all(&steering).unwrap();
+        // A torn file, a non-UTF-8 file and a directory named like a message
+        // sort BEFORE the real one; none of them may hide it or panic.
+        std::fs::write(
+            steering.join("00000000000000000000-0-000000.json"),
+            b"{not json",
+        )
+        .unwrap();
+        std::fs::write(
+            steering.join("00000000000000000000-0-000001.json"),
+            [0xff, 0xfe],
+        )
+        .unwrap();
+        std::fs::create_dir(steering.join("00000000000000000000-0-000002.json")).unwrap();
+        assert!(!q.peek_interrupt(), "junk alone is not an interrupt");
+        q.enqueue(&msg("now", true)).unwrap();
+        assert!(q.peek_interrupt());
+        // Peek left the junk where it was (cleaning it up is drain's job).
+        assert!(steering.join("00000000000000000000-0-000000.json").exists());
     }
 }

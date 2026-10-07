@@ -11,4 +11,6 @@ mod types;
 pub use board::Board;
 pub use error::FleetError;
 pub use mailbox::Mailbox;
-pub use types::{BoardPost, ClaimGuard, ClaimOutcome, Directive, FleetMessage, PostKind};
+pub use types::{
+    BoardPost, ClaimGuard, ClaimOutcome, Directive, DirectiveEvent, FleetMessage, PostKind,
+};

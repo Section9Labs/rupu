@@ -20,6 +20,8 @@ thiserror = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+# CancellationToken: the lead's per-round pause token (`send --now`).
+tokio-util = { workspace = true }
 ulid = { workspace = true }
 # kill(2) wrappers for unit liveness/termination (src/proc.rs). The workspace
 # entry already enables `process`; stated here so the need is local.

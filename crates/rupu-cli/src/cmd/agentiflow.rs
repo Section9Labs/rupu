@@ -1,6 +1,7 @@
-//! `rupu agentiflow run <def>` — launch an agentiflow in the foreground — plus
-//! `list` / `status <id>`, which read the runs it leaves under
-//! `<global>/agentiflows/`.
+//! `rupu agentiflow run <def>` — launch an agentiflow in the foreground (or,
+//! with `--detach`, in a background process of its own) — plus `list` /
+//! `status <id>`, which read the runs it leaves under `<global>/agentiflows/`,
+//! and `send` / `stop`, the operator's controls over a run that is in flight.
 //!
 //! Wires together: paths → layered config → definition loader → engagement
 //! profiles (fail-closed `validate`) → lead agent → provider config → the two
@@ -37,9 +38,10 @@ use anyhow::{anyhow, Context};
 use chrono::{DateTime, Utc};
 use clap::Subcommand;
 use rupu_agentiflow::{
-    agentiflow_dir, load_agentiflow_def, new_run_id, run_agentiflow, AgentiflowDef,
+    agentiflow_dir, hard_stop, load_agentiflow_def, new_run_id, run_agentiflow, AgentiflowDef,
     AgentiflowRecord, Budget, CoverageTarget, EnvelopeOutcome, GenerationCapability, GoalTarget,
-    LeadInputs, ProviderFactory, RunAgentiflowOpts,
+    HardStopOutcome, LeadInputs, OperatorMessage, OperatorQueue, ProviderFactory, ReapSummary,
+    RunAgentiflowOpts,
 };
 use rupu_auth::CredentialResolver;
 use rupu_runtime::provider_factory::{self, FactoryError, ProviderConfig};
@@ -57,9 +59,25 @@ pub enum Action {
     /// profiles, and runs it to a stop: goals met, coverage reached, a budget
     /// or ceiling, or an operator stop. Prints the run id up front (stderr) and
     /// the outcome at the end.
+    ///
+    /// With `--detach` the run goes to a background process of its own and the
+    /// command returns as soon as the run has started, printing the run id on
+    /// stdout; follow it with `agentiflow status <id>`, steer it with `send`,
+    /// end it with `stop`. A run that cannot start (no credential, an invalid
+    /// definition) is reported here with the cause, not left to fail unseen.
     Run {
         /// Agentiflow name (matches an `agentiflows/<name>.yaml` file).
         def: String,
+        /// Run in the background: start the run in its own process group and
+        /// return once it has started. The background process's stderr is kept
+        /// in `<run dir>/detach.log`; a run that fails before it starts has
+        /// that error printed here and no run directory left behind.
+        #[arg(long)]
+        detach: bool,
+        /// Internal: the run id a detached parent minted for this process, so
+        /// the id it printed is the run this process records.
+        #[arg(long, hide = true, value_name = "ID", conflicts_with = "detach")]
+        run_id: Option<String>,
     },
     /// List agentiflow runs, newest first.
     ///
@@ -73,6 +91,72 @@ pub enum Action {
         /// a unique prefix / suffix of it.
         id: String,
     },
+    /// Send a steering message to a running agentiflow's lead.
+    ///
+    /// The message is queued under the run's `steering/` directory and the
+    /// envelope hands it to the lead at the next round boundary. `--now` marks
+    /// it as an interrupt (for delivery mid-round); until the envelope acts on
+    /// that mark, it is still delivered at the round boundary. A run that
+    /// already finished takes no message.
+    Send {
+        /// Run id (`af_...`): the full id, the compact form `list` prints, or
+        /// a unique prefix / suffix of it.
+        id: String,
+        /// What to tell the lead.
+        message: String,
+        /// Mark the message as an interrupt (mid-round delivery). Delivered at
+        /// the round boundary until the envelope acts on the mark.
+        #[arg(long)]
+        now: bool,
+    },
+    /// Stop a running agentiflow.
+    ///
+    /// By default the stop is graceful: it is queued like a steering message,
+    /// and the envelope winds the run down at the next round boundary (the
+    /// units it launched are stopped with it). `--now` is the hard stop: it
+    /// SIGTERMs the coordinator (and, for a detached run, the process group it
+    /// leads, so what its lead's tools started goes too), SIGTERMs every unit
+    /// still running (SIGKILL for one that outlives a short grace), then
+    /// records the run as failed (`operator_stop:now`) without waiting for the
+    /// round.
+    Stop {
+        /// Run id (`af_...`): the full id, the compact form `list` prints, or
+        /// a unique prefix / suffix of it.
+        id: String,
+        /// Hard stop: signal the coordinator and its units now.
+        #[arg(long)]
+        now: bool,
+    },
+    /// Watch an agentiflow run: its event log and its lead's current round.
+    ///
+    /// Prints the run's `events.jsonl` (everything so far, then each line as it
+    /// lands) and the lead's transcript for the round in progress, moving on to
+    /// the next round's transcript as it starts. By default it follows the run
+    /// until it ends (a goal met, a budget, a stop, a failure) and then prints
+    /// why it stopped. `--no-follow` (`--once`) prints what the run has
+    /// recorded so far and returns. Attaching to a run that already finished
+    /// shows its log and returns at once. Ctrl-C leaves the run going.
+    Attach {
+        /// Run id (`af_...`): the full id, the compact form `list` prints, or
+        /// a unique prefix / suffix of it.
+        id: String,
+        /// Print what the run has recorded so far and return, instead of
+        /// following it until it ends.
+        #[arg(long = "no-follow", visible_alias = "once", action = clap::ArgAction::SetFalse)]
+        follow: bool,
+    },
+    /// Supervise agentiflow runs: reap the ones whose coordinator died.
+    ///
+    /// A coordinator that is killed (SIGKILL, a crash, the machine going down)
+    /// leaves its run `running` forever and its detached units burning tokens.
+    /// This runs a sweep at startup and then every `[agentiflow]
+    /// serve_interval_secs` (default 60), recording each such run as failed
+    /// (`orphaned: coordinator pid <p> not running`) and stopping its units. It
+    /// runs until SIGTERM / Ctrl-C. `rupu cp serve` runs the same sweep on its
+    /// own tick, so this is for hosts that do not run the control plane.
+    /// `[agentiflow] serve_enabled = false` or `reaper_enabled = false` turns
+    /// it off.
+    Serve,
 }
 
 pub async fn handle(
@@ -82,9 +166,17 @@ pub async fn handle(
     all_columns: bool,
 ) -> ExitCode {
     let result = match action {
-        Action::Run { def } => run_cmd(&def, global_format).await,
+        Action::Run {
+            def,
+            detach,
+            run_id,
+        } => run_cmd(&def, detach, run_id, global_format).await,
         Action::List => list_cmd(global_format, absolute, all_columns),
         Action::Status { id } => status_cmd(&id, global_format),
+        Action::Send { id, message, now } => send_cmd(&id, &message, now),
+        Action::Stop { id, now } => stop_cmd(&id, now).await,
+        Action::Attach { id, follow } => attach_cmd(&id, follow).await,
+        Action::Serve => serve_cmd().await,
     };
     match result {
         Ok(()) => ExitCode::from(0),
@@ -98,11 +190,20 @@ pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Re
         Action::Run { .. } => ("agentiflow run", output_report::TABLE_JSON),
         Action::List => ("agentiflow list", output_report::TABLE_JSON_CSV),
         Action::Status { .. } => ("agentiflow status", output_report::TABLE_JSON),
+        Action::Send { .. } => ("agentiflow send", output_report::TABLE_ONLY),
+        Action::Stop { .. } => ("agentiflow stop", output_report::TABLE_ONLY),
+        Action::Attach { .. } => ("agentiflow attach", output_report::TABLE_ONLY),
+        Action::Serve => ("agentiflow serve", output_report::TABLE_ONLY),
     };
     formats::ensure_supported(command_name, format, supported)
 }
 
-async fn run_cmd(def_name: &str, format: Option<OutputFormat>) -> anyhow::Result<()> {
+async fn run_cmd(
+    def_name: &str,
+    detach: bool,
+    run_id: Option<String>,
+    format: Option<OutputFormat>,
+) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
     let pwd = std::env::current_dir()?;
@@ -169,7 +270,18 @@ async fn run_cmd(def_name: &str, format: Option<OutputFormat>) -> anyhow::Result
         kind: provider_factory::resolve_kind(&provider_name, &cfg.providers),
     };
 
-    let run_id = new_run_id();
+    // The id is minted exactly once, here: a detached parent hands it to its
+    // child (`--run-id`), which runs the foreground path below under it.
+    let run_id = match run_id {
+        Some(id) => {
+            validate_run_id(&id)?;
+            id
+        }
+        None => new_run_id(),
+    };
+    if detach {
+        return spawn_detached(def_name, &def.name, &run_id, &global, format).await;
+    }
     let run_dir = agentiflow_dir(&global).join(&run_id);
 
     // Netflow sink: built before any provider so the launch-time builds below
@@ -224,6 +336,188 @@ async fn run_cmd(def_name: &str, format: Option<OutputFormat>) -> anyhow::Result
                 run_dir.join("agentiflow.json").display()
             );
         }
+    }
+    Ok(())
+}
+
+/// A run id a caller supplied (`--run-id`) names a directory under
+/// `<global>/agentiflows/`, so it must look like one `new_run_id` mints: `af_`
+/// and a plain token, never a path.
+fn validate_run_id(id: &str) -> anyhow::Result<()> {
+    let token = id.strip_prefix("af_").unwrap_or_default();
+    if token.is_empty() || !token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        anyhow::bail!("`{id}` is not a valid agentiflow run id (expected `af_` and a token)");
+    }
+    Ok(())
+}
+
+/// What the re-exec'd child of `run --detach` is invoked with: the plain
+/// foreground `run`, under the id the parent minted. `--` keeps a definition
+/// name from being read as a flag.
+fn detached_argv(def_name: &str, run_id: &str) -> Vec<String> {
+    ["agentiflow", "run", "--run-id", run_id, "--", def_name]
+        .map(String::from)
+        .to_vec()
+}
+
+/// `--format json` for a detached `agentiflow run`.
+#[derive(Serialize)]
+struct DetachedReport {
+    kind: &'static str,
+    version: u8,
+    id: String,
+    name: String,
+    run_dir: String,
+}
+
+/// The file a detached run's stderr is kept in, under its run directory.
+const DETACH_LOG: &str = "detach.log";
+
+/// How long the parent of `run --detach` waits to learn the child started.
+const DETACH_STARTUP_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How the child of `run --detach` was doing when the parent stopped waiting.
+#[derive(Debug)]
+enum Startup {
+    /// The run's record exists: the run started.
+    Started,
+    /// The child exited without ever writing a record: it failed to start.
+    Exited(std::process::ExitStatus),
+    /// Neither, within the wait (a very slow provider start, say).
+    Pending,
+}
+
+/// Wait for `child` to either write the run's record (it started) or exit
+/// without one (it did not). The record is written before the first round, so
+/// a healthy start resolves in milliseconds and `--detach` stays quick.
+async fn await_startup(
+    child: &mut std::process::Child,
+    run_dir: &Path,
+    wait: std::time::Duration,
+) -> std::io::Result<Startup> {
+    let record = run_dir.join("agentiflow.json");
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        if record.exists() {
+            return Ok(Startup::Started);
+        }
+        if let Some(status) = child.try_wait()? {
+            // It may have written the record in the instant before it exited.
+            return Ok(if record.exists() {
+                Startup::Started
+            } else {
+                Startup::Exited(status)
+            });
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(Startup::Pending);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// The last few KiB of a detached run's log, for an error message.
+fn log_tail(log: &Path) -> String {
+    const TAIL: u64 = 4096;
+    let tail = std::fs::File::open(log).and_then(|mut f| {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let len = f.metadata()?.len();
+        f.seek(SeekFrom::Start(len.saturating_sub(TAIL)))?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf)?;
+        Ok(buf)
+    });
+    match tail {
+        Ok(buf) if !buf.iter().all(u8::is_ascii_whitespace) => {
+            String::from_utf8_lossy(&buf).trim().to_string()
+        }
+        Ok(_) => "(it printed nothing)".to_string(),
+        Err(e) => format!("(its log {} could not be read: {e})", log.display()),
+    }
+}
+
+/// The parent half of `run --detach`: start this binary again as the run,
+/// detached, and return once the run has started, without waiting for it to
+/// finish.
+///
+/// Detached like the CP's launchers and the fleet's unit launcher
+/// (`SubprocessUnitLauncher`): its own process group (`process_group(0)`, so a
+/// Ctrl-C at this terminal or this process exiting does not take the run
+/// down), stdin/stdout null, and `RUPU_HOME` pinned to the home this process
+/// resolved so the child records the run where the id printed here is looked
+/// for. The child is the process that runs `run_agentiflow`, so the
+/// `runner_pid` it stamps is the detached process: what `stop` and the orphan
+/// reaper signal.
+///
+/// A detached run that cannot start must not look like one that did, so this
+/// is a handshake. The child's stderr goes to `<run dir>/detach.log` (the run
+/// directory is made first; `run_agentiflow` accepts one that exists and
+/// refuses only an existing record), and this process waits for the record to
+/// appear (started: print the id) or for the child to exit without one
+/// (failed: its log is the error, and the record-less directory is removed).
+async fn spawn_detached(
+    def_name: &str,
+    name: &str,
+    run_id: &str,
+    global: &Path,
+    format: Option<OutputFormat>,
+) -> anyhow::Result<()> {
+    let exe = std::env::current_exe().context("locate the rupu binary to detach")?;
+    let run_dir = agentiflow_dir(global).join(run_id);
+    std::fs::create_dir_all(&run_dir).with_context(|| format!("create {}", run_dir.display()))?;
+    let log_path = run_dir.join(DETACH_LOG);
+    let log = std::fs::File::create(&log_path)
+        .with_context(|| format!("create {}", log_path.display()))?;
+
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args(detached_argv(def_name, run_id))
+        .env("RUPU_HOME", global)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(log));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&run_dir);
+            return Err(anyhow::Error::new(e).context(format!("detach {}", exe.display())));
+        }
+    };
+
+    // `child` is dropped unwaited on every path that returns Ok: this process
+    // exits next, and the child is then reparented, so nothing is left to reap it.
+    match await_startup(&mut child, &run_dir, DETACH_STARTUP_WAIT)
+        .await
+        .context("wait for the detached run to start")?
+    {
+        Startup::Started => {}
+        Startup::Exited(status) => {
+            // Read the log before the directory that holds it goes.
+            let tail = log_tail(&log_path);
+            let _ = std::fs::remove_dir_all(&run_dir);
+            anyhow::bail!("the detached agentiflow exited ({status}) before it started:\n{tail}");
+        }
+        Startup::Pending => eprintln!(
+            "agentiflow {name}: run {run_id} had not started after {}s; it is still going in \
+             the background. Its output is in {}",
+            DETACH_STARTUP_WAIT.as_secs(),
+            log_path.display()
+        ),
+    }
+
+    match format.unwrap_or(OutputFormat::Table) {
+        OutputFormat::Json => formats::print_json(&DetachedReport {
+            kind: "agentiflow_run_detached",
+            version: 1,
+            id: run_id.to_string(),
+            name: name.to_string(),
+            run_dir: run_dir.display().to_string(),
+        })?,
+        _ => println!("agentiflow {name}: run {run_id} (detached)"),
     }
     Ok(())
 }
@@ -535,6 +829,7 @@ fn mark_failed(run_dir: &Path, why: &str) {
     record.status = "failed".into();
     record.stop_reason = Some(format!("error: {why}"));
     record.ended_at = Some(chrono::Utc::now());
+    record.runner_pid = None;
     if let Err(e) = record.write(run_dir) {
         tracing::warn!(error = %e, "could not record the aborted agentiflow run");
     }
@@ -869,7 +1164,7 @@ fn resolve_run_id(global: &Path, fragment: &str) -> anyhow::Result<String> {
     match ids::resolve(&names, fragment) {
         Resolution::Unique(id) => Ok(id),
         Resolution::NotFound => Err(anyhow!(
-            "agentiflow run `{fragment}` not found under {} (see `rupu agentiflow list`)",
+            "no agentiflow run matches '{fragment}' (not found under {}; see `rupu agentiflow list`)",
             agentiflow_dir(global).display()
         )),
         Resolution::Ambiguous(matches) => Err(anyhow!(
@@ -1077,6 +1372,580 @@ fn status_cmd(id: &str, format: Option<OutputFormat>) -> anyhow::Result<()> {
     output_report::emit_detail(format, &StatusOutput { report })
 }
 
+// ---- `send` / `stop` --------------------------------------------------------
+
+/// Resolve `fragment` to a run and read its record. The run directory comes
+/// back with it: the steering queue lives there.
+fn load_run(
+    global: &Path,
+    fragment: &str,
+) -> anyhow::Result<(String, std::path::PathBuf, AgentiflowRecord)> {
+    let id = resolve_run_id(global, fragment)?;
+    let run_dir = agentiflow_dir(global).join(&id);
+    let record = AgentiflowRecord::read(&run_dir)
+        .with_context(|| format!("read {}", run_dir.join("agentiflow.json").display()))?;
+    Ok((id, run_dir, record))
+}
+
+fn enqueue_steering(run_dir: &Path, msg: &OperatorMessage) -> anyhow::Result<()> {
+    OperatorQueue::new(run_dir).enqueue(msg).with_context(|| {
+        format!(
+            "queue a message under {}",
+            run_dir.join("steering").display()
+        )
+    })
+}
+
+/// Queue a steering message for the run's lead. Returns the line to print.
+fn send(global: &Path, fragment: &str, message: &str, now: bool) -> anyhow::Result<String> {
+    let (id, run_dir, record) = load_run(global, fragment)?;
+    if record.status != "running" {
+        return Ok(format!("{id} already {}", record.status));
+    }
+    enqueue_steering(
+        &run_dir,
+        &OperatorMessage {
+            ts: Utc::now().to_rfc3339(),
+            body: message.to_string(),
+            stop: false,
+            interrupt: now,
+        },
+    )?;
+    Ok(format!("queued steering for {id}"))
+}
+
+fn send_cmd(fragment: &str, message: &str, now: bool) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    println!("{}", send(&global, fragment, message, now)?);
+    Ok(())
+}
+
+/// Stop a run, gracefully (a queued stop the envelope honours at the next round
+/// boundary) or, with `now`, the hard stop in `rupu_agentiflow::hard_stop`.
+/// Returns the line to print. The hard stop blocks (it gives the units a grace
+/// before SIGKILL): call this from `spawn_blocking` in async code.
+fn stop(global: &Path, fragment: &str, now: bool) -> anyhow::Result<String> {
+    if now {
+        // `hard_stop` reads the record itself and judges it twice (before and
+        // after the grace), so only the id is resolved here.
+        let id = resolve_run_id(global, fragment)?;
+        let run_dir = agentiflow_dir(global).join(&id);
+        let outcome = hard_stop(&run_dir, Utc::now())
+            .with_context(|| format!("hard-stop {}", run_dir.join("agentiflow.json").display()))?;
+        return Ok(match outcome {
+            HardStopOutcome::Stopped => format!("hard-stopped {id}"),
+            HardStopOutcome::AlreadyTerminal(status) => format!("{id} already {status}"),
+        });
+    }
+
+    let (id, run_dir, record) = load_run(global, fragment)?;
+    if record.status != "running" {
+        return Ok(format!("{id} already {}", record.status));
+    }
+    enqueue_steering(
+        &run_dir,
+        &OperatorMessage {
+            ts: Utc::now().to_rfc3339(),
+            body: "operator stop".into(),
+            stop: true,
+            interrupt: false,
+        },
+    )?;
+    Ok(format!("requested graceful stop of {id}"))
+}
+
+async fn stop_cmd(fragment: &str, now: bool) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    let fragment = fragment.to_string();
+    // The hard stop sleeps through a SIGTERM grace; keep it off the runtime.
+    let line = tokio::task::spawn_blocking(move || stop(&global, &fragment, now))
+        .await
+        .context("the stop task did not finish")??;
+    println!("{line}");
+    Ok(())
+}
+
+// ---- `attach` ---------------------------------------------------------------
+
+/// How often `attach` looks at the run again. Pure filesystem polling, at the
+/// cadence `session attach` uses.
+const ATTACH_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How long `attach` keeps looking, once the record has gone terminal, for the
+/// run's own `run_stopped` event. A run that finishes on its own writes that
+/// event before it finalizes the record, but `finalize_failed` (the reaper, a
+/// hard stop) writes the record first, so the line can land just after.
+const ATTACH_STOPPED_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Consecutive unreadable-record polls before `attach` gives up (5s). The record
+/// is rewritten in place round by round, so a single bad read is a race with a
+/// writer, not a missing run.
+const ATTACH_MAX_RECORD_FAILURES: u32 = 50;
+
+/// The complete lines a file has gained since the last [`LineTail::drain`]. A
+/// line still being written (no newline yet) waits for the next call, and a
+/// file that shrank (rewritten from the start) is read again from the top.
+struct LineTail {
+    path: std::path::PathBuf,
+    offset: u64,
+}
+
+impl LineTail {
+    fn new(path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            offset: 0,
+        }
+    }
+
+    fn drain(&mut self) -> Vec<String> {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let Ok(mut file) = std::fs::File::open(&self.path) else {
+            return Vec::new();
+        };
+        let Ok(len) = file.metadata().map(|m| m.len()) else {
+            return Vec::new();
+        };
+        if len < self.offset {
+            self.offset = 0;
+        }
+        if len <= self.offset || file.seek(SeekFrom::Start(self.offset)).is_err() {
+            return Vec::new();
+        }
+        let mut bytes = Vec::new();
+        if file.read_to_end(&mut bytes).is_err() {
+            return Vec::new();
+        }
+        let mut lines = Vec::new();
+        for line in bytes.split_inclusive(|&b| b == b'\n') {
+            if !line.ends_with(b"\n") {
+                break;
+            }
+            self.offset += line.len() as u64;
+            let text = String::from_utf8_lossy(&line[..line.len() - 1]);
+            if !text.trim().is_empty() {
+                lines.push(text.into_owned());
+            }
+        }
+        lines
+    }
+}
+
+/// The lead's transcript for the round in progress, following the run from round
+/// to round. The runner writes each round to its own `lead/transcript.r<N>.jsonl`.
+struct LeadTail {
+    dir: std::path::PathBuf,
+    /// The round being followed, once there is one.
+    round: Option<u32>,
+    tailer: Option<crate::output::TranscriptTailer>,
+}
+
+impl LeadTail {
+    fn new(lead_dir: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            dir: lead_dir.into(),
+            round: None,
+            tailer: None,
+        }
+    }
+
+    fn path(&self, round: u32) -> std::path::PathBuf {
+        self.dir.join(format!("transcript.r{round}.jsonl"))
+    }
+
+    /// The highest round that has a transcript yet.
+    fn latest_round(&self) -> Option<u32> {
+        std::fs::read_dir(&self.dir)
+            .ok()?
+            .filter_map(Result::ok)
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter_map(|name| {
+                name.strip_prefix("transcript.r")?
+                    .strip_suffix(".jsonl")?
+                    .parse::<u32>()
+                    .ok()
+            })
+            .max()
+    }
+
+    /// Everything new, as `(round, event)` in order. The first call starts at the
+    /// latest round's first line (a round in progress is shown whole). Once a
+    /// later round has a transcript the one being followed is finished, so its
+    /// last lines are drained before moving on, and every round in between is
+    /// read through, never skipped.
+    fn drain(&mut self) -> Vec<(u32, rupu_transcript::Event)> {
+        // Listed BEFORE the drain: a round that already has a successor is
+        // complete, so draining it now cannot miss its tail.
+        let latest = self.latest_round();
+        let mut out = Vec::new();
+        if let (Some(round), Some(tailer)) = (self.round, self.tailer.as_mut()) {
+            out.extend(tailer.drain().into_iter().map(|e| (round, e)));
+        }
+        let Some(latest) = latest else {
+            return out;
+        };
+        let next = self.round.map_or(latest, |r| r + 1);
+        for round in next..=latest {
+            let mut tailer = crate::output::TranscriptTailer::new(self.path(round));
+            out.extend(tailer.drain().into_iter().map(|e| (round, e)));
+            self.round = Some(round);
+            self.tailer = Some(tailer);
+        }
+        out
+    }
+}
+
+/// The first line of `text`, cut to a length one terminal line can hold.
+fn snippet(text: &str) -> String {
+    const MAX: usize = 160;
+    let first = text.lines().next().unwrap_or("").trim();
+    let mut cut: String = first.chars().take(MAX).collect();
+    if cut.len() < first.len() || text.lines().nth(1).is_some() {
+        cut.push('…');
+    }
+    cut
+}
+
+/// One `events.jsonl` line, as a line of text. A kind this does not know (a
+/// newer writer's) is shown as written.
+fn event_text(raw: &str, parsed: Option<&serde_json::Value>) -> String {
+    let Some(v) = parsed else {
+        return raw.to_string();
+    };
+    let s = |key: &str| v.get(key).and_then(|x| x.as_str());
+    let n = |key: &str| v.get(key).and_then(|x| x.as_u64());
+    match s("kind") {
+        Some("run_started") => format!(
+            "run started: {} ({} goal(s))",
+            s("name").unwrap_or("?"),
+            n("goals").unwrap_or(0)
+        ),
+        Some("round") => format!(
+            "round {} finished: {}  budget {}  goals {}/{}  steering {}{}",
+            n("round").unwrap_or(0),
+            s("outcome").unwrap_or("?"),
+            s("budget").unwrap_or("?"),
+            n("goals_met").unwrap_or(0),
+            n("goals_total").unwrap_or(0),
+            n("steering").unwrap_or(0),
+            s("error")
+                .map(|e| format!("  error: {e}"))
+                .unwrap_or_default(),
+        ),
+        Some("run_stopped") => format!(
+            "run stopped: {}{}",
+            s("stop_reason").unwrap_or("?"),
+            s("detail")
+                .map(|d| format!("  ({})", snippet(d)))
+                .unwrap_or_default()
+        ),
+        _ => raw.to_string(),
+    }
+}
+
+/// One lead transcript event, as a line of text; `None` for the many that are
+/// bookkeeping (turn markers, usage, audits, flows).
+fn transcript_text(event: &rupu_transcript::Event) -> Option<String> {
+    use rupu_transcript::Event;
+    Some(match event {
+        Event::UserMessage { content } => format!("user: {}", snippet(content)),
+        Event::AssistantMessage { content, .. } => format!("assistant: {}", snippet(content)),
+        Event::ToolCall { tool, input, .. } => {
+            format!("tool {tool}: {}", snippet(&input.to_string()))
+        }
+        Event::ToolResult {
+            output,
+            error,
+            duration_ms,
+            ..
+        } => match error {
+            Some(e) => format!("tool error ({duration_ms}ms): {}", snippet(e)),
+            None => format!("tool result ({duration_ms}ms): {}", snippet(output)),
+        },
+        Event::RunComplete { status, error, .. } => {
+            let status = format!("{status:?}").to_lowercase();
+            let why = error
+                .as_deref()
+                .map(|e| format!(" ({e})"))
+                .unwrap_or_default();
+            format!("round ended: {status}{why}")
+        }
+        _ => return None,
+    })
+}
+
+/// The closing line: the run's id and where it stands.
+fn attach_footer(id: &str, record: &AgentiflowRecord) -> String {
+    format!(
+        "{id} {}{}",
+        record.status,
+        record
+            .stop_reason
+            .as_deref()
+            .map(|s| format!("  (stopped: {s})"))
+            .unwrap_or_default()
+    )
+}
+
+/// What to tell an operator watching a run whose coordinator is gone: nothing
+/// else will end the run until the orphan sweep records it as failed.
+fn orphan_notice(record: &AgentiflowRecord) -> Option<String> {
+    let pid = record.runner_pid?;
+    (!rupu_agentiflow::pid_is_running(pid)).then(|| {
+        format!(
+            "coordinator pid {pid} is not running; the run is orphaned and stays `running` until \
+             `rupu agentiflow serve` (or `rupu cp serve`) records it as failed"
+        )
+    })
+}
+
+/// Print what a run has recorded since the last call: its event log, then its
+/// lead's transcript. Returns whether a `run_stopped` event was among them.
+fn print_new(
+    events: &mut LineTail,
+    lead: &mut LeadTail,
+    out: &mut impl std::io::Write,
+) -> std::io::Result<bool> {
+    let mut stopped = false;
+    for raw in events.drain() {
+        let parsed = serde_json::from_str::<serde_json::Value>(&raw).ok();
+        stopped |= parsed
+            .as_ref()
+            .and_then(|v| v.get("kind"))
+            .and_then(|k| k.as_str())
+            == Some("run_stopped");
+        writeln!(out, "[events]  {}", event_text(&raw, parsed.as_ref()))?;
+    }
+    for (round, event) in lead.drain() {
+        if let Some(text) = transcript_text(&event) {
+            writeln!(out, "[lead r{round}]  {text}")?;
+        }
+    }
+    out.flush()?;
+    Ok(stopped)
+}
+
+/// Watch the run in `run_dir`: see the module-level `Attach` docs. With `follow`
+/// it returns once the run is over (its record is no longer `running` and its
+/// `run_stopped` event, or the grace for it, has been printed); without, after
+/// one look.
+fn attach_run(
+    run_dir: &Path,
+    id: &str,
+    follow: bool,
+    poll: std::time::Duration,
+    out: &mut impl std::io::Write,
+) -> anyhow::Result<()> {
+    let mut events = LineTail::new(run_dir.join("events.jsonl"));
+    let mut lead = LeadTail::new(run_dir.join("lead"));
+    let mut saw_stopped = false;
+    let mut over_since: Option<std::time::Instant> = None;
+    let mut warned_orphan = false;
+    let mut failures = 0u32;
+    loop {
+        // The record BEFORE the log: a run that finishes on its own writes its
+        // events first, so a terminal record read now means the drain below
+        // sees them all.
+        let record = AgentiflowRecord::read(run_dir);
+        saw_stopped |= print_new(&mut events, &mut lead, out)?;
+        let record = match record {
+            Ok(record) => {
+                failures = 0;
+                record
+            }
+            Err(e) => {
+                failures += 1;
+                if !follow || failures >= ATTACH_MAX_RECORD_FAILURES {
+                    return Err(anyhow::Error::new(e).context(format!(
+                        "read {}",
+                        run_dir.join("agentiflow.json").display()
+                    )));
+                }
+                std::thread::sleep(poll);
+                continue;
+            }
+        };
+        if !follow {
+            writeln!(out, "{}", attach_footer(id, &record))?;
+            return Ok(());
+        }
+        if record.status != "running" {
+            let since = *over_since.get_or_insert_with(std::time::Instant::now);
+            if saw_stopped || since.elapsed() >= ATTACH_STOPPED_GRACE {
+                writeln!(out, "{}", attach_footer(id, &record))?;
+                return Ok(());
+            }
+        } else if !warned_orphan {
+            if let Some(notice) = orphan_notice(&record) {
+                warned_orphan = true;
+                writeln!(out, "[note]  {notice}")?;
+                out.flush()?;
+            }
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+async fn attach_cmd(fragment: &str, follow: bool) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    // Resolved up front, so an unknown id fails the way `status` / `stop` do.
+    let (id, run_dir, _) = load_run(&global, fragment)?;
+    // A poll loop of blocking reads and sleeps: off the async runtime, as
+    // `session attach` does.
+    tokio::task::spawn_blocking(move || {
+        attach_run(
+            &run_dir,
+            &id,
+            follow,
+            ATTACH_POLL,
+            &mut std::io::stdout().lock(),
+        )
+    })
+    .await
+    .context("the attach task did not finish")?
+}
+
+/// What `agentiflow serve` does for a given `[agentiflow]` config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServePlan {
+    /// `serve_enabled = false`.
+    Disabled,
+    /// Serving, but the reaper (the only duty `serve` has) is off: a loop that
+    /// does nothing is a silent no-op, so say so and exit instead.
+    NothingToDo,
+    /// Sweep every this-many seconds.
+    Reap { interval_secs: u64 },
+}
+
+fn serve_plan(cfg: &rupu_config::AgentiflowConfig) -> ServePlan {
+    if !cfg.serve_enabled {
+        ServePlan::Disabled
+    } else if !cfg.reaper_enabled {
+        ServePlan::NothingToDo
+    } else {
+        // `interval` panics on a zero period.
+        ServePlan::Reap {
+            interval_secs: cfg.serve_interval_secs.max(1),
+        }
+    }
+}
+
+/// `rupu agentiflow serve`: sweep for orphaned runs on a timer until SIGTERM /
+/// Ctrl-C. Host-level, so it reads the global config only (as `cp serve` does).
+///
+/// This command is left out of `lib.rs`'s process-wide SIGTERM handler (which
+/// would kill the process, mid-sweep, by the signal): it takes SIGTERM itself,
+/// through [`shutdown_signal`], so a signal ends the loop and the process exits
+/// 0 through `main`'s normal drain.
+async fn serve_cmd() -> anyhow::Result<()> {
+    // Registered before anything else, so no signal reaches the default
+    // disposition once the command is underway.
+    let shutdown = shutdown_signal()?;
+    let global = paths::global_dir()?;
+    let global_cfg = global.join("config.toml");
+    let cfg = rupu_config::layer_files_locked(rupu_config::LayerPaths::global_only(&global_cfg))?;
+    match serve_plan(&cfg.agentiflow) {
+        ServePlan::Disabled => println!("agentiflow serve: disabled by config"),
+        ServePlan::NothingToDo => {
+            println!("agentiflow serve: nothing to do (the reaper is disabled by config)")
+        }
+        ServePlan::Reap { interval_secs } => {
+            println!("agentiflow serve: reaping orphans every {interval_secs}s");
+            serve_loop(
+                &global,
+                std::time::Duration::from_secs(interval_secs),
+                shutdown,
+                // The same channel as the startup line: the default log filter
+                // is `warn`, so a tracing line would leave an operator watching
+                // this process with no sign that it reaped anything.
+                |id| println!("{}", reap_line(id)),
+            )
+            .await;
+        }
+    }
+    Ok(())
+}
+
+/// What `serve` prints for one run it reaped.
+fn reap_line(id: &str) -> String {
+    format!("agentiflow serve: reaped orphaned run {id}")
+}
+
+/// Resolves on SIGTERM or SIGINT. Both handlers are installed when this is
+/// CALLED (not on first poll), and a signal that arrives before the first poll
+/// is held, so there is no window in which one takes its default disposition.
+#[cfg(unix)]
+fn shutdown_signal() -> anyhow::Result<impl std::future::Future<Output = ()>> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate()).context("listen for SIGTERM")?;
+    let mut int = signal(SignalKind::interrupt()).context("listen for SIGINT")?;
+    Ok(async move {
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+    })
+}
+
+/// Off unix there is no SIGTERM: Ctrl-C only.
+#[cfg(not(unix))]
+fn shutdown_signal() -> anyhow::Result<impl std::future::Future<Output = ()>> {
+    Ok(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+}
+
+/// Sweep immediately, then every `interval`, until `shutdown` resolves, calling
+/// `on_reap` with the id of each run a sweep reaped. A sweep in progress
+/// finishes before the loop looks at `shutdown` again, so a signal never
+/// abandons a run half-reaped.
+async fn serve_loop(
+    global: &Path,
+    interval: std::time::Duration,
+    shutdown: impl std::future::Future<Output = ()>,
+    mut on_reap: impl FnMut(&str),
+) {
+    let mut ticker = tokio::time::interval(interval);
+    // A sweep can outlast the interval (it winds units down); do not queue up
+    // a burst of catch-up sweeps behind it.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tokio::pin!(shutdown);
+    loop {
+        // `biased`, shutdown first: a signal wins over a tick that is ready at
+        // the same moment (including the immediate first one), and the signal
+        // future is polled before the ticker on every pass.
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => break,
+            _ = ticker.tick() => {}
+        }
+        for id in reap_orphans(global).await.reaped {
+            on_reap(&id);
+        }
+    }
+}
+
+/// One orphan sweep, off the async runtime (the reaper blocks on file IO and,
+/// for a run with live units, on their SIGTERM grace). Returns what it reaped;
+/// reporting that is the caller's (`serve` prints it, `cp serve` logs it). A
+/// sweep that did not finish is logged and reads as one that reaped nothing:
+/// nothing here can fail the caller. Shared by `agentiflow serve` and `cp
+/// serve`'s sweep tick.
+pub(crate) async fn reap_orphans(global: &Path) -> ReapSummary {
+    let global = global.to_path_buf();
+    match tokio::task::spawn_blocking(move || {
+        rupu_agentiflow::reap_orphaned_agentiflows(&global, Utc::now())
+    })
+    .await
+    {
+        Ok(summary) => summary,
+        Err(e) => {
+            tracing::warn!(error = %e, "the agentiflow orphan sweep did not finish");
+            ReapSummary::default()
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct GoalRow {
     id: String,
@@ -1159,6 +2028,130 @@ mod tests {
     }
 
     #[test]
+    fn serve_plan_follows_the_agentiflow_config() {
+        use rupu_config::AgentiflowConfig;
+        let cfg = |serve_enabled, serve_interval_secs, reaper_enabled| AgentiflowConfig {
+            serve_enabled,
+            serve_interval_secs,
+            reaper_enabled,
+        };
+        assert_eq!(
+            serve_plan(&AgentiflowConfig::default()),
+            ServePlan::Reap { interval_secs: 60 }
+        );
+        assert_eq!(serve_plan(&cfg(false, 60, true)), ServePlan::Disabled);
+        assert_eq!(serve_plan(&cfg(false, 60, false)), ServePlan::Disabled);
+        assert_eq!(serve_plan(&cfg(true, 60, false)), ServePlan::NothingToDo);
+        assert_eq!(
+            serve_plan(&cfg(true, 30, true)),
+            ServePlan::Reap { interval_secs: 30 }
+        );
+        // A zero interval would panic `tokio::time::interval`.
+        assert_eq!(
+            serve_plan(&cfg(true, 0, true)),
+            ServePlan::Reap { interval_secs: 1 }
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_loop_stays_up_until_shutdown_and_then_returns() {
+        // Liveness and shutdown only; the reap itself is the next test, and
+        // the real-process e2e is Task 8's.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let global = tmp.path().to_path_buf();
+        let task = tokio::spawn(async move {
+            serve_loop(
+                &global,
+                std::time::Duration::from_millis(10),
+                async {
+                    let _ = rx.await;
+                },
+                |_| {},
+            )
+            .await;
+        });
+        // Let it tick a few times over a global with no runs, then stop it.
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        assert!(!task.is_finished(), "the loop must keep running");
+        tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the loop exits promptly on shutdown")
+            .expect("the loop did not panic");
+    }
+
+    #[tokio::test]
+    async fn serve_loop_reports_each_run_it_reaps_and_a_signal_ends_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A coordinator that has exited: a pid that is not running.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = child.id();
+        child.wait().unwrap();
+        let run_dir = agentiflow_dir(tmp.path()).join("af_orphan");
+        AgentiflowRecord {
+            id: "af_orphan".into(),
+            name: "acme".into(),
+            engagement_profiles: vec!["code".into()],
+            trigger: rupu_runtime::RunTriggerSource::Agentiflow,
+            status: "running".into(),
+            stop_reason: None,
+            rounds: 0,
+            goals: Vec::new(),
+            started_at: chrono::Utc::now(),
+            ended_at: None,
+            codename: None,
+            spent_usd: None,
+            spent_tokens: 0,
+            runner_pid: Some(dead_pid),
+        }
+        .write(&run_dir)
+        .unwrap();
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let reaped = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&reaped);
+        let global = tmp.path().to_path_buf();
+        let task = tokio::spawn(async move {
+            serve_loop(
+                &global,
+                std::time::Duration::from_millis(10),
+                async {
+                    let _ = rx.await;
+                },
+                move |id| seen.lock().unwrap().push(id.to_string()),
+            )
+            .await;
+        });
+        // The startup sweep reaps it; later sweeps find nothing to report.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while reaped.lock().unwrap().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the orphan is reaped and reported");
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the loop exits on shutdown")
+            .expect("the loop did not panic");
+
+        assert_eq!(*reaped.lock().unwrap(), vec!["af_orphan".to_string()]);
+        assert_eq!(
+            reap_line("af_orphan"),
+            "agentiflow serve: reaped orphaned run af_orphan"
+        );
+        let after = AgentiflowRecord::read(&run_dir).unwrap();
+        assert_eq!(after.status, "failed");
+        assert!(after
+            .stop_reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with("orphaned: coordinator pid")));
+    }
+
+    #[test]
     fn a_missing_definition_names_both_places_it_looked() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (global, project) = (tmp.path().join("g"), tmp.path().join("p"));
@@ -1202,12 +2195,16 @@ mod tests {
             codename: None,
             spent_usd: None,
             spent_tokens: 0,
+            runner_pid: None,
         };
 
-        record("running").write(tmp.path()).unwrap();
+        let mut running = record("running");
+        running.runner_pid = Some(4321);
+        running.write(tmp.path()).unwrap();
         mark_failed(tmp.path(), "boom");
         let after = AgentiflowRecord::read(tmp.path()).unwrap();
         assert_eq!(after.status, "failed");
+        assert_eq!(after.runner_pid, None, "a closed-out run owns no pid");
         assert_eq!(after.stop_reason.as_deref(), Some("error: boom"));
         assert!(after.ended_at.is_some());
 
@@ -1224,14 +2221,199 @@ mod tests {
     fn run_takes_a_definition_name_and_only_table_or_json() {
         let action = parse(["rupu", "agentiflow", "run", "acme"]);
         match &action {
-            Action::Run { def } => assert_eq!(def, "acme"),
+            Action::Run {
+                def,
+                detach,
+                run_id,
+            } => {
+                assert_eq!(def, "acme");
+                assert!(!detach, "foreground unless asked");
+                assert_eq!(run_id, &None);
+            }
             other => panic!("expected `run`, got {other:?}"),
         }
         assert!(ensure_output_format(&action, OutputFormat::Json).is_ok());
         assert!(ensure_output_format(&action, OutputFormat::Csv).is_err());
     }
 
+    #[test]
+    fn run_detach_and_the_hidden_run_id_parse_but_never_together() {
+        use clap::Parser;
+        let detached = parse(["rupu", "agentiflow", "run", "acme", "--detach"]);
+        assert!(matches!(
+            detached,
+            Action::Run {
+                detach: true,
+                run_id: None,
+                ..
+            }
+        ));
+
+        let child = parse(["rupu", "agentiflow", "run", "--run-id", "af_01X", "acme"]);
+        match child {
+            Action::Run { run_id, detach, .. } => {
+                assert_eq!(run_id.as_deref(), Some("af_01X"));
+                assert!(!detach);
+            }
+            other => panic!("expected `run`, got {other:?}"),
+        }
+
+        assert!(crate::Cli::try_parse_from([
+            "rupu",
+            "agentiflow",
+            "run",
+            "acme",
+            "--detach",
+            "--run-id",
+            "af_01X"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn the_run_id_flag_is_hidden_from_help() {
+        use clap::CommandFactory;
+        let mut cmd = crate::Cli::command();
+        let run = cmd
+            .find_subcommand_mut("agentiflow")
+            .and_then(|a| a.find_subcommand_mut("run"))
+            .expect("agentiflow run");
+        let help = run.render_long_help().to_string();
+        assert!(help.contains("--detach"), "{help}");
+        assert!(!help.contains("--run-id"), "{help}");
+    }
+
+    #[test]
+    fn the_detached_child_runs_the_foreground_path_under_the_parents_id() {
+        let argv = detached_argv("acme", "af_01X");
+        assert_eq!(
+            argv,
+            ["agentiflow", "run", "--run-id", "af_01X", "--", "acme"]
+        );
+        // It parses as the plain foreground `run` carrying that id: no
+        // `--detach`, so it does not detach again.
+        let mut full = vec!["rupu".to_string()];
+        full.extend(argv);
+        match parse_vec(full) {
+            Action::Run {
+                def,
+                detach,
+                run_id,
+            } => {
+                assert_eq!(def, "acme");
+                assert!(!detach);
+                assert_eq!(run_id.as_deref(), Some("af_01X"));
+            }
+            other => panic!("expected `run`, got {other:?}"),
+        }
+        // A definition name that looks like a flag stays a name.
+        let mut full = vec!["rupu".to_string()];
+        full.extend(detached_argv("-x", "af_01X"));
+        assert!(matches!(parse_vec(full), Action::Run { def, .. } if def == "-x"));
+    }
+
+    // ---- the startup handshake ------------------------------------------------
+
+    fn spawn(program: &str, args: &[&str]) -> std::process::Child {
+        std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_child_that_exits_without_a_record_failed_to_start() {
+        let run_dir = tempfile::TempDir::new().unwrap();
+        let mut child = spawn("sh", &["-c", "exit 3"]);
+        let startup = await_startup(
+            &mut child,
+            run_dir.path(),
+            std::time::Duration::from_secs(20),
+        )
+        .await
+        .unwrap();
+        match startup {
+            Startup::Exited(status) => assert_eq!(status.code(), Some(3)),
+            other => panic!("expected `Exited`, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_child_that_writes_its_record_has_started_even_while_it_keeps_running() {
+        let run_dir = tempfile::TempDir::new().unwrap();
+        let mut child = spawn("sleep", &["30"]);
+        let record = run_dir.path().join("agentiflow.json");
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            std::fs::write(record, "{}").unwrap();
+        });
+        let startup = await_startup(
+            &mut child,
+            run_dir.path(),
+            std::time::Duration::from_secs(20),
+        )
+        .await
+        .unwrap();
+        writer.await.unwrap();
+        assert!(matches!(startup, Startup::Started), "{startup:?}");
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the handshake must leave the child running"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_child_that_neither_writes_nor_exits_is_pending_not_failed() {
+        let run_dir = tempfile::TempDir::new().unwrap();
+        let mut child = spawn("sleep", &["30"]);
+        let startup = await_startup(
+            &mut child,
+            run_dir.path(),
+            std::time::Duration::from_millis(200),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(startup, Startup::Pending), "{startup:?}");
+        assert!(child.try_wait().unwrap().is_none());
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn the_log_tail_is_what_the_child_last_said() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let log = tmp.path().join("detach.log");
+        assert!(log_tail(&log).contains("could not be read"));
+        std::fs::write(&log, "  \n").unwrap();
+        assert_eq!(log_tail(&log), "(it printed nothing)");
+        std::fs::write(&log, "error: no credential\n").unwrap();
+        assert_eq!(log_tail(&log), "error: no credential");
+        // A long log keeps its end, where the error is.
+        std::fs::write(&log, format!("{}\nthe real error\n", "x".repeat(10_000))).unwrap();
+        let tail = log_tail(&log);
+        assert!(tail.ends_with("the real error"), "{tail}");
+        assert!(tail.len() <= 4096, "{}", tail.len());
+    }
+
+    #[test]
+    fn a_supplied_run_id_must_look_like_one_the_runner_mints() {
+        assert!(validate_run_id(&new_run_id()).is_ok());
+        assert!(validate_run_id("af_01HZZ_x9").is_ok());
+        for bad in ["", "af_", "01HZZ", "af_../x", "af_a/b", "af_a b", "../af_x"] {
+            assert!(validate_run_id(bad).is_err(), "{bad:?} accepted");
+        }
+    }
+
     fn parse<const N: usize>(argv: [&str; N]) -> Action {
+        parse_vec(argv.iter().map(|s| s.to_string()).collect())
+    }
+
+    fn parse_vec(argv: Vec<String>) -> Action {
         use clap::Parser;
         let cli = crate::Cli::try_parse_from(argv).unwrap();
         let crate::Cmd::Agentiflow { action } = cli.command else {
@@ -1256,6 +2438,358 @@ mod tests {
         }
         assert!(ensure_output_format(&status, OutputFormat::Json).is_ok());
         assert!(ensure_output_format(&status, OutputFormat::Csv).is_err());
+    }
+
+    #[test]
+    fn the_sigterm_grace_for_coordinators_and_units_outlasts_the_credential_drain() {
+        // `stop --now` and the orphan sweep SIGTERM a coordinator or a unit,
+        // whose handler waits for credential writes (`exit`'s drain, then its
+        // stderr lines) before it dies; a SIGKILL inside that wait would lose a
+        // rotated OAuth refresh token.
+        let wait = crate::exit::CREDENTIAL_WRITE_DRAIN + 3 * crate::exit::SIGTERM_STDERR_GRACE;
+        let grace = rupu_agentiflow::HardStopGrace::default();
+        assert!(
+            grace.coordinator > wait,
+            "coordinator grace {:?} <= handler wait {wait:?}",
+            grace.coordinator
+        );
+        assert!(
+            grace.units > wait,
+            "unit grace {:?} <= handler wait {wait:?}",
+            grace.units
+        );
+    }
+
+    #[test]
+    fn send_and_stop_parse_and_take_only_the_table_format() {
+        let send = parse(["rupu", "agentiflow", "send", "af_01ABC", "look at auth"]);
+        match &send {
+            Action::Send { id, message, now } => {
+                assert_eq!(id, "af_01ABC");
+                assert_eq!(message, "look at auth");
+                assert!(!now);
+            }
+            other => panic!("expected `send`, got {other:?}"),
+        }
+        assert!(ensure_output_format(&send, OutputFormat::Table).is_ok());
+        assert!(ensure_output_format(&send, OutputFormat::Json).is_err());
+
+        let send_now = parse(["rupu", "agentiflow", "send", "01ABC", "hi", "--now"]);
+        assert!(matches!(send_now, Action::Send { now: true, .. }));
+
+        let stop = parse(["rupu", "agentiflow", "stop", "af_01ABC"]);
+        assert!(matches!(&stop, Action::Stop { now: false, .. }));
+        assert!(ensure_output_format(&stop, OutputFormat::Json).is_err());
+        let stop_now = parse(["rupu", "agentiflow", "stop", "af_01ABC", "--now"]);
+        assert!(matches!(stop_now, Action::Stop { now: true, .. }));
+    }
+
+    // ---- attach --------------------------------------------------------------
+
+    #[test]
+    fn attach_follows_by_default_and_no_follow_or_once_turns_that_off() {
+        let followed = parse(["rupu", "agentiflow", "attach", "af_01ABC"]);
+        match &followed {
+            Action::Attach { id, follow } => {
+                assert_eq!(id, "af_01ABC");
+                assert!(follow, "attach follows the run unless told not to");
+            }
+            other => panic!("expected `attach`, got {other:?}"),
+        }
+        for flag in ["--no-follow", "--once"] {
+            let one_shot = parse(["rupu", "agentiflow", "attach", "af_01ABC", flag]);
+            assert!(
+                matches!(one_shot, Action::Attach { follow: false, .. }),
+                "{flag}"
+            );
+        }
+        // A viewer: a table (plain text) command only.
+        assert!(ensure_output_format(&followed, OutputFormat::Table).is_ok());
+        assert!(ensure_output_format(&followed, OutputFormat::Json).is_err());
+    }
+
+    fn append(path: &Path, text: &str) {
+        use std::io::Write as _;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        f.write_all(text.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn a_line_tail_returns_each_complete_line_once_and_waits_out_a_partial_one() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("events.jsonl");
+        let mut tail = LineTail::new(&path);
+        assert!(tail.drain().is_empty(), "a file that does not exist yet");
+
+        append(&path, "one\ntwo\npart");
+        assert_eq!(tail.drain(), ["one", "two"]);
+        assert!(tail.drain().is_empty(), "nothing is returned twice");
+        // The writer finishes the line (and adds a blank one).
+        append(&path, "ial\n\nthree\n");
+        assert_eq!(tail.drain(), ["partial", "three"]);
+
+        // A file rewritten from the top (shorter than what was read) is read
+        // from the top again.
+        std::fs::write(&path, "fresh\n").unwrap();
+        assert_eq!(tail.drain(), ["fresh"]);
+    }
+
+    fn transcript_line(event: &rupu_transcript::Event) -> String {
+        format!("{}\n", serde_json::to_string(event).unwrap())
+    }
+
+    fn assistant(text: &str) -> rupu_transcript::Event {
+        rupu_transcript::Event::AssistantMessage {
+            content: text.into(),
+            thinking: None,
+        }
+    }
+
+    fn texts(drained: &[(u32, rupu_transcript::Event)]) -> Vec<(u32, String)> {
+        drained
+            .iter()
+            .filter_map(|(r, e)| transcript_text(e).map(|t| (*r, t)))
+            .collect()
+    }
+
+    #[test]
+    fn a_lead_tail_starts_at_the_current_round_and_follows_the_rollover_without_skipping() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lead = tmp.path().join("lead");
+        let r = |n: u32| lead.join(format!("transcript.r{n}.jsonl"));
+        let mut tail = LeadTail::new(&lead);
+        assert!(tail.drain().is_empty(), "no round has started");
+
+        // Attached mid-run, at round 1: the earlier round is history, not shown.
+        append(&r(0), &transcript_line(&assistant("round zero")));
+        append(&r(1), &transcript_line(&assistant("one, first")));
+        assert_eq!(texts(&tail.drain()), [(1, "assistant: one, first".into())]);
+
+        // More of the same round arrives.
+        append(&r(1), &transcript_line(&assistant("one, second")));
+        assert_eq!(texts(&tail.drain()), [(1, "assistant: one, second".into())]);
+        assert!(tail.drain().is_empty());
+
+        // Round 1 writes its last line, then rounds 2 AND 3 both start before
+        // the next look: round 1 is finished off, round 2 is read through, and
+        // round 3 becomes the one followed.
+        append(&r(1), &transcript_line(&assistant("one, last")));
+        append(&r(2), &transcript_line(&assistant("two")));
+        append(&r(3), &transcript_line(&assistant("three")));
+        assert_eq!(
+            texts(&tail.drain()),
+            [
+                (1, "assistant: one, last".into()),
+                (2, "assistant: two".into()),
+                (3, "assistant: three".into()),
+            ]
+        );
+        append(&r(3), &transcript_line(&assistant("three, more")));
+        assert_eq!(texts(&tail.drain()), [(3, "assistant: three, more".into())]);
+    }
+
+    #[test]
+    fn events_and_transcript_events_read_as_one_line_each() {
+        let line = |raw: &str| {
+            let v = serde_json::from_str::<serde_json::Value>(raw).ok();
+            event_text(raw, v.as_ref())
+        };
+        assert_eq!(
+            line(r#"{"kind":"run_started","name":"acme","goals":2}"#),
+            "run started: acme (2 goal(s))"
+        );
+        assert_eq!(
+            line(
+                r#"{"kind":"round","round":3,"outcome":"yielded","budget":"soft","goals_met":1,"goals_total":2,"steering":1}"#
+            ),
+            "round 3 finished: yielded  budget soft  goals 1/2  steering 1"
+        );
+        assert!(
+            line(r#"{"kind":"round","round":4,"outcome":"error","error":"boom"}"#)
+                .ends_with("error: boom")
+        );
+        assert_eq!(
+            line(
+                r#"{"kind":"run_stopped","stop_reason":"ceiling","detail":"round ceiling reached"}"#
+            ),
+            "run stopped: ceiling  (round ceiling reached)"
+        );
+        // A kind from a newer writer, and a line that is not JSON, come through as written.
+        assert_eq!(line(r#"{"kind":"future"}"#), r#"{"kind":"future"}"#);
+        assert_eq!(line("not json"), "not json");
+
+        use rupu_transcript::Event;
+        assert_eq!(
+            transcript_text(&Event::UserMessage {
+                content: "Operator steering:\n- focus on auth".into()
+            })
+            .unwrap(),
+            "user: Operator steering:…"
+        );
+        assert_eq!(
+            transcript_text(&Event::ToolCall {
+                call_id: "c".into(),
+                tool: "bash".into(),
+                input: serde_json::json!({"command": "ls"}),
+            })
+            .unwrap(),
+            r#"tool bash: {"command":"ls"}"#
+        );
+        assert_eq!(
+            transcript_text(&Event::RunComplete {
+                run_id: "r".into(),
+                status: rupu_transcript::RunStatus::Aborted,
+                total_tokens: 0,
+                duration_ms: 0,
+                error: Some("paused".into()),
+                outcome: None,
+            })
+            .unwrap(),
+            "round ended: aborted (paused)"
+        );
+        assert!(transcript_text(&Event::TurnStart { turn_idx: 0 }).is_none());
+        // A long line is cut to fit one terminal line.
+        let long = transcript_text(&assistant(&"x".repeat(500))).unwrap();
+        assert!(long.chars().count() < 180, "{long}");
+        assert!(long.ends_with('…'));
+    }
+
+    const FAST: std::time::Duration = std::time::Duration::from_millis(10);
+
+    fn attached(run_dir: &Path, id: &str, follow: bool) -> (anyhow::Result<()>, String) {
+        let mut out = Vec::new();
+        let result = attach_run(run_dir, id, follow, FAST, &mut out);
+        (result, String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn attaching_to_a_finished_run_prints_its_log_and_why_it_stopped_and_returns() {
+        let tmp = seeded_global();
+        let run_dir = agentiflow_dir(tmp.path()).join("af_01OLDER");
+        append(
+            &run_dir.join("events.jsonl"),
+            concat!(
+                "{\"kind\":\"run_started\",\"name\":\"acme\",\"goals\":2}\n",
+                "{\"kind\":\"run_stopped\",\"stop_reason\":\"goals_met\",\"detail\":\"all met\"}\n",
+            ),
+        );
+        append(
+            &run_dir.join("lead/transcript.r0.jsonl"),
+            &transcript_line(&assistant("all done")),
+        );
+        let started = std::time::Instant::now();
+        let (result, out) = attached(&run_dir, "af_01OLDER", true);
+        result.unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "a finished run does not make attach wait"
+        );
+        assert_eq!(
+            out.lines().collect::<Vec<_>>(),
+            [
+                "[events]  run started: acme (2 goal(s))",
+                "[events]  run stopped: goals_met  (all met)",
+                "[lead r0]  assistant: all done",
+                "af_01OLDER completed  (stopped: goals_met)",
+            ]
+        );
+    }
+
+    #[test]
+    fn attach_once_prints_what_there_is_and_returns_while_the_run_is_going() {
+        let tmp = seeded_global();
+        let run_dir = agentiflow_dir(tmp.path()).join("af_01NEWER");
+        append(
+            &run_dir.join("events.jsonl"),
+            "{\"kind\":\"run_started\",\"name\":\"acme\",\"goals\":2}\n",
+        );
+        let (result, out) = attached(&run_dir, "af_01NEWER", false);
+        result.unwrap();
+        assert!(out.contains("[events]  run started: acme"), "{out}");
+        assert_eq!(out.lines().last(), Some("af_01NEWER running"), "{out}");
+    }
+
+    #[test]
+    fn attach_follows_a_run_until_its_record_goes_terminal_and_then_exits() {
+        let tmp = seeded_global();
+        let g = tmp.path().to_path_buf();
+        let run_dir = agentiflow_dir(&g).join("af_01NEWER");
+        append(
+            &run_dir.join("events.jsonl"),
+            "{\"kind\":\"run_started\",\"name\":\"acme\",\"goals\":2}\n",
+        );
+        // The run ends a moment later: its last round, its stop event, then
+        // (as a run that finishes on its own does) the final record.
+        let writer = {
+            let (g, run_dir) = (g.clone(), run_dir.clone());
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                append(
+                    &run_dir.join("lead/transcript.r0.jsonl"),
+                    &transcript_line(&assistant("wrapping up")),
+                );
+                append(
+                    &run_dir.join("events.jsonl"),
+                    "{\"kind\":\"run_stopped\",\"stop_reason\":\"ceiling\",\"detail\":\"done\"}\n",
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                edit_record(&g, "af_01NEWER", |r| {
+                    r.status = "completed".into();
+                    r.stop_reason = Some("ceiling".into());
+                });
+            })
+        };
+        let (result, out) = attached(&run_dir, "af_01NEWER", true);
+        writer.join().unwrap();
+        result.unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "[events]  run started: acme (2 goal(s))", "{out}");
+        assert!(out.contains("[lead r0]  assistant: wrapping up"), "{out}");
+        assert!(out.contains("run stopped: ceiling"), "{out}");
+        assert_eq!(
+            lines.last(),
+            Some(&"af_01NEWER completed  (stopped: ceiling)"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn attach_to_a_run_with_an_unreadable_record_says_so_instead_of_hanging() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let run_dir = agentiflow_dir(tmp.path()).join("af_x");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        // One look (`--no-follow`) fails at once.
+        let (result, _) = attached(&run_dir, "af_x", false);
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(msg.contains("agentiflow.json"), "{msg}");
+    }
+
+    #[test]
+    fn a_run_whose_coordinator_is_gone_is_called_out_while_attach_waits() {
+        let tmp = seeded_global();
+        let g = tmp.path();
+        let record = AgentiflowRecord::read(&agentiflow_dir(g).join("af_01NEWER")).unwrap();
+        assert!(orphan_notice(&record).is_none(), "no pid recorded");
+
+        // A pid that is not running.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        let mut orphaned = record.clone();
+        orphaned.runner_pid = Some(dead);
+        let notice = orphan_notice(&orphaned).expect("a dead coordinator is noticed");
+        assert!(notice.contains(&format!("pid {dead}")), "{notice}");
+        assert!(notice.contains("rupu agentiflow serve"), "{notice}");
+
+        // This process is alive.
+        let mut live = record;
+        live.runner_pid = Some(std::process::id());
+        assert!(orphan_notice(&live).is_none());
     }
 
     // ---- list / status over a seeded `<global>/agentiflows/` ----------------
@@ -1323,6 +2857,7 @@ pool:
             codename: None,
             spent_usd: None,
             spent_tokens: 0,
+            runner_pid: None,
         }
         .write(&agentiflow_dir(global).join(id))
         .unwrap();
@@ -1624,6 +3159,215 @@ pool:
             load_status(tmp.path(), "af_01NORECORD").unwrap_err()
         );
         assert!(msg.contains("agentiflow.json"), "{msg}");
+    }
+
+    // ---- send / stop ---------------------------------------------------------
+
+    fn drained(global: &Path, id: &str) -> Vec<OperatorMessage> {
+        OperatorQueue::new(agentiflow_dir(global).join(id))
+            .drain()
+            .unwrap()
+    }
+
+    #[test]
+    fn send_queues_a_steering_message_for_a_running_run() {
+        let tmp = seeded_global();
+        let g = tmp.path();
+        // The compact fragment `list` prints resolves, as it does for `status`.
+        let line = send(g, "01NEWER", "focus on auth", false).unwrap();
+        assert_eq!(line, "queued steering for af_01NEWER");
+        let line = send(g, "af_01NEWER", "drop that, now", true).unwrap();
+        assert_eq!(line, "queued steering for af_01NEWER");
+        let msgs = drained(g, "af_01NEWER");
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].body, "focus on auth");
+        assert!(!msgs[0].stop && !msgs[0].interrupt);
+        assert_eq!(msgs[1].body, "drop that, now");
+        assert!(
+            !msgs[1].stop && msgs[1].interrupt,
+            "--now marks an interrupt"
+        );
+        assert!(chrono::DateTime::parse_from_rfc3339(&msgs[0].ts).is_ok());
+    }
+
+    #[test]
+    fn send_and_stop_to_a_finished_run_say_so_and_queue_nothing() {
+        let tmp = seeded_global();
+        let g = tmp.path();
+        assert_eq!(
+            send(g, "af_01OLDER", "hello", false).unwrap(),
+            "af_01OLDER already completed"
+        );
+        for now in [false, true] {
+            assert_eq!(
+                stop(g, "af_01OLDER", now).unwrap(),
+                "af_01OLDER already completed"
+            );
+        }
+        assert!(drained(g, "af_01OLDER").is_empty());
+        // The finished record is untouched, `--now` included.
+        let rec = AgentiflowRecord::read(&agentiflow_dir(g).join("af_01OLDER")).unwrap();
+        assert_eq!(rec.status, "completed");
+        assert_eq!(rec.stop_reason.as_deref(), Some("goals_met"));
+    }
+
+    #[test]
+    fn send_and_stop_refuse_an_unknown_or_ambiguous_run() {
+        let tmp = seeded_global();
+        let g = tmp.path();
+        let msg = send(g, "af_01MISSING", "x", false).unwrap_err().to_string();
+        assert!(
+            msg.contains("no agentiflow run matches 'af_01MISSING'"),
+            "{msg}"
+        );
+        let msg = stop(g, "af_01MISSING", true).unwrap_err().to_string();
+        assert!(
+            msg.contains("no agentiflow run matches 'af_01MISSING'"),
+            "{msg}"
+        );
+        let msg = stop(g, "af_01", false).unwrap_err().to_string();
+        assert!(msg.contains("more than one"), "{msg}");
+        assert!(drained(g, "af_01NEWER").is_empty());
+    }
+
+    #[test]
+    fn a_graceful_stop_queues_a_stop_message_and_leaves_the_record_running() {
+        let tmp = seeded_global();
+        let g = tmp.path();
+        assert_eq!(
+            stop(g, "01NEWER", false).unwrap(),
+            "requested graceful stop of af_01NEWER"
+        );
+        let msgs = drained(g, "af_01NEWER");
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].stop && !msgs[0].interrupt);
+        assert_eq!(msgs[0].body, "operator stop");
+        // The envelope, not the CLI, ends a graceful stop.
+        let rec = AgentiflowRecord::read(&agentiflow_dir(g).join("af_01NEWER")).unwrap();
+        assert_eq!(rec.status, "running");
+    }
+
+    /// A `sleep` leading its own process group (as a launched unit does, so its
+    /// pid is its pgid), plus a thread that reaps it the moment it dies:
+    /// without the waiter a killed child stays a zombie of this process, and
+    /// `kill(pid, 0)` reads a zombie as alive.
+    #[cfg(unix)]
+    fn spawn_sleeper() -> (u32, std::thread::JoinHandle<std::process::ExitStatus>) {
+        use std::os::unix::process::CommandExt as _;
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        (
+            child.id(),
+            std::thread::spawn(move || child.wait().unwrap()),
+        )
+    }
+
+    #[cfg(unix)]
+    fn write_unit(run_dir: &Path, unit: &str, pgid: u32, state: &str) {
+        let dir = run_dir.join("units").join(unit);
+        std::fs::create_dir_all(&dir).unwrap();
+        let status = if state == "done" {
+            serde_json::json!({"state": "done", "success": true, "output": "ok"})
+        } else {
+            serde_json::json!({"state": state})
+        };
+        std::fs::write(
+            dir.join("unit.json"),
+            serde_json::json!({"kind": "agent", "pgid": pgid, "status": status}).to_string(),
+        )
+        .unwrap();
+    }
+
+    fn event_lines(run_dir: &Path) -> Vec<serde_json::Value> {
+        match std::fs::read_to_string(run_dir.join("events.jsonl")) {
+            Ok(raw) => raw
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_stop_signals_the_coordinator_and_the_live_units_and_closes_the_record() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let tmp = seeded_global();
+        let g = tmp.path();
+        let run_dir = agentiflow_dir(g).join("af_01NEWER");
+
+        let (coordinator, coordinator_exit) = spawn_sleeper();
+        let (live_unit, live_unit_exit) = spawn_sleeper();
+        let (finished_unit, finished_unit_exit) = spawn_sleeper();
+        write_unit(&run_dir, "unit_live", live_unit, "running");
+        // A unit that already finished keeps its process group: not signalled.
+        write_unit(&run_dir, "unit_done", finished_unit, "done");
+        edit_record(g, "af_01NEWER", |r| r.runner_pid = Some(coordinator));
+
+        assert_eq!(
+            stop(g, "af_01NEWER", true).unwrap(),
+            "hard-stopped af_01NEWER"
+        );
+
+        assert_eq!(
+            coordinator_exit.join().unwrap().signal(),
+            Some(15),
+            "coordinator got SIGTERM"
+        );
+        assert_eq!(
+            live_unit_exit.join().unwrap().signal(),
+            Some(15),
+            "live unit's group got SIGTERM"
+        );
+        assert!(
+            rupu_agentiflow::pid_is_running(finished_unit),
+            "a finished unit is left alone"
+        );
+        rupu_agentiflow::kill_group(finished_unit);
+        finished_unit_exit.join().unwrap();
+
+        let rec = AgentiflowRecord::read(&run_dir).unwrap();
+        assert_eq!(rec.status, "failed");
+        assert_eq!(rec.stop_reason.as_deref(), Some("operator_stop:now"));
+        assert_eq!(rec.runner_pid, None);
+        assert!(rec.ended_at.is_some());
+        // A hard stop is a signal, not a message.
+        assert!(drained(g, "af_01NEWER").is_empty());
+        // The coordinator dies on SIGTERM without a word, so the stop writes
+        // the terminal event, or the log would end mid-run on a `failed` run.
+        let last = event_lines(&run_dir).pop().expect("a terminal event");
+        assert_eq!(last["kind"], "run_stopped");
+        assert_eq!(last["stop_reason"], "operator_stop:now");
+    }
+
+    #[test]
+    fn a_hard_stop_with_no_live_coordinator_still_closes_the_record_and_the_log() {
+        let tmp = seeded_global();
+        let g = tmp.path();
+        let run_dir = agentiflow_dir(g).join("af_01NEWER");
+        // `runner_pid` is `None` (an older record): nothing to signal.
+        assert_eq!(
+            stop(g, "af_01NEWER", true).unwrap(),
+            "hard-stopped af_01NEWER"
+        );
+        let rec = AgentiflowRecord::read(&run_dir).unwrap();
+        assert_eq!(rec.status, "failed");
+        assert_eq!(rec.stop_reason.as_deref(), Some("operator_stop:now"));
+        let events = event_lines(&run_dir);
+        let last = events.last().expect("a terminal event");
+        assert_eq!(last["kind"], "run_stopped");
+        assert_eq!(last["stop_reason"], "operator_stop:now");
+        assert_eq!(last["detail"], "operator hard stop (--now)");
+        assert_eq!(events.len(), 1);
+        // The record is final now: a second hard stop leaves it, and the log, be.
+        assert_eq!(
+            stop(g, "af_01NEWER", true).unwrap(),
+            "af_01NEWER already failed"
+        );
+        assert_eq!(event_lines(&run_dir).len(), 1);
     }
 
     // ---- generation capability gating ---------------------------------------

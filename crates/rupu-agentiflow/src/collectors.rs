@@ -140,9 +140,25 @@ impl TurnCollector for DirectiveCollector {
                 kind: InjectionKind::Directive,
                 cadence: Cadence::EveryTurn,
                 priority: DIRECTIVE_PRIORITY,
-                content: format!("standing directive from {}: {}", d.author, d.body),
+                content: directive_text(d),
             })
             .collect()
+    }
+}
+
+/// The text a standing directive is injected as. A directive with an id carries
+/// it in brackets: the injection is the one place the lead reliably re-sees a
+/// standing directive (the `board.directive` result does not survive compaction
+/// or a resumed run), and the id is what `board.retract` takes. A legacy
+/// directive with no id cannot be retracted, so it shows none.
+fn directive_text(d: &Directive) -> String {
+    if d.id.trim().is_empty() {
+        format!("standing directive from {}: {}", d.author, d.body)
+    } else {
+        format!(
+            "standing directive [{}] from {}: {}",
+            d.id, d.author, d.body
+        )
     }
 }
 
@@ -184,6 +200,7 @@ mod tests {
 
     fn directive(body: &str, to: Option<&str>) -> Directive {
         Directive {
+            id: String::new(),
             author: "operator".into(),
             ts: "t".into(),
             body: body.into(),
@@ -272,6 +289,7 @@ mod tests {
         let board = Arc::new(Board::new(dir.path()));
         board
             .put_directive(&Directive {
+                id: String::new(),
                 author: "lead".into(),
                 ts: "t".into(),
                 body: "focus on the auth module".into(),
@@ -291,6 +309,55 @@ mod tests {
         assert_eq!(again[0].priority, 230);
         assert_eq!(again[0].source, "directive:board");
         assert!(again[0].content.contains("focus on the auth module"));
+    }
+
+    #[test]
+    fn directive_collector_stops_injecting_a_retracted_directive() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = Arc::new(Board::new(dir.path()));
+        let stale = board
+            .put_directive(&directive("focus on auth", None))
+            .unwrap();
+        board
+            .put_directive(&directive("expand to staging", None))
+            .unwrap();
+        let c = DirectiveCollector::new(board.clone(), "lead", None);
+        assert_eq!(c.collect(&ctx("lead")).len(), 2);
+
+        board.retract_directive(&stale).unwrap();
+        let after = c.collect(&ctx("lead"));
+        assert_eq!(after.len(), 1, "{after:?}");
+        assert!(after[0].content.contains("expand to staging"));
+    }
+
+    #[test]
+    fn directive_injection_shows_the_id_a_retraction_needs() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = Arc::new(Board::new(dir.path()));
+        let id = board
+            .put_directive(&directive("focus on auth", None))
+            .unwrap();
+        // A legacy line (written before ids): live, but nothing to retract it by.
+        std::fs::write(
+            dir.path().join("board").join("directives.jsonl"),
+            std::fs::read_to_string(dir.path().join("board").join("directives.jsonl")).unwrap()
+                + "{\"author\":\"operator\",\"ts\":\"t\",\"body\":\"old rule\"}\n",
+        )
+        .unwrap();
+
+        let c = DirectiveCollector::new(board, "lead", None);
+        let got: Vec<String> = c
+            .collect(&ctx("lead"))
+            .into_iter()
+            .map(|i| i.content)
+            .collect();
+        assert_eq!(
+            got,
+            [
+                format!("standing directive [{id}] from operator: focus on auth"),
+                "standing directive from operator: old rule".to_string(),
+            ]
+        );
     }
 
     #[test]

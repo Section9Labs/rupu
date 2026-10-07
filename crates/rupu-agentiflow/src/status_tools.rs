@@ -13,7 +13,9 @@
 //!
 //! `board.directive` is the lead's steering write: a standing
 //! [`rupu_fleet::Directive`] that the units' `DirectiveCollector` delivers on
-//! every turn.
+//! every turn, and whose minted `id` it returns. `board.retract` lifts one by
+//! that id (an appended retraction folded on read; the board log is never
+//! rewritten).
 //!
 //! Error discipline matches `tools.rs` / `roster.rs`: a failure on a well-formed
 //! call is `Ok(ToolOutput { error: Some(..) })` so the model sees it and can
@@ -50,9 +52,9 @@ struct StatusCtx {
     budget: BudgetProbe,
 }
 
-/// The four status/steering tools (`goal.status`, `coverage.status`,
-/// `budget.status`, `board.directive`), each holding a clone of the shared
-/// context.
+/// The five status/steering tools (`goal.status`, `coverage.status`,
+/// `budget.status`, `board.directive`, `board.retract`), each holding a clone
+/// of the shared context.
 ///
 /// `paths` is the run's POOLED scope (the one its units' findings are merged
 /// into), `active` the engagement's active profile set, `budget` the live view
@@ -77,7 +79,8 @@ pub fn status_tools(
         Arc::new(GoalStatus(ctx.clone())),
         Arc::new(CoverageStatus(ctx.clone())),
         Arc::new(BudgetStatus(ctx.clone())),
-        Arc::new(BoardDirective(ctx)),
+        Arc::new(BoardDirective(ctx.clone())),
+        Arc::new(BoardRetract(ctx)),
     ]
 }
 
@@ -494,8 +497,9 @@ impl Tool for BudgetStatus {
 
 // ---- board.directive --------------------------------------------------------
 
-/// `board.directive { body, addressed_to? }` -> `{ok: true}`: write a standing
-/// directive authored by the lead.
+/// `board.directive { body, addressed_to? }` -> `{ok: true, id, addressed_to}`:
+/// write a standing directive authored by the lead. The `id` is what
+/// `board.retract` takes to lift it again.
 struct BoardDirective(Arc<StatusCtx>);
 
 #[async_trait]
@@ -506,9 +510,10 @@ impl Tool for BoardDirective {
 
     fn description(&self) -> &'static str {
         "Steer the fleet: write a standing directive to the board. Units see it on \
-         every turn for the rest of the run -- there is no retraction, so \
-         directives accumulate; post sparingly and keep each short and actionable. \
-         Omit `addressed_to` to address everyone; name a unit or role to address only it."
+         every turn until you lift it, so post sparingly and keep each short and \
+         actionable. Returns the directive's `id`: pass it to `board.retract` once \
+         the instruction is obsolete. Omit `addressed_to` to address everyone; name \
+         a unit or role to address only it."
     }
 
     fn input_schema(&self) -> Value {
@@ -529,14 +534,68 @@ impl Tool for BoardDirective {
         let body = req_str(&input, "body")?.to_string();
         let addressed_to = opt_str(&input, "addressed_to")?;
         let directive = Directive {
+            // Minted by the board.
+            id: String::new(),
             author: LEAD_AUTHOR.to_string(),
             ts: chrono::Utc::now().to_rfc3339(),
             body,
             addressed_to: addressed_to.clone(),
         };
         Ok(match self.0.board.put_directive(&directive) {
-            Ok(()) => done(json!({ "ok": true, "addressed_to": addressed_to })),
+            Ok(id) => done(json!({ "ok": true, "id": id, "addressed_to": addressed_to })),
             Err(e) => failed(format!("could not write directive: {e}")),
+        })
+    }
+}
+
+// ---- board.retract ----------------------------------------------------------
+
+/// `board.retract { id }` -> `{ok: true, retracted}`: lift a standing directive
+/// from the live set. The board log is append-only, so this appends a
+/// retraction; an id with no live directive behind it is reported and appends
+/// nothing.
+struct BoardRetract(Arc<StatusCtx>);
+
+#[async_trait]
+impl Tool for BoardRetract {
+    fn name(&self) -> &'static str {
+        "board.retract"
+    }
+
+    fn description(&self) -> &'static str {
+        "Lift a standing directive: pass the `id` that `board.directive` returned \
+         (it is also shown in brackets on each standing directive you see each \
+         turn). Units stop seeing it from their next turn. An unknown or already \
+         retracted id is reported and changes nothing."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "required": ["id"],
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "The `id` `board.directive` returned for the directive to lift"
+                }
+            }
+        })
+    }
+
+    async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let id = req_str(&input, "id")?.to_string();
+        let live = match self.0.board.read_directives() {
+            Ok(live) => live,
+            Err(e) => return Ok(failed(format!("could not read directives: {e}"))),
+        };
+        if !live.iter().any(|d| d.id == id) {
+            return Ok(failed(format!(
+                "no live directive has id {id}: it is unknown or already retracted"
+            )));
+        }
+        Ok(match self.0.board.retract_directive(&id) {
+            Ok(()) => done(json!({ "ok": true, "retracted": id })),
+            Err(e) => failed(format!("could not retract directive: {e}")),
         })
     }
 }
@@ -831,7 +890,7 @@ mod tests {
     }
 
     #[test]
-    fn exposes_the_four_tools() {
+    fn exposes_the_five_tools() {
         let fx = fx();
         let mut names: Vec<_> = tools(&fx, vec![], None).iter().map(|t| t.name()).collect();
         names.sort_unstable();
@@ -839,6 +898,7 @@ mod tests {
             names,
             [
                 "board.directive",
+                "board.retract",
                 "budget.status",
                 "coverage.status",
                 "goal.status"
@@ -1182,6 +1242,124 @@ mod tests {
         let out = call(&ts, "board.directive", json!({ "body": "x" })).await;
         let err = out.error.expect("a store failure is reported, not raised");
         assert!(err.starts_with("could not write directive:"), "{err}");
+    }
+
+    // ---- board.retract -------------------------------------------------------
+
+    /// The raw line count of the run's directive log.
+    fn directive_log_lines(fx: &Fx) -> usize {
+        std::fs::read_to_string(fx.board_root.join("board").join("directives.jsonl"))
+            .map(|t| t.lines().count())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn board_directive_returns_the_id_it_stored() {
+        let fx = fx();
+        let ts = tools(&fx, vec![], None);
+        let v = json_of(&call(&ts, "board.directive", json!({ "body": "focus on auth" })).await);
+        let id = v["id"].as_str().expect("the minted id is surfaced");
+        assert!(!id.is_empty());
+        let ds = Board::new(&fx.board_root).read_directives().unwrap();
+        assert_eq!(ds[0].id, id);
+    }
+
+    #[tokio::test]
+    async fn board_retract_lifts_a_directive_the_lead_wrote() {
+        let fx = fx();
+        let ts = tools(&fx, vec![], None);
+        let first =
+            json_of(&call(&ts, "board.directive", json!({ "body": "focus on auth" })).await);
+        call(
+            &ts,
+            "board.directive",
+            json!({ "body": "expand to staging" }),
+        )
+        .await;
+        let id = first["id"].as_str().unwrap();
+
+        let out = json_of(&call(&ts, "board.retract", json!({ "id": id })).await);
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["retracted"], id);
+
+        // A fresh handle sees only what is still live; the log only grew.
+        let live = Board::new(&fx.board_root).read_directives().unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].body, "expand to staging");
+        assert_eq!(directive_log_lines(&fx), 3);
+    }
+
+    #[tokio::test]
+    async fn board_retract_of_an_unknown_or_already_retracted_id_reports_and_appends_nothing() {
+        let fx = fx();
+        let ts = tools(&fx, vec![], None);
+        let v = json_of(&call(&ts, "board.directive", json!({ "body": "x" })).await);
+        let id = v["id"].as_str().unwrap().to_string();
+
+        let out = call(&ts, "board.retract", json!({ "id": "no-such-id" })).await;
+        let err = out.error.expect("an unknown id is reported to the model");
+        assert!(err.contains("no-such-id"), "{err}");
+        assert_eq!(directive_log_lines(&fx), 1, "nothing was appended");
+
+        call(&ts, "board.retract", json!({ "id": id })).await;
+        assert_eq!(directive_log_lines(&fx), 2);
+        let again = call(&ts, "board.retract", json!({ "id": id })).await;
+        assert!(
+            again.error.is_some(),
+            "already retracted: nothing to retract"
+        );
+        assert_eq!(directive_log_lines(&fx), 2, "and nothing was appended");
+    }
+
+    #[tokio::test]
+    async fn board_retract_rejects_a_missing_or_blank_id() {
+        let fx = fx();
+        let ts = tools(&fx, vec![], None);
+        let tool = ts.iter().find(|t| t.name() == "board.retract").unwrap();
+        for bad in [json!({}), json!({ "id": "   " }), json!({ "id": 7 })] {
+            let err = tool
+                .invoke(bad.clone(), &ToolContext::default())
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ToolError::InvalidInput(_)), "{bad}");
+        }
+        assert_eq!(directive_log_lines(&fx), 0);
+    }
+
+    #[tokio::test]
+    async fn board_retract_reports_a_store_failure_to_the_model() {
+        let fx = fx();
+        // The board root's parent is a FILE, so the directive log cannot be read.
+        let blocker = fx._tmp.path().join("blocker");
+        std::fs::write(&blocker, "x").unwrap();
+        let ts = status_tools(
+            vec![],
+            None,
+            fx.paths.clone(),
+            Arc::new(active()),
+            Arc::new(Board::new(blocker.join("fleet"))),
+            fx.probe(None, Budget::default()),
+        );
+        let out = call(&ts, "board.retract", json!({ "id": "x" })).await;
+        let err = out.error.expect("a store failure is reported, not raised");
+        assert!(err.starts_with("could not read directives:"), "{err}");
+    }
+
+    #[test]
+    fn the_directive_tools_describe_retraction() {
+        let fx = fx();
+        let ts = tools(&fx, vec![], None);
+        let directive = ts.iter().find(|t| t.name() == "board.directive").unwrap();
+        assert!(
+            !directive.description().contains("no retraction"),
+            "{}",
+            directive.description()
+        );
+        assert!(
+            directive.description().contains("board.retract"),
+            "{}",
+            directive.description()
+        );
     }
 
     // ---- budget.status -------------------------------------------------------

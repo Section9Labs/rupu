@@ -54,6 +54,14 @@
 //!   `detail` (human text), `rounds`, `goals` (`id` / `met` / `current` /
 //!   `target`), `summary`, and the final `spent_usd` / `spent_tokens`
 //!
+//! A run whose coordinator died without writing its own `run_stopped` gets one
+//! from the orphan reaper (`reap_orphaned_agentiflows`): same shape, with
+//! `stop_reason` / `detail` `orphaned: coordinator pid <p> not running`. So does
+//! a run an operator hard-stops (`rupu agentiflow stop --now`, via `hard_stop`):
+//! the coordinator is killed without running any cleanup, so the stop writes it,
+//! with `stop_reason` `operator_stop:now` and `detail` `operator hard stop
+//! (--now)`. Both go through `finalize_failed`.
+//!
 //! The log is deliberately local and minimal: a best-effort append. A failed
 //! append is logged (`tracing::warn!`) and never stops the run; the durable
 //! state of record is `agentiflow.json`.
@@ -115,7 +123,9 @@ pub struct GoalStatus {
 ///
 /// `stop_reason` is a stable snake_case code: `goals_met`,
 /// `coverage_reached`, `budget_exhausted:<dimension>`, `operator_stop`,
-/// `ceiling`; for a `failed` run it is `error: <message>`.
+/// `ceiling`; for a `failed` run it is `error: <message>`,
+/// `orphaned: coordinator pid <p> not running` when the orphan reaper found the
+/// coordinator dead, or `operator_stop:now` when an operator hard-stopped it.
 ///
 /// `spent_usd` / `spent_tokens` are the run's metered spend (the same meter
 /// `budget.usd` / `budget.tokens` are enforced against): refreshed as each
@@ -124,6 +134,13 @@ pub struct GoalStatus {
 /// run has metered anything, and on a record written before metering existed;
 /// a model with no price counts as `$0` in it. Both default when absent, so
 /// older records still parse.
+///
+/// `runner_pid` is the process executing the run (the coordinator: under
+/// `--detach` that is the detached child, not the shell that launched it),
+/// stamped when the record is first written `running` and cleared once the run
+/// reaches a terminal status. It is what the orphan reaper checks for liveness
+/// and what `agentiflow stop` signals. `None` on a record written before pids
+/// were recorded, which a reaper reads as "owner unknown", never "dead".
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentiflowRecord {
     pub id: String,
@@ -145,6 +162,10 @@ pub struct AgentiflowRecord {
     /// Billable (input + output) tokens spent so far.
     #[serde(default)]
     pub spent_tokens: u64,
+    /// The pid of the process running this agentiflow (`None` once it has
+    /// finished, and on records that predate it).
+    #[serde(default)]
+    pub runner_pid: Option<u32>,
 }
 
 impl AgentiflowRecord {
@@ -372,13 +393,23 @@ fn goal_statuses(outcome: &EnvelopeOutcome) -> Vec<GoalStatus> {
         .collect()
 }
 
-/// The best-effort `events.jsonl` appender (shape in the module docs).
-struct EventLog {
+/// The best-effort `events.jsonl` appender (shape in the module docs). The
+/// orphan reaper and the operator's hard stop append their terminal
+/// `run_stopped` through the same writer (via `finalize_failed`), so there is
+/// one event shape and one append path.
+pub(crate) struct EventLog {
     path: PathBuf,
 }
 
 impl EventLog {
-    fn emit(&self, ts: DateTime<Utc>, kind: &str, fields: Value) {
+    /// The log of the run in `run_dir` (`<run_dir>/events.jsonl`).
+    pub(crate) fn new(run_dir: &Path) -> Self {
+        Self {
+            path: run_dir.join(EVENTS_FILE),
+        }
+    }
+
+    pub(crate) fn emit(&self, ts: DateTime<Utc>, kind: &str, fields: Value) {
         let mut line = serde_json::Map::new();
         line.insert(
             "ts".into(),
@@ -655,6 +686,10 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 codename: None,
                 spent_usd: None,
                 spent_tokens: 0,
+                // This runs in the process that executes the run: under
+                // `--detach` the detached child, i.e. the long-lived coordinator
+                // the reaper and `stop` must signal, not the launching shell.
+                runner_pid: Some(std::process::id()),
             };
             record.write(&run_dir)?;
 
@@ -663,6 +698,7 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 record.status = "failed".into();
                 record.stop_reason = Some(format!("error: {e}"));
                 record.ended_at = Some(now());
+                record.runner_pid = None;
                 if let Err(werr) = record.write(&run_dir) {
                     tracing::error!(error = %werr, "could not record the failed agentiflow run");
                 }
@@ -822,15 +858,16 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 usage_ledger: Some(rupu_orchestrator::usage_ledger::UsageLedger::open(
                     lead_usage,
                 )),
+                // `rupu agentiflow send --now` interrupts through the same
+                // queue the envelope drains at each round boundary.
+                steering_queue: Some(OperatorQueue::new(&run_dir)),
             };
             let driver = match RunAgentLeadDriver::new(lead_cfg, make_provider) {
                 Ok(d) => d,
                 Err(e) => return Err(fail(&mut record, e)),
             };
 
-            let events = EventLog {
-                path: run_dir.join(EVENTS_FILE),
-            };
+            let events = EventLog::new(&run_dir);
             let mut lead = RecordingLead {
                 inner: driver,
                 events: &events,
@@ -882,6 +919,7 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
             record.rounds = outcome.rounds;
             record.goals = goals;
             record.ended_at = Some(ended);
+            record.runner_pid = None;
             if let Err(e) = record.write(&run_dir) {
                 // The run genuinely finished: its outcome is returned below and
                 // the `run_stopped` event is already on disk. Only this summary
@@ -1091,6 +1129,7 @@ mod tests {
             codename: None,
             spent_usd: Some(0.0042),
             spent_tokens: 12_345,
+            runner_pid: Some(4321),
         }
     }
 
@@ -1110,6 +1149,23 @@ mod tests {
         assert_eq!(rec.spent_usd, None);
         assert_eq!(rec.spent_tokens, 0);
         assert_eq!(rec.rounds, 3, "the rest of the record is intact");
+    }
+
+    #[test]
+    fn a_record_written_before_runner_pid_still_parses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run = tmp.path().join("run");
+        // Same shape as the spend fixture above: an older build's record has
+        // no `runner_pid` key.
+        let mut old = serde_json::to_value(sample_record()).unwrap();
+        let obj = old.as_object_mut().unwrap();
+        assert!(obj.remove("runner_pid").is_some());
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join(RECORD_FILE), serde_json::to_vec(&old).unwrap()).unwrap();
+
+        let rec = AgentiflowRecord::read(&run).unwrap();
+        assert_eq!(rec.runner_pid, None);
+        assert_eq!(rec.spent_tokens, 12_345, "the rest of the record is intact");
     }
 
     #[test]
@@ -1370,6 +1426,7 @@ mod tests {
                 ts: "2026-10-05T12:00:00Z".into(),
                 body: "wrap up".into(),
                 stop: true,
+                interrupt: false,
             })
             .unwrap();
 
@@ -1435,6 +1492,7 @@ mod tests {
                 ts: "2026-10-05T12:00:00Z".into(),
                 body: "stop".into(),
                 stop: true,
+                interrupt: false,
             })
             .unwrap();
     }
@@ -1616,6 +1674,35 @@ mod tests {
         assert_eq!(rec.status, "completed");
         assert_eq!(rec.spent_tokens, 6);
         assert!(close(rec.spent_usd.unwrap(), 6e-6));
+    }
+
+    /// The reaper and `agentiflow stop` signal `runner_pid`, so a `running`
+    /// record must name the process actually executing the run (this one, here),
+    /// and a finished record must not keep naming a pid that may be recycled.
+    #[test]
+    fn running_record_stamps_this_processes_pid_and_the_final_one_clears_it() {
+        let fx = fixture();
+        let id = "af_runner_pid";
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let def = operator_only("round: { ceiling: { rounds: 2 } }");
+        let mut o = opts(&fx, def, id);
+        o.make_provider = spend_watching_factory(run_dir(&fx, id), seen.clone());
+        run_agentiflow(o).unwrap();
+
+        // Every in-flight read (each round, after the per-round rewrite too)
+        // found the record running and owned by this process.
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(seen.iter().all(|r| r.status == "running"));
+        assert!(
+            seen.iter()
+                .all(|r| r.runner_pid == Some(std::process::id())),
+            "{seen:?}"
+        );
+
+        let rec = AgentiflowRecord::read(&run_dir(&fx, id)).unwrap();
+        assert_eq!(rec.status, "completed");
+        assert_eq!(rec.runner_pid, None);
     }
 
     #[test]
@@ -1912,6 +1999,7 @@ mod tests {
         let seeded = rupu_fleet::Board::new(run_dir(&fx, id));
         seeded
             .put_directive(&rupu_fleet::Directive {
+                id: String::new(),
                 author: "operator".into(),
                 ts: "2026-10-05T11:59:00Z".into(),
                 body: "never scan outside 10.0.0.0/24".into(),
