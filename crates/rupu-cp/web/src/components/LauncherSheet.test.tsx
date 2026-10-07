@@ -4,9 +4,9 @@
 // react-router's `useNavigate` are both stubbed.
 
 import '@testing-library/jest-dom/vitest';
-import { afterEach, describe, it, expect, vi } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
-import { api } from '../lib/api';
+import { api, ApiError, type PreviewResponse } from '../lib/api';
 
 // Stub useNavigate — keep the rest of react-router-dom intact.
 const navigateMock = vi.fn();
@@ -16,6 +16,20 @@ vi.mock('react-router-dom', async () => {
 });
 
 import LauncherSheet from './LauncherSheet';
+
+const GLOBAL_PREVIEW: PreviewResponse = { customer: null, accounts: [], warnings: [] };
+const ACME_PREVIEW: PreviewResponse = {
+  customer: { slug: 'acme', name: 'Acme Corp', tint: { light: '#2563eb', dark: '#60a5fa' }, archived: false },
+  accounts: [{ role: 'provider', account: 'acme-anthropic', kind: 'anthropic', agents: [], source: 'customer default' }],
+  warnings: [],
+};
+
+beforeEach(() => {
+  vi.spyOn(api, 'getHosts').mockResolvedValue([]);
+  vi.spyOn(api, 'getProjects').mockResolvedValue([]);
+  vi.spyOn(api, 'getRepos').mockResolvedValue([]);
+  vi.spyOn(api, 'launchPreview').mockResolvedValue(GLOBAL_PREVIEW);
+});
 
 afterEach(() => {
   cleanup();
@@ -157,5 +171,43 @@ describe('LauncherSheet', () => {
         working_dir: undefined,
       }),
     );
+  });
+
+  it('previews the launch for this workflow and shows the customer chip + accounts', async () => {
+    const preview = vi.spyOn(api, 'launchPreview').mockResolvedValue(ACME_PREVIEW);
+    render(<LauncherSheet workflow="audit" declaredInputs={[]} onClose={() => {}} />);
+    expect(await screen.findByText("Acme Corp's accounts", { exact: false })).toBeInTheDocument();
+    expect(screen.getByText('acme-anthropic')).toBeInTheDocument();
+    expect(screen.getAllByText('Acme Corp').length).toBeGreaterThan(0);
+    expect(preview.mock.calls[0][0]).toMatchObject({ workflow: 'audit' });
+    expect(screen.getByRole('button', { name: 'Launch' })).toBeEnabled();
+  });
+
+  it('re-requests the preview with the working dir when the target changes', async () => {
+    vi.spyOn(api, 'browseDir').mockResolvedValue({ path: '/tmp/p', parent: null, dirs: [] });
+    const preview = vi.spyOn(api, 'launchPreview').mockResolvedValue(GLOBAL_PREVIEW);
+    render(<LauncherSheet workflow="audit" declaredInputs={[]} onClose={() => {}} />);
+    await waitFor(() => expect(preview).toHaveBeenCalledTimes(1));
+    const picker = screen.getByPlaceholderText('search projects, repos, or a path…');
+    fireEvent.focus(picker);
+    fireEvent.change(picker, { target: { value: '/tmp/p' } });
+    fireEvent.keyDown(picker, { key: 'Enter' });
+    await waitFor(() =>
+      expect(preview).toHaveBeenLastCalledWith(
+        { workflow: 'audit', working_dir: '/tmp/p', host: undefined },
+        expect.anything(),
+      ),
+    );
+  });
+
+  it('disables Launch with the server message when the preview is a 409', async () => {
+    vi.spyOn(api, 'launchPreview').mockRejectedValue(new ApiError(409, 'customer "gone" no longer exists'));
+    const launch = vi.spyOn(api, 'launchRun').mockResolvedValue({ run_id: 'r' } as never);
+    render(<LauncherSheet workflow="audit" declaredInputs={[]} onClose={() => {}} />);
+    expect(await screen.findByRole('alert')).toHaveTextContent('customer "gone" no longer exists');
+    const btn = screen.getByRole('button', { name: 'Launch' });
+    expect(btn).toBeDisabled();
+    fireEvent.click(btn);
+    expect(launch).not.toHaveBeenCalled();
   });
 });

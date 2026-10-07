@@ -6,9 +6,9 @@
 // api.browseDir (TargetPicker deps), and useNavigate.
 
 import '@testing-library/jest-dom/vitest';
-import { afterEach, describe, it, expect, vi } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
-import { api } from '../lib/api';
+import { api, ApiError, type PreviewResponse } from '../lib/api';
 import { WORKSPACE_ITEM, type TargetItem } from '../lib/targetItems';
 import { buildAgentLaunch } from './AgentLauncherSheet';
 
@@ -20,6 +20,20 @@ vi.mock('react-router-dom', async () => {
 });
 
 import AgentLauncherSheet from './AgentLauncherSheet';
+
+const GLOBAL_PREVIEW: PreviewResponse = { customer: null, accounts: [], warnings: [] };
+const ACME_PREVIEW: PreviewResponse = {
+  customer: { slug: 'acme', name: 'Acme Corp', tint: { light: '#2563eb', dark: '#60a5fa' }, archived: false },
+  accounts: [{ role: 'provider', account: 'acme-anthropic', kind: 'anthropic', agents: [], source: 'customer default' }],
+  warnings: [],
+};
+
+beforeEach(() => {
+  vi.spyOn(api, 'getHosts').mockResolvedValue([]);
+  vi.spyOn(api, 'getProjects').mockResolvedValue([]);
+  vi.spyOn(api, 'getRepos').mockResolvedValue([]);
+  vi.spyOn(api, 'launchPreview').mockResolvedValue(GLOBAL_PREVIEW);
+});
 
 afterEach(() => {
   cleanup();
@@ -214,5 +228,43 @@ describe('AgentLauncherSheet toggle', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Single run' }));
     expect(screen.queryByText(/multi-turn chat/i)).toBeNull();
+  });
+
+  it('previews the launch for this agent and shows the customer chip + accounts', async () => {
+    const preview = vi.spyOn(api, 'launchPreview').mockResolvedValue(ACME_PREVIEW);
+    render(<AgentLauncherSheet agent="scout" onClose={() => {}} />);
+    expect(await screen.findByText("Acme Corp's accounts", { exact: false })).toBeInTheDocument();
+    expect(screen.getByText('acme-anthropic')).toBeInTheDocument();
+    expect(screen.getAllByText('Acme Corp').length).toBeGreaterThan(0);
+    expect(preview.mock.calls[0][0]).toMatchObject({ agent: 'scout' });
+    expect(screen.getByRole('button', { name: 'Run' })).toBeEnabled();
+  });
+
+  it('re-requests the preview with the working dir when the target changes', async () => {
+    vi.spyOn(api, 'browseDir').mockResolvedValue({ path: '/tmp/p', parent: null, dirs: [] });
+    const preview = vi.spyOn(api, 'launchPreview').mockResolvedValue(GLOBAL_PREVIEW);
+    render(<AgentLauncherSheet agent="scout" onClose={() => {}} />);
+    await waitFor(() => expect(preview).toHaveBeenCalledTimes(1));
+    const picker = screen.getByPlaceholderText('search projects, repos, or a path…');
+    fireEvent.focus(picker);
+    fireEvent.change(picker, { target: { value: '/tmp/p' } });
+    fireEvent.keyDown(picker, { key: 'Enter' });
+    await waitFor(() =>
+      expect(preview).toHaveBeenLastCalledWith(
+        { agent: 'scout', working_dir: '/tmp/p', host: undefined },
+        expect.anything(),
+      ),
+    );
+  });
+
+  it('disables Launch with the server message when the preview is a 409', async () => {
+    vi.spyOn(api, 'launchPreview').mockRejectedValue(new ApiError(409, 'customer "gone" no longer exists'));
+    const launch = vi.spyOn(api, 'launchAgent').mockResolvedValue({ run_id: 'r' } as never);
+    render(<AgentLauncherSheet agent="scout" onClose={() => {}} />);
+    expect(await screen.findByRole('alert')).toHaveTextContent('customer "gone" no longer exists');
+    const btn = screen.getByRole('button', { name: 'Run' });
+    expect(btn).toBeDisabled();
+    fireEvent.click(btn);
+    expect(launch).not.toHaveBeenCalled();
   });
 });

@@ -5,12 +5,14 @@
 // Target field. On Launch it POSTs to the launcher endpoint and navigates to
 // the new run's detail page.
 
-import { useEffect, useId, useRef, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { api, type LaunchMode } from '../lib/api';
+import { api, type LaunchMode, type PreviewBody } from '../lib/api';
 import TargetPicker from './TargetPicker';
 import HostSelect from './HostSelect';
 import { Button } from './ui/Button';
+import { LaunchBillingPanel, type BillingState } from './customers/LaunchBillingPanel';
+import { CustomerChip } from './customers/CustomerChip';
 import { WORKSPACE_ITEM, type TargetItem } from '../lib/targetItems';
 
 interface KvRow {
@@ -65,6 +67,16 @@ export default function LauncherSheet({
   const [host, setHost] = useState('local');
   const [launching, setLaunching] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Which customer/accounts the launch would use, and whether it would fail.
+  const [billing, setBilling] = useState<BillingState>({ customer: undefined, blocked: false });
+  const previewBody = useMemo<PreviewBody>(
+    () => ({
+      workflow: workflow,
+      working_dir: target.resolved.working_dir,
+      host: host !== 'local' ? host : undefined,
+    }),
+    [workflow, target, host],
+  );
 
   // Esc-to-close; focus the dialog on open for keyboard users.
   useEffect(() => {
@@ -207,7 +219,14 @@ export default function LauncherSheet({
 
           {/* ── Target ─────────────────────────────────────────────── */}
           <div>
-            <span className="mb-1 block text-ui font-semibold uppercase tracking-wide text-ink-dim">Target</span>
+            <span className="mb-1 flex items-center gap-2 text-ui font-semibold uppercase tracking-wide text-ink-dim">
+              Target
+              {billing.customer !== undefined && (
+                <span className="normal-case tracking-normal">
+                  <CustomerChip customer={billing.customer} size="sm" />
+                </span>
+              )}
+            </span>
             <TargetPicker value={target} onChange={setTarget} disabled={launching} />
           </div>
 
@@ -224,6 +243,8 @@ export default function LauncherSheet({
             />
           </label>
 
+          <LaunchBillingPanel body={previewBody} onResult={setBilling} />
+
           {error && (
             <p role="alert" className="text-ui font-medium text-err">
               {error}
@@ -235,7 +256,7 @@ export default function LauncherSheet({
           <Button variant="secondary" onClick={onClose} disabled={launching}>
             Cancel
           </Button>
-          <Button onClick={onLaunch} disabled={launching}>
+          <Button onClick={onLaunch} disabled={launching || billing.blocked}>
             {launching ? 'Launching…' : 'Launch'}
           </Button>
         </div>

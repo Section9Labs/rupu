@@ -2298,10 +2298,11 @@ export const api = {
   /** The customer and the provider / fallback / SCM accounts a launch from
    *  this directory would use. 409 when the launch itself would fail (a
    *  project assigned to a customer that no longer exists). */
-  launchPreview(body: PreviewBody): Promise<PreviewResponse> {
+  launchPreview(body: PreviewBody, signal?: AbortSignal): Promise<PreviewResponse> {
     return request<PreviewResponse>('/api/launch/preview', {
       method: 'POST',
       body: JSON.stringify(body),
+      signal,
     });
   },
 
