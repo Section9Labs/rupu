@@ -587,6 +587,12 @@ async fn hard_stop_now_kills_the_coordinator_and_units() {
         unit.id,
         unit.pgid
     );
+    // The coordinator led its own group, and the `sleep 120` its lead's bash
+    // tool was running is in it: left behind, it would be work nobody can stop.
+    assert!(
+        group_goes_away(pid, 15).await,
+        "what the lead's tool started (group {pid}) outlived `stop --now`"
+    );
 
     // And the run is over for good: the status the operator sees agrees.
     let after = status_json(&fx, &script, &id);

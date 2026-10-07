@@ -53,6 +53,20 @@ pub fn terminate_pid(pid: u32) -> bool {
     rustix::process::kill_process(pid, rustix::process::Signal::TERM).is_ok()
 }
 
+/// Whether `pid` leads its own process group (its pgid is its pid).
+///
+/// A detached coordinator (`rupu agentiflow run --detach`) does: it is spawned
+/// with `process_group(0)`, so the children its lead's `bash` tool starts are in
+/// its group. A foreground coordinator shares the group of the shell that
+/// started it, which must never be signalled on its account. `false` for a pid
+/// that is not running or not a real pid.
+pub fn leads_own_group(pid: u32) -> bool {
+    let Some(target) = rustix_pid(pid) else {
+        return false;
+    };
+    rustix::process::getpgid(Some(target)).is_ok_and(|pgid| pgid == target)
+}
+
 /// A process-group id as a rustix `Pid`, or `None` when signalling it could
 /// only be a mistake.
 ///
@@ -132,6 +146,31 @@ mod tests {
             assert!(!f(0));
             assert!(!f(u32::MAX));
         }
+    }
+
+    #[test]
+    fn a_process_leads_its_own_group_only_when_spawned_to() {
+        use std::os::unix::process::CommandExt;
+        let sleeper = |own_group: bool| {
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.args(["-c", "sleep 30"]);
+            if own_group {
+                cmd.process_group(0);
+            }
+            cmd.spawn().unwrap()
+        };
+        let (mut leader, mut follower) = (sleeper(true), sleeper(false));
+        assert!(leads_own_group(leader.id()));
+        // Spawned without `process_group(0)`: in this test process's group.
+        assert!(!leads_own_group(follower.id()));
+        leader.kill().unwrap();
+        follower.kill().unwrap();
+        leader.wait().unwrap();
+        follower.wait().unwrap();
+        // Gone, and never a real pid.
+        assert!(!leads_own_group(leader.id()));
+        assert!(!leads_own_group(0));
+        assert!(!leads_own_group(u32::MAX));
     }
 
     #[test]

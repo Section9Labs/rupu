@@ -114,9 +114,11 @@ pub enum Action {
     /// By default the stop is graceful: it is queued like a steering message,
     /// and the envelope winds the run down at the next round boundary (the
     /// units it launched are stopped with it). `--now` is the hard stop: it
-    /// SIGTERMs the coordinator, SIGTERMs every unit still running (SIGKILL
-    /// for one that outlives a short grace), then records the run as failed
-    /// (`operator_stop:now`) without waiting for the round.
+    /// SIGTERMs the coordinator (and, for a detached run, the process group it
+    /// leads, so what its lead's tools started goes too), SIGTERMs every unit
+    /// still running (SIGKILL for one that outlives a short grace), then
+    /// records the run as failed (`operator_stop:now`) without waiting for the
+    /// round.
     Stop {
         /// Run id (`af_...`): the full id, the compact form `list` prints, or
         /// a unique prefix / suffix of it.

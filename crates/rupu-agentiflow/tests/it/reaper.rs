@@ -82,6 +82,43 @@ impl Drop for Sleeper {
     }
 }
 
+/// A process that is not a group leader: a `sleep` placed in an existing group
+/// (`pgid`), or, with `None`, left in this test process's own group. What a
+/// coordinator's `bash` tool starts is the first; a bystander is the second.
+/// Reaped by a thread the moment it dies, like [`Sleeper`].
+struct Member {
+    pid: u32,
+    waiter: Option<JoinHandle<ExitStatus>>,
+}
+
+impl Member {
+    fn spawn(pgid: Option<u32>) -> Self {
+        let mut cmd = Command::new("/bin/sleep");
+        cmd.arg("60").stdin(Stdio::null());
+        if let Some(pgid) = pgid {
+            cmd.process_group(i32::try_from(pgid).unwrap());
+        }
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id();
+        Self {
+            pid,
+            waiter: Some(std::thread::spawn(move || child.wait().unwrap())),
+        }
+    }
+}
+
+impl Drop for Member {
+    fn drop(&mut self) {
+        if let Some(waiter) = self.waiter.take() {
+            // SIGKILL this one process: it may share the test's own group.
+            let _ = Command::new("kill")
+                .args(["-9", &self.pid.to_string()])
+                .status();
+            let _ = waiter.join();
+        }
+    }
+}
+
 /// Wait (bounded) for a group the reaper signalled to be gone. The reaper
 /// returns as soon as it has sent SIGKILL (in production it is not the units'
 /// parent and cannot reap them), so the kernel's termination and this test's
@@ -492,6 +529,42 @@ fn a_hard_stop_kills_the_coordinator_and_the_units_and_closes_the_record_and_the
         .reaped
         .is_empty());
     assert_eq!(events(&global, "af_live").len(), 1);
+}
+
+#[test]
+fn a_hard_stop_signals_the_whole_group_of_a_detached_coordinator() {
+    let global = tempdir().unwrap();
+    // A detached run's coordinator leads its own group, and the process its
+    // lead's `bash` tool started (a long scan) is in that group.
+    let coordinator = Sleeper::spawn();
+    let tool = Member::spawn(Some(coordinator.pgid));
+    write_running_record(&global, "af_live", Some(coordinator.pgid));
+
+    let out = hard_stop(&run_dir(&global, "af_live"), Utc::now()).unwrap();
+
+    assert_eq!(out, HardStopOutcome::Stopped);
+    wait_until_dead(coordinator.pgid);
+    wait_until_dead(tool.pid);
+    assert_eq!(read_record(&global, "af_live").status, "failed");
+}
+
+#[test]
+fn a_hard_stop_signals_only_the_pid_of_a_coordinator_that_leads_no_group() {
+    let global = tempdir().unwrap();
+    // A foreground run's coordinator shares its shell's group (here, this test
+    // process's): the stop ends it and leaves everything else in that group be.
+    let coordinator = Member::spawn(None);
+    let bystander = Member::spawn(None);
+    write_running_record(&global, "af_fg", Some(coordinator.pid));
+
+    let out = hard_stop(&run_dir(&global, "af_fg"), Utc::now()).unwrap();
+
+    assert_eq!(out, HardStopOutcome::Stopped);
+    wait_until_dead(coordinator.pid);
+    assert!(
+        pid_is_running(bystander.pid),
+        "a process in the coordinator's (shared) group was signalled"
+    );
 }
 
 #[test]

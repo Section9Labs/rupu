@@ -60,7 +60,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use serde_json::json;
 
-use crate::proc::{kill_group, pid_is_running, terminate_group, terminate_pid};
+use crate::proc::{kill_group, leads_own_group, pid_is_running, terminate_group, terminate_pid};
 use crate::run::{agentiflow_dir, AgentiflowRecord, EventLog};
 use crate::supervisor::units_on_disk;
 
@@ -156,7 +156,7 @@ fn reap_one(run_dir: &Path, now: DateTime<Utc>) -> bool {
         return false;
     };
 
-    wind_down_units(run_dir);
+    wind_down_units(run_dir, None);
 
     // The grace can be long enough for something else to have settled the run (a
     // second reaper, or a resume that stamped a new owner): re-read and judge
@@ -242,12 +242,15 @@ pub enum HardStopOutcome {
 /// 1. Read the record; a run that is not `running` is
 ///    [`AlreadyTerminal`](HardStopOutcome::AlreadyTerminal), untouched, nothing
 ///    signalled.
-/// 2. SIGTERM the coordinator (`runner_pid`) if it is running. Its SIGTERM
-///    handler exits the process without running any cleanup, so nothing below
-///    is left to it.
+/// 2. SIGTERM the coordinator (`runner_pid`) if it is running: its whole
+///    process group when it leads one (a detached run does, and what its lead's
+///    `bash` tool started is in it), else just the pid. Its SIGTERM handler
+///    exits the process without running any cleanup, so nothing below is left
+///    to it.
 /// 3. Wind down the run's units: SIGTERM each live unit group, a bounded
-///    grace, SIGKILL whatever outlived it (the reaper's own wind-down). An
-///    operator who asks for a hard stop gets the escalation.
+///    grace, SIGKILL whatever outlived it (the reaper's own wind-down; the
+///    coordinator's group shares the grace). An operator who asks for a hard
+///    stop gets the escalation.
 /// 4. RE-READ the record and, only if it is STILL `running`, [`finalize_failed`]
 ///    it (`operator_stop:now`). The grace is long enough for the run to have
 ///    finished on its own meanwhile; the stale snapshot from step 1 must never
@@ -270,12 +273,27 @@ pub fn hard_stop(run_dir: &Path, now: DateTime<Utc>) -> std::io::Result<HardStop
         return Ok(HardStopOutcome::AlreadyTerminal(record.status));
     }
 
+    let mut coordinator_group = None;
     if let Some(pid) = record.runner_pid {
-        if pid_is_running(pid) && !terminate_pid(pid) {
-            tracing::warn!(run = %run_dir.display(), pid, "could not SIGTERM the coordinator");
+        if pid_is_running(pid) {
+            // A detached coordinator leads its own group, and what its lead's
+            // `bash` tool started (a long scan) is in it: its SIGTERM handler
+            // exits without cleanup, so signal the group, or that work is left
+            // running with nobody to stop it. A foreground coordinator shares
+            // its shell's group, which is not ours to signal: just the pid.
+            let delivered = if leads_own_group(pid) {
+                let delivered = terminate_group(pid);
+                coordinator_group = delivered.then_some(pid);
+                delivered
+            } else {
+                terminate_pid(pid)
+            };
+            if !delivered {
+                tracing::warn!(run = %run_dir.display(), pid, "could not SIGTERM the coordinator");
+            }
         }
     }
-    wind_down_units(run_dir);
+    wind_down_units(run_dir, coordinator_group);
 
     let mut record = AgentiflowRecord::read(run_dir)?;
     if record.status != "running" {
@@ -295,8 +313,11 @@ pub fn hard_stop(run_dir: &Path, now: DateTime<Utc>) -> std::io::Result<HardStop
 /// SIGTERM every live, non-terminal unit group the run recorded, give them
 /// [`TERM_GRACE`], then SIGKILL the ones still standing. One pass, bounded:
 /// neither a sweep nor a hard stop may hang on a unit that will not die.
-fn wind_down_units(run_dir: &Path) {
-    let mut signalled: Vec<u32> = Vec::new();
+///
+/// `already_signalled` is a group the caller has just sent SIGTERM (a hard
+/// stop's coordinator group): it shares the grace and the SIGKILL.
+fn wind_down_units(run_dir: &Path, already_signalled: Option<u32>) {
+    let mut signalled: Vec<u32> = already_signalled.into_iter().collect();
     for unit in units_on_disk(run_dir) {
         if unit.status.is_terminal() {
             continue;
