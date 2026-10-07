@@ -27,11 +27,17 @@ vi.mock('../../lib/netflow', async () => {
 
 import ProjectNetworkTab from './ProjectNetworkTab';
 
+const NOW = new Date('2026-10-06T12:00:00Z');
+const DAY = { from: '2026-10-05T12:00:00.000Z' };
+
 afterEach(() => {
+  vi.useRealTimers();
   cleanup();
 });
 
 beforeEach(() => {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(NOW);
   fetchProjectNetflow.mockReset();
   fetchNetflowExplorer.mockReset();
   fetchProjectNetflow.mockResolvedValue(emptyFlowsResponse());
@@ -47,9 +53,9 @@ describe('ProjectNetworkTab', () => {
     render(<ProjectNetworkTab wsId="ws-1" />);
 
     await waitFor(() =>
-      expect(fetchNetflowExplorer).toHaveBeenCalledWith('project:ws-1', undefined, undefined),
+      expect(fetchNetflowExplorer).toHaveBeenCalledWith('project:ws-1', DAY, undefined),
     );
-    expect(fetchProjectNetflow).toHaveBeenCalledWith('ws-1', undefined, undefined);
+    expect(fetchProjectNetflow).toHaveBeenCalledWith('ws-1', DAY, undefined);
     await screen.findByText('api.anthropic.com');
     // Attribution columns show at project scope too.
     expect(screen.getByText('review-wf')).toBeInTheDocument();
@@ -78,10 +84,10 @@ describe('ProjectNetworkTab', () => {
 
   it('re-fetches when wsId changes (key remount resets all view state)', async () => {
     const { rerender } = render(<ProjectNetworkTab wsId="ws-1" />);
-    await waitFor(() => expect(fetchProjectNetflow).toHaveBeenCalledWith('ws-1', undefined, undefined));
+    await waitFor(() => expect(fetchProjectNetflow).toHaveBeenCalledWith('ws-1', DAY, undefined));
 
     rerender(<ProjectNetworkTab wsId="ws-2" />);
-    await waitFor(() => expect(fetchProjectNetflow).toHaveBeenCalledWith('ws-2', undefined, undefined));
+    await waitFor(() => expect(fetchProjectNetflow).toHaveBeenCalledWith('ws-2', DAY, undefined));
   });
 
   it('threads the server-echoed window into the table, producing the range-aware empty state', async () => {

@@ -27,11 +27,17 @@ vi.mock('../../../lib/netflow', async () => {
 
 import NetflowExplorer from './NetflowExplorer';
 
+const NOW = new Date('2026-10-06T12:00:00Z');
+const DAY = { from: '2026-10-05T12:00:00.000Z' };
+
 afterEach(() => {
+  vi.useRealTimers();
   cleanup();
 });
 
 beforeEach(() => {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(NOW);
   fetchGlobalNetflow.mockReset();
   fetchRunNetflow.mockReset();
   fetchNetflowExplorer.mockReset();
@@ -48,8 +54,8 @@ describe('NetflowExplorer', () => {
     render(<NetflowExplorer scope="global" />);
 
     await screen.findByText('api.anthropic.com');
-    expect(fetchNetflowExplorer).toHaveBeenCalledWith(undefined, undefined, undefined);
-    expect(fetchGlobalNetflow).toHaveBeenCalledWith(undefined, undefined);
+    expect(fetchNetflowExplorer).toHaveBeenCalledWith(undefined, DAY, undefined);
+    expect(fetchGlobalNetflow).toHaveBeenCalledWith(DAY, undefined);
     // KPI strip, coverage pill, view switcher, topology column, org card.
     expect(screen.getByText('Flows')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /coverage & gaps/i })).toBeInTheDocument();
@@ -65,8 +71,8 @@ describe('NetflowExplorer', () => {
 
     await waitFor(() => expect(fetchNetflowExplorer).toHaveBeenCalledTimes(2));
     const filters = { workflows: ['review-wf'], origins: [], orgs: [], hosts: [] };
-    expect(fetchNetflowExplorer).toHaveBeenLastCalledWith(undefined, undefined, filters);
-    expect(fetchGlobalNetflow).toHaveBeenLastCalledWith(undefined, filters);
+    expect(fetchNetflowExplorer).toHaveBeenLastCalledWith(undefined, DAY, filters);
+    expect(fetchGlobalNetflow).toHaveBeenLastCalledWith(DAY, filters);
     expect(screen.getByText('workflow:review-wf')).toBeInTheDocument();
   });
 
@@ -79,7 +85,7 @@ describe('NetflowExplorer', () => {
     fireEvent.click(screen.getByRole('button', { name: /remove filter workflow:review-wf/i }));
 
     await waitFor(() => expect(fetchNetflowExplorer).toHaveBeenCalledTimes(3));
-    expect(fetchNetflowExplorer).toHaveBeenLastCalledWith(undefined, undefined, undefined);
+    expect(fetchNetflowExplorer).toHaveBeenLastCalledWith(undefined, DAY, undefined);
   });
 
   it('org chips carry the display label from the sankey org list', async () => {
@@ -117,7 +123,7 @@ describe('NetflowExplorer', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /zoom out/i }));
     await waitFor(() => expect(fetchNetflowExplorer).toHaveBeenCalledTimes(3));
-    expect(fetchNetflowExplorer).toHaveBeenLastCalledWith(undefined, undefined, undefined);
+    expect(fetchNetflowExplorer).toHaveBeenLastCalledWith(undefined, DAY, undefined);
   });
 
   it('a table row click opens the flow detail panel; close dismisses it', async () => {
@@ -158,5 +164,45 @@ describe('NetflowExplorer', () => {
         undefined,
       ),
     );
+  });
+
+  it('renders the aggregate sections while the flows request is still pending', async () => {
+    fetchGlobalNetflow.mockReturnValue(new Promise(() => {}));
+    render(<NetflowExplorer scope="global" />);
+    await screen.findByText('Workflows');
+    expect(screen.getByText('Flows')).toBeInTheDocument();
+    expect(screen.getByText(/loading network flows/i)).toBeInTheDocument();
+  });
+
+  it('renders the flows table while the explorer request is still pending', async () => {
+    fetchNetflowExplorer.mockReturnValue(new Promise(() => {}));
+    render(<NetflowExplorer scope="global" />);
+    await screen.findByText('api.anthropic.com');
+    expect(screen.queryByText('Workflows')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '24h' })).toBeInTheDocument();
+    expect(screen.getByText(/loading network flows/i)).toBeInTheDocument();
+  });
+
+  it('an explorer error leaves the picker and the table usable', async () => {
+    fetchNetflowExplorer.mockRejectedValue(new Error('explorer down'));
+    render(<NetflowExplorer scope="global" />);
+    await screen.findByText('explorer down');
+    await screen.findByText('api.anthropic.com');
+    expect(screen.getByRole('button', { name: '24h' })).toBeInTheDocument();
+  });
+
+  it('a flows error leaves the aggregates on screen', async () => {
+    fetchGlobalNetflow.mockRejectedValue(new Error('flows down'));
+    render(<NetflowExplorer scope="global" />);
+    await screen.findByText('flows down');
+    expect(screen.getByText('Workflows')).toBeInTheDocument();
+  });
+
+  it('run scope without a span still opens on All', async () => {
+    render(<NetflowExplorer scope="run" runId="run-1" />);
+    await waitFor(() =>
+      expect(fetchNetflowExplorer).toHaveBeenCalledWith('run:run-1', undefined, undefined),
+    );
+    expect(fetchRunNetflow).toHaveBeenCalledWith('run-1', undefined, undefined);
   });
 });

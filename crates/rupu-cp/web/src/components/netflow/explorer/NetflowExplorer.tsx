@@ -12,10 +12,11 @@
 // visualizations, the org cards, and the table always describe the same
 // server-computed set.
 //
-// One fetch effect, one Promise.all, one error surface (the Fix 6
-// pattern from the pre-v3 pages); the server `window` echo is threaded to
-// every consumer that words an empty state or reads out the window —
-// never picker state. Mount this with a `key` of the scope id so a
+// Two independent fetch effects — the aggregates (a few KB) and the flows
+// list (can be large) — each with its own error surface, so every section
+// renders as soon as its own response arrives; the server `window` echo is
+// threaded to every consumer that words an empty state or reads out the
+// window — never picker state. Mount this with a `key` of the scope id so a
 // scope-target change (e.g. RunDetail switching runs) resets all view
 // state instead of leaking the previous target's filters.
 
@@ -35,7 +36,7 @@ import {
 import { Segmented } from '../../ui/Segmented';
 import { netflowWindowApplied, type NetflowScope } from '../ScopeDisclosure';
 import NetflowTable from '../NetflowTable';
-import TimeRangePicker, { toNetflowRange, type TimeRangeValue } from '../TimeRangePicker';
+import TimeRangePicker, { presetValue, toNetflowRange, type TimeRangeValue } from '../TimeRangePicker';
 import ActivityStrip from './ActivityStrip';
 import CoveragePopover from './CoveragePopover';
 import FilterChips, { type FilterDim } from './FilterChips';
@@ -84,7 +85,9 @@ export function NetflowExplorer({ scope, projectId, runId, initialWindow }: Netf
   const [range, setRange] = useState<TimeRangeValue>(() =>
     initialWindow && (initialWindow.from || initialWindow.to)
       ? { preset: 'custom', from: initialWindow.from, to: initialWindow.to }
-      : { preset: 'all' },
+      : scope === 'run'
+        ? { preset: 'all' }
+        : presetValue('24h', new Date()),
   );
   const [view, setView] = useState<ViewMode>('topology');
   const [filters, setFilters] = useState<NetflowFilters>(EMPTY_NETFLOW_FILTERS);
@@ -92,13 +95,15 @@ export function NetflowExplorer({ scope, projectId, runId, initialWindow }: Netf
   const [selectedFlow, setSelectedFlow] = useState<FlowView | null>(null);
   const [explorer, setExplorer] = useState<ExplorerResponse | null>(null);
   const [flows, setFlows] = useState<NetflowResponse | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  // True while a refetch is in flight OVER existing data (the initial
-  // load has its own full-surface loading state). Previous data staying
-  // on screen is deliberate — but only honest with a visible "Updating…"
-  // beside it, or whole-history numbers would render under a
+  const [explorerError, setExplorerError] = useState<string | null>(null);
+  const [flowsError, setFlowsError] = useState<string | null>(null);
+  // True while a refetch is in flight OVER existing data, per request (the
+  // initial load has its own per-section loading state). Previous data
+  // staying on screen is deliberate — but only honest with a visible
+  // "Updating…" beside it, or whole-history numbers would render under a
   // just-selected narrower label with nothing saying so.
-  const [refreshing, setRefreshing] = useState(false);
+  const [explorerRefreshing, setExplorerRefreshing] = useState(false);
+  const [flowsRefreshing, setFlowsRefreshing] = useState(false);
 
   const scopeParam =
     scope === 'run' && runId
@@ -107,9 +112,36 @@ export function NetflowExplorer({ scope, projectId, runId, initialWindow }: Netf
         ? `project:${projectId}`
         : undefined;
 
+  // The aggregates and the flows list load independently: each section
+  // renders as soon as its own response arrives. Previous data stays on
+  // screen during a refetch — a cross-filter click narrowing the set must
+  // not collapse the whole surface to a loading line and rebuild it.
   useEffect(() => {
     let cancelled = false;
-    setError(null);
+    setExplorerError(null);
+    setExplorerRefreshing(true);
+    const f = filtersAreEmpty(filters) ? undefined : filters;
+    fetchNetflowExplorer(scopeParam, toNetflowRange(range), f)
+      .then((e) => {
+        if (cancelled) return;
+        setExplorer(e);
+        setExplorerRefreshing(false);
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        setExplorerRefreshing(false);
+        setExplorerError(e instanceof Error ? e.message : 'Failed to load network flows');
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scope, projectId, runId, range, filters]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setFlowsError(null);
+    setFlowsRefreshing(true);
     const q = toNetflowRange(range);
     const f = filtersAreEmpty(filters) ? undefined : filters;
     const flowsFetch =
@@ -118,23 +150,16 @@ export function NetflowExplorer({ scope, projectId, runId, initialWindow }: Netf
         : scope === 'project' && projectId
           ? fetchProjectNetflow(projectId, q, f)
           : fetchGlobalNetflow(q, f);
-    // Previous data stays on screen while a refetch is in flight — a
-    // cross-filter click narrowing the set must not collapse the whole
-    // surface to a loading line and rebuild it. `refreshing` marks the
-    // interim so the stale numbers are never silently presented as the
-    // new selection's.
-    setRefreshing(true);
-    Promise.all([fetchNetflowExplorer(scopeParam, q, f), flowsFetch])
-      .then(([e, fl]) => {
+    flowsFetch
+      .then((fl) => {
         if (cancelled) return;
-        setExplorer(e);
         setFlows(fl);
-        setRefreshing(false);
+        setFlowsRefreshing(false);
       })
       .catch((e: unknown) => {
         if (cancelled) return;
-        setRefreshing(false);
-        setError(e instanceof Error ? e.message : 'Failed to load network flows');
+        setFlowsRefreshing(false);
+        setFlowsError(e instanceof Error ? e.message : 'Failed to load network flows');
       });
     return () => {
       cancelled = true;
@@ -184,21 +209,6 @@ export function NetflowExplorer({ scope, projectId, runId, initialWindow }: Netf
     setRange({ preset: 'all' });
   }
 
-  if (error) {
-    // The picker stays reachable so changing the window (or re-choosing a
-    // preset) is the retry affordance — an error state with no way back
-    // out would strand the operator.
-    return (
-      <div className="space-y-3">
-        <TimeRangePicker value={range} onChange={changeRange} />
-        <p className="text-sm text-err">{error}</p>
-      </div>
-    );
-  }
-  if (explorer === null || flows === null) {
-    return <p className="text-sm text-ink-dim">Loading network flows…</p>;
-  }
-
   const selectedTopo: Record<TopoDim, string[]> = {
     wf: filters.workflows,
     or: filters.origins,
@@ -206,87 +216,112 @@ export function NetflowExplorer({ scope, projectId, runId, initialWindow }: Netf
   };
 
   const filtersActive = !filtersAreEmpty(filters);
+  const updating =
+    (explorerRefreshing && explorer !== null) || (flowsRefreshing && flows !== null);
 
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-end gap-3">
-        {refreshing && (
+        {updating && (
           <p role="status" className="text-note text-ink-mute">
             Updating…
           </p>
         )}
-        <CoveragePopover
-          scope={scope}
-          droppedTotal={explorer.dropped_total}
-          capture={flows.capture}
-        />
-      </div>
-      <ActivityStrip
-        histogram={explorer.histogram}
-        range={range}
-        onRangeChange={changeRange}
-        onZoom={zoomTo}
-        appliedWindow={explorer.window}
-      />
-      <KpiStrip kpis={explorer.kpis} />
-      <div className="rounded-xl border border-border bg-panel px-5 py-4">
-        <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
-          <Segmented
-            ariaLabel="Visualization"
-            size="sm"
-            options={VIEW_OPTIONS}
-            value={view}
-            onChange={(v) => setView(v as ViewMode)}
-          />
-          <p className="text-note text-ink-mute">{PANEL_HINT[view]}</p>
-        </div>
-        {view === 'topology' ? (
-          <TopologyView
-            sankey={explorer.sankey}
-            selected={selectedTopo}
-            onToggle={(dim, key) => toggleFilter(TOPO_DIM_TO_FILTER[dim], key)}
+        {explorer && flows && (
+          <CoveragePopover
             scope={scope}
-            appliedWindow={explorer.window}
-          />
-        ) : (
-          <TimelineView
-            timeline={explorer.timeline}
-            selectedHosts={filters.hosts}
-            onToggleHost={(key) => toggleFilter('hosts', key)}
-            onZoomBucket={zoomTo}
-            canZoomOut={zoomStack.length > 0}
-            onZoomOut={zoomOut}
-            scope={scope}
-            appliedWindow={explorer.window}
+            droppedTotal={explorer.dropped_total}
+            capture={flows.capture}
           />
         )}
       </div>
-      {view === 'topology' && (
-        <OrgCards
-          lanes={explorer.timeline.lanes}
-          selectedHosts={filters.hosts}
-          onToggleHost={(key) => toggleFilter('hosts', key)}
+      {explorerError || explorer === null ? (
+        // The picker stays reachable before the aggregates arrive and on
+        // their error — changing the window is the retry affordance.
+        <div className="space-y-3">
+          <TimeRangePicker value={range} onChange={changeRange} />
+          {explorerError ? (
+            <p className="text-sm text-err">{explorerError}</p>
+          ) : (
+            <p className="text-sm text-ink-dim">Loading network flows…</p>
+          )}
+        </div>
+      ) : (
+        <>
+          <ActivityStrip
+            histogram={explorer.histogram}
+            range={range}
+            onRangeChange={changeRange}
+            onZoom={zoomTo}
+            appliedWindow={explorer.window}
+          />
+          <KpiStrip kpis={explorer.kpis} />
+          <div className="rounded-xl border border-border bg-panel px-5 py-4">
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+              <Segmented
+                ariaLabel="Visualization"
+                size="sm"
+                options={VIEW_OPTIONS}
+                value={view}
+                onChange={(v) => setView(v as ViewMode)}
+              />
+              <p className="text-note text-ink-mute">{PANEL_HINT[view]}</p>
+            </div>
+            {view === 'topology' ? (
+              <TopologyView
+                sankey={explorer.sankey}
+                selected={selectedTopo}
+                onToggle={(dim, key) => toggleFilter(TOPO_DIM_TO_FILTER[dim], key)}
+                scope={scope}
+                appliedWindow={explorer.window}
+              />
+            ) : (
+              <TimelineView
+                timeline={explorer.timeline}
+                selectedHosts={filters.hosts}
+                onToggleHost={(key) => toggleFilter('hosts', key)}
+                onZoomBucket={zoomTo}
+                canZoomOut={zoomStack.length > 0}
+                onZoomOut={zoomOut}
+                scope={scope}
+                appliedWindow={explorer.window}
+              />
+            )}
+          </div>
+          {view === 'topology' && (
+            <OrgCards
+              lanes={explorer.timeline.lanes}
+              selectedHosts={filters.hosts}
+              onToggleHost={(key) => toggleFilter('hosts', key)}
+            />
+          )}
+          <FilterChips
+            filters={filters}
+            orgLabel={(key) => orgLabels.get(key) ?? key}
+            windowApplied={netflowWindowApplied(explorer.window)}
+            onRemove={toggleFilter}
+            onClearWindow={() => changeRange({ preset: 'all' })}
+            onClearAll={clearAll}
+          />
+        </>
+      )}
+      {flowsError ? (
+        <p className="text-sm text-err">{flowsError}</p>
+      ) : flows === null ? (
+        <p className="text-sm text-ink-dim">Loading network flows…</p>
+      ) : (
+        <NetflowTable
+          flows={flows.flows}
+          droppedTotal={flows.dropped_total}
+          incomplete={flows.incomplete}
+          asnLoaded={flows.asn_loaded}
+          scope={scope}
+          appliedWindow={flows.window}
+          showAttribution={scope !== 'run'}
+          onRowClick={setSelectedFlow}
+          filtersActive={filtersActive}
         />
       )}
-      <FilterChips
-        filters={filters}
-        orgLabel={(key) => orgLabels.get(key) ?? key}
-        windowApplied={netflowWindowApplied(explorer.window)}
-        onRemove={toggleFilter}
-        onClearWindow={() => changeRange({ preset: 'all' })}
-        onClearAll={clearAll}
-      />
-      <NetflowTable
-        flows={flows.flows}
-        droppedTotal={flows.dropped_total}
-        incomplete={flows.incomplete}
-        asnLoaded={flows.asn_loaded}
-        scope={scope}
-        appliedWindow={flows.window}
-        showAttribution={scope !== 'run'}
-        onRowClick={setSelectedFlow}
-        filtersActive={filtersActive}
-      />
       <FlowDetailPanel flow={selectedFlow} scope={scope} onClose={() => setSelectedFlow(null)} />
     </div>
   );
