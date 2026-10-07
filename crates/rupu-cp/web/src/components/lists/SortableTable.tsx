@@ -7,11 +7,16 @@
 // `sortable` + `sortValue`. Strings compare case-insensitively (localeCompare);
 // numbers compare numerically; null/undefined always sort LAST regardless of
 // direction. The sort is stable (original order is the tiebreaker).
+//
+// `virtualize` opts a long table into window virtualization: above its
+// threshold only the rows near the viewport are mounted, with spacer rows
+// standing in for the rest (see `useWindowVirtualRows`).
 
 import { Fragment, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { ChevronDown, ChevronRight, ChevronUp } from 'lucide-react';
 import { cn } from '../../lib/cn';
+import { useWindowVirtualRows } from './useWindowVirtualRows';
 
 export interface Column<T> {
   key: string;
@@ -103,6 +108,7 @@ export default function SortableTable<T>({
   rowHref,
   onRowClick,
   renderDetail,
+  virtualize,
 }: {
   columns: Column<T>[];
   rows: T[];
@@ -126,6 +132,11 @@ export default function SortableTable<T>({
    *  nested-concern panels) see no behavior change: every row is
    *  expandable, so `rowHref` never applies, same as before. */
   renderDetail?: (row: T) => React.ReactNode;
+  /** Mount only the rows near the viewport once the table has more than
+   *  `threshold` rows (window virtualization; sorting still covers every
+   *  row). At or below the threshold rendering is unchanged. For tables
+   *  without `renderDetail` (detail-row heights are not measured). */
+  virtualize?: { threshold: number };
 }) {
   const [sort, setSort] = useState<SortSpec | null>(initialSort ?? null);
   const [open, setOpen] = useState<ReadonlySet<string>>(new Set());
@@ -179,6 +190,11 @@ export default function SortableTable<T>({
       })
       .map((d) => d.row);
   }, [rows, sort, columns]);
+
+  const isVirtual = virtualize !== undefined && sorted.length > virtualize.threshold;
+  const virtualKeys = isVirtual ? sorted.map(rowKey) : [];
+  const win = useWindowVirtualRows(virtualKeys, isVirtual);
+  const visibleRows = isVirtual ? sorted.slice(win.start, win.end) : sorted;
 
   function toggleSort(key: string) {
     setSort((prev) =>
@@ -234,8 +250,13 @@ export default function SortableTable<T>({
             })}
           </tr>
         </thead>
-        <tbody className="divide-y divide-border">
-          {sorted.map((row) => {
+        <tbody ref={win.bodyRef} className="divide-y divide-border">
+          {isVirtual && win.topPx > 0 && (
+            <tr aria-hidden="true" style={{ height: win.topPx }}>
+              <td colSpan={totalCols} />
+            </tr>
+          )}
+          {visibleRows.map((row) => {
             const key = rowKey(row);
             // A row is expandable iff renderDetail returns non-null content
             // for IT specifically — not table-global. Rows without detail
@@ -256,6 +277,7 @@ export default function SortableTable<T>({
             return (
               <Fragment key={key}>
                 <tr
+                  ref={isVirtual ? win.measure(key) : undefined}
                   onClick={onRowClick ? () => onRowClick(row) : undefined}
                   tabIndex={onRowClick ? 0 : undefined}
                   onKeyDown={
@@ -337,6 +359,11 @@ export default function SortableTable<T>({
               </Fragment>
             );
           })}
+          {isVirtual && win.bottomPx > 0 && (
+            <tr aria-hidden="true" style={{ height: win.bottomPx }}>
+              <td colSpan={totalCols} />
+            </tr>
+          )}
         </tbody>
       </table>
     </div>

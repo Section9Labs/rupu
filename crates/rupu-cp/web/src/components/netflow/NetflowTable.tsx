@@ -410,6 +410,7 @@ export function NetflowTable({
         rowKey={(f) => f.id}
         initialSort={{ key: 'ts', dir: 'desc' }}
         onRowClick={onRowClick}
+        virtualize={{ threshold: 500 }}
       />
     </div>
   );

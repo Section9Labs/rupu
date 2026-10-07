@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
-import { afterEach, describe, it, expect } from 'vitest';
-import { render, screen, cleanup, fireEvent, within } from '@testing-library/react';
+import { afterEach, describe, it, expect, vi } from 'vitest';
+import { render, screen, cleanup, fireEvent, within, act } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import SortableTable, { type Column } from './SortableTable';
+import { ESTIMATED_ROW_PX, OVERSCAN_ROWS } from './useWindowVirtualRows';
 
 interface Row {
   id: string;
@@ -261,5 +262,65 @@ describe('SortableTable', () => {
     // The subject cell still carries the row's real navigation link.
     const nameLink = within(betaRow).getByRole('link');
     expect(nameLink).toHaveAttribute('href', '/things/b');
+  });
+});
+
+describe('SortableTable virtualization', () => {
+  type VRow = { id: string; n: number };
+  const rows = (count: number): VRow[] =>
+    Array.from({ length: count }, (_, i) => ({ id: `r${i}`, n: count - i }));
+  const columns = [
+    { key: 'id', header: 'Id', render: (r: VRow) => r.id },
+    { key: 'n', header: 'N', sortable: true, sortValue: (r: VRow) => r.n, render: (r: VRow) => String(r.n) },
+  ];
+  const mounted = (c: HTMLElement) =>
+    Array.from(c.querySelectorAll('tbody tr:not([aria-hidden])')) as HTMLTableRowElement[];
+  const spacers = (c: HTMLElement) =>
+    Array.from(c.querySelectorAll('tbody tr[aria-hidden]')) as HTMLTableRowElement[];
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('at or below the threshold renders every row exactly as before', () => {
+    const { container } = render(
+      <SortableTable columns={columns} rows={rows(10)} rowKey={(r) => r.id} virtualize={{ threshold: 500 }} />,
+    );
+    expect(mounted(container)).toHaveLength(10);
+    expect(spacers(container)).toHaveLength(0);
+  });
+
+  it('above the threshold mounts only the viewport plus overscan, with a bottom spacer', () => {
+    const { container } = render(
+      <SortableTable columns={columns} rows={rows(1000)} rowKey={(r) => r.id} virtualize={{ threshold: 500 }} />,
+    );
+    // jsdom: no layout, so rows use the estimate; viewport = innerHeight (768).
+    const visible = Math.ceil(window.innerHeight / ESTIMATED_ROW_PX);
+    expect(mounted(container)).toHaveLength(visible + OVERSCAN_ROWS);
+    const [bottom] = spacers(container);
+    expect(bottom.style.height).toBe(`${(1000 - visible - OVERSCAN_ROWS) * ESTIMATED_ROW_PX}px`);
+  });
+
+  it('scrolling moves the window and adds a top spacer', async () => {
+    const { container } = render(
+      <SortableTable columns={columns} rows={rows(1000)} rowKey={(r) => r.id} virtualize={{ threshold: 500 }} />,
+    );
+    vi.spyOn(HTMLTableSectionElement.prototype, 'getBoundingClientRect').mockReturnValue({
+      top: -100 * ESTIMATED_ROW_PX, bottom: 0, left: 0, right: 0, width: 0, height: 0, x: 0, y: 0, toJSON: () => ({}),
+    } as DOMRect);
+    await act(async () => {
+      document.dispatchEvent(new Event('scroll'));
+    });
+    const first = mounted(container)[0];
+    expect(first.textContent).toContain(`r${100 - OVERSCAN_ROWS}`);
+    expect(spacers(container)[0].style.height).toBe(`${(100 - OVERSCAN_ROWS) * ESTIMATED_ROW_PX}px`);
+  });
+
+  it('sorting still orders the full row set', () => {
+    const { container } = render(
+      <SortableTable columns={columns} rows={rows(1000)} rowKey={(r) => r.id} virtualize={{ threshold: 500 }} />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Sort by N' }));
+    expect(mounted(container)[0].textContent).toContain('r999'); // n = 1, ascending
   });
 });
