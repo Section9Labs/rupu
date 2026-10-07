@@ -49,6 +49,8 @@
 // identity — changing it behaves like a window change. Aggregates are
 // local-only under a filter: a remote host answers 501, which the engine
 // records as `unavailable` (shown as such in the host strip, never counted).
+// Under a filter a host's 501 is authoritative `unavailable` (never a stale
+// `(stale)` / `offline`), and a filter change reseeds every host.
 // `data.hostsWithoutCustomer` is the union of the current answers'
 // `hosts_without_customer`. A failed scoped request calls `onScopeRejected`
 // with the error, so the page can clear a scope the backend rejected (400).
@@ -187,6 +189,22 @@ export function useUsageData(
           setHosts((prev) => prev.filter((h) => h.hostId !== hostId));
           return;
         }
+        if (scoped && f.kind === 'unavailable') {
+          // Under a customer filter a 501 is the host's answer, not a blip: its totals can't be
+          // filtered (or it can't say whose its runs are). Authoritative `unavailable`, with no
+          // stale figure kept, and — like every unavailable host — not polled again until the
+          // filter changes.
+          update((h) => ({
+            ...h,
+            state: 'unavailable',
+            response: null,
+            windowKey: null,
+            failedKey: null,
+            reason: f.reason,
+            receivedAt: null,
+          }));
+          return;
+        }
         update((h) =>
           h.response
             ? { ...h, failedKey: key, reason: f.reason } // stale-on-error: keep last good
@@ -262,12 +280,22 @@ export function useUsageData(
     );
   };
 
-  // A user window change (preset button, drag-select, clear): every host, now.
+  // A user window change (preset button, drag-select, clear): every host, now. A different
+  // customer filter is a different question altogether: every host is reseeded first, so no
+  // answer (or failure) for the old filter stands in for the new one — a host the old filter
+  // could count may be unavailable under the new one, and must not read as `(stale)`.
   const firstKey = useRef(true);
+  const lastCustomer = useRef(customer);
   useEffect(() => {
     if (firstKey.current) {
       firstKey.current = false;
       return;
+    }
+    if (lastCustomer.current !== customer) {
+      lastCustomer.current = customer;
+      setHosts((prev) =>
+        prev.map((h) => seedOf({ id: h.hostId, name: h.name, transport_kind: h.transportKind })),
+      );
     }
     fetchWhere(() => true);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on the window identity only

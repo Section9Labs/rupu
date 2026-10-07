@@ -582,6 +582,41 @@ describe('useUsageData', () => {
       expect(spy).toHaveBeenLastCalledWith(WIN, 'model', 'local', expect.any(AbortSignal), 'globex');
     });
 
+    it('setting a scope on a mounted page: the remote\'s 501 is unavailable (not stale), and it is not polled', async () => {
+      vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+      vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL, REG_PROD]);
+      const reason = "host host_prod can't be filtered by customer: its totals are summed remotely";
+      vi.spyOn(api, 'getUsage').mockImplementation((_w, _p, host, _s, customer) =>
+        customer && host === 'host_prod'
+          ? Promise.reject(new ApiError(501, 'x', JSON.stringify({ error: reason })))
+          : Promise.resolve(resp(host ?? 'local', host === 'local' ? 1 : 10)),
+      );
+      const { result, rerender } = renderHook(
+        ({ c }: { c?: string }) => useUsageData(WIN, 'preset:30d', 'user', c),
+        { initialProps: { c: undefined as string | undefined } },
+      );
+      await until(() => expect(result.current.data?.summary.runs).toBe(11));
+
+      rerender({ c: 'acme' });
+      await until(() => expect(result.current.hosts[1]?.state).toBe('unavailable'));
+      expect(result.current.hosts[1]?.reason).toBe(reason);
+      await until(() => expect(result.current.data?.summary.runs).toBe(1));
+      expect(result.current.data?.excluded).toEqual(['prod (unavailable)']);
+      expect(result.current.error).toBeNull();
+
+      // A guaranteed 501 is not asked again on the remote cadence.
+      const asked = usageCallsFor('host_prod').length;
+      vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+      await act(() => vi.advanceTimersByTimeAsync(USAGE_REMOTE_POLL_MS));
+      await act(() => vi.advanceTimersByTimeAsync(USAGE_REMOTE_POLL_MS));
+      expect(usageCallsFor('host_prod')).toHaveLength(asked);
+
+      // Clearing the filter asks it again, unfiltered.
+      rerender({ c: undefined });
+      await until(() => expect(result.current.hosts[1]?.state).toBe('ok'));
+      await until(() => expect(result.current.data?.summary.runs).toBe(11));
+    });
+
     it('unions the answers\' hosts_without_customer', async () => {
       vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL, REG_PROD]);
       vi.spyOn(api, 'getUsage').mockImplementation((_w, _p, host) =>

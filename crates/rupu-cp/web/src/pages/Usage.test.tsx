@@ -4,8 +4,9 @@ import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import Usage from './Usage';
-import { api, presetWindow, type UsageResponse, type OutlierRun, type UsageRunRow } from '../lib/api';
-import { REG_LOCAL } from '../lib/perHost/testUtils';
+import { api, ApiError, presetWindow, type UsageResponse, type OutlierRun, type UsageRunRow } from '../lib/api';
+import { REG_LOCAL, REG_PROD } from '../lib/perHost/testUtils';
+import { useCustomerScope } from '../lib/customerScope';
 import { scopedEntry, withCustomerScope } from '../lib/customerScopeTestUtils';
 
 // Fixed clock so `presetWindow(...)` computed here (for assertions) and
@@ -426,7 +427,59 @@ describe('Usage page', () => {
   });
 });
 
+function ScopeSetter() {
+  const { setScope } = useCustomerScope();
+  return (
+    <button type="button" onClick={() => setScope('acme')}>
+      scope-acme
+    </button>
+  );
+}
+
 describe('Usage — pricing errors and the global customer scope', () => {
+  it('setting the scope on a mounted page shows a remote 501 as unavailable and names it, never stale', async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL, REG_PROD]);
+    vi.spyOn(api, 'getUsage').mockImplementation((_w, _p, host, _s, customer) =>
+      customer && host === 'host_prod'
+        ? Promise.reject(
+            new ApiError(
+              501,
+              'x',
+              JSON.stringify({ error: "host host_prod can't be filtered by customer: its totals are summed remotely" }),
+            ),
+          )
+        : Promise.resolve(
+            usageResponse({
+              hosts: [{ host_id: host as string, name: host as string, transport_kind: 'local', state: 'ok', captured_at: '2026-09-30T00:00:00Z', reason: null }],
+            }),
+          ),
+    );
+    vi.spyOn(api, 'getUsageRuns').mockResolvedValue([runRow()]);
+    vi.spyOn(api, 'getUsageOutliers').mockResolvedValue([]);
+    render(
+      <MemoryRouter initialEntries={['/usage']}>
+        {withCustomerScope(
+          <>
+            <Usage />
+            <ScopeSetter />
+          </>,
+        )}
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(api.getUsage).toHaveBeenCalledWith(expect.anything(), 'model', 'host_prod', expect.any(AbortSignal)));
+    await waitFor(() => expect(screen.getAllByText('$9.00').length).toBeGreaterThan(0));
+
+    fireEvent.click(screen.getByRole('button', { name: 'scope-acme' }));
+
+    expect(await screen.findByTestId('hosts-without-customer')).toHaveTextContent(
+      /prod can’t be filtered by customer \(its totals are summed on the host\)/,
+    );
+    await waitFor(() => expect(screen.getByText(/excludes prod \(unavailable\)/)).toBeInTheDocument());
+    expect(screen.queryByText(/\(stale\)|prod \(offline\)/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/refresh failed/)).not.toBeInTheDocument();
+  });
+
+
   it('marks breakdown rows and outliers priced at the wrong rates', async () => {
     const outlier = {
       run_id: 'run-42',
