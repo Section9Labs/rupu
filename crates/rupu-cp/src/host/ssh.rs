@@ -3658,6 +3658,7 @@ impl HostConnector for SshHostConnector {
             // `fleet_partial` so the strip says so.
             fleet: crate::host::dashboard_summary::FleetCounts::default(),
             captured_at: now,
+            hosts_without_customer: Vec::new(),
         })
     }
 

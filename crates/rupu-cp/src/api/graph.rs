@@ -47,10 +47,15 @@ async fn run_graph_from_host(
     // the blocking pool, as in the local branches of `run_graph`.
     if conn.serves_runs_from_local_mirror() {
         let store = std::sync::Arc::clone(&s.run_store);
-        let pricing = s.pricing.clone();
+        let (global, pricing) = (
+            s.global_dir.clone(),
+            std::sync::Arc::clone(&s.customer_pricing),
+        );
         let id = id.to_string();
-        return crate::api::runs::blocking(move || build_run_graph_json(&store, &pricing, &id))
-            .await;
+        return crate::api::runs::blocking(move || {
+            build_run_graph_json(&store, &global, &pricing, &id)
+        })
+        .await;
     }
     conn.proxy_get_json(&format!("/api/runs/{id}/graph"))
         .await
@@ -68,7 +73,8 @@ async fn run_graph_from_host(
 /// branches of `run_graph`.
 fn build_run_graph_json(
     store: &RunStore,
-    pricing: &rupu_config::PricingConfig,
+    global: &std::path::Path,
+    pricing: &crate::customers::CustomerPricing,
     id: &str,
 ) -> ApiResult<serde_json::Value> {
     // 1. Verify the run exists (gives us the RunRecord too).
@@ -144,7 +150,16 @@ fn build_run_graph_json(
     }
 
     // 6. Token/cost rollup for the run-detail header breakdown.
-    let usage = crate::usage::summarize_run(store, id, pricing);
+    // Priced at the run's attributed customer, as its row and detail are.
+    let mut lookup =
+        crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(global));
+    let key = crate::usage::run_price_key(&run, &mut lookup);
+    let usage = crate::usage::summarize_run_keyed(
+        store,
+        id,
+        &key,
+        &mut crate::customers::PricingMemo::new(pricing),
+    );
 
     Ok(serde_json::json!({
         "run": run,
@@ -180,15 +195,21 @@ async fn run_graph(
         // Store reads + the usage fold run on the blocking pool.
         RunLocation::Global => {
             let store = std::sync::Arc::clone(&s.run_store);
-            let pricing = s.pricing.clone();
-            crate::api::runs::blocking(move || build_run_graph_json(&store, &pricing, &id))
+            let (global, pricing) = (
+                s.global_dir.clone(),
+                std::sync::Arc::clone(&s.customer_pricing),
+            );
+            crate::api::runs::blocking(move || build_run_graph_json(&store, &global, &pricing, &id))
                 .await
                 .map(Json)
         }
         RunLocation::ProjectLocal { path } => {
             let store = RunStore::new(path.join(".rupu").join("runs"));
-            let pricing = s.pricing.clone();
-            crate::api::runs::blocking(move || build_run_graph_json(&store, &pricing, &id))
+            let (global, pricing) = (
+                s.global_dir.clone(),
+                std::sync::Arc::clone(&s.customer_pricing),
+            );
+            crate::api::runs::blocking(move || build_run_graph_json(&store, &global, &pricing, &id))
                 .await
                 .map(Json)
         }

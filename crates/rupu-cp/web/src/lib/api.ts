@@ -866,6 +866,9 @@ export interface FleetCounts {
  * arrays. Mirrors `DashboardSummary` in `rupu-cp/src/host/dashboard_summary.rs`.
  */
 export interface DashboardSummary {
+  /** Under a customer filter: hosts some of whose (legacy, mirrored) runs were
+   *  left out because their customer can't be known. Absent when empty. */
+  hosts_without_customer?: string[];
   active: ActiveCounts;
   /** The single longest-running run, or absent when nothing is running.
    *  The server omits this key entirely when `None` (`skip_serializing_if`),
@@ -945,6 +948,9 @@ export interface UsageResponse extends UsageOverview {
  * out across hosts the way `/api/usage` does.
  */
 export interface OutlierRun {
+  /** Set when this run was priced at the global rates (its customer's layer
+   *  does not resolve, or its customer is unknown) — its ratio may be wrong. */
+  pricing_error?: string;
   run_id: string;
   /** What produced the run: an orchestrator `workflow` run, a standalone
    *  `agent` run, or a `session` turn. Absent on servers that predate

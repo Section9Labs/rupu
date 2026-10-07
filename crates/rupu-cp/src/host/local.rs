@@ -226,6 +226,7 @@ impl HostConnector for LocalHostConnector {
                 crate::api::runs::RowCustomers {
                     lookup: Some(&mut lookup),
                     filter: None,
+                    unreportable: None,
                 },
             )
             .map_err(crate::api::runs::RunRowsError::into_host)
@@ -242,10 +243,15 @@ impl HostConnector for LocalHostConnector {
 
     async fn get_run(&self, run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
         let store = Arc::clone(&self.run_store);
-        let pricing = self.pricing.clone();
+        let customer_pricing = Arc::clone(&self.customer_pricing);
+        let global = self.global_dir.clone();
         let run_id = run_id.to_string();
         blocking_host(move || {
-            query_run_detail(&store, &run_id, &pricing).map_err(|e| map_store_err(&run_id, e))
+            let mut lookup =
+                crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
+            let mut prices = crate::customers::PricingMemo::new(&customer_pricing);
+            query_run_detail(&store, &run_id, &mut prices, Some(&mut lookup))
+                .map_err(|e| map_store_err(&run_id, e))
         })
         .await
     }
@@ -528,14 +534,16 @@ impl LocalHostConnector {
             &self.global_dir,
         ));
         let internal = |e: crate::error::ApiError| HostConnectorError::Internal(e.1);
+        let mut unreportable: Vec<String> = Vec::new();
         if let Some(f) = customer {
             let mut kept = Vec::with_capacity(runs.len());
             for r in runs {
-                let who = lookup
-                    .attribute(crate::customers::Recorded::of(&r.customer), &r.workspace_id)
-                    .map_err(internal)?;
-                if f.matches(who.slug.as_deref()) {
-                    kept.push(r);
+                // A mirrored worker run counts by what it recorded only; a
+                // legacy one is left out and its host named, never "none".
+                match lookup.attribute_run(&r, true).map_err(internal)? {
+                    Some(who) if f.matches(who.slug.as_deref()) => kept.push(r),
+                    Some(_) => {}
+                    None => crate::customers::note_unreportable(&mut unreportable, &r),
                 }
             }
             runs = kept;
@@ -570,14 +578,16 @@ impl LocalHostConnector {
         if let Some(inv) = &self.inventory {
             fleet = crate::host::fleet_counts::apply_inventory(fleet, &inv.snapshot());
         }
-        Ok(crate::host::summary_build::build_summary(
+        let mut summary = crate::host::summary_build::build_summary(
             &runs,
             &cycles,
             findings_open,
             fleet,
             range,
             chrono::Utc::now(),
-        ))
+        );
+        summary.hosts_without_customer = unreportable;
+        Ok(summary)
     }
 }
 

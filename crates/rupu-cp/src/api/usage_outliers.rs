@@ -64,6 +64,11 @@ pub struct RunCost {
     /// `None` = unpriced. NOT zero — we do not know what it cost.
     pub cost_usd: Option<f64>,
     pub started_at: DateTime<Utc>,
+    /// Set when the run was priced at the global rates because its
+    /// customer's layer does not resolve, or its customer can't be known
+    /// (`UsageSummary.pricing_error`): its cost is not comparable, so it is
+    /// left out of every baseline (it can still be flagged against one).
+    pub pricing_error: Option<String>,
 }
 
 impl RunCost {
@@ -101,6 +106,10 @@ pub struct OutlierRun {
     pub baseline_usd: f64,
     pub ratio: f64,
     pub started_at: DateTime<Utc>,
+    /// See [`RunCost::pricing_error`]: this outlier's own cost was priced at
+    /// the global rates, so its ratio may be wrong.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_error: Option<String>,
 }
 
 /// A workflow needs at least this many priced runs before it has a baseline.
@@ -123,7 +132,9 @@ fn median(mut xs: Vec<f64>) -> f64 {
 }
 
 /// Find runs costing more than `threshold`x their baseline population's
-/// median (see [`RunCost::baseline_key`]).
+/// median (see [`RunCost::baseline_key`]). A run priced with a fallback
+/// (`pricing_error`) is left out of the median — its cost is not comparable
+/// — but is still a candidate, flagged with its `pricing_error`.
 pub fn find_outliers(runs: &[RunCost], threshold: f64) -> Vec<OutlierRun> {
     use std::collections::HashMap;
 
@@ -139,10 +150,15 @@ pub fn find_outliers(runs: &[RunCost], threshold: f64) -> Vec<OutlierRun> {
 
     let mut out = Vec::new();
     for wf_runs in by_wf.values() {
-        if wf_runs.len() < MIN_BASELINE_RUNS {
+        let comparable: Vec<f64> = wf_runs
+            .iter()
+            .filter(|r| r.pricing_error.is_none())
+            .filter_map(|r| r.cost_usd)
+            .collect();
+        if comparable.len() < MIN_BASELINE_RUNS {
             continue;
         }
-        let baseline = median(wf_runs.iter().filter_map(|r| r.cost_usd).collect());
+        let baseline = median(comparable);
         if baseline <= 0.0 {
             continue;
         }
@@ -161,6 +177,7 @@ pub fn find_outliers(runs: &[RunCost], threshold: f64) -> Vec<OutlierRun> {
                     baseline_usd: baseline,
                     ratio,
                     started_at: r.started_at,
+                    pricing_error: r.pricing_error.clone(),
                 });
             }
         }
@@ -194,21 +211,25 @@ pub fn find_outliers(runs: &[RunCost], threshold: f64) -> Vec<OutlierRun> {
 async fn get_usage_outliers(
     State(s): State<AppState>,
     Query(q): Query<OutliersQuery>,
-) -> ApiResult<Json<Vec<OutlierRun>>> {
+) -> ApiResult<(axum::http::HeaderMap, Json<Vec<OutlierRun>>)> {
     let (since, until) =
         crate::api::usage::resolve_window(q.since.as_deref(), q.until.as_deref(), Utc::now())
             .map_err(ApiError::bad_request)?;
 
     let customer = crate::customers::CustomerFilter::parse(q.customer.as_deref())?;
 
-    let (sources, _) = crate::api::usage::local_sources(&s, since, until, None, customer).await?;
+    let crate::api::usage::LocalSources {
+        sources,
+        hosts_without_customer,
+        ..
+    } = crate::api::usage::local_sources(&s, since, until, None, customer).await?;
     // Each source is priced with its customer's pricing (spec §1).
     let mut prices = crate::customers::PricingMemo::new(&s.customer_pricing);
     let run_costs: Vec<RunCost> = sources
         .into_iter()
         .map(|src| RunCost {
-            cost_usd: crate::usage::summarize(&src.rows, prices.get(src.customer.as_deref()))
-                .cost_usd,
+            pricing_error: src.price.pricing_error(&mut prices),
+            cost_usd: crate::usage::summarize(&src.rows, prices.get(src.price.slug())).cost_usd,
             run_id: src.id,
             kind: src.kind,
             workflow_name: src.workflow,
@@ -221,7 +242,10 @@ async fn get_usage_outliers(
         })
         .collect();
 
-    Ok(Json(find_outliers(&run_costs, DEFAULT_THRESHOLD)))
+    Ok((
+        crate::customers::hosts_without_customer_header(&hosts_without_customer),
+        Json(find_outliers(&run_costs, DEFAULT_THRESHOLD)),
+    ))
 }
 
 #[cfg(test)]
@@ -239,6 +263,7 @@ mod tests {
                 transcript_path: None,
                 cost_usd: Some(cost),
                 started_at: chrono::Utc::now(),
+                pricing_error: None,
             })
             .collect()
     }
@@ -253,6 +278,7 @@ mod tests {
             transcript_path: Some(format!("/t/{run_id}.jsonl")),
             cost_usd: Some(cost),
             started_at: chrono::Utc::now(),
+            pricing_error: None,
         }
     }
 
@@ -364,9 +390,44 @@ mod tests {
                 transcript_path: None,
                 cost_usd: None,
                 started_at: chrono::Utc::now(),
+                pricing_error: None,
             }],
             3.0,
         );
         assert!(out.is_empty());
+    }
+
+    /// A run priced with a fallback (`pricing_error`) is not comparable: it
+    /// is left out of its workflow's median — so it can neither drag the
+    /// baseline nor make up the minimum population — yet it is still flagged
+    /// against the comparable runs' baseline, carrying its `pricing_error`.
+    #[test]
+    fn fallback_priced_runs_are_left_out_of_the_baseline_but_flagged() {
+        let mut runs = to_fixtures(vec![
+            ("wf", "a", 1.0),
+            ("wf", "b", 1.0),
+            ("wf", "c", 1.0),
+            ("wf", "mispriced_hi", 50.0),
+            ("wf", "mispriced_hi2", 50.0),
+            ("wf", "mispriced_hi3", 50.0),
+        ]);
+        for r in runs
+            .iter_mut()
+            .filter(|r| r.run_id.starts_with("mispriced"))
+        {
+            r.pricing_error = Some("customer `acme`'s config layer does not resolve".into());
+        }
+        let out = find_outliers(&runs, 3.0);
+        // Baseline from a, b, c only (median 1.0) — with the three mispriced
+        // runs in it the median would be 25.5 and nothing would flag.
+        assert_eq!(out.len(), 3, "{out:?}");
+        assert!(out
+            .iter()
+            .all(|o| o.baseline_usd == 1.0 && o.pricing_error.is_some()));
+
+        // Flagged runs never make up the minimum population.
+        let mut few = to_fixtures(vec![("wf", "a", 1.0), ("wf", "b", 1.0), ("wf", "x", 9.0)]);
+        few[2].pricing_error = Some("customer unknown; priced at global rates".into());
+        assert!(find_outliers(&few, 3.0).is_empty());
     }
 }

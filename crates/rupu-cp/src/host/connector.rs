@@ -896,8 +896,15 @@ pub(crate) fn mirror_get_run(
     pricing: &rupu_config::PricingConfig,
 ) -> Result<serde_json::Value, HostConnectorError> {
     check_mirror_run(run_store, worker_id, run_id)?;
-    crate::api::runs::query_run_detail(run_store, run_id, pricing)
-        .map_err(|e| HostConnectorError::Invalid(e.to_string()))
+    // A mirrored run is priced by what it recorded only (no lookup: its
+    // workspace's assignment lives on the worker).
+    crate::api::runs::query_run_detail(
+        run_store,
+        run_id,
+        &mut crate::customers::FlatPricing(pricing),
+        None,
+    )
+    .map_err(|e| HostConnectorError::Invalid(e.to_string()))
 }
 
 /// `Ok` when `run_id` is in the mirror and `worker_id` ran it, else

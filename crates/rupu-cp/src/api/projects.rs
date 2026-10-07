@@ -149,9 +149,11 @@ pub(crate) fn project_rollups(
         if !keep(&r.workspace_id) {
             continue;
         }
-        let who = lookup.attribute(crate::customers::Recorded::of(&r.customer), &r.workspace_id)?;
-        let usage = crate::usage::summarize_run(run_store, &r.id, prices.get(who.slug.as_deref()));
-        let usage = prices.stamp(usage, who.slug.as_deref());
+        // A mirrored worker run is priced by what it recorded only (a legacy
+        // one at the global rates, flagged).
+        let key = crate::customers::PriceKey::of(lookup.attribute_run(r, true)?.as_ref());
+        let mut usage = crate::usage::summarize_run(run_store, &r.id, prices.get(key.slug()));
+        usage.pricing_error = key.pricing_error(prices);
         out.entry(r.workspace_id.clone())
             .or_default()
             .add(&usage, Some(r.started_at.to_rfc3339()));
@@ -310,13 +312,12 @@ async fn get_project(
                 crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
             let mut prices = crate::customers::PricingMemo::new(&pricing);
             let customers = project_customers(&mut lookup, std::slice::from_ref(&ws))?;
-            // The recent runs' customers: recorded, else (legacy) derived.
+            // The recent runs' customers: recorded, else (a local legacy run)
+            // derived; a legacy mirrored run's can't be known (`None`).
             let recent_who = scoped
                 .iter()
                 .take(10)
-                .map(|r| {
-                    lookup.attribute(crate::customers::Recorded::of(&r.customer), &r.workspace_id)
-                })
+                .map(|r| lookup.attribute_run(r, true))
                 .collect::<Result<Vec<_>, ApiError>>()?;
             let sessions = crate::api::sessions::collect_sessions_with(
                 &global,
@@ -343,7 +344,7 @@ async fn get_project(
         .await?
     };
     for (row, who) in recent_runs.iter_mut().zip(recent_who) {
-        row.set_customer(who);
+        row.customer = who.map(Into::into);
     }
     let sessions_active = scoped_sessions
         .iter()

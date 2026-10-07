@@ -65,6 +65,9 @@ export interface UsageBreakdownRow {
 export interface UsageOverview {
   summary: UsageSummary;
   breakdown: UsageBreakdownRow[];
+  /** Under a customer filter: hosts some of whose (legacy, mirrored) runs were
+   *  left out because their customer can't be known. Absent when empty. */
+  hosts_without_customer?: string[];
 }
 
 /**

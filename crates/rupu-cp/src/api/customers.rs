@@ -37,7 +37,7 @@ use crate::api::config::require_writable_to;
 use crate::api::projects::{apply_rollup, project_rollups, project_row, ProjectRow};
 use crate::api::runs::blocking;
 pub use crate::customers::DefaultAccount;
-use crate::customers::{customer_dto, CustomerDto, CustomerLookup, PricingMemo, Recorded};
+use crate::customers::{customer_dto, CustomerDto, CustomerLookup, PricingMemo};
 use crate::error::{ApiError, ApiResult};
 use crate::host::dashboard_summary::DashboardRange;
 use crate::state::AppState;
@@ -67,6 +67,11 @@ pub struct CustomerRollup {
     /// Findings in the customer's current projects' coverage ledgers.
     pub findings_open: u64,
     pub last_active: Option<String>,
+    /// Worker hosts some of whose (legacy, mirrored) runs were left out of
+    /// the rollups because their customer can't be known — so the counts may
+    /// be short; never counted as "no customer". Absent when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hosts_without_customer: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -208,14 +213,18 @@ impl Pass {
             Some(cut) => at.is_some_and(|t| t >= cut),
         };
         let mut rolls: BTreeMap<String, EntityRollup> = BTreeMap::new();
+        let mut unreportable: Vec<String> = Vec::new();
 
         for run in &self.runs {
             if !in_range(Some(run.started_at)) {
                 continue;
             }
-            let who = self
-                .lookup
-                .attribute(Recorded::of(&run.customer), &run.workspace_id)?;
+            // A mirrored worker run counts by what it recorded only; a legacy
+            // one is left out and its host named — never counted as none.
+            let Some(who) = self.lookup.attribute_run(run, true)? else {
+                crate::customers::note_unreportable(&mut unreportable, run);
+                continue;
+            };
             let Some(slug) = who.slug.filter(|s| wanted.contains(s)) else {
                 continue;
             };
@@ -269,6 +278,7 @@ impl Pass {
                         .map(|w| findings.get(&w.id).copied().unwrap_or(0))
                         .sum(),
                     last_active: roll.last_active,
+                    hosts_without_customer: unreportable.clone(),
                 };
                 (slug.clone(), rollup)
             })

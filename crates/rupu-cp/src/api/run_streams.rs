@@ -211,14 +211,14 @@ struct AgentRunRow {
 }
 
 impl AgentRunRow {
-    /// The customer this row is priced under: its attribution, else (a row
-    /// whose attribution could not be read) the one it recorded.
-    fn pricing_customer(&self) -> Option<String> {
+    /// What this row is priced under: its attribution, else (a row whose
+    /// attribution could not be read — only ever a legacy one, since a
+    /// recorded slug or `null` needs no read) `Unknown`: the global rates,
+    /// flagged.
+    fn price_key(&self) -> crate::customers::PriceKey {
         match &self.customer {
-            Some(c) => c.customer.clone(),
-            None => crate::customers::Recorded::of(&self.recorded_customer)
-                .slug()
-                .map(str::to_string),
+            Some(c) => crate::customers::PriceKey::Customer(c.customer.clone()),
+            None => crate::customers::PriceKey::Unknown,
         }
     }
 }
@@ -910,14 +910,15 @@ fn agent_run_metrics(
     }
 }
 
-/// [`agent_run_metrics`] for each `(run_id, transcript_path, customer)`, in
+/// [`agent_run_metrics`] for each `(run_id, transcript_path, price key)`, in
 /// order, off the async executor, each priced with its customer's pricing
-/// (work with no customer at the global pricing).
+/// (work with no customer, or an `Unknown` one — flagged — at the global
+/// pricing).
 /// Never fails: a panicked fold reports every run as an empty, `partial`
 /// result.
 async fn agent_runs_metrics(
     s: &AppState,
-    runs: Vec<(String, String, Option<String>)>,
+    runs: Vec<(String, String, crate::customers::PriceKey)>,
 ) -> Vec<crate::usage::RunMetrics> {
     let store = std::sync::Arc::clone(&s.run_store);
     let customer_pricing = std::sync::Arc::clone(&s.customer_pricing);
@@ -928,9 +929,9 @@ async fn agent_runs_metrics(
         move || {
             let mut prices = crate::customers::PricingMemo::new(&customer_pricing);
             runs.iter()
-                .map(|(id, tp, customer)| {
-                    let mut m = agent_run_metrics(&store, prices.get(customer.as_deref()), id, tp);
-                    m.usage.pricing_error = prices.error(customer.as_deref());
+                .map(|(id, tp, key)| {
+                    let mut m = agent_run_metrics(&store, prices.get(key.slug()), id, tp);
+                    m.usage.pricing_error = key.pricing_error(&mut prices);
                     m
                 })
                 .collect()
@@ -1037,15 +1038,9 @@ async fn list_agent_runs(
         let range = q.range();
         local_rows.retain(|r| range.contains_str(r.started_at.as_deref()));
         let mut page_rows = crate::pagination::paginate(local_rows, &q.page());
-        let wanted: Vec<(String, String, Option<String>)> = page_rows
+        let wanted: Vec<(String, String, crate::customers::PriceKey)> = page_rows
             .iter()
-            .filter_map(|r| {
-                Some((
-                    r.run_id.clone(),
-                    r.transcript_path.clone()?,
-                    r.pricing_customer(),
-                ))
-            })
+            .filter_map(|r| Some((r.run_id.clone(), r.transcript_path.clone()?, r.price_key())))
             .collect();
         let mut metrics = agent_runs_metrics(&s, wanted).await.into_iter();
         for row in &mut page_rows {
@@ -1105,16 +1100,21 @@ async fn list_agent_runs(
     let mut page_values = crate::pagination::paginate(all_values, &q.page());
 
     // Fill usage for local rows on this page only (remote rows already have it)
-    let local_agent_run = |row: &serde_json::Value| -> Option<(String, String, Option<String>)> {
+    let local_agent_run = |row: &serde_json::Value| {
         if row["host_id"].as_str() != Some("local") {
             return None;
         }
         let tp = row["transcript_path"].as_str()?;
         let run_id = row["run_id"].as_str().unwrap_or_default();
-        let customer = row["customer"].as_str().map(String::from);
-        Some((run_id.to_string(), tp.to_string(), customer))
+        // A local row without the key is one whose attribution couldn't be
+        // read: priced at the global rates, flagged.
+        let key = match row.get("customer") {
+            None => crate::customers::PriceKey::Unknown,
+            Some(c) => crate::customers::PriceKey::Customer(c.as_str().map(String::from)),
+        };
+        Some((run_id.to_string(), tp.to_string(), key))
     };
-    let wanted: Vec<(String, String, Option<String>)> =
+    let wanted: Vec<(String, String, crate::customers::PriceKey)> =
         page_values.iter().filter_map(local_agent_run).collect();
     let mut metrics = agent_runs_metrics(&s, wanted).await.into_iter();
     for row in &mut page_values {
@@ -1241,7 +1241,8 @@ async fn list_autoflow_runs(
         let mut summaries = crate::usage::summarize_runs_blocking(
             std::sync::Arc::clone(&s.run_store),
             run_ids,
-            s.pricing.clone(),
+            s.global_dir.clone(),
+            std::sync::Arc::clone(&s.customer_pricing),
         )
         .await
         .into_iter();
@@ -1304,7 +1305,8 @@ async fn list_autoflow_runs(
     let mut summaries = crate::usage::summarize_runs_blocking(
         std::sync::Arc::clone(&s.run_store),
         run_ids,
-        s.pricing.clone(),
+        s.global_dir.clone(),
+        std::sync::Arc::clone(&s.customer_pricing),
     )
     .await
     .into_iter();
@@ -1463,7 +1465,8 @@ async fn list_autoflow_events(
         let mut all_metrics = crate::usage::run_metrics_blocking(
             std::sync::Arc::clone(&s.run_store),
             run_ids,
-            s.pricing.clone(),
+            s.global_dir.clone(),
+            std::sync::Arc::clone(&s.customer_pricing),
         )
         .await
         .into_iter();
@@ -1518,7 +1521,8 @@ async fn list_autoflow_events(
     let mut all_metrics = crate::usage::run_metrics_blocking(
         std::sync::Arc::clone(&s.run_store),
         run_ids,
-        s.pricing.clone(),
+        s.global_dir.clone(),
+        std::sync::Arc::clone(&s.customer_pricing),
     )
     .await
     .into_iter();

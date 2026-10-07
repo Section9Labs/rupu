@@ -593,8 +593,15 @@ async fn show(
     // the result, so byte-identical output here is what keeps the remote
     // path in sync with the local `mirror_get_run` path (both call
     // `query_run_detail`).
-    let item = rupu_cp::api::runs::query_run_detail(&store, &run_id, &cfg.pricing)
-        .map_err(|e| anyhow::anyhow!("run {run_id}: {e}"))?;
+    // Priced at the run's attributed customer, exactly as `run list` (and
+    // the CP's own detail) prices it.
+    let mut customers =
+        rupu_cp::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
+    let customer_pricing = rupu_cp::customers::CustomerPricing::new(global.clone(), cfg.pricing);
+    let mut prices = rupu_cp::customers::PricingMemo::new(&customer_pricing);
+    let item =
+        rupu_cp::api::runs::query_run_detail(&store, &run_id, &mut prices, Some(&mut customers))
+            .map_err(|e| anyhow::anyhow!("run {run_id}: {e}"))?;
 
     match global_format.unwrap_or(crate::output::formats::OutputFormat::Table) {
         crate::output::formats::OutputFormat::Json => {

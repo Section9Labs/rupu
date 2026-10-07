@@ -892,8 +892,231 @@ async fn an_unreadable_assignment_degrades_an_unfiltered_list() {
         assert_eq!(resp.status(), StatusCode::OK, "{path}");
         let rows: Value = resp.json().await.unwrap();
         assert!(!has_keys(by_id(&rows, key, broken)), "{path}: {rows}");
+        // Priced at the global rates — and saying so (R3).
+        assert_eq!(
+            by_id(&rows, key, broken)["usage"]["pricing_error"],
+            "customer unknown; priced at global rates",
+            "{path}: {rows}"
+        );
         assert_eq!(by_id(&rows, key, ok)["customer"], "acme", "{path}");
+        assert!(
+            by_id(&rows, key, ok)["usage"]
+                .get("pricing_error")
+                .is_none(),
+            "{path}"
+        );
     }
+    // The session detail degrades the same way (R2).
+    let detail = get_json(format!("{base}/api/sessions/s_acme_legacy")).await;
+    assert!(!has_keys(&detail), "{detail}");
+    let detail = get_json(format!("{base}/api/sessions/s_acme")).await;
+    assert_eq!(detail["customer"], "acme");
+}
+
+// ── residual fixes ──────────────────────────────────────────────────────
+
+/// `GET /api/sessions/:id` carries `customer` / `customer_derived`, attributed
+/// exactly as the list does: recorded slug, recorded none (stays none in an
+/// assigned project), legacy (derived from the current assignment).
+#[tokio::test]
+async fn session_detail_carries_its_customer() {
+    let f = seed_fleet();
+    let at = Utc::now() - Duration::hours(5);
+    let dir = f.global.join("sessions").join("s_none_recorded");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("session.json"),
+        json!({
+            "session_id": "s_none_recorded",
+            "agent_name": "reviewer",
+            "workspace_id": "ws_acme",
+            "customer": null,
+            "created_at": at.to_rfc3339(),
+            "updated_at": at.to_rfc3339(),
+            "status": "idle",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let base = spawn(&f.global).await;
+    let keys = |v: &Value| (v["customer"].clone(), v["customer_derived"].clone());
+    let detail = get_json(format!("{base}/api/sessions/s_acme")).await;
+    assert_eq!(keys(&detail), (json!("acme"), json!(false)));
+    let detail = get_json(format!("{base}/api/sessions/s_none_recorded")).await;
+    assert!(
+        detail.as_object().unwrap().contains_key("customer"),
+        "{detail}"
+    );
+    assert_eq!(keys(&detail), (json!(null), json!(false)));
+    let detail = get_json(format!("{base}/api/sessions/s_acme_legacy")).await;
+    assert_eq!(keys(&detail), (json!("acme"), json!(true)));
+}
+
+/// A mirrored worker run (its `run.json` carries `worker_id`) is never
+/// attributed through the coordinator's assignments: one that recorded a
+/// customer counts as that; a LEGACY one — even in a project the coordinator
+/// has assigned — is not counted under any customer nor under "none": it is
+/// left out of filters and rollups with its worker host named, and listed
+/// unfiltered without customer keys (priced at the global rates, flagged).
+#[tokio::test]
+async fn mirrored_legacy_runs_are_never_attributed_through_the_coordinator() {
+    let f = seed_fleet();
+    let store = RunStore::new(f.global.join("runs"));
+    let at = Utc::now() - Duration::minutes(30);
+    for (id, customer) in [
+        ("m_legacy", None),
+        ("m_acme", Some(Some("acme".to_string()))),
+    ] {
+        let mut rec = record(id, "ws_acme", customer.clone(), at);
+        rec.worker_id = Some("node_1".into());
+        store.create(rec, "name: wf\n").unwrap();
+    }
+    let base = spawn(&f.global).await;
+    let header = |resp: &reqwest::Response| {
+        resp.headers()
+            .get("x-rupu-hosts-without-customer")
+            .map(|v| v.to_str().unwrap().to_string())
+    };
+
+    for path in [
+        "/api/runs?host=local&",
+        "/api/runs?",
+        "/api/runs/workflows?host=local&",
+    ] {
+        for filter in ["none", "acme"] {
+            let resp = reqwest::get(format!("{base}{path}customer={filter}"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{path}{filter}");
+            assert_eq!(header(&resp).as_deref(), Some("node_1"), "{path}{filter}");
+            let rows: Value = resp.json().await.unwrap();
+            let got = ids(&rows, "id");
+            assert!(
+                !got.contains(&"m_legacy".to_string()),
+                "{path}{filter}: {got:?}"
+            );
+            assert_eq!(
+                got.contains(&"m_acme".to_string()),
+                filter == "acme",
+                "{path}{filter}"
+            );
+        }
+    }
+    // Unfiltered: listed, keyless, priced unknown.
+    let rows = get_json(format!("{base}/api/runs?host=local")).await;
+    let legacy = by_id(&rows, "id", "m_legacy");
+    assert!(
+        !legacy.as_object().unwrap().contains_key("customer"),
+        "{legacy}"
+    );
+    assert_eq!(
+        legacy["usage"]["pricing_error"],
+        "customer unknown; priced at global rates"
+    );
+    assert_eq!(by_id(&rows, "id", "m_acme")["customer"], "acme");
+
+    // Rollups: acme counts its own recorded runs + the mirrored acme one.
+    let rows = get_json(format!("{base}/api/customers")).await;
+    let acme = by_id(&rows, "slug", "acme");
+    assert_eq!(acme["rollup"]["run_count"], 3, "{acme}");
+    assert_eq!(acme["rollup"]["hosts_without_customer"], json!(["node_1"]));
+    // Usage and dashboard under a filter name the host, never count it.
+    let usage = get_json(format!("{base}/api/usage?customer=none")).await;
+    assert_eq!(
+        usage["hosts_without_customer"],
+        json!(["node_1"]),
+        "{usage}"
+    );
+    assert_eq!(usage["summary"]["input_tokens"], 2_000_000, "{usage}");
+    let resp = reqwest::get(format!("{base}/api/usage/runs?customer=none"))
+        .await
+        .unwrap();
+    assert_eq!(header(&resp).as_deref(), Some("node_1"));
+    let dash = get_json(format!("{base}/api/dashboard?host=local&customer=none")).await;
+    assert_eq!(dash["hosts_without_customer"], json!(["node_1"]), "{dash}");
+}
+
+/// A run's detail, live usage and graph cost what its list row costs: all
+/// priced at its attributed customer's pricing (spec §1).
+#[tokio::test]
+async fn a_runs_detail_costs_what_its_row_costs() {
+    let f = seed_fleet();
+    let toml = |p: f64| {
+        format!("[pricing.anthropic.\"{MODEL}\"]\ninput_per_mtok = {p}\noutput_per_mtok = 1.0\n")
+    };
+    std::fs::write(f.global.join("config.toml"), toml(1.0)).unwrap();
+    std::fs::write(CustomerStore::new(&f.global).config_path("acme"), toml(5.0)).unwrap();
+    let base = spawn(&f.global).await;
+    let rows = get_json(format!("{base}/api/runs?host=local")).await;
+    for (id, want) in [("r_acme", 5.0), ("r_acme_legacy", 5.0), ("r_none", 1.0)] {
+        let row_cost = by_id(&rows, "id", id)["usage"]["cost_usd"]
+            .as_f64()
+            .unwrap();
+        assert!((row_cost - want).abs() < 1e-9, "{id} row: {row_cost}");
+        let detail = get_json(format!("{base}/api/runs/{id}")).await;
+        assert_eq!(
+            detail["usage"]["cost_usd"].as_f64().unwrap(),
+            row_cost,
+            "{id} detail"
+        );
+        let live = get_json(format!("{base}/api/runs/{id}/usage")).await;
+        assert_eq!(
+            live["summary"]["cost_usd"].as_f64().unwrap(),
+            row_cost,
+            "{id} usage"
+        );
+    }
+}
+
+/// The session LIST prices each turn at that turn's own attribution, not
+/// the session's latest customer: a turn that recorded none at the global
+/// $1, a turn that recorded acme at Acme's $5 — $6, the same the rollups and
+/// the session detail show.
+#[tokio::test]
+async fn the_session_list_prices_each_turn_at_its_own_customer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let global = tmp.path();
+    seed_workspace(global, "ws_p", &proj.path().join("ws_p"));
+    create_customer(global, "acme");
+    assign(global, "acme", "ws_p");
+    let toml = |p: f64| {
+        format!("[pricing.anthropic.\"{MODEL}\"]\ninput_per_mtok = {p}\noutput_per_mtok = 1.0\n")
+    };
+    std::fs::write(global.join("config.toml"), toml(1.0)).unwrap();
+    std::fs::write(CustomerStore::new(global).config_path("acme"), toml(5.0)).unwrap();
+    let at = Utc::now() - Duration::hours(2);
+    let tdir = global.join("sess_tx");
+    let mut runs = Vec::new();
+    for (id, field) in [("t1", Some(None)), ("t2", Some(Some("acme".to_string())))] {
+        let path = tdir.join(format!("{id}.jsonl"));
+        write_transcript_rec(&path, id, "ws_p", field, at);
+        runs.push(
+            json!({"run_id": id, "transcript_path": path.to_string_lossy(),
+                         "started_at": at.to_rfc3339(), "status": "ok"}),
+        );
+    }
+    let sdir = global.join("sessions").join("s_1");
+    std::fs::create_dir_all(&sdir).unwrap();
+    std::fs::write(
+        sdir.join("session.json"),
+        json!({
+            "session_id": "s_1", "agent_name": "reviewer", "provider_name": "anthropic",
+            "model": MODEL, "workspace_id": "ws_p", "customer": "acme",
+            "created_at": at.to_rfc3339(), "updated_at": at.to_rfc3339(),
+            "status": "idle", "runs": runs,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let base = spawn(global).await;
+    let rows = get_json(format!("{base}/api/sessions?host=local")).await;
+    let cost = by_id(&rows, "session_id", "s_1")["usage"]["cost_usd"]
+        .as_f64()
+        .unwrap();
+    assert!((cost - 6.0).abs() < 1e-9, "$1 + $5, got {cost}");
+    let detail = get_json(format!("{base}/api/sessions/s_1")).await;
+    assert_eq!(detail["usage"]["cost_usd"].as_f64().unwrap(), cost);
 }
 
 // ── tri-state attribution ───────────────────────────────────────────────

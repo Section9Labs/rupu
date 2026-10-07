@@ -329,7 +329,13 @@ fn merge_dashboard_summaries(
     // falls back to `now` when no host reported at all.
     let mut oldest_captured_at: Option<DateTime<Utc>> = None;
 
+    let mut hosts_without_customer: Vec<String> = Vec::new();
     for sum in reported {
+        for h in &sum.hosts_without_customer {
+            if !hosts_without_customer.contains(h) {
+                hosts_without_customer.push(h.clone());
+            }
+        }
         oldest_captured_at = Some(match oldest_captured_at {
             Some(oldest) => oldest.min(sum.captured_at),
             None => sum.captured_at,
@@ -473,6 +479,7 @@ fn merge_dashboard_summaries(
             findings_open,
             fleet,
             captured_at: oldest_captured_at.unwrap_or(now),
+            hosts_without_customer,
         },
         findings_partial,
         cycles_partial,
@@ -514,6 +521,7 @@ mod merge_tests {
             findings_open: None,
             fleet: FleetCounts::default(),
             captured_at,
+            hosts_without_customer: Vec::new(),
         }
     }
 

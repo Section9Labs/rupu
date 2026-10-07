@@ -198,43 +198,119 @@ fn session_turn_transcripts<'a>(
     (labeled, missing)
 }
 
+use crate::customers::PriceKey;
+
+/// The [`PriceKey`] of one turn of `dto` (`transcript` = its own transcript;
+/// `None` for a turn whose transcript is gone, or the session's own
+/// totals): what the turn's `RunStart` recorded; for a legacy one, the
+/// session's customer, else the workspace's current assignment — the rule
+/// the agent-run rows and rollups use. `fail_closed`: an unreadable
+/// assignment is an error; otherwise the turn is `Unknown`.
+fn turn_price_key(
+    lookup: &mut crate::customers::CustomerLookup,
+    dto: &SessionDto,
+    transcript: Option<&std::path::Path>,
+    fail_closed: bool,
+) -> Result<PriceKey, ApiError> {
+    use crate::customers::Recorded;
+    let head = transcript
+        .map(crate::usage_sources::head_of)
+        .unwrap_or_default();
+    let (field, _) = crate::customers::session_turn_customer(&head.customer, &dto.customer);
+    let ws = if head.workspace_id.is_empty() {
+        dto.workspace_id.as_str()
+    } else {
+        head.workspace_id.as_str()
+    };
+    let recorded = Recorded::of(&field);
+    if recorded.is_legacy() && ws.is_empty() {
+        return Ok(PriceKey::Customer(None));
+    }
+    if fail_closed {
+        Ok(PriceKey::Customer(lookup.attribute(recorded, ws)?.slug))
+    } else {
+        Ok(lookup
+            .attribute_for_listing(recorded, ws)
+            .map_or(PriceKey::Unknown, |w| PriceKey::Customer(w.slug)))
+    }
+}
+
 /// Token + cost summary for a local session: the live fold of every turn's
 /// transcript plus its dispatch sub-runs ([`crate::usage::transcripts_usage`]),
 /// so a turn still in flight counts as it streams — `session.json`'s own
-/// totals only move when a turn ends. A turn whose transcript is gone (e.g.
-/// archived) contributes the totals recorded for that turn, priced at the
-/// session's model; a session with no recorded turns at all falls back to
-/// [`session_usage_from_totals`]. `runs` stays 1 (one session).
+/// totals only move when a turn ends. Each turn is priced at ITS OWN
+/// attribution (`key_of`, see [`turn_price_key`]) — not the session's latest
+/// customer — the same rule the rollups use. A turn whose transcript is gone
+/// (e.g. archived) contributes the totals recorded for that turn, priced at
+/// the session's model; a session with no recorded turns at all falls back
+/// to [`session_usage_from_totals`]. `runs` stays 1 (one session). Work priced
+/// at the global rates for an unknown customer, or a customer whose layer
+/// does not resolve, carries `pricing_error`.
 fn session_usage(
     dto: &SessionDto,
     run_store: &rupu_orchestrator::runs::RunStore,
-    pricing: &rupu_config::PricingConfig,
-) -> crate::usage::UsageSummary {
-    if dto.runs.is_empty() {
-        return session_usage_from_totals(dto, pricing);
+    prices: &mut dyn crate::customers::PriceBook,
+    key_of: &mut dyn FnMut(Option<&std::path::Path>) -> Result<PriceKey, ApiError>,
+) -> Result<crate::usage::UsageSummary, ApiError> {
+    fn priced(
+        prices: &mut dyn crate::customers::PriceBook,
+        key: &PriceKey,
+        f: impl FnOnce(&rupu_config::PricingConfig) -> crate::usage::UsageSummary,
+    ) -> crate::usage::UsageSummary {
+        let mut u = f(prices.pricing_for(key.slug()));
+        u.pricing_error = key.pricing_error(prices);
+        u
     }
-    let (labeled, missing) = session_turn_transcripts(&dto.runs, run_store);
-    let u = crate::usage::transcripts_usage(&labeled);
-    let mut rows = u.rows.clone();
-    rows.extend(
-        missing
-            .into_iter()
-            .filter(|r| r.total_tokens_in + r.total_tokens_out + r.total_tokens_cached > 0)
-            .map(|r| rupu_transcript::UsageRow {
-                provider: dto.provider_name.clone(),
-                model: dto.model.clone(),
-                agent: dto.agent_name.clone(),
-                input_tokens: r.total_tokens_in,
-                output_tokens: r.total_tokens_out,
-                cached_tokens: r.total_tokens_cached,
-                runs: 1,
-                ..rupu_transcript::UsageRow::default()
-            }),
+    if dto.runs.is_empty() {
+        let key = key_of(None)?;
+        return Ok(priced(prices, &key, |p| session_usage_from_totals(dto, p)));
+    }
+    type Group = (
+        Vec<(String, std::path::PathBuf)>,
+        Vec<rupu_transcript::UsageRow>,
     );
-    let mut summary = crate::usage::summarize(&rows, pricing);
-    summary.partial = u.partial;
+    let mut groups: std::collections::BTreeMap<PriceKey, Group> = Default::default();
+    for r in &dto.runs {
+        match r.transcript_path.as_deref().filter(|t| !t.is_empty()) {
+            Some(tp) if std::path::Path::new(tp).is_file() => {
+                let tp = std::path::Path::new(tp);
+                let key = key_of(Some(tp))?;
+                groups.entry(key).or_default().0.extend(
+                    crate::usage_sources::with_dispatch_children(run_store, &r.run_id, tp),
+                );
+            }
+            _ if r.total_tokens_in + r.total_tokens_out + r.total_tokens_cached > 0 => {
+                let key = key_of(None)?;
+                groups
+                    .entry(key)
+                    .or_default()
+                    .1
+                    .push(rupu_transcript::UsageRow {
+                        provider: dto.provider_name.clone(),
+                        model: dto.model.clone(),
+                        agent: dto.agent_name.clone(),
+                        input_tokens: r.total_tokens_in,
+                        output_tokens: r.total_tokens_out,
+                        cached_tokens: r.total_tokens_cached,
+                        runs: 1,
+                        ..rupu_transcript::UsageRow::default()
+                    });
+            }
+            _ => {}
+        }
+    }
+    let mut summaries = Vec::with_capacity(groups.len());
+    for (key, (labeled, missing)) in groups {
+        let u = crate::usage::transcripts_usage(&labeled);
+        let mut rows = u.rows.clone();
+        rows.extend(missing);
+        let mut summary = priced(prices, &key, |p| crate::usage::summarize(&rows, p));
+        summary.partial = u.partial;
+        summaries.push(summary);
+    }
+    let mut summary = crate::usage::rollup(summaries.into_iter());
     summary.runs = 1;
-    summary
+    Ok(summary)
 }
 
 /// Token + cost summary from a session's own token totals, priced at its
@@ -352,18 +428,16 @@ fn scan_session_dir(
             continue;
         }
         let who = session_customer(&mut ctx.lookup, &dto, scan.fail_closed)?;
-        // Priced at its attribution's customer; a session whose attribution
-        // can't be read, at the customer it recorded (else global).
-        let pricing_slug = match &who {
-            Some(w) => w.slug.clone(),
-            None => crate::customers::Recorded::of(&dto.customer)
-                .slug()
-                .map(str::to_string),
+        // Each turn priced at its own attribution (R8).
+        let usage = match ctx.prices.as_mut() {
+            None => None,
+            Some(prices) => {
+                let lookup = &mut ctx.lookup;
+                Some(session_usage(&dto, run_store, prices, &mut |tp| {
+                    turn_price_key(lookup, &dto, tp, scan.fail_closed)
+                })?)
+            }
         };
-        let usage = ctx.prices.as_mut().map(|prices| {
-            let u = session_usage(&dto, run_store, prices.get(pricing_slug.as_deref()));
-            prices.stamp(u, pricing_slug.as_deref())
-        });
         match serde_json::to_value(&dto) {
             Ok(mut val) => {
                 if let serde_json::Value::Object(ref mut map) = val {
@@ -670,14 +744,26 @@ async fn get_session(
         None => return Err(ApiError::not_found(format!("session {id} not found"))),
     };
 
-    // Folding the turns' transcripts is blocking IO.
-    let usage = {
+    // Attributed exactly as the list scan does (an unreadable assignment
+    // omits the customer keys rather than fail the page), and each turn
+    // priced at its own customer's pricing — so the detail matches its list
+    // row. Folding the turns' transcripts is blocking IO.
+    let (who, usage) = {
         let dto = dto.clone();
         let store = std::sync::Arc::clone(&s.run_store);
-        let pricing = s.pricing.clone();
-        tokio::task::spawn_blocking(move || session_usage(&dto, &store, &pricing))
-            .await
-            .map_err(|e| ApiError::internal(e.to_string()))?
+        let global = s.global_dir.clone();
+        let pricing = std::sync::Arc::clone(&s.customer_pricing);
+        crate::api::runs::blocking(move || {
+            let mut lookup =
+                crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
+            let mut prices = crate::customers::PricingMemo::new(&pricing);
+            let who = session_customer(&mut lookup, &dto, false)?;
+            let usage = session_usage(&dto, &store, &mut prices, &mut |tp| {
+                turn_price_key(&mut lookup, &dto, tp, false)
+            })?;
+            Ok((who, usage))
+        })
+        .await?
     };
     let mut val = serde_json::to_value(&dto).map_err(|e| ApiError::internal(e.to_string()))?;
     if let serde_json::Value::Object(ref mut map) = val {
@@ -687,6 +773,13 @@ async fn get_session(
         );
         if let Ok(u) = serde_json::to_value(&usage) {
             map.insert("usage".to_string(), u);
+        }
+        if let Some(who) = &who {
+            map.insert("customer".to_string(), serde_json::json!(who.slug));
+            map.insert(
+                "customer_derived".to_string(),
+                serde_json::json!(who.derived),
+            );
         }
     }
     crate::codename::inject_codename(&mut val, &dto.session_id, Some(&dto.agent_name));
@@ -1398,7 +1491,13 @@ mod tests {
             customer: None,
         };
         let store = rupu_orchestrator::runs::RunStore::new(tmp.path().join("runs"));
-        let u = session_usage(&dto, &store, &rupu_config::PricingConfig::default());
+        let u = session_usage(
+            &dto,
+            &store,
+            &mut crate::customers::FlatPricing(&rupu_config::PricingConfig::default()),
+            &mut |_| Ok(PriceKey::Customer(None)),
+        )
+        .unwrap();
         assert_eq!(u.input_tokens, 970);
         assert_eq!(u.output_tokens, 7);
         assert_eq!(u.runs, 1);

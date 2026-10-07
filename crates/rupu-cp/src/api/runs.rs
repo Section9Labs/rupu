@@ -94,8 +94,16 @@ async fn run_response(s: &AppState, id: &str) -> ApiResult<Json<serde_json::Valu
         other => ApiError::internal(other.to_string()),
     })?;
     let steps = s.run_store.read_step_results(id).unwrap_or_default();
-    let u = crate::usage::run_usage_blocking(Arc::clone(&s.run_store), id.to_string()).await;
-    let usage = crate::usage::summarize_run_usage(&u, &s.pricing);
+    // Priced at the run's attributed customer, as its row and detail are.
+    let usage = crate::usage::summarize_runs_blocking(
+        Arc::clone(&s.run_store),
+        vec![id.to_string()],
+        s.global_dir.clone(),
+        Arc::clone(&s.customer_pricing),
+    )
+    .await
+    .pop()
+    .unwrap_or_default();
     let mut out = serde_json::json!({ "run": record, "steps": steps, "usage": usage });
     crate::codename_legacy::fill_detail_steps(&s.run_store, &record, &mut out);
     Ok(Json(out))
@@ -527,10 +535,10 @@ pub(crate) fn host_list_error(e: HostConnectorError) -> ApiError {
 /// The failures that are not skipped are the LOCAL host's own, which fail
 /// the request rather than silently dropping every local run: an `Internal`
 /// error on this side (a run store it cannot read), and — under a customer
-/// filter — a local row whose customer can't be known (its workspace's
-/// assignment is unreadable: the unfiltered local listing omits that row's
-/// customer keys), which is answered with the fail-closed 500 naming the
-/// workspace, never by naming the local host in the header.
+/// filter, where the local host is read from its own store fail-closed — an
+/// unreadable workspace assignment (a 500 naming the workspace, never the
+/// local host in the header). A legacy MIRRORED worker run the local store
+/// holds is left out of a filter and its worker host named in the header.
 async fn fan_out_list_runs(
     s: &AppState,
     kind: RunKind,
@@ -545,6 +553,21 @@ async fn fan_out_list_runs(
             let lifecycle = lifecycle.clone();
             async move {
                 let host_id = h.id;
+                // The local host under a filter is read from its own store,
+                // fail-closed: an unreadable assignment is a 500 naming the
+                // workspace, and a legacy mirrored run is left out with its
+                // worker host named — never a header entry for `local`.
+                if let (Some(f), "local") = (filter, host_id.as_str()) {
+                    let (rows, hosts) = local_filtered_runs(s, kind, lifecycle, f).await?;
+                    let rows = rows
+                        .into_iter()
+                        .map(|mut v| {
+                            crate::codename::inject_codename_row(&mut v, "id", None);
+                            v
+                        })
+                        .collect();
+                    return Ok((rows, hosts));
+                }
                 let conn = match registry.resolve(&host_id) {
                     Ok(c) => c,
                     Err(e) => {
@@ -553,14 +576,13 @@ async fn fan_out_list_runs(
                             error = %e,
                             "run fan-out: could not resolve connector; skipping host"
                         );
-                        return Ok((Vec::new(), None));
+                        return Ok((Vec::new(), Vec::new()));
                     }
                 };
                 // Unfiltered: one page of up to FAN_OUT_LIMIT, as ever.
                 // Filtered: the host's WHOLE list, page by page, so a peer
                 // that clamps its page size (an HTTP peer: 200) never caps
                 // the merged answer.
-                let local_lifecycle = lifecycle.clone();
                 let listed = match filter {
                     None => conn
                         .list_runs(RunListQuery {
@@ -584,30 +606,7 @@ async fn fan_out_list_runs(
                     }
                 };
                 match listed {
-                    Ok(FilteredRuns::CannotReport) if host_id == "local" => {
-                        // Re-ask the local store fail-closed: its error names
-                        // the workspace whose assignment can't be read.
-                        let err = local_run_rows(
-                            s,
-                            crate::pagination::PageQuery {
-                                offset: Some(0),
-                                limit: Some(1),
-                            },
-                            local_lifecycle,
-                            kind == RunKind::Workflow,
-                            crate::pagination::DateRangeQuery::default(),
-                            filter.cloned(),
-                        )
-                        .await
-                        .err()
-                        .unwrap_or_else(|| {
-                            ApiError::internal(
-                                "the local host can't report a customer for every run",
-                            )
-                        });
-                        Err(err)
-                    }
-                    Ok(FilteredRuns::CannotReport) => Ok((Vec::new(), Some(host_id))),
+                    Ok(FilteredRuns::CannotReport) => Ok((Vec::new(), vec![host_id])),
                     Ok(FilteredRuns::Rows(rows)) => {
                         let rows = rows
                             .into_iter()
@@ -617,7 +616,7 @@ async fn fan_out_list_runs(
                                 v
                             })
                             .collect();
-                        Ok((rows, None))
+                        Ok((rows, Vec::new()))
                     }
                     Err(HostConnectorError::Internal(e)) if host_id == "local" => {
                         Err(ApiError::internal(e))
@@ -628,20 +627,24 @@ async fn fan_out_list_runs(
                             error = %e,
                             "run fan-out: list_runs failed; skipping host"
                         );
-                        Ok((Vec::new(), None))
+                        Ok((Vec::new(), Vec::new()))
                     }
                 }
             }
         })
         .collect();
 
-    let all: Vec<(Vec<serde_json::Value>, Option<String>)> =
+    let all: Vec<(Vec<serde_json::Value>, Vec<String>)> =
         join_all(futs).await.into_iter().collect::<ApiResult<_>>()?;
     let mut merged: Vec<serde_json::Value> = Vec::new();
     let mut without_customer: Vec<String> = Vec::new();
     for (rows, skipped) in all {
         merged.extend(rows);
-        without_customer.extend(skipped);
+        for h in skipped {
+            if !without_customer.contains(&h) {
+                without_customer.push(h);
+            }
+        }
     }
     // Sort newest-first by `started_at` (ISO-8601 strings compare lexicographically).
     merged.sort_by(|a, b| {
@@ -724,26 +727,27 @@ impl RunListRow {
 
     /// A row whose customer is already attributed (`who`; `None` = it cannot
     /// be known, and the row carries no customer keys), priced with that
-    /// customer's pricing (an unknown one at the run's recorded customer's,
-    /// else global).
+    /// customer's pricing (an unknown one at the global rates, with
+    /// `usage.pricing_error` saying so).
     pub fn priced(
         r: &RunRecord,
         who: Option<crate::customers::Attribution>,
         store: &rupu_orchestrator::runs::RunStore,
         prices: &mut dyn crate::customers::PriceBook,
     ) -> Self {
-        let slug = match &who {
-            Some(w) => w.slug.as_deref(),
-            None => crate::customers::Recorded::of(&r.customer).slug(),
-        };
-        let mut row = Self::with_usage(r, store, prices.pricing_for(slug));
-        row.usage.pricing_error = prices.pricing_error_for(slug);
+        // `who == None` (the attribution can't be known — only ever a legacy
+        // run) prices at the global rates, flagged.
+        let key = crate::customers::PriceKey::of(who.as_ref());
+        let mut row = Self::with_usage(r, store, prices.pricing_for(key.slug()));
+        row.usage.pricing_error = key.pricing_error(prices);
         row.customer = who.map(Into::into);
         row
     }
 
     /// The full list row: attributed through `lookup` (recorded customer,
-    /// else the workspace's current assignment — `customer_derived`) and
+    /// else — a local legacy run — the workspace's current assignment —
+    /// `customer_derived`; a mirrored worker run by what it recorded only,
+    /// no keys for a legacy one) and
     /// priced with that customer's pricing. An assignment that cannot be read
     /// is an error naming the workspace (never "no customer"). Shared by the
     /// CP's run lists and `rupu run list` (the SSH run-list surface).
@@ -753,8 +757,8 @@ impl RunListRow {
         lookup: &mut crate::customers::CustomerLookup,
         prices: &mut dyn crate::customers::PriceBook,
     ) -> Result<Self, ApiError> {
-        let who = lookup.attribute(crate::customers::Recorded::of(&r.customer), &r.workspace_id)?;
-        Ok(Self::priced(r, Some(who), store, prices))
+        let who = lookup.attribute_run(r, true)?;
+        Ok(Self::priced(r, who, store, prices))
     }
 
     /// [`Self::attributed`] for `rupu run list`, a display listing that must
@@ -767,8 +771,8 @@ impl RunListRow {
         lookup: &mut crate::customers::CustomerLookup,
         prices: &mut dyn crate::customers::PriceBook,
     ) -> Self {
-        let who = lookup
-            .attribute_for_listing(crate::customers::Recorded::of(&r.customer), &r.workspace_id);
+        // Not fail-closed: never an error (an unreadable assignment is `None`).
+        let who = lookup.attribute_run(r, false).unwrap_or(None);
         Self::priced(r, who, store, prices)
     }
 
@@ -867,23 +871,36 @@ pub fn query_run_rows(
     // timestamps `DateRangeQuery::contains_str` guards against elsewhere.
     runs.retain(|r| range.contains(r.started_at));
     runs.sort_by_key(|r| std::cmp::Reverse(r.started_at));
-    let RowCustomers { mut lookup, filter } = customers;
+    let RowCustomers {
+        mut lookup,
+        filter,
+        mut unreportable,
+    } = customers;
     let mut attributed: Vec<(RunRecord, Option<crate::customers::Attribution>)> =
         Vec::with_capacity(runs.len());
     for r in runs {
-        let recorded = crate::customers::Recorded::of(&r.customer);
         let who = match lookup.as_deref_mut() {
-            Some(l) if filter.is_some() => Some(
-                l.attribute(recorded, &r.workspace_id)
-                    .map_err(RunRowsError::Customer)?,
-            ),
-            Some(l) => l.attribute_for_listing(recorded, &r.workspace_id),
-            None => crate::customers::Attribution::recorded_only(recorded),
+            // A mirrored worker run is attributed by what it recorded only
+            // (`CustomerLookup::attribute_run`).
+            Some(l) => l
+                .attribute_run(&r, filter.is_some())
+                .map_err(RunRowsError::Customer)?,
+            None => crate::customers::Attribution::recorded_only(crate::customers::Recorded::of(
+                &r.customer,
+            )),
         };
         let keep = match (filter, &who) {
             (None, _) => true,
             (Some(f), Some(w)) => f.matches(w.slug.as_deref()),
-            (Some(_), None) => false,
+            // A run whose customer can't be known here (a legacy mirrored
+            // worker run) is left out of a filter — never "no customer" —
+            // and its host named.
+            (Some(_), None) => {
+                if let Some(hosts) = unreportable.as_deref_mut() {
+                    crate::customers::note_unreportable(hosts, &r);
+                }
+                false
+            }
         };
         if keep {
             attributed.push((r, who));
@@ -909,6 +926,10 @@ pub struct RowCustomers<'a> {
     pub lookup: Option<&'a mut crate::customers::CustomerLookup>,
     /// Keep only the rows this matches (before paging).
     pub filter: Option<&'a crate::customers::CustomerFilter>,
+    /// Under a filter: collects the worker ids of the mirrored runs left
+    /// out because their customer can't be known (legacy worker runs) — the
+    /// hosts a response names as unable to report a customer for every run.
+    pub unreportable: Option<&'a mut Vec<String>>,
 }
 
 /// Why [`query_run_rows`] failed.
@@ -951,14 +972,30 @@ impl RunRowsError {
 /// yields byte-identical data to the local `mirror_get_run` path — which calls
 /// this same function. Hand-building a parallel detail shape in the CLI would
 /// let the two drift silently.
+///
+/// `usage` is priced like the run's list row (spec §1: a run's detail costs
+/// what its row does): at its attributed customer through `lookup`
+/// ([`crate::usage::run_price_key`]); with no lookup (a mirror, whose
+/// workspaces live on the worker) by what the run recorded only; `Unknown`
+/// (global rates, `pricing_error`) when that can't be known.
 pub fn query_run_detail(
     store: &rupu_orchestrator::runs::RunStore,
     id: &str,
-    pricing: &rupu_config::PricingConfig,
+    prices: &mut dyn crate::customers::PriceBook,
+    lookup: Option<&mut crate::customers::CustomerLookup>,
 ) -> Result<serde_json::Value, rupu_orchestrator::RunStoreError> {
     let record = store.load(id)?;
     let steps = store.read_step_results(id).unwrap_or_default();
-    let usage = crate::usage::summarize_run(store, id, pricing);
+    let key = match lookup {
+        Some(l) => crate::usage::run_price_key(&record, l),
+        None => crate::customers::PriceKey::of(
+            crate::customers::Attribution::recorded_only(crate::customers::Recorded::of(
+                &record.customer,
+            ))
+            .as_ref(),
+        ),
+    };
+    let usage = crate::usage::summarize_run_keyed(store, id, &key, prices);
     let mut out = serde_json::json!({ "run": record, "steps": steps, "usage": usage });
     crate::codename::inject_codename(&mut out["run"], &record.id, None);
     // Legacy runs: derive names below the run level too (steps, units,
@@ -990,7 +1027,10 @@ impl RunsListQuery {
 
 /// The local run list as wire rows (tagged `host_id: "local"`), attributed,
 /// filtered by customer and dated BEFORE it is paged, each row priced per its
-/// customer. Blocking IO runs on the blocking pool.
+/// customer, plus — under a filter — the worker hosts of the mirrored runs
+/// left out because their customer can't be known (for the
+/// [`crate::customers::HOSTS_WITHOUT_CUSTOMER_HEADER`]). Blocking IO runs on
+/// the blocking pool.
 async fn local_run_rows(
     s: &AppState,
     page: crate::pagination::PageQuery,
@@ -998,15 +1038,16 @@ async fn local_run_rows(
     workflow_only: bool,
     range: crate::pagination::DateRangeQuery,
     filter: Option<crate::customers::CustomerFilter>,
-) -> ApiResult<Vec<serde_json::Value>> {
+) -> ApiResult<(Vec<serde_json::Value>, Vec<String>)> {
     let store = Arc::clone(&s.run_store);
     let customer_pricing = Arc::clone(&s.customer_pricing);
     let global = s.global_dir.clone();
-    let rows = blocking(move || {
+    let (rows, hosts) = blocking(move || {
         let mut lookup =
             crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
         let mut prices = crate::customers::PricingMemo::new(&customer_pricing);
-        query_run_rows(
+        let mut hosts = Vec::new();
+        let rows = query_run_rows(
             &store,
             page.offset(),
             page.limit(),
@@ -1018,19 +1059,62 @@ async fn local_run_rows(
             RowCustomers {
                 lookup: Some(&mut lookup),
                 filter: filter.as_ref(),
+                unreportable: Some(&mut hosts),
             },
         )
-        .map_err(RunRowsError::into_api)
+        .map_err(RunRowsError::into_api)?;
+        Ok((rows, hosts))
     })
     .await?;
-    Ok(rows
-        .into_iter()
-        .map(|r| {
-            let mut v = serde_json::to_value(r).unwrap();
-            v["host_id"] = serde_json::json!("local");
-            v
-        })
-        .collect())
+    Ok((
+        rows.into_iter()
+            .map(|r| {
+                let mut v = serde_json::to_value(r).unwrap();
+                v["host_id"] = serde_json::json!("local");
+                v
+            })
+            .collect(),
+        hosts,
+    ))
+}
+
+/// Every local run matching `filter` (fail-closed), page after page, for the
+/// filtered fan-out — plus the worker hosts of the mirrored runs it left out.
+async fn local_filtered_runs(
+    s: &AppState,
+    kind: RunKind,
+    lifecycle: Option<String>,
+    filter: &crate::customers::CustomerFilter,
+) -> ApiResult<(Vec<serde_json::Value>, Vec<String>)> {
+    let mut all = Vec::new();
+    let mut hosts: Vec<String> = Vec::new();
+    let mut offset = 0usize;
+    loop {
+        let (rows, skipped) = local_run_rows(
+            s,
+            crate::pagination::PageQuery {
+                offset: Some(offset),
+                limit: Some(crate::pagination::MAX_LIMIT),
+            },
+            lifecycle.clone(),
+            kind == RunKind::Workflow,
+            crate::pagination::DateRangeQuery::default(),
+            Some(filter.clone()),
+        )
+        .await?;
+        for h in skipped {
+            if !hosts.contains(&h) {
+                hosts.push(h);
+            }
+        }
+        let n = rows.len();
+        all.extend(rows);
+        if n < crate::pagination::MAX_LIMIT {
+            break;
+        }
+        offset += n;
+    }
+    Ok((all, hosts))
 }
 
 /// One remote host's run-list page, tagged with `host_id` (and a derived
@@ -1184,7 +1268,7 @@ async fn list_runs(
         if host_id == "local" && filter.is_some() {
             // The connector pages before a filter could apply; list here so
             // the filter runs first.
-            let rows = local_run_rows(
+            let (rows, hosts) = local_run_rows(
                 &s,
                 page,
                 None,
@@ -1193,7 +1277,10 @@ async fn list_runs(
                 filter,
             )
             .await?;
-            return Ok((axum::http::HeaderMap::new(), Json(rows)));
+            return Ok((
+                crate::customers::hosts_without_customer_header(&hosts),
+                Json(rows),
+            ));
         }
         let conn = resolve_host(&s, host_id)?;
         let tagged = remote_run_window(
@@ -1308,7 +1395,7 @@ async fn list_workflow_runs(
     let filter = crate::customers::CustomerFilter::parse(q.customer.as_deref())?;
     if let Some(host_id) = &q.host {
         if host_id == "local" {
-            let rows = local_run_rows(
+            let (rows, hosts) = local_run_rows(
                 &s,
                 page,
                 q.lifecycle.clone(),
@@ -1317,7 +1404,10 @@ async fn list_workflow_runs(
                 filter,
             )
             .await?;
-            return Ok((axum::http::HeaderMap::new(), Json(rows)));
+            return Ok((
+                crate::customers::hosts_without_customer_header(&hosts),
+                Json(rows),
+            ));
         }
         let conn = resolve_host(&s, host_id)?;
         let tagged = remote_run_window(
@@ -1407,10 +1497,15 @@ async fn local_run_detail(
     s: &AppState,
     id: &str,
 ) -> ApiResult<serde_json::Value> {
-    let pricing = s.pricing.clone();
+    let global = s.global_dir.clone();
+    let pricing = Arc::clone(&s.customer_pricing);
     let id = id.to_string();
     blocking(move || {
-        query_run_detail(&store, &id, &pricing).map_err(|e| run_not_found_or_internal(&id, e))
+        let mut lookup =
+            crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
+        let mut prices = crate::customers::PricingMemo::new(&pricing);
+        query_run_detail(&store, &id, &mut prices, Some(&mut lookup))
+            .map_err(|e| run_not_found_or_internal(&id, e))
     })
     .await
 }
@@ -1748,19 +1843,24 @@ fn de_opt_u64_from_str<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<
 fn run_usage_response(
     u: &crate::usage_index::RunUsage,
     pricing: &rupu_config::PricingConfig,
+    pricing_error: Option<String>,
     since: Option<usize>,
     epoch: Option<u64>,
 ) -> RunUsageResponse {
+    let stamp = |mut s: crate::usage::UsageSummary| {
+        s.pricing_error = pricing_error.clone();
+        s
+    };
     let from = match (since, epoch) {
         (Some(n), Some(e)) if e == u.epoch && n <= u.points.len() => n,
         _ => 0,
     };
     RunUsageResponse {
-        summary: crate::usage::summarize_run_usage(u, pricing),
+        summary: stamp(crate::usage::summarize_run_usage(u, pricing)),
         steps: u
             .by_step
             .iter()
-            .map(|(k, rows)| (k.clone(), crate::usage::summarize(rows, pricing)))
+            .map(|(k, rows)| (k.clone(), stamp(crate::usage::summarize(rows, pricing))))
             .collect(),
         turns: u.turns,
         partial: u.partial,
@@ -1773,10 +1873,17 @@ fn run_usage_response(
 fn run_usage_json(
     u: &crate::usage_index::RunUsage,
     pricing: &rupu_config::PricingConfig,
+    pricing_error: Option<String>,
     q: &RunUsageQuery,
 ) -> ApiResult<serde_json::Value> {
-    serde_json::to_value(run_usage_response(u, pricing, q.since, q.epoch))
-        .map_err(|e| ApiError::internal(e.to_string()))
+    serde_json::to_value(run_usage_response(
+        u,
+        pricing,
+        pricing_error,
+        q.since,
+        q.epoch,
+    ))
+    .map_err(|e| ApiError::internal(e.to_string()))
 }
 
 /// The live usage of run `id` in `store`: 404 unless the run exists there,
@@ -1788,19 +1895,28 @@ async fn local_run_usage(
     id: &str,
     q: &RunUsageQuery,
 ) -> ApiResult<serde_json::Value> {
-    {
+    // The run's price: its attributed customer's, as its row and detail
+    // (spec §1).
+    let (pricing, pricing_error) = {
         let store = Arc::clone(&store);
         let id = id.to_string();
+        let global = s.global_dir.clone();
+        let customer_pricing = Arc::clone(&s.customer_pricing);
         blocking(move || {
-            store
+            let record = store
                 .load(&id)
-                .map(drop)
-                .map_err(|e| run_not_found_or_internal(&id, e))
+                .map_err(|e| run_not_found_or_internal(&id, e))?;
+            let mut lookup =
+                crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
+            let mut prices = crate::customers::PricingMemo::new(&customer_pricing);
+            let key = crate::usage::run_price_key(&record, &mut lookup);
+            let error = key.pricing_error(&mut prices);
+            Ok((prices.get(key.slug()).clone(), error))
         })
-        .await?;
-    }
+        .await?
+    };
     let u = crate::usage::run_usage_blocking(store, id.to_string()).await;
-    run_usage_json(&u, &s.pricing, q)
+    run_usage_json(&u, &pricing, pricing_error, q)
 }
 
 /// `GET /api/runs/:id/usage` on a resolved host. Shared by the explicit
@@ -1871,9 +1987,13 @@ async fn get_run_usage(
             local_run_usage(store, &s, &id, &q).await.map(Json)
         }
         RunLocation::Host { host_id } => run_usage_from_host(&s, &host_id, &id, &q).await.map(Json),
-        RunLocation::Unpersisted { .. } => {
-            run_usage_json(&crate::usage_index::RunUsage::default(), &s.pricing, &q).map(Json)
-        }
+        RunLocation::Unpersisted { .. } => run_usage_json(
+            &crate::usage_index::RunUsage::default(),
+            &s.pricing,
+            None,
+            &q,
+        )
+        .map(Json),
         RunLocation::NotFound => Err(ApiError::not_found(format!("run {id} not found"))),
     }
 }
@@ -3466,8 +3586,13 @@ pub(crate) mod tests {
         assert_eq!(row.codename, "jade-reef");
         assert!(row.codename_derived);
         s.run_store.create(legacy, "name: x\n").unwrap();
-        let d =
-            query_run_detail(&s.run_store, "run_01J9ZQ3K4M5N6P7Q8R9S0T1V2W", &s.pricing).unwrap();
+        let d = query_run_detail(
+            &s.run_store,
+            "run_01J9ZQ3K4M5N6P7Q8R9S0T1V2W",
+            &mut crate::customers::FlatPricing(&s.pricing),
+            None,
+        )
+        .unwrap();
         assert_eq!(d["run"]["codename"], "jade-reef");
         assert_eq!(d["run"]["codename_derived"], true);
 
@@ -3478,7 +3603,13 @@ pub(crate) mod tests {
         assert_eq!(row.codename, "cobalt-harbor");
         assert!(!row.codename_derived);
         s.run_store.create(named, "name: x\n").unwrap();
-        let d = query_run_detail(&s.run_store, "run_01NAMED", &s.pricing).unwrap();
+        let d = query_run_detail(
+            &s.run_store,
+            "run_01NAMED",
+            &mut crate::customers::FlatPricing(&s.pricing),
+            None,
+        )
+        .unwrap();
         assert_eq!(d["run"]["codename"], "cobalt-harbor");
         assert_eq!(d["run"]["codename_derived"], false);
     }

@@ -164,6 +164,7 @@ pub fn build_summary(
         findings_open,
         fleet,
         captured_at: now,
+        hosts_without_customer: Vec::new(),
     }
 }
 

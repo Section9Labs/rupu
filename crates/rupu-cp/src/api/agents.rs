@@ -491,8 +491,11 @@ struct AgentDetailDto {
     raw: String,
 }
 
-/// Every local spend source's usage rows, for the per-agent rollup, plus
-/// each agent's most recent contributing start (RFC-3339). Blocking IO.
+/// Every local spend source's usage rows, for the per-agent rollup, grouped
+/// by what prices them — each source's attributed customer
+/// ([`crate::customers::PriceKey`]), the same attribution its list row and
+/// `/api/usage` use — plus each agent's most recent contributing start
+/// (RFC-3339). Blocking IO.
 ///
 /// Workflow runs come from the one fold (`crate::usage::run_usage` —
 /// ledger-first, cached process-wide); standalone agent runs and session
@@ -501,18 +504,23 @@ struct AgentDetailDto {
 /// standalone source). Each `UsageRow` (one per `(provider, model, agent)`)
 /// names the agent its transcript ran — for a standalone run, its own
 /// agent, and each dispatched child's agent for the child's share. `last_run`
-/// is folded from the SAME rows, the run's start as the candidate time.
+/// is folded from the SAME rows, the run's start as the candidate time. A
+/// source whose customer can't be read is `Unknown` (global rates, flagged)
+/// — this list does not fail on it.
 fn agent_usage_rows(
     store: &rupu_orchestrator::runs::RunStore,
     global: &std::path::Path,
 ) -> (
-    Vec<rupu_transcript::UsageRow>,
+    crate::api::usage::RowsByCustomer,
     std::collections::BTreeMap<String, String>,
 ) {
-    let mut all_rows: Vec<rupu_transcript::UsageRow> = Vec::new();
+    use crate::customers::PriceKey;
+    let mut lookup =
+        crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(global));
+    let mut groups = crate::api::usage::RowsByCustomer::new();
     let mut last_runs: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
-    let mut add = |rows: Vec<rupu_transcript::UsageRow>, at: Option<String>| {
+    let mut add = |key: PriceKey, rows: Vec<rupu_transcript::UsageRow>, at: Option<String>| {
         if let Some(at) = at {
             for row in rows.iter().filter(|r| !r.agent.is_empty()) {
                 last_runs
@@ -525,17 +533,22 @@ fn agent_usage_rows(
                     .or_insert_with(|| at.clone());
             }
         }
-        all_rows.extend(rows);
+        groups.entry(key).or_default().extend(rows);
     };
     for r in store.list().unwrap_or_default() {
+        let key = crate::usage::run_price_key(&r, &mut lookup);
         let rows = crate::usage::run_usage(store, &r.id).rows.clone();
-        add(rows, Some(r.started_at.to_rfc3339()));
+        add(key, rows, Some(r.started_at.to_rfc3339()));
     }
     for src in crate::usage_sources::unclaimed_extra_sources(global, store) {
+        let key = match src.attribute(&mut lookup) {
+            Ok(who) => PriceKey::Customer(who.slug),
+            Err(_) => PriceKey::Unknown,
+        };
         let rows = crate::usage::transcripts_usage(&src.paths).rows.clone();
-        add(rows, src.started_at.map(|t| t.to_rfc3339()));
+        add(key, rows, src.started_at.map(|t| t.to_rfc3339()));
     }
-    (all_rows, last_runs)
+    (groups, last_runs)
 }
 
 /// `GET /api/agents` — global agent definitions plus one representative
@@ -614,14 +627,30 @@ async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>
     // Every local spend source feeds `breakdown` (see `agent_usage_rows`),
     // which re-groups by agent name — the same rows `/api/usage` groups, so
     // an agent's usage here matches `/api/usage?group_by=agent`.
-    let (all_rows, last_runs) = {
+    let (groups, last_runs) = {
         let store = Arc::clone(&s.run_store);
         let global = s.global_dir.clone();
         tokio::task::spawn_blocking(move || agent_usage_rows(&store, &global))
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?
     };
-    let breakdown = crate::usage::breakdown(&all_rows, &s.pricing, crate::usage::GroupBy::Agent);
+    // Each source's rows priced at its customer's pricing (spec §1), as
+    // `/api/usage?group_by=agent` prices them; an agent any of whose work was
+    // priced with a fallback carries that `pricing_error`.
+    let mut prices = crate::customers::PricingMemo::new(&s.customer_pricing);
+    let (_, breakdown, _) =
+        crate::api::usage::priced_usage(&groups, &mut prices, crate::usage::GroupBy::Agent);
+    let mut agent_errors: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for (key, rows) in &groups {
+        if let Some(e) = key.pricing_error(&mut prices) {
+            for row in rows {
+                agent_errors
+                    .entry(row.agent.clone())
+                    .or_insert_with(|| e.clone());
+            }
+        }
+    }
 
     let mut canonical_dto_for_name: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
@@ -648,7 +677,7 @@ async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>
                 priced: b.priced,
                 runs: b.runs,
                 partial: false,
-                pricing_error: None,
+                pricing_error: agent_errors.get(&name).cloned(),
             };
             dto.run_count = b.runs;
             dto.last_run = last_runs.get(&name).cloned();

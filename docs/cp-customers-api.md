@@ -44,8 +44,20 @@ and `layer_error` saying why, and its work is priced at the GLOBAL rates —
 visibly: every usage summary that includes such work (the customer's
 `rollup.usage`, project rollups, run / agent-run / session rows, `/api/usage`'s
 `summary`, `/api/usage/timeline` buckets and `/api/usage/runs` rows) carries
-`pricing_error` naming the customer. `pricing_error` is absent otherwise (it
-is unrelated to `partial`, which flags missing token counts).
+`pricing_error` naming the customer. Work whose customer can't be known (a
+row listed without customer keys, below) is priced at the global rates too,
+with `pricing_error: "customer unknown; priced at global rates"`.
+`pricing_error` is absent otherwise (it is unrelated to `partial`, which flags
+missing token counts). `/api/usage/outliers` rows carry it as well, and such
+runs are left out of every outlier baseline (their cost is not comparable)
+while still being flagged against it.
+
+**A run costs the same everywhere.** Its list row, `GET /api/runs/:id`,
+`/api/runs/:id/usage`, `/api/runs/:id/graph`, the workflows list's and the
+agents list's usage, autoflow rows and the rollups all price it at its
+attributed customer. A session's list row and `GET /api/sessions/:id` price
+each TURN at that turn's own attribution (not the session's latest customer),
+as the rollups do.
 
 ## Attribution
 
@@ -115,6 +127,16 @@ is not an error — it matches nothing.
   WORKER resolved from its own customers and assignments; the coordinator's
   layer is not shipped to remote hosts yet. A peer's `acme` is that peer's
   customer, which the filter matches by slug.
+- **Mirrored runs are never attributed through the coordinator.** A run the
+  coordinator's store holds for a worker (`worker_id` set — tunnel, bucket,
+  placed units) counts only by what it recorded. A LEGACY one (no `customer`
+  key) is listed unfiltered without customer keys (priced as unknown); under a
+  filter, and in counts and rollups, it is left out — never counted as "no
+  customer" — and its worker host is named: in the
+  `X-Rupu-Hosts-Without-Customer` header on run lists, `/api/usage/timeline`,
+  `/api/usage/runs` and `/api/usage/outliers`, and in a
+  `hosts_without_customer` array on `/api/usage`, `/api/dashboard` and each
+  customer row's `rollup`.
 - **Aggregates (`/api/usage`, `/api/dashboard`) are local-only under a filter.**
   A remote host's totals arrive already summed and cannot be filtered:
   `?host=<remote>&customer=…` is **501**, and the fan-out reports each remote
@@ -131,7 +153,7 @@ customer". On the fan-out, a filtered run list whose LOCAL rows can't all be
 attributed is that same 500, never a header entry.
 
 An **unfiltered** run / workflow-run / agent-run / session list (and a
-project's session list) does not fail: the affected rows **omit the `customer`
+project's session list, and a run's or session's detail) does not fail: the affected rows **omit the `customer`
 / `customer_derived` keys** and one warning per workspace goes to the server
 log; every other row keeps its keys. The CLI's display listings (`rupu run
 list`, `transcript list`, `session list`, which an SSH coordinator reads)

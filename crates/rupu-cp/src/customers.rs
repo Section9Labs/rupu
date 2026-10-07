@@ -120,6 +120,11 @@ impl CustomerFilter {
 
 pub use rupu_transcript::{Recorded, RecordedField};
 
+/// `UsageSummary.pricing_error` for work whose customer can't be known (its
+/// workspace's assignment is unreadable; an unfiltered list degrades): it is
+/// priced at the global rates, which may be wrong.
+pub const UNKNOWN_CUSTOMER_PRICING: &str = "customer unknown; priced at global rates";
+
 /// A run's customer as rows report it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attribution {
@@ -310,6 +315,31 @@ impl CustomerLookup {
                 }
                 None
             }
+        }
+    }
+
+    /// A workflow run's attribution. A MIRRORED worker run (`worker_id`
+    /// set: a tunnel / bucket / placed unit's run held in this coordinator's
+    /// store) is never attributed through THIS coordinator's assignments —
+    /// its workspace lives on the worker, whose own customer namespace
+    /// resolved it: only what it recorded counts ([`Attribution::recorded_only`];
+    /// `None` for a legacy one, whose customer this host cannot know). A
+    /// local run: [`Self::attribute`] when `fail_closed` (filters, counts,
+    /// rollups, prices), else [`Self::attribute_for_listing`] (`None` = its
+    /// assignment can't be read).
+    pub fn attribute_run(
+        &mut self,
+        r: &rupu_orchestrator::RunRecord,
+        fail_closed: bool,
+    ) -> Result<Option<Attribution>, ApiError> {
+        let recorded = Recorded::of(&r.customer);
+        if r.worker_id.is_some() {
+            return Ok(Attribution::recorded_only(recorded));
+        }
+        if fail_closed {
+            self.attribute(recorded, &r.workspace_id).map(Some)
+        } else {
+            Ok(self.attribute_for_listing(recorded, &r.workspace_id))
         }
     }
 
@@ -521,6 +551,43 @@ impl CustomerPricing {
     }
 }
 
+/// What prices one piece of work: the customer it is attributed to (`None`
+/// = no customer), or `Unknown` — its attribution could not be read (an
+/// unfiltered list degrades), priced at the global rates and flagged with
+/// [`UNKNOWN_CUSTOMER_PRICING`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PriceKey {
+    Customer(Option<String>),
+    Unknown,
+}
+
+impl PriceKey {
+    /// `Unknown` for `None` (the attribution can't be known), else the
+    /// attributed customer.
+    pub fn of(who: Option<&Attribution>) -> Self {
+        match who {
+            Some(w) => Self::Customer(w.slug.clone()),
+            None => Self::Unknown,
+        }
+    }
+
+    /// The customer whose pricing applies (`None` = global).
+    pub fn slug(&self) -> Option<&str> {
+        match self {
+            Self::Customer(slug) => slug.as_deref(),
+            Self::Unknown => None,
+        }
+    }
+
+    /// The `pricing_error` work priced under this key carries.
+    pub fn pricing_error(&self, prices: &mut dyn PriceBook) -> Option<String> {
+        match self {
+            Self::Customer(slug) => prices.pricing_error_for(slug.as_deref()),
+            Self::Unknown => Some(UNKNOWN_CUSTOMER_PRICING.to_string()),
+        }
+    }
+}
+
 /// What prices a piece of work, by the customer it is attributed to
 /// (`None` = no customer).
 pub trait PriceBook {
@@ -666,6 +733,16 @@ pub fn filter_remote_rows(
         }
     }
     Some(out)
+}
+
+/// Record `r`'s worker as a host that can't report a customer for every
+/// run (a legacy mirrored run left out of a filter, count or rollup), once.
+pub fn note_unreportable(hosts: &mut Vec<String>, r: &rupu_orchestrator::RunRecord) {
+    if let Some(w) = r.worker_id.as_deref() {
+        if !hosts.iter().any(|h| h == w) {
+            hosts.push(w.to_string());
+        }
+    }
 }
 
 /// The fan-out header value for the hosts skipped, if any.
