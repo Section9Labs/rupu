@@ -186,6 +186,205 @@ function IncompleteBanner({ incomplete }: { incomplete?: IncompleteSource[] }) {
   );
 }
 
+/** The exact text each cell below displays — the columns' `widthText`, from
+ *  which the virtualized table picks the rows its width probe renders.
+ *  `netflowColumns`' test pins every one to its cell's rendered text. */
+const timeText = (f: FlowView) => new Date(f.ts).toLocaleTimeString();
+const originText = (f: FlowView) => {
+  if (!isSocketFlow(f)) return originLabel(f);
+  return (
+    (f.process?.name ?? originLabel(f)) +
+    (f.process ? ` · pid ${f.process.pid}` : '') +
+    (transcriptHref(f) ? ' transcript' : '')
+  );
+};
+const asnText = (f: FlowView) => (f.asn ? `AS${f.asn.asn} ${f.asn.org}` : '');
+const networkText = (f: FlowView) =>
+  isSocketFlow(f)
+    ? `${f.scheme} → ${f.host}:${f.port}` + (f.asn ? ` · ${asnText(f)}` : '')
+    : f.asn
+      ? asnText(f)
+      : '—';
+const statusText = (f: FlowView) => (isSocketFlow(f) ? '—' : String(f.status ?? '—'));
+const durationText = (f: FlowView) => (f.duration_ms != null ? `${f.duration_ms} ms` : '—');
+
+/** The flows table's columns. Exported for tests (each `widthText` must be
+ *  exactly the text its `render` shows). */
+export function netflowColumns(showAttribution: boolean): Column<FlowView>[] {
+  return [
+    {
+      key: 'ts',
+      header: 'Time',
+      fit: true,
+      sortable: true,
+      sortValue: (f) => f.ts,
+      widthText: timeText,
+      render: (f) => timeText(f),
+    },
+    // Attribution columns (non-run scopes only): server-resolved root run
+    // + workflow. `—` is an honest "no run record accounts for this
+    // ledger" (e.g. a standalone agent run), not missing data.
+    ...(showAttribution
+      ? ([
+          {
+            key: 'run',
+            header: 'Run',
+            fit: true,
+            sortable: true,
+            sortValue: (f) => f.run_id ?? null,
+            widthText: (f) => f.run_id ?? '—',
+            render: (f) =>
+              f.run_id ? (
+                <span className="font-mono text-note text-brand-500">{f.run_id}</span>
+              ) : (
+                <span className="text-ink-mute">—</span>
+              ),
+          },
+          {
+            key: 'workflow',
+            header: 'Workflow',
+            fit: true,
+            sortable: true,
+            sortValue: (f) => f.workflow ?? null,
+            widthText: (f) => f.workflow ?? '—',
+            render: (f) =>
+              f.workflow ? (
+                <span className="font-mono text-note text-ink-dim">{f.workflow}</span>
+              ) : (
+                <span className="text-ink-mute">—</span>
+              ),
+          },
+        ] as Column<FlowView>[])
+      : []),
+    {
+      key: 'origin',
+      header: 'Origin',
+      fit: true,
+      widthText: originText,
+      render: (f) => {
+        if (!isSocketFlow(f)) return <span className="text-ink-dim">{originLabel(f)}</span>;
+        const href = transcriptHref(f);
+        return (
+          <span className="text-ink-dim">
+            {f.process?.name ?? originLabel(f)}
+            {f.process && <span className="text-ink-mute"> · pid {f.process.pid}</span>}
+            {href && (
+              <>
+                {' '}
+                <Link
+                  to={href}
+                  onClick={(e) => e.stopPropagation()}
+                  onKeyDown={(e) => e.stopPropagation()}
+                  className="text-brand-500 hover:underline"
+                >
+                  transcript
+                </Link>
+              </>
+            )}
+          </span>
+        );
+      },
+    },
+    {
+      key: 'host',
+      header: 'Host',
+      fit: true,
+      sortable: true,
+      sortValue: (f) => f.host,
+      widthText: (f) => f.host,
+      render: (f) => <span className="font-mono text-note">{f.host}</span>,
+    },
+    {
+      key: 'path',
+      header: 'Path',
+      subject: true,
+      titleValue: (f) => (isSocketFlow(f) ? '—' : `${f.method} ${f.path}`),
+      render: (f) =>
+        isSocketFlow(f) ? (
+          <span className="text-ink-mute">—</span>
+        ) : (
+          <span className="font-mono text-note text-ink-dim">{f.path}</span>
+        ),
+    },
+    {
+      key: 'network',
+      header: 'Network',
+      fit: true,
+      widthText: networkText,
+      render: (f) => {
+        if (!isSocketFlow(f)) {
+          return f.asn ? (
+            <span className="font-mono text-note text-ink-mute">
+              AS{f.asn.asn} {f.asn.org}
+            </span>
+          ) : (
+            <span className="text-ink-mute">—</span>
+          );
+        }
+        // A socket flow has no URL, so the transport → endpoint is its
+        // identity; an ASN (when enrichment found one) follows.
+        return (
+          <>
+            <span className="font-mono text-note text-ink-dim">
+              {f.scheme} → {f.host}:{f.port}
+            </span>
+            {f.asn && (
+              <span className="font-mono text-note text-ink-mute">
+                {' · '}AS{f.asn.asn} {f.asn.org}
+              </span>
+            )}
+          </>
+        );
+      },
+    },
+    {
+      key: 'status',
+      header: 'Status',
+      fit: true,
+      align: 'right',
+      widthText: statusText,
+      render: (f) =>
+        isSocketFlow(f) ? (
+          <span className="text-ink-mute">—</span>
+        ) : (
+          <span className={f.outcome === 'ok' ? 'text-ink-dim' : 'text-err'}>
+            {f.status ?? '—'}
+          </span>
+        ),
+    },
+    {
+      key: 'bytes_in',
+      header: 'In',
+      fit: true,
+      align: 'right',
+      sortable: true,
+      sortValue: (f) => f.bytes_in ?? null,
+      widthText: (f) => formatBytes(f.bytes_in),
+      render: (f) => formatBytes(f.bytes_in),
+    },
+    {
+      key: 'bytes_out',
+      header: 'Out',
+      fit: true,
+      align: 'right',
+      sortable: true,
+      sortValue: (f) => f.bytes_out ?? null,
+      widthText: (f) => formatBytes(f.bytes_out),
+      render: (f) => formatBytes(f.bytes_out),
+    },
+    {
+      key: 'duration_ms',
+      header: 'Duration',
+      fit: true,
+      align: 'right',
+      sortable: true,
+      sortValue: (f) => f.duration_ms ?? null,
+      widthText: durationText,
+      render: (f) => durationText(f),
+    },
+  ];
+}
+
 export function NetflowTable({
   flows,
   droppedTotal,
@@ -233,168 +432,7 @@ export function NetflowTable({
     );
   }
 
-  const columns: Column<FlowView>[] = [
-    {
-      key: 'ts',
-      header: 'Time',
-      fit: true,
-      sortable: true,
-      sortValue: (f) => f.ts,
-      render: (f) => new Date(f.ts).toLocaleTimeString(),
-    },
-    // Attribution columns (non-run scopes only): server-resolved root run
-    // + workflow. `—` is an honest "no run record accounts for this
-    // ledger" (e.g. a standalone agent run), not missing data.
-    ...(showAttribution
-      ? ([
-          {
-            key: 'run',
-            header: 'Run',
-            fit: true,
-            sortable: true,
-            sortValue: (f) => f.run_id ?? null,
-            render: (f) =>
-              f.run_id ? (
-                <span className="font-mono text-note text-brand-500">{f.run_id}</span>
-              ) : (
-                <span className="text-ink-mute">—</span>
-              ),
-          },
-          {
-            key: 'workflow',
-            header: 'Workflow',
-            fit: true,
-            sortable: true,
-            sortValue: (f) => f.workflow ?? null,
-            render: (f) =>
-              f.workflow ? (
-                <span className="font-mono text-note text-ink-dim">{f.workflow}</span>
-              ) : (
-                <span className="text-ink-mute">—</span>
-              ),
-          },
-        ] as Column<FlowView>[])
-      : []),
-    {
-      key: 'origin',
-      header: 'Origin',
-      fit: true,
-      render: (f) => {
-        if (!isSocketFlow(f)) return <span className="text-ink-dim">{originLabel(f)}</span>;
-        const href = transcriptHref(f);
-        return (
-          <span className="text-ink-dim">
-            {f.process?.name ?? originLabel(f)}
-            {f.process && <span className="text-ink-mute"> · pid {f.process.pid}</span>}
-            {href && (
-              <>
-                {' '}
-                <Link
-                  to={href}
-                  onClick={(e) => e.stopPropagation()}
-                  onKeyDown={(e) => e.stopPropagation()}
-                  className="text-brand-500 hover:underline"
-                >
-                  transcript
-                </Link>
-              </>
-            )}
-          </span>
-        );
-      },
-    },
-    {
-      key: 'host',
-      header: 'Host',
-      fit: true,
-      sortable: true,
-      sortValue: (f) => f.host,
-      render: (f) => <span className="font-mono text-note">{f.host}</span>,
-    },
-    {
-      key: 'path',
-      header: 'Path',
-      subject: true,
-      titleValue: (f) => (isSocketFlow(f) ? '—' : `${f.method} ${f.path}`),
-      render: (f) =>
-        isSocketFlow(f) ? (
-          <span className="text-ink-mute">—</span>
-        ) : (
-          <span className="font-mono text-note text-ink-dim">{f.path}</span>
-        ),
-    },
-    {
-      key: 'network',
-      header: 'Network',
-      fit: true,
-      render: (f) => {
-        if (!isSocketFlow(f)) {
-          return f.asn ? (
-            <span className="font-mono text-note text-ink-mute">
-              AS{f.asn.asn} {f.asn.org}
-            </span>
-          ) : (
-            <span className="text-ink-mute">—</span>
-          );
-        }
-        // A socket flow has no URL, so the transport → endpoint is its
-        // identity; an ASN (when enrichment found one) follows.
-        return (
-          <>
-            <span className="font-mono text-note text-ink-dim">
-              {f.scheme} → {f.host}:{f.port}
-            </span>
-            {f.asn && (
-              <span className="font-mono text-note text-ink-mute">
-                {' · '}AS{f.asn.asn} {f.asn.org}
-              </span>
-            )}
-          </>
-        );
-      },
-    },
-    {
-      key: 'status',
-      header: 'Status',
-      fit: true,
-      align: 'right',
-      render: (f) =>
-        isSocketFlow(f) ? (
-          <span className="text-ink-mute">—</span>
-        ) : (
-          <span className={f.outcome === 'ok' ? 'text-ink-dim' : 'text-err'}>
-            {f.status ?? '—'}
-          </span>
-        ),
-    },
-    {
-      key: 'bytes_in',
-      header: 'In',
-      fit: true,
-      align: 'right',
-      sortable: true,
-      sortValue: (f) => f.bytes_in ?? null,
-      render: (f) => formatBytes(f.bytes_in),
-    },
-    {
-      key: 'bytes_out',
-      header: 'Out',
-      fit: true,
-      align: 'right',
-      sortable: true,
-      sortValue: (f) => f.bytes_out ?? null,
-      render: (f) => formatBytes(f.bytes_out),
-    },
-    {
-      key: 'duration_ms',
-      header: 'Duration',
-      fit: true,
-      align: 'right',
-      sortable: true,
-      sortValue: (f) => f.duration_ms ?? null,
-      render: (f) => (f.duration_ms != null ? `${f.duration_ms} ms` : '—'),
-    },
-  ];
+  const columns = netflowColumns(showAttribution);
 
   return (
     <div className="space-y-3">

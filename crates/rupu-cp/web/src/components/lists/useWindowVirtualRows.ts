@@ -6,8 +6,13 @@
 // height, scrollbar and scroll position match a fully rendered table.
 // Row heights are tracked by one ResizeObserver (so spacers follow real
 // heights, including after a width-only resize re-wraps rows); rows not yet
-// measured use the average measured height. Scroll is observed on the document in the capture phase, which catches
-// whichever ancestor actually scrolls.
+// measured use the average measured height. Scroll is observed on the
+// document in the capture phase, which catches whichever ancestor actually
+// scrolls.
+//
+// The row holding keyboard focus stays mounted at its true position even
+// when it leaves the window (the spacer on its side is split around it), so
+// scrolling never drops focus to <body>.
 
 import { useLayoutEffect, useRef, useState } from 'react';
 
@@ -15,6 +20,12 @@ import { useLayoutEffect, useRef, useState } from 'react';
 export const ESTIMATED_ROW_PX = 41;
 /** Rows mounted beyond the viewport on each side. */
 export const OVERSCAN_ROWS = 20;
+
+/** One piece of the virtual body, in document order: a spacer standing in
+ *  for unmounted rows, or a run of mounted rows `[start, end)`. */
+export type VirtualSlot =
+  | { kind: 'spacer'; key: string; px: number }
+  | { kind: 'rows'; start: number; end: number };
 
 export function useWindowVirtualRows(keys: string[], enabled: boolean) {
   const bodyRef = useRef<HTMLTableSectionElement | null>(null);
@@ -26,6 +37,33 @@ export function useWindowVirtualRows(keys: string[], enabled: boolean) {
   const [viewport, setViewport] = useState({ top: 0, height: 0 });
   // Bumped when a measured height actually changed, to re-size the spacers.
   const [, setMeasureVersion] = useState(0);
+  // The row that holds focus (or contains the focused element).
+  const [focusedKey, setFocusedKey] = useState<string | null>(null);
+
+  useLayoutEffect(() => {
+    const body = bodyRef.current;
+    if (!enabled || !body) return;
+    const rowKeyOf = (target: EventTarget | null): string | undefined => {
+      const tr = target instanceof Element ? target.closest('tr') : null;
+      return tr && body.contains(tr) ? targetKeys.current.get(tr) : undefined;
+    };
+    const onFocusIn = (e: FocusEvent) => {
+      const key = rowKeyOf(e.target);
+      setFocusedKey(key ?? null);
+    };
+    const onFocusOut = (e: FocusEvent) => {
+      // Focus moving within the same row keeps it pinned.
+      if (rowKeyOf(e.relatedTarget) !== undefined) return;
+      setFocusedKey(null);
+    };
+    body.addEventListener('focusin', onFocusIn);
+    body.addEventListener('focusout', onFocusOut);
+    return () => {
+      body.removeEventListener('focusin', onFocusIn);
+      body.removeEventListener('focusout', onFocusOut);
+      setFocusedKey(null);
+    };
+  }, [enabled]);
 
   // Layout effect: the first above-threshold paint already has the full
   // visible window (no extra frame showing only overscan rows).
@@ -100,7 +138,8 @@ export function useWindowVirtualRows(keys: string[], enabled: boolean) {
   };
 
   if (!enabled) {
-    return { bodyRef, start: 0, end: keys.length, topPx: 0, bottomPx: 0, measure };
+    const slots: VirtualSlot[] = [{ kind: 'rows', start: 0, end: keys.length }];
+    return { bodyRef, start: 0, end: keys.length, topPx: 0, bottomPx: 0, slots, measure };
   }
 
   let sum = 0;
@@ -123,9 +162,34 @@ export function useWindowVirtualRows(keys: string[], enabled: boolean) {
   }
   const start = Math.max(0, first - OVERSCAN_ROWS);
   const end = Math.min(keys.length, last + OVERSCAN_ROWS);
-  let topPx = 0;
-  for (let i = 0; i < start; i++) topPx += h(keys[i]);
-  let bottomPx = 0;
-  for (let i = end; i < keys.length; i++) bottomPx += h(keys[i]);
-  return { bodyRef, start, end, topPx, bottomPx, measure };
+  const span = (from: number, to: number) => {
+    let px = 0;
+    for (let i = from; i < to; i++) px += h(keys[i]);
+    return px;
+  };
+  const slots: VirtualSlot[] = [];
+  const spacer = (key: string, from: number, to: number) => {
+    const px = span(from, to);
+    if (px > 0) slots.push({ kind: 'spacer', key, px });
+  };
+  // A focused row outside [start, end) stays mounted at its true index.
+  const pinned = focusedKey === null ? -1 : keys.indexOf(focusedKey);
+  if (pinned >= 0 && pinned < start) {
+    spacer('top', 0, pinned);
+    slots.push({ kind: 'rows', start: pinned, end: pinned + 1 });
+    spacer('pinned', pinned + 1, start);
+  } else {
+    spacer('top', 0, start);
+  }
+  slots.push({ kind: 'rows', start, end });
+  if (pinned >= end) {
+    spacer('pinned', end, pinned);
+    slots.push({ kind: 'rows', start: pinned, end: pinned + 1 });
+    spacer('bottom', pinned + 1, keys.length);
+  } else {
+    spacer('bottom', end, keys.length);
+  }
+  const topPx = span(0, start);
+  const bottomPx = span(end, keys.length);
+  return { bodyRef, start, end, topPx, bottomPx, slots, measure };
 }

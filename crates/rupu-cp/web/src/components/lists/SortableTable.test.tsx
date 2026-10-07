@@ -273,10 +273,23 @@ describe('SortableTable virtualization', () => {
     { key: 'id', header: 'Id', render: (r: VRow) => r.id },
     { key: 'n', header: 'N', sortable: true, sortValue: (r: VRow) => r.n, render: (r: VRow) => String(r.n) },
   ];
+  // The first tbody is the real (virtual) body; a second, aria-hidden one is
+  // the width probe.
   const mounted = (c: HTMLElement) =>
-    Array.from(c.querySelectorAll('tbody tr:not([aria-hidden])')) as HTMLTableRowElement[];
+    Array.from(c.querySelectorAll('tbody:first-of-type tr:not([aria-hidden])')) as HTMLTableRowElement[];
   const spacers = (c: HTMLElement) =>
-    Array.from(c.querySelectorAll('tbody tr[aria-hidden]')) as HTMLTableRowElement[];
+    Array.from(c.querySelectorAll('tbody:first-of-type tr[aria-hidden]')) as HTMLTableRowElement[];
+  const probe = (c: HTMLElement) => c.querySelectorAll('tbody')[1] as HTMLTableSectionElement | undefined;
+  const probeTexts = (c: HTMLElement, col: number) =>
+    Array.from(probe(c)?.querySelectorAll('tr') ?? []).map((tr) => tr.children[col].textContent);
+  const scrollTo = async (rowsAbove: number) => {
+    vi.spyOn(HTMLTableSectionElement.prototype, 'getBoundingClientRect').mockReturnValue({
+      top: -rowsAbove * ESTIMATED_ROW_PX, bottom: 0, left: 0, right: 0, width: 0, height: 0, x: 0, y: 0, toJSON: () => ({}),
+    } as DOMRect);
+    await act(async () => {
+      document.dispatchEvent(new Event('scroll'));
+    });
+  };
 
   afterEach(() => {
     vi.restoreAllMocks();
@@ -323,6 +336,161 @@ describe('SortableTable virtualization', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Sort by N' }));
     expect(mounted(container)[0].textContent).toContain('r999'); // n = 1, ascending
   });
+  describe('width probe', () => {
+    // A wide-column fixture: row 900 carries the longest host AND the
+    // longest duration, far outside the initially mounted window.
+    type WRow = { id: string; host: string; ms: number | null; path: string };
+    const wrows = (count: number): WRow[] =>
+      Array.from({ length: count }, (_, i) => ({
+        id: `w${i}`,
+        host: i === 900 ? 'a-very-long-host-name.example.com' : `h${i % 7}.io`,
+        ms: i === 900 ? 1234567 : i % 50,
+        path: `/p/${i}`,
+      }));
+    const wcols: Column<WRow>[] = [
+      { key: 'host', header: 'Host', fit: true, widthText: (r) => r.host, render: (r) => <span>{r.host}</span> },
+      { key: 'path', header: 'Path', subject: true, titleValue: (r) => r.path, render: (r) => r.path },
+      {
+        key: 'ms',
+        header: 'Duration',
+        fit: true,
+        align: 'right',
+        // No widthText: falls back to the plain-string render.
+        render: (r) => (r.ms != null ? `${r.ms} ms` : '—'),
+      },
+    ];
+
+    it('is absent at or below the threshold (rendering unchanged)', () => {
+      const { container } = render(
+        <SortableTable columns={wcols} rows={wrows(500)} rowKey={(r) => r.id} virtualize={{ threshold: 500 }} />,
+      );
+      expect(container.querySelectorAll('tbody')).toHaveLength(1);
+      expect(mounted(container)).toHaveLength(500);
+    });
+
+    it('renders hidden, inert, zero-height probe rows holding each column\'s widest row', () => {
+      const { container } = render(
+        <SortableTable columns={wcols} rows={wrows(1000)} rowKey={(r) => r.id} virtualize={{ threshold: 500 }} />,
+      );
+      // Row 900 is far outside the mounted window.
+      expect(mounted(container).some((tr) => tr.textContent?.includes('a-very-long-host'))).toBe(false);
+      const body = probe(container)!;
+      expect(body).toBeDefined();
+      expect(body).toHaveAttribute('aria-hidden', 'true');
+      expect(body).toHaveAttribute('inert');
+      expect(body.className).not.toMatch(/divide/);
+      const trs = Array.from(body.querySelectorAll('tr'));
+      expect(trs.length).toBeGreaterThan(0);
+      expect(trs.length).toBeLessThanOrEqual(2 * 16);
+      for (const tr of trs) {
+        expect(tr.style.visibility).toBe('collapse');
+        Array.from(tr.children).forEach((td, i) => {
+          const cell = td as HTMLElement;
+          expect(cell.style.visibility).toBe('hidden');
+          expect(cell.className).toMatch(/\bpy-0\b/);
+          expect(cell.className).toMatch(/\bpx-4\b/);
+          if (i === 1) {
+            // The subject column's probe cell is empty.
+            expect(cell).toBeEmptyDOMElement();
+          } else {
+            const inner = cell.firstElementChild as HTMLElement;
+            expect(inner.style.height).toBe('0px');
+            expect(inner.style.overflow).toBe('visible');
+          }
+        });
+      }
+      // Same classes as the real cells of that column.
+      expect(trs[0].children[0].className).toMatch(/w-\[1%\]/);
+      expect(trs[0].children[2].className).toMatch(/text-right/);
+      expect(probeTexts(container, 0)).toContain('a-very-long-host-name.example.com');
+      expect(probeTexts(container, 2)).toContain('1234567 ms');
+      // Probe rows are not accessible rows.
+      expect(within(screen.getByRole('table')).queryByText('a-very-long-host-name.example.com')).toBeInTheDocument();
+      expect(screen.getAllByRole('row').some((r) => r.textContent?.includes('a-very-long-host'))).toBe(false);
+    });
+
+    it('does not change on scroll', async () => {
+      const { container } = render(
+        <SortableTable columns={wcols} rows={wrows(1000)} rowKey={(r) => r.id} virtualize={{ threshold: 500 }} />,
+      );
+      const before = probe(container)!.innerHTML;
+      await scrollTo(300);
+      expect(mounted(container)[0].textContent).toContain(`/p/${300 - OVERSCAN_ROWS}`);
+      expect(probe(container)!.innerHTML).toBe(before);
+    });
+  });
+
+  describe('focus and row count', () => {
+    const clickable = () => (
+      <SortableTable
+        columns={columns}
+        rows={rows(1000)}
+        rowKey={(r) => r.id}
+        virtualize={{ threshold: 500 }}
+        onRowClick={() => {}}
+      />
+    );
+
+    it('keeps a focused row mounted (and focused) when it scrolls out of the window', async () => {
+      const { container } = render(clickable());
+      const row = mounted(container).find((tr) => tr.textContent?.startsWith('r5'))!;
+      act(() => row.focus());
+      expect(document.activeElement).toBe(row);
+      await scrollTo(300);
+      const now = mounted(container);
+      expect(now).toContain(row);
+      expect(document.activeElement).toBe(row);
+      expect(row.getAttribute('aria-rowindex')).toBe('7');
+      // Pinned at its true index: [spacer r0..r4] r5 [spacer r6..start) window [bottom].
+      const start = 300 - OVERSCAN_ROWS;
+      const sp = spacers(container).map((tr) => parseFloat(tr.style.height));
+      expect(sp[0]).toBe(5 * ESTIMATED_ROW_PX);
+      expect(sp[1]).toBe((start - 6) * ESTIMATED_ROW_PX);
+      const body = container.querySelector('tbody')!;
+      expect(body.children[1]).toBe(row);
+      // Everything still adds up to the full table.
+      const total = sp.reduce((a, b) => a + b, 0) + now.length * ESTIMATED_ROW_PX;
+      expect(total).toBe(1000 * ESTIMATED_ROW_PX);
+      // Blurring releases the pin.
+      act(() => row.blur());
+      await scrollTo(301);
+      expect(mounted(container)).not.toContain(row);
+    });
+
+    it('keeps a focused row pinned below the window when scrolling back up', async () => {
+      const { container } = render(clickable());
+      await scrollTo(300);
+      const row = mounted(container).find((tr) => tr.textContent?.startsWith('r310'))!;
+      act(() => row.focus());
+      await scrollTo(0);
+      const now = mounted(container);
+      expect(now[now.length - 1]).toBe(row);
+      expect(document.activeElement).toBe(row);
+      const sp = spacers(container).map((tr) => parseFloat(tr.style.height));
+      const total = sp.reduce((a, b) => a + b, 0) + now.length * ESTIMATED_ROW_PX;
+      expect(total).toBe(1000 * ESTIMATED_ROW_PX);
+    });
+
+    it('sets aria-rowcount / aria-rowindex only when virtual', async () => {
+      const { container, unmount } = render(clickable());
+      expect(screen.getByRole('table')).toHaveAttribute('aria-rowcount', '1001');
+      expect(container.querySelector('thead tr')).toHaveAttribute('aria-rowindex', '1');
+      expect(mounted(container)[0]).toHaveAttribute('aria-rowindex', '2');
+      await scrollTo(100);
+      expect(mounted(container)[0]).toHaveAttribute('aria-rowindex', String(100 - OVERSCAN_ROWS + 2));
+      unmount();
+      vi.restoreAllMocks();
+
+      const small = render(
+        <SortableTable columns={columns} rows={rows(10)} rowKey={(r) => r.id} virtualize={{ threshold: 500 }} />,
+      );
+      expect(screen.getByRole('table')).not.toHaveAttribute('aria-rowcount');
+      for (const tr of Array.from(small.container.querySelectorAll('tr'))) {
+        expect(tr).not.toHaveAttribute('aria-rowindex');
+      }
+    });
+  });
+
   it('re-sizes the spacers from observed row heights, without a scroll event', async () => {
     const observed = new Set<Element>();
     let fire: ((entries: unknown[]) => void) | undefined;

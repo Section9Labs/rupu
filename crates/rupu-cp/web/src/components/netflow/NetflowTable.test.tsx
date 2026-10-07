@@ -5,7 +5,7 @@ import type { ReactElement } from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup } from '@testing-library/react';
-import NetflowTable from './NetflowTable';
+import NetflowTable, { netflowColumns } from './NetflowTable';
 import type { FlowView } from '../../lib/netflow';
 import { socketFlowView } from './explorer/explorerFixtures';
 
@@ -224,6 +224,34 @@ describe('NetflowTable', () => {
       />,
     );
     expect(screen.queryByText(/no network flows/i)).not.toBeInTheDocument();
+  });
+
+  // The virtualized table picks its width-probe rows by `widthText`, so it
+  // must be exactly what each cell displays — for every row shape.
+  it("every column's widthText is exactly its cell's rendered text", () => {
+    const shapes: FlowView[] = [
+      flow({ status: 201 }),
+      flow({ status: undefined, asn: undefined, bytes_in: undefined, duration_ms: undefined }),
+      flow({ outcome: 'http_error', status: 503, run_id: 'run_x', workflow: 'wf' }),
+      socketFlowView(),
+      socketFlowView({ asn: { asn: 15169, org: 'GOOGLE' } }),
+      socketFlowView({
+        process: undefined,
+        ctx: { origin: { kind: 'subprocess', name: 'curl' }, run_id: 'run1' },
+      }),
+    ];
+    for (const f of shapes) {
+      for (const col of netflowColumns(true)) {
+        if (!col.widthText) continue;
+        const { container, unmount } = render(<>{col.render(f)}</>);
+        expect(col.widthText(f), `${col.key} of ${f.fidelity}`).toBe(container.textContent);
+        unmount();
+      }
+    }
+    // Every non-subject column supplies one.
+    for (const col of netflowColumns(true)) {
+      expect(Boolean(col.widthText), col.key).toBe(!col.subject);
+    }
   });
 
   describe('socket flows', () => {
