@@ -69,8 +69,12 @@ export default function Findings() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    // A query that doesn't parse never reaches the server; its chip says why.
-    if (localError) return;
+    // A query that doesn't parse never reaches the server; the page shows why
+    // in place of the results. Drop any earlier server error with it.
+    if (localError) {
+      setError(null);
+      return;
+    }
     let cancelled = false;
     setError(null);
     (q ? api.getFindings({ q }) : api.getFindings())
@@ -131,7 +135,7 @@ export default function Findings() {
         />
       ) : (
         <div className="space-y-6">
-          {data && (
+          {data && !localError && (
             <FindingMetrics
               summary={tileSummary}
               active={active}
@@ -151,10 +155,16 @@ export default function Findings() {
               />
             </div>
             {/* The report covers exactly the rows the query leaves. */}
-            {data && <ExportReportButton findings={data.findings} defaultTitle="Findings report" />}
+            {data && !localError && <ExportReportButton findings={data.findings} defaultTitle="Findings report" />}
           </div>
 
-          {data && unreadable.length > 0 && (
+          {localError && (
+            <p role="alert" className="rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
+              {localError}
+            </p>
+          )}
+
+          {data && !localError && unreadable.length > 0 && (
             <div
               role="status"
               className="rounded-lg bg-warn-bg px-3 py-2 text-note text-warn ring-1 ring-warn/30"
@@ -164,6 +174,7 @@ export default function Findings() {
           )}
 
           {data &&
+            !localError &&
             (data.findings.length === 0 && q ? (
               <EmptyState title="No matches" hint={`No findings match \`${q}\`.`} />
             ) : (

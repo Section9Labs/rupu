@@ -7,7 +7,7 @@
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, useNavigate } from 'react-router-dom';
 import { api, type FindingOut, type FindingsResponse } from '../lib/api';
 
 import Findings from './Findings';
@@ -169,6 +169,47 @@ describe('Findings — query bar', () => {
     const chip = await screen.findByText('sevrity:x');
     expect(chip.closest('span[title]')?.className).toMatch(/text-err/);
     expect(spy).not.toHaveBeenCalled();
+  });
+
+  it('replaces stale results with a visible error when the query turns invalid', async () => {
+    vi.spyOn(api, 'getFindings').mockResolvedValue(resp([FINDING]));
+    function Go() {
+      const navigate = useNavigate();
+      return <button onClick={() => navigate('/security?tab=findings&q=sevrity%3Ax')}>go-bad</button>;
+    }
+    render(
+      <MemoryRouter initialEntries={['/security?tab=findings&q=tag%3Aa']}>
+        <Go />
+        <Findings />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByText(FINDING.summary)).toBeInTheDocument());
+
+    fireEvent.click(screen.getByText('go-bad'));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/unknown/i);
+    expect(screen.queryByText(FINDING.summary)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Export report' })).toBeNull();
+    expect(screen.queryByRole('button', { name: /filter by high/i })).toBeNull();
+  });
+
+  it('drops an earlier server error when the query turns invalid', async () => {
+    vi.spyOn(api, 'getFindings').mockRejectedValue(new Error('server said no'));
+    function Go() {
+      const navigate = useNavigate();
+      return <button onClick={() => navigate('/security?tab=findings&q=sevrity%3Ax')}>go-bad</button>;
+    }
+    render(
+      <MemoryRouter initialEntries={['/security?tab=findings&q=tag%3Aa']}>
+        <Go />
+        <Findings />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByText('server said no')).toBeInTheDocument();
+    fireEvent.click(screen.getByText('go-bad'));
+    await waitFor(() => expect(screen.queryByText('server said no')).toBeNull());
+    expect(screen.getByRole('alert')).toHaveTextContent(/unknown/i);
   });
 
   it('says which query matched nothing', async () => {
