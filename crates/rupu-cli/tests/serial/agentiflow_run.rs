@@ -341,7 +341,9 @@ async fn poll<T>(secs: u64, mut f: impl FnMut() -> Option<T>) -> Option<T> {
 }
 
 /// One `ps -o <field>= -p <pid>` value, or `None` when `ps` is unavailable or
-/// the process is gone.
+/// the process is gone. Used for the group-leader (`pgid`) check, which stays
+/// best-effort; the musl CI image's busybox `ps` cannot answer it, so there it
+/// returns `None` and the caller skips the check.
 fn ps_field(pid: u32, field: &str) -> Option<String> {
     let out = std::process::Command::new("ps")
         .args(["-o", &format!("{field}="), "-p", &pid.to_string()])
@@ -349,6 +351,24 @@ fn ps_field(pid: u32, field: &str) -> Option<String> {
         .ok()?;
     let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (out.status.success() && !value.is_empty()).then_some(value)
+}
+
+/// Whether `pid` has exited but not been reaped (state `Z`, or `X` mid-teardown).
+/// On Linux this reads `/proc/<pid>/stat` directly — the musl CI image has no
+/// `ps` that understands `-o stat= -p`. The state follows the parenthesised
+/// command name, which may itself contain `)`.
+#[cfg(target_os = "linux")]
+fn is_zombie(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| stat.rsplit_once(')').and_then(|(_, rest)| rest.trim_start().chars().next()))
+        .is_some_and(|state| state == 'Z' || state == 'X')
+}
+
+/// Off Linux, ask `ps` for the process state.
+#[cfg(not(target_os = "linux"))]
+fn is_zombie(pid: u32) -> bool {
+    ps_field(pid, "stat").is_some_and(|s| s.starts_with('Z'))
 }
 
 /// SIGKILLs a process group on drop, so a failing assertion cannot leave the
@@ -475,8 +495,7 @@ async fn run_detach_returns_at_once_and_leaves_a_live_coordinator_in_its_own_gro
     // The coordinator is gone (a zombie that nothing has reaped yet counts: it
     // is dead, and a container's PID 1 may never collect it).
     let gone = poll(15, || {
-        let dead = !rupu_agentiflow::pid_is_running(pid)
-            || ps_field(pid, "stat").is_some_and(|s| s.starts_with('Z'));
+        let dead = !rupu_agentiflow::pid_is_running(pid) || is_zombie(pid);
         dead.then_some(())
     })
     .await;
