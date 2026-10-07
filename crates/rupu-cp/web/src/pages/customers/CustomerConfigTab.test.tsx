@@ -41,6 +41,7 @@ function view(over: Partial<ConfigView> = {}): ConfigView {
       permission_mode: { source: 'global', locked: true, locked_by: 'global' },
       log_level: { source: 'customer', locked: false },
       [AZURE_KEY]: { source: 'customer', locked: false },
+      'providers.acme-prod.kind': { source: 'global', locked: false },
     },
     raw_global: '',
     raw_project: null,
@@ -91,6 +92,83 @@ describe('CustomerConfigTab', () => {
     const globalChip = screen.getAllByText('global')[0];
     expect(globalChip.className).not.toContain('text-brand-700');
     expect(screen.getByText('locked by customer')).toBeInTheDocument();
+  });
+
+  describe('the default_provider account note', () => {
+    function withProvenance(kindSource: 'global' | 'customer' | 'project' | null, acct = 'acme-prod') {
+      const base = view();
+      const provenance = { ...base.provenance };
+      if (kindSource) provenance[`providers.${acct}.kind`] = { source: kindSource, locked: false };
+      return view({
+        effective: {
+          ...base.effective,
+          default_provider: acct,
+          providers: { [acct]: kindSource ? { kind: 'anthropic' } : {} },
+        },
+        provenance,
+      });
+    }
+
+    it('says declared globally only when the provider table came from the global layer', async () => {
+      get.mockResolvedValue(withProvenance('global'));
+      mount();
+      await screen.findByLabelText('Default provider');
+      expect(screen.getByText(/Declared globally by/)).toBeInTheDocument();
+      expect(screen.getByText('rupu auth login --account acme-prod --kind anthropic')).toBeInTheDocument();
+    });
+
+    it("says it is declared in this customer's layer when the customer layer wrote it", async () => {
+      get.mockResolvedValue(withProvenance('customer'));
+      mount();
+      await screen.findByLabelText('Default provider');
+      expect(screen.getByText(/Declared in this customer's layer/)).toBeInTheDocument();
+      expect(screen.queryByText(/Declared globally/)).toBeNull();
+    });
+
+    it('names a project layer plainly', async () => {
+      get.mockResolvedValue(withProvenance('project'));
+      mount();
+      await screen.findByLabelText('Default provider');
+      expect(screen.getByText(/Declared in a project's layer/)).toBeInTheDocument();
+      expect(screen.queryByText(/Declared globally/)).toBeNull();
+    });
+
+    it('warns when the account is declared nowhere', async () => {
+      get.mockResolvedValue(withProvenance(null));
+      mount();
+      await screen.findByLabelText('Default provider');
+      const note = screen.getByText(/isn't declared/);
+      expect(note.className).toContain('text-warn');
+      expect(screen.getByText('rupu auth login --account acme-prod --kind <vendor>')).toBeInTheDocument();
+      expect(screen.queryByText(/Declared globally/)).toBeNull();
+    });
+
+    it('keys a dotted account name by its quoted provenance path', async () => {
+      const base = view();
+      get.mockResolvedValue(
+        view({
+          effective: {
+            ...base.effective,
+            default_provider: 'azure.eastus',
+            providers: { 'azure.eastus': { kind: 'openai-compatible', base_url: 'https://az.example' } },
+          },
+          provenance: {
+            ...base.provenance,
+            'providers."azure.eastus".kind': { source: 'customer', locked: false },
+          },
+        }),
+      );
+      mount();
+      await screen.findByLabelText('Default provider');
+      expect(screen.getByText(/Declared in this customer's layer/)).toBeInTheDocument();
+    });
+
+    it('stays quiet for a built-in vendor account, whose name is the vendor', async () => {
+      get.mockResolvedValue(withProvenance(null, 'anthropic'));
+      mount();
+      await screen.findByLabelText('Default provider');
+      expect(screen.queryByText(/isn't declared/)).toBeNull();
+    });
   });
 
   it('an inherited key is read-only until "Override for <name>" stages it', async () => {
@@ -150,11 +228,12 @@ describe('CustomerConfigTab', () => {
     expect(screen.getByText('rupu auth login --account acme-prod --kind anthropic')).toBeInTheDocument();
   });
 
-  it('omits the declaration line when the account kind is unknown', async () => {
+  it('flags an account declared nowhere instead of omitting the line', async () => {
     get.mockResolvedValue(view({ effective: { ...view().effective, providers: {} } }));
     mount();
     await screen.findByLabelText('Default provider');
-    expect(screen.queryByText(/rupu auth login/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Declared globally/)).not.toBeInTheDocument();
+    expect(screen.getByText(/isn't declared/)).toBeInTheDocument();
   });
 
   it('warns that the layer\'s scm.rules replace the global ones', async () => {

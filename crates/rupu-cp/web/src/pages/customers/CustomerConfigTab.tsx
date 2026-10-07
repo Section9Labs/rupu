@@ -68,6 +68,10 @@ function layerSetsScmRules(view: ConfigView): boolean {
   );
 }
 
+/** Provider accounts whose name IS the vendor (no `kind` needed) —
+ *  `RESERVED_PROVIDER_NAMES`'s model providers in `rupu-config`. */
+const BUILTIN_VENDORS = new Set(['anthropic', 'openai', 'gemini', 'copilot', 'local']);
+
 export default function CustomerConfigTab({ slug, name, projectCount, layerPath, onChanged }: CustomerConfigTabProps) {
   const [view, setView] = useState<ConfigView | null>(null);
   // `loadError` is a failed read with nothing to show yet; `reloadError` is a
@@ -255,14 +259,40 @@ export default function CustomerConfigTab({ slug, name, projectCount, layerPath,
         if (key !== 'default_provider' || view.provenance.default_provider?.source !== 'customer') return null;
         const acct = pendingPatch.default_provider ?? getPath(view.effective, 'default_provider');
         if (typeof acct !== 'string' || acct === '') return null;
-        const kind = getPath(view.effective, `providers.${quoteSegment(acct)}.kind`);
-        if (typeof kind !== 'string' || kind === '') return null;
+        const kindKey = `providers.${quoteSegment(acct)}.kind`;
+        const kind = getPath(view.effective, kindKey);
+        if (typeof kind !== 'string' || kind === '') {
+          // A built-in vendor name needs no `kind` — the name is the vendor.
+          if (BUILTIN_VENDORS.has(acct)) return null;
+          return (
+            <p className="mt-1.5 text-note text-warn">
+              <code className="font-mono">{acct}</code> isn&apos;t declared — add it with{' '}
+              <code className="font-mono">rupu auth login --account {acct} --kind &lt;vendor&gt;</code>
+            </p>
+          );
+        }
+        // Where the account's table was actually declared, not assumed.
+        const source = view.provenance[kindKey]?.source;
+        if (source === undefined) return null;
+        if (source === 'global') {
+          return (
+            <p className="mt-1.5 text-note text-ink-mute">
+              Declared globally by{' '}
+              <code className="font-mono text-ink">
+                rupu auth login --account {acct} --kind {kind}
+              </code>
+            </p>
+          );
+        }
+        const where =
+          source === 'customer'
+            ? "this customer's layer"
+            : source === 'project'
+              ? "a project's layer"
+              : 'the built-in defaults';
         return (
           <p className="mt-1.5 text-note text-ink-mute">
-            Declared globally by{' '}
-            <code className="font-mono text-ink">
-              rupu auth login --account {acct} --kind {kind}
-            </code>
+            Declared in {where} (<code className="font-mono text-ink">kind = &quot;{kind}&quot;</code>)
           </p>
         );
       },
