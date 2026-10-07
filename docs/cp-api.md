@@ -233,7 +233,7 @@ without `rupu cp serve`.
 | GET | `/api/agents/:name` | Agent detail with its prompt and raw file. | |
 | PUT | `/api/agents/:name` | Overwrite an agent. | `scope_kind`, `scope_id`. Body `{raw}`. |
 | DELETE | `/api/agents/:name` | Delete an agent. | `scope_kind`, `scope_id`. |
-| POST | `/api/agents/:name/run` | Launch an agent run → `{run_id, host_id}`. | Body `AgentRunBody {prompt, mode, target, working_dir, host, scope_kind, scope_id, findings_profile}`. |
+| POST | `/api/agents/:name/run` | Launch an agent run → `{run_id, host_id}`. | Body `AgentRunBody {prompt, mode, target, working_dir, host, scope_kind, scope_id, findings_profile, engagement_profiles}`. `engagement_profiles` (ids; blank → 400) becomes `rupu run --engagement-profile`; a remote host that does not advertise `agent.engagement_profile` refuses it. |
 | POST | `/api/agents/:name/session` | Start a session → `{session_id, host_id}`. | Body `SessionStartBody {prompt, mode, target, working_dir, host, scope_kind, scope_id}`. |
 | POST | `/api/agents/generate` | Draft an agent from a description. | Body `{description, provider?, model?}`. |
 
