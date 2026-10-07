@@ -1901,6 +1901,86 @@ export interface CustomerRef {
   archived: boolean;
 }
 
+/** `GET /api/customers/:slug` → `customer`, and the body of the writes. */
+export interface CustomerDto {
+  slug: string;
+  name: string;
+  notes: string | null;
+  contact: string | null;
+  /** The explicit color, when one was set (else `tint` is derived). */
+  color: string | null;
+  tint: TintDto;
+  archived: boolean;
+  created_at: string;
+}
+
+export interface CustomerRollup {
+  projects: number;
+  run_count: number;
+  usage: UsageSummary;
+  findings_open: number;
+  last_active: string | null;
+  /** Hosts whose (legacy, mirrored) runs were left out because their customer
+   *  can't be known. Absent when empty. */
+  hosts_without_customer?: string[];
+}
+
+/** The provider account a customer's runs default to. */
+export interface DefaultAccount {
+  account: string;
+  locked_by: 'global' | 'customer' | null;
+  /** True when the value is the global one. */
+  inherited: boolean;
+}
+
+/** A row of `GET /api/customers`. */
+export interface CustomerRow extends CustomerDto {
+  rollup: CustomerRollup;
+  default_account: DefaultAccount | null;
+  /** Set when the customer's config layer does not resolve. */
+  layer_error?: string | null;
+}
+
+/** `GET /api/customers/:slug`. */
+export interface CustomerDetail {
+  customer: CustomerDto;
+  rollup: CustomerRollup;
+  projects: ProjectRow[];
+  default_account: DefaultAccount | null;
+  layer_error: string | null;
+}
+
+/** The `customer` list param: a slug, `'none'` (work with no customer), or
+ *  `null`/absent (all customers — the param is omitted). */
+export type CustomerScope = string | 'none' | null;
+
+export interface NewCustomerBody {
+  slug: string;
+  name: string;
+  notes?: string;
+  contact?: string;
+  color?: string;
+}
+
+/** Absent fields stay; `''` clears `notes` / `contact` / `color`. */
+export interface CustomerPatch {
+  name?: string;
+  notes?: string;
+  contact?: string;
+  color?: string;
+}
+
+/** The body of a 409 from `DELETE /api/customers/:slug` (parse `ApiError.body`). */
+export interface CustomerConflict {
+  error: string;
+  projects: { ws_id: string; path: string }[];
+}
+
+/** Append `customer=<slug|none>` to a list query — only when scoped. */
+function setCustomer(q: URLSearchParams, customer?: CustomerScope): void {
+  if (customer) q.set('customer', customer);
+}
+
 // ---------------------------------------------------------------------------
 // Launch preview
 // ---------------------------------------------------------------------------
@@ -1922,6 +2002,9 @@ export interface ManifestEntry {
   account: string;
   /** The vendor the account authenticates against, when known. */
   kind: string | null;
+  /** The agent's `auth:` (`api-key` / `sso`) on its provider entry and on a
+   *  fallback hop on that same provider, else `null`. */
+  auth_mode?: string | null;
   /** The agent(s) using it (provider/fallback); empty for scm. */
   agents: string[];
   /** Where the choice came from, e.g. "customer default · locked". */
@@ -2158,9 +2241,12 @@ export const api = {
    * one registered host id instead of every host — used to paint the local
    * host first and merge remotes in as they answer.
    */
-  getDashboard(range: DashboardRange = '30d', host?: string): Promise<DashboardResponse> {
+  getDashboard(range: DashboardRange = '30d', host?: string, customer?: CustomerScope): Promise<DashboardResponse> {
     const hostQs = host ? `&host=${encodeURIComponent(host)}` : '';
-    return request<DashboardResponse>(`/api/dashboard?range=${range}${hostQs}`);
+    const q = new URLSearchParams();
+    setCustomer(q, customer);
+    const customerQs = q.toString() ? `&${q.toString()}` : '';
+    return request<DashboardResponse>(`/api/dashboard?range=${range}${hostQs}${customerQs}`);
   },
 
   // --- Usage ---
@@ -2177,14 +2263,22 @@ export const api = {
     pivot: Pivot = 'model',
     host?: string,
     signal?: AbortSignal,
+    customer?: CustomerScope,
   ): Promise<UsageResponse> {
     const q = new URLSearchParams({ since: win.since, until: win.until, group_by: pivot });
     if (host) q.set('host', host);
+    setCustomer(q, customer);
     return request<UsageResponse>(`/api/usage?${q.toString()}`, { signal });
   },
   /** Per-bucket usage timeline (chronological). `bucket` defaults to `day`. */
-  getUsageTimeline(opts?: { since?: string; until?: string; bucket?: 'day' | 'week' }): Promise<UsageTimelineBucket[]> {
+  getUsageTimeline(opts?: {
+    since?: string;
+    until?: string;
+    bucket?: 'day' | 'week';
+    customer?: CustomerScope;
+  }): Promise<UsageTimelineBucket[]> {
     const q = new URLSearchParams();
+    setCustomer(q, opts?.customer);
     if (opts?.since) q.set('since', opts.since);
     if (opts?.until) q.set('until', opts.until);
     if (opts?.bucket) q.set('bucket', opts.bucket);
@@ -2208,18 +2302,24 @@ export const api = {
    * hosts, so this takes no `host` param. `workspaceId` (optional) scopes to
    * one project's runs — what the Projects page's usage tab uses.
    */
-  getUsageRuns(win: UsageWindow = presetWindow('30d'), workspaceId?: string): Promise<UsageRunRow[]> {
+  getUsageRuns(
+    win: UsageWindow = presetWindow('30d'),
+    workspaceId?: string,
+    customer?: CustomerScope,
+  ): Promise<UsageRunRow[]> {
     const q = new URLSearchParams({ since: win.since, until: win.until });
     if (workspaceId) q.set('workspace_id', workspaceId);
+    setCustomer(q, customer);
     return request<UsageRunRow[]>(`/api/usage/runs?${q.toString()}`);
   },
 
   // --- Runs ---
-  getRuns(params?: ListParams & Cancellable & { host?: string }): Promise<RunListRow[]> {
+  getRuns(params?: ListParams & Cancellable & { host?: string; customer?: CustomerScope }): Promise<RunListRow[]> {
     const q = new URLSearchParams();
     if (params?.offset != null) q.set('offset', String(params.offset));
     if (params?.limit != null) q.set('limit', String(params.limit));
     if (params?.host) q.set('host', params.host);
+    setCustomer(q, params?.customer);
     const qs = q.toString();
     return request<RunListRow[]>(`/api/runs${qs ? `?${qs}` : ''}`, { signal: params?.signal });
   },
@@ -2410,13 +2510,18 @@ export const api = {
     return request<SessionRunRow[]>(`/api/sessions/${encodeURIComponent(id)}/runs${qs}`);
   },
   getWorkflowRuns(
-    params?: ListParams & Cancellable & { lifecycle?: 'active' | 'completed' | 'failed'; host?: string },
+    params?: ListParams & Cancellable & {
+      lifecycle?: 'active' | 'completed' | 'failed';
+      host?: string;
+      customer?: CustomerScope;
+    },
   ): Promise<RunListRow[]> {
     const q = new URLSearchParams();
     if (params?.offset != null) q.set('offset', String(params.offset));
     if (params?.limit != null) q.set('limit', String(params.limit));
     if (params?.lifecycle) q.set('lifecycle', params.lifecycle);
     if (params?.host) q.set('host', params.host);
+    setCustomer(q, params?.customer);
     const qs = q.toString();
     return request<RunListRow[]>(`/api/runs/workflows${qs ? `?${qs}` : ''}`, { signal: params?.signal });
   },
@@ -2455,13 +2560,18 @@ export const api = {
     });
   },
   getAgentRuns(
-    params?: ListParams & Cancellable & { lifecycle?: 'active' | 'completed' | 'failed'; host?: string },
+    params?: ListParams & Cancellable & {
+      lifecycle?: 'active' | 'completed' | 'failed';
+      host?: string;
+      customer?: CustomerScope;
+    },
   ): Promise<AgentRunRow[]> {
     const q = new URLSearchParams();
     if (params?.offset != null) q.set('offset', String(params.offset));
     if (params?.limit != null) q.set('limit', String(params.limit));
     if (params?.lifecycle) q.set('lifecycle', params.lifecycle);
     if (params?.host) q.set('host', params.host);
+    setCustomer(q, params?.customer);
     const qs = q.toString();
     return request<AgentRunRow[]>(`/api/runs/agents${qs ? `?${qs}` : ''}`, { signal: params?.signal });
   },
@@ -2685,12 +2795,15 @@ export const api = {
   },
 
   // --- Sessions ---
-  getSessions(params?: ListParams & Cancellable & { scope?: 'active' | 'archived'; host?: string }): Promise<SessionSummary[]> {
+  getSessions(
+    params?: ListParams & Cancellable & { scope?: 'active' | 'archived'; host?: string; customer?: CustomerScope },
+  ): Promise<SessionSummary[]> {
     const q = new URLSearchParams();
     if (params?.offset != null) q.set('offset', String(params.offset));
     if (params?.limit != null) q.set('limit', String(params.limit));
     if (params?.scope) q.set('scope', params.scope);
     if (params?.host) q.set('host', params.host);
+    setCustomer(q, params?.customer);
     const qs = q.toString();
     return request<SessionSummary[]>(`/api/sessions${qs ? `?${qs}` : ''}`, { signal: params?.signal });
   },
@@ -2835,8 +2948,14 @@ export const api = {
   },
 
   // --- Findings ---
-  getFindings(opts?: { wsId?: string; workflow?: string; runId?: string }): Promise<FindingsResponse> {
+  getFindings(opts?: {
+    wsId?: string;
+    workflow?: string;
+    runId?: string;
+    customer?: CustomerScope;
+  }): Promise<FindingsResponse> {
     const q = new URLSearchParams();
+    setCustomer(q, opts?.customer);
     if (opts?.wsId) q.set('ws_id', opts.wsId);
     if (opts?.workflow) q.set('workflow', opts.workflow);
     if (opts?.runId) q.set('run_id', opts.runId);
@@ -2972,8 +3091,11 @@ export const api = {
 
   // --- Projects ---
 
-  getProjects(): Promise<ProjectRow[]> {
-    return request<ProjectRow[]>('/api/projects');
+  getProjects(opts?: { customer?: CustomerScope }): Promise<ProjectRow[]> {
+    const q = new URLSearchParams();
+    setCustomer(q, opts?.customer);
+    const qs = q.toString();
+    return request<ProjectRow[]>(`/api/projects${qs ? `?${qs}` : ''}`);
   },
   getProject(wsId: string): Promise<ProjectDetail> {
     return request<ProjectDetail>(`/api/projects/${encodeURIComponent(wsId)}`);
@@ -3059,6 +3181,66 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify(body),
     });
+  },
+
+  /** The customer layer's config view (`GET /api/config?customer=`). */
+  getCustomerConfig(slug: string): Promise<ConfigView> {
+    return request<ConfigView>(`/api/config?customer=${encodeURIComponent(slug)}`);
+  },
+  /** Persist a customer-layer config edit (`{ raw }` or `{ patch }`). 400 when
+   *  the layer breaks the merged config or sets a globally locked key. */
+  async putCustomerConfig(slug: string, body: ConfigWriteBody): Promise<void> {
+    await request<unknown>(`/api/config/customer/${encodeURIComponent(slug)}`, {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    });
+  },
+
+  // --- Customers ---
+
+  getCustomers(opts?: { archived?: boolean; range?: DashboardRange }): Promise<CustomerRow[]> {
+    const q = new URLSearchParams();
+    if (opts?.archived) q.set('archived', '1');
+    if (opts?.range) q.set('range', opts.range);
+    const qs = q.toString();
+    return request<CustomerRow[]>(`/api/customers${qs ? `?${qs}` : ''}`);
+  },
+  getCustomer(slug: string, range?: DashboardRange): Promise<CustomerDetail> {
+    const qs = range ? `?range=${range}` : '';
+    return request<CustomerDetail>(`/api/customers/${encodeURIComponent(slug)}${qs}`);
+  },
+  createCustomer(body: NewCustomerBody): Promise<CustomerDto> {
+    return request<CustomerDto>('/api/customers', { method: 'POST', body: JSON.stringify(body) });
+  },
+  updateCustomer(slug: string, patch: CustomerPatch): Promise<CustomerDto> {
+    return request<CustomerDto>(`/api/customers/${encodeURIComponent(slug)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    });
+  },
+  archiveCustomer(slug: string, archived: boolean): Promise<CustomerDto> {
+    return request<CustomerDto>(
+      `/api/customers/${encodeURIComponent(slug)}/${archived ? 'archive' : 'unarchive'}`,
+      { method: 'POST' },
+    );
+  },
+  /** 409 while projects are assigned: an `ApiError` whose `body` parses as a `CustomerConflict`. */
+  deleteCustomer(slug: string): Promise<void> {
+    return request<void>(`/api/customers/${encodeURIComponent(slug)}`, { method: 'DELETE' });
+  },
+  /** Replaces any earlier assignment. 409 when the customer is archived. */
+  assignProject(slug: string, wsId: string): Promise<ProjectRow> {
+    return request<ProjectRow>(
+      `/api/customers/${encodeURIComponent(slug)}/projects/${encodeURIComponent(wsId)}`,
+      { method: 'PUT' },
+    );
+  },
+  /** 404 when the project is not assigned to `slug`. */
+  unassignProject(slug: string, wsId: string): Promise<void> {
+    return request<void>(
+      `/api/customers/${encodeURIComponent(slug)}/projects/${encodeURIComponent(wsId)}`,
+      { method: 'DELETE' },
+    );
   },
 
   // --- Repos ---
