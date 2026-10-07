@@ -125,7 +125,7 @@ Two more tools are **not** injected: grant them explicitly in the agent's
 
 | Tool | Purpose |
 |------|---------|
-| `query_findings` | list the workspace's findings, filtered by tag, severity, concern or file; returns a page of slim rows plus `tags_in_use` (explicit `tools:` grant) |
+| `query_findings` | list the workspace's findings that match a query (`q`, in the [findings query language](#querying-findings)); returns a page of slim rows plus `tags_in_use` (explicit `tools:` grant) |
 | `tag_findings` | add or remove tags on one or many findings; returns each finding's tags before and after (explicit `tools:` grant) |
 
 ## Finding reports
@@ -547,11 +547,13 @@ rupu's global output flag (`table`, `json`, `csv`) and has nothing to shape here
 Filters combine: a finding must pass all of them. `--severity` keeps that
 severity and worse. `--run` keeps findings declared by that run and its
 sub-runs. `--cwe` compares CWE numbers: `CWE-79` (or `cwe-79`, or `79`) keeps
-findings whose report lists CWE-79 or whose concern is CWE-79
-(`cwe-top25-2023:cwe-79-xss`), never CWE-798 or CWE-179; a value that is not a
-CWE id is a usage error. `--project` must be a registered project: a workspace
-id, or the path of a registered project's checkout. Anything else is an error
-("no project matches ...").
+findings whose report lists CWE-79, whose concern is CWE-79
+(`cwe-top25-2023:cwe-79-xss`) or, when the concern names no CWE, whose first
+MITRE reference URL is CWE-79 (`https://cwe.mitre.org/data/definitions/79.html`),
+never CWE-798 or CWE-179; a value that is not a CWE id is a usage error. This is
+the query's `cwe:` rule and the CP's CWE column. `--project` must be a
+registered project: a workspace id, or the path of a registered project's
+checkout. Anything else is an error ("no project matches ...").
 
 Exactly one `--id` on its own writes that finding as a stand-alone document.
 Adding any of `--project`, `--run`, `--severity`, `--owner`, `--cwe`, `--split`
@@ -959,9 +961,9 @@ severity>=high tag:class:sqli -tag:false-positive -has:poc "sql injection"
 - Only `severity` takes `>=`, `>`, `<=` and `<`, with one value (`severity>=high`).
 - A bare word or quoted phrase is free text, matched case-insensitively against
   title, summary, id and file path. `-word` negates it.
-- A token shaped like letters plus an operator (`word:`, `word>=`) names a key,
-  so an unknown key is an error, never text. To search for text containing a
-  colon, quote it: `"http://host"`.
+- A token shaped like key characters (letters and `_`) plus an operator
+  (`word:`, `word>=`) names a key, so an unknown key is an error, never text.
+  To search for text containing a colon, quote it: `"http://host"`.
 - Quotes (`"` or `'`) open only at the start of an item: the start of a token
   (after an optional `-`), right after a key's operator, or right after a `,`
   in a keyed value. `\` escapes the next character. A quote anywhere else is
@@ -970,10 +972,10 @@ severity>=high tag:class:sqli -tag:false-positive -has:poc "sql injection"
 - A tag value may itself contain `:` (`tag:class:sqli`): only the first `:`
   after the key splits.
 
-An invalid query does not run; it is refused with an error naming the token and
-a code: `unknown_key`, `empty_value`, `bad_value` (not a valid severity,
-enum value, tag or CWE), `bad_operator` (a comparison on a key other than
-`severity`, or with several values), `unclosed_quote`, `bad_quote`.
+An invalid query does not run; it is refused with an error naming the token (by
+its 0-based index) and a code: `unknown_key`, `empty_value`, `bad_value` (not a
+valid severity, enum value, tag or CWE), `bad_operator` (a comparison on a key
+other than `severity`, or with several values), `unclosed_quote`, `bad_quote`.
 
 ### Fields
 
@@ -983,7 +985,7 @@ enum value, tag or CWE), `bad_operator` (a comparison on a key other than
 | `tag` | an effective tag, normalized like any tag (`Class:SQLi` is `class:sqli`) |
 | `has` | `tags`, `report`, `poc` (the report has artifacts), `cwe` |
 | `project` | workspace name or id (CLI and control plane only) |
-| `cwe` | `79` or `CWE-79`, by number: the report's CWE or the one the concern names |
+| `cwe` | `79` or `CWE-79`, by number: the report's CWEs, the one the concern names or, when it names none, the first MITRE reference URL (`cwe.mitre.org/data/definitions/<n>`); the same rule as the CWE column and `--cwe` |
 | `owner`, `product` | the report's ownership, case-insensitive |
 | `verified` | `unverified`, `confirmed`, `disputed`, `inconclusive` (no verification counts as `unverified`) |
 | `profile` | `full`, `summary` |
@@ -1036,8 +1038,10 @@ show with their declared tags, so tag filters may miss them).
 The same query reaches the API as `GET /api/findings?q=…`. The response adds
 `facets` (per key, `[{value, count}]` over the scope-filtered but unqueried set;
 they feed the suggestions and tiles) and `tags_unavailable` (the workspace ids
-above). An invalid `q` is a 400 with `{error, token, code, start, end}`, offsets
-in characters.
+above, limited to the request's scope: the `ws_id` asked for, or a workspace
+with a finding in the scope). An invalid `q` is a 400 with
+`{error, token, code, start, end}`: `token` is the 0-based token index, and the
+offsets are in characters.
 
 ## CLI
 

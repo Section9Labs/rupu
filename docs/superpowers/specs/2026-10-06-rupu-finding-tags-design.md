@@ -217,7 +217,7 @@ Findings are filtered everywhere with ONE single-line query language, modeled on
 | `tag` | normalized like `Tag`. Repeated tokens AND, comma OR. Tags may contain `:`; only the first `:` after the key splits |
 | `has` | tags / report / poc / cwe |
 | `project` | workspace name or id |
-| `cwe` | `79` or `CWE-79`, compared by number with `report.cwe` and the CWE a `concern_id` names. Same rules as export, now in `rupu_coverage::report::cwe` |
+| `cwe` | `79` or `CWE-79`, compared by number with `report.cwe`, the CWE a `concern_id` names and MITRE reference URLs — the same rule as the CWE column and export (`rupu_coverage::report::cwe::finding_cwes`) |
 | `owner`, `product` | report ownership, case-insensitive |
 | `verified` | unverified/confirmed/disputed/inconclusive. A finding with no verification counts as unverified |
 | `profile` | full/summary |
@@ -232,7 +232,7 @@ Findings are filtered everywhere with ONE single-line query language, modeled on
 - `project`, `workflow` and `run` expansion exist only where provenance is known (CP, CLI). The agent tool and MCP answer a query that uses them with an "unavailable here" error.
 
 **One grammar, two parsers, one evaluator.**
-- **Rust is authoritative.** `rupu_coverage::ledger::query_lang` parses, and `ledger::query` evaluates, shared by the CP API (`GET /api/findings?q=`), the CLI (`rupu findings list|tags [QUERY…]`), the agent tool and MCP (`{"q": …}`).
+- **Rust is authoritative.** `rupu_coverage::ledger::query_lang` parses, and `ledger::finding_filter` evaluates, shared by the CP API (`GET /api/findings?q=`), the CLI (`rupu findings list|tags [QUERY…]`), the agent tool and MCP (`{"q": …}`).
 - **TypeScript only parses.** The web's copy (`web/src/lib/findingQuery/`) parses for chips, suggestions and inline errors. The page always asks the server to evaluate.
 - **Lockstep.** The two parsers are held together by shared fixtures in `crates/rupu-coverage/tests/fixtures/finding_query/`, run by both `cargo test` and vitest:
   - `cases.json`: query → canonical AST, or `{token, code}` error
@@ -302,7 +302,7 @@ Each crate keeps one integration-test binary, with modules under `tests/it/`. Al
    - `rupu findings list|tag|tags`.
    - Docs.
 2. **Plan 2 (complete): the query language** — `docs/superpowers/plans/2026-10-06-rupu-finding-tags-plan-2-query-language.md`. Rust parser + evaluator, the TS twin and fixtures, `GET /api/findings?q=` with `facets` / `tags_unavailable`, the CLI/agent/MCP `q` surfaces, the web query bar on the Findings page, docs.
-3. **Plan 3 (remaining; originally "Plan 2: CP API and web UI", split by the Query language section above): bulk tagging and the report-page tag editor, with the tag-write endpoints.** The three endpoint changes, plus the bulk bar and report-page editor, with the mock shown first. The three endpoint changes, plus the table, filter, bulk bar and report-page editor, with the mock shown first.
+3. **Plan 3 (remaining; originally "Plan 2: CP API and web UI", split by the Query language section above): bulk tagging and the report-page tag editor, with the tag-write endpoints.** The three endpoint changes, plus the bulk bar and report-page editor, with the mock shown first.
 
 ## Out of scope (follow-ups)
 
