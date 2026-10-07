@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rupu_agent::{run_agent_full, AgentRunOpts, BypassDecider, RunError, RunExit};
+use rupu_orchestrator::usage_ledger::{LedgerTag, UsageLedger};
 use rupu_providers::model_limits::ModelLimits;
 use rupu_providers::types::Message;
 use rupu_providers::LlmProvider;
@@ -292,6 +293,12 @@ pub struct LeadConfig {
     /// (its inbox, the board's standing directives). Shared `Arc`s, cloned
     /// into every round's `AgentRunOpts`.
     pub collectors: Vec<Arc<dyn rupu_agent::TurnCollector>>,
+    /// Where the lead's LLM calls are metered: every round's `on_usage` hook
+    /// appends one row per call here (`<run dir>/usage.jsonl`), and the budget's
+    /// [`LedgerUsageSource`](crate::LedgerUsageSource) folds it with the
+    /// units' ledgers. `None` meters nothing (the lead's spend never reaches
+    /// `budget.usd` / `budget.tokens`).
+    pub usage_ledger: Option<UsageLedger>,
 }
 
 /// The `run_agent`-backed lead: each [`LeadDriver::run_round`] is one
@@ -358,6 +365,20 @@ impl LeadDriver for RunAgentLeadDriver {
         let ceiling = self
             .total_turns
             .saturating_add(self.cfg.per_round_max_turns);
+        let transcript_path = round_transcript_path(&self.cfg.transcript_path, ctx.round);
+        // One ledger row per billed call, whatever the round's outcome: the
+        // runner reports a call before it writes the transcript, so a round
+        // that errors or busts its turns still has its spend counted.
+        let on_usage = self.cfg.usage_ledger.as_ref().map(|ledger| {
+            ledger.hook(
+                LedgerTag::default(),
+                self.cfg.run_id.clone(),
+                None,
+                transcript_path.clone(),
+                self.cfg.agent_name.clone(),
+                None,
+            )
+        });
         let opts = AgentRunOpts {
             codename: None,
             agent_name: self.cfg.agent_name.clone(),
@@ -371,7 +392,7 @@ impl LeadDriver for RunAgentLeadDriver {
             run_id: self.cfg.run_id.clone(),
             workspace_id: self.cfg.workspace_id.clone(),
             workspace_path: self.cfg.workspace_path.clone(),
-            transcript_path: round_transcript_path(&self.cfg.transcript_path, ctx.round),
+            transcript_path,
             max_turns: ceiling,
             decider: Arc::new(BypassDecider),
             tool_context: rupu_tools::ToolContext {
@@ -404,7 +425,7 @@ impl LeadDriver for RunAgentLeadDriver {
             step_id: String::new(),
             on_tool_call: None,
             on_stream_event: None,
-            on_usage: None,
+            on_usage,
             concerns: None,
             limits: self.limits.clone(),
             scope_name: self.cfg.scope_name.clone(),
@@ -674,6 +695,7 @@ mod tests {
             findings_engagement: None,
             extra_tools: Vec::new(),
             collectors: Vec::new(),
+            usage_ledger: None,
         }
     }
 
@@ -754,6 +776,49 @@ mod tests {
         // its own file rather than clobbering the previous round's.
         assert!(dir.path().join("lead.r0.jsonl").exists());
         assert!(dir.path().join("lead.r1.jsonl").exists());
+    }
+
+    #[test]
+    fn a_leads_rounds_are_metered_into_its_usage_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = lead_cfg(dir.path(), 1);
+        let ledger_path = dir.path().join("usage.jsonl");
+        cfg.usage_ledger = Some(UsageLedger::open(ledger_path.clone()));
+        let make = scripted_factory(vec![
+            vec![text_turn("Round zero.")],
+            vec![text_turn("Round one.")],
+        ]);
+        let mut d = RunAgentLeadDriver::new(cfg, make).unwrap();
+        assert_eq!(d.run_round(&round(0)), RoundOutcome::Yielded);
+        assert_eq!(d.run_round(&round(1)), RoundOutcome::Yielded);
+
+        let rows: Vec<rupu_orchestrator::usage_ledger::LedgerRow> =
+            std::fs::read_to_string(&ledger_path)
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+        // One row per billed call: one turn per round, attributed to the lead.
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        for r in &rows {
+            assert_eq!(r.agent, "lead");
+            assert_eq!(r.agent_run_id, "run_lead_test");
+            assert_eq!((r.provider.as_str(), r.model.as_str()), ("mock", "mock-1"));
+            assert_eq!((r.input_tokens, r.output_tokens), (1, 1));
+        }
+        // ...each pointing at its own round's transcript.
+        assert!(rows[0].transcript.ends_with("lead.r0.jsonl"));
+        assert!(rows[1].transcript.ends_with("lead.r1.jsonl"));
+    }
+
+    #[test]
+    fn a_lead_without_a_usage_ledger_writes_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = lead_cfg(dir.path(), 1);
+        let mut d =
+            RunAgentLeadDriver::new(cfg, scripted_factory(vec![vec![text_turn("hi")]])).unwrap();
+        assert_eq!(d.run_round(&round(0)), RoundOutcome::Yielded);
+        assert!(!dir.path().join("usage.jsonl").exists());
     }
 
     #[test]

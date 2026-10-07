@@ -298,6 +298,12 @@ async fn launch(
         // Production: a `SubprocessUnitLauncher` over this binary.
         unit_launcher: None,
         generation,
+        // The layered `[pricing]` config (global, then project, with the
+        // `[providers.*].kind` account map attached by the loader) over the
+        // built-in vendor prices: what `budget.usd` is metered with. A lead
+        // model neither prices makes `run_agentiflow` warn that the cap is not
+        // enforced.
+        pricing: cfg.pricing.clone(),
     };
 
     eprintln!("agentiflow {name}: run {run_id}");
@@ -741,12 +747,43 @@ struct StatusGoal {
     required: Option<bool>,
 }
 
-/// Budget as far as a run records it: the definition's caps, and the state the
-/// last finished round saw (`ok` / `soft` / `hard:<dimension>`).
+/// Budget as far as a run records it: the definition's caps, the state the
+/// last finished round saw (`ok` / `soft` / `hard:<dimension>`), and what has
+/// been spent so far.
 #[derive(Debug, Serialize)]
 struct StatusBudget {
     state: Option<String>,
     caps: Option<Budget>,
+    /// USD spent, as of the last finished round while the run is going and
+    /// final once it has stopped. `None` when the record carries no spend (it
+    /// predates metering, or no round has finished) so only the tokens could
+    /// be recovered from the ledgers.
+    spent_usd: Option<f64>,
+    /// Billable (input + output) tokens spent.
+    spent_tokens: u64,
+}
+
+/// The tokens a run's ledgers hold, for a record that carries no spend: the
+/// lead's `usage.jsonl` plus the `usage.jsonl` of every unit the run
+/// launched (`units/<id>/` under the run dir names each one; its ledger is
+/// `<global>/runs/<id>/usage.jsonl`). Best-effort, like the fold itself: a
+/// ledger that is missing or unreadable adds nothing.
+fn ledger_tokens(global: &Path, run_dir: &Path) -> u64 {
+    let mut unit_ids: Vec<String> = std::fs::read_dir(run_dir.join("units"))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    unit_ids.sort();
+    let mut ledgers = vec![run_dir.join("usage.jsonl")];
+    ledgers.extend(
+        unit_ids
+            .into_iter()
+            .map(|id| global.join("runs").join(id).join("usage.jsonl")),
+    );
+    rupu_agentiflow::fold_tokens(&ledgers).total.billable()
 }
 
 /// `--format json` for `agentiflow status`.
@@ -859,6 +896,15 @@ fn load_status(global: &Path, fragment: &str) -> anyhow::Result<StatusReport> {
         .ok()
         .and_then(|raw| AgentiflowDef::parse_str(&raw).ok());
 
+    // Spend: the record's, kept current round by round. One without any (an
+    // older build wrote it, or no round has finished yet) is recovered from the
+    // ledgers; that gives tokens only, since pricing is not in the record.
+    let (spent_usd, spent_tokens) = if record.spent_usd.is_some() || record.spent_tokens > 0 {
+        (record.spent_usd, record.spent_tokens)
+    } else {
+        (None, ledger_tokens(global, &run_dir))
+    };
+
     let goals = record
         .goals
         .iter()
@@ -896,6 +942,8 @@ fn load_status(global: &Path, fragment: &str) -> anyhow::Result<StatusReport> {
         budget: StatusBudget {
             state: last_round_budget(&run_dir),
             caps: def.as_ref().and_then(|d| d.budget.clone()),
+            spent_usd,
+            spent_tokens,
         },
         coverage_target: def.and_then(|d| d.coverage),
     })
@@ -1000,6 +1048,14 @@ fn render_status(r: &StatusReport) -> String {
             let _ = writeln!(out, "  caps: {}", caps.join(", "));
         }
     }
+    let _ = writeln!(
+        out,
+        "  spent: {}, {} tokens",
+        r.budget
+            .spent_usd
+            .map_or_else(|| "usd n/a".to_string(), |usd| format!("${usd:.4}")),
+        r.budget.spent_tokens
+    );
 
     if let Some(c) = &r.coverage_target {
         let _ = writeln!(
@@ -1149,6 +1205,8 @@ mod tests {
             started_at: chrono::Utc::now(),
             ended_at: None,
             codename: None,
+            spent_usd: None,
+            spent_tokens: 0,
         };
 
         record("running").write(tmp.path()).unwrap();
@@ -1268,6 +1326,8 @@ pool:
                 .unwrap(),
             ended_at: None,
             codename: None,
+            spent_usd: None,
+            spent_tokens: 0,
         }
         .write(&agentiflow_dir(global).join(id))
         .unwrap();
@@ -1421,6 +1481,124 @@ pool:
         assert!(status.coverage_target.is_none());
         let human = render_status(&status);
         assert!(human.contains("(no round recorded)"), "{human}");
+    }
+
+    // ---- status: spend ----------------------------------------------------
+
+    /// Rewrite a seeded run's record with `edit` applied.
+    fn edit_record(global: &Path, id: &str, edit: impl FnOnce(&mut AgentiflowRecord)) {
+        let dir = agentiflow_dir(global).join(id);
+        let mut record = AgentiflowRecord::read(&dir).unwrap();
+        edit(&mut record);
+        record.write(&dir).unwrap();
+    }
+
+    fn ledger_line(id: &str, input: u64, output: u64) -> String {
+        let row = rupu_orchestrator::usage_ledger::LedgerRow {
+            v: rupu_orchestrator::usage_ledger::LEDGER_VERSION,
+            id: id.into(),
+            at: chrono::Utc::now(),
+            kind: rupu_orchestrator::usage_ledger::LedgerKind::Turn,
+            step_id: None,
+            unit_index: None,
+            unit_key: None,
+            agent_run_id: "ar_1".into(),
+            parent_agent_run_id: None,
+            transcript: std::path::PathBuf::from("/t/x.jsonl"),
+            agent: "recon".into(),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-5-5".into(),
+            input_tokens: input,
+            output_tokens: output,
+            cached_tokens: 0,
+            cache_write_tokens: 0,
+        };
+        format!("{}\n", serde_json::to_string(&row).unwrap())
+    }
+
+    #[test]
+    fn status_shows_the_spend_the_record_carries() {
+        let tmp = seeded_global();
+        let g = tmp.path();
+        // A run in flight: the spend as of its last finished round.
+        edit_record(g, "af_01NEWER", |r| {
+            r.spent_usd = Some(1.5);
+            r.spent_tokens = 123_456;
+        });
+        // A ledger that disagrees must not override a record that has spend.
+        write(
+            &agentiflow_dir(g).join("af_01NEWER/usage.jsonl"),
+            &ledger_line("01A", 1, 1),
+        );
+
+        let status = load_status(g, "af_01NEWER").unwrap();
+        assert_eq!(status.budget.spent_usd, Some(1.5));
+        assert_eq!(status.budget.spent_tokens, 123_456);
+        let human = render_status(&status);
+        assert!(human.contains("spent: $1.5000, 123456 tokens"), "{human}");
+
+        // The JSON report carries both under `budget`.
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["budget"]["spent_usd"], 1.5, "{json}");
+        assert_eq!(json["budget"]["spent_tokens"], 123_456, "{json}");
+    }
+
+    #[test]
+    fn a_metered_zero_is_a_record_with_spend_not_one_without() {
+        let tmp = seeded_global();
+        let g = tmp.path();
+        edit_record(g, "af_01OLDER", |r| {
+            r.spent_usd = Some(0.0);
+            r.spent_tokens = 0;
+        });
+        write(
+            &agentiflow_dir(g).join("af_01OLDER/usage.jsonl"),
+            &ledger_line("01A", 500, 50),
+        );
+
+        let status = load_status(g, "af_01OLDER").unwrap();
+        assert_eq!(status.budget.spent_usd, Some(0.0));
+        assert_eq!(status.budget.spent_tokens, 0, "the record is authoritative");
+        assert!(render_status(&status).contains("spent: $0.0000, 0 tokens"));
+    }
+
+    #[test]
+    fn status_recovers_tokens_from_the_ledgers_when_the_record_has_no_spend() {
+        let tmp = seeded_global();
+        let g = tmp.path();
+        let run_dir = agentiflow_dir(g).join("af_01NEWER");
+        // The lead's ledger...
+        write(&run_dir.join("usage.jsonl"), &ledger_line("01A", 100, 10));
+        // ...and one launched unit's, found through `units/<id>/`. A second
+        // unit that never wrote a ledger adds nothing.
+        write(&run_dir.join("units/run_u1/unit.json"), "{}");
+        write(&run_dir.join("units/run_u2/unit.json"), "{}");
+        write(
+            &g.join("runs/run_u1/usage.jsonl"),
+            &format!(
+                "{}{}",
+                ledger_line("01B", 200, 20),
+                // The same row twice (a mirror replay) counts once.
+                ledger_line("01B", 200, 20)
+            ),
+        );
+
+        let status = load_status(g, "af_01NEWER").unwrap();
+        assert_eq!(
+            status.budget.spent_usd, None,
+            "pricing is not in the ledger"
+        );
+        assert_eq!(status.budget.spent_tokens, 100 + 10 + 200 + 20);
+        let human = render_status(&status);
+        assert!(human.contains("spent: usd n/a, 330 tokens"), "{human}");
+    }
+
+    #[test]
+    fn status_with_no_spend_anywhere_reports_zero_tokens() {
+        let tmp = seeded_global();
+        let status = load_status(tmp.path(), "af_01NEWER").unwrap();
+        assert_eq!(status.budget.spent_usd, None);
+        assert_eq!(status.budget.spent_tokens, 0);
     }
 
     #[test]

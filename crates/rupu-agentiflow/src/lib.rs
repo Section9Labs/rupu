@@ -21,6 +21,7 @@ mod subprocess;
 mod supervisor;
 mod tools;
 mod unit;
+mod usage;
 #[cfg(test)]
 mod verify_fixtures;
 
@@ -52,10 +53,11 @@ pub use run::{
     agentiflow_dir, new_run_id, run_agentiflow, AgentiflowRecord, GoalStatus, LeadInputs,
     RunAgentiflowOpts,
 };
-pub use status_tools::status_tools;
+pub use status_tools::{status_tools, BudgetProbe};
 pub use subprocess::SubprocessUnitLauncher;
 pub use supervisor::FleetSupervisor;
 pub use tools::{fleet_tools, FleetToolCtx};
 pub use unit::{
     MockUnitLauncher, UnitError, UnitId, UnitKind, UnitLauncher, UnitOutcome, UnitSpec, UnitStatus,
 };
+pub use usage::{fold_tokens, LedgerUsageSource, TokenTotals, Tokens};

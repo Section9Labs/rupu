@@ -321,3 +321,106 @@ async fn rupu_run_bare_dispatches_child_agent_via_dispatch_agent_tool() {
         "the dispatched child agent should also complete OK against the mock provider"
     );
 }
+
+/// Run `rupu run echo … say hi` against the mock provider with `extra` flags
+/// between the agent and the prompt. Returns the global dir (a `TempDir`
+/// child, kept alive by `tmp`) and the standalone run's id.
+async fn run_echo_with(tmp: &assert_fs::TempDir, extra: &[&str]) -> (std::path::PathBuf, String) {
+    let global = tmp.child(".rupu");
+    global.child("agents").create_dir_all().unwrap();
+    global
+        .child("agents/echo.md")
+        .write_str(
+            "---\nname: echo\nprovider: anthropic\nmodel: claude-sonnet-4-6\nmaxTurns: 1\n---\nyou echo.",
+        )
+        .unwrap();
+    let project = assert_fs::TempDir::new().unwrap();
+
+    std::env::set_var("RUPU_HOME", global.path());
+    std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", MOCK_SCRIPT);
+    std::env::set_current_dir(project.path()).unwrap();
+
+    let mut argv: Vec<String> = vec![
+        "rupu".into(),
+        "run".into(),
+        "echo".into(),
+        "--mode".into(),
+        "bypass".into(),
+    ];
+    argv.extend(extra.iter().map(|a| a.to_string()));
+    argv.push("say hi".into());
+    let exit = rupu_cli::run(argv).await;
+
+    std::env::set_current_dir(tmp.path()).unwrap();
+    std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+    std::env::remove_var("RUPU_HOME");
+    assert_eq!(exit, std::process::ExitCode::from(0), "the run exits 0");
+
+    let run_id = std::fs::read_dir(global.child("transcripts").path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
+        .expect("standalone transcript should exist")
+        .file_stem()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    (global.path().to_path_buf(), run_id)
+}
+
+/// An agentiflow unit (a fleet-attached `rupu run`) writes its own
+/// `usage.jsonl`, so the agentiflow can fold the unit's spend into its budget.
+#[tokio::test(flavor = "multi_thread")]
+async fn fleet_attached_run_writes_a_usage_ledger() {
+    let _guard = ENV_LOCK.lock().await;
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let fleet_dir = tmp.child("agentiflows/af_1");
+    fleet_dir.create_dir_all().unwrap();
+
+    let (global, run_id) = run_echo_with(
+        &tmp,
+        &[
+            "--fleet-run-dir",
+            fleet_dir.path().to_str().unwrap(),
+            "--fleet-participant",
+            "p#1",
+        ],
+    )
+    .await;
+
+    let ledger = global.join("runs").join(&run_id).join("usage.jsonl");
+    let body = std::fs::read_to_string(&ledger)
+        .unwrap_or_else(|e| panic!("a fleet-attached run must write {ledger:?}: {e}"));
+    let rows: Vec<rupu_orchestrator::usage_ledger::LedgerRow> = body
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("a ledger row parses"))
+        .collect();
+    assert!(!rows.is_empty(), "at least one turn row");
+    let row = &rows[0];
+    assert_eq!(row.kind, rupu_orchestrator::usage_ledger::LedgerKind::Turn);
+    assert_eq!(row.agent_run_id, run_id);
+    assert_eq!(row.agent, "echo");
+    assert_eq!(row.provider, "anthropic");
+    assert_eq!(row.model, "claude-sonnet-4-6");
+    assert!(row.input_tokens > 0, "input tokens recorded: {row:?}");
+    assert!(row.output_tokens > 0, "output tokens recorded: {row:?}");
+}
+
+/// A plain `rupu run` is unchanged: no usage ledger.
+#[tokio::test(flavor = "multi_thread")]
+async fn plain_run_writes_no_usage_ledger() {
+    let _guard = ENV_LOCK.lock().await;
+    let tmp = assert_fs::TempDir::new().unwrap();
+
+    let (global, run_id) = run_echo_with(&tmp, &[]).await;
+
+    assert!(
+        !global
+            .join("runs")
+            .join(&run_id)
+            .join("usage.jsonl")
+            .exists(),
+        "a non-fleet run writes no usage.jsonl"
+    );
+}
