@@ -301,7 +301,8 @@ Each crate keeps one integration-test binary, with modules under `tests/it/`. Al
    - `query_findings` / `tag_findings` and their MCP mirrors.
    - `rupu findings list|tag|tags`.
    - Docs.
-2. **Plan 2 (superseded by the Query language section above — now Plans 2 and 3): CP API and web UI.** The three endpoint changes, plus the table, filter, bulk bar and report-page editor, with the mock shown first.
+2. **Plan 2 (complete): the query language** — `docs/superpowers/plans/2026-10-06-rupu-finding-tags-plan-2-query-language.md`. Rust parser + evaluator, the TS twin and fixtures, `GET /api/findings?q=` with `facets` / `tags_unavailable`, the CLI/agent/MCP `q` surfaces, the web query bar on the Findings page, docs.
+3. **Plan 3 (remaining; originally "Plan 2: CP API and web UI", split by the Query language section above): bulk tagging and the report-page tag editor, with the tag-write endpoints.** The three endpoint changes, plus the bulk bar and report-page editor, with the mock shown first. The three endpoint changes, plus the table, filter, bulk bar and report-page editor, with the mock shown first.
 
 ## Out of scope (follow-ups)
 
