@@ -25,6 +25,7 @@ import { AgentName } from '../components/codename/AgentName';
 import AgentiflowGraph from '../components/agentiflow/AgentiflowGraph';
 import AssetInventory from '../components/agentiflow/AssetInventory';
 import MessageFeed from '../components/agentiflow/MessageFeed';
+import EngagementFindings from '../components/agentiflow/EngagementFindings';
 import TranscriptPanel from '../components/TranscriptPanel';
 import { Segmented } from '../components/ui/Segmented';
 import { Badge, type BadgeTone } from '../components/ui/Badge';
@@ -56,10 +57,11 @@ import {
 
 const POLL_MS = 5000;
 
-type AfTab = 'flow' | 'assets' | 'messages' | 'transcript' | 'events';
+type AfTab = 'flow' | 'assets' | 'findings' | 'messages' | 'transcript' | 'events';
 const TABS: { value: AfTab; label: string }[] = [
   { value: 'flow', label: 'Flow' },
   { value: 'assets', label: 'Assets' },
+  { value: 'findings', label: 'Findings' },
   { value: 'messages', label: 'Messages' },
   { value: 'transcript', label: 'Transcript' },
   { value: 'events', label: 'Events' },
@@ -325,6 +327,12 @@ export default function AgentiflowDetail() {
               </>
             }
           />
+        </Panel>
+      )}
+
+      {tab === 'findings' && (
+        <Panel title="Findings" meta={<span className="text-meta text-ink-mute">verified by this engagement</span>}>
+          <EngagementFindings runId={record.id} live={running} />
         </Panel>
       )}
 
