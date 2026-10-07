@@ -20,7 +20,7 @@ import { cn } from '../../lib/cn';
 import { cweFromFinding, cweRef } from '../../lib/cwe';
 import { codeHref } from '../../lib/findingReport';
 import SeverityChip from '../coverage/SeverityChip';
-import SortableTable, { type Column } from '../lists/SortableTable';
+import SortableTable, { type Column, type RowSelection } from '../lists/SortableTable';
 import { AgentName } from '../codename/AgentName';
 import { FindingEvidence } from './FindingEvidence';
 import TriageCard from './TriageCard';
@@ -45,6 +45,7 @@ export function FindingsTable({
   findings,
   showProvenance = false,
   wsId,
+  selection,
 }: {
   findings: FindingRecord[];
   /** Render Project / Target columns. Only set when `findings` are `FindingOut`
@@ -56,6 +57,8 @@ export function FindingsTable({
    *  use their own `ws_id` instead. When resolved alongside `file_path` +
    *  `line_range`, the location cell deep-links into that project's Code tab. */
   wsId?: string;
+  /** Leading checkbox column (bulk tagging). */
+  selection?: RowSelection<FindingRecord>;
 }) {
   const navigate = useNavigate();
 
@@ -258,6 +261,7 @@ export function FindingsTable({
           ? `${(f as FindingOut).ws_id}/${(f as FindingOut).target_id}/${f.id}`
           : f.id
       }
+      selection={selection}
       renderDetail={(f) =>
         f.profile === 'full' && f.report_summary ? (
           <TriageCard finding={f} />

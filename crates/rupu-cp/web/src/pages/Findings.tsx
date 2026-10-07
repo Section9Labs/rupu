@@ -8,13 +8,23 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { api, apiErrorMessage, type FindingsResponse, type FindingsSummary } from '../lib/api';
+import {
+  api,
+  apiErrorMessage,
+  type FindingOut,
+  type FindingRecord,
+  type FindingsResponse,
+  type FindingsSummary,
+} from '../lib/api';
 import { SEVERITY_STYLE, type Severity } from '../lib/severity';
 import { FINDING_FIELDS } from '../lib/findingQuery/fields';
 import { parseQuery, tokenize } from '../lib/findingQuery/grammar';
+import { BulkTagBar } from '../components/findings/BulkTagBar';
 import { ExportReportButton } from '../components/findings/ExportReportButton';
 import { FindingMetrics } from '../components/findings/FindingMetrics';
 import { FindingsTable } from '../components/findings/FindingsTable';
+import { summarizeTagResult } from '../components/findings/tags/tagResult';
+import type { RowSelection } from '../components/lists/SortableTable';
 import { QueryBar } from '../components/query/QueryBar';
 import { EmptyState } from '../components/ui/EmptyState';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
@@ -76,6 +86,17 @@ export default function Findings() {
   // Set once the first fetch settles, or once an invalid query has shown its
   // error: until then the page is one spinner. After it, the bar stays mounted.
   const [settled, setSettled] = useState(false);
+  // Bulk tagging: the selected rows (keyed ws_id/target_id/id), a counter that
+  // refetches the list after a change, and the last bulk result.
+  const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
+  const [reload, setReload] = useState(0);
+  const [bulkNote, setBulkNote] = useState<{ message: string; ok: boolean } | null>(null);
+
+  // A new query is a new list: nothing carries over from the old one.
+  useEffect(() => {
+    setSelected(new Set());
+    setBulkNote(null);
+  }, [q]);
 
   useEffect(() => {
     // A query that doesn't parse never reaches the server; the page shows why
@@ -103,7 +124,7 @@ export default function Findings() {
     return () => {
       cancelled = true;
     };
-  }, [q, localError]);
+  }, [q, localError, reload]);
 
   const data = !localError && answer?.q === q ? answer.resp : null;
   const error = !localError && failure?.q === q ? failure.message : null;
@@ -126,6 +147,55 @@ export default function Findings() {
     () => (data?.tags_unavailable ?? []).map((w) => w.project || w.ws_id),
     [data],
   );
+
+  const rowKey = (f: FindingRecord) => {
+    const o = f as FindingOut;
+    return `${o.ws_id}/${o.target_id}/${o.id}`;
+  };
+  const unavailable = new Set((data?.tags_unavailable ?? []).map((w) => w.ws_id));
+  const selection: RowSelection<FindingRecord> = {
+    isSelected: (f) => selected.has(rowKey(f)),
+    blockedReason: (f) => {
+      const o = f as FindingOut;
+      return unavailable.has(o.ws_id) ? `${o.project || o.ws_id}'s tags couldn't be read, so they can't be changed` : null;
+    },
+    label: (f) => `Select ${f.id}`,
+    onToggle: (f) => {
+      setBulkNote(null);
+      setSelected((prev) => {
+        const next = new Set(prev);
+        const k = rowKey(f);
+        if (next.has(k)) next.delete(k);
+        else next.add(k);
+        return next;
+      });
+    },
+    onToggleAll: (rows, on) => {
+      setBulkNote(null);
+      setSelected((prev) => {
+        const next = new Set(prev);
+        for (const r of rows) {
+          if (on) next.add(rowKey(r));
+          else next.delete(rowKey(r));
+        }
+        return next;
+      });
+    },
+  };
+  const selectedRows = (data?.findings ?? []).filter((f) => selected.has(rowKey(f)));
+  const projectOf = (wsId: string) =>
+    data?.tags_unavailable.find((w) => w.ws_id === wsId)?.project ||
+    (data?.findings ?? []).find((f) => f.ws_id === wsId)?.project ||
+    wsId;
+  const applyBulk = async (mode: 'add' | 'remove', tag: string) => {
+    const ids = [...new Set(selectedRows.map((f) => f.id))];
+    const r = await api.tagFindings(ids, mode === 'add' ? { add: [tag] } : { remove: [tag] });
+    const summary = summarizeTagResult(r, mode, projectOf);
+    setBulkNote(summary);
+    setSelected(new Set());
+    setReload((n) => n + 1);
+    return summary;
+  };
 
   const active = activeSeverity(q);
   // A fetch for this query is in flight (the last answer was for another).
@@ -199,11 +269,30 @@ export default function Findings() {
             </div>
           )}
 
+          {data && selectedRows.length > 0 && (
+            <BulkTagBar
+              count={selectedRows.length}
+              suggestions={(data.facets?.tag ?? []).map((v) => ({ tag: v.value, count: v.count }))}
+              onApply={applyBulk}
+              onClear={() => setSelected(new Set())}
+            />
+          )}
+
+          {/* The bar unmounts once the selection clears; this keeps its result. */}
+          {data && selectedRows.length === 0 && bulkNote && (
+            <p
+              role={bulkNote.ok ? 'status' : 'alert'}
+              className={bulkNote.ok ? 'text-note text-ink-dim' : 'text-note text-err'}
+            >
+              {bulkNote.message}
+            </p>
+          )}
+
           {data &&
             (data.findings.length === 0 && q ? (
               <EmptyState title="No matches" hint={`No findings match \`${q}\`.`} />
             ) : (
-              <FindingsTable findings={data.findings} showProvenance />
+              <FindingsTable findings={data.findings} showProvenance selection={selection} />
             ))}
         </div>
       )}

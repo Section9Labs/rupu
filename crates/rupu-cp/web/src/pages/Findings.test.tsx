@@ -379,3 +379,68 @@ describe('Findings — export report', () => {
     expect(screen.queryByRole('button', { name: 'Export report' })).toBeNull();
   });
 });
+
+describe('Findings — bulk tagging', () => {
+  const A: FindingOut = { ...FINDING, id: 'fa', summary: 'Alpha issue' };
+  const B: FindingOut = { ...FINDING, id: 'fb', summary: 'Beta issue' };
+  const outcome = (id: string) => ({
+    workspaces: [{ ws_id: 'ws-1', outcomes: [{ finding_id: id, before: [], after: ['triaged'] }] }],
+    unknown: [],
+  });
+
+  it('selects a row, tags it, reloads, clears the selection and keeps the result', async () => {
+    const get = vi.spyOn(api, 'getFindings').mockResolvedValue(resp([A, B]));
+    const tag = vi.spyOn(api, 'tagFindings').mockResolvedValue(outcome('fa'));
+    renderPage();
+    await waitFor(() => expect(screen.getByText('Alpha issue')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select fa' }));
+    expect(screen.getByText('1 selected')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Tag…' }));
+    const input = screen.getByRole('combobox', { name: 'Tag selected findings' });
+    fireEvent.change(input, { target: { value: 'triaged' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+
+    await waitFor(() => expect(tag).toHaveBeenCalledWith(['fa'], { add: ['triaged'] }));
+    await waitFor(() => expect(get).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByText('1 selected')).toBeNull());
+    expect(screen.getByRole('status')).toHaveTextContent('Tagged 1 finding.');
+    expect(screen.getByRole('checkbox', { name: 'Select fa' })).not.toBeChecked();
+  });
+
+  it('disables the checkbox of a finding whose workspace tags are unreadable', async () => {
+    vi.spyOn(api, 'getFindings').mockResolvedValue(
+      resp([A, { ...B, ws_id: 'ws-2', project: 'billing-api' }], {
+        tags_unavailable: [{ ws_id: 'ws-2', project: 'billing-api' }],
+      }),
+    );
+    renderPage();
+    await waitFor(() => expect(screen.getByText('Alpha issue')).toBeInTheDocument());
+    expect(screen.getByRole('checkbox', { name: 'Select fa' })).toBeEnabled();
+    const blocked = screen.getByRole('checkbox', { name: 'Select fb' });
+    expect(blocked).toBeDisabled();
+    expect(blocked.getAttribute('title')).toMatch(/billing-api/);
+  });
+
+  it('clears the selection when the query changes', async () => {
+    vi.spyOn(api, 'getFindings').mockResolvedValue(resp([A, B]));
+    function Nav() {
+      const navigate = useNavigate();
+      return <button onClick={() => navigate('/security?tab=findings&q=tag%3Ab')}>go-b</button>;
+    }
+    render(
+      <MemoryRouter initialEntries={['/security?tab=findings&q=tag%3Aa']}>
+        <Nav />
+        <Findings />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByText('Alpha issue')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select fa' }));
+    expect(screen.getByText('1 selected')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText('go-b'));
+    await waitFor(() => expect(screen.queryByText('1 selected')).toBeNull());
+    await waitFor(() => expect(screen.getByRole('checkbox', { name: 'Select fa' })).not.toBeChecked());
+  });
+});

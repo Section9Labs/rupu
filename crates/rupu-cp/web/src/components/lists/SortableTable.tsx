@@ -14,7 +14,7 @@
 // match the full table: a hidden, zero-height "width probe" body renders the
 // rows that are widest in each column (see `widthProbeRows`).
 
-import { Fragment, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { ChevronDown, ChevronRight, ChevronUp } from 'lucide-react';
 import { cn } from '../../lib/cn';
@@ -67,6 +67,19 @@ export interface Column<T> {
    *  a plain-string `render` result, then the stringified `sortValue`. */
   widthText?: (row: T) => string;
   render: (row: T) => React.ReactNode;
+}
+
+/** Row selection: a leading checkbox column (and a header checkbox that
+ *  selects every selectable visible row). The table holds no selection state;
+ *  the caller owns it. */
+export interface RowSelection<T> {
+  isSelected: (row: T) => boolean;
+  /** null = selectable; a string = why not (disabled checkbox title). */
+  blockedReason?: (row: T) => string | null;
+  label: (row: T) => string;
+  onToggle: (row: T) => void;
+  /** Header checkbox: select or clear every selectable visible row. */
+  onToggleAll: (rows: T[], selected: boolean) => void;
 }
 
 export interface SortSpec {
@@ -208,6 +221,7 @@ export default function SortableTable<T>({
   onRowClick,
   renderDetail,
   virtualize,
+  selection,
 }: {
   columns: Column<T>[];
   rows: T[];
@@ -243,6 +257,8 @@ export default function SortableTable<T>({
    *  widths exactly when every non-subject column is `fit` (the subject
    *  column takes the rest, as it does in the full table). */
   virtualize?: { threshold: number };
+  /** Optional leading checkbox column; see `RowSelection`. */
+  selection?: RowSelection<T>;
 }) {
   const [sort, setSort] = useState<SortSpec | null>(initialSort ?? null);
   const [open, setOpen] = useState<ReadonlySet<string>>(new Set());
@@ -250,7 +266,7 @@ export default function SortableTable<T>({
   // leading chevron column in the header and every row, for grid
   // alignment) — distinct from whether any GIVEN row is expandable.
   const hasDetailFeature = Boolean(renderDetail);
-  const totalCols = columns.length + (hasDetailFeature ? 1 : 0);
+  const totalCols = columns.length + (hasDetailFeature ? 1 : 0) + (selection ? 1 : 0);
   // rowHref link-wraps every cell so the whole row is clickable, but that
   // used to mean a 13-column row was 13 identical tab stops and screen
   // readers announced the same link 13 times per row. Only the subject
@@ -297,6 +313,18 @@ export default function SortableTable<T>({
       .map((d) => d.row);
   }, [rows, sort, columns]);
 
+  // The header checkbox acts on the selectable rows currently shown.
+  const selectable = selection
+    ? sorted.filter((r) => !(selection.blockedReason?.(r) ?? null))
+    : [];
+  const selectedCount = selection ? selectable.filter((r) => selection.isSelected(r)).length : 0;
+  const allSelected = selectable.length > 0 && selectedCount === selectable.length;
+  const someSelected = selectedCount > 0 && !allSelected;
+  const headerBox = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (headerBox.current) headerBox.current.indeterminate = someSelected;
+  }, [someSelected, selection]);
+
   const isVirtual = virtualize !== undefined && sorted.length > virtualize.threshold;
   const virtualKeys = isVirtual ? sorted.map(rowKey) : [];
   const win = useWindowVirtualRows(virtualKeys, isVirtual);
@@ -318,7 +346,7 @@ export default function SortableTable<T>({
     if (!isVirtual) return;
     const tr = win.bodyRef.current?.querySelector('tr:not([aria-hidden])');
     if (!tr) return;
-    const cells = Array.from(tr.children).slice(hasDetailFeature ? 1 : 0);
+    const cells = Array.from(tr.children).slice((selection ? 1 : 0) + (hasDetailFeature ? 1 : 0));
     const next = new Map<string, string>();
     columnsRef.current.forEach((col, i) => {
       const font = cells[i] ? cellFont(cells[i]) : undefined;
@@ -327,7 +355,7 @@ export default function SortableTable<T>({
     setProbeFonts((prev) =>
       prev.size === next.size && Array.from(next).every(([k, v]) => prev.get(k) === v) ? prev : next,
     );
-  }, [isVirtual, columnSig, hasDetailFeature]);
+  }, [isVirtual, columnSig, hasDetailFeature, selection]);
 
   function toggleSort(key: string) {
     setSort((prev) =>
@@ -380,6 +408,24 @@ export default function SortableTable<T>({
             onRowClick && 'cursor-pointer focus-visible:bg-bg/60 focus-visible:outline-none',
           )}
         >
+          {selection && (
+            <td className="w-8 pl-3 align-middle">
+              {(() => {
+                const reason = selection.blockedReason?.(row) ?? null;
+                return (
+                  <input
+                    type="checkbox"
+                    aria-label={selection.label(row)}
+                    checked={selection.isSelected(row)}
+                    disabled={reason !== null}
+                    title={reason ?? undefined}
+                    onChange={() => selection.onToggle(row)}
+                    onClick={(e) => e.stopPropagation()}
+                  />
+                );
+              })()}
+            </td>
+          )}
           {hasDetailFeature && (
             <td className="w-8 pl-3 align-middle">
               {isRowExpandable && (
@@ -452,6 +498,18 @@ export default function SortableTable<T>({
             className="border-b border-border text-meta uppercase tracking-wide text-ink-mute"
             aria-rowindex={isVirtual ? 1 : undefined}
           >
+            {selection && (
+              <th scope="col" className="w-8 pl-3">
+                <input
+                  ref={headerBox}
+                  type="checkbox"
+                  aria-label="Select all"
+                  checked={allSelected}
+                  disabled={selectable.length === 0}
+                  onChange={() => selection.onToggleAll(selectable, !allSelected)}
+                />
+              </th>
+            )}
             {hasDetailFeature && <th scope="col" className="w-8" aria-label="Expand" />}
             {columns.map((col) => {
               const active = sort?.key === col.key;
@@ -517,6 +575,7 @@ export default function SortableTable<T>({
           <tbody aria-hidden="true" {...{ inert: '' }}>
             {probeRows.map((row) => (
               <tr key={rowKey(row)} style={{ visibility: 'collapse' }}>
+                {selection && <td className="w-8 pl-3 py-0" style={{ visibility: 'hidden' }} />}
                 {hasDetailFeature && <td className="w-8 pl-3 py-0" style={{ visibility: 'hidden' }} />}
                 {columns.map((col) => (
                   <td
