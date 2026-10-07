@@ -60,9 +60,12 @@ pub struct FindingOut {
     pub workflow_name: Option<String>,
     /// Deep link to the finding's location on the SCM's web UI (github/gitlab
     /// blob URL at the recorded line range), derived from the owning
-    /// workspace's `repo_remote` + `initial_branch`. `None` when the
-    /// workspace has no remote, the host is unrecognized, or the finding has
-    /// no `file_path`.
+    /// workspace's `repo_remote` + `initial_branch`. NOT pinned to a commit:
+    /// no run or finding records the commit it ran against, so the link
+    /// follows the branch recorded when the project was registered and can
+    /// drift as that branch moves. Self-hosted hosts are recognized from the
+    /// global `[scm.<account>].base_url`s. `None` when the workspace has no
+    /// remote, the host is unrecognized, or the finding has no `file_path`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permalink: Option<String>,
     /// Present for full-profile findings in LIST responses: the fields a row
@@ -429,6 +432,24 @@ pub fn collect_all_findings(global_dir: &std::path::Path) -> Vec<FindingOut> {
     collect_all_findings_reporting(global_dir).0
 }
 
+/// The self-hosted SCM web hosts named by the GLOBAL config's
+/// `[scm.<account>].base_url`s (permalinks for GitHub Enterprise /
+/// self-managed GitLab remotes). A missing or unreadable config yields none
+/// — permalinks are best-effort, so a bad config only costs those links.
+fn scm_web_hosts(global_dir: &std::path::Path) -> rupu_scm::weburl::WebHosts {
+    let config_path = global_dir.join("config.toml");
+    if !config_path.exists() {
+        return rupu_scm::weburl::WebHosts::default();
+    }
+    match rupu_config::layer_files(rupu_config::LayerPaths::global_only(&config_path)) {
+        Ok(cfg) => rupu_scm::weburl::WebHosts::from_scm(&cfg.scm),
+        Err(e) => {
+            tracing::warn!(path = %config_path.display(), error = %e, "failed to load [scm] for finding permalinks; self-hosted hosts unlinked");
+            rupu_scm::weburl::WebHosts::default()
+        }
+    }
+}
+
 /// [`collect_all_findings`], plus the workspaces (id + project) whose finding-tag
 /// log could not be read (their findings carry declared tags only).
 pub fn collect_all_findings_reporting(
@@ -436,6 +457,7 @@ pub fn collect_all_findings_reporting(
 ) -> (Vec<FindingOut>, Vec<TagsUnavailable>) {
     let mut out: Vec<FindingOut> = Vec::new();
     let mut tags_unavailable: Vec<TagsUnavailable> = Vec::new();
+    let web_hosts = scm_web_hosts(global_dir);
     each_ledger(
         global_dir,
         |w, target_id, _paths, records| {
@@ -445,11 +467,12 @@ pub fn collect_all_findings_reporting(
                 // finding in this target — no separate lookup/memoization is
                 // needed, unlike a flat finding list without provenance.
                 let permalink = match (w.repo_remote.as_deref(), record.file_path.as_deref()) {
-                    (Some(remote), Some(path)) => rupu_scm::weburl::repo_permalink(
+                    (Some(remote), Some(path)) => rupu_scm::weburl::repo_permalink_with(
                         remote,
                         w.initial_branch.as_deref(),
                         path,
                         record.line_range,
+                        &web_hosts,
                     ),
                     _ => None,
                 };

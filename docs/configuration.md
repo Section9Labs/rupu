@@ -90,7 +90,7 @@ key there:
 | `RUPU_LOG` | Wins over `log_level` |
 | `RUPU_MAX_OPEN_FILES`, `RUPU_MAX_CONCURRENT_JOBS`, `RUPU_MIN_FREE_MEMORY_MB` | Win over the `[runtime]` keys of the same name (`--max-open-files` also wins over `max_open_files`) |
 | `RUPU_NETFLOW_SUBPROCESS=0` | Forces `[netflow].subprocess_capture` off |
-| `RUPU_NO_UPDATE_CHECK` | When set to any value (even `0`), suppresses the passive update notice, like `[update].check = false` |
+| `RUPU_NO_UPDATE_CHECK` | When set to anything other than empty, `0` or `false`, suppresses the passive update notice, like `[update].check = false` (`=0` leaves it on) |
 | `RUPU_LIVE_VIEW=0` | Turns the workflow live view off |
 | `NO_COLOR` | Forces `[ui].color = "never"` |
 | `VISUAL` / `EDITOR` | Used when `[ui].editor` is unset |

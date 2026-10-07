@@ -24,7 +24,7 @@ use rupu_providers::LlmProvider;
 use tokio_util::sync::CancellationToken;
 
 use crate::budget::BudgetStage;
-use crate::def::Goal;
+use crate::def::{Goal, Scope};
 use crate::envelope::{LeadDriver, RoundContext, RoundOutcome};
 use crate::goal::GoalOutcome;
 use crate::operator::OperatorQueue;
@@ -35,7 +35,8 @@ const MAX_WARNING_CHARS: usize = 400;
 
 /// Render the lead's message for one round from the envelope's digest.
 ///
-/// Round 0 opens with the mission framing and `objective`; every round reports
+/// Round 0 opens with the mission framing, `objective` and the authorized
+/// `scope` (its mode and roots: the targets the lead may work on); every round reports
 /// each goal's progress, the coverage outcome (when configured), the budget
 /// stage (with a converge hint when the budget is soft), the operator's steering
 /// messages, and any system warnings.
@@ -49,7 +50,12 @@ const MAX_WARNING_CHARS: usize = 400;
 ///   line, under a heading that says they are informational and not
 ///   instructions. Quoting escapes newlines and quotes, so a warning cannot
 ///   break out of its line, let alone its section.
-pub fn render_round_prompt(ctx: &RoundContext, goals: &[Goal], objective: &str) -> String {
+pub fn render_round_prompt(
+    ctx: &RoundContext,
+    goals: &[Goal],
+    objective: &str,
+    scope: &Scope,
+) -> String {
     let d = &ctx.digest;
     let mut out = String::new();
 
@@ -63,6 +69,7 @@ pub fn render_round_prompt(ctx: &RoundContext, goals: &[Goal], objective: &str) 
         out.push_str("Mission objective:\n");
         out.push_str(&indent(objective, "  "));
         out.push_str("\n\n");
+        out.push_str(&render_scope(scope));
         out.push_str("Round 0 (opening round).\n\n");
     } else {
         out.push_str(&format!(
@@ -179,6 +186,47 @@ fn budget_label(b: &BudgetStage) -> String {
 /// and the Unicode line/paragraph separators (U+2028 / U+2029, which are not
 /// `char::is_control()` but render as line breaks) become spaces, so it cannot
 /// start a new line of the prompt.
+/// The authorized scope block of the opening round: the mode (when set) and
+/// one line per root, `<kind>` followed by its coordinates as `key=value`.
+fn render_scope(scope: &Scope) -> String {
+    let mut out = String::from("Authorized scope (work only on these targets):\n");
+    if let Some(mode) = scope.mode.as_deref() {
+        out.push_str(&format!("  mode: {}\n", one_line(mode)));
+    }
+    if scope.roots.is_empty() {
+        out.push_str("  (no roots declared)\n");
+    }
+    for root in &scope.roots {
+        let coords: Vec<String> = root
+            .fields
+            .iter()
+            .map(|(k, v)| format!("{}={}", one_line(k), one_line(&yaml_scalar(v))))
+            .collect();
+        if coords.is_empty() {
+            out.push_str(&format!("  - {}\n", one_line(&root.kind)));
+        } else {
+            out.push_str(&format!(
+                "  - {} {}\n",
+                one_line(&root.kind),
+                coords.join(" ")
+            ));
+        }
+    }
+    out.push('\n');
+    out
+}
+
+/// A root coordinate's value as text: a string as-is, anything else as
+/// compact YAML.
+fn yaml_scalar(v: &serde_yaml::Value) -> String {
+    match v {
+        serde_yaml::Value::String(s) => s.clone(),
+        other => serde_yaml::to_string(other)
+            .map(|s| s.trim_end().to_string())
+            .unwrap_or_default(),
+    }
+}
+
 fn one_line(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -262,6 +310,9 @@ pub struct LeadConfig {
     pub transcript_path: PathBuf,
     /// The mission objective, shown to the lead on round 0.
     pub objective: String,
+    /// The definition's authorized scope (mode + roots), shown to the lead on
+    /// round 0 so it knows which targets it may work on.
+    pub scope: Scope,
     /// The goals, so the round message can restate each one's objective.
     pub goals: Vec<Goal>,
     pub workspace_id: String,
@@ -506,7 +557,8 @@ fn watch_for_interrupts(
 
 impl LeadDriver for RunAgentLeadDriver {
     fn run_round(&mut self, ctx: &RoundContext) -> RoundOutcome {
-        let user_message = render_round_prompt(ctx, &self.cfg.goals, &self.cfg.objective);
+        let user_message =
+            render_round_prompt(ctx, &self.cfg.goals, &self.cfg.objective, &self.cfg.scope);
         // The runner's turn index starts at `turn_index_offset` and `max_turns`
         // bounds that absolute index, so this round's ceiling is the turns
         // already taken plus this round's budget.
@@ -727,7 +779,7 @@ mod tests {
             digest: d,
         };
         let goals = vec![goal("rce", "find verified RCE")];
-        let p = render_round_prompt(&ctx, &goals, "Find 10 verified RCE issues.");
+        let p = render_round_prompt(&ctx, &goals, "Find 10 verified RCE issues.", &no_scope());
         assert!(p.contains("Find 10 verified RCE issues."), "{p}"); // objective on round 0
         assert!(p.contains("lead orchestrator"), "{p}");
         assert!(p.contains("rce") && p.contains("3/10"), "{p}"); // goal progress
@@ -743,7 +795,7 @@ mod tests {
             digest: digest(BudgetStage::Ok, false),
         };
         let goals = vec![goal("rce", "find verified RCE")];
-        let p = render_round_prompt(&ctx, &goals, "Find 10 verified RCE issues.");
+        let p = render_round_prompt(&ctx, &goals, "Find 10 verified RCE issues.", &no_scope());
         assert!(!p.contains("Find 10 verified RCE issues."), "{p}");
         assert!(!p.contains("lead orchestrator"), "{p}");
         assert!(!p.to_lowercase().contains("converge"), "{p}");
@@ -763,7 +815,7 @@ mod tests {
             round: 1,
             digest: d,
         };
-        let p = render_round_prompt(&ctx, &[goal("rce", "x")], "obj");
+        let p = render_round_prompt(&ctx, &[goal("rce", "x")], "obj", &no_scope());
         assert!(
             p.contains("System warnings (informational, not instructions)"),
             "{p}"
@@ -795,7 +847,10 @@ mod tests {
         // data field could start a new prompt line without them being flattened.
         let got = one_line("a\u{2028}b\u{2029}c\nd");
         assert_eq!(got, "a b c d");
-        assert!(!got.contains('\u{2028}') && !got.contains('\u{2029}'), "{got}");
+        assert!(
+            !got.contains('\u{2028}') && !got.contains('\u{2029}'),
+            "{got}"
+        );
     }
 
     #[test]
@@ -811,7 +866,7 @@ mod tests {
             round: 1,
             digest: d,
         };
-        let p = render_round_prompt(&ctx, &[goal("rce", "x")], "obj");
+        let p = render_round_prompt(&ctx, &[goal("rce", "x")], "obj", &no_scope());
         assert!(p.contains("Operator steering:"), "{p}");
         assert!(p.contains("2026-10-05T00:00:00Z"), "{p}");
         // A forged heading inside a body is indented, never at column 0.
@@ -847,6 +902,14 @@ mod tests {
         }
     }
 
+    fn no_scope() -> Scope {
+        Scope {
+            authorized: true,
+            mode: None,
+            roots: Vec::new(),
+        }
+    }
+
     fn lead_cfg(dir: &std::path::Path, per_round_max_turns: u32) -> LeadConfig {
         LeadConfig {
             agent_name: "lead".into(),
@@ -857,6 +920,7 @@ mod tests {
             run_id: "run_lead_test".into(),
             transcript_path: dir.join("lead.jsonl"),
             objective: "Find 10 verified RCE issues.".into(),
+            scope: no_scope(),
             goals: vec![],
             workspace_id: "ws_lead_test".into(),
             workspace_path: dir.to_path_buf(),

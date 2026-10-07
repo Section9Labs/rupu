@@ -29,6 +29,21 @@ pub fn format_token_compact(n: u64) -> String {
     }
 }
 
+/// The session status header's context gauge: `ctx 52K/200K 26%` — the
+/// last turn's prompt size against the input limit. `None` when either is 0
+/// (no limit known, or no completed turn yet).
+pub fn context_gauge_text(last_input: u64, window: u64) -> Option<String> {
+    if last_input == 0 || window == 0 {
+        return None;
+    }
+    let pct = (last_input * 100) / window;
+    Some(format!(
+        "ctx {}/{} {pct}%",
+        format_token_compact(last_input),
+        format_token_compact(window)
+    ))
+}
+
 /// Humanize a token count for the live dashboard header, matching the CP
 /// web's `formatTokens` (crates/rupu-cp/web/src/lib/usage.ts) byte-for-byte
 /// so the terminal and the web read the same: `12.9B` / `55.7M` (one

@@ -190,3 +190,42 @@ async fn get_coverage_returns_files_and_findings() {
     assert_eq!(findings[0]["severity"].as_str(), Some("high"));
     assert_eq!(findings[0]["summary"].as_str(), Some("thing"));
 }
+
+/// Finding permalinks on a GitHub Enterprise remote: the host is recognized
+/// from the GLOBAL `[scm.<account>].base_url`, and the link follows the
+/// workspace's recorded branch (no commit is recorded to pin it to).
+#[test]
+fn finding_permalink_uses_self_hosted_scm_host_from_global_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let global = tmp.path();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let ws_dir = global.join("workspaces");
+    std::fs::create_dir_all(&ws_dir).unwrap();
+    std::fs::write(
+        ws_dir.join("ws_ghe.toml"),
+        format!(
+            "id = \"ws_ghe\"\npath = \"{}\"\nrepo_remote = \"git@git.acme.internal:sec/app.git\"\n\
+             initial_branch = \"trunk\"\ncreated_at = \"2026-06-19T00:00:00Z\"\n",
+            proj.display()
+        ),
+    )
+    .unwrap();
+    seed_coverage_target(&proj, "tgt");
+
+    // No [scm] account names the host yet → no permalink.
+    let out = rupu_cp::api::findings::collect_all_findings(global);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].permalink, None);
+
+    std::fs::write(
+        global.join("config.toml"),
+        "[scm.acme-ghe]\nkind = \"github\"\nbase_url = \"https://git.acme.internal/api/v3\"\n",
+    )
+    .unwrap();
+    let out = rupu_cp::api::findings::collect_all_findings(global);
+    assert_eq!(
+        out[0].permalink.as_deref(),
+        Some("https://git.acme.internal/sec/app/blob/trunk/src/a.rs#L1-L5")
+    );
+}

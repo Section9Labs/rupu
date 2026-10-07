@@ -703,7 +703,10 @@ fn resolve_ledger_paths(workspace: &StdPath, global_dir: &StdPath, id: &str) -> 
 /// `ScopeDisclosure.tsx` says so explicitly, so "this run's netflow"
 /// is never silently read as "only what this run's own provider calls
 /// did" when it also includes what every agent it dispatched did.
-fn run_and_unit_ids(store: &RunStore, run_id: &str) -> Vec<String> {
+///
+/// `pub` so `rupu netflow prune` protects every ledger a live run owns
+/// with the same id walk the read side uses.
+pub fn run_and_unit_ids(store: &RunStore, run_id: &str) -> Vec<String> {
     let mut ids = vec![run_id.to_string()];
     for record in store.read_step_results(run_id).unwrap_or_default() {
         ids.push(record.run_id);

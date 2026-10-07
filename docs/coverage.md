@@ -427,6 +427,13 @@ checked, for example above 64 MiB). The proof-of-concept browser lists the
 artifacts, the patch renders as a diff, and the CI/CD and regression commands
 have copy buttons. A `summary`-profile finding opens a compact page instead.
 
+A finding with a file links to it on the SCM's web UI when its project's
+`origin` remote is on github.com, gitlab.com, or a self-hosted host named by a
+`base_url` in the global config's `[scm.<account>]` tables (GitHub Enterprise,
+self-managed GitLab). The link is not pinned to a commit: rupu does not record
+the commit a run worked on, so it points at the branch recorded when the project
+was registered, and the lines can drift as that branch moves.
+
 **Lists and triage.** The findings tables (the global Findings page, a
 project's findings tab, and coverage detail) show a Report column with the
 `n/11` count and a PoC marker for full-profile rows, and "summary" for the
@@ -440,14 +447,16 @@ tab, a full-profile finding's inline card has tabs (Root cause, Call chain,
 Evidence, Patch, Repro) that load the report when the card is expanded.
 
 **Links to the repository.** When a finding names a file and its project's
-checkout has a `github.com` or `gitlab.com` remote, the expanded Code-tab card
+checkout's remote is on a known SCM host, the expanded Code-tab card
 and the finding's card in the Situation Room show a **View on repository ↗**
 link to that file on the SCM's web UI, with the line range highlighted
 (`#L10-L14` on GitHub, `#L10-14` on GitLab). The link points at the branch
 the checkout was on when rupu first registered the project (`main` when that
 was unknown), not at the commit the finding was recorded against, so once that
-branch has moved on the lines may have shifted. Self-managed GitLab, GitHub
-Enterprise and other hosts get no link. List rows carry it as `permalink`
+branch has moved on the lines may have shifted. `github.com` and `gitlab.com`
+are always known; a GitHub Enterprise or self-managed GitLab host is known when
+a global `[scm.<account>]` names it in `base_url` (the account's `kind`, else
+its name, gives the platform). Any other host gets no link. List rows carry it as `permalink`
 (omitted when there is none).
 
 **API.**
@@ -905,7 +914,9 @@ not gain any.
   it annotates the ledger and never touches the workspace's files.
 - **Workflow `action:` steps.** The MCP catalog has `findings.query` and
   `findings.tag` (same inputs and results as the agent tools), and
-  `findings.record` accepts `tags`:
+  `findings.record` accepts `tags`. These MCP tools are for `action:` steps
+  only: an agent is never offered them, even with
+  `tools: ["*"]`, and uses the builtins above instead.
 
   ```yaml
   - id: mark

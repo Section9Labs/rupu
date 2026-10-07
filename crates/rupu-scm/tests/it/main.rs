@@ -19,3 +19,4 @@ mod live_smoke;
 mod netflow_capture;
 mod netflow_coarse;
 mod registry_discover;
+mod weburl_self_hosted;

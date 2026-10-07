@@ -199,6 +199,9 @@ The run is a loop of rounds. At the top of each round the envelope:
 
 4. otherwise hands the lead a digest (goal progress, coverage, budget stage,
    steering, warnings) and lets it run one round of up to `lead_max_turns` turns.
+   The opening round's message also carries the mission objective and the
+   authorized scope: `scope.mode` and one line per `scope.roots` entry, its
+   `kind` followed by its coordinates (`network:host host=10.0.0.5`).
 
 The lead's conversation carries over from round to round. A round that errors is
 recorded and the loop continues; the budget and ceilings are what bound a lead
@@ -511,9 +514,10 @@ What is not built, or only partly built, today:
   can't be run as units.
 - **`trigger:` is not acted on.** It is parsed and stored, but nothing schedules
   an agentiflow. Use cron to call `rupu agentiflow run --detach` if you need one.
-- **`scope.mode` is not acted on**, and `scope.roots` is only validated: neither
-  is passed to the lead. Put targets and constraints in the goal objectives or
-  `description` so the lead sees them.
+- **`scope` is shown, not enforced.** The lead's opening-round prompt lists
+  `scope.mode` and every `scope.roots` entry with its coordinates as the
+  authorized targets, but nothing stops an agent from reaching beyond them; put
+  hard constraints in the goal objectives too.
 - **No sub-leads.** Only the lead can start units.
 - **Workflows with approval gates can't run as units.** A unit has no terminal to
   answer the prompt.

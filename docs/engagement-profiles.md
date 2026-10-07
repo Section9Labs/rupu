@@ -372,7 +372,7 @@ lead: assessment-lead
 engagement_profiles: [network]
 goals:
   - id: gateway
-    # The objective is what tells the lead its scope (see below).
+    # The lead also sees scope.roots (below); spelling the limits out here helps.
     objective: "Authorized scope: 198.51.100.0/28 only. Enumerate and test every service; start with the gateway at 198.51.100.1."
     target:
       asset: { kind: "network:host", locator: { host: "198.51.100.1" } }
@@ -394,10 +394,10 @@ budget:
   usd: 15
 ```
 
-The lead's first-round mission is built from the goals' `objective` text and
-the coverage target; `scope.roots` is validated but not shown to the lead. So
-state the authorized scope in a goal objective (as above), or in a steering
-message (`rupu agentiflow send`), or the lead has no scope to read. See
+The lead's first-round mission lists the goals' `objective` text, the coverage
+target and the authorized scope (`scope.mode` and each `scope.roots` entry with
+its coordinates). The roots are shown, not enforced: units can still reach
+anything their tools can. See
 [agentiflows.md](agentiflows.md) for the definition format and how a run
 proceeds.
 

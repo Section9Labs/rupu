@@ -1714,10 +1714,12 @@ export interface FindingRecord {
   evidence: FindingEvidence;
   declared_by: unknown;
   declared_at: string;
-  /** Deep link to the finding's location on the SCM's web UI (e.g. a GitHub
-   *  permalink pinned to the commit the finding was recorded against). Wired
-   *  up in a later task — optional so consumers (`InlineFindingCard`) can
-   *  guard it now and pick it up automatically once populated. */
+  /** Deep link to the finding's location on the SCM's web UI (a GitHub /
+   *  GitLab blob URL at the recorded lines). NOT pinned to a commit: it
+   *  follows the branch recorded when the project was registered, so it can
+   *  drift as that branch moves. Absent when the project has no recognized
+   *  remote (github.com, gitlab.com, or a self-hosted host named by a global
+   *  `[scm.<account>].base_url`) or the finding has no file. */
   permalink?: string | null;
   target_ref?: string | null;
   profile?: 'full' | 'summary';
