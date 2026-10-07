@@ -52,7 +52,9 @@ export function useScopedList(customerProp: string | undefined, resetKey: unknow
 
   const rejectIfScopeError = useCallback(
     (e: unknown) => {
-      if (!embedded && customer && isScopeRejection(e)) rejectScope(scopeRejectedNotice(e));
+      // `customer` is the scope this request carried: a 400 that lands after
+      // the scope moved on is ignored by `rejectScope`.
+      if (!embedded && customer && isScopeRejection(e)) rejectScope(scopeRejectedNotice(e), customer);
     },
     [embedded, customer, rejectScope],
   );

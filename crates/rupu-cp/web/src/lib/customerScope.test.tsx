@@ -2,7 +2,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, render, renderHook, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { api, type CustomerRow } from './api';
+import { api, ApiError, type CustomerRow } from './api';
+import { useScopedList } from './useScopedList';
 import {
   CUSTOMER_SCOPE_KEY,
   CustomerScopeProvider,
@@ -166,6 +167,50 @@ describe('CustomerScopeProvider', () => {
     expect(window.localStorage.getItem(CUSTOMER_SCOPE_KEY)).toBeNull();
     // A later explicit choice dismisses the notice.
     act(() => ctx.setScope('globex'));
+    expect(screen.getByTestId('notice').textContent).toBe('');
+  });
+
+  it('rejectScope ignores a rejection for a scope that is no longer current', async () => {
+    window.localStorage.setItem(CUSTOMER_SCOPE_KEY, 'acme');
+    mount();
+    await waitFor(() => expect(screen.getByTestId('customer').textContent).toBe('acme'));
+    act(() => ctx.setScope('globex'));
+    act(() => ctx.rejectScope('rejected acme', 'acme'));
+    expect(screen.getByTestId('scope').textContent).toBe('globex');
+    expect(screen.getByTestId('notice').textContent).toBe('');
+    expect(window.localStorage.getItem(CUSTOMER_SCOPE_KEY)).toBe('globex');
+    // The current scope's own rejection still clears it.
+    act(() => ctx.rejectScope('rejected globex', 'globex'));
+    expect(screen.getByTestId('scope').textContent).toBe('null');
+    expect(screen.getByTestId('notice').textContent).toBe('rejected globex');
+  });
+
+  it('a 400 that lands after the user picked another scope does not clear it', async () => {
+    let fail!: (e: unknown) => void;
+    const pending = new Promise<never>((_, reject) => (fail = reject));
+    let scoped!: ReturnType<typeof useScopedList>;
+    function Page() {
+      scoped = useScopedList(undefined, []);
+      return null;
+    }
+    render(
+      <MemoryRouter initialEntries={['/?customer=Bad!']}>
+        <CustomerScopeProvider>
+          <Probe />
+          <Page />
+        </CustomerScopeProvider>
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId('scope').textContent).toBe('Bad!');
+    // The request goes out under `Bad!`...
+    const guarded = scoped.guard(pending).catch(() => undefined);
+    // ...the user picks Acme before its 400 lands.
+    act(() => ctx.setScope('acme'));
+    await act(async () => {
+      fail(new ApiError(400, 'bad', JSON.stringify({ error: 'customer: invalid slug `Bad!`' })));
+      await guarded;
+    });
+    expect(screen.getByTestId('scope').textContent).toBe('acme');
     expect(screen.getByTestId('notice').textContent).toBe('');
   });
 

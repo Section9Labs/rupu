@@ -12,6 +12,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from 'react';
@@ -32,8 +33,11 @@ export interface CustomerScopeValue {
    *  a slug not in the active list — looked up among archived customers. */
   setScope(next: CustomerScope, row?: CustomerRow): void;
   /** Clear a scope the backend rejected and show `message` as a one-line
-   *  notice. Pages call this on a 400 from a request carrying the scope. */
-  rejectScope(message: string): void;
+   *  notice. Pages call this on a 400 from a request carrying the scope, and
+   *  pass `rejected` — the scope that request carried: a rejection that lands
+   *  after the scope has changed is about a scope no longer in effect, and is
+   *  ignored (it must not clear the one just picked). */
+  rejectScope(message: string, rejected?: CustomerScope): void;
   /** True once the active list has loaded (successfully) at least once. */
   loaded?: boolean;
   /** Refetch the list — after create / rename / archive / delete. A failed
@@ -82,14 +86,21 @@ export function CustomerScopeProvider({ children }: { children: ReactNode }): JS
   const [notice, setNotice] = useState<string | null>(null);
   const [noticeSeq, setNoticeSeq] = useState(0);
   const [nonce, setNonce] = useState(0);
+  // The scope in effect, readable from a late callback (kept in step by
+  // `setScope` / `rejectScope` as well as by render).
+  const scopeRef = useRef(scope);
+  scopeRef.current = scope;
 
   const setScope = useCallback((next: CustomerScope, row?: CustomerRow) => {
+    scopeRef.current = next;
     persist(next);
     setNotice(null);
     setExtra(row ?? null);
     setScopeState(next);
   }, []);
-  const rejectScope = useCallback((message: string) => {
+  const rejectScope = useCallback((message: string, rejected?: CustomerScope) => {
+    if (rejected !== undefined && rejected !== scopeRef.current) return;
+    scopeRef.current = null;
     persist(null);
     setExtra(null);
     setScopeState(null);
