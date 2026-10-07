@@ -469,6 +469,28 @@ fn cwe_narrows_to_the_findings_that_carry_it() {
 }
 
 #[test]
+fn cwe_reads_a_mitre_reference_url_when_the_report_names_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut a = full_record("fnd_crit", Severity::Critical, "run_crit");
+    a.report.as_mut().unwrap().cwe = Vec::new();
+    a.concern_id = None;
+    a.evidence.references = vec!["https://cwe.mitre.org/data/definitions/79.html".to_string()];
+    let mut b = full_record("fnd_high", Severity::High, "run_high");
+    b.report.as_mut().unwrap().cwe = vec!["CWE-89".to_string()];
+    seed(tmp.path(), &[a, b]);
+    let out_path = tmp.path().join("cwe.md");
+    let out = rupu(tmp.path())
+        .args(["findings", "export", "--cwe", "79", "-o"])
+        .arg(&out_path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = std::fs::read_to_string(&out_path).unwrap();
+    assert!(text.contains("SEC-001"), "{text}");
+    assert!(!text.contains("SEC-002"), "{text}");
+}
+
+#[test]
 fn summary_findings_are_left_out_unless_asked_for() {
     let tmp = tempfile::tempdir().unwrap();
     let mut summary = full_record("fnd_low", Severity::Low, "run_low");

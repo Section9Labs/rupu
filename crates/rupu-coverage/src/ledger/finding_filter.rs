@@ -390,6 +390,27 @@ mod tests {
         assert!(ids("has:report").is_empty());
     }
 
+    /// A finding whose only CWE is a MITRE reference URL matches `cwe:` and
+    /// shows in the cwe facet, as its CWE column shows it on the web.
+    #[test]
+    fn a_mitre_reference_is_a_cwe_for_the_query_and_the_facets() {
+        let mut f = fixture();
+        f[0].concern_id = None;
+        f[0].evidence.references = vec!["https://cwe.mitre.org/data/definitions/79.html".into()];
+        let q = parse_query("cwe:79").unwrap();
+        let got: Vec<&str> = select(&f, FindingView::bare, &q, &RunScopes::new())
+            .into_iter()
+            .map(|r| r.id.as_str())
+            .collect();
+        assert_eq!(got, ["fnd_low"]);
+        let fc = facets(f.iter().map(FindingView::bare));
+        let cwe: Vec<(&str, usize)> = fc["cwe"]
+            .iter()
+            .map(|v| (v.value.as_str(), v.count))
+            .collect();
+        assert_eq!(cwe, [("CWE-89", 2), ("CWE-79", 1)]);
+    }
+
     #[test]
     fn free_text_is_case_insensitive_over_title_summary_id_and_file() {
         assert_eq!(ids("ORDER search").len(), 3);

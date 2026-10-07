@@ -5,7 +5,7 @@ use crate::number::rank;
 use rupu_coverage::{FindingProfile, Severity};
 use std::collections::HashSet;
 
-pub use rupu_coverage::report::cwe::{concern_cwe, parse_cwe};
+pub use rupu_coverage::report::cwe::{concern_cwe, finding_cwes, parse_cwe, reference_cwe};
 
 /// What to keep. Every field narrows the result; unset fields keep everything.
 #[derive(Debug, Clone, Default)]
@@ -22,8 +22,9 @@ pub struct Selection {
     /// Exact match on `report.ownership.owner`.
     pub owner: Option<String>,
     /// A CWE (`CWE-79`, `cwe-79`, `cwe_79` or `79`), compared by number with
-    /// each entry of `report.cwe` and with the CWE a `concern_id` names (see
-    /// [`concern_cwe`]). A value [`parse_cwe`] cannot read matches nothing,
+    /// every CWE the finding names ([`finding_cwes`]: `report.cwe`, the
+    /// `concern_id`'s CWE and MITRE reference URLs — the query's, facets' and
+    /// CWE column's rule). A value [`parse_cwe`] cannot read matches nothing,
     /// so callers refuse one up front.
     pub cwe: Option<String>,
     /// Keep summary-profile findings. Off by default: a report is about the
@@ -76,15 +77,7 @@ pub fn select(numbered: Vec<ExportFinding>, sel: &Selection) -> Vec<ExportFindin
                 let Some(n) = cwe else {
                     return false;
                 };
-                let in_report = r
-                    .report
-                    .as_ref()
-                    .is_some_and(|rep| rep.cwe.iter().any(|c| parse_cwe(c) == Some(n)));
-                let in_concern = r
-                    .concern_id
-                    .as_deref()
-                    .is_some_and(|c| concern_cwe(c) == Some(n));
-                if !in_report && !in_concern {
+                if !finding_cwes(r).contains(&n) {
                     return false;
                 }
             }
@@ -307,6 +300,22 @@ mod tests {
             ..with_summaries()
         };
         assert!(!ids(&select(all, &sel)).contains(&"full"));
+    }
+
+    /// The export's CWE filter reads a finding's CWEs by the same rule as
+    /// the query, the facets and the CWE column: a MITRE reference URL counts
+    /// when the concern names none.
+    #[test]
+    fn cwe_matches_a_mitre_reference_url() {
+        let mut by_ref = make("by_ref", Severity::High, "run_a", None);
+        by_ref.input.record.evidence.references =
+            vec!["https://cwe.mitre.org/data/definitions/79.html".into()];
+        let all = vec![by_ref, make("neither", Severity::High, "run_a", None)];
+        let sel = Selection {
+            cwe: Some("79".into()),
+            ..with_summaries()
+        };
+        assert_eq!(ids(&select(all, &sel)), ["by_ref"]);
     }
 
     #[test]
