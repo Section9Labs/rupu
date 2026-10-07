@@ -4211,16 +4211,39 @@ impl From<RunStoreError> for PauseError {
 /// to signal it. The old `/bin/kill` version reported that case as dead
 /// (any non-zero exit was "dead"), which could reap a run that was in
 /// fact still going. Only `ESRCH` — and any other error, conservatively —
-/// means "no such process".
+/// means "no such process". An exited process nothing has reaped yet is not
+/// running either (see `is_zombie`): its runner is dead, so the run is reaped.
 pub fn pid_is_running(pid: u32) -> bool {
-    let Some(pid) = rustix_pid(pid) else {
+    let Some(target) = rustix_pid(pid) else {
         return false;
     };
-    match rustix::process::test_kill_process(pid) {
-        Ok(()) => true,
-        Err(rustix::io::Errno::PERM) => true,
+    match rustix::process::test_kill_process(target) {
+        Ok(()) | Err(rustix::io::Errno::PERM) => !is_zombie(pid),
         Err(_) => false,
     }
+}
+
+/// Whether `pid` has exited but nothing has reaped it yet (a zombie, `Z`, or
+/// one being torn down, `X`). `kill(pid, 0)` still succeeds on one, yet it
+/// runs nothing: under a parent that never `wait`s — a container whose PID 1
+/// is not an init, a long-lived spawner — an exited process stays a zombie
+/// indefinitely and would read as running forever. Linux reads the state
+/// from `/proc/<pid>/stat` (after the last `)`, since the command name may
+/// itself hold one); elsewhere this is `false`, the `kill(2)` answer alone.
+#[cfg(target_os = "linux")]
+fn is_zombie(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            let (_, rest) = stat.rsplit_once(')')?;
+            Some(rest.trim_start().starts_with(['Z', 'X']))
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_zombie(_pid: u32) -> bool {
+    false
 }
 
 /// Send SIGTERM to `pid`. Returns whether the signal was delivered.
@@ -7897,6 +7920,30 @@ mod tests {
             "pid 0 means `our whole process group` to kill(2) and must never \
              be treated as a live runner"
         );
+    }
+
+    /// An exited child nothing has reaped yet is a zombie: `kill(pid, 0)`
+    /// still finds it, but it runs nothing, so it is not running. (Linux
+    /// only: elsewhere the probe is the `kill(2)` answer alone.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unreaped_exited_child_is_not_running() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        // Not `try_wait`: that would reap it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !is_zombie(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child never exited"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!pid_is_running(pid), "a zombie read as running");
+        child.wait().unwrap();
     }
 
     #[test]

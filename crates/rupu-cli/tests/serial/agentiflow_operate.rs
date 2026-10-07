@@ -239,38 +239,23 @@ fn ps_stat(pid: u32) -> Option<String> {
     (out.status.success() && !value.is_empty()).then_some(value)
 }
 
-/// Whether any process is still in group `pgid`. `None` where `pgrep` is
-/// unavailable (the check is then skipped, loudly).
+/// Whether any live process is still in group `pgid`. `None` where that
+/// cannot be determined (the check is then skipped, loudly).
 fn group_is_empty(pgid: u32) -> Option<bool> {
-    let out = std::process::Command::new("pgrep")
-        .args(["-g", &pgid.to_string()])
-        .output()
-        .ok()?;
-    match out.status.code() {
-        Some(0) => Some(false),
-        Some(1) => Some(true),
-        _ => None,
-    }
+    crate::proc_probe::group_members(pgid).map(|members| members.is_empty())
 }
 
-/// Whether a process whose command line matches `pattern` is in group `pgid`.
-/// `None` where `pgrep` is unavailable.
+/// Whether a live process in group `pgid` has `pattern` in its command line.
+/// `None` where that cannot be determined.
 fn group_runs(pgid: u32, pattern: &str) -> Option<bool> {
-    let out = std::process::Command::new("pgrep")
-        .args(["-g", &pgid.to_string(), "-f", pattern])
-        .output()
-        .ok()?;
-    match out.status.code() {
-        Some(0) => Some(true),
-        Some(1) => Some(false),
-        _ => None,
-    }
+    crate::proc_probe::group_members(pgid)
+        .map(|members| members.iter().any(|cmd| cmd.contains(pattern)))
 }
 
-/// Wait for group `pgid` to be empty. Passes where `pgrep` cannot tell.
+/// Wait for group `pgid` to be empty. Passes where groups cannot be listed.
 async fn group_goes_away(pgid: u32, secs: u64) -> bool {
     if group_is_empty(pgid).is_none() {
-        eprintln!("`pgrep -g` is unavailable here: skipping the process-group check");
+        eprintln!("process groups cannot be listed here: skipping the process-group check");
         return true;
     }
     poll(secs, || group_is_empty(pgid).unwrap_or(true).then_some(()))
@@ -399,7 +384,7 @@ async fn live_unit(fx: &Fixture, run_id: &str, cleanup: &mut Cleanup) -> LiveUni
             // The unit is really running its script (not merely spawned) once
             // its bash tool's `sleep 300` is in its group. (Its transcript
             // cannot say so: a tool call is flushed after the tool returns.)
-            // Without `pgrep`, a live group leader has to do.
+            // Where groups cannot be listed, a live group leader has to do.
             let running = group_runs(pgid, "sleep 300").unwrap_or(true);
             if running && pid_is_running(pgid) {
                 return Some(LiveUnit { id: unit_id, pgid });

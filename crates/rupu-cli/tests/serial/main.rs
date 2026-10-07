@@ -101,6 +101,7 @@ mod netflow_run;
 mod netflow_subprocess_live;
 mod netflow_workflow;
 mod policy_lock;
+mod proc_probe;
 mod reject_mode_inheritance;
 mod resume_clears_web_marker;
 mod resume_recovers_interrupted;

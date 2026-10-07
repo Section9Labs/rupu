@@ -440,13 +440,9 @@ async fn run_detach_returns_at_once_and_leaves_a_live_coordinator_in_its_own_gro
     );
     // The parent already exited, so the coordinator is another process, and a
     // group leader (`process_group(0)`): its pgid is its pid.
-    match ps_field(pid, "pgid") {
-        Some(pgid) => assert_eq!(
-            pgid,
-            pid.to_string(),
-            "the child is not its own group leader"
-        ),
-        None => eprintln!("`ps` is unavailable here: skipping the process-group check"),
+    match crate::proc_probe::pgid_of(pid) {
+        Some(pgid) => assert_eq!(pgid, pid, "the child is not its own group leader"),
+        None => eprintln!("process groups cannot be read here: skipping the process-group check"),
     }
 
     let status =
