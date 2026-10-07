@@ -180,7 +180,7 @@ export const PROJECT_COLUMNS: Column<ProjectRow>[] = [
     sortable: true,
     sortValue: (p) => p.name,
     titleValue: (p) => p.name,
-    render: (p) => <span className="text-sm font-semibold text-ink">{p.name}</span>,
+    render: (p) => <span className="text-sm font-semibold text-ink whitespace-nowrap">{p.name}</span>,
   },
   {
     key: 'path',
@@ -188,8 +188,12 @@ export const PROJECT_COLUMNS: Column<ProjectRow>[] = [
     fit: true,
     sortable: true,
     sortValue: (p) => p.path,
+    // Capped narrower than the name's share of a 1280-1440px table, and truncating
+    // for real: the full path is on hover.
     render: (p) => (
-      <span className="text-note text-ink-mute font-mono truncate block max-w-xs">{p.path}</span>
+      <span className="text-note text-ink-mute font-mono truncate block max-w-[14rem]" title={p.path}>
+        {p.path}
+      </span>
     ),
   },
   {

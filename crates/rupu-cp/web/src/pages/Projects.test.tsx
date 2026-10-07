@@ -94,6 +94,21 @@ describe('Projects — table rules', () => {
     expect(subjectCell?.querySelector('[title="my-project"]')).toBeInTheDocument();
   });
 
+  it('the name never wraps and the path truncates with the full path on hover', async () => {
+    const long = '/Users/matt/Code/Oracle/some/very/deep/workspace/directory/my-project';
+    vi.spyOn(api, 'getProjects').mockResolvedValue([{ ...ROWS[0], path: long }]);
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText('my-project')).toBeInTheDocument());
+
+    expect(screen.getByText('my-project').className).toMatch(/whitespace-nowrap/);
+    const path = screen.getByTitle(long);
+    expect(path).toHaveTextContent(long);
+    expect(path.className).toMatch(/truncate/);
+    expect(path.className).toMatch(/max-w-\[14rem\]/);
+    expect(path.className).not.toMatch(/max-w-xs/);
+  });
+
   it('the Runs column is a fit (nowrap) column', async () => {
     vi.spyOn(api, 'getProjects').mockResolvedValue(ROWS);
     const { container } = renderPage();
