@@ -39,7 +39,7 @@ rupu cp serve
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--bind <addr>` | `127.0.0.1:7878` | Address and port to listen on. |
-| `--token <token>` | none | Require `Authorization: Bearer <token>` on every `/api/*` route (see [Authentication](#authentication)). |
+| `--token <token>` | none | Require the token on every `/api/*` route — a bearer header, or the browser cookie the printed link sets (see [Authentication](#authentication)). |
 | `--no-open` | off | Don't open the URL in a browser. By default the URL is opened when running in a terminal; it is always printed. |
 | `--max-open-files <N>` | — | Raise the process's open-file limit (overrides `RUPU_MAX_OPEN_FILES` and `[runtime].max_open_files`). |
 
@@ -76,27 +76,42 @@ Without `--token` the API is open to anything that can reach the bind address.
 That is the intended posture on `127.0.0.1`. **Do not bind a non-loopback
 address without a token.**
 
-With `--token`, every `/api/*` route requires:
+With `--token`, every `/api/*` route needs the token, in one of two forms:
 
-```
-Authorization: Bearer <token>
-```
+- **Scripts and peer control planes** send `Authorization: Bearer <token>`.
+- **Browsers** sign in once. The URL `cp serve` prints (and opens) carries
+  `?token=<token>`. Opening it sets a cookie and redirects (303) to the same
+  page without the parameter, so the token leaves the address bar and the
+  history at once. From then on the web UI's requests, live streams included,
+  carry the cookie. To sign another browser in, open
+  `http://<host>:<port>/?token=<token>` there. A wrong token in that link is
+  a 401 and sets nothing.
 
-The token is compared in constant time; a missing or wrong token gets a bare
-`401` with an empty body. `/healthz`, the node WebSocket
+The cookie is `HttpOnly`, `SameSite=Strict`, lasts 30 days, and is named
+`rupu_cp_token_<port>`, so control planes on different ports never overwrite
+each other. Its value is derived from the token (an HMAC), not the token
+itself, and it is refused as a bearer: browsers send `localhost` cookies to
+every port, so another local server could read it, but it never learns the
+token. A write (anything but `GET`/`HEAD`/`OPTIONS`) authenticated by the
+cookie must also carry an `Origin` naming this server, so a page served from
+another origin (another `localhost` port included) can't drive runs with it.
+Behind a reverse proxy, preserve the `Host` header: the cookie name and the
+origin check both read it. Restarting with a different token makes the old
+cookie a 401 until the browser opens the new link.
+
+Tokens are compared in constant time. A missing or wrong one is a `401` with
+the usual `{"error": ...}` body. `/healthz`, the node WebSocket
 (`/api/node/connect`, authenticated by its own enrollment token) and the static
-UI (HTML, JS, client-side routes) stay open.
+UI (HTML, JS, client-side routes) stay open. They hold no data: everything the
+UI shows comes from `/api/*`.
 
 ```sh
 rupu cp serve --bind 127.0.0.1:9100 --token "$CP_TOKEN" --no-open
 curl -H "Authorization: Bearer $CP_TOKEN" http://127.0.0.1:9100/api/runs
 ```
 
-There is no cookie or query-string form of the token. **The browser UI does
-not send a bearer header**, so with `--token` set the page shell loads but its
-API calls fail with 401: `--token` is for scripted API access (peer control
-planes, automation) rather than for securing the web UI. Settings → Runtime
-status only ever shows whether a token is set, never the token.
+The tracing log prints the URL without the token. Settings → Runtime status
+only ever shows whether a token is set, never the token.
 
 ---
 

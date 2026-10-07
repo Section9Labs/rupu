@@ -33,16 +33,22 @@ a peer needs is advertised in `GET /api/host/info` → `features`.
 ### Authentication
 
 Started without `--token`, the API is open. Started with `--token <t>`, every
-`/api/*` route requires the header
+`/api/*` route requires the token, either as the header
 
 ```
 Authorization: Bearer <t>
 ```
 
-compared in constant time. A missing or wrong token is a bare `401` with an
-empty body. There is no cookie or query-parameter form. `/healthz`, the static
-UI and `/api/node/connect` (which authenticates nodes with their own enrollment
-token) are outside the check.
+or as the browser cookie `rupu_cp_token_<port>`. A page load (any non-`/api`
+path) with `?token=<t>` sets that cookie and answers `303` to the same URL
+without the parameter. The cookie's value is derived from the token, not the
+token, and is not accepted as a bearer. A cookie-authenticated request that
+isn't `GET`/`HEAD`/`OPTIONS` must also send an `Origin` matching the `Host` it
+was sent to, or it is a `403`. Comparisons are constant time. A missing or
+wrong token is a `401` with the standard `{"error": ...}` body. `?token=` is
+ignored on `/api` paths. `/healthz`, the static UI and `/api/node/connect`
+(which authenticates nodes with their own enrollment token) are outside the
+check. See [control-plane.md](control-plane.md#authentication).
 
 ```sh
 curl -s -H "Authorization: Bearer $CP_TOKEN" \
@@ -64,10 +70,18 @@ rejected by the framework before the handler runs, with a plain-text 400/415/422
 An unknown `/api/...` path is a JSON 404 (`no API route for /api/...`), never
 the web app.
 
+**Path parameters** (`:id`, `:name`, `:ws_id`, …) are single plain path
+components. Before any handler runs, a request is a 400 if any `/api/*` path
+segment percent-decodes to something that can't be one: `.`, `..` or a name
+starting with `.` or `-`, an encoded `/` or `\`, an encoded `?` or `#`, a
+control character, or an invalid escape. Handlers validate their own
+parameters on top of that.
+
 | Status | Meaning across the API |
 |--------|------------------------|
 | 400 | Bad input: an id or path that fails validation, a bad slug, a malformed query. |
-| 401 | Missing or wrong bearer token. |
+| 401 | Missing or wrong token. |
+| 403 | A cookie-authenticated write from another origin; a `/api/fs/browse` path outside the browsable directories. |
 | 404 | Unknown run / session / finding / host id. |
 | 409 | The request conflicts with current state: approving a run not awaiting approval, deleting a run that isn't finished, resuming a run that isn't paused. |
 | 500 | Internal error, an unreadable store, and — on run **detail** routes — an unreachable remote host. |
@@ -191,7 +205,7 @@ remotely `{ok, host_id}`.
 |--------|------|---------|-------|
 | GET | `/api/events/stream` | SSE firehose, or one run with `run`. | `run`, `host` (a remote host requires `run`). |
 | GET | `/api/events` | Recent step events, newest first, each with `ts` and `pos`. | `limit` (default 200), cursor `before_ts` (unix ms), `before_run`, `before_pos`. Scans the 20 newest runs. |
-| GET | `/api/transcript` | Read a transcript: `{events, summary, unparsed, partial?}`. | `path` (a `.jsonl` under the global dir or a registered workspace), `host`, `run`. A missing local file is an empty 200. For a remote run the coordinator's mirror is served; `partial: true` when the host couldn't be reached to finish it; 502 when unreachable with nothing cached. |
+| GET | `/api/transcript` | Read a transcript: `{events, summary, unparsed, partial?}`. | `path` (a `.jsonl` under the global dir or a registered workspace), `host`, `run`. A missing local file is an empty 200. With `host` naming an SSH, tunnel or bucket host, a path that isn't one of that host's mirrored transcripts must lie under the same local roots (400 otherwise). For a remote run the coordinator's mirror is served; `partial: true` when the host couldn't be reached to finish it; 502 when unreachable with nothing cached. |
 | GET | `/api/transcript/stream` | SSE tail of a transcript. | `path`, `host`, `run` — `run` is required for a remote transcript not mirrored yet. 502 host unreachable. |
 | POST | `/api/transcripts/:id/archive` | Archive a standalone agent-run transcript. | `host`, `ignore_liveness` (skip the "still running" check when a PID was reused). 501 without `cp serve`. |
 | DELETE | `/api/transcripts/:id` | Delete a standalone transcript. | Same parameters. |
@@ -263,12 +277,12 @@ Query language, tags and report export are covered in depth in
 | Method | Path | Purpose | Notes |
 |--------|------|---------|-------|
 | GET | `/api/findings` | Every finding across all workspaces. | Query: `ws_id`, `workflow`, `run_id` (the run plus its direct sub-runs), `customer` (the project's *current* assignment), `q` (query language, e.g. `severity>=high tag:triage`). Rows are slim: no `report` body, a `report_summary` on full-profile rows. Response also carries `summary`, `facets` (counts over the scope-filtered, unqueried set) and `tags_unavailable`. A bad `q` is a 400 `{error, token, code, start, end}`. |
-| GET | `/api/findings/:id` | One finding in full. | Adds per-claim `evidence_status` (`current` / `changed` / `missing` / `unknown`), `tag_history`, `tags_editable`. 404 unknown id. |
-| GET | `/api/findings/:id/export` | One finding as a report file. | `format=md\|html\|pdf` (required). 400 bad format; 501 PDF in a build without the `pdf` feature; 404. |
+| GET | `/api/findings/:id` | One finding in full. | `ws_id`. Adds per-claim `evidence_status` (`current` / `changed` / `missing` / `unknown`), `tag_history`, `tags_editable`. 404 unknown id; **409** when the id exists in several workspaces and no `ws_id` picks one (the message names them). |
+| GET | `/api/findings/:id/export` | One finding as a report file. | `format=md\|html\|pdf` (required), `ws_id`. 400 bad format; 501 PDF in a build without the `pdf` feature; 404; 409 ambiguous id, as above. |
 | POST | `/api/findings/export` | Several findings as one report. | Body `ExportBody`: `format` (required), `title`, `ids`, `ws_id`, `run_id`, `min_severity`, `owner`, `cwe`, `include_summaries`, `split`. Returns `text/markdown`, `text/html`, `application/pdf`, or `application/zip` when `split`; always an attachment with `nosniff`. 404 when nothing matches. |
 | GET | `/api/findings/tags` | Tags in use, most used first. | Query: `ws_id`. |
-| POST | `/api/findings/tags` | Add / remove tags on many findings. | Body `TagChangeInput {finding_ids, add, remove}`; at most 1000 ids. Atomic per workspace; response `TagAcrossResult {workspaces, unknown}`. 404 only when *every* id is unknown. Recorded as `via: cp`. |
-| GET | `/api/findings/:id/artifacts/:sha256` | An artifact or evidence-block file the finding references. | Text inline as `text/plain`, raster images inline as `image/*`, everything else as an attachment; always `nosniff` + `Content-Security-Policy: sandbox`. 404 if the finding doesn't reference it; 409 if a referenced workspace file changed since it was recorded; a remote artifact is pulled from its host on first view, and a failed pull is 404 `{"unavailable": reason}`. |
+| POST | `/api/findings/tags` | Add / remove tags on many findings. | Body `{finding_ids, add, remove}` — each id tagged in every workspace that holds it — or `{findings: [{ws_id, id}], add, remove}` — each finding tagged only in its own workspace (what the web sends). Exactly one of `finding_ids` / `findings`; at most 1000. Atomic per workspace; response `TagAcrossResult {workspaces, unknown}`. 404 only when *every* finding is unknown. Recorded as `via: cp`. |
+| GET | `/api/findings/:id/artifacts/:sha256` | An artifact or evidence-block file the finding references. | `ws_id`; 409 for an ambiguous id, as above. Text inline as `text/plain`, raster images inline as `image/*`, everything else as an attachment; always `nosniff` + `Content-Security-Policy: sandbox`. 404 if the finding doesn't reference it; 409 if a referenced workspace file changed since it was recorded; a remote artifact is pulled from its host on first view, and a failed pull is 404 `{"unavailable": reason}`. |
 | GET | `/api/findings/artifacts/:sha256` | **Host-internal.** Raw blob from this host's artifact store. | Used by a coordinator pulling a remote unit's artifact (`findings.artifact_blob` feature). Not finding-scoped. 404 if not in the store. |
 
 ## Coverage and assets
@@ -378,7 +392,7 @@ and pulls back the diff. The web UI never calls these.
 | POST | `/api/models/refresh` | Refetch provider model lists. | Body `{provider?}`; empty = all. 10 s per provider. 400 unknown provider. |
 | GET | `/api/tools` | MCP tool catalog with JSON input schemas (`ToolsResponse`). | Feeds the workflow editor's action forms. |
 | GET | `/api/repos` | Repositories visible to the configured SCM accounts. | 501 with no SCM credentials. |
-| GET | `/api/fs/browse` | Subdirectories of a server path, for the folder picker. | `path` (default `$HOME`). Lists **any** directory on the server — another reason to keep the API on loopback or behind a token. |
+| GET | `/api/fs/browse` | Subdirectories of a server path, for the folder picker. | `path` (default `$HOME`). Only under `$HOME` or a registered project: anything else (missing or not) is a 403, and `parent` is `null` at the top of a browsable directory. |
 
 ## Customers
 
