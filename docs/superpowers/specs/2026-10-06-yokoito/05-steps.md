@@ -276,7 +276,7 @@ Every failure is an `Error` value (§2.7) with a dotted `type`. Error types form
 - Every other block re-raises it to its own parent.
 - At the machine root, it fails the instance: `run.status = failed`, `run.outcome = failed`, and the error is recorded.
 
-**The rupu mapping.** The agentic families correspond one-to-one with rupu's `OutcomeClass`. rupu's recovery ladder (retry on the same provider, then a fallback provider, then fail with a hint) runs **inside** one attempt of an agent step. Only what the ladder cannot recover reaches weft as an error, and that error carries the ladder's hint in `data`.
+**The rupu mapping.** The agentic families correspond one-to-one with rupu's `OutcomeClass`. rupu's recovery ladder (retry on the same provider, then a fallback provider, then fail with a hint) runs **inside** one attempt of an agent step. Only what the ladder cannot recover reaches yokoito as an error, and that error carries the ladder's hint in `data`.
 
 ## 5.6 Step results
 

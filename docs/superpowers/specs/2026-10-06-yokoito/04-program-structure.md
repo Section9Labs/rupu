@@ -6,15 +6,15 @@
 |---|---|---|
 | **machine file** | exactly one `machine`, plus any `enum`, `type`, `event`, `flow` and `test` items | runnable |
 | **library file** | `enum`, `type`, `event`, `flow` and `test` items only | importable, not runnable |
-| **test file** (`*.test.weft`) | `import`s plus `test` items | run by `weft test` |
+| **test file** (`*.test.yoko`) | `import`s plus `test` items | run by `yoko test` |
 
 ## 4.2 Imports
 
 ```
-import "./lib/review.weft"                 // brings every top-level item into scope
-import "./lib/review.weft" as rv           // namespaced: rv.review(...), rv.Review
+import "./lib/review.yoko"                 // brings every top-level item into scope
+import "./lib/review.yoko" as rv           // namespaced: rv.review(...), rv.Review
 import agentic/panel                       // an extension's standard library module
-import schema "triage_v1" as Triage        // JSON Schema → weft type (§2.7)
+import schema "triage_v1" as Triage        // JSON Schema → yokoito type (§2.7)
 ```
 
 - Relative paths resolve from the importing file.
@@ -33,7 +33,7 @@ machine kitchen_sink
 version "3"                                  // optional human label; identity is the IR hash
 uses agentic                                 // extensions (comma-separated)
 
-import "./lib/review.weft"
+import "./lib/review.yoko"
 
 enum  Severity { low, medium, high, critical }
 type  Triage   { actionable: bool, files: list<string>, summary: string }
@@ -75,7 +75,7 @@ input {
 }
 ```
 - A field with no default is required.
-- Inputs come from `weft run --input k=v`, from trigger `with { }` mappings, from the CP launcher form, and from `call machine` arguments.
+- Inputs come from the host's run command (rupu: `rupu workflow run <name> --input k=v`), from trigger `with { }` mappings, from the CP launcher form, and from `call machine` arguments.
 - Values are validated against the declared types when the machine starts, so a bad input fails the start before any work runs.
 
 ### `output`

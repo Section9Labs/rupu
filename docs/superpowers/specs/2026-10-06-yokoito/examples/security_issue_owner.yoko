@@ -7,7 +7,7 @@ machine security_issue_owner
 version "1"
 uses agentic
 
-import "./lib/autoflow.weft"                    // Outcome, OutcomeStatus, Dispatch
+import "./lib/autoflow.yoko"                    // Outcome, OutcomeStatus, Dispatch
 
 instance per issue keyed entity.ref {
   select {

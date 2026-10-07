@@ -1,7 +1,7 @@
-# weft: a state-machine language for complex agentic workflows
+# yokoito: a state-machine language for complex agentic workflows
 
 **Status:** design spec. Approved section by section on 2026-10-06; awaiting a full read.
-**Working name:** "weft". On a loom, the *warp* is the fixed structure and the *weft* is the thread woven through it. Here the machine definition is the warp, and execution forks and rejoins through it like the weft. The name is a placeholder until the repo is created (see [Open questions](#open-questions)).
+**Name:** yokoito, 横糸 in Japanese: "weft", the thread woven across the loom. Decided 2026-10-06 after "weft" turned out to be taken in this domain. See the [README](README.md) for the naming story. Crates are `yokoito` and `yokoito-*`, the CLI is `yoko`, source files are `.yoko`, and npm packages use `@yokoito/`. All were free when checked on 2026-10-06.
 **Home:** this spec lives in the rupu repo until the library's own repository exists, and moves there when it does.
 
 ---
@@ -16,7 +16,7 @@ rupu has three ways to define automated work, and each hard-codes a different sl
 | **Autoflows** (`autoflow:` block) | a long-lived, per-issue lifecycle | a 9-state machine hidden in ~300 lines of if/else in the autoflow tick; leases never renew; no attempt cap; `autoflow.enabled` is overloaded |
 | **Agentiflows** (`.rupu/agentiflows/*.yaml`) | a goal-directed round loop | a fixed Rust loop with a fixed stop order; no phases, checkpoints or human steps; no resume |
 
-All three are state machines. **weft** is one language, with one engine, that expresses all three, and expresses far more than any of them can today.
+All three are state machines. **yokoito** is one language, with one engine, that expresses all three, and expresses far more than any of them can today.
 
 ## 2. Goals
 
@@ -30,7 +30,7 @@ All three are state machines. **weft** is one language, with one engine, that ex
 ## 3. Non-goals
 
 - No implementation code in this spec. That comes in the plans listed in §6.
-- No general-purpose programming language. weft has no user-defined recursion in expressions, no I/O in expressions, and no unbounded loops.
+- No general-purpose programming language. yokoito has no user-defined recursion in expressions, no I/O in expressions, and no unbounded loops.
 - No compatibility layer for legacy YAML. This is a deliberate clean break (§5, decision 1).
 - No macOS app work. The app is deprecated.
 
@@ -38,6 +38,7 @@ All three are state machines. **weft** is one language, with one engine, that ex
 
 | Chapter | Contents |
 |---|---|
+| [README](README.md) | what yokoito is, why it's called that, a taste of the language, the crate list |
 | [01 Rationale & research](01-rationale-and-research.md) | what we studied (XState/SCXML, LangGraph and agent frameworks, Temporal/Restate/Step Functions/Serverless Workflow/BPMN, the Rust ecosystem) and what we took from each |
 | [02 Lexical structure & types](02-lexical-and-types.md) | tokens, literals, names, the type system |
 | [03 Expressions & templates](03-expressions-and-templates.md) | the expression language, standard library, prose templates |
@@ -48,11 +49,11 @@ All three are state machines. **weft** is one language, with one engine, that ex
 | [08 Runtime semantics & IR](08-semantics-and-ir.md) | the pure stepper, durable engine, journal, cancellation, versioning, the IR |
 | [09 Extensions & the agentic extension](09-extensions-and-agentic.md) | the extension contract and the full agentic catalogue |
 | [10 Tooling](10-tooling.md) | CLI, formatter, lint catalogue, LSP, VS Code extension, tests, rendering, WASM |
-| [11 rupu integration](11-rupu-integration.md) | how rupu adopts weft; CP editor and graph; migration |
+| [11 rupu integration](11-rupu-integration.md) | how rupu adopts yokoito; CP editor and graph; migration |
 | [A Grammar](A-grammar.md) | the complete EBNF grammar |
-| [B Workflow Patterns coverage](B-workflow-patterns.md) | all 43 control-flow patterns, in weft |
-| [C Legacy parity](C-legacy-parity.md) | every legacy rupu feature → its weft form |
-| [examples/](examples/) | `kitchen_sink.weft`, `security_issue_owner.weft`, `pr_shepherd.weft`, `vuln_hunt.weft`, and the legacy kitchen-sink fixture |
+| [B Workflow Patterns coverage](B-workflow-patterns.md) | all 43 control-flow patterns, in yokoito |
+| [C Legacy parity](C-legacy-parity.md) | every legacy rupu feature → its yokoito form |
+| [examples/](examples/) | `kitchen_sink.yoko`, `security_issue_owner.yoko`, `pr_shepherd.yoko`, `vuln_hunt.yoko`, and the legacy kitchen-sink fixture |
 
 ## 5. Decisions log
 
@@ -60,7 +61,7 @@ These were made during the 2026-10-06 design session. Each one is load-bearing.
 
 | # | Decision | Why |
 |---|---|---|
-| 1 | **A clean break, not a compatibility layer.** Legacy files are migrated with a Claude skill that loops on `weft check`. The legacy kitchen-sink becomes entry #1 of a behavioural-equivalence test corpus. | A permanent legacy compiler costs more than one migration. The corpus replaces the "compiler as coverage proof" argument. |
+| 1 | **A clean break, not a compatibility layer.** Legacy files are migrated with a Claude skill that loops on `yoko check`. The legacy kitchen-sink becomes entry #1 of a behavioural-equivalence test corpus. | A permanent legacy compiler costs more than one migration. The corpus replaces the "compiler as coverage proof" argument. |
 | 2 | **A clean core plus an optional agentic extension, shipped from the same repo.** | The core forces the right abstractions; the extension stops every host from reinventing "an agent step". |
 | 3 | **A purpose-built text language, with a canonical JSON IR.** YAML is not a surface. | YAML hid the flow and forced `${ }`/quoting rules. A purpose-built syntax reads like the flow it describes, in about 40% fewer lines than YAML for the kitchen-sink. |
 | 4 | **Two layers in one language.** `flow { }` for pipelines, `state` for lifecycles. They nest both ways. | Pipelines and lifecycles read differently. Forcing either into the other's shape costs readability. |
@@ -75,13 +76,13 @@ These were made during the 2026-10-06 design session. Each one is load-bearing.
 
 This spec is sub-project 1. Each item below gets its own implementation plan (`superpowers:writing-plans`), executed in order:
 
-1. **Syntax, IR and checker.** `weft-syntax` (lexer, lossless CST, parser, formatter), `weft-ir`, `weft-check`, `weft-cli` (`fmt`/`check`/`lower`/`ir`/`render`).
-2. **Core stepper.** `weft-core`: SCXML semantics plus dynamic regions; deterministic; property-tested.
-3. **Durable engine.** `weft-engine`: journal, snapshots, recovery, timers, instances, locks; JSONL store adapter.
-4. **Agentic extension.** `weft-agentic`: manifest, lowering rules, handler traits, `agent`/`tool`/`run`/`approve`/`ask`, `best_of`/`vote`/`pursue`, usage dimensions for core `budget`.
-5. **Tooling.** `weft-ide` (shared analysis), `weft-lsp`, `weft-wasm`, `weft-test` (`test` blocks + `simulate`), the VS Code extension (TextMate grammar + LSP client + live graph preview + Test Explorer), the tree-sitter grammar, and the lint catalogue.
+1. **Syntax, IR and checker.** `yokoito-syntax` (lexer, lossless CST, parser, formatter), `yokoito-ir`, `yokoito-check`, `yokoito-cli` (the `yoko` binary: `fmt`/`check`/`lower`/`ir`/`render`).
+2. **Core stepper.** `yokoito-kernel`: SCXML semantics plus dynamic regions; deterministic; property-tested.
+3. **Durable engine.** `yokoito-engine`: journal, snapshots, recovery, timers, instances, locks; JSONL store adapter.
+4. **Agentic extension.** `yokoito-agentic`: manifest, lowering rules, handler traits, `agent`/`tool`/`run`/`approve`/`ask`, `best_of`/`vote`/`pursue`, usage dimensions for core `budget`.
+5. **Tooling.** `yokoito-ide` (shared analysis), `yokoito-lsp`, `yokoito-wasm`, `yokoito-test` (`test` blocks + `simulate`), the VS Code extension (TextMate grammar + LSP client + live graph preview + Test Explorer), the tree-sitter grammar, and the lint catalogue.
 6. **rupu integration:**
-   - **6a:** `rupu-weft` host (ports over rupu-agent, rupu-mcp, run steps, fleet, claim store, `cp serve`)
+   - **6a:** `rupu-yokoito` host (ports over rupu-agent, rupu-mcp, run steps, fleet, claim store, `cp serve`)
    - **6b:** workflow cut-over and deletion of the legacy engine
    - **6c:** autoflows as instance machines
    - **6d:** agentiflows as `pursue` machines
@@ -92,7 +93,7 @@ This spec is sub-project 1. Each item below gets its own implementation plan (`s
 
 | Term | Meaning |
 |---|---|
-| **machine** | a compiled weft program; its definition is identified by the hash of its IR |
+| **machine** | a compiled yokoito program; its definition is identified by the hash of its IR |
 | **instance** | one running (or waiting) execution of a machine, with its own journal |
 | **flow** | a top-to-bottom pipeline body, or a reusable named sub-flow (`flow name(...)`) |
 | **step** | one statement in a flow; a leaf step performs a single operation |
@@ -107,7 +108,7 @@ This spec is sub-project 1. Each item below gets its own implementation plan (`s
 
 ## Open questions
 
-1. **Name.** "weft" is a placeholder; check crates.io and GitHub before choosing.
+1. ~~Name~~: decided: **yokoito** (crates `yokoito`/`yokoito-*`, CLI `yoko`, files `.yoko`, npm `@yokoito/*`).
 2. **Repository.** Where it lives (e.g. `Section9Labs/<name>`) and its license. MIT/Apache-2.0 dual licensing is suggested, to match the Rust ecosystem.
 3. **rupu CLI surface.** Keep `rupu workflow …` as the umbrella for all machines, or introduce `rupu machine …` / `rupu instance …`. To be decided in plan 6a.
 4. **Numeric defaults.** Snapshot interval, cancel grace period, the per-map item ceiling and the blob threshold. To be decided in plans 2–3, with benchmarks.

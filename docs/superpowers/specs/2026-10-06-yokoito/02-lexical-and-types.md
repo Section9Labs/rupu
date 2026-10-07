@@ -2,7 +2,7 @@
 
 ## 2.1 Source text
 
-- **Encoding.** Files are UTF-8, use the extension `.weft`, and have no byte-order mark.
+- **Encoding.** Files are UTF-8, use the extension `.yoko`, and have no byte-order mark.
 - **Whitespace is insignificant** except for newlines, which end statements (§2.6). Indentation is a formatter convention, not syntax.
 - **Case.** Keywords are lower-case and reserved (§2.3). Identifiers are case-sensitive.
 
@@ -78,7 +78,7 @@ Extensions add contextual keyword spellings (§9.2). The `agentic` extension add
 | list | `[a, b, c]` | `list<T>` | trailing comma allowed |
 | record | `{ file: f, hits: 3 }` | record | keys are value names or `"quoted strings"`; shorthand `{ file }` means `{ file: file }` |
 
-**Interpolation is lexed in expression mode.** Inside `{{ … }}` and `{% … %}`, the lexer switches to expression mode, tracking nesting depth (as Swift and Kotlin do), so expression string literals don't end the enclosing string: `"by {{ names | join(", ") }}"` is one string. weft has no single-quoted strings; `'…'` appears only inside command literals.
+**Interpolation is lexed in expression mode.** Inside `{{ … }}` and `{% … %}`, the lexer switches to expression mode, tracking nesting depth (as Swift and Kotlin do), so expression string literals don't end the enclosing string: `"by {{ names | join(", ") }}"` is one string. yokoito has no single-quoted strings; `'…'` appears only inside command literals.
 
 **Dedent rule for `"""`:**
 1. The opening `"""` must end its line, and the closing `"""` must start its own line.
@@ -164,13 +164,13 @@ type Triage {
 - **Inference.** `let`, step bindings and `var`s with initialisers infer their type. `input` fields, `var`s without initialisers, and `flow` parameters must be annotated.
 - **Generics.** There are no user-defined generics. The only parameterised types are the built-ins listed above.
 - **Optional bindings.** A step binding is `T?` when the step may not produce a value: it is guarded by `if`, has `on_error continue` or a catch that falls through, or is a race or join loser. The checker requires handling the null before use (`x ?? default`, `x?.f`, `if x != null`).
-- **JSON Schema import.** `import schema "triage_v1" as Triage` turns a JSON Schema (draft-07+) into a weft type. Unsupported schema features (`patternProperties`, conditional schemas) become `json` for the affected field, with a warning.
+- **JSON Schema import.** `import schema "triage_v1" as Triage` turns a JSON Schema (draft-07+) into a yokoito type. Unsupported schema features (`patternProperties`, conditional schemas) become `json` for the affected field, with a warning.
 
 ### JSON mapping (IR, journals, effect payloads)
-| weft | JSON |
+| yokoito | JSON |
 |---|---|
 | `int`, `float`, `bool`, `string`, `null` | native |
-| `duration` | string in weft syntax: `"1h30m"` |
+| `duration` | string in yokoito syntax: `"1h30m"` |
 | `time` | RFC 3339 string: `"2026-10-06T09:00:00Z"` |
 | enum | string: `"high"` |
 | record, `map<T>` | object |

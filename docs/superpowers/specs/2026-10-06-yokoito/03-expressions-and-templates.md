@@ -1,12 +1,12 @@
 # 03. Expressions and templates
 
-weft has **one** expression language. It is used in guards (`if`, `until`, `when`), step options and tool arguments, assignments, outputs, and inside prose templates. Expressions are:
+yokoito has **one** expression language. It is used in guards (`if`, `until`, `when`), step options and tool arguments, assignments, outputs, and inside prose templates. Expressions are:
 
 - **pure.** No side effects. `now()`, `uuid()` and `random()` are deterministic per macrostep (§3.5).
 - **total.** Every expression terminates, because there are no loops or user recursion. Evaluation that goes wrong (division by zero, an out-of-range index) raises a typed `expression.*` error.
 - **typed.** They are checked at compile time against declared and inferred types. There is no truthiness.
 
-The semantics follow CEL (Common Expression Language). The surface syntax is weft's own, chosen for readability.
+The semantics follow CEL (Common Expression Language). The surface syntax is yokoito's own, chosen for readability.
 
 ## 3.1 Operators and precedence
 
@@ -141,7 +141,7 @@ Every string literal except raw strings is a template.
 - `{{ expr }}` evaluates an expression with the same language and scope as anywhere else, then renders it:
   - strings verbatim
   - numbers and booleans in canonical form
-  - durations and times in weft and RFC 3339 syntax
+  - durations and times in yokoito and RFC 3339 syntax
   - `null` as the empty string
   - records and lists as compact JSON
 - `\{{` writes a literal `{{`.

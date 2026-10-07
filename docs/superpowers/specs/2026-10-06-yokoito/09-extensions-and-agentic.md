@@ -12,13 +12,13 @@ An extension is a Rust crate that provides three things:
 
 ```mermaid
 flowchart LR
-  subgraph EXT[weft-agentic]
+  subgraph EXT[yokoito-agentic]
     MAN[manifest] ; LOWR[lowering rules] ; TR[handler traits]
   end
-  MAN --> CHK[weft-check / weft-ide]
+  MAN --> CHK[yokoito-check / yokoito-ide]
   LOWR --> IR[core IR]
-  IR --> CORE[weft-core]
-  TR --> HOST["host handlers (rupu-weft)"]
+  IR --> CORE[yokoito-kernel]
+  TR --> HOST["host handlers (rupu-yokoito)"]
   CORE -- "Invoke{kind: agentic.*}" --> HOST
 ```
 
@@ -54,7 +54,7 @@ pub struct StepSpec {
 ```
 
 - **The grammar is fixed.** Every step and block uses the uniform shape (§5.1). A `BlockSpec` adds a body, named sub-sections (like `pursue`'s `round { }`) and `on <hook>` clauses. The parser accepts any keyword in uniform shape, and the checker validates it against the manifest.
-- **Host catalogues.** An extension can declare catalogues that the host must supply, such as `agents`, `tools` and `events`. The host provides them through `weft.toml`'s `catalog` command (§10.4). The checker uses them to resolve `@agents`, check tool arguments against the tool's schema, and know event payload types.
+- **Host catalogues.** An extension can declare catalogues that the host must supply, such as `agents`, `tools` and `events`. The host provides them through `yoko.toml`'s `catalog` command (§10.4). The checker uses them to resolve `@agents`, check tool arguments against the tool's schema, and know event payload types.
 
 ---
 

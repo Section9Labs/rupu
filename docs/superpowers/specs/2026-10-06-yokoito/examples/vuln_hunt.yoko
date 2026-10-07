@@ -1,4 +1,4 @@
-// An agentiflow as a weft machine. The fixed Rust envelope loop becomes a
+// An agentiflow as a yokoito machine. The fixed Rust envelope loop becomes a
 // `pursue` block; the AgentiflowDef fields become agentic top-level blocks.
 
 /// Lead-driven fleet hunt for exploitable memory-safety bugs.

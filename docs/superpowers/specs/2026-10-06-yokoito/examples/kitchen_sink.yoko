@@ -1,4 +1,4 @@
-// The legacy kitchen-sink (examples/legacy/kitchen-sink.yaml) in weft.
+// The legacy kitchen-sink (examples/legacy/kitchen-sink.yaml) in yokoito.
 // Parity corpus entry #1: the tests at the bottom pin the legacy behaviour.
 
 /// Triage a security issue, investigate in parallel, patch in a loop with a
@@ -7,7 +7,7 @@ machine kitchen_sink
 version "1"
 uses agentic
 
-import "./lib/autoflow.weft"                   // Outcome, OutcomeStatus
+import "./lib/autoflow.yoko"                   // Outcome, OutcomeStatus
 
 enum Severity { low, medium, high, critical }
 

@@ -1,6 +1,6 @@
 # 01. Rationale and research
 
-Before designing weft we surveyed rupu's three definition languages and four bodies of prior art. This chapter records what we found and what we took from each source, so later readers can see why each design choice was made.
+Before designing yokoito we surveyed rupu's three definition languages and four bodies of prior art. This chapter records what we found and what we took from each source, so later readers can see why each design choice was made.
 
 ## 1.1 What rupu has today
 
@@ -62,14 +62,14 @@ Sources:
   - exit deepest-first, enter outermost-first
 - **Invocations start only at the end of a macrostep.** A state passed through within one macrostep never launches its work. This matters when that work is an expensive LLM call.
 - **`done.*` and `error.*` as ordinary events.** Joins and error routing then need no special machinery.
-- **Invoke vs spawn.** Invoke is scoped to its state; spawn creates a dynamic collection. weft's *dynamic regions* (ch. 08) generalise spawn within one instance.
+- **Invoke vs spawn.** Invoke is scoped to its state; spawn creates a dynamic collection. yokoito's *dynamic regions* (ch. 08) generalise spawn within one instance.
 - **Three transition flavours:** targetless, targeted, and `reenter`.
 - **XState v6's durable contract:** a pure stepper, effects with stable IDs, host-owned timers, single-writer instances, and deduplication of stale completions.
 
 **Avoided:**
 - XState's fragile persistence: an invalid snapshot yields an unusable actor, and versioning was bolted on later.
 - Positional effect IDs, which silently misalign when a definition changes.
-- Hand-writing statecharts for simple pipelines. Their main criticism is verbosity, which weft's flow layer exists to fix.
+- Hand-writing statecharts for simple pipelines. Their main criticism is verbosity, which yokoito's flow layer exists to fix.
 
 ## 1.3 Agent-graph frameworks
 
@@ -81,18 +81,18 @@ Sources:
 
 What the field converged on: typed state with merge rules, checkpoints at step boundaries keyed by instance, interrupt-then-resume for human-in-the-loop, dynamic fan-out with a reducing join, per-node retry/timeout/error handlers, and a step-count recursion limit.
 
-**Pitfalls weft designs out:**
+**Pitfalls yokoito designs out:**
 - **Unscoped joins.** LangGraph has three subtly different join behaviours:
   - an AND-join that silently never fires when a branch was skipped
   - a join that fires once per super-step
   - a global `defer` barrier
 
-  In weft, every join belongs to the block that opened it, and skipped branches don't count (pydantic-graph's fork-stack lesson).
-- **Re-running the node on resume.** LangGraph and Mastra re-execute the whole node and match interrupts by call order. weft journals effects and resumes them by structural ID.
-- **Durability as a performance knob.** weft's default is correct (journal before dispatch), with an opt-in `ephemeral` mode.
-- **Parallelism and persistence pulling apart.** pydantic-graph's beta graph isn't persisted at all, and Burr can't combine parallelism with typed state. In weft, map items are journaled units with their own identity.
+  In yokoito, every join belongs to the block that opened it, and skipped branches don't count (pydantic-graph's fork-stack lesson).
+- **Re-running the node on resume.** LangGraph and Mastra re-execute the whole node and match interrupts by call order. yokoito journals effects and resumes them by structural ID.
+- **Durability as a performance knob.** yokoito's default is correct (journal before dispatch), with an opt-in `ephemeral` mode.
+- **Parallelism and persistence pulling apart.** pydantic-graph's beta graph isn't persisted at all, and Burr can't combine parallelism with typed state. In yokoito, map items are journaled units with their own identity.
 - **State bloat.** Large values go to a blob store, and the journal holds references.
-- **Weak timers and concurrent input.** Most frameworks have no durable timers and no policy for input that arrives mid-run. weft has durable timers and an `inbox` policy per instance (LangGraph's "double-texting").
+- **Weak timers and concurrent input.** Most frameworks have no durable timers and no policy for input that arrives mid-run. yokoito has durable timers and an `inbox` policy per instance (LangGraph's "double-texting").
 
 **labgraph** is an archived (November 2024) real-time sensor pub/sub framework with no control flow or persistence. It is not relevant.
 
@@ -108,7 +108,7 @@ Sources:
 
 **Taken:**
 
-| From | Idea | Where in weft |
+| From | Idea | Where in yokoito |
 |---|---|---|
 | Temporal | event-sourced history; effects recorded as scheduled then completed; continue-as-new; per-instance version pinning | ch. 08 journal, `restart with`, versioning |
 | Restate | keyed single-writer *virtual objects*; awakeables vs named signals | `instance keyed …`, inbox; `wait for` vs `send` |
@@ -120,7 +120,7 @@ Sources:
 | Kestra / Windmill | scoped `errors`/`finally`; approvals with N-of-M, forms, no self-approval | `try`/`finally`; `approve (quorum, approvers, form)` |
 | Workflow Patterns | the expressiveness yardstick | Appendix B |
 
-**The trade-off of a declarative language.** A declarative language gives up arbitrary code, functions and types. It gains static analysis, visualisation, safe versioning and migration checks, no determinism bugs in user code, and definitions that can be stored and diffed. weft keeps those gains and closes most of the losses:
+**The trade-off of a declarative language.** A declarative language gives up arbitrary code, functions and types. It gains static analysis, visualisation, safe versioning and migration checks, no determinism bugs in user code, and definitions that can be stored and diffed. yokoito keeps those gains and closes most of the losses:
 - typed expressions with a rich standard library
 - reusable `flow`s and imports
 - in-language types
@@ -145,7 +145,7 @@ The same kitchen-sink workflow, counted in non-comment lines:
 |---|---|
 | legacy YAML | 178 |
 | the new semantics expressed in YAML | 189 |
-| weft text | 109 |
+| yokoito source (`.yoko`) | 109 |
 
 Line count isn't the main point. YAML forces expressions into strings, gives no visual sense of the flow, and makes nested blocks hard to follow. A purpose-built syntax reads in the shape of the flow.
 
@@ -154,4 +154,4 @@ The cost is a parser, formatter, LSP and highlighter, which is bounded and paid 
 **Alternatives rejected:**
 - **HCL, KDL, Pkl, CUE.** No sequential statements, so pipelines degrade into nested blocks.
 - **Starlark or TypeScript code that builds a machine.** One-way: the visual editor can't write changes back, and authors can break determinism.
-- **The Dagger lesson.** Dagger dropped CUE because users would not learn a *general* language. weft is narrow and shaped to its domain, closer to SQL or HCL.
+- **The Dagger lesson.** Dagger dropped CUE because users would not learn a *general* language. yokoito is narrow and shaped to its domain, closer to SQL or HCL.

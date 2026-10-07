@@ -1,10 +1,10 @@
-# Appendix C. Legacy parity: every rupu feature and its weft form
+# Appendix C. Legacy parity: every rupu feature and its yokoito form
 
-This table drives the migration skill (§11.9) and the parity corpus. The worked end-to-end example is `examples/legacy/kitchen-sink.yaml` (which parses under rupu 0.82) against `examples/kitchen_sink.weft`.
+This table drives the migration skill (§11.9) and the parity corpus. The worked end-to-end example is `examples/legacy/kitchen-sink.yaml` (which parses under rupu 0.82) against `examples/kitchen_sink.yoko`.
 
 ## C.1 Workflows
 
-| Legacy (YAML) | weft | Behaviour change |
+| Legacy (YAML) | yokoito | Behaviour change |
 |---|---|---|
 | `name:` / `description:` | `machine <name>` + `///` doc comment | |
 | `trigger: {on: manual}` | `trigger manual` | Multiple triggers are now allowed. |
@@ -55,7 +55,7 @@ This table drives the migration skill (§11.9) and the parity corpus. The worked
 
 ## C.2 Autoflows
 
-| Legacy | weft |
+| Legacy | yokoito |
 |---|---|
 | `autoflow.enabled: true` on a workflow | a separate machine with `instance per <entity> keyed entity.ref { … }` |
 | `autoflow.entity: issue \| pull_request`, `claim.key: pr_head_sha` | `instance per issue` / `per pull_request` / `per pr_head` |
@@ -66,7 +66,7 @@ This table drives the migration skill (§11.9) and the parity corpus. The worked
 | `reconcile_every: 30m` | `after 30m -> working` |
 | `claim.ttl` | `lease 4h, renew while active` (now actually renewed) |
 | `workspace: {strategy, branch}` | `workspace worktree, branch "…"` |
-| `outcome.output` + `autoflow_outcome_v1` | `do call machine work(…)` + `on done if output.status == "…" -> state` (`Outcome` type in `lib/autoflow.weft`) |
+| `outcome.output` + `autoflow_outcome_v1` | `do call machine work(…)` + `on done if output.status == "…" -> state` (`Outcome` type in `lib/autoflow.yoko`) |
 | `ClaimStatus` Claimed / Running | `working` state (activity running) |
 | AwaitHuman | implicit: the child machine is waiting at its `approve`. The owner stays `working`. |
 | AwaitExternal | an `awaiting_external` state with `on` transitions and an `after` give-up |
@@ -81,7 +81,7 @@ This table drives the migration skill (§11.9) and the parity corpus. The worked
 
 ## C.3 Agentiflows
 
-| Legacy (`AgentiflowDef`) | weft |
+| Legacy (`AgentiflowDef`) | yokoito |
 |---|---|
 | `name`, `description` | `machine` + `///` |
 | `lead` | the agent in `pursue`'s `round { agent @lead … }` |
@@ -99,4 +99,4 @@ This table drives the migration skill (§11.9) and the parity corpus. The worked
 
 ## C.4 Worked example
 
-See [`examples/legacy/kitchen-sink.yaml`](examples/legacy/kitchen-sink.yaml) next to [`examples/kitchen_sink.weft`](examples/kitchen_sink.weft). The weft file ends with the `test` blocks that pin the legacy behaviour (parity corpus entry #1).
+See [`examples/legacy/kitchen-sink.yaml`](examples/legacy/kitchen-sink.yaml) next to [`examples/kitchen_sink.yoko`](examples/kitchen_sink.yoko). The yokoito file ends with the `test` blocks that pin the legacy behaviour (parity corpus entry #1).

@@ -1,14 +1,14 @@
 # 11. rupu integration (plan 6, sub-plans 6a–6f)
 
-rupu becomes a **weft host**. It implements the engine ports, supplies the agentic effect handlers and catalogues, and renders machines and instances in the CLI and the CP. The legacy workflow engine, the autoflow claim logic and the agentiflow envelope loop are deleted once the parity corpus passes.
+rupu becomes a **yokoito host**. It implements the engine ports, supplies the agentic effect handlers and catalogues, and renders machines and instances in the CLI and the CP. The legacy workflow engine, the autoflow claim logic and the agentiflow envelope loop are deleted once the parity corpus passes.
 
 ```mermaid
 flowchart TB
-  subgraph WEFT["weft library (own repo)"]
-    CORE[weft-core] --- ENG[weft-engine] --- AG[weft-agentic] --- IDE[weft-ide / wasm / lsp]
+  subgraph YOKO["yokoito library (own repo)"]
+    CORE[yokoito-kernel] --- ENG[yokoito-engine] --- AG[yokoito-agentic] --- IDE[yokoito-ide / wasm / lsp]
   end
   subgraph RUPU[rupu]
-    HOST[rupu-weft: ports + handlers]
+    HOST[rupu-yokoito: ports + handlers]
     CLI[rupu-cli]
     CP[rupu-cp + web]
     AGENT[rupu-agent / rupu-runtime]
@@ -23,7 +23,7 @@ flowchart TB
   IDE --> CP
 ```
 
-## 11.1 Sub-plan 6a: the `rupu-weft` host crate
+## 11.1 Sub-plan 6a: the `rupu-yokoito` host crate
 
 | Port | rupu implementation |
 |---|---|
@@ -38,14 +38,14 @@ flowchart TB
 | `TimerService` | In-process timers for the instance's driver, plus a durable timer index read by the `cp serve` sweep. This **replaces the gate sweep**: an approval timeout is now just a timer. |
 | `EventBus` | Webhook server, poll sources and the wake queue (`rupu-runtime::wake`) become the inbox feeders; `emit` is routed to triggered machines. |
 | `LockService` | Local file locks and semaphores; CP-coordinated locks for fleet-wide names. |
-| `CacheStore` / `BlobStore` | `<global>/cache/weft/` and the content-addressed store at `<global>/blobs/`. |
+| `CacheStore` / `BlobStore` | `<global>/cache/yokoito/` and the content-addressed store at `<global>/blobs/`. |
 | `Policy` | Permission modes (`readonly` refuses write tools and `run`), the author gate for entity machines (fail-closed), the run-step allowlist, and `scope.authorized` for `pursue`. |
 | `Observer` | Writes `events.jsonl` (a new run event schema, v3: observations keyed by structural id), feeds the CP SSE and the CLI live view, and keeps the usage ledger. |
 
 **Who drives an instance.**
 - **The CLI** (`rupu workflow run`) drives it in the foreground.
 - **`cp serve`** runs an **engine worker pool** that holds leases on detached instances: launched from the CP, triggered, entity owners, and resumed runs.
-- **Operator commands** are **inbox inputs**, not signals, addressed by instance id. Cancel, pause and resume are engine commands (§8.6); approve, reject and steer are events. Whoever holds the lease processes them. Whoever holds the lease processes them. This removes today's SIGTERM-to-`runner_pid` and marker-file paths for weft instances. A dead lease holder is recovered by any worker taking the expired lease, which also replaces orphan reaping.
+- **Operator commands** are **inbox inputs**, not signals, addressed by instance id. Cancel, pause and resume are engine commands (§8.6); approve, reject and steer are events. Whoever holds the lease processes them. Whoever holds the lease processes them. This removes today's SIGTERM-to-`runner_pid` and marker-file paths for yokoito instances. A dead lease holder is recovered by any worker taking the expired lease, which also replaces orphan reaping.
 
 ## 11.2 The CLI surface
 
@@ -60,8 +60,8 @@ Command naming is open question #3 in the index, decided in plan 6a. The capabil
 | cancel / pause / resume | as today; implemented as inbox inputs |
 | instances of entity machines | `rupu workflow instances [<machine>]`: key, state, lease, since |
 | upgrade / migrate | `rupu workflow upgrade <machine> --to latest` |
-| authoring | `rupu workflow check/fmt/test/render`, delegating to `weft-ide` |
-| host catalogue | `rupu catalog --json` (used by `weft.toml`) |
+| authoring | `rupu workflow check/fmt/test/render`, delegating to `yokoito-ide` |
+| host catalogue | `rupu catalog --json` (used by `yoko.toml`) |
 
 ## 11.3 Event vocabulary
 
@@ -87,7 +87,7 @@ The `entity` binding carries: `ref`, `repo`, `number`, `title`, `url`, `state`, 
 
 ## 11.5 Sub-plan 6b: workflows cut over
 
-1. `.rupu/workflows/*.weft` (project) and `~/.rupu/workflows/*.weft` (global) are discovered by `weft.toml` roots.
+1. `.rupu/workflows/*.yoko` (project) and `~/.rupu/workflows/*.yoko` (global) are discovered by `yoko.toml` roots.
 2. A legacy `*.yaml` workflow is **refused**, with a message pointing at the migration skill. Refused files are listed by `rupu workflow list --legacy`.
 3. The in-repo samples (`.rupu/workflows/`, `examples/workflows/`) are migrated with the skill and checked against the parity corpus.
 4. **Deleted when the corpus is green:**
@@ -99,17 +99,17 @@ The `entity` binding carries: `ref`, `repo`, `number`, `title`, `url`, `state`, 
 
 ## 11.6 Sub-plan 6c: autoflows become instance machines
 
-- **Each autoflow becomes an `instance per issue|pull_request|pr_head` machine** whose activity calls the work machine (example: `examples/security_issue_owner.weft`).
-- **Outcome contracts.** `autoflow_outcome_v1` becomes a weft type, `Outcome`, in a shared library (`lib/autoflow.weft`). `dispatch` becomes `call machine (…)` from a `dispatching(d)` state.
+- **Each autoflow becomes an `instance per issue|pull_request|pr_head` machine** whose activity calls the work machine (example: `examples/security_issue_owner.yoko`).
+- **Outcome contracts.** `autoflow_outcome_v1` becomes a yokoito type, `Outcome`, in a shared library (`lib/autoflow.yoko`). `dispatch` becomes `call machine (…)` from a `dispatching(d)` state.
 - **Deleted:** the reconcile tick's claim state machine (`execute_autoflow_cycle`, `apply_terminal_run_to_claim`, `should_run_claim`, `claim_should_yield_to_winner`, …).
 - **Generalised into the `InstanceRegistry` and `EventBus`:** wake hints, `reconcile_every` (now `after 30m -> working`), `retry_after` (now a computed `after`), and cleanup (now `retain`).
 - **The `autoflow.enabled` overload disappears.** Cron is just `trigger cron`, and ownership is just `instance per …`.
 
 ## 11.7 Sub-plan 6d: agentiflows become `pursue` machines
 
-- `AgentiflowDef` maps one-to-one onto the agentic top-level blocks (§9.5) plus a `pursue` (example: `examples/vuln_hunt.weft`).
+- `AgentiflowDef` maps one-to-one onto the agentic top-level blocks (§9.5) plus a `pursue` (example: `examples/vuln_hunt.yoko`).
 - **Deleted:** `rupu-agentiflow`'s `Envelope::run` loop.
-- **Kept as agentic effects and tools:** the fleet substrate (board, mailboxes, directives, `FleetSupervisor`, `dispatch`/`run_workflow`/`join` lead tools). `run_workflow` now launches weft machines.
+- **Kept as agentic effects and tools:** the fleet substrate (board, mailboxes, directives, `FleetSupervisor`, `dispatch`/`run_workflow`/`join` lead tools). `run_workflow` now launches yokoito machines.
 - **Gains:**
   - resume after a crash (journal recovery)
   - pause
@@ -120,13 +120,13 @@ The `entity` binding carries: `ref`, `repo`, `number`, `title`, `url`, `state`, 
 ## 11.8 Sub-plan 6e: the CP
 
 ### Editor
-- **CodeMirror 6 language mode.** Highlighting is a Lezer grammar generated from the tree-sitter grammar's queries, or the TextMate grammar through `codemirror-textmate`, as decided in the plan. **Diagnostics, autocomplete, hover and format** come from `@weft/wasm` with the catalogue served by `GET /api/catalog`. They match VS Code exactly.
+- **CodeMirror 6 language mode.** Highlighting is a Lezer grammar generated from the tree-sitter grammar's queries, or the TextMate grammar through `codemirror-textmate`, as decided in the plan. **Diagnostics, autocomplete, hover and format** come from `@yokoito/wasm` with the catalogue served by `GET /api/catalog`. They match VS Code exactly.
 - **Split view: text ↔ graph.** Editing the graph (insert or delete a step, wrap in a block, change an option, connect a state transition) calls `applyGraphEdit`. The source is re-formatted with comments preserved. Selecting a node highlights its source and vice versa.
-- **Save** validates through `POST /api/workflows/validate`, which uses the same `weft-ide`. That makes it authoritative, and the client-side check only gives speed.
+- **Save** validates through `POST /api/workflows/validate`, which uses the same `yokoito-ide`. That makes it authoritative, and the client-side check only gives speed.
 - **Launcher.** The input form is generated from `input { }`, including `///` docs, defaults, enums and lists.
 
 ### Graph engine and UI
-The graph engine is one renderer, shared with VS Code through `@weft/graph`, and its input is `graph-json`.
+The graph engine is one renderer, shared with VS Code through `@yokoito/graph`, and its input is `graph-json`.
 
 **Node catalogue.** Every construct is drawn distinctly:
 
@@ -175,17 +175,17 @@ The graph engine is one renderer, shared with VS Code through `@weft/graph`, and
 ### The migration skill (Claude)
 A Claude Code skill (`.claude/skills/migrate-rupu-flow/SKILL.md`, shipped in the rupu repo) that:
 1. Reads a legacy workflow, autoflow or agentiflow file.
-2. Drafts the `.weft` equivalent using the mapping in Appendix C, plus `examples/`.
+2. Drafts the `.yoko` equivalent using the mapping in Appendix C, plus `examples/`.
 3. Runs `rupu workflow check --format json` and fixes the diagnostics, looping until clean (at most 5 rounds, then it reports what's left).
 4. Writes `test` blocks that pin the legacy behaviour, using the corpus patterns.
 5. Shows a side-by-side diff, plus a summary of every semantic change. Typical items: "a missing template variable that used to render empty is now a compile error", or "branch arms are now nested blocks".
 6. Writes the file only after the user approves it.
 
 ### The parity corpus
-`tests/weft-parity/` in rupu: one machine plus its `test` blocks per legacy feature, and per autoflow and agentiflow behaviour. Entry #1 is `examples/kitchen_sink.weft` against `examples/legacy/kitchen-sink.yaml`. 6b's deletions are gated on the corpus passing.
+`tests/yokoito-parity/` in rupu: one machine plus its `test` blocks per legacy feature, and per autoflow and agentiflow behaviour. Entry #1 is `examples/kitchen_sink.yoko` against `examples/legacy/kitchen-sink.yaml`. 6b's deletions are gated on the corpus passing.
 
 ### Docs
-- `docs/workflow-format.md` is replaced by the weft language reference (generated, §10.11), plus the rupu host guide: catalogue, placement, entity schema, CLI.
+- `docs/workflow-format.md` is replaced by the yokoito language reference (generated, §10.11), plus the rupu host guide: catalogue, placement, entity schema, CLI.
 - `docs/triggers.md` gains the payload types.
 - `CLAUDE.md`'s crate map is updated.
 
@@ -195,6 +195,6 @@ A Claude Code skill (`.claude/skills/migrate-rupu-flow/SKILL.md`, shipped in the
 |---|---|
 | A large deletion breaks unknown consumers | The parity corpus gates 6b; the CP API keeps its run-list and usage shapes (§11.5). |
 | Authors find the new language unfamiliar | The migration skill, the LSP's autocomplete and quick fixes, the tutorial and cookbook, and examples that mirror the legacy samples. |
-| Remote hosts run an older rupu | Capability advertisement, as today (`host_features()`), with an `engine.weft` feature. A connector refuses placement on a peer without it, never silently. |
+| Remote hosts run an older rupu | Capability advertisement, as today (`host_features()`), with an `engine.yokoito` feature. A connector refuses placement on a peer without it, never silently. |
 | Journal growth for long-lived owners | Snapshots, blobs, `restart with`, `retain`. |
 | WASM bundle size in the CP | Lazy-loaded on the editor route; the analysis core has no tokio and no engine. |

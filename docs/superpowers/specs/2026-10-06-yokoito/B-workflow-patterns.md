@@ -1,7 +1,7 @@
 # Appendix B. Workflow Patterns coverage
 
 This appendix uses the 43 control-flow patterns of the Workflow Patterns initiative (Russell, ter Hofstede, van der Aalst, Mulyar, 2006; <http://www.workflowpatterns.com/patterns/control/>) as the expressiveness yardstick. For each pattern it gives:
-- the weft construct, with a minimal snippet;
+- the yokoito construct, with a minimal snippet;
 - whether **legacy rupu** supports it (✓ full · ◐ partial · ✗ none).
 
 **Summary:**
@@ -9,13 +9,13 @@ This appendix uses the 43 control-flow patterns of the Workflow Patterns initiat
 | | Full | Partial | None |
 |---|---|---|---|
 | legacy rupu workflows | 12 | 7 | 24 |
-| weft | **43** | 0 | 0 |
+| yokoito | **43** | 0 | 0 |
 
-Plan 2 turns each row into a golden test (`tests/patterns/wcp-NN.weft`).
+Plan 2 turns each row into a golden test (`tests/patterns/wcp-NN.yoko`).
 
 ## Basic control flow
 
-| # | Pattern | weft | Legacy |
+| # | Pattern | yokoito | Legacy |
 |---|---|---|---|
 | 1 | Sequence | statements in order | ✓ |
 | 2 | Parallel Split | `fork { a { … } b { … } }` | ✓ |
@@ -25,7 +25,7 @@ Plan 2 turns each row into a golden test (`tests/patterns/wcp-NN.weft`).
 
 ## Advanced branching and synchronization
 
-| # | Pattern | weft | Legacy |
+| # | Pattern | yokoito | Legacy |
 |---|---|---|---|
 | 6 | Multi-Choice | guarded fork branches: `fork { a if x { … } b if y { … } }` | ◐ (`when:` on split successors) |
 | 7 | Structured Synchronizing Merge | guarded branches + `join: all` (skipped branches don't count) | ◐ |
@@ -44,7 +44,7 @@ Plan 2 turns each row into a golden test (`tests/patterns/wcp-NN.weft`).
 
 ## Multiple instances
 
-| # | Pattern | weft | Legacy |
+| # | Pattern | yokoito | Legacy |
 |---|---|---|---|
 | 12 | MI without Synchronization | `for x in xs { h = async agent @a "…{{ x }}"; detach h }` | ✗ |
 | 13 | MI with a priori design-time knowledge | `map r in [@a, @b, @c] { … }` · `fork` | ✓ (`parallel:`) |
@@ -56,7 +56,7 @@ Plan 2 turns each row into a golden test (`tests/patterns/wcp-NN.weft`).
 
 ## State-based
 
-| # | Pattern | weft | Legacy |
+| # | Pattern | yokoito | Legacy |
 |---|---|---|---|
 | 16 | Deferred Choice | `race { a { wait for x } b { wait for y } c { sleep 1h; yield null } }` · a state with several `on` transitions | ✗ |
 | 17 | Interleaved Parallel Routing | `fork (concurrency: 1) { … }`: any order, never concurrently; sequences inside branches give the partial order | ✗ |
@@ -66,7 +66,7 @@ Plan 2 turns each row into a golden test (`tests/patterns/wcp-NN.weft`).
 
 ## Cancellation and force completion
 
-| # | Pattern | weft | Legacy |
+| # | Pattern | yokoito | Legacy |
 |---|---|---|---|
 | 19 | Cancel Task | `during { step } on operator.skip { cancel }` · `race` with an event branch · the `timeout` modifier | ✗ |
 | 20 | Cancel Case | instance cancel (operator) · `end cancelled` | ✓ |
@@ -76,7 +76,7 @@ Plan 2 turns each row into a golden test (`tests/patterns/wcp-NN.weft`).
 
 ## Iteration
 
-| # | Pattern | weft | Legacy |
+| # | Pattern | yokoito | Legacy |
 |---|---|---|---|
 | 10 | Arbitrary Cycles | `goto` (backward jumps) · state-layer transitions | ✗ (acyclic DAG) |
 | 21 | Structured Loop | `loop (max, until)` · `while` · `for` | ✓ (`loops:`, not nestable) |
@@ -84,14 +84,14 @@ Plan 2 turns each row into a golden test (`tests/patterns/wcp-NN.weft`).
 
 ## Termination
 
-| # | Pattern | weft | Legacy |
+| # | Pattern | yokoito | Legacy |
 |---|---|---|---|
 | 11 | Implicit Termination | the flow ends when nothing is left to run | ✓ |
 | 43 | Explicit Termination | `end [outcome]` cancels everything and completes | ◐ (only via gate rejection) |
 
 ## Triggers
 
-| # | Pattern | weft | Legacy |
+| # | Pattern | yokoito | Legacy |
 |---|---|---|---|
 | 23 | Transient Trigger | `wait for e` with `inbox drop` (only events while waiting count) | ✗ (events only start new runs) |
 | 24 | Persistent Trigger | `wait for e` with `inbox queue` (earlier unconsumed events count) | ◐ (autoflow wake queue) |
@@ -100,7 +100,7 @@ Plan 2 turns each row into a golden test (`tests/patterns/wcp-NN.weft`).
 
 ## Beyond the catalogue
 
-weft also covers the following, which the control-flow catalogue does not address:
+yokoito also covers the following, which the control-flow catalogue does not address:
 
 | Area | Constructs |
 |---|---|

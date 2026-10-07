@@ -1,37 +1,37 @@
 # 10. Tooling
 
-Every tool is built on **one analysis core**, `weft-ide`, which wraps `weft-syntax` and `weft-check`. The CLI, the language server and the WASM build for the CP editor all call it, so they always agree, on diagnostics, completions, formatting and graphs alike.
+Every tool is built on **one analysis core**, `yokoito-ide`, which wraps `yokoito-syntax` and `yokoito-check`. The CLI, the language server and the WASM build for the CP editor all call it, so they always agree, on diagnostics, completions, formatting and graphs alike.
 
 ```mermaid
 flowchart TB
-  SYN[weft-syntax] --> IDE[weft-ide]
-  CHK[weft-check] --> IDE
+  SYN[yokoito-syntax] --> IDE[yokoito-ide]
+  CHK[yokoito-check] --> IDE
   EXT["extension manifests"] --> IDE
-  CAT["host catalogs (weft.toml)"] --> IDE
-  IDE --> CLI[weft-cli]
-  IDE --> LSP[weft-lsp] --> VSC[VS Code extension]
+  CAT["host catalogs (yoko.toml)"] --> IDE
+  IDE --> CLI[yokoito-cli]
+  IDE --> LSP[yokoito-lsp] --> VSC[VS Code extension]
   LSP --> NVIM[Neovim / Helix / Zed]
-  IDE --> WASM[weft-wasm] --> CP[rupu CP editor]
-  IR[weft-ir] --> RENDER[graph-json / mermaid / dot / svg]
+  IDE --> WASM[yokoito-wasm] --> CP[rupu CP editor]
+  IR[yokoito-ir] --> RENDER[graph-json / mermaid / dot / svg]
   RENDER --> VSC
   RENDER --> CP
 ```
 
-## 10.1 The `weft` CLI
+## 10.1 The `yoko` CLI (crate `yokoito-cli`)
 
 | Command | Purpose |
 |---|---|
-| `weft fmt [--check] <paths>` | Canonical formatting: idempotent and comment-preserving, with no options. `--check` exits 1 when a file would change. |
-| `weft check <paths>` | Parse, resolve, type-check and analyse. Exits 1 on errors. `--format json` produces machine-readable output for the migration skill. |
-| `weft lint <paths>` | Runs the rule catalogue (§10.3). Severities come from `weft.toml`. |
-| `weft test [filter] [--coverage]` | Runs `test` blocks (§10.6). |
-| `weft simulate <file> [--input k=v] [--script s.json]` | An interactive or scripted dry run (§10.7). |
-| `weft render <file> --format mermaid\|dot\|svg\|graph-json [--expand-sugar] [--flow name]` | Graph output (§10.8). |
-| `weft lower <file>` | Prints the core form, the lowered IR, pretty-printed as weft core syntax. |
-| `weft ir <file>` | Prints the canonical JSON IR and its definition id. |
-| `weft explain <code>` | The long explanation for a diagnostic code, with examples. |
-| `weft migrate check <old> <new>` | Migration verification (§8.7). |
-| `weft new <name> [--template flow\|owner\|pursue]` | Scaffolds a machine file. |
+| `yoko fmt [--check] <paths>` | Canonical formatting: idempotent and comment-preserving, with no options. `--check` exits 1 when a file would change. |
+| `yoko check <paths>` | Parse, resolve, type-check and analyse. Exits 1 on errors. `--format json` produces machine-readable output for the migration skill. |
+| `yoko lint <paths>` | Runs the rule catalogue (§10.3). Severities come from `yoko.toml`. |
+| `yoko test [filter] [--coverage]` | Runs `test` blocks (§10.6). |
+| `yoko simulate <file> [--input k=v] [--script s.json]` | An interactive or scripted dry run (§10.7). |
+| `yoko render <file> --format mermaid\|dot\|svg\|graph-json [--expand-sugar] [--flow name]` | Graph output (§10.8). |
+| `yoko lower <file>` | Prints the core form, the lowered IR, pretty-printed as yokoito core syntax. |
+| `yoko ir <file>` | Prints the canonical JSON IR and its definition id. |
+| `yoko explain <code>` | The long explanation for a diagnostic code, with examples. |
+| `yoko migrate check <old> <new>` | Migration verification (§8.7). |
+| `yoko new <name> [--template flow\|owner\|pursue]` | Scaffolds a machine file. |
 
 The library's CLI covers authoring only. Running machines is the host's job: rupu provides it through its own commands (§11.2).
 
@@ -41,13 +41,13 @@ Diagnostics are rustc-style, rendered with labelled spans:
 
 ```
 error[E0412]: unknown field `summry` on `Triage`
-  --> kitchen_sink.weft:31:33
+  --> kitchen_sink.yoko:31:33
    |
 31 |       body: "Not actionable: {{ triage.summry }}")
    |                                        ^^^^^^ did you mean `summary`?
    |
    = note: `triage` is the result of `agent @security-triager -> Triage` (line 22)
-   = help: run `weft explain E0412`
+   = help: run `yoko explain E0412`
 ```
 
 **Code ranges:**
@@ -66,7 +66,7 @@ error[E0412]: unknown field `summry` on `Triage`
 | `E09xx` | extensions and catalogues |
 | `W…` | the lint rules (§10.3) |
 
-**Quick fixes.** Every diagnostic that has a mechanical fix carries a machine-applicable suggestion. These are used by the LSP's code actions and by `weft check --fix`.
+**Quick fixes.** Every diagnostic that has a mechanical fix carries a machine-applicable suggestion. These are used by the LSP's code actions and by `yoko check --fix`.
 
 ## 10.3 Lint rule catalogue (initial)
 
@@ -96,16 +96,16 @@ error[E0412]: unknown field `summry` on `Triage`
 | `naming` | warn | `snake_case` / `PascalCase` / `@kebab-case` conventions |
 | `magic-agent-option` | info | agent options repeated across 3+ steps; suggests `defaults` |
 
-**Configuration** lives in `weft.toml`:
+**Configuration** lives in `yoko.toml`:
 ```toml
 [lint]
 "prompt-unbounded-value" = "error"
 "map-default-concurrency" = "off"
 ```
 
-**Inline suppression:** `// weft:allow(silent-catch) — reason` on the line above.
+**Inline suppression:** `// yoko:allow(silent-catch) — reason` on the line above.
 
-## 10.4 Project configuration (`weft.toml`)
+## 10.4 Project configuration (`yoko.toml`)
 
 ```toml
 [project]
@@ -127,7 +127,7 @@ paths = [".rupu/contracts", "~/.rupu/contracts"]
 
 **The catalogue command** prints one JSON document, `{ agents: [...], tools: [...], events: [...], entities: {...}, approver_sets: [...] }`, versioned by `catalog_format`. The LSP caches it and re-runs it according to `refresh`. If the command fails, the tools keep the last cached catalogue and warn; they never block editing.
 
-## 10.5 Language server (`weft-lsp`)
+## 10.5 Language server (`yokoito-lsp`)
 
 Built on `tower-lsp`. Capabilities:
 
@@ -142,9 +142,9 @@ Built on `tower-lsp`. Capabilities:
 | Code actions | Apply quick fixes; *extract to flow*; *wrap in retry/try/within*; *add timeout*; *convert `if`-chain to `match`*; *add missing match arms*. |
 | Inlay hints | Inferred types of step bindings; the effective `timeout`/`retry` inherited from `defaults`. |
 | Semantic tokens | Distinct colours for effects (`agent`/`tool`/`run`/`approve`/`ask`), agent refs, events, error types, durations, prose interpolation. |
-| Formatting | Full document and range, through `weft fmt`. |
+| Formatting | Full document and range, through `yoko fmt`. |
 | Folding, selection ranges | By block. |
-| Custom request `weft/graph` | Returns `graph-json` for the document, with the node ↔ source-span map, for the preview pane. |
+| Custom request `yokoito/graph` | Returns `graph-json` for the document, with the node ↔ source-span map, for the preview pane. |
 
 ## 10.6 Tests
 
@@ -217,18 +217,18 @@ test "an entity owner starts from discovery" {
 
 **How tests run.** Against the pure stepper and an in-memory simulated host: deterministic and instant, with no network and no cost.
 - **Coverage.** `--coverage` reports which states, transitions, branches, catch clauses and loop exits were exercised, per machine.
-- **Reporting.** Tests appear in VS Code's Test Explorer, and `weft test --format junit` produces CI output.
+- **Reporting.** Tests appear in VS Code's Test Explorer, and `yoko test --format junit` produces CI output.
 
 ## 10.7 Simulation
 
-`weft simulate kitchen_sink.weft --input repo=acme/widget` opens an interactive terminal session:
+`yoko simulate kitchen_sink.yoko --input repo=acme/widget` opens an interactive terminal session:
 - It shows the active configuration and pending effects.
 - At each pending effect you choose an outcome: a value, an error type, or *use mock*.
 - Commands: `advance 2h`, `send operator.stop`, `back` (time-travel to an earlier step, made possible by the pure stepper), `graph` (opens the rendered graph with live highlighting).
 
 `--script s.json` runs it non-interactively and writes a trace (`--trace out.jsonl`) usable as a regression test.
 
-## 10.8 Rendering (`weft render`)
+## 10.8 Rendering (`yoko render`)
 
 | Format | Use |
 |---|---|
@@ -242,27 +242,27 @@ test "an entity owner starts from discovery" {
 ## 10.9 The VS Code extension
 
 **Contents:**
-- **TextMate grammar** (`weft.tmLanguage.json`) for instant highlighting before the LSP starts: keywords, effect keywords, `@agents`, dotted events and errors, durations, strings with `{{ }}`/`{% %}` interpolation highlighted as embedded expressions, command literals with `{x}` interpolation, comments and doc comments (embedded Markdown).
+- **TextMate grammar** (`yokoito.tmLanguage.json`) for instant highlighting before the LSP starts: keywords, effect keywords, `@agents`, dotted events and errors, durations, strings with `{{ }}`/`{% %}` interpolation highlighted as embedded expressions, command literals with `{x}` interpolation, comments and doc comments (embedded Markdown).
 - **Language configuration:** comment tokens, bracket pairs, auto-closing (including `"""` and backticks), indentation rules, and folding markers.
 - **Snippets:** `machine`, `flow`, `fork`, `map`, `loop`, `race`, `state`, `parallel`, `test`, `approve`, `agent`.
 - **LSP client:**
-  - It starts the bundled `weft-lsp` for each platform (darwin-arm64/x64, linux-x64/arm64, win32-x64), or `weft.server.path` from settings.
+  - It starts the bundled `yokoito-lsp` for each platform (darwin-arm64/x64, linux-x64/arm64, win32-x64), or `yokoito.server.path` from settings.
   - It surfaces every LSP feature in §10.5.
-- **Graph preview pane** (command *weft: Open Graph Preview*, also a toolbar button):
-  - a webview rendering `weft/graph` output with the same graph renderer component as the CP (shared npm package `@weft/graph`);
+- **Graph preview pane** (command *Yokoito: Open Graph Preview*, also a toolbar button):
+  - a webview rendering `yokoito/graph` output with the same graph renderer component as the CP (shared npm package `@yokoito/graph`);
   - bi-directional sync: moving the cursor highlights a node, and clicking a node reveals its source;
   - collapse/expand of blocks, and a sugar/core toggle.
-- **Test Explorer integration:** discovers `test` blocks, runs them through `weft test --format json`, and shows a pass/fail gutter.
+- **Test Explorer integration:** discovers `test` blocks, runs them through `yoko test --format json`, and shows a pass/fail gutter.
 - **Commands:** *Format Document*, *Show Lowered Core*, *Show IR*, *Render to Mermaid (copy)*, *Explain Diagnostic*, *Refresh Catalog*.
-- **Settings:** `weft.server.path`, `weft.catalog.command` (overrides `weft.toml`), `weft.preview.autoOpen`, `weft.lint.*`.
+- **Settings:** `yokoito.server.path`, `yokoito.catalog.command` (overrides `yoko.toml`), `yokoito.preview.autoOpen`, `yokoito.lint.*`.
 
 **Published** to the VS Code Marketplace and Open VSX from the library repo's CI.
 
-**Tree-sitter grammar** (`tree-sitter-weft`), shipped in the same plan, for Neovim, Helix, Zed and GitHub-style highlighting. It includes highlight, injection (prose templates, Markdown docs) and fold queries.
+**Tree-sitter grammar** (`tree-sitter-yokoito`), shipped in the same plan, for Neovim, Helix, Zed and GitHub-style highlighting. It includes highlight, injection (prose templates, Markdown docs) and fold queries.
 
-## 10.10 WASM (`weft-wasm`)
+## 10.10 WASM (`yokoito-wasm`)
 
-The analysis core is compiled to `wasm32-unknown-unknown` with `wasm-bindgen` and published as the npm package `@weft/wasm`. Its API:
+The analysis core is compiled to `wasm32-unknown-unknown` with `wasm-bindgen` and published as the npm package `@yokoito/wasm`. Its API:
 
 ```ts
 parse(src: string): ParseResult                       // CST summary + syntax diagnostics
@@ -271,7 +271,7 @@ complete(files, catalog, file: string, offset: number): CompletionItem[]
 hover(files, catalog, file, offset): Hover | null
 format(src: string): string
 lower(files, catalog, file): IR
-graph(files, catalog, file, opts): GraphJson         // same as `weft render --format graph-json`
+graph(files, catalog, file, opts): GraphJson         // same as `yoko render --format graph-json`
 applyGraphEdit(src: string, edit: GraphEdit): string  // structural edit → re-formatted source (comments kept)
 ```
 
@@ -284,5 +284,5 @@ applyGraphEdit(src: string, edit: GraphEdit): string  // structural edit → re-
 | **Language reference** | Generated from this spec: one page per construct, each with syntax, options, semantics, example and Mermaid diagram. |
 | **Tutorial** | From a 5-line flow up to an entity-owner machine. |
 | **Cookbook** | One recipe per Workflow Pattern (Appendix B), plus agentic recipes: review panel, best-of patching, fleet hunt, PR shepherd, release train. |
-| **Diagnostics reference** | Generated from `weft explain`. |
+| **Diagnostics reference** | Generated from `yoko explain`. |
 | **Extension author guide** | The manifest, lowering rules and handler traits. |

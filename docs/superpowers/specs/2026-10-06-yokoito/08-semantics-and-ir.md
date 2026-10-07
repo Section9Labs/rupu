@@ -4,29 +4,29 @@
 
 ```mermaid
 flowchart LR
-  SRC[".weft source"] --> CST["CST (lossless: comments, trivia)"] --> AST --> CHK["typed AST (weft-check)"] --> LOW["lower (sugar → core)"] --> IR["IR (JSON)"]
+  SRC[".yokoito source"] --> CST["CST (lossless: comments, trivia)"] --> AST --> CHK["typed AST (yokoito-check)"] --> LOW["lower (sugar → core)"] --> IR["IR (JSON)"]
   IR --> HASH["definition id = sha256(canonical IR)"]
-  IR --> CORE["weft-core: pure stepper"]
-  CORE <--> ENG["weft-engine: durable host"]
+  IR --> CORE["yokoito-kernel: pure stepper"]
+  CORE <--> ENG["yokoito-engine: durable host"]
   ENG <--> PORTS["ports implemented by the host (rupu)"]
-  CST --> FMT["weft fmt"]
-  CHK --> IDE["weft-ide → LSP / WASM"]
-  IR --> RENDER["weft render (graph)"]
+  CST --> FMT["yoko fmt"]
+  CHK --> IDE["yokoito-ide → LSP / WASM"]
+  IR --> RENDER["yoko render (graph)"]
 ```
 
 **Crate responsibilities:**
-- `weft-syntax` owns the CST and the formatter.
-- `weft-check` owns name resolution, types and static analysis.
-- The lowering lives in `weft-ir`.
-- `weft-core` executes the IR and **never** sees source syntax.
+- `yokoito-syntax` owns the CST and the formatter.
+- `yokoito-check` owns name resolution, types and static analysis.
+- The lowering lives in `yokoito-ir`.
+- `yokoito-kernel` executes the IR and **never** sees source syntax.
 
 ## 8.2 The IR
 
-The IR is a JSON document described by a JSON Schema, generated with `schemars` and published as `weft-ir.schema.json`. Its top-level shape:
+The IR is a JSON document described by a JSON Schema, generated with `schemars` and published as `yokoito-ir.schema.json`. Its top-level shape:
 
 ```jsonc
 {
-  "weft_ir": 1,                            // IR format version
+  "yokoito_ir": 1,                            // IR format version
   "id": "sha256:9f2c…",                    // definition hash (§8.2.4)
   "machine": "kitchen_sink",
   "version_label": "3",
@@ -44,7 +44,7 @@ The IR is a JSON document described by a JSON Schema, generated with `schemars` 
   "root":     { /* StateNode */ },
   "flows":    { /* named sub-flow templates, referenced by flow-call invokes */ },
   "migrations": [ … ],
-  "source":   { "files": ["kitchen_sink.weft"], "spans": "separate" }   // spans live in a sidecar
+  "source":   { "files": ["kitchen_sink.yoko"], "spans": "separate" }   // spans live in a sidecar
 }
 ```
 
@@ -114,7 +114,7 @@ The IR is a JSON document described by a JSON Schema, generated with `schemars` 
 
 ## 8.3 Dynamic regions
 
-SCXML has only static regions. weft adds one core construct, the **dynamic region**: a region *template* instantiated at runtime once per key, inside the same instance and journal. It is how `map`, `pipeline`, `worklist`, `async`, `best_of`, the handlers of `during`, and the item scopes of `distribute` are lowered.
+SCXML has only static regions. yokoito adds one core construct, the **dynamic region**: a region *template* instantiated at runtime once per key, inside the same instance and journal. It is how `map`, `pipeline`, `worklist`, `async`, `best_of`, the handlers of `during`, and the item scopes of `distribute` are lowered.
 
 - A `dynamic` node owns a template subtree, a **key table** (`key → instance status`) and a **concurrency gate**.
 - **`spawn`** creates a keyed instance. Its state ids are prefixed `<node>{<key>}`, e.g. `audits.item{src/a.rs}.audit`.
@@ -124,7 +124,7 @@ SCXML has only static regions. weft adds one core construct, the **dynamic regio
 
 XState's *spawned actors* are separate actors with separate persistence. Dynamic regions share the instance's single journal, which gives atomic snapshots and simple recovery. `call machine` is the escape hatch when separate identity is wanted.
 
-## 8.4 The pure stepper (`weft-core`)
+## 8.4 The pure stepper (`yokoito-kernel`)
 
 ```rust
 pub fn step(def: &Definition, snap: &Snapshot, input: Input) -> Result<Step, StepError>;
@@ -189,7 +189,7 @@ The snapshot is serialised as JSON and versioned by `snapshot_format`.
   - Example: `refine[2].review[1].panel{@security-reviewer}.assess#a1`.
   - The same work always has the same id across replays, and the UI maps an effect id back to its node by stripping the annotations.
 
-## 8.5 The durable engine (`weft-engine`)
+## 8.5 The durable engine (`yokoito-engine`)
 
 ### Journal
 There is one append-only journal per instance, through the `JournalStore` port. Its entries:
@@ -267,13 +267,13 @@ Any effect result value larger than `blob_threshold` (default 64 KiB) is stored 
     drop var legacy_flag
   }
   ```
-- **`weft migrate check <old> <new>`** proves statically that:
+- **`yoko migrate check <old> <new>`** proves statically that:
   - every *reachable* old configuration maps to a valid new configuration;
   - every old var is kept, renamed or dropped;
   - every new var has a default;
   - the types are compatible.
 - **Applying a migration.** The engine applies `Input::Migrate` only at a **safe point**: no in-flight effects inside regions that the mapping changes. Otherwise the migration is deferred until such a point.
-- **Commands.** Upgrades are a host operator command (rupu: `rupu workflow upgrade <machine> --to latest`, §11.2). The engine API is `Engine::upgrade(machine, to, filter)`, and each upgrade writes the `migrated` journal entry. Without a migration path, old instances simply drain. The library's own CLI only *checks* migrations (`weft migrate check`).
+- **Commands.** Upgrades are a host operator command (rupu: `rupu workflow upgrade <machine> --to latest`, §11.2). The engine API is `Engine::upgrade(machine, to, filter)`, and each upgrade writes the `migrated` journal entry. Without a migration path, old instances simply drain. The library's own CLI only *checks* migrations (`yoko migrate check`).
 
 ## 8.8 Continue-as-new
 
@@ -349,6 +349,6 @@ Every observation carries the **structural id**, so a UI can map it onto IR node
 ## 8.12 Conformance
 
 Plan 2 ships a conformance suite:
-1. The applicable W3C SCXML IRP tests, translated to weft.
+1. The applicable W3C SCXML IRP tests, translated to yokoito.
 2. One golden test per construct in chapter 06. Each pairs a source snippet, a scripted input sequence, and the expected effect and outcome trace.
 3. Property tests: determinism, replay equivalence (snapshot plus tail replay equals full replay), and the cancellation invariants (no orphaned effects, every scope exit releases its locks).
