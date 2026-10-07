@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu docs — API reference</title>
+<meta name="description" content="Every HTTP route the rupu control plane serves: runs, run control, live event streams, sessions, launch, findings, usage, netflow, hosts, config, customers and agentiflows.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="docs-shell">
+
+  <!-- ════ SHARED SIDEBAR (copy verbatim into every docs page; set .active) ════ -->
+  <aside class="docs-side">
+    <a class="brand" href="/" aria-label="rupu home">
+      <span class="mark" aria-hidden="true">&#8734;</span>
+      <span class="name">rupu</span>
+    </a>
+    <div class="grp">Start</div>
+    <a class="item" href="/docs/quickstart.html">Quickstart</a>
+    <a class="item" href="/docs/">Overview &amp; install</a>
+    <div class="grp">Concepts</div>
+    <a class="item" href="/docs/agents.html">Agents</a>
+    <a class="item" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
+    <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
+    <a class="item" href="/docs/sessions.html">Sessions</a>
+    <a class="item" href="/docs/profiles.html">Engagement profiles</a>
+    <div class="grp">Platform</div>
+    <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item" href="/docs/reliability.html">Recovery &amp; reliability</a>
+    <a class="item" href="/docs/integrations.html">Integrations</a>
+    <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
+    <a class="item" href="/docs/triggers.html">Triggers</a>
+    <a class="item" href="/docs/control-plane.html">Control plane</a>
+    <a class="item" href="/docs/multi-host.html">Multi-host</a>
+    <a class="item" href="/docs/netflow.html">Netflow</a>
+    <a class="item" href="/docs/coverage.html">Coverage</a>
+    <a class="item" href="/docs/findings.html">Findings</a>
+    <a class="item" href="/docs/customers.html">Customers</a>
+    <div class="grp">Reference</div>
+    <a class="item" href="/docs/cli.html">CLI reference</a>
+    <a class="item" href="/docs/configuration.html">Configuration</a>
+    <a class="item active" href="/docs/api.html">HTTP API</a>
+    <a class="item" href="/docs/transcripts.html">Transcript schema</a>
+    <div class="grp">More</div>
+    <a class="item" href="/docs/examples/">Examples</a>
+    <a class="item" href="/#download">Download</a>
+    <a class="item" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </aside>
+  <!-- ════ /SHARED SIDEBAR ════ -->
+
+  <main class="docs-main">
+    <h1>API reference</h1>
+    <p class="intro"><code class="inline">rupu cp serve</code> serves a JSON API under <code class="inline">/api/*</code>; the web UI is built entirely on it, and so are peer control planes that drive this host remotely. This page lists every route. The operator guide is <a class="link" href="/docs/control-plane.html">Control plane</a>; customer scoping, attribution and the launch preview are covered in more depth in <a class="link" href="/docs/customers.html">Customers</a>.</p>
+
+    <p>Request and response bodies are named by their Rust type where they are large; those types live in <code class="inline">crates/rupu-cp/src/api/</code> (and <code class="inline">rupu_orchestrator</code> / <code class="inline">rupu_transcript</code> for events). The API is versioned with the binary: a feature a peer needs is advertised in <code class="inline">GET /api/host/info</code> → <code class="inline">features</code>.</p>
+    <h2 id="conventions">Conventions</h2>
+    <h3 id="authentication">Authentication</h3>
+    <p>Started without <code class="inline">--token</code>, the API is open. Started with <code class="inline">--token &lt;t&gt;</code>, every <code class="inline">/api/*</code> route requires the header</p>
+    <pre class="code">Authorization: Bearer &lt;t&gt;</pre>
+    <p>compared in constant time. A missing or wrong token is a bare <code class="inline">401</code> with an empty body. There is no cookie or query-parameter form. <code class="inline">/healthz</code>, the static UI and <code class="inline">/api/node/connect</code> (which authenticates nodes with their own enrollment token) are outside the check.</p>
+    <pre class="code">curl -s -H "Authorization: Bearer $CP_TOKEN" \
+  "http://127.0.0.1:7878/api/runs?limit=5"</pre>
+    <h3 id="errors">Errors</h3>
+    <p>Handler errors are JSON:</p>
+    <pre class="code">{ "error": "run 01JEXAMPLE0000000000000000 not found" }</pre>
+    <p>A few endpoints add fields (a bad findings query adds <code class="inline">token</code>, <code class="inline">code</code>, <code class="inline">start</code>, <code class="inline">end</code>; deleting a customer with projects adds <code class="inline">projects</code>; a failed artifact pull is <code class="inline">{ "unavailable": "&lt;reason&gt;" }</code>). A malformed query string or JSON body is rejected by the framework before the handler runs, with a plain-text 400/415/422. An unknown <code class="inline">/api/...</code> path is a JSON 404 (<code class="inline">no API route for /api/...</code>), never the web app.</p>
+    <table>
+      <thead><tr><th>Status</th><th>Meaning across the API</th></tr></thead>
+      <tbody>
+        <tr><td>400</td><td>Bad input: an id or path that fails validation, a bad slug, a malformed query.</td></tr>
+        <tr><td>401</td><td>Missing or wrong bearer token.</td></tr>
+        <tr><td>404</td><td>Unknown run / session / finding / host id.</td></tr>
+        <tr><td>409</td><td>The request conflicts with current state: approving a run not awaiting approval, deleting a run that isn't finished, resuming a run that isn't paused.</td></tr>
+        <tr><td>500</td><td>Internal error, an unreadable store, and — on run <strong>detail</strong> routes — an unreachable remote host.</td></tr>
+        <tr><td>501</td><td>This server can't do it: an adapter only <code>rupu cp serve</code> installs is missing, a remote host's transport doesn't support the operation, or a remote host can't answer this query (too old).</td></tr>
+        <tr><td>502</td><td>A remote host failed while serving a <strong>list</strong> (shown "offline" in the UI) or a transcript.</td></tr>
+      </tbody>
+    </table>
+    <h3 id="common-query-parameters">Common query parameters</h3>
+    <ul>
+      <li><strong><code class="inline">host=&lt;id&gt;</code></strong> — act on a registered remote host instead of this one. <code class="inline">local</code> is this host. An unknown id is a 404. On list endpoints an absent <code class="inline">host</code> fans out to every host and merges newest-first; per-host failures follow the 501/502 rules above.</li>
+      <li><strong><code class="inline">customer=&lt;slug&gt;|none</code></strong> — narrow to a customer's runs (by recorded attribution) or to projects currently assigned to it. See <a class="link" href="/docs/customers.html">Customers</a>.</li>
+      <li><strong><code class="inline">offset</code>, <code class="inline">limit</code></strong> — paging. <code class="inline">limit</code> defaults to 20 and is clamped to 1–200.</li>
+      <li><strong><code class="inline">since</code>, <code class="inline">until</code></strong> — RFC 3339 timestamps bounding a list by start time.</li>
+      <li><strong><code class="inline">scope_kind=global|project</code>, <code class="inline">scope_id=&lt;ws_id&gt;</code></strong> — pin a definition to the global layer or one project's <code class="inline">.rupu/</code>.</li>
+    </ul>
+    <h3 id="mutations-are-recorded-not-done">Mutations are recorded, not done</h3>
+    <p>Runs are detached processes. A control endpoint's 200 means the request was recorded (a marker, a decision, a signal sent) — watch the run's status on a stream to see it take effect.</p>
+    <h2 id="server-sent-events">Server-sent events</h2>
+    <p>Three endpoints stream <code class="inline">text/event-stream</code>:</p>
+    <table>
+      <thead><tr><th>Endpoint</th><th>Frames</th></tr></thead>
+      <tbody>
+        <tr><td><code>GET /api/events/stream</code></td><td>Without <code>run</code>: the <strong>firehose</strong> — every orchestrator run's step events, merged. With <code>run=&lt;id&gt;</code>: one run.</td></tr>
+        <tr><td><code>GET /api/runs/:id/log</code></td><td>One run's step events.</td></tr>
+        <tr><td><code>GET /api/transcript/stream?path=…</code></td><td>One transcript's events.</td></tr>
+      </tbody>
+    </table>
+    <p>Every frame is an unnamed <code class="inline">data:</code> line carrying one JSON event (no <code class="inline">event:</code> or <code class="inline">id:</code> fields):</p>
+    <ul>
+      <li>Run streams carry <code class="inline">rupu_orchestrator::executor::Event</code>, internally tagged: <code class="inline">{"type": "step_started", ...}</code>.</li>
+      <li>Transcript streams carry <code class="inline">rupu_transcript::Event</code>, adjacently tagged: <code class="inline">{"type": "...", "data": {...}}</code> (see <a class="link" href="https://github.com/Section9Labs/rupu/blob/main/docs/transcript-schema.md">transcript schema</a>).</li>
+    </ul>
+    <pre class="code">data: {"type":"step_started","run_id":"01JEXAMPLE...","step_id":"triage",...}
+
+: keep-alive</pre>
+    <p>Behaviour worth knowing:</p>
+    <ul>
+      <li><strong>Replay on connect.</strong> A stream sends the file's whole history from the start, then tails it (polled every 250 ms). Reconnecting replays it again; <code class="inline">Last-Event-ID</code> is not supported. De-duplicate on the client if you reconnect.</li>
+      <li><strong>Keep-alive</strong> is a comment line every 15 s.</li>
+      <li><strong>Streams don't end</strong> when the run does; close them yourself.</li>
+      <li><strong>Firehose scope.</strong> The firehose follows runs in the run store — workflows and autoflows. Standalone agent runs and session turns never appear on it. It attaches to active runs at start, then to any new run id it sees (checked once a second), and drops a run's tail 30 s after it finishes.</li>
+      <li><strong>Remote hosts.</strong> With <code class="inline">host=&lt;remote&gt;</code>, the remote's stream is passed through unchanged; <code class="inline">/api/events/stream</code> then requires <code class="inline">run</code>.</li>
+      <li>Sessions and run lists have no stream; the UI polls them.</li>
+    </ul>
+    <pre class="code">curl -N -H "Authorization: Bearer $CP_TOKEN" \
+  "http://127.0.0.1:7878/api/events/stream?run=01JEXAMPLE0000000000000000"</pre>
+    <h2 id="runs">Runs</h2>
+    <table>
+      <thead><tr><th>Method</th><th>Path</th><th>Purpose</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>GET</td><td><code>/api/runs</code></td><td>Every orchestrator run, newest first (<code>RunListRow</code> + <code>host_id</code>).</td><td><code>offset</code>, <code>limit</code>, <code>host</code>, <code>customer</code>.</td></tr>
+        <tr><td>GET</td><td><code>/api/runs/workflows</code></td><td>Manually launched workflow runs (no cron or event wake).</td><td>Also <code>lifecycle</code> (<code>active</code>, <code>completed</code>, <code>failed</code>), <code>since</code>, <code>until</code> (honoured on the local host).</td></tr>
+        <tr><td>GET</td><td><code>/api/runs/archived</code></td><td>Archived runs.</td><td><code>kind=workflow</code> keeps manual runs only. Local only, unpaged.</td></tr>
+        <tr><td>GET</td><td><code>/api/runs/agents</code></td><td>Standalone and session agent runs (<code>AgentRunRow</code>).</td><td><code>offset</code>, <code>limit</code>, <code>lifecycle</code>, <code>host</code> (<code>all</code> default, <code>local</code>, or an id), <code>since</code>, <code>until</code>, <code>customer</code>. Offline hosts are skipped on fan-out.</td></tr>
+        <tr><td>GET</td><td><code>/api/runs/autoflows</code></td><td>Autoflow cycle ticks (<code>AutoflowCycleRow</code>).</td><td><code>offset</code>, <code>limit</code>, <code>host</code>, <code>since</code>, <code>until</code>.</td></tr>
+        <tr><td>GET</td><td><code>/api/runs/autoflows/events</code></td><td>Actionable autoflow events: run launched, awaiting a human, cycle failed (<code>AutoflowEventRow</code>).</td><td>Same parameters.</td></tr>
+        <tr><td>GET</td><td><code>/api/runs/:id</code></td><td>Run detail: <code>{run, steps, usage}</code>.</td><td><code>host</code>. 404 unknown.</td></tr>
+        <tr><td>DELETE</td><td><code>/api/runs/:id</code></td><td>Hard-delete a finished run.</td><td><code>host</code>. 409 if the run isn't terminal ("cancel it first").</td></tr>
+        <tr><td>POST</td><td><code>/api/runs/:id/archive</code></td><td>Move a finished run to the archive.</td><td><code>host</code>. 409 if not terminal or already archived.</td></tr>
+        <tr><td>POST</td><td><code>/api/runs/:id/restore</code></td><td>Move an archived run back.</td><td><code>host</code>. 404 not archived; 409 already present.</td></tr>
+      </tbody>
+    </table>
+    <h2 id="run-control">Run control</h2>
+    <p>All take <code class="inline">host</code>. Locally they return the updated run detail plus <code class="inline">host_id</code>; remotely <code class="inline">{ok, host_id}</code>.</p>
+    <table>
+      <thead><tr><th>Method</th><th>Path</th><th>Purpose</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>POST</td><td><code>/api/runs/:id/approve</code></td><td>Approve a parked gate.</td><td><code>gate=&lt;step_id&gt;</code> picks one gate when several are parked. Optional body <code>{mode: "ask"|"bypass"|"readonly"}</code>. Records the decision and a resume marker; the <code>cp serve</code> resume worker (or the run's live runner) continues the run. 409: not awaiting approval, gate expired, gate already decided, ambiguous gate (several parked, no <code>gate</code>), unknown gate.</td></tr>
+        <tr><td>POST</td><td><code>/api/runs/:id/reject</code></td><td>Reject a parked gate.</td><td><code>gate</code>. Body <code>{reason?}</code> — a JSON body (<code>{}</code> at least) is required. Same 409s.</td></tr>
+        <tr><td>POST</td><td><code>/api/runs/:id/cancel</code></td><td>Cancel a run.</td><td>Optional body <code>{reason?}</code>. A live runner process is sent SIGTERM and the run is marked <code>Cancelled</code>; a run parked at a single gate with no live runner is rejected instead. 409 already finished.</td></tr>
+        <tr><td>POST</td><td><code>/api/runs/:id/pause</code></td><td>Pause a running run.</td><td>Writes a <code>.pause</code> marker the detached runner polls; it stops at its next safe boundary. 409 not running. 501 when the host's transport can't pause.</td></tr>
+        <tr><td>POST</td><td><code>/api/runs/:id/resume</code></td><td>Resume a paused run.</td><td>Marker only; the resume worker spawns <code>rupu workflow resume --if-unfinished</code>. 409 not <code>paused</code>; 501 without <code>rupu cp serve</code> or when the transport can't resume.</td></tr>
+      </tbody>
+    </table>
+    <h2 id="run-views">Run views</h2>
+    <table>
+      <thead><tr><th>Method</th><th>Path</th><th>Purpose</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>GET</td><td><code>/api/runs/:id/graph</code></td><td>The run's DAG with step results, fan-out units, usage and codenames.</td><td><code>host</code>.</td></tr>
+        <tr><td>GET</td><td><code>/api/runs/:id/log</code></td><td>SSE of the run's step events.</td><td><code>host</code>. See <a class="link" href="#server-sent-events">Server-sent events</a>.</td></tr>
+        <tr><td>GET</td><td><code>/api/runs/:id/usage</code></td><td>Live usage: totals, per-step, per-call points.</td><td><code>host</code>, <code>since</code>, <code>epoch</code> — pass back the previous response's <code>epoch</code> to receive only new points.</td></tr>
+        <tr><td>GET</td><td><code>/api/runs/:id/usage-timeline</code></td><td>Tokens per model call (<code>TurnPoint</code>).</td><td><code>host</code>.</td></tr>
+        <tr><td>GET</td><td><code>/api/runs/:id/autoflow</code></td><td>Autoflow provenance: repo, issue, claim, prior cycles.</td><td>404 means the run has no autoflow context.</td></tr>
+        <tr><td>GET</td><td><code>/api/runs/:id/coverage</code></td><td><strong>Host-internal.</strong> The run's raw <code>coverage.jsonl</code> (<code>application/x-ndjson</code>); empty when none.</td><td>Read by a coordinator merging a remote unit's findings (<code>run.coverage_stream</code> feature).</td></tr>
+        <tr><td>GET</td><td><code>/api/runs/:id/source</code></td><td>A line-numbered slice of a file in the run's workspace (<code>SourceSlice</code>).</td><td><code>path</code> (workspace-relative), <code>line</code>, <code>context</code> (default 20, max 200), <code>host</code>. A missing, binary, &gt; 2 MiB or remote file is 200 with <code>available: false</code> and a <code>reason</code>. 400 on path traversal.</td></tr>
+        <tr><td>GET</td><td><code>/api/runs/:id/ast</code></td><td>The tree-sitter syntax subtree at a position (<code>AstResponse</code>).</td><td><code>path</code>, <code>line</code>, <code>col</code> (1-based), <code>host</code>. Soft-fails like <code>source</code> when there's no grammar.</td></tr>
+        <tr><td>GET</td><td><code>/api/runs/:id/netflow</code></td><td>See <a class="link" href="#netflow">Netflow</a>.</td><td></td></tr>
+      </tbody>
+    </table>
+    <h2 id="events-and-transcripts">Events and transcripts</h2>
+    <table>
+      <thead><tr><th>Method</th><th>Path</th><th>Purpose</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>GET</td><td><code>/api/events/stream</code></td><td>SSE firehose, or one run with <code>run</code>.</td><td><code>run</code>, <code>host</code> (a remote host requires <code>run</code>).</td></tr>
+        <tr><td>GET</td><td><code>/api/events</code></td><td>Recent step events, newest first, each with <code>ts</code> and <code>pos</code>.</td><td><code>limit</code> (default 200), cursor <code>before_ts</code> (unix ms), <code>before_run</code>, <code>before_pos</code>. Scans the 20 newest runs.</td></tr>
+        <tr><td>GET</td><td><code>/api/transcript</code></td><td>Read a transcript: <code>{events, summary, unparsed, partial?}</code>.</td><td><code>path</code> (a <code>.jsonl</code> under the global dir or a registered workspace), <code>host</code>, <code>run</code>. A missing local file is an empty 200. For a remote run the coordinator's mirror is served; <code>partial: true</code> when the host couldn't be reached to finish it; 502 when unreachable with nothing cached.</td></tr>
+        <tr><td>GET</td><td><code>/api/transcript/stream</code></td><td>SSE tail of a transcript.</td><td><code>path</code>, <code>host</code>, <code>run</code> — <code>run</code> is required for a remote transcript not mirrored yet. 502 host unreachable.</td></tr>
+        <tr><td>POST</td><td><code>/api/transcripts/:id/archive</code></td><td>Archive a standalone agent-run transcript.</td><td><code>host</code>, <code>ignore_liveness</code> (skip the "still running" check when a PID was reused). 501 without <code>cp serve</code>.</td></tr>
+        <tr><td>DELETE</td><td><code>/api/transcripts/:id</code></td><td>Delete a standalone transcript.</td><td>Same parameters.</td></tr>
+      </tbody>
+    </table>
+    <h2 id="sessions">Sessions</h2>
+    <table>
+      <thead><tr><th>Method</th><th>Path</th><th>Purpose</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>GET</td><td><code>/api/sessions</code></td><td>Sessions, most recently updated first.</td><td><code>offset</code>, <code>limit</code>, <code>scope</code> (<code>active</code> / <code>archived</code>), <code>host</code>, <code>since</code>, <code>until</code>, <code>customer</code>.</td></tr>
+        <tr><td>GET</td><td><code>/api/sessions/:id</code></td><td>Session detail with usage and codename.</td><td><code>host</code>.</td></tr>
+        <tr><td>GET</td><td><code>/api/sessions/:id/runs</code></td><td>The session's turns for the chat view (<code>SessionRunRow</code>).</td><td><code>host</code>.</td></tr>
+        <tr><td>GET</td><td><code>/api/sessions/:id/usage-timeline</code></td><td>Tokens per model call.</td><td><code>host</code>.</td></tr>
+        <tr><td>POST</td><td><code>/api/sessions/:id/send</code></td><td>Send a prompt as the next turn.</td><td>Body <code>{prompt}</code> → <code>{run_id, host_id}</code>; watch the turn with <code>/api/transcript/stream</code>. 400 empty prompt; 409 session stopped; 501 without <code>cp serve</code>.</td></tr>
+        <tr><td>POST</td><td><code>/api/sessions/:id/archive</code></td><td>Archive a session.</td><td><code>host</code>.</td></tr>
+        <tr><td>POST</td><td><code>/api/sessions/:id/restore</code></td><td>Restore an archived session.</td><td><code>host</code>.</td></tr>
+        <tr><td>DELETE</td><td><code>/api/sessions/:id</code></td><td>Delete a session.</td><td><code>host</code>.</td></tr>
+      </tbody>
+    </table>
+    <p>Start a session with <code class="inline">POST /api/agents/:name/session</code>.</p>
+    <h2 id="launch-agents-and-workflows">Launch, agents and workflows</h2>
+    <p>Launches return as soon as the detached process is spawned; all are 501 without <code class="inline">rupu cp serve</code>.</p>
+    <table>
+      <thead><tr><th>Method</th><th>Path</th><th>Purpose</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>POST</td><td><code>/api/launch/preview</code></td><td>Who a launch would bill and authenticate as (<code>PreviewResponse</code>).</td><td>Body <code>{workflow</code> <em>or</em> <code>agent, working_dir?, scope_kind?, scope_id?, host?}</code>. 409 when the launch itself would fail to resolve (dangling customer, bad config). See <a class="link" href="/docs/customers.html">Customers</a>.</td></tr>
+        <tr><td>GET</td><td><code>/api/workflows</code></td><td>Workflow definitions, global and per project (<code>WorkflowDto</code>).</td><td></td></tr>
+        <tr><td>POST</td><td><code>/api/workflows</code></td><td>Create a workflow in the global layer.</td><td>Body <code>{raw}</code> (YAML). 409 if the name exists.</td></tr>
+        <tr><td>GET</td><td><code>/api/workflows/:name</code></td><td><code>{workflow, yaml, usage, scope, scope_kind, scope_id}</code>.</td><td></td></tr>
+        <tr><td>PUT</td><td><code>/api/workflows/:name</code></td><td>Overwrite a workflow.</td><td><code>scope_kind</code>, <code>scope_id</code>. Body <code>{raw}</code>; the YAML's name must match <code>:name</code>.</td></tr>
+        <tr><td>DELETE</td><td><code>/api/workflows/:name</code></td><td>Delete a workflow.</td><td><code>scope_kind</code>, <code>scope_id</code>.</td></tr>
+        <tr><td>POST</td><td><code>/api/workflows/:name/run</code></td><td>Launch a run → <code>{run_id, host_id}</code>.</td><td>Body <code>LaunchBody {inputs, mode, target, working_dir, host, scope_kind, scope_id}</code>. <code>scope_kind</code> and <code>working_dir</code> are mutually exclusive; scope pinning is local-only.</td></tr>
+        <tr><td>POST</td><td><code>/api/workflows/validate</code></td><td>Parse-check YAML without saving.</td><td>Body <code>{raw}</code>. 400 with the parse error.</td></tr>
+        <tr><td>POST</td><td><code>/api/workflows/generate</code></td><td>Draft a workflow from a description with a model.</td><td>Body <code>{description, provider?, model?}</code>.</td></tr>
+        <tr><td>GET</td><td><code>/api/generate/models</code></td><td>Providers and models available for generation.</td><td></td></tr>
+        <tr><td>GET</td><td><code>/api/agents</code></td><td>Agent definitions, global and per project (<code>AgentDto</code>).</td><td></td></tr>
+        <tr><td>POST</td><td><code>/api/agents</code></td><td>Create an agent in the global layer.</td><td>Body <code>{raw}</code> (the <code>.md</code> file). 409 if the name exists.</td></tr>
+        <tr><td>GET</td><td><code>/api/agents/:name</code></td><td>Agent detail with its prompt and raw file.</td><td></td></tr>
+        <tr><td>PUT</td><td><code>/api/agents/:name</code></td><td>Overwrite an agent.</td><td><code>scope_kind</code>, <code>scope_id</code>. Body <code>{raw}</code>.</td></tr>
+        <tr><td>DELETE</td><td><code>/api/agents/:name</code></td><td>Delete an agent.</td><td><code>scope_kind</code>, <code>scope_id</code>.</td></tr>
+        <tr><td>POST</td><td><code>/api/agents/:name/run</code></td><td>Launch an agent run → <code>{run_id, host_id}</code>.</td><td>Body <code>AgentRunBody {prompt, mode, target, working_dir, host, scope_kind, scope_id, findings_profile}</code>.</td></tr>
+        <tr><td>POST</td><td><code>/api/agents/:name/session</code></td><td>Start a session → <code>{session_id, host_id}</code>.</td><td>Body <code>SessionStartBody {prompt, mode, target, working_dir, host, scope_kind, scope_id}</code>.</td></tr>
+        <tr><td>POST</td><td><code>/api/agents/generate</code></td><td>Draft an agent from a description.</td><td>Body <code>{description, provider?, model?}</code>.</td></tr>
+      </tbody>
+    </table>
+    <pre class="code">curl -s -X POST -H "Authorization: Bearer $CP_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"inputs":{"pr":"42"},"mode":"readonly"}' \
+  http://127.0.0.1:7878/api/workflows/review-pr/run
+<span class="c"># {"run_id":"01JEXAMPLE0000000000000000","host_id":"local"}</span></pre>
+    <h2 id="autoflows">Autoflows</h2>
+    <table>
+      <thead><tr><th>Method</th><th>Path</th><th>Purpose</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>GET</td><td><code>/api/autoflows</code></td><td>Workflows with an <code>autoflow:</code> block, with trigger kind and enabled state.</td><td></td></tr>
+        <tr><td>POST</td><td><code>/api/autoflows/:name/enable</code></td><td>Set <code>autoflow.enabled: true</code> in the file (a <code>.bak</code> is kept).</td><td><code>scope_kind</code>, <code>scope_id</code>. 404 not an autoflow.</td></tr>
+        <tr><td>POST</td><td><code>/api/autoflows/:name/disable</code></td><td>Set it to <code>false</code>.</td><td>Same.</td></tr>
+        <tr><td>GET</td><td><code>/api/autoflows/claims</code></td><td>Issue claims held by the entity engine (<code>ClaimRow</code>).</td><td></td></tr>
+        <tr><td>POST</td><td><code>/api/autoflows/claims/release</code></td><td>Drop a claim.</td><td>Body <code>{issue_ref}</code> → <code>{released}</code>.</td></tr>
+        <tr><td>POST</td><td><code>/api/autoflows/claims/requeue</code></td><td>Queue a manual wake for a claimed issue.</td><td>Body <code>{issue_ref, not_before?}</code> → <code>{wake_id}</code>. 404 no claim.</td></tr>
+      </tbody>
+    </table>
+    <h2 id="findings">Findings</h2>
+    <p>Query language, tags and report export are covered in depth in <a class="link" href="/docs/findings.html">Findings</a>.</p>
+    <table>
+      <thead><tr><th>Method</th><th>Path</th><th>Purpose</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>GET</td><td><code>/api/findings</code></td><td>Every finding across all workspaces.</td><td>Query: <code>ws_id</code>, <code>workflow</code>, <code>run_id</code> (the run plus its direct sub-runs), <code>customer</code> (the project's <em>current</em> assignment), <code>q</code> (query language, e.g. <code>severity&gt;=high tag:triage</code>). Rows are slim: no <code>report</code> body, a <code>report_summary</code> on full-profile rows. Response also carries <code>summary</code>, <code>facets</code> (counts over the scope-filtered, unqueried set) and <code>tags_unavailable</code>. A bad <code>q</code> is a 400 <code>{error, token, code, start, end}</code>.</td></tr>
+        <tr><td>GET</td><td><code>/api/findings/:id</code></td><td>One finding in full.</td><td>Adds per-claim <code>evidence_status</code> (<code>current</code> / <code>changed</code> / <code>missing</code> / <code>unknown</code>), <code>tag_history</code>, <code>tags_editable</code>. 404 unknown id.</td></tr>
+        <tr><td>GET</td><td><code>/api/findings/:id/export</code></td><td>One finding as a report file.</td><td><code>format=md|html|pdf</code> (required). 400 bad format; 501 PDF in a build without the <code>pdf</code> feature; 404.</td></tr>
+        <tr><td>POST</td><td><code>/api/findings/export</code></td><td>Several findings as one report.</td><td>Body <code>ExportBody</code>: <code>format</code> (required), <code>title</code>, <code>ids</code>, <code>ws_id</code>, <code>run_id</code>, <code>min_severity</code>, <code>owner</code>, <code>cwe</code>, <code>include_summaries</code>, <code>split</code>. Returns <code>text/markdown</code>, <code>text/html</code>, <code>application/pdf</code>, or <code>application/zip</code> when <code>split</code>; always an attachment with <code>nosniff</code>. 404 when nothing matches.</td></tr>
+        <tr><td>GET</td><td><code>/api/findings/tags</code></td><td>Tags in use, most used first.</td><td>Query: <code>ws_id</code>.</td></tr>
+        <tr><td>POST</td><td><code>/api/findings/tags</code></td><td>Add / remove tags on many findings.</td><td>Body <code>TagChangeInput {finding_ids, add, remove}</code>; at most 1000 ids. Atomic per workspace; response <code>TagAcrossResult {workspaces, unknown}</code>. 404 only when <em>every</em> id is unknown. Recorded as <code>via: cp</code>.</td></tr>
+        <tr><td>GET</td><td><code>/api/findings/:id/artifacts/:sha256</code></td><td>An artifact or evidence-block file the finding references.</td><td>Text inline as <code>text/plain</code>, raster images inline as <code>image/*</code>, everything else as an attachment; always <code>nosniff</code> + <code>Content-Security-Policy: sandbox</code>. 404 if the finding doesn't reference it; 409 if a referenced workspace file changed since it was recorded; a remote artifact is pulled from its host on first view, and a failed pull is 404 <code>{"unavailable": reason}</code>.</td></tr>
+        <tr><td>GET</td><td><code>/api/findings/artifacts/:sha256</code></td><td><strong>Host-internal.</strong> Raw blob from this host's artifact store.</td><td>Used by a coordinator pulling a remote unit's artifact (<code>findings.artifact_blob</code> feature). Not finding-scoped. 404 if not in the store.</td></tr>
+      </tbody>
+    </table>
+    <h2 id="coverage-and-assets">Coverage and assets</h2>
+    <p>All local-only. <code class="inline">ws_id</code> is optional; without it the first workspace containing the target is used.</p>
+    <table>
+      <thead><tr><th>Method</th><th>Path</th><th>Purpose</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>GET</td><td><code>/api/coverage</code></td><td>Every coverage target across workspaces.</td><td><code>CoverageSummary</code> rows.</td></tr>
+        <tr><td>GET</td><td><code>/api/coverage/templates</code></td><td>Bundled concern templates.</td><td><code>TemplateSummary</code> rows.</td></tr>
+        <tr><td>GET</td><td><code>/api/coverage/templates/:name</code></td><td>One template.</td><td>404.</td></tr>
+        <tr><td>GET</td><td><code>/api/coverage/:target</code></td><td>Target detail: assertions, findings, files touched.</td><td><code>ws_id</code>. 404 unknown target.</td></tr>
+        <tr><td>GET</td><td><code>/api/coverage/:target/catalog</code></td><td>The concern catalog snapshot (<code>FlatCatalog</code>).</td><td><code>ws_id</code>.</td></tr>
+        <tr><td>GET</td><td><code>/api/coverage/:target/audit</code></td><td>Per-concern gap audit (<code>AuditReport</code>).</td><td><code>ws_id</code>.</td></tr>
+        <tr><td>GET</td><td><code>/api/coverage/:target/runs</code></td><td>Runs that contributed to the target.</td><td><code>ws_id</code>.</td></tr>
+        <tr><td>GET</td><td><code>/api/coverage/:target/diff</code></td><td>Two runs' contributions side by side (<code>RunDiff</code>).</td><td><code>ws_id</code>, <code>base</code> (default <code>previous</code>), <code>compare</code> (default <code>latest</code>, or a run id). 400 unknown run.</td></tr>
+        <tr><td>GET</td><td><code>/api/assets</code></td><td>Asset inventory (<code>AssetListResponse</code>).</td><td><code>ws_id</code>, <code>target</code>.</td></tr>
+      </tbody>
+    </table>
+    <h2 id="usage-and-dashboard">Usage and dashboard</h2>
+    <p><code class="inline">since</code> / <code class="inline">until</code> are RFC 3339 (default: the last 30 days). A value that doesn't parse is a 400.</p>
+    <table>
+      <thead><tr><th>Method</th><th>Path</th><th>Purpose</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>GET</td><td><code>/api/usage</code></td><td>Token and cost totals with a breakdown (<code>UsageResponse</code>).</td><td><code>since</code>, <code>until</code>, <code>group_by</code> (<code>provider</code>, <code>model</code> (default), <code>agent</code>, <code>workflow</code>, <code>host</code>, <code>project</code>), <code>host</code>, <code>customer</code>. Without <code>host</code>, fans out to every host and reports each one's freshness in <code>hosts</code>. 404 unknown host; <strong>501</strong> for <code>?host=&lt;remote&gt;&amp;customer=</code> (a remote aggregate arrives already summed).</td></tr>
+        <tr><td>GET</td><td><code>/api/usage/timeline</code></td><td>Gap-filled spend series.</td><td><code>since</code>, <code>until</code>, <code>bucket</code> (<code>day</code> / <code>week</code>), <code>customer</code>. Local only.</td></tr>
+        <tr><td>GET</td><td><code>/api/usage/runs</code></td><td>One row per run per model (<code>UsageRunRow</code>).</td><td><code>since</code>, <code>until</code>, <code>workspace_id</code>, <code>customer</code>. Local only.</td></tr>
+        <tr><td>GET</td><td><code>/api/usage/outliers</code></td><td>Runs costing at least 3× the median of their workflow (<code>OutlierRun</code>).</td><td><code>since</code>, <code>until</code>, <code>customer</code>. Needs ≥ 3 runs for a baseline. Local only.</td></tr>
+        <tr><td>GET</td><td><code>/api/dashboard</code></td><td>The Overview dashboard (<code>DashboardResponse</code>).</td><td><code>range</code> (<code>7d</code>, <code>30d</code>, <code>all</code>), <code>host</code>, <code>customer</code>. Same <code>host</code> / <code>customer</code> rules as <code>/api/usage</code>.</td></tr>
+      </tbody>
+    </table>
+    <p>Endpoints that take <code class="inline">customer</code> add an <code class="inline">X-Rupu-Hosts-Without-Customer</code> response header naming hosts whose rows couldn't be attributed — see <a class="link" href="/docs/customers.html">Customers</a>.</p>
+    <h2 id="netflow">Netflow</h2>
+    <p>Netflow reads take <code class="inline">from</code> / <code class="inline">to</code> (inclusive RFC 3339) and comma-separated dimension filters <code class="inline">workflow</code>, <code class="inline">origin</code>, <code class="inline">org</code> and <code class="inline">host</code>. Here <code class="inline">host</code> filters by <strong>remote endpoint</strong> (<code class="inline">host:port</code>), not by registered rupu host.</p>
+    <table>
+      <thead><tr><th>Method</th><th>Path</th><th>Purpose</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>GET</td><td><code>/api/runs/:id/netflow</code></td><td>One run's flows (<code>NetflowResponse</code>).</td><td>Proxied to the run's host when remote. 404 unknown run.</td></tr>
+        <tr><td>GET</td><td><code>/api/projects/:id/netflow</code></td><td>Project-scope flows.</td><td><code>incomplete</code> lists remote hosts not included.</td></tr>
+        <tr><td>GET</td><td><code>/api/netflow</code></td><td>Every workspace's flows.</td><td></td></tr>
+        <tr><td>GET</td><td><code>/api/netflow/graph</code></td><td>Source → endpoint graph (<code>GraphView</code>).</td><td><code>scope</code> (<code>run:&lt;id&gt;</code>, <code>project:&lt;id&gt;</code>, absent = global), <code>from</code>, <code>to</code>. Dimension filters are not applied.</td></tr>
+        <tr><td>GET</td><td><code>/api/netflow/explorer</code></td><td>Explorer aggregates: sankey, timeline, histogram, KPIs.</td><td><code>scope</code> plus the filters above.</td></tr>
+        <tr><td>GET</td><td><code>/api/netflow/index</code></td><td>Resident netflow index status (size, budget, evictions).</td><td></td></tr>
+      </tbody>
+    </table>
+    <h2 id="projects-and-code">Projects and code</h2>
+    <p>An unknown <code class="inline">ws_id</code> is a 404 on every route except the list.</p>
+    <table>
+      <thead><tr><th>Method</th><th>Path</th><th>Purpose</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>GET</td><td><code>/api/projects</code></td><td>Projects with rollups (<code>ProjectRow</code>).</td><td><code>customer</code>.</td></tr>
+        <tr><td>GET</td><td><code>/api/projects/:ws_id</code></td><td>Project overview (<code>ProjectDetail</code>): run/session counts, coverage, 10 recent runs, usage.</td><td></td></tr>
+        <tr><td>GET</td><td><code>/api/projects/:ws_id/runs</code></td><td>The project's runs.</td><td><code>offset</code>, <code>limit</code>.</td></tr>
+        <tr><td>GET</td><td><code>/api/projects/:ws_id/sessions</code></td><td>The project's sessions.</td><td><code>offset</code>, <code>limit</code>.</td></tr>
+        <tr><td>GET</td><td><code>/api/projects/:ws_id/coverage</code></td><td>Per-target coverage summary.</td><td></td></tr>
+        <tr><td>GET</td><td><code>/api/projects/:ws_id/coverage/assessed</code></td><td>Assessed percentage (<code>{assessed_pct}</code>).</td><td>Computed by a full audit; slower than the summary.</td></tr>
+        <tr><td>GET</td><td><code>/api/projects/:ws_id/agents</code></td><td>Agents the project can use (project overrides global by name).</td><td></td></tr>
+        <tr><td>GET</td><td><code>/api/projects/:ws_id/workflows</code></td><td>Workflows the project can use.</td><td></td></tr>
+        <tr><td>GET</td><td><code>/api/projects/:ws_id/autoflows</code></td><td>Autoflow definitions the project can use.</td><td></td></tr>
+        <tr><td>GET</td><td><code>/api/projects/:ws_id/tree</code></td><td>One directory of the checkout (<code>TreeResult</code>).</td><td><code>path</code> (workspace-relative). 400 for an absolute path, <code>..</code>, or a path leaving the workspace. Skips <code>.git</code>, <code>.rupu</code>, <code>node_modules</code>, <code>target</code>.</td></tr>
+        <tr><td>GET</td><td><code>/api/projects/:ws_id/source</code></td><td>One file's contents (<code>FileContent</code>).</td><td><code>path</code>. A missing, binary or &gt; 2 MiB file is 200 with <code>available: false</code> and a <code>reason</code>.</td></tr>
+        <tr><td>GET</td><td><code>/api/projects/:ws_id/files</code></td><td>Flat file list for search.</td><td>Capped at 20 000 (<code>truncated</code>).</td></tr>
+      </tbody>
+    </table>
+    <h2 id="hosts-workers-and-fleet">Hosts, workers and fleet</h2>
+    <table>
+      <thead><tr><th>Method</th><th>Path</th><th>Purpose</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>GET</td><td><code>/api/hosts</code></td><td>Hosts with health (<code>HostView</code>).</td><td>Local first, always online. Remote status comes from the probe cache (fresh 15 s; stale is served while one background refresh runs; &gt; 5 min or never probed is awaited).</td></tr>
+        <tr><td>GET</td><td><code>/api/hosts/registered</code></td><td>Registered hosts with no probe (<code>RegisteredHostView</code>).</td><td>What the per-host loaders iterate.</td></tr>
+        <tr><td>POST</td><td><code>/api/hosts</code></td><td>Register an HTTP control-plane host.</td><td>Body <code>AddHostBody {name, base_url, token?}</code>; the token goes to the keychain. 501 without <code>cp serve</code>.</td></tr>
+        <tr><td>POST</td><td><code>/api/hosts/ssh</code></td><td>Register an SSH host.</td><td>Body <code>AddSshHostBody {name, host, port?, identity_file?}</code>.</td></tr>
+        <tr><td>POST</td><td><code>/api/hosts/bucket</code></td><td>Register an object-store bucket host.</td><td>Body <code>AddBucketHostBody {name, url, prefix?}</code>.</td></tr>
+        <tr><td>POST</td><td><code>/api/hosts/node</code></td><td>Enroll a tunnel node.</td><td>Body <code>{name}</code>. Returns <code>EnrollNodeResponse {host, command, token}</code>; the plaintext token is shown once, only its hash is stored. 400 empty name.</td></tr>
+        <tr><td>DELETE</td><td><code>/api/hosts/:id</code></td><td>Remove a host.</td><td>204. 400 for <code>local</code>.</td></tr>
+        <tr><td>GET</td><td><code>/api/workers</code></td><td>Workers with run activity (<code>WorkerView</code>).</td><td></td></tr>
+        <tr><td>GET</td><td><code>/api/host/info</code></td><td><strong>Host-internal.</strong> This host's version, capabilities and feature list (<code>HostInfoResponse</code>).</td><td>A coordinator's HTTP connector reads <code>features</code> before using an optional capability.</td></tr>
+        <tr><td>GET</td><td><code>/api/node/connect</code></td><td><strong>Host-internal.</strong> WebSocket for <code>rupu node</code> tunnel peers.</td><td>Outside the bearer check. See <a class="link" href="#node-tunnel">Node tunnel</a>.</td></tr>
+      </tbody>
+    </table>
+    <h3 id="workspace-sync-host-internal">Workspace sync (host-internal)</h3>
+    <p>A coordinator placing a run on an HTTP host ships the workspace, runs there, and pulls back the diff. The web UI never calls these.</p>
+    <table>
+      <thead><tr><th>Method</th><th>Path</th><th>Purpose</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>POST</td><td><code>/api/workspace/stage</code></td><td>Stage a packed workspace (<code>rupu_workspace::Payload</code>, raw bytes).</td><td>Returns <code>{working_dir}</code>. 413 over the compiled 256 MiB cap; 400 over <code>[cp].max_workspace_bytes</code> or a malformed payload.</td></tr>
+        <tr><td>GET</td><td><code>/api/workspace/delta</code></td><td>Diff a staged dir against its baseline (<code>Delta</code>, octet-stream) and remove it.</td><td><code>dir</code>. 400 outside the sync root.</td></tr>
+        <tr><td>DELETE</td><td><code>/api/workspace/discard</code></td><td>Best-effort cleanup after a failed launch.</td><td><code>dir</code>.</td></tr>
+      </tbody>
+    </table>
+    <h2 id="config-models-and-tools">Config, models and tools</h2>
+    <table>
+      <thead><tr><th>Method</th><th>Path</th><th>Purpose</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>GET</td><td><code>/api/config</code></td><td>Effective config with per-key provenance and each layer's raw TOML (<code>ConfigView</code>).</td><td><code>project</code> (ws id) or <code>customer</code> (slug), not both. Includes <code>status {bind, token_set, restart_required_keys}</code> — the token itself is never returned. A malformed layer is 200 with <code>layer_error</code>.</td></tr>
+        <tr><td>PUT</td><td><code>/api/config/global</code></td><td>Write the global config.</td><td>Body <code>ConfigWriteBody {raw?, patch?}</code>. 400 invalid TOML. Validated, backed up, written atomically.</td></tr>
+        <tr><td>PUT</td><td><code>/api/config/customer/:slug</code></td><td>Write a customer's layer.</td><td>400 for a globally locked key or a layer that doesn't validate on top of global.</td></tr>
+        <tr><td>PUT</td><td><code>/api/config/project/:id</code></td><td>Write a project's <code>.rupu/config.toml</code>.</td><td>400 for a locked key or a project whose <code>.rupu/</code> is the global dir.</td></tr>
+        <tr><td>PUT</td><td><code>/api/config/policy</code></td><td>Set the global <code>[policy].lock</code>.</td><td>Body <code>{lock: [...]}</code>.</td></tr>
+        <tr><td>GET</td><td><code>/api/models</code></td><td>Model catalog per provider, with limits and provenance (<code>CatalogProvider</code>).</td><td>501 without <code>cp serve</code>.</td></tr>
+        <tr><td>POST</td><td><code>/api/models/refresh</code></td><td>Refetch provider model lists.</td><td>Body <code>{provider?}</code>; empty = all. 10 s per provider. 400 unknown provider.</td></tr>
+        <tr><td>GET</td><td><code>/api/tools</code></td><td>MCP tool catalog with JSON input schemas (<code>ToolsResponse</code>).</td><td>Feeds the workflow editor's action forms.</td></tr>
+        <tr><td>GET</td><td><code>/api/repos</code></td><td>Repositories visible to the configured SCM accounts.</td><td>501 with no SCM credentials.</td></tr>
+        <tr><td>GET</td><td><code>/api/fs/browse</code></td><td>Subdirectories of a server path, for the folder picker.</td><td><code>path</code> (default <code>$HOME</code>). Lists <strong>any</strong> directory on the server — another reason to keep the API on loopback or behind a token.</td></tr>
+      </tbody>
+    </table>
+    <h2 id="customers">Customers</h2>
+    <table>
+      <thead><tr><th>Method</th><th>Path</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td>GET</td><td><code>/api/customers</code></td><td>Customers with rollups (<code>archived</code>, <code>range=7d|30d|all</code>).</td></tr>
+        <tr><td>POST</td><td><code>/api/customers</code></td><td>Create (201).</td></tr>
+        <tr><td>GET</td><td><code>/api/customers/:slug</code></td><td>Detail with projects and rollup.</td></tr>
+        <tr><td>PATCH</td><td><code>/api/customers/:slug</code></td><td>Update metadata.</td></tr>
+        <tr><td>DELETE</td><td><code>/api/customers/:slug</code></td><td>Delete (409 with the project list while projects are assigned).</td></tr>
+        <tr><td>POST</td><td><code>/api/customers/:slug/archive</code></td><td>Archive.</td></tr>
+        <tr><td>POST</td><td><code>/api/customers/:slug/unarchive</code></td><td>Unarchive.</td></tr>
+        <tr><td>PUT</td><td><code>/api/customers/:slug/projects/:ws_id</code></td><td>Assign a project.</td></tr>
+        <tr><td>DELETE</td><td><code>/api/customers/:slug/projects/:ws_id</code></td><td>Unassign a project.</td></tr>
+      </tbody>
+    </table>
+    <p>Bodies, status codes, attribution and <code class="inline">?customer=</code> semantics: <a class="link" href="/docs/customers.html">Customers</a>.</p>
+    <h2 id="agentiflows">Agentiflows</h2>
+    <p>Local host only.</p>
+    <table>
+      <thead><tr><th>Method</th><th>Path</th><th>Purpose</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>GET</td><td><code>/api/agentiflows</code></td><td>All agentiflow runs, newest first (<code>{rows}</code>).</td><td></td></tr>
+        <tr><td>GET</td><td><code>/api/agentiflows/:id</code></td><td>One run: record, definition, budget, events, units, lead transcripts (<code>AgentiflowDetail</code>).</td><td>404 unknown or malformed id.</td></tr>
+        <tr><td>GET</td><td><code>/api/agentiflows/:id/messages</code></td><td>The run's message board (<code>{posts, directives}</code>).</td><td></td></tr>
+        <tr><td>POST</td><td><code>/api/agentiflows/:id/steer</code></td><td>Queue an operator message for the lead.</td><td>Body <code>SteerRequest {message, now?, stop?}</code> → <code>{queued: true}</code>. 400 empty message; 409 run not <code>running</code>.</td></tr>
+      </tbody>
+    </table>
+    <h2 id="node-tunnel">Node tunnel</h2>
+    <p><code class="inline">GET /api/node/connect</code> upgrades to a WebSocket for <code class="inline">rupu node</code> peers that dial home (a tunnel host). It is <strong>host-internal</strong> and sits outside the bearer check; it authenticates with the node's own enrollment token:</p>
+    <ol>
+      <li>Enroll the node with <code class="inline">POST /api/hosts/node</code>, which returns a one-time token and the <code class="inline">rupu node --cp-url ws://&lt;cp&gt;/api/node/connect --token … --node-id …</code> command to run on the node. Only the token's hash is stored.</li>
+      <li>Within 10 s of connecting, the node sends a <code class="inline">Hello</code> frame with its node id, token, capabilities and version. An unknown node or bad token closes the socket.</li>
+      <li>The CP answers <code class="inline">Welcome</code> with its own capabilities, then pings every 30 s. The node streams run artifacts (transcripts, coverage) and finished-run notices back over the same socket, and serves artifact pulls on request.</li>
+    </ol>
+    <p>A newer connection for the same node replaces an older one. Frames are JSON text messages; the shapes are <code class="inline">rupu-cp</code>'s <code class="inline">node::protocol::Frame</code>.</p>
+    <h2 id="health">Health</h2>
+    <table>
+      <thead><tr><th>Method</th><th>Path</th><th>Purpose</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>GET</td><td><code>/healthz</code></td><td>Liveness: <code>200 ok</code> (plain text).</td><td>Never requires the token. Response headers <code>x-rupu-pid</code> and <code>x-rupu-version</code> identify the serving process; a second <code>cp serve</code> that loses the bind race uses them to name the PID holding the port.</td></tr>
+      </tbody>
+    </table>
+    <pre class="code">curl -si http://127.0.0.1:7878/healthz
+<span class="c"># HTTP/1.1 200 OK</span>
+<span class="c"># x-rupu-pid: 41207</span>
+<span class="c"># x-rupu-version: 0.82.0</span>
+#
+<span class="c"># ok</span></pre>
+
+    <div class="doc-nav">
+      <a href="/docs/configuration.html">&#8592; Configuration</a>
+      <a href="/docs/transcripts.html">Transcript schema &#8594;</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

@@ -27,6 +27,7 @@
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
     <a class="item active" href="/docs/agentiflows.html">Agentiflows</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
+    <a class="item" href="/docs/profiles.html">Engagement profiles</a>
     <div class="grp">Platform</div>
     <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
     <a class="item" href="/docs/reliability.html">Recovery &amp; reliability</a>
@@ -39,6 +40,11 @@
     <a class="item" href="/docs/coverage.html">Coverage</a>
     <a class="item" href="/docs/findings.html">Findings</a>
     <a class="item" href="/docs/customers.html">Customers</a>
+    <div class="grp">Reference</div>
+    <a class="item" href="/docs/cli.html">CLI reference</a>
+    <a class="item" href="/docs/configuration.html">Configuration</a>
+    <a class="item" href="/docs/api.html">HTTP API</a>
+    <a class="item" href="/docs/transcripts.html">Transcript schema</a>
     <div class="grp">More</div>
     <a class="item" href="/docs/examples/">Examples</a>
     <a class="item" href="/#download">Download</a>
@@ -202,7 +208,7 @@
       <tbody>
         <tr><td><code>name</code></td><td>yes</td><td>The run's definition name.</td></tr>
         <tr><td><code>lead</code></td><td>yes</td><td>The agent that runs each round. Must be listed in <code>pool.agents</code>.</td></tr>
-        <tr><td><code>engagement_profiles</code></td><td>yes</td><td>The engagement profile set (<code>code</code>, <code>web</code>, <code>network</code>, <code>binary</code>, …) that defines the asset kinds, coverage ladders and finding classifications the goals refer to. An unknown profile id fails the load. It's carried to every unit the lead launches.</td></tr>
+        <tr><td><code>engagement_profiles</code></td><td>yes</td><td>The engagement profile set (<code>code</code>, <code>web</code>, <code>network</code>, <code>binary</code>, …) that defines the asset kinds, coverage ladders and finding classifications the goals refer to. An unknown profile id fails the load. It's carried to every unit the lead launches. See <a class="link" href="/docs/profiles.html">Engagement profiles</a>.</td></tr>
         <tr><td><code>goals</code></td><td>one of goals / coverage</td><td>Measurable targets. A <strong>findings</strong> target counts findings (optionally by <code>classification</code>, e.g. <code>CWE-89</code>) and needs <code>count_gte</code>. An <strong>asset</strong> target names a profile-namespaced kind plus a <code>locator</code> and needs <code>depth_at_least</code>, a rung of that profile's coverage ladder. <code>required</code> defaults to <code>true</code>.</td></tr>
         <tr><td><code>coverage</code></td><td>one of goals / coverage</td><td>An engagement-wide stop: <code>reach</code> in <code>(0, 1]</code>, an optional <code>depth</code> rung, and optional <code>kinds</code> to measure. Validated to be reachable.</td></tr>
         <tr><td><code>budget</code></td><td>no</td><td><code>usd</code>, <code>tokens</code>, <code>wall_clock</code> (<code>Ns</code>/<code>Nm</code>/<code>Nh</code>/<code>Nd</code>), <code>rounds</code>, and <code>soft_at</code> (default <code>0.8</code>). Every field is optional; an unset one never stops the run. See <a class="link" href="#budget">Budgets</a>.</td></tr>

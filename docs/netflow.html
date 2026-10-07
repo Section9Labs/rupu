@@ -27,6 +27,7 @@
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
     <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
+    <a class="item" href="/docs/profiles.html">Engagement profiles</a>
     <div class="grp">Platform</div>
     <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
     <a class="item" href="/docs/reliability.html">Recovery &amp; reliability</a>
@@ -39,6 +40,11 @@
     <a class="item" href="/docs/coverage.html">Coverage</a>
     <a class="item" href="/docs/findings.html">Findings</a>
     <a class="item" href="/docs/customers.html">Customers</a>
+    <div class="grp">Reference</div>
+    <a class="item" href="/docs/cli.html">CLI reference</a>
+    <a class="item" href="/docs/configuration.html">Configuration</a>
+    <a class="item" href="/docs/api.html">HTTP API</a>
+    <a class="item" href="/docs/transcripts.html">Transcript schema</a>
     <div class="grp">More</div>
     <a class="item" href="/docs/examples/">Examples</a>
     <a class="item" href="/#download">Download</a>
@@ -221,14 +227,14 @@
         <tr>
           <td><strong>Linux</strong></td>
           <td><code class="inline">sock_diag</code> netlink: a short poll of every TCP/UDP socket (default every 50 ms) plus the kernel's socket-close notifications with final byte counts.</td>
-          <td>By cgroup: each bash call's shell moves itself into a per-call cgroup before running anything, so every descendant — even a detached one — is attributed. Where no delegated cgroup is available, it falls back to the process tree and says so on the run.</td>
+          <td>By cgroup: each bash call's shell moves itself into a per-call cgroup before running anything, so every descendant — even a detached one — is attributed. Where no delegated cgroup is available, capture is reported as <strong>unavailable</strong> on the run (naming the cgroup and why); there is no process-tree fallback on Linux.</td>
         </tr>
       </tbody>
     </table>
     <p>
       Each connection becomes one flow at <code class="inline">socket</code>
       fidelity: transport, remote IP and port, local address, the process name
-      and pid, direction (macOS), open and close times, and bytes in and out where
+      and pid, open and close times, and bytes in and out where
       the OS reports them (UDP has none on Linux). It carries the
       <strong>tool-call id</strong> of the bash call that caused it, so the CP's
       flow table links straight to that call in the run's transcript. There is no
@@ -271,7 +277,7 @@
         <tr><td><code>peer_ip</code></td><td>The peer actually connected to. Absent at <code>coarse</code> fidelity. This is the field ASN enrichment keys on.</td></tr>
         <tr><td><code>process</code></td><td>The process that owned the socket — <code>pid</code> and <code>name</code>. Socket flows only.</td></tr>
         <tr><td><code>local_addr</code></td><td>The local <code>ip:port</code>, for correlating with other logs. Socket flows only.</td></tr>
-        <tr><td><code>direction</code></td><td><code>outbound</code> | <code>inbound</code>, when the OS reports it. Socket flows only.</td></tr>
+        <tr><td><code>direction</code></td><td><code>outbound</code> | <code>inbound</code>. Reserved in the schema; no capture backend fills it in yet.</td></tr>
         <tr><td><code>resolved_ips</code></td><td>Every A/AAAA answer the custom DNS resolver saw for the host — strictly more than the one peer used.</td></tr>
         <tr><td><code>http_version</code></td><td>Negotiated HTTP version, when known.</td></tr>
         <tr><td><code>status</code></td><td>Response status code, when a response was received.</td></tr>

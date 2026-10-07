@@ -27,6 +27,7 @@
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
     <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
+    <a class="item" href="/docs/profiles.html">Engagement profiles</a>
     <div class="grp">Platform</div>
     <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
     <a class="item" href="/docs/reliability.html">Recovery &amp; reliability</a>
@@ -39,6 +40,11 @@
     <a class="item" href="/docs/coverage.html">Coverage</a>
     <a class="item" href="/docs/findings.html">Findings</a>
     <a class="item" href="/docs/customers.html">Customers</a>
+    <div class="grp">Reference</div>
+    <a class="item" href="/docs/cli.html">CLI reference</a>
+    <a class="item" href="/docs/configuration.html">Configuration</a>
+    <a class="item" href="/docs/api.html">HTTP API</a>
+    <a class="item" href="/docs/transcripts.html">Transcript schema</a>
     <div class="grp">More</div>
     <a class="item" href="/docs/examples/">Examples</a>
     <a class="item" href="/#download">Download</a>
@@ -59,7 +65,9 @@
       Everything below is validated at <strong>parse time</strong>. Workflow YAML is parsed strictly: unknown keys
       inside <code class="inline">trigger:</code>, <code class="inline">inputs:</code>,
       <code class="inline">panel:</code>, <code class="inline">branch:</code>, <code class="inline">approval:</code>,
-      <code class="inline">distribute:</code>, a step, or the document root are rejected outright rather than
+      <code class="inline">distribute:</code>, <code class="inline">defaults:</code>, <code class="inline">contracts:</code>,
+      <code class="inline">autoflow:</code> (and each of its sub-blocks), <code class="inline">run:</code>,
+      <code class="inline">join:</code>, a loop definition, a step, or the document root are rejected outright rather than
       silently ignored. A typo is a load error, not a surprise at 3 a.m.
     </p>
 
@@ -79,9 +87,9 @@
         <tr><td><code>defaults</code></td><td>object</td><td>no</td><td><code class="inline">{}</code></td><td>Per-workflow defaults inherited by every step (<code class="inline">continue_on_error</code>, <code class="inline">workspace</code>, <code class="inline">findings_profile</code>).</td></tr>
         <tr><td><code>steps</code></td><td>array&lt;Step&gt;</td><td>yes</td><td>&mdash;</td><td>The ordered step list. An empty array is a parse error.</td></tr>
         <tr><td><code>contracts</code></td><td>object</td><td>no</td><td><code class="inline">{}</code></td><td>Named machine-readable workflow outputs under <code class="inline">contracts.outputs.&lt;name&gt;</code>, validated against a stored schema.</td></tr>
-        <tr><td><code>autoflow</code></td><td>object</td><td>no</td><td>none</td><td>Autonomous-ownership metadata consumed by <code class="inline">rupu autoflow</code>. See <a class="link" href="/docs/autoflows.html">Autoflows</a>.</td></tr>
+        <tr><td><code>autoflow</code></td><td>object</td><td>no</td><td>none</td><td>Autonomous-ownership metadata consumed by <code class="inline">rupu autoflow</code>. Fields in <a class="link" href="#autoflow">the autoflow block</a>; behaviour on <a class="link" href="/docs/autoflows.html">Autoflows</a>.</td></tr>
         <tr><td><code>notifyIssue</code></td><td>bool</td><td>no</td><td><code class="inline">false</code></td><td>When true <em>and</em> the run target resolves to an issue, rupu auto-comments on the issue at run start and at terminal state. Note the camelCase spelling &mdash; it is the literal YAML key.</td></tr>
-        <tr><td><code>concerns</code></td><td>list</td><td>no</td><td>none</td><td>Coverage catalog for the whole run. When present it overrides each step agent's own <code class="inline">concerns:</code> so every step shares one ledger. See <a class="link" href="/docs/coverage.html">Coverage</a>.</td></tr>
+        <tr><td><code>concerns</code></td><td>list</td><td>no</td><td>none</td><td>Coverage catalog for the whole run. When present it overrides each step agent's own <code class="inline">concerns:</code> so every step shares one ledger. See <a class="link" href="#concerns">the concerns block</a>.</td></tr>
         <tr><td><code>loops</code></td><td>map&lt;string, LoopDef&gt;</td><td>no</td><td><code class="inline">{}</code></td><td>Named, bounded loops over a subgraph of existing steps. See <a class="link" href="#graph">Graph orchestration</a>.</td></tr>
         <tr><td><code>max_concurrency</code></td><td>integer</td><td>no</td><td>unbounded</td><td>Cap on how many nodes a graph workflow runs at once, across the whole graph. Must be &#8805; 1. Ignored by a plain chain workflow.</td></tr>
       </tbody>
@@ -152,6 +160,104 @@
       If a step's <code class="inline">contract</code> disagrees with the workflow-level declaration that points at
       it, the workflow is invalid &mdash; the workflow-level entry is the runtime authority.
     </p>
+
+    <h3 id="concerns">The <code class="inline">concerns:</code> block</h3>
+    <p>
+      A workflow can declare one coverage catalog for the whole run, in the same shape as an agent&rsquo;s
+      <code class="inline">concerns:</code> frontmatter (catalog includes, with optional overrides, filters and render
+      mode). When it does, <strong>every agent step runs with it</strong>, and each step agent&rsquo;s own
+      <code class="inline">concerns:</code> is ignored for this run. When it doesn&rsquo;t, each step uses its agent&rsquo;s
+      block, if any.
+    </p>
+    <pre class="code"><span class="k">name</span>: <span class="v">payments-review</span>
+<span class="k">concerns</span>:
+  - <span class="k">include</span>: <span class="s">owasp-top10-2021</span>
+  - <span class="k">include</span>: <span class="s">secrets-in-source</span>
+<span class="k">steps</span>:
+  - <span class="k">id</span>: <span class="v">map</span>
+    <span class="k">agent</span>: <span class="v">surface-mapper</span>        <span class="c"># its own concerns: (if any) are ignored here</span>
+    <span class="k">actions</span>: <span class="v">[]</span>
+    <span class="k">prompt</span>: <span class="s">"Map the request handlers under services/payments."</span>
+  - <span class="k">id</span>: <span class="v">review</span>
+    <span class="k">agent</span>: <span class="v">security-reviewer</span>
+    <span class="k">actions</span>: <span class="v">[]</span>
+    <span class="k">prompt</span>: <span class="s">"Review what map found: &#123;&#123; steps.map.output &#125;&#125;"</span></pre>
+    <p>
+      All of a workflow&rsquo;s steps report into <strong>one coverage target</strong>, keyed by the workflow&rsquo;s
+      name, so their file touches, verdicts and findings accumulate in one ledger whichever agent ran each step.
+      The workflow-level block is what makes that ledger coherent: one catalog, one snapshot, one audit. (A
+      workflow launched as an <a class="link" href="/docs/agentiflows.html">agentiflow</a> unit reports into the
+      agentiflow&rsquo;s target instead.) See <a class="link" href="/docs/coverage.html#workflow-concerns">Coverage</a>.
+    </p>
+
+    <h3 id="autoflow">The <code class="inline">autoflow:</code> block</h3>
+    <p>
+      Optional metadata that lets <code class="inline">rupu autoflow</code> run the workflow on its own: which issues or
+      pull requests it may claim, when it wakes, where it works, and which declared output it hands back. The
+      <code class="inline">steps:</code> DSL is unchanged. Every key is optional and unknown keys are rejected at every
+      level. This is the field list; the behaviour (claims, leases, worktrees, the outcome loop) is explained on
+      <a class="link" href="/docs/autoflows.html">Autoflows</a>.
+    </p>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>enabled</code></td><td>bool</td><td><code class="inline">false</code></td><td>Marks the workflow as autonomously runnable. Everything else in the block is inert until this is <code class="inline">true</code>.</td></tr>
+        <tr><td><code>entity</code></td><td><code>issue</code> | <code>pull_request</code></td><td><code class="inline">issue</code></td><td>The kind of item this autoflow owns. <code class="inline">pull_request</code> unlocks the PR-only selector fields.</td></tr>
+        <tr><td><code>source</code></td><td>string</td><td>the repo binding</td><td>Explicit discovery source when the work lives outside the repo, e.g. <code class="inline">github:acme/widgets</code>.</td></tr>
+        <tr><td><code>priority</code></td><td>integer</td><td><code class="inline">0</code></td><td>When several autoflows select the same item, the highest priority wins the claim; ties go to the workflow name that sorts first. Negative values are allowed.</td></tr>
+        <tr><td><code>selector</code></td><td>object</td><td>empty (matches every item)</td><td>Candidate filter. See <a class="link" href="#autoflow-selector">the selector table</a> below.</td></tr>
+        <tr><td><code>wake_on</code></td><td>array&lt;string&gt;</td><td><code class="inline">[]</code></td><td>Event ids that mark a candidate dirty and due for reconciliation. Same vocabulary and <code class="inline">*</code> glob matching as <a class="link" href="/docs/triggers.html">triggers</a>.</td></tr>
+        <tr><td><code>reconcile_every</code></td><td>duration</td><td>unset</td><td>Maximum time between reconciliations of an already-claimed item.</td></tr>
+        <tr><td><code>claim.key</code></td><td><code>issue</code> | <code>pr_head_sha</code></td><td><code class="inline">issue</code></td><td>What a claim is keyed on: one durable claim per issue, or one per pull request <em>at a given head SHA</em>.</td></tr>
+        <tr><td><code>claim.ttl</code></td><td>duration</td><td>unset (no lease expiry)</td><td>How long the ownership lease is valid before another worker may take the item over.</td></tr>
+        <tr><td><code>workspace.strategy</code></td><td><code>worktree</code> | <code>in_place</code></td><td><code class="inline">worktree</code></td><td>A durable per-item git worktree, or the repo's own checkout. With no <code class="inline">workspace:</code> block at all, <code class="inline">[autoflow].checkout</code> in config decides.</td></tr>
+        <tr><td><code>workspace.branch</code></td><td>template string</td><td>derived from the entity</td><td>The branch the worktree sits on. The only template-rendered field in the block (rendered strictly). Not consulted for <code class="inline">entity: pull_request</code>.</td></tr>
+        <tr><td><code>outcome.output</code></td><td>string</td><td>&mdash; (required inside <code class="inline">outcome:</code>)</td><td>Names a key under <code class="inline">contracts.outputs</code> whose parsed value decides the claim's next state. An undeclared name is a parse error.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      <strong>Durations</strong> (<code class="inline">reconcile_every</code>, <code class="inline">claim.ttl</code>) are digits
+      followed by exactly one of <code class="inline">s</code>, <code class="inline">m</code>, <code class="inline">h</code>,
+      <code class="inline">d</code> &mdash; <code class="inline">45s</code>, <code class="inline">15m</code>,
+      <code class="inline">6h</code>, <code class="inline">2d</code>. Compound forms and bare numbers are parse errors.
+    </p>
+
+    <h3 id="autoflow-selector">The <code class="inline">autoflow.selector:</code> block</h3>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>states</code></td><td>array of <code>open</code> | <code>closed</code></td><td><code class="inline">[]</code> (any state)</td><td>The item's state must be one of these.</td></tr>
+        <tr><td><code>labels_all</code></td><td>array&lt;string&gt;</td><td><code class="inline">[]</code></td><td><strong>Every</strong> listed label must be present. Sent to the connector as the server-side narrowing filter.</td></tr>
+        <tr id="labels-any"><td><code>labels_any</code></td><td>array&lt;string&gt;</td><td><code class="inline">[]</code> (no constraint)</td><td><strong>At least one</strong> listed label must be present. An empty list imposes nothing. Applied locally after the fetch, because the issue connectors only filter conjunctively.</td></tr>
+        <tr id="labels-none"><td><code>labels_none</code></td><td>array&lt;string&gt;</td><td><code class="inline">[]</code></td><td><strong>None</strong> of the listed labels may be present &mdash; the usual way to make an item drop out of the loop once it has been handled. Applied locally.</td></tr>
+        <tr><td><code>limit</code></td><td>integer</td><td>connector default</td><td>Cap on how many candidates one discovery query returns.</td></tr>
+        <tr><td><code>draft</code></td><td><code>include</code> | <code>exclude</code> | <code>only</code></td><td>unset (both)</td><td><strong>Pull requests only</strong> &mdash; a parse error on <code class="inline">entity: issue</code>.</td></tr>
+        <tr><td><code>base</code></td><td>string</td><td>unset (any base)</td><td><strong>Pull requests only</strong>: restrict to PRs targeting this base branch. A parse error on <code class="inline">entity: issue</code>.</td></tr>
+        <tr><td><code>authors</code></td><td>array&lt;string&gt;</td><td><code class="inline">[]</code></td><td>Explicit author-login allowlist. A listed login is always allowed.</td></tr>
+        <tr><td><code>authors_from</code></td><td><code>collaborators</code> | <code>org_members</code></td><td>unset</td><td>Broader author scope, resolved by the SCM connector at tick time.</td></tr>
+        <tr><td><code>on_skip</code></td><td><code>skip</code> | <code>label_needs_human</code></td><td><code class="inline">skip</code></td><td>What happens to an item excluded <em>solely</em> by the author gate.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      The three label lists combine with AND: an item must carry every <code class="inline">labels_all</code> label,
+      at least one <code class="inline">labels_any</code> label (when that list is non-empty), and no
+      <code class="inline">labels_none</code> label. Labels compare as exact, case-sensitive strings.
+    </p>
+    <pre class="code"><span class="k">autoflow</span>:
+  <span class="k">enabled</span>: <span class="v">true</span>
+  <span class="k">entity</span>: <span class="v">issue</span>
+  <span class="k">selector</span>:
+    <span class="k">states</span>: [<span class="v">open</span>]
+    <span class="k">labels_all</span>: [<span class="s">bot-ready</span>]
+    <span class="k">labels_any</span>: [<span class="s">area:parser</span>, <span class="s">area:cli</span>]    <span class="c"># either area will do</span>
+    <span class="k">labels_none</span>: [<span class="s">blocked</span>, <span class="s">bot-done</span>]       <span class="c"># drop out once handled</span>
+  <span class="k">wake_on</span>: [<span class="s">"github.issue.*"</span>]
+  <span class="k">reconcile_every</span>: <span class="s">"30m"</span>
+  <span class="k">claim</span>: { <span class="k">key</span>: <span class="v">issue</span>, <span class="k">ttl</span>: <span class="s">"2h"</span> }
+  <span class="k">workspace</span>:
+    <span class="k">strategy</span>: <span class="v">worktree</span>
+    <span class="k">branch</span>: <span class="s">"bot/issue-&#123;&#123; issue.number &#125;&#125;"</span>
+  <span class="k">outcome</span>: { <span class="k">output</span>: <span class="v">result</span> }       <span class="c"># must name a contracts.outputs key</span></pre>
 
     <h2>Inputs</h2>
     <p>
@@ -739,7 +845,7 @@
         <tr><td><code>id</code></td><td>string</td><td>all</td><td>Required. Must be unique within the workflow. Referenced as <code class="inline">steps.&lt;id&gt;</code> in templates &mdash; so use identifier-safe characters (letters, digits, underscore); a hyphen truncates the reference.</td></tr>
         <tr><td><code>when</code></td><td>string</td><td>all except <code>branch</code></td><td>Minijinja expression reduced to truthy/falsy; falsy skips the step and sets <code class="inline">steps.&lt;id&gt;.skipped</code>. Evaluated <em>before</em> approval. Rejected on a <code class="inline">branch:</code> step and on <code class="inline">on_reject</code> cleanup steps.</td></tr>
         <tr><td><code>continue_on_error</code></td><td>bool</td><td>all</td><td>Tolerate this step's failure and keep going. Inherits <code class="inline">defaults.continue_on_error</code> when unset. On fan-out shapes it applies <em>per unit</em> &mdash; a failed item is recorded with <code class="inline">success = false</code> and the rest still dispatch.</td></tr>
-        <tr><td><code>actions</code></td><td>array&lt;string&gt;</td><td>all</td><td>The action-protocol allowlist &mdash; <strong>not</strong> a tool allowlist. Tool access lives in the agent's own <code class="inline">tools:</code> list. Unless you deliberately use the action protocol, write <code class="inline">actions: []</code>.</td></tr>
+        <tr><td><code>actions</code></td><td>array&lt;string&gt;</td><td>agent steps</td><td>Narrows the agent&rsquo;s <em>connector</em> tools for this step to the ones listed; built-ins are untouched. Each entry must be an MCP catalog tool name. <code class="inline">[]</code> (or omitting it) leaves the agent&rsquo;s grant as is. Must be empty on an <code class="inline">action:</code> step and on a <code class="inline">host:</code>/<code class="inline">distribute:</code> step. See <a class="link" href="#step-actions">Step actions</a>.</td></tr>
         <tr><td><code>max_parallel</code></td><td>integer</td><td><code>for_each</code>, <code>parallel</code>, <code>panel</code></td><td>Concurrency cap; must be &#8805; 1. Absent means serial in declared order. Ignored on non-fan-out shapes. On <code class="inline">panel</code> it is set inside the <code class="inline">panel:</code> block.</td></tr>
         <tr><td><code>host</code></td><td>string</td><td>linear only</td><td>Run this step's agent on a named fleet host. Rejected on <code class="inline">for_each</code>/<code class="inline">parallel</code>/<code class="inline">panel</code>/<code class="inline">branch</code>/<code class="inline">action</code>/gate nodes, alongside <code class="inline">distribute:</code>, and when empty.</td></tr>
         <tr><td><code>distribute</code></td><td>object</td><td><code>for_each</code> only</td><td><code class="inline">{ hosts: [...] }</code>, spread round-robin. Rejected without <code class="inline">for_each:</code>, rejected outright on a <code class="inline">run:</code> step (which executes on the coordinator), and <code class="inline">hosts</code> must be non-empty.</td></tr>
@@ -751,6 +857,51 @@
         <tr><td><code>depends_on</code></td><td>array&lt;string&gt;</td><td>all</td><td>Predecessor step ids &mdash; the inverse of <code class="inline">next</code>. <code class="inline">a.next: [b]</code> and <code class="inline">b.depends_on: [a]</code> describe the same edge.</td></tr>
       </tbody>
     </table>
+
+    <h3 id="step-actions">Step actions: narrowing connector tools</h3>
+    <p>
+      An agent&rsquo;s <code class="inline">tools:</code> says what it may ever call. A step&rsquo;s
+      <code class="inline">actions:</code> narrows that, for this step only, to a subset of the <strong>connector</strong>
+      tools &mdash; the MCP catalog (<code class="inline">scm.*</code>, <code class="inline">issues.*</code>,
+      <code class="inline">findings.*</code>, <code class="inline">github.workflows_dispatch</code>,
+      <code class="inline">gitlab.pipeline_trigger</code>; the full list is <a class="link" href="#the-action-catalog">the action catalog</a>).
+    </p>
+    <pre class="code"><span class="k">steps</span>:
+  - <span class="k">id</span>: <span class="v">triage</span>
+    <span class="k">agent</span>: <span class="v">issue-triager</span>           <span class="c"># tools: ["*"]</span>
+    <span class="k">actions</span>: <span class="v">[issues.get, issues.comment]</span>
+    <span class="k">prompt</span>: <span class="s">"Triage &#123;&#123; inputs.issue &#125;&#125; and leave one comment."</span></pre>
+    <p>Here the agent keeps <code class="inline">bash</code>, <code class="inline">read_file</code> and every other built-in, can read and comment on issues, and can&rsquo;t open a PR, dispatch a CI workflow or touch any other connector tool during this step.</p>
+    <table>
+      <thead><tr><th>Rule</th><th>What it means</th></tr></thead>
+      <tbody>
+        <tr><td>Empty means unchanged</td><td><code>actions: []</code>, or no key, leaves the agent&rsquo;s grant exactly as declared. Existing workflows keep working.</td></tr>
+        <tr><td>Connector tools only</td><td>Built-ins (<code>bash</code>, <code>read_file</code>, <code>ast_grep</code>, &hellip;) are never removed, whatever the list says.</td></tr>
+        <tr><td>No escalation</td><td>The step&rsquo;s connector tools are the agent&rsquo;s grant <em>intersected</em> with <code>actions:</code>. Wildcards in <code>tools:</code> (<code>scm.*</code>, <code>*</code>) are expanded first; an agent with no <code>tools:</code> counts as granted everything. Listing a tool the agent isn&rsquo;t granted doesn&rsquo;t grant it &mdash; rupu logs a warning, since it&rsquo;s probably an authoring mistake.</td></tr>
+        <tr><td>Checked at load</td><td>Every entry must name a catalog tool; an unknown name is a parse error. A non-empty list is rejected on an <code>action:</code> step (its tool is already explicit) and on a <code>host:</code>/<code>distribute:</code> step, where the narrowing couldn&rsquo;t reach the remote agent.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      <strong>The <code class="inline">tool_audit</code> trail.</strong> Every connector call a step makes &mdash; by an
+      agent, or by an <code class="inline">action:</code> node &mdash; writes one <code class="inline">tool_audit</code>
+      event to the step&rsquo;s transcript. Built-in calls don&rsquo;t. Four booleans describe it:
+    </p>
+    <table>
+      <thead><tr><th>Field</th><th>True when</th></tr></thead>
+      <tbody>
+        <tr><td><code>restricted</code></td><td>The step declared a non-empty <code>actions:</code> list.</td></tr>
+        <tr><td><code>declared</code></td><td>The step&rsquo;s <code>actions:</code> names this tool. Always false on an unrestricted step, which is not a violation &mdash; check <code>restricted</code>.</td></tr>
+        <tr><td><code>granted</code></td><td>The agent&rsquo;s <code>tools:</code> covers this tool, before narrowing. Always true for an <code>action:</code> node.</td></tr>
+        <tr><td><code>blocked</code></td><td>The call was denied: narrowed out of the step, or refused by the permission mode (a write in <code>readonly</code>).</td></tr>
+      </tbody>
+    </table>
+    <pre class="code">{<span class="s">"type"</span>:<span class="s">"tool_audit"</span>,<span class="s">"data"</span>:{<span class="s">"tool"</span>:<span class="s">"scm.prs.create"</span>,<span class="s">"declared"</span>:<span class="v">false</span>,<span class="s">"granted"</span>:<span class="v">true</span>,<span class="s">"blocked"</span>:<span class="v">true</span>,<span class="s">"restricted"</span>:<span class="v">true</span>}}</pre>
+    <p>
+      That line reads: the agent is allowed to open PRs in general, this step didn&rsquo;t list it, and the call was
+      blocked. The live run view flags blocked calls, and the control plane&rsquo;s transcript view badges each
+      audited call. The full event schema is in <a class="link" href="/docs/transcripts.html#tool-audit">Transcripts</a>.
+    </p>
+    <div class="callout"><strong>Sub-agents aren&rsquo;t covered.</strong> A sub-agent the step starts with <code class="inline">dispatch_agent</code> runs under its own grant: <code class="inline">actions:</code> doesn&rsquo;t narrow it, and its connector calls aren&rsquo;t in this step&rsquo;s trail. rupu logs a warning on every dispatch and leaves a note saying so in the sub-agent&rsquo;s own transcript.</div>
 
     <h3 id="findings-profile">Findings profile</h3>
     <p>
@@ -820,7 +971,7 @@
     <span class="k">max_iterations</span>: <span class="v">3</span>
     <span class="k">on_max</span>: <span class="v">proceed</span></pre>
 
-    <h2>The action catalog</h2>
+    <h2 id="the-action-catalog">The action catalog</h2>
     <p>
       These are the tools an <code class="inline">action:</code> step (or a gate's
       <code class="inline">notify:</code>/<code class="inline">on_reject:</code> entry) may name. It is the same
