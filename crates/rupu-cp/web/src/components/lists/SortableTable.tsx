@@ -421,6 +421,8 @@ export default function SortableTable<T>({
                     title={reason ?? undefined}
                     onChange={() => selection.onToggle(row)}
                     onClick={(e) => e.stopPropagation()}
+                    // Space toggles the box, never the row's own click.
+                    onKeyDown={(e) => e.stopPropagation()}
                   />
                 );
               })()}

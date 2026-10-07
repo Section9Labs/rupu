@@ -57,6 +57,26 @@ describe('SortableTable selection', () => {
     fireEvent.click(all);
     expect(onToggleAll).toHaveBeenCalledWith([rows[0], rows[1]], false);
   });
+  it("a key on a row's checkbox never reaches the row's click", () => {
+    const onRowClick = vi.fn();
+    render(
+      <MemoryRouter>
+        <SortableTable
+          columns={cols}
+          rows={[{ id: 'a' }]}
+          rowKey={(r) => r.id}
+          onRowClick={onRowClick}
+          selection={{ isSelected: () => false, label: (r) => `Select ${r.id}`, onToggle: vi.fn(), onToggleAll: vi.fn() }}
+        />
+      </MemoryRouter>,
+    );
+    const box = screen.getByRole('checkbox', { name: 'Select a' });
+    const space = fireEvent.keyDown(box, { key: ' ' });
+    fireEvent.keyDown(box, { key: 'Enter' });
+    expect(onRowClick).not.toHaveBeenCalled();
+    // Not default-prevented, so the browser still toggles the box.
+    expect(space).toBe(true);
+  });
   it('no selection prop renders no checkboxes', () => {
     render(
       <MemoryRouter>
