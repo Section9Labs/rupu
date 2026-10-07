@@ -320,6 +320,96 @@ describe('FindingDetail page', () => {
     });
   });
 
+  describe('tags', () => {
+    const removed = {
+      workspaces: [{ ws_id: 'ws1', outcomes: [{ finding_id: 'fnd_1', before: ['needs-poc'], after: [] }] }],
+      unknown: [],
+    };
+
+    beforeEach(() => {
+      vi.spyOn(api, 'getTagsInUse').mockResolvedValue([]);
+    });
+
+    it('removes a tag through the API and refetches the finding', async () => {
+      const get = vi.spyOn(api, 'getFinding').mockResolvedValue(
+        base({ profile: 'summary', report: null, tags: ['needs-poc'], tags_editable: true }),
+      );
+      const tag = vi.spyOn(api, 'tagFindings').mockResolvedValue(removed);
+      renderAt();
+
+      expect(await screen.findByText('needs-poc')).toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: 'Remove tag needs-poc' }));
+
+      await waitFor(() => expect(tag).toHaveBeenCalledWith(['fnd_1'], { remove: ['needs-poc'] }));
+      await waitFor(() => expect(get).toHaveBeenCalledTimes(2));
+    });
+
+    it('shows tags read-only, with no remove button, when the tag log is unreadable', async () => {
+      vi.spyOn(api, 'getFinding').mockResolvedValue(
+        base({ profile: 'summary', report: null, tags: ['needs-poc'], tags_editable: false }),
+      );
+      renderAt();
+
+      expect(await screen.findByText('needs-poc')).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: /Remove tag/ })).toBeNull();
+      expect(screen.getByText('tags read-only')).toBeInTheDocument();
+    });
+
+    it('shows a workspace error as an alert and does not refetch', async () => {
+      const get = vi.spyOn(api, 'getFinding').mockResolvedValue(
+        base({ profile: 'full', report, evidence_status: ['current'], tags: ['needs-poc'], tags_editable: true }),
+      );
+      vi.spyOn(api, 'tagFindings').mockResolvedValue({
+        workspaces: [{ ws_id: 'ws1', error: 'tag log is locked' }],
+        unknown: [],
+      });
+      renderAt();
+
+      fireEvent.click(await screen.findByRole('button', { name: 'Remove tag needs-poc' }));
+
+      const alert = await screen.findByRole('alert');
+      expect(alert).toHaveTextContent("demo's tags couldn't be changed: tag log is locked.");
+      expect(get).toHaveBeenCalledTimes(1);
+    });
+
+    it('lists the tag history in a disclosure', async () => {
+      vi.spyOn(api, 'getFinding').mockResolvedValue(
+        base({
+          profile: 'summary',
+          report: null,
+          tags: ['needs-poc'],
+          tag_history: [{
+            id: 'tev_1',
+            finding_id: 'fnd_1',
+            op: 'add',
+            tag: 'needs-poc',
+            by: { kind: 'agent', run_id: 'run_42', model: 'claude-x', surface: 'agent', codename: 'cobalt-harbor/heron', agent: 'recon' },
+            at: '2026-08-02T00:00:00Z',
+          }],
+        }),
+      );
+      renderAt();
+
+      const summary = await screen.findByText('Tag history (1)');
+      const details = summary.closest('details')!;
+      expect(within(details).getByText('+ needs-poc')).toBeInTheDocument();
+      expect(within(details).getByText('cobalt-harbor/heron (recon)')).toBeInTheDocument();
+    });
+
+    it("loads the project's tags in use as suggestions", async () => {
+      vi.spyOn(api, 'getFinding').mockResolvedValue(
+        base({ profile: 'summary', report: null, tags: [], tags_editable: true }),
+      );
+      const inUse = vi.spyOn(api, 'getTagsInUse').mockResolvedValue([{ tag: 'needs-poc', count: 3 }]);
+      renderAt();
+
+      fireEvent.click(await screen.findByRole('button', { name: /tag$/ }));
+      await waitFor(() => expect(inUse).toHaveBeenCalledWith({ wsId: 'ws1' }));
+      fireEvent.change(screen.getByRole('combobox', { name: 'Add tag' }), { target: { value: 'needs' } });
+      expect(await screen.findByText('needs-poc')).toBeInTheDocument();
+    });
+  });
+
   it('shows an alert with the error text when the API fails', async () => {
     vi.spyOn(api, 'getFinding').mockRejectedValue(new Error('404 finding not found'));
     renderAt('missing');
