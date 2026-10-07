@@ -175,6 +175,9 @@ pub struct FindingsQuery {
     pub workflow: Option<String>,
     /// Keep only findings whose `declared_by.run_id` matches.
     pub run_id: Option<String>,
+    /// A findings query (`severity>=high tag:needs-poc ...`), applied after
+    /// the `ws_id` / `workflow` / `run_id` scope. A bad one is a 400.
+    pub q: Option<String>,
 }
 
 /// Per-severity counts plus the grand total.
@@ -192,6 +195,12 @@ pub struct FindingsSummary {
 pub struct FindingsResponse {
     pub findings: Vec<FindingOut>,
     pub summary: FindingsSummary,
+    /// Values in use per query key over the scope (ws/workflow/run), before
+    /// `q`: autocomplete and the severity tiles.
+    pub facets: std::collections::BTreeMap<&'static str, Vec<rupu_coverage::FacetValue>>,
+    /// Workspaces whose finding-tag log could not be read: their findings are
+    /// served with declared tags only, and tag filters may miss them.
+    pub tags_unavailable: Vec<String>,
 }
 
 /// Sort rank for a severity: critical (highest) sorts first.
@@ -269,7 +278,12 @@ pub(crate) fn build_response(mut findings: Vec<FindingOut>) -> FindingsResponse 
         }
     }
 
-    FindingsResponse { findings, summary }
+    FindingsResponse {
+        findings,
+        summary,
+        facets: Default::default(),
+        tags_unavailable: Vec::new(),
+    }
 }
 
 fn store_for(global_dir: &std::path::Path) -> WorkspaceStore {
@@ -291,10 +305,13 @@ fn project_name(path: &str) -> String {
 ///
 /// This is the one workspace/target walk. Tolerant by design: a workspace
 /// whose path is gone, or a target whose `findings.jsonl` is absent/unreadable,
-/// is skipped with a `warn!` rather than failing the caller.
+/// is skipped with a `warn!` rather than failing the caller. A workspace whose
+/// tag log cannot be read is still walked (declared tags only) and its id is
+/// pushed to `tags_unavailable`.
 fn each_ledger(
     global_dir: &std::path::Path,
     mut f: impl FnMut(&rupu_workspace::Workspace, &str, CoveragePaths, Vec<FindingRecord>),
+    tags_unavailable: &mut Vec<String>,
 ) {
     let workspaces = store_for(global_dir).list().unwrap_or_default();
     for w in &workspaces {
@@ -320,6 +337,7 @@ fn each_ledger(
                     error = %e,
                     "cannot read the finding-tag log; showing declared tags only"
                 );
+                tags_unavailable.push(w.id.clone());
                 Vec::new()
             }
         };
@@ -352,41 +370,54 @@ fn each_ledger(
 /// `findings.jsonl` is absent/unreadable, is skipped with a `warn!` rather
 /// than failing the caller.
 pub fn collect_all_findings(global_dir: &std::path::Path) -> Vec<FindingOut> {
+    collect_all_findings_reporting(global_dir).0
+}
+
+/// [`collect_all_findings`], plus the ids of the workspaces whose finding-tag
+/// log could not be read (their findings carry declared tags only).
+pub fn collect_all_findings_reporting(
+    global_dir: &std::path::Path,
+) -> (Vec<FindingOut>, Vec<String>) {
     let mut out: Vec<FindingOut> = Vec::new();
-    each_ledger(global_dir, |w, target_id, _paths, records| {
-        let project = project_name(&w.path);
-        for record in records {
-            // `w` (the owning workspace) is already in hand for every
-            // finding in this target — no separate lookup/memoization is
-            // needed, unlike a flat finding list without provenance.
-            let permalink = match (w.repo_remote.as_deref(), record.file_path.as_deref()) {
-                (Some(remote), Some(path)) => rupu_scm::weburl::repo_permalink(
-                    remote,
-                    w.initial_branch.as_deref(),
-                    path,
-                    record.line_range,
-                ),
-                _ => None,
-            };
-            let (codename, codename_derived) = crate::codename::named(
-                record.declared_by.codename.as_deref(),
-                &record.declared_by.run_id,
-                None,
-            );
-            out.push(FindingOut {
-                codename,
-                codename_derived,
-                ws_id: w.id.clone(),
-                project: project.clone(),
-                target_id: target_id.to_string(),
-                workflow_name: None,
-                permalink,
-                report_summary: None,
-                record,
-            });
-        }
-    });
-    out
+    let mut tags_unavailable: Vec<String> = Vec::new();
+    each_ledger(
+        global_dir,
+        |w, target_id, _paths, records| {
+            let project = project_name(&w.path);
+            for record in records {
+                // `w` (the owning workspace) is already in hand for every
+                // finding in this target — no separate lookup/memoization is
+                // needed, unlike a flat finding list without provenance.
+                let permalink = match (w.repo_remote.as_deref(), record.file_path.as_deref()) {
+                    (Some(remote), Some(path)) => rupu_scm::weburl::repo_permalink(
+                        remote,
+                        w.initial_branch.as_deref(),
+                        path,
+                        record.line_range,
+                    ),
+                    _ => None,
+                };
+                let (codename, codename_derived) = crate::codename::named(
+                    record.declared_by.codename.as_deref(),
+                    &record.declared_by.run_id,
+                    None,
+                );
+                out.push(FindingOut {
+                    codename,
+                    codename_derived,
+                    ws_id: w.id.clone(),
+                    project: project.clone(),
+                    target_id: target_id.to_string(),
+                    workflow_name: None,
+                    permalink,
+                    report_summary: None,
+                    record,
+                });
+            }
+        },
+        &mut tags_unavailable,
+    );
+    (out, tags_unavailable)
 }
 
 /// Which ledger holds each finding: id → the coverage paths of every ledger
@@ -394,11 +425,15 @@ pub fn collect_all_findings(global_dir: &std::path::Path) -> Vec<FindingOut> {
 /// uses it to find the finding a report belongs to.
 pub fn finding_ledgers(global_dir: &std::path::Path) -> HashMap<String, Vec<CoveragePaths>> {
     let mut out: HashMap<String, Vec<CoveragePaths>> = HashMap::new();
-    each_ledger(global_dir, |_, _, paths, records| {
-        for r in records {
-            out.entry(r.id).or_default().push(paths.clone());
-        }
-    });
+    each_ledger(
+        global_dir,
+        |_, _, paths, records| {
+            for r in records {
+                out.entry(r.id).or_default().push(paths.clone());
+            }
+        },
+        &mut Vec::new(),
+    );
     out
 }
 
@@ -434,15 +469,19 @@ pub fn tag_findings_across(
     change.check()?;
     // finding id → each (ws_id, workspace path) holding it, once per path.
     let mut homes: HashMap<String, Vec<(String, std::path::PathBuf)>> = HashMap::new();
-    each_ledger(global_dir, |w, _, _, records| {
-        let path = std::path::PathBuf::from(&w.path);
-        for r in records {
-            let entry = homes.entry(r.id).or_default();
-            if !entry.iter().any(|(_, p)| *p == path) {
-                entry.push((w.id.clone(), path.clone()));
+    each_ledger(
+        global_dir,
+        |w, _, _, records| {
+            let path = std::path::PathBuf::from(&w.path);
+            for r in records {
+                let entry = homes.entry(r.id).or_default();
+                if !entry.iter().any(|(_, p)| *p == path) {
+                    entry.push((w.id.clone(), path.clone()));
+                }
             }
-        }
-    });
+        },
+        &mut Vec::new(),
+    );
     let mut out = TagAcrossResult::default();
     let mut by_ws: std::collections::BTreeMap<(String, std::path::PathBuf), Vec<String>> =
         std::collections::BTreeMap::new();
@@ -616,8 +655,22 @@ pub fn query_findings(
 async fn list_findings(
     State(s): State<AppState>,
     Query(q): Query<FindingsQuery>,
-) -> ApiResult<Json<FindingsResponse>> {
-    let mut out: Vec<FindingOut> = collect_all_findings(&s.global_dir);
+) -> Result<Json<FindingsResponse>, axum::response::Response> {
+    use axum::response::IntoResponse;
+    let parsed = rupu_coverage::parse_query(q.q.as_deref().unwrap_or("")).map_err(|e| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": e.message,
+                "token": e.token,
+                "code": e.code,
+                "start": e.start,
+                "end": e.end,
+            })),
+        )
+            .into_response()
+    })?;
+    let (mut out, tags_unavailable) = collect_all_findings_reporting(&s.global_dir);
 
     // Join `declared_by.run_id → workflow_name` via the RunStore. Load each
     // distinct run id once; a load error / NotFound leaves that id out of the
@@ -641,13 +694,19 @@ async fn list_findings(
         .as_ref()
         .map(|parent| resolve_run_scope(&s.run_store, parent));
 
-    let mut resp = scope_by_run_set(out, &run_ids, &q.ws_id, &q.workflow);
+    let scoped = scope_by_run_set(out, &run_ids, &q.ws_id, &q.workflow).findings;
+    // Facets describe the scope, before `q` narrows it.
+    let facets = rupu_coverage::facets(scoped.iter().map(finding_view));
+    let filtered = query_findings(&s.run_store, scoped, &parsed);
+    let mut resp = build_response(filtered);
     // List rows never carry the report body; full-profile rows get a summary.
     resp.findings = resp
         .findings
         .into_iter()
         .map(FindingOut::into_list_row)
         .collect();
+    resp.facets = facets;
+    resp.tags_unavailable = tags_unavailable;
     Ok(Json(resp))
 }
 
@@ -4646,5 +4705,104 @@ mod tests {
             "{md}"
         );
         assert!(!md.contains("base64"), "{md}");
+    }
+
+    // ---- GET /api/findings?q= ----
+
+    /// One registered workspace with three findings: `fnd_crit` (critical,
+    /// tagged `needs-poc`), `fnd_high` and `fnd_low`. Returns the workspace path.
+    fn seed_query_fixture(global: &std::path::Path) -> std::path::PathBuf {
+        let records = [
+            finding("fnd_crit", Severity::Critical, "2026-09-29T00:00:00Z").record,
+            finding("fnd_high", Severity::High, "2026-09-28T00:00:00Z").record,
+            finding("fnd_low", Severity::Low, "2026-09-27T00:00:00Z").record,
+        ];
+        let repo = seed_workspace_findings(global, &records);
+        rupu_coverage::apply(
+            &rupu_coverage::TagLog::for_workspace(&repo),
+            &rupu_coverage::TagChange {
+                finding_ids: vec!["fnd_crit".to_string()],
+                add: vec![rupu_coverage::Tag::parse("needs-poc").unwrap()],
+                remove: vec![],
+            },
+            &rupu_coverage::TagActor::operator(rupu_coverage::OperatorSurface::Cli),
+        )
+        .unwrap();
+        repo
+    }
+
+    fn facet_count(json: &serde_json::Value, key: &str, value: &str) -> Option<u64> {
+        json["facets"][key]
+            .as_array()?
+            .iter()
+            .find(|v| v["value"] == value)
+            .and_then(|v| v["count"].as_u64())
+    }
+
+    #[tokio::test]
+    async fn list_findings_q_filters_but_facets_stay_unfiltered() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_query_fixture(tmp.path());
+        let (status, json) =
+            get_json(app_for(tmp.path()), "/api/findings?q=severity%3E%3Dhigh").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(json["findings"].as_array().unwrap().len(), 2);
+        assert_eq!(json["summary"]["total"], 2);
+        assert_eq!(facet_count(&json, "severity", "critical"), Some(1));
+        assert_eq!(facet_count(&json, "severity", "high"), Some(1));
+        assert_eq!(facet_count(&json, "severity", "low"), Some(1));
+    }
+
+    #[tokio::test]
+    async fn list_findings_q_tag_selects_the_tagged_row_and_serves_its_tags() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_query_fixture(tmp.path());
+        let (status, json) = get_json(app_for(tmp.path()), "/api/findings?q=tag%3Aneeds-poc").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let rows = json["findings"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], "fnd_crit");
+        assert_eq!(rows[0]["tags"], serde_json::json!(["needs-poc"]));
+    }
+
+    #[tokio::test]
+    async fn list_findings_bad_q_is_a_structured_400() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_query_fixture(tmp.path());
+        let (status, json) = get_json(app_for(tmp.path()), "/api/findings?q=sevrity%3Ahigh").await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(json["code"], "unknown_key");
+        assert_eq!(json["token"], 0);
+        assert_eq!(json["start"], 0);
+        assert!(json["end"].is_number());
+        assert!(
+            json["error"].as_str().unwrap().contains("unknown key"),
+            "{json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_findings_reports_a_workspace_whose_tag_log_is_unreadable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = seed_query_fixture(tmp.path());
+        // A directory where the log should be: reading it is an I/O error,
+        // unlike a missing file.
+        let log = rupu_coverage::TagLog::for_workspace(&repo).path;
+        std::fs::remove_file(&log).unwrap();
+        std::fs::create_dir(&log).unwrap();
+        let (status, json) = get_json(app_for(tmp.path()), "/api/findings").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(json["tags_unavailable"], serde_json::json!(["ws1"]));
+        assert_eq!(json["findings"].as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn list_findings_without_q_returns_everything_and_no_unavailable_tags() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_query_fixture(tmp.path());
+        let (status, json) = get_json(app_for(tmp.path()), "/api/findings").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(json["findings"].as_array().unwrap().len(), 3);
+        assert_eq!(json["tags_unavailable"], serde_json::json!([]));
     }
 }
