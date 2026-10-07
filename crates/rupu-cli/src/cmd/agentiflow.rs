@@ -533,6 +533,7 @@ fn mark_failed(run_dir: &Path, why: &str) {
     record.status = "failed".into();
     record.stop_reason = Some(format!("error: {why}"));
     record.ended_at = Some(chrono::Utc::now());
+    record.runner_pid = None;
     if let Err(e) = record.write(run_dir) {
         tracing::warn!(error = %e, "could not record the aborted agentiflow run");
     }
@@ -1207,12 +1208,16 @@ mod tests {
             codename: None,
             spent_usd: None,
             spent_tokens: 0,
+            runner_pid: None,
         };
 
-        record("running").write(tmp.path()).unwrap();
+        let mut running = record("running");
+        running.runner_pid = Some(4321);
+        running.write(tmp.path()).unwrap();
         mark_failed(tmp.path(), "boom");
         let after = AgentiflowRecord::read(tmp.path()).unwrap();
         assert_eq!(after.status, "failed");
+        assert_eq!(after.runner_pid, None, "a closed-out run owns no pid");
         assert_eq!(after.stop_reason.as_deref(), Some("error: boom"));
         assert!(after.ended_at.is_some());
 
@@ -1328,6 +1333,7 @@ pool:
             codename: None,
             spent_usd: None,
             spent_tokens: 0,
+            runner_pid: None,
         }
         .write(&agentiflow_dir(global).join(id))
         .unwrap();

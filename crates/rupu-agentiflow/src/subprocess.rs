@@ -46,7 +46,9 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::proc::{kill_group, terminate_group};
-use crate::unit::{UnitError, UnitId, UnitKind, UnitLauncher, UnitOutcome, UnitSpec, UnitStatus};
+use crate::unit::{
+    Spawned, UnitError, UnitId, UnitKind, UnitLauncher, UnitOutcome, UnitSpec, UnitStatus,
+};
 use rupu_orchestrator::{RunStatus, RunStore, RunStoreError};
 
 /// How long `Drop` waits for SIGTERMed units to exit before it SIGKILLs them.
@@ -363,7 +365,7 @@ impl SubprocessUnitLauncher {
 }
 
 impl UnitLauncher for SubprocessUnitLauncher {
-    fn spawn(&self, spec: &UnitSpec, run_dir: &Path) -> Result<UnitId, UnitError> {
+    fn spawn(&self, spec: &UnitSpec, run_dir: &Path) -> Result<Spawned, UnitError> {
         let id = format!("run_{}", ulid::Ulid::new());
         let mut cmd = Command::new(&self.exe);
         cmd.args((self.argv)(spec, &id, run_dir))
@@ -394,7 +396,12 @@ impl UnitLauncher for SubprocessUnitLauncher {
                 done: None,
             },
         );
-        Ok(UnitId(id))
+        // `process_group(0)` made the child its own group leader, so its pid is
+        // the pgid the supervisor persists for out-of-process group signalling.
+        Ok(Spawned {
+            id: UnitId(id),
+            pgid: Some(pid),
+        })
     }
 
     fn poll(&self, id: &UnitId, _run_dir: &Path) -> UnitStatus {
@@ -756,7 +763,8 @@ mod tests {
             });
         let id = launcher
             .spawn(&spec(&[]), Path::new("/the/run/dir"))
-            .unwrap();
+            .unwrap()
+            .id;
         assert!(id.0.starts_with("run_"), "pre-minted run id: {id:?}");
         assert_eq!(
             seen.lock().unwrap().clone(),
@@ -895,7 +903,7 @@ mod tests {
             dir,
             &format!("sleep 30 & echo $! > {}; wait", pidfile.display()),
         );
-        let id = launcher.spawn(&spec(&[]), dir).unwrap();
+        let id = launcher.spawn(&spec(&[]), dir).unwrap().id;
         let grandchild = read_pid_file(&pidfile);
         assert!(pid_is_running(grandchild));
         (launcher, id, grandchild)
@@ -907,7 +915,7 @@ mod tests {
         // Long enough that the child never exits on its own mid-test: every
         // state below is driven explicitly, not raced against its natural exit.
         let launcher = sh(dir.path(), "sleep 5");
-        let id = launcher.spawn(&spec(&[]), dir.path()).unwrap();
+        let id = launcher.spawn(&spec(&[]), dir.path()).unwrap().id;
         let pid = pid_of(&launcher, &id);
 
         // Alive but no transcript yet: not started as far as evidence goes.
@@ -931,7 +939,7 @@ mod tests {
     fn a_clean_exit_with_an_answer_is_done_successful_and_stays_done() {
         let dir = tempfile::tempdir().unwrap();
         let launcher = sh(dir.path(), "exit 0");
-        let id = launcher.spawn(&spec(&[]), dir.path()).unwrap();
+        let id = launcher.spawn(&spec(&[]), dir.path()).unwrap().id;
         // Written before the first poll, so the outcome read cannot race it.
         write_transcript(dir.path(), &id, Some("all clear"));
         let done = wait_terminal(&launcher, &id, dir.path());
@@ -949,7 +957,7 @@ mod tests {
     fn an_exited_unit_is_terminal_and_reaped_not_left_a_zombie() {
         let dir = tempfile::tempdir().unwrap();
         let launcher = sh(dir.path(), "exit 0");
-        let id = launcher.spawn(&spec(&[]), dir.path()).unwrap();
+        let id = launcher.spawn(&spec(&[]), dir.path()).unwrap().id;
         let pid = pid_of(&launcher, &id);
 
         // Give it time to exit, and do NOT poll: nobody has reaped it, so it is
@@ -973,7 +981,7 @@ mod tests {
     fn a_failing_unit_that_wrote_an_answer_is_done_unsuccessful() {
         let dir = tempfile::tempdir().unwrap();
         let launcher = sh(dir.path(), "sleep 0.2; exit 3");
-        let id = launcher.spawn(&spec(&[]), dir.path()).unwrap();
+        let id = launcher.spawn(&spec(&[]), dir.path()).unwrap().id;
         write_transcript(dir.path(), &id, Some("blocked by waf"));
         assert_eq!(
             wait_terminal(&launcher, &id, dir.path()),
@@ -988,7 +996,7 @@ mod tests {
     fn a_failing_unit_with_no_answer_is_failed() {
         let dir = tempfile::tempdir().unwrap();
         let launcher = sh(dir.path(), "exit 7");
-        let id = launcher.spawn(&spec(&[]), dir.path()).unwrap();
+        let id = launcher.spawn(&spec(&[]), dir.path()).unwrap().id;
         assert!(matches!(
             wait_terminal(&launcher, &id, dir.path()),
             UnitStatus::Failed(_)
@@ -999,7 +1007,7 @@ mod tests {
     fn a_clean_exit_without_an_answer_is_done_with_empty_output() {
         let dir = tempfile::tempdir().unwrap();
         let launcher = sh(dir.path(), "exit 0");
-        let id = launcher.spawn(&spec(&[]), dir.path()).unwrap();
+        let id = launcher.spawn(&spec(&[]), dir.path()).unwrap().id;
         assert_eq!(
             wait_terminal(&launcher, &id, dir.path()),
             UnitStatus::Done(UnitOutcome {
@@ -1013,7 +1021,7 @@ mod tests {
     fn terminate_stops_a_running_unit_promptly_and_it_reads_failed() {
         let dir = tempfile::tempdir().unwrap();
         let launcher = sh(dir.path(), "sleep 5");
-        let id = launcher.spawn(&spec(&[]), dir.path()).unwrap();
+        let id = launcher.spawn(&spec(&[]), dir.path()).unwrap().id;
         let pid = pid_of(&launcher, &id);
         assert!(pid_is_running(pid));
 
@@ -1060,8 +1068,8 @@ mod tests {
     fn dropping_the_launcher_terminates_and_reaps_live_units() {
         let dir = tempfile::tempdir().unwrap();
         let launcher = sh(dir.path(), "sleep 30");
-        let a = launcher.spawn(&spec(&[]), dir.path()).unwrap();
-        let b = launcher.spawn(&spec(&[]), dir.path()).unwrap();
+        let a = launcher.spawn(&spec(&[]), dir.path()).unwrap().id;
+        let b = launcher.spawn(&spec(&[]), dir.path()).unwrap().id;
         let (pa, pb) = (pid_of(&launcher, &a), pid_of(&launcher, &b));
         assert!(pid_is_running(pa) && pid_is_running(pb));
 
@@ -1103,7 +1111,7 @@ mod tests {
                 pidfile.display()
             ),
         );
-        let id = launcher.spawn(&spec(&[]), dir.path()).unwrap();
+        let id = launcher.spawn(&spec(&[]), dir.path()).unwrap().id;
         let grandchild = read_pid_file(&pidfile);
         let leader = pid_of(&launcher, &id);
 
@@ -1211,7 +1219,7 @@ mod tests {
             "0.3",
             "exit 0",
         );
-        let id = launcher.spawn(&workflow_spec(), dir.path()).unwrap();
+        let id = launcher.spawn(&workflow_spec(), dir.path()).unwrap().id;
 
         // Alive, and `run.json` is not there yet: not started.
         assert_eq!(launcher.poll(&id, dir.path()), UnitStatus::Pending);
@@ -1231,7 +1239,7 @@ mod tests {
     fn a_completed_workflow_with_no_steps_is_done_with_empty_output() {
         let dir = tempfile::tempdir().unwrap();
         let launcher = workflow_launcher(dir.path(), "completed", None, &[], "0", "exit 0");
-        let id = launcher.spawn(&workflow_spec(), dir.path()).unwrap();
+        let id = launcher.spawn(&workflow_spec(), dir.path()).unwrap().id;
         assert_eq!(
             wait_terminal(&launcher, &id, dir.path()),
             UnitStatus::Done(UnitOutcome {
@@ -1253,7 +1261,7 @@ mod tests {
             "0",
             "exit 0",
         );
-        let id = launcher.spawn(&workflow_spec(), dir.path()).unwrap();
+        let id = launcher.spawn(&workflow_spec(), dir.path()).unwrap().id;
         assert_eq!(
             wait_terminal(&launcher, &id, dir.path()),
             UnitStatus::Failed("step `scan` failed: boom".into())
@@ -1265,7 +1273,7 @@ mod tests {
         for status in ["rejected", "cancelled"] {
             let dir = tempfile::tempdir().unwrap();
             let launcher = workflow_launcher(dir.path(), status, None, &[], "0", "exit 0");
-            let id = launcher.spawn(&workflow_spec(), dir.path()).unwrap();
+            let id = launcher.spawn(&workflow_spec(), dir.path()).unwrap().id;
             let got = wait_terminal(&launcher, &id, dir.path());
             assert_eq!(got, UnitStatus::Failed(format!("workflow run {status}")));
         }
@@ -1276,7 +1284,7 @@ mod tests {
         for status in ["awaiting_approval", "paused"] {
             let dir = tempfile::tempdir().unwrap();
             let launcher = workflow_launcher(dir.path(), status, None, &[], "0", "exit 0");
-            let id = launcher.spawn(&workflow_spec(), dir.path()).unwrap();
+            let id = launcher.spawn(&workflow_spec(), dir.path()).unwrap().id;
             assert_eq!(
                 wait_terminal(&launcher, &id, dir.path()),
                 UnitStatus::Failed("workflow unit parked at an approval gate".into()),
@@ -1289,7 +1297,7 @@ mod tests {
     fn a_workflow_that_exits_without_writing_run_json_is_failed() {
         let dir = tempfile::tempdir().unwrap();
         let launcher = sh(dir.path(), "exit 0");
-        let id = launcher.spawn(&workflow_spec(), dir.path()).unwrap();
+        let id = launcher.spawn(&workflow_spec(), dir.path()).unwrap().id;
         assert_eq!(
             wait_terminal(&launcher, &id, dir.path()),
             UnitStatus::Failed("workflow exited before writing run.json".into())
@@ -1302,7 +1310,7 @@ mod tests {
         // `run.json` says `running` and the runner dies by SIGKILL: the run
         // never reached a terminal state, so the unit must not read as alive.
         let launcher = workflow_launcher(dir.path(), "running", None, &[], "0", "kill -9 $$");
-        let id = launcher.spawn(&workflow_spec(), dir.path()).unwrap();
+        let id = launcher.spawn(&workflow_spec(), dir.path()).unwrap().id;
         let got = wait_terminal(&launcher, &id, dir.path());
         assert!(
             matches!(&got, UnitStatus::Failed(why) if why.contains("signal 9") && why.contains("running")),
@@ -1321,7 +1329,7 @@ mod tests {
             "0",
             "sleep 5",
         );
-        let id = launcher.spawn(&workflow_spec(), dir.path()).unwrap();
+        let id = launcher.spawn(&workflow_spec(), dir.path()).unwrap().id;
         let pid = pid_of(&launcher, &id);
 
         // The copy lands a moment after spawn; poll until it has.
@@ -1351,7 +1359,7 @@ mod tests {
             "0",
             &format!("sleep 30 & echo $! > {}; wait", pidfile.display()),
         );
-        let id = launcher.spawn(&workflow_spec(), dir.path()).unwrap();
+        let id = launcher.spawn(&workflow_spec(), dir.path()).unwrap().id;
         let grandchild = read_pid_file(&pidfile);
         let leader = pid_of(&launcher, &id);
 
@@ -1388,7 +1396,7 @@ mod tests {
         std::fs::create_dir_all(&workspace).unwrap();
 
         let launcher = sh(&global, "sleep 5").with_workspace(&workspace);
-        let id = launcher.spawn(&spec(&[]), tmp.path()).unwrap();
+        let id = launcher.spawn(&spec(&[]), tmp.path()).unwrap().id;
         assert_eq!(launcher.poll(&id, tmp.path()), UnitStatus::Pending);
 
         write_transcript_in(&transcripts, &id, Some("found it"));
@@ -1413,7 +1421,7 @@ mod tests {
         std::fs::create_dir_all(&workspace).unwrap();
 
         let launcher = sh(&global, "sleep 5").with_workspace(&workspace);
-        let id = launcher.spawn(&spec(&[]), tmp.path()).unwrap();
+        let id = launcher.spawn(&spec(&[]), tmp.path()).unwrap().id;
         write_transcript(&global, &id, Some("global one"));
         assert_eq!(launcher.poll(&id, tmp.path()), UnitStatus::Running);
         assert_eq!(launcher.final_text(&id.0).as_deref(), Some("global one"));
@@ -1427,12 +1435,15 @@ mod tests {
             dir.path(),
             &format!("echo \"$RUPU_HOME\" > {}; sleep 5", out.display()),
         );
-        let id = launcher.spawn(&spec(&[]), dir.path()).unwrap();
+        let spawned = launcher.spawn(&spec(&[]), dir.path()).unwrap();
+        let id = spawned.id.clone();
         let pid = pid_of(&launcher, &id);
 
         let child = rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
         let pgid = rustix::process::getpgid(Some(child)).unwrap();
         assert_eq!(pgid, child, "the unit leads its own process group");
+        // The group id spawn reports (and the supervisor persists) is that group.
+        assert_eq!(spawned.pgid, Some(pgid.as_raw_nonzero().get() as u32));
 
         let deadline = Instant::now() + Duration::from_secs(10);
         while !out.is_file() || std::fs::metadata(&out).unwrap().len() == 0 {

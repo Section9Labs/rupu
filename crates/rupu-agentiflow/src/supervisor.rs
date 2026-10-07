@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use rupu_fleet::Mailbox;
 
-use crate::unit::{UnitError, UnitId, UnitKind, UnitLauncher, UnitSpec, UnitStatus};
+use crate::unit::{
+    Spawned, UnitError, UnitId, UnitKind, UnitLauncher, UnitOutcome, UnitSpec, UnitStatus,
+};
 
 /// How often `join` re-polls a unit that has not finished.
 const JOIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -27,6 +29,10 @@ struct UnitRec {
     kind: UnitKind,
     participant: String,
     started_at: DateTime<Utc>,
+    /// The unit's process-group id, as its launcher reported it at spawn
+    /// (`None` when the launcher has no process). Persisted to `unit.json` so
+    /// a process that outlives this supervisor can signal the group.
+    pgid: Option<u32>,
     /// The last status observed from the launcher.
     status: UnitStatus,
 }
@@ -64,12 +70,13 @@ impl FleetSupervisor {
             );
         }
 
-        let id = self.launcher.spawn(&spec, &self.run_dir)?;
+        let Spawned { id, pgid } = self.launcher.spawn(&spec, &self.run_dir)?;
         let rec = UnitRec {
             agent: spec.agent,
             kind: spec.kind,
             participant: spec.participant,
             started_at: Utc::now(),
+            pgid,
             status: UnitStatus::Pending,
         };
         self.write_unit_json(&id.0, &rec);
@@ -207,6 +214,7 @@ impl FleetSupervisor {
             "kind": rec.kind.as_str(),
             "participant": rec.participant,
             "started_at": rec.started_at.to_rfc3339(),
+            "pgid": rec.pgid,
             "status": status_json(&rec.status),
         });
         if let Err(e) = write_json_atomic(&dir, &body) {
@@ -234,6 +242,139 @@ fn status_json(status: &UnitStatus) -> serde_json::Value {
         }),
         UnitStatus::Failed(why) => serde_json::json!({ "state": "failed", "error": why }),
     }
+}
+
+/// One unit as `units/<id>/unit.json` records it, read back by
+/// [`units_on_disk`]: the facts a process that did not launch the unit (the
+/// orphan reaper, `agentiflow stop`) needs to wind it down.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnitOnDisk {
+    /// The unit's run id (the `units/<id>` directory name).
+    pub unit_id: String,
+    /// The process group the unit leads. `None` for a `unit.json` written
+    /// before the pgid was recorded, or by a launcher with no process.
+    pub pgid: Option<u32>,
+    pub kind: UnitKind,
+    /// The last status the supervisor mirrored to disk.
+    pub status: UnitStatus,
+}
+
+/// What `unit.json` holds, parsed tolerantly: only what [`UnitOnDisk`] needs,
+/// with every key but the status optional so an older file still reads.
+#[derive(serde::Deserialize)]
+struct UnitJson {
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    pgid: Option<u32>,
+    status: StatusJson,
+}
+
+/// The `status` object [`status_json`] writes.
+#[derive(serde::Deserialize)]
+struct StatusJson {
+    state: String,
+    #[serde(default)]
+    success: Option<bool>,
+    #[serde(default)]
+    output: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+impl StatusJson {
+    /// `None` for a state this build does not know (a bad file, not a guess).
+    fn into_status(self) -> Option<UnitStatus> {
+        Some(match self.state.as_str() {
+            "pending" => UnitStatus::Pending,
+            "running" => UnitStatus::Running,
+            "done" => UnitStatus::Done(UnitOutcome {
+                output: self.output.unwrap_or_default(),
+                success: self.success.unwrap_or(false),
+            }),
+            "failed" => UnitStatus::Failed(self.error.unwrap_or_default()),
+            _ => return None,
+        })
+    }
+}
+
+fn parse_unit_json(path: &Path, unit_id: &str) -> Option<UnitOnDisk> {
+    let raw = match std::fs::read(path) {
+        Ok(raw) => raw,
+        // A unit dir whose unit.json was never written is not an error worth a
+        // log line (the write is tmp + rename, so it is never half there).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::warn!(unit = unit_id, error = %e, "could not read unit.json; skipping");
+            return None;
+        }
+    };
+    let parsed: UnitJson = match serde_json::from_slice(&raw) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(unit = unit_id, error = %e, "malformed unit.json; skipping");
+            return None;
+        }
+    };
+    let kind = match parsed.kind.as_deref() {
+        None | Some("agent") => UnitKind::Agent,
+        Some("workflow") => UnitKind::Workflow,
+        Some(other) => {
+            tracing::warn!(
+                unit = unit_id,
+                kind = other,
+                "unknown unit kind in unit.json; skipping"
+            );
+            return None;
+        }
+    };
+    let Some(status) = parsed.status.into_status() else {
+        tracing::warn!(unit = unit_id, "unknown unit state in unit.json; skipping");
+        return None;
+    };
+    Some(UnitOnDisk {
+        unit_id: unit_id.to_string(),
+        pgid: parsed.pgid,
+        kind,
+        status,
+    })
+}
+
+/// Every unit `run_dir` records, oldest first (ids are ULIDs), read from
+/// `units/*/unit.json`.
+///
+/// This is what lets a process other than the supervisor find a run's units:
+/// the supervisor's in-memory map dies with its process, `unit.json` does not.
+/// Reading is tolerant by design (a reaper sweep must survive any run dir): a
+/// missing `units/`, a unit dir without a `unit.json`, a torn or unparseable
+/// file, or an unknown kind / state is skipped (the unparseable ones with a
+/// warning), never a panic or an error.
+pub fn units_on_disk(run_dir: &Path) -> Vec<UnitOnDisk> {
+    let units_dir = run_dir.join("units");
+    let entries = match std::fs::read_dir(&units_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            tracing::warn!(dir = %units_dir.display(), error = %e, "could not list units; skipping");
+            return Vec::new();
+        }
+    };
+    let mut out: Vec<UnitOnDisk> = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            // A stray file where a unit dir is expected has no unit.json under it.
+            let unit_id = entry.file_name().into_string().ok()?;
+            // `write_unit_json` only ever writes plain run ids; the id is handed
+            // on as a path component, so anything else is not ours.
+            if !is_safe_unit_id(&unit_id) {
+                tracing::warn!(unit = %unit_id, "unit dir is not a plain run id; skipping");
+                return None;
+            }
+            parse_unit_json(&entry.path().join("unit.json"), &unit_id)
+        })
+        .collect();
+    out.sort_by(|a, b| a.unit_id.cmp(&b.unit_id));
+    out
 }
 
 fn write_json_atomic(dir: &Path, body: &serde_json::Value) -> std::io::Result<()> {
@@ -400,7 +541,7 @@ mod tests {
     fn an_unknown_id_reads_as_failed_and_a_spawn_error_tracks_nothing() {
         struct Refusing;
         impl UnitLauncher for Refusing {
-            fn spawn(&self, _: &UnitSpec, _: &Path) -> Result<UnitId, UnitError> {
+            fn spawn(&self, _: &UnitSpec, _: &Path) -> Result<Spawned, UnitError> {
                 Err(UnitError::Spawn("no such agent".into()))
             }
             fn poll(&self, _: &UnitId, _: &Path) -> UnitStatus {
@@ -533,7 +674,7 @@ mod tests {
     fn a_failed_spawn_adds_no_launched_unit_dir() {
         struct Refusing;
         impl UnitLauncher for Refusing {
-            fn spawn(&self, _: &UnitSpec, _: &Path) -> Result<UnitId, UnitError> {
+            fn spawn(&self, _: &UnitSpec, _: &Path) -> Result<Spawned, UnitError> {
                 Err(UnitError::Spawn("no such agent".into()))
             }
             fn poll(&self, _: &UnitId, _: &Path) -> UnitStatus {
@@ -568,6 +709,134 @@ mod tests {
         let got = mb.read_broadcast("recon#1").unwrap();
         let bodies: Vec<&str> = got.iter().map(|m| m.body.as_str()).collect();
         assert_eq!(bodies, vec!["after dispatch"]);
+    }
+
+    #[test]
+    fn dispatch_persists_unit_pgid_and_units_on_disk_reads_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher =
+            Arc::new(MockUnitLauncher::scripted(vec![UnitStatus::Running]).with_pid(4242));
+        let sup = FleetSupervisor::new(launcher, dir.path().to_path_buf());
+        let id = sup.dispatch(spec("recon#1")).unwrap();
+
+        // The group id is in unit.json next to the rest of the dispatch...
+        let j = read_unit_json(dir.path(), &id);
+        assert_eq!(j["pgid"], 4242, "{j}");
+        assert_eq!(j["agent"], "recon");
+
+        // ...and the disk reader hands it back with the unit's kind + status.
+        let units = units_on_disk(dir.path());
+        assert_eq!(units.len(), 1, "{units:?}");
+        assert_eq!(units[0].unit_id, id);
+        assert_eq!(units[0].pgid, Some(4242));
+        assert_eq!(units[0].kind, UnitKind::Agent);
+        assert_eq!(units[0].status, UnitStatus::Pending);
+
+        // A status change rewrites unit.json and keeps the pgid.
+        assert_eq!(sup.status(&id), UnitStatus::Running);
+        let units = units_on_disk(dir.path());
+        assert_eq!(units[0].pgid, Some(4242));
+        assert_eq!(units[0].status, UnitStatus::Running);
+    }
+
+    #[test]
+    fn a_launcher_with_no_pgid_writes_none_and_units_on_disk_reports_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = Arc::new(MockUnitLauncher::scripted(vec![UnitStatus::Running]));
+        let sup = FleetSupervisor::new(launcher, dir.path().to_path_buf());
+        sup.dispatch(spec("recon#1")).unwrap();
+        let units = units_on_disk(dir.path());
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].pgid, None);
+    }
+
+    #[test]
+    fn units_on_disk_reads_a_unit_json_written_before_pgid_existed() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("units").join("run_OLD");
+        std::fs::create_dir_all(&unit).unwrap();
+        // Exactly the pre-4-3 shape: no `pgid` key at all.
+        std::fs::write(
+            unit.join("unit.json"),
+            r#"{"run_id":"run_OLD","agent":"web-assess","kind":"workflow",
+               "participant":"web-assess#1","started_at":"2026-10-06T00:00:00+00:00",
+               "status":{"state":"done","success":true,"output":"ok"}}"#,
+        )
+        .unwrap();
+        let units = units_on_disk(dir.path());
+        assert_eq!(units.len(), 1, "{units:?}");
+        assert_eq!(units[0].unit_id, "run_OLD");
+        assert_eq!(units[0].pgid, None);
+        assert_eq!(units[0].kind, UnitKind::Workflow);
+        assert_eq!(
+            units[0].status,
+            UnitStatus::Done(UnitOutcome {
+                output: "ok".into(),
+                success: true
+            })
+        );
+    }
+
+    #[test]
+    fn units_on_disk_skips_a_bad_unit_json_and_never_panics() {
+        let dir = tempfile::tempdir().unwrap();
+        // No `units/` dir at all: nothing, not an error.
+        assert!(units_on_disk(dir.path()).is_empty());
+
+        let units = dir.path().join("units");
+        let write = |name: &str, body: &str| {
+            let d = units.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("unit.json"), body).unwrap();
+        };
+        write("run_a_torn", "{ not json");
+        write(
+            "run_b_unknown_state",
+            r#"{"kind":"agent","status":{"state":"levitating"}}"#,
+        );
+        write(
+            "run_c_unknown_kind",
+            r#"{"kind":"sorcery","status":{"state":"running"}}"#,
+        );
+        write(
+            "run_d_pgid_out_of_range",
+            r#"{"kind":"agent","pgid":99999999999,"status":{"state":"running"}}"#,
+        );
+        write(
+            "not a run id",
+            r#"{"kind":"agent","pgid":88,"status":{"state":"running"}}"#,
+        );
+        // A dir with no unit.json, and a stray file where a dir is expected.
+        std::fs::create_dir_all(units.join("run_e_empty")).unwrap();
+        std::fs::write(units.join("stray.txt"), "x").unwrap();
+        write(
+            "run_f_good",
+            r#"{"kind":"agent","pgid":77,"status":{"state":"failed","error":"boom"}}"#,
+        );
+
+        let got = units_on_disk(dir.path());
+        let ids: Vec<&str> = got.iter().map(|u| u.unit_id.as_str()).collect();
+        assert_eq!(ids, ["run_f_good"], "{got:?}");
+        assert_eq!(got[0].pgid, Some(77));
+        assert_eq!(got[0].status, UnitStatus::Failed("boom".into()));
+    }
+
+    #[test]
+    fn units_on_disk_lists_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = Arc::new(MockUnitLauncher::scripted(vec![UnitStatus::Running]));
+        let sup = FleetSupervisor::new(launcher, dir.path().to_path_buf());
+        let mut want = vec![
+            sup.dispatch(spec("a#1")).unwrap(),
+            sup.dispatch(spec("b#1")).unwrap(),
+            sup.dispatch(spec("c#1")).unwrap(),
+        ];
+        want.sort();
+        let got: Vec<String> = units_on_disk(dir.path())
+            .into_iter()
+            .map(|u| u.unit_id)
+            .collect();
+        assert_eq!(got, want);
     }
 
     #[test]

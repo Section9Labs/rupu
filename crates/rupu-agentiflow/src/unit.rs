@@ -60,6 +60,20 @@ pub struct UnitSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct UnitId(pub String);
 
+/// What a successful [`UnitLauncher::spawn`] hands back: the unit's handle plus
+/// the process-group id it leads, when it has one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Spawned {
+    /// The unit's pre-minted run id.
+    pub id: UnitId,
+    /// The unit's process-group id. A launcher that starts the unit as its own
+    /// group leader reports `Some(pid)` (the leader's pid *is* the pgid); the
+    /// supervisor persists it to `unit.json` so a later process (the orphan
+    /// reaper, `agentiflow stop`) can signal the whole group even after this
+    /// coordinator is gone. `None` when the launcher has no process to point at.
+    pub pgid: Option<u32>,
+}
+
 /// A unit's final answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnitOutcome {
@@ -100,8 +114,9 @@ pub enum UnitError {
 /// The port the supervisor drives. Implementations must be cheap to `poll` and
 /// must never block `spawn` on the unit's execution.
 pub trait UnitLauncher: Send + Sync {
-    /// Fire a unit; return its handle immediately (non-blocking).
-    fn spawn(&self, spec: &UnitSpec, run_dir: &Path) -> Result<UnitId, UnitError>;
+    /// Fire a unit; return its handle (and process-group id, see [`Spawned`])
+    /// immediately (non-blocking).
+    fn spawn(&self, spec: &UnitSpec, run_dir: &Path) -> Result<Spawned, UnitError>;
     /// Current status (started-evidence + liveness + terminal outcome). Cheap,
     /// pollable.
     fn poll(&self, id: &UnitId, run_dir: &Path) -> UnitStatus;
@@ -119,6 +134,8 @@ pub trait UnitLauncher: Send + Sync {
 pub struct MockUnitLauncher {
     script: Vec<UnitStatus>,
     on_spawn: Option<OnSpawn>,
+    /// The process-group id every spawned unit reports (`None` by default).
+    pgid: Option<u32>,
     state: Mutex<MockState>,
 }
 
@@ -140,8 +157,17 @@ impl MockUnitLauncher {
         Self {
             script,
             on_spawn: None,
+            pgid: None,
             state: Mutex::new(MockState::default()),
         }
+    }
+
+    /// Report `pgid` as the process-group id of every unit this launcher spawns
+    /// (a real launcher reports each unit's own; the mock has no process, so
+    /// every unit shares the scripted one).
+    pub fn with_pid(mut self, pgid: u32) -> Self {
+        self.pgid = Some(pgid);
+        self
     }
 
     /// Run `f(spec, run_dir)` on every `spawn`, before the id is returned.
@@ -166,7 +192,7 @@ impl MockUnitLauncher {
 }
 
 impl UnitLauncher for MockUnitLauncher {
-    fn spawn(&self, spec: &UnitSpec, run_dir: &Path) -> Result<UnitId, UnitError> {
+    fn spawn(&self, spec: &UnitSpec, run_dir: &Path) -> Result<Spawned, UnitError> {
         let id = format!("run_{}", ulid::Ulid::new());
         if let Some(f) = &self.on_spawn {
             f(spec, run_dir);
@@ -174,7 +200,10 @@ impl UnitLauncher for MockUnitLauncher {
         let mut st = self.lock();
         st.polls.insert(id.clone(), 0);
         st.spawned.push(spec.clone());
-        Ok(UnitId(id))
+        Ok(Spawned {
+            id: UnitId(id),
+            pgid: self.pgid,
+        })
     }
 
     fn poll(&self, id: &UnitId, _run_dir: &Path) -> UnitStatus {
@@ -224,7 +253,7 @@ mod tests {
             done.clone(),
         ]);
         let dir = tempfile::tempdir().unwrap();
-        let id = m.spawn(&spec("recon#1"), dir.path()).unwrap();
+        let id = m.spawn(&spec("recon#1"), dir.path()).unwrap().id;
         assert!(
             id.0.starts_with("run_"),
             "id is a pre-minted run id: {id:?}"
@@ -240,8 +269,8 @@ mod tests {
         let m =
             MockUnitLauncher::scripted(vec![UnitStatus::Running, UnitStatus::Failed("x".into())]);
         let dir = tempfile::tempdir().unwrap();
-        let a = m.spawn(&spec("a#1"), dir.path()).unwrap();
-        let b = m.spawn(&spec("b#1"), dir.path()).unwrap();
+        let a = m.spawn(&spec("a#1"), dir.path()).unwrap().id;
+        let b = m.spawn(&spec("b#1"), dir.path()).unwrap().id;
         assert_ne!(a, b);
         assert_eq!(m.poll(&a, dir.path()), UnitStatus::Running);
         // `b` has not been polled yet, so it starts at the head of the script.
@@ -253,7 +282,7 @@ mod tests {
     fn mock_empty_script_is_pending_and_unknown_id_fails() {
         let m = MockUnitLauncher::scripted(vec![]);
         let dir = tempfile::tempdir().unwrap();
-        let id = m.spawn(&spec("a#1"), dir.path()).unwrap();
+        let id = m.spawn(&spec("a#1"), dir.path()).unwrap().id;
         assert_eq!(m.poll(&id, dir.path()), UnitStatus::Pending);
         assert!(matches!(
             m.poll(&UnitId("run_nope".into()), dir.path()),
@@ -271,7 +300,7 @@ mod tests {
                 .push((s.participant.clone(), d.to_path_buf()));
         });
         let dir = tempfile::tempdir().unwrap();
-        let id = m.spawn(&spec("recon#1"), dir.path()).unwrap();
+        let id = m.spawn(&spec("recon#1"), dir.path()).unwrap().id;
         assert_eq!(
             seen.lock().unwrap().clone(),
             vec![("recon#1".to_string(), dir.path().to_path_buf())]
@@ -279,6 +308,18 @@ mod tests {
         assert_eq!(m.spawned(), vec![spec("recon#1")]);
         m.terminate(&id);
         assert_eq!(m.terminated(), vec![id.0]);
+    }
+
+    #[test]
+    fn mock_reports_no_pgid_unless_scripted_with_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = MockUnitLauncher::scripted(vec![]);
+        assert_eq!(plain.spawn(&spec("a#1"), dir.path()).unwrap().pgid, None);
+        let pinned = MockUnitLauncher::scripted(vec![]).with_pid(4242);
+        assert_eq!(
+            pinned.spawn(&spec("a#1"), dir.path()).unwrap().pgid,
+            Some(4242)
+        );
     }
 
     #[test]
