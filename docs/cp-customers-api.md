@@ -162,6 +162,17 @@ as unable to report. `/api/usage` marks the local host `offline` with the reason
 (its per-host contract). A recorded slug or `null` needs no assignment read and
 is always reported. A malformed legacy workspace id reads as unassigned.
 
+Surfaces that only PRICE work (no customer filter, no per-customer count)
+degrade instead of failing: a run or turn whose customer can't be read — an
+unreadable assignment, a legacy mirrored run, a `run.json` that won't load — is
+priced at the global rates as `Unknown`, with `pricing_error: "customer
+unknown; priced at global rates"`. These are the workflows list and detail,
+the agents list, autoflow cycle and event rows, a run's detail, graph and
+`/api/runs/:id/usage`, a session's detail, and the unfiltered run / agent-run /
+session lists above. A remote session priced here (the `?host=` proxy, for a
+peer that sent no `usage`) that has a customer carries `pricing_error: "the
+peer's customer pricing isn't available here"`.
+
 ## Launch preview
 
 `POST /api/launch/preview` says what a launch would authenticate as, before it

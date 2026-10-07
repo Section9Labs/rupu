@@ -856,6 +856,33 @@ pub fn query_run_rows(
     range: &crate::pagination::DateRangeQuery,
     customers: RowCustomers<'_>,
 ) -> Result<Vec<RunListRow>, RunRowsError> {
+    query_run_rows_windowed(
+        store,
+        Some((offset, limit)),
+        lifecycle,
+        workflow_only,
+        worker_id,
+        prices,
+        range,
+        customers,
+    )
+}
+
+/// [`query_run_rows`] with an optional window: `Some((offset, limit))` pages
+/// as it does (the limit clamped to the page cap); `None` returns EVERY
+/// matching row in one pass over the store — for the filtered fan-out,
+/// which windows the merged result itself.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn query_run_rows_windowed(
+    store: &rupu_orchestrator::runs::RunStore,
+    window: Option<(usize, usize)>,
+    lifecycle: Option<&str>,
+    workflow_only: bool,
+    worker_id: Option<&str>,
+    prices: &mut dyn crate::customers::PriceBook,
+    range: &crate::pagination::DateRangeQuery,
+    customers: RowCustomers<'_>,
+) -> Result<Vec<RunListRow>, RunRowsError> {
     let mut runs = store.list().map_err(RunRowsError::Store)?;
     if workflow_only {
         runs.retain(|r| r.event.is_none() && r.source_wake_id.is_none());
@@ -906,11 +933,16 @@ pub fn query_run_rows(
             attributed.push((r, who));
         }
     }
-    let page = crate::pagination::PageQuery {
-        offset: Some(offset),
-        limit: Some(limit),
+    let page_runs = match window {
+        Some((offset, limit)) => crate::pagination::paginate(
+            attributed,
+            &crate::pagination::PageQuery {
+                offset: Some(offset),
+                limit: Some(limit),
+            },
+        ),
+        None => attributed,
     };
-    let page_runs = crate::pagination::paginate(attributed, &page);
     Ok(page_runs
         .into_iter()
         .map(|(r, who)| RunListRow::priced(&r, who, store, prices))
@@ -1078,43 +1110,53 @@ async fn local_run_rows(
     ))
 }
 
-/// Every local run matching `filter` (fail-closed), page after page, for the
-/// filtered fan-out — plus the worker hosts of the mirrored runs it left out.
+/// Every local run matching `filter` (fail-closed), in ONE pass over the
+/// store, for the filtered fan-out — plus the worker hosts of the mirrored
+/// runs it left out.
 async fn local_filtered_runs(
     s: &AppState,
     kind: RunKind,
     lifecycle: Option<String>,
     filter: &crate::customers::CustomerFilter,
 ) -> ApiResult<(Vec<serde_json::Value>, Vec<String>)> {
-    let mut all = Vec::new();
-    let mut hosts: Vec<String> = Vec::new();
-    let mut offset = 0usize;
-    loop {
-        let (rows, skipped) = local_run_rows(
-            s,
-            crate::pagination::PageQuery {
-                offset: Some(offset),
-                limit: Some(crate::pagination::MAX_LIMIT),
-            },
-            lifecycle.clone(),
+    // One pass over the store, every match: the fan-out windows the merge.
+    let store = Arc::clone(&s.run_store);
+    let customer_pricing = Arc::clone(&s.customer_pricing);
+    let global = s.global_dir.clone();
+    let filter = filter.clone();
+    let (rows, hosts) = blocking(move || {
+        let mut lookup =
+            crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
+        let mut prices = crate::customers::PricingMemo::new(&customer_pricing);
+        let mut hosts = Vec::new();
+        let rows = query_run_rows_windowed(
+            &store,
+            None,
+            lifecycle.as_deref(),
             kind == RunKind::Workflow,
-            crate::pagination::DateRangeQuery::default(),
-            Some(filter.clone()),
+            None,
+            &mut prices,
+            &crate::pagination::DateRangeQuery::default(),
+            RowCustomers {
+                lookup: Some(&mut lookup),
+                filter: Some(&filter),
+                unreportable: Some(&mut hosts),
+            },
         )
-        .await?;
-        for h in skipped {
-            if !hosts.contains(&h) {
-                hosts.push(h);
-            }
-        }
-        let n = rows.len();
-        all.extend(rows);
-        if n < crate::pagination::MAX_LIMIT {
-            break;
-        }
-        offset += n;
-    }
-    Ok((all, hosts))
+        .map_err(RunRowsError::into_api)?;
+        Ok((rows, hosts))
+    })
+    .await?;
+    Ok((
+        rows.into_iter()
+            .map(|r| {
+                let mut v = serde_json::to_value(r).unwrap();
+                v["host_id"] = serde_json::json!("local");
+                v
+            })
+            .collect(),
+        hosts,
+    ))
 }
 
 /// One remote host's run-list page, tagged with `host_id` (and a derived

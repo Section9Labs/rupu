@@ -147,11 +147,26 @@ fn ensure_usage_block(detail: &mut serde_json::Value, pricing: &rupu_config::Pri
         Err(_) => return,
     };
     // The remote's transcripts are not on this machine: price the token
-    // totals it reported.
-    if let Ok(u) = serde_json::to_value(session_usage_from_totals(&dto, pricing)) {
+    // totals it reported. A session with a customer is priced by THAT PEER's
+    // customer layer, which this coordinator does not have: the global
+    // rates here may be wrong, and the body says so.
+    let mut usage = session_usage_from_totals(&dto, pricing);
+    if map
+        .get("customer")
+        .and_then(|c| c.as_str())
+        .is_some_and(|c| !c.is_empty())
+    {
+        usage.pricing_error = Some(PEER_CUSTOMER_PRICING.to_string());
+    }
+    if let Ok(u) = serde_json::to_value(usage) {
         map.insert("usage".to_string(), u);
     }
 }
+
+/// `pricing_error` on a remote session priced here at the coordinator's
+/// global rates although it has a customer (its peer's pricing for that
+/// customer isn't available here).
+const PEER_CUSTOMER_PRICING: &str = "the peer's customer pricing isn't available here";
 
 /// Try to load and parse `session.json` inside `dir` for list scanning.
 /// Returns `None` when the file is absent or fails to parse (with a warning).
@@ -1242,6 +1257,23 @@ mod tests {
 
     /// An HTTP remote already priced its own session with its own config.
     /// Re-pricing it here would silently overwrite that with ours.
+    /// A remote session with a customer is priced at the coordinator's
+    /// global rates — flagged, since the peer's customer pricing isn't
+    /// available here (M5); one without a customer is not flagged.
+    #[test]
+    fn ensure_usage_block_flags_a_remote_session_with_a_customer() {
+        let mut with = serde_json::json!({
+            "session_id": "s1", "total_tokens_in": 10, "customer": "acme",
+        });
+        ensure_usage_block(&mut with, &rupu_config::PricingConfig::default());
+        assert_eq!(with["usage"]["pricing_error"], PEER_CUSTOMER_PRICING);
+        let mut without = serde_json::json!({
+            "session_id": "s1", "total_tokens_in": 10, "customer": null,
+        });
+        ensure_usage_block(&mut without, &rupu_config::PricingConfig::default());
+        assert!(without["usage"].get("pricing_error").is_none(), "{without}");
+    }
+
     #[test]
     fn ensure_usage_block_leaves_an_already_priced_body_alone() {
         let mut detail = serde_json::json!({

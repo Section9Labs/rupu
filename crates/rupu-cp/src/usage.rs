@@ -197,7 +197,8 @@ pub fn run_metrics_keyed(
 }
 
 /// The [`PriceKey`](crate::customers::PriceKey) of each of `run_ids` in
-/// `store` (a run that can't be loaded: no customer).
+/// `store`. A run whose `run.json` can't be loaded has no knowable customer:
+/// `Unknown` (global rates, flagged with `pricing_error`), never "none".
 fn run_keys(
     store: &RunStore,
     run_ids: &[String],
@@ -207,7 +208,7 @@ fn run_keys(
         .iter()
         .map(|id| match store.load(id) {
             Ok(r) => run_price_key(&r, lookup),
-            Err(_) => crate::customers::PriceKey::Customer(None),
+            Err(_) => crate::customers::PriceKey::Unknown,
         })
         .collect()
 }
@@ -1193,5 +1194,25 @@ pub(crate) mod tests {
 
         let got = run_transcript_paths(&store, "run_01LOCAL");
         assert_eq!(got, vec![recorded]);
+    }
+
+    /// A run whose `run.json` can't be loaded is priced as unknown —
+    /// global rates, flagged — never as "no customer" (M3).
+    #[tokio::test]
+    async fn an_unloadable_run_is_priced_as_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+        std::fs::create_dir_all(tmp.path().join("runs/run_broken")).unwrap();
+        std::fs::write(tmp.path().join("runs/run_broken/run.json"), "{not json").unwrap();
+        let pricing = Arc::new(crate::customers::CustomerPricing::flat(
+            PricingConfig::default(),
+        ));
+        let got =
+            summarize_runs_blocking(store, vec!["run_broken".into()], tmp.path().into(), pricing)
+                .await;
+        assert_eq!(
+            got[0].pricing_error.as_deref(),
+            Some(crate::customers::UNKNOWN_CUSTOMER_PRICING)
+        );
     }
 }
