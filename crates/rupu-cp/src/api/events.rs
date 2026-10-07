@@ -64,10 +64,17 @@ pub(crate) fn proxy_event_byte_stream(stream: EventByteStream) -> Result<Respons
 ///    is required in this case. Unknown host id or run id → 404.
 /// 2. If `?run=<id>` (local): tail that one run's `events.jsonl` (404 if unknown).
 /// 3. Otherwise: return the merged live firehose across all runs on the local host.
+///
+/// A one-run stream (1, 2) numbers its events and honours `Last-Event-ID`,
+/// and ends with an `end` event once the run is over
+/// ([`crate::sse::run_frames`]). The firehose does neither: it follows many
+/// runs and never ends.
 async fn events_stream(
     State(s): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Response, ApiError> {
+    let after = crate::sse::last_event_id(&headers);
     let run_id = params.get("run").map(String::as_str);
     let host_id = params.get("host").map(String::as_str).unwrap_or("local");
 
@@ -82,12 +89,15 @@ async fn events_stream(
         let id = run_id.ok_or_else(|| {
             ApiError::bad_request("?run= is required when ?host= names a remote host")
         })?;
-        let stream = conn.stream_run_events(id).await.map_err(|e| match e {
-            HostConnectorError::NotFound(_) => {
-                ApiError::not_found(format!("run {id} not found on {host_id}"))
-            }
-            other => crate::api::runs::host_read_error(host_id, other),
-        })?;
+        let stream = conn
+            .stream_run_events_after(id, after)
+            .await
+            .map_err(|e| match e {
+                HostConnectorError::NotFound(_) => {
+                    ApiError::not_found(format!("run {id} not found on {host_id}"))
+                }
+                other => crate::api::runs::host_read_error(host_id, other),
+            })?;
         return proxy_event_byte_stream(stream);
     }
 
@@ -97,7 +107,7 @@ async fn events_stream(
             RunStoreError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
             other => ApiError::internal(other.to_string()),
         })?;
-        let sse = crate::sse::tail_events_sse(s.run_store.clone(), id)
+        let sse = crate::sse::tail_events_sse(s.run_store.clone(), id, after)
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?;
         return Ok(sse.into_response());

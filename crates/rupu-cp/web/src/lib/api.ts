@@ -3396,7 +3396,7 @@ export const api = {
     const qs = opts?.host ? `?host=${encodeURIComponent(opts.host)}` : '';
     const es = new EventSource(`/api/runs/${encodeURIComponent(id)}/log${qs}`);
     es.onmessage = (m) => onEvent(JSON.parse(m.data) as RunEvent);
-    if (onError) es.onerror = onError;
+    recheckAfterEnd(es, onError);
     return () => es.close();
   },
 
@@ -3461,7 +3461,7 @@ export const api = {
     if (opts?.host) q.set('host', opts.host);
     const es = new EventSource(`/api/events/stream?${q.toString()}`);
     es.onmessage = (m) => onEvent(JSON.parse(m.data) as RunEvent);
-    if (onError) es.onerror = onError;
+    recheckAfterEnd(es, onError);
     if (onOpen) es.onopen = () => onOpen();
     return () => es.close();
   },
@@ -3662,7 +3662,9 @@ export const api = {
    */
   subscribeTranscript(
     path: string,
-    onEvent: (e: TranscriptEvent) => void,
+    /** `id` is the event's line number in the transcript (absent from an
+     *  older remote CP, which replays from the start on every reconnect). */
+    onEvent: (e: TranscriptEvent, id?: number) => void,
     onError?: (e: Event) => void,
     opts?: { host?: string; run?: string },
   ): () => void {
@@ -3670,7 +3672,11 @@ export const api = {
     if (opts?.host) url += `&host=${encodeURIComponent(opts.host)}`;
     if (opts?.run) url += `&run=${encodeURIComponent(opts.run)}`;
     const es = new EventSource(url);
-    es.onmessage = (m) => onEvent(JSON.parse(m.data) as TranscriptEvent);
+    es.onmessage = (m) => {
+      const id = m.lastEventId ? Number(m.lastEventId) : NaN;
+      onEvent(JSON.parse(m.data) as TranscriptEvent, Number.isFinite(id) ? id : undefined);
+    };
+    closeOnEnd(es);
     if (onError) es.onerror = onError;
     return () => es.close();
   },
@@ -3706,6 +3712,31 @@ export const api = {
     return request<AstResponse>(url);
   },
 };
+
+/** A transcript stream ends with a named `end` event after `run_complete`;
+ *  close on it, or the browser would reconnect (and be told "end" again).
+ *  A reconnect after a dropped connection sends `Last-Event-ID` itself, and
+ *  the server resumes after it. */
+function closeOnEnd(es: EventSource): void {
+  es.addEventListener('end', () => es.close());
+}
+
+/** A one-run stream ends with `end` (carrying `retry: 15000`) once the run
+ *  has finished. The EventSource is kept: it reconnects 15 s later with
+ *  `Last-Event-ID`, so an operator's retry of the run streams in. That
+ *  planned reconnect is not reported as an error; a real drop still is. */
+function recheckAfterEnd(es: EventSource, onError?: (e: Event) => void): void {
+  let ended = false;
+  es.addEventListener('end', () => {
+    ended = true;
+  });
+  es.addEventListener('message', () => {
+    ended = false;
+  });
+  es.onerror = (e) => {
+    if (!ended) onError?.(e);
+  };
+}
 
 /** `?ws_id=` (or `&ws_id=`) for the finding-id routes, or `''`. */
 function wsQuery(wsId: string | null | undefined, sep: '?' | '&'): string {

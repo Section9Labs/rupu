@@ -14,32 +14,207 @@ use rupu_orchestrator::executor::{Event, FileTailRunSource};
 use rupu_orchestrator::runs::{RunStatus, RunStore};
 use tokio::sync::mpsc;
 
-/// Tail run `run_id`'s `events.jsonl` in `store` as an SSE stream. Each rupu
-/// [`Event`] becomes one SSE `data:` line of JSON. The stream is live — it
-/// stays open and emits events as the run progresses, never terminating on
-/// its own. A legacy (pre-codename) run's step/unit/dispatch events get a
-/// derived codename (see [`sse_frame`]).
+/// One item of a single run's event stream ([`run_frames`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunFrame {
+    /// The event on line `id` of the run's `events.jsonl` (1-based), already
+    /// serialized.
+    Event { id: u64, json: String },
+    /// The run is over: its last event was terminal, nothing followed, and
+    /// its record is settled. The stream ends after this.
+    End,
+}
+
+impl RunFrame {
+    /// The frame as SSE wire bytes: `id:` + `data:` for an event; for the
+    /// end, a named `end` event carrying `retry:` [`END_RETRY`] — a client
+    /// may close on it, or let its `EventSource` reconnect that much later
+    /// (resuming via `Last-Event-ID`), which is how an open page notices an
+    /// operator retrying the run.
+    pub fn to_sse_bytes(&self) -> String {
+        match self {
+            RunFrame::Event { id, json } => format!("id: {id}\ndata: {json}\n\n"),
+            RunFrame::End => format!(
+                "event: end\nretry: {}\ndata: {{}}\n\n",
+                END_RETRY.as_millis()
+            ),
+        }
+    }
+
+    fn to_sse_event(&self) -> SseEvent {
+        match self {
+            RunFrame::Event { id, json } => SseEvent::default().id(id.to_string()).data(json),
+            RunFrame::End => SseEvent::default().event("end").retry(END_RETRY).data("{}"),
+        }
+    }
+}
+
+/// The `Last-Event-ID` a reconnecting client sent: the id of the last event
+/// it saw, so the stream resumes after it. `0` (replay from the start) when
+/// absent or not a number.
+pub fn last_event_id(headers: &axum::http::HeaderMap) -> u64 {
+    headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Whether `run_id` is settled: its record is terminal, no gate-reject
+/// cleanup is still owed (`reject_cleanup_pending`), and no recorded runner
+/// is alive — nothing will append to its `events.jsonl` again (blocking
+/// read, off the runtime). An unreadable record is "not settled": the stream
+/// stays open, as it always did.
+async fn run_is_settled(store: Arc<RunStore>, run_id: String) -> bool {
+    tokio::task::spawn_blocking(move || {
+        store.load(&run_id).is_ok_and(|r| {
+            r.status.is_terminal()
+                && r.reject_cleanup_pending.is_none()
+                && !r
+                    .runner_pid
+                    .is_some_and(rupu_orchestrator::runs::pid_is_running)
+        })
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// The reconnect delay an `end` frame asks for: a client that keeps its
+/// `EventSource` re-checks a finished run this often.
+pub const END_RETRY: Duration = Duration::from_secs(15);
+
+/// How long the tail must stay quiet after a terminal event before the
+/// stream ends. Longer than a few of the tail's 250 ms polls, so a replay
+/// (whose next line is already on disk) and the trailing events a dying or
+/// cleaning-up runner writes just after its terminal event arrive first.
+pub const END_IDLE: Duration = Duration::from_secs(2);
+
+/// Tail run `run_id`'s `events.jsonl` in `store` as a resumable, finite
+/// stream of [`RunFrame`]s — what every single-run event stream serves
+/// (`/api/runs/:id/log`, `/api/events/stream?run=`, and a mirror-backed
+/// host's `stream_run_events`).
 ///
-/// [`Event`]: rupu_orchestrator::executor::Event
+/// - Every event carries its line number in `events.jsonl` (1-based; every
+///   non-blank line counts, so ids don't shift when a rupu version learns a
+///   new event type) as its id. Lines up to `after` (a client's
+///   `Last-Event-ID`) are read but not sent, so a reconnect resumes where it
+///   left off instead of replaying. See [`crate::transcript_tail::NumberedTail`]
+///   for a file that is rewritten.
+/// - The stream ends ([`RunFrame::End`]) only at the real end of the run:
+///   the last event read was `run_completed` / `run_failed`, the tail then
+///   stayed quiet for [`END_IDLE`], and the run is settled
+///   ([`run_is_settled`]). An earlier terminal event in the file — a failed
+///   attempt an operator retried, a gate reject followed by its `on_reject`
+///   chain — is followed by more events, so it never ends the stream. While
+///   the run is not settled the stream keeps tailing, and decides again at
+///   the next quiet terminal event.
+/// - A legacy (pre-codename) run's step/unit/dispatch events get a derived
+///   codename (see [`crate::codename_legacy`]).
+pub async fn run_frames(
+    store: Arc<RunStore>,
+    run_id: &str,
+    after: u64,
+) -> std::io::Result<impl Stream<Item = RunFrame>> {
+    run_frames_with_idle(store, run_id, after, END_IDLE).await
+}
+
+/// [`run_frames`] with an injectable quiet period (tests).
+pub async fn run_frames_with_idle(
+    store: Arc<RunStore>,
+    run_id: &str,
+    after: u64,
+    idle: Duration,
+) -> std::io::Result<impl Stream<Item = RunFrame>> {
+    let source =
+        crate::transcript_tail::NumberedTail::<Event>::open(&store.events_path(run_id), after);
+    // Classified once, at attach, off the executor: `None` for a
+    // codename-era run, whose events then pass through untouched.
+    let namers = crate::codename_legacy::namers_for_run(Arc::clone(&store), run_id).await;
+    struct St {
+        source: Pin<Box<crate::transcript_tail::NumberedTail<Event>>>,
+        namers: Option<crate::codename_legacy::SharedEventNamers>,
+        store: Arc<RunStore>,
+        run_id: String,
+        idle: Duration,
+        /// The last line read (sent or not) was a terminal event.
+        at_terminal: bool,
+        done: bool,
+    }
+    let st = St {
+        source: Box::pin(source),
+        namers,
+        store,
+        run_id: run_id.to_string(),
+        idle,
+        at_terminal: false,
+        done: false,
+    };
+    Ok(futures_util::stream::unfold(st, |mut st| async move {
+        if st.done {
+            return None;
+        }
+        loop {
+            let line = if st.at_terminal {
+                match tokio::time::timeout(st.idle, st.source.next()).await {
+                    Ok(line) => line?,
+                    Err(_quiet) => {
+                        if run_is_settled(Arc::clone(&st.store), st.run_id.clone()).await {
+                            st.done = true;
+                            return Some((RunFrame::End, st));
+                        }
+                        // Not settled (a retry or cleanup is under way):
+                        // keep tailing, and ask again after the next quiet
+                        // terminal event.
+                        st.at_terminal = false;
+                        st.source.next().await?
+                    }
+                }
+            } else {
+                st.source.next().await?
+            };
+            // Every line counts toward the ids (`NumberedTail`); one that
+            // doesn't parse, or a newer rupu's event type (`Unknown`), is
+            // just not sent.
+            let Some(ev) = line.event else {
+                st.at_terminal = false;
+                continue;
+            };
+            st.at_terminal = matches!(ev, Event::RunCompleted { .. } | Event::RunFailed { .. });
+            if !line.send || matches!(ev, Event::Unknown) {
+                continue;
+            }
+            let row = match &st.namers {
+                Some(n) => crate::codename_legacy::name_event(n, &ev).await,
+                None => None,
+            };
+            let json = match row {
+                Some(row) => serde_json::to_string(&row),
+                None => serde_json::to_string(&ev),
+            };
+            let Ok(json) = json else {
+                // Unserializable (never expected): skip it, keep the ids.
+                continue;
+            };
+            return Some((RunFrame::Event { id: line.id, json }, st));
+        }
+    }))
+}
+
+/// [`run_frames`] as an axum SSE response (15 s keep-alive comments).
 pub async fn tail_events_sse(
     store: Arc<RunStore>,
     run_id: &str,
+    after: u64,
 ) -> std::io::Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>> {
-    let source = FileTailRunSource::open(&store.events_path(run_id)).await?;
-    // Classified once, at attach, off the executor: `None` for a
-    // codename-era run, whose events then pass through untouched.
-    let namers = crate::codename_legacy::namers_for_run(store, run_id).await;
-    let stream = source.then(move |ev| {
-        let namers = namers.clone();
-        async move { Ok::<_, Infallible>(sse_frame(namers.as_ref(), ev).await) }
-    });
+    let frames = run_frames(store, run_id, after).await?;
+    let stream = frames.map(|f| Ok::<_, Infallible>(f.to_sse_event()));
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }
 
-/// One SSE frame for `ev`. An agent-announcing event without a codename of a
-/// legacy run is re-serialized with a derived one + `codename_derived: true`
-/// (any disk work on the blocking pool); every other event is serialized
-/// exactly as before.
+/// One firehose SSE frame for `ev`. An agent-announcing event without a
+/// codename of a legacy run is re-serialized with a derived one +
+/// `codename_derived: true` (any disk work on the blocking pool); every other
+/// event is serialized exactly as before.
 async fn sse_frame(
     namers: Option<&crate::codename_legacy::SharedEventNamers>,
     ev: Event,

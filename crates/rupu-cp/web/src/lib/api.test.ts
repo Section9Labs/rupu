@@ -891,7 +891,7 @@ class FakeEventSource {
   url: string;
   readyState = FakeEventSource.CONNECTING;
   closed = false;
-  onmessage: ((m: { data: string }) => void) | null = null;
+  onmessage: ((m: { data: string; lastEventId?: string }) => void) | null = null;
   onerror: ((e: unknown) => void) | null = null;
   onopen: ((e?: unknown) => void) | null = null;
 
@@ -913,7 +913,56 @@ class FakeEventSource {
   emitMessage(data: unknown): void {
     this.onmessage?.({ data: JSON.stringify(data) });
   }
+
+  listeners: Record<string, (() => void)[]> = {};
+
+  addEventListener(type: string, fn: () => void): void {
+    (this.listeners[type] ??= []).push(fn);
+  }
+
+  emitNamed(type: string): void {
+    this.listeners[type]?.forEach((fn) => fn());
+  }
+
+  /** What a real EventSource does for a `message` alongside `onmessage`:
+   *  notify `addEventListener('message', …)` listeners too. */
+  emitNamedMessage(type: string): void {
+    this.emitNamed(type);
+  }
 }
+
+describe('one-run streams', () => {
+  it('keep a run stream open across its `end` (to pick up a retry) without reporting the planned reconnect, and close a transcript on `end`', async () => {
+    vi.stubGlobal('EventSource', FakeEventSource);
+    FakeEventSource.instances = [];
+    const { api } = await import('./api');
+    const errors: unknown[] = [];
+    api.subscribeRunLog('run_1', () => {}, (e) => errors.push(e));
+    api.subscribeEvents(() => {}, { run: 'run_1' }, (e) => errors.push(e));
+    const ids: (number | undefined)[] = [];
+    api.subscribeTranscript('/t.jsonl', (_e, id) => ids.push(id));
+    expect(FakeEventSource.instances).toHaveLength(3);
+    const [log, one, transcript] = FakeEventSource.instances;
+
+    for (const es of [log, one]) {
+      es.emitNamed('end');
+      es.onerror?.(new Event('error')); // the server closing after `end`
+      expect(es.closed).toBe(false);
+    }
+    expect(errors).toHaveLength(0);
+    // After new data, a real drop is reported again.
+    log.emitMessage({ type: 'run_resumed' });
+    log.emitNamedMessage('message');
+    log.onerror?.(new Event('error'));
+    expect(errors).toHaveLength(1);
+
+    transcript.onmessage?.({ data: '{"type":"assistant_message"}', lastEventId: '7' });
+    expect(ids).toEqual([7]);
+    transcript.emitNamed('end');
+    expect(transcript.closed).toBe(true);
+    vi.unstubAllGlobals();
+  });
+});
 
 describe('subscribeEvents shared firehose', () => {
   beforeEach(() => {

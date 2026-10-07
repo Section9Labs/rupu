@@ -492,11 +492,24 @@ impl HostConnector for HttpHostConnector {
     }
 
     async fn stream_run_events(&self, run_id: &str) -> Result<EventByteStream, HostConnectorError> {
-        let req = self
+        self.stream_run_events_after(run_id, 0).await
+    }
+
+    /// Forwards the resume point as the remote's own `Last-Event-ID`: the
+    /// remote CP numbers the run's events the same way, so the ids line up.
+    async fn stream_run_events_after(
+        &self,
+        run_id: &str,
+        after: u64,
+    ) -> Result<EventByteStream, HostConnectorError> {
+        let mut req = self
             .client
             .get(self.url("/api/events/stream"))
             .query(&[("run", run_id)])
             .header("Accept", "text/event-stream");
+        if after > 0 {
+            req = req.header("Last-Event-ID", after.to_string());
+        }
 
         let resp = self.send(req).await?;
 

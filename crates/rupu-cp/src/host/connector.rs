@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt as _};
-use rupu_orchestrator::{executor::FileTailRunSource, runs::RunStore};
+use rupu_orchestrator::runs::RunStore;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -305,10 +305,23 @@ pub trait HostConnector: Send + Sync {
         Err(HostConnectorError::Unsupported("delete".into()))
     }
 
-    /// Open a live SSE byte stream of `events.jsonl` for the given run. Each
-    /// `Ok(Bytes)` item is a `data: {json}\n\n` SSE frame. See Task 8 for
-    /// host-aware observation built on top of this.
+    /// Open a live SSE byte stream of `events.jsonl` for the given run: SSE
+    /// frames as [`crate::sse::RunFrame::to_sse_bytes`] writes them (`id:` +
+    /// `data:`, then a closing `event: end` once the run is over). See Task 8
+    /// for host-aware observation built on top of this.
     async fn stream_run_events(&self, run_id: &str) -> Result<EventByteStream, HostConnectorError>;
+
+    /// [`Self::stream_run_events`] resuming after event `after` (a client's
+    /// `Last-Event-ID`). Every production connector overrides it; the
+    /// default ignores `after` and replays from the start.
+    async fn stream_run_events_after(
+        &self,
+        run_id: &str,
+        after: u64,
+    ) -> Result<EventByteStream, HostConnectorError> {
+        let _ = after;
+        self.stream_run_events(run_id).await
+    }
 
     /// Fetch the parsed events + summary for a transcript JSONL path.
     ///
@@ -785,40 +798,19 @@ pub(crate) fn deserialize_baseline(
 ///
 /// The caller is responsible for verifying that the run exists (and optionally
 /// that it belongs to the expected host/worker) **before** calling this
-/// function. This helper only opens the file tail and maps it into the
-/// `data: …\n\n` SSE frame format.
+/// function. This helper only opens the file tail ([`crate::sse::run_frames`],
+/// resuming after event `after`) and writes its frames as SSE bytes.
 pub(crate) async fn open_run_events_tail(
     run_store: &Arc<RunStore>,
     run_id: &str,
+    after: u64,
 ) -> Result<EventByteStream, HostConnectorError> {
-    let events_path = run_store.events_path(run_id);
-    let source = FileTailRunSource::open(&events_path)
+    let frames = crate::sse::run_frames(Arc::clone(run_store), run_id, after)
         .await
         .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
-
-    // Legacy (pre-codename) runs' step/unit/dispatch events get a derived
-    // name; every other event is serialized exactly as before.
-    // Classified once at attach, off the executor (`None` for a codename-era
-    // run); any per-event disk work runs on the blocking pool.
-    let namers = crate::codename_legacy::namers_for_run(Arc::clone(run_store), run_id).await;
-    let stream = source.then(move |ev| {
-        let namers = namers.clone();
-        async move {
-            let row = match &namers {
-                Some(n) => crate::codename_legacy::name_event(n, &ev).await,
-                None => None,
-            };
-            let json = match row {
-                Some(row) => serde_json::to_string(&row),
-                None => serde_json::to_string(&ev),
-            }
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            let frame = format!("data: {json}\n\n");
-            Ok::<Bytes, std::io::Error>(Bytes::from(frame.into_bytes()))
-        }
-    });
-
-    Ok(Box::pin(stream))
+    Ok(Box::pin(frames.map(|f| {
+        Ok::<Bytes, std::io::Error>(Bytes::from(f.to_sse_bytes().into_bytes()))
+    })))
 }
 
 // ── Mirror-backed observation helpers ────────────────────────────────────────
@@ -946,6 +938,7 @@ pub(crate) async fn mirror_stream_run_events(
     run_store: &Arc<RunStore>,
     worker_id: &str,
     run_id: &str,
+    after: u64,
 ) -> Result<EventByteStream, HostConnectorError> {
     let (store, worker, id) = (
         Arc::clone(run_store),
@@ -953,7 +946,7 @@ pub(crate) async fn mirror_stream_run_events(
         run_id.to_owned(),
     );
     blocking_host(move || check_mirror_run(&store, &worker, &id)).await?;
-    open_run_events_tail(run_store, run_id).await
+    open_run_events_tail(run_store, run_id, after).await
 }
 
 /// Whether `id` has the shape of a run id this system mints: `run_` followed
@@ -1334,7 +1327,7 @@ mod off_runtime_tests {
 
         one_blocking_thread_runtime().block_on(async {
             let held = HeldBlockingThread::hold();
-            let open = mirror_stream_run_events(&store, "host_abc", "run_01ELSEWHERE");
+            let open = mirror_stream_run_events(&store, "host_abc", "run_01ELSEWHERE", 0);
             let got = assert_waits_for_the_blocking_pool(open, held).await;
 
             assert!(

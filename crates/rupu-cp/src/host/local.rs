@@ -444,12 +444,20 @@ impl HostConnector for LocalHostConnector {
     }
 
     async fn stream_run_events(&self, run_id: &str) -> Result<EventByteStream, HostConnectorError> {
+        self.stream_run_events_after(run_id, 0).await
+    }
+
+    async fn stream_run_events_after(
+        &self,
+        run_id: &str,
+        after: u64,
+    ) -> Result<EventByteStream, HostConnectorError> {
         // Verify the run exists before opening the tail.
         self.run_store
             .load(run_id)
             .map_err(|e| map_store_err(run_id, e))?;
 
-        open_run_events_tail(&self.run_store, run_id).await
+        open_run_events_tail(&self.run_store, run_id, after).await
     }
 
     async fn proxy_get_json(

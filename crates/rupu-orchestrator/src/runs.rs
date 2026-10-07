@@ -3715,27 +3715,6 @@ impl RunStore {
         Ok(())
     }
 
-    /// Cancel a run. This is the shared backend for `rupu workflow
-    /// cancel` and the CP web cancel control.
-    ///
-    /// - Terminal runs (`Completed`/`Failed`/`Rejected`/`Cancelled`)
-    ///   yield [`CancelError::AlreadyTerminal`].
-    /// - A run paused at an approval gate (`AwaitingApproval`) is
-    ///   cancelled by rejecting it with `reason` — status flips to
-    ///   `Rejected`; returns [`CancelOutcome::RejectedAwaitingApproval`].
-    /// - A `Pending`/`Running` run is marked `Cancelled`: if its
-    ///   recorded `runner_pid` is live AND is not our own process it is
-    ///   sent SIGTERM, the pause and active-step fields are cleared,
-    ///   `finished_at`/`error_message` are set, and
-    ///   [`CancelOutcome::MarkedCancelled`] is returned.
-    ///
-    /// # Limitation
-    ///
-    /// Cancelling a run that is being resumed in-process by `cp serve`
-    /// marks it `Cancelled` but cannot interrupt the in-flight resume
-    /// task (no cooperative cancellation yet); the resume may run to
-    /// completion. Cancelling a run owned by a *separate* process (e.g.
-    /// `rupu run`) sends SIGTERM and stops it.
     /// Best-effort append of a terminal event to the run's
     /// `events.jsonl`. Store-side terminal transitions (cancel /
     /// reject / approval expiry) happen when no runner process is
@@ -3758,6 +3737,25 @@ impl RunStore {
         }
     }
 
+    /// Cancel a run. This is the shared backend for `rupu workflow
+    /// cancel` and the CP web cancel control.
+    ///
+    /// - Terminal runs (`Completed`/`Failed`/`Rejected`/`Cancelled`)
+    ///   yield [`CancelError::AlreadyTerminal`].
+    /// - A run paused at an approval gate (`AwaitingApproval`) is
+    ///   cancelled by rejecting it with `reason` — status flips to
+    ///   `Rejected`; returns [`CancelOutcome::RejectedAwaitingApproval`].
+    /// - A `Pending`/`Running` run is marked `Cancelled`: if its
+    ///   recorded `runner_pid` is live AND is not our own process it is
+    ///   sent SIGTERM, the pause and active-step fields are cleared,
+    ///   `finished_at`/`error_message` are set, and
+    ///   [`CancelOutcome::MarkedCancelled`] is returned.
+    ///
+    /// Every runner is its own process — `rupu run`, `rupu workflow run`,
+    /// and the detached `rupu workflow approve` / `workflow resume` children
+    /// `cp serve`'s resume worker and gate sweep spawn — so SIGTERM stops it.
+    /// A `runner_pid` naming the calling process is never signalled (that
+    /// would kill the caller); the run is still marked `Cancelled`.
     pub fn cancel(
         &self,
         run_id: &str,
@@ -3805,13 +3803,11 @@ impl RunStore {
                 let pid = record.runner_pid;
                 let was_running = pid.is_some_and(pid_is_running);
                 // Only signal a pid that is live AND is NOT our own
-                // process. A web-approved gate is resumed in-process
-                // inside `cp serve`, so the run's `runner_pid` can be the
-                // cp-serve PID itself — SIGTERMing it would kill the whole
-                // control plane (web server + resume worker + every
-                // in-flight resume). The run is still marked `Cancelled`
-                // below; we just cannot interrupt an in-process resume via
-                // signal (see the limitation note on `cancel`).
+                // process: a `runner_pid` naming the caller (say `cp
+                // serve`) must never SIGTERM it — that would take down the
+                // whole control plane. Resumes run in their own detached
+                // processes, so this only guards a misrecorded pid; the
+                // run is still marked `Cancelled` below (see `cancel`).
                 if let Some(pid) =
                     pid.filter(|pid| pid_is_running(*pid) && *pid != std::process::id())
                 {

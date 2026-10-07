@@ -324,8 +324,10 @@ fn map_cancel_err(id: &str, e: CancelError) -> ApiError {
 /// `POST /api/runs/:id/cancel[?host=<id>]` — cancel an in-flight run.
 ///
 /// Without `?host=` (or `?host=local`): a `Pending`/`Running` run is marked
-/// `Cancelled` (and its live runner TERM'd); a run paused at an approval gate is
-/// rejected. Terminal runs yield 409. The JSON body is optional.
+/// `Cancelled` and its live runner is sent SIGTERM; a run parked at a single
+/// approval gate with no live runner is rejected instead
+/// ([`RunStore::cancel`]). Terminal runs yield 409. The JSON body is
+/// optional.
 ///
 /// With `?host=<remote-id>`: proxies via [`HostConnector::cancel_run`] and
 /// returns `{ "ok": true, "host_id": "<id>" }`.
@@ -1758,25 +1760,29 @@ async fn get_run_log_from_host(
     s: &AppState,
     host_id: &str,
     id: &str,
+    after: u64,
 ) -> Result<Response, ApiError> {
     let conn = resolve_host(s, host_id)?;
-    let stream = conn.stream_run_events(id).await.map_err(|e| match e {
-        HostConnectorError::NotFound(_) => {
-            ApiError::not_found(format!("run {id} not found on host {host_id}"))
-        }
-        other => host_read_error(host_id, other),
-    })?;
+    let stream = conn
+        .stream_run_events_after(id, after)
+        .await
+        .map_err(|e| match e {
+            HostConnectorError::NotFound(_) => {
+                ApiError::not_found(format!("run {id} not found on host {host_id}"))
+            }
+            other => host_read_error(host_id, other),
+        })?;
     crate::api::events::proxy_event_byte_stream(stream)
 }
 
 /// Verify the run exists in `store`, then tail its `events.jsonl`. Shared by
 /// the `Global` and `ProjectLocal` branches of `get_run_log`.
-async fn tail_local_log(store: &RunStore, id: &str) -> Result<Response, ApiError> {
+async fn tail_local_log(store: &RunStore, id: &str, after: u64) -> Result<Response, ApiError> {
     store
         .load(id)
         .map_err(|e| run_not_found_or_internal(id, e))?;
     let store = std::sync::Arc::new(RunStore::new(store.root.clone()));
-    let sse = crate::sse::tail_events_sse(store, id)
+    let sse = crate::sse::tail_events_sse(store, id, after)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(sse.into_response())
@@ -1792,24 +1798,28 @@ async fn tail_local_log(store: &RunStore, id: &str) -> Result<Response, ApiError
 /// `events.jsonl` anywhere (the run never persisted one) so it returns an
 /// empty-but-OK SSE stream rather than erroring; `NotFound` → 404.
 ///
-/// The stream stays open while the run is in progress and emits each
-/// [`rupu_orchestrator::executor::Event`] as a JSON `data:` line.
+/// Each [`rupu_orchestrator::executor::Event`] is a JSON `data:` line with
+/// its position in the file as `id:`; a reconnect's `Last-Event-ID` resumes
+/// after it, and once the run is over an `end` event closes the stream
+/// ([`crate::sse::run_frames`]).
 async fn get_run_log(
     State(s): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<RunDetailQuery>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Response, ApiError> {
+    let after = crate::sse::last_event_id(&headers);
     if let Some(host_id) = q.host.as_deref().filter(|h| *h != "local") {
-        return get_run_log_from_host(&s, host_id, &id).await;
+        return get_run_log_from_host(&s, host_id, &id, after).await;
     }
 
     match resolve_run_location(&s, &id).await {
-        RunLocation::Global => tail_local_log(&s.run_store, &id).await,
+        RunLocation::Global => tail_local_log(&s.run_store, &id, after).await,
         RunLocation::ProjectLocal { path } => {
             let store = RunStore::new(path.join(".rupu").join("runs"));
-            tail_local_log(&store, &id).await
+            tail_local_log(&store, &id, after).await
         }
-        RunLocation::Host { host_id } => get_run_log_from_host(&s, &host_id, &id).await,
+        RunLocation::Host { host_id } => get_run_log_from_host(&s, &host_id, &id, after).await,
         RunLocation::Unpersisted { .. } => Ok(crate::sse::empty_events_sse().into_response()),
         RunLocation::NotFound => Err(ApiError::not_found(format!("run {id} not found"))),
     }
