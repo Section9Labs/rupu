@@ -6,9 +6,8 @@
 //
 // Runs, Findings and Usage embed the CP's own Workflow/Agent Runs tables,
 // Findings table and Usage page, each scoped with `customer=<slug>` (remote
-// hosts that can't filter show as unavailable, never as zero). Config shows
-// what this page can say from the detail; Task 8 (the config-layer editor)
-// replaces its body.
+// hosts that can't filter show as unavailable, never as zero). Config is the
+// customer layer's editor (CustomerConfigTab).
 
 import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
@@ -40,6 +39,7 @@ import { formatCost, formatTokens } from '../../lib/usage';
 import { relativeTime } from '../../lib/time';
 import { runHref } from '../../lib/runs';
 import { TabBar, TabButton } from '../../components/TabBar';
+import CustomerConfigTab from './CustomerConfigTab';
 import SortableTable, { type Column } from '../../components/lists/SortableTable';
 import { ListCard } from '../../components/lists/ListCard';
 import { StatusPill } from '../../components/StatusPill';
@@ -391,7 +391,16 @@ export default function CustomerDetail() {
       {tab === 'runs' && <CustomerRunsTab slug={c.slug} />}
       {tab === 'findings' && <Findings key={c.slug} customer={c.slug} />}
       {tab === 'usage' && <Usage key={c.slug} customer={c.slug} />}
-      {tab === 'config' && <ConfigSummary detail={detail} />}
+      {tab === 'config' && (
+        <CustomerConfigTab
+          key={c.slug}
+          slug={c.slug}
+          name={c.name}
+          projectCount={detail.projects.length}
+          layerPath={layerPath(c.slug)}
+          onChanged={refetch}
+        />
+      )}
 
       {editing && (
         <CustomerFormDialog
@@ -849,30 +858,6 @@ function RecentRuns({ slug, limit, title }: { slug: string; limit: number; title
           ))}
         </ListCard>
       )}
-    </section>
-  );
-}
-
-function ConfigSummary({ detail }: { detail: CustomerDetailDto }) {
-  const c = detail.customer;
-  return (
-    <section className="bg-panel border border-border rounded-xl shadow-card px-5 py-4 space-y-3 text-ui text-ink-dim">
-      <h2 className="text-sm font-semibold text-ink">Config layer</h2>
-      <p>
-        <span className="font-mono text-ink">{layerPath(c.slug)}</span> sits between the global config and
-        each project’s own <span className="font-mono">.rupu/config.toml</span>: a project wins on any key{' '}
-        {c.name} hasn’t locked with its <span className="font-mono">[policy].lock</span>.
-      </p>
-      {detail.layer_error && (
-        <pre className="whitespace-pre-wrap rounded-lg border border-err/30 bg-err-bg px-3 py-2 font-mono text-note text-err">
-          {detail.layer_error}
-        </pre>
-      )}
-      <p>
-        Edit and validate it from a terminal with <code className="font-mono text-ink">rupu customer edit {c.slug}</code>
-        ; see the effective config with sources and locks with{' '}
-        <code className="font-mono text-ink">rupu customer show {c.slug}</code>.
-      </p>
     </section>
   );
 }

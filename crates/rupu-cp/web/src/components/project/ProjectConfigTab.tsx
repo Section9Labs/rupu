@@ -22,6 +22,7 @@ import { Cpu, DollarSign, FileCode, GitBranch, Server, SlidersHorizontal, Workfl
 import { api, ApiError, type ConfigView } from '../../lib/api';
 import { TabBar, TabButton } from '../TabBar';
 import { Button } from '../ui/Button';
+import { LayerErrorBanner } from '../settings/LayerErrorBanner';
 import { getPath, GeneralTab, ProvidersTab, AutoflowTab, ScmTab, PricingTab, CpFieldTab, RawTab } from '../ConfigEditor';
 
 type ProjectConfigSubTab = 'general' | 'providers' | 'autoflow' | 'scm' | 'pricing' | 'cp' | 'raw';
@@ -181,6 +182,12 @@ export default function ProjectConfigTab({ wsId }: { wsId: string }) {
         </div>
       </div>
 
+      {configView.layer_error && (
+        <LayerErrorBanner
+          message={configView.layer_error}
+          hint="Fix it in the Raw tab (this project) or the customer's Config tab."
+        />
+      )}
       {readOnly && (
         <div className="rounded-lg border border-warn/30 bg-warn-bg px-4 py-3 text-sm text-warn">
           This is a read-only deploy — editing config requires <code className="font-mono">rupu cp serve</code>.

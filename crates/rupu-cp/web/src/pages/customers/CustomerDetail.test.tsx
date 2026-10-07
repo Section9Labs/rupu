@@ -287,9 +287,23 @@ describe('CustomerDetail tabs', () => {
     }
   });
 
-  it('the Config tab names the layer file and its CLI commands', async () => {
+  it('the Config tab mounts the layer editor and names its CLI commands', async () => {
+    const getConfig = vi.spyOn(api, 'getCustomerConfig').mockResolvedValue({
+      effective: { default_provider: 'acme-prod' },
+      provenance: { default_provider: { source: 'customer', locked: false } },
+      raw_global: '',
+      raw_project: null,
+      raw_customer: 'default_provider = "acme-prod"\n',
+      customer_lock: [],
+      layer_error: null,
+      cp: {},
+      status: { bind: '127.0.0.1:7878', token_set: false, restart_required_keys: [] },
+    });
     mount('/customers/acme/config');
     await screen.findByRole('heading', { level: 1, name: 'Acme Corp' });
+    expect(await screen.findByLabelText('Default provider')).toHaveValue('acme-prod');
+    expect(getConfig).toHaveBeenCalledWith('acme');
+    expect(screen.getByText(/applies to Acme Corp's 2 projects/)).toBeInTheDocument();
     expect(screen.getByText('rupu customer edit acme')).toBeInTheDocument();
     expect(screen.getByText('rupu customer show acme')).toBeInTheDocument();
   });
