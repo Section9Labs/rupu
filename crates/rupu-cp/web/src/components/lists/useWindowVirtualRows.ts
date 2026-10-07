@@ -4,9 +4,12 @@
 // are mounted; spacer rows above and below stand in for the rest, sized
 // from each row's measured height (estimated until measured), so page
 // height, scrollbar and scroll position match a fully rendered table.
-// Row heights are tracked by one ResizeObserver (so spacers follow real
-// heights, including after a width-only resize re-wraps rows); rows not yet
-// measured use the average measured height. Scroll is observed on the
+// Row heights are measured synchronously as each row mounts (ResizeObserver
+// does not deliver in a background tab, and only after layout) and then
+// tracked by one ResizeObserver (so spacers follow real heights, including
+// after a width-only resize re-wraps rows); rows not yet measured use the
+// average measured height. Heights are the row's bounding-box height — its
+// pitch — never the RO border box, which differs under collapsed borders. Scroll is observed on the
 // document in the capture phase, which catches whichever ancestor actually
 // scrolls.
 //
@@ -54,6 +57,9 @@ export function useWindowVirtualRows(keys: string[], enabled: boolean) {
     const onFocusOut = (e: FocusEvent) => {
       // Focus moving within the same row keeps it pinned.
       if (rowKeyOf(e.relatedTarget) !== undefined) return;
+      // The window lost focus, not the row: the row is still the active
+      // element and gets focus back on return, so it must stay mounted.
+      if (!document.hasFocus() || rowKeyOf(document.activeElement) !== undefined) return;
       setFocusedKey(null);
     };
     body.addEventListener('focusin', onFocusIn);
@@ -85,6 +91,16 @@ export function useWindowVirtualRows(keys: string[], enabled: boolean) {
     };
   }, [enabled]);
 
+  /** Store a row's height; true when the stored value changed. */
+  const store = (key: string, el: Element): boolean => {
+    const h = el.getBoundingClientRect().height;
+    if (!(h > 0)) return false;
+    const prev = heights.current.get(key);
+    if (prev !== undefined && Math.abs(prev - h) <= 0.01) return false;
+    heights.current.set(key, h);
+    return true;
+  };
+
   // One observer per enabled hook. Row ref callbacks run before this effect
   // on first mount, so it also adopts every row already registered.
   useLayoutEffect(() => {
@@ -93,14 +109,7 @@ export function useWindowVirtualRows(keys: string[], enabled: boolean) {
       let changed = false;
       for (const entry of entries) {
         const key = targetKeys.current.get(entry.target);
-        if (key === undefined) continue;
-        const h = entry.borderBoxSize?.[0]?.blockSize ?? entry.target.getBoundingClientRect().height;
-        if (!(h > 0)) continue;
-        const prev = heights.current.get(key);
-        if (prev === undefined || Math.abs(prev - h) > 0.01) {
-          heights.current.set(key, h);
-          changed = true;
-        }
+        if (key !== undefined && store(key, entry.target)) changed = true;
       }
       if (changed) setMeasureVersion((v) => v + 1);
     });
@@ -125,12 +134,8 @@ export function useWindowVirtualRows(keys: string[], enabled: boolean) {
         if (!el) return;
         elements.current.set(key, el);
         targetKeys.current.set(el, key);
-        if (observer.current) {
-          observer.current.observe(el);
-        } else if (typeof ResizeObserver === 'undefined') {
-          const h = el.getBoundingClientRect().height;
-          if (h > 0) heights.current.set(key, h);
-        }
+        observer.current?.observe(el);
+        if (store(key, el)) setMeasureVersion((v) => v + 1);
       };
       refCallbacks.current.set(key, cb);
     }

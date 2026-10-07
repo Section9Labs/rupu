@@ -451,7 +451,9 @@ describe('SortableTable virtualization', () => {
       // Everything still adds up to the full table.
       const total = sp.reduce((a, b) => a + b, 0) + now.length * ESTIMATED_ROW_PX;
       expect(total).toBe(1000 * ESTIMATED_ROW_PX);
-      // Blurring releases the pin.
+      // Blurring the row (the window keeps focus) releases the pin. jsdom
+      // reports no document focus while <body> is active; a browser does.
+      vi.spyOn(document, 'hasFocus').mockReturnValue(true);
       act(() => row.blur());
       await scrollTo(301);
       expect(mounted(container)).not.toContain(row);
@@ -469,6 +471,22 @@ describe('SortableTable virtualization', () => {
       const sp = spacers(container).map((tr) => parseFloat(tr.style.height));
       const total = sp.reduce((a, b) => a + b, 0) + now.length * ESTIMATED_ROW_PX;
       expect(total).toBe(1000 * ESTIMATED_ROW_PX);
+    });
+
+    it('keeps the pin when the window (not the row) loses focus', async () => {
+      const { container } = render(clickable());
+      const row = mounted(container).find((tr) => tr.textContent?.startsWith('r5'))!;
+      act(() => row.focus());
+      // Window blur: focusout with no relatedTarget while the row is still
+      // the document's active element (document focus reported, so the
+      // active-element guard is what keeps the pin).
+      vi.spyOn(document, 'hasFocus').mockReturnValue(true);
+      act(() => {
+        row.dispatchEvent(new FocusEvent('focusout', { bubbles: true, relatedTarget: null }));
+      });
+      expect(document.activeElement).toBe(row);
+      await scrollTo(300);
+      expect(mounted(container)).toContain(row);
     });
 
     it('sets aria-rowcount / aria-rowindex only when virtual', async () => {
@@ -489,6 +507,29 @@ describe('SortableTable virtualization', () => {
         expect(tr).not.toHaveAttribute('aria-rowindex');
       }
     });
+  });
+
+  it('measures mounted rows synchronously even when ResizeObserver never calls back', () => {
+    class SilentResizeObserver {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    vi.stubGlobal('ResizeObserver', SilentResizeObserver);
+    vi.spyOn(HTMLTableRowElement.prototype, 'getBoundingClientRect').mockReturnValue({
+      top: 0, bottom: 42.5, left: 0, right: 0, width: 0, height: 42.5, x: 0, y: 0, toJSON: () => ({}),
+    } as DOMRect);
+    try {
+      const { container } = render(
+        <SortableTable columns={columns} rows={rows(1000)} rowKey={(r) => r.id} virtualize={{ threshold: 500 }} />,
+      );
+      const n = mounted(container).length;
+      expect(n).toBe(Math.ceil(window.innerHeight / 42.5) + OVERSCAN_ROWS);
+      // Unmeasured rows use the average measured pitch, not the 41px estimate.
+      expect(spacers(container)[0].style.height).toBe(`${(1000 - n) * 42.5}px`);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it('re-sizes the spacers from observed row heights, without a scroll event', async () => {
@@ -514,8 +555,13 @@ describe('SortableTable virtualization', () => {
         <SortableTable columns={columns} rows={rows(1000)} rowKey={(r) => r.id} virtualize={{ threshold: 500 }} />,
       );
       expect(observed.size).toBe(mounted(container).length);
+      // Heights come from the row's bounding box (its pitch), not the RO
+      // border box.
+      vi.spyOn(HTMLTableRowElement.prototype, 'getBoundingClientRect').mockReturnValue({
+        top: 0, bottom: 60, left: 0, right: 0, width: 0, height: 60, x: 0, y: 0, toJSON: () => ({}),
+      } as DOMRect);
       await act(async () => {
-        fire?.(Array.from(observed).map((target) => ({ target, borderBoxSize: [{ blockSize: 60 }] })));
+        fire?.(Array.from(observed).map((target) => ({ target, borderBoxSize: [{ blockSize: 999 }] })));
       });
       const n = mounted(container).length;
       expect(n).toBeLessThan(Math.ceil(window.innerHeight / ESTIMATED_ROW_PX) + OVERSCAN_ROWS);
