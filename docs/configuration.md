@@ -100,14 +100,16 @@ The control plane manages customers, filters its lists by `?customer=` and previ
 
 ## `[providers.<name>]`
 
-One table per provider name (`anthropic`, `openai`, `gemini`, `copilot`, or a
-user-declared `openai-compatible` name such as `oracle`). Full narrative reference:
+One table per provider **account**: a bare vendor name (`anthropic`, `openai`,
+`gemini`, `copilot`), a named account of a vendor (`anthropic-work` with
+`kind = "anthropic"`), or a user-declared `openai-compatible` name such as `oracle`.
+An agent's `provider:` names the account. Full narrative reference:
 [providers.md](providers.md#field-reference).
 
 | Key               | Type                     | Default                                             |
 |-------------------|--------------------------|-------------------------------------------------------|
 | `base_url`        | string                   | vendor's documented URL; today read only by `openai-compatible` accounts — anthropic-kind ignores it (I-92) |
-| `kind`            | string                   | none (built-in provider); `"openai-compatible"` declares a generic adapter |
+| `kind`            | string                   | none — the table name is the vendor (`[providers.anthropic]`). Set it to name the vendor of a second, named account (`[providers.anthropic-work] kind = "anthropic"`; written for you by `rupu auth login --account <name> --kind <vendor>`), or `"openai-compatible"` to declare a generic adapter. See [providers.md](providers.md#accounts-vs-vendor-kind) |
 | `stream`          | bool                     | `true`                                                 |
 | `org_id`          | string                   | none (OpenAI-only; sent as `OpenAI-Organization`)      |
 | `region`          | string                   | none (accepted but not currently used by any shipped client) |
@@ -131,9 +133,10 @@ Full narrative reference: [scm.md](scm.md#configuration).
 
 | Key                  | Type   | Default | Notes |
 |----------------------|--------|---------|-------|
-| `[scm.default]`      | table  | none    | `platform`, `owner`, `repo` — fallback repo when a tool call omits `platform?` |
+| `[scm.default]`      | table  | none    | `platform` — fallback platform when a tool call omits `platform?`. `owner` / `repo` are deprecated and never read (a warning at load says to delete them) |
 | `[issues.default]`   | table  | none    | `tracker`, `project` — fallback tracker when a tool call omits `tracker?` |
-| `[scm.<platform>]`   | table  | none    | Per-platform override for `github` / `gitlab` (`base_url`, `timeout_ms` default `30000`, `max_concurrency` default github `8` / gitlab `6`, `clone_protocol` default `https`; GitLab only: `oauth_client_id`, the OAuth application SSO logs in as — default glab's on gitlab.com, required for self-managed) |
+| `[scm.<account>]`    | table  | none    | One table per SCM account. The table name is the account (`[scm.github]`, `[scm.gh-work]`). Keys: `kind` (`"github"` \| `"gitlab"`; omit when the name *is* the platform), `base_url`, `timeout_ms` default `30000`, `max_concurrency` default github `8` / gitlab `6`, `clone_protocol` default `https`; GitLab only: `oauth_client_id`, the OAuth application SSO logs in as — default glab's on gitlab.com, required for self-managed |
+| `[[scm.rules]]`      | array  | `[]`    | Account selection when two accounts share a platform: each entry sets `account` plus exactly one of `owner` (repo-owner glob, `acme/*`) or `path` (cwd glob, `~/Code/work/*`). Precedence: `--account` → owner rule → path rule → the sole account of that platform → error. Append one with `rupu scm bind`; list accounts with `rupu scm accounts`. See [scm.md](scm.md#multi-account-routing) |
 
 ---
 
@@ -320,7 +323,8 @@ the machine going down) leaves its run `running` forever and its detached units 
 tokens; the orphan reaper records such a run as `failed` (`orphaned: coordinator pid <p>
 not running`) and stops its units. Two things run it: `rupu agentiflow serve` (a
 foreground loop for hosts without the control plane) and `rupu cp serve` (on its gate-sweep
-tick, every `[cp].gate_sweep_interval_secs`).
+tick, every `[cp].gate_sweep_interval_secs`). For what an agentiflow is and how to run
+one, see [agentiflows.md](agentiflows.md).
 
 | Key                   | Type    | Default | Notes |
 |-----------------------|---------|---------|-------|

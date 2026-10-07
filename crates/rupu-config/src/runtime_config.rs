@@ -17,8 +17,8 @@ pub struct RuntimeConfig {
     /// radius of a wide fan-out or `split:`; the memory watchdog
     /// ([`min_free_memory_mb`]) is the adaptive safety net underneath it.
     /// Unset ⇒ a RAM-derived default of `clamp(total_RAM_GB / 4, 4, 128)`.
-    /// Overridden by `RUPU_MAX_CONCURRENT_JOBS`. A value of `0` is treated as
-    /// unset (the default applies), never as "forbid all work".
+    /// Overridden by `RUPU_MAX_CONCURRENT_JOBS`. A value of `0` means no
+    /// ceiling (unbounded), never "forbid all work".
     pub max_concurrent_jobs: Option<usize>,
 
     /// Memory-watchdog headroom: a new local agent job is held until at least
