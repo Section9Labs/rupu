@@ -56,6 +56,7 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -66,7 +67,7 @@ use rupu_runtime::RunTriggerSource;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::budget::{parse_duration, Budget, BudgetStage};
+use crate::budget::{parse_duration, Budget, BudgetStage, UsageSource};
 use crate::def::{AgentiflowDef, WorkflowsSpec};
 use crate::dispatch_tools::{fleet_unit_tools, WorkflowToolCtx};
 use crate::envelope::{
@@ -76,7 +77,7 @@ use crate::error::AgentiflowError;
 use crate::lead::{LeadConfig, ProviderFactory, RunAgentLeadDriver};
 use crate::operator::OperatorQueue;
 use crate::roster::{roster_collector, roster_tools, RosterCtx};
-use crate::status_tools::status_tools;
+use crate::status_tools::{status_tools, BudgetProbe};
 use crate::subprocess::SubprocessUnitLauncher;
 use crate::supervisor::FleetSupervisor;
 use crate::unit::UnitLauncher;
@@ -396,10 +397,13 @@ struct RecordingLead<'a> {
     inner: RunAgentLeadDriver,
     events: &'a EventLog,
     now: &'a (dyn Fn() -> DateTime<Utc> + Send + Sync),
+    /// Published as each round begins, for the lead's `budget.status` tool.
+    round: Arc<AtomicU32>,
 }
 
 impl LeadDriver for RecordingLead<'_> {
     fn run_round(&mut self, ctx: &RoundContext) -> RoundOutcome {
+        self.round.store(ctx.round, Ordering::Relaxed);
         let out = self.inner.run_round(ctx);
         let d = &ctx.digest;
         let (outcome, error) = match &out {
@@ -467,6 +471,10 @@ impl LeadDriver for RecordingLead<'_> {
 ///
 /// The fold undercounts a unit's `dispatch_agent` sub-agents (see
 /// `usage.rs`), so a cap can trip later than the true spend.
+///
+/// The lead's `budget.status` tool reads the same meter, enforced budget and
+/// clock the envelope does (see [`BudgetProbe`]), so it reports exactly what
+/// the next round's check will act on.
 pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, AgentiflowError> {
     let RunAgentiflowOpts {
         def,
@@ -489,6 +497,9 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
     std::thread::scope(|s| {
         s.spawn(move || -> Result<EnvelopeOutcome, AgentiflowError> {
             let _log_scope = tracing::dispatcher::set_default(&dispatch);
+            // The injected clock is shared: the envelope's round checks read it
+            // and so does the lead's `budget.status` tool.
+            let now: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync> = Arc::from(now);
 
             // ---- everything that can be rejected without touching the disk ----------
             def.validate(&active)?;
@@ -592,11 +603,12 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
             // The lead's status tools evaluate the same pooled scope the envelope
             // does, so keep a copy of the paths before the envelope takes them.
             let status_paths = paths.clone();
+            let enforced = enforced_budget(def.budget.as_ref(), usd_priceable);
             let mut envelope = Envelope::new(
                 paths,
                 active,
                 cfg,
-                enforced_budget(def.budget.as_ref(), usd_priceable),
+                enforced.clone(),
                 OperatorQueue::new(&run_dir),
                 started,
             );
@@ -638,8 +650,15 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
             let sup = Arc::new(FleetSupervisor::new(launcher, run_dir.clone()));
             // Spend: the lead's ledger plus every unit the supervisor launches.
             let lead_usage = run_dir.join("usage.jsonl");
-            let usage =
-                LedgerUsageSource::new(lead_usage.clone(), sup.clone(), global.clone(), pricing);
+            let usage = Arc::new(LedgerUsageSource::new(
+                lead_usage.clone(),
+                sup.clone(),
+                global.clone(),
+                pricing,
+            ));
+            // The round the lead is in, kept current by `RecordingLead` so the
+            // lead's `budget.status` can report rounds elapsed.
+            let round = Arc::new(AtomicU32::new(0));
             // Where the catalog lives: the roster tools read it, and
             // `run_workflow` loads and vets the workflow it is asked to start
             // from it. The pool's workflow ids are resolved ONCE against it, so
@@ -677,6 +696,17 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 status_paths,
                 findings_engagement.clone(),
                 board.clone(),
+                // The very meter, enforced budget, clock and start the
+                // envelope runs against, so `budget.status` reports what the
+                // next round check will act on.
+                BudgetProbe::new(
+                    def.budget.clone(),
+                    enforced,
+                    started,
+                    usage.clone() as Arc<dyn UsageSource>,
+                    round.clone(),
+                    now.clone(),
+                ),
             ));
 
             let mut collectors = crate::collectors::lead_collectors(mailbox, board, "lead");
@@ -724,6 +754,7 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 inner: driver,
                 events: &events,
                 now: &*now,
+                round,
             };
 
             events.emit(
@@ -736,7 +767,7 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                     "engagement_profiles": def.engagement_profiles,
                 }),
             );
-            let outcome = envelope.run(&mut lead, &usage, &*now);
+            let outcome = envelope.run(&mut lead, &*usage, &*now);
             // The run is over: SIGTERM every unit still alive so a stop (a
             // goal met, the ceiling, an operator stop) never leaves orphans.
             sup.terminate_all();
@@ -1412,6 +1443,103 @@ mod tests {
         let out = run_agentiflow(opts(&fx, def, id)).unwrap();
         assert_eq!(out.stop, StopReason::Ceiling);
         assert_eq!(out.rounds, 2);
+    }
+
+    /// The latest `budget.status` result in a request (the last text that is
+    /// a JSON object carrying a `stage`, or the `no budget set` reply).
+    fn latest_budget_report(req: &rupu_providers::LlmRequest) -> Value {
+        request_texts(req)
+            .iter()
+            .rev()
+            .filter_map(|t| serde_json::from_str::<Value>(t).ok())
+            .find(|v| v.get("stage").is_some() || v.get("budget").is_some())
+            .expect("a budget.status result reached the lead")
+    }
+
+    #[test]
+    fn the_lead_reads_its_budget_through_budget_status_round_by_round() {
+        let fx = fixture();
+        let id = "af_budget_status";
+        // Two rounds, each: ask for the budget, then finish. The one-turn
+        // billing is 0 for the tool turn and 1 in + 1 out for the closing turn.
+        let (factory, captured) = capturing_factory(vec![
+            vec![tool_turn("t0", "budget.status", json!({})), done_turn()],
+            vec![tool_turn("t1", "budget.status", json!({})), done_turn()],
+        ]);
+        let mut o = opts(
+            &fx,
+            operator_only("budget: { tokens: 1000, rounds: 5 }\nround: { ceiling: { rounds: 2 } }"),
+            id,
+        );
+        o.make_provider = factory;
+        let out = run_agentiflow(o).unwrap();
+        assert_eq!(out.stop, StopReason::Ceiling, "{:?}", out.stop);
+        assert_eq!(out.rounds, 2);
+
+        let reqs = captured.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 4, "two model calls per round");
+
+        // Round 0: only the tool-calling turn (1 in + 1 out) has been billed,
+        // no round has completed, and both caps are far off.
+        let r0 = latest_budget_report(&reqs[1]);
+        assert_eq!(r0["stage"], "ok", "{r0}");
+        assert_eq!(r0["tokens"]["cap"], 1000);
+        assert_eq!(r0["tokens"]["spent"], 2);
+        assert_eq!(r0["rounds"]["cap"], 5);
+        assert_eq!(r0["rounds"]["elapsed"], 0);
+        // Only the dimensions the flow sets.
+        assert!(
+            r0.get("usd").is_none() && r0.get("wall_clock").is_none(),
+            "{r0}"
+        );
+
+        // Round 1: round 0's two turns and this round's tool turn (2 tokens
+        // each) are spent, read live from the lead's ledger, and one round has
+        // elapsed.
+        let r1 = latest_budget_report(&reqs[3]);
+        assert_eq!(r1["tokens"]["spent"], 6, "{r1}");
+        assert_eq!(r1["tokens"]["remaining"], 994);
+        assert_eq!(r1["rounds"]["elapsed"], 1);
+        assert_eq!(r1["rounds"]["remaining"], 4);
+    }
+
+    #[test]
+    fn budget_status_reports_a_usd_cap_the_lead_cannot_price_as_not_enforced() {
+        let fx = fixture();
+        let id = "af_budget_status_unpriced";
+        let (factory, captured) = capturing_factory(vec![vec![
+            tool_turn("t0", "budget.status", json!({})),
+            done_turn(),
+        ]]);
+        // No price for `mock` / `mock-1`: the envelope drops the usd cap.
+        let mut o = opts(
+            &fx,
+            operator_only("budget: { usd: 5.0, tokens: 1000 }\nround: { ceiling: { rounds: 1 } }"),
+            id,
+        );
+        o.make_provider = factory;
+        run_agentiflow(o).unwrap();
+        let reqs = captured.lock().unwrap().clone();
+        let r = latest_budget_report(&reqs[1]);
+        assert_eq!(r["usd"]["enforced"], false, "{r}");
+        assert_eq!(r["usd"]["cap"], 5.0);
+        assert_eq!(r["tokens"]["state"], "ok");
+    }
+
+    #[test]
+    fn budget_status_says_so_when_the_flow_sets_no_budget() {
+        let fx = fixture();
+        let id = "af_budget_status_none";
+        let (factory, captured) = capturing_factory(vec![vec![
+            tool_turn("t0", "budget.status", json!({})),
+            done_turn(),
+        ]]);
+        let mut o = opts(&fx, operator_only("round: { ceiling: { rounds: 1 } }"), id);
+        o.make_provider = factory;
+        run_agentiflow(o).unwrap();
+        let reqs = captured.lock().unwrap().clone();
+        let r = latest_budget_report(&reqs[1]);
+        assert_eq!(r, json!({ "budget": null, "detail": "no budget set" }));
     }
 
     #[test]

@@ -53,7 +53,7 @@ pub use run::{
     agentiflow_dir, new_run_id, run_agentiflow, AgentiflowRecord, GoalStatus, LeadInputs,
     RunAgentiflowOpts,
 };
-pub use status_tools::status_tools;
+pub use status_tools::{status_tools, BudgetProbe};
 pub use subprocess::SubprocessUnitLauncher;
 pub use supervisor::FleetSupervisor;
 pub use tools::{fleet_tools, FleetToolCtx};
