@@ -15,6 +15,7 @@ import {
   type FindingRecord,
   type FindingsResponse,
   type FindingsSummary,
+  type TagAcrossResult,
 } from '../lib/api';
 import { SEVERITY_STYLE, type Severity } from '../lib/severity';
 import { FINDING_FIELDS } from '../lib/findingQuery/fields';
@@ -31,6 +32,27 @@ import { ErrorBanner } from '../components/ui/ErrorBanner';
 import { Spinner } from '../components/ui/Spinner';
 
 const SEVS: Severity[] = ['critical', 'high', 'medium', 'low', 'info'];
+
+/** At most this many findings per `POST /api/findings/tags` — the server's
+ *  `MAX_TAG_BATCH` in `crates/rupu-cp/src/api/findings.rs`; keep them equal. */
+const MAX_TAG_BATCH = 1000;
+
+/** The selection key of a row: `ws_id/target_id/id`. */
+function rowKey(f: FindingRecord): string {
+  const o = f as FindingOut;
+  return `${o.ws_id}/${o.target_id}/${o.id}`;
+}
+
+const plural = (n: number) => `${n} finding${n === 1 ? '' : 's'}`;
+
+/** One answer for several batches: their workspace results in order, and
+ *  every unknown id once. */
+function mergeTagResults(rs: TagAcrossResult[]): TagAcrossResult {
+  return {
+    workspaces: rs.flatMap((r) => r.workspaces),
+    unknown: [...new Set(rs.flatMap((r) => r.unknown))],
+  };
+}
 
 function sevTone(key: string, value: string): string | null {
   return key === 'severity' && (SEVS as string[]).includes(value) ? SEVERITY_STYLE[value as Severity].pill : null;
@@ -148,17 +170,24 @@ export default function Findings() {
     [data],
   );
 
-  const rowKey = (f: FindingRecord) => {
+  const unavailable = useMemo(() => new Set((data?.tags_unavailable ?? []).map((w) => w.ws_id)), [data]);
+  const blockedReason = (f: FindingRecord) => {
     const o = f as FindingOut;
-    return `${o.ws_id}/${o.target_id}/${o.id}`;
+    return unavailable.has(o.ws_id) ? `${o.project || o.ws_id}'s tags couldn't be read, so they can't be changed` : null;
   };
-  const unavailable = new Set((data?.tags_unavailable ?? []).map((w) => w.ws_id));
+  // A selected row whose workspace's tag log turned unreadable on a reload
+  // leaves the selection: it can't be changed, so it is neither counted nor sent.
+  useEffect(() => {
+    if (!data || unavailable.size === 0) return;
+    const blocked = new Set(data.findings.filter((f) => unavailable.has(f.ws_id)).map(rowKey));
+    setSelected((prev) => {
+      if (![...prev].some((k) => blocked.has(k))) return prev;
+      return new Set([...prev].filter((k) => !blocked.has(k)));
+    });
+  }, [data, unavailable]);
   const selection: RowSelection<FindingRecord> = {
     isSelected: (f) => selected.has(rowKey(f)),
-    blockedReason: (f) => {
-      const o = f as FindingOut;
-      return unavailable.has(o.ws_id) ? `${o.project || o.ws_id}'s tags couldn't be read, so they can't be changed` : null;
-    },
+    blockedReason,
     label: (f) => `Select ${f.id}`,
     onToggle: (f) => {
       setBulkNote(null);
@@ -182,17 +211,43 @@ export default function Findings() {
       });
     },
   };
-  const selectedRows = (data?.findings ?? []).filter((f) => selected.has(rowKey(f)));
+  const selectedRows = (data?.findings ?? []).filter((f) => selected.has(rowKey(f)) && !blockedReason(f));
   const projectOf = (wsId: string) =>
     data?.tags_unavailable.find((w) => w.ws_id === wsId)?.project ||
     (data?.findings ?? []).find((f) => f.ws_id === wsId)?.project ||
     wsId;
+  // Sent in batches of MAX_TAG_BATCH, one after another. Only the rows that
+  // were sent leave the selection, so a row ticked meanwhile stays ticked. A
+  // failed first batch is a failed change (it throws); a later one stops the
+  // rest and the result says what was applied before it.
   const applyBulk = async (mode: 'add' | 'remove', tag: string) => {
-    const ids = [...new Set(selectedRows.map((f) => f.id))];
-    const r = await api.tagFindings(ids, mode === 'add' ? { add: [tag] } : { remove: [tag] });
-    const summary = summarizeTagResult(r, mode, projectOf);
+    const rows = selectedRows;
+    const ids = [...new Set(rows.map((f) => f.id))];
+    const change = mode === 'add' ? { add: [tag] } : { remove: [tag] };
+    const results: TagAcrossResult[] = [];
+    const sent = new Set<string>();
+    let stopped: { error: string; left: number } | null = null;
+    for (let i = 0; i < ids.length; i += MAX_TAG_BATCH) {
+      const batch = ids.slice(i, i + MAX_TAG_BATCH);
+      try {
+        results.push(await api.tagFindings(batch, change));
+      } catch (e: unknown) {
+        if (results.length === 0) throw e;
+        stopped = { error: apiErrorMessage(e), left: ids.length - i };
+        break;
+      }
+      for (const id of batch) sent.add(id);
+    }
+    const merged = summarizeTagResult(mergeTagResults(results), mode, projectOf);
+    const summary = stopped
+      ? {
+          message: `${merged.message} The other ${plural(stopped.left)} ${stopped.left === 1 ? "wasn't" : "weren't"} changed: ${stopped.error}`,
+          ok: false,
+        }
+      : merged;
+    const sentKeys = new Set(rows.filter((f) => sent.has(f.id)).map(rowKey));
     setBulkNote(summary);
-    setSelected(new Set());
+    setSelected((prev) => new Set([...prev].filter((k) => !sentKeys.has(k))));
     setReload((n) => n + 1);
     return summary;
   };
@@ -279,7 +334,8 @@ export default function Findings() {
           )}
 
           {/* The bar unmounts once the selection clears; this keeps its result. */}
-          {data && selectedRows.length === 0 && bulkNote && (
+          {/* About the write, not the list: it stays even if the reload fails. */}
+          {selectedRows.length === 0 && bulkNote && (
             <p
               role={bulkNote.ok ? 'status' : 'alert'}
               className={bulkNote.ok ? 'text-note text-ink-dim' : 'text-note text-err'}
