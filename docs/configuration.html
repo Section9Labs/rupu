@@ -1,0 +1,421 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu docs — Configuration</title>
+<meta name="description" content="Complete config.toml reference for rupu: layering, locks, providers, SCM, UI, runtime limits, recovery, findings, netflow, control plane, triggers, autoflows, pricing and more.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="docs-shell">
+
+  <!-- ════ SHARED SIDEBAR (copy verbatim into every docs page; set .active) ════ -->
+  <aside class="docs-side">
+    <a class="brand" href="/" aria-label="rupu home">
+      <span class="mark" aria-hidden="true">&#8734;</span>
+      <span class="name">rupu</span>
+    </a>
+    <div class="grp">Start</div>
+    <a class="item" href="/docs/quickstart.html">Quickstart</a>
+    <a class="item" href="/docs/">Overview &amp; install</a>
+    <div class="grp">Concepts</div>
+    <a class="item" href="/docs/agents.html">Agents</a>
+    <a class="item" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
+    <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
+    <a class="item" href="/docs/sessions.html">Sessions</a>
+    <a class="item" href="/docs/profiles.html">Engagement profiles</a>
+    <div class="grp">Platform</div>
+    <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item" href="/docs/reliability.html">Recovery &amp; reliability</a>
+    <a class="item" href="/docs/integrations.html">Integrations</a>
+    <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
+    <a class="item" href="/docs/triggers.html">Triggers</a>
+    <a class="item" href="/docs/control-plane.html">Control plane</a>
+    <a class="item" href="/docs/multi-host.html">Multi-host</a>
+    <a class="item" href="/docs/netflow.html">Netflow</a>
+    <a class="item" href="/docs/coverage.html">Coverage</a>
+    <a class="item" href="/docs/findings.html">Findings</a>
+    <a class="item" href="/docs/customers.html">Customers</a>
+    <div class="grp">Reference</div>
+    <a class="item" href="/docs/cli.html">CLI reference</a>
+    <a class="item active" href="/docs/configuration.html">Configuration</a>
+    <a class="item" href="/docs/api.html">HTTP API</a>
+    <a class="item" href="/docs/transcripts.html">Transcript schema</a>
+    <div class="grp">More</div>
+    <a class="item" href="/docs/examples/">Examples</a>
+    <a class="item" href="/#download">Download</a>
+    <a class="item" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </aside>
+  <!-- ════ /SHARED SIDEBAR ════ -->
+
+  <main class="docs-main">
+    <h1>Configuration</h1>
+    <p class="intro">Everything rupu reads from <code class="inline">config.toml</code> — every section and key, its type, its default, and what it does. All keys are optional: an empty file (or no file) is a working configuration.</p>
+
+    <h2 id="layering">Files and layering</h2>
+    <p>rupu reads up to three TOML files and merges them, most specific last:</p>
+    <table>
+      <thead><tr><th>Layer</th><th>File</th><th>Use it for</th></tr></thead>
+      <tbody>
+        <tr><td>Global</td><td><code>~/.rupu/config.toml</code></td><td>Your accounts, defaults, pricing, control-plane settings. <code>RUPU_HOME</code> moves the whole directory.</td></tr>
+        <tr><td>Customer</td><td><code>~/.rupu/customers/&lt;slug&gt;/config.toml</code></td><td>Per-customer overrides for every project assigned to that customer — see <a class="link" href="#customer-layer">Customer layer</a>.</td></tr>
+        <tr><td>Project</td><td><code>&lt;repo&gt;/.rupu/config.toml</code></td><td>Repo-local overrides, checked in with the code.</td></tr>
+      </tbody>
+    </table>
+    <p>Scalars and tables from a more specific layer override the less specific one; <strong>arrays replace rather than merge</strong> (a project that declares <code class="inline">[[scm.rules]]</code> replaces the global list). Resolution order, highest first:</p>
+    <pre class="code"><span class="c"># highest wins</span>
+global lock  ›  customer lock  ›  project  ›  customer  ›  global  ›  built-in default</pre>
+    <p>Sections are strict: an unknown key inside a section such as <code class="inline">[bash]</code>, <code class="inline">[cp]</code> or <code class="inline">[netflow]</code> is a parse error rather than a silently ignored typo. A few retired keys are still accepted as no-ops — see <a class="link" href="#deprecated">Deprecated keys</a>.</p>
+
+    <h3 id="env">Environment variables</h3>
+    <p>There is no environment <em>layer</em> — environment variables are never merged into the config. A handful are read directly by the code they affect and win over the matching key there:</p>
+    <table>
+      <thead><tr><th>Variable</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td><code>RUPU_HOME</code></td><td>Moves the global directory (default <code>~/.rupu</code>): config, credentials, runs, caches.</td></tr>
+        <tr><td><code>RUPU_LOG</code></td><td>Wins over <code>log_level</code>.</td></tr>
+        <tr><td><code>RUPU_MAX_OPEN_FILES</code>, <code>RUPU_MAX_CONCURRENT_JOBS</code>, <code>RUPU_MIN_FREE_MEMORY_MB</code></td><td>Win over the <a class="link" href="#runtime"><code>[runtime]</code></a> keys of the same name.</td></tr>
+        <tr><td><code>RUPU_NETFLOW_SUBPROCESS=0</code></td><td>Forces <code>[netflow].subprocess_capture</code> off.</td></tr>
+        <tr><td><code>RUPU_NO_UPDATE_CHECK</code></td><td>Suppresses the passive update notice, like <code>[update].check = false</code>, when set to anything other than empty, <code>0</code> or <code>false</code> (so <code>RUPU_NO_UPDATE_CHECK=0</code> leaves it on).</td></tr>
+        <tr><td><code>RUPU_LIVE_VIEW=0</code></td><td>Turns the workflow live view off (as <code>--plain</code> does).</td></tr>
+        <tr><td><code>NO_COLOR</code></td><td>Forces <code>[ui].color = "never"</code>.</td></tr>
+        <tr><td><code>VISUAL</code> / <code>EDITOR</code></td><td>Used when <code>[ui].editor</code> is unset.</td></tr>
+        <tr><td><code>RUPU_&lt;ACCOUNT&gt;_API_KEY</code></td><td>API-key fallback for a provider account with no stored credential — see <a class="link" href="/docs/providers.html#accounts">Providers</a>.</td></tr>
+      </tbody>
+    </table>
+
+    <h3 id="editing">Reading and editing</h3>
+    <pre class="code">rupu config get <span class="v">ui.theme</span>
+rupu config set <span class="v">cp.gate_sweep_interval_secs</span> <span class="v">30</span>
+rupu config set <span class="v">update.channel</span> <span class="s">beta</span></pre>
+    <p><code class="inline">rupu config get</code> / <code class="inline">set</code> work on the <strong>global</strong> file only. Dotted keys descend into tables; the value is parsed as a TOML scalar (string, integer or bool), and <code class="inline">set</code> refuses to replace a table with a scalar or the reverse. Edit arrays and tables (<code class="inline">[[scm.rules]]</code>, <code class="inline">[recovery].fallbacks</code>) by hand, a customer layer with <code class="inline">rupu customer edit &lt;slug&gt;</code>, or everything from the control plane's <a class="link" href="/docs/control-plane.html">Settings</a> page, which shows each effective value with the layer it came from, a lock toggle, and a raw TOML editor.</p>
+
+    <h2 id="policy">Locks and policy — <code class="inline">[policy]</code></h2>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>lock</code></td><td>array&lt;string&gt;</td><td><code>[]</code></td><td>Dotted key paths (<code>permission_mode</code>, <code>autoflow.max_active</code>) whose value from <em>this</em> layer can't be overridden. A global lock beats every layer; a customer lock beats the project layer only and cannot unlock a key the global list names. A project's own <code>lock</code> list is ignored.</td></tr>
+      </tbody>
+    </table>
+    <pre class="code"><span class="c"># ~/.rupu/config.toml — no project or customer can loosen these</span>
+<span class="k">permission_mode</span> = <span class="s">"readonly"</span>
+
+<span class="v">[policy]</span>
+<span class="k">lock</span> = [<span class="s">"permission_mode"</span>, <span class="s">"bash.env_allowlist"</span>]</pre>
+    <div class="callout"><strong>Scope of a lock.</strong> A lock covers config keys only. An agent whose own frontmatter names <code class="inline">provider:</code> or <code class="inline">auth:</code> still runs on that provider even when <code class="inline">default_provider</code> is locked.</div>
+
+    <h2 id="customer-layer">Customer layer</h2>
+    <p>Assign a project to a customer with <code class="inline">rupu customer assign &lt;slug&gt;</code> (a slug is 1–63 of <code class="inline">a-z</code>, <code class="inline">0-9</code>, <code class="inline">-</code>; <code class="inline">none</code> is reserved). The customer's <code class="inline">config.toml</code> then sits between the global and project files for every run in that project — and its subdirectories, since a run uses the nearest assigned ancestor of its working directory.</p>
+    <pre class="code"><span class="c"># ~/.rupu/customers/northwind/config.toml</span>
+<span class="k">default_provider</span> = <span class="s">"anthropic-northwind"</span>
+
+<span class="v">[[scm.rules]]</span>
+<span class="k">owner</span>   = <span class="s">"northwind-labs"</span>
+<span class="k">account</span> = <span class="s">"github-northwind"</span>
+
+<span class="v">[policy]</span>
+<span class="k">lock</span> = [<span class="s">"default_provider"</span>]   <span class="c"># a repo's .rupu/config.toml can't move these runs</span></pre>
+    <ul>
+      <li>Accounts are declared once, globally (<code class="inline">rupu auth login --account anthropic-northwind --kind anthropic</code>); the customer layer only references them.</li>
+      <li>A run records the customer it ran under; <code class="inline">workflow resume</code> / <code class="inline">approve</code> reuse that record even if the project was reassigned since.</li>
+      <li>A dangling assignment or an unparseable customer layer fails the run — it never falls back to global.</li>
+      <li><code class="inline">rupu customer show &lt;slug&gt;</code> prints the effective config with sources and locks.</li>
+    </ul>
+    <p>More in <a class="link" href="/docs/customers.html">Customers</a>.</p>
+
+    <h2 id="top-level">Top-level keys</h2>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>default_provider</code></td><td>string</td><td>none</td><td>Provider account used when an agent omits <code>provider:</code>.</td></tr>
+        <tr><td><code>default_model</code></td><td>string</td><td><code>claude-sonnet-4-6</code></td><td>Used when the agent sets no <code>model:</code> and the provider's own <code>default_model</code> is unset.</td></tr>
+        <tr><td><code>permission_mode</code></td><td>string</td><td><code>ask</code></td><td><code>ask</code> | <code>bypass</code> | <code>readonly</code>; fallback when neither the agent nor <code>--mode</code> sets one.</td></tr>
+        <tr><td><code>log_level</code></td><td>string</td><td><code>warn</code></td><td>Any tracing directive (<code>debug</code>, <code>rupu_scm=debug,info</code>). <code>RUPU_LOG</code> wins; blank counts as unset.</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="providers">Model providers — <code class="inline">[providers.&lt;account&gt;]</code></h2>
+    <p>One table per provider <strong>account</strong>: a bare vendor name (<code class="inline">anthropic</code>, <code class="inline">openai</code>, <code class="inline">gemini</code>, <code class="inline">copilot</code>), a named account of a vendor (<code class="inline">anthropic-work</code> with <code class="inline">kind = "anthropic"</code>), or an <code class="inline">openai-compatible</code> endpoint you name yourself. An agent's <code class="inline">provider:</code> names the account. Narrative: <a class="link" href="/docs/providers.html">Providers &amp; Auth</a>.</p>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>kind</code></td><td>string</td><td>none (the table name is the vendor)</td><td>Vendor of a named account, or <code>openai-compatible</code>. Written for you by <code>rupu auth login --account &lt;name&gt; --kind &lt;vendor&gt;</code>. An unknown kind is a load error.</td></tr>
+        <tr><td><code>base_url</code></td><td>string</td><td>vendor URL</td><td>Read by <code>openai-compatible</code> accounts.</td></tr>
+        <tr><td><code>default_model</code></td><td>string</td><td>none</td><td>Beats the global <code>default_model</code> for agents on this account.</td></tr>
+        <tr><td><code>stream</code></td><td>bool</td><td><code>true</code></td><td><code>false</code> forces non-streaming for servers without SSE.</td></tr>
+        <tr><td><code>org_id</code></td><td>string</td><td>none</td><td>OpenAI only; sent as <code>OpenAI-Organization</code>.</td></tr>
+        <tr><td><code>region</code></td><td>string</td><td>none</td><td>Accepted; not used by any shipped client today.</td></tr>
+        <tr><td><code>timeout_ms</code></td><td>integer</td><td><code>120000</code></td><td><code>0</code> counts as unset.</td></tr>
+        <tr><td><code>max_retries</code></td><td>integer</td><td><code>1</code></td><td>Retries after the first attempt on a retryable error.</td></tr>
+        <tr><td><code>max_concurrency</code></td><td>integer</td><td>anthropic 4, openai 8, gemini 4, copilot 4</td><td>In-flight requests per account; <code>0</code> counts as unset.</td></tr>
+        <tr><td><code>prompt_cache</code></td><td>bool</td><td><code>true</code></td><td>Anthropic only. <code>false</code> for gateways that reject <code>cache_control</code>; an agent's <code>anthropicPromptCache</code> overrides it.</td></tr>
+        <tr><td><code>models</code></td><td>array of tables</td><td><code>[]</code></td><td>Each entry: <code>id</code> (required), <code>context_window</code> and <code>max_output</code> (optional; when unset or <code>0</code> the limit is discovered from the provider's model list).</td></tr>
+      </tbody>
+    </table>
+    <pre class="code"><span class="v">[providers.anthropic]</span>
+<span class="k">default_model</span> = <span class="s">"claude-sonnet-4-6"</span>
+<span class="k">max_concurrency</span> = <span class="v">6</span>
+
+<span class="v">[providers.lab-llm]</span>              <span class="c"># an OpenAI-compatible endpoint</span>
+<span class="k">kind</span> = <span class="s">"openai-compatible"</span>
+<span class="k">base_url</span> = <span class="s">"http://10.0.0.20:8000/v1"</span>
+<span class="k">default_model</span> = <span class="s">"qwen3-coder"</span>
+<span class="k">models</span> = [{ <span class="k">id</span> = <span class="s">"qwen3-coder"</span>, <span class="k">context_window</span> = <span class="v">131072</span>, <span class="k">max_output</span> = <span class="v">8192</span> }]</pre>
+    <p>An <code class="inline">openai-compatible</code> account must set <code class="inline">base_url</code> and <code class="inline">default_model</code>, and may not reuse a reserved name (<code class="inline">anthropic</code>, <code class="inline">openai</code>, <code class="inline">gemini</code>, <code class="inline">copilot</code>, <code class="inline">local</code>, <code class="inline">github</code>, <code class="inline">gitlab</code>, <code class="inline">linear</code>, <code class="inline">jira</code>).</p>
+
+    <h2 id="scm">SCM and trackers — <code class="inline">[scm.*]</code>, <code class="inline">[[scm.rules]]</code>, <code class="inline">[issues]</code></h2>
+    <table>
+      <thead><tr><th>Key</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>[scm.default].platform</code></td><td>Fallback platform when a tool call omits <code>platform</code>. (<code>owner</code> / <code>repo</code> here are deprecated and never read.)</td></tr>
+        <tr><td><code>[issues.default].tracker</code></td><td>Fallback tracker when a tool call omits <code>tracker</code>.</td></tr>
+        <tr><td><code>[issues.default].project</code></td><td><code>&lt;owner&gt;/&lt;repo&gt;</code> default for <code>rupu issues list</code>, between an explicit <code>--repo</code> and git-remote autodetection. Needs <code>tracker</code> set too.</td></tr>
+        <tr><td><code>[scm.&lt;account&gt;]</code></td><td>One table per SCM account (<code>[scm.github]</code>, <code>[scm.gh-work]</code>). Keys: <code>kind</code> (<code>github</code> | <code>gitlab</code>; omit when the name <em>is</em> the platform), <code>base_url</code>, <code>timeout_ms</code> (default <code>30000</code>), <code>max_concurrency</code> (github 8, gitlab 6), <code>clone_protocol</code> (<code>https</code> | <code>ssh</code>, default <code>https</code>), and GitLab-only <code>oauth_client_id</code> — the OAuth application SSO logs in as (glab's on gitlab.com; required for self-managed; read from the global file only).</td></tr>
+        <tr><td><code>[[scm.rules]]</code></td><td>Account selection when two accounts share a platform. Each entry sets <code>account</code> plus exactly one of <code>owner</code> (repo-owner glob) or <code>path</code> (cwd glob). Precedence: <code>--account</code> → owner rule → path rule → the sole account of that platform → error. <code>rupu scm bind</code> appends one.</td></tr>
+      </tbody>
+    </table>
+    <pre class="code"><span class="v">[scm.github]</span>
+<span class="k">clone_protocol</span> = <span class="s">"ssh"</span>
+
+<span class="v">[scm.gh-work]</span>
+<span class="k">kind</span> = <span class="s">"github"</span>
+<span class="k">base_url</span> = <span class="s">"https://ghe.example.com/api/v3"</span>
+
+<span class="v">[[scm.rules]]</span>
+<span class="k">owner</span> = <span class="s">"example-corp/*"</span>
+<span class="k">account</span> = <span class="s">"gh-work"</span>
+
+<span class="v">[[scm.rules]]</span>
+<span class="k">path</span> = <span class="s">"~/Code/work/*"</span>
+<span class="k">account</span> = <span class="s">"gh-work"</span></pre>
+    <p>See <a class="link" href="/docs/integrations.html#multi-account">Integrations</a> for the full routing story.</p>
+
+    <h2 id="ui">Terminal UI — <code class="inline">[ui]</code></h2>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>color</code></td><td>string</td><td><code>auto</code></td><td><code>auto</code> | <code>always</code> | <code>never</code>. <code>NO_COLOR</code> and <code>--no-color</code> force <code>never</code>.</td></tr>
+        <tr><td><code>theme</code></td><td>string</td><td>none</td><td>One name for both syntax and palette: a palette theme name selects that palette (and its paired syntax theme); a syntax theme name selects that syntax theme.</td></tr>
+        <tr><td><code>live_view</code></td><td>string</td><td><code>focused</code></td><td><code>focused</code> | <code>compact</code> | <code>full</code> — density of the workflow live view.</td></tr>
+        <tr><td><code>pager</code></td><td>string</td><td><code>auto</code></td><td><code>auto</code> | <code>always</code> | <code>never</code>.</td></tr>
+        <tr><td><code>editor</code></td><td>string</td><td><code>$VISUAL</code> / <code>$EDITOR</code></td><td>Command used by <code>agent edit</code>/<code>create</code> and <code>workflow edit</code>/<code>create</code>.</td></tr>
+        <tr><td><code>[ui.syntax].theme</code></td><td>string</td><td><code>base16-ocean.dark</code></td><td>Code-highlighting theme; beats <code>theme</code>. Built-ins include <code>base16-ocean.dark</code>, <code>base16-eighties.dark</code>, <code>base16-mocha.dark</code>, <code>base16-ocean.light</code>, <code>InspiredGitHub</code>, <code>Solarized (dark)</code>, <code>Solarized (light)</code>.</td></tr>
+        <tr><td><code>[ui.palette].theme</code></td><td>string</td><td><code>rupu-dark</code></td><td>CLI status colors; beats <code>theme</code>. Built-ins: <code>rupu-dark</code>, <code>rupu-light</code>, <code>rupu-midnight</code>, <code>tokyo-night</code>, <code>dracula</code>, <code>gruvbox-dark</code>, <code>github-dark</code>, <code>github-light</code>.</td></tr>
+        <tr><td><code>[ui.cp].shell</code></td><td>string</td><td><code>v1</code></td><td><code>v1</code> | <code>v2</code> — control-plane web shell. Read from the global file on every page load, so a browser refresh switches it.</td></tr>
+      </tbody>
+    </table>
+    <p>Custom themes live in <code class="inline">~/.rupu/themes/</code> or a project's <code class="inline">.rupu/themes/</code>. <code class="inline">rupu ui themes</code> lists what's available (marking the current one); <code class="inline">rupu ui theme show|validate|import</code> manages them, and <code class="inline">import</code> accepts native rupu theme files and Base16 schemes.</p>
+    <pre class="code"><span class="v">[ui]</span>
+<span class="k">live_view</span> = <span class="s">"compact"</span>
+<span class="k">pager</span> = <span class="s">"never"</span>
+
+<span class="v">[ui.palette]</span>
+<span class="k">theme</span> = <span class="s">"tokyo-night"</span>
+
+<span class="v">[ui.syntax]</span>
+<span class="k">theme</span> = <span class="s">"base16-mocha.dark"</span></pre>
+
+    <h2 id="bash">The bash tool — <code class="inline">[bash]</code></h2>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>timeout_secs</code></td><td>integer</td><td><code>120</code></td><td>Timeout for one <code>bash</code> tool invocation.</td></tr>
+        <tr><td><code>env_allowlist</code></td><td>array&lt;string&gt;</td><td><code>[]</code></td><td>Extra env vars forwarded into the subprocess, beyond the always-allowed <code>PATH</code>, <code>HOME</code>, <code>USER</code>, <code>TERM</code>, <code>LANG</code>.</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="runtime">Machine limits — <code class="inline">[runtime]</code></h2>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>max_open_files</code></td><td>integer</td><td>unset</td><td>Soft open-file limit rupu raises itself to at startup, and the cap for automatic growth under fan-out. Unset: raise to 10240 (capped at the hard limit) and grow on demand. Past the cap, new agent runs are paced instead of failing with "Too many open files". Env: <code>RUPU_MAX_OPEN_FILES</code> / <code>--max-open-files</code>.</td></tr>
+        <tr><td><code>max_concurrent_jobs</code></td><td>integer</td><td>RAM-derived</td><td>Process-wide ceiling on local agent jobs, whatever a workflow's <code>max_parallel:</code> / <code>max_concurrency:</code> says. Unset: <code>clamp(RAM_GB / 4, 4, 128)</code>. <code>0</code> means no ceiling. Remote (<code>distribute:</code>) units are bounded by their own host. Env: <code>RUPU_MAX_CONCURRENT_JOBS</code>.</td></tr>
+        <tr><td><code>min_free_memory_mb</code></td><td>integer</td><td>RAM-derived</td><td>Memory watchdog: a new local job waits until this much memory is free (proceeding anyway after 60 s, with a warning). Unset: <code>max(RAM × 10%, 4096)</code>. <code>0</code> disables the watchdog. Env: <code>RUPU_MIN_FREE_MEMORY_MB</code>.</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="workflow">Workflow <code class="inline">run:</code> steps — <code class="inline">[workflow]</code></h2>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>run_step_enabled</code></td><td>bool</td><td><code>false</code></td><td>Whether <code>run:</code> steps (which execute declared commands) may run. A workflow that reaches one while this is off <strong>fails</strong>; it never silently skips it.</td></tr>
+        <tr><td><code>run_step_allowlist</code></td><td>array&lt;string&gt;</td><td><code>[]</code></td><td>Executables a <code>run:</code> step may invoke, matched on basename (<code>/usr/bin/python3</code> and <code>python3</code> gate alike). Empty means any.</td></tr>
+      </tbody>
+    </table>
+    <pre class="code"><span class="v">[workflow]</span>
+<span class="k">run_step_enabled</span> = <span class="v">true</span>
+<span class="k">run_step_allowlist</span> = [<span class="s">"python3"</span>, <span class="s">"make"</span>]</pre>
+
+    <h2 id="recovery">Recovery — <code class="inline">[recovery]</code></h2>
+    <p>What happens when a model's reply can't be used or the provider fails the request. Background: <a class="link" href="/docs/reliability.html">Recovery &amp; reliability</a>.</p>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>fallbacks</code></td><td>array of <code>{ model, provider? }</code></td><td><code>[]</code></td><td>Fallback chain for every agent that declares no <code>fallbacks:</code> of its own (an agent's list replaces this one). An entry without <code>provider</code> means the provider the run started on; same-provider entries are tried first, then the others.</td></tr>
+        <tr><td><code>server_side_fallback</code></td><td>bool</td><td><code>true</code></td><td>Ask Anthropic to fall back server-side when the requested model refuses. API-key auth on supported models only, never OAuth.</td></tr>
+      </tbody>
+    </table>
+    <pre class="code"><span class="v">[recovery]</span>
+<span class="k">fallbacks</span> = [
+  { <span class="k">model</span> = <span class="s">"claude-sonnet-4-6"</span> },
+  { <span class="k">provider</span> = <span class="s">"openai"</span>, <span class="k">model</span> = <span class="s">"gpt-5"</span> },
+]</pre>
+
+    <h2 id="findings">Findings — <code class="inline">[findings]</code></h2>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>artifact_max_bytes</code></td><td>integer</td><td>500 MiB</td><td>Per-file cap for copying an artifact into the store; larger files are recorded by hash only.</td></tr>
+        <tr><td><code>artifact_max_files</code></td><td>integer</td><td><code>500</code></td><td>Most files one report's artifacts may expand to (a directory counts every file inside).</td></tr>
+        <tr><td><code>artifact_total_max_bytes</code></td><td>integer</td><td>2 GiB</td><td>Most bytes one report's copied artifacts may add up to.</td></tr>
+        <tr><td><code>report_max_bytes</code></td><td>integer</td><td>256 KiB</td><td>Size budget for one <code>full</code> finding report.</td></tr>
+        <tr><td><code>ticket_patterns</code></td><td>array&lt;string&gt;</td><td><code>[]</code></td><td>Regexes or URL prefixes identifying your existing tickets; added to the finding-writing guidance agents get.</td></tr>
+        <tr><td><code>export_id_prefix</code></td><td>string</td><td><code>SEC</code></td><td>Prefix of exported report numbers (<code>SEC-001</code>). <strong>Global file only</strong>; must match <code>^[A-Za-z][A-Za-z0-9_-]{0,15}$</code>.</td></tr>
+      </tbody>
+    </table>
+    <p><code class="inline">rupu findings import</code> reads the size limits from the global file only. See <a class="link" href="/docs/findings.html">Findings</a>.</p>
+
+    <h2 id="netflow">Network capture — <code class="inline">[netflow]</code></h2>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>subprocess_capture</code></td><td>bool</td><td><code>true</code></td><td>Master switch for recording the connections an agent's <code>bash</code> commands open, by passively observing the OS socket table (no proxy, no root). Where the backend can't start, the run records why. <code>RUPU_NETFLOW_SUBPROCESS=0</code> forces it off.</td></tr>
+        <tr><td><code>subprocess_poll_ms</code></td><td>integer</td><td><code>50</code></td><td>Linux only: interval between socket-table polls while a <code>bash</code> call runs.</td></tr>
+        <tr><td><code>subprocess_linger_ms</code></td><td>integer</td><td><code>3000</code></td><td>How long after the shell exits its sockets are still attributed to that call. A socket still open at the end is recorded as still open. Clamped to one day.</td></tr>
+        <tr><td><code>asn_auto_refresh</code></td><td>bool</td><td><code>true</code></td><td>Keep the IP → ASN enrichment table fresh: the control plane downloads it in the background when it is missing or stale.</td></tr>
+        <tr><td><code>asn_refresh_interval_days</code></td><td>integer</td><td><code>7</code></td><td>Age after which the ASN table is re-downloaded. <code>0</code> treats it as always stale.</td></tr>
+        <tr><td><code>asn_source_url</code></td><td>string</td><td><code>https://iptoasn.com/data/ip2asn-combined.tsv.gz</code></td><td>Where the ASN table comes from (gzipped ip2asn TSV) — point it at a mirror on an air-gapped network.</td></tr>
+        <tr><td><code>cp_index_budget_mb</code></td><td>integer</td><td><code>256</code></td><td>Memory budget for the flow rows <code>rupu cp serve</code> keeps indexed. Over budget, the oldest files' rows are dropped and re-read from disk on demand — slower, never different. Status: <code>GET /api/netflow/index</code>.</td></tr>
+      </tbody>
+    </table>
+    <pre class="code"><span class="v">[netflow]</span>
+<span class="k">asn_source_url</span> = <span class="s">"https://mirror.internal.example/ip2asn-combined.tsv.gz"</span>
+<span class="k">asn_refresh_interval_days</span> = <span class="v">30</span>
+<span class="k">subprocess_linger_ms</span> = <span class="v">5000</span></pre>
+    <p>See <a class="link" href="/docs/netflow.html">Netflow</a>.</p>
+
+    <h2 id="cp">Control plane — <code class="inline">[cp]</code></h2>
+    <p>Background loops <code class="inline">rupu cp serve</code> runs in-process, so autoflows, triggers and gate timeouts work with no external cron.</p>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>max_workspace_bytes</code></td><td>integer</td><td>256 MiB</td><td>Largest workspace-sync payload or delta for placed runs.</td></tr>
+        <tr><td><code>autoflow_reconcile_enabled</code></td><td>bool</td><td><code>true</code></td><td>Run the autoflow reconcile loop (issue/PR entity autoflows).</td></tr>
+        <tr><td><code>autoflow_reconcile_interval_secs</code></td><td>integer</td><td><code>60</code></td><td></td></tr>
+        <tr><td><code>cron_tick_enabled</code></td><td>bool</td><td><code>true</code></td><td>Run the cron / polled-event trigger tick (what <code>rupu cron tick</code> does).</td></tr>
+        <tr><td><code>cron_tick_interval_secs</code></td><td>integer</td><td><code>60</code></td><td></td></tr>
+        <tr><td><code>gate_sweep_enabled</code></td><td>bool</td><td><code>true</code></td><td>Enforce gate <code>on_timeout</code> routing and reap orphaned runs whose runner process died. The same tick also drives the ASN refresh and the agentiflow reaper, each gated by its own key.</td></tr>
+        <tr><td><code>gate_sweep_interval_secs</code></td><td>integer</td><td><code>60</code></td><td></td></tr>
+      </tbody>
+    </table>
+    <div class="callout"><strong>Retired UI flags.</strong> <code class="inline">agent_authoring_ui</code> and <code class="inline">workflow_editor_ui</code> are no longer read: the agent builder and workflow editor are the only UIs. They still parse (with a warning) so an old config keeps loading — delete them.</div>
+
+    <h2 id="agentiflow">Agentiflow supervision — <code class="inline">[agentiflow]</code></h2>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>serve_enabled</code></td><td>bool</td><td><code>true</code></td><td><code>false</code> makes <code>rupu agentiflow serve</code> say it's disabled and exit.</td></tr>
+        <tr><td><code>serve_interval_secs</code></td><td>integer</td><td><code>60</code></td><td>Seconds between <code>agentiflow serve</code> sweeps (<code>cp serve</code> reaps on its gate-sweep tick).</td></tr>
+        <tr><td><code>reaper_enabled</code></td><td>bool</td><td><code>true</code></td><td>Finalize a run whose coordinator died as <code>failed</code> and stop its units — in both <code>agentiflow serve</code> and <code>cp serve</code>.</td></tr>
+      </tbody>
+    </table>
+    <p>See <a class="link" href="/docs/agentiflows.html">Agentiflows</a>.</p>
+
+    <h2 id="triggers">Event triggers — <code class="inline">[triggers]</code></h2>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>poll_sources</code></td><td>array of string | table</td><td><code>[]</code></td><td>Sources polled for event-triggered workflows: <code>github:owner/repo</code>, <code>gitlab:group/project</code>, <code>linear:&lt;team-id&gt;</code>, <code>jira:&lt;site&gt;/&lt;project&gt;</code>. A table entry adds <code>poll_interval</code> (<code>"5m"</code>) and <code>account</code> — the only way to choose between two tracker accounts of one kind.</td></tr>
+        <tr><td><code>max_events_per_tick</code></td><td>integer</td><td><code>50</code></td><td>Cap on events processed per source per tick.</td></tr>
+      </tbody>
+    </table>
+    <pre class="code"><span class="v">[triggers]</span>
+<span class="k">poll_sources</span> = [
+  <span class="s">"github:example-org/api"</span>,
+  { <span class="k">source</span> = <span class="s">"linear:team-1234"</span>, <span class="k">poll_interval</span> = <span class="s">"10m"</span>, <span class="k">account</span> = <span class="s">"linear-ops"</span> },
+]</pre>
+    <p>See <a class="link" href="/docs/triggers.html">Triggers</a>.</p>
+
+    <h2 id="autoflow">Autoflow defaults — <code class="inline">[autoflow]</code></h2>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>enabled</code></td><td>bool</td><td><code>false</code></td><td></td></tr>
+        <tr><td><code>repo</code></td><td>string</td><td>none</td><td>e.g. <code>github:example-org/api</code>.</td></tr>
+        <tr><td><code>checkout</code></td><td>string</td><td><code>worktree</code></td><td><code>worktree</code> | <code>in_place</code>.</td></tr>
+        <tr><td><code>worktree_root</code></td><td>string</td><td>none</td><td>Only with <code>checkout = "worktree"</code>.</td></tr>
+        <tr><td><code>permission_mode</code></td><td>string</td><td>none</td><td>Only <code>bypass</code> or <code>readonly</code>; <code>ask</code> is rejected for unattended runs.</td></tr>
+        <tr><td><code>strict_templates</code></td><td>bool</td><td><code>false</code></td><td></td></tr>
+        <tr><td><code>max_active</code></td><td>integer</td><td>unbounded</td><td>Cap on concurrently active claims.</td></tr>
+        <tr><td><code>cleanup_after</code></td><td>string</td><td>never</td><td>e.g. <code>7d</code> — completed/released claims and their worktrees are pruned after this.</td></tr>
+      </tbody>
+    </table>
+    <p>See <a class="link" href="/docs/autoflows.html">Autoflows</a>.</p>
+
+    <h2 id="pricing">Pricing — <code class="inline">[pricing]</code></h2>
+    <p>Turns token counts into USD for <code class="inline">rupu usage</code>, run listings and the control plane. Lookup order: <code class="inline">[pricing.&lt;provider&gt;."&lt;model&gt;"]</code> override → built-in table (each vendor's standard-tier list rate) → <code class="inline">[pricing.agents.&lt;agent&gt;]</code>. A named account prices through its <code class="inline">kind</code>, and an account-level override beats the vendor one. Model ids match exactly, then with a trailing <code class="inline">[tag]</code> stripped, then with a date snapshot stripped.</p>
+    <table>
+      <thead><tr><th>Field</th><th>Type</th><th>Required</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>input_per_mtok</code></td><td>float</td><td>yes</td><td>USD per million input tokens.</td></tr>
+        <tr><td><code>output_per_mtok</code></td><td>float</td><td>yes</td><td>USD per million output tokens (reasoning tokens included).</td></tr>
+        <tr><td><code>cached_input_per_mtok</code></td><td>float</td><td>no</td><td>Cache reads; defaults to the input rate.</td></tr>
+        <tr><td><code>cache_write_per_mtok</code></td><td>float</td><td>no</td><td>Cache writes; defaults to the input rate.</td></tr>
+      </tbody>
+    </table>
+    <pre class="code"><span class="v">[pricing.anthropic."claude-sonnet-4-6"]</span>
+<span class="k">input_per_mtok</span> = <span class="v">3.0</span>
+<span class="k">output_per_mtok</span> = <span class="v">15.0</span>
+<span class="k">cached_input_per_mtok</span> = <span class="v">0.30</span>
+<span class="k">cache_write_per_mtok</span> = <span class="v">3.75</span>
+
+<span class="v">[pricing.lab-llm."qwen3-coder"]</span>    <span class="c"># an openai-compatible account</span>
+<span class="k">input_per_mtok</span> = <span class="v">0.4</span>
+<span class="k">output_per_mtok</span> = <span class="v">1.2</span>
+
+<span class="v">[pricing.agents.triage-bot]</span>        <span class="c"># fallback when no model price is known</span>
+<span class="k">input_per_mtok</span> = <span class="v">0.5</span>
+<span class="k">output_per_mtok</span> = <span class="v">1.5</span></pre>
+
+    <h2 id="storage">Retention — <code class="inline">[storage]</code></h2>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>archived_session_retention</code></td><td>string</td><td><code>30d</code></td><td>Default cutoff for <code>rupu session prune</code>.</td></tr>
+        <tr><td><code>archived_transcript_retention</code></td><td>string</td><td><code>30d</code></td><td>Default cutoff for <code>rupu transcript prune</code> / <code>rupu cleanup</code>.</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="update">Updates — <code class="inline">[update]</code></h2>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>channel</code></td><td>string</td><td><code>stable</code></td><td><code>stable</code> | <code>beta</code> — which channel <code>rupu update</code> follows.</td></tr>
+        <tr><td><code>check</code></td><td>bool</td><td><code>true</code></td><td>Print a passive "update available" notice on normal commands.</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="deprecated">Deprecated keys</h2>
+    <p>These still parse — so an old file doesn't lose every other setting — but drive nothing. Loading one logs a warning; delete them, as a future release will reject them.</p>
+    <table>
+      <thead><tr><th>Key</th><th>Replacement</th></tr></thead>
+      <tbody>
+        <tr><td><code>[retry]</code> (<code>max_attempts</code>, <code>initial_delay_ms</code>)</td><td><code>[providers.&lt;name&gt;].max_retries</code></td></tr>
+        <tr><td><code>[cp].agent_authoring_ui</code></td><td>none — the agent builder is the only UI</td></tr>
+        <tr><td><code>[cp].workflow_editor_ui</code></td><td>none — the workflow editor is the only UI</td></tr>
+        <tr><td><code>[scm.default].owner</code>, <code>[scm.default].repo</code></td><td>pass <code>--repo</code>, or set <code>[issues.default].project</code></td></tr>
+      </tbody>
+    </table>
+
+    <div class="doc-nav">
+      <a href="/docs/cli.html">&#8592; CLI reference</a>
+      <a href="/docs/api.html">HTTP API &#8594;</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

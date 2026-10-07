@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu docs — Integrations</title>
+<meta name="description" content="Connect rupu to your source host and issue tracker — GitHub, GitLab, Jira, and Linear — so agents can read issues, work in repos, open PRs, and comment back.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="docs-shell">
+
+  <!-- ════ SHARED SIDEBAR (copy verbatim into every docs page; set .active) ════ -->
+  <aside class="docs-side">
+    <a class="brand" href="/" aria-label="rupu home">
+      <span class="mark" aria-hidden="true">&#8734;</span>
+      <span class="name">rupu</span>
+    </a>
+    <div class="grp">Start</div>
+    <a class="item" href="/docs/quickstart.html">Quickstart</a>
+    <a class="item" href="/docs/">Overview &amp; install</a>
+    <div class="grp">Concepts</div>
+    <a class="item" href="/docs/agents.html">Agents</a>
+    <a class="item" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
+    <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
+    <a class="item" href="/docs/sessions.html">Sessions</a>
+    <a class="item" href="/docs/profiles.html">Engagement profiles</a>
+    <div class="grp">Platform</div>
+    <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item" href="/docs/reliability.html">Recovery &amp; reliability</a>
+    <a class="item active" href="/docs/integrations.html">Integrations</a>
+    <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
+    <a class="item" href="/docs/triggers.html">Triggers</a>
+    <a class="item" href="/docs/control-plane.html">Control plane</a>
+    <a class="item" href="/docs/multi-host.html">Multi-host</a>
+    <a class="item" href="/docs/netflow.html">Netflow</a>
+    <a class="item" href="/docs/coverage.html">Coverage</a>
+    <a class="item" href="/docs/findings.html">Findings</a>
+    <a class="item" href="/docs/customers.html">Customers</a>
+    <div class="grp">Reference</div>
+    <a class="item" href="/docs/cli.html">CLI reference</a>
+    <a class="item" href="/docs/configuration.html">Configuration</a>
+    <a class="item" href="/docs/api.html">HTTP API</a>
+    <a class="item" href="/docs/transcripts.html">Transcript schema</a>
+    <div class="grp">More</div>
+    <a class="item" href="/docs/examples/">Examples</a>
+    <a class="item" href="/#download">Download</a>
+    <a class="item" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </aside>
+  <!-- ════ /SHARED SIDEBAR ════ -->
+
+  <main class="docs-main">
+    <h1>Integrations</h1>
+    <p class="intro">rupu plugs into your source host and your issue tracker so agents can read issues, work in repos, open pull requests, and comment back — across more than one platform at once.</p>
+
+    <h2>Plug rupu into your stack</h2>
+    <p>Integrations are how rupu reaches out beyond your laptop. Two connector families do the work, and both speak through rupu's single embedded MCP server so agents call the same typed tools regardless of which platform a call resolves to:</p>
+    <ul>
+      <li><strong>Source control (SCM)</strong> — the <code class="inline">RepoConnector</code>. List and read repos, clone working trees, read files by ref, open pull requests / merge requests. Ships for <strong>GitHub</strong> and <strong>GitLab</strong>.</li>
+      <li><strong>Issue trackers</strong> — the <code class="inline">IssueConnector</code>. Fetch and list issues, comment, create, and transition state. Ships for <strong>GitHub Issues</strong>, <strong>GitLab Issues</strong>, <strong>Jira</strong>, and <strong>Linear</strong>.</li>
+    </ul>
+    <p>Per-platform connectors absorb the vendor quirks — GitLab MR vs GitHub PR vocabulary, nested namespaces, rate-limit headers — so your agent files stay portable. An agent that reads <code class="inline">scm.prs.diff</code> and posts <code class="inline">scm.prs.comment</code> works against GitHub and GitLab unchanged.</p>
+    <div class="callout"><strong>One auth flow.</strong> SCM and tracker credentials go through the same <code class="inline">rupu auth login</code> path as your model providers, stored in <code class="inline">~/.rupu/auth.json</code> (mode 0600). <code class="inline">rupu auth status</code> lists SCM and tracker rows automatically, and you can hold <a class="link" href="#multi-account">more than one account per platform</a>.</div>
+
+    <h2>Source control (SCM)</h2>
+    <p>The <code class="inline">RepoConnector</code> handles everything repo-shaped. When a run targets a repo or a PR (not a bare issue), rupu clones the repo into a tempdir and runs the agent there; issue targets skip the clone and rely on read tools.</p>
+
+    <table>
+      <thead><tr><th>Platform</th><th>API</th><th>What rupu can do</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>GitHub</strong></td>
+          <td>REST</td>
+          <td>List / get repos &amp; branches, create branches, read files by ref, list / get PRs, fetch diffs, comment on PRs, open PRs (incl. <code>draft</code>), <code>clone_to</code> local checkout, dispatch a GitHub Actions <code>workflow_dispatch</code>. GitHub Enterprise Server via a <code>base_url</code> on the account.</td>
+        </tr>
+        <tr>
+          <td><strong>GitLab</strong></td>
+          <td>REST</td>
+          <td>The same surface, with MR vocabulary translated to <code>scm.prs.*</code>: list / get repos &amp; branches, read files, list / get MRs, fetch diffs, comment, open MRs, <code>clone_to</code>, trigger a CI pipeline against a ref. Nested groups and self-managed instances (<code>base_url</code> on the account) supported.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>Run-targets pick a platform by prefix. PRs use <code class="inline">#N</code> on GitHub and <code class="inline">!N</code> on GitLab (GitLab's MR convention):</p>
+    <pre class="code"><span class="c"># repo working tree / PR / MR / issue</span>
+github:owner/repo            <span class="c"># repo</span>
+github:owner/repo#42         <span class="c"># PR 42</span>
+github:owner/repo/issues/123 <span class="c"># issue 123</span>
+gitlab:group/sub/project!7   <span class="c"># MR 7</span></pre>
+
+    <h3>The <code class="inline">rupu repos</code> CLI</h3>
+    <p>List remote repos and manage the local repo registry (which checkout on disk maps to which repo ref):</p>
+    <pre class="code"><span class="k">rupu repos list</span>                       <span class="c"># list repos across configured platforms</span>
+<span class="k">rupu repos attach</span> github:owner/repo   <span class="c"># map a local checkout to a repo ref</span>
+<span class="k">rupu repos prefer</span> github:owner/repo   <span class="c"># mark a checkout as the preferred path</span>
+<span class="k">rupu repos tracked</span>                    <span class="c"># list locally tracked checkouts</span>
+<span class="k">rupu repos forget</span> github:owner/repo   <span class="c"># forget a repo or one tracked path</span></pre>
+    <p><code class="inline">clone_to</code> currently uses the public host's clone URLs, so it refuses an account whose <code class="inline">base_url</code> points at a GitHub Enterprise or self-managed GitLab host rather than send that account's token elsewhere. With <code class="inline">clone_protocol = "ssh"</code> clones go through your system <code class="inline">git</code> and SSH agent instead of an embedded token.</p>
+    <div class="callout"><strong>Private repos missing?</strong> Your token likely lacks the <code class="inline">repo</code> scope, or it is a GitHub App user-to-server token (no OAuth scopes). <code class="inline">rupu repos list</code> diagnoses this and tells you whether to re-login with a classic PAT or install the app on the relevant org.</div>
+
+    <h2>Issue trackers</h2>
+    <p>The <code class="inline">IssueConnector</code> family lets agents read and write tracker state. All four trackers work with the <code class="inline">issues.*</code> MCP tools (list, get, comment, create, update state); GitHub Issues and GitLab Issues also drive the <code class="inline">rupu issues</code> CLI, and Jira and Linear add native trigger sources (polling and webhook — see <a class="link" href="/docs/triggers.html">Triggers</a>). Reading an issue's existing comment thread (<code class="inline">issues.comments</code>, oldest-first) is GitHub-only today; the other trackers answer &ldquo;not supported&rdquo;.</p>
+
+    <table>
+      <thead><tr><th>Tracker</th><th>Auth</th><th>What rupu reads / writes</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>GitHub Issues</strong></td>
+          <td>PAT or device-code SSO</td>
+          <td>List, fetch (title, body, state, labels, author), read the comment thread, comment, create, transition open/closed. Full <code>issues.*</code> tools + <code>rupu issues</code>. Plus issue / PR / push event triggers.</td>
+        </tr>
+        <tr>
+          <td><strong>GitLab Issues</strong></td>
+          <td>PAT or browser-callback PKCE SSO</td>
+          <td>The same read/write surface except the comment-thread read (<code>#N</code> for issues; MRs use <code>!N</code>). Plus issue / MR / push event triggers.</td>
+        </tr>
+        <tr>
+          <td><strong>Jira</strong></td>
+          <td>API key — store as <code>&lt;email&gt;:&lt;api_token&gt;</code></td>
+          <td>Project-scoped <code>IssueConnector</code> (the <code>issues.*</code> tools, minus the comment-thread read) + native trigger source. Polls <code>jira:&lt;site&gt;/&lt;project&gt;</code> (or <code>jira:&lt;project&gt;</code> with <code>[scm.jira].base_url</code>); normalizes <code>jira.issue.opened</code> / <code>jira.issue.updated</code> and workflow-state transitions.</td>
+        </tr>
+        <tr>
+          <td><strong>Linear</strong></td>
+          <td>API key</td>
+          <td>Team-scoped <code>IssueConnector</code> (the <code>issues.*</code> tools, minus the comment-thread read) + native trigger source. Polls <code>linear:&lt;team-id&gt;</code>; normalizes <code>linear.issue.opened</code> / <code>linear.issue.updated</code> and native workflow-state changes.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p><strong>GitHub Projects (v2)</strong> also drives the tracker workflow vocabulary: when an issue-backed project item's <code class="inline">Status</code> field changes, rupu maps it into portable <code class="inline">issue.*</code> aliases (e.g. <code class="inline">issue.entered_workflow_state.ready_for_review</code>). Projects native state mapping is webhook-only today — there is no <code class="inline">poll_sources</code> form for Projects yet.</p>
+
+    <h3>The <code class="inline">rupu issues</code> CLI</h3>
+    <p>Auto-detects the target repo from the cwd's git <code class="inline">origin</code> remote when <code class="inline">--repo</code> is omitted (currently GitHub / GitLab):</p>
+    <pre class="code"><span class="k">rupu issues list</span> --state open --label triage   <span class="c"># list issues</span>
+<span class="k">rupu issues show</span> github:owner/repo/issues/42    <span class="c"># full body + metadata</span>
+<span class="k">rupu issues run</span> &lt;workflow&gt; #42                  <span class="c"># run a workflow against an issue</span></pre>
+
+    <h3>Run a workflow against an issue</h3>
+    <p><code class="inline">rupu issues run</code> is a convenience wrapper for the canonical form, which takes the issue ref as a positional run-target:</p>
+    <pre class="code"><span class="k">rupu workflow run</span> &lt;workflow&gt; github:owner/repo/issues/42</pre>
+    <p>Issue targets do <strong>not</strong> clone — the workflow runs in the current checkout and binds the issue's metadata into step prompts and <code class="inline">when:</code> filters as <code class="inline">{{ issue.* }}</code>:</p>
+    <table>
+      <thead><tr><th>Field</th><th>Value</th></tr></thead>
+      <tbody>
+        <tr><td><code>issue.number</code></td><td>Issue number</td></tr>
+        <tr><td><code>issue.title</code></td><td>Title</td></tr>
+        <tr><td><code>issue.body</code></td><td>Description / body</td></tr>
+        <tr><td><code>issue.labels</code></td><td>Label list</td></tr>
+        <tr><td><code>issue.author</code></td><td>Reporter</td></tr>
+        <tr><td><code>issue.state</code></td><td><code>open</code> / <code>closed</code></td></tr>
+        <tr><td><code>issue.ref</code></td><td>Tracker-native ref (e.g. <code>ENG-123</code> on Linear / Jira)</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="multi-account">Multiple accounts per platform</h2>
+    <p>A single GitHub (or GitLab) account needs none of this — <code class="inline">[scm.github]</code>, or just a stored credential, resolves as before. To hold <strong>two</strong> accounts of one platform — a work and a personal identity, or github.com alongside a GitHub Enterprise host — name them. <code class="inline">[scm.&lt;name&gt;]</code> is <em>account</em>-keyed: the table name is the identity and <code class="inline">kind</code> selects the vendor client.</p>
+    <pre class="code"><span class="c"># declares the account (writes [scm.&lt;name&gt;] kind = ...) and stores its credential in one step</span>
+<span class="k">rupu auth login</span> --account gh-work     --kind github --mode sso
+<span class="k">rupu auth login</span> --account gh-personal --kind github --mode sso</pre>
+    <pre class="code"><span class="v">[scm.gh-work]</span>
+<span class="k">kind</span> = <span class="s">"github"</span>
+
+<span class="v">[scm.gh-personal]</span>
+<span class="k">kind</span> = <span class="s">"github"</span>
+
+<span class="v">[scm.corp-ghe]</span>
+<span class="k">kind</span> = <span class="s">"github"</span>
+<span class="k">base_url</span> = <span class="s">"https://git.example.internal/api/v3"</span>   <span class="c"># GitHub Enterprise</span>
+
+<span class="c"># which account serves which repo</span>
+<span class="v">[[scm.rules]]</span>
+<span class="k">owner</span> = <span class="s">"example-org/*"</span>
+<span class="k">account</span> = <span class="s">"gh-work"</span>
+
+<span class="v">[[scm.rules]]</span>
+<span class="k">path</span> = <span class="s">"~/Code/work/*"</span>
+<span class="k">account</span> = <span class="s">"gh-work"</span></pre>
+    <p>Each rule sets exactly one of <code class="inline">owner</code> (a glob on the repo owner) or <code class="inline">path</code> (a glob on the caller's working directory). Account selection runs in a fixed precedence, highest first:</p>
+    <ol>
+      <li><strong>Explicit</strong> — <code class="inline">--account &lt;name&gt;</code> on <code class="inline">rupu issues list|show</code>, or an <code class="inline">account</code> argument on an <code class="inline">scm.*</code> / <code class="inline">issues.*</code> MCP tool.</li>
+      <li><strong>Owner rule</strong> — the first matching <code class="inline">owner</code> glob. This is the tier daemons rely on: a webhook or cron poll knows the repo owner but has no cwd.</li>
+      <li><strong>Path rule</strong> — the first matching <code class="inline">path</code> glob.</li>
+      <li><strong>Sole account</strong> — only one account of that platform is configured, so nothing is ambiguous.</li>
+      <li><strong>Error</strong> — never a silent guess.</li>
+    </ol>
+    <p>A targeted call that matches no rule with two or more candidates fails with the configured accounts and a ready-made fix line; a rule that names an account with no live credential fails too, instead of falling through to a different identity. <code class="inline">rupu repos list</code> and <code class="inline">scm.repos.list</code>, which have no repo to key on, fan out across every account of the platform and tag each row with its account.</p>
+    <pre class="code"><span class="k">rupu scm accounts</span>                                     <span class="c"># accounts, kinds, base_urls, and the rules pointing at each</span>
+<span class="k">rupu scm bind</span> --owner <span class="s">'example-org/*'</span> --account gh-work  <span class="c"># append an owner rule</span>
+<span class="k">rupu scm bind</span> --path  <span class="s">'~/Code/oss/*'</span>  --account gh-personal
+<span class="k">rupu issues list</span> --repo github:other/thing --account gh-work   <span class="c"># one-off override</span></pre>
+    <div class="callout"><strong>Run targets resolve by rule only.</strong> <code class="inline">rupu run &lt;target&gt;</code>, <code class="inline">rupu workflow run &lt;target&gt;</code> and <code class="inline">rupu issues run</code> have no <code class="inline">--account</code> flag; for an ambiguous repo, add a rule with <code class="inline">rupu scm bind</code>.</div>
+
+    <h2>How it fits together</h2>
+    <p>The integrations close a loop. A new or labeled issue (or a tracker state change) wakes a workflow or an <a class="link" href="/docs/autoflows.html">autoflow</a>; rupu's agents do the work in a cloned checkout; the SCM connector opens a PR / MR with the result; and the issue connector posts a comment back so the conversation stays where your team already lives.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 660 150" role="img" aria-label="Issue tracker to rupu agents to pull request">
+        <defs><marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path class="d-arrow" d="M0,0 L7,3 L0,6 Z"></path></marker></defs>
+        <rect class="d-box" x="20" y="46" width="180" height="58" rx="10"></rect>
+        <text class="d-label" x="110" y="70" text-anchor="middle">issue tracker</text>
+        <text class="d-sub" x="110" y="88" text-anchor="middle">Linear / Jira / GitHub / GitLab</text>
+        <line class="d-edge" x1="200" y1="75" x2="265" y2="75" marker-end="url(#ar)"></line>
+        <rect class="d-box-accent" x="265" y="46" width="150" height="58" rx="10"></rect>
+        <text class="d-label" x="340" y="70" text-anchor="middle">rupu agents</text>
+        <text class="d-sub" x="340" y="88" text-anchor="middle">workflow / autoflow</text>
+        <line class="d-edge" x1="415" y1="75" x2="480" y2="75" marker-end="url(#ar)"></line>
+        <rect class="d-box" x="480" y="46" width="160" height="58" rx="10"></rect>
+        <text class="d-label" x="560" y="70" text-anchor="middle">pull request</text>
+        <text class="d-sub" x="560" y="88" text-anchor="middle">SCM: GitHub / GitLab</text>
+        <path class="d-edge" d="M480,98 C360,140 230,140 110,108" marker-end="url(#ar)"></path>
+        <text class="d-sub" x="295" y="138" text-anchor="middle">comment back on the issue (notifyIssue)</text>
+      </svg>
+      <figcaption>tracker &#8594; rupu agents &#8594; pull request, with a comment posted back on the originating issue.</figcaption>
+    </figure>
+
+    <p>Cross-references: <a class="link" href="/docs/autoflows.html">Autoflows</a> drive the long-running issue&#8594;PR loop with branch ownership; <a class="link" href="/docs/triggers.html">Triggers</a> cover the polling and webhook tiers that wake workflows on tracker and SCM events.</p>
+
+    <h2>Auth for integrations</h2>
+    <p>Each platform stores its credential in <code class="inline">~/.rupu/auth.json</code> via one command. These are <strong>SCM / tracker</strong> credentials — distinct from model-provider auth (for that, see <a class="link" href="/docs/providers.html">Providers &amp; Auth</a>).</p>
+    <pre class="code"><span class="k">rupu auth login</span> --provider &lt;github|gitlab|linear|jira&gt; --mode &lt;api-key|sso&gt;
+<span class="k">rupu auth login</span> --account &lt;name&gt; --kind &lt;github|gitlab&gt; --mode &lt;api-key|sso&gt;   <span class="c"># a named account</span>
+<span class="k">rupu auth status</span>     <span class="c"># SCM + tracker rows appear automatically</span></pre>
+    <ul>
+      <li><strong>GitHub</strong> — classic PAT (<code class="inline">repo</code>, <code class="inline">workflow</code>, <code class="inline">gist</code>, <code class="inline">read:org</code>, <code class="inline">read:user</code>) or a device-code SSO flow.</li>
+      <li><strong>GitLab</strong> — PAT (<code class="inline">api</code>, <code class="inline">read_user</code>, <code class="inline">read_repository</code>, <code class="inline">write_repository</code>) or browser-callback PKCE SSO. See <a class="link" href="#gitlab-sso">GitLab SSO</a> below.</li>
+      <li><strong>Linear</strong> — API-key mode (used for polling / webhook normalization).</li>
+      <li><strong>Jira</strong> — API-key mode; store the credential as <code class="inline">&lt;email&gt;:&lt;api_token&gt;</code> in one secret for Jira Cloud polling.</li>
+    </ul>
+    <h3 id="gitlab-sso">GitLab SSO and token refresh</h3>
+    <p>On gitlab.com, <code class="inline">rupu auth login --provider gitlab --mode sso</code> signs in as the GitLab CLI's (glab's) public OAuth application, the way GitHub SSO uses <code class="inline">gh</code>'s. A <strong>self-managed</strong> instance needs its own OAuth application: set its Application ID as <code class="inline">oauth_client_id</code> on the account in the global <code class="inline">~/.rupu/config.toml</code>, and the authorize and token endpoints are derived from <code class="inline">base_url</code>:</p>
+    <pre class="code"><span class="v">[scm.gl-corp]</span>
+<span class="k">kind</span> = <span class="s">"gitlab"</span>
+<span class="k">base_url</span> = <span class="s">"https://gitlab.example.internal/api/v4"</span>
+<span class="k">oauth_client_id</span> = <span class="s">"&lt;application id&gt;"</span></pre>
+    <p>GitLab OAuth access tokens expire two hours after issue. Every GitLab connector refreshes its token through the credential store when it is within five minutes of expiry — so a long-lived <code class="inline">rupu cp serve</code>, <code class="inline">rupu mcp serve</code> or session keeps working — and the rotated token is saved under the store's lock for every other process. A request GitLab refuses with a 401 is retried once with the latest stored token, so a fresh <code class="inline">rupu auth login</code> reaches processes that are already running. GitHub SSO tokens don't expire.</p>
+
+    <div class="callout"><strong>Webhook secrets are different.</strong> The secrets for <code class="inline">rupu webhook serve</code> are read from environment variables only — never config files, never the credential store: <code class="inline">RUPU_GITHUB_WEBHOOK_SECRET</code>, <code class="inline">RUPU_GITLAB_WEBHOOK_TOKEN</code> (GitLab&rsquo;s shared token, not a signing secret), <code class="inline">RUPU_LINEAR_WEBHOOK_SECRET</code> and <code class="inline">RUPU_JIRA_WEBHOOK_SECRET</code>. Set only the vendors you receive from. See <a class="link" href="/docs/triggers.html">Triggers</a>.</div>
+
+    <div class="doc-nav">
+      <a href="/docs/reliability.html">&#8592; Recovery &amp; reliability</a>
+      <a href="/docs/mcp.html">MCP &amp; tools &#8594;</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>
