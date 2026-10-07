@@ -2875,3 +2875,88 @@ async fn netflow_index_status_reports_files_flows_and_budget() {
         assert!(status[key].is_u64(), "missing {key}: {status}");
     }
 }
+
+/// Lines appended to a ledger between two requests reach the second one
+/// (the index tails the file): a new flow appears, a completion patches
+/// the earlier streamed flow, and the dropped count grows — and both the
+/// flows list and the explorer then answer exactly what a fresh server,
+/// reading the file for the first time, answers.
+#[tokio::test]
+async fn lines_appended_between_requests_reach_the_next_response() {
+    let global = tempfile::tempdir().unwrap();
+    let mut streamed = e2e_flow(
+        FlowId::new(),
+        Some("run-tail"),
+        "api.anthropic.com",
+        Origin::Provider("anthropic".into()),
+    );
+    streamed.bytes_in = None;
+    streamed.duration_ms = None;
+    streamed.body_complete = false;
+    let streamed_id = streamed.id;
+    let paths = write_global_ledger(
+        global.path(),
+        "run-tail",
+        &[LedgerLine::Flow(Box::new(streamed))],
+    );
+    let state = new_state(global.path());
+    let addr = serve(state).await;
+    let get = |addr: std::net::SocketAddr, route: &'static str| async move {
+        let resp = reqwest::get(format!("http://{addr}{route}")).await.unwrap();
+        assert_eq!(resp.status(), 200, "{route}");
+        resp.json::<serde_json::Value>().await.unwrap()
+    };
+
+    let before = get(addr, "/api/netflow").await;
+    assert_eq!(before["flows"].as_array().unwrap().len(), 1, "{before}");
+    assert!(before["flows"][0]["bytes_in"].is_null(), "{before}");
+    get(addr, "/api/netflow/explorer").await;
+
+    let appended: String = [
+        LedgerLine::Flow(Box::new(e2e_flow(
+            FlowId::new(),
+            Some("run-tail"),
+            "api.github.com",
+            Origin::Scm("github".into()),
+        ))),
+        LedgerLine::Complete {
+            id: streamed_id,
+            bytes_in: 4096,
+            duration_ms: 70,
+        },
+        LedgerLine::Dropped {
+            count: 3,
+            ts: chrono::Utc::now(),
+        },
+    ]
+    .iter()
+    .map(|l| format!("{}\n", serde_json::to_string(l).unwrap()))
+    .collect();
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&paths.flows)
+        .unwrap();
+    std::io::Write::write_all(&mut f, appended.as_bytes()).unwrap();
+    drop(f);
+
+    let after = get(addr, "/api/netflow").await;
+    let flows = after["flows"].as_array().unwrap();
+    assert_eq!(flows.len(), 2, "{after}");
+    let patched = flows
+        .iter()
+        .find(|f| f["host"] == "api.anthropic.com")
+        .unwrap();
+    assert_eq!(patched["bytes_in"], 4096, "{after}");
+    assert_eq!(patched["duration_ms"], 70, "{after}");
+    assert!(
+        flows.iter().any(|f| f["host"] == "api.github.com"),
+        "{after}"
+    );
+    assert_eq!(after["dropped_total"], 3, "{after}");
+    let explorer_after = get(addr, "/api/netflow/explorer").await;
+
+    // The index's answer is the cold read's answer.
+    let fresh = serve(new_state(global.path())).await;
+    assert_eq!(after, get(fresh, "/api/netflow").await);
+    assert_eq!(explorer_after, get(fresh, "/api/netflow/explorer").await);
+}

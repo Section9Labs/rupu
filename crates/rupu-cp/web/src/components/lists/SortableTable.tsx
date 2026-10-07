@@ -335,17 +335,29 @@ export default function SortableTable<T>({
   const columnsRef = useRef(columns);
   columnsRef.current = columns;
   const columnSig = columns.map((c) => `${c.key}${c.subject ? '*' : ''}`).join('|');
-  const [probeFonts, setProbeFonts] = useState<ReadonlyMap<string, string>>(new Map());
+  // `null` until the mounted cells' fonts have been read: selection waits
+  // for them rather than running once in a default font and again in the
+  // real one (a full pass over every row each time).
+  const [probeFonts, setProbeFonts] = useState<ReadonlyMap<string, string> | null>(null);
   const probeRows = useMemo(
-    () => (isVirtual ? widthProbeRows(rows, columnsRef.current, probeFonts).map((i) => rows[i]) : []),
+    () =>
+      isVirtual && probeFonts
+        ? widthProbeRows(rows, columnsRef.current, probeFonts).map((i) => rows[i])
+        : [],
     [isVirtual, rows, columnSig, probeFonts],
   );
   // Once rows are mounted, read each column's font so the candidates are
-  // measured in it (before paint; at most one re-pick).
+  // measured in it. Runs before paint: the first virtual commit has no
+  // probe rows, and the re-render this triggers adds them before anything
+  // is painted.
   useLayoutEffect(() => {
     if (!isVirtual) return;
     const tr = win.bodyRef.current?.querySelector('tr:not([aria-hidden])');
-    if (!tr) return;
+    if (!tr) {
+      // No mounted row to read: measure in the default font.
+      setProbeFonts((prev) => prev ?? new Map());
+      return;
+    }
     const cells = Array.from(tr.children).slice((selection ? 1 : 0) + (hasDetailFeature ? 1 : 0));
     const next = new Map<string, string>();
     columnsRef.current.forEach((col, i) => {
@@ -353,7 +365,9 @@ export default function SortableTable<T>({
       if (font) next.set(col.key, font);
     });
     setProbeFonts((prev) =>
-      prev.size === next.size && Array.from(next).every(([k, v]) => prev.get(k) === v) ? prev : next,
+      prev && prev.size === next.size && Array.from(next).every(([k, v]) => prev.get(k) === v)
+        ? prev
+        : next,
     );
   }, [isVirtual, columnSig, hasDetailFeature, selection]);
 

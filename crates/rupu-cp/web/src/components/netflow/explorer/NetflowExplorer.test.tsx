@@ -6,7 +6,7 @@
 // panel, and previous data stays on screen during a refetch.
 
 import '@testing-library/jest-dom/vitest';
-import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
+import { act, render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   emptyFlowsResponse,
@@ -147,6 +147,65 @@ describe('NetflowExplorer', () => {
 
     expect(screen.getByText('api.anthropic.com')).toBeInTheDocument();
     expect(screen.queryByText(/loading network flows/i)).not.toBeInTheDocument();
+  });
+
+  describe('"Updating…"', () => {
+    const updating = () => screen.queryByText('Updating…');
+
+    it('is not shown on the initial load', () => {
+      fetchNetflowExplorer.mockReturnValue(new Promise(() => {}));
+      fetchGlobalNetflow.mockReturnValue(new Promise(() => {}));
+      render(<NetflowExplorer scope="global" />);
+      expect(updating()).toBeNull();
+    });
+
+    it('is not shown while one section is still on its first load', async () => {
+      fetchGlobalNetflow.mockReturnValue(new Promise(() => {}));
+      render(<NetflowExplorer scope="global" />);
+      await screen.findByText('Workflows');
+      expect(screen.getByText(/loading network flows/i)).toBeInTheDocument();
+      expect(updating()).toBeNull();
+    });
+
+    it('is shown while a refetch runs over existing data, and cleared when it lands', async () => {
+      render(<NetflowExplorer scope="global" />);
+      await screen.findByText('api.anthropic.com');
+      expect(updating()).toBeNull();
+
+      let resolveExplorer!: (v: unknown) => void;
+      let resolveFlows!: (v: unknown) => void;
+      fetchNetflowExplorer.mockReturnValueOnce(new Promise((r) => (resolveExplorer = r)));
+      fetchGlobalNetflow.mockReturnValueOnce(new Promise((r) => (resolveFlows = r)));
+      fireEvent.click(screen.getByRole('button', { name: /review-wf/ }));
+
+      expect(screen.getByText('Updating…')).toHaveAttribute('role', 'status');
+      // The previous surface stays under it.
+      expect(screen.getByText('api.anthropic.com')).toBeInTheDocument();
+
+      // Still updating while either request is outstanding.
+      await act(async () => {
+        resolveExplorer(populatedExplorerResponse());
+      });
+      expect(screen.getByText('Updating…')).toBeInTheDocument();
+
+      await act(async () => {
+        resolveFlows({
+          ...emptyFlowsResponse(),
+          flows: [flowView({ run_id: 'run-9', workflow: 'review-wf' })],
+        });
+      });
+      expect(updating()).toBeNull();
+    });
+
+    it('is cleared when the refetch fails', async () => {
+      render(<NetflowExplorer scope="global" />);
+      await screen.findByText('api.anthropic.com');
+      fetchNetflowExplorer.mockRejectedValueOnce(new Error('explorer down'));
+      fetchGlobalNetflow.mockRejectedValueOnce(new Error('flows down'));
+      fireEvent.click(screen.getByRole('button', { name: /review-wf/ }));
+      await screen.findByText('flows down');
+      expect(updating()).toBeNull();
+    });
   });
 
   it('seeds the initial window from the run span at run scope', async () => {

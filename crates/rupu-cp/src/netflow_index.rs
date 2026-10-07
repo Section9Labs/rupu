@@ -19,6 +19,8 @@
 //! last read (ledgers are append-only) and then tailed from the stored
 //! offset, or re-read in full if it was rewritten, shrank, or its rows were
 //! evicted. Concurrent calls for one file serialize on that file's lock.
+//! Entries are keyed by the path with its directory canonicalized
+//! ([`DirKeys`]), so every spelling of one ledger shares one entry.
 
 use chrono::{DateTime, Utc};
 use rupu_netflow::ledger::explorer::{is_error_outcome, origin_key, HistPoint};
@@ -175,13 +177,62 @@ struct Entry {
 /// The entry a reader fetched was removed from the map in the meantime.
 struct Removed;
 
+/// Index keys: a ledger's path with its DIRECTORY canonicalized, so one
+/// file reached through two spellings (the global listing canonicalizes
+/// its directories; project/run reads join a workspace path as given) is
+/// one entry. Each directory spelling is canonicalized once and cached —
+/// a read costs a map lookup, not a `realpath`. The cache is cleared by
+/// `sweep_missing_now`, which bounds how long a retargeted symlink keeps
+/// its old key (a stale key only costs re-reads: entries are re-checked
+/// against the file's stamp, inode included, on every call).
+#[derive(Default)]
+struct DirKeys {
+    dirs: Mutex<HashMap<PathBuf, PathBuf>>,
+    /// Successful `canonicalize` calls (cache misses), for tests.
+    canonicalized: AtomicU64,
+}
+
+impl DirKeys {
+    fn key(&self, path: &Path) -> PathBuf {
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+            return path.to_path_buf();
+        };
+        if let Some(canon) = self.lock().get(dir) {
+            return canon.join(name);
+        }
+        // A directory that does not exist (yet) keys as given and is not
+        // cached, so it is canonicalized once it appears.
+        let Ok(canon) = dir.canonicalize() else {
+            return path.to_path_buf();
+        };
+        self.canonicalized.fetch_add(1, Ordering::Relaxed);
+        let key = canon.join(name);
+        self.lock().insert(dir.to_path_buf(), canon);
+        key
+    }
+
+    fn clear(&self) {
+        self.lock().clear();
+    }
+
+    fn lock(&self) -> MutexGuard<'_, HashMap<PathBuf, PathBuf>> {
+        self.dirs.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
 pub struct NetflowIndex {
     entries: Mutex<HashMap<PathBuf, Arc<Mutex<Entry>>>>,
+    dir_keys: DirKeys,
+    /// `enforce_budget` runs that found the index over budget.
+    eviction_passes: AtomicU64,
     resident_bytes: AtomicU64,
     budget_bytes: AtomicU64,
     evictions: AtomicU64,
     last_sweep: Mutex<Option<Instant>>,
 }
+
+/// Where an eviction pass stops, as a percentage of the budget.
+const LOW_WATER_PERCENT: u64 = 90;
 
 /// How often `sweep_missing` may actually stat every indexed path.
 const SWEEP_EVERY: Duration = Duration::from_secs(60);
@@ -201,6 +252,8 @@ impl NetflowIndex {
     pub fn new(budget_bytes: u64) -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
+            dir_keys: DirKeys::default(),
+            eviction_passes: AtomicU64::new(0),
             resident_bytes: AtomicU64::new(0),
             budget_bytes: AtomicU64::new(budget_bytes),
             evictions: AtomicU64::new(0),
@@ -246,17 +299,24 @@ impl NetflowIndex {
         Ok(out)
     }
 
+    /// The map key for `path` (see [`DirKeys`]).
+    fn key(&self, path: &Path) -> PathBuf {
+        self.dir_keys.key(path)
+    }
+
     fn entry(&self, path: &Path) -> Arc<Mutex<Entry>> {
+        let key = self.key(path);
         let mut map = self.entries.lock().unwrap_or_else(|p| p.into_inner());
-        Arc::clone(map.entry(path.to_path_buf()).or_default())
+        Arc::clone(map.entry(key).or_default())
     }
 
     fn remove(&self, path: &Path) {
+        let key = self.key(path);
         let removed = self
             .entries
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .remove(path);
+            .remove(&key);
         if let Some(entry) = removed {
             self.retire(&entry);
         }
@@ -409,16 +469,21 @@ impl NetflowIndex {
         self.budget_bytes.store(bytes, Ordering::Relaxed);
     }
 
-    /// Drop tier 2 of the files with the oldest newest-flow first until the
-    /// resident rows fit the budget. Entries locked by an in-flight read are
-    /// skipped this pass (they are re-checked on the next call). Only
-    /// `try_lock` is used while the map lock is held, so this never blocks
-    /// behind a read.
+    /// Once the resident rows exceed the budget, drop tier 2 of the files
+    /// with the oldest newest-flow first until they fit the low-water mark
+    /// ([`LOW_WATER_PERCENT`] of the budget). Freeing past the budget is what
+    /// keeps this off the per-read path: each pass scans and sorts every
+    /// entry, so stopping right at the budget would rescan after nearly
+    /// every read once history outgrows it. Entries locked by an in-flight
+    /// read are skipped this pass (they are re-checked on the next call).
+    /// Only `try_lock` is used while the map lock is held, so this never
+    /// blocks behind a read.
     fn enforce_budget(&self) {
         let budget = self.budget_bytes.load(Ordering::Relaxed);
         if self.resident_bytes.load(Ordering::Relaxed) <= budget {
             return;
         }
+        let low_water = budget / 100 * LOW_WATER_PERCENT;
         let mut candidates: Vec<_> = {
             let map = self.entries.lock().unwrap_or_else(|p| p.into_inner());
             map.values()
@@ -429,11 +494,12 @@ impl NetflowIndex {
                 })
                 .collect()
         };
+        self.eviction_passes.fetch_add(1, Ordering::Relaxed);
         candidates.sort_by_key(|(max_ts, _)| *max_ts);
         let mut evicted = 0u64;
         let mut freed = 0u64;
         for (_, entry) in candidates {
-            if self.resident_bytes.load(Ordering::Relaxed) <= budget {
+            if self.resident_bytes.load(Ordering::Relaxed) <= low_water {
                 break;
             }
             if let Some(mut e) = try_lock_entry(&entry) {
@@ -492,8 +558,10 @@ impl NetflowIndex {
         self.sweep_missing_now();
     }
 
-    /// [`sweep_missing`](Self::sweep_missing) without the throttle.
+    /// [`sweep_missing`](Self::sweep_missing) without the throttle. Also
+    /// forgets the cached directory keys (see [`DirKeys`]).
     pub fn sweep_missing_now(&self) {
+        self.dir_keys.clear();
         // Stat without the map lock: a slow filesystem must not stall readers.
         let paths: Vec<PathBuf> = {
             let map = self.entries.lock().unwrap_or_else(|p| p.into_inner());
@@ -873,7 +941,8 @@ mod tests {
     }
 
     fn is_resident(index: &NetflowIndex, path: &Path) -> bool {
-        let entry = Arc::clone(index.entries.lock().unwrap().get(path).unwrap());
+        let key = index.key(path);
+        let entry = Arc::clone(index.entries.lock().unwrap().get(&key).unwrap());
         let e = entry.lock().unwrap();
         e.resident.is_some()
     }
@@ -904,6 +973,94 @@ mod tests {
         assert!(!is_resident(&index, &old));
         let st = index.status();
         assert!(st.tier2_bytes <= st.budget_bytes, "{st:?}");
+    }
+
+    /// Past the budget, one pass frees down to a low-water mark, so reading
+    /// many files does not rescan the whole map after every single read.
+    #[test]
+    fn over_budget_eviction_is_amortized_across_reads() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let files: Vec<PathBuf> = (0..200u64)
+            .map(|i| {
+                ledger_with(
+                    tmp.path(),
+                    &format!("run_{i:03}.jsonl"),
+                    i * 100,
+                    1000 + i as i64 * 100,
+                    10,
+                )
+            })
+            .collect();
+        let index = NetflowIndex::new(u64::MAX);
+        index.flows_in_range(&files[0], &all());
+        let per_file = index.status().tier2_bytes;
+        index.remove(&files[0]);
+        // Room for 50 files' rows.
+        index.set_budget_bytes(per_file * 50);
+        for f in &files {
+            assert_same(&index, f, &all());
+        }
+        let st = index.status();
+        assert!(st.tier2_bytes <= st.budget_bytes, "{st:?}");
+        // One pass per read past the 50th would be 150; a 10% low-water
+        // mark frees ~5 files' rows per pass.
+        let passes = index.eviction_passes.load(Ordering::Relaxed);
+        assert!(passes <= 40, "{passes} eviction passes for 200 reads");
+        // Still oldest-first: the newest file kept its rows.
+        assert!(is_resident(&index, files.last().unwrap()));
+        assert!(!is_resident(&index, &files[0]));
+    }
+
+    /// The same ledger reached through a symlinked directory and through a
+    /// `..` spelling is one entry, not three.
+    #[cfg(unix)]
+    #[test]
+    fn one_ledger_under_several_path_spellings_is_indexed_once() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("netflow");
+        std::fs::create_dir(&real).unwrap();
+        let direct = ledger_with(&real, "run_a.jsonl", 0, 100, 5);
+        let link = tmp.path().join("linked");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let via_link = link.join("run_a.jsonl");
+        let via_dotdot = real.join("..").join("netflow").join("run_a.jsonl");
+
+        let index = NetflowIndex::new(u64::MAX);
+        for p in [&direct, &via_link, &via_dotdot] {
+            assert_same(&index, p, &all());
+        }
+        let one = index.status();
+        assert_eq!(
+            (one.files, one.flows, one.resident_files),
+            (1, 5, 1),
+            "{one:?}"
+        );
+
+        // An append seen through one spelling is seen through the others.
+        append(&direct, &line(&LedgerLine::Flow(Box::new(flow(99, 999)))));
+        for p in [&via_link, &via_dotdot, &direct] {
+            assert_same(&index, p, &all());
+        }
+        assert_eq!(index.status().flows, 6);
+
+        // Deleting the file through any spelling drops the one entry.
+        std::fs::remove_file(&direct).unwrap();
+        assert_eq!(index.flows_in_range(&via_link, &all()), (vec![], 0));
+        assert_eq!(index.status().files, 0);
+    }
+
+    /// Normalizing a key canonicalizes each directory once, not per read.
+    #[test]
+    fn key_normalization_canonicalizes_each_directory_once() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let a = ledger_with(tmp.path(), "run_a.jsonl", 0, 100, 2);
+        let b = ledger_with(tmp.path(), "run_b.jsonl", 10, 100, 2);
+        let index = NetflowIndex::new(u64::MAX);
+        for _ in 0..50 {
+            index.flows_in_range(&a, &all());
+            index.flows_in_range(&b, &all());
+        }
+        assert_eq!(index.dir_keys.canonicalized.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -1054,7 +1211,7 @@ mod tests {
 
         // Via the sweep.
         index.summary(&p);
-        let held = Arc::clone(index.entries.lock().unwrap().get(&p).unwrap());
+        let held = Arc::clone(index.entries.lock().unwrap().get(&index.key(&p)).unwrap());
         let gone = tmp.path().join("run_gone.jsonl");
         let held_gone = index.entry(&gone);
         append(&gone, &line(&LedgerLine::Flow(Box::new(flow(1, 1)))));

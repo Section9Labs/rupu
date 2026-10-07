@@ -191,6 +191,10 @@ pub fn host_rollup(flows: &[FlowRecord]) -> Vec<HostRollup> {
 /// flows live inside a wrapper type (`FlowView`/`ExplorerFlow` on the CP
 /// read side), so they never deep-clone the whole set into a `Vec` just
 /// to satisfy the slice signature.
+///
+/// Rows are ordered by `(host, port)`, so the same flows always serialize
+/// the same way (the accumulator is a `HashMap`, whose iteration order
+/// changes per call).
 pub fn host_rollup_iter<'a>(flows: impl IntoIterator<Item = &'a FlowRecord>) -> Vec<HostRollup> {
     let mut acc: HashMap<(String, u16), RollupAcc> = HashMap::new();
 
@@ -209,7 +213,9 @@ pub fn host_rollup_iter<'a>(flows: impl IntoIterator<Item = &'a FlowRecord>) -> 
         }
     }
 
-    acc.into_iter()
+    let mut rows: Vec<_> = acc.into_iter().collect();
+    rows.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+    rows.into_iter()
         .map(|((host, port), mut a)| {
             a.ms.sort_unstable();
             HostRollup {
@@ -503,6 +509,26 @@ mod tests {
         assert_eq!(rollup[0].p95_ms, Some(100));
         assert_eq!(rollup[1].host, "api.github.com");
         assert_eq!(rollup[1].calls, 1);
+    }
+
+    /// Rows come out in `(host, port)` order, never `HashMap` order: two
+    /// calls over the same flows must serialize identically.
+    #[test]
+    fn host_rollup_orders_rows_by_host_then_port() {
+        let mut flows = Vec::new();
+        for i in (0..24u64).rev() {
+            let mut f = flow(i, &format!("h{:02}.example", i % 12), None, 5, true);
+            f.port = if i < 12 { 443 } else { 80 };
+            flows.push(f);
+        }
+        let keys: Vec<(String, u16)> = host_rollup(&flows)
+            .into_iter()
+            .map(|r| (r.host, r.port))
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys.len(), 24);
+        assert_eq!(keys, sorted);
     }
 
     #[test]
