@@ -653,16 +653,41 @@ impl UnitDispatcher for FleetUnitDispatcher {
     /// apply them to the coordinator workspace. Conflicts (overlapping tar files
     /// or conflicting git hunks) become [`WorkspaceConflict`]; any other codec
     /// failure is surfaced as a conflict-class step failure too.
+    ///
+    /// A delta's finding-tag log is never written as a file: its events are
+    /// merged into the coordinator's log by id (`Delta::take_tag_log`,
+    /// `rupu_coverage::merge_tag_log_copy`), so tag changes made here while
+    /// the unit ran survive, and units that all tagged don't conflict.
     async fn apply_workspace_deltas(
         &self,
         workspace_path: &Path,
         deltas: &[WorkspaceDelta],
     ) -> Result<(), WorkspaceConflict> {
         let mut codec = Vec::with_capacity(deltas.len());
+        let mut tag_logs = Vec::new();
         for wd in deltas {
-            match from_orchestrator_delta(wd) {
-                Ok(d) => codec.push(d),
-                Err(e) => return Err(WorkspaceConflict(vec![e.to_string()])),
+            let delta =
+                from_orchestrator_delta(wd).map_err(|e| WorkspaceConflict(vec![e.to_string()]))?;
+            let (rest, tag_log) = delta
+                .take_tag_log()
+                .map_err(|e| WorkspaceConflict(vec![e.to_string()]))?;
+            codec.push(rest);
+            tag_logs.extend(tag_log);
+        }
+        let log = rupu_coverage::TagLog::for_workspace(workspace_path);
+        for copy in &tag_logs {
+            let merged = rupu_coverage::merge_tag_log_copy(&log, copy).map_err(|e| {
+                WorkspaceConflict(vec![format!(
+                    "{}: merging a unit's finding-tag log failed: {e}",
+                    rupu_workspace::TAG_LOG_PATH
+                )])
+            })?;
+            if merged.unreadable > 0 {
+                tracing::warn!(
+                    unreadable = merged.unreadable,
+                    appended = merged.appended,
+                    "skipped finding-tag log lines in a unit's workspace delta that this rupu version cannot read"
+                );
             }
         }
         match rupu_workspace::apply_deltas(workspace_path, &codec) {
@@ -1833,6 +1858,94 @@ steps:
     /// `strip_delta_coverage` bridges to `rupu_workspace::Delta::without_coverage`
     /// through the wire codec: the root `.rupu/coverage/` file leaves the
     /// payload and the lists, everything else applies.
+    /// `rupu-workspace` names the tag log by path; `rupu-coverage` owns the
+    /// file. They must agree, or a delta's log would be written as a file.
+    #[test]
+    fn workspace_tag_log_path_matches_coverage() {
+        let ws = std::path::Path::new("/ws");
+        assert_eq!(
+            rupu_coverage::TagLog::for_workspace(ws).path,
+            ws.join(rupu_workspace::TAG_LOG_PATH)
+        );
+    }
+
+    fn tar_of(files: &[(&str, &str)]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut buf);
+            for (path, body) in files {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(body.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                b.append_data(&mut header, path, body.as_bytes()).unwrap();
+            }
+            b.finish().unwrap();
+        }
+        buf
+    }
+
+    fn tag_line(id: &str, finding: &str, tag: &str) -> String {
+        serde_json::to_string(&rupu_coverage::TagEvent {
+            id: id.into(),
+            finding_id: finding.into(),
+            op: rupu_coverage::TagOp::Add,
+            tag: rupu_coverage::Tag::parse(tag).unwrap(),
+            by: rupu_coverage::TagActor::operator(rupu_coverage::OperatorSurface::Cli),
+            at: chrono::Utc::now(),
+        })
+        .unwrap()
+            + "\n"
+    }
+
+    /// Two units' unstripped deltas both carry the tag log: their events merge
+    /// into the coordinator's log by id, next to the event an operator wrote
+    /// meanwhile, and the shared path is no conflict.
+    #[tokio::test]
+    async fn apply_workspace_deltas_merges_each_units_tag_log() {
+        let conn = Arc::new(FakeConnector::completed());
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
+        let ws = tempfile::tempdir().unwrap();
+        let log = rupu_coverage::TagLog::for_workspace(ws.path());
+        let shared = tag_line("tge_shared", "fnd_a", "shared");
+        std::fs::create_dir_all(log.path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &log.path,
+            shared.clone() + &tag_line("tge_op", "fnd_a", "from-operator"),
+        )
+        .unwrap();
+        let unit = |file: &str, event: String| {
+            let tag_log = shared.clone() + &event;
+            to_orchestrator_delta(&rupu_workspace::Delta {
+                mode: rupu_workspace::SyncMode::Tar,
+                changed: vec![
+                    rupu_workspace::TAG_LOG_PATH.into(),
+                    format!("{}.lock", rupu_workspace::TAG_LOG_PATH),
+                    file.into(),
+                ],
+                deleted: vec![],
+                bytes: tar_of(&[
+                    (rupu_workspace::TAG_LOG_PATH, tag_log.as_str()),
+                    (&format!("{}.lock", rupu_workspace::TAG_LOG_PATH), ""),
+                    (file, "x"),
+                ]),
+            })
+        };
+        let deltas = [
+            unit("one.txt", tag_line("tge_u1", "fnd_b", "from-unit-1")),
+            unit("two.txt", tag_line("tge_u2", "fnd_c", "from-unit-2")),
+        ];
+        d.apply_workspace_deltas(ws.path(), &deltas).await.unwrap();
+
+        let ids: Vec<String> = rupu_coverage::read_tag_events(&log)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(ids, ["tge_shared", "tge_op", "tge_u1", "tge_u2"]);
+        assert!(ws.path().join("one.txt").exists() && ws.path().join("two.txt").exists());
+    }
+
     #[tokio::test]
     async fn strip_delta_coverage_bridges_to_the_workspace_codec() {
         let conn = Arc::new(FakeConnector::completed());

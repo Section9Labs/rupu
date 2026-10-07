@@ -45,6 +45,6 @@ pub use store::{upsert, StoreError, WorkspaceStore};
 pub use worker_store::{WorkerStore, WorkerStoreError};
 pub use workspace_sync::{
     apply_deltas, collect_delta, detect_mode, pack, stage, Baseline, Delta, Payload, SyncError,
-    SyncMode,
+    SyncMode, TAG_LOG_PATH,
 };
 pub use worktree_layout::{issue_dir_name, issue_worktree_path, repo_dir_name};

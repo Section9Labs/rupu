@@ -1014,6 +1014,13 @@ lines next to the `findings` lines, and `ingest_unit_stream` appends them to
 the coordinator workspace's tag log (a replayed event is dropped as a
 duplicate), so they reach the coordinator exactly as the unit's findings do.
 
+When the stream did not arrive whole (the host dropped mid-run, a malformed
+line), the unit's workspace delta keeps its `.rupu/coverage/` as the fallback
+copy. Its tag log is still never written over the coordinator's: its events are
+merged into the coordinator's log by event id, the same way, so tags added on
+the coordinator while the unit ran survive, and several units that all tagged
+never conflict on the file.
+
 ### Limits
 
 - Tags belong to a finding id. A vulnerability an agent reports again is a new
