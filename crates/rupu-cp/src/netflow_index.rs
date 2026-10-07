@@ -34,7 +34,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_BUDGET_MB: u64 = 256;
@@ -396,12 +396,13 @@ impl NetflowIndex {
     }
 
     /// Make sure tier 2 is resident, re-reading the file if it was evicted.
-    /// `false` = the re-read failed; tier 1 is left intact.
+    /// `false` = no rows: the re-read failed (tier 1 is left intact) or found
+    /// the file non-UTF-8 (`e.unreadable` is then set).
     fn ensure_rows(&self, e: &mut Entry, path: &Path) -> bool {
         if e.resident.is_none() && !e.unreadable {
-            return self.full_read(e, path).is_ok();
+            return self.full_read(e, path).is_ok() && e.resident.is_some();
         }
-        true
+        e.resident.is_some()
     }
 
     pub fn set_budget_bytes(&self, bytes: u64) {
@@ -422,7 +423,7 @@ impl NetflowIndex {
             let map = self.entries.lock().unwrap_or_else(|p| p.into_inner());
             map.values()
                 .filter_map(|entry| {
-                    let e = entry.try_lock().ok()?;
+                    let e = try_lock_entry(entry)?;
                     e.resident.as_ref()?;
                     Some((e.summary.max_ts, Arc::clone(entry)))
                 })
@@ -435,7 +436,7 @@ impl NetflowIndex {
             if self.resident_bytes.load(Ordering::Relaxed) <= budget {
                 break;
             }
-            if let Ok(mut e) = entry.try_lock() {
+            if let Some(mut e) = try_lock_entry(&entry) {
                 if let Some(r) = e.resident.take() {
                     self.resident_bytes
                         .fetch_sub(r.accounted, Ordering::Relaxed);
@@ -469,7 +470,7 @@ impl NetflowIndex {
             evictions_total: self.evictions.load(Ordering::Relaxed),
         };
         for entry in map.values() {
-            if let Ok(e) = entry.try_lock() {
+            if let Some(e) = try_lock_entry(entry) {
                 st.flows += e.summary.flow_count as u64;
                 st.tier1_bytes += e.summary.heap_bytes() as u64;
                 st.resident_files += u64::from(e.resident.is_some());
@@ -516,6 +517,17 @@ impl NetflowIndex {
     }
 }
 
+/// `try_lock` that recovers a poisoned entry (a panicked holder left it in
+/// a state every reader already tolerates) instead of skipping it forever;
+/// `None` only when a read holds it right now.
+fn try_lock_entry(entry: &Mutex<Entry>) -> Option<MutexGuard<'_, Entry>> {
+    match entry.try_lock() {
+        Ok(e) => Some(e),
+        Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
+        Err(TryLockError::WouldBlock) => None,
+    }
+}
+
 /// What `refresh` found.
 enum Refresh {
     /// The entry now reflects the file.
@@ -548,7 +560,12 @@ impl NetflowIndex {
                     } else if !e.summary.overlaps(range) {
                         Some((Vec::new(), e.summary.dropped))
                     } else if !self.ensure_rows(&mut e, path) {
-                        Some(DirectReader.flows_in_range(path, range))
+                        if e.unreadable {
+                            // The re-read found the file non-UTF-8.
+                            Some((Vec::new(), 0))
+                        } else {
+                            Some(DirectReader.flows_in_range(path, range))
+                        }
                     } else {
                         let dropped = e.summary.dropped;
                         let rows = &e.resident.as_ref().expect("rows ensured").rows;
@@ -949,6 +966,69 @@ mod tests {
         assert_eq!(index.status().files, 2);
         index.sweep_missing_now();
         assert_eq!(index.status().files, 1);
+    }
+
+    /// Evicted rows re-read from a file that has meanwhile become non-UTF-8
+    /// (the change landed after `refresh` stamped the entry): the read
+    /// answers `([], 0)` like the direct reader, and the entry stays usable.
+    #[test]
+    fn an_evicted_file_that_turned_non_utf8_reads_empty_without_panicking() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let p = ledger_with(tmp.path(), "run_a.jsonl", 0, 100, 3);
+        let index = NetflowIndex::new(0); // rows evicted after every read
+        assert_eq!(index.flows_in_range(&p, &all()).0.len(), 3);
+        // Same length, bytes no longer UTF-8.
+        let len = std::fs::metadata(&p).unwrap().len() as usize;
+        let mut bad = vec![b'x'; len - 1];
+        bad[0] = 0xff;
+        bad.push(b'\n');
+        std::fs::write(&p, &bad).unwrap();
+        // Model the race: the stat `refresh` took already matched the new
+        // file, so the entry looks current with its rows evicted.
+        {
+            let entry = index.entry(&p);
+            let mut e = entry.lock().unwrap();
+            assert!(e.resident.is_none());
+            e.stamp = Some(FileStamp::of(&std::fs::metadata(&p).unwrap()));
+        }
+        assert_eq!(index.flows_in_range(&p, &all()), (vec![], 0));
+        assert_eq!(
+            index.flows_in_range(&p, &all()),
+            DirectReader.flows_in_range(&p, &all())
+        );
+        // The entry was not poisoned: the file recovers on its next rewrite.
+        std::fs::write(&p, line(&LedgerLine::Flow(Box::new(flow(9, 900))))).unwrap();
+        assert_same(&index, &p, &all());
+    }
+
+    fn poison(index: &NetflowIndex, path: &Path) {
+        let entry = index.entry(path);
+        let _ = std::thread::spawn(move || {
+            let _g = entry.lock().unwrap();
+            panic!("poison the entry lock");
+        })
+        .join();
+        assert!(index.entry(path).is_poisoned());
+    }
+
+    /// A poisoned entry is still evicted and still counted — never skipped
+    /// forever as if a read held it.
+    #[test]
+    fn a_poisoned_entry_is_still_evicted_and_counted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let a = ledger_with(tmp.path(), "run_a.jsonl", 0, 100, 3);
+        let b = ledger_with(tmp.path(), "run_b.jsonl", 10, 10_000, 4);
+        let index = NetflowIndex::new(u64::MAX);
+        index.summary(&a);
+        index.summary(&b);
+        poison(&index, &a);
+        let st = index.status();
+        assert_eq!((st.files, st.flows, st.resident_files), (2, 7, 2), "{st:?}");
+        index.set_budget_bytes(0);
+        index.enforce_budget();
+        let st = index.status();
+        assert_eq!((st.resident_files, st.tier2_bytes), (0, 0), "{st:?}");
+        assert_eq!(st.evictions_total, 2);
     }
 
     #[test]
