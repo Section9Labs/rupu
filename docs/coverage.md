@@ -932,20 +932,22 @@ the query bar's job (`tag:needs-poc`, see [Querying findings](#querying-findings
 
 - **A finding's page.** Under the header the finding's tags show as chips: the
   `✕` on a chip removes it, and `+ tag` opens an input that suggests the tags
-  already in use in that finding's project, most used first (the same
-  validation as above, so a bad tag is refused in the input with the reason).
-  A change that fails keeps what you typed and shows the error. A "Tags"
-  section further down holds a collapsed "Tag history (N)": each add or remove,
-  newest first, with who made it (an agent's codename and name, or `user via
-  cp` / `user via cli`) and when.
+  already in use in that finding's project, most used first; once you type,
+  best match first (the same validation as above, so a bad tag is refused in
+  the input with the reason). A change that fails keeps what you typed and
+  shows the error; one that was saved but the page couldn't reload after says
+  so instead. A "Tags" section further down holds a collapsed "Tag history
+  (N)": each add or remove, newest first, with who made it (an agent's
+  codename and name, or `<user> via cp` / `<user> via cli`) and when.
 - **Bulk, from the Findings table.** Each row has a checkbox, and the header
   checkbox selects every row that can be selected. With rows selected a bar
   reads "N selected · Tag… · Untag… · Clear": `Tag…` and `Untag…` open the same
   input (suggestions are the tags in use across the projects the page covers) and apply
-  to every selected finding. The result stays as one line after the selection
-  clears ("Tagged 3 findings (1 already had it)."), and names any project whose
-  tags couldn't be changed and any finding that no longer exists. Changing the
-  query clears the selection.
+  to every selected finding (more than 1000 go in batches of 1000, one after
+  another; a batch that fails stops the rest). The result stays as one line
+  after the selection clears ("Tagged 3 findings (1 already had it)."), and
+  names any project whose tags couldn't be changed and any finding that no
+  longer exists. Changing the query clears the selection.
 - **Unreadable tag logs.** A project whose tag log can't be read still lists its
   findings with their declared tags, under the existing "couldn't be read"
   banner, but its rows' checkboxes are disabled (the tooltip says why) and its
@@ -997,7 +999,7 @@ equals its `after` changed nothing and wrote no event. Statuses:
 `GET /api/findings/tags` lists the tags in use, most used first, as `[{ "tag":
 "needs-poc", "count": 4 }]`. `?ws_id=` limits it to one workspace.
 `GET /api/findings/:id` gains two fields: `tag_history`, that finding's tag
-events in file order (`id`, `op`, `tag`, `by`, `at`), and `tags_editable`,
+events in file order (`id`, `finding_id`, `op`, `tag`, `by`, `at`), and `tags_editable`,
 `false` (with an empty `tag_history`) when the finding's workspace can't be
 resolved or its tag log can't be read. The list response's `tags_unavailable`
 (`[{ws_id, project}]`, from the query bar's section) names the same
