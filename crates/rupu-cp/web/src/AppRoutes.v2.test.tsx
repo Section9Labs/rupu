@@ -145,6 +145,22 @@ describe('AppRoutes shell branch', () => {
     await waitFor(() => expect(screen.getByTestId('loc')).toHaveTextContent('/security?tab=findings'));
   });
 
+  it('v2: /findings?q= keeps the query through the redirect', async () => {
+    renderApp('v2', '/findings?q=tag%3Aneeds-poc+severity%3E%3Dhigh');
+    await waitFor(() =>
+      expect(screen.getByTestId('loc')).toHaveTextContent(
+        '/security?tab=findings&q=tag%3Aneeds-poc+severity%3E%3Dhigh',
+      ),
+    );
+  });
+
+  it('v2: the redirect target owns its tab even when the link names another', async () => {
+    renderApp('v2', '/findings?tab=coverage&q=tag%3Aa');
+    await waitFor(() =>
+      expect(screen.getByTestId('loc')).toHaveTextContent('/security?tab=findings&q=tag%3Aa'),
+    );
+  });
+
   it('v2: /workers redirects to /fleet?tab=workers', async () => {
     renderApp('v2', '/workers');
     await waitFor(() => expect(screen.getByTestId('loc')).toHaveTextContent('/fleet?tab=workers'));
