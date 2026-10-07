@@ -54,6 +54,10 @@
 //!   `detail` (human text), `rounds`, `goals` (`id` / `met` / `current` /
 //!   `target`), `summary`, and the final `spent_usd` / `spent_tokens`
 //!
+//! A run whose coordinator died without writing its own `run_stopped` gets one
+//! from the orphan reaper (`reap_orphaned_agentiflows`): same shape, with
+//! `stop_reason` / `detail` `orphaned: coordinator pid <p> not running`.
+//!
 //! The log is deliberately local and minimal: a best-effort append. A failed
 //! append is logged (`tracing::warn!`) and never stops the run; the durable
 //! state of record is `agentiflow.json`.
@@ -115,7 +119,9 @@ pub struct GoalStatus {
 ///
 /// `stop_reason` is a stable snake_case code: `goals_met`,
 /// `coverage_reached`, `budget_exhausted:<dimension>`, `operator_stop`,
-/// `ceiling`; for a `failed` run it is `error: <message>`.
+/// `ceiling`; for a `failed` run it is `error: <message>`, or
+/// `orphaned: coordinator pid <p> not running` when the orphan reaper found the
+/// coordinator dead.
 ///
 /// `spent_usd` / `spent_tokens` are the run's metered spend (the same meter
 /// `budget.usd` / `budget.tokens` are enforced against): refreshed as each
@@ -378,13 +384,22 @@ fn goal_statuses(outcome: &EnvelopeOutcome) -> Vec<GoalStatus> {
         .collect()
 }
 
-/// The best-effort `events.jsonl` appender (shape in the module docs).
-struct EventLog {
+/// The best-effort `events.jsonl` appender (shape in the module docs). The
+/// orphan reaper appends its terminal `run_stopped` through the same writer, so
+/// there is one event shape and one append path.
+pub(crate) struct EventLog {
     path: PathBuf,
 }
 
 impl EventLog {
-    fn emit(&self, ts: DateTime<Utc>, kind: &str, fields: Value) {
+    /// The log of the run in `run_dir` (`<run_dir>/events.jsonl`).
+    pub(crate) fn new(run_dir: &Path) -> Self {
+        Self {
+            path: run_dir.join(EVENTS_FILE),
+        }
+    }
+
+    pub(crate) fn emit(&self, ts: DateTime<Utc>, kind: &str, fields: Value) {
         let mut line = serde_json::Map::new();
         line.insert(
             "ts".into(),
@@ -837,9 +852,7 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 Err(e) => return Err(fail(&mut record, e)),
             };
 
-            let events = EventLog {
-                path: run_dir.join(EVENTS_FILE),
-            };
+            let events = EventLog::new(&run_dir);
             let mut lead = RecordingLead {
                 inner: driver,
                 events: &events,

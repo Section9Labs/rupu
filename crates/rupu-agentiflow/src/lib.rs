@@ -14,6 +14,7 @@ mod goal;
 mod lead;
 mod operator;
 mod proc;
+pub mod reaper;
 mod roster;
 mod run;
 mod status_tools;
@@ -48,6 +49,7 @@ pub use lead::{
 };
 pub use operator::{OperatorMessage, OperatorQueue};
 pub use proc::{kill_group, pid_is_running, terminate_group, terminate_pid};
+pub use reaper::{reap_orphaned_agentiflows, ReapSummary};
 pub use roster::{roster_collector, roster_tools, RosterCollector, RosterCtx};
 pub use run::{
     agentiflow_dir, new_run_id, run_agentiflow, AgentiflowRecord, GoalStatus, LeadInputs,
