@@ -20,11 +20,17 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use rupu_agentiflow::{
     agentiflow_dir, hard_stop, hard_stop_with, kill_group, pid_is_running,
-    reap_orphaned_agentiflows, AgentiflowRecord, HardStopGrace, HardStopOutcome,
+    reap_orphaned_agentiflows, reap_orphaned_agentiflows_with, AgentiflowRecord, HardStopGrace,
+    HardStopOutcome,
 };
 use rupu_runtime::RunTriggerSource;
 use serde_json::{json, Value};
 use tempfile::{tempdir, TempDir};
+
+/// The grace the tests that need a SIGTERM-ignoring unit killed give it: the
+/// production default is the credential-drain grace (12s), which a test must
+/// not sit through.
+const SHORT_GRACE: Duration = Duration::from_millis(1500);
 
 /// A unit's stand-in: a `sleep` leading its own process group, with a thread
 /// reaping it the moment it dies. (Without the waiter the killed leader stays a
@@ -335,7 +341,7 @@ fn a_unit_that_ignores_sigterm_is_killed_after_the_grace() {
     write_unit(&global, "af_dead", "u1", Some(stubborn.pgid), "running");
 
     let started = Instant::now();
-    let s = reap_orphaned_agentiflows(global.path(), Utc::now());
+    let s = reap_orphaned_agentiflows_with(global.path(), Utc::now(), SHORT_GRACE);
     let took = started.elapsed();
 
     assert_eq!(s.reaped, vec!["af_dead".to_string()]);
@@ -472,6 +478,47 @@ fn a_bad_run_dir_is_skipped_and_never_aborts_the_sweep() {
     assert!(!Path::new(&root.join("af_empty").join("agentiflow.json")).exists());
 }
 
+#[test]
+fn the_default_graces_outlast_the_credential_drain_and_a_unit_that_dies_does_not_wait_it_out() {
+    // A unit is a `rupu run` that, like the coordinator, drains credential
+    // writes on SIGTERM (10s) before it dies: a SIGKILL inside that wait loses
+    // a rotated refresh token. So the default grace is longer than the drain,
+    // for the units and the coordinator alike (`rupu-cli` pins the exact
+    // relation against its own constants)...
+    let grace = HardStopGrace::default();
+    assert_eq!(grace.units, grace.coordinator);
+    assert!(grace.units >= Duration::from_secs(11), "{grace:?}");
+
+    // ...and it is only a bound: a unit with nothing to drain dies at once, and
+    // neither the sweep nor the hard stop waits for it.
+    let global = tempdir().unwrap();
+    let polite = Sleeper::spawn();
+    write_running_record(&global, "af_dead", Some(a_dead_pid()));
+    write_unit(&global, "af_dead", "u1", Some(polite.pgid), "running");
+    let started = Instant::now();
+    let s = reap_orphaned_agentiflows(global.path(), Utc::now());
+    assert_eq!(s.reaped, vec!["af_dead".to_string()]);
+    wait_until_dead(polite.pgid);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the sweep waited for a unit that was already gone: {:?}",
+        started.elapsed()
+    );
+
+    let polite = Sleeper::spawn();
+    write_running_record(&global, "af_live", None);
+    write_unit(&global, "af_live", "u1", Some(polite.pgid), "running");
+    let started = Instant::now();
+    let out = hard_stop(&run_dir(&global, "af_live"), Utc::now()).unwrap();
+    assert_eq!(out, HardStopOutcome::Stopped);
+    wait_until_dead(polite.pgid);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the hard stop waited for a unit that was already gone: {:?}",
+        started.elapsed()
+    );
+}
+
 // ---- hard_stop ---------------------------------------------------------------
 
 #[test]
@@ -489,7 +536,11 @@ fn a_hard_stop_kills_the_coordinator_and_the_units_and_closes_the_record_and_the
 
     let now = Utc::now();
     let started = Instant::now();
-    let out = hard_stop(&run_dir(&global, "af_live"), now).unwrap();
+    let grace = HardStopGrace {
+        units: SHORT_GRACE,
+        ..HardStopGrace::default()
+    };
+    let out = hard_stop_with(&run_dir(&global, "af_live"), now, grace).unwrap();
     let took = started.elapsed();
 
     assert_eq!(out, HardStopOutcome::Stopped);
@@ -669,7 +720,7 @@ fn a_hard_stop_of_a_finished_run_signals_and_writes_nothing() {
 #[test]
 fn a_run_that_finishes_during_the_grace_is_not_overwritten() {
     let global = tempdir().unwrap();
-    // A unit that outlasts SIGTERM keeps the hard stop in its grace for 1.5s.
+    // A unit that outlasts SIGTERM keeps the hard stop in its (1.5s) grace.
     let stubborn = Sleeper::spawn_ignoring_sigterm();
     write_running_record(&global, "af_race", None);
     write_unit(&global, "af_race", "u1", Some(stubborn.pgid), "running");
@@ -687,7 +738,11 @@ fn a_run_that_finishes_during_the_grace_is_not_overwritten() {
         }
     });
 
-    let out = hard_stop(&dir, Utc::now()).unwrap();
+    let grace = HardStopGrace {
+        units: SHORT_GRACE,
+        ..HardStopGrace::default()
+    };
+    let out = hard_stop_with(&dir, Utc::now(), grace).unwrap();
     finisher.join().unwrap();
 
     assert_eq!(out, HardStopOutcome::AlreadyTerminal("completed".into()));

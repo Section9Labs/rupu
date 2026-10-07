@@ -2445,14 +2445,23 @@ mod tests {
     }
 
     #[test]
-    fn a_hard_stops_coordinator_grace_outlasts_the_sigterm_credential_drain() {
-        // `stop --now` SIGTERMs the coordinator, whose handler waits for
-        // credential writes (`exit`'s drain, then its stderr lines) before it
-        // dies; the stop must not SIGKILL it inside that wait, or a rotated
-        // OAuth refresh token is lost.
+    fn the_sigterm_grace_for_coordinators_and_units_outlasts_the_credential_drain() {
+        // `stop --now` and the orphan sweep SIGTERM a coordinator or a unit,
+        // whose handler waits for credential writes (`exit`'s drain, then its
+        // stderr lines) before it dies; a SIGKILL inside that wait would lose a
+        // rotated OAuth refresh token.
         let wait = crate::exit::CREDENTIAL_WRITE_DRAIN + 3 * crate::exit::SIGTERM_STDERR_GRACE;
-        let grace = rupu_agentiflow::HardStopGrace::default().coordinator;
-        assert!(grace > wait, "grace {grace:?} <= handler wait {wait:?}");
+        let grace = rupu_agentiflow::HardStopGrace::default();
+        assert!(
+            grace.coordinator > wait,
+            "coordinator grace {:?} <= handler wait {wait:?}",
+            grace.coordinator
+        );
+        assert!(
+            grace.units > wait,
+            "unit grace {:?} <= handler wait {wait:?}",
+            grace.units
+        );
     }
 
     #[test]
