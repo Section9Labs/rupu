@@ -116,7 +116,10 @@ pub struct BudgetProbe {
 }
 
 /// One read of the meter, replayed to the enforcer so the stage and the
-/// reported spend always agree.
+/// reported spend always agree. A dimension the budget does not set is not read
+/// (it is `0` here): the enforcer ignores it anyway, and reading it would cost a
+/// ledger fold and, for usd on an unpriced model, a spurious "counted as $0"
+/// warning for a flow that has no usd budget.
 struct SpendSnapshot {
     usd: f64,
     tokens: u64,
@@ -159,8 +162,16 @@ impl BudgetProbe {
             return json!({ "budget": null, "detail": "no budget set" });
         };
         let spend = SpendSnapshot {
-            usd: self.usage.spent_usd(),
-            tokens: self.usage.spent_tokens(),
+            usd: if declared.usd.is_some() {
+                self.usage.spent_usd()
+            } else {
+                0.0
+            },
+            tokens: if declared.tokens.is_some() {
+                self.usage.spent_tokens()
+            } else {
+                0
+            },
         };
         let round = self.round.load(Ordering::Relaxed);
         let now = (self.now)();
@@ -1448,5 +1459,84 @@ mod tests {
         let ts = budget_tools(&fx, all_caps());
         let out = call(&ts, "budget.status", json!({ "anything": 1 })).await;
         assert!(out.error.is_none(), "{:?}", out.error);
+    }
+
+    #[tokio::test]
+    async fn budget_status_reads_only_the_dimensions_the_budget_declares() {
+        use std::sync::atomic::AtomicUsize;
+
+        /// A meter that counts how often each dimension is read.
+        #[derive(Default)]
+        struct Counting {
+            usd: AtomicUsize,
+            tokens: AtomicUsize,
+        }
+        impl UsageSource for Counting {
+            fn spent_usd(&self) -> f64 {
+                self.usd.fetch_add(1, Ordering::Relaxed);
+                1.0
+            }
+            fn spent_tokens(&self) -> u64 {
+                self.tokens.fetch_add(1, Ordering::Relaxed);
+                7
+            }
+        }
+
+        let fx = fx();
+        let reads = |declared: Option<Budget>| {
+            let meter = Arc::new(Counting::default());
+            let probe = BudgetProbe::new(
+                declared.clone(),
+                declared.unwrap_or_default(),
+                t0(),
+                meter.clone(),
+                fx.round.clone(),
+                Arc::new(t0),
+            );
+            let report = probe.report();
+            (
+                meter.usd.load(Ordering::Relaxed),
+                meter.tokens.load(Ordering::Relaxed),
+                report,
+            )
+        };
+
+        // tokens only: usd is never read (so an unpriced model is never warned about).
+        let (usd, tokens, report) = reads(Some(Budget {
+            tokens: Some(100),
+            ..Budget::default()
+        }));
+        assert_eq!((usd, tokens), (0, 1));
+        assert_eq!(report["tokens"]["spent"], 7);
+        assert!(report.get("usd").is_none(), "{report}");
+        assert_eq!(report["stage"], "ok");
+
+        // usd only: tokens are not folded.
+        let (usd, tokens, report) = reads(Some(Budget {
+            usd: Some(10.0),
+            ..Budget::default()
+        }));
+        assert_eq!((usd, tokens), (1, 0));
+        near(&report["usd"]["spent"], 1.0);
+
+        // rounds / wall-clock only, and no budget at all: the meter is untouched.
+        let (usd, tokens, _) = reads(Some(Budget {
+            rounds: Some(3),
+            wall_clock: Some("1h".into()),
+            ..Budget::default()
+        }));
+        assert_eq!((usd, tokens), (0, 0));
+        let (usd, tokens, _) = reads(None);
+        assert_eq!((usd, tokens), (0, 0));
+
+        // A skipped dimension never changes the stage: tokens over their cap
+        // still trip while usd (unset) is not consulted.
+        let (usd, _, report) = reads(Some(Budget {
+            tokens: Some(5),
+            ..Budget::default()
+        }));
+        assert_eq!(usd, 0);
+        assert_eq!(report["stage"], "hard");
+        assert_eq!(report["tripped"], "tokens");
     }
 }

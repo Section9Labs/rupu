@@ -1460,8 +1460,8 @@ mod tests {
     fn the_lead_reads_its_budget_through_budget_status_round_by_round() {
         let fx = fixture();
         let id = "af_budget_status";
-        // Two rounds, each: ask for the budget, then finish. The one-turn
-        // billing is 0 for the tool turn and 1 in + 1 out for the closing turn.
+        // Two rounds, each: ask for the budget, then finish. Every scripted
+        // turn (the tool turn and the closing turn alike) bills 1 in + 1 out.
         let (factory, captured) = capturing_factory(vec![
             vec![tool_turn("t0", "budget.status", json!({})), done_turn()],
             vec![tool_turn("t1", "budget.status", json!({})), done_turn()],
