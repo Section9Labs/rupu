@@ -254,7 +254,7 @@ Findings are filtered everywhere with ONE single-line query language, modeled on
 
 **Plans.**
 - **Plan 2:** the query language everywhere, plus the query bar on Findings, the Tags column and the `tags_unavailable` banner.
-- **Plan 3:** tag editing in the CP:
+- **Plan 3 (complete):** tag editing in the CP (`docs/superpowers/plans/2026-10-06-rupu-finding-tags-plan-3-cp-editing.md`):
   - `POST /api/findings/tags`, `GET /api/findings/tags` and `tag_history`
   - row selection and the bulk tag/untag bar
   - the finding-page tag editor and history
@@ -302,7 +302,7 @@ Each crate keeps one integration-test binary, with modules under `tests/it/`. Al
    - `rupu findings list|tag|tags`.
    - Docs.
 2. **Plan 2 (complete): the query language** — `docs/superpowers/plans/2026-10-06-rupu-finding-tags-plan-2-query-language.md`. Rust parser + evaluator, the TS twin and fixtures, `GET /api/findings?q=` with `facets` / `tags_unavailable`, the CLI/agent/MCP `q` surfaces, the web query bar on the Findings page, docs.
-3. **Plan 3 (remaining; originally "Plan 2: CP API and web UI", split by the Query language section above): bulk tagging and the report-page tag editor, with the tag-write endpoints.** The three endpoint changes, plus the bulk bar and report-page editor, with the mock shown first.
+3. **Plan 3 (complete; originally "Plan 2: CP API and web UI", split by the Query language section above): bulk tagging and the report-page tag editor, with the tag-write endpoints** — `docs/superpowers/plans/2026-10-06-rupu-finding-tags-plan-3-cp-editing.md`. The three endpoint changes, plus the bulk bar and report-page editor, with the mock shown first.
 
 ## Out of scope (follow-ups)
 

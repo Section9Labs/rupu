@@ -872,7 +872,8 @@ not gain any.
     with: { finding_ids: ["fnd_01J…"], add: ["needs-poc"] }
   ```
 
-- **Operators**, through `rupu findings` (below).
+- **Operators**, through `rupu findings` (below) or the control plane's
+  Findings page and finding pages ("In the control plane").
 
 ### Where tags live
 
@@ -924,6 +925,84 @@ makes the command exit non-zero after the other workspaces have kept their
 changes; its output says which were not changed. `--format json` works with all
 three commands (`--format table` is the default).
 
+### In the control plane
+
+The Findings page and a finding's own page both edit tags. Filtering by tag is
+the query bar's job (`tag:needs-poc`, see [Querying findings](#querying-findings)).
+
+- **A finding's page.** Under the header the finding's tags show as chips: the
+  `✕` on a chip removes it, and `+ tag` opens an input that suggests the tags
+  already in use in that finding's project, most used first (the same
+  validation as above, so a bad tag is refused in the input with the reason).
+  A change that fails keeps what you typed and shows the error. A "Tags"
+  section further down holds a collapsed "Tag history (N)": each add or remove,
+  newest first, with who made it (an agent's codename and name, or `user via
+  cp` / `user via cli`) and when.
+- **Bulk, from the Findings table.** Each row has a checkbox, and the header
+  checkbox selects every row that can be selected. With rows selected a bar
+  reads "N selected · Tag… · Untag… · Clear": `Tag…` and `Untag…` open the same
+  input (suggestions are the tags in use across the projects the page covers) and apply
+  to every selected finding. The result stays as one line after the selection
+  clears ("Tagged 3 findings (1 already had it)."), and names any project whose
+  tags couldn't be changed and any finding that no longer exists. Changing the
+  query clears the selection.
+- **Unreadable tag logs.** A project whose tag log can't be read still lists its
+  findings with their declared tags, under the existing "couldn't be read"
+  banner, but its rows' checkboxes are disabled (the tooltip says why) and its
+  findings' pages show the tags read-only ("tags read-only"). Editing is not
+  offered for a log that can't be read.
+
+Every change the control plane makes is recorded as an operator event, `via:
+cp`, in the project's `finding_tags.jsonl`, the same log the CLI writes to.
+
+### Control-plane API
+
+The web UI is a client of these; they are also usable directly. Responses are
+JSON.
+
+`POST /api/findings/tags` adds or removes tags on findings wherever they live:
+
+```json
+{ "finding_ids": ["fnd_01J…", "fnd_01K…"], "add": ["needs-poc"], "remove": [] }
+```
+
+`finding_ids` is required; `add` and `remove` default to empty, and at least one
+must name a tag. Tags are normalized as under "Syntax". The ids are grouped by
+the workspace holding them and each workspace's batch is atomic, the request as
+a whole is not, exactly as for `rupu findings tag`. The `200` body reports per
+workspace, plus the ids no registered workspace holds:
+
+```json
+{
+  "workspaces": [
+    { "ws_id": "ws1", "outcomes": [ { "finding_id": "fnd_01J…", "before": [], "after": ["needs-poc"] } ] },
+    { "ws_id": "ws2", "error": "…why this workspace's batch was refused…" }
+  ],
+  "unknown": ["fnd_01K…"]
+}
+```
+
+A workspace that could not be changed carries an `error` and no `outcomes`
+while the others keep their changes, so a `200` does not mean everything
+applied: read `workspaces[].error` and `unknown`. An `outcome` whose `before`
+equals its `after` changed nothing and wrote no event. Statuses:
+
+| Status | When |
+|---|---|
+| `200` | At least one workspace was reached (it may still carry errors and `unknown` ids). |
+| `400` | An invalid tag, no tag to add or remove, a tag both added and removed, no finding ids, or more than 1000 ids. The body is `{"error": "…"}`. |
+| `404` | None of the ids exists. |
+| `422` | The body doesn't deserialize: a field other than `finding_ids`, `add` and `remove`, or a missing `finding_ids`. |
+
+`GET /api/findings/tags` lists the tags in use, most used first, as `[{ "tag":
+"needs-poc", "count": 4 }]`. `?ws_id=` limits it to one workspace.
+`GET /api/findings/:id` gains two fields: `tag_history`, that finding's tag
+events in file order (`id`, `op`, `tag`, `by`, `at`), and `tags_editable`,
+`false` (with an empty `tag_history`) when the finding's workspace can't be
+resolved or its tag log can't be read. The list response's `tags_unavailable`
+(`[{ws_id, project}]`, from the query bar's section) names the same
+workspaces for the Findings page.
+
 ### Remote units
 
 A placed unit (`host:` / `distribute:`) tags findings in its own workspace.
@@ -938,9 +1017,6 @@ duplicate), so they reach the coordinator exactly as the unit's findings do.
   finding and starts with no tags.
 - Tagging a finding that exists only in a remote host's own ledgers, and was
   never ingested into the coordinator, is not supported.
-- The control plane's findings page filters and shows tags (a read-only Tags
-  column), but bulk tagging and the report page's tag editor are a later plan.
-  Today tags are written through the agent tools, MCP and `rupu findings tag`.
 
 ## Querying findings
 
