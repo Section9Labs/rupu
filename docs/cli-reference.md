@@ -1635,8 +1635,8 @@ rupu netflow prune [OPTIONS]
 
 | Option | Description |
 |---|---|
-| `--older-than <DURATION>` | Retention cutoff, e.g. `30d`, `12h`, or `1w`. Must be positive — `0s` or a negative value is rejected, not treated as "everything". Defaults to `30d` (mirrors `transcript prune`'s own fallback) when omitted. A ledger is matched by file mtime, NOT by asking whether its owning run has actually finished, so a run that has been idle (no outbound calls) longer than this cutoff can still be pruned mid-run — this command cannot tell "idle" from "finished". Run `--dry-run` first if you're unsure. Anything modified in roughly the last hour is never eligible regardless of what you pass here |
-| `--dry-run` | Preview deletions without removing files. Always cheap to run first — the default (no flag) deletes immediately, same as `transcript prune`. Recommended before any cutoff shorter than a day, since this command cannot distinguish an idle run from a finished one (see `--older-than`'s own help) |
+| `--older-than <DURATION>` | Retention cutoff, e.g. `30d`, `12h`, or `1w`. Must be positive — `0s` or a negative value is rejected, not treated as "everything". Defaults to `30d` (mirrors `transcript prune`'s own fallback) when omitted. A ledger is matched by file mtime, but a ledger whose run is still live is never deleted however old it is: a workflow run that is not finished (and whose recorded runner pid, if any, is alive) protects its own, its steps', its fan-out units' and its sub-agents' ledgers, and a standalone `rupu run` whose process is alive protects its own and its sub-agents'. Such ledgers are listed as `skipped_live`. Anything modified in roughly the last hour is never eligible regardless of what you pass here |
+| `--dry-run` | Preview deletions without removing files. Always cheap to run first — the default (no flag) deletes immediately, same as `transcript prune` |
 
 <a id="rupu-repos"></a>
 ### `rupu repos`
