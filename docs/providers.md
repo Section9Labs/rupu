@@ -8,7 +8,7 @@ Slice B-1 adds four LLM providers, each supporting two authentication modes. Thi
 | ------------------ | :-----: | :--: | ---------------- | ------------------------------------------------------------------------------------------ |
 | anthropic          |   ✓     |  ✓   | Browser callback | Console API key OR Claude.ai SSO.                                                          |
 | openai             |   ✓     |  ✓   | Browser callback | Platform API key OR ChatGPT SSO. Different endpoints under hood.                           |
-| gemini             |   ✓     |  ✓   | Browser callback | API key via Google AI Studio (`AIzaSy…`). SSO is the Gemini CLI / Antigravity login (Cloud Code Assist, not Vertex). |
+| gemini             |   ✓     |  ✓   | Browser callback | API key via Google AI Studio (`AIzaSy…`). SSO is the Gemini CLI / Antigravity login (Cloud Code Assist, not Vertex); its Google Cloud project is set up at login — see [gemini.md](providers/gemini.md#code-assist-project). |
 | copilot            |   ✓     |  ✓   | Device code      | API-key path uses a GitHub PAT (`GITHUB_TOKEN`). Requires paid Copilot.                   |
 | openai-compatible  |   ✓     |  —   | —                | Generic adapter for any `/v1/chat/completions` endpoint (vLLM, Oracle GenAI, Together, …). |
 
@@ -19,7 +19,7 @@ Anthropic remains the most exercised provider; Copilot's API-key path is most re
 A provider *name* used to mean two things at once: which credential to use, and which vendor client to build. They're now split:
 
 - **Account** — the identity. Whatever you pass to `--account` (below) is a credential slot: `anthropic`, `anthropic-work`, `gh-personal`, ... Freeform, and it's what an agent's `provider:` frontmatter field names.
-- **`kind`** — the vendor. Selects which client authenticates the account: `anthropic`, `openai`, `gemini`, `copilot`, `github`, `gitlab`, `linear`, `jira`, or `openai-compatible` (see below).
+- **`kind`** — the vendor. Selects which client authenticates the account: `anthropic`, `openai`, `gemini`, `copilot`, `local`, `github`, `gitlab`, `linear`, `jira`, or `openai-compatible` (see below).
 
 A bare vendor name used as the account (`--account anthropic`) needs no `--kind` — the account name *is* the vendor, exactly like before this existed, and every example below that uses a plain provider name still works unchanged. To hold a second account of the same vendor — a work identity and a personal identity, each with an independent credential including an independent SSO token — give it a distinct name and its vendor via `--kind`:
 
@@ -87,7 +87,12 @@ When an agent file declares `provider: anthropic` without an explicit `auth:` fi
 2. API-key entry if present.
 3. Error: `no credentials configured for <account>. Run: rupu auth login --account <account> --mode <api-key|sso>`.
 
-To force a specific mode, set `auth: api-key` or `auth: sso` in the agent's YAML frontmatter.
+To force a specific mode, set `auth: api-key` or `auth: sso` in the agent's YAML frontmatter. `auth:` picks the mode of whichever account `provider:` names, so a named account works the same way:
+
+```yaml
+provider: anthropic-work   # an account declared with --kind anthropic
+auth: sso
+```
 
 ### Refresh
 
@@ -382,10 +387,15 @@ Older versions kept credentials in the macOS keychain; rupu now uses only `~/.ru
 **`rupu auth logout --all` removes credentials I didn't expect.**
 By design — `--all` iterates every stored account × mode. Use `--account <name>` (with optional `--mode <m>`) for surgical removals.
 
+## Usage and cost accounting
+
+Every reply's token counts land in the run's transcript (`input_tokens`, `output_tokens`, and for providers that report them `cached_tokens` — cache reads — and `cache_write_tokens`; both are subsets of `input_tokens`). A workflow run additionally appends one row per LLM call, as it is made, to its usage ledger `<RUPU_HOME>/runs/<run_id>/usage.jsonl` — dispatched sub-agents and compaction-summary calls included — so the control plane's Usage page and run views show a running run's spend live instead of after it ends. Cost is priced at read time from `[pricing]` (cache reads and writes at the model's cache-read / cache-write rates) and never stored; a model with no price shows tokens only. `rupu usage` is the CLI report — see [using-rupu.md](using-rupu.md#inspect-usage-and-structured-reports).
+
+Anthropic prompt caching (`prompt_cache`, above) is on by default, so a long agent loop re-reads its tools, system prompt and prior turns from the cache; the savings show up as `cached_tokens`. OpenAI reports its own automatic prompt-cache hits as `cached_tokens` too.
+
 ## Deferred / future
 
-- Richer usage visualization / dashboards beyond `rupu usage` — per-response usage is captured in JSONL transcripts and joined with workflow-run metadata today; future work is higher-level visualization, not the base reporting command.
 - Local-model provider (Ollama / llama.cpp) — out of scope for Slice B-1; planned for a later slice.
 - Cost accuracy enhancements — `rupu usage` reports USD from built-in/default pricing tables today; users with strict accounting needs should override provider/model pricing in config.
 - Cross-provider model aliases (e.g., `model: smart`) — not planned; explicit model names are clearer.
-- Vendor-specific model features (Anthropic prompt-cache toggles, OpenAI structured-output mode, Gemini grounding) — adapters expose them as opaque pass-through fields where natural; no first-class rupu surface yet.
+- Vendor-specific model features (OpenAI structured-output mode, Gemini grounding) — adapters expose them as opaque pass-through fields where natural; no first-class rupu surface yet. (Anthropic prompt caching does have one: `prompt_cache` above and the agent's `anthropicPromptCache:`.)

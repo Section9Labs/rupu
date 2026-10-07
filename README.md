@@ -1,36 +1,108 @@
 # rupu
 
-**Status:** local CLI feature-complete (Slices A + B + C shipped)
+**Status:** CLI + control-plane web UI in active development, released on
+`beta` and `stable` channels (`rupu update`). The native macOS app (`rupu.app`)
+is deprecated — see [Install](#install).
 
 ---
 
 ## What is rupu?
 
-`rupu` is a CLI for orchestrating coding agents across repositories — driven by
-issue-tracker events, gated by human approvals when you want them, with a JSONL
-transcript on every run. A single Rust binary that:
+`rupu` is a CLI for orchestrating coding and security agents across
+repositories and hosts — driven by schedules and issue-tracker events, gated by
+human approvals when you want them, with a JSONL transcript on every run. A
+single Rust binary that:
 
-- Drives any of four LLM providers (Anthropic, OpenAI, Gemini, GitHub Copilot)
-  via API key OR SSO, with credentials kept in a chmod-600 file (`~/.rupu/auth.json`).
-- Loads agent + workflow definitions from `.rupu/` in your project (or globally
-  from `~/.rupu/`); ships a curated starter set via `rupu init --with-samples`.
-- Talks to GitHub and GitLab through a single embedded MCP server (so the same
-  surface works inside rupu and inside Claude Desktop / Cursor / any MCP host).
-- Fires workflows on cron schedules OR external SCM events (GitHub / GitLab),
-  via either a system-cron poll loop (no daemon) or a user-managed
-  `rupu webhook serve` long-running process.
-- Renders runs as live terminal streams (`rupu workflow run` / `rupu run`),
-  with `rupu watch <run_id>` to re-attach to anything in flight.
-- Records an auditable **coverage** ledger for review-shaped tasks — what the
-  agent examined, for which concerns (OWASP / CWE / STRIDE / …), and what it
-  found — that accumulates across runs and is diff-able and replayable
-  (`rupu coverage`; see [docs/coverage.md](docs/coverage.md)).
+- **Drives multiple LLM providers** — Anthropic, OpenAI, Gemini and GitHub
+  Copilot via API key or SSO, plus any OpenAI-compatible `/v1/chat/completions`
+  endpoint (vLLM, Oracle GenAI, Together, …). Named accounts let you hold
+  several independently-credentialed identities per vendor (work / personal);
+  credentials live in a chmod-600 `~/.rupu/auth.json` and SSO tokens refresh
+  themselves.
+- **Knows each model's limits** — every run resolves its model's context window
+  and output cap (agent frontmatter → config → the provider's live model list),
+  and `rupu models list|refresh` browses the discovered catalog.
+- **Recovers from bad replies** — every provider reply and error is classified
+  into a typed outcome (refusal, truncation, context overflow, rate limit, …)
+  and walked up a recovery ladder: retry, then the agent's `fallbacks:` chain
+  of other models/providers, then fail with a concrete hint. Anthropic
+  server-side fallback is used where supported
+  ([docs/response-outcomes.md](docs/response-outcomes.md)).
+- **Resumes interrupted work** — `rupu run --continue <id>` rebuilds a killed or
+  failed run's conversation from its transcript and carries on (optionally on
+  another model); `rupu workflow resume` continues the steps and `for_each`
+  units a dead runner left mid-flight instead of restarting them.
+- **Runs agents and workflows** — agents are `.md` files with YAML frontmatter;
+  workflows are YAML DAGs with linear steps, `for_each:` fan-out, `parallel:`
+  and `panel:` review steps, `branch:` / `split:` / `join:` / `loops:`,
+  deterministic `run:` command steps, `action:` connector steps, standalone
+  approval gate nodes (with `notify:` hooks and unattended timeout routing),
+  JSON-Schema `contracts:` between steps, and `rupu workflow run --file` for a
+  workflow outside the catalog. `rupu agent create --describe` /
+  `rupu workflow create --describe` have a model draft the definition for you.
+- **Runs autonomously** — **autoflows** own issues end-to-end against
+  persistent claim state (`rupu autoflow serve|tick|monitor`), and
+  **agentiflows** run goal-directed, lead-coordinated agent fleets with a shared
+  board, mailboxes, budgets and coverage-based stop conditions, steerable while
+  they run (`rupu agentiflow run|attach|send|stop`).
+- **Holds persistent sessions** — multi-turn agent conversations that outlive a
+  single run, with compaction, archive/restore and attach
+  (`rupu session`).
+- **Fires on triggers** — cron schedules (`rupu cron tick` from system cron, no
+  daemon), polled SCM events, or inbound webhooks from GitHub, GitLab, Linear
+  and Jira (`rupu webhook serve`) ([docs/triggers.md](docs/triggers.md)).
+- **Spans many hosts** — register remote hosts over SSH, HTTP, a dial-home
+  WebSocket tunnel (`rupu node`) or a bucket dead-drop (`rupu node pull`), place
+  a step with `host:` or spread a `for_each:` fan-out with `distribute:`, and
+  get workspace changes synced back. SSH-hosted transcripts stream back through
+  a lazy mirror, and remote units' coverage, findings and evidence artifacts
+  reach the coordinator on every transport.
+- **Serves a control-plane web UI** — `rupu cp serve` hosts a local dashboard:
+  live runs and run graphs, transcripts, approvals, sessions, a workflow
+  editor, findings, coverage, usage, network flows, hosts, agentiflows and
+  customers, loading each host progressively.
+- **Records coverage and structured findings** — an auditable coverage ledger
+  of what the agent examined, for which concerns (OWASP / CWE / STRIDE / …),
+  diff-able and replayable across runs; findings follow a schema-validated
+  report contract (`full` / `summary` profiles) with evidence blocks (images,
+  hexdumps, pcap refs) and a content-addressed artifact store; reports export
+  to Markdown, HTML or PDF (`rupu findings export`) and older ones can be
+  backfilled (`rupu findings import`) ([docs/coverage.md](docs/coverage.md)).
+- **Lets you query and tag findings** — one query language
+  (`severity>=high -tag:noise`) shared by the CLI, the web UI, agent tools and
+  MCP, with a workspace-wide tag log (`rupu findings list|tag|tags`).
+- **Speaks more than code** — data-driven engagement profiles (`code`, `web`,
+  `api`, `network`, `binary`, `firmware`, `mobile`, `cloud`, `container`,
+  `iac`, `sca`, `secrets`, `threat-model`, `redteam`, the `pentest` composite,
+  or your own TOML) define the asset model findings and coverage are validated
+  against (`--engagement-profile`).
+- **Bills by customer** — group projects under customers with their own config
+  layer (global → customer → project), attribute every run to one, and filter
+  and price runs, usage and findings per customer in the control plane
+  (`rupu customer`; [docs/cp-customers-api.md](docs/cp-customers-api.md)).
+- **Counts every token** — a live per-run usage ledger with built-in pricing,
+  Anthropic prompt caching, and reports grouped by provider, model, agent,
+  workflow, repo or day (`rupu usage`).
+- **Watches the network** — per-run netflow ledgers record rupu's own outbound
+  HTTP and the sockets opened by an agent's `bash` subprocesses (passive,
+  unprivileged OS socket observation on macOS and Linux), browsable in the web
+  UI (`rupu netflow show`).
+- **Names things for humans** — agent codenames (`cobalt-harbor/heron#412`)
+  label runs, sessions, units and sub-agents across the CLI and web UI.
+- **Keeps faithful transcripts** — schema v2 JSONL records thinking blocks,
+  seeds, compaction and notices, and replays back to the exact conversation
+  ([docs/transcript-schema.md](docs/transcript-schema.md)); runs render live in
+  the terminal (a three-pane workflow dashboard) and `rupu watch <run_id>`
+  re-attaches or replays.
+- **Embeds an MCP server** — one typed GitHub + GitLab tool catalog for agents,
+  also served to Claude Desktop / Cursor / any MCP host via `rupu mcp serve`
+  ([docs/mcp.md](docs/mcp.md)).
+- **Updates itself** — `rupu update` follows the `stable` or `beta` channel
+  with checksum-verified, atomic in-place swaps.
 
 What's NOT in this binary yet: the hosted multi-tenant `rupu.cloud` relay and
-the remote sandbox runtime (Slice E). The local control-plane web UI
-(`rupu cp serve`) and the native desktop app (`rupu.app`, a separate binary,
-Slice D) already ship. See [TODO.md](TODO.md) for deferred items in
-already-shipped slices.
+the remote sandbox runtime (Slice E). See [TODO.md](TODO.md) for deferred
+items.
 
 ---
 
@@ -238,19 +310,13 @@ sudo dnf install --enablerepo=rupu-beta rupu
 sudo dnf upgrade --enablerepo=rupu-beta rupu
 ```
 
-**macOS app (rupu.app):**
+**macOS app (rupu.app) — deprecated:**
 
-Download `rupu-app-darwin-arm64.dmg` (or the `.zip`) from the
-[Releases](https://github.com/Section9Labs/rupu/releases) page, open the DMG, and drag
-`rupu.app` to `/Applications`. Both the DMG and the app inside it are signed, notarized,
-and stapled, so Gatekeeper opens it cleanly — no "unidentified developer" workaround
-needed.
-
-`rupu.app` is a thin native client for `rupu cp serve`; it needs a `rupu` binary
-**version 0.74.0 or newer** on your `$PATH` (install it via any of the methods above
-first). On launch it probes for an already-running control plane on port 7420 and
-attaches to it, or spawns `rupu cp serve` itself if none answers. Both the discovered
-`rupu` binary and the port are overridable in the app's Settings.
+The native SwiftUI client, `rupu.app`, is deprecated and no longer developed.
+Its last builds remain on the
+[Releases](https://github.com/Section9Labs/rupu/releases) page, but new
+features land only in the CLI and the control-plane web UI — run
+`rupu cp serve` and use the browser instead.
 
 ---
 
@@ -431,7 +497,13 @@ rupu run summarize-diff "summarize changes since main"
 | `~/.rupu/contracts/` | Global reusable contract schemas |
 | `~/.rupu/transcripts/` | JSONL run transcripts |
 | `~/.rupu/cache/` | Scratch space + crash logs |
-| `~/.rupu/workspaces/` | Reserved for Slice C session state |
+| `~/.rupu/workspaces/` | Workspace (project) records + customer assignments |
+| `~/.rupu/runs/` | Persistent workflow run store (status, step results, events) |
+| `~/.rupu/sessions/` | Persistent agent sessions |
+| `~/.rupu/agentiflows/` | Agentiflow definitions and run directories |
+| `~/.rupu/customers/` | Customer records and per-customer config layers |
+| `~/.rupu/findings/artifacts/` | Content-addressed finding artifact store |
+| `~/.rupu/hosts/` | Registered remote hosts |
 
 ### Per-project (`<project>/.rupu/`)
 
@@ -440,6 +512,8 @@ rupu run summarize-diff "summarize changes since main"
 | `<project>/.rupu/agents/` | Agent `.md` files for this repo |
 | `<project>/.rupu/contracts/` | Repo-local JSON Schemas for workflow handoffs |
 | `<project>/.rupu/workflows/` | Workflow YAML files for this repo |
+| `<project>/.rupu/agentiflows/` | Agentiflow definitions for this repo |
+| `<project>/.rupu/coverage/` | Coverage ledgers, findings and the finding tag log |
 | `<project>/.rupu/config.toml` | Project-local config overrides |
 
 ---
@@ -468,50 +542,88 @@ coverage gaps.
 
 ## Documentation
 
-- `docs/using-rupu.md` — practical day-to-day usage
-- `docs/agent-format.md` — complete agent schema reference
-- `docs/agent-authoring.md` — how to write good agents
-- `docs/workflow-format.md` — complete workflow schema reference
-- `docs/workflow-authoring.md` — how to design good workflows
-- `docs/configuration.md` — complete `~/.rupu/config.toml` reference
-- `docs/development-flows.md` — recommended engineering flows
-- `docs/coverage.md` — agentic coverage harness (ledgers, catalogs, audit / diff / rerun)
-- `examples/README.md` — copyable agents and workflows
+Full documentation lives at **<https://rupu.sh/docs/>**. The same material, in
+this repo:
+
+- [`docs/using-rupu.md`](docs/using-rupu.md) — practical day-to-day usage
+- [`docs/agent-format.md`](docs/agent-format.md) — complete agent schema reference
+- [`docs/agent-authoring.md`](docs/agent-authoring.md) — how to write good agents
+- [`docs/workflow-format.md`](docs/workflow-format.md) — complete workflow schema reference
+- [`docs/workflow-authoring.md`](docs/workflow-authoring.md) — how to design good workflows
+- [`docs/agentiflows.md`](docs/agentiflows.md) — goal-directed agent fleets (`rupu agentiflow`)
+- [`docs/triggers.md`](docs/triggers.md) — cron, polled-event and webhook triggers
+- [`docs/configuration.md`](docs/configuration.md) — complete `config.toml` reference, including the customer layer
+- [`docs/providers.md`](docs/providers.md) — LLM providers, accounts and auth modes (per-provider pages in [`docs/providers/`](docs/providers/))
+- [`docs/response-outcomes.md`](docs/response-outcomes.md) — reply outcomes, the recovery ladder and `fallbacks:`
+- [`docs/scm.md`](docs/scm.md) — GitHub / GitLab / issue-tracker integration (per-platform pages in [`docs/scm/`](docs/scm/))
+- [`docs/mcp.md`](docs/mcp.md) — the embedded MCP server and its tool catalog
+- [`docs/coverage.md`](docs/coverage.md) — coverage harness, finding reports, queries, tags, exports and engagement profiles
+- [`docs/cp-customers-api.md`](docs/cp-customers-api.md) — the control plane's customers API and web scope
+- [`docs/transcript-schema.md`](docs/transcript-schema.md) — the JSONL transcript event schema
+- [`docs/development-flows.md`](docs/development-flows.md) — recommended engineering flows
+- [`docs/spec.md`](docs/spec.md) — architecture reference
+- [`docs/RELEASING.md`](docs/RELEASING.md) — release channels and the release-gated CI
+- [`examples/README.md`](examples/README.md) — copyable agents and workflows
 
 ## Subcommands
 
 ```
 rupu init [--with-samples] [--git]    Bootstrap .rupu/ in the current dir
-rupu run <agent> [prompt]             Run an agent from the project's .rupu/agents/
-rupu agent {list, show, edit}         Manage agents (list / inspect / open in $EDITOR)
-rupu workflow {list, show, edit}      Manage workflows
-rupu workflow run <name> [target]     Run a workflow (target: repo, PR, or issue ref)
-rupu workflow runs                    List recent persisted runs
-rupu workflow {approve, reject} <id>  Resume / cancel a paused-for-approval run (--gate <step-id> when several gates are parked at once)
-rupu watch <run_id> [--replay]        Re-attach to any past or in-flight run
-rupu transcript {list, show}          Browse JSONL transcripts
-rupu coverage {list, show, audit, gap} Inspect agentic coverage ledgers (+ catalog, templates)
+rupu run <agent> [prompt|target]      Run an agent (--continue <id>, --model, --provider,
+                                       --engagement-profile, --findings-profile, --tmp/--into)
+rupu run {list, show, pause, resume}  List / inspect runs; pause or resume a run by id
+rupu agent {list, show, edit, create} Manage agents (create --describe drafts one with a model)
+rupu workflow {list, show, edit, create}
+                                       Manage workflows (create --describe drafts one with a model)
+rupu workflow run <name> [target]     Run a workflow (target: repo, PR, or issue ref; --file <path>)
+rupu workflow {runs, show-run}        List / inspect persisted runs
+rupu workflow {approve, reject} <id>  Release / reject a parked approval gate (--gate <step-id>)
+rupu workflow {cancel, pause, resume} Control a run; resume continues interrupted work
+rupu workflow {archive-run, restore-run, delete-run}
+                                       Manage run history
+rupu agentiflow {run, list, status, attach, send, stop, serve}
+                                       Goal-directed, lead-coordinated agent fleets
+rupu autoflow {list, show, run, tick, serve, stop, monitor, history, ...}
+                                       Autonomous workflows against persistent issue state
+                                       (+ wakes, explain, doctor, repair, requeue, status,
+                                        claims, release, create)
+rupu session {start, list, show, send, attach, stop, compact, usage-timeline,
+              archive, restore, delete, prune}
+                                       Persistent agent sessions (multi-turn conversations)
+rupu watch <run_id> [--follow|--replay]
+                                       Re-attach to any past or in-flight run
+rupu transcript {list, show, archive, delete, prune}
+                                       Browse and manage JSONL transcripts
+rupu coverage {list, show, audit, gap, catalog, templates}
+                                       Inspect agentic coverage ledgers and concern catalogs
 rupu coverage {runs, diff, rerun}     Compare and replay coverage runs
+rupu findings {list, tag, tags}       Query findings (`severity>=high -tag:noise`) and tag them
+rupu findings {export, import, schema}
+                                       Export reports (--to md|html|pdf), backfill old ones,
+                                       print the report JSON Schema
+rupu netflow {show, prune}            Per-run network flow ledgers
+rupu usage [runs, backfill]           Token spend + cost reports (--group-by, --since, filters)
+rupu cleanup [--sessions|--transcripts] [--stats] [--dry-run]
+                                       Prune archived local sessions and transcripts
 rupu issues {list, show, run}         Issue-tracker surface (auto-detects from cwd)
-rupu repos list                       List configured-platform repositories
+rupu repos {list, attach, prefer, tracked, forget}
+                                       SCM repositories and tracked local checkouts
+rupu scm {bind, accounts}             Multi-account SCM routing rules and account roster
 rupu cron {list, tick, events}        Cron + polled-event trigger runtime
 rupu webhook serve [--addr]           Long-lived webhook receiver for GitHub / GitLab / Linear / Jira
 rupu mcp serve [--transport]          Expose rupu's tools to MCP clients
-rupu auth {login, logout, status}     Provider credential management
-rupu models {list, refresh}           Browse / refresh discovered model lists
-rupu ui {themes, theme ...}           List, inspect, validate, and import UI themes
-rupu config {get, set}                Read / write rupu configuration
-rupu completions {print, install}     Shell-completion scripts (with dynamic agent names)
-rupu usage                            Usage reports across transcripts + workflow runs
-rupu session {start, list, show, send, attach, stop, archive, restore, delete, prune, compact}
-                                       Persistent agent sessions (multi-turn conversations)
-rupu autoflow {list, show, run, tick, serve, ...}
-                                       Autonomous workflows against persistent issue state
-rupu cleanup [--sessions|--transcripts] [--stats] [--dry-run]
-                                       Prune archived local sessions and transcripts
 rupu cp serve [--bind] [--token]      Local control-plane HTTP server for the rupu web UI
-rupu host {add, list, remove}         Manage named rupu-cp hosts
-rupu node [--cp-url] | {enroll, pull} Dial-home tunnel agent + node enrollment
+rupu host {add, list, remove}         Manage named remote hosts (SSH / HTTP / tunnel / bucket)
+rupu node [--cp-url] | {enroll, pull} Dial-home tunnel agent, node enrollment, bucket worker
+rupu auth {login, logout, status, backend}
+                                       Provider + SCM credential management
+rupu models {list, refresh}           Browse / refresh discovered model lists and limits
+rupu customer {list, show, create, set, edit, archive, unarchive, delete, assign, unassign}
+                                       Customers: project grouping + a per-customer config layer
+rupu config {get, set}                Read / write rupu configuration
+rupu ui {themes, theme {show, validate, import}}
+                                       List, inspect, validate, and import UI themes
+rupu completions {print, install}     Shell-completion scripts (with dynamic agent names)
 rupu update [--check] [--channel]     Download and install the latest release for the configured channel
 ```
 
@@ -684,8 +796,14 @@ See [`docs/spec.md`](docs/spec.md) for the full architecture. Short version:
 - **Agents** are `.md` files with YAML frontmatter for provider, model, tools,
   permission mode, and optional reasoning / output controls, plus a markdown system
   prompt body.
-- **Workflows** are YAML orchestration files with sequential steps plus `for_each`,
-  `parallel`, `panel`, `approval`, and trigger support.
+- **Workflows** are YAML orchestration DAGs: linear steps plus `for_each`,
+  `parallel`, `panel`, `branch`, `split`/`join`, `loops`, `run:` command steps,
+  `action:` connector steps, approval gate nodes, remote placement
+  (`host:` / `distribute:`), and trigger support.
+- **Autoflows** are workflows with an `autoflow:` block that own issues
+  end-to-end against persistent claim state; **agentiflows** are YAML goal
+  definitions run by a lead agent that dispatches agent and workflow units
+  over a shared fleet board until goals, coverage or a budget stop it.
 - **Transcripts** are append-only JSONL files, and workflow runs are also tracked in
   the persistent run store for re-attach, approval, and history.
 - **Sessions** are persistent agent containers that own multiple standalone runs over
@@ -700,6 +818,39 @@ See [`docs/spec.md`](docs/spec.md) for the full architecture. Short version:
   `dispatch_agents_parallel`) and can only narrow, never grant beyond what the
   agent's `tools:` already allows. Every catalog call is recorded in the
   transcript's `tool_audit` trail.
+
+### Crates
+
+The workspace is hexagonal: `rupu-providers`, `rupu-tools` and `rupu-auth`
+define ports, the agent runtime only knows traits, and `rupu-cli` is a thin
+clap dispatcher.
+
+| Crate | Role |
+|-------|------|
+| `rupu-cli` | The `rupu` binary — argument parsing and delegation to the libraries |
+| `rupu-agent` | Agent file format, agent loop, permission resolver, continuation/replay, outcome classification and the recovery ladder |
+| `rupu-providers` | LLM provider clients behind the `LlmProvider` port, typed reply outcomes, model limits |
+| `rupu-runtime` | Run assembly shared by CLI, orchestrator and CP: provider factory, model-limit resolution, fallback hops, credential manifest |
+| `rupu-auth` | Credential storage (`~/.rupu/auth.json`, mode 0600) and SSO flows |
+| `rupu-tools` | Builtin agent tools: `bash`, file read/write/edit, `grep`, `glob`, `ast_grep`, sub-agent dispatch |
+| `rupu-ast` | Tree-sitter CST wrapper behind `ast_grep` source and CST previews |
+| `rupu-orchestrator` | Workflow YAML parser, minijinja rendering, DAG executor, gates, actions, run store and interrupt recovery |
+| `rupu-agentiflow` | The agentiflow envelope: definition loader, round loop, lead driver, budgets and stop conditions |
+| `rupu-fleet` | File-backed fleet comms for agentiflows: shared board (claims / posts / directives) and mailboxes |
+| `rupu-transcript` | JSONL transcript event schema (v2), writer and reader |
+| `rupu-codename` | Human codenames for runs, sessions, units and sub-agents |
+| `rupu-config` | Layered TOML configuration (global → customer → project) |
+| `rupu-workspace` | Workspace records, customer store, config-layer resolution, workspace sync deltas |
+| `rupu-coverage` | Coverage ledgers, concern catalogs, engagement profiles, finding reports, query language and tags |
+| `rupu-findings-report` | Pure finding-report renderers (Markdown / HTML / PDF via Typst) and the Markdown importer |
+| `rupu-scm` | GitHub / GitLab repo + issue connectors and event pollers |
+| `rupu-mcp` | Embedded MCP server (in-process and stdio) over the SCM tool catalog |
+| `rupu-webhook` | Webhook receiver for event-triggered workflows (GitHub, GitLab, Linear, Jira) |
+| `rupu-cp` | Control-plane HTTP server, host connectors (local / SSH / HTTP / tunnel / bucket) and the embedded web UI |
+| `rupu-netflow` | Network egress observability: per-run flow ledgers for rupu's own HTTP |
+| `rupu-netwatch` | Passive subprocess socket capture (macOS / Linux) for agent `bash` calls |
+| `rupu-app-canvas` | Pure view layer that turns a workflow into graph rows for the CLI's workflow views |
+| `rupu-update` | Channel-aware release selection, checksum verification and atomic binary swap behind `rupu update` |
 
 ---
 

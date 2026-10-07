@@ -190,6 +190,137 @@ Important:
 - it does not expose extra `--input` flags
 - when you need both an issue target and additional inputs, use `rupu workflow run`
 
+### Run a workflow from a file outside the catalog
+
+```sh
+rupu workflow run --file ./drafts/triage-sweep.yaml --input target=src/
+```
+
+`--file <path>` runs a workflow straight from a YAML file instead of looking a name up
+in `.rupu/workflows/` or `~/.rupu/workflows/`. The file is not copied into the catalog,
+and the run is named by the file's own `name:`. It stands in for the workflow name, so
+it can't be combined with a name or with a run target (`github:owner/repo#42`);
+`--input`, `--mode` and the other run flags work as usual, and the agents its steps name
+resolve from the usual agent directories.
+
+### Run a workflow under an engagement profile
+
+```sh
+rupu workflow run network-sweep --engagement-profile network
+rupu workflow run app-assessment --engagement-profile network,web   # or repeat the flag
+```
+
+`--engagement-profile <id>` (alias `--engagement-profiles`; repeatable or
+comma-separated) selects the asset domain(s) every agent step's findings are validated
+against — the same selection `rupu run --engagement-profile` makes for a single agent.
+With no flag the run takes the native `code` path, exactly as before. An unknown profile
+id fails the command before any run state is created. The selection is not recorded on
+the run, so `rupu workflow resume` and an in-view approve-resume continue on the `code`
+path. Profiles, asset kinds and the built-in catalog: [coverage.md](coverage.md#engagement-profiles).
+
+### Watch a workflow run (the live dashboard)
+
+In a terminal, `rupu workflow run` (and `rupu workflow resume`) opens a full-screen
+dashboard on the alternate screen:
+
+- **Header** — the workflow name and the run's codename, status and elapsed time, a `step N/M`
+  progress bar, and a meter row (tokens, cost, findings, provider/model) once the run
+  has produced them.
+- **Structure** — the workflow as a live DAG: every step with its state, fan-out units
+  under their step, sub-agents under their unit. This is the pane you navigate.
+- **Stream** — the transcript of whatever is selected in the structure pane (by default
+  it follows the newest activity).
+- **Firehose** — one arrival-ordered feed of events across the whole run, every unit
+  and sub-agent included.
+- **Footer** — the keys that apply right now.
+
+| Key | Action |
+|---|---|
+| `↑` `↓` / `j` `k` | move the selection (structure) or scroll (stream / firehose) |
+| `Enter` / `→` / `l` | drill in: run → step → fan-out unit → sub-agent |
+| `←` / `Backspace` / `h` | back out one level |
+| `a` | follow the newest activity again (back to the run level) |
+| `/` | with the structure pane focused, cycle the fan-out unit filter: all → running → failed → done |
+| `Tab` / `Shift-Tab` | move focus between structure, stream and firehose |
+| `PgUp` / `PgDn` | page the focused stream or firehose |
+| `Esc` | ask the run to pause at its next safe boundary (what `rupu workflow pause` does); resume it later with `rupu workflow resume <run-id>` |
+| `q` / `Ctrl-C` | close the dashboard |
+| `Ctrl-L` | repaint the screen |
+
+When the run parks at an approval gate the gate is focused and the footer changes:
+`a` approves it, `r` rejects it (running its `on_reject` cleanup), and `v` / `Enter`
+toggles the gate's details (the findings it is gating). The decision is the same one
+`rupu workflow approve|reject` records, and the dashboard keeps following the run
+while it resumes. `q` at a gate leaves the run parked for a later approve or reject.
+
+Mid-run, closing the dashboard with `q` does not stop the run: the command keeps
+running the workflow and prints the completion summary when it ends. Use
+`rupu workflow cancel <run-id>` from another terminal to stop it.
+
+The dashboard is the default whenever stdout is a terminal. Pass `--plain` (on
+`workflow run` and `workflow resume`) or set `RUPU_LIVE_VIEW=0` for the line printer
+instead; output that is not a terminal always gets the line printer, and `--view
+focused|full` sets its density.
+
+### Resuming interrupted work
+
+A workflow run whose process died — a closed laptop, a killed terminal, a crash, an
+out-of-memory kill — or that you paused, cancelled or that failed, is picked up with:
+
+```sh
+rupu workflow resume run_01J...
+rupu workflow resume run_01J... --restart-interrupted
+```
+
+Steps and `for_each` units with a recorded result are skipped. An agent that was
+mid-flight is **continued** from its transcript rather than started over (or, if it had
+in fact finished, its answer is **recovered** without a model call); the live view marks
+those `↩ continued` / `↩ recovered`. `--restart-interrupted` starts every interrupted
+step and unit over from its prompt instead. A run still marked running whose runner
+process is gone is marked failed first, so the CLI can recover it alone. `parallel:` /
+`panel:` members, loop members and remote (`host:` / `distribute:`) units still restart.
+The full rules are in
+[workflow-format.md](workflow-format.md#resuming-an-interrupted-run).
+
+A single agent run continues the same way:
+
+```sh
+rupu run review-diff --continue run_01J...                       # interrupted: pick it up
+rupu run review-diff --continue run_01J... --model <other-model>  # failed on a refusal / cut-off: try another model
+```
+
+Run it from the same project as the original run. Which failures can be continued, and
+on what, is covered in [response-outcomes.md](response-outcomes.md#continuing-a-failed-run-on-another-model)
+and [agent-format.md](agent-format.md#continuing-an-interrupted-run).
+
+### Codenames
+
+Every run, session, step, fan-out unit and sub-agent gets a human codename alongside
+its ULID:
+
+| What | Codename |
+|---|---|
+| a workflow run (its *crew*) | `cobalt-harbor` |
+| a step's agent | `cobalt-harbor/heron` |
+| fan-out unit 412 of that step | `cobalt-harbor/heron#412` |
+| a sub-agent that unit dispatched | `cobalt-harbor/heron#412>lynx#3` |
+| a retry of the unit | `cobalt-harbor/heron#412.2` |
+| a standalone `rupu run` / a session | `amber-lantern/heron` |
+
+The crew (`color-noun`) is derived from the top-level run or session id; the role
+(an animal) is derived from the agent's name, so the same agent keeps the same role
+across runs. Names are minted once and stored on the records; runs from before
+codenames existed get the same names derived on read. They show in the start line
+(`▶ cobalt-harbor  (run_01J…)`), the live view, the `NAME` column of
+`rupu workflow runs`, `rupu session list` and `rupu transcript list`, and throughout the
+control-plane UI.
+
+A crew name works wherever a run or session id does — `rupu workflow show-run
+cobalt-harbor`, `rupu workflow resume cobalt-harbor`, `rupu transcript show …`,
+`rupu session show …`. Crew names can repeat over time: a crew resolves to its most
+recent run, and if others used the same crew in the last 30 days a note on stderr lists
+their ids.
+
 ### Re-attach to a run
 
 ```sh
@@ -384,6 +515,17 @@ rupu --format json repos tracked
 ```
 
 Default `rupu usage` shows the last 30 days, total input/output/cached tokens, total cost, and top providers/models/agents, then a breakdown table grouped by `provider + model + agent`.
+
+`CACHED` is prompt-cache reads, a subset of input; prompt-cache writes are reported as
+`cache_write_tokens` in `--format json` only. Both are priced at the model's cache rates
+(see [providers.md](providers.md#usage-and-cost-accounting)). Narrow the window with
+`--since` / `--until` (RFC-3339, or relative: `--since 7d`, `24h`, `30m`) and the set with
+`--workflow <name>` or `--agent <name>`.
+
+`rupu usage` folds the runs' transcripts, joined with workflow-run metadata. The control
+plane reads each workflow run's usage ledger first (`runs/<run_id>/usage.jsonl`, one
+row per LLM call as it happens, dispatched sub-agents included), so its Usage page and
+run views show a running run's tokens and cost live.
 
 Breakdowns support:
 
