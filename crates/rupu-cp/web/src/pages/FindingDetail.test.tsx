@@ -33,6 +33,8 @@ function base(over: Partial<Detail>): Detail {
     codename: 'amber-delta/heron',
     codename_derived: false,
     evidence_status: [],
+    tag_history: [],
+    tags_editable: true,
     ...over,
   };
 }
