@@ -100,6 +100,19 @@ fn no_redirect() -> reqwest::Client {
         .unwrap()
 }
 
+/// Sign in the way a browser does (`/?token=`) and return the `name=value`
+/// cookie pair the server set.
+async fn signed_in_cookie(addr: std::net::SocketAddr, token: &str) -> String {
+    let resp = no_redirect()
+        .get(format!("http://{addr}/?token={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 303);
+    let set = resp.headers()["set-cookie"].to_str().unwrap();
+    set.split(';').next().unwrap().to_string()
+}
+
 #[tokio::test]
 async fn unauthorized_uses_the_error_envelope() {
     let addr = spawn(Some("secret123".to_string())).await;
@@ -127,9 +140,11 @@ async fn token_query_bootstraps_a_cookie_and_drops_the_token() {
     let cookie = resp.headers()["set-cookie"].to_str().unwrap().to_string();
     let port = addr.port();
     assert!(
-        cookie.starts_with(&format!("rupu_cp_token_{port}=secret123;")),
+        cookie.starts_with(&format!("rupu_cp_token_{port}=")),
         "{cookie}"
     );
+    // The cookie carries a value derived from the token, never the token.
+    assert!(!cookie.contains("secret123"), "{cookie}");
     for attr in ["HttpOnly", "SameSite=Strict", "Path=/"] {
         assert!(cookie.contains(attr), "{cookie} lacks {attr}");
     }
@@ -140,6 +155,15 @@ async fn token_query_bootstraps_a_cookie_and_drops_the_token() {
         .send()
         .await
         .unwrap();
+    assert_eq!(resp.headers()["location"], "/");
+
+    // A protocol-relative path never becomes an off-site redirect.
+    let resp = no_redirect()
+        .get(format!("http://{addr}//evil.example/?token=secret123"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 303);
     assert_eq!(resp.headers()["location"], "/");
 }
 
@@ -158,7 +182,8 @@ async fn wrong_bootstrap_token_is_refused_without_a_cookie() {
 #[tokio::test]
 async fn cookie_authenticates_api_and_sse_reads() {
     let addr = spawn(Some("secret123".to_string())).await;
-    let cookie = format!("rupu_cp_token_{}=secret123", addr.port());
+    let cookie = signed_in_cookie(addr, "secret123").await;
+    let value = cookie.split_once('=').unwrap().1.to_string();
     let client = no_redirect();
     let resp = client
         .get(format!("http://{addr}/api/dashboard"))
@@ -181,10 +206,12 @@ async fn cookie_authenticates_api_and_sse_reads() {
         .unwrap()
         .starts_with("text/event-stream"));
 
-    // Wrong value, or the cookie of a control plane on another port → 401.
+    // Wrong value, the raw token as a cookie, or the cookie of a control
+    // plane on another port → 401.
     for bad in [
         format!("rupu_cp_token_{}=nope", addr.port()),
-        "rupu_cp_token_1=secret123".to_string(),
+        format!("rupu_cp_token_{}=secret123", addr.port()),
+        format!("rupu_cp_token_1={value}"),
     ] {
         let resp = client
             .get(format!("http://{addr}/api/dashboard"))
@@ -194,12 +221,21 @@ async fn cookie_authenticates_api_and_sse_reads() {
             .unwrap();
         assert_eq!(resp.status(), 401);
     }
+
+    // The cookie value is no bearer token.
+    let resp = client
+        .get(format!("http://{addr}/api/dashboard"))
+        .header("Authorization", format!("Bearer {value}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
 }
 
 #[tokio::test]
 async fn cookie_writes_need_a_same_origin_origin() {
     let addr = spawn(Some("secret123".to_string())).await;
-    let cookie = format!("rupu_cp_token_{}=secret123", addr.port());
+    let cookie = signed_in_cookie(addr, "secret123").await;
     let url = format!("http://{addr}/api/runs/run_missing/cancel");
     let client = no_redirect();
 

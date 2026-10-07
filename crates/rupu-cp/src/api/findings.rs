@@ -516,13 +516,27 @@ pub struct TagAcrossResult {
 /// Apply `change` to findings wherever they live: ids are grouped by the
 /// registered workspace holding them and `rupu_coverage::apply` runs once
 /// per workspace (spec "Batches that span workspaces"). An id found in two
-/// distinct workspace paths is tagged in both. Used by `rupu findings tag`
-/// and, in Plan 2, `POST /api/findings/tags`.
+/// distinct workspace paths is tagged in both — unless `only` names the
+/// workspace each id means: then an id is tagged only in the workspaces
+/// paired with it there (ids repeat across workspaces; the CP's detail page
+/// and bulk tagging send `(ws_id, id)` pairs so one finding's tag never lands
+/// on its namesake elsewhere). A pair naming a workspace that does not hold
+/// the id reports the id as unknown. Used by `rupu findings tag` and
+/// `POST /api/findings/tags`.
 pub fn tag_findings_across(
     global_dir: &std::path::Path,
     change: &rupu_coverage::TagChange,
     by: &rupu_coverage::TagActor,
+    only: Option<&[FindingTarget]>,
 ) -> Result<TagAcrossResult, rupu_coverage::TagError> {
+    // finding id → the workspaces `only` allows it in.
+    let allowed: Option<HashMap<&str, Vec<&str>>> = only.map(|pairs| {
+        let mut m: HashMap<&str, Vec<&str>> = HashMap::new();
+        for t in pairs {
+            m.entry(t.id.trim()).or_default().push(t.ws_id.as_str());
+        }
+        m
+    });
     change.check()?;
     // finding id → each (ws_id, workspace path) holding it, once per path.
     let mut homes: HashMap<String, Vec<(String, std::path::PathBuf)>> = HashMap::new();
@@ -547,14 +561,27 @@ pub fn tag_findings_across(
         if id.is_empty() {
             continue;
         }
-        match homes.get(id) {
-            Some(hs) => {
-                for h in hs {
-                    by_ws.entry(h.clone()).or_default().push(id.to_string());
-                }
+        let hs: Vec<&(String, std::path::PathBuf)> = homes
+            .get(id)
+            .into_iter()
+            .flatten()
+            .filter(|(ws, _)| {
+                allowed
+                    .as_ref()
+                    .is_none_or(|a| a.get(id).is_some_and(|w| w.contains(&ws.as_str())))
+            })
+            .collect();
+        if hs.is_empty() {
+            if !out.unknown.iter().any(|u| u == id) {
+                out.unknown.push(id.to_string());
             }
-            None if !out.unknown.iter().any(|u| u == id) => out.unknown.push(id.to_string()),
-            None => {}
+            continue;
+        }
+        for h in hs {
+            let ids = by_ws.entry(h.clone()).or_default();
+            if !ids.iter().any(|i| i == id) {
+                ids.push(id.to_string());
+            }
         }
     }
     for ((ws_id, path), ids) in by_ws {
@@ -804,30 +831,73 @@ async fn list_findings(
 /// At most this many findings per `POST /api/findings/tags`.
 const MAX_TAG_BATCH: usize = 1000;
 
-/// `POST /api/findings/tags` — add/remove tags on findings wherever they
-/// live (`tag_findings_across`: atomic per workspace, results per workspace),
+/// One finding, named by its workspace and id (ids repeat across
+/// workspaces).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FindingTarget {
+    pub ws_id: String,
+    pub id: String,
+}
+
+/// Body of `POST /api/findings/tags`: the findings as bare `finding_ids`
+/// (tagged in every workspace that holds them) or as `findings` —
+/// `{ws_id, id}` pairs, tagged only there. Exactly one of the two.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TagFindingsBody {
+    #[serde(default)]
+    finding_ids: Vec<String>,
+    #[serde(default)]
+    findings: Vec<FindingTarget>,
+    #[serde(default)]
+    add: Vec<String>,
+    #[serde(default)]
+    remove: Vec<String>,
+}
+
+/// `POST /api/findings/tags` — add/remove tags on findings
+/// (`tag_findings_across`: atomic per workspace, results per workspace),
 /// attributed to the CP operator.
 async fn tag_findings(
     State(s): State<AppState>,
-    Json(body): Json<rupu_coverage::TagChangeInput>,
+    Json(body): Json<TagFindingsBody>,
 ) -> ApiResult<Json<TagAcrossResult>> {
-    if body.finding_ids.len() > MAX_TAG_BATCH {
+    let (ids, only) = match (body.finding_ids.is_empty(), body.findings.is_empty()) {
+        (false, true) => (body.finding_ids, None),
+        (true, false) => (
+            body.findings.iter().map(|t| t.id.clone()).collect(),
+            Some(body.findings),
+        ),
+        _ => {
+            return Err(ApiError::bad_request(
+                "give exactly one of `finding_ids` or `findings`",
+            ))
+        }
+    };
+    if ids.len() > MAX_TAG_BATCH {
         return Err(ApiError::bad_request(format!(
             "at most {MAX_TAG_BATCH} findings per change"
         )));
     }
-    let change = body
-        .into_change()
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let change = rupu_coverage::TagChangeInput {
+        finding_ids: ids,
+        add: body.add,
+        remove: body.remove,
+    }
+    .into_change()
+    .map_err(|e| ApiError::bad_request(e.to_string()))?;
     change
         .check()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     let global = s.global_dir.clone();
     let by = rupu_coverage::TagActor::operator(rupu_coverage::OperatorSurface::Cp);
-    let result = tokio::task::spawn_blocking(move || tag_findings_across(&global, &change, &by))
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let result = tokio::task::spawn_blocking(move || {
+        tag_findings_across(&global, &change, &by, only.as_deref())
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?
+    .map_err(|e| ApiError::bad_request(e.to_string()))?;
     if result.workspaces.is_empty() {
         return Err(ApiError::not_found(format!(
             "unknown finding id(s): {}",

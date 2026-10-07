@@ -249,26 +249,29 @@ export default function Findings({ customer: fixedCustomer }: { customer?: strin
     const forQ = q;
     const forCustomer = customer;
     const rows = selectedRows;
-    const ids = [...new Set(rows.map((f) => f.id))];
+    // Each finding by (workspace, id): ids repeat across workspaces, and a
+    // tag must land only on the rows ticked.
+    const targets = [...new Map(rows.map((f) => [`${f.ws_id}\u0000${f.id}`, { ws_id: f.ws_id, id: f.id }])).values()];
     const change = mode === 'add' ? { add: [tag] } : { remove: [tag] };
     const results: TagAcrossResult[] = [];
     const sent = new Set<string>();
+    const keyOf = (t: { ws_id: string; id: string }) => `${t.ws_id}\u0000${t.id}`;
     let stopped: { error: string; left: number } | null = null;
-    for (let i = 0; i < ids.length; i += MAX_TAG_BATCH) {
-      const batch = ids.slice(i, i + MAX_TAG_BATCH);
+    for (let i = 0; i < targets.length; i += MAX_TAG_BATCH) {
+      const batch = targets.slice(i, i + MAX_TAG_BATCH);
       try {
         results.push(await api.tagFindings(batch, change));
       } catch (e: unknown) {
         if (e instanceof ApiError && e.status === 404) {
-          results.push({ workspaces: [], unknown: batch });
-          for (const id of batch) sent.add(id);
+          results.push({ workspaces: [], unknown: batch.map((t) => t.id) });
+          for (const t of batch) sent.add(keyOf(t));
           continue;
         }
         if (results.length === 0) throw e;
-        stopped = { error: apiErrorMessage(e), left: ids.length - i };
+        stopped = { error: apiErrorMessage(e), left: targets.length - i };
         break;
       }
-      for (const id of batch) sent.add(id);
+      for (const t of batch) sent.add(keyOf(t));
     }
     const merged = summarizeTagResult(mergeTagResults(results), mode, projectOf);
     const summary = stopped
@@ -277,7 +280,7 @@ export default function Findings({ customer: fixedCustomer }: { customer?: strin
           ok: false,
         }
       : merged;
-    const sentKeys = new Set(rows.filter((f) => sent.has(f.id)).map(rowKey));
+    const sentKeys = new Set(rows.filter((f) => sent.has(keyOf(f))).map(rowKey));
     if (currentQ.current === forQ && currentCustomer.current === forCustomer) setBulkNote(summary);
     setSelected((prev) => new Set([...prev].filter((k) => !sentKeys.has(k))));
     setReload((n) => n + 1);

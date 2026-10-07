@@ -19,8 +19,15 @@
 //!
 //! The cookie name carries the port from the `Host` header, so two control
 //! planes on one machine (cookies ignore ports) never overwrite each other's.
-//! Every comparison is constant-time. Without `--token` none of this is
-//! installed and the API is open.
+//! Its value is not the token but `HMAC-SHA256(token, "rupu-cp-browser")`
+//! (base64url): browsers send cookies to every port on a host, so another
+//! local server could read the cookie — it then holds a browser credential
+//! for this control plane, never the bearer token itself (the cookie value
+//! is refused as a bearer). Every comparison is constant-time. Without
+//! `--token` none of this is installed and the API is open.
+//!
+//! Behind a reverse proxy, keep the `Host` header (`proxy_set_header Host
+//! $host`): the cookie name and the same-origin check both read it.
 
 use crate::error::ApiError;
 use axum::{
@@ -45,16 +52,26 @@ pub const TOKEN_COOKIE_PREFIX: &str = "rupu_cp_token";
 /// stale cookie until the operator opens the printed link again.
 const COOKIE_MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
 
-/// The configured token plus its cookie encoding (computed once).
+/// The configured token plus the browser cookie value derived from it
+/// (computed once).
 #[derive(Debug)]
 pub struct Token {
     raw: String,
     cookie_value: String,
 }
 
+/// The HMAC message the cookie value is derived with.
+const COOKIE_CONTEXT: &[u8] = b"rupu-cp-browser";
+
 impl Token {
     pub fn new(raw: String) -> Arc<Self> {
-        let cookie_value = url::form_urlencoded::byte_serialize(raw.as_bytes()).collect();
+        use base64::Engine as _;
+        use hmac::Mac as _;
+        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(raw.as_bytes())
+            .expect("HMAC takes a key of any length");
+        mac.update(COOKIE_CONTEXT);
+        let cookie_value =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
         Arc::new(Self { raw, cookie_value })
     }
 
@@ -182,6 +199,13 @@ pub async fn bootstrap_cookie(
         )
             .into_response();
     }
+    // Never a protocol-relative (`//host`, `/\\host`) target: the redirect
+    // stays on this server.
+    let path = if path.starts_with("//") || path.starts_with("/\\") {
+        "/"
+    } else {
+        path.as_str()
+    };
     let location = if rest.is_empty() {
         path.to_string()
     } else {
@@ -241,11 +265,19 @@ mod tests {
     }
 
     #[test]
-    fn cookie_encoding_survives_awkward_tokens() {
+    fn the_cookie_is_derived_from_the_token_never_the_token() {
         let t = Token::new("a b;c=d".into());
-        assert_eq!(t.cookie_value, "a+b%3Bc%3Dd");
-        assert!(t.matches_cookie("a+b%3Bc%3Dd"));
+        // Cookie-safe (base64url), deterministic, and not the token.
+        assert!(t
+            .cookie_value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+        assert_eq!(t.cookie_value, Token::new("a b;c=d".into()).cookie_value);
+        assert_ne!(t.cookie_value, Token::new("other".into()).cookie_value);
+        assert!(t.matches_cookie(&t.cookie_value.clone()));
         assert!(!t.matches_cookie("a b;c=d"));
+        // …and it is no bearer.
+        assert!(!t.matches(&t.cookie_value.clone()));
     }
 
     #[test]

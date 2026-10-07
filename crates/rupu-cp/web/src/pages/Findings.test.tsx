@@ -434,7 +434,7 @@ describe('Findings — bulk tagging', () => {
     fireEvent.change(input, { target: { value: 'triaged' } });
     fireEvent.keyDown(input, { key: 'Enter' });
 
-    await waitFor(() => expect(tag).toHaveBeenCalledWith(['fa'], { add: ['triaged'] }));
+    await waitFor(() => expect(tag).toHaveBeenCalledWith([{ ws_id: A.ws_id, id: 'fa' }], { add: ['triaged'] }));
     await waitFor(() => expect(get).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(screen.queryByText('1 selected')).toBeNull());
     expect(screen.getByRole('status')).toHaveTextContent('Tagged 1 finding.');
@@ -473,7 +473,8 @@ describe('Findings — bulk tagging', () => {
     // f1000 was deleted since the list loaded: the server answers its batch,
     // where every id is unknown, with a 404.
     const gone = JSON.stringify({ error: 'unknown finding id(s): f1000' });
-    const tag = vi.spyOn(api, 'tagFindings').mockImplementation(async (ids: string[]) => {
+    const tag = vi.spyOn(api, 'tagFindings').mockImplementation(async (targets) => {
+      const ids = targets.map((t) => t.id);
       if (ids.includes('f1000')) throw new ApiError(404, gone, gone);
       return {
         workspaces: [{ ws_id: 'ws-1', outcomes: ids.map((id) => ({ finding_id: id, before: [], after: ['triaged'] })) }],
@@ -489,7 +490,7 @@ describe('Findings — bulk tagging', () => {
 
     await waitFor(() => expect(tag).toHaveBeenCalledTimes(2));
     expect(tag.mock.calls[0][0]).toHaveLength(1000);
-    expect(tag.mock.calls[1][0]).toEqual(['f1000']);
+    expect(tag.mock.calls[1][0]).toEqual([{ ws_id: FINDING.ws_id, id: 'f1000' }]);
     expect(await screen.findByRole('alert')).toHaveTextContent('Tagged 1000 findings. 1 finding no longer exists.');
   }, 30000);
 
@@ -497,8 +498,8 @@ describe('Findings — bulk tagging', () => {
     const rows = Array.from({ length: 1001 }, (_, i): FindingOut => ({ ...FINDING, id: `f${i}`, summary: `Issue ${i}` }));
     vi.spyOn(api, 'getFindings').mockResolvedValue(resp(rows));
     const tag = vi.spyOn(api, 'tagFindings')
-      .mockImplementationOnce(async (ids: string[]) => ({
-        workspaces: [{ ws_id: 'ws-1', outcomes: ids.map((id) => ({ finding_id: id, before: [], after: ['triaged'] })) }],
+      .mockImplementationOnce(async (targets) => ({
+        workspaces: [{ ws_id: 'ws-1', outcomes: targets.map((t) => ({ finding_id: t.id, before: [], after: ['triaged'] })) }],
         unknown: [],
       }))
       .mockRejectedValueOnce(new Error('server went away'));
@@ -516,6 +517,18 @@ describe('Findings — bulk tagging', () => {
     expect(screen.getByText('1 selected')).toBeInTheDocument();
     expect(screen.getByRole('checkbox', { name: 'Select f1000' })).toBeChecked();
   }, 30000);
+
+  it('tags only the ticked finding when its id also exists in another workspace', async () => {
+    const here: FindingOut = { ...FINDING, id: 'fdup', ws_id: 'ws-1', summary: 'Dup here' };
+    const there: FindingOut = { ...FINDING, id: 'fdup', ws_id: 'ws-2', summary: 'Dup there' };
+    vi.spyOn(api, 'getFindings').mockResolvedValue(resp([here, there]));
+    const tag = vi.spyOn(api, 'tagFindings').mockResolvedValue(outcome('fdup'));
+    renderPage();
+    await waitFor(() => expect(screen.getByText('Dup here')).toBeInTheDocument());
+    fireEvent.click(screen.getAllByRole('checkbox', { name: 'Select fdup' })[0]);
+    tagSelected('triaged');
+    await waitFor(() => expect(tag).toHaveBeenCalledWith([{ ws_id: 'ws-1', id: 'fdup' }], { add: ['triaged'] }));
+  });
 
   it("never shows a bulk result from an earlier query on the next one's list", async () => {
     vi.spyOn(api, 'getFindings').mockResolvedValue(resp([A, B]));
@@ -584,7 +597,7 @@ describe('Findings — bulk tagging', () => {
     expect(screen.getByText('1 selected')).toBeInTheDocument();
     tagSelected('triaged');
     await waitFor(() => expect(tag).toHaveBeenCalledTimes(2));
-    expect(tag.mock.calls[1][0]).toEqual(['fc']);
+    expect(tag.mock.calls[1][0]).toEqual([{ ws_id: 'ws-1', id: 'fc' }]);
   });
 
   it('disables the checkbox of a finding whose workspace tags are unreadable', async () => {

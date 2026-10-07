@@ -340,7 +340,7 @@ describe('FindingDetail page', () => {
       expect(await screen.findByText('needs-poc')).toBeInTheDocument();
       fireEvent.click(screen.getByRole('button', { name: 'Remove tag needs-poc' }));
 
-      await waitFor(() => expect(tag).toHaveBeenCalledWith(['fnd_1'], { remove: ['needs-poc'] }));
+      await waitFor(() => expect(tag).toHaveBeenCalledWith([{ ws_id: 'ws1', id: 'fnd_1' }], { remove: ['needs-poc'] }));
       await waitFor(() => expect(get).toHaveBeenCalledTimes(2));
     });
 

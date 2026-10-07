@@ -786,4 +786,55 @@ async fn an_id_two_workspaces_share_needs_ws_id() {
     // A ws_id that holds no such finding is a plain 404.
     let resp = get("/api/findings/fnd_dup?ws_id=ws_zz".into()).await;
     assert_eq!(resp.status(), 404);
+
+    // Tagging by (ws_id, id) lands on that workspace's finding only.
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{addr}/api/findings/tags"))
+        .json(&serde_json::json!({
+            "findings": [{ "ws_id": "ws_a", "id": "fnd_dup" }],
+            "add": ["triaged"],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let tags_of = |ws: &'static str| {
+        async move {
+            let v: serde_json::Value = get(format!("/api/findings/fnd_dup?ws_id={ws}"))
+                .await
+                .json()
+                .await
+                .unwrap();
+            v["tags"].clone()
+        }
+    };
+    assert_eq!(tags_of("ws_a").await, serde_json::json!(["triaged"]));
+    // An empty tag list is omitted from the record.
+    let b = tags_of("ws_b").await;
+    assert!(b.as_array().is_none_or(|a| a.is_empty()), "{b}");
+
+    // A pair whose workspace lacks the id is unknown; both shapes at once is
+    // a 400.
+    let resp = client
+        .post(format!("http://{addr}/api/findings/tags"))
+        .json(&serde_json::json!({
+            "findings": [{ "ws_id": "ws_zz", "id": "fnd_dup" }],
+            "add": ["triaged"],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let resp = client
+        .post(format!("http://{addr}/api/findings/tags"))
+        .json(&serde_json::json!({
+            "finding_ids": ["fnd_dup"],
+            "findings": [{ "ws_id": "ws_a", "id": "fnd_dup" }],
+            "add": ["triaged"],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
 }

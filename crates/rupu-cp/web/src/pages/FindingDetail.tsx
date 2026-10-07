@@ -156,7 +156,7 @@ function FindingTags({
     return () => { live = false; };
   }, [detail.ws_id]);
   const change = async (mode: 'add' | 'remove', tag: string): Promise<TagChangeReport> => {
-    const r = await api.tagFindings([detail.id], mode === 'add' ? { add: [tag] } : { remove: [tag] });
+    const r = await api.tagFindings([{ ws_id: detail.ws_id, id: detail.id }], mode === 'add' ? { add: [tag] } : { remove: [tag] });
     const s = summarizeTagResult(r, mode, (ws) => (ws === detail.ws_id && detail.project) || ws);
     const changed = changedOutcomes(r);
     if (changed.length === 0) {

@@ -3324,10 +3324,16 @@ export const api = {
   getFinding(id: string, wsId?: string | null): Promise<FindingDetail> {
     return request<FindingDetail>(`/api/findings/${encodeURIComponent(id)}${wsQuery(wsId, '?')}`);
   },
-  tagFindings(findingIds: string[], change: { add?: string[]; remove?: string[] }): Promise<TagAcrossResult> {
+  /** Tag findings named by `(ws_id, id)`: finding ids repeat across
+   *  workspaces, so the change lands only on the findings meant. */
+  tagFindings(findings: FindingTarget[], change: { add?: string[]; remove?: string[] }): Promise<TagAcrossResult> {
     return request<TagAcrossResult>('/api/findings/tags', {
       method: 'POST',
-      body: JSON.stringify({ finding_ids: findingIds, add: change.add ?? [], remove: change.remove ?? [] }),
+      body: JSON.stringify({
+        findings: findings.map((f) => ({ ws_id: f.ws_id, id: f.id })),
+        add: change.add ?? [],
+        remove: change.remove ?? [],
+      }),
     });
   },
   getTagsInUse(opts?: { wsId?: string }): Promise<TagCount[]> {
@@ -3702,6 +3708,12 @@ export const api = {
 /** `?ws_id=` (or `&ws_id=`) for the finding-id routes, or `''`. */
 function wsQuery(wsId: string | null | undefined, sep: '?' | '&'): string {
   return wsId ? `${sep}ws_id=${encodeURIComponent(wsId)}` : '';
+}
+
+/** One finding by workspace + id (`POST /api/findings/tags`'s `findings`). */
+export interface FindingTarget {
+  ws_id: string;
+  id: string;
 }
 
 export function findingArtifactUrl(id: string, sha256: string, wsId?: string | null): string {

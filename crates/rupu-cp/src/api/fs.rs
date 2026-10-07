@@ -45,16 +45,35 @@ pub(crate) enum BrowseError {
 /// must lie under one of `roots` (canonical paths). `parent` is `None` at a
 /// root, so the picker cannot walk above it. Pure + testable.
 pub(crate) fn browse_dir(path: &str, roots: &[PathBuf]) -> Result<BrowseResult, BrowseError> {
-    let p = FsPath::new(path)
-        .canonicalize()
-        .map_err(|e| BrowseError::Bad(format!("{path}: {e}")))?;
     let within = |q: &FsPath| roots.iter().any(|r| q.starts_with(r));
-    if !within(&p) {
-        return Err(BrowseError::OutsideRoots(format!(
+    let outside = |shown: &FsPath| {
+        BrowseError::OutsideRoots(format!(
             "{} is outside the browsable directories (your home directory and \
              registered projects)",
-            p.display()
-        )));
+            shown.display()
+        ))
+    };
+    let raw = FsPath::new(path);
+    let p = match raw.canonicalize() {
+        Ok(p) => p,
+        // A path that does not resolve is only "missing" (400) when it is
+        // plainly under a root; anywhere else it is the same 403 an existing
+        // path gets, so the answer never says what exists outside the roots.
+        Err(e) => {
+            let lexically_within = raw.is_absolute()
+                && !raw
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+                && within(raw);
+            return Err(if lexically_within {
+                BrowseError::Bad(format!("{path}: {e}"))
+            } else {
+                outside(raw)
+            });
+        }
+    };
+    if !within(&p) {
+        return Err(outside(&p));
     }
     if !p.is_dir() {
         return Err(BrowseError::Bad(format!(
@@ -158,6 +177,19 @@ mod tests {
             browse_dir("/no/such/dir/xyz", &roots),
             Err(BrowseError::Bad(_))
         ));
+    }
+
+    #[test]
+    fn a_missing_path_outside_the_roots_reads_like_an_existing_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let roots = vec![root.join("proj")];
+        for p in ["/no/such/dir/xyz", "/etc"] {
+            assert!(
+                matches!(browse_dir(p, &roots), Err(BrowseError::OutsideRoots(_))),
+                "{p}"
+            );
+        }
     }
 
     #[test]

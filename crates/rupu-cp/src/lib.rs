@@ -337,7 +337,9 @@ pub async fn serve_on(listener: tokio::net::TcpListener, opts: ServeOpts) -> any
     };
     // Always surface the URL prominently — independent of RUST_LOG / tracing.
     println!("\n  ➜  rupu Control Plane  →  {url}\n");
-    info!("rupu cp serving on {url}");
+    // The log gets the URL without the token: tracing sinks outlive the
+    // terminal.
+    info!("rupu cp serving on {}", click_url(addr));
 
     // Auto-open only when interactive (a real terminal), so headless / scripted
     // / supervised runs don't spawn a surprise browser. `--no-open` forces off.

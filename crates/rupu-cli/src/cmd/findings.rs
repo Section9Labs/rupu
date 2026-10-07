@@ -374,7 +374,7 @@ fn tag_cmd(args: &TagArgs, json: bool) -> anyhow::Result<()> {
     };
     let global = crate::paths::global_dir()?;
     let by = rupu_coverage::TagActor::operator(rupu_coverage::OperatorSurface::Cli);
-    let result = cp_findings::tag_findings_across(&global, &change, &by)?;
+    let result = cp_findings::tag_findings_across(&global, &change, &by, None)?;
     if json {
         crate::output::formats::print_json(&result)?;
     } else {

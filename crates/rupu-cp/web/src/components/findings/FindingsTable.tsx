@@ -264,7 +264,7 @@ export function FindingsTable({
       selection={selection}
       renderDetail={(f) =>
         f.profile === 'full' && f.report_summary ? (
-          <TriageCard finding={f} />
+          <TriageCard finding={f} wsId={(f as FindingOut).ws_id ?? wsId} />
         ) : (
           <FindingEvidence finding={f} />
         )
