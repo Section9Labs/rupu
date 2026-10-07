@@ -160,7 +160,11 @@ describe('AppRoutes shell branch', () => {
     'v1: %s is routed (not redirected, not a 404)',
     async (path) => {
       renderApp('v1', path);
-      await waitFor(() => expect(screen.getByRole('heading', { level: 1 })).toBeInTheDocument());
+      // The customers pages are lazy chunks: a cold import under full-suite
+      // load can outlast waitFor's 1s default.
+      await waitFor(() => expect(screen.getByRole('heading', { level: 1 })).toBeInTheDocument(), {
+        timeout: 5000,
+      });
       expect(screen.getByTestId('loc')).toHaveTextContent(path);
     },
   );
@@ -169,7 +173,11 @@ describe('AppRoutes shell branch', () => {
     'v2: %s is routed (not redirected, not a 404)',
     async (path) => {
       renderApp('v2', path);
-      await waitFor(() => expect(screen.getByRole('heading', { level: 1 })).toBeInTheDocument());
+      // The customers pages are lazy chunks: a cold import under full-suite
+      // load can outlast waitFor's 1s default.
+      await waitFor(() => expect(screen.getByRole('heading', { level: 1 })).toBeInTheDocument(), {
+        timeout: 5000,
+      });
       expect(screen.getByTestId('loc')).toHaveTextContent(path);
     },
   );
