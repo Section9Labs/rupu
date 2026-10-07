@@ -3,6 +3,7 @@ import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import Layout from './components/Layout';
 import { Spinner } from './components/ui/Spinner';
+import { CustomerScopeProvider } from './lib/customerScope';
 import { getShell, type ShellVersion } from './lib/shell';
 
 // All page-level routes are lazy-loaded so each page lands in its own chunk
@@ -140,9 +141,11 @@ export default function App() {
   const shell = getShell();
   return (
     <BrowserRouter>
-      <ErrorBoundary>
-        <AppRoutes shell={shell} />
-      </ErrorBoundary>
+      <CustomerScopeProvider>
+        <ErrorBoundary>
+          <AppRoutes shell={shell} />
+        </ErrorBoundary>
+      </CustomerScopeProvider>
     </BrowserRouter>
   );
 }
