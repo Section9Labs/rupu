@@ -183,6 +183,48 @@ describe('Customers page', () => {
     expect(within(tile('findings')).getByText('across 1 customer')).toBeInTheDocument();
   });
 
+  it('says the cost total excludes a customer whose usage is unpriced', async () => {
+    const UNPRICED = row({
+      slug: 'globex',
+      name: 'Globex',
+      rollup: {
+        projects: 1,
+        run_count: 6,
+        usage: { ...USAGE, cost_usd: null, priced: false, runs: 6 },
+        findings_open: 0,
+        last_active: null,
+      },
+    });
+    getCustomers.mockResolvedValue([ACME, UNPRICED]);
+    mount();
+    await screen.findByText('Acme Corp');
+    const cost = screen.getByTestId('tile-cost');
+    expect(within(cost).getByText('$30.00')).toBeInTheDocument();
+    expect(within(cost).getByText('excludes unpriced usage from Globex')).toBeInTheDocument();
+    expect(within(cost).queryByText(/% from/)).toBeNull();
+  });
+
+  it('counts the customers when several have unpriced usage', async () => {
+    const mk = (slug: string, name: string) =>
+      row({
+        slug,
+        name,
+        rollup: {
+          projects: 1,
+          run_count: 2,
+          usage: { ...USAGE, cost_usd: 5, priced: true, partial: true, runs: 2 },
+          findings_open: 0,
+          last_active: null,
+        },
+      });
+    getCustomers.mockResolvedValue([ACME, mk('a', 'Aaa'), mk('b', 'Bbb')]);
+    mount();
+    await screen.findByText('Acme Corp');
+    expect(
+      within(screen.getByTestId('tile-cost')).getByText('excludes unpriced usage from 2 customers'),
+    ).toBeInTheDocument();
+  });
+
   it('status views are derived from one list: no refetch, archived count on Active', async () => {
     const OLD = row({ slug: 'old', name: 'Old Co', archived: true });
     getCustomers.mockResolvedValue([ACME, OLD]);

@@ -233,11 +233,16 @@ export default function Customers() {
     const totalCost = scoped.reduce((s, r) => s + costOf(r), 0);
     const top = scoped.reduce<CustomerRow | null>((t, r) => (t === null || costOf(r) > costOf(t) ? r : t), null);
     const anyCost = scoped.some((r) => r.rollup.usage.cost_usd !== null);
+    // Customers whose spend is missing or partial: their cost is left out of (or
+    // only partly in) the headline total, which has to say so.
+    const unpriced = scoped.filter(
+      (r) => r.rollup.usage.runs > 0 && (!r.rollup.usage.priced || r.rollup.usage.partial === true),
+    );
     const priceError = scoped.find((r) => r.rollup.usage.pricing_error)?.rollup.usage.pricing_error;
     const withFindings = scoped.filter((r) => r.rollup.findings_open > 0).length;
     const findings = scoped.reduce((s, r) => s + r.rollup.findings_open, 0);
     const hosts = [...new Set(scoped.flatMap((r) => r.rollup.hosts_without_customer ?? []))].sort();
-    return { totalCost, top, anyCost, priceError, withFindings, findings, hosts };
+    return { totalCost, top, anyCost, unpriced, priceError, withFindings, findings, hosts };
   }, [scoped]);
 
   // null `customer` = no customer; an ABSENT key can't say, so it is neither.
@@ -245,6 +250,14 @@ export default function Customers() {
   const unassigned = projects?.filter((p) => p.customer === null).length ?? 0;
   const topShare =
     stats.top && stats.totalCost > 0 ? Math.round((costOf(stats.top) / stats.totalCost) * 100) : null;
+  const costSub =
+    stats.unpriced.length > 0
+      ? `excludes unpriced usage from ${
+          stats.unpriced.length === 1 ? stats.unpriced[0].name : `${stats.unpriced.length} customers`
+        }`
+      : topShare !== null && stats.top
+        ? `${topShare}% from ${stats.top.name}`
+        : undefined;
   const rangeLabel = range === 'all' ? 'all time' : range;
 
   function closeDialog() {
@@ -327,7 +340,8 @@ export default function Customers() {
                   <PricingErrorMark error={stats.priceError} />
                 </span>
               }
-              sub={topShare !== null && stats.top ? `${topShare}% from ${stats.top.name}` : undefined}
+              sub={costSub}
+              subTone={stats.unpriced.length > 0 ? 'warn' : undefined}
             />
             <Tile
               id="findings"
