@@ -89,6 +89,10 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
   const { wsId } = useParams<{ wsId: string }>();
   const navigate = useNavigate();
   const [detail, setDetail] = useState<ProjectDetailType | null>(null);
+  // Bumped when the header assigns / unassigns the project's customer: the
+  // Config tab's provenance and locks come from that customer's layer, so it
+  // re-reads its view.
+  const [customerChanges, setCustomerChanges] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [notFound, setNotFound] = useState(false);
   /** assessed_pct fetched lazily in parallel — undefined = still loading,
@@ -203,9 +207,10 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
           <ProjectCustomerMenu
             wsId={p.ws_id}
             customer={p.customer}
-            onChange={(next) =>
-              setDetail((d) => (d ? { ...d, project: { ...d.project, customer: next } } : d))
-            }
+            onChange={(next) => {
+              setDetail((d) => (d ? { ...d, project: { ...d.project, customer: next } } : d));
+              setCustomerChanges((n) => n + 1);
+            }}
           />
         </div>
         <div className="mt-1.5 flex items-center flex-wrap gap-x-4 gap-y-1 text-note text-ink-dim">
@@ -355,7 +360,7 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
       {tab === 'sessions' && <ProjectSessionsTab wsId={p.ws_id} />}
       {tab === 'coverage' && <ProjectCoverageTab wsId={p.ws_id} />}
       {tab === 'network' && <ProjectNetworkTab wsId={p.ws_id} />}
-      {tab === 'config' && <ProjectConfigTab wsId={p.ws_id} />}
+      {tab === 'config' && <ProjectConfigTab wsId={p.ws_id} reloadKey={customerChanges} />}
     </div>
   );
 }

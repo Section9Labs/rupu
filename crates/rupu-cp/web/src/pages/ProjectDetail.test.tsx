@@ -322,6 +322,32 @@ describe('ProjectDetail — customer assignment in the header', () => {
     expect(await screen.findByRole('button', { name: /Customer: Acme/ })).toBeInTheDocument();
   });
 
+  it('assigning from the header re-reads an open Config tab under the new customer', async () => {
+    stubLoad(null);
+    let assigned = false;
+    vi.spyOn(api, 'getConfig').mockImplementation(async () =>
+      assigned
+        ? {
+            ...PROJECT_CONFIG,
+            effective: { ...PROJECT_CONFIG.effective, default_model: 'acme-model' },
+            provenance: { ...PROJECT_CONFIG.provenance, default_model: { source: 'customer', locked: false } },
+          }
+        : PROJECT_CONFIG,
+    );
+    vi.spyOn(api, 'assignProject').mockImplementation(async () => {
+      assigned = true;
+      return { ...DETAIL.project, customer: ACME_REF };
+    });
+    renderAt('/projects/x/config', 'config');
+    const model = (await screen.findByLabelText('Default model')) as HTMLInputElement;
+    expect(model.value).toBe('claude-sonnet-4-6');
+    fireEvent.click(screen.getByRole('button', { name: /No customer/ }));
+    fireEvent.click(await screen.findByRole('menuitemradio', { name: /Acme/ }));
+    await waitFor(() =>
+      expect((screen.getByLabelText('Default model') as HTMLInputElement).value).toBe('acme-model'),
+    );
+  });
+
   it('unassigns from the header', async () => {
     stubLoad(ACME_REF);
     const unassign = vi.spyOn(api, 'unassignProject').mockResolvedValue(undefined);

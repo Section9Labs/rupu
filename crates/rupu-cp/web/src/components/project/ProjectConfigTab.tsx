@@ -17,7 +17,7 @@
 //  - The Raw tab edits `raw_project` (this workspace's own file), not the
 //    merged/global text.
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Cpu, DollarSign, FileCode, GitBranch, Server, SlidersHorizontal, Workflow } from 'lucide-react';
 import { api, ApiError, type ConfigView } from '../../lib/api';
 import { TabBar, TabButton } from '../TabBar';
@@ -27,7 +27,15 @@ import { getPath, GeneralTab, ProvidersTab, AutoflowTab, ScmTab, PricingTab, CpF
 
 type ProjectConfigSubTab = 'general' | 'providers' | 'autoflow' | 'scm' | 'pricing' | 'cp' | 'raw';
 
-export default function ProjectConfigTab({ wsId }: { wsId: string }) {
+export default function ProjectConfigTab({
+  wsId,
+  reloadKey,
+}: {
+  wsId: string;
+  /** Changing it re-reads the view (keeping staged edits) — e.g. after the
+   *  project's customer changed, which changes its provenance and locks. */
+  reloadKey?: unknown;
+}) {
   const [configView, setConfigView] = useState<ConfigView | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [pendingPatch, setPendingPatch] = useState<Record<string, unknown>>({});
@@ -64,6 +72,14 @@ export default function ProjectConfigTab({ wsId }: { wsId: string }) {
     // when the project itself changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wsId]);
+
+  const seenReloadKey = useRef(reloadKey);
+  useEffect(() => {
+    if (Object.is(seenReloadKey.current, reloadKey)) return;
+    seenReloadKey.current = reloadKey;
+    void reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reloadKey]);
 
   // Keys enforced by the GLOBAL policy lock — derived straight from
   // provenance (no local toggle state to keep in sync; this view can't set
