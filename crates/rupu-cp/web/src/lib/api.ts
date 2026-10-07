@@ -2339,7 +2339,6 @@ export const api = {
     until?: string;
     bucket?: 'day' | 'week';
     customer?: CustomerScope;
-    onHostsWithoutCustomer?: HostsWithoutCustomerSink;
   }): Promise<UsageTimelineBucket[]> {
     const q = new URLSearchParams();
     setCustomer(q, opts?.customer);
@@ -2347,11 +2346,7 @@ export const api = {
     if (opts?.until) q.set('until', opts.until);
     if (opts?.bucket) q.set('bucket', opts.bucket);
     const qs = q.toString();
-    return requestMaybeReportingHosts<UsageTimelineBucket[]>(
-      `/api/usage/timeline${qs ? `?${qs}` : ''}`,
-      undefined,
-      opts?.onHostsWithoutCustomer,
-    );
+    return request<UsageTimelineBucket[]>(`/api/usage/timeline${qs ? `?${qs}` : ''}`);
   },
   /**
    * Cost outliers — runs far above their workflow's own median. LOCAL-ONLY:

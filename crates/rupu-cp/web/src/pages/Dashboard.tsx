@@ -29,7 +29,8 @@
 // filters every host's summary; the header's `ScopeChip` names it and its ×
 // clears it. Under a filter, remote hosts can't be counted (their totals are
 // summed remotely) and some hosts can't tag every run with a customer — the
-// `HostsWithoutCustomerBanner` names both. A scope the backend rejects (400)
+// `HostsWithoutCustomerBanner` names both. The fleet counts are not
+// run-scoped, so an `UnscopedNote` says so. A scope the backend rejects (400)
 // is cleared with a notice.
 
 import { useMemo, useState } from 'react';
@@ -46,6 +47,7 @@ import type { DashboardRange } from '../lib/api';
 import { useScopedList } from '../lib/useScopedList';
 import { ScopeChip } from '../components/customers/ScopeChip';
 import { HostsWithoutCustomerBanner } from '../components/customers/HostsWithoutCustomerBanner';
+import { UnscopedNote } from '../components/customers/UnscopedNote';
 
 const RANGES: DashboardRange[] = ['7d', '30d', 'all'];
 
@@ -150,6 +152,7 @@ export default function Dashboard() {
 
           <CycleSummaryLine cycles={data.cycles} cyclesPartial={data.cycles_partial} />
 
+          <UnscopedNote>Fleet counts aren’t per customer.</UnscopedNote>
           <FleetStrip fleet={data.fleet} fleetPartial={data.fleet_partial} />
         </>
       ) : error ? (

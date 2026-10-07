@@ -779,9 +779,9 @@ describe('AutoflowRuns — the customer scope', () => {
         {withCustomerScope(<AutoflowRuns />)}
       </MemoryRouter>,
     );
-    expect(
-      await screen.findByText(/Autoflow runs, cycles and claims aren’t filtered by customer/),
-    ).toBeInTheDocument();
+    expect(await screen.findByRole('note')).toHaveTextContent(
+      'Autoflow runs can’t be filtered by customer — this list shows every customer’s runs, cycles and claims.',
+    );
     await waitFor(() => expect(callsFor(vi.mocked(api.getAutoflowEvents), 'local').length).toBeGreaterThan(0));
     expect(callsFor(vi.mocked(api.getAutoflowEvents), 'local')[0][0]).not.toHaveProperty('customer');
   });
@@ -790,6 +790,6 @@ describe('AutoflowRuns — the customer scope', () => {
     stubPage();
     renderPage();
     await waitFor(() => expect(callsFor(vi.mocked(api.getAutoflowEvents), 'local').length).toBeGreaterThan(0));
-    expect(screen.queryByText(/aren’t filtered by customer/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/can’t be filtered by customer/)).not.toBeInTheDocument();
   });
 });

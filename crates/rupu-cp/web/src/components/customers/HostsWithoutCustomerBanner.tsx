@@ -16,7 +16,9 @@
 // Unscoped requests never produce any of these, so the banner needs no scope
 // check of its own: it renders whenever a host qualifies, nothing otherwise.
 
+import { useEffect, useState } from 'react';
 import { AlertTriangle } from 'lucide-react';
+import { api } from '../../lib/api';
 import { cn } from '../../lib/cn';
 
 export interface BannerHost {
@@ -50,6 +52,31 @@ export function hostsLeftOut(
   }
   for (const id of without) unreportable.add(nameOf.get(id) ?? id);
   return { unreportable: [...unreportable].sort(), aggregate: [...aggregate].sort() };
+}
+
+/** Names for host ids on a page that holds no per-host state of its own (the
+ *  customer rollups carry ids only): the registered hosts, read once while
+ *  there are ids to name. Unknown ids — or an unreadable list — fall back to
+ *  the id in the banner. */
+export function useRegisteredHostNames(ids: readonly string[]): BannerHost[] {
+  const wanted = ids.length > 0;
+  const [hosts, setHosts] = useState<BannerHost[]>([]);
+  useEffect(() => {
+    if (!wanted) return;
+    let cancelled = false;
+    api.getRegisteredHosts().then(
+      (rows) => {
+        if (!cancelled) setHosts(rows.map((h) => ({ id: h.id, name: h.name, state: 'ok', reason: null })));
+      },
+      () => {
+        // Can't name them: the banner shows the ids.
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [wanted]);
+  return hosts;
 }
 
 export function HostsWithoutCustomerBanner({
@@ -91,4 +118,17 @@ export function HostsWithoutCustomerBanner({
       </div>
     </div>
   );
+}
+
+/** The banner for a source that names hosts by id only (the customer rollups'
+ *  `hosts_without_customer`): names come from the registered hosts. */
+export function RollupHostsWithoutCustomerBanner({
+  without,
+  className,
+}: {
+  without: readonly string[];
+  className?: string;
+}) {
+  const hosts = useRegisteredHostNames(without);
+  return <HostsWithoutCustomerBanner hosts={hosts} without={without} className={className} />;
 }

@@ -9,6 +9,7 @@ import SortableTable, { type Column } from '../components/lists/SortableTable';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
 import { Spinner } from '../components/ui/Spinner';
 import { SEVERITY_STYLE, type Severity } from '../lib/severity';
+import { UnscopedNote } from '../components/customers/UnscopedNote';
 
 // Severity columns, most → least severe.
 const SEV_COLS: Severity[] = ['critical', 'high', 'medium', 'low', 'info'];
@@ -47,6 +48,9 @@ export default function CoverageTemplates() {
           Bundled concern catalogs (OWASP, CWE, STRIDE, …).
         </p>
       </header>
+      <UnscopedNote className="mt-4">
+        Concern templates aren’t per customer — every customer shares this catalog.
+      </UnscopedNote>
 
       {error && <ErrorBanner className="mt-4">{error}</ErrorBanner>}
       {templates === null ? (

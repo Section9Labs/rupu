@@ -53,7 +53,7 @@ import { Spinner } from '../../components/ui/Spinner';
 import { CustomerDot } from '../../components/customers/CustomerDot';
 import { CustomerFormDialog } from '../../components/customers/CustomerFormDialog';
 import { PricingErrorMark } from '../../components/customers/PricingErrorMark';
-import { HostsWithoutCustomerBanner } from '../../components/customers/HostsWithoutCustomerBanner';
+import { RollupHostsWithoutCustomerBanner } from '../../components/customers/HostsWithoutCustomerBanner';
 import { AssignProjectDialog } from '../../components/customers/AssignProjectDialog';
 import { DialogFrame } from '../../components/customers/DialogFrame';
 import { CustomerRunsTab } from '../../components/customers/CustomerRunsTab';
@@ -356,7 +356,7 @@ export default function CustomerDetail() {
           />
           <BillsToTile account={detail.default_account} layerError={detail.layer_error} />
         </div>
-        <HostsWithoutCustomerBanner without={rollup.hosts_without_customer ?? []} />
+        <RollupHostsWithoutCustomerBanner without={rollup.hosts_without_customer ?? []} />
       </section>
 
       <div className="-mx-8">

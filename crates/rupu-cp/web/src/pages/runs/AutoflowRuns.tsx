@@ -22,8 +22,8 @@
 //
 // Customer scope (customers Plan 2B): the autoflow endpoints
 // (`/api/runs/autoflows{,/events}`, `/api/autoflows/claims`) take no customer
-// filter, so this page cannot narrow to one customer. While a scope is set it
-// says so in one line instead of passing it off as filtered.
+// filter, so this page cannot narrow to one customer. While a scope is set an
+// `UnscopedNote` says so instead of passing the list off as filtered.
 
 import { useCallback, useState } from 'react';
 import { Link } from 'react-router-dom';
@@ -56,8 +56,8 @@ import { durationBetween, relativeTime } from '../../lib/time';
 import { formatTokens, formatCost } from '../../lib/usage';
 import { formatDuration } from '../../lib/duration';
 import { shortId } from '../../lib/shortId';
-import { useCustomerParam } from '../../lib/customerScope';
 import { PricingErrorMark } from '../../components/customers/PricingErrorMark';
+import { UnscopedNote } from '../../components/customers/UnscopedNote';
 
 const MODE_CLS: Record<string, string> = {
   ask:       'bg-warn-bg text-warn ring-warn/30',
@@ -518,7 +518,6 @@ const VIEW_OPTIONS: SegmentedOption[] = [
 ];
 
 export default function AutoflowRuns() {
-  const customer = useCustomerParam();
   const [tab, setTab] = useState<Tab>('runs');
   // All hosts by default: local paints at once, each remote merges in as it
   // answers (usePerHostPagedList). A picked host lists only that host.
@@ -855,12 +854,10 @@ export default function AutoflowRuns() {
         />
       </div>
 
-      {customer && (
-        <p role="note" className="mb-4 text-note text-ink-mute">
-          Autoflow runs, cycles and claims aren’t filtered by customer — this page lists every
-          customer’s.
-        </p>
-      )}
+      <UnscopedNote className="mb-4">
+        Autoflow runs can’t be filtered by customer — this list shows every customer’s runs,
+        cycles and claims.
+      </UnscopedNote>
       {tab === 'runs' && <PerHostStrip slices={events.slices} />}
       {tab === 'cycles' && <PerHostStrip slices={cycles.slices} />}
 

@@ -201,6 +201,37 @@ describe('Dashboard customer scope', () => {
     const banner = await screen.findByTestId('hosts-without-customer');
     expect(banner).toHaveTextContent(/worker-7 runs an older rupu/);
     expect(banner).toHaveTextContent(/prod can’t be filtered by customer \(its totals are summed on the host\)/);
+    // The fleet counts are not run-scoped: said so, not passed off as the customer's.
+    expect(screen.getByRole('note')).toHaveTextContent('Fleet counts aren’t per customer.');
+  });
+
+  it('a remote 501 under the scope is a host state: no failure text, even before local answers', async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST, PROD_HOST]);
+    let answerLocal: (v: DashboardResponse) => void = () => {};
+    vi.spyOn(api, 'getDashboard').mockImplementation((_r, host) =>
+      host === 'host_prod'
+        ? Promise.reject(
+            new ApiError(
+              501,
+              'x',
+              JSON.stringify({ error: "host host_prod can't be filtered by customer: its totals are summed remotely" }),
+            ),
+          )
+        : new Promise<DashboardResponse>((resolve) => {
+            answerLocal = resolve;
+          }),
+    );
+    vi.spyOn(api, 'subscribeEvents').mockReturnValue(() => {});
+
+    mountScoped();
+    // The remote's 501 has landed; local is still loading.
+    expect(await screen.findByTestId('hosts-without-customer')).toHaveTextContent(/prod can’t be filtered by customer/);
+    expect(screen.queryByText(/Could not load dashboard/)).not.toBeInTheDocument();
+
+    answerLocal(summary());
+    await waitFor(() => expect(screen.getByTestId('tile-awaiting')).toHaveTextContent('1'));
+    expect(screen.queryByText(/refresh failed/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Could not load dashboard/)).not.toBeInTheDocument();
   });
 
   it('clearing the chip sets the scope to null and refetches unfiltered', async () => {

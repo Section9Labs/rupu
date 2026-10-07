@@ -175,11 +175,13 @@ describe('CustomerDetail header and tiles', () => {
   });
 
   it('names the hosts the rollup left out in the warn banner', async () => {
-    getCustomer.mockResolvedValue(detail({ rollup: { ...detail().rollup, hosts_without_customer: ['mini'] } }));
+    vi.mocked(api.getRegisteredHosts).mockResolvedValue([REG_LOCAL, REG_PROD]);
+    getCustomer.mockResolvedValue(detail({ rollup: { ...detail().rollup, hosts_without_customer: ['host_prod'] } }));
     mount();
     await screen.findByRole('heading', { level: 1, name: 'Acme Corp' });
-    expect(screen.getByTestId('hosts-without-customer')).toHaveTextContent(
-      /mini runs an older rupu .* not counted as zero/,
+    // Named by the registered host's name, not its id.
+    await waitFor(() =>
+      expect(screen.getByTestId('hosts-without-customer')).toHaveTextContent(/^prod runs an older rupu .* not counted as zero/),
     );
   });
 

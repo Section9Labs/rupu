@@ -203,7 +203,6 @@ describe('X-Rupu-Hosts-Without-Customer', () => {
       ['sessions', (sink) => api.getSessions({ customer: 'acme', onHostsWithoutCustomer: sink })],
       ['usage runs', (sink) => api.getUsageRuns(undefined, undefined, 'acme', sink)],
       ['outliers', (sink) => api.getUsageOutliers(undefined, 'acme', sink)],
-      ['timeline', (sink) => api.getUsageTimeline({ customer: 'acme', onHostsWithoutCustomer: sink })],
     ];
     for (const [name, call] of calls) {
       mockFetchWithHeader('mini,host_prod', [{ id: 'r1' }]);

@@ -235,12 +235,22 @@ describe('Customers page', () => {
     expect(screen.getByTestId('where')).toHaveTextContent('/projects');
   });
 
-  it('names hosts whose runs are left out in the warn banner', async () => {
+  it('names hosts whose runs are left out in the warn banner, by their registered name', async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([{ id: 'mini', name: 'Mini studio', transport_kind: 'ssh' }]);
     mount();
     await screen.findByText('Acme Corp');
-    expect(screen.getByTestId('hosts-without-customer')).toHaveTextContent(
-      /mini runs an older rupu .* can’t tag every run with a customer — those runs are left out of this view, not counted as zero/,
+    await waitFor(() =>
+      expect(screen.getByTestId('hosts-without-customer')).toHaveTextContent(
+        /^Mini studio runs an older rupu .* can’t tag every run with a customer — those runs are left out of this view, not counted as zero/,
+      ),
     );
+  });
+
+  it('falls back to the host id when the registered hosts can’t be read', async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockRejectedValue(new Error('down'));
+    mount();
+    await screen.findByText('Acme Corp');
+    expect(screen.getByTestId('hosts-without-customer')).toHaveTextContent(/^mini runs an older rupu/);
   });
 
   it('empty state offers New customer, which opens the dialog', async () => {

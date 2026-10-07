@@ -26,7 +26,7 @@ import { Spinner } from '../../components/ui/Spinner';
 import { CustomerDot } from '../../components/customers/CustomerDot';
 import { CustomerFormDialog } from '../../components/customers/CustomerFormDialog';
 import { PricingErrorMark } from '../../components/customers/PricingErrorMark';
-import { HostsWithoutCustomerBanner } from '../../components/customers/HostsWithoutCustomerBanner';
+import { RollupHostsWithoutCustomerBanner } from '../../components/customers/HostsWithoutCustomerBanner';
 import { StatTile as Tile } from '../../components/customers/StatTile';
 
 type StatusView = 'active' | 'archived' | 'all';
@@ -366,7 +366,7 @@ export default function Customers() {
             />
           )}
 
-          <HostsWithoutCustomerBanner className="mt-3" without={stats.hosts} />
+          <RollupHostsWithoutCustomerBanner className="mt-3" without={stats.hosts} />
         </>
       )}
 
