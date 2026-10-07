@@ -83,6 +83,8 @@ import { ScopeChip } from '../components/customers/ScopeChip';
 import { HostsWithoutCustomerBanner } from '../components/customers/HostsWithoutCustomerBanner';
 
 const RANGES: DashboardRange[] = ['7d', '30d', 'all'];
+const EMPTY_RUNS: UsageRunRow[] = [];
+const EMPTY_OUTLIERS: OutlierRun[] = [];
 
 /** How often a preset ("ends now") window is re-derived and its data refetched. */
 const USAGE_REFRESH_MS = 30_000;
@@ -176,7 +178,13 @@ export default function Usage({ customer: fixedCustomer }: { customer?: string }
     setWindowSource('user');
   }, [range]);
 
-  const [outliers, setOutliers] = useState<OutlierRun[]>([]);
+  // Outliers, tagged with the scope they were fetched for: a list fetched for
+  // another customer is never shown under this one (see `runsFor` below).
+  const [outliersFor, setOutliersFor] = useState<{ customer: typeof customer; rows: OutlierRun[] }>({
+    customer,
+    rows: [],
+  });
+  const outliers = outliersFor.customer === customer ? outliersFor.rows : EMPTY_OUTLIERS;
   // Customer-scoped only: the hosts the run-rows and outliers fetches named in
   // their `X-Rupu-Hosts-Without-Customer` header (each replaced by its latest
   // answer; cleared when the filter goes).
@@ -194,7 +202,18 @@ export default function Usage({ customer: fixedCustomer }: { customer?: string }
   // heard of (no effect), get stuck disabled (the top-6/others rollup), or
   // render as a bare "—" for an empty pivot value. Mirrors
   // `ProjectUsageTimeline`'s `aggregateRuns(runs, pivot)` table.
-  const [runs, setRuns] = useState<UsageRunRow[]>([]);
+  // Tagged with the scope the rows were fetched for, like the headline's
+  // `lastGood`: until the new scope's own rows land — or when its fetch fails,
+  // which never calls `onRunsLoaded` — the table is empty, never the previous
+  // customer's breakdown under this one's chip. `UsageTimeline` refetches on a
+  // scope change and drops a superseded answer, so the scope captured by the
+  // callback its effect ran with is the scope of the rows it hands back.
+  const [runsFor, setRunsFor] = useState<{ customer: typeof customer; rows: UsageRunRow[] }>({
+    customer,
+    rows: [],
+  });
+  const runs = runsFor.customer === customer ? runsFor.rows : EMPTY_RUNS;
+  const handleRunsLoaded = useCallback((rows: UsageRunRow[]) => setRunsFor({ customer, rows }), [customer]);
 
   const [excludedKeys, setExcludedKeys] = useState<Set<string>>(new Set());
   const [excludedRunIds, setExcludedRunIds] = useState<Set<string>>(new Set());
@@ -223,11 +242,16 @@ export default function Usage({ customer: fixedCustomer }: { customer?: string }
       : api.getUsageOutliers(usageWindow)
     )
       .then((rows) => {
-        if (!cancelled) setOutliers(rows);
+        if (!cancelled) setOutliersFor({ customer, rows });
       })
       .catch(() => {
-        // A failed tick-driven refresh keeps the last good outliers.
-        if (!cancelled && windowSource !== 'tick') setOutliers([]);
+        // A failed tick-driven refresh keeps the last good outliers — but only
+        // ones fetched for this same scope: another customer's are not a
+        // stand-in for this one's.
+        if (cancelled) return;
+        setOutliersFor((prev) =>
+          windowSource === 'tick' && prev.customer === customer ? prev : { customer, rows: [] },
+        );
       });
     return () => {
       cancelled = true;
@@ -352,7 +376,11 @@ export default function Usage({ customer: fixedCustomer }: { customer?: string }
               local-only run rows `UsageTimeline` fetches for the graph itself,
               which is why it's passed in rather than computed inside that
               component (see its doc comment). */}
+          {/* Keyed by the scope: a new customer's graph starts empty rather
+              than keeping the last one's rows through a failed refetch (a
+              tick's "keep the last good rows" applies within one scope only). */}
           <UsageTimeline
+            key={String(customer)}
             customer={customer}
             usageWindow={usageWindow}
             pivot={pivot}
@@ -361,7 +389,7 @@ export default function Usage({ customer: fixedCustomer }: { customer?: string }
             filter={filter}
             excludedCount={excludedCount}
             onReset={resetExclusions}
-            onRunsLoaded={setRuns}
+            onRunsLoaded={handleRunsLoaded}
             onHostsWithoutCustomer={customer ? setRunsHostsWithout : undefined}
             onSelectRange={handleSelectRange}
             pending={isPending || headlineStale}

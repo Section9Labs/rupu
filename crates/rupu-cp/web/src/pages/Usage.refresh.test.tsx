@@ -36,7 +36,8 @@ vi.mock('../components/dashboard/UsageTimelineStacked', () => ({
 }));
 
 import Usage from './Usage';
-import { withCustomerScope } from '../lib/customerScopeTestUtils';
+import { ACME, customerRow, scopedEntry, withCustomerScope } from '../lib/customerScopeTestUtils';
+import { useCustomerScope } from '../lib/customerScope';
 
 const FIXED_NOW = new Date('2026-07-16T12:00:00.000Z').getTime();
 const TICK = 30_000;
@@ -290,5 +291,55 @@ describe('Usage page — background refreshes are quiet', () => {
     expect(screen.getByText(/refresh failed/)).toBeInTheDocument();
     // ...but a spinner beside "refresh failed" would never end (a drag-selected window never retries).
     expect(screen.queryByRole('status', { name: 'updating' })).not.toBeInTheDocument();
+  });
+});
+
+function ScopeGlobex() {
+  const { setScope } = useCustomerScope();
+  return (
+    <button type="button" onClick={() => setScope('globex')}>
+      scope-globex
+    </button>
+  );
+}
+
+describe('Usage page — a scope change never carries the last customer\'s rows', () => {
+  it('after a tick, switching customers with the new fetches failing shows none of the old rows', async () => {
+    vi.mocked(api.getUsageRuns).mockImplementation((_w, _ws, customer) =>
+      customer === 'acme' ? Promise.resolve([{ ...runRow(), model: 'acme-model' }]) : Promise.reject(new Error('runs down')),
+    );
+    vi.mocked(api.getUsageOutliers).mockImplementation((_w, customer) =>
+      customer === 'acme' ? Promise.resolve([{ ...outlierRow(), workflow_name: 'acme-flow' }]) : Promise.reject(new Error('outliers down')),
+    );
+    render(
+      <MemoryRouter initialEntries={[scopedEntry('acme', '/usage')]}>
+        {withCustomerScope(
+          <>
+            <Usage />
+            <ScopeGlobex />
+          </>,
+          { customers: [ACME, customerRow('globex')] },
+        )}
+      </MemoryRouter>,
+    );
+    await flush();
+    expect(screen.getByRole('link', { name: 'acme-flow' })).toBeInTheDocument();
+    expect(screen.getAllByText('acme-model').length).toBeGreaterThan(0);
+    expect(screen.getByTestId('bucket-count')).toHaveTextContent('1');
+
+    // One background tick: from here on a failed refresh keeps the last good
+    // rows — within the same scope.
+    await advance(TICK);
+    await flush();
+    expect(screen.getByRole('link', { name: 'acme-flow' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'scope-globex' }));
+    await flush();
+    await flush();
+    expect(api.getUsageRuns).toHaveBeenLastCalledWith(expect.anything(), undefined, 'globex', expect.any(Function));
+    expect(api.getUsageOutliers).toHaveBeenLastCalledWith(expect.anything(), 'globex', expect.any(Function));
+    expect(screen.queryByRole('link', { name: 'acme-flow' })).not.toBeInTheDocument();
+    expect(screen.queryByText('acme-model')).not.toBeInTheDocument();
+    expect(screen.getByTestId('bucket-count')).toHaveTextContent('0');
   });
 });
