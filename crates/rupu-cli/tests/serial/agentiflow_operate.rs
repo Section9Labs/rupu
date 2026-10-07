@@ -224,23 +224,95 @@ async fn poll<T>(secs: u64, mut f: impl FnMut() -> Option<T>) -> Option<T> {
     }
 }
 
+// Process liveness and process-group membership, without procps. The musl CI
+// image (Alpine busybox) has neither: its `ps` rejects `-o stat= -p`, and its
+// `pgrep` has no `-g` (it prints "unrecognized option: g" and exits 1, which a
+// naive reader mistakes for procps's "no match"). So on Linux these read
+// `/proc` directly; off Linux (matt's macOS) they shell out to the real tools.
+
 /// Dead for the purposes of a test: gone, or an exited process nothing has
 /// reaped yet (a container's PID 1 may never collect one).
 fn is_dead(pid: u32) -> bool {
-    !pid_is_running(pid) || ps_stat(pid).is_some_and(|s| s.starts_with('Z'))
+    !pid_is_running(pid) || is_zombie(pid)
 }
 
-fn ps_stat(pid: u32) -> Option<String> {
-    let out = std::process::Command::new("ps")
+/// Whether `pid` has exited but not been reaped (state `Z`, or `X` mid-teardown).
+#[cfg(target_os = "linux")]
+fn is_zombie(pid: u32) -> bool {
+    proc_stat_after_comm(pid)
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|state| state == 'Z' || state == 'X')
+}
+
+/// Off Linux, ask `ps` for the process state.
+#[cfg(not(target_os = "linux"))]
+fn is_zombie(pid: u32) -> bool {
+    std::process::Command::new("ps")
         .args(["-o", "stat=", "-p", &pid.to_string()])
         .output()
-        .ok()?;
-    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (out.status.success() && !value.is_empty()).then_some(value)
+        .ok()
+        .filter(|out| out.status.success())
+        .is_some_and(|out| String::from_utf8_lossy(&out.stdout).trim().starts_with('Z'))
 }
 
-/// Whether any process is still in group `pgid`. `None` where `pgrep` is
+/// The fields of `/proc/<pid>/stat` after the parenthesised command name:
+/// `state ppid pgrp session …`, already left-trimmed. The command name can
+/// itself contain `)`, so the split is on the LAST one. `None` when gone.
+#[cfg(target_os = "linux")]
+fn proc_stat_after_comm(pid: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, rest) = stat.rsplit_once(')')?;
+    Some(rest.trim_start().to_string())
+}
+
+/// The LIVE pids currently in process group `pgid`, read from `/proc`. The
+/// fields after the command name are `state ppid pgrp …`, so the state is
+/// first and the pgrp third. A zombie (`Z`) or dying (`X`) process is excluded:
+/// it has exited and will never act, so the group "goes away" once only
+/// zombies remain — matching a reaping init's view on macOS, where the killed
+/// unit and coordinator are collected rather than left defunct (the musl CI
+/// container's PID 1 is `cargo`, which reaps nothing).
+#[cfg(target_os = "linux")]
+fn pids_in_group(pgid: u32) -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()))
+        .filter(|&pid| {
+            let Some(rest) = proc_stat_after_comm(pid) else {
+                return false;
+            };
+            let mut fields = rest.split_whitespace();
+            let live = fields.next().is_some_and(|state| state != "Z" && state != "X");
+            let pgrp = fields.nth(1).and_then(|f| f.parse::<u32>().ok());
+            live && pgrp == Some(pgid)
+        })
+        .collect()
+}
+
+/// `/proc/<pid>/cmdline` as a space-joined string (argv is NUL-separated).
+#[cfg(target_os = "linux")]
+fn proc_cmdline(pid: u32) -> String {
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .map(|raw| {
+            raw.split(|&b| b == 0)
+                .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default()
+}
+
+/// Whether any process is still in group `pgid`. `None` where the probe is
 /// unavailable (the check is then skipped, loudly).
+#[cfg(target_os = "linux")]
+fn group_is_empty(pgid: u32) -> Option<bool> {
+    Some(pids_in_group(pgid).is_empty())
+}
+
+#[cfg(not(target_os = "linux"))]
 fn group_is_empty(pgid: u32) -> Option<bool> {
     let out = std::process::Command::new("pgrep")
         .args(["-g", &pgid.to_string()])
@@ -254,7 +326,17 @@ fn group_is_empty(pgid: u32) -> Option<bool> {
 }
 
 /// Whether a process whose command line matches `pattern` is in group `pgid`.
-/// `None` where `pgrep` is unavailable.
+/// `None` where the probe is unavailable.
+#[cfg(target_os = "linux")]
+fn group_runs(pgid: u32, pattern: &str) -> Option<bool> {
+    Some(
+        pids_in_group(pgid)
+            .into_iter()
+            .any(|pid| proc_cmdline(pid).contains(pattern)),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
 fn group_runs(pgid: u32, pattern: &str) -> Option<bool> {
     let out = std::process::Command::new("pgrep")
         .args(["-g", &pgid.to_string(), "-f", pattern])
@@ -267,10 +349,10 @@ fn group_runs(pgid: u32, pattern: &str) -> Option<bool> {
     }
 }
 
-/// Wait for group `pgid` to be empty. Passes where `pgrep` cannot tell.
+/// Wait for group `pgid` to be empty. Passes where the probe cannot tell.
 async fn group_goes_away(pgid: u32, secs: u64) -> bool {
     if group_is_empty(pgid).is_none() {
-        eprintln!("`pgrep -g` is unavailable here: skipping the process-group check");
+        eprintln!("the process-group probe is unavailable here: skipping the check");
         return true;
     }
     poll(secs, || group_is_empty(pgid).unwrap_or(true).then_some(()))

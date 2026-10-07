@@ -1490,6 +1490,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                 resume_approver: None,
                 resume_rerequested_at: None,
                 reject_cleanup_pending: None,
+                engagement_profiles: Vec::new(),
                 // ISSUES.md I-24: `rupu run` has no on_reject cleanup path of
                 // its own, but recording the launch mode here keeps this
                 // record consistent with the workflow-run creation site.
@@ -2305,6 +2306,7 @@ mod tests {
             resume_approver: None,
             resume_rerequested_at: None,
             reject_cleanup_pending: None,
+            engagement_profiles: Vec::new(),
             permission_mode: None,
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),

@@ -449,6 +449,14 @@ pub trait StepFactory: Send + Sync {
     fn customer(&self) -> Option<&str> {
         None
     }
+
+    /// The engagement profile ids every step this factory builds validates
+    /// its findings against (`--engagement-profile`), as selected; empty =
+    /// the native `code` path. Recorded on the run's `RunRecord` at launch
+    /// so a resume rebuilds the same engagement. Defaulted like `customer`.
+    fn engagement_profiles(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// `Clone` exists solely so [`run_scheduler`] can wrap one `Arc`-shared copy
@@ -1216,6 +1224,9 @@ pub async fn run_workflow(
                 resume_approver: None,
                 resume_rerequested_at: None,
                 reject_cleanup_pending: None,
+                // Recorded so a resume re-resolves the same engagement
+                // instead of dropping to the native code path.
+                engagement_profiles: opts.factory.engagement_profiles(),
                 // ISSUES.md I-24: capture the launch mode straight off the
                 // factory so it's on disk from the very first write —
                 // `rebuild_opts_from_disk` reads this back as the
@@ -16692,6 +16703,7 @@ loops:
                     resume_approver: None,
                     resume_rerequested_at: None,
                     reject_cleanup_pending: None,
+                    engagement_profiles: Vec::new(),
                     permission_mode: None,
                     final_output: None,
                     loop_progress: BTreeMap::new(),

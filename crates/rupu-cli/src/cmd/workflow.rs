@@ -3659,6 +3659,11 @@ pub(crate) async fn resume_run(
         .map_err(|e| anyhow::anyhow!("discover interrupted attempts: {e}"))?
     };
 
+    // The engagement it was launched under (`--engagement-profile`),
+    // resolved before the run is flipped back to running so a profile that
+    // no longer resolves refuses the resume without touching the run.
+    let engagement = crate::findings_opts::recorded_engagement(&global, &record)?;
+
     // Restore inputs, event, issue, workspace path from the record.
     let inputs_map: BTreeMap<String, String> = record.inputs.clone();
     let event = record.event.clone();
@@ -3759,6 +3764,12 @@ pub(crate) async fn resume_run(
     let provider_tuning = rupu_runtime::provider_factory::provider_tuning_map(&cfg.providers);
     let kinds = rupu_runtime::provider_factory::resolve_kind_map(&cfg.providers);
     let limits_ctx = rupu_runtime::model_limits::LimitsContext::from_config(&cfg, &global);
+    // The engagement the run was launched under (`--engagement-profile`),
+    // shared by sub-agents, action steps and agent steps as at launch.
+    let findings_base = rupu_coverage::FindingWriteOptions {
+        engagement,
+        ..crate::findings_opts::base_options(&global, &cfg.findings)
+    };
     let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
         global.clone(),
         project_root.clone(),
@@ -3774,7 +3785,7 @@ pub(crate) async fn resume_run(
         openai_compatible.clone(),
         provider_tuning.clone(),
         kinds.clone(),
-        crate::findings_opts::base_options(&global, &cfg.findings),
+        findings_base.clone(),
         // Dispatched children append the resumed run's own ledger.
         Some(rupu_orchestrator::usage_ledger::UsageLedger::for_run(
             &store, run_id,
@@ -3810,13 +3821,13 @@ pub(crate) async fn resume_run(
             run_id: run_id.to_string(),
             model: cfg.default_model.clone().unwrap_or_default(),
             surface: rupu_coverage::Surface::Workflow,
-            options: crate::findings_opts::base_options(&global, &cfg.findings).with_profile(
-                rupu_coverage::FindingProfile::resolve(
+            options: findings_base
+                .clone()
+                .with_profile(rupu_coverage::FindingProfile::resolve(
                     None,
                     workflow.defaults.findings_profile,
                     None,
-                ),
-            ),
+                )),
             codename: Some(rupu_codename::crew_for(run_id)),
             provider: cfg.default_provider.clone(),
         }),
@@ -3838,7 +3849,7 @@ pub(crate) async fn resume_run(
         default_model: cfg.default_model.clone(),
         bash_timeout_secs: cfg.bash.timeout_secs.unwrap_or(120),
         bash_env_allowlist: cfg.bash.env_allowlist.clone().unwrap_or_default(),
-        findings_base: crate::findings_opts::base_options(&global, &cfg.findings),
+        findings_base,
         limits_ctx,
         providers: cfg.providers.clone(),
         recovery: cfg.recovery.clone(),
@@ -6716,6 +6727,7 @@ mod tests {
             resume_approver: None,
             resume_rerequested_at: None,
             reject_cleanup_pending: None,
+            engagement_profiles: Vec::new(),
             permission_mode: None,
             issue_ref: None,
             issue: None,

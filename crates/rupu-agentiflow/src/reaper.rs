@@ -61,7 +61,9 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use serde_json::json;
 
-use crate::proc::{kill_group, leads_own_group, pid_is_running, terminate_group, terminate_pid};
+use crate::proc::{
+    is_zombie, kill_group, leads_own_group, pid_is_running, terminate_group, terminate_pid,
+};
 use crate::run::{agentiflow_dir, AgentiflowRecord, EventLog};
 use crate::supervisor::units_on_disk;
 
@@ -169,14 +171,20 @@ fn run_dirs(global: &Path) -> Vec<(String, PathBuf)> {
 }
 
 /// The coordinator pid of an orphan: a `running` record whose recorded
-/// `runner_pid` is not running. `None` for everything else, which includes the
+/// `runner_pid` has exited. `None` for everything else, which includes the
 /// owner-unknown record (`runner_pid: None`).
+///
+/// "Has exited" is gone OR a zombie: a coordinator that was SIGKILLed but whose
+/// zombie has not been reaped (a container with a non-reaping PID 1) has still
+/// exited for good, and its run is as orphaned as a vanished one's. Without the
+/// zombie check `pid_is_running` — a `kill(pid, 0)` — reports it alive forever
+/// and the run is never reaped.
 fn dead_coordinator(record: &AgentiflowRecord) -> Option<u32> {
     if record.status != "running" {
         return None;
     }
     let pid = record.runner_pid?;
-    (!pid_is_running(pid)).then_some(pid)
+    (!pid_is_running(pid) || is_zombie(pid)).then_some(pid)
 }
 
 /// Read a run's record, quietly for a dir with none yet (a run being created),
