@@ -27,6 +27,7 @@
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
     <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
+    <a class="item" href="/docs/profiles.html">Engagement profiles</a>
     <div class="grp">Platform</div>
     <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
     <a class="item" href="/docs/reliability.html">Recovery &amp; reliability</a>
@@ -39,6 +40,11 @@
     <a class="item" href="/docs/coverage.html">Coverage</a>
     <a class="item" href="/docs/findings.html">Findings</a>
     <a class="item" href="/docs/customers.html">Customers</a>
+    <div class="grp">Reference</div>
+    <a class="item" href="/docs/cli.html">CLI reference</a>
+    <a class="item" href="/docs/configuration.html">Configuration</a>
+    <a class="item" href="/docs/api.html">HTTP API</a>
+    <a class="item" href="/docs/transcripts.html">Transcript schema</a>
     <div class="grp">More</div>
     <a class="item" href="/docs/examples/">Examples</a>
     <a class="item" href="/#download">Download</a>
@@ -136,6 +142,106 @@
       explicitly so behavior does not drift with a mutable global default.
     </div>
 
+    <h2 id="advanced-frontmatter">Advanced frontmatter</h2>
+    <p>
+      The fields above cover most agents. The ones below tune reasoning, token limits, findings, failure
+      recovery, and provider-specific behavior. All are optional; leave them out and rupu uses the
+      discovered or configured default.
+    </p>
+
+    <h3 id="provider-accounts">Provider accounts</h3>
+    <p>
+      <code class="inline">provider:</code> names an <strong>account</strong>, not only a vendor. A bare vendor
+      name (<code class="inline">anthropic</code>, <code class="inline">openai</code>, &hellip;) is its own
+      account; to keep two identities for one vendor, log in to a named account with
+      <code class="inline">--kind</code> and point the agent at it, e.g.
+      <code class="inline">provider: anthropic-work</code>. <code class="inline">auth:</code>
+      (<code class="inline">api-key</code> or <code class="inline">sso</code>) then picks between that account&rsquo;s
+      credentials when it holds both. See <a class="link" href="/docs/providers.html#accounts">Providers &rarr; Accounts</a>.
+    </p>
+
+    <h3 id="reasoning-and-limits">Reasoning, context &amp; token limits</h3>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>effort</code></td><td>string</td><td>provider default</td><td>One cross-provider reasoning level: <code class="inline">auto</code>, <code class="inline">minimal</code>, <code class="inline">low</code>, <code class="inline">medium</code>, <code class="inline">high</code>, <code class="inline">max</code>; aliases <code class="inline">adaptive</code> (= <code class="inline">auto</code>) and <code class="inline">xhigh</code> (= <code class="inline">max</code>). rupu translates it per provider &mdash; Anthropic <code class="inline">thinking.budget_tokens</code>, Gemini <code class="inline">thinkingLevel</code> / <code class="inline">thinkingBudget</code>, OpenAI <code class="inline">reasoning.effort</code>, OpenAI-compatible <code class="inline">reasoning_effort</code>.</td></tr>
+        <tr><td><code>contextWindow</code></td><td>string</td><td><code>default</code></td><td><code class="inline">default</code> or <code class="inline">1m</code> (aliases <code class="inline">1M</code>, <code class="inline">one_million</code>). On Anthropic, <code class="inline">1m</code> opts an API-key account into the 1M-token context beta; an SSO account uses a <code class="inline">[1m]</code> suffix on <code class="inline">model:</code> instead. Other providers ignore it.</td></tr>
+        <tr><td><code>maxTokens</code></td><td>integer</td><td>discovered output cap</td><td>Per-request output-token cap. Overrides the cap discovered from the provider&rsquo;s model list; when neither is known, Anthropic gets <code class="inline">8192</code> and other providers get no cap. <code class="inline">0</code> is ignored. Extended thinking draws from this budget.</td></tr>
+        <tr><td><code>contextWindowTokens</code></td><td>integer</td><td>discovered input limit</td><td>Input-token limit used for proactive context compaction. Overrides the discovered limit; compaction is off only when neither is known. <code class="inline">0</code> is ignored.</td></tr>
+        <tr><td><code>compactAtPercent</code></td><td>integer</td><td><code>80</code></td><td>Share of the input limit at which older turns are summarized before the next turn. Clamped to 10&ndash;95.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      Pin <code class="inline">maxTokens</code> / <code class="inline">contextWindowTokens</code> only to override what rupu
+      discovers &mdash; see <a class="link" href="/docs/reliability.html">Reliability &rarr; Model limits discovery</a>.
+    </p>
+
+    <h3 id="findings-frontmatter">Coverage &amp; findings</h3>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>concerns</code></td><td>list</td><td>none</td><td>Coverage-concerns block (<code class="inline">include:</code> a catalog, or inline concerns). Injects the coverage tools and prepends the concern catalog to the system prompt. A workflow step&rsquo;s own <code class="inline">concerns:</code> wins.</td></tr>
+        <tr><td><code>findingsProfile</code></td><td><code>full</code> | <code>summary</code></td><td><code>full</code></td><td>Contract for <code class="inline">report_finding</code>: <code class="inline">full</code> requires a complete structured report; <code class="inline">summary</code> records the lightweight summary / severity / evidence form. Precedence: workflow step &rarr; workflow defaults &rarr; agent &rarr; <code class="inline">full</code>; <code class="inline">rupu run --findings-profile</code> overrides it for a standalone run.</td></tr>
+      </tbody>
+    </table>
+    <p>See <a class="link" href="/docs/coverage.html">Coverage</a> and <a class="link" href="/docs/findings.html">Findings</a>.</p>
+
+    <h3 id="fallbacks">Fallbacks</h3>
+    <p>
+      <code class="inline">fallbacks:</code> is an ordered list of models to try when the agent&rsquo;s own model
+      can&rsquo;t give a usable reply (a refusal, repeated truncation, an overloaded provider). Each entry has a
+      required <code class="inline">model</code> and an optional <code class="inline">provider</code>; without one,
+      the entry stays on the provider the run started on. Unknown keys inside an entry are an error. The list
+      <strong>replaces</strong> <code class="inline">[recovery].fallbacks</code> from <code class="inline">config.toml</code>
+      for this agent (it is not merged), and <code class="inline">fallbacks: []</code> means no fallbacks. See
+      <a class="link" href="/docs/reliability.html">Reliability &rarr; Configuring fallbacks</a>.
+    </p>
+
+    <h3 id="anthropic-fields">Anthropic-only fields</h3>
+    <table>
+      <thead><tr><th>Key</th><th>Values</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>anthropicOauthPrefix</code></td><td><code>true</code> | <code>false</code></td><td>SSO (OAuth) only. Prefix is on by default; <code class="inline">false</code> turns it off for this agent.</td></tr>
+        <tr><td><code>anthropicPromptCache</code></td><td><code>true</code> | <code>false</code></td><td>Explicit prompt caching, on by default. <code class="inline">false</code> drops the <code class="inline">cache_control</code> breakpoints (e.g. for a gateway that rejects them). Overrides <code class="inline">[providers.&lt;name&gt;] prompt_cache</code> in either direction.</td></tr>
+        <tr><td><code>anthropicTaskBudget</code></td><td>positive integer</td><td>Soft output-token budget the model paces toward (sent as <code class="inline">output_config.task_budget</code>). <code class="inline">maxTurns</code> stays the hard ceiling.</td></tr>
+        <tr><td><code>anthropicContextManagement</code></td><td><code>tool_clearing</code></td><td>Server-side pruning of earlier tool-use / tool-result blocks when the conversation would overflow.</td></tr>
+        <tr><td><code>anthropicSpeed</code></td><td><code>fast</code></td><td>Fast mode. Account-gated: an account without it gets a 400.</td></tr>
+      </tbody>
+    </table>
+    <div class="callout">
+      <strong>Use the frontmatter names, not wire names.</strong> Keys such as <code class="inline">thinking</code>,
+      <code class="inline">budget_tokens</code>, <code class="inline">thinkingBudget</code>,
+      <code class="inline">context_management</code> or <code class="inline">speed</code> are what rupu
+      <em>sends</em> to a provider, not frontmatter fields &mdash; strict parsing rejects them. Use
+      <code class="inline">effort</code>, <code class="inline">anthropicContextManagement</code> and
+      <code class="inline">anthropicSpeed</code>. A rupu release older than a field also refuses an agent that
+      sets it, so upgrade remote hosts before adding new keys to agents they run.
+    </div>
+
+    <h3 id="advanced-example">Example</h3>
+    <pre class="code"><span class="c">---</span>
+<span class="k">name</span>: <span class="s">deep-auditor</span>
+<span class="k">description</span>: <span class="s">Long-running audit agent with tuned limits and a fallback chain.</span>
+<span class="k">provider</span>: <span class="s">anthropic-work</span>        <span class="c"># a named account</span>
+<span class="k">auth</span>: <span class="s">sso</span>
+<span class="k">model</span>: <span class="s">claude-sonnet-4-6</span>
+<span class="k">tools</span>: <span class="v">[read_file, grep, glob]</span>
+<span class="k">permissionMode</span>: <span class="s">readonly</span>
+<span class="k">effort</span>: <span class="s">high</span>
+<span class="k">maxTokens</span>: <span class="v">32000</span>
+<span class="k">compactAtPercent</span>: <span class="v">70</span>
+<span class="k">concerns</span>:
+  - <span class="k">include</span>: <span class="s">secrets-in-source</span>
+<span class="k">findingsProfile</span>: <span class="s">summary</span>
+<span class="k">fallbacks</span>:
+  - <span class="k">model</span>: <span class="s">claude-opus-4-6</span>       <span class="c"># same account</span>
+  - <span class="k">provider</span>: <span class="s">openai</span>             <span class="c"># another provider</span>
+    <span class="k">model</span>: <span class="s">gpt-5</span>
+<span class="k">anthropicContextManagement</span>: <span class="s">tool_clearing</span>
+<span class="c">---</span>
+
+Audit the repository for hard-coded secrets and record each one you find.</pre>
+
     <h2>A complete example</h2>
     <p>
       This is the <code class="inline">code-reviewer</code> agent that ships as a rupu template — a read-only
@@ -184,7 +290,44 @@ Do not edit code.</pre>
       <li><code class="inline">bash</code> — run shell commands</li>
       <li><code class="inline">read_file</code> · <code class="inline">write_file</code> · <code class="inline">edit_file</code> — file I/O</li>
       <li><code class="inline">grep</code> · <code class="inline">glob</code> — search and match</li>
+      <li><code class="inline">ast_grep</code> — structural search over syntax trees (below)</li>
+      <li><code class="inline">dispatch_agent</code> · <code class="inline">dispatch_agents_parallel</code> — start sub-agents (see <a class="link" href="#sub-agent-dispatch">Sub-agent dispatch</a>)</li>
     </ul>
+    <h3 id="ast-grep">Structural search with <code class="inline">ast_grep</code></h3>
+    <p>
+      <code class="inline">ast_grep</code> matches code by its <strong>syntax tree</strong> rather than its text, so a
+      pattern finds every call site or definition however it&rsquo;s formatted. It wraps the
+      <a class="link" href="https://ast-grep.github.io/" target="_blank" rel="noopener">ast-grep</a> binary, which must be
+      on <code class="inline">PATH</code> as <code class="inline">ast-grep</code> (<code class="inline">brew install ast-grep</code>
+      or <code class="inline">cargo install ast-grep</code>); without it the tool returns an error saying so. It takes a
+      <code class="inline">pattern</code>, a <code class="inline">lang</code> (required: <code class="inline">rust</code>,
+      <code class="inline">python</code>, <code class="inline">typescript</code>, <code class="inline">go</code>,
+      <code class="inline">java</code>, <code class="inline">c</code>, <code class="inline">cpp</code>, &hellip;) and an optional
+      <code class="inline">path</code> inside the workspace.
+    </p>
+    <p>A pattern is ordinary code in the target language, with <strong>metavariables</strong> where anything may appear:</p>
+    <table>
+      <thead><tr><th>Metavariable</th><th>Matches</th></tr></thead>
+      <tbody>
+        <tr><td><code>$NAME</code></td><td>exactly one syntax node, captured as <code>NAME</code> (metavariable names are uppercase). Using the same name twice requires both places to match the same code.</td></tr>
+        <tr><td><code>$$$</code> / <code>$$$ARGS</code></td><td>zero or more nodes, such as an argument list or a block body; the named form captures them.</td></tr>
+      </tbody>
+    </table>
+    <table>
+      <thead><tr><th>Pattern</th><th>lang</th><th>Finds</th></tr></thead>
+      <tbody>
+        <tr><td><code>impl $TRAIT for $TYPE</code></td><td><code>rust</code></td><td>every trait implementation</td></tr>
+        <tr><td><code>$CONN.execute($SQL, $$$)</code></td><td><code>python</code></td><td>every <code>execute</code> call, capturing the receiver and the first argument</td></tr>
+        <tr><td><code>eval($$$)</code></td><td><code>javascript</code></td><td>every <code>eval</code> call, whatever its arguments</td></tr>
+      </tbody>
+    </table>
+    <p>
+      The agent sees one <code class="inline">path:line:col: match</code> line per hit (1-based, workspace-relative); no
+      matches is an empty result, not an error, while a bad pattern or path is an error rather than a silent
+      &ldquo;nothing found&rdquo;. Each matched file counts as a file touch for <a class="link" href="/docs/coverage.html">coverage</a>.
+      The transcript also keeps each match&rsquo;s range and metavariable bindings (up to 200 matches), which the
+      control plane uses to highlight captures and open the matched source or its syntax tree.
+    </p>
     <p>
       MCP-backed tool names are also valid — for example <code class="inline">scm.prs.get</code>,
       <code class="inline">scm.prs.diff</code>, <code class="inline">scm.prs.create</code>,
@@ -193,9 +336,10 @@ Do not edit code.</pre>
       and a global wildcard (<code class="inline">*</code>).
     </p>
     <div class="callout">
-      <strong>Tools vs. actions.</strong> <code class="inline">tools:</code> gates the tool calls an agent may
-      make. It is <em>not</em> the same as a workflow's <code class="inline">actions:</code>, which gates the
-      action protocol emitted from agent output inside a workflow.
+      <strong>Tools vs. actions.</strong> <code class="inline">tools:</code> is what the agent may ever call. A
+      workflow step&rsquo;s <code class="inline">actions:</code> can only <em>narrow</em> the connector (MCP) part of that
+      grant for one step &mdash; never widen it, and never touch built-ins. See
+      <a class="link" href="/docs/workflow-reference.html#step-actions">Step actions</a>.
     </div>
     <h3>Permission modes</h3>
     <p>
@@ -219,7 +363,7 @@ Do not edit code.</pre>
       CLI <code class="inline">--mode</code> flag always overrides the value in the file.
     </p>
 
-    <h2>Sub-agent dispatch</h2>
+    <h2 id="sub-agent-dispatch">Sub-agent dispatch</h2>
     <p>
       An agent can invoke <em>other</em> agents as tool calls in the middle of its own run, read their
       results, and fold them back into its context before continuing. This is composition at the

@@ -27,6 +27,7 @@
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
     <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
+    <a class="item" href="/docs/profiles.html">Engagement profiles</a>
     <div class="grp">Platform</div>
     <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
     <a class="item" href="/docs/reliability.html">Recovery &amp; reliability</a>
@@ -39,6 +40,11 @@
     <a class="item" href="/docs/coverage.html">Coverage</a>
     <a class="item" href="/docs/findings.html">Findings</a>
     <a class="item" href="/docs/customers.html">Customers</a>
+    <div class="grp">Reference</div>
+    <a class="item" href="/docs/cli.html">CLI reference</a>
+    <a class="item" href="/docs/configuration.html">Configuration</a>
+    <a class="item" href="/docs/api.html">HTTP API</a>
+    <a class="item" href="/docs/transcripts.html">Transcript schema</a>
     <div class="grp">More</div>
     <a class="item" href="/docs/examples/">Examples</a>
     <a class="item" href="/#download">Download</a>
@@ -140,8 +146,19 @@
     <h3>Webhook serve</h3>
     <p>For sub-second latency or events the polled tier doesn't deliver, run <code class="inline">rupu webhook serve</code> under your own supervisor. Secrets come from environment variables only — never config files, never the keychain.</p>
     <pre class="code">RUPU_GITHUB_WEBHOOK_SECRET=<span class="v">&lt;your-webhook-secret&gt;</span> \
+RUPU_GITLAB_WEBHOOK_TOKEN=<span class="v">&lt;your-gitlab-token&gt;</span> \
   rupu webhook serve --addr 0.0.0.0:8080</pre>
-    <p>The receiver validates the vendor signature (<code class="inline">X-Hub-Signature-256</code> for GitHub, <code class="inline">X-Gitlab-Token</code> for GitLab, <code class="inline">Linear-Signature</code> + timestamp freshness for Linear, <code class="inline">X-Hub-Signature</code> for Jira Cloud), maps the raw delivery onto the rupu event id, and fires matching workflows with <code class="inline">&#123;&#123;event.*&#125;&#125;</code> populated. Bind to <code class="inline">127.0.0.1</code> and front it with a TLS-terminating reverse proxy — rupu does not terminate TLS itself.</p>
+    <p>Each vendor has its own route and its own secret. Set only the ones you use: a route whose secret is unset answers <code class="inline">503</code>, so a disabled endpoint is distinguishable from a misconfigured one. With none set, <code class="inline">rupu webhook serve</code> refuses to start. A request whose signature or token doesn&rsquo;t match gets <code class="inline">401</code>.</p>
+    <table>
+      <thead><tr><th>Vendor</th><th>Route</th><th>Environment variable</th><th>Checked against</th></tr></thead>
+      <tbody>
+        <tr><td>GitHub</td><td><code>POST /webhook/github</code></td><td><code>RUPU_GITHUB_WEBHOOK_SECRET</code></td><td>HMAC-SHA256 of the body in <code>X-Hub-Signature-256</code></td></tr>
+        <tr><td>GitLab</td><td><code>POST /webhook/gitlab</code></td><td><code>RUPU_GITLAB_WEBHOOK_TOKEN</code></td><td>The shared token GitLab sends in <code>X-Gitlab-Token</code> (GitLab webhooks don&rsquo;t sign bodies) &mdash; set the same value as the hook&rsquo;s <em>Secret token</em></td></tr>
+        <tr><td>Linear</td><td><code>POST /webhook/linear</code></td><td><code>RUPU_LINEAR_WEBHOOK_SECRET</code></td><td>HMAC-SHA256 in <code>Linear-Signature</code>, plus timestamp freshness</td></tr>
+        <tr><td>Jira Cloud</td><td><code>POST /webhook/jira</code></td><td><code>RUPU_JIRA_WEBHOOK_SECRET</code></td><td>HMAC-SHA256 in <code>X-Hub-Signature</code> (<code>sha256=&lt;hex&gt;</code>)</td></tr>
+      </tbody>
+    </table>
+    <p>After validating the request, the receiver maps the raw delivery onto the rupu event id, and fires matching workflows with <code class="inline">&#123;&#123;event.*&#125;&#125;</code> populated. Bind to <code class="inline">127.0.0.1</code> and front it with a TLS-terminating reverse proxy — rupu does not terminate TLS itself.</p>
 
     <h3>The event vocabulary</h3>
     <p>Each connector lifts events from the vendor's events API and maps them onto canonical rupu ids. You match against these in <code class="inline">trigger.event:</code>, and glob wildcards (<code class="inline">*</code>) work — <code class="inline">github.issue.*</code> matches every GitHub issue event, <code class="inline">"*.pr.merged"</code> matches cross-vendor, and <code class="inline">"*"</code> wakes on anything. A few common ids:</p>

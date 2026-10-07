@@ -27,6 +27,7 @@
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
     <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
+    <a class="item" href="/docs/profiles.html">Engagement profiles</a>
     <div class="grp">Platform</div>
     <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
     <a class="item" href="/docs/reliability.html">Recovery &amp; reliability</a>
@@ -39,6 +40,11 @@
     <a class="item active" href="/docs/coverage.html">Coverage</a>
     <a class="item" href="/docs/findings.html">Findings</a>
     <a class="item" href="/docs/customers.html">Customers</a>
+    <div class="grp">Reference</div>
+    <a class="item" href="/docs/cli.html">CLI reference</a>
+    <a class="item" href="/docs/configuration.html">Configuration</a>
+    <a class="item" href="/docs/api.html">HTTP API</a>
+    <a class="item" href="/docs/transcripts.html">Transcript schema</a>
     <div class="grp">More</div>
     <a class="item" href="/docs/examples/">Examples</a>
     <a class="item" href="/#download">Download</a>
@@ -98,7 +104,7 @@
         <tr><td><strong>Concern</strong></td><td>A single criterion the agent assesses against (e.g. an OWASP or CWE entry), drawn from the effective catalog.</td></tr>
         <tr><td><strong>Assertion</strong></td><td>A <code>(concern, file)</code> verdict with evidence: <code>clean</code>, <code>finding</code>, <code>examined</code>, or <code>not_applicable</code>.</td></tr>
         <tr><td><strong>Finding</strong></td><td>A reported issue &mdash; under the default <code>full</code> profile, a complete structured report (see <a class="link" href="/docs/findings.html">Findings</a>).</td></tr>
-        <tr><td><strong>Asset</strong></td><td>Under an <a class="link" href="#engagement-profiles">engagement profile</a>, the thing a finding is about (a host, a service, a route, a binary function&hellip;), with how deeply it was examined.</td></tr>
+        <tr><td><strong>Asset</strong></td><td>Under an <a class="link" href="/docs/profiles.html">engagement profile</a>, the thing a finding is about (a host, a service, a route, a binary function&hellip;), with how deeply it was examined.</td></tr>
         <tr><td><strong>Ledger</strong></td><td>The append-only JSONL files that make up a target&rsquo;s record (below). Every row carries <code>run_id</code> + <code>model</code> + <code>surface</code> attribution.</td></tr>
       </tbody>
     </table>
@@ -139,6 +145,23 @@
 <span class="c">coverage_mark; for each issue, call report_finding…</span></pre>
     <p><strong>Render modes.</strong> <code class="inline">full</code> inlines each concern&rsquo;s body into the prompt; <code class="inline">index</code> renders a compact one-line-per-concern table that the agent searches on demand (use it for large catalogs like the full CWE list so the prompt stays small); <code class="inline">auto</code> (default) picks based on catalog size.</p>
 
+    <h3 id="workflow-concerns">Coverage across a workflow</h3>
+    <p>A workflow can declare the same <code class="inline">concerns:</code> block at its top level. It then <strong>overrides every step agent&rsquo;s own block</strong>: each agent step runs the workflow&rsquo;s catalog, and the harness is active on every step even when an agent declares no concerns of its own. Without a workflow-level block, each step uses its agent&rsquo;s block, if any.</p>
+    <pre class="code"><span class="c"># .rupu/workflows/api-hardening.yaml</span>
+<span class="k">name</span>: <span class="v">api-hardening</span>
+<span class="k">concerns</span>:
+  - <span class="k">include</span>: <span class="s">owasp-api-top10-2023</span>
+<span class="k">steps</span>:
+  - <span class="k">id</span>: <span class="v">sweep</span>
+    <span class="k">agent</span>: <span class="v">route-sweeper</span>
+    <span class="k">actions</span>: <span class="v">[]</span>
+    <span class="k">prompt</span>: <span class="s">"Assess every handler under api/."</span>
+  - <span class="k">id</span>: <span class="v">verify</span>
+    <span class="k">agent</span>: <span class="v">finding-verifier</span>
+    <span class="k">actions</span>: <span class="v">[]</span>
+    <span class="k">prompt</span>: <span class="s">"Re-check each finding sweep reported."</span></pre>
+    <p>Every step of a workflow writes to <strong>one target</strong>, derived from the workflow&rsquo;s name rather than each step&rsquo;s agent, so the ledger accumulates across steps and across runs of that workflow (an agentiflow-launched workflow unit uses the agentiflow&rsquo;s target instead). File touches from workflow steps are attributed to the <code class="inline">workflow</code> surface. Use the workflow-level block whenever more than one step does coverage work, so the shared target has one catalog.</p>
+
     <h3>Bundled catalogs</h3>
     <p><code class="inline">rupu coverage templates list</code> prints them all:</p>
     <pre class="code">owasp-top10-2021        owasp-api-top10-2023
@@ -159,7 +182,7 @@ web-security-default    api-security-default</pre>
         <tr><td><code>coverage_concerns_search</code> / <code>coverage_concerns_detail</code></td><td>search / fetch full bodies for index-mode catalogs</td></tr>
       </tbody>
     </table>
-    <p>Two more tools are <strong>not</strong> injected; grant them explicitly in the agent&rsquo;s <code class="inline">tools:</code>: <code class="inline">query_findings</code> (list the workspace&rsquo;s findings matching a <a class="link" href="/docs/findings.html#querying-findings">findings query</a>) and <code class="inline">tag_findings</code> (add or remove tags). Under an active engagement profile, <code class="inline">asset_mark</code> is offered as well (below).</p>
+    <p>Two more tools are <strong>not</strong> injected; grant them explicitly in the agent&rsquo;s <code class="inline">tools:</code>: <code class="inline">query_findings</code> (list the workspace&rsquo;s findings matching a <a class="link" href="/docs/findings.html#querying-findings">findings query</a>) and <code class="inline">tag_findings</code> (add or remove tags). Under an active <a class="link" href="/docs/profiles.html">engagement profile</a>, <code class="inline">asset_mark</code> is offered as well.</p>
 
     <h2>Running &amp; auditing</h2>
     <p>All inspection commands take the global <code class="inline">--format table|json|csv</code> flag (<code class="inline">table</code> is the default; structured commands support <code class="inline">table</code>/<code class="inline">json</code>, tabular ones also <code class="inline">csv</code>).</p>
@@ -192,42 +215,7 @@ web-security-default    api-security-default</pre>
     <p>Everything the harness controls about what the model sees &mdash; concern ordering, the catalog snapshot, and the live file list &mdash; is byte-stable and independent of the order catalog inputs are declared in. That makes the model the <em>only</em> source of run-to-run variance, which is exactly what <code class="inline">diff</code> measures. The harness does <strong>not</strong> claim byte-identical model output: prompt <em>construction</em> is deterministic; sampling is not.</p>
 
     <h2 id="engagement-profiles">Engagement profiles</h2>
-    <p>A finding is about an <strong>asset</strong>, and an asset has a <strong>kind</strong>. Code (<code class="inline">file</code> / <code class="inline">function</code>) is one kind; a binary <code class="inline">function@address</code>, a network <code class="inline">host</code> / <code class="inline">service</code>, a cloud <code class="inline">resource</code> and a web <code class="inline">route</code> are others. An <strong>engagement profile</strong> is a pure-data TOML package that declares a domain&rsquo;s asset kinds and their locator coordinates, the evidence blocks and taxonomies it uses, a completeness checklist, and a coverage depth ladder. Adding a new kind of engagement is authoring a profile, not writing code.</p>
-    <div class="callout"><strong>Not a sandbox.</strong> A profile governs how a finding is <em>validated and routed</em>; it does not run, gate or scope tools. Agents reach binaries, hosts and services with bash and whatever tooling they like; rupu records and validates the resulting findings, not the traffic.</div>
-
-    <h3>Selecting a profile</h3>
-    <pre class="code"><span class="k">rupu run</span> --engagement-profile binary  <span class="s">my-agent</span> <span class="s">"reverse this blob"</span>
-<span class="k">rupu run</span> --engagement-profile network <span class="s">my-agent</span> <span class="s">"assess the staging subnet"</span>
-<span class="k">rupu run</span> --engagement-profile network,web <span class="s">my-agent</span> <span class="s">"..."</span>   <span class="c"># repeatable or comma-separated</span>
-<span class="k">rupu run</span> --engagement-profiles pentest <span class="s">my-agent</span> <span class="s">"..."</span>       <span class="c"># a composite = network + web</span></pre>
-    <p>No selection is the native <code class="inline">code</code> path, unchanged. A finding whose asset kind no active profile owns, or an unknown profile id, is a loud error &mdash; never a silent default.</p>
-
-    <h3>Built-in catalog</h3>
-    <pre class="code">code   binary   firmware   network   web   api   cloud   sca
-iac    secrets  container  redteam   threat-model
-<span class="c"># composites</span>
-mobile  = binary + web + MASVS
-pentest = network + web</pre>
-    <p>A composite activates each member as its own routing target, so a <code class="inline">pentest</code> run files a <code class="inline">network:service</code> finding and a <code class="inline">web:route</code> finding side by side, each validated against its own profile. Override or add profiles by dropping a <code class="inline">*.toml</code> under <code class="inline">~/.rupu/profiles/</code> (global) or <code class="inline">.rupu/profiles/</code> (project); later sources win by id (built-in &lt; global &lt; project). A profile that fails to parse fails the launch rather than running under the wrong rules.</p>
-    <pre class="code"><span class="c"># an excerpt of the built-in network profile</span>
-<span class="k">id</span> = <span class="s">"network"</span>
-<span class="k">evidence_blocks</span> = [<span class="s">"text"</span>, <span class="s">"table"</span>, <span class="s">"scan_output"</span>, <span class="s">"http_exchange"</span>, <span class="s">"pcap_ref"</span>]
-
-[[<span class="k">asset_kinds</span>]]
-<span class="k">id</span> = <span class="s">"service"</span>
-<span class="k">parent</span> = <span class="s">"host"</span>
-<span class="k">coordinates</span> = [<span class="s">"host"</span>, <span class="s">"port"</span>]
-
-[[<span class="k">completeness</span>]]
-<span class="k">id</span> = <span class="s">"service_identified"</span>
-<span class="k">required</span> = <span class="v">true</span>
-<span class="k">satisfied_when</span> = { <span class="k">all</span> = [ { <span class="k">locator_has_coordinate</span> = <span class="s">"host"</span> }, { <span class="k">locator_has_coordinate</span> = <span class="s">"port"</span> } ] }
-
-[<span class="k">coverage</span>]
-<span class="k">depth_ladder</span> = [<span class="s">"discovered"</span>, <span class="s">"enumerated"</span>, <span class="s">"tested"</span>, <span class="s">"exploited"</span>]</pre>
-
-    <h3>The asset ledger</h3>
-    <p>Under an active engagement, <code class="inline">report_finding</code> (and <code class="inline">findings.record</code>) take an optional <code class="inline">asset { kind, coordinates }</code>. The kind routes the finding to its owning profile, that profile&rsquo;s <strong>required completeness checks</strong> must pass (e.g. <code class="inline">network</code> requires the service pinned to a host and port), and the asset is stamped into the target&rsquo;s asset ledger, <code class="inline">assets.jsonl</code>. The <code class="inline">asset_mark</code> tool &mdash; offered only under an active engagement &mdash; records how deeply an asset was examined along its profile&rsquo;s depth ladder. Depth is <strong>monotonic</strong>: a shallower mark after a deeper one keeps the deeper rung.</p>
+    <p>Engagement profiles type a run&rsquo;s findings by asset domain (<code class="inline">code</code>, <code class="inline">binary</code>, <code class="inline">network</code>, <code class="inline">web</code>, &hellip;): each finding is routed to the profile that owns its asset kind and gated on that profile&rsquo;s completeness checks, and assets and their depth are recorded in <code class="inline">assets.jsonl</code>. They have their own page: <a class="link" href="/docs/profiles.html">Engagement profiles</a>.</p>
 
     <div class="doc-nav">
       <a href="/docs/netflow.html">&#8592; Netflow</a>

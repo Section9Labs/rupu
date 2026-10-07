@@ -1,0 +1,400 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu docs — Engagement profiles</title>
+<meta name="description" content="Engagement profiles: asset kinds, coordinates, completeness checks and depth ladders; the built-in catalog, the TOML schema for your own, and the asset ledger.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="docs-shell">
+
+  <!-- ════ SHARED SIDEBAR (copy verbatim into every docs page; set .active) ════ -->
+  <aside class="docs-side">
+    <a class="brand" href="/" aria-label="rupu home">
+      <span class="mark" aria-hidden="true">&#8734;</span>
+      <span class="name">rupu</span>
+    </a>
+    <div class="grp">Start</div>
+    <a class="item" href="/docs/quickstart.html">Quickstart</a>
+    <a class="item" href="/docs/">Overview &amp; install</a>
+    <div class="grp">Concepts</div>
+    <a class="item" href="/docs/agents.html">Agents</a>
+    <a class="item" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
+    <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
+    <a class="item" href="/docs/sessions.html">Sessions</a>
+    <a class="item active" href="/docs/profiles.html">Engagement profiles</a>
+    <div class="grp">Platform</div>
+    <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item" href="/docs/reliability.html">Recovery &amp; reliability</a>
+    <a class="item" href="/docs/integrations.html">Integrations</a>
+    <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
+    <a class="item" href="/docs/triggers.html">Triggers</a>
+    <a class="item" href="/docs/control-plane.html">Control plane</a>
+    <a class="item" href="/docs/multi-host.html">Multi-host</a>
+    <a class="item" href="/docs/netflow.html">Netflow</a>
+    <a class="item" href="/docs/coverage.html">Coverage</a>
+    <a class="item" href="/docs/findings.html">Findings</a>
+    <a class="item" href="/docs/customers.html">Customers</a>
+    <div class="grp">Reference</div>
+    <a class="item" href="/docs/cli.html">CLI reference</a>
+    <a class="item" href="/docs/configuration.html">Configuration</a>
+    <a class="item" href="/docs/api.html">HTTP API</a>
+    <a class="item" href="/docs/transcripts.html">Transcript schema</a>
+    <div class="grp">More</div>
+    <a class="item" href="/docs/examples/">Examples</a>
+    <a class="item" href="/#download">Download</a>
+    <a class="item" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </aside>
+  <!-- ════ /SHARED SIDEBAR ════ -->
+
+  <main class="docs-main">
+    <h1>Engagement profiles</h1>
+    <p class="intro">An engagement profile tells rupu what kind of thing an engagement is about &mdash; source code, a binary, a network, a web application, a cloud account, a threat model &mdash; and therefore what a complete finding about it looks like.</p>
+
+    <h2 id="concepts">Concepts</h2>
+    <p>A profile is a small TOML file. It declares the <strong>asset kinds</strong> that exist in its domain, the <strong>coordinates</strong> that pin each one down, a <strong>completeness checklist</strong> that every finding must pass, and a <strong>depth ladder</strong> that records how far each asset has been examined. rupu ships 15 profiles. You can override any of them, or add your own by writing a TOML file &mdash; no Rust needed.</p>
+    <ul>
+      <li><strong>Asset.</strong> A finding is always about something: a file, a function at an address, a service on a host, a route, a cloud resource. That thing is an asset. It has a kind, a locator and, optionally, a depth.</li>
+      <li><strong>Kind.</strong> Every kind belongs to a profile and carries its namespace: <code class="inline">network:service</code>, <code class="inline">web:route</code>, <code class="inline">binary:function</code>. Kinds can form a hierarchy within their profile (a <code class="inline">service</code> sits under a <code class="inline">host</code>).</li>
+      <li><strong>Routing.</strong> When a finding names an asset, its kind&rsquo;s namespace picks the profile that owns it. That profile, and only that profile, judges the finding.</li>
+      <li><strong>Validation.</strong> The owning profile&rsquo;s required completeness checks run against the finding&rsquo;s report and the asset&rsquo;s locator. A finding that fails is rejected, and the error lists each unmet check, so the agent can fix it and record it again.</li>
+      <li><strong>Depth.</strong> Each profile has a depth ladder, such as <code class="inline">discovered &rarr; enumerated &rarr; tested &rarr; exploited</code>. It records how deeply each asset was examined, separately from any findings about it.</li>
+    </ul>
+    <div class="callout"><strong>Not a sandbox.</strong> A profile governs how findings are <em>typed, routed and validated</em>. It doesn&rsquo;t run, gate or scope tools, and it doesn&rsquo;t limit what an agent can reach. Agents examine binaries, hosts and services with <code class="inline">bash</code> and whatever tooling they like; rupu records and validates the findings that result, not the traffic.</div>
+
+    <h3>Coordinates</h3>
+    <p>A <strong>locator</strong> is the set of typed coordinates that pins an asset down. The core knows exactly 13 coordinate types, and every profile builds on them. Each is written as <code class="inline">{"t": &lt;tag&gt;, "v": &lt;value&gt;}</code>. A locator can be empty &mdash; a threat-model component has no coordinates at all.</p>
+    <table>
+      <thead><tr><th>Tag</th><th>Value</th><th>Typical use</th></tr></thead>
+      <tbody>
+        <tr><td><code>path</code></td><td>string</td><td>file or archive path</td></tr>
+        <tr><td><code>line_range</code></td><td><code>{"start": 10, "end": 24}</code></td><td>lines in a file</td></tr>
+        <tr><td><code>symbol</code></td><td>string</td><td>function or symbol name</td></tr>
+        <tr><td><code>commit</code></td><td>string</td><td>VCS commit</td></tr>
+        <tr><td><code>sha256</code></td><td>string</td><td>hash of a binary, image or package</td></tr>
+        <tr><td><code>offset</code></td><td>integer</td><td>byte offset</td></tr>
+        <tr><td><code>address</code></td><td>integer</td><td>virtual address</td></tr>
+        <tr><td><code>host</code></td><td>string</td><td>hostname or IP</td></tr>
+        <tr><td><code>port</code></td><td><code>{"number": 443, "proto": "tcp"}</code> (<code>tcp</code> | <code>udp</code> | <code>other</code>)</td><td>network port</td></tr>
+        <tr><td><code>url</code></td><td>string</td><td>URL</td></tr>
+        <tr><td><code>http_route</code></td><td><code>{"method": "GET", "path": "/api/items"}</code></td><td>HTTP method + path</td></tr>
+        <tr><td><code>param</code></td><td>string</td><td>request parameter</td></tr>
+        <tr><td><code>resource_id</code></td><td><code>{"scheme": "arn", "id": "…"}</code></td><td>cloud resource, package URL, objective id</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="selecting">Selecting profiles</h2>
+    <pre class="code"><span class="k">rupu run</span> --engagement-profile binary  <span class="s">firmware-re</span> <span class="s">"reverse ./dist/updater.bin"</span>
+<span class="k">rupu run</span> --engagement-profile network <span class="s">recon</span>       <span class="s">"map 10.20.0.0/24"</span>
+<span class="k">rupu run</span> --engagement-profile network,web <span class="s">assessor</span> <span class="s">"..."</span>   <span class="c"># two profiles</span>
+<span class="k">rupu run</span> --engagement-profiles pentest <span class="s">assessor</span>    <span class="s">"..."</span>   <span class="c"># a composite</span>
+<span class="k">rupu workflow run</span> <span class="s">edge-sweep</span> --engagement-profile network</pre>
+    <table>
+      <thead><tr><th>Surface</th><th>How</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>rupu run</code></td><td><code>--engagement-profile &lt;id&gt;</code></td><td>Alias <code>--engagement-profiles</code>; repeat the flag or pass a comma-separated list. Sub-agents started with <code>dispatch_agent</code> inherit the selection.</td></tr>
+        <tr><td><code>rupu workflow run</code></td><td><code>--engagement-profile &lt;id&gt;</code></td><td>Applies to every agent step. The selection isn&rsquo;t recorded on the run, so <code>rupu workflow resume</code> and an approve-resume carry on without it, on the <code>code</code> path.</td></tr>
+        <tr><td>Agentiflows</td><td><code>engagement_profiles:</code> (required)</td><td>rupu validates the definition against the profiles and passes the set to the lead and every unit. See <a class="link" href="/docs/agentiflows.html">Agentiflows</a>.</td></tr>
+        <tr><td>Sessions, autoflows, CP launches</td><td>&mdash;</td><td>These don&rsquo;t accept a selection and always run on the <code>code</code> path. The control plane shows the profiles an agentiflow ran with, but nothing launched from it takes one.</td></tr>
+        <tr><td>Remote workflow units</td><td>&mdash;</td><td>The selection doesn&rsquo;t reach a <code>host:</code> / <code>distribute:</code> unit, which runs on the <code>code</code> path.</td></tr>
+        <tr><td><code>rupu coverage rerun</code></td><td>&mdash;</td><td>Replays on the <code>code</code> path.</td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li><strong>No selection</strong> gives the native <code class="inline">code</code> path. This is not the same as selecting <code class="inline">code</code>: no engagement is active, so <code class="inline">asset_mark</code> isn&rsquo;t offered and <code class="inline">asset</code> arguments are ignored.</li>
+      <li><strong>An unknown id</strong> fails the launch. It never falls back to a default.</li>
+      <li><strong>A kind claimed twice</strong> is an error. <code class="inline">pentest,network</code> fails because <code class="inline">pentest</code> already includes <code class="inline">network</code>.</li>
+      <li><strong>Overlay profiles load at launch.</strong> If a discovered profile file fails to parse, the launch fails, even if you didn&rsquo;t select that profile.</li>
+    </ul>
+
+    <h2 id="catalog">The built-in catalog</h2>
+    <p><code class="inline">code</code> is the default. Each asset-kind entry gives its locator coordinates, with its parent kind in parentheses where it has one.</p>
+    <table>
+      <thead><tr><th>Profile</th><th>Purpose</th><th>Asset kinds &rarr; coordinates</th><th>Depth ladder</th></tr></thead>
+      <tbody>
+        <tr><td><code>code</code></td><td>Source code review</td><td><code>repo</code> &rarr; path; <code>file</code> (repo) &rarr; path, line_range; <code>function</code> (file) &rarr; path, symbol, line_range</td><td>unreviewed &rarr; reviewed</td></tr>
+        <tr><td><code>binary</code></td><td>Binary reverse engineering</td><td><code>binary</code> &rarr; sha256; <code>function</code> (binary) &rarr; sha256, address, symbol</td><td>located &rarr; disassembled &rarr; analyzed</td></tr>
+        <tr><td><code>firmware</code></td><td>Firmware assessment</td><td><code>image</code> &rarr; sha256; <code>partition</code> (image) &rarr; sha256, path; <code>file</code> (partition) &rarr; path, sha256; <code>function</code> (file) &rarr; path, address, symbol</td><td>acquired &rarr; extracted &rarr; unpacked &rarr; analyzed</td></tr>
+        <tr><td><code>network</code></td><td>Network security assessment</td><td><code>host</code> &rarr; host; <code>service</code> (host) &rarr; host, port</td><td>discovered &rarr; enumerated &rarr; tested &rarr; exploited</td></tr>
+        <tr><td><code>web</code></td><td>Web application assessment</td><td><code>site</code> &rarr; url; <code>route</code> (site) &rarr; url, http_route, param</td><td>mapped &rarr; crawled &rarr; tested &rarr; exploited</td></tr>
+        <tr><td><code>api</code></td><td>API security assessment</td><td><code>service</code> &rarr; url; <code>endpoint</code> (service) &rarr; url, http_route, param</td><td>mapped &rarr; tested &rarr; exploited</td></tr>
+        <tr><td><code>cloud</code></td><td>Cloud configuration review</td><td><code>account</code> &rarr; resource_id; <code>resource</code> (account) &rarr; resource_id</td><td>inventoried &rarr; policy-evaluated &rarr; validated</td></tr>
+        <tr><td><code>sca</code></td><td>Software composition analysis</td><td><code>repo</code> &rarr; path; <code>dependency</code> (repo) &rarr; path, resource_id</td><td>inventoried &rarr; resolved &rarr; triaged</td></tr>
+        <tr><td><code>iac</code></td><td>Infrastructure-as-code review</td><td><code>repo</code> &rarr; path; <code>resource</code> (repo) &rarr; path, line_range</td><td>mapped &rarr; reviewed</td></tr>
+        <tr><td><code>secrets</code></td><td>Secret scanning</td><td><code>repo</code> &rarr; path; <code>secret</code> (repo) &rarr; path, line_range, commit</td><td>scanned &rarr; triaged &rarr; confirmed</td></tr>
+        <tr><td><code>container</code></td><td>Container image assessment</td><td><code>image</code> &rarr; sha256; <code>layer</code> (image) &rarr; sha256, path; <code>package</code> (image) &rarr; resource_id</td><td>inventoried &rarr; scanned &rarr; triaged</td></tr>
+        <tr><td><code>redteam</code></td><td>Red team operation</td><td><code>host</code> &rarr; host; <code>objective</code> (host) &rarr; host, resource_id</td><td>planned &rarr; executed &rarr; validated</td></tr>
+        <tr><td><code>threat-model</code></td><td>Threat model</td><td><code>system</code> &rarr; none; <code>component</code> (system) &rarr; none</td><td>modeled &rarr; reviewed</td></tr>
+        <tr><td><code>mobile</code></td><td>Mobile application assessment (composite: <code>binary</code> + <code>web</code>)</td><td><code>package</code> &rarr; sha256</td><td>unpacked &rarr; static &rarr; dynamic</td></tr>
+        <tr><td><code>pentest</code></td><td>Penetration test (composite: <code>network</code> + <code>web</code>)</td><td>none of its own</td><td>none of its own</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Completeness, evidence and taxonomies</h3>
+    <p>Every built-in check is required, and <code class="inline">report_finding</code> enforces them. <strong>Evidence blocks</strong> and <strong>taxonomies</strong> are advisory: rupu enforces them only when a check names one. Taxonomy matching ignores case, and a report&rsquo;s legacy <code class="inline">cwe</code> list counts as <code class="inline">CWE</code>.</p>
+    <table>
+      <thead><tr><th>Profile</th><th>Required checks</th><th>Evidence blocks</th><th>Taxonomies</th></tr></thead>
+      <tbody>
+        <tr><td><code>code</code></td><td><code>located</code>: has <code>path</code> &middot; <code>has_root_cause</code></td><td>text, code_slice, diff</td><td>CWE, OWASP</td></tr>
+        <tr><td><code>binary</code></td><td><code>evidence_has_listing</code>: a disasm or hexdump block &middot; <code>has_root_cause</code> &middot; <code>classified</code>: CWE</td><td>text, code_slice, diff, hexdump, disasm</td><td>CWE, CVE</td></tr>
+        <tr><td><code>firmware</code></td><td><code>evidence_has_listing</code>: disasm, decompile or hexdump &middot; <code>classified</code>: CWE</td><td>text, hexdump, disasm, decompile, table</td><td>CWE, CVE</td></tr>
+        <tr><td><code>network</code></td><td><code>service_identified</code>: <code>host</code> and <code>port</code> &middot; <code>has_root_cause</code> &middot; <code>classified</code>: CVE or CWE</td><td>text, table, scan_output, http_exchange, pcap_ref</td><td>CVE, CWE, CAPEC, ATT&amp;CK</td></tr>
+        <tr><td><code>web</code></td><td><code>route_identified</code>: <code>http_route</code> or <code>url</code> &middot; <code>evidence_has_exchange</code>: http_exchange &middot; <code>classified</code>: OWASP or CWE</td><td>text, http_exchange, image, table</td><td>OWASP, CWE, CVE</td></tr>
+        <tr><td><code>api</code></td><td><code>endpoint_identified</code>: <code>http_route</code> &middot; <code>evidence_has_exchange</code>: http_exchange</td><td>text, http_exchange, table</td><td>OWASP-API, CWE</td></tr>
+        <tr><td><code>cloud</code></td><td><code>resource_identified</code>: <code>resource_id</code> &middot; <code>classified</code>: CIS or CWE</td><td>text, table, code_slice</td><td>CIS, CWE, ATT&amp;CK</td></tr>
+        <tr><td><code>sca</code></td><td><code>dependency_identified</code>: <code>resource_id</code> (a purl) &middot; <code>classified</code>: CVE or GHSA</td><td>table, text</td><td>CVE, GHSA</td></tr>
+        <tr><td><code>iac</code></td><td><code>located</code>: <code>path</code> and <code>line_range</code> &middot; <code>classified</code>: CIS or CWE</td><td>code_slice, diff, table</td><td>CIS, CWE</td></tr>
+        <tr><td><code>secrets</code></td><td><code>located</code>: <code>path</code> and <code>line_range</code> &middot; <code>classified</code>: CWE</td><td>code_slice, text</td><td>CWE</td></tr>
+        <tr><td><code>container</code></td><td><code>component_identified</code>: <code>resource_id</code> or <code>path</code> &middot; <code>classified</code>: CVE</td><td>table, text</td><td>CVE</td></tr>
+        <tr><td><code>redteam</code></td><td><code>mapped_to_attack</code>: ATT&amp;CK &middot; <code>has_narrative</code>: <code>description</code></td><td>text, scan_output, image</td><td>ATT&amp;CK</td></tr>
+        <tr><td><code>threat-model</code></td><td><code>has_threat</code>: <code>description</code> &middot; <code>classified</code>: STRIDE</td><td>text, image, table</td><td>STRIDE, CAPEC, ATT&amp;CK</td></tr>
+        <tr><td><code>mobile</code></td><td><code>package_identified</code>: <code>sha256</code>, <code>address</code> or <code>http_route</code> (its own <code>mobile:package</code> kind only)</td><td>disasm, http_exchange, image</td><td>MASVS, OWASP, CWE</td></tr>
+        <tr><td><code>pentest</code></td><td>none of its own</td><td>&mdash;</td><td>&mdash;</td></tr>
+      </tbody>
+    </table>
+    <p>Every built-in profile also declares a <code class="inline">[bundle]</code>: the agents and workflows an engagement of that kind typically uses. A bundle never grants tools. The <a class="link" href="#fleet">stock security fleet</a> is built from these bundles, and rupu&rsquo;s own tests keep the two in lockstep.</p>
+
+    <h3>Composites and routing</h3>
+    <p>A composite is a profile with an <code class="inline">includes</code> list. Selecting one is shorthand for selecting its members, and each member stays its <strong>own routing target</strong> &mdash; the members are not merged. During a <code class="inline">pentest</code> run, a <code class="inline">network:service</code> finding is judged by <code class="inline">network</code>&rsquo;s checks and a <code class="inline">web:route</code> finding by <code class="inline">web</code>&rsquo;s. <code class="inline">mobile</code> adds its own root kind, <code class="inline">mobile:package</code>, alongside <code class="inline">binary</code> and <code class="inline">web</code>. <code class="inline">includes</code> is transitive; an include cycle, or an include of a profile that doesn&rsquo;t exist, is a load error.</p>
+
+    <h2 id="fleet">The stock security fleet</h2>
+    <p>A profile says what a complete finding looks like; it doesn&rsquo;t ship anyone to find them. The <strong>stock fleet</strong> does: 18 generic security-assessment agents and 3 workflows, one set for every built-in bundle. Install it once and every engagement, in any project, can draw on it.</p>
+    <pre class="code"><span class="k">rupu fleet list</span>                    <span class="c"># what the fleet ships</span>
+<span class="k">rupu fleet install</span>                 <span class="c"># into ~/.rupu (or $RUPU_HOME)</span>
+<span class="k">rupu fleet install</span> --project       <span class="c"># into this project's .rupu/ instead</span>
+<span class="k">rupu fleet install</span> --force         <span class="c"># re-seed files you've edited</span></pre>
+    <p>The fleet is plain files: <code class="inline">agents/&lt;name&gt;.md</code> and <code class="inline">workflows/&lt;id&gt;.yaml</code>, written exactly where rupu&rsquo;s loaders look. A file that already exists is <strong>kept</strong>, so your edits survive a reinstall; each file is reported as <code class="inline">CREATED</code>, <code class="inline">SKIPPED</code> or <code class="inline">OVERWROTE</code>. <code class="inline">--force</code> overwrites them with the shipped versions. <code class="inline">--project</code> needs a <code class="inline">.rupu/</code> (run <code class="inline">rupu init</code> first), and a project copy shadows the global one, as for any agent or workflow.</p>
+    <table>
+      <thead><tr><th>Profile</th><th>Bundle agents</th><th>Bundle workflows</th></tr></thead>
+      <tbody>
+        <tr><td><code>network</code></td><td><code>assessment-lead</code>, <code>recon</code>, <code>service-analyst</code>, <code>exploit-verifier</code></td><td><code>network-assessment</code></td></tr>
+        <tr><td><code>web</code></td><td><code>assessment-lead</code>, <code>crawler</code>, <code>appsec-tester</code></td><td><code>web-assessment</code></td></tr>
+        <tr><td><code>api</code></td><td><code>assessment-lead</code>, <code>api-tester</code></td><td><code>api-assessment</code></td></tr>
+        <tr><td><code>pentest</code></td><td>the <code>network</code> and <code>web</code> agents</td><td><code>network-assessment</code>, <code>web-assessment</code></td></tr>
+        <tr><td><code>redteam</code></td><td><code>assessment-lead</code>, <code>redteam-operator</code></td><td>&mdash;</td></tr>
+        <tr><td><code>code</code></td><td><code>code-auditor</code></td><td>&mdash;</td></tr>
+        <tr><td><code>binary</code></td><td><code>binary-analyst</code></td><td>&mdash;</td></tr>
+        <tr><td><code>firmware</code></td><td><code>firmware-analyst</code></td><td>&mdash;</td></tr>
+        <tr><td><code>cloud</code></td><td><code>cloud-auditor</code></td><td>&mdash;</td></tr>
+        <tr><td><code>sca</code></td><td><code>sca-auditor</code></td><td>&mdash;</td></tr>
+        <tr><td><code>iac</code></td><td><code>iac-reviewer</code></td><td>&mdash;</td></tr>
+        <tr><td><code>secrets</code></td><td><code>secret-scanner</code></td><td>&mdash;</td></tr>
+        <tr><td><code>container</code></td><td><code>container-scanner</code></td><td>&mdash;</td></tr>
+        <tr><td><code>threat-model</code></td><td><code>threat-modeler</code></td><td>&mdash;</td></tr>
+        <tr><td><code>mobile</code></td><td><code>mobile-analyst</code></td><td>&mdash;</td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li><strong>Specialists</strong> each do one job inside the authorized scope they&rsquo;re given. Discovery agents (<code class="inline">recon</code>, <code class="inline">crawler</code>) map and <code class="inline">asset_mark</code> what they find but don&rsquo;t test; analysts and testers verify before they <code class="inline">report_finding</code>, pinned to the asset with the evidence and classification their profile&rsquo;s checks require; <code class="inline">exploit-verifier</code> independently confirms or refutes claimed exposures. Destructive testing is ruled out in every prompt.</li>
+      <li><strong><code class="inline">assessment-lead</code></strong> is a generic <a class="link" href="/docs/agentiflows.html">agentiflow</a> lead. It reads the scope and goals, lists the pool with <code class="inline">agents.list</code> / <code class="inline">workflows.list</code> rather than assuming names, then works in rounds &mdash; map, analyze in parallel batches, verify &mdash; until the scope is swept or the budget runs low.</li>
+      <li><strong>The workflows</strong> chain the same agents for a fixed run: <code class="inline">network-assessment</code> is recon &rarr; analyze &rarr; verify, <code class="inline">web-assessment</code> is crawl &rarr; test, and <code class="inline">api-assessment</code> is a single assess step. Each takes one required input, <code class="inline">scope</code>.</li>
+      <li><strong>Every fleet agent runs in <code class="inline">bypass</code> mode</strong> with a wide tool grant (<code class="inline">*</code> plus the findings and asset tools). That suits an authorized lab engagement; for anything else, read the files and narrow them before you run them.</li>
+    </ul>
+    <p>Run a workflow under its profile so the asset and findings tools are active:</p>
+    <pre class="code"><span class="k">rupu fleet install</span>
+<span class="k">rupu workflow run</span> <span class="s">web-assessment</span> --engagement-profile web \
+  --input scope=<span class="s">"https://staging.example.test (exclude /admin/billing)"</span></pre>
+    <p>Or hand the whole pool to the lead in an agentiflow:</p>
+    <pre class="code"><span class="c"># .rupu/agentiflows/lab-sweep.yaml (excerpt)</span>
+<span class="k">lead</span>: <span class="s">assessment-lead</span>
+<span class="k">engagement_profiles</span>: [<span class="s">network</span>]
+<span class="k">pool</span>:
+  <span class="k">agents</span>: [<span class="s">assessment-lead</span>, <span class="s">recon</span>, <span class="s">service-analyst</span>, <span class="s">exploit-verifier</span>]
+  <span class="k">workflows</span>: [<span class="s">network-assessment</span>]</pre>
+    <div class="callout"><strong>Bundles and the fleet stay in step.</strong> A test fails rupu&rsquo;s build if any built-in bundle names an agent or workflow the fleet doesn&rsquo;t ship, or if the fleet ships one no bundle names. A bundle in <em>your own</em> profile isn&rsquo;t checked against anything, and rupu doesn&rsquo;t install or select a bundle&rsquo;s members when you pick the profile &mdash; you still name the agent or workflow you run.</div>
+
+    <h2 id="assets">Recording assets</h2>
+    <p>Two tools write assets, both to the target&rsquo;s asset ledger, <code class="inline">.rupu/coverage/&lt;target&gt;/assets.jsonl</code>, next to <code class="inline">findings.jsonl</code>.</p>
+    <h3>report_finding with an asset</h3>
+    <pre class="code">{
+  <span class="k">"scope"</span>: <span class="s">"edge-sweep"</span>,
+  <span class="k">"report"</span>: { <span class="c">/* a complete finding report */</span> },
+  <span class="k">"asset"</span>: {
+    <span class="k">"kind"</span>: <span class="s">"network:service"</span>,
+    <span class="k">"coordinates"</span>: [
+      { <span class="k">"t"</span>: <span class="s">"host"</span>, <span class="k">"v"</span>: <span class="s">"198.51.100.20"</span> },
+      { <span class="k">"t"</span>: <span class="s">"port"</span>, <span class="k">"v"</span>: { <span class="k">"number"</span>: <span class="v">8443</span>, <span class="k">"proto"</span>: <span class="s">"tcp"</span> } }
+    ],
+    <span class="k">"label"</span>: <span class="s">"198.51.100.20:8443 admin console"</span>
+  }
+}</pre>
+    <p>When an engagement is active, rupu:</p>
+    <ol>
+      <li><strong>Routes</strong> the finding by its namespaced <code class="inline">kind</code>. If no active profile owns the kind, the call fails, and the error names the active set.</li>
+      <li><strong>Checks completeness.</strong> Every required check of the owning profile is evaluated under the <code class="inline">full</code> finding profile. If any check fails, the finding is rejected with the labels of the failing checks. Under <code class="inline">summary</code> there&rsquo;s no report to evaluate, so this step is skipped.</li>
+      <li><strong>Stamps the asset</strong> into <code class="inline">assets.jsonl</code> and the run&rsquo;s coverage stream, so a coordinator collecting a remote unit receives it. The new line keeps the asset&rsquo;s existing depth, parent, attributes and label, unless the call supplies a new label.</li>
+    </ol>
+    <p>The finding record itself does not store an asset id. When no engagement is active, <code class="inline">asset</code> is ignored. When an engagement is active but the finding has no asset, it records on the plain path without a completeness check. The MCP <code class="inline">findings.record</code> tool doesn&rsquo;t accept <code class="inline">asset</code> yet, and <code class="inline">rupu findings import</code> records no asset.</p>
+    <h3>asset_mark</h3>
+    <pre class="code">{ <span class="k">"kind"</span>: <span class="s">"web:route"</span>,
+  <span class="k">"coordinates"</span>: [ { <span class="k">"t"</span>: <span class="s">"url"</span>, <span class="k">"v"</span>: <span class="s">"https://shop.example.test"</span> },
+                   { <span class="k">"t"</span>: <span class="s">"http_route"</span>, <span class="k">"v"</span>: { <span class="k">"method"</span>: <span class="s">"POST"</span>, <span class="k">"path"</span>: <span class="s">"/cart/apply"</span> } } ],
+  <span class="k">"depth"</span>: <span class="s">"tested"</span> }</pre>
+    <p><code class="inline">depth</code> must be a rung of the owning profile&rsquo;s ladder; any other value is an error that lists the ladder. <strong>Depth only moves forward</strong>: if an asset is already at <code class="inline">exploited</code>, marking it <code class="inline">tested</code> leaves it at <code class="inline">exploited</code>, and the tool returns the rung that ends up recorded (<code class="inline">effective_depth</code>). The engine offers <code class="inline">asset_mark</code> and <code class="inline">report_finding</code> to every agent in an engagement run, whatever the agent&rsquo;s <code class="inline">tools:</code> list says. Without an active engagement, <code class="inline">asset_mark</code> doesn&rsquo;t exist.</p>
+    <h3>The ledger and its views</h3>
+    <p><code class="inline">assets.jsonl</code> only ever gets appended to, one full asset per line (<code class="inline">id</code>, <code class="inline">kind</code>, <code class="inline">parent</code>, <code class="inline">locator</code>, <code class="inline">label</code>, <code class="inline">depth</code>, <code class="inline">attributes</code>). When the file is read, the last line for each id wins. An asset&rsquo;s id is <code class="inline">&lt;kind&gt;:&lt;16 hex&gt;</code>, derived from the kind plus the sorted locator, so the same host and port always map to the same asset, across reruns too. The profile&rsquo;s <code class="inline">label</code> template is declarative and isn&rsquo;t rendered: an asset&rsquo;s label is whatever the caller passed, or else its kind.</p>
+    <p>Remote units&rsquo; asset lines arrive through the coverage stream and are merged into the coordinator. The control plane&rsquo;s <strong>Security &rarr; Assets</strong> page lists every asset from every registered workspace, and an agentiflow&rsquo;s <strong>Assets</strong> tab shows the same data for one run (both use <code class="inline">GET /api/assets</code>). Agentiflow coverage goals measure this ledger.</p>
+
+    <h2 id="writing">Writing a profile</h2>
+    <h3>Where profiles live</h3>
+    <table>
+      <thead><tr><th>Source</th><th>Location</th><th>Precedence</th></tr></thead>
+      <tbody>
+        <tr><td>Built-in</td><td>compiled into the binary</td><td>lowest</td></tr>
+        <tr><td>Global</td><td><code>~/.rupu/profiles/*.toml</code></td><td>overrides built-in</td></tr>
+        <tr><td>Project</td><td><code>.rupu/profiles/*.toml</code> in the run&rsquo;s workspace (for an agentiflow, the directory you launch from)</td><td>highest</td></tr>
+      </tbody>
+    </table>
+    <p>rupu identifies a profile by its <code class="inline">id</code> field; the file name doesn&rsquo;t matter. A later source with the same <code class="inline">id</code> <strong>replaces</strong> the earlier profile completely &mdash; nothing is merged &mdash; so to change one check of a built-in, copy the whole built-in and edit the copy. Within one directory, files load in name order, and the last one wins. Only <code class="inline">*.toml</code> files are read, and a missing directory is fine.</p>
+
+    <h3>Schema</h3>
+    <p>All keys are strict: <strong>an unknown key in any table is a parse error.</strong> Put the top-level keys before the first <code class="inline">[[asset_kinds]]</code>, or TOML assigns them to that kind and the file fails to parse.</p>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>id</code></td><td>string, required</td><td>Profile id, and the namespace of its kinds (<code>&lt;id&gt;:&lt;kind&gt;</code>)</td></tr>
+        <tr><td><code>name</code></td><td>string, required</td><td>Human-readable name</td></tr>
+        <tr><td><code>includes</code></td><td>string list</td><td>Profiles this one includes (makes it a composite)</td></tr>
+        <tr><td><code>evidence_blocks</code></td><td>string list</td><td>Evidence-block kinds the engagement expects (advisory)</td></tr>
+        <tr><td><code>classification_systems</code></td><td>string list</td><td>Taxonomies the engagement uses (advisory)</td></tr>
+        <tr><td><code>[[asset_kinds]]</code> <code>id</code></td><td>string, required</td><td>Bare kind id, namespaced as <code>&lt;profile&gt;:&lt;id&gt;</code></td></tr>
+        <tr><td><code>[[asset_kinds]]</code> <code>parent</code></td><td>string</td><td>Parent kind id in the same profile; omit for a root</td></tr>
+        <tr><td><code>[[asset_kinds]]</code> <code>coordinates</code></td><td>string list</td><td>Coordinate tags an asset of this kind carries (descriptive)</td></tr>
+        <tr><td><code>[[asset_kinds]]</code> <code>label</code></td><td>string, required</td><td>Label template such as <code>"{host}:{port}"</code> (descriptive, not rendered)</td></tr>
+        <tr><td><code>[[completeness]]</code> <code>id</code> / <code>label</code></td><td>string, required</td><td>Check id; the label is shown in the rejection message when the check fails</td></tr>
+        <tr><td><code>[[completeness]]</code> <code>required</code></td><td>bool, default <code>true</code></td><td><code>false</code> makes the check informational; it isn&rsquo;t evaluated</td></tr>
+        <tr><td><code>[[completeness]]</code> <code>satisfied_when</code></td><td>predicate, required</td><td>See below</td></tr>
+        <tr><td><code>[coverage]</code> <code>enumerates</code></td><td>string list</td><td>Bare kind ids that agentiflow coverage goals count by default</td></tr>
+        <tr><td><code>[coverage]</code> <code>depth_ladder</code></td><td>string list</td><td>Ordered rungs, shallowest first; the only depths <code>asset_mark</code> accepts. The last rung is a coverage goal&rsquo;s default target.</td></tr>
+        <tr><td><code>[bundle]</code> <code>agents</code> / <code>workflows</code> / <code>tools</code></td><td>string lists</td><td>The agents, workflows and tools an engagement of this kind typically uses. Descriptive only: never a grant, and nothing installs or loads them for you</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Predicates</h3>
+    <table>
+      <thead><tr><th>Predicate</th><th>True when</th></tr></thead>
+      <tbody>
+        <tr><td><code>{ has_field = "…" }</code></td><td>the report field is filled in: <code>root_cause</code>, <code>remediation</code>, <code>impact</code>, <code>description</code>, <code>attack_vector</code>, <code>category</code> (non-blank), <code>replication_steps</code> (non-empty), <code>evidence</code> (any claim or block)</td></tr>
+        <tr><td><code>{ has_block_kind = "…" }</code></td><td>the report has at least one block of that kind: <code>text</code>, <code>code_slice</code>, <code>diff</code>, <code>table</code>, <code>image</code>, <code>hexdump</code>, <code>disasm</code>, <code>decompile</code>, <code>http_exchange</code>, <code>scan_output</code>, <code>pcap_ref</code></td></tr>
+        <tr><td><code>{ has_classification_system = "…" }</code></td><td>a classification uses that system (case-insensitive)</td></tr>
+        <tr><td><code>{ locator_has_coordinate = "…" }</code></td><td>the asset&rsquo;s locator has a coordinate with that tag</td></tr>
+        <tr><td><code>{ min_severity = "…" }</code></td><td><code>rating.risk_rating</code> is at least <code>Low</code>, <code>Medium</code>, <code>High</code> or <code>Critical</code> (capitalized)</td></tr>
+        <tr><td><code>{ all = [ … ] }</code> / <code>{ any = [ … ] }</code></td><td>every / at least one nested predicate holds</td></tr>
+      </tbody>
+    </table>
+    <p>That is the whole predicate grammar. It isn&rsquo;t meant to grow into a scripting language.</p>
+
+    <h3>Failure modes</h3>
+    <table>
+      <thead><tr><th>Mistake</th><th>When it shows up</th><th>What you see</th></tr></thead>
+      <tbody>
+        <tr><td>Unknown key, wrong type, or a top-level key after <code>[[asset_kinds]]</code></td><td>launch, for any run with a selection</td><td><code>engagement profiles: unloadable profiles: &lt;file&gt;: profile parse: …</code> &mdash; even if this profile wasn&rsquo;t selected</td></tr>
+        <tr><td>Unreadable file or directory</td><td>launch</td><td>the same message, with the IO error</td></tr>
+        <tr><td>Missing include, or an include cycle</td><td>launch</td><td><code>profile `x` is included but not defined</code> / <code>include cycle at profile `x`</code></td></tr>
+        <tr><td>Selected id doesn&rsquo;t exist</td><td>launch</td><td><code>unknown engagement profile `x`</code></td></tr>
+        <tr><td>Two selections contribute the same kind</td><td>launch</td><td><code>asset kind `x:y` is contributed by more than one selected profile</code></td></tr>
+        <tr><td>Typo in a predicate&rsquo;s field, block kind or coordinate tag</td><td>the first finding that routes to the profile</td><td>that finding is rejected with <code>completeness predicate error for profile …</code></td></tr>
+      </tbody>
+    </table>
+    <div class="callout"><strong>Test with one finding.</strong> Loading checks only the TOML structure. A predicate&rsquo;s field names, block kinds and coordinate tags are first checked when a finding reaches it, so record one real finding against a new profile before you rely on it.</div>
+
+    <h3>Worked example: an IoT fleet engagement</h3>
+    <p>The profile below is invented for this guide. It covers fleets of embedded devices: a device is found by its address, it exposes services, and each firmware build is identified by its hash. Save it as <code class="inline">.rupu/profiles/iot-fleet.toml</code>:</p>
+    <pre class="code"><span class="k">id</span> = <span class="s">"iot-fleet"</span>
+<span class="k">name</span> = <span class="s">"IoT device fleet assessment"</span>
+<span class="k">evidence_blocks</span> = [<span class="s">"text"</span>, <span class="s">"scan_output"</span>, <span class="s">"hexdump"</span>, <span class="s">"http_exchange"</span>, <span class="s">"table"</span>]
+<span class="k">classification_systems</span> = [<span class="s">"CWE"</span>, <span class="s">"CVE"</span>]
+
+[[<span class="k">asset_kinds</span>]]
+<span class="k">id</span> = <span class="s">"device"</span>
+<span class="k">coordinates</span> = [<span class="s">"host"</span>]
+<span class="k">label</span> = <span class="s">"{host}"</span>
+
+[[<span class="k">asset_kinds</span>]]
+<span class="k">id</span> = <span class="s">"service"</span>
+<span class="k">parent</span> = <span class="s">"device"</span>
+<span class="k">coordinates</span> = [<span class="s">"host"</span>, <span class="s">"port"</span>]
+<span class="k">label</span> = <span class="s">"{host}:{port}"</span>
+
+[[<span class="k">asset_kinds</span>]]
+<span class="k">id</span> = <span class="s">"firmware"</span>
+<span class="k">parent</span> = <span class="s">"device"</span>
+<span class="k">coordinates</span> = [<span class="s">"host"</span>, <span class="s">"sha256"</span>]
+<span class="k">label</span> = <span class="s">"{sha256}"</span>
+
+[[<span class="k">completeness</span>]]
+<span class="k">id</span> = <span class="s">"pinned"</span>
+<span class="k">label</span> = <span class="s">"Pinned to a device service or a firmware build"</span>
+<span class="k">satisfied_when</span> = { <span class="k">all</span> = [
+  { <span class="k">locator_has_coordinate</span> = <span class="s">"host"</span> },
+  { <span class="k">any</span> = [ { <span class="k">locator_has_coordinate</span> = <span class="s">"port"</span> }, { <span class="k">locator_has_coordinate</span> = <span class="s">"sha256"</span> } ] },
+] }
+
+[[<span class="k">completeness</span>]]
+<span class="k">id</span> = <span class="s">"evidence"</span>
+<span class="k">label</span> = <span class="s">"Scan output, hexdump or HTTP exchange attached"</span>
+<span class="k">satisfied_when</span> = { <span class="k">any</span> = [
+  { <span class="k">has_block_kind</span> = <span class="s">"scan_output"</span> },
+  { <span class="k">has_block_kind</span> = <span class="s">"hexdump"</span> },
+  { <span class="k">has_block_kind</span> = <span class="s">"http_exchange"</span> },
+] }
+
+[[<span class="k">completeness</span>]]
+<span class="k">id</span> = <span class="s">"classified"</span>
+<span class="k">label</span> = <span class="s">"Classified (CWE or CVE)"</span>
+<span class="k">satisfied_when</span> = { <span class="k">any</span> = [ { <span class="k">has_classification_system</span> = <span class="s">"CWE"</span> }, { <span class="k">has_classification_system</span> = <span class="s">"CVE"</span> } ] }
+
+[[<span class="k">completeness</span>]]
+<span class="k">id</span> = <span class="s">"has_fix"</span>
+<span class="k">label</span> = <span class="s">"Remediation for high-severity issues"</span>
+<span class="k">required</span> = <span class="v">false</span>        <span class="c"># informational: not evaluated</span>
+<span class="k">satisfied_when</span> = { <span class="k">has_field</span> = <span class="s">"remediation"</span> }
+
+[<span class="k">coverage</span>]
+<span class="k">enumerates</span> = [<span class="s">"device"</span>, <span class="s">"service"</span>, <span class="s">"firmware"</span>]
+<span class="k">depth_ladder</span> = [<span class="s">"discovered"</span>, <span class="s">"fingerprinted"</span>, <span class="s">"tested"</span>, <span class="s">"exploited"</span>]</pre>
+    <pre class="code"><span class="k">rupu run</span> --engagement-profile iot-fleet <span class="s">fleet-recon</span> <span class="s">"assess the lab segment 192.0.2.0/28"</span></pre>
+    <p>During the run, the agent might call <code class="inline">asset_mark</code> with kind <code class="inline">iot-fleet:device</code>, host <code class="inline">192.0.2.7</code> and depth <code class="inline">fingerprinted</code>, then call <code class="inline">report_finding</code> with an <code class="inline">iot-fleet:service</code> asset pinned by host and port 23/tcp, and a report that has a <code class="inline">scan_output</code> block and a CWE classification. If the agent omits the port and the hash, the finding is rejected with <em>Pinned to a device service or a firmware build</em>, and the agent can add the missing coordinates and try again.</p>
+
+    <h2 id="not-to-confuse">Profiles, finding profiles and concern catalogs</h2>
+    <p>Three separate rupu features have names that sound alike. They don&rsquo;t depend on each other:</p>
+    <table>
+      <thead><tr><th></th><th>Engagement profile</th><th>Finding profile</th><th>Concern catalog</th></tr></thead>
+      <tbody>
+        <tr><td>Answers</td><td>What is this engagement about, and when is a finding about it complete?</td><td>How much does each finding record?</td><td>What should the agent check for, file by file?</td></tr>
+        <tr><td>Values</td><td><code>code</code>, <code>network</code>, <code>web</code>, &hellip; or your own TOML</td><td><code>full</code> (default) or <code>summary</code></td><td><code>owasp-top10-2021</code>, <code>cwe-top25-2023</code>, &hellip; or your own YAML</td></tr>
+        <tr><td>Chosen by</td><td><code>--engagement-profile</code>, agentiflow <code>engagement_profiles:</code></td><td>agent <code>findingsProfile</code>, workflow / step <code>findings_profile</code>, <code>--findings-profile</code></td><td>the agent&rsquo;s <code>concerns:</code> block</td></tr>
+        <tr><td>Lives in</td><td>built-in, <code>~/.rupu/profiles/</code>, <code>.rupu/profiles/</code></td><td>built into rupu</td><td>built-in, <code>~/.rupu/concerns/</code>, <code>.rupu/concerns/</code></td></tr>
+        <tr><td>Records</td><td><code>assets.jsonl</code> + completeness-gated findings</td><td>the shape of each finding record</td><td>file &times; concern verdicts</td></tr>
+      </tbody>
+    </table>
+    <p>Completeness checks run only on a <code class="inline">full</code> report (see <a class="link" href="/docs/findings.html">Findings</a>); under <code class="inline">summary</code> an asset is still routed and recorded, but its checks are skipped. Concern catalogs are lists of things to check (see <a class="link" href="/docs/coverage.html">Coverage</a>). They&rsquo;re independent of the engagement: a <code class="inline">code</code> engagement can use <code class="inline">owasp-top10-2021</code>, and so can a run with no engagement. The bundled catalogs (<code class="inline">rupu coverage templates list</code>, or <code class="inline">show &lt;name&gt;</code> to print one):</p>
+    <table>
+      <thead><tr><th>Catalog</th><th>Contents</th></tr></thead>
+      <tbody>
+        <tr><td><code>owasp-top10-2021</code></td><td>OWASP Top 10 web risks, 2021 (10 concerns)</td></tr>
+        <tr><td><code>owasp-api-top10-2023</code></td><td>OWASP API Security Top 10, 2023 (10)</td></tr>
+        <tr><td><code>cwe-top25-2023</code></td><td>2023 CWE Top 25 most dangerous weaknesses (25)</td></tr>
+        <tr><td><code>cwe-software-development</code></td><td>MITRE CWE Software Development view (~399)</td></tr>
+        <tr><td><code>cwe-research</code></td><td>MITRE CWE Research view (~944)</td></tr>
+        <tr><td><code>stride</code></td><td>STRIDE threat categories (6)</td></tr>
+        <tr><td><code>secrets-in-source</code></td><td>hardcoded secrets in source (1)</td></tr>
+        <tr><td><code>code-smells</code></td><td>Fowler-style code smells (12)</td></tr>
+        <tr><td><code>web-security-default</code></td><td>bundle: owasp-top10-2021 + cwe-top25-2023 + secrets-in-source</td></tr>
+        <tr><td><code>api-security-default</code></td><td>bundle: owasp-api-top10-2023 + cwe-top25-2023 + secrets-in-source</td></tr>
+      </tbody>
+    </table>
+
+    <div class="doc-nav">
+      <a href="/docs/sessions.html">&#8592; Sessions</a>
+      <a href="/docs/providers.html">Providers &amp; Auth &#8594;</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

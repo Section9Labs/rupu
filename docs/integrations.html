@@ -27,6 +27,7 @@
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
     <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
+    <a class="item" href="/docs/profiles.html">Engagement profiles</a>
     <div class="grp">Platform</div>
     <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
     <a class="item" href="/docs/reliability.html">Recovery &amp; reliability</a>
@@ -39,6 +40,11 @@
     <a class="item" href="/docs/coverage.html">Coverage</a>
     <a class="item" href="/docs/findings.html">Findings</a>
     <a class="item" href="/docs/customers.html">Customers</a>
+    <div class="grp">Reference</div>
+    <a class="item" href="/docs/cli.html">CLI reference</a>
+    <a class="item" href="/docs/configuration.html">Configuration</a>
+    <a class="item" href="/docs/api.html">HTTP API</a>
+    <a class="item" href="/docs/transcripts.html">Transcript schema</a>
     <div class="grp">More</div>
     <a class="item" href="/docs/examples/">Examples</a>
     <a class="item" href="/#download">Download</a>
@@ -232,7 +238,7 @@ gitlab:group/sub/project!7   <span class="c"># MR 7</span></pre>
 <span class="k">oauth_client_id</span> = <span class="s">"&lt;application id&gt;"</span></pre>
     <p>GitLab OAuth access tokens expire two hours after issue. Every GitLab connector refreshes its token through the credential store when it is within five minutes of expiry — so a long-lived <code class="inline">rupu cp serve</code>, <code class="inline">rupu mcp serve</code> or session keeps working — and the rotated token is saved under the store's lock for every other process. A request GitLab refuses with a 401 is retried once with the latest stored token, so a fresh <code class="inline">rupu auth login</code> reaches processes that are already running. GitHub SSO tokens don't expire.</p>
 
-    <div class="callout"><strong>Webhook secrets are different.</strong> The signing secrets for <code class="inline">rupu webhook serve</code> (GitHub / GitLab / Linear / Jira) are read from environment variables only — never config files, never the credential store. See <a class="link" href="/docs/triggers.html">Triggers</a>.</div>
+    <div class="callout"><strong>Webhook secrets are different.</strong> The secrets for <code class="inline">rupu webhook serve</code> are read from environment variables only — never config files, never the credential store: <code class="inline">RUPU_GITHUB_WEBHOOK_SECRET</code>, <code class="inline">RUPU_GITLAB_WEBHOOK_TOKEN</code> (GitLab&rsquo;s shared token, not a signing secret), <code class="inline">RUPU_LINEAR_WEBHOOK_SECRET</code> and <code class="inline">RUPU_JIRA_WEBHOOK_SECRET</code>. Set only the vendors you receive from. See <a class="link" href="/docs/triggers.html">Triggers</a>.</div>
 
     <div class="doc-nav">
       <a href="/docs/reliability.html">&#8592; Recovery &amp; reliability</a>

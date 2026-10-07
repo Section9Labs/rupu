@@ -27,6 +27,7 @@
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
     <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
+    <a class="item" href="/docs/profiles.html">Engagement profiles</a>
     <div class="grp">Platform</div>
     <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
     <a class="item" href="/docs/reliability.html">Recovery &amp; reliability</a>
@@ -39,6 +40,11 @@
     <a class="item" href="/docs/coverage.html">Coverage</a>
     <a class="item" href="/docs/findings.html">Findings</a>
     <a class="item" href="/docs/customers.html">Customers</a>
+    <div class="grp">Reference</div>
+    <a class="item" href="/docs/cli.html">CLI reference</a>
+    <a class="item" href="/docs/configuration.html">Configuration</a>
+    <a class="item" href="/docs/api.html">HTTP API</a>
+    <a class="item" href="/docs/transcripts.html">Transcript schema</a>
     <div class="grp">More</div>
     <a class="item" href="/docs/examples/">Examples</a>
     <a class="item" href="/#download">Download</a>
@@ -183,7 +189,7 @@ rupu auth login
 
 <span class="c"># run a one-off agent against a prompt</span>
 rupu run code-reviewer --prompt "Review the diff on this branch"</pre>
-    <p>Everything rupu does is recorded as a JSONL transcript you can inspect with <code class="inline">rupu transcript</code>.</p>
+    <p>Everything rupu does is recorded as a JSONL transcript you can inspect with <code class="inline">rupu transcript</code> &mdash; or parse yourself; the schema is in <a class="link" href="/docs/transcripts.html">Transcripts</a>.</p>
 
     <h2>The building blocks</h2>
     <p>Read these in order — each builds on the last.</p>
@@ -232,6 +238,11 @@ rupu run code-reviewer --prompt "Review the diff on this branch"</pre>
         <div class="ic" aria-hidden="true">&#9670;</div>
         <h3>Customers &#8594;</h3>
         <p>Per-customer config layers, run attribution, and runs, findings and usage filtered and priced by customer.</p>
+      </a>
+      <a class="card" href="/docs/profiles.html#fleet">
+        <div class="ic" aria-hidden="true">&#10035;</div>
+        <h3>Security fleet &#8594;</h3>
+        <p>Engagement profiles for code, binaries, networks, web apps and more, and a stock fleet of assessment agents and workflows to run under them: <code class="inline">rupu fleet install</code>.</p>
       </a>
       <a class="card" href="/docs/providers.html">
         <div class="ic" aria-hidden="true">&#9878;</div>

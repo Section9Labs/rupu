@@ -27,6 +27,7 @@
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
     <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
+    <a class="item" href="/docs/profiles.html">Engagement profiles</a>
     <div class="grp">Platform</div>
     <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
     <a class="item" href="/docs/reliability.html">Recovery &amp; reliability</a>
@@ -39,6 +40,11 @@
     <a class="item" href="/docs/coverage.html">Coverage</a>
     <a class="item" href="/docs/findings.html">Findings</a>
     <a class="item" href="/docs/customers.html">Customers</a>
+    <div class="grp">Reference</div>
+    <a class="item" href="/docs/cli.html">CLI reference</a>
+    <a class="item" href="/docs/configuration.html">Configuration</a>
+    <a class="item" href="/docs/api.html">HTTP API</a>
+    <a class="item" href="/docs/transcripts.html">Transcript schema</a>
     <div class="grp">More</div>
     <a class="item" href="/docs/examples/">Examples</a>
     <a class="item" href="/#download">Download</a>
@@ -259,6 +265,17 @@ $ rupu cp <span class="k">serve</span> <span class="v">--bind</span> <span class
         run that finished in the meantime.
       </li>
       <li>
+        <strong>Cancel &amp; pause.</strong> Cancel or pause a run from its
+        run view. Runs are detached processes, so the browser signals them:
+        cancel sends the recorded runner a <code class="inline">SIGTERM</code>
+        (a run parked at a single gate with no live runner is cancelled by rejecting it), and pause leaves
+        a marker the runner picks up at its next safe boundary. A paused run
+        shows a Resume button; the resume worker continues it, picking up
+        interrupted steps from their transcripts rather than restarting them.
+        A button press means <em>recorded</em>; the run's status on the live
+        stream is what confirms it.
+      </li>
+      <li>
         <strong>Drive sessions.</strong> Send a prompt to a live session and
         watch the turn stream back as a chat.
       </li>
@@ -273,18 +290,22 @@ $ rupu cp <span class="k">serve</span> <span class="v">--bind</span> <span class
         <strong>archiving</strong> finished runs and sessions (moving them out of
         the active lists without losing them), <strong>restoring</strong> them
         when you need them back, or <strong>deleting</strong> them for good.
-        Archived items honour retention windows from config — the
+        Archiving never deletes anything by itself: archived items are removed
+        only when you prune them with <code class="inline">rupu session prune</code>,
+        <code class="inline">rupu transcript prune</code> or
+        <code class="inline">rupu cleanup</code>. The
         <code class="inline">[storage]</code> section's
         <code class="inline">archived_session_retention</code> and
         <code class="inline">archived_transcript_retention</code> (e.g.
-        <code class="inline">30d</code>) set how long archived artifacts are kept
-        before they're pruned.
+        <code class="inline">30d</code>) are those commands' default age cutoffs.
       </li>
     </ul>
     <div class="callout">
       <strong>Same engine, new surface.</strong> The control plane doesn't
       reimplement any logic — launching, approving, and sending all route through
       the very same code the CLI uses. The browser is just another way in.
+      Everything the UI does goes through the control plane's HTTP API, which
+      you can script too — see the <a class="link" href="/docs/api.html">API reference</a>.
     </div>
 
     <h2>Author</h2>
@@ -370,7 +391,7 @@ $ rupu cp <span class="k">serve</span> <span class="v">--bind</span> <span class
       <code class="inline">~/.rupu/config.toml</code>, and a <strong>Config</strong>
       tab on each Project detail view writes that project's
       <code class="inline">.rupu/config.toml</code>. Config is layered
-      <strong>global &rarr; customer &rarr; project &rarr; env</strong>, and the control plane
+      <strong>global <strong>global &rarr; customer &rarr; project &rarr; env</strong>, and the control planerarr; customer <strong>global &rarr; customer &rarr; project &rarr; env</strong>, and the control planerarr; project</strong> (a locked key in a higher layer wins; see <a class="link" href="/docs/configuration.html">Configuration</a>), and the control plane
       shows the <strong>effective</strong> value for every key together with its
       <strong>provenance</strong> — which layer won.
     </p>
@@ -441,6 +462,144 @@ max_workspace_bytes = <span class="v">104857600</span></pre>
       with a <strong>Fleet &rarr; Hosts</strong> surface and host filtering on run
       lists. See <a class="link" href="/docs/multi-host.html">Multi-host</a>
       for setup and the transport roadmap.
+    </p>
+
+    <h2>UI tour</h2>
+    <p>
+      A page-by-page map of the web app, with the route each page lives at. Every
+      route can be bookmarked or shared, and the &#8984;K command palette jumps to
+      any of them.
+    </p>
+
+    <h3>Two navigation shells</h3>
+    <p>
+      The app ships two sidebars over the same pages. The default (<em>v1</em>)
+      shell lists every page in grouped sections — Runs, Security, Build, Fleet.
+      The newer <em>v2</em> shell folds them into seven destinations
+      (<code class="inline">/overview</code>, <code class="inline">/activity</code>,
+      <code class="inline">/projects</code>, <code class="inline">/security</code>,
+      <code class="inline">/library</code>, <code class="inline">/fleet</code>, plus
+      Customers), each a tab bar whose active tab sits in
+      <code class="inline">?tab=</code>. Old links keep working: under v2,
+      <code class="inline">/agents</code> redirects to
+      <code class="inline">/library?tab=agents</code>,
+      <code class="inline">/hosts</code> to <code class="inline">/fleet</code>, and so
+      on. Pick the shell in the global config; a browser refresh applies it, no
+      restart needed:
+    </p>
+    <pre class="code"><span class="c"># ~/.rupu/config.toml — opt into the v2 navigation shell</span>
+<span class="k">[ui.cp]</span>
+shell = <span class="s">"v2"</span></pre>
+    <table>
+      <thead><tr><th>v2 destination</th><th>Tabs</th></tr></thead>
+      <tbody>
+        <tr><td><code class="inline">/overview</code></td><td>The dashboard.</td></tr>
+        <tr><td><code class="inline">/activity</code></td><td>agents &middot; workflows &middot; autoflows &middot; sessions (run lists)</td></tr>
+        <tr><td><code class="inline">/security</code></td><td>findings &middot; coverage &middot; catalog</td></tr>
+        <tr><td><code class="inline">/library</code></td><td>agents &middot; workflows &middot; autoflows (definitions)</td></tr>
+        <tr><td><code class="inline">/fleet</code></td><td>hosts &middot; workers</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Runs and transcripts</h3>
+    <table>
+      <thead><tr><th>Route</th><th>What it shows</th></tr></thead>
+      <tbody>
+        <tr><td><code class="inline">/runs/agents</code>, <code class="inline">/runs/workflows</code>, <code class="inline">/runs/autoflows</code>, <code class="inline">/runs/agentiflows</code></td><td>One run list per kind, filterable by host and customer.</td></tr>
+        <tr><td><code class="inline">/runs/&lt;id&gt;</code></td><td>The live run view: graph, focused step's transcript, events, findings and network for the run.</td></tr>
+        <tr><td><code class="inline">/transcript?path=&hellip;</code></td><td>A transcript on its own page, for agent runs, sessions and sub-agents that have no workflow graph. It streams while the run is live, and resolves a remote host's transcript when the link carries <code class="inline">host</code> and <code class="inline">run</code>.</td></tr>
+        <tr><td><code class="inline">/sessions</code>, <code class="inline">/sessions/&lt;id&gt;</code></td><td>Session list and chat view.</td></tr>
+        <tr><td><code class="inline">/agentiflows/&lt;id&gt;</code></td><td>Agentiflow detail (see <em>Observe</em> above).</td></tr>
+        <tr><td><code class="inline">/events</code></td><td>The Live Events wall.</td></tr>
+        <tr><td><code class="inline">/usage</code></td><td>Spend over time and the outlier panel.</td></tr>
+        <tr><td><code class="inline">/netflow</code></td><td>The global network explorer.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Library: agents, workflows, autoflows</h3>
+    <table>
+      <thead><tr><th>Route</th><th>What it shows</th></tr></thead>
+      <tbody>
+        <tr><td><code class="inline">/agents</code></td><td>Every agent definition the control plane can see, global or project-scoped, with its last run. <strong>New agent</strong> opens the builder.</td></tr>
+        <tr><td><code class="inline">/agents/new</code></td><td>The <strong>Agent Builder</strong>, a full-page card composer: drag field cards (identity, prompt, model, tools, permission, reasoning, output and more) from a palette onto a canvas and watch the <code class="inline">.md</code> file build in a live preview beside it. A <em>Cards &middot; Raw &middot; AI</em> switch lets you edit the file directly or describe the agent and have a model draft it. Saving opens the new agent's page.</td></tr>
+        <tr><td><code class="inline">/agents/&lt;name&gt;</code></td><td>Provider, model and limits up top, the highlighted definition file below, with Edit, Delete, and Run (which opens the launcher), plus the agent's recent runs.</td></tr>
+        <tr><td><code class="inline">/workflows</code></td><td>Workflow definitions. <strong>New workflow</strong> starts one from YAML, or has a model generate it from a description.</td></tr>
+        <tr><td><code class="inline">/workflows/&lt;name&gt;</code></td><td>The visual workflow editor (see <em>Author</em> above), with a validity badge and Save, Revert, Delete and Run.</td></tr>
+        <tr><td><code class="inline">/autoflows</code></td><td>Workflows that declare autoflow triggers, each with a toggle to enable or disable it.</td></tr>
+      </tbody>
+    </table>
+    <div class="callout">
+      <strong>No feature flags.</strong> The Agent Builder and the visual workflow
+      editor are always on. The old <code class="inline">[cp].agent_authoring_ui</code>
+      and <code class="inline">[cp].workflow_editor_ui</code> keys picked between
+      a classic and a newer UI; the classic UIs are gone, and the keys are now
+      ignored. rupu logs a warning if your config still sets them. Delete them.
+    </div>
+
+    <h3>Projects</h3>
+    <p>
+      <code class="inline">/projects</code> lists every project this control plane
+      tracks, with its customer. Each project's page has an identity header with
+      rollup tiles and a tab per route:
+    </p>
+    <table>
+      <thead><tr><th>Route</th><th>Tab</th></tr></thead>
+      <tbody>
+        <tr><td><code class="inline">/projects/&lt;id&gt;</code></td><td><strong>Overview</strong>: a usage timeline, recent runs, coverage, sessions, and a summary of the project's definitions.</td></tr>
+        <tr><td><code class="inline">/projects/&lt;id&gt;/runs</code></td><td><strong>Runs</strong> started in this project.</td></tr>
+        <tr><td><code class="inline">/projects/&lt;id&gt;/findings</code></td><td><strong>Findings</strong> filed against the project.</td></tr>
+        <tr><td><code class="inline">/projects/&lt;id&gt;/code</code></td><td><strong>Code</strong>: a file tree and source viewer for the project's checkout, with findings shown inline at their lines and a link to the repository.</td></tr>
+        <tr><td><code class="inline">/projects/&lt;id&gt;/sessions</code></td><td><strong>Sessions</strong> in this project.</td></tr>
+        <tr><td><code class="inline">/projects/&lt;id&gt;/coverage</code></td><td><strong>Coverage</strong> for the project's targets.</td></tr>
+        <tr><td><code class="inline">/projects/&lt;id&gt;/network</code></td><td><strong>Network</strong>: the netflow explorer scoped to this project.</td></tr>
+        <tr><td><code class="inline">/projects/&lt;id&gt;/config</code></td><td><strong>Config</strong>: the project's <code class="inline">.rupu/config.toml</code> (see <em>Settings &amp; project config</em>).</td></tr>
+        <tr><td><code class="inline">/projects/&lt;id&gt;/definitions</code></td><td>The agents, workflows and autoflows this project can use: global definitions merged with its own <code class="inline">.rupu/</code> ones, each badged <em>project</em> or <em>global</em>. Linked from the Overview tab.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Security: findings, coverage, assets</h3>
+    <table>
+      <thead><tr><th>Route</th><th>What it shows</th></tr></thead>
+      <tbody>
+        <tr><td><code class="inline">/findings</code>, <code class="inline">/findings/&lt;id&gt;</code></td><td>The findings table and report page (see <em>Findings</em> above).</td></tr>
+        <tr><td><code class="inline">/coverage</code></td><td>Coverage status for every target.</td></tr>
+        <tr><td><code class="inline">/coverage/&lt;target&gt;</code></td><td>Overview: findings, files touched (by kind of touch), and how many concerns were assessed clean, with a finding, examined, or not applicable.</td></tr>
+        <tr><td><code class="inline">/coverage/&lt;target&gt;/catalog</code></td><td>The concern catalog that applied to the target.</td></tr>
+        <tr><td><code class="inline">/coverage/&lt;target&gt;/audit</code></td><td>Per-concern coverage: which in-scope files were assessed and which weren't, plus cross-model and serendipitous findings.</td></tr>
+        <tr><td><code class="inline">/coverage/&lt;target&gt;/gap</code></td><td>Only the concerns with unassessed files, filterable by severity and file.</td></tr>
+        <tr><td><code class="inline">/coverage/&lt;target&gt;/diff</code></td><td>Two runs' contributions to the target side by side (previous vs latest by default).</td></tr>
+        <tr><td><code class="inline">/coverage/templates</code></td><td>The bundled concern templates, independent of any target.</td></tr>
+        <tr><td><code class="inline">/assets</code></td><td><strong>Security &#8594; Assets</strong>: the asset inventory across every project: hosts and services for network engagements, sites and routes for web, files for code.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Fleet: hosts and workers</h3>
+    <table>
+      <thead><tr><th>Route</th><th>What it shows</th></tr></thead>
+      <tbody>
+        <tr><td><code class="inline">/hosts</code></td><td>Registered hosts and their health.</td></tr>
+        <tr><td><code class="inline">/hosts/&lt;id&gt;</code></td><td>One host's details and health, plus the workflow runs on it.</td></tr>
+        <tr><td><code class="inline">/workers</code></td><td>Read-only list of workers: the machine-and-identity pairs that have run something (a <code class="inline">rupu workflow run</code> or a session turn registers one), with their capabilities, recent activity and when each was last seen. A worker is not a running process; one that hasn't checked in for a while shows as stale.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Settings</h3>
+    <p>
+      <code class="inline">/settings</code> has typed tabs for
+      <em>General</em>, <em>Providers</em>, <em>Models</em>, <em>Autoflow</em>,
+      <em>SCM / Issues</em>, <em>Pricing</em> and <em>CP-Runtime</em>, then
+      <em>Raw</em> (the global <code class="inline">config.toml</code>, read-only until
+      you click Edit), <em>Policy</em> (every key with a lock checkbox), and
+      <em>Runtime status</em>. Each typed field shows its effective value, which layer
+      it came from, and a lock toggle. The control plane's own bearer token is never
+      shown or editable, only whether one is set.
+    </p>
+
+    <h3>Customers</h3>
+    <p>
+      <code class="inline">/customers</code> and
+      <code class="inline">/customers/&lt;slug&gt;</code> (with a tab per
+      sub-route) manage customers; see <em>Customers</em> above.
     </p>
 
     <!-- prev / next footer nav -->

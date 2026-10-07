@@ -27,6 +27,7 @@
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
     <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
+    <a class="item" href="/docs/profiles.html">Engagement profiles</a>
     <div class="grp">Platform</div>
     <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
     <a class="item" href="/docs/reliability.html">Recovery &amp; reliability</a>
@@ -39,6 +40,11 @@
     <a class="item" href="/docs/coverage.html">Coverage</a>
     <a class="item" href="/docs/findings.html">Findings</a>
     <a class="item" href="/docs/customers.html">Customers</a>
+    <div class="grp">Reference</div>
+    <a class="item" href="/docs/cli.html">CLI reference</a>
+    <a class="item" href="/docs/configuration.html">Configuration</a>
+    <a class="item" href="/docs/api.html">HTTP API</a>
+    <a class="item" href="/docs/transcripts.html">Transcript schema</a>
     <div class="grp">More</div>
     <a class="item" href="/docs/examples/">Examples</a>
     <a class="item" href="/#download">Download</a>
@@ -182,7 +188,7 @@
       <thead><tr><th>Key</th><th>Applies to</th><th>Meaning</th></tr></thead>
       <tbody>
         <tr><td><code>id</code></td><td>all</td><td>Unique within the workflow.</td></tr>
-        <tr><td><code>actions</code></td><td>all</td><td>Action-protocol allowlist — <strong>not</strong> a tool allowlist. Use <code class="inline">[]</code> unless you intentionally use the action protocol.</td></tr>
+        <tr><td><code>actions</code></td><td>agent steps</td><td>Narrows which <a class="link" href="/docs/mcp.html">connector (MCP catalog) tools</a> the step&rsquo;s agent may call, e.g. <code class="inline">[issues.get, issues.comment]</code>. Built-ins like <code class="inline">bash</code> are never affected, and a step can&rsquo;t grant a tool the agent&rsquo;s <code class="inline">tools:</code> doesn&rsquo;t. <code class="inline">[]</code> leaves the agent&rsquo;s grant unchanged. Every connector call is recorded as a <code class="inline">tool_audit</code> event. See <a class="link" href="/docs/workflow-reference.html#step-actions">Step actions</a>.</td></tr>
         <tr><td><code>when</code></td><td>all</td><td>Minijinja expression reduced to truthy / falsy; falsy values are empty string, <code class="inline">false</code>, <code class="inline">0</code>, <code class="inline">no</code>, <code class="inline">off</code>.</td></tr>
         <tr><td><code>continue_on_error</code></td><td>all</td><td>Tolerate failure and keep going; inherits the workflow default.</td></tr>
         <tr><td><code>max_parallel</code></td><td><code>for_each</code>, <code>parallel</code>, <code>panel</code></td><td>Concurrency cap (at least 1).</td></tr>
@@ -564,7 +570,7 @@ rupu workflow run investigate-then-fix --input prompt=<span class="s">"NPE on em
         <tr><td><code>--input key=value</code></td><td>A declared input (repeatable).</td></tr>
         <tr><td><code>--file &lt;path&gt;</code></td><td>Run a workflow straight from a YAML file instead of resolving a name from the catalog — handy for a draft or a generated workflow. The file is not added to the catalog. Takes the place of the name, and can't be combined with a positional run target.</td></tr>
         <tr><td><code>--mode ask|bypass|readonly</code></td><td>Permission mode for every step. Pass <code class="inline">readonly</code> explicitly to deny <code class="inline">bash</code> and file writes — <code class="inline">ask</code> can't prompt mid-run, so it behaves like <code class="inline">bypass</code>.</td></tr>
-        <tr><td><code>--engagement-profile &lt;id&gt;</code></td><td>The engagement profile(s) every step's findings are validated against — <code class="inline">network</code>, <code class="inline">binary</code>, or a composite such as <code class="inline">pentest</code>. Repeatable or comma-separated; omitted means the default code path. See <a class="link" href="/docs/coverage.html">Coverage</a>.</td></tr>
+        <tr><td><code>--engagement-profile &lt;id&gt;</code></td><td>The engagement profile(s) every step's findings are validated against — <code class="inline">network</code>, <code class="inline">binary</code>, or a composite such as <code class="inline">pentest</code>. Repeatable or comma-separated; omitted means the default code path. See <a class="link" href="/docs/profiles.html">Engagement profiles</a>.</td></tr>
         <tr><td><code>--plain</code></td><td>Use the line printer instead of the live view (below).</td></tr>
         <tr><td><code>--run-id &lt;id&gt;</code></td><td>Pre-assign the run id, so a caller can reference the run before it starts.</td></tr>
       </tbody>
