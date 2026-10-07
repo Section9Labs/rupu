@@ -39,6 +39,9 @@ export interface CustomerScopeValue {
   reload(): void;
   /** e.g. "Customer “acme” no longer exists — showing all customers." */
   notice: string | null;
+  /** Bumps on every `rejectScope`, so a repeated identical notice is a new
+   *  occurrence (a dismissed one shows again). */
+  noticeSeq: number;
 }
 
 function readStored(): CustomerScope {
@@ -75,6 +78,7 @@ export function CustomerScopeProvider({ children }: { children: ReactNode }): JS
   // found among the archived customers.
   const [extra, setExtra] = useState<CustomerRow | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [noticeSeq, setNoticeSeq] = useState(0);
   const [nonce, setNonce] = useState(0);
 
   const setScope = useCallback((next: CustomerScope, row?: CustomerRow) => {
@@ -88,6 +92,7 @@ export function CustomerScopeProvider({ children }: { children: ReactNode }): JS
     setExtra(null);
     setScopeState(null);
     setNotice(message);
+    setNoticeSeq((n) => n + 1);
   }, []);
   const reload = useCallback(() => setNonce((n) => n + 1), []);
 
@@ -145,8 +150,8 @@ export function CustomerScopeProvider({ children }: { children: ReactNode }): JS
   );
 
   const value = useMemo<CustomerScopeValue>(
-    () => ({ scope, customer, customers, setScope, rejectScope, reload, notice }),
-    [scope, customer, customers, setScope, rejectScope, reload, notice],
+    () => ({ scope, customer, customers, setScope, rejectScope, reload, notice, noticeSeq }),
+    [scope, customer, customers, setScope, rejectScope, reload, notice, noticeSeq],
   );
   return <CustomerScopeContext.Provider value={value}>{children}</CustomerScopeContext.Provider>;
 }

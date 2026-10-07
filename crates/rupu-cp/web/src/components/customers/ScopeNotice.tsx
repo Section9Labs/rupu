@@ -7,10 +7,10 @@ import { Info, X } from 'lucide-react';
 import { useCustomerScope } from '../../lib/customerScope';
 
 export function ScopeNotice() {
-  const { notice } = useCustomerScope();
-  // Keyed by text so a later, different notice shows again.
-  const [dismissed, setDismissed] = useState<string | null>(null);
-  if (!notice || dismissed === notice) return null;
+  const { notice, noticeSeq } = useCustomerScope();
+  // Keyed by occurrence, so a repeated identical notice shows again.
+  const [dismissed, setDismissed] = useState<number | null>(null);
+  if (!notice || dismissed === noticeSeq) return null;
   return (
     <div
       role="status"
@@ -21,7 +21,7 @@ export function ScopeNotice() {
       <button
         type="button"
         aria-label="Dismiss notice"
-        onClick={() => setDismissed(notice)}
+        onClick={() => setDismissed(noticeSeq)}
         className="rounded p-0.5 hover:bg-surface-hover"
       >
         <X size={13} aria-hidden />

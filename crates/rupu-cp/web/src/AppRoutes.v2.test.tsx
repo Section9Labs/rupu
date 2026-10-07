@@ -133,6 +133,15 @@ afterEach(() => {
 
 describe('AppRoutes shell branch', () => {
   it.each(['/customers', '/customers/acme', '/customers/acme/config'])(
+    'v1: %s is routed (not redirected, not a 404)',
+    async (path) => {
+      renderApp('v1', path);
+      await waitFor(() => expect(screen.getByRole('heading', { level: 1 })).toBeInTheDocument());
+      expect(screen.getByTestId('loc')).toHaveTextContent(path);
+    },
+  );
+
+  it.each(['/customers', '/customers/acme', '/customers/acme/config'])(
     'v2: %s is routed (not redirected, not a 404)',
     async (path) => {
       renderApp('v2', path);

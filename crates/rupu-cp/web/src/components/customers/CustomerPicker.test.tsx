@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { api, type CustomerRow } from '../../lib/api';
 import { CustomerScopeProvider } from '../../lib/customerScope';
@@ -196,14 +196,140 @@ describe('CustomerPicker', () => {
   it('"Manage →" links to /customers', async () => {
     mount();
     await open();
-    const menu = await screen.findByRole('menu');
+    await screen.findByRole('menu');
     expect(screen.getByRole('link', { name: /Manage/ })).toHaveAttribute('href', '/customers');
-    void menu;
   });
 
   it('the compact variant has no CUSTOMER label', async () => {
     mount('compact');
     await screen.findByRole('button', { name: /customer scope/i });
     expect(screen.queryByText('Customer')).toBeNull();
+  });
+
+  it('Escape works from a row, the checkbox and the Manage link, and returns focus to the trigger', async () => {
+    mount();
+    const trigger = await open();
+    let menu = await screen.findByRole('menu');
+    await waitFor(() => expect(within(menu).getByText('Acme Corp')).toBeInTheDocument());
+    for (const get of [
+      () => within(menu).getByRole('menuitem', { name: /Acme Corp/ }),
+      () => screen.getByLabelText('Show archived'),
+      () => screen.getByRole('link', { name: /Manage/ }),
+    ]) {
+      const el = get();
+      el.focus();
+      fireEvent.keyDown(el, { key: 'Escape' });
+      expect(screen.queryByRole('menu')).toBeNull();
+      expect(trigger).toHaveFocus();
+      fireEvent.click(trigger);
+      menu = await screen.findByRole('menu');
+    }
+  });
+
+  it('closes when focus moves to an element outside the picker', async () => {
+    const outside = document.createElement('button');
+    document.body.appendChild(outside);
+    mount();
+    await open();
+    await screen.findByRole('menu');
+    const search = screen.getByPlaceholderText('Find a customer…');
+    act(() => search.focus());
+    act(() => outside.focus());
+    expect(screen.queryByRole('menu')).toBeNull();
+    outside.remove();
+  });
+
+  it('does not close when focus moves between elements inside the picker', async () => {
+    mount();
+    await open();
+    await screen.findByRole('menu');
+    act(() => screen.getByPlaceholderText('Find a customer…').focus());
+    act(() => screen.getByLabelText('Show archived').focus());
+    expect(screen.getByRole('menu')).toBeInTheDocument();
+  });
+
+  it('announces the active row with aria-activedescendant', async () => {
+    mount();
+    await open();
+    const menu = await screen.findByRole('menu');
+    await waitFor(() => expect(within(menu).getByText('Acme Corp')).toBeInTheDocument());
+    const search = screen.getByPlaceholderText('Find a customer…');
+    fireEvent.keyDown(search, { key: 'ArrowDown' });
+    const id = search.getAttribute('aria-activedescendant');
+    expect(id).toBeTruthy();
+    expect(document.getElementById(id!)).toHaveTextContent('Acme Corp');
+  });
+
+  it('scrolls the active row into view', async () => {
+    const scroll = vi.fn();
+    Element.prototype.scrollIntoView = scroll;
+    try {
+      mount();
+      await open();
+      await screen.findByRole('menu');
+      scroll.mockClear();
+      fireEvent.keyDown(screen.getByPlaceholderText('Find a customer…'), { key: 'ArrowDown' });
+      expect(scroll).toHaveBeenCalledWith({ block: 'nearest' });
+    } finally {
+      delete (Element.prototype as { scrollIntoView?: unknown }).scrollIntoView;
+    }
+  });
+
+  it('an empty filtered list never sets a negative active index', async () => {
+    mount();
+    await open();
+    const menu = await screen.findByRole('menu');
+    await waitFor(() => expect(within(menu).getByText('Acme Corp')).toBeInTheDocument());
+    const search = screen.getByPlaceholderText('Find a customer…');
+    fireEvent.change(search, { target: { value: 'zzz' } });
+    expect(within(menu).getByText('No matching customer.')).toBeInTheDocument();
+    expect(search).not.toHaveAttribute('aria-activedescendant');
+    fireEvent.keyDown(search, { key: 'ArrowDown' });
+    fireEvent.keyDown(search, { key: 'ArrowDown' });
+    fireEvent.keyDown(search, { key: 'ArrowUp' });
+    fireEvent.keyDown(search, { key: 'Enter' }); // nothing to pick
+    expect(screen.getByRole('menu')).toBeInTheDocument();
+    // clearing the filter lands on the first row, not on index -1
+    fireEvent.change(search, { target: { value: '' } });
+    expect(document.getElementById(search.getAttribute('aria-activedescendant')!)).toHaveTextContent(
+      'All customers',
+    );
+    fireEvent.keyDown(search, { key: 'Enter' });
+    expect(screen.getByRole('button', { name: /customer scope/i })).toHaveTextContent('All customers');
+  });
+
+  it('refetches archived customers every time "Show archived" is ticked', async () => {
+    mount();
+    await open();
+    await screen.findByRole('menu');
+    const box = screen.getByLabelText('Show archived');
+    const archivedCalls = () => getCustomers.mock.calls.filter((c: unknown[]) => (c[0] as { archived?: boolean } | undefined)?.archived).length;
+    fireEvent.click(box);
+    await waitFor(() => expect(archivedCalls()).toBe(1));
+    fireEvent.click(box);
+    fireEvent.click(box);
+    await waitFor(() => expect(archivedCalls()).toBe(2));
+  });
+
+  it('clears the archived error when a refetch starts and succeeds', async () => {
+    let fail = true;
+    getCustomers.mockImplementation(async (opts?: { archived?: boolean }) => {
+      if (opts?.archived) {
+        if (fail) throw new Error('boom');
+        return [ACME, GLOBEX, OLD];
+      }
+      return [ACME, GLOBEX];
+    });
+    mount();
+    await open();
+    await screen.findByRole('menu');
+    const box = screen.getByLabelText('Show archived');
+    fireEvent.click(box);
+    expect(await screen.findByText(/Couldn’t load archived customers/)).toBeInTheDocument();
+    fail = false;
+    fireEvent.click(box);
+    fireEvent.click(box);
+    await waitFor(() => expect(screen.queryByText(/Couldn’t load archived customers/)).toBeNull());
+    expect(await screen.findByText('Old Co')).toBeInTheDocument();
   });
 });

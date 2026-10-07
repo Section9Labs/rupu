@@ -34,13 +34,16 @@ export function CustomerPicker({ variant = 'sidebar' }: { variant?: Variant }) {
   const rootRef = useRef<HTMLDivElement>(null);
   const menuId = useId();
 
-  // Archived customers load lazily, the first time the box is ticked.
+  // Archived customers load lazily, afresh each time the box is ticked.
   useEffect(() => {
-    if (!showArchived || archived !== null) return;
+    if (!showArchived) return;
     let cancelled = false;
+    setArchivedError(false);
     api.getCustomers({ archived: true }).then(
       (rows) => {
-        if (!cancelled) setArchived(rows.filter((r) => r.archived));
+        if (cancelled) return;
+        setArchived(rows.filter((r) => r.archived));
+        setArchivedError(false);
       },
       () => {
         if (!cancelled) setArchivedError(true);
@@ -49,7 +52,7 @@ export function CustomerPicker({ variant = 'sidebar' }: { variant?: Variant }) {
     return () => {
       cancelled = true;
     };
-  }, [showArchived, archived]);
+  }, [showArchived]);
 
   // Click outside closes (focus stays wherever the user clicked).
   useEffect(() => {
@@ -90,7 +93,15 @@ export function CustomerPicker({ variant = 'sidebar' }: { variant?: Variant }) {
     return out;
   }, [query, customers, archived, showArchived]);
 
-  const activeIdx = Math.min(active, Math.max(items.length - 1, 0));
+  const activeIdx = Math.max(0, Math.min(active, items.length - 1));
+  const rowId = (i: number) => `${menuId}-row-${i}`;
+
+  // Keep the active row in view while arrowing through a long list.
+  useEffect(() => {
+    if (!open) return;
+    document.getElementById(rowId(activeIdx))?.scrollIntoView?.({ block: 'nearest' });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, activeIdx, items.length]);
 
   function close(returnFocus: boolean) {
     setOpen(false);
@@ -106,21 +117,30 @@ export function CustomerPicker({ variant = 'sidebar' }: { variant?: Variant }) {
     close(true);
   }
 
-  function onSearchKey(e: React.KeyboardEvent) {
+  // On the popover container, so Escape and the arrows work from any element
+  // inside it. Enter only picks from the search box — on a row, the checkbox
+  // or the link it keeps its native action.
+  function onPopoverKey(e: React.KeyboardEvent) {
     if (e.key === 'Escape') {
       e.preventDefault();
       close(true);
     } else if (e.key === 'ArrowDown') {
       e.preventDefault();
-      setActive(Math.min(activeIdx + 1, items.length - 1));
+      setActive(Math.max(0, Math.min(activeIdx + 1, items.length - 1)));
     } else if (e.key === 'ArrowUp') {
       e.preventDefault();
       setActive(Math.max(activeIdx - 1, 0));
-    } else if (e.key === 'Enter') {
+    } else if (e.key === 'Enter' && e.target === searchRef.current) {
       e.preventDefault();
       const item = items[activeIdx];
       if (item) pick(item);
     }
+  }
+
+  // Focus moving to an element outside the picker closes it.
+  function onRootBlur(e: React.FocusEvent) {
+    const next = e.relatedTarget as Node | null;
+    if (open && next && rootRef.current && !rootRef.current.contains(next)) close(false);
   }
 
   const triggerName =
@@ -157,13 +177,14 @@ export function CustomerPicker({ variant = 'sidebar' }: { variant?: Variant }) {
   );
 
   return (
-    <div ref={rootRef} className={cn('relative', variant === 'sidebar' && 'px-3 pt-3')}>
+    <div ref={rootRef} onBlur={onRootBlur} className={cn('relative', variant === 'sidebar' && 'px-3 pt-3')}>
       {variant === 'sidebar' && (
         <div className="mb-1 text-meta font-medium uppercase tracking-wide text-ink-mute">Customer</div>
       )}
       {trigger}
       {open && (
         <div
+          onKeyDown={onPopoverKey}
           className={cn(
             'absolute z-30 mt-1 w-64 rounded-md border border-border bg-panel shadow-lg',
             variant === 'sidebar' ? 'left-3' : 'left-0',
@@ -179,7 +200,7 @@ export function CustomerPicker({ variant = 'sidebar' }: { variant?: Variant }) {
                 setQuery(e.target.value);
                 setActive(0);
               }}
-              onKeyDown={onSearchKey}
+              aria-activedescendant={items.length > 0 ? rowId(activeIdx) : undefined}
               placeholder="Find a customer…"
               aria-label="Find a customer"
               className="w-full bg-transparent text-sm text-ink outline-none placeholder:text-ink-mute"
@@ -196,6 +217,7 @@ export function CustomerPicker({ variant = 'sidebar' }: { variant?: Variant }) {
               return (
                 <button
                   key={item.key}
+                  id={rowId(i)}
                   type="button"
                   role="menuitem"
                   aria-current={current ? 'true' : undefined}
