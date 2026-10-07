@@ -1786,6 +1786,7 @@ async fn run_agent_inner(
     // so the guidance is part of the recorded system prompt.
     let findings_opts = opts.tool_context.findings.clone().unwrap_or_default();
     let records_findings = coverage.is_some()
+        || findings_opts.engagement.is_some()
         || opts
             .agent_tools
             .as_ref()
@@ -1870,26 +1871,42 @@ async fn run_agent_inner(
     // entirely. Recording a finding and running the coverage harness are
     // different things and are now separable.
     //
-    // Opt-in via `tools:`, not automatic: `report_finding` writes to the
-    // project's ledger, and every builtin here is an explicit grant. The
-    // registry insert happens after `filter_to` for the same reason the
-    // coverage tools do — the grant list gates the six builtins, and these
-    // are registered on top of it.
+    // Two ways in, and they must not be confused:
     //
-    // `finding.verify` follows the same model, with one difference: it is
-    // independent of the concerns block. A verifier that records a verdict on
-    // another run's finding needs the ledger but no concern catalog, and a
-    // `concerns:` agent does NOT hold it either — it is granted only by an
-    // exact `finding.verify` entry in `tools:` (so `tools:` absent or `["*"]`
-    // grants nothing), whether or not the agent runs the coverage harness.
+    //   * An explicit `tools:` grant. `report_finding` writes to the project's
+    //     ledger and `finding.verify` records a verdict on another run's
+    //     finding; both are opt-in builtins, registered after `filter_to` for
+    //     the same reason the coverage tools are — the grant list gates the six
+    //     builtins, and these are inserted on top of it. `finding.verify` is
+    //     ALWAYS opt-in: it needs the ledger but no concern catalog, a
+    //     `concerns:` agent does NOT get it, and `tools:` absent or `["*"]`
+    //     grants nothing.
+    //
+    //   * An active engagement profile (`--engagement-profile X`). This is the
+    //     operator declaring the run records assets and findings under profile
+    //     X, so `asset_mark` and `report_finding` are ENGINE-GRANTED here —
+    //     offered regardless of the agent's `tools:` allowlist, exactly like
+    //     the concerns-block coverage tools (`coverage_tools::register` above)
+    //     and the always-on injected tools (below), both of which also bypass
+    //     `filter_to`. Without this an engagement agent with an explicit
+    //     `tools:` list and no `concerns:` block — the normal shape for a
+    //     network recon agent, which records assets, not file-concern coverage
+    //     — would silently lose `asset_mark`: the model can't see the tool,
+    //     runs `asset_mark` as a shell command, and the assets never reach the
+    //     ledger. `asset_mark` is engagement-gated and nothing else: it needs
+    //     the active set to validate a depth against the profile's ladder, so
+    //     it is meaningless without one.
     let lists_tool = |name: &str| {
         opts.agent_tools
             .as_ref()
             .is_some_and(|list| list.iter().any(|t| t == name))
     };
-    let standalone_report = coverage.is_none() && lists_tool("report_finding");
+    let engagement_active = findings_opts.engagement.is_some();
+    let standalone_report =
+        coverage.is_none() && (lists_tool("report_finding") || engagement_active);
+    let standalone_asset = coverage.is_none() && engagement_active;
     let want_verify = lists_tool("finding.verify");
-    if standalone_report || want_verify {
+    if standalone_report || standalone_asset || want_verify {
         // A concerns agent's ledger is the bundle's own (same scope, target
         // id and run stream, directory already ensured); otherwise it is
         // built here the same way.
@@ -1912,10 +1929,7 @@ async fn run_agent_inner(
                 std::sync::Arc::new(coverage_tools::FindingVerifyTool::new(paths.clone())),
             );
         }
-        if standalone_report {
-            // asset_mark is offered whenever an engagement is active, with or
-            // without a concerns block — it needs the active set to validate a
-            // depth against the profile's ladder.
+        if standalone_asset {
             if let Some(engagement) = findings_opts.engagement.clone() {
                 registry.insert(
                     "asset_mark",
@@ -1925,6 +1939,8 @@ async fn run_agent_inner(
                     )),
                 );
             }
+        }
+        if standalone_report {
             registry.insert(
                 "report_finding",
                 std::sync::Arc::new(coverage_tools::ReportFindingTool::new(
@@ -3768,6 +3784,162 @@ mod on_tool_call_tests {
             "the injected tool ran despite an empty agent_tools: {:?}",
             run.final_messages
         );
+    }
+
+    /// Regression: an engagement agent with an explicit `tools:` allowlist
+    /// that omits every coverage tool, and no `concerns:` block, still gets
+    /// `asset_mark` and `report_finding`. They are engine-granted by the
+    /// active `--engagement-profile`, not a `tools:` opt-in — the same way
+    /// the concerns-block coverage tools and the always-on injected tools
+    /// bypass `filter_to`. Before the fix a network recon agent (the normal
+    /// shape: `tools: [bash, ...]`, no concerns) silently lost `asset_mark`;
+    /// the model ran it as a shell command and the assets never reached the
+    /// ledger.
+    #[tokio::test]
+    async fn engagement_tools_bypass_the_agent_tools_allowlist() {
+        let tmp_dir = tempfile::tempdir().expect("tmpdir");
+        let transcript_path = tmp_dir.path().join("run_test_engagement_tools.jsonl");
+
+        // The run's active engagement: the built-in `network` profile.
+        let engagement = Arc::new(
+            rupu_coverage::builtin_registry()
+                .unwrap()
+                .active_set(&["network".to_string()])
+                .unwrap(),
+        );
+        // Summary profile keeps the finding input compact; the registration
+        // fix under test is independent of the findings profile.
+        let findings = rupu_coverage::FindingWriteOptions {
+            engagement: Some(engagement),
+            ..Default::default()
+        }
+        .with_profile(rupu_coverage::FindingProfile::Summary);
+
+        // turn 1: asset_mark a host; turn 2: report_finding on it; turn 3: stop.
+        let provider = MockProvider::new(vec![
+            ScriptedTurn::AssistantToolUse {
+                text: None,
+                tool_id: "call_asset_1".into(),
+                tool_name: "asset_mark".into(),
+                tool_input: serde_json::json!({
+                    "kind": "network:host",
+                    "coordinates": [{ "t": "host", "v": "10.0.0.1" }],
+                    "depth": "discovered"
+                }),
+                stop: StopReason::ToolUse,
+            },
+            ScriptedTurn::AssistantToolUse {
+                text: None,
+                tool_id: "call_report_1".into(),
+                tool_name: "report_finding".into(),
+                tool_input: serde_json::json!({
+                    "scope": "host",
+                    "target_ref": "10.0.0.1",
+                    "summary": "Telnet exposed on the gateway",
+                    "severity": "high",
+                    "evidence": { "rationale": "nmap shows 23/tcp open" },
+                    "asset": {
+                        "kind": "network:host",
+                        "coordinates": [{ "t": "host", "v": "10.0.0.1" }]
+                    }
+                }),
+                stop: StopReason::ToolUse,
+            },
+            ScriptedTurn::AssistantText {
+                text: "done".into(),
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        ]);
+
+        let opts = AgentRunOpts {
+            seed_source: None,
+            collectors: Vec::new(),
+            extra_tools: Vec::new(),
+            agent_name: "cellgw-recon".into(),
+            agent_system_prompt: "test".into(),
+            // Explicit allowlist that OMITS every coverage tool, and no
+            // `concerns:` block — the exact shape that lost `asset_mark`.
+            agent_tools: Some(vec!["bash".to_string()]),
+            provider: Box::new(provider),
+            provider_name: "mock".into(),
+            model: "mock-1".into(),
+            run_id: "run_test_engagement_tools".into(),
+            workspace_id: "ws_test".into(),
+            workspace_path: tmp_dir.path().to_path_buf(),
+            transcript_path,
+            max_turns: 5,
+            decider: Arc::new(BypassDecider),
+            tool_context: rupu_tools::ToolContext {
+                workspace_path: tmp_dir.path().to_path_buf(),
+                findings: Some(findings),
+                ..Default::default()
+            },
+            user_message: "test prompt".into(),
+            initial_messages: Vec::new(),
+            turn_index_offset: 0,
+            mode_str: "bypass".into(),
+            no_stream: true,
+            suppress_stream_stdout: false,
+            mcp_registry: None,
+            effort: None,
+            context_window: None,
+            output_format: None,
+            output_schema: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+            parent_run_id: None,
+            depth: 0,
+            dispatchable_agents: None,
+            step_id: "s1".into(),
+            on_tool_call: None,
+            on_stream_event: None,
+            on_usage: None,
+            concerns: None,
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
+            scope_name: None,
+            surface_tag: None,
+            pause: None,
+            codename: None,
+            recovery: Default::default(),
+        };
+
+        let exit = run_agent_full(opts).await;
+        let run = exit.result.expect("run ok");
+
+        // Both coverage tool calls ran and neither errored.
+        let tool_results: Vec<String> = run
+            .final_messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                rupu_providers::types::ContentBlock::ToolResult {
+                    content, is_error, ..
+                } => {
+                    assert!(!is_error, "a coverage tool call errored: {content}");
+                    Some(content.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            tool_results.iter().any(|c| c.contains("depth")),
+            "asset_mark did not run as a native tool: {tool_results:?}"
+        );
+        assert!(
+            tool_results.iter().any(|c| c.contains("finding_id")),
+            "report_finding did not run as a native tool: {tool_results:?}"
+        );
+
+        // The asset and the finding reached the ledger on disk.
+        let target = rupu_coverage::target_id(tmp_dir.path(), "cellgw-recon");
+        let paths = rupu_coverage::CoveragePaths::new(tmp_dir.path(), &target);
+        let assets = rupu_coverage::read_assets(&paths.assets).expect("read assets");
+        assert_eq!(assets.len(), 1, "expected one asset, got {assets:?}");
+        let findings = rupu_coverage::read_findings(&paths).expect("read findings");
+        assert_eq!(findings.len(), 1, "expected one finding, got {findings:?}");
     }
 
     #[tokio::test]

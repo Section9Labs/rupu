@@ -98,11 +98,12 @@ async fn mcp_registry_attaches_tools_to_run() {
         "MCP tool issues.list should be present: {tool_names:?}"
     );
     // Total must be 9 builtins (6 v0 + ast_grep + dispatch_agent + dispatch_agents_parallel)
-    // + 19 MCP tools = 28. The 19th is `findings.record`.
+    // + 21 MCP tools = 30. The findings MCP trio is `findings.query`,
+    // `findings.record` and `findings.tag`.
     assert_eq!(
         tool_names.len(),
-        28,
-        "expected 9 builtins + 19 MCP tools; got {} tools: {tool_names:?}",
+        30,
+        "expected 9 builtins + 21 MCP tools; got {} tools: {tool_names:?}",
         tool_names.len()
     );
 }
