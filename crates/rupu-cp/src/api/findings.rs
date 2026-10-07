@@ -200,7 +200,16 @@ pub struct FindingsResponse {
     pub facets: std::collections::BTreeMap<&'static str, Vec<rupu_coverage::FacetValue>>,
     /// Workspaces whose finding-tag log could not be read: their findings are
     /// served with declared tags only, and tag filters may miss them.
-    pub tags_unavailable: Vec<String>,
+    pub tags_unavailable: Vec<TagsUnavailable>,
+}
+
+/// A workspace whose finding-tag log could not be read: its id, and the
+/// project name (the workspace path's basename — what `FindingOut.project`
+/// carries) so a client can name it even when no row of it is in the answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TagsUnavailable {
+    pub ws_id: String,
+    pub project: String,
 }
 
 /// Sort rank for a severity: critical (highest) sorts first.
@@ -306,12 +315,12 @@ fn project_name(path: &str) -> String {
 /// This is the one workspace/target walk. Tolerant by design: a workspace
 /// whose path is gone, or a target whose `findings.jsonl` is absent/unreadable,
 /// is skipped with a `warn!` rather than failing the caller. A workspace whose
-/// tag log cannot be read is still walked (declared tags only) and its id is
-/// pushed to `tags_unavailable`.
+/// tag log cannot be read is still walked (declared tags only) and it is
+/// pushed to `tags_unavailable` (id + project name).
 fn each_ledger(
     global_dir: &std::path::Path,
     mut f: impl FnMut(&rupu_workspace::Workspace, &str, CoveragePaths, Vec<FindingRecord>),
-    tags_unavailable: &mut Vec<String>,
+    tags_unavailable: &mut Vec<TagsUnavailable>,
 ) {
     let workspaces = store_for(global_dir).list().unwrap_or_default();
     for w in &workspaces {
@@ -337,7 +346,10 @@ fn each_ledger(
                     error = %e,
                     "cannot read the finding-tag log; showing declared tags only"
                 );
-                tags_unavailable.push(w.id.clone());
+                tags_unavailable.push(TagsUnavailable {
+                    ws_id: w.id.clone(),
+                    project: project_name(&w.path),
+                });
                 Vec::new()
             }
         };
@@ -373,13 +385,13 @@ pub fn collect_all_findings(global_dir: &std::path::Path) -> Vec<FindingOut> {
     collect_all_findings_reporting(global_dir).0
 }
 
-/// [`collect_all_findings`], plus the ids of the workspaces whose finding-tag
+/// [`collect_all_findings`], plus the workspaces (id + project) whose finding-tag
 /// log could not be read (their findings carry declared tags only).
 pub fn collect_all_findings_reporting(
     global_dir: &std::path::Path,
-) -> (Vec<FindingOut>, Vec<String>) {
+) -> (Vec<FindingOut>, Vec<TagsUnavailable>) {
     let mut out: Vec<FindingOut> = Vec::new();
-    let mut tags_unavailable: Vec<String> = Vec::new();
+    let mut tags_unavailable: Vec<TagsUnavailable> = Vec::new();
     each_ledger(
         global_dir,
         |w, target_id, _paths, records| {
@@ -710,9 +722,9 @@ async fn list_findings(
     let facets = rupu_coverage::facets(scoped.iter().map(finding_view));
     // Warn only about the workspaces this request covers: the requested one,
     // or one with a finding in the scope.
-    let tags_unavailable: Vec<String> = tags_unavailable
+    let tags_unavailable: Vec<TagsUnavailable> = tags_unavailable
         .into_iter()
-        .filter(|ws| q.ws_id.as_ref() == Some(ws) || scoped.iter().any(|f| &f.ws_id == ws))
+        .filter(|w| q.ws_id.as_ref() == Some(&w.ws_id) || scoped.iter().any(|f| f.ws_id == w.ws_id))
         .collect();
     let filtered = query_findings(&s.run_store, scoped, &parsed);
     let mut resp = build_response(filtered);
@@ -4841,7 +4853,10 @@ mod tests {
         std::fs::create_dir(&log).unwrap();
         let (status, json) = get_json(app_for(tmp.path()), "/api/findings").await;
         assert_eq!(status, axum::http::StatusCode::OK);
-        assert_eq!(json["tags_unavailable"], serde_json::json!(["ws1"]));
+        assert_eq!(
+            json["tags_unavailable"],
+            serde_json::json!([{ "ws_id": "ws1", "project": "repo" }])
+        );
         assert_eq!(json["findings"].as_array().unwrap().len(), 3);
     }
 
@@ -4867,9 +4882,15 @@ mod tests {
         assert_eq!(json["findings"].as_array().unwrap().len(), 1);
         // In scope by ws_id, even when `q` selects none of its rows.
         let (_, json) = get_json(app.clone(), "/api/findings?ws_id=ws1&q=id%3Anone").await;
-        assert_eq!(json["tags_unavailable"], serde_json::json!(["ws1"]));
+        assert_eq!(
+            json["tags_unavailable"],
+            serde_json::json!([{ "ws_id": "ws1", "project": "repo" }])
+        );
         let (_, json) = get_json(app, "/api/findings").await;
-        assert_eq!(json["tags_unavailable"], serde_json::json!(["ws1"]));
+        assert_eq!(
+            json["tags_unavailable"],
+            serde_json::json!([{ "ws_id": "ws1", "project": "repo" }])
+        );
     }
 
     #[tokio::test]

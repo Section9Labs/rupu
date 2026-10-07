@@ -1517,9 +1517,10 @@ export interface FindingsResponse {
   /** Values in use per query field (`severity` always lists all five,
    *  critical first), with counts — what the query bar suggests. */
   facets: Record<string, { value: string; count: number }[]>;
-  /** Workspace ids whose tag log couldn't be read — tag filters may miss
-   *  their findings. */
-  tags_unavailable: string[];
+  /** Workspaces whose tag log couldn't be read — tag filters may miss their
+   *  findings. `project` is the workspace's project name (as `FindingOut.project`),
+   *  present even when none of its rows is in the answer. */
+  tags_unavailable: { ws_id: string; project: string }[];
 }
 
 /** A finding-report export format — `?format=` on the per-finding endpoint and

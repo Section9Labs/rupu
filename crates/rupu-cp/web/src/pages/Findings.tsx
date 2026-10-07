@@ -121,11 +121,11 @@ export default function Findings() {
     };
   }, [data]);
 
-  // Name the projects whose tag logs couldn't be read (fall back to the id).
-  const unreadable = useMemo(() => {
-    const ids = data?.tags_unavailable ?? [];
-    return ids.map((id) => data?.findings.find((f) => f.ws_id === id)?.project || id);
-  }, [data]);
+  // Name the projects whose tag logs couldn't be read.
+  const unreadable = useMemo(
+    () => (data?.tags_unavailable ?? []).map((w) => w.project || w.ws_id),
+    [data],
+  );
 
   const active = activeSeverity(q);
   // A fetch for this query is in flight (the last answer was for another).

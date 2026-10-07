@@ -143,17 +143,23 @@ describe('Findings — query bar', () => {
 
   it('warns which projects have unreadable tags', async () => {
     vi.spyOn(api, 'getFindings').mockResolvedValue(
-      resp([{ ...FINDING, ws_id: 'ws1', project: 'billing-api' }], { tags_unavailable: ['ws1'] }),
+      resp([{ ...FINDING, ws_id: 'ws1', project: 'billing-api' }], {
+        tags_unavailable: [{ ws_id: 'ws1', project: 'billing-api' }],
+      }),
     );
     renderPage();
     const banner = await screen.findByText(/couldn't be read/i);
     expect(banner).toHaveTextContent('billing-api');
   });
 
-  it('falls back to the workspace id when no row names the project', async () => {
-    vi.spyOn(api, 'getFindings').mockResolvedValue(resp([FINDING], { tags_unavailable: ['ws-gone'] }));
+  it('names the project even when no row of that workspace is in the answer', async () => {
+    vi.spyOn(api, 'getFindings').mockResolvedValue(
+      resp([FINDING], { tags_unavailable: [{ ws_id: 'ws_bill', project: 'billing-api' }] }),
+    );
     renderPage();
-    expect(await screen.findByText(/couldn't be read/i)).toHaveTextContent('ws-gone');
+    const banner = await screen.findByText(/couldn't be read/i);
+    expect(banner).toHaveTextContent('billing-api');
+    expect(banner).not.toHaveTextContent('ws_bill');
   });
 
   it('shows no banner when every tag log was readable', async () => {

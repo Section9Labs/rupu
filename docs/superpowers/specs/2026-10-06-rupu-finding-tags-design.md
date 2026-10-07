@@ -242,7 +242,7 @@ Findings are filtered everywhere with ONE single-line query language, modeled on
 - `GET /api/findings` gains `q`. An invalid `q` gives a 400 with `{error, token, code, start, end}` (char offsets).
 - The response gains:
   - `facets` (per key, `[{value, count}]` over the scope-filtered but not q-filtered set). These feed autocomplete and the severity tiles.
-  - `tags_unavailable: [ws_id]`, the workspaces whose tag log could not be read. This was decision A: findings are still served with their declared tags, flagged, and the page shows a banner.
+  - `tags_unavailable: [{ws_id, project}]`, the workspaces whose tag log could not be read (`project` is the workspace path's basename, as on a finding row, so the banner can name it even when no row of it is in the answer). This was decision A: findings are still served with their declared tags, flagged, and the page shows a banner.
 
 **Web.**
 - A generic `QueryBar` (chips, a fuzzy spotlight dropdown with lucide icons and per-value colors, keyboard handling, inline errors) driven by a per-view field registry. Plan 2 wires it into the global Findings page only.

@@ -1037,9 +1037,10 @@ show with their declared tags, so tag filters may miss them).
 
 The same query reaches the API as `GET /api/findings?q=…`. The response adds
 `facets` (per key, `[{value, count}]` over the scope-filtered but unqueried set;
-they feed the suggestions and tiles) and `tags_unavailable` (the workspace ids
-above, limited to the request's scope: the `ws_id` asked for, or a workspace
-with a finding in the scope). An invalid `q` is a 400 with
+they feed the suggestions and tiles) and `tags_unavailable` (the workspaces
+above, each `{ws_id, project}` where `project` is the path basename a finding
+row carries; limited to the request's scope: the `ws_id` asked for, or a
+workspace with a finding in the scope). An invalid `q` is a 400 with
 `{error, token, code, start, end}`: `token` is the 0-based token index, and the
 offsets are in characters.
 
