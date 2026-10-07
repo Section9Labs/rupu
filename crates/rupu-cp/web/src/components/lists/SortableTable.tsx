@@ -103,6 +103,7 @@ export default function SortableTable<T>({
   rowHref,
   onRowClick,
   renderDetail,
+  footer,
 }: {
   columns: Column<T>[];
   rows: T[];
@@ -126,6 +127,9 @@ export default function SortableTable<T>({
    *  nested-concern panels) see no behavior change: every row is
    *  expandable, so `rowHref` never applies, same as before. */
   renderDetail?: (row: T) => React.ReactNode;
+  /** Content rendered inside the table panel, under the rows, separated by a
+   *  rule (e.g. a "N unassigned — review" line). */
+  footer?: React.ReactNode;
 }) {
   const [sort, setSort] = useState<SortSpec | null>(initialSort ?? null);
   const [open, setOpen] = useState<ReadonlySet<string>>(new Set());
@@ -339,6 +343,7 @@ export default function SortableTable<T>({
           })}
         </tbody>
       </table>
+      {footer && <div className="border-t border-border px-4 py-2.5 text-note">{footer}</div>}
     </div>
   );
 }
