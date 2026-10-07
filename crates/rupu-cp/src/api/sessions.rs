@@ -1255,11 +1255,6 @@ mod tests {
         assert_eq!(usage["total_tokens"], 30, "priced from in + out");
     }
 
-    /// An HTTP remote already priced its own session with its own config.
-    /// Re-pricing it here would silently overwrite that with ours.
-    /// A remote session with a customer is priced at the coordinator's
-    /// global rates — flagged, since the peer's customer pricing isn't
-    /// available here (M5); one without a customer is not flagged.
     #[test]
     fn ensure_usage_block_flags_a_remote_session_with_a_customer() {
         let mut with = serde_json::json!({
@@ -1274,6 +1269,11 @@ mod tests {
         assert!(without["usage"].get("pricing_error").is_none(), "{without}");
     }
 
+    /// An HTTP remote already priced its own session with its own config.
+    /// Re-pricing it here would silently overwrite that with ours.
+    /// A remote session with a customer is priced at the coordinator's
+    /// global rates — flagged, since the peer's customer pricing isn't
+    /// available here (M5); one without a customer is not flagged.
     #[test]
     fn ensure_usage_block_leaves_an_already_priced_body_alone() {
         let mut detail = serde_json::json!({
