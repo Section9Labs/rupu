@@ -35,6 +35,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/findings", get(list_findings))
         .route("/api/findings/export", post(export_findings))
+        .route("/api/findings/tags", get(tags_in_use).post(tag_findings))
         .route("/api/findings/:id", get(get_finding))
         .route("/api/findings/:id/export", get(export_finding))
         .route("/api/findings/:id/artifacts/:sha256", get(get_artifact))
@@ -160,6 +161,11 @@ pub struct FindingDetail {
     #[serde(flatten)]
     pub finding: FindingOut,
     pub evidence_status: Vec<ClaimState>,
+    /// This finding's tag changes, in file order (`ledger::tags`).
+    pub tag_history: Vec<rupu_coverage::TagEvent>,
+    /// Whether its workspace's tag log can be read (and so edited). False
+    /// keeps the declared tags visible, read-only (decision A).
+    pub tags_editable: bool,
 }
 
 /// Optional query filters for `GET /api/findings`.
@@ -739,6 +745,67 @@ async fn list_findings(
     Ok(Json(resp))
 }
 
+/// At most this many findings per `POST /api/findings/tags`.
+const MAX_TAG_BATCH: usize = 1000;
+
+/// `POST /api/findings/tags` — add/remove tags on findings wherever they
+/// live (`tag_findings_across`: atomic per workspace, results per workspace),
+/// attributed to the CP operator.
+async fn tag_findings(
+    State(s): State<AppState>,
+    Json(body): Json<rupu_coverage::TagChangeInput>,
+) -> ApiResult<Json<TagAcrossResult>> {
+    if body.finding_ids.len() > MAX_TAG_BATCH {
+        return Err(ApiError::bad_request(format!(
+            "at most {MAX_TAG_BATCH} findings per change"
+        )));
+    }
+    let change = body
+        .into_change()
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    change
+        .check()
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let global = s.global_dir.clone();
+    let by = rupu_coverage::TagActor::operator(rupu_coverage::OperatorSurface::Cp);
+    let result = tokio::task::spawn_blocking(move || tag_findings_across(&global, &change, &by))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    if result.workspaces.is_empty() {
+        return Err(ApiError::not_found(format!(
+            "unknown finding id(s): {}",
+            result.unknown.join(", ")
+        )));
+    }
+    Ok(Json(result))
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TagsQuery {
+    pub ws_id: Option<String>,
+}
+
+/// `GET /api/findings/tags` — the tags in use (with how many findings carry
+/// each), most used first: the tag editor's autocomplete.
+async fn tags_in_use(
+    State(s): State<AppState>,
+    Query(q): Query<TagsQuery>,
+) -> ApiResult<Json<Vec<rupu_coverage::TagCount>>> {
+    let global = s.global_dir.clone();
+    let counts = tokio::task::spawn_blocking(move || {
+        let all = collect_all_findings(&global);
+        rupu_coverage::tags_in_use(
+            all.iter()
+                .filter(|f| q.ws_id.as_deref().is_none_or(|w| f.ws_id == w))
+                .map(|f| &f.record),
+        )
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(counts))
+}
+
 /// Find one finding by id across every registered workspace. Synchronous and
 /// potentially slow (it reads every coverage ledger): async callers must run
 /// it under `spawn_blocking`.
@@ -778,9 +845,27 @@ async fn get_finding(
         (Some(report), Err(_)) => vec![ClaimState::Unknown; report.evidence.len()],
         (None, _) => Vec::new(),
     };
+    let (tag_history, tags_editable) = match crate::api::code::load_workspace(&s, &finding.ws_id) {
+        Ok(ws) => {
+            let log = rupu_coverage::TagLog::for_workspace(std::path::Path::new(&ws.path));
+            let id_for_history = finding.record.id.clone();
+            match tokio::task::spawn_blocking(move || {
+                rupu_coverage::tag_history(&log, &id_for_history)
+            })
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?
+            {
+                Ok(h) => (h, true),
+                Err(_) => (Vec::new(), false),
+            }
+        }
+        Err(_) => (Vec::new(), false),
+    };
     let mut body = serde_json::to_value(FindingDetail {
         finding,
         evidence_status,
+        tag_history,
+        tags_editable,
     })
     .map_err(|e| ApiError::internal(e.to_string()))?;
     add_hex_siblings(&mut body);
@@ -4901,5 +4986,201 @@ mod tests {
         assert_eq!(status, axum::http::StatusCode::OK);
         assert_eq!(json["findings"].as_array().unwrap().len(), 3);
         assert_eq!(json["tags_unavailable"], serde_json::json!([]));
+    }
+
+    // ---- POST/GET /api/findings/tags ----
+
+    /// `ws1` (at `<global>/repo`) with `fnd_a` and `fnd_b`, `ws2` with `fnd_c`.
+    fn seed_tag_fixture(global: &std::path::Path) -> std::path::PathBuf {
+        let repo = seed_workspace_findings(
+            global,
+            &[
+                finding("fnd_a", Severity::High, "2026-09-29T00:00:00Z").record,
+                finding("fnd_b", Severity::Low, "2026-09-28T00:00:00Z").record,
+            ],
+        );
+        seed_named_workspace(
+            global,
+            "ws2",
+            "repo2",
+            &[finding("fnd_c", Severity::Medium, "2026-09-27T00:00:00Z").record],
+        );
+        repo
+    }
+
+    async fn post_tags(
+        app: Router,
+        body: serde_json::Value,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        let (status, _, bytes) = post_raw(app, "/api/findings/tags", body).await;
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    fn tag_needs_poc() -> serde_json::Value {
+        serde_json::json!({ "finding_ids": ["fnd_a", "fnd_c"], "add": ["Needs-POC"] })
+    }
+
+    #[tokio::test]
+    async fn post_tags_applies_per_workspace_and_attributes_the_cp_operator() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = seed_tag_fixture(tmp.path());
+        let app = app_for(tmp.path());
+        let (status, json) = post_tags(app.clone(), tag_needs_poc()).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{json}");
+        let wss = json["workspaces"].as_array().unwrap();
+        assert_eq!(wss.len(), 2, "{json}");
+        for w in wss {
+            assert_eq!(
+                w["outcomes"][0]["after"],
+                serde_json::json!(["needs-poc"]),
+                "{json}"
+            );
+        }
+        assert_eq!(json["unknown"], serde_json::json!([]));
+
+        let (status, listed) = get_json(app, "/api/findings?q=tag%3Aneeds-poc").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let mut ids: Vec<&str> = listed["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["id"].as_str().unwrap())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, ["fnd_a", "fnd_c"]);
+
+        let log =
+            std::fs::read_to_string(rupu_coverage::TagLog::for_workspace(&repo).path).unwrap();
+        let event: serde_json::Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
+        assert_eq!(event["by"]["kind"], "operator", "{event}");
+        assert_eq!(event["by"]["via"], "cp", "{event}");
+    }
+
+    #[tokio::test]
+    async fn post_tags_reports_unknown_ids_alongside_the_applied_ones() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_tag_fixture(tmp.path());
+        let (status, json) = post_tags(
+            app_for(tmp.path()),
+            serde_json::json!({ "finding_ids": ["fnd_a", "fnd_nope"], "remove": ["x"] }),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{json}");
+        assert_eq!(json["unknown"], serde_json::json!(["fnd_nope"]));
+    }
+
+    #[tokio::test]
+    async fn post_tags_with_no_known_id_is_a_404() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_tag_fixture(tmp.path());
+        let (status, json) = post_tags(
+            app_for(tmp.path()),
+            serde_json::json!({ "finding_ids": ["fnd_nope"], "add": ["x"] }),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{json}");
+        assert!(json["error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn post_tags_rejects_bad_requests_with_a_400_and_a_message() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_tag_fixture(tmp.path());
+        let app = app_for(tmp.path());
+        let too_many: Vec<String> = (0..1001).map(|i| format!("fnd_{i}")).collect();
+        for body in [
+            serde_json::json!({ "finding_ids": ["fnd_a"], "add": ["bad tag"] }),
+            serde_json::json!({ "finding_ids": ["fnd_a"] }),
+            serde_json::json!({ "finding_ids": ["fnd_a"], "add": ["x"], "remove": ["x"] }),
+            serde_json::json!({ "finding_ids": [], "add": ["x"] }),
+            serde_json::json!({ "finding_ids": too_many, "add": ["x"] }),
+        ] {
+            let (status, json) = post_tags(app.clone(), body.clone()).await;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::BAD_REQUEST,
+                "{body}: {json}"
+            );
+            assert!(
+                json["error"].as_str().is_some_and(|e| !e.is_empty()),
+                "{json}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn post_tags_rejects_an_unknown_field() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_tag_fixture(tmp.path());
+        let (status, _) = post_tags(
+            app_for(tmp.path()),
+            serde_json::json!({ "finding_ids": ["fnd_a"], "tags": ["x"] }),
+        )
+        .await;
+        assert!(status.is_client_error(), "{status}");
+    }
+
+    #[tokio::test]
+    async fn get_tags_counts_what_is_in_use_and_follows_the_ws_scope() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_tag_fixture(tmp.path());
+        let app = app_for(tmp.path());
+        let (status, _) = post_tags(app.clone(), tag_needs_poc()).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let (status, json) = get_json(app.clone(), "/api/findings/tags").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            json,
+            serde_json::json!([{ "tag": "needs-poc", "count": 2 }])
+        );
+        let (_, json) = get_json(app, "/api/findings/tags?ws_id=ws2").await;
+        assert_eq!(
+            json,
+            serde_json::json!([{ "tag": "needs-poc", "count": 1 }])
+        );
+    }
+
+    #[tokio::test]
+    async fn get_finding_serves_tag_history_and_degrades_when_the_log_is_unreadable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = seed_tag_fixture(tmp.path());
+        let app = app_for(tmp.path());
+        let (status, _) = post_tags(app.clone(), tag_needs_poc()).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let (status, json) = get_json(app.clone(), "/api/findings/fnd_a").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(json["tags"], serde_json::json!(["needs-poc"]));
+        assert_eq!(json["tags_editable"], true);
+        assert_eq!(json["tag_history"].as_array().unwrap().len(), 1, "{json}");
+        assert_eq!(json["tag_history"][0]["op"], "add");
+
+        let log = rupu_coverage::TagLog::for_workspace(&repo).path;
+        std::fs::remove_file(&log).unwrap();
+        std::fs::create_dir(&log).unwrap();
+        let (status, json) = get_json(app, "/api/findings/fnd_a").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(json["tags_editable"], false);
+        assert_eq!(json["tag_history"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn post_tags_reports_an_unreadable_workspace_without_failing_the_others() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = seed_tag_fixture(tmp.path());
+        let log = rupu_coverage::TagLog::for_workspace(&repo).path;
+        std::fs::create_dir_all(&log).unwrap();
+        let (status, json) = post_tags(app_for(tmp.path()), tag_needs_poc()).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{json}");
+        let wss = json["workspaces"].as_array().unwrap();
+        let ws1 = wss.iter().find(|w| w["ws_id"] == "ws1").unwrap();
+        let ws2 = wss.iter().find(|w| w["ws_id"] == "ws2").unwrap();
+        assert!(ws1["error"].is_string(), "{json}");
+        assert!(
+            ws2["outcomes"].is_array() && ws2.get("error").is_none(),
+            "{json}"
+        );
     }
 }
