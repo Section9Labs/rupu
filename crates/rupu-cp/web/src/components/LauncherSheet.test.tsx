@@ -210,4 +210,19 @@ describe('LauncherSheet', () => {
     fireEvent.click(btn);
     expect(launch).not.toHaveBeenCalled();
   });
+
+  it('says the preview resolved from the control plane cwd when a repo target is chosen', async () => {
+    vi.spyOn(api, 'getRepos').mockResolvedValue([
+      { provider: 'github', owner: 'o', name: 'r', default_branch: 'main' } as never,
+    ]);
+    vi.spyOn(api, 'launchPreview').mockResolvedValue(ACME_PREVIEW);
+    render(<LauncherSheet workflow="audit" declaredInputs={[]} onClose={() => {}} />);
+    await screen.findByText("Acme Corp's accounts", { exact: false });
+    expect(screen.queryByText(/control plane's working directory/)).toBeNull();
+    const picker = screen.getByPlaceholderText('search projects, repos, or a path…');
+    fireEvent.focus(picker);
+    fireEvent.change(picker, { target: { value: 'github:o/r' } });
+    fireEvent.keyDown(picker, { key: 'Enter' });
+    expect(await screen.findByText(/control plane's working directory/)).toBeInTheDocument();
+  });
 });

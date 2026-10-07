@@ -8,6 +8,7 @@ import {
   type PreviewBody,
   type PreviewResponse,
 } from '../../lib/api';
+import { cn } from '../../lib/cn';
 import { CustomerDot } from './CustomerDot';
 
 const DEBOUNCE_MS = 250;
@@ -21,11 +22,9 @@ export interface BillingState {
   blocked: boolean;
 }
 
-type Load =
-  | { kind: 'idle' }
-  | { kind: 'loading' }
+type Result =
   | { kind: 'ready'; data: PreviewResponse }
-  | { kind: 'error'; message: string; blocked: boolean };
+  | { kind: 'error'; message: string; blocked: boolean; remote: boolean };
 
 const ROLES: { role: ManifestEntry['role']; label: string }[] = [
   { role: 'provider', label: 'Provider' },
@@ -43,41 +42,61 @@ const ROLES: { role: ManifestEntry['role']; label: string }[] = [
 export function LaunchBillingPanel({
   body,
   onResult,
+  resolvedFrom = null,
 }: {
   body: PreviewBody | null;
   onResult?: (state: BillingState) => void;
+  /** `'cp-cwd'` when the launch has no working directory of its own (a repo
+   *  target): the control plane resolves it from its own cwd, and says so. */
+  resolvedFrom?: 'cp-cwd' | null;
 }) {
-  const [load, setLoad] = useState<Load>({ kind: 'idle' });
+  // The last answer stays on screen (dimmed) while the next one is pending.
+  const [result, setResult] = useState<Result | null>(null);
+  const [pending, setPending] = useState(false);
   const onResultRef = useRef(onResult);
   onResultRef.current = onResult;
+  // What the last answer said, so a pending request neither drops the chip nor
+  // lifts a block: only the next answer does.
+  const lastRef = useRef<BillingState>({ customer: undefined, blocked: false });
+
+  function report(state: BillingState) {
+    lastRef.current = state;
+    onResultRef.current?.(state);
+  }
 
   // A stable key so an equal body built fresh each render doesn't refetch.
   const key = useMemo(() => (body ? JSON.stringify(body) : null), [body]);
 
   useEffect(() => {
     if (key === null) {
-      setLoad({ kind: 'idle' });
-      onResultRef.current?.({ customer: undefined, blocked: false });
+      setResult(null);
+      setPending(false);
+      report({ customer: undefined, blocked: false });
       return;
     }
     const ctrl = new AbortController();
-    setLoad({ kind: 'loading' });
-    // Nothing is known about this body yet: don't keep blocking on the last one.
-    onResultRef.current?.({ customer: undefined, blocked: false });
+    setPending(true);
+    onResultRef.current?.(lastRef.current);
+    const remote = !!(JSON.parse(key) as PreviewBody).host;
     const timer = setTimeout(() => {
       api
         .launchPreview(JSON.parse(key) as PreviewBody, ctrl.signal)
         .then((data) => {
           if (ctrl.signal.aborted) return;
-          setLoad({ kind: 'ready', data });
-          onResultRef.current?.({ customer: data.customer, blocked: false });
+          setResult({ kind: 'ready', data });
+          setPending(false);
+          report({ customer: data.customer, blocked: false });
         })
         .catch((e: unknown) => {
           if (ctrl.signal.aborted) return;
-          const blocked = e instanceof ApiError && e.status === 409;
+          const is409 = e instanceof ApiError && e.status === 409;
+          // A remote host runs on its own config: a failure to resolve the
+          // control plane's doesn't stop the launch.
+          const blocked = is409 && !remote;
           const message = e instanceof Error ? e.message : 'Could not preview the accounts';
-          setLoad({ kind: 'error', message, blocked });
-          onResultRef.current?.({ customer: undefined, blocked });
+          setResult({ kind: 'error', message, blocked, remote: is409 && remote });
+          setPending(false);
+          report({ customer: undefined, blocked });
         });
     }, DEBOUNCE_MS);
     return () => {
@@ -86,29 +105,51 @@ export function LaunchBillingPanel({
     };
   }, [key]);
 
-  if (load.kind === 'idle') return null;
-
-  if (load.kind === 'loading') {
+  if (result === null) {
+    if (!pending) return null;
     return (
-      <p className="rounded-lg border border-border bg-surface px-3 py-2 text-ui text-ink-mute">
+      <p
+        aria-busy="true"
+        className="rounded-lg border border-border bg-surface px-3 py-2 text-ui text-ink-mute"
+      >
         Checking which accounts this run uses…
       </p>
     );
   }
 
-  if (load.kind === 'error') {
+  if (result.kind === 'error') {
+    if (result.remote) {
+      return (
+        <p
+          role="status"
+          aria-busy={pending}
+          className={cn('flex items-start gap-1.5 text-ui text-warn', pending && 'opacity-60')}
+        >
+          <AlertTriangle size={12} aria-hidden className="mt-1 shrink-0" />
+          <span>
+            The control plane's own config failed to resolve ({result.message}); the remote host
+            uses its own config.
+          </span>
+        </p>
+      );
+    }
     return (
-      <p role="alert" className="text-ui font-medium text-err">
-        {load.message}
+      <p
+        role="alert"
+        aria-busy={pending}
+        className={cn('text-ui font-medium text-err', pending && 'opacity-60')}
+      >
+        {result.message}
       </p>
     );
   }
 
-  const { customer, accounts, warnings, host } = load.data;
+  const { customer, accounts, warnings, host } = result.data;
   return (
     <section
       aria-label="Accounts this run uses"
-      className="rounded-lg border border-brand-100 bg-brand-50 px-3 py-2.5"
+      aria-busy={pending}
+      className={cn('rounded-lg border border-brand-100 bg-brand-50 px-3 py-2.5', pending && 'opacity-60')}
     >
       <h3 className="flex items-center gap-1.5 text-ui font-semibold text-brand-700">
         {customer && <CustomerDot tint={customer.tint} />}
@@ -116,6 +157,12 @@ export function LaunchBillingPanel({
           This run uses {customer ? `${customer.name}'s accounts` : 'the global accounts'}
         </span>
       </h3>
+      {resolvedFrom === 'cp-cwd' && (
+        <p className="mt-1 text-meta text-ink-mute">
+          Resolved from the control plane's working directory, not the repo — the run bills like a
+          launch from there.
+        </p>
+      )}
       {host && (
         <p className="mt-1 text-meta text-ink-dim">
           Host <span className="font-mono">{host}</span>
@@ -149,8 +196,8 @@ export function LaunchBillingPanel({
       </dl>
       {warnings.length > 0 && (
         <ul className="mt-2 space-y-0.5">
-          {warnings.map((w) => (
-            <li key={w} className="flex items-start gap-1.5 text-meta text-warn">
+          {warnings.map((w, i) => (
+            <li key={`${i}-${w}`} className="flex items-start gap-1.5 text-meta text-warn">
               <AlertTriangle size={12} aria-hidden className="mt-0.5 shrink-0" />
               <span>{w}</span>
             </li>

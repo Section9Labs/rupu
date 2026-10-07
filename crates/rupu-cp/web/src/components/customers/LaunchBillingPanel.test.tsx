@@ -145,4 +145,70 @@ describe('LaunchBillingPanel', () => {
     expect(spy).not.toHaveBeenCalled();
     expect(container).toBeEmptyDOMElement();
   });
+
+  it('keeps Launch blocked while the next preview is pending after a 409', async () => {
+    let resolveNext!: (r: PreviewResponse) => void;
+    vi.spyOn(api, 'launchPreview')
+      .mockRejectedValueOnce(new ApiError(409, 'config does not load'))
+      .mockImplementationOnce(() => new Promise((res) => { resolveNext = res; }));
+    const onResult = vi.fn();
+    const { rerender } = render(<LaunchBillingPanel body={{ agent: 'a', working_dir: '/1' }} onResult={onResult} />);
+    await flush();
+    expect(onResult).toHaveBeenLastCalledWith({ customer: undefined, blocked: true });
+
+    onResult.mockClear();
+    rerender(<LaunchBillingPanel body={{ agent: 'a', working_dir: '/2' }} onResult={onResult} />);
+    await flush();
+    expect(onResult).toHaveBeenCalled();
+    for (const call of onResult.mock.calls) expect(call[0].blocked).toBe(true);
+    // The old error stays, dimmed and busy.
+    expect(screen.getByRole('alert')).toHaveAttribute('aria-busy', 'true');
+
+    await act(async () => {
+      resolveNext(RESP);
+    });
+    expect(onResult).toHaveBeenLastCalledWith({ customer: ACME, blocked: false });
+  });
+
+  it('keeps the previous result (and its customer) visible and busy while the next loads', async () => {
+    vi.spyOn(api, 'launchPreview')
+      .mockResolvedValueOnce(RESP)
+      .mockImplementationOnce(() => new Promise(() => {}));
+    const onResult = vi.fn();
+    const { rerender } = render(<LaunchBillingPanel body={{ agent: 'a', working_dir: '/1' }} onResult={onResult} />);
+    await flush();
+    onResult.mockClear();
+    rerender(<LaunchBillingPanel body={{ agent: 'a', working_dir: '/2' }} onResult={onResult} />);
+    const section = screen.getByRole('region', { name: 'Accounts this run uses' });
+    expect(section).toHaveAttribute('aria-busy', 'true');
+    expect(screen.getByText('acme-anthropic')).toBeInTheDocument();
+    expect(onResult).toHaveBeenLastCalledWith({ customer: ACME, blocked: false });
+  });
+
+  it('a 409 for a remote host is a warning and does not block', async () => {
+    vi.spyOn(api, 'launchPreview').mockRejectedValue(new ApiError(409, 'config does not load'));
+    const onResult = vi.fn();
+    render(<LaunchBillingPanel body={{ agent: 'a', host: 'mini' }} onResult={onResult} />);
+    await flush();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.getByRole('status')).toHaveTextContent("control plane's own config failed to resolve");
+    expect(screen.getByRole('status')).toHaveTextContent('config does not load');
+    expect(onResult).toHaveBeenLastCalledWith({ customer: undefined, blocked: false });
+  });
+
+  it('says the control plane resolved from its own cwd for a repo target', async () => {
+    vi.spyOn(api, 'launchPreview').mockResolvedValue(RESP);
+    render(<LaunchBillingPanel body={{ agent: 'a' }} resolvedFrom="cp-cwd" />);
+    await flush();
+    expect(screen.getByText(/Resolved from the control plane's working directory/)).toBeInTheDocument();
+  });
+
+  it('renders duplicate warnings without key collisions', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(api, 'launchPreview').mockResolvedValue({ ...RESP, warnings: ['dup', 'dup'] });
+    render(<LaunchBillingPanel body={{ agent: 'a' }} />);
+    await flush();
+    expect(screen.getAllByText('dup')).toHaveLength(2);
+    expect(err).not.toHaveBeenCalled();
+  });
 });

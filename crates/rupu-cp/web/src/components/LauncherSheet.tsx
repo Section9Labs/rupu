@@ -243,7 +243,11 @@ export default function LauncherSheet({
             />
           </label>
 
-          <LaunchBillingPanel body={previewBody} onResult={setBilling} />
+          <LaunchBillingPanel
+            body={previewBody}
+            onResult={setBilling}
+            resolvedFrom={target.resolved.target && !target.resolved.working_dir ? 'cp-cwd' : null}
+          />
 
           {error && (
             <p role="alert" className="text-ui font-medium text-err">
