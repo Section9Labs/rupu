@@ -10,8 +10,9 @@
 // taller spine. Colors come from the real codename palette — the spine is tinted
 // by the run's own crew (the lead), each branch by its unit's crew.
 
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { ChevronRight, ChevronDown } from 'lucide-react';
 import { AgentName } from '../codename/AgentName';
 import { StatusPill } from '../StatusPill';
 import { Badge } from '../ui/Badge';
@@ -59,6 +60,10 @@ interface SpineNode {
   ev?: AgentiflowEvent;
   transcriptPath?: string;
   units: UnitNode[];
+  /** A round whose units are hidden (long-flow collapse). */
+  collapsed?: boolean;
+  /** Total units in the round, even when collapsed (units[] is then empty). */
+  unitCount?: number;
 }
 
 function str(v: unknown): string | undefined {
@@ -81,10 +86,17 @@ export default function AgentiflowGraph({ detail }: { detail: AgentiflowDetail }
   const leadCrew = parseCodename(record.codename).crew;
   const leadTint = crewTint(leadCrew, mode) ?? pal.brand;
 
+  // Per-round collapse override (round → explicit expanded state). Without an
+  // entry a round defaults to collapsed unless it is the last / live one, so a
+  // long engagement stays compact and only the active round is open.
+  const [expandedOverride, setExpandedOverride] = useState<Record<number, boolean>>({});
+  const toggleRound = (round: number, currentlyExpanded: boolean) =>
+    setExpandedOverride((o) => ({ ...o, [round]: !currentlyExpanded }));
+
   const { nodes, totalH } = useMemo(
-    () => build(detail, mode, pal),
-    // detail identity + mode drive the geometry; pal is derived from mode.
-    [detail, mode], // eslint-disable-line react-hooks/exhaustive-deps
+    () => build(detail, mode, pal, expandedOverride),
+    // detail identity + mode + the collapse overrides drive the geometry.
+    [detail, mode, expandedOverride], // eslint-disable-line react-hooks/exhaustive-deps
   );
 
   const lastY = nodes.length ? nodes[nodes.length - 1].nodeY : 0;
@@ -175,7 +187,7 @@ export default function AgentiflowGraph({ detail }: { detail: AgentiflowDetail }
         {/* Row content — aligned to the SVG node y's. */}
         {nodes.map((n) => (
           <div key={`row-${n.key}`} className="absolute" style={{ top: n.top, left: CARD_X, right: 0, height: n.kind === 'round' ? HEADER_H : n.height }}>
-            <RowHead node={n} detail={detail} leadCrew={leadCrew} />
+            <RowHead node={n} detail={detail} leadCrew={leadCrew} onToggle={toggleRound} />
           </div>
         ))}
         {nodes.flatMap((n) =>
@@ -203,7 +215,12 @@ function stopTone(reason: string, pal: Palette): string {
 // Geometry
 // ---------------------------------------------------------------------------
 
-function build(detail: AgentiflowDetail, mode: 'light' | 'dark', pal: Palette): { nodes: SpineNode[]; totalH: number } {
+function build(
+  detail: AgentiflowDetail,
+  mode: 'light' | 'dark',
+  pal: Palette,
+  override: Record<number, boolean>,
+): { nodes: SpineNode[]; totalH: number } {
   const { record, events, units, lead_transcripts } = detail;
   const running = record.status === 'running';
 
@@ -268,8 +285,12 @@ function build(detail: AgentiflowDetail, mode: 'light' | 'dark', pal: Palette): 
 
   for (let r = 0; r <= maxRound; r++) {
     const us = unitsByRound.get(r) ?? [];
+    // Default: only the last / live round is open; earlier rounds collapse
+    // unless the operator expanded one. A round with no units never "collapses".
+    const expanded = us.length === 0 ? true : r in override ? override[r] : r === maxRound;
     const top = y;
-    const unitNodes = us.map((u, i) => toUnitNode(u, top + HEADER_H + i * ROW_H + ROW_H / 2));
+    const unitNodes = expanded ? us.map((u, i) => toUnitNode(u, top + HEADER_H + i * ROW_H + ROW_H / 2)) : [];
+    const bodyH = unitNodes.length * ROW_H;
     nodes.push({
       kind: 'round',
       key: `round-${r}`,
@@ -278,10 +299,12 @@ function build(detail: AgentiflowDetail, mode: 'light' | 'dark', pal: Palette): 
       transcriptPath: txByRound.get(r),
       top,
       nodeY: top + HEADER_H / 2,
-      height: HEADER_H + us.length * ROW_H,
+      height: HEADER_H + bodyH,
       units: unitNodes,
+      collapsed: us.length > 0 && !expanded,
+      unitCount: us.length,
     });
-    y += HEADER_H + us.length * ROW_H;
+    y += HEADER_H + bodyH;
   }
 
   if (stopEv) pushHead({ kind: 'stop', key: 'stop', ev: stopEv });
@@ -294,7 +317,17 @@ function build(detail: AgentiflowDetail, mode: 'light' | 'dark', pal: Palette): 
 // Row content
 // ---------------------------------------------------------------------------
 
-function RowHead({ node, detail, leadCrew }: { node: SpineNode; detail: AgentiflowDetail; leadCrew: string }) {
+function RowHead({
+  node,
+  detail,
+  leadCrew,
+  onToggle,
+}: {
+  node: SpineNode;
+  detail: AgentiflowDetail;
+  leadCrew: string;
+  onToggle: (round: number, currentlyExpanded: boolean) => void;
+}) {
   if (node.kind === 'start') {
     const profiles = detail.record.engagement_profiles;
     return (
@@ -350,9 +383,22 @@ function RowHead({ node, detail, leadCrew }: { node: SpineNode; detail: Agentifl
   const tokens = num(ev?.spent_tokens);
   const converge = ev?.converge === true;
   const live = !ev; // no round event yet → this round is in progress
+  const unitCount = node.unitCount ?? 0;
+  const expanded = !node.collapsed;
   return (
     <div className="flex h-[50px] flex-col justify-center">
       <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
+        {unitCount > 0 && (
+          <button
+            type="button"
+            onClick={() => onToggle(node.round!, expanded)}
+            className="-ml-1 inline-flex items-center rounded text-ink-mute hover:text-ink"
+            aria-label={expanded ? `Collapse round ${node.round}` : `Expand round ${node.round}`}
+            title={expanded ? 'Collapse round' : 'Expand round'}
+          >
+            {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+          </button>
+        )}
         <span className="text-sm font-semibold text-ink">round {node.round}</span>
         {live ? (
           <span className="text-meta text-ink-dim">
@@ -375,10 +421,15 @@ function RowHead({ node, detail, leadCrew }: { node: SpineNode; detail: Agentifl
             )}
           </>
         )}
-        {node.units.length > 0 && (
-          <span className="text-meta text-ink-mute">
-            · {node.units.length} {node.units.length === 1 ? 'unit' : 'units'}
-          </span>
+        {unitCount > 0 && (
+          <button
+            type="button"
+            onClick={() => onToggle(node.round!, expanded)}
+            className="text-meta text-ink-mute hover:text-ink"
+          >
+            · {unitCount} {unitCount === 1 ? 'unit' : 'units'}
+            {node.collapsed && ' (hidden)'}
+          </button>
         )}
         {node.transcriptPath && (
           <Link
@@ -404,13 +455,25 @@ function UnitCard({ unit }: { unit: AgentiflowUnit }) {
       {unit.participant && <span className="truncate font-mono text-meta text-ink-mute">{unit.participant}</span>}
       <span className="ml-auto flex shrink-0 items-center gap-2.5 text-meta text-ink-mute">
         {unit.started_at && <span title={absoluteTime(unit.started_at)}>{relativeTime(unit.started_at)}</span>}
-        {unit.transcript_path && (
+        {unit.kind === 'workflow' ? (
+          // A dispatched workflow IS a full workflow run — drill into its own
+          // DAG (the standard run graph) rather than a single transcript.
           <Link
-            to={`/transcript?path=${encodeURIComponent(unit.transcript_path)}&live=0`}
+            to={`/runs/${encodeURIComponent(unit.unit_id)}`}
             className="font-medium text-brand-600 hover:text-brand-700 hover:underline"
+            title="Open this workflow's run graph"
           >
-            transcript
+            open flow →
           </Link>
+        ) : (
+          unit.transcript_path && (
+            <Link
+              to={`/transcript?path=${encodeURIComponent(unit.transcript_path)}&live=0`}
+              className="font-medium text-brand-600 hover:text-brand-700 hover:underline"
+            >
+              transcript
+            </Link>
+          )
         )}
       </span>
     </div>
