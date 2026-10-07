@@ -48,6 +48,7 @@ import { absoluteTime } from '../lib/time';
 import { formatTokens, formatCost } from '../lib/usage';
 import { CrewChip } from '../components/codename/CrewChip';
 import { RunCustomerChip } from '../components/customers/RunCustomer';
+import { PricingErrorMark } from '../components/customers/PricingErrorMark';
 import { AgentName } from '../components/codename/AgentName';
 import {
   SubrunIdentityContext,
@@ -872,7 +873,8 @@ export default function RunDetail() {
                   <span className="text-ink-mute">total</span> {displayUsage.partial ? '≥' : ''}
                   {formatTokens(displayUsage.total_tokens)}
                 </span>
-                <span className="font-medium text-ink">
+                <span className="inline-flex items-center gap-1 font-medium text-ink">
+                  <PricingErrorMark error={displayUsage.pricing_error} />
                   {formatCost(displayUsage.cost_usd)}{displayUsage.cost_usd !== null && !displayUsage.priced ? '*' : ''}
                 </span>
               </div>

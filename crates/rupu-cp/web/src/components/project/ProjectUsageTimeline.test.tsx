@@ -114,3 +114,17 @@ describe('ProjectUsageTimeline', () => {
     expect(screen.queryByText(/cost outliers/i)).not.toBeInTheDocument();
   });
 });
+
+describe('ProjectUsageTimeline — pricing errors', () => {
+  it('marks the headline cost (and the row) when a run was priced at the global rates', async () => {
+    vi.spyOn(api, 'getUsageRuns').mockResolvedValue([
+      runRow({ pricing_error: 'acme layer broken' }),
+      runRow({ run_id: 'run_2', model: 'other' }),
+    ]);
+    render(<ProjectUsageTimeline wsId="ws_42" />);
+    // One beside the headline, one on the breakdown row it came from.
+    await waitFor(() =>
+      expect(screen.getAllByRole('img', { name: 'Pricing unavailable: acme layer broken' })).toHaveLength(2),
+    );
+  });
+});

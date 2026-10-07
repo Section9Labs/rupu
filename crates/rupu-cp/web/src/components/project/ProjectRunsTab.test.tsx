@@ -282,3 +282,12 @@ describe('ProjectRunsTab — codenames', () => {
     expect(screen.getByText('wf-a')).toBeInTheDocument();
   });
 });
+
+describe('ProjectRunsTab — pricing errors', () => {
+  it('marks a run row priced at the global rates', async () => {
+    mockRuns([{ ...ROWS[0], usage: { ...usage(), pricing_error: 'acme layer broken' } }, ROWS[1]]);
+    renderTab();
+    expect(await screen.findByRole('img', { name: 'Pricing unavailable: acme layer broken', hidden: true })).toBeInTheDocument();
+    expect(screen.getAllByRole('img', { name: /^Pricing unavailable/, hidden: true })).toHaveLength(1);
+  });
+});

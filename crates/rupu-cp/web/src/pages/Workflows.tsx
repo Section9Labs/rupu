@@ -13,6 +13,7 @@ import { Button } from '../components/ui/Button';
 import { EmptyState } from '../components/ui/EmptyState';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
 import { UnscopedNote } from '../components/customers/UnscopedNote';
+import { PricingErrorMark } from '../components/customers/PricingErrorMark';
 import { Spinner } from '../components/ui/Spinner';
 import { ScopeChip } from '../components/ScopeChip';
 import { EnabledChip } from './AutoflowsDefs';
@@ -456,7 +457,10 @@ function workflowColumns(
       sortable: true,
       sortValue: (w) => w.usage?.cost_usd ?? null,
       render: (w) => (
-        <span className="text-ink font-medium">{w.usage ? formatCost(w.usage.cost_usd) : '—'}</span>
+        <span className="inline-flex items-center justify-end gap-1 text-ink font-medium">
+          <PricingErrorMark error={w.usage?.pricing_error} />
+          {w.usage ? formatCost(w.usage.cost_usd) : '—'}
+        </span>
       ),
     },
     {

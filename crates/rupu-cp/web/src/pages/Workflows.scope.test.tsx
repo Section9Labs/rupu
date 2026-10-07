@@ -67,6 +67,22 @@ describe('Workflows scope column', () => {
   });
 });
 
+describe('Workflows cost column', () => {
+  it('marks a workflow whose spend was priced at the global rates', async () => {
+    vi.spyOn(api, 'getWorkflows').mockResolvedValue([
+      { ...ROWS[0], usage: { ...USAGE, cost_usd: 1.2, pricing_error: 'acme layer broken' } },
+      ROWS[1],
+    ]);
+    render(
+      <MemoryRouter initialEntries={['/workflows']}>
+        {withCustomerScope(<Workflows />)}
+      </MemoryRouter>,
+    );
+    expect(await screen.findByRole('img', { name: 'Pricing unavailable: acme layer broken', hidden: true })).toBeInTheDocument();
+    expect(screen.getAllByRole('img', { name: /^Pricing unavailable/, hidden: true })).toHaveLength(1);
+  });
+});
+
 describe('Workflows under a customer scope', () => {
   const NOTE = 'Run counts and spend here cover every customer.';
 

@@ -35,6 +35,7 @@ import { EmptyState } from '../ui/EmptyState';
 import { ErrorBanner } from '../ui/ErrorBanner';
 import { Spinner } from '../ui/Spinner';
 import ProjectUsageTimeline from './ProjectUsageTimeline';
+import { PricingErrorMark } from '../customers/PricingErrorMark';
 import { usePagedList } from '../../lib/usePagedList';
 import { durationBetween, relativeTime } from '../../lib/time';
 import { formatTokens, formatCost } from '../../lib/usage';
@@ -161,7 +162,12 @@ const RUN_COLUMNS: Column<RunListRow>[] = [
     fit: true,
     sortable: true,
     sortValue: (r) => r.usage.cost_usd,
-    render: (r) => <span className="text-ink font-medium">{formatCost(r.usage.cost_usd)}</span>,
+    render: (r) => (
+      <span className="inline-flex items-center justify-end gap-1 text-ink font-medium">
+        <PricingErrorMark error={r.usage.pricing_error} />
+        {formatCost(r.usage.cost_usd)}
+      </span>
+    ),
   },
   {
     key: 'turns',

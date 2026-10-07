@@ -1494,6 +1494,21 @@ describe('RunDetail: customer chip', () => {
     expect(spy.mock.calls.filter(([o]) => o?.archived).length).toBe(1);
   });
 
+  it('marks the header cost when the run was priced at the global rates', async () => {
+    const graph: RunGraphResponse = {
+      ...GRAPH,
+      usage: { ...EMPTY_USAGE, cost_usd: 1.2, priced: true, pricing_error: 'customer acme: config layer does not parse' },
+    };
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(graph);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+    renderWithCustomers();
+    expect(
+      await screen.findByRole('img', { name: 'Pricing unavailable: customer acme: config layer does not parse' }),
+    ).toBeInTheDocument();
+  });
+
   it('does not load the archived list when the slug is an active customer', async () => {
     stubCustomerRun({ customer: 'acme' });
     const spy = vi.spyOn(api, 'getCustomers').mockResolvedValue([customerRow('acme', { name: 'Acme Corp' })]);

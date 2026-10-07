@@ -13,6 +13,7 @@ import { Button } from '../components/ui/Button';
 import { EmptyState } from '../components/ui/EmptyState';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
 import { UnscopedNote } from '../components/customers/UnscopedNote';
+import { PricingErrorMark } from '../components/customers/PricingErrorMark';
 import { Spinner } from '../components/ui/Spinner';
 import { ScopeChip } from '../components/ScopeChip';
 import { formatTokens, formatCost } from '../lib/usage';
@@ -325,7 +326,10 @@ const AGENT_BASE_COLUMNS: Column<AgentSummary>[] = [
     sortable: true,
     sortValue: (a) => a.usage?.cost_usd ?? null,
     render: (a) => (
-      <span className="text-ink font-medium">{a.usage ? formatCost(a.usage.cost_usd) : '—'}</span>
+      <span className="inline-flex items-center justify-end gap-1 text-ink font-medium">
+        <PricingErrorMark error={a.usage?.pricing_error} />
+        {a.usage ? formatCost(a.usage.cost_usd) : '—'}
+      </span>
     ),
   },
   {
