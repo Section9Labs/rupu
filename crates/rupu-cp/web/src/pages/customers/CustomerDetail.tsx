@@ -660,6 +660,20 @@ function DeleteCustomerDialog({
 // Tab bodies
 // ---------------------------------------------------------------------------
 
+/** The customer Projects tab's "Last active": this customer's own last work in
+ *  the project over the range, or none. */
+const CUSTOMER_LAST_ACTIVE_COLUMN: Column<ProjectRow> = {
+  key: 'last_active',
+  header: 'Last active',
+  align: 'right',
+  fit: true,
+  sortable: true,
+  sortValue: (p) => (p.last_active ? Date.parse(p.last_active) : null),
+  render: (p) => (
+    <span className="text-ink-mute">{p.last_active ? relativeTime(p.last_active) : 'no runs in range'}</span>
+  ),
+};
+
 /** "over the last 30d" / "over all time" — what a range-scoped figure covers. */
 function overRange(rangeLabel: string): string {
   return rangeLabel === 'all time' ? 'over all time' : `over the last ${rangeLabel}`;
@@ -707,7 +721,10 @@ function ProjectsTab({
   }
 
   const columns: Column<ProjectRow>[] = [
-    ...PROJECT_COLUMNS,
+    // "Last active" here is this customer's last work in the project over the
+    // range (`last_active`) — never the Projects page's fallback to the
+    // project's last run, which may have been billed to another customer.
+    ...PROJECT_COLUMNS.map((col) => (col.key === 'last_active' ? CUSTOMER_LAST_ACTIVE_COLUMN : col)),
     {
       key: 'actions',
       header: '',
@@ -736,8 +753,8 @@ function ProjectsTab({
     <section className="space-y-3">
       <div ref={headRef} className="flex flex-wrap items-center justify-between gap-3">
         <p className="text-ui text-ink-dim">
-          {n} {n === 1 ? 'project' : 'projects'} · runs in their subdirectories count too · runs, tokens and
-          cost are {c.name}&apos;s work in each {overRange(rangeLabel)}
+          {n} {n === 1 ? 'project' : 'projects'} · runs in their subdirectories count too · runs, tokens, cost
+          and last activity are {c.name}&apos;s work in each {overRange(rangeLabel)}
         </p>
         <Button
           onClick={() => setAssigning(true)}

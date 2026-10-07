@@ -295,7 +295,7 @@ describe('CustomerDetail tabs', () => {
     expect(screen.getByTestId('where')).toHaveTextContent('/customers/acme/projects');
     expect(
       await screen.findByText(
-        /2 projects · runs in their subdirectories count too · runs, tokens and cost are Acme Corp's work in each over the last 30d/,
+        /2 projects · runs in their subdirectories count too · runs, tokens, cost and last activity are Acme Corp's work in each over the last 30d/,
       ),
     ).toBeInTheDocument();
 
@@ -311,6 +311,24 @@ describe('CustomerDetail tabs', () => {
       fireEvent.click(screen.getByRole('button', { name }));
       expect(screen.getByTestId('where')).toHaveTextContent(`/customers/acme/${path}`);
     }
+  });
+
+  it('the Projects tab\'s Last active is this customer\'s work only, never the project\'s last run by anyone', async () => {
+    const base = detail();
+    getCustomer.mockResolvedValue(
+      detail({
+        projects: [
+          // Globex ran here yesterday; Acme has no work in range.
+          { ...base.projects[0], last_active: null, last_run_at: new Date(Date.now() - 86_400_000).toISOString() },
+          ...base.projects.slice(1),
+        ],
+      }),
+    );
+    mount('/customers/acme/projects');
+    const name = base.projects[0].name;
+    const row = (await screen.findAllByText(name))[0].closest('tr') as HTMLElement;
+    expect(within(row).getByText('no runs in range')).toBeInTheDocument();
+    expect(within(row).queryByText(/ago/)).toBeNull();
   });
 
   it('Recent runs names the hosts its listing left out', async () => {
