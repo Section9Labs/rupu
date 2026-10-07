@@ -47,6 +47,7 @@ import { layoutGraph, type Pos } from '../lib/graphLayout';
 import { absoluteTime } from '../lib/time';
 import { formatTokens, formatCost } from '../lib/usage';
 import { CrewChip } from '../components/codename/CrewChip';
+import { RunCustomerChip } from '../components/customers/RunCustomer';
 import { AgentName } from '../components/codename/AgentName';
 import {
   SubrunIdentityContext,
@@ -837,6 +838,7 @@ export default function RunDetail() {
                 <CrewChip crew={parseCodename(run.codename).crew} derived={run.codename_derived} />
               )}
               <StatusPill status={effectiveStatus} />
+              <RunCustomerChip customer={run.customer} derived={run.customer_derived} />
               {host && host !== 'local' && (
                 <span className="rounded bg-info-bg px-1.5 py-0.5 text-note font-medium text-info ring-1 ring-info/30 font-mono">
                   {host}

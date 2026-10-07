@@ -25,6 +25,7 @@ import {
   type ProjectAssessedPct,
 } from '../lib/api';
 import { TabBar, TabButton } from '../components/TabBar';
+import { ProjectCustomerMenu } from '../components/customers/ProjectCustomerMenu';
 import { Spinner } from '../components/ui/Spinner';
 import ProjectOverviewTab from '../components/project/ProjectOverviewTab';
 import ProjectRunsTab from '../components/project/ProjectRunsTab';
@@ -197,7 +198,16 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
     <div className="p-8 space-y-6">
       {/* ── Identity header ── */}
       <header className="bg-panel border border-border rounded-xl shadow-card px-5 py-4">
-        <h1 className="text-lg font-bold text-ink">{p.name}</h1>
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          <h1 className="text-lg font-bold text-ink">{p.name}</h1>
+          <ProjectCustomerMenu
+            wsId={p.ws_id}
+            customer={p.customer}
+            onChange={(next) =>
+              setDetail((d) => (d ? { ...d, project: { ...d.project, customer: next } } : d))
+            }
+          />
+        </div>
         <div className="mt-1.5 flex items-center flex-wrap gap-x-4 gap-y-1 text-note text-ink-dim">
           <span className="font-mono">{p.path}</span>
           {p.repo_remote && (

@@ -48,7 +48,7 @@ describe('AgentRuns — canonical column order', () => {
 
     const { container } = render(
       <MemoryRouter>
-        {withCustomerScope(<AgentRuns />)}
+        {withCustomerScope(<AgentRuns />, { customers: [] })}
       </MemoryRouter>,
     );
 

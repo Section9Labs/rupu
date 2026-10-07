@@ -8,7 +8,7 @@
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
-import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { api, ApiError } from '../../lib/api';
 import type { RunListRow } from '../../lib/api';
@@ -694,5 +694,62 @@ describe('WorkflowRuns — the global customer scope', () => {
     expect(last).not.toHaveProperty('customer');
     // The Archived state is back once unscoped.
     expect(screen.getByText('Archived')).toBeInTheDocument();
+  });
+});
+
+describe('WorkflowRuns — the Customer column', () => {
+  const GLOBEX = customerRow('globex');
+  function renderWith(path: string, customers = [ACME, GLOBEX]) {
+    return render(
+      <MemoryRouter initialEntries={[path]}>{withCustomerScope(<WorkflowRuns />, { customers })}</MemoryRouter>,
+    );
+  }
+  const headers = (c: HTMLElement) =>
+    Array.from(c.querySelectorAll('thead th')).map((th) => th.textContent?.trim() ?? '');
+
+  it('shows a Customer column after Host when unscoped: dot + name, "—" for none, Unknown when absent', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getWorkflowRuns').mockImplementation(
+      onlyHost('local', [
+        makeRun({ id: 'run_a', workflow_name: 'wf-a', customer: 'acme' }),
+        makeRun({ id: 'run_b', workflow_name: 'wf-b', customer: 'globex', customer_derived: true }),
+        makeRun({ id: 'run_c', workflow_name: 'wf-c', customer: null }),
+        makeRun({ id: 'run_d', workflow_name: 'wf-d' }),
+      ]),
+    );
+    const { container } = renderWith('/');
+    await waitFor(() => expect(screen.getByText('wf-a')).toBeInTheDocument());
+    await waitFor(() => expect(headers(container)).toContain('Customer'));
+    const h = headers(container);
+    expect(h.indexOf('Customer')).toBe(h.indexOf('Host') + 1);
+    const row = (name: string) => screen.getByText(name).closest('tr') as HTMLElement;
+    expect(row('wf-a')).toHaveTextContent('Acme');
+    expect(row('wf-b')).toHaveTextContent('Globex');
+    expect(within(row('wf-b')).getByText('Globex').closest('[title]')).toHaveAttribute(
+      'title',
+      expect.stringMatching(/current customer/i),
+    );
+    expect(row('wf-c')).not.toHaveTextContent('Unknown');
+    expect(row('wf-d')).toHaveTextContent('Unknown');
+  });
+
+  it('has no Customer column while scoped (every row is that customer)', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getWorkflowRuns').mockImplementation(
+      onlyHost('local', [makeRun({ id: 'run_a', workflow_name: 'wf-a', customer: 'acme' })]),
+    );
+    const { container } = renderWith(scopedEntry('acme'));
+    await waitFor(() => expect(screen.getByText('wf-a')).toBeInTheDocument());
+    expect(headers(container)).not.toContain('Customer');
+  });
+
+  it('has no Customer column when no customers exist', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getWorkflowRuns').mockImplementation(
+      onlyHost('local', [makeRun({ id: 'run_a', workflow_name: 'wf-a' })]),
+    );
+    const { container } = renderWith('/', []);
+    await waitFor(() => expect(screen.getByText('wf-a')).toBeInTheDocument());
+    expect(headers(container)).not.toContain('Customer');
   });
 });

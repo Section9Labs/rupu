@@ -48,7 +48,7 @@ describe('WorkflowRuns — canonical column order', () => {
 
     const { container } = render(
       <MemoryRouter>
-        {withCustomerScope(<WorkflowRuns />)}
+        {withCustomerScope(<WorkflowRuns />, { customers: [] })}
       </MemoryRouter>,
     );
 

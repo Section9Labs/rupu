@@ -162,6 +162,13 @@ export function useCustomerScope(): CustomerScopeValue {
   return ctx;
 }
 
+/** The active customers, for resolving a row's slug to a name and tint. Unlike
+ *  `useCustomerScope` it tolerates a missing provider (an empty list): it only
+ *  decorates a row, so a surface mounted without the scope still renders. */
+export function useCustomerDirectory(): CustomerRow[] {
+  return useContext(CustomerScopeContext)?.customers ?? [];
+}
+
 /** The value list fetches pass as their `customer` argument. */
 export function useCustomerParam(): CustomerScope {
   return useCustomerScope().scope;

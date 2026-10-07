@@ -172,6 +172,12 @@ export interface RunRecord {
   workspace_id?: string;
   workspace_path?: string;
   transcript_dir?: string;
+  /** The customer the run RECORDED at launch: a slug, `null` = recorded "no
+   *  customer", ABSENT = a legacy record (or a peer too old to report it) —
+   *  never read absence as "no customer". `customer_derived` is set by the
+   *  listing rows only; the raw record carries none. */
+  customer?: string | null;
+  customer_derived?: boolean;
   error_message?: string | null;
   /**
    * The FULL set of currently-parked gates (Task 5b-2b, spec §7). Absent or

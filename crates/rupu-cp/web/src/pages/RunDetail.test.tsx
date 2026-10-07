@@ -25,6 +25,7 @@ import {
   type FindingsResponse,
 } from '../lib/api';
 import type { NodeSelection } from '../components/RunGraph';
+import { customerRow, withCustomerScope } from '../lib/customerScopeTestUtils';
 import type { SeqEvent } from '../components/RunEventFeed';
 
 // ---- Mocks for heavy children -------------------------------------------
@@ -1410,5 +1411,75 @@ describe('RunDetail: pause leftovers are not approval gates', () => {
     await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument());
     expect(screen.queryByRole('button', { name: 'Approve run' })).not.toBeInTheDocument();
     expect(screen.queryByText(/Awaiting approval/)).not.toBeInTheDocument();
+  });
+});
+
+// The run's customer chip (customers Plan 2B): a recorded slug resolves to the
+// active customer; `null` is "No customer"; an ABSENT key is the muted
+// "Unknown customer" (never "No customer"); a derived attribution is muted
+// with a tooltip. With no customers defined, none/unknown show nothing.
+describe('RunDetail: customer chip', () => {
+  function stubCustomerRun(fields: { customer?: string | null; customer_derived?: boolean }) {
+    const graph: RunGraphResponse = {
+      ...GRAPH,
+      run: { ...GRAPH.run, ...fields } as RunGraphResponse['run'],
+    };
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(graph);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+  }
+  function renderWithCustomers(customers = [customerRow('acme', { name: 'Acme Corp' })]) {
+    return render(
+      <MemoryRouter initialEntries={['/runs/run-1']}>
+        {withCustomerScope(
+          <Routes>
+            <Route path="/runs/:id" element={<RunDetailLoaded />} />
+          </Routes>,
+          { customers },
+        )}
+      </MemoryRouter>,
+    );
+  }
+
+  it('shows the recorded customer resolved from the active list', async () => {
+    stubCustomerRun({ customer: 'acme', customer_derived: false });
+    renderWithCustomers();
+    expect(await screen.findByText('Acme Corp')).toBeInTheDocument();
+    expect(screen.queryByTitle(/project's current customer/i)).toBeNull();
+  });
+
+  it('mutes a derived attribution and explains it in a tooltip', async () => {
+    stubCustomerRun({ customer: 'acme', customer_derived: true });
+    renderWithCustomers();
+    const chip = (await screen.findByText('Acme Corp')).closest('span[title]');
+    expect(chip).toHaveAttribute('title', expect.stringMatching(/current customer/i));
+    expect(chip?.className).toMatch(/text-ink-dim/);
+  });
+
+  it('shows "No customer" for a recorded null', async () => {
+    stubCustomerRun({ customer: null });
+    renderWithCustomers();
+    expect(await screen.findByText('No customer')).toBeInTheDocument();
+  });
+
+  it('shows "Unknown customer" — never "No customer" — when the key is absent', async () => {
+    stubCustomerRun({});
+    renderWithCustomers();
+    expect(await screen.findByText('Unknown customer')).toBeInTheDocument();
+    expect(screen.queryByText('No customer')).toBeNull();
+  });
+
+  it('shows a slug the active list does not hold under its slug', async () => {
+    stubCustomerRun({ customer: 'gone' });
+    renderWithCustomers();
+    expect(await screen.findByText('gone')).toBeInTheDocument();
+  });
+
+  it('shows nothing for none / unknown when no customers are defined', async () => {
+    stubCustomerRun({ customer: null });
+    renderWithCustomers([]);
+    await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument());
+    expect(screen.queryByText('No customer')).toBeNull();
   });
 });
