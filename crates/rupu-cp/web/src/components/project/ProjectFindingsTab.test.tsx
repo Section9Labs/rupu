@@ -38,6 +38,8 @@ function finding(id: string, severity: string, summary: string): FindingOut {
 
 // Backend pre-sorts critical → info; mirror that here.
 const RESP: FindingsResponse = {
+  facets: {},
+  tags_unavailable: [],
   findings: [
     finding('f-crit', 'critical', 'Critical SQL injection'),
     finding('f-high', 'high', 'High auth bypass'),

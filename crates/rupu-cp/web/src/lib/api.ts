@@ -1478,6 +1478,8 @@ export interface FindingRecord {
   profile?: 'full' | 'summary';
   report_summary?: ReportSummary | null;
   report?: FindingReport | null;
+  /** The finding's tags (normalized, sorted); absent on rows from an older server. */
+  tags?: string[];
 }
 
 /** Severity rollup for a set of findings — matches the `GET /api/findings`
@@ -1512,6 +1514,12 @@ export interface FindingDetail extends FindingOut {
 export interface FindingsResponse {
   findings: FindingOut[];
   summary: FindingsSummary;
+  /** Values in use per query field (`severity` always lists all five,
+   *  critical first), with counts — what the query bar suggests. */
+  facets: Record<string, { value: string; count: number }[]>;
+  /** Workspace ids whose tag log couldn't be read — tag filters may miss
+   *  their findings. */
+  tags_unavailable: string[];
 }
 
 /** A finding-report export format — `?format=` on the per-finding endpoint and
@@ -2730,11 +2738,12 @@ export const api = {
   },
 
   // --- Findings ---
-  getFindings(opts?: { wsId?: string; workflow?: string; runId?: string }): Promise<FindingsResponse> {
+  getFindings(opts?: { wsId?: string; workflow?: string; runId?: string; q?: string }): Promise<FindingsResponse> {
     const q = new URLSearchParams();
     if (opts?.wsId) q.set('ws_id', opts.wsId);
     if (opts?.workflow) q.set('workflow', opts.workflow);
     if (opts?.runId) q.set('run_id', opts.runId);
+    if (opts?.q) q.set('q', opts.q);
     const qs = q.toString();
     return request<FindingsResponse>(`/api/findings${qs ? `?${qs}` : ''}`);
   },

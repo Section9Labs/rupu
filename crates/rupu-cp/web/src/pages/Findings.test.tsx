@@ -8,19 +8,38 @@ import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { api, type FindingOut, type FindingsSummary } from '../lib/api';
+import { api, type FindingOut, type FindingsResponse } from '../lib/api';
 
 import Findings from './Findings';
 
-function renderPage() {
+function renderPage(entry = '/findings') {
   return render(
-    <MemoryRouter initialEntries={['/findings']}>
+    <MemoryRouter initialEntries={[entry]}>
       <Findings />
     </MemoryRouter>,
   );
 }
 
-const SUMMARY: FindingsSummary = { total: 1, critical: 0, high: 1, medium: 0, low: 0, info: 0 };
+const SEV_ORDER = ['critical', 'high', 'medium', 'low', 'info'];
+
+/** A well-formed response: the severity facets are derived from the rows. */
+function resp(findings: FindingOut[], over: Partial<FindingsResponse> = {}): FindingsResponse {
+  const count = (s: string) => findings.filter((f) => f.severity === s).length;
+  return {
+    findings,
+    summary: {
+      total: findings.length,
+      critical: count('critical'),
+      high: count('high'),
+      medium: count('medium'),
+      low: count('low'),
+      info: count('info'),
+    },
+    facets: { severity: SEV_ORDER.map((value) => ({ value, count: count(value) })) },
+    tags_unavailable: [],
+    ...over,
+  };
+}
 
 const FINDING: FindingOut = {
     codename: 'cobalt-harbor/heron#1', codename_derived: false,
@@ -51,10 +70,7 @@ describe('Findings — kit loading/empty states', () => {
   });
 
   it('renders the kit EmptyState with the existing copy when there are no findings at all', async () => {
-    vi.spyOn(api, 'getFindings').mockResolvedValue({
-      findings: [],
-      summary: { total: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0 },
-    });
+    vi.spyOn(api, 'getFindings').mockResolvedValue(resp([]));
     renderPage();
 
     await waitFor(() => expect(screen.getByText('No findings')).toBeInTheDocument());
@@ -63,17 +79,6 @@ describe('Findings — kit loading/empty states', () => {
     ).toBeInTheDocument();
   });
 
-  it('renders the kit EmptyState when a severity tile narrows the list to zero', async () => {
-    vi.spyOn(api, 'getFindings').mockResolvedValue({ findings: [FINDING], summary: SUMMARY });
-    renderPage();
-
-    await waitFor(() => expect(screen.getByText(FINDING.summary)).toBeInTheDocument());
-
-    fireEvent.click(screen.getByRole('button', { name: /critical/i }));
-
-    await waitFor(() => expect(screen.getByText('No matches')).toBeInTheDocument());
-    expect(screen.getByText('No critical findings.')).toBeInTheDocument();
-  });
 
   it('renders the kit ErrorBanner on fetch failure', async () => {
     vi.spyOn(api, 'getFindings').mockRejectedValue(new Error('boom'));
@@ -85,7 +90,7 @@ describe('Findings — kit loading/empty states', () => {
 
 describe('Findings — table rules', () => {
   it('the Summary column is the one flexible/truncating subject column', async () => {
-    vi.spyOn(api, 'getFindings').mockResolvedValue({ findings: [FINDING], summary: SUMMARY });
+    vi.spyOn(api, 'getFindings').mockResolvedValue(resp([FINDING]));
     renderPage();
 
     await waitFor(() => expect(screen.getByText(FINDING.summary)).toBeInTheDocument());
@@ -96,108 +101,87 @@ describe('Findings — table rules', () => {
   });
 });
 
-describe('Findings — profile / owner / CWE filters', () => {
-  function full(id: string, summary: string, owner: string, cwe: string[]): FindingOut {
-    return {
-      ...FINDING,
-      id,
-      summary,
-      profile: 'full',
-      report_summary: {
-        owner,
-        product: 'Notebin',
-        cwe,
-        root_cause: 'rc',
-        chain: [],
-        completeness: { filled: 9, total: 11, gaps: [] },
-        has_poc: false,
-        verification_status: null,
-      },
-    };
-  }
+describe('Findings — query bar', () => {
+  it('sends ?q= to the server', async () => {
+    const spy = vi.spyOn(api, 'getFindings').mockResolvedValue(resp([FINDING]));
+    renderPage('/security?tab=findings&q=tag%3Aneeds-poc');
+    await waitFor(() => expect(spy).toHaveBeenCalled());
+    expect(spy).toHaveBeenCalledWith({ q: 'tag:needs-poc' });
+  });
 
-  const ROWS: FindingOut[] = [
-    full('a', 'Full alpha', 'Team A', ['CWE-639']),
-    full('b', 'Full beta', 'Team B', ['CWE-862']),
-    { ...FINDING, id: 'c', summary: 'Summary gamma', profile: 'summary', concern_id: 'cwe-top25:cwe-639-idor' },
-    { ...FINDING, id: 'd', summary: 'Summary delta' },
-  ];
-  const SUM4: FindingsSummary = { total: 4, critical: 0, high: 4, medium: 0, low: 0, info: 0 };
-
-  async function loaded() {
-    vi.spyOn(api, 'getFindings').mockResolvedValue({ findings: ROWS, summary: SUM4 });
+  it('fetches with no arguments when the query is empty', async () => {
+    const spy = vi.spyOn(api, 'getFindings').mockResolvedValue(resp([FINDING]));
     renderPage();
-    await waitFor(() => expect(screen.getByText('Full alpha')).toBeInTheDocument());
-  }
-
-  it('the Full reports pill hides summary rows, Summaries hides full rows, All restores', async () => {
-    await loaded();
-    fireEvent.click(screen.getByRole('button', { name: 'Full reports' }));
-    expect(screen.getByText('Full alpha')).toBeInTheDocument();
-    expect(screen.getByText('Full beta')).toBeInTheDocument();
-    expect(screen.queryByText('Summary gamma')).not.toBeInTheDocument();
-    expect(screen.queryByText('Summary delta')).not.toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole('button', { name: 'Summaries' }));
-    expect(screen.queryByText('Full alpha')).not.toBeInTheDocument();
-    expect(screen.getByText('Summary gamma')).toBeInTheDocument();
-    expect(screen.getByText('Summary delta')).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole('button', { name: 'All' }));
-    expect(screen.getByText('Full alpha')).toBeInTheDocument();
-    expect(screen.getByText('Summary delta')).toBeInTheDocument();
+    await waitFor(() => expect(spy).toHaveBeenCalled());
+    expect(spy).toHaveBeenCalledWith();
   });
 
-  it('the Owner select keeps only matching rows and lists distinct owners', async () => {
-    await loaded();
-    const owner = screen.getByLabelText('Owner filter');
-    const options = Array.from(owner.querySelectorAll('option')).map((o) => o.textContent);
-    expect(options).toEqual(['All owners', 'Team A', 'Team B']);
-
-    fireEvent.change(owner, { target: { value: 'Team B' } });
-    expect(screen.getByText('Full beta')).toBeInTheDocument();
-    expect(screen.queryByText('Full alpha')).not.toBeInTheDocument();
-    expect(screen.queryByText('Summary gamma')).not.toBeInTheDocument();
-  });
-
-  it('the CWE select matches report_summary.cwe or the concern-derived CWE', async () => {
-    await loaded();
-    const cwe = screen.getByLabelText('CWE filter');
-    const options = Array.from(cwe.querySelectorAll('option')).map((o) => o.textContent);
-    expect(options).toEqual(['All CWEs', 'CWE-639', 'CWE-862']);
-
-    fireEvent.change(cwe, { target: { value: 'CWE-639' } });
-    expect(screen.getByText('Full alpha')).toBeInTheDocument();
-    expect(screen.getByText('Summary gamma')).toBeInTheDocument();
-    expect(screen.queryByText('Full beta')).not.toBeInTheDocument();
-    expect(screen.queryByText('Summary delta')).not.toBeInTheDocument();
-  });
-
-  it('combines with the severity filter and leaves the metric totals untouched', async () => {
-    const rows = [
-      ...ROWS,
-      { ...ROWS[0], id: 'e', summary: 'Full crit', severity: 'critical' },
-    ];
-    vi.spyOn(api, 'getFindings').mockResolvedValue({
-      findings: rows,
-      summary: { ...SUM4, total: 5, critical: 1 },
-    });
+  it('a severity tile toggles a severity: token', async () => {
+    const spy = vi.spyOn(api, 'getFindings').mockResolvedValue(resp([FINDING]));
     renderPage();
-    await waitFor(() => expect(screen.getByText('Full alpha')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(FINDING.summary)).toBeInTheDocument());
 
-    fireEvent.click(screen.getByRole('button', { name: 'Full reports' }));
-    fireEvent.click(screen.getByRole('button', { name: /critical/i }));
-    expect(screen.getByText('Full crit')).toBeInTheDocument();
-    expect(screen.queryByText('Full alpha')).not.toBeInTheDocument();
-    // Tiles still report the unfiltered totals.
-    expect(screen.getByRole('button', { name: /critical/i })).toHaveTextContent('1');
+    fireEvent.click(screen.getByRole('button', { name: /filter by high/i }));
+    await waitFor(() =>
+      expect(spy.mock.calls[spy.mock.calls.length - 1][0]).toEqual({ q: 'severity:high' }),
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /filter by high/i }));
+    await waitFor(() => expect(spy.mock.calls[spy.mock.calls.length - 1]).toEqual([]));
   });
 
-  it('shows the no-matches state when the filters exclude everything', async () => {
-    await loaded();
-    fireEvent.change(screen.getByLabelText('Owner filter'), { target: { value: 'Team A' } });
-    fireEvent.change(screen.getByLabelText('CWE filter'), { target: { value: 'CWE-862' } });
-    expect(screen.getByText('No matches')).toBeInTheDocument();
+  it('a severity tile replaces an existing severity token and keeps the rest', async () => {
+    const spy = vi.spyOn(api, 'getFindings').mockResolvedValue(resp([FINDING]));
+    renderPage('/security?tab=findings&q=severity%3Alow%20tag%3Aneeds-poc');
+    await waitFor(() => expect(spy).toHaveBeenCalled());
+
+    fireEvent.click(screen.getByRole('button', { name: /filter by high/i }));
+    await waitFor(() =>
+      expect(spy.mock.calls[spy.mock.calls.length - 1][0]).toEqual({ q: 'tag:needs-poc severity:high' }),
+    );
+  });
+
+  it('warns which projects have unreadable tags', async () => {
+    vi.spyOn(api, 'getFindings').mockResolvedValue(
+      resp([{ ...FINDING, ws_id: 'ws1', project: 'billing-api' }], { tags_unavailable: ['ws1'] }),
+    );
+    renderPage();
+    const banner = await screen.findByText(/couldn't be read/i);
+    expect(banner).toHaveTextContent('billing-api');
+  });
+
+  it('falls back to the workspace id when no row names the project', async () => {
+    vi.spyOn(api, 'getFindings').mockResolvedValue(resp([FINDING], { tags_unavailable: ['ws-gone'] }));
+    renderPage();
+    expect(await screen.findByText(/couldn't be read/i)).toHaveTextContent('ws-gone');
+  });
+
+  it('shows no banner when every tag log was readable', async () => {
+    vi.spyOn(api, 'getFindings').mockResolvedValue(resp([FINDING]));
+    renderPage();
+    await waitFor(() => expect(screen.getByText(FINDING.summary)).toBeInTheDocument());
+    expect(screen.queryByText(/couldn't be read/i)).toBeNull();
+  });
+
+  it('a locally invalid query is flagged on its chip and never fetched', async () => {
+    const spy = vi.spyOn(api, 'getFindings').mockResolvedValue(resp([FINDING]));
+    renderPage('/security?tab=findings&q=sevrity%3Ax');
+    const chip = await screen.findByText('sevrity:x');
+    expect(chip.closest('span[title]')?.className).toMatch(/text-err/);
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it('says which query matched nothing', async () => {
+    vi.spyOn(api, 'getFindings').mockResolvedValue(resp([]));
+    renderPage('/security?tab=findings&q=tag%3Anope');
+    expect(await screen.findByText('No matches')).toBeInTheDocument();
+    expect(screen.getByText(/No findings match/)).toHaveTextContent('tag:nope');
+  });
+
+  it('shows a server rejection of the query', async () => {
+    vi.spyOn(api, 'getFindings').mockRejectedValue(new Error('bad query'));
+    renderPage('/security?tab=findings&q=tag%3Aa');
+    expect(await screen.findByRole('alert')).toHaveTextContent('bad query');
   });
 });
 
@@ -210,10 +194,13 @@ describe('Findings — export report', () => {
     full('b', 'Full beta', 'critical'),
     { ...FINDING, id: 'c', summary: 'Summary gamma', profile: 'summary' },
   ];
-  const SUM: FindingsSummary = { total: 3, critical: 1, high: 2, medium: 0, low: 0, info: 0 };
 
   async function loaded() {
-    vi.spyOn(api, 'getFindings').mockResolvedValue({ findings: ROWS, summary: SUM });
+    // A fake server: honours a lone `severity:<x>` token, like the real one.
+    vi.spyOn(api, 'getFindings').mockImplementation(async (opts) => {
+      const m = /severity:(\w+)/.exec(opts?.q ?? '');
+      return resp(m ? ROWS.filter((r) => r.severity === m[1]) : ROWS);
+    });
     renderPage();
     await waitFor(() => expect(screen.getByText('Full alpha')).toBeInTheDocument());
   }
@@ -221,7 +208,8 @@ describe('Findings — export report', () => {
   it('exports exactly the rows the filters leave, not the whole list', async () => {
     const exportSpy = vi.spyOn(api, 'exportFindings').mockResolvedValue(new Blob(['x']));
     await loaded();
-    fireEvent.click(screen.getByRole('button', { name: /critical/i }));
+    fireEvent.click(screen.getByRole('button', { name: /filter by critical/i }));
+    await waitFor(() => expect(screen.queryByText('Full alpha')).not.toBeInTheDocument());
     fireEvent.click(screen.getByRole('button', { name: 'Export report' }));
 
     const dialog = screen.getByRole('dialog');
@@ -235,17 +223,13 @@ describe('Findings — export report', () => {
 
   it('is disabled when the filters leave nothing to export', async () => {
     await loaded();
-    fireEvent.change(screen.getByLabelText('Owner filter'), { target: { value: '' } });
-    fireEvent.click(screen.getByRole('button', { name: /medium/i }));
+    fireEvent.click(screen.getByRole('button', { name: /filter by medium/i }));
     await waitFor(() => expect(screen.getByText('No matches')).toBeInTheDocument());
     expect(screen.getByRole('button', { name: 'Export report' })).toBeDisabled();
   });
 
   it('is not offered while there are no findings at all', async () => {
-    vi.spyOn(api, 'getFindings').mockResolvedValue({
-      findings: [],
-      summary: { total: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0 },
-    });
+    vi.spyOn(api, 'getFindings').mockResolvedValue(resp([]));
     renderPage();
     await waitFor(() => expect(screen.getByText('No findings')).toBeInTheDocument());
     expect(screen.queryByRole('button', { name: 'Export report' })).toBeNull();

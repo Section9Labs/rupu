@@ -89,6 +89,8 @@ function mockApi() {
   vi.spyOn(api, 'getAutoflowClaims').mockResolvedValue([]);
   vi.spyOn(api, 'getWorkers').mockResolvedValue([]);
   vi.spyOn(api, 'getFindings').mockResolvedValue({
+    facets: {},
+    tags_unavailable: [],
     findings: [],
     summary: { total: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0 },
   });

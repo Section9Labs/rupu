@@ -1,6 +1,6 @@
 // Shared findings list rendered as a SortableTable. Used by the global Findings
 // page, the per-project Findings tab, and the coverage-detail Overview. Columns:
-// Severity | Summary | Report | File:Line | CWE | Concern | Agent, plus Project |
+// Severity | Summary | Tags | Report | File:Line | CWE | Concern | Agent, plus Project |
 // Target when `showProvenance` is set (the cross-project / project-scoped
 // variants). Each row expands (via `renderDetail`) to its evidence panel — or,
 // for a full-profile finding, to the triage card summarising its structured report.
@@ -69,6 +69,29 @@ export function FindingsTable({
       sortValue: (f) => f.summary,
       titleValue: (f) => f.summary,
       render: (f) => <span className="text-ink leading-snug">{f.summary}</span>,
+    },
+    {
+      key: 'tags',
+      header: 'Tags',
+      fit: true,
+      render: (f) => {
+        const tags = f.tags ?? [];
+        if (tags.length === 0) return null;
+        return (
+          <span className="flex items-center gap-1">
+            {tags.slice(0, 2).map((t) => (
+              <span key={t} className="rounded bg-surface px-1.5 py-0.5 font-mono text-note text-ink ring-1 ring-border">
+                {t}
+              </span>
+            ))}
+            {tags.length > 2 && (
+              <span title={tags.join(', ')} className="text-note text-ink-mute">
+                +{tags.length - 2}
+              </span>
+            )}
+          </span>
+        );
+      },
     },
     {
       key: 'report',
