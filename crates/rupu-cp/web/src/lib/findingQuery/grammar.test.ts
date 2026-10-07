@@ -28,4 +28,12 @@ describe('grammar extras', () => {
     const r = parseQuery(`owner:${quoteValue('a, "b"')}`, FINDING_FIELDS);
     expect(r.ok && r.terms[0].values).toEqual(['a, "b"']);
   });
+  it('quoteValue quotes a value holding any separator the scanner splits on', () => {
+    // U+0085 is whitespace to the scanner (Rust's `char::is_whitespace`) but
+    // not to JS `\s`.
+    for (const v of ['a\u0085b', 'a\u00a0b', 'a\u3000b', 'a\tb']) {
+      const r = parseQuery(`owner:${quoteValue(v)}`, FINDING_FIELDS);
+      expect(r.ok && r.terms, JSON.stringify(v)).toEqual([{ neg: false, key: 'owner', op: 'eq', values: [v] }]);
+    }
+  });
 });

@@ -89,6 +89,14 @@ describe('QueryBar', () => {
     expect(spy).toHaveBeenLastCalledWith('tag:b');
   });
 
+  it("a negated chip's ✕ names it with its not", () => {
+    const spy = vi.fn();
+    render(<Harness initial="-tag:a tag:a" spy={spy} />);
+    expect(screen.getByRole('button', { name: 'Remove tag: a' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Remove not tag: a' }));
+    expect(spy).toHaveBeenLastCalledWith('tag:a');
+  });
+
   it('marks an invalid chip from the URL in red with its reason', () => {
     render(<Harness initial="sevrity:high" />);
     expect(screen.getByTitle(/unknown key/)).toHaveClass('ring-err/40');

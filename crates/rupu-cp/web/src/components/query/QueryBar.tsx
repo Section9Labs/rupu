@@ -175,7 +175,7 @@ export function QueryBar({ value, onChange, fields, facets, placeholder, valueTo
               <span>{text}</span>
               <button
                 type="button"
-                aria-label={`Remove ${term ? chipText(term).replace(/^not /, '') : raw}`}
+                aria-label={`Remove ${text}`}
                 className="rounded text-ink-mute hover:text-ink"
                 onMouseDown={(e) => e.preventDefault()}
                 onClick={() => commit(tokens.filter((_, j) => j !== i))}

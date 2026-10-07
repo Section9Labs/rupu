@@ -300,8 +300,10 @@ export function parseToken(raw: string, fields: readonly FieldSpec[]): ParseResu
   return parseQuery(raw, fields);
 }
 
-/** A value as the grammar must spell it: bare when it can be, else quoted. */
+/** A value as the grammar must spell it: bare when it can be, else quoted.
+ *  It must be quoted when it holds a separator the scanner splits on
+ *  (`isWs`, not JS `\s`, which lacks U+0085) or a `,`, quote or `\`. */
 export function quoteValue(v: string): string {
-  if (v !== '' && !/[\s,"'\\]/u.test(v)) return v;
+  if (v !== '' && !Array.from(v).some((c) => isWs(c) || `,"'\\`.includes(c))) return v;
   return `"${v.replace(/["\\]/g, (c) => `\\${c}`)}"`;
 }
