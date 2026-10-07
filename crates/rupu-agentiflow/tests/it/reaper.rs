@@ -79,6 +79,19 @@ impl Drop for Sleeper {
     }
 }
 
+/// Wait (bounded) for a group the reaper signalled to be gone. The reaper
+/// returns as soon as it has sent SIGKILL (in production it is not the units'
+/// parent and cannot reap them), so the kernel's termination and this test's
+/// own waiter reaping the zombie race a bare `!pid_is_running`: `kill(pid, 0)`
+/// reads a dying or zombie leader as alive for a brief window.
+fn wait_until_dead(pgid: u32) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline && pid_is_running(pgid) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!pid_is_running(pgid), "group should have been killed");
+}
+
 /// A pid that is certainly not running: a child that has exited and been reaped.
 fn a_dead_pid() -> u32 {
     let mut child = Command::new("/bin/sh")
@@ -175,7 +188,7 @@ fn reaps_a_dead_coordinator_and_signals_its_units() {
     assert_eq!(dead.runner_pid, None);
     assert_eq!(dead.rounds, 2, "the rest of the record is kept");
     assert_eq!(dead.spent_tokens, 1000);
-    assert!(!pid_is_running(unit.pgid), "the unit group was killed");
+    wait_until_dead(unit.pgid); // the unit group was killed
 
     // A terminal event, in the shape `run_agentiflow` writes, so a live events
     // view stops spinning.
@@ -270,8 +283,8 @@ fn a_finished_units_group_is_left_alone() {
     assert_eq!(s.reaped, vec!["af_dead".to_string()]);
     assert!(pid_is_running(done.pgid));
     assert!(pid_is_running(failed.pgid));
-    assert!(!pid_is_running(running.pgid));
-    assert!(!pid_is_running(pending.pgid));
+    wait_until_dead(running.pgid);
+    wait_until_dead(pending.pgid);
 }
 
 #[test]
@@ -286,7 +299,7 @@ fn a_unit_that_ignores_sigterm_is_killed_after_the_grace() {
     let took = started.elapsed();
 
     assert_eq!(s.reaped, vec!["af_dead".to_string()]);
-    assert!(!pid_is_running(stubborn.pgid), "SIGKILL ended the group");
+    wait_until_dead(stubborn.pgid); // SIGKILL ended the group
     assert!(
         took >= Duration::from_millis(1400),
         "SIGTERM was given its grace first: {took:?}"

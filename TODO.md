@@ -388,3 +388,5 @@ sizes, so the render and the dagre reservation agree.
 
 So this is purely "commission better art for two node kinds" — worth doing, safe
 to defer indefinitely, and it needs a design call rather than an engineering one.
+
+- **agentiflow reaper: lockless re-read+finalize (Plan 4-3 T2).** `reap_orphaned_agentiflows` re-reads the record and writes it back without a run lock; when an `agentiflow resume` path is added, the finalize and the resume's `runner_pid` stamp must be coordinated under the run lock (like the orchestrator's `claim_runner`) to close the re-read->write TOCTOU. Not reachable today (no agentiflow resume exists).
