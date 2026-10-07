@@ -1,14 +1,20 @@
 //! The orphan reaper: [`reap_orphaned_agentiflows`] finalizes the record of an
 //! agentiflow whose coordinator died without finishing it, and group-kills the
-//! detached units that coordinator left running.
+//! detached units that coordinator left running. [`hard_stop`] is the operator's
+//! counterpart for a coordinator that is still alive.
 //!
 //! A coordinator can vanish mid-run (SIGKILL, a crash, the machine going down)
 //! and take its own bookkeeping with it: `agentiflow.json` stays `running`
 //! forever, `events.jsonl` never gets a terminal event, and the units it
 //! launched as their own process groups keep burning tokens with nobody
-//! steering them. This is the one place that cleans all of that up. `stop
-//! --now`, `agentiflow serve` and `cp serve` all call it, so a reaped orphan
-//! reads the same wherever it was found.
+//! steering them. The sweep cleans all of that up; `agentiflow serve` and
+//! `cp serve` call it. A hard stop (`rupu agentiflow stop --now`) ends up in
+//! the same place from the other side: the coordinator dies on SIGTERM without
+//! running any cleanup (the CLI's SIGTERM handler exits the process), so the
+//! stop itself must close out the record and the event log. Both therefore
+//! share [`finalize_failed`] (the terminal record + `run_stopped` event) and the
+//! unit wind-down (SIGTERM, a bounded grace, SIGKILL), so a run closed by force
+//! reads the same whoever closed it.
 //!
 //! # What gets reaped
 //!
@@ -46,6 +52,7 @@
 //!
 //! The function blocks (file IO, and up to [`TERM_GRACE`] per reaped run when a
 //! unit group needs winding down). Call it from `spawn_blocking` in async code.
+//! [`hard_stop`] blocks the same way.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -53,7 +60,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use serde_json::json;
 
-use crate::proc::{kill_group, pid_is_running, terminate_group};
+use crate::proc::{kill_group, pid_is_running, terminate_group, terminate_pid};
 use crate::run::{agentiflow_dir, AgentiflowRecord, EventLog};
 use crate::supervisor::units_on_disk;
 
@@ -163,37 +170,123 @@ fn reap_one(run_dir: &Path, now: DateTime<Utc>) -> bool {
     }
 
     let reason = format!("orphaned: coordinator pid {pid} not running");
-    record.status = "failed".into();
-    record.stop_reason = Some(reason.clone());
-    record.ended_at = Some(now);
-    record.runner_pid = None;
-    if let Err(e) = record.write(run_dir) {
+    if let Err(e) = finalize_failed(run_dir, &mut record, &reason, &reason, now) {
         tracing::warn!(run = %run_dir.display(), error = %e, "could not finalize an orphaned agentiflow; it stays `running` until the next sweep");
         return false;
     }
-
-    // After the record, like the record is the durable fact; a failed append is
-    // the writer's own best-effort warning.
-    EventLog::new(run_dir).emit(
-        now,
-        "run_stopped",
-        json!({
-            "stop_reason": reason,
-            "detail": reason,
-            "rounds": record.rounds,
-            "goals": record.goals,
-            "summary": format!("Stopped: {reason} after {} round(s).", record.rounds),
-            "spent_usd": record.spent_usd.unwrap_or(0.0),
-            "spent_tokens": record.spent_tokens,
-        }),
-    );
     tracing::info!(id = %record.id, pid, "reaped an orphaned agentiflow");
     true
 }
 
+/// Close a run out as `failed`: rewrite its record (`status = "failed"`,
+/// `stop_reason`, `ended_at = now`, no `runner_pid`) and THEN append the
+/// terminal `run_stopped` event, so a live events view stops spinning.
+///
+/// The one finalizer for a run that is closed by force rather than by its own
+/// coordinator: the orphan reaper (`stop_reason` and `detail` both
+/// `orphaned: coordinator pid <p> not running`) and the operator's
+/// [`hard_stop`] (`operator_stop:now` / `operator hard stop (--now)`). Without
+/// the event a `failed` record would be final (the reaper skips it) yet its log
+/// would end mid-run. `stop_reason` is the stable code the record persists;
+/// `detail` is the human text the event and its summary carry.
+///
+/// The record is the durable fact, so it is written first and a failure to
+/// write it is returned with no event appended. A failed event append is the
+/// writer's own best-effort warning, not an error. `record` is mutated in
+/// place; pass the CURRENT on-disk record (re-read just before), so nothing it
+/// gained meanwhile (spend, rounds) is lost.
+pub fn finalize_failed(
+    run_dir: &Path,
+    record: &mut AgentiflowRecord,
+    stop_reason: &str,
+    detail: &str,
+    now: DateTime<Utc>,
+) -> std::io::Result<()> {
+    record.status = "failed".into();
+    record.stop_reason = Some(stop_reason.to_string());
+    record.ended_at = Some(now);
+    record.runner_pid = None;
+    record.write(run_dir)?;
+
+    EventLog::new(run_dir).emit(
+        now,
+        "run_stopped",
+        json!({
+            "stop_reason": stop_reason,
+            "detail": detail,
+            "rounds": record.rounds,
+            "goals": record.goals,
+            "summary": format!("Stopped: {detail} after {} round(s).", record.rounds),
+            "spent_usd": record.spent_usd.unwrap_or(0.0),
+            "spent_tokens": record.spent_tokens,
+        }),
+    );
+    Ok(())
+}
+
+/// What [`hard_stop`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HardStopOutcome {
+    /// The run was already past `running` (the status it is in), either when
+    /// the stop began or by the time its processes had been signalled: it
+    /// finished on its own in between. Nothing was written.
+    AlreadyTerminal(String),
+    /// The coordinator and the units were signalled and the run is closed out
+    /// `failed` (`operator_stop:now`).
+    Stopped,
+}
+
+/// The operator's hard stop of ONE run (`rupu agentiflow stop --now`): act on a
+/// live coordinator now, without waiting for its round.
+///
+/// 1. Read the record; a run that is not `running` is
+///    [`AlreadyTerminal`](HardStopOutcome::AlreadyTerminal), untouched, nothing
+///    signalled.
+/// 2. SIGTERM the coordinator (`runner_pid`) if it is running. Its SIGTERM
+///    handler exits the process without running any cleanup, so nothing below
+///    is left to it.
+/// 3. Wind down the run's units: SIGTERM each live unit group, a bounded
+///    grace, SIGKILL whatever outlived it (the reaper's own wind-down). An
+///    operator who asks for a hard stop gets the escalation.
+/// 4. RE-READ the record and, only if it is STILL `running`, [`finalize_failed`]
+///    it (`operator_stop:now`). The grace is long enough for the run to have
+///    finished on its own meanwhile; the stale snapshot from step 1 must never
+///    overwrite that. This is the re-check `reap_one` makes too.
+///
+/// Blocking (file IO and up to [`TERM_GRACE`] of grace): call it from
+/// `spawn_blocking` in async code. A record that cannot be read, or the final
+/// write failing, is an error; every signal failure is only logged.
+pub fn hard_stop(run_dir: &Path, now: DateTime<Utc>) -> std::io::Result<HardStopOutcome> {
+    let record = AgentiflowRecord::read(run_dir)?;
+    if record.status != "running" {
+        return Ok(HardStopOutcome::AlreadyTerminal(record.status));
+    }
+
+    if let Some(pid) = record.runner_pid {
+        if pid_is_running(pid) && !terminate_pid(pid) {
+            tracing::warn!(run = %run_dir.display(), pid, "could not SIGTERM the coordinator");
+        }
+    }
+    wind_down_units(run_dir);
+
+    let mut record = AgentiflowRecord::read(run_dir)?;
+    if record.status != "running" {
+        return Ok(HardStopOutcome::AlreadyTerminal(record.status));
+    }
+    finalize_failed(
+        run_dir,
+        &mut record,
+        "operator_stop:now",
+        "operator hard stop (--now)",
+        now,
+    )?;
+    tracing::info!(id = %record.id, "hard-stopped an agentiflow");
+    Ok(HardStopOutcome::Stopped)
+}
+
 /// SIGTERM every live, non-terminal unit group the run recorded, give them
 /// [`TERM_GRACE`], then SIGKILL the ones still standing. One pass, bounded:
-/// a sweep must not hang on a unit that will not die.
+/// neither a sweep nor a hard stop may hang on a unit that will not die.
 fn wind_down_units(run_dir: &Path) {
     let mut signalled: Vec<u32> = Vec::new();
     for unit in units_on_disk(run_dir) {
@@ -210,7 +303,7 @@ fn wind_down_units(run_dir: &Path) {
             signalled.push(pgid);
         } else {
             // Refused (our own group, an impossible id) or the signal failed.
-            tracing::warn!(unit = %unit.unit_id, pgid, "could not SIGTERM an orphaned unit's process group");
+            tracing::warn!(unit = %unit.unit_id, pgid, "could not SIGTERM a unit's process group");
         }
     }
     signalled.sort_unstable();
@@ -225,12 +318,9 @@ fn wind_down_units(run_dir: &Path) {
     }
     for pgid in signalled {
         if pid_is_running(pgid) {
-            tracing::warn!(
-                pgid,
-                "an orphaned unit outlived its SIGTERM grace; sending SIGKILL"
-            );
+            tracing::warn!(pgid, "a unit outlived its SIGTERM grace; sending SIGKILL");
             if !kill_group(pgid) {
-                tracing::warn!(pgid, "could not SIGKILL an orphaned unit's process group");
+                tracing::warn!(pgid, "could not SIGKILL a unit's process group");
             }
         }
     }

@@ -1,6 +1,8 @@
 //! `reap_orphaned_agentiflows`: a `running` record whose coordinator is dead is
 //! finalized `failed` and its still-live unit groups are killed; anything whose
 //! owner is alive or unknown is left alone; a bad run dir never aborts a sweep.
+//! `hard_stop` (the operator's `stop --now`) shares the unit wind-down and the
+//! finalize, and is tested at the bottom.
 //!
 //! Fixtures are written straight onto disk (a record via the public
 //! `AgentiflowRecord::write`, a `unit.json` as the supervisor lays it out), and
@@ -17,7 +19,8 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use rupu_agentiflow::{
-    agentiflow_dir, kill_group, pid_is_running, reap_orphaned_agentiflows, AgentiflowRecord,
+    agentiflow_dir, hard_stop, kill_group, pid_is_running, reap_orphaned_agentiflows,
+    AgentiflowRecord, HardStopOutcome,
 };
 use rupu_runtime::RunTriggerSource;
 use serde_json::{json, Value};
@@ -430,4 +433,131 @@ fn a_bad_run_dir_is_skipped_and_never_aborts_the_sweep() {
         b"{ not json"
     );
     assert!(!Path::new(&root.join("af_empty").join("agentiflow.json")).exists());
+}
+
+// ---- hard_stop ---------------------------------------------------------------
+
+#[test]
+fn a_hard_stop_kills_the_coordinator_and_the_units_and_closes_the_record_and_the_log() {
+    let global = tempdir().unwrap();
+    // The coordinator is a live process (the CLI's SIGTERM handler would exit
+    // it without cleanup); one unit ignores SIGTERM, so only the escalation
+    // ends it.
+    let coordinator = Sleeper::spawn();
+    let polite = Sleeper::spawn();
+    let stubborn = Sleeper::spawn_ignoring_sigterm();
+    write_running_record(&global, "af_live", Some(coordinator.pgid));
+    write_unit(&global, "af_live", "u1", Some(polite.pgid), "running");
+    write_unit(&global, "af_live", "u2", Some(stubborn.pgid), "running");
+
+    let now = Utc::now();
+    let started = Instant::now();
+    let out = hard_stop(&run_dir(&global, "af_live"), now).unwrap();
+    let took = started.elapsed();
+
+    assert_eq!(out, HardStopOutcome::Stopped);
+    wait_until_dead(coordinator.pgid);
+    wait_until_dead(polite.pgid);
+    wait_until_dead(stubborn.pgid);
+    assert!(
+        took >= Duration::from_millis(1400),
+        "SIGTERM got its grace before SIGKILL: {took:?}"
+    );
+
+    let rec = read_record(&global, "af_live");
+    assert_eq!(rec.status, "failed");
+    assert_eq!(rec.stop_reason.as_deref(), Some("operator_stop:now"));
+    assert_eq!(rec.ended_at, Some(now));
+    assert_eq!(rec.runner_pid, None);
+    assert_eq!(rec.rounds, 2, "the rest of the record is kept");
+    assert_eq!(rec.spent_tokens, 1000);
+
+    // The log's last line closes the run, in the shape the reaper writes.
+    let evs = events(&global, "af_live");
+    let last = evs.last().expect("a terminal event");
+    assert_eq!(last["kind"], "run_stopped");
+    assert_eq!(last["stop_reason"], "operator_stop:now");
+    assert_eq!(last["detail"], "operator hard stop (--now)");
+    assert_eq!(last["rounds"], 2);
+    assert_eq!(last["spent_tokens"], 1000);
+    assert!(last["goals"].is_array() && last["summary"].is_string());
+    assert_eq!(evs.len(), 1);
+
+    // The record is final: neither a second hard stop nor the reaper revisits it.
+    assert_eq!(
+        hard_stop(&run_dir(&global, "af_live"), Utc::now()).unwrap(),
+        HardStopOutcome::AlreadyTerminal("failed".into())
+    );
+    assert!(reap_orphaned_agentiflows(global.path(), Utc::now())
+        .reaped
+        .is_empty());
+    assert_eq!(events(&global, "af_live").len(), 1);
+}
+
+#[test]
+fn a_hard_stop_of_a_finished_run_signals_and_writes_nothing() {
+    let global = tempdir().unwrap();
+    let bystander = Sleeper::spawn();
+    write_record(&global, "af_done", "completed", Some(bystander.pgid));
+    write_unit(&global, "af_done", "u1", Some(bystander.pgid), "running");
+
+    let out = hard_stop(&run_dir(&global, "af_done"), Utc::now()).unwrap();
+
+    assert_eq!(out, HardStopOutcome::AlreadyTerminal("completed".into()));
+    assert!(pid_is_running(bystander.pgid), "nothing was signalled");
+    let rec = read_record(&global, "af_done");
+    assert_eq!(rec.status, "completed");
+    assert_eq!(rec.stop_reason, None);
+    assert_eq!(
+        rec.runner_pid,
+        Some(bystander.pgid),
+        "the record is untouched"
+    );
+    assert!(events(&global, "af_done").is_empty());
+}
+
+#[test]
+fn a_run_that_finishes_during_the_grace_is_not_overwritten() {
+    let global = tempdir().unwrap();
+    // A unit that outlasts SIGTERM keeps the hard stop in its grace for 1.5s.
+    let stubborn = Sleeper::spawn_ignoring_sigterm();
+    write_running_record(&global, "af_race", None);
+    write_unit(&global, "af_race", "u1", Some(stubborn.pgid), "running");
+
+    // The coordinator wins the race: it finishes its run while the stop waits.
+    let dir = run_dir(&global, "af_race");
+    let finisher = std::thread::spawn({
+        let dir = dir.clone();
+        move || {
+            std::thread::sleep(Duration::from_millis(300));
+            let mut rec = AgentiflowRecord::read(&dir).unwrap();
+            rec.status = "completed".into();
+            rec.stop_reason = Some("goals_met".into());
+            rec.write(&dir).unwrap();
+        }
+    });
+
+    let out = hard_stop(&dir, Utc::now()).unwrap();
+    finisher.join().unwrap();
+
+    assert_eq!(out, HardStopOutcome::AlreadyTerminal("completed".into()));
+    wait_until_dead(stubborn.pgid); // the units were still wound down
+    let rec = read_record(&global, "af_race");
+    assert_eq!(rec.status, "completed");
+    assert_eq!(rec.stop_reason.as_deref(), Some("goals_met"));
+    assert!(
+        events(&global, "af_race").is_empty(),
+        "no run_stopped over a run that finished"
+    );
+}
+
+#[test]
+fn a_hard_stop_of_a_run_with_no_record_is_an_error_not_a_write() {
+    let global = tempdir().unwrap();
+    let dir = run_dir(&global, "af_missing");
+    std::fs::create_dir_all(&dir).unwrap();
+    let err = hard_stop(&dir, Utc::now()).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    assert!(!dir.join("agentiflow.json").exists());
+    assert!(!dir.join("events.jsonl").exists());
 }

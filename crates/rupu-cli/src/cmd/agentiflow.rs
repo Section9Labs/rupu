@@ -38,10 +38,10 @@ use anyhow::{anyhow, Context};
 use chrono::{DateTime, Utc};
 use clap::Subcommand;
 use rupu_agentiflow::{
-    agentiflow_dir, load_agentiflow_def, new_run_id, pid_is_running, run_agentiflow,
-    terminate_group, terminate_pid, units_on_disk, AgentiflowDef, AgentiflowRecord, Budget,
-    CoverageTarget, EnvelopeOutcome, GenerationCapability, GoalTarget, LeadInputs, OperatorMessage,
-    OperatorQueue, ProviderFactory, RunAgentiflowOpts,
+    agentiflow_dir, hard_stop, load_agentiflow_def, new_run_id, run_agentiflow, AgentiflowDef,
+    AgentiflowRecord, Budget, CoverageTarget, EnvelopeOutcome, GenerationCapability, GoalTarget,
+    HardStopOutcome, LeadInputs, OperatorMessage, OperatorQueue, ProviderFactory,
+    RunAgentiflowOpts,
 };
 use rupu_auth::CredentialResolver;
 use rupu_runtime::provider_factory::{self, FactoryError, ProviderConfig};
@@ -98,8 +98,9 @@ pub enum Action {
     /// By default the stop is graceful: it is queued like a steering message,
     /// and the envelope winds the run down at the next round boundary (the
     /// units it launched are stopped with it). `--now` is the hard stop: it
-    /// SIGTERMs the coordinator and every unit still running, then records the
-    /// run as failed (`operator_stop:now`) without waiting for the round.
+    /// SIGTERMs the coordinator, SIGTERMs every unit still running (SIGKILL
+    /// for one that outlives a short grace), then records the run as failed
+    /// (`operator_stop:now`) without waiting for the round.
     Stop {
         /// Run id (`af_...`): the full id, the compact form `list` prints, or
         /// a unique prefix / suffix of it.
@@ -121,7 +122,7 @@ pub async fn handle(
         Action::List => list_cmd(global_format, absolute, all_columns),
         Action::Status { id } => status_cmd(&id, global_format),
         Action::Send { id, message, now } => send_cmd(&id, &message, now),
-        Action::Stop { id, now } => stop_cmd(&id, now),
+        Action::Stop { id, now } => stop_cmd(&id, now).await,
     };
     match result {
         Ok(()) => ExitCode::from(0),
@@ -1171,60 +1172,47 @@ fn send_cmd(fragment: &str, message: &str, now: bool) -> anyhow::Result<()> {
 }
 
 /// Stop a run, gracefully (a queued stop the envelope honours at the next round
-/// boundary) or, with `now`, by signalling the coordinator and its units and
-/// closing the record out. Returns the line to print.
+/// boundary) or, with `now`, the hard stop in `rupu_agentiflow::hard_stop`.
+/// Returns the line to print. The hard stop blocks (it gives the units a grace
+/// before SIGKILL): call this from `spawn_blocking` in async code.
 fn stop(global: &Path, fragment: &str, now: bool) -> anyhow::Result<String> {
-    let (id, run_dir, mut record) = load_run(global, fragment)?;
+    if now {
+        // `hard_stop` reads the record itself and judges it twice (before and
+        // after the grace), so only the id is resolved here.
+        let id = resolve_run_id(global, fragment)?;
+        let run_dir = agentiflow_dir(global).join(&id);
+        let outcome = hard_stop(&run_dir, Utc::now())
+            .with_context(|| format!("hard-stop {}", run_dir.join("agentiflow.json").display()))?;
+        return Ok(match outcome {
+            HardStopOutcome::Stopped => format!("hard-stopped {id}"),
+            HardStopOutcome::AlreadyTerminal(status) => format!("{id} already {status}"),
+        });
+    }
+
+    let (id, run_dir, record) = load_run(global, fragment)?;
     if record.status != "running" {
         return Ok(format!("{id} already {}", record.status));
     }
-    if !now {
-        enqueue_steering(
-            &run_dir,
-            &OperatorMessage {
-                ts: Utc::now().to_rfc3339(),
-                body: "operator stop".into(),
-                stop: true,
-                interrupt: false,
-            },
-        )?;
-        return Ok(format!("requested graceful stop of {id}"));
-    }
-
-    // Hard stop. SIGTERM the coordinator first: it catches the signal and winds
-    // its own units down. Every call below is a quick signal send, never a wait,
-    // and this acts on a LIVE coordinator, so it is not the orphan reaper (which
-    // is for dead ones, and blocks while it escalates).
-    if let Some(pid) = record.runner_pid {
-        if pid_is_running(pid) && !terminate_pid(pid) {
-            tracing::warn!(run = %id, pid, "could not SIGTERM the coordinator");
-        }
-    }
-    // Belt and braces for a coordinator that cannot run its own cleanup: one
-    // SIGTERM pass over the process group of each unit that has not finished.
-    // Escalating past SIGTERM is the coordinator's job, or the reaper's.
-    for unit in units_on_disk(&run_dir) {
-        if unit.status.is_terminal() {
-            continue;
-        }
-        let Some(pgid) = unit.pgid else { continue };
-        if pid_is_running(pgid) && !terminate_group(pgid) {
-            tracing::warn!(unit = %unit.unit_id, pgid, "could not SIGTERM a unit's process group");
-        }
-    }
-    record.status = "failed".into();
-    record.stop_reason = Some("operator_stop:now".into());
-    record.ended_at = Some(Utc::now());
-    record.runner_pid = None;
-    record
-        .write(&run_dir)
-        .with_context(|| format!("record the stop of {id}"))?;
-    Ok(format!("hard-stopped {id}"))
+    enqueue_steering(
+        &run_dir,
+        &OperatorMessage {
+            ts: Utc::now().to_rfc3339(),
+            body: "operator stop".into(),
+            stop: true,
+            interrupt: false,
+        },
+    )?;
+    Ok(format!("requested graceful stop of {id}"))
 }
 
-fn stop_cmd(fragment: &str, now: bool) -> anyhow::Result<()> {
+async fn stop_cmd(fragment: &str, now: bool) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
-    println!("{}", stop(&global, fragment, now)?);
+    let fragment = fragment.to_string();
+    // The hard stop sleeps through a SIGTERM grace; keep it off the runtime.
+    let line = tokio::task::spawn_blocking(move || stop(&global, &fragment, now))
+        .await
+        .context("the stop task did not finish")??;
+    println!("{line}");
     Ok(())
 }
 
@@ -1892,15 +1880,22 @@ pool:
         assert_eq!(rec.status, "running");
     }
 
+    /// A `sleep` leading its own process group (as a launched unit does, so its
+    /// pid is its pgid), plus a thread that reaps it the moment it dies:
+    /// without the waiter a killed child stays a zombie of this process, and
+    /// `kill(pid, 0)` reads a zombie as alive.
     #[cfg(unix)]
-    fn spawn_sleeper() -> std::process::Child {
+    fn spawn_sleeper() -> (u32, std::thread::JoinHandle<std::process::ExitStatus>) {
         use std::os::unix::process::CommandExt as _;
-        // Its own process group, as a launched unit is, so its pid is its pgid.
-        std::process::Command::new("sleep")
+        let mut child = std::process::Command::new("sleep")
             .arg("60")
             .process_group(0)
             .spawn()
-            .unwrap()
+            .unwrap();
+        (
+            child.id(),
+            std::thread::spawn(move || child.wait().unwrap()),
+        )
     }
 
     #[cfg(unix)]
@@ -1919,6 +1914,16 @@ pool:
         .unwrap();
     }
 
+    fn event_lines(run_dir: &Path) -> Vec<serde_json::Value> {
+        match std::fs::read_to_string(run_dir.join("events.jsonl")) {
+            Ok(raw) => raw
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_hard_stop_signals_the_coordinator_and_the_live_units_and_closes_the_record() {
@@ -1927,14 +1932,13 @@ pool:
         let g = tmp.path();
         let run_dir = agentiflow_dir(g).join("af_01NEWER");
 
-        let mut coordinator = spawn_sleeper();
-        let mut live_unit = spawn_sleeper();
-        let mut finished_unit = spawn_sleeper();
-        write_unit(&run_dir, "unit_live", live_unit.id(), "running");
+        let (coordinator, coordinator_exit) = spawn_sleeper();
+        let (live_unit, live_unit_exit) = spawn_sleeper();
+        let (finished_unit, finished_unit_exit) = spawn_sleeper();
+        write_unit(&run_dir, "unit_live", live_unit, "running");
         // A unit that already finished keeps its process group: not signalled.
-        write_unit(&run_dir, "unit_done", finished_unit.id(), "done");
-        let coordinator_pid = coordinator.id();
-        edit_record(g, "af_01NEWER", |r| r.runner_pid = Some(coordinator_pid));
+        write_unit(&run_dir, "unit_done", finished_unit, "done");
+        edit_record(g, "af_01NEWER", |r| r.runner_pid = Some(coordinator));
 
         assert_eq!(
             stop(g, "af_01NEWER", true).unwrap(),
@@ -1942,21 +1946,21 @@ pool:
         );
 
         assert_eq!(
-            coordinator.wait().unwrap().signal(),
+            coordinator_exit.join().unwrap().signal(),
             Some(15),
             "coordinator got SIGTERM"
         );
         assert_eq!(
-            live_unit.wait().unwrap().signal(),
+            live_unit_exit.join().unwrap().signal(),
             Some(15),
             "live unit's group got SIGTERM"
         );
         assert!(
-            finished_unit.try_wait().unwrap().is_none(),
+            rupu_agentiflow::pid_is_running(finished_unit),
             "a finished unit is left alone"
         );
-        finished_unit.kill().unwrap();
-        finished_unit.wait().unwrap();
+        rupu_agentiflow::kill_group(finished_unit);
+        finished_unit_exit.join().unwrap();
 
         let rec = AgentiflowRecord::read(&run_dir).unwrap();
         assert_eq!(rec.status, "failed");
@@ -1965,20 +1969,38 @@ pool:
         assert!(rec.ended_at.is_some());
         // A hard stop is a signal, not a message.
         assert!(drained(g, "af_01NEWER").is_empty());
+        // The coordinator dies on SIGTERM without a word, so the stop writes
+        // the terminal event, or the log would end mid-run on a `failed` run.
+        let last = event_lines(&run_dir).pop().expect("a terminal event");
+        assert_eq!(last["kind"], "run_stopped");
+        assert_eq!(last["stop_reason"], "operator_stop:now");
     }
 
     #[test]
-    fn a_hard_stop_with_no_live_coordinator_still_closes_the_record() {
+    fn a_hard_stop_with_no_live_coordinator_still_closes_the_record_and_the_log() {
         let tmp = seeded_global();
         let g = tmp.path();
+        let run_dir = agentiflow_dir(g).join("af_01NEWER");
         // `runner_pid` is `None` (an older record): nothing to signal.
         assert_eq!(
             stop(g, "af_01NEWER", true).unwrap(),
             "hard-stopped af_01NEWER"
         );
-        let rec = AgentiflowRecord::read(&agentiflow_dir(g).join("af_01NEWER")).unwrap();
+        let rec = AgentiflowRecord::read(&run_dir).unwrap();
         assert_eq!(rec.status, "failed");
         assert_eq!(rec.stop_reason.as_deref(), Some("operator_stop:now"));
+        let events = event_lines(&run_dir);
+        let last = events.last().expect("a terminal event");
+        assert_eq!(last["kind"], "run_stopped");
+        assert_eq!(last["stop_reason"], "operator_stop:now");
+        assert_eq!(last["detail"], "operator hard stop (--now)");
+        assert_eq!(events.len(), 1);
+        // The record is final now: a second hard stop leaves it, and the log, be.
+        assert_eq!(
+            stop(g, "af_01NEWER", true).unwrap(),
+            "af_01NEWER already failed"
+        );
+        assert_eq!(event_lines(&run_dir).len(), 1);
     }
 
     // ---- generation capability gating ---------------------------------------

@@ -56,7 +56,11 @@
 //!
 //! A run whose coordinator died without writing its own `run_stopped` gets one
 //! from the orphan reaper (`reap_orphaned_agentiflows`): same shape, with
-//! `stop_reason` / `detail` `orphaned: coordinator pid <p> not running`.
+//! `stop_reason` / `detail` `orphaned: coordinator pid <p> not running`. So does
+//! a run an operator hard-stops (`rupu agentiflow stop --now`, via `hard_stop`):
+//! the coordinator is killed without running any cleanup, so the stop writes it,
+//! with `stop_reason` `operator_stop:now` and `detail` `operator hard stop
+//! (--now)`. Both go through `finalize_failed`.
 //!
 //! The log is deliberately local and minimal: a best-effort append. A failed
 //! append is logged (`tracing::warn!`) and never stops the run; the durable
@@ -119,9 +123,9 @@ pub struct GoalStatus {
 ///
 /// `stop_reason` is a stable snake_case code: `goals_met`,
 /// `coverage_reached`, `budget_exhausted:<dimension>`, `operator_stop`,
-/// `ceiling`; for a `failed` run it is `error: <message>`, or
+/// `ceiling`; for a `failed` run it is `error: <message>`,
 /// `orphaned: coordinator pid <p> not running` when the orphan reaper found the
-/// coordinator dead.
+/// coordinator dead, or `operator_stop:now` when an operator hard-stopped it.
 ///
 /// `spent_usd` / `spent_tokens` are the run's metered spend (the same meter
 /// `budget.usd` / `budget.tokens` are enforced against): refreshed as each
@@ -385,8 +389,9 @@ fn goal_statuses(outcome: &EnvelopeOutcome) -> Vec<GoalStatus> {
 }
 
 /// The best-effort `events.jsonl` appender (shape in the module docs). The
-/// orphan reaper appends its terminal `run_stopped` through the same writer, so
-/// there is one event shape and one append path.
+/// orphan reaper and the operator's hard stop append their terminal
+/// `run_stopped` through the same writer (via `finalize_failed`), so there is
+/// one event shape and one append path.
 pub(crate) struct EventLog {
     path: PathBuf,
 }

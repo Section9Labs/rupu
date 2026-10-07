@@ -49,7 +49,9 @@ pub use lead::{
 };
 pub use operator::{OperatorMessage, OperatorQueue};
 pub use proc::{kill_group, pid_is_running, terminate_group, terminate_pid};
-pub use reaper::{reap_orphaned_agentiflows, ReapSummary};
+pub use reaper::{
+    finalize_failed, hard_stop, reap_orphaned_agentiflows, HardStopOutcome, ReapSummary,
+};
 pub use roster::{roster_collector, roster_tools, RosterCollector, RosterCtx};
 pub use run::{
     agentiflow_dir, new_run_id, run_agentiflow, AgentiflowRecord, GoalStatus, LeadInputs,
