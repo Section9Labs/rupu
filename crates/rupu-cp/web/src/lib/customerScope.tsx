@@ -83,6 +83,10 @@ export function CustomerScopeProvider({ children }: { children: ReactNode }): JS
   // A scoped customer that is not in the active list: picked by the caller, or
   // found among the archived customers.
   const [extra, setExtra] = useState<CustomerRow | null>(null);
+  // The `nonce` (reload generation) `extra` was resolved at: a `reload()`
+  // after an edit re-resolves it, so a renamed / recolored archived customer
+  // the scope holds never keeps its old row.
+  const [extraAt, setExtraAt] = useState(0);
   const [notice, setNotice] = useState<string | null>(null);
   const [noticeSeq, setNoticeSeq] = useState(0);
   const [nonce, setNonce] = useState(0);
@@ -90,12 +94,15 @@ export function CustomerScopeProvider({ children }: { children: ReactNode }): JS
   // `setScope` / `rejectScope` as well as by render).
   const scopeRef = useRef(scope);
   scopeRef.current = scope;
+  const nonceRef = useRef(nonce);
+  nonceRef.current = nonce;
 
   const setScope = useCallback((next: CustomerScope, row?: CustomerRow) => {
     scopeRef.current = next;
     persist(next);
     setNotice(null);
     setExtra(row ?? null);
+    setExtraAt(nonceRef.current);
     setScopeState(next);
   }, []);
   const rejectScope = useCallback((message: string, rejected?: CustomerScope) => {
@@ -136,14 +143,17 @@ export function CustomerScopeProvider({ children }: { children: ReactNode }): JS
       return;
     }
     if (!loaded) return;
-    if (customers.some((c) => c.slug === scope) || extra?.slug === scope) return;
+    if (customers.some((c) => c.slug === scope)) return;
+    if (extra?.slug === scope && extraAt === nonce) return;
     let cancelled = false;
     api.getCustomers({ archived: true }).then(
       (all) => {
         if (cancelled) return;
         const hit = all.find((c) => c.slug === scope) ?? null;
-        if (hit) setExtra(hit);
-        else rejectScope(`Customer “${scope}” no longer exists — showing all customers.`);
+        if (hit) {
+          setExtra(hit);
+          setExtraAt(nonce);
+        } else rejectScope(`Customer “${scope}” no longer exists — showing all customers.`);
       },
       () => {
         // Can't tell — keep the scope.
@@ -152,7 +162,7 @@ export function CustomerScopeProvider({ children }: { children: ReactNode }): JS
     return () => {
       cancelled = true;
     };
-  }, [scope, customers, loaded, extra, rejectScope]);
+  }, [scope, customers, loaded, extra, extraAt, nonce, rejectScope]);
 
   const customer = useMemo(
     () =>

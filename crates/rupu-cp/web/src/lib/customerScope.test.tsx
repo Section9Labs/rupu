@@ -214,6 +214,30 @@ describe('CustomerScopeProvider', () => {
     expect(screen.getByTestId('notice').textContent).toBe('');
   });
 
+  it('reload() refreshes an archived scoped customer\'s row after an edit', async () => {
+    let name = 'Old Co';
+    vi.mocked(api.getCustomers).mockImplementation(async (o) =>
+      o?.archived ? [row('acme'), { ...row('oldco', true), name }] : [row('acme')],
+    );
+    let resolved!: ReturnType<typeof useCustomerScope>;
+    function NameProbe() {
+      resolved = useCustomerScope();
+      return <span data-testid="name">{resolved.customer?.name ?? ''}</span>;
+    }
+    render(
+      <MemoryRouter initialEntries={['/?customer=oldco']}>
+        <CustomerScopeProvider>
+          <NameProbe />
+        </CustomerScopeProvider>
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByTestId('name').textContent).toBe('Old Co'));
+    name = 'Renamed Co';
+    act(() => resolved.reload());
+    await waitFor(() => expect(screen.getByTestId('name').textContent).toBe('Renamed Co'));
+    expect(resolved.scope).toBe('oldco');
+  });
+
   it('setScope resolves the row for a scope picked after mount', async () => {
     mount();
     await waitFor(() => expect(screen.getByTestId('customers').textContent).toBe('acme,globex'));
