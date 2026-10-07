@@ -112,7 +112,8 @@ fn query_spec() -> ToolSpec {
         name: "findings.query",
         description: "List this project's findings matching a one-line query `q` (e.g. \
                       `severity>=high tag:needs-poc`): one page of slim rows, `next_cursor`, \
-                      `total`, and `tags_in_use`.",
+                      `total`, and `tags_in_use`; with `all: true`, every match unpaged \
+                      (for a workflow `for_each` over `rows`).",
         input_schema: rupu_coverage::query_input_schema(),
         kind: ToolKind::Read,
     }

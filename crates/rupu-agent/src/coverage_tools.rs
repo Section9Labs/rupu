@@ -824,7 +824,8 @@ impl Tool for QueryFindingsTool {
         "List findings recorded in this project with a one-line query in `q` (e.g. \
          `severity>=high tag:needs-poc -has:poc`). Returns one page of slim rows (id, title, \
          severity, location, tags), `next_cursor`, `total`, and `tags_in_use` — reuse an \
-         existing tag where it fits."
+         existing tag where it fits. `all: true` returns every match unpaged, however many: \
+         page with `cursor` instead unless you need the whole set."
     }
 
     fn input_schema(&self) -> Value {

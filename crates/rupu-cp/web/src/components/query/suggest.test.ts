@@ -72,6 +72,10 @@ describe('suggest', () => {
     expect(suggest('cwe:79,', FINDING_FIELDS, cwe).map((x) => x.label)).toEqual(['CWE-89']);
     expect(suggest('cwe:cwe-89,', FINDING_FIELDS, cwe).map((x) => x.label)).toEqual(['CWE-79']);
     expect(suggest('has:POC,', FINDING_FIELDS, facets).map((x) => x.label)).toEqual(['tags', 'report', 'cwe']);
+    expect(suggest('owner:"payments team",', FINDING_FIELDS, facets).map((x) => x.label)).toEqual(['Acme, Inc.']);
+    // `file`, `run` and `id` match exactly, so another case is another value.
+    const files = { file: [{ value: 'src/A.rs', count: 1 }] };
+    expect(suggest('file:src/a.rs,', FINDING_FIELDS, files).map((x) => x.label)).toEqual(['src/A.rs']);
   });
   it('reads chosen values through quotes and escapes', () => {
     expect(suggest('owner:"Acme, Inc.",', FINDING_FIELDS, facets).map((x) => x.label)).toEqual(['Payments Team']);

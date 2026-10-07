@@ -35,7 +35,7 @@ pub use stream::{
     STREAM_FILE, STREAM_VERSION,
 };
 pub use tags::{
-    apply, fold_tags, ingest_tag_events, merge_tag_log_copy, parse_tags,
+    apply, fold_tags, ingest_tag_events, merge_tag_log_copies, parse_tags,
     read_declared_workspace_findings, read_tag_events, read_workspace_findings, tag_history,
     tag_input_schema, tags_schema_property, OperatorAttribution, OperatorSurface, Tag, TagActor,
     TagChange, TagChangeInput, TagError, TagEvent, TagLog, TagLogMerge, TagOp, TagOutcome,

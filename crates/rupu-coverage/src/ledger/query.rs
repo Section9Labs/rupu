@@ -228,7 +228,7 @@ pub fn query_input_schema() -> serde_json::Value {
             "q": { "type": "string", "description": "Findings query, e.g. `severity>=high tag:class:sqli -tag:false-positive -has:poc \"sql injection\"`. Tokens AND; `key:a,b` is any-of; `-` negates; keys: severity (>=,>,<=,<), tag, has (tags|report|poc|cwe), cwe, owner, product, verified, profile, scope, concern, agent, file (path prefix), run, id; bare words search title/summary/id/file. Empty matches everything." },
             "limit": { "type": "integer", "minimum": 1, "maximum": MAX_LIMIT, "description": "Rows per page (default 50)." },
             "cursor": { "type": "string", "description": "`next_cursor` from the previous page." },
-            "all": { "type": "boolean", "description": "Return every match in one answer, unpaged (no `limit`/`cursor`). For a workflow `for_each` over the rows; rows are slim (no report body)." }
+            "all": { "type": "boolean", "description": "Return every match in one answer, unpaged (no `limit`/`cursor`) and unbounded. For a workflow `for_each` over the rows; to read findings into a conversation, page instead." }
         }
     })
 }

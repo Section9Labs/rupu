@@ -2,7 +2,7 @@
 
 use chrono::Utc;
 use rupu_coverage::ledger::tags::{
-    apply, ingest_tag_events, merge_tag_log_copy, TagChange, TagError, TagLogMerge, TagOutcome,
+    apply, ingest_tag_events, merge_tag_log_copies, TagChange, TagError, TagLogMerge, TagOutcome,
 };
 use rupu_coverage::{
     append_record, parse_tags, read_tag_events, read_workspace_findings, Attribution,
@@ -426,7 +426,7 @@ fn merging_a_units_copy_of_the_log_keeps_events_written_meanwhile() {
     // ... while an operator tags on the coordinator.
     apply(&log, &change(&["fnd_a"], &["from-operator"], &[]), &by()).unwrap();
 
-    let merged = merge_tag_log_copy(&log, &unit_copy).unwrap();
+    let merged = merge_tag_log_copies(&log, &[&unit_copy]).unwrap();
     assert_eq!(
         merged,
         TagLogMerge {
@@ -438,5 +438,13 @@ fn merging_a_units_copy_of_the_log_keeps_events_written_meanwhile() {
     assert_eq!(tags_of(ws.path(), "fnd_a"), ["from-operator", "shared"]);
     assert_eq!(tags_of(ws.path(), "fnd_b"), ["from-unit"]);
     // Merging the same copy again changes nothing.
-    assert_eq!(merge_tag_log_copy(&log, &unit_copy).unwrap().appended, 0);
+    assert_eq!(
+        merge_tag_log_copies(&log, &[&unit_copy, &unit_copy]).unwrap(),
+        TagLogMerge {
+            appended: 0,
+            duplicates: 4,
+            unreadable: 2
+        },
+        "merging copies again, twice in one pass, adds nothing"
+    );
 }

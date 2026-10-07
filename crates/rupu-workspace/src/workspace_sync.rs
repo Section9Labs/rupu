@@ -80,6 +80,21 @@ pub fn collect_delta(scratch_dir: &Path, baseline: &Baseline) -> Result<Delta, S
     }
 }
 
+/// The directory a delta's paths are relative to when [`apply_deltas`] applies
+/// it to `workspace_path`: the workspace itself in tar mode, the enclosing
+/// repository's working directory in git mode (a git workspace can be a
+/// subdirectory of its repo, and a patch names repo-relative paths).
+pub fn delta_root(workspace_path: &Path, mode: SyncMode) -> Result<PathBuf, SyncError> {
+    match mode {
+        SyncMode::Tar => Ok(workspace_path.to_path_buf()),
+        SyncMode::Git => git2::Repository::discover(workspace_path)
+            .map_err(git_err)?
+            .workdir()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| SyncError::Git("bare repo has no workdir".into())),
+    }
+}
+
 pub fn apply_deltas(workspace_path: &Path, deltas: &[Delta]) -> Result<(), SyncError> {
     if deltas.is_empty() {
         return Ok(());
@@ -178,7 +193,8 @@ impl Delta {
     /// [`TAG_LOG_PATH`]), plus the log lines it carried: the unit's whole copy
     /// in tar mode, the lines its patch adds in git mode (the log is
     /// append-only). `None` when the delta does not touch the log. The caller
-    /// merges those lines by event id (`rupu_coverage::merge_tag_log_copy`);
+    /// merges those lines by event id (`rupu_coverage::merge_tag_log_copies`),
+    /// into the log under [`delta_root`];
     /// a deletion of the log is dropped, never applied.
     pub fn take_tag_log(&self) -> Result<(Delta, Option<Vec<u8>>), SyncError> {
         if !self
@@ -891,9 +907,6 @@ mod tests {
         );
     }
 
-    /// The strip removes exactly `.rupu/coverage/` at the workspace root —
-    /// changes AND deletions, from the lists and from the archive — and
-    /// keeps everything else, including look-alikes.
     #[test]
     fn tar_take_tag_log_returns_the_units_copy_and_never_writes_it() {
         let ws = tempfile::tempdir().unwrap();
@@ -964,6 +977,9 @@ mod tests {
         );
     }
 
+    /// The strip removes exactly `.rupu/coverage/` at the workspace root —
+    /// changes AND deletions, from the lists and from the archive — and
+    /// keeps everything else, including look-alikes.
     #[test]
     fn tar_without_coverage_drops_exactly_the_root_coverage_dir() {
         let ws = tempfile::tempdir().unwrap();
@@ -1242,10 +1258,6 @@ mod git_sync_tests {
         );
     }
 
-    /// Git-mode strip: the patch is re-printed without the root
-    /// `.rupu/coverage/` file deltas (changes and deletions), and everything
-    /// else — look-alikes, a modified tracked file, a file with no trailing
-    /// newline, a deletion — still applies byte-for-byte.
     /// The tag log never travels as a file in git mode either: its added lines
     /// come out for a merge, and the rest of the patch applies without it.
     #[test]
@@ -1283,6 +1295,64 @@ mod git_sync_tests {
         assert_eq!(read(TAG_LOG_PATH), "{\"id\":\"e1\"}\n{\"id\":\"e3\"}\n");
     }
 
+    /// A tag log the unit created from scratch (untracked on the coordinator)
+    /// comes out whole, and the coordinator still gets no file.
+    #[test]
+    fn git_take_tag_log_returns_a_log_the_unit_created() {
+        let ws = tempfile::tempdir().unwrap();
+        git_init(ws.path());
+        let payload = pack(ws.path()).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let baseline = stage(&payload, scratch.path()).unwrap();
+        write(scratch.path(), TAG_LOG_PATH, "{\"id\":\"e1\"}\n");
+        write(scratch.path(), "c.txt", "c\n");
+        let delta = collect_delta(scratch.path(), &baseline).unwrap();
+
+        let (rest, log) = delta.take_tag_log().unwrap();
+        assert_eq!(log.as_deref(), Some(&b"{\"id\":\"e1\"}\n"[..]));
+        assert_eq!(rest.changed, vec!["c.txt".to_string()]);
+        apply_deltas(ws.path(), &[rest]).unwrap();
+        assert!(!ws.path().join(TAG_LOG_PATH).exists());
+        assert_eq!(fs::read_to_string(ws.path().join("c.txt")).unwrap(), "c\n");
+    }
+
+    /// A delta that only touched the lock carries no log, and no lock either.
+    #[test]
+    fn take_tag_log_drops_a_lock_only_change() {
+        let ws = tempfile::tempdir().unwrap();
+        let payload = pack_tar(ws.path()).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let baseline = stage_tar(&payload, scratch.path()).unwrap();
+        write(scratch.path(), TAG_LOG_LOCK_PATH, "");
+        let delta = collect_delta_tar(scratch.path(), &baseline).unwrap();
+        assert_eq!(delta.changed, vec![TAG_LOG_LOCK_PATH.to_string()]);
+        let (rest, log) = delta.take_tag_log().unwrap();
+        assert_eq!(log, None);
+        assert!(rest.changed.is_empty());
+        apply_deltas(ws.path(), &[rest]).unwrap();
+        assert!(!ws.path().join(TAG_LOG_LOCK_PATH).exists());
+    }
+
+    /// A git patch names repo-relative paths, so a workspace inside a repo
+    /// subdirectory has the repo's working directory as its delta root.
+    #[test]
+    fn delta_root_is_the_repo_workdir_in_git_mode() {
+        let repo = tempfile::tempdir().unwrap();
+        git_init(repo.path());
+        let sub = repo.path().join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        let canon = |p: &Path| fs::canonicalize(p).unwrap();
+        assert_eq!(
+            canon(&delta_root(&sub, SyncMode::Git).unwrap()),
+            canon(repo.path())
+        );
+        assert_eq!(delta_root(&sub, SyncMode::Tar).unwrap(), sub);
+    }
+
+    /// Git-mode strip: the patch is re-printed without the root
+    /// `.rupu/coverage/` file deltas (changes and deletions), and everything
+    /// else — look-alikes, a modified tracked file, a file with no trailing
+    /// newline, a deletion — still applies byte-for-byte.
     #[test]
     fn git_without_coverage_drops_exactly_the_root_coverage_dir() {
         let ws = tempfile::tempdir().unwrap();

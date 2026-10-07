@@ -51,7 +51,7 @@ pub use diff::generate::{list_runs, run_diff, DiffError, RunSelector};
 pub use diff::{CellRef, FindingThemeRef, RunDiff, RunListEntry, VerdictFlip};
 pub use ledger::{
     append_manifest, append_record, apply, discover_targets, file_views, find_manifest, fold_tags,
-    ingest_tag_events, ingest_unit_stream, merge_tag_log_copy, parse_tags, read_concern_assertions,
+    ingest_tag_events, ingest_unit_stream, merge_tag_log_copies, parse_tags, read_concern_assertions,
     read_declared_findings, read_declared_workspace_findings, read_file_events, read_findings,
     read_manifests, read_tag_events, read_workspace_findings, stream_catalog, stream_path,
     tag_history, tag_input_schema, tags_schema_property, target_id, write_stream_begin,
