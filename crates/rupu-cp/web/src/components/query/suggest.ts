@@ -5,7 +5,7 @@
 //   'tag:ne'      → values for `tag` in use (facets) or the key's fixed
 //                   values, fuzzy-matched on the part after the last comma
 import { fuzzyScore } from '../../lib/fuzzy';
-import { findField, quoteValue } from '../../lib/findingQuery/grammar';
+import { findField, normalize, quoteValue } from '../../lib/findingQuery/grammar';
 import type { QueryField } from '../../lib/findingQuery/fields';
 
 export interface FacetValue {
@@ -104,8 +104,14 @@ export function suggest(
     const { prefix, partial, chosen } = splitItem(rest);
     if (op !== ':' && prefix !== '') return [];
     const counts = new Map((facets?.[field.key] ?? []).map((f) => [f.value, f.count]));
-    const taken = new Set(['', ...chosen]);
-    const pool = (field.values.length > 0 ? field.values : [...counts.keys()]).filter((v) => !taken.has(v));
+    // Compare canonical forms, as the query does: `Needs-Poc` already chose
+    // `needs-poc`, and `79` already chose `CWE-79`.
+    const canon = (v: string) => {
+      const n = normalize(field, v);
+      return n.ok ? n.value : v;
+    };
+    const taken = new Set(['', ...chosen.map(canon)]);
+    const pool = (field.values.length > 0 ? field.values : [...counts.keys()]).filter((v) => !taken.has(canon(v)));
     return pool
       .map((value) => ({ value, hit: fuzzyScore(partial, value), count: counts.get(value) ?? 0 }))
       .filter((x) => x.hit !== null)

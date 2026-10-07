@@ -214,7 +214,10 @@ export function parseCwe(raw: string): number | null {
   return Number.isSafeInteger(n) && n <= 4294967295 ? n : null;
 }
 
-function normalize(f: FieldSpec, v: string): { ok: true; value: string } | { ok: false; message: string } {
+/** A value in the canonical form the query compares (tags lowercased, `79`
+ *  as `CWE-79`, enum values lowercased), or an error for a value the key
+ *  doesn't take. */
+export function normalize(f: FieldSpec, v: string): { ok: true; value: string } | { ok: false; message: string } {
   switch (f.kind) {
     case 'severity':
     case 'enum': {
