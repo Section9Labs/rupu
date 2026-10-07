@@ -2510,16 +2510,15 @@ async fn explorer_from_host(
             "host {host_id} has no netflow explorer endpoint ({m}); the remote CP is \
              likely older than this one"
         )),
-        HostConnectorError::Unreachable(m) => {
-            ApiError::internal(format!("host {host_id} unreachable: {m}"))
-        }
         // Neither surface: report why the STRUCTURED one declined, which
         // names the actual problem (an out-of-date remote `rupu`), not the
         // generic-GET refusal that is merely a property of the transport.
-        HostConnectorError::Invalid(_) | HostConnectorError::Unsupported(_) => ApiError::internal(
-            format!("host {host_id} cannot serve netflow: {no_structured_reason}"),
-        ),
-        other => ApiError::internal(other.to_string()),
+        HostConnectorError::Invalid(_) | HostConnectorError::Unsupported(_) => {
+            ApiError::not_available(format!(
+                "host {host_id} cannot serve netflow: {no_structured_reason}"
+            ))
+        }
+        other => crate::api::runs::host_read_error(host_id, other),
     })?;
     serde_json::from_value(value).map_err(|e| {
         ApiError::internal(format!(
@@ -2577,14 +2576,13 @@ async fn run_netflow_from_host(
     );
     let value = conn.proxy_get_json(&path).await.map_err(|e| match e {
         HostConnectorError::NotFound(m) => ApiError::not_found(m),
-        HostConnectorError::Unreachable(m) => {
-            ApiError::internal(format!("host {host_id} unreachable: {m}"))
-        }
         // See `explorer_from_host`: prefer the structured surface's reason.
-        HostConnectorError::Invalid(_) | HostConnectorError::Unsupported(_) => ApiError::internal(
-            format!("host {host_id} cannot serve netflow: {no_structured_reason}"),
-        ),
-        other => ApiError::internal(other.to_string()),
+        HostConnectorError::Invalid(_) | HostConnectorError::Unsupported(_) => {
+            ApiError::not_available(format!(
+                "host {host_id} cannot serve netflow: {no_structured_reason}"
+            ))
+        }
+        other => crate::api::runs::host_read_error(host_id, other),
     })?;
     // A deserialization failure here is most likely `dropped_total` not
     // parsing on an OLDER remote still emitting the pre-rename `dropped`

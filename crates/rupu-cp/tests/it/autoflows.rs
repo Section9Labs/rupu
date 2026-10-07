@@ -114,3 +114,64 @@ async fn list_autoflows_skips_unparseable_yaml() {
     assert_eq!(arr.len(), 1, "expected 1 autoflow, got {arr:?}");
     assert_eq!(arr[0]["name"], "cron-wf");
 }
+
+/// Any launcher: the CP's "this is `cp serve`" signal, which toggling needs.
+struct NoopLauncher;
+
+#[async_trait::async_trait]
+impl rupu_cp::launcher::RunLauncher for NoopLauncher {
+    async fn launch(
+        &self,
+        _req: rupu_cp::launcher::LaunchRequest,
+    ) -> Result<String, rupu_cp::launcher::LaunchError> {
+        Ok("run_unused".into())
+    }
+}
+
+/// An autoflow saved as `.yml` is listed (the runtime runs it), so its toggle
+/// and its workflow link must resolve it too — both used to 404.
+#[tokio::test]
+async fn a_yml_autoflow_toggles_and_links() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wf = tmp.path().join("workflows");
+    std::fs::create_dir_all(&wf).unwrap();
+    let body = "name: nightly\nautoflow:\n  enabled: true\nsteps:\n  - id: s1\n    agent: ag\n    actions: []\n    prompt: p\n";
+    std::fs::write(wf.join("nightly.yml"), body).unwrap();
+
+    let state =
+        rupu_cp::state::AppState::new(tmp.path().into(), rupu_config::PricingConfig::default())
+            .with_launcher(Some(std::sync::Arc::new(NoopLauncher)));
+    let app = rupu_cp::server::router(state, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = reqwest::Client::new();
+
+    let list: serde_json::Value = client
+        .get(format!("http://{addr}/api/autoflows"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(list.to_string().contains("nightly"), "{list}");
+
+    let resp = client
+        .post(format!("http://{addr}/api/autoflows/nightly/disable"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let on_disk = std::fs::read_to_string(wf.join("nightly.yml")).unwrap();
+    assert!(on_disk.contains("enabled: false"), "{on_disk}");
+
+    let resp = client
+        .get(format!("http://{addr}/api/workflows/nightly"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}

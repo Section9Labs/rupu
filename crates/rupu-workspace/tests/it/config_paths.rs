@@ -214,3 +214,31 @@ fn locate_workflow_prefers_the_project_then_the_global_layer() {
     }
     assert!(rupu_workspace::is_safe_definition_name("w"));
 }
+
+/// `.yml` definitions resolve too (the autoflow runtime runs them), with
+/// `.yaml` winning in a directory that has both, and a project `.yml`
+/// shadowing a global `.yaml`.
+#[test]
+fn locate_workflow_takes_yml_with_yaml_winning() {
+    let (_tmp, home, project) = setup();
+    let put = |dir: &Path, file: &str| {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(file), "name: w\n").unwrap();
+        dir.join(file)
+    };
+    let global_yml = put(&home.join("workflows"), "w.yml");
+    assert_eq!(
+        rupu_workspace::locate_workflow(&home, None, "w"),
+        Some(global_yml)
+    );
+    let global_yaml = put(&home.join("workflows"), "w.yaml");
+    assert_eq!(
+        rupu_workspace::locate_workflow(&home, None, "w"),
+        Some(global_yaml)
+    );
+    let local_yml = put(&project.join(".rupu/workflows"), "w.yml");
+    assert_eq!(
+        rupu_workspace::locate_workflow(&home, Some(&project), "w"),
+        Some(local_yml)
+    );
+}

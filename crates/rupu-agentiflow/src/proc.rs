@@ -64,6 +64,14 @@ pub(crate) fn is_zombie(_pid: u32) -> bool {
     false
 }
 
+/// Whether a coordinator with this pid is still running: it exists and is not
+/// a zombie ([`is_zombie`]) — the liveness the orphan reaper uses, for any
+/// caller that must not mistake an exited-but-unreaped coordinator for a
+/// live one (the control plane's steering check).
+pub fn coordinator_alive(pid: u32) -> bool {
+    pid_is_running(pid) && !is_zombie(pid)
+}
+
 /// Send SIGTERM to `pid`. Returns whether the signal was delivered.
 ///
 /// Never signals this process: a recorded pid equal to our own is always a

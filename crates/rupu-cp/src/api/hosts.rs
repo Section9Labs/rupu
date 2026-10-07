@@ -554,17 +554,20 @@ async fn add_bucket_host_handler(
 
 /// `DELETE /api/hosts/:id` — remove a registered host.
 ///
-/// - 204 on success.
+/// - 204 on success; a tunnel host's live node connection is closed.
 /// - 400 when `id` is `"local"` (the local host cannot be removed).
+/// - 404 for an unknown id.
 async fn remove_host(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult<StatusCode> {
     if id == "local" {
         return Err(ApiError::bad_request(
             "cannot remove the built-in local host",
         ));
     }
-    s.hosts
-        .remove_host(&id)
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    s.hosts.remove_host(&id).map_err(|e| match e {
+        crate::host::connector::HostConnectorError::NotFound(m) => ApiError::not_found(m),
+        crate::host::connector::HostConnectorError::Invalid(m) => ApiError::bad_request(m),
+        other => ApiError::internal(other.to_string()),
+    })?;
     s.host_probes.forget(&id);
     Ok(StatusCode::NO_CONTENT)
 }

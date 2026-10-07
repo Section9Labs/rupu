@@ -30,8 +30,12 @@ Step prompts are rendered with minijinja templates against workflow inputs, prio
 ## File location and resolution
 
 ```text
-<dir>/workflows/<name>.yaml
+<dir>/workflows/<name>.yaml      (or <name>.yml)
 ```
+
+`.yml` is accepted everywhere a workflow is looked up or listed (`rupu
+workflow run`/`list`, autoflows, the control plane). When a directory holds
+both `<name>.yaml` and `<name>.yml`, the `.yaml` file wins.
 
 `<dir>` is one of:
 

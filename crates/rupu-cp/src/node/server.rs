@@ -175,6 +175,19 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         capabilities,
         Some(rupu_version),
     );
+    // The host may have been removed while this node was authenticating:
+    // `remove_host` deletes the record THEN disconnects, so either its
+    // disconnect sees this registration (and kicks it), or this re-check
+    // sees the record gone.
+    let still_enrolled = state.hosts.list_hosts().into_iter().any(|h| {
+        matches!(&h.transport, HostTransport::Tunnel { node_id: nid } if *nid == node_id)
+    });
+    if !still_enrolled {
+        warn!(node_id, "node_tunnel: host removed during the handshake");
+        state.node_registry.remove(&node_id, &conn);
+        let _ = ws_tx.send(Message::Close(None)).await;
+        return;
+    }
 
     // Advertise what this CP can mirror so a node only sends frames we handle
     // (an older CP logs-and-continues on a frame it can't parse; the gate
@@ -327,9 +340,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     };
 
     // Run both pumps concurrently; clean up on whichever exits first.
+    // A kick (the host was removed) ends the tunnel too.
+    let kicked = Arc::clone(&conn);
     tokio::select! {
         _ = write_pump => {}
         _ = read_pump => {}
+        _ = kicked.kicked() => {
+            info!(node_id, "node_tunnel: host removed; closing the tunnel");
+        }
     }
 
     // ── 5. Cleanup ────────────────────────────────────────────────────────────

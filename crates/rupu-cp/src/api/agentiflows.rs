@@ -1,23 +1,26 @@
-//! Agentiflows (read-only, LOCAL only): the runs `rupu agentiflow run` lays out
-//! under `<global>/agentiflows/af_<ULID>/`.
+//! Agentiflows (LOCAL only): the runs `rupu agentiflow run` lays out under
+//! `<global>/agentiflows/af_<ULID>/`. Reads, plus one write — steering.
 //!
 //! - `GET /api/agentiflows` — every run's slim row, newest first.
 //! - `GET /api/agentiflows/:id` — one run: its record, the definition snapshot
 //!   it started from, the `events.jsonl` log, and the units (branches) it
 //!   dispatched.
+//! - `GET /api/agentiflows/:id/messages` — the run's board posts + directives.
+//! - `POST /api/agentiflows/:id/steer` — queue an operator message for the
+//!   lead (`cp serve` only; refused unless its coordinator is alive).
 //!
 //! The run-dir layout and `events.jsonl` line shapes are documented on
 //! `rupu_agentiflow::run`'s module docs; the readers here mirror
 //! `rupu-cli`'s `agentiflow list` / `agentiflow status` (`cmd/agentiflow.rs`)
-//! without depending on it. Nothing here writes: the CP only observes a run the
-//! coordinator (or its reaper) owns.
+//! without depending on it. Apart from the steering queue, nothing here writes:
+//! the CP only observes a run the coordinator (or its reaper) owns.
 //!
 //! Transcripts are NOT served here. The lead's per-round transcripts
 //! (`lead/transcript.r<N>.jsonl`) and a unit's transcript are plain `.jsonl`
 //! files under the global dir (or a workspace), so the detail carries their
 //! paths and the existing `/api/transcript` endpoint reads them.
 //!
-//! Remote hosts, SSE and steering are a later pass; this module reads
+//! Remote hosts and SSE are a later pass; this module reads
 //! `AppState::global_dir` directly.
 
 use crate::{
@@ -31,7 +34,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use rupu_agentiflow::{
-    agentiflow_dir, pid_is_running, units_on_disk, AgentiflowDef, AgentiflowRecord, Budget,
+    agentiflow_dir, units_on_disk, AgentiflowDef, AgentiflowRecord, Budget,
     CoverageTarget, Goal, GoalTarget, OperatorMessage, OperatorQueue, Pool, RoundConfig, UnitOnDisk,
     UnitStatus,
 };
@@ -247,7 +250,9 @@ fn runner_alive(record: &AgentiflowRecord) -> Option<bool> {
     if record.status != "running" {
         return None;
     }
-    record.runner_pid.map(pid_is_running)
+    // A zombie (exited, unreaped — PID 1 in some containers reaps nothing)
+    // is as dead as a vanished pid: it will never drain anything.
+    record.runner_pid.map(rupu_agentiflow::coordinator_alive)
 }
 
 /// The run's codename: the stored one if the record ever carries it, else
@@ -692,8 +697,11 @@ async fn get_agentiflow_messages(
 /// `POST /api/agentiflows/:id/steer` — queue an operator steering message for
 /// the lead, the same channel `rupu agentiflow send` writes. The lead drains
 /// the queue at the next round boundary (`now: true` also asks for a mid-round
-/// interrupt). Refused (409) when the run is not `running`, since a finished
-/// lead never drains it.
+/// interrupt). A write, so `cp serve` only (501 otherwise). Refused (409)
+/// unless a live coordinator will read it: the record must be `running` and
+/// its recorded `runner_pid` alive — a coordinator that died without
+/// finalizing leaves `running` on disk, and a message queued there is never
+/// drained ([`steerable`]).
 #[derive(Deserialize)]
 struct SteerRequest {
     message: String,
@@ -703,6 +711,26 @@ struct SteerRequest {
     /// Ask the envelope to wind the run down after this message.
     #[serde(default)]
     stop: bool,
+}
+
+/// Whether `record`'s lead will drain a steering message: `running`, and its
+/// coordinator not known dead. A record with no `runner_pid` (owner unknown)
+/// is accepted — there is nothing to check it against.
+fn steerable(id: &str, record: &AgentiflowRecord) -> ApiResult<()> {
+    if record.status != "running" {
+        return Err(ApiError::conflict(format!(
+            "agentiflow `{id}` is not running ({}) — it cannot take a steering message",
+            record.status
+        )));
+    }
+    if runner_alive(record) == Some(false) {
+        return Err(ApiError::conflict(format!(
+            "agentiflow `{id}`'s coordinator (pid {}) is no longer running — nothing \
+             would read a steering message; the run will be reaped as interrupted",
+            record.runner_pid.unwrap_or_default()
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -722,22 +750,20 @@ async fn steer_agentiflow(
     if body.is_empty() {
         return Err(ApiError::bad_request("steering message is empty"));
     }
+    crate::api::config::require_writable_to(&s, "steering an agentiflow")?;
     let run_dir = agentiflow_dir(&s.global_dir).join(&id);
-    if !run_dir.is_dir() {
-        return Err(ApiError::not_found(format!("no agentiflow run `{id}`")));
-    }
-    // The lead only drains steering while the run is active — refuse otherwise
-    // rather than silently queue a message nothing will ever read.
-    let status = std::fs::read_to_string(run_dir.join("agentiflow.json"))
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .and_then(|v| v.get("status").and_then(|st| st.as_str()).map(String::from));
-    if status.as_deref() != Some("running") {
-        return Err(ApiError::conflict(format!(
-            "agentiflow `{id}` is not running ({}) — it cannot take a steering message",
-            status.as_deref().unwrap_or("unknown"),
-        )));
-    }
+    let record = match AgentiflowRecord::read(&run_dir) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ApiError::not_found(format!("no agentiflow run `{id}`")))
+        }
+        Err(e) => {
+            return Err(ApiError::internal(format!(
+                "agentiflow {id}: agentiflow.json is unreadable: {e}"
+            )))
+        }
+    };
+    steerable(&id, &record)?;
     let msg = OperatorMessage {
         ts: Utc::now().to_rfc3339(),
         body,

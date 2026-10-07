@@ -224,6 +224,39 @@ async fn delete_local_host_returns_400() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+/// `DELETE /api/hosts/:id` for an id that was never registered → 404 (was 500).
+#[tokio::test]
+async fn delete_unknown_host_returns_404() {
+    let tmp = tempfile::tempdir().unwrap();
+    let addr = spawn_server_serve(tmp.path()).await;
+    let resp = reqwest::Client::new()
+        .delete(format!("http://{addr}/api/hosts/no-such-host"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert!(v["error"].as_str().unwrap().contains("no-such-host"));
+}
+
+/// An unreadable host record (corrupt, or a newer schema) never shows in the
+/// list, so `DELETE` is the only way to remove it: it must still work.
+#[tokio::test]
+async fn delete_an_unreadable_host_record_still_removes_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hosts = tmp.path().join("hosts");
+    std::fs::create_dir_all(&hosts).unwrap();
+    std::fs::write(hosts.join("broken.toml"), "this is = = not toml").unwrap();
+    let addr = spawn_server_serve(tmp.path()).await;
+    let resp = reqwest::Client::new()
+        .delete(format!("http://{addr}/api/hosts/broken"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(!hosts.join("broken.toml").exists());
+}
+
 /// `DELETE /api/hosts/:id` for an added host → 204; host gone from list after.
 #[tokio::test]
 async fn delete_added_host_returns_204_and_removes_it() {

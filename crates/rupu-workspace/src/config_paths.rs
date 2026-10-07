@@ -142,20 +142,34 @@ pub fn is_safe_definition_name(name: &str) -> bool {
     !name.is_empty() && !name.contains(['/', '\\', '\0']) && !name.contains("..")
 }
 
+/// Workflow definition file extensions, in preference order: in one
+/// directory `<name>.yaml` wins over `<name>.yml`. Held in lockstep with
+/// `rupu_orchestrator::catalog::WORKFLOW_EXTENSIONS` (the two crates don't
+/// depend on each other).
+pub const WORKFLOW_EXTENSIONS: [&str; 2] = ["yaml", "yml"];
+
+/// `<dir>/<name>.yaml`, else `<dir>/<name>.yml` — whichever is a file.
+pub fn workflow_file(dir: &Path, name: &str) -> Option<PathBuf> {
+    WORKFLOW_EXTENSIONS
+        .iter()
+        .map(|ext| dir.join(format!("{name}.{ext}")))
+        .find(|p| p.is_file())
+}
+
 /// The workflow file `name` resolves to from a project: the project's
-/// `.rupu/workflows/<name>.yaml` first, then `<global>/workflows/<name>.yaml`
-/// — `rupu workflow run`'s lookup, shared by the CLI and the CP's launch
-/// preview so the two can never find different files. `None` when neither
-/// exists, and for a name that is not [`is_safe_definition_name`] (it could
-/// only resolve outside the workflow directories).
+/// `.rupu/workflows/<name>.yaml` (else `.yml`) first, then
+/// `<global>/workflows/<name>.yaml` (else `.yml`) — `rupu workflow run`'s
+/// lookup, shared by the CLI and the CP (launch preview, definition reads,
+/// autoflow toggles) so they can never find different files. `None` when
+/// none exists, and for a name that is not [`is_safe_definition_name`] (it
+/// could only resolve outside the workflow directories).
 pub fn locate_workflow(global: &Path, project_root: Option<&Path>, name: &str) -> Option<PathBuf> {
     if !is_safe_definition_name(name) {
         return None;
     }
-    let file = format!("{name}.yaml");
     project_root
-        .map(|r| r.join(".rupu").join("workflows").join(&file))
+        .map(|r| r.join(".rupu").join("workflows"))
         .into_iter()
-        .chain(std::iter::once(global.join("workflows").join(&file)))
-        .find(|p| p.is_file())
+        .chain(std::iter::once(global.join("workflows")))
+        .find_map(|dir| workflow_file(&dir, name))
 }

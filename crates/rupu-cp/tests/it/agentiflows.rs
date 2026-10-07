@@ -34,7 +34,28 @@ round: { lead_max_turns: 40, ceiling: { rounds: 6 } }
 "#;
 
 async fn spawn_server(dir: &Path) -> SocketAddr {
-    let state = rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
+    spawn_server_with(dir, false).await
+}
+
+/// Any launcher: the CP's "this is `cp serve`" signal, which steering needs.
+struct NoopLauncher;
+
+#[async_trait::async_trait]
+impl rupu_cp::launcher::RunLauncher for NoopLauncher {
+    async fn launch(
+        &self,
+        _req: rupu_cp::launcher::LaunchRequest,
+    ) -> Result<String, rupu_cp::launcher::LaunchError> {
+        Ok("run_unused".into())
+    }
+}
+
+async fn spawn_server_with(dir: &Path, writable: bool) -> SocketAddr {
+    let mut state =
+        rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
+    if writable {
+        state = state.with_launcher(Some(std::sync::Arc::new(NoopLauncher)));
+    }
     let app = rupu_cp::server::router(state, None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -304,4 +325,69 @@ async fn detail_404s_an_unknown_or_unsafe_id() {
     // guard refuses it (`rupu_cp::path_guard`).
     let (status, _) = get(addr, "/api/agentiflows/af_..%2Fx").await;
     assert_eq!(status, 400);
+}
+
+/// A pid that existed and is gone: a child that ran to completion and was
+/// reaped.
+fn dead_pid() -> u32 {
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    pid
+}
+
+async fn steer(addr: SocketAddr, id: &str) -> (u16, Value) {
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/agentiflows/{id}/steer"))
+        .json(&json!({ "message": "focus on auth" }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn steer_needs_a_live_coordinator_and_cp_serve() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = agentiflow_dir(tmp.path());
+    let live = root.join(LIVE);
+    let mut rec = record(LIVE, "2026-10-07T00:00:00Z", "running");
+    rec.runner_pid = Some(std::process::id());
+    rec.write(&live).unwrap();
+
+    // A read-only CP (no `cp serve` runtime) refuses the write.
+    let ro = spawn_server_with(tmp.path(), false).await;
+    assert_eq!(steer(ro, LIVE).await.0, 501);
+
+    let addr = spawn_server_with(tmp.path(), true).await;
+    let (status, body) = steer(addr, LIVE).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["queued"], true);
+    assert_eq!(
+        rupu_agentiflow::OperatorQueue::new(&live)
+            .drain()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // `running` on disk but the coordinator is dead: nothing would drain it.
+    rec.runner_pid = Some(dead_pid());
+    rec.write(&live).unwrap();
+    let (status, body) = steer(addr, LIVE).await;
+    assert_eq!(status, 409, "{body}");
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("no longer running"));
+    assert!(rupu_agentiflow::OperatorQueue::new(&live)
+        .drain()
+        .unwrap()
+        .is_empty());
+
+    // Finished, or unknown.
+    seed(tmp.path());
+    assert_eq!(steer(addr, DONE).await.0, 409);
+    assert_eq!(steer(addr, "af_missing").await.0, 404);
 }

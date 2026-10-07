@@ -48,7 +48,7 @@ pub use lead::{
     ProviderFactory, RunAgentLeadDriver,
 };
 pub use operator::{OperatorMessage, OperatorQueue};
-pub use proc::{kill_group, pid_is_running, terminate_group, terminate_pid};
+pub use proc::{coordinator_alive, kill_group, pid_is_running, terminate_group, terminate_pid};
 pub use reaper::{
     finalize_failed, hard_stop, hard_stop_with, reap_orphaned_agentiflows,
     reap_orphaned_agentiflows_with, HardStopGrace, HardStopOutcome, ReapSummary,

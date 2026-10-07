@@ -100,13 +100,7 @@ pub(crate) fn scan_autoflow_defs(
 
     let mut rows: Vec<AutoflowDefRow> = entries
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .and_then(|s| s.to_str())
-                .map(|ext| ext == "yaml" || ext == "yml")
-                .unwrap_or(false)
-        })
+        .filter(|e| rupu_orchestrator::catalog::is_listed_workflow_file(&e.path()))
         .filter_map(|e| {
             let path = e.path();
             let slug = path

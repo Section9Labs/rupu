@@ -86,10 +86,7 @@ async fn events_stream(
             HostConnectorError::NotFound(_) => {
                 ApiError::not_found(format!("run {id} not found on {host_id}"))
             }
-            HostConnectorError::Unreachable(m) => {
-                ApiError::internal(format!("host {host_id} unreachable: {m}"))
-            }
-            other => ApiError::internal(other.to_string()),
+            other => crate::api::runs::host_read_error(host_id, other),
         })?;
         return proxy_event_byte_stream(stream);
     }

@@ -114,8 +114,7 @@ pub(crate) fn resolve_workflow_scoped(
         let proj_dir = std::path::Path::new(&r.workspace.path)
             .join(".rupu")
             .join("workflows");
-        let candidate = proj_dir.join(format!("{name}.yaml"));
-        if candidate.exists() {
+        if let Some(candidate) = definition_file(&proj_dir, name) {
             return Some((
                 candidate,
                 proj_dir,
@@ -126,11 +125,17 @@ pub(crate) fn resolve_workflow_scoped(
         }
     }
     let dir = workflows_dir(s);
-    let global = dir.join(format!("{name}.yaml"));
-    if global.exists() {
-        return Some((global, dir, "global".to_string(), ScopeKind::Global, None));
-    }
-    None
+    let global = definition_file(&dir, name)?;
+    Some((global, dir, "global".to_string(), ScopeKind::Global, None))
+}
+
+/// `<dir>/<name>.yaml`, else `<dir>/<name>.yml`: the one rule every workflow
+/// lookup follows (`rupu_workspace::workflow_file` — `rupu workflow run`,
+/// the launch preview and the orchestrator catalog agree), so a definition
+/// listed under either extension resolves for its detail, edit, toggle and
+/// launch routes alike.
+pub(crate) fn definition_file(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    rupu_workspace::config_paths::workflow_file(dir, name)
 }
 
 /// Path-only convenience wrapper over [`resolve_workflow_scoped`], for
@@ -179,12 +184,8 @@ pub(crate) fn resolve_workflow_scoped_explicit(
     match scope_kind {
         ScopeKind::Global => {
             let dir = workflows_dir(s);
-            let global = dir.join(format!("{name}.yaml"));
-            if global.exists() {
-                Some((global, dir, "global".to_string(), ScopeKind::Global))
-            } else {
-                None
-            }
+            let global = definition_file(&dir, name)?;
+            Some((global, dir, "global".to_string(), ScopeKind::Global))
         }
         ScopeKind::Project => {
             let scope_id = scope_id?;
@@ -193,12 +194,8 @@ pub(crate) fn resolve_workflow_scoped_explicit(
             let proj_dir = std::path::Path::new(&w.path)
                 .join(".rupu")
                 .join("workflows");
-            let candidate = proj_dir.join(format!("{name}.yaml"));
-            if candidate.exists() {
-                Some((candidate, proj_dir, scope_name(&w), ScopeKind::Project))
-            } else {
-                None
-            }
+            let candidate = definition_file(&proj_dir, name)?;
+            Some((candidate, proj_dir, scope_name(&w), ScopeKind::Project))
         }
     }
 }
@@ -289,7 +286,7 @@ pub(crate) fn scan_workflow_names(
     };
     let mut rows: Vec<WorkflowDto> = entries
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("yaml"))
+        .filter(|e| rupu_orchestrator::catalog::is_listed_workflow_file(&e.path()))
         .filter_map(|e| {
             let path = e.path();
             let name = path.file_stem().and_then(|s| s.to_str())?.to_string();

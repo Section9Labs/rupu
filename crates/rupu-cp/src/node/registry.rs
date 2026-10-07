@@ -71,6 +71,9 @@ pub struct NodeConn {
     /// In-flight artifact pulls on this connection, by request id: where
     /// the read pump delivers each `ArtifactChunk` / `ArtifactPullDone`.
     pulls: Mutex<HashMap<String, tokio::sync::mpsc::Sender<PullMsg>>>,
+    /// Signalled by [`NodeRegistry::disconnect`]: the tunnel's pumps stop
+    /// and the socket closes (the host was removed).
+    kick: tokio::sync::Notify,
 }
 
 impl NodeConn {
@@ -83,7 +86,14 @@ impl NodeConn {
             capabilities,
             rupu_version,
             pulls: Mutex::new(HashMap::new()),
+            kick: tokio::sync::Notify::new(),
         }
+    }
+
+    /// Resolves once this connection has been told to close
+    /// ([`NodeRegistry::disconnect`]). The tunnel handler selects on it.
+    pub async fn kicked(&self) {
+        self.kick.notified().await
     }
 
     /// Whether the node advertised `capability` (e.g.
@@ -195,8 +205,13 @@ impl NodeRegistry {
     ) -> Arc<NodeConn> {
         let conn = Arc::new(NodeConn::new(tx, capabilities, rupu_version));
         let mut map = self.conns.lock().expect("NodeRegistry lock poisoned");
-        // The old Arc is dropped here, closing the sender side of the old channel.
-        map.insert(node_id.to_owned(), Arc::clone(&conn));
+        // The old connection is replaced: kick it so its handler stops its
+        // pumps and closes its socket now. Its handler holds its own `Arc`,
+        // so dropping ours alone would leave a half-open old tunnel serving
+        // (and mirroring) until its socket happened to fail.
+        if let Some(old) = map.insert(node_id.to_owned(), Arc::clone(&conn)) {
+            old.kick.notify_one();
+        }
         conn
     }
 
@@ -216,6 +231,28 @@ impl NodeRegistry {
             if Arc::ptr_eq(current, only_if) {
                 map.remove(node_id);
             }
+        }
+    }
+
+    /// Drop `node_id`'s live connection, if any, and close its tunnel: its
+    /// handler stops both pumps and the socket goes away. Used when the host
+    /// is removed, so a node that is no longer registered stops serving.
+    /// Its reconnect then fails `Hello` verification. Returns whether a
+    /// connection was live.
+    pub fn disconnect(&self, node_id: &str) -> bool {
+        let conn = self
+            .conns
+            .lock()
+            .expect("NodeRegistry lock poisoned")
+            .remove(node_id);
+        match conn {
+            Some(c) => {
+                // `notify_one` stores a permit, so a handler not yet parked
+                // on `kicked()` still sees it.
+                c.kick.notify_one();
+                true
+            }
+            None => false,
         }
     }
 
@@ -353,6 +390,27 @@ mod tests {
         drop(rx);
         let result = conn.send(Frame::Ping {}).await;
         assert!(matches!(result, Err(NodeError::Offline)));
+    }
+
+    /// A reconnect replaces the old connection AND kicks it, so the old
+    /// handler closes its socket rather than serving on half-open.
+    #[tokio::test]
+    async fn a_replaced_connection_is_kicked() {
+        let reg = NodeRegistry::new();
+        let (tx1, _rx1) = mpsc::channel::<Frame>(8);
+        let old = reg.register("n", tx1);
+        let (tx2, _rx2) = mpsc::channel::<Frame>(8);
+        let new = reg.register("n", tx2);
+        tokio::time::timeout(std::time::Duration::from_secs(1), old.kicked())
+            .await
+            .expect("the replaced connection must be kicked");
+        assert!(Arc::ptr_eq(&reg.get("n").unwrap(), &new));
+        // …and `disconnect` kicks the current one.
+        assert!(reg.disconnect("n"));
+        tokio::time::timeout(std::time::Duration::from_secs(1), new.kicked())
+            .await
+            .expect("disconnect must kick the live connection");
+        assert!(!reg.is_online("n"));
     }
 
     fn bare_conn() -> NodeConn {
