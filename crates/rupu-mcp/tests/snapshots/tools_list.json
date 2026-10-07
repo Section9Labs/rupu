@@ -767,9 +767,33 @@
     "name": "gitlab.pipeline_trigger"
   },
   {
-    "description": "Record a security finding in this project's findings ledger, so it appears in the control plane rather than only in an external tracker. Use the narrowest scope the evidence supports. Under the full findings profile (the step's `findings_profile`, else the workflow default, else full) send `report` (a complete finding report) and omit summary/severity/rationale; under the summary profile send summary, severity and rationale.",
+    "description": "Record a security finding in this project's findings ledger, so it appears in the control plane rather than only in an external tracker. Use the narrowest scope the evidence supports. Under the full findings profile (the step's `findings_profile`, else the workflow default, else full) send `report` (a complete finding report) and omit summary/severity/rationale; under the summary profile send summary, severity and rationale. Under an active engagement profile, name the `asset` the finding is about: its kind routes the finding to the owning profile, whose completeness checks it must pass.",
     "inputSchema": {
       "properties": {
+        "asset": {
+          "description": "The engagement asset this finding is about (only under an active engagement profile). Its `kind` routes the finding to the owning profile for completeness validation and stamps it into the asset graph. Omit on a plain code run.",
+          "properties": {
+            "coordinates": {
+              "description": "Locator coordinates pinning the asset, each {\"t\": <tag>, \"v\": <value>}. Tags: host, port, url, path, line_range, symbol, sha256, address, offset, commit, http_route, param, resource_id.",
+              "items": {
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "kind": {
+              "description": "Profile-namespaced asset kind, e.g. \"network:service\", \"binary:function\", \"web:route\".",
+              "type": "string"
+            },
+            "label": {
+              "description": "Optional human label; if omitted, the asset keeps its existing label (a new asset is labelled with its kind).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
         "code_excerpt": {
           "description": "Relevant excerpt, if any. Summary profile only.",
           "type": "string"

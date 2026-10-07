@@ -18,7 +18,7 @@ pub mod tools;
 pub mod cwe_gen;
 
 pub use tools::{
-    asset_mark, coverage_concerns_detail, coverage_concerns_search, coverage_mark,
+    asset_mark, asset_schema_property, coverage_concerns_detail, coverage_concerns_search, coverage_mark,
     coverage_remaining, coverage_status, report_finding, AssetMarkError, AssetMarkInput,
     AssetMarkOutput, AssetRef, CoverageConcernsDetailInput, CoverageConcernsDetailOutput,
     CoverageConcernsSearchInput, CoverageMarkError, CoverageMarkInput, CoverageMarkOutput,

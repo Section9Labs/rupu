@@ -88,6 +88,7 @@ pub fn specs() -> Vec<ToolSpec> {
     // the report schema is attached after construction.
     input_schema["properties"]["report"] = rupu_coverage::report::schema::advertised_schema();
     input_schema["properties"]["tags"] = rupu_coverage::tags_schema_property();
+    input_schema["properties"]["asset"] = rupu_coverage::asset_schema_property();
     vec![
         ToolSpec {
             name: "findings.record",
@@ -98,7 +99,9 @@ pub fn specs() -> Vec<ToolSpec> {
                       (the step's `findings_profile`, else the workflow default, else full) \
                       send `report` (a complete finding report) and omit \
                       summary/severity/rationale; under the summary profile send summary, \
-                      severity and rationale.",
+                      severity and rationale. Under an active engagement profile, name the \
+                      `asset` the finding is about: its kind routes the finding to the owning \
+                      profile, whose completeness checks it must pass.",
             input_schema,
             kind: ToolKind::Write,
         },
@@ -192,6 +195,11 @@ pub struct RecordArgs {
     pub concern_id: Option<String>,
     #[serde(default)]
     pub report: Option<rupu_coverage::FindingReport>,
+    /// The engagement asset this finding is about. Routed, completeness-gated
+    /// and stamped exactly as `report_finding` does it under the run's active
+    /// engagement; ignored on the native code path.
+    #[serde(default)]
+    pub asset: Option<rupu_coverage::AssetRef>,
 }
 
 /// Write the finding. Returns the new finding id.
@@ -236,9 +244,7 @@ pub fn dispatch_record(ctx: &FindingsContext, args: RecordArgs) -> Result<String
         concern_id: args.concern_id,
         evidence,
         report: args.report,
-        // Engagement asset arg is wired through the MCP tool in the selection
-        // step; until then findings.record uses the native code path.
-        asset: None,
+        asset: args.asset,
         tags: args.tags,
     };
     // Locator, profile and report validation live in `report_finding` so both

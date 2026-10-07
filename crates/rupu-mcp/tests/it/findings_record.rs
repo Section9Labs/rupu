@@ -421,3 +421,135 @@ async fn record_accepts_declared_tags() {
     let tags: Vec<&str> = rec.tags.iter().map(|t| t.as_str()).collect();
     assert_eq!(tags, ["class:authz", "needs-poc"]);
 }
+
+fn network_ctx(workspace: &std::path::Path) -> FindingsContext {
+    let mut ctx = ctx_with(workspace, rupu_coverage::FindingProfile::Full);
+    ctx.options.engagement = Some(Arc::new(
+        rupu_coverage::builtin_registry()
+            .unwrap()
+            .active_set(&["network".into()])
+            .unwrap(),
+    ));
+    ctx
+}
+
+fn full_report() -> serde_json::Value {
+    serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../rupu-coverage/tests/fixtures/finding_report/valid_full.json"
+    )))
+    .unwrap()
+}
+
+fn service_finding(coordinates: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "scope": "host",
+        "target_ref": "198.51.100.7",
+        "report": full_report(),
+        "asset": { "kind": "network:service", "coordinates": coordinates }
+    })
+}
+
+fn paths_for(workspace: &std::path::Path) -> rupu_coverage::CoveragePaths {
+    rupu_coverage::CoveragePaths::new(
+        workspace,
+        &rupu_coverage::target_id(workspace, "chimera-campaign"),
+    )
+}
+
+#[tokio::test]
+async fn an_engagement_asset_is_routed_and_stamped() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
+        .with_findings(network_ctx(tmp.path()));
+    let out = dispatcher
+        .call(
+            "findings.record",
+            service_finding(serde_json::json!([
+                { "t": "host", "v": "198.51.100.7" },
+                { "t": "port", "v": { "number": 8443, "proto": "tcp" } }
+            ])),
+        )
+        .await
+        .expect("a complete network finding records");
+    assert!(out.starts_with("finding_id: fnd_"), "got {out}");
+
+    let paths = paths_for(tmp.path());
+    assert_eq!(rupu_coverage::read_findings(&paths).unwrap().len(), 1);
+    let assets = rupu_coverage::read_assets(&paths.assets).unwrap();
+    assert_eq!(assets.len(), 1, "the asset must be stamped: {assets:?}");
+    assert_eq!(assets[0].kind, "network:service");
+}
+
+#[tokio::test]
+async fn an_engagement_asset_must_pass_its_profiles_completeness() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
+        .with_findings(network_ctx(tmp.path()));
+    // A service pinned to a host but no port fails `service_identified`.
+    let err = dispatcher
+        .call(
+            "findings.record",
+            service_finding(serde_json::json!([{ "t": "host", "v": "198.51.100.7" }])),
+        )
+        .await
+        .expect_err("an incomplete network finding must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("incomplete for engagement profile `network`"),
+        "{msg}"
+    );
+    assert!(msg.contains("host + port"), "{msg}");
+    let paths = paths_for(tmp.path());
+    assert!(!paths.findings.exists(), "a refused finding must not land");
+    assert!(!paths.assets.exists(), "nor its asset");
+}
+
+#[tokio::test]
+async fn an_asset_kind_no_active_profile_owns_is_refused() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
+        .with_findings(network_ctx(tmp.path()));
+    let mut input = service_finding(serde_json::json!([]));
+    input["asset"]["kind"] = serde_json::json!("binary:function");
+    let err = dispatcher
+        .call("findings.record", input)
+        .await
+        .expect_err("an unowned kind must be refused");
+    assert!(
+        err.to_string()
+            .contains("not owned by any active engagement profile (network)"),
+        "{err}"
+    );
+    assert!(!paths_for(tmp.path()).findings.exists());
+}
+
+#[tokio::test]
+async fn without_an_engagement_the_asset_is_ignored() {
+    // The native code path, exactly as `report_finding` treats it.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
+        .with_findings(ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full));
+    dispatcher
+        .call(
+            "findings.record",
+            service_finding(serde_json::json!([{ "t": "host", "v": "198.51.100.7" }])),
+        )
+        .await
+        .expect("records on the code path");
+    let paths = paths_for(tmp.path());
+    assert_eq!(rupu_coverage::read_findings(&paths).unwrap().len(), 1);
+    assert!(!paths.assets.exists(), "no engagement, no asset graph");
+}
+
+#[tokio::test]
+async fn the_record_schema_advertises_the_asset() {
+    let spec = rupu_mcp::tools::findings::specs()
+        .into_iter()
+        .find(|s| s.name == "findings.record")
+        .unwrap();
+    assert_eq!(
+        spec.input_schema["properties"]["asset"],
+        rupu_coverage::asset_schema_property()
+    );
+}
