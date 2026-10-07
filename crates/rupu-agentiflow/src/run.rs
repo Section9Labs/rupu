@@ -851,6 +851,9 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 usage_ledger: Some(rupu_orchestrator::usage_ledger::UsageLedger::open(
                     lead_usage,
                 )),
+                // `rupu agentiflow send --now` interrupts through the same
+                // queue the envelope drains at each round boundary.
+                steering_queue: Some(OperatorQueue::new(&run_dir)),
             };
             let driver = match RunAgentLeadDriver::new(lead_cfg, make_provider) {
                 Ok(d) => d,

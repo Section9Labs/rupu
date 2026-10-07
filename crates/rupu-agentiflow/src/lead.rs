@@ -12,18 +12,22 @@
 //! instructions" heading).
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use rupu_agent::{run_agent_full, AgentRunOpts, BypassDecider, RunError, RunExit};
 use rupu_orchestrator::usage_ledger::{LedgerTag, UsageLedger};
 use rupu_providers::model_limits::ModelLimits;
 use rupu_providers::types::Message;
 use rupu_providers::LlmProvider;
+use tokio_util::sync::CancellationToken;
 
 use crate::budget::BudgetStage;
 use crate::def::Goal;
 use crate::envelope::{LeadDriver, RoundContext, RoundOutcome};
 use crate::goal::GoalOutcome;
+use crate::operator::OperatorQueue;
 
 /// Longest a single warning is allowed to run once quoted. Warnings are
 /// diagnostics; a runaway one should not crowd out the digest.
@@ -299,6 +303,13 @@ pub struct LeadConfig {
     /// units' ledgers. `None` meters nothing (the lead's spend never reaches
     /// `budget.usd` / `budget.tokens`).
     pub usage_ledger: Option<UsageLedger>,
+    /// The operator steering queue to watch for `send --now` interrupts. When
+    /// `Some`, [`RunAgentLeadDriver::new`] starts a watcher thread that cuts a
+    /// round short (through the runner's pause token) as soon as a message with
+    /// `interrupt: true` is queued -- the message itself stays queued, for the
+    /// envelope's boundary drain to deliver. `None` runs every round to
+    /// completion, however the queue fills.
+    pub steering_queue: Option<OperatorQueue>,
 }
 
 /// The `run_agent`-backed lead: each [`LeadDriver::run_round`] is one
@@ -321,6 +332,18 @@ pub struct LeadConfig {
 /// [`LeadConfig::collectors`] feed the lead's inbox and standing directives
 /// into each turn. No parent run, depth 0 -- the same shape as a session
 /// turn's `AgentRunOpts` minus the CLI-only plumbing.
+///
+/// ## Interrupts (`send --now`)
+///
+/// Every round runs under a fresh [`CancellationToken`] handed to the runner as
+/// its `pause` token, and published in a slot the interrupt watcher reads (see
+/// [`InterruptWatcher`]). A never-cancelled token behaves exactly like no
+/// token, so a flow nobody interrupts runs as it always did. When the watcher
+/// sees a queued `interrupt: true` message it cancels the running round's
+/// token; the runner stops at its next safe boundary (a provider call is
+/// abandoned with its partial reply dropped; a running tool finishes first) and
+/// the round ends as a normal [`RoundOutcome::Yielded`]. The envelope's next
+/// `assess()` then drains and delivers the message like any other steering.
 pub struct RunAgentLeadDriver {
     cfg: LeadConfig,
     make_provider: ProviderFactory,
@@ -328,6 +351,11 @@ pub struct RunAgentLeadDriver {
     history: Vec<Message>,
     total_turns: u32,
     limits: ModelLimits,
+    /// The running round's pause token (`None` between rounds), shared with
+    /// the watcher.
+    round_token: RoundToken,
+    /// Joined when the driver drops. Never read: it exists for its `Drop`.
+    _watcher: Option<InterruptWatcher>,
 }
 
 impl RunAgentLeadDriver {
@@ -345,6 +373,13 @@ impl RunAgentLeadDriver {
             .enable_all()
             .build()?;
         let limits = cfg.limits.clone();
+        let round_token = RoundToken::default();
+        // Last, so a failure above never leaves a thread behind.
+        let watcher = cfg
+            .steering_queue
+            .clone()
+            .map(|queue| InterruptWatcher::spawn(queue, round_token.clone(), INTERRUPT_POLL))
+            .transpose()?;
         Ok(Self {
             cfg,
             make_provider,
@@ -352,7 +387,116 @@ impl RunAgentLeadDriver {
             history: Vec::new(),
             total_turns: 0,
             limits,
+            round_token,
+            _watcher: watcher,
         })
+    }
+}
+
+/// How often the interrupt watcher looks at the steering queue: a `send --now`
+/// takes effect within about this long.
+const INTERRUPT_POLL: Duration = Duration::from_millis(200);
+
+/// The running round's pause token, or `None` between rounds.
+type RoundToken = Arc<Mutex<Option<CancellationToken>>>;
+
+/// The slot's lock. A poisoned lock is still a usable slot (it only ever holds
+/// an `Option` swapped whole), so a panic elsewhere never wedges the lead.
+fn lock_slot(slot: &RoundToken) -> MutexGuard<'_, Option<CancellationToken>> {
+    slot.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Clears the round-token slot when a round ends, however it ends (including
+/// by unwinding out of `block_on`), so the watcher never cancels a token whose
+/// round is over.
+struct ArmedRound(RoundToken);
+
+impl ArmedRound {
+    fn arm(slot: &RoundToken, token: &CancellationToken) -> Self {
+        *lock_slot(slot) = Some(token.clone());
+        Self(Arc::clone(slot))
+    }
+}
+
+impl Drop for ArmedRound {
+    fn drop(&mut self) {
+        *lock_slot(&self.0) = None;
+    }
+}
+
+/// The thread that turns a queued `send --now` into a cancelled round.
+///
+/// A plain `std::thread`, not a task on the lead's runtime: that runtime is
+/// current-thread and sits inside `block_on` for the whole round, so nothing
+/// scheduled on it could run while the lead is mid-generation -- which is
+/// exactly when the cancel has to fire. Cancelling a [`CancellationToken`] is
+/// thread-safe and wakes the runner's `select!` from any thread.
+///
+/// Every `poll` it reads the slot FIRST and only then peeks the queue
+/// ([`OperatorQueue::peek_interrupt`], which removes nothing). That order is
+/// the correctness argument. The envelope drains steering in `assess()`, BEFORE
+/// a round's token is published; so a message the watcher can see after it has
+/// read round N's token is one that arrived after round N's boundary drain,
+/// i.e. one round N has not been told about. A message the previous boundary
+/// already delivered is gone from the queue and can never cancel the next
+/// round. (Peek-then-read-slot would let a stale "an interrupt is queued"
+/// answer, taken just before a boundary, cancel the following round.)
+///
+/// An interrupt that arrives between rounds finds an empty slot, cancels
+/// nothing, and is delivered at the next boundary like any other message.
+///
+/// Dropping the watcher stops and JOINS the thread; the join is prompt because
+/// the thread waits on a channel, not on a sleep.
+struct InterruptWatcher {
+    /// Dropping this wakes the thread, which then exits.
+    stop: Option<mpsc::Sender<()>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl InterruptWatcher {
+    fn spawn(queue: OperatorQueue, slot: RoundToken, poll: Duration) -> std::io::Result<Self> {
+        let (stop, stop_rx) = mpsc::channel::<()>();
+        let handle = std::thread::Builder::new()
+            .name("agentiflow-interrupt-watcher".into())
+            .spawn(move || watch_for_interrupts(&queue, &slot, &stop_rx, poll))?;
+        Ok(Self {
+            stop: Some(stop),
+            handle: Some(handle),
+        })
+    }
+}
+
+impl Drop for InterruptWatcher {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        if let Some(handle) = self.handle.take() {
+            if handle.join().is_err() {
+                tracing::warn!("the agentiflow interrupt watcher panicked");
+            }
+        }
+    }
+}
+
+fn watch_for_interrupts(
+    queue: &OperatorQueue,
+    slot: &RoundToken,
+    stop: &mpsc::Receiver<()>,
+    poll: Duration,
+) {
+    loop {
+        match stop.recv_timeout(poll) {
+            Err(RecvTimeoutError::Timeout) => {}
+            // The driver is gone (or told us to stop).
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
+        }
+        // Slot first, THEN the queue (see the type's docs for why).
+        let Some(token) = lock_slot(slot).clone() else {
+            continue;
+        };
+        if !token.is_cancelled() && queue.peek_interrupt() {
+            tracing::info!("agentiflow operator interrupt: cutting the lead's round short");
+            token.cancel();
+        }
     }
 }
 
@@ -379,6 +523,9 @@ impl LeadDriver for RunAgentLeadDriver {
                 None,
             )
         });
+        // This round's pause token. Never cancelled unless the watcher sees an
+        // `interrupt: true` steering message while the round runs.
+        let pause = CancellationToken::new();
         let opts = AgentRunOpts {
             codename: None,
             agent_name: self.cfg.agent_name.clone(),
@@ -430,7 +577,7 @@ impl LeadDriver for RunAgentLeadDriver {
             limits: self.limits.clone(),
             scope_name: self.cfg.scope_name.clone(),
             surface_tag: None,
-            pause: None,
+            pause: Some(pause.clone()),
             seed_source: None,
             collectors: self.cfg.collectors.clone(),
             extra_tools: self.cfg.extra_tools.clone(),
@@ -441,7 +588,12 @@ impl LeadDriver for RunAgentLeadDriver {
             result,
             final_limits,
             messages,
-        } = self.rt.block_on(run_agent_full(opts));
+        } = {
+            // Armed only for the run itself: the slot is cleared again before
+            // the result is looked at, and on unwind.
+            let _armed = ArmedRound::arm(&self.round_token, &pause);
+            self.rt.block_on(run_agent_full(opts))
+        };
         self.limits = ModelLimits {
             note: None,
             ..final_limits
@@ -449,7 +601,19 @@ impl LeadDriver for RunAgentLeadDriver {
 
         match result {
             Ok(run) => {
-                let outcome = if run.error.as_deref()
+                let outcome = if run.paused {
+                    // An operator interrupt (`send --now`) cut the round short.
+                    // The runner stopped at a safe boundary and `run` holds the
+                    // conversation up to it, so this is an ordinary round end:
+                    // the envelope's next `assess()` drains the message and
+                    // hands it to the lead, which carries on from here.
+                    tracing::info!(
+                        round = ctx.round,
+                        turns = run.turns,
+                        "agentiflow lead round cut short by an operator interrupt"
+                    );
+                    RoundOutcome::Yielded
+                } else if run.error.as_deref()
                     == Some(RunError::MaxTurns { max: ceiling }.to_string().as_str())
                 {
                     RoundOutcome::TurnBudgetHit
@@ -698,6 +862,7 @@ mod tests {
             extra_tools: Vec::new(),
             collectors: Vec::new(),
             usage_ledger: None,
+            steering_queue: None,
         }
     }
 
@@ -908,6 +1073,375 @@ mod tests {
         assert_eq!(
             round_transcript_path(std::path::Path::new("/x/lead"), 0),
             std::path::PathBuf::from("/x/lead.r0")
+        );
+    }
+
+    // ---- interrupts (`send --now`) -----------------------------------------
+
+    use crate::budget::{Budget, UsageSource};
+    use crate::envelope::{Envelope, EnvelopeConfig};
+    use crate::operator::OperatorQueue;
+    use rupu_providers::types::{LlmRequest, LlmResponse, Role, Stop, StreamEvent, Usage};
+    use rupu_providers::{ProviderError, ProviderId};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
+
+    /// A provider whose reply takes `delay` to arrive. `started` flips when
+    /// generation begins, so a test can act "mid-round".
+    struct GatedProvider {
+        delay: Duration,
+        started: Arc<AtomicBool>,
+    }
+
+    impl GatedProvider {
+        async fn reply(&self) -> Result<LlmResponse, ProviderError> {
+            self.started.store(true, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            Ok(LlmResponse {
+                id: "gated".into(),
+                model: "mock-1".into(),
+                content: vec![ContentBlock::Text {
+                    text: "the full answer".into(),
+                }],
+                stop: Stop::synthetic(rupu_agent::StopReason::EndTurn, "mock"),
+                usage: Usage::default(),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for GatedProvider {
+        async fn send(&mut self, _r: &LlmRequest) -> Result<LlmResponse, ProviderError> {
+            self.reply().await
+        }
+        async fn stream(
+            &mut self,
+            _r: &LlmRequest,
+            _on_event: &mut (dyn FnMut(StreamEvent) + Send),
+        ) -> Result<LlmResponse, ProviderError> {
+            self.reply().await
+        }
+        fn default_model(&self) -> &str {
+            "mock-1"
+        }
+        fn provider_id(&self) -> ProviderId {
+            ProviderId::Anthropic
+        }
+    }
+
+    fn gated(delay: Duration) -> (Box<dyn LlmProvider>, Arc<AtomicBool>) {
+        let started = Arc::new(AtomicBool::new(false));
+        let p = GatedProvider {
+            delay,
+            started: started.clone(),
+        };
+        (Box::new(p), started)
+    }
+
+    /// A factory handing out the given providers in round order.
+    fn provider_sequence(providers: Vec<Box<dyn LlmProvider>>) -> ProviderFactory {
+        let mut it = providers.into_iter();
+        Box::new(move || it.next().expect("a provider for this round"))
+    }
+
+    /// Enqueue `msg` once `started` flips: a message arriving MID-round, from
+    /// another thread, the way `rupu agentiflow send --now` would.
+    fn enqueue_when_started(
+        started: Arc<AtomicBool>,
+        queue: OperatorQueue,
+        msg: OperatorMessage,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !started.load(Ordering::SeqCst) {
+                assert!(Instant::now() < deadline, "the round never started");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            queue.enqueue(&msg).unwrap();
+        })
+    }
+
+    fn interrupt_msg(body: &str) -> OperatorMessage {
+        OperatorMessage {
+            ts: "2026-10-06T00:00:00Z".into(),
+            body: body.into(),
+            stop: false,
+            interrupt: true,
+        }
+    }
+
+    fn transcript_events(path: &std::path::Path) -> Vec<rupu_transcript::Event> {
+        std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// The `error` of a transcript's `RunComplete` (`Some("paused")` for a
+    /// round the runner stopped at a pause boundary), and whether the model
+    /// ever committed an assistant message.
+    fn run_end(events: &[rupu_transcript::Event]) -> (Option<String>, bool) {
+        let error = events.iter().find_map(|e| match e {
+            rupu_transcript::Event::RunComplete { error, .. } => Some(error.clone()),
+            _ => None,
+        });
+        let answered = events
+            .iter()
+            .any(|e| matches!(e, rupu_transcript::Event::AssistantMessage { .. }));
+        (error.expect("a RunComplete event"), answered)
+    }
+
+    fn steering_files(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir.join("steering"))
+            .map(|rd| rd.count())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn an_interrupt_steering_message_cuts_the_round_short_and_stays_queued() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = OperatorQueue::new(dir.path());
+        let mut cfg = lead_cfg(dir.path(), 1);
+        cfg.steering_queue = Some(queue.clone());
+        // Generation would take 30 s; only the interrupt can end the round
+        // in the seconds this test allows.
+        let (provider, started) = gated(Duration::from_secs(30));
+        let mut d = RunAgentLeadDriver::new(cfg, provider_sequence(vec![provider])).unwrap();
+        let sender = enqueue_when_started(
+            started,
+            queue.clone(),
+            interrupt_msg("drop the web leg, look at auth"),
+        );
+
+        let began = Instant::now();
+        let out = d.run_round(&round(0));
+        let took = began.elapsed();
+        sender.join().unwrap();
+
+        // The round ended by cancellation, long before generation finished...
+        assert!(took < Duration::from_secs(15), "round took {took:?}");
+        // ...as an ordinary yield...
+        assert_eq!(out, RoundOutcome::Yielded);
+        // ...with the runner's own record of why: a pause, no committed reply.
+        let events = transcript_events(&dir.path().join("lead.r0.jsonl"));
+        let (error, answered) = run_end(&events);
+        assert_eq!(error.as_deref(), Some("paused"));
+        assert!(!answered, "the abandoned reply must not be committed");
+        // The conversation up to the cut is kept: the round's own prompt.
+        assert_eq!(d.history.len(), 1, "{:?}", d.history);
+        assert_eq!(d.history[0].role, Role::User);
+        // The watcher only OBSERVED the message: it is still queued, for the
+        // envelope's boundary drain to deliver.
+        assert_eq!(steering_files(dir.path()), 1);
+        assert!(queue.peek_interrupt());
+        let delivered = queue.drain().unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].body, "drop the web leg, look at auth");
+        // The slot is cleared again once the round is over.
+        assert!(lock_slot(&d.round_token).is_none());
+    }
+
+    #[test]
+    fn the_envelope_delivers_an_interrupt_at_the_next_boundary_and_the_lead_carries_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = OperatorQueue::new(dir.path());
+        let mut cfg = lead_cfg(dir.path(), 1);
+        cfg.steering_queue = Some(queue.clone());
+        let (blocked, started) = gated(Duration::from_secs(30));
+        let follow_up: Box<dyn LlmProvider> =
+            Box::new(MockProvider::new(vec![text_turn("Pivoting to auth.")]));
+        let mut d =
+            RunAgentLeadDriver::new(cfg, provider_sequence(vec![blocked, follow_up])).unwrap();
+        let sender = enqueue_when_started(
+            started,
+            queue.clone(),
+            interrupt_msg("drop the web leg, look at auth"),
+        );
+
+        let paths = rupu_coverage::CoveragePaths::new(dir.path(), "t");
+        paths.ensure_dir().unwrap();
+        let active = rupu_coverage::builtin_registry()
+            .unwrap()
+            .active_set(&["network".to_string()])
+            .unwrap();
+        let started_at = chrono::Utc::now();
+        let mut envelope = Envelope::new(
+            paths,
+            active,
+            EnvelopeConfig {
+                goals: vec![],
+                coverage: None,
+                ceiling_rounds: Some(2),
+                ceiling_wall_clock: None,
+            },
+            Budget {
+                usd: None,
+                tokens: None,
+                wall_clock: None,
+                rounds: None,
+                soft_at: None,
+            },
+            queue.clone(),
+            started_at,
+        );
+        struct NoSpend;
+        impl UsageSource for NoSpend {
+            fn spent_usd(&self) -> f64 {
+                0.0
+            }
+            fn spent_tokens(&self) -> u64 {
+                0
+            }
+        }
+
+        let began = Instant::now();
+        let out = envelope.run(&mut d, &NoSpend, &chrono::Utc::now);
+        sender.join().unwrap();
+        assert!(began.elapsed() < Duration::from_secs(20));
+        assert_eq!(out.rounds, 2, "{}", out.summary);
+
+        // Round 0 was cut; round 1 ran to its end.
+        let r0 = transcript_events(&dir.path().join("lead.r0.jsonl"));
+        assert_eq!(run_end(&r0), (Some("paused".to_string()), false));
+        let r1 = transcript_events(&dir.path().join("lead.r1.jsonl"));
+        assert_eq!(run_end(&r1), (None, true));
+
+        // The boundary drain delivered the message, authoritatively, in round
+        // 1's prompt -- and consumed it, exactly once.
+        assert_eq!(steering_files(dir.path()), 0);
+        let prompt = text_of(&d.history[0]);
+        assert!(prompt.contains("Operator steering:"), "{prompt}");
+        assert!(
+            prompt.contains("drop the web leg, look at auth"),
+            "{prompt}"
+        );
+        // The cut round left a trailing user turn; round 1's prompt joined it
+        // rather than making two consecutive user messages (providers reject
+        // those).
+        assert!(prompt.contains("lead orchestrator"), "{prompt}");
+        assert!(
+            d.history.windows(2).all(|w| w[0].role != w[1].role),
+            "roles must alternate: {:?}",
+            d.history
+        );
+        assert_eq!(
+            d.history.last().map(text_of).as_deref(),
+            Some("Pivoting to auth.")
+        );
+    }
+
+    #[test]
+    fn a_round_nobody_interrupts_runs_to_completion_with_the_watcher_armed() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = OperatorQueue::new(dir.path());
+        let mut cfg = lead_cfg(dir.path(), 1);
+        cfg.steering_queue = Some(queue.clone());
+        // An ordinary message is queued the whole time: only `interrupt`
+        // cuts a round. 700 ms spans several 200 ms watcher polls.
+        queue
+            .enqueue(&OperatorMessage {
+                ts: "t".into(),
+                body: "focus auth next round".into(),
+                stop: false,
+                interrupt: false,
+            })
+            .unwrap();
+        let (provider, started) = gated(Duration::from_millis(700));
+        let mut d = RunAgentLeadDriver::new(cfg, provider_sequence(vec![provider])).unwrap();
+
+        assert_eq!(d.run_round(&round(0)), RoundOutcome::Yielded);
+        assert!(started.load(Ordering::SeqCst));
+        let events = transcript_events(&dir.path().join("lead.r0.jsonl"));
+        assert_eq!(run_end(&events), (None, true), "the round ran to its end");
+        assert_eq!(d.history.len(), 2);
+        assert_eq!(text_of(&d.history[1]), "the full answer");
+        // And the message is untouched, waiting for the boundary drain.
+        assert_eq!(queue.drain().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_driver_without_a_steering_queue_has_no_watcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = lead_cfg(dir.path(), 1);
+        assert!(cfg.steering_queue.is_none());
+        let d = RunAgentLeadDriver::new(cfg, scripted_factory(vec![])).unwrap();
+        assert!(d._watcher.is_none());
+    }
+
+    #[test]
+    fn dropping_the_driver_stops_and_joins_the_watcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = lead_cfg(dir.path(), 1);
+        cfg.steering_queue = Some(OperatorQueue::new(dir.path()));
+        let d = RunAgentLeadDriver::new(cfg, scripted_factory(vec![])).unwrap();
+        assert!(d._watcher.is_some());
+        let began = Instant::now();
+        drop(d);
+        assert!(began.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn the_watcher_thread_is_gone_when_its_handle_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = RoundToken::default();
+        // A poll far longer than the test: the watcher must be woken by the
+        // drop, not by a timer.
+        let w = InterruptWatcher::spawn(
+            OperatorQueue::new(dir.path()),
+            slot.clone(),
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        // The thread's closure owns a clone of the slot.
+        assert_eq!(Arc::strong_count(&slot), 2);
+        let began = Instant::now();
+        drop(w);
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "drop must not wait out the poll"
+        );
+        // `drop` joined the thread, so its clone is gone: nothing leaked.
+        assert_eq!(Arc::strong_count(&slot), 1);
+    }
+
+    #[test]
+    fn the_watcher_cancels_only_a_running_rounds_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = OperatorQueue::new(dir.path());
+        let slot = RoundToken::default();
+        let _w = InterruptWatcher::spawn(queue.clone(), slot.clone(), Duration::from_millis(10))
+            .unwrap();
+
+        // An interrupt arriving between rounds (no token) is not lost to a
+        // cancel of nothing: it stays queued...
+        queue.enqueue(&interrupt_msg("between rounds")).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(steering_files(dir.path()), 1);
+
+        // ...and a round that starts while it is still queued is cut at once
+        // (it has not been delivered to the lead yet).
+        let token = CancellationToken::new();
+        let armed = ArmedRound::arm(&slot, &token);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !token.is_cancelled() {
+            assert!(
+                Instant::now() < deadline,
+                "the armed round was never cancelled"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(armed);
+        assert!(lock_slot(&slot).is_none());
+
+        // The boundary drain delivers it; the NEXT round is then left alone.
+        assert_eq!(queue.drain().unwrap().len(), 1);
+        let next = CancellationToken::new();
+        let _armed = ArmedRound::arm(&slot, &next);
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            !next.is_cancelled(),
+            "a delivered interrupt must not cut the next round"
         );
     }
 }
