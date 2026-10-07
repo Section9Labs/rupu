@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 fn seed_run(id: &str, status: RunStatus) -> RunRecord {
     RunRecord {
+        customer: None,
         id: id.into(),
         workflow_name: "test-workflow".into(),
         status,

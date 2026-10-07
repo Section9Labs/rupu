@@ -26,6 +26,13 @@ export interface UsageSummary {
    * predates the field, still type-checks.
    */
   partial?: boolean;
+  /**
+   * Set when some contributing work was priced at the GLOBAL rates because
+   * its customer's config layer does not resolve (a malformed
+   * `customers/<slug>/config.toml`) — the cost may be wrong; the message
+   * names the customer. Absent otherwise.
+   */
+  pricing_error?: string;
 }
 
 /**
@@ -53,11 +60,18 @@ export interface UsageBreakdownRow {
   cost_usd: number | null;
   priced: boolean;
   runs: number;
+  /** Client-side only: set by `aggregateRuns` / `buildTimeline` from the
+   *  first contributing run row's `pricing_error` (the server's breakdown rows
+   *  don't carry it) — the row's cost may be wrong. */
+  pricing_error?: string;
 }
 
 export interface UsageOverview {
   summary: UsageSummary;
   breakdown: UsageBreakdownRow[];
+  /** Under a customer filter: hosts some of whose (legacy, mirrored) runs were
+   *  left out because their customer can't be known. Absent when empty. */
+  hosts_without_customer?: string[];
 }
 
 /**
@@ -103,6 +117,8 @@ export interface UsageRunRow {
   total_tokens: number;
   cost_usd: number | null;
   priced: boolean;
+  /** See `UsageSummary.pricing_error`. */
+  pricing_error?: string;
 }
 
 /** One time bucket of the usage timeline — a `YYYY-MM-DD` key (the day, or the
@@ -111,6 +127,8 @@ export interface UsageRunRow {
 export interface UsageTimelineBucket {
   bucket: string;
   rows: UsageBreakdownRow[];
+  /** See `UsageSummary.pricing_error`. */
+  pricing_error?: string;
 }
 
 /** Compact a token count consistently from ≥10k so columns don't mix

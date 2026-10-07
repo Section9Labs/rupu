@@ -25,6 +25,8 @@ import {
   type ProjectAssessedPct,
 } from '../lib/api';
 import { TabBar, TabButton } from '../components/TabBar';
+import { ProjectCustomerMenu } from '../components/customers/ProjectCustomerMenu';
+import { PricingErrorMark } from '../components/customers/PricingErrorMark';
 import { Spinner } from '../components/ui/Spinner';
 import ProjectOverviewTab from '../components/project/ProjectOverviewTab';
 import ProjectRunsTab from '../components/project/ProjectRunsTab';
@@ -64,7 +66,7 @@ function RollupTile({
   children,
 }: {
   label: string;
-  value: string | number;
+  value: React.ReactNode;
   sub?: string;
   children?: React.ReactNode;
 }) {
@@ -88,6 +90,10 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
   const { wsId } = useParams<{ wsId: string }>();
   const navigate = useNavigate();
   const [detail, setDetail] = useState<ProjectDetailType | null>(null);
+  // Bumped when the header assigns / unassigns the project's customer: the
+  // Config tab's provenance and locks come from that customer's layer, so it
+  // re-reads its view.
+  const [customerChanges, setCustomerChanges] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [notFound, setNotFound] = useState(false);
   /** assessed_pct fetched lazily in parallel — undefined = still loading,
@@ -197,7 +203,17 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
     <div className="p-8 space-y-6">
       {/* ── Identity header ── */}
       <header className="bg-panel border border-border rounded-xl shadow-card px-5 py-4">
-        <h1 className="text-lg font-bold text-ink">{p.name}</h1>
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          <h1 className="text-lg font-bold text-ink">{p.name}</h1>
+          <ProjectCustomerMenu
+            wsId={p.ws_id}
+            customer={p.customer}
+            onChange={(next) => {
+              setDetail((d) => (d ? { ...d, project: { ...d.project, customer: next } } : d));
+              setCustomerChanges((n) => n + 1);
+            }}
+          />
+        </div>
         <div className="mt-1.5 flex items-center flex-wrap gap-x-4 gap-y-1 text-note text-ink-dim">
           <span className="font-mono">{p.path}</span>
           {p.repo_remote && (
@@ -258,8 +274,10 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
           <RollupTile
             label="Usage"
             value={
-              formatCost(usage.cost_usd) +
-              (usage.cost_usd !== null && !usage.priced ? '*' : '')
+              <span className="inline-flex items-center gap-1.5">
+                {formatCost(usage.cost_usd) + (usage.cost_usd !== null && !usage.priced ? '*' : '')}
+                <PricingErrorMark error={usage.pricing_error} />
+              </span>
             }
             sub={`${formatTokens(usage.total_tokens)} tok`}
           />
@@ -345,7 +363,7 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
       {tab === 'sessions' && <ProjectSessionsTab wsId={p.ws_id} />}
       {tab === 'coverage' && <ProjectCoverageTab wsId={p.ws_id} />}
       {tab === 'network' && <ProjectNetworkTab wsId={p.ws_id} />}
-      {tab === 'config' && <ProjectConfigTab wsId={p.ws_id} />}
+      {tab === 'config' && <ProjectConfigTab wsId={p.ws_id} reloadKey={customerChanges} />}
     </div>
   );
 }

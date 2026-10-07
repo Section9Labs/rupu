@@ -17,6 +17,7 @@ vi.mock('../components/charts/UsageBarChart', () => ({
 }));
 
 import Agents from './Agents';
+import { withCustomerScope } from '../lib/customerScopeTestUtils';
 
 const USAGE = {
   input_tokens: 0,
@@ -56,7 +57,7 @@ describe('Agents — Last run column', () => {
 
     render(
       <MemoryRouter initialEntries={['/agents']}>
-        <Agents />
+        {withCustomerScope(<Agents />)}
       </MemoryRouter>,
     );
 
@@ -76,7 +77,7 @@ describe('Agents — Last run column', () => {
 
     render(
       <MemoryRouter initialEntries={['/agents']}>
-        <Agents />
+        {withCustomerScope(<Agents />)}
       </MemoryRouter>,
     );
 
@@ -98,7 +99,7 @@ describe('Agents — definition-table canonical column order', () => {
 
     const { container } = render(
       <MemoryRouter initialEntries={['/agents']}>
-        <Agents />
+        {withCustomerScope(<Agents />)}
       </MemoryRouter>,
     );
 

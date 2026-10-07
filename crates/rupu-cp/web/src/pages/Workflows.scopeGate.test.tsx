@@ -36,6 +36,7 @@ vi.mock('../components/CodeEditor', () => ({
 }));
 
 import Workflows from './Workflows';
+import { withCustomerScope } from '../lib/customerScopeTestUtils';
 
 const USAGE = {
   input_tokens: 0,
@@ -68,7 +69,7 @@ describe('Workflows — scope-aware Delete', () => {
 
     render(
       <MemoryRouter initialEntries={['/workflows']}>
-        <Workflows />
+        {withCustomerScope(<Workflows />)}
       </MemoryRouter>,
     );
     await waitFor(() => expect(screen.getByText('nightly-sweep')).toBeInTheDocument());
@@ -96,7 +97,7 @@ describe('Workflows — scope-aware Delete', () => {
 
     render(
       <MemoryRouter initialEntries={['/workflows']}>
-        <Workflows />
+        {withCustomerScope(<Workflows />)}
       </MemoryRouter>,
     );
     await waitFor(() => expect(screen.getByText('nightly-sweep')).toBeInTheDocument());
@@ -125,7 +126,7 @@ describe('Workflows — scope-aware Delete', () => {
 
     render(
       <MemoryRouter initialEntries={['/workflows']}>
-        <Workflows />
+        {withCustomerScope(<Workflows />)}
       </MemoryRouter>,
     );
     await waitFor(() => expect(screen.getByText('nightly-sweep')).toBeInTheDocument());
@@ -153,7 +154,7 @@ describe('Workflows — scope-aware Delete', () => {
 
     render(
       <MemoryRouter initialEntries={['/workflows']}>
-        <Workflows />
+        {withCustomerScope(<Workflows />)}
       </MemoryRouter>,
     );
     await waitFor(() => expect(screen.getByText('nightly-sweep')).toBeInTheDocument());

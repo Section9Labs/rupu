@@ -45,7 +45,7 @@ pub struct BucketHostConnector {
     bucket: Arc<dyn Bucket>,
     mirror: Arc<NodeMirror>,
     run_store: Arc<RunStore>,
-    pricing: rupu_config::PricingConfig,
+    pricing: Arc<crate::customers::CustomerPricing>,
 }
 
 impl BucketHostConnector {
@@ -55,7 +55,7 @@ impl BucketHostConnector {
         bucket: Arc<dyn Bucket>,
         mirror: Arc<NodeMirror>,
         run_store: Arc<RunStore>,
-        pricing: rupu_config::PricingConfig,
+        pricing: Arc<crate::customers::CustomerPricing>,
     ) -> Self {
         Self {
             host_id: host_id.into(),
@@ -263,7 +263,7 @@ impl HostConnector for BucketHostConnector {
         let (store, id, pricing) = (
             Arc::clone(&self.run_store),
             self.host_id.clone(),
-            self.pricing.clone(),
+            Arc::clone(&self.pricing),
         );
         blocking_host(move || mirror_list_runs(&store, &id, &params, &pricing)).await
     }
@@ -272,7 +272,7 @@ impl HostConnector for BucketHostConnector {
         let (store, id, pricing) = (
             Arc::clone(&self.run_store),
             self.host_id.clone(),
-            self.pricing.clone(),
+            Arc::clone(&self.pricing),
         );
         let run_id = run_id.to_string();
         blocking_host(move || mirror_get_run(&store, &id, &run_id, &pricing)).await
@@ -418,7 +418,9 @@ mod tests {
             Arc::clone(&bucket),
             mirror,
             Arc::clone(&run_store),
-            rupu_config::PricingConfig::default(),
+            Arc::new(crate::customers::CustomerPricing::flat(
+                rupu_config::PricingConfig::default(),
+            )),
         );
         (conn, run_store, bucket, tmp)
     }
@@ -797,7 +799,9 @@ mod tests {
             Arc::new(FailingBucket),
             mirror,
             run_store,
-            rupu_config::PricingConfig::default(),
+            Arc::new(crate::customers::CustomerPricing::flat(
+                rupu_config::PricingConfig::default(),
+            )),
         );
         for bad in ["../../etc/passwd", "", "AB", &"AB".repeat(32)] {
             let err = conn
@@ -902,7 +906,9 @@ mod tests {
             bucket,
             mirror,
             Arc::clone(&run_store),
-            rupu_config::PricingConfig::default(),
+            Arc::new(crate::customers::CustomerPricing::flat(
+                rupu_config::PricingConfig::default(),
+            )),
         );
 
         let err = conn

@@ -333,3 +333,12 @@ describe('ProjectSessionsTab — kit loading/empty/error states', () => {
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('network down'));
   });
 });
+
+describe('ProjectSessionsTab — pricing errors', () => {
+  it('marks a session row priced at the global rates', async () => {
+    mockSessions([{ ...ROWS[0], usage: { ...usage(), pricing_error: 'acme layer broken' } }, ROWS[1]]);
+    renderTab();
+    expect(await screen.findByRole('img', { name: 'Pricing unavailable: acme layer broken', hidden: true })).toBeInTheDocument();
+    expect(screen.getAllByRole('img', { name: /^Pricing unavailable/, hidden: true })).toHaveLength(1);
+  });
+});

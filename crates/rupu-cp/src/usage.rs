@@ -56,6 +56,13 @@ pub struct UsageSummary {
     /// arrived), so the totals are a lower bound. ORed by [`rollup`].
     #[serde(default)]
     pub partial: bool,
+    /// Set when some contributing work was priced at the GLOBAL rates because
+    /// its customer's config layer does not resolve (a malformed
+    /// `customers/<slug>/config.toml`): the cost may be wrong, and this says
+    /// why (naming the customer). Distinct from `partial`, which is about
+    /// missing token counts. Folded by [`rollup`] (the first one wins).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_error: Option<String>,
 }
 
 /// Fold token rows into a single summary, pricing each row.
@@ -152,22 +159,83 @@ pub async fn transcripts_usage_blocking(labeled: Vec<(String, PathBuf)>) -> Arc<
     .await
 }
 
+/// What prices run `r` (spec §1 — a run costs the same on every surface):
+/// its attribution through `lookup` (a mirrored worker run by what it
+/// recorded only), or `Unknown` — global rates, flagged — when that can't be
+/// known (an unreadable assignment, a legacy mirrored run).
+pub fn run_price_key(
+    r: &rupu_orchestrator::RunRecord,
+    lookup: &mut crate::customers::CustomerLookup,
+) -> crate::customers::PriceKey {
+    crate::customers::PriceKey::of(lookup.attribute_run(r, false).unwrap_or(None).as_ref())
+}
+
+/// [`summarize_run`] priced at `key`'s customer, stamped with its
+/// `pricing_error`.
+pub fn summarize_run_keyed(
+    store: &RunStore,
+    run_id: &str,
+    key: &crate::customers::PriceKey,
+    prices: &mut dyn crate::customers::PriceBook,
+) -> UsageSummary {
+    let mut u = summarize_run(store, run_id, prices.pricing_for(key.slug()));
+    u.pricing_error = key.pricing_error(prices);
+    u
+}
+
+/// [`run_metrics`] priced at `key`'s customer, stamped with its
+/// `pricing_error`.
+pub fn run_metrics_keyed(
+    store: &RunStore,
+    run_id: &str,
+    key: &crate::customers::PriceKey,
+    prices: &mut dyn crate::customers::PriceBook,
+) -> RunMetrics {
+    let mut m = run_metrics(store, run_id, prices.pricing_for(key.slug()));
+    m.usage.pricing_error = key.pricing_error(prices);
+    m
+}
+
+/// The [`PriceKey`](crate::customers::PriceKey) of each of `run_ids` in
+/// `store`. A run whose `run.json` can't be loaded has no knowable customer:
+/// `Unknown` (global rates, flagged with `pricing_error`), never "none".
+fn run_keys(
+    store: &RunStore,
+    run_ids: &[String],
+    lookup: &mut crate::customers::CustomerLookup,
+) -> Vec<crate::customers::PriceKey> {
+    run_ids
+        .iter()
+        .map(|id| match store.load(id) {
+            Ok(r) => run_price_key(&r, lookup),
+            Err(_) => crate::customers::PriceKey::Unknown,
+        })
+        .collect()
+}
+
 /// [`summarize_run`] for each of `run_ids`, in order, off the async executor
-/// (see [`usage_blocking`]). Never fails: a panicked fold prices every run as
-/// an empty, `partial` result.
+/// (see [`usage_blocking`]), each priced at its attributed customer
+/// ([`run_price_key`]) — what its list row and detail show. Never fails: a
+/// panicked fold prices every run as an empty, `partial` result.
 pub async fn summarize_runs_blocking(
     store: Arc<RunStore>,
     run_ids: Vec<String>,
-    pricing: PricingConfig,
+    global: PathBuf,
+    pricing: Arc<crate::customers::CustomerPricing>,
 ) -> Vec<UsageSummary> {
     let n = run_ids.len();
-    let fallback_pricing = pricing.clone();
+    let fallback_pricing = pricing.for_customer(None);
     usage_blocking(
         "summarize_runs",
         move || {
+            let mut lookup =
+                crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
+            let mut prices = crate::customers::PricingMemo::new(&pricing);
+            let keys = run_keys(&store, &run_ids, &mut lookup);
             run_ids
                 .iter()
-                .map(|id| summarize_run(&store, id, &pricing))
+                .zip(keys)
+                .map(|(id, key)| summarize_run_keyed(&store, id, &key, &mut prices))
                 .collect()
         },
         move || vec![summarize_run_usage(&unknown_usage(), &fallback_pricing); n],
@@ -176,21 +244,28 @@ pub async fn summarize_runs_blocking(
 }
 
 /// [`run_metrics`] for each of `run_ids`, in order, off the async executor
-/// (see [`usage_blocking`]). Never fails: a panicked fold reports every run
-/// as an empty, `partial` result.
+/// (see [`usage_blocking`]), each priced at its attributed customer
+/// ([`run_price_key`]). Never fails: a panicked fold reports every run as an
+/// empty, `partial` result.
 pub async fn run_metrics_blocking(
     store: Arc<RunStore>,
     run_ids: Vec<String>,
-    pricing: PricingConfig,
+    global: PathBuf,
+    pricing: Arc<crate::customers::CustomerPricing>,
 ) -> Vec<RunMetrics> {
     let n = run_ids.len();
-    let fallback_pricing = pricing.clone();
+    let fallback_pricing = pricing.for_customer(None);
     usage_blocking(
         "run_metrics",
         move || {
+            let mut lookup =
+                crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
+            let mut prices = crate::customers::PricingMemo::new(&pricing);
+            let keys = run_keys(&store, &run_ids, &mut lookup);
             run_ids
                 .iter()
-                .map(|id| run_metrics(&store, id, &pricing))
+                .zip(keys)
+                .map(|(id, key)| run_metrics_keyed(&store, id, &key, &mut prices))
                 .collect()
         },
         move || {
@@ -301,6 +376,9 @@ pub fn rollup(summaries: impl Iterator<Item = UsageSummary>) -> UsageSummary {
             out.priced = false;
         }
         out.partial |= s.partial;
+        if out.pricing_error.is_none() {
+            out.pricing_error = s.pricing_error;
+        }
     }
     out.total_tokens = out.input_tokens + out.output_tokens;
     out.cost_usd = if any_cost { Some(cost_acc) } else { None };
@@ -355,16 +433,20 @@ impl EntityRollup {
 
 /// Group every run's usage by a caller-chosen key, computing per-key rollups
 /// in a single pass over the store. `key_of` returns `None` to skip a run.
+/// Each run is priced at its attributed customer ([`run_price_key`]), so a
+/// rollup sums what the runs' rows show.
 pub fn rollup_by(
     store: &RunStore,
     runs: &[rupu_orchestrator::RunRecord],
-    pricing: &PricingConfig,
+    lookup: &mut crate::customers::CustomerLookup,
+    prices: &mut dyn crate::customers::PriceBook,
     key_of: impl Fn(&rupu_orchestrator::RunRecord) -> Option<String>,
 ) -> BTreeMap<String, EntityRollup> {
     let mut out: BTreeMap<String, EntityRollup> = BTreeMap::new();
     for run in runs {
         let Some(key) = key_of(run) else { continue };
-        let usage = summarize_run(store, &run.id, pricing);
+        let price = run_price_key(run, lookup);
+        let usage = summarize_run_keyed(store, &run.id, &price, prices);
         let at = Some(run.started_at.to_rfc3339());
         out.entry(key).or_default().add(&usage, at);
     }
@@ -720,6 +802,7 @@ pub(crate) mod tests {
             priced: true,
             runs: 1,
             partial: false,
+            pricing_error: None,
         };
         let unpriced = UsageSummary {
             input_tokens: 20,
@@ -731,6 +814,7 @@ pub(crate) mod tests {
             priced: false,
             runs: 1,
             partial: false,
+            pricing_error: None,
         };
         let r = rollup([priced, unpriced].into_iter());
         assert_eq!(r.input_tokens, 30);
@@ -846,6 +930,7 @@ pub(crate) mod tests {
                 priced: true,
                 runs: 1,
                 partial: false,
+                pricing_error: None,
             },
             Some("2026-01-02T00:00:00Z".into()),
         );
@@ -860,6 +945,7 @@ pub(crate) mod tests {
                 priced: true,
                 runs: 1,
                 partial: false,
+                pricing_error: None,
             },
             Some("2026-01-01T00:00:00Z".into()),
         );
@@ -1034,6 +1120,7 @@ pub(crate) mod tests {
         let store = RunStore::new(tmp.path().join("runs"));
         let recorded = PathBuf::from("/does/not/exist/run_local.jsonl");
         let record = rupu_orchestrator::runs::RunRecord {
+            customer: None,
             id: "run_01LOCAL".into(),
             workflow_name: "wf".into(),
             status: rupu_orchestrator::runs::RunStatus::Completed,
@@ -1107,5 +1194,25 @@ pub(crate) mod tests {
 
         let got = run_transcript_paths(&store, "run_01LOCAL");
         assert_eq!(got, vec![recorded]);
+    }
+
+    /// A run whose `run.json` can't be loaded is priced as unknown —
+    /// global rates, flagged — never as "no customer" (M3).
+    #[tokio::test]
+    async fn an_unloadable_run_is_priced_as_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+        std::fs::create_dir_all(tmp.path().join("runs/run_broken")).unwrap();
+        std::fs::write(tmp.path().join("runs/run_broken/run.json"), "{not json").unwrap();
+        let pricing = Arc::new(crate::customers::CustomerPricing::flat(
+            PricingConfig::default(),
+        ));
+        let got =
+            summarize_runs_blocking(store, vec!["run_broken".into()], tmp.path().into(), pricing)
+                .await;
+        assert_eq!(
+            got[0].pricing_error.as_deref(),
+            Some(crate::customers::UNKNOWN_CUSTOMER_PRICING)
+        );
     }
 }

@@ -374,3 +374,27 @@ describe('WorkflowDetail', () => {
     expect(spy).toHaveBeenCalledWith(COMPLETE_STEP_YAML);
   });
 });
+
+describe('WorkflowDetail under a customer scope', () => {
+  it('says its runs and spend cover every customer', async () => {
+    const { scopedEntry, withCustomerScope } = await import('../lib/customerScopeTestUtils');
+    vi.spyOn(api, 'getWorkflow').mockResolvedValue(DETAIL);
+    render(
+      <MemoryRouter initialEntries={[scopedEntry('acme', '/workflows/nightly')]}>
+        {withCustomerScope(
+          <Routes>
+            <Route path="/workflows/:name" element={<WorkflowDetailPage />} />
+          </Routes>,
+        )}
+      </MemoryRouter>,
+    );
+    expect(await screen.findByText('Runs and spend on this page cover every customer.')).toBeInTheDocument();
+  });
+
+  it('shows no note without a scope', async () => {
+    vi.spyOn(api, 'getWorkflow').mockResolvedValue(DETAIL);
+    renderPage();
+    expect(await screen.findByRole('heading', { name: 'nightly' })).toBeInTheDocument();
+    expect(screen.queryByText('Runs and spend on this page cover every customer.')).toBeNull();
+  });
+});

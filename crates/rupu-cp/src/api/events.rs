@@ -335,6 +335,7 @@ mod tests {
 
     fn seed_run(store: &RunStore, id: &str, started_at: DateTime<Utc>) {
         let record = RunRecord {
+            customer: None,
             id: id.into(),
             workflow_name: "test-workflow".into(),
             status: RunStatus::Completed,

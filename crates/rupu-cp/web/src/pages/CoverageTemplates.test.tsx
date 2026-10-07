@@ -10,6 +10,7 @@ import { MemoryRouter } from 'react-router-dom';
 import { api, type TemplateSummary } from '../lib/api';
 
 import CoverageTemplates from './CoverageTemplates';
+import { scopedEntry, withCustomerScope } from '../lib/customerScopeTestUtils';
 
 const TEMPLATE: TemplateSummary = {
   name: 'owasp-top-10',
@@ -27,7 +28,7 @@ afterEach(() => {
 function renderPage() {
   return render(
     <MemoryRouter initialEntries={['/coverage/templates']}>
-      <CoverageTemplates />
+      {withCustomerScope(<CoverageTemplates />)}
     </MemoryRouter>,
   );
 }
@@ -71,5 +72,19 @@ describe('CoverageTemplates — table rules', () => {
       th.textContent?.includes('Concerns'),
     );
     expect(header?.className).toMatch(/whitespace-nowrap/);
+  });
+});
+
+describe('CoverageTemplates — under a customer scope', () => {
+  it('says the catalog is shared by every customer', async () => {
+    vi.spyOn(api, 'getCoverageTemplates').mockResolvedValue([TEMPLATE]);
+    render(
+      <MemoryRouter initialEntries={[scopedEntry('acme', '/coverage/templates')]}>
+        {withCustomerScope(<CoverageTemplates />)}
+      </MemoryRouter>,
+    );
+    expect(await screen.findByRole('note')).toHaveTextContent(
+      'Concern templates aren’t per customer — every customer shares this catalog.',
+    );
   });
 });

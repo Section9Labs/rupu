@@ -577,6 +577,27 @@ impl KeychainResolver {
             .unwrap_or(false)
     }
 
+    /// Whether a credential exists for the account `name`: a stored
+    /// api-key or SSO credential, or `RUPU_<ACCOUNT>_API_KEY` — the places
+    /// [`CredentialResolver::get`] reads for a named account, and what a
+    /// connector build (`Registry::discover`) needs before it registers the
+    /// account. Existence only: nothing is refreshed or validated.
+    ///
+    /// Unlike [`Self::peek_named`], an unreadable store is an error rather
+    /// than "absent", so a caller can tell "no credential" from "could not
+    /// look".
+    pub fn has_credential_named(&self, name: &str) -> Result<bool> {
+        if Self::has_env_api_key(name) {
+            return Ok(true);
+        }
+        for mode in [AuthMode::ApiKey, AuthMode::Sso] {
+            if self.read_account(name, Some(name), mode)?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// `RUPU_<UPPER_ACCOUNT>_API_KEY`. Non-alphanumeric characters in an
     /// account name map to `_` so `anthropic-work` reads
     /// `RUPU_ANTHROPIC_WORK_API_KEY`.

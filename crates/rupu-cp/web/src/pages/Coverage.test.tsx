@@ -10,6 +10,7 @@ import { MemoryRouter } from 'react-router-dom';
 import { api, type CoverageSummary } from '../lib/api';
 
 import Coverage from './Coverage';
+import { scopedEntry, withCustomerScope } from '../lib/customerScopeTestUtils';
 
 const TARGET: CoverageSummary = {
   ws_id: 'ws-1',
@@ -28,7 +29,7 @@ afterEach(() => {
 function renderPage() {
   return render(
     <MemoryRouter initialEntries={['/coverage']}>
-      <Coverage />
+      {withCustomerScope(<Coverage />)}
     </MemoryRouter>,
   );
 }
@@ -80,5 +81,23 @@ describe('Coverage — table rules', () => {
       th.textContent?.includes('Catalog'),
     );
     expect(header?.className).toMatch(/whitespace-nowrap/);
+  });
+});
+
+describe('Coverage — under a customer scope', () => {
+  it('says coverage is not filtered by customer; nothing when unscoped', async () => {
+    vi.spyOn(api, 'getCoverage').mockResolvedValue([TARGET]);
+    render(
+      <MemoryRouter initialEntries={[scopedEntry('acme', '/coverage')]}>
+        {withCustomerScope(<Coverage />)}
+      </MemoryRouter>,
+    );
+    expect(await screen.findByRole('note')).toHaveTextContent(
+      'Coverage can’t be filtered by customer — it shows every customer’s projects.',
+    );
+    cleanup();
+    renderPage();
+    await waitFor(() => expect(api.getCoverage).toHaveBeenCalledTimes(2));
+    expect(screen.queryByRole('note')).not.toBeInTheDocument();
   });
 });

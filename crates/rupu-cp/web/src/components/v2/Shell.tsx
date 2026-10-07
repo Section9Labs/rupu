@@ -14,6 +14,8 @@ import CommandPalette, { openCommandPalette } from '../CommandPalette';
 import { ThemeToggle } from '../theme/ThemeToggle';
 import type { ConnectionState } from '../RunEventFeed';
 import { Segmented } from '../ui/Segmented';
+import { CustomerPicker } from '../customers/CustomerPicker';
+import { ScopeNotice } from '../customers/ScopeNotice';
 import { ShellStateProvider, useShellState, type ShellRange } from './shellState';
 
 const HOST_POLL_INTERVAL_MS = 60_000;
@@ -185,6 +187,7 @@ function TopBar() {
   return (
     <header className="flex h-12 shrink-0 items-center gap-3 border-b border-border bg-panel px-4">
       <span className="font-mono text-[11px] text-ink-mute">scope</span>
+      <CustomerPicker variant="compact" />
       <ScopeSelect />
       <span aria-hidden className="font-mono text-[11px] text-ink-mute">/</span>
       <RangeSegmented />
@@ -212,6 +215,7 @@ export default function Shell() {
         <div className="flex min-w-0 flex-1 flex-col">
           <TopBar />
           <main className="flex-1 overflow-auto">
+            <ScopeNotice />
             <Outlet />
           </main>
         </div>

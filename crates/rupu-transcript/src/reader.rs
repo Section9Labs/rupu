@@ -166,6 +166,10 @@ pub struct RunHead {
     pub model: String,
     pub started_at: DateTime<Utc>,
     pub mode: RunMode,
+    /// Customer recorded on `run_start`, tri-state (see
+    /// [`crate::recorded`]): `None` on transcripts that predate customers,
+    /// `Some(None)` for a run recorded with no customer.
+    pub customer: crate::recorded::RecordedField,
 }
 
 pub struct JsonlReader;
@@ -270,6 +274,7 @@ impl JsonlReader {
                     model,
                     started_at,
                     mode,
+                    customer,
                     ..
                 }) => {
                     return Ok(RunHead {
@@ -280,6 +285,7 @@ impl JsonlReader {
                         model,
                         started_at,
                         mode,
+                        customer,
                     })
                 }
                 // A real IO error is fatal; a bad line is not (the tolerated

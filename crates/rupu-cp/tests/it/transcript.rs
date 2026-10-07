@@ -22,6 +22,7 @@ fn write_two_event_jsonl(path: &std::path::Path) {
         schema: None,
         system_prompt: None,
         codename: None,
+        customer: None,
     };
     let e1 = Event::AssistantMessage {
         content: "hello".into(),
@@ -167,6 +168,7 @@ fn write_one_event_jsonl(path: &std::path::Path) -> &'static str {
         schema: None,
         system_prompt: None,
         codename: None,
+        customer: None,
     };
     std::fs::write(path, format!("{}\n", serde_json::to_string(&e).unwrap())).unwrap();
     "run_start"

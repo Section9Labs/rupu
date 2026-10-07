@@ -689,6 +689,7 @@ mod tests {
                 schema: None,
                 system_prompt: None,
                 codename: None,
+                customer: None,
             })
             .unwrap();
         writer
@@ -719,6 +720,7 @@ mod tests {
 
     fn sample_run_record(id: &str, started_at: DateTime<Utc>, transcript_dir: &Path) -> RunRecord {
         RunRecord {
+            customer: None,
             id: id.into(),
             workflow_name: "phase-delivery-cycle".into(),
             status: RunStatus::Completed,
@@ -1127,6 +1129,7 @@ mod tests {
             schema: None,
             system_prompt: None,
             codename: None,
+            customer: None,
         };
         events[0] = Ok(run_start);
         let mut writer = JsonlWriter::create(&transcript_path).unwrap();

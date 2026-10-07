@@ -293,6 +293,10 @@ pub struct LeadConfig {
     /// (its inbox, the board's standing directives). Shared `Arc`s, cloned
     /// into every round's `AgentRunOpts`.
     pub collectors: Vec<Arc<dyn rupu_agent::TurnCollector>>,
+    /// The customer the run belongs to, resolved by the launch site; every
+    /// round's transcript records it (`run_start.customer`). `None` ⇒ no
+    /// customer.
+    pub customer: Option<String>,
     /// Where the lead's LLM calls are metered: every round's `on_usage` hook
     /// appends one row per call here (`<run dir>/usage.jsonl`), and the budget's
     /// [`LedgerUsageSource`](crate::LedgerUsageSource) folds it with the
@@ -396,6 +400,7 @@ impl LeadDriver for RunAgentLeadDriver {
             max_turns: ceiling,
             decider: Arc::new(BypassDecider),
             tool_context: rupu_tools::ToolContext {
+                customer: self.cfg.customer.clone(),
                 workspace_path: self.cfg.workspace_path.clone(),
                 findings: self.cfg.findings_engagement.clone().map(|engagement| {
                     rupu_coverage::FindingWriteOptions {
@@ -695,6 +700,7 @@ mod tests {
             findings_engagement: None,
             extra_tools: Vec::new(),
             collectors: Vec::new(),
+            customer: None,
             usage_ledger: None,
         }
     }
@@ -776,6 +782,21 @@ mod tests {
         // its own file rather than clobbering the previous round's.
         assert!(dir.path().join("lead.r0.jsonl").exists());
         assert!(dir.path().join("lead.r1.jsonl").exists());
+    }
+
+    #[test]
+    fn the_lead_records_its_customer_on_every_round_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = lead_cfg(dir.path(), 1);
+        cfg.customer = Some("acme".into());
+        let make = scripted_factory(vec![vec![text_turn("planning")], vec![text_turn("done")]]);
+        let mut d = RunAgentLeadDriver::new(cfg, make).unwrap();
+        d.run_round(&round(0));
+        d.run_round(&round(1));
+        for name in ["lead.r0.jsonl", "lead.r1.jsonl"] {
+            let head = rupu_transcript::JsonlReader::head(dir.path().join(name)).unwrap();
+            assert_eq!(head.customer, Some(Some("acme".to_string())), "{name}");
+        }
     }
 
     #[test]

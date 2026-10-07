@@ -54,7 +54,7 @@ pub struct HostRegistry {
     node_registry: Option<Arc<NodeRegistry>>,
     node_mirror: Option<Arc<NodeMirror>>,
     run_store: Option<Arc<RunStore>>,
-    pricing: rupu_config::PricingConfig,
+    pricing: Arc<crate::customers::CustomerPricing>,
 }
 
 impl HostRegistry {
@@ -72,7 +72,9 @@ impl HostRegistry {
             node_registry: None,
             node_mirror: None,
             run_store: None,
-            pricing: rupu_config::PricingConfig::default(),
+            pricing: Arc::new(crate::customers::CustomerPricing::flat(
+                rupu_config::PricingConfig::default(),
+            )),
         }
     }
 
@@ -85,7 +87,7 @@ impl HostRegistry {
         node_registry: Arc<NodeRegistry>,
         node_mirror: Arc<NodeMirror>,
         run_store: Arc<RunStore>,
-        pricing: rupu_config::PricingConfig,
+        pricing: Arc<crate::customers::CustomerPricing>,
     ) -> Self {
         self.node_registry = Some(node_registry);
         self.node_mirror = Some(node_mirror);
@@ -352,7 +354,7 @@ impl HostRegistry {
                         Arc::clone(reg),
                         Arc::clone(mir),
                         Arc::clone(store),
-                        self.pricing.clone(),
+                        Arc::clone(&self.pricing),
                     ))),
                     _ => Err(HostConnectorError::Invalid(
                         "tunnel deps not wired (call HostRegistry::with_tunnel_deps)".to_string(),
@@ -396,7 +398,7 @@ impl HostRegistry {
                             std::sync::Arc::new(bucket),
                             std::sync::Arc::clone(mir),
                             std::sync::Arc::clone(store),
-                            self.pricing.clone(),
+                            Arc::clone(&self.pricing),
                         ),
                     ))
                 }

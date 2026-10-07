@@ -46,6 +46,16 @@
 // `workspaceId`, instead of forking it. Pivot/metric/the exclusion filter
 // stay OWNED here (not inside `UsageTimeline`) because this page shares all
 // three with the breakdown table and outlier panel below.
+//
+// Customer scope (customers Plan 2B): the page follows the global scope
+// (`useScopedList`; its header shows the `ScopeChip`), or — embedded in a
+// customer's Usage tab — a fixed `customer` prop, which also drops the title.
+// Either scopes every fetch to that customer's work (`?customer=`). Aggregates
+// are local-only under a filter, so a remote host answers 501 and shows as
+// unavailable rather than being counted; `HostsWithoutCustomerBanner` names it,
+// along with the hosts the headline's `hosts_without_customer` and the run-rows
+// / outliers fetches' `X-Rupu-Hosts-Without-Customer` header name. A scope the
+// backend rejects (400) is cleared with a notice.
 
 import { useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react';
 import {
@@ -68,8 +78,13 @@ import UsageTimeline from '../components/usage/UsageTimeline';
 import { type UsageMetric } from '../components/dashboard/UsageTimelineStacked';
 import ModelBreakdownTable from '../components/dashboard/ModelBreakdownTable';
 import { Spinner } from '../components/ui/Spinner';
+import { useScopedList } from '../lib/useScopedList';
+import { ScopeChip } from '../components/customers/ScopeChip';
+import { HostsWithoutCustomerBanner } from '../components/customers/HostsWithoutCustomerBanner';
 
 const RANGES: DashboardRange[] = ['7d', '30d', 'all'];
+const EMPTY_RUNS: UsageRunRow[] = [];
+const EMPTY_OUTLIERS: OutlierRun[] = [];
 
 /** How often a preset ("ends now") window is re-derived and its data refetched. */
 const USAGE_REFRESH_MS = 30_000;
@@ -81,7 +96,8 @@ function toggleInSet(set: Set<string>, key: string): Set<string> {
   return next;
 }
 
-export default function Usage() {
+export default function Usage({ customer: fixedCustomer }: { customer?: string } = {}) {
+  const { customer, embedded, rejectIfScopeError } = useScopedList(fixedCustomer, []);
   const [range, setRange] = useState<DashboardRange>('30d');
   // The `{since, until}` window driving every usage fetch below (Task W2) —
   // `range` is kept alongside purely for the 7/30/All button highlighting.
@@ -104,7 +120,13 @@ export default function Usage() {
   // identity is the preset (its `until` ticks every 30s without changing what
   // the operator is looking at); a custom window's is its exact bounds.
   const windowKey = isCustomWindow ? `${usageWindow.since}|${usageWindow.until}` : `preset:${range}`;
-  const { data: current, hosts, error, notice } = useUsageData(usageWindow, windowKey, windowSource);
+  const { data: current, hosts, error, notice } = useUsageData(
+    usageWindow,
+    windowKey,
+    windowSource,
+    customer,
+    rejectIfScopeError,
+  );
   // `current` is null from a user window change until the first host answers for
   // the NEW window (the hook never mixes an old window's figures into a new
   // one). Keep the last good headline on screen meanwhile, as the page did when
@@ -112,9 +134,11 @@ export default function Usage() {
   // host strip's `loading` entries say it is refreshing, and the page does not
   // collapse to its full-page spinner (which would unmount `UsageTimeline` and
   // delay its run-rows fetch until the headline lands).
-  const lastGood = useRef(current);
-  if (current) lastGood.current = current;
-  const data = current ?? lastGood.current;
+  // Never across a customer change, though: another customer's spend is not a
+  // stand-in for this one's, so a new scope waits for its own first answer.
+  const lastGood = useRef({ customer, data: current });
+  if (current) lastGood.current = { customer, data: current };
+  const data = current ?? (lastGood.current.customer === customer ? lastGood.current.data : null);
   // The last good headline is standing in for a window no host has answered yet.
   // If every host has failed for it (`error`), the "refresh failed" chip says so
   // and the cue stops: a drag-selected window never retries, so a spinner beside
@@ -154,7 +178,22 @@ export default function Usage() {
     setWindowSource('user');
   }, [range]);
 
-  const [outliers, setOutliers] = useState<OutlierRun[]>([]);
+  // Outliers, tagged with the scope they were fetched for: a list fetched for
+  // another customer is never shown under this one (see `runsFor` below).
+  const [outliersFor, setOutliersFor] = useState<{ customer: typeof customer; rows: OutlierRun[] }>({
+    customer,
+    rows: [],
+  });
+  const outliers = outliersFor.customer === customer ? outliersFor.rows : EMPTY_OUTLIERS;
+  // Customer-scoped only: the hosts the run-rows and outliers fetches named in
+  // their `X-Rupu-Hosts-Without-Customer` header (each replaced by its latest
+  // answer; cleared when the filter goes).
+  const [runsHostsWithout, setRunsHostsWithout] = useState<string[]>([]);
+  const [outlierHostsWithout, setOutlierHostsWithout] = useState<string[]>([]);
+  useEffect(() => {
+    setRunsHostsWithout([]);
+    setOutlierHostsWithout([]);
+  }, [customer]);
   // The flat per-run rows `UsageTimeline` fetches for the graph (Task U1),
   // handed back via `onRunsLoaded` so the breakdown table below can be built
   // from the SAME rows instead of `data.breakdown` (fleet-wide, from
@@ -163,7 +202,18 @@ export default function Usage() {
   // heard of (no effect), get stuck disabled (the top-6/others rollup), or
   // render as a bare "—" for an empty pivot value. Mirrors
   // `ProjectUsageTimeline`'s `aggregateRuns(runs, pivot)` table.
-  const [runs, setRuns] = useState<UsageRunRow[]>([]);
+  // Tagged with the scope the rows were fetched for, like the headline's
+  // `lastGood`: until the new scope's own rows land — or when its fetch fails,
+  // which never calls `onRunsLoaded` — the table is empty, never the previous
+  // customer's breakdown under this one's chip. `UsageTimeline` refetches on a
+  // scope change and drops a superseded answer, so the scope captured by the
+  // callback its effect ran with is the scope of the rows it hands back.
+  const [runsFor, setRunsFor] = useState<{ customer: typeof customer; rows: UsageRunRow[] }>({
+    customer,
+    rows: [],
+  });
+  const runs = runsFor.customer === customer ? runsFor.rows : EMPTY_RUNS;
+  const handleRunsLoaded = useCallback((rows: UsageRunRow[]) => setRunsFor({ customer, rows }), [customer]);
 
   const [excludedKeys, setExcludedKeys] = useState<Set<string>>(new Set());
   const [excludedRunIds, setExcludedRunIds] = useState<Set<string>>(new Set());
@@ -185,20 +235,29 @@ export default function Usage() {
   // stable (same primitive-deps pattern as `UsageTimeline`'s own effect).
   useEffect(() => {
     let cancelled = false;
-    api
-      .getUsageOutliers(usageWindow)
+    (customer
+      ? api.getUsageOutliers(usageWindow, customer, (ids) => {
+          if (!cancelled) setOutlierHostsWithout(ids);
+        })
+      : api.getUsageOutliers(usageWindow)
+    )
       .then((rows) => {
-        if (!cancelled) setOutliers(rows);
+        if (!cancelled) setOutliersFor({ customer, rows });
       })
       .catch(() => {
-        // A failed tick-driven refresh keeps the last good outliers.
-        if (!cancelled && windowSource !== 'tick') setOutliers([]);
+        // A failed tick-driven refresh keeps the last good outliers — but only
+        // ones fetched for this same scope: another customer's are not a
+        // stand-in for this one's.
+        if (cancelled) return;
+        setOutliersFor((prev) =>
+          windowSource === 'tick' && prev.customer === customer ? prev : { customer, rows: [] },
+        );
       });
     return () => {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed off usageWindow's primitive fields, not the object itself; see comment above.
-  }, [usageWindow.since, usageWindow.until]);
+  }, [usageWindow.since, usageWindow.until, customer]);
 
   // Live refresh: a preset window ends at "now", so its `until` goes stale the
   // moment it is built — new runs (and a still-running run's growing usage)
@@ -249,10 +308,15 @@ export default function Usage() {
   const breakdown = useMemo(() => aggregateRuns(runs, pivot), [runs, pivot]);
 
   return (
-    <div className="space-y-4 p-4">
+    <div className={embedded ? 'space-y-4' : 'space-y-4 p-4'}>
       <header className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="text-lg font-semibold text-ink">Usage</h1>
+          {!embedded && (
+            <div className="flex flex-wrap items-center gap-2">
+              <h1 className="text-lg font-semibold text-ink">Usage</h1>
+              <ScopeChip />
+            </div>
+          )}
           {hosts.length > 0 && (
             <div className="mt-1">
               <HostFreshnessStrip hosts={hosts} />
@@ -296,6 +360,13 @@ export default function Usage() {
         </div>
       </header>
 
+      {customer && (
+        <HostsWithoutCustomerBanner
+          hosts={hosts.map((h) => ({ id: h.host_id, name: h.name, state: h.state, reason: h.reason }))}
+          without={[...(data?.hostsWithoutCustomer ?? []), ...runsHostsWithout, ...outlierHostsWithout]}
+        />
+      )}
+
       {data ? (
         <>
           <UnpricedBanner unpriced={data.unpriced} />
@@ -305,7 +376,12 @@ export default function Usage() {
               local-only run rows `UsageTimeline` fetches for the graph itself,
               which is why it's passed in rather than computed inside that
               component (see its doc comment). */}
+          {/* Keyed by the scope: a new customer's graph starts empty rather
+              than keeping the last one's rows through a failed refetch (a
+              tick's "keep the last good rows" applies within one scope only). */}
           <UsageTimeline
+            key={String(customer)}
+            customer={customer}
             usageWindow={usageWindow}
             pivot={pivot}
             metric={metric}
@@ -313,13 +389,15 @@ export default function Usage() {
             filter={filter}
             excludedCount={excludedCount}
             onReset={resetExclusions}
-            onRunsLoaded={setRuns}
+            onRunsLoaded={handleRunsLoaded}
+            onHostsWithoutCustomer={customer ? setRunsHostsWithout : undefined}
             onSelectRange={handleSelectRange}
             pending={isPending || headlineStale}
             background={windowSource === 'tick'}
             hosts={hosts}
             headline={{
               costLabel: formatCost(data.summary.cost_usd),
+              pricingError: data.summary.pricing_error,
               subLabel: `${formatTokens(data.summary.total_tokens)} tokens · ${data.summary.runs} runs${
                 !data.summary.priced ? ' · partial (see banner above)' : ''
               }${data.excluded.length ? ` · excludes ${data.excluded.join(', ')}` : ''}`,

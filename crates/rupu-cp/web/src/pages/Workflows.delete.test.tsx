@@ -29,6 +29,7 @@ vi.mock('../components/CodeEditor', () => ({
 }));
 
 import Workflows from './Workflows';
+import { withCustomerScope } from '../lib/customerScopeTestUtils';
 
 function LocationProbe() {
   const loc = useLocation();
@@ -60,7 +61,7 @@ describe('Workflows — row Delete action', () => {
 
     render(
       <MemoryRouter initialEntries={['/workflows']}>
-        <Workflows />
+        {withCustomerScope(<Workflows />)}
       </MemoryRouter>,
     );
     await waitFor(() => expect(screen.getByText('nightly-sweep')).toBeInTheDocument());
@@ -77,7 +78,7 @@ describe('Workflows — row Delete action', () => {
 
     render(
       <MemoryRouter initialEntries={['/workflows']}>
-        <Workflows />
+        {withCustomerScope(<Workflows />)}
       </MemoryRouter>,
     );
     await waitFor(() => expect(screen.getByText('nightly-sweep')).toBeInTheDocument());
@@ -95,7 +96,7 @@ describe('Workflows — row Delete action', () => {
 
     render(
       <MemoryRouter initialEntries={['/workflows']}>
-        <Workflows />
+        {withCustomerScope(<Workflows />)}
         <LocationProbe />
       </MemoryRouter>,
     );
@@ -118,7 +119,7 @@ describe('Workflows — row Delete action', () => {
 
     render(
       <MemoryRouter initialEntries={['/workflows']}>
-        <Workflows />
+        {withCustomerScope(<Workflows />)}
       </MemoryRouter>,
     );
     await waitFor(() => expect(screen.getByText('nightly-sweep')).toBeInTheDocument());
@@ -133,7 +134,7 @@ describe('Workflows — row Delete action', () => {
 
     render(
       <MemoryRouter initialEntries={['/workflows']}>
-        <Workflows />
+        {withCustomerScope(<Workflows />)}
       </MemoryRouter>,
     );
     await waitFor(() => expect(screen.getByText('nightly-sweep')).toBeInTheDocument());

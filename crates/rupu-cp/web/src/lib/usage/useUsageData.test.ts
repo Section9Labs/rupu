@@ -538,4 +538,112 @@ describe('useUsageData', () => {
       expect(result.current.hosts.map((h) => h.state)).toEqual(['loading', 'loading']);
     });
   });
+  describe('customer filter', () => {
+    it('passes the customer to every host, and keeps an unfiltered call as it was', async () => {
+      vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL]);
+      const spy = vi.spyOn(api, 'getUsage').mockResolvedValue(resp('local', 3));
+      const { result } = renderHook(() => useUsageData(WIN, 'preset:30d', 'user', 'acme'));
+      await waitFor(() => expect(result.current.data?.summary.runs).toBe(3));
+      expect(spy).toHaveBeenCalledWith(WIN, 'model', 'local', expect.any(AbortSignal), 'acme');
+      cleanup();
+
+      const plain = vi.spyOn(api, 'getUsage').mockClear();
+      const { result: r2 } = renderHook(() => useUsageData(WIN, 'preset:30d', 'user'));
+      await waitFor(() => expect(r2.current.data?.summary.runs).toBe(3));
+      expect(plain.mock.calls[0]).toHaveLength(4);
+    });
+
+    it('a remote host answering 501 under the filter is unavailable and not counted', async () => {
+      vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL, REG_PROD]);
+      vi.spyOn(api, 'getUsage').mockImplementation((_w, _p, host) =>
+        host === 'local'
+          ? Promise.resolve(resp('local', 3))
+          : Promise.reject(new ApiError(501, 'cannot filter', '')),
+      );
+      const { result } = renderHook(() => useUsageData(WIN, 'preset:30d', 'user', 'acme'));
+      await waitFor(() => expect(result.current.hosts[1]?.state).toBe('unavailable'));
+      expect(result.current.data?.summary.runs).toBe(3);
+      expect(result.current.data?.excluded).toEqual(['prod (unavailable)']);
+      expect(result.current.error).toBeNull();
+    });
+
+    it('changing the customer refetches every host and never mixes the old answer in', async () => {
+      vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL]);
+      const spy = vi.spyOn(api, 'getUsage').mockImplementation((_w, _p, _h, _s, customer) =>
+        Promise.resolve(resp('local', customer === 'globex' ? 9 : 3)),
+      );
+      const { result, rerender } = renderHook(
+        ({ c }: { c: string }) => useUsageData(WIN, 'preset:30d', 'user', c),
+        { initialProps: { c: 'acme' } },
+      );
+      await waitFor(() => expect(result.current.data?.summary.runs).toBe(3));
+      rerender({ c: 'globex' });
+      await waitFor(() => expect(result.current.data?.summary.runs).toBe(9));
+      expect(spy).toHaveBeenLastCalledWith(WIN, 'model', 'local', expect.any(AbortSignal), 'globex');
+    });
+
+    it('setting a scope on a mounted page: the remote\'s 501 is unavailable (not stale), and it is not polled', async () => {
+      vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+      vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL, REG_PROD]);
+      const reason = "host host_prod can't be filtered by customer: its totals are summed remotely";
+      vi.spyOn(api, 'getUsage').mockImplementation((_w, _p, host, _s, customer) =>
+        customer && host === 'host_prod'
+          ? Promise.reject(new ApiError(501, 'x', JSON.stringify({ error: reason })))
+          : Promise.resolve(resp(host ?? 'local', host === 'local' ? 1 : 10)),
+      );
+      const { result, rerender } = renderHook(
+        ({ c }: { c?: string }) => useUsageData(WIN, 'preset:30d', 'user', c),
+        { initialProps: { c: undefined as string | undefined } },
+      );
+      await until(() => expect(result.current.data?.summary.runs).toBe(11));
+
+      rerender({ c: 'acme' });
+      await until(() => expect(result.current.hosts[1]?.state).toBe('unavailable'));
+      expect(result.current.hosts[1]?.reason).toBe(reason);
+      await until(() => expect(result.current.data?.summary.runs).toBe(1));
+      expect(result.current.data?.excluded).toEqual(['prod (unavailable)']);
+      expect(result.current.error).toBeNull();
+
+      // A guaranteed 501 is not asked again on the remote cadence.
+      const asked = usageCallsFor('host_prod').length;
+      vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+      await act(() => vi.advanceTimersByTimeAsync(USAGE_REMOTE_POLL_MS));
+      await act(() => vi.advanceTimersByTimeAsync(USAGE_REMOTE_POLL_MS));
+      expect(usageCallsFor('host_prod')).toHaveLength(asked);
+
+      // Clearing the filter asks it again, unfiltered.
+      rerender({ c: undefined });
+      await until(() => expect(result.current.hosts[1]?.state).toBe('ok'));
+      await until(() => expect(result.current.data?.summary.runs).toBe(11));
+    });
+
+    it('unions the answers\' hosts_without_customer', async () => {
+      vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL, REG_PROD]);
+      vi.spyOn(api, 'getUsage').mockImplementation((_w, _p, host) =>
+        Promise.resolve({
+          ...resp(host as string, 1),
+          hosts_without_customer: host === 'local' ? ['worker-2', 'worker-1'] : ['worker-1'],
+        }),
+      );
+      const { result } = renderHook(() => useUsageData(WIN, 'preset:30d', 'user', 'acme'));
+      await waitFor(() => expect(result.current.data?.summary.runs).toBe(2));
+      expect(result.current.data?.hostsWithoutCustomer).toEqual(['worker-1', 'worker-2']);
+    });
+
+    it('hands a scoped request\'s failure to onScopeRejected; an unscoped one never', async () => {
+      vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL]);
+      const bad = new ApiError(400, 'x', '{"error":"customer: invalid slug"}');
+      vi.spyOn(api, 'getUsage').mockRejectedValue(bad);
+      const onRejected = vi.fn();
+      const { result } = renderHook(() => useUsageData(WIN, 'preset:30d', 'user', 'acme', onRejected));
+      await waitFor(() => expect(result.current.error).not.toBeNull());
+      expect(onRejected).toHaveBeenCalledWith(bad);
+      cleanup();
+
+      const unscoped = vi.fn();
+      const { result: r2 } = renderHook(() => useUsageData(WIN, 'preset:30d', 'user', undefined, unscoped));
+      await waitFor(() => expect(r2.current.error).not.toBeNull());
+      expect(unscoped).not.toHaveBeenCalled();
+    });
+  });
 });

@@ -254,3 +254,20 @@ describe('AgentDetail — Agent Builder edit', () => {
     expect(savedRaw).toContain('name: reviewer-2');
   });
 });
+
+describe('AgentDetail under a customer scope', () => {
+  it('says its runs and spend cover every customer', async () => {
+    const { scopedEntry, withCustomerScope } = await import('../lib/customerScopeTestUtils');
+    vi.spyOn(api, 'getAgent').mockResolvedValue(AGENT);
+    render(
+      <MemoryRouter initialEntries={[scopedEntry('acme', '/agents/reviewer')]}>
+        {withCustomerScope(
+          <Routes>
+            <Route path="/agents/:name" element={<AgentDetailPage />} />
+          </Routes>,
+        )}
+      </MemoryRouter>,
+    );
+    expect(await screen.findByText('Runs and spend on this page cover every customer.')).toBeInTheDocument();
+  });
+});

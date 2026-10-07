@@ -10,6 +10,8 @@
 pub mod autoflow_claim;
 pub mod autoflow_claim_store;
 pub mod autoflow_worktree;
+pub mod config_paths;
+pub mod customers;
 pub mod record;
 pub mod repo_record;
 pub mod repo_store;
@@ -32,6 +34,14 @@ pub use autoflow_claim_store::{
 pub use autoflow_worktree::{
     ensure_issue_worktree, remove_issue_worktree, AutoflowWorktree, AutoflowWorktreeError,
 };
+pub use config_paths::{
+    config_paths, config_paths_for_customer, is_safe_definition_name, locate_workflow,
+    project_root_for, ConfigPaths,
+};
+pub use customers::{
+    validate_slug, validate_ws_id, Customer, CustomerError, CustomerMeta, CustomerStore, MetaPatch,
+    NewCustomer, ProjectRef,
+};
 pub use discover::{discover, DiscoverError, Discovery};
 pub use host_store::{
     add_bucket_host, add_ssh_host, delete_host_token, enroll_node, get_host_token, set_host_token,
@@ -41,7 +51,7 @@ pub use record::{new_id, Workspace};
 pub use repo_record::TrackedRepo;
 pub use repo_store::{repo_ref_key, RepoRegistryStore, RepoStoreError};
 pub use rupu_runtime::{WorkerCapabilities, WorkerKind, WorkerRecord};
-pub use store::{upsert, StoreError, WorkspaceStore};
+pub use store::{find_by_path, register, upsert, StoreError, WorkspaceStore};
 pub use worker_store::{WorkerStore, WorkerStoreError};
 pub use workspace_sync::{
     apply_deltas, collect_delta, delta_root, detect_mode, pack, stage, Baseline, Delta, Payload, SyncError,

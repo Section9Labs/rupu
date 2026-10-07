@@ -12,6 +12,7 @@ use std::sync::Arc;
 /// Build a minimal valid RunRecord with the given id.
 fn seed_run(id: &str) -> RunRecord {
     RunRecord {
+        customer: None,
         id: id.into(),
         workflow_name: "test-workflow".into(),
         status: RunStatus::Completed,

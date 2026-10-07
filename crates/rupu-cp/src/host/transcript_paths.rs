@@ -170,6 +170,7 @@ mod tests {
 
     fn record(id: &str) -> RunRecord {
         RunRecord {
+            customer: None,
             id: id.into(),
             workflow_name: "wf".into(),
             status: RunStatus::Running,

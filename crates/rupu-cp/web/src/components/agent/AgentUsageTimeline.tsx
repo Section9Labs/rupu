@@ -40,6 +40,7 @@ import UsageRangeControls from '../usage/UsageRangeControls';
 import UsageTimelineStacked, { type UsageMetric } from '../dashboard/UsageTimelineStacked';
 import ModelBreakdownTable from '../dashboard/ModelBreakdownTable';
 import { Spinner } from '../ui/Spinner';
+import { PricingErrorMark } from '../customers/PricingErrorMark';
 
 const METRICS: UsageMetric[] = ['cost', 'tokens'];
 
@@ -148,6 +149,9 @@ export default function AgentUsageTimeline({ agent }: { agent: string }) {
   const totalCost = breakdown.reduce((acc, r) => acc + (r.cost_usd ?? 0), 0);
   const totalTokens = breakdown.reduce((acc, r) => acc + r.total_tokens, 0);
   const totalRuns = new Set(runs.map((r) => r.run_id)).size;
+  // A run priced at the global rates (its customer's layer doesn't resolve)
+  // makes the headline unreliable — the first-row rule `buildTimeline` uses.
+  const pricingError = runs.find((r) => r.pricing_error)?.pricing_error;
   const anyUnpriced = breakdown.some((r) => !r.priced);
 
   const isUpdating = !isInitialLoad && (isFetching || isPending);
@@ -170,8 +174,9 @@ export default function AgentUsageTimeline({ agent }: { agent: string }) {
               Spend over time
               {isUpdating && <Spinner size="sm" label="updating" />}
             </h3>
-            <p className="mt-0.5 text-2xl font-semibold tabular-nums text-ink">
+            <p className="mt-0.5 inline-flex items-center gap-1.5 text-2xl font-semibold tabular-nums text-ink">
               {formatCost(sawPriced ? totalCost : null)}
+              <PricingErrorMark error={pricingError} />
             </p>
             <p className="text-xs text-ink-mute">
               {formatTokens(totalTokens)} tokens · {totalRuns} runs{anyUnpriced ? ' · partial' : ''}

@@ -14,6 +14,7 @@ import LauncherSheet from '../components/LauncherSheet';
 import { Button } from '../components/ui/Button';
 import { Spinner } from '../components/ui/Spinner';
 import { yamlToGraph, validateGraph } from '../lib/workflowGraph';
+import { UnscopedNote } from '../components/customers/UnscopedNote';
 
 // Lazy so the @xyflow/react canvas + CodeMirror (and the rest of the visual
 // editor) stay out of the main bundle — only fetched once the page mounts.
@@ -421,6 +422,8 @@ export default function WorkflowDetailPage() {
           <p className="mt-1 text-xs text-ink-mute font-mono break-all">{autoflow.trigger}</p>
         )}
       </header>
+
+      <UnscopedNote className="mt-4">Runs and spend on this page cover every customer.</UnscopedNote>
 
       {/* ── Unified editor shell (graph + live YAML + inspector) ──────── */}
       <div className="mt-6">

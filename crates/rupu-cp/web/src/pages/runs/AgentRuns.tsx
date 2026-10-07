@@ -18,6 +18,15 @@
 // merged row before this page ever sees it — the Source pill filters that
 // single merged row's `source` field, it does not need to dedupe anything
 // itself.
+//
+// Customer scope (customers Plan 2B): the list follows the global scope
+// (`useScopedList`), or — embedded in a customer's Runs tab — a fixed
+// `customer` prop, which also drops the page header and padding. Either way the
+// filter goes through the same per-host engine (`?customer=<slug>`), so a
+// remote host that can't filter (501) shows as an unavailable slice, and
+// `HostsWithoutCustomerBanner` names it along with the hosts the
+// `X-Rupu-Hosts-Without-Customer` header lists. A scope the backend rejects
+// (400) is cleared with a notice.
 
 import { useCallback, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
@@ -45,6 +54,10 @@ import { formatDuration } from '../../lib/duration';
 import { usePerHostPagedList, type PerHostFetchParams } from '../../lib/perHost/usePerHostPagedList';
 import { PerHostFooter, PerHostStrip, perHostFooterText } from '../../components/lists/PerHostStatus';
 import { noHostAnswered, notIncluded, waitingLabel } from '../../lib/perHost/status';
+import { PricingErrorMark } from '../../components/customers/PricingErrorMark';
+import { HostsWithoutCustomerBanner } from '../../components/customers/HostsWithoutCustomerBanner';
+import { useRunCustomers, withCustomerColumn } from '../../components/customers/RunCustomer';
+import { useScopedList } from '../../lib/useScopedList';
 
 type Tab = 'active' | 'completed' | 'failed';
 
@@ -103,7 +116,7 @@ function confirmLivenessOverride(runId: string, e: ApiError): boolean {
   );
 }
 
-export default function AgentRuns() {
+export default function AgentRuns({ customer: fixedCustomer }: { customer?: string } = {}) {
   const [tab, setTab] = useState<Tab>('active');
   // Default 'standalone' — an agent-runs read is a standalone invocation by
   // default; session-bound runs live on the Sessions page instead (operator
@@ -112,6 +125,8 @@ export default function AgentRuns() {
   // All hosts by default: local paints at once, each remote merges in as it
   // answers (usePerHostPagedList). A picked host lists only that host.
   const [hostFilter, setHostFilter] = useState<string>(ALL_HOSTS);
+  const scoped = useScopedList(fixedCustomer, [tab, hostFilter]);
+  const { customer, embedded } = scoped;
   // Row-action (archive/restore/delete) failures — kept separate from the
   // list-fetch error the hook owns, but shown in the same banner.
   const [actionError, setActionError] = useState<string | null>(null);
@@ -119,8 +134,20 @@ export default function AgentRuns() {
 
   const fetchRows = useCallback(
     ({ host, offset, limit, signal }: PerHostFetchParams) =>
-      api.getAgentRuns({ lifecycle: tab, offset, limit, host, signal }),
-    [tab],
+      customer
+        ? scoped.guard(
+            api.getAgentRuns({
+              lifecycle: tab,
+              offset,
+              limit,
+              host,
+              signal,
+              customer,
+              onHostsWithoutCustomer: scoped.reportHosts(host, offset),
+            }),
+          )
+        : api.getAgentRuns({ lifecycle: tab, offset, limit, host, signal }),
+    [tab, customer, scoped.guard, scoped.reportHosts],
   );
   const { rows, slices, loading, error, hasMore, sentinelRef, refresh, refreshHost, removeRow, retryPaging, ended } =
     usePerHostPagedList<AgentRunRow>({
@@ -128,7 +155,7 @@ export default function AgentRuns() {
       fetch: fetchRows,
       timeField: 'started_at',
       idField: 'run_id',
-      deps: [tab],
+      deps: [tab, customer],
       poll: tab === 'active',
     });
 
@@ -256,7 +283,12 @@ export default function AgentRuns() {
     handleStandaloneArchive,
     handleStandaloneDelete,
   );
-  const columns: Column<AgentRunRow>[] = [...AGENT_RUN_COLUMNS, actionColumn];
+  // The Customer column resolves slugs (archived customers load on first need).
+  const customers = useRunCustomers(!customer ? rows.map((r) => r.customer) : []);
+  const columns: Column<AgentRunRow>[] = [
+    ...withCustomerColumn(AGENT_RUN_COLUMNS, customers, rows, !customer),
+    actionColumn,
+  ];
   // A fresh action error (e.g. this click's Archive/Delete refusal) must win
   // over a stale fetch error from an earlier load — never the other way
   // around, or the operator sees the wrong banner for what just happened.
@@ -301,12 +333,14 @@ export default function AgentRuns() {
   );
 
   return (
-    <div className="p-8">
-      <header className="flex items-center justify-between mb-6">
-        <div>
-          <h1 className="text-2xl font-semibold text-ink">Agent Runs</h1>
-          <p className="mt-1 text-sm text-ink-dim">Standalone and session-bound agent invocations.</p>
-        </div>
+    <div className={embedded ? undefined : 'p-8'}>
+      <header className={cn('flex items-center justify-between', embedded ? 'mb-3 justify-end' : 'mb-6')}>
+        {!embedded && (
+          <div>
+            <h1 className="text-2xl font-semibold text-ink">Agent Runs</h1>
+            <p className="mt-1 text-sm text-ink-dim">Standalone and session-bound agent invocations.</p>
+          </div>
+        )}
         <Button variant="secondary" onClick={() => refresh()} className="gap-1.5">
           <RefreshCw size={12} className={cn(loading && 'animate-spin')} />
           Refresh
@@ -341,6 +375,13 @@ export default function AgentRuns() {
       <div className="mt-3">
         <PerHostStrip slices={slices} />
       </div>
+      {customer && (
+        <HostsWithoutCustomerBanner
+          className="mt-3"
+          hosts={slices.map((sl) => ({ id: sl.hostId, name: sl.name, state: sl.state, reason: sl.reason }))}
+          without={scoped.hostsWithoutCustomer}
+        />
+      )}
 
       <div className="mt-5">
         {bannerError && <ErrorBanner className="mb-4">{bannerError}</ErrorBanner>}
@@ -365,7 +406,11 @@ export default function AgentRuns() {
             hint={
               missing
                 ? `Not included: ${missing}.`
-                : 'Standalone and session-bound agent invocations will appear here once they run.'
+                : customer === 'none'
+                  ? 'No agent runs without a customer yet.'
+                  : customer
+                    ? 'No agent runs are attributed to this customer yet.'
+                    : 'Standalone and session-bound agent invocations will appear here once they run.'
             }
           />
         ) : visible.length === 0 ? (
@@ -608,7 +653,12 @@ const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
     align: 'right',
     sortable: true,
     sortValue: (r) => r.usage.cost_usd,
-    render: (r) => <span className="text-ink font-medium">{formatCost(r.usage.cost_usd)}</span>,
+    render: (r) => (
+      <span className="inline-flex items-center justify-end gap-1 text-ink font-medium">
+        <PricingErrorMark error={r.usage.pricing_error} />
+        {formatCost(r.usage.cost_usd)}
+      </span>
+    ),
   },
   {
     key: 'turns',

@@ -26,6 +26,8 @@ import { render, screen, cleanup, waitFor } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
 import { api } from './lib/api';
 import { ThemeProvider } from './components/theme/ThemeProvider';
+import { CustomerScopeProvider } from './lib/customerScope';
+import { ACME } from './lib/customerScopeTestUtils';
 
 vi.mock('./pages/RunDetail', () => ({
   __esModule: true,
@@ -75,6 +77,30 @@ function mockApi() {
   // Shell v2 chrome (rail host footer, top-bar scope select, live pill).
   vi.spyOn(api, 'getHosts').mockResolvedValue([]);
   vi.spyOn(api, 'getProjects').mockResolvedValue([]);
+  vi.spyOn(api, 'getCustomers').mockResolvedValue([]);
+  vi.spyOn(api, 'getCustomer').mockResolvedValue({
+    customer: {
+      slug: 'acme',
+      name: 'Acme',
+      notes: null,
+      contact: null,
+      color: null,
+      tint: { light: '#111111', dark: '#eeeeee' },
+      archived: false,
+      created_at: '2026-10-01T00:00:00Z',
+    },
+    rollup: {
+      projects: 0,
+      run_count: 0,
+      usage: { input_tokens: 0, output_tokens: 0, cached_tokens: 0, total_tokens: 0, cost_usd: 0, priced: true, runs: 0 },
+      findings_open: 0,
+      last_active: null,
+    },
+    projects: [],
+    default_account: null,
+    layer_error: null,
+    config_path: '~/.rupu/customers/acme/config.toml',
+  });
   vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([]);
   vi.spyOn(api, 'subscribeEvents').mockImplementation(() => () => {});
   // CommandPalette's fetch-on-open sources (mounted by both Layout and
@@ -110,8 +136,10 @@ function renderApp(shell: 'v1' | 'v2', initialPath: string) {
   return render(
     <ThemeProvider>
       <MemoryRouter initialEntries={[initialPath]}>
-        <LocationSpy />
-        <AppRoutes shell={shell} />
+        <CustomerScopeProvider>
+          <LocationSpy />
+          <AppRoutes shell={shell} />
+        </CustomerScopeProvider>
       </MemoryRouter>
     </ThemeProvider>,
   );
@@ -130,6 +158,32 @@ afterEach(() => {
 });
 
 describe('AppRoutes shell branch', () => {
+  it.each(['/customers', '/customers/acme', '/customers/acme/config'])(
+    'v1: %s is routed (not redirected, not a 404)',
+    async (path) => {
+      renderApp('v1', path);
+      // The customers pages are lazy chunks: a cold import under full-suite
+      // load can outlast waitFor's 1s default.
+      await waitFor(() => expect(screen.getByRole('heading', { level: 1 })).toBeInTheDocument(), {
+        timeout: 5000,
+      });
+      expect(screen.getByTestId('loc')).toHaveTextContent(path);
+    },
+  );
+
+  it.each(['/customers', '/customers/acme', '/customers/acme/config'])(
+    'v2: %s is routed (not redirected, not a 404)',
+    async (path) => {
+      renderApp('v2', path);
+      // The customers pages are lazy chunks: a cold import under full-suite
+      // load can outlast waitFor's 1s default.
+      await waitFor(() => expect(screen.getByRole('heading', { level: 1 })).toBeInTheDocument(), {
+        timeout: 5000,
+      });
+      expect(screen.getByTestId('loc')).toHaveTextContent(path);
+    },
+  );
+
   it('v2: /dashboard redirects to /overview', async () => {
     renderApp('v2', '/dashboard');
     await waitFor(() => expect(screen.getByTestId('loc')).toHaveTextContent('/overview'));
@@ -192,5 +246,37 @@ describe('AppRoutes shell branch', () => {
   it('v2: /events (wall display) survives untouched', async () => {
     renderApp('v2', '/events');
     await waitFor(() => expect(screen.getByTestId('loc')).toHaveTextContent('/events'));
+  });
+});
+
+describe('v2 composite pages follow the customer scope', () => {
+  beforeEach(() => {
+    vi.mocked(api.getCustomers).mockResolvedValue([ACME]);
+    vi.mocked(api.getRegisteredHosts).mockResolvedValue([{ id: 'local', name: 'Local', transport_kind: 'local' }]);
+  });
+
+  it('Activity → agents fetches with the scope', async () => {
+    renderApp('v2', '/activity?tab=agents&customer=acme');
+    await waitFor(() =>
+      expect(api.getAgentRuns).toHaveBeenCalledWith(expect.objectContaining({ customer: 'acme', host: 'local' })),
+    );
+  });
+
+  it('Activity → workflows fetches with the scope', async () => {
+    const spy = vi.spyOn(api, 'getWorkflowRuns').mockResolvedValue([]);
+    renderApp('v2', '/activity?tab=workflows&customer=acme');
+    await waitFor(() => expect(spy).toHaveBeenCalledWith(expect.objectContaining({ customer: 'acme' })));
+  });
+
+  it('Activity → sessions fetches with the scope', async () => {
+    renderApp('v2', '/activity?tab=sessions&customer=acme');
+    await waitFor(() =>
+      expect(api.getSessions).toHaveBeenCalledWith(expect.objectContaining({ customer: 'acme', host: 'local' })),
+    );
+  });
+
+  it('Security → findings fetches with the scope', async () => {
+    renderApp('v2', '/security?tab=findings&customer=acme');
+    await waitFor(() => expect(api.getFindings).toHaveBeenCalledWith({ customer: 'acme' }));
   });
 });

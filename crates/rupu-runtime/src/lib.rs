@@ -2,6 +2,7 @@ pub mod admission;
 mod artifacts;
 mod autoflow_history;
 mod backend;
+pub mod credential_manifest;
 pub mod file_cache;
 pub mod hop_builder;
 pub mod model_limits;

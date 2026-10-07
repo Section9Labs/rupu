@@ -38,6 +38,7 @@ import { SessionStatusPill } from '../StatusPill';
 import { usePagedList } from '../../lib/usePagedList';
 import { durationBetween, relativeTime } from '../../lib/time';
 import { formatTokens, formatCost } from '../../lib/usage';
+import { PricingErrorMark } from '../customers/PricingErrorMark';
 import { sessionStatusDisplayLabel, sessionStatusTone } from '../../lib/sessionStatus';
 import { shortId } from '../../lib/shortId';
 
@@ -156,7 +157,10 @@ function buildSessionColumns(navigate: ReturnType<typeof useNavigate>): Column<S
     sortable: true,
     sortValue: (s) => s.usage?.cost_usd ?? null,
     render: (s) => (
-      <span className="text-ink font-medium">{s.usage ? formatCost(s.usage.cost_usd) : '—'}</span>
+      <span className="inline-flex items-center justify-end gap-1 text-ink font-medium">
+        <PricingErrorMark error={s.usage?.pricing_error} />
+        {s.usage ? formatCost(s.usage.cost_usd) : '—'}
+      </span>
     ),
   },
   {

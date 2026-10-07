@@ -28,6 +28,7 @@ vi.mock('../components/CodeEditor', () => ({
 }));
 
 import Workflows from './Workflows';
+import { withCustomerScope } from '../lib/customerScopeTestUtils';
 
 const USAGE = {
   input_tokens: 0,
@@ -54,7 +55,7 @@ describe('Workflows — definition-table canonical column order', () => {
 
     const { container } = render(
       <MemoryRouter initialEntries={['/workflows']}>
-        <Workflows />
+        {withCustomerScope(<Workflows />)}
       </MemoryRouter>,
     );
 

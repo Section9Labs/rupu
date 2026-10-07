@@ -52,6 +52,7 @@ rupu-config = { path = "../rupu-config" }
 rupu-agent = { path = "../rupu-agent" }
 rupu-workspace = { path = "../rupu-workspace" }
 rupu-runtime = { path = "../rupu-runtime" }
+rupu-auth = { path = "../rupu-auth" }
 rupu-coverage = { path = "../rupu-coverage" }
 rupu-transcript = { path = "../rupu-transcript" }
 rupu-ast = { path = "../rupu-ast" }
@@ -70,6 +71,7 @@ rupu-transcript = { path = "../rupu-transcript" }
 httpmock.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "test-util"] }
 tokio-tungstenite = { workspace = true }
+rupu-providers = { path = "../rupu-providers" }
 futures-util = { workspace = true }
 serde_json.workspace = true
 tower.workspace = true

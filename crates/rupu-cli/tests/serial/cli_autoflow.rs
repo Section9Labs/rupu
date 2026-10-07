@@ -240,6 +240,7 @@ fn seed_monitor_state(home: &std::path::Path) {
 
 fn sample_run_record(id: &str, issue_ref: &str) -> rupu_orchestrator::RunRecord {
     rupu_orchestrator::RunRecord {
+        customer: None,
         id: id.into(),
         workflow_name: "issue-supervisor-dispatch".into(),
         status: rupu_orchestrator::RunStatus::Pending,
@@ -1035,6 +1036,7 @@ steps:
     let ctx = rupu_cli::cmd::workflow::ExplicitWorkflowRunContext {
         project_root: Some(project.path().to_path_buf()),
         workspace_path: project.path().to_path_buf(),
+        customer_dir: None,
         workspace_id: "ws_auto".into(),
         inputs: Vec::new(),
         mode: "bypass".into(),
@@ -1105,6 +1107,7 @@ steps:
     let strict_ctx = rupu_cli::cmd::workflow::ExplicitWorkflowRunContext {
         project_root: Some(project.path().to_path_buf()),
         workspace_path: project.path().to_path_buf(),
+        customer_dir: None,
         workspace_id: "ws_auto".into(),
         inputs: Vec::new(),
         mode: "bypass".into(),

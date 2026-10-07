@@ -270,7 +270,9 @@ async fn tunnel_host_resolves_reachable_false_when_no_node_connected() {
             node_registry,
             node_mirror,
             run_store,
-            rupu_config::PricingConfig::default(),
+            std::sync::Arc::new(rupu_cp::customers::CustomerPricing::flat(
+                rupu_config::PricingConfig::default(),
+            )),
         );
 
     // resolve() must succeed — the Tunnel host record exists and deps are wired.
@@ -351,7 +353,9 @@ async fn ssh_host_resolves_reachable_false_when_ssh_unreachable() {
             node_registry,
             node_mirror,
             run_store,
-            rupu_config::PricingConfig::default(),
+            std::sync::Arc::new(rupu_cp::customers::CustomerPricing::flat(
+                rupu_config::PricingConfig::default(),
+            )),
         );
 
     // resolve() must succeed — the SSH host record exists and deps are wired.
@@ -407,7 +411,9 @@ async fn bucket_host_resolves_ok_with_deps() {
             node_registry,
             node_mirror,
             run_store,
-            rupu_config::PricingConfig::default(),
+            std::sync::Arc::new(rupu_cp::customers::CustomerPricing::flat(
+                rupu_config::PricingConfig::default(),
+            )),
         );
 
     // resolve() must succeed — the Bucket host record exists and deps are wired.

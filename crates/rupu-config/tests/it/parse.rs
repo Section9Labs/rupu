@@ -147,11 +147,21 @@ fn locked_global_key_survives_a_project_override() {
     std::fs::write(&project, "permission_mode = \"bypass\"\n").unwrap();
 
     // Unlocked loader: project wins (today's behavior, unchanged).
-    let plain = rupu_config::layer_files(Some(&global), Some(&project)).unwrap();
+    let plain = rupu_config::layer_files(rupu_config::LayerPaths::new(
+        Some(&global),
+        None,
+        Some(&project),
+    ))
+    .unwrap();
     assert_eq!(plain.permission_mode.as_deref(), Some("bypass"));
 
     // Lock-aware loader: the global lock holds.
-    let locked = rupu_config::layer_files_locked(Some(&global), Some(&project)).unwrap();
+    let locked = rupu_config::layer_files_locked(rupu_config::LayerPaths::new(
+        Some(&global),
+        None,
+        Some(&project),
+    ))
+    .unwrap();
     assert_eq!(
         locked.permission_mode.as_deref(),
         Some("readonly"),
@@ -171,7 +181,12 @@ fn unlocked_keys_still_layer_project_over_global() {
     .unwrap();
     std::fs::write(&project, "default_model = \"p\"\n").unwrap();
 
-    let locked = rupu_config::layer_files_locked(Some(&global), Some(&project)).unwrap();
+    let locked = rupu_config::layer_files_locked(rupu_config::LayerPaths::new(
+        Some(&global),
+        None,
+        Some(&project),
+    ))
+    .unwrap();
     assert_eq!(locked.default_model.as_deref(), Some("p"));
 }
 
@@ -236,13 +251,21 @@ fn retry_survives_layer_files_and_the_lock_aware_loader() {
     .unwrap();
     std::fs::write(&project, "log_level = \"debug\"\n").unwrap();
 
-    let plain = rupu_config::layer_files(Some(&global), Some(&project))
-        .expect("`[retry]` must not fail layer_files");
+    let plain = rupu_config::layer_files(rupu_config::LayerPaths::new(
+        Some(&global),
+        None,
+        Some(&project),
+    ))
+    .expect("`[retry]` must not fail layer_files");
     assert_eq!(plain.default_model.as_deref(), Some("g"));
     assert_eq!(plain.log_level.as_deref(), Some("debug"));
 
-    let locked = rupu_config::layer_files_locked(Some(&global), Some(&project))
-        .expect("`[retry]` must not fail the lock-aware loader");
+    let locked = rupu_config::layer_files_locked(rupu_config::LayerPaths::new(
+        Some(&global),
+        None,
+        Some(&project),
+    ))
+    .expect("`[retry]` must not fail the lock-aware loader");
     assert_eq!(locked.default_model.as_deref(), Some("g"));
     assert_eq!(locked.log_level.as_deref(), Some("debug"));
 }

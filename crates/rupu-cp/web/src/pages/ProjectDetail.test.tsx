@@ -16,7 +16,9 @@ import {
   type FindingsResponse,
   type RunListRow,
   type ConfigView,
+  type CustomerRow,
 } from '../lib/api';
+import { ACME, withCustomerScope } from '../lib/customerScopeTestUtils';
 import { type UsageSummary } from '../lib/usage';
 import ProjectDetail, { type ProjectTab } from './ProjectDetail';
 
@@ -59,6 +61,7 @@ const DETAIL: ProjectDetailType = {
     usage: USAGE,
     run_count: 1,
     last_active: null,
+    customer: null,
   },
   runs: { total: 1, running: 0, by_status: {}, by_surface: { workflow: 1, autoflow: 0 } },
   sessions: { total: 0, active: 0 },
@@ -91,14 +94,17 @@ const FINDINGS: FindingsResponse = {
   summary: { total: 1, critical: 1, high: 0, medium: 0, low: 0, info: 0 },
 };
 
-function renderAt(path: string, tab: ProjectTab) {
+function renderAt(path: string, tab: ProjectTab, customers: CustomerRow[] = [ACME]) {
   return render(
     <MemoryRouter initialEntries={[path]}>
-      <Routes>
-        <Route path="/projects/:wsId" element={<ProjectDetail tab={tab} />} />
-        <Route path="/projects/:wsId/findings" element={<ProjectDetail tab={tab} />} />
-        <Route path="/projects/:wsId/config" element={<ProjectDetail tab={tab} />} />
-      </Routes>
+      {withCustomerScope(
+        <Routes>
+          <Route path="/projects/:wsId" element={<ProjectDetail tab={tab} />} />
+          <Route path="/projects/:wsId/findings" element={<ProjectDetail tab={tab} />} />
+          <Route path="/projects/:wsId/config" element={<ProjectDetail tab={tab} />} />
+        </Routes>,
+        { customers },
+      )}
     </MemoryRouter>,
   );
 }
@@ -284,5 +290,86 @@ describe('ProjectDetail Config tab', () => {
 
     const alert = await screen.findByRole('alert');
     expect(alert.textContent).toMatch(/enforced by global policy/i);
+  });
+});
+
+describe('ProjectDetail Usage tile', () => {
+  it('marks a cost priced at the global rates', async () => {
+    const usage = { ...USAGE, cost_usd: 1.2, pricing_error: 'customer acme: config layer does not parse' };
+    vi.spyOn(api, 'getProject').mockResolvedValue({ ...DETAIL, usage, project: { ...DETAIL.project, usage } });
+    vi.spyOn(api, 'getProjectAssessedPct').mockResolvedValue({ assessed_pct: null });
+    renderAt('/projects/x', 'overview');
+    expect(await screen.findByText('Usage')).toBeInTheDocument();
+    expect(
+      screen.getByRole('img', { name: 'Pricing unavailable: customer acme: config layer does not parse' }),
+    ).toBeInTheDocument();
+  });
+});
+
+describe('ProjectDetail — customer assignment in the header', () => {
+  const ACME_REF = { slug: 'acme', name: 'Acme', tint: ACME.tint, archived: false };
+  function stubLoad(customer: ProjectDetailType['project']['customer']) {
+    vi.spyOn(api, 'getProject').mockResolvedValue({ ...DETAIL, project: { ...DETAIL.project, customer } });
+    vi.spyOn(api, 'getProjectAssessedPct').mockResolvedValue({ assessed_pct: null });
+  }
+
+  it('shows the dashed "No customer" chip beside the title for an unassigned project', async () => {
+    stubLoad(null);
+    renderAt('/projects/x', 'overview');
+    expect(await screen.findByText('Acme Service')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /No customer/ })).toBeInTheDocument();
+  });
+
+  it('shows the muted unknown state when the CP cannot say', async () => {
+    stubLoad(undefined);
+    renderAt('/projects/x', 'overview');
+    expect(await screen.findByText('Unknown customer')).toBeInTheDocument();
+    expect(screen.queryByText('No customer')).toBeNull();
+  });
+
+  it('assigns from the header and the chip updates', async () => {
+    stubLoad(null);
+    const assign = vi.spyOn(api, 'assignProject').mockResolvedValue({ ...DETAIL.project, customer: ACME_REF });
+    renderAt('/projects/x', 'overview');
+    fireEvent.click(await screen.findByRole('button', { name: /No customer/ }));
+    fireEvent.click(await screen.findByRole('menuitemradio', { name: /Acme/ }));
+    await waitFor(() => expect(assign).toHaveBeenCalledWith('acme', 'x'));
+    expect(await screen.findByRole('button', { name: /Customer: Acme/ })).toBeInTheDocument();
+  });
+
+  it('assigning from the header re-reads an open Config tab under the new customer', async () => {
+    stubLoad(null);
+    let assigned = false;
+    vi.spyOn(api, 'getConfig').mockImplementation(async () =>
+      assigned
+        ? {
+            ...PROJECT_CONFIG,
+            effective: { ...PROJECT_CONFIG.effective, default_model: 'acme-model' },
+            provenance: { ...PROJECT_CONFIG.provenance, default_model: { source: 'customer', locked: false } },
+          }
+        : PROJECT_CONFIG,
+    );
+    vi.spyOn(api, 'assignProject').mockImplementation(async () => {
+      assigned = true;
+      return { ...DETAIL.project, customer: ACME_REF };
+    });
+    renderAt('/projects/x/config', 'config');
+    const model = (await screen.findByLabelText('Default model')) as HTMLInputElement;
+    expect(model.value).toBe('claude-sonnet-4-6');
+    fireEvent.click(screen.getByRole('button', { name: /No customer/ }));
+    fireEvent.click(await screen.findByRole('menuitemradio', { name: /Acme/ }));
+    await waitFor(() =>
+      expect((screen.getByLabelText('Default model') as HTMLInputElement).value).toBe('acme-model'),
+    );
+  });
+
+  it('unassigns from the header', async () => {
+    stubLoad(ACME_REF);
+    const unassign = vi.spyOn(api, 'unassignProject').mockResolvedValue(undefined);
+    renderAt('/projects/x', 'overview');
+    fireEvent.click(await screen.findByRole('button', { name: /Customer: Acme/ }));
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Unassign' }));
+    await waitFor(() => expect(unassign).toHaveBeenCalledWith('acme', 'x'));
+    expect(await screen.findByRole('button', { name: /No customer/ })).toBeInTheDocument();
   });
 });

@@ -5,6 +5,8 @@ import CommandPalette from './CommandPalette';
 import { sidebarNav, type NavLeaf, type NavGroup } from '../lib/sidebarNav';
 import SidebarGroup from './SidebarGroup';
 import ThemeToggle from './theme/ThemeToggle';
+import { CustomerPicker } from './customers/CustomerPicker';
+import { ScopeNotice } from './customers/ScopeNotice';
 
 // Pure helpers — kept outside the component so React doesn't have to
 // recreate them on every render.
@@ -31,6 +33,9 @@ export default function Layout() {
         <Link to="/" className="px-5 py-5 flex items-center border-b border-border">
           <Brand />
         </Link>
+
+        {/* Customer scope */}
+        <CustomerPicker variant="sidebar" />
 
         {/* Nav */}
         <nav className="flex-1 py-3 px-2 space-y-0.5 overflow-y-auto">
@@ -86,6 +91,7 @@ export default function Layout() {
       </aside>
 
       <main className="flex-1 overflow-auto">
+        <ScopeNotice />
         <Outlet />
       </main>
 

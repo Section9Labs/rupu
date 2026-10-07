@@ -35,6 +35,7 @@ vi.mock('../components/AgentLauncherSheet', () => ({
 }));
 
 import Agents from './Agents';
+import { withCustomerScope } from '../lib/customerScopeTestUtils';
 
 function LocationProbe() {
   const loc = useLocation();
@@ -67,7 +68,7 @@ describe('Agents — row actions', () => {
 
     render(
       <MemoryRouter initialEntries={['/agents']}>
-        <Agents />
+        {withCustomerScope(<Agents />)}
       </MemoryRouter>,
     );
     await waitFor(() => expect(screen.getByText('reviewer')).toBeInTheDocument());
@@ -88,7 +89,7 @@ describe('Agents — row actions', () => {
 
     render(
       <MemoryRouter initialEntries={['/agents']}>
-        <Agents />
+        {withCustomerScope(<Agents />)}
         <LocationProbe />
       </MemoryRouter>,
     );
@@ -108,7 +109,7 @@ describe('Agents — row actions', () => {
 
     render(
       <MemoryRouter initialEntries={['/agents']}>
-        <Agents />
+        {withCustomerScope(<Agents />)}
         <LocationProbe />
       </MemoryRouter>,
     );
@@ -130,7 +131,7 @@ describe('Agents — row actions', () => {
 
     render(
       <MemoryRouter initialEntries={['/agents']}>
-        <Agents />
+        {withCustomerScope(<Agents />)}
       </MemoryRouter>,
     );
     await waitFor(() => expect(screen.getByText('reviewer')).toBeInTheDocument());
@@ -148,7 +149,7 @@ describe('Agents — row actions', () => {
 
     render(
       <MemoryRouter initialEntries={['/agents']}>
-        <Agents />
+        {withCustomerScope(<Agents />)}
         <LocationProbe />
       </MemoryRouter>,
     );
@@ -171,7 +172,7 @@ describe('Agents — row actions', () => {
 
     render(
       <MemoryRouter initialEntries={['/agents']}>
-        <Agents />
+        {withCustomerScope(<Agents />)}
       </MemoryRouter>,
     );
     await waitFor(() => expect(screen.getByText('reviewer')).toBeInTheDocument());

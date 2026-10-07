@@ -36,6 +36,10 @@ pub struct ProjectRow {
     pub usage: crate::usage::UsageSummary,
     pub run_count: u64,
     pub last_active: Option<String>,
+    /// The customer the project is currently assigned to. Always serialized
+    /// (`null` = no customer), so a coordinator can tell "no customer" from
+    /// a peer too old to say.
+    pub customer: Option<crate::customers::CustomerRef>,
 }
 
 /// Project rollup returned by `GET /api/projects/:ws_id`. The nested
@@ -58,8 +62,10 @@ fn store(s: &AppState) -> WorkspaceStore {
     }
 }
 
-/// Map a [`rupu_workspace::Workspace`] to a [`ProjectRow`].
-fn project_row(w: &rupu_workspace::Workspace) -> ProjectRow {
+/// Map a [`rupu_workspace::Workspace`] to a [`ProjectRow`] with no customer;
+/// callers set `customer` from the current assignment
+/// ([`crate::customers::CustomerLookup::project_customer`]).
+pub(crate) fn project_row(w: &rupu_workspace::Workspace) -> ProjectRow {
     ProjectRow {
         name: std::path::Path::new(&w.path)
             .file_name()
@@ -79,7 +85,22 @@ fn project_row(w: &rupu_workspace::Workspace) -> ProjectRow {
         usage: crate::usage::UsageSummary::default(),
         run_count: 0,
         last_active: None,
+        customer: None,
     }
+}
+
+/// Each workspace's current customer, as row references. Blocking IO.
+fn project_customers(
+    lookup: &mut crate::customers::CustomerLookup,
+    ws_ids: &[String],
+) -> Result<BTreeMap<String, crate::customers::CustomerRef>, ApiError> {
+    let mut out = BTreeMap::new();
+    for id in ws_ids {
+        if let Some(c) = lookup.project_customer(id)? {
+            out.insert(id.clone(), c);
+        }
+    }
+    Ok(out)
 }
 
 pub fn routes() -> Router<AppState> {
@@ -101,66 +122,119 @@ pub fn routes() -> Router<AppState> {
         .route("/api/projects/:ws_id/autoflows", get(project_autoflows))
 }
 
-/// Standalone agent runs and session turns that no workflow run claims
-/// ([`crate::usage_sources::unclaimed_extra_sources`] — each transcript
-/// once), priced and grouped by their transcript's workspace id; `only`
-/// keeps a single project. Each entry is `(usage, started_at RFC-3339)`.
-/// Blocking IO.
-fn extra_spend_by_workspace(
+/// The Projects page's per-project rollups: every workflow run grouped by
+/// owning workspace id, plus each project's standalone agent runs and
+/// session turns (`extras`, from
+/// [`crate::usage_sources::unclaimed_extra_sources`] — each transcript
+/// once), which add spend and activity, not to `run_count` (the project's
+/// workflow-run count, as its runs tab lists). Each run and transcript is
+/// priced with the pricing of the customer it is attributed to (recorded,
+/// else — a legacy record — the workspace's current assignment). A project
+/// rollup counts ALL of the project's work, whoever it is attributed to: a
+/// run that recorded another customer (or none) before the project was
+/// (re)assigned stays in the project's rollup but counts towards the
+/// customer it recorded, so a customer's projects need not sum to that
+/// customer's rollup. `keep` selects the projects. An assignment that
+/// cannot be read fails the call. Blocking IO.
+pub(crate) fn project_rollups(
     run_store: &rupu_orchestrator::runs::RunStore,
-    global: &std::path::Path,
-    pricing: &rupu_config::PricingConfig,
-    only: Option<&str>,
-) -> BTreeMap<String, Vec<(crate::usage::UsageSummary, Option<String>)>> {
-    let mut out: BTreeMap<String, Vec<_>> = BTreeMap::new();
-    for src in crate::usage_sources::unclaimed_extra_sources(global, run_store) {
-        if src.workspace_id.is_empty() || only.is_some_and(|w| src.workspace_id != w) {
+    runs: &[RunRecord],
+    extras: &[crate::usage_sources::ExtraSource],
+    prices: &mut crate::customers::PricingMemo<'_>,
+    lookup: &mut crate::customers::CustomerLookup,
+    keep: impl Fn(&str) -> bool,
+) -> Result<BTreeMap<String, crate::usage::EntityRollup>, ApiError> {
+    let mut out: BTreeMap<String, crate::usage::EntityRollup> = BTreeMap::new();
+    for r in runs {
+        if !keep(&r.workspace_id) {
             continue;
         }
+        // A mirrored worker run is priced by what it recorded only (a legacy
+        // one at the global rates, flagged).
+        let key = crate::customers::PriceKey::of(lookup.attribute_run(r, true)?.as_ref());
+        let mut usage = crate::usage::summarize_run(run_store, &r.id, prices.get(key.slug()));
+        usage.pricing_error = key.pricing_error(prices);
+        out.entry(r.workspace_id.clone())
+            .or_default()
+            .add(&usage, Some(r.started_at.to_rfc3339()));
+    }
+    for src in extras {
+        if src.workspace_id.is_empty() || !keep(&src.workspace_id) {
+            continue;
+        }
+        let who = src.attribute(lookup)?;
         let usage = crate::usage::summarize_run_usage(
             &crate::usage::transcripts_usage(&src.paths),
-            pricing,
+            prices.get(who.slug.as_deref()),
         );
-        out.entry(src.workspace_id)
+        let usage = prices.stamp(usage, who.slug.as_deref());
+        out.entry(src.workspace_id.clone())
             .or_default()
-            .push((usage, src.started_at.map(|t| t.to_rfc3339())));
+            .add_spend(&usage, src.started_at.map(|t| t.to_rfc3339()));
     }
-    out
+    Ok(out)
 }
 
-async fn list_projects(State(s): State<AppState>) -> ApiResult<Json<Vec<ProjectRow>>> {
+/// Apply a project's rollup to its row.
+pub(crate) fn apply_rollup(row: &mut ProjectRow, roll: &crate::usage::EntityRollup) {
+    row.usage = roll.usage.clone();
+    row.run_count = roll.run_count;
+    row.last_active = roll.last_active.clone();
+}
+
+/// `?customer=<slug>|none` on `GET /api/projects`.
+#[derive(serde::Deserialize, Default)]
+struct ProjectsQuery {
+    customer: Option<String>,
+}
+
+/// `GET /api/projects[?customer=<slug>|none]` — every registered project with
+/// its rollup and current customer. `?customer=` keeps the projects CURRENTLY
+/// assigned to that customer (`none` = to no customer; plan ruling 6). A bad
+/// slug is a 400.
+async fn list_projects(
+    State(s): State<AppState>,
+    Query(q): Query<ProjectsQuery>,
+) -> ApiResult<Json<Vec<ProjectRow>>> {
+    let filter = crate::customers::CustomerFilter::parse(q.customer.as_deref())?;
     let workspaces = store(&s).list().unwrap_or_default();
+    let ws_ids: Vec<String> = workspaces.iter().map(|w| w.id.clone()).collect();
     // Every workflow run grouped by owning workspace id, plus each project's
     // standalone agent runs and session turns: they add spend and activity,
     // not to `run_count` (the project's workflow-run count, as its runs tab
     // lists). Blocking IO.
-    let rollups = {
+    let (rollups, mut customers) = {
         let run_store = std::sync::Arc::clone(&s.run_store);
         let global = s.global_dir.clone();
-        let pricing = s.pricing.clone();
-        tokio::task::spawn_blocking(move || {
-            let runs = run_store.list().unwrap_or_default();
-            let mut rollups = crate::usage::rollup_by(&run_store, &runs, &pricing, |r| {
-                Some(r.workspace_id.clone())
-            });
-            for (ws, spend) in extra_spend_by_workspace(&run_store, &global, &pricing, None) {
-                let roll = rollups.entry(ws).or_default();
-                for (usage, at) in spend {
-                    roll.add_spend(&usage, at);
-                }
-            }
-            rollups
+        let pricing = std::sync::Arc::clone(&s.customer_pricing);
+        crate::api::runs::blocking(move || {
+            let mut lookup =
+                crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
+            let mut prices = crate::customers::PricingMemo::new(&pricing);
+            let customers = project_customers(&mut lookup, &ws_ids)?;
+            // An unreadable run store fails the rollups rather than show
+            // every project with no spend.
+            let runs = run_store
+                .list()
+                .map_err(|e| ApiError::internal(format!("cannot list runs: {e}")))?;
+            let extras = crate::usage_sources::unclaimed_extra_sources(&global, &run_store);
+            let rollups =
+                project_rollups(&run_store, &runs, &extras, &mut prices, &mut lookup, |_| {
+                    true
+                })?;
+            Ok((rollups, customers))
         })
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?
+        .await?
     };
     let mut rows: Vec<ProjectRow> = workspaces.iter().map(project_row).collect();
     for row in &mut rows {
         if let Some(roll) = rollups.get(&row.ws_id) {
-            row.usage = roll.usage.clone();
-            row.run_count = roll.run_count;
-            row.last_active = roll.last_active.clone();
+            apply_rollup(row, roll);
         }
+        row.customer = customers.remove(&row.ws_id);
+    }
+    if let Some(f) = &filter {
+        rows.retain(|r| f.matches(r.customer.as_ref().map(|c| c.slug.as_str())));
     }
     // Newest activity first; `None` sorts last (None < Some(_) in Rust's
     // default Ord, so reversing puts Some(_) before None).
@@ -215,7 +289,7 @@ async fn get_project(
             _ => autoflow += 1,
         }
     }
-    let recent_runs: Vec<RunListRow> = runs.iter().take(10).map(RunListRow::from).collect();
+    let mut recent_runs: Vec<RunListRow> = runs.iter().take(10).map(RunListRow::from).collect();
     let runs_obj = json!({
         "total": total,
         "running": running,
@@ -227,32 +301,51 @@ async fn get_project(
     // Sessions are only counted here, so they are listed without folding
     // their transcripts. Usage is the project's workflow runs plus its
     // standalone agent runs and session turns, each transcript once.
-    let (scoped_sessions, usage) = {
+    let (scoped_sessions, usage, mut customers, recent_who) = {
         let run_store = std::sync::Arc::clone(&s.run_store);
         let global = s.global_dir.clone();
-        let pricing = s.pricing.clone();
+        let pricing = std::sync::Arc::clone(&s.customer_pricing);
         let ws = ws_id.clone();
-        let run_ids: Vec<String> = runs.iter().map(|r| r.id.clone()).collect();
-        tokio::task::spawn_blocking(move || {
+        let scoped = runs.clone();
+        crate::api::runs::blocking(move || {
+            let mut lookup =
+                crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
+            let mut prices = crate::customers::PricingMemo::new(&pricing);
+            let customers = project_customers(&mut lookup, std::slice::from_ref(&ws))?;
+            // The recent runs' customers: recorded, else (a local legacy run)
+            // derived; a legacy mirrored run's can't be known (`None`).
+            let recent_who = scoped
+                .iter()
+                .take(10)
+                .map(|r| lookup.attribute_run(r, true))
+                .collect::<Result<Vec<_>, ApiError>>()?;
             let sessions = crate::api::sessions::collect_sessions_with(
                 &global,
                 crate::api::sessions::SessionScan {
                     pricing: None,
                     workspace: Some(&ws),
+                    fail_closed: true,
                 },
-            );
-            let extra = extra_spend_by_workspace(&run_store, &global, &pricing, Some(&ws));
-            let usage = crate::usage::rollup(
-                run_ids
-                    .iter()
-                    .map(|id| crate::usage::summarize_run(&run_store, id, &pricing))
-                    .chain(extra.into_values().flatten().map(|(u, _)| u)),
-            );
-            (sessions, usage)
+            )?;
+            let extras = crate::usage_sources::unclaimed_extra_sources(&global, &run_store);
+            let usage = project_rollups(
+                &run_store,
+                &scoped,
+                &extras,
+                &mut prices,
+                &mut lookup,
+                |w| w == ws,
+            )?
+            .remove(&ws)
+            .unwrap_or_default()
+            .usage;
+            Ok((sessions, usage, customers, recent_who))
         })
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?
+        .await?
     };
+    for (row, who) in recent_runs.iter_mut().zip(recent_who) {
+        row.customer = who.map(Into::into);
+    }
     let sessions_active = scoped_sessions
         .iter()
         .filter(|v| session_is_active(v))
@@ -283,8 +376,10 @@ async fn get_project(
         "findings": findings_sum,
     });
 
+    let mut project = project_row(&w);
+    project.customer = customers.remove(&w.id);
     Ok(Json(ProjectDetail {
-        project: project_row(&w),
+        project,
         runs: runs_obj,
         sessions: sessions_obj,
         coverage: coverage_obj,
@@ -313,6 +408,9 @@ fn session_is_active(v: &Value) -> bool {
 }
 
 /// `GET /api/projects/:ws_id/runs` — scoped slim run list, newest-first.
+/// Each row carries its customer (recorded, else the project's current
+/// assignment) and is priced with that customer's pricing (spec §1); work
+/// with no customer at the global pricing.
 async fn project_runs(
     State(s): State<AppState>,
     Path(ws_id): Path<String>,
@@ -322,14 +420,18 @@ async fn project_runs(
     load_workspace(&s, &ws_id)?;
     let runs = scoped_runs(&s, &ws_id)?; // already sorted newest-first
     let page_runs = crate::pagination::paginate(runs, &page);
-    // The usage fold runs on the blocking pool.
+    // The usage fold and the assignment read run on the blocking pool.
     let store = std::sync::Arc::clone(&s.run_store);
-    let pricing = s.pricing.clone();
+    let customer_pricing = std::sync::Arc::clone(&s.customer_pricing);
+    let global = s.global_dir.clone();
     let rows = crate::api::runs::blocking(move || {
-        Ok(page_runs
+        let mut lookup =
+            crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
+        let mut prices = crate::customers::PricingMemo::new(&customer_pricing);
+        page_runs
             .iter()
-            .map(|r| RunListRow::with_usage(r, &store, &pricing))
-            .collect())
+            .map(|r| RunListRow::attributed(r, &store, &mut lookup, &mut prices))
+            .collect()
     })
     .await?;
     Ok(Json(rows))
@@ -342,21 +444,25 @@ async fn project_sessions(
     Query(page): Query<crate::pagination::PageQuery>,
 ) -> ApiResult<Json<Vec<Value>>> {
     load_workspace(&s, &ws_id)?;
-    // Scoped BEFORE usage is folded; blocking IO.
+    // Scoped BEFORE usage is folded; each session is attributed to its
+    // customer and priced with that customer's pricing. Blocking IO.
     let scoped: Vec<Value> = {
         let global = s.global_dir.clone();
-        let pricing = s.pricing.clone();
+        let pricing = std::sync::Arc::clone(&s.customer_pricing);
         tokio::task::spawn_blocking(move || {
             crate::api::sessions::collect_sessions_with(
                 &global,
+                // An unfiltered list: a session whose assignment can't be
+                // read is listed without customer keys.
                 crate::api::sessions::SessionScan {
                     pricing: Some(&pricing),
                     workspace: Some(&ws_id),
+                    fail_closed: false,
                 },
             )
         })
         .await
-        .map_err(|e| ApiError::internal(e.to_string()))?
+        .map_err(|e| ApiError::internal(e.to_string()))??
     };
     Ok(Json(crate::pagination::paginate(scoped, &page)))
 }
@@ -595,6 +701,7 @@ mod tests {
                 usage: crate::usage::UsageSummary::default(),
                 run_count: 0,
                 last_active: None,
+                customer: None,
             },
             runs: json!({}),
             sessions: json!({}),

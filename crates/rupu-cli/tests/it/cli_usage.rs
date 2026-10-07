@@ -54,6 +54,7 @@ fn write_usage_transcript(
             schema: None,
             system_prompt: None,
             codename: None,
+            customer: None,
         })
         .unwrap();
     writer
@@ -120,6 +121,7 @@ fn sample_run_record(
     status: RunStatus,
 ) -> RunRecord {
     RunRecord {
+        customer: None,
         id: id.into(),
         workflow_name: workflow_name.into(),
         status,
@@ -690,6 +692,7 @@ fn usage_backfill_creates_sidecars_for_old_standalone_transcripts() {
             schema: None,
             system_prompt: None,
             codename: None,
+            customer: None,
         })
         .unwrap();
     for event in events.into_iter().skip(1) {

@@ -14,6 +14,7 @@ import { MemoryRouter } from 'react-router-dom';
 import { api } from '../../lib/api';
 import type { AutoflowEventRow, HostView } from '../../lib/api';
 import AutoflowRuns from './AutoflowRuns';
+import { withCustomerScope } from '../../lib/customerScopeTestUtils';
 
 afterEach(() => {
   cleanup();
@@ -74,7 +75,7 @@ function stubPage(events: AutoflowEventRow[]) {
 function renderPage() {
   return render(
     <MemoryRouter>
-      <AutoflowRuns />
+      {withCustomerScope(<AutoflowRuns />)}
     </MemoryRouter>,
   );
 }

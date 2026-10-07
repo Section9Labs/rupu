@@ -15,6 +15,7 @@ export function rollupSummaries(list: readonly UsageSummary[]): UsageSummary {
   let cost = 0;
   let priced = true;
   let partial = false;
+  let pricingError: string | undefined;
   for (const s of list) {
     input += s.input_tokens;
     output += s.output_tokens;
@@ -27,6 +28,7 @@ export function rollupSummaries(list: readonly UsageSummary[]): UsageSummary {
     }
     if (!s.priced) priced = false;
     if (s.partial) partial = true;
+    pricingError ??= s.pricing_error;
   }
   return {
     input_tokens: input,
@@ -38,6 +40,7 @@ export function rollupSummaries(list: readonly UsageSummary[]): UsageSummary {
     priced,
     runs,
     partial,
+    ...(pricingError ? { pricing_error: pricingError } : {}),
   };
 }
 

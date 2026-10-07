@@ -2327,14 +2327,7 @@ fn retained_workflow_ui_prefs() -> anyhow::Result<UiPrefs> {
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
     // UI prefs only — lock does not apply (I-7)
-    let cfg = rupu_config::layer_files(
-        Some(&global.join("config.toml")),
-        project_root
-            .as_deref()
-            .map(|root| root.join(".rupu/config.toml"))
-            .as_deref(),
-    )
-    .unwrap_or_default();
+    let cfg = paths::load_config_for_display(&global, project_root.as_deref(), &pwd, false);
     Ok(UiPrefs::resolve(&cfg.ui, false, None, None, None))
 }
 
@@ -4155,6 +4148,7 @@ mod tests {
 
     fn sample_run_record() -> RunRecord {
         RunRecord {
+            customer: None,
             id: "run_test".into(),
             workflow_name: "demo".into(),
             status: rupu_orchestrator::RunStatus::Running,
@@ -4666,6 +4660,7 @@ mod tests {
                     schema: None,
                     system_prompt: None,
                     codename: None,
+                    customer: None,
                 },
                 TxEvent::AssistantMessage {
                     content: "Summarized the implementation plan.".into(),
@@ -5077,6 +5072,7 @@ mod tests {
                 schema: None,
                 system_prompt: None,
                 codename: None,
+                customer: None,
             },
             TxEvent::AssistantMessage {
                 content: "## Child output\n\n- item one\n- item two".into(),
@@ -5215,6 +5211,7 @@ mod tests {
                 schema: None,
                 system_prompt: None,
                 codename: None,
+                customer: None,
             },
             TxEvent::AssistantMessage {
                 content: "## Reviewer output\n\n- looks good".into(),

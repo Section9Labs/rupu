@@ -28,6 +28,7 @@ import { buildRoster, buildVitals, deriveActivity, reconcileActivity } from '../
 import PulseStrip from '../components/situationRoom/PulseStrip';
 import EventStream from '../components/situationRoom/EventStream';
 import ProjectRoster from '../components/situationRoom/ProjectRoster';
+import { UnscopedNote } from '../components/customers/UnscopedNote';
 
 const PAGE_SIZE = 200;
 const MAX_EVENTS = 5000;
@@ -345,6 +346,7 @@ export default function Events() {
   return (
     <div className="flex flex-col h-full min-h-0 overflow-hidden">
       <PulseStrip vitals={vitals} connection={connection} spark={spark} />
+      <UnscopedNote className="mx-4 mt-2 shrink-0">Live events cover every customer.</UnscopedNote>
       <div className="flex flex-1 min-h-0">
         <EventStream
           cards={cards}

@@ -111,12 +111,11 @@ async fn run_cmd(def_name: &str, format: Option<OutputFormat>) -> anyhow::Result
     // `agentiflows/` / `agents/`, which in a project is `<root>/.rupu`.
     let project_rupu = project_root.as_ref().map(|p| p.join(".rupu"));
 
-    // Layered config, failing on a malformed file as `rupu run` does.
-    let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
-    let cfg = rupu_config::layer_files_locked(
-        Some(&global.join("config.toml")),
-        project_cfg_path.as_deref(),
-    )?;
+    // Layered config (global → customer → project), failing on a malformed
+    // file or a dangling customer as `rupu run` does. The run records the
+    // customer it resolved.
+    let cfg_paths = paths::config_paths(&global, project_root.as_deref(), &pwd)?;
+    let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
 
     // ---- the definition, validated before anything is built -----------------
     let def = load_agentiflow_def(&global, project_rupu.as_deref(), def_name)
@@ -197,6 +196,7 @@ async fn run_cmd(def_name: &str, format: Option<OutputFormat>) -> anyhow::Result
         model,
         lead_pc,
         netflow_sink,
+        cfg_paths.customer_slug.clone(),
     )
     .await;
 
@@ -245,6 +245,7 @@ async fn launch(
     model: String,
     lead_pc: ProviderConfig,
     sink: Arc<dyn rupu_netflow::FlowSink>,
+    customer: Option<String>,
 ) -> anyhow::Result<(String, EnvelopeOutcome)> {
     let resolver: Arc<dyn CredentialResolver> = Arc::new(crate::accounts::resolver_for(cfg));
     let auth_hint = spec.auth;
@@ -277,6 +278,7 @@ async fn launch(
     let name = def.name.clone();
     let opts = RunAgentiflowOpts {
         def,
+        customer,
         workspace: workspace.to_path_buf(),
         global: global.to_path_buf(),
         active,
@@ -704,14 +706,7 @@ fn table_prefs(absolute: bool, all_columns: bool) -> anyhow::Result<crate::cmd::
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
-    let cfg = rupu_config::layer_files_locked(
-        Some(&global.join("config.toml")),
-        project_root
-            .as_ref()
-            .map(|p| p.join(".rupu/config.toml"))
-            .as_deref(),
-    )
-    .unwrap_or_default();
+    let cfg = paths::load_config_for_display(&global, project_root.as_deref(), &pwd, true);
     Ok(
         crate::cmd::ui::UiPrefs::resolve(&cfg.ui, false, None, None, None)
             .with_table_flags(absolute, all_columns),

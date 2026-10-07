@@ -17,6 +17,7 @@ import { MemoryRouter } from 'react-router-dom';
 import { api } from '../lib/api';
 import type { RunEvent, RunStartedEvent, TimedRunEvent } from '../lib/api';
 import Events from './Events';
+import { scopedEntry, withCustomerScope } from '../lib/customerScopeTestUtils';
 
 afterEach(() => {
   cleanup();
@@ -205,5 +206,20 @@ describe('Live Events (Situation Room) page', () => {
 
     emit?.({ type: 'run_failed', run_id: 'r1', error: 'after-error-xyz', finished_at: new Date().toISOString() });
     expect(await screen.findByText('after-error-xyz')).toBeInTheDocument();
+  });
+});
+
+describe('Live Events under a customer scope', () => {
+  it('says the feed covers every customer while scoped, and nothing when not', async () => {
+    vi.spyOn(api, 'getEvents').mockResolvedValue([]);
+    vi.spyOn(api, 'subscribeEvents').mockImplementation(() => () => {});
+    const { unmount } = render(
+      <MemoryRouter initialEntries={[scopedEntry('acme', '/events')]}>{withCustomerScope(<Events />)}</MemoryRouter>,
+    );
+    expect(await screen.findByRole('note')).toHaveTextContent('Live events cover every customer.');
+    unmount();
+    render(<MemoryRouter initialEntries={['/events']}>{withCustomerScope(<Events />)}</MemoryRouter>);
+    await waitFor(() => expect(api.getEvents).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText('Live events cover every customer.')).toBeNull();
   });
 });
