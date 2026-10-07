@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { suggest } from './suggest';
+import { parseQuery } from '../../lib/findingQuery/grammar';
 import { FINDING_FIELDS } from '../../lib/findingQuery/fields';
 
 const facets = {
@@ -15,7 +16,10 @@ const facets = {
     { value: 'low', count: 2 },
     { value: 'info', count: 0 },
   ],
-  owner: [{ value: 'Payments Team', count: 2 }],
+  owner: [
+    { value: 'Payments Team', count: 2 },
+    { value: 'Acme, Inc.', count: 1 },
+  ],
 };
 
 describe('suggest', () => {
@@ -47,5 +51,25 @@ describe('suggest', () => {
   });
   it('an unknown key suggests nothing', () => {
     expect(suggest('nope:', FINDING_FIELDS, facets)).toEqual([]);
+  });
+  it('offers nothing for a comparison with a comma, or on a non-severity key', () => {
+    expect(suggest('severity>=high,', FINDING_FIELDS, facets)).toEqual([]);
+    expect(suggest('tag>', FINDING_FIELDS, facets)).toEqual([]);
+  });
+  it('matches the item being typed when it opens a quote', () => {
+    expect(suggest('owner:"Pay', FINDING_FIELDS, facets)[0].insert).toBe('owner:"Payments Team"');
+  });
+  it('does not split on a comma inside an open quote', () => {
+    expect(suggest('owner:"Acme, I', FINDING_FIELDS, facets)[0].insert).toBe('owner:"Acme, Inc."');
+  });
+  it('every committed value insert parses', () => {
+    const drafts = ['', 'ta', 'tag:', '-tag:class:sqli,ne', 'severity>=hi', 'has:', 'owner:pay', 'owner:"Pay', 'owner:"Acme, I', 'tag:x,'];
+    for (const draft of drafts) {
+      for (const s of suggest(draft, FINDING_FIELDS, facets)) {
+        if (s.commit && s.kind === 'value') {
+          expect(parseQuery(s.insert, FINDING_FIELDS).ok, `${draft} -> ${s.insert}`).toBe(true);
+        }
+      }
+    }
   });
 });

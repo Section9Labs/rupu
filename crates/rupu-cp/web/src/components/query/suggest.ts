@@ -30,6 +30,46 @@ export interface Suggestion {
 
 const KEY_OP = /^([A-Za-z_]+)(>=|<=|:|>|<)(.*)$/s;
 
+/**
+ * Split a keyed value at its last item-separating comma, walking it the way
+ * the grammar's `scan` does: a quote opens only at an item start (the value
+ * start or right after a comma), and `\` escapes the next char. `prefix` is
+ * everything up to and including that comma; `partial` is the item being
+ * typed, with the quote of a still-open leading quote stripped.
+ */
+function splitItem(rest: string): { prefix: string; partial: string } {
+  const cs = Array.from(rest);
+  let cut = -1;
+  let itemStart = true;
+  let quote: string | null = null;
+  for (let i = 0; i < cs.length; i++) {
+    const c = cs[i];
+    if (quote !== null) {
+      if (c === '\\') i++;
+      else if (c === quote) {
+        quote = null;
+        itemStart = false;
+      }
+      continue;
+    }
+    if (c === '\\') {
+      i++;
+      itemStart = false;
+    } else if (itemStart && (c === '"' || c === "'")) {
+      quote = c;
+      itemStart = false;
+    } else if (c === ',') {
+      cut = i;
+      itemStart = true;
+    } else {
+      itemStart = false;
+    }
+  }
+  const prefix = cs.slice(0, cut + 1).join('');
+  const item = cs.slice(cut + 1).join('');
+  return { prefix, partial: quote !== null ? item.slice(1) : item };
+}
+
 export function suggest(
   draft: string,
   fields: readonly QueryField[],
@@ -44,9 +84,10 @@ export function suggest(
     const [, name, op, rest] = m;
     const field = findField(name, fields) as QueryField | undefined;
     if (!field) return [];
-    const cut = rest.lastIndexOf(',');
-    const prefix = cut >= 0 ? rest.slice(0, cut + 1) : '';
-    const partial = cut >= 0 ? rest.slice(cut + 1) : rest;
+    // A comparison takes one value and only `severity` takes one.
+    if (op !== ':' && field.kind !== 'severity') return [];
+    const { prefix, partial } = splitItem(rest);
+    if (op !== ':' && prefix !== '') return [];
     const counts = new Map((facets?.[field.key] ?? []).map((f) => [f.value, f.count]));
     const pool = field.values.length > 0 ? field.values : [...counts.keys()];
     return pool
