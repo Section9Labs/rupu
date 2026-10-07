@@ -2,6 +2,7 @@ import type { LucideIcon } from 'lucide-react';
 import {
   Activity,
   BookMarked,
+  Building2,
   DollarSign,
   FolderGit2,
   LayoutDashboard,
@@ -48,6 +49,7 @@ export type NavSection =
 export const sidebarNav: NavSection[] = [
   { kind: 'leaf', item: { to: '/dashboard', label: 'Dashboard', icon: LayoutDashboard, enabled: true } },
   { kind: 'leaf', item: { to: '/projects', label: 'Projects', icon: FolderGit2, enabled: true } },
+  { kind: 'leaf', item: { to: '/customers', label: 'Customers', icon: Building2, enabled: true } },
   { kind: 'leaf', item: { to: '/events', label: 'Live Events', icon: Radio, enabled: true } },
   { kind: 'leaf', item: { to: '/usage', label: 'Usage', icon: DollarSign, enabled: true } },
   { kind: 'divider' },
@@ -99,6 +101,7 @@ export const sidebarNavV2: NavLeafV2[] = [
   { to: '/overview', label: 'Overview', icon: LayoutDashboard, badge: 'attention' },
   { to: '/activity', label: 'Activity', icon: Activity, badge: 'running' },
   { to: '/projects', label: 'Projects', icon: FolderGit2, badge: 'projects' },
+  { to: '/customers', label: 'Customers', icon: Building2 },
   { to: '/security', label: 'Security', icon: ShieldCheck, badge: 'critical' },
   { to: '/library', label: 'Library', icon: BookMarked },
   { to: '/fleet', label: 'Fleet', icon: Server, badge: 'unhealthy' },

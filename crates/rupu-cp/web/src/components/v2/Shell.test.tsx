@@ -13,6 +13,7 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { api } from '../../lib/api';
 import type { HostView, RunEvent } from '../../lib/api';
 import { ThemeProvider } from '../theme/ThemeProvider';
+import { CustomerScopeProvider } from '../../lib/customerScope';
 import { SHELL_STATE_KEY } from './shellState';
 
 function installLocalStorage() {
@@ -53,6 +54,7 @@ let subscribeOnEvent: Parameters<typeof api.subscribeEvents>[0] | undefined;
 function mockApi() {
   vi.spyOn(api, 'getHosts').mockResolvedValue([]);
   vi.spyOn(api, 'getProjects').mockResolvedValue([]);
+  vi.spyOn(api, 'getCustomers').mockResolvedValue([]);
   vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([]);
   vi.spyOn(api, 'subscribeEvents').mockImplementation((onEvent) => {
     subscribeOnEvent = onEvent;
@@ -79,11 +81,13 @@ function renderShell(initialPath = '/overview') {
   return render(
     <ThemeProvider>
       <MemoryRouter initialEntries={[initialPath]}>
-        <Routes>
-          <Route element={<Shell />}>
-            <Route path="*" element={<div>body</div>} />
-          </Route>
-        </Routes>
+        <CustomerScopeProvider>
+          <Routes>
+            <Route element={<Shell />}>
+              <Route path="*" element={<div>body</div>} />
+            </Route>
+          </Routes>
+        </CustomerScopeProvider>
       </MemoryRouter>
     </ThemeProvider>,
   );
@@ -102,14 +106,33 @@ afterEach(() => {
 });
 
 describe('Shell v2', () => {
-  it('renders all seven nav labels + Settings, in order', async () => {
+  it('renders all eight nav labels + Settings, in order', async () => {
     mockApi();
     renderShell();
 
     const nav = screen.getByRole('navigation');
-    const labels = ['Overview', 'Activity', 'Projects', 'Security', 'Library', 'Fleet', 'Usage', 'Settings'];
+    const labels = ['Overview', 'Activity', 'Projects', 'Customers', 'Security', 'Library', 'Fleet', 'Usage', 'Settings'];
     const links = within(nav).getAllByRole('link');
     expect(links.map((l) => l.textContent)).toEqual(labels);
+  });
+
+  it('mounts the customer picker in the top bar, left of the project scope', async () => {
+    mockApi();
+    renderShell();
+    const picker = await screen.findByRole('button', { name: /customer scope/i });
+    const projectScope = screen.getByRole('combobox', { name: /project scope/i });
+    expect(picker).toHaveTextContent('All customers');
+    expect(picker.compareDocumentPosition(projectScope) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it('shows a dismissible notice when a stored customer scope no longer exists', async () => {
+    mockApi();
+    localStorage.setItem('rupu.cp.customer', 'ghost');
+    renderShell();
+    const notice = await screen.findByRole('status');
+    expect(notice).toHaveTextContent('ghost');
+    fireEvent.click(within(notice).getByRole('button', { name: /dismiss/i }));
+    expect(screen.queryByRole('status')).toBeNull();
   });
 
   it('shows rupu + cp in the rail header', async () => {
