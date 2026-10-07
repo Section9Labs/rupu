@@ -291,6 +291,19 @@ describe('ProjectDetail Config tab', () => {
   });
 });
 
+describe('ProjectDetail Usage tile', () => {
+  it('marks a cost priced at the global rates', async () => {
+    const usage = { ...USAGE, cost_usd: 1.2, pricing_error: 'customer acme: config layer does not parse' };
+    vi.spyOn(api, 'getProject').mockResolvedValue({ ...DETAIL, usage, project: { ...DETAIL.project, usage } });
+    vi.spyOn(api, 'getProjectAssessedPct').mockResolvedValue({ assessed_pct: null });
+    renderAt('/projects/x', 'overview');
+    expect(await screen.findByText('Usage')).toBeInTheDocument();
+    expect(
+      screen.getByRole('img', { name: 'Pricing unavailable: customer acme: config layer does not parse' }),
+    ).toBeInTheDocument();
+  });
+});
+
 describe('ProjectDetail — customer assignment in the header', () => {
   const ACME_REF = { slug: 'acme', name: 'Acme', tint: ACME.tint, archived: false };
   function stubLoad(customer: ProjectDetailType['project']['customer']) {

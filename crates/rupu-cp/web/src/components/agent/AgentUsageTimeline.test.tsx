@@ -137,3 +137,17 @@ describe('AgentUsageTimeline', () => {
     expect(within(legend).getByText('gpt')).toBeInTheDocument();
   });
 });
+
+describe('AgentUsageTimeline — pricing errors', () => {
+  it('marks the headline cost (and the row) when a run was priced at the global rates', async () => {
+    vi.spyOn(api, 'getUsageRuns').mockResolvedValue([
+      runRow({ pricing_error: 'acme layer broken' }),
+      runRow({ run_id: 'run_2', model: 'other' }),
+    ]);
+    render(<AgentUsageTimeline agent="reviewer" />);
+    // One beside the headline, one on the breakdown row it came from.
+    await waitFor(() =>
+      expect(screen.getAllByRole('img', { name: 'Pricing unavailable: acme layer broken' })).toHaveLength(2),
+    );
+  });
+});

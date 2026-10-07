@@ -26,6 +26,7 @@ import {
 } from '../lib/api';
 import { TabBar, TabButton } from '../components/TabBar';
 import { ProjectCustomerMenu } from '../components/customers/ProjectCustomerMenu';
+import { PricingErrorMark } from '../components/customers/PricingErrorMark';
 import { Spinner } from '../components/ui/Spinner';
 import ProjectOverviewTab from '../components/project/ProjectOverviewTab';
 import ProjectRunsTab from '../components/project/ProjectRunsTab';
@@ -65,7 +66,7 @@ function RollupTile({
   children,
 }: {
   label: string;
-  value: string | number;
+  value: React.ReactNode;
   sub?: string;
   children?: React.ReactNode;
 }) {
@@ -273,8 +274,10 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
           <RollupTile
             label="Usage"
             value={
-              formatCost(usage.cost_usd) +
-              (usage.cost_usd !== null && !usage.priced ? '*' : '')
+              <span className="inline-flex items-center gap-1.5">
+                {formatCost(usage.cost_usd) + (usage.cost_usd !== null && !usage.priced ? '*' : '')}
+                <PricingErrorMark error={usage.pricing_error} />
+              </span>
             }
             sub={`${formatTokens(usage.total_tokens)} tok`}
           />
