@@ -143,7 +143,7 @@ const PROVIDER_ORDER: Record<ProjectProvider, number> = {
   local: 3,
 };
 
-const PROJECT_COLUMNS: Column<ProjectRow>[] = [
+export const PROJECT_COLUMNS: Column<ProjectRow>[] = [
   {
     key: 'provider',
     header: 'Source',

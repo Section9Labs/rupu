@@ -26,6 +26,7 @@ import { Spinner } from '../../components/ui/Spinner';
 import { CustomerDot } from '../../components/customers/CustomerDot';
 import { CustomerFormDialog } from '../../components/customers/CustomerFormDialog';
 import { PricingErrorMark } from '../../components/customers/PricingErrorMark';
+import { StatTile as Tile } from '../../components/customers/StatTile';
 
 type StatusView = 'active' | 'archived' | 'all';
 
@@ -39,29 +40,6 @@ const RANGE_OPTIONS = [
   { value: '30d', label: '30d' },
   { value: 'all', label: 'all' },
 ];
-
-function Tile({
-  id,
-  label,
-  value,
-  sub,
-  warn,
-}: {
-  id: string;
-  label: string;
-  value: React.ReactNode;
-  sub?: React.ReactNode;
-  /** `sub` is a warning (e.g. unassigned projects). */
-  warn?: boolean;
-}) {
-  return (
-    <div data-testid={`tile-${id}`} className="bg-panel border border-border rounded-xl shadow-card px-4 py-3">
-      <p className="text-[9px] font-semibold uppercase tracking-widest text-ink-mute mb-1">{label}</p>
-      <p className="text-2xl font-bold text-ink tabular-nums leading-none">{value}</p>
-      {sub && <p className={warn ? 'mt-1 text-note text-warn' : 'mt-1 text-note text-ink-dim'}>{sub}</p>}
-    </div>
-  );
-}
 
 function costOf(r: CustomerRow): number {
   return r.rollup.usage.cost_usd ?? 0;
@@ -337,7 +315,7 @@ export default function Customers() {
               label="Projects assigned"
               value={projects ? `${assigned} / ${projects.length}` : '—'}
               sub={projects && unassigned > 0 ? `${unassigned} unassigned` : undefined}
-              warn
+              subTone="warn"
             />
             <Tile
               id="cost"

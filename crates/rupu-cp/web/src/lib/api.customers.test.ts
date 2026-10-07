@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { api, ApiError } from './api';
+import { api, ApiError, parseCustomerConflict } from './api';
 
 function mockFetch(status: number, body: unknown) {
   const text = typeof body === 'string' ? body : JSON.stringify(body);
@@ -174,5 +174,32 @@ describe('customer scope param', () => {
     const i = mockFetch(200, {});
     await api.getUsageTimeline();
     expect(urlOf(i)).toBe('/api/usage/timeline');
+  });
+});
+
+describe('parseCustomerConflict', () => {
+  it('parses the 409 body of a delete', () => {
+    const e = new ApiError(409, 'x', JSON.stringify({ error: 'has projects', projects: [{ ws_id: 'ws_1', path: '/p' }] }));
+    expect(parseCustomerConflict(e)).toEqual({ error: 'has projects', projects: [{ ws_id: 'ws_1', path: '/p' }] });
+  });
+
+  it('drops malformed project entries', () => {
+    const e = new ApiError(
+      409,
+      'x',
+      JSON.stringify({ error: 'e', projects: [{ ws_id: 'ws_1', path: '/p' }, { ws_id: 3 }, null, 'nope'] }),
+    );
+    expect(parseCustomerConflict(e)?.projects).toEqual([{ ws_id: 'ws_1', path: '/p' }]);
+  });
+
+  it('is null for anything that is not a parseable 409 conflict', () => {
+    expect(parseCustomerConflict(new ApiError(409, 'x', 'not json'))).toBeNull();
+    expect(parseCustomerConflict(new ApiError(409, 'x', JSON.stringify({ error: 'archived' })))).toBeNull();
+    expect(parseCustomerConflict(new ApiError(409, 'x', 'null'))).toBeNull();
+    expect(
+      parseCustomerConflict(new ApiError(404, 'x', JSON.stringify({ error: 'e', projects: [] }))),
+    ).toBeNull();
+    expect(parseCustomerConflict(new Error('boom'))).toBeNull();
+    expect(parseCustomerConflict('409')).toBeNull();
   });
 });

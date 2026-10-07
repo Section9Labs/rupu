@@ -77,6 +77,28 @@ function mockApi() {
   vi.spyOn(api, 'getHosts').mockResolvedValue([]);
   vi.spyOn(api, 'getProjects').mockResolvedValue([]);
   vi.spyOn(api, 'getCustomers').mockResolvedValue([]);
+  vi.spyOn(api, 'getCustomer').mockResolvedValue({
+    customer: {
+      slug: 'acme',
+      name: 'Acme',
+      notes: null,
+      contact: null,
+      color: null,
+      tint: { light: '#111111', dark: '#eeeeee' },
+      archived: false,
+      created_at: '2026-10-01T00:00:00Z',
+    },
+    rollup: {
+      projects: 0,
+      run_count: 0,
+      usage: { input_tokens: 0, output_tokens: 0, cached_tokens: 0, total_tokens: 0, cost_usd: 0, priced: true, runs: 0 },
+      findings_open: 0,
+      last_active: null,
+    },
+    projects: [],
+    default_account: null,
+    layer_error: null,
+  });
   vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([]);
   vi.spyOn(api, 'subscribeEvents').mockImplementation(() => () => {});
   // CommandPalette's fetch-on-open sources (mounted by both Layout and

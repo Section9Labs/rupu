@@ -1976,6 +1976,29 @@ export interface CustomerConflict {
   projects: { ws_id: string; path: string }[];
 }
 
+/** The conflict a `DELETE /api/customers/:slug` 409 carries (the projects
+ *  still assigned), parsed from the `ApiError`'s raw body; `null` for any
+ *  other error, a non-JSON body, or a body without a `projects` array.
+ *  Malformed project entries are dropped. */
+export function parseCustomerConflict(e: unknown): CustomerConflict | null {
+  if (!(e instanceof ApiError) || e.status !== 409) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(e.body);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object') return null;
+  const obj = parsed as Record<string, unknown>;
+  if (!Array.isArray(obj.projects)) return null;
+  const projects = obj.projects.flatMap((p: unknown) => {
+    if (!p || typeof p !== 'object') return [];
+    const { ws_id, path } = p as Record<string, unknown>;
+    return typeof ws_id === 'string' && typeof path === 'string' ? [{ ws_id, path }] : [];
+  });
+  return { error: typeof obj.error === 'string' ? obj.error : '', projects };
+}
+
 /** Append `customer=<slug|none>` to a list query — only when scoped. */
 function setCustomer(q: URLSearchParams, customer?: CustomerScope): void {
   if (customer) q.set('customer', customer);
