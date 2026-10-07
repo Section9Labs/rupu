@@ -262,11 +262,10 @@ fn queried_findings(query: &[String]) -> anyhow::Result<Vec<cp_findings::Finding
     }
     let parsed = rupu_coverage::parse_query(&query.join(" "))?;
     let global = crate::paths::global_dir()?;
-    Ok(cp_findings::query_findings(
-        &RunStore::new(global.join("runs")),
-        cp_findings::collect_all_findings(&global),
-        &parsed,
-    ))
+    let runs = RunStore::new(global.join("runs"));
+    let mut findings = cp_findings::collect_all_findings(&global);
+    cp_findings::join_workflow_names(&runs, &mut findings);
+    Ok(cp_findings::query_findings(&runs, findings, &parsed))
 }
 
 #[derive(serde::Serialize)]

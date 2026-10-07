@@ -590,6 +590,23 @@ fn workflow_names_by_run<'a>(
     names
 }
 
+/// Fill `workflow_name` (joined via `declared_by.run_id`) on every row that
+/// lacks one, loading each distinct run id once. A row that already carries
+/// a name is left as it is; a run the `RunStore` can't load leaves `None`.
+/// Callers join before [`query_findings`] so `workflow:` can match.
+pub fn join_workflow_names(store: &RunStore, findings: &mut [FindingOut]) {
+    let names = workflow_names_by_run(
+        store,
+        findings
+            .iter()
+            .filter(|f| f.workflow_name.is_none())
+            .map(|f| f.record.declared_by.run_id.as_str()),
+    );
+    for f in findings.iter_mut().filter(|f| f.workflow_name.is_none()) {
+        f.workflow_name = names.get(&f.record.declared_by.run_id).cloned();
+    }
+}
+
 /// A finding as the query evaluator sees it: its record plus the project,
 /// workspace and workflow this surface knows.
 pub fn finding_view(f: &FindingOut) -> rupu_coverage::FindingView<'_> {
@@ -602,27 +619,33 @@ pub fn finding_view(f: &FindingOut) -> rupu_coverage::FindingView<'_> {
 }
 
 /// The findings a parsed query selects, sorted severity (worst first), then
-/// newest, then id. Joins `workflow_name` onto rows that lack it (so
-/// `workflow:` works), and expands each `run:` value to the run plus its
-/// sub-runs ([`resolve_run_scope`]). `rupu findings list|tags` and
-/// `GET /api/findings` both go through this.
+/// newest, then id. Expands each `run:` value to the run plus its sub-runs
+/// ([`resolve_run_scope`]). It does NOT join `workflow_name`: callers run
+/// [`join_workflow_names`] first, or `workflow:` matches nothing.
+/// `rupu findings list|tags` and `GET /api/findings` both go through this.
 pub fn query_findings(
     store: &RunStore,
     mut findings: Vec<FindingOut>,
     q: &rupu_coverage::ParsedQuery,
 ) -> Vec<FindingOut> {
-    let wf = workflow_names_by_run(
-        store,
-        findings
-            .iter()
-            .filter(|f| f.workflow_name.is_none())
-            .map(|f| f.record.declared_by.run_id.as_str()),
-    );
-    for f in &mut findings {
-        if f.workflow_name.is_none() {
-            f.workflow_name = wf.get(&f.record.declared_by.run_id).cloned();
-        }
+    if !q.terms.is_empty() {
+        findings = select_findings(store, findings, q);
     }
+    findings.sort_by(|a, b| {
+        rupu_coverage::severity_rank(b.record.severity)
+            .cmp(&rupu_coverage::severity_rank(a.record.severity))
+            .then_with(|| b.record.declared_at.cmp(&a.record.declared_at))
+            .then_with(|| a.record.id.cmp(&b.record.id))
+    });
+    findings
+}
+
+/// [`query_findings`]' filter step, for a query with at least one term.
+fn select_findings(
+    store: &RunStore,
+    mut findings: Vec<FindingOut>,
+    q: &rupu_coverage::ParsedQuery,
+) -> Vec<FindingOut> {
     let runs: rupu_coverage::RunScopes = rupu_coverage::run_values(q)
         .into_iter()
         .map(|r| {
@@ -637,12 +660,6 @@ pub fn query_findings(
         .map(key)
         .collect();
     findings.retain(|f| keep.contains(&key(f)));
-    findings.sort_by(|a, b| {
-        rupu_coverage::severity_rank(b.record.severity)
-            .cmp(&rupu_coverage::severity_rank(a.record.severity))
-            .then_with(|| b.record.declared_at.cmp(&a.record.declared_at))
-            .then_with(|| a.record.id.cmp(&b.record.id))
-    });
     findings
 }
 
@@ -672,16 +689,10 @@ async fn list_findings(
     })?;
     let (mut out, tags_unavailable) = collect_all_findings_reporting(&s.global_dir);
 
-    // Join `declared_by.run_id → workflow_name` via the RunStore. Load each
-    // distinct run id once; a load error / NotFound leaves that id out of the
-    // map (finding keeps `workflow_name: None`).
-    let wf_by_run = workflow_names_by_run(
-        &s.run_store,
-        out.iter().map(|f| f.record.declared_by.run_id.as_str()),
-    );
-    for f in &mut out {
-        f.workflow_name = wf_by_run.get(&f.record.declared_by.run_id).cloned();
-    }
+    // Join `declared_by.run_id → workflow_name` once, for both the
+    // `workflow` scope and `q`'s `workflow:` key. A run the store can't load
+    // leaves the finding's `workflow_name: None`.
+    join_workflow_names(&s.run_store, &mut out);
 
     // Resolve the run-id match SET when filtering by run: the parent unioned
     // with its sub-runs (each `for_each`/`panel` unit is its own sub-run, and
@@ -697,6 +708,12 @@ async fn list_findings(
     let scoped = scope_by_run_set(out, &run_ids, &q.ws_id, &q.workflow).findings;
     // Facets describe the scope, before `q` narrows it.
     let facets = rupu_coverage::facets(scoped.iter().map(finding_view));
+    // Warn only about the workspaces this request covers: the requested one,
+    // or one with a finding in the scope.
+    let tags_unavailable: Vec<String> = tags_unavailable
+        .into_iter()
+        .filter(|ws| q.ws_id.as_ref() == Some(ws) || scoped.iter().any(|f| &f.ws_id == ws))
+        .collect();
     let filtered = query_findings(&s.run_store, scoped, &parsed);
     let mut resp = build_response(filtered);
     // List rows never carry the report body; full-profile rows get a summary.
@@ -2302,6 +2319,38 @@ mod tests {
         assert_eq!(ids("project:proj"), ["top", "unit"]);
         assert_eq!(ids("project:elsewhere"), ["nope"]);
         assert_eq!(ids(""), ["nope", "top", "unit"]);
+    }
+
+    /// `workflow:` matches the joined workflow name: callers join with
+    /// [`join_workflow_names`] first, and the join leaves a row that already
+    /// carries a name (or whose run can't be loaded) as it is.
+    #[test]
+    fn query_findings_matches_workflow_after_the_join() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        store
+            .create(run_record("run_wf", "audit-flow"), "name: t\nsteps: []\n")
+            .unwrap();
+        let mut named = finding_run("run_named", "named", Severity::Low, "2026-01-03T00:00:00Z");
+        named.workflow_name = Some("audit-flow".to_string());
+        let mut all = vec![
+            finding_run("run_wf", "joined", Severity::High, "2026-01-01T00:00:00Z"),
+            finding_run("run_gone", "gone", Severity::Medium, "2026-01-02T00:00:00Z"),
+            named,
+        ];
+        join_workflow_names(&store, &mut all);
+        assert_eq!(all[0].workflow_name.as_deref(), Some("audit-flow"));
+        assert_eq!(all[1].workflow_name, None);
+        assert_eq!(all[2].workflow_name.as_deref(), Some("audit-flow"));
+        let ids = |q: &str| -> Vec<String> {
+            let parsed = rupu_coverage::parse_query(q).unwrap();
+            query_findings(&store, all.clone(), &parsed)
+                .into_iter()
+                .map(|f| f.record.id)
+                .collect()
+        };
+        assert_eq!(ids("workflow:audit-flow"), ["joined", "named"]);
+        assert_eq!(ids("-workflow:audit-flow"), ["gone"]);
     }
 
     #[test]
@@ -4794,6 +4843,33 @@ mod tests {
         assert_eq!(status, axum::http::StatusCode::OK);
         assert_eq!(json["tags_unavailable"], serde_json::json!(["ws1"]));
         assert_eq!(json["findings"].as_array().unwrap().len(), 3);
+    }
+
+    /// `tags_unavailable` names only workspaces in the request's scope: an
+    /// unreadable log in another workspace doesn't warn about this one.
+    #[tokio::test]
+    async fn list_findings_tags_unavailable_follows_the_ws_scope() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = seed_query_fixture(tmp.path());
+        seed_named_workspace(
+            tmp.path(),
+            "ws2",
+            "repo2",
+            &[finding("fnd_other", Severity::Medium, "2026-09-26T00:00:00Z").record],
+        );
+        let log = rupu_coverage::TagLog::for_workspace(&repo).path;
+        std::fs::remove_file(&log).unwrap();
+        std::fs::create_dir(&log).unwrap();
+        let app = app_for(tmp.path());
+        let (status, json) = get_json(app.clone(), "/api/findings?ws_id=ws2").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(json["tags_unavailable"], serde_json::json!([]));
+        assert_eq!(json["findings"].as_array().unwrap().len(), 1);
+        // In scope by ws_id, even when `q` selects none of its rows.
+        let (_, json) = get_json(app.clone(), "/api/findings?ws_id=ws1&q=id%3Anone").await;
+        assert_eq!(json["tags_unavailable"], serde_json::json!(["ws1"]));
+        let (_, json) = get_json(app, "/api/findings").await;
+        assert_eq!(json["tags_unavailable"], serde_json::json!(["ws1"]));
     }
 
     #[tokio::test]
