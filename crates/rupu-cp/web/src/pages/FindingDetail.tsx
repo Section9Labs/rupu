@@ -186,12 +186,17 @@ function FindingTags({
 function TagsSection({ detail }: { detail: Detail }) {
   return (
     <Section id="s-tags" title="Tags">
-      <details>
-        <summary className="cursor-pointer text-ui text-ink-dim">Tag history ({detail.tag_history.length})</summary>
-        <div className="mt-2">
-          <TagHistory events={detail.tag_history} />
-        </div>
-      </details>
+      {/* An unreadable tag log has an unknown history, not an empty one. */}
+      {detail.tags_editable ? (
+        <details>
+          <summary className="cursor-pointer text-ui text-ink-dim">Tag history ({detail.tag_history.length})</summary>
+          <div className="mt-2">
+            <TagHistory events={detail.tag_history} />
+          </div>
+        </details>
+      ) : (
+        <p className="text-note text-ink-mute">Tag history unavailable: this project's tag log couldn't be read.</p>
+      )}
     </Section>
   );
 }

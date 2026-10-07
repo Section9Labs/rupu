@@ -353,6 +353,8 @@ describe('FindingDetail page', () => {
       expect(await screen.findByText('needs-poc')).toBeInTheDocument();
       expect(screen.queryByRole('button', { name: /Remove tag/ })).toBeNull();
       expect(screen.getByText('tags read-only')).toBeInTheDocument();
+      expect(screen.getByText(/Tag history unavailable/)).toBeInTheDocument();
+      expect(screen.queryByText(/Tag history \(/)).toBeNull();
     });
 
     it('shows a workspace error as an alert and does not refetch', async () => {
