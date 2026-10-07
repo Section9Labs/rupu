@@ -1,3 +1,4 @@
+pub mod agentiflows;
 pub mod agents;
 pub mod autoflow_claims;
 pub mod autoflows;

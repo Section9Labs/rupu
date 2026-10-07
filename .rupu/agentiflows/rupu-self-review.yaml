@@ -1,0 +1,29 @@
+name: rupu-self-review
+description: First agentiflow engagement — a coordinated code review of the rupu-agentiflow crate.
+lead: rupu-review-lead
+
+engagement_profiles: [code]
+
+goals:
+  - id: real-issues
+    objective: "Find and verify at least 3 real issues in crates/rupu-agentiflow."
+    target: { findings: {}, count_gte: 3 }
+    required: true
+
+budget:
+  usd: 5
+  rounds: 6
+  wall_clock: "30m"
+  soft_at: 0.8
+
+scope:
+  authorized: true
+
+pool:
+  agents: [rupu-review-lead, code-reviewer, security-reviewer]
+
+round:
+  lead_max_turns: 120
+  ceiling: { rounds: 6, wall_clock: "45m" }
+
+trigger: manual

@@ -11,6 +11,7 @@ import { getShell, type ShellVersion } from './lib/shell';
 const Dashboard         = React.lazy(() => import('./pages/Dashboard'));
 const Usage             = React.lazy(() => import('./pages/Usage'));
 const RunDetail         = React.lazy(() => import('./pages/RunDetail'));
+const AgentiflowDetail  = React.lazy(() => import('./pages/AgentiflowDetail'));
 const Events            = React.lazy(() => import('./pages/Events'));
 const Coverage          = React.lazy(() => import('./pages/Coverage'));
 const Netflow           = React.lazy(() => import('./pages/Netflow'));
@@ -108,6 +109,7 @@ export function AppRoutes({ shell }: { shell: ShellVersion }) {
         <Route path="/runs" element={<Navigate to={v2 ? '/activity' : '/runs/workflows'} replace />} />
         {/* Run detail graph — wildcard must come after static /runs/* segments */}
         <Route path="/runs/:id" element={page(<RunDetail />)} />
+        <Route path="/agentiflows/:id" element={page(<AgentiflowDetail />)} />
         <Route path="/events" element={page(<Events />)} />
         <Route path="/coverage" element={v2 ? <Navigate to="/security?tab=coverage" replace /> : page(<Coverage />)} />
         <Route path="/coverage/templates" element={v2 ? <Navigate to="/security?tab=catalog" replace /> : page(<CoverageTemplates />)} />
