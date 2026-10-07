@@ -85,7 +85,7 @@ was examined, separately from any findings about it.
 | Surface | How | Notes |
 |---------|-----|-------|
 | `rupu run` | `--engagement-profile <id>` | Alias `--engagement-profiles`. Repeat the flag or pass a comma-separated list. Sub-agents started with `dispatch_agent` inherit the selection. |
-| `rupu workflow run` | `--engagement-profile <id>` | Applies to every agent step. The selection is **not** recorded on the run, so `rupu workflow resume` and an approve-resume carry on without it, on the `code` path. |
+| `rupu workflow run` | `--engagement-profile <id>` | Applies to every agent step. The selection is recorded on the run (`engagement_profiles` in `run.json`), so `rupu workflow resume`, `workflow approve` and a control-plane gate approve continue under it; a recorded id that no longer resolves fails the resume. Runs recorded before this was stored resume on the `code` path. |
 | Agentiflows | `engagement_profiles:` in the definition (required) | rupu validates the definition against the profiles, and passes the set to the lead and to every unit it launches (as `--engagement-profile`). See [agentiflows.md](agentiflows.md#4-engagement-profiles). |
 | Sessions, autoflows, CP launches | — | These don't accept a selection and always run on the `code` path. The control plane shows the profiles an agentiflow ran with, but nothing launched from it takes one. |
 | Remote workflow units (`host:` / `distribute:`) | — | The selection doesn't reach the host, which runs the unit on the `code` path. |

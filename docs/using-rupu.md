@@ -246,9 +246,13 @@ rupu workflow run app-assessment --engagement-profile network,web   # or repeat 
 comma-separated) selects the asset domain(s) every agent step's findings are validated
 against — the same selection `rupu run --engagement-profile` makes for a single agent.
 With no flag the run takes the native `code` path, exactly as before. An unknown profile
-id fails the command before any run state is created. The selection is not recorded on
-the run, so `rupu workflow resume` and an in-view approve-resume continue on the `code`
-path. Profiles, asset kinds and the built-in catalog: [engagement-profiles.md](engagement-profiles.md).
+id fails the command before any run state is created. The selection is recorded on the
+run (`engagement_profiles` in its `run.json`), so every resume continues under it —
+`rupu workflow resume`, `rupu workflow approve`, an in-view approve-resume, and a gate
+approved in the control plane (which `rupu cp serve` resumes). A resume re-resolves the
+recorded ids against the run's workspace and refuses to start if one no longer resolves,
+rather than falling back to the `code` path. Runs recorded before this was stored resume
+on the `code` path. Profiles, asset kinds and the built-in catalog: [engagement-profiles.md](engagement-profiles.md).
 
 ### Watch a workflow run (the live dashboard)
 
