@@ -418,4 +418,3 @@ Spec: [`docs/superpowers/specs/2026-10-06-rupu-customers-design.md`](docs/superp
   - `rupu customer unassign` from a subdirectory of an assigned project errors ("no project") instead of finding the assigned ancestor.
   - `rupu customer list` JSON/CSV output is untested.
   - The resolver's warning for a customer lock on a key the customer layer does not set is suppressed when the global layer also locks it; `layer_files_locked` re-logs warnings on every call.
-  - Two concurrent *first* `upsert`s of a new path can create duplicate workspace records (pre-existing). The customer lookup refuses loudly if duplicates carry different customers.
