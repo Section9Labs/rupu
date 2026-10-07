@@ -1983,6 +1983,87 @@ pub(crate) fn build_explorer_response(
     }
 }
 
+/// [`build_explorer_response`] for a global/project scope served from the
+/// netflow index: the whole-history views (histogram, topology node
+/// universe, dropped total) come from tier-1 summaries of every scope file;
+/// the windowed views read rows only from files overlapping the resolved
+/// window. Files are visited in `files` order and rows in file order — the
+/// same order the direct read produces — so order-dependent details (a
+/// timeline lane's org attribution) are identical.
+pub(crate) fn indexed_explorer(
+    index: &NetflowIndex,
+    files: &[(String, PathBuf)],
+    meta: &RunMetaIndex,
+    table: Option<&AsnTable>,
+    range: &rupu_netflow::ledger::TimeRange,
+    filters: &ExplorerFilters,
+) -> ExplorerResponse {
+    let summaries: Vec<(&str, &StdPath, Arc<crate::netflow_index::LedgerSummary>)> = files
+        .iter()
+        .filter_map(|(id, p)| index.summary(p).map(|s| (id.as_str(), p.as_path(), s)))
+        .collect();
+    let dropped = summaries.iter().map(|(_, _, s)| s.dropped).sum();
+    let histogram = explorer::histogram_from_points(
+        summaries
+            .iter()
+            .flat_map(|(_, _, s)| s.points.iter().copied()),
+        EXPLORER_BUCKETS,
+    );
+
+    let mut universe = explorer::SankeyUniverse::default();
+    for (id, _, s) in &summaries {
+        if s.flow_count == 0 {
+            continue;
+        }
+        let (_, workflow) = meta.attribution(id);
+        universe.add_workflow(workflow.as_deref());
+        for origin in &s.origins {
+            universe.add_origin_key(origin.clone());
+        }
+        for ip in &s.peer_ips {
+            let asn = ip.and_then(|ip| table.and_then(|t| t.lookup(ip)));
+            universe.add_org(asn.as_ref());
+        }
+    }
+
+    // Same resolution as `build_explorer_response`; every flow any windowed
+    // view can count lies inside [from, to].
+    let epoch = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH;
+    let from = range.from.or(histogram.from).unwrap_or(epoch);
+    let to = range.to.or(histogram.to).unwrap_or(from);
+    let rows_window = rupu_netflow::ledger::TimeRange {
+        from: Some(from),
+        to: Some(to),
+    };
+    let mut tagged = Vec::new();
+    for (id, path, s) in &summaries {
+        if s.overlaps(&rows_window) {
+            let (flows, _) = index.flows_in_range(path, &rows_window);
+            tagged.extend(flows.into_iter().map(|f| (id.to_string(), f)));
+        }
+    }
+    let windowed = to_explorer_flows(tagged, meta, table);
+
+    let timeline =
+        explorer::timeline_view(&windowed, from, to, filters, &meta.spans, EXPLORER_BUCKETS);
+    let sankey = explorer::sankey_view_with_universe(&universe, &windowed, range, filters);
+    let kpis = explorer::kpi_view(
+        windowed
+            .iter()
+            .filter(|f| range.contains(f.flow.ts) && filters.passes(f, None)),
+    );
+    ExplorerResponse {
+        sankey,
+        timeline,
+        histogram,
+        kpis,
+        dropped_total: dropped,
+        asn_loaded: table.is_some(),
+        window: WindowEcho::from(range),
+        incomplete: Vec::new(),
+    }
+}
+
 /// `GET /api/netflow/explorer?scope=&from=&to=&workflow=&origin=&org=&host=`
 /// — the aggregate read behind the Network explorer surface. Scope
 /// resolution mirrors [`get_netflow_graph`]; the underlying flow sets are
@@ -2007,23 +2088,11 @@ async fn get_netflow_explorer(
         let cache = Arc::clone(&state.asn_cache);
         let index = index_for(&state);
         let resp = run_blocking(move || {
-            let (tagged, meta, dropped) = project_scoped_flows_meta_and_dropped(
-                &*index,
-                &store,
-                &workspace,
-                &global_dir,
-                &rupu_netflow::ledger::TimeRange::unbounded(),
-            );
+            let meta = project_run_meta(&store, &workspace);
+            let files = project_ledger_files(&meta, &workspace, &global_dir);
             let table = load_asn_table(&cache);
-            let flows = to_explorer_flows(tagged, &meta, table.as_deref());
-            let mut resp = build_explorer_response(
-                &flows,
-                dropped,
-                &meta.spans,
-                table.is_some(),
-                &range,
-                &filters,
-            );
+            let mut resp =
+                indexed_explorer(&index, &files, &meta, table.as_deref(), &range, &filters);
             resp.incomplete = scope_gap_from_workers(&meta);
             resp
         })
@@ -2036,23 +2105,17 @@ async fn get_netflow_explorer(
         let meta_cache = Arc::clone(&state.run_meta_cache);
         let index = index_for(&state);
         let resp = run_blocking(move || {
-            let (tagged, dropped) = read_all_workspaces_sync(
-                &*index,
-                &global_dir,
-                &rupu_netflow::ledger::TimeRange::unbounded(),
-            );
-            let ledger_ids = tagged.iter().map(|(id, _)| id.clone()).collect();
+            let files = global_ledger_files(&global_dir);
+            index.sweep_missing();
+            let ledger_ids = files
+                .iter()
+                .filter(|(_, p)| index.summary(p).is_some_and(|s| s.flow_count > 0))
+                .map(|(id, _)| id.clone())
+                .collect();
             let meta = global_run_meta_cached(&meta_cache, &global_dir, &store, &ledger_ids);
             let table = load_asn_table(&cache);
-            let flows = to_explorer_flows(tagged, &meta, table.as_deref());
-            let mut resp = build_explorer_response(
-                &flows,
-                dropped,
-                &meta.spans,
-                table.is_some(),
-                &range,
-                &filters,
-            );
+            let mut resp =
+                indexed_explorer(&index, &files, &meta, table.as_deref(), &range, &filters);
             resp.incomplete = scope_gap_from_workers(&meta);
             resp
         })
@@ -2758,6 +2821,114 @@ mod tests {
         FlowRecord {
             ts: chrono::DateTime::from_timestamp(secs, 0).unwrap(),
             ..f
+        }
+    }
+
+    fn asn_table() -> AsnTable {
+        AsnTable::compact_from_tsv(std::io::Cursor::new(
+            "1.0.0.0\t1.0.0.255\t13335\tUS\tCLOUDFLARENET\n2.0.0.0\t2.0.0.255\t15169\tUS\tGOOGLE\n",
+        ))
+        .unwrap()
+    }
+
+    fn with_peer(f: FlowRecord, ip: Option<&str>, ok: bool) -> FlowRecord {
+        FlowRecord {
+            peer_ip: ip.map(|s| s.parse().unwrap()),
+            outcome: if ok {
+                rupu_netflow::Outcome::Ok
+            } else {
+                rupu_netflow::Outcome::HttpError
+            },
+            ..f
+        }
+    }
+
+    /// Spec §3.6 for the explorer: `indexed_explorer` (ample and zero
+    /// budget) serializes identically to `build_explorer_response` over the
+    /// full direct read, across windows and filters.
+    #[test]
+    fn the_explorer_is_identical_through_the_index() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("netflow");
+        ledger(
+            &dir,
+            "run_a",
+            &[
+                at(
+                    with_peer(flow(FlowId::new(), None, "a.com"), Some("1.0.0.1"), true),
+                    100,
+                ),
+                at(
+                    with_peer(flow(FlowId::new(), None, "b.com"), Some("2.0.0.1"), false),
+                    300,
+                ),
+            ],
+            2,
+        );
+        ledger(
+            &dir,
+            "run_b",
+            &[at(
+                with_peer(flow(FlowId::new(), None, "a.com"), None, true),
+                200,
+            )],
+            0,
+        );
+        ledger(&dir, "run_c", &[], 5);
+        let files = ledger_files_in_dir(&dir);
+        let table = asn_table();
+        let meta = RunMetaIndex::default();
+        let t = |s| Some(chrono::DateTime::from_timestamp(s, 0).unwrap());
+        let ranges = [
+            rupu_netflow::ledger::TimeRange::unbounded(),
+            rupu_netflow::ledger::TimeRange {
+                from: t(150),
+                to: None,
+            },
+            rupu_netflow::ledger::TimeRange {
+                from: t(150),
+                to: t(250),
+            },
+            rupu_netflow::ledger::TimeRange {
+                from: t(900),
+                to: None,
+            },
+            rupu_netflow::ledger::TimeRange {
+                from: t(500),
+                to: t(100),
+            },
+        ];
+        let filter_sets = [
+            ExplorerFilters::default(),
+            ExplorerFilters {
+                orgs: vec!["as13335".into()],
+                ..Default::default()
+            },
+            ExplorerFilters {
+                hosts: vec!["a.com:443".into()],
+                ..Default::default()
+            },
+        ];
+        for budget in [u64::MAX, 0] {
+            let index = NetflowIndex::new(budget);
+            for range in &ranges {
+                for filters in &filter_sets {
+                    let (tagged, dropped) = read_ledger_files(
+                        &DirectReader,
+                        &files,
+                        &rupu_netflow::ledger::TimeRange::unbounded(),
+                    );
+                    let flows = to_explorer_flows(tagged, &meta, Some(&table));
+                    let want =
+                        build_explorer_response(&flows, dropped, &meta.spans, true, range, filters);
+                    let got = indexed_explorer(&index, &files, &meta, Some(&table), range, filters);
+                    assert_eq!(
+                        serde_json::to_value(&got).unwrap(),
+                        serde_json::to_value(&want).unwrap(),
+                        "budget {budget}, range {range:?}, filters {filters:?}"
+                    );
+                }
+            }
         }
     }
 
