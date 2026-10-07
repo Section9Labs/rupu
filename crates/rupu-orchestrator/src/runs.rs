@@ -140,6 +140,15 @@ pub struct RunRecord {
         skip_serializing_if = "Option::is_none"
     )]
     pub customer: rupu_transcript::RecordedField,
+    /// Engagement profile ids the run was launched under
+    /// (`rupu workflow run --engagement-profile`), as selected. Recorded at
+    /// launch so every resume — `workflow resume`, `workflow approve`, and
+    /// the `cp serve` resume worker — re-resolves the same active set
+    /// instead of falling back to the native `code` path. Empty = no
+    /// engagement, which is also what every `run.json` written before this
+    /// field existed reads as.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub engagement_profiles: Vec<String>,
     /// Set in `Failed` status; the runner's error message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
@@ -4344,6 +4353,7 @@ mod tests {
             resume_approver: None,
             resume_rerequested_at: None,
             reject_cleanup_pending: None,
+            engagement_profiles: Vec::new(),
             permission_mode: None,
             final_output: None,
             loop_progress: BTreeMap::new(),

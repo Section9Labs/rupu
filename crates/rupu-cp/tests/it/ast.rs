@@ -38,6 +38,7 @@ fn seed_run(id: &str, workspace: &std::path::Path) -> RunRecord {
         resume_approver: None,
         resume_rerequested_at: None,
         reject_cleanup_pending: None,
+        engagement_profiles: Vec::new(),
         permission_mode: None,
         issue_ref: None,
         issue: None,

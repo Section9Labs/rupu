@@ -613,6 +613,14 @@ impl StepFactory for DefaultStepFactory {
     fn customer(&self) -> Option<&str> {
         self.customer.as_deref()
     }
+
+    fn engagement_profiles(&self) -> Vec<String> {
+        self.findings_base
+            .engagement
+            .as_deref()
+            .map(|set| set.ids().into_iter().map(str::to_string).collect())
+            .unwrap_or_default()
+    }
 }
 
 /// The agent runtime's builtin (non-connector) tool names — `bash`,
