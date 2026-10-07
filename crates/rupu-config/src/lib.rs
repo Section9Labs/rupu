@@ -41,7 +41,7 @@ pub use config::{BashConfig, Config, UiConfig, UiCpConfig, UiPaletteConfig, UiSy
 pub use findings_config::FindingsConfig;
 pub use layer::{layer_files, layer_files_locked, LayerError};
 pub use netflow_config::NetflowConfig;
-pub use policy_config::{CpConfig, PolicyConfig};
+pub use policy_config::{AgentiflowConfig, CpConfig, PolicyConfig};
 pub use pricing_config::{ModelPricing, PricingConfig};
 pub use provider_config::{CustomModel, ProviderConfig};
 pub use recovery_config::{FallbackEntry, RecoveryConfig};

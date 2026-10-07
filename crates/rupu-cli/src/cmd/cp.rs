@@ -98,12 +98,12 @@ pub async fn handle(action: Action) -> ExitCode {
             // the background autoflow tick below (an LLM-driving path) can
             // build a resolver that knows this daemon's declared accounts,
             // rather than one built from a config-less `KeychainResolver::new()`.
-            let (cp_runtime_cfg, netflow_cfg, autoflow_resolver_accounts) = {
+            let (cp_runtime_cfg, netflow_cfg, agentiflow_cfg, autoflow_resolver_accounts) = {
                 let global_cfg_path = global_dir.join("config.toml");
                 let cfg = rupu_config::layer_files_locked(Some(&global_cfg_path), None)
                     .unwrap_or_default();
                 let accounts = crate::accounts::account_specs(&cfg);
-                (cfg.cp, cfg.netflow, accounts)
+                (cfg.cp, cfg.netflow, cfg.agentiflow, accounts)
             };
             // Spawn the background resume worker. It builds the SAME
             // RunStore the CP's AppState does (`<global_dir>/runs`), so it
@@ -210,15 +210,22 @@ pub async fn handle(action: Action) -> ExitCode {
             // than `[netflow].asn_refresh_interval_days`. The operator must
             // never have to run a command for enrichment to work.
             //
+            // The tick also reaps orphaned agentiflow runs (a run whose
+            // coordinator died), so a CP-only operator needs no separate
+            // `rupu agentiflow serve`.
+            //
             // The loop's own `enabled` flag (below) is therefore
-            // `sweep_loop_enabled(cp, netflow)` (`gate_sweep_enabled ||
-            // asn_auto_refresh`), NOT `gate_sweep_enabled` alone: collapsing
-            // the two into one boolean would mean an operator who disables
-            // gate-timeout enforcement but leaves ASN auto-refresh on (the
-            // default for both) gets zero refresh ticks. `gate_sweep_enabled`
-            // still independently guards whether `run_gate_sweep` itself
-            // runs each tick; `should_refresh_asn` remains the sole
-            // authority over whether the ASN refresh fires.
+            // `sweep_or_reaper_enabled(cp, netflow, agentiflow)`
+            // (`gate_sweep_enabled || asn_auto_refresh || reaper_enabled`),
+            // NOT `gate_sweep_enabled` alone: collapsing the duties into one
+            // boolean would mean an operator who disables gate-timeout
+            // enforcement but leaves ASN auto-refresh (or the reaper) on —
+            // the default for all three — gets zero ticks for the others.
+            // Each duty is still gated independently inside the tick:
+            // `gate_sweep_enabled` guards whether `run_gate_sweep` itself
+            // runs, `reaper_enabled` whether the agentiflow reap runs, and
+            // `should_refresh_asn` remains the sole authority over whether
+            // the ASN refresh fires.
             let gate_sweep_store = Arc::clone(&store);
             let gate_sweep_hosts = rupu_workspace::HostStore {
                 root: global_dir.join("hosts"),
@@ -226,9 +233,10 @@ pub async fn handle(action: Action) -> ExitCode {
             let gate_sweep_exe = exe.clone();
             let gate_sweep_global = global_dir.clone();
             let gate_sweep_enabled = cp_runtime_cfg.gate_sweep_enabled;
+            let agentiflow_reaper_enabled = agentiflow_cfg.reaper_enabled;
             let gate_sweep_handle = tokio::spawn(run_periodic_tick(
                 "gate-sweep",
-                sweep_loop_enabled(&cp_runtime_cfg, &netflow_cfg),
+                sweep_or_reaper_enabled(&cp_runtime_cfg, &netflow_cfg, &agentiflow_cfg),
                 Duration::from_secs(cp_runtime_cfg.gate_sweep_interval_secs.max(1)),
                 shutdown_tx.subscribe(),
                 move || {
@@ -238,11 +246,26 @@ pub async fn handle(action: Action) -> ExitCode {
                     };
                     let exe = gate_sweep_exe.clone();
                     let global = gate_sweep_global.clone();
+                    let reap_global = gate_sweep_global.clone();
                     let worker_id = gate_sweep_worker_id.clone();
                     let netflow_cfg = netflow_cfg.clone();
                     async move {
                         if gate_sweep_enabled {
                             run_gate_sweep(store, hosts, exe, worker_id, global).await;
+                        }
+
+                        // Best-effort and off the runtime (the reaper blocks):
+                        // a reap is logged here, and nothing in it can fail
+                        // the tick.
+                        if agentiflow_reaper_enabled {
+                            let summary = super::agentiflow::reap_orphans(&reap_global).await;
+                            if !summary.reaped.is_empty() {
+                                tracing::info!(
+                                    scanned = summary.scanned,
+                                    reaped = ?summary.reaped,
+                                    "reaped orphaned agentiflow runs"
+                                );
+                            }
                         }
 
                         // ASN freshness. Best-effort and never blocking: a
@@ -513,7 +536,7 @@ async fn run_periodic_tick<F, Fut>(
     Fut: std::future::Future<Output = ()>,
 {
     if !enabled {
-        tracing::info!(loop_name = %loop_name, "background loop disabled via [cp] config");
+        tracing::info!(loop_name = %loop_name, "background loop disabled via config");
         return;
     }
     tracing::info!(
@@ -1697,6 +1720,18 @@ pub(crate) fn sweep_loop_enabled(
     cp.gate_sweep_enabled || netflow.asn_auto_refresh
 }
 
+/// Whether the shared sweep tick runs at all: any of its duties is on — the
+/// gate sweep or ASN refresh ([`sweep_loop_enabled`]) or the agentiflow orphan
+/// reaper (`[agentiflow].reaper_enabled`). The tick gates each duty again, so
+/// this only decides whether the loop exists; with every duty off it does not.
+pub(crate) fn sweep_or_reaper_enabled(
+    cp: &rupu_config::CpConfig,
+    netflow: &rupu_config::NetflowConfig,
+    agentiflow: &rupu_config::AgentiflowConfig,
+) -> bool {
+    sweep_loop_enabled(cp, netflow) || agentiflow.reaper_enabled
+}
+
 /// Process-wide single-flight guard for the ASN refresh spawned from the
 /// gate-sweep tick. `should_refresh_asn` only observes on-disk mtime, so a
 /// download that stalls past one tick interval (the netflow HTTP client
@@ -1728,7 +1763,7 @@ mod tests {
     use super::{
         build_resume_argv, give_back_resume, hand_off_timed_out_approve, resume_one_run,
         resume_subcommand, run_gate_sweep, run_periodic_tick, should_refresh_asn, sweep_decision,
-        sweep_loop_enabled, try_claim_asn_refresh, SweepAction,
+        sweep_loop_enabled, sweep_or_reaper_enabled, try_claim_asn_refresh, SweepAction,
     };
     use rupu_orchestrator::{RunStatus, TimeoutAction};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -4709,5 +4744,42 @@ mod tests {
             ..Default::default()
         };
         assert!(!sweep_loop_enabled(&cp_cfg, &netflow_cfg));
+    }
+
+    #[test]
+    fn sweep_tick_runs_when_only_the_agentiflow_reaper_is_on() {
+        let cp_cfg = rupu_config::CpConfig {
+            gate_sweep_enabled: false,
+            ..Default::default()
+        };
+        let netflow_cfg = rupu_config::NetflowConfig {
+            asn_auto_refresh: false,
+            ..Default::default()
+        };
+        let reaper = |reaper_enabled| rupu_config::AgentiflowConfig {
+            reaper_enabled,
+            ..Default::default()
+        };
+        // Gate sweep off + ASN refresh off + reaper on: the loop must exist,
+        // or a CP-only operator who turned those two off never gets a reap.
+        assert!(sweep_or_reaper_enabled(
+            &cp_cfg,
+            &netflow_cfg,
+            &reaper(true)
+        ));
+        // Every duty off: no loop.
+        assert!(!sweep_or_reaper_enabled(
+            &cp_cfg,
+            &netflow_cfg,
+            &reaper(false)
+        ));
+        // The reaper being off must not turn off a loop another duty needs.
+        let gate = rupu_config::CpConfig::default();
+        assert!(sweep_or_reaper_enabled(&gate, &netflow_cfg, &reaper(false)));
+        let asn = rupu_config::NetflowConfig {
+            asn_auto_refresh: true,
+            ..Default::default()
+        };
+        assert!(sweep_or_reaper_enabled(&cp_cfg, &asn, &reaper(false)));
     }
 }

@@ -316,12 +316,16 @@ pub async fn run(args: Vec<String>) -> ExitCode {
     // SIGTERM — what a workflow-run cancel sends the run's `runner_pid` —
     // would otherwise kill the process mid-way through persisting an OAuth
     // token refresh. The handler (its own thread) drains those, bounded,
-    // then lets the signal kill the process. `autoflow serve` shuts down
-    // gracefully on SIGTERM itself (and `main` drains after it returns).
+    // then lets the signal kill the process. `autoflow serve` and
+    // `agentiflow serve` shut down gracefully on SIGTERM themselves (and
+    // `main` drains after they return); under this handler a SIGTERM would
+    // kill them mid-sweep instead.
     if !matches!(
         cli.command,
         Cmd::Autoflow {
             action: cmd::autoflow::Action::Serve { .. }
+        } | Cmd::Agentiflow {
+            action: cmd::agentiflow::Action::Serve
         }
     ) {
         exit::install_sigterm_handler();

@@ -102,6 +102,37 @@ impl Default for CpConfig {
     }
 }
 
+/// `[agentiflow]` config block: the background supervision of agentiflow runs.
+/// A sibling of `[cp]`; absent fields fall back to the defaults below, and an
+/// unknown key is an error (a typo must not silently leave the reaper off).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentiflowConfig {
+    /// Whether `rupu agentiflow serve` runs. When `false` the command prints
+    /// that it is disabled and exits instead of starting its loop. Defaults to
+    /// `true`.
+    pub serve_enabled: bool,
+    /// Seconds between the sweeps `rupu agentiflow serve` runs. Defaults to 60.
+    pub serve_interval_secs: u64,
+    /// Whether the orphan reaper runs, both inside `rupu agentiflow serve` and
+    /// on `rupu cp serve`'s sweep tick. The reaper finalizes an agentiflow run
+    /// whose coordinator process died as `failed` and stops the units it left
+    /// running. Defaults to `true` so a dead coordinator never leaves a run
+    /// `running` forever. `rupu agentiflow serve`'s only job is this reap, so
+    /// with it off `serve` has nothing to do and exits.
+    pub reaper_enabled: bool,
+}
+
+impl Default for AgentiflowConfig {
+    fn default() -> Self {
+        Self {
+            serve_enabled: true,
+            serve_interval_secs: 60,
+            reaper_enabled: true,
+        }
+    }
+}
+
 /// `[workflow]` config block. Gates the `run:` step kind, which executes
 /// declared commands and is therefore opt-in per workspace.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

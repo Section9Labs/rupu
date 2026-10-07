@@ -248,6 +248,23 @@ fall back to the CP's compiled defaults.
 
 ---
 
+## `[agentiflow]`
+
+Background supervision of agentiflow runs. A coordinator that dies (SIGKILL, a crash,
+the machine going down) leaves its run `running` forever and its detached units burning
+tokens; the orphan reaper records such a run as `failed` (`orphaned: coordinator pid <p>
+not running`) and stops its units. Two things run it: `rupu agentiflow serve` (a
+foreground loop for hosts without the control plane) and `rupu cp serve` (on its gate-sweep
+tick, every `[cp].gate_sweep_interval_secs`).
+
+| Key                   | Type    | Default | Notes |
+|-----------------------|---------|---------|-------|
+| `serve_enabled`       | bool    | `true`  | `false` makes `rupu agentiflow serve` print that it is disabled and exit |
+| `serve_interval_secs` | integer | `60`    | Seconds between `rupu agentiflow serve` sweeps (it also sweeps once at startup). `cp serve` reaps on its own cadence |
+| `reaper_enabled`      | bool    | `true`  | Turns the reaper off in both `rupu agentiflow serve` and `rupu cp serve`; with it off `agentiflow serve` has nothing to do and exits |
+
+---
+
 ## `[findings]`
 
 Limits and hints for recorded findings; see [coverage.md](coverage.md#finding-reports)

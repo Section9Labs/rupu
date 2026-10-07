@@ -135,6 +135,45 @@ fn cp_config_overrides_gate_sweep_flags_from_toml() {
 }
 
 #[test]
+fn agentiflow_config_defaults_when_the_block_is_absent() {
+    let cfg: Config = toml::from_str("default_provider = \"anthropic\"").expect("parse");
+    assert!(cfg.agentiflow.serve_enabled);
+    assert_eq!(cfg.agentiflow.serve_interval_secs, 60);
+    assert!(cfg.agentiflow.reaper_enabled);
+    assert_eq!(cfg.agentiflow, rupu_config::AgentiflowConfig::default());
+}
+
+#[test]
+fn agentiflow_config_partial_block_fills_the_rest_with_defaults() {
+    let cfg: Config = toml::from_str("[agentiflow]\nserve_interval_secs = 30").expect("parse");
+    assert_eq!(cfg.agentiflow.serve_interval_secs, 30);
+    assert!(cfg.agentiflow.serve_enabled);
+    assert!(cfg.agentiflow.reaper_enabled);
+}
+
+#[test]
+fn agentiflow_config_reads_every_key() {
+    let toml =
+        "[agentiflow]\nserve_enabled = false\nserve_interval_secs = 5\nreaper_enabled = false";
+    let cfg: Config = toml::from_str(toml).expect("parse");
+    assert!(!cfg.agentiflow.serve_enabled);
+    assert_eq!(cfg.agentiflow.serve_interval_secs, 5);
+    assert!(!cfg.agentiflow.reaper_enabled);
+}
+
+#[test]
+fn agentiflow_config_rejects_an_unknown_key() {
+    // deny_unknown_fields: a typo'd key must error, not silently leave the
+    // reaper at its default.
+    let err = toml::from_str::<Config>("[agentiflow]\nreaper_enable = false")
+        .expect_err("an unknown `[agentiflow]` key must not parse");
+    assert!(
+        err.to_string().contains("reaper_enable"),
+        "the error should name the key: {err}"
+    );
+}
+
+#[test]
 fn locked_global_key_survives_a_project_override() {
     let dir = tempfile::tempdir().unwrap();
     let global = dir.path().join("global.toml");

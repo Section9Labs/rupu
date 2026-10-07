@@ -40,7 +40,7 @@ use clap::Subcommand;
 use rupu_agentiflow::{
     agentiflow_dir, hard_stop, load_agentiflow_def, new_run_id, run_agentiflow, AgentiflowDef,
     AgentiflowRecord, Budget, CoverageTarget, EnvelopeOutcome, GenerationCapability, GoalTarget,
-    HardStopOutcome, LeadInputs, OperatorMessage, OperatorQueue, ProviderFactory,
+    HardStopOutcome, LeadInputs, OperatorMessage, OperatorQueue, ProviderFactory, ReapSummary,
     RunAgentiflowOpts,
 };
 use rupu_auth::CredentialResolver;
@@ -125,6 +125,18 @@ pub enum Action {
         #[arg(long)]
         now: bool,
     },
+    /// Supervise agentiflow runs: reap the ones whose coordinator died.
+    ///
+    /// A coordinator that is killed (SIGKILL, a crash, the machine going down)
+    /// leaves its run `running` forever and its detached units burning tokens.
+    /// This runs a sweep at startup and then every `[agentiflow]
+    /// serve_interval_secs` (default 60), recording each such run as failed
+    /// (`orphaned: coordinator pid <p> not running`) and stopping its units. It
+    /// runs until SIGTERM / Ctrl-C. `rupu cp serve` runs the same sweep on its
+    /// own tick, so this is for hosts that do not run the control plane.
+    /// `[agentiflow] serve_enabled = false` or `reaper_enabled = false` turns
+    /// it off.
+    Serve,
 }
 
 pub async fn handle(
@@ -143,6 +155,7 @@ pub async fn handle(
         Action::Status { id } => status_cmd(&id, global_format),
         Action::Send { id, message, now } => send_cmd(&id, &message, now),
         Action::Stop { id, now } => stop_cmd(&id, now).await,
+        Action::Serve => serve_cmd().await,
     };
     match result {
         Ok(()) => ExitCode::from(0),
@@ -158,6 +171,7 @@ pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Re
         Action::Status { .. } => ("agentiflow status", output_report::TABLE_JSON),
         Action::Send { .. } => ("agentiflow send", output_report::TABLE_ONLY),
         Action::Stop { .. } => ("agentiflow stop", output_report::TABLE_ONLY),
+        Action::Serve => ("agentiflow serve", output_report::TABLE_ONLY),
     };
     formats::ensure_supported(command_name, format, supported)
 }
@@ -1434,6 +1448,146 @@ async fn stop_cmd(fragment: &str, now: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What `agentiflow serve` does for a given `[agentiflow]` config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServePlan {
+    /// `serve_enabled = false`.
+    Disabled,
+    /// Serving, but the reaper (the only duty `serve` has) is off: a loop that
+    /// does nothing is a silent no-op, so say so and exit instead.
+    NothingToDo,
+    /// Sweep every this-many seconds.
+    Reap { interval_secs: u64 },
+}
+
+fn serve_plan(cfg: &rupu_config::AgentiflowConfig) -> ServePlan {
+    if !cfg.serve_enabled {
+        ServePlan::Disabled
+    } else if !cfg.reaper_enabled {
+        ServePlan::NothingToDo
+    } else {
+        // `interval` panics on a zero period.
+        ServePlan::Reap {
+            interval_secs: cfg.serve_interval_secs.max(1),
+        }
+    }
+}
+
+/// `rupu agentiflow serve`: sweep for orphaned runs on a timer until SIGTERM /
+/// Ctrl-C. Host-level, so it reads the global config only (as `cp serve` does).
+///
+/// This command is left out of `lib.rs`'s process-wide SIGTERM handler (which
+/// would kill the process, mid-sweep, by the signal): it takes SIGTERM itself,
+/// through [`shutdown_signal`], so a signal ends the loop and the process exits
+/// 0 through `main`'s normal drain.
+async fn serve_cmd() -> anyhow::Result<()> {
+    // Registered before anything else, so no signal reaches the default
+    // disposition once the command is underway.
+    let shutdown = shutdown_signal()?;
+    let global = paths::global_dir()?;
+    let cfg = rupu_config::layer_files_locked(Some(&global.join("config.toml")), None)?;
+    match serve_plan(&cfg.agentiflow) {
+        ServePlan::Disabled => println!("agentiflow serve: disabled by config"),
+        ServePlan::NothingToDo => {
+            println!("agentiflow serve: nothing to do (the reaper is disabled by config)")
+        }
+        ServePlan::Reap { interval_secs } => {
+            println!("agentiflow serve: reaping orphans every {interval_secs}s");
+            serve_loop(
+                &global,
+                std::time::Duration::from_secs(interval_secs),
+                shutdown,
+                // The same channel as the startup line: the default log filter
+                // is `warn`, so a tracing line would leave an operator watching
+                // this process with no sign that it reaped anything.
+                |id| println!("{}", reap_line(id)),
+            )
+            .await;
+        }
+    }
+    Ok(())
+}
+
+/// What `serve` prints for one run it reaped.
+fn reap_line(id: &str) -> String {
+    format!("agentiflow serve: reaped orphaned run {id}")
+}
+
+/// Resolves on SIGTERM or SIGINT. Both handlers are installed when this is
+/// CALLED (not on first poll), and a signal that arrives before the first poll
+/// is held, so there is no window in which one takes its default disposition.
+#[cfg(unix)]
+fn shutdown_signal() -> anyhow::Result<impl std::future::Future<Output = ()>> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate()).context("listen for SIGTERM")?;
+    let mut int = signal(SignalKind::interrupt()).context("listen for SIGINT")?;
+    Ok(async move {
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+    })
+}
+
+/// Off unix there is no SIGTERM: Ctrl-C only.
+#[cfg(not(unix))]
+fn shutdown_signal() -> anyhow::Result<impl std::future::Future<Output = ()>> {
+    Ok(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+}
+
+/// Sweep immediately, then every `interval`, until `shutdown` resolves, calling
+/// `on_reap` with the id of each run a sweep reaped. A sweep in progress
+/// finishes before the loop looks at `shutdown` again, so a signal never
+/// abandons a run half-reaped.
+async fn serve_loop(
+    global: &Path,
+    interval: std::time::Duration,
+    shutdown: impl std::future::Future<Output = ()>,
+    mut on_reap: impl FnMut(&str),
+) {
+    let mut ticker = tokio::time::interval(interval);
+    // A sweep can outlast the interval (it winds units down); do not queue up
+    // a burst of catch-up sweeps behind it.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tokio::pin!(shutdown);
+    loop {
+        // `biased`, shutdown first: a signal wins over a tick that is ready at
+        // the same moment (including the immediate first one), and the signal
+        // future is polled before the ticker on every pass.
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => break,
+            _ = ticker.tick() => {}
+        }
+        for id in reap_orphans(global).await.reaped {
+            on_reap(&id);
+        }
+    }
+}
+
+/// One orphan sweep, off the async runtime (the reaper blocks on file IO and,
+/// for a run with live units, on their SIGTERM grace). Returns what it reaped;
+/// reporting that is the caller's (`serve` prints it, `cp serve` logs it). A
+/// sweep that did not finish is logged and reads as one that reaped nothing:
+/// nothing here can fail the caller. Shared by `agentiflow serve` and `cp
+/// serve`'s sweep tick.
+pub(crate) async fn reap_orphans(global: &Path) -> ReapSummary {
+    let global = global.to_path_buf();
+    match tokio::task::spawn_blocking(move || {
+        rupu_agentiflow::reap_orphaned_agentiflows(&global, Utc::now())
+    })
+    .await
+    {
+        Ok(summary) => summary,
+        Err(e) => {
+            tracing::warn!(error = %e, "the agentiflow orphan sweep did not finish");
+            ReapSummary::default()
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct GoalRow {
     id: String,
@@ -1513,6 +1667,130 @@ mod tests {
     fn write(path: &Path, body: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn serve_plan_follows_the_agentiflow_config() {
+        use rupu_config::AgentiflowConfig;
+        let cfg = |serve_enabled, serve_interval_secs, reaper_enabled| AgentiflowConfig {
+            serve_enabled,
+            serve_interval_secs,
+            reaper_enabled,
+        };
+        assert_eq!(
+            serve_plan(&AgentiflowConfig::default()),
+            ServePlan::Reap { interval_secs: 60 }
+        );
+        assert_eq!(serve_plan(&cfg(false, 60, true)), ServePlan::Disabled);
+        assert_eq!(serve_plan(&cfg(false, 60, false)), ServePlan::Disabled);
+        assert_eq!(serve_plan(&cfg(true, 60, false)), ServePlan::NothingToDo);
+        assert_eq!(
+            serve_plan(&cfg(true, 30, true)),
+            ServePlan::Reap { interval_secs: 30 }
+        );
+        // A zero interval would panic `tokio::time::interval`.
+        assert_eq!(
+            serve_plan(&cfg(true, 0, true)),
+            ServePlan::Reap { interval_secs: 1 }
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_loop_stays_up_until_shutdown_and_then_returns() {
+        // Liveness and shutdown only; the reap itself is the next test, and
+        // the real-process e2e is Task 8's.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let global = tmp.path().to_path_buf();
+        let task = tokio::spawn(async move {
+            serve_loop(
+                &global,
+                std::time::Duration::from_millis(10),
+                async {
+                    let _ = rx.await;
+                },
+                |_| {},
+            )
+            .await;
+        });
+        // Let it tick a few times over a global with no runs, then stop it.
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        assert!(!task.is_finished(), "the loop must keep running");
+        tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the loop exits promptly on shutdown")
+            .expect("the loop did not panic");
+    }
+
+    #[tokio::test]
+    async fn serve_loop_reports_each_run_it_reaps_and_a_signal_ends_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A coordinator that has exited: a pid that is not running.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = child.id();
+        child.wait().unwrap();
+        let run_dir = agentiflow_dir(tmp.path()).join("af_orphan");
+        AgentiflowRecord {
+            id: "af_orphan".into(),
+            name: "acme".into(),
+            engagement_profiles: vec!["code".into()],
+            trigger: rupu_runtime::RunTriggerSource::Agentiflow,
+            status: "running".into(),
+            stop_reason: None,
+            rounds: 0,
+            goals: Vec::new(),
+            started_at: chrono::Utc::now(),
+            ended_at: None,
+            codename: None,
+            spent_usd: None,
+            spent_tokens: 0,
+            runner_pid: Some(dead_pid),
+        }
+        .write(&run_dir)
+        .unwrap();
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let reaped = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&reaped);
+        let global = tmp.path().to_path_buf();
+        let task = tokio::spawn(async move {
+            serve_loop(
+                &global,
+                std::time::Duration::from_millis(10),
+                async {
+                    let _ = rx.await;
+                },
+                move |id| seen.lock().unwrap().push(id.to_string()),
+            )
+            .await;
+        });
+        // The startup sweep reaps it; later sweeps find nothing to report.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while reaped.lock().unwrap().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the orphan is reaped and reported");
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the loop exits on shutdown")
+            .expect("the loop did not panic");
+
+        assert_eq!(*reaped.lock().unwrap(), vec!["af_orphan".to_string()]);
+        assert_eq!(
+            reap_line("af_orphan"),
+            "agentiflow serve: reaped orphaned run af_orphan"
+        );
+        let after = AgentiflowRecord::read(&run_dir).unwrap();
+        assert_eq!(after.status, "failed");
+        assert!(after
+            .stop_reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with("orphaned: coordinator pid")));
     }
 
     #[test]

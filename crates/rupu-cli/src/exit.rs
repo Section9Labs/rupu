@@ -148,7 +148,7 @@ fn exit_committed() -> &'static Arc<AtomicBool> {
 /// usual — see [`register_signal_actions_at`] for what that loses.
 ///
 /// Commands that shut down gracefully on SIGTERM themselves (`autoflow
-/// serve`) don't install it.
+/// serve`, `agentiflow serve`) don't install it.
 #[cfg(unix)]
 pub fn install_sigterm_handler() {
     install_sigterm_handler_at(None, CREDENTIAL_WRITE_DRAIN)
