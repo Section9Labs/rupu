@@ -485,6 +485,16 @@ removed host_01J9Z4W7Q0X8Y6V5K3M2N1P0R8</pre>
     <span class="k">agent</span>: <span class="v">model-trainer</span>
     <span class="k">host</span>: <span class="v">gpu-box</span>
     <span class="k">prompt</span>: <span class="s">"Fine-tune on &#123;&#123; inputs.dataset &#125;&#125;."</span></pre>
+    <p>
+      A placed unit (<code class="inline">host:</code> or a
+      <code class="inline">distribute:</code> unit, including a fallback-host retry
+      and a resumed run) runs under the run's
+      <a class="link" href="/docs/profiles.html">engagement profile</a>: the ids
+      travel to the host as <code class="inline">rupu run --engagement-profile</code>
+      and resolve against the host's own profiles, so install a custom profile
+      there too. A host that can't honour it is refused, never run on the
+      <code class="inline">code</code> path.
+    </p>
 
     <h3>Workspace sync for remote steps</h3>
     <p>
@@ -587,6 +597,7 @@ removed host_01J9Z4W7Q0X8Y6V5K3M2N1P0R8</pre>
       <thead><tr><th>Feature</th><th>Lets the coordinator…</th></tr></thead>
       <tbody>
         <tr><td><code>agent.findings_profile</code></td><td>Launch a unit with a step's <code class="inline">findings_profile</code>. A host without it refuses the launch rather than run the unit under a different profile.</td></tr>
+        <tr><td><code>agent.engagement_profile</code></td><td>Launch a unit under the run's engagement profile. An HTTP, tunnel or bucket host without it refuses the launch; an SSH remote too old for the flag rejects it, so the launch fails either way.</td></tr>
         <tr><td><code>run.coverage_stream</code></td><td>Read a remote unit's coverage stream (HTTP).</td></tr>
         <tr><td><code>findings.artifact_blob</code> / <code>findings.artifact_pull</code></td><td>Pull a finding's artifact from the host (HTTP / tunnel).</td></tr>
         <tr><td><code>workflow.resume_if_unfinished</code></td><td>Resume a run with the guard that refuses a run that finished since the request.</td></tr>

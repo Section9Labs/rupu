@@ -269,7 +269,9 @@ $ rupu cp <span class="k">serve</span> <span class="v">--bind</span> <span class
         run view. Runs are detached processes, so the browser signals them:
         cancel sends the recorded runner a <code class="inline">SIGTERM</code>
         (a run parked at a single gate with no live runner is cancelled by rejecting it), and pause leaves
-        a marker the runner picks up at its next safe boundary. A paused run
+        a marker the runner picks up at its next safe boundary. Only workflow
+        runs pause: a standalone agent run has no safe boundary, so pausing one
+        is refused (409). A paused run
         shows a Resume button; the resume worker continues it, picking up
         interrupted steps from their transcripts rather than restarting them.
         A button press means <em>recorded</em>; the run's status on the live

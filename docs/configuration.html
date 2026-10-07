@@ -80,7 +80,7 @@ global lock  ›  customer lock  ›  project  ›  customer  ›  global  ›  
         <tr><td><code>RUPU_LOG</code></td><td>Wins over <code>log_level</code>.</td></tr>
         <tr><td><code>RUPU_MAX_OPEN_FILES</code>, <code>RUPU_MAX_CONCURRENT_JOBS</code>, <code>RUPU_MIN_FREE_MEMORY_MB</code></td><td>Win over the <a class="link" href="#runtime"><code>[runtime]</code></a> keys of the same name.</td></tr>
         <tr><td><code>RUPU_NETFLOW_SUBPROCESS=0</code></td><td>Forces <code>[netflow].subprocess_capture</code> off.</td></tr>
-        <tr><td><code>RUPU_NO_UPDATE_CHECK</code></td><td>Suppresses the passive update notice, like <code>[update].check = false</code>.</td></tr>
+        <tr><td><code>RUPU_NO_UPDATE_CHECK</code></td><td>Suppresses the passive update notice, like <code>[update].check = false</code>, when set to anything other than empty, <code>0</code> or <code>false</code> (so <code>RUPU_NO_UPDATE_CHECK=0</code> leaves it on).</td></tr>
         <tr><td><code>RUPU_LIVE_VIEW=0</code></td><td>Turns the workflow live view off (as <code>--plain</code> does).</td></tr>
         <tr><td><code>NO_COLOR</code></td><td>Forces <code>[ui].color = "never"</code>.</td></tr>
         <tr><td><code>VISUAL</code> / <code>EDITOR</code></td><td>Used when <code>[ui].editor</code> is unset.</td></tr>

@@ -285,6 +285,12 @@ Do not edit code.</pre>
       the full built-in surface plus, when SCM / issue connectors are configured, any discovered MCP tools. For
       reusable repo agents, an explicit list is far better than the implicit wide-open default.
     </p>
+    <p>
+      The <code class="inline">findings.*</code> MCP tools are never offered to an agent, even under
+      <code class="inline">tools: ["*"]</code>: they need the run context only workflow <code class="inline">action:</code>
+      steps have. Agents record, query and tag findings with the <code class="inline">report_finding</code>,
+      <code class="inline">query_findings</code> and <code class="inline">tag_findings</code> builtins.
+    </p>
     <p>The built-in tools are:</p>
     <ul>
       <li><code class="inline">bash</code> — run shell commands</li>
@@ -513,6 +519,11 @@ rupu run code-reviewer --prompt <span class="s">"Review the staged diff for corr
     </p>
     <pre class="code"><span class="c"># inspect a recorded run</span>
 rupu transcript</pre>
+    <p>
+      <code class="inline">rupu run pause</code> / <code class="inline">rupu run resume</code> act on workflow runs
+      only. A standalone agent run has no pause boundary, so pausing one is refused with an error rather than
+      marking it paused while the agent keeps going.
+    </p>
     <div class="callout">
       <strong>Next.</strong> When a job needs multiple specialists, review boundaries, fan-out, or fix loops,
       compose agents into a <a class="link" href="/docs/workflows.html">workflow</a> rather than growing one

@@ -195,6 +195,13 @@ $ rupu session <span class="k">list</span></pre>
       when it's complete (<code class="inline">&#9679;</code>), giving the
       conversation a clear, consistent visual grammar.
     </p>
+    <p>
+      The status header ends with a context gauge,
+      <code class="inline">ctx 52K/200K 26%</code>: the last turn's prompt size
+      against the model's input limit, and the percentage, which changes color as
+      it nears the session's compaction threshold and again once it reaches it. It
+      appears once the input limit is known and a turn has completed.
+    </p>
 
     <h2>The session worker</h2>
     <p>

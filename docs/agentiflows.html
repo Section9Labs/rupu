@@ -133,7 +133,9 @@
       evidence the fleet has written so far — findings, assets and coverage in the run's pooled coverage scope, plus the metered spend — and
       either stops the run or hands the lead a <strong>digest</strong>: where every goal stands, the coverage fraction, the budget stage, any
       operator steering that arrived since the last round, and any non-fatal warnings. Round&nbsp;0 opens with the mission — each goal's
-      <code class="inline">objective</code>, in order.
+      <code class="inline">objective</code>, in order — and the authorized scope: <code class="inline">scope.mode</code> and one line per
+      <code class="inline">scope.roots</code> entry, its <code class="inline">kind</code> followed by its coordinates
+      (<code class="inline">network:host host=10.0.0.5</code>).
     </p>
     <p>
       The lead then takes up to <code class="inline">round.lead_max_turns</code> agentic turns (default <code class="inline">50</code>). It
@@ -212,15 +214,15 @@
         <tr><td><code>goals</code></td><td>one of goals / coverage</td><td>Measurable targets. A <strong>findings</strong> target counts findings (optionally by <code>classification</code>, e.g. <code>CWE-89</code>) and needs <code>count_gte</code>. An <strong>asset</strong> target names a profile-namespaced kind plus a <code>locator</code> and needs <code>depth_at_least</code>, a rung of that profile's coverage ladder. <code>required</code> defaults to <code>true</code>.</td></tr>
         <tr><td><code>coverage</code></td><td>one of goals / coverage</td><td>An engagement-wide stop: <code>reach</code> in <code>(0, 1]</code>, an optional <code>depth</code> rung, and optional <code>kinds</code> to measure. Validated to be reachable.</td></tr>
         <tr><td><code>budget</code></td><td>no</td><td><code>usd</code>, <code>tokens</code>, <code>wall_clock</code> (<code>Ns</code>/<code>Nm</code>/<code>Nh</code>/<code>Nd</code>), <code>rounds</code>, and <code>soft_at</code> (default <code>0.8</code>). Every field is optional; an unset one never stops the run. See <a class="link" href="#budget">Budgets</a>.</td></tr>
-        <tr><td><code>scope</code></td><td>yes</td><td><code>authorized: true</code> is mandatory — it's your statement that the fleet may act unattended. Optional <code>roots</code> name root asset kinds of an active profile (<code>code:repo</code>, <code>network:host</code>, <code>web:site</code>) with their coordinates; they are validated, not passed to the lead.</td></tr>
+        <tr><td><code>scope</code></td><td>yes</td><td><code>authorized: true</code> is mandatory — it's your statement that the fleet may act unattended. Optional <code>roots</code> name root asset kinds of an active profile (<code>code:repo</code>, <code>network:host</code>, <code>web:site</code>) with their coordinates; they are validated and listed, with <code>mode</code>, in the lead&rsquo;s opening-round prompt as the authorized targets.</td></tr>
         <tr><td><code>pool</code></td><td>yes</td><td>The fixed set of <code>agents</code> and <code>workflows</code> (a list, or <code>all</code>) the lead may launch. The lead never invents new fleet agents.</td></tr>
         <tr><td><code>round</code></td><td>no</td><td><code>lead_max_turns</code> per round (default 50, at least 1) and a hard <code>ceiling</code> on <code>rounds</code> / <code>wall_clock</code>.</td></tr>
       </tbody>
     </table>
     <div class="callout">
       <strong>Agentiflows run unattended.</strong> The lead runs without approval prompts and every unit starts in <code>bypass</code> mode,
-      in the directory you launch from. Scope roots are typed and validated, but rupu does not enforce scope in code, and the lead doesn't
-      see the roots — put targets and constraints in the goal objectives or <code>description</code>. Only put agents in the pool that you're
+      in the directory you launch from. Scope roots are typed, validated and shown to the lead, but rupu does not enforce scope in code: nothing stops an agent from
+      reaching beyond them, so put hard constraints in the goal objectives too. Only put agents in the pool that you're
       happy to run unattended.
     </div>
 

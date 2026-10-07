@@ -409,7 +409,14 @@
       older than a cutoff (<code class="inline">--older-than 30d</code> by default,
       <code class="inline">--dry-run</code> to preview). It matches on file age,
       never touches anything modified in the last hour, and rejects a zero or
-      negative cutoff.
+      negative cutoff. A ledger whose run is still live is never deleted, however
+      long the run has been idle: a workflow run that hasn't finished (paused and
+      awaiting-approval runs included, unless it is
+      <code class="inline">running</code>/<code class="inline">pending</code> with a
+      dead recorded runner pid) keeps its own, its steps', its fan-out units' and
+      its sub-agents' ledgers, and a standalone <code class="inline">rupu run</code>
+      whose process is alive keeps its own and its sub-agents'. These rows report
+      <code class="inline">skipped_live</code>.
     </p>
     <pre class="code"><span class="c"># see what a 14-day cutoff would remove, then do it</span>
 rupu netflow prune <span class="v">--older-than</span> <span class="s">14d</span> <span class="v">--dry-run</span>

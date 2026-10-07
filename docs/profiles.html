@@ -98,10 +98,11 @@
       <thead><tr><th>Surface</th><th>How</th><th>Notes</th></tr></thead>
       <tbody>
         <tr><td><code>rupu run</code></td><td><code>--engagement-profile &lt;id&gt;</code></td><td>Alias <code>--engagement-profiles</code>; repeat the flag or pass a comma-separated list. Sub-agents started with <code>dispatch_agent</code> inherit the selection.</td></tr>
-        <tr><td><code>rupu workflow run</code></td><td><code>--engagement-profile &lt;id&gt;</code></td><td>Applies to every agent step. The selection isn&rsquo;t recorded on the run, so <code>rupu workflow resume</code> and an approve-resume carry on without it, on the <code>code</code> path.</td></tr>
+        <tr><td><code>rupu workflow run</code></td><td><code>--engagement-profile &lt;id&gt;</code></td><td>Applies to every agent step and to <code>action: findings.record</code> steps. The selection is recorded on the run (<code>engagement_profiles</code> in <code>run.json</code>), so <code>rupu workflow resume</code>, <code>workflow approve</code> and a gate approved in the control plane continue under it. A recorded profile that no longer resolves fails the resume.</td></tr>
         <tr><td>Agentiflows</td><td><code>engagement_profiles:</code> (required)</td><td>rupu validates the definition against the profiles and passes the set to the lead and every unit. See <a class="link" href="/docs/agentiflows.html">Agentiflows</a>.</td></tr>
-        <tr><td>Sessions, autoflows, CP launches</td><td>&mdash;</td><td>These don&rsquo;t accept a selection and always run on the <code>code</code> path. The control plane shows the profiles an agentiflow ran with, but nothing launched from it takes one.</td></tr>
-        <tr><td>Remote workflow units</td><td>&mdash;</td><td>The selection doesn&rsquo;t reach a <code>host:</code> / <code>distribute:</code> unit, which runs on the <code>code</code> path.</td></tr>
+        <tr><td>CP agent launch API</td><td><code>engagement_profiles: [..]</code> in the <code>POST /api/agents/:name/run</code> body</td><td>Passed to <code>rupu run --engagement-profile</code>, locally or on the chosen host (see the remote row). The web launcher doesn&rsquo;t offer it.</td></tr>
+        <tr><td>Sessions, autoflows</td><td>&mdash;</td><td>These don&rsquo;t accept a selection and always run on the <code>code</code> path.</td></tr>
+        <tr><td>Remote workflow units</td><td>inherited from <code>rupu workflow run</code></td><td>A <code>host:</code> / <code>distribute:</code> unit gets the ids as <code>rupu run --engagement-profile</code>, on every transport. A host must advertise <code>agent.engagement_profile</code> (see <a class="link" href="/docs/multi-host.html">Multi-host</a>); otherwise the launch is refused, never run on the <code>code</code> path. An SSH remote too old for the flag rejects it and the launch fails. The host resolves the ids against its own profiles, so install a custom profile there too.</td></tr>
         <tr><td><code>rupu coverage rerun</code></td><td>&mdash;</td><td>Replays on the <code>code</code> path.</td></tr>
       </tbody>
     </table>
@@ -211,6 +212,7 @@
     <h2 id="assets">Recording assets</h2>
     <p>Two tools write assets, both to the target&rsquo;s asset ledger, <code class="inline">.rupu/coverage/&lt;target&gt;/assets.jsonl</code>, next to <code class="inline">findings.jsonl</code>.</p>
     <h3>report_finding with an asset</h3>
+    <p>When an engagement is active, <code class="inline">report_finding</code> takes an optional <code class="inline">asset</code>. So does the MCP <code class="inline">findings.record</code> tool a workflow <code class="inline">action:</code> step calls, with the same schema and handling.</p>
     <pre class="code">{
   <span class="k">"scope"</span>: <span class="s">"edge-sweep"</span>,
   <span class="k">"report"</span>: { <span class="c">/* a complete finding report */</span> },
@@ -229,7 +231,7 @@
       <li><strong>Checks completeness.</strong> Every required check of the owning profile is evaluated under the <code class="inline">full</code> finding profile. If any check fails, the finding is rejected with the labels of the failing checks. Under <code class="inline">summary</code> there&rsquo;s no report to evaluate, so this step is skipped.</li>
       <li><strong>Stamps the asset</strong> into <code class="inline">assets.jsonl</code> and the run&rsquo;s coverage stream, so a coordinator collecting a remote unit receives it. The new line keeps the asset&rsquo;s existing depth, parent, attributes and label, unless the call supplies a new label.</li>
     </ol>
-    <p>The finding record itself does not store an asset id. When no engagement is active, <code class="inline">asset</code> is ignored. When an engagement is active but the finding has no asset, it records on the plain path without a completeness check. The MCP <code class="inline">findings.record</code> tool doesn&rsquo;t accept <code class="inline">asset</code> yet, and <code class="inline">rupu findings import</code> records no asset.</p>
+    <p>The finding record itself does not store an asset id. When no engagement is active, <code class="inline">asset</code> is ignored. When an engagement is active but the finding has no asset, it records on the plain path without a completeness check. <code class="inline">rupu findings import</code> records no asset.</p>
     <h3>asset_mark</h3>
     <pre class="code">{ <span class="k">"kind"</span>: <span class="s">"web:route"</span>,
   <span class="k">"coordinates"</span>: [ { <span class="k">"t"</span>: <span class="s">"url"</span>, <span class="k">"v"</span>: <span class="s">"https://shop.example.test"</span> },
