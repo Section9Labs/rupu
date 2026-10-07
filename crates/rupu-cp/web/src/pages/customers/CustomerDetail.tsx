@@ -277,7 +277,9 @@ export default function CustomerDetail() {
                 )}
                 <span>created {createdLabel(c.created_at)}</span>
                 <Sep />
-                <span className="font-mono text-ink-mute">{detail.config_path}</span>
+                <span className="min-w-0 max-w-[28rem] truncate font-mono text-ink-mute" title={detail.config_path}>
+                  {detail.config_path}
+                </span>
               </div>
               {c.notes && <p className="mt-2 max-w-3xl whitespace-pre-line text-ui text-ink-dim">{c.notes}</p>}
             </div>

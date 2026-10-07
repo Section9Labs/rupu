@@ -177,6 +177,9 @@ export const PROJECT_COLUMNS: Column<ProjectRow>[] = [
     key: 'name',
     header: 'Name',
     subject: true,
+    // The subject column only gets the table's leftover width; without a floor
+    // the long-path and branch columns squeeze a short name to an ellipsis.
+    width: 'min-w-[9rem]',
     sortable: true,
     sortValue: (p) => p.name,
     titleValue: (p) => p.name,
@@ -191,7 +194,7 @@ export const PROJECT_COLUMNS: Column<ProjectRow>[] = [
     // Capped narrower than the name's share of a 1280-1440px table, and truncating
     // for real: the full path is on hover.
     render: (p) => (
-      <span className="text-note text-ink-mute font-mono truncate block max-w-[14rem]" title={p.path}>
+      <span className="text-note text-ink-mute font-mono truncate block max-w-[12rem]" title={p.path}>
         {p.path}
       </span>
     ),
@@ -205,9 +208,12 @@ export const PROJECT_COLUMNS: Column<ProjectRow>[] = [
     render: (p) => (
       <div className="flex items-center gap-1.5 flex-wrap">
         {p.repo_remote && (
-          <span className="inline-flex items-center gap-1 text-meta text-ink bg-surface rounded px-1.5 py-0.5">
-            <GitFork size={10} />
-            {p.repo_remote}
+          <span
+            className="inline-flex max-w-[13rem] items-center gap-1 text-meta text-ink bg-surface rounded px-1.5 py-0.5"
+            title={p.repo_remote}
+          >
+            <GitFork size={10} className="shrink-0" />
+            <span className="truncate">{p.repo_remote}</span>
           </span>
         )}
         {p.branch ? (
