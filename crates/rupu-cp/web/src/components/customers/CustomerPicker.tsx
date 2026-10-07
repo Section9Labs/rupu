@@ -15,7 +15,7 @@ import { CustomerDot } from './CustomerDot';
 type Variant = 'sidebar' | 'compact';
 
 type Item =
-  | { kind: 'all'; key: string; label: string; count: number | null }
+  | { kind: 'all'; key: string; label: string }
   | { kind: 'none'; key: string; label: string }
   | { kind: 'customer'; key: string; label: string; row: CustomerRow; muted: boolean };
 
@@ -73,7 +73,6 @@ export function CustomerPicker({ variant = 'sidebar' }: { variant?: Variant }) {
         kind: 'all',
         key: 'all',
         label: 'All customers',
-        count: customers.length > 0 ? customers.reduce((n, c) => n + c.rollup.projects, 0) : null,
       });
     }
     for (const c of customers) {
@@ -238,9 +237,6 @@ export function CustomerPicker({ variant = 'sidebar' }: { variant?: Variant }) {
                   <span className="min-w-0 flex-1 truncate">{item.label}</span>
                   {item.kind === 'customer' && (
                     <span className="font-mono text-[11px] text-ink-mute">{item.row.rollup.projects}</span>
-                  )}
-                  {item.kind === 'all' && item.count !== null && (
-                    <span className="font-mono text-[11px] text-ink-mute">{item.count}</span>
                   )}
                   {current && <Check size={13} aria-hidden className="text-brand-600" />}
                 </button>

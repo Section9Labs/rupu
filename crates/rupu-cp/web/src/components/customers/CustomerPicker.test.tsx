@@ -104,8 +104,8 @@ describe('CustomerPicker', () => {
     expect(within(menu).getByText('Globex')).toBeInTheDocument();
     expect(within(menu).getByText('Unassigned')).toBeInTheDocument();
     expect(within(menu).getByRole('menuitem', { name: /Acme Corp/ })).toHaveTextContent('3');
-    // All customers = sum of the rows' project counts
-    expect(within(menu).getByRole('menuitem', { name: /All customers/ })).toHaveTextContent('5');
+    // No count on "All customers": the assigned-only sum would read as a wrong total.
+    expect(within(menu).getByRole('menuitem', { name: /All customers/ })).toHaveTextContent(/^All customers$/);
   });
 
   it('typing filters the rows', async () => {
