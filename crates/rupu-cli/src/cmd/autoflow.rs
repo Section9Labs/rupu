@@ -71,6 +71,7 @@ pub enum Action {
     List(RepoFilterArgs),
     /// Show one autoflow workflow and its resolved metadata.
     Show {
+        /// Name of the autoflow-enabled workflow.
         #[arg(add = ArgValueCompleter::new(workflow_names))]
         name: String,
         /// Limit resolution to one tracked repo.
@@ -79,6 +80,7 @@ pub enum Action {
     },
     /// Execute one autonomous cycle for one issue target.
     Run {
+        /// Name of the autoflow-enabled workflow.
         #[arg(add = ArgValueCompleter::new(workflow_names))]
         name: String,
         /// Issue target in full run-target form:
@@ -171,6 +173,7 @@ pub enum Action {
     },
     /// Explain the current autonomous state for one issue.
     Explain {
+        /// Issue ref, for example `github:owner/repo/issues/42`.
         r#ref: String,
         /// Limit resolution to one bound repo.
         #[arg(long)]
@@ -180,6 +183,7 @@ pub enum Action {
     Doctor(RepoFilterArgs),
     /// Apply safe, bounded remediation to one issue claim.
     Repair {
+        /// Issue ref, for example `github:owner/repo/issues/42`.
         r#ref: String,
         /// Explicitly release the claim after repair.
         #[arg(long)]
@@ -190,6 +194,7 @@ pub enum Action {
     },
     /// Enqueue one manual wake for an issue.
     Requeue {
+        /// Issue ref, for example `github:owner/repo/issues/42`.
         r#ref: String,
         /// Override the synthetic event id.
         #[arg(long)]
@@ -203,7 +208,10 @@ pub enum Action {
     /// Inspect persisted autoflow claims.
     Claims(RepoFilterArgs),
     /// Force-release one claim.
-    Release { r#ref: String },
+    Release {
+        /// Issue ref, for example `github:owner/repo/issues/42`.
+        r#ref: String,
+    },
     /// Scaffold a new autoflow-enabled workflow YAML, then open it for
     /// editing. Same template as `workflow create` plus an `autoflow:`
     /// block pre-filled with reasonable defaults.

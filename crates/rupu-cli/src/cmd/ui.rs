@@ -40,9 +40,15 @@ pub enum Action {
 #[derive(Subcommand, Debug, Clone)]
 pub enum ThemeAction {
     /// Show one theme in detail.
-    Show { name: String },
+    Show {
+        /// Theme name, as listed by `rupu ui themes`.
+        name: String,
+    },
     /// Validate a theme file on disk.
-    Validate { path: PathBuf },
+    Validate {
+        /// Path to the theme file to check.
+        path: PathBuf,
+    },
     /// Import a theme from a local file or URL.
     Import(ImportArgs),
 }

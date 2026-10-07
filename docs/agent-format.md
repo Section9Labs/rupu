@@ -155,6 +155,56 @@ Notes:
 - for reusable repo agents, explicit `tools:` is better than relying on the implicit wide-open default
 - `tools:` is not the same thing as a workflow step's `actions:`. `tools:` is this agent's full tool grant; `actions:` (on a workflow step) can only narrow the connector/MCP subset of that grant further for that one step — it never touches builtin tools (`bash`, `read_file`, `write_file`, `edit_file`, `grep`, `glob`, `ast_grep`, `dispatch_agent`, `dispatch_agents_parallel`) and can never grant a tool beyond what `tools:` already allows
 
+#### The `ast_grep` tool
+
+`ast_grep` searches the workspace by syntax tree rather than by text, so a
+pattern matches code with the same shape however it is spaced, wrapped or
+commented. It runs the [ast-grep](https://ast-grep.github.io/) binary, which
+must be on `PATH` as `ast-grep` (`brew install ast-grep` or
+`cargo install ast-grep`; the short `sg` alias is deliberately not used,
+because it collides with a system tool on macOS). Without it, every call
+returns an "ast-grep not found" error. It is a read tool: `readonly` mode
+allows it.
+
+Input:
+
+| Field | Required | Meaning |
+|-------|----------|---------|
+| `pattern` | yes | A code snippet in the target language, with metavariables |
+| `lang` | yes | The grammar to parse the pattern and the files with: any language ast-grep supports, e.g. `rust`, `python`, `typescript`, `tsx`, `javascript`, `go`, `java`, `c`, `cpp` |
+| `path` | no | A sub-path of the workspace to search. Defaults to the workspace root; a path that leaves the workspace is refused |
+
+Metavariables:
+
+- `$NAME` (upper-case) matches exactly one syntax node and captures it. The
+  same name used twice must match identical code: `$A == $A`.
+- `$$$` matches zero or more nodes — an argument list, a statement block, a
+  run of parameters. `$$$NAME` captures them.
+- `$_` matches one node without capturing it.
+
+Examples (invented):
+
+| `lang` | `pattern` | Finds |
+|--------|-----------|-------|
+| `rust` | `impl $TRAIT for $TYPE { $$$ }` | every trait implementation |
+| `rust` | `$X.unwrap()` | every `.unwrap()` call, whatever it is called on |
+| `python` | `subprocess.run($$$, shell=True, $$$)` | shell-invoking subprocess calls |
+| `typescript` | `fetch($URL, $$$)` | `fetch` call sites with any options |
+| `go` | `if err != nil { return $$$ }` | early returns on error |
+| `javascript` | `$EL.innerHTML = $VALUE` | direct `innerHTML` assignments |
+
+The output is one `path:line:col: <first line of match>` line per match
+(1-based, workspace-relative); no matches is empty output, not an error. A
+malformed pattern or a bad path surfaces ast-grep's diagnostic as the error
+rather than an empty result. Alongside the text, each call records up to 200
+matches as structured data (file, range, full matched text, and every
+metavariable's captured text), which the control plane uses to show a source
+slice and a syntax-tree preview for each match. The syntax-tree half is
+picked by file extension and covers Rust, Python, TypeScript, TSX, JavaScript,
+Go and JSON files (`.rs`, `.py`, `.ts`, `.tsx`, `.js`/`.jsx`/`.mjs`/`.cjs`,
+`.go`, `.json`); other files get no tree. Under a `concerns:` block, each matched file is recorded in
+the coverage ledger like a `grep` hit.
+
 ### `permissionMode`
 
 Valid values:

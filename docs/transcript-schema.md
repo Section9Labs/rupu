@@ -7,9 +7,10 @@
 
 ## Overview
 
-Every rupu run produces an immutable append-only log in JSONL format. Each line is one event.
-The schema is the single source of truth for what happened in a run; there is no separate run
-database in v0. `rupu transcript list` globs JSONL files and reads the `run_start` event from
+Every agent run rupu executes (a standalone `rupu run`, each workflow step and fan-out unit,
+each sub-agent started with `dispatch_agent`, each session turn) writes an append-only log in
+JSONL format. Each line is one event. A workflow run's own records (`run.json`,
+`step_results.jsonl`, `events.jsonl`) live in the run store and point at each step's transcript. `rupu transcript list` globs JSONL files and reads the `run_start` event from
 each for metadata — only that first event, which is what lets it sort thousands of transcripts
 cheaply and then read just the `--limit` most recent ones end to end (`run_complete` at the tail
 carries the status and token totals).
@@ -32,7 +33,9 @@ so it survives every tolerated damage mode. Readers classify such a file as
 Where `<transcripts-dir>` is:
 
 - `<project>/.rupu/transcripts/` if the directory exists.
-- `~/.rupu/transcripts/` otherwise (global fallback).
+- `~/.rupu/transcripts/` (or `$RUPU_HOME/transcripts/`) otherwise (global fallback).
+
+`rupu transcript archive` moves a standalone run's file to `<transcripts-dir>/archive/`.
 
 **The filename is the canonical run identifier.** The `<run_id>` portion has the form
 `run_<26-char-ULID>` (e.g., `run_01HXX3Y7K8NQVZ2P0M4BCJD5F6`). Individual events do not
@@ -53,6 +56,29 @@ object with this shape:
 
 All field names are `snake_case` (`rename_all = "snake_case"` applied to every event variant).
 The `type` discriminator is the snake_case event name (e.g., `"run_start"`, `"tool_call"`).
+
+Optional fields are **omitted**, not written as `null`, when they have no value, and boolean
+flags that default to `false` are omitted when `false` (the one exception is
+`run_start.customer`, where `null` is meaningful). Treat a missing key as its default. Several
+writers append to one file (the agent loop, the `tool_audit` hook, the netflow sink), each line
+whole.
+
+---
+
+## Schema versions
+
+`run_start.schema` says which writer produced the file. Current rupu writes `2`; a transcript
+with no `schema` key is version 1.
+
+| Version | What it records |
+|---------|-----------------|
+| 1 (no key) | The conversation as text. Reasoning, if any, is the plain `thinking` string on `assistant_message`, with no provider payload |
+| 2 | Enough to rebuild the exact conversation sent to the provider: the effective `system_prompt` on `run_start`, the `user_message`, each reasoning block as a `thinking` event with the provider's byte-exact `raw` block, the `seed` the run started from, every `compaction`, and `assistant_block` for reply blocks with no event of their own |
+
+Fields and events have been added within version 2 since it shipped (`outcome`, `recovery`,
+`assistant_block`, `customer`, `codename`, `cache_write_tokens`, `purpose`). A reader should
+accept a missing optional key and an unknown event type (see
+[Unknown event types](#unknown-event-types)).
 
 ---
 
@@ -110,9 +136,16 @@ Emitted once at the very beginning of every run (agent or workflow step).
 | `model`        | string            | Model identifier (e.g., `claude-sonnet-4-6`) |
 | `started_at`   | DateTime\<Utc\>   | RFC3339 timestamp                          |
 | `mode`         | RunMode           | Permission mode for this run               |
+| `schema`       | u32, optional     | Transcript schema version: `2` today; absent on version 1 |
+| `system_prompt` | string, optional | The system prompt actually sent, after rupu appended its own sections (coverage catalog, run target, finding guidance) |
+| `codename`     | string, optional  | The agent instance's human codename (e.g. `amber-lantern/heron`, `cobalt-harbor/heron#412`); absent on transcripts that predate codenames |
+| `customer`     | string \| null, optional | The customer the run ran under. A slug; `null` = recorded as no customer; no key = the transcript predates customers |
+
+`provider` and `model` are what the run was configured to use; a fallback hop appears later
+as a `notice` and a `recovery`, not here.
 
 ```json
-{"type":"run_start","data":{"run_id":"run_01HXX3Y7K8NQ","workspace_id":"ws_01HXX…","agent":"fix-bug","provider":"anthropic","model":"claude-sonnet-4-6","started_at":"2026-05-01T17:00:00Z","mode":"ask"}}
+{"type":"run_start","data":{"run_id":"run_01HXX3Y7K8NQ","workspace_id":"ws_01HXX…","agent":"fix-bug","provider":"anthropic","model":"claude-sonnet-4-6","started_at":"2026-05-01T17:00:00Z","mode":"ask","schema":2,"system_prompt":"You fix failing tests…","codename":"amber-lantern/heron","customer":null}}
 ```
 
 ---
@@ -133,11 +166,12 @@ Emitted at the beginning of each agent turn (before the LLM request is sent).
 
 ### `usage`
 
-Emitted once per LLM response, right after the provider call returns and before any
+Emitted once per provider call, right after the call returns and before any
 `assistant_delta`/`assistant_message` events for that response. `output_tokens` is already the
-billable output figure — Gemini's reasoning/"thinking" tokens (reported separately by the
-provider as `thoughtsTokenCount`) are folded in here upstream, so no separate reasoning-token
-field exists on this event.
+billable output figure — reasoning tokens (e.g. Gemini's `thoughtsTokenCount`) are folded in
+upstream, so no separate reasoning-token field exists on this event. A context-compaction
+summariser call writes its own `usage` line with `purpose: "compaction"`: real, billed spend
+that is not an agent turn (turn counters skip it; token and cost totals include it).
 
 | Field           | Type             | Description                                                  |
 |-----------------|------------------|----------------------------------------------------------------|
@@ -146,7 +180,9 @@ field exists on this event.
 | `served_model`  | string, optional | Actual model the provider served, if it differs from `model`   |
 | `input_tokens`  | u32              | Input tokens for this response                                 |
 | `output_tokens` | u32              | Billable output tokens (includes any reasoning tokens)         |
-| `cached_tokens` | u32              | Cached-input tokens included in `input_tokens` (default `0`)    |
+| `cached_tokens` | u32              | Prompt-cache reads included in `input_tokens` (default `0`)    |
+| `cache_write_tokens` | u32, optional | Prompt-cache writes included in `input_tokens`. Only Anthropic reports it; omitted when `0` |
+| `purpose`       | string, optional | Why the call happened when it is not a normal turn: `"compaction"` today. Absent for a normal turn |
 
 ```json
 {"type":"usage","data":{"provider":"anthropic","model":"claude-sonnet-4-6","input_tokens":1024,"output_tokens":312,"cached_tokens":0}}
@@ -180,7 +216,7 @@ complete message block).
 | Field      | Type             | Description                                     |
 |------------|------------------|-------------------------------------------------|
 | `content`  | string           | Full assistant text                             |
-| `thinking` | string, optional | Extended thinking text (omitted if not present) |
+| `thinking` | string, optional | Version 1 reasoning text. Version 2 writers record reasoning as separate `thinking` events instead |
 
 ```json
 {"type":"assistant_message","data":{"content":"I'll start by reading the test file to understand the failure."}}
@@ -214,6 +250,7 @@ Emitted after a tool call completes (or fails).
 | `output`      | string           | Tool output text                              |
 | `error`       | string, optional | Error description if the tool failed          |
 | `duration_ms` | u64              | Wall-clock time the tool took, in ms          |
+| `structured`  | object, optional | A machine-readable payload some tools add next to the text `output`, e.g. `ast_grep`'s matches with ranges and metavariable bindings. Absent on older transcripts and for tools that add none |
 
 ```json
 {"type":"tool_result","data":{"call_id":"toolu_01ABC","output":"error[E0308]: mismatched types\n  --> src/parser.rs:142","duration_ms":843}}
@@ -321,8 +358,9 @@ line, and it is what the CP transcript panel renders a badge from.
 
 ### `gate_requested`
 
-Reserved for Slice B workflow approval gates. **Not emitted in v0.** The schema is defined and
-stable so Slice B can emit these events without a schema migration.
+Defined, but **not written by current rupu**: workflow approval gates are recorded on the
+workflow run (`run.json`, `events.jsonl`), not in agent transcripts. Readers still parse and
+render the event so older or hand-made files display.
 
 | Field        | Type             | Description                                       |
 |--------------|------------------|---------------------------------------------------|
@@ -332,7 +370,135 @@ stable so Slice B can emit these events without a schema migration.
 | `decided_by` | string, optional | Identity of the approver                          |
 
 ```json
-{"type":"gate_requested","data":{"gate_id":"gate_01HXX","prompt":"Apply the proposed edit to parser.rs?","decision":null,"decided_by":null}}
+{"type":"gate_requested","data":{"gate_id":"gate_01HXX","prompt":"Apply the proposed edit to parser.rs?"}}
+```
+
+---
+
+### `user_message`
+
+The user turn this run added to the conversation. Absent on a run that only continues a
+`seed`. A note rupu sends back to the model mid-run (for example after an interruption, or a
+recovery note) is also a `user_message`.
+
+| Field     | Type   | Description |
+|-----------|--------|-------------|
+| `content` | string | The prompt text |
+
+```json
+{"type":"user_message","data":{"content":"Fix the failing parser test."}}
+```
+
+---
+
+### `seed`
+
+The conversation this run started from (a `rupu run --continue`, a session's earlier turns, a
+workflow resume), stored once rather than re-embedded per turn. Exactly one of
+`source_transcript` and `messages` is present.
+
+| Field               | Type             | Description |
+|---------------------|------------------|-------------|
+| `message_count`     | u32              | Number of messages in the seed |
+| `sha256`            | string           | Hash of the canonical seed JSON, so a reader can verify a reference chain |
+| `source_transcript` | string, optional | A transcript whose replay rebuilds exactly this seed (chains can be several deep) |
+| `messages`          | array, optional  | The seed messages inline (reasoning `raw` intact), when no source transcript vouches for it |
+
+```json
+{"type":"seed","data":{"message_count":6,"sha256":"9f2c…","source_transcript":"/repo/.rupu/transcripts/run_01HXX2A.jsonl"}}
+```
+
+---
+
+### `thinking`
+
+One model reasoning block, in its real position among the turn's other blocks.
+
+| Field      | Type             | Description |
+|------------|------------------|-------------|
+| `text`     | string, optional | Human-readable reasoning. Absent when the reasoning was redacted or its display omitted |
+| `provider` | string           | Provider that produced the block |
+| `model`    | string           | Model that produced the block |
+| `raw`      | object           | The provider's byte-exact block, signatures included. Kept for replay; never display it |
+
+```json
+{"type":"thinking","data":{"text":"The test expects usize…","provider":"anthropic","model":"claude-sonnet-4-6","raw":{"type":"thinking","thinking":"The test expects usize…","signature":"EqQB…"}}}
+```
+
+---
+
+### `thinking_delta`
+
+A streamed chunk of reasoning text, the reasoning counterpart of `assistant_delta`. The
+following `thinking` event carries the whole block; after-the-fact readers can ignore deltas.
+
+| Field     | Type   | Description |
+|-----------|--------|-------------|
+| `content` | string | One incremental reasoning chunk |
+
+---
+
+### `assistant_block`
+
+A reply content block with no event of its own, written in its position among the turn's
+`assistant_message`, `thinking` and `tool_call` events. Replay folds it back into the
+assistant message at that position.
+
+| Field       | Type           | Description |
+|-------------|----------------|-------------|
+| `block`     | object         | The provider-neutral content block: `{"type":"fallback","from_model":…,"to_model":…}` (an Anthropic server-side fallback boundary) or `{"type":"unknown","provider":…,"raw":…}` (a block rupu does not model, with the provider's raw payload) |
+| `abandoned` | bool, optional | `true` for a block the API discarded at a mid-reply server-side fallback. It was never sent back to the model; replay skips it. Omitted when `false` |
+
+```json
+{"type":"assistant_block","data":{"block":{"type":"fallback","from_model":"claude-opus-5","to_model":"claude-sonnet-4-6"}}}
+```
+
+---
+
+### `compaction`
+
+Context compaction rewrote the conversation. The turns that follow were built from
+`messages`.
+
+| Field                 | Type   | Description |
+|-----------------------|--------|-------------|
+| `seq`                 | u32    | Compaction sequence number within the run |
+| `summarized_messages` | u32    | How many messages were summarised |
+| `backup_path`         | string | Where the pre-compaction conversation was saved |
+| `messages`            | array  | The whole conversation after compaction |
+
+The summariser call itself is billed under a `usage` line with `purpose: "compaction"`.
+
+---
+
+### `notice`
+
+A runtime intervention worth showing that is not part of the conversation.
+
+| Field     | Type   | Description |
+|-----------|--------|-------------|
+| `kind`    | string | `model_limits` (the run's input and output limits and where each came from, written at start and on a fallback hop), `model_limits_clamped`, `context_trim`, `provider_retry` or `server_side_fallback_disabled`. Expect new kinds; render an unknown one by its `message` |
+| `message` | string | Human-readable text |
+
+```json
+{"type":"notice","data":{"kind":"provider_retry","message":"overloaded; retrying in 2s (attempt 1/3)"}}
+```
+
+---
+
+### `net_flow`
+
+One outbound network connection the run made, carrying a netflow `FlowRecord` (host, port,
+scheme, method, query-stripped path, status, outcome, bytes, timing and a `fidelity` saying how
+much of it was observed). Written as flows are recorded, so these lines can appear anywhere in
+the file. The record is described in [netflow.md](netflow.md#flow-fields).
+
+| Field  | Type       | Description |
+|--------|------------|-------------|
+| `flow` | FlowRecord | The flow |
+
+```json
+{"type":"net_flow","data":{"flow":{"id":"01JB7Q3V9F8M2K4N6P0R5T7W9X","ts":"2026-10-07T09:14:03Z","ctx":{"origin":{"kind":"provider","name":"anthropic"}},"fidelity":"http","method":"POST","scheme":"https","host":"api.anthropic.com","port":443,"path":"/v1/messages","status":200,"outcome":"ok","body_complete":false}}}
 ```
 
 ---
@@ -463,20 +629,44 @@ Within a single run file the event ordering is:
 
 ```
 run_start
-  (turn_start
-    usage
-    outcome?
-    assistant_delta*
-    assistant_message*
-    (tool_call  tool_result  file_edit?  command_run?  action_emitted?  tool_audit?)*
-  turn_end
-  recovery*)*
+notice?                     # model_limits
+seed?                       # a run seeded from earlier history
+user_message?
+(turn_start
+   usage+                   # one per provider call; a compaction call adds one with purpose
+   outcome?                 # a non-normal reply, ahead of the turn's content
+   (thinking_delta* thinking | assistant_delta* assistant_message | assistant_block)*
+   (tool_call  tool_result  file_edit?  command_run?  action_emitted?  tool_audit?)*
+ turn_end
+ recovery*
+ notice*  compaction?)*
+net_flow*                   # interleaved anywhere
 run_complete
 ```
 
-An `outcome` follows the turn's `usage` and precedes its content. Its `recovery` events follow it,
-usually after `turn_end`. A hop to a fallback model writes a `notice` of kind `model_limits`
-just before its `fell_back` recovery, and a note sent back to the model is a `user_message`.
+Reasoning, text, tool calls and other blocks appear in the order the model produced them. An
+`outcome` follows the turn's `usage` and precedes its content. Its `recovery` events follow it,
+usually after `turn_end`. A `notice` can appear wherever the runtime intervened; a hop to a
+fallback model writes a `notice` of kind `model_limits` just before its `fell_back` recovery,
+and a note sent back to the model is a `user_message`.
 
-`gate_requested` events (Slice B) appear between `turn_end` and the next `turn_start` when a
-gate interrupts the loop.
+---
+
+## Replay
+
+A version 2 transcript is enough to rebuild the exact conversation the provider saw, and rupu
+does so when it continues a run (`rupu run --continue <run-id>`, `rupu workflow resume`
+continuing an interrupted step, a session's next turn). The rules:
+
+- Start from the `seed`, if any. A `source_transcript` seed means "rebuild that transcript
+  first"; its `sha256` must match what was rebuilt.
+- Add the `user_message`. Per turn, fold `thinking` (its `raw` block), `assistant_message`,
+  `tool_call` and `assistant_block` events, in file order, into one assistant message,
+  skipping `abandoned` blocks; the turn's `tool_result`s become the next user message.
+- Drop a turn with no `turn_end` (it was in flight) and a turn whose `turn_end` is
+  `discarded`. A `recovery` with `merge_into_previous` joins the next turn's reply onto the
+  previous assistant message.
+- A `compaction` replaces everything so far with its `messages`.
+
+A version 1 transcript rebuilds without reasoning blocks. Deltas, `usage`, `notice`,
+`outcome`, `tool_audit`, `net_flow` and unknown events don't affect the conversation.

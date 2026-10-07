@@ -9,11 +9,20 @@ use toml::Value;
 pub enum Action {
     /// Print the value of a key. Dotted keys (`ui.theme`) descend into
     /// nested tables.
-    Get { key: String },
+    Get {
+        /// Dotted key to read from the global `config.toml`, e.g. `ui.theme`.
+        key: String,
+    },
     /// Set a key. Dotted keys (`ui.theme`) descend into nested tables,
     /// creating them as needed. The value is parsed as a TOML scalar
     /// (string / integer / bool).
-    Set { key: String, value: String },
+    Set {
+        /// Dotted key to write in the global `config.toml`, e.g. `ui.theme`.
+        key: String,
+        /// Value to store, parsed as a TOML scalar; text that doesn't parse
+        /// is stored as a string.
+        value: String,
+    },
 }
 
 pub async fn handle(action: Action) -> ExitCode {

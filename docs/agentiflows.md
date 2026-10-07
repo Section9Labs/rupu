@@ -103,7 +103,7 @@ round:
 | `name` | yes | Display name, recorded on the run |
 | `description` | no | Used as the lead's mission text when there are no goals or coverage target |
 | `lead` | yes | Agent name of the lead. Must also appear in `pool.agents` |
-| `engagement_profiles` | yes | Profile ids that type the run's evidence (`code`, `network`, `web`, `binary`, a composite like `pentest`, ...). See [Engagement profiles](coverage.md#engagement-profiles) |
+| `engagement_profiles` | yes | Profile ids that type the run's evidence (`code`, `network`, `web`, `binary`, a composite like `pentest`, ...). See [Engagement profiles](engagement-profiles.md) |
 | `goals` | one of `goals` / `coverage` | Measurable targets, below |
 | `coverage` | one of `goals` / `coverage` | `{ reach, depth?, kinds? }`, below |
 | `budget` | no | `{ usd?, tokens?, wall_clock?, rounds?, soft_at? }`, section 5 |
@@ -279,7 +279,7 @@ Profiles resolve the same way as everywhere else: built-ins, then
 `~/.rupu/profiles/`, then `.rupu/profiles/` in the directory you launch from. A
 profile only types and validates evidence. It is not a sandbox and does not
 limit what the agents' tools can reach. See
-[coverage.md](coverage.md#engagement-profiles).
+[engagement-profiles.md](engagement-profiles.md).
 
 ---
 
@@ -534,6 +534,7 @@ What is not built, or only partly built, today:
 ## See also
 
 - [configuration.md](configuration.md#agentiflow): `[agentiflow]` settings; `[pricing]` for `budget.usd`
-- [coverage.md](coverage.md): findings, finding reports, engagement profiles and assets
+- [engagement-profiles.md](engagement-profiles.md): engagement profiles, asset kinds and the asset ledger
+- [coverage.md](coverage.md): findings and finding reports
 - [agent-format.md](agent-format.md): agent files, `tools:` and `findingsProfile`
 - [workflow-format.md](workflow-format.md): workflows a lead can run as units

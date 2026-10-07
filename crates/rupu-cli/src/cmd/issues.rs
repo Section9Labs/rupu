@@ -76,8 +76,10 @@ pub struct ShowArgs {
     /// Disable colored output.
     #[arg(long)]
     pub no_color: bool,
+    /// Force pager. Default: page when stdout is a tty.
     #[arg(long, conflicts_with = "no_pager")]
     pub pager: bool,
+    /// Disable pager.
     #[arg(long, conflicts_with = "pager")]
     pub no_pager: bool,
     /// Which configured SCM account to use, when more than one is

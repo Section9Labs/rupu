@@ -78,6 +78,37 @@ The control plane manages customers, filters its lists by `?customer=` and previ
 
 ---
 
+### Environment variables
+
+There is no environment *layer*: environment variables are not merged into the
+config. A few are read directly by the code they affect and override the matching
+key there:
+
+| Variable | Overrides / does |
+|----------|------------------|
+| `RUPU_HOME` | Moves the global directory (default `~/.rupu`) — config, credentials, runs, caches |
+| `RUPU_LOG` | Wins over `log_level` |
+| `RUPU_MAX_OPEN_FILES`, `RUPU_MAX_CONCURRENT_JOBS`, `RUPU_MIN_FREE_MEMORY_MB` | Win over the `[runtime]` keys of the same name (`--max-open-files` also wins over `max_open_files`) |
+| `RUPU_NETFLOW_SUBPROCESS=0` | Forces `[netflow].subprocess_capture` off |
+| `RUPU_NO_UPDATE_CHECK` | When set to any value (even `0`), suppresses the passive update notice, like `[update].check = false` |
+| `RUPU_LIVE_VIEW=0` | Turns the workflow live view off |
+| `NO_COLOR` | Forces `[ui].color = "never"` |
+| `VISUAL` / `EDITOR` | Used when `[ui].editor` is unset |
+| `RUPU_<ACCOUNT>_API_KEY` | API-key fallback for a provider account with no stored credential (see [providers.md](providers.md)) |
+
+### Editing
+
+`rupu config get <key>` / `rupu config set <key> <value>` read and write the
+**global** `config.toml` only. Dotted keys descend into tables (`ui.theme`,
+`cp.gate_sweep_interval_secs`); the value is parsed as a TOML scalar (string,
+integer or bool), and `set` refuses to replace a table with a scalar or the
+reverse. Arrays and tables (`[[scm.rules]]`, `[recovery].fallbacks`) are edited
+by hand, with `rupu customer edit <slug>` for a customer layer, or from the
+control plane's Settings page (effective values with the layer each came from,
+lock toggles, and a raw TOML editor).
+
+---
+
 ## Top-level keys
 
 | Key               | Type   | Default             | Notes                                                        |
@@ -85,7 +116,7 @@ The control plane manages customers, filters its lists by `?customer=` and previ
 | `default_provider` | string | none                 | Provider used when an agent file omits `provider:`            |
 | `default_model`     | string | `claude-sonnet-4-6`  | Model used when an agent file omits `model:` and `[providers.<name>].default_model` is also unset |
 | `permission_mode`   | string | `ask`                | Fallback permission mode when neither the agent nor `--mode` sets one |
-| `log_level`         | string | none (info-ish default via `RUPU_LOG`) | Logging verbosity                        |
+| `log_level`         | string | `warn` | Logging verbosity — any `tracing-subscriber` directive (`debug`, `rupu_scm=debug,info`). `RUPU_LOG` wins over it; a blank value counts as unset |
 
 ---
 
@@ -159,7 +190,7 @@ Full narrative reference: [scm.md](scm.md#configuration).
 
 | Key                   | Type            | Default | Notes |
 |-----------------------|-----------------|---------|-------|
-| `poll_sources`        | array\<string \| table\> | `[]` | Repo (`github:owner/repo`, `gitlab:group/project`) or tracker-native (`linear:<team-id>`, `jira:<site>/<project>`) sources. A table entry adds `poll_interval` (e.g. `5m`) |
+| `poll_sources`        | array\<string \| table\> | `[]` | Repo (`github:owner/repo`, `gitlab:group/project`) or tracker-native (`linear:<team-id>`, `jira:<site>/<project>`) sources. A table entry (`{ source = "…", poll_interval = "5m", account = "…" }`) adds a per-source `poll_interval` and an explicit `account` — the only way to pick between two tracker accounts of one kind; repo sources otherwise resolve their account through `[[scm.rules]]` |
 | `max_events_per_tick` | integer         | `50`    | Cap on events processed per source per `rupu cron tick` pass |
 
 ---
@@ -293,9 +324,29 @@ A cross-provider entry sends the conversation to that provider's API.
 
 ## `[netflow]`
 
+What netflow records and where it is shown: [netflow.md](netflow.md).
+
 | Key                   | Type    | Default | Notes |
 |------------------------|---------|---------|-------|
+| `asn_auto_refresh`     | bool    | `true`  | Keep the IP→ASN enrichment table fresh without operator action: `rupu cp serve`'s sweep tick (and the CP netflow API on first use) downloads it when it is missing or older than `asn_refresh_interval_days`. The download runs in the background, never inline on a request |
+| `asn_refresh_interval_days` | integer | `7` | Age, in days, after which the ASN table counts as stale and is re-downloaded. `0` treats it as always stale |
+| `asn_source_url`       | string  | `https://iptoasn.com/data/ip2asn-combined.tsv.gz` | Where the ASN table is downloaded from (a gzipped ip2asn TSV) |
+| `subprocess_capture`   | bool    | `true`  | Master switch for observing the network connections an agent's `bash` commands open (passive OS socket-table observation: no proxy, no root). Where the OS backend cannot start, the run records why instead of going silent. `RUPU_NETFLOW_SUBPROCESS=0` forces it off without editing config |
+| `subprocess_poll_ms`   | integer | `50`    | Linux only: interval between socket-table polls while a `bash` call runs |
+| `subprocess_linger_ms` | integer | `3000`  | How long after a `bash` call's shell exits its sockets are still attributed to that call (catches connections closing just after exit); a socket still open when the linger ends is recorded as still open. Clamped to one day |
 | `cp_index_budget_mb`   | integer | `256`   | Memory budget for the flow rows `rupu cp serve` keeps in its netflow index. Over budget, the rows of the files with the oldest flows are dropped and re-read from disk when a view needs them: wide windows get slower, answers never change. Per-file summaries (timestamps, counts, origins) always stay in memory. Check usage with `GET /api/netflow/index`. Takes effect on the next request after a config change made through the control plane; hand edits to `config.toml` need a restart. |
+
+---
+
+## `[workflow]`
+
+Gates the `run:` workflow step kind, which executes declared commands and is
+therefore opt-in.
+
+| Key                  | Type            | Default | Notes |
+|----------------------|-----------------|---------|-------|
+| `run_step_enabled`   | bool            | `false` | Whether `run:` steps may execute. A workflow that reaches a `run:` step while this is off **fails** — it never silently skips the step |
+| `run_step_allowlist` | array\<string\> | `[]`    | Executables a `run:` step may invoke, matched on basename (so `/bin/bash` and `bash` gate alike). Empty means any executable is allowed (when `run_step_enabled`) |
 
 ---
 

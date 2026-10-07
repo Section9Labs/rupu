@@ -92,6 +92,35 @@ renders a compact one-line-per-concern table that the agent searches on demand
 (use it for large catalogs like the full CWE list so the prompt stays small);
 `auto` (default) picks based on catalog size.
 
+### Workflow-level concerns
+
+A workflow can declare the same `concerns:` block at its top level:
+
+```yaml
+name: payments-review
+concerns:
+  - include: owasp-top10-2021
+  - include: secrets-in-source
+steps:
+  - id: map
+    agent: route-mapper
+    actions: []
+    prompt: "List every handler under src/payments/."
+  - id: review
+    agent: file-reviewer
+    actions: []
+    prompt: "Review the handlers mapped in {{ steps.map.output }}."
+```
+
+When it is present, every agent step in the run uses this catalog and the
+step agents' own `concerns:` blocks are ignored (the workflow wins outright;
+the two are not merged). When the workflow has none, each step keeps its
+agent's block. Either way, a workflow's steps record under one scope name, the
+workflow's `name`, so all of its steps accumulate into the same
+`<target_id>` rather than one per agent. (An agentiflow that starts the
+workflow as a unit overrides the scope name so the steps pool into the
+agentiflow's scope.)
+
 ### Bundled catalogs
 
 `rupu coverage templates list` prints them all:
@@ -410,6 +439,17 @@ owner, and CWE. Each full-profile finding row on a run's Findings tab has an
 tab, a full-profile finding's inline card has tabs (Root cause, Call chain,
 Evidence, Patch, Repro) that load the report when the card is expanded.
 
+**Links to the repository.** When a finding names a file and its project's
+checkout has a `github.com` or `gitlab.com` remote, the expanded Code-tab card
+and the finding's card in the Situation Room show a **View on repository ↗**
+link to that file on the SCM's web UI, with the line range highlighted
+(`#L10-L14` on GitHub, `#L10-14` on GitLab). The link points at the branch
+the checkout was on when rupu first registered the project (`main` when that
+was unknown), not at the commit the finding was recorded against, so once that
+branch has moved on the lines may have shifted. Self-managed GitLab, GitHub
+Enterprise and other hosts get no link. List rows carry it as `permalink`
+(omitted when there is none).
+
 **API.**
 
 - `GET /api/findings` and the `findings` array in `GET /api/coverage/:target`
@@ -676,7 +716,7 @@ nothing, and the other reports in the run are still imported. `summary`,
 finding; the id, provenance (run, model, surface, declared-at), location and
 every other field of the record are kept. A finding that already has a report
 is skipped, never changed. A finding records no engagement asset, so an import
-runs no [engagement profile](#engagement-profiles) completeness check and
+runs no [engagement profile](engagement-profiles.md) completeness check and
 stamps no asset: the report is held to the finding report contract only. The size limits (`report_max_bytes` and the
 `artifact_max_*` keys) come from `[findings]` in the global config only;
 unlike when an agent records a report, a project's `.rupu/config.toml` is not
@@ -1212,61 +1252,15 @@ deterministic; sampling is not.
 
 ## Engagement profiles
 
-A finding is about an **asset**, and the asset has a **kind**. Code
-(`file`/`function`) is one kind; a binary `function@address`, a network
-`host`/`service`, a cloud `resource`, a web `route` are others. An **engagement
-profile** is a pure-data package (TOML) that declares a domain's asset kinds and
-their locator coordinates, the evidence blocks and taxonomies it uses, a
-completeness checklist, and a coverage depth ladder. Adding a new engagement
-type is authoring a profile, not writing Rust.
-
-This governs how a finding is **validated and routed** — it is not a sandbox and
-does not run, gate, or scope your tools. Agents reach binaries, hosts and
-services with bash and whatever tooling they want (nmap, curl, radare2, …); rupu
-records and validates the resulting *findings*, not the traffic.
-
-### Selecting a profile
-
-```bash
-rupu run --engagement-profile binary  my-agent "reverse this blob"
-rupu run --engagement-profile network my-agent "assess 10.0.0.0/24"
-rupu run --engagement-profiles pentest my-agent "..."   # a composite = network + web
-```
-
-An empty selection is the native `code` path — byte-identical to before. A
-finding whose asset kind no active profile owns, or an unknown profile id, is a
-loud error, never a silent default.
-
-### Built-in catalog
-
-`code` · `binary` · `firmware` · `network` · `web` · `api` · `cloud` · `sca` ·
-`iac` · `secrets` · `container` · `redteam` · `threat-model`, plus the composites
-`mobile` (= `binary` + `web` + MASVS) and `pentest` (= `network` + `web`).
-Composites activate each member as its own routing target, so a `pentest` run
-files a `network:service` finding and a `web:route` finding side by side, each
-validated against its own profile — never a merged union.
-
-Operators and projects override or add profiles by dropping a `*.toml` under
-`~/.rupu/profiles/` (global) or `.rupu/profiles/` (project); a later source wins
-by id (built-in < global < project). A profile that fails to parse fails the
-launch rather than running under the wrong rules.
-
-### Recording an asset
-
-Under an active engagement, `report_finding` (and `findings.record`) take an
-optional `asset { kind, coordinates }`: the kind routes the finding to its
-owning profile, the profile's **required completeness checks** must pass (e.g.
-`network` requires the service pinned to a host + port), and the asset is stamped
-into the engagement asset graph (`assets.jsonl`). The `asset_mark` tool — offered
-only under an active engagement — records how deeply an asset was examined along
-its profile's depth ladder (`discovered → enumerated → tested → exploited` for
-`network`); depth is **monotonic**, so a shallower mark after a deeper one keeps
-the deeper rung.
-
-Spec: `docs/superpowers/specs/2026-09-30-rupu-engagement-profiles-asset-model-design.md`.
+Engagement profiles type a run's findings by asset domain (`code`, `binary`,
+`network`, `web`, `cloud`, …): they route each finding to the profile that owns its
+asset kind, gate it on that profile's completeness checks, and record assets and their
+depth in `assets.jsonl`. They have their own page:
+[engagement-profiles.md](engagement-profiles.md).
 
 ## See also
 
+- `docs/engagement-profiles.md` — engagement profiles, asset kinds and the asset ledger
 - `docs/agent-format.md` — full agent frontmatter schema (incl. `concerns:` and `findingsProfile`)
 - `docs/workflow-format.md` — workflow `findings_profile` (step and `defaults`)
 - `docs/superpowers/specs/2026-09-29-rupu-finding-reports-design.md` — the finding report design
