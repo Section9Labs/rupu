@@ -1,5 +1,5 @@
 import React, { Suspense, type ReactElement } from 'react';
-import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
+import { BrowserRouter, Navigate, Route, Routes, useLocation } from 'react-router-dom';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import Layout from './components/Layout';
 import { Spinner } from './components/ui/Spinner';
@@ -60,6 +60,21 @@ function page(el: ReactElement) {
   return <Suspense fallback={<PageFallback />}>{el}</Suspense>;
 }
 
+/** A `<Navigate replace>` to `to` that carries the current URL's search
+ *  params along (`/findings?q=…` → `/security?tab=findings&q=…`); a param
+ *  `to` names itself (the tab) keeps `to`'s value. */
+function RedirectKeepingSearch({ to }: { to: string }) {
+  const { search } = useLocation();
+  const [path, own = ''] = to.split('?');
+  const params = new URLSearchParams(own);
+  const named = new Set(params.keys());
+  new URLSearchParams(search).forEach((value, key) => {
+    if (!named.has(key)) params.append(key, value);
+  });
+  const qs = params.toString();
+  return <Navigate to={qs ? `${path}?${qs}` : path} replace />;
+}
+
 export function AppRoutes({ shell }: { shell: ShellVersion }) {
   const v2 = shell === 'v2';
   const layoutEl = v2
@@ -99,7 +114,7 @@ export function AppRoutes({ shell }: { shell: ShellVersion }) {
         <Route path="/coverage/:target/diff" element={page(<CoverageDetail tab="diff" />)} />
         <Route path="/coverage/:target" element={page(<CoverageDetail />)} />
         <Route path="/netflow" element={page(<Netflow />)} />
-        <Route path="/findings" element={v2 ? <Navigate to="/security?tab=findings" replace /> : page(<Findings />)} />
+        <Route path="/findings" element={v2 ? <RedirectKeepingSearch to="/security?tab=findings" /> : page(<Findings />)} />
         {/* Per-finding report — a detail route, so it is NOT redirected under v2. */}
         <Route path="/findings/:id" element={page(<FindingDetail />)} />
         <Route path="/workflows" element={v2 ? <Navigate to="/library?tab=workflows" replace /> : page(<Workflows />)} />

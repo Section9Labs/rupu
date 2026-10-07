@@ -227,6 +227,8 @@ const PAUSED_GRAPH: RunGraphResponse = {
 };
 
 const FINDINGS: FindingsResponse = {
+  facets: {},
+  tags_unavailable: [],
   findings: [],
   summary: { total: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0 },
 };

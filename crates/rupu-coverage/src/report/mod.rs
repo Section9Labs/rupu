@@ -6,6 +6,7 @@
 //! docs/superpowers/specs/2026-09-29-rupu-finding-reports-design.md
 
 pub mod artifacts;
+pub mod cwe;
 pub mod guidance;
 pub mod options;
 pub mod profile;

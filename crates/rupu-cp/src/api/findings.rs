@@ -175,6 +175,9 @@ pub struct FindingsQuery {
     pub workflow: Option<String>,
     /// Keep only findings whose `declared_by.run_id` matches.
     pub run_id: Option<String>,
+    /// A findings query (`severity>=high tag:needs-poc ...`), applied after
+    /// the `ws_id` / `workflow` / `run_id` scope. A bad one is a 400.
+    pub q: Option<String>,
 }
 
 /// Per-severity counts plus the grand total.
@@ -192,6 +195,21 @@ pub struct FindingsSummary {
 pub struct FindingsResponse {
     pub findings: Vec<FindingOut>,
     pub summary: FindingsSummary,
+    /// Values in use per query key over the scope (ws/workflow/run), before
+    /// `q`: autocomplete and the severity tiles.
+    pub facets: std::collections::BTreeMap<&'static str, Vec<rupu_coverage::FacetValue>>,
+    /// Workspaces whose finding-tag log could not be read: their findings are
+    /// served with declared tags only, and tag filters may miss them.
+    pub tags_unavailable: Vec<TagsUnavailable>,
+}
+
+/// A workspace whose finding-tag log could not be read: its id, and the
+/// project name (the workspace path's basename — what `FindingOut.project`
+/// carries) so a client can name it even when no row of it is in the answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TagsUnavailable {
+    pub ws_id: String,
+    pub project: String,
 }
 
 /// Sort rank for a severity: critical (highest) sorts first.
@@ -269,7 +287,12 @@ pub(crate) fn build_response(mut findings: Vec<FindingOut>) -> FindingsResponse 
         }
     }
 
-    FindingsResponse { findings, summary }
+    FindingsResponse {
+        findings,
+        summary,
+        facets: Default::default(),
+        tags_unavailable: Vec::new(),
+    }
 }
 
 fn store_for(global_dir: &std::path::Path) -> WorkspaceStore {
@@ -291,10 +314,13 @@ fn project_name(path: &str) -> String {
 ///
 /// This is the one workspace/target walk. Tolerant by design: a workspace
 /// whose path is gone, or a target whose `findings.jsonl` is absent/unreadable,
-/// is skipped with a `warn!` rather than failing the caller.
+/// is skipped with a `warn!` rather than failing the caller. A workspace whose
+/// tag log cannot be read is still walked (declared tags only) and it is
+/// pushed to `tags_unavailable` (id + project name).
 fn each_ledger(
     global_dir: &std::path::Path,
     mut f: impl FnMut(&rupu_workspace::Workspace, &str, CoveragePaths, Vec<FindingRecord>),
+    tags_unavailable: &mut Vec<TagsUnavailable>,
 ) {
     let workspaces = store_for(global_dir).list().unwrap_or_default();
     for w in &workspaces {
@@ -320,6 +346,10 @@ fn each_ledger(
                     error = %e,
                     "cannot read the finding-tag log; showing declared tags only"
                 );
+                tags_unavailable.push(TagsUnavailable {
+                    ws_id: w.id.clone(),
+                    project: project_name(&w.path),
+                });
                 Vec::new()
             }
         };
@@ -352,41 +382,54 @@ fn each_ledger(
 /// `findings.jsonl` is absent/unreadable, is skipped with a `warn!` rather
 /// than failing the caller.
 pub fn collect_all_findings(global_dir: &std::path::Path) -> Vec<FindingOut> {
+    collect_all_findings_reporting(global_dir).0
+}
+
+/// [`collect_all_findings`], plus the workspaces (id + project) whose finding-tag
+/// log could not be read (their findings carry declared tags only).
+pub fn collect_all_findings_reporting(
+    global_dir: &std::path::Path,
+) -> (Vec<FindingOut>, Vec<TagsUnavailable>) {
     let mut out: Vec<FindingOut> = Vec::new();
-    each_ledger(global_dir, |w, target_id, _paths, records| {
-        let project = project_name(&w.path);
-        for record in records {
-            // `w` (the owning workspace) is already in hand for every
-            // finding in this target — no separate lookup/memoization is
-            // needed, unlike a flat finding list without provenance.
-            let permalink = match (w.repo_remote.as_deref(), record.file_path.as_deref()) {
-                (Some(remote), Some(path)) => rupu_scm::weburl::repo_permalink(
-                    remote,
-                    w.initial_branch.as_deref(),
-                    path,
-                    record.line_range,
-                ),
-                _ => None,
-            };
-            let (codename, codename_derived) = crate::codename::named(
-                record.declared_by.codename.as_deref(),
-                &record.declared_by.run_id,
-                None,
-            );
-            out.push(FindingOut {
-                codename,
-                codename_derived,
-                ws_id: w.id.clone(),
-                project: project.clone(),
-                target_id: target_id.to_string(),
-                workflow_name: None,
-                permalink,
-                report_summary: None,
-                record,
-            });
-        }
-    });
-    out
+    let mut tags_unavailable: Vec<TagsUnavailable> = Vec::new();
+    each_ledger(
+        global_dir,
+        |w, target_id, _paths, records| {
+            let project = project_name(&w.path);
+            for record in records {
+                // `w` (the owning workspace) is already in hand for every
+                // finding in this target — no separate lookup/memoization is
+                // needed, unlike a flat finding list without provenance.
+                let permalink = match (w.repo_remote.as_deref(), record.file_path.as_deref()) {
+                    (Some(remote), Some(path)) => rupu_scm::weburl::repo_permalink(
+                        remote,
+                        w.initial_branch.as_deref(),
+                        path,
+                        record.line_range,
+                    ),
+                    _ => None,
+                };
+                let (codename, codename_derived) = crate::codename::named(
+                    record.declared_by.codename.as_deref(),
+                    &record.declared_by.run_id,
+                    None,
+                );
+                out.push(FindingOut {
+                    codename,
+                    codename_derived,
+                    ws_id: w.id.clone(),
+                    project: project.clone(),
+                    target_id: target_id.to_string(),
+                    workflow_name: None,
+                    permalink,
+                    report_summary: None,
+                    record,
+                });
+            }
+        },
+        &mut tags_unavailable,
+    );
+    (out, tags_unavailable)
 }
 
 /// Which ledger holds each finding: id → the coverage paths of every ledger
@@ -394,11 +437,15 @@ pub fn collect_all_findings(global_dir: &std::path::Path) -> Vec<FindingOut> {
 /// uses it to find the finding a report belongs to.
 pub fn finding_ledgers(global_dir: &std::path::Path) -> HashMap<String, Vec<CoveragePaths>> {
     let mut out: HashMap<String, Vec<CoveragePaths>> = HashMap::new();
-    each_ledger(global_dir, |_, _, paths, records| {
-        for r in records {
-            out.entry(r.id).or_default().push(paths.clone());
-        }
-    });
+    each_ledger(
+        global_dir,
+        |_, _, paths, records| {
+            for r in records {
+                out.entry(r.id).or_default().push(paths.clone());
+            }
+        },
+        &mut Vec::new(),
+    );
     out
 }
 
@@ -434,15 +481,19 @@ pub fn tag_findings_across(
     change.check()?;
     // finding id → each (ws_id, workspace path) holding it, once per path.
     let mut homes: HashMap<String, Vec<(String, std::path::PathBuf)>> = HashMap::new();
-    each_ledger(global_dir, |w, _, _, records| {
-        let path = std::path::PathBuf::from(&w.path);
-        for r in records {
-            let entry = homes.entry(r.id).or_default();
-            if !entry.iter().any(|(_, p)| *p == path) {
-                entry.push((w.id.clone(), path.clone()));
+    each_ledger(
+        global_dir,
+        |w, _, _, records| {
+            let path = std::path::PathBuf::from(&w.path);
+            for r in records {
+                let entry = homes.entry(r.id).or_default();
+                if !entry.iter().any(|(_, p)| *p == path) {
+                    entry.push((w.id.clone(), path.clone()));
+                }
             }
-        }
-    });
+        },
+        &mut Vec::new(),
+    );
     let mut out = TagAcrossResult::default();
     let mut by_ws: std::collections::BTreeMap<(String, std::path::PathBuf), Vec<String>> =
         std::collections::BTreeMap::new();
@@ -551,6 +602,79 @@ fn workflow_names_by_run<'a>(
     names
 }
 
+/// Fill `workflow_name` (joined via `declared_by.run_id`) on every row that
+/// lacks one, loading each distinct run id once. A row that already carries
+/// a name is left as it is; a run the `RunStore` can't load leaves `None`.
+/// Callers join before [`query_findings`] so `workflow:` can match.
+pub fn join_workflow_names(store: &RunStore, findings: &mut [FindingOut]) {
+    let names = workflow_names_by_run(
+        store,
+        findings
+            .iter()
+            .filter(|f| f.workflow_name.is_none())
+            .map(|f| f.record.declared_by.run_id.as_str()),
+    );
+    for f in findings.iter_mut().filter(|f| f.workflow_name.is_none()) {
+        f.workflow_name = names.get(&f.record.declared_by.run_id).cloned();
+    }
+}
+
+/// A finding as the query evaluator sees it: its record plus the project,
+/// workspace and workflow this surface knows.
+pub fn finding_view(f: &FindingOut) -> rupu_coverage::FindingView<'_> {
+    rupu_coverage::FindingView {
+        record: &f.record,
+        project: Some(&f.project),
+        ws_id: Some(&f.ws_id),
+        workflow: f.workflow_name.as_deref(),
+    }
+}
+
+/// The findings a parsed query selects, sorted severity (worst first), then
+/// newest, then id. Expands each `run:` value to the run plus its sub-runs
+/// ([`resolve_run_scope`]). It does NOT join `workflow_name`: callers run
+/// [`join_workflow_names`] first, or `workflow:` matches nothing.
+/// `rupu findings list|tags` and `GET /api/findings` both go through this.
+pub fn query_findings(
+    store: &RunStore,
+    mut findings: Vec<FindingOut>,
+    q: &rupu_coverage::ParsedQuery,
+) -> Vec<FindingOut> {
+    if !q.terms.is_empty() {
+        findings = select_findings(store, findings, q);
+    }
+    findings.sort_by(|a, b| {
+        rupu_coverage::severity_rank(b.record.severity)
+            .cmp(&rupu_coverage::severity_rank(a.record.severity))
+            .then_with(|| b.record.declared_at.cmp(&a.record.declared_at))
+            .then_with(|| a.record.id.cmp(&b.record.id))
+    });
+    findings
+}
+
+/// [`query_findings`]' filter step, for a query with at least one term.
+fn select_findings(
+    store: &RunStore,
+    mut findings: Vec<FindingOut>,
+    q: &rupu_coverage::ParsedQuery,
+) -> Vec<FindingOut> {
+    let runs: rupu_coverage::RunScopes = rupu_coverage::run_values(q)
+        .into_iter()
+        .map(|r| {
+            let scope = resolve_run_scope(store, &r);
+            (r, scope)
+        })
+        .collect();
+    // Ids repeat across workspaces and targets: key by all three.
+    let key = |f: &FindingOut| format!("{}/{}/{}", f.ws_id, f.target_id, f.record.id);
+    let keep: HashSet<String> = rupu_coverage::select(&findings, finding_view, q, &runs)
+        .into_iter()
+        .map(key)
+        .collect();
+    findings.retain(|f| keep.contains(&key(f)));
+    findings
+}
+
 /// `GET /api/findings` — every finding across every registered workspace's
 /// coverage targets, tagged with provenance, plus a per-severity summary.
 ///
@@ -560,19 +684,27 @@ fn workflow_names_by_run<'a>(
 async fn list_findings(
     State(s): State<AppState>,
     Query(q): Query<FindingsQuery>,
-) -> ApiResult<Json<FindingsResponse>> {
-    let mut out: Vec<FindingOut> = collect_all_findings(&s.global_dir);
+) -> Result<Json<FindingsResponse>, axum::response::Response> {
+    use axum::response::IntoResponse;
+    let parsed = rupu_coverage::parse_query(q.q.as_deref().unwrap_or("")).map_err(|e| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": e.message,
+                "token": e.token,
+                "code": e.code,
+                "start": e.start,
+                "end": e.end,
+            })),
+        )
+            .into_response()
+    })?;
+    let (mut out, tags_unavailable) = collect_all_findings_reporting(&s.global_dir);
 
-    // Join `declared_by.run_id → workflow_name` via the RunStore. Load each
-    // distinct run id once; a load error / NotFound leaves that id out of the
-    // map (finding keeps `workflow_name: None`).
-    let wf_by_run = workflow_names_by_run(
-        &s.run_store,
-        out.iter().map(|f| f.record.declared_by.run_id.as_str()),
-    );
-    for f in &mut out {
-        f.workflow_name = wf_by_run.get(&f.record.declared_by.run_id).cloned();
-    }
+    // Join `declared_by.run_id → workflow_name` once, for both the
+    // `workflow` scope and `q`'s `workflow:` key. A run the store can't load
+    // leaves the finding's `workflow_name: None`.
+    join_workflow_names(&s.run_store, &mut out);
 
     // Resolve the run-id match SET when filtering by run: the parent unioned
     // with its sub-runs (each `for_each`/`panel` unit is its own sub-run, and
@@ -585,13 +717,25 @@ async fn list_findings(
         .as_ref()
         .map(|parent| resolve_run_scope(&s.run_store, parent));
 
-    let mut resp = scope_by_run_set(out, &run_ids, &q.ws_id, &q.workflow);
+    let scoped = scope_by_run_set(out, &run_ids, &q.ws_id, &q.workflow).findings;
+    // Facets describe the scope, before `q` narrows it.
+    let facets = rupu_coverage::facets(scoped.iter().map(finding_view));
+    // Warn only about the workspaces this request covers: the requested one,
+    // or one with a finding in the scope.
+    let tags_unavailable: Vec<TagsUnavailable> = tags_unavailable
+        .into_iter()
+        .filter(|w| q.ws_id.as_ref() == Some(&w.ws_id) || scoped.iter().any(|f| f.ws_id == w.ws_id))
+        .collect();
+    let filtered = query_findings(&s.run_store, scoped, &parsed);
+    let mut resp = build_response(filtered);
     // List rows never carry the report body; full-profile rows get a summary.
     resp.findings = resp
         .findings
         .into_iter()
         .map(FindingOut::into_list_row)
         .collect();
+    resp.facets = facets;
+    resp.tags_unavailable = tags_unavailable;
     Ok(Json(resp))
 }
 
@@ -2138,6 +2282,87 @@ mod tests {
             scope.contains("sub_child"),
             "nested layout → dir name (was: {scope:?})"
         );
+    }
+
+    /// `query_findings` joins provenance (project) and expands `run:` to the
+    /// run's sub-runs recovered from its events.
+    #[test]
+    fn query_findings_matches_project_and_expands_run_to_sub_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        let ev_path = store.events_path("run_parent");
+        std::fs::create_dir_all(ev_path.parent().unwrap()).unwrap();
+        let ev = Event::UnitStarted {
+            run_id: "run_parent".into(),
+            step_id: "assess".into(),
+            index: 0,
+            unit_key: "u".into(),
+            agent: None,
+            transcript_path: tmp.path().join("transcripts/run_unit0.jsonl"),
+            host: None,
+            codename: None,
+        };
+        std::fs::write(&ev_path, serde_json::to_string(&ev).unwrap() + "\n").unwrap();
+        let mut other = finding_run(
+            "run_other",
+            "nope",
+            Severity::Critical,
+            "2026-01-04T00:00:00Z",
+        );
+        other.project = "elsewhere".to_string();
+        let all = vec![
+            finding_run("run_parent", "top", Severity::High, "2026-01-01T00:00:00Z"),
+            finding_run(
+                "run_unit0",
+                "unit",
+                Severity::Medium,
+                "2026-01-02T00:00:00Z",
+            ),
+            other,
+        ];
+        let ids = |q: &str| -> Vec<String> {
+            let parsed = rupu_coverage::parse_query(q).unwrap();
+            query_findings(&store, all.clone(), &parsed)
+                .into_iter()
+                .map(|f| f.record.id)
+                .collect()
+        };
+        assert_eq!(ids("run:run_parent"), ["top", "unit"]);
+        assert_eq!(ids("project:proj"), ["top", "unit"]);
+        assert_eq!(ids("project:elsewhere"), ["nope"]);
+        assert_eq!(ids(""), ["nope", "top", "unit"]);
+    }
+
+    /// `workflow:` matches the joined workflow name: callers join with
+    /// [`join_workflow_names`] first, and the join leaves a row that already
+    /// carries a name (or whose run can't be loaded) as it is.
+    #[test]
+    fn query_findings_matches_workflow_after_the_join() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        store
+            .create(run_record("run_wf", "audit-flow"), "name: t\nsteps: []\n")
+            .unwrap();
+        let mut named = finding_run("run_named", "named", Severity::Low, "2026-01-03T00:00:00Z");
+        named.workflow_name = Some("audit-flow".to_string());
+        let mut all = vec![
+            finding_run("run_wf", "joined", Severity::High, "2026-01-01T00:00:00Z"),
+            finding_run("run_gone", "gone", Severity::Medium, "2026-01-02T00:00:00Z"),
+            named,
+        ];
+        join_workflow_names(&store, &mut all);
+        assert_eq!(all[0].workflow_name.as_deref(), Some("audit-flow"));
+        assert_eq!(all[1].workflow_name, None);
+        assert_eq!(all[2].workflow_name.as_deref(), Some("audit-flow"));
+        let ids = |q: &str| -> Vec<String> {
+            let parsed = rupu_coverage::parse_query(q).unwrap();
+            query_findings(&store, all.clone(), &parsed)
+                .into_iter()
+                .map(|f| f.record.id)
+                .collect()
+        };
+        assert_eq!(ids("workflow:audit-flow"), ["joined", "named"]);
+        assert_eq!(ids("-workflow:audit-flow"), ["gone"]);
     }
 
     #[test]
@@ -4541,5 +4766,140 @@ mod tests {
             "{md}"
         );
         assert!(!md.contains("base64"), "{md}");
+    }
+
+    // ---- GET /api/findings?q= ----
+
+    /// One registered workspace with three findings: `fnd_crit` (critical,
+    /// tagged `needs-poc`), `fnd_high` and `fnd_low`. Returns the workspace path.
+    fn seed_query_fixture(global: &std::path::Path) -> std::path::PathBuf {
+        let records = [
+            finding("fnd_crit", Severity::Critical, "2026-09-29T00:00:00Z").record,
+            finding("fnd_high", Severity::High, "2026-09-28T00:00:00Z").record,
+            finding("fnd_low", Severity::Low, "2026-09-27T00:00:00Z").record,
+        ];
+        let repo = seed_workspace_findings(global, &records);
+        rupu_coverage::apply(
+            &rupu_coverage::TagLog::for_workspace(&repo),
+            &rupu_coverage::TagChange {
+                finding_ids: vec!["fnd_crit".to_string()],
+                add: vec![rupu_coverage::Tag::parse("needs-poc").unwrap()],
+                remove: vec![],
+            },
+            &rupu_coverage::TagActor::operator(rupu_coverage::OperatorSurface::Cli),
+        )
+        .unwrap();
+        repo
+    }
+
+    fn facet_count(json: &serde_json::Value, key: &str, value: &str) -> Option<u64> {
+        json["facets"][key]
+            .as_array()?
+            .iter()
+            .find(|v| v["value"] == value)
+            .and_then(|v| v["count"].as_u64())
+    }
+
+    #[tokio::test]
+    async fn list_findings_q_filters_but_facets_stay_unfiltered() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_query_fixture(tmp.path());
+        let (status, json) =
+            get_json(app_for(tmp.path()), "/api/findings?q=severity%3E%3Dhigh").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(json["findings"].as_array().unwrap().len(), 2);
+        assert_eq!(json["summary"]["total"], 2);
+        assert_eq!(facet_count(&json, "severity", "critical"), Some(1));
+        assert_eq!(facet_count(&json, "severity", "high"), Some(1));
+        assert_eq!(facet_count(&json, "severity", "low"), Some(1));
+    }
+
+    #[tokio::test]
+    async fn list_findings_q_tag_selects_the_tagged_row_and_serves_its_tags() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_query_fixture(tmp.path());
+        let (status, json) = get_json(app_for(tmp.path()), "/api/findings?q=tag%3Aneeds-poc").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let rows = json["findings"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], "fnd_crit");
+        assert_eq!(rows[0]["tags"], serde_json::json!(["needs-poc"]));
+    }
+
+    #[tokio::test]
+    async fn list_findings_bad_q_is_a_structured_400() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_query_fixture(tmp.path());
+        let (status, json) = get_json(app_for(tmp.path()), "/api/findings?q=sevrity%3Ahigh").await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(json["code"], "unknown_key");
+        assert_eq!(json["token"], 0);
+        assert_eq!(json["start"], 0);
+        assert!(json["end"].is_number());
+        assert!(
+            json["error"].as_str().unwrap().contains("unknown key"),
+            "{json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_findings_reports_a_workspace_whose_tag_log_is_unreadable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = seed_query_fixture(tmp.path());
+        // A directory where the log should be: reading it is an I/O error,
+        // unlike a missing file.
+        let log = rupu_coverage::TagLog::for_workspace(&repo).path;
+        std::fs::remove_file(&log).unwrap();
+        std::fs::create_dir(&log).unwrap();
+        let (status, json) = get_json(app_for(tmp.path()), "/api/findings").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            json["tags_unavailable"],
+            serde_json::json!([{ "ws_id": "ws1", "project": "repo" }])
+        );
+        assert_eq!(json["findings"].as_array().unwrap().len(), 3);
+    }
+
+    /// `tags_unavailable` names only workspaces in the request's scope: an
+    /// unreadable log in another workspace doesn't warn about this one.
+    #[tokio::test]
+    async fn list_findings_tags_unavailable_follows_the_ws_scope() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = seed_query_fixture(tmp.path());
+        seed_named_workspace(
+            tmp.path(),
+            "ws2",
+            "repo2",
+            &[finding("fnd_other", Severity::Medium, "2026-09-26T00:00:00Z").record],
+        );
+        let log = rupu_coverage::TagLog::for_workspace(&repo).path;
+        std::fs::remove_file(&log).unwrap();
+        std::fs::create_dir(&log).unwrap();
+        let app = app_for(tmp.path());
+        let (status, json) = get_json(app.clone(), "/api/findings?ws_id=ws2").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(json["tags_unavailable"], serde_json::json!([]));
+        assert_eq!(json["findings"].as_array().unwrap().len(), 1);
+        // In scope by ws_id, even when `q` selects none of its rows.
+        let (_, json) = get_json(app.clone(), "/api/findings?ws_id=ws1&q=id%3Anone").await;
+        assert_eq!(
+            json["tags_unavailable"],
+            serde_json::json!([{ "ws_id": "ws1", "project": "repo" }])
+        );
+        let (_, json) = get_json(app, "/api/findings").await;
+        assert_eq!(
+            json["tags_unavailable"],
+            serde_json::json!([{ "ws_id": "ws1", "project": "repo" }])
+        );
+    }
+
+    #[tokio::test]
+    async fn list_findings_without_q_returns_everything_and_no_unavailable_tags() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_query_fixture(tmp.path());
+        let (status, json) = get_json(app_for(tmp.path()), "/api/findings").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(json["findings"].as_array().unwrap().len(), 3);
+        assert_eq!(json["tags_unavailable"], serde_json::json!([]));
     }
 }

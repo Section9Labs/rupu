@@ -153,7 +153,7 @@ async fn query_findings_pages_and_lists_the_vocabulary() {
 
     let q = QueryFindingsTool::new(ws.clone());
     let out = q
-        .invoke(serde_json::json!({"tags": ["needs-poc"]}), &ctx)
+        .invoke(serde_json::json!({"q": "tag:needs-poc"}), &ctx)
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
@@ -204,4 +204,20 @@ async fn bad_input_is_an_error_the_agent_can_read() {
         .invoke(serde_json::json!({"tagz": ["x"]}), &ctx)
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn a_bad_query_is_an_error_the_agent_can_read() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ws = tmp.path().to_path_buf();
+    seed(&ws, "fnd_a", Severity::High);
+    let ctx = ToolContext {
+        workspace_path: ws.clone(),
+        ..Default::default()
+    };
+    let out = QueryFindingsTool::new(ws)
+        .invoke(serde_json::json!({"q": "project:x"}), &ctx)
+        .await
+        .unwrap();
+    assert!(out.error.unwrap().contains("isn't available here"));
 }
