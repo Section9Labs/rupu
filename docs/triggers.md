@@ -339,6 +339,16 @@ RUPU_GITHUB_WEBHOOK_SECRET=<your-webhook-secret> \
   rupu webhook serve --addr 0.0.0.0:8080
 ```
 
+GitLab project and group webhooks use the same server. GitLab sends a plain
+shared-secret token rather than a signature: set the webhook's **Secret token**
+in GitLab to the same value as `RUPU_GITLAB_WEBHOOK_TOKEN`. rupu compares it
+with the `X-Gitlab-Token` header in constant time.
+
+```sh
+RUPU_GITLAB_WEBHOOK_TOKEN=<your-gitlab-secret-token> \
+  rupu webhook serve --addr 0.0.0.0:8080
+```
+
 Linear now works on the same receiver path:
 
 ```sh
@@ -352,6 +362,14 @@ Jira Cloud issue webhooks use the same server:
 RUPU_JIRA_WEBHOOK_SECRET=<your-jira-webhook-secret> \
   rupu webhook serve --addr 0.0.0.0:8080
 ```
+
+Set any combination of the four variables (`RUPU_GITHUB_WEBHOOK_SECRET`,
+`RUPU_GITLAB_WEBHOOK_TOKEN`, `RUPU_LINEAR_WEBHOOK_SECRET`,
+`RUPU_JIRA_WEBHOOK_SECRET`) in one process; `rupu webhook serve` refuses to
+start when none is set. Each vendor posts to its own route — `POST
+/webhook/github`, `/webhook/gitlab`, `/webhook/linear`, `/webhook/jira` (plus
+`GET /healthz`). A route whose secret is unset answers `503`; a bad or missing
+signature/token answers `401`.
 
 Same workflow YAML; same event vocabulary. The webhook receiver:
 

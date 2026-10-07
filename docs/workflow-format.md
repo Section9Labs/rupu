@@ -58,6 +58,9 @@ Resolution rules match agents:
 | `contracts` | object | no | `{}` | Named structured outputs validated against JSON Schema |
 | `autoflow` | object | no | none | Autonomous ownership metadata for `rupu autoflow ...` |
 | `notifyIssue` | bool | no | `false` | Auto-comment only when the run target is an issue |
+| `concerns` | list | no | none | Coverage concern catalog for every agent step; replaces each step agent's own `concerns:` for this run (see `docs/coverage.md#workflow-level-concerns`) |
+| `max_concurrency` | integer | no | unbounded | Cap on nodes the graph scheduler runs at once (see [`max_concurrency:`](#max_concurrency)) |
+| `loops` | map | no | `{}` | Named bounded subgraph loops (see [`loops:`](#loops)) |
 | `steps` | array<Step> | yes | — | Ordered step list |
 
 An empty `steps:` array is invalid.

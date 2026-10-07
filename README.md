@@ -75,7 +75,15 @@ single Rust binary that:
   `api`, `network`, `binary`, `firmware`, `mobile`, `cloud`, `container`,
   `iac`, `sca`, `secrets`, `threat-model`, `redteam`, the `pentest` composite,
   or your own TOML) define the asset model findings and coverage are validated
-  against (`--engagement-profile`).
+  against (`--engagement-profile`;
+  [docs/engagement-profiles.md](docs/engagement-profiles.md)).
+- **Ships a stock security fleet** — `rupu fleet install` writes the generic,
+  scope-driven agents and workflows the built-in profiles name in their
+  `[bundle]` (recon, service analysis, exploit verification, web and API
+  testing, code/SCA/secrets/IaC/cloud/container/binary/firmware/mobile review,
+  threat modelling, red-team operations, and an `assessment-lead` for
+  agentiflows) into `~/.rupu`, so an engagement has a fleet to draw on without
+  hand-writing one.
 - **Bills by customer** — group projects under customers with their own config
   layer (global → customer → project), attribute every run to one, and filter
   and price runs, usage and findings per customer in the control plane
@@ -86,7 +94,7 @@ single Rust binary that:
 - **Watches the network** — per-run netflow ledgers record rupu's own outbound
   HTTP and the sockets opened by an agent's `bash` subprocesses (passive,
   unprivileged OS socket observation on macOS and Linux), browsable in the web
-  UI (`rupu netflow show`).
+  UI (`rupu netflow show`; [docs/netflow.md](docs/netflow.md)).
 - **Names things for humans** — agent codenames (`cobalt-harbor/heron#412`)
   label runs, sessions, units and sub-agents across the CLI and web UI.
 - **Keeps faithful transcripts** — schema v2 JSONL records thinking blocks,
@@ -546,6 +554,7 @@ Full documentation lives at **<https://rupu.sh/docs/>**. The same material, in
 this repo:
 
 - [`docs/using-rupu.md`](docs/using-rupu.md) — practical day-to-day usage
+- [`docs/cli-reference.md`](docs/cli-reference.md) — every command, argument and flag (generated from `rupu --help` by `scripts/gen-cli-reference.py`)
 - [`docs/agent-format.md`](docs/agent-format.md) — complete agent schema reference
 - [`docs/agent-authoring.md`](docs/agent-authoring.md) — how to write good agents
 - [`docs/workflow-format.md`](docs/workflow-format.md) — complete workflow schema reference
@@ -557,7 +566,9 @@ this repo:
 - [`docs/response-outcomes.md`](docs/response-outcomes.md) — reply outcomes, the recovery ladder and `fallbacks:`
 - [`docs/scm.md`](docs/scm.md) — GitHub / GitLab / issue-tracker integration (per-platform pages in [`docs/scm/`](docs/scm/))
 - [`docs/mcp.md`](docs/mcp.md) — the embedded MCP server and its tool catalog
-- [`docs/coverage.md`](docs/coverage.md) — coverage harness, finding reports, queries, tags, exports and engagement profiles
+- [`docs/coverage.md`](docs/coverage.md) — coverage harness, finding reports, queries, tags and exports
+- [`docs/engagement-profiles.md`](docs/engagement-profiles.md) — engagement profiles: asset kinds, the built-in catalog, writing your own, the asset ledger, the stock fleet
+- [`docs/netflow.md`](docs/netflow.md) — per-run network flow capture: what is recorded, ledgers, ASN enrichment, `rupu netflow`, `[netflow]` config
 - [`docs/cp-customers-api.md`](docs/cp-customers-api.md) — the control plane's customers API and web scope
 - [`docs/transcript-schema.md`](docs/transcript-schema.md) — the JSONL transcript event schema
 - [`docs/development-flows.md`](docs/development-flows.md) — recommended engineering flows
@@ -602,6 +613,7 @@ rupu findings {export, import, schema}
                                        Export reports (--to md|html|pdf), backfill old ones,
                                        print the report JSON Schema
 rupu netflow {show, prune}            Per-run network flow ledgers
+rupu fleet {install, list}            Install the stock security-assessment fleet (--force, --project)
 rupu usage [runs, backfill]           Token spend + cost reports (--group-by, --since, filters)
 rupu cleanup [--sessions|--transcripts] [--stats] [--dry-run]
                                        Prune archived local sessions and transcripts
@@ -624,6 +636,7 @@ rupu config {get, set}                Read / write rupu configuration
 rupu ui {themes, theme {show, validate, import}}
                                        List, inspect, validate, and import UI themes
 rupu completions {print, install}     Shell-completion scripts (with dynamic agent names)
+rupu man                              Print the man page (roff) to stdout
 rupu update [--check] [--channel]     Download and install the latest release for the configured channel
 ```
 

@@ -504,13 +504,13 @@ pub enum Action {
     /// Approve a paused run and resume execution from the awaited
     /// step. The run must be in `awaiting_approval` status.
     Approve {
+        /// Full run id (`run_<ULID>`) of the run awaiting approval.
         run_id: String,
         /// Override permission mode for the resumed run
         /// (`ask` | `bypass` | `readonly`).
         #[arg(long)]
         mode: Option<String>,
-        /// Target a specific parked approval gate by step id (Task 5b-2a,
-        /// spec §7) — required once a run has more than one gate parked
+        /// Target a specific parked approval gate by step id — required once a run has more than one gate parked
         /// at once (a concurrent DAG run with several gates in the same
         /// batch-park wave). Omit for the legacy/single-gate case: the
         /// sole parked gate is approved exactly as before. Approving one
@@ -518,7 +518,7 @@ pub enum Action {
         /// `awaiting_approval` until every gate is resolved.
         #[arg(long)]
         gate: Option<String>,
-        /// Override the recorded approver identity (ISSUES.md I-82).
+        /// Override the recorded approver identity.
         /// Internal: this is how `cp serve`'s resume worker carries a
         /// web-initiated approve's true actor (e.g. `"web"`) across the
         /// process boundary — it reads the run's `resume_approver` marker
@@ -532,13 +532,13 @@ pub enum Action {
     /// Reject a paused run. Marks it `rejected`; no further steps
     /// dispatch.
     Reject {
+        /// Full run id (`run_<ULID>`) of the run awaiting approval.
         run_id: String,
         /// Optional human-readable reason recorded in the run's
         /// `error_message`.
         #[arg(long)]
         reason: Option<String>,
-        /// Target a specific parked approval gate by step id (Task 5b-2a,
-        /// spec §7) — same targeting rule as `approve --gate`. Rejecting
+        /// Target a specific parked approval gate by step id — same targeting rule as `approve --gate`. Rejecting
         /// one gate of several runs THAT gate's `on_reject` cleanup chain
         /// and leaves the others parked; the run flips to `rejected` only
         /// once every gate is resolved.
@@ -603,6 +603,8 @@ pub enum Action {
     DeleteRun {
         /// Full run id (`run_<ULID>`).
         run_id: String,
+        /// Confirm the permanent deletion (required). A run that has not
+        /// finished is refused even with `--force`; cancel it first.
         #[arg(long)]
         force: bool,
     },

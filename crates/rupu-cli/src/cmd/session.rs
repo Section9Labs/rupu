@@ -71,29 +71,36 @@ pub enum Action {
     List(ListArgs),
     /// Show session details.
     Show {
+        /// Session id (`ses_<ULID>`), a unique prefix, or a codename.
         #[arg(add = ArgValueCompleter::new(session_ids))]
         session_id: String,
         #[arg(long, value_enum)]
         view: Option<LiveViewMode>,
+        /// Disable colored output (also honored: `NO_COLOR` env var).
         #[arg(long)]
         no_color: bool,
+        /// Force pager. Default: page when stdout is a tty.
         #[arg(long, conflicts_with = "no_pager")]
         pager: bool,
+        /// Disable pager.
         #[arg(long, conflicts_with = "pager")]
         no_pager: bool,
     },
     /// Per-turn token series across every run this session recorded.
     UsageTimeline {
+        /// Session id (`ses_<ULID>`), a unique prefix, or a codename.
         #[arg(add = ArgValueCompleter::new(session_ids))]
         session_id: String,
     },
     /// Archive an inactive session and its owned transcripts.
     Archive {
+        /// Session id (`ses_<ULID>`), a unique prefix, or a codename.
         #[arg(add = ArgValueCompleter::new(active_session_ids))]
         session_id: String,
     },
     /// Restore an archived session and its owned transcripts.
     Restore {
+        /// Session id (`ses_<ULID>`), a unique prefix, or a codename.
         #[arg(add = ArgValueCompleter::new(archived_session_ids))]
         session_id: String,
     },
@@ -105,6 +112,7 @@ pub enum Action {
     Send(SendArgs),
     /// Attach to the current or last run in a session.
     Attach {
+        /// Session id (`ses_<ULID>`), a unique prefix, or a codename.
         #[arg(add = ArgValueCompleter::new(active_session_ids))]
         session_id: String,
         #[arg(long, value_enum)]
@@ -112,11 +120,13 @@ pub enum Action {
     },
     /// Stop an active session worker.
     Stop {
+        /// Session id (`ses_<ULID>`), a unique prefix, or a codename.
         #[arg(add = ArgValueCompleter::new(active_session_ids))]
         session_id: String,
     },
     /// Compact a session's stored conversation (summarize older turns now).
     Compact {
+        /// Session id (`ses_<ULID>`), a unique prefix, or a codename.
         #[arg(add = ArgValueCompleter::new(active_session_ids))]
         session_id: String,
         /// Context-window size (tokens) to size compaction against. Overrides
@@ -174,9 +184,12 @@ pub struct ListArgs {
 
 #[derive(ClapArgs, Debug, Clone)]
 pub struct SendArgs {
+    /// Session id (`ses_<ULID>`), a unique prefix, or a codename.
     #[arg(add = ArgValueCompleter::new(active_session_ids))]
     pub session_id: String,
+    /// Follow-up prompt to send as the session's next turn.
     pub prompt: String,
+    /// Start the turn without auto-attaching.
     #[arg(long)]
     pub detach: bool,
     /// Live renderer mode when auto-attaching.
@@ -186,8 +199,11 @@ pub struct SendArgs {
 
 #[derive(ClapArgs, Debug, Clone)]
 pub struct DeleteArgs {
+    /// Session id (`ses_<ULID>`), a unique prefix, or a codename.
     #[arg(add = ArgValueCompleter::new(session_ids))]
     pub session_id: String,
+    /// Confirm the permanent deletion (required). A session whose worker
+    /// is still running is refused even with `--force`; stop it first.
     #[arg(long)]
     pub force: bool,
 }

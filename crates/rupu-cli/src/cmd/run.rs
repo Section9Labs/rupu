@@ -278,7 +278,10 @@ pub enum RunAction {
 /// `clap::Parser`) can be parsed standalone from the raw argv captured
 /// by [`RunAction::Launch`].
 #[derive(Parser, Debug)]
-#[command(name = "rupu run")]
+#[command(
+    name = "rupu run",
+    about = "Run one agent, optionally against a repo/PR/issue target"
+)]
 struct LaunchParser {
     #[command(flatten)]
     args: Args,
@@ -296,13 +299,19 @@ pub(crate) fn parse_launch_args(argv: Vec<String>) -> Result<Args, clap::Error> 
 /// Standalone parser for just the `resume` control action's flags,
 /// re-parsed from the tail of the raw argv by [`classify`].
 #[derive(Parser, Debug)]
-#[command(name = "rupu run resume")]
+#[command(name = "rupu run resume", about = "Resume a paused workflow run by id")]
 struct ResumeArgsParser {
+    /// Full run id (`run_<ULID>`) of the run to resume.
     run_id: String,
+    /// Override permission mode for the resumed run
+    /// (`ask` | `bypass` | `readonly`).
     #[arg(long)]
     mode: Option<String>,
+    /// Use the plain line printer instead of the live graph view.
     #[arg(long)]
     plain: bool,
+    /// Start every interrupted step and `for_each` unit over from its
+    /// prompt instead of continuing it from its transcript.
     #[arg(long)]
     restart_interrupted: bool,
 }
@@ -319,8 +328,10 @@ pub fn classify(argv: Vec<String>) -> Result<RunAction, clap::Error> {
             // of the CLI, without dragging `Args`'s much larger flag
             // set into the pause path.
             #[derive(Parser, Debug)]
-            #[command(name = "rupu run pause")]
+            #[command(name = "rupu run pause", about = "Pause a running workflow run by id")]
             struct PauseArgsParser {
+                /// Full run id (`run_<ULID>`) as printed by `rupu run` /
+                /// `rupu workflow run`.
                 run_id: String,
             }
             let parsed = PauseArgsParser::try_parse_from(
@@ -343,7 +354,10 @@ pub fn classify(argv: Vec<String>) -> Result<RunAction, clap::Error> {
         }
         Some("list") => {
             #[derive(Parser, Debug)]
-            #[command(name = "rupu run list")]
+            #[command(
+                name = "rupu run list",
+                about = "List recent workflow runs, newest first"
+            )]
             struct ListArgsParser {
                 /// Return at most N runs, newest first.
                 #[arg(long, default_value_t = 10_000)]
@@ -362,8 +376,9 @@ pub fn classify(argv: Vec<String>) -> Result<RunAction, clap::Error> {
         }
         Some("show") => {
             #[derive(Parser, Debug)]
-            #[command(name = "rupu run show")]
+            #[command(name = "rupu run show", about = "Show one workflow run's detail")]
             struct ShowArgsParser {
+                /// Full run id (`run_<ULID>`).
                 run_id: String,
             }
             let parsed = ShowArgsParser::try_parse_from(

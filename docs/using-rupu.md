@@ -166,11 +166,15 @@ hand-authoring an agent per engagement. It ships, for example:
   `network-assessment` workflow
 - `web` → `crawler`, `appsec-tester` + `web-assessment`
 - `api` → `api-tester` + `api-assessment`
+- `redteam` → `redteam-operator`
 - `code` / `sca` / `secrets` / `iac` / `binary` / `firmware` / `cloud` /
-  `container` / `mobile` / `threat-model` / `redteam` → one specialist agent each
-- a generic `assessment-lead` that orchestrates a fleet for agentiflow mode
+  `container` / `mobile` / `threat-model` → one specialist agent each
+- a generic `assessment-lead` (in the `network`, `web`, `api`, `pentest` and
+  `redteam` bundles) written to be an agentiflow's `lead:`
 
-See `rupu fleet list` for the full set. Existing files are kept (your edits
+See `rupu fleet list` for the full set (18 agents, 3 workflows) and
+[engagement-profiles.md](engagement-profiles.md#the-stock-fleet) for the
+profile-by-profile table and how to run them. Existing files are kept (your edits
 win); pass `--force` to re-seed them, or `--project` to install into the
 current project's `.rupu/` instead of the global root. The agents request the
 full tool set (`tools: ["*"]`, plus the coverage/findings tools) and run in
@@ -244,7 +248,7 @@ against — the same selection `rupu run --engagement-profile` makes for a singl
 With no flag the run takes the native `code` path, exactly as before. An unknown profile
 id fails the command before any run state is created. The selection is not recorded on
 the run, so `rupu workflow resume` and an in-view approve-resume continue on the `code`
-path. Profiles, asset kinds and the built-in catalog: [coverage.md](coverage.md#engagement-profiles).
+path. Profiles, asset kinds and the built-in catalog: [engagement-profiles.md](engagement-profiles.md).
 
 ### Watch a workflow run (the live dashboard)
 
@@ -320,6 +324,32 @@ rupu run review-diff --continue run_01J... --model <other-model>  # failed on a 
 Run it from the same project as the original run. Which failures can be continued, and
 on what, is covered in [response-outcomes.md](response-outcomes.md#continuing-a-failed-run-on-another-model)
 and [agent-format.md](agent-format.md#continuing-an-interrupted-run).
+
+### Run control by id: `rupu run pause|resume|list|show`
+
+`rupu run` also takes four control words in place of an agent name. They act on
+the run store under `~/.rupu/runs/` (every workflow run, and the record each
+standalone `rupu run` writes):
+
+```sh
+rupu run list                         # newest first; --limit N, --status <status>
+rupu --format json run list           # the full row shape the control plane serves
+rupu run show run_01J...              # one run's detail (JSON)
+rupu run pause run_01J...             # same as `rupu workflow pause`
+rupu run resume run_01J...            # same as `rupu workflow resume`
+rupu run resume run_01J... --restart-interrupted   # also: --mode <mode>, --plain
+```
+
+`--status` matches one status exactly (`running`, `paused`, `completed`,
+`failed`, `awaiting_approval`, …). `show` accepts the same id fragments as
+`rupu workflow show-run` (a unique suffix or prefix). `pause` and `resume` are
+the workflow primitives: pause takes effect at the run's next safe boundary,
+and resume follows the rules in [Resuming interrupted work](#resuming-interrupted-work).
+To pick up an interrupted *standalone agent* run, use
+`rupu run <agent> --continue <run-id>` instead.
+
+Because these words are reserved, an agent literally named `pause`, `resume`,
+`list` or `show` can't be launched with `rupu run <name>`.
 
 ### Codenames
 
@@ -653,6 +683,8 @@ Persistent agent sessions:
 - `rupu session send <session-id> <prompt>`
 - `rupu session attach <session-id>`
 - `rupu session stop <session-id>`
+- `rupu session compact <session-id> [--window <tokens>]`
+- `rupu session usage-timeline <session-id>`
 - `rupu session archive <session-id>`
 - `rupu session restore <session-id>`
 - `rupu session delete <session-id> --force`
@@ -677,9 +709,44 @@ While attached:
   - `/runs`
   - `/transcript`
   - `/cancel`
+  - `/compact` — summarize older turns now (see below; the session must be idle)
+  - `/coverage` — the session's coverage progress: concerns complete and gap files
+    (only for an agent with a `concerns:` block, after its first turn)
   - `/stop`
   - `/detach`
-  - `/quit`
+  - `/quit` (or `/exit`)
+  - read-only CLI views, routed inline: `/workflow list|show|show-run|runs …`,
+    `/session list|show …`, `/transcript list|show …`, `/issues list|show …` (for
+    example `/workflow show-run current --view full`). Other subcommands are not
+    accepted. These work in the full-screen attach view only; the plain line view
+    says so instead.
+
+The attach header shows the session's token totals, `Cov <complete>/<total>` when
+the agent declares `concerns:`, and a **context gauge**: the last turn's input
+tokens as a percentage of the model's input limit (the resolved model limit, else
+the agent's `contextWindowTokens`). It is green well below the compaction point,
+amber within 15 points of it, and red at or past it. The compaction point is the
+model's `compact_at_percent` (default 80%; an agent can set `compactAtPercent`).
+The gauge is hidden until a turn has completed or when no input limit is known.
+
+**Compacting a session.** A long session's stored conversation can be summarized
+on demand:
+
+```sh
+rupu session compact ses_01J...
+rupu session compact ses_01J... --window 1000000   # size against an explicit input limit
+```
+
+It summarizes the older turns so the history fits under the same threshold a run
+compacts at, and stores the result as the session's history. It refuses a session
+that is running (stop it, or `/cancel` the turn, first), does nothing when the
+history has fewer than four messages, and needs a known input limit: when the
+model's limits are unknown and the agent pins no `contextWindowTokens`, pass
+`--window`. `/compact` in the attach view queues the same thing for the worker.
+
+**Per-turn usage.** `rupu session usage-timeline <session-id>` prints one row per
+turn across every run the session recorded, including sub-agents those runs
+dispatched (turn, run id, tokens in / out / cached); `--format json|csv` are supported.
 
 Lifecycle notes:
 
@@ -700,6 +767,11 @@ Standalone transcript lifecycle:
 
 Install shell completion with `rupu completions install` to get dynamic
 tab-completion for session ids and transcript run ids.
+
+For a man page, `rupu man` prints one in roff to stdout, generated from the
+binary's own command definitions (so it never describes a flag the binary
+lacks): `rupu man > ~/.local/share/man/man1/rupu.1`, or view it directly with
+`rupu man | man -l -`. Packaged installs ship it as `rupu.1`.
 
 Transcript archive/delete is only available for standalone runs. If a transcript is owned
 by a session, manage it through `rupu session archive|delete` instead.
@@ -1352,7 +1424,11 @@ rupu update --rollback           # restore the previously-installed binary from 
 `[update].channel` (`stable` by default; see [configuration.md](configuration.md#update)),
 verifying a sha256 checksum before an atomic in-place binary swap with a backup for
 `--rollback`. `[update].check` (default `true`) controls whether ordinary commands print
-a passive "update available" notice.
+a passive "update available" notice. The notice goes to stderr, is read from a local
+cache (refreshed in the background at most once a day, never blocking the command), and
+is printed only when stderr is a terminal and no `--format` other than `table` is given (never by
+`rupu update` itself). Setting `RUPU_NO_UPDATE_CHECK` (to any value)
+turns it off for that process, as `[update].check = false` does.
 
 ---
 

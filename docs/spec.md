@@ -34,8 +34,10 @@ discovered during implementation:
 a task as a `.md` agent file (system prompt + frontmatter) or a `.yaml` workflow (a linear
 sequence of agent steps), then invokes `rupu run` or `rupu workflow run`. The agent loop drives
 an LLM through tool calls — bash, file read/write/edit, grep, glob — logging every event to an
-immutable JSONL transcript. The action protocol contract is present from day one so Slice B can
-wire real effects (open PR, post comment) without schema changes. Slice A is local-only; no
+immutable JSONL transcript. (Slice A shipped an "action protocol" envelope so later slices could
+wire real effects without schema changes; today a workflow `action:` step calls one MCP connector
+tool for real, and a step's `actions:` list narrows the connector/MCP tools its agent may call,
+never the builtins — see [workflow-format.md](workflow-format.md#actions).) Slice A is local-only; no
 SaaS control plane and remote sandboxing are still out of scope here; SCM and issue integrations are now part of the shipped local CLI.
 
 ---
@@ -65,7 +67,7 @@ SaaS control plane and remote sandboxing are still out of scope here; SCM and is
 - ~~Workflow action effects (open PR, post comment). v0 logs `action_emitted` only.~~
   **Shipped since** — `action:` steps now execute for real through the in-process MCP
   tool layer (`docs/superpowers/plans/2026-07-23-rupu-gate-nodes-plan-2-action-execution.md`).
-- Workflow action effects beyond today's transcripted action-protocol validation.
+- Workflow action effects beyond what the MCP connector catalog exposes (`action:` steps can only call catalog tools).
 - Transcript compaction, resume from aborted run, concurrent-run locking.
 - SaaS control plane, remote runs, OAuth flows.
 - Sandbox / microVM / session save-restore.

@@ -56,19 +56,24 @@ pub enum Action {
     },
     /// Print a transcript's full event stream.
     Show {
+        /// Run id (`run_<ULID>`), a unique prefix, or a codename.
         #[arg(add = ArgValueCompleter::new(transcript_run_ids))]
         run_id: String,
         #[arg(long, value_enum)]
         view: Option<LiveViewMode>,
+        /// Disable colored output (also honored: `NO_COLOR` env var).
         #[arg(long)]
         no_color: bool,
+        /// Force pager. Default: page when stdout is a tty.
         #[arg(long, conflicts_with = "no_pager")]
         pager: bool,
+        /// Disable pager.
         #[arg(long, conflicts_with = "pager")]
         no_pager: bool,
     },
     /// Archive a standalone transcript and its metadata.
     Archive {
+        /// Run id (`run_<ULID>`), a unique prefix, or a codename.
         #[arg(add = ArgValueCompleter::new(standalone_transcript_run_ids))]
         run_id: String,
         /// Skip the still-running check; only use when the recorded pid was
@@ -85,8 +90,10 @@ pub enum Action {
 
 #[derive(ClapArgs, Debug)]
 pub struct DeleteArgs {
+    /// Run id (`run_<ULID>`), a unique prefix, or a codename.
     #[arg(add = ArgValueCompleter::new(standalone_transcript_run_ids))]
     pub run_id: String,
+    /// Confirm the permanent deletion (required).
     #[arg(long)]
     pub force: bool,
     /// Skip the still-running check; only use when the recorded pid was

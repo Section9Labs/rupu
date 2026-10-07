@@ -23,35 +23,47 @@ pub enum Action {
     },
     /// Metadata, assigned projects, and the customer's effective config.
     Show {
+        /// Customer slug (e.g. `acme`).
         slug: String,
     },
     /// Create a customer.
     Create {
+        /// New customer's slug: lowercase letters, digits and `-`, starting
+        /// with a letter or digit, at most 63 characters.
         slug: String,
+        /// Display name.
         #[arg(long)]
         name: String,
+        /// Free-form notes.
         #[arg(long)]
         notes: Option<String>,
+        /// Contact (a person, email, or channel).
         #[arg(long)]
         contact: Option<String>,
-        /// `#rrggbb`.
+        /// Display color, `#rrggbb`.
         #[arg(long)]
         color: Option<String>,
     },
     /// Change metadata. An empty value clears `--notes`, `--contact`, `--color`.
     Set {
+        /// Customer slug (e.g. `acme`).
         slug: String,
+        /// New display name.
         #[arg(long)]
         name: Option<String>,
+        /// New notes; an empty value clears them.
         #[arg(long)]
         notes: Option<String>,
+        /// New contact; an empty value clears it.
         #[arg(long)]
         contact: Option<String>,
+        /// New display color, `#rrggbb`; an empty value clears it.
         #[arg(long)]
         color: Option<String>,
     },
     /// Edit the customer's config layer in $EDITOR (validated on save).
     Edit {
+        /// Customer slug (e.g. `acme`).
         slug: String,
         /// Editor command; defaults to `[ui].editor`, then $VISUAL / $EDITOR.
         #[arg(long)]
@@ -59,17 +71,22 @@ pub enum Action {
     },
     /// Hide a customer from pickers; its projects keep running.
     Archive {
+        /// Customer slug (e.g. `acme`).
         slug: String,
     },
+    /// Restore an archived customer to pickers.
     Unarchive {
+        /// Customer slug (e.g. `acme`).
         slug: String,
     },
     /// Delete a customer. Refused while any project is assigned.
     Delete {
+        /// Customer slug (e.g. `acme`).
         slug: String,
     },
     /// Assign a project (default: the current directory).
     Assign {
+        /// Customer slug (e.g. `acme`).
         slug: String,
         /// A project directory or workspace id (`ws_…`).
         #[arg(long)]
@@ -77,6 +94,7 @@ pub enum Action {
     },
     /// Remove a project's customer (default: the current directory).
     Unassign {
+        /// A project directory or workspace id (`ws_…`).
         #[arg(long)]
         project: Option<String>,
     },

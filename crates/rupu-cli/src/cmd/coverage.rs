@@ -67,7 +67,10 @@ pub enum TemplatesAction {
     /// List bundled template names.
     List,
     /// Print a bundled template's concerns.
-    Show { name: String },
+    Show {
+        /// Template name, as listed by `rupu coverage templates list`.
+        name: String,
+    },
 }
 
 fn workspace() -> Result<PathBuf> {

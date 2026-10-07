@@ -1,9 +1,8 @@
 // Full-page Agent Builder — the `next` (card-composer) authoring UI gets the
 // whole content area instead of a floating modal. Route: /agents/new (linked
-// from the Agents page's "New agent" button when `[cp].agent_authoring_ui`
-// resolves to `next`; the classic Describe/Edit modal remains on the default
-// path). Cancel returns to /agents; a successful create navigates to the new
-// agent's detail page.
+// from the Agents page's "New agent" button; ungated — `[cp].agent_authoring_ui`
+// is no longer read). Cancel returns to /agents; a successful create navigates
+// to the new agent's detail page.
 
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
