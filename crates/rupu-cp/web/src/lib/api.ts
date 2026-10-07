@@ -1507,7 +1507,20 @@ export interface FindingOut extends FindingRecord {
 /** Finding detail with evidence status — response from `GET /api/findings/:id`. */
 export interface FindingDetail extends FindingOut {
   evidence_status: ClaimState[];
+  /** The finding's tag changes, oldest first. */
+  tag_history: TagEvent[];
+  /** false when the project's tag log couldn't be read: tags are read-only. */
+  tags_editable: boolean;
 }
+
+export type TagActor =
+  | { kind: 'agent'; run_id: string; model: string; surface: string; codename?: string; agent?: string; provider?: string }
+  | { kind: 'operator'; user: string; via: 'cli' | 'cp' };
+export interface TagEvent { id: string; finding_id: string; op: 'add' | 'remove'; tag: string; by: TagActor; at: string }
+export interface TagOutcome { finding_id: string; before: string[]; after: string[] }
+export interface WorkspaceTagResult { ws_id: string; outcomes?: TagOutcome[]; error?: string }
+export interface TagAcrossResult { workspaces: WorkspaceTagResult[]; unknown: string[] }
+export interface TagCount { tag: string; count: number }
 
 /** Response from `GET /api/findings` — the severity-sorted cross-project
  *  findings list plus the severity rollup. */
@@ -2750,6 +2763,16 @@ export const api = {
   },
   getFinding(id: string): Promise<FindingDetail> {
     return request<FindingDetail>(`/api/findings/${encodeURIComponent(id)}`);
+  },
+  tagFindings(findingIds: string[], change: { add?: string[]; remove?: string[] }): Promise<TagAcrossResult> {
+    return request<TagAcrossResult>('/api/findings/tags', {
+      method: 'POST',
+      body: JSON.stringify({ finding_ids: findingIds, add: change.add ?? [], remove: change.remove ?? [] }),
+    });
+  },
+  getTagsInUse(opts?: { wsId?: string }): Promise<TagCount[]> {
+    const qs = opts?.wsId ? `?ws_id=${encodeURIComponent(opts.wsId)}` : '';
+    return request<TagCount[]>(`/api/findings/tags${qs}`);
   },
   /**
    * Render a project report over the findings `body` selects

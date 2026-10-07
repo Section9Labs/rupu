@@ -6,9 +6,9 @@
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
+import { act, render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, useNavigate } from 'react-router-dom';
-import { api, type FindingOut, type FindingsResponse } from '../lib/api';
+import { api, ApiError, type FindingOut, type FindingsResponse, type TagAcrossResult } from '../lib/api';
 
 import Findings from './Findings';
 
@@ -377,5 +377,216 @@ describe('Findings — export report', () => {
     renderPage();
     await waitFor(() => expect(screen.getByText('No findings')).toBeInTheDocument());
     expect(screen.queryByRole('button', { name: 'Export report' })).toBeNull();
+  });
+});
+
+describe('Findings — bulk tagging', () => {
+  const A: FindingOut = { ...FINDING, id: 'fa', summary: 'Alpha issue' };
+  const B: FindingOut = { ...FINDING, id: 'fb', summary: 'Beta issue' };
+  const outcome = (id: string) => ({
+    workspaces: [{ ws_id: 'ws-1', outcomes: [{ finding_id: id, before: [], after: ['triaged'] }] }],
+    unknown: [],
+  });
+
+  it('selects a row, tags it, reloads, clears the selection and keeps the result', async () => {
+    const get = vi.spyOn(api, 'getFindings').mockResolvedValue(resp([A, B]));
+    const tag = vi.spyOn(api, 'tagFindings').mockResolvedValue(outcome('fa'));
+    renderPage();
+    await waitFor(() => expect(screen.getByText('Alpha issue')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select fa' }));
+    expect(screen.getByText('1 selected')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Tag…' }));
+    const input = screen.getByRole('combobox', { name: 'Tag selected findings' });
+    fireEvent.change(input, { target: { value: 'triaged' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+
+    await waitFor(() => expect(tag).toHaveBeenCalledWith(['fa'], { add: ['triaged'] }));
+    await waitFor(() => expect(get).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByText('1 selected')).toBeNull());
+    expect(screen.getByRole('status')).toHaveTextContent('Tagged 1 finding.');
+    expect(screen.getByRole('checkbox', { name: 'Select fa' })).not.toBeChecked();
+  });
+
+  /** Opens Tag… on the bar and submits `tag`. */
+  function tagSelected(tag: string) {
+    fireEvent.click(screen.getByRole('button', { name: 'Tag…' }));
+    const input = screen.getByRole('combobox', { name: 'Tag selected findings' });
+    fireEvent.change(input, { target: { value: tag } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+  }
+
+  it('keeps a row ticked while a bulk change was in flight', async () => {
+    vi.spyOn(api, 'getFindings').mockResolvedValue(resp([A, B]));
+    let finish!: (r: TagAcrossResult) => void;
+    vi.spyOn(api, 'tagFindings').mockImplementation(() => new Promise((r) => { finish = r; }));
+    renderPage();
+    await waitFor(() => expect(screen.getByText('Alpha issue')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select fa' }));
+    tagSelected('triaged');
+    await waitFor(() => expect(finish).toBeDefined());
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select fb' }));
+
+    await act(async () => finish(outcome('fa')));
+    await waitFor(() => expect(screen.getByText('1 selected')).toBeInTheDocument());
+    expect(screen.getByRole('checkbox', { name: 'Select fb' })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'Select fa' })).not.toBeChecked();
+  });
+
+  it('sends a selection over the server limit in batches; a batch of deleted findings reads as gone', async () => {
+    const rows = Array.from({ length: 1001 }, (_, i): FindingOut => ({ ...FINDING, id: `f${i}`, summary: `Issue ${i}` }));
+    vi.spyOn(api, 'getFindings').mockResolvedValue(resp(rows));
+    // f1000 was deleted since the list loaded: the server answers its batch,
+    // where every id is unknown, with a 404.
+    const gone = JSON.stringify({ error: 'unknown finding id(s): f1000' });
+    const tag = vi.spyOn(api, 'tagFindings').mockImplementation(async (ids: string[]) => {
+      if (ids.includes('f1000')) throw new ApiError(404, gone, gone);
+      return {
+        workspaces: [{ ws_id: 'ws-1', outcomes: ids.map((id) => ({ finding_id: id, before: [], after: ['triaged'] })) }],
+        unknown: [],
+      };
+    });
+    renderPage();
+    await waitFor(() => expect(screen.getByText('Issue 0')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select all' }));
+    expect(screen.getByText('1001 selected')).toBeInTheDocument();
+    tagSelected('triaged');
+
+    await waitFor(() => expect(tag).toHaveBeenCalledTimes(2));
+    expect(tag.mock.calls[0][0]).toHaveLength(1000);
+    expect(tag.mock.calls[1][0]).toEqual(['f1000']);
+    expect(await screen.findByRole('alert')).toHaveTextContent('Tagged 1000 findings. 1 finding no longer exists.');
+  }, 30000);
+
+  it('stops at a failed batch and says what was applied before it', async () => {
+    const rows = Array.from({ length: 1001 }, (_, i): FindingOut => ({ ...FINDING, id: `f${i}`, summary: `Issue ${i}` }));
+    vi.spyOn(api, 'getFindings').mockResolvedValue(resp(rows));
+    const tag = vi.spyOn(api, 'tagFindings')
+      .mockImplementationOnce(async (ids: string[]) => ({
+        workspaces: [{ ws_id: 'ws-1', outcomes: ids.map((id) => ({ finding_id: id, before: [], after: ['triaged'] })) }],
+        unknown: [],
+      }))
+      .mockRejectedValueOnce(new Error('server went away'));
+    renderPage();
+    await waitFor(() => expect(screen.getByText('Issue 0')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select all' }));
+    tagSelected('triaged');
+
+    await waitFor(() => expect(tag).toHaveBeenCalledTimes(2));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      "Tagged 1000 findings. The other 1 finding wasn't changed: server went away",
+    );
+    // Only what was applied leaves the selection.
+    expect(screen.getByText('1 selected')).toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: 'Select f1000' })).toBeChecked();
+  }, 30000);
+
+  it("never shows a bulk result from an earlier query on the next one's list", async () => {
+    vi.spyOn(api, 'getFindings').mockResolvedValue(resp([A, B]));
+    let finish!: (r: TagAcrossResult) => void;
+    const tag = vi.spyOn(api, 'tagFindings').mockImplementation(() => new Promise((r) => { finish = r; }));
+    function Nav() {
+      const navigate = useNavigate();
+      return <button onClick={() => navigate('/findings?q=tag%3Ab')}>go-b</button>;
+    }
+    render(
+      <MemoryRouter initialEntries={['/findings?q=tag%3Aa']}>
+        <Nav />
+        <Findings />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByText('Alpha issue')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select fa' }));
+    tagSelected('triaged');
+    await waitFor(() => expect(tag).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByText('go-b'));
+    await waitFor(() => expect(screen.queryByText('1 selected')).toBeNull());
+    await act(async () => finish(outcome('fa')));
+
+    await waitFor(() => expect(api.getFindings).toHaveBeenCalledWith({ q: 'tag:b' }));
+    expect(screen.queryByText(/Tagged 1 finding/)).toBeNull();
+  });
+
+  it('keeps the bulk result when the reload after it fails', async () => {
+    vi.spyOn(api, 'getFindings')
+      .mockResolvedValueOnce(resp([A, B]))
+      .mockRejectedValueOnce(new Error('list unavailable'));
+    vi.spyOn(api, 'tagFindings').mockResolvedValue(outcome('fa'));
+    renderPage();
+    await waitFor(() => expect(screen.getByText('Alpha issue')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select fa' }));
+    tagSelected('triaged');
+
+    expect(await screen.findByText('list unavailable')).toBeInTheDocument();
+    expect(screen.getByRole('status')).toHaveTextContent('Tagged 1 finding.');
+  });
+
+  it('neither counts nor sends a selected row whose tags became unreadable', async () => {
+    const C: FindingOut = { ...FINDING, id: 'fc', summary: 'Gamma issue' };
+    const B2: FindingOut = { ...B, ws_id: 'ws-2', project: 'billing-api' };
+    vi.spyOn(api, 'getFindings')
+      .mockResolvedValueOnce(resp([A, B2, C]))
+      .mockResolvedValue(resp([A, B2, C], { tags_unavailable: [{ ws_id: 'ws-2', project: 'billing-api' }] }));
+    let finish!: (r: TagAcrossResult) => void;
+    const tag = vi.spyOn(api, 'tagFindings')
+      .mockImplementationOnce(() => new Promise((r) => { finish = r; }))
+      .mockResolvedValue(outcome('fc'));
+    renderPage();
+    await waitFor(() => expect(screen.getByText('Alpha issue')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select fa' }));
+    tagSelected('triaged');
+    await waitFor(() => expect(finish).toBeDefined());
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select fb' }));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select fc' }));
+    await act(async () => finish(outcome('fa')));
+
+    // The reload marks ws-2 unreadable: fb drops out of the count.
+    await waitFor(() => expect(screen.getByRole('checkbox', { name: 'Select fb' })).toBeDisabled());
+    expect(screen.getByText('1 selected')).toBeInTheDocument();
+    tagSelected('triaged');
+    await waitFor(() => expect(tag).toHaveBeenCalledTimes(2));
+    expect(tag.mock.calls[1][0]).toEqual(['fc']);
+  });
+
+  it('disables the checkbox of a finding whose workspace tags are unreadable', async () => {
+    vi.spyOn(api, 'getFindings').mockResolvedValue(
+      resp([A, { ...B, ws_id: 'ws-2', project: 'billing-api' }], {
+        tags_unavailable: [{ ws_id: 'ws-2', project: 'billing-api' }],
+      }),
+    );
+    renderPage();
+    await waitFor(() => expect(screen.getByText('Alpha issue')).toBeInTheDocument());
+    expect(screen.getByRole('checkbox', { name: 'Select fa' })).toBeEnabled();
+    const blocked = screen.getByRole('checkbox', { name: 'Select fb' });
+    expect(blocked).toBeDisabled();
+    expect(blocked.getAttribute('title')).toMatch(/billing-api/);
+  });
+
+  it('clears the selection when the query changes', async () => {
+    vi.spyOn(api, 'getFindings').mockResolvedValue(resp([A, B]));
+    function Nav() {
+      const navigate = useNavigate();
+      return <button onClick={() => navigate('/security?tab=findings&q=tag%3Ab')}>go-b</button>;
+    }
+    render(
+      <MemoryRouter initialEntries={['/security?tab=findings&q=tag%3Aa']}>
+        <Nav />
+        <Findings />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByText('Alpha issue')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select fa' }));
+    expect(screen.getByText('1 selected')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText('go-b'));
+    await waitFor(() => expect(screen.queryByText('1 selected')).toBeNull());
+    await waitFor(() => expect(screen.getByRole('checkbox', { name: 'Select fa' })).not.toBeChecked());
   });
 });

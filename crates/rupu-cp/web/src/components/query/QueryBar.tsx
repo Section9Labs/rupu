@@ -193,6 +193,9 @@ export function QueryBar({ value, onChange, fields, facets, placeholder, valueTo
           aria-controls={open && options.length > 0 ? listId : undefined}
           aria-activedescendant={activeRow >= 0 ? `${listId}-${activeRow}` : undefined}
           aria-invalid={error ? true : undefined}
+          aria-describedby={error ? `${listId}-error` : undefined}
+          aria-autocomplete="list"
+          aria-haspopup="listbox"
           value={draft}
           placeholder={tokens.length === 0 ? (placeholder ?? 'Filter… e.g. severity>=high tag:needs-poc') : ''}
           onFocus={() => setOpen(true)}
@@ -207,7 +210,7 @@ export function QueryBar({ value, onChange, fields, facets, placeholder, valueTo
         />
       </div>
       {error && (
-        <p role="alert" className="mt-1 text-note text-err">
+        <p id={`${listId}-error`} role="alert" className="mt-1 text-note text-err">
           {error}
         </p>
       )}
@@ -215,6 +218,7 @@ export function QueryBar({ value, onChange, fields, facets, placeholder, valueTo
         <ul
           id={listId}
           role="listbox"
+          aria-label="Suggestions"
           className="absolute z-30 mt-1 max-h-80 w-full overflow-auto rounded-xl border border-border bg-panel py-1 shadow-card"
         >
           {options.map((s, i) => {

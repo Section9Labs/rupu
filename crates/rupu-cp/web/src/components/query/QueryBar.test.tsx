@@ -121,6 +121,26 @@ describe('QueryBar', () => {
     expect(screen.getByRole('alert')).toBeInTheDocument();
   });
 
+  it('exposes combobox semantics once open, with a labelled listbox', () => {
+    render(<Harness />);
+    fireEvent.focus(input());
+    expect(input()).toHaveAttribute('aria-autocomplete', 'list');
+    expect(input()).toHaveAttribute('aria-haspopup', 'listbox');
+    expect(screen.getByRole('listbox', { name: 'Suggestions' })).toBeInTheDocument();
+  });
+
+  it('points aria-describedby at the alert only while the draft is invalid', () => {
+    render(<Harness />);
+    expect(input()).not.toHaveAttribute('aria-describedby');
+    fireEvent.change(input(), { target: { value: 'nope:x' } });
+    fireEvent.keyDown(input(), { key: 'Enter' });
+    const alert = screen.getByRole('alert');
+    expect(alert.id).not.toBe('');
+    expect(input()).toHaveAttribute('aria-describedby', alert.id);
+    fireEvent.change(input(), { target: { value: 'tag:x' } });
+    expect(input()).not.toHaveAttribute('aria-describedby');
+  });
+
   it('Escape clears the draft first', () => {
     render(<Harness />);
     fireEvent.change(input(), { target: { value: 'sql' } });

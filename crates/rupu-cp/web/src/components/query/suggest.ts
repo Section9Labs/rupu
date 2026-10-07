@@ -30,15 +30,29 @@ export interface Suggestion {
 
 const KEY_OP = /^([A-Za-z_]+)(>=|<=|:|>|<)(.*)$/s;
 
+/** An item's value as the grammar's `items` decodes it: a leading quote wraps it, and `\` escapes the next char. */
+function decodeItem(cs: string[]): string {
+  const q = cs[0] === '"' || cs[0] === "'" ? cs[0] : null;
+  let out = '';
+  for (let i = q === null ? 0 : 1; i < cs.length; i++) {
+    if (cs[i] === '\\' && i + 1 < cs.length) out += cs[++i];
+    else if (q !== null && cs[i] === q) break;
+    else out += cs[i];
+  }
+  return out;
+}
+
 /**
  * Split a keyed value at its last item-separating comma, walking it the way
  * the grammar's `scan` does: a quote opens only at an item start (the value
  * start or right after a comma), and `\` escapes the next char. `prefix` is
  * everything up to and including that comma; `partial` is the item being
- * typed, with the quote of a still-open leading quote stripped.
+ * typed, with the quote of a still-open leading quote stripped. `chosen` is
+ * the decoded value of every item already finished in `prefix`.
  */
-function splitItem(rest: string): { prefix: string; partial: string } {
+function splitItem(rest: string): { prefix: string; partial: string; chosen: string[] } {
   const cs = Array.from(rest);
+  const chosen: string[] = [];
   let cut = -1;
   let itemStart = true;
   let quote: string | null = null;
@@ -59,6 +73,7 @@ function splitItem(rest: string): { prefix: string; partial: string } {
       quote = c;
       itemStart = false;
     } else if (c === ',') {
+      chosen.push(decodeItem(cs.slice(cut + 1, i)));
       cut = i;
       itemStart = true;
     } else {
@@ -67,7 +82,7 @@ function splitItem(rest: string): { prefix: string; partial: string } {
   }
   const prefix = cs.slice(0, cut + 1).join('');
   const item = cs.slice(cut + 1).join('');
-  return { prefix, partial: quote !== null ? item.slice(1) : item };
+  return { prefix, partial: quote !== null ? item.slice(1) : item, chosen };
 }
 
 export function suggest(
@@ -86,10 +101,11 @@ export function suggest(
     if (!field) return [];
     // A comparison takes one value and only `severity` takes one.
     if (op !== ':' && field.kind !== 'severity') return [];
-    const { prefix, partial } = splitItem(rest);
+    const { prefix, partial, chosen } = splitItem(rest);
     if (op !== ':' && prefix !== '') return [];
     const counts = new Map((facets?.[field.key] ?? []).map((f) => [f.value, f.count]));
-    const pool = field.values.length > 0 ? field.values : [...counts.keys()];
+    const taken = new Set(['', ...chosen]);
+    const pool = (field.values.length > 0 ? field.values : [...counts.keys()]).filter((v) => !taken.has(v));
     return pool
       .map((value) => ({ value, hit: fuzzyScore(partial, value), count: counts.get(value) ?? 0 }))
       .filter((x) => x.hit !== null)

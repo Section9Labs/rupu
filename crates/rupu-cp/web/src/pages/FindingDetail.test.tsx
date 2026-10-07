@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom';
 import fixture from '../../../../rupu-coverage/tests/fixtures/finding_report/valid_full.json';
 import { api, ApiError, type FindingDetail as Detail } from '../lib/api';
 import type { FindingReport } from '../lib/findingReport';
@@ -33,6 +33,8 @@ function base(over: Partial<Detail>): Detail {
     codename: 'amber-delta/heron',
     codename_derived: false,
     evidence_status: [],
+    tag_history: [],
+    tags_editable: true,
     ...over,
   };
 }
@@ -315,6 +317,181 @@ describe('FindingDetail page', () => {
       fireEvent.click(within(group).getByRole('button', { name: 'PDF' }));
       cleanup();
       expect(signal?.aborted).toBe(true);
+    });
+  });
+
+  describe('tags', () => {
+    const removed = {
+      workspaces: [{ ws_id: 'ws1', outcomes: [{ finding_id: 'fnd_1', before: ['needs-poc'], after: [] }] }],
+      unknown: [],
+    };
+
+    beforeEach(() => {
+      vi.spyOn(api, 'getTagsInUse').mockResolvedValue([]);
+    });
+
+    it('removes a tag through the API and refetches the finding', async () => {
+      const get = vi.spyOn(api, 'getFinding').mockResolvedValue(
+        base({ profile: 'summary', report: null, tags: ['needs-poc'], tags_editable: true }),
+      );
+      const tag = vi.spyOn(api, 'tagFindings').mockResolvedValue(removed);
+      renderAt();
+
+      expect(await screen.findByText('needs-poc')).toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: 'Remove tag needs-poc' }));
+
+      await waitFor(() => expect(tag).toHaveBeenCalledWith(['fnd_1'], { remove: ['needs-poc'] }));
+      await waitFor(() => expect(get).toHaveBeenCalledTimes(2));
+    });
+
+    it('shows tags read-only, with no remove button, when the tag log is unreadable', async () => {
+      vi.spyOn(api, 'getFinding').mockResolvedValue(
+        base({ profile: 'summary', report: null, tags: ['needs-poc'], tags_editable: false }),
+      );
+      renderAt();
+
+      expect(await screen.findByText('needs-poc')).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: /Remove tag/ })).toBeNull();
+      expect(screen.getByText('tags read-only')).toBeInTheDocument();
+      expect(screen.getByText(/Tag history unavailable/)).toBeInTheDocument();
+      expect(screen.queryByText(/Tag history \(/)).toBeNull();
+    });
+
+    it('shows a workspace error as an alert and does not refetch', async () => {
+      const get = vi.spyOn(api, 'getFinding').mockResolvedValue(
+        base({ profile: 'full', report, evidence_status: ['current'], tags: ['needs-poc'], tags_editable: true }),
+      );
+      vi.spyOn(api, 'tagFindings').mockResolvedValue({
+        workspaces: [{ ws_id: 'ws1', error: 'tag log is locked' }],
+        unknown: [],
+      });
+      renderAt();
+
+      fireEvent.click(await screen.findByRole('button', { name: 'Remove tag needs-poc' }));
+
+      const alert = await screen.findByRole('alert');
+      expect(alert).toHaveTextContent("demo's tags couldn't be changed: tag log is locked.");
+      expect(get).toHaveBeenCalledTimes(1);
+    });
+
+    it("reports a saved change whose refetch failed as saved, not failed", async () => {
+      const get = vi.spyOn(api, 'getFinding')
+        .mockResolvedValueOnce(base({ profile: 'summary', report: null, tags: [], tags_editable: true }))
+        .mockRejectedValueOnce(new Error('network down'));
+      vi.spyOn(api, 'tagFindings').mockResolvedValue({
+        workspaces: [{ ws_id: 'ws1', outcomes: [{ finding_id: 'fnd_1', before: [], after: ['triaged'] }] }],
+        unknown: [],
+      });
+      renderAt();
+
+      fireEvent.click(await screen.findByRole('button', { name: /tag$/ }));
+      const box = screen.getByRole('combobox', { name: 'Add tag' });
+      fireEvent.change(box, { target: { value: 'triaged' } });
+      fireEvent.keyDown(box, { key: 'Enter' });
+
+      const note = await screen.findByRole('status');
+      expect(note).toHaveTextContent("Saved, but the page couldn't refresh: network down");
+      expect(get).toHaveBeenCalledTimes(2);
+      expect(screen.queryByRole('alert')).toBeNull();
+      expect(screen.queryByRole('combobox', { name: 'Add tag' })).toBeNull();
+      // The chips follow the write's own answer.
+      expect(screen.getByText('triaged')).toBeInTheDocument();
+    });
+
+    it('refetches after a partly applied change and still shows its error', async () => {
+      const get = vi.spyOn(api, 'getFinding')
+        .mockResolvedValueOnce(base({ profile: 'summary', report: null, tags: ['needs-poc'], tags_editable: true }))
+        .mockResolvedValueOnce(base({ profile: 'summary', report: null, tags: [], tags_editable: true }));
+      vi.spyOn(api, 'tagFindings').mockResolvedValue({
+        workspaces: [
+          { ws_id: 'ws1', outcomes: [{ finding_id: 'fnd_1', before: ['needs-poc'], after: [] }] },
+          { ws_id: 'ws2', error: 'tag log is locked' },
+        ],
+        unknown: [],
+      });
+      renderAt();
+
+      fireEvent.click(await screen.findByRole('button', { name: 'Remove tag needs-poc' }));
+
+      await waitFor(() => expect(get).toHaveBeenCalledTimes(2));
+      const alert = await screen.findByRole('alert');
+      expect(alert).toHaveTextContent("ws2's tags couldn't be changed: tag log is locked.");
+      await waitFor(() => expect(screen.queryByText('needs-poc')).toBeNull());
+    });
+
+    it("drops a tag change's refetch once the page has moved to another finding", async () => {
+      let resolveRefetch: ((d: Detail) => void) | null = null;
+      let loadsOfA = 0;
+      vi.spyOn(api, 'getFinding').mockImplementation((id: string) => {
+        if (id === 'fnd_2') {
+          return Promise.resolve(base({ id: 'fnd_2', summary: 'Second finding', profile: 'summary', report: null }));
+        }
+        loadsOfA += 1;
+        if (loadsOfA === 1) {
+          return Promise.resolve(base({ summary: 'First finding', profile: 'summary', report: null, tags: ['needs-poc'] }));
+        }
+        return new Promise<Detail>((r) => { resolveRefetch = r; });
+      });
+      vi.spyOn(api, 'tagFindings').mockResolvedValue(removed);
+      function Nav() {
+        const navigate = useNavigate();
+        return <button type="button" onClick={() => navigate('/findings/fnd_2')}>go-b</button>;
+      }
+      render(
+        <MemoryRouter initialEntries={['/findings/fnd_1']}>
+          <Routes>
+            <Route path="/findings/:id" element={<><Nav /><FindingDetail /></>} />
+          </Routes>
+        </MemoryRouter>,
+      );
+
+      fireEvent.click(await screen.findByRole('button', { name: 'Remove tag needs-poc' }));
+      await waitFor(() => expect(resolveRefetch).not.toBeNull());
+      fireEvent.click(screen.getByText('go-b'));
+      expect(await screen.findByRole('heading', { level: 1, name: 'Second finding' })).toBeInTheDocument();
+
+      await act(async () => {
+        resolveRefetch!(base({ summary: 'First finding', profile: 'summary', report: null, tags: [] }));
+      });
+      expect(screen.getByRole('heading', { level: 1, name: 'Second finding' })).toBeInTheDocument();
+      expect(screen.queryByText('First finding')).toBeNull();
+    });
+
+    it('lists the tag history in a disclosure', async () => {
+      vi.spyOn(api, 'getFinding').mockResolvedValue(
+        base({
+          profile: 'summary',
+          report: null,
+          tags: ['needs-poc'],
+          tag_history: [{
+            id: 'tev_1',
+            finding_id: 'fnd_1',
+            op: 'add',
+            tag: 'needs-poc',
+            by: { kind: 'agent', run_id: 'run_42', model: 'claude-x', surface: 'agent', codename: 'cobalt-harbor/heron', agent: 'recon' },
+            at: '2026-08-02T00:00:00Z',
+          }],
+        }),
+      );
+      renderAt();
+
+      const summary = await screen.findByText('Tag history (1)');
+      const details = summary.closest('details')!;
+      expect(within(details).getByText('+ needs-poc')).toBeInTheDocument();
+      expect(within(details).getByText('cobalt-harbor/heron (recon)')).toBeInTheDocument();
+    });
+
+    it("loads the project's tags in use as suggestions", async () => {
+      vi.spyOn(api, 'getFinding').mockResolvedValue(
+        base({ profile: 'summary', report: null, tags: [], tags_editable: true }),
+      );
+      const inUse = vi.spyOn(api, 'getTagsInUse').mockResolvedValue([{ tag: 'needs-poc', count: 3 }]);
+      renderAt();
+
+      fireEvent.click(await screen.findByRole('button', { name: /tag$/ }));
+      await waitFor(() => expect(inUse).toHaveBeenCalledWith({ wsId: 'ws1' }));
+      fireEvent.change(screen.getByRole('combobox', { name: 'Add tag' }), { target: { value: 'needs' } });
+      expect(await screen.findByText('needs-poc')).toBeInTheDocument();
     });
   });
 

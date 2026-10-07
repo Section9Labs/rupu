@@ -62,6 +62,19 @@ describe('suggest', () => {
   it('does not split on a comma inside an open quote', () => {
     expect(suggest('owner:"Acme, I', FINDING_FIELDS, facets)[0].insert).toBe('owner:"Acme, Inc."');
   });
+  it('does not offer a value already chosen earlier in the token', () => {
+    expect(suggest('has:tags,', FINDING_FIELDS, facets).map((x) => x.label)).toEqual(['report', 'poc', 'cwe']);
+    expect(suggest('tag:needs-poc,', FINDING_FIELDS, facets).map((x) => x.label)).toEqual(['class:sqli', 'triaged']);
+  });
+  it('reads chosen values through quotes and escapes', () => {
+    expect(suggest('owner:"Acme, Inc.",', FINDING_FIELDS, facets).map((x) => x.label)).toEqual(['Payments Team']);
+    expect(suggest("owner:'Payments Team',", FINDING_FIELDS, facets).map((x) => x.label)).toEqual(['Acme, Inc.']);
+    expect(suggest('owner:Payments\\ Team,', FINDING_FIELDS, facets).map((x) => x.label)).toEqual(['Acme, Inc.']);
+  });
+  it('never offers an empty facet value', () => {
+    const withEmpty = { tag: [{ value: '', count: 9 }, { value: 'needs-poc', count: 3 }] };
+    expect(suggest('tag:', FINDING_FIELDS, withEmpty).map((x) => x.label)).toEqual(['needs-poc']);
+  });
   it('every committed value insert parses', () => {
     const drafts = ['', 'ta', 'tag:', '-tag:class:sqli,ne', 'severity>=hi', 'has:', 'owner:pay', 'owner:"Pay', 'owner:"Acme, I', 'tag:x,'];
     for (const draft of drafts) {
