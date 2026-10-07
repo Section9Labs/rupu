@@ -185,7 +185,13 @@ export default function ProjectConfigTab({ wsId }: { wsId: string }) {
       {configView.layer_error && (
         <LayerErrorBanner
           message={configView.layer_error}
-          hint="Fix it in the Raw tab (this project) or the customer's Config tab."
+          kept={configView.layer_error_kept}
+          customerName={configView.customer?.name}
+          hint={
+            configView.layer_error_kept === 'global_customer' || !configView.customer
+              ? 'Fix it in the Raw tab.'
+              : "Fix it in the Raw tab (this project) or the customer's Config tab."
+          }
         />
       )}
       {readOnly && (

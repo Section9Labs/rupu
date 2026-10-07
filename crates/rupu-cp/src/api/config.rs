@@ -81,8 +81,21 @@ pub struct ConfigView {
     /// still served — `effective` is then global only — so the editor opens
     /// and the text can be fixed.
     pub layer_error: Option<String>,
+    /// With `layer_error`: the layers `effective` was resolved from instead —
+    /// `global_customer` when only a project layer is broken and its
+    /// customer's layer still resolves, else `global`. Absent without an error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layer_error_kept: Option<KeptLayers>,
     pub cp: serde_json::Value,
     pub status: RuntimeStatus,
+}
+
+/// The layers a view with a `layer_error` still resolves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeptLayers {
+    Global,
+    GlobalCustomer,
 }
 
 /// `GET /api/config` (+ `?project=<ws_id>` | `?customer=<slug>`) — effective
@@ -110,8 +123,8 @@ async fn get_config(
         }
         (None, None) => rupu_workspace::ConfigPaths::without_customer(&s.global_dir, None),
     };
-    let (resolved, layer_error) = match rupu_config::resolve(layers.layers()) {
-        Ok(r) => (r, None),
+    let (resolved, layer_error, layer_error_kept) = match rupu_config::resolve(layers.layers()) {
+        Ok(r) => (r, None, None),
         // A malformed layer must not lock the operator out of the editor
         // that fixes it: serve what still resolves, with the error beside
         // it. A broken PROJECT layer keeps global + customer (so the
@@ -125,12 +138,15 @@ async fn get_config(
                 }
                 _ => None,
             };
-            let fallback = match kept {
-                Some(r) => r,
-                None => rupu_config::resolve(rupu_config::LayerPaths::global_only(&global))
-                    .map_err(|e| ApiError::internal(e.to_string()))?,
+            let (fallback, kept) = match kept {
+                Some(r) => (r, KeptLayers::GlobalCustomer),
+                None => (
+                    rupu_config::resolve(rupu_config::LayerPaths::global_only(&global))
+                        .map_err(|e| ApiError::internal(e.to_string()))?,
+                    KeptLayers::Global,
+                ),
             };
-            (fallback, Some(e.to_string()))
+            (fallback, Some(e.to_string()), Some(kept))
         }
         Err(e) => return Err(ApiError::internal(e.to_string())),
     };
@@ -148,6 +164,7 @@ async fn get_config(
         customer,
         customer_lock: resolved.customer_lock,
         layer_error,
+        layer_error_kept,
         cp: serde_json::to_value(&resolved.config.cp).unwrap_or(serde_json::Value::Null),
         status: RuntimeStatus {
             bind: s.bind.clone(),
@@ -1135,6 +1152,7 @@ input_per_mtok = 5.0
         assert_eq!(view.customer.as_ref().unwrap().slug, "acme");
         assert_eq!(view.raw_project, None);
         assert_eq!(view.layer_error, None);
+        assert_eq!(view.layer_error_kept, None);
         let prov = serde_json::to_value(view.provenance.get("default_model").unwrap()).unwrap();
         assert_eq!(prov["source"], "customer");
     }
@@ -1182,6 +1200,7 @@ input_per_mtok = 5.0
             .expect("the editor must still open")
             .0;
         assert!(view.layer_error.is_some());
+        assert_eq!(view.layer_error_kept, Some(KeptLayers::Global));
         // Effective is global only; the broken text is still served to fix.
         assert_eq!(view.effective["default_model"], "opus");
         assert_eq!(
@@ -1450,6 +1469,8 @@ input_per_mtok = 5.0
             .expect("the editor must still open")
             .0;
         assert!(view.layer_error.is_some());
+        // No customer to keep: global alone.
+        assert_eq!(view.layer_error_kept, Some(KeptLayers::Global));
         assert_eq!(view.effective["default_model"], "opus");
         assert_eq!(view.raw_project.as_deref(), Some("default_model = = x\n"));
     }
@@ -1475,6 +1496,9 @@ input_per_mtok = 5.0
             .expect("the editor must still open")
             .0;
         assert!(view.layer_error.is_some());
+        assert_eq!(view.layer_error_kept, Some(KeptLayers::GlobalCustomer));
+        let json = serde_json::to_value(&view.layer_error_kept).unwrap();
+        assert_eq!(json, "global_customer");
         assert_eq!(view.effective["default_model"], "acme-model");
         let prov = serde_json::to_value(view.provenance.get("default_model").unwrap()).unwrap();
         assert_eq!(prov["source"], "customer");
@@ -1502,6 +1526,7 @@ input_per_mtok = 5.0
             .expect("the editor must still open")
             .0;
         assert!(view.layer_error.is_some());
+        assert_eq!(view.layer_error_kept, Some(KeptLayers::Global));
         assert_eq!(view.effective["default_model"], "opus");
         assert!(view.customer_lock.is_empty());
     }

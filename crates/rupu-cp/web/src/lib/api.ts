@@ -1831,9 +1831,14 @@ export interface ConfigView {
   customer?: CustomerRef | null;
   /** The customer layer's `[policy].lock`, as written. */
   customer_lock?: string[];
-  /** Set when a layer is malformed: `effective` is then global only, and the
-   *  raw text is still served so the editor can fix it. */
+  /** Set when a layer is malformed. The raw text is still served so the
+   *  editor can fix it, and `effective` comes from the layers that still
+   *  resolve — `layer_error_kept` says which. */
   layer_error?: string | null;
+  /** With `layer_error`: `global_customer` when only the project layer is
+   *  broken and its customer's layer still resolves; `global` otherwise (a
+   *  broken customer layer drops the project layer too). */
+  layer_error_kept?: 'global' | 'global_customer';
   cp: Record<string, unknown>;
   status: ConfigRuntimeStatus;
 }

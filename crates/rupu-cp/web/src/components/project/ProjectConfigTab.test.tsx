@@ -42,4 +42,35 @@ describe('ProjectConfigTab', () => {
     expect(banner).toHaveTextContent("doesn't parse");
     expect(banner).toHaveTextContent('expected `=` at line 3');
   });
+
+  it('a broken project layer under a customer says the values are global + that customer', async () => {
+    vi.spyOn(api, 'getConfig').mockResolvedValue(
+      view({
+        layer_error: 'expected `=` at line 3',
+        layer_error_kept: 'global_customer',
+        customer: { slug: 'acme', name: 'Acme Corp', tint: { light: '#111111', dark: '#eeeeee' }, archived: false },
+      }),
+    );
+    render(<ProjectConfigTab wsId="ws1" />);
+    const banner = await screen.findByRole('alert');
+    expect(banner).toHaveTextContent(
+      "This project's config doesn't parse — the values below are the global config plus Acme Corp's layer, without this project's own settings",
+    );
+    expect(banner).not.toHaveTextContent('global config alone');
+    expect(banner).toHaveTextContent('Fix it in the Raw tab.');
+  });
+
+  it('a broken customer layer says the values are the global config alone', async () => {
+    vi.spyOn(api, 'getConfig').mockResolvedValue(
+      view({
+        layer_error: 'customers/acme/config.toml: expected `=`',
+        layer_error_kept: 'global',
+        customer: { slug: 'acme', name: 'Acme Corp', tint: { light: '#111111', dark: '#eeeeee' }, archived: false },
+      }),
+    );
+    render(<ProjectConfigTab wsId="ws1" />);
+    const banner = await screen.findByRole('alert');
+    expect(banner).toHaveTextContent('the values below are the global config alone');
+    expect(banner).toHaveTextContent("or the customer's Config tab");
+  });
 });

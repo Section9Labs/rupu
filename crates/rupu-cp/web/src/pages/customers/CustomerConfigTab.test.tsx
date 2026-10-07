@@ -288,6 +288,8 @@ describe('CustomerConfigTab', () => {
     const banner = await screen.findByRole('alert');
     expect(banner).toHaveTextContent("doesn't parse");
     expect(banner).toHaveTextContent('expected `=` at line 2');
+    // A broken customer layer leaves the global config alone (the server's fallback).
+    expect(banner).toHaveTextContent('the values below are the global config alone');
     expect(await screen.findByText(/this customer\)/)).toBeInTheDocument();
     expect(screen.queryByLabelText('Default provider')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Save changes' })).toBeDisabled();

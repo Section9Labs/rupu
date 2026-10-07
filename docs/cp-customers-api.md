@@ -18,7 +18,7 @@ Writes need a `cp serve` deployment and answer **501** otherwise.
 | `DELETE /api/customers/:slug` | 204 | 409 `{error, projects: [{ws_id, path}]}` while projects are assigned; 404; 501 |
 | `PUT /api/customers/:slug/projects/:ws_id` | 200, the project's row (any earlier assignment is replaced) | 404 unknown customer / project; 409 customer archived; 400 malformed id; 501 |
 | `DELETE /api/customers/:slug/projects/:ws_id` | 204 | 404 when the project is not assigned to `:slug`; 501 |
-| `GET /api/config?customer=<slug>` | 200, effective config + provenance + `customer_lock`, `raw_customer`, `customer`, `layer_error` | 400 with `?project=` (mutually exclusive); 404; 500 a dangling customer on `?project=` |
+| `GET /api/config?customer=<slug>` | 200, effective config + provenance + `customer_lock`, `raw_customer`, `customer`, `layer_error` (+ `layer_error_kept`: `global_customer` when only `?project=`'s own layer is broken and its customer's layer resolves, else `global`) | 400 with `?project=` (mutually exclusive); 404; 500 a dangling customer on `?project=` |
 | `PUT /api/config/customer/:slug` | 200 `{ok: true}` | 400 the layer breaks the merged config, or sets a key the GLOBAL `[policy].lock` enforces; 404; 501 |
 | `PUT /api/config/project/:id` | 200 | 400 also for a key the project's customer locks (`key … is enforced by customer … policy`) |
 | `POST /api/launch/preview` | 200, see below | 400 / 404 / 409, see below |
@@ -299,7 +299,10 @@ zero. The banner never shows unscoped.
   a field is inherited from global, owned by the customer (with a "Lock for
   projects" switch), or pinned by the global `[policy].lock` (read-only; the
   server's 400 shows inline). A layer that does not parse (`layer_error`) shows
-  a banner and opens the Raw tab.
+  a banner and opens the Raw tab. The banner says which layers the values
+  shown come from (`layer_error_kept`): the global config alone for a broken
+  customer layer; on a project's Config tab, the global config plus the
+  customer's layer when only the project's own layer is broken.
 - **Project header** (`ProjectCustomerMenu`): the project's customer chip and an
   "Assign to customer" menu (active customers, with the account the project's
   runs would switch to, and "Unassign"). The Projects table has a customer

@@ -420,7 +420,11 @@ export default function CustomerConfigTab({ slug, name, projectCount, layerPath,
         </div>
       )}
       {view.layer_error && (
-        <LayerErrorBanner message={view.layer_error} hint="Fix it in the Raw tab — the form can't edit a file that doesn't parse." />
+        <LayerErrorBanner
+          message={view.layer_error}
+          kept={view.layer_error_kept ?? 'global'}
+          hint="Fix it in the Raw tab — the form can't edit a file that doesn't parse."
+        />
       )}
       {readOnly && (
         <div className="rounded-lg border border-warn/30 bg-warn-bg px-4 py-3 text-sm text-warn">
