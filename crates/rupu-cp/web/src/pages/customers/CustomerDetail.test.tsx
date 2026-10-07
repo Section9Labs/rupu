@@ -65,6 +65,7 @@ function detail(over: Partial<CustomerDetailDto> = {}): CustomerDetailDto {
     projects: [proj('a', 20), proj('b', 10)],
     default_account: { account: 'acme-prod', locked_by: 'customer', inherited: false },
     layer_error: null,
+    config_path: '~/.rupu/customers/acme/config.toml',
     ...over,
   };
 }
@@ -172,6 +173,14 @@ describe('CustomerDetail header and tiles', () => {
     expect(screen.getByText('Pen-test retainer, renews in March.')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Edit details' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Archive' })).toBeInTheDocument();
+  });
+
+  it('shows the config path the server reports, not a hard-coded one', async () => {
+    getCustomer.mockResolvedValue(detail({ config_path: '/srv/rupu-home/customers/acme/config.toml' }));
+    mount();
+    await screen.findByRole('heading', { level: 1, name: 'Acme Corp' });
+    expect(screen.getByText('/srv/rupu-home/customers/acme/config.toml')).toBeInTheDocument();
+    expect(screen.queryByText('~/.rupu/customers/acme/config.toml')).toBeNull();
   });
 
   it('names the hosts the rollup left out in the warn banner', async () => {
@@ -370,6 +379,14 @@ describe('CustomerDetail delete', () => {
     fireEvent.keyDown(menu, { key: 'Escape' });
     expect(screen.queryByRole('menu')).not.toBeInTheDocument();
     expect(trigger).toHaveFocus();
+  });
+
+  it('the delete dialog names the real customer directory', async () => {
+    getCustomer.mockResolvedValue(detail({ config_path: '/srv/rupu-home/customers/acme/config.toml' }));
+    mount();
+    await screen.findByRole('heading', { level: 1, name: 'Acme Corp' });
+    const dialog = openDelete();
+    expect(within(dialog).getByText('/srv/rupu-home/customers/acme/')).toBeInTheDocument();
   });
 
   it('deleting with no projects removes the customer and returns to the list', async () => {

@@ -1994,6 +1994,8 @@ export interface CustomerDetail {
   projects: ProjectRow[];
   default_account: DefaultAccount | null;
   layer_error: string | null;
+  /** The customer's `config.toml` as the CP resolves it (home shown as `~`). */
+  config_path: string;
 }
 
 /** The `customer` list param: a slug, `'none'` (work with no customer), or

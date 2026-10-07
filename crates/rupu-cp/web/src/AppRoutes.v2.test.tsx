@@ -99,6 +99,7 @@ function mockApi() {
     projects: [],
     default_account: null,
     layer_error: null,
+    config_path: '~/.rupu/customers/acme/config.toml',
   });
   vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([]);
   vi.spyOn(api, 'subscribeEvents').mockImplementation(() => () => {});

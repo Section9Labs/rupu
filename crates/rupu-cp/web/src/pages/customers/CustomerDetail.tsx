@@ -83,8 +83,10 @@ function isTab(t: string | undefined): t is CustomerTab {
   return TABS.some((x) => x.id === t);
 }
 
-function layerPath(slug: string): string {
-  return `~/.rupu/customers/${slug}/config.toml`;
+/** The customer's directory: its config layer's path, minus the file. */
+function layerDir(configPath: string): string {
+  const i = configPath.lastIndexOf('/');
+  return i > 0 ? configPath.slice(0, i + 1) : configPath;
 }
 
 function tabHref(slug: string, tab: CustomerTab): string {
@@ -275,7 +277,7 @@ export default function CustomerDetail() {
                 )}
                 <span>created {createdLabel(c.created_at)}</span>
                 <Sep />
-                <span className="font-mono text-ink-mute">{layerPath(c.slug)}</span>
+                <span className="font-mono text-ink-mute">{detail.config_path}</span>
               </div>
               {c.notes && <p className="mt-2 max-w-3xl whitespace-pre-line text-ui text-ink-dim">{c.notes}</p>}
             </div>
@@ -397,7 +399,7 @@ export default function CustomerDetail() {
           slug={c.slug}
           name={c.name}
           projectCount={detail.projects.length}
-          layerPath={layerPath(c.slug)}
+          layerPath={detail.config_path}
           onChanged={refetch}
         />
       )}
@@ -420,6 +422,7 @@ export default function CustomerDetail() {
       {deleting && (
         <DeleteCustomerDialog
           customer={c}
+          layerDir={layerDir(detail.config_path)}
           onDeleted={onDeleted}
           onClose={(changed) => {
             setDeleting(false);
@@ -535,10 +538,13 @@ function KebabMenu({
  *  refetch. */
 function DeleteCustomerDialog({
   customer,
+  layerDir,
   onDeleted,
   onClose,
 }: {
   customer: CustomerDto;
+  /** The customer's directory, as the CP resolves it. */
+  layerDir: string;
   onDeleted: () => void;
   /** `changed`: some projects were unassigned while the dialog was open. */
   onClose: (changed: boolean) => void;
@@ -624,7 +630,7 @@ function DeleteCustomerDialog({
       ) : (
         <p className="mt-3 text-ui text-ink-dim">
           Deletes {customer.name} and{' '}
-          <span className="font-mono text-ink">~/.rupu/customers/{customer.slug}/</span>, its config layer
+          <span className="font-mono text-ink">{layerDir}</span>, its config layer
           included. This can’t be undone — Archive keeps it instead.
         </p>
       )}

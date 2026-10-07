@@ -12,7 +12,7 @@ Writes need a `cp serve` deployment and answer **501** otherwise.
 |---|---|---|
 | `GET /api/customers?archived=1&range=7d\|30d\|all` | 200, rows: customer + `tint` + `rollup` + `default_account` + `layer_error` (default range `30d`; archived only with `archived=1`) | 400 bad `range`; 500 an unreadable assignment (names the workspace) |
 | `POST /api/customers` `{slug, name, notes?, contact?, color?}` | 201, the customer | 400 invalid slug / color / empty name, or the reserved slug `none` (the filter's "no customer"); 409 slug exists; 501 |
-| `GET /api/customers/:slug?range=` | 200, `{customer, rollup, projects[], default_account, layer_error}` | 404 unknown; 400 bad `range`; 500 unreadable assignment |
+| `GET /api/customers/:slug?range=` | 200, `{customer, rollup, projects[], default_account, layer_error, config_path}` | 404 unknown; 400 bad `range`; 500 unreadable assignment |
 | `PATCH /api/customers/:slug` | 200; absent fields stay, `""` clears `notes` / `contact` / `color` | 400; 404; 501 |
 | `POST /api/customers/:slug/archive`, `…/unarchive` | 200, the customer | 404; 501 |
 | `DELETE /api/customers/:slug` | 204 | 409 `{error, projects: [{ws_id, path}]}` while projects are assigned; 404; 501 |
@@ -29,6 +29,9 @@ never invent colors. `default_account` is `{account, locked_by, inherited}`:
 the provider account the customer's runs default to over global + its layer
 (`inherited: true` when the value is the global one); `null` when nothing sets
 one or the layer does not resolve (`layer_error` says why on the detail).
+`config_path` on the detail is the customer layer's real `config.toml` under the
+CP's global dir (any `RUPU_HOME`), with a leading `$HOME` shown as `~` — for
+display only.
 
 Rollups (`projects`, `run_count`, `usage`, `findings_open`, `last_active`) are
 computed in one pass over the run store. Standalone agent runs and session

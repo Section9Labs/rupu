@@ -896,3 +896,22 @@ async fn read_only_customer_writes_name_the_action() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["error"], "managing customers requires `rupu cp serve`");
 }
+
+#[tokio::test]
+async fn detail_reports_the_real_config_layer_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = spawn(tmp.path(), true).await;
+    assert_eq!(
+        create(&base, "acme", "Acme").await.status(),
+        StatusCode::CREATED
+    );
+    let detail = get_json(format!("{base}/api/customers/acme")).await;
+    // A custom global dir outside $HOME stays absolute; it is the store's path.
+    let expected = tmp.path().join("customers/acme/config.toml");
+    let shown = detail["config_path"].as_str().unwrap();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    match home.as_ref().and_then(|h| expected.strip_prefix(h).ok()) {
+        Some(rest) => assert_eq!(shown, format!("~/{}", rest.display())),
+        None => assert_eq!(shown, expected.display().to_string()),
+    }
+}

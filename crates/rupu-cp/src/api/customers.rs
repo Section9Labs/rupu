@@ -86,6 +86,25 @@ pub struct CustomerDetail {
     /// Why the customer's config could not be resolved (a malformed layer);
     /// `default_account` is then `None`.
     pub layer_error: Option<String>,
+    /// Where the customer's config layer lives (`<global>/customers/<slug>/
+    /// config.toml`), with a leading `$HOME` shown as `~`. For display only.
+    pub config_path: String,
+}
+
+/// `path` for display: a leading `home` becomes `~`; anything else (a custom
+/// `RUPU_HOME` outside the home directory) stays absolute.
+fn display_path(path: &std::path::Path, home: Option<&std::path::Path>) -> String {
+    if let Some(rest) = home
+        .filter(|h| !h.as_os_str().is_empty())
+        .and_then(|h| path.strip_prefix(h).ok())
+    {
+        return if rest.as_os_str().is_empty() {
+            "~".to_string()
+        } else {
+            format!("~/{}", rest.display())
+        };
+    }
+    path.display().to_string()
 }
 
 pub fn routes() -> Router<AppState> {
@@ -387,6 +406,12 @@ async fn get_customer(
             projects,
             default_account,
             layer_error,
+            config_path: display_path(
+                &store.config_path(&slug),
+                std::env::var_os("HOME")
+                    .map(std::path::PathBuf::from)
+                    .as_deref(),
+            ),
         })
     })
     .await?;
@@ -570,4 +595,38 @@ async fn unassign_project(
         Ok(StatusCode::NO_CONTENT)
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::display_path;
+    use std::path::Path;
+
+    #[test]
+    fn display_path_abbreviates_only_under_home() {
+        let home = Path::new("/Users/matt");
+        assert_eq!(
+            display_path(
+                Path::new("/Users/matt/.rupu/customers/acme/config.toml"),
+                Some(home)
+            ),
+            "~/.rupu/customers/acme/config.toml"
+        );
+        assert_eq!(
+            display_path(
+                Path::new("/srv/rupu/customers/acme/config.toml"),
+                Some(home)
+            ),
+            "/srv/rupu/customers/acme/config.toml"
+        );
+        // A sibling that merely shares the prefix text is not under home.
+        assert_eq!(
+            display_path(Path::new("/Users/mattress/x/config.toml"), Some(home)),
+            "/Users/mattress/x/config.toml"
+        );
+        assert_eq!(
+            display_path(Path::new("/srv/x/config.toml"), None),
+            "/srv/x/config.toml"
+        );
+    }
 }
