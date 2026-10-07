@@ -21,6 +21,19 @@
 - `make cp-web` rebuilds `web/dist`, which release builds embed (do it once at the end; never commit `dist` unless the repo already tracks it — check `git ls-files crates/rupu-cp/web/dist | head`).
 - Never `git stash`; never push; never amend.
 
+## Alignment with the shipped Plan 2A API (binding; supersedes task text where they differ)
+
+Plan 2A shipped after this plan was written. `docs/cp-customers-api.md` is the contract; read it before every task. Differences every task must honour:
+
+1. **Types already exist** in `web/src/lib/api.ts`: `TintDto`, `CustomerRef`, `PreviewBody`, `ManifestEntry` (with `auth_mode`), `PreviewResponse` (with optional `host`), `api.launchPreview`, `ConfigView.{raw_customer, customer, customer_lock, layer_error}`, optional `customer` / `customer_derived` on run/agent-run/session/project/finding rows, `pricing_error?` on `UsageSummary`, `hosts_without_customer?` on usage/dashboard. Task 1 adds only what is missing (customers CRUD client, `CustomerRow` incl. `layer_error` and `rollup.hosts_without_customer`, `CustomerDetail` incl. `layer_error`, the `customer` list param).
+2. **Three customer states on a row**: `customer: "<slug>"` (with `customer_derived`), `customer: null` = no customer, key ABSENT = can't say. `CustomerChip` gets a third, muted "unknown" state (`title="This host or record can't say whose this is"`); never render an absent key as "No customer".
+3. **The 501 reason text** for hosts that can't filter is "can't report a customer for every run" (lists) and the aggregates' 501 for remote hosts under a filter; `HostsWithoutCustomerBanner` matches on the HTTP status + those reasons, and ALSO reads `hosts_without_customer` arrays (usage, dashboard, customer rollups) and the `X-Rupu-Hosts-Without-Customer` header where a page uses a fan-out request.
+4. **`pricing_error`**: wherever a cost from a `UsageSummary` is shown (customer rows/tiles, project rows, run/session rows and details, usage headline/timeline/runs/outliers, dashboard), show a small warn marker with the `pricing_error` text as tooltip (a shared `PricingErrorMark` component, added in Task 2). Task 7 wires it everywhere the scope touches; Tasks 4–6 use it on the new pages.
+5. **Reserved slug**: `CustomerFormDialog` rejects `none` inline ("`none` is reserved — it's the filter's “no customer”"), matching the API's 400.
+6. **Unassign** answers 404 when the project is not assigned to that slug — show "Already unassigned" and refetch.
+7. **Launch preview**: 409 (dangling assignment, unloadable config, malformed agent files) disables Launch with the server message; 400 for a bad name; show `auth_mode` next to provider/fallback accounts when present; show `host` + its warning when echoed.
+8. **Config**: `PUT /api/config/customer/:slug` 400 when the layer breaks the merged config or sets a globally locked key — show the message inline; `layer_error` on `GET` → banner + open Raw (Task 8). ALSO surface `ConfigView.layer_error` on the existing project config tab (`components/project/ProjectConfigTab.tsx`) with the same banner (carried from Plan 2A).
+
 ## File map
 
 | File | Change |
