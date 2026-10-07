@@ -49,6 +49,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/agentiflows", get(list_agentiflows))
         .route("/api/agentiflows/:id", get(get_agentiflow))
+        .route("/api/agentiflows/:id/messages", get(get_agentiflow_messages))
 }
 
 // ---------------------------------------------------------------------------
@@ -644,6 +645,46 @@ async fn get_agentiflow(
     detail
         .map(Json)
         .ok_or_else(|| ApiError::not_found(format!("no agentiflow run `{id}`")))
+}
+
+/// `GET /api/agentiflows/:id/messages` — the engagement's board: the fleet's
+/// shared posts (fire-and-forget broadcasts + observations the agents write to
+/// each other) and the lead's directives, oldest first. This is the "message
+/// inbox" — how the fleet talks to itself during an engagement. Each line is
+/// returned as-is (`{kind, author, addressed_to?, ts, body}` for a post).
+#[derive(Serialize)]
+struct MessagesResponse {
+    posts: Vec<Value>,
+    directives: Vec<Value>,
+}
+
+async fn get_agentiflow_messages(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<MessagesResponse>> {
+    if !valid_run_id(&id) {
+        return Err(ApiError::not_found(format!("no agentiflow run `{id}`")));
+    }
+    let run_dir = agentiflow_dir(&s.global_dir).join(&id);
+    if !run_dir.is_dir() {
+        return Err(ApiError::not_found(format!("no agentiflow run `{id}`")));
+    }
+    let board = run_dir.join("board");
+    let read_jsonl = |p: std::path::PathBuf| -> Vec<Value> {
+        std::fs::read_to_string(&p)
+            .ok()
+            .map(|text| {
+                text.lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    Ok(Json(MessagesResponse {
+        posts: read_jsonl(board.join("posts.jsonl")),
+        directives: read_jsonl(board.join("directives.jsonl")),
+    }))
 }
 
 #[cfg(test)]

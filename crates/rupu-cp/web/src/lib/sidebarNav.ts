@@ -2,12 +2,14 @@ import type { LucideIcon } from 'lucide-react';
 import {
   Activity,
   BookMarked,
+  Boxes,
   Building2,
   DollarSign,
   FolderGit2,
   LayoutDashboard,
   MessageSquare,
   Network,
+  Orbit,
   Radio,
   Repeat,
   Server,
@@ -55,15 +57,17 @@ export const sidebarNav: NavSection[] = [
   { kind: 'divider' },
   { kind: 'group', group: {
     id: 'runs', label: 'Runs', items: [
-      { to: '/runs/agents',    label: 'Agents',    icon: Sparkles,      enabled: true },
-      { to: '/runs/workflows', label: 'Workflows', icon: Workflow,      enabled: true },
-      { to: '/runs/autoflows', label: 'Autoflows', icon: Repeat,        enabled: true },
-      { to: '/sessions',       label: 'Sessions',  icon: MessageSquare, enabled: true },
+      { to: '/runs/agents',      label: 'Agents',      icon: Sparkles,      enabled: true },
+      { to: '/runs/workflows',   label: 'Workflows',   icon: Workflow,      enabled: true },
+      { to: '/runs/autoflows',   label: 'Autoflows',   icon: Repeat,        enabled: true },
+      { to: '/runs/agentiflows', label: 'Agentiflows', icon: Orbit,         enabled: true },
+      { to: '/sessions',         label: 'Sessions',    icon: MessageSquare, enabled: true },
     ],
   }},
   { kind: 'group', group: {
     id: 'security', label: 'Security', items: [
       { to: '/coverage', label: 'Coverage', icon: ShieldCheck, enabled: true },
+      { to: '/assets',   label: 'Assets',   icon: Boxes,       enabled: true },
       { to: '/netflow',  label: 'Network',  icon: Network,     enabled: true },
       { to: '/findings', label: 'Findings', icon: ShieldAlert, enabled: true },
     ],

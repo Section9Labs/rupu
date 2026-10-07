@@ -1,5 +1,6 @@
-// Agentiflow run-stream tab — the Activity "agentiflows" list. Same shape as
-// Runs → Workflows (page header + Refresh, the shared SortableTable, row click
+// Agentiflow run list — the sidebar Runs → Agentiflows destination (its own
+// standalone page, NOT an Activity top-strip tab). Same shape as Runs →
+// Workflows (page header + Refresh, the shared SortableTable, row click
 // → detail), but deliberately simpler for v1: agentiflows are LOCAL-only, so
 // there is no host scope, no per-host progressive loading and no paging — one
 // `GET /api/agentiflows` (newest first, the whole list) per load, plus the
@@ -29,26 +30,10 @@ import {
   stopReasonTone,
 } from '../../lib/agentiflow';
 
+// Column order mirrors the other run lists (WorkflowRuns / AgentRuns):
+// Status first, then the subject (crew chip + name together), then the
+// run's metadata, right-aligned numerics, and Started last.
 const COLUMNS: Column<AgentiflowRow>[] = [
-  {
-    key: 'codename',
-    header: 'Codename',
-    fit: true,
-    sortable: true,
-    sortValue: (r) => r.codename,
-    render: (r) => <CrewChip crew={parseCodename(r.codename).crew} derived={r.codename_derived} />,
-  },
-  {
-    key: 'name',
-    header: 'Agentiflow',
-    subject: true,
-    sortable: true,
-    sortValue: (r) => r.name,
-    titleValue: (r) => r.name,
-    // Plain content — row navigation is `rowHref` (SortableTable link-wraps the
-    // whole row); an inline <Link> here would nest an <a> inside its <a>.
-    render: (r) => <span className="text-sm font-medium text-ink">{r.name}</span>,
-  },
   {
     key: 'status',
     header: 'Status',
@@ -66,6 +51,23 @@ const COLUMNS: Column<AgentiflowRow>[] = [
             coordinator gone
           </Badge>
         )}
+      </span>
+    ),
+  },
+  {
+    key: 'name',
+    header: 'Agentiflow',
+    subject: true,
+    sortable: true,
+    sortValue: (r) => r.name,
+    titleValue: (r) => r.name,
+    // Crew chip + name in the subject column, exactly like Workflow Runs.
+    // Row navigation is `rowHref` (SortableTable link-wraps the whole row);
+    // an inline <Link> here would nest an <a> inside its <a>.
+    render: (r) => (
+      <span className="inline-flex items-center gap-2">
+        {r.codename && <CrewChip crew={parseCodename(r.codename).crew} derived={r.codename_derived} />}
+        <span className="text-sm font-medium text-ink">{r.name}</span>
       </span>
     ),
   },

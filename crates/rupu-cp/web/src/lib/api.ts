@@ -809,6 +809,45 @@ export interface AgentiflowDetail {
   lead_transcripts: AgentiflowLeadTranscript[];
 }
 
+/** One board message — a fire-and-forget post the fleet writes to itself. */
+export interface AgentiflowBoardPost {
+  kind?: string;
+  author?: string;
+  addressed_to?: string | null;
+  ts?: string;
+  body?: string;
+  [k: string]: unknown;
+}
+
+/** `GET /api/agentiflows/:id/messages` — the engagement's board (how the
+ *  agents talk to each other). */
+export interface AgentiflowMessages {
+  posts: AgentiflowBoardPost[];
+  directives: AgentiflowBoardPost[];
+}
+
+/** One asset from `GET /api/assets` — a node in an engagement's asset graph
+ *  (a host, a service, a site, a route, a file …), profile-namespaced. */
+export interface AssetRow {
+  id: string;
+  ws_id: string;
+  project: string;
+  target_id: string;
+  /** Full kind, e.g. `network:service`. */
+  kind: string;
+  /** Owning profile (`network`). */
+  profile: string;
+  /** Bare kind (`service`). */
+  sub_kind: string;
+  /** Parent asset id (a service's host), when in the graph. */
+  parent?: string;
+  label: string;
+  /** Coverage-depth rung reached (`enumerated`, `tested`, …). */
+  depth?: string;
+  /** Flattened locator coordinates: `{host, port, proto, url, path, …}`. */
+  coords: Record<string, unknown>;
+}
+
 /**
  * One raw autoflow-cycle event, as embedded in `AutoflowPriorCycle.events`.
  * Mirrors `rupu_runtime::autoflow_history::AutoflowCycleEvent`'s serde shape
@@ -2815,6 +2854,22 @@ export const api = {
   /** One agentiflow run: record, definition snapshot, events, units, lead transcripts. */
   getAgentiflow(id: string, opts?: Cancellable): Promise<AgentiflowDetail> {
     return request<AgentiflowDetail>(`/api/agentiflows/${encodeURIComponent(id)}`, { signal: opts?.signal });
+  },
+
+  /** The engagement's board — the messages the fleet posts to each other. */
+  getAgentiflowMessages(id: string, opts?: Cancellable): Promise<AgentiflowMessages> {
+    return request<AgentiflowMessages>(`/api/agentiflows/${encodeURIComponent(id)}/messages`, { signal: opts?.signal });
+  },
+
+  /** Engagement assets (hosts/services/sites/routes/files). Optionally scoped
+   *  to one workspace / coverage target. */
+  async getAssets(opts?: { ws_id?: string; target?: string } & Cancellable): Promise<AssetRow[]> {
+    const q = new URLSearchParams();
+    if (opts?.ws_id) q.set('ws_id', opts.ws_id);
+    if (opts?.target) q.set('target', opts.target);
+    const qs = q.toString();
+    const res = await request<{ assets: AssetRow[] }>(`/api/assets${qs ? `?${qs}` : ''}`, { signal: opts?.signal });
+    return res.assets;
   },
   /** Active autoflow claims — leased issues the worker is (or was) driving. */
   getAutoflowClaims(): Promise<AutoflowClaim[]> {

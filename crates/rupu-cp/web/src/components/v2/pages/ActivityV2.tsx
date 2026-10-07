@@ -7,7 +7,6 @@ import { Composite } from './Composite';
 const AgentRuns = lazy(() => import('../../../pages/runs/AgentRuns'));
 const WorkflowRuns = lazy(() => import('../../../pages/runs/WorkflowRuns'));
 const AutoflowRuns = lazy(() => import('../../../pages/runs/AutoflowRuns'));
-const AgentiflowRuns = lazy(() => import('../../../pages/runs/AgentiflowRuns'));
 const Sessions = lazy(() => import('../../../pages/Sessions'));
 
 export default function ActivityV2() {
@@ -19,7 +18,6 @@ export default function ActivityV2() {
         { value: 'agents', label: 'agents', element: <AgentRuns /> },
         { value: 'workflows', label: 'workflows', element: <WorkflowRuns /> },
         { value: 'autoflows', label: 'autoflows', element: <AutoflowRuns /> },
-        { value: 'agentiflows', label: 'agentiflows', element: <AgentiflowRuns /> },
         { value: 'sessions', label: 'sessions', element: <Sessions /> },
       ]}
     />

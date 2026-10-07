@@ -22,7 +22,11 @@ import {
 import { StatusPill } from '../components/StatusPill';
 import { CrewChip } from '../components/codename/CrewChip';
 import { AgentName } from '../components/codename/AgentName';
+import AgentiflowGraph from '../components/agentiflow/AgentiflowGraph';
+import AssetInventory from '../components/agentiflow/AssetInventory';
+import MessageFeed from '../components/agentiflow/MessageFeed';
 import TranscriptPanel from '../components/TranscriptPanel';
+import { Segmented } from '../components/ui/Segmented';
 import { Badge, type BadgeTone } from '../components/ui/Badge';
 import { Button } from '../components/ui/Button';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
@@ -52,7 +56,17 @@ import {
 
 const POLL_MS = 5000;
 
+type AfTab = 'flow' | 'assets' | 'messages' | 'transcript' | 'events';
+const TABS: { value: AfTab; label: string }[] = [
+  { value: 'flow', label: 'Flow' },
+  { value: 'assets', label: 'Assets' },
+  { value: 'messages', label: 'Messages' },
+  { value: 'transcript', label: 'Transcript' },
+  { value: 'events', label: 'Events' },
+];
+
 export default function AgentiflowDetail() {
+  const [tab, setTab] = useState<AfTab>('flow');
   const { id = '' } = useParams<{ id: string }>();
   const [detail, setDetail] = useState<AgentiflowDetailData | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -193,6 +207,7 @@ export default function AgentiflowDetail() {
 
       {error && <ErrorBanner>{error}</ErrorBanner>}
 
+      {/* Always-visible status: goals + budget. */}
       <div className="grid gap-4 lg:grid-cols-2">
         <Panel
           title="Goals"
@@ -251,7 +266,32 @@ export default function AgentiflowDetail() {
         </Panel>
       </div>
 
-      <Panel
+      {/* Profile-aware tabs — the same shape workflow runs + projects use. */}
+      <div className="flex flex-wrap items-center gap-3">
+        <Segmented options={TABS} value={tab} onChange={(v) => setTab(v as AfTab)} ariaLabel="Agentiflow view" />
+        <span className="text-meta text-ink-mute">
+          profile{record.engagement_profiles.length === 1 ? '' : 's'}: {record.engagement_profiles.join(', ') || 'none'}
+        </span>
+      </div>
+
+      {tab === 'flow' && (
+        <>
+          <Panel
+            title="Flow"
+            meta={
+              <span className="text-note tabular-nums text-ink-dim">
+                {record.rounds} {record.rounds === 1 ? 'round' : 'rounds'} · {detail.units.length} units
+              </span>
+            }
+          >
+            {detail.events.length === 0 && detail.units.length === 0 ? (
+              <Muted>Nothing has happened yet.</Muted>
+            ) : (
+              <AgentiflowGraph detail={detail} />
+            )}
+          </Panel>
+
+          <Panel
         title="Fleet"
         meta={<span className="text-note tabular-nums text-ink-dim">{detail.units.length} units</span>}
         flush
@@ -268,7 +308,33 @@ export default function AgentiflowDetail() {
           </ul>
         )}
       </Panel>
+        </>
+      )}
 
+      {tab === 'assets' && (
+        <Panel
+          title="Assets"
+          meta={<span className="text-note text-ink-mute">{record.engagement_profiles.join(', ') || 'engagement'}</span>}
+        >
+          <AssetInventory
+            emptyHint={
+              <>
+                This engagement hasn’t recorded assets yet — a fleet records them with the{' '}
+                <span className="font-mono">asset_mark</span> tool as it discovers hosts, services, sites or routes. They
+                also appear on the <Link to="/assets" className="text-brand-600 hover:underline">Assets</Link> page.
+              </>
+            }
+          />
+        </Panel>
+      )}
+
+      {tab === 'messages' && (
+        <Panel title="Board" meta={<span className="text-meta text-ink-mute">how the fleet talks to itself</span>}>
+          <MessageFeed id={id} live={running} />
+        </Panel>
+      )}
+
+      {tab === 'transcript' && (
       <section>
         <div className="mb-2 flex items-baseline justify-between gap-3">
           <h2 className="text-xs font-semibold uppercase tracking-wide text-ink-dim">Lead transcript</h2>
@@ -291,7 +357,9 @@ export default function AgentiflowDetail() {
           </div>
         )}
       </section>
+      )}
 
+      {tab === 'events' && (
       <Panel
         title="Events"
         meta={<span className="text-note tabular-nums text-ink-dim">{detail.events.length} · newest first</span>}
@@ -309,6 +377,7 @@ export default function AgentiflowDetail() {
           </ul>
         )}
       </Panel>
+      )}
     </div>
   );
 }
@@ -316,7 +385,7 @@ export default function AgentiflowDetail() {
 function BackLink() {
   return (
     <Link
-      to="/activity?tab=agentiflows"
+      to="/runs/agentiflows"
       className="inline-flex items-center gap-1.5 text-xs font-medium text-ink-dim hover:text-ink"
     >
       <ArrowLeft size={14} />
