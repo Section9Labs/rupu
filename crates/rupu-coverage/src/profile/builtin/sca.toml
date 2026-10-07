@@ -29,3 +29,6 @@ satisfied_when = { any = [ { has_classification_system = "CVE" }, { has_classifi
 [coverage]
 enumerates = ["dependency"]
 depth_ladder = ["inventoried", "resolved", "triaged"]
+
+[bundle]
+agents = ["sca-auditor"]

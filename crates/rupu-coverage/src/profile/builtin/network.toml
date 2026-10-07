@@ -37,5 +37,5 @@ enumerates = ["host", "service"]
 depth_ladder = ["discovered", "enumerated", "tested", "exploited"]
 
 [bundle]
-agents = ["recon", "service-analyst", "exploit-verifier"]
+agents = ["assessment-lead", "recon", "service-analyst", "exploit-verifier"]
 workflows = ["network-assessment"]

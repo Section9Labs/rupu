@@ -29,3 +29,6 @@ satisfied_when = { any = [ { has_classification_system = "CIS" }, { has_classifi
 [coverage]
 enumerates = ["account", "resource"]
 depth_ladder = ["inventoried", "policy-evaluated", "validated"]
+
+[bundle]
+agents = ["cloud-auditor"]

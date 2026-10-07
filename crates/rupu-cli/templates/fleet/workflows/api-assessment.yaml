@@ -1,0 +1,24 @@
+name: api-assessment
+description: API security assessment — an API tester maps the authorized API's endpoints and actively tests them for verified vulnerabilities (OWASP API Top 10). Run under the `api` engagement profile so coverage/findings tools are active.
+inputs:
+  scope:
+    type: string
+    required: true
+    description: The authorized in-scope API base URL(s) for this engagement, plus an OpenAPI/Swagger/GraphQL spec path when available. Everything the fleet touches must be inside this scope.
+steps:
+  - id: assess
+    agent: api-tester
+    actions: []
+    prompt: |
+      Map and then actively test the authorized API:
+
+      {{ inputs.scope }}
+
+      First enumerate endpoints (from the provided spec, or by probing),
+      calling `asset_mark` for the service and each endpoint. Then work the
+      OWASP API Top 10 against each endpoint, verify before reporting, and
+      `report_finding` every verified issue (pinned to an endpoint via
+      http_route, with an OWASP-API/CWE classification and a required
+      http_exchange evidence block). Test ONLY endpoints inside the scope
+      above; no destructive actions. Return a per-endpoint summary of what
+      you mapped, tested, and recorded.

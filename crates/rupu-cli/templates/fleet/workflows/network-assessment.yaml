@@ -1,0 +1,47 @@
+name: network-assessment
+description: Network security assessment — recon enumerates the authorized scope, a service analyst actively tests the enumerated services, and an exploit verifier confirms the real exposures. Run under the `network` engagement profile so coverage/findings tools are active.
+inputs:
+  scope:
+    type: string
+    required: true
+    description: The authorized in-scope hosts / CIDR ranges for this engagement (and any range file path). Everything the fleet touches must be inside this scope.
+steps:
+  - id: recon
+    agent: recon
+    actions: []
+    prompt: |
+      Perform network reconnaissance against the authorized scope:
+
+      {{ inputs.scope }}
+
+      Discover live hosts and enumerate open services/versions, calling
+      `asset_mark` for every host and service. Scan ONLY addresses inside the
+      scope above. Return a concise host:port worklist with service/version,
+      flagging anything that already looks interesting.
+  - id: analyze
+    agent: service-analyst
+    actions: []
+    prompt: |
+      Actively test the enumerated services from recon's worklist:
+
+      {{ steps.recon.output }}
+
+      Authorized scope (hard boundary): {{ inputs.scope }}
+
+      Test each service, verify before reporting, and `report_finding` every
+      verified exposure (pinned to host:port, with root_cause, a CVE/CWE
+      classification, and scan_output/http_exchange evidence). No destructive
+      actions. Return a summary of what you tested and recorded.
+  - id: verify
+    agent: exploit-verifier
+    actions: []
+    prompt: |
+      Independently confirm the exposures reported by the analyst:
+
+      {{ steps.analyze.output }}
+
+      Authorized scope (hard boundary): {{ inputs.scope }}
+
+      Reproduce each claimed exposure, capture proof, and record a verdict
+      (confirmed / false positive / needs-preconditions). Non-destructive only.
+      Return a summary of what you confirmed and refuted.

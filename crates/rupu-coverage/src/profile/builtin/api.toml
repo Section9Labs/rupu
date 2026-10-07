@@ -31,5 +31,5 @@ enumerates = ["service", "endpoint"]
 depth_ladder = ["mapped", "tested", "exploited"]
 
 [bundle]
-agents = ["api-tester"]
+agents = ["assessment-lead", "api-tester"]
 workflows = ["api-assessment"]

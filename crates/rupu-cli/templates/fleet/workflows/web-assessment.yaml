@@ -1,0 +1,34 @@
+name: web-assessment
+description: Web application assessment — a crawler maps the authorized site's routes, then an appsec tester actively tests them for verified vulnerabilities. Run under the `web` engagement profile so coverage/findings tools are active.
+inputs:
+  scope:
+    type: string
+    required: true
+    description: The authorized in-scope site(s) / origin(s) for this engagement (and any path inclusions/exclusions). Everything the fleet touches must be inside this scope.
+steps:
+  - id: crawl
+    agent: crawler
+    actions: []
+    prompt: |
+      Map the attack surface of the authorized web application:
+
+      {{ inputs.scope }}
+
+      Enumerate routes, parameters, forms and interesting endpoints, calling
+      `asset_mark` for the site and every route. Crawl ONLY URLs inside the
+      scope above. Return a structured worklist grouped by surface
+      (public / authenticated / admin / API), with method + parameters.
+  - id: test
+    agent: appsec-tester
+    actions: []
+    prompt: |
+      Actively test the routes from the crawler's worklist:
+
+      {{ steps.crawl.output }}
+
+      Authorized scope (hard boundary): {{ inputs.scope }}
+
+      Work the OWASP categories per route, verify before reporting, and
+      `report_finding` every verified issue (pinned to a route, with an
+      OWASP/CWE classification and a required http_exchange evidence block).
+      No destructive actions. Return a per-route summary of what you recorded.
