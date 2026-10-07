@@ -146,6 +146,12 @@ pub struct UnitDispatch {
     /// host as `rupu run --findings-profile` or refuse the launch. `None` ⇒
     /// the host resolves from the agent file's `findingsProfile`, else `full`.
     pub findings_profile: Option<rupu_coverage::FindingProfile>,
+    /// The run's engagement profile ids (`rupu workflow run
+    /// --engagement-profile`, recorded on `RunRecord.engagement_profiles` so
+    /// a resume carries them too) — [`StepFactory::engagement_profiles`].
+    /// The dispatcher must deliver them to the host as `rupu run
+    /// --engagement-profile` or refuse the launch. Empty ⇒ the `code` path.
+    pub engagement_profiles: Vec<String>,
 }
 
 /// The findings profile a remote (`host:` / `distribute:`) unit must run
@@ -7677,6 +7683,7 @@ async fn dispatch_placed_step(
         run_id: run_id.to_string(),
         workspace: prepared,
         findings_profile: remote_unit_findings_profile(step, &opts.workflow.defaults),
+        engagement_profiles: opts.factory.engagement_profiles(),
         codename: codename.map(ToString::to_string),
     };
     announce_placed_agent(
@@ -8753,6 +8760,8 @@ async fn run_fanout_step(
     // Same for every unit of the step (and its retry); `Copy`, so each
     // spawned task gets its own.
     let unit_findings_profile = remote_unit_findings_profile(step, &opts.workflow.defaults);
+    // The run's engagement, shared by every unit (cloned into each task).
+    let unit_engagement_profiles = opts.factory.engagement_profiles();
     let mut handles = Vec::with_capacity(total);
     for (idx, item_value, rendered, run_id, transcript_path) in prepared {
         // Compute host placement for this unit. `None` → local inline path
@@ -8776,6 +8785,7 @@ async fn run_fanout_step(
         let rendered_clone = rendered.clone();
         let run_id_clone = run_id.clone();
         let transcript_clone = transcript_path.clone();
+        let engagement_for_task = unit_engagement_profiles.clone();
         // Per-unit live-view events. Cloned into the task so emission
         // ordering reflects the unit's REAL start/finish under
         // `max_parallel` concurrency (the started/completed pair brackets
@@ -8967,6 +8977,7 @@ async fn run_fanout_step(
                                     run_id: run_id_clone.clone(),
                                     workspace: unit_ws.clone(),
                                     findings_profile: unit_findings_profile,
+                                    engagement_profiles: engagement_for_task.clone(),
                                     codename: unit_codename.as_ref().map(ToString::to_string),
                                 };
                                 announce_placed_agent(
@@ -9072,6 +9083,7 @@ async fn run_fanout_step(
                                             run_id: retry_run_id.clone(),
                                             workspace: unit_ws.clone(),
                                             findings_profile: unit_findings_profile,
+                                            engagement_profiles: engagement_for_task.clone(),
                                             codename: unit_codename
                                                 .as_ref()
                                                 .map(ToString::to_string),

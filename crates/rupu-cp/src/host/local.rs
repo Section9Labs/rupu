@@ -1213,6 +1213,7 @@ mod launch_agent_tests {
                 working_dir: None,
                 run_id: None,
                 findings_profile: Some(rupu_coverage::FindingProfile::Summary),
+                engagement_profiles: Vec::new(),
                 codename: None,
             })
             .await
@@ -1221,6 +1222,44 @@ mod launch_agent_tests {
         assert_eq!(
             capture.0.lock().unwrap().as_ref().unwrap().findings_profile,
             Some(rupu_coverage::FindingProfile::Summary)
+        );
+    }
+
+    /// Same hop for a placed unit's engagement.
+    #[tokio::test]
+    async fn launch_agent_forwards_the_engagement_to_the_launcher() {
+        let tmp = tempfile::tempdir().unwrap();
+        let capture = Arc::new(Capture(Mutex::new(None)));
+        let conn = LocalHostConnector::new(
+            None,
+            Some(capture.clone()),
+            None,
+            None,
+            Arc::new(RunStore::new(tmp.path().join("runs"))),
+            tmp.path().to_path_buf(),
+        );
+        conn.launch_agent(AgentLaunchRequest {
+            agent: "recon".into(),
+            prompt: None,
+            mode: None,
+            target: None,
+            working_dir: None,
+            run_id: None,
+            findings_profile: None,
+            engagement_profiles: vec!["network".into()],
+            codename: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            capture
+                .0
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .engagement_profiles,
+            ["network"]
         );
     }
 }

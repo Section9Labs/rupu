@@ -100,6 +100,15 @@ pub struct RunSpec {
     /// [`CAP_AGENT_FINDINGS_PROFILE`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub findings_profile: Option<rupu_coverage::FindingProfile>,
+    /// Agent runs only: `rupu run --engagement-profile` (one flag per id).
+    /// Absent on the wire when empty, so a job without an engagement is
+    /// byte-identical to before.
+    ///
+    /// Same rule as `findings_profile`: an executor predating this field
+    /// would silently drop it, so a sender must only set it for an executor
+    /// known to honour it — see [`CAP_AGENT_ENGAGEMENT_PROFILE`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub engagement_profiles: Vec<String>,
 }
 
 /// `Hello.capabilities` entry: this node's executor passes
@@ -107,6 +116,13 @@ pub struct RunSpec {
 /// A tunnel that has not seen it refuses a launch that carries a profile
 /// rather than let an older node run the agent under a different one.
 pub const CAP_AGENT_FINDINGS_PROFILE: &str = "agent.findings_profile";
+
+/// `Hello.capabilities` / host feature / bucket marker entry: this
+/// executor passes [`RunSpec::engagement_profiles`] (HTTP: the agent-run
+/// body's `engagement_profiles`) through to `rupu run --engagement-profile`.
+/// A connector refuses a launch that carries an engagement for a peer that
+/// has not advertised it, rather than let the unit run on the `code` path.
+pub const CAP_AGENT_ENGAGEMENT_PROFILE: &str = "agent.engagement_profile";
 
 /// `Welcome.capabilities` entry: this CP mirrors [`ArtifactFile::Coverage`].
 pub const CAP_MIRROR_COVERAGE: &str = "mirror.coverage";
@@ -139,6 +155,7 @@ pub const ARTIFACT_CHUNK_BYTES: usize = 1 << 20;
 pub fn node_capabilities() -> Vec<String> {
     vec![
         CAP_AGENT_FINDINGS_PROFILE.to_string(),
+        CAP_AGENT_ENGAGEMENT_PROFILE.to_string(),
         CAP_FINDINGS_ARTIFACT_PULL.to_string(),
     ]
 }
@@ -164,6 +181,7 @@ pub const CAP_RUN_LIST: &str = "run.list";
 pub fn host_features() -> Vec<String> {
     vec![
         CAP_AGENT_FINDINGS_PROFILE.to_string(),
+        CAP_AGENT_ENGAGEMENT_PROFILE.to_string(),
         CAP_WORKFLOW_RESUME_IF_UNFINISHED.to_string(),
         CAP_RUN_COVERAGE_STREAM.to_string(),
         CAP_FINDINGS_ARTIFACT_BLOB.to_string(),
@@ -202,7 +220,10 @@ impl FeaturesReport {
 /// [`node_capabilities`], so a new tunnel-only capability can never leak in
 /// — a capability missing here fails closed (the CP refuses the feature).
 pub fn bucket_worker_capabilities() -> Vec<String> {
-    vec![CAP_AGENT_FINDINGS_PROFILE.to_string()]
+    vec![
+        CAP_AGENT_FINDINGS_PROFILE.to_string(),
+        CAP_AGENT_ENGAGEMENT_PROFILE.to_string(),
+    ]
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -250,6 +271,7 @@ mod tests {
                 mode: None,
                 target: None,
                 findings_profile: None,
+                engagement_profiles: Vec::new(),
             },
         };
 
@@ -461,11 +483,51 @@ mod tests {
     fn a_bucket_worker_advertises_no_tunnel_only_capability() {
         assert_eq!(
             bucket_worker_capabilities(),
-            vec![CAP_AGENT_FINDINGS_PROFILE.to_string()]
+            vec![
+                CAP_AGENT_FINDINGS_PROFILE.to_string(),
+                CAP_AGENT_ENGAGEMENT_PROFILE.to_string(),
+            ]
         );
         assert!(!bucket_worker_capabilities()
             .iter()
             .any(|c| c == CAP_FINDINGS_ARTIFACT_PULL));
+    }
+
+    #[test]
+    fn every_executor_surface_advertises_engagement_profile_support() {
+        for (surface, caps) in [
+            ("tunnel node", node_capabilities()),
+            ("host features", host_features()),
+            ("bucket worker", bucket_worker_capabilities()),
+        ] {
+            assert!(
+                caps.iter().any(|c| c == CAP_AGENT_ENGAGEMENT_PROFILE),
+                "{surface}: {caps:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_spec_engagement_profiles_are_absent_on_the_wire_when_empty() {
+        let mut spec = RunSpec {
+            kind: RunSpecKind::Agent,
+            name: "recon".into(),
+            inputs: BTreeMap::new(),
+            prompt: None,
+            mode: None,
+            target: None,
+            findings_profile: None,
+            engagement_profiles: Vec::new(),
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(!json.contains("engagement_profiles"), "{json}");
+        spec.engagement_profiles = vec!["network".into(), "web".into()];
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(
+            json.contains(r#""engagement_profiles":["network","web"]"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<RunSpec>(&json).unwrap(), spec);
     }
 
     #[test]

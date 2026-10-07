@@ -29,6 +29,18 @@ pub struct AgentLaunchRequest {
     /// (e.g. a tunnel node too old to advertise support) must refuse the
     /// launch rather than run the agent under a different profile.
     pub findings_profile: Option<rupu_coverage::FindingProfile>,
+    /// Engagement profile ids for this run — `rupu run --engagement-profile`,
+    /// one flag per id; empty = the native `code` path. A placed unit's
+    /// coordinator sets it from the workflow run's selection
+    /// (`rupu workflow run --engagement-profile`); the executing host
+    /// resolves the ids against its own profile registry (built-ins + its
+    /// `<global>/profiles` + the run workspace's `.rupu/profiles`).
+    ///
+    /// Same contract as `findings_profile`: EVERY connector honours it, and
+    /// one that cannot deliver it to the host (a peer that has not
+    /// advertised `agent.engagement_profile`) refuses the launch rather than
+    /// run the agent on the `code` path.
+    pub engagement_profiles: Vec<String>,
     /// Codename minted by a placed unit's coordinator. Forwarded to the
     /// remote `rupu run` as `RUPU_CODENAME` (an env var, so an older remote
     /// binary ignores it instead of rejecting an unknown flag). SSH only this

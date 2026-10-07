@@ -1859,6 +1859,12 @@ impl SshHostConnector {
             a.push("--findings-profile".into());
             a.push(f.as_str().into());
         }
+        // Same for an engagement: an older remote's clap rejects the flag,
+        // never runs the unit on the `code` path.
+        for id in &req.engagement_profiles {
+            a.push("--engagement-profile".into());
+            a.push(id.clone());
+        }
         if let Some(p) = &req.prompt {
             a.push("--prompt".into());
             a.push(p.clone());
@@ -2655,6 +2661,7 @@ impl HostConnector for SshHostConnector {
             mode: req.mode.clone(),
             target: req.target.clone(),
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         };
 
         // Build the remote command BEFORE creating the mirror run: a refused
@@ -2718,6 +2725,7 @@ impl HostConnector for SshHostConnector {
             mode: req.mode.clone(),
             target: req.target.clone(),
             findings_profile: req.findings_profile,
+            engagement_profiles: req.engagement_profiles.clone(),
         };
 
         // Build the remote command BEFORE creating the mirror run — see
@@ -3749,6 +3757,7 @@ mod tests {
             working_dir: None,
             run_id: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
             codename: Some("cobalt-harbor/heron#412".into()),
         };
         let argv = SshHostConnector::agent_argv(&req, "run_1");
@@ -6236,6 +6245,7 @@ mod tests {
             mode: None,
             target: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
@@ -7210,6 +7220,7 @@ mod tests {
             mode: None,
             target: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
@@ -7299,6 +7310,7 @@ mod tests {
                 working_dir: None,
                 run_id: Some(run_id.into()),
                 findings_profile: None,
+                engagement_profiles: Vec::new(),
                 codename: None,
             })
             .await
@@ -7500,6 +7512,7 @@ mod tests {
             mode: None,
             target: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         };
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -7625,6 +7638,7 @@ mod tests {
             mode: None,
             target: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
@@ -7695,6 +7709,7 @@ mod tests {
             mode: None,
             target: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
@@ -7762,6 +7777,7 @@ mod tests {
             mode: None,
             target: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
@@ -7814,6 +7830,7 @@ mod tests {
             mode: None,
             target: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
@@ -7866,6 +7883,7 @@ mod tests {
             mode: None,
             target: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
@@ -8054,6 +8072,7 @@ mod tests {
             mode: None,
             target: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
@@ -8137,6 +8156,7 @@ mod tests {
             mode: None,
             target: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
@@ -8226,6 +8246,7 @@ mod tests {
             mode: None,
             target: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
@@ -8662,6 +8683,7 @@ mod tests {
                     working_dir: None,
                     run_id: None,
                     findings_profile: None,
+                    engagement_profiles: Vec::new(),
                 })
                 .await
                 .expect("launch_agent");
@@ -8960,6 +8982,7 @@ mod tests {
                 working_dir: Some(STAGED_WD.into()),
                 run_id: None,
                 findings_profile: None,
+                engagement_profiles: Vec::new(),
             })
             .await
             .unwrap();
@@ -8995,6 +9018,7 @@ mod tests {
                 working_dir: None,
                 run_id: Some("run_01MINTEDBYCOORD".into()),
                 findings_profile: None,
+                engagement_profiles: Vec::new(),
             })
             .await
             .unwrap();
@@ -9024,6 +9048,7 @@ mod tests {
                 working_dir: None,
                 run_id: Some("run_01PROFILED".into()),
                 findings_profile: Some(rupu_coverage::FindingProfile::Summary),
+                engagement_profiles: Vec::new(),
                 codename: None,
             })
             .await
@@ -9042,6 +9067,34 @@ mod tests {
         assert_eq!(rec.worker_id.as_deref(), Some("host_abc"));
     }
 
+    #[tokio::test]
+    async fn launch_agent_passes_the_engagement_to_the_remote_rupu_run() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn, _run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        conn.launch_agent(crate::agent_launcher::AgentLaunchRequest {
+            agent: "recon".into(),
+            prompt: Some("enumerate".into()),
+            mode: None,
+            target: None,
+            working_dir: None,
+            run_id: Some("run_01ENGAGED".into()),
+            findings_profile: None,
+            engagement_profiles: vec!["network".into(), "web".into()],
+            codename: None,
+        })
+        .await
+        .unwrap();
+        let cmds = fake.commands.lock().unwrap();
+        let launch = cmds
+            .iter()
+            .find(|c| c.contains("'rupu' 'run' 'recon'"))
+            .unwrap_or_else(|| panic!("no agent launch in {cmds:?}"));
+        assert!(
+            launch.contains("'--engagement-profile' 'network' '--engagement-profile' 'web'"),
+            "the remote `rupu run` must carry the engagement: {launch}"
+        );
+    }
+
     #[test]
     fn agent_argv_without_a_profile_omits_the_flag() {
         let req = crate::agent_launcher::AgentLaunchRequest {
@@ -9052,10 +9105,15 @@ mod tests {
             working_dir: None,
             run_id: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
             codename: None,
         };
         let argv = SshHostConnector::agent_argv(&req, "run_X");
         assert!(!argv.iter().any(|a| a == "--findings-profile"), "{argv:?}");
+        assert!(
+            !argv.iter().any(|a| a == "--engagement-profile"),
+            "{argv:?}"
+        );
     }
 
     #[tokio::test]
@@ -9072,6 +9130,7 @@ mod tests {
                 working_dir: None,
                 run_id: Some("../evil".into()),
                 findings_profile: None,
+                engagement_profiles: Vec::new(),
             })
             .await
             .unwrap_err();
@@ -9348,6 +9407,7 @@ mod tests {
             mode: None,
             target: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         }
     }
 
@@ -9360,6 +9420,7 @@ mod tests {
             mode: None,
             target: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         }
     }
 

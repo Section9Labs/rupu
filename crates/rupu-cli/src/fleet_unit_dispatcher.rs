@@ -345,6 +345,8 @@ impl UnitDispatcher for FleetUnitDispatcher {
                 run_id: Some(unit_run_id.clone()),
                 // Every connector delivers this or refuses the launch.
                 findings_profile: unit.findings_profile,
+                // Likewise: delivered as `--engagement-profile`, or refused.
+                engagement_profiles: unit.engagement_profiles,
             })
             .await
         {
@@ -1189,6 +1191,7 @@ mod tests {
             run_id: "r".to_string(),
             workspace: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
             codename: None,
         }
     }
@@ -2746,6 +2749,22 @@ steps:
             d.dispatch_unit(unit, "h1").await.unwrap();
             let launched = conn.launched.lock().unwrap().clone().expect("launched");
             assert_eq!(launched.findings_profile, profile);
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_passes_the_units_engagement_to_launch_agent() {
+        for ids in [vec!["network".to_string(), "web".to_string()], vec![]] {
+            let conn = Arc::new(FakeConnector::completed());
+            let d = FleetUnitDispatcher::from_connector(
+                Arc::clone(&conn) as Arc<dyn HostConnector>,
+                PathBuf::from("/g"),
+            );
+            let mut unit = make_unit();
+            unit.engagement_profiles = ids.clone();
+            d.dispatch_unit(unit, "h1").await.unwrap();
+            let launched = conn.launched.lock().unwrap().clone().expect("launched");
+            assert_eq!(launched.engagement_profiles, ids);
         }
     }
 

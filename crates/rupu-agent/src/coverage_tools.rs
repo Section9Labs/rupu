@@ -539,20 +539,7 @@ fn summary_schema() -> Value {
                     }
                 }
             },
-            "asset": {
-                "type": "object",
-                "required": ["kind"],
-                "description": "The engagement asset this finding is about (only under an active engagement profile). Its `kind` routes the finding to the owning profile for completeness validation and stamps it into the asset graph. Omit on a plain code run.",
-                "properties": {
-                    "kind": { "type": "string", "description": "Profile-namespaced asset kind, e.g. \"network:service\", \"binary:function\", \"web:route\"." },
-                    "coordinates": {
-                        "type": "array",
-                        "description": "Locator coordinates pinning the asset, each {\"t\": <tag>, \"v\": <value>}. Tags: host, port, url, path, line_range, symbol, sha256, address, offset, commit, http_route, param, resource_id.",
-                        "items": { "type": "object" }
-                    },
-                    "label": { "type": "string", "description": "Optional human label; if omitted, the asset keeps its existing label (a new asset is labelled with its kind)." }
-                }
-            }
+            "asset": rupu_coverage::asset_schema_property()
         }
     })
 }

@@ -55,6 +55,25 @@ pub struct AssetRef {
     pub label: Option<String>,
 }
 
+/// The `asset` property `report_finding` and `findings.record` advertise —
+/// one schema for both, as both write through [`report_finding`].
+pub fn asset_schema_property() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "required": ["kind"],
+        "description": "The engagement asset this finding is about (only under an active engagement profile). Its `kind` routes the finding to the owning profile for completeness validation and stamps it into the asset graph. Omit on a plain code run.",
+        "properties": {
+            "kind": { "type": "string", "description": "Profile-namespaced asset kind, e.g. \"network:service\", \"binary:function\", \"web:route\"." },
+            "coordinates": {
+                "type": "array",
+                "description": "Locator coordinates pinning the asset, each {\"t\": <tag>, \"v\": <value>}. Tags: host, port, url, path, line_range, symbol, sha256, address, offset, commit, http_route, param, resource_id.",
+                "items": { "type": "object" }
+            },
+            "label": { "type": "string", "description": "Optional human label; if omitted, the asset keeps its existing label (a new asset is labelled with its kind)." }
+        }
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReportFindingOutput {
     pub id: String,

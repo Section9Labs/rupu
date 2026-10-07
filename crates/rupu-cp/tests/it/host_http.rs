@@ -198,15 +198,18 @@ async fn http_archive_restore_delete_session_round_trip() {
     let server = httpmock::MockServer::start_async().await;
     let archive_mock = server.mock(|when, then| {
         when.method("POST").path("/api/sessions/sess_a/archive");
-        then.status(200).json_body(serde_json::json!({"ok": true, "id": "sess_a"}));
+        then.status(200)
+            .json_body(serde_json::json!({"ok": true, "id": "sess_a"}));
     });
     let restore_mock = server.mock(|when, then| {
         when.method("POST").path("/api/sessions/sess_a/restore");
-        then.status(200).json_body(serde_json::json!({"ok": true, "id": "sess_a"}));
+        then.status(200)
+            .json_body(serde_json::json!({"ok": true, "id": "sess_a"}));
     });
     let delete_mock = server.mock(|when, then| {
         when.method("DELETE").path("/api/sessions/sess_a");
-        then.status(200).json_body(serde_json::json!({"ok": true, "id": "sess_a"}));
+        then.status(200)
+            .json_body(serde_json::json!({"ok": true, "id": "sess_a"}));
     });
     let c = HttpHostConnector::new(server.base_url(), None);
     c.archive_session("sess_a").await.unwrap();
@@ -222,11 +225,13 @@ async fn http_archive_delete_transcript_round_trip() {
     let server = httpmock::MockServer::start_async().await;
     let archive_mock = server.mock(|when, then| {
         when.method("POST").path("/api/transcripts/run_a/archive");
-        then.status(200).json_body(serde_json::json!({"ok": true, "id": "run_a"}));
+        then.status(200)
+            .json_body(serde_json::json!({"ok": true, "id": "run_a"}));
     });
     let delete_mock = server.mock(|when, then| {
         when.method("DELETE").path("/api/transcripts/run_a");
-        then.status(200).json_body(serde_json::json!({"ok": true, "id": "run_a"}));
+        then.status(200)
+            .json_body(serde_json::json!({"ok": true, "id": "run_a"}));
     });
     let c = HttpHostConnector::new(server.base_url(), None);
     c.archive_transcript("run_a", false).await.unwrap();
@@ -244,13 +249,15 @@ async fn http_archive_delete_transcript_ignore_liveness_query_param() {
         when.method("POST")
             .path("/api/transcripts/run_b/archive")
             .query_param("ignore_liveness", "true");
-        then.status(200).json_body(serde_json::json!({"ok": true, "id": "run_b"}));
+        then.status(200)
+            .json_body(serde_json::json!({"ok": true, "id": "run_b"}));
     });
     let delete_mock = server.mock(|when, then| {
         when.method("DELETE")
             .path("/api/transcripts/run_b")
             .query_param("ignore_liveness", "true");
-        then.status(200).json_body(serde_json::json!({"ok": true, "id": "run_b"}));
+        then.status(200)
+            .json_body(serde_json::json!({"ok": true, "id": "run_b"}));
     });
     let c = HttpHostConnector::new(server.base_url(), None);
     c.archive_transcript("run_b", true).await.unwrap();
@@ -634,6 +641,7 @@ fn profiled_agent_req(
         working_dir: None,
         run_id: None,
         findings_profile: profile,
+        engagement_profiles: Vec::new(),
         codename: None,
     }
 }
@@ -764,6 +772,100 @@ async fn launch_agent_without_a_profile_skips_the_feature_check() {
         "run_X"
     );
     info.assert_hits(0);
+    post.assert();
+}
+
+// ── engagement_profiles over HTTP ─────────────────────────────────────────────
+
+fn engaged_agent_req(ids: &[&str]) -> rupu_cp::agent_launcher::AgentLaunchRequest {
+    let mut req = profiled_agent_req(None);
+    req.engagement_profiles = ids.iter().map(|s| s.to_string()).collect();
+    req
+}
+
+/// End to end against a real remote CP: it advertises
+/// `agent.engagement_profile`, takes the ids off the body and hands them to
+/// its own agent launcher (which puts them on the `rupu run` argv).
+#[tokio::test]
+async fn launch_agent_delivers_the_engagement_to_a_real_remote_cp() {
+    let tmp = tempfile::tempdir().unwrap();
+    let launcher = std::sync::Arc::new(CapturingAgentLauncher {
+        last: std::sync::Mutex::new(None),
+    });
+    let state = rupu_cp::state::AppState::new(
+        tmp.path().to_path_buf(),
+        rupu_config::PricingConfig::default(),
+    )
+    .with_agent_launcher(Some(launcher.clone()));
+    let addr = serve_cp(state).await;
+
+    let c = HttpHostConnector::new(format!("http://{addr}"), None);
+    let id = c
+        .launch_agent(engaged_agent_req(&["network", "web"]))
+        .await
+        .unwrap();
+    assert_eq!(id, "run_REMOTE");
+    let got = launcher
+        .last
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("remote launched");
+    assert_eq!(got.engagement_profiles, ["network", "web"]);
+}
+
+/// A remote predating the field would ignore the body key and run the unit on
+/// the `code` path, so the connector refuses one that does not advertise it —
+/// even when it advertises the findings-profile feature.
+#[tokio::test]
+async fn launch_agent_refuses_an_engagement_the_remote_does_not_advertise() {
+    let server = httpmock::MockServer::start_async().await;
+    server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(200).json_body(serde_json::json!({
+            "version": "0.81.0",
+            "capabilities": {"backends": [], "scm_hosts": [], "permission_modes": []},
+            "features": ["agent.findings_profile"]
+        }));
+    });
+    let post = server.mock(|when, then| {
+        when.method("POST").path("/api/agents/sec/run");
+        then.status(200)
+            .json_body(serde_json::json!({"run_id": "run_X"}));
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    let err = c
+        .launch_agent(engaged_agent_req(&["network"]))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, HostConnectorError::Unsupported(m) if m.contains("0.81.0") && m.contains("`network`")),
+        "{err:?}"
+    );
+    post.assert_hits(0);
+}
+
+/// No engagement ⇒ the body carries no `engagement_profiles` key at all, so
+/// an older remote sees exactly the request it always did.
+#[tokio::test]
+async fn launch_agent_without_an_engagement_posts_no_engagement_key() {
+    let server = httpmock::MockServer::start_async().await;
+    let post = server.mock(|when, then| {
+        when.method("POST")
+            .path("/api/agents/sec/run")
+            .matches(|req| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(req.body.as_deref().unwrap_or_default()).unwrap();
+                body.get("engagement_profiles").is_none()
+            });
+        then.status(200)
+            .json_body(serde_json::json!({"run_id": "run_X"}));
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    assert_eq!(
+        c.launch_agent(profiled_agent_req(None)).await.unwrap(),
+        "run_X"
+    );
     post.assert();
 }
 

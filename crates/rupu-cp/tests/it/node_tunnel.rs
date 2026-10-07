@@ -234,6 +234,7 @@ async fn mirror_create_append_finish_round_trip() {
         mode: None,
         target: None,
         findings_profile: None,
+        engagement_profiles: Vec::new(),
     };
 
     let run_id = "run_NODEMIRRTEST001";
@@ -310,6 +311,7 @@ async fn mirror_usage_lines_land_in_the_run_usage_ledger() {
 
     let spec = RunSpec {
         findings_profile: None,
+        engagement_profiles: Vec::new(),
         kind: RunSpecKind::Workflow,
         name: "smoke-workflow".to_string(),
         inputs: BTreeMap::new(),
@@ -374,6 +376,7 @@ async fn mirror_replace_usage_ledger_swaps_the_file_atomically() {
     let mirror = NodeMirror::new(Arc::clone(&store));
     let spec = RunSpec {
         findings_profile: None,
+        engagement_profiles: Vec::new(),
         kind: RunSpecKind::Workflow,
         name: "smoke-workflow".to_string(),
         inputs: BTreeMap::new(),
@@ -468,6 +471,7 @@ async fn mirror_replace_usage_ledger_failure_removes_the_temp_file() {
     let mirror = NodeMirror::new(Arc::clone(&store));
     let spec = RunSpec {
         findings_profile: None,
+        engagement_profiles: Vec::new(),
         kind: RunSpecKind::Workflow,
         name: "smoke-workflow".to_string(),
         inputs: BTreeMap::new(),
@@ -530,6 +534,7 @@ async fn mirror_run_json_repins_cp_local_paths() {
         mode: None,
         target: None,
         findings_profile: None,
+        engagement_profiles: Vec::new(),
     };
 
     let run_id = "run_REPINTEST001";
@@ -633,6 +638,7 @@ async fn mirror_run_json_nulls_resume_fields() {
         mode: None,
         target: None,
         findings_profile: None,
+        engagement_profiles: Vec::new(),
     };
 
     let run_id = "run_RESUMENULLTEST01";
@@ -709,6 +715,7 @@ async fn mirror_run_json_preserves_final_output() {
         mode: None,
         target: None,
         findings_profile: None,
+        engagement_profiles: Vec::new(),
     };
 
     let run_id = "run_FINALOUTPUTTEST1";
@@ -811,6 +818,7 @@ async fn mirror_traversal_run_id_rejected_before_io() {
         mode: None,
         target: None,
         findings_profile: None,
+        engagement_profiles: Vec::new(),
     };
     for bad in &[
         "run_../escape",
@@ -855,6 +863,7 @@ async fn mirror_wrong_node_id_rejected() {
         mode: None,
         target: None,
         findings_profile: None,
+        engagement_profiles: Vec::new(),
     };
 
     // Run created by owner_node.
@@ -922,6 +931,7 @@ async fn mirror_legitimate_owner_can_append_and_finish() {
         mode: None,
         target: None,
         findings_profile: None,
+        engagement_profiles: Vec::new(),
     };
 
     mirror
@@ -1432,6 +1442,7 @@ mod tunnel_connector {
             mode: None,
             target: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         }
     }
 
@@ -1455,6 +1466,7 @@ mod tunnel_connector {
             working_dir: None,
             run_id: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
         }
     }
 
@@ -1899,6 +1911,55 @@ mod tunnel_connector {
             .await
             .expect("launch_agent");
         assert!(matches!(rx.recv().await, Some(Frame::Run { .. })));
+    }
+
+    /// A placed unit's engagement reaches the node in the Run frame.
+    #[tokio::test]
+    async fn launch_agent_carries_the_engagement_to_a_capable_node() {
+        let dir = tempdir().unwrap();
+        let (conn, mut rx, _run_store, _node_conn) = setup_with_capabilities(
+            "node-ep-1",
+            dir.path(),
+            rupu_cp::node::protocol::node_capabilities(),
+        );
+        let mut req = make_agent_req("recon");
+        req.engagement_profiles = vec!["network".into(), "web".into()];
+        let run_id = conn.launch_agent(req).await.expect("launch_agent");
+
+        match rx.recv().await.expect("should receive a frame") {
+            Frame::Run { run_id: fid, spec } => {
+                assert_eq!(fid, run_id);
+                assert_eq!(spec.engagement_profiles, ["network", "web"]);
+            }
+            other => panic!("expected Frame::Run, got {other:?}"),
+        }
+    }
+
+    /// A node that advertises the findings profile but not engagements (a
+    /// build between the two) would drop the ids and run the unit on the
+    /// `code` path — refuse, and leave no mirror run or frame behind.
+    #[tokio::test]
+    async fn launch_agent_refuses_an_engagement_for_a_node_without_the_capability() {
+        let dir = tempdir().unwrap();
+        let (conn, mut rx, run_store, _node_conn) = setup_with_capabilities(
+            "node-ep-old",
+            dir.path(),
+            vec![rupu_cp::node::protocol::CAP_AGENT_FINDINGS_PROFILE.to_string()],
+        );
+        let mut req = make_agent_req("recon");
+        req.engagement_profiles = vec!["network".into()];
+
+        let err = conn.launch_agent(req).await.unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Unsupported(m)
+                if m.contains("node-ep-old") && m.contains("`network`")),
+            "{err:?}"
+        );
+        assert!(
+            run_store.list().unwrap().is_empty(),
+            "no orphaned mirror run"
+        );
+        assert!(rx.try_recv().is_err(), "no frame sent");
     }
 
     // ── pull_finding_artifact ────────────────────────────────────────────────
@@ -3375,6 +3436,7 @@ async fn mirror_transcript_append_finish_synthesizes_agent_step_result() {
         mode: None,
         target: None,
         findings_profile: None,
+        engagement_profiles: Vec::new(),
     };
     let run_id = "run_NODEMIRRTRANS01";
     let node_id = "node-42";
@@ -3453,6 +3515,7 @@ async fn mirror_reset_transcript_makes_replay_idempotent() {
         mode: None,
         target: None,
         findings_profile: None,
+        engagement_profiles: Vec::new(),
     };
     let run_id = "run_NODEMIRRTRANS02";
     let node_id = "node-42";
