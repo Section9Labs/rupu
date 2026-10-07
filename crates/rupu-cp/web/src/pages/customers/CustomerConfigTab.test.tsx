@@ -163,6 +163,27 @@ describe('CustomerConfigTab', () => {
       expect(screen.getByText(/Declared in this customer's layer/)).toBeInTheDocument();
     });
 
+    it('stays quiet for every built-in vendor account name, codex included', async () => {
+      for (const acct of ['codex', 'openai_codex', 'google_gemini', 'github_copilot']) {
+        get.mockResolvedValue(withProvenance(null, acct));
+        const { unmount } = mount();
+        await screen.findByLabelText('Default provider');
+        expect(screen.queryByText(/isn't declared/)).toBeNull();
+        unmount();
+      }
+    });
+
+    it('still says what the kind is when no layer claims it', async () => {
+      const base = withProvenance('global');
+      const provenance = { ...base.provenance };
+      delete provenance['providers.acme-prod.kind'];
+      get.mockResolvedValue(view({ effective: base.effective, provenance }));
+      mount();
+      await screen.findByLabelText('Default provider');
+      expect(screen.getByText(/Declared as/)).toBeInTheDocument();
+      expect(screen.queryByText(/Declared globally/)).toBeNull();
+    });
+
     it('stays quiet for a built-in vendor account, whose name is the vendor', async () => {
       get.mockResolvedValue(withProvenance(null, 'anthropic'));
       mount();

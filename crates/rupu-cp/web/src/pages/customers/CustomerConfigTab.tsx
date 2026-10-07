@@ -68,9 +68,20 @@ function layerSetsScmRules(view: ConfigView): boolean {
   );
 }
 
-/** Provider accounts whose name IS the vendor (no `kind` needed) —
- *  `RESERVED_PROVIDER_NAMES`'s model providers in `rupu-config`. */
-const BUILTIN_VENDORS = new Set(['anthropic', 'openai', 'gemini', 'copilot', 'local']);
+/** Provider accounts whose name IS the vendor (no `kind` needed). Mirrors
+ *  `is_builtin_provider` in `crates/rupu-runtime/src/provider_factory.rs` — the
+ *  source of truth; keep the two in lockstep. */
+const BUILTIN_VENDORS = new Set([
+  'anthropic',
+  'openai',
+  'openai_codex',
+  'codex',
+  'gemini',
+  'google_gemini',
+  'copilot',
+  'github_copilot',
+  'local',
+]);
 
 export default function CustomerConfigTab({ slug, name, projectCount, layerPath, onChanged }: CustomerConfigTabProps) {
   const [view, setView] = useState<ConfigView | null>(null);
@@ -273,7 +284,14 @@ export default function CustomerConfigTab({ slug, name, projectCount, layerPath,
         }
         // Where the account's table was actually declared, not assumed.
         const source = view.provenance[kindKey]?.source;
-        if (source === undefined) return null;
+        if (source === undefined) {
+          // The kind is set but no layer claims it: say what it is, never claim where.
+          return (
+            <p className="mt-1.5 text-note text-ink-mute">
+              Declared as <code className="font-mono text-ink">{kind}</code>
+            </p>
+          );
+        }
         if (source === 'global') {
           return (
             <p className="mt-1.5 text-note text-ink-mute">
