@@ -35,3 +35,6 @@ satisfied_when = { has_classification_system = "CWE" }
 [coverage]
 enumerates = ["binary", "function"]
 depth_ladder = ["located", "disassembled", "analyzed"]
+
+[bundle]
+agents = ["binary-analyst"]

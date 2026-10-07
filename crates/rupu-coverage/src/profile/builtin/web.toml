@@ -37,5 +37,5 @@ enumerates = ["site", "route"]
 depth_ladder = ["mapped", "crawled", "tested", "exploited"]
 
 [bundle]
-agents = ["crawler", "appsec-tester"]
+agents = ["assessment-lead", "crawler", "appsec-tester"]
 workflows = ["web-assessment"]

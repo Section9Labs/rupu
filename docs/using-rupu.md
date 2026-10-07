@@ -150,6 +150,34 @@ poll_sources = [
 
 `poll_interval` affects only source cadence. Workflow matching stays the same.
 
+### 5. Install the stock security fleet (for security engagements)
+
+```sh
+rupu fleet install
+```
+
+This materializes the **stock security-assessment fleet** — the generic,
+scope-parameterized agents and workflows the built-in engagement profiles name
+in their `[bundle]` — into the global `~/.rupu/agents` and `~/.rupu/workflows`,
+so any engagement (in any project) has a ready fleet to draw on without
+hand-authoring an agent per engagement. It ships, for example:
+
+- `network` → `recon`, `service-analyst`, `exploit-verifier` + the
+  `network-assessment` workflow
+- `web` → `crawler`, `appsec-tester` + `web-assessment`
+- `api` → `api-tester` + `api-assessment`
+- `code` / `sca` / `secrets` / `iac` / `binary` / `firmware` / `cloud` /
+  `container` / `mobile` / `threat-model` / `redteam` → one specialist agent each
+- a generic `assessment-lead` that orchestrates a fleet for agentiflow mode
+
+See `rupu fleet list` for the full set. Existing files are kept (your edits
+win); pass `--force` to re-seed them, or `--project` to install into the
+current project's `.rupu/` instead of the global root. The agents request the
+full tool set (`tools: ["*"]`, plus the coverage/findings tools) and run in
+`bypass` mode; each reads its authorized scope from the task prompt / engagement
+scope and stays strictly inside it, so they are generic — point them at a target
+by giving them scope, not by editing the agent.
+
 ---
 
 ## Day-to-day commands

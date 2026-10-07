@@ -19,6 +19,7 @@ pub mod customer;
 pub mod dispatch;
 pub mod editor;
 pub mod features_helper;
+pub mod fleet;
 pub mod findings;
 pub mod findings_helper;
 pub mod host;

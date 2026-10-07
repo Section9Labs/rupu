@@ -18,3 +18,6 @@ satisfied_when = { any = [ { locator_has_coordinate = "sha256" }, { locator_has_
 [coverage]
 enumerates = ["package"]
 depth_ladder = ["unpacked", "static", "dynamic"]
+
+[bundle]
+agents = ["mobile-analyst"]

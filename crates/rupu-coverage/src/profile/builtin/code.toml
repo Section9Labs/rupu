@@ -35,3 +35,6 @@ satisfied_when = { has_field = "root_cause" }
 [coverage]
 enumerates = ["file"]
 depth_ladder = ["unreviewed", "reviewed"]
+
+[bundle]
+agents = ["code-auditor"]

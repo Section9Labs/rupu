@@ -29,3 +29,6 @@ satisfied_when = { has_field = "description" }
 [coverage]
 enumerates = ["host", "objective"]
 depth_ladder = ["planned", "executed", "validated"]
+
+[bundle]
+agents = ["assessment-lead", "redteam-operator"]

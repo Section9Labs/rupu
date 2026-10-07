@@ -29,3 +29,6 @@ satisfied_when = { has_classification_system = "STRIDE" }
 [coverage]
 enumerates = ["component"]
 depth_ladder = ["modeled", "reviewed"]
+
+[bundle]
+agents = ["threat-modeler"]

@@ -190,6 +190,12 @@ pub enum Cmd {
         #[command(subcommand)]
         action: cmd::coverage::Action,
     },
+    /// Install the stock security-assessment fleet (the generic agents +
+    /// workflows the built-in engagement profiles name) into `~/.rupu`.
+    Fleet {
+        #[command(subcommand)]
+        action: cmd::fleet::Action,
+    },
     /// Finding reports: the embedded report schema, and report exports.
     Findings {
         #[command(subcommand)]
@@ -458,6 +464,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Init(args) => cmd::init::handle(args).await,
         Cmd::Mcp { action } => cmd::mcp::handle(action).await,
         Cmd::Coverage { action } => cmd::coverage::handle(action, cli.format).await,
+        Cmd::Fleet { action } => cmd::fleet::handle(action).await,
         Cmd::Findings { action } => cmd::findings::handle(action, cli.format).await,
         Cmd::Cron { action } => {
             cmd::cron::handle(action, cli.format, cli.absolute, cli.all_columns).await
@@ -531,6 +538,11 @@ fn ensure_output_format_supported(
             &[output::formats::OutputFormat::Table],
         ),
         Cmd::Coverage { action } => cmd::coverage::ensure_output_format(action, format),
+        Cmd::Fleet { .. } => output::formats::ensure_supported(
+            "fleet",
+            format,
+            &[output::formats::OutputFormat::Table],
+        ),
         Cmd::Findings { action } => cmd::findings::ensure_output_format(action, format),
         Cmd::Cron { action } => cmd::cron::ensure_output_format(action, format),
         Cmd::Webhook { .. } => output::formats::ensure_supported(

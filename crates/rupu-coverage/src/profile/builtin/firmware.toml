@@ -41,3 +41,6 @@ satisfied_when = { has_classification_system = "CWE" }
 [coverage]
 enumerates = ["image", "partition", "file", "function"]
 depth_ladder = ["acquired", "extracted", "unpacked", "analyzed"]
+
+[bundle]
+agents = ["firmware-analyst"]

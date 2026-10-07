@@ -147,6 +147,112 @@ pub const MANIFEST: &[Template] = &[
     },
 ];
 
+/// The stock security-assessment fleet shipped by `rupu fleet install`.
+///
+/// Unlike [`MANIFEST`] (project dev/code samples, materialized into a
+/// project's `.rupu/`), the fleet is the generic agents + workflows the
+/// built-in engagement profiles name in their `[bundle]`. It is installed
+/// into the GLOBAL rupu root (`~/.rupu`), so any engagement — in any
+/// project — can draw on it without per-engagement hand-authoring.
+///
+/// `target_relpath` here is therefore relative to the GLOBAL root
+/// (`agents/<name>.md`, `workflows/<id>.yaml`), NOT `.rupu/`-prefixed, so
+/// it lands exactly where `rupu_agent::load_agents` /
+/// `rupu_orchestrator::list_workflow_summaries` read it. The on-disk
+/// source lives under `crates/rupu-cli/templates/fleet/<target_relpath>`.
+///
+/// Adding a fleet member is the same two steps as [`MANIFEST`]: drop the
+/// file under `templates/fleet/<dir>/<name>` and add a line here.
+/// `init_manifest_in_sync.rs` enforces both directions, and
+/// `fleet_bundle_coverage.rs` enforces that every built-in profile's
+/// `[bundle]` names a fleet member that exists here.
+pub const FLEET_MANIFEST: &[Template] = &[
+    Template {
+        target_relpath: "agents/assessment-lead.md",
+        content: include_str!("../templates/fleet/agents/assessment-lead.md"),
+    },
+    Template {
+        target_relpath: "agents/recon.md",
+        content: include_str!("../templates/fleet/agents/recon.md"),
+    },
+    Template {
+        target_relpath: "agents/service-analyst.md",
+        content: include_str!("../templates/fleet/agents/service-analyst.md"),
+    },
+    Template {
+        target_relpath: "agents/exploit-verifier.md",
+        content: include_str!("../templates/fleet/agents/exploit-verifier.md"),
+    },
+    Template {
+        target_relpath: "agents/crawler.md",
+        content: include_str!("../templates/fleet/agents/crawler.md"),
+    },
+    Template {
+        target_relpath: "agents/appsec-tester.md",
+        content: include_str!("../templates/fleet/agents/appsec-tester.md"),
+    },
+    Template {
+        target_relpath: "agents/api-tester.md",
+        content: include_str!("../templates/fleet/agents/api-tester.md"),
+    },
+    Template {
+        target_relpath: "agents/code-auditor.md",
+        content: include_str!("../templates/fleet/agents/code-auditor.md"),
+    },
+    Template {
+        target_relpath: "agents/sca-auditor.md",
+        content: include_str!("../templates/fleet/agents/sca-auditor.md"),
+    },
+    Template {
+        target_relpath: "agents/secret-scanner.md",
+        content: include_str!("../templates/fleet/agents/secret-scanner.md"),
+    },
+    Template {
+        target_relpath: "agents/iac-reviewer.md",
+        content: include_str!("../templates/fleet/agents/iac-reviewer.md"),
+    },
+    Template {
+        target_relpath: "agents/binary-analyst.md",
+        content: include_str!("../templates/fleet/agents/binary-analyst.md"),
+    },
+    Template {
+        target_relpath: "agents/firmware-analyst.md",
+        content: include_str!("../templates/fleet/agents/firmware-analyst.md"),
+    },
+    Template {
+        target_relpath: "agents/cloud-auditor.md",
+        content: include_str!("../templates/fleet/agents/cloud-auditor.md"),
+    },
+    Template {
+        target_relpath: "agents/container-scanner.md",
+        content: include_str!("../templates/fleet/agents/container-scanner.md"),
+    },
+    Template {
+        target_relpath: "agents/threat-modeler.md",
+        content: include_str!("../templates/fleet/agents/threat-modeler.md"),
+    },
+    Template {
+        target_relpath: "agents/mobile-analyst.md",
+        content: include_str!("../templates/fleet/agents/mobile-analyst.md"),
+    },
+    Template {
+        target_relpath: "agents/redteam-operator.md",
+        content: include_str!("../templates/fleet/agents/redteam-operator.md"),
+    },
+    Template {
+        target_relpath: "workflows/network-assessment.yaml",
+        content: include_str!("../templates/fleet/workflows/network-assessment.yaml"),
+    },
+    Template {
+        target_relpath: "workflows/web-assessment.yaml",
+        content: include_str!("../templates/fleet/workflows/web-assessment.yaml"),
+    },
+    Template {
+        target_relpath: "workflows/api-assessment.yaml",
+        content: include_str!("../templates/fleet/workflows/api-assessment.yaml"),
+    },
+];
+
 /// Skeleton config.toml content. Created on every `rupu init`.
 pub const CONFIG_SKELETON: &str = r#"# rupu project config — see https://github.com/Section9Labs/rupu/blob/main/docs/providers.md
 

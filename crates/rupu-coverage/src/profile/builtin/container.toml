@@ -35,3 +35,6 @@ satisfied_when = { has_classification_system = "CVE" }
 [coverage]
 enumerates = ["package"]
 depth_ladder = ["inventoried", "scanned", "triaged"]
+
+[bundle]
+agents = ["container-scanner"]
