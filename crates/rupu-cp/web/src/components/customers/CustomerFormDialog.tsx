@@ -1,7 +1,7 @@
 // CustomerFormDialog — create / edit a customer. Rendered by its owner only
 // while open (so every opening starts clean); the owner returns focus to its
-// trigger on close. Modal: Escape / Cancel / overlay click close, Tab is
-// trapped, the first field is focused on open.
+// trigger on close. Modal via DialogFrame: Escape / Cancel / overlay click
+// close, Tab is trapped, the first field is focused on open.
 //
 // Closing (Escape, overlay click, Cancel) is ignored while a save is in flight;
 // with unsaved edits it asks "Discard changes?" first (real buttons, inline).
@@ -13,12 +13,13 @@
 // the API's other 400s are shown inline; success reloads the scope's customer
 // list and calls `onSaved`.
 
-import { useEffect, useId, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
+import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
 import { api, apiErrorMessage, ApiError, type CustomerDto, type NewCustomerBody } from '../../lib/api';
 import { useCustomerScope } from '../../lib/customerScope';
 import { Button } from '../ui/Button';
 import { ErrorBanner } from '../ui/ErrorBanner';
 import { CustomerDot } from './CustomerDot';
+import { DialogFrame } from './DialogFrame';
 
 export interface CustomerFormDialogProps {
   mode: 'create' | 'edit';
@@ -51,7 +52,6 @@ function slugProblem(slug: string): string | null {
   return null;
 }
 
-const FOCUSABLE = 'button, input, select, textarea, a[href], [tabindex]:not([tabindex="-1"])';
 const fieldCls =
   'w-full rounded-md border border-border bg-panel px-2.5 py-1.5 text-lead text-ink placeholder:text-ink-mute focus:border-brand-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60 aria-[invalid=true]:border-err';
 const labelCls = 'mb-1 block text-ui font-semibold uppercase tracking-wide text-ink-dim';
@@ -61,8 +61,7 @@ const errCls = 'mt-1 text-note text-err';
 export function CustomerFormDialog({ mode, initial, onSaved, onClose }: CustomerFormDialogProps) {
   const { reload } = useCustomerScope();
   const create = mode === 'create';
-  const titleId = useId();
-  const panelRef = useRef<HTMLDivElement>(null);
+  const fieldId = useId();
   const firstRef = useRef<HTMLInputElement>(null);
 
   const [name, setName] = useState(initial?.name ?? '');
@@ -96,39 +95,9 @@ export function CustomerFormDialog({ mode, initial, onSaved, onClose }: Customer
     if (dirty) setConfirmingDiscard(true);
     else onClose();
   }
-  const requestCloseRef = useRef(requestClose);
-  requestCloseRef.current = requestClose;
-  const confirmingRef = useRef(false);
-  confirmingRef.current = confirmingDiscard;
-  useEffect(() => {
-    function onKey(e: globalThis.KeyboardEvent) {
-      if (e.key !== 'Escape') return;
-      // Escape on the "Discard changes?" prompt means "keep editing".
-      if (confirmingRef.current) setConfirmingDiscard(false);
-      else requestCloseRef.current();
-    }
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, []);
   useEffect(() => {
     if (confirmingDiscard) confirmRef.current?.querySelector('button')?.focus();
   }, [confirmingDiscard]);
-
-  function trapTab(e: KeyboardEvent<HTMLDivElement>) {
-    if (e.key !== 'Tab' || !panelRef.current) return;
-    const stops = Array.from(panelRef.current.querySelectorAll<HTMLElement>(FOCUSABLE)).filter(
-      (el) => !(el as HTMLInputElement).disabled,
-    );
-    if (stops.length === 0) return;
-    const at = stops.indexOf(document.activeElement as HTMLElement);
-    if (e.shiftKey && at <= 0) {
-      e.preventDefault();
-      stops[stops.length - 1].focus();
-    } else if (!e.shiftKey && (at === -1 || at === stops.length - 1)) {
-      e.preventDefault();
-      stops[0].focus();
-    }
-  }
 
   function onName(v: string) {
     setName(v);
@@ -181,32 +150,20 @@ export function CustomerFormDialog({ mode, initial, onSaved, onClose }: Customer
   }
 
   return (
-    <div
-      data-testid="customer-form-overlay"
-      className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/30 p-4 pt-[8vh]"
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget) requestClose();
-      }}
+    <DialogFrame
+      title={create ? 'New customer' : `Edit ${initial?.name ?? 'customer'}`}
+      onRequestClose={requestClose}
+      // Escape on the "Discard changes?" prompt means "keep editing".
+      onEscape={() => (confirmingDiscard ? setConfirmingDiscard(false) : requestClose())}
+      overlayTestId="customer-form-overlay"
     >
-      <div
-        ref={panelRef}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby={titleId}
-        onKeyDown={trapTab}
-        className="w-full max-w-md rounded-xl border border-border bg-panel p-5 shadow-card"
-      >
-        <h2 id={titleId} className="text-base font-semibold text-ink">
-          {create ? 'New customer' : `Edit ${initial?.name ?? 'customer'}`}
-        </h2>
-
         <form onSubmit={onSubmit} className="mt-4 space-y-4" noValidate>
           <div>
-            <label htmlFor={`${titleId}-name`} className={labelCls}>
+            <label htmlFor={`${fieldId}-name`} className={labelCls}>
               Name <span aria-hidden>*</span>
             </label>
             <input
-              id={`${titleId}-name`}
+              id={`${fieldId}-name`}
               ref={firstRef}
               type="text"
               required
@@ -219,11 +176,11 @@ export function CustomerFormDialog({ mode, initial, onSaved, onClose }: Customer
 
           {create && (
             <div>
-              <label htmlFor={`${titleId}-slug`} className={labelCls}>
+              <label htmlFor={`${fieldId}-slug`} className={labelCls}>
                 Slug <span aria-hidden>*</span>
               </label>
               <input
-                id={`${titleId}-slug`}
+                id={`${fieldId}-slug`}
                 type="text"
                 value={slug}
                 onChange={(e) => {
@@ -234,15 +191,15 @@ export function CustomerFormDialog({ mode, initial, onSaved, onClose }: Customer
                 disabled={busy}
                 spellCheck={false}
                 aria-invalid={slugError ? true : undefined}
-                aria-describedby={`${titleId}-slug-msg`}
+                aria-describedby={`${fieldId}-slug-msg`}
                 className={`${fieldCls} font-mono`}
               />
               {slugError ? (
-                <p id={`${titleId}-slug-msg`} className={errCls}>
+                <p id={`${fieldId}-slug-msg`} className={errCls}>
                   {slugError}
                 </p>
               ) : (
-                <p id={`${titleId}-slug-msg`} className={hintCls}>
+                <p id={`${fieldId}-slug-msg`} className={hintCls}>
                   The customer’s permanent id — used in URLs and on the command line.
                 </p>
               )}
@@ -250,11 +207,11 @@ export function CustomerFormDialog({ mode, initial, onSaved, onClose }: Customer
           )}
 
           <div>
-            <label htmlFor={`${titleId}-contact`} className={labelCls}>
+            <label htmlFor={`${fieldId}-contact`} className={labelCls}>
               Contact
             </label>
             <input
-              id={`${titleId}-contact`}
+              id={`${fieldId}-contact`}
               type="text"
               value={contact}
               onChange={(e) => setContact(e.target.value)}
@@ -264,11 +221,11 @@ export function CustomerFormDialog({ mode, initial, onSaved, onClose }: Customer
           </div>
 
           <div>
-            <label htmlFor={`${titleId}-notes`} className={labelCls}>
+            <label htmlFor={`${fieldId}-notes`} className={labelCls}>
               Notes
             </label>
             <textarea
-              id={`${titleId}-notes`}
+              id={`${fieldId}-notes`}
               rows={3}
               value={notes}
               onChange={(e) => setNotes(e.target.value)}
@@ -278,7 +235,7 @@ export function CustomerFormDialog({ mode, initial, onSaved, onClose }: Customer
           </div>
 
           <div>
-            <label htmlFor={`${titleId}-color`} className={labelCls}>
+            <label htmlFor={`${fieldId}-color`} className={labelCls}>
               Color
             </label>
             <div className="flex items-center gap-2">
@@ -298,7 +255,7 @@ export function CustomerFormDialog({ mode, initial, onSaved, onClose }: Customer
                 )}
               </span>
               <input
-                id={`${titleId}-color`}
+                id={`${fieldId}-color`}
                 type="text"
                 value={color}
                 onChange={(e) => {
@@ -342,8 +299,7 @@ export function CustomerFormDialog({ mode, initial, onSaved, onClose }: Customer
             </div>
           )}
         </form>
-      </div>
-    </div>
+    </DialogFrame>
   );
 }
 

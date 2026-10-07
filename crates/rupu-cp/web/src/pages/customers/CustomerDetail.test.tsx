@@ -246,6 +246,14 @@ describe('CustomerDetail tabs', () => {
     }
   });
 
+  it('the Usage tab tiles say their range', async () => {
+    mount('/customers/acme/usage');
+    await screen.findByRole('heading', { level: 1, name: 'Acme Corp' });
+    for (const id of ['usage-cost', 'usage-input', 'usage-output', 'usage-cached']) {
+      expect(tile(id)).toHaveTextContent('· 30d');
+    }
+  });
+
   it('the Config tab names the layer file and its CLI commands', async () => {
     mount('/customers/acme/config');
     await screen.findByRole('heading', { level: 1, name: 'Acme Corp' });
@@ -365,5 +373,46 @@ describe('CustomerDetail delete', () => {
     fireEvent.click(within(dialog).getByRole('button', { name: 'Unassign all and delete' }));
     await waitFor(() => expect(order).toEqual(['delete', 'unassign:a', 'unassign:b', 'delete']));
     await waitFor(() => expect(screen.getByTestId('where')).toHaveTextContent(/^\/customers$/));
+  });
+  it('a part-failed "Unassign all and delete" names what changed and refetches on close', async () => {
+    const conflict = new ApiError(
+      409,
+      'conflict',
+      JSON.stringify({
+        error: '',
+        projects: [
+          { ws_id: 'a', path: '/src/a' },
+          { ws_id: 'b', path: '/src/b' },
+        ],
+      }),
+    );
+    const del = vi.spyOn(api, 'deleteCustomer').mockRejectedValue(conflict);
+    vi.spyOn(api, 'unassignProject').mockImplementation(async (_s, ws) => {
+      if (ws === 'b') throw new ApiError(500, 'boom', JSON.stringify({ error: 'disk full' }));
+    });
+
+    mount();
+    await screen.findByRole('heading', { level: 1, name: 'Acme Corp' });
+    const dialog = openDelete();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Delete' }));
+    await within(dialog).findByText('/src/a');
+    // An empty error string renders no paragraph.
+    expect(dialog.querySelector('p.text-err')).toBeNull();
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Unassign all and delete' }));
+    expect(
+      await within(dialog).findByText('Unassigned /src/a, then failed on /src/b: disk full'),
+    ).toBeInTheDocument();
+    expect(del).toHaveBeenCalledTimes(1);
+    // Only what is left stays listed.
+    expect(within(dialog).queryByText('/src/a')).not.toBeInTheDocument();
+    expect(within(dialog).getByText('/src/b')).toBeInTheDocument();
+
+    const before = getCustomer.mock.calls.length;
+    reload.mockClear();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    await waitFor(() => expect(getCustomer.mock.calls.length).toBeGreaterThan(before));
+    expect(reload).toHaveBeenCalled();
   });
 });

@@ -37,6 +37,7 @@ import {
 import { useCustomerScope } from '../../lib/customerScope';
 import { formatCost, formatTokens } from '../../lib/usage';
 import { relativeTime } from '../../lib/time';
+import { runHref } from '../../lib/runs';
 import { TabBar, TabButton } from '../../components/TabBar';
 import SortableTable, { type Column } from '../../components/lists/SortableTable';
 import { ListCard } from '../../components/lists/ListCard';
@@ -98,15 +99,6 @@ function createdLabel(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
   return d.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
-}
-
-/** The detail link for a run, with `?host=` for a remote one (as WorkflowRuns). */
-function runHref(r: RunListRow): string {
-  const hid = r.host_id;
-  if (hid && hid !== 'local') {
-    return `/runs/${encodeURIComponent(r.id)}?host=${encodeURIComponent(hid)}`;
-  }
-  return `/runs/${encodeURIComponent(r.id)}`;
 }
 
 /** Focus `selector` inside `ref` once a closing dialog has unmounted. */
@@ -420,8 +412,14 @@ export default function CustomerDetail() {
         <DeleteCustomerDialog
           customer={c}
           onDeleted={onDeleted}
-          onClose={() => {
+          onClose={(changed) => {
             setDeleting(false);
+            // Some projects were unassigned before a failure: the page and
+            // the scope's customer list no longer match the server.
+            if (changed) {
+              reload();
+              refetch();
+            }
             setTimeout(() => kebabRef.current?.focus(), 0);
           }}
         />
@@ -522,7 +520,10 @@ function KebabMenu({
 }
 
 /** Confirm, then delete. A 409 (projects still assigned) lists them and
- *  offers "Unassign all and delete" — explicit, never automatic. */
+ *  offers "Unassign all and delete" — explicit, never automatic. If that
+ *  sequence fails part-way, the error names what was already unassigned, the
+ *  list keeps only what is left, and `onClose(true)` tells the page to
+ *  refetch. */
 function DeleteCustomerDialog({
   customer,
   onDeleted,
@@ -530,11 +531,15 @@ function DeleteCustomerDialog({
 }: {
   customer: CustomerDto;
   onDeleted: () => void;
-  onClose: () => void;
+  /** `changed`: some projects were unassigned while the dialog was open. */
+  onClose: (changed: boolean) => void;
 }) {
   const [conflict, setConflict] = useState<CustomerConflict | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const changedRef = useRef(false);
+
+  const close = () => onClose(changedRef.current);
 
   function fail(e: unknown) {
     const c = parseCustomerConflict(e);
@@ -558,27 +563,42 @@ function DeleteCustomerDialog({
     if (!conflict) return;
     setBusy(true);
     setError(null);
-    try {
-      for (const p of conflict.projects) {
-        try {
-          await api.unassignProject(customer.slug, p.ws_id);
-        } catch (e: unknown) {
-          // Already unassigned (404) is what we wanted; anything else stops.
-          if (!(e instanceof ApiError && e.status === 404)) throw e;
+    const done: string[] = [];
+    for (const p of conflict.projects) {
+      try {
+        await api.unassignProject(customer.slug, p.ws_id);
+      } catch (e: unknown) {
+        // Already unassigned (404) is what we wanted; anything else stops.
+        if (!(e instanceof ApiError && e.status === 404)) {
+          setConflict({ ...conflict, projects: conflict.projects.filter((q) => !done.includes(q.path)) });
+          setError(
+            done.length > 0
+              ? `Unassigned ${done.join(', ')}, then failed on ${p.path}: ${apiErrorMessage(e)}`
+              : `Failed to unassign ${p.path}: ${apiErrorMessage(e)}`,
+          );
+          setBusy(false);
+          return;
         }
       }
+      done.push(p.path);
+      changedRef.current = true;
+    }
+    try {
       await api.deleteCustomer(customer.slug);
       onDeleted();
     } catch (e: unknown) {
-      fail(e);
+      const c = parseCustomerConflict(e);
+      if (c) setConflict(c);
+      else setError(`Unassigned ${done.join(', ')}, then the delete failed: ${apiErrorMessage(e)}`);
+      setBusy(false);
     }
   }
 
   return (
-    <DialogFrame title={`Delete ${customer.name}?`} onRequestClose={() => !busy && onClose()}>
+    <DialogFrame title={`Delete ${customer.name}?`} onRequestClose={() => !busy && close()}>
       {conflict ? (
         <div className="mt-3 space-y-3">
-          <p className="text-ui text-err">{conflict.error}</p>
+          {conflict.error && <p className="text-ui text-err">{conflict.error}</p>}
           <p className="text-ui text-ink-dim">
             {conflict.projects.length === 1 ? 'This project is' : 'These projects are'} still assigned
             to {customer.name}. Unassign {conflict.projects.length === 1 ? 'it' : 'them'} first — they
@@ -601,7 +621,7 @@ function DeleteCustomerDialog({
       )}
       {error && <ErrorBanner className="mt-3">{error}</ErrorBanner>}
       <div className="mt-4 flex items-center justify-end gap-2">
-        <Button variant="secondary" onClick={onClose} disabled={busy}>
+        <Button variant="secondary" onClick={close} disabled={busy}>
           Cancel
         </Button>
         {conflict ? (
@@ -883,9 +903,9 @@ function UsageSummaryTab({ detail, rangeLabel }: { detail: CustomerDetailDto; ra
           sub={u.priced ? undefined : 'some models have no price'}
           subTone="warn"
         />
-        <StatTile id="usage-input" label="Input tokens" value={formatTokens(u.input_tokens)} />
-        <StatTile id="usage-output" label="Output tokens" value={formatTokens(u.output_tokens)} />
-        <StatTile id="usage-cached" label="Cached tokens" value={formatTokens(u.cached_tokens)} />
+        <StatTile id="usage-input" label={`Input tokens · ${rangeLabel}`} value={formatTokens(u.input_tokens)} />
+        <StatTile id="usage-output" label={`Output tokens · ${rangeLabel}`} value={formatTokens(u.output_tokens)} />
+        <StatTile id="usage-cached" label={`Cached tokens · ${rangeLabel}`} value={formatTokens(u.cached_tokens)} />
       </div>
       <CostByProject projects={detail.projects} />
     </section>

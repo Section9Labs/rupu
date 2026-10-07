@@ -3,7 +3,8 @@
 // Escape / overlay click ask to close (`onRequestClose` decides), Tab is
 // trapped inside the panel, and the first focusable control is focused on
 // open. The owner renders it only while open and returns focus to its
-// trigger on close.
+// trigger on close. `onEscape` overrides what Escape does (e.g. dismiss an
+// inline "Discard changes?" prompt rather than ask to close again).
 
 import { useEffect, useId, useRef, type KeyboardEvent, type ReactNode } from 'react';
 import { cn } from '../../lib/cn';
@@ -13,23 +14,27 @@ const FOCUSABLE = 'button, input, select, textarea, a[href], [tabindex]:not([tab
 export function DialogFrame({
   title,
   onRequestClose,
+  onEscape,
   children,
   className,
+  overlayTestId,
 }: {
   title: string;
   onRequestClose: () => void;
+  onEscape?: () => void;
   children: ReactNode;
   className?: string;
+  overlayTestId?: string;
 }) {
   const titleId = useId();
   const panelRef = useRef<HTMLDivElement>(null);
-  const closeRef = useRef(onRequestClose);
-  closeRef.current = onRequestClose;
+  const escapeRef = useRef(onEscape ?? onRequestClose);
+  escapeRef.current = onEscape ?? onRequestClose;
 
   useEffect(() => {
     panelRef.current?.querySelector<HTMLElement>(FOCUSABLE)?.focus();
     function onKey(e: globalThis.KeyboardEvent) {
-      if (e.key === 'Escape') closeRef.current();
+      if (e.key === 'Escape') escapeRef.current();
     }
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
@@ -53,6 +58,7 @@ export function DialogFrame({
 
   return (
     <div
+      data-testid={overlayTestId}
       className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/30 p-4 pt-[8vh]"
       onMouseDown={(e) => {
         if (e.target === e.currentTarget) onRequestClose();

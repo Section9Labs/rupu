@@ -42,6 +42,7 @@ import { durationBetween, relativeTime } from '../../lib/time';
 import { formatTokens, formatCost } from '../../lib/usage';
 import { formatDuration } from '../../lib/duration';
 import { shortId } from '../../lib/shortId';
+import { runHref } from '../../lib/runs';
 
 type Tab = 'active' | 'completed' | 'failed';
 /** The lifecycle FilterPills group's value space: the three tabs plus the
@@ -84,15 +85,6 @@ function TriggerChip({ trigger }: { trigger: string }) {
       {trigger}
     </span>
   );
-}
-
-/** Build the detail link for a run, including ?host= for remote runs. */
-function runHref(r: RunListRow): string {
-  const hid = r.host_id;
-  if (hid && hid !== 'local') {
-    return `/runs/${encodeURIComponent(r.id)}?host=${encodeURIComponent(hid)}`;
-  }
-  return `/runs/${encodeURIComponent(r.id)}`;
 }
 
 export default function WorkflowRuns() {
