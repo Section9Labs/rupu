@@ -73,13 +73,18 @@ export default function Findings() {
   // Facets describe the scope before `q`, so the last answer's keep serving
   // the bar's suggestions while the next query loads or after it fails.
   const [facets, setFacets] = useState<FindingsResponse['facets'] | undefined>(undefined);
-  // Set once the first fetch settles: until then the page is one spinner.
+  // Set once the first fetch settles, or once an invalid query has shown its
+  // error: until then the page is one spinner. After it, the bar stays mounted.
   const [settled, setSettled] = useState(false);
 
   useEffect(() => {
     // A query that doesn't parse never reaches the server; the page shows why
-    // in place of the results.
-    if (localError) return;
+    // in place of the results. That counts as settled, so fixing a shared
+    // link's typo doesn't swap the bar for the full-page spinner.
+    if (localError) {
+      setSettled(true);
+      return;
+    }
     let cancelled = false;
     setFailure(null);
     (q ? api.getFindings({ q }) : api.getFindings())

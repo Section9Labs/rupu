@@ -296,6 +296,19 @@ describe('Findings — query bar', () => {
     expect(screen.queryByRole('alert')).toBeNull();
   });
 
+  it('fixing an invalid shared query keeps the bar mounted while the fetch is pending', async () => {
+    vi.spyOn(api, 'getFindings').mockImplementation(() => new Promise<FindingsResponse>(() => {}));
+    renderWithNav('sevrity:x', { 'go-b': 'tag:b' });
+    const bar = screen.getByRole('combobox', { name: 'Filter findings' });
+    expect(await screen.findByRole('alert')).toHaveTextContent(/unknown/i);
+
+    fireEvent.click(screen.getByText('go-b'));
+
+    await waitFor(() => expect(api.getFindings).toHaveBeenCalledWith({ q: 'tag:b' }));
+    expect(screen.getByRole('combobox', { name: 'Filter findings' })).toBe(bar);
+    expect(bar).toBeInTheDocument();
+  });
+
   it('says which query matched nothing', async () => {
     vi.spyOn(api, 'getFindings').mockResolvedValue(resp([]));
     renderPage('/security?tab=findings&q=tag%3Anope');
