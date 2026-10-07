@@ -83,6 +83,30 @@ const BUILTIN_VENDORS = new Set([
   'local',
 ]);
 
+/** `staged` minus every key `saved` wrote that still holds the saved value. */
+export function unstageSaved(
+  staged: Record<string, unknown>,
+  saved: Record<string, unknown>,
+): Record<string, unknown> {
+  let next: Record<string, unknown> | null = null;
+  for (const [key, value] of Object.entries(saved)) {
+    if (!Object.prototype.hasOwnProperty.call(staged, key)) continue;
+    if (!sameValue(staged[key], value)) continue;
+    next ??= { ...staged };
+    delete next[key];
+  }
+  return next ?? staged;
+}
+
+function sameValue(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true;
+  try {
+    return JSON.stringify(a) === JSON.stringify(b);
+  } catch {
+    return false;
+  }
+}
+
 export default function CustomerConfigTab({ slug, name, projectCount, layerPath, onChanged }: CustomerConfigTabProps) {
   const [view, setView] = useState<ConfigView | null>(null);
   // `loadError` is a failed read with nothing to show yet; `reloadError` is a
@@ -108,6 +132,12 @@ export default function CustomerConfigTab({ slug, name, projectCount, layerPath,
   const lockRef = useRef<string[]>([]);
   const lockBusyRef = useRef(false);
   const [lockBusy, setLockBusy] = useState(false);
+  // What a save wrote that no successful re-read has confirmed yet. Those keys
+  // stay staged until one does (a failed re-read must not make them vanish);
+  // then exactly they are un-staged — and only while each still holds the
+  // value that was saved, so an edit made during the save, or a field changed
+  // again since, stays staged.
+  const savedPatchRef = useRef<Record<string, unknown> | null>(null);
 
   /** Re-read the layer; resolves true on success. A failure keeps the last
    *  good view (and every staged edit) and reports inline. */
@@ -119,6 +149,11 @@ export default function CustomerConfigTab({ slug, name, projectCount, layerPath,
         setLoadError(null);
         setReloadError(null);
         lockRef.current = data.customer_lock ?? [];
+        const saved = savedPatchRef.current;
+        if (saved) {
+          savedPatchRef.current = null;
+          setPendingPatch((prev) => unstageSaved(prev, saved));
+        }
         if (!settledTab.current) {
           settledTab.current = true;
           if (data.layer_error) setTab('raw');
@@ -140,6 +175,7 @@ export default function CustomerConfigTab({ slug, name, projectCount, layerPath,
     setReloadError(null);
     settledTab.current = false;
     lockRef.current = [];
+    savedPatchRef.current = null;
     void reload();
     // `reload` closes over `slug`; re-fetch only when the customer changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -223,9 +259,11 @@ export default function CustomerConfigTab({ slug, name, projectCount, layerPath,
     setReadOnly(false);
     try {
       await api.putCustomerConfig(slug, { patch });
-      // The edits are saved; keep them staged until the re-read confirms, so a
-      // transient read failure never makes them vanish from the screen.
-      if (await reload()) setPendingPatch({});
+      // The edits are saved; keep them staged until a re-read confirms, so a
+      // transient read failure never makes them vanish from the screen. The
+      // re-read here, or a later Retry, un-stages exactly what was saved.
+      savedPatchRef.current = { ...(savedPatchRef.current ?? {}), ...patch };
+      await reload();
       onChanged?.();
     } catch (e: unknown) {
       if (e instanceof ApiError && e.status === 501) setReadOnly(true);
@@ -242,6 +280,7 @@ export default function CustomerConfigTab({ slug, name, projectCount, layerPath,
     try {
       await api.putCustomerConfig(slug, { raw: draft });
       // Staged values were read against the old file; they may be stale now.
+      savedPatchRef.current = null;
       setPendingPatch({});
       await reload();
       onChanged?.();

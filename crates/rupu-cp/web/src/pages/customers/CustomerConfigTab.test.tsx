@@ -376,9 +376,48 @@ describe('CustomerConfigTab', () => {
     expect(put).toHaveBeenCalledWith('acme', { patch: { log_level: 'debug' } });
     // Still on the form, still showing the edit.
     expect((screen.getByLabelText('Log level') as HTMLSelectElement).value).toBe('debug');
+    expect(screen.getByText('1 unsaved change')).toBeInTheDocument();
+    // The disk now holds the saved value; a successful Retry confirms it.
+    get.mockResolvedValue(view({ effective: { ...view().effective, log_level: 'debug' } }));
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
     await waitFor(() => expect(screen.queryByText(/Couldn't refresh/)).not.toBeInTheDocument());
     expect(screen.getByLabelText('Log level')).toBeInTheDocument();
+    // The saved key is no longer staged: no "unsaved change", Save disabled.
+    expect(screen.queryByText(/unsaved change/)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Save changes' })).toBeDisabled();
+    expect((screen.getByLabelText('Log level') as HTMLSelectElement).value).toBe('debug');
+  });
+
+  it('an edit made while a save is in flight stays staged after the save', async () => {
+    let release!: () => void;
+    put.mockImplementation(() => new Promise<void>((resolve) => (release = resolve)));
+    mount();
+    fireEvent.change(await screen.findByLabelText('Log level'), { target: { value: 'debug' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
+    await waitFor(() => expect(put).toHaveBeenCalledWith('acme', { patch: { log_level: 'debug' } }));
+    // Typed after Save was clicked: not in the PUT.
+    fireEvent.change(screen.getByLabelText('Default provider'), { target: { value: 'acme-staging' } });
+    get.mockResolvedValue(view({ effective: { ...view().effective, log_level: 'debug' } }));
+    release();
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Save changes' })).toHaveTextContent('Save changes'));
+    await waitFor(() => expect(screen.getByText('1 unsaved change')).toBeInTheDocument());
+    expect((screen.getByLabelText('Default provider') as HTMLInputElement).value).toBe('acme-staging');
+    expect((screen.getByLabelText('Log level') as HTMLSelectElement).value).toBe('debug');
+    expect(screen.getByRole('button', { name: 'Save changes' })).not.toBeDisabled();
+  });
+
+  it('a saved key changed again during the save stays staged with the newer value', async () => {
+    let release!: () => void;
+    put.mockImplementation(() => new Promise<void>((resolve) => (release = resolve)));
+    mount();
+    fireEvent.change(await screen.findByLabelText('Log level'), { target: { value: 'debug' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
+    await waitFor(() => expect(put).toHaveBeenCalledTimes(1));
+    fireEvent.change(screen.getByLabelText('Log level'), { target: { value: 'warn' } });
+    get.mockResolvedValue(view({ effective: { ...view().effective, log_level: 'debug' } }));
+    release();
+    await waitFor(() => expect(screen.getByText('1 unsaved change')).toBeInTheDocument());
+    expect((screen.getByLabelText('Log level') as HTMLSelectElement).value).toBe('warn');
   });
 
   it('a failed first load offers Retry', async () => {
