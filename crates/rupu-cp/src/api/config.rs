@@ -230,7 +230,9 @@ async fn write_atomic_blocking(path: PathBuf, contents: String) -> ApiResult<()>
 }
 
 /// The global keys `rupu cp serve` reads once, at start (its background
-/// loops: whether each runs, and how often). A saved change to one of them
+/// loops: whether each runs, and how often — the autoflow reconcile, the cron
+/// tick, the shared gate-sweep/ASN-refresh/agentiflow-reaper tick). Keep in
+/// step with what `rupu-cli`'s `cmd/cp.rs` captures before its loops start. A saved change to one of them
 /// applies only after a restart.
 pub(crate) fn restart_required(
     boot: &rupu_config::Config,
@@ -261,6 +263,14 @@ pub(crate) fn restart_required(
         (
             "cp.gate_sweep_interval_secs",
             b.gate_sweep_interval_secs != n.gate_sweep_interval_secs,
+        ),
+        (
+            "agentiflow.reaper_enabled",
+            boot.agentiflow.reaper_enabled != now.agentiflow.reaper_enabled,
+        ),
+        (
+            "netflow.asn_auto_refresh",
+            boot.netflow.asn_auto_refresh != now.netflow.asn_auto_refresh,
         ),
     ]
     .into_iter()

@@ -133,8 +133,8 @@ Three endpoints stream `text/event-stream`:
 | `GET /api/transcript/stream?path=…` | One transcript's events. |
 
 Every frame is an unnamed `data:` line carrying one JSON event. On the one-run
-and transcript streams it also carries an `id:` — the event's 1-based position
-in its file — and the stream ends with a named `end` event (see below). The
+and transcript streams it also carries an `id:` — the event's line number in
+its file — and the stream ends with a named `end` event (see below). The
 firehose has neither.
 
 - Run streams carry `rupu_orchestrator::executor::Event`, internally tagged:
@@ -158,16 +158,23 @@ data: {}
 Behaviour worth knowing:
 
 - **Replay, then resume.** A stream sends the file's history from the start,
-  then tails it (polled every 250 ms). A one-run or transcript stream honours
-  `Last-Event-ID`: it resumes after that event instead of replaying it.
-  Browsers' `EventSource` sends the header on its own when it reconnects.
+  then tails it (polled every 250 ms). On a one-run or transcript stream an
+  event's `id` is its line number in the file (every line counts, so ids
+  don't shift across rupu versions), and `Last-Event-ID` resumes after it
+  instead of replaying. Browsers' `EventSource` sends the header on its own
+  when it reconnects. If the file is rewritten (a mirror cache refilled from
+  byte zero), the stream doesn't resend what it already sent.
 - **Keep-alive** is a comment line every 15 s.
-- **Ending.** A one-run stream ends once the run is over: after a
-  `run_completed` / `run_failed` event, if the run's record is terminal (a gate
-  park or a pause is not), one `event: end` frame follows and the connection
-  closes. A transcript stream ends the same way after `run_complete`. Close
-  your `EventSource` on `end`, or it will reconnect and get `end` again. A
-  reconnect at or past the end gets just the `end`. The firehose never ends.
+- **Ending.** A one-run stream ends once the run is over: its last event is a
+  `run_completed` / `run_failed`, nothing follows it for 2 s, and the run is
+  settled (terminal record, no gate-reject cleanup pending, no live runner).
+  An earlier terminal event in the file (a failed attempt that was retried, a
+  gate reject followed by its `on_reject` chain) never ends it. Then one
+  `event: end` frame with `retry: 15000` follows and the connection closes:
+  close your `EventSource` on it, or keep it and it reconnects 15 s later with
+  `Last-Event-ID` — getting `end` again, or the events of a retry (the web
+  run page does this). A transcript stream ends with `end` after
+  `run_complete`. The firehose never ends.
 - **Firehose scope.** The firehose follows runs in the run store — workflows and
   autoflows. Standalone agent runs and session turns never appear on it.
   It attaches to active runs at start, then to any new run id it sees (checked
@@ -175,7 +182,8 @@ Behaviour worth knowing:
 - **Remote hosts.** With `host=<remote>`, the remote's run stream is passed
   through; `/api/events/stream` then requires `run`. `Last-Event-ID` reaches
   it: a mirror-backed host (SSH, tunnel, bucket) resumes from the
-  coordinator's mirror, and an HTTP host gets the header forwarded.
+  coordinator's mirror, and an HTTP host gets the header forwarded. An HTTP
+  host running an older rupu ignores it and replays without ids, as before.
 - Sessions and run lists have no stream; the UI polls them.
 
 ```sh
@@ -413,7 +421,7 @@ and pulls back the diff. The web UI never calls these.
 | Method | Path | Purpose | Notes |
 |--------|------|---------|-------|
 | GET | `/api/config` | Effective config with per-key provenance and each layer's raw TOML (`ConfigView`). | `project` (ws id) or `customer` (slug), not both. Includes `status {bind, token_set, restart_required_keys}` — the token itself is never returned. A malformed layer is 200 with `layer_error`. |
-| PUT | `/api/config/global` | Write the global config. | Body `ConfigWriteBody {raw?, patch?}`. 400 invalid TOML. Validated, backed up, written atomically. Response `{ok, restart_required}`: the start-time-only keys (`cp.{autoflow_reconcile,cron_tick,gate_sweep}_{enabled,interval_secs}` — `cp serve`'s background loops) whose saved value now differs from the one the server started with; they apply after a restart. Everything else applies at once. |
+| PUT | `/api/config/global` | Write the global config. | Body `ConfigWriteBody {raw?, patch?}`. 400 invalid TOML. Validated, backed up, written atomically. Response `{ok, restart_required}`: the start-time-only keys (`cp.{autoflow_reconcile,cron_tick,gate_sweep}_{enabled,interval_secs}`, `agentiflow.reaper_enabled`, `netflow.asn_auto_refresh` — what `cp serve`'s background loops capture at start) whose saved value now differs from the one the server started with; they apply after a restart. Everything else applies at once. |
 | PUT | `/api/config/customer/:slug` | Write a customer's layer. | 400 for a globally locked key or a layer that doesn't validate on top of global. |
 | PUT | `/api/config/project/:id` | Write a project's `.rupu/config.toml`. | 400 for a locked key or a project whose `.rupu/` is the global dir. |
 | PUT | `/api/config/policy` | Set the global `[policy].lock`. | Body `{lock: [...]}`. |

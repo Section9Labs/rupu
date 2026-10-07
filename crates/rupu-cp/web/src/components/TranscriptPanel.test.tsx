@@ -230,7 +230,7 @@ describe('TranscriptPanel live backlog', () => {
   /** Mount a live panel and hand back the SSE `onEvent` / `onError` callbacks. */
   async function mountLive(snapshot: TranscriptEvent[]) {
     vi.spyOn(api, 'getTranscript').mockResolvedValue({ events: snapshot, summary: null });
-    let onEvent: (e: TranscriptEvent) => void = () => {};
+    let onEvent: (e: TranscriptEvent, id?: number) => void = () => {};
     let onError: () => void = () => {};
     vi.spyOn(api, 'subscribeTranscript').mockImplementation((_path, cb, err) => {
       onEvent = cb;
@@ -244,10 +244,32 @@ describe('TranscriptPanel live backlog', () => {
     );
     await screen.findAllByText('first message body');
     return {
-      emit: (e: TranscriptEvent) => act(() => onEvent(e)),
+      emit: (e: TranscriptEvent, id?: number) => act(() => onEvent(e, id)),
       fail: () => act(() => onError()),
     };
   }
+
+  it('resumes after the last numbered event on a reconnect: new events show, repeats are dropped', async () => {
+    const THIRD: TranscriptEvent = { type: 'assistant_message', data: { content: 'third message body' } };
+    const { emit, fail } = await mountLive([RUN_START, FIRST]);
+    emit(RUN_START, 1);
+    emit(FIRST, 2);
+    const firstBefore = screen.getAllByText('first message body').length;
+
+    // The server resumes after Last-Event-ID: only what's new arrives —
+    // and it shows at once, not after a replay catches up.
+    fail();
+    emit(SECOND, 3);
+    expect(screen.getAllByText('second message body').length).toBeGreaterThan(0);
+    // A repeat (an id already shown) is dropped.
+    emit(SECOND, 3);
+    emit(THIRD, 4);
+    expect(screen.getAllByText('first message body')).toHaveLength(firstBefore);
+    expect(screen.getAllByText('third message body').length).toBeGreaterThan(0);
+    const secondCount = screen.getAllByText('second message body').length;
+    emit(SECOND, 3);
+    expect(screen.getAllByText('second message body')).toHaveLength(secondCount);
+  });
 
   it('does not render the backlog twice when the stream replays what the snapshot has', async () => {
     const { emit } = await mountLive([RUN_START, FIRST]);

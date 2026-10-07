@@ -424,8 +424,10 @@ async fn a_finished_runs_stream_is_numbered_and_ends() {
     ] {
         let body = read_to_end(client.get(&url)).await;
         assert_eq!(ids(&body), vec![1, 2, 3], "{url}: {body}");
+        // `retry:` with or without the optional space (both are SSE).
+        let tail = body.trim_end().replace("retry: ", "retry:");
         assert!(
-            body.trim_end().ends_with("event: end\ndata: {}"),
+            tail.ends_with("event: end\nretry:15000\ndata: {}"),
             "{url}: {body}"
         );
     }
@@ -476,7 +478,8 @@ async fn a_live_run_stream_stays_open() {
     let resp = reqwest::get(format!("http://{addr}/api/runs/run_live/log"))
         .await
         .unwrap();
-    let ended = tokio::time::timeout(std::time::Duration::from_millis(1500), resp.text()).await;
+    // Well past the 2 s quiet period: still open, the run isn't settled.
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(4), resp.text()).await;
     assert!(ended.is_err(), "a parked run's stream must stay open");
 }
 
@@ -532,4 +535,49 @@ async fn a_finished_transcript_stream_is_numbered_resumable_and_ends() {
 
     let body = read_to_end(req().header("Last-Event-ID", "1")).await;
     assert_eq!(ids(&body), vec![2, 3], "{body}");
+}
+
+/// An earlier terminal event — a failed attempt the operator retried — is
+/// followed by more events, so it doesn't end the stream; and a line this
+/// rupu doesn't recognise still counts toward the ids (they are line
+/// numbers), so they don't shift between versions.
+#[tokio::test]
+async fn a_retried_run_streams_past_its_first_failure_and_ids_are_line_numbers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RunStore::new(tmp.path().join("runs"));
+    let run_id = "run_retried";
+    store
+        .create(
+            seed_run(run_id, RunStatus::Completed),
+            "name: test\nsteps: []\n",
+        )
+        .unwrap();
+    let line = |e: &Event| serde_json::to_string(e).unwrap();
+    let events = make_events();
+    let body = [
+        line(&events[0]),
+        line(&Event::RunFailed {
+            run_id: run_id.into(),
+            error: "first attempt".into(),
+            finished_at: Utc::now(),
+        }),
+        r#"{"type":"some_future_event","run_id":"run_retried"}"#.to_string(),
+        line(&events[1]),
+        line(&Event::RunCompleted {
+            run_id: run_id.into(),
+            status: RunStatus::Completed,
+            finished_at: Utc::now(),
+        }),
+    ]
+    .join("\n")
+        + "\n";
+    std::fs::write(store.events_path(run_id), body).unwrap();
+    let addr = spawn_server(tmp.path()).await;
+    let body =
+        read_to_end(reqwest::Client::new().get(format!("http://{addr}/api/runs/{run_id}/log")))
+            .await;
+    // Line 3 (unknown) is counted but not sent.
+    assert_eq!(ids(&body), vec![1, 2, 4, 5], "{body}");
+    assert!(body.contains("run_completed"), "{body}");
+    assert!(body.contains("event: end"), "{body}");
 }

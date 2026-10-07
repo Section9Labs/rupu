@@ -463,11 +463,7 @@ async fn stream_transcript(
             }
         }
     };
-    let tail = match crate::transcript_tail::TranscriptTail::open(&path).await {
-        Ok(t) => t,
-        Err(e) => return ApiError::internal(e.to_string()).into_response(),
-    };
-    let frames = crate::transcript_tail::sequenced(tail, after);
+    let frames = crate::transcript_tail::sequenced(&path, after);
     let stream = hold_while_streaming(frames, guard).map(|frame| {
         let sse = match frame {
             crate::transcript_tail::TranscriptFrame::Event { id, event } => SseEvent::default()

@@ -891,7 +891,7 @@ class FakeEventSource {
   url: string;
   readyState = FakeEventSource.CONNECTING;
   closed = false;
-  onmessage: ((m: { data: string }) => void) | null = null;
+  onmessage: ((m: { data: string; lastEventId?: string }) => void) | null = null;
   onerror: ((e: unknown) => void) | null = null;
   onopen: ((e?: unknown) => void) | null = null;
 
@@ -923,22 +923,43 @@ class FakeEventSource {
   emitNamed(type: string): void {
     this.listeners[type]?.forEach((fn) => fn());
   }
+
+  /** What a real EventSource does for a `message` alongside `onmessage`:
+   *  notify `addEventListener('message', …)` listeners too. */
+  emitNamedMessage(type: string): void {
+    this.emitNamed(type);
+  }
 }
 
 describe('one-run streams', () => {
-  it('close on the server\'s `end` event, so the browser never reconnects to a finished run', async () => {
+  it('keep a run stream open across its `end` (to pick up a retry) without reporting the planned reconnect, and close a transcript on `end`', async () => {
     vi.stubGlobal('EventSource', FakeEventSource);
     FakeEventSource.instances = [];
     const { api } = await import('./api');
-    api.subscribeRunLog('run_1', () => {});
-    api.subscribeEvents(() => {}, { run: 'run_1' });
-    api.subscribeTranscript('/t.jsonl', () => {});
+    const errors: unknown[] = [];
+    api.subscribeRunLog('run_1', () => {}, (e) => errors.push(e));
+    api.subscribeEvents(() => {}, { run: 'run_1' }, (e) => errors.push(e));
+    const ids: (number | undefined)[] = [];
+    api.subscribeTranscript('/t.jsonl', (_e, id) => ids.push(id));
     expect(FakeEventSource.instances).toHaveLength(3);
-    for (const es of FakeEventSource.instances) {
-      expect(es.closed).toBe(false);
+    const [log, one, transcript] = FakeEventSource.instances;
+
+    for (const es of [log, one]) {
       es.emitNamed('end');
-      expect(es.closed).toBe(true);
+      es.onerror?.(new Event('error')); // the server closing after `end`
+      expect(es.closed).toBe(false);
     }
+    expect(errors).toHaveLength(0);
+    // After new data, a real drop is reported again.
+    log.emitMessage({ type: 'run_resumed' });
+    log.emitNamedMessage('message');
+    log.onerror?.(new Event('error'));
+    expect(errors).toHaveLength(1);
+
+    transcript.onmessage?.({ data: '{"type":"assistant_message"}', lastEventId: '7' });
+    expect(ids).toEqual([7]);
+    transcript.emitNamed('end');
+    expect(transcript.closed).toBe(true);
     vi.unstubAllGlobals();
   });
 });

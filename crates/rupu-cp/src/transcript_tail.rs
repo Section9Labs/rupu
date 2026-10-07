@@ -92,50 +92,191 @@ impl Stream for TranscriptTail {
     }
 }
 
+/// One line of a [`NumberedTail`]: its 1-based position among the file's
+/// non-blank lines (`id`), the line parsed as `E` (`None` when it does not
+/// parse), and whether it lies past the resume point (`send`) — a line the
+/// client already has is still reported, unsent, so a caller can see what
+/// it was (a terminal event, say).
+#[derive(Debug, Clone, PartialEq)]
+pub struct NumberedLine<E> {
+    pub id: u64,
+    pub event: Option<E>,
+    pub send: bool,
+}
+
+/// Live tail of a JSONL file, numbering every non-blank line — parseable or
+/// not, recognised or not — so ids are positions in the file and stay stable
+/// across reconnects and rupu versions. Lines up to `after` (a client's
+/// `Last-Event-ID`) come back with `send: false`.
+///
+/// When the file shrinks or is replaced (a mirror cache truncated for a
+/// byte-zero replay, a terminal pull renaming a fresh copy over it), the
+/// numbering restarts at 1 — and nothing at or before the highest id already
+/// sent on this stream is sent again: the rewrite carries the same history.
+pub struct NumberedTail<E> {
+    rx: mpsc::Receiver<NumberedLine<E>>,
+}
+
+impl<E: serde::de::DeserializeOwned + Send + 'static> NumberedTail<E> {
+    pub fn open(path: &Path, after: u64) -> Self {
+        let (tx, rx) = mpsc::channel::<NumberedLine<E>>(256);
+        let path_buf: PathBuf = path.to_path_buf();
+        tokio::spawn(async move {
+            let mut cursor = JsonlCursor::new();
+            let (mut seq, mut floor, mut sent_max) = (0u64, after, 0u64);
+            loop {
+                if tx.is_closed() {
+                    return;
+                }
+                let p = path_buf.clone();
+                let mut c = std::mem::take(&mut cursor);
+                let drained = tokio::task::spawn_blocking(move || {
+                    let mut lines = Vec::new();
+                    let mut reset = false;
+                    let _ = c.drain_with(&p, || reset = true, |l| lines.push(l.to_string()));
+                    (c, reset, lines)
+                })
+                .await;
+                match drained {
+                    Ok((c, reset, lines)) => {
+                        cursor = c;
+                        if reset {
+                            seq = 0;
+                            floor = floor.max(sent_max);
+                        }
+                        for line in lines {
+                            seq += 1;
+                            let send = seq > floor;
+                            if send {
+                                sent_max = seq;
+                            }
+                            let item = NumberedLine {
+                                id: seq,
+                                event: serde_json::from_str::<E>(&line).ok(),
+                                send,
+                            };
+                            if tx.send(item).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // The blocking closure panicked and the cursor went
+                        // with it: the next drain restarts from offset 0,
+                        // which is a reset.
+                        tracing::warn!(error = %e, "jsonl tail drain failed; restarting cursor");
+                        seq = 0;
+                        floor = floor.max(sent_max);
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        });
+        Self { rx }
+    }
+}
+
+impl<E> Stream for NumberedTail<E> {
+    type Item = NumberedLine<E>;
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.get_mut().rx.poll_recv(cx)
+    }
+}
+
 /// One item of a resumable transcript stream ([`sequenced`]).
 #[derive(Debug, Clone, PartialEq)]
 pub enum TranscriptFrame {
-    /// The `id`-th event of the transcript (1-based).
+    /// A transcript event and its line number in the file (1-based).
     Event { id: u64, event: Box<Event> },
     /// The transcript reached its `run_complete`; the stream ends after this.
     End,
 }
 
-/// Number `events` (a transcript, from its first line) and resume after
-/// event `after` (a client's `Last-Event-ID`): events up to it are read but
-/// not passed on. After a `run_complete` event one [`TranscriptFrame::End`]
-/// follows and the stream ends — a run writes nothing after it. A reconnect
-/// whose resume point is past the end gets the end at once.
-pub fn sequenced(
-    events: impl Stream<Item = Event>,
-    after: u64,
-) -> impl Stream<Item = TranscriptFrame> {
+/// A transcript's events, numbered by line ([`NumberedTail`]) and resumed
+/// after line `after`. After a `run_complete` one [`TranscriptFrame::End`]
+/// follows and the stream ends — each run writes its own transcript and
+/// nothing after `run_complete`. A resume point at or past it gets the end
+/// at once.
+pub fn sequenced(path: &Path, after: u64) -> impl Stream<Item = TranscriptFrame> {
     use futures_util::StreamExt as _;
-    let state = (Box::pin(events), 0u64, false, false);
-    futures_util::stream::unfold(state, move |(mut events, mut seq, end_next, done)| async move {
-        if done {
-            return None;
-        }
-        if end_next {
-            return Some((TranscriptFrame::End, (events, seq, false, true)));
+    #[derive(Clone, Copy, PartialEq)]
+    enum Phase {
+        Tailing,
+        EndNext,
+        Done,
+    }
+    let lines = Box::pin(NumberedTail::<Event>::open(path, after));
+    futures_util::stream::unfold((lines, Phase::Tailing), |(mut lines, phase)| async move {
+        match phase {
+            Phase::Done => return None,
+            Phase::EndNext => return Some((TranscriptFrame::End, (lines, Phase::Done))),
+            Phase::Tailing => {}
         }
         loop {
-            let ev = events.next().await?;
-            seq += 1;
+            let line = lines.next().await?;
+            let Some(ev) = line.event else { continue };
             let last = matches!(ev, Event::RunComplete { .. });
-            if seq <= after {
+            if !line.send {
                 if last {
-                    return Some((TranscriptFrame::End, (events, seq, false, true)));
+                    return Some((TranscriptFrame::End, (lines, Phase::Done)));
                 }
                 continue;
             }
+            let next = if last { Phase::EndNext } else { Phase::Tailing };
             let frame = TranscriptFrame::Event {
-                id: seq,
+                id: line.id,
                 event: Box::new(ev),
             };
-            return Some((frame, (events, seq, last, false)));
+            return Some((frame, (lines, next)));
         }
     })
+}
+
+#[cfg(test)]
+mod numbered_tests {
+    use super::*;
+    use futures_util::StreamExt as _;
+
+    async fn next<E>(t: &mut NumberedTail<E>) -> NumberedLine<E> {
+        tokio::time::timeout(std::time::Duration::from_secs(3), t.next())
+            .await
+            .expect("a line")
+            .expect("open")
+    }
+
+    /// Every non-blank line is numbered (unparseable ones too, unsent past
+    /// the resume point only), and a rewritten file never resends what this
+    /// stream already sent.
+    #[tokio::test]
+    async fn numbers_every_line_and_survives_a_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.jsonl");
+        std::fs::write(&p, "1\nnot json\n3\n").unwrap();
+        let mut t = NumberedTail::<u32>::open(&p, 1);
+        let a = next(&mut t).await;
+        assert_eq!((a.id, a.event, a.send), (1, Some(1), false));
+        let b = next(&mut t).await;
+        assert_eq!((b.id, b.event, b.send), (2, None, true));
+        let c = next(&mut t).await;
+        assert_eq!((c.id, c.event, c.send), (3, Some(3), true));
+
+        // Replaced by a shorter file with the same history plus one line: the
+        // numbering restarts, nothing already sent is sent again.
+        std::fs::write(&p, "1\nx\n").unwrap();
+        let d = next(&mut t).await;
+        assert_eq!((d.id, d.send), (1, false));
+        let e = next(&mut t).await;
+        assert_eq!((e.id, e.send), (2, false));
+        std::fs::write(&p, "1\nx\n3\n4\n").unwrap();
+        let mut sent = Vec::new();
+        while sent.is_empty() {
+            let l = next(&mut t).await;
+            if l.send {
+                sent.push((l.id, l.event));
+            }
+        }
+        assert_eq!(sent, vec![(4, Some(4))]);
+    }
 }
 
 #[cfg(test)]
@@ -224,9 +365,7 @@ mod tests {
             agent: "agent".into(),
             provider: "anthropic".into(),
             model: "claude-opus-4-8".into(),
-            started_at: chrono::Utc
-                .with_ymd_and_hms(2026, 6, 16, 12, 0, 0)
-                .unwrap(),
+            started_at: chrono::Utc.with_ymd_and_hms(2026, 6, 16, 12, 0, 0).unwrap(),
             mode: RunMode::Ask,
             schema: None,
             system_prompt: None,

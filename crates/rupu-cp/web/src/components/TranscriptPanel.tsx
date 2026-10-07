@@ -162,7 +162,9 @@ export default function TranscriptPanel({
     // empty (covers `live` flipping off and back on for the same path).
     setStream([]);
     // `shown` mirrors what `stream` state holds. EventSource auto-reconnects
-    // after an error and the server replays from byte 0 again; extending the
+    // after an error. This server numbers events and resumes after the last
+    // one (handled first, below); an older remote CP replays from byte 0
+    // again instead, and for that stream extending the
     // shown copy would duplicate the backlog, and restarting it would rewind
     // the view (the merge falls back to the shorter snapshot) until the replay
     // caught up. So a post-error replay is buffered in `replay` and swapped in
@@ -174,23 +176,35 @@ export default function TranscriptPanel({
     let shown: TranscriptEvent[] = [];
     let replay: TranscriptEvent[] | null = null;
     let reconnected = false;
+    // Numbered events (`id` = line number): a reconnect resumes after the
+    // last one (`Last-Event-ID`), so append anything newer and drop repeats.
+    // The replay buffering below is only for an older remote CP whose
+    // stream carries no ids and replays from the start.
+    let lastId = 0;
     const unsub = api.subscribeTranscript(
       path,
-      (e) => {
-        if (reconnected) {
-          reconnected = false;
-          replay = [];
-        }
-        if (replay) {
-          replay.push(e);
-          if (replay.length >= shown.length) {
-            shown = replay;
-            replay = null;
-            setStream(shown);
-          }
-        } else {
+      (e, id) => {
+        if (id !== undefined) {
+          if (id <= lastId) return;
+          lastId = id;
           shown = [...shown, e];
           setStream(shown);
+        } else {
+          if (reconnected) {
+            reconnected = false;
+            replay = [];
+          }
+          if (replay) {
+            replay.push(e);
+            if (replay.length >= shown.length) {
+              shown = replay;
+              replay = null;
+              setStream(shown);
+            }
+          } else {
+            shown = [...shown, e];
+            setStream(shown);
+          }
         }
         if (
           !completedRef.current &&
