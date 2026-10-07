@@ -124,6 +124,7 @@ fn collect_run_ledger(
     // drops every dispatched step's and fan-out item's ledger.
     let (store, workspace) = resolve_run_store(global, run_id);
     Ok(rupu_cp::api::netflow::run_scoped_flows_and_dropped(
+        &rupu_cp::netflow_index::DirectReader,
         &store,
         run_id,
         &workspace,

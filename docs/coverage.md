@@ -125,7 +125,7 @@ Two more tools are **not** injected: grant them explicitly in the agent's
 
 | Tool | Purpose |
 |------|---------|
-| `query_findings` | list the workspace's findings, filtered by tag, severity, concern or file; returns a page of slim rows plus `tags_in_use` (explicit `tools:` grant) |
+| `query_findings` | list the workspace's findings that match a query (`q`, in the [findings query language](#querying-findings)); returns a page of slim rows plus `tags_in_use` (explicit `tools:` grant) |
 | `tag_findings` | add or remove tags on one or many findings; returns each finding's tags before and after (explicit `tools:` grant) |
 
 ## Finding reports
@@ -547,11 +547,13 @@ rupu's global output flag (`table`, `json`, `csv`) and has nothing to shape here
 Filters combine: a finding must pass all of them. `--severity` keeps that
 severity and worse. `--run` keeps findings declared by that run and its
 sub-runs. `--cwe` compares CWE numbers: `CWE-79` (or `cwe-79`, or `79`) keeps
-findings whose report lists CWE-79 or whose concern is CWE-79
-(`cwe-top25-2023:cwe-79-xss`), never CWE-798 or CWE-179; a value that is not a
-CWE id is a usage error. `--project` must be a registered project: a workspace
-id, or the path of a registered project's checkout. Anything else is an error
-("no project matches ...").
+findings whose report lists CWE-79, whose concern is CWE-79
+(`cwe-top25-2023:cwe-79-xss`) or, when the concern names no CWE, whose first
+MITRE reference URL is CWE-79 (`https://cwe.mitre.org/data/definitions/79.html`),
+never CWE-798 or CWE-179; a value that is not a CWE id is a usage error. This is
+the query's `cwe:` rule and the CP's CWE column. `--project` must be a
+registered project: a workspace id, or the path of a registered project's
+checkout. Anything else is an error ("no project matches ...").
 
 Exactly one `--id` on its own writes that finding as a stand-alone document.
 Adding any of `--project`, `--run`, `--severity`, `--owner`, `--cwe`, `--split`
@@ -850,12 +852,14 @@ not gain any.
   tools: [read_file, query_findings, tag_findings]
   ```
 
-  `query_findings` lists the agent's own workspace's findings, filtered by tag,
-  severity, concern or file. It returns `{rows, next_cursor, total,
+  `query_findings` lists the agent's own workspace's findings matching a query
+  (`{q, limit, cursor}`; the language is under "Querying findings" below). It
+  returns `{rows, next_cursor, total,
   tags_in_use}`: one page of slim rows, a cursor for the next, the number of
   matches, and every tag already used in the workspace with its count (so an
   agent reuses a tag instead of inventing a near-duplicate). `limit` defaults
-  to 50 and is at most 500. `tag_findings` adds or removes tags on one or many
+  to 50 and is at most 500; `all: true` returns every match in one answer
+  instead (no `limit` or `cursor`). `tag_findings` adds or removes tags on one or many
   findings and returns each finding's tags before and after. Both work only on
   the agent's own workspace, and `tag_findings` is allowed in `readonly` mode:
   it annotates the ledger and never touches the workspace's files.
@@ -869,7 +873,8 @@ not gain any.
     with: { finding_ids: ["fnd_01J…"], add: ["needs-poc"] }
   ```
 
-- **Operators**, through `rupu findings` (below).
+- **Operators**, through `rupu findings` (below) or the control plane's
+  Findings page and finding pages ("In the control plane").
 
 ### Where tags live
 
@@ -890,29 +895,29 @@ so the others keep their changes when one is refused).
 ### CLI
 
 ```
-rupu findings list [--project WS_ID|PATH] [--run RUN_ID] [--tag TAG]… [--any-tag]
-                   [--untagged] [--severity SEV] [--limit N] [--ids-only]
+rupu findings list [--limit N] [--ids-only] [QUERY]…
 rupu findings tag <ID>… [--add TAG]… [--remove TAG]…
-rupu findings tags [--project WS_ID|PATH] [--run RUN_ID]
+rupu findings tags [QUERY]…
 ```
 
-`list` spans every project; `--project` and `--run` narrow it. Several `--tag`
-flags match findings that carry all of them, or any of them with `--any-tag`;
-`--untagged` selects findings with none. `--severity` keeps that severity and
-worse. `--limit N` shows the first N, and says "showing N of M findings" on
-stderr when it left some out. `--ids-only` prints bare ids, one per line.
-`tags` lists the tags in use with how many findings carry each.
+`list` spans every project; narrow it with a query (see "Querying findings").
+Flags go before the query words: a query word that starts with `--` is
+refused with a hint, since it would otherwise read as a negated word.
+`--limit N` shows the first N, and says "showing N of M findings" on stderr
+when it left some out. `--ids-only` prints bare ids, one per line. `tags`
+lists the tags in use with how many findings carry each, over the findings the
+query selects (all of them with no query).
 
 ```bash
 rupu findings tag fnd_01J… --add needs-poc --add class:sqli
-rupu findings list --tag class:sqli --tag class:xss --any-tag --severity high
-rupu findings list --untagged --ids-only
+rupu findings list 'severity>=high' tag:class:sqli,class:xss
+rupu findings list --ids-only -has:tags
 rupu findings tags
 
 # Tag everything matching a query: a lone `-` reads ids from stdin
-rupu findings list --tag class:sqli --ids-only | rupu findings tag - --add needs-poc
+rupu findings list --ids-only tag:class:sqli | rupu findings tag - --add needs-poc
 
-rupu --format json findings list --tag needs-poc
+rupu --format json findings list tag:needs-poc
 ```
 
 `tag` changes findings across projects, project by project. An unknown id, or a
@@ -920,6 +925,86 @@ workspace that could not be changed (a finding past the cap, an unwritable log),
 makes the command exit non-zero after the other workspaces have kept their
 changes; its output says which were not changed. `--format json` works with all
 three commands (`--format table` is the default).
+
+### In the control plane
+
+The Findings page and a finding's own page both edit tags. Filtering by tag is
+the query bar's job (`tag:needs-poc`, see [Querying findings](#querying-findings)).
+
+- **A finding's page.** Under the header the finding's tags show as chips: the
+  `✕` on a chip removes it, and `+ tag` opens an input that suggests the tags
+  already in use in that finding's project, most used first; once you type,
+  best match first (the same validation as above, so a bad tag is refused in
+  the input with the reason). A change that fails keeps what you typed and
+  shows the error; one that was saved but the page couldn't reload after says
+  so instead. A "Tags" section further down holds a collapsed "Tag history
+  (N)": each add or remove, newest first, with who made it (an agent's
+  codename and name, or `<user> via cp` / `<user> via cli`) and when.
+- **Bulk, from the Findings table.** Each row has a checkbox, and the header
+  checkbox selects every row that can be selected. With rows selected a bar
+  reads "N selected · Tag… · Untag… · Clear": `Tag…` and `Untag…` open the same
+  input (suggestions are the tags in use across the projects the page covers) and apply
+  to every selected finding (more than 1000 go in batches of 1000, one after
+  another; a batch that fails stops the rest). The result stays as one line
+  after the selection clears ("Tagged 3 findings (1 already had it)."), and
+  names any project whose tags couldn't be changed and any finding that no
+  longer exists. Changing the query clears the selection.
+- **Unreadable tag logs.** A project whose tag log can't be read still lists its
+  findings with their declared tags, under the existing "couldn't be read"
+  banner, but its rows' checkboxes are disabled (the tooltip says why) and its
+  findings' pages show the tags read-only ("tags read-only"). Editing is not
+  offered for a log that can't be read.
+
+Every change the control plane makes is recorded as an operator event, `via:
+cp`, in the project's `finding_tags.jsonl`, the same log the CLI writes to.
+
+### Control-plane API
+
+The web UI is a client of these; they are also usable directly. Responses are
+JSON.
+
+`POST /api/findings/tags` adds or removes tags on findings wherever they live:
+
+```json
+{ "finding_ids": ["fnd_01J…", "fnd_01K…"], "add": ["needs-poc"], "remove": [] }
+```
+
+`finding_ids` is required; `add` and `remove` default to empty, and at least one
+must name a tag. Tags are normalized as under "Syntax". The ids are grouped by
+the workspace holding them and each workspace's batch is atomic, the request as
+a whole is not, exactly as for `rupu findings tag`. The `200` body reports per
+workspace, plus the ids no registered workspace holds:
+
+```json
+{
+  "workspaces": [
+    { "ws_id": "ws1", "outcomes": [ { "finding_id": "fnd_01J…", "before": [], "after": ["needs-poc"] } ] },
+    { "ws_id": "ws2", "error": "…why this workspace's batch was refused…" }
+  ],
+  "unknown": ["fnd_01K…"]
+}
+```
+
+A workspace that could not be changed carries an `error` and no `outcomes`
+while the others keep their changes, so a `200` does not mean everything
+applied: read `workspaces[].error` and `unknown`. An `outcome` whose `before`
+equals its `after` changed nothing and wrote no event. Statuses:
+
+| Status | When |
+|---|---|
+| `200` | At least one workspace was reached (it may still carry errors and `unknown` ids). |
+| `400` | An invalid tag, no tag to add or remove, a tag both added and removed, no finding ids, or more than 1000 ids. The body is `{"error": "…"}`. |
+| `404` | None of the ids exists. |
+| `422` | The body doesn't deserialize: a field other than `finding_ids`, `add` and `remove`, or a missing `finding_ids`. |
+
+`GET /api/findings/tags` lists the tags in use, most used first, as `[{ "tag":
+"needs-poc", "count": 4 }]`. `?ws_id=` limits it to one workspace.
+`GET /api/findings/:id` gains two fields: `tag_history`, that finding's tag
+events in file order (`id`, `finding_id`, `op`, `tag`, `by`, `at`), and `tags_editable`,
+`false` (with an empty `tag_history`) when the finding's workspace can't be
+resolved or its tag log can't be read. The list response's `tags_unavailable`
+(`[{ws_id, project}]`, from the query bar's section) names the same
+workspaces for the Findings page.
 
 ### Remote units
 
@@ -929,15 +1014,143 @@ lines next to the `findings` lines, and `ingest_unit_stream` appends them to
 the coordinator workspace's tag log (a replayed event is dropped as a
 duplicate), so they reach the coordinator exactly as the unit's findings do.
 
+When the stream did not arrive whole (the host dropped mid-run, a malformed
+line), the unit's workspace delta keeps its `.rupu/coverage/` as the fallback
+copy. Its tag log is still never written over the coordinator's: its events are
+merged into the coordinator's log by event id, the same way, so tags added on
+the coordinator while the unit ran survive, and several units that all tagged
+never conflict on the file.
+
 ### Limits
 
 - Tags belong to a finding id. A vulnerability an agent reports again is a new
   finding and starts with no tags.
 - Tagging a finding that exists only in a remote host's own ledgers, and was
   never ingested into the coordinator, is not supported.
-- The control plane (the findings table, filter, bulk tagging and the report
-  page's editor, with their HTTP endpoints) is a later plan. Today tags are
-  read and written through the agent tools, MCP and `rupu findings`.
+
+## Querying findings
+
+One single-line query language filters findings on every surface: `rupu
+findings list|tags`, the agent tool `query_findings`, the MCP tool
+`findings.query`, and the control plane's Findings page.
+
+```
+severity>=high tag:class:sqli -tag:false-positive -has:poc "sql injection"
+```
+
+### Grammar
+
+- Tokens are separated by whitespace, and every token must match (AND).
+  Repeating a key ANDs too: `tag:a tag:b` needs both tags.
+- `key:value` filters a field. `key:a,b` matches any of the values (OR within
+  one token). `-key:value` negates the token.
+- Only `severity` takes `>=`, `>`, `<=` and `<`, with one value (`severity>=high`).
+- A bare word or quoted phrase is free text, matched case-insensitively against
+  title, summary, id and file path. `-word` negates it.
+- A token shaped like key characters (letters and `_`) plus an operator
+  (`word:`, `word>=`) names a key, so an unknown key is an error, never text.
+  To search for text containing a colon, quote it: `"http://host"`.
+- Quotes (`"` or `'`) open only at the start of an item: the start of a token
+  (after an optional `-`), right after a key's operator, or right after a `,`
+  in a keyed value. `\` escapes the next character. A quote anywhere else is
+  an ordinary character, so `a="c d"` is the two words `a="c` and `d"`. Text
+  glued to a closing quote is an error.
+- A tag value may itself contain `:` (`tag:class:sqli`): only the first `:`
+  after the key splits.
+
+An invalid query does not run; it is refused with an error naming the token (by
+its 0-based index) and a code: `unknown_key`, `empty_value`, `bad_value` (not a
+valid severity, enum value, tag or CWE), `bad_operator` (a comparison on a key
+other than `severity`, or with several values), `unclosed_quote`, `bad_quote`.
+
+### Fields
+
+| Key | Matches |
+|---|---|
+| `severity` (`sev`) | `info`, `low`, `medium`, `high`, `critical`; also `>=`, `>`, `<=`, `<` |
+| `tag` | an effective tag, normalized like any tag (`Class:SQLi` is `class:sqli`) |
+| `has` | `tags`, `report`, `poc` (the report has artifacts), `cwe` |
+| `project` | workspace name or id (CLI and control plane only) |
+| `cwe` | `79` or `CWE-79`, by number: the report's CWEs, the one the concern names or, when it names none, the first MITRE reference URL (`cwe.mitre.org/data/definitions/<n>`); the same rule as the CWE column and `--cwe` |
+| `owner`, `product` | the report's ownership, case-insensitive |
+| `verified` | `unverified`, `confirmed`, `disputed`, `inconclusive` (no verification counts as `unverified`) |
+| `profile` | `full`, `summary` |
+| `scope` | `line`, `file`, `repo`, `host`, `endpoint`, `resource` |
+| `concern` | concern id, case-insensitive |
+| `agent` | agent name or codename, case-insensitive |
+| `workflow` | workflow name, case-insensitive (CLI and control plane only) |
+| `file` | path prefix |
+| `run` | run id; the CLI and control plane also match the run's sub-runs |
+| `id` | finding id |
+
+`project:` and `workflow:` need provenance, which only the CLI and control
+plane have: the agent tool and MCP refuse a query that uses them. There
+`run:` is an exact match on the run id.
+
+### On each surface
+
+```bash
+# CLI: quote what your shell would treat as a redirect or split on spaces
+rupu findings list 'severity>=high' tag:needs-poc -has:poc
+rupu findings list 'owner:"payments team"' run:run_01J…
+rupu findings tags severity:critical
+```
+
+`>` and `<` are shell redirects, so `severity>=high` unquoted writes a file
+named `=high`; quote the query word (or the whole query). Put `--limit` and
+`--ids-only` before the query words.
+
+```yaml
+# Agent tool and MCP: {q, limit, cursor}; limit defaults to 50, at most 500
+- id: queue
+  action: findings.query
+  with: { q: "severity>=high tag:needs-poc -verified:confirmed", limit: 20 }
+```
+
+An agent calls `query_findings` the same way (`{"q": "has:poc tag:class:xss"}`);
+a bad `q` comes back as a tool error with the parse message, and `cursor` is
+the previous page's `next_cursor`.
+
+To work on every finding a query matches, fan out over it: `all: true`
+returns every match unpaged, and a `for_each` takes its rows. Each `item` is a
+slim row (`id`, `title`, `severity`, `scope`, `location`, `concern_id`,
+`tags`, `declared_at`, `run_id`).
+
+```yaml
+steps:
+  - id: tagged
+    action: findings.query
+    with: { q: "tag:needs-poc severity>=high", all: true }
+  - id: poc
+    agent: poc-writer
+    for_each: "{{ (steps.tagged.output | fromjson).rows | tojson }}"
+    max_parallel: 4
+    prompt: |
+      Write a proof of concept for finding {{ item.id }}: {{ item.title }}
+      ({{ item.location }}). When it works, tag it `has-poc` with tag_findings.
+```
+
+`| tojson` hands `for_each` an exact JSON array rather than relying on how the
+template engine happens to print a list.
+
+Control plane: the Findings page has a query bar. Press `/` to focus it. Typing
+offers fuzzy suggestions (keys, then values with counts); Enter or Tab accepts
+one, Escape clears the draft, and Backspace on an empty draft turns the last
+chip back into text. An invalid query shows its error on the page instead of
+stale results. The query lives in the URL, so
+`/findings?q=severity%3Ahigh%20tag%3Aneeds-poc` is a shareable link, and the
+severity tiles toggle `severity:<x>` in it. The table has a Tags column, and a
+banner names any workspace whose tag log could not be read (its findings still
+show with their declared tags, so tag filters may miss them).
+
+The same query reaches the API as `GET /api/findings?q=…`. The response adds
+`facets` (per key, `[{value, count}]` over the scope-filtered but unqueried set;
+they feed the suggestions and tiles) and `tags_unavailable` (the workspaces
+above, each `{ws_id, project}` where `project` is the path basename a finding
+row carries; limited to the request's scope: the `ws_id` asked for, or a
+workspace with a finding in the scope). An invalid `q` is a 400 with
+`{error, token, code, start, end}`: `token` is the 0-based token index, and the
+offsets are in characters.
 
 ## CLI
 

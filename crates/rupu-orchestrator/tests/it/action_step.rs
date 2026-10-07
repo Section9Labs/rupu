@@ -1306,3 +1306,138 @@ async fn step_level_findings_profile_reaches_findings_record() {
         "Admin console reachable without authentication"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A workflow fans out over a findings query: an `action: findings.query` step
+// with `all: true` feeds a `for_each`, one unit per matching finding.
+// ---------------------------------------------------------------------------
+
+fn findings_dispatcher(workspace: &Path, run_id: &str) -> Arc<ToolDispatcher> {
+    Arc::new(
+        ToolDispatcher::new(
+            Arc::new(Registry::empty()),
+            McpPermission::new(PermissionMode::Bypass, vec!["*".into()]),
+        )
+        .with_findings(rupu_mcp::FindingsContext {
+            workspace_path: workspace.to_path_buf(),
+            scope_name: "tag-fanout".into(),
+            run_id: run_id.into(),
+            model: "mock-1".into(),
+            surface: rupu_coverage::Surface::Workflow,
+            options: rupu_coverage::FindingWriteOptions::default(),
+            codename: None,
+            provider: None,
+        }),
+    )
+}
+
+async fn run_fanout(
+    yaml: &str,
+    tmp: &Path,
+    dispatcher: Arc<ToolDispatcher>,
+) -> rupu_orchestrator::runner::OrchestratorRunResult {
+    let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
+        workflow: Workflow::parse(yaml).unwrap(),
+        inputs: BTreeMap::new(),
+        workspace_id: "ws_tag_fanout".into(),
+        naming: None,
+        workspace_path: tmp.to_path_buf(),
+        transcript_dir: tmp.join("transcripts"),
+        factory: Arc::new(EchoFactory),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::new(RunStore::new(tmp.join("runs")))),
+        workflow_yaml: Some(yaml.to_string()),
+        resume_from: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        action_dispatcher: Some(dispatcher),
+        pause: None,
+    };
+    run_workflow(opts).await.expect("workflow runs")
+}
+
+/// Records `n` findings, tags the first `tagged` of them `needs-poc`, and
+/// returns the tagged ids in recording order.
+async fn seed_findings(d: &ToolDispatcher, n: usize, tagged: usize) -> Vec<String> {
+    let mut ids = Vec::new();
+    for i in 0..n {
+        let out = d
+            .call_with_findings_profile(
+                "findings.record",
+                serde_json::json!({
+                    "scope": "host",
+                    "target_ref": format!("host-{i}.internal.example"),
+                    "summary": format!("Admin console {i} reachable without authentication"),
+                    "severity": "high",
+                    "rationale": "GET /admin returned 200 with no session.",
+                }),
+                rupu_coverage::FindingProfile::Summary,
+            )
+            .await
+            .expect("record");
+        ids.push(out.trim_start_matches("finding_id: ").trim().to_string());
+    }
+    let tagged_ids: Vec<String> = ids[..tagged].to_vec();
+    d.call(
+        "findings.tag",
+        serde_json::json!({ "finding_ids": tagged_ids, "add": ["needs-poc"] }),
+    )
+    .await
+    .expect("tag");
+    tagged_ids
+}
+
+const WF_TAG_FANOUT: &str = r#"
+name: tag-fanout
+steps:
+  - id: tagged
+    action: findings.query
+    with:
+      q: "tag:needs-poc"
+      all: true
+  - id: poc
+    agent: poc-writer
+    for_each: "{{ (steps.tagged.output | fromjson).rows | tojson }}"
+    prompt: "poc {{ item.id }}"
+"#;
+
+#[tokio::test]
+async fn for_each_fans_out_over_every_finding_a_tag_query_matches() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = findings_dispatcher(tmp.path(), "run_seed");
+    // More matches than one page (500) holds: `all` must return every one.
+    let tagged = seed_findings(
+        &d,
+        rupu_coverage::MAX_LIMIT + 5,
+        rupu_coverage::MAX_LIMIT + 3,
+    )
+    .await;
+
+    let res = run_fanout(WF_TAG_FANOUT, tmp.path(), d).await;
+    let poc = res
+        .step_results
+        .iter()
+        .find(|s| s.step_id == "poc")
+        .unwrap();
+    assert!(poc.success, "{}", poc.output);
+    let mut seen: Vec<String> = poc
+        .items
+        .iter()
+        .map(|it| it.item["id"].as_str().unwrap().to_string())
+        .collect();
+    seen.sort();
+    let mut want = tagged.clone();
+    want.sort();
+    assert_eq!(
+        seen, want,
+        "one unit per tagged finding, untagged ones skipped"
+    );
+    assert!(poc.items.iter().all(|it| it
+        .output
+        .contains(&format!("poc {}", it.item["id"].as_str().unwrap()))));
+}

@@ -35,6 +35,11 @@ pub struct NetflowConfig {
     /// in milliseconds. Defaults to 3000.
     #[serde(default = "NetflowConfig::default_subprocess_linger_ms")]
     pub subprocess_linger_ms: u64,
+    /// Memory budget, in MiB, for the flow rows `cp serve`'s netflow index
+    /// keeps resident. Over budget, the oldest files' rows are dropped and
+    /// re-read on demand: slower, never wrong. Defaults to 256.
+    #[serde(default = "NetflowConfig::default_cp_index_budget_mb")]
+    pub cp_index_budget_mb: u64,
 }
 
 impl NetflowConfig {
@@ -61,6 +66,10 @@ impl NetflowConfig {
     fn default_subprocess_linger_ms() -> u64 {
         3000
     }
+
+    fn default_cp_index_budget_mb() -> u64 {
+        256
+    }
 }
 
 impl Default for NetflowConfig {
@@ -72,6 +81,7 @@ impl Default for NetflowConfig {
             subprocess_capture: Self::default_subprocess_capture(),
             subprocess_poll_ms: Self::default_subprocess_poll_ms(),
             subprocess_linger_ms: Self::default_subprocess_linger_ms(),
+            cp_index_budget_mb: Self::default_cp_index_budget_mb(),
         }
     }
 }
@@ -86,6 +96,7 @@ mod tests {
         assert!(cfg.asn_auto_refresh);
         assert_eq!(cfg.asn_refresh_interval_days, 7);
         assert!(cfg.asn_source_url.contains("iptoasn.com"));
+        assert_eq!(cfg.cp_index_budget_mb, 256);
     }
 
     #[test]

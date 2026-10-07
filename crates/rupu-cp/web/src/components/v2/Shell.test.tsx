@@ -66,6 +66,8 @@ function mockApi() {
   vi.spyOn(api, 'getSessions').mockResolvedValue([]);
   vi.spyOn(api, 'getCoverage').mockResolvedValue([]);
   vi.spyOn(api, 'getFindings').mockResolvedValue({
+    facets: {},
+    tags_unavailable: [],
     findings: [],
     summary: { total: 0, by_severity: {} } as never,
   });

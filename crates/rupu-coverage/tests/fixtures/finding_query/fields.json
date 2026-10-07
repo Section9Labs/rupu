@@ -1,0 +1,18 @@
+[
+  {"key": "severity", "aliases": ["sev"], "kind": "severity", "values": ["info", "low", "medium", "high", "critical"]},
+  {"key": "tag", "aliases": [], "kind": "tag", "values": []},
+  {"key": "has", "aliases": [], "kind": "enum", "values": ["tags", "report", "poc", "cwe"]},
+  {"key": "project", "aliases": [], "kind": "text", "values": []},
+  {"key": "cwe", "aliases": [], "kind": "cwe", "values": []},
+  {"key": "owner", "aliases": [], "kind": "text", "values": []},
+  {"key": "product", "aliases": [], "kind": "text", "values": []},
+  {"key": "verified", "aliases": [], "kind": "enum", "values": ["unverified", "confirmed", "disputed", "inconclusive"]},
+  {"key": "profile", "aliases": [], "kind": "enum", "values": ["full", "summary"]},
+  {"key": "scope", "aliases": [], "kind": "enum", "values": ["line", "file", "repo", "host", "endpoint", "resource"]},
+  {"key": "concern", "aliases": [], "kind": "text", "values": []},
+  {"key": "agent", "aliases": [], "kind": "text", "values": []},
+  {"key": "workflow", "aliases": [], "kind": "text", "values": []},
+  {"key": "file", "aliases": [], "kind": "text", "values": []},
+  {"key": "run", "aliases": [], "kind": "text", "values": []},
+  {"key": "id", "aliases": [], "kind": "text", "values": []}
+]

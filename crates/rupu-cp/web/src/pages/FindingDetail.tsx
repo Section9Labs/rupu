@@ -22,12 +22,16 @@ import CrossReferences from '../components/findings/report/CrossReferences';
 import { Button } from '../components/ui/Button';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
 import { Spinner } from '../components/ui/Spinner';
+import { TagEditor, type TagChangeReport } from '../components/findings/tags/TagEditor';
+import { TagHistory } from '../components/findings/tags/TagHistory';
+import type { TagSuggestion } from '../components/findings/tags/TagInput';
+import { changedOutcomes, summarizeTagResult } from '../components/findings/tags/tagResult';
 
 const RAIL: [string, string][] = [
   ['s-desc', 'Description'], ['s-impact', 'Impact'], ['s-loc', 'Location'], ['s-root', 'Root cause'],
   ['s-chain', 'Call chain'], ['s-evidence', 'Evidence'], ['s-blocks', 'Evidence blocks'], ['s-artifacts', 'PoC artifacts'], ['s-repro', 'Replication'],
   ['s-remediation', 'Remediation'], ['s-patch', 'Patch'], ['s-ci', 'CI/CD detection'], ['s-reg', 'Regression test'],
-  ['s-refs', 'References'], ['s-prov', 'Provenance'],
+  ['s-refs', 'References'], ['s-tags', 'Tags'], ['s-prov', 'Provenance'],
 ];
 
 function BackLink() {
@@ -126,12 +130,86 @@ function Provenance({ detail }: { detail: Detail }) {
   );
 }
 
+/** The editable tag row plus the suggestions it needs. Changes go through
+ *  `POST /api/findings/tags`. Only a failed POST, or an answer that changed
+ *  nothing and names an error (a workspace error or an unknown id), is a failed
+ *  change. Once anything changed the write is committed: the page refetches
+ *  the finding, a failed refetch is a note (the chips take the write's own
+ *  `after`), and a partial error still shows. */
+function FindingTags({
+  detail,
+  onChanged,
+  onSaved,
+}: {
+  detail: Detail;
+  onChanged: () => Promise<void>;
+  onSaved: (tags: string[]) => void;
+}) {
+  const [suggestions, setSuggestions] = useState<TagSuggestion[]>([]);
+  useEffect(() => {
+    let live = true;
+    api.getTagsInUse({ wsId: detail.ws_id }).then(
+      (t) => { if (live) setSuggestions(t); },
+      () => { /* suggestions are optional */ },
+    );
+    return () => { live = false; };
+  }, [detail.ws_id]);
+  const change = async (mode: 'add' | 'remove', tag: string): Promise<TagChangeReport> => {
+    const r = await api.tagFindings([detail.id], mode === 'add' ? { add: [tag] } : { remove: [tag] });
+    const s = summarizeTagResult(r, mode, (ws) => (ws === detail.ws_id && detail.project) || ws);
+    const changed = changedOutcomes(r);
+    if (changed.length === 0) {
+      if (!s.ok) throw new Error(s.message);
+      return {};
+    }
+    const report: TagChangeReport = s.ok ? {} : { error: s.message };
+    try {
+      await onChanged();
+    } catch (e: unknown) {
+      const mine = changed.find((o) => o.finding_id === detail.id);
+      if (mine) onSaved(mine.after);
+      report.note = `Saved, but the page couldn't refresh: ${apiErrorMessage(e)}`;
+    }
+    return report;
+  };
+  return (
+    <TagEditor
+      tags={detail.tags ?? []}
+      suggestions={suggestions}
+      disabledReason={detail.tags_editable ? null : "This project's tag log couldn't be read, so its tags can't be changed here."}
+      onAdd={(t) => change('add', t)}
+      onRemove={(t) => change('remove', t)}
+    />
+  );
+}
+
+function TagsSection({ detail }: { detail: Detail }) {
+  return (
+    <Section id="s-tags" title="Tags">
+      {/* An unreadable tag log has an unknown history, not an empty one. */}
+      {detail.tags_editable ? (
+        <details>
+          <summary className="cursor-pointer text-ui text-ink-dim">Tag history ({detail.tag_history.length})</summary>
+          <div className="mt-2">
+            <TagHistory events={detail.tag_history} />
+          </div>
+        </details>
+      ) : (
+        <p className="text-note text-ink-mute">Tag history unavailable: this project's tag log couldn't be read.</p>
+      )}
+    </Section>
+  );
+}
+
 export default function FindingDetail() {
   const { id = '' } = useParams();
   const [detail, setDetail] = useState<Detail | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The finding the route shows now: a refetch answering for an earlier one is dropped.
+  const currentId = useRef(id);
 
   useEffect(() => {
+    currentId.current = id;
     let live = true;
     setDetail(null);
     setError(null);
@@ -141,6 +219,16 @@ export default function FindingDetail() {
     );
     return () => { live = false; };
   }, [id]);
+
+  const refetch = async () => {
+    const forId = id;
+    const d = await api.getFinding(forId);
+    if (currentId.current === forId) setDetail(d);
+  };
+  const patchTags = (tags: string[]) => {
+    const forId = id;
+    setDetail((d) => (d && currentId.current === forId ? { ...d, tags } : d));
+  };
 
   if (error) return <div className="p-8"><ErrorBanner>{error}</ErrorBanner></div>;
   if (!detail) return <div className="p-8"><Spinner label="Loading finding" /></div>;
@@ -152,12 +240,14 @@ export default function FindingDetail() {
       <div className="mx-auto max-w-4xl space-y-6 p-8">
         <TopBar id={detail.id} />
         <h1 className="text-2xl font-semibold text-ink">{detail.summary}</h1>
+        <FindingTags detail={detail} onChanged={refetch} onSaved={patchTags} />
         <p className="text-ui text-ink-mute">
           {detail.profile === 'full'
             ? UNREADABLE_REPORT_NOTE
             : 'This finding was recorded as a summary, without a full report.'}
         </p>
         <FindingEvidence finding={detail} />
+        <TagsSection detail={detail} />
         <Provenance detail={detail} />
       </div>
     );
@@ -186,6 +276,7 @@ export default function FindingDetail() {
       <article className="min-w-0 max-w-4xl space-y-7">
         <TopBar id={detail.id} />
         <ReportHeader finding={detail} report={report} />
+        <FindingTags detail={detail} onChanged={refetch} onSaved={patchTags} />
         {/* The rail (and its meter) only shows from `lg` up; below that this
             compact line carries the completeness instead. */}
         <p data-testid="completeness-compact" className="text-note text-ink-mute lg:hidden">
@@ -208,6 +299,7 @@ export default function FindingDetail() {
         <Section id="s-remediation" title="Remediation"><div className="text-ink-dim"><Markdown text={report.remediation} /></div></Section>
         <FixSections report={report} />
         <Section id="s-refs" title="References"><CrossReferences refs={report.cross_references} references={report.references} /></Section>
+        <TagsSection detail={detail} />
         <Provenance detail={detail} />
       </article>
     </div>

@@ -60,6 +60,16 @@ function presetFrom(preset: TimeRangePreset, now: Date): string | undefined {
   return new Date(now.getTime() - PRESET_HOURS[preset] * 3_600_000).toISOString();
 }
 
+/** The applied value for a relative preset, resolved against `now` —
+ *  exactly what clicking that preset produces. */
+export function presetValue(
+  preset: Exclude<TimeRangePreset, 'custom'>,
+  now: Date,
+): TimeRangeValue {
+  const from = presetFrom(preset, now);
+  return from !== undefined ? { preset, from } : { preset };
+}
+
 /** A `datetime-local` input's value (local wall-clock, no offset) -> RFC
  *  3339 UTC. `Date`'s parser treats an offset-less date-time string as
  *  LOCAL time (ECMA-262 `Date.parse`), which is exactly the
@@ -147,8 +157,7 @@ export function TimeRangePicker({ value, onChange, now = () => new Date() }: Tim
       setCustomEditorOpen(true);
       return;
     }
-    const from = presetFrom(preset, now());
-    onChange(from !== undefined ? { preset, from } : { preset });
+    onChange(presetValue(preset, now()));
   }
 
   function applyCustom() {

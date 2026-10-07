@@ -27,6 +27,8 @@ afterEach(() => {
 // test (the page swallows their rejections, but stubbing avoids real fetches).
 beforeEach(() => {
   vi.spyOn(api, 'getFindings').mockResolvedValue({
+    facets: {},
+    tags_unavailable: [],
     findings: [],
     summary: { total: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0 },
   });

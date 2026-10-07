@@ -88,6 +88,10 @@ pub struct AppState {
     /// contract that lets it skip re-walking every run store on every
     /// `/api/netflow` + `/api/netflow/explorer` request.
     pub run_meta_cache: Arc<crate::api::netflow::RunMetaCache>,
+    /// The shared, stat-validated netflow ledger index every local ledger
+    /// read goes through (see [`crate::netflow_index`]); its memory budget
+    /// is applied per request from `[netflow].cp_index_budget_mb`.
+    pub netflow_index: Arc<crate::netflow_index::NetflowIndex>,
     /// Each remote host's last health probe, so `GET /api/hosts` (polled by
     /// the shell from every page) answers without waiting on SSH — see
     /// [`crate::host::probe_cache`].
@@ -152,6 +156,9 @@ impl AppState {
             token_set: false,
             asn_cache: Arc::new(crate::api::netflow::AsnCache::default()),
             run_meta_cache: Arc::new(crate::api::netflow::RunMetaCache::default()),
+            netflow_index: Arc::new(crate::netflow_index::NetflowIndex::new(
+                crate::netflow_index::DEFAULT_BUDGET_MB * 1024 * 1024,
+            )),
             host_probes: Arc::default(),
         }
     }

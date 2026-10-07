@@ -89,6 +89,8 @@ function mockApi() {
   vi.spyOn(api, 'getAutoflowClaims').mockResolvedValue([]);
   vi.spyOn(api, 'getWorkers').mockResolvedValue([]);
   vi.spyOn(api, 'getFindings').mockResolvedValue({
+    facets: {},
+    tags_unavailable: [],
     findings: [],
     summary: { total: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0 },
   });
@@ -141,6 +143,22 @@ describe('AppRoutes shell branch', () => {
   it('v2: /findings redirects to /security?tab=findings', async () => {
     renderApp('v2', '/findings');
     await waitFor(() => expect(screen.getByTestId('loc')).toHaveTextContent('/security?tab=findings'));
+  });
+
+  it('v2: /findings?q= keeps the query through the redirect', async () => {
+    renderApp('v2', '/findings?q=tag%3Aneeds-poc+severity%3E%3Dhigh');
+    await waitFor(() =>
+      expect(screen.getByTestId('loc')).toHaveTextContent(
+        '/security?tab=findings&q=tag%3Aneeds-poc+severity%3E%3Dhigh',
+      ),
+    );
+  });
+
+  it('v2: the redirect target owns its tab even when the link names another', async () => {
+    renderApp('v2', '/findings?tab=coverage&q=tag%3Aa');
+    await waitFor(() =>
+      expect(screen.getByTestId('loc')).toHaveTextContent('/security?tab=findings&q=tag%3Aa'),
+    );
   });
 
   it('v2: /workers redirects to /fleet?tab=workers', async () => {
