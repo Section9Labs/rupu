@@ -409,6 +409,42 @@ describe('SortableTable virtualization', () => {
       expect(screen.getAllByRole('row').some((r) => r.textContent?.includes('a-very-long-host'))).toBe(false);
     });
 
+    it('picks the probe rows once, in the measured fonts (no default-font pass first)', () => {
+      // jsdom computes no font; give every element one so the table reads
+      // real fonts from its mounted cells, as a browser does.
+      const original = window.getComputedStyle.bind(window);
+      vi.spyOn(window, 'getComputedStyle').mockImplementation((el, pseudo) => {
+        const cs = original(el, pseudo);
+        return new Proxy(cs, {
+          get(target, prop) {
+            if (prop === 'fontSize') return '13px';
+            if (prop === 'fontFamily') return 'monospace';
+            const v = Reflect.get(target, prop, target);
+            return typeof v === 'function' ? v.bind(target) : v;
+          },
+        });
+      });
+      let widthTextCalls = 0;
+      const counted = wcols.map((c) =>
+        c.key === 'host'
+          ? {
+              ...c,
+              widthText: (r: WRow) => {
+                widthTextCalls++;
+                return r.host;
+              },
+            }
+          : c,
+      );
+      const { container } = render(
+        <SortableTable columns={counted} rows={wrows(1000)} rowKey={(r) => r.id} virtualize={{ threshold: 500 }} />,
+      );
+      // One selection pass reads each row's text once.
+      expect(widthTextCalls).toBe(1000);
+      expect(probeTexts(container, 0)).toContain('a-very-long-host-name.example.com');
+      expect(probeTexts(container, 2)).toContain('1234567 ms');
+    });
+
     it('does not change on scroll', async () => {
       const { container } = render(
         <SortableTable columns={wcols} rows={wrows(1000)} rowKey={(r) => r.id} virtualize={{ threshold: 500 }} />,

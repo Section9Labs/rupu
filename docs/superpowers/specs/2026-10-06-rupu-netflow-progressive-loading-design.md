@@ -154,6 +154,13 @@ so pruned ledgers do not linger in tier 1. (Ruling R5: a keep-list from
 the global listing would drop live entries that project/run reads spell
 with a different, non-canonical path.)
 
+Entries are keyed by the ledger path with its directory canonicalized, so
+one file reached through two spellings (the global listing's canonical
+directories, a project/run read's workspace path as registered) is one
+entry. Each directory spelling is canonicalized once and cached; the cache
+is cleared with each sweep, which bounds how long a retargeted symlink
+keeps its old key.
+
 `serve_on` prewarms the index on the blocking pool at startup, beside
 `usage::prewarm`, logging elapsed time.
 
@@ -163,7 +170,10 @@ with a different, non-canonical path.)
   default `256`. Accounted bytes = sum over resident tier-2 row sets
   (fixed row size × rows + string-table bytes + id map).
 - Over budget: evict tier 2 of the files with the oldest `max_ts` first
-  until under budget. Tier 1 is never evicted.
+  until under a low-water mark of 90% of the budget. Tier 1 is never
+  evicted. (Stopping right at the budget made every read past it rescan and
+  sort the whole entry map, which is quadratic once history outgrows the
+  budget; the headroom amortizes a pass over many reads.)
 - Row sets are `Arc`-shared; a request holds its own `Arc`s, so eviction
   never disturbs an in-flight response.
 - A query that needs an evicted file's rows re-reads that file (through
@@ -267,8 +277,10 @@ components, styles, copy, or controls.
   cell over ALL rows, so a hidden `aria-hidden inert` probe `<tbody>`
   renders zero-height, `visibility: collapse` copies of each column's
   widest-text rows (chosen once per data load via `Column.widthText`,
-  measured with canvas `measureText`) — reproducing the full table's
-  widths without mounting every row.
+  measured with canvas `measureText` in the fonts read from the mounted
+  cells — selection waits for those fonts rather than running once in a
+  default font first; both happen before paint) — reproducing the full
+  table's widths without mounting every row.
 - A focused row stays mounted while focused; when virtual, the table
   carries `aria-rowcount` / `aria-rowindex`.
 - Verified on 40,261 rows against the old build: identical column widths

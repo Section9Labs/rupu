@@ -3191,19 +3191,9 @@ mod tests {
                     range,
                     &ExplorerFilters::default(),
                 );
-                // `host_rollup` emits its rows in `HashMap` order (a fresh
-                // random seed per call), so two reads of the SAME data differ
-                // there regardless of the reader; compare that list sorted.
-                let normalized = |resp: &NetflowResponse| {
-                    let mut v = serde_json::to_value(resp).unwrap();
-                    if let Some(hosts) = v["hosts"].as_array_mut() {
-                        hosts.sort_by_key(|h| h.to_string());
-                    }
-                    v
-                };
                 assert_eq!(
-                    normalized(&got),
-                    normalized(&want),
+                    serde_json::to_value(&got).unwrap(),
+                    serde_json::to_value(&want).unwrap(),
                     "budget {budget}, range {range:?}"
                 );
             }
