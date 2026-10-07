@@ -1,7 +1,7 @@
-//! `rupu agentiflow run <def>` — launch an agentiflow in the foreground — plus
-//! `list` / `status <id>`, which read the runs it leaves under
-//! `<global>/agentiflows/`, and `send` / `stop`, the operator's controls over
-//! a run that is in flight.
+//! `rupu agentiflow run <def>` — launch an agentiflow in the foreground (or,
+//! with `--detach`, in a background process of its own) — plus `list` /
+//! `status <id>`, which read the runs it leaves under `<global>/agentiflows/`,
+//! and `send` / `stop`, the operator's controls over a run that is in flight.
 //!
 //! Wires together: paths → layered config → definition loader → engagement
 //! profiles (fail-closed `validate`) → lead agent → provider config → the two
@@ -59,9 +59,25 @@ pub enum Action {
     /// profiles, and runs it to a stop: goals met, coverage reached, a budget
     /// or ceiling, or an operator stop. Prints the run id up front (stderr) and
     /// the outcome at the end.
+    ///
+    /// With `--detach` the run goes to a background process of its own and the
+    /// command returns as soon as the run has started, printing the run id on
+    /// stdout; follow it with `agentiflow status <id>`, steer it with `send`,
+    /// end it with `stop`. A run that cannot start (no credential, an invalid
+    /// definition) is reported here with the cause, not left to fail unseen.
     Run {
         /// Agentiflow name (matches an `agentiflows/<name>.yaml` file).
         def: String,
+        /// Run in the background: start the run in its own process group and
+        /// return once it has started. The background process's stderr is kept
+        /// in `<run dir>/detach.log`; a run that fails before it starts has
+        /// that error printed here and no run directory left behind.
+        #[arg(long)]
+        detach: bool,
+        /// Internal: the run id a detached parent minted for this process, so
+        /// the id it printed is the run this process records.
+        #[arg(long, hide = true, value_name = "ID", conflicts_with = "detach")]
+        run_id: Option<String>,
     },
     /// List agentiflow runs, newest first.
     ///
@@ -118,7 +134,11 @@ pub async fn handle(
     all_columns: bool,
 ) -> ExitCode {
     let result = match action {
-        Action::Run { def } => run_cmd(&def, global_format).await,
+        Action::Run {
+            def,
+            detach,
+            run_id,
+        } => run_cmd(&def, detach, run_id, global_format).await,
         Action::List => list_cmd(global_format, absolute, all_columns),
         Action::Status { id } => status_cmd(&id, global_format),
         Action::Send { id, message, now } => send_cmd(&id, &message, now),
@@ -142,7 +162,12 @@ pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Re
     formats::ensure_supported(command_name, format, supported)
 }
 
-async fn run_cmd(def_name: &str, format: Option<OutputFormat>) -> anyhow::Result<()> {
+async fn run_cmd(
+    def_name: &str,
+    detach: bool,
+    run_id: Option<String>,
+    format: Option<OutputFormat>,
+) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
     let pwd = std::env::current_dir()?;
@@ -210,7 +235,18 @@ async fn run_cmd(def_name: &str, format: Option<OutputFormat>) -> anyhow::Result
         kind: provider_factory::resolve_kind(&provider_name, &cfg.providers),
     };
 
-    let run_id = new_run_id();
+    // The id is minted exactly once, here: a detached parent hands it to its
+    // child (`--run-id`), which runs the foreground path below under it.
+    let run_id = match run_id {
+        Some(id) => {
+            validate_run_id(&id)?;
+            id
+        }
+        None => new_run_id(),
+    };
+    if detach {
+        return spawn_detached(def_name, &def.name, &run_id, &global, format).await;
+    }
     let run_dir = agentiflow_dir(&global).join(&run_id);
 
     // Netflow sink: built before any provider so the launch-time builds below
@@ -264,6 +300,188 @@ async fn run_cmd(def_name: &str, format: Option<OutputFormat>) -> anyhow::Result
                 run_dir.join("agentiflow.json").display()
             );
         }
+    }
+    Ok(())
+}
+
+/// A run id a caller supplied (`--run-id`) names a directory under
+/// `<global>/agentiflows/`, so it must look like one `new_run_id` mints: `af_`
+/// and a plain token, never a path.
+fn validate_run_id(id: &str) -> anyhow::Result<()> {
+    let token = id.strip_prefix("af_").unwrap_or_default();
+    if token.is_empty() || !token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        anyhow::bail!("`{id}` is not a valid agentiflow run id (expected `af_` and a token)");
+    }
+    Ok(())
+}
+
+/// What the re-exec'd child of `run --detach` is invoked with: the plain
+/// foreground `run`, under the id the parent minted. `--` keeps a definition
+/// name from being read as a flag.
+fn detached_argv(def_name: &str, run_id: &str) -> Vec<String> {
+    ["agentiflow", "run", "--run-id", run_id, "--", def_name]
+        .map(String::from)
+        .to_vec()
+}
+
+/// `--format json` for a detached `agentiflow run`.
+#[derive(Serialize)]
+struct DetachedReport {
+    kind: &'static str,
+    version: u8,
+    id: String,
+    name: String,
+    run_dir: String,
+}
+
+/// The file a detached run's stderr is kept in, under its run directory.
+const DETACH_LOG: &str = "detach.log";
+
+/// How long the parent of `run --detach` waits to learn the child started.
+const DETACH_STARTUP_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How the child of `run --detach` was doing when the parent stopped waiting.
+#[derive(Debug)]
+enum Startup {
+    /// The run's record exists: the run started.
+    Started,
+    /// The child exited without ever writing a record: it failed to start.
+    Exited(std::process::ExitStatus),
+    /// Neither, within the wait (a very slow provider start, say).
+    Pending,
+}
+
+/// Wait for `child` to either write the run's record (it started) or exit
+/// without one (it did not). The record is written before the first round, so
+/// a healthy start resolves in milliseconds and `--detach` stays quick.
+async fn await_startup(
+    child: &mut std::process::Child,
+    run_dir: &Path,
+    wait: std::time::Duration,
+) -> std::io::Result<Startup> {
+    let record = run_dir.join("agentiflow.json");
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        if record.exists() {
+            return Ok(Startup::Started);
+        }
+        if let Some(status) = child.try_wait()? {
+            // It may have written the record in the instant before it exited.
+            return Ok(if record.exists() {
+                Startup::Started
+            } else {
+                Startup::Exited(status)
+            });
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(Startup::Pending);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// The last few KiB of a detached run's log, for an error message.
+fn log_tail(log: &Path) -> String {
+    const TAIL: u64 = 4096;
+    let tail = std::fs::File::open(log).and_then(|mut f| {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let len = f.metadata()?.len();
+        f.seek(SeekFrom::Start(len.saturating_sub(TAIL)))?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf)?;
+        Ok(buf)
+    });
+    match tail {
+        Ok(buf) if !buf.iter().all(u8::is_ascii_whitespace) => {
+            String::from_utf8_lossy(&buf).trim().to_string()
+        }
+        Ok(_) => "(it printed nothing)".to_string(),
+        Err(e) => format!("(its log {} could not be read: {e})", log.display()),
+    }
+}
+
+/// The parent half of `run --detach`: start this binary again as the run,
+/// detached, and return once the run has started, without waiting for it to
+/// finish.
+///
+/// Detached like the CP's launchers and the fleet's unit launcher
+/// (`SubprocessUnitLauncher`): its own process group (`process_group(0)`, so a
+/// Ctrl-C at this terminal or this process exiting does not take the run
+/// down), stdin/stdout null, and `RUPU_HOME` pinned to the home this process
+/// resolved so the child records the run where the id printed here is looked
+/// for. The child is the process that runs `run_agentiflow`, so the
+/// `runner_pid` it stamps is the detached process: what `stop` and the orphan
+/// reaper signal.
+///
+/// A detached run that cannot start must not look like one that did, so this
+/// is a handshake. The child's stderr goes to `<run dir>/detach.log` (the run
+/// directory is made first; `run_agentiflow` accepts one that exists and
+/// refuses only an existing record), and this process waits for the record to
+/// appear (started: print the id) or for the child to exit without one
+/// (failed: its log is the error, and the record-less directory is removed).
+async fn spawn_detached(
+    def_name: &str,
+    name: &str,
+    run_id: &str,
+    global: &Path,
+    format: Option<OutputFormat>,
+) -> anyhow::Result<()> {
+    let exe = std::env::current_exe().context("locate the rupu binary to detach")?;
+    let run_dir = agentiflow_dir(global).join(run_id);
+    std::fs::create_dir_all(&run_dir).with_context(|| format!("create {}", run_dir.display()))?;
+    let log_path = run_dir.join(DETACH_LOG);
+    let log = std::fs::File::create(&log_path)
+        .with_context(|| format!("create {}", log_path.display()))?;
+
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args(detached_argv(def_name, run_id))
+        .env("RUPU_HOME", global)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(log));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&run_dir);
+            return Err(anyhow::Error::new(e).context(format!("detach {}", exe.display())));
+        }
+    };
+
+    // `child` is dropped unwaited on every path that returns Ok: this process
+    // exits next, and the child is then reparented, so nothing is left to reap it.
+    match await_startup(&mut child, &run_dir, DETACH_STARTUP_WAIT)
+        .await
+        .context("wait for the detached run to start")?
+    {
+        Startup::Started => {}
+        Startup::Exited(status) => {
+            // Read the log before the directory that holds it goes.
+            let tail = log_tail(&log_path);
+            let _ = std::fs::remove_dir_all(&run_dir);
+            anyhow::bail!("the detached agentiflow exited ({status}) before it started:\n{tail}");
+        }
+        Startup::Pending => eprintln!(
+            "agentiflow {name}: run {run_id} had not started after {}s; it is still going in \
+             the background. Its output is in {}",
+            DETACH_STARTUP_WAIT.as_secs(),
+            log_path.display()
+        ),
+    }
+
+    match format.unwrap_or(OutputFormat::Table) {
+        OutputFormat::Json => formats::print_json(&DetachedReport {
+            kind: "agentiflow_run_detached",
+            version: 1,
+            id: run_id.to_string(),
+            name: name.to_string(),
+            run_dir: run_dir.display().to_string(),
+        })?,
+        _ => println!("agentiflow {name}: run {run_id} (detached)"),
     }
     Ok(())
 }
@@ -1367,14 +1585,199 @@ mod tests {
     fn run_takes_a_definition_name_and_only_table_or_json() {
         let action = parse(["rupu", "agentiflow", "run", "acme"]);
         match &action {
-            Action::Run { def } => assert_eq!(def, "acme"),
+            Action::Run {
+                def,
+                detach,
+                run_id,
+            } => {
+                assert_eq!(def, "acme");
+                assert!(!detach, "foreground unless asked");
+                assert_eq!(run_id, &None);
+            }
             other => panic!("expected `run`, got {other:?}"),
         }
         assert!(ensure_output_format(&action, OutputFormat::Json).is_ok());
         assert!(ensure_output_format(&action, OutputFormat::Csv).is_err());
     }
 
+    #[test]
+    fn run_detach_and_the_hidden_run_id_parse_but_never_together() {
+        use clap::Parser;
+        let detached = parse(["rupu", "agentiflow", "run", "acme", "--detach"]);
+        assert!(matches!(
+            detached,
+            Action::Run {
+                detach: true,
+                run_id: None,
+                ..
+            }
+        ));
+
+        let child = parse(["rupu", "agentiflow", "run", "--run-id", "af_01X", "acme"]);
+        match child {
+            Action::Run { run_id, detach, .. } => {
+                assert_eq!(run_id.as_deref(), Some("af_01X"));
+                assert!(!detach);
+            }
+            other => panic!("expected `run`, got {other:?}"),
+        }
+
+        assert!(crate::Cli::try_parse_from([
+            "rupu",
+            "agentiflow",
+            "run",
+            "acme",
+            "--detach",
+            "--run-id",
+            "af_01X"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn the_run_id_flag_is_hidden_from_help() {
+        use clap::CommandFactory;
+        let mut cmd = crate::Cli::command();
+        let run = cmd
+            .find_subcommand_mut("agentiflow")
+            .and_then(|a| a.find_subcommand_mut("run"))
+            .expect("agentiflow run");
+        let help = run.render_long_help().to_string();
+        assert!(help.contains("--detach"), "{help}");
+        assert!(!help.contains("--run-id"), "{help}");
+    }
+
+    #[test]
+    fn the_detached_child_runs_the_foreground_path_under_the_parents_id() {
+        let argv = detached_argv("acme", "af_01X");
+        assert_eq!(
+            argv,
+            ["agentiflow", "run", "--run-id", "af_01X", "--", "acme"]
+        );
+        // It parses as the plain foreground `run` carrying that id: no
+        // `--detach`, so it does not detach again.
+        let mut full = vec!["rupu".to_string()];
+        full.extend(argv);
+        match parse_vec(full) {
+            Action::Run {
+                def,
+                detach,
+                run_id,
+            } => {
+                assert_eq!(def, "acme");
+                assert!(!detach);
+                assert_eq!(run_id.as_deref(), Some("af_01X"));
+            }
+            other => panic!("expected `run`, got {other:?}"),
+        }
+        // A definition name that looks like a flag stays a name.
+        let mut full = vec!["rupu".to_string()];
+        full.extend(detached_argv("-x", "af_01X"));
+        assert!(matches!(parse_vec(full), Action::Run { def, .. } if def == "-x"));
+    }
+
+    // ---- the startup handshake ------------------------------------------------
+
+    fn spawn(program: &str, args: &[&str]) -> std::process::Child {
+        std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_child_that_exits_without_a_record_failed_to_start() {
+        let run_dir = tempfile::TempDir::new().unwrap();
+        let mut child = spawn("sh", &["-c", "exit 3"]);
+        let startup = await_startup(
+            &mut child,
+            run_dir.path(),
+            std::time::Duration::from_secs(20),
+        )
+        .await
+        .unwrap();
+        match startup {
+            Startup::Exited(status) => assert_eq!(status.code(), Some(3)),
+            other => panic!("expected `Exited`, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_child_that_writes_its_record_has_started_even_while_it_keeps_running() {
+        let run_dir = tempfile::TempDir::new().unwrap();
+        let mut child = spawn("sleep", &["30"]);
+        let record = run_dir.path().join("agentiflow.json");
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            std::fs::write(record, "{}").unwrap();
+        });
+        let startup = await_startup(
+            &mut child,
+            run_dir.path(),
+            std::time::Duration::from_secs(20),
+        )
+        .await
+        .unwrap();
+        writer.await.unwrap();
+        assert!(matches!(startup, Startup::Started), "{startup:?}");
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the handshake must leave the child running"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_child_that_neither_writes_nor_exits_is_pending_not_failed() {
+        let run_dir = tempfile::TempDir::new().unwrap();
+        let mut child = spawn("sleep", &["30"]);
+        let startup = await_startup(
+            &mut child,
+            run_dir.path(),
+            std::time::Duration::from_millis(200),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(startup, Startup::Pending), "{startup:?}");
+        assert!(child.try_wait().unwrap().is_none());
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn the_log_tail_is_what_the_child_last_said() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let log = tmp.path().join("detach.log");
+        assert!(log_tail(&log).contains("could not be read"));
+        std::fs::write(&log, "  \n").unwrap();
+        assert_eq!(log_tail(&log), "(it printed nothing)");
+        std::fs::write(&log, "error: no credential\n").unwrap();
+        assert_eq!(log_tail(&log), "error: no credential");
+        // A long log keeps its end, where the error is.
+        std::fs::write(&log, format!("{}\nthe real error\n", "x".repeat(10_000))).unwrap();
+        let tail = log_tail(&log);
+        assert!(tail.ends_with("the real error"), "{tail}");
+        assert!(tail.len() <= 4096, "{}", tail.len());
+    }
+
+    #[test]
+    fn a_supplied_run_id_must_look_like_one_the_runner_mints() {
+        assert!(validate_run_id(&new_run_id()).is_ok());
+        assert!(validate_run_id("af_01HZZ_x9").is_ok());
+        for bad in ["", "af_", "01HZZ", "af_../x", "af_a/b", "af_a b", "../af_x"] {
+            assert!(validate_run_id(bad).is_err(), "{bad:?} accepted");
+        }
+    }
+
     fn parse<const N: usize>(argv: [&str; N]) -> Action {
+        parse_vec(argv.iter().map(|s| s.to_string()).collect())
+    }
+
+    fn parse_vec(argv: Vec<String>) -> Action {
         use clap::Parser;
         let cli = crate::Cli::try_parse_from(argv).unwrap();
         let crate::Cmd::Agentiflow { action } = cli.command else {

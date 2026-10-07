@@ -253,6 +253,14 @@ pub enum HardStopOutcome {
 ///    finished on its own meanwhile; the stale snapshot from step 1 must never
 ///    overwrite that. This is the re-check `reap_one` makes too.
 ///
+/// # Known residual
+///
+/// A late coordinator round-write can revert the record from `failed` back to
+/// `running` after step 4. The orphan reaper then re-closes it as
+/// `failed`/`orphaned` with a second `run_stopped` line: self-healing and
+/// harmless. `hard_stop` deliberately does not wait on the coordinator pid to
+/// close that window, because a zombie parent makes such a wait flaky.
+///
 /// Blocking (file IO and up to [`TERM_GRACE`] of grace): call it from
 /// `spawn_blocking` in async code. A record that cannot be read, or the final
 /// write failing, is an error; every signal failure is only logged.
