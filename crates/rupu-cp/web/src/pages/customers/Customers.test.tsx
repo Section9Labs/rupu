@@ -235,10 +235,12 @@ describe('Customers page', () => {
     expect(screen.getByTestId('where')).toHaveTextContent('/projects');
   });
 
-  it('notes hosts whose runs are left out', async () => {
+  it('names hosts whose runs are left out in the warn banner', async () => {
     mount();
     await screen.findByText('Acme Corp');
-    expect(screen.getByText(/mini/)).toBeInTheDocument();
+    expect(screen.getByTestId('hosts-without-customer')).toHaveTextContent(
+      /mini runs an older rupu .* can’t tag every run with a customer — those runs are left out of this view, not counted as zero/,
+    );
   });
 
   it('empty state offers New customer, which opens the dialog', async () => {

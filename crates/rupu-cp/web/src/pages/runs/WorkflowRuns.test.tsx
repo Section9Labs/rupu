@@ -14,6 +14,8 @@ import { api, ApiError } from '../../lib/api';
 import type { RunListRow } from '../../lib/api';
 import { REG_LOCAL, REG_PROD, callsFor, onlyHost } from '../../lib/perHost/testUtils';
 import WorkflowRuns from './WorkflowRuns';
+import { customerRow, scopedEntry, withCustomerScope, ACME } from '../../lib/customerScopeTestUtils';
+import { useCustomerScope } from '../../lib/customerScope';
 
 afterEach(() => {
   cleanup();
@@ -27,7 +29,7 @@ function stubDeps() {
 function renderPage() {
   return render(
     <MemoryRouter>
-      <WorkflowRuns />
+      {withCustomerScope(<WorkflowRuns />)}
     </MemoryRouter>,
   );
 }
@@ -595,5 +597,102 @@ describe('WorkflowRuns — codenames', () => {
 
     await waitFor(() => expect(screen.queryByText('lint-repo')).not.toBeInTheDocument());
     expect(screen.getByText('deploy-prod')).toBeInTheDocument();
+  });
+});
+
+describe('WorkflowRuns — the global customer scope', () => {
+  function ScopeProbe() {
+    const { scope, notice } = useCustomerScope();
+    return (
+      <>
+        <span data-testid="scope">{String(scope)}</span>
+        <span data-testid="notice">{notice ?? ''}</span>
+      </>
+    );
+  }
+  function renderScoped(scope = 'acme', customers = [ACME]) {
+    return render(
+      <MemoryRouter initialEntries={[scopedEntry(scope)]}>
+        {withCustomerScope(
+          <>
+            <WorkflowRuns />
+            <ScopeProbe />
+          </>,
+          { customers },
+        )}
+      </MemoryRouter>,
+    );
+  }
+
+  it('passes customer: "acme" on every per-host request, with a header sink', async () => {
+    stubDeps();
+    const spy = vi.spyOn(api, 'getWorkflowRuns').mockImplementation(onlyHost('local', [makeRun({ id: 'run_a' })]));
+    renderScoped();
+    await waitFor(() => expect(callsFor(spy, 'local').length).toBeGreaterThan(0));
+    for (const host of ['local', 'host_prod']) {
+      await waitFor(() => expect(callsFor(spy, host).length).toBeGreaterThan(0));
+      expect(callsFor(spy, host)[0][0]).toEqual(
+        expect.objectContaining({ customer: 'acme', lifecycle: 'active', onHostsWithoutCustomer: expect.any(Function) }),
+      );
+    }
+    // The archive can't be filtered by customer: no Archived state, and a hint says so.
+    expect(screen.queryByText('Archived')).not.toBeInTheDocument();
+    expect(screen.getByText(/Archived runs aren’t listed here/)).toBeInTheDocument();
+  });
+
+  it('an unscoped page sends no customer and no header sink (requests unchanged)', async () => {
+    stubDeps();
+    const spy = vi.spyOn(api, 'getWorkflowRuns').mockImplementation(onlyHost('local', []));
+    renderPage();
+    await waitFor(() => expect(callsFor(spy, 'local').length).toBeGreaterThan(0));
+    expect(Object.keys(callsFor(spy, 'local')[0][0] as object).sort()).toEqual(
+      ['host', 'lifecycle', 'limit', 'offset', 'signal'].sort(),
+    );
+    expect(screen.queryByTestId('hosts-without-customer')).not.toBeInTheDocument();
+  });
+
+  it('a slice unavailable with the customer reason renders the banner', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getWorkflowRuns').mockImplementation((p) =>
+      p?.host === 'host_prod'
+        ? Promise.reject(
+            new ApiError(501, 'x', JSON.stringify({ error: "host host_prod can't report a customer for every run" })),
+          )
+        : Promise.resolve([makeRun({ id: 'run_a' })]),
+    );
+    renderScoped();
+    expect(await screen.findByTestId('hosts-without-customer')).toHaveTextContent(
+      'prod runs an older rupu or holds runs from before customers, so it can’t tag every run with a customer — those runs are left out of this view, not counted as zero.',
+    );
+  });
+
+  it('names the hosts the X-Rupu-Hosts-Without-Customer header lists, by name', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getWorkflowRuns').mockImplementation((p) => {
+      if (p?.host === 'local') p.onHostsWithoutCustomer?.(['host_prod']);
+      return Promise.resolve([]);
+    });
+    renderScoped();
+    expect(await screen.findByTestId('hosts-without-customer')).toHaveTextContent(/^prod runs an older rupu/);
+  });
+
+  it('a 400 for the scope clears it and refetches unfiltered', async () => {
+    stubDeps();
+    const spy = vi.spyOn(api, 'getWorkflowRuns').mockImplementation((p) =>
+      p?.customer
+        ? Promise.reject(new ApiError(400, 'x', JSON.stringify({ error: 'customer: invalid slug' })))
+        : Promise.resolve([makeRun({ id: 'run_a', workflow_name: 'unscoped-wf' })]),
+    );
+    // A slug the customer list knows, so only the 400 can clear it.
+    renderScoped('Bad', [ACME, customerRow('Bad')]);
+    await waitFor(() => expect(screen.getByTestId('scope')).toHaveTextContent('null'));
+    expect(screen.getByTestId('notice')).toHaveTextContent(
+      'The customer filter was rejected (customer: invalid slug) — showing all customers.',
+    );
+    expect(await screen.findByText('unscoped-wf')).toBeInTheDocument();
+    const last = spy.mock.lastCall?.[0];
+    expect(last).not.toHaveProperty('customer');
+    // The Archived state is back once unscoped.
+    expect(screen.getByText('Archived')).toBeInTheDocument();
   });
 });

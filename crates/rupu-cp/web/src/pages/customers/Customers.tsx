@@ -26,6 +26,7 @@ import { Spinner } from '../../components/ui/Spinner';
 import { CustomerDot } from '../../components/customers/CustomerDot';
 import { CustomerFormDialog } from '../../components/customers/CustomerFormDialog';
 import { PricingErrorMark } from '../../components/customers/PricingErrorMark';
+import { HostsWithoutCustomerBanner } from '../../components/customers/HostsWithoutCustomerBanner';
 import { StatTile as Tile } from '../../components/customers/StatTile';
 
 type StatusView = 'active' | 'archived' | 'all';
@@ -365,12 +366,7 @@ export default function Customers() {
             />
           )}
 
-          {stats.hosts.length > 0 && (
-            <p className="mt-3 text-note text-ink-mute">
-              Runs on {stats.hosts.join(', ')} are left out of these numbers — their customer can’t be
-              known.
-            </p>
-          )}
+          <HostsWithoutCustomerBanner className="mt-3" without={stats.hosts} />
         </>
       )}
 

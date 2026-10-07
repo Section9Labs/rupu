@@ -18,12 +18,15 @@
 // keystroke, over workflow name / run id / host id — composing with (not
 // replacing) the lifecycle/trigger pills above it.
 //
-// Customer scope (customers Plan 2B): `customer` fixes the list to one
-// customer's runs (`?customer=<slug>`, through the same per-host engine, so a
-// remote host that can't filter — 501 — shows as an unavailable slice) and
-// renders it embedded: no page header or padding, and no Archived state (the
-// archived listing has no customer filter). The customer detail's Runs tab
-// mounts it this way.
+// Customer scope (customers Plan 2B): the list follows the global scope
+// (`useScopedList`), or — embedded in a customer's Runs tab — a fixed
+// `customer` prop, which also drops the page header and padding. Either way the
+// filter goes through the same per-host engine (`?customer=<slug>`), so a
+// remote host that can't filter (501) shows as an unavailable slice, and
+// `HostsWithoutCustomerBanner` names it along with the hosts the
+// `X-Rupu-Hosts-Without-Customer` header lists. The archived listing has no
+// customer filter, so while scoped there is no Archived state; a one-line
+// hint says so. A scope the backend rejects (400) is cleared with a notice.
 
 import { useCallback, useState } from 'react';
 import { RefreshCw } from 'lucide-react';
@@ -51,6 +54,8 @@ import { formatDuration } from '../../lib/duration';
 import { shortId } from '../../lib/shortId';
 import { runHref } from '../../lib/runs';
 import { PricingErrorMark } from '../../components/customers/PricingErrorMark';
+import { HostsWithoutCustomerBanner } from '../../components/customers/HostsWithoutCustomerBanner';
+import { useScopedList } from '../../lib/useScopedList';
 
 type Tab = 'active' | 'completed' | 'failed';
 /** The lifecycle FilterPills group's value space: the three tabs plus the
@@ -65,6 +70,8 @@ const LIFECYCLE_OPTIONS: FilterPillOption[] = [
   { value: 'failed', label: 'Failed / Rejected' },
   { value: 'archived', label: 'Archived' },
 ];
+/** While scoped to a customer: the archive has no customer filter. */
+const SCOPED_LIFECYCLE_OPTIONS = LIFECYCLE_OPTIONS.filter((o) => o.value !== 'archived');
 
 type TriggerFilter = 'all' | 'manual' | 'cron' | 'event';
 
@@ -95,14 +102,17 @@ function TriggerChip({ trigger }: { trigger: string }) {
   );
 }
 
-export default function WorkflowRuns({ customer }: { customer?: string } = {}) {
-  const embedded = customer !== undefined;
+export default function WorkflowRuns({ customer: fixedCustomer }: { customer?: string } = {}) {
   const [tab, setTab] = useState<Tab>('active');
-  const [archived, setArchived] = useState(false);
+  const [archivedPicked, setArchived] = useState(false);
   const [filter, setFilter] = useState<TriggerFilter>('all');
   // All hosts by default: local paints at once, each remote merges in as it
   // answers (usePerHostPagedList). A picked host lists only that host.
   const [hostFilter, setHostFilter] = useState<string>(ALL_HOSTS);
+  const scoped = useScopedList(fixedCustomer, [tab, hostFilter]);
+  const { customer, embedded } = scoped;
+  // The archived listing can't be filtered by customer: no Archived state while scoped.
+  const archived = archivedPicked && !customer;
   // Row-action (archive/restore/delete) failures — kept separate from the
   // list-fetch error the hook owns, but shown in the same banner.
   const [actionError, setActionError] = useState<string | null>(null);
@@ -115,9 +125,20 @@ export default function WorkflowRuns({ customer }: { customer?: string } = {}) {
         // Any page beyond the first returns empty so the host settles.
         return offset === 0 ? api.getArchivedRuns('workflow') : Promise.resolve([]);
       }
-      return api.getWorkflowRuns({ lifecycle: tab, offset, limit, host, signal, ...(customer ? { customer } : {}) });
+      if (!customer) return api.getWorkflowRuns({ lifecycle: tab, offset, limit, host, signal });
+      return scoped.guard(
+        api.getWorkflowRuns({
+          lifecycle: tab,
+          offset,
+          limit,
+          host,
+          signal,
+          customer,
+          onHostsWithoutCustomer: scoped.reportHosts(host, offset),
+        }),
+      );
     },
-    [archived, tab, customer],
+    [archived, tab, customer, scoped.guard, scoped.reportHosts],
   );
 
   const { rows, slices, loading, error, hasMore, sentinelRef, refresh, refreshHost, removeRow, retryPaging, ended } =
@@ -286,7 +307,11 @@ export default function WorkflowRuns({ customer }: { customer?: string } = {}) {
         <FilterBar
           filters={
             <>
-              <FilterPills options={embedded ? LIFECYCLE_OPTIONS.filter((o) => o.value !== 'archived') : LIFECYCLE_OPTIONS} value={lifecycleValue} onChange={handleLifecycleChange} />
+              <FilterPills
+                options={customer ? SCOPED_LIFECYCLE_OPTIONS : LIFECYCLE_OPTIONS}
+                value={lifecycleValue}
+                onChange={handleLifecycleChange}
+              />
               {!archived && (
                 <FilterPills
                   options={TRIGGER_OPTIONS}
@@ -320,6 +345,18 @@ export default function WorkflowRuns({ customer }: { customer?: string } = {}) {
         />
       </div>
       {!archived && <PerHostStrip slices={slices} />}
+      {customer && (
+        <>
+          <HostsWithoutCustomerBanner
+            className="mb-4"
+            hosts={slices.map((sl) => ({ id: sl.hostId, name: sl.name, state: sl.state, reason: sl.reason }))}
+            without={scoped.hostsWithoutCustomer}
+          />
+          <p className="mb-4 text-note text-ink-mute">
+            Archived runs aren’t listed here — the archive can’t be filtered by customer.
+          </p>
+        </>
+      )}
 
       {bannerError && <ErrorBanner className="mb-4">{bannerError}</ErrorBanner>}
 
@@ -343,9 +380,11 @@ export default function WorkflowRuns({ customer }: { customer?: string } = {}) {
           hint={
             missing
               ? `Not included: ${missing}.`
-              : embedded
-                ? 'No workflow runs are attributed to this customer yet.'
-                : 'Workflow runs will appear here once you dispatch one from the CLI, the desktop app, or a scheduled trigger.'
+              : customer === 'none'
+                ? 'No workflow runs without a customer yet.'
+                : customer
+                  ? 'No workflow runs are attributed to this customer yet.'
+                  : 'Workflow runs will appear here once you dispatch one from the CLI, the desktop app, or a scheduled trigger.'
           }
         />
       ) : visible.length === 0 ? (

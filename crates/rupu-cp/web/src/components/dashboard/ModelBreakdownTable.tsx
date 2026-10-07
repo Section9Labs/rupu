@@ -25,6 +25,7 @@ import { useThemeColors } from '../../lib/useThemeColors';
 import { assignModelColors, pivotLabel, OTHER_COLOR } from './modelColors';
 import { assignCategoricalColors } from '../usage/pivotColors';
 import { PIVOT_LABEL } from '../usage/PivotPicker';
+import { PricingErrorMark } from '../customers/PricingErrorMark';
 
 const TOP_N = 6;
 
@@ -45,6 +46,9 @@ export interface BreakdownRow {
   share: number | null;
   kind: 'model' | 'others' | 'unpriced';
   rawKey: string;
+  /** Set when some of the row's cost was priced at the wrong rates (see
+   *  `UsageSummary.pricing_error`); the `others` rollup takes its first. */
+  pricingError?: string;
 }
 
 /**
@@ -123,11 +127,13 @@ export function toRows(
       share: share(cost),
       kind: 'model',
       rawKey: pivotRawKey(r, pivot),
+      ...(r.pricing_error ? { pricingError: r.pricing_error } : {}),
     });
   }
 
   if (tail.length > 0) {
     const cost = tail.reduce((a, r) => a + (r.cost_usd ?? 0), 0);
+    const tailPricingError = tail.find((r) => r.pricing_error)?.pricing_error;
     rows.push({
       key: '__others__',
       label: `others (${tail.length})`,
@@ -137,6 +143,7 @@ export function toRows(
       share: share(cost),
       kind: 'others',
       rawKey: '',
+      ...(tailPricingError ? { pricingError: tailPricingError } : {}),
     });
   }
 
@@ -282,7 +289,10 @@ export default function ModelBreakdownTable({
                   </td>
                   <td className="py-1.5 text-right tabular-nums text-ink-dim">{formatTokens(r.tokens)}</td>
                   <td className="py-1.5 text-right tabular-nums text-ink font-medium">
-                    {r.cost === null ? '—' : formatCost(r.cost)}
+                    <span className="inline-flex items-center justify-end gap-1">
+                      <PricingErrorMark error={r.pricingError} />
+                      {r.cost === null ? '—' : formatCost(r.cost)}
+                    </span>
                   </td>
                   <td className="py-1.5 pl-2">
                     {r.share === null ? (

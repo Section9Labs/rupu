@@ -6,6 +6,7 @@ import { MemoryRouter } from 'react-router-dom';
 import Usage from './Usage';
 import { api, presetWindow, type UsageResponse, type OutlierRun, type UsageRunRow } from '../lib/api';
 import { REG_LOCAL } from '../lib/perHost/testUtils';
+import { scopedEntry, withCustomerScope } from '../lib/customerScopeTestUtils';
 
 // Fixed clock so `presetWindow(...)` computed here (for assertions) and
 // inside `Usage` (driving the actual fetch) agree on `until` exactly.
@@ -79,7 +80,7 @@ function runRow(overrides: Partial<UsageRunRow> = {}): UsageRunRow {
 function renderUsage() {
   return render(
     <MemoryRouter>
-      <Usage />
+      {withCustomerScope(<Usage />)}
     </MemoryRouter>,
   );
 }
@@ -422,5 +423,56 @@ describe('Usage page', () => {
       expect(screen.getAllByText('pr-review').length).toBeGreaterThan(0);
       expect(api.getUsageRuns).toHaveBeenCalledTimes(1);
     });
+  });
+});
+
+describe('Usage — pricing errors and the global customer scope', () => {
+  it('marks breakdown rows and outliers priced at the wrong rates', async () => {
+    const outlier = {
+      run_id: 'run-42',
+      workflow_name: 'nightly-review',
+      cost_usd: 12,
+      baseline_usd: 3,
+      ratio: 4,
+      started_at: new Date().toISOString(),
+      pricing_error: 'outlier priced at global rates',
+    };
+    mockAll({ runs: [runRow({ pricing_error: 'acme layer broken' })], outliers: [outlier] });
+    renderUsage();
+    await screen.findByText('Cost outliers');
+    await waitFor(() => expect(screen.getAllByTitle('acme layer broken').length).toBeGreaterThan(0));
+    expect(screen.getByRole('img', { name: 'Pricing unavailable: outlier priced at global rates' })).toBeInTheDocument();
+  });
+
+  it('scopes every usage fetch, shows the ScopeChip, and names the hosts left out', async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL]);
+    const getUsage = vi
+      .spyOn(api, 'getUsage')
+      .mockResolvedValue(usageResponse({ hosts_without_customer: ['worker-7'] }));
+    const getUsageRuns = vi.spyOn(api, 'getUsageRuns').mockImplementation((_w, _ws, _c, sink) => {
+      sink?.(['worker-9']);
+      return Promise.resolve([runRow()]);
+    });
+    const getUsageOutliers = vi.spyOn(api, 'getUsageOutliers').mockImplementation((_w, _c, sink) => {
+      sink?.(['worker-8']);
+      return Promise.resolve([]);
+    });
+    render(
+      <MemoryRouter initialEntries={[scopedEntry('acme', '/usage')]}>
+        {withCustomerScope(<Usage />)}
+      </MemoryRouter>,
+    );
+    await waitFor(() =>
+      expect(getUsage).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'model', 'local', expect.any(AbortSignal), 'acme'),
+    );
+    expect(getUsageRuns).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), undefined, 'acme', expect.any(Function));
+    expect(getUsageOutliers).toHaveBeenCalledWith(presetWindow('30d', FIXED_NOW), 'acme', expect.any(Function));
+    expect(await screen.findByRole('button', { name: 'Clear customer scope' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Usage' })).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByTestId('hosts-without-customer')).toHaveTextContent(
+        /^worker-7, worker-8 and worker-9 run an older rupu/,
+      ),
+    );
   });
 });

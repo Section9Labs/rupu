@@ -18,6 +18,7 @@ import { MemoryRouter } from 'react-router-dom';
 import { api } from '../../lib/api';
 import type { AutoflowEventRow, HostView } from '../../lib/api';
 import AutoflowRuns from './AutoflowRuns';
+import { withCustomerScope } from '../../lib/customerScopeTestUtils';
 
 afterEach(() => {
   cleanup();
@@ -63,7 +64,7 @@ describe('AutoflowRuns — canonical column order + Turns/Duration (I4)', () => 
 
     const { container } = render(
       <MemoryRouter>
-        <AutoflowRuns />
+        {withCustomerScope(<AutoflowRuns />)}
       </MemoryRouter>,
     );
 
@@ -105,7 +106,7 @@ describe('AutoflowRuns — canonical column order + Turns/Duration (I4)', () => 
 
     render(
       <MemoryRouter>
-        <AutoflowRuns />
+        {withCustomerScope(<AutoflowRuns />)}
       </MemoryRouter>,
     );
 

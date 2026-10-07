@@ -19,6 +19,11 @@
 // currently active, client-side, over that tab's own searchable fields (see
 // `matchesAutoflowQuery` below) — composing with (not replacing) the host
 // scope select.
+//
+// Customer scope (customers Plan 2B): the autoflow endpoints
+// (`/api/runs/autoflows{,/events}`, `/api/autoflows/claims`) take no customer
+// filter, so this page cannot narrow to one customer. While a scope is set it
+// says so in one line instead of passing it off as filtered.
 
 import { useCallback, useState } from 'react';
 import { Link } from 'react-router-dom';
@@ -51,6 +56,8 @@ import { durationBetween, relativeTime } from '../../lib/time';
 import { formatTokens, formatCost } from '../../lib/usage';
 import { formatDuration } from '../../lib/duration';
 import { shortId } from '../../lib/shortId';
+import { useCustomerParam } from '../../lib/customerScope';
+import { PricingErrorMark } from '../../components/customers/PricingErrorMark';
 
 const MODE_CLS: Record<string, string> = {
   ask:       'bg-warn-bg text-warn ring-warn/30',
@@ -334,7 +341,10 @@ const EVENT_COLUMNS: Column<AutoflowEventRow>[] = [
     sortValue: (e) => e.usage.cost_usd,
     render: (e) =>
       isRunEvent(e) ? (
-        <span className="text-ink font-medium">{formatCost(e.usage.cost_usd)}</span>
+        <span className="inline-flex items-center justify-end gap-1 text-ink font-medium">
+          <PricingErrorMark error={e.usage.pricing_error} />
+          {formatCost(e.usage.cost_usd)}
+        </span>
       ) : null,
   },
   {
@@ -508,6 +518,7 @@ const VIEW_OPTIONS: SegmentedOption[] = [
 ];
 
 export default function AutoflowRuns() {
+  const customer = useCustomerParam();
   const [tab, setTab] = useState<Tab>('runs');
   // All hosts by default: local paints at once, each remote merges in as it
   // answers (usePerHostPagedList). A picked host lists only that host.
@@ -844,6 +855,12 @@ export default function AutoflowRuns() {
         />
       </div>
 
+      {customer && (
+        <p role="note" className="mb-4 text-note text-ink-mute">
+          Autoflow runs, cycles and claims aren’t filtered by customer — this page lists every
+          customer’s.
+        </p>
+      )}
       {tab === 'runs' && <PerHostStrip slices={events.slices} />}
       {tab === 'cycles' && <PerHostStrip slices={cycles.slices} />}
 

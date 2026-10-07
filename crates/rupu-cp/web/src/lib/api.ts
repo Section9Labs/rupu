@@ -66,7 +66,9 @@ export function apiErrorMessage(e: unknown): string {
 // Core fetch wrapper
 // ---------------------------------------------------------------------------
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+/** The typed-fetch core: the parsed JSON body plus the response headers
+ *  (absent on a test double that gives none). */
+async function fetchJson<T>(path: string, init?: RequestInit): Promise<{ body: T; headers: Headers | undefined }> {
   const res = await fetch(path, {
     credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json' },
@@ -76,10 +78,47 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     const text = await res.text().catch(() => res.statusText);
     throw new ApiError(res.status, text || res.statusText, text);
   }
-  if (res.status === 204) return undefined as T;
+  if (res.status === 204) return { body: undefined as T, headers: res.headers };
   const text = await res.text();
-  if (!text) return undefined as T;
-  return JSON.parse(text) as T;
+  return { body: text ? (JSON.parse(text) as T) : (undefined as T), headers: res.headers };
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  return (await fetchJson<T>(path, init)).body;
+}
+
+/** The response header a customer-filtered fan-out (and a local listing that
+ *  holds mirrored legacy runs) sets, naming — comma-separated host ids — the
+ *  hosts it left out because it can't say whose some of their runs are
+ *  (docs/cp-customers-api.md, "Remote hosts"). */
+export const HOSTS_WITHOUT_CUSTOMER_HEADER = 'X-Rupu-Hosts-Without-Customer';
+
+/** Parse the `X-Rupu-Hosts-Without-Customer` value: comma-separated host ids,
+ *  blanks dropped; `[]` when the header is absent. */
+export function parseHostsWithoutCustomer(value: string | null | undefined): string[] {
+  if (!value) return [];
+  return value
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/** A sink for the hosts a scoped request's `X-Rupu-Hosts-Without-Customer`
+ *  header names (`[]` when it names none). */
+export type HostsWithoutCustomerSink = (hostIds: string[]) => void;
+
+/** `request<T>`, also handing the `X-Rupu-Hosts-Without-Customer` header to
+ *  `onHosts` when the caller asked for it (the scoped list methods). A failed
+ *  request reports nothing. */
+async function requestMaybeReportingHosts<T>(
+  path: string,
+  init: RequestInit | undefined,
+  onHosts: HostsWithoutCustomerSink | undefined,
+): Promise<T> {
+  if (!onHosts) return request<T>(path, init);
+  const { body, headers } = await fetchJson<T>(path, init);
+  onHosts(parseHostsWithoutCustomer(headers?.get(HOSTS_WITHOUT_CUSTOMER_HEADER)));
+  return body;
 }
 
 /** The bytes of a finding-report export response. A non-2xx throws an
@@ -2060,8 +2099,9 @@ export interface ProjectRow {
   usage: UsageSummary;
   run_count: number;
   last_active?: string | null;
-  /** The project's current customer; `null` = none. */
-  customer: CustomerRef | null;
+  /** The project's current customer; `null` = none. ABSENT when the CP can't
+   *  say (never read absence as "no customer"). */
+  customer?: CustomerRef | null;
 }
 
 export interface ProjectDetail {
@@ -2299,6 +2339,7 @@ export const api = {
     until?: string;
     bucket?: 'day' | 'week';
     customer?: CustomerScope;
+    onHostsWithoutCustomer?: HostsWithoutCustomerSink;
   }): Promise<UsageTimelineBucket[]> {
     const q = new URLSearchParams();
     setCustomer(q, opts?.customer);
@@ -2306,7 +2347,11 @@ export const api = {
     if (opts?.until) q.set('until', opts.until);
     if (opts?.bucket) q.set('bucket', opts.bucket);
     const qs = q.toString();
-    return request<UsageTimelineBucket[]>(`/api/usage/timeline${qs ? `?${qs}` : ''}`);
+    return requestMaybeReportingHosts<UsageTimelineBucket[]>(
+      `/api/usage/timeline${qs ? `?${qs}` : ''}`,
+      undefined,
+      opts?.onHostsWithoutCustomer,
+    );
   },
   /**
    * Cost outliers — runs far above their workflow's own median. LOCAL-ONLY:
@@ -2314,10 +2359,18 @@ export const api = {
    * on `rupu-cp/src/api/usage_outliers.rs`), so this accepts single-host
    * results and does not take a `host` param.
    */
-  getUsageOutliers(win: UsageWindow = presetWindow('30d'), customer?: CustomerScope): Promise<OutlierRun[]> {
+  getUsageOutliers(
+    win: UsageWindow = presetWindow('30d'),
+    customer?: CustomerScope,
+    onHostsWithoutCustomer?: HostsWithoutCustomerSink,
+  ): Promise<OutlierRun[]> {
     const q = new URLSearchParams({ since: win.since, until: win.until });
     setCustomer(q, customer);
-    return request<OutlierRun[]>(`/api/usage/outliers?${q.toString()}`);
+    return requestMaybeReportingHosts<OutlierRun[]>(
+      `/api/usage/outliers?${q.toString()}`,
+      undefined,
+      onHostsWithoutCustomer,
+    );
   },
   /**
    * Flat per-`(run × model)` usage rows — the finest grain the `/usage`
@@ -2330,22 +2383,37 @@ export const api = {
     win: UsageWindow = presetWindow('30d'),
     workspaceId?: string,
     customer?: CustomerScope,
+    onHostsWithoutCustomer?: HostsWithoutCustomerSink,
   ): Promise<UsageRunRow[]> {
     const q = new URLSearchParams({ since: win.since, until: win.until });
     if (workspaceId) q.set('workspace_id', workspaceId);
     setCustomer(q, customer);
-    return request<UsageRunRow[]>(`/api/usage/runs?${q.toString()}`);
+    return requestMaybeReportingHosts<UsageRunRow[]>(
+      `/api/usage/runs?${q.toString()}`,
+      undefined,
+      onHostsWithoutCustomer,
+    );
   },
 
   // --- Runs ---
-  getRuns(params?: ListParams & Cancellable & { host?: string; customer?: CustomerScope }): Promise<RunListRow[]> {
+  getRuns(
+    params?: ListParams & Cancellable & {
+      host?: string;
+      customer?: CustomerScope;
+      onHostsWithoutCustomer?: HostsWithoutCustomerSink;
+    },
+  ): Promise<RunListRow[]> {
     const q = new URLSearchParams();
     if (params?.offset != null) q.set('offset', String(params.offset));
     if (params?.limit != null) q.set('limit', String(params.limit));
     if (params?.host) q.set('host', params.host);
     setCustomer(q, params?.customer);
     const qs = q.toString();
-    return request<RunListRow[]>(`/api/runs${qs ? `?${qs}` : ''}`, { signal: params?.signal });
+    return requestMaybeReportingHosts<RunListRow[]>(
+      `/api/runs${qs ? `?${qs}` : ''}`,
+      { signal: params?.signal },
+      params?.onHostsWithoutCustomer,
+    );
   },
   getRun(id: string, opts?: { host?: string }): Promise<{ run: RunRecord; steps: StepResultRecord[]; usage: UsageSummary }> {
     const qs = opts?.host ? `?host=${encodeURIComponent(opts.host)}` : '';
@@ -2538,6 +2606,8 @@ export const api = {
       lifecycle?: 'active' | 'completed' | 'failed';
       host?: string;
       customer?: CustomerScope;
+      /** Receives the `X-Rupu-Hosts-Without-Customer` header's host ids. */
+      onHostsWithoutCustomer?: HostsWithoutCustomerSink;
     },
   ): Promise<RunListRow[]> {
     const q = new URLSearchParams();
@@ -2547,7 +2617,11 @@ export const api = {
     if (params?.host) q.set('host', params.host);
     setCustomer(q, params?.customer);
     const qs = q.toString();
-    return request<RunListRow[]>(`/api/runs/workflows${qs ? `?${qs}` : ''}`, { signal: params?.signal });
+    return requestMaybeReportingHosts<RunListRow[]>(
+      `/api/runs/workflows${qs ? `?${qs}` : ''}`,
+      { signal: params?.signal },
+      params?.onHostsWithoutCustomer,
+    );
   },
   getAutoflowRuns(params?: ListParams & Cancellable & { host?: string }): Promise<AutoflowCycleRow[]> {
     const q = new URLSearchParams();
@@ -2588,6 +2662,8 @@ export const api = {
       lifecycle?: 'active' | 'completed' | 'failed';
       host?: string;
       customer?: CustomerScope;
+      /** Receives the `X-Rupu-Hosts-Without-Customer` header's host ids. */
+      onHostsWithoutCustomer?: HostsWithoutCustomerSink;
     },
   ): Promise<AgentRunRow[]> {
     const q = new URLSearchParams();
@@ -2597,7 +2673,11 @@ export const api = {
     if (params?.host) q.set('host', params.host);
     setCustomer(q, params?.customer);
     const qs = q.toString();
-    return request<AgentRunRow[]>(`/api/runs/agents${qs ? `?${qs}` : ''}`, { signal: params?.signal });
+    return requestMaybeReportingHosts<AgentRunRow[]>(
+      `/api/runs/agents${qs ? `?${qs}` : ''}`,
+      { signal: params?.signal },
+      params?.onHostsWithoutCustomer,
+    );
   },
   getAutoflowDefs(): Promise<AutoflowDefRow[]> {
     return request<AutoflowDefRow[]>('/api/autoflows');
@@ -2820,7 +2900,13 @@ export const api = {
 
   // --- Sessions ---
   getSessions(
-    params?: ListParams & Cancellable & { scope?: 'active' | 'archived'; host?: string; customer?: CustomerScope },
+    params?: ListParams & Cancellable & {
+      scope?: 'active' | 'archived';
+      host?: string;
+      customer?: CustomerScope;
+      /** Receives the `X-Rupu-Hosts-Without-Customer` header's host ids. */
+      onHostsWithoutCustomer?: HostsWithoutCustomerSink;
+    },
   ): Promise<SessionSummary[]> {
     const q = new URLSearchParams();
     if (params?.offset != null) q.set('offset', String(params.offset));
@@ -2829,7 +2915,11 @@ export const api = {
     if (params?.host) q.set('host', params.host);
     setCustomer(q, params?.customer);
     const qs = q.toString();
-    return request<SessionSummary[]>(`/api/sessions${qs ? `?${qs}` : ''}`, { signal: params?.signal });
+    return requestMaybeReportingHosts<SessionSummary[]>(
+      `/api/sessions${qs ? `?${qs}` : ''}`,
+      { signal: params?.signal },
+      params?.onHostsWithoutCustomer,
+    );
   },
   getSession(id: string, opts?: { host?: string }): Promise<SessionSummary> {
     const qs = opts?.host ? `?host=${encodeURIComponent(opts.host)}` : '';

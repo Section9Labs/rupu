@@ -12,6 +12,7 @@ import { api } from '../../lib/api';
 import type { RunListRow } from '../../lib/api';
 import { REG_LOCAL } from '../../lib/perHost/testUtils';
 import WorkflowRuns from './WorkflowRuns';
+import { withCustomerScope } from '../../lib/customerScopeTestUtils';
 
 afterEach(() => {
   cleanup();
@@ -47,7 +48,7 @@ describe('WorkflowRuns — canonical column order', () => {
 
     const { container } = render(
       <MemoryRouter>
-        <WorkflowRuns />
+        {withCustomerScope(<WorkflowRuns />)}
       </MemoryRouter>,
     );
 

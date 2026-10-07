@@ -18,6 +18,10 @@
 // `onRunsLoaded` (optional) hands the raw fetched rows back to the caller —
 // added for the Projects page, which needs the same rows to build its own
 // breakdown table (Task U4) without a second, duplicate fetch.
+//
+// `onHostsWithoutCustomer` (optional, customer-scoped fetches only) receives
+// the `X-Rupu-Hosts-Without-Customer` header of the run-rows fetch — the
+// worker hosts whose legacy runs the filter had to leave out.
 
 import { useEffect, useMemo, useState } from 'react';
 import { api, type CustomerScope, type Pivot, type UsageRunRow, type UsageWindow } from '../../lib/api';
@@ -41,6 +45,7 @@ export default function UsageTimeline({
   hosts,
   headline,
   onRunsLoaded,
+  onHostsWithoutCustomer,
   onSelectRange,
   pending,
   background,
@@ -65,6 +70,8 @@ export default function UsageTimeline({
   hosts?: { host_id: string; name: string }[];
   headline: { costLabel: string; subLabel: string; pricingError?: string };
   onRunsLoaded?: (rows: UsageRunRow[]) => void;
+  /** Customer-scoped fetches only: the hosts the run-rows fetch left out. */
+  onHostsWithoutCustomer?: (hostIds: string[]) => void;
   /**
    * Marquee drag-select (Task W3) — pure passthrough to
    * `UsageTimelineStacked`'s prop of the same name. The caller (which owns
@@ -122,8 +129,15 @@ export default function UsageTimeline({
     // assertion like `toHaveBeenCalledWith(usageWindow)` — matching how
     // `/usage` itself called `getUsageRuns` before this component existed —
     // still matches.
+    const reportHosts = onHostsWithoutCustomer
+      ? (ids: string[]) => {
+          if (!cancelled) onHostsWithoutCustomer(ids);
+        }
+      : undefined;
     (customer
-      ? api.getUsageRuns(usageWindow, workspaceId, customer)
+      ? reportHosts
+        ? api.getUsageRuns(usageWindow, workspaceId, customer, reportHosts)
+        : api.getUsageRuns(usageWindow, workspaceId, customer)
       : workspaceId
         ? api.getUsageRuns(usageWindow, workspaceId)
         : api.getUsageRuns(usageWindow)
@@ -148,7 +162,7 @@ export default function UsageTimeline({
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- onRunsLoaded is a caller-supplied callback, not a re-fetch trigger; `usageWindow` itself is intentionally omitted in favor of its primitive fields (see doc comment above).
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- onRunsLoaded / onHostsWithoutCustomer are caller-supplied callbacks, not re-fetch triggers; `usageWindow` itself is intentionally omitted in favor of its primitive fields (see doc comment above).
   }, [usageWindow.since, usageWindow.until, workspaceId, customer]);
 
   const isInitialLoad = runs === null;

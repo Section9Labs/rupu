@@ -581,5 +581,34 @@ describe('useUsageData', () => {
       await waitFor(() => expect(result.current.data?.summary.runs).toBe(9));
       expect(spy).toHaveBeenLastCalledWith(WIN, 'model', 'local', expect.any(AbortSignal), 'globex');
     });
+
+    it('unions the answers\' hosts_without_customer', async () => {
+      vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL, REG_PROD]);
+      vi.spyOn(api, 'getUsage').mockImplementation((_w, _p, host) =>
+        Promise.resolve({
+          ...resp(host as string, 1),
+          hosts_without_customer: host === 'local' ? ['worker-2', 'worker-1'] : ['worker-1'],
+        }),
+      );
+      const { result } = renderHook(() => useUsageData(WIN, 'preset:30d', 'user', 'acme'));
+      await waitFor(() => expect(result.current.data?.summary.runs).toBe(2));
+      expect(result.current.data?.hostsWithoutCustomer).toEqual(['worker-1', 'worker-2']);
+    });
+
+    it('hands a scoped request\'s failure to onScopeRejected; an unscoped one never', async () => {
+      vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL]);
+      const bad = new ApiError(400, 'x', '{"error":"customer: invalid slug"}');
+      vi.spyOn(api, 'getUsage').mockRejectedValue(bad);
+      const onRejected = vi.fn();
+      const { result } = renderHook(() => useUsageData(WIN, 'preset:30d', 'user', 'acme', onRejected));
+      await waitFor(() => expect(result.current.error).not.toBeNull());
+      expect(onRejected).toHaveBeenCalledWith(bad);
+      cleanup();
+
+      const unscoped = vi.fn();
+      const { result: r2 } = renderHook(() => useUsageData(WIN, 'preset:30d', 'user', undefined, unscoped));
+      await waitFor(() => expect(r2.current.error).not.toBeNull());
+      expect(unscoped).not.toHaveBeenCalled();
+    });
   });
 });

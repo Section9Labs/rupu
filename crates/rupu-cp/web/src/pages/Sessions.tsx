@@ -19,6 +19,13 @@
 // FilterBar's search slot narrows the loaded rows client-side, live per
 // keystroke, over agent name / session id / host id — composing with (not
 // replacing) the Active/Archived pill above it.
+//
+// Customer scope (customers Plan 2B): the list follows the global scope
+// (`useScopedList`; `?customer=` on every per-host request), so the v1 route
+// and the v2 Activity tab both pick it up. A remote host that can't filter
+// (501) is an unavailable slice, and `HostsWithoutCustomerBanner` names it
+// along with the hosts the `X-Rupu-Hosts-Without-Customer` header lists. A
+// scope the backend rejects (400) is cleared with a notice.
 
 import { useCallback, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
@@ -45,6 +52,9 @@ import { durationBetween, relativeTime } from '../lib/time';
 import { formatTokens, formatCost } from '../lib/usage';
 import { sessionStatusDisplayLabel } from '../lib/sessionStatus';
 import { shortId } from '../lib/shortId';
+import { useScopedList } from '../lib/useScopedList';
+import { PricingErrorMark } from '../components/customers/PricingErrorMark';
+import { HostsWithoutCustomerBanner } from '../components/customers/HostsWithoutCustomerBanner';
 
 type Tab = 'active' | 'archived';
 
@@ -73,11 +83,25 @@ export default function Sessions() {
   // list-fetch error the hook owns, but shown in the same banner.
   const [actionError, setActionError] = useState<string | null>(null);
   const [query, setQuery] = useState('');
+  const scoped = useScopedList(undefined, [tab, hostFilter]);
+  const { customer } = scoped;
 
   const fetchRows = useCallback(
     ({ host, offset, limit, signal }: PerHostFetchParams) =>
-      api.getSessions({ scope: tab, offset, limit, host, signal }),
-    [tab],
+      customer
+        ? scoped.guard(
+            api.getSessions({
+              scope: tab,
+              offset,
+              limit,
+              host,
+              signal,
+              customer,
+              onHostsWithoutCustomer: scoped.reportHosts(host, offset),
+            }),
+          )
+        : api.getSessions({ scope: tab, offset, limit, host, signal }),
+    [tab, customer, scoped.guard, scoped.reportHosts],
   );
   const { rows, slices, loading, error, hasMore, sentinelRef, refresh, refreshHost, removeRow, retryPaging, ended } =
     usePerHostPagedList<SessionSummary>({
@@ -85,7 +109,7 @@ export default function Sessions() {
       fetch: fetchRows,
       timeField: 'updated_at',
       idField: 'session_id',
-      deps: [tab],
+      deps: [tab, customer],
       poll: tab === 'active',
     });
 
@@ -192,6 +216,13 @@ export default function Sessions() {
         />
       </div>
       <PerHostStrip slices={slices} />
+      {customer && (
+        <HostsWithoutCustomerBanner
+          className="mb-4"
+          hosts={slices.map((sl) => ({ id: sl.hostId, name: sl.name, state: sl.state, reason: sl.reason }))}
+          without={scoped.hostsWithoutCustomer}
+        />
+      )}
 
       {bannerError && <ErrorBanner className="mb-4">{bannerError}</ErrorBanner>}
 
@@ -390,7 +421,10 @@ const SESSION_BASE_COLUMNS: Column<SessionSummary>[] = [
     sortable: true,
     sortValue: (s) => s.usage?.cost_usd ?? null,
     render: (s) => (
-      <span className="text-ink font-medium">{s.usage ? formatCost(s.usage.cost_usd) : '—'}</span>
+      <span className="inline-flex items-center justify-end gap-1 text-ink font-medium">
+        <PricingErrorMark error={s.usage?.pricing_error} />
+        {s.usage ? formatCost(s.usage.cost_usd) : '—'}
+      </span>
     ),
   },
   {

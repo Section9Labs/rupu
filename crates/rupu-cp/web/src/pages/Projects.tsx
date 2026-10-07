@@ -1,5 +1,13 @@
 // Projects registry — lists all workspaces tracked by this control plane.
 // Each row is a project card that links to /projects/:wsId for the overview.
+//
+// Customer scope (customers Plan 2B): the list follows the global scope
+// (`GET /api/projects?customer=`, keyed on each project's current assignment),
+// and a CUSTOMER column shows each project's customer in its three states
+// (a customer, "No customer" for `null`, "Unknown customer" when the key is
+// absent — the CP can't say). Projects are the coordinator's own workspaces,
+// so no host is ever left out here. A scope the backend rejects (400) is
+// cleared with a notice.
 
 import { useEffect, useState } from 'react';
 import { GitBranch, GitFork, Github, Gitlab, HardDrive, Server } from 'lucide-react';
@@ -13,6 +21,9 @@ import { Spinner } from '../components/ui/Spinner';
 import { formatTokens, formatCost } from '../lib/usage';
 import { relativeTime } from '../lib/time';
 import { useInfiniteScroll } from '../lib/useInfiniteScroll';
+import { useScopedList } from '../lib/useScopedList';
+import { CustomerChip } from '../components/customers/CustomerChip';
+import { PricingErrorMark } from '../components/customers/PricingErrorMark';
 
 const STEP = 20;
 
@@ -20,11 +31,15 @@ export default function Projects() {
   const [projects, setProjects] = useState<ProjectRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [visible, setVisible] = useState(STEP);
+  const { customer, guard } = useScopedList(undefined, []);
 
   useEffect(() => {
     let cancelled = false;
-    api
-      .getProjects()
+    // A different filter: drop the other filter's rows rather than show them while loading.
+    setProjects(null);
+    setError(null);
+    // Called with no argument when unscoped, as the page always did.
+    (customer ? guard(api.getProjects({ customer })) : api.getProjects())
       .then((data) => {
         if (cancelled) return;
         setProjects(data);
@@ -37,7 +52,7 @@ export default function Projects() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [customer, guard]);
 
   const all = projects ?? [];
   const shown = all.slice(0, visible);
@@ -66,8 +81,14 @@ export default function Projects() {
 
       {projects !== null && projects.length === 0 && (
         <EmptyState
-          title="No projects yet"
-          hint="No projects yet — run an agent against a directory to register it as a project."
+          title={customer ? 'No projects' : 'No projects yet'}
+          hint={
+            customer === 'none'
+              ? 'Every project is assigned to a customer.'
+              : customer
+                ? 'No project is assigned to this customer yet.'
+                : 'No projects yet — run an agent against a directory to register it as a project.'
+          }
         />
       )}
 
@@ -87,7 +108,7 @@ export default function Projects() {
             />
           </div>
           <SortableTable<ProjectRow>
-            columns={PROJECT_COLUMNS}
+            columns={PROJECTS_PAGE_COLUMNS}
             rows={shown}
             rowKey={(p) => p.ws_id}
             rowHref={(p) => `/projects/${encodeURIComponent(p.ws_id)}`}
@@ -224,7 +245,10 @@ export const PROJECT_COLUMNS: Column<ProjectRow>[] = [
     sortable: true,
     sortValue: (p) => p.usage?.cost_usd ?? null,
     render: (p) => (
-      <span className="text-ink font-medium">{p.usage ? formatCost(p.usage.cost_usd) : '—'}</span>
+      <span className="inline-flex items-center justify-end gap-1 text-ink font-medium">
+        <PricingErrorMark error={p.usage?.pricing_error} />
+        {p.usage ? formatCost(p.usage.cost_usd) : '—'}
+      </span>
     ),
   },
   {
@@ -242,4 +266,24 @@ export const PROJECT_COLUMNS: Column<ProjectRow>[] = [
       return <span className="text-ink-mute">{t ? relativeTime(t) : 'no runs'}</span>;
     },
   },
+];
+
+/** The project's customer, in its three states: a customer, `null` ("No
+ *  customer"), or an ABSENT key ("Unknown customer" — the CP can't say). */
+export const CUSTOMER_COLUMN: Column<ProjectRow> = {
+  key: 'customer',
+  header: 'Customer',
+  fit: true,
+  sortable: true,
+  sortValue: (p) => (p.customer === undefined ? null : (p.customer?.name ?? '')),
+  render: (p) => <CustomerChip customer={p.customer ?? null} unknown={p.customer === undefined} size="sm" />,
+};
+
+/** The Projects page's columns: `PROJECT_COLUMNS` with the customer after the
+ *  name (a customer's own Projects tab reuses `PROJECT_COLUMNS` without it —
+ *  every row there is that customer's). */
+const PROJECTS_PAGE_COLUMNS: Column<ProjectRow>[] = [
+  ...PROJECT_COLUMNS.slice(0, 2),
+  CUSTOMER_COLUMN,
+  ...PROJECT_COLUMNS.slice(2),
 ];

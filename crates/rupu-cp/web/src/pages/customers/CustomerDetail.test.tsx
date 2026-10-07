@@ -174,6 +174,15 @@ describe('CustomerDetail header and tiles', () => {
     expect(screen.getByRole('button', { name: 'Archive' })).toBeInTheDocument();
   });
 
+  it('names the hosts the rollup left out in the warn banner', async () => {
+    getCustomer.mockResolvedValue(detail({ rollup: { ...detail().rollup, hosts_without_customer: ['mini'] } }));
+    mount();
+    await screen.findByRole('heading', { level: 1, name: 'Acme Corp' });
+    expect(screen.getByTestId('hosts-without-customer')).toHaveTextContent(
+      /mini runs an older rupu .* not counted as zero/,
+    );
+  });
+
   it('renders the five tiles from the rollup', async () => {
     mount();
     await screen.findByRole('heading', { level: 1, name: 'Acme Corp' });
@@ -502,6 +511,24 @@ describe('CustomerDetail Runs tab', () => {
     expect(await screen.findByText('nightly-review')).toBeInTheDocument();
     expect(await screen.findByText(/not included: prod/)).toBeInTheDocument();
     expect(callsFor(getWorkflowRuns, 'host_prod')[0][0]).toEqual(expect.objectContaining({ customer: 'acme' }));
+    // …and the warn banner says why it is left out.
+    expect(screen.getByTestId('hosts-without-customer')).toHaveTextContent(
+      /prod runs an older rupu .* can’t tag every run with a customer — those runs are left out of this view, not counted as zero/,
+    );
+    // The archive can't be filtered by customer: a one-line hint says it isn't listed.
+    expect(screen.getByText(/Archived runs aren’t listed here/)).toBeInTheDocument();
+  });
+
+  it('names the hosts a run listing\'s X-Rupu-Hosts-Without-Customer header lists', async () => {
+    getWorkflowRuns.mockImplementation(
+      (p?: { host?: string; onHostsWithoutCustomer?: (ids: string[]) => void }) => {
+        p?.onHostsWithoutCustomer?.(['worker-7']);
+        return Promise.resolve([RUN]);
+      },
+    );
+    mount('/customers/acme/runs');
+    expect(await screen.findByText('nightly-review')).toBeInTheDocument();
+    expect(await screen.findByTestId('hosts-without-customer')).toHaveTextContent(/worker-7 runs an older rupu/);
   });
 
   it('marks a run whose cost was priced at the global rates', async () => {
@@ -538,8 +565,11 @@ describe('CustomerDetail Usage tab', () => {
     await waitFor(() =>
       expect(getUsage).toHaveBeenCalledWith(expect.anything(), 'model', 'local', expect.any(AbortSignal), 'acme'),
     );
-    await waitFor(() => expect(getUsageRuns).toHaveBeenCalledWith(expect.anything(), undefined, 'acme'));
-    await waitFor(() => expect(getUsageOutliers).toHaveBeenCalledWith(expect.anything(), 'acme'));
+    // The trailing sink receives the `X-Rupu-Hosts-Without-Customer` header.
+    await waitFor(() =>
+      expect(getUsageRuns).toHaveBeenCalledWith(expect.anything(), undefined, 'acme', expect.any(Function)),
+    );
+    await waitFor(() => expect(getUsageOutliers).toHaveBeenCalledWith(expect.anything(), 'acme', expect.any(Function)));
     expect(await screen.findByText('$7.50')).toBeInTheDocument();
     expect(screen.getByText(/Breakdown by/)).toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: 'Usage' })).not.toBeInTheDocument();
@@ -549,12 +579,21 @@ describe('CustomerDetail Usage tab', () => {
     vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL, REG_PROD]);
     getUsage.mockImplementation((_w: unknown, _p: unknown, host?: string) =>
       host === 'host_prod'
-        ? Promise.reject(new ApiError(501, 'a remote host cannot filter aggregates by customer', ''))
+        ? Promise.reject(
+            new ApiError(
+              501,
+              'x',
+              JSON.stringify({ error: "host host_prod can't be filtered by customer: its totals are summed remotely" }),
+            ),
+          )
         : Promise.resolve(USAGE_RESPONSE),
     );
     mount('/customers/acme/usage');
     expect(await screen.findByText('$7.50')).toBeInTheDocument();
     expect(await screen.findByText(/excludes prod \(unavailable\)/)).toBeInTheDocument();
+    expect(screen.getByTestId('hosts-without-customer')).toHaveTextContent(
+      /prod can’t be filtered by customer \(its totals are summed on the host\)/,
+    );
   });
 
   it('marks a headline cost priced at the global rates', async () => {

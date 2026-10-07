@@ -60,6 +60,10 @@ export interface UsageBreakdownRow {
   cost_usd: number | null;
   priced: boolean;
   runs: number;
+  /** Client-side only: set by `aggregateRuns` / `buildTimeline` from the
+   *  first contributing run row's `pricing_error` (the server's breakdown rows
+   *  don't carry it) — the row's cost may be wrong. */
+  pricing_error?: string;
 }
 
 export interface UsageOverview {

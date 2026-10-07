@@ -12,6 +12,7 @@ import { api, ApiError } from '../../lib/api';
 import type { AgentRunRow } from '../../lib/api';
 import { REG_LOCAL, REG_PROD, callsFor, onlyHost } from '../../lib/perHost/testUtils';
 import AgentRuns from './AgentRuns';
+import { scopedEntry, withCustomerScope } from '../../lib/customerScopeTestUtils';
 
 function LocationProbe() {
   const loc = useLocation();
@@ -56,7 +57,7 @@ function stubDeps() {
 function renderPage() {
   return render(
     <MemoryRouter>
-      <AgentRuns />
+      {withCustomerScope(<AgentRuns />)}
     </MemoryRouter>,
   );
 }
@@ -552,7 +553,7 @@ describe('AgentRuns — whole-row navigation (rowHref) goes to the transcript vi
 
     render(
       <MemoryRouter>
-        <AgentRuns />
+        {withCustomerScope(<AgentRuns />)}
       </MemoryRouter>,
     );
 
@@ -623,7 +624,7 @@ describe('AgentRuns — whole-row navigation (rowHref) goes to the transcript vi
 
     render(
       <MemoryRouter>
-        <AgentRuns />
+        {withCustomerScope(<AgentRuns />)}
         <LocationProbe />
       </MemoryRouter>,
     );
@@ -694,5 +695,28 @@ describe('AgentRuns — codenames', () => {
     renderPage();
     fireEvent.click(await screen.findByRole('button', { name: 'All' }));
     expect(await screen.findByText('review-pr · openai/gpt-5')).toBeInTheDocument();
+  });
+});
+
+describe('AgentRuns — the global customer scope', () => {
+  it('passes customer: "acme" on every per-host request and names hosts that can’t filter', async () => {
+    stubDeps();
+    const spy = vi.spyOn(api, 'getAgentRuns').mockImplementation((p) =>
+      p?.host === 'host_prod'
+        ? Promise.reject(new ApiError(501, "host host_prod can't report a customer for every run", ''))
+        : Promise.resolve([]),
+    );
+    render(
+      <MemoryRouter initialEntries={[scopedEntry('acme')]}>
+        {withCustomerScope(<AgentRuns />)}
+      </MemoryRouter>,
+    );
+    for (const host of ['local', 'host_prod']) {
+      await waitFor(() => expect(callsFor(spy, host).length).toBeGreaterThan(0));
+      expect(callsFor(spy, host)[0][0]).toEqual(
+        expect.objectContaining({ customer: 'acme', onHostsWithoutCustomer: expect.any(Function) }),
+      );
+    }
+    expect(await screen.findByTestId('hosts-without-customer')).toHaveTextContent(/^prod runs an older rupu/);
   });
 });

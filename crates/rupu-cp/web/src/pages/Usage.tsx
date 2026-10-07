@@ -47,11 +47,15 @@
 // stay OWNED here (not inside `UsageTimeline`) because this page shares all
 // three with the breakdown table and outlier panel below.
 //
-// Customer scope (customers Plan 2B): `customer` (a slug) scopes every fetch
-// to that customer's work (`?customer=`) and renders the page embedded, without
-// its title. Aggregates are local-only under a filter, so a remote host answers
-// 501 and shows as unavailable in the host strip rather than being counted.
-// The customer detail's Usage tab mounts it this way.
+// Customer scope (customers Plan 2B): the page follows the global scope
+// (`useScopedList`; its header shows the `ScopeChip`), or — embedded in a
+// customer's Usage tab — a fixed `customer` prop, which also drops the title.
+// Either scopes every fetch to that customer's work (`?customer=`). Aggregates
+// are local-only under a filter, so a remote host answers 501 and shows as
+// unavailable rather than being counted; `HostsWithoutCustomerBanner` names it,
+// along with the hosts the headline's `hosts_without_customer` and the run-rows
+// / outliers fetches' `X-Rupu-Hosts-Without-Customer` header name. A scope the
+// backend rejects (400) is cleared with a notice.
 
 import { useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react';
 import {
@@ -74,6 +78,9 @@ import UsageTimeline from '../components/usage/UsageTimeline';
 import { type UsageMetric } from '../components/dashboard/UsageTimelineStacked';
 import ModelBreakdownTable from '../components/dashboard/ModelBreakdownTable';
 import { Spinner } from '../components/ui/Spinner';
+import { useScopedList } from '../lib/useScopedList';
+import { ScopeChip } from '../components/customers/ScopeChip';
+import { HostsWithoutCustomerBanner } from '../components/customers/HostsWithoutCustomerBanner';
 
 const RANGES: DashboardRange[] = ['7d', '30d', 'all'];
 
@@ -87,8 +94,8 @@ function toggleInSet(set: Set<string>, key: string): Set<string> {
   return next;
 }
 
-export default function Usage({ customer }: { customer?: string } = {}) {
-  const embedded = customer !== undefined;
+export default function Usage({ customer: fixedCustomer }: { customer?: string } = {}) {
+  const { customer, embedded, rejectIfScopeError } = useScopedList(fixedCustomer, []);
   const [range, setRange] = useState<DashboardRange>('30d');
   // The `{since, until}` window driving every usage fetch below (Task W2) —
   // `range` is kept alongside purely for the 7/30/All button highlighting.
@@ -111,7 +118,13 @@ export default function Usage({ customer }: { customer?: string } = {}) {
   // identity is the preset (its `until` ticks every 30s without changing what
   // the operator is looking at); a custom window's is its exact bounds.
   const windowKey = isCustomWindow ? `${usageWindow.since}|${usageWindow.until}` : `preset:${range}`;
-  const { data: current, hosts, error, notice } = useUsageData(usageWindow, windowKey, windowSource, customer);
+  const { data: current, hosts, error, notice } = useUsageData(
+    usageWindow,
+    windowKey,
+    windowSource,
+    customer,
+    rejectIfScopeError,
+  );
   // `current` is null from a user window change until the first host answers for
   // the NEW window (the hook never mixes an old window's figures into a new
   // one). Keep the last good headline on screen meanwhile, as the page did when
@@ -119,9 +132,11 @@ export default function Usage({ customer }: { customer?: string } = {}) {
   // host strip's `loading` entries say it is refreshing, and the page does not
   // collapse to its full-page spinner (which would unmount `UsageTimeline` and
   // delay its run-rows fetch until the headline lands).
-  const lastGood = useRef(current);
-  if (current) lastGood.current = current;
-  const data = current ?? lastGood.current;
+  // Never across a customer change, though: another customer's spend is not a
+  // stand-in for this one's, so a new scope waits for its own first answer.
+  const lastGood = useRef({ customer, data: current });
+  if (current) lastGood.current = { customer, data: current };
+  const data = current ?? (lastGood.current.customer === customer ? lastGood.current.data : null);
   // The last good headline is standing in for a window no host has answered yet.
   // If every host has failed for it (`error`), the "refresh failed" chip says so
   // and the cue stops: a drag-selected window never retries, so a spinner beside
@@ -162,6 +177,15 @@ export default function Usage({ customer }: { customer?: string } = {}) {
   }, [range]);
 
   const [outliers, setOutliers] = useState<OutlierRun[]>([]);
+  // Customer-scoped only: the hosts the run-rows and outliers fetches named in
+  // their `X-Rupu-Hosts-Without-Customer` header (each replaced by its latest
+  // answer; cleared when the filter goes).
+  const [runsHostsWithout, setRunsHostsWithout] = useState<string[]>([]);
+  const [outlierHostsWithout, setOutlierHostsWithout] = useState<string[]>([]);
+  useEffect(() => {
+    setRunsHostsWithout([]);
+    setOutlierHostsWithout([]);
+  }, [customer]);
   // The flat per-run rows `UsageTimeline` fetches for the graph (Task U1),
   // handed back via `onRunsLoaded` so the breakdown table below can be built
   // from the SAME rows instead of `data.breakdown` (fleet-wide, from
@@ -192,7 +216,12 @@ export default function Usage({ customer }: { customer?: string } = {}) {
   // stable (same primitive-deps pattern as `UsageTimeline`'s own effect).
   useEffect(() => {
     let cancelled = false;
-    (customer ? api.getUsageOutliers(usageWindow, customer) : api.getUsageOutliers(usageWindow))
+    (customer
+      ? api.getUsageOutliers(usageWindow, customer, (ids) => {
+          if (!cancelled) setOutlierHostsWithout(ids);
+        })
+      : api.getUsageOutliers(usageWindow)
+    )
       .then((rows) => {
         if (!cancelled) setOutliers(rows);
       })
@@ -258,7 +287,12 @@ export default function Usage({ customer }: { customer?: string } = {}) {
     <div className={embedded ? 'space-y-4' : 'space-y-4 p-4'}>
       <header className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          {!embedded && <h1 className="text-lg font-semibold text-ink">Usage</h1>}
+          {!embedded && (
+            <div className="flex flex-wrap items-center gap-2">
+              <h1 className="text-lg font-semibold text-ink">Usage</h1>
+              <ScopeChip />
+            </div>
+          )}
           {hosts.length > 0 && (
             <div className="mt-1">
               <HostFreshnessStrip hosts={hosts} />
@@ -302,6 +336,13 @@ export default function Usage({ customer }: { customer?: string } = {}) {
         </div>
       </header>
 
+      {customer && (
+        <HostsWithoutCustomerBanner
+          hosts={hosts.map((h) => ({ id: h.host_id, name: h.name, state: h.state, reason: h.reason }))}
+          without={[...(data?.hostsWithoutCustomer ?? []), ...runsHostsWithout, ...outlierHostsWithout]}
+        />
+      )}
+
       {data ? (
         <>
           <UnpricedBanner unpriced={data.unpriced} />
@@ -321,6 +362,7 @@ export default function Usage({ customer }: { customer?: string } = {}) {
             excludedCount={excludedCount}
             onReset={resetExclusions}
             onRunsLoaded={setRuns}
+            onHostsWithoutCustomer={customer ? setRunsHostsWithout : undefined}
             onSelectRange={handleSelectRange}
             pending={isPending || headlineStale}
             background={windowSource === 'tick'}

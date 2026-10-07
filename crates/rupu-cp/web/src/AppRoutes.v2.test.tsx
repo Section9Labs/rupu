@@ -27,6 +27,7 @@ import { MemoryRouter, useLocation } from 'react-router-dom';
 import { api } from './lib/api';
 import { ThemeProvider } from './components/theme/ThemeProvider';
 import { CustomerScopeProvider } from './lib/customerScope';
+import { ACME } from './lib/customerScopeTestUtils';
 
 vi.mock('./pages/RunDetail', () => ({
   __esModule: true,
@@ -218,5 +219,37 @@ describe('AppRoutes shell branch', () => {
   it('v2: /events (wall display) survives untouched', async () => {
     renderApp('v2', '/events');
     await waitFor(() => expect(screen.getByTestId('loc')).toHaveTextContent('/events'));
+  });
+});
+
+describe('v2 composite pages follow the customer scope', () => {
+  beforeEach(() => {
+    vi.mocked(api.getCustomers).mockResolvedValue([ACME]);
+    vi.mocked(api.getRegisteredHosts).mockResolvedValue([{ id: 'local', name: 'Local', transport_kind: 'local' }]);
+  });
+
+  it('Activity → agents fetches with the scope', async () => {
+    renderApp('v2', '/activity?tab=agents&customer=acme');
+    await waitFor(() =>
+      expect(api.getAgentRuns).toHaveBeenCalledWith(expect.objectContaining({ customer: 'acme', host: 'local' })),
+    );
+  });
+
+  it('Activity → workflows fetches with the scope', async () => {
+    const spy = vi.spyOn(api, 'getWorkflowRuns').mockResolvedValue([]);
+    renderApp('v2', '/activity?tab=workflows&customer=acme');
+    await waitFor(() => expect(spy).toHaveBeenCalledWith(expect.objectContaining({ customer: 'acme' })));
+  });
+
+  it('Activity → sessions fetches with the scope', async () => {
+    renderApp('v2', '/activity?tab=sessions&customer=acme');
+    await waitFor(() =>
+      expect(api.getSessions).toHaveBeenCalledWith(expect.objectContaining({ customer: 'acme', host: 'local' })),
+    );
+  });
+
+  it('Security → findings fetches with the scope', async () => {
+    renderApp('v2', '/security?tab=findings&customer=acme');
+    await waitFor(() => expect(api.getFindings).toHaveBeenCalledWith({ customer: 'acme' }));
   });
 });

@@ -49,6 +49,9 @@
 // identity — changing it behaves like a window change. Aggregates are
 // local-only under a filter: a remote host answers 501, which the engine
 // records as `unavailable` (shown as such in the host strip, never counted).
+// `data.hostsWithoutCustomer` is the union of the current answers'
+// `hosts_without_customer`. A failed scoped request calls `onScopeRejected`
+// with the error, so the page can clear a scope the backend rejected (400).
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { api, apiErrorMessage, type CustomerScope, type UsageResponse, type UsageWindow } from '../api';
@@ -75,7 +78,7 @@ interface HostUsage {
 }
 
 export interface UseUsageDataResult {
-  data: (MergedUsage & { excluded: string[] }) | null;
+  data: (MergedUsage & { excluded: string[]; hostsWithoutCustomer: string[] }) | null;
   hosts: HostFreshnessEntry[];
   /** Every known host failed for the current window. */
   error: Error | null;
@@ -100,11 +103,14 @@ export function useUsageData(
   windowIdentity: string,
   windowSource: 'user' | 'tick',
   customer?: CustomerScope,
+  onScopeRejected?: (e: unknown) => void,
 ): UseUsageDataResult {
   // What the answers are keyed by: the window, and the customer filter when there is one.
   const windowKey = customer ? `${windowIdentity}|customer=${customer}` : windowIdentity;
   const customerRef = useRef(customer);
   customerRef.current = customer;
+  const onScopeRejectedRef = useRef(onScopeRejected);
+  onScopeRejectedRef.current = onScopeRejected;
   const [hosts, setHosts] = useState<HostUsage[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
   const noticeRef = useRef(notice);
@@ -152,8 +158,9 @@ export function useUsageData(
       if (controllersRef.current.get(hostId) === controller) controllersRef.current.delete(hostId);
     };
     // The customer filter is passed only when set, so an unscoped call is exactly the old one.
-    const request = customerRef.current
-      ? api.getUsage(windowRef.current, 'model', hostId, controller.signal, customerRef.current)
+    const scoped = customerRef.current;
+    const request = scoped
+      ? api.getUsage(windowRef.current, 'model', hostId, controller.signal, scoped)
       : api.getUsage(windowRef.current, 'model', hostId, controller.signal);
     Promise.race([request, timeout]).then(
       (resp) => {
@@ -172,6 +179,7 @@ export function useUsageData(
         // First check, always: an aborted or superseded request must never mark its host offline.
         if (disposedRef.current || seqRef.current.get(hostId) !== seq) return;
         settled();
+        if (scoped) onScopeRejectedRef.current?.(e);
         const f = classifyFailure(e);
         if (f.kind === 'gone' && hostId !== 'local') {
           // The host is no longer registered: drop it, as the list engine does. Local is never
@@ -308,7 +316,9 @@ export function useUsageData(
     const excluded = hosts
       .filter((h) => !current(h))
       .map((h) => `${h.name} (${h.state === 'ok' ? (staleFailed(h) ? 'stale' : 'loading') : h.state})`);
-    return { ...mergeUsage(ok.map((h) => h.response as UsageResponse)), excluded };
+    const responses = ok.map((h) => h.response as UsageResponse);
+    const hostsWithoutCustomer = [...new Set(responses.flatMap((r) => r.hosts_without_customer ?? []))].sort();
+    return { ...mergeUsage(responses), excluded, hostsWithoutCustomer };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `current`/`staleFailed` close over windowKey
   }, [hosts, windowKey]);
 

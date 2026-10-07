@@ -1,11 +1,13 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { render, screen, cleanup, waitFor } from '@testing-library/react';
+import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import Dashboard from './Dashboard';
-import { api, type DashboardResponse, type RegisteredHostView } from '../lib/api';
+import { api, ApiError, type DashboardResponse, type RegisteredHostView } from '../lib/api';
+import { useCustomerScope } from '../lib/customerScope';
 import { emptyFleet } from '../lib/dashboard/mergeSummaries';
+import { customerRow, scopedEntry, withCustomerScope, ACME } from '../lib/customerScopeTestUtils';
 
 afterEach(() => {
   cleanup();
@@ -48,7 +50,7 @@ describe('Dashboard', () => {
 
     render(
       <MemoryRouter>
-        <Dashboard />
+        {withCustomerScope(<Dashboard />)}
       </MemoryRouter>,
     );
 
@@ -65,7 +67,7 @@ describe('Dashboard', () => {
 
     render(
       <MemoryRouter>
-        <Dashboard />
+        {withCustomerScope(<Dashboard />)}
       </MemoryRouter>,
     );
 
@@ -88,7 +90,7 @@ describe('Dashboard', () => {
 
     render(
       <MemoryRouter>
-        <Dashboard />
+        {withCustomerScope(<Dashboard />)}
       </MemoryRouter>,
     );
 
@@ -107,7 +109,7 @@ describe('Dashboard', () => {
 
     render(
       <MemoryRouter>
-        <Dashboard />
+        {withCustomerScope(<Dashboard />)}
       </MemoryRouter>,
     );
 
@@ -133,7 +135,7 @@ describe('Dashboard fleet strip', () => {
 
     render(
       <MemoryRouter>
-        <Dashboard />
+        {withCustomerScope(<Dashboard />)}
       </MemoryRouter>,
     );
 
@@ -146,5 +148,89 @@ describe('Dashboard fleet strip', () => {
     expect(screen.getByTestId('fleet-repos')).toHaveTextContent('—');
     expect(screen.getByTestId('fleet-providers')).toHaveTextContent('—');
     expect(screen.getByTestId('fleet-issues')).toHaveTextContent('—');
+  });
+});
+
+describe('Dashboard customer scope', () => {
+  const PROD_HOST: RegisteredHostView = { id: 'host_prod', name: 'prod', transport_kind: 'http_cp' };
+
+  function ScopeProbe() {
+    const { scope, notice } = useCustomerScope();
+    return (
+      <>
+        <span data-testid="scope">{String(scope)}</span>
+        <span data-testid="notice">{notice ?? ''}</span>
+      </>
+    );
+  }
+
+  function mountScoped(scope = 'acme', customers = [ACME]) {
+    return render(
+      <MemoryRouter initialEntries={[scopedEntry(scope)]}>
+        {withCustomerScope(
+          <>
+            <Dashboard />
+            <ScopeProbe />
+          </>,
+          { customers },
+        )}
+      </MemoryRouter>,
+    );
+  }
+
+  it('fetches every host with the scope, shows the ScopeChip, and names a remote host it could not count', async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST, PROD_HOST]);
+    const getDashboard = vi.spyOn(api, 'getDashboard').mockImplementation((_r, host) =>
+      host === 'host_prod'
+        ? Promise.reject(
+            new ApiError(
+              501,
+              'x',
+              JSON.stringify({ error: "host host_prod can't be filtered by customer: its totals are summed remotely" }),
+            ),
+          )
+        : Promise.resolve(summary({ hosts_without_customer: ['worker-7'] })),
+    );
+    vi.spyOn(api, 'subscribeEvents').mockReturnValue(() => {});
+
+    mountScoped();
+
+    await waitFor(() => expect(getDashboard).toHaveBeenCalledWith('30d', 'local', 'acme'));
+    expect(getDashboard).toHaveBeenCalledWith('30d', 'host_prod', 'acme');
+    expect(await screen.findByText('Acme')).toBeInTheDocument();
+    const banner = await screen.findByTestId('hosts-without-customer');
+    expect(banner).toHaveTextContent(/worker-7 runs an older rupu/);
+    expect(banner).toHaveTextContent(/prod can’t be filtered by customer \(its totals are summed on the host\)/);
+  });
+
+  it('clearing the chip sets the scope to null and refetches unfiltered', async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST]);
+    const getDashboard = vi.spyOn(api, 'getDashboard').mockResolvedValue(summary());
+    vi.spyOn(api, 'subscribeEvents').mockReturnValue(() => {});
+
+    mountScoped();
+    await waitFor(() => expect(getDashboard).toHaveBeenCalledWith('30d', 'local', 'acme'));
+    fireEvent.click(await screen.findByRole('button', { name: 'Clear customer scope' }));
+
+    await waitFor(() => expect(screen.getByTestId('scope')).toHaveTextContent('null'));
+    // The unscoped request is exactly the old one: no third argument.
+    await waitFor(() => expect(getDashboard.mock.lastCall).toEqual(['30d', 'local']));
+    expect(screen.queryByRole('button', { name: 'Clear customer scope' })).not.toBeInTheDocument();
+  });
+
+  it('a scope the backend rejects (400) is cleared and the page refetches unfiltered', async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST]);
+    const getDashboard = vi.spyOn(api, 'getDashboard').mockImplementation((_r, _h, customer) =>
+      customer
+        ? Promise.reject(new ApiError(400, 'x', JSON.stringify({ error: 'customer: invalid slug "Bad Slug"' })))
+        : Promise.resolve(summary()),
+    );
+    vi.spyOn(api, 'subscribeEvents').mockReturnValue(() => {});
+
+    mountScoped('bad', [ACME, customerRow('bad')]);
+    await waitFor(() => expect(screen.getByTestId('scope')).toHaveTextContent('null'));
+    expect(screen.getByTestId('notice')).toHaveTextContent(/The customer filter was rejected \(customer: invalid slug/);
+    await waitFor(() => expect(getDashboard.mock.lastCall).toEqual(['30d', 'local']));
+    await waitFor(() => expect(screen.getByTestId('tile-awaiting')).toHaveTextContent('1'));
   });
 });

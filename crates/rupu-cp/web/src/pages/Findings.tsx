@@ -5,10 +5,13 @@
 // filter — the metric tiles keep the unfiltered totals). The table's Project /
 // Target columns show each finding's owning project · target.
 //
-// Customer scope (customers Plan 2B): `customer` limits the list to the
-// findings of that customer's projects (`GET /api/findings?customer=`; the
-// summary counts only the kept findings) and renders it embedded, without the
-// page header and padding. The customer detail's Findings tab mounts it so.
+// Customer scope (customers Plan 2B): the list follows the global scope
+// (`useScopedList`), or — embedded in a customer's Findings tab — a fixed
+// `customer` prop, which also drops the page header and padding. Either limits
+// it to the findings of that customer's projects (`GET /api/findings?customer=`;
+// the summary counts only the kept findings). Findings are the coordinator's
+// own records, keyed on each project's current assignment, so no host is ever
+// left out here. A scope the backend rejects (400) is cleared with a notice.
 
 import { useEffect, useMemo, useState } from 'react';
 import { api, normFindingSeverity, type FindingOut, type FindingsSummary } from '../lib/api';
@@ -23,6 +26,7 @@ import { FilterBar } from '../components/ui/FilterBar';
 import { FilterPills } from '../components/ui/FilterPills';
 import { Select } from '../components/ui/Select';
 import { Spinner } from '../components/ui/Spinner';
+import { useScopedList } from '../lib/useScopedList';
 
 type ProfileFilter = 'all' | 'full' | 'summary';
 
@@ -34,8 +38,8 @@ const PROFILE_OPTIONS: { value: ProfileFilter; label: string }[] = [
 
 const EMPTY_SUMMARY: FindingsSummary = { total: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0 };
 
-export default function Findings({ customer }: { customer?: string } = {}) {
-  const embedded = customer !== undefined;
+export default function Findings({ customer: fixedCustomer }: { customer?: string } = {}) {
+  const { customer, embedded, guard } = useScopedList(fixedCustomer, []);
   const [findings, setFindings] = useState<FindingOut[] | null>(null);
   const [summary, setSummary] = useState<FindingsSummary>(EMPTY_SUMMARY);
   const [error, setError] = useState<string | null>(null);
@@ -46,8 +50,11 @@ export default function Findings({ customer }: { customer?: string } = {}) {
 
   useEffect(() => {
     let cancelled = false;
+    // A different filter: drop the other filter's rows rather than show them while loading.
+    setFindings(null);
+    setError(null);
     // Called with no argument when unscoped, as the page always did.
-    (customer ? api.getFindings({ customer }) : api.getFindings())
+    (customer ? guard(api.getFindings({ customer })) : api.getFindings())
       .then((data) => {
         if (cancelled) return;
         setFindings(data.findings);
@@ -60,7 +67,7 @@ export default function Findings({ customer }: { customer?: string } = {}) {
     return () => {
       cancelled = true;
     };
-  }, [customer]);
+  }, [customer, guard]);
 
   const all = findings ?? [];
 
@@ -122,9 +129,11 @@ export default function Findings({ customer }: { customer?: string } = {}) {
         <EmptyState
           title="No findings"
           hint={
-            embedded
-              ? 'None of this customer’s projects has recorded a finding yet.'
-              : 'Run an assessment workflow to start recording findings across your projects.'
+            customer === 'none'
+              ? 'No project without a customer has recorded a finding yet.'
+              : customer
+                ? 'None of this customer’s projects has recorded a finding yet.'
+                : 'Run an assessment workflow to start recording findings across your projects.'
           }
         />
       ) : (

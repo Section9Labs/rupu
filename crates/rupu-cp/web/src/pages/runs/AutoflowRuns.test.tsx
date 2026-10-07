@@ -20,6 +20,7 @@ import {
 } from '../../lib/api';
 import { callsFor, onlyHost } from '../../lib/perHost/testUtils';
 import AutoflowRuns from './AutoflowRuns';
+import { scopedEntry, withCustomerScope } from '../../lib/customerScopeTestUtils';
 
 afterEach(() => {
   cleanup();
@@ -91,7 +92,7 @@ function stubPage() {
 function renderPage() {
   return render(
     <MemoryRouter>
-      <AutoflowRuns />
+      {withCustomerScope(<AutoflowRuns />)}
     </MemoryRouter>,
   );
 }
@@ -767,5 +768,28 @@ describe('AutoflowRuns — Find while a host is still loading', () => {
 
     await waitFor(() => expect(screen.getByText('No matches yet · Waiting on prod…')).toBeInTheDocument());
     expect(screen.getAllByText(/waiting on prod/i)).toHaveLength(1);
+  });
+});
+
+describe('AutoflowRuns — the customer scope', () => {
+  it('says the autoflow listings are not filtered by customer while scoped, and sends no customer', async () => {
+    stubPage();
+    render(
+      <MemoryRouter initialEntries={[scopedEntry('acme')]}>
+        {withCustomerScope(<AutoflowRuns />)}
+      </MemoryRouter>,
+    );
+    expect(
+      await screen.findByText(/Autoflow runs, cycles and claims aren’t filtered by customer/),
+    ).toBeInTheDocument();
+    await waitFor(() => expect(callsFor(vi.mocked(api.getAutoflowEvents), 'local').length).toBeGreaterThan(0));
+    expect(callsFor(vi.mocked(api.getAutoflowEvents), 'local')[0][0]).not.toHaveProperty('customer');
+  });
+
+  it('shows no such note when unscoped', async () => {
+    stubPage();
+    renderPage();
+    await waitFor(() => expect(callsFor(vi.mocked(api.getAutoflowEvents), 'local').length).toBeGreaterThan(0));
+    expect(screen.queryByText(/aren’t filtered by customer/)).not.toBeInTheDocument();
   });
 });

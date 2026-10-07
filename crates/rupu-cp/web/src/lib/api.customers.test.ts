@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { api, ApiError, parseCustomerConflict } from './api';
+import { api, ApiError, parseCustomerConflict, parseHostsWithoutCustomer } from './api';
 
 function mockFetch(status: number, body: unknown) {
   const text = typeof body === 'string' ? body : JSON.stringify(body);
@@ -174,6 +174,61 @@ describe('customer scope param', () => {
     const i = mockFetch(200, {});
     await api.getUsageTimeline();
     expect(urlOf(i)).toBe('/api/usage/timeline');
+  });
+});
+
+describe('X-Rupu-Hosts-Without-Customer', () => {
+  function mockFetchWithHeader(header: string | null, body: unknown = []) {
+    const fn = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      headers: new Headers(header === null ? {} : { 'X-Rupu-Hosts-Without-Customer': header }),
+      text: () => Promise.resolve(JSON.stringify(body)),
+    });
+    vi.stubGlobal('fetch', fn);
+    return fn;
+  }
+
+  it('parses the comma-separated host ids', () => {
+    expect(parseHostsWithoutCustomer(' mini, host_prod ,,')).toEqual(['mini', 'host_prod']);
+    expect(parseHostsWithoutCustomer(null)).toEqual([]);
+  });
+
+  it('hands the header to the sink of every scoped list it can name hosts on', async () => {
+    const calls: Array<[string, (sink: (ids: string[]) => void) => Promise<unknown>]> = [
+      ['runs', (sink) => api.getRuns({ customer: 'acme', onHostsWithoutCustomer: sink })],
+      ['workflows', (sink) => api.getWorkflowRuns({ customer: 'acme', onHostsWithoutCustomer: sink })],
+      ['agents', (sink) => api.getAgentRuns({ customer: 'acme', onHostsWithoutCustomer: sink })],
+      ['sessions', (sink) => api.getSessions({ customer: 'acme', onHostsWithoutCustomer: sink })],
+      ['usage runs', (sink) => api.getUsageRuns(undefined, undefined, 'acme', sink)],
+      ['outliers', (sink) => api.getUsageOutliers(undefined, 'acme', sink)],
+      ['timeline', (sink) => api.getUsageTimeline({ customer: 'acme', onHostsWithoutCustomer: sink })],
+    ];
+    for (const [name, call] of calls) {
+      mockFetchWithHeader('mini,host_prod', [{ id: 'r1' }]);
+      const sink = vi.fn();
+      const rows = await call(sink);
+      expect(rows, name).toEqual([{ id: 'r1' }]);
+      expect(sink, name).toHaveBeenCalledWith(['mini', 'host_prod']);
+    }
+  });
+
+  it('reports [] when the header is absent, and nothing on a failure', async () => {
+    mockFetchWithHeader(null);
+    const sink = vi.fn();
+    await api.getWorkflowRuns({ customer: 'acme', onHostsWithoutCustomer: sink });
+    expect(sink).toHaveBeenCalledWith([]);
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({ ok: false, status: 400, statusText: 'Bad', text: () => Promise.resolve('{"error":"customer: bad"}') }),
+    );
+    const failed = vi.fn();
+    await expect(api.getWorkflowRuns({ customer: 'BAD', onHostsWithoutCustomer: failed })).rejects.toMatchObject({
+      status: 400,
+    });
+    expect(failed).not.toHaveBeenCalled();
   });
 });
 

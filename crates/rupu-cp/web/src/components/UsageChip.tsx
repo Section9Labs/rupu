@@ -1,5 +1,6 @@
 import type { UsageSummary } from '../lib/usage';
 import { formatTokens, formatCost } from '../lib/usage';
+import { PricingErrorMark } from './customers/PricingErrorMark';
 
 /**
  * Compact inline usage chip: `· 4,210 tok · $0.03`.
@@ -22,6 +23,7 @@ export default function UsageChip({
     <span className={`inline-flex items-center gap-1.5 text-note text-ink-mute tabular-nums ${className}`}>
       <span>{formatTokens(usage.total_tokens)} tok</span>
       <span className="text-border">·</span>
+      <PricingErrorMark error={usage.pricing_error} />
       <span title={costTitle} className={partial ? 'text-warn' : undefined}>
         {formatCost(usage.cost_usd)}{partial ? '*' : ''}
       </span>

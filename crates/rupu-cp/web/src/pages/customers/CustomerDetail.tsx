@@ -53,6 +53,7 @@ import { Spinner } from '../../components/ui/Spinner';
 import { CustomerDot } from '../../components/customers/CustomerDot';
 import { CustomerFormDialog } from '../../components/customers/CustomerFormDialog';
 import { PricingErrorMark } from '../../components/customers/PricingErrorMark';
+import { HostsWithoutCustomerBanner } from '../../components/customers/HostsWithoutCustomerBanner';
 import { AssignProjectDialog } from '../../components/customers/AssignProjectDialog';
 import { DialogFrame } from '../../components/customers/DialogFrame';
 import { CustomerRunsTab } from '../../components/customers/CustomerRunsTab';
@@ -355,12 +356,7 @@ export default function CustomerDetail() {
           />
           <BillsToTile account={detail.default_account} layerError={detail.layer_error} />
         </div>
-        {rollup.hosts_without_customer && rollup.hosts_without_customer.length > 0 && (
-          <p className="text-note text-ink-mute">
-            Runs on {rollup.hosts_without_customer.join(', ')} are left out of these numbers — their
-            customer can’t be known.
-          </p>
-        )}
+        <HostsWithoutCustomerBanner without={rollup.hosts_without_customer ?? []} />
       </section>
 
       <div className="-mx-8">

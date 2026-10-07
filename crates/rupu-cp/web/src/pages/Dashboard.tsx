@@ -24,6 +24,13 @@
 // soon as ONE host resolves — without waiting on every host. A hung remote
 // host therefore never blanks the page; it just sits in the strip reading
 // "loading" until it resolves or the reconciling poll gives up on it.
+//
+// Customer scope (customers Plan 2B): the global scope (`useCustomerParam()`)
+// filters every host's summary; the header's `ScopeChip` names it and its ×
+// clears it. Under a filter, remote hosts can't be counted (their totals are
+// summed remotely) and some hosts can't tag every run with a customer — the
+// `HostsWithoutCustomerBanner` names both. A scope the backend rejects (400)
+// is cleared with a notice.
 
 import { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
@@ -36,12 +43,16 @@ import { CycleSummaryLine } from '../components/dashboard/CycleSummaryLine';
 import { FleetStrip } from '../components/dashboard/FleetStrip';
 import { Spinner } from '../components/ui/Spinner';
 import type { DashboardRange } from '../lib/api';
+import { useScopedList } from '../lib/useScopedList';
+import { ScopeChip } from '../components/customers/ScopeChip';
+import { HostsWithoutCustomerBanner } from '../components/customers/HostsWithoutCustomerBanner';
 
 const RANGES: DashboardRange[] = ['7d', '30d', 'all'];
 
 export default function Dashboard() {
   const [range, setRange] = useState<DashboardRange>('30d');
-  const { data, hosts, error } = useDashboardData(range);
+  const { customer, rejectIfScopeError } = useScopedList(undefined, []);
+  const { data, hosts, error, hostsWithoutCustomer } = useDashboardData(range, customer, rejectIfScopeError);
 
   // `useDashboardData`'s per-host state is keyed camelCase (`hostId` /
   // `transportKind`) and carries the raw per-host `summary`; the strip wants
@@ -64,7 +75,10 @@ export default function Dashboard() {
     <div className="space-y-4 p-4">
       <header className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="text-lg font-semibold text-ink">Dashboard</h1>
+          <div className="flex flex-wrap items-center gap-2">
+            <h1 className="text-lg font-semibold text-ink">Dashboard</h1>
+            <ScopeChip />
+          </div>
           <div className="mt-1">
             <HostFreshnessStrip hosts={freshnessHosts} />
           </div>
@@ -103,6 +117,11 @@ export default function Dashboard() {
           </Link>
         </div>
       </header>
+
+      <HostsWithoutCustomerBanner
+        hosts={hosts.map((h) => ({ id: h.hostId, name: h.name, state: h.state, reason: h.reason }))}
+        without={hostsWithoutCustomer}
+      />
 
       {data ? (
         <>

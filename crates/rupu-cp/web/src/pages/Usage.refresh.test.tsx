@@ -36,6 +36,7 @@ vi.mock('../components/dashboard/UsageTimelineStacked', () => ({
 }));
 
 import Usage from './Usage';
+import { withCustomerScope } from '../lib/customerScopeTestUtils';
 
 const FIXED_NOW = new Date('2026-07-16T12:00:00.000Z').getTime();
 const TICK = 30_000;
@@ -97,7 +98,7 @@ function outlierRow(): OutlierRun {
 function renderUsage() {
   return render(
     <MemoryRouter>
-      <Usage />
+      {withCustomerScope(<Usage />)}
     </MemoryRouter>,
   );
 }

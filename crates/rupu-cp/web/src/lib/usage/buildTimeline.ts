@@ -101,6 +101,8 @@ interface Agg {
   sawPriced: boolean;
   sawUnpriced: boolean;
   runIds: Set<string>;
+  /** The first contributing row's `pricing_error` (its cost may be wrong). */
+  pricingError?: string;
 }
 
 function newAgg(): Agg {
@@ -144,6 +146,7 @@ function toBreakdownRow(pivot: Pivot, key: string, agg: Agg): UsageBreakdownRow 
     priced: agg.sawPriced && !agg.sawUnpriced,
     runs: agg.runIds.size,
   };
+  if (agg.pricingError) out.pricing_error = agg.pricingError;
   switch (pivot) {
     case 'model':
       out.model = key;
@@ -209,6 +212,7 @@ export function buildTimeline(
       agg.sawPriced = true;
       agg.costSum += row.cost_usd;
     }
+    agg.pricingError ??= row.pricing_error;
     agg.runIds.add(row.run_id);
   }
 
@@ -253,6 +257,7 @@ export function aggregateRuns(rows: UsageRunRow[], pivot: Pivot): UsageBreakdown
       agg.sawPriced = true;
       agg.costSum += row.cost_usd;
     }
+    agg.pricingError ??= row.pricing_error;
     agg.runIds.add(row.run_id);
   }
 

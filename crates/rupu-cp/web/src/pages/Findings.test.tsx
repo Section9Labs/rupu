@@ -11,11 +11,12 @@ import { MemoryRouter } from 'react-router-dom';
 import { api, type FindingOut, type FindingsSummary } from '../lib/api';
 
 import Findings from './Findings';
+import { scopedEntry, withCustomerScope } from '../lib/customerScopeTestUtils';
 
 function renderPage() {
   return render(
     <MemoryRouter initialEntries={['/findings']}>
-      <Findings />
+      {withCustomerScope(<Findings />)}
     </MemoryRouter>,
   );
 }
@@ -249,5 +250,26 @@ describe('Findings — export report', () => {
     renderPage();
     await waitFor(() => expect(screen.getByText('No findings')).toBeInTheDocument());
     expect(screen.queryByRole('button', { name: 'Export report' })).toBeNull();
+  });
+});
+
+describe('Findings — the global customer scope', () => {
+  it('fetches the scoped customer’s findings', async () => {
+    const spy = vi.spyOn(api, 'getFindings').mockResolvedValue({ findings: [FINDING], summary: SUMMARY });
+    render(
+      <MemoryRouter initialEntries={[scopedEntry('acme', '/findings')]}>
+        {withCustomerScope(<Findings />)}
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(spy).toHaveBeenCalledWith({ customer: 'acme' }));
+    // Not embedded: the page keeps its own heading under a global scope.
+    expect(screen.getByRole('heading', { name: 'Findings' })).toBeInTheDocument();
+  });
+
+  it('unscoped, it calls getFindings with no argument, as before', async () => {
+    const spy = vi.spyOn(api, 'getFindings').mockResolvedValue({ findings: [FINDING], summary: SUMMARY });
+    renderPage();
+    await waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
+    expect(spy.mock.calls[0]).toEqual([]);
   });
 });

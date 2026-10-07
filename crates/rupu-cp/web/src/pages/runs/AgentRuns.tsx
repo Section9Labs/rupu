@@ -19,11 +19,14 @@
 // single merged row's `source` field, it does not need to dedupe anything
 // itself.
 //
-// Customer scope (customers Plan 2B): `customer` fixes the list to one
-// customer's runs (`?customer=<slug>`, through the same per-host engine, so a
-// remote host that can't filter — 501 — shows as an unavailable slice) and
-// renders it embedded, without the page header and padding. The customer
-// detail's Runs tab mounts it this way.
+// Customer scope (customers Plan 2B): the list follows the global scope
+// (`useScopedList`), or — embedded in a customer's Runs tab — a fixed
+// `customer` prop, which also drops the page header and padding. Either way the
+// filter goes through the same per-host engine (`?customer=<slug>`), so a
+// remote host that can't filter (501) shows as an unavailable slice, and
+// `HostsWithoutCustomerBanner` names it along with the hosts the
+// `X-Rupu-Hosts-Without-Customer` header lists. A scope the backend rejects
+// (400) is cleared with a notice.
 
 import { useCallback, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
@@ -52,6 +55,8 @@ import { usePerHostPagedList, type PerHostFetchParams } from '../../lib/perHost/
 import { PerHostFooter, PerHostStrip, perHostFooterText } from '../../components/lists/PerHostStatus';
 import { noHostAnswered, notIncluded, waitingLabel } from '../../lib/perHost/status';
 import { PricingErrorMark } from '../../components/customers/PricingErrorMark';
+import { HostsWithoutCustomerBanner } from '../../components/customers/HostsWithoutCustomerBanner';
+import { useScopedList } from '../../lib/useScopedList';
 
 type Tab = 'active' | 'completed' | 'failed';
 
@@ -110,8 +115,7 @@ function confirmLivenessOverride(runId: string, e: ApiError): boolean {
   );
 }
 
-export default function AgentRuns({ customer }: { customer?: string } = {}) {
-  const embedded = customer !== undefined;
+export default function AgentRuns({ customer: fixedCustomer }: { customer?: string } = {}) {
   const [tab, setTab] = useState<Tab>('active');
   // Default 'standalone' — an agent-runs read is a standalone invocation by
   // default; session-bound runs live on the Sessions page instead (operator
@@ -120,6 +124,8 @@ export default function AgentRuns({ customer }: { customer?: string } = {}) {
   // All hosts by default: local paints at once, each remote merges in as it
   // answers (usePerHostPagedList). A picked host lists only that host.
   const [hostFilter, setHostFilter] = useState<string>(ALL_HOSTS);
+  const scoped = useScopedList(fixedCustomer, [tab, hostFilter]);
+  const { customer, embedded } = scoped;
   // Row-action (archive/restore/delete) failures — kept separate from the
   // list-fetch error the hook owns, but shown in the same banner.
   const [actionError, setActionError] = useState<string | null>(null);
@@ -127,8 +133,20 @@ export default function AgentRuns({ customer }: { customer?: string } = {}) {
 
   const fetchRows = useCallback(
     ({ host, offset, limit, signal }: PerHostFetchParams) =>
-      api.getAgentRuns({ lifecycle: tab, offset, limit, host, signal, ...(customer ? { customer } : {}) }),
-    [tab, customer],
+      customer
+        ? scoped.guard(
+            api.getAgentRuns({
+              lifecycle: tab,
+              offset,
+              limit,
+              host,
+              signal,
+              customer,
+              onHostsWithoutCustomer: scoped.reportHosts(host, offset),
+            }),
+          )
+        : api.getAgentRuns({ lifecycle: tab, offset, limit, host, signal }),
+    [tab, customer, scoped.guard, scoped.reportHosts],
   );
   const { rows, slices, loading, error, hasMore, sentinelRef, refresh, refreshHost, removeRow, retryPaging, ended } =
     usePerHostPagedList<AgentRunRow>({
@@ -351,6 +369,13 @@ export default function AgentRuns({ customer }: { customer?: string } = {}) {
       <div className="mt-3">
         <PerHostStrip slices={slices} />
       </div>
+      {customer && (
+        <HostsWithoutCustomerBanner
+          className="mt-3"
+          hosts={slices.map((sl) => ({ id: sl.hostId, name: sl.name, state: sl.state, reason: sl.reason }))}
+          without={scoped.hostsWithoutCustomer}
+        />
+      )}
 
       <div className="mt-5">
         {bannerError && <ErrorBanner className="mb-4">{bannerError}</ErrorBanner>}
@@ -375,9 +400,11 @@ export default function AgentRuns({ customer }: { customer?: string } = {}) {
             hint={
               missing
                 ? `Not included: ${missing}.`
-                : embedded
-                  ? 'No agent runs are attributed to this customer yet.'
-                  : 'Standalone and session-bound agent invocations will appear here once they run.'
+                : customer === 'none'
+                  ? 'No agent runs without a customer yet.'
+                  : customer
+                    ? 'No agent runs are attributed to this customer yet.'
+                    : 'Standalone and session-bound agent invocations will appear here once they run.'
             }
           />
         ) : visible.length === 0 ? (

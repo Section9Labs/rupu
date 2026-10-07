@@ -14,6 +14,7 @@ import { api } from '../../lib/api';
 import type { AgentRunRow } from '../../lib/api';
 import { REG_LOCAL } from '../../lib/perHost/testUtils';
 import AgentRuns from './AgentRuns';
+import { withCustomerScope } from '../../lib/customerScopeTestUtils';
 
 afterEach(() => {
   cleanup();
@@ -47,7 +48,7 @@ describe('AgentRuns — canonical column order', () => {
 
     const { container } = render(
       <MemoryRouter>
-        <AgentRuns />
+        {withCustomerScope(<AgentRuns />)}
       </MemoryRouter>,
     );
 
