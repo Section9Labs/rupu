@@ -275,7 +275,7 @@ pub async fn serve_on(listener: tokio::net::TcpListener, opts: ServeOpts) -> any
             std::sync::Arc::clone(&app_state.node_registry),
             std::sync::Arc::clone(&app_state.node_mirror),
             std::sync::Arc::clone(&app_state.run_store),
-            app_state.pricing.clone(),
+            std::sync::Arc::clone(&app_state.customer_pricing),
         );
     let app_state = app_state.with_hosts(std::sync::Arc::new(registry));
 

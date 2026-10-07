@@ -74,8 +74,10 @@ pub struct TunnelHostConnector {
     pub mirror: Arc<NodeMirror>,
     /// Central run store — used for all observation queries.
     pub run_store: Arc<RunStore>,
-    /// Pricing configuration for usage calculations in list / detail responses.
-    pub pricing: rupu_config::PricingConfig,
+    /// The coordinator's per-customer pricing, for usage in list / detail
+    /// responses: a mirrored run is priced like the same run on every other
+    /// surface (its recorded customer's layer; a legacy one as unknown).
+    pub pricing: Arc<crate::customers::CustomerPricing>,
 }
 
 impl TunnelHostConnector {
@@ -85,7 +87,7 @@ impl TunnelHostConnector {
         registry: Arc<NodeRegistry>,
         mirror: Arc<NodeMirror>,
         run_store: Arc<RunStore>,
-        pricing: rupu_config::PricingConfig,
+        pricing: Arc<crate::customers::CustomerPricing>,
     ) -> Self {
         Self {
             node_id: node_id.into(),
@@ -256,7 +258,7 @@ impl HostConnector for TunnelHostConnector {
         let (store, id, pricing) = (
             Arc::clone(&self.run_store),
             self.node_id.clone(),
-            self.pricing.clone(),
+            Arc::clone(&self.pricing),
         );
         blocking_host(move || mirror_list_runs(&store, &id, &params, &pricing)).await
     }
@@ -265,7 +267,7 @@ impl HostConnector for TunnelHostConnector {
         let (store, id, pricing) = (
             Arc::clone(&self.run_store),
             self.node_id.clone(),
-            self.pricing.clone(),
+            Arc::clone(&self.pricing),
         );
         let run_id = run_id.to_string();
         blocking_host(move || mirror_get_run(&store, &id, &run_id, &pricing)).await
@@ -492,7 +494,9 @@ mod tests {
             registry,
             Arc::new(NodeMirror::new(Arc::clone(&run_store))),
             run_store,
-            rupu_config::PricingConfig::default(),
+            Arc::new(crate::customers::CustomerPricing::flat(
+                rupu_config::PricingConfig::default(),
+            )),
         );
         (connector, rx, node_conn)
     }

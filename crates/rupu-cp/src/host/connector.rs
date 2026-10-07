@@ -855,11 +855,15 @@ pub(crate) async fn blocking_host<T: Send + 'static>(
 /// the coordinator's layer to placed units. Until then each peer has its own
 /// customer namespace — a peer's `acme` is that peer's customer, which may or
 /// may not be the coordinator's `acme`.
+///
+/// Rows are priced with the coordinator's [`crate::customers::CustomerPricing`]
+/// at the customer the run recorded (a legacy run: global rates, flagged
+/// `pricing_error`) — the same price its detail, graph and live usage show.
 pub(crate) fn mirror_list_runs(
     run_store: &RunStore,
     worker_id: &str,
     params: &RunListQuery,
-    pricing: &rupu_config::PricingConfig,
+    pricing: &crate::customers::CustomerPricing,
 ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
     let workflow_only = params.kind == RunKind::Workflow;
     let rows = crate::api::runs::query_run_rows(
@@ -869,7 +873,9 @@ pub(crate) fn mirror_list_runs(
         params.lifecycle.as_deref(),
         workflow_only,
         Some(worker_id),
-        &mut crate::customers::FlatPricing(pricing),
+        // Priced like the same run everywhere else: its recorded customer's
+        // pricing (the coordinator's layer); a legacy run as unknown.
+        &mut crate::customers::PricingMemo::new(pricing),
         // No since/until on `RunListQuery` yet — see `LocalHostConnector::
         // list_runs`'s matching call site for why this is deferred.
         &crate::pagination::DateRangeQuery::default(),
@@ -893,15 +899,17 @@ pub(crate) fn mirror_get_run(
     run_store: &RunStore,
     worker_id: &str,
     run_id: &str,
-    pricing: &rupu_config::PricingConfig,
+    pricing: &crate::customers::CustomerPricing,
 ) -> Result<serde_json::Value, HostConnectorError> {
     check_mirror_run(run_store, worker_id, run_id)?;
     // A mirrored run is priced by what it recorded only (no lookup: its
-    // workspace's assignment lives on the worker).
+    // workspace's assignment lives on the worker) — at the coordinator's
+    // pricing for that customer, exactly as its list row, graph and live
+    // usage price it.
     crate::api::runs::query_run_detail(
         run_store,
         run_id,
-        &mut crate::customers::FlatPricing(pricing),
+        &mut crate::customers::PricingMemo::new(pricing),
         None,
     )
     .map_err(|e| HostConnectorError::Invalid(e.to_string()))
@@ -1261,7 +1269,8 @@ mod off_runtime_tests {
             limit: 50,
             lifecycle: None,
         };
-        let pricing = rupu_config::PricingConfig::default();
+        let pricing =
+            crate::customers::CustomerPricing::flat(rupu_config::PricingConfig::default());
         let none = crate::customers::CustomerFilter::Unassigned;
         let acme = crate::customers::CustomerFilter::Slug("acme".into());
 

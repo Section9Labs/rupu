@@ -1327,3 +1327,61 @@ async fn a_session_turn_prices_and_attributes_alike_on_both_lists() {
         "{turn_cost} vs {session_cost}"
     );
 }
+
+/// A tunnel-mirrored run that recorded `acme` costs the same through the
+/// tunnel host's list, detail, live usage and graph as everywhere else: the
+/// coordinator's acme pricing (M1) — never the flat global rates.
+#[tokio::test]
+async fn a_mirrored_runs_cost_is_the_same_on_every_host_surface() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    let global = tmp.path();
+    seed_workspace(global, "ws_p", &proj.path().join("ws_p"));
+    create_customer(global, "acme");
+    let toml = |p: f64| {
+        format!("[pricing.anthropic.\"{MODEL}\"]\ninput_per_mtok = {p}\noutput_per_mtok = 1.0\n")
+    };
+    std::fs::write(global.join("config.toml"), toml(1.0)).unwrap();
+    std::fs::write(CustomerStore::new(global).config_path("acme"), toml(5.0)).unwrap();
+    let (host, _token) = rupu_workspace::enroll_node(
+        &rupu_workspace::HostStore {
+            root: global.join("hosts"),
+        },
+        "node-a",
+    )
+    .unwrap();
+    let node_id = match &host.transport {
+        rupu_workspace::HostTransport::Tunnel { node_id } => node_id.clone(),
+        other => panic!("expected a tunnel host: {other:?}"),
+    };
+    let at = Utc::now() - Duration::hours(1);
+    seed_run_rec(global, "m_acme", "ws_p", Some(Some("acme".into())), at);
+    let store = RunStore::new(global.join("runs"));
+    let mut rec = store.load("m_acme").unwrap();
+    rec.worker_id = Some(node_id);
+    store.update(&rec).unwrap();
+    // A snapshot the graph can parse (the shared seed's is a bare name).
+    std::fs::write(
+        store.workflow_snapshot_path("m_acme"),
+        "name: wf\nsteps:\n  - id: s1\n    agent: reviewer\n    prompt: hi\n",
+    )
+    .unwrap();
+    let base = spawn(global).await;
+    let h = &host.id;
+
+    let cost = |v: &Value| v["cost_usd"].as_f64().unwrap_or_else(|| panic!("{v}"));
+    let rows = get_json(format!("{base}/api/runs?host={h}")).await;
+    let row = by_id(&rows, "id", "m_acme");
+    assert_eq!(row["customer"], "acme");
+    assert!((cost(&row["usage"]) - 5.0).abs() < 1e-9, "list: {row}");
+    let detail = get_json(format!("{base}/api/runs/m_acme?host={h}")).await;
+    assert_eq!(
+        cost(&detail["usage"]),
+        cost(&row["usage"]),
+        "detail: {detail}"
+    );
+    let live = get_json(format!("{base}/api/runs/m_acme/usage?host={h}")).await;
+    assert_eq!(cost(&live["summary"]), cost(&row["usage"]), "usage: {live}");
+    let graph = get_json(format!("{base}/api/runs/m_acme/graph?host={h}")).await;
+    assert_eq!(cost(&graph["usage"]), cost(&row["usage"]), "graph");
+}

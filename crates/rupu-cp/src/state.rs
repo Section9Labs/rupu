@@ -122,21 +122,20 @@ impl AppState {
         let store = rupu_workspace::HostStore {
             root: global_dir.join("hosts"),
         };
+        let customer_pricing = Arc::new(crate::customers::CustomerPricing::new(
+            global_dir.clone(),
+            pricing.clone(),
+        ));
         let hosts = Arc::new(
             crate::host::registry::HostRegistry::new(store, Arc::new(local)).with_tunnel_deps(
                 Arc::clone(&node_registry),
                 Arc::clone(&node_mirror),
                 Arc::clone(&run_store),
-                pricing.clone(),
+                Arc::clone(&customer_pricing),
             ),
         );
 
         let config = Arc::new(RwLock::new(Self::resolve_global_config(&global_dir)));
-
-        let customer_pricing = Arc::new(crate::customers::CustomerPricing::new(
-            global_dir.clone(),
-            pricing.clone(),
-        ));
 
         Self {
             global_dir,

@@ -743,7 +743,10 @@ pub fn build_dispatcher_if_needed(
         node_registry,
         node_mirror,
         run_store,
-        pricing,
+        Arc::new(rupu_cp::customers::CustomerPricing::new(
+            global.to_path_buf(),
+            pricing,
+        )),
     );
 
     Some(Arc::new(FleetUnitDispatcher::new(

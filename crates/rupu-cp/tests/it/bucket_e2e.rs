@@ -271,7 +271,9 @@ async fn bucket_dead_drop_e2e() {
         Arc::clone(&shared_bucket),
         Arc::clone(&mirror),
         Arc::clone(&run_store),
-        rupu_config::PricingConfig::default(),
+        std::sync::Arc::new(rupu_cp::customers::CustomerPricing::flat(
+            rupu_config::PricingConfig::default(),
+        )),
     );
 
     let run_id = connector

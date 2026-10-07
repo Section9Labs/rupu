@@ -409,6 +409,8 @@ struct CustomerLayer {
 /// only the fallback for a global file that does not parse.
 pub struct CustomerPricing {
     global_dir: PathBuf,
+    /// [`Self::flat`]: no files are read; every customer prices at `startup`.
+    flat: bool,
     startup: PricingConfig,
     store: CustomerStore,
     baseline: Mutex<Option<(Option<SystemTime>, PricingConfig)>>,
@@ -420,15 +422,30 @@ impl CustomerPricing {
         Self {
             store: CustomerStore::new(global_dir.clone()),
             global_dir,
+            flat: false,
             startup: global,
             baseline: Mutex::new(None),
             cache: Mutex::new(HashMap::new()),
         }
     }
 
+    /// One pricing for every customer, reading no files — for a registry or
+    /// connector with no rupu home to resolve customer layers from (tests,
+    /// an unwired default). Layers never fail here, so `layer_error` is
+    /// always `None`.
+    pub fn flat(pricing: PricingConfig) -> Self {
+        Self {
+            flat: true,
+            ..Self::new(PathBuf::new(), pricing)
+        }
+    }
+
     /// The global-only pricing, re-resolved when the global `config.toml`
     /// mtime changes; the startup snapshot if the file fails to parse.
     fn global_pricing(&self) -> PricingConfig {
+        if self.flat {
+            return self.startup.clone();
+        }
         let global_path = self.global_dir.join("config.toml");
         let stamp = mtime(&global_path);
         let mut slot = self.baseline.lock().unwrap_or_else(|p| p.into_inner());
@@ -455,6 +472,12 @@ impl CustomerPricing {
     /// `slug`'s resolved layer (valid slug only), from the cache when the
     /// files are unchanged.
     fn layer(&self, slug: &str) -> CustomerLayer {
+        if self.flat {
+            return CustomerLayer {
+                pricing: self.startup.clone(),
+                default_account: Ok(None),
+            };
+        }
         let global_path = self.global_dir.join("config.toml");
         let customer_path = self.store.config_path(slug);
         let stamps: Stamps = (mtime(&global_path), mtime(&customer_path));
