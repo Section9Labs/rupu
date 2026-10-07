@@ -26,6 +26,7 @@ import { render, screen, cleanup, waitFor } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
 import { api } from './lib/api';
 import { ThemeProvider } from './components/theme/ThemeProvider';
+import { CustomerScopeProvider } from './lib/customerScope';
 
 vi.mock('./pages/RunDetail', () => ({
   __esModule: true,
@@ -75,6 +76,7 @@ function mockApi() {
   // Shell v2 chrome (rail host footer, top-bar scope select, live pill).
   vi.spyOn(api, 'getHosts').mockResolvedValue([]);
   vi.spyOn(api, 'getProjects').mockResolvedValue([]);
+  vi.spyOn(api, 'getCustomers').mockResolvedValue([]);
   vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([]);
   vi.spyOn(api, 'subscribeEvents').mockImplementation(() => () => {});
   // CommandPalette's fetch-on-open sources (mounted by both Layout and
@@ -108,8 +110,10 @@ function renderApp(shell: 'v1' | 'v2', initialPath: string) {
   return render(
     <ThemeProvider>
       <MemoryRouter initialEntries={[initialPath]}>
-        <LocationSpy />
-        <AppRoutes shell={shell} />
+        <CustomerScopeProvider>
+          <LocationSpy />
+          <AppRoutes shell={shell} />
+        </CustomerScopeProvider>
       </MemoryRouter>
     </ThemeProvider>,
   );
@@ -128,6 +132,15 @@ afterEach(() => {
 });
 
 describe('AppRoutes shell branch', () => {
+  it.each(['/customers', '/customers/acme', '/customers/acme/config'])(
+    'v2: %s is routed (not redirected, not a 404)',
+    async (path) => {
+      renderApp('v2', path);
+      await waitFor(() => expect(screen.getByRole('heading', { level: 1 })).toBeInTheDocument());
+      expect(screen.getByTestId('loc')).toHaveTextContent(path);
+    },
+  );
+
   it('v2: /dashboard redirects to /overview', async () => {
     renderApp('v2', '/dashboard');
     await waitFor(() => expect(screen.getByTestId('loc')).toHaveTextContent('/overview'));
