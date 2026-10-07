@@ -51,7 +51,7 @@ pub use diff::generate::{list_runs, run_diff, DiffError, RunSelector};
 pub use diff::{CellRef, FindingThemeRef, RunDiff, RunListEntry, VerdictFlip};
 pub use ledger::{
     append_manifest, append_record, apply, discover_targets, file_views, find_manifest, fold_tags,
-    ingest_tag_events, ingest_unit_stream, parse_tags, read_concern_assertions,
+    ingest_tag_events, ingest_unit_stream, merge_tag_log_copies, parse_tags, read_concern_assertions,
     read_declared_findings, read_declared_workspace_findings, read_file_events, read_findings,
     read_manifests, read_tag_events, read_workspace_findings, stream_catalog, stream_path,
     tag_history, tag_input_schema, tags_schema_property, target_id, write_stream_begin,
@@ -59,8 +59,8 @@ pub use ledger::{
     CoverageWriterHandle, DiscoveredTarget, Evidence, FileTouchEvent, FileView, FindingEvidence,
     FindingRecord, FindingScope, IngestError, IngestReport, IngestSource, Ledger,
     OperatorAttribution, OperatorSurface, RunManifest, RunStream, StreamLine, Surface, Tag,
-    TagActor, TagChange, TagChangeInput, TagError, TagEvent, TagLog, TagOp, TagOutcome,
-    TagParseError, MAX_TAGS_PER_FINDING, STREAM_FILE, STREAM_VERSION, TAG_LOG_FILE,
+    TagActor, TagChange, TagChangeInput, TagError, TagEvent, TagLog, TagLogMerge, TagOp,
+    TagOutcome, TagParseError, MAX_TAGS_PER_FINDING, STREAM_FILE, STREAM_VERSION, TAG_LOG_FILE,
 };
 pub use ledger::{
     check_available, facets, run_values, select, FacetValue, FindingView, RunScopes, Unavailable,

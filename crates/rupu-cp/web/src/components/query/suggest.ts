@@ -5,7 +5,7 @@
 //   'tag:ne'      → values for `tag` in use (facets) or the key's fixed
 //                   values, fuzzy-matched on the part after the last comma
 import { fuzzyScore } from '../../lib/fuzzy';
-import { findField, quoteValue } from '../../lib/findingQuery/grammar';
+import { findField, normalize, quoteValue } from '../../lib/findingQuery/grammar';
 import type { QueryField } from '../../lib/findingQuery/fields';
 
 export interface FacetValue {
@@ -29,6 +29,11 @@ export interface Suggestion {
 }
 
 const KEY_OP = /^([A-Za-z_]+)(>=|<=|:|>|<)(.*)$/s;
+
+/** Text keys the evaluator matches ignoring case (rupu-coverage
+ *  `finding_filter.rs`, its `ci` comparisons); `file`, `run` and `id` match
+ *  exactly. */
+const CASE_INSENSITIVE_TEXT = new Set(['project', 'owner', 'product', 'concern', 'agent', 'workflow']);
 
 /** An item's value as the grammar's `items` decodes it: a leading quote wraps it, and `\` escapes the next char. */
 function decodeItem(cs: string[]): string {
@@ -104,8 +109,16 @@ export function suggest(
     const { prefix, partial, chosen } = splitItem(rest);
     if (op !== ':' && prefix !== '') return [];
     const counts = new Map((facets?.[field.key] ?? []).map((f) => [f.value, f.count]));
-    const taken = new Set(['', ...chosen]);
-    const pool = (field.values.length > 0 ? field.values : [...counts.keys()]).filter((v) => !taken.has(v));
+    // Compare canonical forms, as the query does: `Needs-Poc` already chose
+    // `needs-poc`, `79` already chose `CWE-79`, and `owner:"payments team"`
+    // already chose "Payments Team".
+    const canon = (v: string) => {
+      const n = normalize(field, v);
+      const c = n.ok ? n.value : v;
+      return CASE_INSENSITIVE_TEXT.has(field.key) ? c.toLowerCase() : c;
+    };
+    const taken = new Set(['', ...chosen.map(canon)]);
+    const pool = (field.values.length > 0 ? field.values : [...counts.keys()]).filter((v) => !taken.has(canon(v)));
     return pool
       .map((value) => ({ value, hit: fuzzyScore(partial, value), count: counts.get(value) ?? 0 }))
       .filter((x) => x.hit !== null)

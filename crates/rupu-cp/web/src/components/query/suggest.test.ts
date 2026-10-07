@@ -66,6 +66,17 @@ describe('suggest', () => {
     expect(suggest('has:tags,', FINDING_FIELDS, facets).map((x) => x.label)).toEqual(['report', 'poc', 'cwe']);
     expect(suggest('tag:needs-poc,', FINDING_FIELDS, facets).map((x) => x.label)).toEqual(['class:sqli', 'triaged']);
   });
+  it('treats a chosen value in another spelling as chosen, as the query does', () => {
+    expect(suggest('tag:Needs-POC,', FINDING_FIELDS, facets).map((x) => x.label)).toEqual(['class:sqli', 'triaged']);
+    const cwe = { cwe: [{ value: 'CWE-79', count: 2 }, { value: 'CWE-89', count: 1 }] };
+    expect(suggest('cwe:79,', FINDING_FIELDS, cwe).map((x) => x.label)).toEqual(['CWE-89']);
+    expect(suggest('cwe:cwe-89,', FINDING_FIELDS, cwe).map((x) => x.label)).toEqual(['CWE-79']);
+    expect(suggest('has:POC,', FINDING_FIELDS, facets).map((x) => x.label)).toEqual(['tags', 'report', 'cwe']);
+    expect(suggest('owner:"payments team",', FINDING_FIELDS, facets).map((x) => x.label)).toEqual(['Acme, Inc.']);
+    // `file`, `run` and `id` match exactly, so another case is another value.
+    const files = { file: [{ value: 'src/A.rs', count: 1 }] };
+    expect(suggest('file:src/a.rs,', FINDING_FIELDS, files).map((x) => x.label)).toEqual(['src/A.rs']);
+  });
   it('reads chosen values through quotes and escapes', () => {
     expect(suggest('owner:"Acme, Inc.",', FINDING_FIELDS, facets).map((x) => x.label)).toEqual(['Payments Team']);
     expect(suggest("owner:'Payments Team',", FINDING_FIELDS, facets).map((x) => x.label)).toEqual(['Acme, Inc.']);

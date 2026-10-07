@@ -653,23 +653,61 @@ impl UnitDispatcher for FleetUnitDispatcher {
     /// apply them to the coordinator workspace. Conflicts (overlapping tar files
     /// or conflicting git hunks) become [`WorkspaceConflict`]; any other codec
     /// failure is surfaced as a conflict-class step failure too.
+    ///
+    /// A delta's finding-tag log is never written as a file: once the files
+    /// apply, its events are merged into the log under the deltas' root by id
+    /// (`Delta::take_tag_log`, `rupu_coverage::merge_tag_log_copies`), so tag
+    /// changes made here while the unit ran survive, and units that all
+    /// tagged don't conflict. A failed merge is a warning, never a failed
+    /// apply, as every other coverage-ingest problem is.
     async fn apply_workspace_deltas(
         &self,
         workspace_path: &Path,
         deltas: &[WorkspaceDelta],
     ) -> Result<(), WorkspaceConflict> {
         let mut codec = Vec::with_capacity(deltas.len());
+        let mut tag_logs = Vec::new();
         for wd in deltas {
-            match from_orchestrator_delta(wd) {
-                Ok(d) => codec.push(d),
-                Err(e) => return Err(WorkspaceConflict(vec![e.to_string()])),
-            }
+            let delta =
+                from_orchestrator_delta(wd).map_err(|e| WorkspaceConflict(vec![e.to_string()]))?;
+            let (rest, tag_log) = delta
+                .take_tag_log()
+                .map_err(|e| WorkspaceConflict(vec![e.to_string()]))?;
+            codec.push(rest);
+            tag_logs.extend(tag_log);
         }
         match rupu_workspace::apply_deltas(workspace_path, &codec) {
-            Ok(()) => Ok(()),
-            Err(rupu_workspace::SyncError::Conflict(paths)) => Err(WorkspaceConflict(paths)),
-            Err(e) => Err(WorkspaceConflict(vec![e.to_string()])),
+            Ok(()) => {}
+            Err(rupu_workspace::SyncError::Conflict(paths)) => {
+                return Err(WorkspaceConflict(paths))
+            }
+            Err(e) => return Err(WorkspaceConflict(vec![e.to_string()])),
         }
+        if let Some(first) = codec.first().filter(|_| !tag_logs.is_empty()) {
+            let merged = rupu_workspace::delta_root(workspace_path, first.mode)
+                .map_err(|e| e.to_string())
+                .and_then(|root| {
+                    rupu_coverage::merge_tag_log_copies(
+                        &rupu_coverage::TagLog::for_workspace(&root),
+                        &tag_logs,
+                    )
+                    .map_err(|e| e.to_string())
+                });
+            match merged {
+                Ok(m) if m.unreadable > 0 => tracing::warn!(
+                    unreadable = m.unreadable,
+                    appended = m.appended,
+                    "skipped finding-tag log lines in a unit's workspace delta that this rupu version cannot read"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    copies = tag_logs.len(),
+                    "could not merge the units' finding-tag logs into the coordinator's; their tag changes are not applied"
+                ),
+            }
+        }
+        Ok(())
     }
 
     /// Decode the unit's delta, drop its `.rupu/coverage/`
@@ -1828,6 +1866,119 @@ steps:
         d.apply_workspace_deltas(ws.path(), &[a, b]).await.unwrap();
         assert!(ws.path().join("a.txt").exists());
         assert!(ws.path().join("b.txt").exists());
+    }
+
+    /// `rupu-workspace` names the tag log by path; `rupu-coverage` owns the
+    /// file. They must agree, or a delta's log would be written as a file.
+    #[test]
+    fn workspace_tag_log_path_matches_coverage() {
+        let ws = std::path::Path::new("/ws");
+        assert_eq!(
+            rupu_coverage::TagLog::for_workspace(ws).path,
+            ws.join(rupu_workspace::TAG_LOG_PATH)
+        );
+    }
+
+    fn tar_of(files: &[(&str, &str)]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut buf);
+            for (path, body) in files {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(body.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                b.append_data(&mut header, path, body.as_bytes()).unwrap();
+            }
+            b.finish().unwrap();
+        }
+        buf
+    }
+
+    fn tag_line(id: &str, finding: &str, tag: &str) -> String {
+        serde_json::to_string(&rupu_coverage::TagEvent {
+            id: id.into(),
+            finding_id: finding.into(),
+            op: rupu_coverage::TagOp::Add,
+            tag: rupu_coverage::Tag::parse(tag).unwrap(),
+            by: rupu_coverage::TagActor::operator(rupu_coverage::OperatorSurface::Cli),
+            at: chrono::Utc::now(),
+        })
+        .unwrap()
+            + "\n"
+    }
+
+    /// Two units' unstripped deltas both carry the tag log: their events merge
+    /// into the coordinator's log by id, next to the event an operator wrote
+    /// meanwhile, and the shared path is no conflict.
+    #[tokio::test]
+    async fn apply_workspace_deltas_merges_each_units_tag_log() {
+        let conn = Arc::new(FakeConnector::completed());
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
+        let ws = tempfile::tempdir().unwrap();
+        let log = rupu_coverage::TagLog::for_workspace(ws.path());
+        let shared = tag_line("tge_shared", "fnd_a", "shared");
+        std::fs::create_dir_all(log.path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &log.path,
+            shared.clone() + &tag_line("tge_op", "fnd_a", "from-operator"),
+        )
+        .unwrap();
+        let unit = |file: &str, event: String| {
+            let tag_log = shared.clone() + &event;
+            to_orchestrator_delta(&rupu_workspace::Delta {
+                mode: rupu_workspace::SyncMode::Tar,
+                changed: vec![
+                    rupu_workspace::TAG_LOG_PATH.into(),
+                    format!("{}.lock", rupu_workspace::TAG_LOG_PATH),
+                    file.into(),
+                ],
+                deleted: vec![],
+                bytes: tar_of(&[
+                    (rupu_workspace::TAG_LOG_PATH, tag_log.as_str()),
+                    (&format!("{}.lock", rupu_workspace::TAG_LOG_PATH), ""),
+                    (file, "x"),
+                ]),
+            })
+        };
+        let deltas = [
+            unit("one.txt", tag_line("tge_u1", "fnd_b", "from-unit-1")),
+            unit("two.txt", tag_line("tge_u2", "fnd_c", "from-unit-2")),
+        ];
+        d.apply_workspace_deltas(ws.path(), &deltas).await.unwrap();
+
+        let ids: Vec<String> = rupu_coverage::read_tag_events(&log)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(ids, ["tge_shared", "tge_op", "tge_u1", "tge_u2"]);
+        assert!(ws.path().join("one.txt").exists() && ws.path().join("two.txt").exists());
+    }
+
+    /// A tag log that can't be merged is a warning: the units' files still
+    /// apply. (The log path is a directory, which fails even as root.)
+    #[tokio::test]
+    async fn apply_workspace_deltas_keeps_the_files_when_the_tag_merge_fails() {
+        let conn = Arc::new(FakeConnector::completed());
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(ws.path().join(rupu_workspace::TAG_LOG_PATH)).unwrap();
+        let line = tag_line("tge_u1", "fnd_b", "from-unit");
+        let delta = to_orchestrator_delta(&rupu_workspace::Delta {
+            mode: rupu_workspace::SyncMode::Tar,
+            changed: vec![rupu_workspace::TAG_LOG_PATH.into(), "one.txt".into()],
+            deleted: vec![],
+            bytes: tar_of(&[
+                (rupu_workspace::TAG_LOG_PATH, line.as_str()),
+                ("one.txt", "x"),
+            ]),
+        });
+        d.apply_workspace_deltas(ws.path(), &[delta]).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(ws.path().join("one.txt")).unwrap(),
+            "x"
+        );
     }
 
     /// `strip_delta_coverage` bridges to `rupu_workspace::Delta::without_coverage`

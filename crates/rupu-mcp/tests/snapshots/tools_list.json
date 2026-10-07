@@ -1350,10 +1350,14 @@
     "name": "findings.record"
   },
   {
-    "description": "List this project's findings matching a one-line query `q` (e.g. `severity>=high tag:needs-poc`): one page of slim rows, `next_cursor`, `total`, and `tags_in_use`.",
+    "description": "List this project's findings matching a one-line query `q` (e.g. `severity>=high tag:needs-poc`): one page of slim rows, `next_cursor`, `total`, and `tags_in_use`; with `all: true`, every match unpaged (for a workflow `for_each` over `rows`).",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "all": {
+          "description": "Return every match in one answer, unpaged (no `limit`/`cursor`) and unbounded. For a workflow `for_each` over the rows; to read findings into a conversation, page instead.",
+          "type": "boolean"
+        },
         "cursor": {
           "description": "`next_cursor` from the previous page.",
           "type": "string"
