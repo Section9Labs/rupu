@@ -2,6 +2,7 @@
 import '@testing-library/jest-dom/vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { ApiError } from '../../lib/api';
 import { BulkTagBar } from './BulkTagBar';
 
 afterEach(cleanup);
@@ -61,5 +62,18 @@ describe('BulkTagBar', () => {
     release({ message: 'Tagged 2 findings.', ok: true });
     expect(await screen.findByRole('status')).toHaveTextContent('Tagged 2 findings.');
     expect(onApply).toHaveBeenCalledTimes(1);
+  });
+  it('shows an API rejection as its message, not the JSON body', async () => {
+    const body = '{"error":"at most 1000 findings per change"}';
+    // As `request()` builds it: the message is the raw body text.
+    const onApply = vi.fn().mockRejectedValue(new ApiError(400, body, body));
+    render(<BulkTagBar count={2} suggestions={[]} onApply={onApply} onClear={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Tag…' }));
+    const input = screen.getByRole('combobox', { name: 'Tag selected findings' });
+    fireEvent.change(input, { target: { value: 'triaged' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('at most 1000 findings per change');
+    expect(alert).not.toHaveTextContent('{');
   });
 });

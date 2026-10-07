@@ -1,6 +1,7 @@
 // Shown while findings are selected: "N selected · Tag… · Untag… · Clear".
 // Tag…/Untag… open a TagInput; the result line stays until the next action.
 import { useState } from 'react';
+import { apiErrorMessage } from '../../lib/api';
 import { TagInput, type TagSuggestion } from './tags/TagInput';
 
 export function BulkTagBar({
@@ -28,7 +29,7 @@ export function BulkTagBar({
       setMode(null);
       return true;
     } catch (e: unknown) {
-      setResult({ message: e instanceof Error ? e.message : String(e), ok: false });
+      setResult({ message: apiErrorMessage(e), ok: false });
       return false;
     } finally {
       setBusy(false);
