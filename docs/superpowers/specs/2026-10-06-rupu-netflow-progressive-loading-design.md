@@ -224,18 +224,23 @@ components, styles, copy, or controls.
   same dependencies (`scope`, `projectId`, `runId`, `range`, `filters`):
   one for the explorer aggregates, one for the flows list, each with its
   own cancellation, error, and refreshing state.
-- Before the explorer response first arrives, the surface renders the
-  `TimeRangePicker` (as the error branch already does) and the existing
-  "Loading network flows…" text in place of the aggregate sections. When
-  it arrives, the existing aggregate sections render (`ActivityStrip`,
-  `KpiStrip`, topology/timeline panel, `OrgCards`, `FilterChips`).
-- The table area shows the existing "Loading network flows…" text until
-  the flows response first arrives, then `NetflowTable` as today.
-- Errors are per section using the existing error text style; the picker
-  stays reachable in every state (today's retry affordance).
+- Before the explorer response first arrives, the surface renders only
+  the existing "Loading network flows…" text, exactly like today's loading
+  state (ruling R7: a standalone picker here was a new element, and it
+  remounted — losing an open custom edit — when `ActivityStrip`'s own
+  picker took over). When it arrives, the existing aggregate sections
+  render (`ActivityStrip`, `KpiStrip`, topology/timeline panel,
+  `OrgCards`, `FilterChips`).
+- The table area shows `NetflowTable` as soon as the flows response
+  arrives, even while the aggregates are still loading; one loading line
+  shows while neither has arrived.
+- Errors are per section using the existing error text style; an
+  aggregates error keeps the picker reachable beside it (today's retry
+  affordance).
 - The existing "Updating…" status shows while either request refetches
-  over existing data; `CoveragePopover` renders once both responses it
-  reads (`explorer.dropped_total`, `flows.capture`) have arrived.
+  over existing data; its header row (with `CoveragePopover`, which needs
+  both `explorer.dropped_total` and `flows.capture`) renders only when it
+  has content.
 
 ### 4.2 Default window
 
@@ -254,9 +259,20 @@ components, styles, copy, or controls.
 - Above it: sorting is unchanged (client-side over the full `rows`); only
   the rows intersecting the window viewport (page scroll — the table has no
   inner scroll container) plus an overscan are mounted, with spacer `<tr>`s
-  above and below sized from measured row heights (`ResizeObserver`;
-  estimated until measured), so page height, scrollbar, scroll position,
-  expanded rows, and row clicks behave as today.
+  above and below sized from row heights measured with
+  `getBoundingClientRect` on mount and on `ResizeObserver` callbacks (the
+  measured average stands in for unmeasured rows), so page height,
+  scrollbar, scroll position and row clicks behave as today.
+- Column widths: auto table layout sizes each `fit` column by its widest
+  cell over ALL rows, so a hidden `aria-hidden inert` probe `<tbody>`
+  renders zero-height, `visibility: collapse` copies of each column's
+  widest-text rows (chosen once per data load via `Column.widthText`,
+  measured with canvas `measureText`) — reproducing the full table's
+  widths without mounting every row.
+- A focused row stays mounted while focused; when virtual, the table
+  carries `aria-rowcount` / `aria-rowindex`.
+- Verified on 40,261 rows against the old build: identical column widths
+  at every scroll position; page height within 1px.
 - Known difference, accepted: browser find-in-page only matches mounted
   rows when the table is above the threshold.
 
