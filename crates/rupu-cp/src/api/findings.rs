@@ -2839,6 +2839,49 @@ mod tests {
         }
     }
 
+    /// A path registered twice — two workspace records with the IDENTICAL
+    /// `path`, the shape a lost registration race leaves behind — must not
+    /// double-count its findings. `list()` collapses the duplicate records, so
+    /// the one findings ledger under that path is read exactly once. Regression
+    /// guard for the silent finding/asset/usage doubling that bug caused.
+    #[tokio::test]
+    async fn duplicate_workspace_records_do_not_double_count_findings() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = seed_workspace_findings(tmp.path(), &[full_record("fnd_dup")]);
+
+        // A SECOND record for the same path, as the race minted (`ws1` from
+        // the seed; `ws2` here).
+        let ws2 = rupu_workspace::Workspace {
+            id: "ws2".to_string(),
+            path: repo.to_str().unwrap().to_string(),
+            repo_remote: None,
+            initial_branch: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            last_run_at: None,
+        };
+        std::fs::write(
+            tmp.path().join("workspaces").join("ws2.toml"),
+            toml::to_string(&ws2).unwrap(),
+        )
+        .unwrap();
+
+        let state = AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
+        let app = routes().with_state(state);
+
+        let (status, json) = get_json(app, "/api/findings").await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let rows = json["findings"].as_array().unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the finding must be counted once, not once per duplicate record: {rows:?}"
+        );
+        assert_eq!(rows[0]["id"], "fnd_dup");
+    }
+
     #[tokio::test]
     async fn get_finding_adds_exact_hex_for_64_bit_addresses() {
         use rupu_coverage::report::{ArtifactRef, DisasmLine, EvidenceBlock};

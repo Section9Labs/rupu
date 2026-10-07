@@ -5,9 +5,23 @@
 //! generating a new id. New records auto-detect the git remote and
 //! default branch (snapshot at workspace-creation time only — they are
 //! not refreshed on subsequent runs).
+//!
+//! Registration is idempotent by path under concurrency. Every launch
+//! upserts, and a fan-out (or any two processes) can first-upsert one path at
+//! the same instant; without coordination each read an empty store and minted
+//! its own id, leaving two records with the IDENTICAL path. Every reader that
+//! walks the store then read that path's coverage ledger twice and
+//! double-counted its findings, assets and usage. Two guards close this:
+//! [`with_registration_lock`] serializes the find-or-create across processes
+//! so a second id is never minted, and [`dedup_by_path`] (applied by
+//! [`WorkspaceStore::list`]) collapses any already-duplicated path to one
+//! deterministic record so existing data — and anything that ever slips the
+//! lock on a filesystem that cannot hold one — stops doubling for every
+//! reader at once.
 
 use crate::record::{new_id, Workspace};
 use chrono::Utc;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tracing::warn;
@@ -115,7 +129,7 @@ impl WorkspaceStore {
             };
             out.push(ws);
         }
-        Ok(out)
+        Ok(dedup_by_path(out))
     }
 
     /// Write the record atomically: serialize into a uniquely named temp
@@ -182,6 +196,91 @@ fn find_canonical(
     }))
 }
 
+/// Collapse records that share a stored `path` to one deterministic winner:
+/// the lexicographically-smallest id, a ULID, so the earliest-registered.
+/// First-appearance order of each distinct path is preserved; reads stay pure
+/// (no file is moved or removed — the losing record simply never surfaces).
+///
+/// A lost registration race leaves two records whose `path` strings are byte
+/// identical (both written by [`canonical_key`]), so grouping on the stored
+/// string collapses the real duplicates without a `canonicalize` syscall per
+/// record on this hot read path.
+fn dedup_by_path(records: Vec<Workspace>) -> Vec<Workspace> {
+    let mut chosen: HashMap<String, Workspace> = HashMap::with_capacity(records.len());
+    let mut order: Vec<String> = Vec::with_capacity(records.len());
+    for w in records {
+        match chosen.get(&w.path) {
+            Some(existing) => {
+                if w.id < existing.id {
+                    chosen.insert(w.path.clone(), w);
+                }
+            }
+            None => {
+                order.push(w.path.clone());
+                chosen.insert(w.path.clone(), w);
+            }
+        }
+    }
+    order
+        .into_iter()
+        .map(|p| chosen.remove(&p).expect("every ordered path was inserted"))
+        .collect()
+}
+
+/// Sidecar in the store root whose exclusive lock serializes registration.
+/// Not the record files themselves — those are replaced by rename, and a lock
+/// held on a replaced file would not exclude the next writer. Skipped by
+/// [`WorkspaceStore::list`] (not a `.toml`) and by the customer scan (not a
+/// `.customer`).
+const REGISTRATION_LOCK: &str = ".registration.lock";
+
+/// Run the find-or-create `f` holding the store's registration lock, so two
+/// processes first-upserting one path serialize and the second adopts the
+/// record the first just wrote instead of minting a new id.
+///
+/// Where the lock cannot be taken — the file cannot be opened, or the
+/// filesystem does not support locking — `f` runs unlocked after a warning
+/// rather than failing a registration that used to succeed; [`dedup_by_path`]
+/// then still collapses any duplicate the lost race creates. Released when the
+/// returned handle drops, after `f` has written.
+fn with_registration_lock<T>(
+    store: &WorkspaceStore,
+    f: impl FnOnce() -> Result<T, StoreError>,
+) -> Result<T, StoreError> {
+    store.ensure_root()?;
+    let lock_path = store.root.join(REGISTRATION_LOCK);
+    let lock = match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(file) => match file.lock() {
+            Ok(()) => Some(file),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    lock = %lock_path.display(),
+                    "cannot lock the workspace registration sidecar; registering without it"
+                );
+                None
+            }
+        },
+        Err(e) => {
+            warn!(
+                error = %e,
+                lock = %lock_path.display(),
+                "cannot open the workspace registration sidecar; registering without it"
+            );
+            None
+        }
+    };
+    let out = f();
+    // Released only after `f`'s write has landed.
+    drop(lock);
+    out
+}
+
 /// The workspace recorded for `path`, if any. Never creates one.
 pub fn find_by_path(store: &WorkspaceStore, path: &Path) -> Result<Option<Workspace>, StoreError> {
     let (canonical, _) = canonical_key(path)?;
@@ -194,19 +293,23 @@ pub fn find_by_path(store: &WorkspaceStore, path: &Path) -> Result<Option<Worksp
 /// never run in.
 pub fn register(store: &WorkspaceStore, path: &Path) -> Result<Workspace, StoreError> {
     let (canonical, canonical_str) = canonical_key(path)?;
-    if let Some(w) = find_canonical(store, &canonical)? {
-        return Ok(w);
-    }
-    let ws = Workspace {
-        id: new_id(),
-        path: canonical_str,
-        repo_remote: detect_repo_remote(&canonical),
-        initial_branch: detect_initial_branch(&canonical),
-        created_at: Utc::now().to_rfc3339(),
-        last_run_at: None,
-    };
-    store.write(&ws)?;
-    Ok(ws)
+    with_registration_lock(store, || {
+        // Re-check under the lock: a concurrent registrant may have just
+        // written the record, and we must adopt it rather than mint a new id.
+        if let Some(w) = find_canonical(store, &canonical)? {
+            return Ok(w);
+        }
+        let ws = Workspace {
+            id: new_id(),
+            path: canonical_str,
+            repo_remote: detect_repo_remote(&canonical),
+            initial_branch: detect_initial_branch(&canonical),
+            created_at: Utc::now().to_rfc3339(),
+            last_run_at: None,
+        };
+        store.write(&ws)?;
+        Ok(ws)
+    })
 }
 
 /// Look up an existing workspace for `path` (canonicalized) or create a
@@ -217,23 +320,27 @@ pub fn register(store: &WorkspaceStore, path: &Path) -> Result<Workspace, StoreE
 /// the corresponding fields stay `None`.
 pub fn upsert(store: &WorkspaceStore, path: &Path) -> Result<Workspace, StoreError> {
     let (canonical, canonical_str) = canonical_key(path)?;
-    let now = Utc::now().to_rfc3339();
-    let ws = match find_canonical(store, &canonical)? {
-        Some(mut w) => {
-            w.last_run_at = Some(now);
-            w
-        }
-        None => Workspace {
-            id: new_id(),
-            path: canonical_str,
-            repo_remote: detect_repo_remote(&canonical),
-            initial_branch: detect_initial_branch(&canonical),
-            created_at: now.clone(),
-            last_run_at: Some(now),
-        },
-    };
-    store.write(&ws)?;
-    Ok(ws)
+    with_registration_lock(store, || {
+        let now = Utc::now().to_rfc3339();
+        // Re-check under the lock: a concurrent upsert may have just created
+        // the record, and we must adopt its id rather than mint a new one.
+        let ws = match find_canonical(store, &canonical)? {
+            Some(mut w) => {
+                w.last_run_at = Some(now);
+                w
+            }
+            None => Workspace {
+                id: new_id(),
+                path: canonical_str,
+                repo_remote: detect_repo_remote(&canonical),
+                initial_branch: detect_initial_branch(&canonical),
+                created_at: now.clone(),
+                last_run_at: Some(now),
+            },
+        };
+        store.write(&ws)?;
+        Ok(ws)
+    })
 }
 
 /// The `origin` remote URL of the git checkout at `path`, or `None` when
