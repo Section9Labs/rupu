@@ -29,6 +29,8 @@ vi.mock('../lib/netflow', async () => {
 });
 
 import Netflow from './Netflow';
+import { MemoryRouter } from 'react-router-dom';
+import { scopedEntry, withCustomerScope } from '../lib/customerScopeTestUtils';
 
 afterEach(() => {
   cleanup();
@@ -122,5 +124,20 @@ describe('Netflow global page', () => {
     expect(range).toMatchObject({ from: expect.stringMatching(/T/) });
     const [flowsRange] = fetchGlobalNetflow.mock.calls[1];
     expect(flowsRange).toMatchObject({ from: expect.stringMatching(/T/) });
+  });
+});
+
+describe('Netflow under a customer scope', () => {
+  it('says the flows cover every customer while scoped', async () => {
+    render(
+      <MemoryRouter initialEntries={[scopedEntry('acme', '/netflow')]}>{withCustomerScope(<Netflow />)}</MemoryRouter>,
+    );
+    expect(await screen.findByText('Flows here cover every customer.')).toBeInTheDocument();
+  });
+
+  it('shows no note unscoped', async () => {
+    render(<MemoryRouter initialEntries={['/netflow']}>{withCustomerScope(<Netflow />)}</MemoryRouter>);
+    await waitFor(() => expect(fetchNetflowExplorer).toHaveBeenCalled());
+    expect(screen.queryByText('Flows here cover every customer.')).toBeNull();
   });
 });

@@ -19,6 +19,8 @@ vi.mock('react-router-dom', async () => {
 });
 
 import CommandPalette, { openCommandPalette } from './CommandPalette';
+import { MemoryRouter } from 'react-router-dom';
+import { scopedEntry, withCustomerScope } from '../lib/customerScopeTestUtils';
 
 function mockEmptyApi() {
   vi.spyOn(api, 'getRuns').mockResolvedValue([]);
@@ -289,5 +291,24 @@ describe('CommandPalette v2', () => {
     await waitFor(() => expect(screen.getByText('local-wf')).toBeInTheDocument());
     expect(screen.queryByText(/error|failed/i)).not.toBeInTheDocument();
     expect(signals.host_prod?.aborted).toBe(false);
+  });
+});
+
+describe('CommandPalette under a customer scope', () => {
+  it('its footer says the results cover every customer', async () => {
+    mockEmptyApi();
+    stubHosts();
+    render(<MemoryRouter initialEntries={[scopedEntry('acme')]}>{withCustomerScope(<CommandPalette />)}</MemoryRouter>);
+    openCommandPalette();
+    expect(await screen.findByText('Results cover every customer.')).toBeInTheDocument();
+  });
+
+  it('says nothing unscoped', async () => {
+    mockEmptyApi();
+    stubHosts();
+    render(<MemoryRouter>{withCustomerScope(<CommandPalette />)}</MemoryRouter>);
+    openCommandPalette();
+    await screen.findByRole('dialog');
+    expect(screen.queryByText('Results cover every customer.')).toBeNull();
   });
 });

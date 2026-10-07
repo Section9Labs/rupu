@@ -188,6 +188,12 @@ export function useCustomerDirectoryState(): { customers: CustomerRow[]; loaded:
   return { customers: ctx?.customers ?? [], loaded: ctx?.loaded ?? true };
 }
 
+/** The scope, or null (all customers) when no provider is mounted. Like
+ *  `useCustomerDirectory`, for surfaces that only describe the scope. */
+export function useOptionalCustomerScope(): CustomerScope {
+  return useContext(CustomerScopeContext)?.scope ?? null;
+}
+
 /** The value list fetches pass as their `customer` argument. */
 export function useCustomerParam(): CustomerScope {
   return useCustomerScope().scope;

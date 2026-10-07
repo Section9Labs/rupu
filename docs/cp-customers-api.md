@@ -270,7 +270,7 @@ which customer every scoped page filters to; the pages pass it as `?customer=`.
 
 | Filters by the scope | Shows an "unscoped" note instead |
 |---|---|
-| Dashboard (runs, findings, autoflow cycles, spend), the workflow-run and agent-run lists (Activity / Runs), Sessions, Findings, Projects, Usage (headline, timeline, run rows, outliers) | autoflow listings (runs, cycles, claims), Coverage, the concern-template catalog, the dashboard's fleet counts, and the Workflows / Agents / Autoflows definition lists (their run counts and spend cover every customer) |
+| Dashboard (runs, findings, autoflow cycles, spend), the workflow-run and agent-run lists (Activity / Runs), Sessions, Findings, Projects, Usage (headline, timeline, run rows, outliers) | autoflow listings (runs, cycles, claims), Coverage, the concern-template catalog, the dashboard's fleet counts, the Workflows / Agents / Autoflows definition lists and the workflow / agent detail pages (their run counts and spend cover every customer), Live Events, Network, and the ⌘K palette (a footer line) |
 
 An unscoped page says so in a one-line info note (`UnscopedNote`) while a scope
 is set, so a list or number that is not the customer's is never passed off as

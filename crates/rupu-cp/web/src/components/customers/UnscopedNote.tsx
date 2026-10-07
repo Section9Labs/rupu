@@ -1,16 +1,17 @@
 // The one-line info note a surface shows while a customer scope is set but
 // the surface itself can't be filtered by customer (autoflow listings,
-// coverage, the concern catalog, the dashboard's fleet counts) — so an
-// unfiltered list or number is never passed off as the scoped customer's.
-// Renders nothing when unscoped.
+// coverage, the concern catalog, the dashboard's fleet counts, Live Events,
+// Network, the workflow / agent detail pages) — so an unfiltered list or
+// number is never passed off as the scoped customer's. Renders nothing when
+// unscoped (or outside a scope provider, where there is no scope).
 
 import type { ReactNode } from 'react';
 import { Info } from 'lucide-react';
 import { cn } from '../../lib/cn';
-import { useCustomerScope } from '../../lib/customerScope';
+import { useOptionalCustomerScope } from '../../lib/customerScope';
 
 export function UnscopedNote({ children, className }: { children: ReactNode; className?: string }) {
-  const { scope } = useCustomerScope();
+  const scope = useOptionalCustomerScope();
   if (scope === null) return null;
   return (
     <p

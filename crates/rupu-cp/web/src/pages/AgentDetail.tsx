@@ -14,6 +14,7 @@ import AgentUsageTimeline from '../components/agent/AgentUsageTimeline';
 import { Button } from '../components/ui/Button';
 import { Spinner } from '../components/ui/Spinner';
 import { ScopeChip } from '../components/ScopeChip';
+import { UnscopedNote } from '../components/customers/UnscopedNote';
 
 export default function AgentDetailPage() {
   const { name = '' } = useParams<{ name: string }>();
@@ -181,6 +182,8 @@ export default function AgentDetailPage() {
           <p className="mt-2 text-sm text-ink-dim leading-snug">{agent.description}</p>
         )}
       </header>
+
+      <UnscopedNote className="mt-4">Runs and spend on this page cover every customer.</UnscopedNote>
 
       <section className="mt-8">
         <h2 className="mb-2 pl-1 text-sm font-semibold text-ink">Spend over time</h2>

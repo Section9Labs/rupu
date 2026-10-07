@@ -38,6 +38,7 @@ import type { LucideIcon } from 'lucide-react';
 import { cn } from '../lib/cn';
 import { Spinner } from './ui/Spinner';
 import { useHotkey } from '../lib/useHotkey';
+import { useOptionalCustomerScope } from '../lib/customerScope';
 import { api } from '../lib/api';
 import { fuzzyScore } from '../lib/fuzzy';
 import type { ShellVersion } from '../lib/shell';
@@ -225,6 +226,7 @@ function Hint({ k, label }: { k: string; label: string }) {
 }
 
 export default function CommandPalette({ shell = 'v1' }: { shell?: ShellVersion }) {
+  const scope = useOptionalCustomerScope();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
   const [active, setActive] = useState(0);
@@ -465,6 +467,12 @@ export default function CommandPalette({ shell = 'v1' }: { shell?: ShellVersion 
           <Hint k="↑↓" label="Navigate" />
           <Hint k="↵" label="Open" />
           <Hint k="Esc" label="Close" />
+          {/* The palette searches everything, whatever the customer scope. */}
+          {scope !== null && (
+            <span role="note" className="ml-auto truncate">
+              Results cover every customer.
+            </span>
+          )}
         </footer>
       </div>
     </div>
