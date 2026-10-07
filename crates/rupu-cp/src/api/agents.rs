@@ -1,6 +1,6 @@
 use crate::{
     agent_launcher::{AgentLaunchError, AgentLaunchRequest, AgentLauncher},
-    api::fs_safety::{validate_name, validate_within, write_atomic},
+    api::fs_safety::{validate_name, validate_stem, validate_within, write_atomic},
     api::repo_scope::{distinct_repo_workspaces, scope_name, ScopeKind, ScopeQuery},
     error::{ApiError, ApiResult},
     host::connector::HostConnectorError,
@@ -691,6 +691,7 @@ async fn get_agent(
     State(s): State<AppState>,
     Path(name): Path<String>,
 ) -> ApiResult<Json<AgentDetailDto>> {
+    validate_stem(&name)?;
     Ok(Json(load_detail(&s, &name)?))
 }
 
@@ -1037,6 +1038,7 @@ async fn run_agent(
     Path(name): Path<String>,
     body: Option<Json<AgentRunBody>>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    validate_stem(&name)?;
     let mut b = body.map(|b| b.0).unwrap_or_default();
     let host = b.host.as_deref().unwrap_or("local").to_string();
 
@@ -1159,6 +1161,7 @@ async fn start_session(
     Path(name): Path<String>,
     body: Option<Json<SessionStartBody>>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    validate_stem(&name)?;
     let mut b = body.map(|b| b.0).unwrap_or_default();
     let host = b.host.as_deref().unwrap_or("local").to_string();
 

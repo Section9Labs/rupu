@@ -35,6 +35,7 @@ import ReplicationSteps from '../findings/report/ReplicationSteps';
 import DiffView from '../transcript/DiffView';
 import Markdown from '../transcript/Markdown';
 import { Spinner } from '../ui/Spinner';
+import { FindingWorkspace, findingPath } from '../../lib/findingWorkspace';
 
 const TABS = ['Root cause', 'Call chain', 'Evidence', 'Patch', 'Repro'] as const;
 type Tab = (typeof TABS)[number];
@@ -152,7 +153,7 @@ export default function InlineFindingCard({ finding, stale }: InlineFindingCardP
     if (!open || !isFull || loaded) return;
     let live = true;
     setLoadError(null);
-    api.getFinding(finding.id).then(
+    api.getFinding(finding.id, (finding as Partial<FindingOut>).ws_id).then(
       (d) => {
         if (live) setDetail(d);
       },
@@ -225,11 +226,13 @@ export default function InlineFindingCard({ finding, stale }: InlineFindingCardP
           {isFull && (
             <div className="mt-2 border-t border-border pt-2">
               {loaded ? (
-                <ReportTabs
-                  key={loaded.id}
-                  detail={loaded}
-                  wsId={(finding as Partial<FindingOut>).ws_id}
-                />
+                <FindingWorkspace.Provider value={loaded.ws_id}>
+                  <ReportTabs
+                    key={loaded.id}
+                    detail={loaded}
+                    wsId={(finding as Partial<FindingOut>).ws_id}
+                  />
+                </FindingWorkspace.Provider>
               ) : loadError ? (
                 <p role="alert" className="text-ui text-err">
                   Couldn’t load the report: {loadError}
@@ -238,7 +241,7 @@ export default function InlineFindingCard({ finding, stale }: InlineFindingCardP
                 <Spinner size="sm" label="Loading report…" className="text-ui" />
               )}
               <Link
-                to={`/findings/${encodeURIComponent(finding.id)}`}
+                to={findingPath(finding.id, (finding as Partial<FindingOut>).ws_id)}
                 className="mt-2 inline-block text-note text-brand-700 hover:underline"
               >
                 Open full report →

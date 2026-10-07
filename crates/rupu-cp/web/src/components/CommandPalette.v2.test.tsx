@@ -155,7 +155,7 @@ describe('CommandPalette v2', () => {
     expect(result).toBeTruthy();
     fireEvent.click(result as HTMLElement);
 
-    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith('/findings/f-1'));
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith('/findings/f-1?ws_id=ws-1'));
   });
 
   it('lists local runs without waiting on a hung remote host', async () => {

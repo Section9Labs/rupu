@@ -157,8 +157,25 @@ fn resolve_remote(
         .ok()
         .filter(|p| p.exists());
     let mapped = conn.local_transcript_path(Path::new(raw));
+    if reads_unmapped_path_locally(
+        Path::new(raw),
+        &mapped,
+        conn.serves_runs_from_local_mirror(),
+    ) {
+        validate_local(s, raw)?;
+    }
     let plan = plan_remote_read(local, mapped);
     Ok((conn, plan))
+}
+
+/// True when a remote-host request would end in a read of `raw` from the
+/// coordinator's own disk: the connector did not map it to a mirror cache
+/// file (`mapped == raw`), and it serves from the local mirror, so its
+/// `get_transcript` reads local files (SSH, tunnel, bucket — HTTP forwards
+/// instead). Such a read must clear the same local roots a `host=local` read
+/// does, or `?host=<ssh>&path=/any/file.jsonl` would bypass them.
+fn reads_unmapped_path_locally(raw: &Path, mapped: &Path, serves_local_mirror: bool) -> bool {
+    serves_local_mirror && mapped == raw
 }
 
 /// Read a local transcript file into the `{events, summary, unparsed}` page.
@@ -496,6 +513,21 @@ mod remote_read_tests {
             plan_remote_read(None, raw.to_path_buf()),
             RemoteRead::Cache { complete: false, cache } if cache == raw
         ));
+    }
+
+    #[test]
+    fn an_unmapped_path_on_a_mirror_host_must_clear_the_local_roots() {
+        let raw = Path::new("/etc/x.jsonl");
+        // SSH/tunnel/bucket: no cache mapping → a local read → root check.
+        assert!(reads_unmapped_path_locally(raw, raw, true));
+        // A path mapped to its mirror cache file is ours, not the caller's.
+        assert!(!reads_unmapped_path_locally(
+            raw,
+            Path::new("/g/mirror/h/transcripts/k.jsonl"),
+            true
+        ));
+        // HTTP forwards the read to the remote CP, which checks its own roots.
+        assert!(!reads_unmapped_path_locally(raw, raw, false));
     }
 
     #[test]

@@ -374,7 +374,7 @@ fn tag_cmd(args: &TagArgs, json: bool) -> anyhow::Result<()> {
     };
     let global = crate::paths::global_dir()?;
     let by = rupu_coverage::TagActor::operator(rupu_coverage::OperatorSurface::Cli);
-    let result = cp_findings::tag_findings_across(&global, &change, &by)?;
+    let result = cp_findings::tag_findings_across(&global, &change, &by, None)?;
     if json {
         crate::output::formats::print_json(&result)?;
     } else {
@@ -551,7 +551,22 @@ fn export_cmd(args: &ExportArgs) -> anyhow::Result<()> {
     let runs = RunStore::new(global.join("runs"));
 
     let exported = match args.single_id() {
-        Some(id) => cp_findings::export_finding_report(&global, &runs, id, &prefix, fmt)?,
+        Some(id) => {
+            // `--project` picks the workspace when the id exists in several.
+            let ws_id = args
+                .project
+                .as_deref()
+                .map(|project| cp_findings::resolve_project(&global, project))
+                .transpose()
+                .map_err(anyhow::Error::msg)?;
+            cp_findings::export_finding_report(&global, &runs, id, ws_id.as_deref(), &prefix, fmt)
+                .map_err(|e| match e {
+                cp_findings::ReportError::Ambiguous { .. } => {
+                    anyhow::anyhow!("{e}: pass --project to pick one")
+                }
+                other => other.into(),
+            })?
+        }
         None => {
             let ws_id = args
                 .project

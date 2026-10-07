@@ -612,7 +612,9 @@ several `--id`s or no `--id` at all. `--include-summaries` does not: a single
 changes nothing. `-o` is a file path, or an existing directory to receive the
 generated file name. A write failure reports the OS cause, and an `-o`
 extension that does not match the format (a zip written to `report.pdf`, say)
-produces a warning but is still written.
+produces a warning but is still written. Finding ids are unique within a
+project, not across projects: when a single `--id` exists in several, the
+export refuses and names them, and `--project` picks one.
 
 ```bash
 # One finding as a PDF, named SEC-003 - <title>.pdf, into the existing ./reports

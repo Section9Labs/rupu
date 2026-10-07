@@ -18,6 +18,7 @@ import type {
   AutoflowClaim,
   WorkerRecord,
 } from './api';
+import { findingPath } from './findingWorkspace';
 
 // ---------------------------------------------------------------------------
 // Item model
@@ -240,7 +241,7 @@ export function findingItems(rows: FindingOut[]): PaletteItem[] {
     id: f.id,
     title: f.summary,
     subtitle: [f.severity, f.file_path].filter(Boolean).join(' · ') || undefined,
-    to: `/findings/${encodeURIComponent(f.id)}`,
+    to: findingPath(f.id, f.ws_id),
   }));
 }
 

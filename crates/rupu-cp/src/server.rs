@@ -1,14 +1,6 @@
 use crate::state::AppState;
-use axum::{
-    extract::Request,
-    http::{header::AUTHORIZATION, HeaderName, StatusCode},
-    middleware::{from_fn_with_state, Next},
-    response::Response,
-    routing::get,
-    Router,
-};
+use axum::{http::HeaderName, middleware::from_fn_with_state, routing::get, Router};
 use std::sync::Arc;
-use subtle::ConstantTimeEq;
 use tower_http::trace::TraceLayer;
 
 /// Liveness probe. The body stays the bare `ok` every existing consumer
@@ -31,36 +23,14 @@ async fn healthz() -> ([(HeaderName, String); 2], &'static str) {
     )
 }
 
-/// Bearer-token guard for the `/api/*` surface.
-///
-/// When a token is configured the request must carry
-/// `Authorization: Bearer <token>` or it is rejected with `401`. The token is
-/// compared in constant time. When no token is configured this middleware is
-/// never installed (the API stays open — Phase-1 localhost posture).
-async fn require_bearer(
-    axum::extract::State(token): axum::extract::State<Arc<String>>,
-    req: Request,
-    next: Next,
-) -> Result<Response, StatusCode> {
-    let presented = req
-        .headers()
-        .get(AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-
-    match presented {
-        Some(p) if bool::from(p.as_bytes().ct_eq(token.as_bytes())) => Ok(next.run(req).await),
-        _ => Err(StatusCode::UNAUTHORIZED),
-    }
-}
-
 /// Build the control-plane router.
 ///
-/// `token`: when `Some`, every `/api/*` route requires
-/// `Authorization: Bearer <token>` (constant-time compared) and otherwise
-/// returns `401`. `/healthz` and the static UI / SPA fallback remain open
-/// regardless — on Phase-1 localhost the token guards the API from other
-/// local processes while the browser app loads without a header.
+/// `token`: when `Some`, every `/api/*` route requires the token — as
+/// `Authorization: Bearer <token>` or as the browser's token cookie, which a
+/// page load with `?token=<token>` sets ([`crate::auth`]) — and otherwise
+/// returns `401`. `/healthz`, the node WS endpoint (enrollment-token gated)
+/// and the static UI / SPA fallback stay open: the pages hold no data, every
+/// byte of it comes from `/api/*`.
 pub fn router(state: AppState, token: Option<String>) -> Router {
     let api = Router::new()
         .merge(crate::api::agentiflows::routes())
@@ -97,12 +67,16 @@ pub fn router(state: AppState, token: Option<String>) -> Router {
         .merge(crate::api::tools::routes())
         .merge(crate::api::workspace::routes());
 
-    let api = match token {
-        Some(t) => api.layer(from_fn_with_state(Arc::new(t), require_bearer)),
+    let token = token.map(crate::auth::Token::new);
+    let api = match &token {
+        Some(t) => api.layer(from_fn_with_state(
+            Arc::clone(t),
+            crate::auth::require_token,
+        )),
         None => api,
     };
 
-    Router::new()
+    let app = Router::new()
         .route("/healthz", get(healthz))
         // Node WS endpoint sits OUTSIDE the bearer layer — it is token-gated
         // by the Hello frame's enrollment token, not the API bearer.  Mounting
@@ -115,7 +89,14 @@ pub fn router(state: AppState, token: Option<String>) -> Router {
         // 404 (never the SPA — that made every missing endpoint look present
         // on an older CP), and every other path (incl. client-side routes like
         // `/runs/abc`) falls through to the embedded SPA.
-        .fallback(crate::embed::static_handler)
-        .layer(TraceLayer::new_for_http())
-        .with_state(state)
+        .fallback(crate::embed::static_handler);
+    let app = match token {
+        Some(t) => app.layer(from_fn_with_state(t, crate::auth::bootstrap_cookie)),
+        None => app,
+    };
+    app.layer(axum::middleware::from_fn(
+        crate::path_guard::reject_unsafe_segments,
+    ))
+    .layer(TraceLayer::new_for_http())
+    .with_state(state)
 }

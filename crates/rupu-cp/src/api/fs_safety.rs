@@ -22,6 +22,24 @@ pub(crate) fn validate_name(name: &str) -> Result<(), ApiError> {
     }
 }
 
+/// The read-side check for a definition name from a URL (`GET`, run, start
+/// a session): exactly one plain path component. Looser than
+/// [`validate_name`] so a definition already on disk under a stem that rule
+/// would refuse (a `.` in it, say) stays reachable, but never a separator,
+/// a leading `.` (`..`, hidden files) or `-`, or a control character — the
+/// name is joined onto a definitions directory and forwarded to remote hosts.
+pub(crate) fn validate_stem(name: &str) -> Result<(), ApiError> {
+    let ok = !name.is_empty()
+        && !name.starts_with(['.', '-'])
+        && !name.contains(['/', '\\', '?', '#'])
+        && !name.chars().any(char::is_control);
+    if ok {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(format!("invalid name: {name:?}")))
+    }
+}
+
 /// Write `bytes` to a sibling temp file then atomically rename it over `path`,
 /// so a crashed/partial write never leaves a corrupt definition on disk.
 pub(crate) fn write_atomic(path: &FsPath, bytes: &[u8]) -> std::io::Result<()> {
@@ -60,6 +78,29 @@ pub(crate) fn validate_within(path: &FsPath, dir: &FsPath) -> Result<(), ApiErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_stem_allows_one_plain_component_only() {
+        for ok in ["foo", "oracle-recon", "v1.2", "My Agent"] {
+            assert!(validate_stem(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../x",
+            "a/b",
+            "a\\b",
+            "/etc/passwd",
+            ".hidden",
+            "-x",
+            "a?b",
+            "a#b",
+            "a\0b",
+        ] {
+            assert!(validate_stem(bad).is_err(), "{bad:?}");
+        }
+    }
 
     #[test]
     fn validate_name_rejects_traversal_and_accepts_plain() {

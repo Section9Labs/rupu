@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react';
 import { ApiError, apiErrorMessage, findingArtifactUrl } from '../../../lib/api';
 import { formatBytes, type ArtifactRef } from '../../../lib/findingReport';
+import { useFindingWorkspace } from '../../../lib/findingWorkspace';
 
 const PREVIEW_LIMIT = 256 * 1024;
 
@@ -19,6 +20,7 @@ export default function ArtifactBrowser({ findingId, artifacts }: { findingId: s
   // Bumped on every selection; a fetch only writes state while it is still
   // the latest one, so a slow earlier response can't land under a newer name.
   const token = useRef(0);
+  const wsId = useFindingWorkspace();
 
   async function open(a: ArtifactRef) {
     const mine = ++token.current;
@@ -31,7 +33,7 @@ export default function ArtifactBrowser({ findingId, artifacts }: { findingId: s
     if (a.size > PREVIEW_LIMIT) { setError(`Too large to preview (${formatBytes(a.size)}); download it instead.`); return; }
     setLoading(true);
     try {
-      const res = await fetch(findingArtifactUrl(findingId, a.sha256), { credentials: 'same-origin' });
+      const res = await fetch(findingArtifactUrl(findingId, a.sha256, wsId), { credentials: 'same-origin' });
       if (!res.ok) {
         const msg = await errorMessage(res);
         if (current()) setError(msg);
@@ -78,7 +80,7 @@ export default function ArtifactBrowser({ findingId, artifacts }: { findingId: s
                 {selected.host && (
                   <span title={`Fetched from host ${selected.host} the first time it is viewed.`}>from host {selected.host}</span>
                 )}
-                <a href={findingArtifactUrl(findingId, selected.sha256)} download className="text-brand-700 hover:underline">Download</a>
+                <a href={findingArtifactUrl(findingId, selected.sha256, wsId)} download className="text-brand-700 hover:underline">Download</a>
               </span>
             </div>
             {loading && <p role="status" className="px-3 py-2 text-ui text-ink-mute">Loading…</p>}

@@ -13,6 +13,7 @@ import { SEVERITY_STYLE } from '../../lib/severity';
 import { AgentName } from '../codename/AgentName';
 import { FindingEvidence } from './FindingEvidence';
 import { findingCodename } from './findingCodename';
+import { findingPath } from '../../lib/findingWorkspace';
 
 export interface FindingRowProps {
   finding: FindingRecord;
@@ -121,7 +122,7 @@ export function FindingRow({ finding, project, targetId, wsId }: FindingRowProps
             )}
             {finding.profile === 'full' && (
               <Link
-                to={`/findings/${encodeURIComponent(finding.id)}`}
+                to={findingPath(finding.id, (finding as { ws_id?: string }).ws_id)}
                 className="text-brand-700 hover:underline"
               >
                 Open report →

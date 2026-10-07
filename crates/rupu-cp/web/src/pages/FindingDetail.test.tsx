@@ -58,7 +58,7 @@ describe('FindingDetail page', () => {
 
     const h1 = await screen.findByRole('heading', { level: 1 });
     expect(h1).toHaveTextContent(report.title);
-    expect(spy).toHaveBeenCalledWith('fnd_1');
+    expect(spy).toHaveBeenCalledWith('fnd_1', null);
 
     // Root cause is markdown (the symbol renders as <code>), so match the prose after it.
     expect(screen.getByText(/is called with only the note id/)).toBeInTheDocument();
@@ -249,7 +249,7 @@ describe('FindingDetail page', () => {
       fireEvent.click(within(group).getByRole('button', { name: 'PDF' }));
 
       await waitFor(() => expect(clicked).toHaveLength(1));
-      expect(spy).toHaveBeenCalledWith('fnd_1', 'pdf', { signal: expect.any(AbortSignal) });
+      expect(spy).toHaveBeenCalledWith('fnd_1', 'pdf', { signal: expect.any(AbortSignal), wsId: 'ws1' });
       expect(clicked[0].download).toBe('SEC-001-notes-idor.pdf');
       expect(screen.queryByRole('alert')).toBeNull();
     });
@@ -340,7 +340,7 @@ describe('FindingDetail page', () => {
       expect(await screen.findByText('needs-poc')).toBeInTheDocument();
       fireEvent.click(screen.getByRole('button', { name: 'Remove tag needs-poc' }));
 
-      await waitFor(() => expect(tag).toHaveBeenCalledWith(['fnd_1'], { remove: ['needs-poc'] }));
+      await waitFor(() => expect(tag).toHaveBeenCalledWith([{ ws_id: 'ws1', id: 'fnd_1' }], { remove: ['needs-poc'] }));
       await waitFor(() => expect(get).toHaveBeenCalledTimes(2));
     });
 
