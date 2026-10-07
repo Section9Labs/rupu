@@ -8,11 +8,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 /// One operator steering message. `stop` asks the envelope to wind down.
+/// `interrupt` (`send --now`) asks for delivery mid-round rather than at the
+/// next round boundary. It is `#[serde(default)]` so a steering file written
+/// before the field existed still parses (as `false`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperatorMessage {
     pub ts: String,
     pub body: String,
     pub stop: bool,
+    #[serde(default)]
+    pub interrupt: bool,
 }
 
 /// Process-local tiebreaker so two enqueues in the same nanosecond never collide.
@@ -103,12 +108,14 @@ mod tests {
             ts: "t1".into(),
             body: "focus auth".into(),
             stop: false,
+            interrupt: false,
         })
         .unwrap();
         q.enqueue(&OperatorMessage {
             ts: "t2".into(),
             body: "wrap up".into(),
             stop: true,
+            interrupt: false,
         })
         .unwrap();
         let msgs = q.drain().unwrap();
@@ -127,6 +134,7 @@ mod tests {
                 ts: i.to_string(),
                 body: String::new(),
                 stop: false,
+                interrupt: false,
             })
             .unwrap();
         }
@@ -142,6 +150,7 @@ mod tests {
             ts: "ok".into(),
             body: "b".into(),
             stop: false,
+            interrupt: false,
         })
         .unwrap();
         std::fs::write(
@@ -155,5 +164,36 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].ts, "ok");
         assert!(q.drain().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_message_written_before_interrupt_existed_parses_as_not_interrupting() {
+        let old = br#"{"ts":"t","body":"focus auth","stop":false}"#;
+        let msg: OperatorMessage = serde_json::from_slice(old).unwrap();
+        assert!(!msg.interrupt);
+        assert_eq!(msg.body, "focus auth");
+    }
+
+    #[test]
+    fn interrupt_round_trips_through_the_queue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let q = OperatorQueue::new(tmp.path());
+        q.enqueue(&OperatorMessage {
+            ts: "t".into(),
+            body: "now".into(),
+            stop: false,
+            interrupt: true,
+        })
+        .unwrap();
+        q.enqueue(&OperatorMessage {
+            ts: "t".into(),
+            body: "later".into(),
+            stop: false,
+            interrupt: false,
+        })
+        .unwrap();
+        let msgs = q.drain().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert!(msgs[0].interrupt && !msgs[1].interrupt);
     }
 }

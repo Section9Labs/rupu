@@ -1410,6 +1410,7 @@ mod tests {
                 ts: "2026-10-05T12:00:00Z".into(),
                 body: "wrap up".into(),
                 stop: true,
+                interrupt: false,
             })
             .unwrap();
 
@@ -1475,6 +1476,7 @@ mod tests {
                 ts: "2026-10-05T12:00:00Z".into(),
                 body: "stop".into(),
                 stop: true,
+                interrupt: false,
             })
             .unwrap();
     }

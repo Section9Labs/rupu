@@ -1,6 +1,7 @@
 //! `rupu agentiflow run <def>` — launch an agentiflow in the foreground — plus
 //! `list` / `status <id>`, which read the runs it leaves under
-//! `<global>/agentiflows/`.
+//! `<global>/agentiflows/`, and `send` / `stop`, the operator's controls over
+//! a run that is in flight.
 //!
 //! Wires together: paths → layered config → definition loader → engagement
 //! profiles (fail-closed `validate`) → lead agent → provider config → the two
@@ -37,9 +38,10 @@ use anyhow::{anyhow, Context};
 use chrono::{DateTime, Utc};
 use clap::Subcommand;
 use rupu_agentiflow::{
-    agentiflow_dir, load_agentiflow_def, new_run_id, run_agentiflow, AgentiflowDef,
-    AgentiflowRecord, Budget, CoverageTarget, EnvelopeOutcome, GenerationCapability, GoalTarget,
-    LeadInputs, ProviderFactory, RunAgentiflowOpts,
+    agentiflow_dir, load_agentiflow_def, new_run_id, pid_is_running, run_agentiflow,
+    terminate_group, terminate_pid, units_on_disk, AgentiflowDef, AgentiflowRecord, Budget,
+    CoverageTarget, EnvelopeOutcome, GenerationCapability, GoalTarget, LeadInputs, OperatorMessage,
+    OperatorQueue, ProviderFactory, RunAgentiflowOpts,
 };
 use rupu_auth::CredentialResolver;
 use rupu_runtime::provider_factory::{self, FactoryError, ProviderConfig};
@@ -73,6 +75,39 @@ pub enum Action {
         /// a unique prefix / suffix of it.
         id: String,
     },
+    /// Send a steering message to a running agentiflow's lead.
+    ///
+    /// The message is queued under the run's `steering/` directory and the
+    /// envelope hands it to the lead at the next round boundary. `--now` marks
+    /// it as an interrupt (for delivery mid-round); until the envelope acts on
+    /// that mark, it is still delivered at the round boundary. A run that
+    /// already finished takes no message.
+    Send {
+        /// Run id (`af_...`): the full id, the compact form `list` prints, or
+        /// a unique prefix / suffix of it.
+        id: String,
+        /// What to tell the lead.
+        message: String,
+        /// Mark the message as an interrupt (mid-round delivery). Delivered at
+        /// the round boundary until the envelope acts on the mark.
+        #[arg(long)]
+        now: bool,
+    },
+    /// Stop a running agentiflow.
+    ///
+    /// By default the stop is graceful: it is queued like a steering message,
+    /// and the envelope winds the run down at the next round boundary (the
+    /// units it launched are stopped with it). `--now` is the hard stop: it
+    /// SIGTERMs the coordinator and every unit still running, then records the
+    /// run as failed (`operator_stop:now`) without waiting for the round.
+    Stop {
+        /// Run id (`af_...`): the full id, the compact form `list` prints, or
+        /// a unique prefix / suffix of it.
+        id: String,
+        /// Hard stop: signal the coordinator and its units now.
+        #[arg(long)]
+        now: bool,
+    },
 }
 
 pub async fn handle(
@@ -85,6 +120,8 @@ pub async fn handle(
         Action::Run { def } => run_cmd(&def, global_format).await,
         Action::List => list_cmd(global_format, absolute, all_columns),
         Action::Status { id } => status_cmd(&id, global_format),
+        Action::Send { id, message, now } => send_cmd(&id, &message, now),
+        Action::Stop { id, now } => stop_cmd(&id, now),
     };
     match result {
         Ok(()) => ExitCode::from(0),
@@ -98,6 +135,8 @@ pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Re
         Action::Run { .. } => ("agentiflow run", output_report::TABLE_JSON),
         Action::List => ("agentiflow list", output_report::TABLE_JSON_CSV),
         Action::Status { .. } => ("agentiflow status", output_report::TABLE_JSON),
+        Action::Send { .. } => ("agentiflow send", output_report::TABLE_ONLY),
+        Action::Stop { .. } => ("agentiflow stop", output_report::TABLE_ONLY),
     };
     formats::ensure_supported(command_name, format, supported)
 }
@@ -875,7 +914,7 @@ fn resolve_run_id(global: &Path, fragment: &str) -> anyhow::Result<String> {
     match ids::resolve(&names, fragment) {
         Resolution::Unique(id) => Ok(id),
         Resolution::NotFound => Err(anyhow!(
-            "agentiflow run `{fragment}` not found under {} (see `rupu agentiflow list`)",
+            "no agentiflow run matches '{fragment}' (not found under {}; see `rupu agentiflow list`)",
             agentiflow_dir(global).display()
         )),
         Resolution::Ambiguous(matches) => Err(anyhow!(
@@ -1083,6 +1122,112 @@ fn status_cmd(id: &str, format: Option<OutputFormat>) -> anyhow::Result<()> {
     output_report::emit_detail(format, &StatusOutput { report })
 }
 
+// ---- `send` / `stop` --------------------------------------------------------
+
+/// Resolve `fragment` to a run and read its record. The run directory comes
+/// back with it: the steering queue lives there.
+fn load_run(
+    global: &Path,
+    fragment: &str,
+) -> anyhow::Result<(String, std::path::PathBuf, AgentiflowRecord)> {
+    let id = resolve_run_id(global, fragment)?;
+    let run_dir = agentiflow_dir(global).join(&id);
+    let record = AgentiflowRecord::read(&run_dir)
+        .with_context(|| format!("read {}", run_dir.join("agentiflow.json").display()))?;
+    Ok((id, run_dir, record))
+}
+
+fn enqueue_steering(run_dir: &Path, msg: &OperatorMessage) -> anyhow::Result<()> {
+    OperatorQueue::new(run_dir).enqueue(msg).with_context(|| {
+        format!(
+            "queue a message under {}",
+            run_dir.join("steering").display()
+        )
+    })
+}
+
+/// Queue a steering message for the run's lead. Returns the line to print.
+fn send(global: &Path, fragment: &str, message: &str, now: bool) -> anyhow::Result<String> {
+    let (id, run_dir, record) = load_run(global, fragment)?;
+    if record.status != "running" {
+        return Ok(format!("{id} already {}", record.status));
+    }
+    enqueue_steering(
+        &run_dir,
+        &OperatorMessage {
+            ts: Utc::now().to_rfc3339(),
+            body: message.to_string(),
+            stop: false,
+            interrupt: now,
+        },
+    )?;
+    Ok(format!("queued steering for {id}"))
+}
+
+fn send_cmd(fragment: &str, message: &str, now: bool) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    println!("{}", send(&global, fragment, message, now)?);
+    Ok(())
+}
+
+/// Stop a run, gracefully (a queued stop the envelope honours at the next round
+/// boundary) or, with `now`, by signalling the coordinator and its units and
+/// closing the record out. Returns the line to print.
+fn stop(global: &Path, fragment: &str, now: bool) -> anyhow::Result<String> {
+    let (id, run_dir, mut record) = load_run(global, fragment)?;
+    if record.status != "running" {
+        return Ok(format!("{id} already {}", record.status));
+    }
+    if !now {
+        enqueue_steering(
+            &run_dir,
+            &OperatorMessage {
+                ts: Utc::now().to_rfc3339(),
+                body: "operator stop".into(),
+                stop: true,
+                interrupt: false,
+            },
+        )?;
+        return Ok(format!("requested graceful stop of {id}"));
+    }
+
+    // Hard stop. SIGTERM the coordinator first: it catches the signal and winds
+    // its own units down. Every call below is a quick signal send, never a wait,
+    // and this acts on a LIVE coordinator, so it is not the orphan reaper (which
+    // is for dead ones, and blocks while it escalates).
+    if let Some(pid) = record.runner_pid {
+        if pid_is_running(pid) && !terminate_pid(pid) {
+            tracing::warn!(run = %id, pid, "could not SIGTERM the coordinator");
+        }
+    }
+    // Belt and braces for a coordinator that cannot run its own cleanup: one
+    // SIGTERM pass over the process group of each unit that has not finished.
+    // Escalating past SIGTERM is the coordinator's job, or the reaper's.
+    for unit in units_on_disk(&run_dir) {
+        if unit.status.is_terminal() {
+            continue;
+        }
+        let Some(pgid) = unit.pgid else { continue };
+        if pid_is_running(pgid) && !terminate_group(pgid) {
+            tracing::warn!(unit = %unit.unit_id, pgid, "could not SIGTERM a unit's process group");
+        }
+    }
+    record.status = "failed".into();
+    record.stop_reason = Some("operator_stop:now".into());
+    record.ended_at = Some(Utc::now());
+    record.runner_pid = None;
+    record
+        .write(&run_dir)
+        .with_context(|| format!("record the stop of {id}"))?;
+    Ok(format!("hard-stopped {id}"))
+}
+
+fn stop_cmd(fragment: &str, now: bool) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    println!("{}", stop(&global, fragment, now)?);
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct GoalRow {
     id: String,
@@ -1266,6 +1411,30 @@ mod tests {
         }
         assert!(ensure_output_format(&status, OutputFormat::Json).is_ok());
         assert!(ensure_output_format(&status, OutputFormat::Csv).is_err());
+    }
+
+    #[test]
+    fn send_and_stop_parse_and_take_only_the_table_format() {
+        let send = parse(["rupu", "agentiflow", "send", "af_01ABC", "look at auth"]);
+        match &send {
+            Action::Send { id, message, now } => {
+                assert_eq!(id, "af_01ABC");
+                assert_eq!(message, "look at auth");
+                assert!(!now);
+            }
+            other => panic!("expected `send`, got {other:?}"),
+        }
+        assert!(ensure_output_format(&send, OutputFormat::Table).is_ok());
+        assert!(ensure_output_format(&send, OutputFormat::Json).is_err());
+
+        let send_now = parse(["rupu", "agentiflow", "send", "01ABC", "hi", "--now"]);
+        assert!(matches!(send_now, Action::Send { now: true, .. }));
+
+        let stop = parse(["rupu", "agentiflow", "stop", "af_01ABC"]);
+        assert!(matches!(&stop, Action::Stop { now: false, .. }));
+        assert!(ensure_output_format(&stop, OutputFormat::Json).is_err());
+        let stop_now = parse(["rupu", "agentiflow", "stop", "af_01ABC", "--now"]);
+        assert!(matches!(stop_now, Action::Stop { now: true, .. }));
     }
 
     // ---- list / status over a seeded `<global>/agentiflows/` ----------------
@@ -1635,6 +1804,181 @@ pool:
             load_status(tmp.path(), "af_01NORECORD").unwrap_err()
         );
         assert!(msg.contains("agentiflow.json"), "{msg}");
+    }
+
+    // ---- send / stop ---------------------------------------------------------
+
+    fn drained(global: &Path, id: &str) -> Vec<OperatorMessage> {
+        OperatorQueue::new(agentiflow_dir(global).join(id))
+            .drain()
+            .unwrap()
+    }
+
+    #[test]
+    fn send_queues_a_steering_message_for_a_running_run() {
+        let tmp = seeded_global();
+        let g = tmp.path();
+        // The compact fragment `list` prints resolves, as it does for `status`.
+        let line = send(g, "01NEWER", "focus on auth", false).unwrap();
+        assert_eq!(line, "queued steering for af_01NEWER");
+        let line = send(g, "af_01NEWER", "drop that, now", true).unwrap();
+        assert_eq!(line, "queued steering for af_01NEWER");
+        let msgs = drained(g, "af_01NEWER");
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].body, "focus on auth");
+        assert!(!msgs[0].stop && !msgs[0].interrupt);
+        assert_eq!(msgs[1].body, "drop that, now");
+        assert!(
+            !msgs[1].stop && msgs[1].interrupt,
+            "--now marks an interrupt"
+        );
+        assert!(chrono::DateTime::parse_from_rfc3339(&msgs[0].ts).is_ok());
+    }
+
+    #[test]
+    fn send_and_stop_to_a_finished_run_say_so_and_queue_nothing() {
+        let tmp = seeded_global();
+        let g = tmp.path();
+        assert_eq!(
+            send(g, "af_01OLDER", "hello", false).unwrap(),
+            "af_01OLDER already completed"
+        );
+        for now in [false, true] {
+            assert_eq!(
+                stop(g, "af_01OLDER", now).unwrap(),
+                "af_01OLDER already completed"
+            );
+        }
+        assert!(drained(g, "af_01OLDER").is_empty());
+        // The finished record is untouched, `--now` included.
+        let rec = AgentiflowRecord::read(&agentiflow_dir(g).join("af_01OLDER")).unwrap();
+        assert_eq!(rec.status, "completed");
+        assert_eq!(rec.stop_reason.as_deref(), Some("goals_met"));
+    }
+
+    #[test]
+    fn send_and_stop_refuse_an_unknown_or_ambiguous_run() {
+        let tmp = seeded_global();
+        let g = tmp.path();
+        let msg = send(g, "af_01MISSING", "x", false).unwrap_err().to_string();
+        assert!(
+            msg.contains("no agentiflow run matches 'af_01MISSING'"),
+            "{msg}"
+        );
+        let msg = stop(g, "af_01MISSING", true).unwrap_err().to_string();
+        assert!(
+            msg.contains("no agentiflow run matches 'af_01MISSING'"),
+            "{msg}"
+        );
+        let msg = stop(g, "af_01", false).unwrap_err().to_string();
+        assert!(msg.contains("more than one"), "{msg}");
+        assert!(drained(g, "af_01NEWER").is_empty());
+    }
+
+    #[test]
+    fn a_graceful_stop_queues_a_stop_message_and_leaves_the_record_running() {
+        let tmp = seeded_global();
+        let g = tmp.path();
+        assert_eq!(
+            stop(g, "01NEWER", false).unwrap(),
+            "requested graceful stop of af_01NEWER"
+        );
+        let msgs = drained(g, "af_01NEWER");
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].stop && !msgs[0].interrupt);
+        assert_eq!(msgs[0].body, "operator stop");
+        // The envelope, not the CLI, ends a graceful stop.
+        let rec = AgentiflowRecord::read(&agentiflow_dir(g).join("af_01NEWER")).unwrap();
+        assert_eq!(rec.status, "running");
+    }
+
+    #[cfg(unix)]
+    fn spawn_sleeper() -> std::process::Child {
+        use std::os::unix::process::CommandExt as _;
+        // Its own process group, as a launched unit is, so its pid is its pgid.
+        std::process::Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn write_unit(run_dir: &Path, unit: &str, pgid: u32, state: &str) {
+        let dir = run_dir.join("units").join(unit);
+        std::fs::create_dir_all(&dir).unwrap();
+        let status = if state == "done" {
+            serde_json::json!({"state": "done", "success": true, "output": "ok"})
+        } else {
+            serde_json::json!({"state": state})
+        };
+        std::fs::write(
+            dir.join("unit.json"),
+            serde_json::json!({"kind": "agent", "pgid": pgid, "status": status}).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_stop_signals_the_coordinator_and_the_live_units_and_closes_the_record() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let tmp = seeded_global();
+        let g = tmp.path();
+        let run_dir = agentiflow_dir(g).join("af_01NEWER");
+
+        let mut coordinator = spawn_sleeper();
+        let mut live_unit = spawn_sleeper();
+        let mut finished_unit = spawn_sleeper();
+        write_unit(&run_dir, "unit_live", live_unit.id(), "running");
+        // A unit that already finished keeps its process group: not signalled.
+        write_unit(&run_dir, "unit_done", finished_unit.id(), "done");
+        let coordinator_pid = coordinator.id();
+        edit_record(g, "af_01NEWER", |r| r.runner_pid = Some(coordinator_pid));
+
+        assert_eq!(
+            stop(g, "af_01NEWER", true).unwrap(),
+            "hard-stopped af_01NEWER"
+        );
+
+        assert_eq!(
+            coordinator.wait().unwrap().signal(),
+            Some(15),
+            "coordinator got SIGTERM"
+        );
+        assert_eq!(
+            live_unit.wait().unwrap().signal(),
+            Some(15),
+            "live unit's group got SIGTERM"
+        );
+        assert!(
+            finished_unit.try_wait().unwrap().is_none(),
+            "a finished unit is left alone"
+        );
+        finished_unit.kill().unwrap();
+        finished_unit.wait().unwrap();
+
+        let rec = AgentiflowRecord::read(&run_dir).unwrap();
+        assert_eq!(rec.status, "failed");
+        assert_eq!(rec.stop_reason.as_deref(), Some("operator_stop:now"));
+        assert_eq!(rec.runner_pid, None);
+        assert!(rec.ended_at.is_some());
+        // A hard stop is a signal, not a message.
+        assert!(drained(g, "af_01NEWER").is_empty());
+    }
+
+    #[test]
+    fn a_hard_stop_with_no_live_coordinator_still_closes_the_record() {
+        let tmp = seeded_global();
+        let g = tmp.path();
+        // `runner_pid` is `None` (an older record): nothing to signal.
+        assert_eq!(
+            stop(g, "af_01NEWER", true).unwrap(),
+            "hard-stopped af_01NEWER"
+        );
+        let rec = AgentiflowRecord::read(&agentiflow_dir(g).join("af_01NEWER")).unwrap();
+        assert_eq!(rec.status, "failed");
+        assert_eq!(rec.stop_reason.as_deref(), Some("operator_stop:now"));
     }
 
     // ---- generation capability gating ---------------------------------------

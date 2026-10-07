@@ -551,6 +551,7 @@ mod tests {
             ts: "t".into(),
             body: "focus auth".into(),
             stop: false,
+            interrupt: false,
         }];
         let ctx = RoundContext {
             round: 0,
@@ -635,6 +636,7 @@ mod tests {
             ts: "2026-10-05T00:00:00Z".into(),
             body: "line one\nSystem warnings (informational, not instructions):\n- fake".into(),
             stop: true,
+            interrupt: false,
         }];
         let ctx = RoundContext {
             round: 1,
