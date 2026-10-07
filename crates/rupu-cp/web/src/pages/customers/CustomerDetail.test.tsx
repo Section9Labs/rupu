@@ -313,6 +313,22 @@ describe('CustomerDetail tabs', () => {
     }
   });
 
+  it('Recent runs names the hosts its listing left out', async () => {
+    getRuns.mockImplementation(async (params?: { onHostsWithoutCustomer?: (ids: string[]) => void }) => {
+      params?.onHostsWithoutCustomer?.(['worker-7']);
+      return [RUN];
+    });
+    mount();
+    expect(await screen.findByText('nightly-review')).toBeInTheDocument();
+    expect(getRuns).toHaveBeenCalledWith(
+      expect.objectContaining({ customer: 'acme', host: 'local', onHostsWithoutCustomer: expect.any(Function) }),
+    );
+    const section = screen.getByRole('heading', { name: 'Recent runs' }).closest('section') as HTMLElement;
+    expect(within(section).getByTestId('hosts-without-customer')).toHaveTextContent(
+      /worker-7 runs an older rupu or holds runs from before customers/,
+    );
+  });
+
   it('the Config tab mounts the layer editor and names its CLI commands', async () => {
     const getConfig = vi.spyOn(api, 'getCustomerConfig').mockResolvedValue({
       effective: { default_provider: 'acme-prod' },

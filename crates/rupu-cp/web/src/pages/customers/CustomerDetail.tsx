@@ -836,16 +836,28 @@ function CostByProject({
 }
 
 /** The customer's latest runs on this control plane (`?host=local`, so one
- *  slow remote host never holds the page). */
+ *  slow remote host never holds the page). Mirrored worker runs whose customer
+ *  can't be known are left out; the hosts they came from (the response's
+ *  `X-Rupu-Hosts-Without-Customer`) are named under the list. */
 function RecentRuns({ slug, limit, title }: { slug: string; limit: number; title: string }) {
   const [runs, setRuns] = useState<RunListRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [without, setWithout] = useState<string[]>([]);
 
   useEffect(() => {
     const ctl = new AbortController();
     setRuns(null);
     setError(null);
-    api.getRuns({ customer: slug, limit, host: 'local', signal: ctl.signal }).then(
+    setWithout([]);
+    api.getRuns({
+      customer: slug,
+      limit,
+      host: 'local',
+      signal: ctl.signal,
+      onHostsWithoutCustomer: (ids) => {
+        if (!ctl.signal.aborted) setWithout(ids);
+      },
+    }).then(
       (rows) => {
         if (!ctl.signal.aborted) setRuns(rows);
       },
@@ -897,6 +909,7 @@ function RecentRuns({ slug, limit, title }: { slug: string; limit: number; title
           ))}
         </ListCard>
       )}
+      <RollupHostsWithoutCustomerBanner without={without} className="mt-2" />
     </section>
   );
 }
