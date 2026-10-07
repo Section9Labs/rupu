@@ -107,6 +107,7 @@ is not an error — it matches nothing.
 | `GET /api/findings` | the project's CURRENT assignment (the summary counts only the kept findings) |
 | `GET /api/projects` | the project's CURRENT assignment |
 | `GET /api/usage`, `/usage/timeline`, `/usage/runs` | the attribution of each LOCAL source (runs, standalone agent runs, session turns), priced per customer |
+| `GET /api/usage/outliers` | the same LOCAL sources, as both the candidates and the per-workflow baselines (so a run is judged against that customer's own runs); a bad slug is 400 |
 | `GET /api/dashboard` | the LOCAL host's runs by attribution, `findings_open` by the customer's projects, autoflow cycles by the projects of the repos they touched (a cycle no project resolves for is left out); the `fleet` counts are not run-scoped and stay unfiltered |
 
 ### Remote hosts
@@ -223,7 +224,99 @@ are kept, the entry's `source` says "credentials not checked" and a warning says
 so. Provider accounts are reported from the config; their credentials are not
 probed here.
 
+## Web
+
+The control-plane web UI (`crates/rupu-cp/web/`) is a thin client of the routes
+above. A global **customer scope** (`web/src/lib/customerScope.tsx`) decides
+which customer every scoped page filters to; the pages pass it as `?customer=`.
+
+### The scope
+
+- **Values.** `null` = all customers (no `?customer=` sent), `none` = work with
+  no customer (shown as "Unassigned"), otherwise a customer slug.
+- **Persistence.** The scope is kept in `localStorage` under `rupu.cp.customer`
+  (cleared when the scope returns to all customers). A browser that blocks
+  storage still works for the session.
+- **Deep link.** A `?customer=<slug>|none` on the URL the app first loads wins
+  over storage: it is adopted as the scope and written back to storage, so a
+  link such as `/runs?customer=acme` opens already filtered. It is read once, at
+  load; changing the scope later does not rewrite the URL.
+- **A scope the backend rejects is cleared.** A 400 from a request that carried
+  the scope (a malformed slug, e.g. a stale stored value) clears it and shows a
+  dismissible one-line notice ("The customer filter was rejected (…) — showing
+  all customers."); the page refetches unfiltered. A slug the backend accepts
+  but that no customer carries is cleared the same way once the customer list
+  has loaded and neither the active nor the archived customers hold it
+  ("Customer "acme" no longer exists — showing all customers."). A page
+  embedded in a customer's own detail tab uses that customer and never clears
+  the global scope.
+- **Archived customers** stay valid scopes. The picker lists active customers;
+  "Show archived" in its footer loads the archived ones on demand.
+
+### Pickers and chips
+
+- The **picker** (`components/customers/CustomerPicker.tsx`): the v1 sidebar
+  block under the brand, and a compact button in the v2 top bar. A search box,
+  "All customers", the customers (dot, name), "Unassigned", and a footer with
+  "Show archived" and "Manage →" (the Customers page).
+- A scoped page's header carries a **scope chip** (customer dot + name + ×,
+  which clears the scope; "Unassigned" for `none`).
+
+### Which pages filter
+
+| Filters by the scope | Shows an "unscoped" note instead |
+|---|---|
+| Dashboard (runs, findings, autoflow cycles, spend), the workflow-run and agent-run lists (Activity / Runs), Sessions, Findings, Projects, Usage (headline, timeline, run rows, outliers) | autoflow listings (runs, cycles, claims), Coverage, the concern-template catalog, the dashboard's fleet counts, and the Workflows / Agents / Autoflows definition lists (their run counts and spend cover every customer) |
+
+An unscoped page says so in a one-line info note (`UnscopedNote`) while a scope
+is set, so a list or number that is not the customer's is never passed off as
+theirs. The notes disappear when the scope is all customers.
+
+### Hosts that can't be filtered
+
+A scoped view names the hosts it had to leave out in a warn banner
+(`HostsWithoutCustomerBanner`): hosts whose rows lack a `customer` key (the
+single-host 501 and the `X-Rupu-Hosts-Without-Customer` header / the
+`hosts_without_customer` arrays above) and remote hosts whose aggregate totals
+cannot be filtered (`/api/usage`, `/api/dashboard`). They are never counted as
+zero. The banner never shows unscoped.
+
+### Where customers appear
+
+- **Customers page** (`/customers`, "Customers" in the nav): one row per
+  customer with its rollup (projects, runs, spend, open findings, last
+  activity), a 7d / 30d / all range, search, an Active / Archived / All view,
+  and create. The
+  cost tile says when its total leaves out usage that could not be priced
+  ("excludes unpriced usage from …"), and when part of a customer's usage was
+  unreadable so the total may be understated ("some usage unreadable — may be
+  understated"). Hosts without customer keys are named in a banner.
+- **Customer detail** (`/customers/:slug[/:tab]`): tabs Overview, Projects,
+  Runs, Findings, Usage and Config; edit, archive / unarchive, delete (a 409
+  lists the projects still assigned), assign and unassign projects. The header
+  shows the layer's real path from `config_path`. The **Config** tab edits the
+  customer layer (`GET /api/config?customer=`, `PUT /api/config/customer/:slug`):
+  a field is inherited from global, owned by the customer (with a "Lock for
+  projects" switch), or pinned by the global `[policy].lock` (read-only; the
+  server's 400 shows inline). A layer that does not parse (`layer_error`) shows
+  a banner and opens the Raw tab.
+- **Project header** (`ProjectCustomerMenu`): the project's customer chip and an
+  "Assign to customer" menu (active customers, with the account the project's
+  runs would switch to, and "Unassign"). The Projects table has a customer
+  column.
+- **Runs**: the workflow-run and agent-run lists carry a customer column, and
+  run detail a customer chip (`CustomerChip`); a derived attribution
+  (`customer_derived`) and a row that can't say (no `customer` key) are marked
+  as such. Rows priced at the global rates because the customer is unknown or
+  its layer is broken carry a `pricing_error` mark.
+- **Launcher billing panel** (`LaunchBillingPanel`, in the workflow and agent
+  launchers): debounced `POST /api/launch/preview` for the chosen project and
+  definition — the customer, the provider / fallback / SCM accounts and where
+  each choice came from, and the warnings. A 409 (dangling assignment,
+  unloadable config, malformed agent files) blocks the launch, as the launch
+  itself would fail.
+
 ## Not yet
 
 Remote aggregate filtering, shipping the customer layer and credentials to remote
-hosts, and the web UI are tracked in `TODO.md` (Customers section).
+hosts, and autoflow filtering are tracked in `TODO.md` (Customers section).
