@@ -15,6 +15,7 @@ pub mod fleet_inventory;
 pub mod host;
 pub mod launcher;
 pub mod model_catalog;
+pub mod netflow_index;
 pub mod net;
 pub mod node;
 pub mod pagination;
@@ -289,6 +290,32 @@ pub async fn serve_on(listener: tokio::net::TcpListener, opts: ServeOpts) -> any
             info!(
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "usage index warmed"
+            );
+        });
+    }
+
+    // Read every netflow ledger into the index in the background, so the
+    // first Network page load does not pay for opening every file.
+    {
+        let global = app_state.global_dir.clone();
+        let index = std::sync::Arc::clone(&app_state.netflow_index);
+        let budget_mb = app_state
+            .config
+            .read()
+            .map(|c| c.netflow.cp_index_budget_mb)
+            .unwrap_or(crate::netflow_index::DEFAULT_BUDGET_MB);
+        tokio::task::spawn_blocking(move || {
+            index.set_budget_bytes(budget_mb.saturating_mul(1024 * 1024));
+            let started = std::time::Instant::now();
+            let files = crate::api::netflow::prewarm_netflow_index(&index, &global);
+            let st = index.status();
+            info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                files,
+                flows = st.flows,
+                tier1_bytes = st.tier1_bytes,
+                tier2_bytes = st.tier2_bytes,
+                "netflow index warmed"
             );
         });
     }

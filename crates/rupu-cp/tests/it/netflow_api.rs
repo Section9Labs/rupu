@@ -2823,3 +2823,55 @@ fn a_stale_table_triggers_at_most_one_concurrent_refresh() {
         "after finishing, a later caller may retry"
     );
 }
+
+/// `GET /api/netflow/index` reports the index after a global read — and a
+/// second read returns the same flows from the index.
+#[tokio::test]
+async fn netflow_index_status_reports_files_flows_and_budget() {
+    let global = tempfile::tempdir().unwrap();
+    write_global_ledger(
+        global.path(),
+        "run-indexed",
+        &[LedgerLine::Flow(Box::new(e2e_flow(
+            FlowId::new(),
+            Some("run-indexed"),
+            "api.anthropic.com",
+            Origin::Provider("anthropic".into()),
+        )))],
+    );
+    let addr = serve(new_state(global.path())).await;
+
+    let first: serde_json::Value = reqwest::get(format!("http://{addr}/api/netflow"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let second: serde_json::Value = reqwest::get(format!("http://{addr}/api/netflow"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        first, second,
+        "a cached read must answer exactly like the first"
+    );
+
+    let resp = reqwest::get(format!("http://{addr}/api/netflow/index"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let status: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(status["files"], 1, "{status}");
+    assert_eq!(status["flows"], 1, "{status}");
+    assert_eq!(status["budget_bytes"], 256 * 1024 * 1024, "{status}");
+    for key in [
+        "tier1_bytes",
+        "tier2_bytes",
+        "resident_files",
+        "evictions_total",
+    ] {
+        assert!(status[key].is_u64(), "missing {key}: {status}");
+    }
+}

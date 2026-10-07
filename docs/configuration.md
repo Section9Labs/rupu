@@ -231,6 +231,14 @@ A cross-provider entry sends the conversation to that provider's API.
 
 ---
 
+## `[netflow]`
+
+| Key                   | Type    | Default | Notes |
+|------------------------|---------|---------|-------|
+| `cp_index_budget_mb`   | integer | `256`   | Memory budget for the flow rows `rupu cp serve` keeps in its netflow index. Over budget, the rows of the files with the oldest flows are dropped and re-read from disk when a view needs them: wide windows get slower, answers never change. Per-file summaries (timestamps, counts, origins) always stay in memory. Check usage with `GET /api/netflow/index`. Takes effect on the next request after a config change made through the control plane; hand edits to `config.toml` need a restart. |
+
+---
+
 ## `[cp]`
 
 Runtime settings for `rupu cp serve` (the control-plane HTTP server). Absent fields

@@ -39,6 +39,16 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 /// resolved — shared by the workflow and org dimensions so a filter key
 /// for "the unresolved group" is spelled one way everywhere.
 pub const UNKNOWN_KEY: &str = "unknown";
+
+/// One flow's contribution to a histogram: its timestamp and whether it
+/// errored. The CP index keeps these for every flow (tier 1), so the
+/// whole-history activity strip never needs the flows themselves.
+pub type HistPoint = (DateTime<Utc>, bool);
+
+/// The error rule every explorer view counts by.
+pub fn is_error_outcome(o: Outcome) -> bool {
+    !matches!(o, Outcome::Ok)
+}
 /// Display label for the [`UNKNOWN_KEY`] org (no ASN entry / no peer IP).
 pub const UNKNOWN_ORG_LABEL: &str = "Unknown network";
 /// Display label for the [`UNKNOWN_KEY`] workflow (ledger id matched no
@@ -105,7 +115,7 @@ impl ExplorerFlow {
     }
 
     fn is_error(&self) -> bool {
-        !matches!(self.flow.outcome, Outcome::Ok)
+        is_error_outcome(self.flow.outcome)
     }
 }
 
@@ -349,22 +359,31 @@ fn bucket_index(
     Some(((offset / span * n as f64) as usize).min(n - 1))
 }
 
+fn bucketize_points(
+    points: impl Iterator<Item = HistPoint>,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    n: usize,
+) -> Vec<BucketAgg> {
+    let mut buckets = vec![BucketAgg::default(); n];
+    for (ts, error) in points {
+        if let Some(i) = bucket_index(ts, from, to, n) {
+            buckets[i].calls += 1;
+            if error {
+                buckets[i].errors += 1;
+            }
+        }
+    }
+    buckets
+}
+
 fn bucketize<'a>(
     flows: impl Iterator<Item = &'a ExplorerFlow>,
     from: DateTime<Utc>,
     to: DateTime<Utc>,
     n: usize,
 ) -> Vec<BucketAgg> {
-    let mut buckets = vec![BucketAgg::default(); n];
-    for f in flows {
-        if let Some(i) = bucket_index(f.flow.ts, from, to, n) {
-            buckets[i].calls += 1;
-            if f.is_error() {
-                buckets[i].errors += 1;
-            }
-        }
-    }
-    buckets
+    bucketize_points(flows.map(|f| (f.flow.ts, f.is_error())), from, to, n)
 }
 
 fn bucket_ms(from: DateTime<Utc>, to: DateTime<Utc>, n: usize) -> u64 {
@@ -412,34 +431,88 @@ pub fn sankey_view(
     window: &TimeRange,
     filters: &ExplorerFilters,
 ) -> SankeyView {
+    sankey_view_with_universe(
+        &SankeyUniverse::from_flows(scope_flows),
+        scope_flows,
+        window,
+        filters,
+    )
+}
+
+/// The topology's node universe — every key present in scope, with the
+/// label of its first occurrence (labels are 1:1 with keys for every
+/// dimension). Built from the flows themselves ([`Self::from_flows`]) or,
+/// by the CP index, key by key from per-file summaries.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SankeyUniverse {
+    pub workflows: BTreeMap<String, String>,
+    pub origins: BTreeMap<String, String>,
+    pub orgs: BTreeMap<String, String>,
+}
+
+impl SankeyUniverse {
+    pub fn add_workflow(&mut self, workflow: Option<&str>) {
+        self.workflows
+            .entry(workflow_key_of(workflow).to_string())
+            .or_insert_with(|| workflow.unwrap_or(UNKNOWN_WORKFLOW_LABEL).to_string());
+    }
+
+    /// The origin column labels each node with its key.
+    pub fn add_origin_key(&mut self, key: String) {
+        self.origins.entry(key.clone()).or_insert(key);
+    }
+
+    pub fn add_org(&mut self, asn: Option<&AsnInfo>) {
+        self.orgs
+            .entry(org_key_of(asn))
+            .or_insert_with(|| match asn {
+                Some(a) => a.org.clone(),
+                None => UNKNOWN_ORG_LABEL.to_string(),
+            });
+    }
+
+    pub fn from_flows(flows: &[ExplorerFlow]) -> Self {
+        let mut u = Self::default();
+        for f in flows {
+            u.add_workflow(f.workflow.as_deref());
+            u.add_origin_key(f.origin_key());
+            u.add_org(f.asn.as_ref());
+        }
+        u
+    }
+}
+
+/// [`sankey_view`] with the node universe supplied separately from the
+/// flows. `flows` must contain at least every in-scope flow inside
+/// `window` — node aggregates and links only ever look at in-window flows.
+pub fn sankey_view_with_universe(
+    universe: &SankeyUniverse,
+    flows: &[ExplorerFlow],
+    window: &TimeRange,
+    filters: &ExplorerFilters,
+) -> SankeyView {
     let in_win = |f: &&ExplorerFlow| window.contains(f.flow.ts);
 
     let column = |skip: SkipDim,
-                  key: fn(&ExplorerFlow) -> String,
-                  label: &dyn Fn(&ExplorerFlow) -> String|
+                  labels: &BTreeMap<String, String>,
+                  key: fn(&ExplorerFlow) -> String|
      -> Vec<NodeAgg> {
-        // Universe: every key present in scope, labeled from its first
-        // occurrence (labels are 1:1 with keys for every dimension).
-        let mut labels: BTreeMap<String, String> = BTreeMap::new();
-        for f in scope_flows {
-            labels.entry(key(f)).or_insert_with(|| label(f));
-        }
         let agg = aggregate(
-            scope_flows
+            flows
                 .iter()
                 .filter(in_win)
                 .filter(|f| filters.passes(f, Some(skip))),
             key,
         );
         let mut nodes: Vec<NodeAgg> = labels
-            .into_iter()
+            .iter()
             .map(|(id, label)| {
-                let a = agg.get(&id);
+                let a = agg.get(id);
                 NodeAgg {
-                    label,
+                    label: label.clone(),
                     calls: a.map_or(0, |a| a.calls),
                     errors: a.map_or(0, |a| a.errors),
-                    id,
+                    id: id.clone(),
                 }
             })
             .collect();
@@ -447,21 +520,13 @@ pub fn sankey_view(
         nodes
     };
 
-    let workflows = column(
-        SkipDim::Workflow,
-        |f| f.workflow_key().to_string(),
-        &|f| match &f.workflow {
-            Some(w) => w.clone(),
-            None => UNKNOWN_WORKFLOW_LABEL.to_string(),
-        },
-    );
-    let origins = column(SkipDim::Origin, |f| f.origin_key(), &|f| f.origin_key());
-    let orgs = column(SkipDim::Org, |f| f.org_key(), &|f| match &f.asn {
-        Some(a) => a.org.clone(),
-        None => UNKNOWN_ORG_LABEL.to_string(),
+    let workflows = column(SkipDim::Workflow, &universe.workflows, |f| {
+        f.workflow_key().to_string()
     });
+    let origins = column(SkipDim::Origin, &universe.origins, |f| f.origin_key());
+    let orgs = column(SkipDim::Org, &universe.orgs, |f| f.org_key());
 
-    let filtered: Vec<&ExplorerFlow> = scope_flows
+    let filtered: Vec<&ExplorerFlow> = flows
         .iter()
         .filter(in_win)
         .filter(|f| filters.passes(f, None))
@@ -651,10 +716,20 @@ pub fn timeline_view(
 /// Build the activity-strip histogram over the scope's WHOLE retained
 /// range — no window, no cross-filters (see [`HistogramView`]).
 pub fn histogram_view(scope_flows: &[ExplorerFlow], n: usize) -> HistogramView {
+    histogram_from_points(scope_flows.iter().map(|f| (f.flow.ts, f.is_error())), n)
+}
+
+/// [`histogram_view`] over bare points — what the CP index holds for every
+/// flow without keeping the flows.
+pub fn histogram_from_points<I>(points: I, n: usize) -> HistogramView
+where
+    I: IntoIterator<Item = HistPoint>,
+    I::IntoIter: Clone,
+{
+    let it = points.into_iter();
     let mut min: Option<DateTime<Utc>> = None;
     let mut max: Option<DateTime<Utc>> = None;
-    for f in scope_flows {
-        let ts = f.flow.ts;
+    for (ts, _) in it.clone() {
         min = Some(min.map_or(ts, |m| m.min(ts)));
         max = Some(max.map_or(ts, |m| m.max(ts)));
     }
@@ -663,7 +738,7 @@ pub fn histogram_view(scope_flows: &[ExplorerFlow], n: usize) -> HistogramView {
             from: Some(from),
             to: Some(to),
             bucket_ms: bucket_ms(from, to, n),
-            buckets: bucketize(scope_flows.iter(), from, to, n),
+            buckets: bucketize_points(it, from, to, n),
         },
         _ => HistogramView {
             from: None,
@@ -1129,5 +1204,110 @@ mod tests {
         };
         assert!(!miss.passes(&f, None));
         assert!(miss.passes(&f, Some(SkipDim::Workflow)));
+    }
+
+    fn xf(
+        secs: i64,
+        wf: Option<&str>,
+        origin: Origin,
+        asn: Option<(u32, &str)>,
+        host: &str,
+        ok: bool,
+    ) -> ExplorerFlow {
+        flow(secs as u64, secs, host, origin, wf, asn, ok)
+    }
+
+    fn scope() -> Vec<ExplorerFlow> {
+        vec![
+            xf(
+                100,
+                Some("review"),
+                Origin::Provider("anthropic".into()),
+                Some((1, "One")),
+                "a.com",
+                true,
+            ),
+            xf(
+                200,
+                None,
+                Origin::Scm("github".into()),
+                None,
+                "b.com",
+                false,
+            ),
+            xf(
+                300,
+                Some("triage"),
+                Origin::System,
+                Some((2, "Two")),
+                "a.com",
+                true,
+            ),
+            xf(
+                400,
+                Some("review"),
+                Origin::Provider("anthropic".into()),
+                Some((1, "One")),
+                "c.com",
+                false,
+            ),
+        ]
+    }
+
+    #[test]
+    fn histogram_from_points_matches_histogram_view() {
+        let flows = scope();
+        let points: Vec<HistPoint> = flows
+            .iter()
+            .map(|f| (f.flow.ts, is_error_outcome(f.flow.outcome)))
+            .collect();
+        assert_eq!(
+            histogram_from_points(points.iter().copied(), EXPLORER_BUCKETS),
+            histogram_view(&flows, EXPLORER_BUCKETS)
+        );
+        assert_eq!(
+            histogram_from_points(std::iter::empty::<HistPoint>(), 8),
+            histogram_view(&[], 8)
+        );
+    }
+
+    #[test]
+    fn sankey_with_a_separate_universe_matches_the_whole_scope_view() {
+        let flows = scope();
+        let window = TimeRange {
+            from: Some(DateTime::from_timestamp(250, 0).unwrap()),
+            to: None,
+        };
+        let filters = ExplorerFilters {
+            origins: vec!["provider:anthropic".into()],
+            ..Default::default()
+        };
+        let windowed: Vec<ExplorerFlow> = flows
+            .iter()
+            .filter(|f| window.contains(f.flow.ts))
+            .cloned()
+            .collect();
+        let universe = SankeyUniverse::from_flows(&flows);
+        assert_eq!(
+            sankey_view_with_universe(&universe, &windowed, &window, &filters),
+            sankey_view(&flows, &window, &filters),
+        );
+    }
+
+    #[test]
+    fn universe_built_key_by_key_matches_from_flows() {
+        let flows = scope();
+        let mut u = SankeyUniverse::default();
+        for f in &flows {
+            u.add_workflow(f.workflow.as_deref());
+            u.add_origin_key(origin_key(&f.flow.ctx.origin));
+            u.add_org(f.asn.as_ref());
+        }
+        assert_eq!(u, SankeyUniverse::from_flows(&flows));
+        assert_eq!(
+            u.workflows.get(UNKNOWN_KEY).map(String::as_str),
+            Some(UNKNOWN_WORKFLOW_LABEL)
+        );
+        assert_eq!(u.orgs.get("as1").map(String::as_str), Some("One"));
     }
 }
