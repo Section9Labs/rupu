@@ -2846,7 +2846,8 @@ mod tests {
 
     fn asn_table() -> AsnTable {
         AsnTable::compact_from_tsv(std::io::Cursor::new(
-            "1.0.0.0\t1.0.0.255\t13335\tUS\tCLOUDFLARENET\n2.0.0.0\t2.0.0.255\t15169\tUS\tGOOGLE\n",
+            "1.0.0.0\t1.0.0.255\t13335\tUS\tCLOUDFLARENET\n2.0.0.0\t2.0.0.255\t15169\tUS\tGOOGLE\n\
+             3.0.0.0\t3.0.0.255\t64500\tUS\tORG-ALPHA\n4.0.0.0\t4.0.0.255\t64500\tUS\tORG-BETA\n",
         ))
         .unwrap()
     }
@@ -2895,6 +2896,40 @@ mod tests {
             0,
         );
         ledger(&dir, "run_c", &[], 5);
+        // One ASN under two descriptions (two table rows): the org node is
+        // labelled from its FIRST flow in file order. In both files the
+        // first flow's IP sorts after the second's, so a sorted walk of the
+        // peer IPs would pick the other label whichever file is listed first.
+        ledger(
+            &dir,
+            "run_d",
+            &[
+                at(
+                    with_peer(flow(FlowId::new(), None, "d.com"), Some("4.0.0.9"), true),
+                    250,
+                ),
+                at(
+                    with_peer(flow(FlowId::new(), None, "d.com"), Some("3.0.0.9"), true),
+                    260,
+                ),
+            ],
+            0,
+        );
+        ledger(
+            &dir,
+            "run_e",
+            &[
+                at(
+                    with_peer(flow(FlowId::new(), None, "e.com"), Some("4.0.0.7"), false),
+                    270,
+                ),
+                at(
+                    with_peer(flow(FlowId::new(), None, "e.com"), Some("3.0.0.7"), true),
+                    280,
+                ),
+            ],
+            0,
+        );
         let files = ledger_files_in_dir(&dir);
         let table = asn_table();
         let meta = RunMetaIndex::default();
@@ -2928,6 +2963,10 @@ mod tests {
                 hosts: vec!["a.com:443".into()],
                 ..Default::default()
             },
+            ExplorerFilters {
+                orgs: vec!["as64500".into()],
+                ..Default::default()
+            },
         ];
         for budget in [u64::MAX, 0] {
             let index = NetflowIndex::new(budget);
@@ -2950,6 +2989,18 @@ mod tests {
                 }
             }
         }
+        // The fixture exercises what it claims: AS64500 carries the label of
+        // its first flow (ORG-BETA), not of its lowest IP.
+        let got = indexed_explorer(
+            &NetflowIndex::new(u64::MAX),
+            &files,
+            &meta,
+            Some(&table),
+            &rupu_netflow::ledger::TimeRange::unbounded(),
+            &ExplorerFilters::default(),
+        );
+        let org = got.sankey.orgs.iter().find(|n| n.id == "as64500").unwrap();
+        assert_eq!(org.label, "ORG-BETA");
     }
 
     /// Spec §3.6 for the flows lists: identical JSON through the index

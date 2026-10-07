@@ -29,7 +29,7 @@ use rupu_netflow::ledger::{
 use rupu_netflow::FlowRecord;
 use rupu_runtime::file_cache::FileStamp;
 use serde::Serialize;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -89,8 +89,12 @@ pub struct LedgerSummary {
     pub points: Vec<HistPoint>,
     /// Distinct origin filter keys (`explorer::origin_key`).
     pub origins: BTreeSet<String>,
-    /// Distinct peer IPs; `None` = a flow with no peer IP.
-    pub peer_ips: BTreeSet<Option<IpAddr>>,
+    /// Distinct peer IPs in first-seen (file) order; `None` = a flow with no
+    /// peer IP. Order matters: one ASN can carry several org descriptions
+    /// (one per table range), and its node is labelled from its first flow.
+    pub peer_ips: Vec<Option<IpAddr>>,
+    /// Membership guard for `peer_ips`.
+    seen_peer_ips: HashSet<Option<IpAddr>>,
     pub capture: Vec<CaptureEntry>,
 }
 
@@ -108,7 +112,8 @@ impl LedgerSummary {
     pub(crate) fn heap_bytes(&self) -> usize {
         self.points.capacity() * std::mem::size_of::<HistPoint>()
             + self.origins.iter().map(|o| o.len() + 48).sum::<usize>()
-            + self.peer_ips.len() * 48
+            + self.peer_ips.capacity() * std::mem::size_of::<Option<IpAddr>>()
+            + self.seen_peer_ips.capacity() * 48
             + self.capture.len() * 96
     }
 
@@ -120,7 +125,9 @@ impl LedgerSummary {
                 self.max_ts = Some(self.max_ts.map_or(f.ts, |m| m.max(f.ts)));
                 self.points.push((f.ts, is_error_outcome(f.outcome)));
                 self.origins.insert(origin_key(&f.ctx.origin));
-                self.peer_ips.insert(f.peer_ip);
+                if self.seen_peer_ips.insert(f.peer_ip) {
+                    self.peer_ips.push(f.peer_ip);
+                }
             }
             FoldEvent::Patch { index, patch } => {
                 if let Some(o) = patch.outcome {
