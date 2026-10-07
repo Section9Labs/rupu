@@ -68,6 +68,12 @@ export interface ConfigLayerContextValue {
   onOverride: (key: string) => void;
   /** Optional line under a field's input (e.g. where a named account lives). */
   note?: (key: string) => ReactNode;
+  /** Lock switches are inert (a lock write is in flight, or the layer is broken). */
+  lockDisabled?: boolean;
+  /** Override buttons are inert (the layer is broken). */
+  overrideDisabled?: boolean;
+  /** Why they are inert — shown as the control's tooltip. */
+  disabledReason?: string;
 }
 
 export const ConfigLayerContext = createContext<ConfigLayerContextValue | null>(null);
@@ -132,10 +138,14 @@ function LockForProjects({
   dottedKey,
   locked,
   onToggleLock,
+  disabled,
+  title,
 }: {
   dottedKey: string;
   locked: boolean;
   onToggleLock: (key: string) => void;
+  disabled?: boolean;
+  title?: string;
 }) {
   const id = `${dottedKey}--lock`;
   return (
@@ -146,6 +156,8 @@ function LockForProjects({
         role="switch"
         aria-label={`Lock ${dottedKey} for projects`}
         checked={locked}
+        disabled={disabled}
+        title={title}
         onChange={() => onToggleLock(dottedKey)}
         className={toggleInputCls}
       />
@@ -266,7 +278,9 @@ export function ConfigField({
                   type="button"
                   aria-label={`Override ${dottedKey} for ${layer.name}`}
                   onClick={() => layer.onOverride(dottedKey)}
-                  className="rounded-md border border-border bg-panel px-2 py-0.5 text-note font-medium text-brand-700 hover:bg-surface-hover"
+                  disabled={layer.overrideDisabled}
+                  title={layer.overrideDisabled ? layer.disabledReason : undefined}
+                  className="rounded-md border border-border bg-panel px-2 py-0.5 text-note font-medium text-brand-700 hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-60"
                 >
                   Override for {layer.name}
                 </button>
@@ -318,8 +332,16 @@ export function ConfigField({
       {globalPinned ? null : readOnlyLocked ? (
         <LockedReadOnlyNote owner={lockOwner} />
       ) : layer !== null ? (
-        customerOwned && onToggleLock ? (
-          <LockForProjects dottedKey={dottedKey} locked={customerLocked} onToggleLock={onToggleLock} />
+        // A key in the customer's lock list always gets its switch (so it can be
+        // unlocked), whatever layer its value comes from.
+        (customerOwned || customerLocked) && onToggleLock ? (
+          <LockForProjects
+            dottedKey={dottedKey}
+            locked={customerLocked}
+            onToggleLock={onToggleLock}
+            disabled={layer.lockDisabled}
+            title={layer.lockDisabled ? layer.disabledReason : undefined}
+          />
         ) : null
       ) : onToggleLock ? (
         <LockToggle dottedKey={dottedKey} locked={locked} onToggleLock={onToggleLock} />

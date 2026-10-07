@@ -36,6 +36,7 @@ import {
 import {
   getPath,
   quoteSegment,
+  splitDottedKey,
   GeneralTab,
   ProvidersTab,
   AutoflowTab,
@@ -69,7 +70,10 @@ function layerSetsScmRules(view: ConfigView): boolean {
 
 export default function CustomerConfigTab({ slug, name, projectCount, layerPath, onChanged }: CustomerConfigTabProps) {
   const [view, setView] = useState<ConfigView | null>(null);
+  // `loadError` is a failed read with nothing to show yet; `reloadError` is a
+  // failed re-read while the last good view stays on screen.
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [reloadError, setReloadError] = useState<string | null>(null);
   const [pendingPatch, setPendingPatch] = useState<Record<string, unknown>>({});
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
@@ -82,27 +86,45 @@ export default function CustomerConfigTab({ slug, name, projectCount, layerPath,
   // A broken layer opens Raw — once, on the first load; after that the
   // operator's own tab choice stands.
   const settledTab = useRef(false);
+  // Lock writes are read-modify-write of one array, so they are serialised: the
+  // ref holds the latest known list (optimistic on submit, re-synced on every
+  // successful read) and `lockBusy` keeps a second write out of the PUT→reload
+  // window, where it would otherwise drop the first.
+  const lockRef = useRef<string[]>([]);
+  const lockBusyRef = useRef(false);
+  const [lockBusy, setLockBusy] = useState(false);
 
-  function reload(): Promise<void> {
+  /** Re-read the layer; resolves true on success. A failure keeps the last
+   *  good view (and every staged edit) and reports inline. */
+  function reload(): Promise<boolean> {
     return api
       .getCustomerConfig(slug)
       .then((data) => {
         setView(data);
         setLoadError(null);
+        setReloadError(null);
+        lockRef.current = data.customer_lock ?? [];
         if (!settledTab.current) {
           settledTab.current = true;
           if (data.layer_error) setTab('raw');
         }
+        return true;
       })
       .catch((e: unknown) => {
-        setLoadError(e instanceof Error ? e.message : 'Failed to load customer config');
+        const msg = e instanceof Error ? e.message : 'Failed to load customer config';
+        setLoadError(msg);
+        setReloadError(msg);
+        return false;
       });
   }
 
   useEffect(() => {
     setView(null);
     setPendingPatch({});
+    setLoadError(null);
+    setReloadError(null);
     settledTab.current = false;
+    lockRef.current = [];
     void reload();
     // `reload` closes over `slug`; re-fetch only when the customer changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -141,20 +163,35 @@ export default function CustomerConfigTab({ slug, name, projectCount, layerPath,
   }
 
   async function writeLockList(next: string[]) {
+    if (lockBusyRef.current) return;
+    lockBusyRef.current = true;
+    setLockBusy(true);
     setLockError(null);
     setReadOnly(false);
+    const prev = lockRef.current;
+    lockRef.current = next;
     try {
       await api.putCustomerConfig(slug, { patch: { 'policy.lock': next } });
-      await reload();
-      onChanged?.();
     } catch (e: unknown) {
+      lockRef.current = prev;
       if (e instanceof ApiError && e.status === 501) setReadOnly(true);
       else setLockError(e instanceof Error ? e.message : 'Failed to update the customer lock list');
+      lockBusyRef.current = false;
+      setLockBusy(false);
+      return;
+    }
+    try {
+      await reload();
+      onChanged?.();
+    } finally {
+      lockBusyRef.current = false;
+      setLockBusy(false);
     }
   }
 
   function handleToggleLock(key: string) {
-    void writeLockList(customerLock.includes(key) ? customerLock.filter((k) => k !== key) : [...customerLock, key]);
+    const cur = lockRef.current;
+    void writeLockList(cur.includes(key) ? cur.filter((k) => k !== key) : [...cur, key]);
   }
 
   async function handleSave() {
@@ -171,8 +208,9 @@ export default function CustomerConfigTab({ slug, name, projectCount, layerPath,
     setReadOnly(false);
     try {
       await api.putCustomerConfig(slug, { patch });
-      setPendingPatch({});
-      await reload();
+      // The edits are saved; keep them staged until the re-read confirms, so a
+      // transient read failure never makes them vanish from the screen.
+      if (await reload()) setPendingPatch({});
       onChanged?.();
     } catch (e: unknown) {
       if (e instanceof ApiError && e.status === 501) setReadOnly(true);
@@ -188,6 +226,8 @@ export default function CustomerConfigTab({ slug, name, projectCount, layerPath,
     setReadOnly(false);
     try {
       await api.putCustomerConfig(slug, { raw: draft });
+      // Staged values were read against the old file; they may be stale now.
+      setPendingPatch({});
       await reload();
       onChanged?.();
     } catch (e: unknown) {
@@ -199,10 +239,16 @@ export default function CustomerConfigTab({ slug, name, projectCount, layerPath,
     }
   }
 
+  const layerBroken = Boolean(view?.layer_error);
   const layer: ConfigLayerContextValue | null = useMemo(() => {
     if (!view) return null;
     return {
       name,
+      lockDisabled: lockBusy || layerBroken,
+      overrideDisabled: layerBroken,
+      disabledReason: layerBroken
+        ? "Fix the layer in the Raw tab first — it doesn't parse."
+        : 'Saving the lock list…',
       isStaged: (key) => Object.prototype.hasOwnProperty.call(pendingPatch, key),
       onOverride: handleOverride,
       note: (key) => {
@@ -223,12 +269,18 @@ export default function CustomerConfigTab({ slug, name, projectCount, layerPath,
     };
     // handleOverride only reads `view`, which is in the deps.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [view, pendingPatch, name]);
+  }, [view, pendingPatch, name, lockBusy, layerBroken]);
 
-  if (loadError) {
+  if (view === null && loadError) {
     return (
-      <div role="alert" className="rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
-        {loadError}
+      <div
+        role="alert"
+        className="flex items-center justify-between gap-3 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err"
+      >
+        <span>{loadError}</span>
+        <Button variant="secondary" size="sm" onClick={() => void reload()}>
+          Retry
+        </Button>
       </div>
     );
   }
@@ -269,6 +321,17 @@ export default function CustomerConfigTab({ slug, name, projectCount, layerPath,
         </div>
       </div>
 
+      {reloadError && (
+        <div
+          role="alert"
+          className="flex items-center justify-between gap-3 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err"
+        >
+          <span>Couldn&apos;t refresh this layer: {reloadError}</span>
+          <Button variant="secondary" size="sm" onClick={() => void reload()}>
+            Retry
+          </Button>
+        </div>
+      )}
       {view.layer_error && (
         <LayerErrorBanner message={view.layer_error} hint="Fix it in the Raw tab — the form can't edit a file that doesn't parse." />
       )}
@@ -325,8 +388,10 @@ export default function CustomerConfigTab({ slug, name, projectCount, layerPath,
               globalLock={Object.keys(prov).filter((k) => prov[k]?.locked && prov[k]?.locked_by === 'global')}
               onToggle={handleToggleLock}
               onAdd={(key) => {
-                if (!customerLock.includes(key)) void writeLockList([...customerLock, key]);
+                if (!lockRef.current.includes(key)) void writeLockList([...lockRef.current, key]);
               }}
+              disabled={lockBusy || layerBroken}
+              disabledReason={layerBroken ? "Fix the layer in the Raw tab first — it doesn't parse." : undefined}
             />
           )}
           {tab === 'raw' && (
@@ -363,15 +428,20 @@ function PolicyTab({
   globalLock,
   onToggle,
   onAdd,
+  disabled,
+  disabledReason,
 }: {
   name: string;
   customerLock: string[];
   globalLock: string[];
   onToggle: (key: string) => void;
   onAdd: (key: string) => void;
+  disabled: boolean;
+  disabledReason?: string;
 }): ReactNode {
   const [draft, setDraft] = useState('');
   const key = draft.trim();
+  const keyOk = key === '' || isCanonicalKey(key);
   return (
     <div className="space-y-4">
       <FieldGroup
@@ -388,6 +458,8 @@ function PolicyTab({
                 type="checkbox"
                 role="switch"
                 checked
+                disabled={disabled}
+                title={disabled ? disabledReason : undefined}
                 onChange={() => onToggle(k)}
                 className={toggleInputCls}
               />
@@ -402,7 +474,7 @@ function PolicyTab({
           className="flex items-center gap-2 pt-3"
           onSubmit={(e) => {
             e.preventDefault();
-            if (key) {
+            if (key && keyOk && !disabled) {
               onAdd(key);
               setDraft('');
             }
@@ -410,15 +482,25 @@ function PolicyTab({
         >
           <input
             aria-label="Key to lock"
+            aria-invalid={!keyOk}
+            aria-describedby={keyOk ? undefined : 'customer-lock-key-help'}
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             placeholder="providers.anthropic.default_model"
+            disabled={disabled}
             className={fieldCls}
           />
-          <Button type="submit" variant="secondary" disabled={key === ''}>
+          <Button type="submit" variant="secondary" disabled={key === '' || !keyOk || disabled}>
             Lock key
           </Button>
         </form>
+        {!keyOk && (
+          <p id="customer-lock-key-help" className="pt-1 text-note text-err">
+            Not a canonical key. Quote any segment that contains a dot, e.g.{' '}
+            <span className="font-mono">providers.&quot;azure.eastus&quot;.base_url</span>.
+          </p>
+        )}
+        {disabled && disabledReason && <p className="pt-1 text-note text-ink-mute">{disabledReason}</p>}
       </FieldGroup>
 
       {globalLock.length > 0 && (
@@ -436,4 +518,11 @@ function PolicyTab({
       )}
     </div>
   );
+}
+
+/** A lock key must be the exact string the field rows carry: every segment
+ *  non-empty and joined with `quoteSegment`, so a dotted segment is quoted. */
+function isCanonicalKey(key: string): boolean {
+  const segs = splitDottedKey(key);
+  return segs.every((s) => s !== '') && segs.map(quoteSegment).join('.') === key;
 }

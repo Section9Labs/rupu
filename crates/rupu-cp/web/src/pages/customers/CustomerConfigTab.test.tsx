@@ -6,6 +6,14 @@ import { MemoryRouter } from 'react-router-dom';
 import { api, ApiError, type ConfigView } from '../../lib/api';
 import CustomerConfigTab from './CustomerConfigTab';
 
+// The real editor lazy-loads CodeMirror (which jsdom can't measure); a plain
+// textarea keeps the Raw-tab tests deterministic.
+vi.mock('../../components/CodeEditor', () => ({
+  default: ({ value, onChange, ariaLabel }: { value: string; onChange: (v: string) => void; ariaLabel?: string }) => (
+    <textarea aria-label={ariaLabel} value={value} onChange={(e) => onChange(e.target.value)} />
+  ),
+}));
+
 const TINT = { light: '#111111', dark: '#eeeeee' };
 
 const AZURE_KEY = 'providers."azure.eastus".base_url';
@@ -214,5 +222,130 @@ describe('CustomerConfigTab', () => {
     fireEvent.change(input, { target: { value: 'debug' } });
     fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
     expect(await screen.findByText(/read-only deploy/)).toBeInTheDocument();
+  });
+
+  it('serialises lock writes: a second toggle in the PUT window is blocked, not dropped', async () => {
+    let release!: () => void;
+    put.mockImplementation(() => new Promise<void>((r) => (release = r)));
+    get.mockResolvedValue(
+      view({ customer_lock: ['default_provider'] }),
+    );
+    mount();
+    fireEvent.click(await screen.findByRole('button', { name: 'Providers' }));
+    const sw = await screen.findByRole('switch', {
+      name: 'Lock providers."azure.eastus".base_url for projects',
+    });
+    fireEvent.click(sw);
+    await waitFor(() => expect(put).toHaveBeenCalledTimes(1));
+    // Every lock control is inert while the write is in flight.
+    expect(screen.getByRole('switch', { name: 'Lock providers."azure.eastus".base_url for projects' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('switch', { name: 'Lock providers."azure.eastus".base_url for projects' }));
+    expect(put).toHaveBeenCalledTimes(1);
+    // The reload reports the first write; the next toggle builds on it.
+    get.mockResolvedValue(
+      view({ customer_lock: ['default_provider', AZURE_KEY] }),
+    );
+    release();
+    await waitFor(() =>
+      expect(screen.getByRole('switch', { name: 'Lock providers."azure.eastus".base_url for projects' })).not.toBeDisabled(),
+    );
+    put.mockResolvedValue(undefined);
+    fireEvent.click(screen.getByRole('button', { name: 'Policy' }));
+    fireEvent.click(await screen.findByLabelText('default_provider'));
+    await waitFor(() => expect(put).toHaveBeenCalledTimes(2));
+    expect(put).toHaveBeenLastCalledWith('acme', { patch: { 'policy.lock': [AZURE_KEY] } });
+  });
+
+  it('the Policy Add key control is disabled while a lock write is in flight', async () => {
+    put.mockImplementation(() => new Promise<void>(() => {}));
+    mount();
+    fireEvent.click(await screen.findByRole('switch', { name: 'Lock default_provider for projects' }));
+    await waitFor(() => expect(put).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole('button', { name: 'Policy' }));
+    expect(await screen.findByLabelText('Key to lock')).toBeDisabled();
+    expect(screen.getByLabelText('default_provider')).toBeDisabled();
+  });
+
+  it('a failed reload after a save keeps the view and the staged edit, with Retry', async () => {
+    mount();
+    const input = (await screen.findByLabelText('Log level')) as HTMLSelectElement;
+    fireEvent.change(input, { target: { value: 'debug' } });
+    get.mockRejectedValueOnce(new Error('network down'));
+    fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
+    expect(await screen.findByText(/Couldn't refresh this layer: network down/)).toBeInTheDocument();
+    expect(put).toHaveBeenCalledWith('acme', { patch: { log_level: 'debug' } });
+    // Still on the form, still showing the edit.
+    expect((screen.getByLabelText('Log level') as HTMLSelectElement).value).toBe('debug');
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    await waitFor(() => expect(screen.queryByText(/Couldn't refresh/)).not.toBeInTheDocument());
+    expect(screen.getByLabelText('Log level')).toBeInTheDocument();
+  });
+
+  it('a failed first load offers Retry', async () => {
+    get.mockRejectedValueOnce(new Error('boom'));
+    mount();
+    expect(await screen.findByText('boom')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    expect(await screen.findByLabelText('Default provider')).toBeInTheDocument();
+  });
+
+  it('a key in customer_lock gets an unlockable switch even when its value is inherited', async () => {
+    get.mockResolvedValue(view({ customer_lock: ['default_provider', 'default_model'] }));
+    put.mockResolvedValue(undefined);
+    mount();
+    await screen.findByLabelText('Default provider');
+    // default_model is global-sourced (read-only, "Override") but locked by the customer.
+    const sw = screen.getByRole('switch', { name: 'Lock default_model for projects' });
+    expect(sw).toBeChecked();
+    fireEvent.click(sw);
+    await waitFor(() =>
+      expect(put).toHaveBeenCalledWith('acme', { patch: { 'policy.lock': ['default_provider'] } }),
+    );
+  });
+
+  it('Add key rejects a non-canonical key inline and accepts the quoted form', async () => {
+    mount();
+    fireEvent.click(await screen.findByRole('button', { name: 'Policy' }));
+    const input = await screen.findByLabelText('Key to lock');
+    fireEvent.change(input, { target: { value: 'providers.azure.eastus.base_url.' } });
+    expect(screen.getByText(/Not a canonical key/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Lock key' })).toBeDisabled();
+    fireEvent.change(input, { target: { value: 'providers."azure.eastus".base_url' } });
+    expect(screen.queryByText(/Not a canonical key/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Lock key' }));
+    await waitFor(() =>
+      expect(put).toHaveBeenCalledWith('acme', {
+        patch: { 'policy.lock': ['default_provider', AZURE_KEY] },
+      }),
+    );
+  });
+
+  it('under layer_error, Override and the lock controls are disabled', async () => {
+    get.mockResolvedValue(view({ layer_error: 'bad toml', raw_customer: 'oops\n' }));
+    mount();
+    await screen.findByText(/this customer\)/);
+    fireEvent.click(screen.getByRole('button', { name: 'General' }));
+    const override = await screen.findByRole('button', { name: 'Override default_model for Acme Corp' });
+    expect(override).toBeDisabled();
+    expect(screen.getByRole('switch', { name: 'Lock default_provider for projects' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Policy' }));
+    expect(await screen.findByLabelText('Key to lock')).toBeDisabled();
+    expect(screen.getByText(/Fix the layer in the Raw tab first/)).toBeInTheDocument();
+    // Raw stays usable.
+    fireEvent.click(screen.getByRole('button', { name: 'Raw' }));
+    expect(screen.getByRole('button', { name: 'Edit' })).toBeEnabled();
+  });
+
+  it('a successful Raw save clears staged edits', async () => {
+    mount();
+    const input = (await screen.findByLabelText('Log level')) as HTMLSelectElement;
+    fireEvent.change(input, { target: { value: 'debug' } });
+    expect(screen.getByText('1 unsaved change')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Raw' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit' }));
+    fireEvent.change(await screen.findByLabelText('Edit raw TOML'), { target: { value: 'log_level = "warn"\n' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(put).toHaveBeenCalledWith('acme', { raw: 'log_level = "warn"\n' }));
+    await waitFor(() => expect(screen.queryByText('1 unsaved change')).not.toBeInTheDocument());
   });
 });
