@@ -105,8 +105,20 @@ describe('Projects — table rules', () => {
     const path = screen.getByTitle(long);
     expect(path).toHaveTextContent(long);
     expect(path.className).toMatch(/truncate/);
-    expect(path.className).toMatch(/max-w-\[14rem\]/);
+    expect(path.className).toMatch(/max-w-\[12rem\]/);
     expect(path.className).not.toMatch(/max-w-xs/);
+    // The name cell keeps a floor so long paths can't squeeze it to an ellipsis.
+    expect(screen.getByText('my-project').closest('td')?.className).toMatch(/min-w-\[9rem\]/);
+  });
+
+  it('a long repo remote truncates with the full remote on hover', async () => {
+    const remote = 'https://github.com/some-very-long-org-name/some-very-long-repository-name.git';
+    vi.spyOn(api, 'getProjects').mockResolvedValue([{ ...ROWS[0], repo_remote: remote }]);
+    renderPage();
+
+    const chip = await screen.findByTitle(remote);
+    expect(chip.className).toMatch(/max-w-\[13rem\]/);
+    expect(chip.querySelector('.truncate')).toHaveTextContent(remote);
   });
 
   it('the Runs column is a fit (nowrap) column', async () => {
