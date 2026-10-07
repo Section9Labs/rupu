@@ -34,7 +34,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use rupu_agentiflow::{
-    agentiflow_dir, pid_is_running, units_on_disk, AgentiflowDef, AgentiflowRecord, Budget,
+    agentiflow_dir, units_on_disk, AgentiflowDef, AgentiflowRecord, Budget,
     CoverageTarget, Goal, GoalTarget, OperatorMessage, OperatorQueue, Pool, RoundConfig, UnitOnDisk,
     UnitStatus,
 };
@@ -250,7 +250,9 @@ fn runner_alive(record: &AgentiflowRecord) -> Option<bool> {
     if record.status != "running" {
         return None;
     }
-    record.runner_pid.map(pid_is_running)
+    // A zombie (exited, unreaped — PID 1 in some containers reaps nothing)
+    // is as dead as a vanished pid: it will never drain anything.
+    record.runner_pid.map(rupu_agentiflow::coordinator_alive)
 }
 
 /// The run's codename: the stored one if the record ever carries it, else

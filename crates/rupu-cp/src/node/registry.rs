@@ -205,8 +205,13 @@ impl NodeRegistry {
     ) -> Arc<NodeConn> {
         let conn = Arc::new(NodeConn::new(tx, capabilities, rupu_version));
         let mut map = self.conns.lock().expect("NodeRegistry lock poisoned");
-        // The old Arc is dropped here, closing the sender side of the old channel.
-        map.insert(node_id.to_owned(), Arc::clone(&conn));
+        // The old connection is replaced: kick it so its handler stops its
+        // pumps and closes its socket now. Its handler holds its own `Arc`,
+        // so dropping ours alone would leave a half-open old tunnel serving
+        // (and mirroring) until its socket happened to fail.
+        if let Some(old) = map.insert(node_id.to_owned(), Arc::clone(&conn)) {
+            old.kick.notify_one();
+        }
         conn
     }
 
@@ -385,6 +390,27 @@ mod tests {
         drop(rx);
         let result = conn.send(Frame::Ping {}).await;
         assert!(matches!(result, Err(NodeError::Offline)));
+    }
+
+    /// A reconnect replaces the old connection AND kicks it, so the old
+    /// handler closes its socket rather than serving on half-open.
+    #[tokio::test]
+    async fn a_replaced_connection_is_kicked() {
+        let reg = NodeRegistry::new();
+        let (tx1, _rx1) = mpsc::channel::<Frame>(8);
+        let old = reg.register("n", tx1);
+        let (tx2, _rx2) = mpsc::channel::<Frame>(8);
+        let new = reg.register("n", tx2);
+        tokio::time::timeout(std::time::Duration::from_secs(1), old.kicked())
+            .await
+            .expect("the replaced connection must be kicked");
+        assert!(Arc::ptr_eq(&reg.get("n").unwrap(), &new));
+        // …and `disconnect` kicks the current one.
+        assert!(reg.disconnect("n"));
+        tokio::time::timeout(std::time::Duration::from_secs(1), new.kicked())
+            .await
+            .expect("disconnect must kick the live connection");
+        assert!(!reg.is_online("n"));
     }
 
     fn bare_conn() -> NodeConn {

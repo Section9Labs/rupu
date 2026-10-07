@@ -129,15 +129,13 @@ pub(crate) fn resolve_workflow_scoped(
     Some((global, dir, "global".to_string(), ScopeKind::Global, None))
 }
 
-/// `<dir>/<name>.yaml`, else `<dir>/<name>.yml`, whichever exists. The
-/// autoflow listing and the autoflow runtime both take `.yml` files, so a
-/// definition listed under either extension resolves for its toggle, detail
-/// and edit routes too; `.yaml` wins when both exist.
+/// `<dir>/<name>.yaml`, else `<dir>/<name>.yml`: the one rule every workflow
+/// lookup follows (`rupu_workspace::workflow_file` — `rupu workflow run`,
+/// the launch preview and the orchestrator catalog agree), so a definition
+/// listed under either extension resolves for its detail, edit, toggle and
+/// launch routes alike.
 pub(crate) fn definition_file(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
-    ["yaml", "yml"]
-        .iter()
-        .map(|ext| dir.join(format!("{name}.{ext}")))
-        .find(|p| p.exists())
+    rupu_workspace::config_paths::workflow_file(dir, name)
 }
 
 /// Path-only convenience wrapper over [`resolve_workflow_scoped`], for
@@ -288,7 +286,7 @@ pub(crate) fn scan_workflow_names(
     };
     let mut rows: Vec<WorkflowDto> = entries
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("yaml"))
+        .filter(|e| rupu_orchestrator::catalog::is_listed_workflow_file(&e.path()))
         .filter_map(|e| {
             let path = e.path();
             let name = path.file_stem().and_then(|s| s.to_str())?.to_string();

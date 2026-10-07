@@ -186,7 +186,8 @@ curl -N -H "Authorization: Bearer $CP_TOKEN" \
 ## Run control
 
 All take `host`. Locally they return the updated run detail plus `host_id`;
-remotely `{ok, host_id}`.
+remotely `{ok, host_id}`. Their JSON bodies are optional: an empty body means
+none, and a body that isn't the expected JSON is a 400.
 
 | Method | Path | Purpose | Notes |
 |--------|------|---------|-------|

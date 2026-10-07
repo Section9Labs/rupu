@@ -775,7 +775,20 @@ async fn reject_accepts_an_empty_body() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    m.assert();
+
+    // A body that is there but isn't the expected JSON is a 400, never a
+    // silent reject-with-no-reason.
+    for bad in ["{\"reason\": 5}", "not json"] {
+        let resp = client
+            .post(format!("http://{addr}/api/runs/run_gate/reject?host={host_id}"))
+            .header("Content-Type", "application/json")
+            .body(bad)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad}");
+    }
+    m.assert_hits(1);
 
     // Local: a bodyless reject reaches the store (404 for an unknown run),
     // not a body-parse refusal.

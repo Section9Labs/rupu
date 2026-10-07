@@ -312,15 +312,28 @@ impl HostRegistry {
             ));
         }
 
-        let host = self
-            .store
-            .load(host_id)?
-            .ok_or_else(|| HostConnectorError::NotFound(format!("host {host_id} not found")))?;
-        self.store.delete(host_id)?;
+        // An unreadable record (corrupt, or from a newer schema) is still
+        // removable — `list` skips it, so this is the only way to get rid
+        // of it; there is just no transport to disconnect.
+        let host = match self.store.load(host_id) {
+            Ok(Some(h)) => Some(h),
+            Ok(None) => {
+                return Err(HostConnectorError::NotFound(format!(
+                    "host {host_id} not found"
+                )))
+            }
+            Err(e) => {
+                tracing::warn!(host_id, error = %e, "host_registry: removing an unreadable host record");
+                None
+            }
+        };
+        self.store
+            .delete(host_id)
+            .map_err(|e| HostConnectorError::Internal(e.to_string()))?;
         // A live tunnel would otherwise keep serving (and mirroring) for a
         // host that no longer exists.
-        if let (HostTransport::Tunnel { node_id }, Some(reg)) =
-            (&host.transport, &self.node_registry)
+        if let (Some(HostTransport::Tunnel { node_id }), Some(reg)) =
+            (host.as_ref().map(|h| &h.transport), &self.node_registry)
         {
             reg.disconnect(node_id);
         }

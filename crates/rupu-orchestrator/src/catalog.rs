@@ -60,18 +60,39 @@ pub fn list_workflow_summaries(global: &Path, project: Option<&Path>) -> Vec<Wor
 /// is the `.rupu` directory) shadows `<global>/workflows/<id>.yaml`,
 /// even when the project file does not parse. Returns `None` when the
 /// workflow is not found, does not parse, or `id` is not a plain file
-/// stem (empty, or containing a path separator or `..`). Only `.yaml`
-/// is considered, matching the lister.
+/// stem (empty, or containing a path separator or `..`). `<id>.yaml` wins
+/// over `<id>.yml` in one directory ([`WORKFLOW_EXTENSIONS`]), matching the
+/// lister.
 pub fn load_workflow(global: &Path, project: Option<&Path>, id: &str) -> Option<Workflow> {
     if id.is_empty() || id.contains(['/', '\\']) || id.contains("..") {
         return None;
     }
-    let file = format!("{id}.yaml");
     let path = project
-        .map(|p| p.join("workflows").join(&file))
-        .filter(|p| p.is_file())
-        .or_else(|| Some(global.join("workflows").join(&file)).filter(|p| p.is_file()))?;
+        .and_then(|p| workflow_file(&p.join("workflows"), id))
+        .or_else(|| workflow_file(&global.join("workflows"), id))?;
     Workflow::parse_file(&path).ok()
+}
+
+/// Workflow file extensions, in preference order (`.yaml` wins over `.yml`
+/// for the same stem). Held in lockstep with
+/// `rupu_workspace::config_paths::WORKFLOW_EXTENSIONS`.
+pub const WORKFLOW_EXTENSIONS: [&str; 2] = ["yaml", "yml"];
+
+fn workflow_file(dir: &Path, id: &str) -> Option<std::path::PathBuf> {
+    WORKFLOW_EXTENSIONS
+        .iter()
+        .map(|ext| dir.join(format!("{id}.{ext}")))
+        .find(|p| p.is_file())
+}
+
+/// Whether `path` is a workflow definition file that should be listed: a
+/// `.yaml`, or a `.yml` with no `.yaml` sibling of the same stem (which wins).
+pub fn is_listed_workflow_file(path: &Path) -> bool {
+    match path.extension().and_then(|s| s.to_str()) {
+        Some("yaml") => path.is_file(),
+        Some("yml") => path.is_file() && !path.with_extension("yaml").is_file(),
+        _ => false,
+    }
 }
 
 fn scan_dir(dir: &Path, scope: &str, into: &mut BTreeMap<String, WorkflowSummary>) {
@@ -85,7 +106,7 @@ fn scan_dir(dir: &Path, scope: &str, into: &mut BTreeMap<String, WorkflowSummary
     let mut paths: Vec<_> = entries
         .filter_map(Result::ok)
         .map(|e| e.path())
-        .filter(|p| p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("yaml"))
+        .filter(|p| is_listed_workflow_file(p))
         .collect();
     paths.sort();
     for path in paths {
@@ -146,6 +167,25 @@ steps:
     const ONE_STEP: &str = "name: foo\nsteps:\n  - id: only\n    agent: writer\n    prompt: hi\n";
 
     #[test]
+    fn yml_files_list_and_load_but_a_yaml_sibling_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("global");
+        write(&global, "workflows/only-yml.yml", ONE_STEP);
+        write(&global, "workflows/both.yaml", TWO_STEPS);
+        write(&global, "workflows/both.yml", ONE_STEP);
+        let ids: Vec<String> = list_workflow_summaries(&global, None)
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(ids, vec!["both".to_string(), "only-yml".to_string()]);
+        assert_eq!(
+            load_workflow(&global, None, "both").unwrap().name,
+            "two-step"
+        );
+        assert_eq!(load_workflow(&global, None, "only-yml").unwrap().name, "foo");
+    }
+
+    #[test]
     fn lists_valid_and_broken_files_without_aborting() {
         let tmp = tempfile::tempdir().unwrap();
         let global = tmp.path().join("global");
@@ -155,14 +195,14 @@ steps:
             "workflows/broken.yaml",
             "name: [unclosed\nsteps: {",
         );
-        write(&global, "workflows/ignored.yml", TWO_STEPS);
+        write(&global, "workflows/also.yml", TWO_STEPS);
         write(&global, "workflows/notes.txt", "not a workflow");
 
         let got = list_workflow_summaries(&global, None);
         assert_eq!(
             got.len(),
-            2,
-            "both .yaml files listed, others ignored: {got:?}"
+            3,
+            "the .yaml and .yml files listed, others ignored: {got:?}"
         );
 
         let broken = got

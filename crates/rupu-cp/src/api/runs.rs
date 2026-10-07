@@ -186,13 +186,13 @@ async fn approve_run(
     State(s): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<RunControlQuery>,
-    body: Option<Json<ApproveBody>>,
+    OptionalJson(body): OptionalJson<ApproveBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     validate_id(&id)?;
     let host = q.host.as_deref().unwrap_or("local");
     if host != "local" {
         let conn = resolve_host(&s, host)?;
-        let mode = body.and_then(|b| b.0.mode).unwrap_or_default();
+        let mode = body.and_then(|b| b.mode).unwrap_or_default();
         conn.approve_run(&id, &mode)
             .await
             .map_err(host_control_error)?;
@@ -200,7 +200,7 @@ async fn approve_run(
     }
     // Local path: unchanged for `gate: None` on a <=1-gate run (see doc).
     let now = chrono::Utc::now();
-    let mode = body.and_then(|b| b.0.mode);
+    let mode = body.and_then(|b| b.mode);
     // On the blocking pool: the gate methods take the run lock.
     let (rid, gate) = (id.clone(), q.gate.clone());
     s.run_store
@@ -244,12 +244,12 @@ async fn reject_run(
     State(s): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<RunControlQuery>,
-    body: Option<Json<RejectBody>>,
+    OptionalJson(body): OptionalJson<RejectBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     validate_id(&id)?;
     // Optional, like approve's and cancel's: a bodyless POST rejects with no
     // reason.
-    let reason = body.and_then(|b| b.0.reason);
+    let reason = body.and_then(|b| b.reason);
     let host = q.host.as_deref().unwrap_or("local");
     if host != "local" {
         let conn = resolve_host(&s, host)?;
@@ -272,6 +272,34 @@ async fn reject_run(
     let mut resp = run_response(&s, &id).await?;
     resp.0["host_id"] = serde_json::json!("local");
     Ok(resp)
+}
+
+/// An optional JSON request body (approve, reject, cancel): an absent or
+/// blank body is `None`; anything else must be the expected JSON, or the
+/// request is a 400 — never silently treated as "no body" (axum's
+/// `Option<Json<_>>` drops a malformed body on the floor, so a reject with a
+/// mistyped `reason` would have rejected with none).
+pub(crate) struct OptionalJson<T>(pub Option<T>);
+
+#[axum::async_trait]
+impl<S, T> axum::extract::FromRequest<S> for OptionalJson<T>
+where
+    S: Send + Sync,
+    T: serde::de::DeserializeOwned,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, ApiError> {
+        let bytes = axum::body::Bytes::from_request(req, state)
+            .await
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        if bytes.iter().all(u8::is_ascii_whitespace) {
+            return Ok(Self(None));
+        }
+        serde_json::from_slice(&bytes)
+            .map(|v| Self(Some(v)))
+            .map_err(|e| ApiError::bad_request(format!("invalid JSON body: {e}")))
+    }
 }
 
 /// Optional body for `POST /api/runs/:id/cancel`.
@@ -305,7 +333,7 @@ async fn cancel_run(
     State(s): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<RunControlQuery>,
-    body: Option<Json<CancelBody>>,
+    OptionalJson(body): OptionalJson<CancelBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     validate_id(&id)?;
     let host = q.host.as_deref().unwrap_or("local");
@@ -317,7 +345,7 @@ async fn cancel_run(
     // Local path: unchanged.
     let now = chrono::Utc::now();
     let reason = body
-        .and_then(|b| b.0.reason)
+        .and_then(|b| b.reason)
         .unwrap_or_else(|| "Cancelled from control plane".to_string());
     // On the blocking pool: `cancel` waits (bounded) for the run lock.
     let _outcome: CancelOutcome = {
@@ -514,14 +542,19 @@ pub(crate) fn host_list_error(e: HostConnectorError) -> ApiError {
 /// such run/session", which is the caller's answer, not a broken host.
 ///
 /// - `NotFound` → 404
-/// - `Unsupported` / `Invalid` → 501 (the host can't serve this)
+/// - `Unsupported` / `Invalid`, a non-JSON reply (an older remote CP's SPA
+///   fallback answering a route it lacks) or the remote's own 501 → 501
+///   (the host can't serve this)
 /// - `Internal` → 500 (this side's own fault)
-/// - everything else (unreachable, unauthorized, a remote error status, a
-///   non-JSON reply) → 502, naming the host
+/// - everything else (unreachable, unauthorized, another remote error
+///   status) → 502, naming the host
 pub(crate) fn host_read_error(host_id: &str, e: HostConnectorError) -> ApiError {
     match e {
         HostConnectorError::NotFound(m) => ApiError::not_found(m),
-        HostConnectorError::Unsupported(_) | HostConnectorError::Invalid(_) => {
+        HostConnectorError::Unsupported(_)
+        | HostConnectorError::Invalid(_)
+        | HostConnectorError::NotJson(_)
+        | HostConnectorError::Remote(501, _) => {
             ApiError::not_available(format!("host {host_id}: {e}"))
         }
         HostConnectorError::Internal(_) => ApiError::internal(e.to_string()),
@@ -536,7 +569,7 @@ pub(crate) fn host_read_error(host_id: &str, e: HostConnectorError) -> ApiError 
 /// - `Invalid` → 409 — the host refused the transition (not awaiting
 ///   approval, already terminal, …), the same answer the local branch gives
 /// - a remote CP's own 409 (`Remote(409, _)`) → 409, preserved
-/// - `Unsupported` → 501
+/// - `Unsupported`, or a remote CP's own 501 (a read-only peer) → 501
 /// - `Internal` → 500
 /// - everything else → 502
 pub(crate) fn host_control_error(e: HostConnectorError) -> ApiError {
@@ -545,7 +578,9 @@ pub(crate) fn host_control_error(e: HostConnectorError) -> ApiError {
         HostConnectorError::Invalid(m) | HostConnectorError::Remote(409, m) => {
             ApiError::conflict(m)
         }
-        HostConnectorError::Unsupported(m) => ApiError::not_available(m),
+        HostConnectorError::Unsupported(m) | HostConnectorError::Remote(501, m) => {
+            ApiError::not_available(m)
+        }
         HostConnectorError::Internal(_) => ApiError::internal(e.to_string()),
         other => ApiError::bad_gateway(other.to_string()),
     }
@@ -2389,7 +2424,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: None,
             }),
-            None,
+            OptionalJson(None),
         )
         .await
         .expect("approve should succeed");
@@ -2430,7 +2465,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: None,
             }),
-            Some(Json(body)),
+            OptionalJson(Some(body)),
         )
         .await
         .expect("reject should succeed");
@@ -2459,7 +2494,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: None,
             }),
-            None,
+            OptionalJson(None),
         )
         .await
         .expect_err("approve on completed run should fail");
@@ -2477,7 +2512,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: None,
             }),
-            Some(Json(RejectBody { reason: None })),
+            OptionalJson(Some(RejectBody { reason: None })),
         )
         .await
         .expect_err("reject on missing run should 404");
@@ -2502,7 +2537,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: None,
             }),
-            Some(Json(body)),
+            OptionalJson(Some(body)),
         )
         .await
         .expect("approve should succeed");
@@ -2528,7 +2563,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: None,
             }),
-            None,
+            OptionalJson(None),
         )
         .await
         .expect("bodyless approve should succeed");
@@ -2583,7 +2618,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: Some("gate_b".into()),
             }),
-            None,
+            OptionalJson(None),
         )
         .await
         .expect("approving a named gate on a multi-gate run should succeed");
@@ -2624,7 +2659,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: None,
             }),
-            None,
+            OptionalJson(None),
         )
         .await
         .expect_err("omitting ?gate= on a multi-gate run should be a conflict, not a guess");
@@ -2658,7 +2693,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: Some("does_not_exist".into()),
             }),
-            None,
+            OptionalJson(None),
         )
         .await
         .expect_err("naming a gate that isn't parked should be a clean error, not a 500");
@@ -2686,7 +2721,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: Some("gate_a".into()),
             }),
-            Some(Json(RejectBody {
+            OptionalJson(Some(RejectBody {
                 reason: Some("gate_a looks bad".into()),
             })),
         )
@@ -2722,7 +2757,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: Some("gate_a".into()),
             }),
-            Some(Json(RejectBody { reason: None })),
+            OptionalJson(Some(RejectBody { reason: None })),
         )
         .await
         .expect("rejecting gate_a should succeed");
@@ -2739,7 +2774,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: Some("gate_b".into()),
             }),
-            Some(Json(RejectBody {
+            OptionalJson(Some(RejectBody {
                 reason: Some("gate_b too".into()),
             })),
         )
@@ -2769,7 +2804,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: Some("gate".into()),
             }),
-            None,
+            OptionalJson(None),
         )
         .await
         .expect("naming the sole parked gate should behave like omitting it");
@@ -2800,7 +2835,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: None,
             }),
-            None,
+            OptionalJson(None),
         )
         .await
         .expect("cancel should succeed");
@@ -2835,7 +2870,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: None,
             }),
-            Some(Json(body)),
+            OptionalJson(Some(body)),
         )
         .await
         .expect_err("cancel on completed run should fail");
@@ -2853,7 +2888,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: None,
             }),
-            None,
+            OptionalJson(None),
         )
         .await
         .expect_err("cancel on missing run should 404");
@@ -4944,6 +4979,21 @@ pub(crate) mod tests {
         assert_eq!(err.0, axum::http::StatusCode::BAD_GATEWAY);
         let err = map_host_mutate_err(HostConnectorError::Internal("disk".into()));
         assert_eq!(err.0, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        // A read-only peer's own 501 stays "can't do it here".
+        let err = map_host_mutate_err(HostConnectorError::Remote(501, "read-only".into()));
+        assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
+    }
+
+    /// An older remote CP answers a route it lacks with its SPA's HTML: that
+    /// host can't serve the read (501, "unavailable"), it isn't down (502).
+    #[test]
+    fn host_read_error_treats_a_non_json_reply_as_unsupported() {
+        let err = host_read_error("h", HostConnectorError::NotJson("<html>".into()));
+        assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
+        let err = host_read_error("h", HostConnectorError::Unreachable("down".into()));
+        assert_eq!(err.0, axum::http::StatusCode::BAD_GATEWAY);
+        let err = host_read_error("h", HostConnectorError::NotFound("run x".into()));
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
     }
 
     // ── Date-range filtering (perf & interaction arc, Plan 5 Task 5) ─────────
