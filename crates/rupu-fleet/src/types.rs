@@ -84,12 +84,42 @@ pub struct BoardPost {
 /// A lead→fleet standing instruction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Directive {
+    /// Stable identity, minted by `Board::put_directive` when left empty; what
+    /// `Board::retract_directive` names. Empty on a directive written before
+    /// directives had ids, which therefore can never be retracted.
+    #[serde(default)]
+    pub id: String,
     pub author: String,
     pub ts: String,
     pub body: String,
     /// Participant id or role this directive targets; `None` = all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub addressed_to: Option<String>,
+}
+
+/// One line of the board's append-only `directives.jsonl`: a directive put, or
+/// the retraction of an earlier one. The live set is the file folded in order
+/// (`Board::read_directives`); nothing is ever rewritten.
+///
+/// Untagged, with `Retract` listed first so each shape is unambiguous and a
+/// legacy line still reads:
+///
+/// - `{"retract": "<id>"}` is a retraction. A put line has no `retract` key, so
+///   it cannot match here;
+/// - anything else is tried as a bare [`Directive`]: its `author`, `ts` and
+///   `body` are required, so a `{"retract": ..}` line (or any half-formed line)
+///   is never mistaken for a put, while a directive written before ids existed
+///   (no `id`, no wrapper) parses as a put with an empty id.
+///
+/// A put therefore serializes as the bare directive, exactly the shape older
+/// builds wrote and read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DirectiveEvent {
+    /// Lift the directive with this id from the live set.
+    Retract { retract: String },
+    /// Add (or, for a live id, replace) a directive.
+    Put(Directive),
 }
 
 /// A directed message delivered to a participant's inbox.

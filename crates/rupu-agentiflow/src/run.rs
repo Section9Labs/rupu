@@ -1988,6 +1988,7 @@ mod tests {
         let seeded = rupu_fleet::Board::new(run_dir(&fx, id));
         seeded
             .put_directive(&rupu_fleet::Directive {
+                id: String::new(),
                 author: "operator".into(),
                 ts: "2026-10-05T11:59:00Z".into(),
                 body: "never scan outside 10.0.0.0/24".into(),

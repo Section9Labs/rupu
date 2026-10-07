@@ -1,7 +1,8 @@
 use crate::error::FleetError;
-use crate::types::{BoardPost, ClaimGuard, ClaimOutcome, ClaimRecord, Directive};
+use crate::types::{BoardPost, ClaimGuard, ClaimOutcome, ClaimRecord, Directive, DirectiveEvent};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -196,15 +197,97 @@ impl Board {
         self.root.join("board").join("directives.jsonl")
     }
 
-    /// Append one lead->fleet directive to `directives.jsonl`.
-    pub fn put_directive(&self, directive: &Directive) -> Result<(), FleetError> {
-        append_jsonl(&self.directives_path(), directive)
+    /// Append one lead->fleet directive to `directives.jsonl` and return its id.
+    ///
+    /// A directive with an empty `id` is given a fresh ULID; one that already
+    /// has an id keeps it (writing a live id again replaces that directive).
+    /// The id is what [`Board::retract_directive`] takes.
+    pub fn put_directive(&self, directive: &Directive) -> Result<String, FleetError> {
+        let mut directive = directive.clone();
+        if !is_keyed(&directive.id) {
+            directive.id = ulid::Ulid::new().to_string();
+        }
+        let id = directive.id.clone();
+        append_jsonl(&self.directives_path(), &DirectiveEvent::Put(directive))?;
+        Ok(id)
     }
 
-    /// All directives, oldest first. An absent log yields an empty list.
-    pub fn read_directives(&self) -> Result<Vec<Directive>, FleetError> {
-        read_jsonl(&self.directives_path())
+    /// Retract the directive `id`: append a retraction to `directives.jsonl`.
+    ///
+    /// The log is append-only, so this lifts the directive from the live set
+    /// (what [`Board::read_directives`] returns) without erasing it. Retracting
+    /// an id nothing live carries is a harmless no-op on read; a directive
+    /// written before ids existed has no id and cannot be retracted.
+    pub fn retract_directive(&self, id: &str) -> Result<(), FleetError> {
+        append_jsonl(
+            &self.directives_path(),
+            &DirectiveEvent::Retract {
+                retract: id.to_string(),
+            },
+        )
     }
+
+    /// The LIVE directives, oldest first: the directive log folded in file
+    /// order, a put adding (or, for an id already live, replacing in place) a
+    /// directive and a retraction removing it. An absent log yields an empty
+    /// list.
+    ///
+    /// Unlike the other logs this one tolerates a corrupt line: it is skipped
+    /// and logged, so one bad line cannot silence every standing directive (nor
+    /// can it be mistaken for one). Directives with no id (legacy lines) are all
+    /// live, none retractable.
+    pub fn read_directives(&self) -> Result<Vec<Directive>, FleetError> {
+        let path = self.directives_path();
+        let text = read_log_text(&path)?;
+        // Slot per put, in file order; a retraction empties its slot, so the
+        // survivors stay oldest-first without a re-sort.
+        let mut slots: Vec<Option<Directive>> = Vec::new();
+        let mut slot_of: HashMap<String, usize> = HashMap::new();
+        let mut legacy = 0usize;
+        for (n, line) in text.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<DirectiveEvent>(line) {
+                Ok(DirectiveEvent::Put(d)) if !is_keyed(&d.id) => {
+                    legacy += 1;
+                    slots.push(Some(d));
+                }
+                Ok(DirectiveEvent::Put(d)) => match slot_of.get(&d.id) {
+                    Some(&slot) => slots[slot] = Some(d),
+                    None => {
+                        slot_of.insert(d.id.clone(), slots.len());
+                        slots.push(Some(d));
+                    }
+                },
+                Ok(DirectiveEvent::Retract { retract }) => {
+                    if let Some(slot) = slot_of.remove(&retract) {
+                        slots[slot] = None;
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    path = %path.display(),
+                    line = n + 1,
+                    error = %e,
+                    "skipping an unreadable directive log line"
+                ),
+            }
+        }
+        if legacy > 0 {
+            tracing::debug!(
+                path = %path.display(),
+                legacy,
+                "directives without an id (written before ids existed) cannot be retracted"
+            );
+        }
+        Ok(slots.into_iter().flatten().collect())
+    }
+}
+
+/// Whether `id` names a directive. A blank id is "no id": minted over on a put,
+/// never matched by a retraction.
+fn is_keyed(id: &str) -> bool {
+    !id.trim().is_empty()
 }
 
 fn is_expired(rec: &ClaimRecord) -> bool {
@@ -273,20 +356,23 @@ fn append_jsonl<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), Fleet
     })
 }
 
+/// The text of an append-only log, lossily decoded. A missing file is an empty
+/// log.
+fn read_log_text(path: &Path) -> Result<String, FleetError> {
+    match std::fs::read(path) {
+        Ok(b) => Ok(String::from_utf8_lossy(&b).into_owned()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(FleetError::Io {
+            action: format!("read {}", path.display()),
+            source: e,
+        }),
+    }
+}
+
 /// Read every JSON line of `path`, oldest first. A missing file is an empty
 /// log; blank lines are skipped; a malformed line is a `Parse` error.
 fn read_jsonl<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>, FleetError> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => {
-            return Err(FleetError::Io {
-                action: format!("read {}", path.display()),
-                source: e,
-            })
-        }
-    };
-    let text = String::from_utf8_lossy(&bytes);
+    let text = read_log_text(path)?;
     let mut out = Vec::new();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         out.push(serde_json::from_str(line).map_err(|e| FleetError::Parse {
@@ -600,6 +686,35 @@ mod tests {
         assert_eq!(posts[1].addressed_to.as_deref(), Some("recon"));
     }
 
+    fn directive(body: &str) -> Directive {
+        Directive {
+            id: String::new(),
+            author: "lead".into(),
+            ts: "2026-10-01T00:00:00Z".into(),
+            body: body.into(),
+            addressed_to: None,
+        }
+    }
+
+    /// The raw lines of `board/directives.jsonl` under `root`.
+    fn raw_lines(root: &Path) -> Vec<String> {
+        std::fs::read_to_string(root.join("board").join("directives.jsonl"))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Write `lines` as the directive log verbatim (a hand-built or legacy log).
+    fn write_raw(root: &Path, lines: &[&str]) {
+        std::fs::create_dir_all(root.join("board")).unwrap();
+        std::fs::write(
+            root.join("board").join("directives.jsonl"),
+            lines.join("\n") + "\n",
+        )
+        .unwrap();
+    }
+
     #[test]
     fn directives_round_trip() {
         let tmp = tempfile::tempdir().unwrap();
@@ -608,6 +723,7 @@ mod tests {
 
         board
             .put_directive(&Directive {
+                id: String::new(),
                 author: "lead".into(),
                 ts: "2026-10-01T00:00:00Z".into(),
                 body: "budget almost spent; converge and bank".into(),
@@ -617,5 +733,202 @@ mod tests {
         let ds = board.read_directives().unwrap();
         assert_eq!(ds.len(), 1);
         assert_eq!(ds[0].body, "budget almost spent; converge and bank");
+    }
+
+    #[test]
+    fn put_directive_mints_an_id_and_returns_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = Board::new(tmp.path());
+        let a = board.put_directive(&directive("one")).unwrap();
+        let b = board.put_directive(&directive("two")).unwrap();
+        assert!(!a.is_empty() && !b.is_empty());
+        assert_ne!(a, b, "every directive gets its own id");
+
+        let ds = board.read_directives().unwrap();
+        assert_eq!(ds[0].id, a, "the returned id is the stored id");
+        assert_eq!(ds[1].id, b);
+
+        // A caller-supplied id is kept, not replaced.
+        let mut chosen = directive("three");
+        chosen.id = "dir-chosen".into();
+        assert_eq!(board.put_directive(&chosen).unwrap(), "dir-chosen");
+        assert_eq!(board.read_directives().unwrap()[2].id, "dir-chosen");
+    }
+
+    #[test]
+    fn retracting_a_directive_removes_it_from_the_live_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = Board::new(tmp.path());
+        let id = board.put_directive(&directive("focus auth")).unwrap();
+        board
+            .put_directive(&directive("expand to staging"))
+            .unwrap();
+        assert_eq!(board.read_directives().unwrap().len(), 2);
+        let before = raw_lines(tmp.path());
+
+        board.retract_directive(&id).unwrap();
+
+        let live = board.read_directives().unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].body, "expand to staging");
+
+        // Append-only: the two directive lines are byte-for-byte untouched and
+        // the retraction is one more line after them.
+        let after = raw_lines(tmp.path());
+        assert_eq!(after.len(), 3, "2 directives + 1 retract: {after:?}");
+        assert_eq!(after[..2], before[..]);
+        let retract: serde_json::Value = serde_json::from_str(&after[2]).unwrap();
+        assert_eq!(retract, serde_json::json!({ "retract": id }));
+    }
+
+    #[test]
+    fn a_retraction_is_seen_by_a_fresh_handle_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = Board::new(tmp.path());
+        let id = board.put_directive(&directive("only")).unwrap();
+        board.retract_directive(&id).unwrap();
+        board.retract_directive(&id).unwrap();
+        assert!(Board::new(tmp.path()).read_directives().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_retraction_of_an_unknown_id_changes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = Board::new(tmp.path());
+        let id = board.put_directive(&directive("stays")).unwrap();
+        board.retract_directive("no-such-id").unwrap();
+        board.retract_directive("").unwrap();
+        let live = board.read_directives().unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].id, id);
+    }
+
+    #[test]
+    fn live_directives_stay_oldest_first_across_retractions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = Board::new(tmp.path());
+        let a = board.put_directive(&directive("a")).unwrap();
+        board.put_directive(&directive("b")).unwrap();
+        board.put_directive(&directive("c")).unwrap();
+        board.retract_directive(&a).unwrap();
+        board.put_directive(&directive("d")).unwrap();
+        let bodies: Vec<_> = board
+            .read_directives()
+            .unwrap()
+            .into_iter()
+            .map(|d| d.body)
+            .collect();
+        assert_eq!(bodies, ["b", "c", "d"]);
+    }
+
+    #[test]
+    fn a_put_after_a_retract_of_the_same_id_is_live_again() {
+        // The log is folded in file order: the later event wins.
+        let tmp = tempfile::tempdir().unwrap();
+        let board = Board::new(tmp.path());
+        let mut d = directive("first wording");
+        d.id = "dir-1".into();
+        board.put_directive(&d).unwrap();
+        board.retract_directive("dir-1").unwrap();
+        assert!(board.read_directives().unwrap().is_empty());
+        d.body = "second wording".into();
+        board.put_directive(&d).unwrap();
+        let live = board.read_directives().unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].body, "second wording");
+    }
+
+    #[test]
+    fn a_re_put_of_a_live_id_replaces_it_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let board = Board::new(tmp.path());
+        let mut a = directive("a");
+        a.id = "dir-a".into();
+        board.put_directive(&a).unwrap();
+        board.put_directive(&directive("b")).unwrap();
+        a.body = "a, reworded".into();
+        board.put_directive(&a).unwrap();
+        let bodies: Vec<_> = board
+            .read_directives()
+            .unwrap()
+            .into_iter()
+            .map(|d| d.body)
+            .collect();
+        assert_eq!(bodies, ["a, reworded", "b"]);
+    }
+
+    #[test]
+    fn a_legacy_directive_line_without_an_id_reads_as_a_put() {
+        // Written before directives had ids: no `id`, no event wrapper.
+        let tmp = tempfile::tempdir().unwrap();
+        write_raw(
+            tmp.path(),
+            &[
+                r#"{"author":"operator","ts":"2026-09-01T00:00:00Z","body":"old one"}"#,
+                r#"{"author":"lead","ts":"2026-09-01T00:01:00Z","body":"old two","addressed_to":"scanner"}"#,
+            ],
+        );
+        let board = Board::new(tmp.path());
+        let ds = board.read_directives().unwrap();
+        assert_eq!(ds.len(), 2, "both legacy lines are live, none collapsed");
+        assert_eq!(ds[0].body, "old one");
+        assert_eq!(ds[0].id, "");
+        assert_eq!(ds[1].addressed_to.as_deref(), Some("scanner"));
+
+        // Legacy lines cannot be retracted (no id), and new events fold on top.
+        board.retract_directive("").unwrap();
+        assert_eq!(board.read_directives().unwrap().len(), 2);
+        let id = board.put_directive(&directive("new")).unwrap();
+        board.retract_directive(&id).unwrap();
+        assert_eq!(board.read_directives().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_corrupt_directive_line_is_skipped_not_fatal() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_raw(
+            tmp.path(),
+            &[
+                r#"{"id":"d1","author":"lead","ts":"t","body":"kept"}"#,
+                "this is not json",
+                r#"{"retract":7}"#,
+                "",
+                r#"{"id":"d2","author":"lead","ts":"t","body":"also kept"}"#,
+            ],
+        );
+        let ds = Board::new(tmp.path()).read_directives().unwrap();
+        let bodies: Vec<_> = ds.iter().map(|d| d.body.as_str()).collect();
+        assert_eq!(bodies, ["kept", "also kept"]);
+    }
+
+    #[test]
+    fn put_and_retract_events_have_unambiguous_wire_shapes() {
+        use crate::types::DirectiveEvent;
+        // A legacy bare line is a put.
+        let legacy: DirectiveEvent =
+            serde_json::from_str(r#"{"author":"a","ts":"t","body":"b"}"#).unwrap();
+        assert!(matches!(&legacy, DirectiveEvent::Put(d) if d.id.is_empty() && d.body == "b"));
+        // A line with an id is a put.
+        let put: DirectiveEvent =
+            serde_json::from_str(r#"{"id":"x","author":"a","ts":"t","body":"b"}"#).unwrap();
+        assert!(matches!(&put, DirectiveEvent::Put(d) if d.id == "x"));
+        // A retract line is a retract, never a put.
+        let retract: DirectiveEvent = serde_json::from_str(r#"{"retract":"x"}"#).unwrap();
+        assert!(matches!(&retract, DirectiveEvent::Retract { retract } if retract == "x"));
+        // Neither shape parses as the other: a half-formed line is an error.
+        assert!(serde_json::from_str::<DirectiveEvent>(r#"{"id":"x"}"#).is_err());
+        assert!(serde_json::from_str::<DirectiveEvent>(r#"{"author":"a"}"#).is_err());
+
+        // What is written round-trips to the same shape: a put serializes as
+        // the bare directive (so an older reader still parses it), a retract as
+        // `{"retract": id}`.
+        let line = serde_json::to_value(DirectiveEvent::Put(directive("x"))).unwrap();
+        assert_eq!(line["body"], "x");
+        assert!(line.get("retract").is_none());
+        let line = serde_json::to_value(DirectiveEvent::Retract {
+            retract: "x".into(),
+        })
+        .unwrap();
+        assert_eq!(line, serde_json::json!({ "retract": "x" }));
     }
 }
