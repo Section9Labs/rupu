@@ -9,6 +9,7 @@ import SortableTable, { type Column } from '../components/lists/SortableTable';
 import { Button } from '../components/ui/Button';
 import { EmptyState } from '../components/ui/EmptyState';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
+import { UnscopedNote } from '../components/customers/UnscopedNote';
 import { Spinner } from '../components/ui/Spinner';
 import { ScopeChip } from '../components/ScopeChip';
 import { cn } from '../lib/cn';
@@ -213,6 +214,8 @@ export default function AutoflowsDefs() {
       </header>
 
       {bannerError && <ErrorBanner className="mb-4">{bannerError}</ErrorBanner>}
+
+      <UnscopedNote className="mb-4">This list covers every customer’s autoflow definitions.</UnscopedNote>
 
       {defs === null ? (
         <div className="py-16 flex items-center justify-center">

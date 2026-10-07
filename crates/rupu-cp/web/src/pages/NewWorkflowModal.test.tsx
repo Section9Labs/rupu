@@ -46,6 +46,7 @@ vi.mock('../components/CodeEditor', () => ({
 }));
 
 import Workflows from './Workflows';
+import { withCustomerScope } from '../lib/customerScopeTestUtils';
 
 afterEach(() => {
   cleanup();
@@ -68,7 +69,7 @@ describe('NewWorkflowModal describe mode', () => {
 
     render(
       <MemoryRouter>
-        <Workflows />
+        {withCustomerScope(<Workflows />)}
       </MemoryRouter>,
     );
 

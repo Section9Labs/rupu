@@ -20,6 +20,7 @@ vi.mock('../components/charts/UsageBarChart', () => ({
 }));
 
 import Agents from './Agents';
+import { withCustomerScope } from '../lib/customerScopeTestUtils';
 
 afterEach(() => {
   cleanup();
@@ -34,7 +35,7 @@ describe('New agent — Agent Builder', () => {
 
     render(
       <MemoryRouter>
-        <Agents />
+        {withCustomerScope(<Agents />)}
       </MemoryRouter>,
     );
 

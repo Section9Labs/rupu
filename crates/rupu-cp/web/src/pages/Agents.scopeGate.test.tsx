@@ -40,6 +40,7 @@ vi.mock('../components/AgentLauncherSheet', () => ({
 }));
 
 import Agents from './Agents';
+import { withCustomerScope } from '../lib/customerScopeTestUtils';
 
 const USAGE = {
   input_tokens: 0,
@@ -72,7 +73,7 @@ describe('Agents — scope-aware Delete + slug-based delete', () => {
 
     render(
       <MemoryRouter initialEntries={['/agents']}>
-        <Agents />
+        {withCustomerScope(<Agents />)}
       </MemoryRouter>,
     );
     await waitFor(() => expect(screen.getByText('reviewer')).toBeInTheDocument());
@@ -101,7 +102,7 @@ describe('Agents — scope-aware Delete + slug-based delete', () => {
 
     render(
       <MemoryRouter initialEntries={['/agents']}>
-        <Agents />
+        {withCustomerScope(<Agents />)}
       </MemoryRouter>,
     );
     await waitFor(() => expect(screen.getByText('reviewer')).toBeInTheDocument());
@@ -130,7 +131,7 @@ describe('Agents — scope-aware Delete + slug-based delete', () => {
 
     render(
       <MemoryRouter initialEntries={['/agents']}>
-        <Agents />
+        {withCustomerScope(<Agents />)}
       </MemoryRouter>,
     );
     await waitFor(() => expect(screen.getByText('reviewer')).toBeInTheDocument());
@@ -159,7 +160,7 @@ describe('Agents — scope-aware Delete + slug-based delete', () => {
 
     render(
       <MemoryRouter initialEntries={['/agents']}>
-        <Agents />
+        {withCustomerScope(<Agents />)}
       </MemoryRouter>,
     );
     await waitFor(() => expect(screen.getByText('reviewer')).toBeInTheDocument());
@@ -186,7 +187,7 @@ describe('Agents — scope-aware Delete + slug-based delete', () => {
 
     render(
       <MemoryRouter initialEntries={['/agents']}>
-        <Agents />
+        {withCustomerScope(<Agents />)}
       </MemoryRouter>,
     );
     await waitFor(() => expect(screen.getByText('code-reviewer')).toBeInTheDocument());

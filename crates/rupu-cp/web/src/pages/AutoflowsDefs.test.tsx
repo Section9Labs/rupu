@@ -14,6 +14,7 @@ import { MemoryRouter } from 'react-router-dom';
 import { api, type AutoflowDefRow } from '../lib/api';
 
 import AutoflowsDefs from './AutoflowsDefs';
+import { scopedEntry, withCustomerScope } from '../lib/customerScopeTestUtils';
 
 afterEach(() => {
   cleanup();
@@ -35,7 +36,7 @@ describe('AutoflowsDefs — kit adoption', () => {
 
     render(
       <MemoryRouter initialEntries={['/build/autoflows']}>
-        <AutoflowsDefs />
+        {withCustomerScope(<AutoflowsDefs />)}
       </MemoryRouter>,
     );
 
@@ -50,7 +51,7 @@ describe('AutoflowsDefs — kit adoption', () => {
 
     render(
       <MemoryRouter initialEntries={['/build/autoflows']}>
-        <AutoflowsDefs />
+        {withCustomerScope(<AutoflowsDefs />)}
       </MemoryRouter>,
     );
 
@@ -63,7 +64,7 @@ describe('AutoflowsDefs — kit adoption', () => {
 
     render(
       <MemoryRouter initialEntries={['/build/autoflows']}>
-        <AutoflowsDefs />
+        {withCustomerScope(<AutoflowsDefs />)}
       </MemoryRouter>,
     );
 
@@ -86,7 +87,7 @@ describe('AutoflowsDefs — kit adoption', () => {
 
     const { container } = render(
       <MemoryRouter initialEntries={['/build/autoflows']}>
-        <AutoflowsDefs />
+        {withCustomerScope(<AutoflowsDefs />)}
       </MemoryRouter>,
     );
 
@@ -106,7 +107,7 @@ describe('AutoflowsDefs — kit adoption', () => {
 
     render(
       <MemoryRouter initialEntries={['/build/autoflows']}>
-        <AutoflowsDefs />
+        {withCustomerScope(<AutoflowsDefs />)}
       </MemoryRouter>,
     );
 
@@ -122,7 +123,7 @@ describe('AutoflowsDefs — kit adoption', () => {
 
     const { container } = render(
       <MemoryRouter initialEntries={['/build/autoflows']}>
-        <AutoflowsDefs />
+        {withCustomerScope(<AutoflowsDefs />)}
       </MemoryRouter>,
     );
 
@@ -133,5 +134,20 @@ describe('AutoflowsDefs — kit adoption', () => {
     const triggerHeader = headerCells.find((th) => th.textContent?.trim() === 'Trigger');
     expect(scopeHeader?.className).toMatch(/whitespace-nowrap/);
     expect(triggerHeader?.className).toMatch(/whitespace-nowrap/);
+  });
+});
+
+describe('AutoflowsDefs under a customer scope', () => {
+  it('says the definitions are not filtered by the customer scope', async () => {
+    vi.spyOn(api, 'getAutoflowDefs').mockResolvedValue(ROWS);
+
+    render(
+      <MemoryRouter initialEntries={[scopedEntry('acme', '/build/autoflows')]}>
+        {withCustomerScope(<AutoflowsDefs />)}
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText('nightly-sweep')).toBeInTheDocument());
+    expect(screen.getByRole('note')).toHaveTextContent('covers every customer');
   });
 });

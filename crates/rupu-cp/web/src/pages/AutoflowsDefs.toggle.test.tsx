@@ -15,6 +15,7 @@ import { MemoryRouter, useLocation } from 'react-router-dom';
 import { api, type AutoflowDefRow } from '../lib/api';
 
 import AutoflowsDefs from './AutoflowsDefs';
+import { withCustomerScope } from '../lib/customerScopeTestUtils';
 
 function LocationProbe() {
   const loc = useLocation();
@@ -50,7 +51,7 @@ describe('AutoflowsDefs — Enabled column + toggle', () => {
 
     render(
       <MemoryRouter initialEntries={['/build/autoflows']}>
-        <AutoflowsDefs />
+        {withCustomerScope(<AutoflowsDefs />)}
       </MemoryRouter>,
     );
     await waitFor(() => expect(screen.getByText('nightly-sweep')).toBeInTheDocument());
@@ -71,7 +72,7 @@ describe('AutoflowsDefs — Enabled column + toggle', () => {
 
     render(
       <MemoryRouter initialEntries={['/build/autoflows']}>
-        <AutoflowsDefs />
+        {withCustomerScope(<AutoflowsDefs />)}
         <LocationProbe />
       </MemoryRouter>,
     );
@@ -97,7 +98,7 @@ describe('AutoflowsDefs — Enabled column + toggle', () => {
 
     render(
       <MemoryRouter initialEntries={['/build/autoflows']}>
-        <AutoflowsDefs />
+        {withCustomerScope(<AutoflowsDefs />)}
       </MemoryRouter>,
     );
     await waitFor(() => expect(screen.getByText('stale-cleanup')).toBeInTheDocument());
@@ -115,7 +116,7 @@ describe('AutoflowsDefs — Enabled column + toggle', () => {
 
     render(
       <MemoryRouter initialEntries={['/build/autoflows']}>
-        <AutoflowsDefs />
+        {withCustomerScope(<AutoflowsDefs />)}
       </MemoryRouter>,
     );
     await waitFor(() => expect(screen.getByText('nightly-sweep')).toBeInTheDocument());
