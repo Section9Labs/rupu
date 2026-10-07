@@ -293,6 +293,7 @@ impl WorkflowExecutor for InProcessExecutor {
                             resume_approver: None,
                             resume_rerequested_at: None,
                             reject_cleanup_pending: None,
+                            engagement_profiles: Vec::new(),
                             permission_mode: None,
                             final_output: None,
                             loop_progress: BTreeMap::new(),

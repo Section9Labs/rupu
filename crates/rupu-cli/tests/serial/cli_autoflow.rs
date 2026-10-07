@@ -276,6 +276,7 @@ fn sample_run_record(id: &str, issue_ref: &str) -> rupu_orchestrator::RunRecord 
         resume_approver: None,
         resume_rerequested_at: None,
         reject_cleanup_pending: None,
+        engagement_profiles: Vec::new(),
         permission_mode: None,
         active_step_transcript_path: None,
         final_output: None,

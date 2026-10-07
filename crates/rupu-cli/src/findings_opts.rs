@@ -47,6 +47,25 @@ pub fn base_options(global: &Path, cfg: &rupu_config::FindingsConfig) -> Finding
     }
 }
 
+/// The engagement a RESUMED workflow run continues under: the profile ids it
+/// was launched with (`RunRecord.engagement_profiles`), re-resolved against
+/// the run's own workspace exactly as the launch resolved them. A recorded
+/// profile that no longer resolves fails the resume rather than continuing
+/// on the `code` path; a run recorded without one (or before the field
+/// existed) is `None`, the code path it launched on.
+pub fn recorded_engagement(
+    global: &Path,
+    record: &rupu_orchestrator::RunRecord,
+) -> anyhow::Result<Option<Arc<ActiveSet>>> {
+    resolve_engagement(global, &record.workspace_path, &record.engagement_profiles).map_err(|e| {
+        anyhow::anyhow!(
+            "resume run {} under its recorded engagement profile(s) `{}`: {e}",
+            record.id,
+            record.engagement_profiles.join(",")
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
