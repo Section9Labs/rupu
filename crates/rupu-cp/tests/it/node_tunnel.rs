@@ -3570,3 +3570,60 @@ async fn mirror_reset_transcript_makes_replay_idempotent() {
         "replace from a non-owning node must be refused"
     );
 }
+
+/// Removing a tunnel host closes its live node connection: the node is no
+/// longer registered, so it must stop serving (and mirroring) at once rather
+/// than until it happens to reconnect.
+#[tokio::test]
+async fn removing_a_tunnel_host_closes_its_live_tunnel() {
+    use rupu_workspace::{enroll_node, HostStore};
+    use tokio_tungstenite::connect_async;
+
+    let dir = tempfile::tempdir().unwrap();
+    let host_store = HostStore {
+        root: dir.path().join("hosts"),
+    };
+    let (host, token) = enroll_node(&host_store, "doomed-node").unwrap();
+    let node_id = match &host.transport {
+        rupu_workspace::HostTransport::Tunnel { node_id } => node_id.clone(),
+        _ => panic!("expected Tunnel transport"),
+    };
+    let (addr, registry) = spawn_cp_with_bearer(dir.path(), "tok").await;
+    let (mut ws, _) = connect_async(format!("ws://{addr}/api/node/connect"))
+        .await
+        .unwrap();
+    send_frame(
+        &mut ws,
+        &Frame::Hello {
+            node_id: node_id.clone(),
+            auth: rupu_cp::node::Auth::Token { token },
+            rupu_version: "test".to_string(),
+            capabilities: vec![],
+        },
+    )
+    .await;
+    let welcome = tokio::time::timeout(std::time::Duration::from_secs(5), recv_frame(&mut ws))
+        .await
+        .unwrap();
+    assert!(matches!(welcome, Some(Frame::Welcome { .. })));
+    assert!(registry.is_online(&node_id));
+
+    let resp = reqwest::Client::new()
+        .delete(format!("http://{addr}/api/hosts/{}", host.id))
+        .header("Authorization", "Bearer tok")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    // The socket closes (no more frames), and the node is offline.
+    let rest = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while recv_frame(&mut ws).await.is_some() {}
+    })
+    .await;
+    assert!(
+        rest.is_ok(),
+        "the tunnel must close after its host is removed"
+    );
+    assert!(!registry.is_online(&node_id));
+}

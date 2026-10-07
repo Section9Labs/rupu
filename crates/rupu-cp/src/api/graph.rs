@@ -10,7 +10,6 @@ use crate::{
         resolve_host, run_not_found_or_internal, synthesize_unpersisted_run, RunDetailQuery,
     },
     error::{ApiError, ApiResult},
-    host::connector::HostConnectorError,
     state::AppState,
 };
 use axum::{
@@ -59,13 +58,7 @@ async fn run_graph_from_host(
     }
     conn.proxy_get_json(&format!("/api/runs/{id}/graph"))
         .await
-        .map_err(|e| match e {
-            HostConnectorError::NotFound(m) => ApiError::not_found(m),
-            HostConnectorError::Unreachable(m) => {
-                ApiError::internal(format!("host {host_id} unreachable: {m}"))
-            }
-            other => ApiError::internal(other.to_string()),
-        })
+        .map_err(|e| crate::api::runs::host_read_error(host_id, e))
 }
 
 /// Build the full run-graph response (`{run, workflow, step_results, units,
@@ -937,6 +930,7 @@ fn map_step(step: &rupu_orchestrator::Step) -> StepNodeDto {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::connector::HostConnectorError;
 
     #[test]
     fn events_only_unit_carries_unit_started_codename() {

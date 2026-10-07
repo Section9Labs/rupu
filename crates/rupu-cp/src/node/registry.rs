@@ -71,6 +71,9 @@ pub struct NodeConn {
     /// In-flight artifact pulls on this connection, by request id: where
     /// the read pump delivers each `ArtifactChunk` / `ArtifactPullDone`.
     pulls: Mutex<HashMap<String, tokio::sync::mpsc::Sender<PullMsg>>>,
+    /// Signalled by [`NodeRegistry::disconnect`]: the tunnel's pumps stop
+    /// and the socket closes (the host was removed).
+    kick: tokio::sync::Notify,
 }
 
 impl NodeConn {
@@ -83,7 +86,14 @@ impl NodeConn {
             capabilities,
             rupu_version,
             pulls: Mutex::new(HashMap::new()),
+            kick: tokio::sync::Notify::new(),
         }
+    }
+
+    /// Resolves once this connection has been told to close
+    /// ([`NodeRegistry::disconnect`]). The tunnel handler selects on it.
+    pub async fn kicked(&self) {
+        self.kick.notified().await
     }
 
     /// Whether the node advertised `capability` (e.g.
@@ -216,6 +226,28 @@ impl NodeRegistry {
             if Arc::ptr_eq(current, only_if) {
                 map.remove(node_id);
             }
+        }
+    }
+
+    /// Drop `node_id`'s live connection, if any, and close its tunnel: its
+    /// handler stops both pumps and the socket goes away. Used when the host
+    /// is removed, so a node that is no longer registered stops serving.
+    /// Its reconnect then fails `Hello` verification. Returns whether a
+    /// connection was live.
+    pub fn disconnect(&self, node_id: &str) -> bool {
+        let conn = self
+            .conns
+            .lock()
+            .expect("NodeRegistry lock poisoned")
+            .remove(node_id);
+        match conn {
+            Some(c) => {
+                // `notify_one` stores a permit, so a handler not yet parked
+                // on `kicked()` still sees it.
+                c.kick.notify_one();
+                true
+            }
+            None => false,
         }
     }
 

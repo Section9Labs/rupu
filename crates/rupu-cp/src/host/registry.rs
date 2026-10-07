@@ -312,7 +312,18 @@ impl HostRegistry {
             ));
         }
 
+        let host = self
+            .store
+            .load(host_id)?
+            .ok_or_else(|| HostConnectorError::NotFound(format!("host {host_id} not found")))?;
         self.store.delete(host_id)?;
+        // A live tunnel would otherwise keep serving (and mirroring) for a
+        // host that no longer exists.
+        if let (HostTransport::Tunnel { node_id }, Some(reg)) =
+            (&host.transport, &self.node_registry)
+        {
+            reg.disconnect(node_id);
+        }
 
         // Best-effort: warn but don't propagate token-store failures.
         if let Err(e) = delete_host_token(host_id) {

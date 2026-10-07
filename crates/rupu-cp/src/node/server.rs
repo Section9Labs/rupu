@@ -327,9 +327,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     };
 
     // Run both pumps concurrently; clean up on whichever exits first.
+    // A kick (the host was removed) ends the tunnel too.
+    let kicked = Arc::clone(&conn);
     tokio::select! {
         _ = write_pump => {}
         _ = read_pump => {}
+        _ = kicked.kicked() => {
+            info!(node_id, "node_tunnel: host removed; closing the tunnel");
+        }
     }
 
     // ── 5. Cleanup ────────────────────────────────────────────────────────────

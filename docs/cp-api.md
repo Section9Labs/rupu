@@ -84,16 +84,27 @@ parameters on top of that.
 | 403 | A cookie-authenticated write from another origin; a `/api/fs/browse` path outside the browsable directories. |
 | 404 | Unknown run / session / finding / host id. |
 | 409 | The request conflicts with current state: approving a run not awaiting approval, deleting a run that isn't finished, resuming a run that isn't paused. |
-| 500 | Internal error, an unreadable store, and — on run **detail** routes — an unreachable remote host. |
+| 500 | Internal error: an unreadable store, a fault on this server's own side. |
 | 501 | This server can't do it: an adapter only `rupu cp serve` installs is missing, a remote host's transport doesn't support the operation, or a remote host can't answer this query (too old). |
-| 502 | A remote host failed while serving a **list** (shown "offline" in the UI) or a transcript. |
+| 502 | A remote host failed: unreachable, unauthorized, or an error or non-JSON reply. The same on lists (shown "offline" in the UI), detail views, streams and controls. |
 
 ### Common query parameters
 
 - **`host=<id>`** — act on a registered remote host instead of this one. `local`
   is this host. An unknown id is a 404. On list endpoints an absent `host`
   fans out to every host and merges newest-first; per-host failures follow the
-  501/502 rules above.
+  501/502 rules above. One table holds for every `?host=<remote>` call:
+
+  | The host… | List | Detail / graph / log / usage / netflow / session | Control (approve, reject, cancel, pause, resume, archive, restore, delete) |
+  |---|---|---|---|
+  | has no such run / session | 502 | 404 | 404 |
+  | refuses the transition | — | — | 409 |
+  | can't serve it (transport, too old) | 501 | 501 | 501 |
+  | is unreachable or answers badly | 502 | 502 | 502 |
+
+  A list's "not found" is a 502 because a reachable host answering a list
+  route with 404 is broken, not empty. A 404 that names the *host* (`host
+  <id> not found`) always means the id isn't registered.
 - **`customer=<slug>|none`** — narrow to a customer's runs (by recorded
   attribution) or to projects currently assigned to it. See
   [`cp-customers-api.md`](cp-customers-api.md#customerslugnone).
@@ -180,7 +191,7 @@ remotely `{ok, host_id}`.
 | Method | Path | Purpose | Notes |
 |--------|------|---------|-------|
 | POST | `/api/runs/:id/approve` | Approve a parked gate. | `gate=<step_id>` picks one gate when several are parked. Optional body `{mode: "ask"\|"bypass"\|"readonly"}`. Records the decision and a resume marker; the `cp serve` resume worker (or the run's live runner) continues the run. 409: not awaiting approval, gate expired, gate already decided, ambiguous gate (several parked, no `gate`), unknown gate. |
-| POST | `/api/runs/:id/reject` | Reject a parked gate. | `gate`. Body `{reason?}` — a JSON body (`{}` at least) is required. Same 409s. |
+| POST | `/api/runs/:id/reject` | Reject a parked gate. | `gate`. Optional body `{reason?}`, as for approve and cancel. Same 409s. |
 | POST | `/api/runs/:id/cancel` | Cancel a run. | Optional body `{reason?}`. A live runner process is sent SIGTERM and the run is marked `Cancelled`; a run parked at a single gate with no live runner is rejected instead. 409 already finished. |
 | POST | `/api/runs/:id/pause` | Pause a running run. | Writes a `.pause` marker the detached runner polls; it stops at its next safe boundary. 409 not running. 501 when the host's transport can't pause. |
 | POST | `/api/runs/:id/resume` | Resume a paused run. | Marker only; the resume worker spawns `rupu workflow resume --if-unfinished`. 409 not `paused`; 501 without `rupu cp serve` or when the transport can't resume. |
@@ -263,7 +274,7 @@ curl -s -X POST -H "Authorization: Bearer $CP_TOKEN" -H 'Content-Type: applicati
 | Method | Path | Purpose | Notes |
 |--------|------|---------|-------|
 | GET | `/api/autoflows` | Workflows with an `autoflow:` block, with trigger kind and enabled state. | |
-| POST | `/api/autoflows/:name/enable` | Set `autoflow.enabled: true` in the file (a `.bak` is kept). | `scope_kind`, `scope_id`. 404 not an autoflow. |
+| POST | `/api/autoflows/:name/enable` | Set `autoflow.enabled: true` in the file (a `.bak` is kept). | `scope_kind`, `scope_id`. The file is `<name>.yaml`, else `<name>.yml` (as the list and the autoflow runtime read both; `GET /api/workflows/:name` resolves the same way). 404 not an autoflow. |
 | POST | `/api/autoflows/:name/disable` | Set it to `false`. | Same. |
 | GET | `/api/autoflows/claims` | Issue claims held by the entity engine (`ClaimRow`). | |
 | POST | `/api/autoflows/claims/release` | Drop a claim. | Body `{issue_ref}` → `{released}`. |
@@ -363,7 +374,7 @@ An unknown `ws_id` is a 404 on every route except the list.
 | POST | `/api/hosts/ssh` | Register an SSH host. | Body `AddSshHostBody {name, host, port?, identity_file?}`. |
 | POST | `/api/hosts/bucket` | Register an object-store bucket host. | Body `AddBucketHostBody {name, url, prefix?}`. |
 | POST | `/api/hosts/node` | Enroll a tunnel node. | Body `{name}`. Returns `EnrollNodeResponse {host, command, token}`; the plaintext token is shown once, only its hash is stored. 400 empty name. |
-| DELETE | `/api/hosts/:id` | Remove a host. | 204. 400 for `local`. |
+| DELETE | `/api/hosts/:id` | Remove a host. | 204; a tunnel host's live node connection is closed at once (its reconnect then fails enrollment). 400 for `local`; 404 unknown id. |
 | GET | `/api/workers` | Workers with run activity (`WorkerView`). | |
 | GET | `/api/host/info` | **Host-internal.** This host's version, capabilities and feature list (`HostInfoResponse`). | A coordinator's HTTP connector reads `features` before using an optional capability. |
 | GET | `/api/node/connect` | **Host-internal.** WebSocket for `rupu node` tunnel peers. | Outside the bearer check. See [Node tunnel](#node-tunnel). |
@@ -420,7 +431,7 @@ Local host only.
 | GET | `/api/agentiflows` | All agentiflow runs, newest first (`{rows}`). | |
 | GET | `/api/agentiflows/:id` | One run: record, definition, budget, events, units, lead transcripts (`AgentiflowDetail`). | 404 unknown or malformed id. |
 | GET | `/api/agentiflows/:id/messages` | The run's message board (`{posts, directives}`). | |
-| POST | `/api/agentiflows/:id/steer` | Queue an operator message for the lead. | Body `SteerRequest {message, now?, stop?}` → `{queued: true}`. 400 empty message; 409 run not `running`. |
+| POST | `/api/agentiflows/:id/steer` | Queue an operator message for the lead. | Body `SteerRequest {message, now?, stop?}` → `{queued: true}`. 400 empty message; 404 unknown run; 409 when nothing would read it — the run isn't `running`, or its recorded coordinator process is gone (a dead coordinator leaves `running` on disk until the reaper closes it); 501 without `rupu cp serve`. |
 
 ## Node tunnel
 

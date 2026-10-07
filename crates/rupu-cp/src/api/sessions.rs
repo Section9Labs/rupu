@@ -731,10 +731,10 @@ async fn get_session(
     // ── Remote proxy ───────────────────────────────────────────────────────────
     if let Some(host) = q.host.as_deref().filter(|h| *h != "local") {
         let conn = crate::api::runs::resolve_host(&s, host)?;
-        let mut detail = conn.get_session(&id).await.map_err(|e| match e {
-            HostConnectorError::NotFound(m) => ApiError::not_found(m),
-            other => ApiError::internal(other.to_string()),
-        })?;
+        let mut detail = conn
+            .get_session(&id)
+            .await
+            .map_err(|e| crate::api::runs::host_read_error(host, e))?;
         ensure_usage_block(&mut detail, &s.pricing);
         crate::codename::inject_codename_row(&mut detail, "session_id", Some("agent_name"));
         return Ok(Json(detail));
@@ -844,10 +844,7 @@ async fn get_session_usage_timeline(
         let v = conn
             .session_usage_timeline(&id)
             .await
-            .map_err(|e| match e {
-                HostConnectorError::NotFound(m) => ApiError::not_found(m),
-                other => ApiError::internal(other.to_string()),
-            })?;
+            .map_err(|e| crate::api::runs::host_read_error(host, e))?;
         return Ok(Json(v));
     }
 
@@ -979,10 +976,10 @@ async fn get_session_runs(
     // ── Remote proxy ───────────────────────────────────────────────────────────
     if let Some(host) = q.host.as_deref().filter(|h| *h != "local") {
         let conn = crate::api::runs::resolve_host(&s, host)?;
-        let runs = conn.session_runs(&id).await.map_err(|e| match e {
-            HostConnectorError::NotFound(m) => ApiError::not_found(m),
-            other => ApiError::internal(other.to_string()),
-        })?;
+        let runs = conn
+            .session_runs(&id)
+            .await
+            .map_err(|e| crate::api::runs::host_read_error(host, e))?;
         return Ok(Json(runs));
     }
 
@@ -1064,9 +1061,8 @@ async fn send_session(
             prompt,
         };
         let run_id = conn.send_session_turn(req).await.map_err(|e| match e {
-            HostConnectorError::NotFound(m) => ApiError::not_found(m),
             HostConnectorError::Invalid(m) => ApiError::bad_request(m),
-            other => ApiError::internal(other.to_string()),
+            other => crate::api::runs::host_read_error(&host, other),
         })?;
         return Ok(Json(
             serde_json::json!({ "run_id": run_id, "host_id": host }),
@@ -1138,21 +1134,11 @@ async fn mutate_session(
 }
 
 /// Map a [`HostConnectorError`] from a proxied session archive/restore/
-/// delete call to an [`ApiError`], mirroring the local branch's
-/// [`crate::session_mutator::SessionMutateError`] mapping in [`mutate_session`]
-/// (`NotFound` → 404, `Invalid`-shaped → 409) plus `Unsupported` → 501 for a
-/// transport that genuinely can't do this (never a silent no-op).
+/// delete call: [`crate::api::runs::host_control_error`], the table every
+/// remote control shares (`NotFound` → 404, `Invalid`-shaped → 409, as the
+/// local branch's [`mutate_session`] answers; `Unsupported` → 501).
 fn map_host_session_mutate_err(e: HostConnectorError) -> ApiError {
-    match e {
-        HostConnectorError::NotFound(m) => ApiError::not_found(m),
-        HostConnectorError::Invalid(m) => ApiError::conflict(m),
-        // A remote CP-of-CP hop (HttpHostConnector) already mapped ITS OWN
-        // local refusal to 409 before it reached us — preserve that status
-        // rather than flattening it into a 500 below.
-        HostConnectorError::Remote(409, m) => ApiError::conflict(m),
-        HostConnectorError::Unsupported(m) => ApiError::not_available(m),
-        other => ApiError::internal(other.to_string()),
-    }
+    crate::api::runs::host_control_error(e)
 }
 
 /// `POST /api/sessions/:id/archive[?host=<id>]`.

@@ -193,11 +193,9 @@ async fn approve_run(
     if host != "local" {
         let conn = resolve_host(&s, host)?;
         let mode = body.and_then(|b| b.0.mode).unwrap_or_default();
-        conn.approve_run(&id, &mode).await.map_err(|e| match e {
-            HostConnectorError::NotFound(m) => ApiError::not_found(m),
-            HostConnectorError::Invalid(m) => ApiError::bad_request(m),
-            other => ApiError::internal(other.to_string()),
-        })?;
+        conn.approve_run(&id, &mode)
+            .await
+            .map_err(host_control_error)?;
         return Ok(Json(serde_json::json!({ "ok": true, "host_id": host })));
     }
     // Local path: unchanged for `gate: None` on a <=1-gate run (see doc).
@@ -246,24 +244,23 @@ async fn reject_run(
     State(s): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<RunControlQuery>,
-    Json(body): Json<RejectBody>,
+    body: Option<Json<RejectBody>>,
 ) -> ApiResult<Json<serde_json::Value>> {
     validate_id(&id)?;
+    // Optional, like approve's and cancel's: a bodyless POST rejects with no
+    // reason.
+    let reason = body.and_then(|b| b.0.reason);
     let host = q.host.as_deref().unwrap_or("local");
     if host != "local" {
         let conn = resolve_host(&s, host)?;
-        conn.reject_run(&id, body.reason.as_deref())
+        conn.reject_run(&id, reason.as_deref())
             .await
-            .map_err(|e| match e {
-                HostConnectorError::NotFound(m) => ApiError::not_found(m),
-                HostConnectorError::Invalid(m) => ApiError::bad_request(m),
-                other => ApiError::internal(other.to_string()),
-            })?;
+            .map_err(host_control_error)?;
         return Ok(Json(serde_json::json!({ "ok": true, "host_id": host })));
     }
     // Local path: unchanged for `gate: None` on a <=1-gate run (see doc).
     let now = chrono::Utc::now();
-    let reason = body.reason.unwrap_or_default();
+    let reason = reason.unwrap_or_default();
     // On the blocking pool: the gate methods take the run lock.
     let (rid, gate) = (id.clone(), q.gate.clone());
     s.run_store
@@ -314,11 +311,7 @@ async fn cancel_run(
     let host = q.host.as_deref().unwrap_or("local");
     if host != "local" {
         let conn = resolve_host(&s, host)?;
-        conn.cancel_run(&id).await.map_err(|e| match e {
-            HostConnectorError::NotFound(m) => ApiError::not_found(m),
-            HostConnectorError::Invalid(m) => ApiError::bad_request(m),
-            other => ApiError::internal(other.to_string()),
-        })?;
+        conn.cancel_run(&id).await.map_err(host_control_error)?;
         return Ok(Json(serde_json::json!({ "ok": true, "host_id": host })));
     }
     // Local path: unchanged.
@@ -375,12 +368,7 @@ async fn pause_run(
     let host = q.host.as_deref().unwrap_or("local");
     if host != "local" {
         let conn = resolve_host(&s, host)?;
-        conn.pause_run(&id).await.map_err(|e| match e {
-            HostConnectorError::NotFound(m) => ApiError::not_found(m),
-            HostConnectorError::Invalid(m) => ApiError::conflict(m),
-            HostConnectorError::Unsupported(m) => ApiError::not_available(m),
-            other => ApiError::internal(other.to_string()),
-        })?;
+        conn.pause_run(&id).await.map_err(host_control_error)?;
         return Ok(Json(serde_json::json!({ "ok": true, "host_id": host })));
     }
     // Local path: mirrors cancel_run's local branch — operate on the store
@@ -447,12 +435,7 @@ async fn resume_run(
             )));
         }
         let conn = resolve_host(&s, host)?;
-        conn.resume_run(&id).await.map_err(|e| match e {
-            HostConnectorError::NotFound(m) => ApiError::not_found(m),
-            HostConnectorError::Invalid(m) => ApiError::conflict(m),
-            HostConnectorError::Unsupported(m) => ApiError::not_available(m),
-            other => ApiError::internal(other.to_string()),
-        })?;
+        conn.resume_run(&id).await.map_err(host_control_error)?;
         return Ok(Json(serde_json::json!({ "ok": true, "host_id": host })));
     }
     // Local path.
@@ -520,6 +503,49 @@ pub(crate) fn host_list_error(e: HostConnectorError) -> ApiError {
         HostConnectorError::Unsupported(_) | HostConnectorError::Invalid(_) => {
             ApiError::not_available(e.to_string())
         }
+        HostConnectorError::Internal(_) => ApiError::internal(e.to_string()),
+        other => ApiError::bad_gateway(other.to_string()),
+    }
+}
+
+/// [`host_list_error`]'s counterpart for a remote read of ONE entity (a run's
+/// detail, graph, log, usage, netflow; a session): the same table, except
+/// that the connector's `NotFound` is a 404 — here it means "that host has no
+/// such run/session", which is the caller's answer, not a broken host.
+///
+/// - `NotFound` → 404
+/// - `Unsupported` / `Invalid` → 501 (the host can't serve this)
+/// - `Internal` → 500 (this side's own fault)
+/// - everything else (unreachable, unauthorized, a remote error status, a
+///   non-JSON reply) → 502, naming the host
+pub(crate) fn host_read_error(host_id: &str, e: HostConnectorError) -> ApiError {
+    match e {
+        HostConnectorError::NotFound(m) => ApiError::not_found(m),
+        HostConnectorError::Unsupported(_) | HostConnectorError::Invalid(_) => {
+            ApiError::not_available(format!("host {host_id}: {e}"))
+        }
+        HostConnectorError::Internal(_) => ApiError::internal(e.to_string()),
+        other => ApiError::bad_gateway(format!("host {host_id}: {other}")),
+    }
+}
+
+/// The mapping for a remote run or session CONTROL (approve, reject, cancel,
+/// pause, resume, archive, restore, delete): one table for all of them.
+///
+/// - `NotFound` → 404
+/// - `Invalid` → 409 — the host refused the transition (not awaiting
+///   approval, already terminal, …), the same answer the local branch gives
+/// - a remote CP's own 409 (`Remote(409, _)`) → 409, preserved
+/// - `Unsupported` → 501
+/// - `Internal` → 500
+/// - everything else → 502
+pub(crate) fn host_control_error(e: HostConnectorError) -> ApiError {
+    match e {
+        HostConnectorError::NotFound(m) => ApiError::not_found(m),
+        HostConnectorError::Invalid(m) | HostConnectorError::Remote(409, m) => {
+            ApiError::conflict(m)
+        }
+        HostConnectorError::Unsupported(m) => ApiError::not_available(m),
         HostConnectorError::Internal(_) => ApiError::internal(e.to_string()),
         other => ApiError::bad_gateway(other.to_string()),
     }
@@ -1504,10 +1530,7 @@ pub(crate) fn run_not_found_or_internal(id: &str, e: RunStoreError) -> ApiError 
 fn host_connector_err(id: &str, host_id: &str, e: HostConnectorError) -> ApiError {
     match e {
         HostConnectorError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
-        HostConnectorError::Unreachable(m) => {
-            ApiError::internal(format!("host {host_id} unreachable: {m}"))
-        }
-        other => ApiError::internal(other.to_string()),
+        other => host_read_error(host_id, other),
     }
 }
 
@@ -1706,10 +1729,7 @@ async fn get_run_log_from_host(
         HostConnectorError::NotFound(_) => {
             ApiError::not_found(format!("run {id} not found on host {host_id}"))
         }
-        HostConnectorError::Unreachable(m) => {
-            ApiError::internal(format!("host {host_id} unreachable: {m}"))
-        }
-        other => ApiError::internal(other.to_string()),
+        other => host_read_error(host_id, other),
     })?;
     crate::api::events::proxy_event_byte_stream(stream)
 }
@@ -1778,13 +1798,7 @@ async fn usage_timeline_from_host(
     }
     conn.proxy_get_json(&format!("/api/runs/{id}/usage-timeline"))
         .await
-        .map_err(|e| match e {
-            HostConnectorError::NotFound(m) => ApiError::not_found(m),
-            HostConnectorError::Unreachable(m) => {
-                ApiError::internal(format!("host {host_id} unreachable: {m}"))
-            }
-            other => ApiError::internal(other.to_string()),
-        })
+        .map_err(|e| host_read_error(host_id, e))
 }
 
 /// Build the per-turn usage-timeline series for a run in `store`: the run's
@@ -2001,10 +2015,7 @@ async fn run_usage_from_host(
         HostConnectorError::NotFound(_) | HostConnectorError::NotJson(_) => {
             ApiError::not_found(format!("host {host_id} does not serve usage for run {id}"))
         }
-        HostConnectorError::Unreachable(m) => {
-            ApiError::internal(format!("host {host_id} unreachable: {m}"))
-        }
-        other => ApiError::internal(other.to_string()),
+        other => host_read_error(host_id, other),
     })
 }
 
@@ -2148,24 +2159,12 @@ pub(crate) fn delete_run_checked(store: &RunStore, id: &str) -> Result<(), RunSt
     store.delete(id)
 }
 
-/// Map a [`HostConnectorError`] from a proxied archive/restore/delete call
-/// to an [`ApiError`], mirroring `pause_run`/`resume_run`'s table exactly:
-/// `NotFound` → 404, `Invalid` → 409 (non-terminal / already-archived —
-/// the same conflict semantics as the local branch's `RunStoreError`
-/// mapping), `Unsupported` → 501 (a transport that genuinely can't do this,
-/// surfaced as a real error rather than a silent no-op), everything else →
-/// 500.
+/// Map a [`HostConnectorError`] from a proxied archive/restore/delete call:
+/// [`host_control_error`], the one table every remote control shares
+/// (`Invalid` → 409 is the local branch's non-terminal / already-archived
+/// conflict).
 fn map_host_mutate_err(e: HostConnectorError) -> ApiError {
-    match e {
-        HostConnectorError::NotFound(m) => ApiError::not_found(m),
-        HostConnectorError::Invalid(m) => ApiError::conflict(m),
-        // A remote CP-of-CP hop (HttpHostConnector) already mapped ITS OWN
-        // local refusal to 409 before it reached us — preserve that status
-        // rather than flattening it into a 500 below.
-        HostConnectorError::Remote(409, m) => ApiError::conflict(m),
-        HostConnectorError::Unsupported(m) => ApiError::not_available(m),
-        other => ApiError::internal(other.to_string()),
-    }
+    host_control_error(e)
 }
 
 /// `POST /api/runs/:id/archive[?host=<id>]` — move a terminal run to the
@@ -2431,7 +2430,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: None,
             }),
-            Json(body),
+            Some(Json(body)),
         )
         .await
         .expect("reject should succeed");
@@ -2478,7 +2477,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: None,
             }),
-            Json(RejectBody { reason: None }),
+            Some(Json(RejectBody { reason: None })),
         )
         .await
         .expect_err("reject on missing run should 404");
@@ -2687,9 +2686,9 @@ pub(crate) mod tests {
                 host: None,
                 gate: Some("gate_a".into()),
             }),
-            Json(RejectBody {
+            Some(Json(RejectBody {
                 reason: Some("gate_a looks bad".into()),
-            }),
+            })),
         )
         .await
         .expect("rejecting a named gate on a multi-gate run should succeed");
@@ -2723,7 +2722,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: Some("gate_a".into()),
             }),
-            Json(RejectBody { reason: None }),
+            Some(Json(RejectBody { reason: None })),
         )
         .await
         .expect("rejecting gate_a should succeed");
@@ -2740,9 +2739,9 @@ pub(crate) mod tests {
                 host: None,
                 gate: Some("gate_b".into()),
             }),
-            Json(RejectBody {
+            Some(Json(RejectBody {
                 reason: Some("gate_b too".into()),
-            }),
+            })),
         )
         .await
         .expect("rejecting the last remaining gate should succeed");
@@ -4860,7 +4859,9 @@ pub(crate) mod tests {
         )
         .await
         .expect_err("no local mirror record exists, so the connector error must surface");
-        assert_eq!(err.0, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        // The connector's `Unsupported` is "this host can't serve it": 501
+        // (`host_read_error`).
+        assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
     }
 
     #[tokio::test]
@@ -4933,9 +4934,15 @@ pub(crate) mod tests {
         assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
     }
 
+    /// Any other remote failure is the host's, not ours: 502
+    /// (`host_control_error`). Only this side's own `Internal` is a 500.
     #[test]
-    fn map_host_mutate_err_still_500s_other_remote_statuses() {
+    fn map_host_mutate_err_maps_other_remote_failures_to_502() {
         let err = map_host_mutate_err(HostConnectorError::Remote(500, "boom".into()));
+        assert_eq!(err.0, axum::http::StatusCode::BAD_GATEWAY);
+        let err = map_host_mutate_err(HostConnectorError::Unreachable("down".into()));
+        assert_eq!(err.0, axum::http::StatusCode::BAD_GATEWAY);
+        let err = map_host_mutate_err(HostConnectorError::Internal("disk".into()));
         assert_eq!(err.0, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
     }
 

@@ -750,3 +750,105 @@ async fn unknown_host_in_archive_session_returns_404() {
 
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+// ── Reject body + remote error statuses ──────────────────────────────────────
+
+/// `/reject` takes an optional body, like approve and cancel: a bare POST is
+/// a reject with no reason (it used to need at least `{}`).
+#[tokio::test]
+async fn reject_accepts_an_empty_body() {
+    let remote = httpmock::MockServer::start_async().await;
+    let m = remote.mock(|when, then| {
+        when.method("POST").path("/api/runs/run_gate/reject");
+        then.status(200)
+            .json_body(serde_json::json!({ "ok": true }));
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    let (addr, host_id) = spawn_with_remote(tmp.path(), &remote.base_url()).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!(
+            "http://{addr}/api/runs/run_gate/reject?host={host_id}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    m.assert();
+
+    // Local: a bodyless reject reaches the store (404 for an unknown run),
+    // not a body-parse refusal.
+    let resp = client
+        .post(format!("http://{addr}/api/runs/run_nope/reject"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// One status table for remote hosts (`api::runs::host_read_error` /
+/// `host_control_error`): an unreachable host is a 502 on every read and
+/// control (was 500 on some), a host's "no such run" a 404, and a host's
+/// refusal of a transition a 409 whichever control it was.
+#[tokio::test]
+async fn remote_host_errors_map_consistently() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Nothing listens on port 1: every call is a transport failure.
+    let (addr, down) = spawn_with_remote(tmp.path(), "http://127.0.0.1:1").await;
+    let client = reqwest::Client::new();
+    for (method, path) in [
+        ("GET", "/api/runs/run_x"),
+        ("GET", "/api/runs/run_x/graph"),
+        ("GET", "/api/runs/run_x/log"),
+        ("GET", "/api/runs/run_x/usage-timeline"),
+        ("GET", "/api/sessions/ses_x"),
+        ("POST", "/api/runs/run_x/approve"),
+        ("POST", "/api/runs/run_x/reject"),
+        ("POST", "/api/runs/run_x/cancel"),
+        ("POST", "/api/runs/run_x/pause"),
+        ("POST", "/api/runs/run_x/resume"),
+    ] {
+        let url = format!("http://{addr}{path}?host={down}");
+        let req = if method == "GET" {
+            client.get(&url)
+        } else {
+            client.post(&url)
+        };
+        let resp = req.send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "{method} {path}");
+    }
+
+    // A reachable host: its 404 is ours, its 409 refusal is ours — for approve
+    // and cancel exactly as for pause.
+    let remote = httpmock::MockServer::start_async().await;
+    remote.mock(|when, then| {
+        when.method("GET").path("/api/runs/run_gone");
+        then.status(404)
+            .json_body(serde_json::json!({ "error": "run run_gone not found" }));
+    });
+    for verb in ["approve", "cancel", "pause"] {
+        remote.mock(|when, then| {
+            when.method("POST")
+                .path(format!("/api/runs/run_done/{verb}"));
+            then.status(409)
+                .json_body(serde_json::json!({ "error": "run is not awaiting that" }));
+        });
+    }
+    let tmp2 = tempfile::tempdir().unwrap();
+    let (addr, up) = spawn_with_remote(tmp2.path(), &remote.base_url()).await;
+    let resp = client
+        .get(format!("http://{addr}/api/runs/run_gone?host={up}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    for verb in ["approve", "cancel", "pause"] {
+        let resp = client
+            .post(format!("http://{addr}/api/runs/run_done/{verb}?host={up}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "{verb}");
+    }
+}
