@@ -6,10 +6,11 @@
 // come from the response's severity facets. The table's Project / Target
 // columns show each finding's owning project · target.
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import {
   api,
+  ApiError,
   apiErrorMessage,
   type FindingOut,
   type FindingRecord,
@@ -113,6 +114,10 @@ export default function Findings() {
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
   const [reload, setReload] = useState(0);
   const [bulkNote, setBulkNote] = useState<{ message: string; ok: boolean } | null>(null);
+  // The query now in the URL: a bulk change that finishes after it moved on
+  // doesn't put its result line on the new list.
+  const currentQ = useRef(q);
+  currentQ.current = q;
 
   // A new query is a new list: nothing carries over from the old one.
   useEffect(() => {
@@ -219,8 +224,11 @@ export default function Findings() {
   // Sent in batches of MAX_TAG_BATCH, one after another. Only the rows that
   // were sent leave the selection, so a row ticked meanwhile stays ticked. A
   // failed first batch is a failed change (it throws); a later one stops the
-  // rest and the result says what was applied before it.
+  // rest and the result says what was applied before it. The server answers
+  // a batch whose ids are all unknown with a 404: those findings were deleted
+  // since the list loaded, so they read as gone and the rest go on.
   const applyBulk = async (mode: 'add' | 'remove', tag: string) => {
+    const forQ = q;
     const rows = selectedRows;
     const ids = [...new Set(rows.map((f) => f.id))];
     const change = mode === 'add' ? { add: [tag] } : { remove: [tag] };
@@ -232,6 +240,11 @@ export default function Findings() {
       try {
         results.push(await api.tagFindings(batch, change));
       } catch (e: unknown) {
+        if (e instanceof ApiError && e.status === 404) {
+          results.push({ workspaces: [], unknown: batch });
+          for (const id of batch) sent.add(id);
+          continue;
+        }
         if (results.length === 0) throw e;
         stopped = { error: apiErrorMessage(e), left: ids.length - i };
         break;
@@ -246,7 +259,7 @@ export default function Findings() {
         }
       : merged;
     const sentKeys = new Set(rows.filter((f) => sent.has(f.id)).map(rowKey));
-    setBulkNote(summary);
+    if (currentQ.current === forQ) setBulkNote(summary);
     setSelected((prev) => new Set([...prev].filter((k) => !sentKeys.has(k))));
     setReload((n) => n + 1);
     return summary;

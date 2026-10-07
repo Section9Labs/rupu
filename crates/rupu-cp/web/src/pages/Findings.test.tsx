@@ -8,7 +8,7 @@ import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act, render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, useNavigate } from 'react-router-dom';
-import { api, type FindingOut, type FindingsResponse, type TagAcrossResult } from '../lib/api';
+import { api, ApiError, type FindingOut, type FindingsResponse, type TagAcrossResult } from '../lib/api';
 
 import Findings from './Findings';
 
@@ -435,17 +435,19 @@ describe('Findings — bulk tagging', () => {
     expect(screen.getByRole('checkbox', { name: 'Select fa' })).not.toBeChecked();
   });
 
-  it('sends a selection over the server limit in batches and merges their results', async () => {
+  it('sends a selection over the server limit in batches; a batch of deleted findings reads as gone', async () => {
     const rows = Array.from({ length: 1001 }, (_, i): FindingOut => ({ ...FINDING, id: `f${i}`, summary: `Issue ${i}` }));
     vi.spyOn(api, 'getFindings').mockResolvedValue(resp(rows));
-    // f1000 is gone; each batch reports it unknown, and the summary counts it once.
-    const tag = vi.spyOn(api, 'tagFindings').mockImplementation(async (ids: string[]) => ({
-      workspaces: [{
-        ws_id: 'ws-1',
-        outcomes: ids.filter((id) => id !== 'f1000').map((id) => ({ finding_id: id, before: [], after: ['triaged'] })),
-      }],
-      unknown: ['f1000'],
-    }));
+    // f1000 was deleted since the list loaded: the server answers its batch,
+    // where every id is unknown, with a 404.
+    const gone = JSON.stringify({ error: 'unknown finding id(s): f1000' });
+    const tag = vi.spyOn(api, 'tagFindings').mockImplementation(async (ids: string[]) => {
+      if (ids.includes('f1000')) throw new ApiError(404, gone, gone);
+      return {
+        workspaces: [{ ws_id: 'ws-1', outcomes: ids.map((id) => ({ finding_id: id, before: [], after: ['triaged'] })) }],
+        unknown: [],
+      };
+    });
     renderPage();
     await waitFor(() => expect(screen.getByText('Issue 0')).toBeInTheDocument());
 
@@ -482,6 +484,33 @@ describe('Findings — bulk tagging', () => {
     expect(screen.getByText('1 selected')).toBeInTheDocument();
     expect(screen.getByRole('checkbox', { name: 'Select f1000' })).toBeChecked();
   }, 30000);
+
+  it("never shows a bulk result from an earlier query on the next one's list", async () => {
+    vi.spyOn(api, 'getFindings').mockResolvedValue(resp([A, B]));
+    let finish!: (r: TagAcrossResult) => void;
+    const tag = vi.spyOn(api, 'tagFindings').mockImplementation(() => new Promise((r) => { finish = r; }));
+    function Nav() {
+      const navigate = useNavigate();
+      return <button onClick={() => navigate('/findings?q=tag%3Ab')}>go-b</button>;
+    }
+    render(
+      <MemoryRouter initialEntries={['/findings?q=tag%3Aa']}>
+        <Nav />
+        <Findings />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByText('Alpha issue')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select fa' }));
+    tagSelected('triaged');
+    await waitFor(() => expect(tag).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByText('go-b'));
+    await waitFor(() => expect(screen.queryByText('1 selected')).toBeNull());
+    await act(async () => finish(outcome('fa')));
+
+    await waitFor(() => expect(api.getFindings).toHaveBeenCalledWith({ q: 'tag:b' }));
+    expect(screen.queryByText(/Tagged 1 finding/)).toBeNull();
+  });
 
   it('keeps the bulk result when the reload after it fails', async () => {
     vi.spyOn(api, 'getFindings')
