@@ -60,6 +60,11 @@ rupu-scm = { path = "../rupu-scm" }
 rupu-mcp = { path = "../rupu-mcp" }
 rupu-findings-report = { path = "../rupu-findings-report", default-features = false }
 rupu-codename = { workspace = true }
+# Agentiflows view: the run-dir record/def/unit readers (`api/agentiflows.rs`).
+# rupu-agentiflow depends on neither rupu-cp nor rupu-cli, so this edge is acyclic.
+rupu-agentiflow = { path = "../rupu-agentiflow" }
+# The board/mailbox stores the steering pass will read; same acyclic edge.
+rupu-fleet = { path = "../rupu-fleet" }
 
 [dev-dependencies]
 chrono.workspace = true

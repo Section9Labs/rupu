@@ -1,4 +1,6 @@
+pub mod agentiflows;
 pub mod agents;
+pub mod assets;
 pub mod autoflow_claims;
 pub mod autoflows;
 pub mod code;

@@ -673,6 +673,181 @@ export interface AutoflowClaim {
   updated_at: string;
 }
 
+// --- Agentiflows (GET /api/agentiflows, GET /api/agentiflows/:id) ----------
+// Mirrors `rupu-cp`'s `api/agentiflows.rs` wire types. Local-only for now.
+
+/** An agentiflow run's lifecycle: it has no paused / awaiting states. */
+export type AgentiflowStatus = 'running' | 'completed' | 'failed';
+
+/** One row of `GET /api/agentiflows` (newest first). */
+export interface AgentiflowRow {
+  id: string;
+  name: string;
+  codename: string;
+  /** True while the codename is derived on read (no stored one yet). */
+  codename_derived: boolean;
+  status: AgentiflowStatus;
+  /** `goals_met` | `coverage_reached` | `budget_exhausted:<dim>` |
+   *  `operator_stop[:now]` | `ceiling` | `error: <msg>` | `orphaned: …`;
+   *  `null` while running. */
+  stop_reason: string | null;
+  rounds: number;
+  goals_met: number;
+  goals_total: number;
+  /** `null` until the run has metered anything. */
+  spent_usd: number | null;
+  spent_tokens: number;
+  started_at: string;
+  ended_at: string | null;
+  engagement_profiles: string[];
+  /** `running` records only: whether the recorded coordinator pid still
+   *  exists. `false` = died without finalizing. `null` otherwise. */
+  runner_alive: boolean | null;
+}
+
+/** A goal's status as of the last evaluation (join to `def.goals` by `id`). */
+export interface AgentiflowGoalStatus {
+  id: string;
+  met: boolean;
+  current: number;
+  target: number;
+}
+
+export interface AgentiflowRecord extends AgentiflowRow {
+  trigger: string;
+  runner_pid: number | null;
+  goals: AgentiflowGoalStatus[];
+}
+
+export interface AgentiflowDefGoal {
+  id: string;
+  objective: string;
+  required: boolean;
+  verify_with: string | null;
+  /** The goal's `target:` in words (`findings, count >= 3, verified by x`). */
+  predicate: string;
+  target: unknown;
+}
+
+/** The caps (`budget:`); each is absent when the definition sets none. */
+export interface AgentiflowBudgetDef {
+  usd?: number | null;
+  tokens?: number | null;
+  /** `Ns` / `Nm` / `Nh` / `Nd`. */
+  wall_clock?: string | null;
+  rounds?: number | null;
+  soft_at?: number | null;
+}
+
+/** The definition snapshot a run started from (`agentiflow.yaml`). */
+export interface AgentiflowDef {
+  name: string;
+  description: string | null;
+  lead: string;
+  engagement_profiles: string[];
+  trigger: string | null;
+  goals: AgentiflowDefGoal[];
+  coverage: { reach: number; depth?: string | null; kinds?: string[] | null } | null;
+  budget: AgentiflowBudgetDef | null;
+  scope: unknown;
+  pool: { agents: string[]; workflows: 'all' | string[] };
+  round: {
+    lead_max_turns?: number | null;
+    ceiling?: { rounds?: number | null; wall_clock?: string | null } | null;
+  } | null;
+}
+
+export type AgentiflowUnitState = 'pending' | 'running' | 'done' | 'failed';
+
+export interface AgentiflowUnitStatus {
+  state: AgentiflowUnitState;
+  /** `done` only. */
+  success?: boolean;
+  /** `done` only: the unit's final answer (can be several KB). */
+  output?: string;
+  /** `failed` only. */
+  error?: string;
+}
+
+/** One branch the lead dispatched. */
+export interface AgentiflowUnit {
+  unit_id: string;
+  codename: string;
+  codename_derived: boolean;
+  /** The pool agent (or workflow) it runs; `null` on a legacy `unit.json`. */
+  agent: string | null;
+  /** The roster name the lead addressed it by (`recon#1`). */
+  participant: string | null;
+  kind: 'agent' | 'workflow';
+  status: AgentiflowUnitStatus;
+  pgid: number | null;
+  started_at: string | null;
+  /** Absolute path; read through `/api/transcript?path=`. */
+  transcript_path: string | null;
+}
+
+export interface AgentiflowLeadTranscript {
+  round: number;
+  path: string;
+}
+
+/** `budget_state`: `ok` | `soft` | `hard:<dimension>`; `null` before any round. */
+export type AgentiflowBudgetState = string;
+
+/** One `events.jsonl` line: `ts` + `kind` (`run_started` | `round` |
+ *  `run_stopped`) plus kind-specific fields (see `rupu_agentiflow::run`). */
+export type AgentiflowEvent = { ts?: string; kind?: string } & Record<string, unknown>;
+
+/** `GET /api/agentiflows/:id`. */
+export interface AgentiflowDetail {
+  record: AgentiflowRecord;
+  def: AgentiflowDef | null;
+  budget_state: AgentiflowBudgetState | null;
+  /** Oldest first. */
+  events: AgentiflowEvent[];
+  units: AgentiflowUnit[];
+  lead_transcripts: AgentiflowLeadTranscript[];
+}
+
+/** One board message — a fire-and-forget post the fleet writes to itself. */
+export interface AgentiflowBoardPost {
+  kind?: string;
+  author?: string;
+  addressed_to?: string | null;
+  ts?: string;
+  body?: string;
+  [k: string]: unknown;
+}
+
+/** `GET /api/agentiflows/:id/messages` — the engagement's board (how the
+ *  agents talk to each other). */
+export interface AgentiflowMessages {
+  posts: AgentiflowBoardPost[];
+  directives: AgentiflowBoardPost[];
+}
+
+/** One asset from `GET /api/assets` — a node in an engagement's asset graph
+ *  (a host, a service, a site, a route, a file …), profile-namespaced. */
+export interface AssetRow {
+  id: string;
+  ws_id: string;
+  project: string;
+  target_id: string;
+  /** Full kind, e.g. `network:service`. */
+  kind: string;
+  /** Owning profile (`network`). */
+  profile: string;
+  /** Bare kind (`service`). */
+  sub_kind: string;
+  /** Parent asset id (a service's host), when in the graph. */
+  parent?: string;
+  label: string;
+  /** Coverage-depth rung reached (`enumerated`, `tested`, …). */
+  depth?: string;
+  /** Flattened locator coordinates: `{host, port, proto, url, path, …}`. */
+  coords: Record<string, unknown>;
+}
+
 /**
  * One raw autoflow-cycle event, as embedded in `AutoflowPriorCycle.events`.
  * Mirrors `rupu_runtime::autoflow_history::AutoflowCycleEvent`'s serde shape
@@ -2670,6 +2845,40 @@ export const api = {
     if (params?.host) q.set('host', params.host);
     const qs = q.toString();
     return request<AutoflowEventRow[]>(`/api/runs/autoflows/events${qs ? `?${qs}` : ''}`, { signal: params?.signal });
+  },
+  /** Agentiflow runs (local only), newest first. */
+  async getAgentiflows(opts?: Cancellable): Promise<AgentiflowRow[]> {
+    const res = await request<{ rows: AgentiflowRow[] }>('/api/agentiflows', { signal: opts?.signal });
+    return res.rows;
+  },
+  /** One agentiflow run: record, definition snapshot, events, units, lead transcripts. */
+  getAgentiflow(id: string, opts?: Cancellable): Promise<AgentiflowDetail> {
+    return request<AgentiflowDetail>(`/api/agentiflows/${encodeURIComponent(id)}`, { signal: opts?.signal });
+  },
+
+  /** The engagement's board — the messages the fleet posts to each other. */
+  getAgentiflowMessages(id: string, opts?: Cancellable): Promise<AgentiflowMessages> {
+    return request<AgentiflowMessages>(`/api/agentiflows/${encodeURIComponent(id)}/messages`, { signal: opts?.signal });
+  },
+
+  /** Queue a steering message for the lead (the `rupu agentiflow send` channel).
+   *  `now` asks for mid-round delivery; `stop` winds the run down after it. */
+  async steerAgentiflow(id: string, body: { message: string; now?: boolean; stop?: boolean }): Promise<void> {
+    await request(`/api/agentiflows/${encodeURIComponent(id)}/steer`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+  },
+
+  /** Engagement assets (hosts/services/sites/routes/files). Optionally scoped
+   *  to one workspace / coverage target. */
+  async getAssets(opts?: { ws_id?: string; target?: string } & Cancellable): Promise<AssetRow[]> {
+    const q = new URLSearchParams();
+    if (opts?.ws_id) q.set('ws_id', opts.ws_id);
+    if (opts?.target) q.set('target', opts.target);
+    const qs = q.toString();
+    const res = await request<{ assets: AssetRow[] }>(`/api/assets${qs ? `?${qs}` : ''}`, { signal: opts?.signal });
+    return res.assets;
   },
   /** Active autoflow claims — leased issues the worker is (or was) driving. */
   getAutoflowClaims(): Promise<AutoflowClaim[]> {

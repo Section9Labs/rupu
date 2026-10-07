@@ -11,8 +11,10 @@ import { getShell, type ShellVersion } from './lib/shell';
 const Dashboard         = React.lazy(() => import('./pages/Dashboard'));
 const Usage             = React.lazy(() => import('./pages/Usage'));
 const RunDetail         = React.lazy(() => import('./pages/RunDetail'));
+const AgentiflowDetail  = React.lazy(() => import('./pages/AgentiflowDetail'));
 const Events            = React.lazy(() => import('./pages/Events'));
 const Coverage          = React.lazy(() => import('./pages/Coverage'));
+const Assets            = React.lazy(() => import('./pages/Assets'));
 const Netflow           = React.lazy(() => import('./pages/Netflow'));
 const CoverageDetail    = React.lazy(() => import('./pages/CoverageDetail'));
 const CoverageTemplates = React.lazy(() => import('./pages/CoverageTemplates'));
@@ -33,6 +35,7 @@ const Settings          = React.lazy(() => import('./pages/Settings'));
 const AgentRuns         = React.lazy(() => import('./pages/runs/AgentRuns'));
 const WorkflowRuns      = React.lazy(() => import('./pages/runs/WorkflowRuns'));
 const AutoflowRuns      = React.lazy(() => import('./pages/runs/AutoflowRuns'));
+const AgentiflowRuns    = React.lazy(() => import('./pages/runs/AgentiflowRuns'));
 const Projects          = React.lazy(() => import('./pages/Projects'));
 const ProjectDetail     = React.lazy(() => import('./pages/ProjectDetail'));
 const Customers         = React.lazy(() => import('./pages/customers/Customers'));
@@ -104,10 +107,14 @@ export function AppRoutes({ shell }: { shell: ShellVersion }) {
         <Route path="/runs/agents"    element={v2 ? <Navigate to="/activity?tab=agents" replace /> : page(<AgentRuns />)} />
         <Route path="/runs/workflows" element={v2 ? <Navigate to="/activity?tab=workflows" replace /> : page(<WorkflowRuns />)} />
         <Route path="/runs/autoflows" element={v2 ? <Navigate to="/activity?tab=autoflows" replace /> : page(<AutoflowRuns />)} />
+        {/* Agentiflows are a sidebar-only destination (no Activity top-strip
+            tab): render the standalone list directly under BOTH shells. */}
+        <Route path="/runs/agentiflows" element={page(<AgentiflowRuns />)} />
         {/* Bare /runs → redirect to workflow runs (canonical execution list) */}
         <Route path="/runs" element={<Navigate to={v2 ? '/activity' : '/runs/workflows'} replace />} />
         {/* Run detail graph — wildcard must come after static /runs/* segments */}
         <Route path="/runs/:id" element={page(<RunDetail />)} />
+        <Route path="/agentiflows/:id" element={page(<AgentiflowDetail />)} />
         <Route path="/events" element={page(<Events />)} />
         <Route path="/coverage" element={v2 ? <Navigate to="/security?tab=coverage" replace /> : page(<Coverage />)} />
         <Route path="/coverage/templates" element={v2 ? <Navigate to="/security?tab=catalog" replace /> : page(<CoverageTemplates />)} />
@@ -117,6 +124,8 @@ export function AppRoutes({ shell }: { shell: ShellVersion }) {
         <Route path="/coverage/:target/diff" element={page(<CoverageDetail tab="diff" />)} />
         <Route path="/coverage/:target" element={page(<CoverageDetail />)} />
         <Route path="/netflow" element={page(<Netflow />)} />
+        {/* Assets — engagement asset inventory (sidebar-only; standalone under both shells). */}
+        <Route path="/assets" element={page(<Assets />)} />
         <Route path="/findings" element={v2 ? <RedirectKeepingSearch to="/security?tab=findings" /> : page(<Findings />)} />
         {/* Per-finding report — a detail route, so it is NOT redirected under v2. */}
         <Route path="/findings/:id" element={page(<FindingDetail />)} />
