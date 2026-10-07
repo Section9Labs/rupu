@@ -50,7 +50,8 @@ pub use lead::{
 pub use operator::{OperatorMessage, OperatorQueue};
 pub use proc::{kill_group, pid_is_running, terminate_group, terminate_pid};
 pub use reaper::{
-    finalize_failed, hard_stop, reap_orphaned_agentiflows, HardStopOutcome, ReapSummary,
+    finalize_failed, hard_stop, hard_stop_with, reap_orphaned_agentiflows, HardStopGrace,
+    HardStopOutcome, ReapSummary,
 };
 pub use roster::{roster_collector, roster_tools, RosterCollector, RosterCtx};
 pub use run::{

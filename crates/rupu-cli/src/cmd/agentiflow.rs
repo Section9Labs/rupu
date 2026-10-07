@@ -2445,6 +2445,17 @@ mod tests {
     }
 
     #[test]
+    fn a_hard_stops_coordinator_grace_outlasts_the_sigterm_credential_drain() {
+        // `stop --now` SIGTERMs the coordinator, whose handler waits for
+        // credential writes (`exit`'s drain, then its stderr lines) before it
+        // dies; the stop must not SIGKILL it inside that wait, or a rotated
+        // OAuth refresh token is lost.
+        let wait = crate::exit::CREDENTIAL_WRITE_DRAIN + 3 * crate::exit::SIGTERM_STDERR_GRACE;
+        let grace = rupu_agentiflow::HardStopGrace::default().coordinator;
+        assert!(grace > wait, "grace {grace:?} <= handler wait {wait:?}");
+    }
+
+    #[test]
     fn send_and_stop_parse_and_take_only_the_table_format() {
         let send = parse(["rupu", "agentiflow", "send", "af_01ABC", "look at auth"]);
         match &send {

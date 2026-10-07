@@ -67,8 +67,43 @@ use crate::supervisor::units_on_disk;
 /// How long a SIGTERMed unit group gets to exit before SIGKILL. Matches the
 /// grace `SubprocessUnitLauncher`'s `Drop` gives a unit on the graceful path.
 const TERM_GRACE: Duration = Duration::from_millis(1500);
+/// How long a hard-stopped coordinator's own process group gets to exit before
+/// SIGKILL.
+///
+/// Longer than [`TERM_GRACE`] on purpose. The coordinator keeps the CLI's
+/// process-wide SIGTERM handler, which on a signal waits for OAuth refreshes
+/// still being persisted (`rupu-cli`'s `exit::CREDENTIAL_WRITE_DRAIN`, 10s, plus
+/// up to three `SIGTERM_STDERR_GRACE`s of 250ms for its own log lines) and only
+/// then dies by the signal, so a rotated refresh token is not lost. A SIGKILL
+/// inside that wait would lose it (the next run would need a fresh login). This
+/// must stay above that wait; `rupu-cli` pins the relation in a test. The poll
+/// returns the moment the coordinator is gone, so the long bound costs nothing
+/// in the common case (a coordinator with nothing to drain dies in
+/// milliseconds); it only bites for one that is genuinely still draining, or a
+/// bash child that will not die.
+const COORDINATOR_TERM_GRACE: Duration = Duration::from_secs(12);
 /// How often the grace re-checks whether the signalled groups are gone.
 const GRACE_POLL: Duration = Duration::from_millis(25);
+
+/// How long [`hard_stop_with`] waits, after SIGTERM, before it SIGKILLs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HardStopGrace {
+    /// For each of the run's unit process groups (default [`TERM_GRACE`]).
+    pub units: Duration,
+    /// For the coordinator's own process group, when it leads one, counted from
+    /// its SIGTERM (default 12s: above the CLI's credential-write drain on
+    /// SIGTERM, which a SIGKILL must never cut short).
+    pub coordinator: Duration,
+}
+
+impl Default for HardStopGrace {
+    fn default() -> Self {
+        Self {
+            units: TERM_GRACE,
+            coordinator: COORDINATOR_TERM_GRACE,
+        }
+    }
+}
 
 /// What one [`reap_orphaned_agentiflows`] sweep did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -156,7 +191,7 @@ fn reap_one(run_dir: &Path, now: DateTime<Utc>) -> bool {
         return false;
     };
 
-    wind_down_units(run_dir, None);
+    wind_down_units(run_dir, TERM_GRACE);
 
     // The grace can be long enough for something else to have settled the run (a
     // second reaper, or a resume that stamped a new owner): re-read and judge
@@ -248,9 +283,11 @@ pub enum HardStopOutcome {
 ///    exits the process without running any cleanup, so nothing below is left
 ///    to it.
 /// 3. Wind down the run's units: SIGTERM each live unit group, a bounded
-///    grace, SIGKILL whatever outlived it (the reaper's own wind-down; the
-///    coordinator's group shares the grace). An operator who asks for a hard
-///    stop gets the escalation.
+///    grace, SIGKILL whatever outlived it (the reaper's own wind-down). An
+///    operator who asks for a hard stop gets the escalation. The coordinator's
+///    own group (step 2) is waited on separately, for the longer
+///    [`HardStopGrace::coordinator`], because the coordinator drains
+///    credential writes on SIGTERM and a SIGKILL must not cut that short.
 /// 4. RE-READ the record and, only if it is STILL `running`, [`finalize_failed`]
 ///    it (`operator_stop:now`). The grace is long enough for the run to have
 ///    finished on its own meanwhile; the stale snapshot from step 1 must never
@@ -264,16 +301,28 @@ pub enum HardStopOutcome {
 /// harmless. `hard_stop` deliberately does not wait on the coordinator pid to
 /// close that window, because a zombie parent makes such a wait flaky.
 ///
-/// Blocking (file IO and up to [`TERM_GRACE`] of grace): call it from
-/// `spawn_blocking` in async code. A record that cannot be read, or the final
-/// write failing, is an error; every signal failure is only logged.
+/// Blocking (file IO, up to [`TERM_GRACE`] of grace for the units, and for a
+/// coordinator that leads its own group up to [`COORDINATOR_TERM_GRACE`], which
+/// ends the moment it exits): call it from `spawn_blocking` in async code. A
+/// record that cannot be read, or the final write failing, is an error; every
+/// signal failure is only logged.
 pub fn hard_stop(run_dir: &Path, now: DateTime<Utc>) -> std::io::Result<HardStopOutcome> {
+    hard_stop_with(run_dir, now, HardStopGrace::default())
+}
+
+/// [`hard_stop`] with the SIGTERM graces given (the test seam: the production
+/// values are [`HardStopGrace::default`]).
+pub fn hard_stop_with(
+    run_dir: &Path,
+    now: DateTime<Utc>,
+    grace: HardStopGrace,
+) -> std::io::Result<HardStopOutcome> {
     let record = AgentiflowRecord::read(run_dir)?;
     if record.status != "running" {
         return Ok(HardStopOutcome::AlreadyTerminal(record.status));
     }
 
-    let mut coordinator_group = None;
+    let mut coordinator_group: Option<(u32, Instant)> = None;
     if let Some(pid) = record.runner_pid {
         if pid_is_running(pid) {
             // A detached coordinator leads its own group, and what its lead's
@@ -283,7 +332,7 @@ pub fn hard_stop(run_dir: &Path, now: DateTime<Utc>) -> std::io::Result<HardStop
             // its shell's group, which is not ours to signal: just the pid.
             let delivered = if leads_own_group(pid) {
                 let delivered = terminate_group(pid);
-                coordinator_group = delivered.then_some(pid);
+                coordinator_group = delivered.then(|| (pid, Instant::now()));
                 delivered
             } else {
                 terminate_pid(pid)
@@ -293,7 +342,10 @@ pub fn hard_stop(run_dir: &Path, now: DateTime<Utc>) -> std::io::Result<HardStop
             }
         }
     }
-    wind_down_units(run_dir, coordinator_group);
+    wind_down_units(run_dir, grace.units);
+    if let Some((pgid, signalled_at)) = coordinator_group {
+        wind_down_coordinator(pgid, signalled_at + grace.coordinator);
+    }
 
     let mut record = AgentiflowRecord::read(run_dir)?;
     if record.status != "running" {
@@ -311,13 +363,11 @@ pub fn hard_stop(run_dir: &Path, now: DateTime<Utc>) -> std::io::Result<HardStop
 }
 
 /// SIGTERM every live, non-terminal unit group the run recorded, give them
-/// [`TERM_GRACE`], then SIGKILL the ones still standing. One pass, bounded:
-/// neither a sweep nor a hard stop may hang on a unit that will not die.
-///
-/// `already_signalled` is a group the caller has just sent SIGTERM (a hard
-/// stop's coordinator group): it shares the grace and the SIGKILL.
-fn wind_down_units(run_dir: &Path, already_signalled: Option<u32>) {
-    let mut signalled: Vec<u32> = already_signalled.into_iter().collect();
+/// `grace` ([`TERM_GRACE`] in production), then SIGKILL the ones still
+/// standing. One pass, bounded: neither a sweep nor a hard stop may hang on a
+/// unit that will not die.
+fn wind_down_units(run_dir: &Path, grace: Duration) {
+    let mut signalled: Vec<u32> = Vec::new();
     for unit in units_on_disk(run_dir) {
         if unit.status.is_terminal() {
             continue;
@@ -341,7 +391,7 @@ fn wind_down_units(run_dir: &Path, already_signalled: Option<u32>) {
         return;
     }
 
-    let deadline = Instant::now() + TERM_GRACE;
+    let deadline = Instant::now() + grace;
     while Instant::now() < deadline && signalled.iter().any(|&g| pid_is_running(g)) {
         std::thread::sleep(GRACE_POLL);
     }
@@ -351,6 +401,26 @@ fn wind_down_units(run_dir: &Path, already_signalled: Option<u32>) {
             if !kill_group(pgid) {
                 tracing::warn!(pgid, "could not SIGKILL a unit's process group");
             }
+        }
+    }
+}
+
+/// Wait, until `deadline`, for a coordinator group that has been sent SIGTERM
+/// to exit, then SIGKILL it if its leader is still standing. Returns as soon as
+/// the leader is gone: a coordinator with nothing to drain dies at once, and
+/// one that is still persisting a rotated credential is given the time
+/// ([`COORDINATOR_TERM_GRACE`]) before anything harsher.
+fn wind_down_coordinator(pgid: u32, deadline: Instant) {
+    while Instant::now() < deadline && pid_is_running(pgid) {
+        std::thread::sleep(GRACE_POLL);
+    }
+    if pid_is_running(pgid) {
+        tracing::warn!(
+            pgid,
+            "the coordinator outlived its SIGTERM grace; sending SIGKILL"
+        );
+        if !kill_group(pgid) {
+            tracing::warn!(pgid, "could not SIGKILL the coordinator's process group");
         }
     }
 }

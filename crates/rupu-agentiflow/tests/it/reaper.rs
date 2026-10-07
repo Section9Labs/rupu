@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use rupu_agentiflow::{
-    agentiflow_dir, hard_stop, kill_group, pid_is_running, reap_orphaned_agentiflows,
-    AgentiflowRecord, HardStopOutcome,
+    agentiflow_dir, hard_stop, hard_stop_with, kill_group, pid_is_running,
+    reap_orphaned_agentiflows, AgentiflowRecord, HardStopGrace, HardStopOutcome,
 };
 use rupu_runtime::RunTriggerSource;
 use serde_json::{json, Value};
@@ -540,12 +540,89 @@ fn a_hard_stop_signals_the_whole_group_of_a_detached_coordinator() {
     let tool = Member::spawn(Some(coordinator.pgid));
     write_running_record(&global, "af_live", Some(coordinator.pgid));
 
+    let started = Instant::now();
     let out = hard_stop(&run_dir(&global, "af_live"), Utc::now()).unwrap();
 
     assert_eq!(out, HardStopOutcome::Stopped);
     wait_until_dead(coordinator.pgid);
     wait_until_dead(tool.pid);
     assert_eq!(read_record(&global, "af_live").status, "failed");
+    // A coordinator that dies on SIGTERM is not waited on for its (long) grace.
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the stop held for the coordinator's grace: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_coordinator_group_that_is_still_draining_outlasts_the_units_grace() {
+    let global = tempdir().unwrap();
+    // The coordinator's SIGTERM handler waits for credential writes before it
+    // dies; a leader that ignores SIGTERM stands in for one still doing that.
+    // A SIGKILL inside the wait would lose a rotated refresh token.
+    let coordinator = Sleeper::spawn_ignoring_sigterm();
+    let unit = Sleeper::spawn_ignoring_sigterm();
+    write_running_record(&global, "af_drain", Some(coordinator.pgid));
+    write_unit(&global, "af_drain", "u1", Some(unit.pgid), "running");
+    let grace = HardStopGrace {
+        units: Duration::from_millis(300),
+        coordinator: Duration::from_millis(2500),
+    };
+
+    let dir = run_dir(&global, "af_drain");
+    let started = Instant::now();
+    let stopper = std::thread::spawn(move || hard_stop_with(&dir, Utc::now(), grace).unwrap());
+
+    // The unit is SIGKILLed at its short grace...
+    let deadline = Instant::now() + Duration::from_millis(2000);
+    while Instant::now() < deadline && pid_is_running(unit.pgid) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let unit_gone_at = started.elapsed();
+    assert!(!pid_is_running(unit.pgid), "the unit outlived its grace");
+    assert!(
+        unit_gone_at < Duration::from_millis(2000),
+        "{unit_gone_at:?}"
+    );
+    // ...while the coordinator, past that same moment, has NOT been killed.
+    assert!(
+        pid_is_running(coordinator.pgid),
+        "the coordinator was SIGKILLed at the units' grace ({unit_gone_at:?}), cutting its drain short"
+    );
+
+    // It is killed once its own, longer grace (counted from its SIGTERM) is up.
+    let out = stopper.join().unwrap();
+    let took = started.elapsed();
+    assert_eq!(out, HardStopOutcome::Stopped);
+    assert!(
+        took >= Duration::from_millis(2400),
+        "the stop did not wait out the coordinator's grace: {took:?}"
+    );
+    wait_until_dead(coordinator.pgid);
+    assert_eq!(read_record(&global, "af_drain").status, "failed");
+}
+
+#[test]
+fn a_coordinator_that_dies_at_once_does_not_hold_the_stop_for_its_grace() {
+    let global = tempdir().unwrap();
+    let coordinator = Sleeper::spawn(); // dies on SIGTERM
+    write_running_record(&global, "af_fast", Some(coordinator.pgid));
+    let grace = HardStopGrace {
+        units: Duration::from_millis(1500),
+        coordinator: Duration::from_secs(60),
+    };
+
+    let started = Instant::now();
+    let out = hard_stop_with(&run_dir(&global, "af_fast"), Utc::now(), grace).unwrap();
+
+    assert_eq!(out, HardStopOutcome::Stopped);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the poll did not return when the coordinator went: {:?}",
+        started.elapsed()
+    );
+    wait_until_dead(coordinator.pgid);
 }
 
 #[test]
