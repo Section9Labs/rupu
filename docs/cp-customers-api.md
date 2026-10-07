@@ -263,8 +263,9 @@ which customer every scoped page filters to; the pages pass it as `?customer=`.
   block under the brand, and a compact button in the v2 top bar. A search box,
   "All customers", the customers (dot, name), "Unassigned", and a footer with
   "Show archived" and "Manage →" (the Customers page).
-- A scoped page's header carries a **scope chip** (customer dot + name + ×,
-  which clears the scope; "Unassigned" for `none`).
+- The Dashboard and Usage headers carry a **scope chip** (customer dot + name
+  + ×, which clears the scope; "Unassigned" for `none`). The other scoped
+  pages show the scope through the picker, which always displays it.
 
 ### Which pages filter
 
