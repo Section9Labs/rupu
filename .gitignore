@@ -25,3 +25,6 @@ apps/rupu-macos/*.xcodeproj
 apps/rupu-macos/RupuKit/.build/
 apps/rupu-macos/DerivedData/
 .swiftpm/
+
+# runtime coverage ledgers (not samples)
+.rupu/coverage/

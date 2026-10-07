@@ -1,11 +1,13 @@
 // @vitest-environment jsdom
-// AgentiflowDetail — header, goals joined to the definition, budget bars, the
-// fleet, the lead transcript (last round) and the event log, from one
-// GET /api/agentiflows/:id. TranscriptPanel is mocked (heavy; its own tests).
+// AgentiflowDetail — header + goals + budget (always shown) plus the tabbed
+// Flow (graph + fleet) / Findings / Assets / Messages / Transcript / Events
+// views over one GET /api/agentiflows/:id. TranscriptPanel is mocked (heavy;
+// its own tests); the Findings/Assets/Messages tabs fetch on open and aren't
+// exercised here.
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
-import { render, screen, cleanup, within } from '@testing-library/react';
+import { render, screen, cleanup, within, fireEvent } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { api, ApiError, type AgentiflowDetail as Detail } from '../lib/api';
 
@@ -147,20 +149,24 @@ describe('AgentiflowDetail', () => {
     expect(screen.getByRole('progressbar', { name: 'rounds used' })).toHaveAttribute('aria-valuenow', '100');
     expect(screen.getByRole('progressbar', { name: 'spend used' })).toHaveAttribute('aria-valuenow', '25');
 
-    // Fleet: both units, the failed one's error is available.
-    expect(screen.getByText('heron#1 · recon')).toBeInTheDocument();
-    expect(screen.getByText('lynx#1 · triage')).toBeInTheDocument();
-    expect(screen.getByText('spawn failed')).toBeInTheDocument();
-    expect(screen.getByText('found three things')).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: 'transcript' })).toHaveAttribute(
+    // Fleet (the default Flow tab). Unit identities also render in the graph
+    // above, so scope these assertions to the Fleet panel.
+    const fleet = screen.getByRole('heading', { name: 'Fleet' }).closest('section')!;
+    expect(within(fleet).getByText('heron#1 · recon')).toBeInTheDocument();
+    expect(within(fleet).getByText('lynx#1 · triage')).toBeInTheDocument();
+    expect(within(fleet).getByText('spawn failed')).toBeInTheDocument();
+    expect(within(fleet).getByText('found three things')).toBeInTheDocument();
+    expect(within(fleet).getByRole('link', { name: 'transcript' })).toHaveAttribute(
       'href',
       `/transcript?path=${encodeURIComponent('/tmp/u1.jsonl')}&live=0`,
     );
 
-    // The lead transcript is the LAST round's, not live (the run is over).
+    // Transcript tab: the LAST round's, not live (the run is over).
+    fireEvent.click(screen.getByRole('button', { name: 'Transcript' }));
     expect(screen.getByTestId('transcript-panel')).toHaveTextContent('/tmp/lead/transcript.r1.jsonl:false');
 
-    // Events are newest first.
+    // Events tab, newest first.
+    fireEvent.click(screen.getByRole('button', { name: 'Events' }));
     const events = screen.getByRole('heading', { name: 'Events' }).closest('section')!;
     const items = within(events).getAllByRole('listitem');
     expect(items).toHaveLength(3);
@@ -175,6 +181,8 @@ describe('AgentiflowDetail', () => {
     // The goal id stands in for the objective; no caps to compare against.
     expect(await screen.findByText('real-issues')).toBeInTheDocument();
     expect(screen.getByText(/Definition snapshot unavailable/)).toBeInTheDocument();
+    // The transcript tab shows the empty state when there is no lead transcript.
+    fireEvent.click(screen.getByRole('button', { name: 'Transcript' }));
     expect(screen.getByText('No lead transcript yet.')).toBeInTheDocument();
   });
 
@@ -185,6 +193,8 @@ describe('AgentiflowDetail', () => {
     });
     renderDetail();
     expect(await screen.findByText(/no longer running/)).toHaveTextContent('pid 4242');
+    // The lead transcript tails live while the run is running.
+    fireEvent.click(screen.getByRole('button', { name: 'Transcript' }));
     expect(screen.getByTestId('transcript-panel')).toHaveTextContent('transcript.r1.jsonl:true');
   });
 
