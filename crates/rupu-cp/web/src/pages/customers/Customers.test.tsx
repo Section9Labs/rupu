@@ -204,24 +204,62 @@ describe('Customers page', () => {
     expect(within(cost).queryByText(/% from/)).toBeNull();
   });
 
+  const withUsage = (slug: string, name: string, usage: Partial<CustomerRow['rollup']['usage']>) =>
+    row({
+      slug,
+      name,
+      rollup: {
+        projects: 1,
+        run_count: 2,
+        usage: { ...USAGE, cost_usd: 5, runs: 2, ...usage },
+        findings_open: 0,
+        last_active: null,
+      },
+    });
+
   it('counts the customers when several have unpriced usage', async () => {
-    const mk = (slug: string, name: string) =>
-      row({
-        slug,
-        name,
-        rollup: {
-          projects: 1,
-          run_count: 2,
-          usage: { ...USAGE, cost_usd: 5, priced: true, partial: true, runs: 2 },
-          findings_open: 0,
-          last_active: null,
-        },
-      });
-    getCustomers.mockResolvedValue([ACME, mk('a', 'Aaa'), mk('b', 'Bbb')]);
+    getCustomers.mockResolvedValue([
+      ACME,
+      withUsage('a', 'Aaa', { cost_usd: null, priced: false }),
+      withUsage('b', 'Bbb', { cost_usd: null, priced: false }),
+    ]);
     mount();
     await screen.findByText('Acme Corp');
     expect(
       within(screen.getByTestId('tile-cost')).getByText('excludes unpriced usage from 2 customers'),
+    ).toBeInTheDocument();
+  });
+
+  it('a partial fold says the total may be understated, not that it excludes anything', async () => {
+    getCustomers.mockResolvedValue([ACME, withUsage('a', 'Aaa', { partial: true })]);
+    mount();
+    await screen.findByText('Acme Corp');
+    const cost = within(screen.getByTestId('tile-cost'));
+    expect(cost.getByText('some usage unreadable — may be understated')).toBeInTheDocument();
+    expect(cost.queryByText(/excludes/)).toBeNull();
+  });
+
+  it('a failed fold (partial with zero runs) still says so', async () => {
+    getCustomers.mockResolvedValue([ACME, withUsage('a', 'Aaa', { partial: true, runs: 0, cost_usd: 0 })]);
+    mount();
+    await screen.findByText('Acme Corp');
+    expect(
+      within(screen.getByTestId('tile-cost')).getByText('some usage unreadable — may be understated'),
+    ).toBeInTheDocument();
+  });
+
+  it('says both when one customer is unpriced and another partial', async () => {
+    getCustomers.mockResolvedValue([
+      ACME,
+      withUsage('a', 'Aaa', { cost_usd: null, priced: false }),
+      withUsage('b', 'Bbb', { partial: true }),
+    ]);
+    mount();
+    await screen.findByText('Acme Corp');
+    expect(
+      within(screen.getByTestId('tile-cost')).getByText(
+        'excludes unpriced usage from Aaa; some usage unreadable — may be understated',
+      ),
     ).toBeInTheDocument();
   });
 
