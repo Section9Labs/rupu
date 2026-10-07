@@ -16,12 +16,18 @@ export function TagInput({
   onSubmit,
   onCancel,
   label,
+  busy = false,
 }: {
   suggestions: TagSuggestion[];
   exclude?: string[];
-  onSubmit: (tag: string) => void;
+  /** Receives the normalized tag. The typed text is kept when this returns
+   *  (or resolves to) `false`, or throws/rejects, so a failed submit can be
+   *  retried or corrected; anything else clears it. */
+  onSubmit: (tag: string) => void | boolean | Promise<void | boolean>;
   onCancel?: () => void;
   label: string;
+  /** A submit is in flight: the input is read-only and further submits are ignored. */
+  busy?: boolean;
 }) {
   const listId = useId();
   const [text, setText] = useState('');
@@ -38,13 +44,20 @@ export function TagInput({
       .slice(0, 8);
   }, [suggestions, exclude, text]);
 
-  const submit = (raw: string) => {
+  const submit = async (raw: string) => {
+    if (busy) return;
     const p = parseTag(raw);
     if (!p.ok) {
       setError(p.message);
       return;
     }
-    onSubmit(p.tag);
+    let ok: void | boolean;
+    try {
+      ok = await onSubmit(p.tag);
+    } catch {
+      return;
+    }
+    if (ok === false) return;
     setText('');
     setActive(-1);
     setError(null);
@@ -62,6 +75,8 @@ export function TagInput({
         aria-activedescendant={active >= 0 ? `${listId}-${active}` : undefined}
         autoFocus
         value={text}
+        readOnly={busy}
+        aria-busy={busy}
         placeholder="tag…"
         onChange={(e) => {
           setText(e.target.value);
@@ -76,7 +91,7 @@ export function TagInput({
             setActive((i) => (i + step + options.length + (i < 0 && step < 0 ? 1 : 0)) % options.length);
           } else if (e.key === 'Enter') {
             e.preventDefault();
-            submit(active >= 0 && options[active] ? options[active].tag : text);
+            void submit(active >= 0 && options[active] ? options[active].tag : text);
           } else if (e.key === 'Escape') {
             e.preventDefault();
             onCancel?.();
@@ -103,7 +118,7 @@ export function TagInput({
               role="option"
               aria-selected={i === active}
               onMouseDown={(e) => e.preventDefault()}
-              onClick={() => submit(o.tag)}
+              onClick={() => void submit(o.tag)}
               className={cn(
                 'flex cursor-pointer items-center justify-between px-3 py-1 font-mono text-note',
                 i === active ? 'bg-surface-active text-ink' : 'text-ink-dim hover:bg-surface-hover',

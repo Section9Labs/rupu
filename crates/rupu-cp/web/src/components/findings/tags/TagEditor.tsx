@@ -1,7 +1,7 @@
 // A finding's tags, editable: ✕ removes, "+ tag" adds (TagInput). Read-only
 // with a reason when the finding's tag log can't be read (decision A).
 import { Plus, X } from 'lucide-react';
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { apiErrorMessage } from '../../../lib/api';
 import { TagInput, type TagSuggestion } from './TagInput';
 
@@ -22,14 +22,23 @@ export function TagEditor({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const run = async (f: () => Promise<void>) => {
+  // A ref as well as state: a second submit in the same tick must see the first.
+  const inFlight = useRef(false);
+
+  /** Runs one change; false when it failed (the error is shown) or another is in flight. */
+  const run = async (f: () => Promise<void>): Promise<boolean> => {
+    if (inFlight.current) return false;
+    inFlight.current = true;
     setBusy(true);
     setError(null);
     try {
       await f();
+      return true;
     } catch (e: unknown) {
       setError(apiErrorMessage(e));
+      return false;
     } finally {
+      inFlight.current = false;
       setBusy(false);
     }
   };
@@ -64,9 +73,10 @@ export function TagEditor({
           label="Add tag"
           suggestions={suggestions}
           exclude={tags}
+          busy={busy}
           onCancel={() => setAdding(false)}
           onSubmit={(t) =>
-            void run(async () => {
+            run(async () => {
               await onAdd(t);
               setAdding(false);
             })

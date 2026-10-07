@@ -40,6 +40,30 @@ describe('TagEditor', () => {
     fireEvent.keyDown(screen.getByRole('combobox', { name: 'Add tag' }), { key: 'Enter' });
     expect(await screen.findByRole('alert')).toHaveTextContent('too many tags');
   });
+  it('keeps the typed text when onAdd fails', async () => {
+    render(<TagEditor tags={[]} suggestions={[]} onAdd={vi.fn().mockRejectedValue(new Error('too many tags'))} onRemove={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: 'tag' }));
+    const box = screen.getByRole('combobox', { name: 'Add tag' });
+    fireEvent.change(box, { target: { value: 'triaged' } });
+    fireEvent.keyDown(box, { key: 'Enter' });
+    expect(await screen.findByRole('alert')).toHaveTextContent('too many tags');
+    expect(screen.getByRole('combobox', { name: 'Add tag' })).toHaveValue('triaged');
+  });
+  it('ignores a repeat submit while onAdd is pending', async () => {
+    let resolve!: () => void;
+    const onAdd = vi.fn().mockImplementation(() => new Promise<void>((r) => { resolve = r; }));
+    render(<TagEditor tags={[]} suggestions={[]} onAdd={onAdd} onRemove={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: 'tag' }));
+    const box = screen.getByRole('combobox', { name: 'Add tag' });
+    fireEvent.change(box, { target: { value: 'triaged' } });
+    fireEvent.keyDown(box, { key: 'Enter' });
+    fireEvent.keyDown(box, { key: 'Enter' });
+    expect(onAdd).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('alert')).toBeNull();
+    resolve();
+    await waitFor(() => expect(screen.queryByRole('combobox', { name: 'Add tag' })).toBeNull());
+    expect(onAdd).toHaveBeenCalledTimes(1);
+  });
   it('is read-only with a reason when disabled', () => {
     render(<TagEditor tags={['x']} suggestions={[]} disabledReason="this project's tags couldn't be read" onAdd={vi.fn()} onRemove={vi.fn()} />);
     expect(screen.queryByRole('button', { name: 'Remove tag x' })).toBeNull();
