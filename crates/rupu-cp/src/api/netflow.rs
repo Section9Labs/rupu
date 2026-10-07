@@ -54,6 +54,7 @@
 //! sweep, unrelated API calls), not just the netflow caller. [`run_blocking`]
 //! is the one place every such read goes through instead.
 
+use crate::netflow_index::{LedgerReader, NetflowIndex};
 use crate::{
     api::run_resolve::{resolve_run_location, RunLocation},
     api::runs::{resolve_host, run_not_found_or_internal},
@@ -325,6 +326,15 @@ fn netflow_config(s: &AppState) -> rupu_config::NetflowConfig {
         .read()
         .map(|c| c.netflow.clone())
         .unwrap_or_default()
+}
+
+/// The shared index with the configured budget applied (read per request,
+/// so a config edit takes effect without a restart).
+fn index_for(s: &AppState) -> Arc<NetflowIndex> {
+    let mb = netflow_config(s).cp_index_budget_mb;
+    s.netflow_index
+        .set_budget_bytes(mb.saturating_mul(1024 * 1024));
+    Arc::clone(&s.netflow_index)
 }
 
 /// Process-wide cache for the parsed ASN table, keyed on the on-disk file's
@@ -775,7 +785,7 @@ impl RunMetaIndex {
     /// sub-agent ids of every run folded in. At project scope this IS the
     /// project's own id set, which is what makes the index reusable as
     /// the global-fallback recovery pass's input
-    /// ([`project_fallback_flows_and_dropped`]) instead of a second,
+    /// ([`project_fallback_ledger_files`]) instead of a second,
     /// identical walk producing the same ids.
     fn ledger_ids(&self) -> impl Iterator<Item = &String> {
         self.map.keys()
@@ -790,7 +800,7 @@ impl RunMetaIndex {
 /// apply there).
 ///
 /// This is the attribution-safety property the id-driven global-fallback
-/// pass ([`project_fallback_flows_and_dropped`]) depends on: a run
+/// pass ([`project_fallback_ledger_files`]) depends on: a run
 /// belonging to some OTHER project never contributes an id here just
 /// because its ledger happens to live in the same shared
 /// `<global_dir>/netflow/` directory — only a run record that itself
@@ -983,7 +993,7 @@ fn global_store_fingerprint(
 /// neither forces one rebuild before it can ever be reported as the
 /// explicit `unknown` workflow; an id a rebuild still can't resolve (an
 /// orphaned ledger whose run record is gone — permanently unresolvable
-/// by construction, see [`project_fallback_flows_and_dropped`]'s closing
+/// by construction, see [`project_fallback_ledger_files`]'s closing
 /// note) is remembered so it cannot silently degrade the cache to a
 /// per-request full walk forever. `known_unknown` is reset whenever the
 /// fingerprint changes — a store change is exactly the event that could
@@ -1141,13 +1151,23 @@ pub(crate) fn build_filtered_response(
 /// coordinator over ssh — a host with no generic-GET surface. One
 /// implementation of the ledger+transcript merge, not two that can drift.
 pub fn run_scoped_flows_and_dropped(
+    reader: &dyn LedgerReader,
     store: &RunStore,
     run_id: &str,
     workspace: &StdPath,
     global_dir: &StdPath,
     range: &rupu_netflow::ledger::TimeRange,
 ) -> (Vec<FlowRecord>, u64) {
-    run_scoped_flows_and_dropped_with(store, run_id, workspace, global_dir, range, Vec::new(), 0)
+    run_scoped_flows_and_dropped_with(
+        reader,
+        store,
+        run_id,
+        workspace,
+        global_dir,
+        range,
+        Vec::new(),
+        0,
+    )
 }
 
 /// [`run_scoped_flows_and_dropped`] plus ledger flows read from somewhere
@@ -1166,7 +1186,9 @@ pub fn run_scoped_flows_and_dropped(
 /// `extra_dropped` is added to the local dropped count — records lost on
 /// the remote are lost just the same, and folding them to zero here would
 /// claim a completeness we do not have.
+#[allow(clippy::too_many_arguments)]
 pub fn run_scoped_flows_and_dropped_with(
+    reader: &dyn LedgerReader,
     store: &RunStore,
     run_id: &str,
     workspace: &StdPath,
@@ -1182,8 +1204,7 @@ pub fn run_scoped_flows_and_dropped_with(
     let mut dropped = extra_dropped;
     for id in run_and_unit_ids(store, run_id) {
         for ledger_path in resolve_ledger_paths(workspace, global_dir, &id) {
-            let (f, d) =
-                rupu_netflow::ledger::read_flows_in_range(&ledger_path, range).unwrap_or_default();
+            let (f, d) = reader.flows_in_range(&ledger_path, range);
             all.extend(f);
             dropped += d;
         }
@@ -1211,6 +1232,7 @@ pub fn run_scoped_flows_and_dropped_with(
 /// error. Synchronous — see [`run_scoped_flows_and_dropped`].
 #[allow(clippy::too_many_arguments)]
 fn collect_run_netflow(
+    reader: &dyn LedgerReader,
     store: &RunStore,
     run_id: &str,
     workspace: &StdPath,
@@ -1222,6 +1244,7 @@ fn collect_run_netflow(
 ) -> NetflowResponse {
     let (remote_flows, remote_dropped, incomplete) = remote;
     let (merged, dropped) = run_scoped_flows_and_dropped_with(
+        reader,
         store,
         run_id,
         workspace,
@@ -1251,8 +1274,7 @@ fn collect_run_netflow(
     let mut ledgers = Vec::new();
     for id in run_and_unit_ids(store, run_id) {
         for ledger_path in resolve_ledger_paths(workspace, global_dir, &id) {
-            ledgers
-                .push(rupu_netflow::ledger::read_capture_states(&ledger_path).unwrap_or_default());
+            ledgers.push(reader.capture_states(&ledger_path));
         }
     }
     resp.capture = summarize_capture(&ledgers);
@@ -1285,10 +1307,10 @@ pub(crate) fn workspace_for_project(s: &AppState, project_id: &str) -> ApiResult
     Ok(PathBuf::from(ws.path))
 }
 
-/// Union every per-run ledger file (`NetflowPaths::for_run` writes one
-/// `<run_id>.jsonl` per run) under `netflow_dir` into one flow list +
-/// summed dropped-count. A directory that doesn't exist yet (no run has
-/// ever written a ledger there) degrades to `([], 0)`, the same "missing
+/// List every per-run ledger file (`NetflowPaths::for_run` writes one
+/// `<run_id>.jsonl` per run) under `netflow_dir` as `(id, path)` pairs, in
+/// `read_dir` order. A directory that doesn't exist yet (no run has ever
+/// written a ledger there) degrades to an empty list, the same "missing
 /// data" tolerance every other read in this module already relies on.
 ///
 /// Which files count as a per-run ledger (accepts `*.jsonl`, rejects
@@ -1299,31 +1321,46 @@ pub(crate) fn workspace_for_project(s: &AppState, project_id: &str) -> ApiResult
 /// for the reasoning. `rupu-cli`'s `netflow prune` calls the same
 /// function so the read side and the destructive prune side can never
 /// drift apart on what a "ledger" is.
-fn read_all_run_ledgers_in_dir(
-    netflow_dir: &StdPath,
+fn ledger_files_in_dir(netflow_dir: &StdPath) -> Vec<(String, PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(netflow_dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !is_per_run_ledger_path(&path) {
+                return None;
+            }
+            // `NetflowPaths::for_run` always names a ledger `<id>.jsonl`, so
+            // the file stem IS the owning run/step id -- this is the "the
+            // read side already knows which file each flow came from" the
+            // whole-branch review named as the fix for `graph_view`'s
+            // single-node collapse. A file whose stem somehow isn't valid
+            // UTF-8 is skipped rather than guessed at.
+            let id = path.file_stem().and_then(|s| s.to_str())?.to_string();
+            Some((id, path))
+        })
+        .collect()
+}
+
+/// Read each `(id, path)` ledger in order through `reader`, tagging every
+/// flow with its file's id and summing the dropped-counts. The listing
+/// (which files, in which order) is decided separately —
+/// [`ledger_files_in_dir`] / [`project_ledger_files`] /
+/// [`global_ledger_files`] — so swapping the reader (the shared
+/// [`NetflowIndex`] in `cp serve`, a direct file read in the CLI) can
+/// never change iteration order, and therefore never a response byte.
+fn read_ledger_files(
+    reader: &dyn LedgerReader,
+    files: &[(String, PathBuf)],
     range: &rupu_netflow::ledger::TimeRange,
 ) -> (Vec<(String, FlowRecord)>, u64) {
     let mut flows = Vec::new();
     let mut dropped = 0u64;
-    let Ok(entries) = std::fs::read_dir(netflow_dir) else {
-        return (flows, dropped);
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !is_per_run_ledger_path(&path) {
-            continue;
-        }
-        // `NetflowPaths::for_run` always names a ledger `<id>.jsonl`, so
-        // the file stem IS the owning run/step id -- this is the "the
-        // read side already knows which file each flow came from" the
-        // whole-branch review named as the fix for `graph_view`'s
-        // single-node collapse. A file whose stem somehow isn't valid
-        // UTF-8 is skipped rather than guessed at.
-        let Some(run_id) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        let (f, d) = rupu_netflow::ledger::read_flows_in_range(&path, range).unwrap_or_default();
-        flows.extend(f.into_iter().map(|flow| (run_id.to_string(), flow)));
+    for (id, path) in files {
+        let (f, d) = reader.flows_in_range(path, range);
+        flows.extend(f.into_iter().map(|flow| (id.clone(), flow)));
         dropped += d;
     }
     (flows, dropped)
@@ -1343,7 +1380,7 @@ fn read_all_run_ledgers_in_dir(
 /// Deliberately narrower than [`resolve_ledger_paths`] (which also
 /// resolves the workspace-local candidate): the workspace-local root is
 /// already covered by the whole-directory scan
-/// ([`read_all_run_ledgers_in_dir`]) the caller runs separately, so this
+/// ([`ledger_files_in_dir`]) the caller runs separately, so this
 /// function only ever computes the GLOBAL path for each id — resolving
 /// the workspace-local one here too would re-read files the whole-
 /// directory scan already read, double-counting them (no `FlowId` dedup
@@ -1384,33 +1421,45 @@ fn read_all_run_ledgers_in_dir(
 /// That ledger is an orphan, and staying unreachable is the correct
 /// outcome for a deleted run, not a bug to chase; an archived one is a
 /// narrower, accepted gap in the same direction.
-fn project_fallback_flows_and_dropped(
+fn project_fallback_ledger_files(
     meta: &RunMetaIndex,
     global_dir: &StdPath,
-    range: &rupu_netflow::ledger::TimeRange,
-) -> (Vec<(String, FlowRecord)>, u64) {
+) -> Vec<(String, PathBuf)> {
     let mut paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     for id in meta.ledger_ids() {
         paths.insert(NetflowPaths::for_run(&global_netflow_dir(global_dir), id).flows);
     }
 
-    let mut flows = Vec::new();
-    let mut dropped = 0u64;
-    for path in paths {
-        let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        let (f, d) = rupu_netflow::ledger::read_flows_in_range(&path, range).unwrap_or_default();
-        flows.extend(f.into_iter().map(|flow| (id.to_string(), flow)));
-        dropped += d;
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let id = path.file_stem().and_then(|s| s.to_str())?.to_string();
+            Some((id, path))
+        })
+        .collect()
+}
+
+/// Every ledger file at project scope, in read order: the workspace-local
+/// directory's files, then (unless that directory IS the global one — see
+/// [`project_scoped_flows_meta_and_dropped`]'s `$HOME` collision note) the
+/// id-driven global-fallback recovery set.
+fn project_ledger_files(
+    meta: &RunMetaIndex,
+    workspace: &StdPath,
+    global_dir: &StdPath,
+) -> Vec<(String, PathBuf)> {
+    let local_dir = project_local_netflow_dir(workspace);
+    let mut files = ledger_files_in_dir(&local_dir);
+    if canonicalize_or_self(&local_dir) != canonicalize_or_self(&global_netflow_dir(global_dir)) {
+        files.extend(project_fallback_ledger_files(meta, global_dir));
     }
-    (flows, dropped)
+    files
 }
 
 /// Every flow at project scope — plus the project's own [`RunMetaIndex`]:
 /// the workspace-local ledger directory (whole-directory scan,
-/// [`read_all_run_ledgers_in_dir`]) UNIONED with the id-driven
-/// global-fallback recovery pass ([`project_fallback_flows_and_dropped`])
+/// [`ledger_files_in_dir`]) UNIONED with the id-driven
+/// global-fallback recovery pass ([`project_fallback_ledger_files`])
 /// for runs whose ledgers landed in `<global_dir>/netflow/` instead — see
 /// that function's doc for the full cost accounting and what it
 /// deliberately cannot recover. Shared by [`get_project_netflow`], the
@@ -1434,23 +1483,15 @@ fn project_fallback_flows_and_dropped(
 /// skipped entirely rather than re-reading (and double-counting) that
 /// same directory a second time.
 fn project_scoped_flows_meta_and_dropped(
+    reader: &dyn LedgerReader,
     global_store: &RunStore,
     workspace: &StdPath,
     global_dir: &StdPath,
     range: &rupu_netflow::ledger::TimeRange,
 ) -> (Vec<(String, FlowRecord)>, RunMetaIndex, u64) {
     let meta = project_run_meta(global_store, workspace);
-    let local_dir = project_local_netflow_dir(workspace);
-    let (mut flows, mut dropped) = read_all_run_ledgers_in_dir(&local_dir, range);
-
-    if canonicalize_or_self(&local_dir) == canonicalize_or_self(&global_netflow_dir(global_dir)) {
-        return (flows, meta, dropped);
-    }
-
-    let (fallback_flows, fallback_dropped) =
-        project_fallback_flows_and_dropped(&meta, global_dir, range);
-    flows.extend(fallback_flows);
-    dropped += fallback_dropped;
+    let files = project_ledger_files(&meta, workspace, global_dir);
+    let (flows, dropped) = read_ledger_files(reader, &files, range);
     (flows, meta, dropped)
 }
 
@@ -1482,17 +1523,14 @@ fn project_scoped_flows_meta_and_dropped(
 /// The summed dropped-count follows the same deduped union. Mirrors
 /// `coverage.rs`'s `list_coverage`: a workspace whose path is
 /// gone/unreadable is skipped (its ledger read degrades to empty via
-/// [`read_all_run_ledgers_in_dir`]'s own missing-directory tolerance),
+/// [`ledger_files_in_dir`]'s own missing-directory tolerance),
 /// never a hard error.
 ///
 /// Synchronous — always run through [`run_blocking`] (this is the read that
 /// scales with the number of registered workspaces AND with the number of
 /// runs each one has, so it's the one most worth keeping off the async
 /// task).
-fn read_all_workspaces_sync(
-    global_dir: &StdPath,
-    range: &rupu_netflow::ledger::TimeRange,
-) -> (Vec<(String, FlowRecord)>, u64) {
+fn global_ledger_files(global_dir: &StdPath) -> Vec<(String, PathBuf)> {
     let workspaces = (WorkspaceStore {
         root: global_dir.join("workspaces"),
     })
@@ -1505,15 +1543,18 @@ fn read_all_workspaces_sync(
         .collect();
     dirs.insert(canonicalize_or_self(&global_netflow_dir(global_dir)));
 
-    let mut flows = Vec::new();
-    let mut dropped = 0u64;
-    for dir in &dirs {
-        let (f, d) = read_all_run_ledgers_in_dir(dir, range);
-        flows.extend(f);
-        dropped += d;
-    }
+    dirs.iter().flat_map(|d| ledger_files_in_dir(d)).collect()
+}
 
-    (flows, dropped)
+/// [`global_ledger_files`] read through `reader` — see that function for
+/// the directory union and its dedup, and [`read_ledger_files`] for the
+/// read.
+fn read_all_workspaces_sync(
+    reader: &dyn LedgerReader,
+    global_dir: &StdPath,
+    range: &rupu_netflow::ledger::TimeRange,
+) -> (Vec<(String, FlowRecord)>, u64) {
+    read_ledger_files(reader, &global_ledger_files(global_dir), range)
 }
 
 /// Canonicalize `path` for directory-identity comparisons (resolving
@@ -1526,7 +1567,7 @@ fn read_all_workspaces_sync(
 /// can't collide with anything real either, so using it verbatim as the
 /// dedup key is safe (worst case, two distinct nonexistent paths that
 /// happen to be the same directory both get read — each yields `([], 0)`
-/// per [`read_all_run_ledgers_in_dir`]'s own tolerance, so nothing is
+/// per [`ledger_files_in_dir`]'s own tolerance, so nothing is
 /// double-counted, just a wasted `read_dir` call).
 fn canonicalize_or_self(path: &StdPath) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
@@ -1583,9 +1624,10 @@ async fn get_project_netflow(
     let cache = Arc::clone(&state.asn_cache);
     let store = Arc::clone(&state.run_store);
     let global_dir = state.global_dir.clone();
+    let index = index_for(&state);
     let resp = run_blocking(move || {
         let (flows, meta, dropped) =
-            project_scoped_flows_meta_and_dropped(&store, &workspace, &global_dir, &range);
+            project_scoped_flows_meta_and_dropped(&*index, &store, &workspace, &global_dir, &range);
         let table = load_asn_table(&cache);
         let mut resp =
             build_filtered_response(flows, &meta, dropped, table.as_deref(), &range, &filters);
@@ -1608,8 +1650,9 @@ async fn get_global_netflow(
     let store = Arc::clone(&state.run_store);
     let cache = Arc::clone(&state.asn_cache);
     let meta_cache = Arc::clone(&state.run_meta_cache);
+    let index = index_for(&state);
     let resp = run_blocking(move || {
-        let (flows, dropped) = read_all_workspaces_sync(&global_dir, &range);
+        let (flows, dropped) = read_all_workspaces_sync(&*index, &global_dir, &range);
         let ledger_ids = flows.iter().map(|(id, _)| id.clone()).collect();
         let meta = global_run_meta_cached(&meta_cache, &global_dir, &store, &ledger_ids);
         let table = load_asn_table(&cache);
@@ -1755,7 +1798,7 @@ fn parse_time_range(
 /// run reach", so it shows one source node for the run, not a fragmented
 /// node per internally-dispatched step or sub-agent. Project/global scope
 /// go the other way (one node per contributing run) via
-/// `read_all_run_ledgers_in_dir`.
+/// `ledger_files_in_dir`.
 async fn run_scoped_flows_for_graph(
     s: &AppState,
     run_id: &str,
@@ -1773,8 +1816,10 @@ async fn run_scoped_flows_for_graph(
             let workspace = run.workspace_path.clone();
             let global_dir = s.global_dir.clone();
             let range = range.clone();
+            let index = index_for(s);
             let flows = run_blocking(move || {
-                run_scoped_flows_and_dropped(&store, &rid, &workspace, &global_dir, &range).0
+                run_scoped_flows_and_dropped(&*index, &store, &rid, &workspace, &global_dir, &range)
+                    .0
             })
             .await?;
             Ok(tag(flows))
@@ -1783,9 +1828,10 @@ async fn run_scoped_flows_for_graph(
             let rid = run_id.to_string();
             let global_dir = s.global_dir.clone();
             let range = range.clone();
+            let index = index_for(s);
             let flows = run_blocking(move || {
                 let store = RunStore::new(path.join(".rupu").join("runs"));
-                run_scoped_flows_and_dropped(&store, &rid, &path, &global_dir, &range).0
+                run_scoped_flows_and_dropped(&*index, &store, &rid, &path, &global_dir, &range).0
             })
             .await?;
             Ok(tag(flows))
@@ -1828,13 +1874,16 @@ async fn get_netflow_graph(
         // global-fallback recovery pass — see that function's doc comment
         // (including why the unused meta index costs this caller nothing
         // extra).
+        let index = index_for(&state);
         run_blocking(move || {
-            project_scoped_flows_meta_and_dropped(&store, &workspace, &global_dir, &range).0
+            project_scoped_flows_meta_and_dropped(&*index, &store, &workspace, &global_dir, &range)
+                .0
         })
         .await?
     } else {
         let global_dir = state.global_dir.clone();
-        run_blocking(move || read_all_workspaces_sync(&global_dir, &range).0).await?
+        let index = index_for(&state);
+        run_blocking(move || read_all_workspaces_sync(&*index, &global_dir, &range).0).await?
     };
     Ok(Json(rupu_netflow::ledger::graph_view(&flows)))
 }
@@ -1956,8 +2005,10 @@ async fn get_netflow_explorer(
         let store = Arc::clone(&state.run_store);
         let global_dir = state.global_dir.clone();
         let cache = Arc::clone(&state.asn_cache);
+        let index = index_for(&state);
         let resp = run_blocking(move || {
             let (tagged, meta, dropped) = project_scoped_flows_meta_and_dropped(
+                &*index,
                 &store,
                 &workspace,
                 &global_dir,
@@ -1983,8 +2034,10 @@ async fn get_netflow_explorer(
         let global_dir = state.global_dir.clone();
         let cache = Arc::clone(&state.asn_cache);
         let meta_cache = Arc::clone(&state.run_meta_cache);
+        let index = index_for(&state);
         let resp = run_blocking(move || {
             let (tagged, dropped) = read_all_workspaces_sync(
+                &*index,
                 &global_dir,
                 &rupu_netflow::ledger::TimeRange::unbounded(),
             );
@@ -2036,8 +2089,10 @@ async fn explorer_run_scope(
             let cache = Arc::clone(&s.asn_cache);
             let range = range.clone();
             let filters = filters.clone();
+            let index = index_for(s);
             run_blocking(move || {
                 let (merged, dropped) = run_scoped_flows_and_dropped_with(
+                    &*index,
                     &store,
                     &rid,
                     &workspace,
@@ -2076,9 +2131,11 @@ async fn explorer_run_scope(
             let cache = Arc::clone(&s.asn_cache);
             let range = range.clone();
             let filters = filters.clone();
+            let index = index_for(s);
             run_blocking(move || {
                 let store = RunStore::new(path.join(".rupu").join("runs"));
                 let (merged, dropped) = run_scoped_flows_and_dropped_with(
+                    &*index,
                     &store,
                     &rid,
                     &path,
@@ -2588,8 +2645,10 @@ async fn get_run_netflow(
             let workspace = run.workspace_path.clone();
             let global_dir = s.global_dir.clone();
             let cache = Arc::clone(&s.asn_cache);
+            let index = index_for(&s);
             let resp = run_blocking(move || {
                 collect_run_netflow(
+                    &*index,
                     &store,
                     &rid,
                     &workspace,
@@ -2613,9 +2672,11 @@ async fn get_run_netflow(
             let rid = run_id.clone();
             let global_dir = s.global_dir.clone();
             let cache = Arc::clone(&s.asn_cache);
+            let index = index_for(&s);
             let resp = run_blocking(move || {
                 let store = RunStore::new(path.join(".rupu").join("runs"));
                 collect_run_netflow(
+                    &*index,
                     &store,
                     &rid,
                     &path,
@@ -2663,7 +2724,121 @@ async fn get_run_netflow(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::netflow_index::DirectReader;
     use rupu_netflow::{Fidelity, FlowCtx, Origin, Outcome};
+
+    fn ledger(dir: &std::path::Path, id: &str, flows: &[FlowRecord], dropped: u64) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let p = dir.join(format!("{id}.jsonl"));
+        let mut text = String::new();
+        for f in flows {
+            text.push_str(
+                &serde_json::to_string(&rupu_netflow::record::LedgerLine::Flow(Box::new(
+                    f.clone(),
+                )))
+                .unwrap(),
+            );
+            text.push('\n');
+        }
+        if dropped > 0 {
+            text.push_str(
+                &serde_json::to_string(&rupu_netflow::record::LedgerLine::Dropped {
+                    count: dropped,
+                    ts: chrono::Utc::now(),
+                })
+                .unwrap(),
+            );
+            text.push('\n');
+        }
+        std::fs::write(&p, text).unwrap();
+        p
+    }
+
+    fn at(f: FlowRecord, secs: i64) -> FlowRecord {
+        FlowRecord {
+            ts: chrono::DateTime::from_timestamp(secs, 0).unwrap(),
+            ..f
+        }
+    }
+
+    /// Spec §3.6 for the flows lists: identical JSON through the index
+    /// (ample budget, and a zero budget that forces re-reads) and through
+    /// the direct reader, across windows.
+    #[test]
+    fn flows_lists_are_identical_through_the_index() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("netflow");
+        ledger(
+            &dir,
+            "run_a",
+            &[
+                at(flow(FlowId::new(), None, "a.com"), 100),
+                at(flow(FlowId::new(), None, "b.com"), 300),
+            ],
+            2,
+        );
+        ledger(
+            &dir,
+            "run_b",
+            &[at(flow(FlowId::new(), None, "c.com"), 200)],
+            0,
+        );
+        let files = ledger_files_in_dir(&dir);
+        let ts = |secs| chrono::DateTime::from_timestamp(secs, 0).unwrap();
+        let ranges = [
+            rupu_netflow::ledger::TimeRange::unbounded(),
+            rupu_netflow::ledger::TimeRange {
+                from: Some(ts(150)),
+                to: None,
+            },
+            rupu_netflow::ledger::TimeRange {
+                from: None,
+                to: Some(ts(150)),
+            },
+            rupu_netflow::ledger::TimeRange {
+                from: Some(ts(500)),
+                to: Some(ts(100)),
+            },
+        ];
+        for budget in [u64::MAX, 0] {
+            let index = NetflowIndex::new(budget);
+            for range in &ranges {
+                let (want, want_dropped) = read_ledger_files(&DirectReader, &files, range);
+                let (got, got_dropped) = read_ledger_files(&index, &files, range);
+                let want = build_filtered_response(
+                    want,
+                    &RunMetaIndex::default(),
+                    want_dropped,
+                    None,
+                    range,
+                    &ExplorerFilters::default(),
+                );
+                let got = build_filtered_response(
+                    got,
+                    &RunMetaIndex::default(),
+                    got_dropped,
+                    None,
+                    range,
+                    &ExplorerFilters::default(),
+                );
+                // `host_rollup` emits its rows in `HashMap` order (a fresh
+                // random seed per call), so two reads of the SAME data differ
+                // there regardless of the reader; compare that list sorted.
+                let normalized = |resp: &NetflowResponse| {
+                    let mut v = serde_json::to_value(resp).unwrap();
+                    if let Some(hosts) = v["hosts"].as_array_mut() {
+                        hosts.sort_by_key(|h| h.to_string());
+                    }
+                    v
+                };
+                assert_eq!(
+                    normalized(&got),
+                    normalized(&want),
+                    "budget {budget}, range {range:?}"
+                );
+            }
+        }
+    }
 
     fn flow(id: FlowId, run: Option<&str>, host: &str) -> FlowRecord {
         FlowRecord {
@@ -3106,6 +3281,7 @@ mod tests {
         let remote_only = flow(FlowId::from(2u128), Some("run_placed"), "api.github.com");
 
         let (merged, dropped) = run_scoped_flows_and_dropped_with(
+            &DirectReader,
             &store,
             "run_placed",
             tmp.path(),
@@ -3138,6 +3314,7 @@ mod tests {
         store.create(run, "").unwrap();
 
         let (merged, dropped) = run_scoped_flows_and_dropped_with(
+            &DirectReader,
             &store,
             "run_local",
             tmp.path(),
