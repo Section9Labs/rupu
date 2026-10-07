@@ -53,3 +53,8 @@ rupu-config = { path = "../rupu-config" }
 [dev-dependencies]
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }
+# The log-capture tests install thread-local `tracing` subscribers, which
+# mutate process-global tracing state (the callsite interest cache + the global
+# max-level gate); they must not run concurrently with each other. See the
+# `#[serial]` note on `capture_logs`.
+serial_test = { workspace = true }

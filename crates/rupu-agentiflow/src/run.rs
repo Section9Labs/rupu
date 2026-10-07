@@ -953,6 +953,7 @@ mod tests {
         append_record, read_findings, Attribution, FindingEvidence, FindingProfile, FindingRecord,
         FindingScope, Ledger, Severity, Surface, Verification, VerificationStatus,
     };
+    use serial_test::serial;
 
     fn started() -> DateTime<Utc> {
         "2026-10-05T12:00:00Z".parse().unwrap()
@@ -1448,6 +1449,17 @@ mod tests {
 
     /// Run `f` with a thread-local tracing subscriber and return what it
     /// logged. `run_agentiflow` carries the caller's dispatcher to its worker thread.
+    ///
+    /// Every caller MUST be `#[serial(agentiflow_logs)]`. `with_default` builds a
+    /// `Dispatch`, which registers it process-wide and rebuilds `tracing`'s global
+    /// callsite-interest cache and max-level gate (`tracing_core::callsite`) by
+    /// reducing over the set of live dispatchers. That gate is what every
+    /// `tracing::warn!` consults before firing. Two concurrent `capture_logs`
+    /// calls therefore race this global state: one test's `with_default` entry can
+    /// rewrite the gate while another test's warning is mid-flight, silently
+    /// dropping it. Serializing these tests against one another removes the only
+    /// source of that concurrency (nothing else in the crate installs a
+    /// subscriber), so the global state is quiescent whenever a warning is emitted.
     fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
         use std::sync::{Arc, Mutex};
         #[derive(Clone)]
@@ -1498,6 +1510,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(agentiflow_logs)] // installs a tracing subscriber; see `capture_logs`.
     fn a_flow_with_no_automatic_terminator_warns_but_still_runs() {
         let fx = fixture();
         enqueue_stop(&fx, "af_noterm");
@@ -1519,6 +1532,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(agentiflow_logs)] // installs a tracing subscriber; see `capture_logs`.
     fn an_unpriceable_usd_cap_is_warned_about_and_is_not_a_terminator() {
         let fx = fixture();
         let id = "af_usd";
@@ -1534,6 +1548,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(agentiflow_logs)] // installs a tracing subscriber; see `capture_logs`.
     fn a_priceable_usd_cap_enforces_and_does_not_warn() {
         let fx = fixture();
         let id = "af_usd_priced";
@@ -1548,6 +1563,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(agentiflow_logs)] // installs a tracing subscriber; see `capture_logs`.
     fn a_tokens_cap_enforces_and_does_not_warn() {
         let fx = fixture();
         let id = "af_tokens_warn";
