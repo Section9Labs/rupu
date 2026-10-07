@@ -237,6 +237,19 @@ describe('CustomerDetail header and tiles', () => {
     await waitFor(() => expect(tile('runs')).toHaveTextContent('Runs · 7d'));
   });
 
+  it('labels the per-project costs with the range they cover and whose work they are', async () => {
+    mount();
+    await screen.findByRole('heading', { level: 1, name: 'Acme Corp' });
+    expect(screen.getByRole('heading', { name: 'Cost by project · 30d' })).toBeInTheDocument();
+    expect(
+      screen.getByText(/Acme Corp's runs in each assigned project over the last 30d — not work billed to another customer/),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'all' }));
+    await waitFor(() => expect(getCustomer).toHaveBeenLastCalledWith('acme', 'all'));
+    expect(await screen.findByRole('heading', { name: 'Cost by project · all time' })).toBeInTheDocument();
+    expect(screen.getByText(/in each assigned project over all time/)).toBeInTheDocument();
+  });
+
   it('shows a layer_error banner linking to the Config tab', async () => {
     getCustomer.mockResolvedValue(detail({ layer_error: 'expected `=` at line 3', default_account: null }));
     mount();
@@ -274,13 +287,17 @@ describe('CustomerDetail tabs', () => {
   it('an unknown tab falls back to overview, and tabs route', async () => {
     mount('/customers/acme/bogus');
     await screen.findByRole('heading', { level: 1, name: 'Acme Corp' });
-    expect(screen.getByRole('heading', { name: 'Cost by project' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Cost by project · 30d' })).toBeInTheDocument();
     expect(await screen.findByText('nightly-review')).toBeInTheDocument();
     expect(getRuns).toHaveBeenCalledWith(expect.objectContaining({ customer: 'acme', limit: 10, host: 'local' }));
 
     fireEvent.click(screen.getByRole('button', { name: 'Projects' }));
     expect(screen.getByTestId('where')).toHaveTextContent('/customers/acme/projects');
-    expect(await screen.findByText(/2 projects · runs in their subdirectories count too/)).toBeInTheDocument();
+    expect(
+      await screen.findByText(
+        /2 projects · runs in their subdirectories count too · runs, tokens and cost are Acme Corp's work in each over the last 30d/,
+      ),
+    ).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: 'Overview' }));
     expect(screen.getByTestId('where')).toHaveTextContent(/^\/customers\/acme$/);

@@ -78,9 +78,10 @@ pub struct CustomerRollup {
 pub struct CustomerDetail {
     pub customer: CustomerDto,
     pub rollup: CustomerRollup,
-    /// The customer's current projects, with the Projects page's own
-    /// (all-time) rollups, each run priced with the pricing of the customer
-    /// it recorded.
+    /// The customer's current projects. Each row's `usage` / `run_count` /
+    /// `last_active` cover only THIS customer's work in that project over
+    /// the range (attributed and priced as `rollup` is) — not the project's
+    /// all-time spend, which can include work billed to another customer.
     pub projects: Vec<ProjectRow>,
     pub default_account: Option<DefaultAccount>,
     /// Why the customer's config could not be resolved (a malformed layer);
@@ -219,19 +220,22 @@ impl Pass {
         Ok(out)
     }
 
-    /// Rollups for each slug in `wanted`, over runs started since `since`,
-    /// each priced with its customer's pricing.
-    fn rollups(
+    /// The work started since `since`, attributed to a customer and priced
+    /// with that customer's pricing, folded into one rollup per
+    /// `key(customer slug, workspace id)` (work whose key is `None` is
+    /// skipped). Also returns the hosts whose (legacy, mirrored) runs had to
+    /// be left out because their customer can't be known.
+    fn attributed_rolls<K: Ord>(
         &mut self,
-        wanted: &BTreeSet<String>,
         since: Option<DateTime<Utc>>,
         prices: &mut PricingMemo<'_>,
-    ) -> ApiResult<BTreeMap<String, CustomerRollup>> {
+        key: impl Fn(&str, &str) -> Option<K>,
+    ) -> ApiResult<(BTreeMap<K, EntityRollup>, Vec<String>)> {
         let in_range = |at: Option<DateTime<Utc>>| match since {
             None => true,
             Some(cut) => at.is_some_and(|t| t >= cut),
         };
-        let mut rolls: BTreeMap<String, EntityRollup> = BTreeMap::new();
+        let mut rolls: BTreeMap<K, EntityRollup> = BTreeMap::new();
         let mut unreportable: Vec<String> = Vec::new();
 
         for run in &self.runs {
@@ -244,14 +248,17 @@ impl Pass {
                 crate::customers::note_unreportable(&mut unreportable, run);
                 continue;
             };
-            let Some(slug) = who.slug.filter(|s| wanted.contains(s)) else {
+            let Some(slug) = who.slug else {
+                continue;
+            };
+            let Some(k) = key(&slug, &run.workspace_id) else {
                 continue;
             };
             let usage =
                 crate::usage::summarize_run(&self.run_store, &run.id, prices.get(Some(&slug)));
             let usage = prices.stamp(usage, Some(&slug));
             rolls
-                .entry(slug)
+                .entry(k)
                 .or_default()
                 .add(&usage, Some(run.started_at.to_rfc3339()));
         }
@@ -261,7 +268,10 @@ impl Pass {
                 continue;
             }
             let who = src.attribute(&mut self.lookup)?;
-            let Some(slug) = who.slug.filter(|s| wanted.contains(s)) else {
+            let Some(slug) = who.slug else {
+                continue;
+            };
+            let Some(k) = key(&slug, &src.workspace_id) else {
                 continue;
             };
             let usage = crate::usage::summarize_run_usage(
@@ -270,10 +280,24 @@ impl Pass {
             );
             let usage = prices.stamp(usage, Some(&slug));
             rolls
-                .entry(slug)
+                .entry(k)
                 .or_default()
                 .add_spend(&usage, src.started_at.map(|t| t.to_rfc3339()));
         }
+        Ok((rolls, unreportable))
+    }
+
+    /// Rollups for each slug in `wanted`, over runs started since `since`,
+    /// each priced with its customer's pricing.
+    fn rollups(
+        &mut self,
+        wanted: &BTreeSet<String>,
+        since: Option<DateTime<Utc>>,
+        prices: &mut PricingMemo<'_>,
+    ) -> ApiResult<BTreeMap<String, CustomerRollup>> {
+        let (mut rolls, unreportable) = self.attributed_rolls(since, prices, |slug, _| {
+            wanted.contains(slug).then(|| slug.to_string())
+        })?;
 
         let projects = self.projects_by_customer()?;
         let assigned: Vec<Workspace> = projects
@@ -352,9 +376,9 @@ async fn list_customers(
 }
 
 /// `GET /api/customers/:slug?range=` — one customer (archived included):
-/// its rollups over the range, its current projects (with the Projects
-/// page's all-time rollups, priced per run's customer), its default account
-/// and, when its config layer does not resolve, why.
+/// its rollups over the range, its current projects (each with this
+/// customer's work in it over the same range), its default account and,
+/// when its config layer does not resolve, why.
 async fn get_customer(
     State(s): State<AppState>,
     Path(slug): Path<String>,
@@ -378,15 +402,13 @@ async fn get_customer(
             .projects_by_customer()?
             .remove(&slug)
             .unwrap_or_default();
+        // Each project's share of THIS customer's work over the range — the
+        // same work the rollup above counts — never the project's all-time
+        // spend (which would include work billed to an earlier customer).
         let ids: BTreeSet<&str> = mine.iter().map(|w| w.id.as_str()).collect();
-        let project_rolls = project_rollups(
-            &pass.run_store,
-            &pass.runs,
-            &pass.extras,
-            &mut prices,
-            &mut pass.lookup,
-            |w| ids.contains(w),
-        )?;
+        let (project_rolls, _) = pass.attributed_rolls(since, &mut prices, |who, ws| {
+            (who == slug && ids.contains(ws)).then(|| ws.to_string())
+        })?;
         let mut projects = Vec::with_capacity(mine.len());
         for w in &mine {
             let mut row = project_row(w);
@@ -599,8 +621,141 @@ async fn unassign_project(
 
 #[cfg(test)]
 mod tests {
-    use super::display_path;
-    use std::path::Path;
+    use super::{display_path, get_customer, RangeQuery};
+    use axum::extract::{Path as AxPath, Query, State};
+    use chrono::{Duration, Utc};
+    use rupu_orchestrator::runs::{RunRecord, RunStatus, RunStore};
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    fn register_workspace(global: &Path, id: &str, root: &Path) {
+        std::fs::create_dir_all(global.join("workspaces")).unwrap();
+        std::fs::write(
+            global.join("workspaces").join(format!("{id}.toml")),
+            format!(
+                "id = \"{id}\"\npath = \"{}\"\ncreated_at = \"2026-01-01T00:00:00Z\"\n",
+                root.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    fn seed_run(global: &Path, id: &str, ws: &str, customer: &str, days_ago: i64) {
+        let started_at = Utc::now() - Duration::days(days_ago);
+        let record = RunRecord {
+            customer: Some(Some(customer.into())),
+            id: id.into(),
+            workflow_name: "wf".into(),
+            status: RunStatus::Completed,
+            inputs: BTreeMap::new(),
+            event: None,
+            workspace_id: ws.into(),
+            workspace_path: PathBuf::from("/tmp/proj"),
+            transcript_dir: PathBuf::from("/tmp/proj/.rupu/transcripts"),
+            started_at,
+            finished_at: Some(started_at),
+            error_message: None,
+            awaiting: Vec::new(),
+            awaiting_step_id: None,
+            approval_prompt: None,
+            awaiting_since: None,
+            expires_at: None,
+            issue_ref: None,
+            issue: None,
+            parent_run_id: None,
+            backend_id: None,
+            worker_id: None,
+            artifact_manifest_path: None,
+            runner_pid: None,
+            source_wake_id: None,
+            active_step_id: None,
+            active_step_kind: None,
+            active_step_agent: None,
+            active_step_transcript_path: None,
+            resume_requested_at: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
+            resume_mode: None,
+            resume_gate_id: None,
+            resume_approver: None,
+            resume_rerequested_at: None,
+            reject_cleanup_pending: None,
+            permission_mode: None,
+            final_output: None,
+            loop_progress: Default::default(),
+            gate_decisions: Vec::new(),
+            codename: None,
+            cause: None,
+        };
+        RunStore::new(global.join("runs"))
+            .create(record, "name: wf\n")
+            .unwrap();
+    }
+
+    /// The detail's per-project figures are this customer's work over the
+    /// range — never the project's all-time spend, nor work another
+    /// customer was billed for in the same project.
+    #[tokio::test]
+    async fn detail_projects_cover_this_customers_work_over_the_range() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let global = tmp.path();
+        let proj_a = tempfile::TempDir::new().unwrap();
+        let proj_b = tempfile::TempDir::new().unwrap();
+        register_workspace(global, "ws_a", proj_a.path());
+        register_workspace(global, "ws_b", proj_b.path());
+        let store = rupu_workspace::CustomerStore::new(global);
+        for slug in ["acme", "globex"] {
+            store
+                .create(
+                    slug,
+                    &rupu_workspace::NewCustomer {
+                        name: slug.into(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        store
+            .assign("acme", rupu_workspace::ProjectRef::Id("ws_a"))
+            .unwrap();
+        seed_run(global, "r_recent", "ws_a", "acme", 1);
+        seed_run(global, "r_old", "ws_a", "acme", 20);
+        // Billed to Globex before the project moved to Acme.
+        seed_run(global, "r_globex", "ws_a", "globex", 1);
+        // Acme's work in a project it no longer holds: its rollup, no row.
+        seed_run(global, "r_elsewhere", "ws_b", "acme", 1);
+
+        let detail = |range: &str| {
+            let s = crate::state::AppState::new(
+                global.to_path_buf(),
+                rupu_config::PricingConfig::default(),
+            );
+            let q = RangeQuery {
+                range: Some(range.into()),
+                ..Default::default()
+            };
+            async move {
+                get_customer(State(s), AxPath("acme".into()), Query(q))
+                    .await
+                    .unwrap()
+                    .0
+            }
+        };
+
+        let week = detail("7d").await;
+        assert_eq!(week.rollup.run_count, 2, "r_recent + r_elsewhere");
+        assert_eq!(week.projects.len(), 1);
+        assert_eq!(week.projects[0].ws_id, "ws_a");
+        assert_eq!(week.projects[0].run_count, 1, "r_recent only");
+        assert!(week.projects[0].last_active.is_some());
+
+        let all = detail("all").await;
+        assert_eq!(all.rollup.run_count, 3);
+        assert_eq!(
+            all.projects[0].run_count, 2,
+            "r_recent + r_old, never r_globex"
+        );
+    }
 
     #[test]
     fn display_path_abbreviates_only_under_home() {

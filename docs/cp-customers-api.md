@@ -31,7 +31,11 @@ the provider account the customer's runs default to over global + its layer
 one or the layer does not resolve (`layer_error` says why on the detail).
 `config_path` on the detail is the customer layer's real `config.toml` under the
 CP's global dir (any `RUPU_HOME`), with a leading `$HOME` shown as `~` — for
-display only.
+display only. The detail's `projects[]` are the customer's current projects;
+each row's `usage`, `run_count` and `last_active` cover only this customer's
+work in that project over the same `range` as `rollup` (attributed and priced
+the same way) — not the project's all-time spend, which can include work billed
+to another customer. (`GET /api/projects` keeps the all-time figures.)
 
 Rollups (`projects`, `run_count`, `usage`, `findings_open`, `last_active`) are
 computed in one pass over the run store. Standalone agent runs and session

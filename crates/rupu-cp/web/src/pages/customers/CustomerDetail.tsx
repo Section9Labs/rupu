@@ -379,13 +379,14 @@ export default function CustomerDetail() {
 
       {tab === 'overview' && (
         <div className="space-y-6">
-          <CostByProject projects={detail.projects} />
+          <CostByProject projects={detail.projects} customerName={c.name} rangeLabel={rangeLabel} />
           <RecentRuns slug={c.slug} limit={10} title="Recent runs" />
         </div>
       )}
       {tab === 'projects' && (
         <ProjectsTab
           detail={detail}
+          rangeLabel={rangeLabel}
           onChanged={() => {
             reload();
             refetch();
@@ -659,7 +660,21 @@ function DeleteCustomerDialog({
 // Tab bodies
 // ---------------------------------------------------------------------------
 
-function ProjectsTab({ detail, onChanged }: { detail: CustomerDetailDto; onChanged: () => void }) {
+/** "over the last 30d" / "over all time" — what a range-scoped figure covers. */
+function overRange(rangeLabel: string): string {
+  return rangeLabel === 'all time' ? 'over all time' : `over the last ${rangeLabel}`;
+}
+
+function ProjectsTab({
+  detail,
+  rangeLabel,
+  onChanged,
+}: {
+  detail: CustomerDetailDto;
+  /** The range `detail` was loaded for: its project rows cover it. */
+  rangeLabel: string;
+  onChanged: () => void;
+}) {
   const c = detail.customer;
   const [assigning, setAssigning] = useState(false);
   const [pending, setPending] = useState<ReadonlySet<string>>(new Set());
@@ -721,7 +736,8 @@ function ProjectsTab({ detail, onChanged }: { detail: CustomerDetailDto; onChang
     <section className="space-y-3">
       <div ref={headRef} className="flex flex-wrap items-center justify-between gap-3">
         <p className="text-ui text-ink-dim">
-          {n} {n === 1 ? 'project' : 'projects'} · runs in their subdirectories count too
+          {n} {n === 1 ? 'project' : 'projects'} · runs in their subdirectories count too · runs, tokens and
+          cost are {c.name}&apos;s work in each {overRange(rangeLabel)}
         </p>
         <Button
           onClick={() => setAssigning(true)}
@@ -765,13 +781,28 @@ function ProjectsTab({ detail, onChanged }: { detail: CustomerDetailDto; onChang
   );
 }
 
-/** Horizontal bars of each assigned project's cost (`detail.projects[].usage`). */
-function CostByProject({ projects }: { projects: ProjectRow[] }) {
+/** Horizontal bars of each assigned project's cost (`detail.projects[].usage`:
+ *  this customer's work in the project over the detail's range). */
+function CostByProject({
+  projects,
+  customerName,
+  rangeLabel,
+}: {
+  projects: ProjectRow[];
+  customerName: string;
+  rangeLabel: string;
+}) {
   const rows = [...projects].sort((a, b) => (b.usage?.cost_usd ?? 0) - (a.usage?.cost_usd ?? 0));
   const max = rows.reduce((m, p) => Math.max(m, p.usage?.cost_usd ?? 0), 0);
   return (
     <section className="bg-panel border border-border rounded-xl shadow-card px-5 py-4">
-      <h2 className="text-[9px] font-semibold uppercase tracking-widest text-ink-mute mb-3">Cost by project</h2>
+      <h2 className="text-[9px] font-semibold uppercase tracking-widest text-ink-mute">
+        Cost by project · {rangeLabel}
+      </h2>
+      <p className="mt-0.5 mb-3 text-note text-ink-mute">
+        {customerName}&apos;s runs in each assigned project {overRange(rangeLabel)} — not work billed to another
+        customer.
+      </p>
       {rows.length === 0 ? (
         <p className="text-note text-ink-mute">No projects assigned yet.</p>
       ) : (
