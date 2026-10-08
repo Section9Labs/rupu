@@ -181,9 +181,10 @@ describe('AgentiflowDetail', () => {
     // The goal id stands in for the objective; no caps to compare against.
     expect(await screen.findByText('real-issues')).toBeInTheDocument();
     expect(screen.getByText(/Definition snapshot unavailable/)).toBeInTheDocument();
-    // The transcript tab shows the empty state when there is no lead transcript.
+    // The transcript browser has no lead transcript to default to, so the
+    // viewer prompts for a selection (the unit list is still there to click).
     fireEvent.click(screen.getByRole('button', { name: 'Transcript' }));
-    expect(screen.getByText('No lead transcript yet.')).toBeInTheDocument();
+    expect(screen.getByText('Select a transcript to view it.')).toBeInTheDocument();
   });
 
   it('tails the lead live while the run is running, and flags a dead coordinator', async () => {
