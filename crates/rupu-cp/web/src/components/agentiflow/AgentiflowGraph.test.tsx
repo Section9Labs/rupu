@@ -126,6 +126,35 @@ describe('AgentiflowGraph recursion', () => {
     expect(await screen.findByText("couldn't load this flow")).toBeInTheDocument();
   });
 
+  it('keeps every round open by default — collapse only applies below level 2', () => {
+    const twoRounds: Detail = {
+      ...DETAIL,
+      record: { ...DETAIL.record, status: 'completed', stop_reason: 'goals_met', ended_at: '2026-10-07T15:03:00Z', rounds: 2 },
+      events: [
+        { ts: '2026-10-07T15:00:00Z', kind: 'run_started', goals: 1 },
+        { ts: '2026-10-07T15:01:00Z', kind: 'round', round: 0, budget: 'ok', goals_met: 0, goals_total: 1 },
+        { ts: '2026-10-07T15:02:00Z', kind: 'round', round: 1, budget: 'ok', goals_met: 1, goals_total: 1 },
+        { ts: '2026-10-07T15:03:00Z', kind: 'run_stopped', stop_reason: 'goals_met' },
+      ],
+      units: [
+        { ...DETAIL.units[0], unit_id: 'u_r0', kind: 'agent', status: { state: 'done', success: true }, started_at: '2026-10-07T15:00:30Z' },
+        { ...DETAIL.units[0], unit_id: 'u_r1', codename: 'cobalt-harbor/lynx#1', agent: 'triage', kind: 'agent', status: { state: 'done', success: true }, started_at: '2026-10-07T15:01:30Z' },
+      ],
+    };
+    render(
+      <MemoryRouter>
+        <AgentiflowGraph detail={twoRounds} />
+      </MemoryRouter>,
+    );
+    // Both rounds render, and NEITHER is collapsed (no "(hidden)" affordance) —
+    // the old default only opened the last round.
+    expect(screen.getByText('round 0')).toBeInTheDocument();
+    expect(screen.getByText('round 1')).toBeInTheDocument();
+    expect(screen.queryByText(/hidden/)).not.toBeInTheDocument();
+    // One unit per round is mounted (the kind badge appears once per unit).
+    expect(screen.getAllByText('agent')).toHaveLength(2);
+  });
+
   it('keeps an agent unit a leaf with a transcript link', () => {
     vi.spyOn(api, 'getRunGraph').mockResolvedValue(GRAPH);
     renderGraph();
