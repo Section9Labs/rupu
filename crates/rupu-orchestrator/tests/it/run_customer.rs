@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 use rupu_agent::runner::{MockProvider, ScriptedTurn};
-use rupu_agent::AgentRunOpts;
+use rupu_agent::LegacyRunOpts;
 use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts, StepFactory};
 use rupu_orchestrator::{RunRecord, RunStore, Workflow};
 use rupu_providers::types::StopReason;
@@ -40,14 +40,14 @@ impl StepFactory for Factory {
         workspace_path: std::path::PathBuf,
         transcript_path: std::path::PathBuf,
         on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> AgentRunOpts {
+    ) -> LegacyRunOpts {
         let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
             text: "done".into(),
             stop: StopReason::EndTurn,
             input_tokens: 1,
             output_tokens: 1,
         }]);
-        AgentRunOpts {
+        LegacyRunOpts {
             seed_source: None,
             collectors: Vec::new(),
             extra_tools: Vec::new(),
@@ -119,7 +119,7 @@ impl StepFactory for DefaultFactory {
         workspace_path: std::path::PathBuf,
         transcript_path: std::path::PathBuf,
         on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> AgentRunOpts {
+    ) -> LegacyRunOpts {
         self.0
             .build_opts_for_step(
                 step_id,
@@ -208,4 +208,54 @@ async fn a_run_json_without_the_customer_key_reads_as_legacy_and_stays_legacy() 
     // Re-saving a legacy record writes no key back: it stays legacy.
     let back = serde_json::to_value(&legacy).unwrap();
     assert!(back.get("customer").is_none(), "{back}");
+}
+
+/// A factory that runs with a `## Run target` suffix (W3, R8).
+struct SuffixFactory(Factory);
+
+#[async_trait]
+impl StepFactory for SuffixFactory {
+    #[allow(clippy::too_many_arguments)]
+    async fn build_opts_for_step(
+        &self,
+        step_id: &str,
+        agent_name: &str,
+        rendered_prompt: String,
+        run_id: String,
+        workspace_id: String,
+        workspace_path: std::path::PathBuf,
+        transcript_path: std::path::PathBuf,
+        on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+    ) -> LegacyRunOpts {
+        self.0
+            .build_opts_for_step(
+                step_id,
+                agent_name,
+                rendered_prompt,
+                run_id,
+                workspace_id,
+                workspace_path,
+                transcript_path,
+                on_tool_call,
+            )
+            .await
+    }
+
+    fn system_prompt_suffix(&self) -> Option<&str> {
+        Some("Repository: acme/widgets")
+    }
+}
+
+/// W3, R8: the launch records the factory's `## Run target` text on the run,
+/// so a resume can rebuild the same prompts; a factory with none records
+/// nothing.
+#[tokio::test]
+async fn run_records_the_factory_system_prompt_suffix() {
+    let (_tmp, store, run_id) = run_with(Arc::new(SuffixFactory(Factory { customer: None }))).await;
+    assert_eq!(
+        store.load(&run_id).unwrap().system_prompt_suffix.as_deref(),
+        Some("Repository: acme/widgets")
+    );
+    let (_tmp, store, run_id) = run_with(Arc::new(Factory { customer: None })).await;
+    assert_eq!(store.load(&run_id).unwrap().system_prompt_suffix, None);
 }

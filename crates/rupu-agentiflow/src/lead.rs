@@ -16,7 +16,8 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use rupu_agent::{run_agent_full, AgentRunOpts, RunError, RunExit};
+use rupu_agent::legacy::run_agent_full;
+use rupu_agent::{LegacyRunOpts, RunError, RunExit};
 use rupu_orchestrator::usage_ledger::{LedgerTag, UsageLedger};
 use rupu_providers::model_limits::ModelLimits;
 use rupu_providers::types::Message;
@@ -267,7 +268,7 @@ fn quote(s: &str) -> String {
     serde_json::to_string(&capped).unwrap_or_else(|_| "\"<unrenderable>\"".to_string())
 }
 
-/// Mints a fresh provider for each round. `AgentRunOpts::provider` is a
+/// Mints a fresh provider for each round. `LegacyRunOpts::provider` is a
 /// `Box<dyn LlmProvider>` that the runner consumes and `LlmProvider` is not
 /// `Clone`, so a persistent driver needs a factory rather than one instance.
 pub type ProviderFactory = Box<dyn FnMut() -> Box<dyn LlmProvider> + Send>;
@@ -347,7 +348,7 @@ pub struct LeadConfig {
     pub extra_tools: Vec<Arc<dyn rupu_tools::Tool>>,
     /// Ambient-context collectors run before each of the lead's model calls
     /// (its inbox, the board's standing directives). Shared `Arc`s, cloned
-    /// into every round's `AgentRunOpts`.
+    /// into every round's `LegacyRunOpts`.
     pub collectors: Vec<Arc<dyn rupu_agent::TurnCollector>>,
     /// The customer the run belongs to, resolved by the launch site; every
     /// round's transcript records it (`run_start.customer`). `None` ⇒ no
@@ -388,7 +389,7 @@ pub struct LeadConfig {
 /// (the board / mailbox tools).
 /// [`LeadConfig::collectors`] feed the lead's inbox and standing directives
 /// into each turn. No parent run, depth 0 -- the same shape as a session
-/// turn's `AgentRunOpts` minus the CLI-only plumbing.
+/// turn's `LegacyRunOpts` minus the CLI-only plumbing.
 ///
 /// ## Interrupts (`send --now`)
 ///
@@ -584,7 +585,7 @@ impl LeadDriver for RunAgentLeadDriver {
         // This round's pause token. Never cancelled unless the watcher sees an
         // `interrupt: true` steering message while the round runs.
         let pause = CancellationToken::new();
-        let opts = AgentRunOpts {
+        let opts = LegacyRunOpts {
             codename: None,
             agent_name: self.cfg.agent_name.clone(),
             agent_system_prompt: self.cfg.system_prompt.clone(),
@@ -601,14 +602,20 @@ impl LeadDriver for RunAgentLeadDriver {
             max_turns: ceiling,
             permission: rupu_tools::PermissionPolicy::bypass(),
             tool_context: rupu_tools::ToolContext {
-                customer: self.cfg.customer.clone(),
-                workspace_path: self.cfg.workspace_path.clone(),
-                findings: self.cfg.findings_engagement.clone().map(|engagement| {
-                    rupu_coverage::FindingWriteOptions {
-                        engagement: Some(engagement),
-                        ..Default::default()
-                    }
-                }),
+                workspace: rupu_tools::WorkspaceScope {
+                    path: self.cfg.workspace_path.clone(),
+                    ..Default::default()
+                },
+                services: rupu_tools::ToolServices {
+                    findings: self.cfg.findings_engagement.clone().map(|engagement| {
+                        rupu_coverage::FindingWriteOptions {
+                            engagement: Some(engagement),
+                            ..Default::default()
+                        }
+                    }),
+                    customer: self.cfg.customer.clone(),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             user_message,

@@ -12,7 +12,7 @@
 use async_trait::async_trait;
 use rupu_agent::runner::MockProvider;
 use rupu_agent::runner::ScriptedTurn;
-use rupu_agent::AgentRunOpts;
+use rupu_agent::LegacyRunOpts;
 use rupu_mcp::{McpPermission, ToolDispatcher};
 use rupu_orchestrator::executor::JsonlSink;
 use rupu_orchestrator::runner::{
@@ -46,7 +46,7 @@ impl StepFactory for PanicFactory {
         _workspace_path: PathBuf,
         _transcript_path: PathBuf,
         _on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> AgentRunOpts {
+    ) -> LegacyRunOpts {
         panic!("PanicFactory: build_opts_for_step must not be called — the workflow is gate-only")
     }
 }
@@ -69,7 +69,7 @@ impl StepFactory for EchoFactory {
         workspace_path: PathBuf,
         transcript_path: PathBuf,
         on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> AgentRunOpts {
+    ) -> LegacyRunOpts {
         self.seen.lock().unwrap().push(step_id.to_string());
         let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
             text: format!("done: {rendered_prompt}"),
@@ -77,7 +77,7 @@ impl StepFactory for EchoFactory {
             input_tokens: 1,
             output_tokens: 1,
         }]);
-        AgentRunOpts {
+        LegacyRunOpts {
             seed_source: None,
             collectors: Vec::new(),
             extra_tools: Vec::new(),
@@ -144,11 +144,11 @@ impl StepFactory for FailFactory {
         workspace_path: PathBuf,
         transcript_path: PathBuf,
         on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> AgentRunOpts {
+    ) -> LegacyRunOpts {
         let provider = MockProvider::new(vec![ScriptedTurn::ProviderError(
             "simulated on_reject cleanup failure".into(),
         )]);
-        AgentRunOpts {
+        LegacyRunOpts {
             seed_source: None,
             collectors: Vec::new(),
             extra_tools: Vec::new(),

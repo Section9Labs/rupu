@@ -22,4 +22,4 @@ pub use in_process::{
     EventStream, InProcessExecutor, RunFilter, RunHandle, WorkflowExecutor, WorkflowRunOpts,
 };
 pub use jsonl_sink::JsonlSink;
-pub use sink::{EventSink, FanOutSink};
+pub use sink::{DispatchEventSink, EventSink, FanOutSink};

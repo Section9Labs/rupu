@@ -11,7 +11,7 @@
 
 use async_trait::async_trait;
 use rupu_agent::runner::{MockProvider, ScriptedTurn};
-use rupu_agent::{AgentRunOpts, RunError};
+use rupu_agent::{LegacyRunOpts, RunError};
 use rupu_orchestrator::runner::{
     run_workflow, OrchestratorRunOpts, StepFactory, UnitCoverage, UnitDispatch, UnitDispatcher,
     UnitFailure, UnitOutcome,
@@ -40,14 +40,14 @@ impl StepFactory for EchoFactory {
         workspace_path: PathBuf,
         transcript_path: PathBuf,
         on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> AgentRunOpts {
+    ) -> LegacyRunOpts {
         let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
             text: format!("step {step_id} echo: {rendered_prompt}"),
             stop: StopReason::EndTurn,
             input_tokens: 1,
             output_tokens: 1,
         }]);
-        AgentRunOpts {
+        LegacyRunOpts {
             seed_source: None,
             recovery: Default::default(),
             collectors: Vec::new(),
@@ -114,7 +114,7 @@ impl StepFactory for PanicFactory {
         _workspace_path: PathBuf,
         _transcript_path: PathBuf,
         _on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> AgentRunOpts {
+    ) -> LegacyRunOpts {
         panic!("PanicFactory: placed attempts must not build a local agent");
     }
 }

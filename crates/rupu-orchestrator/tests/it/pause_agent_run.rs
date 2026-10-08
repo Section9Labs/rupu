@@ -54,6 +54,7 @@ fn record(id: &str, workflow_name: &str, status: RunStatus) -> RunRecord {
         final_output: None,
         loop_progress: BTreeMap::new(),
         gate_decisions: Vec::new(),
+        system_prompt_suffix: None,
         codename: None,
         cause: None,
     }

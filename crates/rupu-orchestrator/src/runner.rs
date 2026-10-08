@@ -3,7 +3,7 @@
 //! Per step:
 //! 1. Render the step's `prompt:` template with `inputs.*` and prior
 //!    `steps.<id>.output`.
-//! 2. Build [`AgentRunOpts`] via a caller-supplied [`StepFactory`]
+//! 2. Build [`LegacyRunOpts`] via a caller-supplied [`StepFactory`]
 //!    (this lets tests inject the mock provider; the CLI in Plan 2
 //!    Phase 3 wires real providers).
 //! 3. Run the agent. Capture the final assistant message as the
@@ -28,7 +28,8 @@ use crate::workflow::{
     Workflow, WorkflowParseError, WorkspaceMode,
 };
 use async_trait::async_trait;
-use rupu_agent::{run_agent, AgentRunOpts, RunError, RunResult};
+use rupu_agent::legacy::run_agent;
+use rupu_agent::{LegacyRunOpts, RunError, RunResult};
 use rupu_providers::types::Message;
 use rupu_transcript::{Event, JsonlReader, JsonlWriter};
 use std::collections::BTreeMap;
@@ -434,7 +435,7 @@ impl RunWorkflowError {
     }
 }
 
-/// Trait the orchestrator uses to construct per-unit [`AgentRunOpts`].
+/// Trait the orchestrator uses to construct per-unit [`LegacyRunOpts`].
 /// Production impl wires real providers + the default tool registry;
 /// tests inject mock providers.
 ///
@@ -459,7 +460,7 @@ pub trait StepFactory: Send + Sync {
         workspace_path: PathBuf,
         transcript_path: PathBuf,
         on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> AgentRunOpts;
+    ) -> LegacyRunOpts;
 
     /// The permission mode (`ask` / `bypass` / `readonly`) this factory's
     /// tool registry enforces for the steps it builds, when the factory
@@ -490,6 +491,13 @@ pub trait StepFactory: Send + Sync {
     /// so a resume rebuilds the same engagement. Defaulted like `customer`.
     fn engagement_profiles(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    /// The `## Run target` text every step's system prompt carries.
+    /// Recorded on the run's `RunRecord` at launch so a resume rebuilds the
+    /// same prompts (W3, R8). Defaulted like `customer`.
+    fn system_prompt_suffix(&self) -> Option<&str> {
+        None
     }
 }
 
@@ -1269,6 +1277,8 @@ pub async fn run_workflow(
                 final_output: None,
                 loop_progress: std::collections::BTreeMap::new(),
                 gate_decisions: Vec::new(),
+                // R8: a resume rebuilds every step's prompt from it.
+                system_prompt_suffix: opts.factory.system_prompt_suffix().map(str::to_string),
                 codename: Some(naming.crew().to_string()),
                 // Recorded even when none (`null`): a later assignment of the
                 // project must not re-attribute this run.
@@ -9990,7 +10000,7 @@ async fn dispatch_one(
     // wide fan-out / `split:` DAG cannot drive the host out of memory. The
     // permit is held for the whole agent run and released on drop. Fully open
     // (immediate) until a run entry point calls `admission::configure`.
-    let _job = rupu_runtime::admission::acquire().await;
+    let _job = rupu_runtime::admission::acquire_run(&agent_opts.run_id, None).await;
     if _job.throttled() {
         if let Some(sink) = announce.sink {
             let mut parts = Vec::new();
@@ -10044,7 +10054,7 @@ fn ledger_hook(
     if workflow_run_id.is_empty() {
         return None;
     }
-    let ledger = crate::usage_ledger::UsageLedger::for_run(store, workflow_run_id);
+    let ledger = crate::usage_ledger::UsageLedger::open(store.usage_ledger_path(workflow_run_id));
     Some(ledger.hook(
         tag,
         agent_run_id.to_string(),
@@ -11124,7 +11134,7 @@ mod tests {
             _workspace_path: PathBuf,
             _transcript_path: PathBuf,
             _on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-        ) -> rupu_agent::AgentRunOpts {
+        ) -> rupu_agent::LegacyRunOpts {
             panic!("PanicFactory: build_opts_for_step must not be called for distributed units")
         }
     }
@@ -12351,7 +12361,7 @@ steps:
     // -----------------------------------------------------------------------
 
     use rupu_agent::runner::{CapturingMockProvider, MockProvider, ScriptedTurn};
-    use rupu_agent::AgentRunOpts;
+    use rupu_agent::LegacyRunOpts;
     use rupu_providers::types::{
         ContentBlock, LlmRequest, LlmResponse, Role, StopReason, StreamEvent,
     };
@@ -12405,8 +12415,8 @@ steps:
         workspace_path: PathBuf,
         transcript_path: PathBuf,
         on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> AgentRunOpts {
-        AgentRunOpts {
+    ) -> LegacyRunOpts {
+        LegacyRunOpts {
             seed_source: None,
             collectors: Vec::new(),
             extra_tools: Vec::new(),
@@ -12471,7 +12481,7 @@ steps:
             workspace_path: PathBuf,
             transcript_path: PathBuf,
             on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-        ) -> AgentRunOpts {
+        ) -> LegacyRunOpts {
             let provider = self
                 .provider
                 .lock()
@@ -13213,7 +13223,7 @@ steps:
             workspace_path: PathBuf,
             transcript_path: PathBuf,
             on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-        ) -> AgentRunOpts {
+        ) -> LegacyRunOpts {
             self.seen.lock().unwrap().push(rendered_prompt.clone());
             let provider: Box<dyn LlmProvider> =
                 if self.block_slow && rendered_prompt.contains("SLOW") {
@@ -13448,7 +13458,7 @@ steps:
             workspace_path: PathBuf,
             transcript_path: PathBuf,
             on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-        ) -> AgentRunOpts {
+        ) -> LegacyRunOpts {
             let provider = Box::new(MockProvider::new(vec![ScriptedTurn::AssistantText {
                 text: format!("done:{rendered_prompt}"),
                 stop: StopReason::EndTurn,
@@ -13656,14 +13666,14 @@ mod dag_scheduler_golden {
             workspace_path: PathBuf,
             transcript_path: PathBuf,
             on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-        ) -> AgentRunOpts {
+        ) -> LegacyRunOpts {
             let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
                 text: format!("step {step_id} agent {agent_name} echo: {rendered_prompt}"),
                 stop: StopReason::EndTurn,
                 input_tokens: 1,
                 output_tokens: 1,
             }]);
-            AgentRunOpts {
+            LegacyRunOpts {
                 seed_source: None,
                 collectors: Vec::new(),
                 extra_tools: Vec::new(),
@@ -14192,7 +14202,7 @@ steps:
             workspace_path: PathBuf,
             transcript_path: PathBuf,
             on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-        ) -> AgentRunOpts {
+        ) -> LegacyRunOpts {
             self.calls.lock().unwrap().push(step_id.to_string());
 
             if self.concurrency_tracked.contains(&step_id) {
@@ -14213,7 +14223,7 @@ steps:
                 output_tokens: 1,
             };
             let provider = MockProvider::new(vec![turn]);
-            AgentRunOpts {
+            LegacyRunOpts {
                 seed_source: None,
                 collectors: Vec::new(),
                 extra_tools: Vec::new(),
@@ -14714,7 +14724,7 @@ loops:
             workspace_path: PathBuf,
             transcript_path: PathBuf,
             on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-        ) -> AgentRunOpts {
+        ) -> LegacyRunOpts {
             self.calls.lock().unwrap().push(step_id.to_string());
             if step_id == "gen" {
                 self.gen_prompts
@@ -14738,7 +14748,7 @@ loops:
                 input_tokens: 1,
                 output_tokens: 1,
             }]);
-            AgentRunOpts {
+            LegacyRunOpts {
                 seed_source: None,
                 collectors: Vec::new(),
                 extra_tools: Vec::new(),
@@ -14921,7 +14931,7 @@ loops:
                 workspace_path: PathBuf,
                 transcript_path: PathBuf,
                 on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-            ) -> AgentRunOpts {
+            ) -> LegacyRunOpts {
                 self.calls
                     .lock()
                     .unwrap()
@@ -14937,7 +14947,7 @@ loops:
                     input_tokens: 1,
                     output_tokens: 1,
                 }]);
-                AgentRunOpts {
+                LegacyRunOpts {
                     seed_source: None,
                     collectors: Vec::new(),
                     extra_tools: Vec::new(),
@@ -15223,7 +15233,7 @@ loops:
             workspace_path: PathBuf,
             transcript_path: PathBuf,
             on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-        ) -> AgentRunOpts {
+        ) -> LegacyRunOpts {
             let text = if step_id == "test" { "false" } else { "out" };
             let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
                 text: text.to_string(),
@@ -15231,7 +15241,7 @@ loops:
                 input_tokens: 1,
                 output_tokens: 1,
             }]);
-            AgentRunOpts {
+            LegacyRunOpts {
                 seed_source: None,
                 collectors: Vec::new(),
                 extra_tools: Vec::new(),
@@ -15413,7 +15423,7 @@ loops:
                 workspace_path: PathBuf,
                 transcript_path: PathBuf,
                 on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-            ) -> AgentRunOpts {
+            ) -> LegacyRunOpts {
                 if step_id == "a" || step_id == "b" {
                     let now = self.current.fetch_add(1, Ordering::SeqCst) + 1;
                     self.max_seen.fetch_max(now, Ordering::SeqCst);
@@ -15431,7 +15441,7 @@ loops:
                     input_tokens: 1,
                     output_tokens: 1,
                 }]);
-                AgentRunOpts {
+                LegacyRunOpts {
                     seed_source: None,
                     collectors: Vec::new(),
                     extra_tools: Vec::new(),
@@ -15641,7 +15651,7 @@ loops:
             workspace_path: PathBuf,
             transcript_path: PathBuf,
             on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-        ) -> AgentRunOpts {
+        ) -> LegacyRunOpts {
             self.calls.lock().unwrap().push(step_id.to_string());
             if step_id == "gen" {
                 self.gen_prompts
@@ -15675,7 +15685,7 @@ loops:
                 input_tokens: 1,
                 output_tokens: 1,
             }]);
-            AgentRunOpts {
+            LegacyRunOpts {
                 seed_source: None,
                 collectors: Vec::new(),
                 extra_tools: Vec::new(),
@@ -15967,7 +15977,7 @@ loops:
                 workspace_path: PathBuf,
                 transcript_path: PathBuf,
                 on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-            ) -> AgentRunOpts {
+            ) -> LegacyRunOpts {
                 assert_ne!(step_id, "gen", "a converged loop must not re-dispatch gen");
                 assert_ne!(
                     step_id, "test",
@@ -15984,7 +15994,7 @@ loops:
                     input_tokens: 1,
                     output_tokens: 1,
                 }]);
-                AgentRunOpts {
+                LegacyRunOpts {
                     seed_source: None,
                     collectors: Vec::new(),
                     extra_tools: Vec::new(),
@@ -16132,14 +16142,14 @@ loops:
                 workspace_path: PathBuf,
                 transcript_path: PathBuf,
                 on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-            ) -> AgentRunOpts {
+            ) -> LegacyRunOpts {
                 let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
                     text: format!("out-{step_id}"),
                     stop: StopReason::EndTurn,
                     input_tokens: 1,
                     output_tokens: 1,
                 }]);
-                AgentRunOpts {
+                LegacyRunOpts {
                     seed_source: None,
                     collectors: Vec::new(),
                     extra_tools: Vec::new(),
@@ -16362,7 +16372,7 @@ loops:
             workspace_path: PathBuf,
             transcript_path: PathBuf,
             on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-        ) -> AgentRunOpts {
+        ) -> LegacyRunOpts {
             self.calls.lock().unwrap().push(step_id.to_string());
             if let Some((_, signal)) = self.waits.iter().find(|(id, _)| *id == step_id) {
                 signal.notified().await;
@@ -16373,7 +16383,7 @@ loops:
                 input_tokens: 1,
                 output_tokens: 1,
             }]);
-            AgentRunOpts {
+            LegacyRunOpts {
                 seed_source: None,
                 collectors: Vec::new(),
                 extra_tools: Vec::new(),
@@ -16782,6 +16792,7 @@ loops:
                     final_output: None,
                     loop_progress: BTreeMap::new(),
                     gate_decisions: Vec::new(),
+                    system_prompt_suffix: None,
                     codename: None,
                     cause: None,
                 },
@@ -17015,7 +17026,7 @@ mod join_and_prune {
             workspace_path: PathBuf,
             transcript_path: PathBuf,
             on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-        ) -> AgentRunOpts {
+        ) -> LegacyRunOpts {
             self.calls.lock().unwrap().push(step_id.to_string());
             if let Some(&(_, ms)) = self.slow.iter().find(|&&(id, _)| id == step_id) {
                 tokio::time::sleep(Duration::from_millis(ms)).await;
@@ -17029,7 +17040,7 @@ mod join_and_prune {
                 output_tokens: 1,
             };
             let provider = MockProvider::new(vec![turn]);
-            AgentRunOpts {
+            LegacyRunOpts {
                 seed_source: None,
                 collectors: Vec::new(),
                 extra_tools: Vec::new(),
@@ -18651,7 +18662,7 @@ mod resume_and_cancel {
             workspace_path: PathBuf,
             transcript_path: PathBuf,
             on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-        ) -> AgentRunOpts {
+        ) -> LegacyRunOpts {
             self.calls.lock().unwrap().push(step_id.to_string());
             if let Some(&(_, ms)) = self.slow.iter().find(|&&(id, _)| id == step_id) {
                 tokio::time::sleep(Duration::from_millis(ms)).await;
@@ -18665,7 +18676,7 @@ mod resume_and_cancel {
                 output_tokens: 1,
             };
             let provider = MockProvider::new(vec![turn]);
-            AgentRunOpts {
+            LegacyRunOpts {
                 seed_source: None,
                 collectors: Vec::new(),
                 extra_tools: Vec::new(),
@@ -19403,7 +19414,7 @@ fn scan_for_json_object(s: &str) -> Option<&str> {
 mod agent_terminal_status {
     use super::*;
     use rupu_agent::runner::{MockProvider, ScriptedTurn};
-    use rupu_agent::AgentRunOpts;
+    use rupu_agent::LegacyRunOpts;
     use rupu_providers::types::StopReason;
     use rupu_providers::LlmProvider;
     use std::collections::BTreeMap;
@@ -19444,10 +19455,10 @@ mod agent_terminal_status {
             workspace_path: PathBuf,
             transcript_path: PathBuf,
             on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-        ) -> AgentRunOpts {
+        ) -> LegacyRunOpts {
             self.dispatches.lock().unwrap().push(step_id.to_string());
             let provider: Box<dyn LlmProvider> = Box::new(MockProvider::new(self.script.clone()));
-            AgentRunOpts {
+            LegacyRunOpts {
                 seed_source: None,
                 collectors: Vec::new(),
                 extra_tools: Vec::new(),
@@ -19849,7 +19860,7 @@ mod manual_pause_drain {
             workspace_path: PathBuf,
             transcript_path: PathBuf,
             on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-        ) -> AgentRunOpts {
+        ) -> LegacyRunOpts {
             self.calls.lock().unwrap().push(step_id.to_string());
             let provider = self
                 .providers
@@ -19858,7 +19869,7 @@ mod manual_pause_drain {
                 .get_mut(step_id)
                 .and_then(|q| q.pop_front())
                 .unwrap_or_else(|| Box::new(done_provider()));
-            AgentRunOpts {
+            LegacyRunOpts {
                 seed_source: None,
                 collectors: Vec::new(),
                 extra_tools: Vec::new(),

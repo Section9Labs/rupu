@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use rupu_agent::runner::{MockProvider, ScriptedTurn};
-use rupu_agent::{AgentRunOpts, RunError};
+use rupu_agent::{LegacyRunOpts, RunError};
 use rupu_orchestrator::runner::{
     run_workflow, OrchestratorRunOpts, PreparedWorkspace, StepFactory, UnitCoverage, UnitDispatch,
     UnitDispatcher, UnitFailure, UnitOutcome, WorkspaceConflict, WorkspaceDelta,
@@ -38,7 +38,7 @@ impl StepFactory for PanicFactory {
         _workspace_path: std::path::PathBuf,
         _transcript_path: std::path::PathBuf,
         _on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> AgentRunOpts {
+    ) -> LegacyRunOpts {
         panic!("PanicFactory: build_opts_for_step must not be called in this test");
     }
 }
@@ -151,7 +151,7 @@ impl StepFactory for ReadingFactory {
         workspace_path: std::path::PathBuf,
         transcript_path: std::path::PathBuf,
         on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> AgentRunOpts {
+    ) -> LegacyRunOpts {
         let content = std::fs::read_to_string(workspace_path.join("foo.txt"))
             .unwrap_or_else(|_| "<missing>".to_string());
         *self.saw_content.lock().unwrap() = Some(content.clone());
@@ -161,7 +161,7 @@ impl StepFactory for ReadingFactory {
             input_tokens: 1,
             output_tokens: 1,
         }]);
-        AgentRunOpts {
+        LegacyRunOpts {
             seed_source: None,
             collectors: Vec::new(),
             extra_tools: Vec::new(),

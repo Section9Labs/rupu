@@ -382,8 +382,8 @@ mod tests {
         let t = tmp.path().join("failed.jsonl");
         let provider = MockProvider::new(vec![ScriptedTurn::ProviderError("boom".into())]);
         let mut opts = opts_for(Box::new(provider), tmp.path(), t.clone());
-        opts.initial_messages = vec![Message::user("first"), Message::assistant("ack")];
-        opts.user_message = "second".into();
+        opts.prompt.initial_messages = vec![Message::user("first"), Message::assistant("ack")];
+        opts.prompt.message = "second".into();
         let exit = crate::runner::run_agent_full(opts).await;
         assert!(exit.result.is_err());
         assert_eq!(exit.messages.len(), 3, "{:?}", exit.messages);
@@ -507,7 +507,7 @@ mod tests {
             stop: StopReason::EndTurn,
         }]);
         let mut opts = opts_for(Box::new(provider), tmp.path(), transcript_path.clone());
-        opts.initial_messages = seed.clone();
+        opts.prompt.initial_messages = seed.clone();
         run_agent(opts).await.expect("run completes");
 
         let rebuilt = reconstruct_messages(&read_events(&transcript_path)).unwrap();
@@ -547,8 +547,8 @@ mod tests {
             stop: StopReason::EndTurn,
         }]);
         let mut opts = opts_for(Box::new(p2), tmp.path(), t2.clone());
-        opts.initial_messages = turn1_convo.clone();
-        opts.seed_source = Some(t1.clone());
+        opts.prompt.initial_messages = turn1_convo.clone();
+        opts.prompt.seed_source = Some(t1.clone());
         run_agent(opts).await.expect("turn 2 completes");
 
         // The seed is a reference, not a copy.
@@ -703,8 +703,8 @@ mod tests {
             }]);
         let captured = provider.captured.clone();
         let mut opts = opts_for(Box::new(provider), tmp.path(), transcript.clone());
-        opts.initial_messages = seed.clone();
-        opts.user_message = "you were interrupted".into();
+        opts.prompt.initial_messages = seed.clone();
+        opts.prompt.message = "you were interrupted".into();
         run_agent(opts).await.unwrap();
 
         let mut expected = seed;

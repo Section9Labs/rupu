@@ -23,6 +23,7 @@ pub mod runner;
 pub mod runs;
 pub mod step_factory;
 pub mod templates;
+pub mod subagents;
 pub mod usage_ledger;
 pub mod workflow;
 

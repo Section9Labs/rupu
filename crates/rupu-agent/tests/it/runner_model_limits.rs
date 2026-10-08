@@ -119,57 +119,47 @@ fn build_opts(
     tmp: &tempfile::TempDir,
     transcript_path: std::path::PathBuf,
 ) -> AgentRunOpts {
-    AgentRunOpts {
-        codename: None,
-        seed_source: None,
-        collectors: Vec::new(),
-        extra_tools: Vec::new(),
-        step_actions: Vec::new(),
-        alias_scope: Default::default(),
-        agent_name: "noop".into(),
-        agent_system_prompt: "You are a noop agent.".into(),
-        agent_tools: None,
-        provider,
-        provider_name: "mock".into(),
-        model: "mock-1".into(),
-        run_id: "run_model_limits".into(),
-        workspace_id: "ws_test1".into(),
-        workspace_path: tmp.path().to_path_buf(),
-        transcript_path,
-        max_turns: 5,
-        permission: rupu_tools::PermissionPolicy::bypass(),
-        tool_context: ToolContext {
-            workspace_path: tmp.path().to_path_buf(),
-            ..Default::default()
+    rupu_agent::grant::with_grant(
+        AgentRunOpts {
+            system_prompt: "You are a noop agent.".into(),
+            prompt: rupu_agent::UserTurn::new("say hi"),
+            provider,
+            limits: ModelLimits::unknown(),
+            recovery: Default::default(),
+            permission: rupu_tools::PermissionPolicy::bypass(),
+            grant: Default::default(),
+            alias_scope: Default::default(),
+            tool_context: {
+                let mut tc = ToolContext::in_workspace(tmp.path());
+                tc.identity = std::sync::Arc::new(rupu_tools::RunIdentity {
+                    agent: "noop".into(),
+                    provider: "mock".into(),
+                    model: "mock-1".into(),
+                    run_id: "run_model_limits".into(),
+                    ..Default::default()
+                });
+                tc.workspace.id = "ws_test1".into();
+                tc.workspace.path = tmp.path().to_path_buf();
+                tc
+            },
+            pins: Default::default(),
+            concerns: None,
+            max_turns: 5,
+            stream: rupu_agent::StreamOpts {
+                no_stream: true,
+                suppress_stdout: false,
+                on_stream_event: None,
+            },
+            hooks: Default::default(),
+            pause: None,
+            collectors: Vec::new(),
+            extra_tools: Vec::new(),
+            transcript_path,
         },
-        user_message: "say hi".into(),
-        initial_messages: Vec::new(),
-        turn_index_offset: 0,
-        no_stream: true,
-        suppress_stream_stdout: false,
-        mcp_registry: None,
-        effort: None,
-        thinking_display: None,
-        context_window: None,
-        output_format: None,
-        output_schema: None,
-        anthropic_task_budget: None,
-        anthropic_context_management: None,
-        anthropic_speed: None,
-        parent_run_id: None,
-        depth: 0,
-        dispatchable_agents: None,
-        step_id: String::new(),
-        on_tool_call: None,
-        on_stream_event: None,
-        on_usage: None,
-        concerns: None,
-        limits: ModelLimits::unknown(),
-        scope_name: None,
-        surface_tag: None,
-        pause: None,
-        recovery: Default::default(),
-    }
+        None,
+        &Vec::new(),
+    )
+    .expect("grant")
 }
 
 fn notices(path: &std::path::Path) -> Vec<(String, String)> {
@@ -231,7 +221,7 @@ async fn overflow_error_clamps_the_limit_and_compacts_instead_of_trimming() {
     let tmp = tempfile::tempdir().unwrap();
     let transcript = tmp.path().join("run.jsonl");
     let mut opts = build_opts(Box::new(provider), &tmp, transcript.clone());
-    opts.initial_messages = dense_seed();
+    opts.prompt.initial_messages = dense_seed();
     opts.limits = ModelLimits::unknown()
         .with_input(1_000_000)
         .with_percent(50);
@@ -270,7 +260,7 @@ async fn overflow_without_a_parsed_max_still_compacts_when_the_limit_is_known() 
     let tmp = tempfile::tempdir().unwrap();
     let transcript = tmp.path().join("run.jsonl");
     let mut opts = build_opts(Box::new(provider), &tmp, transcript.clone());
-    opts.initial_messages = dense_seed();
+    opts.prompt.initial_messages = dense_seed();
     opts.limits = ModelLimits::unknown().with_input(1000).with_percent(50);
     let result = run_agent(opts).await.unwrap();
 
@@ -305,7 +295,7 @@ async fn overflow_with_a_max_that_does_not_lower_the_limit_still_compacts() {
     let tmp = tempfile::tempdir().unwrap();
     let transcript = tmp.path().join("run.jsonl");
     let mut opts = build_opts(Box::new(provider), &tmp, transcript.clone());
-    opts.initial_messages = dense_seed();
+    opts.prompt.initial_messages = dense_seed();
     opts.limits = ModelLimits::unknown().with_input(1000).with_percent(50);
     let result = run_agent(opts).await.unwrap();
 
@@ -397,12 +387,12 @@ async fn run_stream_only(
     };
     let transcript = tmp.path().join("run.jsonl");
     let mut opts = build_opts(Box::new(provider), tmp, transcript.clone());
-    opts.no_stream = no_stream;
-    opts.suppress_stream_stdout = true;
+    opts.stream.no_stream = no_stream;
+    opts.stream.suppress_stdout = true;
     opts.limits = limits;
     let forwarded = Arc::new(AtomicUsize::new(0));
     let counter = forwarded.clone();
-    opts.on_stream_event = Some(Arc::new(move |_| {
+    opts.stream.on_stream_event = Some(Arc::new(move |_| {
         counter.fetch_add(1, Ordering::SeqCst);
     }));
     run_agent(opts).await.expect("run completes");
@@ -539,8 +529,8 @@ async fn run_sizing_turn(limits: ModelLimits) -> (Vec<LlmRequest>, Vec<Message>)
     let captured = provider.captured.clone();
     let tmp = tempfile::tempdir().unwrap();
     let mut opts = build_opts(Box::new(provider), &tmp, tmp.path().join("run.jsonl"));
-    opts.initial_messages = sizing_seed();
-    opts.user_message = "go".into();
+    opts.prompt.initial_messages = sizing_seed();
+    opts.prompt.message = "go".into();
     opts.limits = limits;
     let result = run_agent(opts).await.expect("run completes");
     let reqs = captured.lock().unwrap().clone();
@@ -678,7 +668,7 @@ async fn input_plus_max_tokens_below_the_floor_compacts_instead() {
     let tmp = tempfile::tempdir().unwrap();
     let transcript = tmp.path().join("run.jsonl");
     let mut opts = build_opts(Box::new(provider), &tmp, transcript.clone());
-    opts.initial_messages = dense_seed();
+    opts.prompt.initial_messages = dense_seed();
     opts.limits = ModelLimits::unknown().with_input(1000).with_percent(50);
     let result = run_agent(opts).await.expect("compaction recovers");
 
@@ -849,8 +839,8 @@ async fn long_context_unavailable_notice_tells_a_session_to_start_anew() {
     let mut limits = live_1m_limits();
     limits.input = Limit::new(200_000, LimitSource::Observed);
     opts.limits = limits;
-    opts.surface_tag = Some("session".into());
-    opts.turn_index_offset = 3;
+    opts.tool_context.identity_mut().surface = rupu_tools::Surface::Session;
+    opts.prompt.turn_index_offset = 3;
     run_agent(opts).await.expect("the retry succeeds");
     let n = notices(&transcript);
     assert!(
@@ -885,7 +875,7 @@ async fn long_context_unavailable_then_overflow_reaches_compaction() {
     let tmp = tempfile::tempdir().unwrap();
     let transcript = tmp.path().join("run.jsonl");
     let mut opts = build_opts(Box::new(provider), &tmp, transcript.clone());
-    opts.initial_messages = vec![
+    opts.prompt.initial_messages = vec![
         big(Role::User, "task"),
         big(Role::Assistant, "a0"),
         big(Role::User, "u0"),
@@ -931,7 +921,7 @@ async fn compaction_seq_counts_only_compactions_that_ran() {
     let tmp = tempfile::tempdir().unwrap();
     let transcript = tmp.path().join("run.jsonl");
     let mut opts = build_opts(Box::new(provider), &tmp, transcript.clone());
-    opts.initial_messages = dense_seed();
+    opts.prompt.initial_messages = dense_seed();
     opts.limits = ModelLimits::unknown().with_input(1000).with_percent(50);
     run_agent(opts).await.expect("run completes");
 

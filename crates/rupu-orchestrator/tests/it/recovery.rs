@@ -9,8 +9,9 @@
 //! exactly which attempts the run made.
 
 use chrono::Utc;
+use rupu_agent::legacy::run_agent;
 use rupu_agent::runner::{MockProvider, ScriptedTurn};
-use rupu_agent::{run_agent, AgentRunOpts};
+use rupu_agent::LegacyRunOpts;
 use rupu_orchestrator::executor::{Event, EventSink, JsonlSink};
 use rupu_orchestrator::recovery::{discover, AttemptPlan, PlanCounts, RecoveryPlans};
 use rupu_orchestrator::runs::AttemptRecord;
@@ -45,8 +46,8 @@ impl Fx {
             .join(format!("{name}.jsonl"))
     }
 
-    fn opts(&self, provider: MockProvider, name: &str) -> AgentRunOpts {
-        AgentRunOpts {
+    fn opts(&self, provider: MockProvider, name: &str) -> LegacyRunOpts {
+        LegacyRunOpts {
             seed_source: None,
             recovery: Default::default(),
             collectors: Vec::new(),
@@ -66,7 +67,10 @@ impl Fx {
             max_turns: 5,
             permission: rupu_tools::PermissionPolicy::bypass(),
             tool_context: ToolContext {
-                workspace_path: self.tmp.path().to_path_buf(),
+                workspace: rupu_tools::WorkspaceScope {
+                    path: self.tmp.path().to_path_buf(),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             user_message: "go".into(),

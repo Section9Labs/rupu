@@ -383,6 +383,12 @@ pub struct RunRecord {
     /// doesn't track a single mode string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<String>,
+    /// The `## Run target` text appended to every step's system prompt
+    /// (`rupu workflow run --target`, an autoflow's target), persisted at
+    /// launch so a resume rebuilds the same prompts (W3, R8). `None` = no
+    /// target, and every record written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt_suffix: Option<String>,
     /// Final assistant text for an agent run (set by `rupu run`); `None` for
     /// workflow runs and older records. Carried by the mirror so a remotely
     /// dispatched unit's output is retrievable centrally.
@@ -4307,6 +4313,18 @@ fn transcript_codename(path: &Path) -> Option<String> {
     }
 }
 
+/// The run store allocates in-process children's sub-runs for the run
+/// assembler's dispatcher (`<runs>/<parent>/sub/<sub_run_id>/`).
+impl rupu_runtime::dispatch::SubRunStore for RunStore {
+    fn create_sub_run(
+        &self,
+        parent_run_id: &str,
+        agent: &str,
+    ) -> std::io::Result<(String, PathBuf)> {
+        RunStore::create_sub_run(self, parent_run_id, agent).map_err(std::io::Error::other)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4372,6 +4390,7 @@ mod tests {
             final_output: None,
             loop_progress: BTreeMap::new(),
             gate_decisions: Vec::new(),
+            system_prompt_suffix: None,
             codename: None,
             cause: None,
         }

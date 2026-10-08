@@ -192,18 +192,35 @@ fn final_assistant_text(events: &[Event]) -> String {
     rupu_transcript::final_turn_text(events.iter().cloned()).unwrap_or_default()
 }
 
+/// Where a continuation's seed goes: a run's [`UserTurn`] (or, until W3b
+/// deletes it, the legacy flat options a workflow step still builds).
+///
+/// [`UserTurn`]: crate::runner::UserTurn
+pub trait ContinuationTarget {
+    /// Seed with `messages` by reference to `seed_source`, and send `note`.
+    fn seed_continuation(&mut self, messages: Vec<Message>, seed_source: PathBuf, note: String);
+}
+
+impl ContinuationTarget for crate::runner::UserTurn {
+    fn seed_continuation(&mut self, messages: Vec<Message>, seed_source: PathBuf, note: String) {
+        self.message = note;
+        self.initial_messages = messages;
+        self.seed_source = Some(seed_source);
+    }
+}
+
 /// Point a freshly built agent run at the interrupted one: seed it with the
 /// rebuilt conversation *by reference* to `seed_source` and hand it the
 /// continuation note (which joins the conversation's trailing user turn).
-/// Everything else on `opts` — agent, provider, model, tools, mode — is the
-/// caller's fresh configuration.
+/// Everything else about the run — agent, provider, model, tools, mode — is
+/// the caller's fresh configuration.
 ///
 /// If the conversation already ends with the note — the run being continued
 /// was itself a continuation that died before its first turn finished — the
-/// run is seed-only (empty `user_message`): the model has been told once, and
+/// run is seed-only (empty message): the model has been told once, and
 /// repeating it would stack a second identical note into the turn.
 pub fn apply_continuation(
-    opts: &mut crate::runner::AgentRunOpts,
+    target: &mut impl ContinuationTarget,
     messages: Vec<Message>,
     seed_source: PathBuf,
 ) {
@@ -212,21 +229,19 @@ pub fn apply_continuation(
     } else {
         CONTINUATION_NOTE.to_string()
     };
-    apply_continuation_with(opts, messages, seed_source, note);
+    apply_continuation_with(target, messages, seed_source, note);
 }
 
-/// [`apply_continuation`] with the caller's `note` as the `user_message` —
+/// [`apply_continuation`] with the caller's `note` as the user message —
 /// a failed run continued on another model gets
 /// [`crate::recovery::recovery_retry_note`] instead of [`CONTINUATION_NOTE`].
 pub fn apply_continuation_with(
-    opts: &mut crate::runner::AgentRunOpts,
+    target: &mut impl ContinuationTarget,
     messages: Vec<Message>,
     seed_source: PathBuf,
     note: String,
 ) {
-    opts.user_message = note;
-    opts.initial_messages = messages;
-    opts.seed_source = Some(seed_source);
+    target.seed_continuation(messages, seed_source, note);
 }
 
 /// Does `messages` already end in a user turn carrying [`CONTINUATION_NOTE`]?
@@ -242,16 +257,16 @@ fn ends_with_note(messages: &[Message]) -> bool {
     })
 }
 
-/// The transcript `opts` continues, when it describes a continuation: a run
+/// The transcript `turn` continues, when it describes a continuation: a run
 /// seeded by reference whose conversation ends with [`CONTINUATION_NOTE`]
-/// (sent as its `user_message`, or already in the seed), or that is sent a
+/// (sent as its message, or already in the seed), or that is sent a
 /// recovery retry note (a failed run continued on another model). `run_agent` records
 /// it on the run's coverage manifest.
-pub(crate) fn continued_from(opts: &crate::runner::AgentRunOpts) -> Option<&Path> {
-    let source = opts.seed_source.as_deref()?;
-    let carries_note = opts.user_message == CONTINUATION_NOTE
-        || crate::recovery::is_recovery_retry_note(&opts.user_message)
-        || (opts.user_message.is_empty() && ends_with_note(&opts.initial_messages));
+pub(crate) fn continued_from(turn: &crate::runner::UserTurn) -> Option<&Path> {
+    let source = turn.seed_source.as_deref()?;
+    let carries_note = turn.message == CONTINUATION_NOTE
+        || crate::recovery::is_recovery_retry_note(&turn.message)
+        || (turn.message.is_empty() && ends_with_note(&turn.initial_messages));
     carries_note.then_some(source)
 }
 
@@ -294,7 +309,7 @@ mod tests {
             },
         ]);
         let mut opts = opts_for(Box::new(provider), dir, transcript.clone());
-        opts.user_message = "summarise notes.txt".into();
+        opts.prompt.message = "summarise notes.txt".into();
         run_agent(opts).await.unwrap();
         transcript
     }
@@ -429,7 +444,7 @@ mod tests {
             stop: StopReason::EndTurn,
         }]);
         let mut opts = opts_for(Box::new(provider), dir, transcript.clone());
-        opts.user_message = "answer in pieces".into();
+        opts.prompt.message = "answer in pieces".into();
         run_agent(opts).await.unwrap();
         transcript
     }
@@ -491,7 +506,7 @@ mod tests {
             },
         ]);
         let mut opts = opts_for(Box::new(provider), tmp.path(), transcript.clone());
-        opts.user_message = "summarise notes.txt".into();
+        opts.prompt.message = "summarise notes.txt".into();
         run_agent(opts).await.unwrap();
         assert_eq!(finished_output(&transcript), "Summary:\n\nalpha only");
     }
@@ -600,9 +615,9 @@ mod tests {
             }]);
         let captured = provider.captured.clone();
         let mut opts = opts_for(Box::new(provider), tmp.path(), second.clone());
-        opts.user_message = "this must be replaced".into();
-        apply_continuation(&mut opts, messages, seed_source);
-        assert_eq!(opts.user_message, CONTINUATION_NOTE);
+        opts.prompt.message = "this must be replaced".into();
+        apply_continuation(&mut opts.prompt, messages, seed_source);
+        assert_eq!(opts.prompt.message, CONTINUATION_NOTE);
         run_agent(opts).await.unwrap();
 
         let mut expected = rebuilt;
@@ -665,9 +680,10 @@ mod tests {
         }]);
         let second = tmp.path().join("second.jsonl");
         let mut opts = opts_for(Box::new(provider), tmp.path(), second);
-        opts.run_id = "run_second".into();
+        opts.tool_context.identity_mut().run_id = "run_second".into();
         opts.concerns = Some(stride_concerns());
-        apply_continuation(&mut opts, messages, seed_source);
+        let mut opts = crate::grant::with_grant(opts, None, &[]).expect("grant");
+        apply_continuation(&mut opts.prompt, messages, seed_source);
         run_agent(opts).await.unwrap();
 
         let paths = rupu_coverage::CoveragePaths::new(
@@ -707,7 +723,7 @@ mod tests {
         let captured = provider.captured.clone();
         let dir = dest.parent().unwrap();
         let mut opts = opts_for(Box::new(provider), dir, dest.to_path_buf());
-        apply_continuation(&mut opts, messages, seed_source);
+        apply_continuation(&mut opts.prompt, messages, seed_source);
         run_agent(opts).await.unwrap();
         let sent = captured.lock().unwrap()[0].messages.clone();
         sent
@@ -782,15 +798,19 @@ mod tests {
             text: CONTINUATION_NOTE.into(),
         });
         let messages = vec![Message::assistant("thinking"), tool_turn];
-        apply_continuation(&mut opts, messages.clone(), PathBuf::from("/t/b.jsonl"));
-        assert_eq!(opts.user_message, "");
+        apply_continuation(
+            &mut opts.prompt,
+            messages.clone(),
+            PathBuf::from("/t/b.jsonl"),
+        );
+        assert_eq!(opts.prompt.message, "");
         assert_eq!(
-            serde_json::to_value(&opts.initial_messages).unwrap(),
+            serde_json::to_value(&opts.prompt.initial_messages).unwrap(),
             serde_json::to_value(&messages).unwrap()
         );
-        assert_eq!(opts.seed_source, Some(PathBuf::from("/t/b.jsonl")));
+        assert_eq!(opts.prompt.seed_source, Some(PathBuf::from("/t/b.jsonl")));
         // A seed-only continuation is still a continuation.
-        assert_eq!(continued_from(&opts), Some(Path::new("/t/b.jsonl")));
+        assert_eq!(continued_from(&opts.prompt), Some(Path::new("/t/b.jsonl")));
     }
 
     /// A continued transcript whose referenced source was edited after the
@@ -838,7 +858,7 @@ mod tests {
             usage: Default::default(),
         }]);
         let mut opts = opts_for(Box::new(provider), dir, transcript.clone());
-        opts.user_message = "do the thing".into();
+        opts.prompt.message = "do the thing".into();
         let result = run_agent(opts).await.unwrap();
         assert_eq!(result.status, RunStatus::Error);
         assert!(result.outcome.is_some(), "the refusal is the run's outcome");
@@ -945,20 +965,20 @@ mod tests {
         let messages = vec![Message::user("do the thing")];
         let note = crate::recovery::recovery_retry_note("refused", "anthropic", "mock-2");
         apply_continuation_with(
-            &mut opts,
+            &mut opts.prompt,
             messages.clone(),
             PathBuf::from("/t/a.jsonl"),
             note.clone(),
         );
-        assert_eq!(opts.user_message, note);
+        assert_eq!(opts.prompt.message, note);
         assert_eq!(
-            serde_json::to_value(&opts.initial_messages).unwrap(),
+            serde_json::to_value(&opts.prompt.initial_messages).unwrap(),
             serde_json::to_value(&messages).unwrap()
         );
-        assert_eq!(opts.seed_source, Some(PathBuf::from("/t/a.jsonl")));
+        assert_eq!(opts.prompt.seed_source, Some(PathBuf::from("/t/a.jsonl")));
         // A recovery continuation is a continuation: its coverage manifest
         // points `rupu coverage rerun` at the run with the real prompt.
-        assert_eq!(continued_from(&opts), Some(Path::new("/t/a.jsonl")));
+        assert_eq!(continued_from(&opts.prompt), Some(Path::new("/t/a.jsonl")));
     }
 
     /// A seeded run with an ordinary prompt (a session's next turn) is not a
@@ -969,12 +989,12 @@ mod tests {
         let provider = MockProvider::new(vec![]);
         let mut opts = opts_for(Box::new(provider), tmp.path(), tmp.path().join("t.jsonl"));
         apply_continuation_with(
-            &mut opts,
+            &mut opts.prompt,
             vec![Message::user("first")],
             PathBuf::from("/t/a.jsonl"),
             "A previous attempt at this task stopped early; carry on".into(),
         );
-        assert_eq!(continued_from(&opts), None);
+        assert_eq!(continued_from(&opts.prompt), None);
     }
 
     /// A failed continuation says which run it was seeded from — that run

@@ -19,57 +19,48 @@ fn build_opts(
     tmp: &tempfile::TempDir,
     transcript_path: std::path::PathBuf,
 ) -> AgentRunOpts {
-    AgentRunOpts {
-        codename: None,
-        seed_source: None,
-        collectors: Vec::new(),
-        extra_tools: Vec::new(),
-        step_actions: Vec::new(),
-        alias_scope: Default::default(),
-        agent_name: "outcomes".into(),
-        agent_system_prompt: "You are a test agent.".into(),
-        agent_tools: None,
-        provider,
-        provider_name: "mock".into(),
-        model: "mock-1".into(),
-        run_id: "run_outcomes".into(),
-        workspace_id: "ws_outcomes".into(),
-        workspace_path: tmp.path().to_path_buf(),
-        transcript_path,
-        max_turns: 10,
-        permission: rupu_tools::PermissionPolicy::bypass(),
-        tool_context: ToolContext {
-            workspace_path: tmp.path().to_path_buf(),
-            ..Default::default()
+    rupu_agent::grant::with_grant(
+        AgentRunOpts {
+            system_prompt: "You are a test agent.".into(),
+            prompt: rupu_agent::UserTurn::new("write the answer"),
+            provider,
+            limits: ModelLimits::unknown(),
+            recovery: Default::default(),
+            permission: rupu_tools::PermissionPolicy::bypass(),
+            grant: Default::default(),
+            alias_scope: Default::default(),
+            tool_context: {
+                let mut tc = ToolContext::in_workspace(tmp.path());
+                tc.identity = std::sync::Arc::new(rupu_tools::RunIdentity {
+                    agent: "outcomes".into(),
+                    provider: "mock".into(),
+                    model: "mock-1".into(),
+                    run_id: "run_outcomes".into(),
+                    step_id: Some("s1".into()),
+                    ..Default::default()
+                });
+                tc.workspace.id = "ws_outcomes".into();
+                tc.workspace.path = tmp.path().to_path_buf();
+                tc
+            },
+            pins: Default::default(),
+            concerns: None,
+            max_turns: 10,
+            stream: rupu_agent::StreamOpts {
+                no_stream: true,
+                suppress_stdout: false,
+                on_stream_event: None,
+            },
+            hooks: Default::default(),
+            pause: None,
+            collectors: Vec::new(),
+            extra_tools: Vec::new(),
+            transcript_path,
         },
-        user_message: "write the answer".into(),
-        initial_messages: Vec::new(),
-        turn_index_offset: 0,
-        no_stream: true,
-        suppress_stream_stdout: false,
-        mcp_registry: None,
-        effort: None,
-        thinking_display: None,
-        context_window: None,
-        output_format: None,
-        output_schema: None,
-        anthropic_task_budget: None,
-        anthropic_context_management: None,
-        anthropic_speed: None,
-        parent_run_id: None,
-        depth: 0,
-        dispatchable_agents: None,
-        step_id: "s1".into(),
-        on_tool_call: None,
-        on_stream_event: None,
-        on_usage: None,
-        concerns: None,
-        limits: ModelLimits::unknown(),
-        scope_name: None,
-        surface_tag: None,
-        pause: None,
-        recovery: Default::default(),
-    }
+        None,
+        &Vec::new(),
+    )
+    .expect("grant")
 }
 
 fn text(s: &str) -> ContentBlock {
@@ -113,7 +104,7 @@ async fn run_script(turns: Vec<ScriptedTurn>, step_id: &str) -> Ran {
     let tmp = tempfile::tempdir().unwrap();
     let transcript = tmp.path().join("run.jsonl");
     let mut opts = build_opts(Box::new(provider), &tmp, transcript.clone());
-    opts.step_id = step_id.to_string();
+    opts.tool_context.identity_mut().step_id = Some(step_id.to_string()).filter(|s| !s.is_empty());
     let result = run_agent(opts).await.expect("the loop itself completes");
     let requests = captured.lock().unwrap().clone();
     let events = JsonlReader::iter(&transcript)
@@ -299,8 +290,8 @@ async fn a_session_turn_hints_at_sending_another_message() {
     );
     let tmp = tempfile::tempdir().unwrap();
     let mut opts = build_opts(Box::new(provider), &tmp, tmp.path().join("run.jsonl"));
-    opts.step_id = String::new();
-    opts.surface_tag = Some("session".into());
+    opts.tool_context.identity_mut().step_id = None;
+    opts.tool_context.identity_mut().surface = rupu_tools::Surface::Session;
     let result = run_agent(opts).await.expect("the loop itself completes");
     let err = result.error.as_deref().unwrap();
     assert!(
@@ -472,7 +463,7 @@ async fn a_no_stream_refused_turn_writes_its_text_as_deltas() {
         &tmp,
         transcript.clone(),
     );
-    opts.no_stream = true;
+    opts.stream.no_stream = true;
     let result = run_agent(opts).await.expect("the loop completes");
     assert_eq!(result.status, RunStatus::Error);
     let events = read_events(&transcript);
@@ -518,7 +509,7 @@ async fn a_no_stream_kept_turn_writes_no_deltas() {
         &tmp,
         transcript.clone(),
     );
-    opts.no_stream = true;
+    opts.stream.no_stream = true;
     let result = run_agent(opts).await.expect("the loop completes");
     assert_eq!(result.status, RunStatus::Ok);
     assert!(deltas(&read_events(&transcript)).is_empty());
@@ -895,7 +886,7 @@ async fn a_truncated_tool_call_under_a_lowered_cap_compacts_then_retries_at_the_
     let tmp = tempfile::tempdir().unwrap();
     let transcript = tmp.path().join("run.jsonl");
     let mut opts = build_opts(Box::new(provider), &tmp, transcript.clone());
-    opts.initial_messages = vec![
+    opts.prompt.initial_messages = vec![
         dense_msg(Role::User, "task"),
         dense_msg(Role::Assistant, "assistant 0"),
         dense_msg(Role::User, "user 0"),
@@ -1031,7 +1022,7 @@ async fn context_window_exceeded_compacts_then_continues() {
     let tmp = tempfile::tempdir().unwrap();
     let transcript = tmp.path().join("run.jsonl");
     let mut opts = build_opts(Box::new(provider), &tmp, transcript.clone());
-    opts.initial_messages = vec![
+    opts.prompt.initial_messages = vec![
         dense_msg(Role::User, "task"),
         dense_msg(Role::Assistant, "assistant 0"),
         dense_msg(Role::User, "user 0"),
@@ -1085,7 +1076,7 @@ async fn context_window_exceeded_after_a_proactive_compaction_compacts_once() {
     let tmp = tempfile::tempdir().unwrap();
     let transcript = tmp.path().join("run.jsonl");
     let mut opts = build_opts(Box::new(provider), &tmp, transcript.clone());
-    opts.initial_messages = vec![
+    opts.prompt.initial_messages = vec![
         dense_msg(Role::User, "task"),
         dense_msg(Role::Assistant, "assistant 0"),
         dense_msg(Role::User, "user 0"),
@@ -1212,8 +1203,9 @@ async fn run_with_hops_and(
 ) -> HopRun {
     let transcript = tmp.path().join("run.jsonl");
     let mut opts = build_opts(primary, tmp, transcript.clone());
-    opts.provider_name = provider_name.into();
-    opts.model = model.into();
+    let id = opts.tool_context.identity_mut();
+    id.provider = provider_name.into();
+    id.model = model.into();
     edit(&mut opts);
     let builds = hops.as_ref().map(|h| h.calls.clone()).unwrap_or_default();
     opts.recovery = rupu_agent::RecoveryOpts {
@@ -1852,11 +1844,11 @@ async fn unnamed_entries_stay_on_the_origin_provider_after_a_hop() {
 /// `anthropicTaskBudget` and `anthropicContextManagement`, plus a
 /// provider-generic `effort`.
 fn pin_origin_model(opts: &mut AgentRunOpts) {
-    opts.context_window = Some(rupu_providers::model_tier::ContextWindow::OneMillion);
-    opts.anthropic_speed = Some(rupu_providers::types::Speed::Fast);
-    opts.anthropic_task_budget = Some(40_000);
-    opts.anthropic_context_management = Some(ORIGIN_CONTEXT_MANAGEMENT);
-    opts.effort = Some(rupu_providers::model_tier::ThinkingLevel::High);
+    opts.pins.context_window = Some(rupu_providers::model_tier::ContextWindow::OneMillion);
+    opts.pins.anthropic_speed = Some(rupu_providers::types::Speed::Fast);
+    opts.pins.anthropic_task_budget = Some(40_000);
+    opts.pins.anthropic_context_management = Some(ORIGIN_CONTEXT_MANAGEMENT);
+    opts.pins.effort = Some(rupu_providers::model_tier::ThinkingLevel::High);
 }
 
 const ORIGIN_CONTEXT_MANAGEMENT: rupu_providers::types::ContextManagement =

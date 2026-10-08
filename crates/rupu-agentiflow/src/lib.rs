@@ -9,6 +9,7 @@ mod coverage;
 mod def;
 mod dispatch_tools;
 mod envelope;
+mod flow_unit;
 mod error;
 mod goal;
 mod lead;
@@ -42,6 +43,7 @@ pub use envelope::{
     StopReason,
 };
 pub use error::AgentiflowError;
+pub use flow_unit::FlowUnitServices;
 pub use goal::{GoalEvalError, GoalEvaluator, GoalOutcome};
 pub use lead::{
     render_round_prompt, GenerationCapability, GenerationProviderFactory, LeadConfig,

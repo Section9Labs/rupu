@@ -23,10 +23,9 @@ use rupu_providers::reply_error::ApiErrorBody;
 use rupu_providers::types::{
     ContentBlock, LlmRequest, LlmResponse, Message, Role, Stop, StopReason, StreamEvent, Usage,
 };
-use rupu_scm::Registry;
 use rupu_tools::{
-    AliasScope, AllowAlways, AmbientGrant, Decision, DenyReason, DerivedEvent, GrantInputs,
-    PermissionMode, PermissionPolicy, ResolvedGrant, Service, ServiceSet, Tool, ToolContext,
+    AliasScope, AllowAlways, Decision, DenyReason, DerivedEvent, PermissionMode, PermissionPolicy,
+    ResolvedGrant, RunIdentity, Service, Surface, Tool, ToolContext,
 };
 use rupu_transcript::{
     Event, FileEditKind, JsonlWriter, RecoveryAction, RunMode, RunStatus, Severity,
@@ -46,9 +45,10 @@ struct CoverageBundle {
 }
 
 /// The run stream for records written under `scope`, when `rupu run` asked
-/// for one (see `ToolContext::coverage_stream`).
+/// for one (see `ToolServices::coverage_stream`).
 fn run_stream_for(ctx: &ToolContext, scope: &str) -> Option<rupu_coverage::RunStream> {
-    ctx.coverage_stream
+    ctx.services
+        .coverage_stream
         .clone()
         .map(|path| rupu_coverage::RunStream {
             path,
@@ -533,7 +533,7 @@ self-contained.";
 /// undercounts code/JSON-heavy conversations by ~2x.
 async fn compact_context(
     messages: &mut Vec<Message>,
-    opts: &mut AgentRunOpts,
+    opts: &mut Run,
     run_id: &str,
     seq: u32,
     writer: &mut JsonlWriter,
@@ -628,11 +628,7 @@ async fn compact_context(
 /// the usage hook, so the run's spend is complete. Deliberately NOT added to
 /// `total_in`/`total_out` — those feed `RunComplete.total_tokens` and the
 /// context-budget arithmetic, which are turn-scoped.
-fn record_compaction_usage(
-    opts: &AgentRunOpts,
-    writer: &mut JsonlWriter,
-    cu: &rupu_providers::Usage,
-) {
+fn record_compaction_usage(opts: &Run, writer: &mut JsonlWriter, cu: &rupu_providers::Usage) {
     let billable = cu.output_tokens as u64 + cu.reasoning_tokens as u64;
     if let Err(e) = writer.write(&Event::Usage {
         provider: opts.provider_name.clone(),
@@ -646,7 +642,7 @@ fn record_compaction_usage(
     }) {
         tracing::warn!(error = %e, "failed to write compaction usage event to transcript");
     }
-    if let Some(cb) = &opts.on_usage {
+    if let Some(cb) = &opts.hooks.on_usage {
         cb(&UsageTurn {
             kind: UsageKind::Compaction,
             provider: opts.provider_name.clone(),
@@ -977,13 +973,13 @@ pub const SESSION_NO_RECOVERY_HINT: &str =
     "no recovery left — send another message to continue, or start a new session on another model";
 
 /// The rung-3 hint: what the operator can do once nothing is left to try.
-fn no_recovery_hint(opts: &AgentRunOpts) -> String {
-    if opts.surface_tag.as_deref() == Some("session") {
+fn no_recovery_hint(opts: &Run) -> String {
+    if opts.session_turn() {
         SESSION_NO_RECOVERY_HINT.to_string()
-    } else if opts.step_id.is_empty() {
+    } else if opts.step().is_empty() {
         format!(
             "no recovery left — continue with another model: rupu run {} --continue {} --model <model> [--provider <provider>]",
-            opts.agent_name, opts.run_id
+            opts.id.agent, opts.id.run_id
         )
     } else {
         "no recovery left — add fallbacks: to the agent or [recovery].fallbacks to try other models"
@@ -999,7 +995,7 @@ fn no_recovery_hint(opts: &AgentRunOpts) -> String {
 /// index.
 fn exhausted(
     writer: &mut JsonlWriter,
-    opts: &AgentRunOpts,
+    opts: &Run,
     outcome: &crate::outcome::Outcome,
     turn_idx: &mut u32,
 ) -> Result<LoopOutcome, RunError> {
@@ -1044,7 +1040,7 @@ fn still_paused(
 /// returned error's text.
 fn provider_exhausted(
     writer: &mut JsonlWriter,
-    opts: &AgentRunOpts,
+    opts: &Run,
     outcome: &crate::outcome::Outcome,
     error: String,
     message: String,
@@ -1061,7 +1057,7 @@ fn provider_exhausted(
     .write(writer, RecoveryAction::Failed)
     .and_then(|_| {
         writer.write(&Event::RunComplete {
-            run_id: opts.run_id.clone(),
+            run_id: opts.id.run_id.clone(),
             status: RunStatus::Error,
             total_tokens,
             duration_ms: started.elapsed().as_millis() as u64,
@@ -1098,23 +1094,23 @@ struct OriginPins {
 }
 
 impl OriginPins {
-    fn of(opts: &AgentRunOpts) -> Self {
+    fn of(opts: &Run) -> Self {
         Self {
             model: opts.model.clone(),
-            context_window: opts.context_window,
-            anthropic_speed: opts.anthropic_speed,
-            anthropic_task_budget: opts.anthropic_task_budget,
-            anthropic_context_management: opts.anthropic_context_management,
+            context_window: opts.pins.context_window,
+            anthropic_speed: opts.pins.anthropic_speed,
+            anthropic_task_budget: opts.pins.anthropic_task_budget,
+            anthropic_context_management: opts.pins.anthropic_context_management,
         }
     }
 
     /// Set the pins for the model `opts` now runs on.
-    fn apply_to(&self, opts: &mut AgentRunOpts) {
+    fn apply_to(&self, opts: &mut Run) {
         let same = opts.model == self.model;
-        opts.context_window = self.context_window.filter(|_| same);
-        opts.anthropic_speed = self.anthropic_speed.filter(|_| same);
-        opts.anthropic_task_budget = self.anthropic_task_budget.filter(|_| same);
-        opts.anthropic_context_management = self.anthropic_context_management.filter(|_| same);
+        opts.pins.context_window = self.context_window.filter(|_| same);
+        opts.pins.anthropic_speed = self.anthropic_speed.filter(|_| same);
+        opts.pins.anthropic_task_budget = self.anthropic_task_budget.filter(|_| same);
+        opts.pins.anthropic_context_management = self.anthropic_context_management.filter(|_| same);
     }
 }
 
@@ -1159,7 +1155,7 @@ enum FallBack {
 #[allow(clippy::too_many_arguments)]
 async fn fall_back(
     writer: &mut JsonlWriter,
-    opts: &mut AgentRunOpts,
+    opts: &mut Run,
     messages: &mut Vec<Message>,
     recovery: &mut crate::recovery::RecoveryState,
     outcome: &crate::outcome::Outcome,
@@ -1242,7 +1238,7 @@ async fn fall_back(
             && !*compacted_this_turn
             && !rupu_providers::credential_writes::terminating()
         {
-            let run_id = opts.run_id.clone();
+            let run_id = opts.id.run_id.clone();
             if compact_context(
                 messages,
                 opts,
@@ -1305,121 +1301,94 @@ pub(crate) fn call_sign_line(codename: &str) -> Option<String> {
     ))
 }
 
-/// Inputs to a single agent run.
-pub struct AgentRunOpts {
-    /// Human codename for this instance. Written to `RunStart`, announced in
-    /// the system prompt, and copied onto `tool_context` for attribution.
-    pub codename: Option<String>,
-    pub agent_name: String,
-    pub agent_system_prompt: String,
-    /// The agent's `tools:` grant; `None` = [`rupu_tools::DEFAULT_GRANT`].
-    /// Resolved with [`Self::step_actions`] and the run's ambient grants into
-    /// the run's [`ResolvedGrant`], the only input to its tool registry.
-    pub agent_tools: Option<Vec<String>>,
-    /// The workflow step's `actions:`: narrows the connector tools of the
-    /// grant, nothing else. Empty = no narrowing (every non-step run).
-    pub step_actions: Vec<String>,
-    /// Where tool aliases resolve: [`AliasScope::FlowLead`] for an
-    /// agentiflow lead (`coverage.status` → `goal.coverage`), else
-    /// [`AliasScope::Everywhere`].
-    pub alias_scope: AliasScope,
-    pub provider: Box<dyn LlmProvider>,
-    pub provider_name: String,
-    pub model: String,
-    pub run_id: String,
-    pub workspace_id: String,
-    pub workspace_path: PathBuf,
-    pub transcript_path: PathBuf,
-    pub max_turns: u32,
-    /// The run's permission policy: its mode and, for an interactive run,
-    /// the operator prompter. Every tool call is decided by it from the
-    /// tool's declared effect.
-    pub permission: PermissionPolicy,
-    pub tool_context: ToolContext,
-    pub user_message: String,
-    /// Existing conversation state to prepend before `user_message`.
-    /// Empty for one-shot runs.
+/// What the run is asked: the user turn, and the conversation it continues.
+#[derive(Debug, Clone, Default)]
+pub struct UserTurn {
+    /// The user message. EMPTY means "seed-only": `initial_messages` is a
+    /// complete, ready-to-send conversation and nothing is appended.
+    pub message: String,
+    /// Existing conversation state to prepend before `message`. Empty for
+    /// one-shot runs.
     pub initial_messages: Vec<Message>,
+    /// Path of a transcript whose replay-reconstruction equals
+    /// `initial_messages` byte-exact (spec §3 seed dedup rule). When set,
+    /// the Seed event stores this reference instead of re-embedding the
+    /// messages; the caller owns that invariant and replay verifies it via
+    /// the recorded sha256. `None` → the seed is embedded inline in full.
+    pub seed_source: Option<PathBuf>,
     /// Absolute turn index for the first turn in this run.
     pub turn_index_offset: u32,
-    /// If true, don't render tokens as they arrive and don't write
-    /// `AssistantDelta`/`ThinkingDelta` transcript events while a reply
-    /// streams (the transcript keeps its final-message-only shape). A
-    /// discarded turn has no final message, so its text is written as
-    /// `AssistantDelta`s once the reply is in. Display only: the request still streams
-    /// on the wire, so a long response cannot hit the HTTP request timeout and
-    /// the full output cap applies. Default is false. Used by --no-stream.
-    pub no_stream: bool,
-    /// If true, suppress stdout writes from the streaming code path.
-    /// The provider's text deltas still flow into the JSONL transcript
-    /// writer; only the `print!`/`println!` calls used by the legacy
-    /// line-stream UI are skipped. The TUI sets this to `true` because
-    /// it owns the alt-screen — any stdout write corrupts the canvas.
-    /// Default false (preserves the line-stream UI for `rupu run`).
-    pub suppress_stream_stdout: bool,
-    /// SCM/issue registry. When `Some`, the runner spins up an in-process
-    /// MCP server before the first turn and tears it down before returning.
-    /// `None` means MCP tools are unavailable for this run (test harness,
-    /// pre-Task-19 CLI invocations, etc.).
-    pub mcp_registry: Option<Arc<Registry>>,
+}
+
+impl UserTurn {
+    /// A fresh one-shot turn.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            ..Self::default()
+        }
+    }
+}
+
+/// The agent's request knobs, as they apply to the model the run starts on.
+/// A fallback hop onto another model drops the model-specific ones
+/// (`context_window`, `anthropic_*`); `effort` and `thinking_display` are
+/// provider-generic and stay.
+#[derive(Debug, Clone, Default)]
+pub struct AgentPins {
     /// Reasoning / thinking effort level for every turn. Provider-specific
     /// translation (Anthropic `thinking.budget_tokens` / `thinking.type:adaptive`,
     /// OpenAI/Copilot `reasoning.effort`, Gemini `thinkingBudget`).
     pub effort: Option<rupu_providers::model_tier::ThinkingLevel>,
-    /// Reasoning display hint (`thinking.display`). Provider-generic like
-    /// `effort` — carried unchanged across fallback hops, never a model pin.
-    /// Honored by Anthropic adaptive models only.
+    /// Reasoning display hint (`thinking.display`). Honored by Anthropic
+    /// adaptive models only.
     pub thinking_display: Option<rupu_providers::types::ThinkingDisplay>,
-    /// Desired context-window tier. Anthropic api-key path uses this to
-    /// gate the `context-1m-2025-08-07` beta header; other providers
-    /// currently ignore it.
+    /// Desired context-window tier. The Anthropic api-key path uses this to
+    /// gate the `context-1m-2025-08-07` beta header; other providers ignore it.
     pub context_window: Option<rupu_providers::model_tier::ContextWindow>,
     /// Cross-provider output-format hint. Anthropic emits as
     /// `output_config.format`; OpenAI emits as `response_format.type`;
     /// other providers ignore.
     pub output_format: Option<rupu_providers::types::OutputFormat>,
-    /// JSON Schema for Anthropic structured outputs. Threaded from
-    /// `AgentSpec::output_schema`. `Some` gets emitted as
-    /// `output_config.format = {type: "json_schema", schema}` by the
-    /// Anthropic provider; `None` preserves prompt-driven-only
-    /// `output_format` behavior (no schema-less mode exists). Ignored
-    /// by other providers.
+    /// JSON Schema for Anthropic structured outputs (`AgentSpec::output_schema`).
     pub output_schema: Option<serde_json::Value>,
     /// Anthropic-only soft cap on output tokens (model self-paces).
-    /// Distinct from `max_turns` (hard ceiling). Ignored by other
-    /// providers.
     pub anthropic_task_budget: Option<u32>,
-    /// Anthropic-only auto context-pruning strategy. Ignored by
-    /// other providers.
+    /// Anthropic-only auto context-pruning strategy.
     pub anthropic_context_management: Option<rupu_providers::types::ContextManagement>,
-    /// Anthropic-only fast-mode toggle (account-gated). Ignored by
-    /// other providers.
+    /// Anthropic-only fast-mode toggle (account-gated).
     pub anthropic_speed: Option<rupu_providers::types::Speed>,
-    /// When this run is a sub-agent dispatch, the parent run's id.
-    /// `None` for top-level workflow runs.
-    pub parent_run_id: Option<String>,
-    /// Dispatch depth — 0 for top-level workflow steps, 1 for direct
-    /// children of the parent, 2 for grandchildren, etc. The
-    /// `dispatch_agent` tool checks this against the per-agent +
-    /// workspace max-depth limit before spawning a child. See
-    /// `docs/superpowers/specs/2026-05-08-rupu-sub-agent-dispatch-design.md`
-    /// § 4.3.
-    pub depth: u32,
-    /// Per-agent allowlist of children this agent can dispatch via
-    /// `dispatch_agent` / `dispatch_agents_parallel`. Pulled from the
-    /// agent's `dispatchableAgents:` frontmatter field. `None`
-    /// (default) ⇒ no dispatches allowed.
-    pub dispatchable_agents: Option<Vec<String>>,
-    /// Step id that owns this agent run. Threaded through so
-    /// `on_tool_call` can identify which step is calling. Empty
-    /// for free-standing agent runs (no orchestrator).
-    pub step_id: String,
-    /// Optional callback invoked before each tool dispatch.
-    pub on_tool_call: Option<OnToolCallCallback>,
-    /// Optional callback invoked for live stream events while the
-    /// provider is generating. Used by session attach to surface
-    /// real-time usage/progress without changing transcript schema.
+}
+
+/// How a run's reply streams are shown.
+#[derive(Clone, Default)]
+pub struct StreamOpts {
+    /// If true, don't render tokens as they arrive and don't write
+    /// `AssistantDelta`/`ThinkingDelta` transcript events while a reply
+    /// streams (the transcript keeps its final-message-only shape). A
+    /// discarded turn has no final message, so its text is written as
+    /// `AssistantDelta`s once the reply is in. Display only: the request still
+    /// streams on the wire, so a long response cannot hit the HTTP request
+    /// timeout and the full output cap applies. Used by --no-stream.
+    pub no_stream: bool,
+    /// If true, suppress stdout writes from the streaming code path. The
+    /// provider's text deltas still flow into the JSONL transcript writer;
+    /// only the `print!`/`println!` calls used by the legacy line-stream UI
+    /// are skipped. Every production launch sets it: their printers read the
+    /// transcript.
+    pub suppress_stdout: bool,
+    /// Invoked for live stream events while the provider is generating.
+    /// Used by session attach to surface real-time usage/progress without
+    /// changing transcript schema.
     pub on_stream_event: Option<OnStreamEventCallback>,
+}
+
+/// Callbacks a launch site hangs on the run.
+#[derive(Clone, Default)]
+pub struct Hooks {
+    /// Invoked after each tool call is decided (and run): the workflow
+    /// step's `tool_audit` writer.
+    pub on_tool_call: Option<OnToolCallCallback>,
     /// Per-LLM-call usage hook (spec 2026-09-29 §3.3). Invoked synchronously
     /// once per billed call — normal turns AND the compaction summariser —
     /// alongside its transcript `Usage` event and before any early exit, so
@@ -1427,30 +1396,52 @@ pub struct AgentRunOpts {
     /// its `Usage` write (a failed write, which aborts the run, still leaves
     /// the call reported); the compaction hook fires after its best-effort
     /// write, whose failure is only logged. Must be cheap and must never
-    /// panic; the orchestrator uses it to append the run's usage ledger.
+    /// panic; it appends the run's usage ledger.
     pub on_usage: Option<OnUsageCallback>,
-    /// Coverage concerns block. When `Some`, the runner flattens the
-    /// catalog, writes a snapshot, injects coverage tools, and prepends
-    /// the catalog to the system prompt. `None` (default) disables all
-    /// coverage harness machinery.
-    pub concerns: Option<rupu_coverage::ConcernsBlock>,
+}
+
+/// Inputs to a single agent run, as the run assembler
+/// (`rupu_runtime::assembly`) builds them: who the run is (its identity, on
+/// `tool_context`), what it is asked, what it runs on and what it may call.
+/// The identity is never written by the loop (spec 2026-10-07 W3, P6).
+pub struct AgentRunOpts {
+    /// The system prompt, assembled (the agent's prompt plus any suffix).
+    /// The loop appends the coverage catalog, the findings guidance and the
+    /// call-sign line.
+    pub system_prompt: String,
+    pub prompt: UserTurn,
+    pub provider: Box<dyn LlmProvider>,
     /// Resolved model limits (spec 2026-09-30 §5): the request `max_tokens`
     /// (`output`), the compaction threshold (`compact_threshold()`), and the
-    /// run-start notice. Launch sites build this with
-    /// `rupu_runtime::model_limits::resolve`; tests use `ModelLimits::unknown()`
-    /// / `fixed(..)`.
+    /// run-start notice. Tests use `ModelLimits::unknown()` / `fixed(..)`.
     pub limits: rupu_providers::model_limits::ModelLimits,
-    /// Override the `scope_name` used when deriving the coverage `target_id`.
-    /// When `None` (default, standalone agent runs), falls back to `agent_name`.
-    /// Workflow runs set this to the workflow name so all steps accumulate
-    /// ledger entries under the same `target_id`, regardless of which agent
-    /// handled each step.
-    pub scope_name: Option<String>,
-    /// Override the surface tag written into coverage `FileTouchEvent`s.
-    /// When `None` (default), the runner falls back to `"agent"`.
-    /// The workflow step factory sets this to `"workflow"` so coverage events
-    /// from workflow runs are correctly attributed to the workflow surface.
-    pub surface_tag: Option<String>,
+    /// Recovery ladder inputs (spec 2026-10-01 §5–§6). Default: no fallback
+    /// chain and no hop builder — rungs 1 and 2 are unavailable, rung 0
+    /// still applies.
+    pub recovery: crate::recovery::RecoveryOpts,
+    /// The run's permission policy: its mode and, for an interactive run,
+    /// the operator prompter. Every tool call is decided by it from the
+    /// tool's declared effect.
+    pub permission: PermissionPolicy,
+    /// What the model may call (W2), resolved by
+    /// [`crate::grant::resolve_run_grant`] over the services
+    /// `tool_context` provides. The run's tool registry is built from it and
+    /// nothing else.
+    pub grant: ResolvedGrant,
+    /// Where tool aliases resolve: [`AliasScope::FlowLead`] for an
+    /// agentiflow lead (`coverage.status` → `goal.coverage`), else
+    /// [`AliasScope::Everywhere`].
+    pub alias_scope: AliasScope,
+    /// The run's identity, workspace and services.
+    pub tool_context: ToolContext,
+    pub pins: AgentPins,
+    /// Coverage concerns block. When `Some`, the runner flattens the
+    /// catalog, writes a snapshot, offers the coverage tools, and appends
+    /// the catalog to the system prompt.
+    pub concerns: Option<rupu_coverage::ConcernsBlock>,
+    pub max_turns: u32,
+    pub stream: StreamOpts,
+    pub hooks: Hooks,
     /// Cooperative pause signal. When `Some` and the token is cancelled,
     /// the loop stops at the next safe boundary — after the in-flight
     /// stream is dropped (partial assistant text is discarded, not
@@ -1458,26 +1449,118 @@ pub struct AgentRunOpts {
     /// recorded — and `run_agent` returns a `RunResult` with
     /// `paused == true` instead of erroring. A resume is just another
     /// `run_agent` call seeded with the persisted transcript messages.
-    /// `None` (default) preserves today's behavior exactly.
     pub pause: Option<tokio_util::sync::CancellationToken>,
-    /// Path of a transcript whose replay-reconstruction equals
-    /// `initial_messages` byte-exact (spec §3 seed dedup rule). When set,
-    /// the Seed event stores this reference instead of re-embedding the
-    /// messages; the caller owns that invariant and replay verifies it via
-    /// the recorded sha256. `None` → the seed is embedded inline in full.
-    pub seed_source: Option<PathBuf>,
-    /// Pre-turn collectors (spec §8). Empty = no injection; the loop behaves
-    /// exactly as before. Run off the async runtime via spawn_blocking.
+    /// Pre-turn collectors (spec §8). Empty = no injection. Run off the
+    /// async runtime via spawn_blocking.
     pub collectors: Vec<std::sync::Arc<dyn crate::collector::TurnCollector>>,
-    /// Pre-built, run-scoped tools injected into this run regardless of
-    /// `agent_tools`: an ambient grant with reason `origin:injected`, so they
-    /// appear in the run's `tool_grant` and are audited like any tool; the
-    /// `PermissionPolicy` still gates each call. Empty for ordinary runs; the
-    /// agentiflow envelope uses it for its board/mailbox/dispatch tools until
-    /// W5 moves them into the catalog.
+    /// Pre-built, run-scoped tools injected into this run: an ambient grant
+    /// with reason `origin:injected` (already in `grant`), audited like any
+    /// tool; the `PermissionPolicy` still gates each call. Empty for
+    /// ordinary runs; the agentiflow envelope uses it for its
+    /// board/mailbox/dispatch tools until W5 moves them into the catalog.
     pub extra_tools: Vec<std::sync::Arc<dyn rupu_tools::Tool>>,
-    /// Recovery ladder inputs (spec 2026-10-01 §5–§6). Default: no fallback chain and no hop builder — rungs 1 and 2 are unavailable, rung 0 still applies.
-    pub recovery: crate::recovery::RecoveryOpts,
+    pub transcript_path: PathBuf,
+}
+
+impl AgentRunOpts {
+    /// Who the run is.
+    pub fn identity(&self) -> &RunIdentity {
+        &self.tool_context.identity
+    }
+}
+
+/// The run as the loop drives it: the options, plus the provider and model
+/// now serving it — a fallback hop moves those (the identity keeps the ones
+/// the run started on).
+struct Run {
+    id: Arc<RunIdentity>,
+    provider_name: String,
+    model: String,
+    system_prompt: String,
+    prompt: UserTurn,
+    provider: Box<dyn LlmProvider>,
+    limits: rupu_providers::model_limits::ModelLimits,
+    recovery: crate::recovery::RecoveryOpts,
+    permission: PermissionPolicy,
+    grant: ResolvedGrant,
+    alias_scope: AliasScope,
+    tool_context: ToolContext,
+    pins: AgentPins,
+    concerns: Option<rupu_coverage::ConcernsBlock>,
+    max_turns: u32,
+    stream: StreamOpts,
+    hooks: Hooks,
+    pause: Option<tokio_util::sync::CancellationToken>,
+    collectors: Vec<std::sync::Arc<dyn crate::collector::TurnCollector>>,
+    extra_tools: Vec<std::sync::Arc<dyn rupu_tools::Tool>>,
+    transcript_path: PathBuf,
+}
+
+impl Run {
+    fn new(opts: AgentRunOpts) -> Self {
+        let AgentRunOpts {
+            system_prompt,
+            prompt,
+            provider,
+            limits,
+            recovery,
+            permission,
+            grant,
+            alias_scope,
+            mut tool_context,
+            pins,
+            concerns,
+            max_turns,
+            stream,
+            hooks,
+            pause,
+            collectors,
+            extra_tools,
+            transcript_path,
+        } = opts;
+        // A child run a tool call starts asks the run's own operator.
+        tool_context.services.prompter = permission.prompter().cloned();
+        let id = Arc::clone(&tool_context.identity);
+        Self {
+            provider_name: id.provider.clone(),
+            model: id.model.clone(),
+            id,
+            system_prompt,
+            prompt,
+            provider,
+            limits,
+            recovery,
+            permission,
+            grant,
+            alias_scope,
+            tool_context,
+            pins,
+            concerns,
+            max_turns,
+            stream,
+            hooks,
+            pause,
+            collectors,
+            extra_tools,
+            transcript_path,
+        }
+    }
+
+    /// The owning workflow step, `""` outside a workflow (the
+    /// `on_tool_call` contract).
+    fn step(&self) -> &str {
+        self.id.step_id.as_deref().unwrap_or("")
+    }
+
+    /// A session's own turn — not a sub-agent it dispatched, which reports
+    /// under the session's surface but has no session of its own to send to.
+    fn session_turn(&self) -> bool {
+        self.id.surface == Surface::Session && self.id.parent.is_none()
+    }
+
+    fn workspace_path(&self) -> &std::path::Path {
+        &self.tool_context.workspace.path
+    }
 }
 
 /// Outcome of a finished run.
@@ -1649,7 +1732,8 @@ pub struct RunExit {
 }
 
 /// [`run_agent_with_limits`], plus the run's final conversation.
-pub async fn run_agent_full(mut opts: AgentRunOpts) -> RunExit {
+pub async fn run_agent_full(opts: AgentRunOpts) -> RunExit {
+    let mut opts = Run::new(opts);
     let mut messages: Vec<Message> = Vec::new();
     let result = run_agent_inner(&mut opts, &mut messages).await;
     RunExit {
@@ -1660,7 +1744,7 @@ pub async fn run_agent_full(mut opts: AgentRunOpts) -> RunExit {
 }
 
 async fn run_agent_inner(
-    opts: &mut AgentRunOpts,
+    opts: &mut Run,
     messages: &mut Vec<Message>,
 ) -> Result<RunResult, RunError> {
     // Truncate/create a fresh, empty transcript, then hold an
@@ -1681,12 +1765,16 @@ async fn run_agent_inner(
     let mut writer = JsonlWriter::append(&opts.transcript_path)?;
     let started = Instant::now();
 
-    // What the model may call (W2): resolved once, before anything is built,
-    // from the agent's `tools:`, the step's `actions:`, the ambient grants
-    // and the services this run provides. The registry is built from it and
-    // nothing else (below), and it is written to the transcript.
-    let findings_opts = opts.tool_context.findings.clone().unwrap_or_default();
-    let grant = resolve_run_grant(opts, &findings_opts)?;
+    // What the model may call (W2), resolved by the run's assembly over the
+    // services it provides. The registry is built from it and nothing else
+    // (below), and it is written to the transcript.
+    let findings_opts = opts
+        .tool_context
+        .services
+        .findings
+        .clone()
+        .unwrap_or_default();
+    let grant = opts.grant.clone();
 
     // Coverage harness: flatten catalog, write snapshot, spawn writer.
     // The handle is kept separate so it can be consumed (shutdown) at each
@@ -1695,9 +1783,9 @@ async fn run_agent_inner(
         if let Some(block) = opts.concerns.clone() {
             let catalog = flatten(&block)
                 .map_err(|e| RunError::Coverage(format!("flatten coverage catalog: {e}")))?;
-            let resolved_scope = opts.scope_name.as_deref().unwrap_or(&opts.agent_name);
-            let target = target_id(&opts.workspace_path, resolved_scope);
-            let paths = CoveragePaths::new(&opts.workspace_path, &target)
+            let resolved_scope = opts.id.scope();
+            let target = target_id(opts.workspace_path(), resolved_scope);
+            let paths = CoveragePaths::new(opts.workspace_path(), &target)
                 .with_run_stream(run_stream_for(&opts.tool_context, resolved_scope));
             paths
                 .ensure_dir()
@@ -1711,25 +1799,20 @@ async fn run_agent_inner(
             // autoflow / session all reach run_agent), so every run becomes
             // replay-describable. Failure to write the manifest must not
             // abort the run — log and continue.
-            let surface = match opts.surface_tag.as_deref() {
-                Some("workflow") => rupu_coverage::Surface::Workflow,
-                Some("autoflow") => rupu_coverage::Surface::Autoflow,
-                Some("session") => rupu_coverage::Surface::Session,
-                _ => rupu_coverage::Surface::Agent,
-            };
+            let surface = opts.id.surface.coverage();
             let manifest = rupu_coverage::RunManifest {
-                run_id: opts.run_id.clone(),
+                run_id: opts.id.run_id.clone(),
                 started_at: chrono::Utc::now(),
                 surface,
-                agent_name: opts.agent_name.clone(),
+                agent_name: opts.id.agent.clone(),
                 provider: opts.provider_name.clone(),
                 model: opts.model.clone(),
                 permission_mode: opts.permission.mode().as_str().to_string(),
-                user_prompt: opts.user_message.clone(),
+                user_prompt: opts.prompt.message.clone(),
                 concerns: block.clone(),
                 scope_name: resolved_scope.to_string(),
-                workspace_path: opts.workspace_path.clone(),
-                continued_from: crate::continuation::continued_from(opts)
+                workspace_path: opts.workspace_path().to_path_buf(),
+                continued_from: crate::continuation::continued_from(&opts.prompt)
                     .map(|p| p.display().to_string()),
             };
             if let Err(e) = rupu_coverage::append_manifest(&paths, &manifest) {
@@ -1750,8 +1833,8 @@ async fn run_agent_inner(
 
     // Append catalog prompt section to system prompt when coverage is active.
     if let Some(bundle) = &coverage {
-        opts.agent_system_prompt.push_str("\n\n");
-        opts.agent_system_prompt.push_str(&bundle.prompt_section);
+        opts.system_prompt.push_str("\n\n");
+        opts.system_prompt.push_str(&bundle.prompt_section);
     }
 
     // Findings contract for this run. Resolved before `RunStart` is written
@@ -1767,12 +1850,12 @@ async fn run_agent_inner(
         // A concerns agent's ledger is the bundle's own (same scope, target
         // id and run stream, directory already ensured); otherwise it is
         // built here the same way.
-        let scope = opts.scope_name.as_deref().unwrap_or(&opts.agent_name);
+        let scope = opts.id.scope();
         let paths = match coverage.as_ref() {
             Some(bundle) => bundle.paths.clone(),
             None => {
-                let target = target_id(&opts.workspace_path, scope);
-                let paths = CoveragePaths::new(&opts.workspace_path, &target)
+                let target = target_id(opts.workspace_path(), scope);
+                let paths = CoveragePaths::new(opts.workspace_path(), &target)
                     .with_run_stream(run_stream_for(&opts.tool_context, scope));
                 paths
                     .ensure_dir()
@@ -1784,8 +1867,8 @@ async fn run_agent_inner(
             paths,
             catalog: coverage.as_ref().map(|b| Arc::new(b.catalog.clone())),
             findings: findings_opts.clone(),
-            workspace: opts.workspace_path.clone(),
-            tag_log: rupu_coverage::TagLog::for_workspace(&opts.workspace_path)
+            workspace: opts.workspace_path().to_path_buf(),
+            tag_log: rupu_coverage::TagLog::for_workspace(opts.workspace_path())
                 .with_run_stream(run_stream_for(&opts.tool_context, scope)),
         })
     } else {
@@ -1797,7 +1880,7 @@ async fn run_agent_inner(
     // offers, so the two gates can't disagree.
     let mcp_guard: Option<(rupu_mcp::InProcessTransport, ServeHandle)>;
     let mcp_dispatcher: Option<Arc<rupu_mcp::ToolDispatcher>>;
-    match opts.mcp_registry.clone() {
+    match opts.tool_context.services.scm.clone() {
         Some(scm_registry) => {
             let allowlist = grant
                 .entries
@@ -1857,29 +1940,29 @@ async fn run_agent_inner(
 
     if grant.offers(rupu_tools::catalog::findings::FINDINGS_REPORT.name) {
         if let Some(g) = rupu_coverage::report::guidance(&findings_opts) {
-            opts.agent_system_prompt.push_str("\n\n");
-            opts.agent_system_prompt.push_str(&g);
+            opts.system_prompt.push_str("\n\n");
+            opts.system_prompt.push_str(&g);
         }
     }
 
-    if let Some(line) = opts.codename.as_deref().and_then(call_sign_line) {
-        opts.agent_system_prompt.push_str(&line);
+    if let Some(line) = opts.id.codename.as_deref().and_then(call_sign_line) {
+        opts.system_prompt.push_str(&line);
     }
 
     writer.write(&Event::RunStart {
-        run_id: opts.run_id.clone(),
-        workspace_id: opts.workspace_id.clone(),
-        agent: opts.agent_name.clone(),
+        run_id: opts.id.run_id.clone(),
+        workspace_id: opts.tool_context.workspace.id.clone(),
+        agent: opts.id.agent.clone(),
         provider: opts.provider_name.clone(),
         model: opts.model.clone(),
         started_at: Utc::now(),
         mode: run_mode(opts.permission.mode()),
         schema: Some(2),
-        system_prompt: Some(opts.agent_system_prompt.clone()),
-        codename: opts.codename.clone(),
+        system_prompt: Some(opts.system_prompt.clone()),
+        codename: opts.id.codename.clone(),
         // Always recorded: `null` when the run has no customer, so a
         // later assignment of the project never re-attributes it.
-        customer: Some(opts.tool_context.customer.clone()),
+        customer: Some(opts.tool_context.services.customer.clone()),
     })?;
     // One notice per run, before the first turn: what the run resolved, and
     // where each number came from (spec 2026-09-30 §6.6).
@@ -1890,57 +1973,42 @@ async fn run_agent_inner(
     write_tool_grant(&mut writer, &grant)?;
     writer.flush()?;
 
-    // Wire coverage into tool context.
+    // Wire coverage into tool context. Attribution needs nothing here: the
+    // identity on the tool context was set, once, by the run's assembly.
     if let Some(h) = &coverage_handle {
-        opts.tool_context.coverage_writer = Some(h.writer.clone());
+        opts.tool_context.services.coverage_writer = Some(h.writer.clone());
     }
-
-    // Attribution is set unconditionally, NOT only when coverage is enabled.
-    // `attribution_from_ctx` falls back to `String::default()` for a missing
-    // run_id or model, so a finding recorded without the coverage harness
-    // would otherwise be written with EMPTY attribution rather than failing —
-    // a silent hole in the audit trail rather than a loud one. These three
-    // values describe the run, not the coverage harness, so they belong here.
-    opts.tool_context.surface_tag = Some(
-        opts.surface_tag
-            .clone()
-            .unwrap_or_else(|| "agent".to_string()),
-    );
-    opts.tool_context.run_id = Some(opts.run_id.clone());
-    opts.tool_context.model = Some(opts.model.clone());
-    opts.tool_context.codename = opts.codename.clone();
-    opts.tool_context.agent = Some(opts.agent_name.clone());
-    opts.tool_context.provider = Some(opts.provider_name.clone());
 
     // Deterministic, once-per-run validation of the agent's `thinkingDisplay`
     // against the model it will run on (reasoning display is an Anthropic
     // adaptive-model knob; a request that can't honor it degrades silently, so
     // surface the misconfiguration instead).
-    for w in
-        rupu_providers::anthropic::thinking_display_warnings(&opts.model, opts.thinking_display)
-    {
-        tracing::warn!(agent = %opts.agent_name, model = %opts.model, "{w}");
+    for w in rupu_providers::anthropic::thinking_display_warnings(
+        &opts.model,
+        opts.pins.thinking_display,
+    ) {
+        tracing::warn!(agent = %opts.id.agent, model = %opts.model, "{w}");
     }
 
     let tool_defs = registry.to_tool_definitions();
 
-    *messages = opts.initial_messages.clone();
-    if !opts.initial_messages.is_empty() {
-        let (source_transcript, inline) = match &opts.seed_source {
+    *messages = opts.prompt.initial_messages.clone();
+    if !opts.prompt.initial_messages.is_empty() {
+        let (source_transcript, inline) = match &opts.prompt.seed_source {
             // Stored once at the source; this transcript keeps a verifiable
             // reference instead of the 1000th copy.
             Some(src) => (Some(src.display().to_string()), None),
             None => (
                 None,
-                Some(serde_json::to_value(&opts.initial_messages).unwrap_or_else(|e| {
+                Some(serde_json::to_value(&opts.prompt.initial_messages).unwrap_or_else(|e| {
                     tracing::warn!(error = %e, "failed to serialize seed messages for transcript");
                     serde_json::Value::Null
                 })),
             ),
         };
         writer.write(&Event::Seed {
-            message_count: opts.initial_messages.len() as u32,
-            sha256: seed_sha256(&opts.initial_messages),
+            message_count: opts.prompt.initial_messages.len() as u32,
+            sha256: seed_sha256(&opts.prompt.initial_messages),
             source_transcript,
             messages: inline,
         })?;
@@ -1954,14 +2022,14 @@ async fn run_agent_inner(
     // `push_user_turn`: it becomes a new user turn, or — when the seed ends in
     // a user turn, as after a tool turn — joins that turn rather than creating
     // two consecutive user messages, which providers reject.
-    if !opts.user_message.is_empty() {
-        push_user_turn(messages, &opts.user_message);
+    if !opts.prompt.message.is_empty() {
+        push_user_turn(messages, &opts.prompt.message);
         writer.write(&Event::UserMessage {
-            content: opts.user_message.clone(),
+            content: opts.prompt.message.clone(),
         })?;
     }
     writer.flush()?;
-    let mut turn_idx: u32 = opts.turn_index_offset;
+    let mut turn_idx: u32 = opts.prompt.turn_index_offset;
     let initial_turn_idx = turn_idx;
     let mut total_in: u64 = 0;
     let mut total_out: u64 = 0;
@@ -2022,9 +2090,9 @@ async fn run_agent_inner(
                     crate::collector::INJECTION_TOKEN_BUDGET,
                 );
                 let ctx = crate::collector::TurnContext {
-                    run_id: opts.run_id.clone(),
-                    codename: opts.codename.clone(),
-                    participant: opts.agent_name.clone(),
+                    run_id: opts.id.run_id.clone(),
+                    codename: opts.id.codename.clone(),
+                    participant: opts.id.agent.clone(),
                     turn_index: turn_idx,
                 };
                 // Run collectors off the async runtime; a panicking collector
@@ -2041,22 +2109,22 @@ async fn run_agent_inner(
             };
             let mut req = LlmRequest {
                 model: opts.model.clone(),
-                system: Some(opts.agent_system_prompt.clone()),
+                system: Some(opts.system_prompt.clone()),
                 messages: turn_messages,
                 max_tokens: opts.limits.output.tokens,
                 tools: tool_defs.clone(),
                 cell_id: None,
                 trace_id: None,
-                thinking: opts.effort,
-                context_window: opts.context_window,
+                thinking: opts.pins.effort,
+                context_window: opts.pins.context_window,
                 task_type: None,
-                output_format: opts.output_format,
-                output_schema: opts.output_schema.clone(),
-                anthropic_task_budget: opts.anthropic_task_budget,
-                anthropic_context_management: opts.anthropic_context_management,
-                anthropic_speed: opts.anthropic_speed,
+                output_format: opts.pins.output_format,
+                output_schema: opts.pins.output_schema.clone(),
+                anthropic_task_budget: opts.pins.anthropic_task_budget,
+                anthropic_context_management: opts.pins.anthropic_context_management,
+                anthropic_speed: opts.pins.anthropic_speed,
                 disable_prompt_cache: false,
-                thinking_display: opts.thinking_display,
+                thinking_display: opts.pins.thinking_display,
             };
             let mut trim_attempts = 0u32;
             // Compact-on-overflow runs at most once per turn (spec §7); a
@@ -2081,12 +2149,12 @@ async fn run_agent_inner(
                 if rupu_providers::credential_writes::terminating() {
                     return Err(terminated(
                         &mut writer,
-                        &opts.run_id,
+                        &opts.id.run_id,
                         total_in + total_out,
                         started,
                     ));
                 }
-                let step: CallStep = if opts.no_stream {
+                let step: CallStep = if opts.stream.no_stream {
                     // `no_stream` only changes DISPLAY: the request still
                     // streams on the wire, so a long response cannot hit the
                     // HTTP request timeout and the discovered output cap needs
@@ -2097,7 +2165,7 @@ async fn run_agent_inner(
                     // discarded turn's text is written afterwards, by
                     // `emit_discarded_blocks`).
                     let mut quiet = |ev: StreamEvent| {
-                        if let Some(cb) = opts.on_stream_event.as_ref() {
+                        if let Some(cb) = opts.stream.on_stream_event.as_ref() {
                             cb(ev);
                         }
                     };
@@ -2112,10 +2180,10 @@ async fn run_agent_inner(
                         _ = wait_pause(&pause) => CallStep::Paused,
                     }
                 } else {
-                    let suppress = opts.suppress_stream_stdout;
+                    let suppress = opts.stream.suppress_stdout;
                     let mut stream_transcript_error: Option<rupu_transcript::WriteError> = None;
                     let mut on_event = |ev: StreamEvent| {
-                        if let Some(cb) = opts.on_stream_event.as_ref() {
+                        if let Some(cb) = opts.stream.on_stream_event.as_ref() {
                             cb(ev.clone());
                         }
                         match ev {
@@ -2233,7 +2301,7 @@ async fn run_agent_inner(
                                     } else {
                                         String::new()
                                     },
-                                    if opts.surface_tag.as_deref() == Some("session") {
+                                    if opts.session_turn() {
                                         " (an existing session keeps the model and window it started with — start a new session to apply the change)"
                                     } else {
                                         ""
@@ -2298,7 +2366,7 @@ async fn run_agent_inner(
                                         writer.flush()?;
                                     }
                                 }
-                                let run_id_clone = opts.run_id.clone();
+                                let run_id_clone = opts.id.run_id.clone();
                                 let calibration =
                                     overflow.tokens.unwrap_or(last_turn_input_tokens).max(1);
                                 // The summariser is an LLM call too: none once
@@ -2306,7 +2374,7 @@ async fn run_agent_inner(
                                 if rupu_providers::credential_writes::terminating() {
                                     return Err(terminated(
                                         &mut writer,
-                                        &opts.run_id,
+                                        &opts.id.run_id,
                                         total_in + total_out,
                                         started,
                                     ));
@@ -2382,7 +2450,7 @@ async fn run_agent_inner(
                             && matches!(e, rupu_providers::ProviderError::Preflight(_))
                         {
                             writer.write(&Event::RunComplete {
-                                run_id: opts.run_id.clone(),
+                                run_id: opts.id.run_id.clone(),
                                 status: RunStatus::Error,
                                 total_tokens: total_in + total_out,
                                 duration_ms: started.elapsed().as_millis() as u64,
@@ -2399,7 +2467,7 @@ async fn run_agent_inner(
                         {
                             return Err(terminated(
                                 &mut writer,
-                                &opts.run_id,
+                                &opts.id.run_id,
                                 total_in + total_out,
                                 started,
                             ));
@@ -2455,7 +2523,7 @@ async fn run_agent_inner(
                         if let FallBack::Terminated = hopped {
                             return Err(terminated(
                                 &mut writer,
-                                &opts.run_id,
+                                &opts.id.run_id,
                                 total_in + total_out,
                                 started,
                             ));
@@ -2466,11 +2534,11 @@ async fn run_agent_inner(
                             // once-per-turn guard reset for the new client.
                             req.model = opts.model.clone();
                             req.max_tokens = opts.limits.output.tokens;
-                            req.context_window = opts.context_window;
-                            req.anthropic_speed = opts.anthropic_speed;
-                            req.anthropic_task_budget = opts.anthropic_task_budget;
+                            req.context_window = opts.pins.context_window;
+                            req.anthropic_speed = opts.pins.anthropic_speed;
+                            req.anthropic_task_budget = opts.pins.anthropic_task_budget;
                             req.anthropic_context_management =
-                                opts.anthropic_context_management;
+                                opts.pins.anthropic_context_management;
                             if messages_changed {
                                 req.messages = messages.clone();
                             }
@@ -2519,7 +2587,7 @@ async fn run_agent_inner(
             // The call is billed whether or not the transcript write below
             // succeeds: report it to the usage hook (the run's ledger) FIRST,
             // so a failed write can't drop its row.
-            if let Some(cb) = &opts.on_usage {
+            if let Some(cb) = &opts.hooks.on_usage {
                 cb(&UsageTurn {
                     kind: UsageKind::Turn,
                     provider: opts.provider_name.clone(),
@@ -2618,12 +2686,12 @@ async fn run_agent_inner(
                         }
                         return Err(terminated(
                             &mut writer,
-                            &opts.run_id,
+                            &opts.id.run_id,
                             total_in + total_out,
                             started,
                         ));
                     }
-                    let run_id_clone = opts.run_id.clone();
+                    let run_id_clone = opts.id.run_id.clone();
                     let last_input_tokens = resp.usage.input_tokens;
                     if compact_context(
                         messages,
@@ -2646,7 +2714,7 @@ async fn run_agent_inner(
             // and not kept. Rung 0 can retry it (with the output cap raised,
             // or once for an incomplete reply); otherwise it climbs the ladder.
             if let (true, Some(o), Some(p)) = (discard, outcome.as_ref(), policy) {
-                emit_discarded_blocks(&mut writer, &resp.content, opts.no_stream)?;
+                emit_discarded_blocks(&mut writer, &resp.content, opts.stream.no_stream)?;
                 writer.write(&turn_end_event(
                     turn_idx,
                     &resp,
@@ -2682,12 +2750,12 @@ async fn run_agent_inner(
                             if rupu_providers::credential_writes::terminating() {
                                 return Err(terminated(
                                     &mut writer,
-                                    &opts.run_id,
+                                    &opts.id.run_id,
                                     total_in + total_out,
                                     started,
                                 ));
                             }
-                            let run_id_clone = opts.run_id.clone();
+                            let run_id_clone = opts.id.run_id.clone();
                             let ran = compact_context(
                                 messages,
                                 opts,
@@ -2758,7 +2826,7 @@ async fn run_agent_inner(
                     FallBack::Terminated => {
                         return Err(terminated(
                             &mut writer,
-                            &opts.run_id,
+                            &opts.id.run_id,
                             total_in + total_out,
                             started,
                         ));
@@ -2804,9 +2872,9 @@ async fn run_agent_inner(
                             canonical,
                             "not_granted".into(),
                         ))?;
-                        if let Some(cb) = opts.on_tool_call.as_ref() {
+                        if let Some(cb) = opts.hooks.on_tool_call.as_ref() {
                             writer.flush()?;
-                            cb(&opts.step_id, &tool_name, true);
+                            cb(opts.step(), &tool_name, true);
                         }
                         tool_results.push((call_id, String::new(), Some(err)));
                         continue;
@@ -2849,9 +2917,9 @@ async fn run_agent_inner(
                             String::new(),
                             Some("permission_denied".into()),
                         ));
-                        if let Some(cb) = opts.on_tool_call.as_ref() {
+                        if let Some(cb) = opts.hooks.on_tool_call.as_ref() {
                             writer.flush()?;
-                            cb(&opts.step_id, &tool_name, true);
+                            cb(opts.step(), &tool_name, true);
                         }
                         continue;
                     }
@@ -2863,7 +2931,7 @@ async fn run_agent_inner(
                             "denied:operator_stop".into(),
                         ))?;
                         writer.write(&Event::RunComplete {
-                            run_id: opts.run_id.clone(),
+                            run_id: opts.id.run_id.clone(),
                             status: RunStatus::Aborted,
                             total_tokens: total_in + total_out,
                             duration_ms: started.elapsed().as_millis() as u64,
@@ -2885,7 +2953,7 @@ async fn run_agent_inner(
                 if rupu_providers::credential_writes::terminating() {
                     return Err(terminated(
                         &mut writer,
-                        &opts.run_id,
+                        &opts.id.run_id,
                         total_in + total_out,
                         started,
                     ));
@@ -2896,9 +2964,10 @@ async fn run_agent_inner(
                 // (cheap: Arcs + small fields) so a sibling call in the
                 // same turn never inherits a stale id.
                 let mut call_ctx = opts.tool_context.clone();
-                call_ctx.tool_call_id = Some(call_id.clone());
-                call_ctx.spawn_ceiling = spawn_ceiling;
-                call_ctx.prompter = opts.permission.prompter().cloned();
+                call_ctx.call = rupu_tools::CallContext {
+                    tool_call_id: Some(call_id.clone()),
+                    spawn_ceiling,
+                };
                 let invoke_result = tool.invoke(input.clone(), &call_ctx).await;
                 let blocked = matches!(invoke_result, Err(rupu_tools::ToolError::PermissionDenied));
                 match invoke_result {
@@ -2964,13 +3033,13 @@ async fn run_agent_inner(
                     Some(descriptor.name),
                     decision,
                 ))?;
-                if let Some(cb) = opts.on_tool_call.as_ref() {
+                if let Some(cb) = opts.hooks.on_tool_call.as_ref() {
                     // Flush first so a concurrently-appending side writer
                     // (the orchestrator's tool_audit closure) that fires
                     // from `cb` reliably lands AFTER this call's
                     // `ToolResult` event in on-disk order.
                     writer.flush()?;
-                    cb(&opts.step_id, &tool_name, blocked);
+                    cb(opts.step(), &tool_name, blocked);
                 }
             }
 
@@ -3094,7 +3163,7 @@ async fn run_agent_inner(
                                 FallBack::Terminated => {
                                     return Err(terminated(
                                         &mut writer,
-                                        &opts.run_id,
+                                        &opts.id.run_id,
                                         total_in + total_out,
                                         started,
                                     ));
@@ -3147,12 +3216,12 @@ async fn run_agent_inner(
                                     if rupu_providers::credential_writes::terminating() {
                                         return Err(terminated(
                                             &mut writer,
-                                            &opts.run_id,
+                                            &opts.id.run_id,
                                             total_in + total_out,
                                             started,
                                         ));
                                     }
-                                    let run_id_clone = opts.run_id.clone();
+                                    let run_id_clone = opts.id.run_id.clone();
                                     let ran = compact_context(
                                         messages,
                                         opts,
@@ -3248,7 +3317,7 @@ async fn run_agent_inner(
         };
 
         writer.write(&Event::RunComplete {
-            run_id: opts.run_id.clone(),
+            run_id: opts.id.run_id.clone(),
             status: result_status,
             total_tokens: total_in + total_out,
             duration_ms: started.elapsed().as_millis() as u64,
@@ -3289,10 +3358,10 @@ async fn run_agent_inner(
     // holds a clone when shutdown() awaits the JoinHandle, the task's recv()
     // never sees EOF and the await hangs indefinitely.
     // -----------------------------------------------------------------------
-    opts.tool_context.coverage_writer = None;
+    opts.tool_context.services.coverage_writer = None;
     // Release the run's subprocess-capture state once, at run end.
-    if let Some(cap) = &opts.tool_context.net_capture {
-        cap.run_finished(&opts.run_id);
+    if let Some(cap) = &opts.tool_context.services.net_capture {
+        cap.run_finished(&opts.id.run_id);
     }
     if let Some(h) = coverage_handle {
         h.shutdown().await;
@@ -3308,74 +3377,6 @@ fn run_mode(mode: PermissionMode) -> RunMode {
         PermissionMode::Readonly => RunMode::Readonly,
         PermissionMode::Ask => RunMode::Ask,
     }
-}
-
-/// The services this run provides, for its grant. Exact by construction:
-/// a service is here only when the runner can build every tool needing it.
-fn run_services(opts: &AgentRunOpts, findings: &rupu_coverage::FindingWriteOptions) -> ServiceSet {
-    // The findings ledger lives in the workspace: every run can open it.
-    let mut s = ServiceSet::new().with(Service::Findings);
-    if opts.concerns.is_some() {
-        s.insert(Service::Coverage);
-    }
-    if findings.engagement.is_some() {
-        s.insert(Service::Engagement);
-    }
-    if opts.mcp_registry.is_some() {
-        s.insert(Service::Scm);
-    }
-    if opts.tool_context.dispatcher.is_some() {
-        s.insert(Service::AgentDispatcher);
-    }
-    if opts.tool_context.netflow_sink.is_some() {
-        s.insert(Service::Netflow);
-    }
-    // The agentiflow services (message bus, run status, catalog, the unit
-    // launcher, the workflow generator) have no body in the catalog until
-    // W5/W7: their tools reach a run only injected, as self-served grants.
-    s
-}
-
-/// Resolve the run's grant (W2): the agent's `tools:`, the step's
-/// `actions:`, the ambient grants (`concerns:`, an engagement, injected
-/// tools) and the run's services.
-fn resolve_run_grant(
-    opts: &AgentRunOpts,
-    findings: &rupu_coverage::FindingWriteOptions,
-) -> Result<ResolvedGrant, RunError> {
-    let injected: Vec<_> = opts.extra_tools.iter().map(|t| t.descriptor()).collect();
-    let catalog = tool_catalog().with(injected.iter().copied());
-    let mut ambient = Vec::new();
-    if opts.concerns.is_some() {
-        ambient.push(AmbientGrant::concerns());
-    }
-    if findings.engagement.is_some() {
-        ambient.push(AmbientGrant::engagement());
-    }
-    if !injected.is_empty() {
-        ambient.push(AmbientGrant::injected(
-            injected.iter().map(|d| d.name).collect(),
-        ));
-    }
-    let grant = catalog
-        .resolve_grant(GrantInputs {
-            declared: opts.agent_tools.as_deref(),
-            step_actions: &opts.step_actions,
-            ambient: &ambient,
-            available: &run_services(opts, findings),
-            alias_scope: opts.alias_scope,
-        })
-        .map_err(|e| RunError::ToolGrant(e.to_string()))?;
-    for tool in &grant.actions_not_granted {
-        tracing::warn!(
-            agent = %opts.agent_name,
-            step = %opts.step_id,
-            tool,
-            "step `actions:` names `{tool}` but the agent's `tools:` grant does not cover it; \
-             the step can't add it (no escalation), so this is very likely an authoring mistake"
-        );
-    }
-    Ok(grant)
 }
 
 /// Write the run's `tool_grant` event and one `tool_unavailable` notice per
@@ -3500,57 +3501,51 @@ mod on_tool_call_tests {
             },
         ]);
 
-        let opts = AgentRunOpts {
-            seed_source: None,
-            collectors: Vec::new(),
-            extra_tools: Vec::new(),
-            step_actions: Vec::new(),
-            alias_scope: Default::default(),
-            agent_name: "test-agent".into(),
-            agent_system_prompt: "test".into(),
-            agent_tools: None,
-            provider: Box::new(provider),
-            provider_name: "mock".into(),
-            model: "mock-1".into(),
-            run_id: "run_test_cb".into(),
-            workspace_id: "ws_test".into(),
-            workspace_path: tmp_dir.path().to_path_buf(),
-            transcript_path,
-            max_turns: 5,
-            permission: rupu_tools::PermissionPolicy::bypass(),
-            tool_context: rupu_tools::ToolContext {
-                workspace_path: tmp_dir.path().to_path_buf(),
-                ..Default::default()
+        let opts = crate::grant::with_grant(
+            AgentRunOpts {
+                system_prompt: "test".into(),
+                prompt: crate::UserTurn::new("test prompt"),
+                provider: Box::new(provider),
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
+                recovery: Default::default(),
+                permission: rupu_tools::PermissionPolicy::bypass(),
+                grant: Default::default(),
+                alias_scope: Default::default(),
+                tool_context: {
+                    let mut tc = rupu_tools::ToolContext::in_workspace(tmp_dir.path());
+                    tc.identity = std::sync::Arc::new(rupu_tools::RunIdentity {
+                        agent: "test-agent".into(),
+                        provider: "mock".into(),
+                        model: "mock-1".into(),
+                        run_id: "run_test_cb".into(),
+                        step_id: Some("s1".into()),
+                        ..Default::default()
+                    });
+                    tc.workspace.id = "ws_test".into();
+                    tc.workspace.path = tmp_dir.path().to_path_buf();
+                    tc
+                },
+                pins: Default::default(),
+                concerns: None,
+                max_turns: 5,
+                stream: crate::StreamOpts {
+                    no_stream: true,
+                    suppress_stdout: false,
+                    on_stream_event: None,
+                },
+                hooks: crate::Hooks {
+                    on_tool_call: Some(cb),
+                    on_usage: None,
+                },
+                pause: None,
+                collectors: Vec::new(),
+                extra_tools: Vec::new(),
+                transcript_path,
             },
-            user_message: "test prompt".into(),
-            initial_messages: Vec::new(),
-            turn_index_offset: 0,
-            no_stream: true,
-            suppress_stream_stdout: false,
-            mcp_registry: None,
-            effort: None,
-            thinking_display: None,
-            context_window: None,
-            output_format: None,
-            output_schema: None,
-            anthropic_task_budget: None,
-            anthropic_context_management: None,
-            anthropic_speed: None,
-            parent_run_id: None,
-            depth: 0,
-            dispatchable_agents: None,
-            step_id: "s1".into(),
-            on_tool_call: Some(cb),
-            on_stream_event: None,
-            on_usage: None,
-            concerns: None,
-            limits: rupu_providers::model_limits::ModelLimits::unknown(),
-            scope_name: None,
-            surface_tag: None,
-            pause: None,
-            codename: None,
-            recovery: Default::default(),
-        };
+            None,
+            &Vec::new(),
+        )
+        .expect("grant");
 
         run_agent(opts).await.expect("agent run succeeds");
 
@@ -3631,59 +3626,59 @@ mod on_tool_call_tests {
             },
         ]);
 
-        let opts = AgentRunOpts {
-            seed_source: None,
-            collectors: Vec::new(),
-            extra_tools: Vec::new(),
-            step_actions: Vec::new(),
-            alias_scope: Default::default(),
-            agent_name: "test-agent".into(),
-            agent_system_prompt: "test".into(),
-            agent_tools: None,
-            provider: Box::new(provider),
-            provider_name: "mock".into(),
-            model: "mock-1".into(),
-            run_id: "run_netcap".into(),
-            workspace_id: "ws_test".into(),
-            workspace_path: tmp_dir.path().to_path_buf(),
-            transcript_path,
-            max_turns: 6,
-            permission: rupu_tools::PermissionPolicy::bypass(),
-            tool_context: rupu_tools::ToolContext {
-                workspace_path: tmp_dir.path().to_path_buf(),
-                net_capture: Some(Arc::new(RecordingCapture(log.clone()))),
-                netflow_sink: Some(Arc::new(rupu_netflow::MemorySink::default())),
-                ..Default::default()
+        let opts = crate::grant::with_grant(
+            AgentRunOpts {
+                system_prompt: "test".into(),
+                prompt: crate::UserTurn::new("test prompt"),
+                provider: Box::new(provider),
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
+                recovery: Default::default(),
+                permission: rupu_tools::PermissionPolicy::bypass(),
+                grant: Default::default(),
+                alias_scope: Default::default(),
+                tool_context: {
+                    let mut tc = rupu_tools::ToolContext {
+                        workspace: rupu_tools::WorkspaceScope {
+                            path: tmp_dir.path().to_path_buf(),
+                            ..Default::default()
+                        },
+                        services: rupu_tools::ToolServices {
+                            netflow_sink: Some(Arc::new(rupu_netflow::MemorySink::default())),
+                            net_capture: Some(Arc::new(RecordingCapture(log.clone()))),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    tc.identity = std::sync::Arc::new(rupu_tools::RunIdentity {
+                        agent: "test-agent".into(),
+                        provider: "mock".into(),
+                        model: "mock-1".into(),
+                        run_id: "run_netcap".into(),
+                        step_id: Some("s1".into()),
+                        ..Default::default()
+                    });
+                    tc.workspace.id = "ws_test".into();
+                    tc.workspace.path = tmp_dir.path().to_path_buf();
+                    tc
+                },
+                pins: Default::default(),
+                concerns: None,
+                max_turns: 6,
+                stream: crate::StreamOpts {
+                    no_stream: true,
+                    suppress_stdout: false,
+                    on_stream_event: None,
+                },
+                hooks: Default::default(),
+                pause: None,
+                collectors: Vec::new(),
+                extra_tools: Vec::new(),
+                transcript_path,
             },
-            user_message: "test prompt".into(),
-            initial_messages: Vec::new(),
-            turn_index_offset: 0,
-            no_stream: true,
-            suppress_stream_stdout: false,
-            mcp_registry: None,
-            effort: None,
-            thinking_display: None,
-            context_window: None,
-            output_format: None,
-            output_schema: None,
-            anthropic_task_budget: None,
-            anthropic_context_management: None,
-            anthropic_speed: None,
-            parent_run_id: None,
-            depth: 0,
-            dispatchable_agents: None,
-            step_id: "s1".into(),
-            on_tool_call: None,
-            on_stream_event: None,
-            on_usage: None,
-            concerns: None,
-            limits: rupu_providers::model_limits::ModelLimits::unknown(),
-            scope_name: None,
-            surface_tag: None,
-            pause: None,
-            codename: None,
-            recovery: Default::default(),
-        };
+            None,
+            &Vec::new(),
+        )
+        .expect("grant");
 
         run_agent(opts).await.expect("agent run succeeds");
 
@@ -3755,59 +3750,48 @@ mod on_tool_call_tests {
             },
         ]);
 
-        let opts = AgentRunOpts {
-            seed_source: None,
-            collectors: Vec::new(),
-            // Empty allowlist: NO builtins, NO MCP. The injected tool must
-            // still be callable.
-            extra_tools: vec![Arc::new(Ping)],
-            step_actions: Vec::new(),
-            alias_scope: Default::default(),
-            agent_name: "test-agent".into(),
-            agent_system_prompt: "test".into(),
-            agent_tools: Some(vec![]),
-            provider: Box::new(provider),
-            provider_name: "mock".into(),
-            model: "mock-1".into(),
-            run_id: "run_test_extra_tools".into(),
-            workspace_id: "ws_test".into(),
-            workspace_path: tmp_dir.path().to_path_buf(),
-            transcript_path,
-            max_turns: 5,
-            permission: rupu_tools::PermissionPolicy::bypass(),
-            tool_context: rupu_tools::ToolContext {
-                workspace_path: tmp_dir.path().to_path_buf(),
-                ..Default::default()
+        let opts = crate::grant::with_grant(
+            AgentRunOpts {
+                system_prompt: "test".into(),
+                prompt: crate::UserTurn::new("test prompt"),
+                provider: Box::new(provider),
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
+                recovery: Default::default(),
+                permission: rupu_tools::PermissionPolicy::bypass(),
+                grant: Default::default(),
+                alias_scope: Default::default(),
+                tool_context: {
+                    let mut tc = rupu_tools::ToolContext::in_workspace(tmp_dir.path());
+                    tc.identity = std::sync::Arc::new(rupu_tools::RunIdentity {
+                        agent: "test-agent".into(),
+                        provider: "mock".into(),
+                        model: "mock-1".into(),
+                        run_id: "run_test_extra_tools".into(),
+                        step_id: Some("s1".into()),
+                        ..Default::default()
+                    });
+                    tc.workspace.id = "ws_test".into();
+                    tc.workspace.path = tmp_dir.path().to_path_buf();
+                    tc
+                },
+                pins: Default::default(),
+                concerns: None,
+                max_turns: 5,
+                stream: crate::StreamOpts {
+                    no_stream: true,
+                    suppress_stdout: false,
+                    on_stream_event: None,
+                },
+                hooks: Default::default(),
+                pause: None,
+                collectors: Vec::new(),
+                extra_tools: vec![Arc::new(Ping)],
+                transcript_path,
             },
-            user_message: "test prompt".into(),
-            initial_messages: Vec::new(),
-            turn_index_offset: 0,
-            no_stream: true,
-            suppress_stream_stdout: false,
-            mcp_registry: None,
-            effort: None,
-            thinking_display: None,
-            context_window: None,
-            output_format: None,
-            output_schema: None,
-            anthropic_task_budget: None,
-            anthropic_context_management: None,
-            anthropic_speed: None,
-            parent_run_id: None,
-            depth: 0,
-            dispatchable_agents: None,
-            step_id: "s1".into(),
-            on_tool_call: None,
-            on_stream_event: None,
-            on_usage: None,
-            concerns: None,
-            limits: rupu_providers::model_limits::ModelLimits::unknown(),
-            scope_name: None,
-            surface_tag: None,
-            pause: None,
-            codename: None,
-            recovery: Default::default(),
-        };
+            (Some(vec![])).as_deref(),
+            &Vec::new(),
+        )
+        .expect("grant");
 
         let exit = run_agent_full(opts).await;
         let run = exit.result.expect("run ok");
@@ -3894,60 +3878,58 @@ mod on_tool_call_tests {
             },
         ]);
 
-        let opts = AgentRunOpts {
-            seed_source: None,
-            collectors: Vec::new(),
-            extra_tools: Vec::new(),
-            step_actions: Vec::new(),
-            alias_scope: Default::default(),
-            agent_name: "cellgw-recon".into(),
-            agent_system_prompt: "test".into(),
-            // Explicit allowlist that OMITS every coverage tool, and no
-            // `concerns:` block — the exact shape that lost `asset_mark`.
-            agent_tools: Some(vec!["bash".to_string()]),
-            provider: Box::new(provider),
-            provider_name: "mock".into(),
-            model: "mock-1".into(),
-            run_id: "run_test_engagement_tools".into(),
-            workspace_id: "ws_test".into(),
-            workspace_path: tmp_dir.path().to_path_buf(),
-            transcript_path,
-            max_turns: 5,
-            permission: rupu_tools::PermissionPolicy::bypass(),
-            tool_context: rupu_tools::ToolContext {
-                workspace_path: tmp_dir.path().to_path_buf(),
-                findings: Some(findings),
-                ..Default::default()
+        let opts = crate::grant::with_grant(
+            AgentRunOpts {
+                system_prompt: "test".into(),
+                prompt: crate::UserTurn::new("test prompt"),
+                provider: Box::new(provider),
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
+                recovery: Default::default(),
+                permission: rupu_tools::PermissionPolicy::bypass(),
+                grant: Default::default(),
+                alias_scope: Default::default(),
+                tool_context: {
+                    let mut tc = rupu_tools::ToolContext {
+                        workspace: rupu_tools::WorkspaceScope {
+                            path: tmp_dir.path().to_path_buf(),
+                            ..Default::default()
+                        },
+                        services: rupu_tools::ToolServices {
+                            findings: Some(findings),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    tc.identity = std::sync::Arc::new(rupu_tools::RunIdentity {
+                        agent: "cellgw-recon".into(),
+                        provider: "mock".into(),
+                        model: "mock-1".into(),
+                        run_id: "run_test_engagement_tools".into(),
+                        step_id: Some("s1".into()),
+                        ..Default::default()
+                    });
+                    tc.workspace.id = "ws_test".into();
+                    tc.workspace.path = tmp_dir.path().to_path_buf();
+                    tc
+                },
+                pins: Default::default(),
+                concerns: None,
+                max_turns: 5,
+                stream: crate::StreamOpts {
+                    no_stream: true,
+                    suppress_stdout: false,
+                    on_stream_event: None,
+                },
+                hooks: Default::default(),
+                pause: None,
+                collectors: Vec::new(),
+                extra_tools: Vec::new(),
+                transcript_path,
             },
-            user_message: "test prompt".into(),
-            initial_messages: Vec::new(),
-            turn_index_offset: 0,
-            no_stream: true,
-            suppress_stream_stdout: false,
-            mcp_registry: None,
-            effort: None,
-            thinking_display: None,
-            context_window: None,
-            output_format: None,
-            output_schema: None,
-            anthropic_task_budget: None,
-            anthropic_context_management: None,
-            anthropic_speed: None,
-            parent_run_id: None,
-            depth: 0,
-            dispatchable_agents: None,
-            step_id: "s1".into(),
-            on_tool_call: None,
-            on_stream_event: None,
-            on_usage: None,
-            concerns: None,
-            limits: rupu_providers::model_limits::ModelLimits::unknown(),
-            scope_name: None,
-            surface_tag: None,
-            pause: None,
-            codename: None,
-            recovery: Default::default(),
-        };
+            (Some(vec!["bash".to_string()])).as_deref(),
+            &Vec::new(),
+        )
+        .expect("grant");
 
         let exit = run_agent_full(opts).await;
         let run = exit.result.expect("run ok");
@@ -4024,57 +4006,51 @@ mod on_tool_call_tests {
             },
         ]);
 
-        let opts = AgentRunOpts {
-            seed_source: None,
-            collectors: Vec::new(),
-            extra_tools: Vec::new(),
-            step_actions: Vec::new(),
-            alias_scope: Default::default(),
-            agent_name: "test-agent".into(),
-            agent_system_prompt: "test".into(),
-            agent_tools: Some(vec!["read_file".to_string()]),
-            provider: Box::new(provider),
-            provider_name: "mock".into(),
-            model: "mock-1".into(),
-            run_id: "run_test_denied".into(),
-            workspace_id: "ws_test".into(),
-            workspace_path: tmp_dir.path().to_path_buf(),
-            transcript_path: transcript_path.clone(),
-            max_turns: 5,
-            permission: rupu_tools::PermissionPolicy::bypass(),
-            tool_context: rupu_tools::ToolContext {
-                workspace_path: tmp_dir.path().to_path_buf(),
-                ..Default::default()
+        let opts = crate::grant::with_grant(
+            AgentRunOpts {
+                system_prompt: "test".into(),
+                prompt: crate::UserTurn::new("test prompt"),
+                provider: Box::new(provider),
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
+                recovery: Default::default(),
+                permission: rupu_tools::PermissionPolicy::bypass(),
+                grant: Default::default(),
+                alias_scope: Default::default(),
+                tool_context: {
+                    let mut tc = rupu_tools::ToolContext::in_workspace(tmp_dir.path());
+                    tc.identity = std::sync::Arc::new(rupu_tools::RunIdentity {
+                        agent: "test-agent".into(),
+                        provider: "mock".into(),
+                        model: "mock-1".into(),
+                        run_id: "run_test_denied".into(),
+                        step_id: Some("s1".into()),
+                        ..Default::default()
+                    });
+                    tc.workspace.id = "ws_test".into();
+                    tc.workspace.path = tmp_dir.path().to_path_buf();
+                    tc
+                },
+                pins: Default::default(),
+                concerns: None,
+                max_turns: 5,
+                stream: crate::StreamOpts {
+                    no_stream: true,
+                    suppress_stdout: false,
+                    on_stream_event: None,
+                },
+                hooks: crate::Hooks {
+                    on_tool_call: Some(cb),
+                    on_usage: None,
+                },
+                pause: None,
+                collectors: Vec::new(),
+                extra_tools: Vec::new(),
+                transcript_path: transcript_path.clone(),
             },
-            user_message: "test prompt".into(),
-            initial_messages: Vec::new(),
-            turn_index_offset: 0,
-            no_stream: true,
-            suppress_stream_stdout: false,
-            mcp_registry: None,
-            effort: None,
-            thinking_display: None,
-            context_window: None,
-            output_format: None,
-            output_schema: None,
-            anthropic_task_budget: None,
-            anthropic_context_management: None,
-            anthropic_speed: None,
-            parent_run_id: None,
-            depth: 0,
-            dispatchable_agents: None,
-            step_id: "s1".into(),
-            on_tool_call: Some(cb),
-            on_stream_event: None,
-            on_usage: None,
-            concerns: None,
-            limits: rupu_providers::model_limits::ModelLimits::unknown(),
-            scope_name: None,
-            surface_tag: None,
-            pause: None,
-            codename: None,
-            recovery: Default::default(),
-        };
+            (Some(vec!["read_file".to_string()])).as_deref(),
+            &Vec::new(),
+        )
+        .expect("grant");
 
         let result = run_agent(opts)
             .await
@@ -4152,57 +4128,52 @@ mod on_tool_call_tests {
             },
         ]);
 
-        let opts = AgentRunOpts {
-            seed_source: None,
-            collectors: Vec::new(),
-            extra_tools: Vec::new(),
-            step_actions: Vec::new(),
-            alias_scope: Default::default(),
-            agent_name: "test-agent".into(),
-            agent_system_prompt: "test".into(),
-            agent_tools: None,
-            provider: Box::new(provider),
-            provider_name: "mock".into(),
-            model: "mock-1".into(),
-            run_id: "run_readonly_denied".into(),
-            workspace_id: "ws_test".into(),
-            workspace_path: tmp_dir.path().to_path_buf(),
-            transcript_path,
-            max_turns: 5,
-            permission: rupu_tools::PermissionPolicy::unattended(PermissionMode::Readonly),
-            tool_context: rupu_tools::ToolContext {
-                workspace_path: tmp_dir.path().to_path_buf(),
-                ..Default::default()
+        let opts = crate::grant::with_grant(
+            AgentRunOpts {
+                system_prompt: "test".into(),
+                prompt: crate::UserTurn::new("test prompt"),
+                provider: Box::new(provider),
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
+                recovery: Default::default(),
+                permission: rupu_tools::PermissionPolicy::unattended(PermissionMode::Readonly),
+                grant: Default::default(),
+                alias_scope: Default::default(),
+                tool_context: {
+                    let mut tc = rupu_tools::ToolContext::in_workspace(tmp_dir.path());
+                    tc.identity = std::sync::Arc::new(rupu_tools::RunIdentity {
+                        agent: "test-agent".into(),
+                        provider: "mock".into(),
+                        model: "mock-1".into(),
+                        run_id: "run_readonly_denied".into(),
+                        step_id: Some("s1".into()),
+                        ..Default::default()
+                    });
+                    tc.workspace.id = "ws_test".into();
+                    tc.workspace.path = tmp_dir.path().to_path_buf();
+                    tc.services.scm = Some(Arc::new(rupu_scm::Registry::default()));
+                    tc
+                },
+                pins: Default::default(),
+                concerns: None,
+                max_turns: 5,
+                stream: crate::StreamOpts {
+                    no_stream: true,
+                    suppress_stdout: false,
+                    on_stream_event: None,
+                },
+                hooks: crate::Hooks {
+                    on_tool_call: Some(cb),
+                    on_usage: None,
+                },
+                pause: None,
+                collectors: Vec::new(),
+                extra_tools: Vec::new(),
+                transcript_path,
             },
-            user_message: "test prompt".into(),
-            initial_messages: Vec::new(),
-            turn_index_offset: 0,
-            no_stream: true,
-            suppress_stream_stdout: false,
-            mcp_registry: Some(Arc::new(Registry::default())),
-            effort: None,
-            thinking_display: None,
-            context_window: None,
-            output_format: None,
-            output_schema: None,
-            anthropic_task_budget: None,
-            anthropic_context_management: None,
-            anthropic_speed: None,
-            parent_run_id: None,
-            depth: 0,
-            dispatchable_agents: None,
-            step_id: "s1".into(),
-            on_tool_call: Some(cb),
-            on_stream_event: None,
-            on_usage: None,
-            concerns: None,
-            limits: rupu_providers::model_limits::ModelLimits::unknown(),
-            scope_name: None,
-            surface_tag: None,
-            pause: None,
-            codename: None,
-            recovery: Default::default(),
-        };
+            None,
+            &Vec::new(),
+        )
+        .expect("grant");
 
         let result = run_agent(opts)
             .await
@@ -4232,57 +4203,49 @@ mod on_tool_call_tests {
             input_tokens: 1,
             output_tokens: 1,
         }]);
-        let opts = AgentRunOpts {
-            codename: Some("jade-reef/heron#3".into()),
-            seed_source: None,
-            collectors: Vec::new(),
-            extra_tools: Vec::new(),
-            step_actions: Vec::new(),
-            alias_scope: Default::default(),
-            agent_name: "test-agent".into(),
-            agent_system_prompt: "test".into(),
-            agent_tools: None,
-            provider: Box::new(provider),
-            provider_name: "mock".into(),
-            model: "mock-1".into(),
-            run_id: "run_codename".into(),
-            workspace_id: "ws_test".into(),
-            workspace_path: tmp.path().to_path_buf(),
-            transcript_path: transcript.clone(),
-            max_turns: 5,
-            permission: rupu_tools::PermissionPolicy::bypass(),
-            tool_context: rupu_tools::ToolContext {
-                workspace_path: tmp.path().to_path_buf(),
-                ..Default::default()
+        let opts = crate::grant::with_grant(
+            AgentRunOpts {
+                system_prompt: "test".into(),
+                prompt: crate::UserTurn::new("go"),
+                provider: Box::new(provider),
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
+                recovery: Default::default(),
+                permission: rupu_tools::PermissionPolicy::bypass(),
+                grant: Default::default(),
+                alias_scope: Default::default(),
+                tool_context: {
+                    let mut tc = rupu_tools::ToolContext::in_workspace(tmp.path());
+                    tc.identity = std::sync::Arc::new(rupu_tools::RunIdentity {
+                        codename: Some("jade-reef/heron#3".into()),
+                        agent: "test-agent".into(),
+                        provider: "mock".into(),
+                        model: "mock-1".into(),
+                        run_id: "run_codename".into(),
+                        step_id: Some("s1".into()),
+                        ..Default::default()
+                    });
+                    tc.workspace.id = "ws_test".into();
+                    tc.workspace.path = tmp.path().to_path_buf();
+                    tc
+                },
+                pins: Default::default(),
+                concerns: None,
+                max_turns: 5,
+                stream: crate::StreamOpts {
+                    no_stream: true,
+                    suppress_stdout: false,
+                    on_stream_event: None,
+                },
+                hooks: Default::default(),
+                pause: None,
+                collectors: Vec::new(),
+                extra_tools: Vec::new(),
+                transcript_path: transcript.clone(),
             },
-            user_message: "go".into(),
-            initial_messages: Vec::new(),
-            turn_index_offset: 0,
-            no_stream: true,
-            suppress_stream_stdout: false,
-            mcp_registry: None,
-            effort: None,
-            thinking_display: None,
-            context_window: None,
-            output_format: None,
-            output_schema: None,
-            anthropic_task_budget: None,
-            anthropic_context_management: None,
-            anthropic_speed: None,
-            parent_run_id: None,
-            depth: 0,
-            dispatchable_agents: None,
-            step_id: "s1".into(),
-            on_tool_call: None,
-            on_stream_event: None,
-            on_usage: None,
-            concerns: None,
-            limits: rupu_providers::model_limits::ModelLimits::unknown(),
-            scope_name: None,
-            surface_tag: None,
-            pause: None,
-            recovery: Default::default(),
-        };
+            None,
+            &Vec::new(),
+        )
+        .expect("grant");
         let result = run_agent(opts).await.unwrap();
         assert_eq!(result.status, RunStatus::Ok);
 
@@ -4339,57 +4302,48 @@ mod on_tool_call_tests {
             },
         ]);
 
-        let opts = AgentRunOpts {
-            seed_source: None,
-            collectors: Vec::new(),
-            extra_tools: Vec::new(),
-            step_actions: Vec::new(),
-            alias_scope: Default::default(),
-            agent_name: "test-agent".into(),
-            agent_system_prompt: "test".into(),
-            agent_tools: None,
-            provider: Box::new(provider),
-            provider_name: "mock".into(),
-            model: "mock-1".into(),
-            run_id: "run_terminate_no_tools".into(),
-            workspace_id: "ws_test".into(),
-            workspace_path: tmp_dir.path().to_path_buf(),
-            transcript_path,
-            max_turns: 5,
-            permission: rupu_tools::PermissionPolicy::bypass(),
-            tool_context: rupu_tools::ToolContext {
-                workspace_path: tmp_dir.path().to_path_buf(),
-                ..Default::default()
+        let opts = crate::grant::with_grant(
+            AgentRunOpts {
+                system_prompt: "test".into(),
+                prompt: crate::UserTurn::new("do the thing"),
+                provider: Box::new(provider),
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
+                recovery: Default::default(),
+                permission: rupu_tools::PermissionPolicy::bypass(),
+                grant: Default::default(),
+                alias_scope: Default::default(),
+                tool_context: {
+                    let mut tc = rupu_tools::ToolContext::in_workspace(tmp_dir.path());
+                    tc.identity = std::sync::Arc::new(rupu_tools::RunIdentity {
+                        agent: "test-agent".into(),
+                        provider: "mock".into(),
+                        model: "mock-1".into(),
+                        run_id: "run_terminate_no_tools".into(),
+                        step_id: Some("s1".into()),
+                        ..Default::default()
+                    });
+                    tc.workspace.id = "ws_test".into();
+                    tc.workspace.path = tmp_dir.path().to_path_buf();
+                    tc
+                },
+                pins: Default::default(),
+                concerns: None,
+                max_turns: 5,
+                stream: crate::StreamOpts {
+                    no_stream: true,
+                    suppress_stdout: false,
+                    on_stream_event: None,
+                },
+                hooks: Default::default(),
+                pause: None,
+                collectors: Vec::new(),
+                extra_tools: Vec::new(),
+                transcript_path,
             },
-            user_message: "do the thing".into(),
-            initial_messages: Vec::new(),
-            turn_index_offset: 0,
-            no_stream: true,
-            suppress_stream_stdout: false,
-            mcp_registry: None,
-            effort: None,
-            thinking_display: None,
-            context_window: None,
-            output_format: None,
-            output_schema: None,
-            anthropic_task_budget: None,
-            anthropic_context_management: None,
-            anthropic_speed: None,
-            parent_run_id: None,
-            depth: 0,
-            dispatchable_agents: None,
-            step_id: "s1".into(),
-            on_tool_call: None,
-            on_stream_event: None,
-            on_usage: None,
-            concerns: None,
-            limits: rupu_providers::model_limits::ModelLimits::unknown(),
-            scope_name: None,
-            surface_tag: None,
-            pause: None,
-            codename: None,
-            recovery: Default::default(),
-        };
+            None,
+            &Vec::new(),
+        )
+        .expect("grant");
 
         let result = run_agent(opts)
             .await
@@ -4420,57 +4374,48 @@ mod on_tool_call_tests {
             output_tokens: 3,
         }]);
 
-        let opts = AgentRunOpts {
-            seed_source: None,
-            collectors: Vec::new(),
-            extra_tools: Vec::new(),
-            step_actions: Vec::new(),
-            alias_scope: Default::default(),
-            agent_name: "test-agent".into(),
-            agent_system_prompt: "test".into(),
-            agent_tools: None,
-            provider: Box::new(provider),
-            provider_name: "anthropic".into(),
-            model: "claude-opus-4-8".into(),
-            run_id: "run_usage_model".into(),
-            workspace_id: "ws_test".into(),
-            workspace_path: tmp_dir.path().to_path_buf(),
-            transcript_path: transcript_path.clone(),
-            max_turns: 5,
-            permission: rupu_tools::PermissionPolicy::bypass(),
-            tool_context: rupu_tools::ToolContext {
-                workspace_path: tmp_dir.path().to_path_buf(),
-                ..Default::default()
+        let opts = crate::grant::with_grant(
+            AgentRunOpts {
+                system_prompt: "test".into(),
+                prompt: crate::UserTurn::new("do the thing"),
+                provider: Box::new(provider),
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
+                recovery: Default::default(),
+                permission: rupu_tools::PermissionPolicy::bypass(),
+                grant: Default::default(),
+                alias_scope: Default::default(),
+                tool_context: {
+                    let mut tc = rupu_tools::ToolContext::in_workspace(tmp_dir.path());
+                    tc.identity = std::sync::Arc::new(rupu_tools::RunIdentity {
+                        agent: "test-agent".into(),
+                        provider: "anthropic".into(),
+                        model: "claude-opus-4-8".into(),
+                        run_id: "run_usage_model".into(),
+                        step_id: Some("s1".into()),
+                        ..Default::default()
+                    });
+                    tc.workspace.id = "ws_test".into();
+                    tc.workspace.path = tmp_dir.path().to_path_buf();
+                    tc
+                },
+                pins: Default::default(),
+                concerns: None,
+                max_turns: 5,
+                stream: crate::StreamOpts {
+                    no_stream: true,
+                    suppress_stdout: false,
+                    on_stream_event: None,
+                },
+                hooks: Default::default(),
+                pause: None,
+                collectors: Vec::new(),
+                extra_tools: Vec::new(),
+                transcript_path: transcript_path.clone(),
             },
-            user_message: "do the thing".into(),
-            initial_messages: Vec::new(),
-            turn_index_offset: 0,
-            no_stream: true,
-            suppress_stream_stdout: false,
-            mcp_registry: None,
-            effort: None,
-            thinking_display: None,
-            context_window: None,
-            output_format: None,
-            output_schema: None,
-            anthropic_task_budget: None,
-            anthropic_context_management: None,
-            anthropic_speed: None,
-            parent_run_id: None,
-            depth: 0,
-            dispatchable_agents: None,
-            step_id: "s1".into(),
-            on_tool_call: None,
-            on_stream_event: None,
-            on_usage: None,
-            concerns: None,
-            limits: rupu_providers::model_limits::ModelLimits::unknown(),
-            scope_name: None,
-            surface_tag: None,
-            pause: None,
-            codename: None,
-            recovery: Default::default(),
-        };
+            None,
+            &Vec::new(),
+        )
+        .expect("grant");
 
         run_agent(opts).await.expect("agent run succeeds");
 
@@ -4523,57 +4468,48 @@ mod on_tool_call_tests {
                 },
             }]);
 
-            let opts = AgentRunOpts {
-                seed_source: None,
-                collectors: Vec::new(),
-                extra_tools: Vec::new(),
-                step_actions: Vec::new(),
-                alias_scope: Default::default(),
-                agent_name: "test-agent".into(),
-                agent_system_prompt: "test".into(),
-                agent_tools: None,
-                provider: Box::new(provider),
-                provider_name: "google".into(),
-                model: "gemini-2.5-pro".into(),
-                run_id: "run_reasoning".into(),
-                workspace_id: "ws_test".into(),
-                workspace_path: tmp_dir.path().to_path_buf(),
-                transcript_path: transcript_path.clone(),
-                max_turns: 5,
-                permission: rupu_tools::PermissionPolicy::bypass(),
-                tool_context: rupu_tools::ToolContext {
-                    workspace_path: tmp_dir.path().to_path_buf(),
-                    ..Default::default()
+            let opts = crate::grant::with_grant(
+                AgentRunOpts {
+                    system_prompt: "test".into(),
+                    prompt: crate::UserTurn::new("do the thing"),
+                    provider: Box::new(provider),
+                    limits: rupu_providers::model_limits::ModelLimits::unknown(),
+                    recovery: Default::default(),
+                    permission: rupu_tools::PermissionPolicy::bypass(),
+                    grant: Default::default(),
+                    alias_scope: Default::default(),
+                    tool_context: {
+                        let mut tc = rupu_tools::ToolContext::in_workspace(tmp_dir.path());
+                        tc.identity = std::sync::Arc::new(rupu_tools::RunIdentity {
+                            agent: "test-agent".into(),
+                            provider: "google".into(),
+                            model: "gemini-2.5-pro".into(),
+                            run_id: "run_reasoning".into(),
+                            step_id: Some("s1".into()),
+                            ..Default::default()
+                        });
+                        tc.workspace.id = "ws_test".into();
+                        tc.workspace.path = tmp_dir.path().to_path_buf();
+                        tc
+                    },
+                    pins: Default::default(),
+                    concerns: None,
+                    max_turns: 5,
+                    stream: crate::StreamOpts {
+                        no_stream: true,
+                        suppress_stdout: false,
+                        on_stream_event: None,
+                    },
+                    hooks: Default::default(),
+                    pause: None,
+                    collectors: Vec::new(),
+                    extra_tools: Vec::new(),
+                    transcript_path: transcript_path.clone(),
                 },
-                user_message: "do the thing".into(),
-                initial_messages: Vec::new(),
-                turn_index_offset: 0,
-                no_stream: true,
-                suppress_stream_stdout: false,
-                mcp_registry: None,
-                effort: None,
-                thinking_display: None,
-                context_window: None,
-                output_format: None,
-                output_schema: None,
-                anthropic_task_budget: None,
-                anthropic_context_management: None,
-                anthropic_speed: None,
-                parent_run_id: None,
-                depth: 0,
-                dispatchable_agents: None,
-                step_id: "s1".into(),
-                on_tool_call: None,
-                on_stream_event: None,
-                on_usage: None,
-                concerns: None,
-                limits: rupu_providers::model_limits::ModelLimits::unknown(),
-                scope_name: None,
-                surface_tag: None,
-                pause: None,
-                codename: None,
-                recovery: Default::default(),
-            };
+                None,
+                &Vec::new(),
+            )
+            .expect("grant");
 
             let result = run_agent(opts).await.expect("agent run succeeds");
 
@@ -5319,59 +5255,50 @@ mod compaction_tests {
         dir: &std::path::Path,
         transcript_path: &std::path::Path,
     ) -> AgentRunOpts {
-        AgentRunOpts {
-            seed_source: None,
-            collectors: Vec::new(),
-            extra_tools: Vec::new(),
-            step_actions: Vec::new(),
-            alias_scope: Default::default(),
-            agent_name: "test".into(),
-            agent_system_prompt: "test".into(),
-            agent_tools: None,
-            provider: Box::new(provider),
-            provider_name: "mock".into(),
-            model: "mock-1".into(),
-            run_id: "run_compact_test".into(),
-            workspace_id: "ws_test".into(),
-            workspace_path: dir.to_path_buf(),
-            transcript_path: transcript_path.to_path_buf(),
-            max_turns: 5,
-            permission: rupu_tools::PermissionPolicy::bypass(),
-            tool_context: rupu_tools::ToolContext {
-                workspace_path: dir.to_path_buf(),
-                ..Default::default()
+        crate::grant::with_grant(
+            AgentRunOpts {
+                system_prompt: "test".into(),
+                prompt: crate::UserTurn::new("task"),
+                provider: Box::new(provider),
+                limits: rupu_providers::model_limits::ModelLimits::unknown()
+                    .with_input(1_000_000)
+                    .with_percent(75),
+                recovery: Default::default(),
+                permission: rupu_tools::PermissionPolicy::bypass(),
+                grant: Default::default(),
+                alias_scope: Default::default(),
+                tool_context: {
+                    let mut tc = rupu_tools::ToolContext::in_workspace(dir);
+                    tc.identity = std::sync::Arc::new(rupu_tools::RunIdentity {
+                        agent: "test".into(),
+                        provider: "mock".into(),
+                        model: "mock-1".into(),
+                        run_id: "run_compact_test".into(),
+                        step_id: Some("s1".into()),
+                        ..Default::default()
+                    });
+                    tc.workspace.id = "ws_test".into();
+                    tc.workspace.path = dir.to_path_buf();
+                    tc
+                },
+                pins: Default::default(),
+                concerns: None,
+                max_turns: 5,
+                stream: crate::StreamOpts {
+                    no_stream: true,
+                    suppress_stdout: false,
+                    on_stream_event: None,
+                },
+                hooks: Default::default(),
+                pause: None,
+                collectors: Vec::new(),
+                extra_tools: Vec::new(),
+                transcript_path: transcript_path.to_path_buf(),
             },
-            user_message: "task".into(),
-            initial_messages: Vec::new(),
-            turn_index_offset: 0,
-            no_stream: true,
-            suppress_stream_stdout: false,
-            mcp_registry: None,
-            effort: None,
-            thinking_display: None,
-            context_window: None,
-            output_format: None,
-            output_schema: None,
-            anthropic_task_budget: None,
-            anthropic_context_management: None,
-            anthropic_speed: None,
-            parent_run_id: None,
-            depth: 0,
-            dispatchable_agents: None,
-            step_id: "s1".into(),
-            on_tool_call: None,
-            on_stream_event: None,
-            on_usage: None,
-            concerns: None,
-            limits: rupu_providers::model_limits::ModelLimits::unknown()
-                .with_input(1_000_000)
-                .with_percent(75),
-            scope_name: None,
-            surface_tag: None,
-            pause: None,
-            codename: None,
-            recovery: Default::default(),
-        }
+            None,
+            &Vec::new(),
+        )
+        .expect("grant")
     }
 
     #[tokio::test]
@@ -5384,7 +5311,11 @@ mod compaction_tests {
             "summary call failed".to_string(),
         )]);
 
-        let mut opts = compaction_test_opts(provider, tmp_dir.path(), &transcript_path);
+        let mut opts = Run::new(compaction_test_opts(
+            provider,
+            tmp_dir.path(),
+            &transcript_path,
+        ));
 
         let mut messages = vec![
             Message::user("task"),
@@ -5437,10 +5368,14 @@ mod compaction_tests {
                 reasoning_tokens: 0,
             },
         }]);
-        let mut opts = compaction_test_opts(provider, tmp_dir.path(), &transcript_path);
+        let mut opts = Run::new(compaction_test_opts(
+            provider,
+            tmp_dir.path(),
+            &transcript_path,
+        ));
         let seen: Arc<std::sync::Mutex<Vec<UsageTurn>>> = Arc::default();
         let sink = Arc::clone(&seen);
-        opts.on_usage = Some(Arc::new(move |u: &UsageTurn| {
+        opts.hooks.on_usage = Some(Arc::new(move |u: &UsageTurn| {
             sink.lock().unwrap().push(u.clone());
         }));
 
@@ -5867,58 +5802,53 @@ mod pause_tests {
         initial_messages: Vec<Message>,
         user_message: &str,
     ) -> AgentRunOpts {
-        AgentRunOpts {
-            seed_source: None,
-            collectors: Vec::new(),
-            extra_tools: Vec::new(),
-            step_actions: Vec::new(),
-            alias_scope: Default::default(),
-            agent_name: "test-agent".into(),
-            agent_system_prompt: "test".into(),
-            agent_tools: None,
-            provider,
-            provider_name: "mock".into(),
-            model: "mock-1".into(),
-            run_id: "run_pause_test".into(),
-            workspace_id: "ws_test".into(),
-            workspace_path: workspace.to_path_buf(),
-            transcript_path,
-            max_turns: 5,
-            permission: rupu_tools::PermissionPolicy::bypass(),
-            tool_context: rupu_tools::ToolContext {
-                workspace_path: workspace.to_path_buf(),
-                ..Default::default()
+        crate::grant::with_grant(
+            AgentRunOpts {
+                system_prompt: "test".into(),
+                prompt: crate::UserTurn {
+                    message: user_message.into(),
+                    initial_messages,
+                    seed_source: None,
+                    turn_index_offset: 0,
+                },
+                provider,
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
+                recovery: Default::default(),
+                permission: rupu_tools::PermissionPolicy::bypass(),
+                grant: Default::default(),
+                alias_scope: Default::default(),
+                tool_context: {
+                    let mut tc = rupu_tools::ToolContext::in_workspace(workspace);
+                    tc.identity = std::sync::Arc::new(rupu_tools::RunIdentity {
+                        agent: "test-agent".into(),
+                        provider: "mock".into(),
+                        model: "mock-1".into(),
+                        run_id: "run_pause_test".into(),
+                        step_id: Some("s1".into()),
+                        ..Default::default()
+                    });
+                    tc.workspace.id = "ws_test".into();
+                    tc.workspace.path = workspace.to_path_buf();
+                    tc
+                },
+                pins: Default::default(),
+                concerns: None,
+                max_turns: 5,
+                stream: crate::StreamOpts {
+                    no_stream: false,
+                    suppress_stdout: true,
+                    on_stream_event: None,
+                },
+                hooks: Default::default(),
+                pause,
+                collectors: Vec::new(),
+                extra_tools: Vec::new(),
+                transcript_path,
             },
-            user_message: user_message.into(),
-            initial_messages,
-            turn_index_offset: 0,
-            // Exercise the streaming path — that is what pause races against.
-            no_stream: false,
-            suppress_stream_stdout: true,
-            mcp_registry: None,
-            effort: None,
-            thinking_display: None,
-            context_window: None,
-            output_format: None,
-            output_schema: None,
-            anthropic_task_budget: None,
-            anthropic_context_management: None,
-            anthropic_speed: None,
-            parent_run_id: None,
-            depth: 0,
-            dispatchable_agents: None,
-            step_id: "s1".into(),
-            on_tool_call: None,
-            on_stream_event: None,
-            on_usage: None,
-            concerns: None,
-            limits: rupu_providers::model_limits::ModelLimits::unknown(),
-            scope_name: None,
-            surface_tag: None,
-            pause,
-            codename: None,
-            recovery: Default::default(),
-        }
+            None,
+            &Vec::new(),
+        )
+        .expect("grant")
     }
 
     #[tokio::test]
@@ -6211,57 +6141,48 @@ mod reasoning_tests {
         workspace: &std::path::Path,
         transcript_path: PathBuf,
     ) -> AgentRunOpts {
-        AgentRunOpts {
-            seed_source: None,
-            collectors: Vec::new(),
-            extra_tools: Vec::new(),
-            step_actions: Vec::new(),
-            alias_scope: Default::default(),
-            agent_name: "test-agent".into(),
-            agent_system_prompt: "test".into(),
-            agent_tools: None,
-            provider,
-            provider_name: "mock".into(),
-            model: "mock-1".into(),
-            run_id: "run_reasoning_test".into(),
-            workspace_id: "ws_test".into(),
-            workspace_path: workspace.to_path_buf(),
-            transcript_path,
-            max_turns: 5,
-            permission: rupu_tools::PermissionPolicy::bypass(),
-            tool_context: rupu_tools::ToolContext {
-                workspace_path: workspace.to_path_buf(),
-                ..Default::default()
+        crate::grant::with_grant(
+            AgentRunOpts {
+                system_prompt: "test".into(),
+                prompt: crate::UserTurn::new("test prompt"),
+                provider,
+                limits: rupu_providers::model_limits::ModelLimits::unknown(),
+                recovery: Default::default(),
+                permission: rupu_tools::PermissionPolicy::bypass(),
+                grant: Default::default(),
+                alias_scope: Default::default(),
+                tool_context: {
+                    let mut tc = rupu_tools::ToolContext::in_workspace(workspace);
+                    tc.identity = std::sync::Arc::new(rupu_tools::RunIdentity {
+                        agent: "test-agent".into(),
+                        provider: "mock".into(),
+                        model: "mock-1".into(),
+                        run_id: "run_reasoning_test".into(),
+                        step_id: Some("s1".into()),
+                        ..Default::default()
+                    });
+                    tc.workspace.id = "ws_test".into();
+                    tc.workspace.path = workspace.to_path_buf();
+                    tc
+                },
+                pins: Default::default(),
+                concerns: None,
+                max_turns: 5,
+                stream: crate::StreamOpts {
+                    no_stream: true,
+                    suppress_stdout: true,
+                    on_stream_event: None,
+                },
+                hooks: Default::default(),
+                pause: None,
+                collectors: Vec::new(),
+                extra_tools: Vec::new(),
+                transcript_path,
             },
-            user_message: "test prompt".into(),
-            initial_messages: Vec::new(),
-            turn_index_offset: 0,
-            no_stream: true,
-            suppress_stream_stdout: true,
-            mcp_registry: None,
-            effort: None,
-            thinking_display: None,
-            context_window: None,
-            output_format: None,
-            output_schema: None,
-            anthropic_task_budget: None,
-            anthropic_context_management: None,
-            anthropic_speed: None,
-            parent_run_id: None,
-            depth: 0,
-            dispatchable_agents: None,
-            step_id: "s1".into(),
-            on_tool_call: None,
-            on_stream_event: None,
-            on_usage: None,
-            concerns: None,
-            limits: rupu_providers::model_limits::ModelLimits::unknown(),
-            scope_name: None,
-            surface_tag: None,
-            pause: None,
-            codename: None,
-            recovery: Default::default(),
-        }
+            None,
+            &Vec::new(),
+        )
+        .expect("grant")
     }
 
     /// Every `AssistantMessage` the real run wrote, in transcript order, as
@@ -6374,7 +6295,7 @@ mod reasoning_tests {
             stop: StopReason::EndTurn,
         }]);
         let mut opts = opts_for(Box::new(provider), tmp.path(), transcript_path.clone());
-        opts.initial_messages = vec![Message::user("earlier"), Message::assistant("noted")];
+        opts.prompt.initial_messages = vec![Message::user("earlier"), Message::assistant("noted")];
         run_agent(opts).await.expect("run completes");
 
         let events: Vec<rupu_transcript::Event> =

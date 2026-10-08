@@ -265,9 +265,7 @@ impl Tool for FindingVerifyTool {
         // The verifier's identity is the run executing this call. Any
         // `by_run` / `by_agent` the model put in `input` was not read above
         // and is never consulted.
-        let by_run = ctx
-            .run_id
-            .clone()
+        let by_run = Some(ctx.identity.run_id.clone())
             .filter(|r| !r.trim().is_empty())
             .ok_or_else(|| {
                 ToolError::Execution(
@@ -276,7 +274,7 @@ impl Tool for FindingVerifyTool {
                         .into(),
                 )
             })?;
-        let by_agent = ctx.agent.clone().filter(|a| !a.trim().is_empty());
+        let by_agent = Some(ctx.identity.agent.clone()).filter(|a| !a.trim().is_empty());
         let verify = VerifyInput {
             finding_id: finding_id.clone(),
             status,
@@ -687,9 +685,12 @@ mod finding_verify_tests {
 
     fn ctx(run_id: Option<&str>, agent: Option<&str>) -> ToolContext {
         ToolContext {
-            run_id: run_id.map(str::to_string),
-            agent: agent.map(str::to_string),
-            ..ToolContext::default()
+            identity: std::sync::Arc::new(rupu_tools::RunIdentity {
+                run_id: run_id.unwrap_or_default().to_string(),
+                agent: agent.unwrap_or_default().to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
         }
     }
 

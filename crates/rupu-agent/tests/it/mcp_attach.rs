@@ -5,7 +5,6 @@ use rupu_agent::run_agent;
 use rupu_agent::runner::{AgentRunOpts, CapturingMockProvider, ScriptedTurn};
 use rupu_providers::types::StopReason;
 use rupu_scm::Registry;
-use rupu_tools::ToolContext;
 use std::sync::Arc;
 
 /// Structural contract: AgentRunOpts accepts mcp_registry: Some(Registry::empty())
@@ -24,54 +23,53 @@ async fn offered_tools(agent_tools: Option<Vec<String>>) -> Vec<String> {
     let captured = provider.captured.clone();
     let tmp = assert_fs::TempDir::new().unwrap();
 
-    let opts = AgentRunOpts {
-        seed_source: None,
-        collectors: Vec::new(),
-        extra_tools: Vec::new(),
-        step_actions: Vec::new(),
-        alias_scope: Default::default(),
-        agent_name: "mcp-test".into(),
-        agent_system_prompt: "test".into(),
-        agent_tools,
-        provider: Box::new(provider),
-        provider_name: "mock".into(),
-        model: "mock-1".into(),
-        run_id: "run_mcp_attach".into(),
-        workspace_id: "ws_mcp".into(),
-        workspace_path: tmp.path().to_path_buf(),
-        transcript_path: tmp.path().join("run.jsonl"),
-        max_turns: 5,
-        permission: rupu_tools::PermissionPolicy::bypass(),
-        tool_context: ToolContext::default(),
-        user_message: "list repos".into(),
-        initial_messages: Vec::new(),
-        turn_index_offset: 0,
-        no_stream: true,
-        suppress_stream_stdout: false,
-        mcp_registry: Some(Arc::new(Registry::empty())),
-        effort: None,
-        thinking_display: None,
-        context_window: None,
-        output_format: None,
-        output_schema: None,
-        anthropic_task_budget: None,
-        anthropic_context_management: None,
-        anthropic_speed: None,
-        parent_run_id: None,
-        depth: 0,
-        dispatchable_agents: None,
-        step_id: String::new(),
-        on_tool_call: None,
-        on_stream_event: None,
-        on_usage: None,
-        concerns: None,
-        limits: rupu_providers::model_limits::ModelLimits::unknown(),
-        scope_name: None,
-        surface_tag: None,
-        pause: None,
-        codename: None,
-        recovery: Default::default(),
-    };
+    let opts = rupu_agent::grant::with_grant(
+        AgentRunOpts {
+            system_prompt: "test".into(),
+            prompt: rupu_agent::UserTurn::new("list repos"),
+            provider: Box::new(provider),
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
+            recovery: Default::default(),
+            permission: rupu_tools::PermissionPolicy::bypass(),
+            grant: Default::default(),
+            alias_scope: Default::default(),
+            tool_context: rupu_tools::ToolContext {
+                identity: std::sync::Arc::new(rupu_tools::RunIdentity {
+                    agent: "mcp-test".into(),
+                    provider: "mock".into(),
+                    model: "mock-1".into(),
+                    run_id: "run_mcp_attach".into(),
+                    ..Default::default()
+                }),
+                workspace: rupu_tools::WorkspaceScope {
+                    id: "ws_mcp".into(),
+                    path: tmp.path().to_path_buf(),
+                    ..Default::default()
+                },
+                services: rupu_tools::ToolServices {
+                    scm: Some(Arc::new(Registry::empty())),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            pins: Default::default(),
+            concerns: None,
+            max_turns: 5,
+            stream: rupu_agent::StreamOpts {
+                no_stream: true,
+                suppress_stdout: false,
+                on_stream_event: None,
+            },
+            hooks: Default::default(),
+            pause: None,
+            collectors: Vec::new(),
+            extra_tools: Vec::new(),
+            transcript_path: tmp.path().join("run.jsonl"),
+        },
+        agent_tools.as_deref(),
+        &Vec::new(),
+    )
+    .expect("grant");
 
     run_agent(opts).await.unwrap();
 

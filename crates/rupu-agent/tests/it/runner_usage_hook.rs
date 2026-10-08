@@ -48,57 +48,47 @@ fn build_opts(
     tmp: &assert_fs::TempDir,
     transcript_path: std::path::PathBuf,
 ) -> AgentRunOpts {
-    AgentRunOpts {
-        codename: None,
-        seed_source: None,
-        collectors: Vec::new(),
-        extra_tools: Vec::new(),
-        step_actions: Vec::new(),
-        alias_scope: Default::default(),
-        agent_name: "noop".into(),
-        agent_system_prompt: "You are a noop agent.".into(),
-        agent_tools: None,
-        provider: Box::new(provider),
-        provider_name: "mock".into(),
-        model: "mock-1".into(),
-        run_id: "run_usage_hook".into(),
-        workspace_id: "ws_test1".into(),
-        workspace_path: tmp.path().to_path_buf(),
-        transcript_path,
-        max_turns: 5,
-        permission: rupu_tools::PermissionPolicy::bypass(),
-        tool_context: ToolContext {
-            workspace_path: tmp.path().to_path_buf(),
-            ..Default::default()
+    rupu_agent::grant::with_grant(
+        AgentRunOpts {
+            system_prompt: "You are a noop agent.".into(),
+            prompt: rupu_agent::UserTurn::new("say hi"),
+            provider: Box::new(provider),
+            limits: ModelLimits::unknown(),
+            recovery: Default::default(),
+            permission: rupu_tools::PermissionPolicy::bypass(),
+            grant: Default::default(),
+            alias_scope: Default::default(),
+            tool_context: {
+                let mut tc = ToolContext::in_workspace(tmp.path());
+                tc.identity = std::sync::Arc::new(rupu_tools::RunIdentity {
+                    agent: "noop".into(),
+                    provider: "mock".into(),
+                    model: "mock-1".into(),
+                    run_id: "run_usage_hook".into(),
+                    ..Default::default()
+                });
+                tc.workspace.id = "ws_test1".into();
+                tc.workspace.path = tmp.path().to_path_buf();
+                tc
+            },
+            pins: Default::default(),
+            concerns: None,
+            max_turns: 5,
+            stream: rupu_agent::StreamOpts {
+                no_stream: true,
+                suppress_stdout: false,
+                on_stream_event: None,
+            },
+            hooks: Default::default(),
+            pause: None,
+            collectors: Vec::new(),
+            extra_tools: Vec::new(),
+            transcript_path,
         },
-        user_message: "say hi".into(),
-        initial_messages: Vec::new(),
-        turn_index_offset: 0,
-        no_stream: true,
-        suppress_stream_stdout: false,
-        mcp_registry: None,
-        effort: None,
-        thinking_display: None,
-        context_window: None,
-        output_format: None,
-        output_schema: None,
-        anthropic_task_budget: None,
-        anthropic_context_management: None,
-        anthropic_speed: None,
-        parent_run_id: None,
-        depth: 0,
-        dispatchable_agents: None,
-        step_id: String::new(),
-        on_tool_call: None,
-        on_stream_event: None,
-        on_usage: None,
-        concerns: None,
-        limits: ModelLimits::unknown(),
-        scope_name: None,
-        surface_tag: None,
-        pause: None,
-        recovery: Default::default(),
-    }
+        None,
+        &Vec::new(),
+    )
+    .expect("grant")
 }
 
 /// `(input, output, cached, purpose)` of every transcript `Usage` event, in order.
@@ -135,7 +125,7 @@ async fn on_usage_fires_once_per_turn_with_transcript_values() {
     let seen: Arc<Mutex<Vec<UsageTurn>>> = Default::default();
     let seen2 = seen.clone();
     let mut opts = build_opts(provider, &tmp, transcript.clone());
-    opts.on_usage = Some(Arc::new(move |u: &UsageTurn| {
+    opts.hooks.on_usage = Some(Arc::new(move |u: &UsageTurn| {
         seen2.lock().unwrap().push(u.clone());
     }));
     let rr = run_agent(opts).await.unwrap();
@@ -179,7 +169,7 @@ async fn on_usage_reports_billable_output_including_reasoning() {
     let seen: Arc<Mutex<Vec<UsageTurn>>> = Default::default();
     let seen2 = seen.clone();
     let mut opts = build_opts(provider, &tmp, transcript.clone());
-    opts.on_usage = Some(Arc::new(move |u: &UsageTurn| {
+    opts.hooks.on_usage = Some(Arc::new(move |u: &UsageTurn| {
         seen2.lock().unwrap().push(u.clone());
     }));
     run_agent(opts).await.unwrap();
@@ -219,14 +209,14 @@ async fn compaction_call_emits_usage_with_purpose_and_hook_kind() {
     let seen2 = seen.clone();
     let mut opts = build_opts(provider, &tmp, transcript.clone());
     // Enough seeded history for `partition_for_compaction` to find a middle.
-    opts.initial_messages = vec![
+    opts.prompt.initial_messages = vec![
         dense_msg(Role::User, "task"),
         dense_msg(Role::Assistant, "assistant 0"),
         dense_msg(Role::User, "user 0"),
         dense_msg(Role::Assistant, "assistant 1"),
     ];
     opts.limits = ModelLimits::unknown().with_input(1000).with_percent(50);
-    opts.on_usage = Some(Arc::new(move |u: &UsageTurn| {
+    opts.hooks.on_usage = Some(Arc::new(move |u: &UsageTurn| {
         seen2.lock().unwrap().push(u.clone());
     }));
     let rr = run_agent(opts).await.unwrap();
@@ -308,14 +298,14 @@ async fn cache_write_tokens_reach_the_hook_and_transcript_for_turns_and_compacti
     let seen: Arc<Mutex<Vec<UsageTurn>>> = Default::default();
     let seen2 = seen.clone();
     let mut opts = build_opts(provider, &tmp, transcript.clone());
-    opts.initial_messages = vec![
+    opts.prompt.initial_messages = vec![
         dense_msg(Role::User, "task"),
         dense_msg(Role::Assistant, "assistant 0"),
         dense_msg(Role::User, "user 0"),
         dense_msg(Role::Assistant, "assistant 1"),
     ];
     opts.limits = ModelLimits::unknown().with_input(1000).with_percent(50);
-    opts.on_usage = Some(Arc::new(move |u: &UsageTurn| {
+    opts.hooks.on_usage = Some(Arc::new(move |u: &UsageTurn| {
         seen2.lock().unwrap().push(u.clone());
     }));
     run_agent(opts).await.unwrap();

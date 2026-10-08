@@ -2333,6 +2333,7 @@ fn mirrored_awaiting_run_is_not_pending_resume() {
         final_output: None,
         loop_progress: Default::default(),
         gate_decisions: Vec::new(),
+        system_prompt_suffix: None,
         codename: None,
         cause: None,
     };
@@ -2404,6 +2405,7 @@ fn mirrored_awaiting_run_is_not_pending_resume_ssh_host() {
         final_output: None,
         loop_progress: Default::default(),
         gate_decisions: Vec::new(),
+        system_prompt_suffix: None,
         codename: None,
         cause: None,
     };
@@ -2470,6 +2472,7 @@ fn mirrored_awaiting_run_is_not_pending_resume_bucket_host() {
         final_output: None,
         loop_progress: Default::default(),
         gate_decisions: Vec::new(),
+        system_prompt_suffix: None,
         codename: None,
         cause: None,
     };

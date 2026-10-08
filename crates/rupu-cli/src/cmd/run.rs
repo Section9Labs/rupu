@@ -10,13 +10,9 @@ use crate::standalone_run_metadata::{
     metadata_path_for_run, write_metadata, StandaloneRunMetadata,
 };
 use clap::{Args as ClapArgs, Parser};
-use rupu_agent::runner::AgentRunOpts;
 use rupu_agent::{load_agent, resolve_mode};
-use rupu_runtime::provider_factory;
 use rupu_runtime::WorkerKind;
-use rupu_tools::{
-    PermissionMode, PermissionPolicy, PromptAnswer, PromptRequest, Prompter, ToolContext,
-};
+use rupu_tools::{PermissionMode, PermissionPolicy, PromptAnswer, PromptRequest, Prompter};
 use std::io::IsTerminal;
 use std::path::Path;
 use std::process::ExitCode;
@@ -133,56 +129,6 @@ fn parse_codename(s: &str) -> Result<rupu_codename::Codename, String> {
                 Ok(c)
             }
         })
-}
-
-/// The standalone run's findings profile: `--findings-profile` → the agent's
-/// `findingsProfile` → `full`. The flag sits in the step slot of
-/// [`rupu_coverage::FindingProfile::resolve`] — it is how a placed unit's
-/// step/workflow-default override reaches the host that runs the agent.
-fn resolve_findings_profile(
-    flag: Option<rupu_coverage::FindingProfile>,
-    agent: Option<rupu_coverage::FindingProfile>,
-) -> rupu_coverage::FindingProfile {
-    rupu_coverage::FindingProfile::resolve(flag, None, agent)
-}
-
-/// What `--fleet-run-dir` / `--fleet-participant` attach to a run: the fleet
-/// coordination tools, the participant's ambient-context collectors, and the
-/// agentiflow's findings scope.
-pub(crate) struct FleetAttachment {
-    /// `board.claim` / `board.release` / `board.post` / `board.read` /
-    /// `msg.send`, bound to the run's participant id.
-    pub extra_tools: Vec<Arc<dyn rupu_tools::Tool>>,
-    /// The participant's inbox and the board's standing directives.
-    pub collectors: Vec<Arc<dyn rupu_agent::TurnCollector>>,
-    /// The agentiflow id — the run dir's basename. Findings pool under
-    /// `target_id(workspace, <id>)`, where the goal evaluator looks, rather
-    /// than under the agent's own name.
-    pub scope_name: String,
-}
-
-/// Build the fleet attachment for a unit joining the agentiflow whose run dir
-/// is `run_dir`. The board and mailboxes are the SAME file-backed stores the
-/// lead created there (they append their own `board/` / `mailboxes/`
-/// subdirectories, so the run dir root is passed as is). The findings
-/// engagement set needs no handling here: `run_inner` already carries it on
-/// the run's findings options.
-pub(crate) fn fleet_attachment(run_dir: &Path, participant: &str) -> FleetAttachment {
-    let board = Arc::new(rupu_fleet::Board::new(run_dir));
-    let mailbox = Arc::new(rupu_fleet::Mailbox::new(run_dir));
-    let ctx = Arc::new(rupu_agentiflow::FleetToolCtx::new(
-        Arc::clone(&board),
-        Arc::clone(&mailbox),
-        participant,
-    ));
-    FleetAttachment {
-        extra_tools: rupu_agentiflow::fleet_tools(ctx),
-        collectors: rupu_agentiflow::lead_collectors(mailbox, board, participant),
-        scope_name: run_dir
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-    }
 }
 
 /// `--fleet-run-dir` and `--fleet-participant` come as a pair. clap already
@@ -683,7 +629,13 @@ struct RunListReport {
 
 pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     // Both-or-neither, refused before anything is touched.
-    let fleet = fleet_pair(&args)?.map(|(dir, participant)| fleet_attachment(dir, participant));
+    let fleet = fleet_pair(&args)?.map(|(dir, participant)| {
+        (
+            dir.to_path_buf(),
+            participant.to_string(),
+            rupu_agentiflow::FlowUnitServices::for_participant(dir, participant),
+        )
+    });
     let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
 
@@ -873,10 +825,9 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     // inside would otherwise short-circuit straight out of `run_inner`
     // and skip the shutdown entirely.
     let body_result: anyhow::Result<()> = async move {
-        // Provider build via CredentialResolver. Wrapped in an `Arc` so the
-        // same resolver instance can also be handed to `CliAgentDispatcher`
-        // below without a second construction; existing call sites that need
-        // `&dyn CredentialResolver` now go through `resolver.as_ref()`.
+        // Credential resolver, shared by the SCM registry and the run's
+        // assembler (and so its provider, its fallback hops and its
+        // sub-agents).
         let resolver = Arc::new(crate::accounts::resolver_for(&cfg));
 
         // Build the SCM/issue registry from the same resolver + config the
@@ -888,106 +839,29 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             rupu_scm::Registry::discover(resolver.as_ref(), &cfg, netflow_sink.clone()).await,
         );
 
-        // `--provider` / `--model` override the agent and the config, ahead
-        // of the dispatchable pre-flight below. The agent's own provider is
-        // resolved too: its `auth:` names how it reaches that provider only.
-        let agent_provider = provider_factory::resolve_provider_name(
-            spec.provider.as_deref(),
-            cfg.default_provider.as_deref(),
+        // Process-wide subprocess-capture backend, warmed off the async
+        // runtime (its first call blocks). Every run the assembler builds —
+        // this one and its sub-agents — shares it.
+        let net_capture = crate::netflow_sink::net_capture(&cfg.netflow).await;
+        // The run is assembled from what this command says it wants (W3):
+        // the agent, its origin, the overrides below. Provider, limits,
+        // recovery, permission, grant, findings, netflow, `[bash]`, the usage
+        // ledger and the frontmatter pins all come from the assembler.
+        let assembler = rupu_runtime::assembly::RunAssembler::new(
+            rupu_runtime::assembly::AssemblyContext {
+                global: global.clone(),
+                project_root: project_root.clone(),
+                config: cfg.clone(),
+                // The customer the config above was layered with.
+                customer: cfg_paths.customer_slug.clone(),
+                resolver: Arc::clone(&resolver),
+                scm: Some(Arc::clone(&scm_registry)),
+                // The engagement is resolved against the workspace, which a
+                // target clone only creates below (`with_findings`).
+                findings: crate::findings_opts::base_options(&global, &cfg.findings),
+                net_capture: Some(net_capture),
+            },
         );
-        let provider_name = provider_factory::resolve_provider_name(
-            args.provider.as_deref().or(spec.provider.as_deref()),
-            cfg.default_provider.as_deref(),
-        );
-        let oai_params = provider_factory::openai_compatible_params(&provider_name, &cfg.providers);
-        // Pre-flight, before any credential lookup, so a typo'd provider name
-        // fails with a config error rather than a confusing auth one.
-        //
-        // Asks the factory (`is_dispatchable_provider`) rather than
-        // re-deriving the rule: this check used to be
-        // `!is_builtin_provider(name) && oai_params.is_none()`, which tests
-        // the *account name* against the builtin vendor list and so rejected
-        // every named account — `[providers.anthropic-work] kind =
-        // "anthropic"`, exactly what `rupu auth login --account
-        // anthropic-work --kind anthropic` writes and what `rupu auth
-        // status`'s KIND column reads back. The factory has dispatched on
-        // the resolved *kind* since multi-account landed; only this gate,
-        // the one copy of the rule that lived outside it, still looked at
-        // the name.
-        if !provider_factory::is_dispatchable_provider(&provider_name, &cfg.providers) {
-            anyhow::bail!(
-                "provider '{provider_name}' is not a built-in provider, is not a declared \
-                 account (no [providers.{provider_name}] with a vendor `kind` — declare one \
-                 with `rupu auth login --account {provider_name} --kind <vendor>`), and is \
-                 not declared as [providers.{provider_name}] with kind = \"openai-compatible\" \
-                 and a base_url in config.toml"
-            );
-        }
-        // For an openai-compatible provider, prefer its configured default_model
-        // when the agent/spec didn't pin one.
-        let model = provider_factory::resolve_model(
-            args.model.as_deref().or(spec.model.as_deref()),
-            cfg.default_model.as_deref(),
-            oai_params.as_ref().map(|p| p.default_model.as_str()),
-        );
-        let agent_model = provider_factory::resolve_model(
-            spec.model.as_deref(),
-            cfg.default_model.as_deref(),
-            provider_factory::openai_compatible_params(&agent_provider, &cfg.providers)
-                .as_ref()
-                .map(|p| p.default_model.as_str()),
-        );
-        // What the agent pins for its own model and provider applies only
-        // there — the rule a fallback hop follows (`hop_builder` for limits,
-        // the runner's `OriginPins` for `contextWindow` / `anthropicSpeed`). An
-        // "override" naming the agent's own model/provider changes nothing.
-        let pins = AgentPins::for_run(&spec, provider_name != agent_provider, model != agent_model);
-        let auth_hint = pins.auth;
-        let provider_config = provider_factory::ProviderConfig {
-            anthropic_oauth_system_prefix: spec.anthropic_oauth_prefix,
-            anthropic_prompt_cache: spec.anthropic_prompt_cache,
-            anthropic_server_side_fallback: Some(cfg.recovery.server_side_fallback),
-            openai_compatible: oai_params,
-            tuning: Some(provider_factory::provider_tuning(
-                &provider_name,
-                &cfg.providers,
-            )),
-            kind: provider_factory::resolve_kind(&provider_name, &cfg.providers),
-        };
-        let (_resolved_auth, mut provider) = provider_factory::build_for_provider_with_config(
-            &provider_name,
-            &model,
-            auth_hint,
-            resolver.as_ref(),
-            &provider_config,
-            netflow_sink.clone(),
-        )
-        .await?;
-
-        // Print the agent header via the line-stream printer.
-        // `run_id`/`transcript_path` were resolved earlier (see the netflow
-        // comment above) so they're already in scope here.
-        let agent_header_name = spec.name.clone();
-        let agent_header_provider = provider_name.clone();
-        let agent_header_model = model.clone();
-
-        // Construct ONE LineStreamPrinter for the whole run. Keeping a
-        // single instance means a single MultiProgress + ticker — earlier
-        // we built one for the header and another for the tail loop, and
-        // their indicatif draw targets stomped on each other (visible as
-        // two stale spinner rows under heavy tool-call traffic).
-        let mut printer = crate::output::LineStreamPrinter::new();
-        printer.agent_header(
-            &agent_header_name,
-            Some(&codename.to_string()),
-            &agent_header_provider,
-            &agent_header_model,
-            &run_id,
-        );
-
-        // Tool context config (the path is filled in after target resolution below).
-        let bash_timeout = cfg.bash.timeout_secs.unwrap_or(120);
-        let bash_allowlist = cfg.bash.env_allowlist.clone().unwrap_or_default();
 
         // The --prompt flag takes precedence over the positional `prompt` argument.
         // This avoids the positional prompt being mis-parsed as a RunTarget when
@@ -1012,15 +886,39 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             },
         };
 
-        // Preload `## Run target` into the agent system prompt when a target is set.
-        let agent_system_prompt = match run_target.as_ref() {
-            Some(t) => format!(
-                "{}\n\n## Run target\n\n{}",
-                spec.system_prompt,
-                crate::run_target::format_run_target_for_prompt(t),
-            ),
-            None => spec.system_prompt.clone(),
+        // `--provider` / `--model` override the agent and the config. A
+        // `## Run target` section joins the system prompt when a target is
+        // set.
+        let overrides = rupu_runtime::assembly::Overrides {
+            provider: args.provider.clone(),
+            model: args.model.clone(),
+            system_prompt_suffix: run_target
+                .as_ref()
+                .map(crate::run_target::format_run_target_for_prompt),
+            findings_profile: args.findings_profile,
+            ..Default::default()
         };
+
+        // The provider is built before a target is cloned, so a typo'd
+        // provider or a missing credential fails the command before anything
+        // lands on disk.
+        let prepared = assembler
+            .prepare_provider(&spec, &overrides, netflow_sink.clone())
+            .await?;
+
+        // Construct ONE LineStreamPrinter for the whole run. Keeping a
+        // single instance means a single MultiProgress + ticker — earlier
+        // we built one for the header and another for the tail loop, and
+        // their indicatif draw targets stomped on each other (visible as
+        // two stale spinner rows under heavy tool-call traffic).
+        let mut printer = crate::output::LineStreamPrinter::new();
+        printer.agent_header(
+            &spec.name,
+            Some(&codename.to_string()),
+            &prepared.provider_name,
+            &prepared.model,
+            &run_id,
+        );
 
         // Clone the target repo for Repo/Pr targets. Three destination
         // modes, in priority order:
@@ -1074,54 +972,52 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
 
         let mode_str = mode.as_str();
 
-        // Run-store, hoisted above the tool context so it can back both the
+        // Run-store, hoisted above the dispatcher so it can back both the
         // dispatcher (below) and the run.json write further down — a single
         // `RunStore` instance for the whole `run_inner` call, never two.
         let runs_root = global.join("runs");
         let run_store = Arc::new(rupu_orchestrator::RunStore::new(runs_root.clone()));
 
-        // Build tool context now that the resolved workspace_path is known.
-        // Sub-agent dispatch is now wired for bare `rupu run` too, mirroring
-        // `rupu workflow run`: `parent_run_id` is this run's id, so any
-        // `dispatch_agent`/`dispatch_agents_parallel` tool call anchors its
-        // child sub-run(s) under `<run>/sub/`. No event sink is threaded
-        // through — bare `rupu run` uses the `LineStreamPrinter`, which
-        // renders dispatch children post-hoc from the parent transcript's
-        // tool_call/tool_result entries rather than tailing `events.jsonl`.
-        let mut findings_base = crate::findings_opts::base_options(&global, &cfg.findings);
         // Engagement selection: resolve the chosen profile(s) into the active
         // set and carry it on the write options, so report_finding routes/gates
         // and asset_mark is offered. Empty selection = the native code path.
+        let mut findings_base = crate::findings_opts::base_options(&global, &cfg.findings);
         findings_base.engagement = crate::findings_opts::resolve_engagement(
             &global,
             &workspace_path,
             &args.engagement_profiles,
         )?;
-        let limits_ctx = rupu_runtime::model_limits::LimitsContext::from_config(&cfg, &global);
-        let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
-            global.clone(),
-            project_root.clone(),
-            ws.id.clone(),
-            workspace_path.clone(),
-            Arc::clone(&resolver),
-            Arc::clone(&scm_registry),
-            Arc::clone(&run_store),
+        let assembler = Arc::new(assembler.with_findings(findings_base));
+
+        // A fleet unit joins the agentiflow (its board, mailbox and findings
+        // scope); every other `rupu run` is standalone.
+        let (origin, fleet_tools, fleet_collectors) = match fleet {
+            Some((flow_dir, participant, services)) => (
+                rupu_runtime::assembly::Origin::FlowUnit {
+                    flow_id: services.flow_id,
+                    flow_dir,
+                    participant,
+                },
+                services.extra_tools,
+                services.collectors,
+            ),
+            None => (rupu_runtime::assembly::Origin::Standalone, Vec::new(), Vec::new()),
+        };
+        let workspace = rupu_runtime::assembly::WorkspaceBinding {
+            id: ws.id.clone(),
+            path: workspace_path.clone(),
+        };
+
+        // Sub-agent dispatch: any `dispatch_agent`/`dispatch_agents_parallel`
+        // call anchors its child sub-run(s) under `<runs>/<run_id>/sub/`, and
+        // charges this run's usage ledger. No event sink — bare `rupu run`
+        // uses the `LineStreamPrinter`, which renders dispatch children
+        // post-hoc from the parent transcript's tool_call/tool_result entries.
+        let dispatcher = rupu_runtime::dispatch::InProcessDispatcher::new(
+            Arc::clone(&assembler),
+            Arc::clone(&run_store) as Arc<dyn rupu_runtime::dispatch::SubRunStore>,
+            assembler.dispatch_root(&origin, &run_id, workspace.clone()),
             None,
-            cfg.default_provider.clone(),
-            cfg.default_model.clone(),
-            provider_factory::openai_compatible_map(&cfg.providers),
-            provider_factory::provider_tuning_map(&cfg.providers),
-            provider_factory::resolve_kind_map(&cfg.providers),
-            findings_base.clone(),
-            // Standalone `rupu run` has no workflow run ledger to charge;
-            // dispatched children are counted by the CP's fallback over
-            // sub-run transcripts.
-            None,
-            limits_ctx.clone(),
-            Some(coverage_stream.clone()),
-            cfg.providers.clone(),
-            cfg.recovery.clone(),
-            cfg_paths.customer_slug.clone(),
         );
         dispatcher.set_namer(rupu_codename::SharedNamer::open_or_init(
             runs_root.join(&run_id).join("codenames.json"),
@@ -1133,43 +1029,6 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                 n
             },
         ));
-
-        // Process-wide subprocess-capture backend, warmed off the async
-        // runtime (its first call blocks). The dispatcher hands the same
-        // Arc to every child run.
-        let net_capture = crate::netflow_sink::net_capture(&cfg.netflow).await;
-        dispatcher.set_net_capture(Arc::clone(&net_capture));
-        let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
-
-        let tool_context = ToolContext {
-            findings: Some(findings_base.with_profile(resolve_findings_profile(
-                args.findings_profile,
-                spec.findings_profile,
-            ))),
-            workspace_path: workspace_path.clone(),
-            bash_env_allowlist: bash_allowlist,
-            bash_timeout_secs: bash_timeout,
-            dispatcher: Some(dispatcher_dyn),
-            dispatchable_agents: spec.dispatchable_agents.clone(),
-            parent_run_id: Some(run_id.clone()),
-            depth: 0,
-            coverage_writer: None,
-            surface_tag: None,
-            run_id: None,
-            model: None,
-            tool_mappings: None,
-            codename: Some(codename.to_string()),
-            agent: None,
-            provider: None,
-            coverage_stream: Some(coverage_stream.clone()),
-            netflow_sink: Some(netflow_sink.clone()),
-            net_capture: Some(net_capture),
-            tool_call_id: None,
-            spawn_ceiling: None,
-            prompter: None,
-            // The customer the config above was layered with.
-            customer: cfg_paths.customer_slug.clone(),
-        };
 
         let backend_id = "local_checkout".to_string();
         let repo_ref = standalone_repo_ref(run_target.as_ref(), &workspace_path);
@@ -1216,108 +1075,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             workspace_path.display().to_string(),
         );
 
-        // Discover the model's real limits (spec 2026-09-30 §6.1): agent pin →
-        // config → live model list → unknown. Resolved through the same
-        // provider the run is about to use, before it moves into the opts.
-        let limits = rupu_runtime::model_limits::resolve(
-            pins.limits,
-            &provider_name,
-            &model,
-            provider.as_mut(),
-            &limits_ctx,
-        )
-        .await;
-
-        // What a fallback hop keeps from this agent: exactly what the primary
-        // provider's `ProviderConfig` and auth hint above carry.
-        let hop_overrides = rupu_runtime::hop_builder::AgentOverrides {
-            oauth_prefix: spec.anthropic_oauth_prefix,
-            prompt_cache: spec.anthropic_prompt_cache,
-            auth: pins.auth,
-            origin_provider: provider_name.clone(),
-        };
-        // A fleet unit joins the agentiflow's board and pools its findings
-        // under the agentiflow id; every other run keeps the empty defaults.
-        let fleet_attached = fleet.is_some();
-        let (fleet_tools, fleet_collectors, fleet_scope) = match fleet {
-            Some(a) => (a.extra_tools, a.collectors, Some(a.scope_name)),
-            None => (Vec::new(), Vec::new(), None),
-        };
-        // A fleet unit meters itself: its own `<runs>/<run_id>/usage.jsonl`
-        // is what the agentiflow folds into its budget. A plain `rupu run`
-        // keeps no ledger.
-        let on_usage = fleet_attached.then(|| {
-            rupu_orchestrator::usage_ledger::UsageLedger::for_run(&run_store, &run_id).hook(
-                rupu_orchestrator::usage_ledger::LedgerTag::default(),
-                run_id.clone(),
-                None,
-                transcript_path.clone(),
-                spec.name.clone(),
-                None,
-            )
-        });
-        let mut opts = AgentRunOpts {
-            seed_source: None,
-            collectors: fleet_collectors,
-            extra_tools: fleet_tools,
-            step_actions: Vec::new(),
-            alias_scope: Default::default(),
-            agent_name: spec.name.clone(),
-            agent_system_prompt,
-            agent_tools: spec.tools.clone(),
-            provider,
-            provider_name,
-            model,
-            run_id: run_id.clone(),
-            workspace_id: ws.id.clone(),
-            workspace_path: workspace_path.clone(),
-            transcript_path: transcript_path.clone(),
-            max_turns: spec.max_turns.unwrap_or(50),
-            permission,
-            tool_context,
-            user_message,
-            initial_messages: Vec::new(),
-            turn_index_offset: 0,
-            no_stream: args.no_stream,
-            // Suppress the agent runner's inline stdout writes; the CLI's
-            // line-stream printer reads tokens from the JSONL transcript
-            // instead. This prevents duplicate output when the printer is
-            // active and ensures clean output when stdout is piped.
-            suppress_stream_stdout: true,
-            mcp_registry: Some(scm_registry),
-            effort: spec.effort,
-            thinking_display: spec.thinking_display,
-            context_window: pins.context_window,
-            output_format: spec.output_format,
-            output_schema: spec.output_schema.clone(),
-            anthropic_task_budget: pins.anthropic_task_budget,
-            anthropic_context_management: pins.anthropic_context_management,
-            anthropic_speed: pins.anthropic_speed,
-            // Top-level `rupu run` invocation — no parent, depth 0,
-            // dispatch surface taken from the agent's frontmatter.
-            parent_run_id: None,
-            depth: 0,
-            dispatchable_agents: spec.dispatchable_agents.clone(),
-            step_id: String::new(),
-            on_tool_call: None,
-            on_stream_event: None,
-            on_usage,
-            concerns: spec.concerns.clone(),
-            limits,
-            scope_name: fleet_scope,
-            surface_tag: None,
-            pause: None,
-            codename: Some(codename.to_string()),
-            recovery: rupu_runtime::hop_builder::recovery_opts(
-                &cfg.recovery,
-                spec.fallbacks.as_deref(),
-                resolver.clone(),
-                cfg.providers.clone(),
-                limits_ctx.clone(),
-                netflow_sink.clone(),
-                hop_overrides,
-            ),
-        };
+        let mut prompt = rupu_agent::UserTurn::new(user_message);
         match resume_from.take() {
             None => {}
             // A failed run continued on another model: the note says why the
@@ -1325,20 +1083,58 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             Some((messages, seed_source, Some(stopped_on))) => {
                 let note = rupu_agent::recovery::recovery_retry_note(
                     &stopped_on.title,
-                    &opts.provider_name,
-                    &opts.model,
+                    &prepared.provider_name,
+                    &prepared.model,
                 );
                 rupu_agent::continuation::apply_continuation_with(
-                    &mut opts,
+                    &mut prompt,
                     messages,
                     seed_source,
                     note,
                 );
             }
             Some((messages, seed_source, None)) => {
-                rupu_agent::continuation::apply_continuation(&mut opts, messages, seed_source);
+                rupu_agent::continuation::apply_continuation(&mut prompt, messages, seed_source);
             }
         }
+
+        let launch = rupu_runtime::assembly::LaunchSpec {
+            agent: spec.clone(),
+            origin,
+            run_id: run_id.clone(),
+            transcript_path: transcript_path.clone(),
+            codename: Some(codename.to_string()),
+            prompt,
+            workspace,
+            mode: permission.mode(),
+            ceiling: None,
+            prompter: permission.prompter().cloned(),
+            overrides,
+            stream: rupu_agent::StreamOpts {
+                no_stream: args.no_stream,
+                // Suppress the agent runner's inline stdout writes; the CLI's
+                // line-stream printer reads tokens from the JSONL transcript
+                // instead. This prevents duplicate output when the printer is
+                // active and ensures clean output when stdout is piped.
+                suppress_stdout: true,
+                on_stream_event: None,
+            },
+            hooks: Default::default(),
+            pause: None,
+            services: rupu_runtime::assembly::LaunchServices {
+                dispatcher: Some(dispatcher),
+                netflow: Some(netflow_sink.clone()),
+                extra_tools: fleet_tools,
+                provider: Some(prepared),
+            },
+            collectors: fleet_collectors,
+        };
+        // A run that cannot be assembled (its grant fails) is a failed run:
+        // recorded in run.json like any other failure, not an early exit.
+        let assembled = assembler
+            .assemble(launch)
+            .await
+            .map_err(|e| e.into_run_error());
 
         // Spawn the agent in a background task and tail the transcript with
         // the line-stream printer while it runs.
@@ -1354,7 +1150,12 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         // since the agent is async and the printer is sync, we run the
         // printer in a background thread that polls the transcript while
         // the tokio task drives the agent.
-        let agent_task = tokio::spawn(rupu_agent::run_agent(opts));
+        let agent_task = tokio::spawn(async move {
+            match assembled {
+                Ok(run) => run.run().await.result,
+                Err(e) => Err(e),
+            }
+        });
 
         // Tail the transcript in this thread, reusing the printer from
         // the agent_header above so we don't construct a second
@@ -1534,6 +1335,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                 permission_mode: Some(mode_str.to_string()),
                 loop_progress: Default::default(),
                 gate_decisions: Vec::new(),
+                system_prompt_suffix: None,
                 codename: Some(codename.crew.clone()),
                 // The customer this run's config was layered with — recorded
                 // even when none (`null`), so a later assignment of the
@@ -1598,46 +1400,6 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     }
 
     body_result
-}
-
-/// The agent's model- and provider-specific settings, as they apply to this
-/// run: a `--model` onto another model drops the agent's limit pins and its
-/// model-specific Anthropic settings — `contextWindow`, `anthropicSpeed`,
-/// `anthropicTaskBudget`, `anthropicContextManagement` (each exists only on
-/// some models — the rule a fallback hop follows; `effort` is
-/// provider-generic and stays); a `--provider` onto another provider drops
-/// its `auth:`.
-#[derive(Debug)]
-struct AgentPins {
-    limits: rupu_runtime::model_limits::LimitOverrides,
-    context_window: Option<rupu_providers::model_tier::ContextWindow>,
-    anthropic_speed: Option<rupu_providers::types::Speed>,
-    anthropic_task_budget: Option<u32>,
-    anthropic_context_management: Option<rupu_providers::types::ContextManagement>,
-    auth: Option<rupu_providers::AuthMode>,
-}
-
-impl AgentPins {
-    fn for_run(spec: &rupu_agent::AgentSpec, other_provider: bool, other_model: bool) -> Self {
-        Self {
-            limits: if other_model {
-                rupu_runtime::model_limits::LimitOverrides::default()
-            } else {
-                rupu_runtime::model_limits::LimitOverrides::from_spec(spec)
-            },
-            context_window: if other_model {
-                None
-            } else {
-                spec.context_window
-            },
-            anthropic_speed: spec.anthropic_speed.filter(|_| !other_model),
-            anthropic_task_budget: spec.anthropic_task_budget.filter(|_| !other_model),
-            anthropic_context_management: spec
-                .anthropic_context_management
-                .filter(|_| !other_model),
-            auth: if other_provider { None } else { spec.auth },
-        }
-    }
 }
 
 /// What `rupu run --continue` picks up: the rebuilt conversation, the
@@ -1991,62 +1753,6 @@ mod tests {
         parse_launch_args(argv.iter().map(|s| s.to_string()).collect())
     }
 
-    fn pinned_spec() -> rupu_agent::AgentSpec {
-        rupu_agent::AgentSpec::parse(
-            "---\nname: pinned\nprovider: anthropic\nmodel: claude-sonnet-4-6\nauth: api-key\n\
-             contextWindow: 1m\nanthropicSpeed: fast\nanthropicTaskBudget: 40000\n\
-             anthropicContextManagement: tool_clearing\neffort: high\nmaxTokens: 777\ncontextWindowTokens: 9000\n\
-             ---\nhi\n",
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn agent_pins_follow_the_agents_own_model_and_provider() {
-        let spec = pinned_spec();
-        let own = AgentPins::for_run(&spec, false, false);
-        assert_eq!(own.limits.max_tokens, Some(777));
-        assert_eq!(own.limits.context_window_tokens, Some(9000));
-        assert!(own.context_window.is_some());
-        assert_eq!(
-            own.anthropic_speed,
-            Some(rupu_providers::types::Speed::Fast)
-        );
-        assert_eq!(own.anthropic_task_budget, Some(40_000));
-        assert_eq!(
-            own.anthropic_context_management,
-            Some(rupu_providers::types::ContextManagement::ToolClearing)
-        );
-        assert_eq!(own.auth, Some(rupu_providers::AuthMode::ApiKey));
-
-        let other_model = AgentPins::for_run(&spec, false, true);
-        assert_eq!(other_model.limits.max_tokens, None);
-        assert_eq!(other_model.limits.context_window_tokens, None);
-        assert_eq!(other_model.context_window, None);
-        assert_eq!(
-            other_model.anthropic_speed, None,
-            "fast mode exists only on some models"
-        );
-        assert_eq!(other_model.anthropic_task_budget, None);
-        assert_eq!(other_model.anthropic_context_management, None);
-        assert!(
-            spec.effort.is_some(),
-            "effort is provider-generic; AgentPins never carries it"
-        );
-        assert_eq!(other_model.auth, Some(rupu_providers::AuthMode::ApiKey));
-
-        let other_provider = AgentPins::for_run(&spec, true, false);
-        assert_eq!(other_provider.auth, None);
-        assert_eq!(other_provider.limits.max_tokens, Some(777));
-        assert_eq!(
-            other_provider.anthropic_speed,
-            Some(rupu_providers::types::Speed::Fast),
-            "the same model on another provider keeps its pins"
-        );
-        assert_eq!(other_provider.anthropic_task_budget, Some(40_000));
-        assert!(other_provider.anthropic_context_management.is_some());
-    }
-
     #[test]
     fn findings_profile_flag_parses_in_either_position() {
         use rupu_coverage::FindingProfile::{Full, Summary};
@@ -2090,29 +1796,9 @@ mod tests {
     }
 
     #[test]
-    fn fleet_attachment_scopes_to_the_run_dir_and_brings_the_board() {
-        let tmp = tempfile::tempdir().unwrap();
-        let run_dir = tmp.path().join("agentiflows").join("af_01TEST");
-        let a = fleet_attachment(&run_dir, "unit-x");
-        assert_eq!(a.scope_name, "af_01TEST");
-        let names: Vec<_> = a.extra_tools.iter().map(|t| t.name()).collect();
-        assert!(names.contains(&"board.post"), "{names:?}");
-        assert!(!a.collectors.is_empty());
-    }
-
-    #[test]
     fn findings_profile_flag_rejects_an_unknown_profile() {
         let err = launch_args(&["sec", "--findings-profile", "brief"]).unwrap_err();
         assert!(err.to_string().contains("`full` or `summary`"), "{err}");
-    }
-
-    #[test]
-    fn findings_profile_flag_beats_the_agent_frontmatter() {
-        use rupu_coverage::FindingProfile::{Full, Summary};
-        assert_eq!(resolve_findings_profile(Some(Full), Some(Summary)), Full);
-        assert_eq!(resolve_findings_profile(Some(Summary), Some(Full)), Summary);
-        assert_eq!(resolve_findings_profile(None, Some(Summary)), Summary);
-        assert_eq!(resolve_findings_profile(None, None), Full);
     }
 
     fn usage_event(
@@ -2341,6 +2027,7 @@ mod tests {
             permission_mode: None,
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
+            system_prompt_suffix: None,
             codename: None,
             cause: None,
         };

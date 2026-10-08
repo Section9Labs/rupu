@@ -1,7 +1,6 @@
 use rupu_agent::runner::{CapturingMockProvider, ScriptedTurn};
 use rupu_agent::{run_agent, AgentRunOpts};
 use rupu_providers::types::StopReason;
-use rupu_tools::ToolContext;
 
 #[tokio::test]
 async fn run_passes_all_default_tools_to_provider() {
@@ -14,56 +13,49 @@ async fn run_passes_all_default_tools_to_provider() {
     let captured = provider.captured.clone();
 
     let tmp = assert_fs::TempDir::new().unwrap();
-    let opts = AgentRunOpts {
-        seed_source: None,
-        collectors: Vec::new(),
-        extra_tools: Vec::new(),
-        step_actions: Vec::new(),
-        alias_scope: Default::default(),
-        agent_name: "all-tools".into(),
-        agent_system_prompt: "test".into(),
-        // None = the default grant. With no sub-agent dispatcher in this
-        // run, the dispatch pair isn't offered: just the core tools.
-        agent_tools: None,
-        provider: Box::new(provider),
-        provider_name: "mock".into(),
-        model: "mock-1".into(),
-        run_id: "run_test_tools".into(),
-        workspace_id: "ws_test".into(),
-        workspace_path: tmp.path().to_path_buf(),
-        transcript_path: tmp.path().join("run.jsonl"),
-        max_turns: 5,
-        permission: rupu_tools::PermissionPolicy::bypass(),
-        tool_context: ToolContext::default(),
-        user_message: "go".into(),
-        initial_messages: Vec::new(),
-        turn_index_offset: 0,
-        no_stream: false,
-        suppress_stream_stdout: false,
-        mcp_registry: None,
-        effort: None,
-        thinking_display: None,
-        context_window: None,
-        output_format: None,
-        output_schema: None,
-        anthropic_task_budget: None,
-        anthropic_context_management: None,
-        anthropic_speed: None,
-        parent_run_id: None,
-        depth: 0,
-        dispatchable_agents: None,
-        step_id: String::new(),
-        on_tool_call: None,
-        on_stream_event: None,
-        on_usage: None,
-        concerns: None,
-        limits: rupu_providers::model_limits::ModelLimits::unknown(),
-        scope_name: None,
-        surface_tag: None,
-        pause: None,
-        codename: None,
-        recovery: Default::default(),
-    };
+    let opts = rupu_agent::grant::with_grant(
+        AgentRunOpts {
+            system_prompt: "test".into(),
+            prompt: rupu_agent::UserTurn::new("go"),
+            provider: Box::new(provider),
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
+            recovery: Default::default(),
+            permission: rupu_tools::PermissionPolicy::bypass(),
+            grant: Default::default(),
+            alias_scope: Default::default(),
+            tool_context: rupu_tools::ToolContext {
+                identity: std::sync::Arc::new(rupu_tools::RunIdentity {
+                    agent: "all-tools".into(),
+                    provider: "mock".into(),
+                    model: "mock-1".into(),
+                    run_id: "run_test_tools".into(),
+                    ..Default::default()
+                }),
+                workspace: rupu_tools::WorkspaceScope {
+                    id: "ws_test".into(),
+                    path: tmp.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            pins: Default::default(),
+            concerns: None,
+            max_turns: 5,
+            stream: rupu_agent::StreamOpts {
+                no_stream: false,
+                suppress_stdout: false,
+                on_stream_event: None,
+            },
+            hooks: Default::default(),
+            pause: None,
+            collectors: Vec::new(),
+            extra_tools: Vec::new(),
+            transcript_path: tmp.path().join("run.jsonl"),
+        },
+        None,
+        &Vec::new(),
+    )
+    .expect("grant");
 
     run_agent(opts).await.unwrap();
 
@@ -116,54 +108,49 @@ async fn run_with_agent_tools_filter_passes_only_listed_tools() {
     let captured = provider.captured.clone();
 
     let tmp = assert_fs::TempDir::new().unwrap();
-    let opts = AgentRunOpts {
-        seed_source: None,
-        collectors: Vec::new(),
-        extra_tools: Vec::new(),
-        step_actions: Vec::new(),
-        alias_scope: Default::default(),
-        agent_name: "subset".into(),
-        agent_system_prompt: "test".into(),
-        agent_tools: Some(vec!["bash".into(), "read_file".into()]),
-        provider: Box::new(provider),
-        provider_name: "mock".into(),
-        model: "mock-1".into(),
-        run_id: "run_test_subset".into(),
-        workspace_id: "ws_test".into(),
-        workspace_path: tmp.path().to_path_buf(),
-        transcript_path: tmp.path().join("run.jsonl"),
-        max_turns: 5,
-        permission: rupu_tools::PermissionPolicy::bypass(),
-        tool_context: ToolContext::default(),
-        user_message: "go".into(),
-        initial_messages: Vec::new(),
-        turn_index_offset: 0,
-        no_stream: false,
-        suppress_stream_stdout: false,
-        mcp_registry: None,
-        effort: None,
-        thinking_display: None,
-        context_window: None,
-        output_format: None,
-        output_schema: None,
-        anthropic_task_budget: None,
-        anthropic_context_management: None,
-        anthropic_speed: None,
-        parent_run_id: None,
-        depth: 0,
-        dispatchable_agents: None,
-        step_id: String::new(),
-        on_tool_call: None,
-        on_stream_event: None,
-        on_usage: None,
-        concerns: None,
-        limits: rupu_providers::model_limits::ModelLimits::unknown(),
-        scope_name: None,
-        surface_tag: None,
-        pause: None,
-        codename: None,
-        recovery: Default::default(),
-    };
+    let opts = rupu_agent::grant::with_grant(
+        AgentRunOpts {
+            system_prompt: "test".into(),
+            prompt: rupu_agent::UserTurn::new("go"),
+            provider: Box::new(provider),
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
+            recovery: Default::default(),
+            permission: rupu_tools::PermissionPolicy::bypass(),
+            grant: Default::default(),
+            alias_scope: Default::default(),
+            tool_context: rupu_tools::ToolContext {
+                identity: std::sync::Arc::new(rupu_tools::RunIdentity {
+                    agent: "subset".into(),
+                    provider: "mock".into(),
+                    model: "mock-1".into(),
+                    run_id: "run_test_subset".into(),
+                    ..Default::default()
+                }),
+                workspace: rupu_tools::WorkspaceScope {
+                    id: "ws_test".into(),
+                    path: tmp.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            pins: Default::default(),
+            concerns: None,
+            max_turns: 5,
+            stream: rupu_agent::StreamOpts {
+                no_stream: false,
+                suppress_stdout: false,
+                on_stream_event: None,
+            },
+            hooks: Default::default(),
+            pause: None,
+            collectors: Vec::new(),
+            extra_tools: Vec::new(),
+            transcript_path: tmp.path().join("run.jsonl"),
+        },
+        (Some(vec!["bash".into(), "read_file".into()])).as_deref(),
+        &Vec::new(),
+    )
+    .expect("grant");
 
     run_agent(opts).await.unwrap();
 

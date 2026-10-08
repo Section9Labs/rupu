@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use rupu_agent::runner::{MockProvider, ScriptedTurn};
-use rupu_agent::AgentRunOpts;
+use rupu_agent::LegacyRunOpts;
 use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts, StepFactory};
 use rupu_orchestrator::Workflow;
 use rupu_providers::types::StopReason;
@@ -38,7 +38,7 @@ impl StepFactory for FakeFactory {
         workspace_path: std::path::PathBuf,
         transcript_path: std::path::PathBuf,
         on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> AgentRunOpts {
+    ) -> LegacyRunOpts {
         // Produce a single assistant text turn that echoes the
         // rendered prompt + records which (parent step, sub agent)
         // pair dispatched it. Tests assert against this output.
@@ -48,7 +48,7 @@ impl StepFactory for FakeFactory {
             input_tokens: 1,
             output_tokens: 1,
         }]);
-        AgentRunOpts {
+        LegacyRunOpts {
             seed_source: None,
             collectors: Vec::new(),
             extra_tools: Vec::new(),
@@ -513,7 +513,7 @@ impl StepFactory for FailingFactory {
         workspace_path: std::path::PathBuf,
         transcript_path: std::path::PathBuf,
         on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> AgentRunOpts {
+    ) -> LegacyRunOpts {
         let turn = if rendered_prompt.contains("FAIL") {
             ScriptedTurn::ProviderError("simulated failure for fan-out test".into())
         } else {
@@ -525,7 +525,7 @@ impl StepFactory for FailingFactory {
             }
         };
         let provider = MockProvider::new(vec![turn]);
-        AgentRunOpts {
+        LegacyRunOpts {
             seed_source: None,
             collectors: Vec::new(),
             extra_tools: Vec::new(),
@@ -1312,7 +1312,7 @@ impl StepFactory for PanelFactory {
         workspace_path: std::path::PathBuf,
         transcript_path: std::path::PathBuf,
         on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> AgentRunOpts {
+    ) -> LegacyRunOpts {
         // Hand-built JSON keyed by agent name. security-reviewer
         // emits one HIGH; perf-reviewer emits one MEDIUM with
         // surrounding prose (tests the loose-parser fallback);
@@ -1336,7 +1336,7 @@ impl StepFactory for PanelFactory {
             input_tokens: 1,
             output_tokens: 1,
         }]);
-        AgentRunOpts {
+        LegacyRunOpts {
             seed_source: None,
             collectors: Vec::new(),
             extra_tools: Vec::new(),
@@ -1577,7 +1577,7 @@ impl StepFactory for LoopingPanelFactory {
         workspace_path: std::path::PathBuf,
         transcript_path: std::path::PathBuf,
         on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> AgentRunOpts {
+    ) -> LegacyRunOpts {
         let invocation = {
             let mut map = self.calls.lock().unwrap();
             let n = map.entry(agent_name.to_string()).or_insert(0);
@@ -1605,7 +1605,7 @@ impl StepFactory for LoopingPanelFactory {
             input_tokens: 1,
             output_tokens: 1,
         }]);
-        AgentRunOpts {
+        LegacyRunOpts {
             seed_source: None,
             collectors: Vec::new(),
             extra_tools: Vec::new(),
@@ -2144,7 +2144,7 @@ impl StepFactory for RecordingFailingFactory {
         workspace_path: std::path::PathBuf,
         transcript_path: std::path::PathBuf,
         on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> AgentRunOpts {
+    ) -> LegacyRunOpts {
         self.seen.lock().unwrap().push(rendered_prompt.clone());
         let turn = if rendered_prompt.contains("FAIL") {
             ScriptedTurn::ProviderError("simulated failure for resume test".into())
@@ -2157,7 +2157,7 @@ impl StepFactory for RecordingFailingFactory {
             }
         };
         let provider = MockProvider::new(vec![turn]);
-        AgentRunOpts {
+        LegacyRunOpts {
             seed_source: None,
             collectors: Vec::new(),
             extra_tools: Vec::new(),

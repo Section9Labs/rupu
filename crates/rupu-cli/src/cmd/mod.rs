@@ -16,7 +16,6 @@ pub mod cp;
 pub mod create_common;
 pub mod cron;
 pub mod customer;
-pub mod dispatch;
 pub mod editor;
 pub mod features_helper;
 pub mod fleet;

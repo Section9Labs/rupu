@@ -46,57 +46,47 @@ async fn agent_run_with_concerns_writes_catalog_snapshot() {
     }]);
     let captured = provider.captured.clone();
 
-    let opts = AgentRunOpts {
-        seed_source: None,
-        collectors: Vec::new(),
-        extra_tools: Vec::new(),
-        step_actions: Vec::new(),
-        alias_scope: Default::default(),
-        agent_name: "test-agent".into(),
-        agent_system_prompt: "You are a coverage agent.".into(),
-        agent_tools: None,
-        provider: Box::new(provider),
-        provider_name: "mock".into(),
-        model: "mock-1".into(),
-        run_id: "run_cov_test".into(),
-        workspace_id: "ws_cov_test".into(),
-        workspace_path: workspace.clone(),
-        transcript_path: workspace.join("run.jsonl"),
-        max_turns: 5,
-        permission: rupu_tools::PermissionPolicy::bypass(),
-        tool_context: ToolContext {
-            workspace_path: workspace.clone(),
-            ..Default::default()
+    let opts = rupu_agent::grant::with_grant(
+        AgentRunOpts {
+            system_prompt: "You are a coverage agent.".into(),
+            prompt: rupu_agent::UserTurn::new("Check coverage."),
+            provider: Box::new(provider),
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
+            recovery: Default::default(),
+            permission: rupu_tools::PermissionPolicy::bypass(),
+            grant: Default::default(),
+            alias_scope: Default::default(),
+            tool_context: {
+                let mut tc = ToolContext::in_workspace(workspace.clone());
+                tc.identity = std::sync::Arc::new(rupu_tools::RunIdentity {
+                    agent: "test-agent".into(),
+                    provider: "mock".into(),
+                    model: "mock-1".into(),
+                    run_id: "run_cov_test".into(),
+                    ..Default::default()
+                });
+                tc.workspace.id = "ws_cov_test".into();
+                tc.workspace.path = workspace.clone();
+                tc
+            },
+            pins: Default::default(),
+            concerns: Some(stride_block()),
+            max_turns: 5,
+            stream: rupu_agent::StreamOpts {
+                no_stream: true,
+                suppress_stdout: false,
+                on_stream_event: None,
+            },
+            hooks: Default::default(),
+            pause: None,
+            collectors: Vec::new(),
+            extra_tools: Vec::new(),
+            transcript_path: workspace.join("run.jsonl"),
         },
-        user_message: "Check coverage.".into(),
-        initial_messages: Vec::new(),
-        turn_index_offset: 0,
-        no_stream: true,
-        suppress_stream_stdout: false,
-        mcp_registry: None,
-        effort: None,
-        thinking_display: None,
-        context_window: None,
-        output_format: None,
-        output_schema: None,
-        anthropic_task_budget: None,
-        anthropic_context_management: None,
-        anthropic_speed: None,
-        parent_run_id: None,
-        depth: 0,
-        dispatchable_agents: None,
-        step_id: String::new(),
-        on_tool_call: None,
-        on_stream_event: None,
-        on_usage: None,
-        concerns: Some(stride_block()),
-        scope_name: None,
-        limits: rupu_providers::model_limits::ModelLimits::unknown(),
-        surface_tag: None,
-        pause: None,
-        codename: None,
-        recovery: Default::default(),
-    };
+        None,
+        &Vec::new(),
+    )
+    .expect("grant");
 
     run_agent(opts).await.expect("agent run should succeed");
 
@@ -163,57 +153,47 @@ async fn agent_run_without_concerns_does_not_inject_coverage_tools() {
     }]);
     let captured = provider.captured.clone();
 
-    let opts = AgentRunOpts {
-        seed_source: None,
-        collectors: Vec::new(),
-        extra_tools: Vec::new(),
-        step_actions: Vec::new(),
-        alias_scope: Default::default(),
-        agent_name: "plain-agent".into(),
-        agent_system_prompt: "You are a plain agent.".into(),
-        agent_tools: None,
-        provider: Box::new(provider),
-        provider_name: "mock".into(),
-        model: "mock-1".into(),
-        run_id: "run_plain_test".into(),
-        workspace_id: "ws_plain".into(),
-        workspace_path: workspace.clone(),
-        transcript_path: workspace.join("run.jsonl"),
-        max_turns: 5,
-        permission: rupu_tools::PermissionPolicy::bypass(),
-        tool_context: ToolContext {
-            workspace_path: workspace.clone(),
-            ..Default::default()
+    let opts = rupu_agent::grant::with_grant(
+        AgentRunOpts {
+            system_prompt: "You are a plain agent.".into(),
+            prompt: rupu_agent::UserTurn::new("Do nothing."),
+            provider: Box::new(provider),
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
+            recovery: Default::default(),
+            permission: rupu_tools::PermissionPolicy::bypass(),
+            grant: Default::default(),
+            alias_scope: Default::default(),
+            tool_context: {
+                let mut tc = ToolContext::in_workspace(workspace.clone());
+                tc.identity = std::sync::Arc::new(rupu_tools::RunIdentity {
+                    agent: "plain-agent".into(),
+                    provider: "mock".into(),
+                    model: "mock-1".into(),
+                    run_id: "run_plain_test".into(),
+                    ..Default::default()
+                });
+                tc.workspace.id = "ws_plain".into();
+                tc.workspace.path = workspace.clone();
+                tc
+            },
+            pins: Default::default(),
+            concerns: None,
+            max_turns: 5,
+            stream: rupu_agent::StreamOpts {
+                no_stream: true,
+                suppress_stdout: false,
+                on_stream_event: None,
+            },
+            hooks: Default::default(),
+            pause: None,
+            collectors: Vec::new(),
+            extra_tools: Vec::new(),
+            transcript_path: workspace.join("run.jsonl"),
         },
-        user_message: "Do nothing.".into(),
-        initial_messages: Vec::new(),
-        turn_index_offset: 0,
-        no_stream: true,
-        suppress_stream_stdout: false,
-        mcp_registry: None,
-        effort: None,
-        thinking_display: None,
-        context_window: None,
-        output_format: None,
-        output_schema: None,
-        anthropic_task_budget: None,
-        anthropic_context_management: None,
-        anthropic_speed: None,
-        parent_run_id: None,
-        depth: 0,
-        dispatchable_agents: None,
-        step_id: String::new(),
-        on_tool_call: None,
-        on_stream_event: None,
-        on_usage: None,
-        concerns: None,
-        scope_name: None,
-        limits: rupu_providers::model_limits::ModelLimits::unknown(),
-        surface_tag: None,
-        pause: None,
-        codename: None,
-        recovery: Default::default(),
-    };
+        None,
+        &Vec::new(),
+    )
+    .expect("grant");
 
     run_agent(opts).await.expect("agent run should succeed");
 
@@ -240,57 +220,47 @@ async fn agent_run_with_concerns_injects_catalog_into_system_prompt() {
     }]);
     let captured = provider.captured.clone();
 
-    let opts = AgentRunOpts {
-        seed_source: None,
-        collectors: Vec::new(),
-        extra_tools: Vec::new(),
-        step_actions: Vec::new(),
-        alias_scope: Default::default(),
-        agent_name: "prompt-check-agent".into(),
-        agent_system_prompt: "Base prompt.".into(),
-        agent_tools: None,
-        provider: Box::new(provider),
-        provider_name: "mock".into(),
-        model: "mock-1".into(),
-        run_id: "run_prompt_check".into(),
-        workspace_id: "ws_prompt".into(),
-        workspace_path: workspace.clone(),
-        transcript_path: workspace.join("run.jsonl"),
-        max_turns: 5,
-        permission: rupu_tools::PermissionPolicy::bypass(),
-        tool_context: ToolContext {
-            workspace_path: workspace.clone(),
-            ..Default::default()
+    let opts = rupu_agent::grant::with_grant(
+        AgentRunOpts {
+            system_prompt: "Base prompt.".into(),
+            prompt: rupu_agent::UserTurn::new("check prompt"),
+            provider: Box::new(provider),
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
+            recovery: Default::default(),
+            permission: rupu_tools::PermissionPolicy::bypass(),
+            grant: Default::default(),
+            alias_scope: Default::default(),
+            tool_context: {
+                let mut tc = ToolContext::in_workspace(workspace.clone());
+                tc.identity = std::sync::Arc::new(rupu_tools::RunIdentity {
+                    agent: "prompt-check-agent".into(),
+                    provider: "mock".into(),
+                    model: "mock-1".into(),
+                    run_id: "run_prompt_check".into(),
+                    ..Default::default()
+                });
+                tc.workspace.id = "ws_prompt".into();
+                tc.workspace.path = workspace.clone();
+                tc
+            },
+            pins: Default::default(),
+            concerns: Some(stride_block()),
+            max_turns: 5,
+            stream: rupu_agent::StreamOpts {
+                no_stream: true,
+                suppress_stdout: false,
+                on_stream_event: None,
+            },
+            hooks: Default::default(),
+            pause: None,
+            collectors: Vec::new(),
+            extra_tools: Vec::new(),
+            transcript_path: workspace.join("run.jsonl"),
         },
-        user_message: "check prompt".into(),
-        initial_messages: Vec::new(),
-        turn_index_offset: 0,
-        no_stream: true,
-        suppress_stream_stdout: false,
-        mcp_registry: None,
-        effort: None,
-        thinking_display: None,
-        context_window: None,
-        output_format: None,
-        output_schema: None,
-        anthropic_task_budget: None,
-        anthropic_context_management: None,
-        anthropic_speed: None,
-        parent_run_id: None,
-        depth: 0,
-        dispatchable_agents: None,
-        step_id: String::new(),
-        on_tool_call: None,
-        on_stream_event: None,
-        on_usage: None,
-        concerns: Some(stride_block()),
-        scope_name: None,
-        limits: rupu_providers::model_limits::ModelLimits::unknown(),
-        surface_tag: None,
-        pause: None,
-        codename: None,
-        recovery: Default::default(),
-    };
+        None,
+        &Vec::new(),
+    )
+    .expect("grant");
 
     run_agent(opts).await.expect("agent run should succeed");
 
@@ -326,59 +296,48 @@ async fn surface_tag_override_is_respected() {
         output_tokens: 1,
     }]);
 
-    let opts = AgentRunOpts {
-        seed_source: None,
-        collectors: Vec::new(),
-        extra_tools: Vec::new(),
-        step_actions: Vec::new(),
-        alias_scope: Default::default(),
-        agent_name: "workflow-step-agent".into(),
-        agent_system_prompt: "You are a workflow step agent.".into(),
-        agent_tools: None,
-        provider: Box::new(provider),
-        provider_name: "mock".into(),
-        model: "mock-1".into(),
-        run_id: "run_surface_tag_test".into(),
-        workspace_id: "ws_surface_test".into(),
-        workspace_path: workspace.clone(),
-        transcript_path: workspace.join("run.jsonl"),
-        max_turns: 5,
-        permission: rupu_tools::PermissionPolicy::bypass(),
-        tool_context: ToolContext {
-            workspace_path: workspace.clone(),
-            ..Default::default()
+    let opts = rupu_agent::grant::with_grant(
+        AgentRunOpts {
+            system_prompt: "You are a workflow step agent.".into(),
+            prompt: rupu_agent::UserTurn::new("Check coverage."),
+            provider: Box::new(provider),
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
+            recovery: Default::default(),
+            permission: rupu_tools::PermissionPolicy::bypass(),
+            grant: Default::default(),
+            alias_scope: Default::default(),
+            tool_context: {
+                let mut tc = ToolContext::in_workspace(workspace.clone());
+                tc.identity = std::sync::Arc::new(rupu_tools::RunIdentity {
+                    agent: "workflow-step-agent".into(),
+                    provider: "mock".into(),
+                    model: "mock-1".into(),
+                    run_id: "run_surface_tag_test".into(),
+                    surface: rupu_tools::Surface::Workflow,
+                    ..Default::default()
+                });
+                tc.workspace.id = "ws_surface_test".into();
+                tc.workspace.path = workspace.clone();
+                tc
+            },
+            pins: Default::default(),
+            concerns: Some(stride_block()),
+            max_turns: 5,
+            stream: rupu_agent::StreamOpts {
+                no_stream: true,
+                suppress_stdout: false,
+                on_stream_event: None,
+            },
+            hooks: Default::default(),
+            pause: None,
+            collectors: Vec::new(),
+            extra_tools: Vec::new(),
+            transcript_path: workspace.join("run.jsonl"),
         },
-        user_message: "Check coverage.".into(),
-        initial_messages: Vec::new(),
-        turn_index_offset: 0,
-        no_stream: true,
-        suppress_stream_stdout: false,
-        mcp_registry: None,
-        effort: None,
-        thinking_display: None,
-        context_window: None,
-        output_format: None,
-        output_schema: None,
-        anthropic_task_budget: None,
-        anthropic_context_management: None,
-        anthropic_speed: None,
-        parent_run_id: None,
-        depth: 0,
-        dispatchable_agents: None,
-        step_id: String::new(),
-        on_tool_call: None,
-        on_stream_event: None,
-        on_usage: None,
-        // Enable coverage so the runner's surface_tag assignment fires.
-        concerns: Some(stride_block()),
-        limits: rupu_providers::model_limits::ModelLimits::unknown(),
-        scope_name: None,
-        // This is the field under test: override to "workflow".
-        surface_tag: Some("workflow".to_string()),
-        pause: None,
-        codename: None,
-        recovery: Default::default(),
-    };
+        None,
+        &Vec::new(),
+    )
+    .expect("grant");
 
     // The run must complete cleanly — confirms the surface_tag override
     // doesn't break the runner's coverage wiring path.
@@ -408,57 +367,47 @@ async fn agent_run_with_index_mode_concerns_injects_search_and_detail_tools() {
     }]);
     let captured = provider.captured.clone();
 
-    let opts = AgentRunOpts {
-        seed_source: None,
-        collectors: Vec::new(),
-        extra_tools: Vec::new(),
-        step_actions: Vec::new(),
-        alias_scope: Default::default(),
-        agent_name: "index-mode-agent".into(),
-        agent_system_prompt: "You are a coverage index agent.".into(),
-        agent_tools: None,
-        provider: Box::new(provider),
-        provider_name: "mock".into(),
-        model: "mock-1".into(),
-        run_id: "run_index_mode_test".into(),
-        workspace_id: "ws_index_mode".into(),
-        workspace_path: workspace.clone(),
-        transcript_path: workspace.join("run.jsonl"),
-        max_turns: 5,
-        permission: rupu_tools::PermissionPolicy::bypass(),
-        tool_context: ToolContext {
-            workspace_path: workspace.clone(),
-            ..Default::default()
+    let opts = rupu_agent::grant::with_grant(
+        AgentRunOpts {
+            system_prompt: "You are a coverage index agent.".into(),
+            prompt: rupu_agent::UserTurn::new("Check coverage in index mode."),
+            provider: Box::new(provider),
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
+            recovery: Default::default(),
+            permission: rupu_tools::PermissionPolicy::bypass(),
+            grant: Default::default(),
+            alias_scope: Default::default(),
+            tool_context: {
+                let mut tc = ToolContext::in_workspace(workspace.clone());
+                tc.identity = std::sync::Arc::new(rupu_tools::RunIdentity {
+                    agent: "index-mode-agent".into(),
+                    provider: "mock".into(),
+                    model: "mock-1".into(),
+                    run_id: "run_index_mode_test".into(),
+                    ..Default::default()
+                });
+                tc.workspace.id = "ws_index_mode".into();
+                tc.workspace.path = workspace.clone();
+                tc
+            },
+            pins: Default::default(),
+            concerns: Some(stride_index_block()),
+            max_turns: 5,
+            stream: rupu_agent::StreamOpts {
+                no_stream: true,
+                suppress_stdout: false,
+                on_stream_event: None,
+            },
+            hooks: Default::default(),
+            pause: None,
+            collectors: Vec::new(),
+            extra_tools: Vec::new(),
+            transcript_path: workspace.join("run.jsonl"),
         },
-        user_message: "Check coverage in index mode.".into(),
-        initial_messages: Vec::new(),
-        turn_index_offset: 0,
-        no_stream: true,
-        suppress_stream_stdout: false,
-        mcp_registry: None,
-        effort: None,
-        thinking_display: None,
-        context_window: None,
-        output_format: None,
-        output_schema: None,
-        anthropic_task_budget: None,
-        anthropic_context_management: None,
-        anthropic_speed: None,
-        parent_run_id: None,
-        depth: 0,
-        dispatchable_agents: None,
-        step_id: String::new(),
-        on_tool_call: None,
-        on_stream_event: None,
-        on_usage: None,
-        concerns: Some(stride_index_block()),
-        scope_name: None,
-        limits: rupu_providers::model_limits::ModelLimits::unknown(),
-        surface_tag: None,
-        pause: None,
-        codename: None,
-        recovery: Default::default(),
-    };
+        None,
+        &Vec::new(),
+    )
+    .expect("grant");
 
     run_agent(opts)
         .await

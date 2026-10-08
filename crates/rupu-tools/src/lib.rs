@@ -61,7 +61,8 @@ pub use permission::{
 };
 pub use read_file::ReadFileTool;
 pub use tool::{
-    AgentDispatcher, DerivedEvent, DispatchError, DispatchOutcome, SpawnPermission, Tool,
-    ToolContext, ToolError, ToolOutput,
+    AgentDispatcher, BashConfig, CallContext, DerivedEvent, DispatchError, DispatchOutcome,
+    ParentLink, RunIdentity, SpawnPermission, Surface, Tool, ToolContext, ToolError, ToolOutput,
+    ToolServices, WorkspaceScope,
 };
 pub use write_file::WriteFileTool;

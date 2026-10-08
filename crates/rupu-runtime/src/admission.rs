@@ -20,6 +20,7 @@
 //! The [`Admission`] type itself is constructible with explicit limits and an
 //! injected [`MemoryProbe`] for direct unit testing, independent of the global.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -68,6 +69,9 @@ pub struct JobPermit {
     // Dropped (released) when the permit is dropped. `None` when no ceiling is
     // configured.
     _permit: Option<OwnedSemaphorePermit>,
+    // The slot this run lends its in-process children while it waits on
+    // them; withdrawn when the permit drops.
+    _lend: Option<LendGuard>,
     /// How long the call waited for a free slot under the ceiling.
     pub waited_for_slot: Duration,
     /// How long the call waited for system memory to reach the headroom floor.
@@ -96,6 +100,31 @@ pub struct Admission {
     probe: Arc<dyn MemoryProbe>,
     poll: Duration,
     max_wait: Duration,
+    /// Per running agent run (by run id), the slot it lends its in-process
+    /// children: see [`Admission::acquire_run`].
+    lends: Lends,
+}
+
+type Lends = Arc<Mutex<HashMap<String, Arc<Semaphore>>>>;
+
+/// Withdraws a run's lend when its permit drops — only the lend this permit
+/// registered, so a later run that reused the id keeps its own.
+struct LendGuard {
+    lends: Lends,
+    run_id: String,
+    lend: Arc<Semaphore>,
+}
+
+impl Drop for LendGuard {
+    fn drop(&mut self) {
+        if let Ok(mut m) = self.lends.lock() {
+            if m.get(&self.run_id)
+                .is_some_and(|l| Arc::ptr_eq(l, &self.lend))
+            {
+                m.remove(&self.run_id);
+            }
+        }
+    }
 }
 
 impl Admission {
@@ -108,6 +137,7 @@ impl Admission {
             probe: Arc::new(SystemMemoryProbe::default()),
             poll: WATCHDOG_POLL,
             max_wait: WATCHDOG_MAX_WAIT,
+            lends: Lends::default(),
         }
     }
 
@@ -140,6 +170,7 @@ impl Admission {
             probe,
             poll,
             max_wait,
+            lends: Lends::default(),
         }
     }
 
@@ -194,6 +225,64 @@ impl Admission {
 
         JobPermit {
             _permit: permit,
+            _lend: None,
+            waited_for_slot,
+            waited_for_memory,
+            memory_timed_out,
+        }
+    }
+
+    /// Acquire a slot for the agent run `run_id`, an in-process child of the
+    /// run `parent` when it has one (W3, R9: every origin goes through
+    /// admission).
+    ///
+    /// A parent blocked on an in-process child holds a slot it is not using,
+    /// so it lends that slot to its children: a child takes the lend when it
+    /// is free, else a free global slot, else whichever frees first. Without
+    /// the lend, `ceiling` parents each waiting on a child that waits for a
+    /// slot would deadlock. While this run holds its permit it lends a slot
+    /// to its own children in turn.
+    pub async fn acquire_run(&self, run_id: &str, parent: Option<&str>) -> JobPermit {
+        let Some(sem) = &self.ceiling else {
+            return self.acquire().await;
+        };
+        let lend = parent.and_then(|p| self.lends.lock().ok()?.get(p).cloned());
+        let try_lend = || {
+            lend.as_ref()
+                .and_then(|l| Arc::clone(l).try_acquire_owned().ok())
+        };
+        let (permit, waited_for_slot) = match try_lend() {
+            Some(p) => (p, Duration::ZERO),
+            None => match Arc::clone(sem).try_acquire_owned() {
+                Ok(p) => (p, Duration::ZERO),
+                Err(_) => {
+                    let start = Instant::now();
+                    let global = Arc::clone(sem).acquire_owned();
+                    let p = match &lend {
+                        Some(l) => tokio::select! {
+                            p = global => p,
+                            p = Arc::clone(l).acquire_owned() => p,
+                        },
+                        None => global.await,
+                    }
+                    .expect("admission semaphores are never closed");
+                    (p, start.elapsed())
+                }
+            },
+        };
+        let own_lend = Arc::new(Semaphore::new(1));
+        if let Ok(mut m) = self.lends.lock() {
+            m.insert(run_id.to_string(), Arc::clone(&own_lend));
+        }
+        let lend_guard = LendGuard {
+            lends: Arc::clone(&self.lends),
+            run_id: run_id.to_string(),
+            lend: own_lend,
+        };
+        let (waited_for_memory, memory_timed_out) = self.await_memory().await;
+        JobPermit {
+            _permit: Some(permit),
+            _lend: Some(lend_guard),
             waited_for_slot,
             waited_for_memory,
             memory_timed_out,
@@ -284,6 +373,12 @@ pub fn global() -> &'static Admission {
 /// Acquire a job slot from the process-global gate. See [`Admission::acquire`].
 pub async fn acquire() -> JobPermit {
     global().acquire().await
+}
+
+/// Acquire the process-global slot for agent run `run_id`, lending from its
+/// in-process `parent`. See [`Admission::acquire_run`].
+pub async fn acquire_run(run_id: &str, parent: Option<&str>) -> JobPermit {
+    global().acquire_run(run_id, parent).await
 }
 
 // ---- Platform memory probe ----------------------------------------------
@@ -401,6 +496,104 @@ fn read_available_bytes() -> Option<u64> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A parent holding the only slot can still run its in-process child:
+    /// the child borrows the parent's slot instead of waiting forever.
+    #[tokio::test]
+    async fn a_child_borrows_its_parents_slot_at_the_ceiling() {
+        let gate = Admission::with_probe(
+            1,
+            0,
+            FixedProbe::new(None, None),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        );
+        let parent = gate.acquire_run("run_parent", None).await;
+        let child = tokio::time::timeout(
+            Duration::from_secs(2),
+            gate.acquire_run("sub_child", Some("run_parent")),
+        )
+        .await
+        .expect("the child borrows the parent's slot");
+        assert!(!child.throttled());
+        // The grandchild borrows the child's.
+        let grandchild = tokio::time::timeout(
+            Duration::from_secs(2),
+            gate.acquire_run("sub_grandchild", Some("sub_child")),
+        )
+        .await
+        .expect("the grandchild borrows the child's slot");
+        drop(grandchild);
+        drop(child);
+        drop(parent);
+        assert!(gate.lends.lock().unwrap().is_empty(), "lends are withdrawn");
+    }
+
+    /// A permit withdraws only the lend it registered: a run that reused the
+    /// id keeps lending to its children after the older permit drops.
+    #[tokio::test]
+    async fn a_dropped_permit_never_withdraws_anothers_lend() {
+        let gate = Admission::with_probe(
+            2,
+            0,
+            FixedProbe::new(None, None),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        );
+        let old = gate.acquire_run("run_same", None).await;
+        let new = gate.acquire_run("run_same", None).await;
+        drop(old);
+        assert!(gate.lends.lock().unwrap().contains_key("run_same"));
+        drop(new);
+        assert!(gate.lends.lock().unwrap().is_empty());
+    }
+
+    /// Siblings share the one lend: the second waits for the first to finish.
+    #[tokio::test]
+    async fn siblings_share_the_lend() {
+        let gate = Arc::new(Admission::with_probe(
+            1,
+            0,
+            FixedProbe::new(None, None),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        ));
+        let _parent = gate.acquire_run("run_p", None).await;
+        let first = gate.acquire_run("sub_a", Some("run_p")).await;
+        let g = Arc::clone(&gate);
+        let second = tokio::spawn(async move { g.acquire_run("sub_b", Some("run_p")).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!second.is_finished(), "the lend is taken");
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .expect("the lend frees")
+            .unwrap();
+        assert!(second.throttled());
+    }
+
+    /// A run with no parent (or a parent that lends nothing) takes a global
+    /// slot, as `acquire` does.
+    #[tokio::test]
+    async fn a_top_level_run_waits_for_a_global_slot() {
+        let gate = Arc::new(Admission::with_probe(
+            1,
+            0,
+            FixedProbe::new(None, None),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        ));
+        let first = gate.acquire_run("run_1", None).await;
+        let g = Arc::clone(&gate);
+        let second = tokio::spawn(async move { g.acquire_run("run_2", Some("unknown")).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!second.is_finished());
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .expect("the slot frees")
+            .unwrap();
+    }
 
     /// A probe returning a fixed available/total, counting reads.
     struct FixedProbe {

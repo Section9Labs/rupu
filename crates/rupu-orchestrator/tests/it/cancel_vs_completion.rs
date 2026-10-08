@@ -8,7 +8,7 @@
 //! terminal flip, and the record must still say `Cancelled` afterwards.
 
 use async_trait::async_trait;
-use rupu_agent::AgentRunOpts;
+use rupu_agent::LegacyRunOpts;
 use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts, RunWorkflowError, StepFactory};
 use rupu_orchestrator::{RunStatus, RunStore, Workflow};
 use rupu_providers::types::{ContentBlock, LlmRequest, LlmResponse, Stop, StopReason, Usage};
@@ -96,8 +96,8 @@ impl StepFactory for Factory {
         workspace_path: std::path::PathBuf,
         transcript_path: std::path::PathBuf,
         on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> AgentRunOpts {
-        AgentRunOpts {
+    ) -> LegacyRunOpts {
+        LegacyRunOpts {
             seed_source: None,
             collectors: Vec::new(),
             extra_tools: Vec::new(),

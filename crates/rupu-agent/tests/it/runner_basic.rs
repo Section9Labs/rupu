@@ -15,54 +15,49 @@ async fn happy_path_one_turn_no_tools() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let transcript_path = tmp.path().join("run.jsonl");
 
-    let opts = AgentRunOpts {
-        seed_source: None,
-        collectors: Vec::new(),
-        extra_tools: Vec::new(),
-        step_actions: Vec::new(),
-        alias_scope: Default::default(),
-        agent_name: "noop".into(),
-        agent_system_prompt: "You are a noop agent.".into(),
-        agent_tools: None,
-        provider: Box::new(provider),
-        provider_name: "mock".into(),
-        model: "mock-1".into(),
-        run_id: "run_test1".into(),
-        workspace_id: "ws_test1".into(),
-        workspace_path: tmp.path().to_path_buf(),
-        transcript_path: transcript_path.clone(),
-        max_turns: 5,
-        permission: rupu_tools::PermissionPolicy::bypass(),
-        tool_context: ToolContext::default(),
-        user_message: "say hi".into(),
-        initial_messages: Vec::new(),
-        turn_index_offset: 0,
-        no_stream: false,
-        suppress_stream_stdout: false,
-        mcp_registry: None,
-        effort: None,
-        thinking_display: None,
-        context_window: None,
-        output_format: None,
-        output_schema: None,
-        anthropic_task_budget: None,
-        anthropic_context_management: None,
-        anthropic_speed: None,
-        parent_run_id: None,
-        depth: 0,
-        dispatchable_agents: None,
-        step_id: String::new(),
-        on_tool_call: None,
-        on_stream_event: None,
-        on_usage: None,
-        concerns: None,
-        limits: rupu_providers::model_limits::ModelLimits::unknown(),
-        scope_name: None,
-        surface_tag: None,
-        pause: None,
-        codename: None,
-        recovery: Default::default(),
-    };
+    let opts = rupu_agent::grant::with_grant(
+        AgentRunOpts {
+            system_prompt: "You are a noop agent.".into(),
+            prompt: rupu_agent::UserTurn::new("say hi"),
+            provider: Box::new(provider),
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
+            recovery: Default::default(),
+            permission: rupu_tools::PermissionPolicy::bypass(),
+            grant: Default::default(),
+            alias_scope: Default::default(),
+            tool_context: rupu_tools::ToolContext {
+                identity: std::sync::Arc::new(rupu_tools::RunIdentity {
+                    agent: "noop".into(),
+                    provider: "mock".into(),
+                    model: "mock-1".into(),
+                    run_id: "run_test1".into(),
+                    ..Default::default()
+                }),
+                workspace: rupu_tools::WorkspaceScope {
+                    id: "ws_test1".into(),
+                    path: tmp.path().to_path_buf(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            pins: Default::default(),
+            concerns: None,
+            max_turns: 5,
+            stream: rupu_agent::StreamOpts {
+                no_stream: false,
+                suppress_stdout: false,
+                on_stream_event: None,
+            },
+            hooks: Default::default(),
+            pause: None,
+            collectors: Vec::new(),
+            extra_tools: Vec::new(),
+            transcript_path: transcript_path.clone(),
+        },
+        None,
+        &Vec::new(),
+    )
+    .expect("grant");
 
     let res = run_agent(opts).await.unwrap();
     assert_eq!(res.turns, 1);
@@ -82,57 +77,53 @@ async fn run_start_records_the_tool_contexts_customer() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let transcript_path = tmp.path().join("run.jsonl");
 
-    let opts = AgentRunOpts {
-        seed_source: None,
-        collectors: Vec::new(),
-        extra_tools: Vec::new(),
-        step_actions: Vec::new(),
-        alias_scope: Default::default(),
-        agent_name: "noop".into(),
-        agent_system_prompt: "You are a noop agent.".into(),
-        agent_tools: None,
-        provider: Box::new(provider),
-        provider_name: "mock".into(),
-        model: "mock-1".into(),
-        run_id: "run_test1".into(),
-        workspace_id: "ws_test1".into(),
-        workspace_path: tmp.path().to_path_buf(),
-        transcript_path: transcript_path.clone(),
-        max_turns: 5,
-        permission: rupu_tools::PermissionPolicy::bypass(),
-        tool_context: ToolContext {
-            customer: Some("acme".into()),
-            ..ToolContext::default()
+    let opts = rupu_agent::grant::with_grant(
+        AgentRunOpts {
+            system_prompt: "You are a noop agent.".into(),
+            prompt: rupu_agent::UserTurn::new("say hi"),
+            provider: Box::new(provider),
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
+            recovery: Default::default(),
+            permission: rupu_tools::PermissionPolicy::bypass(),
+            grant: Default::default(),
+            alias_scope: Default::default(),
+            tool_context: {
+                let mut tc = ToolContext {
+                    services: rupu_tools::ToolServices {
+                        customer: Some("acme".into()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                tc.identity = std::sync::Arc::new(rupu_tools::RunIdentity {
+                    agent: "noop".into(),
+                    provider: "mock".into(),
+                    model: "mock-1".into(),
+                    run_id: "run_test1".into(),
+                    ..Default::default()
+                });
+                tc.workspace.id = "ws_test1".into();
+                tc.workspace.path = tmp.path().to_path_buf();
+                tc
+            },
+            pins: Default::default(),
+            concerns: None,
+            max_turns: 5,
+            stream: rupu_agent::StreamOpts {
+                no_stream: false,
+                suppress_stdout: false,
+                on_stream_event: None,
+            },
+            hooks: Default::default(),
+            pause: None,
+            collectors: Vec::new(),
+            extra_tools: Vec::new(),
+            transcript_path: transcript_path.clone(),
         },
-        user_message: "say hi".into(),
-        initial_messages: Vec::new(),
-        turn_index_offset: 0,
-        no_stream: false,
-        suppress_stream_stdout: false,
-        mcp_registry: None,
-        effort: None,
-        thinking_display: None,
-        context_window: None,
-        output_format: None,
-        output_schema: None,
-        anthropic_task_budget: None,
-        anthropic_context_management: None,
-        anthropic_speed: None,
-        parent_run_id: None,
-        depth: 0,
-        dispatchable_agents: None,
-        step_id: String::new(),
-        on_tool_call: None,
-        on_stream_event: None,
-        on_usage: None,
-        concerns: None,
-        limits: rupu_providers::model_limits::ModelLimits::unknown(),
-        scope_name: None,
-        surface_tag: None,
-        pause: None,
-        codename: None,
-        recovery: Default::default(),
-    };
+        None,
+        &Vec::new(),
+    )
+    .expect("grant");
 
     let res = run_agent(opts).await.unwrap();
     assert_eq!(res.turns, 1);

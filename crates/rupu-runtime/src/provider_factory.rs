@@ -222,20 +222,47 @@ pub fn resolve_kind(
     None
 }
 
+/// What an agent's frontmatter says about how it reaches a provider: its
+/// Anthropic settings. Applied to the run's provider and to every fallback
+/// hop, so the two cannot disagree.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AgentProviderSettings {
+    /// `anthropicOauthPrefix`.
+    pub oauth_prefix: Option<bool>,
+    /// `anthropicPromptCache`.
+    pub prompt_cache: Option<bool>,
+}
+
+impl ProviderConfig {
+    /// The config `provider` is built with for an agent: the account's
+    /// `[providers.<name>]` settings (openai-compatible endpoint, tuning,
+    /// vendor kind), the agent's own Anthropic settings, and
+    /// `[recovery].server_side_fallback` (`None` = the default, on). The one
+    /// constructor every launch and every fallback hop uses (W3, R10).
+    pub fn for_agent(
+        provider: &str,
+        providers: &std::collections::BTreeMap<String, rupu_config::ProviderConfig>,
+        agent: AgentProviderSettings,
+        server_side_fallback: Option<bool>,
+    ) -> Self {
+        ProviderConfig {
+            anthropic_oauth_system_prefix: agent.oauth_prefix,
+            anthropic_prompt_cache: agent.prompt_cache,
+            anthropic_server_side_fallback: server_side_fallback,
+            openai_compatible: openai_compatible_params(provider, providers),
+            tuning: Some(provider_tuning(provider, providers)),
+            kind: resolve_kind(provider, providers),
+        }
+    }
+}
+
 /// `ProviderConfig` for `name` with no agent-level overrides: what a bare
 /// model-listing call needs (spec 2026-09-30 §5).
 pub fn provider_config_for(
     name: &str,
     providers: &std::collections::BTreeMap<String, rupu_config::ProviderConfig>,
 ) -> ProviderConfig {
-    ProviderConfig {
-        anthropic_oauth_system_prefix: None,
-        anthropic_prompt_cache: None,
-        anthropic_server_side_fallback: None,
-        openai_compatible: openai_compatible_params(name, providers),
-        tuning: Some(provider_tuning(name, providers)),
-        kind: resolve_kind(name, providers),
-    }
+    ProviderConfig::for_agent(name, providers, AgentProviderSettings::default(), None)
 }
 
 /// [`resolve_kind`] for every declared `[providers.<name>]`, keyed by name.

@@ -25,28 +25,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::paths;
-
-/// Build the netflow sink for one run: a ledger writer rooted at
-/// [`paths::netflow_dir`] (project-local when `<project>/.rupu/netflow/`
-/// already exists, global otherwise — same rule as `transcripts_dir`, so
-/// a repo that was never `rupu init`'d never gets a ledger written inside
-/// it) plus a `TranscriptSink` streaming into this run's own transcript.
-///
-/// Best-effort — a ledger that cannot be opened logs at debug and the run
-/// continues with transcript-only capture. Capture must never break a
-/// run.
-///
-/// Returns the composed sink for the caller to hand to
-/// `provider_factory::build_for_provider_with_config` / `Registry::discover`
-/// / connector construction, plus the `NetflowWriterHandle` (when the
-/// ledger opened) so the caller can `shutdown()` it once the run is over
-/// for a prompt flush — the writer task's own periodic ticker is a safety
-/// net for long-running daemons, not a substitute for an explicit
-/// shutdown on a run/turn that may finish within milliseconds of the
-/// ticker's next tick. `None` means the ledger was unavailable
-/// (best-effort degrade to transcript-only capture); there is nothing to
-/// shut down.
+/// Build the netflow sink for one run — [`rupu_runtime::netflow::for_run`]
+/// (see there; the run assembler calls it for every run it builds).
 pub fn for_run(
     global: &Path,
     project_root: Option<&Path>,
@@ -56,22 +36,7 @@ pub fn for_run(
     Arc<dyn rupu_netflow::FlowSink>,
     Option<rupu_netflow::NetflowWriterHandle>,
 ) {
-    let netflow_dir = paths::netflow_dir(global, project_root);
-    let netflow_paths = rupu_netflow::NetflowPaths::for_run(&netflow_dir, run_id);
-    let mut sinks: Vec<Arc<dyn rupu_netflow::FlowSink>> = vec![Arc::new(
-        rupu_transcript::TranscriptSink::new(transcript_path.to_path_buf()),
-    )];
-    let handle = match rupu_netflow::NetflowWriterHandle::spawn(netflow_paths) {
-        Ok(handle) => {
-            sinks.push(handle.writer.clone());
-            Some(handle)
-        }
-        Err(e) => {
-            tracing::debug!(error = %e, run_id, "netflow ledger unavailable for this run");
-            None
-        }
-    };
-    (Arc::new(rupu_netflow::FanoutSink::new(sinks)), handle)
+    rupu_runtime::netflow::for_run(global, project_root, run_id, transcript_path)
 }
 
 /// The process's one subprocess network-capture backend, obtained OFF the

@@ -67,6 +67,7 @@ fn make_run(id: &str) -> RunRecord {
         final_output: None,
         loop_progress: Default::default(),
         gate_decisions: Vec::new(),
+        system_prompt_suffix: None,
         codename: None,
         cause: None,
     }

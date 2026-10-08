@@ -24,14 +24,15 @@ fn ctx_with_coverage(
     workspace: &std::path::Path,
     writer: Arc<rupu_coverage::CoverageWriter>,
 ) -> ToolContext {
-    ToolContext {
-        workspace_path: workspace.to_path_buf(),
-        coverage_writer: Some(writer),
-        surface_tag: Some("agent".to_string()),
-        run_id: Some("run_test_01".to_string()),
-        model: Some("test-model".to_string()),
+    let mut ctx = ToolContext::in_workspace(workspace);
+    ctx.services.coverage_writer = Some(writer);
+    *ctx.identity_mut() = rupu_tools::RunIdentity {
+        run_id: "run_test_01".to_string(),
+        model: "test-model".to_string(),
+        surface: rupu_tools::Surface::Agent,
         ..Default::default()
-    }
+    };
+    ctx
 }
 
 /// Read all `FileTouchEvent`s from the `files.jsonl` ledger.
@@ -120,10 +121,7 @@ async fn read_file_no_event_without_coverage_writer() {
     std::fs::write(workspace.path().join("hi.txt"), "hello\n").unwrap();
 
     // ToolContext without a coverage_writer — confirm the tool still works.
-    let ctx = ToolContext {
-        workspace_path: workspace.path().to_path_buf(),
-        ..Default::default()
-    };
+    let ctx = ToolContext::in_workspace(workspace.path());
     let tool = ReadFileTool;
     let out = tool
         .invoke(json!({ "path": "hi.txt" }), &ctx)

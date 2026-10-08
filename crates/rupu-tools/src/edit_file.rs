@@ -74,8 +74,8 @@ impl Tool for EditFileTool {
         let started = Instant::now();
         let i: Input =
             serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
-        let abs = ctx.workspace_path.join(&i.path);
-        if !is_inside(&ctx.workspace_path, &abs) {
+        let abs = ctx.workspace.path.join(&i.path);
+        if !is_inside(&ctx.workspace.path, &abs) {
             return Ok(err_output(
                 started,
                 format!("path {} escapes workspace", i.path),

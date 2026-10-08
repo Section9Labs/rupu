@@ -11,7 +11,7 @@
 use crate::runner::StepFactory;
 use crate::workflow::Workflow;
 use async_trait::async_trait;
-use rupu_agent::{AgentRunOpts, OnToolCallCallback};
+use rupu_agent::{LegacyRunOpts, OnToolCallCallback};
 use rupu_runtime::provider_factory;
 use rupu_tools::{AgentDispatcher, PermissionMode, PermissionPolicy, ToolContext};
 use std::path::{Path, PathBuf};
@@ -42,7 +42,7 @@ use std::sync::Arc;
 ///
 /// The returned `NetflowWriterHandle` is intentionally NOT kept alive or
 /// explicitly shut down by the caller — this function returns an
-/// `AgentRunOpts`, not a handle-owning scope that outlives the step's own
+/// `LegacyRunOpts`, not a handle-owning scope that outlives the step's own
 /// async work, so there is nowhere to hold it until the step's HTTP
 /// traffic is done. This is safe: `Arc<NetflowWriter>` (cloned into the
 /// returned sink) keeps the writer task's channel open independent of the
@@ -272,7 +272,7 @@ impl StepFactory for DefaultStepFactory {
         workspace_path: PathBuf,
         transcript_path: PathBuf,
         on_tool_call: Option<OnToolCallCallback>,
-    ) -> AgentRunOpts {
+    ) -> LegacyRunOpts {
         // We still verify the parent step exists in the workflow so
         // unknown step ids surface clearly, but we drive the agent
         // load off `agent_name` (which differs from the parent's
@@ -466,14 +466,7 @@ impl StepFactory for DefaultStepFactory {
             None => spec.system_prompt,
         };
 
-        // Precompute the parent_run_id clone before moving `run_id`
-        // into the struct literal (otherwise the borrow-checker
-        // flags it because struct-literal field-init order is the
-        // *source* order: `run_id` moves before `tool_context` is
-        // constructed).
-        let parent_run_id_for_tool_ctx = Some(run_id.clone());
-
-        AgentRunOpts {
+        LegacyRunOpts {
             seed_source: None,
             collectors: Vec::new(),
             extra_tools: Vec::new(),
@@ -500,36 +493,26 @@ impl StepFactory for DefaultStepFactory {
             // `rupu workflow run` warns at startup when no mode was given;
             // `--mode readonly` denies writes and external actions.
             permission: PermissionPolicy::unattended(self.mode),
+            // The identity (run id, dispatchable agents, …) comes from the
+            // flat fields below (`LegacyRunOpts::into_run_opts`).
             tool_context: ToolContext {
-                findings: Some(findings),
-                workspace_path,
-                bash_env_allowlist: self.bash_env_allowlist.clone(),
-                bash_timeout_secs: self.bash_timeout_secs,
-                // Sub-agent dispatch wiring. The dispatcher is set on
-                // the factory by the workflow runner before
-                // `run_workflow` starts; the per-step ToolContext
-                // gets the dispatcher Arc plus the agent's declared
-                // allowlist + parent run id so the `dispatch_agent`
-                // tool can enforce both gates.
-                dispatcher: self.dispatcher.clone(),
-                dispatchable_agents: spec.dispatchable_agents.clone(),
-                parent_run_id: parent_run_id_for_tool_ctx,
-                depth: 0,
-                coverage_writer: None,
-                surface_tag: None,
-                run_id: None,
-                model: None,
-                tool_mappings: None,
-                codename: None,
-                agent: None,
-                provider: None,
-                coverage_stream: None,
-                netflow_sink: tool_netflow_sink,
-                net_capture: self.net_capture.clone(),
-                tool_call_id: None,
-                spawn_ceiling: None,
-                prompter: None,
-                customer: self.customer.clone(),
+                workspace: rupu_tools::WorkspaceScope {
+                    path: workspace_path,
+                    bash: rupu_tools::BashConfig {
+                        env_allowlist: self.bash_env_allowlist.clone(),
+                        timeout_secs: self.bash_timeout_secs,
+                    },
+                    ..Default::default()
+                },
+                services: rupu_tools::ToolServices {
+                    dispatcher: self.dispatcher.clone(),
+                    findings: Some(findings),
+                    netflow_sink: tool_netflow_sink,
+                    net_capture: self.net_capture.clone(),
+                    customer: self.customer.clone(),
+                    ..Default::default()
+                },
+                ..Default::default()
             },
             user_message: rendered_prompt,
             initial_messages: Vec::new(),
@@ -590,6 +573,10 @@ impl StepFactory for DefaultStepFactory {
 
     fn customer(&self) -> Option<&str> {
         self.customer.as_deref()
+    }
+
+    fn system_prompt_suffix(&self) -> Option<&str> {
+        self.system_prompt_suffix.as_deref()
     }
 
     fn engagement_profiles(&self) -> Vec<String> {
@@ -1169,6 +1156,7 @@ steps:
             )
             .await;
         opts.tool_context
+            .services
             .findings
             .expect("step factory must always set findings options")
             .profile
@@ -1223,7 +1211,7 @@ steps:
                 None,
             )
             .await;
-        let fo = opts.tool_context.findings.unwrap();
+        let fo = opts.tool_context.services.findings.unwrap();
         assert_eq!(fo.artifact_max_bytes, 7);
         assert_eq!(fo.artifact_root, Some(tmp.path().join("store")));
     }
@@ -1264,6 +1252,7 @@ steps:
         // step's findings would route as native code findings.
         let got = opts
             .tool_context
+            .services
             .findings
             .unwrap()
             .engagement
@@ -1357,6 +1346,7 @@ steps:
                 )
                 .await
                 .tool_context
+                .services
                 .findings
                 .expect("findings options always set")
                 .profile;
@@ -1387,7 +1377,7 @@ steps:
             workspace_path: std::path::PathBuf,
             transcript_path: std::path::PathBuf,
             on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-        ) -> rupu_agent::AgentRunOpts {
+        ) -> rupu_agent::LegacyRunOpts {
             let mut opts = self
                 .inner
                 .build_opts_for_step(
@@ -1403,6 +1393,7 @@ steps:
                 .await;
             let profile = opts
                 .tool_context
+                .services
                 .findings
                 .as_ref()
                 .expect("findings options always set")
@@ -1531,7 +1522,7 @@ steps:
         // ToolContext construction, so `[bash]` config silently applied
         // under `rupu run`/`rupu session` but not under `rupu workflow run`.
         // A DefaultStepFactory carrying bash_timeout_secs = 42 and
-        // env_allowlist = ["FOO"] must produce an AgentRunOpts whose
+        // env_allowlist = ["FOO"] must produce an LegacyRunOpts whose
         // tool_context carries BOTH through — not 120 / empty.
         let tmp = assert_fs::TempDir::new().unwrap();
         write_agent(tmp.path());
@@ -1553,15 +1544,17 @@ steps:
             .await;
 
         assert_eq!(
-            opts.tool_context.bash_timeout_secs, 42,
+            opts.tool_context.workspace.bash.timeout_secs, 42,
             "bash_timeout_secs must flow from the factory, not hardcode 120"
         );
         assert!(
             opts.tool_context
-                .bash_env_allowlist
+                .workspace
+                .bash
+                .env_allowlist
                 .contains(&"FOO".to_string()),
             "bash_env_allowlist must flow from the factory, not hardcode empty: {:?}",
-            opts.tool_context.bash_env_allowlist
+            opts.tool_context.workspace.bash.env_allowlist
         );
     }
 
@@ -1588,7 +1581,7 @@ steps:
                 None,
             )
             .await;
-        assert_eq!(opts.tool_context.customer.as_deref(), Some("acme"));
+        assert_eq!(opts.tool_context.services.customer.as_deref(), Some("acme"));
     }
 }
 

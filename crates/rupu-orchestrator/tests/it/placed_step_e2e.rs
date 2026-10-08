@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use rupu_agent::runner::{MockProvider, ScriptedTurn};
-use rupu_agent::AgentRunOpts;
+use rupu_agent::LegacyRunOpts;
 use rupu_orchestrator::runner::{
     run_workflow, OrchestratorRunOpts, StepFactory, UnitCoverage, UnitDispatch, UnitDispatcher,
     UnitFailure, UnitOutcome,
@@ -36,14 +36,14 @@ impl StepFactory for FakeFactory {
         workspace_path: std::path::PathBuf,
         transcript_path: std::path::PathBuf,
         on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> AgentRunOpts {
+    ) -> LegacyRunOpts {
         let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
             text: format!("step {step_id} agent {agent_name} echo: {rendered_prompt}"),
             stop: StopReason::EndTurn,
             input_tokens: 1,
             output_tokens: 1,
         }]);
-        AgentRunOpts {
+        LegacyRunOpts {
             seed_source: None,
             collectors: Vec::new(),
             extra_tools: Vec::new(),

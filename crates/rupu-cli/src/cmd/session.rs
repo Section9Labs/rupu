@@ -38,7 +38,6 @@ use crossterm::style::Print;
 use crossterm::terminal;
 use crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
-use rupu_agent::runner::AgentRunOpts;
 use rupu_agent::{load_agent, resolve_mode};
 use rupu_config::PricingConfig;
 use rupu_providers::model_tier::{ContextWindow, ThinkingLevel};
@@ -51,7 +50,7 @@ use rupu_runtime::argv::{RunArgv, SessionWorker};
 use rupu_runtime::provider_factory;
 use rupu_runtime::spawn::{spawn_detached, SpawnSpec};
 use rupu_runtime::WorkerKind;
-use rupu_tools::{PermissionMode, PermissionPolicy, ToolContext};
+use rupu_tools::PermissionMode;
 use rupu_transcript::{
     Event as TranscriptEvent, FileEditKind, JsonlReader, JsonlWriter, RunMode, RunStatus,
 };
@@ -173,6 +172,16 @@ pub struct StartArgs {
     /// Live renderer mode when auto-attaching.
     #[arg(long, value_enum)]
     pub view: Option<LiveViewMode>,
+    /// Engagement profile(s) every turn of the session runs under — the asset
+    /// domain(s) findings are validated against (e.g. `network`, `binary`).
+    /// Repeatable or comma-separated. Empty = the `code` path.
+    #[arg(
+        long = "engagement-profile",
+        visible_alias = "engagement-profiles",
+        value_name = "ID",
+        value_delimiter = ','
+    )]
+    pub engagement_profiles: Vec<String>,
 }
 
 #[derive(ClapArgs, Debug, Clone, Default)]
@@ -411,6 +420,11 @@ struct SessionRecord {
     /// `full`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     findings_profile: Option<rupu_coverage::FindingProfile>,
+    /// The engagement profile ids `session start --engagement-profile`
+    /// selected; every turn re-resolves them against the workspace. Empty =
+    /// the `code` path (and every session that predates the field).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    engagement_profiles: Vec<String>,
     workspace_id: String,
     workspace_path: PathBuf,
     #[serde(default)]
@@ -1677,6 +1691,8 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         root: global.join("workspaces"),
     };
     let ws = rupu_workspace::upsert(&ws_store, &workspace_path)?;
+    // A bad or unloadable engagement profile fails the start, not a turn.
+    crate::findings_opts::resolve_engagement(&global, &workspace_path, &args.engagement_profiles)?;
 
     let provider_name = provider_factory::resolve_provider_name(
         spec.provider.as_deref(),
@@ -1730,6 +1746,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         anthropic_speed: spec.anthropic_speed,
         dispatchable_agents: spec.dispatchable_agents.clone(),
         findings_profile: spec.findings_profile,
+        engagement_profiles: args.engagement_profiles.clone(),
         workspace_id: ws.id,
         workspace_path: canonicalize_if_exists(&workspace_path),
         project_root,
@@ -7004,23 +7021,15 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
     let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
     let resolver = crate::accounts::resolver_for(&cfg);
 
-    let provider_config = provider_factory::ProviderConfig {
-        anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
-        anthropic_prompt_cache: session.anthropic_prompt_cache,
-        anthropic_server_side_fallback: Some(cfg.recovery.server_side_fallback),
-        // `openai_compatible` stays `None` here — a separate, pre-existing
-        // limitation (session compaction doesn't support custom
-        // openai-compatible endpoints), unrelated to kind resolution.
-        openai_compatible: None,
-        tuning: Some(provider_factory::provider_tuning(
-            &session.provider_name,
-            &cfg.providers,
-        )),
-        // `cfg.providers` is already in scope for `provider_tuning` above,
-        // so a declared multi-account name (e.g. `anthropic-work`) resolves
-        // its kind here too.
-        kind: provider_factory::resolve_kind(&session.provider_name, &cfg.providers),
-    };
+    let provider_config = provider_factory::ProviderConfig::for_agent(
+        &session.provider_name,
+        &cfg.providers,
+        provider_factory::AgentProviderSettings {
+            oauth_prefix: session.anthropic_oauth_prefix,
+            prompt_cache: session.anthropic_prompt_cache,
+        },
+        Some(cfg.recovery.server_side_fallback),
+    );
     // No run exists here: `rupu session compact` summarizes an existing
     // session's message history in place — it mints no run id, writes no
     // transcript, and isn't a step of any run in progress. This traffic
@@ -7420,20 +7429,15 @@ async fn run_compact_request(
         &request.transcript_path,
     );
 
-    let provider_config = provider_factory::ProviderConfig {
-        anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
-        anthropic_prompt_cache: session.anthropic_prompt_cache,
-        anthropic_server_side_fallback: Some(cfg.recovery.server_side_fallback),
-        // `openai_compatible` stays `None` here — a separate, pre-existing
-        // limitation (session compaction doesn't support custom
-        // openai-compatible endpoints), unrelated to kind resolution.
-        openai_compatible: None,
-        tuning: Some(provider_factory::provider_tuning(
-            &session.provider_name,
-            &cfg.providers,
-        )),
-        kind: provider_factory::resolve_kind(&session.provider_name, &cfg.providers),
-    };
+    let provider_config = provider_factory::ProviderConfig::for_agent(
+        &session.provider_name,
+        &cfg.providers,
+        provider_factory::AgentProviderSettings {
+            oauth_prefix: session.anthropic_oauth_prefix,
+            prompt_cache: session.anthropic_prompt_cache,
+        },
+        Some(cfg.recovery.server_side_fallback),
+    );
     let (_resolved_auth, mut provider) = provider_factory::build_for_provider_with_config(
         &session.provider_name,
         &session.model,
@@ -7735,19 +7739,54 @@ fn finalize_compact_run(
     Ok(())
 }
 
-/// The fallback chain a session turn runs with. The session record keeps the
-/// agent's prompt, tools and pins but not its `fallbacks:`, so each turn
-/// re-reads the agent file from the same agent dirs `rupu session start`
-/// loaded it from. An agent that no longer loads (renamed, deleted, broken
-/// frontmatter) yields `None`, and the turn uses the `[recovery].fallbacks`
-/// table, the same as an agent that declares no chain.
+/// The agent a session turn runs: the agent settings the session record
+/// snapshotted at `session start` (its prompt, tools, provider, model and
+/// pins), plus the fallback chain, which the record does not keep — each
+/// turn re-reads it from the agent file in the same agent dirs `session
+/// start` loaded it from. An agent that no longer loads (renamed, deleted,
+/// broken frontmatter) gets no chain, and the turn uses the
+/// `[recovery].fallbacks` table, the same as an agent that declares none.
+fn session_agent_spec(global: &Path, session: &SessionRecord) -> rupu_agent::AgentSpec {
+    rupu_agent::AgentSpec {
+        name: session.agent_name.clone(),
+        description: session.description.clone(),
+        provider: Some(session.provider_name.clone()),
+        auth: session.auth_mode,
+        model: Some(session.model.clone()),
+        tools: session.agent_tools.clone(),
+        max_turns: Some(session.max_turns),
+        permission_mode: Some(session.permission_mode.clone()),
+        anthropic_oauth_prefix: session.anthropic_oauth_prefix,
+        anthropic_prompt_cache: session.anthropic_prompt_cache,
+        effort: session.effort,
+        context_window: session.context_window,
+        output_format: session.output_format,
+        output_schema: session.output_schema.clone(),
+        anthropic_task_budget: session.anthropic_task_budget,
+        anthropic_context_management: session.anthropic_context_management,
+        anthropic_speed: session.anthropic_speed,
+        thinking_display: session.thinking_display,
+        dispatchable_agents: session.dispatchable_agents.clone(),
+        concerns: session.concerns.clone(),
+        max_tokens: session.max_tokens,
+        context_window_tokens: session.context_window_tokens,
+        compact_at_percent: session.compact_at_percent,
+        findings_profile: session.findings_profile,
+        fallbacks: session_agent_fallbacks(global, session),
+        system_prompt: session.agent_system_prompt.clone(),
+        raw: String::new(),
+    }
+}
+
+/// The session agent's `fallbacks:`, re-read from its agent file (see
+/// [`session_agent_spec`]); `None` when it no longer loads.
 fn session_agent_fallbacks(
     global: &Path,
     session: &SessionRecord,
 ) -> Option<Vec<rupu_config::FallbackEntry>> {
     let project_agents_parent = session.project_root.as_ref().map(|p| p.join(".rupu"));
     // Only the fallback chain is read here, so the agent's `tools:` aren't
-    // checked: the turn's own launch does that.
+    // checked: the turn's own grant does that.
     match rupu_agent::find_agent(
         global,
         project_agents_parent.as_deref(),
@@ -7843,30 +7882,46 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             rupu_scm::Registry::discover(resolver.as_ref(), &cfg, netflow_sink.clone()).await,
         );
 
-        let provider_config = provider_factory::ProviderConfig {
-            anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
-            anthropic_prompt_cache: session.anthropic_prompt_cache,
-            anthropic_server_side_fallback: Some(cfg.recovery.server_side_fallback),
-            // `openai_compatible` stays `None` here — a separate,
-            // pre-existing limitation (the session worker doesn't support
-            // custom openai-compatible endpoints), unrelated to kind
-            // resolution.
-            openai_compatible: None,
-            tuning: Some(provider_factory::provider_tuning(
-                &session.provider_name,
-                &cfg.providers,
-            )),
-            kind: provider_factory::resolve_kind(&session.provider_name, &cfg.providers),
+        // Process-wide subprocess-capture backend, warmed off the async
+        // runtime (its first call blocks).
+        let net_capture = crate::netflow_sink::net_capture(&cfg.netflow).await;
+        // The engagement the session was started under, re-resolved against
+        // its workspace each turn, like a resumed workflow run's.
+        let mut findings = crate::findings_opts::base_options(&global, &cfg.findings);
+        findings.engagement = crate::findings_opts::resolve_engagement(
+            &global,
+            &session.workspace_path,
+            &session.engagement_profiles,
+        )?;
+        // The turn is assembled like every other run (W3): this turn's config,
+        // registry, engagement and capture; the session record's agent
+        // settings as its agent.
+        let assembler = Arc::new(rupu_runtime::assembly::RunAssembler::new(
+            rupu_runtime::assembly::AssemblyContext {
+                global: global.clone(),
+                project_root: session.project_root.clone(),
+                config: cfg.clone(),
+                customer: turn_customer.clone(),
+                resolver: Arc::clone(&resolver),
+                scm: Some(scm_registry),
+                findings,
+                net_capture: Some(net_capture),
+            },
+        ));
+        let agent = session_agent_spec(&global, &session);
+        // The session's limits: the value stored by an earlier turn
+        // (including any limit learned from an overflow error), else resolved
+        // now — the first turn — through this turn's provider (spec
+        // 2026-09-30 §6.5). A stored value with NO known side is a transient
+        // first-turn failure (timeout, network blip), not an answer: the
+        // assembler resolves again, a cache read unless stale.
+        let overrides = rupu_runtime::assembly::Overrides {
+            limits: session.model_limits.clone(),
+            ..Default::default()
         };
-        let (_resolved_auth, mut provider) = provider_factory::build_for_provider_with_config(
-            &session.provider_name,
-            &session.model,
-            session.auth_mode,
-            resolver.as_ref(),
-            &provider_config,
-            netflow_sink.clone(),
-        )
-        .await?;
+        let prepared = assembler
+            .prepare_provider(&agent, &overrides, netflow_sink.clone())
+            .await?;
 
         let backend_id = "local_checkout".to_string();
         let worker_ctx =
@@ -7903,44 +7958,11 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         let codename = session.codename.clone().unwrap_or_else(|| {
             rupu_codename::derive_legacy(&session.session_id, Some(&session.agent_name))
         });
-        // Process-wide subprocess-capture backend, warmed off the async
-        // runtime (its first call blocks).
-        let net_capture = crate::netflow_sink::net_capture(&cfg.netflow).await;
-        let tool_context = ToolContext {
-            customer: turn_customer.clone(),
-            findings: Some(
-                crate::findings_opts::base_options(&global, &cfg.findings).with_profile(
-                    rupu_coverage::FindingProfile::resolve(None, None, session.findings_profile),
-                ),
-            ),
-            workspace_path: session.workspace_path.clone(),
-            bash_env_allowlist: cfg.bash.env_allowlist.clone().unwrap_or_default(),
-            bash_timeout_secs: cfg.bash.timeout_secs.unwrap_or(120),
-            dispatcher: None,
-            dispatchable_agents: session.dispatchable_agents.clone(),
-            parent_run_id: None,
-            depth: 0,
-            coverage_writer: None,
-            surface_tag: None,
-            run_id: None,
-            model: None,
-            tool_mappings: None,
-            codename: Some(codename.clone()),
-            agent: None,
-            provider: None,
-            coverage_stream: None,
-            netflow_sink: Some(netflow_sink.clone()),
-            net_capture: Some(net_capture),
-            tool_call_id: None,
-            spawn_ceiling: None,
-            prompter: None,
-        };
 
         // A session turn has no operator to prompt. An unreadable recorded
         // mode fails closed to readonly.
-        let permission = PermissionPolicy::unattended(
-            PermissionMode::parse(&session.permission_mode).unwrap_or(PermissionMode::Readonly),
-        );
+        let mode =
+            PermissionMode::parse(&session.permission_mode).unwrap_or(PermissionMode::Readonly);
         let live_usage_state = Arc::new(Mutex::new(SessionLiveUsageWriterState::new(
             &session.provider_name,
             &session.model,
@@ -7972,7 +7994,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
 
         // Reference the previous turn's transcript instead of re-embedding
         // `message_history` inline — the O(n²) dedup this field exists for
-        // (see `AgentRunOpts::seed_source`). Read `history_source_transcript`
+        // (see `UserTurn::seed_source`). Read `history_source_transcript`
         // (NOT `last_transcript_path`, which is a UX pointer updated
         // unconditionally — including on failed/stopped/crashed turns whose
         // transcript does not reconstruct to `message_history`). Only valid
@@ -7984,114 +8006,80 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             .clone()
             .filter(|p| p.exists());
 
-        // The session's limits: the value stored by an earlier turn (including
-        // any limit learned from an overflow error), else resolved now — the
-        // first turn — through this turn's provider (spec 2026-09-30 §6.5). A
-        // stored value with NO known side is a transient first-turn failure
-        // (timeout, network blip), not an answer: resolve again — a cache read
-        // unless stale — and persist the result below.
-        let limits_ctx = rupu_runtime::model_limits::LimitsContext::from_config(&cfg, &global);
-        let limits = match session.model_limits.clone() {
-            // Without its note: a note describes the resolution that wrote
-            // it, often relative to that moment ("refresh failed 2m ago"),
-            // and would otherwise be repeated by every later turn.
-            Some(l) if !l.is_unresolved() => {
-                rupu_providers::model_limits::ModelLimits { note: None, ..l }
-            }
-            _ => {
-                rupu_runtime::model_limits::resolve(
-                    rupu_runtime::model_limits::LimitOverrides {
-                        context_window_tokens: session.context_window_tokens,
-                        max_tokens: session.max_tokens,
-                        compact_at_percent: session.compact_at_percent,
-                    },
-                    &session.provider_name,
-                    &session.model,
-                    provider.as_mut(),
-                    &limits_ctx,
-                )
-                .await
-            }
+        // The turn's usage goes to the session's own ledger
+        // (`<sessions>/<id>/usage.jsonl`), and its sub-agents' too.
+        let origin = rupu_runtime::assembly::Origin::SessionTurn {
+            session_id: session.session_id.clone(),
+            session_dir: session_dir(&global, scope, &session.session_id),
         };
-        let recovery = rupu_runtime::hop_builder::recovery_opts(
-            &cfg.recovery,
-            session_agent_fallbacks(&global, &session).as_deref(),
-            resolver.clone(),
-            cfg.providers.clone(),
-            limits_ctx,
-            netflow_sink,
-            // Exactly what this turn's primary `ProviderConfig` and auth hint
-            // above carry, so a hop keeps the session's settings.
-            rupu_runtime::hop_builder::AgentOverrides {
-                oauth_prefix: session.anthropic_oauth_prefix,
-                prompt_cache: session.anthropic_prompt_cache,
-                auth: session.auth_mode,
-                origin_provider: session.provider_name.clone(),
-            },
+        let workspace = rupu_runtime::assembly::WorkspaceBinding {
+            id: session.workspace_id.clone(),
+            path: session.workspace_path.clone(),
+        };
+        // Sub-agent dispatch (`dispatchableAgents:`): children anchor under
+        // `<runs>/<turn run id>/sub/`.
+        let dispatcher = rupu_runtime::dispatch::InProcessDispatcher::new(
+            Arc::clone(&assembler),
+            Arc::new(rupu_orchestrator::RunStore::new(global.join("runs")))
+                as Arc<dyn rupu_runtime::dispatch::SubRunStore>,
+            assembler.dispatch_root(&origin, &args.run_id, workspace.clone()),
+            None,
         );
-
-        let opts = AgentRunOpts {
-            agent_name: session.agent_name.clone(),
-            agent_system_prompt: session.agent_system_prompt.clone(),
-            agent_tools: session.agent_tools.clone(),
-            provider,
-            provider_name: session.provider_name.clone(),
-            model: session.model.clone(),
+        let launch = rupu_runtime::assembly::LaunchSpec {
+            agent,
+            origin,
             run_id: args.run_id.clone(),
-            workspace_id: session.workspace_id.clone(),
-            workspace_path: session.workspace_path.clone(),
             transcript_path: transcript_path.clone(),
-            max_turns: session.max_turns,
-            permission,
-            tool_context,
-            user_message: args.prompt.clone(),
-            initial_messages: session.message_history.clone(),
-            turn_index_offset: session.total_turns,
-            no_stream: session.no_stream,
-            suppress_stream_stdout: true,
-            mcp_registry: Some(scm_registry),
-            effort: session.effort,
-            thinking_display: session.thinking_display,
-            context_window: session.context_window,
-            output_format: session.output_format,
-            output_schema: session.output_schema.clone(),
-            anthropic_task_budget: session.anthropic_task_budget,
-            anthropic_context_management: session.anthropic_context_management,
-            anthropic_speed: session.anthropic_speed,
-            parent_run_id: None,
-            depth: 0,
-            dispatchable_agents: session.dispatchable_agents.clone(),
-            step_id: String::new(),
-            on_tool_call: None,
-            on_stream_event: Some(on_stream_event),
-            on_usage: None,
-            concerns: session.concerns.clone(),
-            limits,
-            // Sessions key their coverage ledger off the session_id so multiple
-            // sessions against the same workspace stay distinct, and target_id
-            // matches the spec's per-session derivation.
-            scope_name: Some(session.session_id.clone()),
-            surface_tag: Some("session".to_string()),
+            codename: Some(codename),
+            prompt: rupu_agent::UserTurn {
+                message: args.prompt.clone(),
+                initial_messages: session.message_history.clone(),
+                seed_source,
+                turn_index_offset: session.total_turns,
+            },
+            workspace,
+            mode,
+            ceiling: None,
+            prompter: None,
+            overrides,
+            stream: rupu_agent::StreamOpts {
+                no_stream: session.no_stream,
+                suppress_stdout: true,
+                on_stream_event: Some(on_stream_event),
+            },
+            hooks: Default::default(),
             pause: None,
-            seed_source,
+            services: rupu_runtime::assembly::LaunchServices {
+                dispatcher: Some(dispatcher),
+                netflow: Some(netflow_sink.clone()),
+                extra_tools: Vec::new(),
+                provider: Some(prepared),
+            },
             collectors: Vec::new(),
-            extra_tools: Vec::new(),
-            step_actions: Vec::new(),
-            alias_scope: Default::default(),
-            codename: Some(codename.clone()),
-            recovery,
         };
 
-        // `run_agent_full`, not `run_agent`: the run's final limits come back
-        // on an `Err` too, so a limit learned from an overflow (and the first
-        // turn's resolution) is persisted even when the turn then fails (spec
-        // 2026-09-30 §6.5) — and so does the conversation as it stood, so a
-        // failed turn keeps its prompt and tool work (spec 2026-10-01 §7.3).
+        // The run's final limits come back on an `Err` too, so a limit
+        // learned from an overflow (and the first turn's resolution) is
+        // persisted even when the turn then fails (spec 2026-09-30 §6.5) —
+        // and so does the conversation as it stood, so a failed turn keeps
+        // its prompt and tool work (spec 2026-10-01 §7.3).
+        // A turn that cannot be assembled (its grant fails) is a failed
+        // turn, recorded like any other.
         let rupu_agent::RunExit {
             result: outcome,
             final_limits,
             messages: exit_messages,
-        } = rupu_agent::run_agent_full(opts).await;
+        } = match assembler.assemble(launch).await {
+            Ok(run) => run.run().await,
+            Err(e) => rupu_agent::RunExit {
+                result: Err(e.into_run_error()),
+                final_limits: session
+                    .model_limits
+                    .clone()
+                    .unwrap_or_else(rupu_providers::model_limits::ModelLimits::unknown),
+                messages: Vec::new(),
+            },
+        };
         // The turn's cached tokens: the provider-reported total summed over
         // every call (`RunResult.total_tokens_cached`), not the worker's
         // streaming snapshot, which only ever held the last call's figure
@@ -10523,6 +10511,7 @@ mod tests {
             anthropic_speed: None,
             dispatchable_agents: None,
             findings_profile: None,
+            engagement_profiles: Vec::new(),
             workspace_id: "ws_test".into(),
             workspace_path: PathBuf::from("/tmp/repo"),
             project_root: Some(PathBuf::from("/tmp/repo")),

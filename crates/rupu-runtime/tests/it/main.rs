@@ -13,6 +13,10 @@
 //! neighbour has the script set.
 
 mod anthropic_prompt_cache;
+mod assembly;
+mod dispatch;
+mod no_hand_built_run_opts;
+mod support;
 mod gemini_code_assist_project;
 mod hop_builder;
 mod model_limits;

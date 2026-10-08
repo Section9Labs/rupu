@@ -80,7 +80,9 @@ async fn ask_prompts_for_mcp_write() {
         ],
     );
     opts.permission = PermissionPolicy::new(PermissionMode::Ask, Some(prompter.clone()));
-    opts.mcp_registry = Some(Arc::new(rupu_scm::Registry::default()));
+    opts.tool_context.services.scm = Some(Arc::new(rupu_scm::Registry::default()));
+    // The registry adds the connector tools: resolve the grant over it.
+    let opts = rupu_agent::grant::with_grant(opts, None, &[]).expect("grant");
     let transcript = opts.transcript_path.clone();
     run_agent(opts)
         .await

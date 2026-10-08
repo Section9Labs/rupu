@@ -145,6 +145,7 @@ fn seed_transcript_with_model(dir: &std::path::Path, run_id: &str, model: &str) 
         final_output: None,
         loop_progress: Default::default(),
         gate_decisions: Vec::new(),
+        system_prompt_suffix: None,
         codename: None,
         cause: None,
     };
@@ -254,6 +255,7 @@ async fn usage_priced_only_reports_empty_unpriced_gap() {
         final_output: None,
         loop_progress: Default::default(),
         gate_decisions: Vec::new(),
+        system_prompt_suffix: None,
         codename: None,
         cause: None,
     };
@@ -640,6 +642,7 @@ fn seed_run_with_usage(
         final_output: None,
         loop_progress: Default::default(),
         gate_decisions: Vec::new(),
+        system_prompt_suffix: None,
         codename: None,
         cause: None,
     };
@@ -1271,6 +1274,7 @@ fn create_workflow_run(
         final_output: None,
         loop_progress: Default::default(),
         gate_decisions: Vec::new(),
+        system_prompt_suffix: None,
         cause: None,
     };
     run_store.create(record, "name: wf-fold\n").unwrap();
@@ -1943,4 +1947,114 @@ async fn run_usage_endpoint_serves_a_project_local_run() {
     let v = get_json(format!("{}/api/runs/run_PL/usage", srv.base_url)).await;
     assert_eq!(v["summary"]["total_tokens"], 10, "{v}");
     assert_eq!(v["steps"]["review"]["output_tokens"], 3, "{v}");
+}
+
+/// One ledger row, as the run assembler's usage hook writes it.
+fn agent_ledger_line(
+    id: &str,
+    agent_run_id: &str,
+    transcript: &std::path::Path,
+    agent: &str,
+    input: u64,
+    output: u64,
+) -> Vec<u8> {
+    use rupu_orchestrator::usage_ledger::{LedgerKind, LedgerRow, LEDGER_VERSION};
+    let row = LedgerRow {
+        v: LEDGER_VERSION,
+        id: id.into(),
+        at: chrono::Utc::now(),
+        kind: LedgerKind::Turn,
+        step_id: None,
+        unit_index: None,
+        unit_key: None,
+        agent_run_id: agent_run_id.into(),
+        parent_agent_run_id: None,
+        transcript: transcript.to_path_buf(),
+        agent: agent.into(),
+        provider: FOLD_PROVIDER.into(),
+        model: FOLD_MODEL.into(),
+        input_tokens: input,
+        output_tokens: output,
+        cached_tokens: 0,
+        cache_write_tokens: 0,
+    };
+    let mut line = serde_json::to_vec(&row).unwrap();
+    line.push(b'\n');
+    line
+}
+
+/// W3, R13: a standalone `rupu run` and a session turn now keep a usage
+/// ledger next to their transcript. Each is still counted ONCE: a session's
+/// ledger is not read by the CP (its turns are folded from their
+/// transcripts), and a standalone run's ledger, once its `agent:` record
+/// exists, claims its transcript — the ledger replaces the transcript fold,
+/// never adds to it — and the run is reported as the agent run it is.
+#[tokio::test]
+async fn usage_not_double_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path();
+    let tdir = global.join("transcripts");
+
+    // S: a finished standalone run — transcript, ledger, and its record.
+    let s_path = tdir.join("run_S.jsonl");
+    write_fold_transcript(&s_path, "solo", "ws_s", &[(100, 10)]);
+    write_standalone_meta(&tdir, "run_S", None, "run_cli");
+    let store = create_workflow_run(global, "run_S", rupu_orchestrator::RunStatus::Completed);
+    let mut rec = store.load("run_S").unwrap();
+    rec.workflow_name = format!("{}solo", rupu_orchestrator::AGENT_RUN_PREFIX);
+    rec.workspace_id = "ws_s".into();
+    store.update(&rec).unwrap();
+    std::fs::write(
+        store.usage_ledger_path("run_S"),
+        agent_ledger_line("s1", "run_S", &s_path, "solo", 100, 10),
+    )
+    .unwrap();
+
+    // L: a standalone run still in flight — transcript and ledger, no record.
+    let l_path = tdir.join("run_L.jsonl");
+    write_fold_transcript(&l_path, "solo", "ws_s", &[(300, 30)]);
+    write_standalone_meta(&tdir, "run_L", None, "run_cli");
+    let l_ledger = store.usage_ledger_path("run_L");
+    std::fs::create_dir_all(l_ledger.parent().unwrap()).unwrap();
+    std::fs::write(
+        &l_ledger,
+        agent_ledger_line("l1", "run_L", &l_path, "solo", 300, 30),
+    )
+    .unwrap();
+
+    // T: a session turn — transcript, and the session's own ledger.
+    let t_path = tdir.join("run_T.jsonl");
+    write_fold_transcript(&t_path, "chatter", "ws_sess", &[(200, 20)]);
+    write_standalone_meta(&tdir, "run_T", Some("ses_T"), "session_turn");
+    write_session(global, "ses_T", &[("run_T", &t_path)]);
+    std::fs::write(
+        global.join("sessions").join("ses_T").join("usage.jsonl"),
+        agent_ledger_line("t1", "run_T", &t_path, "chatter", 200, 20),
+    )
+    .unwrap();
+
+    let srv = spawn_server(global).await;
+    let body = get_json(format!("{}/api/usage?host=local", srv.base_url)).await;
+    assert_eq!(
+        body["summary"]["total_tokens"].as_u64(),
+        Some(110 + 330 + 220),
+        "S + L + T, each counted once: {body}"
+    );
+
+    let rows = get_json(format!("{}/api/usage/runs", srv.base_url)).await;
+    let rows = rows.as_array().expect("array");
+    let of = |id: &str| -> Vec<&serde_json::Value> {
+        rows.iter().filter(|r| r["run_id"] == id).collect()
+    };
+    for (id, kind, tokens) in [
+        ("run_S", "agent", 110),
+        ("run_L", "agent", 330),
+        ("run_T", "session", 220),
+    ] {
+        let r = of(id);
+        assert_eq!(r.len(), 1, "one row for {id}: {rows:?}");
+        assert_eq!(r[0]["kind"], kind, "{id}: {rows:?}");
+        assert_eq!(r[0]["total_tokens"].as_u64(), Some(tokens), "{id}");
+        assert_eq!(r[0]["workflow_name"], "", "{id} has no workflow");
+    }
 }
