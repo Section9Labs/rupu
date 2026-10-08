@@ -63,7 +63,8 @@ Everything after the closing `---` is the system prompt.
 | `permissionMode` | `ask` \| `bypass` \| `readonly` | no | `ask` | CLI `--mode` overrides the file |
 | `anthropicOauthPrefix` | bool | no | provider default | Anthropic SSO only |
 | `anthropicPromptCache` | bool | no | `[providers.<name>] prompt_cache`, else on | Anthropic only; `false` disables prompt caching for this agent |
-| `effort` | string | no | provider default | Cross-provider reasoning level |
+| `effort` | string | no | provider default | Cross-provider reasoning level (`auto`/`minimal`/`low`/`medium`/`high`/`max`) |
+| `thinkingDisplay` | `summarized` \| `omitted` \| `updates` | no | `summarized` | Cross-provider reasoning-display hint; honored by Anthropic adaptive models only |
 | `contextWindow` | string | no | model default | Cross-provider context tier |
 | `outputFormat` | `text` \| `json` | no | free-form text | Hint for structured outputs |
 | `anthropicTaskBudget` | integer | no | none | Anthropic-only soft output budget |
@@ -251,15 +252,24 @@ knob, so rupu translates it per provider:
 
 | Provider | Wire form |
 | --- | --- |
-| Anthropic | `thinking.budget_tokens` — a token budget derived from the level |
+| Anthropic — adaptive models (4.6+ and the Claude-5 family) | `thinking.type: adaptive` plus `output_config.effort` (`minimal`/`low`→`low`, `medium`→`medium`, `high`→`high`, `max`→`max`). `auto` sends adaptive with **no** effort knob (the server picks). |
+| Anthropic — pre-4.6 and Haiku | `thinking.budget_tokens` — a token budget derived from the level (`auto` → adaptive on the OAuth path) |
 | Gemini 3 | `generationConfig.thinkingConfig.thinkingLevel` (lowercase) |
 | Gemini 2.5 and earlier | `generationConfig.thinkingConfig.thinkingBudget` (numeric) |
-| OpenAI Codex | `reasoning.effort`, sent only for models that support reasoning |
-| OpenAI-compatible endpoints | `reasoning_effort`, forwarded verbatim |
+| OpenAI Codex | `reasoning.effort`, sent only for models that support reasoning (`max`→`xhigh`) |
+| OpenAI-compatible endpoints | `reasoning_effort`, forwarded verbatim (`max`→`xhigh`) |
 
-`auto` is special-cased: on Gemini it sends the `thinkingBudget: -1` sentinel
-("model decides"), and on the openai-compatible path it sends no
-`reasoning_effort` key at all.
+On the Anthropic adaptive path there is no `minimal` or `xhigh` on the wire:
+`minimal` floors to `low` (the API has no "minimal") and both `max` and the
+`xhigh` alias map to `max`. Every value rupu emits is valid on every adaptive
+tier (4.6 accepts `low`/`medium`/`high`/`max`; 4.7+ also accept `xhigh`, which
+this ladder never sends), so no per-model clamping is needed. Sending the old
+`thinking.budget_tokens` shape to a 4.7+/Claude-5 model is a 400 — that is why
+the adaptive path exists.
+
+`auto` is special-cased: on Anthropic it sends adaptive thinking with no effort
+knob, on Gemini it sends the `thinkingBudget: -1` sentinel ("model decides"),
+and on the openai-compatible path it sends no `reasoning_effort` key at all.
 
 #### Caveat for OpenAI-compatible endpoints
 
@@ -279,6 +289,31 @@ are the values in widest use.
 rupu deliberately does **not** clamp `minimal`/`max` for these endpoints — doing
 so would silently downgrade an explicit setting on the endpoints that *do*
 support them.
+
+### `thinkingDisplay`
+
+Accepted values:
+
+- `summarized` (default)
+- `omitted`
+- `updates`
+
+Controls what reasoning the model returns alongside its answer — the
+`thinking.display` knob. It is a display hint, honored **only by Anthropic
+adaptive models** (4.6+ and the Claude-5 family); other providers and the
+pre-4.6 `budget_tokens` path ignore it.
+
+| Value | Effect |
+| --- | --- |
+| `summarized` | A readable summary of the reasoning is returned and captured into the transcript. This is the default when the field is omitted, so reasoning capture stays non-empty. |
+| `omitted` | Thinking still runs (and is billed) but its text comes back empty — a quieter, cheaper transcript. |
+| `updates` | Between-tool-call progress notes instead of full reasoning. Needs the `thinking-display-updates-2026-08-18` beta and a capable model (`claude-fable-5`, `claude-fable-5-1`, `claude-mythos-5-1`, `claude-opus-5-5`, `claude-sonnet-5-5`); on any other model it degrades to `summarized`. |
+
+Only `auto`/explicit-effort requests on an adaptive model carry a `display` at
+all. If you set `thinkingDisplay` on a model that cannot honor it — a pre-4.6
+or Haiku Anthropic model, a non-Anthropic model, or `updates` on a
+non-updates model — the run degrades to the model's default display and logs a
+one-time warning naming the agent and model, rather than failing.
 
 ### `contextWindow`
 

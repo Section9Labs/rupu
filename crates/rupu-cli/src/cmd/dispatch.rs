@@ -487,6 +487,7 @@ impl AgentDispatcher for CliAgentDispatcher {
             suppress_stream_stdout: true,
             mcp_registry: Some(Arc::clone(&self.mcp_registry)),
             effort: spec.effort,
+            thinking_display: spec.thinking_display,
             context_window: spec.context_window,
             output_format: spec.output_format,
             output_schema: spec.output_schema.clone(),

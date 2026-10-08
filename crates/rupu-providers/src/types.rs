@@ -322,6 +322,12 @@ pub struct LlmRequest {
     /// `false` (the client-level setting decides). Ignored by other
     /// providers.
     pub disable_prompt_cache: bool,
+    /// What reasoning the model returns (`thinking.display`). `None` =
+    /// the provider default, which for Anthropic adaptive models is
+    /// `summarized` (so reasoning capture stays non-empty). Only Anthropic
+    /// honors it, and only on the adaptive paths; other providers and the
+    /// fixed `budget_tokens` path ignore it. See [`ThinkingDisplay`].
+    pub thinking_display: Option<ThinkingDisplay>,
 }
 
 /// Output-format hint passed to providers that support structured
@@ -352,6 +358,31 @@ pub enum ContextManagement {
 #[serde(rename_all = "lowercase")]
 pub enum Speed {
     Fast,
+}
+
+/// What reasoning the model returns alongside its answer — the
+/// `thinking.display` knob on Anthropic adaptive-thinking models.
+/// A cross-provider-shaped hint (like [`crate::model_tier::ThinkingLevel`]):
+/// only Anthropic honors it today, and only on the adaptive paths (the
+/// fixed `budget_tokens` path carries no `display`, and sending one there
+/// 400s). Other providers ignore it.
+///
+/// - `Summarized`: a readable summary of the reasoning is returned and
+///   captured into the transcript. The default when a request leaves
+///   `thinking_display` unset.
+/// - `Omitted`: thinking runs (and is billed) but its text comes back
+///   empty — a quieter, cheaper transcript.
+/// - `Updates`: between-tool-call progress notes instead of reasoning.
+///   Needs the `thinking-display-updates-2026-08-18` beta and is
+///   restricted to a small model set (see
+///   `anthropic::supports_thinking_display_updates`); on any other model
+///   the Anthropic client degrades it to `Summarized`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingDisplay {
+    Summarized,
+    Omitted,
+    Updates,
 }
 
 /// A complete response from an LLM provider.

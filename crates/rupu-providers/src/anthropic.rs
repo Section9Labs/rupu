@@ -251,6 +251,11 @@ fn restore_reasoning_blocks(messages: &mut serde_json::Value, self_tag: &str, ec
 /// The `anthropic-beta` flag for server-side fallback.
 const SERVER_SIDE_FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 
+/// Beta that enables `thinking.display: "updates"` (between-tool progress
+/// notes). Sent only when a request's resolved display is `updates` on a
+/// capable model (see `supports_thinking_display_updates`).
+const THINKING_DISPLAY_UPDATES_BETA: &str = "thinking-display-updates-2026-08-18";
+
 /// Models that accept the server-side fallback opt-in. Matched on the model id
 /// with the client-side `[1m]` suffix stripped; the set is exact, so a newer
 /// model is added here deliberately.
@@ -718,9 +723,16 @@ fn model_supports_context_management(model: &str) -> bool {
 ///   * `interleaved-thinking-2025-05-14` — 4-tier+ models.
 ///   * `context-management-2025-06-27` — 4-tier+ models OR when the
 ///     caller explicitly opts in via `wants_context_management`.
-fn build_oauth_beta_csv(model: &str, wants_context_management: bool) -> String {
+///   * `thinking-display-updates-2026-08-18` — only when the request's
+///     resolved `thinking.display` is `updates` (`wants_display_updates`),
+///     which already implies an updates-capable model.
+fn build_oauth_beta_csv(
+    model: &str,
+    wants_context_management: bool,
+    wants_display_updates: bool,
+) -> String {
     let is_haiku = model.to_ascii_lowercase().contains("haiku");
-    let mut betas: Vec<&str> = Vec::with_capacity(10);
+    let mut betas: Vec<&str> = Vec::with_capacity(11);
     if !is_haiku {
         betas.push("claude-code-20250219");
     }
@@ -739,6 +751,9 @@ fn build_oauth_beta_csv(model: &str, wants_context_management: bool) -> String {
     betas.push("advanced-tool-use-2025-11-20");
     betas.push("effort-2025-11-24");
     betas.push("cache-diagnosis-2026-04-07");
+    if wants_display_updates {
+        betas.push(THINKING_DISPLAY_UPDATES_BETA);
+    }
     betas.join(",")
 }
 
@@ -1584,6 +1599,7 @@ impl AnthropicClient {
         model: &str,
         context_window: Option<crate::model_tier::ContextWindow>,
         wants_context_management: bool,
+        wants_display_updates: bool,
     ) -> RequestBuilder {
         // Headers verbatim from MITM capture of real `claude --print`
         // against api.anthropic.com. Order is preserved to match the
@@ -1623,6 +1639,12 @@ impl AnthropicClient {
                 if self.sends_server_side_fallback(model) {
                     betas.push(SERVER_SIDE_FALLBACK_BETA);
                 }
+                // `thinking.display: "updates"` is GA-gated behind this beta
+                // on the api-key path too (effort GA needs no beta, but the
+                // updates display mode does).
+                if wants_display_updates {
+                    betas.push(THINKING_DISPLAY_UPDATES_BETA);
+                }
                 if !betas.is_empty() {
                     b = b.header("anthropic-beta", betas.join(","));
                 }
@@ -1641,7 +1663,8 @@ impl AnthropicClient {
                 } else {
                     model
                 };
-                let beta_csv = build_oauth_beta_csv(model, wants_context_management);
+                let beta_csv =
+                    build_oauth_beta_csv(model, wants_context_management, wants_display_updates);
                 b.header("Authorization", format!("Bearer {access_token}"))
                     .header("anthropic-beta", beta_csv)
                     .header("x-app", "cli")
@@ -1681,6 +1704,85 @@ fn model_supports_adaptive_thinking(model: &str) -> bool {
         anthropic_model_version(model),
         Some((major, minor)) if major >= 5 || (major == 4 && minor >= 6)
     )
+}
+
+/// Whether the model supports `thinking.display: "updates"` (between-tool
+/// progress notes), which rides the `thinking-display-updates-2026-08-18`
+/// beta. Exact set — like [`supports_server_side_fallback`], a newer model
+/// is added deliberately; the `[1m]` suffix is stripped first.
+fn supports_thinking_display_updates(model: &str) -> bool {
+    matches!(
+        crate::model_registry::strip_1m(model),
+        "claude-fable-5"
+            | "claude-fable-5-1"
+            | "claude-mythos-5-1"
+            | "claude-opus-5-5"
+            | "claude-sonnet-5-5"
+    )
+}
+
+/// Resolve a request's effective `thinking.display` against its model,
+/// returning `(display, needs_updates_beta)`. `None` defaults to
+/// `"summarized"` so reasoning capture stays non-empty. `Updates` rides the
+/// `thinking-display-updates-2026-08-18` beta on a capable model and
+/// otherwise degrades to `"summarized"` (never a 400 — see
+/// `supports_thinking_display_updates`). Only meaningful on adaptive-thinking
+/// models; the fixed `budget_tokens` path carries no `display` at all and so
+/// never calls this.
+fn resolve_thinking_display(
+    display: Option<crate::types::ThinkingDisplay>,
+    model: &str,
+) -> (&'static str, bool) {
+    use crate::types::ThinkingDisplay;
+    match display {
+        None | Some(ThinkingDisplay::Summarized) => ("summarized", false),
+        Some(ThinkingDisplay::Omitted) => ("omitted", false),
+        Some(ThinkingDisplay::Updates) if supports_thinking_display_updates(model) => {
+            ("updates", true)
+        }
+        // `updates` on a model that can't do it: degrade, don't 400.
+        Some(ThinkingDisplay::Updates) => ("summarized", false),
+    }
+}
+
+/// Deterministic, catalog-free warnings for an agent's `thinkingDisplay`
+/// against the model it will run on. Returns human-readable strings for the
+/// cases where the requested display can't take effect (so an operator sees
+/// a misconfiguration instead of a silent no-op/degrade); empty when the
+/// display is unset, is `summarized` (the harmless default), or will be
+/// honored. Reasoning is by Anthropic model string — `thinking.display` is
+/// an Anthropic-only knob, so a non-Anthropic model is treated as "won't
+/// honor it". Pure: no I/O, no model catalog.
+pub fn thinking_display_warnings(
+    model: &str,
+    display: Option<crate::types::ThinkingDisplay>,
+) -> Vec<String> {
+    use crate::types::ThinkingDisplay;
+    match display {
+        None | Some(ThinkingDisplay::Summarized) => Vec::new(),
+        Some(other) if !model_supports_adaptive_thinking(model) => vec![format!(
+            "thinkingDisplay: {} has no effect on model '{model}' — reasoning display \
+             applies only to Anthropic adaptive models (4.6+ / the Claude-5 family); \
+             the model's default display will be used.",
+            display_token(other)
+        )],
+        Some(ThinkingDisplay::Updates) if !supports_thinking_display_updates(model) => {
+            vec![format!(
+                "thinkingDisplay: updates is not supported by model '{model}' and will be \
+                 summarized — it needs fable-5, fable-5-1, mythos-5-1, opus-5-5, or sonnet-5-5."
+            )]
+        }
+        Some(_) => Vec::new(),
+    }
+}
+
+fn display_token(d: crate::types::ThinkingDisplay) -> &'static str {
+    use crate::types::ThinkingDisplay;
+    match d {
+        ThinkingDisplay::Summarized => "summarized",
+        ThinkingDisplay::Omitted => "omitted",
+        ThinkingDisplay::Updates => "updates",
+    }
 }
 
 /// Whether a stream event counts as "content emitted" for `stream()`'s
@@ -1887,7 +1989,7 @@ impl AnthropicClient {
         };
         let model_for_betas = "claude-sonnet-4-6";
         let req = self.client.get(&bootstrap_url);
-        let req = self.apply_auth_headers(req, model_for_betas, None, false);
+        let req = self.apply_auth_headers(req, model_for_betas, None, false, false);
         // Cap this best-effort warmup at 10s so a slow / hanging
         // bootstrap endpoint can't strand the agent at the spinner
         // before its first message turn. The shared HTTP client
@@ -1954,6 +2056,7 @@ impl AnthropicClient {
                     &request.model,
                     request.context_window,
                     request.anthropic_context_management.is_some(),
+                    resolve_thinking_display(request.thinking_display, &request.model).1,
                 )
                 .send();
             // Total timeout: a one-shot request that never responds (hung
@@ -2110,6 +2213,7 @@ impl AnthropicClient {
                             &request.model,
                             request.context_window,
                             request.anthropic_context_management.is_some(),
+                            resolve_thinking_display(request.thinking_display, &request.model).1,
                         )
                         .with_extension(attempt_flow_id)
                         .send()
@@ -2399,13 +2503,18 @@ impl AnthropicClient {
         // that pairs with adaptive thinking; it is merged into `output_config`
         // below (alongside `task_budget` / `format`).
         let mut adaptive_effort: Option<&'static str> = None;
+        // Resolved `thinking.display` for the adaptive paths (default
+        // `summarized`; `updates` degrades to `summarized` off a capable
+        // model). The budget_tokens path ignores it — it carries no display.
+        let (adaptive_display, _) =
+            resolve_thinking_display(request.thinking_display, &request.model);
         if let Some(level) = &request.thinking {
             use crate::model_tier::ThinkingLevel;
             let adaptive = model_supports_adaptive_thinking(&request.model);
             match level {
                 ThinkingLevel::Auto => {
                     body["thinking"] =
-                        serde_json::json!({ "type": "adaptive", "display": "summarized" });
+                        serde_json::json!({ "type": "adaptive", "display": adaptive_display });
                 }
                 _ if adaptive => {
                     // 4.6+/Claude-5: adaptive thinking, depth via
@@ -2413,7 +2522,7 @@ impl AnthropicClient {
                     // for every non-`Auto` level and only ever yields values
                     // valid on every adaptive tier, so no per-model clamp.
                     body["thinking"] =
-                        serde_json::json!({ "type": "adaptive", "display": "summarized" });
+                        serde_json::json!({ "type": "adaptive", "display": adaptive_display });
                     adaptive_effort = level.anthropic_effort_str();
                 }
                 _ => {
@@ -2444,15 +2553,17 @@ impl AnthropicClient {
             // and may be down-classified by the OAuth quota router (a 429, not
             // a 400) — that fingerprinting warning is still true and load-bearing.
             //
-            // The `display: "summarized"` addition below is an intentional,
-            // verified deviation from that pinned claude-cli shape (its wire
-            // shape is confirmed against the authoritative API reference, same
-            // as the `ThinkingLevel::Auto` arm above). Do NOT "restore" this to
-            // bare `{"type":"adaptive"}` to match claude-cli more closely: on
-            // Opus 4.7/4.8 and Sonnet 5, `display` defaults to "omitted", and
-            // without an explicit "summarized" here captured reasoning text
-            // comes back empty on those models.
-            body["thinking"] = serde_json::json!({ "type": "adaptive", "display": "summarized" });
+            // The `display` addition below is an intentional, verified
+            // deviation from that pinned claude-cli shape (its wire shape is
+            // confirmed against the authoritative API reference, same as the
+            // `ThinkingLevel::Auto` arm above). Do NOT "restore" this to bare
+            // `{"type":"adaptive"}` to match claude-cli more closely: on the
+            // adaptive models `display` defaults to "omitted", and without an
+            // explicit value here captured reasoning text comes back empty.
+            // `adaptive_display` is the agent's `thinkingDisplay` (default
+            // "summarized").
+            body["thinking"] =
+                serde_json::json!({ "type": "adaptive", "display": adaptive_display });
         }
 
         // ── Optional output-shape / context / speed knobs ──────────────
@@ -3503,6 +3614,7 @@ mod tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             disable_prompt_cache: false,
+            thinking_display: None,
         };
         let body = client.build_request_body(&request, false);
         assert_eq!(
@@ -3516,7 +3628,7 @@ mod tests {
         // Regression: shipping `context-1m-2025-08-07` on a stock 200K
         // model triggers a 429 `"Extra usage is required for long
         // context requests"` on accounts without extra-usage billing.
-        let csv = build_oauth_beta_csv("claude-sonnet-4-6", false);
+        let csv = build_oauth_beta_csv("claude-sonnet-4-6", false, false);
         assert!(
             !csv.contains("context-1m-2025-08-07"),
             "context-1m must not be sent without [1m] suffix; got: {csv}"
@@ -3527,7 +3639,7 @@ mod tests {
 
     #[test]
     fn beta_csv_includes_context_1m_when_suffix_present() {
-        let csv = build_oauth_beta_csv("claude-sonnet-4-6[1m]", false);
+        let csv = build_oauth_beta_csv("claude-sonnet-4-6[1m]", false, false);
         assert!(
             csv.contains("context-1m-2025-08-07"),
             "context-1m must be sent when [1m] suffix is present; got: {csv}"
@@ -3557,7 +3669,7 @@ mod tests {
 
     #[test]
     fn beta_csv_drops_claude_code_for_haiku() {
-        let csv = build_oauth_beta_csv("claude-haiku-4-5", false);
+        let csv = build_oauth_beta_csv("claude-haiku-4-5", false, false);
         assert!(
             !csv.contains("claude-code-20250219"),
             "claude-code beta is gated to non-Haiku tiers; got: {csv}"
@@ -3566,7 +3678,7 @@ mod tests {
 
     #[test]
     fn beta_csv_omits_4_tier_betas_for_pre_4_models() {
-        let csv = build_oauth_beta_csv("claude-3-5-sonnet-20241022", false);
+        let csv = build_oauth_beta_csv("claude-3-5-sonnet-20241022", false, false);
         assert!(
             !csv.contains("interleaved-thinking-2025-05-14"),
             "interleaved-thinking must be 4-tier+; got: {csv}"
@@ -3581,7 +3693,7 @@ mod tests {
     fn beta_csv_includes_context_management_when_explicitly_opted_in() {
         // A pre-4 model that wouldn't normally get context-management-2025-06-27
         // should include it when wants_context_management is true.
-        let csv = build_oauth_beta_csv("claude-3-5-sonnet-20241022", true);
+        let csv = build_oauth_beta_csv("claude-3-5-sonnet-20241022", true, false);
         assert!(
             csv.contains("context-management-2025-06-27"),
             "explicit opt-in must include context-management beta; got: {csv}"
@@ -3612,6 +3724,7 @@ mod tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             disable_prompt_cache: false,
+            thinking_display: None,
         };
         let body = client.build_request_body(&request, false);
         assert_eq!(body["model"], "claude-sonnet-4-6");
@@ -3637,6 +3750,7 @@ mod tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             disable_prompt_cache: false,
+            thinking_display: None,
         };
         let body = client.build_request_body(&request, false);
         assert_eq!(body["model"], "claude-sonnet-4-6");
@@ -3689,6 +3803,7 @@ mod tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             disable_prompt_cache: false,
+            thinking_display: None,
         };
         let body = client.build_request_body(&request, true);
         // Prompt caching is on by default: the (last) system block carries
@@ -3740,6 +3855,7 @@ mod tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             disable_prompt_cache: false,
+            thinking_display: None,
         };
         let body = client.build_request_body(&request, false);
         // `betas` belongs in the `anthropic-beta` header only — including it
@@ -3776,6 +3892,7 @@ mod tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             disable_prompt_cache: false,
+            thinking_display: None,
         };
         let body = client.build_request_body(&request, false);
         assert!(
@@ -3808,6 +3925,7 @@ mod tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             disable_prompt_cache: false,
+            thinking_display: None,
         };
         let body = client.build_request_body(&request, false);
         let user_id = body["metadata"]["user_id"]
@@ -3839,6 +3957,7 @@ mod tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             disable_prompt_cache: false,
+            thinking_display: None,
         };
         let body = client.build_request_body(&request, false);
         let user_id = body["metadata"]["user_id"]
@@ -3869,6 +3988,7 @@ mod tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             disable_prompt_cache: false,
+            thinking_display: None,
         }
     }
 
@@ -3939,6 +4059,7 @@ mod tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             disable_prompt_cache: false,
+            thinking_display: None,
         };
         let body = client.build_request_body(&request, false);
         assert_eq!(body["thinking"]["type"], "enabled");
@@ -3968,6 +4089,7 @@ mod tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             disable_prompt_cache: false,
+            thinking_display: None,
         };
         let body = client.build_request_body(&request, false);
         assert_eq!(
@@ -3998,6 +4120,7 @@ mod tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             disable_prompt_cache: false,
+            thinking_display: None,
         };
         let body = client.build_request_body(&request, false);
         assert_eq!(
@@ -4028,6 +4151,7 @@ mod tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             disable_prompt_cache: false,
+            thinking_display: None,
         };
         let body = client.build_request_body(&request, false);
         assert_eq!(
@@ -4067,6 +4191,7 @@ mod tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             disable_prompt_cache: false,
+            thinking_display: None,
         }
     }
 
@@ -4272,7 +4397,9 @@ mod tests {
             .with_server_side_fallback(true);
         let body = oauth.build_request_body(&request, false);
         assert!(body.get("fallbacks").is_none());
-        assert!(!build_oauth_beta_csv(&request.model, false).contains(SERVER_SIDE_FALLBACK_BETA));
+        assert!(
+            !build_oauth_beta_csv(&request.model, false, false).contains(SERVER_SIDE_FALLBACK_BETA)
+        );
         assert_eq!(body["messages"][1]["content"], expected);
 
         // API key with the switch off: no opt-in, so no echo either.
@@ -4345,6 +4472,7 @@ mod tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             disable_prompt_cache: false,
+            thinking_display: None,
         };
         let body = client.build_request_body(&request, false);
         assert_eq!(body["thinking"]["type"], "enabled");
@@ -4371,6 +4499,7 @@ mod tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             disable_prompt_cache: false,
+            thinking_display: None,
         };
         let body = client.build_request_body(&request, false);
         assert_eq!(body["thinking"]["type"], "enabled");
@@ -4397,6 +4526,7 @@ mod tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             disable_prompt_cache: false,
+            thinking_display: None,
         };
         let body = client.build_request_body(&request, false);
         assert!(body.get("thinking").is_none());
@@ -4422,6 +4552,7 @@ mod tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             disable_prompt_cache: false,
+            thinking_display: None,
         };
         let body = client.build_request_body(&request, false);
         assert!(body.get("thinking").is_none()); // Minimal = skip
@@ -4447,6 +4578,7 @@ mod tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             disable_prompt_cache: false,
+            thinking_display: None,
         };
         let body = client.build_request_body(&request, false);
         assert_eq!(body["thinking"]["type"], "enabled");
@@ -4473,6 +4605,7 @@ mod tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             disable_prompt_cache: false,
+            thinking_display: None,
         };
         let body = client.build_request_body(&request, false);
         let budget = body["thinking"]["budget_tokens"].as_u64().unwrap();
@@ -4555,6 +4688,7 @@ mod tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             disable_prompt_cache: false,
+            thinking_display: None,
         };
         let body = client.build_request_body(&request, false);
         assert!(
@@ -4741,6 +4875,180 @@ mod tests {
                 "{m} should NOT be adaptive"
             );
         }
+    }
+
+    /// `thinkingDisplay: omitted` on an adaptive model emits
+    /// `thinking.display: "omitted"` (reasoning runs but comes back empty).
+    #[test]
+    fn thinking_display_omitted_on_adaptive_model() {
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
+        let mut request = make_request(None);
+        request.model = "claude-mythos-5".into();
+        request.max_tokens = Some(16000);
+        request.thinking = Some(crate::model_tier::ThinkingLevel::High);
+        request.thinking_display = Some(crate::types::ThinkingDisplay::Omitted);
+        let body = client.build_request_body(&request, false);
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["thinking"]["display"], "omitted");
+    }
+
+    /// No `thinkingDisplay` → `summarized` (the default that keeps reasoning
+    /// capture non-empty), on both the explicit-effort and `Auto` adaptive
+    /// paths.
+    #[test]
+    fn thinking_display_defaults_to_summarized() {
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
+        for level in [
+            crate::model_tier::ThinkingLevel::High,
+            crate::model_tier::ThinkingLevel::Auto,
+        ] {
+            let mut request = make_request(None);
+            request.model = "claude-opus-5-5".into();
+            request.max_tokens = Some(16000);
+            request.thinking = Some(level);
+            request.thinking_display = None;
+            let body = client.build_request_body(&request, false);
+            assert_eq!(body["thinking"]["display"], "summarized", "{level:?}");
+        }
+    }
+
+    /// `thinkingDisplay` is ignored on the pre-adaptive budget_tokens path —
+    /// sending a `display` there 400s, so it must never appear.
+    #[test]
+    fn thinking_display_absent_on_pre_adaptive_budget_path() {
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
+        for display in [
+            crate::types::ThinkingDisplay::Omitted,
+            crate::types::ThinkingDisplay::Updates,
+        ] {
+            let mut request = make_request(None);
+            request.model = "claude-sonnet-4-5".into();
+            request.max_tokens = Some(16000);
+            request.thinking = Some(crate::model_tier::ThinkingLevel::High);
+            request.thinking_display = Some(display);
+            let body = client.build_request_body(&request, false);
+            assert_eq!(body["thinking"]["type"], "enabled", "{display:?}");
+            assert!(
+                body["thinking"].get("display").is_none(),
+                "pre-adaptive budget_tokens path must carry no display; got {}",
+                body["thinking"]
+            );
+        }
+    }
+
+    /// `thinkingDisplay: updates` on a capable model emits
+    /// `thinking.display: "updates"` and rides the display-updates beta.
+    #[test]
+    fn thinking_display_updates_on_capable_model() {
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
+        let mut request = make_request(None);
+        request.model = "claude-opus-5-5".into();
+        request.max_tokens = Some(16000);
+        request.thinking = Some(crate::model_tier::ThinkingLevel::High);
+        request.thinking_display = Some(crate::types::ThinkingDisplay::Updates);
+        let body = client.build_request_body(&request, false);
+        assert_eq!(body["thinking"]["display"], "updates");
+        assert_eq!(
+            resolve_thinking_display(request.thinking_display, &request.model),
+            ("updates", true)
+        );
+        assert!(build_oauth_beta_csv("claude-opus-5-5", false, true)
+            .contains(THINKING_DISPLAY_UPDATES_BETA));
+        assert!(!build_oauth_beta_csv("claude-opus-5-5", false, false)
+            .contains(THINKING_DISPLAY_UPDATES_BETA));
+    }
+
+    /// `updates` on an adaptive model that can't do it (opus-5 / mythos-5 /
+    /// opus-4-7 are adaptive but not updates-capable) degrades to
+    /// `summarized` and sends no beta — never a 400.
+    #[test]
+    fn thinking_display_updates_degrades_on_incapable_model() {
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
+        for model in ["claude-opus-5", "claude-mythos-5", "claude-opus-4-7"] {
+            let mut request = make_request(None);
+            request.model = model.into();
+            request.max_tokens = Some(16000);
+            request.thinking = Some(crate::model_tier::ThinkingLevel::High);
+            request.thinking_display = Some(crate::types::ThinkingDisplay::Updates);
+            let body = client.build_request_body(&request, false);
+            assert_eq!(body["thinking"]["display"], "summarized", "{model}");
+            assert_eq!(
+                resolve_thinking_display(request.thinking_display, model),
+                ("summarized", false),
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_thinking_display_mapping() {
+        use crate::types::ThinkingDisplay::{Omitted, Summarized, Updates};
+        let adaptive = "claude-opus-5-5"; // updates-capable
+        assert_eq!(
+            resolve_thinking_display(None, adaptive),
+            ("summarized", false)
+        );
+        assert_eq!(
+            resolve_thinking_display(Some(Summarized), adaptive),
+            ("summarized", false)
+        );
+        assert_eq!(
+            resolve_thinking_display(Some(Omitted), adaptive),
+            ("omitted", false)
+        );
+        assert_eq!(
+            resolve_thinking_display(Some(Updates), adaptive),
+            ("updates", true)
+        );
+        assert_eq!(
+            resolve_thinking_display(Some(Updates), "claude-opus-5"),
+            ("summarized", false),
+            "updates degrades off a non-capable model"
+        );
+    }
+
+    #[test]
+    fn supports_thinking_display_updates_exact_set() {
+        for m in [
+            "claude-fable-5",
+            "claude-fable-5-1",
+            "claude-mythos-5-1",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-opus-5-5[1m]",
+        ] {
+            assert!(supports_thinking_display_updates(m), "{m}");
+        }
+        for m in [
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-mythos-5",
+            "claude-opus-4-8",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5",
+        ] {
+            assert!(!supports_thinking_display_updates(m), "{m}");
+        }
+    }
+
+    #[test]
+    fn thinking_display_warnings_cases() {
+        use crate::types::ThinkingDisplay::{Omitted, Summarized, Updates};
+        // Unset / summarized / honored → no warning.
+        assert!(thinking_display_warnings("claude-opus-5-5", None).is_empty());
+        assert!(thinking_display_warnings("claude-opus-5-5", Some(Summarized)).is_empty());
+        assert!(thinking_display_warnings("claude-opus-5-5", Some(Omitted)).is_empty());
+        assert!(thinking_display_warnings("claude-opus-5-5", Some(Updates)).is_empty());
+        // Non-adaptive model → any non-default display warns "no effect".
+        let w = thinking_display_warnings("claude-sonnet-4-5", Some(Omitted));
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("no effect"), "{w:?}");
+        // Adaptive but not updates-capable → updates warns "not supported".
+        let w = thinking_display_warnings("claude-opus-5", Some(Updates));
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("not supported"), "{w:?}");
+        // Adaptive + Omitted honored → no warning.
+        assert!(thinking_display_warnings("claude-opus-5", Some(Omitted)).is_empty());
     }
 
     #[test]
@@ -6705,8 +7013,8 @@ mod tests {
     async fn oauth_long_context_refusal_disables_the_1m_beta() {
         use httpmock::prelude::*;
         let model = "claude-sonnet-4-6[1m]";
-        let with_1m = build_oauth_beta_csv(model, false);
-        let without_1m = build_oauth_beta_csv("claude-sonnet-4-6", false);
+        let with_1m = build_oauth_beta_csv(model, false, false);
+        let without_1m = build_oauth_beta_csv("claude-sonnet-4-6", false, false);
         assert!(with_1m.contains("context-1m-2025-08-07"));
         for streamed in [false, true] {
             let server = MockServer::start();

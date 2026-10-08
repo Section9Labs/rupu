@@ -47,6 +47,7 @@ fn make_request() -> LlmRequest {
         anthropic_context_management: None,
         anthropic_speed: None,
         disable_prompt_cache: false,
+        thinking_display: None,
     }
 }
 

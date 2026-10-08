@@ -452,6 +452,7 @@ self-contained.";
         // request will ever read what it would write. Caching it would only
         // pay the 1.25× cache-write premium (spec 2026-09-29 §9).
         disable_prompt_cache: true,
+        thinking_display: None,
     };
 
     // The summariser is an LLM call: none once SIGTERM has arrived. Checked
@@ -1402,6 +1403,10 @@ pub struct AgentRunOpts {
     /// translation (Anthropic `thinking.budget_tokens` / `thinking.type:adaptive`,
     /// OpenAI/Copilot `reasoning.effort`, Gemini `thinkingBudget`).
     pub effort: Option<rupu_providers::model_tier::ThinkingLevel>,
+    /// Reasoning display hint (`thinking.display`). Provider-generic like
+    /// `effort` — carried unchanged across fallback hops, never a model pin.
+    /// Honored by Anthropic adaptive models only.
+    pub thinking_display: Option<rupu_providers::types::ThinkingDisplay>,
     /// Desired context-window tier. Anthropic api-key path uses this to
     /// gate the `context-1m-2025-08-07` beta header; other providers
     /// currently ignore it.
@@ -1847,6 +1852,16 @@ async fn run_agent_inner(
     opts.tool_context.agent = Some(opts.agent_name.clone());
     opts.tool_context.provider = Some(opts.provider_name.clone());
 
+    // Deterministic, once-per-run validation of the agent's `thinkingDisplay`
+    // against the model it will run on (reasoning display is an Anthropic
+    // adaptive-model knob; a request that can't honor it degrades silently, so
+    // surface the misconfiguration instead).
+    for w in
+        rupu_providers::anthropic::thinking_display_warnings(&opts.model, opts.thinking_display)
+    {
+        tracing::warn!(agent = %opts.agent_name, model = %opts.model, "{w}");
+    }
+
     // Register coverage tools when coverage is enabled.
     if let Some(bundle) = &coverage {
         coverage_tools::register(
@@ -2176,6 +2191,7 @@ async fn run_agent_inner(
                 anthropic_context_management: opts.anthropic_context_management,
                 anthropic_speed: opts.anthropic_speed,
                 disable_prompt_cache: false,
+                thinking_display: opts.thinking_display,
             };
             let mut trim_attempts = 0u32;
             // Compact-on-overflow runs at most once per turn (spec §7); a
@@ -3515,6 +3531,7 @@ mod on_tool_call_tests {
             suppress_stream_stdout: false,
             mcp_registry: None,
             effort: None,
+            thinking_display: None,
             context_window: None,
             output_format: None,
             output_schema: None,
@@ -3646,6 +3663,7 @@ mod on_tool_call_tests {
             suppress_stream_stdout: false,
             mcp_registry: None,
             effort: None,
+            thinking_display: None,
             context_window: None,
             output_format: None,
             output_schema: None,
@@ -3762,6 +3780,7 @@ mod on_tool_call_tests {
             suppress_stream_stdout: false,
             mcp_registry: None,
             effort: None,
+            thinking_display: None,
             context_window: None,
             output_format: None,
             output_schema: None,
@@ -3900,6 +3919,7 @@ mod on_tool_call_tests {
             suppress_stream_stdout: false,
             mcp_registry: None,
             effort: None,
+            thinking_display: None,
             context_window: None,
             output_format: None,
             output_schema: None,
@@ -4026,6 +4046,7 @@ mod on_tool_call_tests {
             suppress_stream_stdout: false,
             mcp_registry: None,
             effort: None,
+            thinking_display: None,
             context_window: None,
             output_format: None,
             output_schema: None,
@@ -4152,6 +4173,7 @@ mod on_tool_call_tests {
             suppress_stream_stdout: false,
             mcp_registry: Some(Arc::new(Registry::default())),
             effort: None,
+            thinking_display: None,
             context_window: None,
             output_format: None,
             output_schema: None,
@@ -4231,6 +4253,7 @@ mod on_tool_call_tests {
             suppress_stream_stdout: false,
             mcp_registry: None,
             effort: None,
+            thinking_display: None,
             context_window: None,
             output_format: None,
             output_schema: None,
@@ -4335,6 +4358,7 @@ mod on_tool_call_tests {
             suppress_stream_stdout: false,
             mcp_registry: None,
             effort: None,
+            thinking_display: None,
             context_window: None,
             output_format: None,
             output_schema: None,
@@ -4414,6 +4438,7 @@ mod on_tool_call_tests {
             suppress_stream_stdout: false,
             mcp_registry: None,
             effort: None,
+            thinking_display: None,
             context_window: None,
             output_format: None,
             output_schema: None,
@@ -4515,6 +4540,7 @@ mod on_tool_call_tests {
                 suppress_stream_stdout: false,
                 mcp_registry: None,
                 effort: None,
+                thinking_display: None,
                 context_window: None,
                 output_format: None,
                 output_schema: None,
@@ -5347,6 +5373,7 @@ mod compaction_tests {
             suppress_stream_stdout: false,
             mcp_registry: None,
             effort: None,
+            thinking_display: None,
             context_window: None,
             output_format: None,
             output_schema: None,
@@ -5894,6 +5921,7 @@ mod pause_tests {
             suppress_stream_stdout: true,
             mcp_registry: None,
             effort: None,
+            thinking_display: None,
             context_window: None,
             output_format: None,
             output_schema: None,
@@ -6235,6 +6263,7 @@ mod reasoning_tests {
             suppress_stream_stdout: true,
             mcp_registry: None,
             effort: None,
+            thinking_display: None,
             context_window: None,
             output_format: None,
             output_schema: None,
