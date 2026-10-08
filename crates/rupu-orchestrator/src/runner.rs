@@ -152,6 +152,14 @@ pub struct UnitDispatch {
     /// The dispatcher must deliver them to the host as `rupu run
     /// --engagement-profile` or refuse the launch. Empty ⇒ the `code` path.
     pub engagement_profiles: Vec<String>,
+    /// The permission mode the unit must run under — the run's mode as
+    /// [`remote_unit_permission_mode`] resolves it from
+    /// [`StepFactory::permission_mode`]. The dispatcher delivers it to the
+    /// host as `rupu run --mode`, which outranks the agent's frontmatter and
+    /// the host's config there, as the run's mode does for a local step.
+    /// `None` only for a factory that tracks no single mode: the host then
+    /// resolves the mode itself.
+    pub mode: Option<rupu_tools::PermissionMode>,
 }
 
 /// The findings profile a remote (`host:` / `distribute:`) unit must run
@@ -166,6 +174,26 @@ pub(crate) fn remote_unit_findings_profile(
     defaults: &crate::workflow::WorkflowDefaults,
 ) -> Option<rupu_coverage::FindingProfile> {
     step.findings_profile.or(defaults.findings_profile)
+}
+
+/// The permission mode a remote (`host:` / `distribute:`) unit must run
+/// under, given the run's mode ([`StepFactory::permission_mode`]).
+///
+/// `readonly` and `bypass` travel as they are. `ask` becomes `bypass`: a
+/// local workflow step runs `ask` unattended, which allows writes
+/// (`PermissionPolicy::unattended`, ISSUES.md I-78), while a detached
+/// `rupu run --mode ask` refuses to start without a tty — so the unit gets the
+/// mode its local twin actually runs at. A mode word that doesn't parse
+/// fails closed to `readonly` rather than leaving the unit to the host's
+/// default.
+pub(crate) fn remote_unit_permission_mode(
+    run_mode: Option<&str>,
+) -> Option<rupu_tools::PermissionMode> {
+    use rupu_tools::PermissionMode;
+    run_mode.map(|m| match PermissionMode::parse(m) {
+        Ok(PermissionMode::Ask) | Ok(PermissionMode::Bypass) => PermissionMode::Bypass,
+        Ok(PermissionMode::Readonly) | Err(_) => PermissionMode::Readonly,
+    })
 }
 
 /// Outcome of one unit dispatched to a remote host.
@@ -7691,6 +7719,7 @@ async fn dispatch_placed_step(
         workspace: prepared,
         findings_profile: remote_unit_findings_profile(step, &opts.workflow.defaults),
         engagement_profiles: opts.factory.engagement_profiles(),
+        mode: remote_unit_permission_mode(opts.factory.permission_mode()),
         codename: codename.map(ToString::to_string),
     };
     announce_placed_agent(
@@ -8769,6 +8798,8 @@ async fn run_fanout_step(
     let unit_findings_profile = remote_unit_findings_profile(step, &opts.workflow.defaults);
     // The run's engagement, shared by every unit (cloned into each task).
     let unit_engagement_profiles = opts.factory.engagement_profiles();
+    // The run's mode, the same for every unit (and its retry); `Copy`.
+    let unit_mode = remote_unit_permission_mode(opts.factory.permission_mode());
     let mut handles = Vec::with_capacity(total);
     for (idx, item_value, rendered, run_id, transcript_path) in prepared {
         // Compute host placement for this unit. `None` → local inline path
@@ -8985,6 +9016,7 @@ async fn run_fanout_step(
                                     workspace: unit_ws.clone(),
                                     findings_profile: unit_findings_profile,
                                     engagement_profiles: engagement_for_task.clone(),
+                                    mode: unit_mode,
                                     codename: unit_codename.as_ref().map(ToString::to_string),
                                 };
                                 announce_placed_agent(
@@ -9091,6 +9123,7 @@ async fn run_fanout_step(
                                             workspace: unit_ws.clone(),
                                             findings_profile: unit_findings_profile,
                                             engagement_profiles: engagement_for_task.clone(),
+                                            mode: unit_mode,
                                             codename: unit_codename
                                                 .as_ref()
                                                 .map(ToString::to_string),

@@ -1161,6 +1161,10 @@ steps:
 
 `workspace:` is only meaningful on a remote step (one with `host:` or `distribute:`); setting `sync` on a purely local step is rejected at parse time as author confusion. A workflow-level `defaults.workspace:` sets the fallback used by every remote step that doesn't set its own.
 
+### Permission mode on a remote step
+
+A remote unit runs under the workflow run's mode, not the host's. The coordinator launches each unit (and a fan-out unit's retry on its fallback host) with `rupu run --mode <mode>`, which outranks the agent's `permissionMode` and the host's `permission_mode` config there, the same as for a local step. `readonly` and `bypass` travel as they are. `ask`, which is the default when `--mode` is omitted, travels as `bypass`. A local step in `ask` has no one to answer prompts and so allows writes, while a detached `rupu run --mode ask` would refuse to start. So `--mode readonly` is how you keep a placed unit from writing.
+
 ### `actions:` is not supported on a remote step
 
 A non-empty `actions:` allowlist on a `host:`/`distribute:` step is rejected at parse time (`WorkflowParseError::ActionsUnsupportedOnRemoteStep`): the tool roster never reaches the remote dispatch payload today, so a narrowed list there would otherwise be a silent no-op — the remote agent would run with its *full* tool grant while the workflow (and anything reading it) showed the step as narrowed. An empty (or absent) `actions:` stays legal on a remote step.

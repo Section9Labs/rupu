@@ -30,6 +30,7 @@ mod remote_coverage_ingest;
 mod recovery;
 mod remote_engagement;
 mod remote_findings_profile;
+mod remote_permission_mode;
 mod run_customer;
 mod run_step_workflow;
 mod runner_events;

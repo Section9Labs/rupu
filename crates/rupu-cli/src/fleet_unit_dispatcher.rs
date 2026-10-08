@@ -339,7 +339,9 @@ impl UnitDispatcher for FleetUnitDispatcher {
                 codename: unit.codename.clone(),
                 agent: unit.agent,
                 prompt: Some(unit.rendered_prompt),
-                mode: None,
+                // The run's mode, rendered as `--mode` by every connector, so
+                // the host's own `permission_mode` default never applies.
+                mode: unit.mode.map(|m| m.as_str().to_string()),
                 target: None,
                 working_dir: working_dir.clone(),
                 run_id: Some(unit_run_id.clone()),
@@ -1192,6 +1194,7 @@ mod tests {
             workspace: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            mode: None,
             codename: None,
         }
     }
@@ -2765,6 +2768,27 @@ steps:
             d.dispatch_unit(unit, "h1").await.unwrap();
             let launched = conn.launched.lock().unwrap().clone().expect("launched");
             assert_eq!(launched.engagement_profiles, ids);
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_passes_the_units_mode_to_launch_agent() {
+        use rupu_tools::PermissionMode;
+        for (mode, expected) in [
+            (Some(PermissionMode::Readonly), Some("readonly")),
+            (Some(PermissionMode::Bypass), Some("bypass")),
+            (None, None),
+        ] {
+            let conn = Arc::new(FakeConnector::completed());
+            let d = FleetUnitDispatcher::from_connector(
+                Arc::clone(&conn) as Arc<dyn HostConnector>,
+                PathBuf::from("/g"),
+            );
+            let mut unit = make_unit();
+            unit.mode = mode;
+            d.dispatch_unit(unit, "h1").await.unwrap();
+            let launched = conn.launched.lock().unwrap().clone().expect("launched");
+            assert_eq!(launched.mode.as_deref(), expected);
         }
     }
 
