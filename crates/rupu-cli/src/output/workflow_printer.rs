@@ -4217,6 +4217,7 @@ mod tests {
             final_output: None,
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
+            system_prompt_suffix: None,
             codename: None,
             cause: None,
         }
@@ -4292,7 +4293,7 @@ mod tests {
         store
             .create(sample_run_record(), "name: demo\nsteps: []\n")
             .unwrap();
-        let ledger = UsageLedger::for_run(&store, "run_test");
+        let ledger = UsageLedger::open(store.usage_ledger_path("run_test"));
         for (id, step, input, output) in [
             ("r1", "understand", 1_000_000, 0),
             ("r2", "implement", 0, 1_000_000),

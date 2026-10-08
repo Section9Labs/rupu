@@ -179,6 +179,7 @@ impl NodeMirror {
             final_output: None,
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
+            system_prompt_suffix: None,
             codename: None,
             // The launch spec carries no customer; the node's own run.json
             // (`ArtifactFile::RunJson` below) brings the customer the remote

@@ -4,12 +4,9 @@ use std::time::Duration;
 
 fn ctx_with_timeout(secs: u64) -> ToolContext {
     let pwd = std::env::current_dir().unwrap();
-    ToolContext {
-        workspace_path: pwd,
-        bash_env_allowlist: vec![],
-        bash_timeout_secs: secs,
-        ..Default::default()
-    }
+    let mut ctx = ToolContext::in_workspace(pwd);
+    ctx.workspace.bash.timeout_secs = secs;
+    ctx
 }
 
 #[tokio::test]
@@ -58,7 +55,7 @@ async fn timeout_kills_runaway_process() {
 async fn cwd_is_workspace_path() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let mut ctx = ctx_with_timeout(10);
-    ctx.workspace_path = tmp.path().to_path_buf();
+    ctx.workspace.path = tmp.path().to_path_buf();
     let out = BashTool
         .invoke(json!({ "command": "pwd" }), &ctx)
         .await
@@ -74,7 +71,7 @@ async fn cwd_is_workspace_path() {
 #[tokio::test]
 async fn env_allowlist_filters_inherited_env() {
     let mut ctx = ctx_with_timeout(10);
-    ctx.bash_env_allowlist = vec!["RUPU_TEST_VAR".into()];
+    ctx.workspace.bash.env_allowlist = vec!["RUPU_TEST_VAR".into()];
     std::env::set_var("RUPU_TEST_VAR", "hello-rupu");
     std::env::set_var("RUPU_DENIED_VAR", "should-not-leak");
 

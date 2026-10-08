@@ -61,7 +61,7 @@ impl Tool for GlobTool {
         let i: Input =
             serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
 
-        let walker = globwalk::GlobWalkerBuilder::from_patterns(&ctx.workspace_path, &[&i.pattern])
+        let walker = globwalk::GlobWalkerBuilder::from_patterns(&ctx.workspace.path, &[&i.pattern])
             .max_depth(64)
             .follow_links(false)
             .build()
@@ -71,10 +71,10 @@ impl Tool for GlobTool {
         // (`../*`, an absolute path) yields nothing outside the workspace.
         let mut matches = vec![];
         for entry in walker.flatten() {
-            if entry.file_type().is_file() && is_inside(&ctx.workspace_path, entry.path()) {
+            if entry.file_type().is_file() && is_inside(&ctx.workspace.path, entry.path()) {
                 let rel = entry
                     .path()
-                    .strip_prefix(&ctx.workspace_path)
+                    .strip_prefix(&ctx.workspace.path)
                     .unwrap_or(entry.path());
                 matches.push(rel.display().to_string());
             }

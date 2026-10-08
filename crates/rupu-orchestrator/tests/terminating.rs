@@ -9,7 +9,7 @@
 //! (the flag is already up before the run starts).
 
 use async_trait::async_trait;
-use rupu_agent::AgentRunOpts;
+use rupu_agent::LegacyRunOpts;
 use rupu_orchestrator::runner::{
     run_workflow, OrchestratorRunOpts, RunWorkflowError, StepFactory, UnitCoverage, UnitDispatch,
     UnitDispatcher, UnitFailure, UnitOutcome,
@@ -34,7 +34,7 @@ impl StepFactory for PanicFactory {
         _workspace_path: std::path::PathBuf,
         _transcript_path: std::path::PathBuf,
         _on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> AgentRunOpts {
+    ) -> LegacyRunOpts {
         panic!("no step may be built once the process is terminating");
     }
 }

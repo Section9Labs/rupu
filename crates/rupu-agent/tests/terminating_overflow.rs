@@ -13,7 +13,6 @@ use rupu_providers::credential_writes;
 use rupu_providers::model_limits::ModelLimits;
 use rupu_providers::types::{ContentBlock, LlmRequest, LlmResponse, Message, Role, StopReason};
 use rupu_providers::{LlmProvider, ProviderError, StreamEvent};
-use rupu_tools::ToolContext;
 use rupu_transcript::{Event, JsonlReader, RunStatus};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -102,54 +101,56 @@ async fn a_terminating_process_starts_no_overflow_compaction_call() {
         calls: calls.clone(),
     };
     let transcript = tmp.path().join("overflow.jsonl");
-    let res = run_agent(AgentRunOpts {
-        seed_source: None,
-        collectors: Vec::new(),
-        extra_tools: Vec::new(),
-        step_actions: Vec::new(),
-        alias_scope: Default::default(),
-        agent_name: "test".into(),
-        agent_system_prompt: "test".into(),
-        agent_tools: None,
-        provider: Box::new(provider),
-        provider_name: "mock".into(),
-        model: "mock-1".into(),
-        run_id: "run_terminating_overflow".into(),
-        workspace_id: "ws_terminating".into(),
-        workspace_path: tmp.path().to_path_buf(),
-        transcript_path: transcript.clone(),
-        max_turns: 5,
-        permission: rupu_tools::PermissionPolicy::bypass(),
-        tool_context: ToolContext::default(),
-        user_message: "go".into(),
-        initial_messages: history(),
-        turn_index_offset: 0,
-        no_stream: false,
-        suppress_stream_stdout: true,
-        mcp_registry: None,
-        effort: None,
-        thinking_display: None,
-        context_window: None,
-        output_format: None,
-        output_schema: None,
-        anthropic_task_budget: None,
-        anthropic_context_management: None,
-        anthropic_speed: None,
-        parent_run_id: None,
-        depth: 0,
-        dispatchable_agents: None,
-        step_id: String::new(),
-        on_tool_call: None,
-        on_stream_event: None,
-        on_usage: None,
-        concerns: None,
-        limits: ModelLimits::fixed(2_000, 100),
-        scope_name: None,
-        surface_tag: None,
-        pause: None,
-        codename: None,
-        recovery: Default::default(),
-    })
+    let res = run_agent(
+        rupu_agent::grant::with_grant(
+            AgentRunOpts {
+                system_prompt: "test".into(),
+                prompt: rupu_agent::UserTurn {
+                    message: "go".into(),
+                    initial_messages: history(),
+                    seed_source: None,
+                    turn_index_offset: 0,
+                },
+                provider: Box::new(provider),
+                limits: ModelLimits::fixed(2_000, 100),
+                recovery: Default::default(),
+                permission: rupu_tools::PermissionPolicy::bypass(),
+                grant: Default::default(),
+                alias_scope: Default::default(),
+                tool_context: rupu_tools::ToolContext {
+                    identity: std::sync::Arc::new(rupu_tools::RunIdentity {
+                        agent: "test".into(),
+                        provider: "mock".into(),
+                        model: "mock-1".into(),
+                        run_id: "run_terminating_overflow".into(),
+                        ..Default::default()
+                    }),
+                    workspace: rupu_tools::WorkspaceScope {
+                        id: "ws_terminating".into(),
+                        path: tmp.path().to_path_buf(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                pins: Default::default(),
+                concerns: None,
+                max_turns: 5,
+                stream: rupu_agent::StreamOpts {
+                    no_stream: false,
+                    suppress_stdout: true,
+                    on_stream_event: None,
+                },
+                hooks: Default::default(),
+                pause: None,
+                collectors: Vec::new(),
+                extra_tools: Vec::new(),
+                transcript_path: transcript.clone(),
+            },
+            None,
+            &Vec::new(),
+        )
+        .expect("grant"),
+    )
     .await;
     match res {
         Err(RunError::Terminating) => {}

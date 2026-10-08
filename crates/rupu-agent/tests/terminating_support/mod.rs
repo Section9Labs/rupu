@@ -11,7 +11,6 @@ use rupu_providers::credential_writes;
 use rupu_providers::model_limits::ModelLimits;
 use rupu_providers::types::{LlmRequest, LlmResponse, StopReason};
 use rupu_providers::{LlmProvider, ProviderError, StreamEvent};
-use rupu_tools::ToolContext;
 use rupu_transcript::{Event, JsonlReader, RunStatus};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -77,70 +76,68 @@ pub async fn run_terminating(
     let tmp = assert_fs::TempDir::new().unwrap();
     let builds = Arc::new(AtomicUsize::new(0));
     let transcript = tmp.path().join(format!("{name}.jsonl"));
-    let res = run_agent(AgentRunOpts {
-        seed_source: None,
-        collectors: Vec::new(),
-        extra_tools: Vec::new(),
-        step_actions: Vec::new(),
-        alias_scope: Default::default(),
-        agent_name: "test".into(),
-        agent_system_prompt: "test".into(),
-        agent_tools: None,
-        provider: Box::new(TerminatingProvider {
-            inner: MockProvider::new(vec![turn]),
-        }),
-        provider_name: "anthropic".into(),
-        model: "claude-opus-5-5".into(),
-        run_id: format!("run_{name}"),
-        workspace_id: "ws_terminating".into(),
-        workspace_path: tmp.path().to_path_buf(),
-        transcript_path: transcript.clone(),
-        max_turns: 5,
-        permission: rupu_tools::PermissionPolicy::bypass(),
-        tool_context: ToolContext::default(),
-        user_message: "go".into(),
-        initial_messages: Vec::new(),
-        turn_index_offset: 0,
-        no_stream: false,
-        suppress_stream_stdout: true,
-        mcp_registry: None,
-        effort: None,
-        thinking_display: None,
-        context_window: None,
-        output_format: None,
-        output_schema: None,
-        anthropic_task_budget: None,
-        anthropic_context_management: None,
-        anthropic_speed: None,
-        parent_run_id: None,
-        depth: 0,
-        dispatchable_agents: None,
-        step_id: "s1".into(),
-        on_tool_call: None,
-        on_stream_event: None,
-        on_usage: None,
-        concerns: None,
-        limits: ModelLimits::unknown(),
-        scope_name: None,
-        surface_tag: None,
-        pause: None,
-        codename: None,
-        recovery: RecoveryOpts {
-            chain: vec![
-                rupu_config::FallbackEntry {
-                    provider: None,
-                    model: "claude-opus-4-8".into(),
+    let res = run_agent(
+        rupu_agent::grant::with_grant(
+            AgentRunOpts {
+                system_prompt: "test".into(),
+                prompt: rupu_agent::UserTurn::new("go"),
+                provider: Box::new(TerminatingProvider {
+                    inner: MockProvider::new(vec![turn]),
+                }),
+                limits: ModelLimits::unknown(),
+                recovery: RecoveryOpts {
+                    chain: vec![
+                        rupu_config::FallbackEntry {
+                            provider: None,
+                            model: "claude-opus-4-8".into(),
+                        },
+                        rupu_config::FallbackEntry {
+                            provider: Some("openai-codex".into()),
+                            model: "gpt-test".into(),
+                        },
+                    ],
+                    hop_builder: Some(Arc::new(CountingHops {
+                        builds: builds.clone(),
+                    })),
                 },
-                rupu_config::FallbackEntry {
-                    provider: Some("openai-codex".into()),
-                    model: "gpt-test".into(),
+                permission: rupu_tools::PermissionPolicy::bypass(),
+                grant: Default::default(),
+                alias_scope: Default::default(),
+                tool_context: rupu_tools::ToolContext {
+                    identity: std::sync::Arc::new(rupu_tools::RunIdentity {
+                        agent: "test".into(),
+                        provider: "anthropic".into(),
+                        model: "claude-opus-5-5".into(),
+                        run_id: format!("run_{name}"),
+                        step_id: Some("s1".into()),
+                        ..Default::default()
+                    }),
+                    workspace: rupu_tools::WorkspaceScope {
+                        id: "ws_terminating".into(),
+                        path: tmp.path().to_path_buf(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
                 },
-            ],
-            hop_builder: Some(Arc::new(CountingHops {
-                builds: builds.clone(),
-            })),
-        },
-    })
+                pins: Default::default(),
+                concerns: None,
+                max_turns: 5,
+                stream: rupu_agent::StreamOpts {
+                    no_stream: false,
+                    suppress_stdout: true,
+                    on_stream_event: None,
+                },
+                hooks: Default::default(),
+                pause: None,
+                collectors: Vec::new(),
+                extra_tools: Vec::new(),
+                transcript_path: transcript.clone(),
+            },
+            None,
+            &Vec::new(),
+        )
+        .expect("grant"),
+    )
     .await;
     let events: Vec<Event> = JsonlReader::iter(&transcript)
         .expect("transcript")

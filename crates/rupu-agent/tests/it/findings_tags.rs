@@ -120,7 +120,7 @@ async fn tag_events_reach_the_run_stream() {
         Some(vec!["tag_findings".to_string()]),
         tag_then_stop(serde_json::json!({"finding_ids": ["fnd_a"], "add": ["x"]})),
     );
-    opts.tool_context.coverage_stream = Some(stream.clone());
+    opts.tool_context.services.coverage_stream = Some(stream.clone());
     run_agent(opts).await.expect("agent run should succeed");
     let found = std::fs::read_to_string(&stream).unwrap().lines().any(|l| {
         matches!(
@@ -138,10 +138,7 @@ async fn query_findings_pages_and_lists_the_vocabulary() {
     seed(&ws, "fnd_a", Severity::High);
     seed(&ws, "fnd_b", Severity::Low);
     let tag = TagFindingsTool::new(TagLog::for_workspace(&ws));
-    let ctx = ToolContext {
-        workspace_path: ws.clone(),
-        ..Default::default()
-    };
+    let ctx = ToolContext::in_workspace(ws.clone());
     let out = tag
         .invoke(
             serde_json::json!({"finding_ids": ["fnd_b"], "add": ["needs-poc"]}),
@@ -178,10 +175,7 @@ async fn bad_input_is_an_error_the_agent_can_read() {
     let tmp = tempfile::TempDir::new().unwrap();
     let ws = tmp.path().to_path_buf();
     seed(&ws, "fnd_a", Severity::High);
-    let ctx = ToolContext {
-        workspace_path: ws.clone(),
-        ..Default::default()
-    };
+    let ctx = ToolContext::in_workspace(ws.clone());
     let tag = TagFindingsTool::new(TagLog::for_workspace(&ws));
     let out = tag
         .invoke(
@@ -211,10 +205,7 @@ async fn a_bad_query_is_an_error_the_agent_can_read() {
     let tmp = tempfile::TempDir::new().unwrap();
     let ws = tmp.path().to_path_buf();
     seed(&ws, "fnd_a", Severity::High);
-    let ctx = ToolContext {
-        workspace_path: ws.clone(),
-        ..Default::default()
-    };
+    let ctx = ToolContext::in_workspace(ws.clone());
     let out = QueryFindingsTool::new(ws)
         .invoke(serde_json::json!({"q": "project:x"}), &ctx)
         .await

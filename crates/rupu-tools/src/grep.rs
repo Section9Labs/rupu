@@ -79,12 +79,12 @@ impl Tool for GrepTool {
         let search_path = i
             .path
             .as_deref()
-            .map(|p| ctx.workspace_path.join(p))
-            .unwrap_or_else(|| ctx.workspace_path.clone());
+            .map(|p| ctx.workspace.path.join(p))
+            .unwrap_or_else(|| ctx.workspace.path.clone());
         // Containment: `join` replaces the base for an absolute argument and
         // does not normalize `..`, so an agent-supplied path can leave the
         // workspace. Same guard the write tools use (ISSUES.md I-22).
-        if !crate::path_scope::is_inside(&ctx.workspace_path, &search_path) {
+        if !crate::path_scope::is_inside(&ctx.workspace.path, &search_path) {
             return Ok(ToolOutput {
                 stdout: String::new(),
                 error: Some(format!(
@@ -135,7 +135,7 @@ impl Tool for GrepTool {
                 if let Ok(linenum) = linenum_str.parse::<u32>() {
                     // Make the path workspace-relative if possible.
                     let rel_path = std::path::Path::new(raw_path)
-                        .strip_prefix(&ctx.workspace_path)
+                        .strip_prefix(&ctx.workspace.path)
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|_| raw_path.to_string());
                     by_file.entry(rel_path).or_default().push(linenum);
@@ -175,10 +175,7 @@ mod tests {
     use crate::tool::ToolContext;
 
     fn ctx_in(dir: &std::path::Path) -> ToolContext {
-        ToolContext {
-            workspace_path: dir.to_path_buf(),
-            ..ToolContext::default()
-        }
+        ToolContext::in_workspace(dir)
     }
 
     #[tokio::test]

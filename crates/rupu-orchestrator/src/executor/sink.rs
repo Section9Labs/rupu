@@ -34,6 +34,43 @@ impl EventSink for FanOutSink {
     }
 }
 
+/// The parent run's event sink as the in-process dispatcher's
+/// [`DispatchEvents`](rupu_runtime::dispatch::DispatchEvents) port: a child
+/// becomes `DispatchStarted` / `DispatchCompleted` on the parent's run, so
+/// the live view renders it as a node under the active step.
+pub struct DispatchEventSink(pub Arc<dyn EventSink>);
+
+impl rupu_runtime::dispatch::DispatchEvents for DispatchEventSink {
+    fn started(&self, parent_run_id: &str, child: &rupu_runtime::dispatch::DispatchedChild) {
+        self.0.emit(
+            parent_run_id,
+            &Event::DispatchStarted {
+                run_id: parent_run_id.to_string(),
+                sub_run_id: child.sub_run_id.clone(),
+                agent: Some(child.agent.clone()),
+                transcript_path: child.transcript_path.clone(),
+                codename: child.codename.clone(),
+                provider: Some(child.provider.clone()),
+                model: Some(child.model.clone()),
+            },
+        );
+    }
+
+    fn completed(&self, parent_run_id: &str, done: &rupu_runtime::dispatch::DispatchDone) {
+        self.0.emit(
+            parent_run_id,
+            &Event::DispatchCompleted {
+                run_id: parent_run_id.to_string(),
+                sub_run_id: done.sub_run_id.clone(),
+                success: done.success,
+                tokens_in: done.tokens_in,
+                tokens_out: done.tokens_out,
+                cause: done.cause.clone(),
+            },
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

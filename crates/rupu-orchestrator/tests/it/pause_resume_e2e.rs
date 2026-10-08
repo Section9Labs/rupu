@@ -33,7 +33,7 @@
 use async_trait::async_trait;
 use rupu_agent::continuation::CONTINUATION_NOTE;
 use rupu_agent::runner::{CapturingMockProvider, MockProvider, ScriptedTurn};
-use rupu_agent::AgentRunOpts;
+use rupu_agent::LegacyRunOpts;
 use rupu_orchestrator::executor::{AttemptResumeMode, Event, EventSink};
 use rupu_orchestrator::recovery::{discover, AttemptPlan, RecoveryPlans};
 use rupu_orchestrator::runner::{
@@ -150,7 +150,7 @@ impl<P: LlmProvider> LlmProvider for CancelAfterInner<P> {
     }
 }
 
-/// Build a minimal `AgentRunOpts` around `provider`. The runner always
+/// Build a minimal `LegacyRunOpts` around `provider`. The runner always
 /// streams (`no_stream: true` only quiets the display), and it races that
 /// `provider.stream` call against the pause token — the deterministic
 /// boundary these tests exploit (mirrors `rupu_orchestrator::runner`'s own
@@ -165,8 +165,8 @@ fn linear_agent_opts(
     workspace_path: PathBuf,
     transcript_path: PathBuf,
     on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-) -> AgentRunOpts {
-    AgentRunOpts {
+) -> LegacyRunOpts {
+    LegacyRunOpts {
         seed_source: None,
         collectors: Vec::new(),
         extra_tools: Vec::new(),
@@ -232,7 +232,7 @@ impl StepFactory for PanicFactory {
         _workspace_path: PathBuf,
         _transcript_path: PathBuf,
         _on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> AgentRunOpts {
+    ) -> LegacyRunOpts {
         panic!(
             "PanicFactory: build_opts_for_step must not be called for a fully-distributed fan-out"
         )
@@ -282,7 +282,7 @@ impl StepFactory for OneShotFactory {
         workspace_path: PathBuf,
         transcript_path: PathBuf,
         on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> AgentRunOpts {
+    ) -> LegacyRunOpts {
         *self.transcript_path_out.lock().unwrap() = Some(transcript_path.clone());
         let provider = self
             .provider
@@ -581,7 +581,7 @@ impl StepFactory for CancelOnAlphaFactory {
         workspace_path: PathBuf,
         transcript_path: PathBuf,
         on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> AgentRunOpts {
+    ) -> LegacyRunOpts {
         assert_eq!(
             step_id, "alpha",
             "step-boundary pause must stop the loop before step 2 is ever dispatched"
@@ -626,7 +626,7 @@ impl StepFactory for EchoFactory {
         workspace_path: PathBuf,
         transcript_path: PathBuf,
         on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> AgentRunOpts {
+    ) -> LegacyRunOpts {
         self.seen.lock().unwrap().push(step_id.to_string());
         let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
             text: format!("done: {rendered_prompt}"),
@@ -1092,7 +1092,7 @@ impl StepFactory for FastOrHangFactory {
         workspace_path: PathBuf,
         transcript_path: PathBuf,
         on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> AgentRunOpts {
+    ) -> LegacyRunOpts {
         let provider: Box<dyn LlmProvider> = if rendered_prompt.contains("slow") {
             Box::new(BlockingProvider)
         } else {
@@ -1282,7 +1282,7 @@ impl StepFactory for RecoverFactory {
         workspace_path: PathBuf,
         transcript_path: PathBuf,
         on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> AgentRunOpts {
+    ) -> LegacyRunOpts {
         self.built.lock().unwrap().push(rendered_prompt.clone());
         let unit = rendered_prompt.trim_start_matches("Process ").to_string();
         let provider: Box<dyn LlmProvider> = if self.hang_b && unit == "b" {
@@ -1310,7 +1310,7 @@ impl StepFactory for RecoverFactory {
             transcript_path,
             on_tool_call,
         );
-        opts.tool_context.workspace_path = workspace_path;
+        opts.tool_context.workspace.path = workspace_path;
         opts
     }
 }

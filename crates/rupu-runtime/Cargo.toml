@@ -34,6 +34,10 @@ rupu-tools = { path = "../rupu-tools" }
 rupu-coverage = { path = "../rupu-coverage" }
 rupu-netflow = { workspace = true, features = ["http"] }
 rupu-netwatch = { workspace = true }
+rupu-transcript = { path = "../rupu-transcript" }
+rupu-scm = { path = "../rupu-scm" }
+rupu-codename = { path = "../rupu-codename" }
+tokio-util.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
@@ -46,3 +50,4 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 serial_test.workspace = true
 rustix.workspace = true
+insta.workspace = true

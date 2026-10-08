@@ -3,10 +3,7 @@ use rupu_tools::{DerivedEvent, Tool, ToolContext, WriteFileTool};
 use serde_json::json;
 
 fn ctx(workspace: &std::path::Path) -> ToolContext {
-    ToolContext {
-        workspace_path: workspace.to_path_buf(),
-        ..Default::default()
-    }
+    ToolContext::in_workspace(workspace)
 }
 
 #[tokio::test]

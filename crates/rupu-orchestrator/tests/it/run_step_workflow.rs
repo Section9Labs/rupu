@@ -8,7 +8,7 @@
 //! made only of `run:` steps never calls a model, which is the point.
 
 use async_trait::async_trait;
-use rupu_agent::AgentRunOpts;
+use rupu_agent::LegacyRunOpts;
 use rupu_config::policy_config::WorkflowConfig;
 use rupu_orchestrator::runner::{
     run_workflow, OrchestratorRunOpts, OrchestratorRunResult, RunStepPolicy, StepFactory,
@@ -35,7 +35,7 @@ impl StepFactory for NoAgentFactory {
         _workspace_path: PathBuf,
         _transcript_path: PathBuf,
         _on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> AgentRunOpts {
+    ) -> LegacyRunOpts {
         panic!("a run: step must never dispatch an agent");
     }
 }

@@ -1279,6 +1279,7 @@ mod tests {
             final_output: None,
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
+            system_prompt_suffix: None,
             cause: None,
         }
     }

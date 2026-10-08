@@ -524,6 +524,17 @@ fn collect_local_sources(
         }
         let u = crate::usage::run_usage(store, &r.id);
         let mut rows = u.rows.clone();
+        // A standalone `rupu run` is recorded as `agent:<name>`. It meters
+        // itself (W3, R13), so its ledger claims its transcript and it is
+        // counted here, not as an extra source: report it as the agent run it
+        // is (no workflow), exactly as its transcript would be.
+        let agent_run = r
+            .workflow_name
+            .strip_prefix(rupu_orchestrator::AGENT_RUN_PREFIX);
+        let workflow = match agent_run {
+            Some(_) => String::new(),
+            None => r.workflow_name.clone(),
+        };
         // Attribute each row to the run it came from: `r` is already in
         // hand, so this is a free inline join. `host_id` is "local" because
         // this only ever reads the local run store; a REMOTE host's rows
@@ -531,18 +542,21 @@ fn collect_local_sources(
         // `GroupBy::Host` override in `get_usage`'s fan-out loop, which is
         // what keeps `group_by=host` meaningful across more than one host.
         for row in &mut rows {
-            row.workflow = r.workflow_name.clone();
+            row.workflow = workflow.clone();
             row.workspace_id = r.workspace_id.clone();
             row.host_id = "local".to_string();
         }
         out.push(LocalSource {
-            kind: SourceKind::Workflow,
+            kind: match agent_run {
+                Some(_) => SourceKind::Agent,
+                None => SourceKind::Workflow,
+            },
             id: r.id.clone(),
             started_at: r.started_at,
-            workflow: r.workflow_name.clone(),
-            agent: String::new(),
+            workflow,
+            agent: agent_run.unwrap_or_default().to_string(),
             session_id: None,
-            transcript_path: None,
+            transcript_path: agent_run.map(|_| r.transcript_dir.join(format!("{}.jsonl", r.id))),
             rows,
             partial: u.partial,
             price,
@@ -2146,6 +2160,7 @@ mod tests {
             final_output: None,
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
+            system_prompt_suffix: None,
             codename: None,
             cause: None,
         };

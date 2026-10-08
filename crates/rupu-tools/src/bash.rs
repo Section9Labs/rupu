@@ -186,18 +186,19 @@ impl Tool for BashTool {
         // Subprocess network capture: only when a backend, a sink, the run
         // id and the tool-call id are all present. Otherwise the exact
         // pre-capture path runs.
+        let run_id = Some(&ctx.identity.run_id).filter(|id| !id.is_empty());
         let mut capture_call: Option<CaptureGuard> = match (
-            ctx.net_capture.as_ref(),
-            ctx.netflow_sink.as_ref(),
-            ctx.run_id.as_ref(),
-            ctx.tool_call_id.as_ref(),
+            ctx.services.net_capture.as_ref(),
+            ctx.services.netflow_sink.as_ref(),
+            run_id,
+            ctx.call.tool_call_id.as_ref(),
         ) {
             (Some(capture), Some(sink), Some(run_id), Some(tool_call_id)) => Some(CaptureGuard(
                 Some(capture.begin(rupu_netflow::CallAttribution {
                     run_id: run_id.clone(),
                     step_id: None,
-                    agent: ctx.agent.clone(),
-                    codename: ctx.codename.clone(),
+                    agent: Some(ctx.identity.agent.clone()).filter(|a| !a.is_empty()),
+                    codename: ctx.identity.codename.clone(),
                     tool_call_id: tool_call_id.clone(),
                     sink: sink.clone(),
                 })),
@@ -211,12 +212,12 @@ impl Tool for BashTool {
 
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c").arg(&script);
-        cmd.current_dir(&ctx.workspace_path);
+        cmd.current_dir(&ctx.workspace.path);
         cmd.env_clear();
         for key in ALWAYS_ALLOWED_ENV
             .iter()
             .copied()
-            .chain(ctx.bash_env_allowlist.iter().map(|s| s.as_str()))
+            .chain(ctx.workspace.bash.env_allowlist.iter().map(|s| s.as_str()))
         {
             if let Ok(val) = std::env::var(key) {
                 cmd.env(key, val);
@@ -232,7 +233,7 @@ impl Tool for BashTool {
         if let (Some(guard), Some(pid)) = (capture_call.as_mut(), child.id()) {
             guard.spawned(pid);
         }
-        let timeout_dur = Duration::from_secs(ctx.bash_timeout_secs);
+        let timeout_dur = Duration::from_secs(ctx.workspace.bash.timeout_secs);
 
         // `capture_call` (if any) finishes when it drops: on every return
         // path, and also if this future is dropped mid-await (a cancelled
@@ -256,7 +257,7 @@ impl Tool for BashTool {
                     if token.starts_with('-') {
                         continue;
                     }
-                    let candidate = ctx.workspace_path.join(token);
+                    let candidate = ctx.workspace.path.join(token);
                     if candidate.is_file() {
                         emit(
                             ctx,
@@ -278,7 +279,7 @@ impl Tool for BashTool {
                     duration_ms: started.elapsed().as_millis() as u64,
                     derived: Some(DerivedEvent::CommandRun {
                         argv: vec!["/bin/sh".into(), "-c".into(), i.command],
-                        cwd: ctx.workspace_path.display().to_string(),
+                        cwd: ctx.workspace.path.display().to_string(),
                         exit_code,
                         stdout_bytes: out.stdout.len() as u64,
                         stderr_bytes: out.stderr.len() as u64,
@@ -298,7 +299,10 @@ impl Tool for BashTool {
                 // the child handle is dropped at the end of this scope.
                 Ok(ToolOutput {
                     stdout: String::new(),
-                    error: Some(format!("timeout after {}s", ctx.bash_timeout_secs)),
+                    error: Some(format!(
+                        "timeout after {}s",
+                        ctx.workspace.bash.timeout_secs
+                    )),
                     duration_ms: started.elapsed().as_millis() as u64,
                     derived: None,
                     structured: None,
@@ -363,15 +367,12 @@ mod tests {
     }
 
     fn ctx(dir: &std::path::Path, capture: Option<Recorder>) -> ToolContext {
-        let mut c = ToolContext {
-            workspace_path: dir.to_path_buf(),
-            ..Default::default()
-        };
+        let mut c = ToolContext::in_workspace(dir);
         if let Some(r) = capture {
-            c.net_capture = Some(Arc::new(r));
-            c.netflow_sink = Some(Arc::new(MemorySink::default()));
-            c.run_id = Some("run-x".into());
-            c.tool_call_id = Some("toolu_1".into());
+            c.services.net_capture = Some(Arc::new(r));
+            c.services.netflow_sink = Some(Arc::new(MemorySink::default()));
+            c.identity_mut().run_id = "run-x".into();
+            c.call.tool_call_id = Some("toolu_1".into());
         }
         c
     }
@@ -438,7 +439,7 @@ mod tests {
                 log: log.clone(),
             }),
         );
-        c.bash_timeout_secs = 1;
+        c.workspace.bash.timeout_secs = 1;
         let out = BashTool
             .invoke(serde_json::json!({"command": "sleep 5"}), &c)
             .await
@@ -458,7 +459,7 @@ mod tests {
                 log: log.clone(),
             }),
         );
-        c.workspace_path = dir.path().join("does-not-exist");
+        c.workspace.path = dir.path().join("does-not-exist");
         let res = BashTool
             .invoke(serde_json::json!({"command": "echo hi"}), &c)
             .await;

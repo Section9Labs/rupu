@@ -20,7 +20,7 @@
 
 use async_trait::async_trait;
 use rupu_agent::runner::{MockProvider, ScriptedTurn};
-use rupu_agent::AgentRunOpts;
+use rupu_agent::LegacyRunOpts;
 use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts, StepFactory};
 use rupu_orchestrator::Workflow;
 use rupu_providers::types::StopReason;
@@ -54,9 +54,7 @@ impl AgentDispatcher for FakeDispatcher {
         &self,
         agent_name: &str,
         prompt: String,
-        _parent_run_id: &str,
-        _parent_depth: u32,
-        _parent_codename: Option<&str>,
+        _parent: &rupu_tools::RunIdentity,
         _permission: rupu_tools::SpawnPermission,
     ) -> Result<DispatchOutcome, DispatchError> {
         self.calls
@@ -134,7 +132,7 @@ impl StepFactory for DispatchFactory {
         workspace_path: std::path::PathBuf,
         transcript_path: std::path::PathBuf,
         _on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> AgentRunOpts {
+    ) -> LegacyRunOpts {
         // Two-turn script:
         //   turn 0: dispatch_agent tool_use targeting `security-reviewer`.
         //   turn 1: final assistant text after seeing the tool_result.
@@ -156,9 +154,7 @@ impl StepFactory for DispatchFactory {
                 output_tokens: 5,
             },
         ]);
-
-        let parent_run_id_for_ctx = Some(run_id.clone());
-        AgentRunOpts {
+        LegacyRunOpts {
             seed_source: None,
             collectors: Vec::new(),
             extra_tools: Vec::new(),
@@ -177,29 +173,19 @@ impl StepFactory for DispatchFactory {
             max_turns: 5,
             permission: rupu_tools::PermissionPolicy::bypass(),
             tool_context: ToolContext {
-                customer: None,
-                findings: None,
-                workspace_path,
-                bash_env_allowlist: Vec::new(),
-                bash_timeout_secs: 120,
-                dispatcher: Some(self.dispatcher.clone()),
-                dispatchable_agents: Some(vec!["security-reviewer".into()]),
-                parent_run_id: parent_run_id_for_ctx,
-                depth: 0,
-                coverage_writer: None,
-                surface_tag: None,
-                run_id: None,
-                model: None,
-                tool_mappings: None,
-                codename: None,
-                agent: None,
-                provider: None,
-                coverage_stream: None,
-                netflow_sink: None,
-                net_capture: None,
-                tool_call_id: None,
-                spawn_ceiling: None,
-                prompter: None,
+                workspace: rupu_tools::WorkspaceScope {
+                    path: workspace_path,
+                    bash: rupu_tools::BashConfig {
+                        env_allowlist: Vec::new(),
+                        timeout_secs: 120,
+                    },
+                    ..Default::default()
+                },
+                services: rupu_tools::ToolServices {
+                    dispatcher: Some(self.dispatcher.clone()),
+                    ..Default::default()
+                },
+                ..Default::default()
             },
             user_message: rendered_prompt,
             initial_messages: Vec::new(),
@@ -325,7 +311,7 @@ async fn dispatch_to_unlisted_agent_is_blocked_by_allowlist() {
             workspace_path: std::path::PathBuf,
             transcript_path: std::path::PathBuf,
             _on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-        ) -> AgentRunOpts {
+        ) -> LegacyRunOpts {
             let provider = MockProvider::new(vec![
                 ScriptedTurn::AssistantToolUse {
                     text: None,
@@ -344,8 +330,7 @@ async fn dispatch_to_unlisted_agent_is_blocked_by_allowlist() {
                     output_tokens: 3,
                 },
             ]);
-            let parent_run_id_for_ctx = Some(run_id.clone());
-            AgentRunOpts {
+            LegacyRunOpts {
                 seed_source: None,
                 collectors: Vec::new(),
                 extra_tools: Vec::new(),
@@ -364,29 +349,19 @@ async fn dispatch_to_unlisted_agent_is_blocked_by_allowlist() {
                 max_turns: 5,
                 permission: rupu_tools::PermissionPolicy::bypass(),
                 tool_context: ToolContext {
-                    customer: None,
-                    findings: None,
-                    workspace_path,
-                    bash_env_allowlist: Vec::new(),
-                    bash_timeout_secs: 120,
-                    dispatcher: Some(self.dispatcher.clone()),
-                    dispatchable_agents: Some(vec!["security-reviewer".into()]),
-                    parent_run_id: parent_run_id_for_ctx,
-                    depth: 0,
-                    coverage_writer: None,
-                    surface_tag: None,
-                    run_id: None,
-                    model: None,
-                    tool_mappings: None,
-                    codename: None,
-                    agent: None,
-                    provider: None,
-                    coverage_stream: None,
-                    netflow_sink: None,
-                    net_capture: None,
-                    tool_call_id: None,
-                    spawn_ceiling: None,
-                    prompter: None,
+                    workspace: rupu_tools::WorkspaceScope {
+                        path: workspace_path,
+                        bash: rupu_tools::BashConfig {
+                            env_allowlist: Vec::new(),
+                            timeout_secs: 120,
+                        },
+                        ..Default::default()
+                    },
+                    services: rupu_tools::ToolServices {
+                        dispatcher: Some(self.dispatcher.clone()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
                 },
                 user_message: rendered_prompt,
                 initial_messages: Vec::new(),

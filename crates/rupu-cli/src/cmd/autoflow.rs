@@ -12667,12 +12667,13 @@ mod tests {
                     final_output: None,
                     loop_progress: Default::default(),
                     gate_decisions: Vec::new(),
+                    system_prompt_suffix: None,
                     cause: None,
                 },
                 "name: controller\nsteps: []\n",
             )
             .unwrap();
-        let ledger = UsageLedger::for_run(&store, "run_fold");
+        let ledger = UsageLedger::open(store.usage_ledger_path("run_fold"));
         for (id, step, agent_run, parent, input, output) in [
             ("u1", Some("decide"), "ag_step", None, 1_000_000, 0),
             ("u2", None, "ag_child", Some("ag_step"), 0, 1_000_000),
@@ -14068,6 +14069,7 @@ steps:
             final_output: None,
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
+            system_prompt_suffix: None,
             codename: None,
             cause: None,
         };
@@ -14232,6 +14234,7 @@ steps:
             final_output: None,
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
+            system_prompt_suffix: None,
             codename: None,
             cause: None,
         };
@@ -14381,6 +14384,7 @@ steps:
             final_output: None,
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
+            system_prompt_suffix: None,
             codename: None,
             cause: None,
         };
@@ -14545,6 +14549,7 @@ steps:
             final_output: None,
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
+            system_prompt_suffix: None,
             codename: None,
             cause: None,
         };
@@ -14699,6 +14704,7 @@ steps:
             final_output: None,
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
+            system_prompt_suffix: None,
             codename: None,
             cause: None,
         };
@@ -14845,6 +14851,7 @@ steps:
                     final_output: None,
                     loop_progress: Default::default(),
                     gate_decisions: Vec::new(),
+                    system_prompt_suffix: None,
                     codename: None,
                     cause: None,
                 },
@@ -15001,6 +15008,7 @@ steps:
                     final_output: None,
                     loop_progress: Default::default(),
                     gate_decisions: Vec::new(),
+                    system_prompt_suffix: None,
                     codename: None,
                     cause: None,
                 },
@@ -15182,6 +15190,7 @@ steps:
                     final_output: None,
                     loop_progress: Default::default(),
                     gate_decisions: Vec::new(),
+                    system_prompt_suffix: None,
                     codename: None,
                     cause: None,
                 },

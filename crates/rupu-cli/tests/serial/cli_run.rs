@@ -407,20 +407,29 @@ async fn fleet_attached_run_writes_a_usage_ledger() {
     assert!(row.output_tokens > 0, "output tokens recorded: {row:?}");
 }
 
-/// A plain `rupu run` is unchanged: no usage ledger.
+/// A plain `rupu run` meters itself too (W3, R13): its own
+/// `<runs>/<run_id>/usage.jsonl`, which the CP reads once the run's record
+/// exists (the transcript is then claimed, never folded on top).
 #[tokio::test(flavor = "multi_thread")]
-async fn plain_run_writes_no_usage_ledger() {
+async fn plain_run_writes_its_own_usage_ledger() {
     let _guard = ENV_LOCK.lock().await;
     let tmp = assert_fs::TempDir::new().unwrap();
 
     let (global, run_id) = run_echo_with(&tmp, &[]).await;
 
+    let ledger = global.join("runs").join(&run_id).join("usage.jsonl");
+    let body = std::fs::read_to_string(&ledger)
+        .unwrap_or_else(|e| panic!("a standalone run must write {ledger:?}: {e}"));
+    let rows: Vec<rupu_orchestrator::usage_ledger::LedgerRow> = body
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("a ledger row parses"))
+        .collect();
+    assert!(!rows.is_empty(), "at least one turn row");
+    assert_eq!(rows[0].agent_run_id, run_id);
+    assert_eq!(rows[0].parent_agent_run_id, None);
     assert!(
-        !global
-            .join("runs")
-            .join(&run_id)
-            .join("usage.jsonl")
-            .exists(),
-        "a non-fleet run writes no usage.jsonl"
+        rows[0].transcript.ends_with(format!("{run_id}.jsonl")),
+        "the row names the run's own transcript: {:?}",
+        rows[0].transcript
     );
 }

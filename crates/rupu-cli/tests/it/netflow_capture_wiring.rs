@@ -7,10 +7,11 @@
 //! structurally blunt: it matches source text, not types, so it cannot see a
 //! `ToolContext` built via a helper or `..base` spread. The type system still
 //! forces the fields to be spelled out (no `Default` on `ToolContext` is used
-//! at these sites), which is what makes the text check meaningful. It also
-//! checks that every production `CliAgentDispatcher::new` is followed by
-//! `set_net_capture(`, since the dispatcher hands the process-wide capture to
-//! dispatched children.
+//! at these sites), which is what makes the text check meaningful. Since W3
+//! the run assembler builds every run's `ToolContext` from its
+//! `AssemblyContext`, so it also checks that every production
+//! `AssemblyContext` carries the process-wide capture (the assembler hands
+//! it to each run it builds, dispatched children included).
 
 use std::path::{Path, PathBuf};
 
@@ -70,9 +71,9 @@ fn field_is_set(block: &str, field: &str) -> bool {
 #[test]
 fn every_production_tool_context_sets_sink_and_capture() {
     for rel in [
-        "crates/rupu-cli/src/cmd/run.rs",
-        "crates/rupu-cli/src/cmd/session.rs",
-        "crates/rupu-cli/src/cmd/dispatch.rs",
+        "crates/rupu-runtime/src/assembly/mod.rs",
+        // The flat options workflow steps still build (W3b moves them onto
+        // the assembler).
         "crates/rupu-orchestrator/src/step_factory.rs",
     ] {
         let blocks = tool_context_blocks(&production_source(rel));
@@ -91,20 +92,24 @@ fn every_production_tool_context_sets_sink_and_capture() {
 }
 
 #[test]
-fn every_production_dispatcher_installs_the_capture() {
+fn every_production_assembler_gets_the_capture() {
     for rel in [
         "crates/rupu-cli/src/cmd/run.rs",
+        "crates/rupu-cli/src/cmd/session.rs",
         "crates/rupu-cli/src/cmd/workflow.rs",
         "crates/rupu-cli/src/resume.rs",
     ] {
         let src = production_source(rel);
-        let news = src.matches("CliAgentDispatcher::new(").count();
-        let sets = src.matches(".set_net_capture(").count();
-        assert!(news > 0, "{rel}: expected a production dispatcher");
-        assert_eq!(
-            news, sets,
-            "{rel}: {news} CliAgentDispatcher::new vs {sets} set_net_capture"
-        );
+        let mut seen = 0;
+        for chunk in src.split("AssemblyContext {").skip(1) {
+            seen += 1;
+            let body = &chunk[..chunk.find("},").expect("literal end")];
+            assert!(
+                body.contains("net_capture: Some("),
+                "{rel}: AssemblyContext without net_capture: Some(..)"
+            );
+        }
+        assert!(seen > 0, "{rel}: expected a production assembler");
     }
 }
 

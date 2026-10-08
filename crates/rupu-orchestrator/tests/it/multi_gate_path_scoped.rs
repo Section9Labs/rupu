@@ -11,7 +11,7 @@
 
 use async_trait::async_trait;
 use rupu_agent::runner::{MockProvider, ScriptedTurn};
-use rupu_agent::AgentRunOpts;
+use rupu_agent::LegacyRunOpts;
 use rupu_orchestrator::runner::{
     run_reject_cleanup, run_workflow, OrchestratorRunOpts, OrchestratorRunResult, ResumeState,
     RunWorkflowError, StepFactory,
@@ -82,7 +82,7 @@ impl StepFactory for Factory {
         workspace_path: PathBuf,
         transcript_path: PathBuf,
         on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> AgentRunOpts {
+    ) -> LegacyRunOpts {
         self.calls.lock().unwrap().push(step_id.to_string());
         let hold = self
             .holds
@@ -100,7 +100,7 @@ impl StepFactory for Factory {
             input_tokens: 1,
             output_tokens: 1,
         }]);
-        AgentRunOpts {
+        LegacyRunOpts {
             seed_source: None,
             collectors: Vec::new(),
             extra_tools: Vec::new(),

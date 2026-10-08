@@ -6,7 +6,7 @@
 //! (the host resolves the agent's `findingsProfile` from its own agent file).
 
 use async_trait::async_trait;
-use rupu_agent::{AgentRunOpts, RunError};
+use rupu_agent::{LegacyRunOpts, RunError};
 use rupu_coverage::FindingProfile::{self, Full, Summary};
 use rupu_orchestrator::runner::{
     run_workflow, OrchestratorRunOpts, StepFactory, UnitCoverage, UnitDispatch, UnitDispatcher,
@@ -31,7 +31,7 @@ impl StepFactory for PanicFactory {
         _workspace_path: std::path::PathBuf,
         _transcript_path: std::path::PathBuf,
         _on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> AgentRunOpts {
+    ) -> LegacyRunOpts {
         panic!("remote units must not be built by the local step factory");
     }
 }

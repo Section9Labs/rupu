@@ -762,6 +762,7 @@ mod tests {
             final_output: None,
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
+            system_prompt_suffix: None,
             codename: None,
             cause: None,
         }
@@ -1030,7 +1031,7 @@ mod tests {
         store
             .create(record, "name: phase-delivery-cycle\nsteps: []\n")
             .unwrap();
-        let ledger = UsageLedger::for_run(&store, "run_live_01");
+        let ledger = UsageLedger::open(store.usage_ledger_path("run_live_01"));
         for (id, step, agent_run, parent, transcript, agent, input, output) in [
             (
                 "l1",

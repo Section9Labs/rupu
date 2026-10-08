@@ -105,5 +105,6 @@ mod policy_lock;
 mod reject_mode_inheritance;
 mod resume_clears_web_marker;
 mod resume_recovers_interrupted;
+mod resume_system_prompt_suffix;
 mod run_from_file;
 mod workflow_runs_no_side_effects;

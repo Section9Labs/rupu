@@ -75,62 +75,62 @@ fn opts(
         .unwrap()
         .active_set(&["network".into()])
         .unwrap();
-    AgentRunOpts {
-        on_usage: None,
-        seed_source: None,
-        collectors: Vec::new(),
-        extra_tools: Vec::new(),
-        step_actions: Vec::new(),
-        alias_scope: Default::default(),
-        agent_name: "assessor".into(),
-        agent_system_prompt: "You assess networks.".into(),
-        agent_tools: Some(vec!["report_finding".into(), "asset_mark".into()]),
-        provider: Box::new(CapturingMockProvider::new(turns)),
-        provider_name: "mock".into(),
-        model: "mock-1".into(),
-        run_id: "run_engagement".into(),
-        workspace_id: "ws_engagement".into(),
-        workspace_path: workspace.to_path_buf(),
-        transcript_path: workspace.join("run.jsonl"),
-        max_turns: 8,
-        permission: rupu_tools::PermissionPolicy::bypass(),
-        tool_context: ToolContext {
-            workspace_path: workspace.to_path_buf(),
-            findings: Some(FindingWriteOptions {
-                artifact_root: Some(store.to_path_buf()),
-                engagement: Some(Arc::new(engagement)),
-                ..Default::default()
-            }),
-            ..Default::default()
+    rupu_agent::grant::with_grant(
+        AgentRunOpts {
+            system_prompt: "You assess networks.".into(),
+            prompt: rupu_agent::UserTurn::new("Assess the host."),
+            provider: Box::new(CapturingMockProvider::new(turns)),
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
+            recovery: Default::default(),
+            permission: rupu_tools::PermissionPolicy::bypass(),
+            grant: Default::default(),
+            alias_scope: Default::default(),
+            tool_context: {
+                let mut tc = ToolContext {
+                    workspace: rupu_tools::WorkspaceScope {
+                        path: workspace.to_path_buf(),
+                        ..Default::default()
+                    },
+                    services: rupu_tools::ToolServices {
+                        findings: Some(FindingWriteOptions {
+                            artifact_root: Some(store.to_path_buf()),
+                            engagement: Some(Arc::new(engagement)),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                tc.identity = std::sync::Arc::new(rupu_tools::RunIdentity {
+                    agent: "assessor".into(),
+                    provider: "mock".into(),
+                    model: "mock-1".into(),
+                    run_id: "run_engagement".into(),
+                    surface: rupu_tools::Surface::Agent,
+                    ..Default::default()
+                });
+                tc.workspace.id = "ws_engagement".into();
+                tc.workspace.path = workspace.to_path_buf();
+                tc
+            },
+            pins: Default::default(),
+            concerns: None,
+            max_turns: 8,
+            stream: rupu_agent::StreamOpts {
+                no_stream: true,
+                suppress_stdout: false,
+                on_stream_event: None,
+            },
+            hooks: Default::default(),
+            pause: None,
+            collectors: Vec::new(),
+            extra_tools: Vec::new(),
+            transcript_path: workspace.join("run.jsonl"),
         },
-        user_message: "Assess the host.".into(),
-        initial_messages: Vec::new(),
-        turn_index_offset: 0,
-        no_stream: true,
-        suppress_stream_stdout: false,
-        mcp_registry: None,
-        effort: None,
-        thinking_display: None,
-        context_window: None,
-        output_format: None,
-        output_schema: None,
-        anthropic_task_budget: None,
-        anthropic_context_management: None,
-        anthropic_speed: None,
-        parent_run_id: None,
-        depth: 0,
-        dispatchable_agents: None,
-        step_id: String::new(),
-        on_tool_call: None,
-        on_stream_event: None,
-        concerns: None,
-        scope_name: None,
-        limits: rupu_providers::model_limits::ModelLimits::unknown(),
-        surface_tag: Some("agent".into()),
-        pause: None,
-        codename: None,
-        recovery: Default::default(),
-    }
+        (Some(vec!["report_finding".into(), "asset_mark".into()])).as_deref(),
+        &Vec::new(),
+    )
+    .expect("grant")
 }
 
 #[tokio::test]

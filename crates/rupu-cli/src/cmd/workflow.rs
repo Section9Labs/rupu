@@ -3743,7 +3743,7 @@ pub(crate) async fn resume_run(
     let permission_mode = rupu_tools::PermissionMode::parse(mode.unwrap_or("ask"))?;
 
     // Hoisted above the dispatcher build (was created a few lines further
-    // down, right before `opts`) so `CliAgentDispatcher` can be handed a
+    // down, right before `opts`) so the sub-agent dispatcher can be handed a
     // clone of the same sink and emit `DispatchStarted` / `DispatchCompleted`
     // into the same `events.jsonl` the resumed run's opts carry.
     let event_sink_for_resume = {
@@ -3770,30 +3770,34 @@ pub(crate) async fn resume_run(
         engagement,
         ..crate::findings_opts::base_options(&global, &cfg.findings)
     };
-    let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
-        global.clone(),
-        project_root.clone(),
-        record.workspace_id.clone(),
-        workspace_path.clone(),
-        Arc::clone(&resolver),
-        Arc::clone(&mcp_registry),
+    // Process-wide subprocess-capture backend, warmed off the async runtime
+    // (its first call blocks). Shared by the dispatcher (children) and the
+    // step factory (this workflow's steps).
+    let net_capture = crate::netflow_sink::net_capture(&cfg.netflow).await;
+    // Sub-agents dispatched from this run's steps are assembled like every
+    // other run (W3): this run's config, registry, engagement and capture.
+    let assembler = Arc::new(rupu_runtime::assembly::RunAssembler::new(
+        rupu_runtime::assembly::AssemblyContext {
+            global: global.clone(),
+            project_root: project_root.clone(),
+            config: cfg.clone(),
+            customer: cfg_paths.customer_slug.clone(),
+            resolver: Arc::clone(&resolver),
+            scm: Some(Arc::clone(&mcp_registry)),
+            findings: findings_base.clone(),
+            net_capture: Some(Arc::clone(&net_capture)),
+        },
+    ));
+    let dispatcher = rupu_orchestrator::subagents::workflow_dispatcher(
+        &assembler,
         Arc::clone(&store),
+        run_id,
+        &workflow.name,
+        rupu_runtime::assembly::WorkspaceBinding {
+            id: record.workspace_id.clone(),
+            path: workspace_path.clone(),
+        },
         event_sink_for_resume.clone(),
-        cfg.default_provider.clone(),
-        cfg.default_model.clone(),
-        openai_compatible.clone(),
-        provider_tuning.clone(),
-        kinds.clone(),
-        findings_base.clone(),
-        // Dispatched children append the resumed run's own ledger.
-        Some(rupu_orchestrator::usage_ledger::UsageLedger::for_run(
-            &store, run_id,
-        )),
-        limits_ctx.clone(),
-        None,
-        cfg.providers.clone(),
-        cfg.recovery.clone(),
-        cfg_paths.customer_slug.clone(),
     );
     // One codename namer for the whole run, shared by the orchestrator
     // (static slots) and the sub-agent dispatcher (`>role#n`). Built over
@@ -3805,11 +3809,6 @@ pub(crate) async fn resume_run(
         Some(&store.root.join(run_id)),
     ));
     dispatcher.set_namer(naming.namer());
-    // Process-wide subprocess-capture backend, warmed off the async runtime
-    // (its first call blocks). Shared by the dispatcher (children) and the
-    // step factory (this workflow's steps).
-    let net_capture = crate::netflow_sink::net_capture(&cfg.netflow).await;
-    dispatcher.set_net_capture(Arc::clone(&net_capture));
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
     let action_dispatcher = crate::resume::action_dispatcher_for(
         &mcp_registry,
@@ -3838,7 +3837,8 @@ pub(crate) async fn resume_run(
         resolver,
         mode: permission_mode,
         mcp_registry,
-        system_prompt_suffix: None,
+        // The run's `## Run target`, as launched (R8).
+        system_prompt_suffix: record.system_prompt_suffix.clone(),
         dispatcher: Some(dispatcher_dyn),
         openai_compatible,
         provider_tuning,
@@ -5588,7 +5588,7 @@ async fn execute_workflow_invocation(
         .map_err(|e| anyhow::anyhow!("persist customer lookup dir: {e}"))?;
 
     // Hoisted above the dispatcher build (was created a few lines further
-    // down, right before `opts`) so `CliAgentDispatcher` can be handed a
+    // down, right before `opts`) so the sub-agent dispatcher can be handed a
     // clone of the same sink and emit `DispatchStarted` / `DispatchCompleted`
     // into the same `events.jsonl` this run's opts carry.
     let event_sink_for_run = {
@@ -5624,32 +5624,34 @@ async fn execute_workflow_invocation(
         .scope_name
         .clone()
         .unwrap_or_else(|| workflow.name.clone());
-    let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
-        global.clone(),
-        ctx.project_root.clone(),
-        ctx.workspace_id.clone(),
-        ctx.workspace_path.clone(),
-        Arc::clone(&resolver),
-        Arc::clone(&mcp_registry),
+    // Process-wide subprocess-capture backend, warmed off the async runtime
+    // (its first call blocks). Shared by the dispatcher (children) and the
+    // step factory (this workflow's steps).
+    let net_capture = crate::netflow_sink::net_capture(&cfg.netflow).await;
+    // Sub-agents dispatched from this run's steps are assembled like every
+    // other run (W3): this run's config, registry, engagement and capture.
+    let assembler = Arc::new(rupu_runtime::assembly::RunAssembler::new(
+        rupu_runtime::assembly::AssemblyContext {
+            global: global.clone(),
+            project_root: ctx.project_root.clone(),
+            config: cfg.clone(),
+            customer: cfg_paths.customer_slug.clone(),
+            resolver: Arc::clone(&resolver),
+            scm: Some(Arc::clone(&mcp_registry)),
+            findings: findings_base.clone(),
+            net_capture: Some(Arc::clone(&net_capture)),
+        },
+    ));
+    let dispatcher = rupu_orchestrator::subagents::workflow_dispatcher(
+        &assembler,
         Arc::clone(&run_store),
+        &run_id,
+        &workflow.name,
+        rupu_runtime::assembly::WorkspaceBinding {
+            id: ctx.workspace_id.clone(),
+            path: ctx.workspace_path.clone(),
+        },
         event_sink_for_run.clone(),
-        cfg.default_provider.clone(),
-        cfg.default_model.clone(),
-        openai_compatible.clone(),
-        provider_tuning.clone(),
-        kinds.clone(),
-        findings_base.clone(),
-        // Dispatched children append this run's ledger
-        // (`<runs>/<run_id>/usage.jsonl`) — the same file the runner writes
-        // its own agent steps to.
-        Some(rupu_orchestrator::usage_ledger::UsageLedger::for_run(
-            &run_store, &run_id,
-        )),
-        limits_ctx.clone(),
-        None,
-        cfg.providers.clone(),
-        cfg.recovery.clone(),
-        cfg_paths.customer_slug.clone(),
     );
     // One codename namer for the whole run — shared by the orchestrator
     // (static slots), the sub-agent dispatcher (`>role#n`), and the inline
@@ -5662,11 +5664,6 @@ async fn execute_workflow_invocation(
         Some(&runs_dir.join(&run_id)),
     ));
     dispatcher.set_namer(naming.namer());
-    // Process-wide subprocess-capture backend, warmed off the async runtime
-    // (its first call blocks). Shared by the dispatcher (children) and the
-    // step factory (this workflow's steps).
-    let net_capture = crate::netflow_sink::net_capture(&cfg.netflow).await;
-    dispatcher.set_net_capture(Arc::clone(&net_capture));
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
     // Shared across this run's initial `opts` AND the inline
     // approve-resume `resume_opts` built further down this function —
@@ -6748,6 +6745,7 @@ mod tests {
             final_output: None,
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
+            system_prompt_suffix: None,
             codename: None,
             cause: None,
         }

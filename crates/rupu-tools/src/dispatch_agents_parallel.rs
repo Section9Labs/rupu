@@ -150,7 +150,7 @@ impl Tool for DispatchAgentsParallelTool {
             }
         }
 
-        let dispatcher = match ctx.dispatcher.as_ref() {
+        let dispatcher = match ctx.services.dispatcher.as_ref() {
             Some(d) => d.clone(),
             None => {
                 return Ok(err_output(
@@ -162,7 +162,7 @@ impl Tool for DispatchAgentsParallelTool {
             }
         };
 
-        let allowlist = ctx.dispatchable_agents.as_deref().unwrap_or(&[]);
+        let allowlist = ctx.identity.dispatchable_agents.as_deref().unwrap_or(&[]);
         for req in &i.agents {
             if !allowlist.iter().any(|a| a == &req.agent) {
                 return Ok(err_output(
@@ -177,40 +177,35 @@ impl Tool for DispatchAgentsParallelTool {
             }
         }
 
-        if ctx.depth >= MAX_DEPTH {
+        if ctx.identity.depth >= MAX_DEPTH {
             return Ok(err_output(
                 started,
                 format!(
                     "max_dispatch_depth_exceeded: current depth {} >= ceiling {MAX_DEPTH}",
-                    ctx.depth
+                    ctx.identity.depth
                 ),
             ));
         }
 
-        let parent_run_id = match ctx.parent_run_id.as_deref() {
-            Some(id) => id.to_string(),
-            None => {
-                return Ok(err_output(
-                    started,
-                    "no_parent_run_id: dispatcher requires a parent run id to anchor sub-run \
-                     directories; this run was not started by the workflow runner"
-                        .to_string(),
-                ));
-            }
-        };
+        if ctx.identity.run_id.is_empty() {
+            return Ok(err_output(
+                started,
+                "no_parent_run_id: dispatcher requires a parent run id to anchor sub-run \
+                 directories; this run was not started by the workflow runner"
+                    .to_string(),
+            ));
+        }
 
         let max_parallel = i.max_parallel.unwrap_or(i.agents.len()).max(1);
         let semaphore = Arc::new(Semaphore::new(max_parallel));
 
-        let parent_depth = ctx.depth;
-        let parent_codename = ctx.codename.clone();
+        let parent = Arc::clone(&ctx.identity);
         let permission = SpawnPermission::from_ctx(ctx);
         let mut handles = Vec::with_capacity(i.agents.len());
         for (idx, req) in i.agents.iter().cloned().enumerate() {
             let permit_sem = Arc::clone(&semaphore);
             let dispatcher = dispatcher.clone();
-            let parent_run_id = parent_run_id.clone();
-            let parent_codename = parent_codename.clone();
+            let parent = Arc::clone(&parent);
             let permission = permission.clone();
             let child_prompt = render_child_prompt(&req.prompt, req.inputs.as_ref());
             handles.push(tokio::spawn(async move {
@@ -219,14 +214,7 @@ impl Tool for DispatchAgentsParallelTool {
                     .await
                     .expect("semaphore not closed");
                 let outcome = dispatcher
-                    .dispatch(
-                        &req.agent,
-                        child_prompt,
-                        &parent_run_id,
-                        parent_depth,
-                        parent_codename.as_deref(),
-                        permission,
-                    )
+                    .dispatch(&req.agent, child_prompt, &parent, permission)
                     .await;
                 (idx, req, outcome)
             }));
@@ -370,15 +358,13 @@ mod tests {
             &self,
             agent_name: &str,
             _prompt: String,
-            _parent_run_id: &str,
-            _parent_depth: u32,
-            parent_codename: Option<&str>,
+            parent: &crate::tool::RunIdentity,
             _permission: crate::tool::SpawnPermission,
         ) -> Result<DispatchOutcome, DispatchError> {
             self.seen_parent_codenames
                 .lock()
                 .unwrap()
-                .push(parent_codename.map(str::to_string));
+                .push(parent.codename.clone());
             let mut scripted = self.scripted.lock().unwrap();
             // Each agent is dispatched at most once per test, so consume
             // the scripted entry. DispatchError isn't `Clone`, so we
@@ -399,10 +385,16 @@ mod tests {
         depth: u32,
     ) -> ToolContext {
         ToolContext {
-            dispatcher,
-            dispatchable_agents: allowlist,
-            parent_run_id,
-            depth,
+            identity: Arc::new(crate::tool::RunIdentity {
+                run_id: parent_run_id.unwrap_or_default(),
+                dispatchable_agents: allowlist,
+                depth,
+                ..Default::default()
+            }),
+            services: crate::tool::ToolServices {
+                dispatcher,
+                ..Default::default()
+            },
             ..Default::default()
         }
     }
@@ -518,7 +510,7 @@ mod tests {
             Some("run_X".into()),
             0,
         );
-        ctx.codename = Some("jade-reef/heron".into());
+        ctx.identity_mut().codename = Some("jade-reef/heron".into());
         let out = tool
             .invoke(
                 json!({ "agents": [

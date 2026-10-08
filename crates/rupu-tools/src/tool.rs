@@ -35,144 +35,194 @@ pub enum ToolError {
     Execution(String),
 }
 
-/// Per-invocation context the runtime passes to every tool.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct ToolContext {
+/// Which kind of launch a run belongs to. Decided once, by the run
+/// assembler, from the run's origin; recorded on coverage attribution and the
+/// coverage run manifest.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Surface {
+    /// A standalone `rupu run`, or a sub-agent of one.
+    #[default]
+    Agent,
+    /// A workflow step (or a sub-agent of one).
+    Workflow,
+    /// A `rupu session` turn.
+    Session,
+    /// An agentiflow lead or unit.
+    Agentiflow,
+}
+
+impl Surface {
+    /// The wire word (`agent`, `workflow`, `session`, `agentiflow`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Surface::Agent => "agent",
+            Surface::Workflow => "workflow",
+            Surface::Session => "session",
+            Surface::Agentiflow => "agentiflow",
+        }
+    }
+
+    /// The coverage ledger's surface for this run. The coverage vocabulary
+    /// has no agentiflow surface: an agentiflow run records as `agent`, as it
+    /// always has.
+    pub fn coverage(self) -> rupu_coverage::Surface {
+        match self {
+            Surface::Agent | Surface::Agentiflow => rupu_coverage::Surface::Agent,
+            Surface::Workflow => rupu_coverage::Surface::Workflow,
+            Surface::Session => rupu_coverage::Surface::Session,
+        }
+    }
+}
+
+/// The run that started this one, for a child run.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParentLink {
+    /// The parent's own run id.
+    pub run_id: String,
+    /// The parent's codename, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codename: Option<String>,
+    /// The root of the launch tree: the run whose usage ledger charges every
+    /// descendant.
+    pub root_run_id: String,
+}
+
+/// Who a run is. Set once, by the run assembler, and never overwritten
+/// (spec 2026-10-07 W3, P6): the agent loop, tools and transcripts read it;
+/// none of them write it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunIdentity {
+    pub run_id: String,
+    /// The run's codename (`<crew>/<role>#n`); `None` when it has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codename: Option<String>,
+    /// The agent's name.
+    pub agent: String,
+    /// The provider the run starts on. A fallback hop serves later turns on
+    /// another provider; attribution keeps the one the run started on.
+    pub provider: String,
+    /// The model the run starts on (see `provider`).
+    pub model: String,
+    /// Dispatch depth: 0 for a top-level run, the parent's + 1 for a child.
+    pub depth: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<ParentLink>,
+    pub surface: Surface,
+    /// The findings/coverage scope (`target_id(workspace, scope)`). `None`
+    /// scopes the run under its agent's name ([`Self::scope`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_name: Option<String>,
+    /// The workflow step that owns the run; `None` outside a workflow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_id: Option<String>,
+    /// The agents this run may dispatch (`dispatchableAgents:`). `None` =
+    /// none. Moves into the launcher's policy in W7.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatchable_agents: Option<Vec<String>>,
+}
+
+impl RunIdentity {
+    /// The findings/coverage scope: `scope_name`, else the agent's name.
+    pub fn scope(&self) -> &str {
+        self.scope_name.as_deref().unwrap_or(&self.agent)
+    }
+}
+
+/// `[bash]` settings for a run's `bash` calls.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BashConfig {
+    /// Environment variables (beyond the always-allowed
+    /// PATH/HOME/USER/TERM/LANG) forwarded into `bash` subprocess envs.
+    pub env_allowlist: Vec<String>,
+    /// Default timeout for a single `bash` invocation, in seconds.
+    pub timeout_secs: u64,
+}
+
+impl BashConfig {
+    /// The timeout a run without `[bash].timeout_secs` gets.
+    pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
+}
+
+impl Default for BashConfig {
+    fn default() -> Self {
+        Self {
+            env_allowlist: Vec::new(),
+            timeout_secs: Self::DEFAULT_TIMEOUT_SECS,
+        }
+    }
+}
+
+/// Where a run's tools act.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceScope {
+    /// The workspace record id (`rupu_workspace::upsert`).
+    pub id: String,
     /// Workspace root. Read/write tools restrict their scope to this
     /// directory; `bash` runs with this as its cwd.
-    pub workspace_path: PathBuf,
-    /// Environment variables (beyond the always-allowed
-    /// PATH/HOME/USER/TERM/LANG) forwarded into `bash` subprocess
-    /// envs. Used for things like AWS_PROFILE.
-    pub bash_env_allowlist: Vec<String>,
-    /// Default timeout for a single `bash` invocation, in seconds.
-    pub bash_timeout_secs: u64,
-    /// Optional handle the orchestrator wires in so dispatch tools
-    /// (`dispatch_agent` / `dispatch_agents_parallel`) can spawn
-    /// child agent runs. `None` = the runtime hosting this tool
-    /// invocation can't dispatch (e.g. a bare `rupu run`, a unit
-    /// test). Skipped in serde because trait objects don't round-trip
-    /// — production callers always populate it programmatically.
-    /// See `docs/superpowers/specs/2026-05-08-rupu-sub-agent-dispatch-design.md`.
-    #[serde(skip)]
+    pub path: PathBuf,
+    pub bash: BashConfig,
+}
+
+impl Default for WorkspaceScope {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            path: PathBuf::from("."),
+            bash: BashConfig::default(),
+        }
+    }
+}
+
+/// The services a run provides its tools (P7: a granted tool whose service
+/// is absent is not offered, and the grant names it `tool_unavailable`).
+/// Built by the run assembler; the agent loop adds only the coverage writer
+/// it owns.
+#[derive(Clone, Default)]
+pub struct ToolServices {
+    /// The in-process sub-agent dispatcher behind `dispatch_agent` /
+    /// `dispatch_agents_parallel`. `None` = this run can't dispatch.
     pub dispatcher: Option<Arc<dyn AgentDispatcher>>,
-    /// Per-agent allowlist of children this agent can dispatch.
-    /// Pulled from the agent's `dispatchableAgents:` frontmatter
-    /// field by the runner before tool invocation. The dispatch
-    /// tools check the requested agent name against this list.
-    /// `None` = agent has no dispatchable_agents declaration ⇒
-    /// no dispatches allowed.
-    #[serde(skip)]
-    pub dispatchable_agents: Option<Vec<String>>,
-    /// Parent run id of the run currently invoking the tool. Threaded
-    /// through so the dispatcher can record `parent_run_id` on the
-    /// child run and so child transcripts persist under the parent's
-    /// directory. `None` for top-level runs (the parent IS top-level).
-    #[serde(skip)]
-    pub parent_run_id: Option<String>,
-    /// Dispatch depth of the current agent run. The dispatch tools
-    /// check this against the per-agent + workspace max-depth
-    /// before spawning a child. Top-level workflow steps have
-    /// depth 0; first child has depth 1; etc.
-    #[serde(skip)]
-    pub depth: u32,
-    /// Optional coverage writer. When set, file-touching built-in tools
-    /// emit FileTouchEvents to this writer. None disables coverage capture
-    /// entirely (the default outside of a coverage-enabled run).
-    #[serde(skip)]
-    pub coverage_writer: Option<std::sync::Arc<rupu_coverage::CoverageWriter>>,
-    /// Surface that initiated this run — populated by the runner from
-    /// `AgentRunOpts.surface_tag`. The agent runner defaults to `"agent"`;
-    /// the workflow step factory sets it to `"workflow"` via `AgentRunOpts`.
-    #[serde(skip)]
-    pub surface_tag: Option<String>,
-    /// Run identifier — populated by the agent runner from `AgentRunOpts.run_id`.
-    /// Used to tag emitted FileTouchEvents with their owning run.
-    #[serde(skip)]
-    pub run_id: Option<String>,
-    /// Model identifier — populated by the agent runner from `AgentRunOpts.model`.
-    /// Used to tag emitted FileTouchEvents with the model that made the call.
-    #[serde(skip)]
-    pub model: Option<String>,
-    /// Optional user-declared tool→path-arg mappings, so unrecognized tools
-    /// (MCP-provided, custom) can still contribute FileTouchEvents. `None`
-    /// means no mappings are loaded; built-in tools self-instrument regardless.
-    #[serde(skip)]
-    pub tool_mappings: Option<std::sync::Arc<rupu_coverage::ToolMappings>>,
+    /// The SCM/issue registry behind the connector tools (`scm.*`,
+    /// `issues.*`, …). `None` = no connector tools.
+    pub scm: Option<Arc<rupu_scm::Registry>>,
     /// How findings are recorded in this run: the resolved profile, the
-    /// artifact store, and size limits. `None` means the caller did not
-    /// configure it, and tools use `FindingWriteOptions::default()`, which
-    /// is the full profile with no artifact store.
-    #[serde(skip)]
+    /// artifact store, size limits and the engagement. `None` means tools
+    /// use `FindingWriteOptions::default()`, the full profile with no
+    /// artifact store.
     pub findings: Option<rupu_coverage::FindingWriteOptions>,
-    /// Codename of the running agent instance, for coverage attribution.
-    #[serde(skip)]
-    pub codename: Option<String>,
-    /// Name of the running agent — populated by the agent runner from
-    /// `AgentRunOpts.agent_name`, for coverage/finding attribution.
-    #[serde(skip)]
-    pub agent: Option<String>,
-    /// Provider serving the run — populated by the agent runner from
-    /// `AgentRunOpts.provider_name`, for coverage/finding attribution.
-    #[serde(skip)]
-    pub provider: Option<String>,
+    /// The coverage writer the agent loop spawns for a `concerns:` run.
+    /// File-touching builtins emit FileTouchEvents to it; `None` disables
+    /// coverage capture.
+    pub coverage_writer: Option<Arc<rupu_coverage::CoverageWriter>>,
     /// Where this run's coverage is streamed for a coordinator to collect
     /// (`$RUPU_HOME/runs/<run_id>/coverage.jsonl`). Set by `rupu run` — the
     /// command every host connector launches — and shared with its
     /// `dispatch_agent` children; `None` for in-process workflow steps and
     /// sessions, which already write the coordinator's ledgers directly.
-    #[serde(skip)]
-    pub coverage_stream: Option<std::path::PathBuf>,
-    /// Where this run's network flows go. Set (with `net_capture`) by the
-    /// run assembly so the `bash` tool can attribute a child's connections
-    /// to the run; `None` disables subprocess capture.
-    #[serde(skip)]
-    pub netflow_sink: Option<std::sync::Arc<dyn rupu_netflow::FlowSink>>,
+    pub coverage_stream: Option<PathBuf>,
+    /// Where this run's network flows go, so the `bash` tool can attribute a
+    /// child's connections to the run; `None` disables subprocess capture.
+    pub netflow_sink: Option<Arc<dyn rupu_netflow::FlowSink>>,
     /// The process-wide subprocess-capture backend the `bash` tool drives
     /// around each spawn. `None` = no capture (the exact pre-capture path).
-    #[serde(skip)]
-    pub net_capture: Option<std::sync::Arc<dyn rupu_netflow::SubprocessCapture>>,
-    /// The model's tool-call id for the tool invocation in flight —
-    /// attributes a bash call's captured connections to that call.
-    #[serde(skip)]
-    pub tool_call_id: Option<String>,
+    pub net_capture: Option<Arc<dyn rupu_netflow::SubprocessCapture>>,
     /// The customer this run is attributed to (resolved once, at launch).
     /// `None` = no customer.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub customer: Option<String>,
-    /// The ceiling a child run this call starts is capped at: set by the
-    /// agent loop for a `Spawn` call from [`Decision::Spawn`]. `None` (a tool
-    /// invoked without a permission decision) caps a child at readonly.
-    ///
-    /// [`Decision::Spawn`]: crate::permission::Decision::Spawn
-    #[serde(skip)]
-    pub spawn_ceiling: Option<PermissionMode>,
     /// The run's operator prompter, when it has one: a child run started by
-    /// this call asks the same operator.
-    #[serde(skip)]
+    /// a call asks the same operator.
     pub prompter: Option<Arc<dyn Prompter>>,
 }
 
-// Hand-written because the netflow trait objects are not `Debug`.
-impl std::fmt::Debug for ToolContext {
+// Hand-written because the trait objects are not `Debug`.
+impl std::fmt::Debug for ToolServices {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ToolContext")
-            .field("workspace_path", &self.workspace_path)
-            .field("bash_env_allowlist", &self.bash_env_allowlist)
-            .field("bash_timeout_secs", &self.bash_timeout_secs)
+        f.debug_struct("ToolServices")
             .field("dispatcher", &self.dispatcher)
-            .field("dispatchable_agents", &self.dispatchable_agents)
-            .field("parent_run_id", &self.parent_run_id)
-            .field("depth", &self.depth)
-            .field("coverage_writer", &self.coverage_writer)
-            .field("surface_tag", &self.surface_tag)
-            .field("run_id", &self.run_id)
-            .field("model", &self.model)
-            .field("tool_mappings", &self.tool_mappings)
+            .field("scm", &self.scm.as_ref().map(|_| "<registry>"))
             .field("findings", &self.findings)
-            .field("codename", &self.codename)
-            .field("agent", &self.agent)
-            .field("provider", &self.provider)
+            .field("coverage_writer", &self.coverage_writer)
             .field("coverage_stream", &self.coverage_stream)
             .field(
                 "netflow_sink",
@@ -182,41 +232,54 @@ impl std::fmt::Debug for ToolContext {
                 "net_capture",
                 &self.net_capture.as_ref().map(|_| "<capture>"),
             )
-            .field("tool_call_id", &self.tool_call_id)
             .field("customer", &self.customer)
-            .field("spawn_ceiling", &self.spawn_ceiling)
             .field("prompter", &self.prompter.as_ref().map(|_| "<prompter>"))
             .finish()
     }
 }
 
-impl Default for ToolContext {
-    fn default() -> Self {
+/// What the agent loop sets for one tool call.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CallContext {
+    /// The model's tool-call id for the invocation in flight — attributes a
+    /// bash call's captured connections to that call.
+    pub tool_call_id: Option<String>,
+    /// The ceiling a child run this call starts is capped at: set by the
+    /// agent loop for a `Spawn` call from [`Decision::Spawn`]. `None` (a tool
+    /// invoked without a permission decision) caps a child at readonly.
+    ///
+    /// [`Decision::Spawn`]: crate::permission::Decision::Spawn
+    pub spawn_ceiling: Option<PermissionMode>,
+}
+
+/// Per-invocation context the runtime passes to every tool: who the run is,
+/// where it acts, what services it has, and the call in flight.
+#[derive(Clone, Debug, Default)]
+pub struct ToolContext {
+    /// Set once by the run assembler (P6).
+    pub identity: Arc<RunIdentity>,
+    pub workspace: WorkspaceScope,
+    pub services: ToolServices,
+    pub call: CallContext,
+}
+
+impl ToolContext {
+    /// A context acting in `path` with nothing else set — for tests and for
+    /// callers that invoke one tool outside an agent run.
+    pub fn in_workspace(path: impl Into<PathBuf>) -> Self {
         Self {
-            workspace_path: PathBuf::from("."),
-            bash_env_allowlist: Vec::new(),
-            bash_timeout_secs: 120,
-            dispatcher: None,
-            dispatchable_agents: None,
-            parent_run_id: None,
-            depth: 0,
-            coverage_writer: None,
-            surface_tag: None,
-            run_id: None,
-            model: None,
-            tool_mappings: None,
-            findings: None,
-            codename: None,
-            agent: None,
-            provider: None,
-            coverage_stream: None,
-            netflow_sink: None,
-            net_capture: None,
-            tool_call_id: None,
-            customer: None,
-            spawn_ceiling: None,
-            prompter: None,
+            workspace: WorkspaceScope {
+                path: path.into(),
+                ..WorkspaceScope::default()
+            },
+            ..Self::default()
         }
+    }
+
+    /// The run's identity, for a caller building a context by hand (tests):
+    /// copy-on-write, so a shared identity is never changed under a run.
+    pub fn identity_mut(&mut self) -> &mut RunIdentity {
+        Arc::make_mut(&mut self.identity)
     }
 }
 
@@ -233,8 +296,8 @@ impl SpawnPermission {
     /// the tool without a permission decision gets readonly (fail closed).
     pub fn from_ctx(ctx: &ToolContext) -> Self {
         Self {
-            ceiling: ctx.spawn_ceiling.unwrap_or(PermissionMode::Readonly),
-            prompter: ctx.prompter.clone(),
+            ceiling: ctx.call.spawn_ceiling.unwrap_or(PermissionMode::Readonly),
+            prompter: ctx.services.prompter.clone(),
         }
     }
 
@@ -261,16 +324,15 @@ impl std::fmt::Debug for SpawnPermission {
 #[async_trait]
 pub trait AgentDispatcher: Send + Sync + std::fmt::Debug {
     /// Spawn a child agent run synchronously. The dispatcher resolves
-    /// the agent file by name, allocates a sub-run id under
-    /// `parent_run_id`, builds [`AgentRunOpts`] (with `depth =
-    /// parent_depth + 1`), and runs the agent to completion. Returns
-    /// the child's outcome — final assistant text, tokens used,
-    /// duration, and the path to the persisted child transcript.
+    /// the agent file by name, allocates a sub-run id under the parent's
+    /// run, assembles the child (depth `parent.depth + 1`, the parent's
+    /// surface and findings scope) and runs it to completion. Returns the
+    /// child's outcome — final assistant text, tokens used, duration, and
+    /// the path to the persisted child transcript.
     ///
-    /// `parent_codename` is the dispatching agent's own codename
-    /// ([`ToolContext::codename`]); the dispatcher mints the child's
-    /// `<parent>><role>#n` name from it. `None` (a legacy caller with no
-    /// codename) leaves the child unnamed.
+    /// `parent` is the dispatching run's identity; the child's
+    /// `<parent>><role>#n` codename is minted from its codename (`None`
+    /// leaves the child unnamed).
     ///
     /// `permission` caps the child (D7): it runs under
     /// [`SpawnPermission::child_policy`] of its own declared
@@ -279,9 +341,7 @@ pub trait AgentDispatcher: Send + Sync + std::fmt::Debug {
         &self,
         agent_name: &str,
         prompt: String,
-        parent_run_id: &str,
-        parent_depth: u32,
-        parent_codename: Option<&str>,
+        parent: &RunIdentity,
         permission: SpawnPermission,
     ) -> Result<DispatchOutcome, DispatchError>;
 }
@@ -476,6 +536,6 @@ mod coverage_context_tests {
     #[test]
     fn default_tool_context_has_no_coverage_writer() {
         let ctx = ToolContext::default();
-        assert!(ctx.coverage_writer.is_none());
+        assert!(ctx.services.coverage_writer.is_none());
     }
 }

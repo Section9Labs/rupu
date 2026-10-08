@@ -100,7 +100,7 @@ impl Tool for DispatchAgentTool {
         let i: Input =
             serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
 
-        let dispatcher = match ctx.dispatcher.as_ref() {
+        let dispatcher = match ctx.services.dispatcher.as_ref() {
             Some(d) => d.clone(),
             None => {
                 return Ok(err_output(
@@ -112,7 +112,7 @@ impl Tool for DispatchAgentTool {
             }
         };
 
-        let allowlist = ctx.dispatchable_agents.as_deref().unwrap_or(&[]);
+        let allowlist = ctx.identity.dispatchable_agents.as_deref().unwrap_or(&[]);
         if !allowlist.iter().any(|a| a == &i.agent) {
             return Ok(err_output(
                 started,
@@ -124,27 +124,24 @@ impl Tool for DispatchAgentTool {
             ));
         }
 
-        if ctx.depth >= MAX_DEPTH {
+        if ctx.identity.depth >= MAX_DEPTH {
             return Ok(err_output(
                 started,
                 format!(
                     "max_dispatch_depth_exceeded: current depth {} >= ceiling {MAX_DEPTH}",
-                    ctx.depth
+                    ctx.identity.depth
                 ),
             ));
         }
 
-        let parent_run_id = match ctx.parent_run_id.as_deref() {
-            Some(id) => id,
-            None => {
-                return Ok(err_output(
-                    started,
-                    "no_parent_run_id: dispatcher requires a parent run id to anchor the sub-run \
-                     directory; this run was not started by the workflow runner"
-                        .to_string(),
-                ));
-            }
-        };
+        if ctx.identity.run_id.is_empty() {
+            return Ok(err_output(
+                started,
+                "no_parent_run_id: dispatcher requires a parent run id to anchor the sub-run \
+                 directory; this run was not started by the workflow runner"
+                    .to_string(),
+            ));
+        }
 
         let child_prompt = match i.inputs {
             Some(inputs)
@@ -161,9 +158,7 @@ impl Tool for DispatchAgentTool {
             .dispatch(
                 &i.agent,
                 child_prompt,
-                parent_run_id,
-                ctx.depth,
-                ctx.codename.as_deref(),
+                &ctx.identity,
                 SpawnPermission::from_ctx(ctx),
             )
             .await
@@ -243,12 +238,10 @@ mod tests {
             &self,
             agent_name: &str,
             _prompt: String,
-            _parent_run_id: &str,
-            _parent_depth: u32,
-            parent_codename: Option<&str>,
+            parent: &crate::tool::RunIdentity,
             _permission: crate::tool::SpawnPermission,
         ) -> Result<DispatchOutcome, DispatchError> {
-            *self.seen_parent_codename.lock().unwrap() = parent_codename.map(str::to_string);
+            *self.seen_parent_codename.lock().unwrap() = parent.codename.clone();
             Ok(DispatchOutcome {
                 agent: agent_name.to_string(),
                 sub_run_id: "sub_TEST".into(),
@@ -270,10 +263,16 @@ mod tests {
         depth: u32,
     ) -> ToolContext {
         ToolContext {
-            dispatcher,
-            dispatchable_agents: allowlist,
-            parent_run_id,
-            depth,
+            identity: Arc::new(crate::tool::RunIdentity {
+                run_id: parent_run_id.unwrap_or_default(),
+                dispatchable_agents: allowlist,
+                depth,
+                ..Default::default()
+            }),
+            services: crate::tool::ToolServices {
+                dispatcher,
+                ..Default::default()
+            },
             ..Default::default()
         }
     }
@@ -401,7 +400,7 @@ mod tests {
             Some("run_X".into()),
             0,
         );
-        ctx.codename = Some("jade-reef/heron#2".into());
+        ctx.identity_mut().codename = Some("jade-reef/heron#2".into());
         let out = tool
             .invoke(json!({ "agent": "reviewer", "prompt": "p" }), &ctx)
             .await

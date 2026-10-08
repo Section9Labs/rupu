@@ -13,7 +13,7 @@ use rupu_agent::recovery::{Hop, HopBuilder, RecoveryOpts};
 
 use crate::model_limits::{self, LimitOverrides, LimitsContext};
 use crate::provider_factory::{
-    build_for_provider_with_config, is_dispatchable_provider, provider_config_for, ProviderConfig,
+    build_for_provider_with_config, is_dispatchable_provider, AgentProviderSettings, ProviderConfig,
 };
 
 /// The agent's own provider settings, which a hop keeps. Each launch site
@@ -56,10 +56,15 @@ pub struct RuntimeHopBuilder {
 impl RuntimeHopBuilder {
     /// The `ProviderConfig` and auth hint a hop on `provider` is built with.
     pub fn hop_config(&self, provider: &str) -> (ProviderConfig, Option<rupu_providers::AuthMode>) {
-        let mut cfg = provider_config_for(provider, &self.providers);
-        cfg.anthropic_server_side_fallback = Some(self.server_side_fallback);
-        cfg.anthropic_oauth_system_prefix = self.agent_overrides.oauth_prefix;
-        cfg.anthropic_prompt_cache = self.agent_overrides.prompt_cache;
+        let cfg = ProviderConfig::for_agent(
+            provider,
+            &self.providers,
+            AgentProviderSettings {
+                oauth_prefix: self.agent_overrides.oauth_prefix,
+                prompt_cache: self.agent_overrides.prompt_cache,
+            },
+            Some(self.server_side_fallback),
+        );
         let auth = (provider == self.agent_overrides.origin_provider)
             .then_some(self.agent_overrides.auth)
             .flatten();

@@ -2058,6 +2058,7 @@ mod tests {
             permission_mode: None,
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
+            system_prompt_suffix: None,
             codename: None,
             cause: None,
         };
@@ -2491,6 +2492,7 @@ mod tests {
             permission_mode: None,
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
+            system_prompt_suffix: None,
             codename: None,
             cause: None,
         };
@@ -2616,6 +2618,7 @@ mod tests {
             permission_mode: None,
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
+            system_prompt_suffix: None,
             codename: None,
             cause: None,
         };
@@ -3900,6 +3903,7 @@ mod tests {
             permission_mode: None,
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
+            system_prompt_suffix: None,
             codename: None,
             cause: None,
         };
@@ -3996,6 +4000,7 @@ mod tests {
             permission_mode: None,
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
+            system_prompt_suffix: None,
             codename: None,
             cause: None,
         };
@@ -4326,6 +4331,7 @@ mod tests {
             permission_mode: None,
             loop_progress: Default::default(),
             gate_decisions: Vec::new(),
+            system_prompt_suffix: None,
             codename: None,
             cause: None,
         };

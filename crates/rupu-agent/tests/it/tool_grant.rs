@@ -63,57 +63,48 @@ async fn run(workspace: &Path, r: Run) -> (Vec<String>, Vec<Event>) {
     let provider = CapturingMockProvider::new(r.script);
     let captured = provider.captured.clone();
     let transcript: PathBuf = workspace.join("run.jsonl");
-    let opts = AgentRunOpts {
-        seed_source: None,
-        collectors: Vec::new(),
-        extra_tools: Vec::new(),
-        step_actions: r.step_actions,
-        alias_scope: Default::default(),
-        agent_name: "granted".into(),
-        agent_system_prompt: "test".into(),
-        agent_tools: r.agent_tools,
-        provider: Box::new(provider),
-        provider_name: "mock".into(),
-        model: "mock-1".into(),
-        run_id: "run_tool_grant".into(),
-        workspace_id: "ws_grant".into(),
-        workspace_path: workspace.to_path_buf(),
-        transcript_path: transcript.clone(),
-        max_turns: 10,
-        permission: r.permission,
-        tool_context: ToolContext {
-            workspace_path: workspace.to_path_buf(),
-            ..Default::default()
+    let opts = rupu_agent::grant::with_grant(
+        AgentRunOpts {
+            system_prompt: "test".into(),
+            prompt: rupu_agent::UserTurn::new("go"),
+            provider: Box::new(provider),
+            limits: rupu_providers::model_limits::ModelLimits::unknown(),
+            recovery: Default::default(),
+            permission: r.permission,
+            grant: Default::default(),
+            alias_scope: Default::default(),
+            tool_context: {
+                let mut tc = ToolContext::in_workspace(workspace);
+                tc.identity = std::sync::Arc::new(rupu_tools::RunIdentity {
+                    agent: "granted".into(),
+                    provider: "mock".into(),
+                    model: "mock-1".into(),
+                    run_id: "run_tool_grant".into(),
+                    ..Default::default()
+                });
+                tc.workspace.id = "ws_grant".into();
+                tc.workspace.path = workspace.to_path_buf();
+                tc.services.scm = r.scm.then(|| Arc::new(rupu_scm::Registry::empty()));
+                tc
+            },
+            pins: Default::default(),
+            concerns: r.concerns,
+            max_turns: 10,
+            stream: rupu_agent::StreamOpts {
+                no_stream: true,
+                suppress_stdout: true,
+                on_stream_event: None,
+            },
+            hooks: Default::default(),
+            pause: None,
+            collectors: Vec::new(),
+            extra_tools: Vec::new(),
+            transcript_path: transcript.clone(),
         },
-        user_message: "go".into(),
-        initial_messages: Vec::new(),
-        turn_index_offset: 0,
-        no_stream: true,
-        suppress_stream_stdout: true,
-        mcp_registry: r.scm.then(|| Arc::new(rupu_scm::Registry::empty())),
-        effort: None,
-        thinking_display: None,
-        context_window: None,
-        output_format: None,
-        output_schema: None,
-        anthropic_task_budget: None,
-        anthropic_context_management: None,
-        anthropic_speed: None,
-        parent_run_id: None,
-        depth: 0,
-        dispatchable_agents: None,
-        step_id: String::new(),
-        on_tool_call: None,
-        on_stream_event: None,
-        on_usage: None,
-        concerns: r.concerns,
-        limits: rupu_providers::model_limits::ModelLimits::unknown(),
-        scope_name: None,
-        surface_tag: None,
-        pause: None,
-        codename: None,
-        recovery: Default::default(),
-    };
+        r.agent_tools.as_deref(),
+        &r.step_actions,
+    )
+    .expect("grant");
     let _ = run_agent(opts).await;
     let offered = captured
         .lock()
@@ -341,21 +332,23 @@ async fn audit_every_call() {
     assert!(!tmp.path().join("b.txt").exists());
 }
 
-#[tokio::test]
-async fn an_unknown_name_fails_the_run_before_any_turn() {
+#[test]
+fn an_unknown_name_fails_the_grant_before_any_run() {
     // An agent built outside the loader (a test, an embedder) still can't
-    // run with a typo in `tools:`.
-    let tmp = tempfile::TempDir::new().unwrap();
-    let (offered, events) = run(
-        tmp.path(),
-        Run {
-            agent_tools: Some(strs(&["repot_finding"])),
-            ..Default::default()
-        },
-    )
-    .await;
-    assert!(offered.is_empty(), "no request may be sent: {offered:?}");
-    assert!(!events.iter().any(|e| matches!(e, Event::ToolGrant { .. })));
+    // run with a typo in `tools:`: its grant never resolves, so no run (and
+    // no request) can be assembled.
+    let ctx = ToolContext::in_workspace(".");
+    let declared = strs(&["repot_finding"]);
+    let err = rupu_agent::grant::resolve_run_grant(rupu_agent::grant::RunGrantInputs {
+        declared: Some(&declared),
+        step_actions: &[],
+        concerns: false,
+        injected: &[],
+        tool_context: &ctx,
+        alias_scope: Default::default(),
+    })
+    .expect_err("a typo in tools: is refused");
+    assert!(err.to_string().contains("repot_finding"), "{err}");
 }
 
 #[test]

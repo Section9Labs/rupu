@@ -298,6 +298,7 @@ impl WorkflowExecutor for InProcessExecutor {
                             final_output: None,
                             loop_progress: BTreeMap::new(),
                             gate_decisions: Vec::new(),
+                            system_prompt_suffix: None,
                             codename: Some(rupu_codename::crew_for(id)),
                         },
                     );
@@ -421,7 +422,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use rupu_agent::runner::{MockProvider, ScriptedTurn};
-    use rupu_agent::AgentRunOpts;
+    use rupu_agent::LegacyRunOpts;
     use rupu_providers::types::StopReason;
     use rupu_tools::ToolContext;
     use tempfile::TempDir;
@@ -445,14 +446,14 @@ mod tests {
             workspace_path: PathBuf,
             transcript_path: PathBuf,
             on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-        ) -> AgentRunOpts {
+        ) -> LegacyRunOpts {
             let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
                 text: format!("step {step_id} agent {agent_name} echo: {rendered_prompt}"),
                 stop: StopReason::EndTurn,
                 input_tokens: 1,
                 output_tokens: 1,
             }]);
-            AgentRunOpts {
+            LegacyRunOpts {
                 seed_source: None,
                 collectors: Vec::new(),
                 extra_tools: Vec::new(),
