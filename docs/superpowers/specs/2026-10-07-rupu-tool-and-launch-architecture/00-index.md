@@ -3,7 +3,7 @@
 - **Date:** 2026-10-07
 - **Status:** draft, for matt's review
 - **Kind:** re-architecture. Functionally neutral except for the bugs it fixes on purpose, listed in §3.
-- **Followed by:** the feature work this session was opened for. It is specced here too, against the post-refactor architecture: [F1](F1-messaging-everywhere.md) messaging for every run kind (F1a/F1b/F1c) and [F2](F2-dispatch-agentiflow.md) ephemeral agentiflows as a dispatch kind.
+- **Followed by:** the feature work this session was opened for. It is specced here too, against the post-refactor architecture: [F1](F1-messaging-everywhere.md) messaging for every run kind (F1a/F1b/F1c).
 
 ## How to read this spec
 
@@ -21,7 +21,6 @@
 | [F1a-message-space-and-delivery.md](F1a-message-space-and-delivery.md) | (feature) message space per root, canonical log, participants + addresses, one writer API, delivery + receipts, `Message`/`Injected` transcript events, workflow `messaging:` key | F1a |
 | [F1b-operator-participant.md](F1b-operator-participant.md) | (feature) the operator messages anyone in any run; steering folded in; `rupu message` CLI; CP API; remote-host contract | F1b |
 | [F1c-messages-ui.md](F1c-messages-ui.md) | (feature, GUI) the Messages tab for runs/sessions/flows showing every kind; composer; messages as transcript bubbles | F1c |
-| [F2-dispatch-agentiflow.md](F2-dispatch-agentiflow.md) | (feature) `dispatch {kind: agentiflow}` + `agentiflows.draft`; the parent ↔ child-lead bridge | F2 |
 
 Each W-file stands on its own. It has scope, design, the files it touches, what it deletes, acceptance tests and its dependencies. One card is one session is one PR.
 
@@ -325,10 +324,9 @@ flowchart LR
   W7 --> F1a["F1a (feature)<br/>message space + delivery"]
   F1a --> F1b["F1b<br/>operator participant"]
   F1b --> F1c["F1c (GUI)<br/>Messages UI"]
-  F1a --> F2["F2<br/>dispatch kind: agentiflow"]
 ```
 
-**Recommended order:** **W1 → W2 → W6 → W3a → W3b → W4 → W5 → W7**, then the features **F1a → F1b → F1c**, with **F2** any time after F1a.
+**Recommended order:** **W1 → W2 → W6 → W3a → W3b → W4 → W5 → W7**, then the features **F1a → F1b → F1c**.
 
 - **W1 first:** it carries the two security fixes (T2 readonly, T3 ask), it is mostly additive (a descriptor per tool + one policy), and everything later keys off `Effect`.
 - **W6 can run in parallel with anything.** It only touches argv and spawn code: CP launchers, SSH, node, agentiflow subprocess. It doesn't overlap with `runner.rs` / `step_factory.rs`.

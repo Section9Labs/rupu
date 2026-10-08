@@ -1,6 +1,6 @@
 # F1a: Message space, log, addressing, delivery, transcript events
 
-- **Card:** F1a · **Depends on:** W1–W7 merged · **Blocks:** F1b, F1c, F2
+- **Card:** F1a · **Depends on:** W1–W7 merged · **Blocks:** F1b, F1c
 - **Overview + decisions:** [F1-messaging-everywhere.md](F1-messaging-everywhere.md) (FD1–FD7)
 - **Closes:** M1 (store side), M2, M3, M4, M5
 
