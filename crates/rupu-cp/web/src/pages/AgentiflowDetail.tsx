@@ -16,7 +16,6 @@ import {
   apiErrorMessage,
   ApiError,
   type AgentiflowDetail as AgentiflowDetailData,
-  type AgentiflowEvent,
   type AgentiflowUnit,
 } from '../lib/api';
 import { StatusPill } from '../components/StatusPill';
@@ -27,8 +26,9 @@ import AssetInventory from '../components/agentiflow/AssetInventory';
 import MessageFeed from '../components/agentiflow/MessageFeed';
 import EngagementFindings from '../components/agentiflow/EngagementFindings';
 import TranscriptBrowser from '../components/agentiflow/TranscriptBrowser';
+import AgentiflowEventFeed from '../components/agentiflow/AgentiflowEventFeed';
 import { Segmented } from '../components/ui/Segmented';
-import { Badge, type BadgeTone } from '../components/ui/Badge';
+import { Badge } from '../components/ui/Badge';
 import { Button } from '../components/ui/Button';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
 import { EmptyState } from '../components/ui/EmptyState';
@@ -52,7 +52,6 @@ import {
   stopReasonTone,
   unitPillStatus,
   type BudgetUse,
-  type StopTone,
 } from '../lib/agentiflow';
 
 const POLL_MS = 5000;
@@ -346,23 +345,9 @@ export default function AgentiflowDetail() {
       )}
 
       {tab === 'events' && (
-      <Panel
-        title="Events"
-        meta={<span className="text-note tabular-nums text-ink-dim">{detail.events.length} · newest first</span>}
-        flush
-      >
-        {detail.events.length === 0 ? (
-          <div className="px-4 pb-3">
-            <Muted>No events recorded.</Muted>
-          </div>
-        ) : (
-          <ul className="divide-y divide-border border-t border-border">
-            {[...detail.events].reverse().map((ev, i) => (
-              <EventRow key={`${detail.events.length - i}`} event={ev} />
-            ))}
-          </ul>
-        )}
-      </Panel>
+        <section className="flex flex-col" style={{ height: '65vh' }}>
+          <AgentiflowEventFeed id={id} codename={record.codename} running={running} />
+        </section>
       )}
     </div>
   );
@@ -544,128 +529,3 @@ function UnitRow({ unit }: { unit: AgentiflowUnit }) {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Events
-// ---------------------------------------------------------------------------
-
-function str(v: unknown): string | null {
-  return typeof v === 'string' && v !== '' ? v : null;
-}
-function num(v: unknown): number | null {
-  return typeof v === 'number' && Number.isFinite(v) ? v : null;
-}
-
-const OUTCOME_TONE: Record<string, BadgeTone> = {
-  yielded: 'neutral',
-  turn_budget_hit: 'amber',
-  error: 'red',
-};
-
-const KIND_LABEL: Record<string, string> = {
-  run_started: 'started',
-  round: 'round',
-  run_stopped: 'stopped',
-};
-
-function EventRow({ event }: { event: AgentiflowEvent }) {
-  const ts = str(event.ts);
-  const kind = str(event.kind) ?? 'event';
-  return (
-    <li className="flex items-start gap-3 px-4 py-2 text-note">
-      <span className="w-20 shrink-0 pt-px text-ink-mute" title={ts ? absoluteTime(ts) : undefined}>
-        {ts ? relativeTime(ts) : '—'}
-      </span>
-      <span className="w-20 shrink-0">
-        <Badge tone="neutral" ring className="uppercase tracking-wide">
-          {KIND_LABEL[kind] ?? kind.replace(/_/g, ' ')}
-        </Badge>
-      </span>
-      <div className="min-w-0 flex-1 text-ink-dim">
-        <EventBody kind={kind} event={event} />
-      </div>
-    </li>
-  );
-}
-
-function EventBody({ kind, event }: { kind: string; event: AgentiflowEvent }) {
-  if (kind === 'run_started') {
-    const goals = num(event.goals);
-    const profiles = Array.isArray(event.engagement_profiles)
-      ? (event.engagement_profiles as unknown[]).filter((p): p is string => typeof p === 'string')
-      : [];
-    return (
-      <span>
-        {goals != null && `${goals} ${goals === 1 ? 'goal' : 'goals'}`}
-        {profiles.length > 0 && <span className="text-ink-mute"> · {profiles.join(', ')}</span>}
-      </span>
-    );
-  }
-
-  if (kind === 'round') {
-    const round = num(event.round);
-    const outcome = str(event.outcome);
-    const budget = str(event.budget);
-    const met = num(event.goals_met);
-    const total = num(event.goals_total);
-    const steering = num(event.steering);
-    const usd = num(event.spent_usd);
-    const tokens = num(event.spent_tokens);
-    const error = str(event.error);
-    return (
-      <div>
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-          {round != null && <span className="font-medium text-ink">round {round}</span>}
-          {outcome && (
-            <Badge tone={OUTCOME_TONE[outcome] ?? 'neutral'}>{outcome.replace(/_/g, ' ')}</Badge>
-          )}
-          {met != null && total != null && (
-            <span className="tabular-nums">
-              goals {met}/{total}
-            </span>
-          )}
-          {budget && <Badge tone={STOP_TONE_BADGE[budgetStateTone(budget)]}>{budget}</Badge>}
-          {event.converge === true && <span className="text-ok">converging</span>}
-          {steering != null && steering > 0 && (
-            <span>
-              {steering} steering {steering === 1 ? 'message' : 'messages'}
-            </span>
-          )}
-          {(usd != null || tokens != null) && (
-            <span className="tabular-nums text-ink-mute">
-              {formatSpendUsd(usd)}
-              {tokens != null && ` · ${formatSpendTokens(tokens)}`}
-            </span>
-          )}
-        </div>
-        {error && <div className="mt-1 break-words font-mono text-err">{error}</div>}
-      </div>
-    );
-  }
-
-  if (kind === 'run_stopped') {
-    const reason = str(event.stop_reason);
-    const detail = str(event.detail);
-    const summary = str(event.summary);
-    const tone: StopTone = reason ? stopReasonTone(reason) : 'neutral';
-    return (
-      <div>
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-          {reason && <span className={cn('break-words font-mono', STOP_TONE_TEXT[tone])}>{reason}</span>}
-          {detail && detail !== reason && <span className="break-words">{detail}</span>}
-        </div>
-        {summary && (
-          <details className="mt-1">
-            <summary className="cursor-pointer select-none text-ink-dim hover:text-ink">summary</summary>
-            <pre className="mt-1.5 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-bg p-2 font-mono text-ink">
-              {summary}
-            </pre>
-          </details>
-        )}
-      </div>
-    );
-  }
-
-  // A kind this UI doesn't know (a newer server): show its fields, not nothing.
-  const rest = Object.fromEntries(Object.entries(event).filter(([k]) => k !== 'ts' && k !== 'kind'));
-  return <span className="break-words font-mono text-ink-mute">{JSON.stringify(rest)}</span>;
-}

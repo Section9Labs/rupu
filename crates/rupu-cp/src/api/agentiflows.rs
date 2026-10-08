@@ -54,6 +54,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/agentiflows", get(list_agentiflows))
         .route("/api/agentiflows/:id", get(get_agentiflow))
         .route("/api/agentiflows/:id/messages", get(get_agentiflow_messages))
+        .route("/api/agentiflows/:id/events", get(get_agentiflow_events))
         .route("/api/agentiflows/:id/steer", post(steer_agentiflow))
 }
 
@@ -692,6 +693,115 @@ async fn get_agentiflow_messages(
         posts: read_jsonl(board.join("posts.jsonl")),
         directives: read_jsonl(board.join("directives.jsonl")),
     }))
+}
+
+/// `GET /api/agentiflows/:id/events` — the engagement's granular event feed: the
+/// coordinator lifecycle (`run_started` / `round` / `run_stopped`, from
+/// `events.jsonl`) MERGED with per-unit lifecycle — each dispatched unit's
+/// `af_unit_started` and, once terminal, `af_unit_completed`, whose completion
+/// time, token totals and provider/model are joined from `usage.jsonl` (the
+/// `unit.json` checkpoint carries none of those). Oldest first; the web renders
+/// it through the shared RunEventFeed / EventCard. Findings and workflow-step
+/// events are a later pass.
+#[derive(Serialize)]
+struct EventsResponse {
+    events: Vec<Value>,
+}
+
+/// A unit's completion time, approximated by its transcript file's last-write
+/// time — the `unit.json` checkpoint records no finished-at, and the engagement
+/// `usage.jsonl` tracks only the LEAD's turns (keyed by `lead/transcript.r<N>`),
+/// not the units. `None` when the transcript is absent or its mtime unreadable.
+/// (Per-unit tokens come with the findings pass, which reads each unit's run.)
+fn transcript_mtime(path: &str) -> Option<String> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    Some(DateTime::<Utc>::from(modified).to_rfc3339())
+}
+
+/// Cap a unit's final answer so a multi-KB output never bloats an event row.
+fn snippet(s: &str) -> String {
+    const MAX: usize = 400;
+    if s.chars().count() <= MAX {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(MAX).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// A line's `ts` as a sort key; a line without one sorts to the start.
+fn event_ts(v: &Value) -> &str {
+    v.get("ts").and_then(Value::as_str).unwrap_or("")
+}
+
+/// Build the merged event feed for the run in `run_dir`. Pure disk reads
+/// (`events.jsonl`, the unit checkpoints, `usage.jsonl`), so it runs on the
+/// blocking pool.
+fn build_events(s: &AppState, id: &str) -> Option<EventsResponse> {
+    let run_dir = agentiflow_dir(&s.global_dir).join(id);
+    if !run_dir.is_dir() {
+        return None;
+    }
+    let mut out: Vec<Value> = read_events(&run_dir);
+    for u in read_units(s, &run_dir) {
+        let identity = serde_json::json!({
+            "unit_id": u.unit_id,
+            "agent": u.agent,
+            "codename": u.codename,
+            "codename_derived": u.codename_derived,
+            "participant": u.participant,
+            "unit_kind": u.kind,
+            "transcript_path": u.transcript_path,
+        });
+        if let Some(started) = &u.started_at {
+            let mut ev = identity.clone();
+            ev["kind"] = Value::String("af_unit_started".into());
+            ev["ts"] = Value::String(started.clone());
+            out.push(ev);
+        }
+        if matches!(u.status.state, "done" | "failed") {
+            let ts = u
+                .transcript_path
+                .as_deref()
+                .and_then(transcript_mtime)
+                .or_else(|| u.started_at.clone());
+            let mut ev = identity;
+            ev["kind"] = Value::String("af_unit_completed".into());
+            if let Some(ts) = ts {
+                ev["ts"] = Value::String(ts);
+            }
+            ev["success"] = serde_json::to_value(u.status.success).unwrap_or(Value::Null);
+            if let Some(e) = &u.status.error {
+                ev["error"] = Value::String(snippet(e));
+            }
+            if let Some(o) = &u.status.output {
+                ev["output"] = Value::String(snippet(o));
+            }
+            out.push(ev);
+        }
+    }
+    // Chronological (oldest first); the web reverses to newest-first. ISO-8601
+    // timestamps sort lexically, so a plain string compare is chronological.
+    out.sort_by(|a, b| event_ts(a).cmp(event_ts(b)));
+    Some(EventsResponse { events: out })
+}
+
+async fn get_agentiflow_events(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<EventsResponse>> {
+    if !valid_run_id(&id) {
+        return Err(ApiError::not_found(format!("no agentiflow run `{id}`")));
+    }
+    let resp = tokio::task::spawn_blocking({
+        let id = id.clone();
+        move || build_events(&s, &id)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("reading agentiflow {id} events panicked: {e}")))?;
+    resp.map(Json)
+        .ok_or_else(|| ApiError::not_found(format!("no agentiflow run `{id}`")))
 }
 
 /// `POST /api/agentiflows/:id/steer` — queue an operator steering message for

@@ -2868,6 +2868,13 @@ export const api = {
     return request<AgentiflowMessages>(`/api/agentiflows/${encodeURIComponent(id)}/messages`, { signal: opts?.signal });
   },
 
+  /** The engagement's granular event feed: the coordinator lifecycle merged with
+   *  per-unit lifecycle (`af_unit_started` / `af_unit_completed`), oldest first.
+   *  Rendered through the shared RunEventFeed / EventCard. */
+  getAgentiflowEvents(id: string, opts?: Cancellable): Promise<{ events: AgentiflowEvent[] }> {
+    return request<{ events: AgentiflowEvent[] }>(`/api/agentiflows/${encodeURIComponent(id)}/events`, { signal: opts?.signal });
+  },
+
   /** Queue a steering message for the lead (the `rupu agentiflow send` channel).
    *  `now` asks for mid-round delivery; `stop` winds the run down after it. */
   async steerAgentiflow(id: string, body: { message: string; now?: boolean; stop?: boolean }): Promise<void> {
