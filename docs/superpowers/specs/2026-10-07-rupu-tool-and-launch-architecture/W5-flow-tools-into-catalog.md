@@ -83,7 +83,7 @@ Because grants are now just names, an agent outside a flow can list `agents.list
 
 ### 3.6 Bash reserved names
 
-Once the flow tools live in `rupu-tools`, replace W1's static `RESERVED_NATIVE_TOOLS` list in `bash.rs` with `ToolCatalog::non_shell_names()`, derived from the descriptors (every non-core canonical name plus its aliases), and delete W1's lockstep tests. If W7's `dispatch`/`join` are not in the catalog yet, keep their names in a small static remainder until W7.
+Already derived as of W1 (Section9Labs/rupu#809, see the as-built note under W1 §3.6): bash's reserved list is built by `ToolCatalog::non_shell_names()` from the descriptors in `rupu-tools`. W5 only has to keep the moved tools' descriptors registered in the catalog. The `catalog_is_complete` test enforces that.
 
 ## 4. Files
 
