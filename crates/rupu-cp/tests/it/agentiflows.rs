@@ -391,3 +391,49 @@ async fn steer_needs_a_live_coordinator_and_cp_serve() {
     assert_eq!(steer(addr, DONE).await.0, 409);
     assert_eq!(steer(addr, "af_missing").await.0, 404);
 }
+
+#[tokio::test]
+async fn events_feed_merges_coordinator_lifecycle_with_unit_lifecycle() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed(tmp.path());
+    let addr = spawn_server(tmp.path()).await;
+
+    let (status, body) = get(addr, &format!("/api/agentiflows/{DONE}/events")).await;
+    assert_eq!(status, 200, "{body}");
+    let evs = body["events"].as_array().unwrap();
+    let count = |k: &str| evs.iter().filter(|e| e["kind"] == k).count();
+    // 3 coordinator lifecycle lines + 2 units × (started + completed).
+    assert_eq!(count("run_started"), 1);
+    assert_eq!(count("round"), 1);
+    assert_eq!(count("run_stopped"), 1);
+    assert_eq!(count("af_unit_started"), 2);
+    assert_eq!(count("af_unit_completed"), 2);
+
+    // A completed unit carries its agent, verdict and output; UNIT_A's stored
+    // transcript codename wins over a derived one.
+    let done_a = evs
+        .iter()
+        .find(|e| e["kind"] == "af_unit_completed" && e["unit_id"] == UNIT_A)
+        .unwrap();
+    assert_eq!(done_a["agent"], "reviewer");
+    assert_eq!(done_a["success"], true);
+    assert_eq!(done_a["output"], "found it");
+    assert_eq!(done_a["codename"], "topaz-pass/ferret");
+    let failed_b = evs
+        .iter()
+        .find(|e| e["kind"] == "af_unit_completed" && e["unit_id"] == UNIT_B)
+        .unwrap();
+    // A failed unit never reported success (`success` is "done only"), so it is
+    // absent → null here; its failure shows in `error`.
+    assert_ne!(failed_b["success"], Value::Bool(true));
+    assert_eq!(failed_b["error"], "killed");
+
+    // Oldest-first: the feed is sorted by timestamp.
+    let ts: Vec<&str> = evs.iter().map(|e| e["ts"].as_str().unwrap_or("")).collect();
+    let mut sorted = ts.clone();
+    sorted.sort_unstable();
+    assert_eq!(ts, sorted, "events are oldest-first");
+
+    // A run id that names no run is a 404.
+    assert_eq!(get(addr, "/api/agentiflows/af_missing/events").await.0, 404);
+}

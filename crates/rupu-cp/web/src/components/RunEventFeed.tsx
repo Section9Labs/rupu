@@ -29,11 +29,18 @@ function tsOf(ev: SeqEvent['event']): number {
 
 export default function RunEventFeed({
   events,
+  cards: externalCards,
   connection,
   crewByRun,
 }: {
-  events: SeqEvent[];
-  connection: ConnectionState;
+  /** The run's SSE events; mapped to cards via `cardFromEvent`. */
+  events?: SeqEvent[];
+  /** Pre-built cards, when the caller's events are not orchestrator `RunEvent`s
+   *  (e.g. the agentiflow Events tab — see `lib/agentiflowEvents`). Takes
+   *  precedence over `events`. */
+  cards?: StreamCard[];
+  /** The live-connection indicator; omit it for a non-SSE feed (no badge). */
+  connection?: ConnectionState;
   /** run_id → run codename; gives run-level cards (no codename of their own)
    *  the crew tint stripe. */
   crewByRun?: ReadonlyMap<string, string>;
@@ -45,22 +52,26 @@ export default function RunEventFeed({
   // Newest-first cards; drop events that carry nothing worth a row (e.g. a
   // note-less step_working heartbeat → cardFromEvent returns null).
   const cards = useMemo<StreamCard[]>(() => {
+    if (externalCards) return externalCards;
+    const list = events ?? [];
     const out: StreamCard[] = [];
-    const evs = events.map((e) => e.event);
+    const evs = list.map((e) => e.event);
     const ctx = { unitKeys: unitKeyIndex(evs), agentUnits: agentUnitIndex(evs), crewByRun };
-    for (let i = events.length - 1; i >= 0; i--) {
-      const { seq, event } = events[i];
+    for (let i = list.length - 1; i >= 0; i--) {
+      const { seq, event } = list[i];
       const c = cardFromEvent(event, tsOf(event), `run-ev-${seq}`, ctx);
       if (c) out.push(c);
     }
     return out;
-  }, [events, crewByRun]);
+  }, [externalCards, events, crewByRun]);
+
+  const count = externalCards ? externalCards.length : events?.length ?? 0;
 
   useLayoutEffect(() => {
     if (!follow) return;
     const el = scrollRef.current;
     if (el) el.scrollTop = 0;
-  }, [events.length, follow]);
+  }, [count, follow]);
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -73,9 +84,9 @@ export default function RunEventFeed({
   return (
     <div className="flex flex-col h-full min-h-0">
       <div className="flex items-center justify-between px-1 pb-2">
-        <ConnectionBadge state={connection} />
+        {connection ? <ConnectionBadge state={connection} /> : <span />}
         <span className="text-note text-ink-mute tabular-nums">
-          {events.length} event{events.length === 1 ? '' : 's'}
+          {count} event{count === 1 ? '' : 's'}
         </span>
       </div>
 

@@ -132,6 +132,7 @@ function renderDetail() {
 describe('AgentiflowDetail', () => {
   it('renders the header, goals, budget, fleet, lead transcript and events', async () => {
     vi.spyOn(api, 'getAgentiflow').mockResolvedValue(DETAIL);
+    vi.spyOn(api, 'getAgentiflowEvents').mockResolvedValue({ events: DETAIL.events });
     renderDetail();
 
     expect(await screen.findByRole('heading', { name: 'rupu-self-review' })).toBeInTheDocument();
@@ -165,14 +166,13 @@ describe('AgentiflowDetail', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Transcript' }));
     expect(screen.getByTestId('transcript-panel')).toHaveTextContent('/tmp/lead/transcript.r1.jsonl:false');
 
-    // Events tab, newest first.
+    // Events tab: the shared live-events feed (RunEventFeed / EventCard), fed by
+    // GET /api/agentiflows/:id/events (fetched async, hence findByText).
     fireEvent.click(screen.getByRole('button', { name: 'Events' }));
-    const events = screen.getByRole('heading', { name: 'Events' }).closest('section')!;
-    const items = within(events).getAllByRole('listitem');
-    expect(items).toHaveLength(3);
-    expect(items[0]).toHaveTextContent('budget_exhausted:rounds');
-    expect(items[1]).toHaveTextContent('provider: API error 401');
-    expect(items[2]).toHaveTextContent('1 goal');
+    expect(await screen.findByText('3 events')).toBeInTheDocument();
+    expect(screen.getByText('Engagement started')).toBeInTheDocument();
+    expect(screen.getByText('Engagement stopped')).toBeInTheDocument();
+    expect(screen.getByText('provider: API error 401')).toBeInTheDocument();
   });
 
   it('falls back to the record alone without a definition snapshot', async () => {
