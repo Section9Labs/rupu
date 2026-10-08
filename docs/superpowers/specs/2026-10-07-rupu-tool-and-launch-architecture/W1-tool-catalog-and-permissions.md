@@ -176,7 +176,7 @@ The decision table is the whole policy. It is tested exhaustively (§6).
 
 - **T16:** `rupu_tools::output::{ok, ok_json, failed, req_str, opt_str}` replaces the copies in agentiflow `tools.rs`/`dispatch_tools.rs`/`roster.rs` and `coverage_tools.rs` (`ok_output`/`err_output`). `attribution_from_ctx` (`coverage_tools.rs:26`) is replaced by `coverage_emit::attribution_from`.
 - **T17:** `glob` filters results through `path_scope::is_inside`, as the other fs tools already do.
-- `bash.rs`'s `RESERVED_NATIVE_TOOLS` (`:73`) becomes `ToolCatalog::core_names()`, so there is one source.
+- `bash.rs`'s `RESERVED_NATIVE_TOOLS` (`:73`) lists the **non-core** tool names that a model wrongly tries to run as shell commands. Core names like `grep`/`glob` are real programs and must stay runnable. In W1 it stays a static list in `rupu-tools`, extended to every non-core canonical name **and** alias (findings/coverage/assets plus the agentiflow board/msg/goal/budget/roster names). Lockstep tests in `rupu-agent` and `rupu-agentiflow` (the crates that own those descriptors) assert that every non-core descriptor's names are in the list and that no core name is. W5/W7 replace the list with `ToolCatalog::non_shell_names()` once every descriptor lives in `rupu-tools`.
 
 ## 4. Files
 
@@ -196,7 +196,7 @@ The decision table is the whole policy. It is tested exhaustively (§6).
 
 ## 5. Deleted
 
-`PermissionDecider` trait and its 4 impls · `PermissionGate`, `KNOWN_READ_TOOLS`, `KNOWN_WRITE_TOOLS` · the duplicate `ReadonlyDecider` · `parse_mode_for_runtime` / `parse_mode_for_event` · `RESERVED_NATIVE_TOOLS` · per-crate `done`/`failed`/`req_str`/`ok_output`/`err_output` · `attribution_from_ctx` · every `== "readonly"` string comparison at launch sites.
+`PermissionDecider` trait and its 4 impls · `PermissionGate`, `KNOWN_READ_TOOLS`, `KNOWN_WRITE_TOOLS` · the duplicate `ReadonlyDecider` · `parse_mode_for_runtime` / `parse_mode_for_event` · per-crate `done`/`failed`/`req_str`/`ok_output`/`err_output` · `attribution_from_ctx` · every `== "readonly"` string comparison at launch sites.
 
 ## 6. Tests
 
