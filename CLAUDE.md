@@ -45,6 +45,7 @@
 - Recover-on-interrupt Plan 2 (local resume continues interrupted linear steps + `for_each` units; `--restart-interrupted`): `docs/superpowers/plans/2026-10-01-rupu-recover-on-interrupt-plan-2-local-resume.md`
 - Tool + agent-launch re-architecture spec (W1–W7, F1): `docs/superpowers/specs/2026-10-07-rupu-tool-and-launch-architecture/` — W1 catalog/permissions, W2 grants, W6 argv/spawn, W3 run assembler shipped (W3a: `rupu run`, sub-agents, session turns; W3b: workflow steps + the agentiflow lead — every launch site now goes through `rupu_runtime::assembly`)
 - Customers spec + Plan 1 (model, config layer, `rupu customer`; shipped) + Plan 2A (CP backend: attribution, API, `?customer=`, launch preview; shipped) + Plan 2B (CP web UI): `docs/superpowers/specs/2026-10-06-rupu-customers-design.md`, `docs/superpowers/plans/2026-10-06-rupu-customers-plan-1-model-config-cli.md`, `docs/superpowers/plans/2026-10-06-rupu-customers-plan-2a-cp-backend.md`, `docs/superpowers/plans/2026-10-06-rupu-customers-plan-2b-cp-web.md`; operator docs: `docs/configuration.md#customer-layer`, `docs/cp-customers-api.md`
+- yokoito 横糸 (statechart language + durable engine that replaces workflow/autoflow/agentiflow definitions; own repo Section9Labs/yokoito, rupu integration = its spec ch. 11): `docs/superpowers/specs/2026-10-06-yokoito.md`
 
 ## Architecture rules (enforced)
 1. **Hexagonal separation.** `rupu-providers`, `rupu-tools`, `rupu-auth` define traits (ports). The agent runtime in `rupu-agent` only knows traits.
