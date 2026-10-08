@@ -26,7 +26,7 @@ import AgentiflowGraph from '../components/agentiflow/AgentiflowGraph';
 import AssetInventory from '../components/agentiflow/AssetInventory';
 import MessageFeed from '../components/agentiflow/MessageFeed';
 import EngagementFindings from '../components/agentiflow/EngagementFindings';
-import TranscriptPanel from '../components/TranscriptPanel';
+import TranscriptBrowser from '../components/agentiflow/TranscriptBrowser';
 import { Segmented } from '../components/ui/Segmented';
 import { Badge, type BadgeTone } from '../components/ui/Badge';
 import { Button } from '../components/ui/Button';
@@ -145,9 +145,6 @@ export default function AgentiflowDetail() {
 
   const { record, def } = detail;
   const goals = goalViews(record, def);
-  const lastLead = detail.lead_transcripts.length
-    ? detail.lead_transcripts[detail.lead_transcripts.length - 1]
-    : null;
 
   return (
     <div className="p-8 space-y-4">
@@ -343,28 +340,9 @@ export default function AgentiflowDetail() {
       )}
 
       {tab === 'transcript' && (
-      <section>
-        <div className="mb-2 flex items-baseline justify-between gap-3">
-          <h2 className="text-xs font-semibold uppercase tracking-wide text-ink-dim">Lead transcript</h2>
-          {lastLead && (
-            <span className="min-w-0 truncate text-note text-ink-mute" title={lastLead.path}>
-              round {lastLead.round}
-              {detail.lead_transcripts.length > 1 && ` of ${detail.lead_transcripts.length}`} ·{' '}
-              <span className="font-mono">{lastLead.path.split('/').pop()}</span>
-            </span>
-          )}
-        </div>
-        {lastLead ? (
-          <div className="max-h-[65vh] overflow-auto">
-            {/* Keyed by path so a new round's transcript remounts (fresh snapshot + tail). */}
-            <TranscriptPanel key={lastLead.path} path={lastLead.path} live={running} />
-          </div>
-        ) : (
-          <div className="rounded-xl border border-border bg-panel px-4 py-8 text-center text-sm text-ink-dim">
-            No lead transcript yet.
-          </div>
-        )}
-      </section>
+        <section>
+          <TranscriptBrowser detail={detail} running={running} />
+        </section>
       )}
 
       {tab === 'events' && (
