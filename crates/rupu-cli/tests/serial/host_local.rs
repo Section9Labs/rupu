@@ -27,13 +27,10 @@ fn host_local_works() {
     let _env = ENV_LOCK.blocking_lock();
     let tmp = assert_fs::TempDir::new().unwrap();
     let global = tmp.child(".rupu");
-    // The placed unit is a detached `rupu run` with no tty and no `--mode`
-    // (a `UnitDispatch` carries none), so — like any fleet host — this one
-    // runs agents under its configured default mode.
-    global
-        .child("config.toml")
-        .write_str("permission_mode = \"bypass\"\n")
-        .unwrap();
+    // No `permission_mode` configured: the unit runs under the workflow
+    // run's mode (#818), not the host's default — which would be `ask`, and a
+    // detached `rupu run` refuses that.
+    global.create_dir_all().unwrap();
     let project = tmp.child("proj");
     project
         .child(".rupu/workflows/placed.yaml")
