@@ -1754,15 +1754,26 @@ fn workflow_transcript_event_lines(
             declared,
             granted,
             blocked,
+            decision,
             ..
         } => {
+            // Every call is audited; only a denial or an ungranted `actions:`
+            // entry adds anything to the call's own row.
+            if !rupu_transcript::grant::tool_audit_notable(*blocked, *declared, *granted) {
+                return Vec::new();
+            }
             let status = if *blocked {
                 UiStatus::Failed
             } else {
                 UiStatus::Complete
             };
-            let detail =
-                format!("{tool}  ·  declared={declared} granted={granted} blocked={blocked}");
+            let detail = rupu_transcript::grant::tool_audit_detail(
+                tool,
+                *declared,
+                *granted,
+                *blocked,
+                decision.as_deref(),
+            );
             vec![WorkflowViewLine {
                 status,
                 text: retained_workflow_event_line_raw(status, "tool audit", &detail),
@@ -1992,6 +2003,22 @@ fn workflow_transcript_event_lines(
                 UiStatus::Awaiting,
                 "notice",
                 &format!("{kind}  ·  {}", truncate_single_line(message, 96)),
+            ),
+            continuation: false,
+            indent: 0,
+            kind: WorkflowViewLineKind::Event,
+        }],
+        TxEvent::ToolGrant {
+            entries,
+            narrowed,
+            unavailable,
+            ..
+        } => vec![WorkflowViewLine {
+            status: UiStatus::Active,
+            text: retained_workflow_event_line(
+                UiStatus::Active,
+                "tools",
+                &rupu_transcript::grant::tool_grant_line(entries, narrowed, unavailable),
             ),
             continuation: false,
             indent: 0,

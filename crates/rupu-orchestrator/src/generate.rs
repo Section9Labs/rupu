@@ -93,11 +93,14 @@ pub fn strip_fences(raw: &str) -> &str {
 }
 
 /// Parse-validate generated content for the kind. Returns the parse error
-/// text on failure (fed back into the repair prompt).
+/// text on failure (fed back into the repair prompt). An agent's `tools:`
+/// must name known tools — the same check a launch makes — so a model that
+/// invents a tool name gets the did-you-mean back and repairs it.
 pub fn validate(kind: GenKind, content: &str) -> Result<(), String> {
     match kind {
         GenKind::Agent => rupu_agent::AgentSpec::parse(content)
-            .map(|_| ())
+            .map_err(|e| e.to_string())?
+            .validate_tools()
             .map_err(|e| e.to_string()),
         GenKind::Workflow => crate::Workflow::parse(content)
             .map(|_| ())
@@ -130,7 +133,7 @@ delimited by `---` lines, then a Markdown body that is the agent's system prompt
 frontmatter:\n  name: <kebab-case identifier>\n  description: <one short line>\n  provider: \
 anthropic   # one of: anthropic | openai | google | github-copilot | broker\n  model: <a model \
 id for that provider, e.g. claude-sonnet-4-6>\n\nOptional frontmatter: tools (a YAML list, e.g. \
-[bash, read, grep]), permissionMode (ask|bypass|readonly), maxTurns (integer).\n\nThe Markdown \
+[bash, read_file, grep]; unknown tool names are rejected), permissionMode (ask|bypass|readonly), maxTurns (integer).\n\nThe Markdown \
 body after the closing `---` is the system prompt: role, voice, boundaries. Be specific and \
 useful.\n";
 
@@ -283,6 +286,15 @@ mod tests {
     #[test]
     fn strip_fences_leaves_bare_content() {
         assert_eq!(strip_fences("name: hi"), "name: hi");
+    }
+
+    #[test]
+    fn validate_rejects_an_agent_with_an_unknown_tool() {
+        let agent = "---\nname: a\ntools: [bash, read, grep]\n---\nbody\n";
+        let err = validate(GenKind::Agent, agent).unwrap_err();
+        assert!(err.contains("unknown tool \"read\""), "{err}");
+        let fixed = "---\nname: a\ntools: [bash, read_file, grep]\n---\nbody\n";
+        assert!(validate(GenKind::Agent, fixed).is_ok());
     }
 
     #[test]

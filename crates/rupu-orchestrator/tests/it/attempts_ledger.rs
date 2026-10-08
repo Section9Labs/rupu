@@ -52,6 +52,8 @@ impl StepFactory for EchoFactory {
             recovery: Default::default(),
             collectors: Vec::new(),
             extra_tools: Vec::new(),
+            step_actions: Vec::new(),
+            alias_scope: Default::default(),
             agent_name: agent_name.to_string(),
             agent_system_prompt: "echo".into(),
             agent_tools: None,

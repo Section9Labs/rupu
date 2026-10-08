@@ -35,7 +35,8 @@ pub static DESCRIPTOR: ToolDescriptor = ToolDescriptor {
     name: "read_file",
     aliases: &[],
     effect: Effect::Read,
-    needs: &[Service::Coverage],
+    needs: &[],
+    uses: &[Service::Coverage],
     description: "Read a file from the workspace and return its contents prefixed by 1-based line numbers separated by tabs. Always use this before editing a file so you have current line numbers. Paths are relative to the workspace root; absolute paths and paths that escape the workspace (e.g. `../`) are rejected.",
     input_schema: descriptor_schema,
 };

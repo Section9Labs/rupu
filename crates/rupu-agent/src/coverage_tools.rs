@@ -419,39 +419,60 @@ impl Tool for AssetMarkTool {
 // Registration
 // ---------------------------------------------------------------------------
 
-/// Register the coverage tools into the provided registry. `asset_mark` is
-/// registered only when the run has an active engagement profile (its findings
-/// options carry one); otherwise the tool would have nothing to validate
-/// against, so it is not offered.
-pub fn register(
-    registry: &mut crate::tool_registry::ToolRegistry,
-    catalog: FlatCatalog,
-    paths: CoveragePaths,
-    findings: rupu_coverage::FindingWriteOptions,
-) {
-    let catalog = Arc::new(catalog);
-    if let Some(engagement) = findings.engagement.clone() {
-        registry.insert(Arc::new(AssetMarkTool {
-            paths: paths.clone(),
-            engagement,
-        }));
+/// What the coverage-ledger and findings tool bodies are built from in one
+/// run: the ledger paths, the concern catalog (only with a `concerns:`
+/// block), the findings contract, the workspace and its tag log.
+pub struct LedgerTools {
+    pub paths: CoveragePaths,
+    pub catalog: Option<Arc<FlatCatalog>>,
+    pub findings: rupu_coverage::FindingWriteOptions,
+    pub workspace: PathBuf,
+    pub tag_log: rupu_coverage::TagLog,
+}
+
+impl LedgerTools {
+    /// The body of the coverage/findings tool with canonical name `name`,
+    /// or `None` when this run can't build it: a coverage tool without a
+    /// concern catalog, `assets.mark` without an engagement profile, or a
+    /// name that isn't one of these tools.
+    pub fn instantiate(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        use rupu_tools::catalog::{coverage as c, findings as f};
+        let paths = || self.paths.clone();
+        let catalog = || self.catalog.clone();
+        Some(match name {
+            n if n == c::COVERAGE_MARK.name => Arc::new(CoverageMarkTool {
+                paths: paths(),
+                catalog: catalog()?,
+            }),
+            n if n == c::COVERAGE_STATUS.name => {
+                catalog()?;
+                Arc::new(CoverageStatusTool { paths: paths() })
+            }
+            n if n == c::COVERAGE_REMAINING.name => Arc::new(CoverageRemainingTool {
+                paths: paths(),
+                catalog: catalog()?,
+            }),
+            n if n == c::COVERAGE_CONCERNS_SEARCH.name => Arc::new(CoverageConcernsSearchTool {
+                catalog: catalog()?,
+            }),
+            n if n == c::COVERAGE_CONCERNS_DETAIL.name => Arc::new(CoverageConcernsDetailTool {
+                catalog: catalog()?,
+            }),
+            n if n == f::FINDINGS_REPORT.name => {
+                Arc::new(ReportFindingTool::new(paths(), self.findings.clone()))
+            }
+            n if n == f::FINDINGS_VERIFY.name => Arc::new(FindingVerifyTool::new(paths())),
+            n if n == f::ASSETS_MARK.name => Arc::new(AssetMarkTool::new(
+                paths(),
+                self.findings.engagement.clone()?,
+            )),
+            n if n == f::FINDINGS_QUERY.name => {
+                Arc::new(QueryFindingsTool::new(self.workspace.clone()))
+            }
+            n if n == f::FINDINGS_TAG.name => Arc::new(TagFindingsTool::new(self.tag_log.clone())),
+            _ => return None,
+        })
     }
-    registry.insert(Arc::new(CoverageMarkTool {
-        paths: paths.clone(),
-        catalog: catalog.clone(),
-    }));
-    registry.insert(Arc::new(CoverageStatusTool {
-        paths: paths.clone(),
-    }));
-    registry.insert(Arc::new(CoverageRemainingTool {
-        paths: paths.clone(),
-        catalog: catalog.clone(),
-    }));
-    registry.insert(Arc::new(ReportFindingTool::new(paths, findings)));
-    registry.insert(Arc::new(CoverageConcernsSearchTool {
-        catalog: catalog.clone(),
-    }));
-    registry.insert(Arc::new(CoverageConcernsDetailTool { catalog }));
 }
 
 // ---------------------------------------------------------------------------
@@ -863,25 +884,5 @@ mod finding_verify_tests {
             assert!(matches!(err, ToolError::InvalidInput(_)), "{bad}: {err:?}");
         }
         assert_eq!(std::fs::read(&paths.findings).unwrap(), before);
-    }
-
-    #[test]
-    fn the_coverage_bundle_registers_report_finding_but_not_finding_verify() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut registry = crate::tool_registry::ToolRegistry::new();
-        register(
-            &mut registry,
-            FlatCatalog {
-                concerns: Vec::new(),
-                sources: Default::default(),
-                render_modes: Default::default(),
-            },
-            CoveragePaths::new(tmp.path(), "t"),
-            FindingWriteOptions::default(),
-        );
-        let names = registry.known_tools();
-        assert!(names.iter().any(|n| n == "findings.report"), "{names:?}");
-        // A verdict is an explicit `tools:` grant, never part of the bundle.
-        assert!(!names.iter().any(|n| n == "findings.verify"), "{names:?}");
     }
 }

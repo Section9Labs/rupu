@@ -335,23 +335,49 @@ an old transcript file understands what they're looking at.
 
 ### `tool_audit`
 
-Per-catalog-tool-call audit trail for a workflow step's `actions:` enforcement. Emitted from two
-choke points: the agent runtime's `on_tool_call` hook (wrapped by `rupu-orchestrator::step_factory`)
-for agent-driven MCP calls, and `execute_action_step` for `action:`-node calls — for an action-node
-call it is written immediately after that call's `action_emitted` line, covering the same call.
-Never confuse `tool_audit` with `action_emitted`: `tool_audit` is the general catalog-call audit
-line, and it is what the CP transcript panel renders a badge from.
+The audit line for one tool call. Every call ends in exactly one, whatever the tool (core,
+coverage/findings, connector, agentiflow) and whatever happened to it: allowed, denied by the
+run's permission policy, refused by the tool's own gate, or not in the run's grant at all.
+Emitted from two choke points: the agent loop, right after the call's `tool_result` (before a
+`run_complete` when the operator stops the run at the call's prompt), and `execute_action_step`
+for `action:`-node calls, immediately after that call's `action_emitted` line. Never confuse
+`tool_audit` with `action_emitted`: `tool_audit` is the general audit line, and it is what the CP
+transcript panel renders a badge from (blocked / not granted).
 
-| Field        | Type   | Description                                                                                     |
-|--------------|--------|---------------------------------------------------------------------------------------------------|
-| `tool`       | string | The MCP catalog tool name (e.g. `issues.create`)                                                  |
-| `declared`   | bool   | Whether `tool` appears in the step's `actions:` allowlist. `false` both when `actions:` is empty/absent (unrestricted — not a violation) and when `actions:` is non-empty but doesn't name this tool — use `restricted` to tell those apart |
-| `granted`    | bool   | Whether `tool` is covered by the agent's `tools:` grant, evaluated before any `actions:` narrowing. Always `true` for an `action:` node (no agent-grant concept applies there) |
-| `blocked`    | bool   | Whether the call was actually denied — either narrowed out of the agent's roster before reaching the registry, or denied by the MCP mode/permission gate |
-| `restricted` | bool   | Whether the step declared a non-empty `actions:` allowlist at all (disambiguates `declared: false`) |
+| Field        | Type    | Description                                                                                     |
+|--------------|---------|---------------------------------------------------------------------------------------------------|
+| `tool`       | string  | The tool name as the model called it (canonical or a legacy alias, matching its `tool_call`); for an `action:` node, the step's tool |
+| `declared`   | bool    | Whether the step's `actions:` names `tool`. `false` both when `actions:` is empty/absent (unrestricted — not a violation) and when it doesn't name this tool — use `restricted` to tell those apart |
+| `granted`    | bool    | Whether the run's grant covered `tool` before any `actions:` narrowing. Always `true` for an `action:` node |
+| `blocked`    | bool    | Whether the call was denied (`decision` is not `allowed`) |
+| `restricted` | bool    | Whether the step declared a non-empty `actions:` allowlist at all (disambiguates `declared: false`) |
+| `reason`     | string? | Why the tool was in the grant, as comma-separated reasons (the `tool_grant` entry's), or `action` for an `action:` node. Absent when the grant didn't cover the call, and on older lines |
+| `decision`   | string? | `allowed`, `denied:readonly`, `denied:operator` (answered no at the prompt), `denied:operator_stop`, `denied:tool` (the tool's own gate refused), or `not_granted` (the model named a tool the run doesn't offer). Absent on lines written before every call was audited |
 
 ```json
-{"type":"tool_audit","data":{"tool":"issues.create","declared":true,"granted":true,"blocked":false,"restricted":true}}
+{"type":"tool_audit","data":{"tool":"write_file","declared":false,"granted":true,"blocked":true,"restricted":false,"reason":"declared","decision":"denied:readonly"}}
+```
+
+---
+
+### `tool_grant`
+
+The tools the run offered its model, and why. Written once, right after `run_start` and its
+`model_limits` notice. `entries` is exactly the model's tool list.
+
+| Field         | Type   | Description |
+|---------------|--------|-------------|
+| `entries`     | array  | `{tool, reasons}` per offered tool: its canonical name and every reason it is there — `declared` (named in `tools:`), `declared:<wildcard>` (matched `*`, `core.*`, `scm.*`, …), `default` (the agent has no `tools:`), `ambient:concerns`, `ambient:engagement`, `origin:injected` (a tool the launch site handed the run, e.g. an agentiflow's board tools) |
+| `narrowed`    | array? | Connector tools the step's `actions:` removed. Omitted when empty |
+| `unavailable` | array? | `{tool, missing}`: tools named exactly in `tools:` that this run can't serve, with the services it lacks. Each also gets a `tool_unavailable` notice. Omitted when empty |
+| `skipped`     | array? | `{tool, missing}`: tools a wildcard or the default grant matched that this run can't serve. Not offered, no notice. Omitted when empty |
+
+Services: `scm` (configured connectors), `agent_dispatcher` (sub-agent dispatch), `launcher`
+(agentiflow units), `findings`, `engagement`, `coverage` (a `concerns:` block), `message_bus`,
+`run_status`, `catalog`, `workflow_generator`, `netflow`.
+
+```json
+{"type":"tool_grant","data":{"entries":[{"tool":"read_file","reasons":["declared"]},{"tool":"findings.report","reasons":["ambient:concerns"]}],"unavailable":[{"tool":"board.post","missing":["message_bus"]}]}}
 ```
 
 ---
@@ -477,7 +503,7 @@ A runtime intervention worth showing that is not part of the conversation.
 
 | Field     | Type   | Description |
 |-----------|--------|-------------|
-| `kind`    | string | `model_limits` (the run's input and output limits and where each came from, written at start and on a fallback hop), `model_limits_clamped`, `context_trim`, `provider_retry` or `server_side_fallback_disabled`. Expect new kinds; render an unknown one by its `message` |
+| `kind`    | string | `model_limits` (the run's input and output limits and where each came from, written at start and on a fallback hop), `model_limits_clamped`, `context_trim`, `provider_retry`, `server_side_fallback_disabled`, `permission_mode_degraded` (ask mode with no operator to ask) or `tool_unavailable` (a tool named in `tools:` that this run can't serve; one per tool, right after `tool_grant`). Expect new kinds; render an unknown one by its `message` |
 | `message` | string | Human-readable text |
 
 ```json
@@ -630,13 +656,15 @@ Within a single run file the event ordering is:
 ```
 run_start
 notice?                     # model_limits
+tool_grant                  # the tools offered, and why (W2)
+notice*                     # tool_unavailable, one per named tool the run can't serve
 seed?                       # a run seeded from earlier history
 user_message?
 (turn_start
    usage+                   # one per provider call; a compaction call adds one with purpose
    outcome?                 # a non-normal reply, ahead of the turn's content
    (thinking_delta* thinking | assistant_delta* assistant_message | assistant_block)*
-   (tool_call  tool_result  file_edit?  command_run?  action_emitted?  tool_audit?)*
+   (tool_call  tool_result  file_edit?  command_run?  tool_audit)*
  turn_end
  recovery*
  notice*  compaction?)*
@@ -669,4 +697,5 @@ continuing an interrupted step, a session's next turn). The rules:
 - A `compaction` replaces everything so far with its `messages`.
 
 A version 1 transcript rebuilds without reasoning blocks. Deltas, `usage`, `notice`,
-`outcome`, `tool_audit`, `net_flow` and unknown events don't affect the conversation.
+`outcome`, `tool_grant`, `tool_audit`, `net_flow` and unknown events don't affect the
+conversation.

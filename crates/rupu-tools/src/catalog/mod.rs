@@ -6,6 +6,10 @@
 //!
 //! The MCP connector tools (`scm.*`, `issues.*`, …) are not listed: their
 //! descriptors are built from `rupu-mcp`'s catalog until W4 moves them in.
+//! A [`ToolCatalog`] value is this static list plus such extra descriptors
+//! ([`ToolCatalog::with`]); grant resolution ([`crate::grant`]) runs over a
+//! value, so `rupu-agent` hands it the connector descriptors (and a run's
+//! injected tools) until they live here.
 
 pub mod coverage;
 pub mod findings;
@@ -73,10 +77,43 @@ pub static ALL: &[&ToolDescriptor] = &[
     &flow::JOIN,
 ];
 
-/// The catalog's queries.
-pub struct ToolCatalog;
+/// The catalog's queries. The associated functions ([`Self::all`],
+/// [`Self::get`], …) cover the static list; a value ([`Self::builtin`],
+/// extended with [`Self::with`]) also holds descriptors defined outside this
+/// crate, and is what names are resolved and grants computed against.
+#[derive(Clone, Debug, Default)]
+pub struct ToolCatalog {
+    extra: Vec<&'static ToolDescriptor>,
+}
 
 impl ToolCatalog {
+    /// The static catalog, with nothing added.
+    pub fn builtin() -> Self {
+        Self::default()
+    }
+
+    /// This catalog plus `extra`. A descriptor whose canonical name the
+    /// catalog already holds is ignored (the first one listed wins).
+    pub fn with(mut self, extra: impl IntoIterator<Item = &'static ToolDescriptor>) -> Self {
+        for d in extra {
+            if !self.descriptors().any(|have| have.name == d.name) {
+                self.extra.push(d);
+            }
+        }
+        self
+    }
+
+    /// Every descriptor this value holds: the static list, then the extras
+    /// in the order they were added.
+    pub fn descriptors(&self) -> impl Iterator<Item = &'static ToolDescriptor> + '_ {
+        ALL.iter().copied().chain(self.extra.iter().copied())
+    }
+
+    /// The descriptor this value holds under the canonical name `name`.
+    pub fn descriptor(&self, name: &str) -> Option<&'static ToolDescriptor> {
+        self.descriptors().find(|d| d.name == name)
+    }
+
     /// Every descriptor.
     pub fn all() -> &'static [&'static ToolDescriptor] {
         ALL

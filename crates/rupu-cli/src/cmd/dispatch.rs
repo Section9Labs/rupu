@@ -478,6 +478,8 @@ impl AgentDispatcher for CliAgentDispatcher {
             seed_source: None,
             collectors: Vec::new(),
             extra_tools: Vec::new(),
+            step_actions: Vec::new(),
+            alias_scope: Default::default(),
             agent_name: spec.name.clone(),
             agent_system_prompt: spec.system_prompt.clone(),
             agent_tools: spec.tools.clone(),

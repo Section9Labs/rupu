@@ -44,14 +44,17 @@ pub use collector::{
     TurnContext,
 };
 pub use fd_budget::load_agent_admitted;
-pub use loader::{load_agent, load_agents, AgentLoadError};
+pub use loader::{
+    check_agent_files, find_agent, load_agent, load_agents, AgentFileCheck, AgentLayer,
+    AgentLoadError,
+};
 pub use permission::{resolve_mode, PermissionPrompt};
 pub use recovery::{Hop, HopBuilder, RecoveryOpts};
 pub use runner::{
     compact_messages, run_agent, run_agent_full, run_agent_with_limits, AgentRunOpts,
-    CompactionError, CompactionOutcome, MockProvider, OnToolCallCallback, OnUsageCallback, RunError,
-    RunExit, RunResult, ScriptedTurn, UsageKind, UsageTurn,
+    CompactionError, CompactionOutcome, MockProvider, OnToolCallCallback, OnUsageCallback,
+    RunError, RunExit, RunResult, ScriptedTurn, UsageKind, UsageTurn,
 };
 pub use rupu_providers::types::StopReason;
 pub use spec::{AgentSpec, AgentSpecParseError};
-pub use tool_registry::{default_tool_registry, ToolRegistry};
+pub use tool_registry::{builtin_tool, tool_catalog, ToolRegistry};

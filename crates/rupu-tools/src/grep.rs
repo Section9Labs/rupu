@@ -41,6 +41,7 @@ pub static DESCRIPTOR: ToolDescriptor = ToolDescriptor {
     aliases: &[],
     effect: Effect::Read,
     needs: &[],
+    uses: &[],
     description: "Search the workspace for a pattern using ripgrep. Output is `path:line:match` lines, gitignore-aware. Use this to locate symbols, callers, or any text across the workspace. Returns empty stdout (not an error) when there are no matches.",
     input_schema: descriptor_schema,
 };

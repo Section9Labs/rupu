@@ -16,6 +16,7 @@ pub static BOARD_CLAIM: ToolDescriptor = ToolDescriptor {
     aliases: &[],
     effect: Effect::Record,
     needs: &[Service::MessageBus],
+    uses: &[],
     description: "Atomically claim a work unit so no other participant duplicates it. \
      Returns granted, or the current holder when it is already claimed.",
     input_schema: board_claim_schema,
@@ -40,6 +41,7 @@ pub static BOARD_RELEASE: ToolDescriptor = ToolDescriptor {
     aliases: &[],
     effect: Effect::Record,
     needs: &[Service::MessageBus],
+    uses: &[],
     description: "Release a work unit you previously claimed with board.claim, so another \
      participant can take it.",
     input_schema: board_release_schema,
@@ -64,6 +66,7 @@ pub static BOARD_POST: ToolDescriptor = ToolDescriptor {
     aliases: &[],
     effect: Effect::Record,
     needs: &[Service::MessageBus],
+    uses: &[],
     description: "Post to the shared board every participant can read: an observation, a \
      question, an answer, a vote, or a note. Optionally address it to a \
      participant id or role.",
@@ -94,6 +97,7 @@ pub static BOARD_READ: ToolDescriptor = ToolDescriptor {
     aliases: &[],
     effect: Effect::Read,
     needs: &[Service::MessageBus],
+    uses: &[],
     description: "Read the shared board's posts, oldest first, newest last. Returns the \
      most recent posts (default 50); filter to those addressed to a \
      participant id or role with addressed_to.",
@@ -124,6 +128,7 @@ pub static MSG_SEND: ToolDescriptor = ToolDescriptor {
     aliases: &[],
     effect: Effect::Record,
     needs: &[Service::MessageBus],
+    uses: &[],
     description: "Send a message. `to` is a participant id, a role, \"parent\", or \
      \"lead\" (delivered to exactly that inbox), or \"broadcast\" (every \
      participant sees it once, from the moment it started listening; the \
@@ -151,6 +156,7 @@ pub static AGENTS_LIST: ToolDescriptor = ToolDescriptor {
     aliases: &[],
     effect: Effect::Read,
     needs: &[Service::Catalog],
+    uses: &[],
     description: "List the agents you can draw on (global and project): each one's name, \
      description and declared tools. `tools: null` means the agent uses the \
      default tool set, not none. Use agents.get for one agent's detail.",
@@ -167,6 +173,7 @@ pub static AGENTS_GET: ToolDescriptor = ToolDescriptor {
     aliases: &[],
     effect: Effect::Read,
     needs: &[Service::Catalog],
+    uses: &[],
     description: "Get one agent's detail by name: description, provider, model, declared \
      tools, the agents it may dispatch, and its permission mode.",
     input_schema: agents_get_schema,
@@ -188,6 +195,7 @@ pub static WORKFLOWS_LIST: ToolDescriptor = ToolDescriptor {
     aliases: &[],
     effect: Effect::Read,
     needs: &[Service::Catalog],
+    uses: &[],
     description: "List the workflows you can run (global and project). `id` is the runnable \
      identifier (the file stem); `name` is the declared display name. A \
      workflow that failed to parse is listed with its parse_error.",
@@ -204,6 +212,7 @@ pub static WORKFLOWS_GET: ToolDescriptor = ToolDescriptor {
     aliases: &[],
     effect: Effect::Read,
     needs: &[Service::Catalog],
+    uses: &[],
     description: "Get one workflow's summary by its `id` (the runnable file stem workflows.list \
      shows, not the declared name): description, scope, declared inputs, step count.",
     input_schema: workflows_get_schema,
@@ -225,6 +234,7 @@ pub static CATALOG_SEARCH: ToolDescriptor = ToolDescriptor {
     aliases: &[],
     effect: Effect::Read,
     needs: &[Service::Catalog],
+    uses: &[],
     description: "Search the agent and workflow catalog: a case-insensitive substring match \
      over agent name/description and workflow id/name/description. Each hit is \
      tagged kind=agent|workflow. `warnings` is present when part of the catalog \
@@ -248,6 +258,7 @@ pub static GOAL_STATUS: ToolDescriptor = ToolDescriptor {
     aliases: &[],
     effect: Effect::Read,
     needs: &[Service::RunStatus],
+    uses: &[],
     description: "Re-check every goal against the pooled evidence right now (findings and \
      assets banked since the round began count). Each goal reports `satisfied`, \
      its `current`/`target` tally and a one-line `detail`; a goal that could not \
@@ -268,6 +279,7 @@ pub static GOAL_COVERAGE: ToolDescriptor = ToolDescriptor {
     aliases: &[Alias::flow_lead("coverage.status")],
     effect: Effect::Read,
     needs: &[Service::RunStatus],
+    uses: &[],
     description: "Re-check the engagement coverage target against the pooled assets right \
      now. `reach` is the required fraction and `depth` the rung assets must \
      have reached (null: the ladder's terminal rung); `fraction` is what has \
@@ -287,6 +299,7 @@ pub static BUDGET_STATUS: ToolDescriptor = ToolDescriptor {
     aliases: &[],
     effect: Effect::Read,
     needs: &[Service::RunStatus],
+    uses: &[],
     description: "Re-check the run's budget against what it has spent right now: the \
      lead's own and every unit's usage so far, read fresh. `stage` is `ok`, \
      `soft` (a dimension crossed its soft threshold: converge) or `hard` (a \
@@ -310,6 +323,7 @@ pub static BOARD_DIRECTIVE: ToolDescriptor = ToolDescriptor {
     aliases: &[],
     effect: Effect::Record,
     needs: &[Service::MessageBus],
+    uses: &[],
     description: "Steer the fleet: write a standing directive to the board. Units see it on \
      every turn until you lift it, so post sparingly and keep each short and \
      actionable. Returns the directive's `id`: pass it to `board.retract` once \
@@ -338,6 +352,7 @@ pub static BOARD_RETRACT: ToolDescriptor = ToolDescriptor {
     aliases: &[],
     effect: Effect::Record,
     needs: &[Service::MessageBus],
+    uses: &[],
     description: "Lift a standing directive: pass the `id` that `board.directive` returned \
      (it is also shown in brackets on each standing directive you see each \
      turn). Units stop seeing it from their next turn. An unknown or already \
@@ -364,6 +379,7 @@ pub static DISPATCH: ToolDescriptor = ToolDescriptor {
     aliases: &[],
     effect: Effect::Spawn,
     needs: &[Service::Launcher],
+    uses: &[],
     description: "Start a pool agent as an independent unit working on a prompt, in its own \
      process. Returns a handle immediately without waiting; pass it to `join` \
      to wait for the unit's result. Only agents in the flow's pool can be \
@@ -394,6 +410,7 @@ pub static RUN_WORKFLOW: ToolDescriptor = ToolDescriptor {
     aliases: &[],
     effect: Effect::Spawn,
     needs: &[Service::Launcher],
+    uses: &[],
     description: "Start a pool workflow as an independent unit, in its own process. Returns \
      a handle immediately without waiting; pass it to `join` to wait for the \
      workflow's result. Only workflows in the flow's pool can be started, and \
@@ -426,6 +443,7 @@ pub static WORKFLOWS_GENERATE: ToolDescriptor = ToolDescriptor {
     aliases: &[Alias::any("generate_workflow")],
     effect: Effect::Spawn,
     needs: &[Service::WorkflowGenerator],
+    uses: &[],
     description: "Author a NEW workflow for a described task and run it as an independent \
      unit, in its own process. Returns a handle immediately without waiting; \
      pass it to `join` to wait for the workflow's result. The workflow may \
@@ -458,6 +476,7 @@ pub static JOIN: ToolDescriptor = ToolDescriptor {
     aliases: &[],
     effect: Effect::Read,
     needs: &[Service::Launcher],
+    uses: &[],
     description: "Wait for a dispatched unit to finish and return its result. Reports \
      status `done` (with the unit's output and whether it succeeded), `failed`, \
      or `running` / `pending` if it has not finished within the timeout (join \

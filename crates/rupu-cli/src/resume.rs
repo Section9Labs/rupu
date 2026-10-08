@@ -29,8 +29,9 @@ use std::sync::Arc;
 ///
 /// The **tool allowlist** deliberately does NOT match the agent path, and
 /// this is not an oversight (ISSUES.md I-26). An agent step's surface is
-/// its `tools:` list narrowed by `actions:` (`step_factory.rs`'s
-/// `narrow_agent_tools`); this dispatcher passes `["*"]` instead, because
+/// its resolved grant — `tools:` narrowed by `actions:`
+/// (`rupu_tools::ToolCatalog::resolve_grant`); this dispatcher passes `["*"]`
+/// instead, because
 /// it is built once per run while the tool it may call is per-step. That
 /// is sound rather than permissive, resting on three invariants:
 ///

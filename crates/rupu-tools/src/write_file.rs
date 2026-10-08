@@ -32,6 +32,7 @@ pub static DESCRIPTOR: ToolDescriptor = ToolDescriptor {
     aliases: &[],
     effect: Effect::Write,
     needs: &[],
+    uses: &[],
     description: "Create a file or overwrite an existing one in the workspace. Use this for new files; for edits to existing files prefer `edit_file` to preserve unrelated content. Intermediate directories are created as needed. Paths must be inside the workspace root.",
     input_schema: descriptor_schema,
 };

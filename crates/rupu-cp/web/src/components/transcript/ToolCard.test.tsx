@@ -838,3 +838,37 @@ describe('ToolCard call anchor', () => {
     expect(n.container.querySelector('[data-call-id]')).toBeNull();
   });
 });
+
+describe('ToolCard audit badge', () => {
+  const audit = (o: Partial<NonNullable<ToolView['audit']>>) => ({
+    declared: false,
+    granted: true,
+    blocked: false,
+    restricted: false,
+    ...o,
+  });
+
+  it('an allowed call gets no badge (every call is audited)', () => {
+    render(
+      <ToolCard
+        tool={makeToolView({ tool: 'read_file', kind: 'read', audit: audit({ decision: 'allowed' }) })}
+      />,
+    );
+    expect(screen.queryByText('blocked')).toBeNull();
+    expect(screen.queryByText('audited')).toBeNull();
+    expect(screen.queryByText('not granted')).toBeNull();
+  });
+
+  it('a denied call is badged with its recorded decision', () => {
+    render(
+      <ToolCard
+        tool={makeToolView({
+          tool: 'write_file',
+          kind: 'write',
+          audit: audit({ blocked: true, decision: 'denied:readonly' }),
+        })}
+      />,
+    );
+    expect(screen.getByText('blocked').getAttribute('title')).toMatch(/readonly mode/);
+  });
+});

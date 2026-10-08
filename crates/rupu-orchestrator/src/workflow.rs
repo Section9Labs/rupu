@@ -192,8 +192,16 @@ pub enum WorkflowParseError {
         tool: String,
         detail: String,
     },
-    #[error("step `{step}`: `actions:` entry `{tool}` is not a known MCP tool (see `rupu mcp` / GET /api/tools for the catalog)")]
-    ActionsUnknownTool { step: String, tool: String },
+    /// An `actions:` entry naming no tool or namespace; `detail` carries
+    /// the grant resolver's message (with a did-you-mean when one is close).
+    #[error("step `{step}`: {detail}")]
+    ActionsUnknownTool {
+        step: String,
+        tool: String,
+        detail: String,
+    },
+    #[error("step `{step}`: `actions:` entry `{tool}` names no connector tool — `actions:` narrows only connector (scm/issues/github/gitlab) tools, so it would have no effect")]
+    ActionsNotConnector { step: String, tool: String },
     #[error("step `{step}`: an `action:` step must not carry a non-empty `actions:` allowlist — its tool is already explicit")]
     ActionsOnActionStep { step: String },
     #[error("step `{step}`: a non-empty `actions:` is not supported on a remote step (`host:`/`distribute:`) — the roster never reaches the remote dispatch payload, so it would be silently ignored; remove `actions:` or clear it to `[]`")]
@@ -1609,13 +1617,28 @@ fn validate_step_actions(step: &Step) -> Result<(), WorkflowParseError> {
             step: step.id.clone(),
         });
     }
-    let catalog = rupu_mcp::tools::tool_catalog();
+    // The same vocabulary the runner narrows with (W2): canonical names,
+    // aliases, `ns.*` and `*`, each of which must name connector tools.
+    let catalog = rupu_agent::tool_catalog();
     for tool in &step.actions {
-        if !catalog.iter().any(|s| s.name == tool.as_str()) {
-            return Err(WorkflowParseError::ActionsUnknownTool {
-                step: step.id.clone(),
-                tool: tool.clone(),
-            });
+        match catalog.resolve_actions(
+            std::slice::from_ref(tool),
+            rupu_tools::AliasScope::Everywhere,
+        ) {
+            Ok(_) => {}
+            Err(rupu_tools::GrantError::NotConnector { .. }) => {
+                return Err(WorkflowParseError::ActionsNotConnector {
+                    step: step.id.clone(),
+                    tool: tool.clone(),
+                })
+            }
+            Err(e) => {
+                return Err(WorkflowParseError::ActionsUnknownTool {
+                    step: step.id.clone(),
+                    tool: tool.clone(),
+                    detail: e.to_string(),
+                })
+            }
         }
     }
     Ok(())
@@ -3218,7 +3241,7 @@ steps:
     actions: ["issues.list", "open_pr"]
 "#;
         match Workflow::parse(raw).unwrap_err() {
-            WorkflowParseError::ActionsUnknownTool { step, tool } => {
+            WorkflowParseError::ActionsUnknownTool { step, tool, .. } => {
                 assert_eq!(step, "s1");
                 assert_eq!(tool, "open_pr");
             }
@@ -3233,6 +3256,26 @@ steps:
         assert!(matches!(
             Workflow::parse(raw).unwrap_err(),
             WorkflowParseError::ActionsUnknownTool { .. }
+        ));
+    }
+
+    #[test]
+    fn actions_accept_namespaces_and_suggest_near_misses() {
+        let ok = "name: w\nsteps:\n  - id: s1\n    agent: a\n    prompt: p\n    actions: [\"issues.*\", \"scm.prs.get\"]\n";
+        Workflow::parse(ok).expect("a namespace wildcard is valid in actions:");
+
+        let typo = "name: w\nsteps:\n  - id: s1\n    agent: a\n    prompt: p\n    actions: [\"issues.gte\"]\n";
+        let err = Workflow::parse(typo).unwrap_err();
+        assert!(
+            err.to_string().contains("did you mean \"issues.get\"?"),
+            "{err}"
+        );
+
+        let builtin =
+            "name: w\nsteps:\n  - id: s1\n    agent: a\n    prompt: p\n    actions: [\"bash\"]\n";
+        assert!(matches!(
+            Workflow::parse(builtin).unwrap_err(),
+            WorkflowParseError::ActionsNotConnector { .. }
         ));
     }
 

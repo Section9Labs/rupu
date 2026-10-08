@@ -203,7 +203,10 @@ async fn edit_file_no_event_on_not_found() {
             )
             .await
             .unwrap();
-        assert!(out.error.is_some(), "non-matching edit should produce error");
+        assert!(
+            out.error.is_some(),
+            "non-matching edit should produce error"
+        );
     }
 
     handle.shutdown().await;
@@ -384,7 +387,10 @@ async fn grep_no_events_when_nothing_matches() {
         let ctx = ctx_with_coverage(workspace.path(), handle.writer.clone());
         let tool = GrepTool;
         let out = tool
-            .invoke(json!({ "pattern": "PATTERN_THAT_WONT_MATCH_ANYTHING" }), &ctx)
+            .invoke(
+                json!({ "pattern": "PATTERN_THAT_WONT_MATCH_ANYTHING" }),
+                &ctx,
+            )
             .await
             .unwrap();
         // Exit code 1 (no matches) is NOT an error for rg.
@@ -523,16 +529,13 @@ async fn read_file_event_carries_attribution() {
     {
         let ctx = ctx_with_coverage(workspace.path(), handle.writer.clone());
         let tool = ReadFileTool;
-        tool.invoke(json!({ "path": "x.txt" }), &ctx)
-            .await
-            .unwrap();
+        tool.invoke(json!({ "path": "x.txt" }), &ctx).await.unwrap();
     }
 
     handle.shutdown().await;
 
     let body = std::fs::read_to_string(&paths.files).unwrap();
-    let v: serde_json::Value =
-        serde_json::from_str(body.lines().next().unwrap()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
     assert_eq!(v["run_id"], "run_test_01");
     assert_eq!(v["model"], "test-model");
     assert_eq!(v["surface"], "agent");

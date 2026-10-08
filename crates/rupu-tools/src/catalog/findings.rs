@@ -10,6 +10,7 @@ pub static FINDINGS_REPORT: ToolDescriptor = ToolDescriptor {
     aliases: &[Alias::any("report_finding"), Alias::any("findings.record")],
     effect: Effect::Record,
     needs: &[Service::Findings],
+    uses: &[],
     description: "Record a security or quality finding in this project's ledger. Returns the \
      generated finding id (use it in coverage.mark calls and in another finding's \
      cross_references). Under the full profile send a complete `report`; a rejected \
@@ -23,6 +24,7 @@ pub static FINDINGS_VERIFY: ToolDescriptor = ToolDescriptor {
     aliases: &[Alias::any("finding.verify")],
     effect: Effect::Record,
     needs: &[Service::Findings],
+    uses: &[],
     description: "Record your verdict on a finding that ANOTHER run filed: confirmed (you \
      reproduced or independently established it), disputed (you showed it is wrong), \
      or inconclusive (you could not decide). Your run and agent are recorded \
@@ -59,7 +61,8 @@ pub static ASSETS_MARK: ToolDescriptor = ToolDescriptor {
     name: "assets.mark",
     aliases: &[Alias::any("asset_mark")],
     effect: Effect::Record,
-    needs: &[Service::Findings],
+    needs: &[Service::Findings, Service::Engagement],
+    uses: &[],
     description: "Record how deeply an engagement asset has been examined, as a rung of \
      its profile's coverage depth ladder (monotonic — a shallower rung after \
      a deeper one keeps the deeper one). The effective rung is returned.",
@@ -89,6 +92,7 @@ pub static FINDINGS_QUERY: ToolDescriptor = ToolDescriptor {
     aliases: &[Alias::any("query_findings")],
     effect: Effect::Read,
     needs: &[Service::Findings],
+    uses: &[],
     description: "List findings recorded in this project with a one-line query in `q` (e.g. \
      `severity>=high tag:needs-poc -has:poc`). Returns one page of slim rows (id, title, \
      severity, location, tags), `next_cursor`, `total`, and `tags_in_use` — reuse an \
@@ -107,6 +111,7 @@ pub static FINDINGS_TAG: ToolDescriptor = ToolDescriptor {
     aliases: &[Alias::any("tag_findings")],
     effect: Effect::Record,
     needs: &[Service::Findings],
+    uses: &[],
     description: "Add or remove tags on findings in this project, one or many at once. Tags are \
      free-form: lowercase a-z, 0-9 and . _ : / -, starting with a letter or digit (e.g. \
      class:sqli, needs-poc, status:triaged). Prefer tags already in use (findings.query \

@@ -25,6 +25,7 @@ static TOOL_A: ToolDescriptor = ToolDescriptor {
     aliases: &[],
     effect: Effect::Write,
     needs: &[],
+    uses: &[],
     description: "a",
     input_schema: schema,
 };
@@ -34,6 +35,7 @@ static TOOL_B: ToolDescriptor = ToolDescriptor {
     aliases: &[],
     effect: Effect::Write,
     needs: &[],
+    uses: &[],
     description: "b",
     input_schema: schema,
 };

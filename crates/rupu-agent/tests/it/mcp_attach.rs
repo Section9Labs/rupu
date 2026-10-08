@@ -28,6 +28,8 @@ async fn offered_tools(agent_tools: Option<Vec<String>>) -> Vec<String> {
         seed_source: None,
         collectors: Vec::new(),
         extra_tools: Vec::new(),
+        step_actions: Vec::new(),
+        alias_scope: Default::default(),
         agent_name: "mcp-test".into(),
         agent_system_prompt: "test".into(),
         agent_tools,
@@ -83,19 +85,19 @@ async fn mcp_registry_attaches_tools_to_run() {
     let names = offered_tools(None).await;
     let tool_names: Vec<&str> = names.iter().map(String::as_str).collect();
 
-    // All builtins plus all MCP tools should be present.
+    // The default grant: the core tools plus every MCP connector tool. The
+    // sub-agent dispatch pair needs a dispatcher, which this run has none
+    // of, so it is not offered (W2: a tool is offered only where it works).
     assert!(
         tool_names.contains(&"bash"),
         "builtin bash should still be present: {tool_names:?}"
     );
-    assert!(
-        tool_names.contains(&"dispatch_agent"),
-        "builtin dispatch_agent should be present: {tool_names:?}"
-    );
-    assert!(
-        tool_names.contains(&"dispatch_agents_parallel"),
-        "builtin dispatch_agents_parallel should be present: {tool_names:?}"
-    );
+    for name in ["dispatch_agent", "dispatch_agents_parallel"] {
+        assert!(
+            !tool_names.contains(&name),
+            "{name} needs a dispatcher this run lacks: {tool_names:?}"
+        );
+    }
     assert!(
         tool_names.contains(&"scm.repos.list"),
         "MCP tool scm.repos.list should be present: {tool_names:?}"
@@ -113,31 +115,56 @@ async fn mcp_registry_attaches_tools_to_run() {
             "{name} must not be offered to an agent: {tool_names:?}"
         );
     }
-    // Total must be 9 builtins (6 v0 + ast_grep + dispatch_agent + dispatch_agents_parallel)
-    // + the 18 native SCM MCP tools = 27.
+    // 7 core tools + the 18 native SCM MCP tools = 25.
     assert_eq!(
         tool_names.len(),
-        27,
-        "expected 9 builtins + 18 MCP tools; got {} tools: {tool_names:?}",
+        25,
+        "expected 7 core tools + 18 MCP tools; got {} tools: {tool_names:?}",
         tool_names.len()
     );
 }
 
-/// A `tools: ["*"]` agent (every stock-fleet agent) gets the SCM MCP tools but
-/// never the `findings.*` ones: the agent's in-process dispatcher has no run
-/// context for them, so offering them only burns turns on refusals.
+/// A `tools: ["*"]` agent (every stock-fleet agent) gets the whole catalog
+/// this run can serve (W2/D9): the core tools, the SCM MCP tools and the
+/// catalog's own findings tools — never the MCP `findings.record` (an alias of
+/// `findings.report`, so it can't appear twice) and no tool whose service the
+/// run lacks.
 #[tokio::test]
-async fn wildcard_agent_is_not_offered_findings_mcp_tools() {
+async fn wildcard_agent_gets_the_whole_servable_catalog() {
     let names = offered_tools(Some(vec!["*".to_string()])).await;
-    assert!(names.iter().any(|n| n == "scm.repos.list"), "{names:?}");
-    assert!(
-        !names.iter().any(|n| n.starts_with("findings.")),
-        "findings.* MCP tools leaked to a wildcard agent: {names:?}"
-    );
-    // An explicit `findings.*` grant doesn't bring them back either.
+    for want in [
+        "bash",
+        "write_file",
+        "scm.repos.list",
+        "findings.report",
+        "findings.verify",
+        "findings.query",
+        "findings.tag",
+    ] {
+        assert!(names.iter().any(|n| n == want), "{want} missing: {names:?}");
+    }
+    for absent in [
+        "findings.record",
+        "assets.mark",
+        "coverage.mark",
+        "board.post",
+        "dispatch",
+        "dispatch_agent",
+    ] {
+        assert!(
+            !names.iter().any(|n| n == absent),
+            "{absent} must not be offered (no service): {names:?}"
+        );
+    }
+    // `findings.*` is exactly the catalog's findings tools.
     let names = offered_tools(Some(vec!["findings.*".to_string()])).await;
-    assert!(
-        !names.iter().any(|n| n.starts_with("findings.")),
-        "{names:?}"
+    assert_eq!(
+        names,
+        vec![
+            "findings.query".to_string(),
+            "findings.report".to_string(),
+            "findings.tag".to_string(),
+            "findings.verify".to_string(),
+        ]
     );
 }

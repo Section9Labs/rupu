@@ -5,11 +5,11 @@
 //! and `rupu-transcript`. The CLI (Plan 2 Phase 3) calls [`run_agent`]
 //! once per `rupu run` invocation.
 
-use crate::coverage_tools;
+use crate::coverage_tools::LedgerTools;
 use crate::mcp_tool::McpToolAdapter;
 use crate::outcome::OutcomeClass;
 use crate::recovery::Rung0;
-use crate::tool_registry::{default_tool_registry, ToolRegistry};
+use crate::tool_registry::{builtin_tool, tool_catalog, ToolRegistry};
 use async_trait::async_trait;
 use chrono::Utc;
 use rupu_coverage::{
@@ -25,8 +25,8 @@ use rupu_providers::types::{
 };
 use rupu_scm::Registry;
 use rupu_tools::{
-    AllowAlways, Decision, DerivedEvent, PermissionMode, PermissionPolicy, Tool, ToolContext,
-    ToolDescriptor,
+    AliasScope, AllowAlways, AmbientGrant, Decision, DenyReason, DerivedEvent, GrantInputs,
+    PermissionMode, PermissionPolicy, ResolvedGrant, Service, ServiceSet, Tool, ToolContext,
 };
 use rupu_transcript::{
     Event, FileEditKind, JsonlWriter, RecoveryAction, RunMode, RunStatus, Severity,
@@ -690,6 +690,11 @@ pub enum RunError {
     Terminating,
     #[error("coverage setup: {0}")]
     Coverage(String),
+    /// The agent's `tools:` or the step's `actions:` can't be resolved
+    /// (an unknown name), or a granted tool has no implementation in this
+    /// run (a bug: the grant and the runner disagree).
+    #[error("tool grant: {0}")]
+    ToolGrant(String),
     /// The agent loop returned `Ok` — no transport/provider failure — but the
     /// run's own terminal [`RunStatus`] was not `Ok`: a `max_turns` bust, or
     /// a response outcome the recovery ladder could not fix (both
@@ -1307,8 +1312,17 @@ pub struct AgentRunOpts {
     pub codename: Option<String>,
     pub agent_name: String,
     pub agent_system_prompt: String,
-    /// `None` = use all six tools; `Some(list)` = filter the registry.
+    /// The agent's `tools:` grant; `None` = [`rupu_tools::DEFAULT_GRANT`].
+    /// Resolved with [`Self::step_actions`] and the run's ambient grants into
+    /// the run's [`ResolvedGrant`], the only input to its tool registry.
     pub agent_tools: Option<Vec<String>>,
+    /// The workflow step's `actions:`: narrows the connector tools of the
+    /// grant, nothing else. Empty = no narrowing (every non-step run).
+    pub step_actions: Vec<String>,
+    /// Where tool aliases resolve: [`AliasScope::FlowLead`] for an
+    /// agentiflow lead (`coverage.status` → `goal.coverage`), else
+    /// [`AliasScope::Everywhere`].
+    pub alias_scope: AliasScope,
     pub provider: Box<dyn LlmProvider>,
     pub provider_name: String,
     pub model: String,
@@ -1455,10 +1469,12 @@ pub struct AgentRunOpts {
     /// Pre-turn collectors (spec §8). Empty = no injection; the loop behaves
     /// exactly as before. Run off the async runtime via spawn_blocking.
     pub collectors: Vec<std::sync::Arc<dyn crate::collector::TurnCollector>>,
-    /// Pre-built, run-scoped tools injected into this run's registry regardless
-    /// of `agent_tools` (always-on platform tools; the `PermissionPolicy` still
-    /// gates each call). Empty for ordinary runs; the agentiflow envelope uses it
-    /// for the lead's board/mailbox tools.
+    /// Pre-built, run-scoped tools injected into this run regardless of
+    /// `agent_tools`: an ambient grant with reason `origin:injected`, so they
+    /// appear in the run's `tool_grant` and are audited like any tool; the
+    /// `PermissionPolicy` still gates each call. Empty for ordinary runs; the
+    /// agentiflow envelope uses it for its board/mailbox/dispatch tools until
+    /// W5 moves them into the catalog.
     pub extra_tools: Vec<std::sync::Arc<dyn rupu_tools::Tool>>,
     /// Recovery ladder inputs (spec 2026-10-01 §5–§6). Default: no fallback chain and no hop builder — rungs 1 and 2 are unavailable, rung 0 still applies.
     pub recovery: crate::recovery::RecoveryOpts,
@@ -1665,10 +1681,12 @@ async fn run_agent_inner(
     let mut writer = JsonlWriter::append(&opts.transcript_path)?;
     let started = Instant::now();
 
-    let mut registry: ToolRegistry = match &opts.agent_tools {
-        Some(list) => default_tool_registry().filter_to(list),
-        None => default_tool_registry(),
-    };
+    // What the model may call (W2): resolved once, before anything is built,
+    // from the agent's `tools:`, the step's `actions:`, the ambient grants
+    // and the services this run provides. The registry is built from it and
+    // nothing else (below), and it is written to the transcript.
+    let findings_opts = opts.tool_context.findings.clone().unwrap_or_default();
+    let grant = resolve_run_grant(opts, &findings_opts)?;
 
     // Coverage harness: flatten catalog, write snapshot, spawn writer.
     // The handle is kept separate so it can be consumed (shutdown) at each
@@ -1738,14 +1756,106 @@ async fn run_agent_inner(
 
     // Findings contract for this run. Resolved before `RunStart` is written
     // so the guidance is part of the recorded system prompt.
-    let findings_opts = opts.tool_context.findings.clone().unwrap_or_default();
-    let records_findings = coverage.is_some()
-        || findings_opts.engagement.is_some()
-        || grants(
-            &opts.agent_tools,
-            &rupu_tools::catalog::findings::FINDINGS_REPORT,
-        );
-    if records_findings {
+    // The run's tool registry: one loop over the grant. Each entry takes its
+    // body from the one place that provides it today — an injected tool, a
+    // builtin, the ledger tools, or the MCP connector adapter (W4/W5 fold
+    // these into `ToolCatalog`).
+    let ledger = if grant.entries.values().any(|e| {
+        let n = e.descriptor.needs;
+        n.contains(&Service::Findings) || n.contains(&Service::Coverage)
+    }) {
+        // A concerns agent's ledger is the bundle's own (same scope, target
+        // id and run stream, directory already ensured); otherwise it is
+        // built here the same way.
+        let scope = opts.scope_name.as_deref().unwrap_or(&opts.agent_name);
+        let paths = match coverage.as_ref() {
+            Some(bundle) => bundle.paths.clone(),
+            None => {
+                let target = target_id(&opts.workspace_path, scope);
+                let paths = CoveragePaths::new(&opts.workspace_path, &target)
+                    .with_run_stream(run_stream_for(&opts.tool_context, scope));
+                paths
+                    .ensure_dir()
+                    .map_err(|e| RunError::Coverage(format!("ensure findings dir: {e}")))?;
+                paths
+            }
+        };
+        Some(LedgerTools {
+            paths,
+            catalog: coverage.as_ref().map(|b| Arc::new(b.catalog.clone())),
+            findings: findings_opts.clone(),
+            workspace: opts.workspace_path.clone(),
+            tag_log: rupu_coverage::TagLog::for_workspace(&opts.workspace_path)
+                .with_run_stream(run_stream_for(&opts.tool_context, scope)),
+        })
+    } else {
+        None
+    };
+
+    // MCP server: spin up before the loop if we have a Registry. Its
+    // dispatcher's allowlist is exactly the connector tools the grant
+    // offers, so the two gates can't disagree.
+    let mcp_guard: Option<(rupu_mcp::InProcessTransport, ServeHandle)>;
+    let mcp_dispatcher: Option<Arc<rupu_mcp::ToolDispatcher>>;
+    match opts.mcp_registry.clone() {
+        Some(scm_registry) => {
+            let allowlist = grant
+                .entries
+                .values()
+                .filter(|e| e.descriptor.is_connector())
+                .map(|e| e.canonical.to_string())
+                .collect();
+            let permission = McpPermission::new(opts.permission.mode(), allowlist);
+            let (transport, handle) =
+                rupu_mcp::serve_in_process(scm_registry.clone(), permission.clone());
+            mcp_dispatcher = Some(Arc::new(rupu_mcp::ToolDispatcher::new(
+                scm_registry,
+                permission,
+            )));
+            mcp_guard = Some((transport, handle));
+        }
+        None => {
+            mcp_dispatcher = None;
+            mcp_guard = None;
+        }
+    }
+
+    let mut registry = ToolRegistry::with_alias_scope(opts.alias_scope);
+    for entry in grant.entries.values() {
+        let name = entry.canonical;
+        let body: Option<Arc<dyn Tool>> = opts
+            .extra_tools
+            .iter()
+            .find(|t| t.name() == name)
+            .cloned()
+            .or_else(|| builtin_tool(name))
+            .or_else(|| ledger.as_ref().and_then(|l| l.instantiate(name)))
+            .or_else(|| {
+                let d = mcp_dispatcher.as_ref()?;
+                McpToolAdapter::new(name, d.clone()).map(|a| Arc::new(a) as Arc<dyn Tool>)
+            });
+        match body {
+            Some(t) => registry.insert(t),
+            None => {
+                // The grant offered a tool whose services this run
+                // provides, yet nothing here can build it: the service
+                // accounting in `run_services` is wrong. Fail before the run
+                // starts rather than drop a tool the grant says it offers.
+                if let Some((transport, handle)) = mcp_guard {
+                    drop(transport);
+                    let _ = handle.join.await;
+                }
+                if let Some(h) = coverage_handle {
+                    h.shutdown().await;
+                }
+                return Err(RunError::ToolGrant(format!(
+                    "`{name}` is granted but this run has no implementation for it"
+                )));
+            }
+        }
+    }
+
+    if grant.offers(rupu_tools::catalog::findings::FINDINGS_REPORT.name) {
         if let Some(g) = rupu_coverage::report::guidance(&findings_opts) {
             opts.agent_system_prompt.push_str("\n\n");
             opts.agent_system_prompt.push_str(&g);
@@ -1777,6 +1887,7 @@ async fn run_agent_inner(
         kind: "model_limits".into(),
         message: opts.limits.describe(&opts.provider_name, Utc::now()),
     })?;
+    write_tool_grant(&mut writer, &grant)?;
     writer.flush()?;
 
     // Wire coverage into tool context.
@@ -1809,183 +1920,6 @@ async fn run_agent_inner(
         rupu_providers::anthropic::thinking_display_warnings(&opts.model, opts.thinking_display)
     {
         tracing::warn!(agent = %opts.agent_name, model = %opts.model, "{w}");
-    }
-
-    // Register coverage tools when coverage is enabled.
-    if let Some(bundle) = &coverage {
-        coverage_tools::register(
-            &mut registry,
-            bundle.catalog.clone(),
-            bundle.paths.clone(),
-            findings_opts.clone(),
-        );
-    }
-
-    // Findings WITHOUT the coverage harness.
-    //
-    // `coverage_tools::register` above is the only thing that registers
-    // `report_finding`, and it runs only when the agent declares a
-    // `concerns:` block. That ties "can record a finding" to "is running the
-    // coverage harness", which assumes findings are about FILES: the harness
-    // needs a catalog of concerns and marks (concern_id, file_path) pairs.
-    //
-    // An assessment of hosts, endpoints or cloud resources has no such
-    // catalog, so it could not record a finding at all — the control plane
-    // showed zero findings while the workflow reported them somewhere else
-    // entirely. Recording a finding and running the coverage harness are
-    // different things and are now separable.
-    //
-    // Two ways in, and they must not be confused:
-    //
-    //   * An explicit `tools:` grant. `report_finding` writes to the project's
-    //     ledger and `finding.verify` records a verdict on another run's
-    //     finding; both are opt-in builtins, registered after `filter_to` for
-    //     the same reason the coverage tools are — the grant list gates the six
-    //     builtins, and these are inserted on top of it. `finding.verify` is
-    //     ALWAYS opt-in: it needs the ledger but no concern catalog, a
-    //     `concerns:` agent does NOT get it, and `tools:` absent or `["*"]`
-    //     grants nothing.
-    //
-    //   * An active engagement profile (`--engagement-profile X`). This is the
-    //     operator declaring the run records assets and findings under profile
-    //     X, so `asset_mark` and `report_finding` are ENGINE-GRANTED here —
-    //     offered regardless of the agent's `tools:` allowlist, exactly like
-    //     the concerns-block coverage tools (`coverage_tools::register` above)
-    //     and the always-on injected tools (below), both of which also bypass
-    //     `filter_to`. Without this an engagement agent with an explicit
-    //     `tools:` list and no `concerns:` block — the normal shape for a
-    //     network recon agent, which records assets, not file-concern coverage
-    //     — would silently lose `asset_mark`: the model can't see the tool,
-    //     runs `asset_mark` as a shell command, and the assets never reach the
-    //     ledger. `asset_mark` is engagement-gated and nothing else: it needs
-    //     the active set to validate a depth against the profile's ladder, so
-    //     it is meaningless without one.
-    use rupu_tools::catalog::findings as f;
-    let engagement_active = findings_opts.engagement.is_some();
-    let standalone_report =
-        coverage.is_none() && (grants(&opts.agent_tools, &f::FINDINGS_REPORT) || engagement_active);
-    let standalone_asset = coverage.is_none() && engagement_active;
-    let want_verify = grants(&opts.agent_tools, &f::FINDINGS_VERIFY);
-    if standalone_report || standalone_asset || want_verify {
-        // A concerns agent's ledger is the bundle's own (same scope, target
-        // id and run stream, directory already ensured); otherwise it is
-        // built here the same way.
-        let paths = match coverage.as_ref() {
-            Some(bundle) => bundle.paths.clone(),
-            None => {
-                let scope = opts.scope_name.as_deref().unwrap_or(&opts.agent_name);
-                let target = target_id(&opts.workspace_path, scope);
-                let paths = CoveragePaths::new(&opts.workspace_path, &target)
-                    .with_run_stream(run_stream_for(&opts.tool_context, scope));
-                paths
-                    .ensure_dir()
-                    .map_err(|e| RunError::Coverage(format!("ensure findings dir: {e}")))?;
-                paths
-            }
-        };
-        if want_verify {
-            registry.insert(std::sync::Arc::new(coverage_tools::FindingVerifyTool::new(
-                paths.clone(),
-            )));
-        }
-        if standalone_asset {
-            if let Some(engagement) = findings_opts.engagement.clone() {
-                registry.insert(std::sync::Arc::new(coverage_tools::AssetMarkTool::new(
-                    paths.clone(),
-                    engagement,
-                )));
-            }
-        }
-        if standalone_report {
-            registry.insert(std::sync::Arc::new(coverage_tools::ReportFindingTool::new(
-                paths,
-                findings_opts.clone(),
-            )));
-        }
-    }
-
-    // Finding tags (spec 2026-10-06-rupu-finding-tags-design.md): explicit
-    // `tools:` grants like `report_finding`, registered with or without the
-    // coverage harness. Both act on this workspace's findings only — tags
-    // live in one workspace-wide log — and `tag_findings` is allowed in
-    // readonly mode, as `report_finding` is: it annotates the ledger and
-    // never touches the workspace's files.
-    let grant_query = grants(&opts.agent_tools, &f::FINDINGS_QUERY);
-    let grant_tag = grants(&opts.agent_tools, &f::FINDINGS_TAG);
-    if grant_query {
-        registry.insert(std::sync::Arc::new(coverage_tools::QueryFindingsTool::new(
-            opts.workspace_path.clone(),
-        )));
-    }
-    if grant_tag {
-        let scope = opts.scope_name.as_deref().unwrap_or(&opts.agent_name);
-        let log = rupu_coverage::TagLog::for_workspace(&opts.workspace_path)
-            .with_run_stream(run_stream_for(&opts.tool_context, scope));
-        registry.insert(std::sync::Arc::new(coverage_tools::TagFindingsTool::new(
-            log,
-        )));
-    }
-
-    // MCP server: spin up before the loop if we have a Registry.
-    let mcp_guard: Option<(rupu_mcp::InProcessTransport, ServeHandle)> =
-        if let Some(scm_registry) = opts.mcp_registry.clone() {
-            let allowlist = opts
-                .agent_tools
-                .clone()
-                .unwrap_or_else(|| vec!["*".to_string()]);
-            let permission = McpPermission::new(opts.permission.mode(), allowlist);
-            let (transport, handle) =
-                rupu_mcp::serve_in_process(scm_registry.clone(), permission.clone());
-            let dispatcher = Arc::new(rupu_mcp::ToolDispatcher::new(scm_registry, permission));
-
-            // Insert each MCP tool into the agent's tool registry,
-            // BUT respect the agent's `tools:` allowlist when present.
-            // Otherwise the model would see scm.* / issues.* / vendor
-            // tools advertised even when the agent declared a narrower
-            // surface — the model picks one of the leaked tools, the
-            // dispatcher denies it (correctly), and we waste turns on
-            // permission_denied retries. With this gate the model only
-            // sees what it's allowed to call.
-            //
-            // `None` means "no agent allowlist" → register everything,
-            // matching the prior unrestricted behavior.
-            //
-            // The `findings.*` MCP tools are never offered: this in-process
-            // dispatcher has no run/findings context, so every call would be
-            // refused and burn a turn. Agents record, query and tag findings
-            // through the `report_finding` / `query_findings` / `tag_findings`
-            // builtins instead (registered above when coverage is on).
-            for spec in rupu_mcp::tool_catalog() {
-                if !mcp_tool_offered_to_agents(spec.name) {
-                    continue;
-                }
-                let allowed = match &opts.agent_tools {
-                    None => true,
-                    Some(list) => mcp_tool_name_matches_allowlist(spec.name, list),
-                };
-                if !allowed {
-                    continue;
-                }
-                match McpToolAdapter::new(spec.name, dispatcher.clone()) {
-                    Some(adapter) => registry.insert(Arc::new(adapter) as Arc<dyn Tool>),
-                    None => tracing::error!(
-                        tool = spec.name,
-                        "MCP tool has no descriptor (mcp_tool.rs schema table); not offered"
-                    ),
-                }
-            }
-
-            Some((transport, handle))
-        } else {
-            None
-        };
-
-    // Always-on injected tools (agentiflow Tier-1): registered after the
-    // agent_tools filter and the coverage/MCP blocks, so a restrictive agent
-    // tools:/actions: list cannot strip them. A name collision favors the
-    // injected tool. The per-call PermissionPolicy still runs.
-    for tool in &opts.extra_tools {
-        registry.insert(tool.clone());
     }
 
     let tool_defs = registry.to_tool_definitions();
@@ -2848,17 +2782,11 @@ async fn run_agent_inner(
                 let tool: Arc<dyn Tool> = match registry.get(&tool_name) {
                     Some(t) => t,
                     None => {
-                        // Not in the registry: either a genuinely unknown
-                        // tool name or one narrowed out of `agent_tools`
-                        // (never inserted — see the registration loop
-                        // above). Either way this is a DENIAL: report it
-                        // to the callback as `blocked` (the audit trail's
-                        // sole signal for this) and feed the model a tool
-                        // error so it can adapt, WITHOUT failing the run.
-                        if let Some(cb) = opts.on_tool_call.as_ref() {
-                            writer.flush()?;
-                            cb(&opts.step_id, &tool_name, true);
-                        }
+                        // Not in the grant: a genuinely unknown name, or a
+                        // tool the run doesn't offer (narrowed by `actions:`,
+                        // never granted, or unavailable). A DENIAL: feed the
+                        // model a tool error so it can adapt, WITHOUT failing
+                        // the run, and audit it as `not_granted`.
                         let err = format!("unknown tool: {tool_name}");
                         writer.write(&Event::ToolResult {
                             call_id: call_id.clone(),
@@ -2867,6 +2795,19 @@ async fn run_agent_inner(
                             duration_ms: 0,
                             structured: None,
                         })?;
+                        let canonical = tool_catalog()
+                            .resolve_name(&tool_name, opts.alias_scope)
+                            .map(|d| d.name);
+                        writer.write(&tool_audit(
+                            &grant,
+                            &tool_name,
+                            canonical,
+                            "not_granted".into(),
+                        ))?;
+                        if let Some(cb) = opts.on_tool_call.as_ref() {
+                            writer.flush()?;
+                            cb(&opts.step_id, &tool_name, true);
+                        }
                         tool_results.push((call_id, String::new(), Some(err)));
                         continue;
                     }
@@ -2889,7 +2830,7 @@ async fn run_agent_inner(
                         }
                     }
                     Decision::Spawn { ceiling } => spawn_ceiling = Some(ceiling),
-                    Decision::Deny { .. } => {
+                    Decision::Deny { reason } => {
                         writer.write(&Event::ToolResult {
                             call_id: call_id.clone(),
                             output: String::new(),
@@ -2897,6 +2838,12 @@ async fn run_agent_inner(
                             duration_ms: 0,
                             structured: None,
                         })?;
+                        writer.write(&tool_audit(
+                            &grant,
+                            &tool_name,
+                            Some(descriptor.name),
+                            denied(reason),
+                        ))?;
                         tool_results.push((
                             call_id,
                             String::new(),
@@ -2909,6 +2856,12 @@ async fn run_agent_inner(
                         continue;
                     }
                     Decision::Stop => {
+                        writer.write(&tool_audit(
+                            &grant,
+                            &tool_name,
+                            Some(descriptor.name),
+                            "denied:operator_stop".into(),
+                        ))?;
                         writer.write(&Event::RunComplete {
                             run_id: opts.run_id.clone(),
                             status: RunStatus::Aborted,
@@ -2998,6 +2951,19 @@ async fn run_agent_inner(
                         tool_results.push((call_id, String::new(), Some(msg)));
                     }
                 }
+                // A tool may still refuse inside `invoke` (the MCP adapter's
+                // own gate): that is a denial too.
+                let decision = if blocked {
+                    "denied:tool".to_string()
+                } else {
+                    DECISION_ALLOWED.to_string()
+                };
+                writer.write(&tool_audit(
+                    &grant,
+                    &tool_name,
+                    Some(descriptor.name),
+                    decision,
+                ))?;
                 if let Some(cb) = opts.on_tool_call.as_ref() {
                     // Flush first so a concurrently-appending side writer
                     // (the orchestrator's tool_audit closure) that fires
@@ -3344,13 +3310,139 @@ fn run_mode(mode: PermissionMode) -> RunMode {
     }
 }
 
-/// Whether an agent's `tools:` list grants the tool `d`, by canonical name or
-/// alias. Exact names only: wildcard grants (`*`, `ns.*`) for these opt-in
-/// tools arrive with W2's grant resolver.
-fn grants(agent_tools: &Option<Vec<String>>, d: &ToolDescriptor) -> bool {
-    agent_tools
-        .as_ref()
-        .is_some_and(|list| list.iter().any(|t| d.answers_to(t)))
+/// The services this run provides, for its grant. Exact by construction:
+/// a service is here only when the runner can build every tool needing it.
+fn run_services(opts: &AgentRunOpts, findings: &rupu_coverage::FindingWriteOptions) -> ServiceSet {
+    // The findings ledger lives in the workspace: every run can open it.
+    let mut s = ServiceSet::new().with(Service::Findings);
+    if opts.concerns.is_some() {
+        s.insert(Service::Coverage);
+    }
+    if findings.engagement.is_some() {
+        s.insert(Service::Engagement);
+    }
+    if opts.mcp_registry.is_some() {
+        s.insert(Service::Scm);
+    }
+    if opts.tool_context.dispatcher.is_some() {
+        s.insert(Service::AgentDispatcher);
+    }
+    if opts.tool_context.netflow_sink.is_some() {
+        s.insert(Service::Netflow);
+    }
+    // The agentiflow services (message bus, run status, catalog, the unit
+    // launcher, the workflow generator) have no body in the catalog until
+    // W5/W7: their tools reach a run only injected, as self-served grants.
+    s
+}
+
+/// Resolve the run's grant (W2): the agent's `tools:`, the step's
+/// `actions:`, the ambient grants (`concerns:`, an engagement, injected
+/// tools) and the run's services.
+fn resolve_run_grant(
+    opts: &AgentRunOpts,
+    findings: &rupu_coverage::FindingWriteOptions,
+) -> Result<ResolvedGrant, RunError> {
+    let injected: Vec<_> = opts.extra_tools.iter().map(|t| t.descriptor()).collect();
+    let catalog = tool_catalog().with(injected.iter().copied());
+    let mut ambient = Vec::new();
+    if opts.concerns.is_some() {
+        ambient.push(AmbientGrant::concerns());
+    }
+    if findings.engagement.is_some() {
+        ambient.push(AmbientGrant::engagement());
+    }
+    if !injected.is_empty() {
+        ambient.push(AmbientGrant::injected(
+            injected.iter().map(|d| d.name).collect(),
+        ));
+    }
+    let grant = catalog
+        .resolve_grant(GrantInputs {
+            declared: opts.agent_tools.as_deref(),
+            step_actions: &opts.step_actions,
+            ambient: &ambient,
+            available: &run_services(opts, findings),
+            alias_scope: opts.alias_scope,
+        })
+        .map_err(|e| RunError::ToolGrant(e.to_string()))?;
+    for tool in &grant.actions_not_granted {
+        tracing::warn!(
+            agent = %opts.agent_name,
+            step = %opts.step_id,
+            tool,
+            "step `actions:` names `{tool}` but the agent's `tools:` grant does not cover it; \
+             the step can't add it (no escalation), so this is very likely an authoring mistake"
+        );
+    }
+    Ok(grant)
+}
+
+/// Write the run's `tool_grant` event and one `tool_unavailable` notice per
+/// tool it names that the run can't serve (P7).
+fn write_tool_grant(writer: &mut JsonlWriter, grant: &ResolvedGrant) -> Result<(), RunError> {
+    let missing = |list: &[rupu_tools::Unavailable]| {
+        list.iter()
+            .map(|u| rupu_transcript::ToolGrantMissing {
+                tool: u.tool.to_string(),
+                missing: u.missing.iter().map(|s| s.as_str().to_string()).collect(),
+            })
+            .collect()
+    };
+    writer.write(&Event::ToolGrant {
+        entries: grant
+            .entries
+            .values()
+            .map(|e| rupu_transcript::ToolGrantEntry {
+                tool: e.canonical.to_string(),
+                reasons: e.reasons.iter().map(ToString::to_string).collect(),
+            })
+            .collect(),
+        narrowed: grant.narrowed.iter().map(|t| t.to_string()).collect(),
+        unavailable: missing(&grant.unavailable),
+        skipped: missing(&grant.skipped),
+    })?;
+    for u in &grant.unavailable {
+        writer.write(&Event::Notice {
+            kind: rupu_tools::grant::UNAVAILABLE_NOTICE_KIND.into(),
+            message: u.notice_message(),
+        })?;
+    }
+    Ok(())
+}
+
+/// One `tool_audit` line for a tool call (every call ends in exactly one,
+/// T10). `name` is the tool name the model used (as its `tool_call`
+/// records it); `canonical` is what it resolved to, `None` when the run
+/// offers no such tool.
+fn tool_audit(
+    grant: &ResolvedGrant,
+    name: &str,
+    canonical: Option<&str>,
+    decision: String,
+) -> Event {
+    let restricted = grant.actions.is_some();
+    Event::ToolAudit {
+        tool: name.to_string(),
+        declared: canonical.is_some_and(|c| grant.declared_by_actions(c)),
+        granted: canonical.is_some_and(|c| grant.granted_before_narrowing(c)),
+        blocked: decision != DECISION_ALLOWED,
+        restricted,
+        reason: canonical
+            .and_then(|c| grant.entry(c))
+            .map(|e| e.reasons_string()),
+        decision: Some(decision),
+    }
+}
+
+const DECISION_ALLOWED: &str = "allowed";
+
+/// The `tool_audit.decision` of a call the permission policy denied.
+fn denied(reason: DenyReason) -> String {
+    match reason {
+        DenyReason::Readonly => "denied:readonly".into(),
+        DenyReason::OperatorDenied => "denied:operator".into(),
+    }
 }
 
 fn parse_file_edit_kind(s: &str) -> FileEditKind {
@@ -3359,39 +3451,6 @@ fn parse_file_edit_kind(s: &str) -> FileEditKind {
         "delete" => FileEditKind::Delete,
         _ => FileEditKind::Modify,
     }
-}
-
-/// Mirror the allowlist match `McpPermission::tool_in_allowlist` uses,
-/// scoped to the registration-time decision (do we even ADVERTISE
-/// this tool to the model?). Same wildcard semantics:
-///
-/// - `*` matches everything
-/// - `prefix*` matches any tool whose name starts with `prefix`
-///   (e.g. `scm.*` matches `scm.repos.list`, `scm.files.read`, …)
-/// - exact match otherwise
-///
-/// Built-in (non-MCP) tool names like `bash` / `read` in the agent's
-/// `tools:` list don't appear in the MCP catalog, so they correctly
-/// don't match anything here — they're registered separately by
-/// `default_tool_registry`.
-/// Whether an MCP catalog tool is offered to an agent run at all. The
-/// `findings.*` tools need a run context the agent's in-process dispatcher
-/// never has; agents use the findings builtins instead.
-fn mcp_tool_offered_to_agents(name: &str) -> bool {
-    !name.starts_with("findings.")
-}
-
-fn mcp_tool_name_matches_allowlist(name: &str, allowlist: &[String]) -> bool {
-    allowlist.iter().any(|entry| {
-        if entry == "*" || entry == name {
-            return true;
-        }
-        if let Some(prefix) = entry.strip_suffix('*') {
-            name.starts_with(prefix)
-        } else {
-            false
-        }
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3445,6 +3504,8 @@ mod on_tool_call_tests {
             seed_source: None,
             collectors: Vec::new(),
             extra_tools: Vec::new(),
+            step_actions: Vec::new(),
+            alias_scope: Default::default(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -3574,6 +3635,8 @@ mod on_tool_call_tests {
             seed_source: None,
             collectors: Vec::new(),
             extra_tools: Vec::new(),
+            step_actions: Vec::new(),
+            alias_scope: Default::default(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -3648,6 +3711,7 @@ mod on_tool_call_tests {
             aliases: &[],
             effect: rupu_tools::Effect::Read,
             needs: &[],
+            uses: &[],
             description: "returns pong",
             input_schema: ping_schema,
         };
@@ -3697,6 +3761,8 @@ mod on_tool_call_tests {
             // Empty allowlist: NO builtins, NO MCP. The injected tool must
             // still be callable.
             extra_tools: vec![Arc::new(Ping)],
+            step_actions: Vec::new(),
+            alias_scope: Default::default(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: Some(vec![]),
@@ -3763,10 +3829,10 @@ mod on_tool_call_tests {
 
     /// Regression: an engagement agent with an explicit `tools:` allowlist
     /// that omits every coverage tool, and no `concerns:` block, still gets
-    /// `asset_mark` and `report_finding`. They are engine-granted by the
-    /// active `--engagement-profile`, not a `tools:` opt-in — the same way
-    /// the concerns-block coverage tools and the always-on injected tools
-    /// bypass `filter_to`. Before the fix a network recon agent (the normal
+    /// `asset_mark` and `report_finding`. They are ambient grants of the
+    /// active `--engagement-profile` (`ambient:engagement` in the run's
+    /// `tool_grant`), not a `tools:` opt-in — like the concerns-block
+    /// coverage tools and the injected tools. Before the fix a network recon agent (the normal
     /// shape: `tools: [bash, ...]`, no concerns) silently lost `asset_mark`;
     /// the model ran it as a shell command and the assets never reached the
     /// ledger.
@@ -3832,6 +3898,8 @@ mod on_tool_call_tests {
             seed_source: None,
             collectors: Vec::new(),
             extra_tools: Vec::new(),
+            step_actions: Vec::new(),
+            alias_scope: Default::default(),
             agent_name: "cellgw-recon".into(),
             agent_system_prompt: "test".into(),
             // Explicit allowlist that OMITS every coverage tool, and no
@@ -3919,9 +3987,8 @@ mod on_tool_call_tests {
 
     #[tokio::test]
     async fn denied_tool_call_fires_on_tool_call_with_blocked_true_and_does_not_fail_the_run() {
-        // `agent_tools` narrows the roster to `read_file` only, so `bash`
-        // is never inserted into the registry (see the `filter_to` call
-        // above `run_agent`'s dispatch loop). The model calls `bash`
+        // `agent_tools` grants `read_file` only, so `bash` is never in the
+        // run's grant or registry (W2's one registration loop). The model calls `bash`
         // anyway (e.g. a step's `actions:` narrowed it away after the
         // model's context still remembers it, or a hallucinated call) —
         // this must fire `on_tool_call` with `blocked == true`, feed the
@@ -3961,6 +4028,8 @@ mod on_tool_call_tests {
             seed_source: None,
             collectors: Vec::new(),
             extra_tools: Vec::new(),
+            step_actions: Vec::new(),
+            alias_scope: Default::default(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: Some(vec!["read_file".to_string()]),
@@ -4087,6 +4156,8 @@ mod on_tool_call_tests {
             seed_source: None,
             collectors: Vec::new(),
             extra_tools: Vec::new(),
+            step_actions: Vec::new(),
+            alias_scope: Default::default(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -4166,6 +4237,8 @@ mod on_tool_call_tests {
             seed_source: None,
             collectors: Vec::new(),
             extra_tools: Vec::new(),
+            step_actions: Vec::new(),
+            alias_scope: Default::default(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -4270,6 +4343,8 @@ mod on_tool_call_tests {
             seed_source: None,
             collectors: Vec::new(),
             extra_tools: Vec::new(),
+            step_actions: Vec::new(),
+            alias_scope: Default::default(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -4349,6 +4424,8 @@ mod on_tool_call_tests {
             seed_source: None,
             collectors: Vec::new(),
             extra_tools: Vec::new(),
+            step_actions: Vec::new(),
+            alias_scope: Default::default(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -4450,6 +4527,8 @@ mod on_tool_call_tests {
                 seed_source: None,
                 collectors: Vec::new(),
                 extra_tools: Vec::new(),
+                step_actions: Vec::new(),
+                alias_scope: Default::default(),
                 agent_name: "test-agent".into(),
                 agent_system_prompt: "test".into(),
                 agent_tools: None,
@@ -4540,44 +4619,6 @@ mod on_tool_call_tests {
             "cost_with_thinking={cost_with_thinking} cost_without_thinking={cost_without_thinking}: \
              a thinking response must cost strictly more, not be billed as if it never thought"
         );
-    }
-}
-
-#[cfg(test)]
-mod allowlist_tests {
-    use super::mcp_tool_name_matches_allowlist;
-
-    #[test]
-    fn exact_match() {
-        let list = vec!["scm.repos.get".into(), "issues.list".into()];
-        assert!(mcp_tool_name_matches_allowlist("scm.repos.get", &list));
-        assert!(mcp_tool_name_matches_allowlist("issues.list", &list));
-        assert!(!mcp_tool_name_matches_allowlist("scm.files.read", &list));
-    }
-
-    #[test]
-    fn star_matches_all() {
-        let list = vec!["*".into()];
-        assert!(mcp_tool_name_matches_allowlist("any.tool", &list));
-        assert!(mcp_tool_name_matches_allowlist("scm.files.read", &list));
-    }
-
-    #[test]
-    fn namespace_wildcard() {
-        let list = vec!["scm.*".into()];
-        assert!(mcp_tool_name_matches_allowlist("scm.repos.get", &list));
-        assert!(mcp_tool_name_matches_allowlist("scm.files.read", &list));
-        assert!(!mcp_tool_name_matches_allowlist("issues.list", &list));
-    }
-
-    #[test]
-    fn builtin_tools_are_not_matched() {
-        // `bash` / `read` are agent-side built-ins, not MCP tools.
-        // The allowlist may list them but no MCP tool catalog entry
-        // should ever match them.
-        let list = vec!["bash".into(), "read".into()];
-        assert!(!mcp_tool_name_matches_allowlist("scm.repos.get", &list));
-        assert!(!mcp_tool_name_matches_allowlist("issues.list", &list));
     }
 }
 
@@ -5282,6 +5323,8 @@ mod compaction_tests {
             seed_source: None,
             collectors: Vec::new(),
             extra_tools: Vec::new(),
+            step_actions: Vec::new(),
+            alias_scope: Default::default(),
             agent_name: "test".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -5828,6 +5871,8 @@ mod pause_tests {
             seed_source: None,
             collectors: Vec::new(),
             extra_tools: Vec::new(),
+            step_actions: Vec::new(),
+            alias_scope: Default::default(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -6170,6 +6215,8 @@ mod reasoning_tests {
             seed_source: None,
             collectors: Vec::new(),
             extra_tools: Vec::new(),
+            step_actions: Vec::new(),
+            alias_scope: Default::default(),
             agent_name: "test-agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
@@ -6346,20 +6393,25 @@ mod reasoning_tests {
             }
             other => panic!("first event must be run_start, got {other:?}"),
         }
-        // Every run announces its resolved model limits right after RunStart.
+        // Every run announces its resolved model limits right after RunStart,
+        // then the tools its model was offered and why (W2).
         assert!(matches!(
             &events[1],
             rupu_transcript::Event::Notice { kind, .. } if kind == "model_limits"
         ));
         assert!(matches!(
             &events[2],
+            rupu_transcript::Event::ToolGrant { .. }
+        ));
+        assert!(matches!(
+            &events[3],
             rupu_transcript::Event::Seed {
                 message_count: 2,
                 ..
             }
         ));
         assert!(matches!(
-            &events[3],
+            &events[4],
             rupu_transcript::Event::UserMessage { .. }
         ));
     }

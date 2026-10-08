@@ -307,19 +307,18 @@ function StatusBadge({ tool }: { tool: ToolView }) {
 }
 
 /**
- * Marks a `tool_audit` outcome (step `actions:` enforcement's audit
- * trail). `blocked: true` is the case that matters most — a denied
- * call — and gets an error-tinted badge; `declared && !granted` (spec
- * §3c's authoring-mistake case) gets a warn-tinted badge even when the
- * call itself wasn't blocked; otherwise a neutral "audited" marker
- * confirms the trail exists without implying anything went wrong.
+ * Marks a `tool_audit` outcome worth flagging. Every tool call is audited,
+ * so an allowed call gets no marker. `blocked: true` — a denied call — gets
+ * an error-tinted badge naming the recorded decision; `declared && !granted`
+ * (a step `actions:` naming a tool the agent's grant does not cover) gets a
+ * warn-tinted badge even when the call itself wasn't blocked.
  */
 function AuditBadge({ audit }: { audit: ToolAuditView }) {
   if (audit.blocked) {
     return (
       <span
         className="inline-flex items-center rounded px-1.5 py-0.5 text-meta font-semibold bg-err-bg text-err ring-1 ring-inset ring-err/30"
-        title="This tool call was denied (narrowed out of the step's actions: allowlist, or refused by the run's permission mode)."
+        title={blockedTitle(audit.decision)}
       >
         blocked
       </span>
@@ -335,14 +334,25 @@ function AuditBadge({ audit }: { audit: ToolAuditView }) {
       </span>
     );
   }
-  return (
-    <span
-      className="inline-flex items-center rounded px-1.5 py-0.5 text-meta bg-surface text-ink-mute"
-      title="Audited catalog tool call — declared/granted/blocked all clean."
-    >
-      audited
-    </span>
-  );
+  return null;
+}
+
+/** The blocked badge's tooltip, from the audit's recorded decision. */
+export function blockedTitle(decision: string | undefined): string {
+  switch (decision) {
+    case 'not_granted':
+      return "Not in this run's tool grant (never granted, narrowed by the step's actions:, or unavailable in this run).";
+    case 'denied:readonly':
+      return 'Denied: readonly mode blocks workspace writes and external actions.';
+    case 'denied:operator':
+      return 'Denied by the operator at the permission prompt.';
+    case 'denied:operator_stop':
+      return 'The operator stopped the run at this call.';
+    case 'denied:tool':
+      return "Refused by the tool's own permission gate.";
+    default:
+      return "This tool call was denied (narrowed out of the step's actions: allowlist, or refused by the run's permission mode).";
+  }
 }
 
 function CardHeader({ tool, summary }: { tool: ToolView; summary: string }) {

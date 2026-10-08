@@ -2257,6 +2257,7 @@ enum SessionEntry {
         declared: bool,
         granted: bool,
         blocked: bool,
+        decision: Option<String>,
     },
     GateRequested {
         gate_id: String,
@@ -2736,14 +2737,35 @@ impl SessionInteractiveState {
                 declared,
                 granted,
                 blocked,
+                decision,
                 ..
             } => {
-                self.push_entry(SessionEntry::ToolAudit {
-                    tool: tool.clone(),
-                    declared: *declared,
-                    granted: *granted,
-                    blocked: *blocked,
-                });
+                // Every call is audited; only a denial or an ungranted
+                // `actions:` entry adds anything to the call's own row.
+                if rupu_transcript::grant::tool_audit_notable(*blocked, *declared, *granted) {
+                    self.push_entry(SessionEntry::ToolAudit {
+                        tool: tool.clone(),
+                        declared: *declared,
+                        granted: *granted,
+                        blocked: *blocked,
+                        decision: decision.clone(),
+                    });
+                }
+            }
+            TranscriptEvent::ToolGrant {
+                entries,
+                narrowed,
+                unavailable,
+                ..
+            } => {
+                self.push_line(
+                    crate::output::palette::Status::Active,
+                    retained_session_event_line_raw(
+                        crate::output::palette::Status::Active,
+                        "tools",
+                        &rupu_transcript::grant::tool_grant_line(entries, narrowed, unavailable),
+                    ),
+                );
             }
             TranscriptEvent::GateRequested {
                 gate_id,
@@ -4465,14 +4487,20 @@ fn render_session_entry_rows(
             declared,
             granted,
             blocked,
+            decision,
         } => {
             let status = if *blocked {
                 Status::Failed
             } else {
                 Status::Complete
             };
-            let detail =
-                format!("{tool}  ·  declared={declared} granted={granted} blocked={blocked}");
+            let detail = rupu_transcript::grant::tool_audit_detail(
+                tool,
+                *declared,
+                *granted,
+                *blocked,
+                decision.as_deref(),
+            );
             render_nested_event_rows(
                 next_is_nested,
                 status,
@@ -5233,10 +5261,21 @@ fn transcript_event_lines(
             declared,
             granted,
             blocked,
+            decision,
             ..
         } => {
-            let detail =
-                format!("{tool}  ·  declared={declared} granted={granted} blocked={blocked}");
+            // Every call is audited; only a denial or an ungranted `actions:`
+            // entry adds anything to the call's own row.
+            if !rupu_transcript::grant::tool_audit_notable(*blocked, *declared, *granted) {
+                return Vec::new();
+            }
+            let detail = rupu_transcript::grant::tool_audit_detail(
+                tool,
+                *declared,
+                *granted,
+                *blocked,
+                decision.as_deref(),
+            );
             vec![SessionViewLine {
                 status: if *blocked {
                     Status::Failed
@@ -5426,6 +5465,20 @@ fn transcript_event_lines(
                 Status::Awaiting,
                 "notice",
                 &format!("{kind}  ·  {}", truncate_single_line(message, 96)),
+            ),
+            continuation: false,
+        }],
+        TranscriptEvent::ToolGrant {
+            entries,
+            narrowed,
+            unavailable,
+            ..
+        } => vec![SessionViewLine {
+            status: Status::Active,
+            text: retained_session_event_line_raw(
+                Status::Active,
+                "tools",
+                &rupu_transcript::grant::tool_grant_line(entries, narrowed, unavailable),
             ),
             continuation: false,
         }],
@@ -7695,7 +7748,9 @@ fn session_agent_fallbacks(
     session: &SessionRecord,
 ) -> Option<Vec<rupu_config::FallbackEntry>> {
     let project_agents_parent = session.project_root.as_ref().map(|p| p.join(".rupu"));
-    match load_agent(
+    // Only the fallback chain is read here, so the agent's `tools:` aren't
+    // checked: the turn's own launch does that.
+    match rupu_agent::find_agent(
         global,
         project_agents_parent.as_deref(),
         &session.agent_name,
@@ -7713,6 +7768,9 @@ fn session_agent_fallbacks(
                 ),
                 rupu_agent::AgentLoadError::NotFound(_) => {
                     "no agent by this name in the agent dirs".to_string()
+                }
+                rupu_agent::AgentLoadError::UnknownTool { .. } => {
+                    "the agent's `tools:` names an unknown tool".to_string()
                 }
             };
             tracing::warn!(
@@ -8020,6 +8078,8 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             seed_source,
             collectors: Vec::new(),
             extra_tools: Vec::new(),
+            step_actions: Vec::new(),
+            alias_scope: Default::default(),
             codename: Some(codename.clone()),
             recovery,
         };
@@ -12354,9 +12414,11 @@ mod tests {
             rupu_providers::types::Role::User,
             "this scenario must exercise the merge: compacted history ends on a user turn"
         );
-        trailing.content.push(rupu_providers::types::ContentBlock::Text {
-            text: "post-compact prompt".to_string(),
-        });
+        trailing
+            .content
+            .push(rupu_providers::types::ContentBlock::Text {
+                text: "post-compact prompt".to_string(),
+            });
         expected.push(Message::assistant("ack"));
         assert_eq!(
             serde_json::to_value(&full).unwrap(),

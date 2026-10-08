@@ -1016,10 +1016,22 @@ fn transcript_event_lines(
             declared,
             granted,
             blocked,
+            decision,
             ..
         } => {
+            // Every call is audited; only a denial or an ungranted `actions:`
+            // entry adds anything to the call's own row.
+            if !rupu_transcript::grant::tool_audit_notable(*blocked, *declared, *granted) {
+                return Vec::new();
+            }
             let status = if *blocked { Status::Failed } else { Status::Complete };
-            let detail = format!("{tool}  ·  declared={declared} granted={granted} blocked={blocked}");
+            let detail = rupu_transcript::grant::tool_audit_detail(
+                tool,
+                *declared,
+                *granted,
+                *blocked,
+                decision.as_deref(),
+            );
             vec![transcript_event_line(
                 status,
                 0,
@@ -1176,6 +1188,18 @@ fn transcript_event_lines(
                 &format!("{kind}  ·  {}", truncate_single_line(message, 96)),
             ),
         )],
+        TranscriptEvent::ToolGrant { entries, narrowed, unavailable, .. } => {
+            vec![transcript_event_line(
+                Status::Active,
+                0,
+                false,
+                transcript_event_text(
+                    Status::Active,
+                    "tools",
+                    &rupu_transcript::grant::tool_grant_line(entries, narrowed, unavailable),
+                ),
+            )]
+        }
         TranscriptEvent::Compaction { seq, summarized_messages, backup_path, .. } => {
             vec![transcript_event_line(
                 Status::Active,
@@ -1510,16 +1534,26 @@ pub(crate) fn render_pretty_transcript_event(
             declared,
             granted,
             blocked,
+            decision,
             ..
         } => {
-            let status = if *blocked {
-                Status::Failed
-            } else {
-                Status::Complete
-            };
-            let detail =
-                format!("{tool}  ·  declared={declared} granted={granted} blocked={blocked}");
-            printer.sideband_event(status, "tool audit", Some(&detail));
+            // Every call is audited; only a denial or an ungranted `actions:`
+            // entry adds anything to the call's own row.
+            if rupu_transcript::grant::tool_audit_notable(*blocked, *declared, *granted) {
+                let status = if *blocked {
+                    Status::Failed
+                } else {
+                    Status::Complete
+                };
+                let detail = rupu_transcript::grant::tool_audit_detail(
+                    tool,
+                    *declared,
+                    *granted,
+                    *blocked,
+                    decision.as_deref(),
+                );
+                printer.sideband_event(status, "tool audit", Some(&detail));
+            }
         }
         TranscriptEvent::GateRequested {
             gate_id,
@@ -1646,6 +1680,22 @@ pub(crate) fn render_pretty_transcript_event(
                 Status::Awaiting,
                 "notice",
                 Some(&format!("{kind}  ·  {}", truncate_single_line(message, 96))),
+            );
+        }
+        TranscriptEvent::ToolGrant {
+            entries,
+            narrowed,
+            unavailable,
+            ..
+        } => {
+            printer.sideband_event(
+                Status::Active,
+                "tools",
+                Some(&rupu_transcript::grant::tool_grant_line(
+                    entries,
+                    narrowed,
+                    unavailable,
+                )),
             );
         }
         TranscriptEvent::Compaction {

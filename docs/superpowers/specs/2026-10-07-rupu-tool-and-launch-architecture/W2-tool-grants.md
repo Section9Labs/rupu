@@ -45,6 +45,15 @@ A `tools:` entry is one of:
 
 **A tool named explicitly whose service is missing** is *not* offered, and produces one `tool_unavailable` notice that names the tool and the service (P7). Example: an agent lists `board.post` and runs under plain `rupu run`, where there is no message bus until F1.
 
+> **As built (W2 PR).** Where the code refines this section:
+> - **Required vs optional services.** W1 put optional instrumentation in `needs` (`read_file` → coverage emit, `bash` → netflow capture), which would have withheld core tools from most runs. Descriptors now carry `needs` (required; the grant checks these) and `uses` (fed when present, never a reason to withhold).
+> - **Exact services, no post-hoc drops.** Two services were added so the grant can't offer a tool the run can't build: `Service::AgentDispatcher` (the in-process `dispatch_agent*` port; W7 folds it into `Launcher`, which today means the agentiflow unit supervisor) and `Service::Engagement` (`assets.mark` needs Findings + Engagement). Injected tools (`extra_tools`) are self-served ambient grants (`origin:injected`): offered without a service check, because the tool *is* its implementation; a wildcard never drags in a non-injected flow tool. A granted tool the runner can't build is a `RunError::ToolGrant` (a bug), never a silent drop.
+> - **`DEFAULT_GRANT`** is `core.*`, `dispatch_agent`, `dispatch_agents_parallel`, `scm.*`, `issues.*`, `github.*`, `gitlab.*` — today's no-list registry; W7 swaps the dispatch pair for `dispatch`/`join`.
+> - **Load-time validation** lives in `load_agent` / `load_agent_admitted` (launch paths) → `AgentLoadError::UnknownTool`. Listings (`load_agents`, `find_agent`) only parse, so one bad file never hides or breaks the others; the CP DTO carries `load_error`, CP create/save refuse it (400), `agent create`/`edit` warn after saving.
+> - **`actions:`** also rejects an entry naming no connector tool (`bash`, `findings.*`): it would be a silent no-op. A step naming a connector the agent lacks logs one warning per run (it was a per-call warning in the old audit wrapper).
+> - **Audit.** The runner writes every `tool_audit` itself (decision `allowed` / `denied:readonly|operator|operator_stop|tool` / `not_granted`); the orchestrator's audit wrapper is deleted, `on_tool_call` passes through. `tool_grant` also records `skipped`. Views show only notable audits (denied, or an `actions:` entry the agent wasn't granted): the CLI printers via `rupu_transcript::grant`, the web tool card drops its neutral "audited" chip.
+> - The agentiflow lead's hand-appended `report_finding` is gone: the lead always runs under an engagement, whose ambient grant offers `findings.report` + `assets.mark`, visibly.
+
 ### 3.2 `actions:` narrowing: one rule, kept as today's intended semantics
 
 `actions:` narrows **connector tools** only. Builtins are never narrowed (see [[project-step-actions-enforcement]]). Connector tools are the tools whose descriptor `needs` includes `Service::Scm`. The rule is:

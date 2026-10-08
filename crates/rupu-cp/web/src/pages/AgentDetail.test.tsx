@@ -271,3 +271,22 @@ describe('AgentDetail under a customer scope', () => {
     expect(await screen.findByText('Runs and spend on this page cover every customer.')).toBeInTheDocument();
   });
 });
+
+describe('AgentDetail load error', () => {
+  it('shows why an agent with an unknown tool cannot be launched', async () => {
+    const err =
+      'unknown tool "repot_finding" in tools: (did you mean "report_finding" → findings.report?)';
+    vi.spyOn(api, 'getAgent').mockResolvedValue({ ...AGENT, load_error: err });
+    renderPage();
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent("This agent can't be launched:");
+    expect(alert).toHaveTextContent(err);
+  });
+
+  it('shows no load error for a loadable agent', async () => {
+    vi.spyOn(api, 'getAgent').mockResolvedValue(AGENT);
+    renderPage();
+    await screen.findByRole('button', { name: 'Edit definition' });
+    expect(screen.queryByText(/can't be launched/)).not.toBeInTheDocument();
+  });
+});

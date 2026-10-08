@@ -277,6 +277,17 @@ impl AgentSpec {
         let s = std::fs::read_to_string(path)?;
         Self::parse(&s)
     }
+
+    /// Check the `tools:` list against the tool catalog (D8): every entry
+    /// must name a known tool or namespace, by the grant grammar. Names
+    /// only — whether a run can serve a tool is the run's question. A typo
+    /// is an error with a did-you-mean, never a silently missing tool.
+    pub fn validate_tools(&self) -> Result<(), rupu_tools::GrantError> {
+        match &self.tools {
+            Some(tools) => crate::tool_registry::tool_catalog().validate_names(tools),
+            None => Ok(()),
+        }
+    }
 }
 
 #[cfg(test)]

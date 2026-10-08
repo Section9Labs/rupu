@@ -146,6 +146,13 @@ export interface ToolAuditView {
   /** The step declared a non-empty `actions:` allowlist at all
    * (disambiguates `declared: false`). */
   restricted: boolean;
+  /** What happened: `allowed`, `denied:<reason>` (`readonly`, `operator`,
+   * `tool`, `operator_stop`) or `not_granted`. Absent on lines written
+   * before every call was audited. */
+  decision?: string;
+  /** Why the tool was in the run's grant (`declared`, `declared:scm.*`,
+   * `ambient:concerns`, …). Absent for a call the grant didn't cover. */
+  reason?: string;
 }
 
 export type TurnBlock =
@@ -582,6 +589,8 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
           granted: data.granted === true,
           blocked: data.blocked === true,
           restricted: data.restricted === true,
+          decision: asString(data.decision) ?? undefined,
+          reason: asString(data.reason) ?? undefined,
         };
         const tool = asString(data.tool) ?? '';
         const queue = pendingAuditsByTool.get(tool);
@@ -728,7 +737,7 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
             budget: asNumber(data.budget),
             provider: asString(data.provider),
             model: asString(data.model),
-            reason: asString(data.reason),
+            reason: asString(data.reason) ?? undefined,
           }),
         });
         break;

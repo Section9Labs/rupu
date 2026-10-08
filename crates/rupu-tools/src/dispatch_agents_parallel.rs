@@ -58,7 +58,8 @@ struct AgentRequest {
     inputs: Option<Value>,
 }
 
-/// `dispatch_agents_parallel` builtin. Registered in `default_tool_registry()`.
+/// `dispatch_agents_parallel` builtin. Built by `rupu_agent::builtin_tool` when a run's grant offers it
+/// (it needs [`Service::AgentDispatcher`]).
 #[derive(Debug, Default, Clone)]
 pub struct DispatchAgentsParallelTool;
 
@@ -67,7 +68,8 @@ pub static DESCRIPTOR: ToolDescriptor = ToolDescriptor {
     name: "dispatch_agents_parallel",
     aliases: &[],
     effect: Effect::Spawn,
-    needs: &[Service::Launcher],
+    needs: &[Service::AgentDispatcher],
+    uses: &[],
     description: "Run several agents in parallel and aggregate their results. Provide a list of `agents`, each with `{ id, agent, prompt }`. Every agent must appear in this agent's dispatchableAgents allowlist. Returns a map keyed by `id` with each child's output, tokens, and transcript. Use this when N specialist reviews can run independently — for sequential or single-child dispatches use `dispatch_agent` instead.",
     input_schema: descriptor_schema,
 };
