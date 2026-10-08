@@ -481,14 +481,56 @@ tabs:
 
 | Tab | Shows |
 | --- | --- |
-| Flow | The run as a graph: the lead's rounds as a spine with each round's units branching off it, plus a Fleet list of every unit and its status |
+| Flow | The run as a graph: the lead's rounds as a spine with each round's units branching off it (described below), plus a Fleet list of every unit and its status |
 | Assets | Engagement assets (hosts, services, sites, routes, files) with their depth rung |
 | Findings | Findings filed by the lead and its units, in the shared findings table |
-| Messages | The board (posts and directives), with a box to send the lead a steering message, queued for the round boundary or sent mid-round |
+| Messages | The board (posts and directives), with a box to send the lead a steering message, queued for the round boundary or sent mid-round. The send is refused, with an error, once the run has finished or its coordinator process is gone (a dead coordinator's run still reads `running` until the reaper, section 8, closes it) |
 | Transcript | The lead's transcript for the latest round, tailing live |
 | Events | `events.jsonl`, newest first |
 
-A running run refreshes every 5 seconds.
+A running run refreshes every 5 seconds. When a run still reads `running` but
+its coordinator process is gone, the header says so: the run died without
+finishing and the orphan reaper (section 8) will close it.
+
+### The Flow graph
+
+The graph reads top to bottom: **Engagement started** (with the run's
+engagement profiles), one node per round, then **Stopped** with the stop reason
+(or a pulsing "running…" tail while the run is live). The spine is tinted with
+the lead's crew color. Each round's node shows its goals met, budget stage,
+spend and a **lead transcript** link. The units the lead dispatched in that
+round branch off it and merge back into the next round, each tinted with its
+own crew color. A unit's dot is filled when it is running or done (and pulses
+while it runs), hollow when pending, and ringed red when it failed.
+
+- **Rounds collapse.** Only the last (or live) round starts expanded. Earlier
+  rounds show a one-line summary ending in `· N units (hidden)`, so a long
+  engagement stays short. Click the chevron or the unit count to expand or
+  collapse any round. The choice holds across the 5-second refresh.
+- **Agent units** link to their **transcript**.
+- **Workflow units** link to their own run page (**open flow →**,
+  `/runs/<unit id>`): a workflow unit is a full workflow run, with its own DAG,
+  per-step transcripts, findings and events there.
+- **Workflow units unfold in place.** A workflow unit has its own chevron. It
+  starts collapsed. Expanding it hangs the workflow's steps below the unit on
+  an indented sub-spine in the unit's crew color: one row per step, with its
+  id, its kind when it isn't a plain step (`for_each`, `parallel`, `panel`,
+  `gate`, ...), the agent that ran it (codename and agent name) and its state:
+  `✓ done`, `✕ failed` or `⤼ skipped`. The state comes from the step results
+  the unit run has recorded, and a step records its result when it finishes,
+  so a step that is still running (or parked at a gate) shows `• pending`
+  until then. The steps load (`GET /api/runs/<unit id>/graph`) when you
+  expand that unit, so a run with hundreds of units only fetches the workflows
+  you open. They don't follow the 5-second refresh: collapse and expand the
+  unit again to update its steps. The nested view goes one level deep and
+  lists steps in definition order; for forks, fan-out units and per-step
+  detail, use **open flow →**.
+
+For example, a round that dispatched one `api-surface-recon` workflow unit can
+be opened to show `enumerate ✓ done`, `probe ✕ failed`, `summarize • pending`
+under it.
+
+### API
 
 The API behind it, all on the local host:
 
@@ -497,7 +539,8 @@ The API behind it, all on the local host:
 | `GET /api/agentiflows` | Run list, newest first |
 | `GET /api/agentiflows/:id` | Record, definition snapshot, events, units, lead transcript paths |
 | `GET /api/agentiflows/:id/messages` | Board posts and directives |
-| `POST /api/agentiflows/:id/steer` | `{ message, now?, stop? }`: queue a steering message (409 when the run isn't running) |
+| `POST /api/agentiflows/:id/steer` | `{ message, now?, stop? }`: queue a steering message. 409 when nothing would read it: the run isn't `running`, or its recorded coordinator process is gone. 501 unless the server is `rupu cp serve` |
+| `GET /api/runs/:id/graph` | A workflow unit's own graph, fetched when you expand the unit in the Flow tab |
 | `GET /api/findings?run_id=<id>` | The run's findings (the lead's and every unit's) |
 | `GET /api/assets` | Asset inventory (`?ws_id=` / `?target=` to scope it) |
 

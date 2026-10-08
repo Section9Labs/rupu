@@ -58,7 +58,12 @@ response headers, which is how it finds out.
 
 **Restart after upgrading.** `cp serve` is a long-running daemon: installing a
 new `rupu` binary does not change a running server. Stop it and start it again.
-`bind` and `token` are also restart-only settings.
+`bind` and `token` are also restart-only settings, and so are the switches and
+intervals of `cp serve`'s background loops: `[cp].autoflow_reconcile_*`,
+`[cp].cron_tick_*` and `[cp].gate_sweep_*` (each `_enabled` and
+`_interval_secs`), `[agentiflow].reaper_enabled` and
+`[netflow].asn_auto_refresh`. A config save through the API lists the ones it
+changed in its `restart_required` field.
 
 ### Read-only vs full runtime
 
@@ -264,8 +269,12 @@ runner left mid-flight is continued from its transcript rather than restarted
 (see [`using-rupu.md#resuming-interrupted-work`](using-rupu.md#resuming-interrupted-work)). Resuming a run
 that isn't `paused` is a 409.
 
-Controls carry `?host=` for a run on a remote host. Pause and resume are not
-available on every transport (a 501 says so); see [Hosts](#hosts-and-per-host-loading).
+Controls carry `?host=` for a run on a remote host and answer as they would
+locally: 404 when the host has no such run, 409 when it refuses the
+transition, 501 when its transport can't do it (pause and resume are not
+available on every transport), 502 when the host fails or can't be reached.
+See [Hosts](#hosts-and-per-host-loading) and
+[`cp-api.md#errors`](cp-api.md#errors).
 
 **Archive, restore, delete.** Finished runs and sessions can be archived (out of
 the active lists), restored, or deleted. `[storage].archived_session_retention`
@@ -372,7 +381,11 @@ The UI updates over server-sent events:
 
 Runs the CP launched stream straight from the executor; runs started elsewhere
 are tailed from their `events.jsonl`, so the live view looks the same however
-the run began. Format details are in [`cp-api.md#server-sent-events`](cp-api.md#server-sent-events).
+the run began. The one-run and transcript streams number their events, so a
+dropped connection picks up where it left off instead of replaying the run, and
+they end once the run (or transcript) is finished rather than staying open. A
+finished run's page still checks back every 15 s, so a retried run streams in.
+Format details are in [`cp-api.md#server-sent-events`](cp-api.md#server-sent-events).
 
 ---
 
@@ -426,7 +439,11 @@ with ASN enrichment. The server keeps a resident index of the netflow ledgers
   [`cp-customers-api.md`](cp-customers-api.md).
 - **Agentiflows.** `/runs/agentiflows` and `/agentiflows/:id` (Flow, Assets,
   Findings, Messages, Transcript, Events tabs; a steering box on Messages while
-  the run is live). See [`agentiflows.md#10-in-the-control-plane`](agentiflows.md#10-in-the-control-plane).
+  the run is live, refused once its coordinator is gone). The Flow tab draws
+  the lead's rounds as a spine with each round's units branching off it;
+  earlier rounds collapse to a one-line summary, a workflow unit links to its
+  own run page (**open flow →**) and expands in place to list its steps with
+  their status. See [`agentiflows.md#the-flow-graph`](agentiflows.md#the-flow-graph).
 
 ## See also
 
