@@ -651,14 +651,43 @@ fn model_has_1m_suffix(model: &str) -> bool {
     lower.contains("[1m]")
 }
 
-/// Whether the model supports interleaved thinking. Mirrors claude-cli's
-/// `modelSupportsISP` (`utils/betas.ts:92`) for the firstParty path:
-/// any 4-tier (or newer) Claude model.
+/// Parse the `(major, minor)` tier version out of an Anthropic model id.
+///
+/// Handles both the modern `claude-<family>-<major>[-<minor>]` layout
+/// (`claude-opus-4-8`, `claude-mythos-5`, `claude-opus-5-5`, `claude-fable-5-1`)
+/// and the legacy `claude-<major>[-<minor>]-<family>` layout
+/// (`claude-3-5-sonnet-…`): in both, the first integer run after `claude` is
+/// the major and the next integer run is the minor. A trailing release-date
+/// stamp (`-20250514`) is *not* a minor — any run of 3+ digits is ignored for
+/// the minor, so `claude-opus-4-20250514` reads as `(4, 0)`, not `(4, large)`.
+/// The `[1m]`/`[2m]` context suffix is stripped first. Returns `None` when the
+/// id carries no tier number at all. Keeps `model_supports_*` forward-looking
+/// (no per-string hardcoding) and mirrors claude-cli routing on real versions
+/// rather than the per-model capability flags claude-cli reads from its model
+/// catalog.
+fn anthropic_model_version(model: &str) -> Option<(u32, u32)> {
+    let lower = crate::model_registry::strip_1m(model).to_ascii_lowercase();
+    let mut runs = lower
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty());
+    let major: u32 = runs.next()?.parse().ok()?;
+    // A plausible minor is one or two digits; a longer run is a date stamp.
+    let minor = runs
+        .next()
+        .filter(|s| s.len() <= 2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    Some((major, minor))
+}
+
+/// Whether the model supports interleaved thinking (and, via
+/// [`model_supports_context_management`], server-side context management).
+/// Mirrors claude-cli's `modelSupportsISP` (`utils/betas.ts:92`) for the
+/// firstParty path: any 4-tier or newer Claude model, every family (Haiku
+/// included). Version-based so the whole Claude-5 family is recognized rather
+/// than only the `claude-{opus,sonnet,haiku}-4` strings this used to match.
 fn model_supports_interleaved_thinking(model: &str) -> bool {
-    let lower = model.to_ascii_lowercase();
-    lower.contains("claude-opus-4")
-        || lower.contains("claude-sonnet-4")
-        || lower.contains("claude-haiku-4")
+    matches!(anthropic_model_version(model), Some((major, _)) if major >= 4)
 }
 
 /// Whether the model supports server-side context management. Mirrors
@@ -1626,16 +1655,32 @@ impl AnthropicClient {
 /// Always includes `oauth-2025-04-20`. For non-Haiku models also includes
 /// `claude-code-20250219` — the reference client gates this beta to the
 /// Sonnet/Opus tiers; sending it on Haiku produces a 400.
-/// Whether the model supports `thinking: {"type":"adaptive"}`. Mirrors
-/// claude-cli's `modelSupportsAdaptiveThinking` heuristic: Opus / Sonnet
-/// 4-tier and newer support adaptive; Haiku and pre-4 models do not.
+/// Whether the model supports `thinking: {"type":"adaptive"}` (and therefore
+/// drives thinking depth through `output_config.effort` instead of the
+/// deprecated `thinking.budget_tokens`). Mirrors claude-cli's
+/// `supportsAdaptiveThinking` capability: adaptive thinking is a 4.6+ feature,
+/// so Opus/Sonnet 4.6/4.7/4.8 and the entire Claude-5 family (opus-5, opus-5-5,
+/// sonnet-5[-5], fable-5[-1], mythos-5[-1], …) are adaptive, while 4.5-and-older
+/// and legacy 3.x use the fixed `budget_tokens` shape. Haiku is excluded: Haiku
+/// 4.5 is pre-adaptive and no adaptive Haiku has shipped (revisit when one does).
+///
+/// Getting this right is load-bearing: on 4.7/4.8 and all of Claude-5 the
+/// server *rejects* `thinking.type: "enabled"` + `budget_tokens` with a 400
+/// ("… not supported for this model. Use thinking.type.adaptive and
+/// output_config.effort …"), so misclassifying one of those as pre-adaptive
+/// breaks every explicit-effort request on it, on both the OAuth and api-key
+/// paths.
 fn model_supports_adaptive_thinking(model: &str) -> bool {
-    if model.contains("haiku") {
+    if crate::model_registry::strip_1m(model)
+        .to_ascii_lowercase()
+        .contains("haiku")
+    {
         return false;
     }
-    // claude-{opus,sonnet}-4-…  (4-tier and newer). Pre-4 models have
-    // numerical major in {3, 3-5}; we only enable adaptive on 4+.
-    model.contains("-4-") || model.contains("-4.")
+    matches!(
+        anthropic_model_version(model),
+        Some((major, minor)) if major >= 5 || (major == 4 && minor >= 6)
+    )
 }
 
 /// Whether a stream event counts as "content emitted" for `stream()`'s
@@ -2326,28 +2371,50 @@ impl AnthropicClient {
             body["metadata"] = serde_json::json!({ "user_id": user_id.to_string() });
         }
 
-        // Thinking/extended thinking. Anthropic accepts two shapes:
-        //   * `thinking.type: "adaptive"` — server picks the budget
-        //     (Opus/Sonnet 4 OAuth path).
-        //   * `thinking.type: "enabled"` + `budget_tokens: <n>` — fixed
-        //     budget. Must be >= 1024 (API minimum) and < max_tokens
-        //     (thinking counts toward the cap; platform.claude.com/docs/en/
-        //     build-with-claude/extended-thinking, "Budget rules"). Clamped
-        //     to leave 1024 for the visible answer; thinking is skipped when
-        //     the clamped budget falls below the minimum.
-        //   * `display: "summarized"` — opt in to readable thinking text.
-        //     Only ever set alongside "adaptive": `display` accepts exactly
+        // Thinking/extended thinking. Anthropic accepts two thinking shapes,
+        // and depth is controlled differently depending on which:
+        //   * Adaptive models (4.6+ and the Claude-5 family —
+        //     `model_supports_adaptive_thinking`): `thinking.type: "adaptive"`,
+        //     with depth driven by a *separate* `output_config.effort` knob
+        //     (low/medium/high/xhigh/max), exactly as claude-cli and the
+        //     server's own 400 message direct. `thinking.type: "enabled"` +
+        //     `budget_tokens` is rejected (400) on these models, so an explicit
+        //     effort maps to adaptive + effort here, never a token budget.
+        //   * Pre-adaptive models (≤4.5, Haiku, legacy 3.x): the fixed
+        //     `thinking.type: "enabled"` + `budget_tokens: <n>` shape. The
+        //     budget must be >= 1024 (API minimum) and < max_tokens (thinking
+        //     counts toward the cap; platform.claude.com/docs/en/
+        //     build-with-claude/extended-thinking, "Budget rules"). Clamped to
+        //     leave 1024 for the visible answer; thinking is skipped when the
+        //     clamped budget falls below the minimum.
+        //   * `display: "summarized"` — opt in to readable thinking text. Only
+        //     ever set alongside "adaptive": `display` accepts exactly
         //     "summarized" | "omitted" (there is no raw/full — the raw chain of
-        //     thought is not exposed on any Claude model), and the
-        //     budget_tokens path targets pre-4.6 models that predate it.
-        //     Without this, display defaults to "omitted" on Opus 4.7/4.8 and
-        //     Sonnet 5, whose thinking blocks then carry an empty text field.
+        //     thought is not exposed on any Claude model), and the budget_tokens
+        //     path targets pre-4.6 models that predate it. Without this, display
+        //     defaults to "omitted" on the adaptive models, whose thinking
+        //     blocks then carry an empty text field.
+        //
+        // `adaptive_effort`, when `Some`, is the `output_config.effort` value
+        // that pairs with adaptive thinking; it is merged into `output_config`
+        // below (alongside `task_budget` / `format`).
+        let mut adaptive_effort: Option<&'static str> = None;
         if let Some(level) = &request.thinking {
             use crate::model_tier::ThinkingLevel;
+            let adaptive = model_supports_adaptive_thinking(&request.model);
             match level {
                 ThinkingLevel::Auto => {
                     body["thinking"] =
                         serde_json::json!({ "type": "adaptive", "display": "summarized" });
+                }
+                _ if adaptive => {
+                    // 4.6+/Claude-5: adaptive thinking, depth via
+                    // `output_config.effort`. `anthropic_effort_str` is `Some`
+                    // for every non-`Auto` level and only ever yields values
+                    // valid on every adaptive tier, so no per-model clamp.
+                    body["thinking"] =
+                        serde_json::json!({ "type": "adaptive", "display": "summarized" });
+                    adaptive_effort = level.anthropic_effort_str();
                 }
                 _ => {
                     let raw_budget = match level {
@@ -2410,6 +2477,17 @@ impl AnthropicClient {
         // when it is `Some`. Agents with `outputFormat: json` and no
         // `outputSchema` keep today's prompt-driven-only behavior.
         let mut output_config = serde_json::Map::new();
+        if let Some(effort) = adaptive_effort {
+            // Depth knob for adaptive-thinking models — set only when the
+            // thinking branch above routed an explicit effort through adaptive
+            // thinking (never for `Auto` or the pre-adaptive budget_tokens
+            // path). `effort-2025-11-24` is always on the OAuth beta CSV, and
+            // the effort parameter is GA (no beta) on the api-key path.
+            output_config.insert(
+                "effort".to_string(),
+                serde_json::Value::String(effort.to_string()),
+            );
+        }
         if let Some(budget) = request.anthropic_task_budget {
             output_config.insert(
                 "task_budget".to_string(),
@@ -3845,7 +3923,7 @@ mod tests {
     fn test_build_request_body_thinking_low() {
         let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let request = LlmRequest {
-            model: "claude-sonnet-4-6".into(),
+            model: "claude-sonnet-4-5".into(),
             system: None,
             messages: vec![Message::user("low effort")],
             max_tokens: Some(8000),
@@ -3934,7 +4012,7 @@ mod tests {
         // `display`; sending it there risks a 400 on every request.
         let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let request = LlmRequest {
-            model: "claude-sonnet-4-6".into(),
+            model: "claude-sonnet-4-5".into(),
             system: None,
             messages: vec![Message::user("hi")],
             max_tokens: Some(32000),
@@ -4251,7 +4329,7 @@ mod tests {
     fn test_build_request_body_thinking_medium() {
         let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let request = LlmRequest {
-            model: "claude-sonnet-4-6".into(),
+            model: "claude-sonnet-4-5".into(),
             system: None,
             messages: vec![Message::user("medium effort")],
             max_tokens: Some(8000),
@@ -4277,7 +4355,7 @@ mod tests {
     fn test_build_request_body_with_thinking_high() {
         let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let request = LlmRequest {
-            model: "claude-sonnet-4-6".into(),
+            model: "claude-sonnet-4-5".into(),
             system: None,
             messages: vec![Message::user("think hard")],
             max_tokens: Some(16000),
@@ -4328,7 +4406,7 @@ mod tests {
     fn test_build_request_body_thinking_minimal_skipped() {
         let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let request = LlmRequest {
-            model: "claude-sonnet-4-6".into(),
+            model: "claude-sonnet-4-5".into(),
             system: None,
             messages: vec![Message::user("classify")],
             max_tokens: Some(100),
@@ -4353,7 +4431,7 @@ mod tests {
     fn test_build_request_body_thinking_max() {
         let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let request = LlmRequest {
-            model: "claude-opus-4-6".into(),
+            model: "claude-sonnet-4-5".into(),
             system: None,
             messages: vec![Message::user("deep analysis")],
             max_tokens: Some(32000),
@@ -4379,7 +4457,7 @@ mod tests {
     fn test_build_request_body_thinking_high_clamped_to_max_tokens() {
         let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let request = LlmRequest {
-            model: "claude-sonnet-4-6".into(),
+            model: "claude-sonnet-4-5".into(),
             system: None,
             messages: vec![Message::user("think")],
             max_tokens: Some(4096),
@@ -4413,6 +4491,8 @@ mod tests {
         let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let fallback = crate::model_limits::ANTHROPIC_FALLBACK_MAX_TOKENS;
         let mut request = make_request(None);
+        // Pre-adaptive model so the fixed budget_tokens clamp is exercised.
+        request.model = "claude-sonnet-4-5".into();
         request.max_tokens = None;
 
         request.thinking = Some(crate::model_tier::ThinkingLevel::Max);
@@ -4439,6 +4519,8 @@ mod tests {
         let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let budget = |level, cap| {
             let mut request = make_request(None);
+            // Pre-adaptive model so the fixed budget_tokens clamp is exercised.
+            request.model = "claude-sonnet-4-5".into();
             request.max_tokens = Some(cap);
             request.thinking = Some(level);
             client.build_request_body(&request, false)["thinking"].clone()
@@ -4457,7 +4539,7 @@ mod tests {
     fn test_build_request_body_thinking_skipped_when_max_tokens_too_small() {
         let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
         let request = LlmRequest {
-            model: "claude-sonnet-4-6".into(),
+            model: "claude-sonnet-4-5".into(),
             system: None,
             messages: vec![Message::user("tiny")],
             max_tokens: Some(500),
@@ -4479,6 +4561,186 @@ mod tests {
             body.get("thinking").is_none(),
             "budget too small for 1024 minimum"
         );
+    }
+
+    /// The Claude-5 family (and Opus/Sonnet 4.7/4.8) reject
+    /// `thinking.type: "enabled"` + `budget_tokens` with a 400 — the server
+    /// says to use `thinking.type: "adaptive"` + `output_config.effort`
+    /// instead. An explicit effort on such a model must therefore carry the
+    /// adaptive thinking block and an `output_config.effort` knob, never a
+    /// fixed token budget. Covers both auth paths: the 400 fired on an
+    /// api-key account, and the same wire shape is what SSO/OAuth sends.
+    #[test]
+    fn adaptive_models_map_explicit_effort_to_output_config_effort() {
+        use crate::model_tier::ThinkingLevel;
+        for model in [
+            "claude-mythos-5",
+            "claude-mythos-5-1",
+            "claude-opus-5",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-fable-5-1",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-sonnet-4-6",
+        ] {
+            for client in [
+                AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink)),
+                oauth_client(),
+            ] {
+                let mut request = make_request(None);
+                request.model = model.into();
+                request.max_tokens = Some(16000);
+                request.thinking = Some(ThinkingLevel::High);
+                let body = client.build_request_body(&request, false);
+                assert_eq!(
+                    body["thinking"]["type"], "adaptive",
+                    "{model}: thinking.type"
+                );
+                assert_eq!(
+                    body["thinking"]["display"], "summarized",
+                    "{model}: thinking.display"
+                );
+                assert!(
+                    body["thinking"].get("budget_tokens").is_none(),
+                    "{model}: must not send budget_tokens on an adaptive model; got {}",
+                    body["thinking"]
+                );
+                assert_eq!(
+                    body["output_config"]["effort"], "high",
+                    "{model}: output_config.effort"
+                );
+            }
+        }
+    }
+
+    /// `ThinkingLevel` → Anthropic `output_config.effort` ladder, on an
+    /// adaptive model. Minimal collapses onto the API floor `low`; Max is the
+    /// API top `max`. The values here are valid on every adaptive tier (4.6
+    /// accepts low/medium/high/max; 4.7+ additionally accept xhigh, which this
+    /// ladder never emits), so no per-model clamping is required.
+    #[test]
+    fn adaptive_effort_level_ladder() {
+        use crate::model_tier::ThinkingLevel::{High, Low, Max, Medium, Minimal};
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
+        let effort = |lvl| {
+            let mut request = make_request(None);
+            request.model = "claude-opus-5-5".into();
+            request.max_tokens = Some(16000);
+            request.thinking = Some(lvl);
+            client.build_request_body(&request, false)["output_config"]["effort"].clone()
+        };
+        assert_eq!(effort(Minimal), "low");
+        assert_eq!(effort(Low), "low");
+        assert_eq!(effort(Medium), "medium");
+        assert_eq!(effort(High), "high");
+        assert_eq!(effort(Max), "max");
+    }
+
+    /// `effort: auto` on an adaptive model stays bare adaptive — the server
+    /// picks the budget — and carries no `output_config.effort` knob. This is
+    /// the shape the live engagement currently runs on; it must not regress.
+    #[test]
+    fn adaptive_auto_sends_adaptive_without_effort_knob() {
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
+        let mut request = make_request(None);
+        request.model = "claude-mythos-5".into();
+        request.max_tokens = Some(16000);
+        request.thinking = Some(crate::model_tier::ThinkingLevel::Auto);
+        let body = client.build_request_body(&request, false);
+        assert_eq!(
+            body["thinking"],
+            serde_json::json!({ "type": "adaptive", "display": "summarized" })
+        );
+        assert!(
+            body.get("output_config")
+                .and_then(|o| o.get("effort"))
+                .is_none(),
+            "Auto must not pin an effort level; got {:?}",
+            body.get("output_config")
+        );
+    }
+
+    /// `output_config.effort` merges with the other `output_config` knobs
+    /// (here `task_budget`) rather than clobbering them.
+    #[test]
+    fn adaptive_effort_merges_with_task_budget() {
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
+        let mut request = make_request(None);
+        request.model = "claude-opus-5-5".into();
+        request.max_tokens = Some(16000);
+        request.thinking = Some(crate::model_tier::ThinkingLevel::Medium);
+        request.anthropic_task_budget = Some(2048);
+        let body = client.build_request_body(&request, false);
+        assert_eq!(body["output_config"]["effort"], "medium");
+        assert_eq!(body["output_config"]["task_budget"], 2048);
+    }
+
+    /// A pre-4.6 model (and Haiku) keeps the fixed `budget_tokens` thinking
+    /// shape and never grows an `output_config.effort` knob — `budget_tokens`
+    /// is still what those models accept.
+    #[test]
+    fn pre_adaptive_models_keep_budget_tokens_and_no_effort() {
+        let client = AnthropicClient::new("test-key".into(), Arc::new(rupu_netflow::NullSink));
+        for model in [
+            "claude-sonnet-4-5",
+            "claude-haiku-4-5",
+            "claude-3-5-sonnet-20241022",
+        ] {
+            let mut request = make_request(None);
+            request.model = model.into();
+            request.max_tokens = Some(16000);
+            request.thinking = Some(crate::model_tier::ThinkingLevel::High);
+            let body = client.build_request_body(&request, false);
+            assert_eq!(body["thinking"]["type"], "enabled", "{model}");
+            assert_eq!(body["thinking"]["budget_tokens"], 10000, "{model}");
+            assert!(
+                body.get("output_config")
+                    .and_then(|o| o.get("effort"))
+                    .is_none(),
+                "{model}: pre-adaptive models must not send output_config.effort"
+            );
+        }
+    }
+
+    /// Version boundary for adaptive thinking: the whole Claude-5 family and
+    /// Opus/Sonnet 4.6+ are adaptive; 4.5 and legacy 3.x (and Haiku) are not.
+    #[test]
+    fn adaptive_thinking_boundary_is_version_based() {
+        for m in [
+            "claude-mythos-5",
+            "claude-mythos-5-1",
+            "claude-opus-5",
+            "claude-opus-5-5",
+            "claude-sonnet-5",
+            "claude-sonnet-5-5",
+            "claude-fable-5",
+            "claude-fable-5-1",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-5-5[1m]",
+        ] {
+            assert!(
+                model_supports_adaptive_thinking(m),
+                "{m} should be adaptive"
+            );
+        }
+        for m in [
+            "claude-sonnet-4-5",
+            "claude-opus-4-5",
+            "claude-opus-4-1",
+            "claude-opus-4-20250514",
+            "claude-3-5-sonnet-20241022",
+            "claude-3-opus-20240229",
+            "claude-haiku-4-5",
+        ] {
+            assert!(
+                !model_supports_adaptive_thinking(m),
+                "{m} should NOT be adaptive"
+            );
+        }
     }
 
     #[test]

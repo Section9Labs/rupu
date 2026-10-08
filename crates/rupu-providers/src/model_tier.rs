@@ -42,6 +42,28 @@ impl ThinkingLevel {
             ThinkingLevel::Max => Some("xhigh"),
         }
     }
+
+    /// Anthropic `output_config.effort` string for adaptive-thinking models
+    /// (4.6+ and the Claude-5 family). Paired with `thinking.type: "adaptive"`,
+    /// this is how claude-cli — and the server's own 400 message — say to
+    /// control thinking depth on these models; the deprecated
+    /// `thinking.budget_tokens` knob is rejected there. `Auto` pins no level
+    /// so the server chooses adaptively (no `output_config.effort` on the
+    /// wire). The scale is low/medium/high/xhigh/max: `Minimal` collapses onto
+    /// the floor `low` (there is no "minimal"), and `Max` maps to `max`. This
+    /// ladder deliberately never emits `xhigh` — every value it does emit is
+    /// valid on *every* adaptive tier (4.6 accepts low/medium/high/max; 4.7+
+    /// additionally accept xhigh), so no per-model clamping is needed.
+    pub fn anthropic_effort_str(&self) -> Option<&'static str> {
+        match self {
+            ThinkingLevel::Auto => None,
+            ThinkingLevel::Minimal => Some("low"),
+            ThinkingLevel::Low => Some("low"),
+            ThinkingLevel::Medium => Some("medium"),
+            ThinkingLevel::High => Some("high"),
+            ThinkingLevel::Max => Some("max"),
+        }
+    }
 }
 
 /// Desired context-window size for a request. Each provider maps this
@@ -174,6 +196,19 @@ mod tests {
             let parsed: ThinkingLevel = serde_json::from_str(&json).unwrap();
             assert_eq!(*level, parsed);
         }
+    }
+
+    #[test]
+    fn test_anthropic_effort_str() {
+        // Anthropic's `output_config.effort` scale is low/medium/high/xhigh/max.
+        // `Auto` pins no level (the server picks). `Minimal` collapses onto the
+        // floor `low` (Anthropic has no "minimal"), and `Max` is the top `max`.
+        assert_eq!(ThinkingLevel::Auto.anthropic_effort_str(), None);
+        assert_eq!(ThinkingLevel::Minimal.anthropic_effort_str(), Some("low"));
+        assert_eq!(ThinkingLevel::Low.anthropic_effort_str(), Some("low"));
+        assert_eq!(ThinkingLevel::Medium.anthropic_effort_str(), Some("medium"));
+        assert_eq!(ThinkingLevel::High.anthropic_effort_str(), Some("high"));
+        assert_eq!(ThinkingLevel::Max.anthropic_effort_str(), Some("max"));
     }
 
     #[test]
