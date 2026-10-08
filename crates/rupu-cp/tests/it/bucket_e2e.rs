@@ -46,6 +46,7 @@ async fn poll_bucket_run_mirrors_and_finishes() {
         target: None,
         findings_profile: None,
         engagement_profiles: Vec::new(),
+        codename: None,
     };
     mirror
         .create_run(run_id, host_id, &spec)
@@ -175,6 +176,7 @@ async fn poll_bucket_run_remirrors_run_json_each_tick() {
         target: None,
         findings_profile: None,
         engagement_profiles: Vec::new(),
+        codename: None,
     };
     mirror
         .create_run(run_id, host_id, &spec)

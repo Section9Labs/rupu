@@ -109,6 +109,72 @@ pub struct RunSpec {
     /// known to honour it — see [`CAP_AGENT_ENGAGEMENT_PROFILE`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub engagement_profiles: Vec<String>,
+    /// Agent runs only: `rupu run --codename`, the coordinator-minted name.
+    /// Absent on the wire when `None`.
+    ///
+    /// Unlike the fields above, best-effort: a codename is only a display
+    /// name, so an executor predating this field (which drops it — `RunSpec`
+    /// has no `deny_unknown_fields`) costs nothing but a remote transcript
+    /// showing its own name. A sender sets it only for an executor that
+    /// advertised [`CAP_RUN_CODENAME`] and logs the drop otherwise
+    /// (`rupu_runtime::argv::RunArgv::for_peer`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codename: Option<String>,
+}
+
+impl RunSpec {
+    /// The `rupu run` / `rupu workflow run` an executor (`rupu node`, `rupu
+    /// node pull`) starts for this spec under `run_id`. Refuses a field the
+    /// command can't honour rather than launch without it: `findings_profile`
+    /// and `engagement_profiles` are agent-run fields (`rupu workflow run`
+    /// resolves profiles per step from the workflow file), as is a mode word
+    /// that isn't one. A codename on a workflow spec is ignored (logged): a
+    /// workflow run's crew is derived from its run id.
+    pub fn run_argv(&self, run_id: &str) -> Result<rupu_runtime::argv::RunArgv, String> {
+        use rupu_runtime::argv::{AgentRun, RunArgv, WorkflowRef, WorkflowRun};
+        let mode = crate::agent_launcher::parse_mode(self.mode.as_deref())?;
+        match self.kind {
+            RunSpecKind::Workflow => {
+                if self.findings_profile.is_some() {
+                    return Err(format!(
+                        "run spec for workflow `{}` carries a findings_profile, which applies to agent runs only",
+                        self.name
+                    ));
+                }
+                if !self.engagement_profiles.is_empty() {
+                    return Err(format!(
+                        "run spec for workflow `{}` carries engagement_profiles, which apply to agent runs only",
+                        self.name
+                    ));
+                }
+                if let Some(codename) = &self.codename {
+                    tracing::warn!(
+                        run_id,
+                        workflow = %self.name,
+                        codename,
+                        "a workflow run spec carries a codename; ignored (a workflow run's crew is derived from its run id)"
+                    );
+                }
+                let mut run = WorkflowRun::new(WorkflowRef::Name(self.name.clone()), run_id);
+                run.target = self.target.clone();
+                run.mode = mode;
+                run.inputs = self.inputs.clone();
+                run.plain = true;
+                Ok(RunArgv::Workflow(run))
+            }
+            RunSpecKind::Agent => {
+                let mut run = AgentRun::new(&self.name, run_id);
+                run.target = self.target.clone();
+                run.codename = self.codename.clone();
+                run.mode = mode;
+                run.prompt = self.prompt.clone();
+                run.findings_profile = self.findings_profile;
+                run.engagement_profiles = self.engagement_profiles.clone();
+                run.tmp_clone = self.target.is_some();
+                Ok(RunArgv::Agent(run))
+            }
+        }
+    }
 }
 
 /// `Hello.capabilities` entry: this node's executor passes
@@ -123,6 +189,23 @@ pub const CAP_AGENT_FINDINGS_PROFILE: &str = "agent.findings_profile";
 /// A connector refuses a launch that carries an engagement for a peer that
 /// has not advertised it, rather than let the unit run on the `code` path.
 pub const CAP_AGENT_ENGAGEMENT_PROFILE: &str = "agent.engagement_profile";
+
+/// `Hello.capabilities` / bucket marker / host feature entry: this executor
+/// puts [`RunSpec::codename`] (HTTP: the agent-run body's `codename`) on its
+/// `rupu run` as `--codename`. Best-effort, unlike the profiles: a connector
+/// whose peer lacks it launches anyway and logs the dropped codename.
+pub const CAP_RUN_CODENAME: &str = rupu_runtime::argv::FEATURE_SPEC_CODENAME;
+
+/// Host feature: this build's `rupu run` takes `--codename`. An SSH
+/// coordinator passes a codename as `RUPU_CODENAME` to a remote whose `rupu
+/// __features` does not list it.
+pub const CAP_RUN_CODENAME_FLAG: &str = rupu_runtime::argv::FEATURE_CODENAME_FLAG;
+
+/// HTTP `/api/host/info` `features` entry: `POST /api/agents/:name/run`
+/// runs under the body's `run_id` instead of minting one. A coordinator
+/// relies on its pre-minted id for such a host only; an older one mints and
+/// returns its own, which the coordinator reads back.
+pub const CAP_RUN_SUPPLIED_RUN_ID: &str = "run.supplied_run_id";
 
 /// `Welcome.capabilities` entry: this CP mirrors [`ArtifactFile::Coverage`].
 pub const CAP_MIRROR_COVERAGE: &str = "mirror.coverage";
@@ -157,6 +240,7 @@ pub fn node_capabilities() -> Vec<String> {
         CAP_AGENT_FINDINGS_PROFILE.to_string(),
         CAP_AGENT_ENGAGEMENT_PROFILE.to_string(),
         CAP_FINDINGS_ARTIFACT_PULL.to_string(),
+        CAP_RUN_CODENAME.to_string(),
     ]
 }
 
@@ -186,6 +270,9 @@ pub fn host_features() -> Vec<String> {
         CAP_RUN_COVERAGE_STREAM.to_string(),
         CAP_FINDINGS_ARTIFACT_BLOB.to_string(),
         CAP_RUN_LIST.to_string(),
+        CAP_RUN_CODENAME.to_string(),
+        CAP_RUN_CODENAME_FLAG.to_string(),
+        CAP_RUN_SUPPLIED_RUN_ID.to_string(),
     ]
 }
 
@@ -223,6 +310,7 @@ pub fn bucket_worker_capabilities() -> Vec<String> {
     vec![
         CAP_AGENT_FINDINGS_PROFILE.to_string(),
         CAP_AGENT_ENGAGEMENT_PROFILE.to_string(),
+        CAP_RUN_CODENAME.to_string(),
     ]
 }
 
@@ -272,6 +360,7 @@ mod tests {
                 target: None,
                 findings_profile: None,
                 engagement_profiles: Vec::new(),
+                codename: None,
             },
         };
 
@@ -486,6 +575,7 @@ mod tests {
             vec![
                 CAP_AGENT_FINDINGS_PROFILE.to_string(),
                 CAP_AGENT_ENGAGEMENT_PROFILE.to_string(),
+                CAP_RUN_CODENAME.to_string(),
             ]
         );
         assert!(!bucket_worker_capabilities()
@@ -508,6 +598,94 @@ mod tests {
     }
 
     #[test]
+    fn every_executor_surface_advertises_taking_a_codename() {
+        for (surface, caps) in [
+            ("tunnel node", node_capabilities()),
+            ("host features", host_features()),
+            ("bucket worker", bucket_worker_capabilities()),
+        ] {
+            assert!(
+                caps.iter().any(|c| c == CAP_RUN_CODENAME),
+                "{surface}: {caps:?}"
+            );
+        }
+        // The SSH (`rupu __features`) and HTTP-only features.
+        for cap in [CAP_RUN_CODENAME_FLAG, CAP_RUN_SUPPLIED_RUN_ID] {
+            assert!(host_features().iter().any(|c| c == cap), "{cap}");
+        }
+    }
+
+    fn agent_spec() -> RunSpec {
+        RunSpec {
+            kind: RunSpecKind::Agent,
+            name: "recon".into(),
+            inputs: BTreeMap::new(),
+            prompt: Some("-scan".into()),
+            mode: Some("bypass".into()),
+            target: Some("github:o/r".into()),
+            findings_profile: Some(rupu_coverage::FindingProfile::Summary),
+            engagement_profiles: vec!["network".into()],
+            codename: Some("cobalt-harbor/heron#412".into()),
+        }
+    }
+
+    #[test]
+    fn run_spec_codename_is_absent_on_the_wire_when_none_and_old_specs_parse() {
+        let mut spec = agent_spec();
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(
+            json.contains(r#""codename":"cobalt-harbor/heron#412""#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<RunSpec>(&json).unwrap(), spec);
+        spec.codename = None;
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(!json.contains("codename"), "{json}");
+        let old = r#"{"kind":"agent","name":"recon","prompt":null,"mode":null,"target":null}"#;
+        assert_eq!(serde_json::from_str::<RunSpec>(old).unwrap().codename, None);
+    }
+
+    #[test]
+    fn an_agent_spec_becomes_its_rupu_run_with_the_codename() {
+        use rupu_runtime::argv::{RunArgv, WorkflowRef};
+        let RunArgv::Agent(run) = agent_spec().run_argv("run_Z").unwrap() else {
+            panic!("an agent spec is a `rupu run`");
+        };
+        assert_eq!(run.run_id, "run_Z");
+        assert_eq!(run.codename.as_deref(), Some("cobalt-harbor/heron#412"));
+        assert_eq!(run.mode, Some(rupu_tools::PermissionMode::Bypass));
+        assert_eq!(run.prompt.as_deref(), Some("-scan"));
+        assert_eq!(
+            run.findings_profile,
+            Some(rupu_coverage::FindingProfile::Summary)
+        );
+        assert_eq!(run.engagement_profiles, ["network"]);
+        assert!(run.tmp_clone, "a targeted placed run clones into a tmpdir");
+
+        let mut wf = agent_spec();
+        wf.kind = RunSpecKind::Workflow;
+        assert!(wf
+            .run_argv("run_Z")
+            .unwrap_err()
+            .contains("findings_profile"));
+        wf.findings_profile = None;
+        assert!(wf
+            .run_argv("run_Z")
+            .unwrap_err()
+            .contains("engagement_profiles"));
+        wf.engagement_profiles.clear();
+        let RunArgv::Workflow(run) = wf.run_argv("run_Z").unwrap() else {
+            panic!("a workflow spec is a `rupu workflow run`");
+        };
+        assert_eq!(run.workflow, WorkflowRef::Name("recon".into()));
+        assert!(run.plain);
+
+        let mut bad = agent_spec();
+        bad.mode = Some("yolo".into());
+        assert!(bad.run_argv("run_Z").unwrap_err().contains("yolo"));
+    }
+
+    #[test]
     fn run_spec_engagement_profiles_are_absent_on_the_wire_when_empty() {
         let mut spec = RunSpec {
             kind: RunSpecKind::Agent,
@@ -518,6 +696,7 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            codename: None,
         };
         let json = serde_json::to_string(&spec).unwrap();
         assert!(!json.contains("engagement_profiles"), "{json}");

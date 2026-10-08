@@ -13,6 +13,7 @@ use std::task::{Context, Poll};
 use futures_util::stream::Stream;
 use futures_util::StreamExt as _;
 use rupu_orchestrator::runs::RunStore;
+use rupu_runtime::argv::{FeatureSet, RunArgv, WorkflowControl};
 use ulid::Ulid;
 
 use crate::{
@@ -25,8 +26,8 @@ use crate::{
     launcher::LaunchRequest,
     node::{
         protocol::{
-            ArtifactFile, RunSpec, RunSpecKind, CAP_RUN_LIST, CAP_WORKFLOW_RESUME_IF_UNFINISHED,
-            FEATURES_SUBCOMMAND,
+            ArtifactFile, RunSpec, RunSpecKind, CAP_RUN_CODENAME_FLAG, CAP_RUN_LIST,
+            CAP_WORKFLOW_RESUME_IF_UNFINISHED, FEATURES_SUBCOMMAND,
         },
         NodeMirror,
     },
@@ -36,21 +37,7 @@ use crate::{
 
 // ── Pure builder functions ────────────────────────────────────────────────────
 
-/// POSIX single-quote escaping: wrap in single quotes, replacing each embedded
-/// `'` with `'\''`.
-pub(crate) fn shell_escape(arg: &str) -> String {
-    let mut out = String::with_capacity(arg.len() + 2);
-    out.push('\'');
-    for ch in arg.chars() {
-        if ch == '\'' {
-            out.push_str(r"'\''");
-        } else {
-            out.push(ch);
-        }
-    }
-    out.push('\'');
-    out
-}
+pub(crate) use rupu_runtime::argv::shell_escape;
 
 /// Join an argv into a single shell command string with each token escaped.
 pub(crate) fn build_remote_command(argv: &[String]) -> String {
@@ -60,23 +47,22 @@ pub(crate) fn build_remote_command(argv: &[String]) -> String {
         .join(" ")
 }
 
-/// The `rupu workflow resume` argv [`SshHostConnector::resume_run`] sends.
+/// The `rupu workflow resume` [`SshHostConnector::resume_run`] sends.
 /// `if_unfinished` adds `--if-unfinished`, which only a remote advertising
 /// [`CAP_WORKFLOW_RESUME_IF_UNFINISHED`] accepts. Public so `rupu-cli` can
 /// check its own clap accepts exactly this argv.
 #[doc(hidden)]
-pub fn resume_argv(run_id: &str, if_unfinished: bool) -> Vec<String> {
-    let mut argv = vec![
-        "rupu".to_string(),
-        "workflow".to_string(),
-        "resume".to_string(),
-        run_id.to_string(),
-    ];
-    if if_unfinished {
-        argv.push("--if-unfinished".to_string());
-    }
-    argv
+pub fn resume_argv(run_id: &str, if_unfinished: bool) -> RunArgv {
+    RunArgv::WorkflowControl(WorkflowControl::Resume {
+        run_id: run_id.to_string(),
+        mode: None,
+        if_unfinished,
+    })
 }
+
+/// Printed by a launch ([`SshHostConnector::detach_launch_argv`]) whose
+/// remote predates `--codename`, so the codename went as `RUPU_CODENAME`.
+const LAUNCH_CODENAME_ENV: &str = "rupu-launch: codename-env";
 
 /// Printed by [`resume_command`] when it dispatched `--if-unfinished`.
 const RESUME_GUARDED: &str = "rupu-resume: if-unfinished";
@@ -113,7 +99,7 @@ fn resume_command(run_id: &str) -> String {
     let probe = build_remote_command(&["rupu".to_string(), FEATURES_SUBCOMMAND.to_string()]);
     let feature = shell_escape(&format!("\"{CAP_WORKFLOW_RESUME_IF_UNFINISHED}\""));
     let resume = |if_unfinished| {
-        SshHostConnector::detach(&build_remote_command(&resume_argv(run_id, if_unfinished)))
+        SshHostConnector::detach(&resume_argv(run_id, if_unfinished).to_shell("rupu"))
     };
     format!(
         "if {probe} 2>/dev/null | grep -qF {feature}; then echo {}; {}; else echo {}; {}; fi",
@@ -1810,71 +1796,6 @@ impl SshHostConnector {
         }
     }
 
-    /// Build the remote argv for a workflow run.
-    fn workflow_argv(req: &LaunchRequest, run_id: &str) -> Vec<String> {
-        let mut a = vec![
-            "rupu".into(),
-            "workflow".into(),
-            "run".into(),
-            req.workflow.clone(),
-        ];
-        if let Some(t) = &req.target {
-            a.push(t.clone());
-        }
-        a.push("--run-id".into());
-        a.push(run_id.to_string());
-        a.push("--plain".into());
-        for (k, v) in &req.inputs {
-            a.push("--input".into());
-            a.push(format!("{k}={v}"));
-        }
-        if let Some(m) = &req.mode {
-            a.push("--mode".into());
-            a.push(m.clone());
-        }
-        a
-    }
-
-    /// Build the remote argv for an agent run.
-    fn agent_argv(req: &AgentLaunchRequest, run_id: &str) -> Vec<String> {
-        let mut a: Vec<String> = Vec::new();
-        if let Some(c) = &req.codename {
-            a.push("env".into());
-            a.push(format!("RUPU_CODENAME={c}"));
-        }
-        a.extend(["rupu".to_string(), "run".into(), req.agent.clone()]);
-        if let Some(t) = &req.target {
-            a.push(t.clone());
-        }
-        a.push("--run-id".into());
-        a.push(run_id.to_string());
-        if let Some(m) = &req.mode {
-            a.push("--mode".into());
-            a.push(m.clone());
-        }
-        // An older remote rupu rejects the unknown flag (clap) and the run
-        // fails with that in its launch log — refused, never silently run
-        // under the agent's own profile.
-        if let Some(f) = req.findings_profile {
-            a.push("--findings-profile".into());
-            a.push(f.as_str().into());
-        }
-        // Same for an engagement: an older remote's clap rejects the flag,
-        // never runs the unit on the `code` path.
-        for id in &req.engagement_profiles {
-            a.push("--engagement-profile".into());
-            a.push(id.clone());
-        }
-        if let Some(p) = &req.prompt {
-            a.push("--prompt".into());
-            a.push(p.clone());
-        }
-        if req.target.is_some() {
-            a.push("--tmp".into());
-        }
-        a
-    }
-
     /// The CP global dir, derived exactly as `NodeMirror::transcript_mirror_path`
     /// derives it: the run store root is `<global>/runs`.
     fn global_dir(&self) -> PathBuf {
@@ -1977,6 +1898,46 @@ impl SshHostConnector {
         run_id: &str,
         working_dir: Option<&str>,
     ) -> Result<String, HostConnectorError> {
+        Self::detach_launch_with(run_id, working_dir, |redirect| {
+            detach_fragment(remote_cmd, redirect)
+        })
+    }
+
+    /// [`Self::detach_launch`] for a typed launch: the command is `argv`
+    /// rendered for `rupu` ([`RunArgv::to_shell`]). When a remote predating
+    /// `--codename` would need a different command line (the codename as
+    /// `RUPU_CODENAME`, [`RunArgv::for_peer`]), the remote picks between the
+    /// two by its own `rupu __features` in the same ssh session — the same
+    /// one-command pattern as [`resume_command`] — and the legacy branch
+    /// prints [`LAUNCH_CODENAME_ENV`] so the launch can say which ran.
+    fn detach_launch_argv(
+        argv: &RunArgv,
+        run_id: &str,
+        working_dir: Option<&str>,
+    ) -> Result<String, HostConnectorError> {
+        let current = argv.to_shell("rupu");
+        let (legacy, _) = argv.for_peer(&FeatureSet::shell_peer(Vec::<String>::new()));
+        let legacy = legacy.to_shell("rupu");
+        if legacy == current {
+            return Self::detach_launch(&current, run_id, working_dir);
+        }
+        let probe = build_remote_command(&["rupu".to_string(), FEATURES_SUBCOMMAND.to_string()]);
+        let feature = shell_escape(&format!("\"{CAP_RUN_CODENAME_FLAG}\""));
+        Self::detach_launch_with(run_id, working_dir, |redirect| {
+            format!(
+                "if {probe} 2>/dev/null | grep -qF {feature}; then {}; else echo {}; {}; fi",
+                detach_fragment(&current, redirect),
+                shell_escape(LAUNCH_CODENAME_ENV),
+                detach_fragment(&legacy, redirect),
+            )
+        })
+    }
+
+    fn detach_launch_with(
+        run_id: &str,
+        working_dir: Option<&str>,
+        fragment: impl FnOnce(&str) -> String,
+    ) -> Result<String, HostConnectorError> {
         if !is_safe_run_id(run_id) {
             return Err(HostConnectorError::Invalid(format!(
                 "refusing to launch: run id {run_id:?} is not [A-Za-z0-9_]"
@@ -1988,10 +1949,7 @@ impl SshHostConnector {
         if let Some(wd) = working_dir {
             cmd.push_str(&format!("cd {} && ", shell_escape(wd)));
         }
-        cmd.push_str(&format!(
-            "({})",
-            detach_fragment(remote_cmd, &format!("2>>{log}"))
-        ));
+        cmd.push_str(&format!("({})", fragment(&format!("2>>{log}"))));
         Ok(cmd)
     }
 
@@ -2662,14 +2620,17 @@ impl HostConnector for SshHostConnector {
             target: req.target.clone(),
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            codename: None,
         };
 
         // Build the remote command BEFORE creating the mirror run: a refused
         // build (see `detach_launch`) must not leave a Running mirror record
         // with no executor behind it.
-        let argv = Self::workflow_argv(&req, &run_id);
-        let remote_cmd = build_remote_command(&argv);
-        let detached = Self::detach_launch(&remote_cmd, &run_id, req.working_dir.as_deref())?;
+        let argv = RunArgv::Workflow(
+            req.workflow_run(&run_id)
+                .map_err(HostConnectorError::Invalid)?,
+        );
+        let detached = Self::detach_launch_argv(&argv, &run_id, req.working_dir.as_deref())?;
 
         self.mirror
             .create_run(&run_id, &self.host_id, &spec)
@@ -2702,20 +2663,14 @@ impl HostConnector for SshHostConnector {
         // A coordinator dispatching a placed unit already minted this run's
         // id (see `UnitDispatch::run_id`) so it can know the child run's
         // mirrored transcript path before dispatch — validate it BEFORE
-        // touching `build_remote_command`/`detach_launch` (nothing shells
-        // for a bad id) and before `create_run` (no mirror record left
-        // behind). `None` ⇒ this connector mints one, as before.
-        let run_id = match req.run_id.as_deref() {
-            Some(id) => {
-                if !crate::host::connector::valid_run_id(id) {
-                    return Err(HostConnectorError::Invalid(format!(
-                        "supplied run id {id:?} is not a valid run id"
-                    )));
-                }
-                id.to_string()
-            }
-            None => format!("run_{}", Ulid::new()),
-        };
+        // touching `detach_launch_argv` (nothing shells for a bad id) and
+        // before `create_run` (no mirror record left behind). `None` ⇒ this
+        // connector mints one, as before.
+        let run_id = req.run_id_or_mint().map_err(HostConnectorError::Invalid)?;
+        let argv = RunArgv::Agent(
+            req.agent_run(&run_id)
+                .map_err(HostConnectorError::Invalid)?,
+        );
 
         let spec = RunSpec {
             kind: RunSpecKind::Agent,
@@ -2726,13 +2681,12 @@ impl HostConnector for SshHostConnector {
             target: req.target.clone(),
             findings_profile: req.findings_profile,
             engagement_profiles: req.engagement_profiles.clone(),
+            codename: None,
         };
 
         // Build the remote command BEFORE creating the mirror run — see
         // `launch_run`.
-        let argv = Self::agent_argv(&req, &run_id);
-        let remote_cmd = build_remote_command(&argv);
-        let detached = Self::detach_launch(&remote_cmd, &run_id, req.working_dir.as_deref())?;
+        let detached = Self::detach_launch_argv(&argv, &run_id, req.working_dir.as_deref())?;
 
         self.mirror
             .create_run(&run_id, &self.host_id, &spec)
@@ -2751,6 +2705,13 @@ impl HostConnector for SshHostConnector {
         if !out.success {
             let _ = self.mirror.finish(&run_id, &self.host_id, "failed").await;
             return Err(HostConnectorError::Unreachable(out.stderr));
+        }
+        if out.stdout.lines().any(|l| l.trim() == LAUNCH_CODENAME_ENV) {
+            tracing::info!(
+                host = %self.host_id,
+                run_id = %run_id,
+                "the remote rupu predates --codename; the codename was passed as RUPU_CODENAME"
+            );
         }
 
         self.spawn_tail_pump(run_id.clone());
@@ -3252,9 +3213,7 @@ impl HostConnector for SshHostConnector {
 
     /// SSH's `launch_agent` passes `AgentLaunchRequest.run_id` through to the
     /// remote as `rupu run --run-id <id>`, so a coordinator-minted id is the
-    /// id the run actually executes under. The tunnel and bucket connectors
-    /// mint their own, which is why this is separate from
-    /// `serves_runs_from_local_mirror`.
+    /// id the run actually executes under.
     fn honours_supplied_run_id(&self) -> bool {
         true
     }
@@ -3755,30 +3714,85 @@ impl HostConnector for SshHostConnector {
 
 #[cfg(test)]
 mod tests {
+    /// A codename reaches the remote `rupu run` as `--codename` when its
+    /// `rupu __features` lists `run.codename_flag`, else as `RUPU_CODENAME`
+    /// (W6 §3.3) — decided by the remote in the one launch command, run here
+    /// through a real shell against two fake remotes.
     #[test]
-    fn agent_argv_prefixes_codename_env() {
-        let req = crate::agent_launcher::AgentLaunchRequest {
-            agent: "triage".into(),
-            prompt: None,
-            mode: None,
-            target: None,
-            working_dir: None,
-            run_id: None,
-            findings_profile: None,
-            engagement_profiles: Vec::new(),
-            codename: Some("cobalt-harbor/heron#412".into()),
-        };
-        let argv = SshHostConnector::agent_argv(&req, "run_1");
-        assert_eq!(
-            &argv[..3],
-            &[
-                "env".to_string(),
-                "RUPU_CODENAME=cobalt-harbor/heron#412".into(),
-                "rupu".into()
-            ]
+    fn a_launch_passes_the_codename_as_the_remote_can_take_it() {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+        let mut run = rupu_runtime::argv::AgentRun::new("triage", "run_01CODENAME");
+        run.codename = Some("cobalt-harbor/heron#412".into());
+        run.prompt = Some("-go".into());
+        let cmd =
+            SshHostConnector::detach_launch_argv(&RunArgv::Agent(run), "run_01CODENAME", None)
+                .unwrap();
+        for (features, want_flag) in [
+            (r#"echo '{"features":["run.codename_flag"]}'"#, true),
+            (r#"echo '{"features":["run.list"]}'"#, false),
+            (
+                "echo \"error: unrecognized subcommand '__features'\" >&2; exit 2",
+                false,
+            ),
+        ] {
+            let bin = tempfile::tempdir().unwrap();
+            let home = tempfile::tempdir().unwrap();
+            let seen = bin.path().join("seen");
+            let rupu = bin.path().join("rupu");
+            std::fs::write(
+                &rupu,
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" = __features ]; then {features}; exit 0; fi\n\
+                     printf '%s|' \"$@\" \"env=${{RUPU_CODENAME:-}}\" > '{s}.tmp'; mv '{s}.tmp' '{s}'\n",
+                    s = seen.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&rupu, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&cmd)
+                .env("HOME", home.path())
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.path().display()))
+                .output()
+                .expect("the launch shell itself must run");
+            assert!(out.status.success(), "{features}: {out:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).contains(LAUNCH_CODENAME_ENV),
+                !want_flag,
+                "{features}: {out:?}"
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !seen.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{features}: never ran"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let got = std::fs::read_to_string(&seen).unwrap();
+            let want = if want_flag {
+                "run|triage|--run-id|run_01CODENAME|--codename|cobalt-harbor/heron#412|--prompt=-go|env=|"
+            } else {
+                "run|triage|--run-id|run_01CODENAME|--prompt=-go|env=cobalt-harbor/heron#412|"
+            };
+            assert_eq!(got, want, "{features}");
+        }
+    }
+
+    /// No codename: one command, no feature probe.
+    #[test]
+    fn a_launch_without_a_codename_does_not_probe_the_remote() {
+        use super::*;
+        let run = rupu_runtime::argv::AgentRun::new("triage", "run_01PLAIN");
+        let cmd = SshHostConnector::detach_launch_argv(&RunArgv::Agent(run), "run_01PLAIN", None)
+            .unwrap();
+        assert!(!cmd.contains(FEATURES_SUBCOMMAND), "{cmd}");
+        assert!(
+            cmd.contains("'rupu' 'run' 'triage' '--run-id' 'run_01PLAIN'"),
+            "{cmd}"
         );
-        assert!(build_remote_command(&argv)
-            .starts_with("'env' 'RUPU_CODENAME=cobalt-harbor/heron#412' 'rupu' 'run'"));
     }
 
     use super::*;
@@ -6254,6 +6268,7 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            codename: None,
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
@@ -7229,6 +7244,7 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            codename: None,
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
@@ -7521,6 +7537,7 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            codename: None,
         };
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -7647,6 +7664,7 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            codename: None,
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
@@ -7718,6 +7736,7 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            codename: None,
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
@@ -7786,6 +7805,7 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            codename: None,
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
@@ -7839,6 +7859,7 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            codename: None,
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
@@ -7892,6 +7913,7 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            codename: None,
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
@@ -8081,6 +8103,7 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            codename: None,
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
@@ -8165,6 +8188,7 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            codename: None,
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
@@ -8255,6 +8279,7 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            codename: None,
         };
         conn.mirror
             .create_run(run_id, &conn.host_id, &spec)
@@ -9103,27 +9128,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn agent_argv_without_a_profile_omits_the_flag() {
-        let req = crate::agent_launcher::AgentLaunchRequest {
-            agent: "sec".into(),
-            prompt: None,
-            mode: None,
-            target: None,
-            working_dir: None,
-            run_id: None,
-            findings_profile: None,
-            engagement_profiles: Vec::new(),
-            codename: None,
-        };
-        let argv = SshHostConnector::agent_argv(&req, "run_X");
-        assert!(!argv.iter().any(|a| a == "--findings-profile"), "{argv:?}");
-        assert!(
-            !argv.iter().any(|a| a == "--engagement-profile"),
-            "{argv:?}"
-        );
-    }
-
     #[tokio::test]
     async fn launch_agent_rejects_a_malformed_supplied_run_id_without_dispatching() {
         let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
@@ -9416,6 +9420,7 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            codename: None,
         }
     }
 
@@ -9429,6 +9434,7 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            codename: None,
         }
     }
 

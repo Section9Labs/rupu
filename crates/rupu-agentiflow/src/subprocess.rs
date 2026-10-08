@@ -32,8 +32,8 @@
 //!
 //! # Process groups
 //!
-//! Each unit is spawned as its own process-group leader (`process_group(0)`),
-//! so its pid is its pgid. `rupu run`'s SIGTERM handler exits at once without
+//! Each unit is spawned as its own process-group leader
+//! (`rupu_runtime::spawn::spawn_detached`), so its pid is its pgid. `rupu run`'s SIGTERM handler exits at once without
 //! waiting for the run, so the bash tool's own cleanup never fires; signalling
 //! only the unit's pid would leave an in-flight bash grandchild (a long scan)
 //! re-parented to init. Termination therefore signals the whole group.
@@ -41,7 +41,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ExitStatus};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -50,101 +50,62 @@ use crate::unit::{
     Spawned, UnitError, UnitId, UnitKind, UnitLauncher, UnitOutcome, UnitSpec, UnitStatus,
 };
 use rupu_orchestrator::{RunStatus, RunStore, RunStoreError};
+use rupu_runtime::argv::{AgentRun, FlowAttach, RunArgv, WorkflowRef, WorkflowRun};
+use rupu_runtime::spawn::{spawn_detached, SpawnSpec};
+use rupu_tools::PermissionMode;
 
 /// How long `Drop` waits for SIGTERMed units to exit before it SIGKILLs them.
 const DROP_GRACE: Duration = Duration::from_millis(1500);
 
-/// Builds the argv (everything after the executable) for one unit.
+/// Builds the `rupu` command line for one unit.
 ///
 /// Arguments: the unit's spec, the pre-minted run id, the agentiflow run dir.
-/// The default is the real `rupu run …` argv ([`rupu_run_argv`]); tests swap it
-/// to assert the argv or to run a trivial command (`/bin/sh -c 'sleep 0.3'`).
-pub type ArgvBuilder = Box<dyn Fn(&UnitSpec, &str, &Path) -> Vec<OsString> + Send + Sync>;
+/// The default is the real one ([`unit_argv`]); tests swap it to assert the
+/// argv or to stage files for the unit under its id.
+pub type ArgvBuilder = Box<dyn Fn(&UnitSpec, &str, &Path) -> RunArgv + Send + Sync>;
 
-/// The real argv for one unit, by [`UnitSpec::kind`].
-///
-/// An [`UnitKind::Agent`] unit:
-/// `run <agent> --run-id <id> --mode bypass --prompt=<p>
-/// [--engagement-profile a,b] --fleet-run-dir <run_dir> --fleet-participant <p>`.
-///
-/// A [`UnitKind::Workflow`] unit ([`rupu_workflow_argv`]):
-/// `workflow run <name> --run-id <id> --mode bypass --plain [--input k=v]…
-/// [--engagement-profile a,b] --fleet-run-dir <run_dir> --fleet-participant <p>`,
-/// where `<name>` is `spec.agent` (the "thing to run") and there is no
-/// `--prompt` (a workflow takes `--input`s instead).
-///
-/// A generated workflow unit (`spec.workflow_file` is `Some`) instead runs
-/// `workflow run --file <path> --run-id <id> …` with no positional name.
+/// The real command line for one unit, by [`UnitSpec::kind`]: `rupu run
+/// <agent> --mode bypass --prompt=<p>` for an [`UnitKind::Agent`] unit, `rupu
+/// workflow run <name> --mode bypass --plain [--input k=v]…` for a
+/// [`UnitKind::Workflow`] one (`--file <path>` instead of the name for a
+/// generated workflow, `spec.workflow_file`; no prompt — a workflow takes
+/// `--input`s), each under the pre-minted `--run-id`, with the unit's
+/// engagement profiles (none: the default `code` path) and its agentiflow
+/// binding (`--fleet-run-dir` / `--fleet-participant`).
 ///
 /// `--mode bypass` because a unit has no tty to answer an approval prompt.
-/// The prompt is ONE `--prompt=<p>` argument, not `--prompt <p>`: clap reads a
-/// separate value that starts with `-` (`"- enumerate hosts"`, `"--foo"`) as a
-/// flag and rejects it, whereas the `=` form takes the value verbatim.
-/// `--engagement-profile` is omitted for an empty set so the unit takes the
-/// default `code` path; a non-empty set is comma-joined (the flag's
-/// delimiter), never dropped.
-pub fn rupu_run_argv(spec: &UnitSpec, run_id: &str, run_dir: &Path) -> Vec<OsString> {
+pub fn unit_argv(spec: &UnitSpec, run_id: &str, run_dir: &Path) -> RunArgv {
+    let flow = Some(FlowAttach {
+        run_dir: run_dir.to_path_buf(),
+        participant: spec.participant.clone(),
+    });
     match spec.kind {
-        UnitKind::Agent => rupu_agent_argv(spec, run_id, run_dir),
-        UnitKind::Workflow => rupu_workflow_argv(spec, run_id, run_dir),
+        UnitKind::Agent => {
+            let mut run = AgentRun::new(&spec.agent, run_id);
+            run.mode = Some(PermissionMode::Bypass);
+            run.prompt = Some(spec.prompt.clone());
+            run.engagement_profiles = spec.engagement.clone();
+            run.flow = flow;
+            RunArgv::Agent(run)
+        }
+        UnitKind::Workflow => {
+            // A generated workflow unit runs a materialized file; every other
+            // workflow unit runs a catalog id (`spec.agent`, the "thing to
+            // run").
+            let workflow = match &spec.workflow_file {
+                Some(file) => WorkflowRef::File(file.clone()),
+                None => WorkflowRef::Name(spec.agent.clone()),
+            };
+            let mut run = WorkflowRun::new(workflow, run_id);
+            run.mode = Some(PermissionMode::Bypass);
+            // Detached with no tty: the plain printer, never the live view.
+            run.plain = true;
+            run.inputs = spec.inputs.iter().cloned().collect();
+            run.engagement_profiles = spec.engagement.clone();
+            run.flow = flow;
+            RunArgv::Workflow(run)
+        }
     }
-}
-
-/// The agent unit's argv (see [`rupu_run_argv`]).
-fn rupu_agent_argv(spec: &UnitSpec, run_id: &str, run_dir: &Path) -> Vec<OsString> {
-    let mut argv: Vec<OsString> = vec![
-        "run".into(),
-        spec.agent.clone().into(),
-        "--run-id".into(),
-        run_id.into(),
-        "--mode".into(),
-        "bypass".into(),
-        format!("--prompt={}", spec.prompt).into(),
-    ];
-    push_unit_tail(&mut argv, spec, run_dir);
-    argv
-}
-
-/// The workflow unit's argv (see [`rupu_run_argv`]). `--plain` because the unit
-/// is detached with no tty: the plain printer, never the live graph view.
-pub fn rupu_workflow_argv(spec: &UnitSpec, run_id: &str, run_dir: &Path) -> Vec<OsString> {
-    // A generated workflow unit runs a materialized file (`--file <path>`, no
-    // positional name); every other workflow unit runs a catalog id.
-    let mut argv: Vec<OsString> = match &spec.workflow_file {
-        Some(file) => vec![
-            "workflow".into(),
-            "run".into(),
-            "--file".into(),
-            file.as_os_str().to_owned(),
-        ],
-        None => vec!["workflow".into(), "run".into(), spec.agent.clone().into()],
-    };
-    argv.extend([
-        "--run-id".into(),
-        run_id.into(),
-        "--mode".into(),
-        "bypass".into(),
-        "--plain".into(),
-    ]);
-    for (k, v) in &spec.inputs {
-        argv.push("--input".into());
-        argv.push(format!("{k}={v}").into());
-    }
-    push_unit_tail(&mut argv, spec, run_dir);
-    argv
-}
-
-/// The flags every unit kind ends with: the engagement profile (when any) and
-/// the fleet binding.
-fn push_unit_tail(argv: &mut Vec<OsString>, spec: &UnitSpec, run_dir: &Path) {
-    if !spec.engagement.is_empty() {
-        argv.push("--engagement-profile".into());
-        argv.push(spec.engagement.join(",").into());
-    }
-    argv.push("--fleet-run-dir".into());
-    argv.push(run_dir.as_os_str().to_owned());
-    argv.push("--fleet-participant".into());
-    argv.push(spec.participant.clone().into());
 }
 
 /// One tracked unit.
@@ -165,6 +126,8 @@ struct Live {
 /// Launches each unit as a detached `rupu run` subprocess. See the module docs.
 pub struct SubprocessUnitLauncher {
     exe: PathBuf,
+    /// Arguments before the unit's argv ([`SpawnSpec::pre_args`]).
+    pre_args: Vec<OsString>,
     global: PathBuf,
     workspace: Option<PathBuf>,
     argv: ArgvBuilder,
@@ -177,9 +140,10 @@ impl SubprocessUnitLauncher {
     pub fn new(exe: impl Into<PathBuf>, global: impl Into<PathBuf>) -> Self {
         Self {
             exe: exe.into(),
+            pre_args: Vec::new(),
             global: global.into(),
             workspace: None,
-            argv: Box::new(rupu_run_argv),
+            argv: Box::new(unit_argv),
             live: Mutex::new(HashMap::new()),
         }
     }
@@ -193,9 +157,17 @@ impl SubprocessUnitLauncher {
     /// Replace the argv builder (the test seam; see [`ArgvBuilder`]).
     pub fn with_argv(
         mut self,
-        f: impl Fn(&UnitSpec, &str, &Path) -> Vec<OsString> + Send + Sync + 'static,
+        f: impl Fn(&UnitSpec, &str, &Path) -> RunArgv + Send + Sync + 'static,
     ) -> Self {
         self.argv = Box::new(f);
+        self
+    }
+
+    /// Put `args` before every unit's argv: the test seam that runs the
+    /// executable `/bin/sh` as `sh -c <script> sh <unit argv…>`, where the
+    /// script sees the unit's argv as `"$@"`.
+    pub fn with_pre_args<S: Into<OsString>>(mut self, args: impl IntoIterator<Item = S>) -> Self {
+        self.pre_args = args.into_iter().map(Into::into).collect();
         self
     }
 
@@ -367,25 +339,21 @@ impl SubprocessUnitLauncher {
 impl UnitLauncher for SubprocessUnitLauncher {
     fn spawn(&self, spec: &UnitSpec, run_dir: &Path) -> Result<Spawned, UnitError> {
         let id = format!("run_{}", ulid::Ulid::new());
-        let mut cmd = Command::new(&self.exe);
-        cmd.args((self.argv)(spec, &id, run_dir))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            // The unit must write its transcript where `poll` looks for it.
-            .env("RUPU_HOME", &self.global);
-        if let Some(workspace) = &self.workspace {
-            cmd.current_dir(workspace);
-        }
-        // Its own process group, so a Ctrl-C at the coordinator's terminal
-        // does not signal the unit directly: the supervisor decides its fate.
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
-        let child = cmd
-            .spawn()
+        let mut launch = SpawnSpec::new(&self.exe, (self.argv)(spec, &id, run_dir));
+        launch.pre_args = self.pre_args.clone();
+        // The unit must write its transcript where `poll` looks for it.
+        launch.env = vec![("RUPU_HOME".into(), self.global.clone().into())];
+        launch.cwd = self.workspace.clone();
+        // `try_wait` on the retained child is the liveness signal. The unit
+        // leads its own process group (`spawn_detached`), so a Ctrl-C at the
+        // coordinator's terminal does not signal it directly: the supervisor
+        // decides its fate.
+        launch.keep_child = true;
+        let spawned = spawn_detached(launch)
             .map_err(|e| UnitError::Spawn(format!("{}: {e}", self.exe.display())))?;
+        let child = spawned
+            .child
+            .ok_or_else(|| UnitError::Spawn("the spawned unit's child was not kept".into()))?;
         let pid = child.id();
         self.lock().insert(
             id.clone(),
@@ -396,8 +364,8 @@ impl UnitLauncher for SubprocessUnitLauncher {
                 done: None,
             },
         );
-        // `process_group(0)` made the child its own group leader, so its pid is
-        // the pgid the supervisor persists for out-of-process group signalling.
+        // The child leads its own group, so its pid is the pgid the supervisor
+        // persists for out-of-process group signalling.
         Ok(Spawned {
             id: UnitId(id),
             pgid: Some(pid),
@@ -452,7 +420,7 @@ impl UnitLauncher for SubprocessUnitLauncher {
         // an unrelated process, so only a child `try_wait` still reports live
         // is signalled. A live (or unreaped) leader keeps its pid, and so its
         // pgid, reserved: the group below cannot be a recycled one. The pid IS
-        // the pgid (`process_group(0)`), and signalling the group also reaches
+        // the pgid (it leads its own group), and signalling the group also reaches
         // the unit's grandchildren, which a pid-only SIGTERM would orphan.
         if matches!(unit.child.try_wait(), Ok(None)) {
             if unit.kind == UnitKind::Workflow {
@@ -540,8 +508,9 @@ mod tests {
         }
     }
 
-    fn strs(argv: &[OsString]) -> Vec<String> {
-        argv.iter()
+    fn strs(argv: &RunArgv) -> Vec<String> {
+        argv.to_args()
+            .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
     }
@@ -553,7 +522,7 @@ mod tests {
 
     #[test]
     fn default_argv_is_the_real_rupu_run_invocation() {
-        let argv = strs(&rupu_run_argv(
+        let argv = strs(&unit_argv(
             &spec(&["network", "web"]),
             "run_01ABC",
             Path::new("/g/agentiflows/af_1"),
@@ -566,10 +535,12 @@ mod tests {
             argv.iter().any(|a| a == "--prompt=scan the host"),
             "the prompt is one --prompt=<p> argument: {argv:?}"
         );
-        assert_eq!(
-            value_after(&argv, "--engagement-profile"),
-            Some("network,web")
-        );
+        let engagement: Vec<&str> = argv
+            .windows(2)
+            .filter(|w| w[0] == "--engagement-profile")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(engagement, ["network", "web"], "one flag per id");
         assert_eq!(
             value_after(&argv, "--fleet-run-dir"),
             Some("/g/agentiflows/af_1")
@@ -578,9 +549,9 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_unit_argv_is_exactly_the_3b2_shape() {
+    fn an_agent_unit_argv_is_the_canonical_rupu_run() {
         // Regression guard: the workflow branch must not move the agent argv.
-        let argv = strs(&rupu_run_argv(
+        let argv = strs(&unit_argv(
             &spec(&["network", "web"]),
             "run_01ABC",
             Path::new("/rd"),
@@ -594,9 +565,11 @@ mod tests {
                 "run_01ABC",
                 "--mode",
                 "bypass",
-                "--prompt=scan the host",
                 "--engagement-profile",
-                "network,web",
+                "network",
+                "--engagement-profile",
+                "web",
+                "--prompt=scan the host",
                 "--fleet-run-dir",
                 "/rd",
                 "--fleet-participant",
@@ -607,11 +580,7 @@ mod tests {
 
     #[test]
     fn a_workflow_unit_argv_is_workflow_run_with_inputs_and_no_prompt() {
-        let argv = strs(&rupu_run_argv(
-            &workflow_spec(),
-            "run_01ABC",
-            Path::new("/rd"),
-        ));
+        let argv = strs(&unit_argv(&workflow_spec(), "run_01ABC", Path::new("/rd")));
         assert_eq!(
             argv,
             [
@@ -650,7 +619,7 @@ mod tests {
             inputs: vec![("k".into(), "v".into())],
             workflow_file: Some(PathBuf::from("/runs/x/generated/gen-abc.yaml")),
         };
-        let argv = strs(&rupu_workflow_argv(&spec, "run-1", Path::new("/runs/x")));
+        let argv = strs(&unit_argv(&spec, "run-1", Path::new("/runs/x")));
         assert_eq!(
             argv,
             [
@@ -696,7 +665,7 @@ mod tests {
             ("target".into(), "x".into()),
             ("depth".into(), "a=b c".into()),
         ];
-        let argv = strs(&rupu_run_argv(&s, "run_1", Path::new("/rd")));
+        let argv = strs(&unit_argv(&s, "run_1", Path::new("/rd")));
         let inputs: Vec<&str> = argv
             .iter()
             .enumerate()
@@ -705,13 +674,13 @@ mod tests {
             .collect();
         assert_eq!(
             inputs,
-            ["target=x", "depth=a=b c"],
-            "in order, value kept whole"
+            ["depth=a=b c", "target=x"],
+            "in key order, value kept whole"
         );
         assert!(!argv.iter().any(|a| a == "--engagement-profile"));
 
         s.inputs.clear();
-        let argv = strs(&rupu_run_argv(&s, "run_1", Path::new("/rd")));
+        let argv = strs(&unit_argv(&s, "run_1", Path::new("/rd")));
         assert!(!argv.iter().any(|a| a == "--input"), "{argv:?}");
     }
 
@@ -722,7 +691,7 @@ mod tests {
         for prompt in ["- enumerate the hosts", "--foo", "-x"] {
             let mut s = spec(&[]);
             s.prompt = prompt.into();
-            let argv = strs(&rupu_run_argv(&s, "run_1", Path::new("/rd")));
+            let argv = strs(&unit_argv(&s, "run_1", Path::new("/rd")));
             let expected = format!("--prompt={prompt}");
             assert!(
                 argv.contains(&expected),
@@ -741,7 +710,7 @@ mod tests {
 
     #[test]
     fn default_argv_omits_engagement_profile_when_the_set_is_empty() {
-        let argv = strs(&rupu_run_argv(&spec(&[]), "run_1", Path::new("/rd")));
+        let argv = strs(&unit_argv(&spec(&[]), "run_1", Path::new("/rd")));
         assert!(
             !argv.iter().any(|a| a == "--engagement-profile"),
             "an empty set must take the default code path: {argv:?}"
@@ -754,12 +723,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let seen: std::sync::Arc<Mutex<Vec<(String, PathBuf)>>> = Default::default();
         let sink = seen.clone();
-        let launcher =
-            SubprocessUnitLauncher::new("/bin/sh", dir.path()).with_argv(move |_, id, run_dir| {
+        let launcher = SubprocessUnitLauncher::new("/bin/sh", dir.path())
+            .with_pre_args(["-c", "true", "sh"])
+            .with_argv(move |spec, id, run_dir| {
                 sink.lock()
                     .unwrap()
                     .push((id.to_string(), run_dir.to_path_buf()));
-                vec!["-c".into(), "true".into()]
+                unit_argv(spec, id, run_dir)
             });
         let id = launcher
             .spawn(&spec(&[]), Path::new("/the/run/dir"))
@@ -793,11 +763,10 @@ mod tests {
         ));
     }
 
-    /// A launcher that runs `/bin/sh -c <script>` instead of `rupu run`.
+    /// A launcher that runs `/bin/sh -c <script> sh <unit argv…>` instead of
+    /// `rupu run`: the script sees the unit's argv as `"$@"`.
     fn sh(global: &Path, script: &str) -> SubprocessUnitLauncher {
-        let script = script.to_string();
-        SubprocessUnitLauncher::new("/bin/sh", global)
-            .with_argv(move |_, _, _| vec!["-c".into(), script.clone().into()])
+        SubprocessUnitLauncher::new("/bin/sh", global).with_pre_args(["-c", script, "sh"])
     }
 
     /// Write a transcript for `id` into `dir` (created if need be).
@@ -1191,17 +1160,21 @@ mod tests {
         let global_dir = global.to_path_buf();
         let stage = global.join("stage");
         let (delay, after) = (delay.to_string(), after.to_string());
-        SubprocessUnitLauncher::new("/bin/sh", global).with_argv(move |_, id, _| {
-            stage_run(&stage, id, status, error, steps);
-            let script = format!(
-                "sleep {delay}; mkdir -p {g}/runs; \
-                 cp -R {s}/runs/{id} {g}/runs/.{id}.tmp && mv {g}/runs/.{id}.tmp {g}/runs/{id}; \
-                 {after}",
-                g = global_dir.display(),
-                s = stage.display(),
-            );
-            vec!["-c".into(), script.into()]
-        })
+        // The script reads the unit's id off its own `--run-id`.
+        let script = format!(
+            "id=$(printf '%s\\n' \"$@\" | sed -n '/^--run-id$/{{n;p;}}'); \
+             sleep {delay}; mkdir -p {g}/runs; \
+             cp -R {s}/runs/$id {g}/runs/.$id.tmp && mv {g}/runs/.$id.tmp {g}/runs/$id; \
+             {after}",
+            g = global_dir.display(),
+            s = stage.display(),
+        );
+        SubprocessUnitLauncher::new("/bin/sh", global)
+            .with_pre_args(["-c".to_string(), script, "sh".to_string()])
+            .with_argv(move |spec, id, run_dir| {
+                stage_run(&stage, id, status, error, steps);
+                unit_argv(spec, id, run_dir)
+            })
     }
 
     #[test]

@@ -888,6 +888,43 @@ struct AgentRunBody {
     /// advertise `agent.engagement_profile` refuses the launch.
     #[serde(default)]
     engagement_profiles: Vec<String>,
+    /// Optional run id to execute under (`run_<…>`), minted by a
+    /// coordinator that needs to know it before the run starts — honoured
+    /// because `/api/host/info` advertises `run.supplied_run_id`. A malformed
+    /// one is a 400. Absent: the launcher mints one.
+    #[serde(default)]
+    run_id: Option<String>,
+    /// Optional codename for the run (`rupu run --codename`), minted by a
+    /// coordinator — honoured because `/api/host/info` advertises
+    /// `run.codename`. A malformed one is a 400.
+    #[serde(default)]
+    codename: Option<String>,
+}
+
+/// A body's `run_id` / `codename`: well-formed or a 400. The run id names a
+/// run-store directory; the codename lands on the child's command line.
+fn parse_supplied_identity(
+    run_id: Option<String>,
+    codename: Option<String>,
+) -> Result<(Option<String>, Option<String>), ApiError> {
+    if let Some(id) = &run_id {
+        if !crate::host::connector::valid_run_id(id) {
+            return Err(ApiError::bad_request(format!(
+                "run_id: {id:?} is not a valid run id"
+            )));
+        }
+    }
+    if let Some(c) = &codename {
+        let parsed = c
+            .parse::<rupu_codename::Codename>()
+            .map_err(|e| ApiError::bad_request(format!("codename: {e}")))?;
+        if parsed.segments.is_empty() {
+            return Err(ApiError::bad_request(format!(
+                "codename: `{c}` names a crew, not a run"
+            )));
+        }
+    }
+    Ok((run_id, codename))
 }
 
 /// Trim an engagement selection; a blank id is a 400, never a silent
@@ -922,14 +959,15 @@ async fn run_agent_with(
 ) -> Result<String, ApiError> {
     let findings_profile = parse_findings_profile(body.findings_profile.as_deref())?;
     let engagement_profiles = parse_engagement_profiles(body.engagement_profiles)?;
+    let (run_id, codename) = parse_supplied_identity(body.run_id, body.codename)?;
     let req = AgentLaunchRequest {
-        codename: None,
+        codename,
         agent: name.to_string(),
         prompt: body.prompt,
         mode: body.mode,
         target: body.target,
         working_dir: body.working_dir,
-        run_id: None,
+        run_id,
         findings_profile,
         engagement_profiles,
     };
@@ -1065,15 +1103,16 @@ async fn run_agent(
         // with no scope fields at all.
         let findings_profile = parse_findings_profile(b.findings_profile.as_deref())?;
         let engagement_profiles = parse_engagement_profiles(b.engagement_profiles)?;
+        let (run_id, codename) = parse_supplied_identity(b.run_id, b.codename)?;
         let conn = crate::api::runs::resolve_host(&s, &host)?;
         let req = AgentLaunchRequest {
-            codename: None,
+            codename,
             agent: name.clone(),
             prompt: b.prompt,
             mode: b.mode,
             target: b.target,
             working_dir: b.working_dir,
-            run_id: None,
+            run_id,
             findings_profile,
             engagement_profiles,
         };
@@ -1316,6 +1355,8 @@ mod tests {
             scope_id: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            run_id: None,
+            codename: None,
         };
         let run_id = run_agent_with("triage", body, mock.clone())
             .await
@@ -1394,6 +1435,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_agent_forwards_a_supplied_run_id_and_codename() {
+        let mock = Arc::new(MockAgent {
+            last: Mutex::new(None),
+        });
+        let body: AgentRunBody = serde_json::from_value(serde_json::json!({
+            "run_id": "run_01COORD",
+            "codename": "cobalt-harbor/heron#412",
+        }))
+        .unwrap();
+        run_agent_with("recon", body, mock.clone())
+            .await
+            .expect("ok");
+        let got = mock.last.lock().unwrap().clone().unwrap();
+        assert_eq!(got.run_id.as_deref(), Some("run_01COORD"));
+        assert_eq!(got.codename.as_deref(), Some("cobalt-harbor/heron#412"));
+    }
+
+    #[tokio::test]
+    async fn run_agent_rejects_a_malformed_run_id_or_codename_before_launching() {
+        for body in [
+            serde_json::json!({ "run_id": "../../etc" }),
+            serde_json::json!({ "codename": "not a codename" }),
+            serde_json::json!({ "codename": "cobalt-harbor" }),
+        ] {
+            let mock = Arc::new(MockAgent {
+                last: Mutex::new(None),
+            });
+            let b: AgentRunBody = serde_json::from_value(body.clone()).unwrap();
+            let err = run_agent_with("recon", b, mock.clone())
+                .await
+                .expect_err("must be refused");
+            assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST, "{body}");
+            assert!(
+                mock.last.lock().unwrap().is_none(),
+                "nothing launched: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn missing_launcher_is_not_available() {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = test_state(&tmp); // agent_launcher: None
@@ -1452,6 +1533,8 @@ mod tests {
             scope_id: Some("ws_a".into()),
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            run_id: None,
+            codename: None,
         };
         let _ = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -1491,6 +1574,8 @@ mod tests {
             scope_id: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            run_id: None,
+            codename: None,
         };
         let _ = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -1531,6 +1616,8 @@ mod tests {
             scope_id: Some("ws_a".into()),
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            run_id: None,
+            codename: None,
         };
         let err = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -1575,6 +1662,8 @@ mod tests {
             scope_id: Some("ws_unknown_locally".into()),
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            run_id: None,
+            codename: None,
         };
         let resp = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -1627,6 +1716,8 @@ mod tests {
             scope_id: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            run_id: None,
+            codename: None,
         };
         let _ = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -1670,6 +1761,8 @@ mod tests {
             scope_id: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            run_id: None,
+            codename: None,
         };
         let err = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -1701,6 +1794,8 @@ mod tests {
             scope_id: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            run_id: None,
+            codename: None,
         };
         let err = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -1733,6 +1828,8 @@ mod tests {
             scope_id: Some("ws_missing".into()),
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            run_id: None,
+            codename: None,
         };
         let err = run_agent(State(s), Path("triage".into()), Some(Json(body)))
             .await

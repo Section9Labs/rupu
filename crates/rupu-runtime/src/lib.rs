@@ -1,4 +1,5 @@
 pub mod admission;
+pub mod argv;
 mod artifacts;
 mod autoflow_history;
 mod backend;
@@ -9,6 +10,7 @@ pub mod model_limits;
 pub mod net_capture;
 pub mod provider_factory;
 mod run_envelope;
+pub mod spawn;
 mod wake;
 mod worker;
 

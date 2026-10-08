@@ -417,10 +417,13 @@ pub trait HostConnector: Send + Sync {
     /// A placed fan-out unit's coordinator mints the id up front so it can
     /// announce the unit's mirrored transcript path before the run exists
     /// (`UnitDispatcher::unit_transcript_path`). That announcement is only
-    /// truthful for connectors that actually honour the supplied id — today
-    /// SSH alone. It is deliberately NOT the same question as
-    /// [`Self::serves_runs_from_local_mirror`], which is also `true` for the
-    /// tunnel and bucket transports even though both mint their own ids.
+    /// truthful for connectors that actually honour the supplied id: SSH,
+    /// tunnel and bucket always do (a node has run under the id in its `Run`
+    /// frame / job key since the first tunnel slice), the local connector
+    /// when its launcher does, and an HTTP host when it last advertised
+    /// `run.supplied_run_id`. It is deliberately NOT the same question as
+    /// [`Self::serves_runs_from_local_mirror`]: a local or HTTP run honours
+    /// the id but has no mirrored transcript.
     ///
     /// [`AgentLaunchRequest`]: crate::agent_launcher::AgentLaunchRequest
     fn honours_supplied_run_id(&self) -> bool {
@@ -955,8 +958,35 @@ pub(crate) async fn mirror_stream_run_events(
 /// traverse out of the runs root nor smuggle shell metacharacters. Every
 /// connector, the mirror and the coverage route validate an id they did not
 /// mint with this.
-pub(crate) fn valid_run_id(id: &str) -> bool {
+pub fn valid_run_id(id: &str) -> bool {
     id.starts_with("run_") && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The codename a peer that builds its own `rupu run` (a tunnel or bucket
+/// node, an HTTP host) gets for `run`: `run.codename` when the peer's
+/// `features` advertise taking one, else `None` — logged once, naming the
+/// host and its version, never a refusal: a codename is only a display name,
+/// and the coordinator's records keep the one it minted.
+pub(crate) fn spec_peer_codename(
+    run: &rupu_runtime::argv::AgentRun,
+    features: &[String],
+    host: &str,
+    version: Option<&str>,
+) -> Option<String> {
+    use rupu_runtime::argv::{FeatureSet, RunArgv};
+    let (argv, downgrades) = RunArgv::Agent(run.clone()).for_peer(&FeatureSet::spec_peer(features));
+    for downgrade in &downgrades {
+        tracing::warn!(
+            host,
+            version = version.unwrap_or("unknown"),
+            run_id = %run.run_id,
+            "launching without the codename: {downgrade}"
+        );
+    }
+    match argv {
+        RunArgv::Agent(run) => run.codename,
+        _ => None,
+    }
 }
 
 /// A unit's coverage stream as its host connector read it

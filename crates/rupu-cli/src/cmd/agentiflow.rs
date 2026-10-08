@@ -44,7 +44,9 @@ use rupu_agentiflow::{
     RunAgentiflowOpts,
 };
 use rupu_auth::CredentialResolver;
+use rupu_runtime::argv::{AgentiflowRun, RunArgv};
 use rupu_runtime::provider_factory::{self, FactoryError, ProviderConfig};
+use rupu_runtime::spawn::{SpawnSpec, SpawnStdio};
 use serde::Serialize;
 use std::path::Path;
 use std::process::ExitCode;
@@ -354,10 +356,11 @@ fn validate_run_id(id: &str) -> anyhow::Result<()> {
 /// What the re-exec'd child of `run --detach` is invoked with: the plain
 /// foreground `run`, under the id the parent minted. `--` keeps a definition
 /// name from being read as a flag.
-fn detached_argv(def_name: &str, run_id: &str) -> Vec<String> {
-    ["agentiflow", "run", "--run-id", run_id, "--", def_name]
-        .map(String::from)
-        .to_vec()
+fn detached_argv(def_name: &str, run_id: &str) -> RunArgv {
+    RunArgv::Agentiflow(AgentiflowRun {
+        definition: def_name.to_string(),
+        run_id: run_id.to_string(),
+    })
 }
 
 /// `--format json` for a detached `agentiflow run`.
@@ -441,8 +444,8 @@ fn log_tail(log: &Path) -> String {
 /// finish.
 ///
 /// Detached like the CP's launchers and the fleet's unit launcher
-/// (`SubprocessUnitLauncher`): its own process group (`process_group(0)`, so a
-/// Ctrl-C at this terminal or this process exiting does not take the run
+/// (`SubprocessUnitLauncher`), through `rupu_runtime::spawn`: its own process
+/// group (so a Ctrl-C at this terminal or this process exiting does not take the run
 /// down), stdin/stdout null, and `RUPU_HOME` pinned to the home this process
 /// resolved so the child records the run where the id printed here is looked
 /// for. The child is the process that runs `run_agentiflow`, so the
@@ -466,22 +469,14 @@ async fn spawn_detached(
     let run_dir = agentiflow_dir(global).join(run_id);
     std::fs::create_dir_all(&run_dir).with_context(|| format!("create {}", run_dir.display()))?;
     let log_path = run_dir.join(DETACH_LOG);
-    let log = std::fs::File::create(&log_path)
-        .with_context(|| format!("create {}", log_path.display()))?;
 
-    let mut cmd = std::process::Command::new(&exe);
-    cmd.args(detached_argv(def_name, run_id))
-        .env("RUPU_HOME", global)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::from(log));
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
+    let mut launch = SpawnSpec::new(&exe, detached_argv(def_name, run_id));
+    launch.env = vec![("RUPU_HOME".into(), global.as_os_str().to_owned())];
+    launch.stdio = SpawnStdio::Log(log_path.clone());
+    launch.keep_child = true;
+    let mut child = match rupu_runtime::spawn::spawn_detached(launch).map(|s| s.child) {
+        Ok(Some(child)) => child,
+        Ok(None) => anyhow::bail!("the detached agentiflow's child was not kept"),
         Err(e) => {
             let _ = std::fs::remove_dir_all(&run_dir);
             return Err(anyhow::Error::new(e).context(format!("detach {}", exe.display())));
@@ -2285,7 +2280,11 @@ mod tests {
 
     #[test]
     fn the_detached_child_runs_the_foreground_path_under_the_parents_id() {
-        let argv = detached_argv("acme", "af_01X");
+        let argv: Vec<String> = detached_argv("acme", "af_01X")
+            .to_args()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
         assert_eq!(
             argv,
             ["agentiflow", "run", "--run-id", "af_01X", "--", "acme"]
@@ -2308,7 +2307,12 @@ mod tests {
         }
         // A definition name that looks like a flag stays a name.
         let mut full = vec!["rupu".to_string()];
-        full.extend(detached_argv("-x", "af_01X"));
+        full.extend(
+            detached_argv("-x", "af_01X")
+                .to_args()
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned()),
+        );
         assert!(matches!(parse_vec(full), Action::Run { def, .. } if def == "-x"));
     }
 

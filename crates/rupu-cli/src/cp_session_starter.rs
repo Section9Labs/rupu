@@ -2,6 +2,7 @@
 //! `rupu session start … --detach`, which enqueues the first turn + spawns the
 //! session worker and prints `session: <id>`; we parse that and return it.
 use rupu_cp::session_starter::{SessionStartError, SessionStartRequest, SessionStarter};
+use rupu_runtime::argv::{RunArgv, SessionStart};
 use std::path::PathBuf;
 
 /// Spawns `rupu session start …` children. `exe` is the path to the running
@@ -10,35 +11,31 @@ pub struct SubprocessSessionStarter {
     pub exe: PathBuf,
 }
 
-/// Build the argv (after the executable) for a `rupu session start` invocation.
-///
-/// Order: `session start <agent> [<target>] --detach [--mode m] [--prompt p]
-/// [--into <clone_dir>]`. `--into` is added only when a repo target AND a clone
-/// dir are present.
-pub(crate) fn build_session_start_argv(
+/// The `rupu session start --detach` for `req`. `--into` is added only when
+/// a repo target AND a clone dir are present. A mode that isn't `ask` /
+/// `bypass` / `readonly` is refused here, not by the child.
+pub(crate) fn session_start_argv(
     req: &SessionStartRequest,
     clone_dir: Option<&str>,
-) -> Vec<String> {
-    let mut argv = vec!["session".to_string(), "start".to_string(), req.agent.clone()];
-    if let Some(t) = &req.target {
-        argv.push(t.clone());
-    }
-    argv.push("--detach".to_string());
-    if let Some(m) = &req.mode {
-        argv.push("--mode".to_string());
-        argv.push(m.clone());
-    }
-    if let Some(p) = &req.prompt {
-        argv.push("--prompt".to_string());
-        argv.push(p.clone());
-    }
-    if req.target.is_some() {
-        if let Some(dir) = clone_dir {
-            argv.push("--into".to_string());
-            argv.push(dir.to_string());
-        }
-    }
-    argv
+) -> Result<RunArgv, String> {
+    let mode = req
+        .mode
+        .as_deref()
+        .map(rupu_tools::PermissionMode::parse)
+        .transpose()
+        .map_err(|e| e.to_string())?;
+    Ok(RunArgv::SessionStart(SessionStart {
+        agent: req.agent.clone(),
+        target: req.target.clone(),
+        mode,
+        prompt: req.prompt.clone(),
+        into: req
+            .target
+            .as_ref()
+            .and(clone_dir)
+            .map(std::path::PathBuf::from),
+        detach: true,
+    }))
 }
 
 /// Scan `session start --detach` stdout for the `session: <id>` line and return
@@ -73,10 +70,11 @@ impl SessionStarter for SubprocessSessionStarter {
             None
         };
 
-        let argv = build_session_start_argv(&req, clone_dir.as_deref());
+        let argv =
+            session_start_argv(&req, clone_dir.as_deref()).map_err(SessionStartError::Invalid)?;
 
         let mut cmd = tokio::process::Command::new(&self.exe);
-        cmd.args(&argv);
+        cmd.args(argv.to_args());
         if let Some(dir) = req.working_dir.as_deref() {
             cmd.current_dir(dir);
         }
@@ -102,7 +100,7 @@ impl SessionStarter for SubprocessSessionStarter {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_session_start_argv, parse_session_id};
+    use super::{parse_session_id, session_start_argv};
     use rupu_cp::session_starter::SessionStartRequest;
 
     fn req(
@@ -120,43 +118,67 @@ mod tests {
         }
     }
 
+    fn argv(r: &SessionStartRequest, clone_dir: Option<&str>) -> Vec<String> {
+        session_start_argv(r, clone_dir)
+            .unwrap()
+            .to_args()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
     #[test]
     fn argv_workspace_prompt_mode() {
-        let a = build_session_start_argv(&req(None, Some("hi"), Some("ask"), None), None);
         assert_eq!(
-            a,
-            vec!["session", "start", "triage", "--detach", "--mode", "ask", "--prompt", "hi"]
+            argv(&req(None, Some("hi"), Some("ask"), None), None),
+            [
+                "session",
+                "start",
+                "triage",
+                "--detach",
+                "--mode",
+                "ask",
+                "--prompt=hi"
+            ]
         );
     }
 
     #[test]
     fn argv_repo_adds_into() {
-        let a = build_session_start_argv(
-            &req(Some("github:o/r"), Some("hi"), None, None),
-            Some("/clones/x"),
-        );
         assert_eq!(
-            a,
-            vec![
+            argv(
+                &req(Some("github:o/r"), Some("hi"), None, None),
+                Some("/clones/x")
+            ),
+            [
                 "session",
                 "start",
                 "triage",
                 "github:o/r",
                 "--detach",
-                "--prompt",
-                "hi",
+                "--prompt=hi",
                 "--into",
                 "/clones/x",
             ]
+        );
+        // No target: no clone, whatever the dir.
+        assert_eq!(
+            argv(&req(None, None, None, None), Some("/clones/x")),
+            ["session", "start", "triage", "--detach"]
         );
     }
 
     #[test]
     fn argv_minimal() {
         assert_eq!(
-            build_session_start_argv(&req(None, None, None, None), None),
-            vec!["session", "start", "triage", "--detach"]
+            argv(&req(None, None, None, None), None),
+            ["session", "start", "triage", "--detach"]
         );
+    }
+
+    #[test]
+    fn an_unknown_mode_is_refused() {
+        assert!(session_start_argv(&req(None, None, Some("yolo"), None), None).is_err());
     }
 
     #[test]

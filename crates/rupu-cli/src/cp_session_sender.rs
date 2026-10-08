@@ -1,11 +1,12 @@
 //! `SubprocessSessionSender` — the `cp serve` adapter for rupu-cp's
-//! [`SessionSender`] port. It shells `rupu session send <id> "<prompt>"
-//! --detach`, which enqueues the turn + ensures the session worker, prints
+//! [`SessionSender`] port. It shells `rupu session send --detach -- <id>
+//! "<prompt>"`, which enqueues the turn + ensures the session worker, prints
 //! `run: <run_id>` to stdout, and exits promptly (the turn runs async in a
 //! separate worker). We parse that `run: …` line and return the run id so the
 //! web UI can navigate to the new run immediately.
 
 use rupu_cp::session_sender::{SendError, SendMessageRequest, SessionSender};
+use rupu_runtime::argv::{RunArgv, SessionSend};
 use std::path::PathBuf;
 
 /// Spawns `rupu session send …` children. `exe` is the path to the running
@@ -36,8 +37,13 @@ impl SessionSender for SubprocessSessionSender {
             return Err(SendError::Invalid("prompt is empty".into()));
         }
 
+        let argv = RunArgv::SessionSend(SessionSend {
+            session_id: req.session_id.clone(),
+            prompt: req.prompt.clone(),
+            detach: true,
+        });
         let out = tokio::process::Command::new(&self.exe)
-            .args(["session", "send", &req.session_id, &req.prompt, "--detach"])
+            .args(argv.to_args())
             .output()
             .await
             .map_err(|e| SendError::Spawn(e.to_string()))?;

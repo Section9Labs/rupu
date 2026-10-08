@@ -102,6 +102,11 @@ impl NodeConn {
         self.capabilities.iter().any(|c| c == capability)
     }
 
+    /// Everything the node advertised in its `Hello`.
+    pub fn capabilities(&self) -> &[String] {
+        &self.capabilities
+    }
+
     /// The node's self-reported rupu version, when it sent one.
     pub fn rupu_version(&self) -> Option<&str> {
         self.rupu_version.as_deref()

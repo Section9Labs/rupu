@@ -23,8 +23,8 @@ use crate::{
     agent_launcher::AgentLaunchRequest,
     host::connector::{
         blocking_host, mirror_get_run, mirror_list_runs, mirror_stream_run_events,
-        read_transcript_file, EventByteStream, HostCapabilities, HostConnector, HostConnectorError,
-        HostInfo, RunListQuery,
+        read_transcript_file, spec_peer_codename, EventByteStream, HostCapabilities, HostConnector,
+        HostConnectorError, HostInfo, RunListQuery,
     },
     launcher::LaunchRequest,
     node::{
@@ -134,6 +134,7 @@ impl HostConnector for TunnelHostConnector {
             target: req.target.clone(),
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            codename: None,
         };
 
         // Verify the node is reachable BEFORE creating the mirror run.
@@ -171,7 +172,18 @@ impl HostConnector for TunnelHostConnector {
     }
 
     async fn launch_agent(&self, req: AgentLaunchRequest) -> Result<String, HostConnectorError> {
-        let run_id = format!("run_{}", Ulid::new());
+        // A coordinator-minted id (a placed unit's) is the id the node runs
+        // under: it travels in the `Run` frame, which every node passes on as
+        // `rupu run --run-id`. Validated before anything is created.
+        let run_id = req.run_id_or_mint().map_err(HostConnectorError::Invalid)?;
+        let run = req
+            .agent_run(&run_id)
+            .map_err(HostConnectorError::Invalid)?;
+
+        // Verify the node is reachable BEFORE creating the mirror run.
+        // This prevents an offline node from leaving an uncancellable Running
+        // record with no executor attached.
+        let conn = self.live_conn()?;
 
         let spec = RunSpec {
             kind: RunSpecKind::Agent,
@@ -182,12 +194,13 @@ impl HostConnector for TunnelHostConnector {
             target: req.target.clone(),
             findings_profile: req.findings_profile,
             engagement_profiles: req.engagement_profiles.clone(),
+            codename: spec_peer_codename(
+                &run,
+                conn.capabilities(),
+                &self.node_id,
+                conn.rupu_version(),
+            ),
         };
-
-        // Verify the node is reachable BEFORE creating the mirror run.
-        // This prevents an offline node from leaving an uncancellable Running
-        // record with no executor attached.
-        let conn = self.live_conn()?;
 
         // A node that predates `RunSpec.findings_profile` would deserialize
         // the frame, drop the field, and run the agent under its own
@@ -467,6 +480,12 @@ impl HostConnector for TunnelHostConnector {
     /// coordinator's own `RunStore` by `NodeMirror`, so run-scoped detail
     /// endpoints read that mirror instead of the wire.
     fn serves_runs_from_local_mirror(&self) -> bool {
+        true
+    }
+
+    /// `launch_agent` sends a supplied id as the job's run id, which every
+    /// node has run under (`rupu run --run-id`) since the first tunnel slice.
+    fn honours_supplied_run_id(&self) -> bool {
         true
     }
 
