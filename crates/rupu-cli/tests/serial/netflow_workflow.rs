@@ -122,8 +122,8 @@ async fn a_workflow_agent_step_records_flows_to_its_own_ledger() {
     // STEP mints its own fresh run id for its own transcript AND its own
     // netflow ledger file (`runner.rs`'s concurrent DAG scheduler:
     // `dispatch_one`'s `run_id`/`transcript_path` are per-step, not the
-    // parent workflow's — see `step_factory.rs`'s `step_netflow_sink`,
-    // which builds this run's sink from exactly that per-step id). So
+    // parent workflow's — the run assembler's `rupu_runtime::netflow::for_run`
+    // builds each step's sink from exactly that per-step id). So
     // this test does not predict a single ledger filename; it scans every
     // `.jsonl` file `netflow_dir` now holds for the one the step's real
     // HTTP request landed in — proving capture happened somewhere under

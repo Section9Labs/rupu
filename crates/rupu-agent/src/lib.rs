@@ -36,8 +36,6 @@ pub mod recovery;
 pub mod runner;
 // The run's tool grant, resolved at assembly (W2/W3).
 pub mod grant;
-// TEMPORARY (W3a): flat run options for the sites W3b migrates.
-pub mod legacy;
 // implemented in Task 2
 pub mod spec;
 // implemented in Task 6
@@ -54,12 +52,11 @@ pub use loader::{
 };
 pub use permission::{resolve_mode, PermissionPrompt};
 pub use recovery::{Hop, HopBuilder, RecoveryOpts};
-pub use legacy::LegacyRunOpts;
 pub use runner::{
-    compact_messages, run_agent, run_agent_full, run_agent_with_limits, AgentPins, AgentRunOpts,
-    CompactionError, CompactionOutcome, Hooks, MockProvider, OnStreamEventCallback,
-    OnToolCallCallback, OnUsageCallback, RunError, RunExit, RunResult, ScriptedTurn, StreamOpts,
-    UsageKind, UsageTurn, UserTurn,
+    compact_messages, record_unstarted_run, run_agent, run_agent_full, run_agent_with_limits,
+    AgentPins, AgentRunOpts, CompactionError, CompactionOutcome, Hooks, MockProvider,
+    OnStreamEventCallback, OnToolCallCallback, OnUsageCallback, RunError, RunExit, RunResult,
+    ScriptedTurn, StreamOpts, UnstartedRun, UsageKind, UsageTurn, UserTurn,
 };
 pub use rupu_providers::types::StopReason;
 pub use spec::{AgentSpec, AgentSpecParseError};

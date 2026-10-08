@@ -26,7 +26,7 @@ use rupu_agent::load_agents as load_agent_specs;
 use rupu_app_canvas::{render_rows as render_graph_rows, GraphCell, NodeStatus};
 use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts, RunStepPolicy};
 use rupu_orchestrator::runs::{CancelError, CancelOutcome, PauseError};
-use rupu_orchestrator::{DefaultStepFactory, RunWorkflowError};
+use rupu_orchestrator::RunWorkflowError;
 use rupu_runtime::{
     ArtifactKind, ArtifactManifest, ArtifactRef, AutoflowEnvelope, ExecutionBackend,
     ExecutionRequest, PreparedRun, RepoBinding, RunContext, RunCorrelation, RunEnvelope, RunKind,
@@ -2307,23 +2307,12 @@ async fn create(
             // ISSUES.md I-74: pass the operator's `[providers.<name>]`
             // settings through instead of silently generating with none.
             // (`gen_cfg` was loaded above, alongside the resolver.)
-            let gen_provider_config = rupu_runtime::provider_factory::ProviderConfig {
-                anthropic_oauth_system_prefix: None,
-                anthropic_prompt_cache: None,
-                anthropic_server_side_fallback: Some(gen_cfg.recovery.server_side_fallback),
-                openai_compatible: rupu_runtime::provider_factory::openai_compatible_params(
-                    &req.provider,
-                    &gen_cfg.providers,
-                ),
-                tuning: Some(rupu_runtime::provider_factory::provider_tuning(
-                    &req.provider,
-                    &gen_cfg.providers,
-                )),
-                kind: rupu_runtime::provider_factory::resolve_kind(
-                    &req.provider,
-                    &gen_cfg.providers,
-                ),
-            };
+            let gen_provider_config = rupu_runtime::provider_factory::ProviderConfig::for_agent(
+                &req.provider,
+                &gen_cfg.providers,
+                Default::default(),
+                Some(gen_cfg.recovery.server_side_fallback),
+            );
             let outcome =
                 rupu_orchestrator::generate_definition(&req, &resolver, &gen_provider_config)
                     .await?;
@@ -3757,13 +3746,6 @@ pub(crate) async fn resume_run(
         }
     };
 
-    // Hoisted above the dispatcher build: sub-agent dispatch resolves its
-    // provider/model through the same config-derived defaults the step
-    // factory below uses (ISSUES.md I-8).
-    let openai_compatible = rupu_runtime::provider_factory::openai_compatible_map(&cfg.providers);
-    let provider_tuning = rupu_runtime::provider_factory::provider_tuning_map(&cfg.providers);
-    let kinds = rupu_runtime::provider_factory::resolve_kind_map(&cfg.providers);
-    let limits_ctx = rupu_runtime::model_limits::LimitsContext::from_config(&cfg, &global);
     // The engagement the run was launched under (`--engagement-profile`),
     // shared by sub-agents, action steps and agent steps as at launch.
     let findings_base = rupu_coverage::FindingWriteOptions {
@@ -3771,45 +3753,41 @@ pub(crate) async fn resume_run(
         ..crate::findings_opts::base_options(&global, &cfg.findings)
     };
     // Process-wide subprocess-capture backend, warmed off the async runtime
-    // (its first call blocks). Shared by the dispatcher (children) and the
-    // step factory (this workflow's steps).
+    // (its first call blocks).
     let net_capture = crate::netflow_sink::net_capture(&cfg.netflow).await;
-    // Sub-agents dispatched from this run's steps are assembled like every
-    // other run (W3): this run's config, registry, engagement and capture.
-    let assembler = Arc::new(rupu_runtime::assembly::RunAssembler::new(
-        rupu_runtime::assembly::AssemblyContext {
-            global: global.clone(),
-            project_root: project_root.clone(),
-            config: cfg.clone(),
-            customer: cfg_paths.customer_slug.clone(),
-            resolver: Arc::clone(&resolver),
-            scm: Some(Arc::clone(&mcp_registry)),
-            findings: findings_base.clone(),
-            net_capture: Some(Arc::clone(&net_capture)),
-        },
-    ));
-    let dispatcher = rupu_orchestrator::subagents::workflow_dispatcher(
-        &assembler,
-        Arc::clone(&store),
-        run_id,
-        &workflow.name,
-        rupu_runtime::assembly::WorkspaceBinding {
-            id: record.workspace_id.clone(),
-            path: workspace_path.clone(),
-        },
-        event_sink_for_resume.clone(),
-    );
-    // One codename namer for the whole run, shared by the orchestrator
-    // (static slots) and the sub-agent dispatcher (`>role#n`). Built over
-    // the same `<runs>/<run_id>` dir `run_workflow` would use, so both
-    // read and persist the one `codenames.json`.
-    let naming = Arc::new(rupu_orchestrator::codenames::RunNaming::open(
-        &workflow,
-        run_id,
-        Some(&store.root.join(run_id)),
-    ));
-    dispatcher.set_namer(naming.namer());
-    let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
+    // Every agent this run starts — its steps and their sub-agents — is
+    // assembled over this run's config, registry, engagement and capture
+    // (W3); one construction with `workflow run` (R12).
+    let runtime =
+        rupu_orchestrator::WorkflowRuntime::new(rupu_orchestrator::WorkflowRuntimeInputs {
+            context: rupu_runtime::assembly::AssemblyContext {
+                global: global.clone(),
+                project_root: project_root.clone(),
+                config: cfg.clone(),
+                // The recorded customer (or the looked-up one for an older run).
+                customer: cfg_paths.customer_slug.clone(),
+                resolver,
+                scm: Some(Arc::clone(&mcp_registry)),
+                findings: findings_base.clone(),
+                net_capture: Some(net_capture),
+            },
+            workflow: workflow.clone(),
+            run_id: run_id.to_string(),
+            workspace: rupu_runtime::assembly::WorkspaceBinding {
+                id: record.workspace_id.clone(),
+                path: workspace_path.clone(),
+            },
+            store: Arc::clone(&store),
+            events: event_sink_for_resume.clone(),
+            mode: permission_mode,
+            // The run's `## Run target`, as launched (R8).
+            system_prompt_suffix: record.system_prompt_suffix.clone(),
+            // A resumed run is never an agentiflow unit (workflow units
+            // refuse gated workflows), so it keeps the workflow's own scope.
+            scope_name_override: None,
+        });
+    let naming = runtime.naming;
+    let factory = runtime.factory;
     let action_dispatcher = crate::resume::action_dispatcher_for(
         &mcp_registry,
         permission_mode,
@@ -3830,34 +3808,6 @@ pub(crate) async fn resume_run(
             provider: cfg.default_provider.clone(),
         }),
     );
-    let factory = Arc::new(DefaultStepFactory {
-        workflow: workflow.clone(),
-        global: global.clone(),
-        project_root: project_root.clone(),
-        resolver,
-        mode: permission_mode,
-        mcp_registry,
-        // The run's `## Run target`, as launched (R8).
-        system_prompt_suffix: record.system_prompt_suffix.clone(),
-        dispatcher: Some(dispatcher_dyn),
-        openai_compatible,
-        provider_tuning,
-        kinds,
-        default_provider: cfg.default_provider.clone(),
-        default_model: cfg.default_model.clone(),
-        bash_timeout_secs: cfg.bash.timeout_secs.unwrap_or(120),
-        bash_env_allowlist: cfg.bash.env_allowlist.clone().unwrap_or_default(),
-        findings_base,
-        limits_ctx,
-        providers: cfg.providers.clone(),
-        recovery: cfg.recovery.clone(),
-        // A resumed run is never an agentiflow unit (workflow units refuse
-        // gated workflows), so it keeps the workflow's own scope.
-        scope_name_override: None,
-        net_capture: Some(net_capture),
-        // The recorded customer (or the looked-up one for an older run).
-        customer: cfg_paths.customer_slug.clone(),
-    });
 
     // A cooperatively-paused run may carry a persisted mid-step seed
     // transcript (written by `run_workflow` when a linear step's agent
@@ -5602,16 +5552,9 @@ async fn execute_workflow_invocation(
         }
     };
 
-    // Hoisted above the dispatcher build: sub-agent dispatch resolves its
-    // provider/model through the same config-derived defaults the step
-    // factory below uses (ISSUES.md I-8).
-    let openai_compatible = rupu_runtime::provider_factory::openai_compatible_map(&cfg.providers);
-    let provider_tuning = rupu_runtime::provider_factory::provider_tuning_map(&cfg.providers);
-    let kinds = rupu_runtime::provider_factory::resolve_kind_map(&cfg.providers);
-    let limits_ctx = rupu_runtime::model_limits::LimitsContext::from_config(&cfg, &global);
     // The write options every finding-recording surface of this run shares:
     // the dispatcher's sub-agents, the action steps' `FindingsContext`, and
-    // each agent step (the factory clones it per step). The engagement is
+    // each agent step (its profile resolved per step). The engagement is
     // `None` — the native code path — unless `--engagement-profile` selected
     // one, so a run without the flag builds exactly what it always did.
     let findings_base = rupu_coverage::FindingWriteOptions {
@@ -5625,52 +5568,48 @@ async fn execute_workflow_invocation(
         .clone()
         .unwrap_or_else(|| workflow.name.clone());
     // Process-wide subprocess-capture backend, warmed off the async runtime
-    // (its first call blocks). Shared by the dispatcher (children) and the
-    // step factory (this workflow's steps).
+    // (its first call blocks).
     let net_capture = crate::netflow_sink::net_capture(&cfg.netflow).await;
-    // Sub-agents dispatched from this run's steps are assembled like every
-    // other run (W3): this run's config, registry, engagement and capture.
-    let assembler = Arc::new(rupu_runtime::assembly::RunAssembler::new(
-        rupu_runtime::assembly::AssemblyContext {
-            global: global.clone(),
-            project_root: ctx.project_root.clone(),
-            config: cfg.clone(),
-            customer: cfg_paths.customer_slug.clone(),
-            resolver: Arc::clone(&resolver),
-            scm: Some(Arc::clone(&mcp_registry)),
-            findings: findings_base.clone(),
-            net_capture: Some(Arc::clone(&net_capture)),
-        },
-    ));
-    let dispatcher = rupu_orchestrator::subagents::workflow_dispatcher(
-        &assembler,
-        Arc::clone(&run_store),
-        &run_id,
-        &workflow.name,
-        rupu_runtime::assembly::WorkspaceBinding {
-            id: ctx.workspace_id.clone(),
-            path: ctx.workspace_path.clone(),
-        },
-        event_sink_for_run.clone(),
-    );
-    // One codename namer for the whole run — shared by the orchestrator
-    // (static slots), the sub-agent dispatcher (`>role#n`), and the inline
-    // approve-resume below. Built over the same `<runs>/<run_id>` dir
-    // `run_workflow` would use, so all read and persist one
-    // `codenames.json`.
-    let naming = Arc::new(rupu_orchestrator::codenames::RunNaming::open(
-        &workflow,
-        &run_id,
-        Some(&runs_dir.join(&run_id)),
-    ));
-    dispatcher.set_namer(naming.namer());
-    let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
     // Shared across this run's initial `opts` AND the inline
     // approve-resume `resume_opts` built further down this function —
-    // same registry + mode the `DefaultStepFactory` below carries, so
-    // agent steps and action steps see identical permissions across a
-    // pause/resume boundary too.
+    // same registry + mode the step factory carries, so agent steps and
+    // action steps see identical permissions across a pause/resume
+    // boundary too.
     let permission_mode = rupu_tools::PermissionMode::parse(&ctx.mode)?;
+    // Every agent this run starts — its steps and their sub-agents — is
+    // assembled over this run's config, registry, engagement and capture
+    // (W3); one construction with `workflow resume` (R12). The namer is
+    // shared by the orchestrator, the dispatcher and the inline
+    // approve-resume below.
+    let runtime =
+        rupu_orchestrator::WorkflowRuntime::new(rupu_orchestrator::WorkflowRuntimeInputs {
+            context: rupu_runtime::assembly::AssemblyContext {
+                global: global.clone(),
+                project_root: ctx.project_root.clone(),
+                config: cfg.clone(),
+                // The customer the config above was layered with — recorded
+                // on the run so a resume uses it, not whatever the project
+                // maps to later.
+                customer: cfg_paths.customer_slug.clone(),
+                resolver,
+                scm: Some(Arc::clone(&mcp_registry)),
+                findings: findings_base.clone(),
+                net_capture: Some(net_capture),
+            },
+            workflow: workflow.clone(),
+            run_id: run_id.clone(),
+            workspace: rupu_runtime::assembly::WorkspaceBinding {
+                id: ctx.workspace_id.clone(),
+                path: ctx.workspace_path.clone(),
+            },
+            store: Arc::clone(&run_store),
+            events: event_sink_for_run.clone(),
+            mode: permission_mode,
+            system_prompt_suffix: ctx.system_prompt_suffix.clone(),
+            scope_name_override: overlay.scope_name.clone(),
+        });
+    let naming = runtime.naming;
+    let factory = runtime.factory;
     let action_dispatcher = crate::resume::action_dispatcher_for(
         &mcp_registry,
         permission_mode,
@@ -5691,33 +5630,6 @@ async fn execute_workflow_invocation(
             provider: cfg.default_provider.clone(),
         }),
     );
-
-    let factory = Arc::new(DefaultStepFactory {
-        workflow: workflow.clone(),
-        global: global.clone(),
-        project_root: ctx.project_root.clone(),
-        resolver,
-        mode: permission_mode,
-        mcp_registry,
-        system_prompt_suffix: ctx.system_prompt_suffix.clone(),
-        dispatcher: Some(dispatcher_dyn),
-        openai_compatible,
-        provider_tuning,
-        kinds,
-        default_provider: cfg.default_provider.clone(),
-        default_model: cfg.default_model.clone(),
-        bash_timeout_secs: cfg.bash.timeout_secs.unwrap_or(120),
-        bash_env_allowlist: cfg.bash.env_allowlist.clone().unwrap_or_default(),
-        findings_base,
-        limits_ctx,
-        providers: cfg.providers.clone(),
-        recovery: cfg.recovery.clone(),
-        scope_name_override: overlay.scope_name.clone(),
-        net_capture: Some(net_capture),
-        // The customer the config above was layered with — recorded on the
-        // run so a resume uses it, not whatever the project maps to later.
-        customer: cfg_paths.customer_slug.clone(),
-    });
 
     let workflow_for_resume = workflow.clone();
     let workspace_path_for_resume = ctx.workspace_path.clone();

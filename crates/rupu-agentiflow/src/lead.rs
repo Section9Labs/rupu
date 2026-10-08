@@ -16,12 +16,13 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use rupu_agent::legacy::run_agent_full;
-use rupu_agent::{LegacyRunOpts, RunError, RunExit};
-use rupu_orchestrator::usage_ledger::{LedgerTag, UsageLedger};
+use rupu_agent::{RunError, RunExit};
 use rupu_providers::model_limits::ModelLimits;
 use rupu_providers::types::Message;
 use rupu_providers::LlmProvider;
+use rupu_runtime::assembly::{
+    LaunchServices, LaunchSpec, Origin, Overrides, PreparedProvider, RunAssembler, WorkspaceBinding,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::budget::BudgetStage;
@@ -268,10 +269,24 @@ fn quote(s: &str) -> String {
     serde_json::to_string(&capped).unwrap_or_else(|_| "\"<unrenderable>\"".to_string())
 }
 
-/// Mints a fresh provider for each round. `LegacyRunOpts::provider` is a
-/// `Box<dyn LlmProvider>` that the runner consumes and `LlmProvider` is not
-/// `Clone`, so a persistent driver needs a factory rather than one instance.
+/// Mints a fresh provider for each round. A run consumes its
+/// `Box<dyn LlmProvider>` and `LlmProvider` is not `Clone`, so a persistent
+/// driver needs a factory rather than one instance.
 pub type ProviderFactory = Box<dyn FnMut() -> Box<dyn LlmProvider> + Send>;
+
+/// Where each of the lead's rounds gets its provider.
+pub enum LeadProvider {
+    /// Built by the run's assembler from the lead's agent file and the
+    /// config, every round (production).
+    Assembled,
+    /// Minted by the caller for each round under `provider` / `model` — a
+    /// test's mock provider.
+    Injected {
+        provider: String,
+        model: String,
+        make: ProviderFactory,
+    },
+}
 
 /// Mints a provider for each `generate_workflow` call. Unlike
 /// [`ProviderFactory`] it is shared (`Arc`, `Fn`) because the tool holding it
@@ -292,10 +307,21 @@ pub struct GenerationCapability {
 
 /// Static configuration for a [`RunAgentLeadDriver`].
 pub struct LeadConfig {
-    pub agent_name: String,
-    pub system_prompt: String,
-    pub provider_name: String,
-    pub model: String,
+    /// The agentiflow's assembler: its config, SCM registry, findings base
+    /// (with the run's engagement), capture backend and customer. Every
+    /// round is assembled through it as `Origin::FlowLead` — limits,
+    /// recovery, MCP, pins, findings, netflow and the usage ledger like any
+    /// other run (W3, R1/R5/R6).
+    pub assembler: Arc<RunAssembler>,
+    /// The lead's agent file. Its `tools:` is the lead's grant exactly: the
+    /// launch site passes `Some(..)` (absent = none), so an empty list grants
+    /// NO builtins/MCP tools — there is deliberately no way to say "all
+    /// builtins" by omission, because the lead runs unattended under bypass
+    /// permission on digest text an attacker can influence. (The
+    /// engagement's ambient grant adds `findings.report` / `assets.mark`,
+    /// and the board/mailbox `extra_tools` are always-on, so an empty list
+    /// is not "no tools at all".)
+    pub agent: rupu_agent::AgentSpec,
     /// Turns the lead may take in ONE round; must be at least 1
     /// ([`RunAgentLeadDriver::new`] rejects 0, which would bust every round
     /// before its first turn). The runner's own `max_turns` is a ceiling on an
@@ -303,7 +329,16 @@ pub struct LeadConfig {
     /// `total_turns_so_far + per_round_max_turns` -- every round gets a full
     /// budget, however many turns earlier rounds used.
     pub per_round_max_turns: u32,
+    /// The agentiflow run's id: every round's run id, and the findings
+    /// scope the lead pools its findings and assets under (the
+    /// `target_id(workspace, id)` the envelope's goal evaluator reads).
     pub run_id: String,
+    /// The agentiflow's run directory: the lead's usage ledger
+    /// (`<flow_dir>/usage.jsonl`), which the budget's
+    /// [`LedgerUsageSource`](crate::LedgerUsageSource) folds with the units'.
+    pub flow_dir: PathBuf,
+    /// The lead's codename, minted at flow start (`<crew>/<role>`).
+    pub codename: Option<String>,
     /// Base transcript path. The runner truncates its transcript when a run
     /// starts, so round `N` writes `round_transcript_path(this, N)`
     /// (`lead.jsonl` -> `lead.r3.jsonl`) instead of overwriting the previous
@@ -316,50 +351,23 @@ pub struct LeadConfig {
     pub scope: Scope,
     /// The goals, so the round message can restate each one's objective.
     pub goals: Vec<Goal>,
-    pub workspace_id: String,
-    /// The lead's workspace root (the file/bash tools' scope).
-    pub workspace_path: PathBuf,
-    /// The lead's `tools:` grant: the runner offers exactly what this list
-    /// names, so empty (the fail-closed default) grants NO builtins/MCP tools.
-    /// (The engagement's ambient grant adds `findings.report` / `assets.mark`,
-    /// and the board/mailbox `extra_tools` are always-on, so an empty list is
-    /// not "no tools at all".)
-    /// The caller lists what the lead needs -- there is deliberately no way to
-    /// say "all builtins" by omission, because the lead runs unattended under
-    /// bypass permission on digest text an attacker can influence.
-    pub agent_tools: Vec<String>,
+    /// The lead's workspace (its record id and root — the file/bash tools'
+    /// scope).
+    pub workspace: WorkspaceBinding,
     /// Starting model limits; the driver carries the limits each round ends
     /// with (including any learned from a context-overflow error) into the
-    /// next, as a session does. `ModelLimits::unknown()` when not resolved.
+    /// next, as a session does. `ModelLimits::unknown()` = resolved by the
+    /// first round.
     pub limits: ModelLimits,
-    /// Coverage scope the lead's `report_finding` / `asset_mark` write to. Set
-    /// to the agentiflow id so findings pool under the same target the
-    /// envelope's goal evaluator reads (`target_id(workspace, id)`); `None`
-    /// falls back to the runner's default, `target_id(workspace, agent_name)`.
-    pub scope_name: Option<String>,
-    /// The run's resolved engagement profile set. `Some` enables `asset_mark`
-    /// and makes the lead's findings profile-typed; `None` records bare
-    /// findings with no engagement routing.
-    pub findings_engagement: Option<Arc<rupu_coverage::ActiveSet>>,
     /// Always-on tools injected into every round's grant (as `origin:injected`,
-    /// so they need not be listed in `agent_tools`): the lead's
+    /// so they need not be listed in the agent's `tools:`): the lead's
     /// board / mailbox coordination tools. Shared `Arc`s -- the same instances
     /// serve every round, so their per-run state (held claims) persists.
     pub extra_tools: Vec<Arc<dyn rupu_tools::Tool>>,
     /// Ambient-context collectors run before each of the lead's model calls
     /// (its inbox, the board's standing directives). Shared `Arc`s, cloned
-    /// into every round's `LegacyRunOpts`.
+    /// into every round's launch.
     pub collectors: Vec<Arc<dyn rupu_agent::TurnCollector>>,
-    /// The customer the run belongs to, resolved by the launch site; every
-    /// round's transcript records it (`run_start.customer`). `None` ⇒ no
-    /// customer.
-    pub customer: Option<String>,
-    /// Where the lead's LLM calls are metered: every round's `on_usage` hook
-    /// appends one row per call here (`<run dir>/usage.jsonl`), and the budget's
-    /// [`LedgerUsageSource`](crate::LedgerUsageSource) folds it with the
-    /// units' ledgers. `None` meters nothing (the lead's spend never reaches
-    /// `budget.usd` / `budget.tokens`).
-    pub usage_ledger: Option<UsageLedger>,
     /// The operator steering queue to watch for `send --now` interrupts. When
     /// `Some`, [`RunAgentLeadDriver::new`] starts a watcher thread that cuts a
     /// round short (through the runner's pause token) as soon as a message with
@@ -381,15 +389,16 @@ pub struct LeadConfig {
 /// the driver from a BLOCKING context -- a dedicated thread or `spawn_blocking`
 /// -- never directly on a runtime worker.
 ///
-/// What a round does NOT wire up yet (Plan 3b-2): the MCP/SCM registry,
-/// dispatchable agents, and a codename. It runs under bypass permission, so the
-/// tool gate is the run's grant: [`LeadConfig::agent_tools`] (exactly that
-/// list; empty = no builtins/MCP), the engagement's ambient findings tools,
-/// and [`LeadConfig::extra_tools`], the caller's explicit always-on injections
-/// (the board / mailbox tools).
-/// [`LeadConfig::collectors`] feed the lead's inbox and standing directives
-/// into each turn. No parent run, depth 0 -- the same shape as a session
-/// turn's `LegacyRunOpts` minus the CLI-only plumbing.
+/// Each round is assembled as `Origin::FlowLead` by [`LeadConfig::assembler`]
+/// (the agent's limits, recovery chain, frontmatter pins, MCP/SCM registry,
+/// findings base, netflow and usage ledger, like any run). It runs under
+/// bypass permission, so the tool gate is the run's grant: the agent's
+/// `tools:` (exactly that list; empty = no builtins/MCP), the engagement's
+/// ambient findings tools, and [`LeadConfig::extra_tools`], the caller's
+/// explicit always-on injections (the board / mailbox tools). Its launcher
+/// is the agentiflow's own unit supervisor (the `dispatch` / `join` tools),
+/// not the in-process dispatcher. [`LeadConfig::collectors`] feed the lead's
+/// inbox and standing directives into each turn. No parent run, depth 0.
 ///
 /// ## Interrupts (`send --now`)
 ///
@@ -404,7 +413,7 @@ pub struct LeadConfig {
 /// `assess()` then drains and delivers the message like any other steering.
 pub struct RunAgentLeadDriver {
     cfg: LeadConfig,
-    make_provider: ProviderFactory,
+    provider: LeadProvider,
     rt: tokio::runtime::Runtime,
     history: Vec<Message>,
     total_turns: u32,
@@ -420,7 +429,7 @@ impl RunAgentLeadDriver {
     /// Fails with `InvalidInput` when `cfg.per_round_max_turns` is 0 (every
     /// round would bust before its first turn, so the lead could never run),
     /// or with the OS error when the tokio runtime cannot be built.
-    pub fn new(cfg: LeadConfig, make_provider: ProviderFactory) -> std::io::Result<Self> {
+    pub fn new(cfg: LeadConfig, provider: LeadProvider) -> std::io::Result<Self> {
         if cfg.per_round_max_turns == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -440,7 +449,7 @@ impl RunAgentLeadDriver {
             .transpose()?;
         Ok(Self {
             cfg,
-            make_provider,
+            provider,
             rt,
             history: Vec::new(),
             total_turns: 0,
@@ -558,8 +567,11 @@ fn watch_for_interrupts(
     }
 }
 
-impl LeadDriver for RunAgentLeadDriver {
-    fn run_round(&mut self, ctx: &RoundContext) -> RoundOutcome {
+impl RunAgentLeadDriver {
+    /// Round `ctx.round`'s launch: `Origin::FlowLead` seeded with the whole
+    /// conversation so far, its turn ceiling, and the pause token the
+    /// interrupt watcher may cancel.
+    fn round_launch(&mut self, ctx: &RoundContext) -> (LaunchSpec, CancellationToken, u32) {
         let user_message =
             render_round_prompt(ctx, &self.cfg.goals, &self.cfg.objective, &self.cfg.scope);
         // The runner's turn index starts at `turn_index_offset` and `max_turns`
@@ -569,90 +581,70 @@ impl LeadDriver for RunAgentLeadDriver {
             .total_turns
             .saturating_add(self.cfg.per_round_max_turns);
         let transcript_path = round_transcript_path(&self.cfg.transcript_path, ctx.round);
-        // One ledger row per billed call, whatever the round's outcome: the
-        // runner reports a call before it writes the transcript, so a round
-        // that errors or busts its turns still has its spend counted.
-        let on_usage = self.cfg.usage_ledger.as_ref().map(|ledger| {
-            ledger.hook(
-                LedgerTag::default(),
-                self.cfg.run_id.clone(),
-                None,
-                transcript_path.clone(),
-                self.cfg.agent_name.clone(),
-                None,
-            )
-        });
         // This round's pause token. Never cancelled unless the watcher sees an
         // `interrupt: true` steering message while the round runs.
         let pause = CancellationToken::new();
-        let opts = LegacyRunOpts {
-            codename: None,
-            agent_name: self.cfg.agent_name.clone(),
-            agent_system_prompt: self.cfg.system_prompt.clone(),
-            // `Some(..)` always: the runner filters its registry to exactly this
-            // list, so an empty list is "no tools" (never "all builtins").
-            agent_tools: Some(self.cfg.agent_tools.clone()),
-            provider: (self.make_provider)(),
-            provider_name: self.cfg.provider_name.clone(),
-            model: self.cfg.model.clone(),
+        let provider = match &mut self.provider {
+            LeadProvider::Assembled => None,
+            LeadProvider::Injected {
+                provider,
+                model,
+                make,
+            } => Some(PreparedProvider::injected(
+                provider.clone(),
+                model.clone(),
+                make(),
+                &self.cfg.agent,
+                None,
+            )),
+        };
+        let spec = LaunchSpec {
+            agent: self.cfg.agent.clone(),
+            origin: Origin::FlowLead {
+                flow_id: self.cfg.run_id.clone(),
+                flow_dir: self.cfg.flow_dir.clone(),
+            },
             run_id: self.cfg.run_id.clone(),
-            workspace_id: self.cfg.workspace_id.clone(),
-            workspace_path: self.cfg.workspace_path.clone(),
             transcript_path,
-            max_turns: ceiling,
-            permission: rupu_tools::PermissionPolicy::bypass(),
-            tool_context: rupu_tools::ToolContext {
-                workspace: rupu_tools::WorkspaceScope {
-                    path: self.cfg.workspace_path.clone(),
-                    ..Default::default()
-                },
-                services: rupu_tools::ToolServices {
-                    findings: self.cfg.findings_engagement.clone().map(|engagement| {
-                        rupu_coverage::FindingWriteOptions {
-                            engagement: Some(engagement),
-                            ..Default::default()
-                        }
-                    }),
-                    customer: self.cfg.customer.clone(),
-                    ..Default::default()
-                },
+            codename: self.cfg.codename.clone(),
+            prompt: rupu_agent::UserTurn {
+                message: user_message,
+                initial_messages: self.history.clone(),
+                seed_source: None,
+                turn_index_offset: self.total_turns,
+            },
+            workspace: self.cfg.workspace.clone(),
+            // Unattended; the grant is the gate (see the type's docs).
+            mode: rupu_tools::PermissionMode::Bypass,
+            ceiling: None,
+            prompter: None,
+            overrides: Overrides {
+                max_turns: Some(ceiling),
+                // The limits the last round ended with (an overflow may have
+                // lowered them); resolved by the first round.
+                limits: Some(self.limits.clone()),
                 ..Default::default()
             },
-            user_message,
-            initial_messages: self.history.clone(),
-            turn_index_offset: self.total_turns,
-            no_stream: false,
-            suppress_stream_stdout: true,
-            mcp_registry: None,
-            effort: None,
-            thinking_display: None,
-            context_window: None,
-            output_format: None,
-            output_schema: None,
-            anthropic_task_budget: None,
-            anthropic_context_management: None,
-            anthropic_speed: None,
-            parent_run_id: None,
-            depth: 0,
-            dispatchable_agents: None,
-            step_id: String::new(),
-            on_tool_call: None,
-            on_stream_event: None,
-            on_usage,
-            concerns: None,
-            limits: self.limits.clone(),
-            scope_name: self.cfg.scope_name.clone(),
-            surface_tag: None,
+            stream: rupu_agent::StreamOpts {
+                suppress_stdout: true,
+                ..Default::default()
+            },
+            hooks: Default::default(),
             pause: Some(pause.clone()),
-            seed_source: None,
+            services: LaunchServices {
+                extra_tools: self.cfg.extra_tools.clone(),
+                provider,
+                ..Default::default()
+            },
             collectors: self.cfg.collectors.clone(),
-            extra_tools: self.cfg.extra_tools.clone(),
-            step_actions: Vec::new(),
-            // Inside the lead, `coverage.status` is the goal-coverage tool's
-            // legacy name (W1).
-            alias_scope: rupu_tools::AliasScope::FlowLead,
-            recovery: Default::default(),
         };
+        (spec, pause, ceiling)
+    }
+}
+
+impl LeadDriver for RunAgentLeadDriver {
+    fn run_round(&mut self, ctx: &RoundContext) -> RoundOutcome {
+        let (spec, pause, ceiling) = self.round_launch(ctx);
 
         let RunExit {
             result,
@@ -662,7 +654,20 @@ impl LeadDriver for RunAgentLeadDriver {
             // Armed only for the run itself: the slot is cleared again before
             // the result is looked at, and on unwind.
             let _armed = ArmedRound::arm(&self.round_token, &pause);
-            self.rt.block_on(run_agent_full(opts))
+            let assembler = Arc::clone(&self.cfg.assembler);
+            let limits = self.limits.clone();
+            self.rt.block_on(async move {
+                match rupu_runtime::run_agent(&assembler, spec).await {
+                    Ok(exit) => exit,
+                    // The round could not be assembled (its provider did not
+                    // build, say): an error round, the conversation intact.
+                    Err(e) => RunExit {
+                        result: Err(e.into_run_error()),
+                        final_limits: limits,
+                        messages: Vec::new(),
+                    },
+                }
+            })
         };
         self.limits = ModelLimits {
             note: None,
@@ -923,30 +928,56 @@ mod tests {
         }
     }
 
+    /// An assembler over a `RUPU_HOME` under `dir` (no credentials, the
+    /// default config).
+    fn assembler(dir: &std::path::Path, customer: Option<&str>) -> Arc<RunAssembler> {
+        let mut ctx = rupu_runtime::assembly::AssemblyContext::minimal(dir.join("home"));
+        ctx.customer = customer.map(str::to_string);
+        Arc::new(RunAssembler::new(ctx))
+    }
+
+    /// The lead agent: `tools: []` (what the launch site passes for a lead
+    /// file that lists none) plus any extra frontmatter.
+    fn lead_agent(frontmatter: &str) -> rupu_agent::AgentSpec {
+        rupu_agent::AgentSpec::parse(&format!(
+            "---\nname: lead\ntools: []\n{frontmatter}---\nYou are the lead.\n"
+        ))
+        .unwrap()
+    }
+
     fn lead_cfg(dir: &std::path::Path, per_round_max_turns: u32) -> LeadConfig {
         LeadConfig {
-            agent_name: "lead".into(),
-            system_prompt: "You are the lead.".into(),
-            provider_name: "mock".into(),
-            model: "mock-1".into(),
+            assembler: assembler(dir, None),
+            agent: lead_agent(""),
             per_round_max_turns,
             run_id: "run_lead_test".into(),
+            flow_dir: dir.to_path_buf(),
+            codename: None,
             transcript_path: dir.join("lead.jsonl"),
             objective: "Find 10 verified RCE issues.".into(),
             scope: no_scope(),
             goals: vec![],
-            workspace_id: "ws_lead_test".into(),
-            workspace_path: dir.to_path_buf(),
-            agent_tools: vec![],
+            workspace: WorkspaceBinding {
+                id: "ws_lead_test".into(),
+                path: dir.to_path_buf(),
+            },
             limits: rupu_providers::model_limits::ModelLimits::unknown(),
-            scope_name: None,
-            findings_engagement: None,
             extra_tools: Vec::new(),
             collectors: Vec::new(),
-            customer: None,
-            usage_ledger: None,
             steering_queue: None,
         }
+    }
+
+    /// A driver whose rounds run on `make`'s providers (`mock` / `mock-1`).
+    fn new_driver(cfg: LeadConfig, make: ProviderFactory) -> std::io::Result<RunAgentLeadDriver> {
+        RunAgentLeadDriver::new(
+            cfg,
+            LeadProvider::Injected {
+                provider: "mock".into(),
+                model: "mock-1".into(),
+                make,
+            },
+        )
     }
 
     fn text_turn(text: &str) -> ScriptedTurn {
@@ -996,7 +1027,7 @@ mod tests {
             vec![text_turn("Understood; planning.")],
             vec![text_turn("Round one done.")],
         ]);
-        let mut d = RunAgentLeadDriver::new(cfg, make).unwrap();
+        let mut d = new_driver(cfg, make).unwrap();
 
         let out0 = d.run_round(&round(0));
         assert_eq!(out0, RoundOutcome::Yielded);
@@ -1032,9 +1063,9 @@ mod tests {
     fn the_lead_records_its_customer_on_every_round_transcript() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = lead_cfg(dir.path(), 1);
-        cfg.customer = Some("acme".into());
+        cfg.assembler = assembler(dir.path(), Some("acme"));
         let make = scripted_factory(vec![vec![text_turn("planning")], vec![text_turn("done")]]);
-        let mut d = RunAgentLeadDriver::new(cfg, make).unwrap();
+        let mut d = new_driver(cfg, make).unwrap();
         d.run_round(&round(0));
         d.run_round(&round(1));
         for name in ["lead.r0.jsonl", "lead.r1.jsonl"] {
@@ -1046,14 +1077,14 @@ mod tests {
     #[test]
     fn a_leads_rounds_are_metered_into_its_usage_ledger() {
         let dir = tempfile::tempdir().unwrap();
-        let mut cfg = lead_cfg(dir.path(), 1);
+        // The lead's ledger is its flow directory's (`<flow_dir>/usage.jsonl`).
+        let cfg = lead_cfg(dir.path(), 1);
         let ledger_path = dir.path().join("usage.jsonl");
-        cfg.usage_ledger = Some(UsageLedger::open(ledger_path.clone()));
         let make = scripted_factory(vec![
             vec![text_turn("Round zero.")],
             vec![text_turn("Round one.")],
         ]);
-        let mut d = RunAgentLeadDriver::new(cfg, make).unwrap();
+        let mut d = new_driver(cfg, make).unwrap();
         assert_eq!(d.run_round(&round(0)), RoundOutcome::Yielded);
         assert_eq!(d.run_round(&round(1)), RoundOutcome::Yielded);
 
@@ -1077,16 +1108,6 @@ mod tests {
     }
 
     #[test]
-    fn a_lead_without_a_usage_ledger_writes_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let cfg = lead_cfg(dir.path(), 1);
-        let mut d =
-            RunAgentLeadDriver::new(cfg, scripted_factory(vec![vec![text_turn("hi")]])).unwrap();
-        assert_eq!(d.run_round(&round(0)), RoundOutcome::Yielded);
-        assert!(!dir.path().join("usage.jsonl").exists());
-    }
-
-    #[test]
     fn a_turn_budget_bust_is_reported_and_the_next_round_continues() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = lead_cfg(dir.path(), 1);
@@ -1100,7 +1121,7 @@ mod tests {
             stop: rupu_agent::StopReason::ToolUse,
         };
         let make = scripted_factory(vec![vec![busting], vec![text_turn("Caught up.")]]);
-        let mut d = RunAgentLeadDriver::new(cfg, make).unwrap();
+        let mut d = new_driver(cfg, make).unwrap();
 
         assert_eq!(d.run_round(&round(0)), RoundOutcome::TurnBudgetHit);
         assert_eq!(d.total_turns, 1);
@@ -1115,7 +1136,7 @@ mod tests {
         let cfg = lead_cfg(dir.path(), 4);
         // An exhausted script is a (non-retried) provider error.
         let make = scripted_factory(vec![vec![]]);
-        let mut d = RunAgentLeadDriver::new(cfg, make).unwrap();
+        let mut d = new_driver(cfg, make).unwrap();
 
         let out = d.run_round(&round(0));
         assert!(matches!(out, RoundOutcome::Error(_)), "{out:?}");
@@ -1133,7 +1154,7 @@ mod tests {
     fn zero_per_round_max_turns_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let make = scripted_factory(vec![]);
-        let err = RunAgentLeadDriver::new(lead_cfg(dir.path(), 0), make)
+        let err = new_driver(lead_cfg(dir.path(), 0), make)
             .err()
             .expect("0 must be rejected");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
@@ -1152,13 +1173,100 @@ mod tests {
             stop: rupu_agent::StopReason::ToolUse,
         };
         let make = scripted_factory(vec![vec![call, text_turn("done")]]);
-        let mut d = RunAgentLeadDriver::new(lead_cfg(dir.path(), 4), make).unwrap();
+        let mut d = new_driver(lead_cfg(dir.path(), 4), make).unwrap();
         assert_eq!(d.run_round(&round(0)), RoundOutcome::Yielded);
         let transcript = std::fs::read_to_string(dir.path().join("lead.r0.jsonl")).unwrap();
         assert!(
             transcript.contains("unknown tool: bash"),
             "bash must be refused when agent_tools is empty: {transcript}"
         );
+    }
+
+    /// Round 0 of a lead configured by `cfg`, assembled but not run: what
+    /// the assembler derives for an `Origin::FlowLead` round.
+    fn assembled_round(cfg: LeadConfig) -> rupu_runtime::assembly::AssembledRun {
+        let assembler = Arc::clone(&cfg.assembler);
+        let mut d = new_driver(cfg, scripted_factory(vec![vec![]])).unwrap();
+        let (spec, _, _) = d.round_launch(&round(0));
+        d.rt.block_on(async move {
+            match assembler.assemble(spec).await {
+                Ok(run) => run,
+                Err(e) => panic!("the lead's round assembles: {e}"),
+            }
+        })
+    }
+
+    /// R1: the lead resolves its model limits (here its frontmatter pins)
+    /// and carries its `fallbacks:` ladder — it used to run on
+    /// `ModelLimits::unknown()` with no recovery at all. Its frontmatter
+    /// pins reach the request too (R5).
+    #[test]
+    fn lead_gets_limits_and_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = lead_cfg(dir.path(), 1);
+        cfg.agent = lead_agent(
+            "maxTokens: 1234\ncontextWindowTokens: 9000\neffort: high\n\
+             fallbacks:\n  - model: m-2\n",
+        );
+        let run = assembled_round(cfg);
+        assert_eq!(run.opts.limits.output.tokens, Some(1234));
+        assert_eq!(run.opts.limits.input.tokens, Some(9000));
+        assert_eq!(
+            run.opts.recovery.chain,
+            vec![rupu_config::FallbackEntry {
+                provider: None,
+                model: "m-2".into(),
+            }]
+        );
+        assert!(run.opts.recovery.hop_builder.is_some());
+        assert_eq!(
+            run.opts.pins.effort,
+            Some(rupu_providers::model_tier::ThinkingLevel::High)
+        );
+    }
+
+    /// R5: the lead's findings are the run's `[findings]` base options (the
+    /// artifact store and its limits, not bare defaults) under the
+    /// agentiflow's scope and surface, and its `bash` has a netflow sink.
+    #[test]
+    fn lead_findings_base_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = rupu_runtime::assembly::AssemblyContext::minimal(dir.path().join("home"));
+        ctx.findings = rupu_coverage::FindingWriteOptions {
+            artifact_root: Some(dir.path().join("store")),
+            artifact_max_bytes: 7,
+            ..Default::default()
+        };
+        let mut cfg = lead_cfg(dir.path(), 1);
+        cfg.assembler = Arc::new(RunAssembler::new(ctx));
+        let run = assembled_round(cfg);
+        let services = &run.opts.tool_context.services;
+        let findings = services.findings.as_ref().expect("findings options");
+        assert_eq!(findings.artifact_max_bytes, 7);
+        assert_eq!(findings.artifact_root, Some(dir.path().join("store")));
+        assert!(services.netflow_sink.is_some(), "the round's netflow sink");
+        let id = run.identity();
+        assert_eq!(id.scope_name.as_deref(), Some("run_lead_test"));
+        assert_eq!(id.surface, rupu_tools::Surface::Agentiflow);
+    }
+
+    /// R6: the lead runs with the MCP/SCM registry, its codename and its
+    /// real workspace record.
+    #[test]
+    fn lead_has_codename_and_mcp() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = rupu_runtime::assembly::AssemblyContext::minimal(dir.path().join("home"));
+        ctx.scm = Some(Arc::new(rupu_scm::Registry::default()));
+        let mut cfg = lead_cfg(dir.path(), 1);
+        cfg.assembler = Arc::new(RunAssembler::new(ctx));
+        cfg.codename = Some("jade-reef/heron".into());
+        let run = assembled_round(cfg);
+        assert!(
+            run.opts.tool_context.services.scm.is_some(),
+            "the lead's MCP registry"
+        );
+        assert_eq!(run.identity().codename.as_deref(), Some("jade-reef/heron"));
+        assert_eq!(run.opts.tool_context.workspace.id, "ws_lead_test");
     }
 
     #[test]
@@ -1305,7 +1413,7 @@ mod tests {
         // Generation would take 30 s; only the interrupt can end the round
         // in the seconds this test allows.
         let (provider, started) = gated(Duration::from_secs(30));
-        let mut d = RunAgentLeadDriver::new(cfg, provider_sequence(vec![provider])).unwrap();
+        let mut d = new_driver(cfg, provider_sequence(vec![provider])).unwrap();
         let sender = enqueue_when_started(
             started,
             queue.clone(),
@@ -1349,8 +1457,7 @@ mod tests {
         let (blocked, started) = gated(Duration::from_secs(30));
         let follow_up: Box<dyn LlmProvider> =
             Box::new(MockProvider::new(vec![text_turn("Pivoting to auth.")]));
-        let mut d =
-            RunAgentLeadDriver::new(cfg, provider_sequence(vec![blocked, follow_up])).unwrap();
+        let mut d = new_driver(cfg, provider_sequence(vec![blocked, follow_up])).unwrap();
         let sender = enqueue_when_started(
             started,
             queue.clone(),
@@ -1446,7 +1553,7 @@ mod tests {
             })
             .unwrap();
         let (provider, started) = gated(Duration::from_millis(700));
-        let mut d = RunAgentLeadDriver::new(cfg, provider_sequence(vec![provider])).unwrap();
+        let mut d = new_driver(cfg, provider_sequence(vec![provider])).unwrap();
 
         assert_eq!(d.run_round(&round(0)), RoundOutcome::Yielded);
         assert!(started.load(Ordering::SeqCst));
@@ -1463,7 +1570,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = lead_cfg(dir.path(), 1);
         assert!(cfg.steering_queue.is_none());
-        let d = RunAgentLeadDriver::new(cfg, scripted_factory(vec![])).unwrap();
+        let d = new_driver(cfg, scripted_factory(vec![])).unwrap();
         assert!(d._watcher.is_none());
     }
 
@@ -1472,7 +1579,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = lead_cfg(dir.path(), 1);
         cfg.steering_queue = Some(OperatorQueue::new(dir.path()));
-        let d = RunAgentLeadDriver::new(cfg, scripted_factory(vec![])).unwrap();
+        let d = new_driver(cfg, scripted_factory(vec![])).unwrap();
         assert!(d._watcher.is_some());
         let began = Instant::now();
         drop(d);

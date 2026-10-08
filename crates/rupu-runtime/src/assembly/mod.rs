@@ -61,9 +61,33 @@ pub struct AssemblyContext {
     pub net_capture: Option<Arc<dyn rupu_netflow::SubprocessCapture>>,
 }
 
+impl AssemblyContext {
+    /// A context over the `RUPU_HOME` at `global` with the default config,
+    /// its auth file, no SCM registry, no customer and the default findings
+    /// options — a test's, or a site's starting point before it fills in
+    /// what it has.
+    pub fn minimal(global: PathBuf) -> Self {
+        Self {
+            resolver: Arc::new(rupu_auth::KeychainResolver::for_home(&global)),
+            global,
+            project_root: None,
+            config: rupu_config::Config::default(),
+            customer: None,
+            scm: None,
+            findings: rupu_coverage::FindingWriteOptions::default(),
+            net_capture: None,
+        }
+    }
+}
+
 /// Why a run could not be assembled.
 #[derive(Debug, thiserror::Error)]
 pub enum AssembleError {
+    /// The agent file is missing or does not parse. Raised by the site that
+    /// loads it (a workflow step's factory), before there is a spec to
+    /// assemble.
+    #[error("agent `{agent}` not found or failed to load: {message}")]
+    AgentLoad { agent: String, message: String },
     #[error(
         "provider '{0}' is not a built-in provider, is not a declared account (no \
          [providers.{0}] with a vendor `kind` — declare one with `rupu auth login --account {0} \
@@ -92,6 +116,34 @@ impl AssembleError {
             other => rupu_agent::RunError::Provider(other.to_string()),
         }
     }
+
+    /// Record the run this error stopped as a failed run, and return its
+    /// failure (W3 §3.6 — what the workflow step's error-stub providers used
+    /// to produce by failing the run's first call). A failed grant already
+    /// left its empty transcript ([`RunAssembler::assemble`]); everything
+    /// else writes the unstarted run's transcript
+    /// ([`rupu_agent::record_unstarted_run`]):
+    ///
+    /// - a missing agent, verbatim, with where it was looked for;
+    /// - an undeclared provider, as its config error;
+    /// - a provider that did not build, as the auth error a first call on
+    ///   it raised, with the `rupu auth login` hint.
+    pub fn record_unstarted(self, run: rupu_agent::UnstartedRun<'_>) -> rupu_agent::RunError {
+        use rupu_providers::ProviderError;
+        let failure = match self {
+            AssembleError::Grant(_) => return self.into_run_error(),
+            AssembleError::AgentLoad { .. } => ProviderError::Preflight(format!(
+                "{self}\n  Checked the project agents dir (.rupu/agents/) and the global agents dir."
+            )),
+            AssembleError::UnknownProvider(_) => ProviderError::Preflight(self.to_string()),
+            AssembleError::ProviderBuild {
+                provider, source, ..
+            } => ProviderError::AuthConfig(format!(
+                "{provider}: {source}\n  Run: rupu auth login --provider {provider} --mode <api-key|sso>"
+            )),
+        };
+        rupu_agent::record_unstarted_run(run, failure)
+    }
 }
 
 /// A run's provider, built ahead of its assembly ([`RunAssembler::prepare_provider`]):
@@ -102,6 +154,31 @@ pub struct PreparedProvider {
     pub model: String,
     provider: Box<dyn rupu_providers::LlmProvider>,
     pin: PinRule,
+    /// Limits known ahead, used as they are ([`Self::injected`]).
+    limits: Option<rupu_providers::model_limits::ModelLimits>,
+}
+
+impl PreparedProvider {
+    /// A provider the site built itself — a test's mock provider — under
+    /// `provider_name` / `model`, with `limits` used as they are (`None` =
+    /// resolved through the provider like any run's). The agent's pins
+    /// apply as for its own provider and model. Production sites build
+    /// theirs with [`RunAssembler::prepare_provider`].
+    pub fn injected(
+        provider_name: impl Into<String>,
+        model: impl Into<String>,
+        provider: Box<dyn rupu_providers::LlmProvider>,
+        agent: &rupu_agent::AgentSpec,
+        limits: Option<rupu_providers::model_limits::ModelLimits>,
+    ) -> Self {
+        Self {
+            provider_name: provider_name.into(),
+            model: model.into(),
+            provider,
+            pin: PinRule::for_run(agent, false, false),
+            limits,
+        }
+    }
 }
 
 /// A run ready to start: its options, and what the assembler opened for it.
@@ -127,6 +204,13 @@ impl AssembledRun {
     /// Take an admission slot (lending from an in-process parent) and run
     /// the agent loop; flush the run's netflow ledger at the end.
     pub async fn run(self) -> RunExit {
+        self.admit().await.run().await
+    }
+
+    /// Take the run's admission slot (lending from an in-process parent),
+    /// waiting for one when the machine is at its ceiling. The returned run
+    /// says how long it waited ([`AdmittedRun::permit`]).
+    pub async fn admit(self) -> AdmittedRun {
         let AssembledRun {
             opts,
             netflow,
@@ -151,6 +235,36 @@ impl AssembledRun {
                 "admission throttled the run"
             );
         }
+        AdmittedRun {
+            opts,
+            netflow,
+            permit,
+        }
+    }
+}
+
+/// An assembled run holding its admission slot ([`AssembledRun::admit`]).
+pub struct AdmittedRun {
+    opts: AgentRunOpts,
+    netflow: Option<rupu_netflow::NetflowWriterHandle>,
+    permit: Option<crate::admission::JobPermit>,
+}
+
+impl AdmittedRun {
+    /// The slot it holds — how long it waited for it. `None` for an origin
+    /// that skips admission.
+    pub fn permit(&self) -> Option<&crate::admission::JobPermit> {
+        self.permit.as_ref()
+    }
+
+    /// Run the agent loop; release the slot and flush the run's netflow
+    /// ledger at the end.
+    pub async fn run(self) -> RunExit {
+        let AdmittedRun {
+            opts,
+            netflow,
+            permit,
+        } = self;
         let exit = rupu_agent::run_agent_full(opts).await;
         drop(permit);
         if let Some(h) = netflow {
@@ -235,6 +349,15 @@ impl RunAssembler {
         (provider, model)
     }
 
+    /// The provider and model the run `spec` will run on: the provider it
+    /// was handed, else what it resolves to ([`Self::resolve_provider_model`]).
+    pub fn provider_model_of(&self, spec: &LaunchSpec) -> (String, String) {
+        match &spec.services.provider {
+            Some(p) => (p.provider_name.clone(), p.model.clone()),
+            None => self.resolve_provider_model(&spec.agent, &spec.overrides),
+        }
+    }
+
     /// The usage ledger and coverage stream of the run `run_id` of
     /// `origin`, per its row in [`defaults_for`].
     pub(crate) fn root_ledger_and_stream(
@@ -250,6 +373,8 @@ impl RunAssembler {
         };
         let ledger = match &d.usage {
             UsageRoot::OwnRun => Some(UsageLedger::open(runs.join(run_id).join("usage.jsonl"))),
+            // An in-memory workflow run (no run store, so no id) keeps none.
+            UsageRoot::WorkflowRun(id) if id.is_empty() => None,
             UsageRoot::WorkflowRun(id) => {
                 Some(UsageLedger::open(runs.join(id).join("usage.jsonl")))
             }
@@ -305,6 +430,7 @@ impl RunAssembler {
                 model,
                 provider,
                 pin,
+                limits: None,
             }),
             Err(source) => Err(AssembleError::ProviderBuild {
                 provider: provider_name,
@@ -341,6 +467,7 @@ impl RunAssembler {
             model,
             mut provider,
             pin: pins,
+            limits: known_limits,
         } = match prepared {
             Ok(p) => p,
             Err(e) => {
@@ -356,23 +483,24 @@ impl RunAssembler {
             prompt_cache: agent.anthropic_prompt_cache,
         };
 
-        // Limits: a session's stored ones as they are, else resolved through
-        // the provider (agent pin → config → live model list → unknown).
-        let limits = match spec.overrides.limits.clone() {
-            Some(l) if !l.is_unresolved() => {
-                rupu_providers::model_limits::ModelLimits { note: None, ..l }
-            }
-            _ => {
-                crate::model_limits::resolve(
-                    pins.limits,
-                    &provider_name,
-                    &model,
-                    provider.as_mut(),
-                    &self.limits_ctx,
-                )
-                .await
-            }
-        };
+        // Limits: an injected provider's as they are, else a session's (or
+        // the lead's previous round's) stored ones unless unresolved, else
+        // resolved through the provider (agent pin → config → live model
+        // list → unknown).
+        let limits =
+            match known_limits.or(spec.overrides.limits.clone().filter(|l| !l.is_unresolved())) {
+                Some(l) => rupu_providers::model_limits::ModelLimits { note: None, ..l },
+                None => {
+                    crate::model_limits::resolve(
+                        pins.limits,
+                        &provider_name,
+                        &model,
+                        provider.as_mut(),
+                        &self.limits_ctx,
+                    )
+                    .await
+                }
+            };
         let recovery = recovery_opts(
             &cfg.recovery,
             agent.fallbacks.as_deref(),
@@ -499,10 +627,7 @@ impl RunAssembler {
             on_usage: chain_usage(ledger_hook, spec.hooks.on_usage.clone()),
         };
 
-        let system_prompt = match spec.overrides.system_prompt_suffix.as_deref() {
-            Some(suffix) => format!("{}\n\n## Run target\n\n{suffix}", agent.system_prompt),
-            None => agent.system_prompt.clone(),
-        };
+        let system_prompt = system_prompt_for(agent, &spec.overrides);
         let parent_run_id = spec.origin.parent_run_id().map(str::to_string);
         let LaunchSpec {
             agent,
@@ -542,6 +667,15 @@ impl RunAssembler {
             admission: d.admission,
             usage_ledger,
         })
+    }
+}
+
+/// The system prompt a run of `agent` sends: the agent's, with the site's
+/// `## Run target` section appended.
+pub fn system_prompt_for(agent: &rupu_agent::AgentSpec, overrides: &Overrides) -> String {
+    match overrides.system_prompt_suffix.as_deref() {
+        Some(suffix) => format!("{}\n\n## Run target\n\n{suffix}", agent.system_prompt),
+        None => agent.system_prompt.clone(),
     }
 }
 

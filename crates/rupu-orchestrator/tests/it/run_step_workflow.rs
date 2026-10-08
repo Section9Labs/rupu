@@ -8,7 +8,6 @@
 //! made only of `run:` steps never calls a model, which is the point.
 
 use async_trait::async_trait;
-use rupu_agent::LegacyRunOpts;
 use rupu_config::policy_config::WorkflowConfig;
 use rupu_orchestrator::runner::{
     run_workflow, OrchestratorRunOpts, OrchestratorRunResult, RunStepPolicy, StepFactory,
@@ -16,7 +15,6 @@ use rupu_orchestrator::runner::{
 use rupu_orchestrator::{RunStore, StepKind, Workflow};
 use rupu_tools::PermissionMode;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 /// A factory that panics if used. A `run:` workflow must never reach for
@@ -25,17 +23,10 @@ struct NoAgentFactory;
 
 #[async_trait]
 impl StepFactory for NoAgentFactory {
-    async fn build_opts_for_step(
+    async fn launch_for_step(
         &self,
-        _step_id: &str,
-        _agent_name: &str,
-        _rendered_prompt: String,
-        _run_id: String,
-        _workspace_id: String,
-        _workspace_path: PathBuf,
-        _transcript_path: PathBuf,
-        _on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> LegacyRunOpts {
+        _request: rupu_orchestrator::StepRequest,
+    ) -> Result<rupu_orchestrator::StepLaunch, rupu_runtime::assembly::AssembleError> {
         panic!("a run: step must never dispatch an agent");
     }
 }

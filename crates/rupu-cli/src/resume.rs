@@ -13,7 +13,7 @@ use crate::paths;
 use anyhow::Context as _;
 use rupu_mcp::{McpPermission, ToolDispatcher};
 use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts, OrchestratorRunResult};
-use rupu_orchestrator::{DefaultStepFactory, RunStore, Workflow};
+use rupu_orchestrator::{RunStore, Workflow};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -398,7 +398,7 @@ async fn rebuild_opts_from_disk(
 
     // Netflow capture for this resumed run. This run's own linear steps
     // write to the SAME `<transcripts>/<run_id>.jsonl` file (mirrors
-    // `DefaultStepFactory::build_opts_for_step`'s per-step ledger/
+    // `DefaultStepFactory::launch_for_step`'s per-step ledger/
     // transcript naming for a linear step, which reuses the workflow's own
     // run id) — so this registry's sink and every step's own sink converge
     // on the one ledger for this run. The writer handle is intentionally
@@ -449,13 +449,6 @@ async fn rebuild_opts_from_disk(
         }
     };
 
-    // Hoisted above the dispatcher build: sub-agent dispatch resolves its
-    // provider/model through the same config-derived defaults the step
-    // factory below uses (ISSUES.md I-8).
-    let openai_compatible = rupu_runtime::provider_factory::openai_compatible_map(&cfg.providers);
-    let provider_tuning = rupu_runtime::provider_factory::provider_tuning_map(&cfg.providers);
-    let kinds = rupu_runtime::provider_factory::resolve_kind_map(&cfg.providers);
-    let limits_ctx = rupu_runtime::model_limits::LimitsContext::from_config(&cfg, &global);
     // The engagement the run was launched under (`--engagement-profile`),
     // shared by sub-agents, action steps and agent steps as at launch.
     let findings_base = rupu_coverage::FindingWriteOptions {
@@ -463,45 +456,43 @@ async fn rebuild_opts_from_disk(
         ..crate::findings_opts::base_options(&global, &cfg.findings)
     };
     // Process-wide subprocess-capture backend, warmed off the async runtime
-    // (its first call blocks). Shared by the dispatcher (children) and the
-    // step factory (this workflow's steps).
+    // (its first call blocks).
     let net_capture = crate::netflow_sink::net_capture(&cfg.netflow).await;
-    // Sub-agents dispatched from this run's steps are assembled like every
-    // other run (W3): this run's config, registry, engagement and capture.
-    let assembler = Arc::new(rupu_runtime::assembly::RunAssembler::new(
-        rupu_runtime::assembly::AssemblyContext {
-            global: global.clone(),
-            project_root: project_root.clone(),
-            config: cfg.clone(),
-            customer: cfg_paths.customer_slug.clone(),
-            resolver: Arc::clone(&resolver),
-            scm: Some(Arc::clone(&mcp_registry)),
-            findings: findings_base.clone(),
-            net_capture: Some(Arc::clone(&net_capture)),
-        },
-    ));
-    let dispatcher = rupu_orchestrator::subagents::workflow_dispatcher(
-        &assembler,
-        Arc::clone(&store_arc),
-        run_id,
-        &workflow.name,
-        rupu_runtime::assembly::WorkspaceBinding {
-            id: record.workspace_id.clone(),
-            path: workspace_path.clone(),
-        },
-        event_sink_for_resume.clone(),
-    );
-    // One codename namer for the whole run, shared by the orchestrator
-    // (static slots) and the sub-agent dispatcher (`>role#n`). Built over
-    // the same `<runs>/<run_id>` dir `run_workflow` would use, so both
-    // read and persist the one `codenames.json`.
-    let naming = Arc::new(rupu_orchestrator::codenames::RunNaming::open(
-        &workflow,
-        run_id,
-        Some(&store_arc.root.join(run_id)),
-    ));
-    dispatcher.set_namer(naming.namer());
-    let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
+    // Every agent this run starts — its steps and their sub-agents — is
+    // assembled over this run's config, registry, engagement and capture
+    // (W3); one construction with `workflow run` (R12).
+    let runtime =
+        rupu_orchestrator::WorkflowRuntime::new(rupu_orchestrator::WorkflowRuntimeInputs {
+            context: rupu_runtime::assembly::AssemblyContext {
+                global: global.clone(),
+                project_root: project_root.clone(),
+                config: cfg.clone(),
+                // The recorded customer (or, for a run that predates it, the
+                // one looked up above) — what the resumed steps are
+                // attributed to.
+                customer: cfg_paths.customer_slug.clone(),
+                resolver,
+                scm: Some(Arc::clone(&mcp_registry)),
+                findings: findings_base.clone(),
+                net_capture: Some(net_capture),
+            },
+            workflow: workflow.clone(),
+            run_id: run_id.to_string(),
+            workspace: rupu_runtime::assembly::WorkspaceBinding {
+                id: record.workspace_id.clone(),
+                path: workspace_path.clone(),
+            },
+            store: Arc::clone(&store_arc),
+            events: event_sink_for_resume.clone(),
+            mode: permission_mode,
+            // The run's `## Run target`, as launched (R8).
+            system_prompt_suffix: record.system_prompt_suffix.clone(),
+            // A resumed run is never an agentiflow unit (workflow units
+            // refuse gated workflows), so it keeps the workflow's own scope.
+            scope_name_override: None,
+        });
+    let naming = runtime.naming;
+    let factory = runtime.factory;
     let action_dispatcher = action_dispatcher_for(
         &mcp_registry,
         permission_mode,
@@ -522,35 +513,6 @@ async fn rebuild_opts_from_disk(
             provider: cfg.default_provider.clone(),
         }),
     );
-    let factory = Arc::new(DefaultStepFactory {
-        workflow: workflow.clone(),
-        global: global.clone(),
-        project_root: project_root.clone(),
-        resolver,
-        mode: permission_mode,
-        mcp_registry,
-        // The run's `## Run target`, as launched (R8).
-        system_prompt_suffix: record.system_prompt_suffix.clone(),
-        dispatcher: Some(dispatcher_dyn),
-        openai_compatible,
-        provider_tuning,
-        kinds,
-        default_provider: cfg.default_provider.clone(),
-        default_model: cfg.default_model.clone(),
-        bash_timeout_secs: cfg.bash.timeout_secs.unwrap_or(120),
-        bash_env_allowlist: cfg.bash.env_allowlist.clone().unwrap_or_default(),
-        findings_base,
-        limits_ctx,
-        providers: cfg.providers.clone(),
-        recovery: cfg.recovery.clone(),
-        // A resumed run is never an agentiflow unit (workflow units refuse
-        // gated workflows), so it keeps the workflow's own scope.
-        scope_name_override: None,
-        net_capture: Some(net_capture),
-        // The recorded customer (or, for a run that predates it, the one
-        // looked up above) — what the resumed steps are attributed to.
-        customer: cfg_paths.customer_slug.clone(),
-    });
 
     // Rebuild the `run:` step policy from the resolved mode + layered config
     // + workspace, exactly as the fresh-run path does

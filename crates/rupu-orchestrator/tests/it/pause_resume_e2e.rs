@@ -33,7 +33,6 @@
 use async_trait::async_trait;
 use rupu_agent::continuation::CONTINUATION_NOTE;
 use rupu_agent::runner::{CapturingMockProvider, MockProvider, ScriptedTurn};
-use rupu_agent::LegacyRunOpts;
 use rupu_orchestrator::executor::{AttemptResumeMode, Event, EventSink};
 use rupu_orchestrator::recovery::{discover, AttemptPlan, RecoveryPlans};
 use rupu_orchestrator::runner::{
@@ -46,7 +45,6 @@ use rupu_providers::types::{
     ContentBlock, LlmRequest, LlmResponse, Message, Role, StopReason, StreamEvent,
 };
 use rupu_providers::{LlmProvider, ProviderError, ProviderId};
-use rupu_tools::ToolContext;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -150,92 +148,46 @@ impl<P: LlmProvider> LlmProvider for CancelAfterInner<P> {
     }
 }
 
-/// Build a minimal `LegacyRunOpts` around `provider`. The runner always
+/// The launch of `request` as `agent_name` on `provider`. The runner always
 /// streams (`no_stream: true` only quiets the display), and it races that
 /// `provider.stream` call against the pause token — the deterministic
 /// boundary these tests exploit (mirrors `rupu_orchestrator::runner`'s own
 /// pause tests).
-#[allow(clippy::too_many_arguments)]
 fn linear_agent_opts(
     provider: Box<dyn LlmProvider>,
     agent_name: &str,
-    rendered_prompt: String,
-    run_id: String,
-    workspace_id: String,
-    workspace_path: PathBuf,
-    transcript_path: PathBuf,
-    on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-) -> LegacyRunOpts {
-    LegacyRunOpts {
-        seed_source: None,
-        collectors: Vec::new(),
-        extra_tools: Vec::new(),
+    request: rupu_orchestrator::StepRequest,
+) -> Result<rupu_orchestrator::StepLaunch, rupu_runtime::assembly::AssembleError> {
+    rupu_orchestrator::testing::MockRun {
         step_actions: Vec::new(),
-        alias_scope: Default::default(),
         agent_name: agent_name.to_string(),
         agent_system_prompt: "test".into(),
         agent_tools: None,
         provider,
         provider_name: "mock".into(),
         model: "mock-1".into(),
-        run_id,
-        workspace_id,
-        workspace_path,
-        transcript_path,
         max_turns: 5,
-        permission: rupu_tools::PermissionPolicy::bypass(),
-        tool_context: ToolContext::default(),
-        user_message: rendered_prompt,
-        initial_messages: Vec::new(),
-        turn_index_offset: 0,
         no_stream: true,
         suppress_stream_stdout: true,
-        mcp_registry: None,
-        effort: None,
-        thinking_display: None,
-        context_window: None,
-        output_format: None,
-        output_schema: None,
-        anthropic_task_budget: None,
-        anthropic_context_management: None,
-        anthropic_speed: None,
-        parent_run_id: None,
-        depth: 0,
         dispatchable_agents: None,
-        step_id: String::new(),
-        on_tool_call,
-        on_stream_event: None,
-        on_usage: None,
         concerns: None,
         limits: rupu_providers::model_limits::ModelLimits::unknown(),
-        scope_name: None,
-        surface_tag: None,
-        pause: None,
-        codename: None,
-        recovery: Default::default(),
+        ..Default::default()
     }
+    .launch(request)
 }
 
-/// Panics if `build_opts_for_step` is ever called — used where every unit
+/// Panics if `launch_for_step` is ever called — used where every unit
 /// is routed through a `UnitDispatcher` (fully-distributed fan-out), so
 /// local dispatch must never happen.
 struct PanicFactory;
 #[async_trait]
 impl StepFactory for PanicFactory {
-    async fn build_opts_for_step(
+    async fn launch_for_step(
         &self,
-        _step_id: &str,
-        _agent_name: &str,
-        _rendered_prompt: String,
-        _run_id: String,
-        _workspace_id: String,
-        _workspace_path: PathBuf,
-        _transcript_path: PathBuf,
-        _on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> LegacyRunOpts {
-        panic!(
-            "PanicFactory: build_opts_for_step must not be called for a fully-distributed fan-out"
-        )
+        _request: rupu_orchestrator::StepRequest,
+    ) -> Result<rupu_orchestrator::StepLaunch, rupu_runtime::assembly::AssembleError> {
+        panic!("PanicFactory: launch_for_step must not be called for a fully-distributed fan-out")
     }
 }
 
@@ -272,17 +224,13 @@ impl OneShotFactory {
 }
 #[async_trait]
 impl StepFactory for OneShotFactory {
-    async fn build_opts_for_step(
+    async fn launch_for_step(
         &self,
-        _step_id: &str,
-        agent_name: &str,
-        rendered_prompt: String,
-        run_id: String,
-        workspace_id: String,
-        workspace_path: PathBuf,
-        transcript_path: PathBuf,
-        on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> LegacyRunOpts {
+        request: rupu_orchestrator::StepRequest,
+    ) -> Result<rupu_orchestrator::StepLaunch, rupu_runtime::assembly::AssembleError> {
+        let agent_name = request.agent_name.clone();
+        let agent_name = agent_name.as_str();
+        let transcript_path = request.transcript_path.clone();
         *self.transcript_path_out.lock().unwrap() = Some(transcript_path.clone());
         let provider = self
             .provider
@@ -290,16 +238,7 @@ impl StepFactory for OneShotFactory {
             .unwrap()
             .take()
             .expect("OneShotFactory: provider already taken");
-        linear_agent_opts(
-            provider,
-            agent_name,
-            rendered_prompt,
-            run_id,
-            workspace_id,
-            workspace_path,
-            transcript_path,
-            on_tool_call,
-        )
+        linear_agent_opts(provider, agent_name, request)
     }
 }
 
@@ -571,17 +510,14 @@ struct CancelOnAlphaFactory {
 }
 #[async_trait]
 impl StepFactory for CancelOnAlphaFactory {
-    async fn build_opts_for_step(
+    async fn launch_for_step(
         &self,
-        step_id: &str,
-        agent_name: &str,
-        rendered_prompt: String,
-        run_id: String,
-        workspace_id: String,
-        workspace_path: PathBuf,
-        transcript_path: PathBuf,
-        on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> LegacyRunOpts {
+        request: rupu_orchestrator::StepRequest,
+    ) -> Result<rupu_orchestrator::StepLaunch, rupu_runtime::assembly::AssembleError> {
+        let step_id = request.step_id.clone();
+        let step_id = step_id.as_str();
+        let agent_name = request.agent_name.clone();
+        let agent_name = agent_name.as_str();
         assert_eq!(
             step_id, "alpha",
             "step-boundary pause must stop the loop before step 2 is ever dispatched"
@@ -595,16 +531,7 @@ impl StepFactory for CancelOnAlphaFactory {
             }]),
             token: self.token.clone(),
         };
-        linear_agent_opts(
-            Box::new(provider),
-            agent_name,
-            rendered_prompt,
-            run_id,
-            workspace_id,
-            workspace_path,
-            transcript_path,
-            on_tool_call,
-        )
+        linear_agent_opts(Box::new(provider), agent_name, request)
     }
 }
 
@@ -616,17 +543,15 @@ struct EchoFactory {
 }
 #[async_trait]
 impl StepFactory for EchoFactory {
-    async fn build_opts_for_step(
+    async fn launch_for_step(
         &self,
-        step_id: &str,
-        agent_name: &str,
-        rendered_prompt: String,
-        run_id: String,
-        workspace_id: String,
-        workspace_path: PathBuf,
-        transcript_path: PathBuf,
-        on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> LegacyRunOpts {
+        request: rupu_orchestrator::StepRequest,
+    ) -> Result<rupu_orchestrator::StepLaunch, rupu_runtime::assembly::AssembleError> {
+        let step_id = request.step_id.clone();
+        let step_id = step_id.as_str();
+        let agent_name = request.agent_name.clone();
+        let agent_name = agent_name.as_str();
+        let rendered_prompt = request.rendered_prompt.clone();
         self.seen.lock().unwrap().push(step_id.to_string());
         let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
             text: format!("done: {rendered_prompt}"),
@@ -634,16 +559,7 @@ impl StepFactory for EchoFactory {
             input_tokens: 1,
             output_tokens: 1,
         }]);
-        linear_agent_opts(
-            Box::new(provider),
-            agent_name,
-            rendered_prompt,
-            run_id,
-            workspace_id,
-            workspace_path,
-            transcript_path,
-            on_tool_call,
-        )
+        linear_agent_opts(Box::new(provider), agent_name, request)
     }
 }
 
@@ -1082,17 +998,13 @@ steps:
 struct FastOrHangFactory;
 #[async_trait]
 impl StepFactory for FastOrHangFactory {
-    async fn build_opts_for_step(
+    async fn launch_for_step(
         &self,
-        _step_id: &str,
-        agent_name: &str,
-        rendered_prompt: String,
-        run_id: String,
-        workspace_id: String,
-        workspace_path: PathBuf,
-        transcript_path: PathBuf,
-        on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> LegacyRunOpts {
+        request: rupu_orchestrator::StepRequest,
+    ) -> Result<rupu_orchestrator::StepLaunch, rupu_runtime::assembly::AssembleError> {
+        let agent_name = request.agent_name.clone();
+        let agent_name = agent_name.as_str();
+        let rendered_prompt = request.rendered_prompt.clone();
         let provider: Box<dyn LlmProvider> = if rendered_prompt.contains("slow") {
             Box::new(BlockingProvider)
         } else {
@@ -1103,16 +1015,7 @@ impl StepFactory for FastOrHangFactory {
                 output_tokens: 1,
             }]))
         };
-        linear_agent_opts(
-            provider,
-            agent_name,
-            rendered_prompt,
-            run_id,
-            workspace_id,
-            workspace_path,
-            transcript_path,
-            on_tool_call,
-        )
+        linear_agent_opts(provider, agent_name, request)
     }
 }
 
@@ -1272,17 +1175,13 @@ impl RecoverFactory {
 }
 #[async_trait]
 impl StepFactory for RecoverFactory {
-    async fn build_opts_for_step(
+    async fn launch_for_step(
         &self,
-        _step_id: &str,
-        agent_name: &str,
-        rendered_prompt: String,
-        run_id: String,
-        workspace_id: String,
-        workspace_path: PathBuf,
-        transcript_path: PathBuf,
-        on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> LegacyRunOpts {
+        request: rupu_orchestrator::StepRequest,
+    ) -> Result<rupu_orchestrator::StepLaunch, rupu_runtime::assembly::AssembleError> {
+        let agent_name = request.agent_name.clone();
+        let agent_name = agent_name.as_str();
+        let rendered_prompt = request.rendered_prompt.clone();
         self.built.lock().unwrap().push(rendered_prompt.clone());
         let unit = rendered_prompt.trim_start_matches("Process ").to_string();
         let provider: Box<dyn LlmProvider> = if self.hang_b && unit == "b" {
@@ -1300,18 +1199,7 @@ impl StepFactory for RecoverFactory {
                 .insert(rendered_prompt.clone(), p.captured.clone());
             Box::new(p)
         };
-        let mut opts = linear_agent_opts(
-            provider,
-            agent_name,
-            rendered_prompt,
-            run_id,
-            workspace_id,
-            workspace_path.clone(),
-            transcript_path,
-            on_tool_call,
-        );
-        opts.tool_context.workspace.path = workspace_path;
-        opts
+        linear_agent_opts(provider, agent_name, request)
     }
 }
 

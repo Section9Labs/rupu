@@ -49,9 +49,13 @@ rupu-orchestrator = { path = "../rupu-orchestrator" }
 # ledger-backed `budget.usd` meter. rupu-config is foundational (it depends on
 # no other in-workspace crate), so this edge is acyclic.
 rupu-config = { path = "../rupu-config" }
+# The lead's and the run's codenames, minted at flow start. A leaf crate.
+rupu-codename = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# An (empty) SCM registry for the lead's MCP test.
+rupu-scm = { path = "../rupu-scm" }
 tracing-subscriber = { workspace = true }
 # The log-capture tests install thread-local `tracing` subscribers, which
 # mutate process-global tracing state (the callsite interest cache + the global

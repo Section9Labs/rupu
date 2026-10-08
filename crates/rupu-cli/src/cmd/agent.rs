@@ -622,23 +622,12 @@ async fn create(
             // ISSUES.md I-74: pass the operator's `[providers.<name>]`
             // settings through instead of silently generating with none.
             // (`gen_cfg` was loaded above, alongside the resolver.)
-            let gen_provider_config = rupu_runtime::provider_factory::ProviderConfig {
-                anthropic_oauth_system_prefix: None,
-                anthropic_prompt_cache: None,
-                anthropic_server_side_fallback: Some(gen_cfg.recovery.server_side_fallback),
-                openai_compatible: rupu_runtime::provider_factory::openai_compatible_params(
-                    &req.provider,
-                    &gen_cfg.providers,
-                ),
-                tuning: Some(rupu_runtime::provider_factory::provider_tuning(
-                    &req.provider,
-                    &gen_cfg.providers,
-                )),
-                kind: rupu_runtime::provider_factory::resolve_kind(
-                    &req.provider,
-                    &gen_cfg.providers,
-                ),
-            };
+            let gen_provider_config = rupu_runtime::provider_factory::ProviderConfig::for_agent(
+                &req.provider,
+                &gen_cfg.providers,
+                Default::default(),
+                Some(gen_cfg.recovery.server_side_fallback),
+            );
             let outcome =
                 rupu_orchestrator::generate_definition(&req, &resolver, &gen_provider_config)
                     .await?;

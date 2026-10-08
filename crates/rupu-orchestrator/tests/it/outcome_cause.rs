@@ -9,14 +9,12 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use rupu_agent::runner::{MockProvider, ScriptedTurn};
-use rupu_agent::LegacyRunOpts;
 use rupu_orchestrator::executor::{Event, EventSink};
 use rupu_orchestrator::runner::{
     run_reject_cleanup, run_workflow, OrchestratorRunOpts, ResumeState, StepFactory,
 };
 use rupu_orchestrator::{ApprovalDecision, RunStatus, RunStore, StepResult, Workflow};
 use rupu_providers::types::{ContentBlock, Stop, StopReason, Usage};
-use rupu_tools::ToolContext;
 
 #[derive(Default)]
 struct CollectSink {
@@ -47,17 +45,13 @@ fn refusal_turn() -> ScriptedTurn {
 
 #[async_trait]
 impl StepFactory for RefusingFactory {
-    async fn build_opts_for_step(
+    async fn launch_for_step(
         &self,
-        step_id: &str,
-        agent_name: &str,
-        rendered_prompt: String,
-        run_id: String,
-        workspace_id: String,
-        workspace_path: std::path::PathBuf,
-        transcript_path: std::path::PathBuf,
-        on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> LegacyRunOpts {
+        request: rupu_orchestrator::StepRequest,
+    ) -> Result<rupu_orchestrator::StepLaunch, rupu_runtime::assembly::AssembleError> {
+        let agent_name = request.agent_name.clone();
+        let agent_name = agent_name.as_str();
+        let rendered_prompt = request.rendered_prompt.clone();
         let turns = if rendered_prompt.contains("INTERIM") {
             // An interim message plus a tool call, then a refusal on the
             // final turn: the interim text is not the step's answer.
@@ -81,54 +75,23 @@ impl StepFactory for RefusingFactory {
                 output_tokens: 1,
             }]
         };
-        LegacyRunOpts {
-            seed_source: None,
-            collectors: Vec::new(),
-            extra_tools: Vec::new(),
+        rupu_orchestrator::testing::MockRun {
             step_actions: Vec::new(),
-            alias_scope: Default::default(),
             agent_name: agent_name.to_string(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
             provider: Box::new(MockProvider::new(turns)),
             provider_name: "mock".into(),
             model: "mock-1".into(),
-            run_id,
-            workspace_id,
-            workspace_path,
-            transcript_path,
             max_turns: 5,
-            permission: rupu_tools::PermissionPolicy::bypass(),
-            tool_context: ToolContext::default(),
-            user_message: rendered_prompt,
-            initial_messages: Vec::new(),
-            turn_index_offset: 0,
             no_stream: true,
             suppress_stream_stdout: true,
-            mcp_registry: None,
-            effort: None,
-            thinking_display: None,
-            context_window: None,
-            output_format: None,
-            output_schema: None,
-            anthropic_task_budget: None,
-            anthropic_context_management: None,
-            anthropic_speed: None,
-            parent_run_id: None,
-            depth: 0,
             dispatchable_agents: None,
-            step_id: step_id.to_string(),
-            on_tool_call,
-            on_stream_event: None,
-            on_usage: None,
             concerns: None,
             limits: rupu_providers::model_limits::ModelLimits::unknown(),
-            scope_name: None,
-            surface_tag: None,
-            pause: None,
-            codename: None,
-            recovery: Default::default(),
+            ..Default::default()
         }
+        .launch(request)
     }
 }
 

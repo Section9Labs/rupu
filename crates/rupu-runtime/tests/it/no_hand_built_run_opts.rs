@@ -5,32 +5,13 @@
 //!
 //! Source-text scan of `crates/*/src/**/*.rs` with `#[cfg(test)]` items
 //! blanked out. Declarations (`struct`, `impl`) and destructuring patterns
-//! (`let X { .. } =`) are not constructions.
-//!
-//! TEMPORARY allowances (W3a), each deleted by W3b when it migrates the site
-//! onto the assembler: workflow steps (`DefaultStepFactory`) and the
-//! agentiflow lead still build the flat `LegacyRunOpts` (and its
-//! `ToolContext`), and `rupu-agent`'s `legacy` adapter turns those into
-//! `AgentRunOpts`. Nothing else may build either.
+//! (`let X { .. } =`) are not constructions. No exceptions: every launch
+//! site — `rupu run`, sub-agents, session turns, workflow steps and the
+//! agentiflow lead — goes through the assembler (W3a + W3b).
 
 use std::path::{Path, PathBuf};
 
-/// `(file, literal)` pairs W3a still allows. W3b empties this list.
-const W3B_ADAPTER: &[(&str, &str)] = &[
-    (
-        "crates/rupu-orchestrator/src/step_factory.rs",
-        "LegacyRunOpts",
-    ),
-    (
-        "crates/rupu-orchestrator/src/step_factory.rs",
-        "ToolContext",
-    ),
-    ("crates/rupu-agentiflow/src/lead.rs", "LegacyRunOpts"),
-    ("crates/rupu-agentiflow/src/lead.rs", "ToolContext"),
-    ("crates/rupu-agent/src/legacy.rs", "AgentRunOpts"),
-];
-
-const TYPES: &[&str] = &["AgentRunOpts", "LegacyRunOpts", "ToolContext"];
+const TYPES: &[&str] = &["AgentRunOpts", "ToolContext"];
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -149,9 +130,6 @@ fn no_hand_built_run_opts() {
             .replace('\\', "/");
         let src = without_test_items(&std::fs::read_to_string(&file).unwrap());
         for (ty, line) in hits(&src) {
-            if W3B_ADAPTER.iter().any(|(f, t)| *f == rel && *t == ty) {
-                continue;
-            }
             offenders.push(format!("{rel}:{line}: `{ty} {{` built by hand"));
         }
     }
@@ -165,14 +143,9 @@ fn no_hand_built_run_opts() {
 
 /// The other half of "one entry point" (§3.1): only the assembler starts the
 /// agent loop. Production code outside `rupu-agent` and the assembler never
-/// calls `rupu_agent::run_agent*` — except the two W3a adapter sites, which
-/// go through `rupu_agent::legacy`.
+/// calls `rupu_agent::run_agent*`.
 #[test]
 fn only_the_assembler_runs_agents() {
-    const ADAPTER_CALLERS: &[&str] = &[
-        "crates/rupu-orchestrator/src/runner.rs",
-        "crates/rupu-agentiflow/src/lead.rs",
-    ];
     let root = workspace_root();
     let mut files = Vec::new();
     for krate in std::fs::read_dir(root.join("crates")).unwrap().flatten() {
@@ -193,11 +166,14 @@ fn only_the_assembler_runs_agents() {
         let src = without_test_items(&std::fs::read_to_string(&file).unwrap());
         for (n, line) in src.lines().enumerate() {
             let code = line.split("//").next().unwrap_or("");
-            let direct = ["rupu_agent::run_agent", "runner::run_agent"]
-                .iter()
-                .any(|c| code.contains(c));
-            let legacy = code.contains("rupu_agent::legacy::run_agent");
-            if direct || (legacy && !ADAPTER_CALLERS.contains(&rel.as_str())) {
+            let direct = [
+                "rupu_agent::run_agent",
+                "runner::run_agent",
+                "legacy::run_agent",
+            ]
+            .iter()
+            .any(|c| code.contains(c));
+            if direct {
                 offenders.push(format!("{rel}:{}: {}", n + 1, line.trim()));
             }
         }

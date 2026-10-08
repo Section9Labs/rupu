@@ -11,7 +11,7 @@
 
 use async_trait::async_trait;
 use rupu_agent::runner::{MockProvider, ScriptedTurn};
-use rupu_agent::{LegacyRunOpts, RunError};
+use rupu_agent::RunError;
 use rupu_orchestrator::runner::{
     run_workflow, OrchestratorRunOpts, StepFactory, UnitCoverage, UnitDispatch, UnitDispatcher,
     UnitFailure, UnitOutcome,
@@ -19,9 +19,7 @@ use rupu_orchestrator::runner::{
 use rupu_orchestrator::runs::AttemptRecord;
 use rupu_orchestrator::{RunStore, Workflow};
 use rupu_providers::types::StopReason;
-use rupu_tools::ToolContext;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 /// Hands every agent its own single-turn `MockProvider`, so a fan-out's units
@@ -30,71 +28,38 @@ struct EchoFactory;
 
 #[async_trait]
 impl StepFactory for EchoFactory {
-    async fn build_opts_for_step(
+    async fn launch_for_step(
         &self,
-        step_id: &str,
-        agent_name: &str,
-        rendered_prompt: String,
-        run_id: String,
-        workspace_id: String,
-        workspace_path: PathBuf,
-        transcript_path: PathBuf,
-        on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> LegacyRunOpts {
+        request: rupu_orchestrator::StepRequest,
+    ) -> Result<rupu_orchestrator::StepLaunch, rupu_runtime::assembly::AssembleError> {
+        let step_id = request.step_id.clone();
+        let step_id = step_id.as_str();
+        let agent_name = request.agent_name.clone();
+        let agent_name = agent_name.as_str();
+        let rendered_prompt = request.rendered_prompt.clone();
         let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
             text: format!("step {step_id} echo: {rendered_prompt}"),
             stop: StopReason::EndTurn,
             input_tokens: 1,
             output_tokens: 1,
         }]);
-        LegacyRunOpts {
-            seed_source: None,
-            recovery: Default::default(),
-            collectors: Vec::new(),
-            extra_tools: Vec::new(),
+        rupu_orchestrator::testing::MockRun {
             step_actions: Vec::new(),
-            alias_scope: Default::default(),
             agent_name: agent_name.to_string(),
             agent_system_prompt: "echo".into(),
             agent_tools: None,
             provider: Box::new(provider),
             provider_name: "mock".into(),
             model: "mock-1".into(),
-            run_id,
-            workspace_id,
-            workspace_path,
-            transcript_path,
             max_turns: 5,
-            permission: rupu_tools::PermissionPolicy::bypass(),
-            tool_context: ToolContext::default(),
-            user_message: rendered_prompt,
-            initial_messages: Vec::new(),
-            turn_index_offset: 0,
             no_stream: true,
             suppress_stream_stdout: true,
-            mcp_registry: None,
-            effort: None,
-            thinking_display: None,
-            context_window: None,
-            output_format: None,
-            output_schema: None,
-            anthropic_task_budget: None,
-            anthropic_context_management: None,
-            anthropic_speed: None,
-            parent_run_id: None,
-            depth: 0,
             dispatchable_agents: None,
-            step_id: step_id.to_string(),
-            on_tool_call,
-            on_stream_event: None,
-            on_usage: None,
             concerns: None,
             limits: rupu_providers::model_limits::ModelLimits::unknown(),
-            scope_name: None,
-            surface_tag: None,
-            pause: None,
-            codename: None,
+            ..Default::default()
         }
+        .launch(request)
     }
 }
 
@@ -104,17 +69,10 @@ struct PanicFactory;
 
 #[async_trait]
 impl StepFactory for PanicFactory {
-    async fn build_opts_for_step(
+    async fn launch_for_step(
         &self,
-        _step_id: &str,
-        _agent_name: &str,
-        _rendered_prompt: String,
-        _run_id: String,
-        _workspace_id: String,
-        _workspace_path: PathBuf,
-        _transcript_path: PathBuf,
-        _on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> LegacyRunOpts {
+        _request: rupu_orchestrator::StepRequest,
+    ) -> Result<rupu_orchestrator::StepLaunch, rupu_runtime::assembly::AssembleError> {
         panic!("PanicFactory: placed attempts must not build a local agent");
     }
 }

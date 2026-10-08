@@ -70,12 +70,9 @@ fn field_is_set(block: &str, field: &str) -> bool {
 
 #[test]
 fn every_production_tool_context_sets_sink_and_capture() {
-    for rel in [
-        "crates/rupu-runtime/src/assembly/mod.rs",
-        // The flat options workflow steps still build (W3b moves them onto
-        // the assembler).
-        "crates/rupu-orchestrator/src/step_factory.rs",
-    ] {
+    // The only production `ToolContext` literal: the assembler's
+    // (`rupu-runtime`'s `no_hand_built_run_opts` refuses any other).
+    for rel in ["crates/rupu-runtime/src/assembly/mod.rs"] {
         let blocks = tool_context_blocks(&production_source(rel));
         assert!(!blocks.is_empty(), "{rel}: no production ToolContext found");
         for b in blocks {
@@ -98,6 +95,7 @@ fn every_production_assembler_gets_the_capture() {
         "crates/rupu-cli/src/cmd/session.rs",
         "crates/rupu-cli/src/cmd/workflow.rs",
         "crates/rupu-cli/src/resume.rs",
+        "crates/rupu-cli/src/cmd/agentiflow.rs",
     ] {
         let src = production_source(rel);
         let mut seen = 0;
@@ -110,22 +108,5 @@ fn every_production_assembler_gets_the_capture() {
             );
         }
         assert!(seen > 0, "{rel}: expected a production assembler");
-    }
-}
-
-#[test]
-fn every_production_step_factory_gets_a_capture() {
-    for rel in [
-        "crates/rupu-cli/src/cmd/workflow.rs",
-        "crates/rupu-cli/src/resume.rs",
-    ] {
-        let src = production_source(rel);
-        for chunk in src.split("DefaultStepFactory {").skip(1) {
-            let body = &chunk[..chunk.find("});").expect("literal end")];
-            assert!(
-                body.contains("net_capture: Some("),
-                "{rel}: DefaultStepFactory without net_capture: Some(..)"
-            );
-        }
     }
 }

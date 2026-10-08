@@ -292,7 +292,9 @@ impl AgentDispatcher for InProcessDispatcher {
             Err(e) => {
                 self.emit_completed(&parent.run_id, failed(&sub_run_id, None));
                 return Err(match e {
-                    AssembleError::UnknownProvider(_) | AssembleError::ProviderBuild { .. } => {
+                    AssembleError::AgentLoad { .. }
+                    | AssembleError::UnknownProvider(_)
+                    | AssembleError::ProviderBuild { .. } => {
                         DispatchError::ProviderBuild(e.to_string())
                     }
                     AssembleError::Grant(_) => DispatchError::ChildRun(e.to_string()),

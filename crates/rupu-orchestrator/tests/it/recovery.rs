@@ -9,15 +9,12 @@
 //! exactly which attempts the run made.
 
 use chrono::Utc;
-use rupu_agent::legacy::run_agent;
 use rupu_agent::runner::{MockProvider, ScriptedTurn};
-use rupu_agent::LegacyRunOpts;
 use rupu_orchestrator::executor::{Event, EventSink, JsonlSink};
 use rupu_orchestrator::recovery::{discover, AttemptPlan, PlanCounts, RecoveryPlans};
 use rupu_orchestrator::runs::AttemptRecord;
 use rupu_orchestrator::{RunStore, Workflow};
 use rupu_providers::types::StopReason;
-use rupu_tools::ToolContext;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -46,61 +43,48 @@ impl Fx {
             .join(format!("{name}.jsonl"))
     }
 
-    fn opts(&self, provider: MockProvider, name: &str) -> LegacyRunOpts {
-        LegacyRunOpts {
-            seed_source: None,
-            recovery: Default::default(),
-            collectors: Vec::new(),
-            extra_tools: Vec::new(),
+    /// Run `provider` as a step agent writing the transcript `name`.
+    async fn run(
+        &self,
+        provider: MockProvider,
+        name: &str,
+    ) -> Result<rupu_agent::RunResult, rupu_agent::RunError> {
+        let launch = rupu_orchestrator::testing::MockRun {
             step_actions: Vec::new(),
-            alias_scope: Default::default(),
             agent_name: "worker".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
             provider: Box::new(provider),
             provider_name: "mock".into(),
             model: "mock-1".into(),
-            run_id: name.to_string(),
-            workspace_id: "ws_recovery".into(),
-            workspace_path: self.tmp.path().to_path_buf(),
-            transcript_path: self.transcript(name),
             max_turns: 5,
-            permission: rupu_tools::PermissionPolicy::bypass(),
-            tool_context: ToolContext {
-                workspace: rupu_tools::WorkspaceScope {
-                    path: self.tmp.path().to_path_buf(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-            user_message: "go".into(),
-            initial_messages: Vec::new(),
-            turn_index_offset: 0,
             no_stream: true,
             suppress_stream_stdout: true,
-            mcp_registry: None,
-            effort: None,
-            thinking_display: None,
-            context_window: None,
-            output_format: None,
-            output_schema: None,
-            anthropic_task_budget: None,
-            anthropic_context_management: None,
-            anthropic_speed: None,
-            parent_run_id: None,
-            depth: 0,
             dispatchable_agents: None,
-            step_id: String::new(),
-            on_tool_call: None,
-            on_stream_event: None,
-            on_usage: None,
             concerns: None,
             limits: rupu_providers::model_limits::ModelLimits::unknown(),
-            scope_name: None,
-            surface_tag: None,
-            pause: None,
-            codename: None,
+            ..Default::default()
         }
+        .launch(rupu_orchestrator::StepRequest {
+            step_id: "s".into(),
+            agent_name: "worker".into(),
+            rendered_prompt: "go".into(),
+            run_id: name.into(),
+            workflow_run_id: String::new(),
+            workflow_name: "recovery".into(),
+            unit: None,
+            workspace: rupu_runtime::assembly::WorkspaceBinding {
+                id: "ws_recovery".into(),
+                path: self.tmp.path().to_path_buf(),
+            },
+            transcript_path: self.transcript(name),
+            on_tool_call: None,
+        })
+        .expect("launch");
+        rupu_runtime::run_agent(&launch.assembler, launch.spec)
+            .await
+            .expect("assembles")
+            .result
     }
 
     /// A real two-turn run: turn 1 reads `notes.txt`, turn 2 answers `answer`.
@@ -120,7 +104,7 @@ impl Fx {
                 output_tokens: 1,
             },
         ]);
-        run_agent(self.opts(provider, name)).await.unwrap();
+        self.run(provider, name).await.unwrap();
         self.transcript(name)
     }
 
@@ -147,7 +131,7 @@ impl Fx {
     /// A run whose provider fails: its transcript ends `run_complete: error`.
     async fn failed(&self, name: &str) -> PathBuf {
         let provider = MockProvider::new(vec![ScriptedTurn::ProviderError("boom".into())]);
-        let _ = run_agent(self.opts(provider, name)).await;
+        let _ = self.run(provider, name).await;
         self.transcript(name)
     }
 

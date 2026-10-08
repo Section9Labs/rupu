@@ -1,10 +1,8 @@
 use async_trait::async_trait;
 use rupu_agent::runner::{MockProvider, ScriptedTurn};
-use rupu_agent::LegacyRunOpts;
 use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts, StepFactory};
 use rupu_orchestrator::Workflow;
 use rupu_providers::types::StopReason;
-use rupu_tools::ToolContext;
 use std::sync::Arc;
 
 // Note: ItemResult is reachable via res.step_results[i].items; we don't
@@ -28,17 +26,15 @@ struct FakeFactory;
 
 #[async_trait]
 impl StepFactory for FakeFactory {
-    async fn build_opts_for_step(
+    async fn launch_for_step(
         &self,
-        step_id: &str,
-        agent_name: &str,
-        rendered_prompt: String,
-        run_id: String,
-        workspace_id: String,
-        workspace_path: std::path::PathBuf,
-        transcript_path: std::path::PathBuf,
-        on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> LegacyRunOpts {
+        request: rupu_orchestrator::StepRequest,
+    ) -> Result<rupu_orchestrator::StepLaunch, rupu_runtime::assembly::AssembleError> {
+        let step_id = request.step_id.clone();
+        let step_id = step_id.as_str();
+        let agent_name = request.agent_name.clone();
+        let agent_name = agent_name.as_str();
+        let rendered_prompt = request.rendered_prompt.clone();
         // Produce a single assistant text turn that echoes the
         // rendered prompt + records which (parent step, sub agent)
         // pair dispatched it. Tests assert against this output.
@@ -48,54 +44,23 @@ impl StepFactory for FakeFactory {
             input_tokens: 1,
             output_tokens: 1,
         }]);
-        LegacyRunOpts {
-            seed_source: None,
-            collectors: Vec::new(),
-            extra_tools: Vec::new(),
+        rupu_orchestrator::testing::MockRun {
             step_actions: Vec::new(),
-            alias_scope: Default::default(),
             agent_name: format!("ag-{agent_name}"),
             agent_system_prompt: "echo".into(),
             agent_tools: None,
             provider: Box::new(provider),
             provider_name: "mock".into(),
             model: "mock-1".into(),
-            run_id,
-            workspace_id,
-            workspace_path,
-            transcript_path,
             max_turns: 5,
-            permission: rupu_tools::PermissionPolicy::bypass(),
-            tool_context: ToolContext::default(),
-            user_message: rendered_prompt,
-            initial_messages: Vec::new(),
-            turn_index_offset: 0,
             no_stream: false,
             suppress_stream_stdout: false,
-            mcp_registry: None,
-            effort: None,
-            thinking_display: None,
-            context_window: None,
-            output_format: None,
-            output_schema: None,
-            anthropic_task_budget: None,
-            anthropic_context_management: None,
-            anthropic_speed: None,
-            parent_run_id: None,
-            depth: 0,
             dispatchable_agents: None,
-            step_id: step_id.to_string(),
-            on_tool_call,
-            on_stream_event: None,
-            on_usage: None,
             concerns: None,
             limits: rupu_providers::model_limits::ModelLimits::unknown(),
-            scope_name: None,
-            surface_tag: None,
-            pause: None,
-            codename: None,
-            recovery: Default::default(),
+            ..Default::default()
         }
+        .launch(request)
     }
 }
 
@@ -503,17 +468,15 @@ struct FailingFactory;
 
 #[async_trait]
 impl StepFactory for FailingFactory {
-    async fn build_opts_for_step(
+    async fn launch_for_step(
         &self,
-        step_id: &str,
-        agent_name: &str,
-        rendered_prompt: String,
-        run_id: String,
-        workspace_id: String,
-        workspace_path: std::path::PathBuf,
-        transcript_path: std::path::PathBuf,
-        on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> LegacyRunOpts {
+        request: rupu_orchestrator::StepRequest,
+    ) -> Result<rupu_orchestrator::StepLaunch, rupu_runtime::assembly::AssembleError> {
+        let step_id = request.step_id.clone();
+        let step_id = step_id.as_str();
+        let agent_name = request.agent_name.clone();
+        let agent_name = agent_name.as_str();
+        let rendered_prompt = request.rendered_prompt.clone();
         let turn = if rendered_prompt.contains("FAIL") {
             ScriptedTurn::ProviderError("simulated failure for fan-out test".into())
         } else {
@@ -525,54 +488,23 @@ impl StepFactory for FailingFactory {
             }
         };
         let provider = MockProvider::new(vec![turn]);
-        LegacyRunOpts {
-            seed_source: None,
-            collectors: Vec::new(),
-            extra_tools: Vec::new(),
+        rupu_orchestrator::testing::MockRun {
             step_actions: Vec::new(),
-            alias_scope: Default::default(),
             agent_name: format!("ag-{agent_name}"),
             agent_system_prompt: "echo".into(),
             agent_tools: None,
             provider: Box::new(provider),
             provider_name: "mock".into(),
             model: "mock-1".into(),
-            run_id,
-            workspace_id,
-            workspace_path,
-            transcript_path,
             max_turns: 5,
-            permission: rupu_tools::PermissionPolicy::bypass(),
-            tool_context: ToolContext::default(),
-            user_message: rendered_prompt,
-            initial_messages: Vec::new(),
-            turn_index_offset: 0,
             no_stream: false,
             suppress_stream_stdout: false,
-            mcp_registry: None,
-            effort: None,
-            thinking_display: None,
-            context_window: None,
-            output_format: None,
-            output_schema: None,
-            anthropic_task_budget: None,
-            anthropic_context_management: None,
-            anthropic_speed: None,
-            parent_run_id: None,
-            depth: 0,
             dispatchable_agents: None,
-            step_id: step_id.to_string(),
-            on_tool_call,
-            on_stream_event: None,
-            on_usage: None,
             concerns: None,
             limits: rupu_providers::model_limits::ModelLimits::unknown(),
-            scope_name: None,
-            surface_tag: None,
-            pause: None,
-            codename: None,
-            recovery: Default::default(),
+            ..Default::default()
         }
+        .launch(request)
     }
 }
 
@@ -1302,17 +1234,15 @@ struct PanelFactory;
 
 #[async_trait]
 impl StepFactory for PanelFactory {
-    async fn build_opts_for_step(
+    async fn launch_for_step(
         &self,
-        step_id: &str,
-        agent_name: &str,
-        rendered_prompt: String,
-        run_id: String,
-        workspace_id: String,
-        workspace_path: std::path::PathBuf,
-        transcript_path: std::path::PathBuf,
-        on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> LegacyRunOpts {
+        request: rupu_orchestrator::StepRequest,
+    ) -> Result<rupu_orchestrator::StepLaunch, rupu_runtime::assembly::AssembleError> {
+        let step_id = request.step_id.clone();
+        let step_id = step_id.as_str();
+        let agent_name = request.agent_name.clone();
+        let agent_name = agent_name.as_str();
+        let rendered_prompt = request.rendered_prompt.clone();
         // Hand-built JSON keyed by agent name. security-reviewer
         // emits one HIGH; perf-reviewer emits one MEDIUM with
         // surrounding prose (tests the loose-parser fallback);
@@ -1336,54 +1266,23 @@ impl StepFactory for PanelFactory {
             input_tokens: 1,
             output_tokens: 1,
         }]);
-        LegacyRunOpts {
-            seed_source: None,
-            collectors: Vec::new(),
-            extra_tools: Vec::new(),
+        rupu_orchestrator::testing::MockRun {
             step_actions: Vec::new(),
-            alias_scope: Default::default(),
             agent_name: format!("ag-{agent_name}"),
             agent_system_prompt: "review".into(),
             agent_tools: None,
             provider: Box::new(provider),
             provider_name: "mock".into(),
             model: "mock-1".into(),
-            run_id,
-            workspace_id,
-            workspace_path,
-            transcript_path,
             max_turns: 5,
-            permission: rupu_tools::PermissionPolicy::bypass(),
-            tool_context: ToolContext::default(),
-            user_message: rendered_prompt,
-            initial_messages: Vec::new(),
-            turn_index_offset: 0,
             no_stream: false,
             suppress_stream_stdout: false,
-            mcp_registry: None,
-            effort: None,
-            thinking_display: None,
-            context_window: None,
-            output_format: None,
-            output_schema: None,
-            anthropic_task_budget: None,
-            anthropic_context_management: None,
-            anthropic_speed: None,
-            parent_run_id: None,
-            depth: 0,
             dispatchable_agents: None,
-            step_id: step_id.to_string(),
-            on_tool_call,
-            on_stream_event: None,
-            on_usage: None,
             concerns: None,
             limits: rupu_providers::model_limits::ModelLimits::unknown(),
-            scope_name: None,
-            surface_tag: None,
-            pause: None,
-            codename: None,
-            recovery: Default::default(),
+            ..Default::default()
         }
+        .launch(request)
     }
 }
 
@@ -1567,17 +1466,15 @@ impl LoopingPanelFactory {
 
 #[async_trait]
 impl StepFactory for LoopingPanelFactory {
-    async fn build_opts_for_step(
+    async fn launch_for_step(
         &self,
-        step_id: &str,
-        agent_name: &str,
-        rendered_prompt: String,
-        run_id: String,
-        workspace_id: String,
-        workspace_path: std::path::PathBuf,
-        transcript_path: std::path::PathBuf,
-        on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> LegacyRunOpts {
+        request: rupu_orchestrator::StepRequest,
+    ) -> Result<rupu_orchestrator::StepLaunch, rupu_runtime::assembly::AssembleError> {
+        let step_id = request.step_id.clone();
+        let step_id = step_id.as_str();
+        let agent_name = request.agent_name.clone();
+        let agent_name = agent_name.as_str();
+        let rendered_prompt = request.rendered_prompt.clone();
         let invocation = {
             let mut map = self.calls.lock().unwrap();
             let n = map.entry(agent_name.to_string()).or_insert(0);
@@ -1605,54 +1502,23 @@ impl StepFactory for LoopingPanelFactory {
             input_tokens: 1,
             output_tokens: 1,
         }]);
-        LegacyRunOpts {
-            seed_source: None,
-            collectors: Vec::new(),
-            extra_tools: Vec::new(),
+        rupu_orchestrator::testing::MockRun {
             step_actions: Vec::new(),
-            alias_scope: Default::default(),
             agent_name: format!("ag-{agent_name}"),
             agent_system_prompt: "x".into(),
             agent_tools: None,
             provider: Box::new(provider),
             provider_name: "mock".into(),
             model: "mock-1".into(),
-            run_id,
-            workspace_id,
-            workspace_path,
-            transcript_path,
             max_turns: 5,
-            permission: rupu_tools::PermissionPolicy::bypass(),
-            tool_context: ToolContext::default(),
-            user_message: rendered_prompt,
-            initial_messages: Vec::new(),
-            turn_index_offset: 0,
             no_stream: false,
             suppress_stream_stdout: false,
-            mcp_registry: None,
-            effort: None,
-            thinking_display: None,
-            context_window: None,
-            output_format: None,
-            output_schema: None,
-            anthropic_task_budget: None,
-            anthropic_context_management: None,
-            anthropic_speed: None,
-            parent_run_id: None,
-            depth: 0,
             dispatchable_agents: None,
-            step_id: step_id.to_string(),
-            on_tool_call,
-            on_stream_event: None,
-            on_usage: None,
             concerns: None,
             limits: rupu_providers::model_limits::ModelLimits::unknown(),
-            scope_name: None,
-            surface_tag: None,
-            pause: None,
-            codename: None,
-            recovery: Default::default(),
+            ..Default::default()
         }
+        .launch(request)
     }
 }
 
@@ -2134,17 +2000,15 @@ impl RecordingFailingFactory {
 
 #[async_trait]
 impl StepFactory for RecordingFailingFactory {
-    async fn build_opts_for_step(
+    async fn launch_for_step(
         &self,
-        step_id: &str,
-        agent_name: &str,
-        rendered_prompt: String,
-        run_id: String,
-        workspace_id: String,
-        workspace_path: std::path::PathBuf,
-        transcript_path: std::path::PathBuf,
-        on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> LegacyRunOpts {
+        request: rupu_orchestrator::StepRequest,
+    ) -> Result<rupu_orchestrator::StepLaunch, rupu_runtime::assembly::AssembleError> {
+        let step_id = request.step_id.clone();
+        let step_id = step_id.as_str();
+        let agent_name = request.agent_name.clone();
+        let agent_name = agent_name.as_str();
+        let rendered_prompt = request.rendered_prompt.clone();
         self.seen.lock().unwrap().push(rendered_prompt.clone());
         let turn = if rendered_prompt.contains("FAIL") {
             ScriptedTurn::ProviderError("simulated failure for resume test".into())
@@ -2157,54 +2021,23 @@ impl StepFactory for RecordingFailingFactory {
             }
         };
         let provider = MockProvider::new(vec![turn]);
-        LegacyRunOpts {
-            seed_source: None,
-            collectors: Vec::new(),
-            extra_tools: Vec::new(),
+        rupu_orchestrator::testing::MockRun {
             step_actions: Vec::new(),
-            alias_scope: Default::default(),
             agent_name: format!("ag-{agent_name}"),
             agent_system_prompt: "echo".into(),
             agent_tools: None,
             provider: Box::new(provider),
             provider_name: "mock".into(),
             model: "mock-1".into(),
-            run_id,
-            workspace_id,
-            workspace_path,
-            transcript_path,
             max_turns: 5,
-            permission: rupu_tools::PermissionPolicy::bypass(),
-            tool_context: ToolContext::default(),
-            user_message: rendered_prompt,
-            initial_messages: Vec::new(),
-            turn_index_offset: 0,
             no_stream: false,
             suppress_stream_stdout: false,
-            mcp_registry: None,
-            effort: None,
-            thinking_display: None,
-            context_window: None,
-            output_format: None,
-            output_schema: None,
-            anthropic_task_budget: None,
-            anthropic_context_management: None,
-            anthropic_speed: None,
-            parent_run_id: None,
-            depth: 0,
             dispatchable_agents: None,
-            step_id: step_id.to_string(),
-            on_tool_call,
-            on_stream_event: None,
-            on_usage: None,
             concerns: None,
             limits: rupu_providers::model_limits::ModelLimits::unknown(),
-            scope_name: None,
-            surface_tag: None,
-            pause: None,
-            codename: None,
-            recovery: Default::default(),
+            ..Default::default()
         }
+        .launch(request)
     }
 }
 

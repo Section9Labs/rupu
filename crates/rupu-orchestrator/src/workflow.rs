@@ -1596,7 +1596,7 @@ fn validate_action_step(
 /// (an EMPTY list stays legal — it is already present repo-wide).
 ///
 /// A `host:`/`distribute:` (remote/placed) step never reaches
-/// `build_opts_for_step` — its roster travels in `UnitDispatch`/
+/// `launch_for_step` — its roster travels in `UnitDispatch`/
 /// `AgentLaunchRequest`, which carry no tool list — so a narrowed
 /// `actions:` there would be a silent no-op (fail-OPEN: the remote agent
 /// runs its full grant while the CP shows it as narrowed). Until the
@@ -3564,7 +3564,7 @@ steps:
 
     #[test]
     fn non_empty_actions_on_a_host_step_is_rejected() {
-        // A `host:` unit never reaches `build_opts_for_step` — its roster
+        // A `host:` unit never reaches `launch_for_step` — its roster
         // travels in `AgentLaunchRequest`, which carries no tool list — so a
         // narrowed `actions:` there would silently be a no-op (fail-open).
         let raw = r#"
