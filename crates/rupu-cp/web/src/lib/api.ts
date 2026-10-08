@@ -1390,6 +1390,11 @@ export interface AgentSummary {
    *  remote host, shows `null` here ("never ran") even though the
    *  equivalent workflow row would show a timestamp. */
   last_run?: string | null;
+  /** Why this agent can't be launched, when it can't: its `tools:` names a
+   *  tool no catalog tool answers to (the server's load-time check, the same
+   *  one `rupu agent validate` runs; the message carries a did-you-mean).
+   *  Absent for a loadable agent. */
+  load_error?: string | null;
 }
 
 export interface AgentDetail extends AgentSummary {

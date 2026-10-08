@@ -16,6 +16,7 @@
 pub mod catalog;
 pub mod coverage_emit;
 pub mod descriptor;
+pub mod grant;
 pub mod output;
 pub mod tool;
 
@@ -43,13 +44,17 @@ pub mod dispatch_agents_parallel;
 
 pub use ast_grep::AstGrepTool;
 pub use bash::BashTool;
+pub use catalog::ToolCatalog;
+pub use descriptor::{Alias, AliasScope, Effect, Service, ToolDescriptor};
 pub use dispatch_agent::DispatchAgentTool;
 pub use dispatch_agents_parallel::DispatchAgentsParallelTool;
 pub use edit_file::EditFileTool;
 pub use glob::GlobTool;
+pub use grant::{
+    AmbientGrant, GrantEntry, GrantError, GrantInputs, GrantReason, ResolvedGrant, ServiceSet,
+    Unavailable, DEFAULT_GRANT,
+};
 pub use grep::GrepTool;
-pub use catalog::ToolCatalog;
-pub use descriptor::{Alias, AliasScope, Effect, Service, ToolDescriptor};
 pub use permission::{
     AllowAlways, Decision, DenyReason, PermissionMode, PermissionPolicy, PromptAnswer,
     PromptRequest, Prompter, UnknownMode,

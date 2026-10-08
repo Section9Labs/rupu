@@ -51,7 +51,8 @@ struct Input {
     inputs: Option<Value>,
 }
 
-/// `dispatch_agent` builtin. Registered in `default_tool_registry()`.
+/// `dispatch_agent` builtin. Built by `rupu_agent::builtin_tool` when a run's grant offers it
+/// (it needs [`Service::AgentDispatcher`]).
 #[derive(Debug, Default, Clone)]
 pub struct DispatchAgentTool;
 
@@ -60,7 +61,8 @@ pub static DESCRIPTOR: ToolDescriptor = ToolDescriptor {
     name: "dispatch_agent",
     aliases: &[],
     effect: Effect::Spawn,
-    needs: &[Service::Launcher],
+    needs: &[Service::AgentDispatcher],
+    uses: &[],
     description: "Run another agent synchronously as a tool call. Provide the child agent's name (must appear in this agent's dispatchableAgents frontmatter) and a prompt. The child runs to completion in its own context; you receive its final assistant text plus token + duration accounting. Use this to delegate review, search, or specialist tasks to a focused sub-agent.",
     input_schema: descriptor_schema,
 };

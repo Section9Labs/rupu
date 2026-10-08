@@ -12,7 +12,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use rupu_agent::loader::{load_agent, load_agents, AgentLoadError};
+use rupu_agent::loader::{find_agent, load_agents, AgentLoadError};
 use rupu_workspace::{RepoRegistryStore, WorkspaceStore};
 use serde::{Deserialize, Serialize};
 use std::path::{Path as FsPath, PathBuf};
@@ -172,8 +172,7 @@ fn save_agent_file(global_dir: &FsPath, url_name: &str, raw: &str) -> Result<Pat
 /// then atomically writes `<dir>/<url_name>.md`. Returns the written path.
 fn save_agent_file_at(url_name: &str, raw: &str, dir: &FsPath) -> Result<PathBuf, ApiError> {
     validate_name(url_name)?;
-    let spec =
-        rupu_agent::AgentSpec::parse(raw).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let spec = parse_agent_for_write(raw)?;
     if spec.name != url_name {
         return Err(ApiError::bad_request(
             "frontmatter name must equal the agent name",
@@ -192,11 +191,22 @@ fn save_agent_file_at(url_name: &str, raw: &str, dir: &FsPath) -> Result<PathBuf
     Ok(target)
 }
 
+/// Parse a raw `.md` about to be written, refusing (400) one that doesn't
+/// parse or whose `tools:` names an unknown tool — a file the runner would
+/// refuse to launch is never written (D8; the message carries the
+/// did-you-mean).
+fn parse_agent_for_write(raw: &str) -> Result<rupu_agent::AgentSpec, ApiError> {
+    let spec =
+        rupu_agent::AgentSpec::parse(raw).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    spec.validate_tools()
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok(spec)
+}
+
 /// Pure core of `POST /api/agents`: parse the raw `.md` to derive the name,
 /// validate it, refuse to clobber an existing file, then atomically write.
 fn create_agent_file(global_dir: &FsPath, raw: &str) -> Result<PathBuf, ApiError> {
-    let spec =
-        rupu_agent::AgentSpec::parse(raw).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let spec = parse_agent_for_write(raw)?;
     let name = spec.name.clone();
     validate_name(&name)?;
     let dir = global_dir.join("agents");
@@ -316,7 +326,7 @@ fn load_detail(s: &AppState, name: &str) -> ApiResult<AgentDetailDto> {
     let workspaces = store(s).list().unwrap_or_default();
     for r in distinct_repo_workspaces(workspaces, &repo_store(s)) {
         let rupu_dir = std::path::Path::new(&r.workspace.path).join(".rupu");
-        if let Ok(spec) = load_agent(&rupu_dir, None, name) {
+        if let Ok(spec) = find_agent(&rupu_dir, None, name) {
             let slug = agent_slug_map(&rupu_dir)
                 .remove(name)
                 .unwrap_or_else(|| name.to_string());
@@ -329,7 +339,7 @@ fn load_detail(s: &AppState, name: &str) -> ApiResult<AgentDetailDto> {
             ));
         }
     }
-    match load_agent(&s.global_dir, None, name) {
+    match find_agent(&s.global_dir, None, name) {
         Ok(spec) => {
             let slug = agent_slug_map(&s.global_dir)
                 .remove(name)
@@ -448,6 +458,12 @@ pub(crate) struct AgentDto {
     /// absent) rather than omitting the key.
     #[serde(default)]
     pub(crate) last_run: Option<String>,
+    /// Why this agent can't be launched, when it can't: its `tools:` names
+    /// a tool no catalog tool answers to (W2's load-time check, the same one
+    /// `rupu agent validate` runs). Listed and shown anyway, so the operator
+    /// can see and fix it. Absent for a loadable agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) load_error: Option<String>,
 }
 
 impl AgentDto {
@@ -461,7 +477,9 @@ impl AgentDto {
         slug: impl Into<String>,
         scope_id: Option<String>,
     ) -> Self {
+        let load_error = spec.validate_tools().err().map(|e| e.to_string());
         AgentDto {
+            load_error,
             name: spec.name,
             slug: slug.into(),
             description: spec.description,
@@ -775,8 +793,7 @@ async fn create_agent(
     State(s): State<AppState>,
     Json(body): Json<AgentWriteBody>,
 ) -> ApiResult<Json<AgentDetailDto>> {
-    let spec = rupu_agent::AgentSpec::parse(&body.raw)
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let spec = parse_agent_for_write(&body.raw)?;
     validate_name(&spec.name)?;
     if resolve_agent_scoped(&s, &spec.name).is_some() {
         return Err(ApiError::conflict("agent already exists"));
@@ -2691,6 +2708,56 @@ mod tests {
                 "issues.create".to_string()
             ]
         );
+    }
+
+    /// W2 (D8): writing an agent whose `tools:` names an unknown tool is a
+    /// 400 with the did-you-mean, and nothing is written.
+    #[test]
+    fn writing_an_unknown_tool_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let raw = "---\nname: typo\ntools: [read_file, repot_finding]\n---\nhi\n";
+        let err = save_agent_file(tmp.path(), "typo", raw).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            err.1.contains("did you mean \"report_finding\""),
+            "{}",
+            err.1
+        );
+        assert!(create_agent_file(tmp.path(), raw).is_err());
+        assert!(!tmp.path().join("agents/typo.md").exists());
+    }
+
+    /// An agent file that is already on disk with an unknown tool is still
+    /// listed and shown — with the reason it can't be launched.
+    #[tokio::test]
+    async fn an_agent_with_an_unknown_tool_lists_with_its_load_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let agents = s.global_dir.join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("typo.md"),
+            "---\nname: typo\ntools: [repot_finding]\n---\nhi\n",
+        )
+        .unwrap();
+        save_agent_file(
+            &s.global_dir,
+            "fine",
+            "---\nname: fine\ntools: [read_file]\n---\nhi\n",
+        )
+        .unwrap();
+
+        let Json(rows) = list_agents(State(s.clone())).await.expect("ok");
+        let by_name = |n: &str| rows.iter().find(|r| r.name == n).unwrap();
+        assert!(by_name("fine").load_error.is_none());
+        let e = by_name("typo").load_error.as_deref().unwrap();
+        assert!(
+            e.contains("repot_finding") && e.contains("report_finding"),
+            "{e}"
+        );
+
+        let detail = load_detail(&s, "typo").expect("a broken agent's detail still loads");
+        assert!(detail.summary.load_error.is_some());
     }
 
     /// An agent whose frontmatter omits `tools:` entirely (unrestricted) still

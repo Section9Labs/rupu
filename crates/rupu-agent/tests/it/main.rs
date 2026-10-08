@@ -31,4 +31,5 @@ mod runner_tools_in_request;
 mod runner_usage_hook;
 mod spec;
 mod spec_auth_field;
+mod tool_grant;
 mod tool_registry;

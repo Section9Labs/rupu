@@ -181,6 +181,15 @@ export default function AgentDetailPage() {
         {agent.description && (
           <p className="mt-2 text-sm text-ink-dim leading-snug">{agent.description}</p>
         )}
+        {agent.load_error && (
+          <div
+            role="alert"
+            className="mt-3 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err"
+          >
+            <span className="font-semibold">This agent can't be launched: </span>
+            {agent.load_error}
+          </div>
+        )}
       </header>
 
       <UnscopedNote className="mt-4">Runs and spend on this page cover every customer.</UnscopedNote>

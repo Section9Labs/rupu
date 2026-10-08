@@ -39,7 +39,25 @@ const KNOWN_EVENT_TAGS: &[&str] = &[
     "outcome",
     "recovery",
     "assistant_block",
+    "tool_grant",
 ];
+
+/// One tool in a [`Event::ToolGrant`]: its canonical name and why it was
+/// offered (`declared`, `declared:scm.*`, `default`, `ambient:concerns`,
+/// `origin:injected`, …).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolGrantEntry {
+    pub tool: String,
+    pub reasons: Vec<String>,
+}
+
+/// A tool a [`Event::ToolGrant`] could not offer, and the services it
+/// needs that the run lacks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolGrantMissing {
+    pub tool: String,
+    pub missing: Vec<String>,
+}
 
 fn is_zero_u32(v: &u32) -> bool {
     *v == 0
@@ -194,16 +212,19 @@ pub enum Event {
         #[serde(skip_serializing_if = "Option::is_none", default)]
         outcome: Option<crate::outcome::OutcomeRecord>,
     },
-    /// Per-catalog-tool-call audit trail (step `actions:` enforcement,
-    /// 2026-07-26 design). Emitted from two choke points: the agent
-    /// runtime's `on_tool_call` hook (wrapped in
-    /// `rupu-orchestrator::step_factory`) for agent-driven MCP calls, and
+    /// The audit line for one tool call: every call ends in exactly one
+    /// (W2), allowed or not, whatever the tool. Emitted from two choke
+    /// points: the agent loop for every call a model makes (builtins,
+    /// coverage/findings, connector and injected tools, including calls the
+    /// permission policy denies and names the run doesn't offer), and
     /// `execute_action_step` for `action:`-node calls. NEVER confuse this
     /// with `ActionEmitted` (the older, `action:`-step-only envelope) —
-    /// `ToolAudit` is the general catalog-call audit line and is emitted
-    /// *alongside* `ActionEmitted` for action steps, not instead of it.
+    /// `ToolAudit` is emitted *alongside* `ActionEmitted` for action steps,
+    /// not instead of it.
     ToolAudit {
-        /// The MCP catalog tool name (e.g. `issues.create`).
+        /// The tool name as the model called it (canonical or a legacy
+        /// alias), matching the call's `tool_call` line; for an `action:`
+        /// node, the step's tool.
         tool: String,
         /// Whether `tool` appears in the step's `actions:` allowlist.
         /// `false` both when `actions:` is empty/absent (the step is
@@ -211,19 +232,50 @@ pub enum Event {
         /// non-empty but doesn't name this tool. Use `restricted` to
         /// tell those two apart.
         declared: bool,
-        /// Whether `tool` is covered by the agent's `tools:` grant
-        /// (wildcard-expanded, evaluated BEFORE any `actions:`
-        /// narrowing — see `rupu-orchestrator::step_factory::
-        /// narrow_agent_tools`). For an `action:` node (no agent
-        /// grant concept applies) this is always `true`.
+        /// Whether `tool` is covered by the run's grant (wildcard-expanded,
+        /// evaluated BEFORE any `actions:` narrowing — see
+        /// `rupu_tools::ResolvedGrant::granted_before_narrowing`). For an
+        /// `action:` node (no agent grant concept applies) this is always
+        /// `true`.
         granted: bool,
-        /// Whether the call was actually denied — either narrowed out
-        /// of the agent's roster (never reached the registry) or
-        /// denied by the MCP mode/permission gate.
+        /// Whether the call was actually denied — not in the run's grant
+        /// (`decision: not_granted`) or refused by the permission policy or
+        /// the tool's own gate (`denied:*`).
         blocked: bool,
         /// Whether the step declared a non-empty `actions:` allowlist
         /// at all (disambiguates `declared: false`; see its doc).
         restricted: bool,
+        /// Why the tool was in the run's grant (`tool_grant`), as
+        /// comma-separated reasons: `declared`, `declared:<wildcard>`,
+        /// `default`, `ambient:<source>`, `origin:<source>` — or `action`
+        /// for an `action:` step's own tool. Absent for a call the grant
+        /// didn't cover and on lines written before grants.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        /// What happened to the call: `allowed`, `denied:<reason>`
+        /// (`denied:readonly`, `denied:operator`, `denied:tool` when the
+        /// tool's own gate refused — the MCP dispatcher's — and
+        /// `denied:operator_stop`) or `not_granted` (the
+        /// model named a tool the run doesn't offer). Absent on lines
+        /// written before every call was audited.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decision: Option<String>,
+    },
+    /// The tools a run offered its model, and why — written once, right
+    /// after `run_start` (W2). `entries` is exactly the model's tool list.
+    ToolGrant {
+        entries: Vec<ToolGrantEntry>,
+        /// Connector tools the step's `actions:` removed.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        narrowed: Vec<String>,
+        /// Tools named exactly in `tools:` that the run can't serve; each
+        /// also gets a `tool_unavailable` notice.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        unavailable: Vec<ToolGrantMissing>,
+        /// Tools a wildcard (or the default grant) matched that the run
+        /// can't serve. Not offered, no notice.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        skipped: Vec<ToolGrantMissing>,
     },
     /// One outbound network flow attributed to this run.
     ///
@@ -289,7 +341,8 @@ pub enum Event {
     },
     /// A runtime intervention worth showing but not part of the
     /// conversation: `kind` ∈ {"context_trim", "provider_retry",
-    /// "model_limits", "model_limits_clamped"} today.
+    /// "model_limits", "model_limits_clamped", "permission_mode_degraded",
+    /// "tool_unavailable"} today.
     Notice {
         kind: String,
         message: String,
@@ -472,6 +525,8 @@ mod tests {
             granted: true,
             blocked: false,
             restricted: false,
+            reason: None,
+            decision: None,
         };
         let s = serde_json::to_string(&e).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
@@ -479,9 +534,34 @@ mod tests {
         assert_eq!(v["data"]["tool"], "issues.create");
         assert_eq!(v["data"]["granted"], true);
         assert_eq!(v["data"]["blocked"], false);
+        // Old readers' shape: the optional fields are omitted when absent.
+        assert!(v["data"].get("reason").is_none());
+        assert!(v["data"].get("decision").is_none());
 
         let back: Event = serde_json::from_str(&s).unwrap();
         assert_eq!(back, e);
+
+        // The W2 fields roundtrip, and a pre-W2 line still parses.
+        let e = Event::ToolAudit {
+            tool: "write_file".into(),
+            declared: false,
+            granted: true,
+            blocked: true,
+            restricted: false,
+            reason: Some("declared".into()),
+            decision: Some("denied:readonly".into()),
+        };
+        let back: Event = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
+        assert_eq!(back, e);
+        let old = r#"{"type":"tool_audit","data":{"tool":"t","declared":false,"granted":true,"blocked":false,"restricted":false}}"#;
+        assert!(matches!(
+            serde_json::from_str::<Event>(old).unwrap(),
+            Event::ToolAudit {
+                reason: None,
+                decision: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -658,6 +738,21 @@ mod tests {
                     message: "trimmed".into(),
                 },
                 "notice",
+            ),
+            (
+                Event::ToolGrant {
+                    entries: vec![ToolGrantEntry {
+                        tool: "findings.report".into(),
+                        reasons: vec!["declared".into(), "ambient:concerns".into()],
+                    }],
+                    narrowed: vec!["scm.prs.get".into()],
+                    unavailable: vec![ToolGrantMissing {
+                        tool: "board.post".into(),
+                        missing: vec!["message_bus".into()],
+                    }],
+                    skipped: vec![],
+                },
+                "tool_grant",
             ),
         ] {
             let s = serde_json::to_string(&e).unwrap();

@@ -354,6 +354,7 @@ fn reconstruct_with(
             | Event::Usage { .. }
             | Event::RunComplete { .. }
             | Event::ToolAudit { .. }
+            | Event::ToolGrant { .. }
             | Event::NetFlow { .. }
             | Event::Notice { .. }
             | Event::Outcome { .. }

@@ -122,3 +122,39 @@ fn every_fleet_workflow_parses() {
         });
     }
 }
+
+/// `shipped_agents_validate` (W2 §6.7): every agent rupu ships — the stock
+/// fleet, the `rupu init` samples and the repo's own `.rupu/agents` — names
+/// only known tools in `tools:`. Unknown names fail an agent's load (D8), so
+/// a typo here would ship an agent that can't be run.
+#[test]
+fn shipped_agents_validate() {
+    let mut checked = 0;
+    for t in FLEET_MANIFEST.iter().chain(rupu_cli::templates::MANIFEST) {
+        if !t.target_relpath.contains("agents/") || !t.target_relpath.ends_with(".md") {
+            continue;
+        }
+        let spec = AgentSpec::parse(t.content)
+            .unwrap_or_else(|e| panic!("shipped agent `{}` does not parse: {e}", t.target_relpath));
+        spec.validate_tools()
+            .unwrap_or_else(|e| panic!("shipped agent `{}`: {e}", t.target_relpath));
+        checked += 1;
+    }
+    assert!(checked > 0, "no shipped agents found in the manifests");
+
+    let repo_agents = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.rupu");
+    let checks = rupu_agent::check_agent_files(&repo_agents, None);
+    assert!(
+        !checks.is_empty(),
+        "no repo agents under {}",
+        repo_agents.display()
+    );
+    for c in checks {
+        assert!(
+            c.error.is_none(),
+            "repo agent {}: {}",
+            c.path.display(),
+            c.error.unwrap()
+        );
+    }
+}

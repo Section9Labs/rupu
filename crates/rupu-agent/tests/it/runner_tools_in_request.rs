@@ -18,9 +18,13 @@ async fn run_passes_all_default_tools_to_provider() {
         seed_source: None,
         collectors: Vec::new(),
         extra_tools: Vec::new(),
+        step_actions: Vec::new(),
+        alias_scope: Default::default(),
         agent_name: "all-tools".into(),
         agent_system_prompt: "test".into(),
-        agent_tools: None, // None = every default tool
+        // None = the default grant. With no sub-agent dispatcher in this
+        // run, the dispatch pair isn't offered: just the core tools.
+        agent_tools: None,
         provider: Box::new(provider),
         provider_name: "mock".into(),
         model: "mock-1".into(),
@@ -68,8 +72,8 @@ async fn run_passes_all_default_tools_to_provider() {
     let tools = &requests[0].tools;
     assert_eq!(
         tools.len(),
-        9,
-        "expected 9 default tools (6 v0 + ast_grep + dispatch_agent + dispatch_agents_parallel), got {}",
+        7,
+        "expected the 7 core tools (no dispatcher, no SCM registry), got {}",
         tools.len()
     );
 
@@ -80,8 +84,6 @@ async fn run_passes_all_default_tools_to_provider() {
         vec![
             "ast_grep",
             "bash",
-            "dispatch_agent",
-            "dispatch_agents_parallel",
             "edit_file",
             "glob",
             "grep",
@@ -118,6 +120,8 @@ async fn run_with_agent_tools_filter_passes_only_listed_tools() {
         seed_source: None,
         collectors: Vec::new(),
         extra_tools: Vec::new(),
+        step_actions: Vec::new(),
+        alias_scope: Default::default(),
         agent_name: "subset".into(),
         agent_system_prompt: "test".into(),
         agent_tools: Some(vec!["bash".into(), "read_file".into()]),

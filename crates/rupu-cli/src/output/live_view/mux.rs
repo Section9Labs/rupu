@@ -762,6 +762,8 @@ mod tests {
             granted: true,
             blocked: true,
             restricted: true,
+            reason: None,
+            decision: None,
         };
         assert_eq!(
             plain(&blocked, Some("otter#3")),
@@ -776,6 +778,8 @@ mod tests {
             granted: true,
             blocked: false,
             restricted: true,
+            reason: None,
+            decision: None,
         };
         assert!(project_event(&allowed, Some("otter#3")).is_none());
     }

@@ -223,10 +223,11 @@ pub struct LeadInputs {
     pub system_prompt: String,
     pub provider_name: String,
     pub model: String,
-    /// The builtins/MCP allowlist (the runner filters its registry to this
-    /// list); empty grants none of those. `report_finding` is appended by
-    /// `run_agentiflow` and the board/mailbox tools are always-on `extra_tools`,
-    /// so an empty list does not mean the lead is toolless.
+    /// The lead's `tools:` grant (the runner offers exactly what it names);
+    /// empty grants no builtins/MCP tools. The engagement's ambient grant adds
+    /// `findings.report` / `assets.mark` and the board/mailbox tools are
+    /// always-on `extra_tools`, so an empty list does not mean the lead is
+    /// toolless.
     pub agent_tools: Vec<String>,
 }
 
@@ -729,15 +730,11 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 started,
             );
 
-            // The lead records findings through `findings.report`; the runner
-            // only registers it for an agent that lists it (by canonical name
-            // or the legacy `report_finding`). Dedup so a caller that already
-            // granted it does not get it twice.
-            let mut agent_tools = lead.agent_tools;
-            let report = &rupu_tools::catalog::findings::FINDINGS_REPORT;
-            if !agent_tools.iter().any(|t| report.answers_to(t)) {
-                agent_tools.push(report.name.to_string());
-            }
+            // The lead records findings through `findings.report` and assets
+            // through `assets.mark`: its run always carries the engagement
+            // (`findings_engagement` below), whose ambient grant offers both,
+            // recorded as `ambient:engagement` in the lead's `tool_grant`.
+            let agent_tools = lead.agent_tools;
             // The lead's coordination substrate: a file-backed board and mailboxes
             // under the run dir, the tools that act on them, and the collectors that
             // fold its inbox and standing directives into each turn. "lead" is the

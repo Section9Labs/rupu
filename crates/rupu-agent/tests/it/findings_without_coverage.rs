@@ -32,6 +32,8 @@ pub(crate) fn opts_for(
         seed_source: None,
         collectors: Vec::new(),
         extra_tools: Vec::new(),
+        step_actions: Vec::new(),
+        alias_scope: Default::default(),
         agent_name: "net-assessor".into(),
         agent_system_prompt: "You assess hosts.".into(),
         agent_tools,
@@ -322,17 +324,38 @@ async fn finding_verify_is_absent_when_not_granted() {
 }
 
 #[tokio::test]
-async fn finding_verify_is_not_granted_by_an_absent_or_wildcard_tools_list() {
+async fn finding_verify_is_not_in_the_default_grant() {
     let tmp = tempfile::TempDir::new().unwrap();
     let workspace = tmp.path().to_path_buf();
     let id = seed_other_runs_finding(&workspace);
 
-    // Only an exact `finding.verify` entry grants it, as with `report_finding`.
-    for tools in [None, Some(vec!["*".to_string()])] {
-        let _ = run_agent(opts_for(&workspace, tools.clone(), verify_then_stop(&id))).await;
+    // An agent with no `tools:` list gets the default grant, which has no
+    // findings tools.
+    let _ = run_agent(opts_for(&workspace, None, verify_then_stop(&id))).await;
+    assert!(
+        recorded_verification(&workspace, &id).is_none(),
+        "the default grant must not include finding.verify"
+    );
+}
+
+#[tokio::test]
+async fn a_wildcard_grants_finding_verify() {
+    // `*` is the whole catalog (D9), and `findings.*` its findings
+    // namespace: both cover `findings.verify`. A fresh workspace each, so
+    // the second can't pass on the first's verdict.
+    for tools in [vec!["*".to_string()], vec!["findings.*".to_string()]] {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        let id = seed_other_runs_finding(&workspace);
+        let _ = run_agent(opts_for(
+            &workspace,
+            Some(tools.clone()),
+            verify_then_stop(&id),
+        ))
+        .await;
         assert!(
-            recorded_verification(&workspace, &id).is_none(),
-            "tools {tools:?} must not grant finding.verify"
+            recorded_verification(&workspace, &id).is_some(),
+            "tools {tools:?} must grant findings.verify"
         );
     }
 }

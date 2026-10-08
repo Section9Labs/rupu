@@ -96,6 +96,7 @@ pub fn descriptor_for(name: &str) -> Option<&'static ToolDescriptor> {
                         aliases: &[],
                         effect: spec.effect(),
                         needs,
+                        uses: &[],
                         description: spec.description,
                         input_schema,
                     }));
@@ -105,6 +106,20 @@ pub fn descriptor_for(name: &str) -> Option<&'static ToolDescriptor> {
         })
         .get(name)
         .copied()
+}
+
+/// The descriptors of the MCP connector tools an agent run can be offered:
+/// the MCP catalog minus `findings.*`, which the agent loop serves through
+/// the catalog's own findings tools (the in-process MCP dispatcher has no
+/// run context to record findings with).
+pub fn connector_descriptors() -> Vec<&'static ToolDescriptor> {
+    let mut out: Vec<_> = rupu_mcp::tool_catalog()
+        .into_iter()
+        .filter(|spec| !spec.name.starts_with("findings."))
+        .filter_map(|spec| descriptor_for(spec.name))
+        .collect();
+    out.sort_by_key(|d| d.name);
+    out
 }
 
 pub struct McpToolAdapter {

@@ -3,6 +3,7 @@
 pub mod aggregate;
 pub mod cursor;
 pub mod event;
+pub mod grant;
 pub mod netflow_sink;
 pub mod outcome;
 pub mod reader;
@@ -11,7 +12,7 @@ pub mod writer;
 
 pub use aggregate::{aggregate, TimeWindow, UsageRow};
 pub use cursor::{transcript_key, DrainStats, JsonlCursor};
-pub use event::{Event, FileEditKind, RunMode, RunStatus};
+pub use event::{Event, FileEditKind, RunMode, RunStatus, ToolGrantEntry, ToolGrantMissing};
 pub use netflow_sink::TranscriptSink;
 pub use outcome::{OutcomeRecord, RecoveryAction, Severity, StopRecord};
 pub use reader::{final_turn_text, JsonlReader, ReadError, RunHead, RunSummary};

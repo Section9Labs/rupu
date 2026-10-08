@@ -318,10 +318,11 @@ pub struct LeadConfig {
     pub workspace_id: String,
     /// The lead's workspace root (the file/bash tools' scope).
     pub workspace_path: PathBuf,
-    /// The builtins/MCP allowlist: the runner filters its registry to this
-    /// list, so empty (the fail-closed default) grants NO builtins/MCP tools.
-    /// (`report_finding` is appended by `run_agentiflow`, and the board/mailbox
-    /// `extra_tools` are always-on, so an empty list is not "no tools at all".)
+    /// The lead's `tools:` grant: the runner offers exactly what this list
+    /// names, so empty (the fail-closed default) grants NO builtins/MCP tools.
+    /// (The engagement's ambient grant adds `findings.report` / `assets.mark`,
+    /// and the board/mailbox `extra_tools` are always-on, so an empty list is
+    /// not "no tools at all".)
     /// The caller lists what the lead needs -- there is deliberately no way to
     /// say "all builtins" by omission, because the lead runs unattended under
     /// bypass permission on digest text an attacker can influence.
@@ -339,8 +340,8 @@ pub struct LeadConfig {
     /// and makes the lead's findings profile-typed; `None` records bare
     /// findings with no engagement routing.
     pub findings_engagement: Option<Arc<rupu_coverage::ActiveSet>>,
-    /// Always-on tools injected into every round's registry AFTER the
-    /// `agent_tools` filter (so they need not be listed there): the lead's
+    /// Always-on tools injected into every round's grant (as `origin:injected`,
+    /// so they need not be listed in `agent_tools`): the lead's
     /// board / mailbox coordination tools. Shared `Arc`s -- the same instances
     /// serve every round, so their per-run state (held claims) persists.
     pub extra_tools: Vec<Arc<dyn rupu_tools::Tool>>,
@@ -381,9 +382,10 @@ pub struct LeadConfig {
 ///
 /// What a round does NOT wire up yet (Plan 3b-2): the MCP/SCM registry,
 /// dispatchable agents, and a codename. It runs under bypass permission, so the
-/// tool gate is [`LeadConfig::agent_tools`] (the runner's registry is filtered
-/// to exactly that list; empty = no builtins/MCP) plus [`LeadConfig::extra_tools`],
-/// the caller's explicit always-on injections (the board / mailbox tools).
+/// tool gate is the run's grant: [`LeadConfig::agent_tools`] (exactly that
+/// list; empty = no builtins/MCP), the engagement's ambient findings tools,
+/// and [`LeadConfig::extra_tools`], the caller's explicit always-on injections
+/// (the board / mailbox tools).
 /// [`LeadConfig::collectors`] feed the lead's inbox and standing directives
 /// into each turn. No parent run, depth 0 -- the same shape as a session
 /// turn's `AgentRunOpts` minus the CLI-only plumbing.
@@ -638,6 +640,10 @@ impl LeadDriver for RunAgentLeadDriver {
             seed_source: None,
             collectors: self.cfg.collectors.clone(),
             extra_tools: self.cfg.extra_tools.clone(),
+            step_actions: Vec::new(),
+            // Inside the lead, `coverage.status` is the goal-coverage tool's
+            // legacy name (W1).
+            alias_scope: rupu_tools::AliasScope::FlowLead,
             recovery: Default::default(),
         };
 

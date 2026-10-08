@@ -321,15 +321,17 @@ Common fields:
 
 ### `actions`
 
-`actions:` **does narrow tool access** — but only the connector (MCP catalog)
-portion of it. Builtin tools (`bash`, `read_file`, `write_file`, `edit_file`,
-`grep`, `glob`, `ast_grep`, `dispatch_agent`, `dispatch_agents_parallel`) are
-never touched by this field; they're governed entirely by the agent's own
+`actions:` **does narrow tool access** — but only the connector portion of
+it (the `scm.*`, `issues.*`, `github.*` and `gitlab.*` tools). Every other tool
+(`bash`, `read_file`, the findings and coverage tools, `dispatch_agent`, …) is
+never touched by this field; it's governed entirely by the agent's own
 `tools:` and the run mode (`ask`/`bypass`/`readonly`).
 
-Each entry must name a tool in the MCP catalog (`scm.*`, `issues.*`,
-`github.*`, `gitlab.*` — see `GET /api/tools`); an unknown entry is a
-parse-time error.
+Entries use the same grammar as an agent's `tools:` (see
+[agent-format.md](agent-format.md#tools)): an exact connector tool name, a
+namespace (`issues.*`) or `*`. An unknown entry is a parse-time error (with a
+did-you-mean), and so is an entry that names no connector tool (`bash`,
+`findings.*`), since it would have no effect.
 
 Semantics:
 
@@ -340,8 +342,10 @@ Semantics:
 - **A non-empty `actions:` narrows only the connector subset** of the
   agent's grant to the intersection of the agent's tools and this list.
   Builtins pass through untouched. A step can only ever shrink the
-  connector set — naming a catalog tool the agent doesn't grant does
-  **not** add it (no escalation).
+  connector set — naming a connector tool the agent doesn't grant does
+  **not** add it (no escalation; the runner logs a warning, since it is
+  likely an authoring mistake). What was narrowed away is recorded in the
+  step transcript's `tool_grant` event.
 - **Not supported on a remote step** (`host:` / `distribute:`): a non-empty
   `actions:` there is rejected at parse time, because the roster never
   reaches the remote dispatch path today (it would otherwise be a silent

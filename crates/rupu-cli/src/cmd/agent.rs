@@ -1,4 +1,4 @@
-//! `rupu agent list | show <name>`.
+//! `rupu agent list | show <name> | edit | create | validate`.
 
 use crate::cmd::completers::agent_names;
 use crate::cmd::editor;
@@ -54,6 +54,19 @@ pub enum Action {
         /// Default: `$VISUAL` then `$EDITOR` then `vi`.
         #[arg(long)]
         editor: Option<String>,
+    },
+    /// Check agent files: each must parse and its `tools:` must name known
+    /// tools (an unknown name is a load error). Checks every file in the
+    /// global and project agent dirs with `--all`, shadowed ones included.
+    /// Exits nonzero when any check fails.
+    #[command(group = clap::ArgGroup::new("which").required(true).args(["name", "all"]))]
+    Validate {
+        /// Name of the agent (frontmatter `name:` or file stem).
+        #[arg(add = ArgValueCompleter::new(agent_names))]
+        name: Option<String>,
+        /// Check every agent file in both layers.
+        #[arg(long)]
+        all: bool,
     },
     /// Scaffold a new agent file, then open it for editing. Prompts
     /// interactively for scope and name when omitted. With `--describe`,
@@ -114,6 +127,11 @@ pub async fn handle(
                 Err(e) => crate::output::diag::fail(e),
             }
         }
+        Action::Validate { name, all: _ } => match validate(name.as_deref(), global_format) {
+            Ok(true) => ExitCode::from(0),
+            Ok(false) => ExitCode::from(1),
+            Err(e) => crate::output::diag::fail(e),
+        },
         Action::Edit {
             name,
             scope,
@@ -151,6 +169,7 @@ pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Re
     let (command_name, supported) = match action {
         Action::List { .. } => ("agent list", report::TABLE_JSON_CSV),
         Action::Show { .. } => ("agent show", report::TABLE_JSON),
+        Action::Validate { .. } => ("agent validate", report::TABLE_JSON),
         Action::Edit { .. } => ("agent edit", report::TABLE_ONLY),
         Action::Create { .. } => ("agent create", report::TABLE_ONLY),
     };
@@ -379,6 +398,132 @@ async fn show(
     report::emit_detail(global_format, &AgentShowOutput { prefs, report })
 }
 
+#[derive(Serialize)]
+struct AgentValidateRow {
+    name: Option<String>,
+    scope: &'static str,
+    path: String,
+    ok: bool,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AgentValidateReport {
+    kind: &'static str,
+    version: u8,
+    rows: Vec<AgentValidateRow>,
+}
+
+struct AgentValidateOutput {
+    report: AgentValidateReport,
+}
+
+impl CollectionOutput for AgentValidateOutput {
+    type JsonReport = AgentValidateReport;
+    type CsvRow = AgentValidateRow;
+
+    fn command_name(&self) -> &'static str {
+        "agent validate"
+    }
+
+    fn supported_formats(&self) -> &'static [OutputFormat] {
+        report::TABLE_JSON
+    }
+
+    fn json_report(&self) -> &Self::JsonReport {
+        &self.report
+    }
+
+    fn csv_rows(&self) -> &[Self::CsvRow] {
+        &[]
+    }
+
+    fn render_table(&self) -> anyhow::Result<()> {
+        print!("{}", render_validate_report(&self.report.rows));
+        Ok(())
+    }
+}
+
+/// The human `agent validate` report: one line per file, its error indented
+/// under it, then a count.
+fn render_validate_report(rows: &[AgentValidateRow]) -> String {
+    let mut out = String::new();
+    let width = rows
+        .iter()
+        .map(|r| r.name.as_deref().unwrap_or("?").chars().count())
+        .max()
+        .unwrap_or(0);
+    for r in rows {
+        let mark = if r.ok { "\u{2713}" } else { "\u{2717}" };
+        let name = r.name.as_deref().unwrap_or("?");
+        out.push_str(&format!(
+            "{mark} {:<7} {name:<width$}  {}\n",
+            r.scope, r.path
+        ));
+        if let Some(e) = &r.error {
+            out.push_str(&format!("    {e}\n"));
+        }
+    }
+    let failed = rows.iter().filter(|r| !r.ok).count();
+    out.push_str(&format!(
+        "{} agent file{} checked, {failed} failed\n",
+        rows.len(),
+        if rows.len() == 1 { "" } else { "s" }
+    ));
+    out
+}
+
+/// `rupu agent validate`: check one agent (`name`) or every agent file
+/// (`None`, i.e. `--all`). `Ok(true)` when every check passed.
+fn validate(name: Option<&str>, global_format: Option<OutputFormat>) -> anyhow::Result<bool> {
+    let global = paths::global_dir()?;
+    let pwd = std::env::current_dir()?;
+    let project_root = paths::project_root_for(&pwd)?;
+    let project_agents_parent = project_root.as_ref().map(|p| p.join(".rupu"));
+    let checks = rupu_agent::check_agent_files(&global, project_agents_parent.as_deref());
+    let checks: Vec<_> = match name {
+        None => checks,
+        Some(n) => {
+            let picked: Vec<_> = checks
+                .into_iter()
+                .filter(|c| {
+                    c.name.as_deref() == Some(n)
+                        || c.path.file_stem().and_then(|s| s.to_str()) == Some(n)
+                })
+                .collect();
+            if picked.is_empty() {
+                anyhow::bail!("agent not found: {n}");
+            }
+            picked
+        }
+    };
+    let rows: Vec<AgentValidateRow> = checks
+        .into_iter()
+        .map(|c| AgentValidateRow {
+            name: c.name,
+            scope: match c.layer {
+                rupu_agent::AgentLayer::Global => "global",
+                rupu_agent::AgentLayer::Project => "project",
+            },
+            path: c.path.display().to_string(),
+            ok: c.error.is_none(),
+            error: c.error.map(|e| e.to_string()),
+        })
+        .collect();
+    let all_ok = rows.iter().all(|r| r.ok);
+    report::emit_collection(
+        global_format,
+        &AgentValidateOutput {
+            report: AgentValidateReport {
+                kind: "agent_validate",
+                version: 1,
+                rows,
+            },
+        },
+    )?;
+    Ok(all_ok)
+}
+
 /// Bare-minimum starter that parses cleanly through `AgentSpec`. Body is
 /// the system prompt; comments hint at common optional fields without
 /// littering the saved file with churn.
@@ -507,16 +652,8 @@ async fn create(
 
     editor::open_for_edit(editor_override, &target)?;
 
-    match AgentSpec::parse_file(&target) {
-        Ok(_) => {
-            println!("\u{2713} {name}: frontmatter parses cleanly");
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("\u{26a0} {name}: failed to re-parse after save:\n  {e}");
-            Ok(())
-        }
-    }
+    report_after_save(&name, &target);
+    Ok(())
 }
 
 async fn edit(
@@ -538,15 +675,20 @@ async fn edit(
 
     editor::open_for_edit(editor_override, &target)?;
 
-    match AgentSpec::parse_file(&target) {
-        Ok(_) => {
-            println!("✓ {name}: frontmatter parses cleanly");
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("⚠ {name}: failed to re-parse after save:\n  {e}");
-            Ok(())
-        }
+    report_after_save(name, &target);
+    Ok(())
+}
+
+/// After `agent create` / `agent edit` saves: say whether the file parses
+/// and its `tools:` names known tools. Warn-only — the file is saved either
+/// way; a run refuses it until it's fixed.
+fn report_after_save(name: &str, target: &std::path::Path) {
+    match AgentSpec::parse_file(target) {
+        Ok(spec) => match spec.validate_tools() {
+            Ok(()) => println!("\u{2713} {name}: frontmatter parses cleanly"),
+            Err(e) => eprintln!("\u{26a0} {name}: {e}"),
+        },
+        Err(e) => eprintln!("\u{26a0} {name}: failed to re-parse after save:\n  {e}"),
     }
 }
 

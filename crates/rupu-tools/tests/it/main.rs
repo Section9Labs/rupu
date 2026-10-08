@@ -10,6 +10,7 @@ mod coverage_instrumentation;
 mod descriptors;
 mod edit_file;
 mod glob;
+mod grant;
 mod grep;
 mod permission;
 mod read_file;

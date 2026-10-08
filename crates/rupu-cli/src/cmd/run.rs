@@ -1235,6 +1235,8 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             seed_source: None,
             collectors: fleet_collectors,
             extra_tools: fleet_tools,
+            step_actions: Vec::new(),
+            alias_scope: Default::default(),
             agent_name: spec.name.clone(),
             agent_system_prompt,
             agent_tools: spec.tools.clone(),

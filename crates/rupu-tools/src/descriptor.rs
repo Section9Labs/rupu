@@ -46,12 +46,21 @@ impl Effect {
 
 /// A service a tool reads from the run. W3 introduces the `ToolServices`
 /// struct that carries them; W1 declares the enum so descriptors are final.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Service {
+    /// The agentiflow unit supervisor behind `dispatch` / `join` /
+    /// `run_workflow` (W7 makes it the one launcher for every child kind).
     Launcher,
+    /// The in-process sub-agent dispatcher (`ToolContext::dispatcher`) behind
+    /// `dispatch_agent` / `dispatch_agents_parallel`. W7 folds it into
+    /// [`Service::Launcher`].
+    AgentDispatcher,
     Scm,
     Findings,
+    /// An active engagement profile set: what `assets.mark` validates an
+    /// asset's kind and depth against.
+    Engagement,
     Coverage,
     MessageBus,
     RunStatus,
@@ -60,11 +69,31 @@ pub enum Service {
     Netflow,
 }
 
+impl Service {
+    /// The wire word (`launcher`, `message_bus`, …), as serialized.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Service::Launcher => "launcher",
+            Service::AgentDispatcher => "agent_dispatcher",
+            Service::Scm => "scm",
+            Service::Findings => "findings",
+            Service::Engagement => "engagement",
+            Service::Coverage => "coverage",
+            Service::MessageBus => "message_bus",
+            Service::RunStatus => "run_status",
+            Service::Catalog => "catalog",
+            Service::WorkflowGenerator => "workflow_generator",
+            Service::Netflow => "netflow",
+        }
+    }
+}
+
 /// Where a legacy alias is accepted.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AliasScope {
     /// Accepted wherever the tool is offered.
+    #[default]
     Everywhere,
     /// Accepted only for an agent loaded inside an agentiflow lead. The one
     /// case is `coverage.status`: agentiflow's goal-coverage tool used that
@@ -108,7 +137,13 @@ pub struct ToolDescriptor {
     /// Legacy names, accepted forever in `tools:` and in model calls.
     pub aliases: &'static [Alias],
     pub effect: Effect,
+    /// Services the tool can't run without. A grant offers the tool only in
+    /// a run that provides all of them.
     pub needs: &'static [Service],
+    /// Services the tool feeds when the run has them and does without
+    /// otherwise (`read_file` emits coverage touches, `bash` reports flows to
+    /// netflow). Never a reason to withhold the tool.
+    pub uses: &'static [Service],
     pub description: &'static str,
     /// The input JSON Schema. A tool whose schema depends on its run (the
     /// findings profile picks `findings.report`'s) overrides
@@ -126,5 +161,12 @@ impl ToolDescriptor {
     /// True for the unqualified core fs/shell tools (D11).
     pub fn is_core(&self) -> bool {
         crate::catalog::CORE_NAMES.contains(&self.name)
+    }
+
+    /// True for a connector tool: one that acts through an SCM/issue
+    /// tracker (`needs` includes [`Service::Scm`]). A step's `actions:`
+    /// narrows these and nothing else.
+    pub fn is_connector(&self) -> bool {
+        self.needs.contains(&Service::Scm)
     }
 }

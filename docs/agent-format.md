@@ -115,46 +115,64 @@ For stable project behavior, prefer setting `model:` per agent instead of relyin
 
 ### `tools`
 
-`tools:` is the agent's tool allowlist.
+`tools:` is the agent's tool grant: what its model may call. Each entry is
+one of:
 
-Built-in tool names:
+| Entry | Means |
+|---|---|
+| `bash`, `findings.report`, `scm.prs.get`, … | that tool, by its canonical name |
+| `report_finding`, `query_findings`, … | a legacy name, accepted forever as an alias of its canonical tool (see [Tool names](#tool-names)) |
+| `findings.*`, `scm.*`, `issues.*`, `board.*`, … | every tool in that namespace |
+| `core.*` | the core tools: `bash`, `read_file`, `write_file`, `edit_file`, `grep`, `glob`, `ast_grep` |
+| `*` | the whole catalog |
 
-- `bash`
-- `read_file`
-- `write_file`
-- `edit_file`
-- `grep`
-- `glob`
-- `ast_grep`
-- `dispatch_agent`
-- `dispatch_agents_parallel`
+There are no other wildcards (`scm*`, `coverage_*` are errors).
+
+**An unknown name is an error.** An agent whose `tools:` names a tool rupu
+doesn't know fails to load — `rupu run`, a workflow step, a sub-agent dispatch
+all refuse it — with a suggestion when a known name is close:
+
+```text
+agent `reviewer`: unknown tool "repot_finding" in tools: (did you mean "report_finding" → findings.report?)
+```
+
+Check your agents with `rupu agent validate <name>` or `rupu agent validate
+--all` (every file in the global and project agent dirs; exits nonzero if any
+fail). The CP's agent page shows the same error.
+
+**A tool is offered only where it works.** Some tools need something the run
+may not have: the `scm.*` / `issues.*` / `github.*` / `gitlab.*` connector tools
+need configured SCM connectors, `dispatch_agent` / `dispatch_agents_parallel`
+need a sub-agent dispatcher, `coverage.*` needs a `concerns:` block,
+`assets.mark` an engagement profile, and the agentiflow tools (`board.*`,
+`msg.send`, `goal.*`, `dispatch`, `join`, …) an agentiflow run. A wildcard
+silently leaves out a tool the run can't serve. A tool you name exactly that
+the run can't serve is left out too, and the run says so with a
+`tool_unavailable` notice in its transcript.
+
+**Omitting `tools:`** gives the default grant: the core tools, the sub-agent
+dispatch pair and every connector tool (`core.*`, `dispatch_agent`,
+`dispatch_agents_parallel`, `scm.*`, `issues.*`, `github.*`, `gitlab.*`). For
+reusable agents an explicit `tools:` is better than the default.
+
+**Ambient grants.** The run's context adds tools the agent didn't list:
+a `concerns:` block adds the coverage tools and `findings.report`; an active
+engagement profile adds `findings.report` and `assets.mark`; an agentiflow
+adds its coordination tools. They're never hidden: every run's transcript opens
+with a `tool_grant` event listing exactly the tools the model was offered and
+why (`declared`, `declared:scm.*`, `default`, `ambient:concerns`,
+`ambient:engagement`, `origin:injected`), and every call is audited
+(`tool_audit`). See [transcript-schema.md](transcript-schema.md#tool_grant).
 
 `dispatch_agent` and `dispatch_agents_parallel` dispatch to child agents named
 in this agent's `dispatchableAgents:` list (see below); they fail at
 invocation if the requested agent isn't on that allowlist.
 
-MCP-backed tool names are also valid, for example:
-
-- `scm.prs.get`
-- `scm.prs.diff`
-- `scm.prs.create`
-- `issues.get`
-- `issues.comment`
-- `scm.*`
-- `issues.*`
-- `*`
-
-Allowlist matching rules:
-
-- exact match: `scm.prs.get`
-- prefix wildcard: `scm.*`
-- global wildcard: `*`
-
-Notes:
-
-- if you omit `tools:`, the agent gets the full built-in surface and, when SCM / issue connectors are configured, discovered MCP tools as well
-- for reusable repo agents, explicit `tools:` is better than relying on the implicit wide-open default
-- `tools:` is not the same thing as a workflow step's `actions:`. `tools:` is this agent's full tool grant; `actions:` (on a workflow step) can only narrow the connector/MCP subset of that grant further for that one step — it never touches builtin tools (`bash`, `read_file`, `write_file`, `edit_file`, `grep`, `glob`, `ast_grep`, `dispatch_agent`, `dispatch_agents_parallel`) and can never grant a tool beyond what `tools:` already allows
+`tools:` is not the same thing as a workflow step's `actions:`. `tools:` is
+this agent's full grant; `actions:` (on a workflow step) can only narrow the
+connector subset of that grant for that one step — it never touches any other
+tool, and never grants a tool beyond what `tools:` already allows. `*` means
+the same thing with or without `actions:`.
 
 #### The `ast_grep` tool
 

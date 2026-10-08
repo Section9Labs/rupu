@@ -1,91 +1,55 @@
-use rupu_agent::default_tool_registry;
+use rupu_agent::{builtin_tool, tool_catalog, ToolRegistry};
+use rupu_tools::{AliasScope, ToolCatalog};
 
-#[test]
-fn default_registry_contains_six_tools() {
-    let r = default_tool_registry();
-    for name in [
-        "bash",
-        "read_file",
-        "write_file",
-        "edit_file",
-        "grep",
-        "glob",
-    ] {
-        assert!(r.get(name).is_some(), "expected tool {name}");
+const BUILTINS: [&str; 9] = [
+    "ast_grep",
+    "bash",
+    "dispatch_agent",
+    "dispatch_agents_parallel",
+    "edit_file",
+    "glob",
+    "grep",
+    "read_file",
+    "write_file",
+];
+
+fn registry_of(names: &[&str]) -> ToolRegistry {
+    let mut r = ToolRegistry::new();
+    for n in names {
+        r.insert(builtin_tool(n).unwrap_or_else(|| panic!("no builtin {n}")));
     }
+    r
 }
 
 #[test]
-fn unknown_tool_is_none() {
-    let r = default_tool_registry();
-    assert!(r.get("teleport").is_none());
+fn every_builtin_has_a_body_under_its_canonical_name() {
+    for name in BUILTINS {
+        let t = builtin_tool(name).unwrap_or_else(|| panic!("expected tool {name}"));
+        assert_eq!(t.name(), name);
+    }
+    assert!(builtin_tool("teleport").is_none());
+    assert!(builtin_tool("findings.report").is_none(), "not a builtin");
 }
 
 #[test]
 fn known_tools_returns_sorted_list() {
-    let r = default_tool_registry();
-    let mut names = r.known_tools().to_vec();
-    names.sort();
-    assert_eq!(
-        names,
-        vec![
-            "ast_grep",
-            "bash",
-            "dispatch_agent",
-            "dispatch_agents_parallel",
-            "edit_file",
-            "glob",
-            "grep",
-            "read_file",
-            "write_file",
-        ]
-    );
+    let r = registry_of(&BUILTINS);
+    assert_eq!(r.known_tools(), BUILTINS.to_vec());
 }
 
 #[test]
-fn registry_respects_agent_tools_filter() {
-    let r = default_tool_registry();
-    let filtered = r.filter_to(&["bash".into(), "read_file".into()]);
-    assert!(filtered.get("bash").is_some());
-    assert!(filtered.get("read_file").is_some());
-    assert!(filtered.get("write_file").is_none());
+fn unknown_tool_is_none() {
+    assert!(registry_of(&["bash"]).get("teleport").is_none());
 }
 
 #[test]
-fn to_tool_definitions_returns_all_default_tools() {
-    let r = default_tool_registry();
+fn to_tool_definitions_match_the_registry() {
+    let r = registry_of(&["bash", "read_file"]);
     let defs = r.to_tool_definitions();
-    assert_eq!(defs.len(), 9);
-    let mut names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
-    names.sort();
-    assert_eq!(
-        names,
-        vec![
-            "ast_grep",
-            "bash",
-            "dispatch_agent",
-            "dispatch_agents_parallel",
-            "edit_file",
-            "glob",
-            "grep",
-            "read_file",
-            "write_file",
-        ]
-    );
-}
-
-#[test]
-fn to_tool_definitions_descriptions_non_empty() {
-    let r = default_tool_registry();
+    let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(names, vec!["bash", "read_file"]);
     for d in r.to_tool_definitions() {
         assert!(!d.description.is_empty(), "{}: empty description", d.name);
-    }
-}
-
-#[test]
-fn to_tool_definitions_schemas_are_objects() {
-    let r = default_tool_registry();
-    for d in r.to_tool_definitions() {
         assert_eq!(
             d.input_schema.get("type").and_then(|v| v.as_str()),
             Some("object"),
@@ -101,18 +65,24 @@ fn to_tool_definitions_schemas_are_objects() {
 }
 
 #[test]
-fn filtered_registry_tool_definitions_match_filter() {
-    let r = default_tool_registry();
-    let filtered = r.filter_to(&["bash".into(), "read_file".into()]);
-    let defs = filtered.to_tool_definitions();
-    assert_eq!(defs.len(), 2);
-    let mut names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
-    names.sort();
-    assert_eq!(names, vec!["bash", "read_file"]);
-}
-
-#[test]
-fn default_registry_contains_ast_grep() {
-    let r = default_tool_registry();
-    assert!(r.get("ast_grep").is_some());
+fn the_agent_catalog_adds_the_connector_tools_but_not_mcp_findings() {
+    let c = tool_catalog();
+    assert!(c.descriptor("scm.prs.get").is_some());
+    assert!(c.descriptor("issues.comment").is_some());
+    assert!(c.descriptor("github.workflows_dispatch").is_some());
+    // `findings.*` are the catalog's own tools; `findings.record` is an
+    // alias of `findings.report`, not a second tool.
+    assert_eq!(
+        c.descriptors()
+            .filter(|d| d.name == "findings.query")
+            .count(),
+        1
+    );
+    assert_eq!(
+        c.resolve_name("findings.record", AliasScope::Everywhere)
+            .unwrap()
+            .name,
+        "findings.report"
+    );
+    assert!(c.descriptors().count() > ToolCatalog::all().len());
 }

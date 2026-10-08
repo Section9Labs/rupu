@@ -103,6 +103,8 @@ async fn a_terminating_process_starts_no_compaction_summariser_call() {
         seed_source: None,
         collectors: Vec::new(),
         extra_tools: Vec::new(),
+        step_actions: Vec::new(),
+        alias_scope: Default::default(),
         agent_name: "test".into(),
         agent_system_prompt: "test".into(),
         agent_tools: None,

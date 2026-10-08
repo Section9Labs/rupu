@@ -17,8 +17,8 @@
 //! code via the `CommandRun` derived event.
 
 use crate::catalog::ToolCatalog;
-use crate::descriptor::{Effect, Service, ToolDescriptor};
 use crate::coverage_emit::{attribution_from, emit};
+use crate::descriptor::{Effect, Service, ToolDescriptor};
 use crate::tool::{DerivedEvent, Tool, ToolContext, ToolError, ToolOutput};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -135,7 +135,8 @@ pub static DESCRIPTOR: ToolDescriptor = ToolDescriptor {
     name: "bash",
     aliases: &[],
     effect: Effect::Write,
-    needs: &[Service::Netflow],
+    needs: &[],
+    uses: &[Service::Netflow],
     description: "Execute a shell command in the workspace directory. The command runs with a controlled environment (PATH, HOME, USER, TERM, LANG plus a per-workspace allowlist). Default timeout 120 seconds, configurable per-call. Use this for compilation, tests, git operations, and anything else that needs a shell. The cwd is locked to the workspace path; cd outside the workspace will produce an error from the shell, not an escape.",
     input_schema: descriptor_schema,
 };
@@ -151,7 +152,6 @@ fn descriptor_schema() -> Value {
         },
         "required": ["command"]
     })
-
 }
 
 #[async_trait]
@@ -589,7 +589,10 @@ mod tests {
             )
             .await
             .unwrap();
-        let err = out.error.as_ref().expect("a native-tool bash call is refused");
+        let err = out
+            .error
+            .as_ref()
+            .expect("a native-tool bash call is refused");
         assert!(err.contains("native rupu tool"), "{err}");
         assert!(err.contains("asset_mark"), "{err}");
         // The command never ran: no CommandRun was derived.

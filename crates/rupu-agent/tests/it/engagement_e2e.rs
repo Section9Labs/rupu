@@ -80,6 +80,8 @@ fn opts(
         seed_source: None,
         collectors: Vec::new(),
         extra_tools: Vec::new(),
+        step_actions: Vec::new(),
+        alias_scope: Default::default(),
         agent_name: "assessor".into(),
         agent_system_prompt: "You assess networks.".into(),
         agent_tools: Some(vec!["report_finding".into(), "asset_mark".into()]),
