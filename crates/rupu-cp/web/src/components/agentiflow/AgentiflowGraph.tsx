@@ -18,9 +18,10 @@
 // codename palette — the spine is tinted by the run's own crew (the lead), each
 // branch and each nested sub-spine by its unit's crew.
 
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { ChevronRight, ChevronDown } from 'lucide-react';
+import TimeRail, { type TimeAnchor } from './TimeRail';
 import { AgentName } from '../codename/AgentName';
 import { StatusPill } from '../StatusPill';
 import { Badge } from '../ui/Badge';
@@ -46,6 +47,10 @@ const NODE_R = 6;
 const SUB_INDENT = 20; // how far the sub-spine sits in from the unit card's left
 const SUB_ROW_H = 30; // a nested step row
 const SUB_TOP_GAP = 4; // breathing room between the unit card and its sub-flow
+// The flow lives in a fixed-height pane (a share of the screen) and scrolls
+// inside it, so a 400-round run never grows into one mile-high page. A short
+// run fits under the cap and renders exactly as before — no scroll, no rail.
+const PANE_MAX_VH = 70;
 
 type Palette = ReturnType<typeof palette>;
 function palette(mode: 'light' | 'dark') {
@@ -209,7 +214,7 @@ export default function AgentiflowGraph({ detail }: { detail: AgentiflowDetail }
     [loadSub],
   );
 
-  const { nodes, totalH } = useMemo(
+  const { nodes, totalH, anchors } = useMemo(
     () => build(detail, mode, pal, expandedOverride, expandedUnits, subCache),
     // detail identity + mode + the collapse/expand state drive the geometry.
     [detail, mode, expandedOverride, expandedUnits, subCache], // eslint-disable-line react-hooks/exhaustive-deps
@@ -218,9 +223,25 @@ export default function AgentiflowGraph({ detail }: { detail: AgentiflowDetail }
   const lastY = nodes.length ? nodes[nodes.length - 1].nodeY : 0;
   const firstY = nodes.length ? nodes[0].nodeY : 0;
 
+  // The flow scrolls inside a capped pane; the time rail shows only once it
+  // actually overflows (long runs), so short runs keep their current look.
+  const flowRef = useRef<HTMLDivElement>(null);
+  const [overflowing, setOverflowing] = useState(false);
+  useLayoutEffect(() => {
+    const el = flowRef.current;
+    if (!el) return;
+    const measure = () => setOverflowing(el.scrollHeight > el.clientHeight + 4);
+    measure();
+    if (typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [totalH]);
+
   return (
-    <div className="relative overflow-x-auto" style={{ minHeight: totalH }}>
-      <div className="relative" style={{ height: totalH }}>
+    <div className="flex gap-2">
+      <div ref={flowRef} className="relative min-w-0 flex-1 overflow-auto" style={{ maxHeight: `${PANE_MAX_VH}vh` }}>
+        <div className="relative" style={{ height: totalH }}>
         <svg
           className="pointer-events-none absolute left-0 top-0"
           width={CARD_X}
@@ -325,7 +346,9 @@ export default function AgentiflowGraph({ detail }: { detail: AgentiflowDetail }
             </div>
           )),
         )}
+        </div>
       </div>
+      {overflowing && anchors.length >= 2 && <TimeRail flowRef={flowRef} anchors={anchors} tint={leadTint} />}
     </div>
   );
 }
@@ -346,7 +369,7 @@ function build(
   override: Record<number, boolean>,
   expandedUnits: Record<string, boolean>,
   subCache: Record<string, SubCache>,
-): { nodes: SpineNode[]; totalH: number } {
+): { nodes: SpineNode[]; totalH: number; anchors: TimeAnchor[] } {
   const { record, events, units, lead_transcripts } = detail;
   const running = record.status === 'running';
 
@@ -423,9 +446,10 @@ function build(
 
   for (let r = 0; r <= maxRound; r++) {
     const us = unitsByRound.get(r) ?? [];
-    // Default: only the last / live round is open; earlier rounds collapse
-    // unless the operator expanded one. A round with no units never "collapses".
-    const expanded = us.length === 0 ? true : r in override ? override[r] : r === maxRound;
+    // Collapse only kicks in BELOW the second level: rounds (L1) and their units
+    // (L2) stay open by default — the operator can still fold a round via its
+    // chevron, and only the deeper workflow sub-flows (L3) default to collapsed.
+    const expanded = r in override ? override[r] : true;
     const top = y;
     // Lay the round's units out one block under another — a block is the unit
     // card plus, for an expanded workflow unit, its nested sub-flow.
@@ -458,7 +482,22 @@ function build(
   if (stopEv) pushHead({ kind: 'stop', key: 'stop', ev: stopEv });
   else if (running) pushHead({ kind: 'pulse', key: 'pulse', height: PULSE_H });
 
-  return { nodes, totalH: y };
+  // Time anchors for the timelapse rail: start → each round → stop / live tail,
+  // mapping content-y to wall-clock time. Only consumed when the flow overflows
+  // its pane (long runs); a round with no event ts is skipped (interpolated).
+  const startMs = Date.parse(record.started_at);
+  const endMs = record.ended_at ? Date.parse(record.ended_at) : NaN;
+  const anchors: TimeAnchor[] = [];
+  for (const n of nodes) {
+    let t = NaN;
+    if (n.kind === 'start') t = startMs;
+    else if (n.kind === 'stop') t = endMs;
+    else if (n.kind === 'pulse') t = Date.now();
+    else if (n.kind === 'round' && n.round != null) t = roundEvByIdx.get(n.round)?.ts ?? NaN;
+    if (Number.isFinite(t)) anchors.push({ y: n.nodeY, t });
+  }
+
+  return { nodes, totalH: y, anchors };
 }
 
 // ---------------------------------------------------------------------------
