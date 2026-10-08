@@ -49,6 +49,7 @@ async fn offered_tools(agent_tools: Option<Vec<String>>) -> Vec<String> {
         suppress_stream_stdout: false,
         mcp_registry: Some(Arc::new(Registry::empty())),
         effort: None,
+        thinking_display: None,
         context_window: None,
         output_format: None,
         output_schema: None,

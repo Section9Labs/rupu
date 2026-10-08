@@ -1866,6 +1866,7 @@ mod tool_name_sanitize_tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             disable_prompt_cache: false,
+            thinking_display: None,
         };
         let body = client.build_request_body(&req, false);
         let tools = body["tools"].as_array().expect("tools array");
@@ -1904,6 +1905,7 @@ mod tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             disable_prompt_cache: false,
+            thinking_display: None,
         };
 
         let body = client.build_request_body(&request, true);
@@ -1944,6 +1946,7 @@ mod tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             disable_prompt_cache: false,
+            thinking_display: None,
         };
 
         let body = client.build_request_body(&request, false);
@@ -1979,6 +1982,7 @@ mod tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             disable_prompt_cache: false,
+            thinking_display: None,
         };
 
         let body = client.build_request_body(&request, false);
@@ -2011,6 +2015,7 @@ mod tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             disable_prompt_cache: false,
+            thinking_display: None,
         };
 
         let body = client.build_request_body(&request, false);
@@ -2475,6 +2480,7 @@ mod tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             disable_prompt_cache: false,
+            thinking_display: None,
         };
 
         let body = client.build_request_body(&request, false);
@@ -2512,6 +2518,7 @@ mod tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             disable_prompt_cache: false,
+            thinking_display: None,
         };
 
         let body = client.build_request_body(&request, false);
@@ -2548,6 +2555,7 @@ mod tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             disable_prompt_cache: false,
+            thinking_display: None,
         };
 
         let body = client.build_request_body(&request, false);
@@ -2603,6 +2611,7 @@ mod tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             disable_prompt_cache: false,
+            thinking_display: None,
         };
 
         let body = client.build_request_body(&request, true);

@@ -62,6 +62,7 @@ pub(crate) fn opts_for(
         suppress_stream_stdout: false,
         mcp_registry: None,
         effort: None,
+        thinking_display: None,
         context_window: None,
         output_format: None,
         output_schema: None,

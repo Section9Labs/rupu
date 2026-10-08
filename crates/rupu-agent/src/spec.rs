@@ -8,7 +8,7 @@
 
 use rupu_coverage::ConcernsBlock;
 use rupu_providers::model_tier::{ContextWindow, ThinkingLevel};
-use rupu_providers::types::{ContextManagement, OutputFormat, Speed};
+use rupu_providers::types::{ContextManagement, OutputFormat, Speed, ThinkingDisplay};
 use rupu_providers::AuthMode;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -59,12 +59,26 @@ struct Frontmatter {
     /// Reasoning / thinking effort level. Accepts the canonical
     /// `auto|minimal|low|medium|high|max` plus aliases `adaptive`
     /// (= auto) and `xhigh` (= max). Each provider maps to its native
-    /// shape — Anthropic emits `thinking.type: adaptive` for `auto`
-    /// and `thinking.budget_tokens: <n>` for the rest; OpenAI / Copilot
-    /// emit `reasoning.effort: <name>`; Gemini emits
-    /// `generationConfig.thinkingConfig.thinkingBudget: <budget>`.
+    /// shape:
+    /// - Anthropic adaptive models (4.6+ and the Claude-5 family): `auto`
+    ///   → `thinking.type: adaptive` with no effort knob; any other level
+    ///   → `thinking.type: adaptive` + `output_config.effort`
+    ///   (`minimal`/`low`→`low`, `medium`→`medium`, `high`→`high`,
+    ///   `max`→`max`).
+    /// - Anthropic pre-4.6 / Haiku: `thinking.budget_tokens: <n>` scaled
+    ///   from the level (`auto` → adaptive on the OAuth path).
+    /// - OpenAI / Copilot: `reasoning.effort: <name>` (`max`→`xhigh`).
+    /// - Gemini: `generationConfig.thinkingConfig.thinkingBudget`.
     #[serde(default)]
     effort: Option<ThinkingLevel>,
+    /// What reasoning the model returns (`thinking.display`): `summarized`
+    /// (default), `omitted`, or `updates`. A display hint, honored only by
+    /// Anthropic adaptive models (4.6+ / Claude-5); other providers and the
+    /// pre-4.6 `budget_tokens` path ignore it. `updates` (between-tool
+    /// progress notes) needs a capable model (fable-5/5-1, mythos-5-1,
+    /// opus-5-5, sonnet-5-5) and degrades to `summarized` on any other.
+    #[serde(default, rename = "thinkingDisplay")]
+    thinking_display: Option<ThinkingDisplay>,
     /// Desired context-window tier. `default` or omitted picks the
     /// model's native window; `1m` (alias `1M`, `one_million`) opts
     /// into the 1M-token window. Anthropic Sonnet/Opus 4 honor this on
@@ -179,6 +193,9 @@ pub struct AgentSpec {
     pub anthropic_task_budget: Option<u32>,
     pub anthropic_context_management: Option<ContextManagement>,
     pub anthropic_speed: Option<Speed>,
+    /// Reasoning display hint (`thinking.display`). See the `thinkingDisplay`
+    /// frontmatter field.
+    pub thinking_display: Option<ThinkingDisplay>,
     /// Per-agent allowlist of children this agent can dispatch via
     /// `dispatch_agent` / `dispatch_agents_parallel`.
     pub dispatchable_agents: Option<Vec<String>>,
@@ -242,6 +259,7 @@ impl AgentSpec {
             anthropic_task_budget: fm.anthropic_task_budget,
             anthropic_context_management: fm.anthropic_context_management,
             anthropic_speed: fm.anthropic_speed,
+            thinking_display: fm.thinking_display,
             dispatchable_agents: fm.dispatchable_agents,
             concerns: fm.concerns,
             max_tokens: fm.max_tokens,
@@ -289,6 +307,26 @@ You are a test agent.
         let spec = AgentSpec::parse(src).expect("parse ok");
         assert_eq!(spec.context_window_tokens, None);
         assert_eq!(spec.compact_at_percent, None);
+    }
+
+    #[test]
+    fn parses_thinking_display() {
+        let s = "---\nname: a\nthinkingDisplay: omitted\n---\nbody\n";
+        assert_eq!(
+            AgentSpec::parse(s).unwrap().thinking_display,
+            Some(rupu_providers::types::ThinkingDisplay::Omitted)
+        );
+        let s = "---\nname: a\nthinkingDisplay: updates\n---\nbody\n";
+        assert_eq!(
+            AgentSpec::parse(s).unwrap().thinking_display,
+            Some(rupu_providers::types::ThinkingDisplay::Updates)
+        );
+        // Absent → None (the provider defaults to summarized).
+        let s = "---\nname: a\n---\nbody\n";
+        assert_eq!(AgentSpec::parse(s).unwrap().thinking_display, None);
+        // Unknown value is rejected at parse time (clarifies the valid set).
+        let s = "---\nname: a\nthinkingDisplay: verbose\n---\nbody\n";
+        assert!(AgentSpec::parse(s).is_err());
     }
 
     #[test]

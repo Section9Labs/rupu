@@ -239,6 +239,7 @@ fn resolve_step_agent_spec(
                 anthropic_oauth_prefix: None,
                 anthropic_prompt_cache: None,
                 effort: None,
+                thinking_display: None,
                 context_window: None,
                 output_format: None,
                 output_schema: None,
@@ -564,6 +565,7 @@ impl StepFactory for DefaultStepFactory {
             suppress_stream_stdout: true,
             mcp_registry: Some(Arc::clone(&self.mcp_registry)),
             effort: spec.effort,
+            thinking_display: spec.thinking_display,
             context_window: spec.context_window,
             output_format: spec.output_format,
             output_schema: spec.output_schema.clone(),
@@ -993,6 +995,7 @@ mod provider_build_error_stub_tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             disable_prompt_cache: false,
+            thinking_display: None,
         }
     }
 

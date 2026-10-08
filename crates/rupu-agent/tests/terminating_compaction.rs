@@ -124,6 +124,7 @@ async fn a_terminating_process_starts_no_compaction_summariser_call() {
         suppress_stream_stdout: true,
         mcp_registry: None,
         effort: None,
+        thinking_display: None,
         context_window: None,
         output_format: None,
         output_schema: None,

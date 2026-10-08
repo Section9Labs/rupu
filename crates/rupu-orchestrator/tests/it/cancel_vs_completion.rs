@@ -125,6 +125,7 @@ impl StepFactory for Factory {
             suppress_stream_stdout: true,
             mcp_registry: None,
             effort: None,
+            thinking_display: None,
             context_window: None,
             output_format: None,
             output_schema: None,

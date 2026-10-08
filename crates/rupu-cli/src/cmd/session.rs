@@ -44,6 +44,7 @@ use rupu_config::PricingConfig;
 use rupu_providers::model_tier::{ContextWindow, ThinkingLevel};
 use rupu_providers::types::{
     ContextManagement, Message, OutputFormat as ProviderOutputFormat, Speed, StreamEvent,
+    ThinkingDisplay,
 };
 use rupu_providers::AuthMode;
 use rupu_runtime::provider_factory;
@@ -387,6 +388,8 @@ struct SessionRecord {
     anthropic_prompt_cache: Option<bool>,
     #[serde(default)]
     effort: Option<ThinkingLevel>,
+    #[serde(default)]
+    thinking_display: Option<ThinkingDisplay>,
     #[serde(default)]
     context_window: Option<ContextWindow>,
     #[serde(default)]
@@ -1720,6 +1723,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         anthropic_oauth_prefix: spec.anthropic_oauth_prefix,
         anthropic_prompt_cache: spec.anthropic_prompt_cache,
         effort: spec.effort,
+        thinking_display: spec.thinking_display,
         context_window: spec.context_window,
         output_format: spec.output_format,
         output_schema: spec.output_schema.clone(),
@@ -7993,6 +7997,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             suppress_stream_stdout: true,
             mcp_registry: Some(scm_registry),
             effort: session.effort,
+            thinking_display: session.thinking_display,
             context_window: session.context_window,
             output_format: session.output_format,
             output_schema: session.output_schema.clone(),
@@ -9659,6 +9664,7 @@ mod tests {
             provider_name: "openai".into(),
             model: "gpt-5".into(),
             effort: Some(ThinkingLevel::High),
+            thinking_display: None,
             ..test_session_record()
         };
         let mut state = SessionInteractiveState::new(
@@ -10452,6 +10458,7 @@ mod tests {
             anthropic_oauth_prefix: None,
             anthropic_prompt_cache: None,
             effort: None,
+            thinking_display: None,
             context_window: None,
             output_format: None,
             output_schema: None,

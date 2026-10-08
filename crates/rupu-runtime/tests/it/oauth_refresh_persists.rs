@@ -101,6 +101,7 @@ async fn a_factory_built_client_persists_its_token_refresh() {
         anthropic_context_management: None,
         anthropic_speed: None,
         disable_prompt_cache: false,
+        thinking_display: None,
     };
     // The message itself 404s; the refresh before it is what matters.
     let _ = provider.send(&request).await;

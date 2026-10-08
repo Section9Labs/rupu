@@ -1256,6 +1256,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             suppress_stream_stdout: true,
             mcp_registry: Some(scm_registry),
             effort: spec.effort,
+            thinking_display: spec.thinking_display,
             context_window: pins.context_window,
             output_format: spec.output_format,
             output_schema: spec.output_schema.clone(),
