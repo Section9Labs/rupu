@@ -1,83 +1,68 @@
-# F1 (feature): messaging for every run kind
+# F1 (feature): messaging for every run kind (overview)
 
-- **Card:** F1 · **Depends on:** W1–W7 (it builds on `MessageBus` from W5, `Launcher`/codenames from W7, and `RunAssembler` from W3)
-- **Status:** the design direction was agreed in conversation on 2026-10-07. This file is the *feature brief* the F1 session starts from. That session runs its own brainstorm on the open questions in §7 before writing a plan.
+- **Cards:** [F1a](F1a-message-space-and-delivery.md) → [F1b](F1b-operator-participant.md) → [F1c](F1c-messages-ui.md)
+- **Depends on:** W1–W7. The F-specs are written **against the post-refactor architecture** and use its types directly: `ToolCatalog`, `ResolvedGrant`, `RunAssembler`/`Origin`, `rupu_fleet::Bus`, `Launcher` + the children ledger, codenames for every participant (matt, 2026-10-07: "it is ok if we depend on new code since we will change a lot now").
+- **Status:** draft for matt's review. The four open questions from the first brief are decided in §4. matt can override any of them.
 
-## 1. What matt asked for
+## 1. What matt asked for (2026-10-07)
 
-- Agents in a **workflow** (parallel branches, fan-out units, long-running steps, children) can talk to each other in real time through both the **board** and **mailboxes**, just as agentiflow agents do.
-- Messages belong in the **transcripts**: they are part of an agent's living history, and the UI should show them there as identifiable chat bubbles.
-- The Messages tab shows **everything**, not just board posts. The **operator is a participant** who can message the lead, any agent, a role, or everyone.
+1. Agents in a **workflow** (parallel branches, fan-out units, a long-running step, children launched with `dispatch`) talk to each other in real time through the **board** and **mailboxes**, as agentiflow agents do.
+2. Messages are **part of the transcript**: they belong to an agent's living history, and the UI shows them there with an identifiable, nicer presentation.
+3. The **Messages tab shows everything**. Today it shows only board posts and directives: not direct messages, broadcasts, or the operator's own steering.
+4. The **operator is a participant**: they can message the lead, any agent, a role or everyone, in any run kind.
+5. A workflow can have a **lead-shaped step** if someone wants one. That already falls out of W5 + W7 (any agent can be granted `dispatch`, `board.directive`, …) once F1 gives workflows a message space.
 
-## 2. What the deep dive found (the channel inventory)
+## 2. What exists today (from the deep dive)
 
-There are ten operator↔agent and agent↔agent channels, each with its own store, identity, timing, framing and visibility. The full table is in 00-index §3.4. The parts F1 must resolve:
+Ten separate operator↔agent and agent↔agent channels exist (00-index §3.4). The problems F1 must close:
 
-- **Missing from the CP.** Direct `msg.send`, broadcasts and the operator's own steering never appear. Inboxes are cleared on read (`Mailbox::drain` renames and deletes), so delivered messages cannot be shown afterwards.
-- **Collector injections are not recorded** in transcripts, so replay diverges from what the model saw.
-- **Dead letters:**
-  - `msg.send` to `"parent"` or to a role is never drained;
-  - role-addressed directives never match, because `role` is always `None`;
-  - workflow units' `--fleet-participant` is discarded.
-- **Inconsistent identities:**
-  - steering has no author;
-  - directives always say `"lead"`;
-  - participants are `<agent>#n`, not codenames;
-  - mailbox sanitizing collides `recon#1` with `recon-1`.
-- **Two meanings of "broadcast":** a board post with no `addressed_to` (the UI's convention) versus the real broadcast log.
+| # | Problem | Closed by |
+|---|---|---|
+| M1 | Direct `msg.send`, broadcasts and operator steering are invisible in the CP. Inboxes are destructively drained, so delivered messages can't be shown afterwards | F1a log, F1c |
+| M2 | Collector injections aren't recorded in transcripts (`collector.rs:13` claims they are, `collectors.rs:31` correctly says they aren't), so replay diverges from what the model saw | F1a `Event::Injected` |
+| M3 | Dead letters: `msg.send` to `parent` or to a role is never drained; role-addressed directives never match (`role` is always `None`); workflow units' `--fleet-participant` is discarded | F1a addressing + delivery status |
+| M4 | Identities differ per channel: steering has no author, directives always say `"lead"` (W5 fixes), participants are `<agent>#n` rather than codenames, and mailbox sanitizing collides `recon#1` with `recon-1` | F1a addresses = codename roles |
+| M5 | Two meanings of "broadcast" (a post with no `addressed_to` vs the broadcast log) | F1a: one `broadcast` kind |
+| M6 | The operator can only reach an agentiflow **lead** (steering) or a **session** (a new turn). There is no path to a unit, a workflow step or a child | F1b |
+| M7 | Operator steering and agent messages use different framings and stores, and `--now` exists only for the lead | F1b |
 
-## 3. Direction
+## 3. The shape
 
-### 3.1 One message space per run root
+```mermaid
+flowchart TB
+  subgraph root["One message space per ROOT run<br/>(workflow run · agentiflow · session · standalone run with children)"]
+    LOG["log.jsonl — canonical, append-only, never drained<br/>every post · direct · broadcast · directive · retract · operator<br/>+ delivery / seen receipts"]
+    PART["participants.jsonl<br/>address ↔ codename ↔ run ↔ step ↔ joined/left"]
+    WS["working state (as today)<br/>board/ posts, directives, claims · mailboxes/ inboxes, broadcast cursors"]
+  end
+  A1["agent (workflow step / unit / child / lead)"] -- "board.post · msg.send · board.directive<br/>(catalog tools, W5)" --> BUS["rupu_fleet::Bus<br/>(one writer API: log + working state under one lock)"]
+  OP["operator<br/>CLI rupu message · CP composer"] -- "operator_send (F1b)" --> BUS
+  BUS --> LOG & WS
+  WS -- "MessageCollector / DirectiveCollector<br/>before every model call" --> A2["recipient agent"]
+  A2 -- "Event::Message (received) + receipt" --> TX["recipient transcript"]
+  A1 -- "Event::Message (sent)" --> TX1["sender transcript"]
+  LOG --> UI["CP Messages tab · inline transcript bubbles (F1c)"]
+```
 
-Every **root run** gets one message space at `<root run dir>/messages/`. The root runs are a workflow run, an agentiflow, a session, and a standalone `rupu run` that has children. The space holds `board/`, `mailboxes/` and the canonical **`log.jsonl`**: an append-only log of every message of every kind (post, direct, broadcast, directive, retract, operator), each with a ULID `id`. The log is never trimmed or drained, which makes it the source the UI reads.
+**One sentence:** every root run has one message space; everything said in it goes through `Bus` into one append-only log; agents receive messages through collectors before each model call; both sides' transcripts record the message; and the UI reads the log.
 
-### 3.2 Addresses
+## 4. Decisions (the brief's open questions, decided)
 
-- Participant addresses come from codenames (W7): the role tail `lynx#1`, unique within a root, or the full codename.
-- Reserved addresses: `operator`, `broadcast`, `parent`, `lead` (the flow lead; in a workflow, undefined → recorded undeliverable).
-- A role name (`recon`) is resolved **at send time** to that role's current participants.
-- Delivery status is recorded in the log line (`delivered_to: [...]` or `undelivered: <reason>`), never dropped silently.
+| # | Question | Decision | Why |
+|---|---|---|---|
+| FD1 | Does a standalone `rupu run` with no children get a message space? | **Yes, lazily.** It is created on the first message (an operator send or a child launch), never eagerly. | The operator steering a long single agent is a real use (matt: "send messages to the lead or anyone we want"). Lazy creation costs nothing for runs that never use it |
+| FD2 | How does a workflow opt its agents into messaging without editing agent files? | **A workflow-level `messaging:` key** (`messaging: true`, or `messaging: { tools: [...] }`) grants the messaging set to every agent step and unit as an ambient grant (reason `ambient:workflow_messaging`). No general per-step `grants:` key. Agents can still opt in individually via `tools:` | Narrow and explicit (YAGNI on a general grants key). Recorded in the `ToolGrant` event, so it's auditable |
+| FD3 | Retention | **The log is not count-capped.** A size cap `[messaging].log_max_mb` (default 64) makes further sends fail *to the sender* with an explicit error plus a `messaging_full` notice. Inbox delivery caps (256) and the broadcast cap stay as backpressure | The log is the audit record; silently trimming it would recreate M1 |
+| FD4 | Does "now / urgent" interrupt mid-tool-call? | **No.** Every message is delivered before the recipient's **next model call** (collectors already run before each LLM request). `urgent: true` sorts it first and marks it urgent. For an agentiflow lead it also ends the current round early (today's `--now` behaviour) | Interrupting a tool mid-flight (e.g. a long `bash`) risks half-applied effects. Per-model-call delivery is already "real time" for agents |
+| FD5 | Framing | **Agent → agent = untrusted data** (today's `wrap_injection` framing). **Operator → agent = an operator instruction** (a distinct, trusted framing, as steering is today). The `from` field is set by the writer API from the caller's identity, never from tool input | Prompt-injection hygiene: one agent must not be able to command another as if it were the operator |
+| FD6 | Cross-root messaging (a parent workflow talking to a dispatched child *workflow* or *agentiflow*) | **Not in F1.** In-process sub-agents and process `agent` children **share their parent's root** (they get `--message-space`). `workflow` and `agentiflow` children are their own roots. F2 adds parent ↔ child-flow messaging | Keeps F1's addressing unambiguous: one root, one participant set |
+| FD7 | Remote placed units (`host:`/`distribute:`) | **No message space** (W2's `tool_unavailable` notice). A transport is a later spec | Same honesty rule as P7 |
 
-### 3.3 Delivery and framing
+## 5. Card order and scope
 
-- **The collectors generalize.** The mailbox, broadcast and directive collectors attach to every agent run under a root with a message space whenever the agent is granted any `board.*` / `msg.*` tool or has mail waiting. The operator can therefore message an agent that has no messaging tools of its own: receive-only.
-- **Agent → agent messages are framed as untrusted data,** as today.
-- **Operator → agent messages are framed as operator instructions** (the trusted channel, like today's steering). `now: true` interrupts the agent's current turn at a safe boundary and delivers the message, generalizing agentiflow `send --now` to any running agent.
-- The agentiflow `OperatorQueue` folds into this. The lead's round-prompt steering block becomes "operator messages addressed to the lead".
-
-### 3.4 Transcripts
-
-- `Event::Message { id, direction: sent | received, from, to, kind, body, via: tool | injected }` is written when an agent sends a message (its tool call) and when a collector delivers one.
-- A general `Event::Injected { source, kind, content }` records every `Once` injection, which fixes replay fidelity for all collectors, not only messaging.
-- Old readers see both events as `Unknown` and keep them.
-
-### 3.5 UI
-
-- **Run detail gains a Messages tab** for workflow runs and sessions, reusing `MessageFeed` and reading the log. The agentiflow tab switches to the log, with a legacy fallback to `board/*.jsonl` for flows recorded before F1.
-- **The composer is the same everywhere:** to `{participant | role | broadcast}`, with a `now` toggle.
-- **The transcript view renders `Message` events inline as chat bubbles** (sender codename tint, sent vs received, an @mention pill). Clicking one jumps to it in the channel, and back.
-- **API:** `GET /api/runs/:id/messages` and `POST /api/runs/:id/messages` (operator send). The agentiflow `/messages` + `/steer` endpoints become aliases of these.
-
-## 4. Fits the architecture
-
-- **No new tool homes.** `board.*` and `msg.send` are already catalog tools after W5. F1 makes `MessageBus` present for more origins (`WorkflowStep`, `SessionTurn`, `SubAgent`, process children through `--fleet-run-dir` → generalized `--message-space`). That is one row in `RunAssembler::defaults_for`.
-- **Workflows get no automatic grants.** An agent opts in through its `tools:` (`board.*`, `msg.send`), or a workflow step adds them with a new step key `grants:` (open question §7.2).
-
-## 5. Out of scope for F1
-
-- A messaging transport for remote placed units (`host:`/`distribute:`). They get W2's `tool_unavailable` notice until a transport exists.
-- Cross-root messaging (two separate workflow runs talking).
-
-## 6. Rough card split
-
-- **F1a:** message space + log + addresses + delivery status + collectors for all origins, and the transcript events.
-- **F1b:** the operator as a participant (send/now for any agent; steering folded in) + CP API.
-- **F1c:** the web Messages tab for workflows/sessions, inline transcript bubbles, the agentiflow tab on the log. GUI work, so it stops for matt's visual check.
-
-## 7. Open questions for the F1 brainstorm
-
-1. Should a standalone `rupu run` with no children get a message space at all? It only matters for operator messages to a long single agent.
-2. A workflow-level or step-level `grants:` key to add messaging tools without editing agent files: yes or no?
-3. Retention: is the log capped per run (as broadcasts are today)? If so, what happens when it hits the cap?
-4. Does `now` interrupt a turn that is mid-tool-call, or wait for the tool to finish?
+| Card | Scope | Blocks |
+|---|---|---|
+| **F1a** | Message space, log, participants, addresses, one writer API, delivery + receipts, transcript `Message`/`Injected` events, collectors for every origin, workflow `messaging:` key, `--message-space` for process children | F1b, F1c |
+| **F1b** | Operator as a participant: `operator_send`, framing, `urgent`, `rupu message` CLI, CP `GET/POST …/messages` for runs/sessions/flows, steering folded in, remote-host contract | F1c |
+| **F1c** | Web: Messages tab for workflow runs + sessions, MessageFeed on the log (all kinds), the composer with a recipient picker, inline transcript message bubbles + injected-context chips, cross-links. **GUI: stops for matt's visual check** | — |
+| **F2** | [Ephemeral agentiflows as a dispatch kind](F2-dispatch-agentiflow.md) (`dispatch {kind: agentiflow}` + `agentiflows.draft`) | — (needs F1a for parent ↔ child-lead messaging) |
