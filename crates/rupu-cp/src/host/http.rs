@@ -13,11 +13,13 @@ use std::time::Duration;
 use crate::{
     agent_launcher::AgentLaunchRequest,
     host::connector::{
-        EventByteStream, HostCapabilities, HostConnector, HostConnectorError, HostInfo, RunKind,
-        RunListQuery, MAX_WORKSPACE_BYTES,
+        spec_peer_codename, EventByteStream, HostCapabilities, HostConnector, HostConnectorError,
+        HostInfo, RunKind, RunListQuery, MAX_WORKSPACE_BYTES,
     },
     launcher::LaunchRequest,
-    node::protocol::{CAP_AGENT_ENGAGEMENT_PROFILE, CAP_AGENT_FINDINGS_PROFILE},
+    node::protocol::{
+        CAP_AGENT_ENGAGEMENT_PROFILE, CAP_AGENT_FINDINGS_PROFILE, CAP_RUN_SUPPLIED_RUN_ID,
+    },
     session_sender::SendMessageRequest,
     session_starter::SessionStartRequest,
 };
@@ -42,6 +44,18 @@ pub struct HttpHostConnector {
     token: Option<String>,
     /// [`ARTIFACT_PULL_IDLE_TIMEOUT`]; a field so tests can shorten it.
     artifact_idle: Duration,
+    /// The `features` the remote's `/api/host/info` last listed (empty for a
+    /// remote predating it); `None` until it was first read. What the
+    /// synchronous [`HostConnector::honours_supplied_run_id`] answers from.
+    features_seen: std::sync::Mutex<Option<Vec<String>>>,
+}
+
+/// What `/api/host/info` said about the remote.
+enum PeerInfo {
+    Info(HostInfoBody),
+    /// The remote predates `/api/host/info` (404, or its web UI's HTML):
+    /// it advertises nothing. The text says which, for a refusal message.
+    Predates(String),
 }
 
 /// Private response struct for deserializing the `/api/host/info` endpoint.
@@ -97,6 +111,7 @@ impl HttpHostConnector {
             base_url,
             token,
             artifact_idle: ARTIFACT_PULL_IDLE_TIMEOUT,
+            features_seen: std::sync::Mutex::new(None),
         }
     }
 
@@ -132,6 +147,7 @@ impl HttpHostConnector {
             base_url,
             token,
             artifact_idle: ARTIFACT_PULL_IDLE_TIMEOUT,
+            features_seen: std::sync::Mutex::new(None),
         }
     }
 
@@ -177,50 +193,70 @@ impl HttpHostConnector {
         }
     }
 
+    /// Read the remote's `/api/host/info`, remembering its `features` for
+    /// [`HostConnector::honours_supplied_run_id`]. Read, then parse (as
+    /// `proxy_get_json` does): a body that failed to ARRIVE is a transport
+    /// failure, but a 200 whose body is not the info JSON is a remote that
+    /// has no such route and answered with its SPA — the signature of a rupu
+    /// older than `/api/host/info`, the same as its 404.
+    async fn peer_info(&self) -> Result<PeerInfo, HostConnectorError> {
+        let info = match self.send(self.client.get(self.url("/api/host/info"))).await {
+            Ok(resp) => {
+                let bytes = resp
+                    .bytes()
+                    .await
+                    .map_err(|e| HostConnectorError::Remote(0, e.to_string()))?;
+                match parse_host_info(&bytes) {
+                    Ok(body) => PeerInfo::Info(body),
+                    Err(e) => PeerInfo::Predates(format!(
+                        "did not answer /api/host/info with host info ({e}; an older rupu \
+                         serves its web UI there)"
+                    )),
+                }
+            }
+            Err(HostConnectorError::NotFound(_)) => {
+                PeerInfo::Predates("predates /api/host/info".to_string())
+            }
+            Err(e) => return Err(e),
+        };
+        self.remember_features(match &info {
+            PeerInfo::Info(body) => body.features.clone(),
+            PeerInfo::Predates(_) => Vec::new(),
+        });
+        Ok(info)
+    }
+
+    fn remember_features(&self, features: Vec<String>) {
+        *self.features_seen.lock().unwrap_or_else(|e| e.into_inner()) = Some(features);
+    }
+
     /// Refuse unless the remote's `/api/host/info` lists `feature`. A remote
     /// predating a request field ignores it (its body structs don't deny
     /// unknown fields), so an unadvertised feature — including a remote with
     /// no `/api/host/info` at all — is a refusal, not a best-effort send.
     async fn require_feature(&self, feature: &str, what: &str) -> Result<(), HostConnectorError> {
-        let resp = match self.send(self.client.get(self.url("/api/host/info"))).await {
-            Ok(resp) => resp,
-            Err(HostConnectorError::NotFound(_)) => {
-                return Err(HostConnectorError::Unsupported(format!(
-                    "{what}: remote host {} predates /api/host/info, so it cannot \
-                     advertise support; upgrade rupu there",
-                    self.base_url
-                )))
-            }
-            Err(e) => return Err(e),
-        };
-        // Read, then parse (as `proxy_get_json` does): a body that failed to
-        // ARRIVE is a transport failure, but a 200 whose body is not the info
-        // JSON is a remote that has no such route and answered with its SPA —
-        // the signature of a rupu older than `/api/host/info`. That cannot
-        // advertise a feature, so it is the same refusal as a 404.
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| HostConnectorError::Remote(0, e.to_string()))?;
-        let body = match parse_host_info(&bytes) {
-            Ok(body) => body,
-            Err(e) => {
-                return Err(HostConnectorError::Unsupported(format!(
-                    "{what}: remote host {} did not answer /api/host/info with host \
-                     info ({e}; an older rupu serves its web UI there), so it cannot \
-                     advertise support; upgrade rupu there",
-                    self.base_url
-                )))
-            }
-        };
-        if body.features.iter().any(|f| f == feature) {
-            return Ok(());
+        let info = self.peer_info().await?;
+        Self::require_in(&info, feature, what, &self.base_url)
+    }
+
+    /// [`Self::require_feature`] against an already-read [`PeerInfo`].
+    fn require_in(
+        info: &PeerInfo,
+        feature: &str,
+        what: &str,
+        base_url: &str,
+    ) -> Result<(), HostConnectorError> {
+        match info {
+            PeerInfo::Predates(why) => Err(HostConnectorError::Unsupported(format!(
+                "{what}: remote host {base_url} {why}, so it cannot advertise support; \
+                 upgrade rupu there"
+            ))),
+            PeerInfo::Info(body) if body.features.iter().any(|f| f == feature) => Ok(()),
+            PeerInfo::Info(body) => Err(HostConnectorError::Unsupported(format!(
+                "{what}: remote host {base_url} (rupu {}) does not support it; upgrade rupu there",
+                body.version.as_deref().unwrap_or("unknown version"),
+            ))),
         }
-        Err(HostConnectorError::Unsupported(format!(
-            "{what}: remote host {} (rupu {}) does not support it; upgrade rupu there",
-            self.base_url,
-            body.version.as_deref().unwrap_or("unknown version"),
-        )))
     }
 }
 
@@ -245,11 +281,14 @@ impl HostConnector for HttpHostConnector {
                     .await
                     .map_err(|e| HostConnectorError::Remote(0, e.to_string()))?;
                 Ok(match parse_host_info(&bytes) {
-                    Ok(body) => HostInfo {
-                        reachable: true,
-                        version: body.version,
-                        capabilities: body.capabilities,
-                    },
+                    Ok(body) => {
+                        self.remember_features(body.features);
+                        HostInfo {
+                            reachable: true,
+                            version: body.version,
+                            capabilities: body.capabilities,
+                        }
+                    }
                     Err(_) => HostInfo {
                         reachable: true,
                         version: None,
@@ -289,23 +328,48 @@ impl HostConnector for HttpHostConnector {
     }
 
     async fn launch_agent(&self, req: AgentLaunchRequest) -> Result<String, HostConnectorError> {
-        if let Some(profile) = req.findings_profile {
-            self.require_feature(
+        // A supplied id (and the mode) is validated whether or not the remote
+        // will take it; `run` is what the codename decision below reads.
+        if let Some(Err(e)) = req.run_id.as_ref().map(|_| req.run_id_or_mint()) {
+            return Err(HostConnectorError::Invalid(e));
+        }
+        let run = req
+            .agent_run(req.run_id.as_deref().unwrap_or("(minted by the remote)"))
+            .map_err(HostConnectorError::Invalid)?;
+        // One `/api/host/info` read covers every field that needs the
+        // remote's say-so, and none is made for a launch that needs none.
+        let needs_info = req.findings_profile.is_some()
+            || !req.engagement_profiles.is_empty()
+            || req.run_id.is_some()
+            || req.codename.is_some();
+        let info = if needs_info {
+            Some(self.peer_info().await?)
+        } else {
+            None
+        };
+        if let (Some(profile), Some(info)) = (req.findings_profile, &info) {
+            Self::require_in(
+                info,
                 CAP_AGENT_FINDINGS_PROFILE,
                 &format!("this run cannot be held to the `{profile}` findings profile"),
-            )
-            .await?;
+                &self.base_url,
+            )?;
         }
-        if !req.engagement_profiles.is_empty() {
-            self.require_feature(
+        if let (false, Some(info)) = (req.engagement_profiles.is_empty(), &info) {
+            Self::require_in(
+                info,
                 CAP_AGENT_ENGAGEMENT_PROFILE,
                 &format!(
                     "this run cannot run under the `{}` engagement profile(s)",
                     req.engagement_profiles.join(",")
                 ),
-            )
-            .await?;
+                &self.base_url,
+            )?;
         }
+        let (features, version): (&[String], Option<&str>) = match &info {
+            Some(PeerInfo::Info(body)) => (&body.features, body.version.as_deref()),
+            _ => (&[], None),
+        };
         let mut body = serde_json::json!({
             "prompt": req.prompt,
             "mode": req.mode,
@@ -316,6 +380,16 @@ impl HostConnector for HttpHostConnector {
         // Only when set: a body without an engagement stays what it was.
         if !req.engagement_profiles.is_empty() {
             body["engagement_profiles"] = serde_json::json!(req.engagement_profiles);
+        }
+        // A remote that doesn't advertise `run.supplied_run_id` mints its own
+        // id, and the one it returns is the one used either way.
+        if let Some(id) = &req.run_id {
+            if features.iter().any(|f| f == CAP_RUN_SUPPLIED_RUN_ID) {
+                body["run_id"] = serde_json::json!(id);
+            }
+        }
+        if let Some(codename) = spec_peer_codename(&run, features, &self.base_url, version) {
+            body["codename"] = serde_json::json!(codename);
         }
         let resp = self
             .send(
@@ -672,6 +746,17 @@ impl HostConnector for HttpHostConnector {
         }
         file.flush().await.map_err(write_err)?;
         Ok(())
+    }
+
+    /// From the `features` the remote's `/api/host/info` last listed
+    /// (`run.supplied_run_id`); `false` before it was ever read. Whatever this
+    /// says, `launch_agent` returns the id the remote reports it used.
+    fn honours_supplied_run_id(&self) -> bool {
+        self.features_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|f| f.iter().any(|f| f == CAP_RUN_SUPPLIED_RUN_ID))
     }
 
     async fn proxy_get_json(

@@ -147,6 +147,13 @@ impl HostConnector for LocalHostConnector {
         })
     }
 
+    /// When the agent launcher does (`cp serve`'s subprocess launcher).
+    fn honours_supplied_run_id(&self) -> bool {
+        self.agent_launcher
+            .as_ref()
+            .is_some_and(|l| l.honours_supplied_run_id())
+    }
+
     async fn launch_run(&self, req: LaunchRequest) -> Result<String, HostConnectorError> {
         let launcher = self.launcher.as_ref().ok_or_else(|| {
             HostConnectorError::Invalid("no run launcher configured for this host".to_string())

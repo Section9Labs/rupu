@@ -44,6 +44,7 @@ mod sessions_host;
 mod sessions_live;
 mod source;
 mod sse;
+mod supplied_identity;
 mod transcript;
 mod usage;
 mod workers;

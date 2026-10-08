@@ -30,6 +30,8 @@ rupu-providers = { path = "../rupu-providers" }
 rupu-auth = { path = "../rupu-auth" }
 rupu-agent = { path = "../rupu-agent" }
 rupu-config = { path = "../rupu-config" }
+rupu-tools = { path = "../rupu-tools" }
+rupu-coverage = { path = "../rupu-coverage" }
 rupu-netflow = { workspace = true, features = ["http"] }
 rupu-netwatch = { workspace = true }
 
@@ -43,3 +45,4 @@ httpmock.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 serial_test.workspace = true
+rustix.workspace = true

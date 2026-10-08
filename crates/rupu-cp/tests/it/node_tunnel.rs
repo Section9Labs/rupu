@@ -235,6 +235,7 @@ async fn mirror_create_append_finish_round_trip() {
         target: None,
         findings_profile: None,
         engagement_profiles: Vec::new(),
+        codename: None,
     };
 
     let run_id = "run_NODEMIRRTEST001";
@@ -312,6 +313,7 @@ async fn mirror_usage_lines_land_in_the_run_usage_ledger() {
     let spec = RunSpec {
         findings_profile: None,
         engagement_profiles: Vec::new(),
+        codename: None,
         kind: RunSpecKind::Workflow,
         name: "smoke-workflow".to_string(),
         inputs: BTreeMap::new(),
@@ -377,6 +379,7 @@ async fn mirror_replace_usage_ledger_swaps_the_file_atomically() {
     let spec = RunSpec {
         findings_profile: None,
         engagement_profiles: Vec::new(),
+        codename: None,
         kind: RunSpecKind::Workflow,
         name: "smoke-workflow".to_string(),
         inputs: BTreeMap::new(),
@@ -472,6 +475,7 @@ async fn mirror_replace_usage_ledger_failure_removes_the_temp_file() {
     let spec = RunSpec {
         findings_profile: None,
         engagement_profiles: Vec::new(),
+        codename: None,
         kind: RunSpecKind::Workflow,
         name: "smoke-workflow".to_string(),
         inputs: BTreeMap::new(),
@@ -535,6 +539,7 @@ async fn mirror_run_json_repins_cp_local_paths() {
         target: None,
         findings_profile: None,
         engagement_profiles: Vec::new(),
+        codename: None,
     };
 
     let run_id = "run_REPINTEST001";
@@ -639,6 +644,7 @@ async fn mirror_run_json_nulls_resume_fields() {
         target: None,
         findings_profile: None,
         engagement_profiles: Vec::new(),
+        codename: None,
     };
 
     let run_id = "run_RESUMENULLTEST01";
@@ -716,6 +722,7 @@ async fn mirror_run_json_preserves_final_output() {
         target: None,
         findings_profile: None,
         engagement_profiles: Vec::new(),
+        codename: None,
     };
 
     let run_id = "run_FINALOUTPUTTEST1";
@@ -819,6 +826,7 @@ async fn mirror_traversal_run_id_rejected_before_io() {
         target: None,
         findings_profile: None,
         engagement_profiles: Vec::new(),
+        codename: None,
     };
     for bad in &[
         "run_../escape",
@@ -864,6 +872,7 @@ async fn mirror_wrong_node_id_rejected() {
         target: None,
         findings_profile: None,
         engagement_profiles: Vec::new(),
+        codename: None,
     };
 
     // Run created by owner_node.
@@ -932,6 +941,7 @@ async fn mirror_legitimate_owner_can_append_and_finish() {
         target: None,
         findings_profile: None,
         engagement_profiles: Vec::new(),
+        codename: None,
     };
 
     mirror
@@ -1443,6 +1453,7 @@ mod tunnel_connector {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            codename: None,
         }
     }
 
@@ -3437,6 +3448,7 @@ async fn mirror_transcript_append_finish_synthesizes_agent_step_result() {
         target: None,
         findings_profile: None,
         engagement_profiles: Vec::new(),
+        codename: None,
     };
     let run_id = "run_NODEMIRRTRANS01";
     let node_id = "node-42";
@@ -3516,6 +3528,7 @@ async fn mirror_reset_transcript_makes_replay_idempotent() {
         target: None,
         findings_profile: None,
         engagement_profiles: Vec::new(),
+        codename: None,
     };
     let run_id = "run_NODEMIRRTRANS02";
     let node_id = "node-42";

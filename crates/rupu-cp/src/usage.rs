@@ -1054,6 +1054,7 @@ pub(crate) mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            codename: None,
         };
         mirror
             .create_run("run_01USAGE", "host_abc", &spec)

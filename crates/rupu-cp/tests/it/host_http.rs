@@ -869,6 +869,81 @@ async fn launch_agent_without_an_engagement_posts_no_engagement_key() {
     post.assert();
 }
 
+// ── W6: supplied run id + codename over HTTP ──────────────────────────────────
+
+fn placed_agent_req() -> rupu_cp::agent_launcher::AgentLaunchRequest {
+    let mut req = profiled_agent_req(None);
+    req.run_id = Some("run_01COORD".into());
+    req.codename = Some("cobalt-harbor/heron#412".into());
+    req
+}
+
+/// A remote advertising `run.supplied_run_id` and `run.codename` hands both
+/// to its own launcher, and the connector then says it honours the id.
+#[tokio::test]
+async fn launch_agent_delivers_the_run_id_and_codename_to_a_real_remote_cp() {
+    let tmp = tempfile::tempdir().unwrap();
+    let launcher = std::sync::Arc::new(CapturingAgentLauncher {
+        last: std::sync::Mutex::new(None),
+    });
+    let state = rupu_cp::state::AppState::new(
+        tmp.path().to_path_buf(),
+        rupu_config::PricingConfig::default(),
+    )
+    .with_agent_launcher(Some(launcher.clone()));
+    let addr = serve_cp(state).await;
+
+    let c = HttpHostConnector::new(format!("http://{addr}"), None);
+    assert!(
+        !c.honours_supplied_run_id(),
+        "unknown before the remote is read"
+    );
+    c.launch_agent(placed_agent_req()).await.unwrap();
+    let got = launcher
+        .last
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("remote launched");
+    assert_eq!(got.run_id.as_deref(), Some("run_01COORD"));
+    assert_eq!(got.codename.as_deref(), Some("cobalt-harbor/heron#412"));
+    assert!(c.honours_supplied_run_id());
+}
+
+/// An older remote gets neither field (it would ignore them anyway), still
+/// launches — a codename is only a display name — and the id it reports
+/// is the one used.
+#[tokio::test]
+async fn launch_agent_to_an_older_remote_omits_the_identity_and_reads_its_id_back() {
+    let server = httpmock::MockServer::start_async().await;
+    server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(200).json_body(serde_json::json!({
+            "version": "0.70.0",
+            "capabilities": {"backends": [], "scm_hosts": [], "permission_modes": []},
+            "features": [rupu_cp::node::protocol::CAP_AGENT_FINDINGS_PROFILE]
+        }));
+    });
+    let post = server.mock(|when, then| {
+        when.method("POST")
+            .path("/api/agents/sec/run")
+            .matches(|req| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(req.body.as_deref().unwrap_or_default()).unwrap();
+                body.get("run_id").is_none() && body.get("codename").is_none()
+            });
+        then.status(200)
+            .json_body(serde_json::json!({"run_id": "run_MINTED_THERE"}));
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    assert_eq!(
+        c.launch_agent(placed_agent_req()).await.unwrap(),
+        "run_MINTED_THERE"
+    );
+    post.assert();
+    assert!(!c.honours_supplied_run_id());
+}
+
 // ── Remote findings Plan A, Task 6: coverage stream over HTTP ────────────────
 
 /// A real remote CP serves a run's stream; the connector fetches it.

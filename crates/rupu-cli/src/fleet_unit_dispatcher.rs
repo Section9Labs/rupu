@@ -727,15 +727,15 @@ impl UnitDispatcher for FleetUnitDispatcher {
         Ok(to_orchestrator_delta(&stripped))
     }
 
-    /// The path is only truthful when the host will actually EXECUTE the unit
-    /// under `unit_run_id` — otherwise the mirror lands at the id the
-    /// connector minted for itself and this path names a file that never
-    /// exists. `serves_runs_from_local_mirror` is the wrong question: it is
-    /// also true for the tunnel and bucket transports, and neither honours
-    /// `AgentLaunchRequest.run_id`.
+    /// The path is only truthful when the host mirrors the unit's run here
+    /// AND will actually EXECUTE it under `unit_run_id` — otherwise the
+    /// mirror lands at the id the connector minted for itself (or there is no
+    /// mirror at all) and this path names a file that never exists.
     fn unit_transcript_path(&self, host: &str, unit_run_id: &str) -> Option<PathBuf> {
         let conn = self.resolver.resolve(host).ok()?;
-        if !conn.honours_supplied_run_id() {
+        // The path is the coordinator's MIRROR of the unit's transcript: a
+        // local or HTTP unit honours the id but has no mirror here.
+        if !(conn.serves_runs_from_local_mirror() && conn.honours_supplied_run_id()) {
             return None;
         }
         Some(rupu_cp::host::transcript_paths::agent_mirror_path(
@@ -746,6 +746,23 @@ impl UnitDispatcher for FleetUnitDispatcher {
 }
 
 // ── Registry builder ──────────────────────────────────────────────────────────
+
+/// What a `host: local` unit launches through: a detached `rupu run` of this
+/// binary (`cp serve`'s own launcher). Without one the local connector
+/// refused every placed unit with "no agent launcher configured". `None`
+/// (logged) only when this binary can't locate itself, and then a `host:
+/// local` unit fails with that refusal.
+fn local_agent_launcher() -> Option<Arc<dyn rupu_cp::agent_launcher::AgentLauncher>> {
+    match std::env::current_exe() {
+        Ok(exe) => Some(Arc::new(
+            crate::cp_agent_launcher::SubprocessAgentLauncher { exe },
+        )),
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot locate the rupu binary; `host: local` units cannot launch");
+            None
+        }
+    }
+}
 
 /// Build a `FleetUnitDispatcher` only when the workflow needs one.
 ///
@@ -771,7 +788,7 @@ pub fn build_dispatcher_if_needed(
     let node_mirror = Arc::new(rupu_cp::node::NodeMirror::new(Arc::clone(&run_store)));
     let local = rupu_cp::host::local::LocalHostConnector::new(
         None,
-        None,
+        local_agent_launcher(),
         None,
         None,
         Arc::clone(&run_store),
@@ -2805,11 +2822,8 @@ steps:
     #[test]
     fn unit_transcript_path_is_unknown_for_hosts_that_mint_their_own_run_id() {
         // `UnreachableConnector` is a unit struct that keeps the trait's
-        // `honours_supplied_run_id` default (false) — the same answer the
-        // tunnel and bucket connectors give, both of which mint their own id
-        // in `launch_agent` even though they ARE mirror-backed. Gating on
-        // `serves_runs_from_local_mirror` would announce a path for them that
-        // no file ever occupies.
+        // defaults: it mints its own id (like an HTTP host predating
+        // `run.supplied_run_id`) and has no mirror here — no path either way.
         let conn = Arc::new(UnreachableConnector);
         let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
         assert_eq!(d.unit_transcript_path("h1", "run_01X"), None);

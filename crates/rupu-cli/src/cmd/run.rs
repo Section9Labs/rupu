@@ -64,6 +64,11 @@ pub struct Args {
     /// Pre-assign the run id (so a caller can reference the run before it starts).
     #[arg(long)]
     pub run_id: Option<String>,
+    /// The run's codename, minted by the coordinator that launched it (a
+    /// placed unit, a CP launch). Internal; replaces the `RUPU_CODENAME`
+    /// environment variable, which is still read for one release.
+    #[arg(long, hide = true, value_name = "CODENAME", value_parser = parse_codename)]
+    pub codename: Option<rupu_codename::Codename>,
     /// Attach this run to an agentiflow's shared board + mailboxes: the
     /// agentiflow run dir (`<global>/agentiflows/<id>`). Set by an
     /// agentiflow lead when it spawns a pool unit; not for direct use.
@@ -114,6 +119,20 @@ pub struct Args {
 
 fn parse_findings_profile(s: &str) -> Result<rupu_coverage::FindingProfile, String> {
     s.parse()
+}
+
+/// `--codename`: a codename with at least one segment. A malformed one is a
+/// usage error, never silently replaced by a derived name.
+fn parse_codename(s: &str) -> Result<rupu_codename::Codename, String> {
+    s.parse::<rupu_codename::Codename>()
+        .map_err(|e| e.to_string())
+        .and_then(|c| {
+            if c.segments.is_empty() {
+                Err(format!("`{s}` is not a codename"))
+            } else {
+                Ok(c)
+            }
+        })
 }
 
 /// The standalone run's findings profile: `--findings-profile` → the agent's
@@ -295,7 +314,7 @@ struct LaunchParser {
 /// identical positional/flag semantics to the pre-Task-7 `rupu run
 /// <agent> …` parse (agent-first AND flag-first both work, since `Args`
 /// is plain `clap::Args`, not a subcommand).
-pub(crate) fn parse_launch_args(argv: Vec<String>) -> Result<Args, clap::Error> {
+pub fn parse_launch_args(argv: Vec<String>) -> Result<Args, clap::Error> {
     LaunchParser::try_parse_from(std::iter::once("rupu run".to_string()).chain(argv))
         .map(|wrapper| wrapper.args)
 }
@@ -720,11 +739,17 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         .run_id
         .clone()
         .unwrap_or_else(|| format!("run_{}", Ulid::new()));
-    let codename = standalone_codename(
-        &run_id,
-        &spec.name,
-        placed_codename_override(args.run_id.is_some(), std::env::var("RUPU_CODENAME").ok()),
-    );
+    let codename = match args.codename.clone() {
+        Some(codename) => codename,
+        None => standalone_codename(
+            &run_id,
+            &spec.name,
+            placed_codename_override(
+                args.run_id.is_some(),
+                std::env::var(rupu_runtime::argv::CODENAME_ENV).ok(),
+            ),
+        ),
+    };
     let transcripts = paths::transcripts_dir(&global, project_root.as_deref());
     paths::ensure_dir(&transcripts)?;
     let transcript_path = transcripts.join(format!("{run_id}.jsonl"));
@@ -1915,10 +1940,13 @@ impl Prompter for TtyPrompter {
     }
 }
 
-/// `RUPU_CODENAME` counts only for a placed launch, which always passes
-/// the coordinator-minted `--run-id` too. A bare `rupu run` ignores it, so
-/// an ambient `RUPU_CODENAME` left in a user's shell can't stamp one name on
-/// every run they start.
+/// The legacy `RUPU_CODENAME` (read for one release after `--codename`
+/// replaced it, so in-flight detached runs and SSH remotes launched by an
+/// older coordinator keep their names) counts only for a placed launch,
+/// which always passes the coordinator-minted `--run-id` too. A bare `rupu
+/// run` ignores it, so an ambient `RUPU_CODENAME` left in a user's shell
+/// can't stamp one name on every run they start. `--codename` has no such
+/// condition: a flag can't be ambient.
 pub(crate) fn placed_codename_override(
     run_id_supplied: bool,
     env: Option<String>,
@@ -1926,9 +1954,9 @@ pub(crate) fn placed_codename_override(
     env.filter(|_| run_id_supplied)
 }
 
-/// Codename for a standalone `rupu run`: a placed unit's coordinator passes
-/// its minted name via `RUPU_CODENAME` (see [`placed_codename_override`]);
-/// otherwise the run is its own crew.
+/// Codename for a standalone `rupu run` without `--codename`: the legacy
+/// `RUPU_CODENAME` from an older coordinator (see
+/// [`placed_codename_override`]); otherwise the run is its own crew.
 pub(crate) fn standalone_codename(
     run_id: &str,
     agent: &str,

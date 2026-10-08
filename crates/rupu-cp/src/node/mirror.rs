@@ -699,6 +699,7 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            codename: None,
         };
         mirror.create_run("run_C1", "node-1", &spec).await.unwrap();
         mirror
@@ -745,6 +746,7 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            codename: None,
         };
         mirror.create_run("run_C3", "node-1", &spec).await.unwrap();
         assert!(
@@ -798,6 +800,7 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            codename: None,
         };
         mirror.create_run("run_C2", "node-1", &spec).await.unwrap();
         mirror
@@ -854,6 +857,7 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            codename: None,
         };
         mirror.create_run("run_C3", "node-1", &spec).await.unwrap();
         // A directory where the stream file belongs: the write of the temp
@@ -902,6 +906,7 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            codename: None,
         };
         mirror.create_run("run_A1", "node-1", &spec).await.unwrap();
 

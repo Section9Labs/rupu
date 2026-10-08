@@ -1247,6 +1247,7 @@ async fn run_rerun_in(target_id: &str, run_id: &str) -> ExitCode {
         into: None,
         tmp: false,
         run_id: None,
+        codename: None,
         findings_profile: None,
         // Rerun uses the code path unless/until the run manifest records the
         // engagement selection (follow-on); it never silently guesses one.

@@ -47,7 +47,9 @@ use rupu_providers::types::{
     ThinkingDisplay,
 };
 use rupu_providers::AuthMode;
+use rupu_runtime::argv::{RunArgv, SessionWorker};
 use rupu_runtime::provider_factory;
+use rupu_runtime::spawn::{spawn_detached, SpawnSpec};
 use rupu_runtime::WorkerKind;
 use rupu_tools::{PermissionMode, PermissionPolicy, ToolContext};
 use rupu_transcript::{
@@ -1990,19 +1992,16 @@ fn ensure_session_worker(
     }
     write_session(global, scope, session)?;
 
+    // Detached (`rupu_runtime::spawn`): its own process group, so a Ctrl-C
+    // at the terminal that started or attached to the session reaches only
+    // the CLI, never the worker the session's later turns run on.
     let exe = std::env::current_exe()?;
-    let child = Command::new(exe)
-        .arg("session")
-        .arg("_worker")
-        .arg("--session-id")
-        .arg(&session.session_id)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| format!("spawn warm session worker for {}", session.session_id))?;
-
-    let pid = child.id();
+    let worker = RunArgv::SessionWorker(SessionWorker {
+        session_id: session.session_id.clone(),
+    });
+    let pid = spawn_detached(SpawnSpec::new(exe, worker))
+        .with_context(|| format!("spawn warm session worker for {}", session.session_id))?
+        .pid;
     session.worker_pid = Some(pid);
     session.worker_binary_mtime = current_binary_mtime();
     session.updated_at = Utc::now();
@@ -2010,7 +2009,6 @@ fn ensure_session_worker(
         session.active_pid = Some(pid);
     }
     write_session(global, scope, session)?;
-    drop(child);
     Ok(pid)
 }
 

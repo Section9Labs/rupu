@@ -18,8 +18,8 @@ use crate::{
         bucket::{Bucket, BucketError, ControlEnvelope, WorkerInfo},
         connector::{
             blocking_host, mirror_get_run, mirror_list_runs, mirror_stream_run_events,
-            read_transcript_file, EventByteStream, HostCapabilities, HostConnector,
-            HostConnectorError, HostInfo, RunListQuery,
+            read_transcript_file, spec_peer_codename, EventByteStream, HostCapabilities,
+            HostConnector, HostConnectorError, HostInfo, RunListQuery,
         },
     },
     launcher::LaunchRequest,
@@ -148,6 +148,50 @@ impl BucketHostConnector {
     }
 }
 
+impl BucketHostConnector {
+    /// The capabilities EVERY pull worker on this bucket advertised (any of
+    /// them may claim a job), and their versions for a log line. No marker,
+    /// or an unreadable one, contributes nothing: an empty set.
+    async fn common_worker_capabilities(
+        &self,
+    ) -> Result<(Vec<String>, String), HostConnectorError> {
+        let bodies = self
+            .bucket
+            .list_worker_info()
+            .await
+            .map_err(bucket_err_to_unreachable)?;
+        let infos: Vec<Option<WorkerInfo>> = bodies
+            .iter()
+            .map(|b| serde_json::from_slice(b).ok())
+            .collect();
+        let versions = infos
+            .iter()
+            .map(|i| match i {
+                Some(i) => format!("{} (rupu {})", i.worker_id, i.rupu_version),
+                None => "an unreadable worker marker".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut common: Option<Vec<String>> = None;
+        for info in &infos {
+            let caps = info
+                .as_ref()
+                .map(|i| i.capabilities.clone())
+                .unwrap_or_default();
+            common = Some(match common {
+                None => caps,
+                Some(prev) => prev.into_iter().filter(|c| caps.contains(c)).collect(),
+            });
+        }
+        let versions = if versions.is_empty() {
+            "no worker marker".to_string()
+        } else {
+            versions
+        };
+        Ok((common.unwrap_or_default(), versions))
+    }
+}
+
 fn bucket_err_to_unreachable(e: BucketError) -> HostConnectorError {
     HostConnectorError::Unreachable(e.to_string())
 }
@@ -177,6 +221,7 @@ impl HostConnector for BucketHostConnector {
             target: req.target.clone(),
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            codename: None,
         };
 
         self.mirror
@@ -219,7 +264,19 @@ impl HostConnector for BucketHostConnector {
             .await?;
         }
 
-        let run_id = format!("run_{}", Ulid::new());
+        // A coordinator-minted id (a placed unit's) keys the job, and every
+        // worker runs under its job's key (`rupu run --run-id`).
+        let run_id = req.run_id_or_mint().map_err(HostConnectorError::Invalid)?;
+        let run = req
+            .agent_run(&run_id)
+            .map_err(HostConnectorError::Invalid)?;
+        let codename = match &run.codename {
+            Some(_) => {
+                let (caps, versions) = self.common_worker_capabilities().await?;
+                spec_peer_codename(&run, &caps, &self.host_id, Some(&versions))
+            }
+            None => None,
+        };
 
         let spec = RunSpec {
             kind: RunSpecKind::Agent,
@@ -230,6 +287,7 @@ impl HostConnector for BucketHostConnector {
             target: req.target.clone(),
             findings_profile: req.findings_profile,
             engagement_profiles: req.engagement_profiles.clone(),
+            codename,
         };
 
         self.mirror
@@ -389,6 +447,12 @@ impl HostConnector for BucketHostConnector {
     /// coordinator's own `RunStore` by `NodeMirror`, so run-scoped detail
     /// endpoints read that mirror instead of the wire.
     fn serves_runs_from_local_mirror(&self) -> bool {
+        true
+    }
+
+    /// `launch_agent` sends a supplied id as the job's run id, which every
+    /// node has run under (`rupu run --run-id`) since the first tunnel slice.
+    fn honours_supplied_run_id(&self) -> bool {
         true
     }
 

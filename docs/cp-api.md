@@ -284,7 +284,7 @@ without `rupu cp serve`.
 | GET | `/api/agents/:name` | Agent detail with its prompt and raw file. | |
 | PUT | `/api/agents/:name` | Overwrite an agent. | `scope_kind`, `scope_id`. Body `{raw}`. |
 | DELETE | `/api/agents/:name` | Delete an agent. | `scope_kind`, `scope_id`. |
-| POST | `/api/agents/:name/run` | Launch an agent run → `{run_id, host_id}`. | Body `AgentRunBody {prompt, mode, target, working_dir, host, scope_kind, scope_id, findings_profile, engagement_profiles}`. `engagement_profiles` (ids; blank → 400) becomes `rupu run --engagement-profile`; a remote host that does not advertise `agent.engagement_profile` refuses it. |
+| POST | `/api/agents/:name/run` | Launch an agent run → `{run_id, host_id}`. | Body `AgentRunBody {prompt, mode, target, working_dir, host, scope_kind, scope_id, findings_profile, engagement_profiles, run_id, codename}`. `engagement_profiles` (ids; blank → 400) becomes `rupu run --engagement-profile`; a remote host that does not advertise `agent.engagement_profile` refuses it. `run_id` (a `run_…` id; malformed → 400) is the id the run executes under instead of a minted one (advertised as `run.supplied_run_id`); `codename` (malformed → 400) becomes the hidden `rupu run --codename` (advertised as `run.codename`). A coordinator sends either only to a host that advertises it, and a codename a host can't take never blocks the launch. |
 | POST | `/api/agents/:name/session` | Start a session → `{session_id, host_id}`. | Body `SessionStartBody {prompt, mode, target, working_dir, host, scope_kind, scope_id}`. |
 | POST | `/api/agents/generate` | Draft an agent from a description. | Body `{description, provider?, model?}`. |
 

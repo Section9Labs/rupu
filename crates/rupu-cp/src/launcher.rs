@@ -12,6 +12,21 @@ pub struct LaunchRequest {
     pub working_dir: Option<String>,
 }
 
+impl LaunchRequest {
+    /// The detached `rupu workflow run --plain` this request asks for, under
+    /// `run_id`. A mode that isn't `ask` / `bypass` / `readonly` is refused
+    /// here, not by the child.
+    pub fn workflow_run(&self, run_id: &str) -> Result<rupu_runtime::argv::WorkflowRun, String> {
+        use rupu_runtime::argv::{WorkflowRef, WorkflowRun};
+        let mut run = WorkflowRun::new(WorkflowRef::Name(self.workflow.clone()), run_id);
+        run.target = self.target.clone();
+        run.mode = crate::agent_launcher::parse_mode(self.mode.as_deref())?;
+        run.inputs = self.inputs.clone();
+        run.plain = true;
+        Ok(run)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LaunchError {
     #[error("invalid launch request: {0}")]

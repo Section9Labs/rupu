@@ -36,8 +36,10 @@ use clap::Subcommand;
 use futures_util::{SinkExt, StreamExt};
 use rupu_cp::host::bucket::{Bucket, BucketError, ControlEnvelope, ObjectStoreBucket};
 use rupu_cp::node::protocol::{
-    ArtifactFile, Auth, Frame, RunSpec, RunSpecKind, ARTIFACT_CHUNK_BYTES, CAP_USAGE_LEDGER,
+    ArtifactFile, Auth, Frame, RunSpec, ARTIFACT_CHUNK_BYTES, CAP_USAGE_LEDGER,
 };
+use rupu_runtime::argv::{RunArgv, WorkflowControl};
+use rupu_runtime::spawn::SpawnSpec;
 use rupu_workspace::{enroll_node, HostStore};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
@@ -707,19 +709,12 @@ async fn connect_and_run(
             Frame::Cancel { run_id } => {
                 info!(run_id = %run_id, "node: Cancel received");
                 if let Some(mut state) = active.remove(&run_id) {
-                    // Kill the direct child.  Process group would give
-                    // a cleaner kill of any grandchildren, but requires
-                    // `process_group(0)` at spawn time and libc kill(−pgid)
-                    // for the signal — both are safe but add complexity.
-                    // `start_kill` on the tokio Child is sufficient here;
-                    // the grandchildren will be reparented to init/launchd
-                    // and eventually exit naturally.
-                    //
-                    // NOTE: We set process_group(0) at spawn time (see
-                    // `spawn_run`), so the child is already in its own
-                    // process group.  To kill the whole group without unsafe
-                    // would require nix/libc; we only kill the direct child
-                    // here and note this limitation.
+                    // Kill the direct child. The child leads its own
+                    // process group (`spawn_rupu` → `rupu_runtime::spawn`),
+                    // so a group signal would also reach its grandchildren;
+                    // only the direct child is killed today, and the
+                    // grandchildren are reparented to init/launchd and exit
+                    // on their own.
                     if let Err(e) = state.child.start_kill() {
                         warn!(run_id = %run_id, error = %e, "node: kill child failed");
                     }
@@ -748,8 +743,7 @@ async fn connect_and_run(
             Frame::Approve { run_id, mode } => {
                 info!(run_id = %run_id, "node: Approve received");
                 if let Some(state) = active.get_mut(&run_id) {
-                    let argv = build_control_argv(ControlKind::Approve, &run_id, &mode, None);
-                    match spawn_control(exe, &argv) {
+                    match approve_argv(&run_id, &mode).and_then(|argv| spawn_rupu(exe, argv)) {
                         Ok(child) => {
                             state.child = child;
                         }
@@ -762,9 +756,7 @@ async fn connect_and_run(
             Frame::Reject { run_id, reason } => {
                 info!(run_id = %run_id, "node: Reject received");
                 if let Some(state) = active.get_mut(&run_id) {
-                    let argv =
-                        build_control_argv(ControlKind::Reject, &run_id, "", reason.as_deref());
-                    match spawn_control(exe, &argv) {
+                    match spawn_rupu(exe, reject_argv(&run_id, reason.as_deref())) {
                         Ok(child) => {
                             state.child = child;
                         }
@@ -800,154 +792,47 @@ async fn connect_and_run(
 // Run spawning
 // ---------------------------------------------------------------------------
 
-/// Which control subprocess to launch in response to an Approve/Reject frame.
-#[derive(Debug, Clone, Copy)]
-enum ControlKind {
-    Approve,
-    Reject,
+/// The local `rupu workflow approve <run_id> [--mode m]` an Approve frame or
+/// bucket envelope asks for. An empty `mode` means the run's stored one; a
+/// mode that isn't one is an error (a command that could never succeed).
+fn approve_argv(run_id: &str, mode: &str) -> anyhow::Result<RunArgv> {
+    let mode = (!mode.is_empty())
+        .then(|| rupu_tools::PermissionMode::parse(mode))
+        .transpose()?;
+    Ok(RunArgv::WorkflowControl(WorkflowControl::Approve {
+        run_id: run_id.to_string(),
+        mode,
+        gate: None,
+        approver: None,
+    }))
 }
 
-/// Build the argv (after the executable) for the local approve/reject command
-/// the node runs against a gated run.
-///   Approve: `workflow approve <run_id> [--mode <mode>]`
-///   Reject:  `workflow reject  <run_id> [--reason <reason>]`
-fn build_control_argv(
-    kind: ControlKind,
-    run_id: &str,
-    mode: &str,
-    reason: Option<&str>,
-) -> Vec<String> {
-    let mut argv = vec!["workflow".to_string()];
-    match kind {
-        ControlKind::Approve => {
-            argv.push("approve".to_string());
-            argv.push(run_id.to_string());
-            if !mode.is_empty() {
-                argv.push("--mode".to_string());
-                argv.push(mode.to_string());
-            }
-        }
-        ControlKind::Reject => {
-            argv.push("reject".to_string());
-            argv.push(run_id.to_string());
-            if let Some(r) = reason {
-                argv.push("--reason".to_string());
-                argv.push(r.to_string());
-            }
-        }
-    }
-    argv
+/// The local `rupu workflow reject <run_id> [--reason=r]`.
+fn reject_argv(run_id: &str, reason: Option<&str>) -> RunArgv {
+    RunArgv::WorkflowControl(WorkflowControl::Reject {
+        run_id: run_id.to_string(),
+        reason: reason.map(str::to_string),
+        gate: None,
+    })
 }
 
-/// Spawn a detached `rupu workflow approve|reject` child, same launch posture
-/// as `spawn_run` (null stdio, own process group on Unix).
-fn spawn_control(exe: &Path, argv: &[String]) -> anyhow::Result<tokio::process::Child> {
-    let mut cmd = tokio::process::Command::new(exe);
-    cmd.args(argv)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    #[cfg(unix)]
-    cmd.process_group(0);
-    cmd.spawn().context("spawn rupu control child")
+/// Start `argv` detached (`rupu_runtime::spawn`: own process group, null
+/// stdio), as a tokio child the node can `start_kill` on Cancel.
+fn spawn_rupu(exe: &Path, argv: RunArgv) -> anyhow::Result<tokio::process::Child> {
+    let mut spec = SpawnSpec::new(exe, argv);
+    spec.keep_child = true;
+    tokio::process::Command::from(spec.command()?)
+        .spawn()
+        .context("spawn rupu child")
 }
 
+/// Start the run a [`RunSpec`] asks for under `run_id` (the id the CP sent in
+/// the `Run` frame / the bucket job key), refusing a spec whose fields the
+/// command can't honour ([`RunSpec::run_argv`]) rather than launch without
+/// them.
 fn spawn_run(exe: &Path, run_id: &str, spec: &RunSpec) -> anyhow::Result<tokio::process::Child> {
-    check_spec(spec)?;
-    let argv = build_argv(run_id, spec);
-    let mut cmd = tokio::process::Command::new(exe);
-    cmd.args(&argv)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    // Own process group on Unix so a future kill of the direct child
-    // does not cascade to the node agent itself via SIGINT propagation.
-    // `process_group(0)` is safe (no `unsafe` block required).
-    #[cfg(unix)]
-    cmd.process_group(0);
-    cmd.spawn().context("spawn rupu child")
-}
-
-/// Refuse a spec whose fields `build_argv` could not honour, rather than
-/// launch without them. `findings_profile` is an agent-run flag; `rupu
-/// workflow run` resolves profiles per step from the workflow file.
-/// `engagement_profiles` is likewise only ever sent for an agent run (a
-/// placed workflow unit), and a workflow spec has no argv slot for it.
-fn check_spec(spec: &RunSpec) -> anyhow::Result<()> {
-    if spec.kind == RunSpecKind::Workflow && spec.findings_profile.is_some() {
-        anyhow::bail!(
-            "run spec for workflow `{}` carries a findings_profile, which applies to agent runs only",
-            spec.name
-        );
-    }
-    if spec.kind == RunSpecKind::Workflow && !spec.engagement_profiles.is_empty() {
-        anyhow::bail!(
-            "run spec for workflow `{}` carries engagement_profiles, which apply to agent runs only",
-            spec.name
-        );
-    }
-    Ok(())
-}
-
-/// Build the argv (after the executable) for a local `rupu workflow run`
-/// or `rupu run` invocation dispatched by the node agent.
-///
-/// Workflow: `workflow run <name> [<target>] --run-id <id> --plain [--input k=v]… [--mode m]`
-/// Agent:    `run <name> [<target>] --run-id <id> [--mode m] [--findings-profile f] [--engagement-profile e]… [--prompt p] [--tmp (if target)]`
-///
-/// Flag names are verified against the clap definitions in `cmd/workflow.rs`
-/// (`--run-id`, `--plain`, `--input`, `--mode`) and `cmd/run.rs`
-/// (`--run-id`, `--mode`, `--findings-profile`, `--engagement-profile`,
-/// `--prompt`, `--tmp`).
-pub(crate) fn build_argv(run_id: &str, spec: &RunSpec) -> Vec<String> {
-    match spec.kind {
-        RunSpecKind::Workflow => {
-            let mut argv = vec!["workflow".to_string(), "run".to_string(), spec.name.clone()];
-            if let Some(t) = &spec.target {
-                argv.push(t.clone());
-            }
-            argv.push("--run-id".to_string());
-            argv.push(run_id.to_string());
-            argv.push("--plain".to_string());
-            for (k, v) in &spec.inputs {
-                argv.push("--input".to_string());
-                argv.push(format!("{k}={v}"));
-            }
-            if let Some(m) = &spec.mode {
-                argv.push("--mode".to_string());
-                argv.push(m.clone());
-            }
-            argv
-        }
-        RunSpecKind::Agent => {
-            let mut argv = vec!["run".to_string(), spec.name.clone()];
-            if let Some(t) = &spec.target {
-                argv.push(t.clone());
-            }
-            argv.push("--run-id".to_string());
-            argv.push(run_id.to_string());
-            if let Some(m) = &spec.mode {
-                argv.push("--mode".to_string());
-                argv.push(m.clone());
-            }
-            if let Some(f) = spec.findings_profile {
-                argv.push("--findings-profile".to_string());
-                argv.push(f.as_str().to_string());
-            }
-            for id in &spec.engagement_profiles {
-                argv.push("--engagement-profile".to_string());
-                argv.push(id.clone());
-            }
-            if let Some(p) = &spec.prompt {
-                argv.push("--prompt".to_string());
-                argv.push(p.clone());
-            }
-            if spec.target.is_some() {
-                argv.push("--tmp".to_string());
-            }
-            argv
-        }
-    }
+    let argv = spec.run_argv(run_id).map_err(anyhow::Error::msg)?;
+    spawn_rupu(exe, argv)
 }
 
 // ---------------------------------------------------------------------------
@@ -1860,13 +1745,20 @@ async fn drain_active_runs(
                                 }
                                 "approve" => {
                                     info!(run_id = %rid, seq, "node pull: approve");
-                                    let argv = build_control_argv(
-                                        ControlKind::Approve,
+                                    let argv = match approve_argv(
                                         rid,
                                         envelope.mode.as_deref().unwrap_or(""),
-                                        None,
-                                    );
-                                    match spawn_control(exe, &argv) {
+                                    ) {
+                                        Ok(argv) => argv,
+                                        Err(e) => {
+                                            // A command that can never
+                                            // succeed: consumed, not retried.
+                                            warn!(run_id = %rid, error = %e, "node pull: approve envelope is malformed; skipping it");
+                                            state.last_ctrl_seq = Some(*seq);
+                                            continue;
+                                        }
+                                    };
+                                    match spawn_rupu(exe, argv) {
                                         Ok(child) => {
                                             state.child = child;
                                             // Advance ONLY on successful spawn so a
@@ -1882,13 +1774,8 @@ async fn drain_active_runs(
                                 }
                                 "reject" => {
                                     info!(run_id = %rid, seq, "node pull: reject");
-                                    let argv = build_control_argv(
-                                        ControlKind::Reject,
-                                        rid,
-                                        "",
-                                        envelope.reason.as_deref(),
-                                    );
-                                    match spawn_control(exe, &argv) {
+                                    let argv = reject_argv(rid, envelope.reason.as_deref());
+                                    match spawn_rupu(exe, argv) {
                                         Ok(child) => {
                                             state.child = child;
                                             // Advance ONLY on successful spawn.
@@ -2925,6 +2812,7 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            codename: None,
         })
         .unwrap()
     }
@@ -3615,243 +3503,107 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // build_argv: argv builders
+    // spawn_run / control: the argv the node starts
     // ------------------------------------------------------------------
 
-    #[test]
-    fn build_argv_workflow_full() {
-        let mut inputs = BTreeMap::new();
-        inputs.insert("k".to_string(), "v".to_string());
-        inputs.insert("a".to_string(), "b".to_string());
-        let spec = RunSpec {
-            kind: RunSpecKind::Workflow,
-            name: "audit".to_string(),
-            inputs,
-            prompt: None,
+    fn agent_spec() -> RunSpec {
+        RunSpec {
+            kind: RunSpecKind::Agent,
+            name: "recon".to_string(),
+            inputs: BTreeMap::new(),
+            prompt: Some("- enumerate".to_string()),
             mode: Some("bypass".to_string()),
-            target: Some("github:o/r".to_string()),
-            findings_profile: None,
-            engagement_profiles: Vec::new(),
-        };
-        let argv = build_argv("run_X", &spec);
-        assert_eq!(
-            argv,
-            vec![
-                "workflow",
-                "run",
-                "audit",
-                "github:o/r",
-                "--run-id",
-                "run_X",
-                "--plain",
-                "--input",
-                "a=b",
-                "--input",
-                "k=v",
-                "--mode",
-                "bypass",
-            ]
-        );
-    }
-
-    #[test]
-    fn build_argv_workflow_minimal() {
-        let spec = RunSpec {
-            kind: RunSpecKind::Workflow,
-            name: "simple".to_string(),
-            inputs: BTreeMap::new(),
-            prompt: None,
-            mode: None,
-            target: None,
-            findings_profile: None,
-            engagement_profiles: Vec::new(),
-        };
-        let argv = build_argv("run_Y", &spec);
-        assert_eq!(
-            argv,
-            vec!["workflow", "run", "simple", "--run-id", "run_Y", "--plain"]
-        );
-    }
-
-    #[test]
-    fn build_argv_agent_full() {
-        let spec = RunSpec {
-            kind: RunSpecKind::Agent,
-            name: "triage".to_string(),
-            inputs: BTreeMap::new(),
-            prompt: Some("look at this PR".to_string()),
-            mode: Some("bypass".to_string()),
-            target: Some("github:o/r".to_string()),
-            findings_profile: None,
-            engagement_profiles: Vec::new(),
-        };
-        let argv = build_argv("run_Z", &spec);
-        assert_eq!(
-            argv,
-            vec![
-                "run",
-                "triage",
-                "github:o/r",
-                "--run-id",
-                "run_Z",
-                "--mode",
-                "bypass",
-                "--prompt",
-                "look at this PR",
-                "--tmp",
-            ]
-        );
-    }
-
-    #[test]
-    fn build_argv_agent_minimal() {
-        let spec = RunSpec {
-            kind: RunSpecKind::Agent,
-            name: "check".to_string(),
-            inputs: BTreeMap::new(),
-            prompt: None,
-            mode: None,
-            target: None,
-            findings_profile: None,
-            engagement_profiles: Vec::new(),
-        };
-        let argv = build_argv("run_W", &spec);
-        assert_eq!(argv, vec!["run", "check", "--run-id", "run_W"]);
-    }
-
-    #[test]
-    fn build_argv_agent_carries_the_findings_profile() {
-        let spec = RunSpec {
-            kind: RunSpecKind::Agent,
-            name: "sec".to_string(),
-            inputs: BTreeMap::new(),
-            prompt: Some("audit".to_string()),
-            mode: None,
             target: None,
             findings_profile: Some(rupu_coverage::FindingProfile::Summary),
-            engagement_profiles: Vec::new(),
-        };
-        let argv = build_argv("run_P", &spec);
+            engagement_profiles: vec!["network".into(), "web".into()],
+            codename: Some("cobalt-harbor/heron#412".to_string()),
+        }
+    }
+
+    /// Parse `argv` with the real `rupu run` parser.
+    fn parsed_run(argv: &RunArgv) -> crate::cmd::run::Args {
+        let args: Vec<String> = argv
+            .to_args()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args[0], "run");
+        crate::cmd::run::parse_launch_args(args[1..].to_vec()).unwrap()
+    }
+
+    /// W6 §6 test 4: the run the node starts for a `Run` frame / bucket job
+    /// runs under the id the CP sent and the codename the spec carries.
+    #[test]
+    fn node_honours_supplied_identity() {
+        let args = parsed_run(&agent_spec().run_argv("run_01COORD").unwrap());
+        assert_eq!(args.run_id.as_deref(), Some("run_01COORD"));
         assert_eq!(
-            argv,
-            vec![
-                "run",
-                "sec",
-                "--run-id",
-                "run_P",
-                "--findings-profile",
-                "summary",
-                "--prompt",
-                "audit"
-            ]
+            args.codename.map(|c| c.to_string()).as_deref(),
+            Some("cobalt-harbor/heron#412")
         );
-        // Round-trips through the real `rupu run` parser.
-        let args = crate::cmd::run::parse_launch_args(argv[1..].to_vec()).unwrap();
+        assert_eq!(args.prompt_flag.as_deref(), Some("- enumerate"));
+        assert_eq!(args.mode.as_deref(), Some("bypass"));
         assert_eq!(
             args.findings_profile,
             Some(rupu_coverage::FindingProfile::Summary)
         );
-        check_spec(&spec).expect("an agent spec may carry a profile");
-    }
-
-    #[test]
-    fn build_argv_agent_carries_the_engagement_profiles() {
-        let spec = RunSpec {
-            kind: RunSpecKind::Agent,
-            name: "recon".to_string(),
-            inputs: BTreeMap::new(),
-            prompt: Some("enumerate".to_string()),
-            mode: None,
-            target: None,
-            findings_profile: None,
-            engagement_profiles: vec!["network".into(), "web".into()],
-        };
-        let argv = build_argv("run_E", &spec);
-        assert_eq!(
-            argv,
-            vec![
-                "run",
-                "recon",
-                "--run-id",
-                "run_E",
-                "--engagement-profile",
-                "network",
-                "--engagement-profile",
-                "web",
-                "--prompt",
-                "enumerate"
-            ]
-        );
-        // Round-trips through the real `rupu run` parser.
-        let args = crate::cmd::run::parse_launch_args(argv[1..].to_vec()).unwrap();
         assert_eq!(args.engagement_profiles, ["network", "web"]);
-        check_spec(&spec).expect("an agent spec may carry an engagement");
+        // An older CP's spec carries no codename: the run is its own crew.
+        let mut old = agent_spec();
+        old.codename = None;
+        assert!(parsed_run(&old.run_argv("run_01COORD").unwrap())
+            .codename
+            .is_none());
     }
 
     #[test]
-    fn a_workflow_spec_carrying_engagement_profiles_is_refused() {
-        let spec = RunSpec {
-            kind: RunSpecKind::Workflow,
-            name: "audit".to_string(),
-            inputs: BTreeMap::new(),
-            prompt: None,
-            mode: None,
-            target: None,
-            findings_profile: None,
-            engagement_profiles: vec!["network".into()],
-        };
-        let err = check_spec(&spec).unwrap_err().to_string();
-        assert!(err.contains("agent runs only"), "{err}");
+    fn a_spec_the_node_cannot_honour_is_refused_before_spawning() {
+        let mut wf = agent_spec();
+        wf.kind = RunSpecKind::Workflow;
+        let err = spawn_run(Path::new("/nonexistent/rupu"), "run_1", &wf).unwrap_err();
+        assert!(err.to_string().contains("agent runs only"), "{err}");
     }
 
     #[test]
-    fn a_workflow_spec_carrying_a_findings_profile_is_refused() {
-        let spec = RunSpec {
-            kind: RunSpecKind::Workflow,
-            name: "audit".to_string(),
-            inputs: BTreeMap::new(),
-            prompt: None,
-            mode: None,
-            target: None,
-            findings_profile: Some(rupu_coverage::FindingProfile::Full),
-            engagement_profiles: Vec::new(),
-        };
-        let err = check_spec(&spec).unwrap_err().to_string();
-        assert!(err.contains("agent runs only"), "{err}");
+    fn the_node_advertises_findings_profile_and_codename_support() {
+        let caps = rupu_cp::node::protocol::node_capabilities();
+        for cap in [
+            rupu_cp::node::protocol::CAP_AGENT_FINDINGS_PROFILE,
+            rupu_cp::node::protocol::CAP_RUN_CODENAME,
+        ] {
+            assert!(caps.iter().any(|c| c == cap), "{cap}");
+        }
     }
 
-    #[test]
-    fn the_node_advertises_findings_profile_support() {
-        assert!(rupu_cp::node::protocol::node_capabilities()
+    fn rendered(argv: &RunArgv) -> Vec<String> {
+        argv.to_args()
             .iter()
-            .any(|c| c == rupu_cp::node::protocol::CAP_AGENT_FINDINGS_PROFILE));
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
     }
-
-    // ------------------------------------------------------------------
-    // build_control_argv: approve/reject argv builders
-    // ------------------------------------------------------------------
 
     #[test]
     fn control_argv_approve_with_and_without_mode() {
         assert_eq!(
-            build_control_argv(ControlKind::Approve, "run_1", "bypass", None),
-            vec!["workflow", "approve", "run_1", "--mode", "bypass"]
+            rendered(&approve_argv("run_1", "bypass").unwrap()),
+            ["workflow", "approve", "run_1", "--mode", "bypass"]
         );
         assert_eq!(
-            build_control_argv(ControlKind::Approve, "run_1", "", None),
-            vec!["workflow", "approve", "run_1"]
+            rendered(&approve_argv("run_1", "").unwrap()),
+            ["workflow", "approve", "run_1"]
         );
+        assert!(approve_argv("run_1", "yolo").is_err());
     }
 
     #[test]
     fn control_argv_reject_with_and_without_reason() {
         assert_eq!(
-            build_control_argv(ControlKind::Reject, "run_1", "", Some("nope")),
-            vec!["workflow", "reject", "run_1", "--reason", "nope"]
+            rendered(&reject_argv("run_1", Some("-nope"))),
+            ["workflow", "reject", "run_1", "--reason=-nope"]
         );
         assert_eq!(
-            build_control_argv(ControlKind::Reject, "run_1", "", None),
-            vec!["workflow", "reject", "run_1"]
+            rendered(&reject_argv("run_1", None)),
+            ["workflow", "reject", "run_1"]
         );
     }
 
@@ -4822,6 +4574,7 @@ mod tests {
             vec![
                 rupu_cp::node::protocol::CAP_AGENT_FINDINGS_PROFILE.to_string(),
                 rupu_cp::node::protocol::CAP_AGENT_ENGAGEMENT_PROFILE.to_string(),
+                rupu_cp::node::protocol::CAP_RUN_CODENAME.to_string(),
             ]
         );
     }
@@ -4868,6 +4621,7 @@ mod tests {
                     target: None,
                     findings_profile: None,
                     engagement_profiles: Vec::new(),
+                    codename: None,
                 },
             }))
             .await

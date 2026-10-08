@@ -4,6 +4,7 @@ use crate::paths;
 use clap::Subcommand;
 use rupu_cp::host::bucket::{poll_bucket_run, ObjectStoreBucket};
 use rupu_orchestrator::runs::RunStore;
+use rupu_runtime::argv::{RunArgv, WorkflowControl};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::process::ExitCode;
@@ -860,15 +861,14 @@ fn resume_subcommand(run: &rupu_orchestrator::RunRecord) -> &'static str {
     }
 }
 
-/// Build the `rupu workflow <subcommand> <run_id> [--gate <g>] [--approver
-/// <a>] [--if-unfinished] [--mode <m>]` argv the resume worker spawns for a
-/// claimed run. Pure + independently
-/// testable (T5b-2b-i correctness fix, spec §7): `gate` MUST come from the
-/// run's `resume_gate_id` MARKER field, not live `awaiting_step_id` — a
-/// second concurrent approve request can reorder the latter before this
-/// runs, but the marker is immutable once written (see `resume_gate_id`'s
-/// doc on `RunRecord`) — and is only ever appended for the `approve`
-/// subcommand: a `Paused` resume (`workflow resume`) has no gate concept.
+/// The `rupu workflow approve|resume <run_id> …` the resume worker spawns
+/// for a claimed run. Pure + independently testable (T5b-2b-i correctness
+/// fix, spec §7): `gate` MUST come from the run's `resume_gate_id` MARKER
+/// field, not live `awaiting_step_id` — a second concurrent approve request
+/// can reorder the latter before this runs, but the marker is immutable once
+/// written (see `resume_gate_id`'s doc on `RunRecord`) — and is only ever
+/// used for the `approve` subcommand: a `Paused` resume (`workflow resume`)
+/// has no gate concept.
 ///
 /// Without `--gate` on a genuinely >1-gate run, `workflow approve` hits
 /// `AmbiguousGate` and the detached child exits non-zero — but the caller
@@ -884,41 +884,40 @@ fn resume_subcommand(run: &rupu_orchestrator::RunRecord) -> &'static str {
 /// request made while the run was unfinished, so a run that finished before
 /// the child loads it is refused instead of retried the way an operator's
 /// `workflow resume` retries a failed, rejected or cancelled run.
-fn build_resume_argv<'a>(
-    subcommand: &'a str,
-    run_id: &'a str,
-    gate: Option<&'a str>,
-    mode: Option<&'a str>,
-    approver: Option<&'a str>,
-) -> Vec<&'a str> {
-    let mut argv: Vec<&str> = vec!["workflow", subcommand, run_id];
-    if subcommand == "approve" {
-        if let Some(g) = gate {
-            argv.push("--gate");
-            argv.push(g);
-        }
-        // ISSUES.md I-82: carry the web-initiated approve's true actor
-        // (persisted on the run's `resume_approver` marker by
+fn resume_control(
+    subcommand: &str,
+    run_id: &str,
+    gate: Option<&str>,
+    mode: Option<&str>,
+    approver: Option<&str>,
+) -> Result<RunArgv, String> {
+    let mode = mode
+        .map(rupu_tools::PermissionMode::parse)
+        .transpose()
+        .map_err(|e| format!("the run's resume mode: {e}"))?;
+    let run_id = run_id.to_string();
+    Ok(RunArgv::WorkflowControl(match subcommand {
+        // ISSUES.md I-82: `approver` carries the web-initiated approve's true
+        // actor (persisted on the run's `resume_approver` marker by
         // `request_resume_approval`) across the process boundary so the
         // spawned child records it on the gate decision row instead of
-        // falling back to `whoami::username()`. `resume` (the Paused,
-        // non-gate case) has no approver/gate-decision concept, so this is
-        // approve-only, same as `--gate`.
-        if let Some(a) = approver {
-            argv.push("--approver");
-            argv.push(a);
-        }
-    } else if subcommand == "resume" {
+        // falling back to `whoami::username()`. Approve-only, like `--gate`.
+        "approve" => WorkflowControl::Approve {
+            run_id,
+            mode,
+            gate: gate.map(str::to_string),
+            approver: approver.map(str::to_string),
+        },
         // The child serves a request made while the run was unfinished; a
         // run that finished since (its own runner completed it, a sweep
         // failed it, a cancel) is refused, never retried.
-        argv.push("--if-unfinished");
-    }
-    if let Some(m) = mode {
-        argv.push("--mode");
-        argv.push(m);
-    }
-    argv
+        "resume" => WorkflowControl::Resume {
+            run_id,
+            mode,
+            if_unfinished: true,
+        },
+        other => return Err(format!("unknown resume subcommand `{other}`")),
+    }))
 }
 
 /// `RunStore::clear_resume_if_marked_at` on the blocking pool (it takes
@@ -1010,7 +1009,7 @@ fn reap_detached(child: std::process::Child, run_id: &str, what: &'static str) {
 /// resume`, which `approve` would refuse as already decided), the
 /// requested resume mode AND the targeted gate (T5b-2b-i) from the run's
 /// marker fields (`resume_mode`/`resume_gate_id`), then hands off to
-/// [`build_resume_argv`]. A marker gone by the reload — consumed between
+/// [`resume_control`]. A marker gone by the reload — consumed between
 /// the listing and the claim, by another spawner or the `workflow resume`
 /// it asked for — spawns nothing: the claim is given back and that is all.
 /// The clear afterwards is for the marker read here only
@@ -1057,15 +1056,25 @@ async fn resume_one_run(
         },
     };
 
-    let argv = build_resume_argv(
+    let argv = match resume_control(
         subcommand,
         &run_id,
         gate.as_deref(),
         mode.as_deref(),
         approver.as_deref(),
-    );
+    ) {
+        Ok(argv) => argv,
+        Err(e) => {
+            tracing::error!(run_id = %run_id, subcommand, error = %e, "resume worker: cannot build the workflow command; clearing marker");
+            give_back_resume(&store, &run_id, marked_at, "resume worker").await;
+            return;
+        }
+    };
 
-    match std::process::Command::new(&exe).args(&argv).spawn() {
+    match std::process::Command::new(&exe)
+        .args(argv.to_args())
+        .spawn()
+    {
         Ok(child) => {
             // Detached: not awaited here. The child now owns the run and is
             // reaped on its own thread when it exits; the marker is given
@@ -1179,14 +1188,11 @@ async fn hand_off_timed_out_approve(
             Some(named) => named == gate_step_id,
             None => fresh.awaiting_gates().len() == 1,
         };
-    let mut argv: Vec<&str> = vec!["workflow", "approve", run_id, "--gate", gate_step_id];
-    if marker_is_this_gate {
-        if let Some(m) = fresh.resume_mode.as_deref() {
-            argv.push("--mode");
-            argv.push(m);
-        }
-    }
-    match std::process::Command::new(exe).args(&argv).spawn() {
+    let mode = fresh.resume_mode.as_deref().filter(|_| marker_is_this_gate);
+    let spawned = resume_control("approve", run_id, Some(gate_step_id), mode, None)
+        .map_err(std::io::Error::other)
+        .and_then(|argv| std::process::Command::new(exe).args(argv.to_args()).spawn());
+    match spawned {
         Ok(child) => {
             tracing::info!(run_id = %run_id, gate = %gate_step_id, "gate sweep: on_timeout=approve → spawned detached workflow approve");
             reap_detached(child, run_id, "gate sweep");
@@ -1642,13 +1648,16 @@ async fn spawn_decision_runner(
         }
     }
     // `--if-unfinished`: a run that finished before the child loads it is
-    // refused, never retried (see `build_resume_argv`).
-    let mut argv: Vec<&str> = vec!["workflow", "resume", run_id, "--if-unfinished"];
-    if let Some(m) = rec.resume_mode.as_deref() {
-        argv.push("--mode");
-        argv.push(m);
-    }
-    match std::process::Command::new(exe).args(&argv).spawn() {
+    // refused, never retried (see `resume_control`).
+    let argv = match resume_control("resume", run_id, None, rec.resume_mode.as_deref(), None) {
+        Ok(argv) => argv,
+        Err(e) => {
+            tracing::error!(run_id = %run_id, error = %e, "gate sweep: cannot build the workflow resume command");
+            give_back_resume(store, run_id, rec.resume_requested_at, "gate sweep").await;
+            return;
+        }
+    };
+    match std::process::Command::new(exe).args(argv.to_args()).spawn() {
         Ok(child) => {
             tracing::info!(run_id = %run_id, "gate sweep: on_timeout=reject → spawned detached workflow resume");
             reap_detached(child, run_id, "gate sweep");
@@ -1767,7 +1776,7 @@ pub(crate) fn try_claim_asn_refresh(guard: &AtomicBool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_resume_argv, give_back_resume, hand_off_timed_out_approve, resume_one_run,
+        give_back_resume, hand_off_timed_out_approve, resume_control, resume_one_run,
         resume_subcommand, run_gate_sweep, run_periodic_tick, should_refresh_asn, sweep_decision,
         sweep_loop_enabled, sweep_or_reaper_enabled, try_claim_asn_refresh, SweepAction,
     };
@@ -1777,6 +1786,28 @@ mod tests {
     use std::time::Duration;
 
     // ── T5b-2b-i correctness fix: the resume worker's gate-id round-trip ──
+
+    /// [`resume_control`], rendered.
+    fn build_resume_argv(
+        subcommand: &str,
+        run_id: &str,
+        gate: Option<&str>,
+        mode: Option<&str>,
+        approver: Option<&str>,
+    ) -> Vec<String> {
+        resume_control(subcommand, run_id, gate, mode, approver)
+            .unwrap()
+            .to_args()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn resume_control_refuses_a_junk_mode_or_subcommand() {
+        assert!(resume_control("approve", "run_x", None, Some("yolo"), None).is_err());
+        assert!(resume_control("reject", "run_x", None, None, None).is_err());
+    }
 
     #[test]
     fn build_resume_argv_includes_gate_only_for_approve_when_present() {

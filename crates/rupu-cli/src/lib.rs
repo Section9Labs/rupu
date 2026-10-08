@@ -846,7 +846,9 @@ mod arg_parse_tests {
     fn the_ssh_resume_argv_for_a_remote_advertising_the_flag_parses() {
         assert!(rupu_cp::node::protocol::FeaturesReport::current()
             .supports(rupu_cp::node::protocol::CAP_WORKFLOW_RESUME_IF_UNFINISHED));
-        let cli = Cli::try_parse_from(rupu_cp::host::ssh::resume_argv("run_01ABC", true)).unwrap();
+        let argv = rupu_cp::host::ssh::resume_argv("run_01ABC", true);
+        let cli =
+            Cli::try_parse_from(std::iter::once("rupu".into()).chain(argv.to_args())).unwrap();
         match cli.command {
             Cmd::Workflow {
                 action:

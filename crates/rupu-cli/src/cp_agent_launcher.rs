@@ -1,222 +1,121 @@
 //! `cp serve` adapter for rupu-cp's `AgentLauncher`. Spawns a detached
-//! `rupu run <agent> …` child per request (own process group + null stdio).
+//! `rupu run <agent> …` child per request (`rupu_runtime::spawn`).
 use rupu_cp::agent_launcher::{AgentLaunchError, AgentLaunchRequest, AgentLauncher};
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use rupu_runtime::argv::RunArgv;
+use rupu_runtime::spawn::{spawn_detached, SpawnSpec};
 use std::path::PathBuf;
-use std::process::Stdio;
 
 pub struct SubprocessAgentLauncher {
     pub exe: PathBuf,
 }
 
-/// Build the argv (after the executable) for a `rupu run` invocation.
-///
-/// Order: `run <agent> [<target>] --run-id <id> [--mode m] [--findings-profile f] [--engagement-profile e]… [--prompt <p>] [--tmp]`.
-/// The prompt is always passed via `--prompt` (never positionally) so it cannot
-/// be mis-parsed as a RunTarget when no target is present.
-/// `--tmp` is added when a target is present so a repo/PR clone lands in an
-/// auto-deleted tmpdir instead of polluting / refusing in cwd.
-pub(crate) fn build_agent_argv(req: &AgentLaunchRequest, run_id: &str) -> Vec<String> {
-    let mut argv = vec!["run".to_string(), req.agent.clone()];
-    if let Some(t) = &req.target {
-        argv.push(t.clone());
-    }
-    argv.push("--run-id".to_string());
-    argv.push(run_id.to_string());
-    if let Some(m) = &req.mode {
-        argv.push("--mode".to_string());
-        argv.push(m.clone());
-    }
-    if let Some(f) = req.findings_profile {
-        argv.push("--findings-profile".to_string());
-        argv.push(f.as_str().to_string());
-    }
-    for id in &req.engagement_profiles {
-        argv.push("--engagement-profile".to_string());
-        argv.push(id.clone());
-    }
-    if let Some(p) = &req.prompt {
-        argv.push("--prompt".to_string());
-        argv.push(p.clone());
-    }
-    if req.target.is_some() {
-        argv.push("--tmp".to_string());
-    }
-    argv
+/// The detached `rupu run` for `req`: its own process group + null stdio,
+/// so a Ctrl-C / SIGINT to `cp serve` (or the CP exiting) does not take the
+/// run down. The child writes its own transcript and run.json lifecycle.
+/// It runs under the caller's run id and codename when given (a placed
+/// unit's coordinator), else a minted id and its own crew.
+fn spawn_spec(
+    exe: &std::path::Path,
+    req: &AgentLaunchRequest,
+) -> Result<(SpawnSpec, String), AgentLaunchError> {
+    let run_id = req.run_id_or_mint().map_err(AgentLaunchError::Invalid)?;
+    let run = req.agent_run(&run_id).map_err(AgentLaunchError::Invalid)?;
+    let mut spec = SpawnSpec::new(exe, RunArgv::Agent(run));
+    spec.cwd = req.working_dir.as_deref().map(PathBuf::from);
+    Ok((spec, run_id))
 }
 
 #[async_trait::async_trait]
 impl AgentLauncher for SubprocessAgentLauncher {
     async fn launch(&self, req: AgentLaunchRequest) -> Result<String, AgentLaunchError> {
-        let run_id = format!("run_{}", ulid::Ulid::new());
-        let argv = build_agent_argv(&req, &run_id);
-        // Detached: its own process group + null stdio, so a Ctrl-C / SIGINT to
-        // `cp serve` (or the CP exiting) does not take the run down. The child
-        // writes its own transcript and run.json lifecycle.
-        let mut cmd = std::process::Command::new(&self.exe);
-        cmd.args(&argv)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        if let Some(dir) = req.working_dir.as_deref() {
-            cmd.current_dir(dir);
-        }
-        #[cfg(unix)]
-        cmd.process_group(0); // own process group; detaches from cp-serve's
-        cmd.spawn()
-            .map_err(|e| AgentLaunchError::Spawn(e.to_string()))?;
+        let (spec, run_id) = spawn_spec(&self.exe, &req)?;
+        spawn_detached(spec).map_err(|e| AgentLaunchError::Spawn(e.to_string()))?;
         Ok(run_id)
+    }
+
+    fn honours_supplied_run_id(&self) -> bool {
+        true
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::build_agent_argv;
-    use rupu_cp::agent_launcher::AgentLaunchRequest;
+    use super::spawn_spec;
+    use rupu_cp::agent_launcher::{AgentLaunchError, AgentLaunchRequest};
+    use rupu_runtime::argv::RunArgv;
 
-    #[test]
-    fn argv_with_target_prompt_mode() {
-        let req = AgentLaunchRequest {
+    fn req() -> AgentLaunchRequest {
+        AgentLaunchRequest {
             codename: None,
             agent: "triage".into(),
             prompt: Some("look at PR".into()),
             mode: Some("bypass".into()),
             target: Some("github:o/r".into()),
-            working_dir: None,
+            working_dir: Some("/tmp/p".into()),
             run_id: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
-        };
-        let argv = build_agent_argv(&req, "run_X");
+        }
+    }
+
+    fn args(spec: &rupu_runtime::spawn::SpawnSpec) -> Vec<String> {
+        spec.argv
+            .to_args()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_targeted_launch_clones_into_a_tmpdir_and_runs_in_the_working_dir() {
+        let (spec, run_id) = spawn_spec("/bin/rupu".as_ref(), &req()).unwrap();
+        assert!(run_id.starts_with("run_"), "{run_id}");
         assert_eq!(
-            argv,
-            vec![
+            args(&spec),
+            [
                 "run",
                 "triage",
                 "github:o/r",
                 "--run-id",
-                "run_X",
+                &run_id,
                 "--mode",
                 "bypass",
-                "--prompt",
-                "look at PR",
-                "--tmp",
+                "--prompt=look at PR",
+                "--tmp"
             ]
         );
+        assert_eq!(spec.cwd.as_deref(), Some("/tmp/p".as_ref()));
+        assert!(!spec.keep_child);
+    }
+
+    /// L8: the local CP launcher used to mint its own id and drop the
+    /// codename. A coordinator's are the run's now.
+    #[test]
+    fn a_supplied_run_id_and_codename_are_honoured() {
+        let mut r = req();
+        r.run_id = Some("run_01COORD".into());
+        r.codename = Some("cobalt-harbor/heron#412".into());
+        let (spec, run_id) = spawn_spec("/bin/rupu".as_ref(), &r).unwrap();
+        assert_eq!(run_id, "run_01COORD");
+        let RunArgv::Agent(run) = &spec.argv else {
+            panic!()
+        };
+        assert_eq!(run.run_id, "run_01COORD");
+        assert_eq!(run.codename.as_deref(), Some("cobalt-harbor/heron#412"));
+        assert!(args(&spec).contains(&"--codename".to_string()));
     }
 
     #[test]
-    fn argv_carries_the_engagement_profiles() {
-        let req = AgentLaunchRequest {
-            agent: "recon".into(),
-            prompt: Some("enumerate".into()),
-            mode: None,
-            target: None,
-            working_dir: None,
-            run_id: None,
-            findings_profile: None,
-            engagement_profiles: vec!["network".into(), "web".into()],
-            codename: None,
-        };
-        let argv = build_agent_argv(&req, "run_X");
-        assert_eq!(
-            argv,
-            vec![
-                "run",
-                "recon",
-                "--run-id",
-                "run_X",
-                "--engagement-profile",
-                "network",
-                "--engagement-profile",
-                "web",
-                "--prompt",
-                "enumerate"
-            ]
-        );
-        // The argv must round-trip through the real `rupu run` parser.
-        let args = crate::cmd::run::parse_launch_args(argv[1..].to_vec()).unwrap();
-        assert_eq!(args.engagement_profiles, ["network", "web"]);
-    }
-
-    #[test]
-    fn argv_carries_the_findings_profile() {
-        let req = AgentLaunchRequest {
-            agent: "sec".into(),
-            prompt: Some("audit".into()),
-            mode: None,
-            target: None,
-            working_dir: None,
-            run_id: None,
-            findings_profile: Some(rupu_coverage::FindingProfile::Summary),
-            engagement_profiles: Vec::new(),
-            codename: None,
-        };
-        let argv = build_agent_argv(&req, "run_X");
-        assert_eq!(
-            argv,
-            vec![
-                "run",
-                "sec",
-                "--run-id",
-                "run_X",
-                "--findings-profile",
-                "summary",
-                "--prompt",
-                "audit"
-            ]
-        );
-        // The argv must round-trip through the real `rupu run` parser.
-        let args = crate::cmd::run::parse_launch_args(argv[1..].to_vec()).unwrap();
-        assert_eq!(
-            args.findings_profile,
-            Some(rupu_coverage::FindingProfile::Summary)
-        );
-    }
-
-    #[test]
-    fn argv_minimal() {
-        let req = AgentLaunchRequest {
-            codename: None,
-            agent: "triage".into(),
-            prompt: None,
-            mode: None,
-            target: None,
-            working_dir: None,
-            run_id: None,
-            findings_profile: None,
-            engagement_profiles: Vec::new(),
-        };
-        assert_eq!(
-            build_agent_argv(&req, "run_X"),
-            vec!["run", "triage", "--run-id", "run_X"]
-        );
-    }
-
-    #[test]
-    fn argv_prompt_no_target() {
-        let req = AgentLaunchRequest {
-            codename: None,
-            agent: "triage".into(),
-            prompt: Some("do a security audit".into()),
-            mode: None,
-            target: None,
-            working_dir: None,
-            run_id: None,
-            findings_profile: None,
-            engagement_profiles: Vec::new(),
-        };
-        assert_eq!(
-            build_agent_argv(&req, "run_X"),
-            vec![
-                "run",
-                "triage",
-                "--run-id",
-                "run_X",
-                "--prompt",
-                "do a security audit"
-            ]
-        );
+    fn a_malformed_run_id_or_mode_is_refused() {
+        let mut bad_id = req();
+        bad_id.run_id = Some("../x".into());
+        let mut bad_mode = req();
+        bad_mode.mode = Some("yolo".into());
+        for r in [bad_id, bad_mode] {
+            assert!(matches!(
+                spawn_spec("/bin/rupu".as_ref(), &r),
+                Err(AgentLaunchError::Invalid(_))
+            ));
+        }
     }
 }
