@@ -1,8 +1,7 @@
-use rupu_agent::runner::{BypassDecider, CapturingMockProvider, ScriptedTurn};
+use rupu_agent::runner::{CapturingMockProvider, ScriptedTurn};
 use rupu_agent::{run_agent, AgentRunOpts};
 use rupu_providers::types::StopReason;
 use rupu_tools::ToolContext;
-use std::sync::Arc;
 
 #[tokio::test]
 async fn run_passes_all_default_tools_to_provider() {
@@ -30,12 +29,11 @@ async fn run_passes_all_default_tools_to_provider() {
         workspace_path: tmp.path().to_path_buf(),
         transcript_path: tmp.path().join("run.jsonl"),
         max_turns: 5,
-        decider: Arc::new(BypassDecider),
+        permission: rupu_tools::PermissionPolicy::bypass(),
         tool_context: ToolContext::default(),
         user_message: "go".into(),
         initial_messages: Vec::new(),
         turn_index_offset: 0,
-        mode_str: "bypass".into(),
         no_stream: false,
         suppress_stream_stdout: false,
         mcp_registry: None,
@@ -131,12 +129,11 @@ async fn run_with_agent_tools_filter_passes_only_listed_tools() {
         workspace_path: tmp.path().to_path_buf(),
         transcript_path: tmp.path().join("run.jsonl"),
         max_turns: 5,
-        decider: Arc::new(BypassDecider),
+        permission: rupu_tools::PermissionPolicy::bypass(),
         tool_context: ToolContext::default(),
         user_message: "go".into(),
         initial_messages: Vec::new(),
         turn_index_offset: 0,
-        mode_str: "bypass".into(),
         no_stream: false,
         suppress_stream_stdout: false,
         mcp_registry: None,

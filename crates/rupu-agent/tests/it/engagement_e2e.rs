@@ -3,7 +3,7 @@
 //! the asset graph — and `asset_mark` advances coverage depth. Drives the real
 //! `run_agent` loop with a scripted mock provider and synthetic finding data.
 
-use rupu_agent::runner::{BypassDecider, CapturingMockProvider, ScriptedTurn};
+use rupu_agent::runner::{CapturingMockProvider, ScriptedTurn};
 use rupu_agent::{run_agent, AgentRunOpts};
 use rupu_coverage::{builtin_registry, target_id, CoveragePaths, FindingWriteOptions};
 use rupu_providers::types::StopReason;
@@ -91,7 +91,7 @@ fn opts(
         workspace_path: workspace.to_path_buf(),
         transcript_path: workspace.join("run.jsonl"),
         max_turns: 8,
-        decider: Arc::new(BypassDecider),
+        permission: rupu_tools::PermissionPolicy::bypass(),
         tool_context: ToolContext {
             workspace_path: workspace.to_path_buf(),
             findings: Some(FindingWriteOptions {
@@ -104,7 +104,6 @@ fn opts(
         user_message: "Assess the host.".into(),
         initial_messages: Vec::new(),
         turn_index_offset: 0,
-        mode_str: "bypass".into(),
         no_stream: true,
         suppress_stream_stdout: false,
         mcp_registry: None,

@@ -34,8 +34,8 @@ fn cwe_research_in_index_mode_supports_search_and_detail() {
     // Catalog far exceeds the threshold → index mode.
     let prompt = render_prompt_section(&cat, DEFAULT_FULL_MODE_THRESHOLD);
     assert!(prompt.contains("## Coverage Catalog (index)"));
-    assert!(prompt.contains("coverage_concerns_search"));
-    assert!(prompt.contains("coverage_concerns_detail"));
+    assert!(prompt.contains("coverage.concerns.search"));
+    assert!(prompt.contains("coverage.concerns.detail"));
 
     // Search for "injection" — should surface multiple injection CWEs.
     let results = coverage_concerns_search(

@@ -586,8 +586,8 @@ async fn launch(
             model,
             // What the lead file declares, exactly. `rupu run` treats an absent
             // `tools:` as "all six builtins"; an autonomous lead (it runs under
-            // `BypassDecider`) gets none of them unless it asks. `run_agentiflow`
-            // adds `report_finding` and the fleet tools on top either way.
+            // bypass permission) gets none of them unless it asks. `run_agentiflow`
+            // adds `findings.report` and the fleet tools on top either way.
             agent_tools: spec.tools.clone().unwrap_or_default(),
         },
         run_id: run_id.clone(),
@@ -702,7 +702,7 @@ async fn generation_capability(
             tracing::warn!(
                 provider = %gen_provider,
                 error = %e,
-                "generate_workflow is unavailable: no credential for the generating provider \
+                "workflows.generate is unavailable: no credential for the generating provider \
                  (run `rupu auth login --account {gen_provider} --mode <api-key|sso>`)"
             );
             return Ok(None);
@@ -742,7 +742,7 @@ async fn generation_capability(
         Err(FactoryError::RequiresAsyncBootstrap { provider }) => {
             tracing::warn!(
                 provider = %provider,
-                "generate_workflow is unavailable: `{provider}` authenticates with Anthropic OAuth, \
+                "workflows.generate is unavailable: `{provider}` authenticates with Anthropic OAuth, \
                  which cannot be built where the tool runs (use an API key to enable it: \
                  `rupu auth login --account {provider} --mode api-key`)"
             );

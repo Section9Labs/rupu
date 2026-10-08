@@ -176,11 +176,19 @@ Git operations use `bash git ...` in v0. Dedicated git tools land in Slice B.
 
 ## Permission model
 
-| Mode       | bash   | write_file | edit_file | read_file | grep  | glob  |
-|------------|--------|------------|-----------|-----------|-------|-------|
-| `readonly` | deny   | deny       | deny      | allow     | allow | allow |
-| `ask`      | prompt | prompt     | prompt    | allow     | allow | allow |
-| `bypass`   | allow  | allow      | allow     | allow     | allow | allow |
+Every tool declares one effect — `read`, `record`, `write`, `external` or
+`spawn` — and one policy (`rupu_tools::PermissionPolicy`) decides each call
+from the effect and the mode:
+
+| Mode       | read  | record | write  | external | spawn |
+|------------|-------|--------|--------|----------|-------|
+| `readonly` | allow | allow  | deny   | deny     | allow, child capped at `readonly` |
+| `ask`      | allow | allow  | prompt | prompt   | allow, child capped at `ask` |
+| `bypass`   | allow | allow  | allow  | allow    | allow, child keeps its own mode |
+
+`ask` with no operator present (workflow steps, sessions, flows) allows
+write/external calls and writes one `permission_mode_degraded` notice. The
+effect of each tool is listed in [agent-format.md](agent-format.md#permissionmode).
 
 **Mode resolution** (highest precedence first): CLI flag → agent frontmatter →
 project config → global config → default (`ask`).
@@ -194,7 +202,7 @@ receives this and can adapt (e.g., switch to read-only investigation).
 
 **Prompt UX** (when `ask`): shows tool name + full input (truncated to ~200 chars/field with
 a `more` option) + workspace path. Choices: `[y]es` / `[n]o` / `[a]lways for this tool this run` /
-`[s]top run`. There is no "always for all tools" option.
+`[s]top run`. There is no "always for all tools" option: "always" allows that one tool.
 
 ---
 

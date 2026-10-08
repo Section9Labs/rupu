@@ -1,67 +1,39 @@
-//! Tool trait wrappers for the 4 coverage harness tools.
+//! Tool bodies of the coverage-ledger and findings tools. Their descriptors
+//! (canonical names, aliases, effects, schemas) live in
+//! `rupu_tools::catalog::{coverage, findings}`; W4 moves these bodies there.
 //!
-//! These tools are injected into the agent registry when a `concerns:` block
-//! is present in the agent frontmatter. They delegate to the free functions in
-//! `rupu_coverage::tools` and populate `Attribution` from the `ToolContext`.
+//! The coverage tools are injected into the agent registry when a `concerns:`
+//! block is present in the agent frontmatter. They delegate to the free
+//! functions in `rupu_coverage::tools` and populate `Attribution` from the
+//! `ToolContext`.
 
 use async_trait::async_trait;
 use rupu_coverage::tools::{verify_finding, VerifyError, VerifyInput};
 use rupu_coverage::{
     asset_mark, coverage_concerns_detail, coverage_concerns_search, coverage_mark,
-    coverage_remaining, coverage_status, report_finding, AssetMarkInput, Attribution,
+    coverage_remaining, coverage_status, report_finding, AssetMarkInput,
     CoverageConcernsDetailInput, CoverageConcernsSearchInput, CoverageMarkInput, CoveragePaths,
-    CoverageRemainingInput, CoverageStatusInput, FlatCatalog, ReportFindingInput, Surface,
+    CoverageRemainingInput, CoverageStatusInput, FlatCatalog, ReportFindingInput,
     VerificationStatus,
 };
-use rupu_tools::{Tool, ToolContext, ToolError, ToolOutput};
+use rupu_tools::coverage_emit::attribution_from;
+use rupu_tools::output::{failed, ok};
+use rupu_tools::{Tool, ToolContext, ToolDescriptor, ToolError, ToolOutput};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-// ---------------------------------------------------------------------------
-// Shared helper
-// ---------------------------------------------------------------------------
-
-fn attribution_from_ctx(ctx: &ToolContext) -> Attribution {
-    let surface = match ctx.surface_tag.as_deref() {
-        Some("agent") => Surface::Agent,
-        Some("autoflow") => Surface::Autoflow,
-        Some("session") => Surface::Session,
-        _ => Surface::Workflow,
-    };
-    Attribution {
-        run_id: ctx.run_id.clone().unwrap_or_default(),
-        model: ctx.model.clone().unwrap_or_default(),
-        surface,
-        codename: ctx.codename.clone(),
-        agent: ctx.agent.clone(),
-        provider: ctx.provider.clone(),
-    }
+fn ok_in(text: impl Into<String>, started: Instant) -> ToolOutput {
+    ok(text).timed(started)
 }
 
-fn ok_output(text: impl Into<String>, elapsed: Instant) -> ToolOutput {
-    ToolOutput {
-        stdout: text.into(),
-        error: None,
-        duration_ms: elapsed.elapsed().as_millis() as u64,
-        derived: None,
-        structured: None,
-    }
-}
-
-fn err_output(text: impl Into<String>, elapsed: Instant) -> ToolOutput {
-    ToolOutput {
-        stdout: String::new(),
-        error: Some(text.into()),
-        duration_ms: elapsed.elapsed().as_millis() as u64,
-        derived: None,
-        structured: None,
-    }
+fn failed_in(text: impl Into<String>, started: Instant) -> ToolOutput {
+    failed(text).timed(started)
 }
 
 // ---------------------------------------------------------------------------
-// coverage_mark
+// coverage.mark
 // ---------------------------------------------------------------------------
 
 pub struct CoverageMarkTool {
@@ -71,64 +43,15 @@ pub struct CoverageMarkTool {
 
 #[async_trait]
 impl Tool for CoverageMarkTool {
-    fn name(&self) -> &'static str {
-        "coverage_mark"
-    }
-
-    fn description(&self) -> &'static str {
-        "Record a coverage assertion for a (concern_id, file_path) pair. \
-         Status must be one of: clean | finding | not_applicable. \
-         The file must have been read at the required min_strength first, \
-         unless status is not_applicable."
-    }
-
-    fn input_schema(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "required": ["concern_id", "file_path", "status", "evidence"],
-            "properties": {
-                "concern_id": {
-                    "type": "string",
-                    "description": "Concern ID from the effective catalog (e.g. stride:spoofing)."
-                },
-                "file_path": {
-                    "type": "string",
-                    "description": "Workspace-relative path of the file being marked."
-                },
-                "status": {
-                    "type": "string",
-                    "enum": ["clean", "finding", "not_applicable"],
-                    "description": "Coverage assertion result."
-                },
-                "evidence": {
-                    "type": "object",
-                    "required": ["summary"],
-                    "properties": {
-                        "summary": { "type": "string" },
-                        "line_ranges": {
-                            "type": "array",
-                            "items": {
-                                "type": "array",
-                                "items": { "type": "integer" },
-                                "minItems": 2,
-                                "maxItems": 2
-                            }
-                        },
-                        "finding_ids": {
-                            "type": "array",
-                            "items": { "type": "string" }
-                        }
-                    }
-                }
-            }
-        })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &rupu_tools::catalog::coverage::COVERAGE_MARK
     }
 
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let started = Instant::now();
         let parsed: CoverageMarkInput =
             serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
-        let attribution = attribution_from_ctx(ctx);
+        let attribution = attribution_from(ctx);
         match coverage_mark(&self.paths, &self.catalog, attribution, parsed).await {
             Ok(out) => {
                 let mut text = if out.warnings.is_empty() {
@@ -139,9 +62,9 @@ impl Tool for CoverageMarkTool {
                 if !out.warnings.is_empty() {
                     text = format!("ok\nwarnings:\n{}", out.warnings.join("\n"));
                 }
-                Ok(ok_output(text, started))
+                Ok(ok_in(text, started))
             }
-            Err(e) => Ok(err_output(e.to_string(), started)),
+            Err(e) => Ok(failed_in(e.to_string(), started)),
         }
     }
 }
@@ -156,34 +79,8 @@ pub struct CoverageStatusTool {
 
 #[async_trait]
 impl Tool for CoverageStatusTool {
-    fn name(&self) -> &'static str {
-        "coverage_status"
-    }
-
-    fn description(&self) -> &'static str {
-        "Query existing coverage assertions. Optionally filter by concern_id, \
-         file_path_prefix, or since timestamp. Returns a JSON array of assertion records."
-    }
-
-    fn input_schema(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "concern_id": {
-                    "type": "string",
-                    "description": "Filter to this concern ID only."
-                },
-                "file_path_prefix": {
-                    "type": "string",
-                    "description": "Return only assertions whose file_path starts with this prefix."
-                },
-                "since": {
-                    "type": "string",
-                    "format": "date-time",
-                    "description": "ISO-8601 timestamp. Return only assertions after this point."
-                }
-            }
-        })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &rupu_tools::catalog::coverage::COVERAGE_STATUS
     }
 
     async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -194,9 +91,9 @@ impl Tool for CoverageStatusTool {
             Ok(assertions) => {
                 let text =
                     serde_json::to_string_pretty(&assertions).unwrap_or_else(|_| "[]".to_string());
-                Ok(ok_output(text, started))
+                Ok(ok_in(text, started))
             }
-            Err(e) => Ok(err_output(e.to_string(), started)),
+            Err(e) => Ok(failed_in(e.to_string(), started)),
         }
     }
 }
@@ -212,31 +109,8 @@ pub struct CoverageRemainingTool {
 
 #[async_trait]
 impl Tool for CoverageRemainingTool {
-    fn name(&self) -> &'static str {
-        "coverage_remaining"
-    }
-
-    fn description(&self) -> &'static str {
-        "List (concern_id, file_path) pairs that have been touched but not yet \
-         asserted. Optionally filter by concern_id or min_strength. \
-         Use this to discover what still needs coverage_mark calls."
-    }
-
-    fn input_schema(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "concern_id": {
-                    "type": "string",
-                    "description": "Filter to this concern ID only."
-                },
-                "min_strength": {
-                    "type": "string",
-                    "enum": ["glob", "cmd", "grep", "read", "edit"],
-                    "description": "Minimum touch strength to include."
-                }
-            }
-        })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &rupu_tools::catalog::coverage::COVERAGE_REMAINING
     }
 
     async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -247,9 +121,9 @@ impl Tool for CoverageRemainingTool {
             Ok(items) => {
                 let text =
                     serde_json::to_string_pretty(&items).unwrap_or_else(|_| "[]".to_string());
-                Ok(ok_output(text, started))
+                Ok(ok_in(text, started))
             }
-            Err(e) => Ok(err_output(e.to_string(), started)),
+            Err(e) => Ok(failed_in(e.to_string(), started)),
         }
     }
 }
@@ -280,21 +154,16 @@ impl ReportFindingTool {
 
 #[async_trait]
 impl Tool for ReportFindingTool {
-    fn name(&self) -> &'static str {
-        "report_finding"
-    }
-
-    fn description(&self) -> &'static str {
-        "Record a security or quality finding in this project's ledger. Returns the \
-         generated finding id (use it in coverage_mark calls and in another finding's \
-         cross_references). Under the full profile send a complete `report`; a rejected \
-         call lists every problem to fix."
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &rupu_tools::catalog::findings::FINDINGS_REPORT
     }
 
     fn input_schema(&self) -> Value {
         match self.options.profile {
-            rupu_coverage::FindingProfile::Summary => summary_schema(),
-            rupu_coverage::FindingProfile::Full => full_schema(),
+            rupu_coverage::FindingProfile::Summary => {
+                rupu_tools::catalog::findings::summary_schema()
+            }
+            rupu_coverage::FindingProfile::Full => rupu_tools::catalog::findings::full_schema(),
         }
     }
 
@@ -305,7 +174,7 @@ impl Tool for ReportFindingTool {
         // bare message the agent has to hunt for in a large report.
         let parsed: ReportFindingInput = serde_path_to_error::deserialize(input)
             .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
-        let attribution = attribution_from_ctx(ctx);
+        let attribution = attribution_from(ctx);
         // The write is synchronous and can be long (hashing and copying
         // artifacts up to the configured caps), so it runs on the blocking
         // pool rather than stalling this runtime worker.
@@ -316,10 +185,10 @@ impl Tool for ReportFindingTool {
         })
         .await;
         match result {
-            Ok(Ok(out)) => Ok(ok_output(format!("finding_id: {}", out.id), started)),
-            Ok(Err(e)) => Ok(err_output(e.to_string(), started)),
-            Err(join) => Ok(err_output(
-                format!("report_finding did not complete: {join}"),
+            Ok(Ok(out)) => Ok(ok_in(format!("finding_id: {}", out.id), started)),
+            Ok(Err(e)) => Ok(failed_in(e.to_string(), started)),
+            Err(join) => Ok(failed_in(
+                format!("findings.report did not complete: {join}"),
                 started,
             )),
         }
@@ -327,7 +196,7 @@ impl Tool for ReportFindingTool {
 }
 
 // ---------------------------------------------------------------------------
-// finding.verify
+// findings.verify
 // ---------------------------------------------------------------------------
 
 /// Record an independent verdict on a finding another run filed.
@@ -345,7 +214,7 @@ pub struct FindingVerifyTool {
 impl FindingVerifyTool {
     /// Build the tool against an explicit ledger location. It is never part
     /// of the coverage bundle (`register` does not add it): `runner`
-    /// registers it only for an agent that lists `finding.verify` in
+    /// registers it only for an agent that lists `findings.verify` (or its alias `finding.verify`) in
     /// `tools:`, with or without a `concerns:` block.
     pub fn new(paths: CoveragePaths) -> Self {
         Self { paths }
@@ -354,39 +223,8 @@ impl FindingVerifyTool {
 
 #[async_trait]
 impl Tool for FindingVerifyTool {
-    fn name(&self) -> &'static str {
-        "finding.verify"
-    }
-
-    fn description(&self) -> &'static str {
-        "Record your verdict on a finding that ANOTHER run filed: confirmed (you \
-         reproduced or independently established it), disputed (you showed it is wrong), \
-         or inconclusive (you could not decide). Your run and agent are recorded \
-         automatically. A finding cannot be verified by the run that filed it, and a \
-         finding without a full report cannot be verified. A later verdict replaces an \
-         earlier one."
-    }
-
-    fn input_schema(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "required": ["finding_id", "status"],
-            "properties": {
-                "finding_id": {
-                    "type": "string",
-                    "description": "The id of the finding to verify (as returned by report_finding)."
-                },
-                "status": {
-                    "type": "string",
-                    "enum": ["confirmed", "disputed", "inconclusive"],
-                    "description": "Your verdict."
-                },
-                "notes": {
-                    "type": "string",
-                    "description": "What you did and saw: how you reproduced it, or why it does not hold."
-                }
-            }
-        })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &rupu_tools::catalog::findings::FINDINGS_VERIFY
     }
 
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -433,7 +271,7 @@ impl Tool for FindingVerifyTool {
             .filter(|r| !r.trim().is_empty())
             .ok_or_else(|| {
                 ToolError::Execution(
-                    "finding.verify needs the calling run's id, and this context has none; \
+                    "findings.verify needs the calling run's id, and this context has none; \
                      no verification was recorded"
                         .into(),
                 )
@@ -452,10 +290,10 @@ impl Tool for FindingVerifyTool {
         let result = tokio::task::spawn_blocking(move || verify_finding(&paths, &verify))
             .await
             .map_err(|join| {
-                ToolError::Execution(format!("finding.verify did not complete: {join}"))
+                ToolError::Execution(format!("findings.verify did not complete: {join}"))
             })?;
         match result {
-            Ok(()) => Ok(ok_output(
+            Ok(()) => Ok(ok_in(
                 format!(
                     "verification recorded: {finding_id} is {}",
                     status_word(status)
@@ -470,7 +308,7 @@ impl Tool for FindingVerifyTool {
                 | VerifyError::SelfVerification
                 | VerifyError::BadStatus
                 | VerifyError::MissingVerifier),
-            ) => Ok(err_output(e.to_string(), started)),
+            ) => Ok(failed_in(e.to_string(), started)),
             // The ledger could not be locked or replaced: not the agent's
             // doing, and nothing was recorded.
             Err(VerifyError::Io(e)) => Err(ToolError::Io(e)),
@@ -487,79 +325,6 @@ fn status_word(status: VerificationStatus) -> &'static str {
     }
 }
 
-/// The lightweight record: the original schema, verbatim.
-fn summary_schema() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "required": ["scope", "summary", "severity", "evidence"],
-        "properties": {
-            "tags": rupu_coverage::tags_schema_property(),
-            "file_path": {
-                "type": "string",
-                "description": "Workspace-relative path of the affected file, if applicable."
-            },
-            "line_range": {
-                "type": "array",
-                "items": { "type": "integer" },
-                "minItems": 2,
-                "maxItems": 2,
-                "description": "Line range [start, end] within the file, if applicable."
-            },
-            "target_ref": {
-                "type": "string",
-                "description": "What this finding is about when it is not a file: a host or IP (host), a URL (endpoint), or a cloud resource id such as an OCID/ARN/URN (resource). Required for those three scopes."
-            },
-            "scope": {
-                "type": "string",
-                "enum": ["line", "file", "repo", "host", "endpoint", "resource"],
-                "description": "What the finding is about. Code scopes: 'line' (needs file_path + line_range), 'file' (needs file_path), 'repo' (the project as a whole). Target scopes, each needing target_ref: 'host' (a machine or IP), 'endpoint' (a specific service URL), 'resource' (a cloud resource by its own id). Pick the narrowest scope the evidence actually supports - claiming a whole host for a defect on one endpoint overstates it."
-            },
-            "summary": {
-                "type": "string",
-                "description": "One-sentence description of the finding."
-            },
-            "severity": {
-                "type": "string",
-                "enum": ["info", "low", "medium", "high", "critical"],
-                "description": "Severity of the finding."
-            },
-            "concern_id": {
-                "type": "string",
-                "description": "Concern ID this finding relates to, if known."
-            },
-            "evidence": {
-                "type": "object",
-                "required": ["rationale"],
-                "properties": {
-                    "code_excerpt": { "type": "string" },
-                    "rationale": { "type": "string" },
-                    "references": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    }
-                }
-            },
-            "asset": rupu_coverage::asset_schema_property()
-        }
-    })
-}
-
-/// The full profile: locators + a complete `report`. `summary`, `severity`
-/// and `evidence` are derived from the report, so they are not offered.
-fn full_schema() -> Value {
-    let mut s = summary_schema();
-    let props = s["properties"].as_object_mut().expect("object schema");
-    props.remove("summary");
-    props.remove("severity");
-    props.remove("evidence");
-    props.insert(
-        "report".to_string(),
-        rupu_coverage::report::schema::advertised_schema(),
-    );
-    s["required"] = serde_json::json!(["scope", "report"]);
-    s
-}
-
 // ---------------------------------------------------------------------------
 // coverage_concerns_search
 // ---------------------------------------------------------------------------
@@ -570,47 +335,8 @@ pub struct CoverageConcernsSearchTool {
 
 #[async_trait]
 impl Tool for CoverageConcernsSearchTool {
-    fn name(&self) -> &'static str {
-        "coverage_concerns_search"
-    }
-
-    fn description(&self) -> &'static str {
-        "Search the concern catalog by substring and/or filter. Returns up to `limit` \
-matching concerns in summary form (id, name, severity, summary) by default, or full \
-form if `form: 'full'`. Use when the catalog is too large to inline in the prompt."
-    }
-
-    fn input_schema(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Case-insensitive substring match against id, name, description."
-                },
-                "filter": {
-                    "type": "object",
-                    "properties": {
-                        "severity": {
-                            "type": "array",
-                            "items": {
-                                "type": "string",
-                                "enum": ["info", "low", "medium", "high", "critical"]
-                            }
-                        },
-                        "tags": { "type": "array", "items": { "type": "string" } },
-                        "ids": { "type": "array", "items": { "type": "string" } },
-                        "applicable_to_path": { "type": "string" }
-                    }
-                },
-                "limit": { "type": "integer", "default": 20 },
-                "form": {
-                    "type": "string",
-                    "enum": ["summary", "full"],
-                    "default": "summary"
-                }
-            }
-        })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &rupu_tools::catalog::coverage::COVERAGE_CONCERNS_SEARCH
     }
 
     async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -619,7 +345,7 @@ form if `form: 'full'`. Use when the catalog is too large to inline in the promp
             serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
         let results = coverage_concerns_search(&self.catalog, parsed);
         let text = serde_json::to_string_pretty(&results).unwrap_or_else(|_| "[]".to_string());
-        Ok(ok_output(text, started))
+        Ok(ok_in(text, started))
     }
 }
 
@@ -633,23 +359,8 @@ pub struct CoverageConcernsDetailTool {
 
 #[async_trait]
 impl Tool for CoverageConcernsDetailTool {
-    fn name(&self) -> &'static str {
-        "coverage_concerns_detail"
-    }
-
-    fn description(&self) -> &'static str {
-        "Fetch full concern records by id. Use after coverage_concerns_search finds a \
-relevant concern and you need its full description, applicable_globs, or references."
-    }
-
-    fn input_schema(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "required": ["concern_ids"],
-            "properties": {
-                "concern_ids": { "type": "array", "items": { "type": "string" } }
-            }
-        })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &rupu_tools::catalog::coverage::COVERAGE_CONCERNS_DETAIL
     }
 
     async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -658,7 +369,7 @@ relevant concern and you need its full description, applicable_globs, or referen
             serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
         let out = coverage_concerns_detail(&self.catalog, parsed);
         let text = serde_json::to_string_pretty(&out).unwrap_or_else(|_| "{}".to_string());
-        Ok(ok_output(text, started))
+        Ok(ok_in(text, started))
     }
 }
 
@@ -679,31 +390,8 @@ impl AssetMarkTool {
 
 #[async_trait]
 impl Tool for AssetMarkTool {
-    fn name(&self) -> &'static str {
-        "asset_mark"
-    }
-
-    fn description(&self) -> &'static str {
-        "Record how deeply an engagement asset has been examined, as a rung of \
-         its profile's coverage depth ladder (monotonic — a shallower rung after \
-         a deeper one keeps the deeper one). The effective rung is returned."
-    }
-
-    fn input_schema(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "required": ["kind", "depth"],
-            "properties": {
-                "kind": { "type": "string", "description": "Profile-namespaced asset kind, e.g. \"network:service\"." },
-                "coordinates": {
-                    "type": "array",
-                    "description": "Locator coordinates pinning the asset, each {\"t\": <tag>, \"v\": <value>}.",
-                    "items": { "type": "object" }
-                },
-                "depth": { "type": "string", "description": "The depth-ladder rung reached, e.g. \"tested\"." },
-                "label": { "type": "string" }
-            }
-        })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &rupu_tools::catalog::findings::ASSETS_MARK
     }
 
     async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -714,13 +402,15 @@ impl Tool for AssetMarkTool {
         let engagement = self.engagement.clone();
         let res = tokio::task::spawn_blocking(move || asset_mark(&paths, parsed, &engagement))
             .await
-            .map_err(|join| ToolError::Execution(format!("asset_mark did not complete: {join}")))?;
+            .map_err(|join| {
+                ToolError::Execution(format!("assets.mark did not complete: {join}"))
+            })?;
         match res {
-            Ok(out) => Ok(ok_output(
+            Ok(out) => Ok(ok_in(
                 format!("asset {} is at depth `{}`", out.id, out.effective_depth),
                 started,
             )),
-            Err(e) => Ok(err_output(e.to_string(), started)),
+            Err(e) => Ok(failed_in(e.to_string(), started)),
         }
     }
 }
@@ -741,48 +431,27 @@ pub fn register(
 ) {
     let catalog = Arc::new(catalog);
     if let Some(engagement) = findings.engagement.clone() {
-        registry.insert(
-            "asset_mark",
-            Arc::new(AssetMarkTool {
-                paths: paths.clone(),
-                engagement,
-            }),
-        );
+        registry.insert(Arc::new(AssetMarkTool {
+            paths: paths.clone(),
+            engagement,
+        }));
     }
-    registry.insert(
-        "coverage_mark",
-        Arc::new(CoverageMarkTool {
-            paths: paths.clone(),
-            catalog: catalog.clone(),
-        }),
-    );
-    registry.insert(
-        "coverage_status",
-        Arc::new(CoverageStatusTool {
-            paths: paths.clone(),
-        }),
-    );
-    registry.insert(
-        "coverage_remaining",
-        Arc::new(CoverageRemainingTool {
-            paths: paths.clone(),
-            catalog: catalog.clone(),
-        }),
-    );
-    registry.insert(
-        "report_finding",
-        Arc::new(ReportFindingTool::new(paths, findings)),
-    );
-    registry.insert(
-        "coverage_concerns_search",
-        Arc::new(CoverageConcernsSearchTool {
-            catalog: catalog.clone(),
-        }),
-    );
-    registry.insert(
-        "coverage_concerns_detail",
-        Arc::new(CoverageConcernsDetailTool { catalog }),
-    );
+    registry.insert(Arc::new(CoverageMarkTool {
+        paths: paths.clone(),
+        catalog: catalog.clone(),
+    }));
+    registry.insert(Arc::new(CoverageStatusTool {
+        paths: paths.clone(),
+    }));
+    registry.insert(Arc::new(CoverageRemainingTool {
+        paths: paths.clone(),
+        catalog: catalog.clone(),
+    }));
+    registry.insert(Arc::new(ReportFindingTool::new(paths, findings)));
+    registry.insert(Arc::new(CoverageConcernsSearchTool {
+        catalog: catalog.clone(),
+    }));
+    registry.insert(Arc::new(CoverageConcernsDetailTool { catalog }));
 }
 
 // ---------------------------------------------------------------------------
@@ -803,20 +472,8 @@ impl QueryFindingsTool {
 
 #[async_trait]
 impl Tool for QueryFindingsTool {
-    fn name(&self) -> &'static str {
-        "query_findings"
-    }
-
-    fn description(&self) -> &'static str {
-        "List findings recorded in this project with a one-line query in `q` (e.g. \
-         `severity>=high tag:needs-poc -has:poc`). Returns one page of slim rows (id, title, \
-         severity, location, tags), `next_cursor`, `total`, and `tags_in_use` — reuse an \
-         existing tag where it fits. `all: true` returns every match unpaged, however many: \
-         page with `cursor` instead unless you need the whole set."
-    }
-
-    fn input_schema(&self) -> Value {
-        rupu_coverage::query_input_schema()
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &rupu_tools::catalog::findings::FINDINGS_QUERY
     }
 
     async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -831,13 +488,13 @@ impl Tool for QueryFindingsTool {
         })
         .await;
         match result {
-            Ok(Ok(v)) => Ok(ok_output(
+            Ok(Ok(v)) => Ok(ok_in(
                 serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".into()),
                 started,
             )),
-            Ok(Err(e)) => Ok(err_output(e, started)),
-            Err(join) => Ok(err_output(
-                format!("query_findings did not complete: {join}"),
+            Ok(Err(e)) => Ok(failed_in(e, started)),
+            Err(join) => Ok(failed_in(
+                format!("findings.query did not complete: {join}"),
                 started,
             )),
         }
@@ -857,20 +514,8 @@ impl TagFindingsTool {
 
 #[async_trait]
 impl Tool for TagFindingsTool {
-    fn name(&self) -> &'static str {
-        "tag_findings"
-    }
-
-    fn description(&self) -> &'static str {
-        "Add or remove tags on findings in this project, one or many at once. Tags are \
-         free-form: lowercase a-z, 0-9 and . _ : / -, starting with a letter or digit (e.g. \
-         class:sqli, needs-poc, status:triaged). Prefer tags already in use (query_findings \
-         lists them). An unknown finding id rejects the whole call; adding a tag a finding \
-         already has changes nothing. Returns each finding's tags before and after."
-    }
-
-    fn input_schema(&self) -> Value {
-        rupu_coverage::tag_input_schema()
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &rupu_tools::catalog::findings::FINDINGS_TAG
     }
 
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -879,21 +524,21 @@ impl Tool for TagFindingsTool {
             .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
         let change = match parsed.into_change() {
             Ok(c) => c,
-            Err(e) => return Ok(err_output(e.to_string(), started)),
+            Err(e) => return Ok(failed_in(e.to_string(), started)),
         };
-        let by = rupu_coverage::TagActor::Agent(attribution_from_ctx(ctx));
+        let by = rupu_coverage::TagActor::Agent(attribution_from(ctx));
         let log = self.log.clone();
         let result =
             tokio::task::spawn_blocking(move || rupu_coverage::apply(&log, &change, &by)).await;
         match result {
-            Ok(Ok(outcomes)) => Ok(ok_output(
+            Ok(Ok(outcomes)) => Ok(ok_in(
                 serde_json::to_string_pretty(&serde_json::json!({ "outcomes": outcomes }))
                     .unwrap_or_else(|_| "{}".into()),
                 started,
             )),
-            Ok(Err(e)) => Ok(err_output(e.to_string(), started)),
-            Err(join) => Ok(err_output(
-                format!("tag_findings did not complete: {join}"),
+            Ok(Err(e)) => Ok(failed_in(e.to_string(), started)),
+            Err(join) => Ok(failed_in(
+                format!("findings.tag did not complete: {join}"),
                 started,
             )),
         }
@@ -985,6 +630,7 @@ mod finding_verify_tests {
     use rupu_coverage::{
         read_findings, FindingProfile, FindingReport, FindingScope, FindingWriteOptions,
     };
+    use rupu_coverage::{Attribution, Surface};
 
     /// File a full-report finding as `run_id` (the same write path
     /// `report_finding` uses) and return its id.
@@ -1041,7 +687,7 @@ mod finding_verify_tests {
     fn schema_requires_id_and_status_and_offers_only_verdicts() {
         let tmp = tempfile::TempDir::new().unwrap();
         let tool = FindingVerifyTool::new(CoveragePaths::new(tmp.path(), "t"));
-        assert_eq!(tool.name(), "finding.verify");
+        assert_eq!(tool.name(), "findings.verify");
         let s = tool.input_schema();
         let req: Vec<&str> = s["required"]
             .as_array()
@@ -1234,8 +880,8 @@ mod finding_verify_tests {
             FindingWriteOptions::default(),
         );
         let names = registry.known_tools();
-        assert!(names.iter().any(|n| n == "report_finding"), "{names:?}");
+        assert!(names.iter().any(|n| n == "findings.report"), "{names:?}");
         // A verdict is an explicit `tools:` grant, never part of the bundle.
-        assert!(!names.iter().any(|n| n == "finding.verify"), "{names:?}");
+        assert!(!names.iter().any(|n| n == "findings.verify"), "{names:?}");
     }
 }

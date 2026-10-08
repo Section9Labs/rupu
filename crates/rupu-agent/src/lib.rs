@@ -45,11 +45,11 @@ pub use collector::{
 };
 pub use fd_budget::load_agent_admitted;
 pub use loader::{load_agent, load_agents, AgentLoadError};
-pub use permission::{parse_mode, resolve_mode, PermissionDecision, PermissionPrompt};
+pub use permission::{resolve_mode, PermissionPrompt};
 pub use recovery::{Hop, HopBuilder, RecoveryOpts};
 pub use runner::{
     compact_messages, run_agent, run_agent_full, run_agent_with_limits, AgentRunOpts,
-    BypassDecider, CompactionError, CompactionOutcome, MockProvider, OnToolCallCallback, OnUsageCallback, RunError,
+    CompactionError, CompactionOutcome, MockProvider, OnToolCallCallback, OnUsageCallback, RunError,
     RunExit, RunResult, ScriptedTurn, UsageKind, UsageTurn,
 };
 pub use rupu_providers::types::StopReason;

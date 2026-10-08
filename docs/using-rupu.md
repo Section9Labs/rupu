@@ -1257,7 +1257,7 @@ Keep reviewer agents read-only even if their `tools:` list names writable SCM to
 
 The `findings.*` MCP tools are never offered to an agent, even under `tools: ["*"]`: they need the
 run context only workflow `action:` steps have. Agents record, query and tag
-findings with the `report_finding`, `query_findings` and `tag_findings` builtins.
+findings with the `findings.report`, `findings.query` and `findings.tag` builtins.
 
 ---
 

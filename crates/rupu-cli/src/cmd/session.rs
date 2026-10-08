@@ -2,7 +2,7 @@ use crate::cmd::completers::{active_session_ids, archived_session_ids, session_i
 use crate::cmd::retention::parse_retention_duration;
 use crate::cmd::run::{
     canonicalize_if_exists, resolve_clone_dest, standalone_issue_ref, standalone_repo_ref,
-    standalone_workspace_strategy, ReadonlyDecider,
+    standalone_workspace_strategy,
 };
 use crate::cmd::transcript::{
     render_pretty_transcript_event, truncate_single_line, TranscriptPrettyContext,
@@ -38,8 +38,8 @@ use crossterm::style::Print;
 use crossterm::terminal;
 use crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
-use rupu_agent::runner::{AgentRunOpts, BypassDecider, PermissionDecider};
-use rupu_agent::{load_agent, parse_mode, resolve_mode};
+use rupu_agent::runner::AgentRunOpts;
+use rupu_agent::{load_agent, resolve_mode};
 use rupu_config::PricingConfig;
 use rupu_providers::model_tier::{ContextWindow, ThinkingLevel};
 use rupu_providers::types::{
@@ -49,7 +49,7 @@ use rupu_providers::types::{
 use rupu_providers::AuthMode;
 use rupu_runtime::provider_factory;
 use rupu_runtime::WorkerKind;
-use rupu_tools::{PermissionMode, ToolContext};
+use rupu_tools::{PermissionMode, PermissionPolicy, ToolContext};
 use rupu_transcript::{
     Event as TranscriptEvent, FileEditKind, JsonlReader, JsonlWriter, RunMode, RunStatus,
 };
@@ -1591,9 +1591,10 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     let cfg_paths = paths::config_paths(&global, project_root.as_deref(), &pwd)?;
     let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
 
-    let cli_mode = args.mode.as_deref().and_then(parse_mode);
-    let agent_mode = spec.permission_mode.as_deref().and_then(parse_mode);
-    let global_mode = cfg.permission_mode.as_deref().and_then(parse_mode);
+    let parse = |s: &str| PermissionMode::parse(s).ok();
+    let cli_mode = args.mode.as_deref().and_then(parse);
+    let agent_mode = spec.permission_mode.as_deref().and_then(parse);
+    let global_mode = cfg.permission_mode.as_deref().and_then(parse);
     let mode = resolve_mode(cli_mode, agent_mode, None, global_mode);
     if matches!(mode, PermissionMode::Ask) {
         anyhow::bail!(
@@ -1687,12 +1688,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
             .map(|p| p.default_model.as_str()),
     );
 
-    let mode_str = match mode {
-        PermissionMode::Ask => "ask",
-        PermissionMode::Bypass => "bypass",
-        PermissionMode::Readonly => "readonly",
-    }
-    .to_string();
+    let mode_str = mode.as_str().to_string();
 
     let repo_ref = standalone_repo_ref(run_target.as_ref(), &workspace_path);
     let issue_ref = standalone_issue_ref(run_target.as_ref());
@@ -7880,12 +7876,15 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             netflow_sink: Some(netflow_sink.clone()),
             net_capture: Some(net_capture),
             tool_call_id: None,
+            spawn_ceiling: None,
+            prompter: None,
         };
 
-        let decider: Arc<dyn PermissionDecider> = match session.permission_mode.as_str() {
-            "readonly" => Arc::new(ReadonlyDecider),
-            _ => Arc::new(BypassDecider),
-        };
+        // A session turn has no operator to prompt. An unreadable recorded
+        // mode fails closed to readonly.
+        let permission = PermissionPolicy::unattended(
+            PermissionMode::parse(&session.permission_mode).unwrap_or(PermissionMode::Readonly),
+        );
         let live_usage_state = Arc::new(Mutex::new(SessionLiveUsageWriterState::new(
             &session.provider_name,
             &session.model,
@@ -7987,12 +7986,11 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             workspace_path: session.workspace_path.clone(),
             transcript_path: transcript_path.clone(),
             max_turns: session.max_turns,
-            decider,
+            permission,
             tool_context,
             user_message: args.prompt.clone(),
             initial_messages: session.message_history.clone(),
             turn_index_offset: session.total_turns,
-            mode_str: session.permission_mode.clone(),
             no_stream: session.no_stream,
             suppress_stream_stdout: true,
             mcp_registry: Some(scm_registry),

@@ -103,7 +103,7 @@ rupu workflow run edge-sweep --engagement-profile network
 The rules:
 
 - **No selection** gives the native `code` path. This is not the same as
-  selecting `code`: no engagement is active, so `asset_mark` isn't offered and
+  selecting `code`: no engagement is active, so `assets.mark` isn't offered and
   `asset` arguments are ignored.
 - **An unknown id** fails the launch. It never falls back to a default.
 - **A kind claimed twice** is an error. If the same asset kind would come from
@@ -142,7 +142,7 @@ and every built-in check is `required = true`.
 
 ### Completeness, evidence and taxonomies
 
-The required checks are what `report_finding` enforces. **Evidence blocks**
+The required checks are what `findings.report` enforces. **Evidence blocks**
 and **taxonomies** describe the evidence and classification systems the
 engagement expects, but they're advisory. rupu enforces them only when a
 completeness check names one.
@@ -204,9 +204,9 @@ include cycle, or an include of a profile that doesn't exist, is a load error.
 Two tools write assets. Both write to the target's asset ledger,
 `.rupu/coverage/<target>/assets.jsonl`, which sits next to `findings.jsonl`.
 
-### `report_finding` with an `asset`
+### `findings.report` with an `asset`
 
-When an engagement is active, `report_finding` takes an optional `asset`. So does
+When an engagement is active, `findings.report` takes an optional `asset`. So does
 the MCP `findings.record` tool that a workflow `action:` step calls, with the same
 schema and handling:
 
@@ -246,9 +246,9 @@ check.
 
 `rupu findings import` records no asset.
 
-### `asset_mark`
+### `assets.mark`
 
-`asset_mark` records how far an asset has been examined:
+`assets.mark` records how far an asset has been examined:
 
 ```json
 { "kind": "web:route",
@@ -262,9 +262,9 @@ check.
 - **Depth only moves forward.** If an asset is already at `exploited`, marking
   it `tested` leaves it at `exploited`. The tool returns the rung that ends up
   recorded (`effective_depth`).
-- The engine offers `asset_mark`, and `report_finding`, to every agent in an
+- The engine offers `assets.mark`, and `findings.report`, to every agent in an
   engagement run, whatever the agent's `tools:` list says. Without an active
-  engagement, `asset_mark` doesn't exist.
+  engagement, `assets.mark` doesn't exist.
 
 ### The ledger and its views
 
@@ -337,12 +337,12 @@ built-in bundle lists must ship in the fleet, and every fleet file must be
 named by some bundle.
 
 **How the agents behave.** Every fleet agent runs in `bypass` mode and asks for
-the full tool set (`tools: ["*"]`) plus `report_finding`, `asset_mark`,
-`finding.verify`, `query_findings` and `tag_findings`. None of them has a target
+the full tool set (`tools: ["*"]`) plus `findings.report`, `assets.mark`,
+`findings.verify`, `findings.query` and `findings.tag`. None of them has a target
 built in: each reads its authorized scope from its task prompt (and the
 engagement's scope), treats it as a hard boundary, records what it finds with
-`asset_mark` at the right depth rung, and records verified issues with
-`report_finding`. Run them under the matching profile so `asset_mark` is
+`assets.mark` at the right depth rung, and records verified issues with
+`findings.report`. Run them under the matching profile so `assets.mark` is
 offered and their findings are checked against it:
 
 ```bash
@@ -361,7 +361,7 @@ coordinator, written to be an agentiflow's `lead:`. It does not test anything
 itself: it lists the pool (`agents.list`, `workflows.list`), dispatches
 discovery agents first, then analysis and testing agents over what they
 enumerated, then a verification pass, checking `goal.status`,
-`coverage.status` and `budget.status` between rounds and winding down when the
+`goal.coverage` and `budget.status` between rounds and winding down when the
 scope is covered or the budget runs low. An agentiflow that uses it puts it in
 both `lead:` and `pool.agents`, alongside the specialists:
 
@@ -459,7 +459,7 @@ assigns them to that kind and the file fails to parse.
 | Key | Type | Meaning |
 |-----|------|---------|
 | `enumerates` | string list | The bare kind ids that agentiflow coverage goals count by default |
-| `depth_ladder` | string list | Ordered rungs, shallowest first. `asset_mark` accepts only these. The last rung is the default target depth for a coverage goal. |
+| `depth_ladder` | string list | Ordered rungs, shallowest first. `assets.mark` accepts only these. The last rung is the default target depth for a coverage goal. |
 
 **`[bundle]`** holds `agents`, `workflows` and `tools`, all string lists. It's
 descriptive metadata: it names the definitions an engagement of this kind
@@ -570,9 +570,9 @@ rupu run --engagement-profile iot-fleet fleet-recon "assess the lab segment 192.
 
 During the run, the agent might call:
 
-- `asset_mark` with kind `iot-fleet:device`, coordinates
+- `assets.mark` with kind `iot-fleet:device`, coordinates
   `[{"t":"host","v":"192.0.2.7"}]` and depth `fingerprinted`.
-- `report_finding` with an `asset` of kind `iot-fleet:service`, pinned by
+- `findings.report` with an `asset` of kind `iot-fleet:service`, pinned by
   `host` `192.0.2.7` and `port` `{"number": 23, "proto": "tcp"}`, and a report
   that has a `scan_output` block and a CWE classification.
 
@@ -602,7 +602,7 @@ The three combine as follows:
   recorded, but its completeness checks are skipped. See
   [coverage.md → Finding reports](coverage.md#finding-reports).
 - **Concern catalogs are lists of things to check.** A catalog lists concerns
-  that an agent judges file by file (`coverage_mark`). It's independent of the
+  that an agent judges file by file (`coverage.mark`). It's independent of the
   engagement: a `code` engagement can use `owasp-top10-2021`, and so can a run
   with no engagement.
 

@@ -2,12 +2,11 @@
 //! An incomplete one is rejected with every problem listed; the agent fixes
 //! it and the retry records exactly one finding.
 
-use rupu_agent::runner::{BypassDecider, CapturingMockProvider, ScriptedTurn};
+use rupu_agent::runner::{CapturingMockProvider, ScriptedTurn};
 use rupu_agent::{run_agent, AgentRunOpts};
 use rupu_coverage::{target_id, CoveragePaths, FindingWriteOptions};
 use rupu_providers::types::StopReason;
 use rupu_tools::ToolContext;
-use std::sync::Arc;
 
 fn report() -> serde_json::Value {
     serde_json::from_str(include_str!(concat!(
@@ -48,7 +47,7 @@ fn opts(
         workspace_path: workspace.to_path_buf(),
         transcript_path: workspace.join("run.jsonl"),
         max_turns: 6,
-        decider: Arc::new(BypassDecider),
+        permission: rupu_tools::PermissionPolicy::bypass(),
         tool_context: ToolContext {
             workspace_path: workspace.to_path_buf(),
             findings: Some(FindingWriteOptions {
@@ -60,7 +59,6 @@ fn opts(
         user_message: "Assess.".into(),
         initial_messages: Vec::new(),
         turn_index_offset: 0,
-        mode_str: "bypass".into(),
         no_stream: true,
         suppress_stream_stdout: false,
         mcp_registry: None,

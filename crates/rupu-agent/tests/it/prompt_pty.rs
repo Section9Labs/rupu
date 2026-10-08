@@ -1,4 +1,5 @@
-use rupu_agent::permission::{PermissionDecision, PermissionPrompt};
+use rupu_agent::permission::PermissionPrompt;
+use rupu_tools::PromptAnswer;
 use std::io::{IsTerminal, Read, Write};
 use std::process::{Child, ExitStatus};
 use std::sync::mpsc::{self, Receiver};
@@ -14,7 +15,7 @@ fn allow_on_y() {
     let d = prompt
         .ask("bash", &serde_json::json!({"command": "ls"}), "/tmp/ws")
         .unwrap();
-    assert_eq!(d, PermissionDecision::Allow);
+    assert_eq!(d, PromptAnswer::Allow);
     let s = String::from_utf8(output).unwrap();
     assert!(s.contains("bash"), "prompt should mention tool name: {s}");
     assert!(
@@ -31,7 +32,7 @@ fn deny_on_n() {
     let d = prompt
         .ask("bash", &serde_json::json!({}), "/tmp/ws")
         .unwrap();
-    assert_eq!(d, PermissionDecision::Deny);
+    assert_eq!(d, PromptAnswer::Deny);
 }
 
 #[test]
@@ -42,7 +43,7 @@ fn always_on_a() {
     let d = prompt
         .ask("bash", &serde_json::json!({}), "/tmp/ws")
         .unwrap();
-    assert_eq!(d, PermissionDecision::AllowAlwaysForToolThisRun);
+    assert_eq!(d, PromptAnswer::AllowAlways);
 }
 
 #[test]
@@ -53,7 +54,7 @@ fn stop_on_s() {
     let d = prompt
         .ask("bash", &serde_json::json!({}), "/tmp/ws")
         .unwrap();
-    assert_eq!(d, PermissionDecision::StopRun);
+    assert_eq!(d, PromptAnswer::Stop);
 }
 
 #[test]
@@ -64,7 +65,7 @@ fn invalid_input_re_prompts_then_decides() {
     let d = prompt
         .ask("bash", &serde_json::json!({}), "/tmp/ws")
         .unwrap();
-    assert_eq!(d, PermissionDecision::Allow);
+    assert_eq!(d, PromptAnswer::Allow);
 }
 
 #[test]

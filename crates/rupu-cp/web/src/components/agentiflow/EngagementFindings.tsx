@@ -71,7 +71,7 @@ export default function EngagementFindings({ runId, live }: { runId: string; liv
     return (
       <EmptyState
         title="No findings recorded yet"
-        hint="A finding appears here once the lead (or a reviewer/assessor) records it with the report_finding tool. The engagement's goal often counts these."
+        hint="A finding appears here once the lead (or a reviewer/assessor) records it with the findings.report tool. The engagement's goal often counts these."
       />
     );
   }

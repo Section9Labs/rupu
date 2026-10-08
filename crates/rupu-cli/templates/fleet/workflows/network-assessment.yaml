@@ -15,7 +15,7 @@ steps:
       {{ inputs.scope }}
 
       Discover live hosts and enumerate open services/versions, calling
-      `asset_mark` for every host and service. Scan ONLY addresses inside the
+      `assets.mark` for every host and service. Scan ONLY addresses inside the
       scope above. Return a concise host:port worklist with service/version,
       flagging anything that already looks interesting.
   - id: analyze
@@ -28,7 +28,7 @@ steps:
 
       Authorized scope (hard boundary): {{ inputs.scope }}
 
-      Test each service, verify before reporting, and `report_finding` every
+      Test each service, verify before reporting, and `findings.report` every
       verified exposure (pinned to host:port, with root_cause, a CVE/CWE
       classification, and scan_output/http_exchange evidence). No destructive
       actions. Return a summary of what you tested and recorded.

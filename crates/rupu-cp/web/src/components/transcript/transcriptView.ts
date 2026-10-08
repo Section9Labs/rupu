@@ -10,7 +10,8 @@
  *   • the next `file_edit` is paired (by adjacency) onto the preceding
  *     `write_file` / `edit_file` tool; the next `command_run` onto the
  *     preceding `bash` tool.
- *   • findings are built from `report_finding` tool_calls (NOT `action_emitted`).
+ *   • findings are built from `findings.report` (legacy `report_finding`)
+ *     tool_calls (NOT `action_emitted`).
  *   • `tool_audit` (step `actions:` enforcement's audit trail) is paired onto
  *     a `tool_call` of the SAME tool name, FIFO per name — NOT by adjacency.
  *     A single turn can carry >1 `tool_use` block; `run_agent` writes every
@@ -221,7 +222,8 @@ function asStringArray(v: unknown): string[] {
 }
 
 /**
- * Parse a `report_finding` tool_call input into a FindingView.
+ * Parse a `findings.report` (legacy `report_finding`) tool_call input into a
+ * FindingView.
  * Returns null when the shape isn't a recognisable finding.
  *
  * Two input shapes exist, one per findings profile:
@@ -310,9 +312,14 @@ function commandFromArgv(argv: unknown[]): string {
   return isShellScript ? argv[2] : argv.join(' ');
 }
 
-/** Classify a tool by its name. `report_finding` is resolved separately. */
+/**
+ * Classify a tool by the name the model called it by: the canonical catalog
+ * name (`findings.report`) or a legacy alias (`report_finding`), which older
+ * transcripts and agent prompts still use.
+ */
 function classify(tool: string): ToolKind {
   switch (tool) {
+    case 'findings.report':
     case 'report_finding':
       return 'finding';
     case 'read_file':
@@ -335,7 +342,7 @@ function classify(tool: string): ToolKind {
     case 'ast_grep':
       return 'ast_grep';
     default:
-      return tool.startsWith('coverage_') ? 'coverage' : 'generic';
+      return tool.startsWith('coverage.') || tool.startsWith('coverage_') ? 'coverage' : 'generic';
   }
 }
 

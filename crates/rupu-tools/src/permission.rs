@@ -1,83 +1,267 @@
-//! Permission gating for tool calls. Three modes; all logic here is
-//! synchronous and pure. Interactive prompt UX (for `Ask` mode) lives
-//! in `rupu-cli` (Plan 2) and consumes this gate as a pure decision API.
+//! The one permission policy. Every tool call — agent loop, sub-agent, MCP
+//! dispatch — is decided by [`PermissionPolicy::decide`] from the tool's
+//! declared [`Effect`] and the run's [`PermissionMode`]. No permission code
+//! reads a tool's name.
 //!
-//! Mode resolution (CLI flag > agent frontmatter > project config >
-//! global config > default `Ask`) happens upstream of this gate; by
-//! the time a tool dispatch reaches `PermissionGate`, the mode is
-//! already chosen.
+//! | Effect ↓ / Mode → | bypass | ask + prompter | ask, no prompter | readonly |
+//! |---|---|---|---|---|
+//! | Read | allow | allow | allow | allow |
+//! | Record | allow | allow | allow | allow |
+//! | Write | allow | prompt | allow, degraded | deny |
+//! | External | allow | prompt | allow, degraded | deny |
+//! | Spawn | allow, ceiling bypass | allow, ceiling ask | allow, ceiling ask | allow, ceiling readonly |
+//!
+//! A child run's mode is `min(ceiling, child's own permissionMode)`
+//! ([`PermissionPolicy::ceiling_for_child`]), so a child never has more than
+//! its parent. Mode resolution (CLI flag > agent frontmatter > config >
+//! default `Ask`) happens upstream; [`PermissionMode::parse`] is the one
+//! parser of the mode word.
 
+use crate::descriptor::{Effect, ToolDescriptor};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeSet;
+use std::sync::Arc;
 
-/// Three permission modes the agent runtime can run in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// The three permission modes, ordered by what they allow:
+/// `Readonly < Ask < Bypass`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
-    /// Prompt the operator before each write-class tool call. Default.
-    Ask,
-    /// Allow all tool calls without prompting. Use for unattended runs.
-    Bypass,
-    /// Allow only read-class tools; deny writers outright.
+    /// Allow reads and rupu's own bookkeeping; deny workspace writes and
+    /// external actions outright; cap children at readonly.
     Readonly,
+    /// Prompt the operator before each write or external call. Default.
+    Ask,
+    /// Allow every call without prompting. Use for unattended runs.
+    Bypass,
 }
 
-/// Pure decision API for whether a tool call is allowed under a given
-/// permission mode. The interactive `Ask`-mode prompt UX lives in the
-/// CLI (Plan 2); this struct only answers yes/no/needs-decision.
-#[derive(Debug, Clone, Copy)]
-pub struct PermissionGate {
-    mode: PermissionMode,
-}
+/// A mode word that isn't `ask`, `bypass` or `readonly`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown permission mode `{0}` (expected ask, bypass or readonly)")]
+pub struct UnknownMode(pub String);
 
-const KNOWN_READ_TOOLS: &[&str] = &["read_file", "grep", "glob", "ast_grep"];
-const KNOWN_WRITE_TOOLS: &[&str] = &["bash", "write_file", "edit_file"];
-
-impl PermissionGate {
-    /// Construct a gate for the given mode.
-    pub fn for_mode(mode: PermissionMode) -> Self {
-        Self { mode }
+impl PermissionMode {
+    /// Parse the mode word used by `--mode`, frontmatter `permissionMode:`
+    /// and config `permission_mode`. The one parser.
+    pub fn parse(s: &str) -> Result<Self, UnknownMode> {
+        match s {
+            "ask" => Ok(Self::Ask),
+            "bypass" => Ok(Self::Bypass),
+            "readonly" => Ok(Self::Readonly),
+            other => Err(UnknownMode(other.to_string())),
+        }
     }
 
-    /// The mode this gate was constructed with.
+    /// The mode word.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Bypass => "bypass",
+            Self::Readonly => "readonly",
+        }
+    }
+}
+
+impl std::fmt::Display for PermissionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What the operator is asked about.
+#[derive(Debug, Clone)]
+pub struct PromptRequest<'a> {
+    /// Canonical name of the tool.
+    pub tool: &'a str,
+    pub effect: Effect,
+    pub input: &'a Value,
+}
+
+/// The operator's answer to a prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptAnswer {
+    /// Allow this one call.
+    Allow,
+    /// Allow this tool (only this tool) for the rest of the run.
+    AllowAlways,
+    /// Deny this one call; the agent sees `permission_denied`.
+    Deny,
+    /// Stop the run.
+    Stop,
+}
+
+/// Asks the operator about one call. Implemented by the CLI's TTY prompt.
+/// One prompter may be shared by a run and its sub-agents, so an
+/// implementation serializes its own prompts.
+pub trait Prompter: Send + Sync {
+    fn ask(&self, req: &PromptRequest<'_>) -> PromptAnswer;
+}
+
+/// Why a call was denied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenyReason {
+    /// Readonly mode denies workspace writes and external actions.
+    Readonly,
+    /// The operator answered no.
+    OperatorDenied,
+}
+
+/// The decision for one call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    Allow,
+    /// Allowed only because ask mode has no operator in this run (D5): the
+    /// caller reports that once (`permission_mode_degraded`).
+    AllowDegraded,
+    Deny {
+        reason: DenyReason,
+    },
+    /// Allowed; any child run this call starts is capped at `ceiling`.
+    Spawn {
+        ceiling: PermissionMode,
+    },
+    /// The operator stopped the run.
+    Stop,
+}
+
+/// The canonical names of the tools the operator chose "allow always" for in
+/// this run. Keyed by tool, never by mode: allowing one tool always never
+/// allows another (T4).
+#[derive(Debug, Clone, Default)]
+pub struct AllowAlways(BTreeSet<&'static str>);
+
+impl AllowAlways {
+    pub fn contains(&self, tool: &str) -> bool {
+        self.0.contains(tool)
+    }
+
+    pub fn insert(&mut self, tool: &'static str) {
+        self.0.insert(tool);
+    }
+}
+
+/// A run's permission policy: its mode and, when an operator is present, the
+/// prompter that asks them.
+#[derive(Clone)]
+pub struct PermissionPolicy {
+    mode: PermissionMode,
+    prompter: Option<Arc<dyn Prompter>>,
+}
+
+impl std::fmt::Debug for PermissionPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PermissionPolicy")
+            .field("mode", &self.mode)
+            .field("prompter", &self.prompter.as_ref().map(|_| "<prompter>"))
+            .finish()
+    }
+}
+
+impl PermissionPolicy {
+    pub fn new(mode: PermissionMode, prompter: Option<Arc<dyn Prompter>>) -> Self {
+        Self { mode, prompter }
+    }
+
+    /// `mode` with no operator to prompt (detached runs, workflow steps,
+    /// sessions, flows, tests).
+    pub fn unattended(mode: PermissionMode) -> Self {
+        Self::new(mode, None)
+    }
+
+    /// Bypass with no prompter.
+    pub fn bypass() -> Self {
+        Self::unattended(PermissionMode::Bypass)
+    }
+
     pub fn mode(&self) -> PermissionMode {
         self.mode
     }
 
-    /// True if `tool` can run with no operator decision under this
-    /// mode. False either because the tool is denied outright
-    /// (readonly + writer, unknown tool) OR because it needs a
-    /// decision (ask + writer — see [`Self::requires_decision`]).
-    pub fn allow_unconditionally(&self, tool: &str) -> bool {
-        let is_read = KNOWN_READ_TOOLS.contains(&tool);
-        let is_write = KNOWN_WRITE_TOOLS.contains(&tool);
-        if !is_read && !is_write {
-            // Unknown tool: never allow without explicit thought, even
-            // under bypass. The runtime will refuse to dispatch it
-            // anyway, but the gate also says no.
-            return false;
-        }
-        match self.mode {
-            PermissionMode::Bypass => true,
-            PermissionMode::Readonly => is_read,
-            PermissionMode::Ask => is_read,
+    pub fn prompter(&self) -> Option<&Arc<dyn Prompter>> {
+        self.prompter.as_ref()
+    }
+
+    /// Decide one call of the tool `d` with `input`. `always` is the run's
+    /// "allow always" set; an `AllowAlways` answer adds `d`'s canonical name.
+    pub fn decide(&self, d: &ToolDescriptor, input: &Value, always: &mut AllowAlways) -> Decision {
+        self.decide_call(d.name, d.effect, input, always)
+    }
+
+    /// [`Self::decide`] for a tool known by canonical name and effect rather
+    /// than by descriptor (the MCP dispatcher's catalog entries).
+    pub fn decide_call(
+        &self,
+        tool: &'static str,
+        effect: Effect,
+        input: &Value,
+        always: &mut AllowAlways,
+    ) -> Decision {
+        match effect {
+            Effect::Read | Effect::Record => Decision::Allow,
+            Effect::Spawn => Decision::Spawn { ceiling: self.mode },
+            Effect::Write | Effect::External => match self.mode {
+                PermissionMode::Bypass => Decision::Allow,
+                PermissionMode::Readonly => Decision::Deny {
+                    reason: DenyReason::Readonly,
+                },
+                PermissionMode::Ask => {
+                    let Some(prompter) = self.prompter.as_ref() else {
+                        return Decision::AllowDegraded;
+                    };
+                    if always.contains(tool) {
+                        return Decision::Allow;
+                    }
+                    let req = PromptRequest {
+                        tool,
+                        effect,
+                        input,
+                    };
+                    match prompter.ask(&req) {
+                        PromptAnswer::Allow => Decision::Allow,
+                        PromptAnswer::AllowAlways => {
+                            always.insert(tool);
+                            Decision::Allow
+                        }
+                        PromptAnswer::Deny => Decision::Deny {
+                            reason: DenyReason::OperatorDenied,
+                        },
+                        PromptAnswer::Stop => Decision::Stop,
+                    }
+                }
+            },
         }
     }
 
-    /// True if `tool` needs an operator decision before running. The
-    /// CLI's interactive prompt only fires when this returns true.
-    pub fn requires_decision(&self, tool: &str) -> bool {
-        let is_write = KNOWN_WRITE_TOOLS.contains(&tool);
-        matches!(self.mode, PermissionMode::Ask) && is_write
+    /// The child ceiling rule (D7): the most restrictive of this run's mode
+    /// and the child's own declared `permissionMode`.
+    pub fn ceiling_for_child(&self, child_declared: Option<PermissionMode>) -> PermissionMode {
+        child_cap(self.mode, child_declared)
     }
 
-    /// True if the tool is denied outright — no decision will help.
-    /// Used by the CLI to short-circuit before the prompt UX.
-    pub fn denied_outright(&self, tool: &str) -> bool {
-        let is_write = KNOWN_WRITE_TOOLS.contains(&tool);
-        let is_read = KNOWN_READ_TOOLS.contains(&tool);
-        if !is_read && !is_write {
-            return true;
-        }
-        matches!(self.mode, PermissionMode::Readonly) && is_write
+    /// The policy a child run started under `ceiling` runs with: the capped
+    /// mode, and this run's prompter (an interactive parent's operator
+    /// answers its children's prompts too).
+    pub fn for_child(
+        ceiling: PermissionMode,
+        child_declared: Option<PermissionMode>,
+        prompter: Option<Arc<dyn Prompter>>,
+    ) -> Self {
+        Self::new(child_cap(ceiling, child_declared), prompter)
     }
 }
+
+/// `min(ceiling, child_declared)`; an undeclared child gets the ceiling.
+fn child_cap(ceiling: PermissionMode, child_declared: Option<PermissionMode>) -> PermissionMode {
+    match child_declared {
+        Some(child) => ceiling.min(child),
+        None => ceiling,
+    }
+}
+
+/// The notice the agent loop writes, once, the first time ask mode allows a
+/// write or external call because the run has no operator (D5).
+pub const DEGRADED_NOTICE_KIND: &str = "permission_mode_degraded";
+pub const DEGRADED_NOTICE_MESSAGE: &str =
+    "ask mode has no operator in this run; write/external tools run without prompting";

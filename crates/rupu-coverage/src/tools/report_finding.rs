@@ -97,7 +97,7 @@ pub enum ReportFindingError {
     },
     #[error("`{0}` is required under the summary findings profile")]
     MissingField(&'static str),
-    #[error("this step records findings under the full profile: `report` is required (see the report_finding tool schema)")]
+    #[error("this step records findings under the full profile: `report` is required (see the findings.report tool schema)")]
     ReportRequired,
     #[error("this step records findings under the summary profile: omit `report`, or have the workflow author set findings_profile: full")]
     ReportInSummaryMode,

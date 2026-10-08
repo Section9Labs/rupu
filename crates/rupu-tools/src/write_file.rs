@@ -6,6 +6,7 @@
 //! refused via `error: Some(...)` on the ToolOutput. Intermediate
 //! directories are created as needed (mkdir -p semantics).
 
+use crate::descriptor::{Effect, ToolDescriptor};
 use crate::path_scope::is_inside;
 use crate::tool::{render_file_edit_diff, DerivedEvent, Tool, ToolContext, ToolError, ToolOutput};
 use async_trait::async_trait;
@@ -25,31 +26,37 @@ struct Input {
 #[derive(Debug, Default, Clone)]
 pub struct WriteFileTool;
 
+/// This tool's descriptor.
+pub static DESCRIPTOR: ToolDescriptor = ToolDescriptor {
+    name: "write_file",
+    aliases: &[],
+    effect: Effect::Write,
+    needs: &[],
+    description: "Create a file or overwrite an existing one in the workspace. Use this for new files; for edits to existing files prefer `edit_file` to preserve unrelated content. Intermediate directories are created as needed. Paths must be inside the workspace root.",
+    input_schema: descriptor_schema,
+};
+
+fn descriptor_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Path relative to the workspace root."
+            },
+            "content": {
+                "type": "string",
+                "description": "Full content of the file. Existing content is replaced."
+            }
+        },
+        "required": ["path", "content"]
+    })
+}
+
 #[async_trait]
 impl Tool for WriteFileTool {
-    fn name(&self) -> &'static str {
-        "write_file"
-    }
-
-    fn description(&self) -> &'static str {
-        "Create a file or overwrite an existing one in the workspace. Use this for new files; for edits to existing files prefer `edit_file` to preserve unrelated content. Intermediate directories are created as needed. Paths must be inside the workspace root."
-    }
-
-    fn input_schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Path relative to the workspace root."
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Full content of the file. Existing content is replaced."
-                }
-            },
-            "required": ["path", "content"]
-        })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &DESCRIPTOR
     }
 
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {

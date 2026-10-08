@@ -26,8 +26,9 @@
 //! See `docs/superpowers/specs/2026-05-08-rupu-sub-agent-dispatch-design.md`
 //! § 3.1 for the on-the-wire request / response shape.
 
+use crate::descriptor::{Effect, Service, ToolDescriptor};
 use crate::dispatch_agent::MAX_DEPTH;
-use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
+use crate::tool::{SpawnPermission, Tool, ToolContext, ToolError, ToolOutput};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -61,55 +62,61 @@ struct AgentRequest {
 #[derive(Debug, Default, Clone)]
 pub struct DispatchAgentsParallelTool;
 
-#[async_trait]
-impl Tool for DispatchAgentsParallelTool {
-    fn name(&self) -> &'static str {
-        "dispatch_agents_parallel"
-    }
+/// This tool's descriptor.
+pub static DESCRIPTOR: ToolDescriptor = ToolDescriptor {
+    name: "dispatch_agents_parallel",
+    aliases: &[],
+    effect: Effect::Spawn,
+    needs: &[Service::Launcher],
+    description: "Run several agents in parallel and aggregate their results. Provide a list of `agents`, each with `{ id, agent, prompt }`. Every agent must appear in this agent's dispatchableAgents allowlist. Returns a map keyed by `id` with each child's output, tokens, and transcript. Use this when N specialist reviews can run independently — for sequential or single-child dispatches use `dispatch_agent` instead.",
+    input_schema: descriptor_schema,
+};
 
-    fn description(&self) -> &'static str {
-        "Run several agents in parallel and aggregate their results. Provide a list of `agents`, each with `{ id, agent, prompt }`. Every agent must appear in this agent's dispatchableAgents allowlist. Returns a map keyed by `id` with each child's output, tokens, and transcript. Use this when N specialist reviews can run independently — for sequential or single-child dispatches use `dispatch_agent` instead."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "agents": {
-                    "type": "array",
-                    "minItems": 1,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "id": {
-                                "type": "string",
-                                "description": "Caller-chosen key. Distinguishes children in the result map and child-frame headline."
-                            },
-                            "agent": {
-                                "type": "string",
-                                "description": "Agent name. Must appear in dispatchableAgents."
-                            },
-                            "prompt": {
-                                "type": "string",
-                                "description": "Initial user message for the child agent."
-                            },
-                            "inputs": {
-                                "type": "object",
-                                "description": "Optional structured inputs forwarded alongside the prompt.",
-                                "additionalProperties": true
-                            }
+fn descriptor_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "agents": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "Caller-chosen key. Distinguishes children in the result map and child-frame headline."
                         },
-                        "required": ["id", "agent", "prompt"]
-                    }
-                },
-                "max_parallel": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "Concurrency cap. Defaults to the number of agents (full parallelism)."
+                        "agent": {
+                            "type": "string",
+                            "description": "Agent name. Must appear in dispatchableAgents."
+                        },
+                        "prompt": {
+                            "type": "string",
+                            "description": "Initial user message for the child agent."
+                        },
+                        "inputs": {
+                            "type": "object",
+                            "description": "Optional structured inputs forwarded alongside the prompt.",
+                            "additionalProperties": true
+                        }
+                    },
+                    "required": ["id", "agent", "prompt"]
                 }
             },
-            "required": ["agents"]
-        })
+            "max_parallel": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Concurrency cap. Defaults to the number of agents (full parallelism)."
+            }
+        },
+        "required": ["agents"]
+    })
+}
+
+#[async_trait]
+impl Tool for DispatchAgentsParallelTool {
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &DESCRIPTOR
     }
 
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -195,12 +202,14 @@ impl Tool for DispatchAgentsParallelTool {
 
         let parent_depth = ctx.depth;
         let parent_codename = ctx.codename.clone();
+        let permission = SpawnPermission::from_ctx(ctx);
         let mut handles = Vec::with_capacity(i.agents.len());
         for (idx, req) in i.agents.iter().cloned().enumerate() {
             let permit_sem = Arc::clone(&semaphore);
             let dispatcher = dispatcher.clone();
             let parent_run_id = parent_run_id.clone();
             let parent_codename = parent_codename.clone();
+            let permission = permission.clone();
             let child_prompt = render_child_prompt(&req.prompt, req.inputs.as_ref());
             handles.push(tokio::spawn(async move {
                 let _permit = permit_sem
@@ -214,6 +223,7 @@ impl Tool for DispatchAgentsParallelTool {
                         &parent_run_id,
                         parent_depth,
                         parent_codename.as_deref(),
+                        permission,
                     )
                     .await;
                 (idx, req, outcome)
@@ -361,6 +371,7 @@ mod tests {
             _parent_run_id: &str,
             _parent_depth: u32,
             parent_codename: Option<&str>,
+            _permission: crate::tool::SpawnPermission,
         ) -> Result<DispatchOutcome, DispatchError> {
             self.seen_parent_codenames
                 .lock()

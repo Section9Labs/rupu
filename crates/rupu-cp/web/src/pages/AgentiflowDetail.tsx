@@ -322,7 +322,7 @@ export default function AgentiflowDetail() {
             emptyHint={
               <>
                 This engagement hasn’t recorded assets yet — a fleet records them with the{' '}
-                <span className="font-mono">asset_mark</span> tool as it discovers hosts, services, sites or routes. They
+                <span className="font-mono">assets.mark</span> tool as it discovers hosts, services, sites or routes. They
                 also appear on the <Link to="/assets" className="text-brand-600 hover:underline">Assets</Link> page.
               </>
             }

@@ -5,7 +5,7 @@ expression: rendered
 ---
 ## Coverage Catalog
 
-You are reviewing this workspace against the following concerns. For each (file × concern) you assess, call `coverage_mark` with the appropriate status. For each issue you discover, call `report_finding`. Files you read, grep, or edit are tracked automatically — you do not need to declare them.
+You are reviewing this workspace against the following concerns. For each (file × concern) you assess, call `coverage.mark` with the appropriate status. For each issue you discover, call `findings.report`. Files you read, grep, or edit are tracked automatically — you do not need to declare them.
 
 ### stride:denial-of-service
 **Name:** Denial of Service — availability

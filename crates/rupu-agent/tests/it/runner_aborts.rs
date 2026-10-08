@@ -1,8 +1,7 @@
-use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
+use rupu_agent::runner::{MockProvider, ScriptedTurn};
 use rupu_agent::{run_agent, AgentRunOpts, RunError};
 use rupu_providers::types::StopReason;
 use rupu_tools::ToolContext;
-use std::sync::Arc;
 
 fn opts(
     provider: MockProvider,
@@ -25,12 +24,11 @@ fn opts(
         workspace_path: ws,
         transcript_path: transcript,
         max_turns,
-        decider: Arc::new(BypassDecider),
+        permission: rupu_tools::PermissionPolicy::bypass(),
         tool_context: ToolContext::default(),
         user_message: "go".into(),
         initial_messages: Vec::new(),
         turn_index_offset: 0,
-        mode_str: "bypass".into(),
         no_stream: false,
         suppress_stream_stdout: false,
         mcp_registry: None,

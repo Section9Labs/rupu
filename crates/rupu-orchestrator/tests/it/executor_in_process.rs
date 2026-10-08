@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
+use rupu_agent::runner::{MockProvider, ScriptedTurn};
 use rupu_agent::AgentRunOpts;
 use rupu_orchestrator::executor::{
     Event, InProcessExecutor, RunFilter, WorkflowExecutor, WorkflowRunOpts,
@@ -52,12 +52,11 @@ impl StepFactory for FakeFactory {
             workspace_path,
             transcript_path,
             max_turns: 5,
-            decider: Arc::new(BypassDecider),
+            permission: rupu_tools::PermissionPolicy::bypass(),
             tool_context: ToolContext::default(),
             user_message: rendered_prompt,
             initial_messages: Vec::new(),
             turn_index_offset: 0,
-            mode_str: "bypass".into(),
             no_stream: false,
             suppress_stream_stdout: false,
             mcp_registry: None,

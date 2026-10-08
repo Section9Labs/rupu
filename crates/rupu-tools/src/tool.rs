@@ -7,6 +7,8 @@
 //! `tool_result`, which the transcript layer indexes for cheap
 //! "all file edits in this run" queries.
 
+use crate::descriptor::ToolDescriptor;
+use crate::permission::{PermissionMode, PermissionPolicy, Prompter};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -138,6 +140,17 @@ pub struct ToolContext {
     /// `None` = no customer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub customer: Option<String>,
+    /// The ceiling a child run this call starts is capped at: set by the
+    /// agent loop for a `Spawn` call from [`Decision::Spawn`]. `None` (a tool
+    /// invoked without a permission decision) caps a child at readonly.
+    ///
+    /// [`Decision::Spawn`]: crate::permission::Decision::Spawn
+    #[serde(skip)]
+    pub spawn_ceiling: Option<PermissionMode>,
+    /// The run's operator prompter, when it has one: a child run started by
+    /// this call asks the same operator.
+    #[serde(skip)]
+    pub prompter: Option<Arc<dyn Prompter>>,
 }
 
 // Hand-written because the netflow trait objects are not `Debug`.
@@ -171,6 +184,8 @@ impl std::fmt::Debug for ToolContext {
             )
             .field("tool_call_id", &self.tool_call_id)
             .field("customer", &self.customer)
+            .field("spawn_ceiling", &self.spawn_ceiling)
+            .field("prompter", &self.prompter.as_ref().map(|_| "<prompter>"))
             .finish()
     }
 }
@@ -199,7 +214,43 @@ impl Default for ToolContext {
             net_capture: None,
             tool_call_id: None,
             customer: None,
+            spawn_ceiling: None,
+            prompter: None,
         }
+    }
+}
+
+/// What a child run started by a `Spawn` call is allowed: the ceiling the
+/// permission decision set, and the operator prompter to share.
+#[derive(Clone)]
+pub struct SpawnPermission {
+    pub ceiling: PermissionMode,
+    pub prompter: Option<Arc<dyn Prompter>>,
+}
+
+impl SpawnPermission {
+    /// The spawn permission of the call `ctx` describes. A call that reached
+    /// the tool without a permission decision gets readonly (fail closed).
+    pub fn from_ctx(ctx: &ToolContext) -> Self {
+        Self {
+            ceiling: ctx.spawn_ceiling.unwrap_or(PermissionMode::Readonly),
+            prompter: ctx.prompter.clone(),
+        }
+    }
+
+    /// The policy the child runs under: `min(ceiling, child's own mode)`
+    /// (D7), with the shared prompter.
+    pub fn child_policy(&self, child_declared: Option<PermissionMode>) -> PermissionPolicy {
+        PermissionPolicy::for_child(self.ceiling, child_declared, self.prompter.clone())
+    }
+}
+
+impl std::fmt::Debug for SpawnPermission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpawnPermission")
+            .field("ceiling", &self.ceiling)
+            .field("prompter", &self.prompter.as_ref().map(|_| "<prompter>"))
+            .finish()
     }
 }
 
@@ -220,6 +271,10 @@ pub trait AgentDispatcher: Send + Sync + std::fmt::Debug {
     /// ([`ToolContext::codename`]); the dispatcher mints the child's
     /// `<parent>><role>#n` name from it. `None` (a legacy caller with no
     /// codename) leaves the child unnamed.
+    ///
+    /// `permission` caps the child (D7): it runs under
+    /// [`SpawnPermission::child_policy`] of its own declared
+    /// `permissionMode`, never above the parent's ceiling.
     async fn dispatch(
         &self,
         agent_name: &str,
@@ -227,6 +282,7 @@ pub trait AgentDispatcher: Send + Sync + std::fmt::Debug {
         parent_run_id: &str,
         parent_depth: u32,
         parent_codename: Option<&str>,
+        permission: SpawnPermission,
     ) -> Result<DispatchOutcome, DispatchError>;
 }
 
@@ -384,26 +440,33 @@ pub fn render_file_edit_diff(path: &str, before: Option<&str>, after: Option<&st
     out
 }
 
-/// One verb the agent can invoke. Implementations live one per file
-/// in this crate (`bash.rs`, `read_file.rs`, etc).
+/// One verb the agent can invoke. What the tool *is* — name, aliases,
+/// effect, needs, description, schema — is its [`ToolDescriptor`]; the
+/// agent runtime decides permission from the descriptor's effect alone.
 #[async_trait]
 pub trait Tool: Send + Sync {
-    /// Stable tool name used in agent files and tool calls. The
-    /// agent runtime dispatches on this string.
-    fn name(&self) -> &'static str;
-
-    /// Human-readable description shown to the LLM. Should explain
-    /// what the tool does, when to use it, and any pitfalls.
-    fn description(&self) -> &'static str;
-
-    /// JSON Schema describing the tool's input. Sent to the LLM as
-    /// part of the request so it knows how to call the tool. Format
-    /// matches Anthropic's tool-use input_schema convention.
-    fn input_schema(&self) -> serde_json::Value;
+    /// The tool's static declaration (see [`crate::catalog`]).
+    fn descriptor(&self) -> &'static ToolDescriptor;
 
     /// Invoke the tool with JSON-encoded input. The boxed `Send +
     /// Sync` future makes this trait object-safe for `Box<dyn Tool>`.
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError>;
+
+    /// Canonical name the model sees and the runtime dispatches on.
+    fn name(&self) -> &'static str {
+        self.descriptor().name
+    }
+
+    /// Human-readable description shown to the LLM.
+    fn description(&self) -> &'static str {
+        self.descriptor().description
+    }
+
+    /// JSON Schema of the tool's input, sent to the LLM. Overridden only by
+    /// a tool whose schema depends on its run.
+    fn input_schema(&self) -> serde_json::Value {
+        (self.descriptor().input_schema)()
+    }
 }
 
 #[cfg(test)]

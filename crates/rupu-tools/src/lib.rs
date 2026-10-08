@@ -7,17 +7,20 @@
 //! - [`grep`] — search across the workspace (ripgrep-backed).
 //! - [`glob`] — file pattern matching.
 //!
-//! All tools implement the [`Tool`] trait. Permission gating (the
-//! `ask` / `bypass` / `readonly` modes) lives in [`permission`] and
-//! is consumed by the agent runtime in Plan 2 — tools themselves
-//! are not aware of permission state.
+//! All tools implement the [`Tool`] trait and declare a
+//! [`ToolDescriptor`] (name, aliases, [`Effect`], needs). [`catalog`] lists
+//! every descriptor rupu defines. Permission is [`PermissionPolicy`]: a pure
+//! function of a descriptor's effect and the run's [`PermissionMode`] —
+//! tools themselves are not aware of permission state.
 
-pub mod tool;
+pub mod catalog;
 pub mod coverage_emit;
+pub mod descriptor;
+pub mod output;
+pub mod tool;
 
 mod path_scope;
 
-// implemented in Task 18 (PermissionGate decision API)
 pub mod permission;
 // implemented in Task 19 (line-numbered output + workspace-scope check)
 pub mod read_file;
@@ -45,10 +48,15 @@ pub use dispatch_agents_parallel::DispatchAgentsParallelTool;
 pub use edit_file::EditFileTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
-pub use permission::{PermissionGate, PermissionMode};
+pub use catalog::ToolCatalog;
+pub use descriptor::{Alias, AliasScope, Effect, Service, ToolDescriptor};
+pub use permission::{
+    AllowAlways, Decision, DenyReason, PermissionMode, PermissionPolicy, PromptAnswer,
+    PromptRequest, Prompter, UnknownMode,
+};
 pub use read_file::ReadFileTool;
 pub use tool::{
-    AgentDispatcher, DerivedEvent, DispatchError, DispatchOutcome, Tool, ToolContext, ToolError,
-    ToolOutput,
+    AgentDispatcher, DerivedEvent, DispatchError, DispatchOutcome, SpawnPermission, Tool,
+    ToolContext, ToolError, ToolOutput,
 };
 pub use write_file::WriteFileTool;

@@ -16,7 +16,7 @@ use assert_fs::prelude::*;
 
 /// Turn 0 asks to write a file; turn 1 ends the run. Under `bypass` the file
 /// lands on disk; under `readonly` the `write_file` call is denied
-/// (`ReadonlyDecider`) and the run still completes normally.
+/// (readonly `PermissionPolicy`) and the run still completes normally.
 const WRITE_SCRIPT: &str = r#"
 [
   { "AssistantToolUse": { "text": null, "tool_id": "call_1", "tool_name": "write_file", "tool_input": {"path": "locked.txt", "content": "written"}, "stop": "tool_use" } },

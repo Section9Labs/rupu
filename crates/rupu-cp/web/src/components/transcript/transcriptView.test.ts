@@ -341,6 +341,11 @@ describe('buildTranscriptView — tool kinds', () => {
     expect(kindOf('dispatch_agents_parallel')).toBe('subrun');
     expect(kindOf('coverage_status')).toBe('coverage');
     expect(kindOf('coverage_remaining')).toBe('coverage');
+    // Canonical catalog names (W1) classify as their legacy aliases do.
+    expect(kindOf('coverage.status')).toBe('coverage');
+    expect(kindOf('coverage.concerns.search')).toBe('coverage');
+    expect(kindOf('findings.report')).toBe('finding');
+    expect(kindOf('report_finding')).toBe('finding');
     expect(kindOf('something_else')).toBe('generic');
   });
 });

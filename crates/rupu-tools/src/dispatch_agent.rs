@@ -26,7 +26,8 @@
 //!
 //! See `docs/superpowers/specs/2026-05-08-rupu-sub-agent-dispatch-design.md`.
 
-use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
+use crate::descriptor::{Effect, Service, ToolDescriptor};
+use crate::tool::{SpawnPermission, Tool, ToolContext, ToolError, ToolOutput};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -54,36 +55,42 @@ struct Input {
 #[derive(Debug, Default, Clone)]
 pub struct DispatchAgentTool;
 
+/// This tool's descriptor.
+pub static DESCRIPTOR: ToolDescriptor = ToolDescriptor {
+    name: "dispatch_agent",
+    aliases: &[],
+    effect: Effect::Spawn,
+    needs: &[Service::Launcher],
+    description: "Run another agent synchronously as a tool call. Provide the child agent's name (must appear in this agent's dispatchableAgents frontmatter) and a prompt. The child runs to completion in its own context; you receive its final assistant text plus token + duration accounting. Use this to delegate review, search, or specialist tasks to a focused sub-agent.",
+    input_schema: descriptor_schema,
+};
+
+fn descriptor_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "agent": {
+                "type": "string",
+                "description": "Name of the agent to dispatch. Must be in the parent's dispatchableAgents list."
+            },
+            "prompt": {
+                "type": "string",
+                "description": "Initial user message the child agent receives."
+            },
+            "inputs": {
+                "type": "object",
+                "description": "Optional structured inputs forwarded into the child's prompt. Renders alongside `prompt` as a JSON block.",
+                "additionalProperties": true
+            }
+        },
+        "required": ["agent", "prompt"]
+    })
+}
+
 #[async_trait]
 impl Tool for DispatchAgentTool {
-    fn name(&self) -> &'static str {
-        "dispatch_agent"
-    }
-
-    fn description(&self) -> &'static str {
-        "Run another agent synchronously as a tool call. Provide the child agent's name (must appear in this agent's dispatchableAgents frontmatter) and a prompt. The child runs to completion in its own context; you receive its final assistant text plus token + duration accounting. Use this to delegate review, search, or specialist tasks to a focused sub-agent."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "agent": {
-                    "type": "string",
-                    "description": "Name of the agent to dispatch. Must be in the parent's dispatchableAgents list."
-                },
-                "prompt": {
-                    "type": "string",
-                    "description": "Initial user message the child agent receives."
-                },
-                "inputs": {
-                    "type": "object",
-                    "description": "Optional structured inputs forwarded into the child's prompt. Renders alongside `prompt` as a JSON block.",
-                    "additionalProperties": true
-                }
-            },
-            "required": ["agent", "prompt"]
-        })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &DESCRIPTOR
     }
 
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -155,6 +162,7 @@ impl Tool for DispatchAgentTool {
                 parent_run_id,
                 ctx.depth,
                 ctx.codename.as_deref(),
+                SpawnPermission::from_ctx(ctx),
             )
             .await
         {
@@ -236,6 +244,7 @@ mod tests {
             _parent_run_id: &str,
             _parent_depth: u32,
             parent_codename: Option<&str>,
+            _permission: crate::tool::SpawnPermission,
         ) -> Result<DispatchOutcome, DispatchError> {
             *self.seen_parent_codename.lock().unwrap() = parent_codename.map(str::to_string);
             Ok(DispatchOutcome {

@@ -5,7 +5,7 @@
 //! in before the flag is up.
 
 use async_trait::async_trait;
-use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
+use rupu_agent::runner::{MockProvider, ScriptedTurn};
 use rupu_agent::{run_agent, AgentRunOpts, Hop, HopBuilder, RecoveryOpts, RunError};
 use rupu_providers::credential_writes;
 use rupu_providers::model_limits::ModelLimits;
@@ -94,12 +94,11 @@ pub async fn run_terminating(
         workspace_path: tmp.path().to_path_buf(),
         transcript_path: transcript.clone(),
         max_turns: 5,
-        decider: Arc::new(BypassDecider),
+        permission: rupu_tools::PermissionPolicy::bypass(),
         tool_context: ToolContext::default(),
         user_message: "go".into(),
         initial_messages: Vec::new(),
         turn_index_offset: 0,
-        mode_str: "bypass".into(),
         no_stream: false,
         suppress_stream_stdout: true,
         mcp_registry: None,

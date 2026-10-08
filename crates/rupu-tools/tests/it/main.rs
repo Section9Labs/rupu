@@ -7,6 +7,7 @@
 mod ast_grep;
 mod bash;
 mod coverage_instrumentation;
+mod descriptors;
 mod edit_file;
 mod glob;
 mod grep;

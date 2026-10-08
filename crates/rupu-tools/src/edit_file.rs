@@ -9,6 +9,7 @@
 //! already exist (no implicit create — use `write_file` for that).
 
 use crate::coverage_emit::{attribution_from, emit};
+use crate::descriptor::{Effect, ToolDescriptor};
 use crate::path_scope::is_inside;
 use crate::tool::{render_file_edit_diff, DerivedEvent, Tool, ToolContext, ToolError, ToolOutput};
 use async_trait::async_trait;
@@ -31,35 +32,41 @@ struct Input {
 #[derive(Debug, Default, Clone)]
 pub struct EditFileTool;
 
+/// This tool's descriptor.
+pub static DESCRIPTOR: ToolDescriptor = ToolDescriptor {
+    name: "edit_file",
+    aliases: &[],
+    effect: Effect::Write,
+    needs: &[],
+    description: "Replace an exact string in a file. The `old_string` must match exactly once in the file; if it matches zero times or more than once, the edit fails. Pass enough surrounding context (a few lines before/after) to make `old_string` uniquely identifying. The file must already exist; for new files use `write_file`.",
+    input_schema: descriptor_schema,
+};
+
+fn descriptor_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Path relative to the workspace root."
+            },
+            "old_string": {
+                "type": "string",
+                "description": "Exact substring to replace. Must match exactly once."
+            },
+            "new_string": {
+                "type": "string",
+                "description": "Replacement substring."
+            }
+        },
+        "required": ["path", "old_string", "new_string"]
+    })
+}
+
 #[async_trait]
 impl Tool for EditFileTool {
-    fn name(&self) -> &'static str {
-        "edit_file"
-    }
-
-    fn description(&self) -> &'static str {
-        "Replace an exact string in a file. The `old_string` must match exactly once in the file; if it matches zero times or more than once, the edit fails. Pass enough surrounding context (a few lines before/after) to make `old_string` uniquely identifying. The file must already exist; for new files use `write_file`."
-    }
-
-    fn input_schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Path relative to the workspace root."
-                },
-                "old_string": {
-                    "type": "string",
-                    "description": "Exact substring to replace. Must match exactly once."
-                },
-                "new_string": {
-                    "type": "string",
-                    "description": "Replacement substring."
-                }
-            },
-            "required": ["path", "old_string", "new_string"]
-        })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &DESCRIPTOR
     }
 
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {

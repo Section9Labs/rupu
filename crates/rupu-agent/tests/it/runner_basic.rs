@@ -1,9 +1,8 @@
-use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
+use rupu_agent::runner::{MockProvider, ScriptedTurn};
 use rupu_agent::{run_agent, AgentRunOpts};
 use rupu_providers::types::StopReason;
 use rupu_tools::ToolContext;
 use rupu_transcript::JsonlReader;
-use std::sync::Arc;
 
 #[tokio::test]
 async fn happy_path_one_turn_no_tools() {
@@ -31,12 +30,11 @@ async fn happy_path_one_turn_no_tools() {
         workspace_path: tmp.path().to_path_buf(),
         transcript_path: transcript_path.clone(),
         max_turns: 5,
-        decider: Arc::new(BypassDecider),
+        permission: rupu_tools::PermissionPolicy::bypass(),
         tool_context: ToolContext::default(),
         user_message: "say hi".into(),
         initial_messages: Vec::new(),
         turn_index_offset: 0,
-        mode_str: "bypass".into(),
         no_stream: false,
         suppress_stream_stdout: false,
         mcp_registry: None,
@@ -97,7 +95,7 @@ async fn run_start_records_the_tool_contexts_customer() {
         workspace_path: tmp.path().to_path_buf(),
         transcript_path: transcript_path.clone(),
         max_turns: 5,
-        decider: Arc::new(BypassDecider),
+        permission: rupu_tools::PermissionPolicy::bypass(),
         tool_context: ToolContext {
             customer: Some("acme".into()),
             ..ToolContext::default()
@@ -105,7 +103,6 @@ async fn run_start_records_the_tool_contexts_customer() {
         user_message: "say hi".into(),
         initial_messages: Vec::new(),
         turn_index_offset: 0,
-        mode_str: "bypass".into(),
         no_stream: false,
         suppress_stream_stdout: false,
         mcp_registry: None,

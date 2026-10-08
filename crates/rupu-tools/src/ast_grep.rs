@@ -19,6 +19,7 @@
 //! bad path/pattern from being silently reported as "no matches".
 
 use crate::coverage_emit::{attribution_from, emit};
+use crate::descriptor::{Effect, ToolDescriptor};
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -85,14 +86,13 @@ struct Input {
 #[derive(Debug, Default, Clone)]
 pub struct AstGrepTool;
 
-#[async_trait]
-impl Tool for AstGrepTool {
-    fn name(&self) -> &'static str {
-        "ast_grep"
-    }
-
-    fn description(&self) -> &'static str {
-        "Search the workspace by code STRUCTURE (syntax tree), not text, using ast-grep. \
+/// This tool's descriptor.
+pub static DESCRIPTOR: ToolDescriptor = ToolDescriptor {
+    name: "ast_grep",
+    aliases: &[],
+    effect: Effect::Read,
+    needs: &[],
+    description: "Search the workspace by code STRUCTURE (syntax tree), not text, using ast-grep. \
 Provide a `pattern` in ast-grep syntax and a `lang` (rust, python, typescript, go, …). \
 Metavariables: `$VAR` matches one named node, `$$$` matches zero or more nodes. \
 Example: pattern `impl $T for $S` with lang `rust` finds trait impls; \
@@ -100,28 +100,35 @@ pattern `async fn $NAME($$$) -> Result<$$$>` finds async fns returning Result. \
 Output is `path:line:col: match` lines (1-based, workspace-relative). \
 Prefer this over `grep` when you want syntactic matches (call sites, impls, \
 signatures) instead of regex over raw text. Returns empty stdout (not an error) \
-when there are no matches."
-    }
+when there are no matches.",
+    input_schema: descriptor_schema,
+};
 
-    fn input_schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "pattern": {
-                    "type": "string",
-                    "description": "Structural pattern in ast-grep syntax. Metavariables: `$VAR` = one node, `$$$` = zero-or-more nodes. Example: `impl $T for $S`."
-                },
-                "lang": {
-                    "type": "string",
-                    "description": "Language grammar to parse with, e.g. `rust`, `python`, `typescript`, `go`, `javascript`, `java`, `c`, `cpp`. Required."
-                },
-                "path": {
-                    "type": "string",
-                    "description": "Optional sub-path within the workspace to restrict the search. Defaults to the whole workspace."
-                }
+fn descriptor_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "pattern": {
+                "type": "string",
+                "description": "Structural pattern in ast-grep syntax. Metavariables: `$VAR` = one node, `$$$` = zero-or-more nodes. Example: `impl $T for $S`."
             },
-            "required": ["pattern", "lang"]
-        })
+            "lang": {
+                "type": "string",
+                "description": "Language grammar to parse with, e.g. `rust`, `python`, `typescript`, `go`, `javascript`, `java`, `c`, `cpp`. Required."
+            },
+            "path": {
+                "type": "string",
+                "description": "Optional sub-path within the workspace to restrict the search. Defaults to the whole workspace."
+            }
+        },
+        "required": ["pattern", "lang"]
+    })
+}
+
+#[async_trait]
+impl Tool for AstGrepTool {
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &DESCRIPTOR
     }
 
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {

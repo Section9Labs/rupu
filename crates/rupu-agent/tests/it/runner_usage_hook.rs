@@ -2,7 +2,7 @@
 //! spec 2026-09-29 §3.3). The hook must see exactly what the transcript's
 //! `Usage` events record, for normal turns AND the compaction summariser.
 
-use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
+use rupu_agent::runner::{MockProvider, ScriptedTurn};
 use rupu_agent::{run_agent, AgentRunOpts, UsageKind, UsageTurn};
 use rupu_providers::model_limits::ModelLimits;
 use rupu_providers::types::{ContentBlock, Message, Role, StopReason, Usage};
@@ -64,7 +64,7 @@ fn build_opts(
         workspace_path: tmp.path().to_path_buf(),
         transcript_path,
         max_turns: 5,
-        decider: Arc::new(BypassDecider),
+        permission: rupu_tools::PermissionPolicy::bypass(),
         tool_context: ToolContext {
             workspace_path: tmp.path().to_path_buf(),
             ..Default::default()
@@ -72,7 +72,6 @@ fn build_opts(
         user_message: "say hi".into(),
         initial_messages: Vec::new(),
         turn_index_offset: 0,
-        mode_str: "bypass".into(),
         no_stream: true,
         suppress_stream_stdout: false,
         mcp_registry: None,

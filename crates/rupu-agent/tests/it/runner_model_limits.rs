@@ -3,7 +3,7 @@
 //! overflow error teaches the run the real input limit (spec 2026-09-30
 //! §6.3, §6.6, §7).
 
-use rupu_agent::runner::{BypassDecider, CapturingMockProvider, ScriptedTurn};
+use rupu_agent::runner::{CapturingMockProvider, ScriptedTurn};
 use rupu_agent::{run_agent, run_agent_with_limits, AgentRunOpts, RunError};
 use rupu_providers::model_limits::{Limit, LimitSource, ModelLimits};
 use rupu_providers::types::{
@@ -135,7 +135,7 @@ fn build_opts(
         workspace_path: tmp.path().to_path_buf(),
         transcript_path,
         max_turns: 5,
-        decider: Arc::new(BypassDecider),
+        permission: rupu_tools::PermissionPolicy::bypass(),
         tool_context: ToolContext {
             workspace_path: tmp.path().to_path_buf(),
             ..Default::default()
@@ -143,7 +143,6 @@ fn build_opts(
         user_message: "say hi".into(),
         initial_messages: Vec::new(),
         turn_index_offset: 0,
-        mode_str: "bypass".into(),
         no_stream: true,
         suppress_stream_stdout: false,
         mcp_registry: None,

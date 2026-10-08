@@ -21,7 +21,7 @@ use assert_fs::prelude::*;
 
 /// One turn: the agent immediately attempts `write_file`, then ends its
 /// turn. Under `ask`/`bypass` the file lands; under `readonly` the
-/// `write_file` call is denied (`ReadonlyDecider`) and the step still
+/// `write_file` call is denied (readonly `PermissionPolicy`) and the step still
 /// completes (the tool call surfaces as denied, not as a hard failure).
 const WRITE_SCRIPT: &str = r#"
 [

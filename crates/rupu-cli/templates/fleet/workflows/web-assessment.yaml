@@ -15,7 +15,7 @@ steps:
       {{ inputs.scope }}
 
       Enumerate routes, parameters, forms and interesting endpoints, calling
-      `asset_mark` for the site and every route. Crawl ONLY URLs inside the
+      `assets.mark` for the site and every route. Crawl ONLY URLs inside the
       scope above. Return a structured worklist grouped by surface
       (public / authenticated / admin / API), with method + parameters.
   - id: test
@@ -29,6 +29,6 @@ steps:
       Authorized scope (hard boundary): {{ inputs.scope }}
 
       Work the OWASP categories per route, verify before reporting, and
-      `report_finding` every verified issue (pinned to a route, with an
+      `findings.report` every verified issue (pinned to a route, with an
       OWASP/CWE classification and a required http_exchange evidence block).
       No destructive actions. Return a per-route summary of what you recorded.

@@ -1,9 +1,11 @@
-//! Permission mode resolution + interactive prompt UX.
+//! Permission mode resolution + the interactive prompt UX. The mode word is
+//! parsed by [`PermissionMode::parse`]; the decision itself is
+//! `rupu_tools::PermissionPolicy`.
 //!
 //! Resolution precedence (spec §"Permission model"):
 //!   CLI flag > agent frontmatter > project config > global config > default (Ask)
 
-use rupu_tools::PermissionMode;
+use rupu_tools::{PermissionMode, PromptAnswer};
 
 /// Pick the effective mode. The interactive prompt UX (in this same
 /// module, [`PermissionPrompt`]) consumes the result.
@@ -18,31 +20,6 @@ pub fn resolve_mode(
         .or(project_config)
         .or(global_config)
         .unwrap_or(PermissionMode::Ask)
-}
-
-/// Parse the textual mode from agent frontmatter / config files.
-/// Returns `None` for an unknown string (caller decides whether that's
-/// a hard error or a "skip this layer").
-pub fn parse_mode(s: &str) -> Option<PermissionMode> {
-    match s {
-        "ask" => Some(PermissionMode::Ask),
-        "bypass" => Some(PermissionMode::Bypass),
-        "readonly" => Some(PermissionMode::Readonly),
-        _ => None,
-    }
-}
-
-/// Operator decision for an `Ask`-mode tool call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PermissionDecision {
-    /// Allow this single tool call.
-    Allow,
-    /// Allow all calls of this tool kind for the rest of this run.
-    AllowAlwaysForToolThisRun,
-    /// Deny this single tool call (agent sees `permission_denied`).
-    Deny,
-    /// Stop the run entirely.
-    StopRun,
 }
 
 use serde_json::Value;
@@ -101,7 +78,7 @@ impl<'r, 'w, W: Write> PermissionPrompt<'r, 'w, W> {
         tool: &str,
         input_json: &Value,
         workspace_path: &str,
-    ) -> std::io::Result<PermissionDecision> {
+    ) -> std::io::Result<PromptAnswer> {
         let summary = render_inline_summary(tool, input_json);
         let ws = compact_workspace(workspace_path);
         loop {
@@ -113,13 +90,13 @@ impl<'r, 'w, W: Write> PermissionPrompt<'r, 'w, W> {
             let mut line = String::new();
             if self.reader.read_line(&mut line)? == 0 {
                 // EOF — treat as Stop.
-                return Ok(PermissionDecision::StopRun);
+                return Ok(PromptAnswer::Stop);
             }
             match line.trim() {
-                "y" | "Y" => return Ok(PermissionDecision::Allow),
-                "n" | "N" => return Ok(PermissionDecision::Deny),
-                "a" | "A" => return Ok(PermissionDecision::AllowAlwaysForToolThisRun),
-                "s" | "S" => return Ok(PermissionDecision::StopRun),
+                "y" | "Y" => return Ok(PromptAnswer::Allow),
+                "n" | "N" => return Ok(PromptAnswer::Deny),
+                "a" | "A" => return Ok(PromptAnswer::AllowAlways),
+                "s" | "S" => return Ok(PromptAnswer::Stop),
                 other => {
                     writeln!(
                         self.writer,

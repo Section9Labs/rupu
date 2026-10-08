@@ -26,8 +26,8 @@ pub fn render_prompt_section(catalog: &FlatCatalog, full_mode_max_concerns: usiz
         out.push_str("## Coverage Catalog (index)\n\n");
         out.push_str(&format!(
             "You also have access to {} concerns in index mode. Use \
-`coverage_concerns_search` to find relevant ones by topic or file, and \
-`coverage_concerns_detail` to fetch full descriptions for specific ids.\n\n",
+`coverage.concerns.search` to find relevant ones by topic or file, and \
+`coverage.concerns.detail` to fetch full descriptions for specific ids.\n\n",
             index.len()
         ));
         out.push_str("| concern_id | severity | summary |\n");
@@ -48,8 +48,8 @@ pub fn render_prompt_section(catalog: &FlatCatalog, full_mode_max_concerns: usiz
 
 fn intro_text() -> &'static str {
     "You are reviewing this workspace against the following concerns. \
-For each (file × concern) you assess, call `coverage_mark` with the \
-appropriate status. For each issue you discover, call `report_finding`. \
+For each (file × concern) you assess, call `coverage.mark` with the \
+appropriate status. For each issue you discover, call `findings.report`. \
 Files you read, grep, or edit are tracked automatically — you do not \
 need to declare them.\n"
 }
@@ -104,15 +104,15 @@ fn severity_str(s: crate::catalog::types::Severity) -> &'static str {
 }
 
 /// Render the catalog as a compact one-line-per-concern table for
-/// large catalogs. The agent uses `coverage_concerns_search` /
-/// `coverage_concerns_detail` to fetch full bodies on demand.
+/// large catalogs. The agent uses `coverage.concerns.search` /
+/// `coverage.concerns.detail` to fetch full bodies on demand.
 pub fn render_index_mode(catalog: &FlatCatalog) -> String {
     let mut out = String::new();
     out.push_str("## Coverage Catalog (index)\n\n");
     out.push_str(&format!(
         "You have access to a large concern catalog ({} entries). The full \
-descriptions are not inlined; use `coverage_concerns_search` to find \
-concerns relevant to a topic or file, and `coverage_concerns_detail` \
+descriptions are not inlined; use `coverage.concerns.search` to find \
+concerns relevant to a topic or file, and `coverage.concerns.detail` \
 to fetch full text for any specific concern_id.\n\n",
         catalog.concerns.len()
     ));
@@ -155,7 +155,7 @@ mod tests {
         assert!(rendered.starts_with("## Coverage Catalog"));
         assert!(rendered.contains("### stride:spoofing"));
         assert!(rendered.contains("**Severity:** high"));
-        assert!(rendered.contains("call `coverage_mark`"));
+        assert!(rendered.contains("call `coverage.mark`"));
     }
 
     #[test]

@@ -20,7 +20,8 @@
 use async_trait::async_trait;
 use rupu_agent::{AgentSpec, Cadence, Injection, InjectionKind, TurnCollector, TurnContext};
 use rupu_orchestrator::{list_workflow_summaries, WorkflowSummary};
-use rupu_tools::{Tool, ToolContext, ToolError, ToolOutput};
+use rupu_tools::output::{failed, ok_json, req_str};
+use rupu_tools::{Tool, ToolContext, ToolDescriptor, ToolError, ToolOutput};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -47,38 +48,6 @@ pub fn roster_tools(ctx: Arc<RosterCtx>) -> Vec<Arc<dyn Tool>> {
 }
 
 // ---- helpers ----------------------------------------------------------------
-
-/// A successful result carrying compact JSON.
-pub(crate) fn done(v: Value) -> ToolOutput {
-    ToolOutput {
-        stdout: v.to_string(),
-        error: None,
-        duration_ms: 0,
-        derived: None,
-        structured: None,
-    }
-}
-
-/// A failure the model should see (not a run-aborting `Err`).
-pub(crate) fn failed(msg: impl Into<String>) -> ToolOutput {
-    ToolOutput {
-        stdout: String::new(),
-        error: Some(msg.into()),
-        duration_ms: 0,
-        derived: None,
-        structured: None,
-    }
-}
-
-/// A required, non-blank string argument.
-pub(crate) fn req_str<'a>(input: &'a Value, key: &str) -> Result<&'a str, ToolError> {
-    match input.get(key).and_then(Value::as_str).map(str::trim) {
-        Some(s) if !s.is_empty() => Ok(s),
-        _ => Err(ToolError::InvalidInput(format!(
-            "{key} (non-empty string) required"
-        ))),
-    }
-}
 
 /// Load every agent, or the message naming why that was not possible.
 fn load(ctx: &RosterCtx) -> Result<Vec<AgentSpec>, String> {
@@ -118,23 +87,13 @@ struct AgentsList(Arc<RosterCtx>);
 
 #[async_trait]
 impl Tool for AgentsList {
-    fn name(&self) -> &'static str {
-        "agents.list"
-    }
-
-    fn description(&self) -> &'static str {
-        "List the agents you can draw on (global and project): each one's name, \
-         description and declared tools. `tools: null` means the agent uses the \
-         default tool set, not none. Use agents.get for one agent's detail."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({ "type": "object", "properties": {} })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &rupu_tools::catalog::flow::AGENTS_LIST
     }
 
     async fn invoke(&self, _input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         Ok(match load(&self.0) {
-            Ok(agents) => done(Value::Array(agents.iter().map(agent_row).collect())),
+            Ok(agents) => ok_json(Value::Array(agents.iter().map(agent_row).collect())),
             Err(msg) => failed(msg),
         })
     }
@@ -147,23 +106,8 @@ struct AgentsGet(Arc<RosterCtx>);
 
 #[async_trait]
 impl Tool for AgentsGet {
-    fn name(&self) -> &'static str {
-        "agents.get"
-    }
-
-    fn description(&self) -> &'static str {
-        "Get one agent's detail by name: description, provider, model, declared \
-         tools, the agents it may dispatch, and its permission mode."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "required": ["name"],
-            "properties": {
-                "name": { "type": "string", "description": "The agent's name, as agents.list shows it" }
-            }
-        })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &rupu_tools::catalog::flow::AGENTS_GET
     }
 
     async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -173,7 +117,7 @@ impl Tool for AgentsGet {
             Err(msg) => return Ok(failed(msg)),
         };
         Ok(match agents.iter().find(|a| a.name == name) {
-            Some(a) => done(json!({
+            Some(a) => ok_json(json!({
                 "name": a.name,
                 "description": a.description,
                 "provider": a.provider,
@@ -195,22 +139,12 @@ struct WorkflowsList(Arc<RosterCtx>);
 
 #[async_trait]
 impl Tool for WorkflowsList {
-    fn name(&self) -> &'static str {
-        "workflows.list"
-    }
-
-    fn description(&self) -> &'static str {
-        "List the workflows you can run (global and project). `id` is the runnable \
-         identifier (the file stem); `name` is the declared display name. A \
-         workflow that failed to parse is listed with its parse_error."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({ "type": "object", "properties": {} })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &rupu_tools::catalog::flow::WORKFLOWS_LIST
     }
 
     async fn invoke(&self, _input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        Ok(done(Value::Array(
+        Ok(ok_json(Value::Array(
             workflows(&self.0).iter().map(workflow_row).collect(),
         )))
     }
@@ -223,23 +157,8 @@ struct WorkflowsGet(Arc<RosterCtx>);
 
 #[async_trait]
 impl Tool for WorkflowsGet {
-    fn name(&self) -> &'static str {
-        "workflows.get"
-    }
-
-    fn description(&self) -> &'static str {
-        "Get one workflow's summary by its `id` (the runnable file stem workflows.list \
-         shows, not the declared name): description, scope, declared inputs, step count."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "required": ["id"],
-            "properties": {
-                "id": { "type": "string", "description": "The workflow's id, as workflows.list shows it" }
-            }
-        })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &rupu_tools::catalog::flow::WORKFLOWS_GET
     }
 
     async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -248,7 +167,7 @@ impl Tool for WorkflowsGet {
             Some(w) => {
                 let mut row = workflow_row(&w);
                 row["input_keys"] = json!(w.input_keys);
-                done(row)
+                ok_json(row)
             }
             None => failed(format!("workflow not found: {id}")),
         })
@@ -271,25 +190,8 @@ fn matches(needle: &str, fields: &[Option<&str>]) -> bool {
 
 #[async_trait]
 impl Tool for CatalogSearch {
-    fn name(&self) -> &'static str {
-        "catalog.search"
-    }
-
-    fn description(&self) -> &'static str {
-        "Search the agent and workflow catalog: a case-insensitive substring match \
-         over agent name/description and workflow id/name/description. Each hit is \
-         tagged kind=agent|workflow. `warnings` is present when part of the catalog \
-         could not be read."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "required": ["query"],
-            "properties": {
-                "query": { "type": "string", "description": "Substring to look for (case-insensitive)" }
-            }
-        })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &rupu_tools::catalog::flow::CATALOG_SEARCH
     }
 
     async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -331,7 +233,7 @@ impl Tool for CatalogSearch {
         if !warnings.is_empty() {
             out["warnings"] = json!(warnings);
         }
-        Ok(done(out))
+        Ok(ok_json(out))
     }
 }
 

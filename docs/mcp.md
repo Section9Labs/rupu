@@ -69,7 +69,7 @@ attribute to. Only a workflow `action:` step supplies that (for example
 "unavailable: … started without run context" error rather than writing to a
 guessed location. Agents are never offered them (see [Permissions](#permissions));
 an agent records and queries findings through its own builtins instead:
-`report_finding`, `query_findings` and `tag_findings`.
+`findings.report`, `findings.query` and `findings.tag`.
 
 ## Permissions
 
@@ -80,13 +80,16 @@ the MCP ecosystem; rupu does NOT prompt from the server.
 
 For `rupu run` invocations from the CLI, the agent's frontmatter `tools:`
 list and the `--mode` flag enforce per-tool gating; the MCP server enforces
-both.
+both. The mode is applied by effect, as everywhere else
+([agent-format.md](agent-format.md#permissionmode)): connector reads are
+`read`, connector writes are `external` (refused under `readonly`), and
+`findings.record` / `findings.tag` are `record` (allowed under `readonly`).
 
 An agent is never offered the `findings.record` / `findings.query` /
 `findings.tag` tools, whatever its `tools:` list says (`["*"]` included): its
 in-process MCP server has no run context to record or read findings against,
-so every call would be refused. Agents use the `report_finding`,
-`query_findings` and `tag_findings` builtins; the `findings.*` MCP tools serve
+so every call would be refused. Agents use the `findings.report`,
+`findings.query` and `findings.tag` builtins; the `findings.*` MCP tools serve
 workflow `action:` steps.
 
 ## Troubleshooting

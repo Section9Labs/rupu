@@ -215,21 +215,21 @@ can't end a run as a success.
 ### What the lead can do
 
 The lead gets the tools its own agent file lists in `tools:` (none of the
-built-ins if `tools:` is absent), plus `report_finding` (and `asset_mark` under an
+built-ins if `tools:` is absent), plus `findings.report` (and `assets.mark` under an
 engagement profile), plus these always-on fleet tools:
 
 | Group | Tools | Purpose |
 | --- | --- | --- |
 | Units | `dispatch { agent, prompt }` | Start a pool agent as a unit. Returns a handle at once |
 | | `run_workflow { workflow, inputs? }` | Start a pool workflow as a unit |
-| | `generate_workflow { description, inputs? }` | Write a new workflow and start it as a unit (only offered when generation is available, below) |
+| | `workflows.generate { description, inputs? }` | Write a new workflow and start it as a unit (only offered when generation is available, below) |
 | | `join { handle, timeout_secs? }` | Wait for a unit's result. Default 300 s, at most 3600 s per call |
 | Board | `board.claim`, `board.release` | Claim a piece of work (a one-hour lease) so two participants don't duplicate it |
 | | `board.post`, `board.read` | Shared posts of kind `observation`, `question`, `answer`, `vote` or `note` |
 | | `msg.send` | Message one participant's inbox, or `broadcast` |
 | Steering | `board.directive` | Write a standing directive every agent unit sees on every turn. Returns an id |
 | | `board.retract { id }` | Lift a directive. Retraction is appended to the log; the board is never rewritten |
-| Status | `goal.status`, `coverage.status`, `budget.status` | Re-check goals, coverage and spend mid-round with the same evaluators and meter the envelope uses |
+| Status | `goal.status`, `goal.coverage`, `budget.status` | Re-check goals, coverage and spend mid-round with the same evaluators and meter the envelope uses |
 | Roster | `agents.list`, `agents.get`, `workflows.list`, `workflows.get`, `catalog.search` | Browse the agents and workflows it can draw on |
 
 Each lead turn also includes the lead's inbox, the standing directives, and a
@@ -249,7 +249,7 @@ profiles. Agent units also get the board, mailbox and directive tools; workflow
 units are findings-only (their steps get no board tools). Its findings and assets
 are pooled with the lead's under one coverage scope, which is what the goals are
 evaluated against. Units don't get `dispatch`, `run_workflow` or
-`generate_workflow`, so they can't start units of their own (an agent's
+`workflows.generate`, so they can't start units of their own (an agent's
 in-process `dispatch_agent` sub-agents still work).
 
 `dispatch` refuses an agent that is not in `pool.agents`. `run_workflow` checks,
@@ -258,7 +258,7 @@ approval gate and no `host:`/`distribute:` placement, dispatches only pool
 agents, and that its inputs resolve. A refusal comes back to the lead as a tool
 error it can react to.
 
-`generate_workflow` writes a new workflow, applies the same checks, saves it as
+`workflows.generate` writes a new workflow, applies the same checks, saves it as
 `<run dir>/generated/<name>-<ulid>.yaml`, and runs it as a unit. The generating
 provider is the first authenticated one in rupu's default generation order,
 falling back to the lead's own. When that provider has no credential, or
@@ -276,7 +276,7 @@ code. The profiles declare the asset kinds (`network:host`, `web:route`,
 `code:file`, ...), their coordinates, and the depth ladder (`discovered →
 enumerated → tested → exploited` for `network`; `unreviewed → reviewed` for
 `code`). The definition is validated against them, the lead and every unit run
-under them, and `asset_mark` records how deep each asset was examined.
+under them, and `assets.mark` records how deep each asset was examined.
 
 Profiles resolve the same way as everywhere else: built-ins, then
 `~/.rupu/profiles/`, then `.rupu/profiles/` in the directory you launch from. A
@@ -347,7 +347,7 @@ Setting `verify_with` turns verification on even without `verified: true`.
 `verify_check` without either is rejected. Verification applies to findings
 goals only; an asset goal's depth rung is its own evidence.
 
-Verdicts are written by the `finding.verify` tool. It is never granted
+Verdicts are written by the `findings.verify` tool. It is never granted
 automatically, not even to a `concerns:` agent. Write a verifier agent that lists
 it, and put that agent in the pool:
 
@@ -355,7 +355,7 @@ it, and put that agent in the pool:
 ---
 name: finding-verifier
 description: Re-checks a finding another run filed and records a verdict.
-tools: [read_file, grep, glob, finding.verify]
+tools: [read_file, grep, glob, findings.verify]
 ---
 Reproduce or refute the finding you are given. Record `confirmed` only if
 you established it yourself.
@@ -457,7 +457,7 @@ Each run gets a directory `~/.rupu/agentiflows/af_<ULID>/`:
 | `board/` | `posts.jsonl`, `directives.jsonl` and `claims/` |
 | `mailboxes/` | Per-participant inboxes and the broadcast log |
 | `units/<run id>/unit.json` | One record per unit: kind, process group and last known status |
-| `generated/` | Workflows written by `generate_workflow` |
+| `generated/` | Workflows written by `workflows.generate` |
 | `detach.log` | stderr of a `--detach` run |
 
 A run that completes normally has status `completed` whatever the reason; the

@@ -8,7 +8,6 @@
 //! terminal flip, and the record must still say `Cancelled` afterwards.
 
 use async_trait::async_trait;
-use rupu_agent::runner::BypassDecider;
 use rupu_agent::AgentRunOpts;
 use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts, RunWorkflowError, StepFactory};
 use rupu_orchestrator::{RunStatus, RunStore, Workflow};
@@ -115,12 +114,11 @@ impl StepFactory for Factory {
             workspace_path,
             transcript_path,
             max_turns: 5,
-            decider: Arc::new(BypassDecider),
+            permission: rupu_tools::PermissionPolicy::bypass(),
             tool_context: ToolContext::default(),
             user_message: rendered_prompt,
             initial_messages: Vec::new(),
             turn_index_offset: 0,
-            mode_str: "bypass".into(),
             no_stream: false,
             suppress_stream_stdout: true,
             mcp_registry: None,

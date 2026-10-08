@@ -16,7 +16,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use rupu_agent::{run_agent_full, AgentRunOpts, BypassDecider, RunError, RunExit};
+use rupu_agent::{run_agent_full, AgentRunOpts, RunError, RunExit};
 use rupu_orchestrator::usage_ledger::{LedgerTag, UsageLedger};
 use rupu_providers::model_limits::ModelLimits;
 use rupu_providers::types::Message;
@@ -324,7 +324,7 @@ pub struct LeadConfig {
     /// `extra_tools` are always-on, so an empty list is not "no tools at all".)
     /// The caller lists what the lead needs -- there is deliberately no way to
     /// say "all builtins" by omission, because the lead runs unattended under
-    /// `BypassDecider` on digest text an attacker can influence.
+    /// bypass permission on digest text an attacker can influence.
     pub agent_tools: Vec<String>,
     /// Starting model limits; the driver carries the limits each round ends
     /// with (including any learned from a context-overflow error) into the
@@ -380,7 +380,7 @@ pub struct LeadConfig {
 /// -- never directly on a runtime worker.
 ///
 /// What a round does NOT wire up yet (Plan 3b-2): the MCP/SCM registry,
-/// dispatchable agents, and a codename. It runs with `BypassDecider`, so the
+/// dispatchable agents, and a codename. It runs under bypass permission, so the
 /// tool gate is [`LeadConfig::agent_tools`] (the runner's registry is filtered
 /// to exactly that list; empty = no builtins/MCP) plus [`LeadConfig::extra_tools`],
 /// the caller's explicit always-on injections (the board / mailbox tools).
@@ -597,7 +597,7 @@ impl LeadDriver for RunAgentLeadDriver {
             workspace_path: self.cfg.workspace_path.clone(),
             transcript_path,
             max_turns: ceiling,
-            decider: Arc::new(BypassDecider),
+            permission: rupu_tools::PermissionPolicy::bypass(),
             tool_context: rupu_tools::ToolContext {
                 customer: self.cfg.customer.clone(),
                 workspace_path: self.cfg.workspace_path.clone(),
@@ -612,7 +612,6 @@ impl LeadDriver for RunAgentLeadDriver {
             user_message,
             initial_messages: self.history.clone(),
             turn_index_offset: self.total_turns,
-            mode_str: "bypass".to_string(),
             no_stream: false,
             suppress_stream_stdout: true,
             mcp_registry: None,

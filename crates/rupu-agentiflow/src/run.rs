@@ -256,7 +256,7 @@ pub struct RunAgentiflowOpts {
     /// new workflow and a factory minting a provider for each generation call.
     /// Built by the launch site exactly as `make_provider` is (`rupu agentiflow
     /// run` builds both, Plan 4-1; tests inject a mock). `None` disables
-    /// `generate_workflow` entirely: the lead is not even offered the tool --
+    /// `workflows.generate` entirely: the lead is not even offered the tool --
     /// the CLI passes `None` when the generating provider has no credential or
     /// cannot be built synchronously (Anthropic OAuth).
     pub generation: Option<crate::lead::GenerationCapability>,
@@ -729,12 +729,14 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 started,
             );
 
-            // The lead records findings through `report_finding`; the runner only
-            // registers it for an agent that lists it. Dedup so a caller that
-            // already granted it does not get it twice.
+            // The lead records findings through `findings.report`; the runner
+            // only registers it for an agent that lists it (by canonical name
+            // or the legacy `report_finding`). Dedup so a caller that already
+            // granted it does not get it twice.
             let mut agent_tools = lead.agent_tools;
-            if !agent_tools.iter().any(|t| t == "report_finding") {
-                agent_tools.push("report_finding".to_string());
+            let report = &rupu_tools::catalog::findings::FINDINGS_REPORT;
+            if !agent_tools.iter().any(|t| report.answers_to(t)) {
+                agent_tools.push(report.name.to_string());
             }
             // The lead's coordination substrate: a file-backed board and mailboxes
             // under the run dir, the tools that act on them, and the collectors that
@@ -2637,7 +2639,7 @@ mod tests {
         }
     }
 
-    // ---- generate_workflow threaded through run_agentiflow -----------------
+    // ---- workflows.generate threaded through run_agentiflow -----------------
 
     /// A workflow whose only agent (`recon`) is in `def_with_recon_pool`'s pool.
     const GENERATED_WF: &str =
@@ -2751,7 +2753,7 @@ mod tests {
         let reqs = captured.lock().unwrap().clone();
         assert_eq!(reqs.len(), 3, "one model call per scripted turn");
         assert!(
-            offered_tools(&reqs[0]).contains(&"generate_workflow"),
+            offered_tools(&reqs[0]).contains(&"workflows.generate"),
             "{:?}",
             offered_tools(&reqs[0])
         );
@@ -2819,7 +2821,7 @@ mod tests {
         // Absence is proven twice: the advertised tool list omits it (while the
         // sibling unit tools are present, so the list is the real one)...
         let offered = offered_tools(&reqs[0]);
-        assert!(!offered.contains(&"generate_workflow"), "{offered:?}");
+        assert!(!offered.contains(&"workflows.generate"), "{offered:?}");
         for sibling in ["dispatch", "join", "run_workflow"] {
             assert!(offered.contains(&sibling), "{sibling} missing: {offered:?}");
         }

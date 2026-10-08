@@ -21,7 +21,7 @@
 //! See `docs/superpowers/specs/2026-05-08-rupu-sub-agent-dispatch-design.md`.
 
 use async_trait::async_trait;
-use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
+use rupu_agent::runner::{MockProvider, ScriptedTurn};
 use rupu_agent::AgentRunOpts;
 use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts, StepFactory};
 use rupu_orchestrator::Workflow;
@@ -76,6 +76,7 @@ impl AgentDispatcher for FakeDispatcher {
         _parent_run_id: &str,
         _parent_depth: u32,
         _parent_codename: Option<&str>,
+        _permission: rupu_tools::SpawnPermission,
     ) -> Result<DispatchOutcome, DispatchError> {
         self.calls
             .lock()
@@ -187,7 +188,7 @@ impl StepFactory for ParallelFactory {
             workspace_path: workspace_path.clone(),
             transcript_path,
             max_turns: 5,
-            decider: Arc::new(BypassDecider),
+            permission: rupu_tools::PermissionPolicy::bypass(),
             tool_context: ToolContext {
                 customer: None,
                 findings: None,
@@ -210,11 +211,12 @@ impl StepFactory for ParallelFactory {
                 netflow_sink: None,
                 net_capture: None,
                 tool_call_id: None,
+                spawn_ceiling: None,
+                prompter: None,
             },
             user_message: rendered_prompt,
             initial_messages: Vec::new(),
             turn_index_offset: 0,
-            mode_str: "bypass".into(),
             no_stream: false,
             suppress_stream_stdout: false,
             mcp_registry: None,

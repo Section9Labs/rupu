@@ -11,7 +11,7 @@
 
 use async_trait::async_trait;
 use rupu_agent::runner::MockProvider;
-use rupu_agent::runner::{BypassDecider, ScriptedTurn};
+use rupu_agent::runner::ScriptedTurn;
 use rupu_agent::AgentRunOpts;
 use rupu_mcp::{McpPermission, ToolDispatcher};
 use rupu_orchestrator::executor::JsonlSink;
@@ -92,12 +92,11 @@ impl StepFactory for EchoFactory {
             workspace_path,
             transcript_path,
             max_turns: 5,
-            decider: Arc::new(BypassDecider),
+            permission: rupu_tools::PermissionPolicy::bypass(),
             tool_context: ToolContext::default(),
             user_message: rendered_prompt,
             initial_messages: Vec::new(),
             turn_index_offset: 0,
-            mode_str: "bypass".into(),
             no_stream: true,
             suppress_stream_stdout: true,
             mcp_registry: None,
@@ -162,12 +161,11 @@ impl StepFactory for FailFactory {
             workspace_path,
             transcript_path,
             max_turns: 5,
-            decider: Arc::new(BypassDecider),
+            permission: rupu_tools::PermissionPolicy::bypass(),
             tool_context: ToolContext::default(),
             user_message: rendered_prompt,
             initial_messages: Vec::new(),
             turn_index_offset: 0,
-            mode_str: "bypass".into(),
             no_stream: true,
             suppress_stream_stdout: true,
             mcp_registry: None,

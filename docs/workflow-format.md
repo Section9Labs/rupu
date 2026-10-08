@@ -456,11 +456,12 @@ Behavior:
 default when `--mode` is omitted — so a workflow run without an explicit mode
 grants its steps full tool access.
 
-That is deliberate. The agent runtime's interactive `ask` decider blocks on
-stdin waiting for a human, and a workflow step has no operator present at the
-tool layer, so a genuinely-prompting `ask` would hang every unattended run.
-Rather than silently doing something different from what the name suggests,
-`rupu workflow run` prints a warning when no mode was given:
+That is deliberate. A genuinely-prompting `ask` blocks on stdin waiting for a
+human, and a workflow step has no operator present at the tool layer, so it
+would hang every unattended run. Rather than silently doing something
+different from what the name suggests, each step's transcript records a
+`permission_mode_degraded` notice the first time `ask` lets a write through,
+and `rupu workflow run` prints a warning when no mode was given:
 
 ```
 warning: --mode not set; workflow steps run at `bypass`
@@ -472,7 +473,10 @@ warning: --mode not set; workflow steps run at `bypass`
 | --- | --- | --- |
 | `bypass` | all tools allowed | all catalog tools allowed |
 | `ask` | **same as `bypass`** — no prompt is possible | same as `bypass` |
-| `readonly` | `bash`, `write_file`, `edit_file` denied | Write-classified tools refused |
+| `readonly` | `write` and `external` tools denied (`bash`, `write_file`, `edit_file`, `scm.prs.create`, …); sub-agents run readonly | `external` tools refused |
+
+The effect each tool declares is listed in
+[agent-format.md](agent-format.md#permissionmode).
 
 **If you want a workflow restricted, pass `--mode readonly` explicitly** —
 `ask` will not do it. For human-in-the-loop control over *what a workflow

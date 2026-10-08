@@ -20,6 +20,7 @@ mod findings_without_coverage;
 mod loader;
 mod mcp_attach;
 mod mock_provider_outcomes;
+mod permission_policy;
 mod permission_resolution;
 mod prompt_pty;
 mod runner_aborts;
