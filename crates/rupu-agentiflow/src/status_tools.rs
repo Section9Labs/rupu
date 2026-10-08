@@ -3,7 +3,7 @@
 //! directive.
 //!
 //! The round digest the lead is handed is a snapshot from the START of the
-//! round. `goal.status` and `coverage.status` re-run the same pure evaluators
+//! round. `goal.status` and `goal.coverage` re-run the same pure evaluators
 //! ([`GoalEvaluator`], [`CoverageEvaluator`]) over the pooled scope, so they
 //! reflect findings and assets the lead (or a unit it just joined) JUST banked.
 //! `budget.status` re-reads the run's usage ledgers through the SAME
@@ -27,12 +27,12 @@ use crate::budget::{parse_duration, Budget, BudgetEnforcer, BudgetStage, UsageSo
 use crate::coverage::{CoverageEvaluator, CoverageTarget};
 use crate::def::Goal;
 use crate::goal::{count_matching_findings, requires_verification, GoalEvaluator};
-use crate::roster::{done, failed, req_str};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rupu_coverage::{read_findings, ActiveSet, CoveragePaths};
 use rupu_fleet::{Board, Directive};
-use rupu_tools::{Tool, ToolContext, ToolError, ToolOutput};
+use rupu_tools::output::{failed, ok_json, opt_str, req_str};
+use rupu_tools::{Tool, ToolContext, ToolDescriptor, ToolError, ToolOutput};
 use serde_json::{json, Map, Value};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -52,7 +52,7 @@ struct StatusCtx {
     budget: BudgetProbe,
 }
 
-/// The five status/steering tools (`goal.status`, `coverage.status`,
+/// The five status/steering tools (`goal.status`, `goal.coverage`,
 /// `budget.status`, `board.directive`, `board.retract`), each holding a clone
 /// of the shared context.
 ///
@@ -277,21 +277,6 @@ fn stage_word(stage: &BudgetStage) -> &'static str {
     }
 }
 
-/// An optional string argument: absent, `null` and blank are all `None`; any
-/// other non-string value is an error rather than silently ignored.
-fn opt_str(input: &Value, key: &str) -> Result<Option<String>, ToolError> {
-    match input.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(s)) => {
-            let s = s.trim();
-            Ok((!s.is_empty()).then(|| s.to_string()))
-        }
-        Some(_) => Err(ToolError::InvalidInput(format!(
-            "{key} must be a string when given"
-        ))),
-    }
-}
-
 /// Run a blocking evaluation off the async runtime: the evaluators read whole
 /// ledgers from disk, which can be large.
 async fn blocking<T: Send + 'static>(
@@ -345,22 +330,8 @@ struct GoalStatus(Arc<StatusCtx>);
 
 #[async_trait]
 impl Tool for GoalStatus {
-    fn name(&self) -> &'static str {
-        "goal.status"
-    }
-
-    fn description(&self) -> &'static str {
-        "Re-check every goal against the pooled evidence right now (findings and \
-         assets banked since the round began count). Each goal reports `satisfied`, \
-         its `current`/`target` tally and a one-line `detail`; a goal that could not \
-         be evaluated carries an `error` instead. A findings goal that requires \
-         verification also reports in `detail` how many findings match it and how \
-         many of those are independently verified, and names the agent that must \
-         verify the rest (dispatch it)."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({ "type": "object", "properties": {} })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &rupu_tools::catalog::flow::GOAL_STATUS
     }
 
     async fn invoke(&self, _input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -394,38 +365,25 @@ impl Tool for GoalStatus {
             Ok(rows) => rows,
             Err(out) => return Ok(out),
         };
-        Ok(done(Value::Array(rows)))
+        Ok(ok_json(Value::Array(rows)))
     }
 }
 
-// ---- coverage.status --------------------------------------------------------
+// ---- goal.coverage ----------------------------------------------------------
 
-/// `coverage.status` -> `{reach, depth, fraction, satisfied, per_kind}`, or
+/// `goal.coverage` (formerly `coverage.status`) -> `{reach, depth, fraction, satisfied, per_kind}`, or
 /// `{coverage: null}` when the definition has no coverage target.
 struct CoverageStatus(Arc<StatusCtx>);
 
 #[async_trait]
 impl Tool for CoverageStatus {
-    fn name(&self) -> &'static str {
-        "coverage.status"
-    }
-
-    fn description(&self) -> &'static str {
-        "Re-check the engagement coverage target against the pooled assets right \
-         now. `reach` is the required fraction and `depth` the rung assets must \
-         have reached (null: the ladder's terminal rung); `fraction` is what has \
-         been reached so far, `satisfied` whether it meets `reach`, `per_kind` the \
-         per-asset-kind fractions. `{coverage: null}` when the flow sets no \
-         coverage target."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({ "type": "object", "properties": {} })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &rupu_tools::catalog::flow::GOAL_COVERAGE
     }
 
     async fn invoke(&self, _input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let Some(target) = self.0.coverage.clone() else {
-            return Ok(done(json!({ "coverage": null })));
+            return Ok(ok_json(json!({ "coverage": null })));
         };
         let ctx = self.0.clone();
         let evaluated = match blocking(move || {
@@ -450,7 +408,7 @@ impl Tool for CoverageStatus {
             Err(out) => return Ok(out),
         };
         Ok(match evaluated {
-            Ok(v) => done(v),
+            Ok(v) => ok_json(v),
             Err(e) => failed(format!("could not evaluate coverage: {e}")),
         })
     }
@@ -465,31 +423,14 @@ struct BudgetStatus(Arc<StatusCtx>);
 
 #[async_trait]
 impl Tool for BudgetStatus {
-    fn name(&self) -> &'static str {
-        "budget.status"
-    }
-
-    fn description(&self) -> &'static str {
-        "Re-check the run's budget against what it has spent right now: the \
-         lead's own and every unit's usage so far, read fresh. `stage` is `ok`, \
-         `soft` (a dimension crossed its soft threshold: converge) or `hard` (a \
-         cap is reached and the run stops at the next round check; `tripped` \
-         names the dimension). Each dimension the flow sets is reported with its \
-         `cap`, what it has used (`spent` for `usd` / `tokens`, `elapsed` rounds \
-         completed before this one or `elapsed_secs` for `wall_clock`), what is \
-         `remaining` and its own `state`. A `usd` cap nothing can price carries \
-         `enforced: false` and a note. `{budget: null}` when the flow sets no \
-         budget."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({ "type": "object", "properties": {} })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &rupu_tools::catalog::flow::BUDGET_STATUS
     }
 
     async fn invoke(&self, _input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let ctx = self.0.clone();
         Ok(match blocking(move || ctx.budget.report()).await {
-            Ok(report) => done(report),
+            Ok(report) => ok_json(report),
             Err(out) => out,
         })
     }
@@ -504,30 +445,8 @@ struct BoardDirective(Arc<StatusCtx>);
 
 #[async_trait]
 impl Tool for BoardDirective {
-    fn name(&self) -> &'static str {
-        "board.directive"
-    }
-
-    fn description(&self) -> &'static str {
-        "Steer the fleet: write a standing directive to the board. Units see it on \
-         every turn until you lift it, so post sparingly and keep each short and \
-         actionable. Returns the directive's `id`: pass it to `board.retract` once \
-         the instruction is obsolete. Omit `addressed_to` to address everyone; name \
-         a unit or role to address only it."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "required": ["body"],
-            "properties": {
-                "body": { "type": "string", "description": "The directive text" },
-                "addressed_to": {
-                    "type": "string",
-                    "description": "A unit name or role to address; omit for everyone"
-                }
-            }
-        })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &rupu_tools::catalog::flow::BOARD_DIRECTIVE
     }
 
     async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -542,7 +461,7 @@ impl Tool for BoardDirective {
             addressed_to: addressed_to.clone(),
         };
         Ok(match self.0.board.put_directive(&directive) {
-            Ok(id) => done(json!({ "ok": true, "id": id, "addressed_to": addressed_to })),
+            Ok(id) => ok_json(json!({ "ok": true, "id": id, "addressed_to": addressed_to })),
             Err(e) => failed(format!("could not write directive: {e}")),
         })
     }
@@ -558,28 +477,8 @@ struct BoardRetract(Arc<StatusCtx>);
 
 #[async_trait]
 impl Tool for BoardRetract {
-    fn name(&self) -> &'static str {
-        "board.retract"
-    }
-
-    fn description(&self) -> &'static str {
-        "Lift a standing directive: pass the `id` that `board.directive` returned \
-         (it is also shown in brackets on each standing directive you see each \
-         turn). Units stop seeing it from their next turn. An unknown or already \
-         retracted id is reported and changes nothing."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "required": ["id"],
-            "properties": {
-                "id": {
-                    "type": "string",
-                    "description": "The `id` `board.directive` returned for the directive to lift"
-                }
-            }
-        })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &rupu_tools::catalog::flow::BOARD_RETRACT
     }
 
     async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -594,7 +493,7 @@ impl Tool for BoardRetract {
             )));
         }
         Ok(match self.0.board.retract_directive(&id) {
-            Ok(()) => done(json!({ "ok": true, "retracted": id })),
+            Ok(()) => ok_json(json!({ "ok": true, "retracted": id })),
             Err(e) => failed(format!("could not retract directive: {e}")),
         })
     }
@@ -890,6 +789,19 @@ mod tests {
     }
 
     #[test]
+    fn the_legacy_coverage_status_name_resolves_to_goal_coverage_in_a_lead() {
+        // W1: the lead's goal-coverage tool was `coverage.status` before it
+        // became `goal.coverage`; a lead prompt naming the old tool still
+        // reaches it (a flow-lead-scoped alias).
+        let fx = fx();
+        let mut reg = rupu_agent::ToolRegistry::new();
+        for t in tools(&fx, vec![], None) {
+            reg.insert(t);
+        }
+        assert_eq!(reg.get("coverage.status").unwrap().name(), "goal.coverage");
+    }
+
+    #[test]
     fn exposes_the_five_tools() {
         let fx = fx();
         let mut names: Vec<_> = tools(&fx, vec![], None).iter().map(|t| t.name()).collect();
@@ -900,7 +812,7 @@ mod tests {
                 "board.directive",
                 "board.retract",
                 "budget.status",
-                "coverage.status",
+                "goal.coverage",
                 "goal.status"
             ]
         );
@@ -1123,7 +1035,7 @@ mod tests {
     #[tokio::test]
     async fn coverage_status_is_null_without_a_target() {
         let fx = fx();
-        let v = json_of(&call(&tools(&fx, vec![], None), "coverage.status", json!({})).await);
+        let v = json_of(&call(&tools(&fx, vec![], None), "goal.coverage", json!({})).await);
         assert_eq!(v, json!({ "coverage": null }));
     }
 
@@ -1138,7 +1050,7 @@ mod tests {
         let ts = tools(&fx, vec![], Some(target));
 
         // Nothing discovered yet: 0/0 is 0.0, never "satisfied".
-        let v = json_of(&call(&ts, "coverage.status", json!({})).await);
+        let v = json_of(&call(&ts, "goal.coverage", json!({})).await);
         assert_eq!(v["reach"], 0.5);
         assert_eq!(v["depth"], "enumerated");
         assert_eq!(v["fraction"], 0.0);
@@ -1160,7 +1072,7 @@ mod tests {
             host("10.0.0.1", Some("enumerated")) + &host("10.0.0.2", None),
         )
         .unwrap();
-        let v = json_of(&call(&ts, "coverage.status", json!({})).await);
+        let v = json_of(&call(&ts, "goal.coverage", json!({})).await);
         assert_eq!(v["fraction"], 0.5);
         assert_eq!(v["satisfied"], true);
         assert_eq!(v["per_kind"]["network:host"], 0.5);

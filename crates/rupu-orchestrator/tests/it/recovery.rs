@@ -9,7 +9,7 @@
 //! exactly which attempts the run made.
 
 use chrono::Utc;
-use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
+use rupu_agent::runner::{MockProvider, ScriptedTurn};
 use rupu_agent::{run_agent, AgentRunOpts};
 use rupu_orchestrator::executor::{Event, EventSink, JsonlSink};
 use rupu_orchestrator::recovery::{discover, AttemptPlan, PlanCounts, RecoveryPlans};
@@ -19,7 +19,6 @@ use rupu_providers::types::StopReason;
 use rupu_tools::ToolContext;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 const RUN_ID: &str = "run_recovery";
 
@@ -63,7 +62,7 @@ impl Fx {
             workspace_path: self.tmp.path().to_path_buf(),
             transcript_path: self.transcript(name),
             max_turns: 5,
-            decider: Arc::new(BypassDecider),
+            permission: rupu_tools::PermissionPolicy::bypass(),
             tool_context: ToolContext {
                 workspace_path: self.tmp.path().to_path_buf(),
                 ..Default::default()
@@ -71,7 +70,6 @@ impl Fx {
             user_message: "go".into(),
             initial_messages: Vec::new(),
             turn_index_offset: 0,
-            mode_str: "bypass".into(),
             no_stream: true,
             suppress_stream_stdout: true,
             mcp_registry: None,

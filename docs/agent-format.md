@@ -73,7 +73,7 @@ Everything after the closing `---` is the system prompt.
 | `outputSchema` | object (inline YAML) | no | none | JSON Schema for Anthropic structured outputs; only takes effect with `outputFormat: json` |
 | `dispatchableAgents` | array\<string\> | no | none (no dispatch) | Allowlist of agent names this agent may dispatch via `dispatch_agent` / `dispatch_agents_parallel` |
 | `concerns` | object | no | none | Coverage-concerns block; injects the coverage tools + catalog into the system prompt |
-| `findingsProfile` | `full` \| `summary` | no | `full` | Findings contract for `report_finding`; a workflow step's `findings_profile` or the workflow's `defaults.findings_profile` overrides it |
+| `findingsProfile` | `full` \| `summary` | no | `full` | Findings contract for `findings.report`; a workflow step's `findings_profile` or the workflow's `defaults.findings_profile` overrides it |
 | `fallbacks` | array of `{model, provider?}` | no | `[recovery].fallbacks` from config, else none | Ordered fallback models tried when a reply cannot be used (a refusal, say). Wins over the config table; not merged with it. See [response-outcomes.md](response-outcomes.md#3-configuring-fallbacks) |
 | `maxTokens` | integer | no | discovered output cap | Per-request output-token cap. Overrides the cap discovered from the provider's model list; when neither is known, Anthropic gets `8192` and other providers get no cap (model max). `0` is ignored. Extended thinking (`effort`) draws from this budget |
 | `contextWindowTokens` | integer | no | discovered input limit | Input-token limit used for proactive compaction. Overrides the discovered limit; compaction is off only when neither is known. `0` is ignored |
@@ -208,20 +208,62 @@ the coverage ledger like a `grep` hit.
 
 ### `permissionMode`
 
-Valid values:
+Valid values: `ask`, `bypass`, `readonly`.
 
-| Value | Meaning |
+Every tool declares one **effect**, and the mode decides each call from the
+effect alone — never from the tool's name, so a new tool is gated correctly
+the day it lands:
+
+| Effect | Examples |
 | --- | --- |
-| `ask` | prompt before shell and write effects |
-| `bypass` | execute allowed tools without confirmation |
-| `readonly` | allow reads, deny writes |
+| `read` | `read_file`, `grep`, `glob`, `ast_grep`, `findings.query`, `coverage.status`, `scm.prs.get`, `goal.status`, `join` |
+| `record` | rupu's own bookkeeping: `findings.report`, `findings.verify`, `findings.tag`, `assets.mark`, `coverage.mark`, `board.post`, `msg.send` |
+| `write` | changes the workspace or runs code: `bash`, `write_file`, `edit_file` |
+| `external` | acts outside this machine: `scm.prs.create`, `scm.branches.create`, `issues.comment`, `issues.create`, `github.workflows_dispatch` |
+| `spawn` | starts another run or model call: `dispatch_agent`, `dispatch_agents_parallel`, `dispatch`, `run_workflow`, `workflows.generate` |
 
-`readonly` blocks:
+| Effect ↓ / Mode → | `bypass` | `ask` (interactive) | `ask` (no operator) | `readonly` |
+| --- | --- | --- | --- | --- |
+| read | allow | allow | allow | allow |
+| record | allow | allow | allow | allow |
+| write | allow | **prompt** | allow, with a notice | **deny** |
+| external | allow | **prompt** | allow, with a notice | **deny** |
+| spawn | allow; child keeps its own mode | allow; child capped at `ask` | allow; child capped at `ask` | allow; **child capped at `readonly`** |
 
-- built-in writes: `write_file`, `edit_file`, destructive shell work via `bash`
-- MCP write tools such as `scm.prs.create`, `issues.comment`, `issues.create`, `scm.branches.create`
+- **A child never has more than its parent.** A sub-agent runs at the more
+  restrictive of the parent's mode and its own `permissionMode`; a readonly
+  run's children are readonly whatever their frontmatter says. An interactive
+  parent's operator answers its children's prompts, one at a time.
+- **`readonly` still records findings.** It means "no change to your
+  workspace or the outside world"; rupu's own ledgers are bookkeeping, so a
+  readonly reviewer can report, tag and verify findings.
+- **`ask` without an operator** (a workflow step, a session turn, a flow, a
+  detached run) cannot prompt, so it allows write/external calls and the
+  transcript says so once with a `permission_mode_degraded` notice. An
+  interactive `rupu run` in `ask` prompts; a non-TTY `rupu run` in `ask`
+  is refused at startup.
+- **"Allow always"** (`a` at the prompt) allows that one tool for the rest of
+  the run, not every tool.
 
-`ask` is the safest default for agents that edit code. In non-interactive contexts, `ask` cannot proceed; use `--mode bypass` or `--mode readonly` explicitly.
+`ask` is the safest default for agents that edit code. Pass `--mode readonly`
+for unattended runs that must not change anything.
+
+#### Tool names
+
+Tools are named `namespace.verb` (`findings.report`, `coverage.mark`); the
+core fs/shell tools stay unqualified (`bash`, `read_file`, …). Earlier names
+remain accepted forever, in `tools:` and when a model calls them, as aliases:
+
+| Canonical | Also accepted |
+| --- | --- |
+| `findings.report` | `report_finding`, `findings.record` |
+| `findings.verify` | `finding.verify` |
+| `findings.query` / `findings.tag` | `query_findings` / `tag_findings` |
+| `assets.mark` | `asset_mark` |
+| `coverage.mark` / `coverage.status` / `coverage.remaining` | `coverage_mark` / `coverage_status` / `coverage_remaining` |
+| `coverage.concerns.search` / `coverage.concerns.detail` | `coverage_concerns_search` / `coverage_concerns_detail` |
+| `workflows.generate` | `generate_workflow` |
+| `goal.coverage` (agentiflow lead) | `coverage.status`, inside a lead only |
 
 ### `maxTurns`
 
@@ -351,14 +393,14 @@ Coverage-concerns block (see `docs/coverage.md`). When present, the runner flatt
 
 ### `findingsProfile`
 
-Selects the contract an agent's findings are recorded under. It governs the agent's `report_finding` builtin, whether the tool comes from a `concerns:` block (which injects the coverage tools) or from an explicit `tools: [report_finding]` grant.
+Selects the contract an agent's findings are recorded under. It governs the agent's `findings.report` builtin, whether the tool comes from a `concerns:` block (which injects the coverage tools) or from an explicit `tools: [findings.report]` grant.
 
-- `full` (default) — findings must include a complete `report` (see `rupu findings schema`). The tool rejects `summary`, `severity`, and `evidence` as separate arguments: rupu derives them from the report (`summary` from `title`, `severity` from `rating.risk_rating`, `evidence.rationale` from `root_cause`). A rejected call lists every validation problem at once so the agent can fix them all in one retry. When the run can record findings (a `concerns:` block or `report_finding` in `tools:`), finding-writing guidance is appended to the system prompt. rupu generates the Markdown, HTML and PDF reports from the stored report (see [coverage.md](coverage.md#exporting-reports)), so an agent should not also write a report file.
+- `full` (default) — findings must include a complete `report` (see `rupu findings schema`). The tool rejects `summary`, `severity`, and `evidence` as separate arguments: rupu derives them from the report (`summary` from `title`, `severity` from `rating.risk_rating`, `evidence.rationale` from `root_cause`). A rejected call lists every validation problem at once so the agent can fix them all in one retry. When the run can record findings (a `concerns:` block or `findings.report` in `tools:`), finding-writing guidance is appended to the system prompt. rupu generates the Markdown, HTML and PDF reports from the stored report (see [coverage.md](coverage.md#exporting-reports)), so an agent should not also write a report file.
 - `summary` — the lightweight `summary` / `severity` / `evidence` record. A `report` sent under `summary` is refused rather than silently dropped.
 
 A workflow step's `findings_profile` or the workflow's `defaults.findings_profile` overrides this value. The order is step → workflow defaults → agent `findingsProfile` → `full`; see [workflow-format.md](workflow-format.md#findings_profile). A standalone `rupu run <agent>` uses `--findings-profile full|summary` when given, then the agent's value, then `full`. The flag is also how a remote workflow step's profile reaches the host that runs the agent. Sub-agents started through `dispatch_agent` resolve only from their own agent file.
 
-**Upgrade note:** because the built-in default is `full`, an existing agent that records thin findings (a `concerns:` block, or `report_finding` in `tools:`) is now rejected unless it sets `findingsProfile: summary` (or its workflow sets `findings_profile: summary`), or its prompt is updated to send a complete `report`.
+**Upgrade note:** because the built-in default is `full`, an existing agent that records thin findings (a `concerns:` block, or `findings.report` in `tools:`) is now rejected unless it sets `findingsProfile: summary` (or its workflow sets `findings_profile: summary`), or its prompt is updated to send a complete `report`.
 
 **Remote hosts:** agent frontmatter rejects unknown keys, so a rupu release that predates `findingsProfile` refuses to load an agent file that sets it. A workflow step placed on a remote host (`host:` / `distribute:`) resolves its profile from the agent file on that host, so upgrade rupu on every remote host before adding `findingsProfile` to agents they run.
 

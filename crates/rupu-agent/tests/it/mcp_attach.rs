@@ -2,7 +2,7 @@
 //! the MCP-backed tools to appear in the runner's tool registry.
 
 use rupu_agent::run_agent;
-use rupu_agent::runner::{AgentRunOpts, BypassDecider, CapturingMockProvider, ScriptedTurn};
+use rupu_agent::runner::{AgentRunOpts, CapturingMockProvider, ScriptedTurn};
 use rupu_providers::types::StopReason;
 use rupu_scm::Registry;
 use rupu_tools::ToolContext;
@@ -39,12 +39,11 @@ async fn offered_tools(agent_tools: Option<Vec<String>>) -> Vec<String> {
         workspace_path: tmp.path().to_path_buf(),
         transcript_path: tmp.path().join("run.jsonl"),
         max_turns: 5,
-        decider: Arc::new(BypassDecider),
+        permission: rupu_tools::PermissionPolicy::bypass(),
         tool_context: ToolContext::default(),
         user_message: "list repos".into(),
         initial_messages: Vec::new(),
         turn_index_offset: 0,
-        mode_str: "bypass".into(),
         no_stream: true,
         suppress_stream_stdout: false,
         mcp_registry: Some(Arc::new(Registry::empty())),

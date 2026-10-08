@@ -4,8 +4,9 @@
 
 use crate::error::McpError;
 use crate::permission::McpPermission;
-use crate::tools::{self, ToolKind};
+use crate::tools;
 use rupu_scm::Registry;
+use rupu_tools::Effect;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -80,8 +81,8 @@ impl ToolDispatcher {
         args: Value,
         findings_profile: Option<rupu_coverage::FindingProfile>,
     ) -> Result<String, McpError> {
-        let kind = self.kind_for(name)?;
-        self.permission.check(name, kind)?;
+        let (name, effect) = self.effect_for(name)?;
+        self.permission.check(name, effect)?;
         match name {
             "scm.repos.list" => tools::scm_repos::dispatch_list(args, &self.registry).await,
             "scm.repos.get" => tools::scm_repos::dispatch_get(args, &self.registry).await,
@@ -157,10 +158,11 @@ impl ToolDispatcher {
         }
     }
 
-    fn kind_for(&self, name: &str) -> Result<ToolKind, McpError> {
+    /// The catalog's own (static) name and the effect of the tool `name`.
+    fn effect_for(&self, name: &str) -> Result<(&'static str, Effect), McpError> {
         for spec in tools::tool_catalog() {
             if spec.name == name {
-                return Ok(spec.kind);
+                return Ok((spec.name, spec.effect()));
             }
         }
         Err(McpError::UnknownTool(name.to_string()))
@@ -221,11 +223,11 @@ mod is_blocked_tests {
         let narrow = wide.narrowed_to("issues.comment");
 
         assert!(narrow
-            .check("issues.comment", crate::tools::ToolKind::Write)
+            .check("issues.comment", rupu_tools::Effect::External)
             .is_ok());
         assert!(
             narrow
-                .check("scm.prs.create", crate::tools::ToolKind::Write)
+                .check("scm.prs.create", rupu_tools::Effect::External)
                 .is_err(),
             "a narrowed permission must refuse a tool outside its single-entry allowlist"
         );
@@ -240,7 +242,7 @@ mod is_blocked_tests {
         let narrow = ro.narrowed_to("issues.comment");
         assert!(
             narrow
-                .check("issues.comment", crate::tools::ToolKind::Write)
+                .check("issues.comment", rupu_tools::Effect::External)
                 .is_err(),
             "narrowing must preserve readonly's refusal of Write tools"
         );

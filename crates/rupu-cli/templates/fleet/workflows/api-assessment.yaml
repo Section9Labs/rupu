@@ -15,9 +15,9 @@ steps:
       {{ inputs.scope }}
 
       First enumerate endpoints (from the provided spec, or by probing),
-      calling `asset_mark` for the service and each endpoint. Then work the
+      calling `assets.mark` for the service and each endpoint. Then work the
       OWASP API Top 10 against each endpoint, verify before reporting, and
-      `report_finding` every verified issue (pinned to an endpoint via
+      `findings.report` every verified issue (pinned to an endpoint via
       http_route, with an OWASP-API/CWE classification and a required
       http_exchange evidence block). Test ONLY endpoints inside the scope
       above; no destructive actions. Return a per-endpoint summary of what

@@ -7,12 +7,11 @@
 //! at all. It reported findings somewhere else entirely and the control plane
 //! showed zero.
 
-use rupu_agent::runner::{BypassDecider, CapturingMockProvider, ScriptedTurn};
+use rupu_agent::runner::{CapturingMockProvider, ScriptedTurn};
 use rupu_agent::{run_agent, AgentRunOpts};
 use rupu_coverage::{target_id, CoveragePaths};
 use rupu_providers::types::StopReason;
 use rupu_tools::ToolContext;
-use std::sync::Arc;
 
 /// A finding with no `file_path` — the shape a network assessment produces.
 fn finding_input() -> serde_json::Value {
@@ -44,7 +43,7 @@ pub(crate) fn opts_for(
         workspace_path: workspace.to_path_buf(),
         transcript_path: workspace.join("run.jsonl"),
         max_turns: 5,
-        decider: Arc::new(BypassDecider),
+        permission: rupu_tools::PermissionPolicy::bypass(),
         tool_context: ToolContext {
             workspace_path: workspace.to_path_buf(),
             // These tests exercise the lightweight record.
@@ -57,7 +56,6 @@ pub(crate) fn opts_for(
         user_message: "Assess the endpoint.".into(),
         initial_messages: Vec::new(),
         turn_index_offset: 0,
-        mode_str: "bypass".into(),
         no_stream: true,
         suppress_stream_stdout: false,
         mcp_registry: None,

@@ -10,6 +10,7 @@
 //! as success; anything else surfaces stderr in `error`.
 
 use crate::coverage_emit::{attribution_from, emit};
+use crate::descriptor::{Effect, ToolDescriptor};
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -34,31 +35,37 @@ struct Input {
 #[derive(Debug, Default, Clone)]
 pub struct GrepTool;
 
+/// This tool's descriptor.
+pub static DESCRIPTOR: ToolDescriptor = ToolDescriptor {
+    name: "grep",
+    aliases: &[],
+    effect: Effect::Read,
+    needs: &[],
+    description: "Search the workspace for a pattern using ripgrep. Output is `path:line:match` lines, gitignore-aware. Use this to locate symbols, callers, or any text across the workspace. Returns empty stdout (not an error) when there are no matches.",
+    input_schema: descriptor_schema,
+};
+
+fn descriptor_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "pattern": {
+                "type": "string",
+                "description": "Regex pattern to search for. Ripgrep's default regex syntax (similar to PCRE)."
+            },
+            "path": {
+                "type": "string",
+                "description": "Optional sub-path within the workspace to restrict the search. Defaults to the whole workspace."
+            }
+        },
+        "required": ["pattern"]
+    })
+}
+
 #[async_trait]
 impl Tool for GrepTool {
-    fn name(&self) -> &'static str {
-        "grep"
-    }
-
-    fn description(&self) -> &'static str {
-        "Search the workspace for a pattern using ripgrep. Output is `path:line:match` lines, gitignore-aware. Use this to locate symbols, callers, or any text across the workspace. Returns empty stdout (not an error) when there are no matches."
-    }
-
-    fn input_schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "pattern": {
-                    "type": "string",
-                    "description": "Regex pattern to search for. Ripgrep's default regex syntax (similar to PCRE)."
-                },
-                "path": {
-                    "type": "string",
-                    "description": "Optional sub-path within the workspace to restrict the search. Defaults to the whole workspace."
-                }
-            },
-            "required": ["pattern"]
-        })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &DESCRIPTOR
     }
 
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {

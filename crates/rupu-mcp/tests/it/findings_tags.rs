@@ -69,21 +69,25 @@ async fn tag_then_query_by_tag() {
 }
 
 #[tokio::test]
-async fn readonly_mode_blocks_findings_tag_but_not_query() {
+async fn readonly_mode_allows_findings_tag_and_query() {
+    // D4 (W1): readonly denies workspace writes and external actions, never
+    // rupu's own bookkeeping — `findings.tag` is a Record tool, so it reaches
+    // the ledger (here: refused for an unknown id, not by the mode).
     let tmp = tempfile::TempDir::new().unwrap();
     let d = ToolDispatcher::new(
         Arc::new(Registry::default()),
         McpPermission::new(PermissionMode::Readonly, vec!["*".into()]),
     )
     .with_findings(ctx(tmp.path()));
-    let err = d
+    let res = d
         .call(
             "findings.tag",
             serde_json::json!({"finding_ids": ["fnd_x"], "add": ["x"]}),
         )
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("readonly"), "{err}");
+        .await;
+    assert!(!ToolDispatcher::is_blocked(&res), "{res:?}");
+    let err = res.unwrap_err();
+    assert!(err.to_string().contains("unknown finding id"), "{err}");
     assert!(d
         .call("findings.query", serde_json::json!({}))
         .await

@@ -1354,7 +1354,7 @@
           "type": "string"
         },
         "tags": {
-          "description": "Free-form tags: lowercase a-z, 0-9 and . _ : / -, starting with a letter or digit, e.g. class:sqli, needs-poc. Reuse tags already in use where they fit (query_findings / findings.query list them).",
+          "description": "Free-form tags: lowercase a-z, 0-9 and . _ : / -, starting with a letter or digit, e.g. class:sqli, needs-poc. Reuse tags already in use where they fit (findings.query lists them).",
           "items": {
             "type": "string"
           },
@@ -1414,7 +1414,7 @@
           "type": "array"
         },
         "finding_ids": {
-          "description": "Finding ids (fnd_…) from query_findings or report_finding.",
+          "description": "Finding ids (fnd_…) from findings.query or findings.report.",
           "items": {
             "type": "string"
           },

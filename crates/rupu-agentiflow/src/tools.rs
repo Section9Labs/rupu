@@ -11,7 +11,9 @@
 
 use async_trait::async_trait;
 use rupu_fleet::{Board, BoardPost, ClaimGuard, ClaimOutcome, FleetMessage, Mailbox, PostKind};
-use rupu_tools::{Tool, ToolContext, ToolError, ToolOutput};
+use rupu_tools::catalog::flow::MAX_READ_LIMIT;
+use rupu_tools::output::{failed, ok, opt_str, req_str};
+use rupu_tools::{Tool, ToolContext, ToolDescriptor, ToolError, ToolOutput};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -26,8 +28,6 @@ const DEFAULT_MSG_CAP: usize = 256;
 const BROADCAST: &str = "broadcast";
 /// Posts `board.read` returns when `limit` is omitted.
 const DEFAULT_READ_LIMIT: usize = 50;
-/// Hard ceiling on `board.read`'s `limit`, so one call cannot flood the context.
-const MAX_READ_LIMIT: usize = 500;
 
 /// Run-scoped handles the five fleet tools share.
 ///
@@ -78,53 +78,6 @@ pub fn fleet_tools(ctx: Arc<FleetToolCtx>) -> Vec<Arc<dyn Tool>> {
 
 // ---- argument + output helpers ---------------------------------------------
 
-/// A successful result.
-fn done(stdout: impl Into<String>) -> ToolOutput {
-    ToolOutput {
-        stdout: stdout.into(),
-        error: None,
-        duration_ms: 0,
-        derived: None,
-        structured: None,
-    }
-}
-
-/// A store failure the model should see (not a run-aborting `Err`).
-fn failed(msg: impl Into<String>) -> ToolOutput {
-    ToolOutput {
-        stdout: String::new(),
-        error: Some(msg.into()),
-        duration_ms: 0,
-        derived: None,
-        structured: None,
-    }
-}
-
-/// A required, non-blank string argument.
-fn req_str<'a>(input: &'a Value, key: &str) -> Result<&'a str, ToolError> {
-    match input.get(key).and_then(Value::as_str).map(str::trim) {
-        Some(s) if !s.is_empty() => Ok(s),
-        _ => Err(ToolError::InvalidInput(format!(
-            "{key} (non-empty string) required"
-        ))),
-    }
-}
-
-/// An optional string argument: absent, `null` and blank are all `None`; any
-/// other non-string value is an error rather than silently ignored.
-fn opt_str(input: &Value, key: &str) -> Result<Option<String>, ToolError> {
-    match input.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(s)) => {
-            let s = s.trim();
-            Ok((!s.is_empty()).then(|| s.to_string()))
-        }
-        Some(_) => Err(ToolError::InvalidInput(format!(
-            "{key} must be a string when given"
-        ))),
-    }
-}
-
 fn parse_kind(s: &str) -> Result<PostKind, ToolError> {
     match s.trim().to_ascii_lowercase().as_str() {
         "observation" => Ok(PostKind::Observation),
@@ -155,26 +108,8 @@ struct BoardClaim(Arc<FleetToolCtx>);
 
 #[async_trait]
 impl Tool for BoardClaim {
-    fn name(&self) -> &'static str {
-        "board.claim"
-    }
-
-    fn description(&self) -> &'static str {
-        "Atomically claim a work unit so no other participant duplicates it. \
-         Returns granted, or the current holder when it is already claimed."
-    }
-
-    fn input_schema(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "required": ["work_unit"],
-            "properties": {
-                "work_unit": {
-                    "type": "string",
-                    "description": "Identifier of the unit of work to claim, e.g. host:1.1.2.2"
-                }
-            }
-        })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &rupu_tools::catalog::flow::BOARD_CLAIM
     }
 
     async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -185,15 +120,15 @@ impl Tool for BoardClaim {
         // would be Denied by its own first claim.
         let mut held = c.claims();
         if held.contains_key(key) {
-            return Ok(done(format!("granted (already held by you): {key}")));
+            return Ok(ok(format!("granted (already held by you): {key}")));
         }
         match c.board.claim(key, &c.participant, DEFAULT_CLAIM_TTL) {
             Ok(ClaimOutcome::Granted(guard)) => {
                 held.insert(key.to_string(), guard);
-                Ok(done(format!("granted: {key}")))
+                Ok(ok(format!("granted: {key}")))
             }
             Ok(ClaimOutcome::Denied { holder }) => {
-                Ok(done(format!("denied: {key} held by {holder}")))
+                Ok(ok(format!("denied: {key} held by {holder}")))
             }
             Err(e) => Ok(failed(format!("board.claim failed: {e}"))),
         }
@@ -207,26 +142,8 @@ struct BoardRelease(Arc<FleetToolCtx>);
 
 #[async_trait]
 impl Tool for BoardRelease {
-    fn name(&self) -> &'static str {
-        "board.release"
-    }
-
-    fn description(&self) -> &'static str {
-        "Release a work unit you previously claimed with board.claim, so another \
-         participant can take it."
-    }
-
-    fn input_schema(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "required": ["work_unit"],
-            "properties": {
-                "work_unit": {
-                    "type": "string",
-                    "description": "Identifier of the claimed unit of work to release"
-                }
-            }
-        })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &rupu_tools::catalog::flow::BOARD_RELEASE
     }
 
     async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -237,9 +154,9 @@ impl Tool for BoardRelease {
         Ok(match removed {
             Some(guard) => {
                 drop(guard);
-                done(format!("released: {key}"))
+                ok(format!("released: {key}"))
             }
-            None => done(format!("not held by you: {key} (nothing to release)")),
+            None => ok(format!("not held by you: {key} (nothing to release)")),
         })
     }
 }
@@ -251,32 +168,8 @@ struct BoardPostTool(Arc<FleetToolCtx>);
 
 #[async_trait]
 impl Tool for BoardPostTool {
-    fn name(&self) -> &'static str {
-        "board.post"
-    }
-
-    fn description(&self) -> &'static str {
-        "Post to the shared board every participant can read: an observation, a \
-         question, an answer, a vote, or a note. Optionally address it to a \
-         participant id or role."
-    }
-
-    fn input_schema(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "required": ["kind", "body"],
-            "properties": {
-                "kind": {
-                    "type": "string",
-                    "enum": ["observation", "question", "answer", "vote", "note"]
-                },
-                "body": { "type": "string" },
-                "addressed_to": {
-                    "type": "string",
-                    "description": "Participant id or role this post is for; omit for everyone"
-                }
-            }
-        })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &rupu_tools::catalog::flow::BOARD_POST
     }
 
     async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -292,7 +185,7 @@ impl Tool for BoardPostTool {
             addressed_to,
         };
         Ok(match c.board.post(&post) {
-            Ok(()) => done(format!("posted [{}]", kind_str(kind))),
+            Ok(()) => ok(format!("posted [{}]", kind_str(kind))),
             Err(e) => failed(format!("board.post failed: {e}")),
         })
     }
@@ -305,32 +198,8 @@ struct BoardRead(Arc<FleetToolCtx>);
 
 #[async_trait]
 impl Tool for BoardRead {
-    fn name(&self) -> &'static str {
-        "board.read"
-    }
-
-    fn description(&self) -> &'static str {
-        "Read the shared board's posts, oldest first, newest last. Returns the \
-         most recent posts (default 50); filter to those addressed to a \
-         participant id or role with addressed_to."
-    }
-
-    fn input_schema(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "addressed_to": {
-                    "type": "string",
-                    "description": "Only posts addressed to this participant id or role"
-                },
-                "limit": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": MAX_READ_LIMIT,
-                    "description": "Maximum posts to return (the most recent ones); default 50"
-                }
-            }
-        })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &rupu_tools::catalog::flow::BOARD_READ
     }
 
     async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -352,7 +221,7 @@ impl Tool for BoardRead {
             posts.retain(|p| p.addressed_to.as_deref() == Some(to.as_str()));
         }
         if posts.is_empty() {
-            return Ok(done("(no posts)"));
+            return Ok(ok("(no posts)"));
         }
         let skip = posts.len().saturating_sub(limit);
         let lines: Vec<String> = posts
@@ -374,7 +243,7 @@ impl Tool for BoardRead {
                 )
             })
             .collect();
-        Ok(done(lines.join("\n")))
+        Ok(ok(lines.join("\n")))
     }
 }
 
@@ -386,29 +255,8 @@ struct MsgSend(Arc<FleetToolCtx>);
 
 #[async_trait]
 impl Tool for MsgSend {
-    fn name(&self) -> &'static str {
-        "msg.send"
-    }
-
-    fn description(&self) -> &'static str {
-        "Send a message. `to` is a participant id, a role, \"parent\", or \
-         \"lead\" (delivered to exactly that inbox), or \"broadcast\" (every \
-         participant sees it once, from the moment it started listening; the \
-         broadcast log is capped per run, so don't spam it)."
-    }
-
-    fn input_schema(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "required": ["to", "body"],
-            "properties": {
-                "to": {
-                    "type": "string",
-                    "description": "Recipient inbox: participant id, role, parent, lead or broadcast"
-                },
-                "body": { "type": "string" }
-            }
-        })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &rupu_tools::catalog::flow::MSG_SEND
     }
 
     async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -429,7 +277,7 @@ impl Tool for MsgSend {
             c.mailbox.send(to, &msg, c.msg_cap)
         };
         Ok(match sent {
-            Ok(()) => done(format!("sent to {to}")),
+            Ok(()) => ok(format!("sent to {to}")),
             Err(e) => failed(format!("msg.send failed: {e}")),
         })
     }

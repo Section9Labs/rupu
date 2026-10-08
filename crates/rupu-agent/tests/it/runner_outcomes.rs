@@ -3,7 +3,7 @@
 //! warning stop, and replay rebuilds exactly what the runner sent.
 
 use rupu_agent::recovery::{malformed_note, EMPTY_REPLY_NOTE, TRUNCATION_NOTE};
-use rupu_agent::runner::{BypassDecider, CapturingMockProvider, MockProvider, ScriptedTurn};
+use rupu_agent::runner::{CapturingMockProvider, MockProvider, ScriptedTurn};
 use rupu_agent::{run_agent, AgentRunOpts, RunResult};
 use rupu_providers::model_limits::ModelLimits;
 use rupu_providers::types::{
@@ -35,7 +35,7 @@ fn build_opts(
         workspace_path: tmp.path().to_path_buf(),
         transcript_path,
         max_turns: 10,
-        decider: Arc::new(BypassDecider),
+        permission: rupu_tools::PermissionPolicy::bypass(),
         tool_context: ToolContext {
             workspace_path: tmp.path().to_path_buf(),
             ..Default::default()
@@ -43,7 +43,6 @@ fn build_opts(
         user_message: "write the answer".into(),
         initial_messages: Vec::new(),
         turn_index_offset: 0,
-        mode_str: "bypass".into(),
         no_stream: true,
         suppress_stream_stdout: false,
         mcp_registry: None,

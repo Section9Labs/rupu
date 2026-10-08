@@ -13,7 +13,7 @@
 //! * `run_workflow { workflow, inputs? }` starts a pool WORKFLOW as a unit (its
 //!   own `rupu workflow run` process), after five fail-closed checks that all
 //!   run before anything is spawned (see [`RunWorkflowTool`]).
-//! * `generate_workflow { description, inputs? }` (offered only when the run has
+//! * `workflows.generate { description, inputs? }` (offered only when the run has
 //!   a [`GenerationCapability`]) authors a NEW workflow with the lead's own
 //!   provider, vets it fail-closed against the pool, writes it under the run
 //!   dir and starts it as a unit (see [`GenerateWorkflowTool`]).
@@ -35,7 +35,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use rupu_orchestrator::generate::{generate_definition_with_provider, GenKind, GenerateRequest};
 use rupu_orchestrator::Workflow;
-use rupu_tools::{Tool, ToolContext, ToolError, ToolOutput};
+use rupu_tools::catalog::flow::MAX_JOIN_TIMEOUT_SECS;
+use rupu_tools::output::{failed, ok, req_str};
+use rupu_tools::{Tool, ToolContext, ToolDescriptor, ToolError, ToolOutput};
 use serde_json::{json, Value};
 
 use crate::lead::GenerationCapability;
@@ -48,9 +50,6 @@ pub const MAX_DEPTH: u32 = 5;
 
 /// How long `join` waits when `timeout_secs` is omitted.
 const DEFAULT_JOIN_TIMEOUT_SECS: u64 = 300;
-/// Hard ceiling on `join`'s `timeout_secs`, so one call cannot park a lead turn
-/// forever; the lead can join again to keep waiting.
-const MAX_JOIN_TIMEOUT_SECS: u64 = 3600;
 
 /// What the two tools share.
 struct DispatchCtx {
@@ -124,12 +123,12 @@ pub struct WorkflowToolCtx {
 }
 
 /// The lead's `dispatch`, `join` and `run_workflow` tools (the lead is depth 0),
-/// plus `generate_workflow` when `generation` is given.
+/// plus `workflows.generate` when `generation` is given.
 ///
 /// All of them share ONE participant counter: an agent and a workflow with the
 /// same name must never mint the same `<name>#<n>`, because the supervisor
 /// registers a broadcast cursor per participant. `run_dir` is where
-/// `generate_workflow` materializes the workflows it authors
+/// `workflows.generate` materializes the workflows it authors
 /// (`<run_dir>/generated/`).
 pub fn fleet_unit_tools(
     sup: Arc<FleetSupervisor>,
@@ -162,37 +161,6 @@ pub fn fleet_unit_tools(
 
 // ---- output / argument helpers ---------------------------------------------
 
-fn done(stdout: impl Into<String>) -> ToolOutput {
-    ToolOutput {
-        stdout: stdout.into(),
-        error: None,
-        duration_ms: 0,
-        derived: None,
-        structured: None,
-    }
-}
-
-/// A refusal / failure the model should see (not a run-aborting `Err`).
-fn failed(msg: impl Into<String>) -> ToolOutput {
-    ToolOutput {
-        stdout: String::new(),
-        error: Some(msg.into()),
-        duration_ms: 0,
-        derived: None,
-        structured: None,
-    }
-}
-
-/// A required, non-blank string argument.
-fn req_str<'a>(input: &'a Value, key: &str) -> Result<&'a str, ToolError> {
-    match input.get(key).and_then(Value::as_str).map(str::trim) {
-        Some(s) if !s.is_empty() => Ok(s),
-        _ => Err(ToolError::InvalidInput(format!(
-            "{key} (non-empty string) required"
-        ))),
-    }
-}
-
 // ---- dispatch --------------------------------------------------------------
 
 /// `dispatch { agent, prompt }` -> `{ "handle": "<unit id>" }`.
@@ -200,32 +168,8 @@ struct DispatchTool(Arc<DispatchCtx>);
 
 #[async_trait]
 impl Tool for DispatchTool {
-    fn name(&self) -> &'static str {
-        "dispatch"
-    }
-
-    fn description(&self) -> &'static str {
-        "Start a pool agent as an independent unit working on a prompt, in its own \
-         process. Returns a handle immediately without waiting; pass it to `join` \
-         to wait for the unit's result. Only agents in the flow's pool can be \
-         dispatched."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "required": ["agent", "prompt"],
-            "properties": {
-                "agent": {
-                    "type": "string",
-                    "description": "Name of a pool agent to run"
-                },
-                "prompt": {
-                    "type": "string",
-                    "description": "The unit's task: what to do and what to report back"
-                }
-            }
-        })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &rupu_tools::catalog::flow::DISPATCH
     }
 
     async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -257,7 +201,7 @@ impl Tool for DispatchTool {
         };
         let participant = spec.participant.clone();
         Ok(match c.sup.dispatch(spec) {
-            Ok(handle) => done(json!({ "handle": handle, "participant": participant }).to_string()),
+            Ok(handle) => ok(json!({ "handle": handle, "participant": participant }).to_string()),
             Err(e) => failed(format!("dispatch failed: {e}")),
         })
     }
@@ -316,34 +260,8 @@ fn workflow_inputs(input: &Value) -> Result<BTreeMap<String, String>, String> {
 
 #[async_trait]
 impl Tool for RunWorkflowTool {
-    fn name(&self) -> &'static str {
-        "run_workflow"
-    }
-
-    fn description(&self) -> &'static str {
-        "Start a pool workflow as an independent unit, in its own process. Returns \
-         a handle immediately without waiting; pass it to `join` to wait for the \
-         workflow's result. Only workflows in the flow's pool can be started, and \
-         only if every agent they dispatch is also in the pool. Workflows with an \
-         approval gate or a host / distribute placement cannot be run as a unit."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "required": ["workflow"],
-            "properties": {
-                "workflow": {
-                    "type": "string",
-                    "description": "Id of a pool workflow to run"
-                },
-                "inputs": {
-                    "type": "object",
-                    "description": "The workflow's declared inputs, as name: value pairs",
-                    "additionalProperties": { "type": ["string", "number", "boolean"] }
-                }
-            }
-        })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &rupu_tools::catalog::flow::RUN_WORKFLOW
     }
 
     async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -417,7 +335,7 @@ impl Tool for RunWorkflowTool {
         };
         let participant = spec.participant.clone();
         Ok(match c.sup.dispatch(spec) {
-            Ok(handle) => done(json!({ "handle": handle, "participant": participant }).to_string()),
+            Ok(handle) => ok(json!({ "handle": handle, "participant": participant }).to_string()),
             Err(e) => failed(format!("run_workflow failed: {e}")),
         })
     }
@@ -430,7 +348,7 @@ impl Tool for RunWorkflowTool {
 const GENERATE_CONSTRAINT: &str = "\n\nConstraints: the workflow runs unattended as a single \
 local process. Do NOT use approval gates (`approval:`), `host:`, or `distribute:`.";
 
-/// `generate_workflow { description, inputs? }` -> `{ "handle": .., "participant": ..,
+/// `workflows.generate { description, inputs? }` -> `{ "handle": .., "participant": ..,
 /// "generated_file": .. }`.
 ///
 /// Authors a NEW workflow with the lead's own provider (the
@@ -476,34 +394,8 @@ fn slug(name: &str) -> String {
 
 #[async_trait]
 impl Tool for GenerateWorkflowTool {
-    fn name(&self) -> &'static str {
-        "generate_workflow"
-    }
-
-    fn description(&self) -> &'static str {
-        "Author a NEW workflow for a described task and run it as an independent \
-         unit, in its own process. Returns a handle immediately without waiting; \
-         pass it to `join` to wait for the workflow's result. The workflow may \
-         only dispatch agents in this flow's pool; it runs unattended (no approval \
-         gates, no remote placement)."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "required": ["description"],
-            "properties": {
-                "description": {
-                    "type": "string",
-                    "description": "What the workflow should do, in plain language"
-                },
-                "inputs": {
-                    "type": "object",
-                    "description": "Values for any inputs the generated workflow declares, as name: value pairs",
-                    "additionalProperties": { "type": ["string", "number", "boolean"] }
-                }
-            }
-        })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &rupu_tools::catalog::flow::WORKFLOWS_GENERATE
     }
 
     async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -517,7 +409,7 @@ impl Tool for GenerateWorkflowTool {
         // 1. Depth guard, before any model call is paid for.
         if c.depth >= MAX_DEPTH {
             return Ok(failed(format!(
-                "generate_workflow refused: maximum dispatch depth ({MAX_DEPTH}) reached"
+                "workflows.generate refused: maximum dispatch depth ({MAX_DEPTH}) reached"
             )));
         }
 
@@ -586,14 +478,12 @@ impl Tool for GenerateWorkflowTool {
         };
         let participant = spec.participant.clone();
         Ok(match c.sup.dispatch(spec) {
-            Ok(handle) => done(
-                json!({
-                    "handle": handle,
-                    "participant": participant,
-                    "generated_file": path.display().to_string(),
-                })
-                .to_string(),
-            ),
+            Ok(handle) => ok(json!({
+                "handle": handle,
+                "participant": participant,
+                "generated_file": path.display().to_string(),
+            })
+            .to_string()),
             Err(e) => failed(format!("generated workflow failed to start: {e}")),
         })
     }
@@ -635,34 +525,8 @@ fn parse_timeout(input: &Value) -> Result<Duration, ToolError> {
 
 #[async_trait]
 impl Tool for JoinTool {
-    fn name(&self) -> &'static str {
-        "join"
-    }
-
-    fn description(&self) -> &'static str {
-        "Wait for a dispatched unit to finish and return its result. Reports \
-         status `done` (with the unit's output and whether it succeeded), `failed`, \
-         or `running` / `pending` if it has not finished within the timeout (join \
-         again to keep waiting)."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "required": ["handle"],
-            "properties": {
-                "handle": {
-                    "type": "string",
-                    "description": "The handle `dispatch` returned"
-                },
-                "timeout_secs": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": MAX_JOIN_TIMEOUT_SECS,
-                    "description": "How long to wait, in seconds; default 300"
-                }
-            }
-        })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &rupu_tools::catalog::flow::JOIN
     }
 
     async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -676,7 +540,7 @@ impl Tool for JoinTool {
             tokio::task::spawn_blocking(move || sup.join(&handle, timeout, &|| chrono::Utc::now()))
                 .await;
         Ok(match joined {
-            Ok(st) => done(status_json(&st).to_string()),
+            Ok(st) => ok(status_json(&st).to_string()),
             Err(e) => failed(format!("join failed: {e}")),
         })
     }
@@ -936,7 +800,7 @@ mod tests {
             dir.join("run"),
             None,
         );
-        // No generation capability: `generate_workflow` is not mounted, so the
+        // No generation capability: `workflows.generate` is not mounted, so the
         // pops below still land on run_workflow / join / dispatch.
         assert_eq!(v.len(), 3);
         let run_workflow = v.pop().unwrap();
@@ -1275,8 +1139,8 @@ mod tests {
     }
 
     /// The unit tools over a pool of exactly `writer`, engagement `network`, with
-    /// generation scripted to `turns`. Returns `(dispatch, generate_workflow,
-    /// run_dir)`; the tool order is dispatch, join, run_workflow, generate_workflow.
+    /// generation scripted to `turns`. Returns `(dispatch, workflows.generate,
+    /// run_dir)`; the tool order is dispatch, join, run_workflow, workflows.generate.
     fn gen_tools(
         launcher: Arc<MockUnitLauncher>,
         dir: &std::path::Path,
@@ -1299,7 +1163,7 @@ mod tests {
         );
         assert_eq!(
             v.iter().map(|t| t.name()).collect::<Vec<_>>(),
-            ["dispatch", "join", "run_workflow", "generate_workflow"]
+            ["dispatch", "join", "run_workflow", "workflows.generate"]
         );
         let generate = v.pop().unwrap();
         let _run_workflow = v.pop().unwrap();
@@ -1308,7 +1172,7 @@ mod tests {
         (dispatch, generate, run_dir)
     }
 
-    /// Invoke `generate_workflow`, assert it refused with `needle`, and that
+    /// Invoke `workflows.generate`, assert it refused with `needle`, and that
     /// nothing was spawned and no `generated/` dir (hence no file) was created.
     async fn assert_gen_refused(
         launcher: &MockUnitLauncher,

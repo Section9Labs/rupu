@@ -84,7 +84,7 @@ concerns:
     mode: index                          # one-line table, searched on demand
 ---
 You are a security assessor. For each (file × concern) you assess, call
-coverage_mark; for each issue, call report_finding…
+coverage.mark; for each issue, call findings.report…
 ```
 
 **Render modes.** `full` inlines each concern's body into the prompt; `index`
@@ -142,20 +142,20 @@ list them in the agent's `tools:`):
 
 | Tool | Purpose |
 |------|---------|
-| `coverage_mark` | record a `(concern, file)` verdict + evidence |
-| `report_finding` | record an issue — a complete `report` under the `full` profile (default), or `summary` / `severity` / `evidence` under `summary`; see [Finding reports](#finding-reports) |
-| `coverage_remaining` | list in-scope files still lacking an assertion |
-| `coverage_status` | summary of assessed-vs-gap progress |
-| `coverage_concerns_search` / `coverage_concerns_detail` | search / fetch full bodies for index-mode catalogs |
+| `coverage.mark` | record a `(concern, file)` verdict + evidence |
+| `findings.report` | record an issue — a complete `report` under the `full` profile (default), or `summary` / `severity` / `evidence` under `summary`; see [Finding reports](#finding-reports) |
+| `coverage.remaining` | list in-scope files still lacking an assertion |
+| `coverage.status` | summary of assessed-vs-gap progress |
+| `coverage.concerns.search` / `coverage.concerns.detail` | search / fetch full bodies for index-mode catalogs |
 
 Two more tools are **not** injected: grant them explicitly in the agent's
-`tools:` (like `report_finding` outside a `concerns:` agent). See
+`tools:` (like `findings.report` outside a `concerns:` agent). See
 [Who can tag](#who-can-tag).
 
 | Tool | Purpose |
 |------|---------|
-| `query_findings` | list the workspace's findings that match a query (`q`, in the [findings query language](#querying-findings)); returns a page of slim rows plus `tags_in_use` (explicit `tools:` grant) |
-| `tag_findings` | add or remove tags on one or many findings; returns each finding's tags before and after (explicit `tools:` grant) |
+| `findings.query` | list the workspace's findings that match a query (`q`, in the [findings query language](#querying-findings)); returns a page of slim rows plus `tags_in_use` (explicit `tools:` grant) |
+| `findings.tag` | add or remove tags on one or many findings; returns each finding's tags before and after (explicit `tools:` grant) |
 
 ## Finding reports
 
@@ -167,7 +167,7 @@ at the end of this section).
 
 ### Profiles
 
-| Profile | What `report_finding` / `findings.record` accepts |
+| Profile | What `findings.report` / `findings.record` accepts |
 |---------|----------------------------------------------------|
 | `full` (default) | A complete `report` object. `summary`, `severity`, and `evidence` are **rejected**: rupu derives them (`summary` ← `title`, `severity` ← `rating.risk_rating`, `evidence.rationale` ← `root_cause`). |
 | `summary` | The lightweight `summary` / `severity` / `evidence` record. A `report` is **refused**, never silently dropped. |
@@ -194,7 +194,7 @@ and `artifacts`. The rules below are enforced at write time; a
 rejected call returns **every** problem at once, each with its field path, so
 the agent can fix them all in one retry. (A structurally malformed JSON argument
 surfaces as a single parse error instead.) When a full-profile run can record
-findings (the agent has a `concerns:` block or `report_finding` in `tools:`),
+findings (the agent has a `concerns:` block or `findings.report` in `tools:`),
 finding-writing guidance is also appended to its system prompt, so the agent
 needs no external reporting-standard file.
 
@@ -205,7 +205,7 @@ and are left out of the schema the agent is shown:
 
 - `verification` (`{status: unverified|confirmed|disputed|inconclusive,
   by_run?, notes?}`) is set by verification runs, not by the agent that wrote
-  the finding. A `report_finding` / `findings.record` call that supplies it is
+  the finding. A `findings.report` / `findings.record` call that supplies it is
   rejected at `report.verification`.
 - Each evidence claim's `sha256` is the hash rupu takes of the claim's `file`
   at write time. Anything the agent sends there is discarded; a claim whose
@@ -268,7 +268,7 @@ harnesses) as workspace-relative paths. At write time rupu hashes each one:
 - A path that escapes the workspace, names the workspace root itself (`.`),
   does not exist, or names something other than a regular file (a device,
   socket, or the like) rejects the finding, so a typo is not silently dropped.
-- A remote workflow unit (`host:` / `distribute:`) runs `report_finding` on the
+- A remote workflow unit (`host:` / `distribute:`) runs `findings.report` on the
   host, so its artifacts are copied into **that host's** store. Every
   `rupu run` also streams its coverage (runs, file touches, concern
   assertions, findings, engagement assets) to
@@ -728,7 +728,7 @@ exactly one ledger (a project keeps one per coverage target). Two files for
 the same finding fail both.
 
 **What happens to the finding.** It becomes a full-profile finding. The report
-goes through the same validation as `report_finding` and attaches whole or not
+goes through the same validation as `findings.report` and attaches whole or not
 at all: a report that fails validation is listed with every problem and changes
 nothing, and the other reports in the run are still imported. `summary`,
 `severity` and `evidence` are re-derived from the report, as for any full
@@ -903,24 +903,24 @@ not gain any.
 
 ### Who can tag
 
-- **Agents.** `report_finding` takes an optional `tags` array, so a finding is
+- **Agents.** `findings.report` takes an optional `tags` array, so a finding is
   tagged as it is declared. Two more tools are explicit `tools:` grants, like
-  `report_finding` (an agent without the grant is not offered them):
+  `findings.report` (an agent without the grant is not offered them):
 
   ```yaml
-  tools: [read_file, query_findings, tag_findings]
+  tools: [read_file, findings.query, findings.tag]
   ```
 
-  `query_findings` lists the agent's own workspace's findings matching a query
+  `findings.query` lists the agent's own workspace's findings matching a query
   (`{q, limit, cursor}`; the language is under "Querying findings" below). It
   returns `{rows, next_cursor, total,
   tags_in_use}`: one page of slim rows, a cursor for the next, the number of
   matches, and every tag already used in the workspace with its count (so an
   agent reuses a tag instead of inventing a near-duplicate). `limit` defaults
   to 50 and is at most 500; `all: true` returns every match in one answer
-  instead (no `limit` or `cursor`). `tag_findings` adds or removes tags on one or many
+  instead (no `limit` or `cursor`). `findings.tag` adds or removes tags on one or many
   findings and returns each finding's tags before and after. Both work only on
-  the agent's own workspace, and `tag_findings` is allowed in `readonly` mode:
+  the agent's own workspace, and `findings.tag` is allowed in `readonly` mode:
   it annotates the ledger and never touches the workspace's files.
 - **Workflow `action:` steps.** The MCP catalog has `findings.query` and
   `findings.tag` (same inputs and results as the agent tools), and
@@ -1103,7 +1103,7 @@ never conflict on the file.
 ## Querying findings
 
 One single-line query language filters findings on every surface: `rupu
-findings list|tags`, the agent tool `query_findings`, the MCP tool
+findings list|tags`, the agent tool `findings.query`, the MCP tool
 `findings.query`, and the control plane's Findings page.
 
 ```
@@ -1179,7 +1179,7 @@ named `=high`; quote the query word (or the whole query). Put `--limit` and
   with: { q: "severity>=high tag:needs-poc -verified:confirmed", limit: 20 }
 ```
 
-An agent calls `query_findings` the same way (`{"q": "has:poc tag:class:xss"}`);
+An agent calls `findings.query` the same way (`{"q": "has:poc tag:class:xss"}`);
 a bad `q` comes back as a tool error with the parse message, and `cursor` is
 the previous page's `next_cursor`.
 
@@ -1199,7 +1199,7 @@ steps:
     max_parallel: 4
     prompt: |
       Write a proof of concept for finding {{ item.id }}: {{ item.title }}
-      ({{ item.location }}). When it works, tag it `has-poc` with tag_findings.
+      ({{ item.location }}). When it works, tag it `has-poc` with findings.tag.
 ```
 
 `| tojson` hands `for_each` an exact JSON array rather than relying on how the

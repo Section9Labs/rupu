@@ -9,7 +9,7 @@
 //! (the flag is already up).
 
 use async_trait::async_trait;
-use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
+use rupu_agent::runner::{MockProvider, ScriptedTurn};
 use rupu_agent::{run_agent, AgentRunOpts, RunError};
 use rupu_providers::credential_writes;
 use rupu_providers::types::{LlmRequest, LlmResponse, StopReason};
@@ -72,12 +72,11 @@ fn opts(
         workspace_path: ws,
         transcript_path: transcript,
         max_turns: 5,
-        decider: Arc::new(BypassDecider),
+        permission: rupu_tools::PermissionPolicy::bypass(),
         tool_context: ToolContext::default(),
         user_message: "go".into(),
         initial_messages: Vec::new(),
         turn_index_offset: 0,
-        mode_str: "bypass".into(),
         no_stream: false,
         suppress_stream_stdout: true,
         mcp_registry: None,

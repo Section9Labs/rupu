@@ -11,12 +11,9 @@
 use crate::runner::StepFactory;
 use crate::workflow::Workflow;
 use async_trait::async_trait;
-use rupu_agent::{
-    runner::BypassDecider, runner::PermissionDecider, runner::ReadonlyDecider, AgentRunOpts,
-    OnToolCallCallback,
-};
+use rupu_agent::{AgentRunOpts, OnToolCallCallback};
 use rupu_runtime::provider_factory;
-use rupu_tools::{AgentDispatcher, ToolContext};
+use rupu_tools::{AgentDispatcher, PermissionMode, PermissionPolicy, ToolContext};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -126,7 +123,9 @@ pub struct DefaultStepFactory {
     pub global: PathBuf,
     pub project_root: Option<PathBuf>,
     pub resolver: Arc<rupu_auth::KeychainResolver>,
-    pub mode_str: String,
+    /// The mode the workflow run was launched under; every agent step runs
+    /// under it (unattended: no operator prompter).
+    pub mode: PermissionMode,
     pub mcp_registry: Arc<rupu_scm::Registry>,
     /// Formatted `## Run target` text to append to each step's system prompt.
     /// `None` when no `--target` was supplied at workflow invocation.
@@ -502,29 +501,14 @@ impl StepFactory for DefaultStepFactory {
             workspace_path: workspace_path.clone(),
             transcript_path,
             max_turns: spec.max_turns.unwrap_or(50),
-            // `readonly` gets a real, non-interactive deny-writers decider
-            // (ISSUES.md I-24 needs this to be observable at the tool layer).
-            //
-            // `ask` and `bypass` both get `BypassDecider`, i.e. **`ask`
-            // grants full tool access in a workflow** (ISSUES.md I-78). That
-            // is deliberate, not an oversight: the agent runtime's `ask`
-            // decider blocks on stdin, and a workflow step has no operator
-            // present to answer — so a genuinely-prompting `ask` would hang
-            // every unattended run.
-            //
-            // Operator decision (2026-07-28): keep the behavior, make it
-            // visible. Changing `ask` to deny writers would break every
-            // existing workflow that writes without an explicit `--mode`,
-            // because `ask` is also the **default** when `--mode` is
-            // omitted. Instead `rupu workflow run` warns at startup when no
-            // mode was given, and `docs/workflow-format.md` states it
-            // plainly. Anyone wanting the restriction passes
-            // `--mode readonly`.
-            decider: if self.mode_str == "readonly" {
-                Arc::new(ReadonlyDecider) as Arc<dyn PermissionDecider>
-            } else {
-                Arc::new(BypassDecider) as Arc<dyn PermissionDecider>
-            },
+            // Unattended: a workflow step has no operator to prompt, so
+            // `ask` allows writes and says so once per step with a
+            // `permission_mode_degraded` notice (ISSUES.md I-78, D5). That is
+            // deliberate: `ask` is also the default when `--mode` is omitted,
+            // and a genuinely prompting `ask` would hang every unattended run.
+            // `rupu workflow run` warns at startup when no mode was given;
+            // `--mode readonly` denies writes and external actions.
+            permission: PermissionPolicy::unattended(self.mode),
             tool_context: ToolContext {
                 findings: Some(findings),
                 workspace_path,
@@ -552,12 +536,13 @@ impl StepFactory for DefaultStepFactory {
                 netflow_sink: tool_netflow_sink,
                 net_capture: self.net_capture.clone(),
                 tool_call_id: None,
+                spawn_ceiling: None,
+                prompter: None,
                 customer: self.customer.clone(),
             },
             user_message: rendered_prompt,
             initial_messages: Vec::new(),
             turn_index_offset: 0,
-            mode_str: self.mode_str.clone(),
             no_stream: false,
             // Workflow runs stream through the workflow printer by
             // tailing JSONL transcripts. Suppress direct stdout
@@ -609,7 +594,7 @@ impl StepFactory for DefaultStepFactory {
     }
 
     fn permission_mode(&self) -> Option<&str> {
-        Some(self.mode_str.as_str())
+        Some(self.mode.as_str())
     }
 
     fn customer(&self) -> Option<&str> {
@@ -1363,7 +1348,7 @@ steps:
             global,
             project_root: None,
             resolver: Arc::new(rupu_auth::KeychainResolver::new()),
-            mode_str: "bypass".to_string(),
+            mode: rupu_tools::PermissionMode::Bypass,
             mcp_registry: Arc::new(rupu_scm::Registry::empty()),
             system_prompt_suffix: None,
             dispatcher: None,
@@ -2152,7 +2137,7 @@ steps:
             global: tmp.path().to_path_buf(),
             project_root: None,
             resolver: Arc::new(rupu_auth::KeychainResolver::new()),
-            mode_str: "bypass".to_string(),
+            mode: rupu_tools::PermissionMode::Bypass,
             mcp_registry: Arc::new(rupu_scm::Registry::empty()),
             system_prompt_suffix: None,
             dispatcher: None,
@@ -2217,7 +2202,7 @@ steps:
             global: tmp.path().to_path_buf(),
             project_root: None,
             resolver: Arc::new(rupu_auth::KeychainResolver::new()),
-            mode_str: "bypass".to_string(),
+            mode: rupu_tools::PermissionMode::Bypass,
             mcp_registry: Arc::new(rupu_scm::Registry::empty()),
             system_prompt_suffix: None,
             dispatcher: None,
@@ -2306,7 +2291,7 @@ steps:
             global: tmp.path().to_path_buf(),
             project_root: None,
             resolver: Arc::new(rupu_auth::KeychainResolver::new()),
-            mode_str: "bypass".to_string(),
+            mode: rupu_tools::PermissionMode::Bypass,
             mcp_registry: Arc::new(rupu_scm::Registry::empty()),
             system_prompt_suffix: None,
             dispatcher: None,
@@ -2512,7 +2497,7 @@ steps:
             global: tmp.path().to_path_buf(),
             project_root: None,
             resolver: Arc::new(resolver),
-            mode_str: "bypass".to_string(),
+            mode: rupu_tools::PermissionMode::Bypass,
             mcp_registry: Arc::new(rupu_scm::Registry::empty()),
             system_prompt_suffix: None,
             dispatcher: None,
@@ -2589,7 +2574,7 @@ steps:
             global: tmp.to_path_buf(),
             project_root: None,
             resolver: Arc::new(rupu_auth::KeychainResolver::new()),
-            mode_str: "bypass".to_string(),
+            mode: rupu_tools::PermissionMode::Bypass,
             mcp_registry: Arc::new(rupu_scm::Registry::empty()),
             system_prompt_suffix: None,
             dispatcher: None,

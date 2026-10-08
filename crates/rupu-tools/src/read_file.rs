@@ -10,6 +10,7 @@
 //! the agent sees the error and decides what to do.
 
 use crate::coverage_emit::{attribution_from, emit};
+use crate::descriptor::{Effect, Service, ToolDescriptor};
 use crate::path_scope::is_inside;
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 use async_trait::async_trait;
@@ -29,27 +30,33 @@ struct Input {
 #[derive(Debug, Default, Clone)]
 pub struct ReadFileTool;
 
+/// This tool's descriptor.
+pub static DESCRIPTOR: ToolDescriptor = ToolDescriptor {
+    name: "read_file",
+    aliases: &[],
+    effect: Effect::Read,
+    needs: &[Service::Coverage],
+    description: "Read a file from the workspace and return its contents prefixed by 1-based line numbers separated by tabs. Always use this before editing a file so you have current line numbers. Paths are relative to the workspace root; absolute paths and paths that escape the workspace (e.g. `../`) are rejected.",
+    input_schema: descriptor_schema,
+};
+
+fn descriptor_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Path relative to the workspace root, e.g. `src/lib.rs` or `tests/foo.rs`."
+            }
+        },
+        "required": ["path"]
+    })
+}
+
 #[async_trait]
 impl Tool for ReadFileTool {
-    fn name(&self) -> &'static str {
-        "read_file"
-    }
-
-    fn description(&self) -> &'static str {
-        "Read a file from the workspace and return its contents prefixed by 1-based line numbers separated by tabs. Always use this before editing a file so you have current line numbers. Paths are relative to the workspace root; absolute paths and paths that escape the workspace (e.g. `../`) are rejected."
-    }
-
-    fn input_schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Path relative to the workspace root, e.g. `src/lib.rs` or `tests/foo.rs`."
-                }
-            },
-            "required": ["path"]
-        })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &DESCRIPTOR
     }
 
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {

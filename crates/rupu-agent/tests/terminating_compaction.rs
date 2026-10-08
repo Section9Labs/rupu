@@ -7,7 +7,7 @@
 //! Its own test binary: the flag is process-wide and never cleared.
 
 use async_trait::async_trait;
-use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
+use rupu_agent::runner::{MockProvider, ScriptedTurn};
 use rupu_agent::{run_agent, AgentRunOpts, RunError};
 use rupu_providers::credential_writes;
 use rupu_providers::model_limits::ModelLimits;
@@ -114,12 +114,11 @@ async fn a_terminating_process_starts_no_compaction_summariser_call() {
         workspace_path: tmp.path().to_path_buf(),
         transcript_path: transcript.clone(),
         max_turns: 5,
-        decider: Arc::new(BypassDecider),
+        permission: rupu_tools::PermissionPolicy::bypass(),
         tool_context: ToolContext::default(),
         user_message: "go".into(),
         initial_messages: history(),
         turn_index_offset: 0,
-        mode_str: "bypass".into(),
         no_stream: false,
         suppress_stream_stdout: true,
         mcp_registry: None,

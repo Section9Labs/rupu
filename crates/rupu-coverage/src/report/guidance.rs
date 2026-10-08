@@ -7,7 +7,7 @@ const FULL_GUIDANCE: &str = "\
 ## Recording findings
 
 Findings in this run use the full report profile. Record each finding with one \
-`report_finding` call whose `report` object is complete. rupu generates the \
+`findings.report` call whose `report` object is complete. rupu generates the \
 Markdown, HTML and PDF reports from it, so do not also write a report file.
 
 - Write in a concise, formal, factual tone. Do not speculate.
@@ -31,7 +31,7 @@ patched build. If one genuinely cannot be produced, write exactly \
 `Not Provided — <one-line justification>`.
 - List proof-of-concept files (scripts, outputs, harnesses) as workspace-relative \
 paths in `artifacts`; rupu stores them with the finding.
-- Cross-reference related findings by the `fnd_` id a previous `report_finding` \
+- Cross-reference related findings by the `fnd_` id a previous `findings.report` \
 call returned.
 - A rejected call lists every problem at once. Fix all of them and call again.";
 

@@ -3740,7 +3740,7 @@ pub(crate) async fn resume_run(
     let mcp_registry =
         Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg, netflow_sink).await);
 
-    let mode_str = mode.unwrap_or("ask").to_string();
+    let permission_mode = rupu_tools::PermissionMode::parse(mode.unwrap_or("ask"))?;
 
     // Hoisted above the dispatcher build (was created a few lines further
     // down, right before `opts`) so `CliAgentDispatcher` can be handed a
@@ -3776,7 +3776,6 @@ pub(crate) async fn resume_run(
         record.workspace_id.clone(),
         workspace_path.clone(),
         Arc::clone(&resolver),
-        mode_str.clone(),
         Arc::clone(&mcp_registry),
         Arc::clone(&store),
         event_sink_for_resume.clone(),
@@ -3814,7 +3813,7 @@ pub(crate) async fn resume_run(
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
     let action_dispatcher = crate::resume::action_dispatcher_for(
         &mcp_registry,
-        &mode_str,
+        permission_mode,
         Some(rupu_mcp::FindingsContext {
             workspace_path: workspace_path.clone(),
             scope_name: workflow.name.clone(),
@@ -3832,13 +3831,12 @@ pub(crate) async fn resume_run(
             provider: cfg.default_provider.clone(),
         }),
     );
-    let mode_str_for_policy = mode_str.clone();
     let factory = Arc::new(DefaultStepFactory {
         workflow: workflow.clone(),
         global: global.clone(),
         project_root: project_root.clone(),
         resolver,
-        mode_str,
+        mode: permission_mode,
         mcp_registry,
         system_prompt_suffix: None,
         dispatcher: Some(dispatcher_dyn),
@@ -3932,7 +3930,7 @@ pub(crate) async fn resume_run(
         spawn_pause_marker_poller(Arc::clone(&store), run_id.to_string(), pause_token.clone());
 
     let opts = OrchestratorRunOpts {
-        run_step: run_step_policy_for(&mode_str_for_policy, &cfg, workspace_path.clone()),
+        run_step: run_step_policy_for(permission_mode, &cfg, workspace_path.clone()),
         workflow,
         inputs: inputs_map,
         workspace_id: record.workspace_id.clone(),
@@ -5632,7 +5630,6 @@ async fn execute_workflow_invocation(
         ctx.workspace_id.clone(),
         ctx.workspace_path.clone(),
         Arc::clone(&resolver),
-        ctx.mode.clone(),
         Arc::clone(&mcp_registry),
         Arc::clone(&run_store),
         event_sink_for_run.clone(),
@@ -5676,9 +5673,10 @@ async fn execute_workflow_invocation(
     // same registry + mode the `DefaultStepFactory` below carries, so
     // agent steps and action steps see identical permissions across a
     // pause/resume boundary too.
+    let permission_mode = rupu_tools::PermissionMode::parse(&ctx.mode)?;
     let action_dispatcher = crate::resume::action_dispatcher_for(
         &mcp_registry,
-        &ctx.mode,
+        permission_mode,
         Some(rupu_mcp::FindingsContext {
             workspace_path: ctx.workspace_path.clone(),
             scope_name,
@@ -5702,7 +5700,7 @@ async fn execute_workflow_invocation(
         global: global.clone(),
         project_root: ctx.project_root.clone(),
         resolver,
-        mode_str: ctx.mode.clone(),
+        mode: permission_mode,
         mcp_registry,
         system_prompt_suffix: ctx.system_prompt_suffix.clone(),
         dispatcher: Some(dispatcher_dyn),
@@ -5735,7 +5733,7 @@ async fn execute_workflow_invocation(
     let run_store_for_resume = Arc::clone(&run_store);
     let body_for_resume = body.clone();
     let inputs_for_resume = inputs_map.clone();
-    let mode_for_resume = ctx.mode.clone();
+    let mode_for_resume = permission_mode;
     let strict_templates = ctx.strict_templates;
 
     let unit_dispatcher = build_dispatcher_if_needed(
@@ -5760,7 +5758,7 @@ async fn execute_workflow_invocation(
     );
 
     let opts = OrchestratorRunOpts {
-        run_step: run_step_policy_for(&ctx.mode, &cfg, ctx.workspace_path.clone()),
+        run_step: run_step_policy_for(permission_mode, &cfg, ctx.workspace_path.clone()),
         workflow,
         inputs: inputs_map,
         workspace_id: ctx.workspace_id,
@@ -5979,7 +5977,7 @@ async fn execute_workflow_invocation(
                     );
                     let resume_opts = OrchestratorRunOpts {
                         run_step: run_step_policy_for(
-                            &mode_for_resume,
+                            mode_for_resume,
                             &cfg,
                             workspace_path_for_resume.clone(),
                         ),
@@ -6296,10 +6294,10 @@ async fn post_run_summary_to_issue(
 /// Warn when a workflow run will execute its agent steps at `bypass`
 /// because no `--mode` was given (ISSUES.md I-78).
 ///
-/// `ask` is the default mode, but a workflow step resolves `ask` to
-/// `BypassDecider` — the agent runtime's interactive `ask` decider blocks on
-/// stdin, and an unattended workflow step has no operator to answer it, so a
-/// genuinely-prompting `ask` would hang every scheduled run.
+/// `ask` is the default mode, but a workflow step has no operator prompter,
+/// so `ask` allows writes there (each step's transcript says so once with a
+/// `permission_mode_degraded` notice) — a genuinely-prompting `ask` would
+/// block on stdin and hang every scheduled run.
 ///
 /// The operator decision (2026-07-28) was to keep that behavior rather than
 /// tighten it: making `ask` deny writers would break every existing workflow
@@ -6326,14 +6324,15 @@ async fn post_run_summary_to_issue(
 /// The real protection is `[workflow].run_step_enabled`, which defaults
 /// to false and which `bypass` cannot override.
 pub(crate) fn run_step_policy_for(
-    mode_str: &str,
+    mode: rupu_tools::PermissionMode,
     cfg: &rupu_config::Config,
     workspace_path: PathBuf,
 ) -> RunStepPolicy {
-    let mode = match mode_str {
-        "readonly" => rupu_tools::PermissionMode::Readonly,
-        // "ask" included: see the doc comment above.
-        _ => rupu_tools::PermissionMode::Bypass,
+    use rupu_tools::PermissionMode;
+    let mode = match mode {
+        PermissionMode::Readonly => PermissionMode::Readonly,
+        // `Ask` included: see the doc comment above.
+        PermissionMode::Ask | PermissionMode::Bypass => PermissionMode::Bypass,
     };
     RunStepPolicy {
         mode,
@@ -6593,15 +6592,15 @@ mod tests {
         // readonly denies; ask and bypass both allow, matching how agent
         // tool calls already resolve in a workflow (no operator mid-run).
         assert_eq!(
-            super::run_step_policy_for("readonly", &cfg, wp.clone()).mode,
+            super::run_step_policy_for(PermissionMode::Readonly, &cfg, wp.clone()).mode,
             PermissionMode::Readonly
         );
         assert_eq!(
-            super::run_step_policy_for("ask", &cfg, wp.clone()).mode,
+            super::run_step_policy_for(PermissionMode::Ask, &cfg, wp.clone()).mode,
             PermissionMode::Bypass
         );
         assert_eq!(
-            super::run_step_policy_for("bypass", &cfg, wp).mode,
+            super::run_step_policy_for(PermissionMode::Bypass, &cfg, wp).mode,
             PermissionMode::Bypass
         );
     }
@@ -6613,7 +6612,11 @@ mod tests {
         let mut cfg = rupu_config::Config::default();
         cfg.workflow.run_step_enabled = true;
         cfg.workflow.run_step_allowlist = vec!["python3".into()];
-        let p = super::run_step_policy_for("bypass", &cfg, std::path::PathBuf::from("/w"));
+        let p = super::run_step_policy_for(
+            rupu_tools::PermissionMode::Bypass,
+            &cfg,
+            std::path::PathBuf::from("/w"),
+        );
         assert!(p.config.run_step_enabled);
         assert!(p.config.allows("python3"));
         assert!(!p.config.allows("bash"));

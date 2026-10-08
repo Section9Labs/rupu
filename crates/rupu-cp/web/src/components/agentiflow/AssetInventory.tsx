@@ -183,7 +183,7 @@ export default function AssetInventory({
         title="No assets recorded yet"
         hint={
           emptyHint ?? (
-            <>Assets appear here once an engagement records them with the <span className="font-mono">asset_mark</span> tool (hosts/services for network, sites/routes for web, files for code).</>
+            <>Assets appear here once an engagement records them with the <span className="font-mono">assets.mark</span> tool (hosts/services for network, sites/routes for web, files for code).</>
           )
         }
       />

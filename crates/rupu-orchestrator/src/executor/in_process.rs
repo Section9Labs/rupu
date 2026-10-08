@@ -420,7 +420,7 @@ fn map_approval_err(e: ApprovalError) -> ExecutorError {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
+    use rupu_agent::runner::{MockProvider, ScriptedTurn};
     use rupu_agent::AgentRunOpts;
     use rupu_providers::types::StopReason;
     use rupu_tools::ToolContext;
@@ -467,12 +467,11 @@ mod tests {
                 workspace_path,
                 transcript_path,
                 max_turns: 5,
-                decider: Arc::new(BypassDecider),
+                permission: rupu_tools::PermissionPolicy::bypass(),
                 tool_context: ToolContext::default(),
                 user_message: rendered_prompt,
                 initial_messages: Vec::new(),
                 turn_index_offset: 0,
-                mode_str: "bypass".into(),
                 no_stream: false,
                 suppress_stream_stdout: false,
                 mcp_registry: None,

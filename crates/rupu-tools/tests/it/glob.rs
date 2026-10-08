@@ -48,3 +48,27 @@ async fn no_matches_returns_empty() {
     assert!(out.stdout.is_empty());
     assert!(out.error.is_none());
 }
+
+#[tokio::test]
+async fn glob_stays_in_workspace() {
+    // W1 T17: a pattern that climbs out of the workspace — relative, absolute
+    // or through a symlinked directory — yields nothing outside it, as the
+    // other fs tools refuse such paths.
+    let outer = assert_fs::TempDir::new().unwrap();
+    outer.child("secret.txt").write_str("s").unwrap();
+    outer.child("ws/inside.txt").write_str("").unwrap();
+    std::os::unix::fs::symlink(outer.path(), outer.path().join("ws/up")).unwrap();
+    let ws = outer.path().join("ws");
+    let absolute = format!("{}/*", outer.path().display());
+    for pattern in ["../*", "../**/*", "**/../../*", "up/*", absolute.as_str()] {
+        let out = GlobTool
+            .invoke(json!({ "pattern": pattern }), &ctx(&ws))
+            .await
+            .unwrap();
+        assert!(
+            !out.stdout.contains("secret.txt"),
+            "{pattern} escaped the workspace: {}",
+            out.stdout
+        );
+    }
+}

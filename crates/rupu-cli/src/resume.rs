@@ -22,10 +22,10 @@ use std::sync::Arc;
 /// site wires: an in-process MCP `ToolDispatcher` over the same SCM
 /// `Registry` and the run's permission mode.
 ///
-/// **Mode** genuinely matches the agent path — `parse_mode_for_runtime`
-/// (rupu-agent) is reused rather than duplicated, so it is the same mode
-/// string → `PermissionMode` mapping `run_agent` applies to its own tool
-/// registry, and a `readonly` run refuses Write-classified tools here too.
+/// **Mode** genuinely matches the agent path — the same `PermissionMode`
+/// the run's agent steps run under, decided by the same `PermissionPolicy`
+/// from each tool's effect, so a `readonly` run refuses external (and
+/// workspace-writing) tools here too.
 ///
 /// The **tool allowlist** deliberately does NOT match the agent path, and
 /// this is not an oversight (ISSUES.md I-26). An agent step's surface is
@@ -53,15 +53,12 @@ use std::sync::Arc;
 /// is tracked as **I-79**.
 pub fn action_dispatcher_for(
     registry: &Arc<rupu_scm::Registry>,
-    mode_str: &str,
+    mode: rupu_tools::PermissionMode,
     findings: Option<rupu_mcp::FindingsContext>,
 ) -> Arc<ToolDispatcher> {
     let dispatcher = ToolDispatcher::new(
         Arc::clone(registry),
-        McpPermission::new(
-            rupu_agent::runner::parse_mode_for_runtime(mode_str),
-            vec!["*".into()],
-        ),
+        McpPermission::new(mode, vec!["*".into()]),
     );
     // Without this context `findings.record` is listed but refuses: an
     // action step could observe a weakness and have nowhere to record it.
@@ -433,6 +430,7 @@ async fn rebuild_opts_from_disk(
         .or_else(|| record.resume_mode.clone())
         .or_else(|| record.permission_mode.clone())
         .unwrap_or_else(|| "ask".to_string());
+    let permission_mode = rupu_tools::PermissionMode::parse(&mode_str)?;
 
     // Hoisted above the dispatcher build so `CliAgentDispatcher` can be
     // handed a clone of the same sink and emit `DispatchStarted` /
@@ -469,7 +467,6 @@ async fn rebuild_opts_from_disk(
         record.workspace_id.clone(),
         workspace_path.clone(),
         Arc::clone(&resolver),
-        mode_str.clone(),
         Arc::clone(&mcp_registry),
         Arc::clone(&store_arc),
         event_sink_for_resume.clone(),
@@ -507,7 +504,7 @@ async fn rebuild_opts_from_disk(
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
     let action_dispatcher = action_dispatcher_for(
         &mcp_registry,
-        &mode_str,
+        permission_mode,
         Some(rupu_mcp::FindingsContext {
             workspace_path: workspace_path.clone(),
             scope_name: workflow.name.clone(),
@@ -530,7 +527,7 @@ async fn rebuild_opts_from_disk(
         global: global.clone(),
         project_root: project_root.clone(),
         resolver,
-        mode_str: mode_str.clone(),
+        mode: permission_mode,
         mcp_registry,
         system_prompt_suffix: None,
         dispatcher: Some(dispatcher_dyn),
@@ -562,7 +559,7 @@ async fn rebuild_opts_from_disk(
     // the gate — or in an `on_reject` cleanup chain — was refused with
     // `ConfigDisabled` regardless of config.
     let run_step =
-        crate::cmd::workflow::run_step_policy_for(&mode_str, &cfg, workspace_path.clone());
+        crate::cmd::workflow::run_step_policy_for(permission_mode, &cfg, workspace_path.clone());
 
     // Rebuild the fan-out unit dispatcher the same way the fresh-run path
     // does (`build_dispatcher_if_needed`): `None` when the workflow has no

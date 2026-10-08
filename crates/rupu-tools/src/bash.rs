@@ -16,6 +16,8 @@
 //! (Ok(ToolOutput { error: None, ... })) and the agent sees the exit
 //! code via the `CommandRun` derived event.
 
+use crate::catalog::ToolCatalog;
+use crate::descriptor::{Effect, Service, ToolDescriptor};
 use crate::coverage_emit::{attribution_from, emit};
 use crate::tool::{DerivedEvent, Tool, ToolContext, ToolError, ToolOutput};
 use async_trait::async_trait;
@@ -62,28 +64,6 @@ impl Drop for CaptureGuard {
 /// workspace-configured allowlist).
 const ALWAYS_ALLOWED_ENV: &[&str] = &["PATH", "HOME", "USER", "TERM", "LANG"];
 
-/// rupu's native agent tools that are NOT shell programs — there is no
-/// executable, module or endpoint by these names. When a run offers them a
-/// model still reaches for bash (`asset_mark --kind ...`, `which asset_mark`,
-/// `type report_finding`), so an attempt to run one as a shell command is
-/// caught before it spawns and redirected to the structured tool call. Kept
-/// aligned with the coverage/findings tools `rupu-agent`'s `coverage_tools`
-/// registers; none is a real binary, so catching them in command position is
-/// always safe. (bash lives below rupu-agent in the crate graph, so this is a
-/// local list rather than a shared import.)
-const RESERVED_NATIVE_TOOLS: &[&str] = &[
-    "asset_mark",
-    "report_finding",
-    "coverage_mark",
-    "coverage_status",
-    "coverage_remaining",
-    "coverage_concerns_search",
-    "coverage_concerns_detail",
-    "query_findings",
-    "tag_findings",
-    "finding.verify",
-];
-
 /// Whether `word` is a `NAME=value` shell environment-assignment prefix.
 fn is_env_assignment(word: &str) -> bool {
     match word.split_once('=') {
@@ -96,7 +76,15 @@ fn is_env_assignment(word: &str) -> bool {
     }
 }
 
-/// If `command` tries to run one of [`RESERVED_NATIVE_TOOLS`] as a shell
+/// rupu's native agent tools are NOT shell programs — there is no executable,
+/// module or endpoint by their names. When a run offers them a model still
+/// reaches for bash (`assets.mark --kind ...`, `which asset_mark`, `type
+/// report_finding`), so an attempt to run one as a shell command is caught
+/// before it spawns and redirected to the structured tool call. The names are
+/// [`ToolCatalog::non_shell_names`] (canonical and legacy), so the list can't
+/// drift from the catalog.
+///
+/// If `command` tries to run one of those names as a shell
 /// program — in command position, or as the subject of `which`/`type`/
 /// `command -v` — return that tool's name. Only command-position matches
 /// count: a reserved name that is merely an argument (`grep report_finding
@@ -104,7 +92,7 @@ fn is_env_assignment(word: &str) -> bool {
 fn reserved_native_tool_as_command(command: &str) -> Option<&'static str> {
     let is_reserved = |tok: &str| -> Option<&'static str> {
         let name = tok.rsplit('/').next().unwrap_or(tok);
-        RESERVED_NATIVE_TOOLS.iter().copied().find(|&r| r == name)
+        ToolCatalog::non_shell_names().find(|&r| r == name)
     };
     // Split on the shell separators that begin a new simple command. `&&`/`||`
     // reduce to the single-char split (the empty segment between them is just
@@ -142,27 +130,34 @@ fn reserved_native_tool_as_command(command: &str) -> Option<&'static str> {
 #[derive(Debug, Default, Clone)]
 pub struct BashTool;
 
+/// This tool's descriptor.
+pub static DESCRIPTOR: ToolDescriptor = ToolDescriptor {
+    name: "bash",
+    aliases: &[],
+    effect: Effect::Write,
+    needs: &[Service::Netflow],
+    description: "Execute a shell command in the workspace directory. The command runs with a controlled environment (PATH, HOME, USER, TERM, LANG plus a per-workspace allowlist). Default timeout 120 seconds, configurable per-call. Use this for compilation, tests, git operations, and anything else that needs a shell. The cwd is locked to the workspace path; cd outside the workspace will produce an error from the shell, not an escape.",
+    input_schema: descriptor_schema,
+};
+
+fn descriptor_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "command": {
+                "type": "string",
+                "description": "The shell command to execute, e.g. `cargo test`, `git diff HEAD`, `ls -la src/`."
+            }
+        },
+        "required": ["command"]
+    })
+
+}
+
 #[async_trait]
 impl Tool for BashTool {
-    fn name(&self) -> &'static str {
-        "bash"
-    }
-
-    fn description(&self) -> &'static str {
-        "Execute a shell command in the workspace directory. The command runs with a controlled environment (PATH, HOME, USER, TERM, LANG plus a per-workspace allowlist). Default timeout 120 seconds, configurable per-call. Use this for compilation, tests, git operations, and anything else that needs a shell. The cwd is locked to the workspace path; cd outside the workspace will produce an error from the shell, not an escape."
-    }
-
-    fn input_schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "The shell command to execute, e.g. `cargo test`, `git diff HEAD`, `ls -la src/`."
-                }
-            },
-            "required": ["command"]
-        })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &DESCRIPTOR
     }
 
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -544,6 +539,23 @@ mod tests {
             reserved_native_tool_as_command("command -v asset_mark"),
             Some("asset_mark")
         );
+        // Canonical catalog names are caught as their legacy aliases are.
+        assert_eq!(
+            reserved_native_tool_as_command("findings.report --scope repo"),
+            Some("findings.report")
+        );
+        assert_eq!(
+            reserved_native_tool_as_command("which assets.mark"),
+            Some("assets.mark")
+        );
+    }
+
+    #[test]
+    fn plain_word_tool_names_stay_runnable_commands() {
+        // `join` and `grep` are rupu tools AND real programs: never reserved.
+        for cmd in ["join a.txt b.txt", "grep -r x .", "glob"] {
+            assert_eq!(reserved_native_tool_as_command(cmd), None, "{cmd:?}");
+        }
     }
 
     #[test]

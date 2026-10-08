@@ -104,7 +104,7 @@ pub fn tags_schema_property() -> serde_json::Value {
         "type": "array",
         "items": { "type": "string" },
         "maxItems": MAX_TAGS_PER_FINDING,
-        "description": "Free-form tags: lowercase a-z, 0-9 and . _ : / -, starting with a letter or digit, e.g. class:sqli, needs-poc. Reuse tags already in use where they fit (query_findings / findings.query list them)."
+        "description": "Free-form tags: lowercase a-z, 0-9 and . _ : / -, starting with a letter or digit, e.g. class:sqli, needs-poc. Reuse tags already in use where they fit (findings.query lists them)."
     })
 }
 
@@ -327,7 +327,7 @@ pub fn tag_input_schema() -> serde_json::Value {
         "required": ["finding_ids"],
         "additionalProperties": false,
         "properties": {
-            "finding_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Finding ids (fnd_…) from query_findings or report_finding." },
+            "finding_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Finding ids (fnd_…) from findings.query or findings.report." },
             "add": { "type": "array", "items": { "type": "string" }, "description": "Tags to add." },
             "remove": { "type": "array", "items": { "type": "string" }, "description": "Tags to remove." }
         }

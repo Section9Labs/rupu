@@ -257,7 +257,7 @@ pub fn validate_report(r: &FindingReport, ctx: &ValidateCtx) -> Result<(), Repor
                     c.err(
                         format!("report.cross_references[{i}].finding_id"),
                         format!(
-                            "`{}` is not a finding in this project; use the id a previous report_finding call returned",
+                            "`{}` is not a finding in this project; use the id a previous findings.report call returned",
                             x.finding_id
                         ),
                     );

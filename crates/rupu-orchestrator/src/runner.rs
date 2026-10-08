@@ -12311,7 +12311,7 @@ steps:
     // -----------------------------------------------------------------------
 
     use rupu_agent::runner::{CapturingMockProvider, MockProvider, ScriptedTurn};
-    use rupu_agent::{AgentRunOpts, BypassDecider};
+    use rupu_agent::AgentRunOpts;
     use rupu_providers::types::{
         ContentBlock, LlmRequest, LlmResponse, Role, StopReason, StreamEvent,
     };
@@ -12381,12 +12381,11 @@ steps:
             workspace_path,
             transcript_path,
             max_turns: 5,
-            decider: Arc::new(BypassDecider),
+            permission: rupu_tools::PermissionPolicy::bypass(),
             tool_context: rupu_tools::ToolContext::default(),
             user_message: rendered_prompt,
             initial_messages: Vec::new(),
             turn_index_offset: 0,
-            mode_str: "bypass".into(),
             // The runner always streams (`no_stream` only quiets the
             // display) and races `provider.stream` against the pause token —
             // the deterministic pause boundary for these tests.
@@ -13582,7 +13581,7 @@ loops:
 #[cfg(test)]
 mod dag_scheduler_golden {
     use super::*;
-    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
+    use rupu_agent::runner::{MockProvider, ScriptedTurn};
     use rupu_mcp::{McpPermission, ToolDispatcher};
     use rupu_providers::types::StopReason;
     use rupu_scm::{
@@ -13637,12 +13636,11 @@ mod dag_scheduler_golden {
                 workspace_path,
                 transcript_path,
                 max_turns: 5,
-                decider: Arc::new(BypassDecider),
+                permission: rupu_tools::PermissionPolicy::bypass(),
                 tool_context: ToolContext::default(),
                 user_message: rendered_prompt,
                 initial_messages: Vec::new(),
                 turn_index_offset: 0,
-                mode_str: "bypass".into(),
                 no_stream: true,
                 suppress_stream_stdout: true,
                 mcp_registry: None,
@@ -14060,7 +14058,7 @@ steps:
 #[cfg(test)]
 mod scheduler_concurrency {
     use super::*;
-    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
+    use rupu_agent::runner::{MockProvider, ScriptedTurn};
     use rupu_providers::types::StopReason;
     use rupu_tools::ToolContext;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14186,12 +14184,11 @@ steps:
                 workspace_path,
                 transcript_path,
                 max_turns: 5,
-                decider: Arc::new(BypassDecider),
+                permission: rupu_tools::PermissionPolicy::bypass(),
                 tool_context: ToolContext::default(),
                 user_message: rendered_prompt,
                 initial_messages: Vec::new(),
                 turn_index_offset: 0,
-                mode_str: "bypass".into(),
                 no_stream: true,
                 suppress_stream_stdout: true,
                 mcp_registry: None,
@@ -14597,7 +14594,7 @@ steps:
 #[cfg(test)]
 mod bounded_loops {
     use super::*;
-    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
+    use rupu_agent::runner::{MockProvider, ScriptedTurn};
     use rupu_providers::types::StopReason;
     use rupu_tools::ToolContext;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14710,12 +14707,11 @@ loops:
                 workspace_path,
                 transcript_path,
                 max_turns: 5,
-                decider: Arc::new(BypassDecider),
+                permission: rupu_tools::PermissionPolicy::bypass(),
                 tool_context: ToolContext::default(),
                 user_message: rendered_prompt,
                 initial_messages: Vec::new(),
                 turn_index_offset: 0,
-                mode_str: "bypass".into(),
                 no_stream: true,
                 suppress_stream_stdout: true,
                 mcp_registry: None,
@@ -14908,12 +14904,11 @@ loops:
                     workspace_path,
                     transcript_path,
                     max_turns: 5,
-                    decider: Arc::new(BypassDecider),
+                    permission: rupu_tools::PermissionPolicy::bypass(),
                     tool_context: ToolContext::default(),
                     user_message: rendered_prompt,
                     initial_messages: Vec::new(),
                     turn_index_offset: 0,
-                    mode_str: "bypass".into(),
                     no_stream: true,
                     suppress_stream_stdout: true,
                     mcp_registry: None,
@@ -15201,12 +15196,11 @@ loops:
                 workspace_path,
                 transcript_path,
                 max_turns: 5,
-                decider: Arc::new(BypassDecider),
+                permission: rupu_tools::PermissionPolicy::bypass(),
                 tool_context: ToolContext::default(),
                 user_message: rendered_prompt,
                 initial_messages: Vec::new(),
                 turn_index_offset: 0,
-                mode_str: "bypass".into(),
                 no_stream: true,
                 suppress_stream_stdout: true,
                 mcp_registry: None,
@@ -15400,12 +15394,11 @@ loops:
                     workspace_path,
                     transcript_path,
                     max_turns: 5,
-                    decider: Arc::new(BypassDecider),
+                    permission: rupu_tools::PermissionPolicy::bypass(),
                     tool_context: ToolContext::default(),
                     user_message: rendered_prompt,
                     initial_messages: Vec::new(),
                     turn_index_offset: 0,
-                    mode_str: "bypass".into(),
                     no_stream: true,
                     suppress_stream_stdout: true,
                     mcp_registry: None,
@@ -15487,7 +15480,7 @@ loops:
 #[cfg(test)]
 mod loop_resume {
     use super::*;
-    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
+    use rupu_agent::runner::{MockProvider, ScriptedTurn};
     use rupu_providers::types::StopReason;
     use rupu_tools::ToolContext;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -15643,12 +15636,11 @@ loops:
                 workspace_path,
                 transcript_path,
                 max_turns: 5,
-                decider: Arc::new(BypassDecider),
+                permission: rupu_tools::PermissionPolicy::bypass(),
                 tool_context: ToolContext::default(),
                 user_message: rendered_prompt,
                 initial_messages: Vec::new(),
                 turn_index_offset: 0,
-                mode_str: "bypass".into(),
                 no_stream: true,
                 suppress_stream_stdout: true,
                 mcp_registry: None,
@@ -15951,12 +15943,11 @@ loops:
                     workspace_path,
                     transcript_path,
                     max_turns: 5,
-                    decider: Arc::new(BypassDecider),
+                    permission: rupu_tools::PermissionPolicy::bypass(),
                     tool_context: ToolContext::default(),
                     user_message: rendered_prompt,
                     initial_messages: Vec::new(),
                     turn_index_offset: 0,
-                    mode_str: "bypass".into(),
                     no_stream: true,
                     suppress_stream_stdout: true,
                     mcp_registry: None,
@@ -16105,12 +16096,11 @@ loops:
                     workspace_path,
                     transcript_path,
                     max_turns: 5,
-                    decider: Arc::new(BypassDecider),
+                    permission: rupu_tools::PermissionPolicy::bypass(),
                     tool_context: ToolContext::default(),
                     user_message: rendered_prompt,
                     initial_messages: Vec::new(),
                     turn_index_offset: 0,
-                    mode_str: "bypass".into(),
                     no_stream: true,
                     suppress_stream_stdout: true,
                     mcp_registry: None,
@@ -16338,12 +16328,11 @@ loops:
                 workspace_path,
                 transcript_path,
                 max_turns: 5,
-                decider: Arc::new(BypassDecider),
+                permission: rupu_tools::PermissionPolicy::bypass(),
                 tool_context: ToolContext::default(),
                 user_message: rendered_prompt,
                 initial_messages: Vec::new(),
                 turn_index_offset: 0,
-                mode_str: "bypass".into(),
                 no_stream: true,
                 suppress_stream_stdout: true,
                 mcp_registry: None,
@@ -16917,7 +16906,7 @@ loops:
 #[cfg(test)]
 mod join_and_prune {
     use super::*;
-    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
+    use rupu_agent::runner::{MockProvider, ScriptedTurn};
     use rupu_providers::types::StopReason;
     use rupu_tools::ToolContext;
     use std::sync::Mutex;
@@ -16993,12 +16982,11 @@ mod join_and_prune {
                 workspace_path,
                 transcript_path,
                 max_turns: 5,
-                decider: Arc::new(BypassDecider),
+                permission: rupu_tools::PermissionPolicy::bypass(),
                 tool_context: ToolContext::default(),
                 user_message: rendered_prompt,
                 initial_messages: Vec::new(),
                 turn_index_offset: 0,
-                mode_str: "bypass".into(),
                 no_stream: true,
                 suppress_stream_stdout: true,
                 mcp_registry: None,
@@ -18555,7 +18543,7 @@ steps:
 #[cfg(test)]
 mod resume_and_cancel {
     use super::*;
-    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
+    use rupu_agent::runner::{MockProvider, ScriptedTurn};
     use rupu_providers::types::StopReason;
     use rupu_tools::ToolContext;
     use std::sync::Mutex;
@@ -18628,12 +18616,11 @@ mod resume_and_cancel {
                 workspace_path,
                 transcript_path,
                 max_turns: 5,
-                decider: Arc::new(BypassDecider),
+                permission: rupu_tools::PermissionPolicy::bypass(),
                 tool_context: ToolContext::default(),
                 user_message: rendered_prompt,
                 initial_messages: Vec::new(),
                 turn_index_offset: 0,
-                mode_str: "bypass".into(),
                 no_stream: true,
                 suppress_stream_stdout: true,
                 mcp_registry: None,
@@ -19349,7 +19336,7 @@ fn scan_for_json_object(s: &str) -> Option<&str> {
 #[cfg(test)]
 mod agent_terminal_status {
     use super::*;
-    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
+    use rupu_agent::runner::{MockProvider, ScriptedTurn};
     use rupu_agent::AgentRunOpts;
     use rupu_providers::types::StopReason;
     use rupu_providers::LlmProvider;
@@ -19409,12 +19396,11 @@ mod agent_terminal_status {
                 workspace_path,
                 transcript_path,
                 max_turns: self.max_turns,
-                decider: Arc::new(BypassDecider),
+                permission: rupu_tools::PermissionPolicy::bypass(),
                 tool_context: rupu_tools::ToolContext::default(),
                 user_message: rendered_prompt,
                 initial_messages: Vec::new(),
                 turn_index_offset: 0,
-                mode_str: "bypass".into(),
                 no_stream: true,
                 suppress_stream_stdout: true,
                 mcp_registry: None,
@@ -19680,7 +19666,7 @@ steps:
 #[cfg(test)]
 mod manual_pause_drain {
     use super::*;
-    use rupu_agent::runner::{BypassDecider, CapturingMockProvider, MockProvider, ScriptedTurn};
+    use rupu_agent::runner::{CapturingMockProvider, MockProvider, ScriptedTurn};
     use rupu_providers::types::{ContentBlock, LlmRequest, LlmResponse, StopReason, StreamEvent};
     use rupu_providers::{LlmProvider, ProviderError, ProviderId};
     use std::collections::VecDeque;
@@ -19819,12 +19805,11 @@ mod manual_pause_drain {
                 workspace_path,
                 transcript_path,
                 max_turns: 5,
-                decider: Arc::new(BypassDecider),
+                permission: rupu_tools::PermissionPolicy::bypass(),
                 tool_context: rupu_tools::ToolContext::default(),
                 user_message: rendered_prompt,
                 initial_messages: Vec::new(),
                 turn_index_offset: 0,
-                mode_str: "bypass".into(),
                 // The one-shot path races `provider.send` against the pause
                 // token — the deterministic pause boundary for these tests.
                 no_stream: true,

@@ -66,7 +66,7 @@ pub async fn coverage_mark(
     let mut warnings = Vec::new();
     if input.status == AssertionStatus::Finding && input.evidence.finding_ids.is_empty() {
         warnings.push(
-            "status=finding with no finding_ids — call report_finding first or attach the id"
+            "status=finding with no finding_ids — call findings.report first or attach the id"
                 .to_string(),
         );
     }

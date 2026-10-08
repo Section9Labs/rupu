@@ -10,11 +10,13 @@ use crate::standalone_run_metadata::{
     metadata_path_for_run, write_metadata, StandaloneRunMetadata,
 };
 use clap::{Args as ClapArgs, Parser};
-use rupu_agent::runner::{AgentRunOpts, BypassDecider, PermissionDecider};
-use rupu_agent::{load_agent, parse_mode, resolve_mode, PermissionDecision};
+use rupu_agent::runner::AgentRunOpts;
+use rupu_agent::{load_agent, resolve_mode};
 use rupu_runtime::provider_factory;
 use rupu_runtime::WorkerKind;
-use rupu_tools::{PermissionMode, ToolContext};
+use rupu_tools::{
+    PermissionMode, PermissionPolicy, PromptAnswer, PromptRequest, Prompter, ToolContext,
+};
 use std::io::IsTerminal;
 use std::path::Path;
 use std::process::ExitCode;
@@ -683,11 +685,12 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     let prefs = UiPrefs::resolve(&cfg.ui, false, None, None, args.view);
 
     // Resolve permission mode.
-    let cli_mode = args.mode.as_deref().and_then(parse_mode);
-    let agent_mode = spec.permission_mode.as_deref().and_then(parse_mode);
+    let parse = |s: &str| PermissionMode::parse(s).ok();
+    let cli_mode = args.mode.as_deref().and_then(parse);
+    let agent_mode = spec.permission_mode.as_deref().and_then(parse);
     // Project-level mode override is rare; v0 reads only the cli/agent/global path.
     let project_mode = None;
-    let global_mode = cfg.permission_mode.as_deref().and_then(parse_mode);
+    let global_mode = cfg.permission_mode.as_deref().and_then(parse);
     let mode = resolve_mode(cli_mode, agent_mode, project_mode, global_mode);
 
     // Non-TTY + Ask = abort (spec rule).
@@ -1044,11 +1047,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             }
         };
 
-        let mode_str = match mode {
-            PermissionMode::Ask => "ask",
-            PermissionMode::Bypass => "bypass",
-            PermissionMode::Readonly => "readonly",
-        };
+        let mode_str = mode.as_str();
 
         // Run-store, hoisted above the tool context so it can back both the
         // dispatcher (below) and the run.json write further down — a single
@@ -1080,7 +1079,6 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             ws.id.clone(),
             workspace_path.clone(),
             Arc::clone(&resolver),
-            mode_str.to_string(),
             Arc::clone(&scm_registry),
             Arc::clone(&run_store),
             None,
@@ -1142,6 +1140,8 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             netflow_sink: Some(netflow_sink.clone()),
             net_capture: Some(net_capture),
             tool_call_id: None,
+            spawn_ceiling: None,
+            prompter: None,
             // The customer the config above was layered with.
             customer: cfg_paths.customer_slug.clone(),
         };
@@ -1185,7 +1185,11 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         };
         write_metadata(&metadata_path_for_run(&transcripts, &run_id), &metadata)?;
 
-        let decider: Arc<dyn PermissionDecider> = pick_decider(mode, Some(printer.multi_handle()));
+        let permission = permission_policy(
+            mode,
+            Some(printer.multi_handle()),
+            workspace_path.display().to_string(),
+        );
 
         // Discover the model's real limits (spec 2026-09-30 §6.1): agent pin →
         // config → live model list → unknown. Resolved through the same
@@ -1242,12 +1246,11 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             workspace_path: workspace_path.clone(),
             transcript_path: transcript_path.clone(),
             max_turns: spec.max_turns.unwrap_or(50),
-            decider,
+            permission,
             tool_context,
             user_message,
             initial_messages: Vec::new(),
             turn_index_offset: 0,
-            mode_str: mode_str.to_string(),
             no_stream: args.no_stream,
             // Suppress the agent runner's inline stdout writes; the CLI's
             // line-stream printer reads tokens from the JSONL transcript
@@ -1750,15 +1753,22 @@ pub(crate) fn standalone_workspace_strategy(
     Some(value.into())
 }
 
-pub(crate) fn pick_decider(
+/// The permission policy of an interactive `rupu run`: `ask` gets the TTY
+/// prompter; the other modes need no operator.
+pub(crate) fn permission_policy(
     mode: PermissionMode,
     multi: Option<indicatif::MultiProgress>,
-) -> Arc<dyn PermissionDecider> {
-    match mode {
-        PermissionMode::Bypass => Arc::new(BypassDecider),
-        PermissionMode::Readonly => Arc::new(ReadonlyDecider),
-        PermissionMode::Ask => Arc::new(AskDecider { multi }),
-    }
+    workspace: String,
+) -> PermissionPolicy {
+    let prompter: Option<Arc<dyn Prompter>> = match mode {
+        PermissionMode::Ask => Some(Arc::new(TtyPrompter {
+            multi,
+            workspace,
+            serial: std::sync::Mutex::new(()),
+        })),
+        PermissionMode::Bypass | PermissionMode::Readonly => None,
+    };
+    PermissionPolicy::new(mode, prompter)
 }
 
 /// Resolve where to clone a `<platform>:<owner>/<repo>` target. Returns
@@ -1797,23 +1807,6 @@ pub(crate) fn resolve_clone_dest(
         );
     }
     Ok((dest, None))
-}
-
-/// Readonly: deny writers (bash/write_file/edit_file), allow readers.
-pub(crate) struct ReadonlyDecider;
-impl PermissionDecider for ReadonlyDecider {
-    fn decide(
-        &self,
-        _mode: PermissionMode,
-        tool: &str,
-        _input: &serde_json::Value,
-        _workspace: &str,
-    ) -> Result<PermissionDecision, rupu_agent::runner::RunError> {
-        match tool {
-            "bash" | "write_file" | "edit_file" => Ok(PermissionDecision::Deny),
-            _ => Ok(PermissionDecision::Allow),
-        }
-    }
 }
 
 /// A `rupu run` agent's running spend, accumulated from the transcript
@@ -1879,12 +1872,13 @@ impl LiveUsageTally {
     }
 }
 
-/// Ask: stdin-driven prompt for writers; readers always allowed.
+/// The operator prompt of an interactive `ask` run: asks on stderr, reads
+/// stdin. `PermissionPolicy` only calls it for a write or external call.
 ///
-/// Prompts via [`rupu_agent::PermissionPrompt::for_stdio`], which writes
-/// to stderr and reads from stdin. We re-take the stderr lock for each
-/// decision so back-to-back prompts don't deadlock.
-struct AskDecider {
+/// Prompts via [`rupu_agent::PermissionPrompt::for_stdio`]. One prompter is
+/// shared by the run and every sub-agent it dispatches (D7), so prompts are
+/// serialized: parallel children ask one at a time.
+struct TtyPrompter {
     /// Clone of the printer's `MultiProgress`. When `Some`, the
     /// permission prompt suspends the spinner via
     /// `MultiProgress::suspend` so the spinner's `\r`-based redraw
@@ -1893,29 +1887,29 @@ struct AskDecider {
     /// the same physical cursor that stderr writes are using.)
     /// `None` = no spinner active (non-TTY / test) — prompt directly.
     multi: Option<indicatif::MultiProgress>,
+    /// The workspace shown on the prompt line.
+    workspace: String,
+    serial: std::sync::Mutex<()>,
 }
-impl PermissionDecider for AskDecider {
-    fn decide(
-        &self,
-        _mode: PermissionMode,
-        tool: &str,
-        input: &serde_json::Value,
-        workspace: &str,
-    ) -> Result<PermissionDecision, rupu_agent::runner::RunError> {
-        if !matches!(tool, "bash" | "write_file" | "edit_file") {
-            return Ok(PermissionDecision::Allow);
-        }
-        let do_prompt = || -> Result<PermissionDecision, rupu_agent::runner::RunError> {
+
+impl Prompter for TtyPrompter {
+    fn ask(&self, req: &PromptRequest<'_>) -> PromptAnswer {
+        let _one_at_a_time = self.serial.lock().unwrap_or_else(|p| p.into_inner());
+        let do_prompt = || {
             let mut stderr = std::io::stderr();
             let mut prompt = rupu_agent::PermissionPrompt::for_stdio(&mut stderr);
-            prompt
-                .ask(tool, input, workspace)
-                .map_err(|e| rupu_agent::runner::RunError::Provider(format!("ask prompt io: {e}")))
+            prompt.ask(req.tool, req.input, &self.workspace)
         };
-        match &self.multi {
+        let answer = match &self.multi {
             Some(m) => m.suspend(do_prompt),
             None => do_prompt(),
-        }
+        };
+        // A prompt that can't be read can't be answered: stop the run
+        // rather than guess.
+        answer.unwrap_or_else(|e| {
+            warn!(error = %e, "permission prompt failed; stopping the run");
+            PromptAnswer::Stop
+        })
     }
 }
 

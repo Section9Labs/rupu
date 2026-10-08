@@ -8,7 +8,6 @@
 use crate::coverage_tools;
 use crate::mcp_tool::McpToolAdapter;
 use crate::outcome::OutcomeClass;
-use crate::permission::PermissionDecision;
 use crate::recovery::Rung0;
 use crate::tool_registry::{default_tool_registry, ToolRegistry};
 use async_trait::async_trait;
@@ -25,7 +24,10 @@ use rupu_providers::types::{
     ContentBlock, LlmRequest, LlmResponse, Message, Role, Stop, StopReason, StreamEvent, Usage,
 };
 use rupu_scm::Registry;
-use rupu_tools::{DerivedEvent, PermissionMode, Tool, ToolContext};
+use rupu_tools::{
+    AllowAlways, Decision, DerivedEvent, PermissionMode, PermissionPolicy, Tool, ToolContext,
+    ToolDescriptor,
+};
 use rupu_transcript::{
     Event, FileEditKind, JsonlWriter, RecoveryAction, RunMode, RunStatus, Severity,
 };
@@ -1284,61 +1286,6 @@ fn malformed_correction(stop: &Stop) -> String {
     )
 }
 
-/// Pluggable permission decider. Three production impls + a `Bypass`
-/// for tests.
-pub trait PermissionDecider: Send + Sync {
-    /// Decide whether `tool` may run with `input`. Called once per
-    /// tool call before dispatch.
-    fn decide(
-        &self,
-        mode: PermissionMode,
-        tool: &str,
-        input: &serde_json::Value,
-        workspace_path: &str,
-    ) -> Result<PermissionDecision, RunError>;
-}
-
-/// Test/CI decider: always Allow regardless of mode.
-pub struct BypassDecider;
-
-impl PermissionDecider for BypassDecider {
-    fn decide(
-        &self,
-        _mode: PermissionMode,
-        _tool: &str,
-        _input: &serde_json::Value,
-        _workspace_path: &str,
-    ) -> Result<PermissionDecision, RunError> {
-        Ok(PermissionDecision::Allow)
-    }
-}
-
-/// Deny writers (`bash`/`write_file`/`edit_file`), allow everything else.
-/// No interactive prompt — unlike `rupu run`'s own `ask` decider, this
-/// never blocks on stdin, so it's safe for an unattended context (a
-/// workflow step has no per-step operator to prompt). `DefaultStepFactory`
-/// (`rupu-orchestrator`) selects this for a workflow step whose run
-/// launched `--mode readonly`, so a workflow's own tool calls — including
-/// an `on_reject` cleanup step's (ISSUES.md I-24) — actually honor the
-/// mode instead of the `BypassDecider` every workflow step used
-/// unconditionally before this existed.
-pub struct ReadonlyDecider;
-
-impl PermissionDecider for ReadonlyDecider {
-    fn decide(
-        &self,
-        _mode: PermissionMode,
-        tool: &str,
-        _input: &serde_json::Value,
-        _workspace_path: &str,
-    ) -> Result<PermissionDecision, RunError> {
-        match tool {
-            "bash" | "write_file" | "edit_file" => Ok(PermissionDecision::Deny),
-            _ => Ok(PermissionDecision::Allow),
-        }
-    }
-}
-
 /// `\n\nYour call sign in this run is `heron#3` (crew `jade-reef`). ...` --
 /// `None` for anything that isn't a member codename.
 pub(crate) fn call_sign_line(codename: &str) -> Option<String> {
@@ -1370,7 +1317,10 @@ pub struct AgentRunOpts {
     pub workspace_path: PathBuf,
     pub transcript_path: PathBuf,
     pub max_turns: u32,
-    pub decider: Arc<dyn PermissionDecider>,
+    /// The run's permission policy: its mode and, for an interactive run,
+    /// the operator prompter. Every tool call is decided by it from the
+    /// tool's declared effect.
+    pub permission: PermissionPolicy,
     pub tool_context: ToolContext,
     pub user_message: String,
     /// Existing conversation state to prepend before `user_message`.
@@ -1378,7 +1328,6 @@ pub struct AgentRunOpts {
     pub initial_messages: Vec<Message>,
     /// Absolute turn index for the first turn in this run.
     pub turn_index_offset: u32,
-    pub mode_str: String,
     /// If true, don't render tokens as they arrive and don't write
     /// `AssistantDelta`/`ThinkingDelta` transcript events while a reply
     /// streams (the transcript keeps its final-message-only shape). A
@@ -1507,7 +1456,7 @@ pub struct AgentRunOpts {
     /// exactly as before. Run off the async runtime via spawn_blocking.
     pub collectors: Vec<std::sync::Arc<dyn crate::collector::TurnCollector>>,
     /// Pre-built, run-scoped tools injected into this run's registry regardless
-    /// of `agent_tools` (always-on platform tools; the `PermissionDecider` still
+    /// of `agent_tools` (always-on platform tools; the `PermissionPolicy` still
     /// gates each call). Empty for ordinary runs; the agentiflow envelope uses it
     /// for the lead's board/mailbox tools.
     pub extra_tools: Vec<std::sync::Arc<dyn rupu_tools::Tool>>,
@@ -1757,7 +1706,7 @@ async fn run_agent_inner(
                 agent_name: opts.agent_name.clone(),
                 provider: opts.provider_name.clone(),
                 model: opts.model.clone(),
-                permission_mode: opts.mode_str.clone(),
+                permission_mode: opts.permission.mode().as_str().to_string(),
                 user_prompt: opts.user_message.clone(),
                 concerns: block.clone(),
                 scope_name: resolved_scope.to_string(),
@@ -1792,10 +1741,10 @@ async fn run_agent_inner(
     let findings_opts = opts.tool_context.findings.clone().unwrap_or_default();
     let records_findings = coverage.is_some()
         || findings_opts.engagement.is_some()
-        || opts
-            .agent_tools
-            .as_ref()
-            .is_some_and(|list| list.iter().any(|t| t == "report_finding"));
+        || grants(
+            &opts.agent_tools,
+            &rupu_tools::catalog::findings::FINDINGS_REPORT,
+        );
     if records_findings {
         if let Some(g) = rupu_coverage::report::guidance(&findings_opts) {
             opts.agent_system_prompt.push_str("\n\n");
@@ -1814,7 +1763,7 @@ async fn run_agent_inner(
         provider: opts.provider_name.clone(),
         model: opts.model.clone(),
         started_at: Utc::now(),
-        mode: parse_mode_for_event(&opts.mode_str),
+        mode: run_mode(opts.permission.mode()),
         schema: Some(2),
         system_prompt: Some(opts.agent_system_prompt.clone()),
         codename: opts.codename.clone(),
@@ -1911,16 +1860,12 @@ async fn run_agent_inner(
     //     ledger. `asset_mark` is engagement-gated and nothing else: it needs
     //     the active set to validate a depth against the profile's ladder, so
     //     it is meaningless without one.
-    let lists_tool = |name: &str| {
-        opts.agent_tools
-            .as_ref()
-            .is_some_and(|list| list.iter().any(|t| t == name))
-    };
+    use rupu_tools::catalog::findings as f;
     let engagement_active = findings_opts.engagement.is_some();
     let standalone_report =
-        coverage.is_none() && (lists_tool("report_finding") || engagement_active);
+        coverage.is_none() && (grants(&opts.agent_tools, &f::FINDINGS_REPORT) || engagement_active);
     let standalone_asset = coverage.is_none() && engagement_active;
-    let want_verify = lists_tool("finding.verify");
+    let want_verify = grants(&opts.agent_tools, &f::FINDINGS_VERIFY);
     if standalone_report || standalone_asset || want_verify {
         // A concerns agent's ledger is the bundle's own (same scope, target
         // id and run stream, directory already ensured); otherwise it is
@@ -1939,30 +1884,23 @@ async fn run_agent_inner(
             }
         };
         if want_verify {
-            registry.insert(
-                "finding.verify",
-                std::sync::Arc::new(coverage_tools::FindingVerifyTool::new(paths.clone())),
-            );
+            registry.insert(std::sync::Arc::new(coverage_tools::FindingVerifyTool::new(
+                paths.clone(),
+            )));
         }
         if standalone_asset {
             if let Some(engagement) = findings_opts.engagement.clone() {
-                registry.insert(
-                    "asset_mark",
-                    std::sync::Arc::new(coverage_tools::AssetMarkTool::new(
-                        paths.clone(),
-                        engagement,
-                    )),
-                );
+                registry.insert(std::sync::Arc::new(coverage_tools::AssetMarkTool::new(
+                    paths.clone(),
+                    engagement,
+                )));
             }
         }
         if standalone_report {
-            registry.insert(
-                "report_finding",
-                std::sync::Arc::new(coverage_tools::ReportFindingTool::new(
-                    paths,
-                    findings_opts.clone(),
-                )),
-            );
+            registry.insert(std::sync::Arc::new(coverage_tools::ReportFindingTool::new(
+                paths,
+                findings_opts.clone(),
+            )));
         }
     }
 
@@ -1972,29 +1910,20 @@ async fn run_agent_inner(
     // live in one workspace-wide log — and `tag_findings` is allowed in
     // readonly mode, as `report_finding` is: it annotates the ledger and
     // never touches the workspace's files.
-    let granted = |name: &str| {
-        opts.agent_tools
-            .as_ref()
-            .is_some_and(|list| list.iter().any(|t| t == name))
-    };
-    let grant_query = granted("query_findings");
-    let grant_tag = granted("tag_findings");
+    let grant_query = grants(&opts.agent_tools, &f::FINDINGS_QUERY);
+    let grant_tag = grants(&opts.agent_tools, &f::FINDINGS_TAG);
     if grant_query {
-        registry.insert(
-            "query_findings",
-            std::sync::Arc::new(coverage_tools::QueryFindingsTool::new(
-                opts.workspace_path.clone(),
-            )),
-        );
+        registry.insert(std::sync::Arc::new(coverage_tools::QueryFindingsTool::new(
+            opts.workspace_path.clone(),
+        )));
     }
     if grant_tag {
         let scope = opts.scope_name.as_deref().unwrap_or(&opts.agent_name);
         let log = rupu_coverage::TagLog::for_workspace(&opts.workspace_path)
             .with_run_stream(run_stream_for(&opts.tool_context, scope));
-        registry.insert(
-            "tag_findings",
-            std::sync::Arc::new(coverage_tools::TagFindingsTool::new(log)),
-        );
+        registry.insert(std::sync::Arc::new(coverage_tools::TagFindingsTool::new(
+            log,
+        )));
     }
 
     // MCP server: spin up before the loop if we have a Registry.
@@ -2004,8 +1933,7 @@ async fn run_agent_inner(
                 .agent_tools
                 .clone()
                 .unwrap_or_else(|| vec!["*".to_string()]);
-            let mode = parse_mode_for_runtime(&opts.mode_str);
-            let permission = McpPermission::new(mode, allowlist);
+            let permission = McpPermission::new(opts.permission.mode(), allowlist);
             let (transport, handle) =
                 rupu_mcp::serve_in_process(scm_registry.clone(), permission.clone());
             let dispatcher = Arc::new(rupu_mcp::ToolDispatcher::new(scm_registry, permission));
@@ -2038,13 +1966,13 @@ async fn run_agent_inner(
                 if !allowed {
                     continue;
                 }
-                let adapter = Arc::new(McpToolAdapter::new(
-                    spec.name,
-                    spec.description,
-                    spec.input_schema.clone(),
-                    dispatcher.clone(),
-                ));
-                registry.insert(spec.name.to_string(), adapter as Arc<dyn Tool>);
+                match McpToolAdapter::new(spec.name, dispatcher.clone()) {
+                    Some(adapter) => registry.insert(Arc::new(adapter) as Arc<dyn Tool>),
+                    None => tracing::error!(
+                        tool = spec.name,
+                        "MCP tool has no descriptor (mcp_tool.rs schema table); not offered"
+                    ),
+                }
             }
 
             Some((transport, handle))
@@ -2055,9 +1983,9 @@ async fn run_agent_inner(
     // Always-on injected tools (agentiflow Tier-1): registered after the
     // agent_tools filter and the coverage/MCP blocks, so a restrictive agent
     // tools:/actions: list cannot strip them. A name collision favors the
-    // injected tool. The per-call PermissionDecider still runs.
+    // injected tool. The per-call PermissionPolicy still runs.
     for tool in &opts.extra_tools {
-        registry.insert(tool.name().to_string(), tool.clone());
+        registry.insert(tool.clone());
     }
 
     let tool_defs = registry.to_tool_definitions();
@@ -2104,7 +2032,10 @@ async fn run_agent_inner(
     let mut total_in: u64 = 0;
     let mut total_out: u64 = 0;
     let mut total_cached: u64 = 0;
-    let mut runtime_mode = parse_mode_for_runtime(&opts.mode_str);
+    // Tools the operator chose "allow always" for, by canonical name (D6),
+    // and whether the ask-without-operator notice has been written (D5).
+    let mut allow_always = AllowAlways::default();
+    let mut degraded_noticed = false;
     // Clone the cooperative pause token so it can be awaited in `select!`
     // arms without borrowing `opts` (which the provider call borrows
     // mutably). Cheap: `CancellationToken` is `Arc`-backed.
@@ -2911,47 +2842,9 @@ async fn run_agent_inner(
             // Dispatch tool calls in order.
             let mut tool_results: Vec<(String, String, Option<String>)> = Vec::new();
             for (call_id, tool_name, input) in tool_uses {
-                // Permission gate.
-                let decision = opts.decider.decide(
-                    runtime_mode,
-                    &tool_name,
-                    &input,
-                    &opts.workspace_path.display().to_string(),
-                )?;
-                match decision {
-                    PermissionDecision::Deny => {
-                        writer.write(&Event::ToolResult {
-                            call_id: call_id.clone(),
-                            output: String::new(),
-                            error: Some("permission_denied".into()),
-                            duration_ms: 0,
-                            structured: None,
-                        })?;
-                        tool_results.push((
-                            call_id,
-                            String::new(),
-                            Some("permission_denied".into()),
-                        ));
-                        continue;
-                    }
-                    PermissionDecision::StopRun => {
-                        writer.write(&Event::RunComplete {
-                            run_id: opts.run_id.clone(),
-                            status: RunStatus::Aborted,
-                            total_tokens: total_in + total_out,
-                            duration_ms: started.elapsed().as_millis() as u64,
-                            error: Some("operator_stop".into()),
-                            outcome: None,
-                        })?;
-                        writer.flush()?;
-                        return Err(RunError::OperatorStop { turn: turn_idx });
-                    }
-                    PermissionDecision::AllowAlwaysForToolThisRun => {
-                        runtime_mode = PermissionMode::Bypass;
-                    }
-                    PermissionDecision::Allow => {}
-                }
-
+                // Resolve the name the model used (canonical or a legacy
+                // alias) to the tool and its descriptor. The transcript's
+                // `ToolCall` keeps the name the model actually used.
                 let tool: Arc<dyn Tool> = match registry.get(&tool_name) {
                     Some(t) => t,
                     None => {
@@ -2978,16 +2871,63 @@ async fn run_agent_inner(
                         continue;
                     }
                 };
-                // The audit callback fires AFTER `invoke` resolves, not
-                // before: the mode check (readonly blocks writes) lives
-                // inside `invoke` (McpToolAdapter -> ToolDispatcher ->
-                // McpPermission::check), so firing beforehand with a
-                // hardcoded `blocked: false` recorded a per-mode denial as
-                // an allowed call — a false negative in the audit trail
-                // (spec §4a/§4b; a readonly-mode write denial MUST show
-                // `blocked: true`). `blocked` is derived from the actual
-                // outcome below. Exactly one callback invocation per call,
-                // same as before.
+                let descriptor = tool.descriptor();
+
+                // Permission: a pure function of the tool's effect and the
+                // run's mode (W1). The operator is asked only for a
+                // write/external call under `ask` with a prompter.
+                let mut spawn_ceiling = None;
+                match opts.permission.decide(descriptor, &input, &mut allow_always) {
+                    Decision::Allow => {}
+                    Decision::AllowDegraded => {
+                        if !degraded_noticed {
+                            degraded_noticed = true;
+                            writer.write(&Event::Notice {
+                                kind: rupu_tools::permission::DEGRADED_NOTICE_KIND.into(),
+                                message: rupu_tools::permission::DEGRADED_NOTICE_MESSAGE.into(),
+                            })?;
+                        }
+                    }
+                    Decision::Spawn { ceiling } => spawn_ceiling = Some(ceiling),
+                    Decision::Deny { .. } => {
+                        writer.write(&Event::ToolResult {
+                            call_id: call_id.clone(),
+                            output: String::new(),
+                            error: Some("permission_denied".into()),
+                            duration_ms: 0,
+                            structured: None,
+                        })?;
+                        tool_results.push((
+                            call_id,
+                            String::new(),
+                            Some("permission_denied".into()),
+                        ));
+                        if let Some(cb) = opts.on_tool_call.as_ref() {
+                            writer.flush()?;
+                            cb(&opts.step_id, &tool_name, true);
+                        }
+                        continue;
+                    }
+                    Decision::Stop => {
+                        writer.write(&Event::RunComplete {
+                            run_id: opts.run_id.clone(),
+                            status: RunStatus::Aborted,
+                            total_tokens: total_in + total_out,
+                            duration_ms: started.elapsed().as_millis() as u64,
+                            error: Some("operator_stop".into()),
+                            outcome: None,
+                        })?;
+                        writer.flush()?;
+                        return Err(RunError::OperatorStop { turn: turn_idx });
+                    }
+                }
+
+                // The audit callback fires AFTER `invoke` resolves: a policy
+                // denial above already reported `blocked: true`, and a tool
+                // may still refuse inside `invoke` (`ToolError::
+                // PermissionDenied`), so `blocked` is derived from the actual
+                // outcome below (spec §4a/§4b; a denial MUST show `blocked:
+                // true`). Exactly one callback invocation per call.
                 // No new tool dispatch once SIGTERM has arrived.
                 if rupu_providers::credential_writes::terminating() {
                     return Err(terminated(
@@ -3004,6 +2944,8 @@ async fn run_agent_inner(
                 // same turn never inherits a stale id.
                 let mut call_ctx = opts.tool_context.clone();
                 call_ctx.tool_call_id = Some(call_id.clone());
+                call_ctx.spawn_ceiling = spawn_ceiling;
+                call_ctx.prompter = opts.permission.prompter().cloned();
                 let invoke_result = tool.invoke(input.clone(), &call_ctx).await;
                 let blocked = matches!(invoke_result, Err(rupu_tools::ToolError::PermissionDenied));
                 match invoke_result {
@@ -3393,26 +3335,22 @@ async fn run_agent_inner(
     inner_result
 }
 
-fn parse_mode_for_event(s: &str) -> RunMode {
-    match s {
-        "bypass" => RunMode::Bypass,
-        "readonly" => RunMode::Readonly,
-        _ => RunMode::Ask,
+/// The transcript's record of a run's permission mode.
+fn run_mode(mode: PermissionMode) -> RunMode {
+    match mode {
+        PermissionMode::Bypass => RunMode::Bypass,
+        PermissionMode::Readonly => RunMode::Readonly,
+        PermissionMode::Ask => RunMode::Ask,
     }
 }
 
-/// Map a CLI/config mode string (`"ask"` / `"bypass"` / `"readonly"`,
-/// defaulting to `Ask` for anything else) to a [`PermissionMode`]. `pub`
-/// so callers building an in-process MCP `ToolDispatcher` outside this
-/// crate (rupu-cli's action-dispatcher wiring) can reuse the exact same
-/// mapping `run_agent` uses for its own tool registry, rather than
-/// duplicating the match arms.
-pub fn parse_mode_for_runtime(s: &str) -> PermissionMode {
-    match s {
-        "bypass" => PermissionMode::Bypass,
-        "readonly" => PermissionMode::Readonly,
-        _ => PermissionMode::Ask,
-    }
+/// Whether an agent's `tools:` list grants the tool `d`, by canonical name or
+/// alias. Exact names only: wildcard grants (`*`, `ns.*`) for these opt-in
+/// tools arrive with W2's grant resolver.
+fn grants(agent_tools: &Option<Vec<String>>, d: &ToolDescriptor) -> bool {
+    agent_tools
+        .as_ref()
+        .is_some_and(|list| list.iter().any(|t| d.answers_to(t)))
 }
 
 fn parse_file_edit_kind(s: &str) -> FileEditKind {
@@ -3518,7 +3456,7 @@ mod on_tool_call_tests {
             workspace_path: tmp_dir.path().to_path_buf(),
             transcript_path,
             max_turns: 5,
-            decider: Arc::new(BypassDecider),
+            permission: rupu_tools::PermissionPolicy::bypass(),
             tool_context: rupu_tools::ToolContext {
                 workspace_path: tmp_dir.path().to_path_buf(),
                 ..Default::default()
@@ -3526,7 +3464,6 @@ mod on_tool_call_tests {
             user_message: "test prompt".into(),
             initial_messages: Vec::new(),
             turn_index_offset: 0,
-            mode_str: "bypass".into(),
             no_stream: true,
             suppress_stream_stdout: false,
             mcp_registry: None,
@@ -3648,7 +3585,7 @@ mod on_tool_call_tests {
             workspace_path: tmp_dir.path().to_path_buf(),
             transcript_path,
             max_turns: 6,
-            decider: Arc::new(BypassDecider),
+            permission: rupu_tools::PermissionPolicy::bypass(),
             tool_context: rupu_tools::ToolContext {
                 workspace_path: tmp_dir.path().to_path_buf(),
                 net_capture: Some(Arc::new(RecordingCapture(log.clone()))),
@@ -3658,7 +3595,6 @@ mod on_tool_call_tests {
             user_message: "test prompt".into(),
             initial_messages: Vec::new(),
             turn_index_offset: 0,
-            mode_str: "bypass".into(),
             no_stream: true,
             suppress_stream_stdout: false,
             mcp_registry: None,
@@ -3704,16 +3640,21 @@ mod on_tool_call_tests {
     async fn extra_tools_are_registered_and_bypass_the_agent_tools_filter() {
         // A trivial always-on tool.
         struct Ping;
+        fn ping_schema() -> serde_json::Value {
+            serde_json::json!({"type":"object","properties":{}})
+        }
+        static PING: rupu_tools::ToolDescriptor = rupu_tools::ToolDescriptor {
+            name: "ping",
+            aliases: &[],
+            effect: rupu_tools::Effect::Read,
+            needs: &[],
+            description: "returns pong",
+            input_schema: ping_schema,
+        };
         #[async_trait::async_trait]
         impl rupu_tools::Tool for Ping {
-            fn name(&self) -> &'static str {
-                "ping"
-            }
-            fn description(&self) -> &'static str {
-                "returns pong"
-            }
-            fn input_schema(&self) -> serde_json::Value {
-                serde_json::json!({"type":"object","properties":{}})
+            fn descriptor(&self) -> &'static rupu_tools::ToolDescriptor {
+                &PING
             }
             async fn invoke(
                 &self,
@@ -3767,7 +3708,7 @@ mod on_tool_call_tests {
             workspace_path: tmp_dir.path().to_path_buf(),
             transcript_path,
             max_turns: 5,
-            decider: Arc::new(BypassDecider),
+            permission: rupu_tools::PermissionPolicy::bypass(),
             tool_context: rupu_tools::ToolContext {
                 workspace_path: tmp_dir.path().to_path_buf(),
                 ..Default::default()
@@ -3775,7 +3716,6 @@ mod on_tool_call_tests {
             user_message: "test prompt".into(),
             initial_messages: Vec::new(),
             turn_index_offset: 0,
-            mode_str: "bypass".into(),
             no_stream: true,
             suppress_stream_stdout: false,
             mcp_registry: None,
@@ -3905,7 +3845,7 @@ mod on_tool_call_tests {
             workspace_path: tmp_dir.path().to_path_buf(),
             transcript_path,
             max_turns: 5,
-            decider: Arc::new(BypassDecider),
+            permission: rupu_tools::PermissionPolicy::bypass(),
             tool_context: rupu_tools::ToolContext {
                 workspace_path: tmp_dir.path().to_path_buf(),
                 findings: Some(findings),
@@ -3914,7 +3854,6 @@ mod on_tool_call_tests {
             user_message: "test prompt".into(),
             initial_messages: Vec::new(),
             turn_index_offset: 0,
-            mode_str: "bypass".into(),
             no_stream: true,
             suppress_stream_stdout: false,
             mcp_registry: None,
@@ -4033,7 +3972,7 @@ mod on_tool_call_tests {
             workspace_path: tmp_dir.path().to_path_buf(),
             transcript_path: transcript_path.clone(),
             max_turns: 5,
-            decider: Arc::new(BypassDecider),
+            permission: rupu_tools::PermissionPolicy::bypass(),
             tool_context: rupu_tools::ToolContext {
                 workspace_path: tmp_dir.path().to_path_buf(),
                 ..Default::default()
@@ -4041,7 +3980,6 @@ mod on_tool_call_tests {
             user_message: "test prompt".into(),
             initial_messages: Vec::new(),
             turn_index_offset: 0,
-            mode_str: "bypass".into(),
             no_stream: true,
             suppress_stream_stdout: false,
             mcp_registry: None,
@@ -4160,7 +4098,7 @@ mod on_tool_call_tests {
             workspace_path: tmp_dir.path().to_path_buf(),
             transcript_path,
             max_turns: 5,
-            decider: Arc::new(BypassDecider),
+            permission: rupu_tools::PermissionPolicy::unattended(PermissionMode::Readonly),
             tool_context: rupu_tools::ToolContext {
                 workspace_path: tmp_dir.path().to_path_buf(),
                 ..Default::default()
@@ -4168,7 +4106,6 @@ mod on_tool_call_tests {
             user_message: "test prompt".into(),
             initial_messages: Vec::new(),
             turn_index_offset: 0,
-            mode_str: "readonly".into(),
             no_stream: true,
             suppress_stream_stdout: false,
             mcp_registry: Some(Arc::new(Registry::default())),
@@ -4240,7 +4177,7 @@ mod on_tool_call_tests {
             workspace_path: tmp.path().to_path_buf(),
             transcript_path: transcript.clone(),
             max_turns: 5,
-            decider: Arc::new(BypassDecider),
+            permission: rupu_tools::PermissionPolicy::bypass(),
             tool_context: rupu_tools::ToolContext {
                 workspace_path: tmp.path().to_path_buf(),
                 ..Default::default()
@@ -4248,7 +4185,6 @@ mod on_tool_call_tests {
             user_message: "go".into(),
             initial_messages: Vec::new(),
             turn_index_offset: 0,
-            mode_str: "bypass".into(),
             no_stream: true,
             suppress_stream_stdout: false,
             mcp_registry: None,
@@ -4345,7 +4281,7 @@ mod on_tool_call_tests {
             workspace_path: tmp_dir.path().to_path_buf(),
             transcript_path,
             max_turns: 5,
-            decider: Arc::new(BypassDecider),
+            permission: rupu_tools::PermissionPolicy::bypass(),
             tool_context: rupu_tools::ToolContext {
                 workspace_path: tmp_dir.path().to_path_buf(),
                 ..Default::default()
@@ -4353,7 +4289,6 @@ mod on_tool_call_tests {
             user_message: "do the thing".into(),
             initial_messages: Vec::new(),
             turn_index_offset: 0,
-            mode_str: "bypass".into(),
             no_stream: true,
             suppress_stream_stdout: false,
             mcp_registry: None,
@@ -4425,7 +4360,7 @@ mod on_tool_call_tests {
             workspace_path: tmp_dir.path().to_path_buf(),
             transcript_path: transcript_path.clone(),
             max_turns: 5,
-            decider: Arc::new(BypassDecider),
+            permission: rupu_tools::PermissionPolicy::bypass(),
             tool_context: rupu_tools::ToolContext {
                 workspace_path: tmp_dir.path().to_path_buf(),
                 ..Default::default()
@@ -4433,7 +4368,6 @@ mod on_tool_call_tests {
             user_message: "do the thing".into(),
             initial_messages: Vec::new(),
             turn_index_offset: 0,
-            mode_str: "bypass".into(),
             no_stream: true,
             suppress_stream_stdout: false,
             mcp_registry: None,
@@ -4527,7 +4461,7 @@ mod on_tool_call_tests {
                 workspace_path: tmp_dir.path().to_path_buf(),
                 transcript_path: transcript_path.clone(),
                 max_turns: 5,
-                decider: Arc::new(BypassDecider),
+                permission: rupu_tools::PermissionPolicy::bypass(),
                 tool_context: rupu_tools::ToolContext {
                     workspace_path: tmp_dir.path().to_path_buf(),
                     ..Default::default()
@@ -4535,7 +4469,6 @@ mod on_tool_call_tests {
                 user_message: "do the thing".into(),
                 initial_messages: Vec::new(),
                 turn_index_offset: 0,
-                mode_str: "bypass".into(),
                 no_stream: true,
                 suppress_stream_stdout: false,
                 mcp_registry: None,
@@ -5360,7 +5293,7 @@ mod compaction_tests {
             workspace_path: dir.to_path_buf(),
             transcript_path: transcript_path.to_path_buf(),
             max_turns: 5,
-            decider: Arc::new(BypassDecider),
+            permission: rupu_tools::PermissionPolicy::bypass(),
             tool_context: rupu_tools::ToolContext {
                 workspace_path: dir.to_path_buf(),
                 ..Default::default()
@@ -5368,7 +5301,6 @@ mod compaction_tests {
             user_message: "task".into(),
             initial_messages: Vec::new(),
             turn_index_offset: 0,
-            mode_str: "bypass".into(),
             no_stream: true,
             suppress_stream_stdout: false,
             mcp_registry: None,
@@ -5907,7 +5839,7 @@ mod pause_tests {
             workspace_path: workspace.to_path_buf(),
             transcript_path,
             max_turns: 5,
-            decider: Arc::new(BypassDecider),
+            permission: rupu_tools::PermissionPolicy::bypass(),
             tool_context: rupu_tools::ToolContext {
                 workspace_path: workspace.to_path_buf(),
                 ..Default::default()
@@ -5915,7 +5847,6 @@ mod pause_tests {
             user_message: user_message.into(),
             initial_messages,
             turn_index_offset: 0,
-            mode_str: "bypass".into(),
             // Exercise the streaming path — that is what pause races against.
             no_stream: false,
             suppress_stream_stdout: true,
@@ -6250,7 +6181,7 @@ mod reasoning_tests {
             workspace_path: workspace.to_path_buf(),
             transcript_path,
             max_turns: 5,
-            decider: Arc::new(BypassDecider),
+            permission: rupu_tools::PermissionPolicy::bypass(),
             tool_context: rupu_tools::ToolContext {
                 workspace_path: workspace.to_path_buf(),
                 ..Default::default()
@@ -6258,7 +6189,6 @@ mod reasoning_tests {
             user_message: "test prompt".into(),
             initial_messages: Vec::new(),
             turn_index_offset: 0,
-            mode_str: "bypass".into(),
             no_stream: true,
             suppress_stream_stdout: true,
             mcp_registry: None,

@@ -11,11 +11,13 @@
 //! See `docs/superpowers/specs/2026-05-08-rupu-sub-agent-dispatch-design.md`.
 
 use async_trait::async_trait;
-use rupu_agent::runner::{run_agent, AgentRunOpts, BypassDecider, PermissionDecider};
+use rupu_agent::runner::{run_agent, AgentRunOpts};
 use rupu_orchestrator::executor::{Event as OrchEvent, EventSink};
 use rupu_orchestrator::RunStore;
 use rupu_runtime::provider_factory;
-use rupu_tools::{AgentDispatcher, DispatchError, DispatchOutcome, ToolContext};
+use rupu_tools::{
+    AgentDispatcher, DispatchError, DispatchOutcome, PermissionMode, SpawnPermission, ToolContext,
+};
 use rupu_transcript::{Event as TxEvent, JsonlReader, JsonlWriter};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -29,7 +31,6 @@ pub struct CliAgentDispatcher {
     workspace_id: String,
     workspace_path: PathBuf,
     resolver: Arc<rupu_auth::KeychainResolver>,
-    parent_mode_str: String,
     mcp_registry: Arc<rupu_scm::Registry>,
     run_store: Arc<RunStore>,
     /// Self-reference as a trait object so each child's `ToolContext`
@@ -119,7 +120,6 @@ impl std::fmt::Debug for CliAgentDispatcher {
             .field("project_root", &self.project_root)
             .field("workspace_id", &self.workspace_id)
             .field("workspace_path", &self.workspace_path)
-            .field("parent_mode_str", &self.parent_mode_str)
             .finish()
     }
 }
@@ -132,7 +132,6 @@ impl CliAgentDispatcher {
         workspace_id: String,
         workspace_path: PathBuf,
         resolver: Arc<rupu_auth::KeychainResolver>,
-        parent_mode_str: String,
         mcp_registry: Arc<rupu_scm::Registry>,
         run_store: Arc<RunStore>,
         event_sink: Option<Arc<dyn EventSink>>,
@@ -158,7 +157,6 @@ impl CliAgentDispatcher {
             workspace_id,
             workspace_path,
             resolver,
-            parent_mode_str,
             mcp_registry,
             run_store,
             self_dyn: OnceLock::new(),
@@ -265,6 +263,7 @@ impl AgentDispatcher for CliAgentDispatcher {
         parent_run_id: &str,
         parent_depth: u32,
         parent_codename: Option<&str>,
+        permission: SpawnPermission,
     ) -> Result<DispatchOutcome, DispatchError> {
         // KNOWN LIMITATION (tool_audit design §4/review IMPORTANT 4): the
         // `AgentDispatcher::dispatch` trait (rupu-tools) takes no narrowed
@@ -419,10 +418,24 @@ impl AgentDispatcher for CliAgentDispatcher {
         )
         .await;
 
-        let child_mode_str = spec
-            .permission_mode
-            .clone()
-            .unwrap_or_else(|| self.parent_mode_str.clone());
+        // The child's permission ceiling (D7, fixes R2): the parent's mode as
+        // the call's permission decision set it, lowered — never raised — by
+        // the child's own `permissionMode`. A readonly parent's child is
+        // readonly whatever its frontmatter says, and an interactive parent's
+        // operator answers the child's prompts.
+        let child_declared = match spec.permission_mode.as_deref() {
+            None => None,
+            Some(word) => match PermissionMode::parse(word) {
+                Ok(mode) => Some(mode),
+                // An unreadable mode can't lower the ceiling; cap at readonly
+                // rather than run the child at the parent's full mode.
+                Err(e) => {
+                    tracing::warn!(child_agent = agent_name, error = %e, "capping the child at readonly");
+                    Some(PermissionMode::Readonly)
+                }
+            },
+        };
+        let child_permission = permission.child_policy(child_declared);
         let child_depth = parent_depth + 1;
 
         let child_tool_ctx = ToolContext {
@@ -449,6 +462,8 @@ impl AgentDispatcher for CliAgentDispatcher {
             netflow_sink: Some(netflow_sink.clone()),
             net_capture: self.net_capture.lock().ok().and_then(|g| g.clone()),
             tool_call_id: None,
+            spawn_ceiling: None,
+            prompter: None,
         };
 
         // What a fallback hop keeps from this child's agent: exactly what its
@@ -474,12 +489,11 @@ impl AgentDispatcher for CliAgentDispatcher {
             workspace_path: self.workspace_path.clone(),
             transcript_path: transcript_path.clone(),
             max_turns: spec.max_turns.unwrap_or(50),
-            decider: Arc::new(BypassDecider) as Arc<dyn PermissionDecider>,
+            permission: child_permission,
             tool_context: child_tool_ctx,
             user_message: prompt,
             initial_messages: Vec::new(),
             turn_index_offset: 0,
-            mode_str: child_mode_str,
             no_stream: false,
             // The parent's printer renders the child as a callout from
             // the `dispatch_agent` tool result; suppress the child's
@@ -710,6 +724,14 @@ fn read_final_assistant_text(path: &Path) -> Option<String> {
 mod tests {
     use super::*;
     use crate::test_support::ENV_LOCK;
+
+    /// The spawn permission of a dispatch from a bypass parent.
+    fn bypass() -> SpawnPermission {
+        SpawnPermission {
+            ceiling: PermissionMode::Bypass,
+            prompter: None,
+        }
+    }
     use rupu_transcript::{Event, JsonlWriter, RunMode, RunStatus};
     use tempfile::TempDir;
 
@@ -810,6 +832,104 @@ mod tests {
         assert_eq!(read_final_assistant_text(&path), None);
     }
 
+    /// W1 R2 / D7 (`readonly_subagent_is_capped`): a readonly parent
+    /// dispatches a child whose own frontmatter says `permissionMode: bypass`;
+    /// the child runs readonly, so its `write_file` is denied. Before W1
+    /// every sub-agent ran under `BypassDecider` and the child's mode could
+    /// raise the parent's.
+    #[tokio::test]
+    async fn readonly_subagent_is_capped() {
+        let _guard = ENV_LOCK.lock().await;
+        let dir = TempDir::new().unwrap();
+        let global = dir.path().join("global");
+        std::fs::create_dir_all(global.join("agents")).unwrap();
+        std::fs::write(
+            global.join("agents/writer.md"),
+            "---\nname: writer\nprovider: anthropic\nmodel: claude-sonnet-4-6\nmaxTurns: 3\n\
+             permissionMode: bypass\ntools: [write_file]\n---\nyou write files.",
+        )
+        .unwrap();
+        let runs_dir = dir.path().join("runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        let workspace_path = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_path).unwrap();
+
+        let dispatcher = CliAgentDispatcher::new(
+            global,
+            None,
+            "ws_test".into(),
+            workspace_path.clone(),
+            Arc::new(rupu_auth::KeychainResolver::new()),
+            Arc::new(rupu_scm::Registry::default()),
+            Arc::new(RunStore::new(runs_dir)),
+            None,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            rupu_coverage::FindingWriteOptions::default(),
+            None,
+            rupu_runtime::model_limits::LimitsContext::for_cache_dir(
+                dir.path().join("cache/models"),
+            ),
+            None,
+            Default::default(),
+            Default::default(),
+            None,
+        );
+
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[
+              { "AssistantToolUse": { "text": null, "tool_id": "w1", "tool_name": "write_file", "tool_input": {"path": "escaped.txt", "content": "x"}, "stop": "tool_use" } },
+              { "AssistantText": { "text": "done", "stop": "end_turn" } }
+            ]"#,
+        );
+        let readonly_parent = SpawnPermission {
+            ceiling: PermissionMode::Readonly,
+            prompter: None,
+        };
+        let result = dispatcher
+            .dispatch(
+                "writer",
+                "write it".into(),
+                "parent_run_1",
+                0,
+                None,
+                readonly_parent,
+            )
+            .await;
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        let outcome = result.expect("dispatch succeeds; the denied call does not fail it");
+
+        assert!(
+            !workspace_path.join("escaped.txt").exists(),
+            "a readonly parent's child must not write"
+        );
+        let events: Vec<Event> = JsonlReader::iter(&outcome.transcript_path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                Event::RunStart {
+                    mode: RunMode::Readonly,
+                    ..
+                }
+            )),
+            "the child runs readonly: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                Event::ToolResult { error: Some(err), .. } if err == "permission_denied"
+            )),
+            "{events:?}"
+        );
+    }
+
     /// Records every emitted event as `(run_id, Event)` for assertion.
     #[derive(Default)]
     struct CapturingSink {
@@ -866,7 +986,6 @@ mod tests {
             "ws_test".into(),
             workspace_path,
             resolver,
-            "bypass".into(),
             mcp_registry,
             run_store,
             Some(sink.clone() as Arc<dyn EventSink>),
@@ -893,7 +1012,14 @@ mod tests {
             r#"[{ "AssistantText": { "text": "child done", "stop": "end_turn" } }]"#,
         );
         let result = dispatcher
-            .dispatch("child", "do the thing".into(), "parent_run_1", 0, None)
+            .dispatch(
+                "child",
+                "do the thing".into(),
+                "parent_run_1",
+                0,
+                None,
+                bypass(),
+            )
             .await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
 
@@ -991,7 +1117,6 @@ mod tests {
             "ws_test".into(),
             workspace_path,
             Arc::new(rupu_auth::KeychainResolver::new()),
-            "bypass".into(),
             Arc::new(rupu_scm::Registry::default()),
             Arc::new(RunStore::new(runs_dir)),
             None,
@@ -1016,7 +1141,14 @@ mod tests {
             r#"[{ "AssistantText": { "text": "child done", "stop": "end_turn" } }]"#,
         );
         let result = dispatcher
-            .dispatch("pinnedchild", "go".into(), "parent_run_1", 0, None)
+            .dispatch(
+                "pinnedchild",
+                "go".into(),
+                "parent_run_1",
+                0,
+                None,
+                bypass(),
+            )
             .await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
         let outcome = result.expect("dispatch should succeed against the mock provider");
@@ -1056,7 +1188,6 @@ mod tests {
             "ws_test".into(),
             workspace_path,
             Arc::new(rupu_auth::KeychainResolver::new()),
-            "bypass".into(),
             Arc::new(rupu_scm::Registry::default()),
             Arc::new(RunStore::new(runs_dir)),
             None,
@@ -1081,7 +1212,7 @@ mod tests {
             r#"[{ "AssistantText": { "text": "child done", "stop": "end_turn" } }]"#,
         );
         let result = dispatcher
-            .dispatch("child", "go".into(), "parent_run_1", 0, None)
+            .dispatch("child", "go".into(), "parent_run_1", 0, None, bypass())
             .await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
         let outcome = result.expect("dispatch should succeed against the mock provider");
@@ -1125,7 +1256,6 @@ mod tests {
             "ws_test".into(),
             workspace_path,
             Arc::new(rupu_auth::KeychainResolver::new()),
-            "bypass".into(),
             Arc::new(rupu_scm::Registry::default()),
             Arc::new(RunStore::new(runs_dir)),
             None,
@@ -1153,7 +1283,7 @@ mod tests {
             ]"#,
         );
         let result = dispatcher
-            .dispatch("child", "go".into(), "parent_run_1", 0, None)
+            .dispatch("child", "go".into(), "parent_run_1", 0, None, bypass())
             .await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
         result.expect("dispatch should succeed against the mock provider");
@@ -1229,7 +1359,6 @@ mod tests {
             "ws_test".into(),
             workspace_path,
             Arc::new(rupu_auth::KeychainResolver::new()),
-            "bypass".into(),
             Arc::new(rupu_scm::Registry::default()),
             run_store,
             Some(sink.clone() as Arc<dyn EventSink>),
@@ -1257,7 +1386,14 @@ mod tests {
         for parent in [Some("jade-reef/heron"), Some("jade-reef/heron"), None] {
             std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", script);
             let r = dispatcher
-                .dispatch("security-reviewer", "go".into(), "parent_run_1", 0, parent)
+                .dispatch(
+                    "security-reviewer",
+                    "go".into(),
+                    "parent_run_1",
+                    0,
+                    parent,
+                    bypass(),
+                )
                 .await;
             std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
             outcomes.push(r.expect("dispatch should succeed against the mock provider"));
@@ -1340,7 +1476,6 @@ mod tests {
             "ws_test".into(),
             workspace_path,
             Arc::new(rupu_auth::KeychainResolver::new()),
-            "bypass".into(),
             Arc::new(rupu_scm::Registry::default()),
             Arc::new(RunStore::new(runs_dir)),
             None,
@@ -1370,6 +1505,7 @@ mod tests {
                 "parent_run_1",
                 0,
                 Some("amber-lantern/otter"),
+                bypass(),
             )
             .await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
@@ -1410,7 +1546,6 @@ mod tests {
             "ws_test".into(),
             workspace_path,
             resolver,
-            "bypass".into(),
             mcp_registry,
             run_store,
             None,
@@ -1435,7 +1570,14 @@ mod tests {
             r#"[{ "AssistantText": { "text": "child done", "stop": "end_turn" } }]"#,
         );
         let result = dispatcher
-            .dispatch("child", "do the thing".into(), "parent_run_1", 0, None)
+            .dispatch(
+                "child",
+                "do the thing".into(),
+                "parent_run_1",
+                0,
+                None,
+                bypass(),
+            )
             .await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
 
@@ -1470,7 +1612,6 @@ mod tests {
             "ws_test".into(),
             workspace_path,
             Arc::new(rupu_auth::KeychainResolver::new()),
-            "bypass".into(),
             Arc::new(rupu_scm::Registry::default()),
             Arc::new(RunStore::new(runs_dir)),
             None,
@@ -1503,7 +1644,14 @@ mod tests {
             ]"#,
         );
         let result = dispatcher
-            .dispatch("child", "do the thing".into(), "parent_run_1", 0, None)
+            .dispatch(
+                "child",
+                "do the thing".into(),
+                "parent_run_1",
+                0,
+                None,
+                bypass(),
+            )
             .await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
 
@@ -1572,7 +1720,6 @@ mod tests {
             "ws_test".into(),
             workspace_path,
             resolver,
-            "bypass".into(),
             mcp_registry,
             run_store,
             None,
@@ -1597,7 +1744,14 @@ mod tests {
             r#"[{ "AssistantText": { "text": "child done", "stop": "end_turn" } }]"#,
         );
         let result = dispatcher
-            .dispatch("child", "do the thing".into(), "parent_run_1", 0, None)
+            .dispatch(
+                "child",
+                "do the thing".into(),
+                "parent_run_1",
+                0,
+                None,
+                bypass(),
+            )
             .await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
 
@@ -1658,7 +1812,6 @@ mod tests {
             "ws_test".into(),
             workspace_path,
             resolver,
-            "bypass".into(),
             mcp_registry,
             run_store,
             None,
@@ -1683,7 +1836,14 @@ mod tests {
             r#"[{ "AssistantText": { "text": "child done", "stop": "end_turn" } }]"#,
         );
         let result = dispatcher
-            .dispatch("child", "do the thing".into(), "parent_run_1", 0, None)
+            .dispatch(
+                "child",
+                "do the thing".into(),
+                "parent_run_1",
+                0,
+                None,
+                bypass(),
+            )
             .await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
 
@@ -1751,7 +1911,6 @@ mod tests {
             "ws_test".into(),
             workspace_path,
             resolver,
-            "bypass".into(),
             mcp_registry,
             run_store,
             None,
@@ -1776,7 +1935,14 @@ mod tests {
             r#"[{ "AssistantText": { "text": "child done", "stop": "end_turn" } }]"#,
         );
         let result = dispatcher
-            .dispatch("child", "do the thing".into(), "parent_run_1", 0, None)
+            .dispatch(
+                "child",
+                "do the thing".into(),
+                "parent_run_1",
+                0,
+                None,
+                bypass(),
+            )
             .await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
 
@@ -1846,7 +2012,6 @@ mod tests {
             "ws_test".into(),
             workspace_path,
             resolver,
-            "bypass".into(),
             mcp_registry,
             run_store,
             None,
@@ -1874,7 +2039,14 @@ mod tests {
             r#"[{ "AssistantText": { "text": "child done", "stop": "end_turn" } }]"#,
         );
         let result = dispatcher
-            .dispatch("child", "do the thing".into(), "parent_run_1", 0, None)
+            .dispatch(
+                "child",
+                "do the thing".into(),
+                "parent_run_1",
+                0,
+                None,
+                bypass(),
+            )
             .await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
 
@@ -1932,7 +2104,6 @@ mod tests {
             "ws_test".into(),
             workspace_path,
             resolver,
-            "bypass".into(),
             mcp_registry,
             run_store,
             None,
@@ -1957,7 +2128,14 @@ mod tests {
             r#"[{ "AssistantText": { "text": "child done", "stop": "end_turn" } }]"#,
         );
         let result = dispatcher
-            .dispatch("child", "do the thing".into(), "parent_run_1", 0, None)
+            .dispatch(
+                "child",
+                "do the thing".into(),
+                "parent_run_1",
+                0,
+                None,
+                bypass(),
+            )
             .await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
 

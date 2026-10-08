@@ -2,9 +2,12 @@
 //!
 //! Returns a sorted, newline-separated list of matching file paths
 //! relative to the workspace root. Pattern syntax is glob-style with
-//! `**` for recursive descent.
+//! `**` for recursive descent. Matches outside the workspace root are
+//! dropped.
 
 use crate::coverage_emit::{attribution_from, emit};
+use crate::descriptor::{Effect, ToolDescriptor};
+use crate::path_scope::is_inside;
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -23,27 +26,33 @@ struct Input {
 #[derive(Debug, Default, Clone)]
 pub struct GlobTool;
 
+/// This tool's descriptor.
+pub static DESCRIPTOR: ToolDescriptor = ToolDescriptor {
+    name: "glob",
+    aliases: &[],
+    effect: Effect::Read,
+    needs: &[],
+    description: "List files in the workspace matching a glob pattern. Output is one path per line, sorted, relative to the workspace root. Supports `**` for recursive descent. Returns empty stdout when nothing matches.",
+    input_schema: descriptor_schema,
+};
+
+fn descriptor_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "pattern": {
+                "type": "string",
+                "description": "Glob pattern, e.g. `src/**/*.rs` or `*.toml`."
+            }
+        },
+        "required": ["pattern"]
+    })
+}
+
 #[async_trait]
 impl Tool for GlobTool {
-    fn name(&self) -> &'static str {
-        "glob"
-    }
-
-    fn description(&self) -> &'static str {
-        "List files in the workspace matching a glob pattern. Output is one path per line, sorted, relative to the workspace root. Supports `**` for recursive descent. Returns empty stdout when nothing matches."
-    }
-
-    fn input_schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "pattern": {
-                    "type": "string",
-                    "description": "Glob pattern, e.g. `src/**/*.rs` or `*.toml`."
-                }
-            },
-            "required": ["pattern"]
-        })
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &DESCRIPTOR
     }
 
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -57,9 +66,11 @@ impl Tool for GlobTool {
             .build()
             .map_err(|e| ToolError::Execution(e.to_string()))?;
 
+        // Workspace scope, as the other fs tools: a pattern that climbs out
+        // (`../*`, an absolute path) yields nothing outside the workspace.
         let mut matches = vec![];
         for entry in walker.flatten() {
-            if entry.file_type().is_file() {
+            if entry.file_type().is_file() && is_inside(&ctx.workspace_path, entry.path()) {
                 let rel = entry
                     .path()
                     .strip_prefix(&ctx.workspace_path)

@@ -19,6 +19,7 @@ pub mod scm_files;
 pub mod scm_prs;
 pub mod scm_repos;
 
+use rupu_tools::Effect;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -37,6 +38,22 @@ pub enum ToolKind {
     #[default]
     Read,
     Write,
+}
+
+impl ToolSpec {
+    /// The tool's [`Effect`] — the ONE place a `ToolKind` maps to an effect
+    /// (W1; W4 replaces `ToolKind` with catalog descriptors). Reads observe;
+    /// writes act on a system outside this machine (`External`), except the
+    /// findings writes, which only touch rupu's own ledgers (`Record`).
+    pub fn effect(&self) -> Effect {
+        match self.kind {
+            ToolKind::Read => Effect::Read,
+            ToolKind::Write if matches!(self.name, "findings.record" | "findings.tag") => {
+                Effect::Record
+            }
+            ToolKind::Write => Effect::External,
+        }
+    }
 }
 
 /// Returns the full tool catalog. Stable order — used by snapshot test.

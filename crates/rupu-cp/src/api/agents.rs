@@ -376,8 +376,8 @@ pub(crate) struct AgentDto {
     /// definition, so this DTO deliberately does not attempt to resolve or
     /// guess an effective mode). Not validated against the three known
     /// values here — an unrecognized string round-trips as-is, the same
-    /// "unknown → treat as absent" tolerance `rupu_agent::permission::
-    /// parse_mode` already gives the runtime. Added for the macOS Library
+    /// "unknown → treat as absent" tolerance the runtime's mode resolution
+    /// gives it (`PermissionMode::parse(..).ok()`). Added for the macOS Library
     /// screen's permission-tone badge (Phase 5A, Task 7): `read-only` =
     /// done, `ask` = await, `bypass` = fail (always loud) — see
     /// `docs/macOS_design/HANDOFF.md`'s Library line.

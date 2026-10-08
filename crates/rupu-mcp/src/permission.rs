@@ -1,33 +1,23 @@
-//! Permission gating for MCP tools — per-tool allowlist + per-mode.
+//! Permission gating for MCP tools — per-tool allowlist, then the one
+//! [`PermissionPolicy`] decides from the tool's effect (W4 deletes this type
+//! when MCP becomes a transport over the catalog's resolved grant).
 
 use crate::error::McpError;
-use crate::tools::ToolKind;
-use rupu_tools::PermissionMode;
-use std::sync::Arc;
-
-/// Callback type for `--mode ask` prompts. Returns `true` to allow the call.
-pub type AskCb = Arc<dyn Fn(&str, &serde_json::Value) -> bool + Send + Sync>;
+use rupu_tools::{AllowAlways, Decision, Effect, PermissionMode, PermissionPolicy};
 
 #[derive(Clone)]
 pub struct McpPermission {
     mode: PermissionMode,
     allowlist: Vec<String>,
-    /// Optional callback for `--mode ask`. Returns Ok(true) to allow.
-    /// `None` means deny all writes silently in --mode ask.
-    ask_cb: Option<AskCb>,
 }
 
 impl McpPermission {
     pub fn new(mode: PermissionMode, allowlist: Vec<String>) -> Self {
-        Self {
-            mode,
-            allowlist,
-            ask_cb: None,
-        }
+        Self { mode, allowlist }
     }
 
-    /// Same mode and `ask` callback, but the allowlist narrowed to exactly
-    /// one tool (ISSUES.md I-79).
+    /// Same mode, but the allowlist narrowed to exactly one tool (ISSUES.md
+    /// I-79).
     ///
     /// Used by `execute_action_step` so an `action:` step's dispatch is
     /// constrained *structurally* to the tool named in the workflow, rather
@@ -39,7 +29,6 @@ impl McpPermission {
         Self {
             mode: self.mode,
             allowlist: vec![tool.to_string()],
-            ask_cb: self.ask_cb.clone(),
         }
     }
 
@@ -49,17 +38,14 @@ impl McpPermission {
         Self {
             mode: PermissionMode::Bypass,
             allowlist: vec!["*".into()],
-            ask_cb: None,
         }
     }
 
-    pub fn with_ask_callback(mut self, cb: AskCb) -> Self {
-        self.ask_cb = Some(cb);
-        self
-    }
-
-    /// Per-tool gating. Allowlist match first, then mode check.
-    pub fn check(&self, tool: &str, kind: ToolKind) -> Result<(), McpError> {
+    /// Per-tool gating: allowlist match first, then [`PermissionPolicy`] on
+    /// the tool's effect. There is no operator here: `ask` allows (the agent
+    /// loop, which has one, has already decided the call by the time it
+    /// reaches this dispatcher).
+    pub fn check(&self, tool: &'static str, effect: Effect) -> Result<(), McpError> {
         if !self.tool_in_allowlist(tool) {
             return Err(McpError::PermissionDenied {
                 tool: tool.to_string(),
@@ -69,14 +55,18 @@ impl McpPermission {
                 ),
             });
         }
-        match (self.mode, kind) {
-            (PermissionMode::Readonly, ToolKind::Write) => Err(McpError::PermissionDenied {
+        let decision = PermissionPolicy::unattended(self.mode).decide_call(
+            tool,
+            effect,
+            &serde_json::Value::Null,
+            &mut AllowAlways::default(),
+        );
+        match decision {
+            Decision::Deny { .. } | Decision::Stop => Err(McpError::PermissionDenied {
                 tool: tool.to_string(),
-                reason: "readonly mode blocks write tools".into(),
+                reason: format!("{} mode blocks {} tools", self.mode, effect.as_str()),
             }),
-            // Ask mode: allowed at the gate; runtime ask happens via ask_cb
-            // (driven by the agent runtime in Task 18, not the MCP server).
-            _ => Ok(()),
+            Decision::Allow | Decision::AllowDegraded | Decision::Spawn { .. } => Ok(()),
         }
     }
 
@@ -101,11 +91,11 @@ mod tests {
     #[test]
     fn allowlist_wildcard_matches_namespace() {
         let p = McpPermission::new(PermissionMode::Bypass, vec!["scm.*".into()]);
-        assert!(p.check("scm.repos.list", ToolKind::Read).is_ok());
-        assert!(p.check("scm.prs.create", ToolKind::Write).is_ok());
-        assert!(p.check("issues.get", ToolKind::Read).is_err());
+        assert!(p.check("scm.repos.list", Effect::Read).is_ok());
+        assert!(p.check("scm.prs.create", Effect::External).is_ok());
+        assert!(p.check("issues.get", Effect::Read).is_err());
         assert!(p
-            .check("github.workflows_dispatch", ToolKind::Write)
+            .check("github.workflows_dispatch", Effect::External)
             .is_err());
     }
 
@@ -115,26 +105,34 @@ mod tests {
             PermissionMode::Bypass,
             vec!["scm.repos.list".into(), "issues.get".into()],
         );
-        assert!(p.check("scm.repos.list", ToolKind::Read).is_ok());
-        assert!(p.check("issues.get", ToolKind::Read).is_ok());
-        assert!(p.check("scm.repos.get", ToolKind::Read).is_err());
+        assert!(p.check("scm.repos.list", Effect::Read).is_ok());
+        assert!(p.check("issues.get", Effect::Read).is_ok());
+        assert!(p.check("scm.repos.get", Effect::Read).is_err());
     }
 
     #[test]
     fn star_allows_all_namespaces() {
         let p = McpPermission::new(PermissionMode::Bypass, vec!["*".into()]);
-        assert!(p.check("scm.repos.list", ToolKind::Read).is_ok());
-        assert!(p.check("issues.create", ToolKind::Write).is_ok());
+        assert!(p.check("scm.repos.list", Effect::Read).is_ok());
+        assert!(p.check("issues.create", Effect::External).is_ok());
         assert!(p
-            .check("github.workflows_dispatch", ToolKind::Write)
+            .check("github.workflows_dispatch", Effect::External)
             .is_ok());
+    }
+
+    #[test]
+    fn readonly_allows_record_tools() {
+        // D4: readonly denies workspace writes and external actions, never
+        // rupu's own bookkeeping.
+        let p = McpPermission::new(PermissionMode::Readonly, vec!["*".into()]);
+        assert!(p.check("findings.tag", Effect::Record).is_ok());
     }
 
     #[test]
     fn readonly_blocks_writes_even_when_allowlisted() {
         let p = McpPermission::new(PermissionMode::Readonly, vec!["*".into()]);
-        assert!(p.check("scm.repos.list", ToolKind::Read).is_ok());
-        let err = p.check("scm.prs.create", ToolKind::Write).unwrap_err();
+        assert!(p.check("scm.repos.list", Effect::Read).is_ok());
+        let err = p.check("scm.prs.create", Effect::External).unwrap_err();
         assert!(matches!(err, McpError::PermissionDenied { .. }));
     }
 }

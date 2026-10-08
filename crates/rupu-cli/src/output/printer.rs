@@ -349,7 +349,7 @@ impl LineStreamPrinter {
 
     /// Hand out a clone of the underlying `MultiProgress`. Cheap —
     /// `MultiProgress` is `Arc`-backed internally. Used by the
-    /// `AskDecider` so it can call `multi.suspend(...)` around the
+    /// `TtyPrompter` so it can call `multi.suspend(...)` around the
     /// stderr permission prompt: indicatif rewrites the spinner row
     /// via `\r` on stdout, but `\r` is a terminal-level cursor move
     /// — it clobbers ANY content on that row, including a prompt

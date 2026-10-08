@@ -2,7 +2,7 @@
 //! expected coverage artifacts: catalog snapshot + ledger directory with
 //! the coverage tools injected into the agent's tool list.
 
-use rupu_agent::runner::{BypassDecider, CapturingMockProvider, ScriptedTurn};
+use rupu_agent::runner::{CapturingMockProvider, ScriptedTurn};
 use rupu_agent::{run_agent, AgentRunOpts};
 use rupu_coverage::{
     read_manifests, target_id, CatalogMode, ConcernsBlock, ConcernsEntry, CoveragePaths,
@@ -10,7 +10,6 @@ use rupu_coverage::{
 };
 use rupu_providers::types::StopReason;
 use rupu_tools::ToolContext;
-use std::sync::Arc;
 
 fn stride_block() -> ConcernsBlock {
     ConcernsBlock {
@@ -62,7 +61,7 @@ async fn agent_run_with_concerns_writes_catalog_snapshot() {
         workspace_path: workspace.clone(),
         transcript_path: workspace.join("run.jsonl"),
         max_turns: 5,
-        decider: Arc::new(BypassDecider),
+        permission: rupu_tools::PermissionPolicy::bypass(),
         tool_context: ToolContext {
             workspace_path: workspace.clone(),
             ..Default::default()
@@ -70,7 +69,6 @@ async fn agent_run_with_concerns_writes_catalog_snapshot() {
         user_message: "Check coverage.".into(),
         initial_messages: Vec::new(),
         turn_index_offset: 0,
-        mode_str: "bypass".into(),
         no_stream: true,
         suppress_stream_stdout: false,
         mcp_registry: None,
@@ -121,20 +119,20 @@ async fn agent_run_with_concerns_writes_catalog_snapshot() {
     assert_eq!(requests.len(), 1, "expected exactly one LLM request");
     let tool_names: Vec<&str> = requests[0].tools.iter().map(|t| t.name.as_str()).collect();
     assert!(
-        tool_names.contains(&"coverage_mark"),
-        "coverage_mark should be in tools: {tool_names:?}"
+        tool_names.contains(&"coverage.mark"),
+        "coverage.mark should be in tools: {tool_names:?}"
     );
     assert!(
-        tool_names.contains(&"coverage_status"),
-        "coverage_status should be in tools: {tool_names:?}"
+        tool_names.contains(&"coverage.status"),
+        "coverage.status should be in tools: {tool_names:?}"
     );
     assert!(
-        tool_names.contains(&"coverage_remaining"),
-        "coverage_remaining should be in tools: {tool_names:?}"
+        tool_names.contains(&"coverage.remaining"),
+        "coverage.remaining should be in tools: {tool_names:?}"
     );
     assert!(
-        tool_names.contains(&"report_finding"),
-        "report_finding should be in tools: {tool_names:?}"
+        tool_names.contains(&"findings.report"),
+        "findings.report should be in tools: {tool_names:?}"
     );
 
     // Verify the run manifest was captured.
@@ -178,7 +176,7 @@ async fn agent_run_without_concerns_does_not_inject_coverage_tools() {
         workspace_path: workspace.clone(),
         transcript_path: workspace.join("run.jsonl"),
         max_turns: 5,
-        decider: Arc::new(BypassDecider),
+        permission: rupu_tools::PermissionPolicy::bypass(),
         tool_context: ToolContext {
             workspace_path: workspace.clone(),
             ..Default::default()
@@ -186,7 +184,6 @@ async fn agent_run_without_concerns_does_not_inject_coverage_tools() {
         user_message: "Do nothing.".into(),
         initial_messages: Vec::new(),
         turn_index_offset: 0,
-        mode_str: "bypass".into(),
         no_stream: true,
         suppress_stream_stdout: false,
         mcp_registry: None,
@@ -220,7 +217,7 @@ async fn agent_run_without_concerns_does_not_inject_coverage_tools() {
     assert_eq!(requests.len(), 1);
     let tool_names: Vec<&str> = requests[0].tools.iter().map(|t| t.name.as_str()).collect();
     assert!(
-        !tool_names.contains(&"coverage_mark"),
+        !tool_names.contains(&"coverage.mark"),
         "coverage_mark should NOT be present when concerns is None: {tool_names:?}"
     );
 }
@@ -254,7 +251,7 @@ async fn agent_run_with_concerns_injects_catalog_into_system_prompt() {
         workspace_path: workspace.clone(),
         transcript_path: workspace.join("run.jsonl"),
         max_turns: 5,
-        decider: Arc::new(BypassDecider),
+        permission: rupu_tools::PermissionPolicy::bypass(),
         tool_context: ToolContext {
             workspace_path: workspace.clone(),
             ..Default::default()
@@ -262,7 +259,6 @@ async fn agent_run_with_concerns_injects_catalog_into_system_prompt() {
         user_message: "check prompt".into(),
         initial_messages: Vec::new(),
         turn_index_offset: 0,
-        mode_str: "bypass".into(),
         no_stream: true,
         suppress_stream_stdout: false,
         mcp_registry: None,
@@ -339,7 +335,7 @@ async fn surface_tag_override_is_respected() {
         workspace_path: workspace.clone(),
         transcript_path: workspace.join("run.jsonl"),
         max_turns: 5,
-        decider: Arc::new(BypassDecider),
+        permission: rupu_tools::PermissionPolicy::bypass(),
         tool_context: ToolContext {
             workspace_path: workspace.clone(),
             ..Default::default()
@@ -347,7 +343,6 @@ async fn surface_tag_override_is_respected() {
         user_message: "Check coverage.".into(),
         initial_messages: Vec::new(),
         turn_index_offset: 0,
-        mode_str: "bypass".into(),
         no_stream: true,
         suppress_stream_stdout: false,
         mcp_registry: None,
@@ -420,7 +415,7 @@ async fn agent_run_with_index_mode_concerns_injects_search_and_detail_tools() {
         workspace_path: workspace.clone(),
         transcript_path: workspace.join("run.jsonl"),
         max_turns: 5,
-        decider: Arc::new(BypassDecider),
+        permission: rupu_tools::PermissionPolicy::bypass(),
         tool_context: ToolContext {
             workspace_path: workspace.clone(),
             ..Default::default()
@@ -428,7 +423,6 @@ async fn agent_run_with_index_mode_concerns_injects_search_and_detail_tools() {
         user_message: "Check coverage in index mode.".into(),
         initial_messages: Vec::new(),
         turn_index_offset: 0,
-        mode_str: "bypass".into(),
         no_stream: true,
         suppress_stream_stdout: false,
         mcp_registry: None,
@@ -466,21 +460,21 @@ async fn agent_run_with_index_mode_concerns_injects_search_and_detail_tools() {
     assert_eq!(requests.len(), 1, "expected exactly one LLM request");
     let tool_names: Vec<&str> = requests[0].tools.iter().map(|t| t.name.as_str()).collect();
     assert!(
-        tool_names.contains(&"coverage_concerns_search"),
-        "coverage_concerns_search should be in tools: {tool_names:?}"
+        tool_names.contains(&"coverage.concerns.search"),
+        "coverage.concerns.search should be in tools: {tool_names:?}"
     );
     assert!(
-        tool_names.contains(&"coverage_concerns_detail"),
-        "coverage_concerns_detail should be in tools: {tool_names:?}"
+        tool_names.contains(&"coverage.concerns.detail"),
+        "coverage.concerns.detail should be in tools: {tool_names:?}"
     );
     // Existing 4 tools must still be present.
     assert!(
-        tool_names.contains(&"coverage_mark"),
-        "coverage_mark should be in tools: {tool_names:?}"
+        tool_names.contains(&"coverage.mark"),
+        "coverage.mark should be in tools: {tool_names:?}"
     );
     assert!(
-        tool_names.contains(&"report_finding"),
-        "report_finding should be in tools: {tool_names:?}"
+        tool_names.contains(&"findings.report"),
+        "findings.report should be in tools: {tool_names:?}"
     );
 
     // In index mode, the system prompt should contain the index header
