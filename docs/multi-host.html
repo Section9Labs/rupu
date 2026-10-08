@@ -189,7 +189,7 @@
     <h3>HTTP federation</h3>
     <p>
       Federation has two sides. On the <strong>remote machine</strong>, run the
-      control plane so it's reachable from the center and guarded by a bearer
+      control plane so it's reachable from the center and guarded by a
       token. Bind to an address other than loopback, and set
       <code class="inline">--token</code> so <code class="inline">/api/*</code>
       requires <code class="inline">Authorization: Bearer &lt;token&gt;</code>:
@@ -359,7 +359,9 @@ removed host_01J9Z4W7Q0X8Y6V5K3M2N1P0R8</pre>
     <p>
       The same registry is exposed in the browser — adding and removing hosts in
       the Control Plane writes the exact same TOML records and keychain entries,
-      so the CLI and the CP are always looking at one shared fleet.
+      so the CLI and the CP are always looking at one shared fleet. Removing a
+      tunnel host from the control plane also closes its live node connection at
+      once; the node's reconnect then fails enrollment.
     </p>
 
     <h2>In the Control Plane</h2>
@@ -427,8 +429,13 @@ removed host_01J9Z4W7Q0X8Y6V5K3M2N1P0R8</pre>
         run-list fan-out tolerates it per-host: that host shows an
         <em>offline</em> marker (or <em>unavailable</em> when it's reachable but
         runs a rupu too old to answer) and the rest of the page stays intact.
-        Launch or control against an offline host returns a clear error, and live
-        streams auto-reconnect.
+        Launch or control against an offline host returns a clear error (a
+        <code class="inline">502</code>; a run the host doesn't have is a
+        <code class="inline">404</code>, a transition it refuses a
+        <code class="inline">409</code>, and an operation its transport or rupu
+        version can't do a <code class="inline">501</code>). Live streams
+        auto-reconnect and pick up after the last event they saw, rather than
+        replaying the run (an HTTP host on an older rupu still replays).
       </li>
     </ul>
     <div class="callout">

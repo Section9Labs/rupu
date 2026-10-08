@@ -81,6 +81,10 @@
       <code class="inline">~/.rupu/workflows/&lt;name&gt;.yaml</code> (global) and
       <code class="inline">&lt;project&gt;/.rupu/workflows/&lt;name&gt;.yaml</code> (project-local), with
       project-local files shadowing global ones by <code class="inline">name:</code>.
+      A <code class="inline">.yml</code> extension works everywhere a workflow is looked up or listed
+      (<code class="inline">rupu workflow run</code> / <code class="inline">list</code>, autoflows, the control plane);
+      when one directory holds both <code class="inline">&lt;name&gt;.yaml</code> and
+      <code class="inline">&lt;name&gt;.yml</code>, the <code class="inline">.yaml</code> file wins.
     </p>
 
     <figure class="diagram">

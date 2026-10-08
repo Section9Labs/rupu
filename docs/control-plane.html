@@ -75,12 +75,63 @@ $ rupu cp <span class="k">serve</span></pre>
       By default it binds to <code class="inline">127.0.0.1:7878</code> and opens
       the URL in your browser when you run it interactively. Useful flags:
       <code class="inline">--bind &lt;addr&gt;</code> to choose a different
-      address or port, <code class="inline">--token &lt;token&gt;</code> to guard
-      the API with a bearer token, and <code class="inline">--no-open</code> to
-      print the URL without launching a browser.
+      address or port, <code class="inline">--token &lt;token&gt;</code> to require
+      a token on every <code class="inline">/api/*</code> route, and
+      <code class="inline">--no-open</code> to print the URL without launching a
+      browser.
     </p>
-    <pre class="code"><span class="c"># bind a custom port and require a bearer token on /api/*</span>
+    <pre class="code"><span class="c"># bind a custom port and require a token on /api/*</span>
 $ rupu cp <span class="k">serve</span> <span class="v">--bind</span> <span class="s">127.0.0.1:9000</span> <span class="v">--token</span> <span class="s">"$RUPU_CP_TOKEN"</span> <span class="v">--no-open</span></pre>
+    <h3 id="authentication">Authentication</h3>
+    <p>
+      Without <code class="inline">--token</code> the API is open to anything
+      that can reach the bind address. That is the intended posture on
+      <code class="inline">127.0.0.1</code>. <strong>Do not bind a non-loopback
+      address without a token.</strong> With <code class="inline">--token</code>,
+      every <code class="inline">/api/*</code> route needs the token, in one of
+      two forms:
+    </p>
+    <ul>
+      <li>
+        <strong>Scripts and peer control planes</strong> send
+        <code class="inline">Authorization: Bearer &lt;token&gt;</code>.
+      </li>
+      <li>
+        <strong>Browsers</strong> sign in once. The URL
+        <code class="inline">cp serve</code> prints (and opens) carries
+        <code class="inline">?token=&lt;token&gt;</code>. Opening it sets a
+        cookie and redirects to the same page without the parameter, so the token
+        leaves the address bar and the history at once. From then on the web UI's
+        requests, live streams included, carry the cookie. To sign another
+        browser in, open <code class="inline">http://&lt;host&gt;:&lt;port&gt;/?token=&lt;token&gt;</code>
+        there. A wrong token in that link is a 401 and sets nothing.
+      </li>
+    </ul>
+    <p>
+      The cookie is <code class="inline">HttpOnly</code>,
+      <code class="inline">SameSite=Strict</code>, lasts 30 days, and is named
+      <code class="inline">rupu_cp_token_&lt;port&gt;</code>, so control planes on
+      different ports never overwrite each other. Its value is derived from the
+      token, not the token itself, and it is refused as a bearer: browsers send
+      <code class="inline">localhost</code> cookies to every port, so another
+      local server could read it, but it never learns the token. A write made
+      with the cookie must also carry an <code class="inline">Origin</code>
+      naming this server, so a page served from another origin (another
+      <code class="inline">localhost</code> port included) can't drive runs with
+      it. Behind a reverse proxy, preserve the <code class="inline">Host</code>
+      header: the cookie name and the origin check both read it. Restarting with
+      a different token makes the old cookie a 401 until the browser opens the
+      new link.
+    </p>
+    <p>
+      <code class="inline">/healthz</code>, the node WebSocket and the static UI
+      shell stay open; they hold no data, since everything the UI shows comes
+      from <code class="inline">/api/*</code>. The server log prints the URL
+      without the token, and Settings only ever shows whether a token is set.
+      The folder picker browses only your home directory and registered
+      projects. See the <a class="link" href="/docs/api.html#authentication">HTTP API</a>
+      for the wire details.
+    </p>
     <div class="callout">
       <strong>Single binary, no setup.</strong> The web UI is compiled into the
       <code class="inline">rupu</code> binary — there's nothing to install or
@@ -177,9 +228,11 @@ $ rupu cp <span class="k">serve</span> <span class="v">--bind</span> <span class
         <a class="link" href="/docs/agentiflows.html">agentiflow</a> runs and a
         detail page with <em>Flow</em>, <em>Assets</em>, <em>Findings</em>,
         <em>Messages</em>, <em>Transcript</em> and <em>Events</em> tabs: the goals and
-        budget, the units the lead dispatched, the asset inventory the fleet built,
+        budget, the units the lead dispatched (a flow graph whose earlier rounds
+        collapse to one line each, and whose workflow units unfold into their own
+        steps), the asset inventory the fleet built,
         the run's findings across every sub-run, and the message board the agents
-        talk on. While the run is live, a steering box on the Messages tab sends
+        talk on. While the run's coordinator is alive, a steering box on the Messages tab sends
         the lead a message, the same channel as <code class="inline">rupu agentiflow send</code>.
         A <strong>Security &#8594; Assets</strong> page shows the asset inventory
         across every project.
@@ -194,7 +247,10 @@ $ rupu cp <span class="k">serve</span> <span class="v">--bind</span> <span class
       timeline and per-run streams for each run view. Runs the control plane
       started stream straight from the executor; runs started elsewhere (the CLI,
       a cron trigger, an autoflow) are tailed from their on-disk event log — so
-      the same live view works no matter what kicked the run off.
+      the same live view works no matter what kicked the run off. A run's
+      stream resumes where it left off after a dropped connection rather than
+      replaying the run, and closes once the run has settled; the run page keeps
+      checking every 15 s, so a retried run streams back in.
     </p>
 
     <h3>Transcripts</h3>
@@ -393,7 +449,7 @@ $ rupu cp <span class="k">serve</span> <span class="v">--bind</span> <span class
       <code class="inline">~/.rupu/config.toml</code>, and a <strong>Config</strong>
       tab on each Project detail view writes that project's
       <code class="inline">.rupu/config.toml</code>. Config is layered
-      <strong>global <strong>global &rarr; customer &rarr; project &rarr; env</strong>, and the control planerarr; customer <strong>global &rarr; customer &rarr; project &rarr; env</strong>, and the control planerarr; project</strong> (a locked key in a higher layer wins; see <a class="link" href="/docs/configuration.html">Configuration</a>), and the control plane
+      <strong>global &rarr; customer &rarr; project</strong> (a locked key in a higher layer wins; see <a class="link" href="/docs/configuration.html">Configuration</a>), and the control plane
       shows the <strong>effective</strong> value for every key together with its
       <strong>provenance</strong> — which layer won.
     </p>
@@ -403,7 +459,12 @@ $ rupu cp <span class="k">serve</span> <span class="v">--bind</span> <span class
       writing the same file. Alongside them sit a <strong>policy</strong> view
       (what's locked) and a <strong>runtime status</strong> view — the latter
       shows restart-required settings such as <code class="inline">bind</code> and
-      <code class="inline">token</code> read-only (the token masked).
+      <code class="inline">token</code> read-only (the token masked). Saving the
+      global config reports which of the start-time-only keys you changed
+      (the <code class="inline">[cp]</code> background-loop toggles and
+      intervals, <code class="inline">agentiflow.reaper_enabled</code>,
+      <code class="inline">netflow.asn_auto_refresh</code>): those apply after
+      <code class="inline">cp serve</code> restarts, everything else at once.
     </p>
     <p>
       <strong>Policy enforcement.</strong> An admin can <strong>lock</strong>
@@ -593,7 +654,7 @@ shell = <span class="s">"v2"</span></pre>
       <em>Raw</em> (the global <code class="inline">config.toml</code>, read-only until
       you click Edit), <em>Policy</em> (every key with a lock checkbox), and
       <em>Runtime status</em>. Each typed field shows its effective value, which layer
-      it came from, and a lock toggle. The control plane's own bearer token is never
+      it came from, and a lock toggle. The control plane's own token is never
       shown or editable, only whether one is set.
     </p>
 

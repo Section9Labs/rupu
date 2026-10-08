@@ -369,10 +369,10 @@ reaper_enabled = <span class="v">true</span>         <span class="c"># the reap 
     <table>
       <thead><tr><th>Tab</th><th>Shows</th></tr></thead>
       <tbody>
-        <tr><td><strong>Flow</strong></td><td>The run as a growing graph — the lead is the spine, round by round, and every unit it launched fans out as a branch and merges back into the next round — plus the fleet of units and their status.</td></tr>
+        <tr><td><strong>Flow</strong></td><td>The run as a growing graph — the lead is the spine, round by round, and every unit it launched fans out as a branch and merges back into the next round — plus the fleet of units and their status. Earlier rounds collapse to a one-line summary (goals, budget, spend, unit count) so a long engagement stays compact; the latest round stays open, and the chevron or unit count toggles any round. An agent unit links to its transcript. A <code>workflow</code> unit is a full workflow run: it links to its own run graph (<em>open flow →</em>), and its chevron unfolds the workflow's steps beneath it, each with its agent and status, loaded only when you open it. A running sub-workflow's steps are a snapshot taken when you expand it; collapse and reopen to refresh.</td></tr>
         <tr><td><strong>Assets</strong></td><td>Engagement assets (hosts, services, sites, routes, files) with their depth rung.</td></tr>
         <tr><td><strong>Findings</strong></td><td>Findings filed by the lead and its units.</td></tr>
-        <tr><td><strong>Messages</strong></td><td>The board — posts and the lead's directives — plus a <em>Steer the lead</em> box while the run is live, queued for the round boundary or sent mid-round.</td></tr>
+        <tr><td><strong>Messages</strong></td><td>The board — posts and the lead's directives — plus a <em>Steer the lead</em> box while the run is live, queued for the round boundary or sent mid-round. A message is accepted only while the run's coordinator process is alive (otherwise it would never be read): a run that died without finalizing still says <code>running</code> on disk until the orphan reaper closes it, and the page flags it.</td></tr>
         <tr><td><strong>Transcript</strong></td><td>The lead's transcript for the latest round, live while the run is going.</td></tr>
         <tr><td><strong>Events</strong></td><td>The raw event log, newest first.</td></tr>
       </tbody>

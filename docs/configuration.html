@@ -300,6 +300,7 @@ rupu config set <span class="v">update.channel</span> <span class="s">beta</span
 
     <h2 id="cp">Control plane — <code class="inline">[cp]</code></h2>
     <p>Background loops <code class="inline">rupu cp serve</code> runs in-process, so autoflows, triggers and gate timeouts work with no external cron.</p>
+    <p>The loop toggles and intervals below, like <code class="inline">agentiflow.reaper_enabled</code> and <code class="inline">netflow.asn_auto_refresh</code>, are read once when <code class="inline">cp serve</code> starts: change them and restart it. Saving the global config from the control plane lists the ones you changed as <code class="inline">restart_required</code>; every other key applies at once.</p>
     <table>
       <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Notes</th></tr></thead>
       <tbody>

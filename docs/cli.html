@@ -1354,7 +1354,7 @@
 <pre class="code">rupu cp serve [OPTIONS]</pre>
 <table><thead><tr><th>Option</th><th>Description</th></tr></thead><tbody>
 <tr><td><code>--bind &lt;BIND&gt;</code></td><td>Address to bind. Defaults to 127.0.0.1:7878 [default: 127.0.0.1:7878]</td></tr>
-<tr><td><code>--token &lt;TOKEN&gt;</code></td><td>Optional bearer token. If set, <code class="inline">/api/*</code> requires <code class="inline">Authorization: Bearer &lt;token&gt;</code> (the web UI and <code class="inline">/healthz</code> remain open on localhost)</td></tr>
+<tr><td><code>--token &lt;TOKEN&gt;</code></td><td>Optional access token. If set, every <code class="inline">/api/*</code> call needs it, as <code class="inline">Authorization: Bearer &lt;token&gt;</code> or the browser&#x27;s token cookie. The printed (and auto-opened) URL carries <code class="inline">?token=&lt;token&gt;</code>; opening it signs that browser in (cookie set, token dropped from the URL). <code class="inline">/healthz</code> and the page shell stay open; the UI shows no data until the browser is signed in</td></tr>
 <tr><td><code>--no-open</code></td><td>Do not open the served URL in a browser on startup. By default the URL is opened when running interactively (a terminal); the URL is always printed regardless</td></tr>
 </tbody></table>
 <h2 id="rupu-usage"><code class="inline">rupu usage</code></h2>
