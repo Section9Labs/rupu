@@ -15,7 +15,7 @@ For the architectural background, see
 
 ## Schema
 
-Add a top-level `trigger:` block to any `.rupu/workflows/<name>.yaml`:
+Add a top-level `trigger:` block to any `.rupu/workflows/<name>.yaml` (or `.yml`):
 
 ```yaml
 trigger:

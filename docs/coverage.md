@@ -466,6 +466,11 @@ its name, gives the platform). Any other host gets no link. List rows carry it a
   `report_summary`: `owner`, `product`, `cwe`, `root_cause`, `chain`,
   `completeness` (`filled`, `total`, `gaps`), `has_poc`, and
   `verification_status`.
+- Finding ids are unique within a workspace, not across workspaces. Every
+  by-id route below takes `?ws_id=` to say which workspace's finding is meant;
+  without it, an id that exists in several workspaces is a `409` whose message
+  names them (never the first match). The web passes the workspace on every
+  link and fetch.
 - `GET /api/findings/:id` returns the whole record with its `report` and an
   `evidence_status` per evidence claim (`current`, `changed`, `missing`,
   `unknown`). Claim files are hashed off the async runtime; a file over
@@ -479,7 +484,8 @@ its name, gives the platform). Any other host gets no link. List rows carry it a
   answers are under [Downloading artifacts](#downloading-artifacts).
 - `GET /api/findings/artifacts/:sha256` is the host-side half of that pull: it
   serves any blob in this control plane's own artifact store by hash. It sits
-  behind the CP's bearer token when one is configured, and is open to anyone
+  behind the CP's `--token` (bearer header or browser cookie) when one is
+  configured, and is open to anyone
   who can reach the CP otherwise. It is not finding-scoped, so that access
   control is its only boundary; browsers use the finding-scoped endpoint above.
 
@@ -639,6 +645,8 @@ findings** to add the `summary`-profile rows (off by default), and set the
 title. The download is named by the server.
 
 - `GET /api/findings/:id/export?format=md|html|pdf` returns one finding.
+  Add `&ws_id=` when the id exists in more than one project (otherwise `409`,
+  naming them).
 - `POST /api/findings/export` takes `{format, title?, ids?, ws_id?, run_id?,
   min_severity?, owner?, cwe?, include_summaries?, split?}`. Unknown fields are
   rejected with `422` (a misspelt filter must not widen the report), and the
@@ -1022,7 +1030,17 @@ JSON.
 { "finding_ids": ["fnd_01J…", "fnd_01K…"], "add": ["needs-poc"], "remove": [] }
 ```
 
-`finding_ids` is required; `add` and `remove` default to empty, and at least one
+Finding ids are unique within a workspace, not across workspaces, so a bare
+id in `finding_ids` is tagged in every workspace that holds it. To tag one
+finding only where it lives, name it with its workspace instead (this is what
+the web sends):
+
+```json
+{ "findings": [{ "ws_id": "ws1", "id": "fnd_01J…" }], "add": ["needs-poc"] }
+```
+
+Give exactly one of `finding_ids` or `findings`, at most 1000 entries. `add`
+and `remove` default to empty, and at least one
 must name a tag. Tags are normalized as under "Syntax". The ids are grouped by
 the workspace holding them and each workspace's batch is atomic, the request as
 a whole is not, exactly as for `rupu findings tag`. The `200` body reports per
@@ -1046,9 +1064,10 @@ equals its `after` changed nothing and wrote no event. Statuses:
 | Status | When |
 |---|---|
 | `200` | At least one workspace was reached (it may still carry errors and `unknown` ids). |
-| `400` | An invalid tag, no tag to add or remove, a tag both added and removed, no finding ids, or more than 1000 ids. The body is `{"error": "…"}`. |
-| `404` | None of the ids exists. |
-| `422` | The body doesn't deserialize: a field other than `finding_ids`, `add` and `remove`, or a missing `finding_ids`. |
+| `400` | An invalid tag, no tag to add or remove, a tag both added and removed, neither or both of `finding_ids` / `findings`, or more than 1000 findings. The body is `{"error": "…"}`. |
+| `404` | None of the findings exists. |
+| `422` | The body doesn't deserialize: a field other than `finding_ids`, `findings`, `add` and `remove` (or other than `ws_id` and `id` in a `findings` entry). |
+| `500` | Writing a tag log failed outright. |
 
 `GET /api/findings/tags` lists the tags in use, most used first, as `[{ "tag":
 "needs-poc", "count": 4 }]`. `?ws_id=` limits it to one workspace.
