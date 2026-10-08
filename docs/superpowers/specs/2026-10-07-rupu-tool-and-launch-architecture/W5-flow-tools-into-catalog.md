@@ -81,6 +81,10 @@ Because grants are now just names, an agent outside a flow can list `agents.list
 - **Units** (`rupu run --fleet-run-dir --fleet-participant`): W3 already moved `fleet_attachment` into `rupu-agentiflow` as `FlowUnitServices::for_participant`. It now returns `extra_services` (a Bus) + `collectors` instead of tools.
 - **Workflow units under a flow** (`workflow.rs:449`, `fleet_participant: _`): **unchanged in W5**. Giving workflow steps a bus is F1's job, which covers all run kinds.
 
+### 3.6 Bash reserved names
+
+Once the flow tools live in `rupu-tools`, replace W1's static `RESERVED_NATIVE_TOOLS` list in `bash.rs` with `ToolCatalog::non_shell_names()`, derived from the descriptors (every non-core canonical name plus its aliases), and delete W1's lockstep tests. If W7's `dispatch`/`join` are not in the catalog yet, keep their names in a small static remainder until W7.
+
 ## 4. Files
 
 | File | Change |
