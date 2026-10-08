@@ -8,12 +8,10 @@
 //! terminal flip, and the record must still say `Cancelled` afterwards.
 
 use async_trait::async_trait;
-use rupu_agent::LegacyRunOpts;
 use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts, RunWorkflowError, StepFactory};
 use rupu_orchestrator::{RunStatus, RunStore, Workflow};
 use rupu_providers::types::{ContentBlock, LlmRequest, LlmResponse, Stop, StopReason, Usage};
 use rupu_providers::{LlmProvider, ProviderError, StreamEvent};
-use rupu_tools::ToolContext;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -86,23 +84,14 @@ struct Factory {
 
 #[async_trait]
 impl StepFactory for Factory {
-    async fn build_opts_for_step(
+    async fn launch_for_step(
         &self,
-        step_id: &str,
-        agent_name: &str,
-        rendered_prompt: String,
-        run_id: String,
-        workspace_id: String,
-        workspace_path: std::path::PathBuf,
-        transcript_path: std::path::PathBuf,
-        on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> LegacyRunOpts {
-        LegacyRunOpts {
-            seed_source: None,
-            collectors: Vec::new(),
-            extra_tools: Vec::new(),
+        request: rupu_orchestrator::StepRequest,
+    ) -> Result<rupu_orchestrator::StepLaunch, rupu_runtime::assembly::AssembleError> {
+        let agent_name = request.agent_name.clone();
+        let agent_name = agent_name.as_str();
+        rupu_orchestrator::testing::MockRun {
             step_actions: Vec::new(),
-            alias_scope: Default::default(),
             agent_name: format!("ag-{agent_name}"),
             agent_system_prompt: "echo".into(),
             agent_tools: None,
@@ -111,42 +100,15 @@ impl StepFactory for Factory {
             }),
             provider_name: "mock".into(),
             model: "mock-1".into(),
-            run_id,
-            workspace_id,
-            workspace_path,
-            transcript_path,
             max_turns: 5,
-            permission: rupu_tools::PermissionPolicy::bypass(),
-            tool_context: ToolContext::default(),
-            user_message: rendered_prompt,
-            initial_messages: Vec::new(),
-            turn_index_offset: 0,
             no_stream: false,
             suppress_stream_stdout: true,
-            mcp_registry: None,
-            effort: None,
-            thinking_display: None,
-            context_window: None,
-            output_format: None,
-            output_schema: None,
-            anthropic_task_budget: None,
-            anthropic_context_management: None,
-            anthropic_speed: None,
-            parent_run_id: None,
-            depth: 0,
             dispatchable_agents: None,
-            step_id: step_id.to_string(),
-            on_tool_call,
-            on_stream_event: None,
-            on_usage: None,
             concerns: None,
             limits: rupu_providers::model_limits::ModelLimits::unknown(),
-            scope_name: None,
-            surface_tag: None,
-            pause: None,
-            codename: None,
-            recovery: Default::default(),
+            ..Default::default()
         }
+        .launch(request)
     }
 }
 

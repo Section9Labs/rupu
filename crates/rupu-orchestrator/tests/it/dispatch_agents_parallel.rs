@@ -22,11 +22,10 @@
 
 use async_trait::async_trait;
 use rupu_agent::runner::{MockProvider, ScriptedTurn};
-use rupu_agent::LegacyRunOpts;
 use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts, StepFactory};
 use rupu_orchestrator::Workflow;
 use rupu_providers::types::StopReason;
-use rupu_tools::{AgentDispatcher, DispatchError, DispatchOutcome, ToolContext};
+use rupu_tools::{AgentDispatcher, DispatchError, DispatchOutcome};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -144,17 +143,10 @@ struct ParallelFactory {
 
 #[async_trait]
 impl StepFactory for ParallelFactory {
-    async fn build_opts_for_step(
+    async fn launch_for_step(
         &self,
-        _step_id: &str,
-        _agent_name: &str,
-        rendered_prompt: String,
-        run_id: String,
-        workspace_id: String,
-        workspace_path: std::path::PathBuf,
-        transcript_path: std::path::PathBuf,
-        _on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> LegacyRunOpts {
+        request: rupu_orchestrator::StepRequest,
+    ) -> Result<rupu_orchestrator::StepLaunch, rupu_runtime::assembly::AssembleError> {
         let provider = MockProvider::new(vec![
             ScriptedTurn::AssistantToolUse {
                 text: None,
@@ -170,68 +162,24 @@ impl StepFactory for ParallelFactory {
                 output_tokens: 5,
             },
         ]);
-        LegacyRunOpts {
-            seed_source: None,
-            collectors: Vec::new(),
-            extra_tools: Vec::new(),
+        rupu_orchestrator::testing::MockRun {
             step_actions: Vec::new(),
-            alias_scope: Default::default(),
             agent_name: "writer".into(),
             agent_system_prompt: "you are the writer".into(),
             agent_tools: Some(vec!["dispatch_agents_parallel".into()]),
             provider: Box::new(provider),
             provider_name: "mock".into(),
             model: "mock-1".into(),
-            run_id,
-            workspace_id,
-            workspace_path: workspace_path.clone(),
-            transcript_path,
             max_turns: 5,
-            permission: rupu_tools::PermissionPolicy::bypass(),
-            tool_context: ToolContext {
-                workspace: rupu_tools::WorkspaceScope {
-                    path: workspace_path,
-                    bash: rupu_tools::BashConfig {
-                        env_allowlist: Vec::new(),
-                        timeout_secs: 120,
-                    },
-                    ..Default::default()
-                },
-                services: rupu_tools::ToolServices {
-                    dispatcher: Some(self.dispatcher.clone()),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-            user_message: rendered_prompt,
-            initial_messages: Vec::new(),
-            turn_index_offset: 0,
             no_stream: false,
             suppress_stream_stdout: false,
-            mcp_registry: None,
-            effort: None,
-            thinking_display: None,
-            context_window: None,
-            output_format: None,
-            output_schema: None,
-            anthropic_task_budget: None,
-            anthropic_context_management: None,
-            anthropic_speed: None,
-            parent_run_id: None,
-            depth: 0,
             dispatchable_agents: Some(vec!["security-reviewer".into(), "perf-reviewer".into()]),
-            step_id: String::new(),
-            on_tool_call: None,
-            on_stream_event: None,
-            on_usage: None,
+            dispatcher: Some(self.dispatcher.clone()),
             concerns: None,
             limits: rupu_providers::model_limits::ModelLimits::unknown(),
-            scope_name: None,
-            surface_tag: None,
-            pause: None,
-            codename: None,
-            recovery: Default::default(),
+            ..Default::default()
         }
+        .launch(request)
     }
 }
 

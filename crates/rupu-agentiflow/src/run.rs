@@ -75,6 +75,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use rupu_config::PricingConfig;
 use rupu_coverage::{target_id, ActiveSet, CoveragePaths};
 use rupu_providers::model_limits::ModelLimits;
+use rupu_runtime::assembly::RunAssembler;
 use rupu_runtime::RunTriggerSource;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -86,7 +87,7 @@ use crate::envelope::{
     Envelope, EnvelopeConfig, EnvelopeOutcome, LeadDriver, RoundContext, RoundOutcome, StopReason,
 };
 use crate::error::AgentiflowError;
-use crate::lead::{LeadConfig, ProviderFactory, RunAgentLeadDriver};
+use crate::lead::{LeadConfig, RunAgentLeadDriver};
 use crate::operator::OperatorQueue;
 use crate::roster::{roster_collector, roster_tools, RosterCtx};
 use crate::status_tools::{status_tools, BudgetProbe};
@@ -215,20 +216,19 @@ pub fn new_run_id() -> String {
     format!("af_{}", ulid::Ulid::new())
 }
 
-/// The caller-resolved lead: which agent, with which prompt / provider /
-/// model / tools. (`rupu agentiflow run` resolves it from the lead's agent file
-/// and the layered config -- Plan 4-1; tests hand in a mock.)
+/// The caller-resolved lead: its agent file, and where its rounds' provider
+/// comes from. (`rupu agentiflow run` loads the lead's agent file -- Plan
+/// 4-1; tests hand in a mock provider.)
 pub struct LeadInputs {
-    pub agent_name: String,
-    pub system_prompt: String,
-    pub provider_name: String,
-    pub model: String,
-    /// The lead's `tools:` grant (the runner offers exactly what it names);
-    /// empty grants no builtins/MCP tools. The engagement's ambient grant adds
-    /// `findings.report` / `assets.mark` and the board/mailbox tools are
-    /// always-on `extra_tools`, so an empty list does not mean the lead is
-    /// toolless.
-    pub agent_tools: Vec<String>,
+    /// The lead's agent. Its `tools:` is the lead's grant exactly (the runner
+    /// offers what it names): the launch site passes what the file declares,
+    /// absent = `Some(vec![])`, which grants no builtins/MCP tools. The
+    /// engagement's ambient grant adds `findings.report` / `assets.mark` and
+    /// the board/mailbox tools are always-on `extra_tools`, so an empty list
+    /// does not mean the lead is toolless.
+    pub agent: rupu_agent::AgentSpec,
+    /// [`LeadProvider::Assembled`] in production.
+    pub provider: crate::lead::LeadProvider,
 }
 
 /// Everything [`run_agentiflow`] needs.
@@ -244,7 +244,13 @@ pub struct RunAgentiflowOpts {
     pub started: DateTime<Utc>,
     /// The injected clock.
     pub now: Box<dyn Fn() -> DateTime<Utc> + Send + Sync>,
-    pub make_provider: ProviderFactory,
+    /// What the lead's rounds are assembled with: the layered config, SCM
+    /// registry, `[findings]` base, capture backend and the run's customer
+    /// (which every round's transcript records). The run adds its
+    /// engagement to the findings base.
+    pub assembler: RunAssembler,
+    /// The workspace's record id (`rupu_workspace::upsert`).
+    pub workspace_id: String,
     pub lead: LeadInputs,
     /// This run's id (see [`new_run_id`]). Must be a safe path component.
     pub run_id: String,
@@ -261,11 +267,6 @@ pub struct RunAgentiflowOpts {
     /// the CLI passes `None` when the generating provider has no credential or
     /// cannot be built synchronously (Anthropic OAuth).
     pub generation: Option<crate::lead::GenerationCapability>,
-    /// The customer this run belongs to (`rupu customer`), resolved by the
-    /// launch site from the workspace's assignment
-    /// (`rupu_workspace::config_paths(..).customer_slug`) -- never inferred
-    /// here. The lead's transcripts record it. `None` ⇒ no customer.
-    pub customer: Option<String>,
     /// The layered `[pricing]` config (with its `provider_kinds` attached): what
     /// prices the ledgers' tokens for `budget.usd`. A model with no price here
     /// (or in the built-in table) counts as `$0`; when the LEAD's own model is
@@ -592,12 +593,12 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
         active,
         started,
         now,
-        make_provider,
+        assembler,
+        workspace_id,
         lead,
         run_id: id,
         unit_launcher,
         generation,
-        customer,
         pricing,
     } = opts;
 
@@ -637,7 +638,15 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
             // `budget.usd` can only be enforced against spend that can be priced.
             // The lead's own model is what is known at launch (the units' models
             // are chosen by their agent files, in subprocesses).
-            let usd_priceable = usd_is_priceable(&pricing, &lead.provider_name, &lead.model);
+            let (lead_provider, lead_model) = match &lead.provider {
+                crate::lead::LeadProvider::Injected {
+                    provider, model, ..
+                } => (provider.clone(), model.clone()),
+                crate::lead::LeadProvider::Assembled => {
+                    assembler.resolve_provider_model(&lead.agent, &Default::default())
+                }
+            };
+            let usd_priceable = usd_is_priceable(&pricing, &lead_provider, &lead_model);
             if !has_automatic_terminator(&def, usd_priceable) {
                 tracing::warn!(
                     name = %def.name,
@@ -649,13 +658,18 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 tracing::warn!(
                     name = %def.name,
                     run_id = %id,
-                    provider = %lead.provider_name,
-                    model = %lead.model,
+                    provider = %lead_provider,
+                    model = %lead_model,
                     "budget.usd cannot be enforced: there is no price for the lead's model, so \
                      its spend would read $0; add a [pricing.<provider>.\"<model>\"] entry. \
                      budget.tokens / budget.wall_clock / budget.rounds still apply"
                 );
             }
+
+            let crew = rupu_codename::crew_for(&id);
+            let lead_codename = rupu_codename::Codename::crew_only(crew.clone())
+                .child(rupu_codename::role_word(&lead.agent.name), None)
+                .to_string();
 
             // ---- run directory ------------------------------------------------------
             let run_dir = agentiflow_dir(&global).join(&id);
@@ -684,7 +698,8 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 goals: Vec::new(),
                 started_at: started,
                 ended_at: None,
-                codename: None,
+                // The run's crew; the lead is its `<crew>/<role>`.
+                codename: Some(crew.clone()),
                 spent_usd: None,
                 spent_tokens: 0,
                 // This runs in the process that executes the run: under
@@ -731,10 +746,15 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
             );
 
             // The lead records findings through `findings.report` and assets
-            // through `assets.mark`: its run always carries the engagement
-            // (`findings_engagement` below), whose ambient grant offers both,
-            // recorded as `ambient:engagement` in the lead's `tool_grant`.
-            let agent_tools = lead.agent_tools;
+            // through `assets.mark`: its rounds are assembled over the
+            // engagement (`findings_engagement`, on top of the `[findings]`
+            // base), whose ambient grant offers both, recorded as
+            // `ambient:engagement` in the lead's `tool_grant`.
+            let findings = rupu_coverage::FindingWriteOptions {
+                engagement: Some(findings_engagement.clone()),
+                ..assembler.context().findings.clone()
+            };
+            let assembler = Arc::new(assembler.with_findings(findings));
             // The lead's coordination substrate: a file-backed board and mailboxes
             // under the run dir, the tools that act on them, and the collectors that
             // fold its inbox and standing directives into each turn. "lead" is the
@@ -833,36 +853,29 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 roster_ctx,
             ));
             let lead_cfg = LeadConfig {
-                agent_name: lead.agent_name,
-                system_prompt: lead.system_prompt,
-                provider_name: lead.provider_name,
-                model: lead.model,
+                assembler,
+                agent: lead.agent,
                 per_round_max_turns,
                 run_id: id.clone(),
+                flow_dir: run_dir.clone(),
+                codename: Some(lead_codename),
                 transcript_path: run_dir.join("lead").join("transcript.jsonl"),
                 objective: mission_objective(&def),
                 scope: def.scope.clone(),
                 goals: def.goals.clone(),
-                workspace_id: format!("ws_{}", target_id(&workspace, "workspace")),
-                workspace_path: workspace.clone(),
-                agent_tools,
-                // Real limit resolution is Plan 4's; unknown limits are the safe start.
+                workspace: rupu_runtime::assembly::WorkspaceBinding {
+                    id: workspace_id,
+                    path: workspace.clone(),
+                },
+                // Resolved by the first round, then carried round to round.
                 limits: ModelLimits::unknown(),
-                // Pool the lead's findings and assets under the run id: the same
-                // `target_id(workspace, id)` the envelope's goal evaluator reads.
-                scope_name: Some(id.clone()),
-                findings_engagement: Some(findings_engagement),
                 extra_tools,
                 collectors,
-                customer,
-                usage_ledger: Some(rupu_orchestrator::usage_ledger::UsageLedger::open(
-                    lead_usage,
-                )),
                 // `rupu agentiflow send --now` interrupts through the same
                 // queue the envelope drains at each round boundary.
                 steering_queue: Some(OperatorQueue::new(&run_dir)),
             };
-            let driver = match RunAgentLeadDriver::new(lead_cfg, make_provider) {
+            let driver = match RunAgentLeadDriver::new(lead_cfg, lead.provider) {
                 Ok(d) => d,
                 Err(e) => return Err(fail(&mut record, e)),
             };
@@ -944,6 +957,7 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lead::ProviderFactory;
     use crate::operator::OperatorMessage;
     use crate::verify_fixtures::full_finding;
     use rupu_agent::runner::CapturingMockProvider;
@@ -982,6 +996,15 @@ mod tests {
             .unwrap()
             .active_set(&["network".to_string()])
             .unwrap()
+    }
+
+    /// The lead's rounds on `make`'s providers, as `mock` / `mock-1`.
+    fn injected(make: ProviderFactory) -> crate::lead::LeadProvider {
+        crate::lead::LeadProvider::Injected {
+            provider: "mock".into(),
+            model: "mock-1".into(),
+            make,
+        }
     }
 
     /// A factory handing out a fresh one-turn `MockProvider` per round.
@@ -1024,18 +1047,20 @@ mod tests {
             started: started(),
             // A frozen clock: wall-clock caps never trip in these tests.
             now: Box::new(started),
-            make_provider: one_turn_factory(),
+            assembler: RunAssembler::new(rupu_runtime::assembly::AssemblyContext::minimal(
+                fx.global.clone(),
+            )),
+            workspace_id: "ws_test".into(),
             lead: LeadInputs {
-                agent_name: "lead".into(),
-                system_prompt: "You are the lead.".into(),
-                provider_name: "mock".into(),
-                model: "mock-1".into(),
-                agent_tools: vec![],
+                agent: rupu_agent::AgentSpec::parse(
+                    "---\nname: lead\ntools: []\n---\nYou are the lead.\n",
+                )
+                .unwrap(),
+                provider: injected(one_turn_factory()),
             },
             run_id: id.into(),
             unit_launcher: None,
             generation: None,
-            customer: None,
             pricing: PricingConfig::default(),
         }
     }
@@ -1652,7 +1677,7 @@ mod tests {
         let def = operator_only("round: { ceiling: { rounds: 3 } }");
         let mut o = opts(&fx, def, id);
         o.pricing = mock_pricing();
-        o.make_provider = spend_watching_factory(run_dir(&fx, id), seen.clone());
+        o.lead.provider = injected(spend_watching_factory(run_dir(&fx, id), seen.clone()));
         let out = run_agentiflow(o).unwrap();
         assert_eq!(out.rounds, 3);
 
@@ -1702,7 +1727,7 @@ mod tests {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let def = operator_only("round: { ceiling: { rounds: 2 } }");
         let mut o = opts(&fx, def, id);
-        o.make_provider = spend_watching_factory(run_dir(&fx, id), seen.clone());
+        o.lead.provider = injected(spend_watching_factory(run_dir(&fx, id), seen.clone()));
         run_agentiflow(o).unwrap();
 
         // Every in-flight read (each round, after the per-round rewrite too)
@@ -1773,6 +1798,35 @@ mod tests {
             .expect("a budget.status result reached the lead")
     }
 
+    /// R6: a flow is named at its start — the record carries its crew and
+    /// the lead runs as `<crew>/<role>` — and the lead's rounds record the
+    /// workspace's real id (the launch site's `WorkspaceStore::upsert`), not
+    /// a synthetic one.
+    #[test]
+    fn the_flow_and_its_lead_are_named_and_the_lead_runs_in_the_real_workspace() {
+        let fx = fixture();
+        let id = "af_named";
+        let o = opts(&fx, operator_only("round: { ceiling: { rounds: 1 } }"), id);
+        run_agentiflow(o).unwrap();
+
+        let crew = rupu_codename::crew_for(id);
+        let record = AgentiflowRecord::read(&run_dir(&fx, id)).unwrap();
+        assert_eq!(record.codename.as_deref(), Some(crew.as_str()));
+
+        let start: Value =
+            std::fs::read_to_string(run_dir(&fx, id).join("lead").join("transcript.r0.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str::<Value>(l).unwrap())
+                .find(|v| v["type"] == "run_start")
+                .expect("the round's run_start");
+        assert_eq!(
+            start["data"]["codename"],
+            format!("{crew}/{}", rupu_codename::role_word("lead"))
+        );
+        assert_eq!(start["data"]["workspace_id"], "ws_test");
+    }
+
     #[test]
     fn the_lead_reads_its_budget_through_budget_status_round_by_round() {
         let fx = fixture();
@@ -1788,7 +1842,7 @@ mod tests {
             operator_only("budget: { tokens: 1000, rounds: 5 }\nround: { ceiling: { rounds: 2 } }"),
             id,
         );
-        o.make_provider = factory;
+        o.lead.provider = injected(factory);
         let out = run_agentiflow(o).unwrap();
         assert_eq!(out.stop, StopReason::Ceiling, "{:?}", out.stop);
         assert_eq!(out.rounds, 2);
@@ -1834,7 +1888,7 @@ mod tests {
             operator_only("budget: { usd: 5.0, tokens: 1000 }\nround: { ceiling: { rounds: 1 } }"),
             id,
         );
-        o.make_provider = factory;
+        o.lead.provider = injected(factory);
         run_agentiflow(o).unwrap();
         let reqs = captured.lock().unwrap().clone();
         let r = latest_budget_report(&reqs[1]);
@@ -1852,7 +1906,7 @@ mod tests {
             done_turn(),
         ]]);
         let mut o = opts(&fx, operator_only("round: { ceiling: { rounds: 1 } }"), id);
-        o.make_provider = factory;
+        o.lead.provider = injected(factory);
         run_agentiflow(o).unwrap();
         let reqs = captured.lock().unwrap().clone();
         let r = latest_budget_report(&reqs[1]);
@@ -1925,7 +1979,7 @@ mod tests {
         let fx = fixture();
         let id = "af_finding";
         let mut o = opts(&fx, def_with("round: { ceiling: { rounds: 1 } }"), id);
-        o.make_provider = report_finding_factory();
+        o.lead.provider = injected(report_finding_factory());
         let out = run_agentiflow(o).unwrap();
 
         let findings = std::fs::read_to_string(&pooled_paths(&fx, id).findings).unwrap_or_default();
@@ -2032,7 +2086,7 @@ mod tests {
             done_turn(),
         ]]);
         let mut o = opts(&fx, def_with("round: { ceiling: { rounds: 1 } }"), id);
-        o.make_provider = factory;
+        o.lead.provider = injected(factory);
         let out = run_agentiflow(o).unwrap();
         assert_eq!(out.stop, StopReason::Ceiling, "{:?}", out.stop);
 
@@ -2101,7 +2155,7 @@ mod tests {
             done_turn(),
         ]]);
         let mut o = opts(&fx, def_with("round: { ceiling: { rounds: 1 } }"), id);
-        o.make_provider = factory;
+        o.lead.provider = injected(factory);
         let out = run_agentiflow(o).unwrap();
         assert_eq!(out.stop, StopReason::Ceiling, "{:?}", out.stop);
 
@@ -2310,9 +2364,9 @@ mod tests {
             def_with_recon_pool("round: { ceiling: { rounds: 1 } }"),
             id,
         );
-        o.make_provider = Box::new(move || -> Box<dyn rupu_providers::LlmProvider> {
+        o.lead.provider = injected(Box::new(move || -> Box<dyn rupu_providers::LlmProvider> {
             Box::new(DispatchingLead::new(shared.clone()))
-        });
+        }));
         o.unit_launcher = Some(launcher.clone());
         let out = run_agentiflow(o).unwrap();
 
@@ -2504,7 +2558,7 @@ mod tests {
 
         let captured: Captured = Arc::default();
         let mut o = opts(&fx, def_with_workflow_pool(&["sweep"]), id);
-        o.make_provider = PickingLead::factory(captured.clone(), |i, req| match i {
+        o.lead.provider = injected(PickingLead::factory(captured.clone(), |i, req| match i {
             0 => tool_turn(
                 "t0",
                 "run_workflow",
@@ -2516,7 +2570,7 @@ mod tests {
                 json!({ "handle": DispatchingLead::handle_in(req), "timeout_secs": 30 }),
             ),
             _ => done_turn(),
-        });
+        }));
         o.unit_launcher = Some(launcher.clone());
         let out = run_agentiflow(o).unwrap();
 
@@ -2606,13 +2660,13 @@ mod tests {
             def_with_workflow_pool(&["wide", "gated", "needs-input"]),
             id,
         );
-        o.make_provider = PickingLead::factory(captured.clone(), |i, _| match i {
+        o.lead.provider = injected(PickingLead::factory(captured.clone(), |i, _| match i {
             0 => tool_turn("t0", "run_workflow", json!({ "workflow": "unlisted" })),
             1 => tool_turn("t1", "run_workflow", json!({ "workflow": "wide" })),
             2 => tool_turn("t2", "run_workflow", json!({ "workflow": "gated" })),
             3 => tool_turn("t3", "run_workflow", json!({ "workflow": "needs-input" })),
             _ => done_turn(),
-        });
+        }));
         o.unit_launcher = Some(launcher.clone());
         let out = run_agentiflow(o).unwrap();
 
@@ -2693,7 +2747,7 @@ mod tests {
             def_with_recon_pool("round: { ceiling: { rounds: 1 } }"),
             id,
         );
-        o.make_provider = PickingLead::factory(captured.clone(), |i, req| match i {
+        o.lead.provider = injected(PickingLead::factory(captured.clone(), |i, req| match i {
             0 => tool_turn(
                 "t0",
                 "generate_workflow",
@@ -2705,7 +2759,7 @@ mod tests {
                 json!({ "handle": DispatchingLead::handle_in(req), "timeout_secs": 30 }),
             ),
             _ => done_turn(),
-        });
+        }));
         o.unit_launcher = Some(launcher.clone());
         o.generation = Some(GenerationCapability {
             provider: "mock".into(),
@@ -2800,14 +2854,14 @@ mod tests {
         );
         // The lead calls the tool anyway (a model can name a tool it was never
         // offered): it must come back as an unknown-tool error, spawning nothing.
-        o.make_provider = PickingLead::factory(captured.clone(), |i, _| match i {
+        o.lead.provider = injected(PickingLead::factory(captured.clone(), |i, _| match i {
             0 => tool_turn(
                 "t0",
                 "generate_workflow",
                 json!({ "description": "sweep the exposed gateway" }),
             ),
             _ => done_turn(),
-        });
+        }));
         o.unit_launcher = Some(launcher.clone());
         assert!(o.generation.is_none());
         let out = run_agentiflow(o).unwrap();
@@ -2891,7 +2945,7 @@ mod tests {
             def_with_recon_pool("round: { ceiling: { rounds: 1 } }"),
             id,
         );
-        o.make_provider = factory;
+        o.lead.provider = injected(factory);
         o.unit_launcher = Some(launcher.clone());
         let out = run_agentiflow(o).unwrap();
         assert_eq!(out.stop, StopReason::GoalsMet, "{:?}", out.stop);
@@ -3045,7 +3099,7 @@ mod tests {
             def_with_verified_goal("round: { ceiling: { rounds: 1 } }"),
             id,
         );
-        o.make_provider = factory;
+        o.lead.provider = injected(factory);
         o.unit_launcher = Some(launcher.clone());
         let out = run_agentiflow(o).unwrap();
         assert_eq!(out.stop, StopReason::GoalsMet, "{:?}", out.stop);
@@ -3174,7 +3228,7 @@ mod tests {
             def_with_verified_goal("round: { ceiling: { rounds: 1 } }"),
             id,
         );
-        o.make_provider = factory;
+        o.lead.provider = injected(factory);
         o.unit_launcher = Some(launcher.clone());
         let out = run_agentiflow(o).unwrap();
 
@@ -3254,7 +3308,7 @@ mod tests {
             def_with_recon_pool("round: { ceiling: { rounds: 1 } }"),
             id,
         );
-        o.make_provider = factory;
+        o.lead.provider = injected(factory);
         o.unit_launcher = Some(launcher.clone());
         let out = run_agentiflow(o).unwrap();
         assert_eq!(out.stop, StopReason::Ceiling, "{:?}", out.stop);

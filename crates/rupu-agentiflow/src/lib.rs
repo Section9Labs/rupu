@@ -9,8 +9,8 @@ mod coverage;
 mod def;
 mod dispatch_tools;
 mod envelope;
-mod flow_unit;
 mod error;
+mod flow_unit;
 mod goal;
 mod lead;
 mod operator;
@@ -46,7 +46,7 @@ pub use error::AgentiflowError;
 pub use flow_unit::FlowUnitServices;
 pub use goal::{GoalEvalError, GoalEvaluator, GoalOutcome};
 pub use lead::{
-    render_round_prompt, GenerationCapability, GenerationProviderFactory, LeadConfig,
+    render_round_prompt, GenerationCapability, GenerationProviderFactory, LeadConfig, LeadProvider,
     ProviderFactory, RunAgentLeadDriver,
 };
 pub use operator::{OperatorMessage, OperatorQueue};

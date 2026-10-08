@@ -6,7 +6,7 @@
 //! through `run_workflow` and assert what each dispatched unit carried.
 
 use async_trait::async_trait;
-use rupu_agent::{LegacyRunOpts, RunError};
+use rupu_agent::RunError;
 use rupu_orchestrator::runner::{
     run_workflow, OrchestratorRunOpts, StepFactory, UnitCoverage, UnitDispatch, UnitDispatcher,
     UnitFailure, UnitOutcome,
@@ -23,17 +23,10 @@ struct ModeFactory(Option<&'static str>);
 
 #[async_trait]
 impl StepFactory for ModeFactory {
-    async fn build_opts_for_step(
+    async fn launch_for_step(
         &self,
-        _step_id: &str,
-        _agent_name: &str,
-        _rendered_prompt: String,
-        _run_id: String,
-        _workspace_id: String,
-        _workspace_path: std::path::PathBuf,
-        _transcript_path: std::path::PathBuf,
-        _on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> LegacyRunOpts {
+        _request: rupu_orchestrator::StepRequest,
+    ) -> Result<rupu_orchestrator::StepLaunch, rupu_runtime::assembly::AssembleError> {
         panic!("remote units must not be built by the local step factory");
     }
 

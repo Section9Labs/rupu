@@ -1,8 +1,8 @@
 //! The shared per-run netflow sink builder.
 //!
 //! Every agent-driven entry point in this crate (`rupu run`, `rupu
-//! session`'s per-turn worker, `rupu workflow run`/`resume`, autoflow via
-//! `DefaultStepFactory`, sub-agent dispatch) needs to hand its provider —
+//! session`'s per-turn worker, `rupu workflow run`/`resume`, autoflow, the
+//! agentiflow lead, sub-agent dispatch) needs to hand its provider —
 //! and its SCM registry — an `Arc<dyn rupu_netflow::FlowSink>` scoped to
 //! exactly the run doing the calling.
 //!
@@ -47,8 +47,8 @@ pub fn for_run(
 /// socket open), so it must never run inline on an async worker. This
 /// wrapper runs it on the blocking pool; later calls are cheap `OnceLock`
 /// reads (still routed through `spawn_blocking` for uniformity). Every
-/// run's `ToolContext.net_capture` comes from here (or from a
-/// `DefaultStepFactory` / dispatcher that was handed this value).
+/// run's `ToolContext.net_capture` comes from here, through the run
+/// assembler's `AssemblyContext` that was handed this value.
 /// A panicked blocking task degrades to [`rupu_netflow::NoopCapture`] —
 /// capture must never break a run.
 pub async fn net_capture(

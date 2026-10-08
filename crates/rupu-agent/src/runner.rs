@@ -741,6 +741,142 @@ impl RunError {
     }
 }
 
+/// A run that could not start (W3 §3.6): its agent file did not load, its
+/// provider is not declared, or its provider did not build. Who it would
+/// have been and what it was asked — everything [`record_unstarted_run`]
+/// writes.
+pub struct UnstartedRun<'a> {
+    pub transcript_path: &'a std::path::Path,
+    pub run_id: &'a str,
+    pub workspace_id: &'a str,
+    pub agent: &'a str,
+    /// The provider and model it resolved to (`unresolved` / `-` when its
+    /// agent did not load).
+    pub provider: &'a str,
+    pub model: &'a str,
+    pub mode: PermissionMode,
+    pub codename: Option<&'a str>,
+    pub customer: Option<&'a str>,
+    /// The agent's system prompt; `None` when the agent did not load.
+    pub system_prompt: Option<&'a str>,
+    pub prompt: &'a UserTurn,
+}
+
+/// Record a run that never started — no provider was built, so nothing was
+/// asked of one — as the run that failed on its first call, and return its
+/// error. The transcript reads like a run whose first provider call failed:
+/// `RunStart`, the `model_limits` notice, the seed and user turn it was given,
+/// `TurnStart`, then `failure`:
+///
+/// - `ProviderError::Preflight` (the agent did not load, or names an
+///   undeclared provider) closes the run with the message verbatim and no
+///   outcome → [`RunError::Preflight`];
+/// - any other error (the provider did not build) is an `Outcome` the run
+///   fails on, with the same `provider: …` text a failed call carries →
+///   [`RunError::Outcome`].
+///
+/// Unlike a run that started, it offers no tools (no `tool_grant`) and climbs
+/// no recovery ladder (no `Recovery` with a "add fallbacks" hint): nothing
+/// was built to fall back from.
+pub fn record_unstarted_run(
+    run: UnstartedRun<'_>,
+    failure: rupu_providers::ProviderError,
+) -> RunError {
+    let written = (|| -> Result<RunError, RunError> {
+        JsonlWriter::create(run.transcript_path)?;
+        let mut writer = JsonlWriter::append(run.transcript_path)?;
+        let system_prompt = run.system_prompt.map(|p| {
+            let mut p = p.to_string();
+            if let Some(line) = run.codename.and_then(call_sign_line) {
+                p.push_str(&line);
+            }
+            p
+        });
+        writer.write(&Event::RunStart {
+            run_id: run.run_id.to_string(),
+            workspace_id: run.workspace_id.to_string(),
+            agent: run.agent.to_string(),
+            provider: run.provider.to_string(),
+            model: run.model.to_string(),
+            started_at: Utc::now(),
+            mode: run_mode(run.mode),
+            schema: Some(2),
+            system_prompt,
+            codename: run.codename.map(str::to_string),
+            customer: Some(run.customer.map(str::to_string)),
+        })?;
+        writer.write(&Event::Notice {
+            kind: "model_limits".into(),
+            message: rupu_providers::model_limits::ModelLimits::unknown()
+                .describe(run.provider, Utc::now()),
+        })?;
+        if !run.prompt.initial_messages.is_empty() {
+            writer.write(&Event::Seed {
+                message_count: run.prompt.initial_messages.len() as u32,
+                sha256: seed_sha256(&run.prompt.initial_messages),
+                source_transcript: run
+                    .prompt
+                    .seed_source
+                    .as_ref()
+                    .map(|p| p.display().to_string()),
+                messages: match run.prompt.seed_source {
+                    Some(_) => None,
+                    None => Some(
+                        serde_json::to_value(&run.prompt.initial_messages)
+                            .unwrap_or(serde_json::Value::Null),
+                    ),
+                },
+            })?;
+        }
+        if !run.prompt.message.is_empty() {
+            writer.write(&Event::UserMessage {
+                content: run.prompt.message.clone(),
+            })?;
+        }
+        let turn_idx = run.prompt.turn_index_offset;
+        writer.write(&Event::TurnStart { turn_idx })?;
+        let e_str = failure.to_string();
+        let err = match failure {
+            rupu_providers::ProviderError::Preflight(_) => {
+                writer.write(&Event::RunComplete {
+                    run_id: run.run_id.to_string(),
+                    status: RunStatus::Error,
+                    total_tokens: 0,
+                    duration_ms: 0,
+                    error: Some(e_str.clone()),
+                    outcome: None,
+                })?;
+                RunError::Preflight(e_str)
+            }
+            other => {
+                let mut o = crate::outcome::classify_error(&other);
+                o.id = crate::recovery::RecoveryState::with_origin(run.provider, run.model)
+                    .next_outcome_id();
+                writer.write(&Event::Outcome {
+                    turn_idx,
+                    outcome: o.record(),
+                })?;
+                writer.write(&Event::RunComplete {
+                    run_id: run.run_id.to_string(),
+                    status: RunStatus::Error,
+                    total_tokens: 0,
+                    duration_ms: 0,
+                    error: Some(format!("provider: {e_str}")),
+                    outcome: Some(o.record()),
+                })?;
+                RunError::Outcome {
+                    message: RunError::Provider(e_str).to_string(),
+                    outcome: Box::new(o.record()),
+                    hint: None,
+                }
+            }
+        };
+        writer.flush()?;
+        Ok(err)
+    })();
+    written.unwrap_or_else(|e| e)
+}
+
 /// The run's exit once SIGTERM has arrived: close the transcript as
 /// `Aborted` (saying why) and hand back [`RunError::Terminating`] — or the
 /// transcript error, if even that could not be written.

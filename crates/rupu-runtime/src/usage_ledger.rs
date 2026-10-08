@@ -68,6 +68,17 @@ pub struct UnitTokenCounters {
     pub output: AtomicU64,
 }
 
+impl UnitTokenCounters {
+    /// A usage hook that only adds each call's tokens to these counters (a
+    /// unit's live totals); its ledger rows come from the run's own hook.
+    pub fn hook(self: Arc<Self>) -> rupu_agent::OnUsageCallback {
+        Arc::new(move |u: &rupu_agent::UsageTurn| {
+            self.input.fetch_add(u.input_tokens, Ordering::Relaxed);
+            self.output.fetch_add(u.output_tokens, Ordering::Relaxed);
+        })
+    }
+}
+
 /// Cloneable append handle. The file opens lazily on first append (so a
 /// ledger for a run that never calls a model creates no file) with
 /// `O_APPEND | O_CREAT`; each row is ONE `write_all` of `json + "\n"` under

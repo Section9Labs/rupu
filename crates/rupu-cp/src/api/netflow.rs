@@ -643,9 +643,9 @@ fn resolve_ledger_paths(workspace: &StdPath, global_dir: &StdPath, id: &str) -> 
 /// `step_results.jsonl`, PLUS every sub-agent id this run (or one of its
 /// sub-agents, transitively) dispatched via `dispatch_agent`. The
 /// concurrent DAG scheduler mints a fresh run id per dispatched unit (see
-/// `rupu-orchestrator`'s `runner.rs`, and `step_factory.rs`'s
-/// `step_netflow_sink`, which is handed that id and builds THAT unit's
-/// own `NetflowPaths::for_run`), so a step's provider flows AND its
+/// `rupu-orchestrator`'s `runner.rs`, and the run assembler's per-run sink,
+/// `rupu_runtime::netflow::for_run`, which is handed that id and builds THAT
+/// unit's own `NetflowPaths::for_run`), so a step's provider flows AND its
 /// ledger-only `Dropped` count live in their own file, never the parent
 /// workflow run's. `dispatch_agent` (`rupu-cli`'s `cmd/dispatch.rs`) does
 /// the identical thing by a different mechanism — CORRECTION: an earlier

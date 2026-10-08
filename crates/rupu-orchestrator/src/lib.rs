@@ -22,10 +22,13 @@ pub mod run_step;
 pub mod runner;
 pub mod runs;
 pub mod step_factory;
-pub mod templates;
 pub mod subagents;
+pub mod templates;
+#[doc(hidden)]
+pub mod testing;
 pub mod usage_ledger;
 pub mod workflow;
+pub mod workflow_runtime;
 
 pub use catalog::{list_workflow_summaries, load_workflow, WorkflowSummary};
 pub use event_match::event_matches;
@@ -41,8 +44,8 @@ pub use recovery::{AttemptPlan, PlanCounts, RecoveryPlans, StepPlan};
 pub use runner::{
     read_final_assistant_text, resolve_inputs, run_workflow, AwaitingInfo, Finding, ItemResult,
     OrchestratorRunOpts, OrchestratorRunResult, PauseReason, PausedStep, ResumeState,
-    RunWorkflowError, StepFactory, StepResult, UnitCoverage, UnitDispatch, UnitDispatcher,
-    UnitFailure, UnitOutcome, WorkspaceConflict, WorkspaceDelta,
+    RunWorkflowError, StepFactory, StepLaunch, StepRequest, StepResult, UnitCoverage, UnitDispatch,
+    UnitDispatcher, UnitFailure, UnitOutcome, WorkspaceConflict, WorkspaceDelta,
 };
 pub use runs::{
     ApprovalDecision, ApprovalError, FindingRecord, GateDecision, GateVerdict, ItemResultRecord,
@@ -63,3 +66,4 @@ pub use workflow::{
     TimeoutAction, Trigger, TriggerKind, Workflow, WorkflowDefaults, WorkflowOutputContract,
     WorkflowParseError,
 };
+pub use workflow_runtime::{WorkflowRuntime, WorkflowRuntimeInputs};

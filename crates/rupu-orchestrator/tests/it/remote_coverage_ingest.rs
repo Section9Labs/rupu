@@ -3,7 +3,7 @@
 //! never a failed unit (spec 2026-09-30-rupu-remote-findings-transport-design.md §A4).
 
 use async_trait::async_trait;
-use rupu_agent::{LegacyRunOpts, RunError};
+use rupu_agent::RunError;
 use rupu_coverage::{target_id, CoveragePaths, StreamLine, STREAM_VERSION};
 use rupu_orchestrator::executor::{Event, EventSink};
 use rupu_orchestrator::runner::{
@@ -18,17 +18,10 @@ struct PanicFactory;
 
 #[async_trait]
 impl StepFactory for PanicFactory {
-    async fn build_opts_for_step(
+    async fn launch_for_step(
         &self,
-        _step_id: &str,
-        _agent_name: &str,
-        _rendered_prompt: String,
-        _run_id: String,
-        _workspace_id: String,
-        _workspace_path: std::path::PathBuf,
-        _transcript_path: std::path::PathBuf,
-        _on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    ) -> LegacyRunOpts {
+        _request: rupu_orchestrator::StepRequest,
+    ) -> Result<rupu_orchestrator::StepLaunch, rupu_runtime::assembly::AssembleError> {
         panic!("remote units must not be built locally");
     }
 }

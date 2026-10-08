@@ -40,7 +40,7 @@ use clap::Subcommand;
 use rupu_agentiflow::{
     agentiflow_dir, hard_stop, load_agentiflow_def, new_run_id, run_agentiflow, AgentiflowDef,
     AgentiflowRecord, Budget, CoverageTarget, EnvelopeOutcome, GenerationCapability, GoalTarget,
-    HardStopOutcome, LeadInputs, OperatorMessage, OperatorQueue, ProviderFactory, ReapSummary,
+    HardStopOutcome, LeadInputs, LeadProvider, OperatorMessage, OperatorQueue, ReapSummary,
     RunAgentiflowOpts,
 };
 use rupu_auth::CredentialResolver;
@@ -238,14 +238,14 @@ async fn run_cmd(
     let spec = rupu_agent::load_agent(&global, project_rupu.as_deref(), &def.lead)
         .with_context(|| format!("load lead agent `{}`", def.lead))?;
 
-    // Provider + model for the lead, resolved exactly as `rupu run` does.
+    // Pre-flight, before any credential lookup (and before `--detach`), so a
+    // typo'd provider name fails with a config error rather than a confusing
+    // auth one. The provider itself is resolved and built by the run's
+    // assembler, exactly as for `rupu run`.
     let provider_name = provider_factory::resolve_provider_name(
         spec.provider.as_deref(),
         cfg.default_provider.as_deref(),
     );
-    let oai_params = provider_factory::openai_compatible_params(&provider_name, &cfg.providers);
-    // Pre-flight, before any credential lookup, so a typo'd provider name
-    // fails with a config error rather than a confusing auth one.
     if !provider_factory::is_dispatchable_provider(&provider_name, &cfg.providers) {
         anyhow::bail!(
             "provider '{provider_name}' (the lead agent's) is not a built-in provider, is not a \
@@ -255,22 +255,6 @@ async fn run_cmd(
              base_url in config.toml"
         );
     }
-    let model = provider_factory::resolve_model(
-        spec.model.as_deref(),
-        cfg.default_model.as_deref(),
-        oai_params.as_ref().map(|p| p.default_model.as_str()),
-    );
-    let lead_pc = ProviderConfig {
-        anthropic_oauth_system_prefix: spec.anthropic_oauth_prefix,
-        anthropic_prompt_cache: spec.anthropic_prompt_cache,
-        anthropic_server_side_fallback: Some(cfg.recovery.server_side_fallback),
-        openai_compatible: oai_params,
-        tuning: Some(provider_factory::provider_tuning(
-            &provider_name,
-            &cfg.providers,
-        )),
-        kind: provider_factory::resolve_kind(&provider_name, &cfg.providers),
-    };
 
     // The id is minted exactly once, here: a detached parent hands it to its
     // child (`--run-id`), which runs the foreground path below under it.
@@ -286,10 +270,12 @@ async fn run_cmd(
     }
     let run_dir = agentiflow_dir(&global).join(&run_id);
 
-    // Netflow sink: built before any provider so the launch-time builds below
-    // and every round's provider record into this run's ledger. Its transcript
-    // half lands in `lead/netflow.jsonl`: the per-round `transcript.rN.jsonl`
-    // files are truncated by the runner each round, so they cannot host it.
+    // Netflow sink for the launch itself — the SCM registry's discovery, the
+    // lead provider's pre-flight build and the generation provider — into
+    // this run's ledger. Its transcript half lands in `lead/netflow.jsonl`
+    // (no round transcript exists yet). Each round's own provider and `bash`
+    // get a per-round sink from the assembler: the same ledger (it is keyed
+    // by the run id), and that round's transcript.
     let (netflow_sink, netflow_handle) = crate::netflow_sink::for_run(
         &global,
         project_root.as_deref(),
@@ -300,15 +286,13 @@ async fn run_cmd(
     let body = launch(
         def,
         active,
-        &spec,
-        &cfg,
+        spec,
+        cfg,
         &global,
+        project_root,
         &pwd,
         run_id.clone(),
         run_dir.clone(),
-        provider_name,
-        model,
-        lead_pc,
         netflow_sink,
         cfg_paths.customer_slug.clone(),
     )
@@ -517,73 +501,97 @@ async fn spawn_detached(
     Ok(())
 }
 
-/// Everything after the netflow sink exists: pre-validate the lead's provider,
-/// classify generation, assemble the options and run to a stop. Split from
-/// [`run_cmd`] so the ledger is flushed on every path out of it.
+/// Everything after the netflow sink exists: the run's assembler, the lead's
+/// provider pre-validated, generation classified, the options assembled and
+/// the run driven to a stop. Split from [`run_cmd`] so the ledger is flushed
+/// on every path out of it.
 #[allow(clippy::too_many_arguments)]
 async fn launch(
     def: AgentiflowDef,
     active: rupu_coverage::ActiveSet,
-    spec: &rupu_agent::AgentSpec,
-    cfg: &rupu_config::Config,
+    spec: rupu_agent::AgentSpec,
+    cfg: rupu_config::Config,
     global: &Path,
+    project_root: Option<std::path::PathBuf>,
     workspace: &Path,
     run_id: String,
     run_dir: std::path::PathBuf,
-    provider_name: String,
-    model: String,
-    lead_pc: ProviderConfig,
     sink: Arc<dyn rupu_netflow::FlowSink>,
     customer: Option<String>,
 ) -> anyhow::Result<(String, EnvelopeOutcome)> {
-    let resolver: Arc<dyn CredentialResolver> = Arc::new(crate::accounts::resolver_for(cfg));
-    let auth_hint = spec.auth;
+    let resolver = Arc::new(crate::accounts::resolver_for(&cfg));
+    // The workspace's record (its id rides every round's `RunStart`).
+    let ws = rupu_workspace::upsert(
+        &rupu_workspace::WorkspaceStore {
+            root: global.join("workspaces"),
+        },
+        workspace,
+    )?;
+    // The lead's MCP connector tools (R6), its `[findings]` base (R5) and the
+    // capture backend for its `bash` — what every run is assembled with.
+    let scm = Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg, sink.clone()).await);
+    let findings = crate::findings_opts::base_options(global, &cfg.findings);
+    let net_capture = crate::netflow_sink::net_capture(&cfg.netflow).await;
+    let pricing = cfg.pricing.clone();
+    let assembler =
+        rupu_runtime::assembly::RunAssembler::new(rupu_runtime::assembly::AssemblyContext {
+            global: global.to_path_buf(),
+            project_root,
+            config: cfg,
+            customer,
+            resolver: Arc::clone(&resolver),
+            scm: Some(scm),
+            findings,
+            net_capture: Some(net_capture),
+        });
 
     // The lead's provider, built once now so a missing credential or bad
-    // config fails the launch; each round then builds its own (below).
-    provider_factory::build_for_provider_with_config(
+    // config fails the launch; each round then builds its own.
+    let prepared = match assembler
+        .prepare_provider(&spec, &Default::default(), sink.clone())
+        .await
+    {
+        Ok(p) => p,
+        Err(rupu_runtime::AssembleError::ProviderBuild {
+            provider, source, ..
+        }) => {
+            return Err(anyhow::Error::new(source)
+                .context(format!("build the lead's provider `{provider}`")))
+        }
+        Err(e) => return Err(anyhow::Error::new(e).context("build the lead's provider")),
+    };
+    let (provider_name, model) = (prepared.provider_name.clone(), prepared.model.clone());
+    drop(prepared);
+
+    let generation = generation_capability(
+        resolver,
+        &assembler.context().config,
         &provider_name,
         &model,
-        auth_hint,
-        resolver.as_ref(),
-        &lead_pc,
-        sink.clone(),
-    )
-    .await
-    .with_context(|| format!("build the lead's provider `{provider_name}`"))?;
-
-    let generation =
-        generation_capability(resolver.clone(), cfg, &provider_name, &model, sink.clone()).await?;
-
-    let make_provider = lead_provider_factory(
-        provider_name.clone(),
-        model.clone(),
-        auth_hint,
-        resolver,
-        lead_pc,
         sink,
-    );
+    )
+    .await?;
+
+    // What the lead file declares, exactly. `rupu run` treats an absent
+    // `tools:` as the default grant; an autonomous lead (it runs under bypass
+    // permission) gets none of them unless it asks. `run_agentiflow` adds
+    // `findings.report` and the fleet tools on top either way.
+    let mut lead = spec;
+    lead.tools = Some(lead.tools.unwrap_or_default());
 
     let name = def.name.clone();
     let opts = RunAgentiflowOpts {
         def,
-        customer,
         workspace: workspace.to_path_buf(),
         global: global.to_path_buf(),
         active,
         started: chrono::Utc::now(),
         now: Box::new(chrono::Utc::now),
-        make_provider,
+        assembler,
+        workspace_id: ws.id,
         lead: LeadInputs {
-            agent_name: spec.name.clone(),
-            system_prompt: spec.system_prompt.clone(),
-            provider_name,
-            model,
-            // What the lead file declares, exactly. `rupu run` treats an absent
-            // `tools:` as "all six builtins"; an autonomous lead (it runs under
-            // bypass permission) gets none of them unless it asks. `run_agentiflow`
-            // adds `findings.report` and the fleet tools on top either way.
-            agent_tools: spec.tools.clone().unwrap_or_default(),
+            agent: lead,
+            provider: LeadProvider::Assembled,
         },
         run_id: run_id.clone(),
         // Production: a `SubprocessUnitLauncher` over this binary.
@@ -594,7 +602,7 @@ async fn launch(
         // built-in vendor prices: what `budget.usd` is metered with. A lead
         // model neither prices makes `run_agentiflow` warn that the cap is not
         // enforced.
-        pricing: cfg.pricing.clone(),
+        pricing,
     };
 
     eprintln!("agentiflow {name}: run {run_id}");
@@ -612,63 +620,6 @@ async fn launch(
             Err(anyhow!("agentiflow run {run_id} aborted: {why}"))
         }
     }
-}
-
-/// The lead's per-round provider factory: a dedicated runtime that `block_on`s
-/// the async factory each round, so every auth mode builds (Anthropic OAuth
-/// included) and each round re-resolves its credential.
-///
-/// The runtime is created on first use, on `run_agentiflow`'s worker thread
-/// (never in an async context, where creating-then-dropping one on an early
-/// exit would panic), and lives as long as the closure. It is multi-threaded
-/// (one worker) rather than current-thread on purpose: a client built here
-/// shares the netflow connection pool keyed by THIS runtime, and an Anthropic
-/// OAuth build's bootstrap request leaves a pooled connection whose dispatch
-/// task lives here; the lead's own runtime would then send its first message
-/// on it, and a current-thread runtime that is not inside `block_on` never
-/// polls it. A worker thread keeps those connections driven.
-fn lead_provider_factory(
-    provider: String,
-    model: String,
-    auth_hint: Option<rupu_providers::AuthMode>,
-    resolver: Arc<dyn CredentialResolver>,
-    pc: ProviderConfig,
-    sink: Arc<dyn rupu_netflow::FlowSink>,
-) -> ProviderFactory {
-    let mut rt: Option<tokio::runtime::Runtime> = None;
-    Box::new(move || {
-        let rt = rt.get_or_insert_with(|| {
-            // IMPORTANT: this MUST stay `new_multi_thread` with at least one
-            // worker. Do NOT change it to `new_current_thread`. A current-thread
-            // runtime only polls its tasks while a `block_on` is running on it;
-            // once the `block_on` below returns, nothing drives the netflow HTTP
-            // connection-pool dispatch task the Anthropic-OAuth bootstrap request
-            // spawned onto this runtime. The lead's own runtime then reuses that
-            // pooled connection for its first message, which is never polled, so
-            // the first request hangs (verified in the Task-3 review). A worker
-            // thread keeps those connections driven between rounds. There is no
-            // timing test for this on purpose (it would be flaky); this comment
-            // is the regression guard.
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
-                .thread_name("agentiflow-lead-provider")
-                .enable_all()
-                .build()
-                .expect("build the lead provider runtime")
-        });
-        // The signature is infallible; the same build succeeded at launch, so
-        // a failure here is a credential that went away mid-run.
-        rt.block_on(provider_factory::build_for_provider_with_config(
-            &provider,
-            &model,
-            auth_hint,
-            resolver.as_ref(),
-            &pc,
-            sink.clone(),
-        ))
-        .unwrap_or_else(|e| panic!("lead provider `{provider}` could not be built: {e}"))
-        .1
-    })
 }
 
 /// The lead's `generate_workflow` capability, or `None` when it cannot be
@@ -689,7 +640,15 @@ async fn generation_capability(
     let (gen_provider, gen_model) = rupu_orchestrator::pick_default_gen_model(resolver.as_ref())
         .await
         .unwrap_or_else(|| (lead_provider.to_string(), lead_model.to_string()));
-    let gen_pc = generation_provider_config(&gen_provider, cfg);
+    // The operator's `[providers.<name>]` settings and no agent-level
+    // overrides (as the `agent generate` / `workflow generate` call sites
+    // build it).
+    let gen_pc = ProviderConfig::for_agent(
+        &gen_provider,
+        &cfg.providers,
+        Default::default(),
+        Some(cfg.recovery.server_side_fallback),
+    );
 
     let (gen_mode, gen_cred) = match resolver.get(&gen_provider, None).await {
         Ok(resolved) => resolved,
@@ -745,20 +704,6 @@ async fn generation_capability(
         }
         Err(e) => Err(anyhow::Error::new(e)
             .context(format!("build the generation provider `{gen_provider}`"))),
-    }
-}
-
-/// `ProviderConfig` for the generating provider: the operator's
-/// `[providers.<name>]` settings and no agent-level overrides (as the
-/// `agent generate` / `workflow generate` call sites build it).
-fn generation_provider_config(provider: &str, cfg: &rupu_config::Config) -> ProviderConfig {
-    ProviderConfig {
-        anthropic_oauth_system_prefix: None,
-        anthropic_prompt_cache: None,
-        anthropic_server_side_fallback: Some(cfg.recovery.server_side_fallback),
-        openai_compatible: provider_factory::openai_compatible_params(provider, &cfg.providers),
-        tuning: Some(provider_factory::provider_tuning(provider, &cfg.providers)),
-        kind: provider_factory::resolve_kind(provider, &cfg.providers),
     }
 }
 

@@ -64,23 +64,12 @@ impl DefinitionGenerator for RuntimeDefinitionGenerator {
         // the CP's "generate a definition" button, so it previously ran with
         // none of the operator's timeout/retry/concurrency/base_url settings.
         // (`gen_cfg` was loaded above, alongside the resolver.)
-        let gen_provider_config = rupu_runtime::provider_factory::ProviderConfig {
-            anthropic_oauth_system_prefix: None,
-            anthropic_prompt_cache: None,
-            anthropic_server_side_fallback: Some(gen_cfg.recovery.server_side_fallback),
-            openai_compatible: rupu_runtime::provider_factory::openai_compatible_params(
-                &gen_req.provider,
-                &gen_cfg.providers,
-            ),
-            tuning: Some(rupu_runtime::provider_factory::provider_tuning(
-                &gen_req.provider,
-                &gen_cfg.providers,
-            )),
-            kind: rupu_runtime::provider_factory::resolve_kind(
-                &gen_req.provider,
-                &gen_cfg.providers,
-            ),
-        };
+        let gen_provider_config = rupu_runtime::provider_factory::ProviderConfig::for_agent(
+            &gen_req.provider,
+            &gen_cfg.providers,
+            Default::default(),
+            Some(gen_cfg.recovery.server_side_fallback),
+        );
         let out = rupu_orchestrator::generate_definition(&gen_req, &resolver, &gen_provider_config)
             .await
             .map_err(|e| match e {
