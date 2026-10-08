@@ -864,7 +864,7 @@ describe('ToolCard audit badge', () => {
       <ToolCard
         tool={makeToolView({
           tool: 'write_file',
-          kind: 'write',
+          kind: 'diff',
           audit: audit({ blocked: true, decision: 'denied:readonly' }),
         })}
       />,
