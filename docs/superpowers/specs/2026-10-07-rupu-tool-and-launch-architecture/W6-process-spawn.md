@@ -92,11 +92,23 @@ SSH keeps its remote `setsid nohup … &` wrapper, but takes its command string 
 
 ### 3.3 Run id and codename across peers (L8)
 
-- **Node protocol.** `RunSpec` (`rupu-cp/src/node/protocol.rs:87`) gains optional `run_id` and `codename` (`#[serde(default, skip_serializing_if)]`). A node that knows them **honours** a supplied run id and codename. Nodes advertise this as the capability `run.supplied_identity`, in tunnel `Hello.capabilities` and bucket node markers, following the existing `agent.findings_profile` pattern.
-  - The coordinator relies on its pre-minted id only when the capability is advertised. Otherwise it keeps today's behaviour (learn the id from the node's reply). That choice is logged, never silent.
-- **HTTP host.** `POST /api/agents/:name/run` accepts optional `run_id` / `codename` behind the same feature in `/api/host/info`.
-- **SSH.** Already honours both (`ssh.rs:3258`). The `__features` list gains `run.codename_flag`. An older remote gets the env var form, chosen by `RunArgv::for_peer`.
-- `honours_supplied_run_id` (SSH-only today) becomes a `HostConnector` method answered from each connector's advertised features.
+*(Corrected 2026-10-08. The first draft wrongly put `run_id` into `RunSpec` behind a capability.)*
+
+**Run id: no protocol change and no capability.** The id already travels outside `RunSpec` (tunnel `Frame::Run { run_id, spec }`, the bucket `jobs/<run_id>.json` key), and every node since #414 runs `rupu run --run-id <that id>`. The bug is on the coordinator side: the tunnel and bucket connectors mint a fresh id instead of using `AgentLaunchRequest.run_id`.
+- **Fix:** `req.run_id.clone().unwrap_or_else(mint)` in both connectors.
+- `honours_supplied_run_id` returns `true` for tunnel and bucket, unconditionally.
+- **HTTP is the exception.** `POST /api/agents/:name/run` mints on the peer. Add an optional `run_id` body field. The peer honours it only if it advertises `run.supplied_run_id` in `/api/host/info`, and the HTTP connector's `honours_supplied_run_id` answers from that feature. The connector keeps reading the returned id, so an older peer that ignores the field still reports the id it really used.
+
+**Codename: best-effort, never a launch refusal.** A codename is display identity. Unlike `findings_profile` / `engagement_profiles`, it changes nothing about how the run behaves, so a peer that can't take it must not block the launch.
+- `RunSpec` gains an optional `codename` field (`#[serde(default, skip_serializing_if)]`; `RunSpec` has no `deny_unknown_fields`, so an old node ignores it). Nodes that pass it on as `--codename` advertise `run.codename`. The HTTP body gets the same field under the same feature.
+- **When the peer lacks the capability:**
+  - the launch proceeds;
+  - the remote run derives its own standalone codename;
+  - the coordinator's own records (the `UnitDispatch` / `AgentStarted` / run records) keep the coordinator-minted name, as they do today;
+  - the connector records the downgrade: one `tracing::warn!` per launch naming the host and its version, and a `Downgrade` returned from `RunArgv::for_peer`.
+
+  The result is a codename mismatch between the coordinator's record and the remote transcript's `RunStart`. That is visible and cosmetic, never silent breakage.
+- SSH keeps its existing env-var path for remotes without `run.codename_flag` (`for_peer`).
 
 ### 3.4 L12
 
@@ -109,7 +121,7 @@ SSH keeps its remote `setsid nohup … &` wrapper, but takes its command string 
 | `rupu-runtime/src/{argv,spawn}.rs` | **new** |
 | `rupu-cli/src/{cp_agent_launcher,cp_launcher,cp_session_starter,cp_session_sender}.rs` | use `RunArgv` + `spawn_detached` |
 | `rupu-cli/src/cmd/{cp,node,run,workflow,session}.rs` | `build_resume_argv`/`build_argv` deleted; `--codename` flag; session worker spawn |
-| `rupu-cp/src/host/{ssh,http,tunnel,bucket}.rs`, `node/protocol.rs` | `to_shell`; `RunSpec.{run_id,codename}`; capability advertisement |
+| `rupu-cp/src/host/{ssh,http,tunnel,bucket}.rs`, `node/protocol.rs` | `to_shell`; `RunSpec.codename` + `run.codename` / `run.supplied_run_id` capability advertisement; tunnel/bucket connectors honour `req.run_id` |
 | `rupu-agentiflow/src/subprocess.rs` | `rupu_run_argv` deleted; `SpawnSpec { keep_child: true }` |
 | `rupu-cli/src/fleet_unit_dispatcher.rs` | the L12 wiring |
 
@@ -122,7 +134,7 @@ SSH keeps its remote `setsid nohup … &` wrapper, but takes its command string 
 1. **`argv_roundtrip`** (`rupu-cli` it, because the clap types live there): for a generated set of `RunArgv` values, `to_args()` → the real clap `Cli::try_parse_from` → convert back → equal. This makes the argv and the CLI impossible to drift apart. A prompt beginning with `-` and containing newlines and quotes is included.
 2. **`argv_shell_safe`** (`rupu-runtime`): `to_shell` output, run through `sh -c 'printf %s\\n "$@"' _ …`, reproduces `to_args` element for element.
 3. **`for_peer_downgrades`**: a peer without `run.codename_flag` gets the env form, with a recorded `Downgrade`.
-4. **`node_honours_supplied_identity`** (`rupu-cli` it, node executor): with the capability, the spawned run's id and codename equal the supplied ones.
+4. **`tunnel_bucket_use_supplied_run_id`** (`rupu-cp` it): both connectors launch under `req.run_id` when it is set. **`codename_best_effort`**: a node with `run.codename` runs under the supplied codename; one without it still launches, and the downgrade is logged.
 5. **`host_local_works`** (`rupu-cli` serial): a workflow with `host: local` dispatches through the subprocess launcher.
 
 ## 7. Acceptance
