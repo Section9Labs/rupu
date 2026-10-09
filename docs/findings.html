@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu docs — Findings</title>
+<meta name="description" content="Structured finding reports: profiles, evidence blocks and artifacts, the findings query language, tags, and Markdown/HTML/PDF export.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="docs-shell">
+
+  <!-- ════ SHARED SIDEBAR (copy verbatim into every docs page; set .active) ════ -->
+  <aside class="docs-side">
+    <a class="brand" href="/" aria-label="rupu home">
+      <span class="mark" aria-hidden="true">&#8734;</span>
+      <span class="name">rupu</span>
+    </a>
+    <div class="grp">Start</div>
+    <a class="item" href="/docs/quickstart.html">Quickstart</a>
+    <a class="item" href="/docs/">Overview &amp; install</a>
+    <div class="grp">Concepts</div>
+    <a class="item" href="/docs/agents.html">Agents</a>
+    <a class="item" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
+    <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
+    <a class="item" href="/docs/sessions.html">Sessions</a>
+    <a class="item" href="/docs/profiles.html">Engagement profiles</a>
+    <div class="grp">Platform</div>
+    <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item" href="/docs/reliability.html">Recovery &amp; reliability</a>
+    <a class="item" href="/docs/integrations.html">Integrations</a>
+    <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
+    <a class="item" href="/docs/triggers.html">Triggers</a>
+    <a class="item" href="/docs/control-plane.html">Control plane</a>
+    <a class="item" href="/docs/multi-host.html">Multi-host</a>
+    <a class="item" href="/docs/netflow.html">Netflow</a>
+    <a class="item" href="/docs/coverage.html">Coverage</a>
+    <a class="item active" href="/docs/findings.html">Findings</a>
+    <a class="item" href="/docs/customers.html">Customers</a>
+    <div class="grp">Reference</div>
+    <a class="item" href="/docs/cli.html">CLI reference</a>
+    <a class="item" href="/docs/configuration.html">Configuration</a>
+    <a class="item" href="/docs/api.html">HTTP API</a>
+    <a class="item" href="/docs/transcripts.html">Transcript schema</a>
+    <div class="grp">More</div>
+    <a class="item" href="/docs/examples/">Examples</a>
+    <a class="item" href="/#download">Download</a>
+    <a class="item" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </aside>
+  <!-- ════ /SHARED SIDEBAR ════ -->
+
+  <main class="docs-main">
+    <h1>Findings</h1>
+    <p class="intro">A finding is recorded once, as structured data. That record is the source of truth: rupu renders the report page, the Markdown, HTML and PDF exports, and every list and query from it, so an agent never writes a separate report file.</p>
+
+    <p>Findings are written by the <a class="link" href="/docs/coverage.html">coverage harness</a>&rsquo;s <code class="inline">report_finding</code> tool (and the <code class="inline">findings.record</code> MCP action). This page covers what a finding report contains, how to query and tag findings, and how to export, import and download them.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 640 220" role="img" aria-label="An agent records a structured report; rupu validates it, stores artifacts, and serves it to the CLI, control plane and exports">
+        <defs><marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path class="d-arrow" d="M0,0 L7,3 L0,6 Z"></path></marker></defs>
+
+        <rect class="d-box" x="20" y="86" width="140" height="48" rx="10"></rect>
+        <text class="d-label" x="90" y="108" text-anchor="middle">report_finding</text>
+        <text class="d-sub" x="90" y="124" text-anchor="middle">agent / MCP</text>
+
+        <line class="d-edge" x1="160" y1="110" x2="223" y2="110" marker-end="url(#ar)"></line>
+
+        <rect class="d-box-accent" x="225" y="86" width="170" height="48" rx="10"></rect>
+        <text class="d-label" x="310" y="108" text-anchor="middle">validated report</text>
+        <text class="d-sub" x="310" y="124" text-anchor="middle">findings.jsonl + artifact store</text>
+
+        <line class="d-edge" x1="395" y1="100" x2="458" y2="48" marker-end="url(#ar)"></line>
+        <line class="d-edge" x1="395" y1="110" x2="458" y2="110" marker-end="url(#ar)"></line>
+        <line class="d-edge" x1="395" y1="120" x2="458" y2="172" marker-end="url(#ar)"></line>
+
+        <rect class="d-box" x="460" y="24" width="160" height="48" rx="10"></rect>
+        <text class="d-label" x="540" y="46" text-anchor="middle">query &amp; tags</text>
+        <text class="d-sub" x="540" y="62" text-anchor="middle">CLI / agent / MCP / CP</text>
+
+        <rect class="d-box" x="460" y="86" width="160" height="48" rx="10"></rect>
+        <text class="d-label" x="540" y="108" text-anchor="middle">report page</text>
+        <text class="d-sub" x="540" y="124" text-anchor="middle">control plane</text>
+
+        <rect class="d-box" x="460" y="148" width="160" height="48" rx="10"></rect>
+        <text class="d-label" x="540" y="170" text-anchor="middle">exports</text>
+        <text class="d-sub" x="540" y="186" text-anchor="middle">md / html / pdf</text>
+      </svg>
+      <figcaption>One structured record per finding; every view and export is generated from it.</figcaption>
+    </figure>
+
+    <h2>Finding profiles</h2>
+    <p>Every finding is written under one of two profiles:</p>
+    <table>
+      <thead><tr><th>Profile</th><th>What <code>report_finding</code> / <code>findings.record</code> accepts</th></tr></thead>
+      <tbody>
+        <tr><td><code>full</code> (default)</td><td>A complete <code>report</code> object. <code>summary</code>, <code>severity</code> and <code>evidence</code> are <strong>rejected</strong>: rupu derives them (<code>summary</code> &larr; <code>title</code>, <code>severity</code> &larr; <code>rating.risk_rating</code>, <code>evidence.rationale</code> &larr; <code>root_cause</code>).</td></tr>
+        <tr><td><code>summary</code></td><td>The lightweight <code>summary</code> / <code>severity</code> / <code>evidence</code> record. A <code>report</code> is <strong>refused</strong>, never silently dropped.</td></tr>
+      </tbody>
+    </table>
+    <p>The profile is chosen, highest precedence first, by:</p>
+    <ol>
+      <li>a workflow step&rsquo;s <code class="inline">findings_profile</code>, or <code class="inline">rupu run --findings-profile</code> for a standalone run;</li>
+      <li>the workflow&rsquo;s <code class="inline">defaults.findings_profile</code>;</li>
+      <li>the agent&rsquo;s <code class="inline">findingsProfile</code> frontmatter;</li>
+      <li>the built-in default, <code class="inline">full</code>.</li>
+    </ol>
+    <p>Remote workflow units (<code class="inline">host:</code> / <code class="inline">distribute:</code>) resolve the same way; the value travels to the host as <code class="inline">--findings-profile</code>, and a connector refuses a profile its peer doesn&rsquo;t advertise rather than dropping it. The profile is stored on each finding; records written before profiles existed read back as <code class="inline">summary</code>.</p>
+    <pre class="code"><span class="c">---</span>
+<span class="k">name</span>: <span class="s">quick-triage</span>
+<span class="k">findingsProfile</span>: <span class="v">summary</span>      <span class="c"># this agent records thin findings</span>
+<span class="k">concerns</span>:
+  - <span class="k">include</span>: <span class="s">owasp-top10-2021</span>
+<span class="c">---</span></pre>
+    <div class="callout"><strong>Upgrading.</strong> Because the default is <code class="inline">full</code>, an older agent that records thin findings is rejected until it declares <code class="inline">findingsProfile: summary</code> or its prompt is updated to send a <code class="inline">report</code>. When a full-profile run can record findings, finding-writing guidance is appended to its system prompt automatically, so no external reporting-standard file is needed.</div>
+
+    <h2>What a full report contains</h2>
+    <p>A <code class="inline">full</code> report has these fields; every one is required except <code class="inline">cwe</code> (which may be an empty list), <code class="inline">artifacts</code>, <code class="inline">blocks</code> and <code class="inline">classifications</code>:</p>
+    <table>
+      <thead><tr><th>Group</th><th>Fields</th></tr></thead>
+      <tbody>
+        <tr><td>Identity</td><td><code>title</code>, <code>category</code>, <code>attack_vector</code>, <code>cwe</code> (<code>CWE-&lt;n&gt;</code> ids)</td></tr>
+        <tr><td>Ownership</td><td><code>ownership</code> (<code>owner</code>, <code>product</code>, <code>affected_component</code>, <code>source_repository</code>), <code>tickets</code></td></tr>
+        <tr><td>Rating</td><td><code>rating</code>: <code>impact</code>, <code>risk_rating</code>, <code>risk_factor</code> (<code>Low</code>/<code>Medium</code>/<code>High</code>/<code>Critical</code>), <code>likelihood</code> (<code>Low</code>/<code>Medium</code>/<code>High</code>), <code>cvss_v3</code></td></tr>
+        <tr><td>Narrative</td><td><code>description</code>, <code>impact</code>, <code>location</code> (<code>input</code> / <code>output</code>), <code>root_cause</code>, <code>call_chain</code> (source &rarr; hop &rarr; sink)</td></tr>
+        <tr><td>Proof</td><td><code>evidence</code> (at least one claim, each optionally pinned to a workspace-relative <code>file</code> + <code>lines</code>), <code>replication_steps</code> (at least one), <code>artifacts</code>, <code>blocks</code></td></tr>
+        <tr><td>Fix</td><td><code>remediation</code>, <code>recommended_patch</code> (a unified diff), <code>ci_cd_detection</code>, <code>regression_test</code></td></tr>
+        <tr><td>Links</td><td><code>cross_references</code> (existing finding ids), <code>references</code></td></tr>
+      </tbody>
+    </table>
+    <p>Rules are enforced at write time, and a rejected call returns <strong>every</strong> problem at once with its field path, so the agent can fix them all in one retry. The serialized report must fit <code class="inline">[findings].report_max_bytes</code> (default 256 KiB). Some fields are set by rupu, never by the agent: the <code class="inline">verification</code> status (set by verification runs), each evidence claim&rsquo;s <code class="inline">sha256</code> (rupu hashes the claim&rsquo;s file), and an artifact&rsquo;s hash, size, kind and storage.</p>
+
+    <h3>Sentinels</h3>
+    <p>Where information genuinely cannot be determined, a field uses a sentinel instead of being omitted or guessed. On the structured fields only the exact sentinels listed for that field are accepted.</p>
+    <table>
+      <thead><tr><th>Sentinel</th><th>Used for</th></tr></thead>
+      <tbody>
+        <tr><td><code>Unknown</code></td><td>owner, product, affected component, source repository, attack vector, CVSS score, tickets</td></tr>
+        <tr><td><code>Not Applicable</code></td><td>source repository, when no source-controlled code is involved</td></tr>
+        <tr><td><code>None Provided</code></td><td>tickets, when none are mentioned</td></tr>
+        <tr><td><code>None</code></td><td>cross references, when there is no related finding</td></tr>
+        <tr><td><code>Not Provided &mdash; &lt;justification&gt;</code></td><td>call chain, recommended patch, CI/CD detection, regression test (the justification must be non-empty)</td></tr>
+      </tbody>
+    </table>
+    <p><code class="inline">Unknown</code> is <strong>not</strong> accepted for the patch, CI/CD detection or regression test: provide the item or say why it could not be produced.</p>
+
+    <h3>Evidence blocks</h3>
+    <p>Alongside the prose <code class="inline">evidence</code> claims, a report may carry typed <code class="inline">blocks</code>, each an object tagged by <code class="inline">kind</code>:</p>
+    <pre class="code">text   code_slice   diff   table   image   hexdump
+disasm   decompile   http_exchange   scan_output   pcap_ref</pre>
+    <p>Three of them name a file: <code class="inline">image</code> (plus an optional caption), <code class="inline">hexdump</code> (a base address and an optional rendered dump) and <code class="inline">pcap_ref</code> (a summary). That file, in the block&rsquo;s <code class="inline">artifact.path</code>, is verified and stored exactly like a proof-of-concept artifact (below) and counts against the same per-finding limits, but it doesn&rsquo;t appear in the PoC list. The control plane renders every block kind in an &ldquo;Evidence blocks&rdquo; section, with <code class="inline">image</code> blocks shown inline.</p>
+    <pre class="code">{ <span class="k">"kind"</span>: <span class="s">"http_exchange"</span>,
+  <span class="k">"request"</span>:  <span class="s">"GET /api/notes?sort=title%27-- HTTP/1.1\nHost: notes.example.test"</span>,
+  <span class="k">"response"</span>: <span class="s">"HTTP/1.1 500 Internal Server Error\n..."</span> }
+
+{ <span class="k">"kind"</span>: <span class="s">"image"</span>,
+  <span class="k">"artifact"</span>: { <span class="k">"path"</span>: <span class="s">"poc/error-page.png"</span> },
+  <span class="k">"caption"</span>: <span class="s">"Stack trace leaked by the sort parameter"</span> }</pre>
+
+    <h3>Artifacts and the content-addressed store</h3>
+    <p><code class="inline">report.artifacts[].path</code> lists proof-of-concept files (scripts, outputs, harnesses) as workspace-relative paths; the agent supplies only the path. At write time rupu hashes each one:</p>
+    <ul>
+      <li>A file up to <code class="inline">[findings].artifact_max_bytes</code> (default 500 MiB) is copied into a content-addressed store at <code class="inline">&lt;RUPU_HOME&gt;/findings/artifacts/&lt;aa&gt;/&lt;sha256&gt;</code> and recorded <code class="inline">stored: copied</code>. Identical content is stored once across runs and projects, and the store outlives the workspace.</li>
+      <li>A larger file is recorded <code class="inline">stored: external</code> with its path, size and sha256.</li>
+      <li>A directory expands to the files inside it (symlinks inside are skipped).</li>
+      <li>One report is bounded to <code class="inline">artifact_max_files</code> files (default 500) and <code class="inline">artifact_total_max_bytes</code> copied (default 2 GiB).</li>
+      <li>A path that escapes the workspace, doesn&rsquo;t exist, or isn&rsquo;t a regular file rejects the finding, so a typo is never silently dropped.</li>
+    </ul>
+    <pre class="code">[<span class="k">findings</span>]
+<span class="k">artifact_max_bytes</span>       = <span class="v">524288000</span>    <span class="c"># copy cap per artifact file (500 MiB)</span>
+<span class="k">artifact_max_files</span>       = <span class="v">500</span>          <span class="c"># files per report</span>
+<span class="k">artifact_total_max_bytes</span> = <span class="v">2147483648</span>   <span class="c"># bytes copied per report (2 GiB)</span>
+<span class="k">report_max_bytes</span>         = <span class="v">262144</span>       <span class="c"># serialized report budget (256 KiB)</span>
+<span class="k">ticket_patterns</span>          = [<span class="s">"ABC-[0-9]+"</span>] <span class="c"># extra ticket formats for the guidance</span>
+<span class="k">export_id_prefix</span>         = <span class="s">"VULN"</span>       <span class="c"># export numbering prefix (global config only)</span></pre>
+
+    <h3>Remote artifacts, pulled on view</h3>
+    <p>A remote workflow unit records its findings on the host, so its artifacts land in <strong>that host&rsquo;s</strong> store. The unit&rsquo;s coverage stream (findings included) reaches the coordinator when the unit ends, and the coordinator records those artifacts as <code class="inline">stored: external</code> with the host&rsquo;s id. The bytes stay on the host until someone views them: the first preview or download through the control plane pulls the blob over whatever transport the host uses (SSH, HTTP, tunnel or bucket), checks it against the recorded size and sha256, and keeps it in the coordinator&rsquo;s store. Concurrent first views share one pull. If the bytes can&rsquo;t be had (host offline, blob missing, over the coordinator&rsquo;s size cap, failed verification), the response is a <code class="inline">404</code> naming the reason, nothing is stored, and the next view tries again.</p>
+    <p>Artifacts are served with <code class="inline">nosniff</code> and a sandboxing Content-Security-Policy: text inline as plain text, PNG/JPEG/GIF/WebP images inline (recognised by their bytes, never by name), everything else as a download. Opening a finding never pulls from a host on its own; a remote image block loads only when you click it.</p>
+
+    <h3><code class="inline">rupu findings schema</code></h3>
+    <pre class="code"><span class="k">rupu findings schema</span>                 <span class="c">Print the embedded draft-07 JSON Schema of a finding report</span>
+<span class="k">rupu findings schema</span> --advertised    <span class="c">Print the simplified copy used in tool definitions</span></pre>
+    <p>The schema is embedded in the binary and held in lockstep with the validator by a test, so external prompts and tools can be generated from rupu rather than maintained by hand.</p>
+
+    <h2 id="querying-findings">Querying findings</h2>
+    <p>One single-line query language filters findings on every surface: <code class="inline">rupu findings list</code> and <code class="inline">tags</code>, the agent tool <code class="inline">query_findings</code>, the MCP tool <code class="inline">findings.query</code>, and the control plane&rsquo;s Findings page. One evaluator serves all of them, so a query means the same thing everywhere.</p>
+    <pre class="code"><span class="k">severity</span>&gt;=<span class="v">high</span> <span class="k">tag</span>:<span class="v">class:sqli</span> -<span class="k">tag</span>:<span class="v">false-positive</span> -<span class="k">has</span>:<span class="v">poc</span> <span class="s">"sql injection"</span></pre>
+
+    <h3>Grammar</h3>
+    <ul>
+      <li>Tokens are separated by whitespace and <strong>every token must match</strong> (AND). Repeating a key ANDs too: <code class="inline">tag:a tag:b</code> needs both tags.</li>
+      <li><code class="inline">key:value</code> filters a field; <code class="inline">key:a,b</code> matches any of the values (OR within one token); <code class="inline">-key:value</code> negates it.</li>
+      <li>Only <code class="inline">severity</code> takes <code class="inline">&gt;=</code>, <code class="inline">&gt;</code>, <code class="inline">&lt;=</code>, <code class="inline">&lt;</code>, with a single value.</li>
+      <li>A bare word or quoted phrase is free text, matched case-insensitively against title, summary, id and file path; <code class="inline">-word</code> negates it.</li>
+      <li>A token shaped like a key plus an operator always names a key, so an unknown key is an error, never text. Quote text that contains a colon: <code class="inline">"http://host"</code>.</li>
+      <li>Only the first <code class="inline">:</code> after the key splits, so <code class="inline">tag:class:sqli</code> works.</li>
+    </ul>
+    <p>An invalid query never runs. It is refused with the offending token&rsquo;s index and a code: <code class="inline">unknown_key</code>, <code class="inline">empty_value</code>, <code class="inline">bad_value</code>, <code class="inline">bad_operator</code>, <code class="inline">unclosed_quote</code> or <code class="inline">bad_quote</code>.</p>
+
+    <h3>Fields</h3>
+    <table>
+      <thead><tr><th>Key</th><th>Matches</th></tr></thead>
+      <tbody>
+        <tr><td><code>severity</code> (<code>sev</code>)</td><td><code>info</code>, <code>low</code>, <code>medium</code>, <code>high</code>, <code>critical</code>; also <code>&gt;=</code>, <code>&gt;</code>, <code>&lt;=</code>, <code>&lt;</code></td></tr>
+        <tr><td><code>tag</code></td><td>an effective tag (normalized, so <code>Class:SQLi</code> is <code>class:sqli</code>)</td></tr>
+        <tr><td><code>has</code></td><td><code>tags</code>, <code>report</code>, <code>poc</code> (the report has artifacts), <code>cwe</code></td></tr>
+        <tr><td><code>project</code></td><td>workspace name or id (CLI and control plane only)</td></tr>
+        <tr><td><code>cwe</code></td><td><code>79</code> or <code>CWE-79</code>, compared by number &mdash; <code>CWE-79</code> never matches CWE-798</td></tr>
+        <tr><td><code>owner</code>, <code>product</code></td><td>the report&rsquo;s ownership, case-insensitive</td></tr>
+        <tr><td><code>verified</code></td><td><code>unverified</code>, <code>confirmed</code>, <code>disputed</code>, <code>inconclusive</code></td></tr>
+        <tr><td><code>profile</code></td><td><code>full</code>, <code>summary</code></td></tr>
+        <tr><td><code>scope</code></td><td><code>line</code>, <code>file</code>, <code>repo</code>, <code>host</code>, <code>endpoint</code>, <code>resource</code></td></tr>
+        <tr><td><code>concern</code></td><td>concern id, case-insensitive</td></tr>
+        <tr><td><code>agent</code></td><td>agent name or codename, case-insensitive</td></tr>
+        <tr><td><code>workflow</code></td><td>workflow name (CLI and control plane only)</td></tr>
+        <tr><td><code>file</code></td><td>path prefix</td></tr>
+        <tr><td><code>run</code></td><td>run id; the CLI and control plane also match the run&rsquo;s sub-runs</td></tr>
+        <tr><td><code>id</code></td><td>finding id</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Examples</h3>
+    <pre class="code"><span class="c"># quote anything your shell would treat as a redirect: &gt; and &lt; are redirects</span>
+<span class="k">rupu findings list</span> <span class="s">'severity&gt;=high'</span> tag:needs-poc -has:poc
+<span class="k">rupu findings list</span> <span class="s">'owner:"payments team"'</span> profile:full
+<span class="k">rupu findings list</span> --limit 20 cwe:89,79 file:src/api/
+<span class="k">rupu findings list</span> --ids-only -has:tags
+<span class="k">rupu</span> --format json <span class="k">findings list</span> verified:confirmed project:notes-service</pre>
+    <p><code class="inline">list</code> spans every registered project; put <code class="inline">--limit N</code> and <code class="inline">--ids-only</code> before the query words. An agent with <code class="inline">query_findings</code> in its <code class="inline">tools:</code> (or a workflow <code class="inline">action: findings.query</code> step) sends <code class="inline">{q, limit, cursor}</code>; <code class="inline">limit</code> defaults to 50 (at most 500), or <code class="inline">all: true</code> returns every match unpaged &mdash; handy for fanning out over the results:</p>
+    <pre class="code"><span class="k">steps</span>:
+  - <span class="k">id</span>: <span class="s">tagged</span>
+    <span class="k">action</span>: <span class="s">findings.query</span>
+    <span class="k">with</span>: { <span class="k">q</span>: <span class="s">"tag:needs-poc severity&gt;=high"</span>, <span class="k">all</span>: <span class="v">true</span> }
+  - <span class="k">id</span>: <span class="s">poc</span>
+    <span class="k">agent</span>: <span class="s">poc-writer</span>
+    <span class="k">for_each</span>: <span class="v">"{{ (steps.tagged.output | fromjson).rows | tojson }}"</span>
+    <span class="k">max_parallel</span>: <span class="v">4</span>
+    <span class="k">prompt</span>: |
+      Write a proof of concept for finding {{ item.id }}: {{ item.title }}.</pre>
+    <p>The agent tool and MCP work only on the agent&rsquo;s own workspace, so they refuse <code class="inline">project:</code> and <code class="inline">workflow:</code>.</p>
+
+    <h2 id="tagging-findings">Tagging findings</h2>
+    <p>A finding can carry free-form tags (<code class="inline">needs-poc</code>, <code class="inline">class:sqli</code>, <code class="inline">status:triaged</code>) used to sort, filter and queue work. Tags never change a finding&rsquo;s report, severity or id.</p>
+    <ul>
+      <li><strong>Syntax.</strong> Trimmed and lowercased, then checked: <code class="inline">a-z</code>, <code class="inline">0-9</code> and <code class="inline">. _ : / -</code>, starting with a letter or digit, at most 64 characters (<code class="inline">Needs-POC</code> is stored as <code class="inline">needs-poc</code>). An invalid tag is rejected, never rewritten. <code class="inline">namespace:value</code> is a convention, not something rupu interprets.</li>
+      <li><strong>Cap.</strong> At most 32 tags per finding.</li>
+      <li><strong>Where they live.</strong> Tags a finding was declared with sit on its record in <code class="inline">findings.jsonl</code>. Every later add or remove is an event in one append-only file per workspace, <code class="inline">.rupu/coverage/finding_tags.jsonl</code>, folded on read in file order. Each event records who made it: an agent&rsquo;s run/agent/model, or an operator via the CLI or the control plane.</li>
+    </ul>
+
+    <h3>Who can tag</h3>
+    <table>
+      <thead><tr><th>Who</th><th>How</th></tr></thead>
+      <tbody>
+        <tr><td>Agents</td><td><code>report_finding</code> takes an optional <code>tags</code> array. <code>query_findings</code> and <code>tag_findings</code> are explicit <code>tools:</code> grants; <code>tag_findings</code> is allowed in <code>readonly</code> mode since it never touches workspace files. <code>query_findings</code> also returns <code>tags_in_use</code>, so agents reuse tags instead of inventing near-duplicates.</td></tr>
+        <tr><td>Workflow steps</td><td>MCP actions <code>findings.query</code> and <code>findings.tag</code>; <code>findings.record</code> accepts <code>tags</code>. These are for <code>action:</code> steps only; an agent is never offered them, even with <code>tools: ["*"]</code>.</td></tr>
+        <tr><td>Operators</td><td><code>rupu findings tag</code> / <code>tags</code>, or the control plane.</td></tr>
+      </tbody>
+    </table>
+    <pre class="code"><span class="k">rupu findings tag</span> fnd_01J&hellip; --add needs-poc --add class:sqli
+<span class="k">rupu findings tag</span> fnd_01J&hellip; --remove needs-poc
+<span class="k">rupu findings tags</span>                       <span class="c"># tags in use, with counts</span>
+<span class="k">rupu findings tags</span> severity:critical      <span class="c"># ...over the findings a query selects</span>
+
+<span class="c"># tag everything a query matches: a lone `-` reads ids from stdin</span>
+<span class="k">rupu findings list</span> --ids-only tag:class:sqli | <span class="k">rupu findings tag</span> - --add needs-poc</pre>
+    <pre class="code"><span class="c"># a workflow action step</span>
+- <span class="k">id</span>: <span class="s">mark</span>
+  <span class="k">action</span>: <span class="s">findings.tag</span>
+  <span class="k">with</span>: { <span class="k">finding_ids</span>: [<span class="s">"fnd_01J&hellip;"</span>], <span class="k">add</span>: [<span class="s">"needs-poc"</span>] }</pre>
+    <p><code class="inline">rupu findings tag</code> works across projects, atomically per workspace: an unknown id or a workspace that couldn&rsquo;t be changed makes it exit non-zero after the others have kept their changes. Tags added by a remote unit travel back in its coverage stream and are merged into the coordinator&rsquo;s tag log by event id.</p>
+
+    <h2>Exporting reports</h2>
+    <p>A stored finding exports as Markdown, self-contained HTML, or PDF &mdash; one finding, or a whole project. All three carry the same sections in the same order, and every field of the report.</p>
+    <pre class="code"><span class="k">rupu findings export</span> [--id &lt;fnd_&hellip;&gt;]&hellip; [--project &lt;ws_id|path&gt;] [--run &lt;run_id&gt;]
+                     [--severity &lt;critical|high|medium|low|info&gt;]
+                     [--owner &lt;name&gt;] [--cwe &lt;CWE-n&gt;] [--include-summaries]
+                     [--to md|html|pdf] [--split] [--title &lt;text&gt;] -o &lt;path&gt;</pre>
+    <p>The document format is <code class="inline">--to</code> (default <code class="inline">md</code>), not the global <code class="inline">--format</code>. Filters combine; <code class="inline">--severity</code> keeps that severity and worse; <code class="inline">--run</code> includes sub-runs. A single <code class="inline">--id</code> alone writes a stand-alone document; anything else writes a project report over the selection (title, summary, index, then one section per finding), or with <code class="inline">--split</code> a zip of <code class="inline">index.md</code> plus one file per finding. Summary-profile findings are left out unless you pass <code class="inline">--include-summaries</code>. <code class="inline">-o</code> may be an existing directory to receive the generated file name. Finding ids are unique within a project, not across projects: when a single <code class="inline">--id</code> exists in several, the export refuses and names them, and <code class="inline">--project</code> picks one.</p>
+    <pre class="code"><span class="c"># one finding as a PDF, into ./reports</span>
+<span class="k">rupu findings export</span> --id fnd_01J&hellip; --to pdf -o ./reports
+
+<span class="c"># everything high or worse in one project, as a single HTML report</span>
+<span class="k">rupu findings export</span> --project ~/src/notes-service --severity high --to html \
+  --title <span class="s">"Notes service assessment"</span> -o assessment.html
+
+<span class="c"># one file per finding plus an index, for one run</span>
+<span class="k">rupu findings export</span> --run run_01J&hellip; --to pdf --split -o run-findings.zip</pre>
+
+    <h3>Numbering</h3>
+    <p>Exports number findings within their project &mdash; by severity (critical first), then declaration time, then id &mdash; as <code class="inline">&lt;PREFIX&gt;-NNN</code> (<code class="inline">SEC-001</code>, <code class="inline">SEC-002</code>, &hellip;). Numbers are assigned before any filter applies, so a finding keeps its number whatever a report leaves out, and the CLI and the control plane agree. A number is a point-in-time display label: the <code class="inline">fnd_</code> id is the stable handle, and a project report&rsquo;s index lists both. Files are named <code class="inline">&lt;NUMBER&gt; - &lt;Short Title&gt;.&lt;ext&gt;</code>, e.g. <code class="inline">SEC-003 - SQL injection in the search endpoint.pdf</code>.</p>
+    <p>The prefix is <code class="inline">[findings].export_id_prefix</code> (default <code class="inline">SEC</code>), read from the <strong>global</strong> config only &mdash; a repo&rsquo;s <code class="inline">.rupu/config.toml</code> never changes it, since it ends up in file names and document text. It must match <code class="inline">^[A-Za-z][A-Za-z0-9_-]{0,15}$</code>; anything else is ignored with a warning.</p>
+
+    <h3>Formats</h3>
+    <table>
+      <thead><tr><th>Format</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>md</code></td><td>Plain Markdown. Report text is kept as Markdown but neutralised so it can&rsquo;t restructure the document (line-leading <code>&lt;</code> escaped, headings demoted, unclosed fences closed). <code>image</code> blocks are referenced by path.</td></tr>
+        <tr><td><code>html</code></td><td>One self-contained file with inline CSS; loads nothing from the network and runs no script, with a strict embedded CSP. Raw HTML in report text is neutralised. <code>image</code> blocks are inlined as <code>data:</code> URIs.</td></tr>
+        <tr><td><code>pdf</code></td><td>Rendered in-process with Typst &mdash; no headless browser, no external tools, bundled fonts (so no CJK or emoji glyphs). Behind the default-on <code>pdf</code> cargo feature.</td></tr>
+      </tbody>
+    </table>
+    <p>Only <code class="inline">image</code> blocks whose file is in this machine&rsquo;s store, is a raster image by its leading bytes, is at most 4 MiB and still matches its hash are embedded; anything else is shown by path, sha256 and size with a note. An export never fetches from another host.</p>
+
+    <h2>Importing older reports</h2>
+    <p>Findings recorded before the <code class="inline">full</code> profile existed are summary findings whose report was written separately as Markdown. <code class="inline">rupu findings import</code> attaches those reports to their findings &mdash; a one-time, best-effort migration aid, not an input path.</p>
+    <pre class="code"><span class="k">rupu findings import</span> &lt;PATH&gt;&hellip; [--id &lt;fnd_&hellip;&gt;] [--dry-run]</pre>
+    <ul>
+      <li><strong>Input.</strong> Report files, or directories searched recursively for <code class="inline">*.md</code>. It reads the layout <code class="inline">rupu findings export --to md</code> writes, and a plain-text layout of bare section headings and <code class="inline">Label: value</code> fields. Files that aren&rsquo;t reports (a README, an index) are skipped.</li>
+      <li><strong>Which finding.</strong> The id on the report&rsquo;s <code class="inline">Finding ID:</code> line (an id mentioned only in prose is never used); <code class="inline">--id</code> names it for a single file that has none.</li>
+      <li><strong>Result.</strong> The finding becomes full-profile. The report goes through the same validation as <code class="inline">report_finding</code> and attaches whole or not at all; a finding that already has a report is skipped. Nothing is invented: a missing field with a sentinel gets the sentinel, a missing required section fails the file.</li>
+      <li><strong>Safety.</strong> Each changed ledger is backed up byte-for-byte to <code class="inline">findings.jsonl.pre-import-&lt;UTC time&gt;</code> first, then replaced atomically under the ledger lock. <code class="inline">--dry-run</code> validates everything and prints <code class="inline">would attach</code> without writing anything.</li>
+    </ul>
+    <div class="callout"><strong>Note.</strong> Run an import when no agents are recording findings, and stop long-running processes started from an older rupu first (a session worker, <code class="inline">cp serve</code>). Once you&rsquo;ve checked the result, delete the backups &mdash; each is a full copy of the ledger.</div>
+
+    <h2>In the control plane</h2>
+    <p>The control-plane web UI (<code class="inline">rupu cp serve</code>) renders stored reports directly; no export step is needed to read one.</p>
+    <ul>
+      <li><strong>Report page</strong> (<code class="inline">/findings/:id</code>). A section rail (description, impact, location, root cause, call chain, evidence, PoC artifacts, replication steps, remediation, patch, CI/CD and regression commands, references, provenance), CWE and verification chips over a ledger of ownership and ratings, and a <strong>completeness meter</strong> <code class="inline">n/11</code> that lists the gaps (an <code class="inline">Unknown</code> or <code class="inline">Not Provided</code> counts as a gap). Each evidence claim carries a badge comparing the file hash at write time with the file now: <code class="inline">current</code>, <code class="inline">changed</code>, <code class="inline">missing</code> or <code class="inline">unknown</code>. Call-chain steps link into the project&rsquo;s Code tab, the patch renders as a diff, commands have copy buttons, and Markdown / HTML / PDF buttons export the finding. A summary-profile finding opens a compact page.</li>
+      <li><strong>Lists and triage.</strong> The global Findings page, a project&rsquo;s findings tab, coverage detail and a run&rsquo;s Findings tab show a Report column (<code class="inline">n/11</code> plus a PoC marker, or &ldquo;summary&rdquo;). Expanding a full-profile row shows a triage card &mdash; root cause, attack path, owner and product with unknowns flagged, completeness, verification status &mdash; with an &ldquo;Open full report&rdquo; link. An <strong>Export report</strong> button exports exactly the rows listed.</li>
+      <li><strong>Query bar.</strong> The Findings page takes the same query language: press <code class="inline">/</code> to focus it, get fuzzy suggestions for keys and values (with counts), and see an invalid query&rsquo;s error inline instead of stale results. The query lives in the URL, so <code class="inline">/findings?q=severity%3Ahigh%20tag%3Aneeds-poc</code> is a shareable link, and the severity tiles toggle <code class="inline">severity:&lt;x&gt;</code> in it.</li>
+      <li><strong>Findings in the code.</strong> A project&rsquo;s Code tab shows each finding inline, under the lines it&rsquo;s pinned to, like a review comment: severity, summary and rationale, with full-profile findings adding tabs for root cause, call chain, evidence, patch and repro. Several findings on one line stack. When the project&rsquo;s git remote is on <code class="inline">github.com</code>, <code class="inline">gitlab.com</code>, or a self-hosted host named by a <code class="inline">base_url</code> in the global config&rsquo;s <code class="inline">[scm.&lt;account&gt;]</code> tables (GitHub Enterprise, self-managed GitLab), a finding with a file path also gets a <strong>View on repository</strong> link to the file on the branch the project had checked out when rupu first registered it (<code class="inline">main</code> if unknown), anchored to the finding&rsquo;s line range (<code class="inline">#L40-L52</code> on GitHub, <code class="inline">#L40-52</code> on GitLab). The link isn&rsquo;t pinned to a commit: rupu doesn&rsquo;t record the commit a run worked on, so the lines can drift as that branch moves. The same <code class="inline">permalink</code> field is on finding rows from <code class="inline">GET /api/findings</code>; it&rsquo;s absent for unrecognized hosts and findings with no file.</li>
+      <li><strong>Structural search results.</strong> In a run&rsquo;s transcript, an <a class="link" href="/docs/agents.html#ast-grep"><code class="inline">ast_grep</code></a> call renders each match with its metavariable captures highlighted and listed. Click a match&rsquo;s <code class="inline">file:line:col</code> to open a line-numbered, syntax-highlighted <strong>source preview</strong> around it, or <strong>tree</strong> to open its <strong>syntax tree</strong>: a collapsible concrete-syntax-tree viewer with the matched node highlighted and its ancestors expanded (named nodes only, with a toggle for anonymous ones). Both read the file from the run&rsquo;s workspace as it is now, so they work for local runs; for a run on a remote host they say the preview isn&rsquo;t available.</li>
+      <li><strong>Tag editing.</strong> On a finding&rsquo;s page, tags show as removable chips with a <code class="inline">+ tag</code> input that suggests tags already in use, plus a collapsible tag history (who, when). On the Findings table, select rows and use <strong>Tag&hellip;</strong> / <strong>Untag&hellip;</strong> for bulk changes. Every change is recorded as an operator event, <code class="inline">via: cp</code>, in the same tag log the CLI writes, and lands only on the finding you selected, even when another project holds a finding with the same id. A project whose tag log can&rsquo;t be read shows its tags read-only.</li>
+    </ul>
+    <p>The same data is available over the API: <code class="inline">GET /api/findings?q=&hellip;</code> (slim rows plus <code class="inline">facets</code>; an invalid <code class="inline">q</code> is a 400 naming the token), <code class="inline">GET /api/findings/:id</code> (the full report with per-claim evidence status and tag history), <code class="inline">GET /api/findings/:id/artifacts/:sha256</code>, <code class="inline">GET /api/findings/:id/export?format=md|html|pdf</code>, <code class="inline">POST /api/findings/export</code>, and <code class="inline">GET</code>/<code class="inline">POST /api/findings/tags</code>. Because an id is unique only within its project, the per-finding routes take <code class="inline">?ws_id=</code>, and answer 409 naming the projects when an id is ambiguous without it; see the <a class="link" href="/docs/api.html#findings">HTTP API</a>.</p>
+
+    <div class="doc-nav">
+      <a href="/docs/coverage.html">&#8592; Coverage</a>
+      <a href="/docs/customers.html">Customers &#8594;</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>
