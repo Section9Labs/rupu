@@ -538,8 +538,8 @@ fn repo_to_issue_tracker(p: Platform) -> IssueTracker {
 /// id, not `"owner/repo"` — `issues_for` already treats a `None` repo as
 /// "only the explicit and sole-account tiers can resolve", which is
 /// correct for them (see `Registry::issues_for`'s doc). Delegates to
-/// the shared `rupu_scm::tracker_project_repo` — mirrors `rupu-mcp`'s
-/// `tools/issues.rs::project_repo` (Task 6 lifted the duplicated logic
+/// the shared `rupu_scm::tracker_project_repo` — mirrors `rupu-tools`'
+/// `issues::project_repo` (Task 6 lifted the duplicated logic
 /// when `Registry::events_for_source` needed a third copy).
 fn issue_ref_repo(issue_ref: &IssueRef) -> Option<RepoRef> {
     rupu_scm::tracker_project_repo(issue_ref.tracker, &issue_ref.project)

@@ -6,13 +6,17 @@
 
 mod ast_grep;
 mod bash;
+mod connector_dispatch;
 mod coverage_instrumentation;
 mod descriptors;
 mod edit_file;
+mod findings_record;
+mod findings_tags;
 mod glob;
 mod grant;
 mod grep;
 mod permission;
 mod read_file;
+mod support;
 mod tool_schemas;
 mod write_file;

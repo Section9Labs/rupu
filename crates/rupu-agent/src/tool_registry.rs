@@ -1,16 +1,13 @@
 //! Tool registry — the tools one run offers, keyed by canonical name.
 //!
 //! A run's registry is built from its resolved grant
-//! ([`rupu_tools::ResolvedGrant`]) and nothing else; [`tool_catalog`] is the
-//! catalog that grant is resolved against, and [`builtin_tool`] the bodies of
-//! the builtins. The model sees canonical names ([`ToolRegistry::to_tool_definitions`]);
-//! a call by a legacy alias (`report_finding` for `findings.report`) still
-//! resolves ([`ToolRegistry::resolve`]).
+//! ([`rupu_tools::ResolvedGrant`]) and nothing else, each body from
+//! `rupu_tools::bodies` (or an injected tool). The model sees canonical names
+//! ([`ToolRegistry::to_tool_definitions`]); a call by a legacy alias
+//! (`report_finding` for `findings.report`) still resolves
+//! ([`ToolRegistry::resolve`]).
 
-use rupu_tools::{
-    AliasScope, AstGrepTool, BashTool, DispatchAgentTool, DispatchAgentsParallelTool, EditFileTool,
-    GlobTool, GrepTool, ReadFileTool, Tool, ToolCatalog, WriteFileTool,
-};
+use rupu_tools::{AliasScope, Tool};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -99,32 +96,4 @@ impl Default for ToolRegistry {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// The catalog agent grants are resolved against: `rupu-tools`' catalog plus
-/// the MCP connector tools (`scm.*`, `issues.*`, `github.*`, `gitlab.*`),
-/// whose descriptors are built from `rupu-mcp` until W4 moves them in. This
-/// is the name universe an agent's `tools:` is validated against.
-pub fn tool_catalog() -> ToolCatalog {
-    ToolCatalog::builtin().with(crate::mcp_tool::connector_descriptors())
-}
-
-/// The body of the builtin tool with canonical name `name` (the core
-/// fs/shell tools and the sub-agent dispatch pair), or `None` for any other
-/// name. The dispatch pair works only in a run with a dispatcher; the caller
-/// decides whether the run has one.
-pub fn builtin_tool(name: &str) -> Option<Arc<dyn Tool>> {
-    let t: Arc<dyn Tool> = match name {
-        "bash" => Arc::new(BashTool),
-        "read_file" => Arc::new(ReadFileTool),
-        "write_file" => Arc::new(WriteFileTool),
-        "edit_file" => Arc::new(EditFileTool),
-        "grep" => Arc::new(GrepTool),
-        "glob" => Arc::new(GlobTool),
-        "ast_grep" => Arc::new(AstGrepTool),
-        "dispatch_agent" => Arc::new(DispatchAgentTool),
-        "dispatch_agents_parallel" => Arc::new(DispatchAgentsParallelTool),
-        _ => return None,
-    };
-    Some(t)
 }

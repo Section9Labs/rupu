@@ -1,4 +1,4 @@
-//! Arc 2 Task 5: proves `rupu-mcp` tool dispatch actually routes to the
+//! Arc 2 Task 5: proves connector tool dispatch actually routes to the
 //! account the rule engine selects, not merely that the call succeeds.
 //!
 //! Each fake `RepoConnector` below is tagged with a distinct
@@ -12,8 +12,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::support::{scm_ctx, Caller};
 use async_trait::async_trait;
-use rupu_mcp::{McpPermission, ToolDispatcher};
 use rupu_scm::rules::Rule;
 use rupu_scm::{
     AccountId, Branch, Comment, CreateIssue, CreatePr, Diff, FileContent, Issue, IssueConnector,
@@ -288,7 +288,7 @@ async fn owner_rule_routes_scm_repos_get_to_the_matching_account() {
         path: None,
         account: AccountId::new("gh-work"),
     }]);
-    let dispatcher = ToolDispatcher::new(Arc::new(reg), McpPermission::allow_all());
+    let dispatcher = Caller::new(scm_ctx(reg));
 
     let result = dispatcher
         .call(
@@ -326,7 +326,7 @@ async fn explicit_account_argument_overrides_the_owner_rule() {
         path: None,
         account: AccountId::new("gh-personal"),
     }]);
-    let dispatcher = ToolDispatcher::new(Arc::new(reg), McpPermission::allow_all());
+    let dispatcher = Caller::new(scm_ctx(reg));
 
     let result = dispatcher
         .call(
@@ -351,7 +351,7 @@ async fn explicit_account_argument_overrides_the_owner_rule() {
 #[tokio::test]
 async fn unknown_explicit_account_errors_rather_than_falling_back() {
     let reg = two_github_accounts_repo_registry();
-    let dispatcher = ToolDispatcher::new(Arc::new(reg), McpPermission::allow_all());
+    let dispatcher = Caller::new(scm_ctx(reg));
 
     let err = dispatcher
         .call(
@@ -376,7 +376,7 @@ async fn unknown_explicit_account_errors_rather_than_falling_back() {
 #[tokio::test]
 async fn scm_repos_list_fans_out_and_tags_each_row_with_its_account() {
     let reg = two_github_accounts_repo_registry();
-    let dispatcher = ToolDispatcher::new(Arc::new(reg), McpPermission::allow_all());
+    let dispatcher = Caller::new(scm_ctx(reg));
 
     let result = dispatcher
         .call("scm.repos.list", serde_json::json!({"platform": "github"}))
@@ -434,7 +434,7 @@ async fn two_github_accounts_route_issues_list_by_owner_rule() {
         path: None,
         account: AccountId::new("gh-work"),
     }]);
-    let dispatcher = ToolDispatcher::new(Arc::new(reg), McpPermission::allow_all());
+    let dispatcher = Caller::new(scm_ctx(reg));
 
     let result = dispatcher
         .call(
@@ -476,7 +476,7 @@ async fn scm_repos_list_skips_a_failing_account_and_still_returns_the_others() {
             branch_tag: "work-default-branch",
         }),
     );
-    let dispatcher = ToolDispatcher::new(Arc::new(reg), McpPermission::allow_all());
+    let dispatcher = Caller::new(scm_ctx(reg));
 
     let result = dispatcher
         .call("scm.repos.list", serde_json::json!({"platform": "github"}))
@@ -511,7 +511,7 @@ async fn scm_repos_list_errors_when_every_account_fails() {
         Platform::Github,
         Arc::new(FailingRepoConnector),
     );
-    let dispatcher = ToolDispatcher::new(Arc::new(reg), McpPermission::allow_all());
+    let dispatcher = Caller::new(scm_ctx(reg));
 
     let err = dispatcher
         .call("scm.repos.list", serde_json::json!({"platform": "github"}))
@@ -539,7 +539,7 @@ async fn scm_repos_list_rejects_an_account_of_the_wrong_platform() {
             platform: Platform::Gitlab,
         }),
     );
-    let dispatcher = ToolDispatcher::new(Arc::new(reg), McpPermission::allow_all());
+    let dispatcher = Caller::new(scm_ctx(reg));
 
     let err = dispatcher
         .call(
@@ -569,7 +569,7 @@ async fn scm_repos_list_account_alone_resolves_without_a_platform_argument() {
             platform: Platform::Gitlab,
         }),
     );
-    let dispatcher = ToolDispatcher::new(Arc::new(reg), McpPermission::allow_all());
+    let dispatcher = Caller::new(scm_ctx(reg));
 
     dispatcher
         .call(
@@ -590,7 +590,7 @@ async fn scm_repos_list_unknown_account_names_the_configured_candidates() {
     // configured candidates an agent could retry with), not a bare
     // `InvalidArgs("no such account: ...")` with no candidate list.
     let reg = two_github_accounts_repo_registry();
-    let dispatcher = ToolDispatcher::new(Arc::new(reg), McpPermission::allow_all());
+    let dispatcher = Caller::new(scm_ctx(reg));
 
     let err = dispatcher
         .call(
@@ -626,7 +626,7 @@ async fn single_account_and_no_rules_still_resolves_without_an_account_argument(
             branch_tag: "only-account-branch",
         }),
     );
-    let dispatcher = ToolDispatcher::new(Arc::new(reg), McpPermission::allow_all());
+    let dispatcher = Caller::new(scm_ctx(reg));
 
     let result = dispatcher
         .call(

@@ -18,6 +18,7 @@ mod distributed_fanout_e2e;
 mod executor_file_tail;
 mod executor_in_process;
 mod final_step_output;
+mod findings_single_impl;
 mod gate_node;
 mod gate_sweep_smoke;
 mod linear_runner;

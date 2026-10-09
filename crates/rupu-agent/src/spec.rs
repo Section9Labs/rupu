@@ -284,7 +284,7 @@ impl AgentSpec {
     /// is an error with a did-you-mean, never a silently missing tool.
     pub fn validate_tools(&self) -> Result<(), rupu_tools::GrantError> {
         match &self.tools {
-            Some(tools) => crate::tool_registry::tool_catalog().validate_names(tools),
+            Some(tools) => rupu_tools::ToolCatalog::builtin().validate_names(tools),
             None => Ok(()),
         }
     }

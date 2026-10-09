@@ -14,14 +14,10 @@ pub mod continuation;
 // Pre-turn collector pipeline: TurnCollector port + data-never-authority
 // injection wrapper (agentiflows plan 1, Part B).
 pub mod collector;
-// Task 18: coverage tool wrappers (injected when concerns: is present)
-pub mod coverage_tools;
 // Open-file limit management + agent-run admission pacing.
 pub mod fd_budget;
 // implemented in Task 3
 pub mod loader;
-// Tasks 17+18: MCP tool adapter + runner wiring
-pub mod mcp_tool;
 // Classifies every reply and provider error into an outcome (response-outcomes plan 2).
 pub mod outcome;
 // implemented in Task 4
@@ -60,4 +56,4 @@ pub use runner::{
 };
 pub use rupu_providers::types::StopReason;
 pub use spec::{AgentSpec, AgentSpecParseError};
-pub use tool_registry::{builtin_tool, tool_catalog, ToolRegistry};
+pub use tool_registry::ToolRegistry;

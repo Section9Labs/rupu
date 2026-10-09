@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 ///
 /// This enum is a claim about what the subsystem can capture, so it lists
 /// only egress that can actually occur. `Mcp` and `Webhook` were removed
-/// deliberately: `rupu-mcp` makes no outbound HTTP (it dispatches into
-/// `rupu-scm`'s connectors, which tag their own calls `Scm`), and
+/// deliberately: the MCP server makes no outbound HTTP of its own (its
+/// connector tools dispatch into `rupu-scm`'s connectors, which tag their own calls `Scm`), and
 /// `rupu-webhook` is an inbound server. A variant nothing can construct
 /// is a promise of coverage that does not exist. `Subprocess` IS present
 /// and CAN occur — it is emitted by the subprocess-capture backend (spec
@@ -95,7 +95,7 @@ mod tests {
     fn origin_enumerates_only_egress_that_can_occur() {
         // The enum is a claim about what this subsystem can capture.
         // `Mcp` and `Webhook` were removed because neither crate makes
-        // outbound HTTP: rupu-mcp dispatches into rupu-scm's connectors
+        // outbound HTTP: the MCP server's tools dispatch into rupu-scm's connectors
         // (already tagged Scm), and rupu-webhook is an inbound server.
         // A variant that can never be constructed is a false claim.
         for json in [

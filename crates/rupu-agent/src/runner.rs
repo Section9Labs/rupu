@@ -5,18 +5,15 @@
 //! and `rupu-transcript`. The CLI (Plan 2 Phase 3) calls [`run_agent`]
 //! once per `rupu run` invocation.
 
-use crate::coverage_tools::LedgerTools;
-use crate::mcp_tool::McpToolAdapter;
 use crate::outcome::OutcomeClass;
 use crate::recovery::Rung0;
-use crate::tool_registry::{builtin_tool, tool_catalog, ToolRegistry};
+use crate::tool_registry::ToolRegistry;
 use async_trait::async_trait;
 use chrono::Utc;
 use rupu_coverage::{
-    flatten, render_prompt_section, target_id, write_snapshot, CoveragePaths, CoverageWriterHandle,
-    FlatCatalog, DEFAULT_FULL_MODE_THRESHOLD,
+    flatten, render_prompt_section, write_snapshot, CoverageWriterHandle, FlatCatalog,
+    DEFAULT_FULL_MODE_THRESHOLD,
 };
-use rupu_mcp::{McpPermission, ServeHandle};
 use rupu_providers::overflow::{context_overflow_of, output_cap_overflow_of};
 use rupu_providers::provider::LlmProvider;
 use rupu_providers::reply_error::ApiErrorBody;
@@ -35,25 +32,13 @@ use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
 
-/// Coverage bundle built from a `concerns:` block. Holds catalog, paths,
-/// and prompt section for use across the run. The `CoverageWriterHandle`
-/// is stored separately so it can be consumed (shutdown) at each exit point.
+/// Coverage bundle built from a `concerns:` block: the flattened catalog
+/// (which the `coverage.*` tools read from the tool context) and its prompt
+/// section. The `CoverageWriterHandle` is stored separately so it can be
+/// consumed (shutdown) at each exit point.
 struct CoverageBundle {
-    catalog: FlatCatalog,
-    paths: CoveragePaths,
+    catalog: Arc<FlatCatalog>,
     prompt_section: String,
-}
-
-/// The run stream for records written under `scope`, when `rupu run` asked
-/// for one (see `ToolServices::coverage_stream`).
-fn run_stream_for(ctx: &ToolContext, scope: &str) -> Option<rupu_coverage::RunStream> {
-    ctx.services
-        .coverage_stream
-        .clone()
-        .map(|path| rupu_coverage::RunStream {
-            path,
-            scope_name: scope.to_string(),
-        })
 }
 
 const MAX_TOOL_RESULT_BYTES: usize = 256 * 1024;
@@ -1920,9 +1905,8 @@ async fn run_agent_inner(
             let catalog = flatten(&block)
                 .map_err(|e| RunError::Coverage(format!("flatten coverage catalog: {e}")))?;
             let resolved_scope = opts.id.scope();
-            let target = target_id(opts.workspace_path(), resolved_scope);
-            let paths = CoveragePaths::new(opts.workspace_path(), &target)
-                .with_run_stream(run_stream_for(&opts.tool_context, resolved_scope));
+            // The ledger every coverage/findings tool of this run writes.
+            let paths = rupu_tools::ledger::paths(&opts.tool_context);
             paths
                 .ensure_dir()
                 .map_err(|e| RunError::Coverage(format!("ensure coverage dir: {e}")))?;
@@ -1958,8 +1942,7 @@ async fn run_agent_inner(
                 .map_err(|e| RunError::Coverage(format!("spawn coverage writer: {e}")))?;
             let prompt_section = render_prompt_section(&catalog, DEFAULT_FULL_MODE_THRESHOLD);
             let bundle = CoverageBundle {
-                catalog,
-                paths,
+                catalog: Arc::new(catalog),
                 prompt_section,
             };
             (Some(bundle), Some(handle))
@@ -1971,74 +1954,25 @@ async fn run_agent_inner(
     if let Some(bundle) = &coverage {
         opts.system_prompt.push_str("\n\n");
         opts.system_prompt.push_str(&bundle.prompt_section);
+        // The `coverage.*` tools read the concern catalog from the context.
+        opts.tool_context.services.coverage_catalog = Some(bundle.catalog.clone());
     }
 
-    // Findings contract for this run. Resolved before `RunStart` is written
-    // so the guidance is part of the recorded system prompt.
-    // The run's tool registry: one loop over the grant. Each entry takes its
-    // body from the one place that provides it today — an injected tool, a
-    // builtin, the ledger tools, or the MCP connector adapter (W4/W5 fold
-    // these into `ToolCatalog`).
-    let ledger = if grant.entries.values().any(|e| {
+    // The ledger the findings/coverage tools write: ensured once, up front,
+    // so a run's first record never races its directory.
+    if grant.entries.values().any(|e| {
         let n = e.descriptor.needs;
         n.contains(&Service::Findings) || n.contains(&Service::Coverage)
-    }) {
-        // A concerns agent's ledger is the bundle's own (same scope, target
-        // id and run stream, directory already ensured); otherwise it is
-        // built here the same way.
-        let scope = opts.id.scope();
-        let paths = match coverage.as_ref() {
-            Some(bundle) => bundle.paths.clone(),
-            None => {
-                let target = target_id(opts.workspace_path(), scope);
-                let paths = CoveragePaths::new(opts.workspace_path(), &target)
-                    .with_run_stream(run_stream_for(&opts.tool_context, scope));
-                paths
-                    .ensure_dir()
-                    .map_err(|e| RunError::Coverage(format!("ensure findings dir: {e}")))?;
-                paths
-            }
-        };
-        Some(LedgerTools {
-            paths,
-            catalog: coverage.as_ref().map(|b| Arc::new(b.catalog.clone())),
-            findings: findings_opts.clone(),
-            workspace: opts.workspace_path().to_path_buf(),
-            tag_log: rupu_coverage::TagLog::for_workspace(opts.workspace_path())
-                .with_run_stream(run_stream_for(&opts.tool_context, scope)),
-        })
-    } else {
-        None
-    };
-
-    // MCP server: spin up before the loop if we have a Registry. Its
-    // dispatcher's allowlist is exactly the connector tools the grant
-    // offers, so the two gates can't disagree.
-    let mcp_guard: Option<(rupu_mcp::InProcessTransport, ServeHandle)>;
-    let mcp_dispatcher: Option<Arc<rupu_mcp::ToolDispatcher>>;
-    match opts.tool_context.services.scm.clone() {
-        Some(scm_registry) => {
-            let allowlist = grant
-                .entries
-                .values()
-                .filter(|e| e.descriptor.is_connector())
-                .map(|e| e.canonical.to_string())
-                .collect();
-            let permission = McpPermission::new(opts.permission.mode(), allowlist);
-            let (transport, handle) =
-                rupu_mcp::serve_in_process(scm_registry.clone(), permission.clone());
-            mcp_dispatcher = Some(Arc::new(rupu_mcp::ToolDispatcher::new(
-                scm_registry,
-                permission,
-            )));
-            mcp_guard = Some((transport, handle));
-        }
-        None => {
-            mcp_dispatcher = None;
-            mcp_guard = None;
-        }
+    }) && coverage.is_none()
+    {
+        rupu_tools::ledger::paths(&opts.tool_context)
+            .ensure_dir()
+            .map_err(|e| RunError::Coverage(format!("ensure findings dir: {e}")))?;
     }
 
+    // The run's tool registry: one loop over the grant. Each entry takes its
+    // body from an injected tool or the catalog (`rupu_tools::bodies`); the
+    // agentiflow tools reach a run only injected until W5.
     let mut registry = ToolRegistry::with_alias_scope(opts.alias_scope);
     for entry in grant.entries.values() {
         let name = entry.canonical;
@@ -2047,23 +1981,15 @@ async fn run_agent_inner(
             .iter()
             .find(|t| t.name() == name)
             .cloned()
-            .or_else(|| builtin_tool(name))
-            .or_else(|| ledger.as_ref().and_then(|l| l.instantiate(name)))
-            .or_else(|| {
-                let d = mcp_dispatcher.as_ref()?;
-                McpToolAdapter::new(name, d.clone()).map(|a| Arc::new(a) as Arc<dyn Tool>)
-            });
+            .or_else(|| rupu_tools::bodies::body(name, &opts.tool_context));
         match body {
             Some(t) => registry.insert(t),
             None => {
                 // The grant offered a tool whose services this run
                 // provides, yet nothing here can build it: the service
-                // accounting in `run_services` is wrong. Fail before the run
-                // starts rather than drop a tool the grant says it offers.
-                if let Some((transport, handle)) = mcp_guard {
-                    drop(transport);
-                    let _ = handle.join.await;
-                }
+                // accounting in `ToolServices::provided` is wrong. Fail
+                // before the run starts rather than drop a tool the grant
+                // says it offers.
                 if let Some(h) = coverage_handle {
                     h.shutdown().await;
                 }
@@ -2074,7 +2000,9 @@ async fn run_agent_inner(
         }
     }
 
-    if grant.offers(rupu_tools::catalog::findings::FINDINGS_REPORT.name) {
+    // Findings contract for this run. Resolved before `RunStart` is written
+    // so the guidance is part of the recorded system prompt.
+    if grant.offers(rupu_tools::findings::report::DESCRIPTOR.name) {
         if let Some(g) = rupu_coverage::report::guidance(&findings_opts) {
             opts.system_prompt.push_str("\n\n");
             opts.system_prompt.push_str(&g);
@@ -2999,7 +2927,7 @@ async fn run_agent_inner(
                             duration_ms: 0,
                             structured: None,
                         })?;
-                        let canonical = tool_catalog()
+                        let canonical = rupu_tools::ToolCatalog::builtin()
                             .resolve_name(&tool_name, opts.alias_scope)
                             .map(|d| d.name);
                         writer.write(&tool_audit(
@@ -3463,13 +3391,6 @@ async fn run_agent_inner(
             outcome: run_outcome.clone(),
         })?;
         writer.flush()?;
-
-        // Drop the MCP transport so the server's recv() returns None and exits.
-        // Then await its JoinHandle for deterministic shutdown.
-        if let Some((transport, handle)) = mcp_guard {
-            drop(transport);
-            let _ = handle.join.await;
-        }
 
         Ok(RunResult {
             status: result_status,
@@ -4220,16 +4141,13 @@ mod on_tool_call_tests {
 
     #[tokio::test]
     async fn readonly_mode_mcp_write_denial_fires_on_tool_call_with_blocked_true() {
-        // Regression (tool_audit CRITICAL 1): the mode check (readonly
-        // blocks write tools) lives INSIDE `McpToolAdapter::invoke` ->
-        // `ToolDispatcher::call` -> `McpPermission::check`, not in the
-        // registry-lookup fast path `denied_tool_call_...` above covers.
-        // `issues.create` IS in the registry (agent_tools: None ->
-        // unrestricted -> every catalog tool registered), so this call
-        // reaches `tool.invoke`, and readonly mode denies it there. Before
-        // the fix, `on_tool_call` fired BEFORE `invoke` with a hardcoded
-        // `blocked: false` — a false negative in the audit trail for
-        // exactly this case. It must now report `blocked: true`.
+        // Regression (tool_audit CRITICAL 1): `issues.create` IS in the
+        // registry (agent_tools: None -> the default grant, every connector
+        // tool), so this call is not the registry-lookup denial
+        // `denied_tool_call_...` above covers: the permission policy denies
+        // it on its `external` effect. Before the fix, `on_tool_call` fired
+        // with a hardcoded `blocked: false` — a false negative in the audit
+        // trail for exactly this case. It must report `blocked: true`.
         let calls: Arc<Mutex<Vec<(String, String, bool)>>> = Arc::new(Mutex::new(Vec::new()));
         let calls_clone = calls.clone();
         let cb: OnToolCallCallback =

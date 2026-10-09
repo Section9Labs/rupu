@@ -9,8 +9,26 @@ describe('tools API', () => {
       new Response(
         JSON.stringify({
           tools: [
-            { name: 'scm.prs.create', description: 'Open a PR', input_schema: {}, kind: 'write' },
-            { name: 'scm.repos.list', description: 'List repos', input_schema: {}, kind: 'read' },
+            {
+              name: 'scm.prs.create',
+              aliases: [],
+              namespace: 'scm',
+              effect: 'external',
+              needs: ['scm'],
+              description: 'Open a PR',
+              input_schema: {},
+              action_eligible: true,
+            },
+            {
+              name: 'bash',
+              aliases: [],
+              namespace: 'core',
+              effect: 'write',
+              needs: [],
+              description: 'Run a command',
+              input_schema: {},
+              action_eligible: false,
+            },
           ],
         }),
       ),
@@ -20,7 +38,7 @@ describe('tools API', () => {
 
     expect(fetchMock.mock.calls[0][0]).toBe('/api/tools');
     expect(tools).toHaveLength(2);
-    expect(tools.find((t) => t.name === 'scm.prs.create')?.kind).toBe('write');
-    expect(tools.find((t) => t.name === 'scm.repos.list')?.kind).toBe('read');
+    expect(tools.find((t) => t.name === 'scm.prs.create')?.effect).toBe('external');
+    expect(tools.find((t) => t.name === 'bash')?.action_eligible).toBe(false);
   });
 });

@@ -351,7 +351,7 @@ pub enum RunWorkflowError {
     Action {
         step: String,
         #[source]
-        source: rupu_mcp::McpError,
+        source: ActionError,
     },
     #[error("run step `{step}` refused: {reason}")]
     RunStepDenied { step: String, reason: String },
@@ -399,9 +399,9 @@ pub enum RunWorkflowError {
     )]
     PauseWithWorkspaceSync,
     #[error(
-        "action step `{step}` requires runtime wiring — this entry point does not provide an SCM dispatcher"
+        "action step `{step}` requires runtime wiring — this entry point does not provide action services"
     )]
-    ActionDispatcherMissing { step: String },
+    ActionServicesMissing { step: String },
     #[error("scheduler: a dispatched node task panicked or was cancelled: {0}")]
     SchedulerTaskJoin(#[from] tokio::task::JoinError),
     #[error(
@@ -434,6 +434,30 @@ impl RunWorkflowError {
             _ => None,
         }
     }
+}
+
+/// Why an `action:` step's tool call failed.
+#[derive(Debug, Error)]
+pub enum ActionError {
+    /// The run's permission mode refused the call: the tool never ran.
+    #[error("permission denied for tool {tool}: {reason}")]
+    Denied { tool: String, reason: String },
+    /// The tool ran and failed (a connector error, a refused finding, …),
+    /// or the run can't provide what it needs.
+    #[error("{0}")]
+    Failed(String),
+}
+
+/// What an `action:` step's tool runs with (spec W4 §3.3): the tool context
+/// every action call of the run shares — the workflow run's identity (no
+/// agent: an action step is not one), its workspace, and the services an
+/// action step provides (`rupu_tools::ACTION_SERVICES`: the SCM registry and
+/// the findings options) — and the run's permission mode, which decides each
+/// call from the tool's effect exactly as for an agent step.
+#[derive(Clone, Debug)]
+pub struct ActionServices {
+    pub context: rupu_tools::ToolContext,
+    pub mode: rupu_tools::PermissionMode,
 }
 
 /// One agent run a workflow asks its [`StepFactory`] for: a step, or one
@@ -689,15 +713,14 @@ pub struct OrchestratorRunOpts {
     /// pause only at the step boundary — mid-unit fan-out pause/resume is not
     /// supported in v1 (same class of limitation as `workspace: sync`).
     pub pause: Option<CancellationToken>,
-    /// In-process MCP tool dispatcher for `action:` steps (spec §3.2). When
-    /// `Some`, a workflow's `action:` steps execute for real by calling the
-    /// dispatcher with the step's `with:` values (template-rendered first).
-    /// `None` ⇒ any `action:` step fails loudly with
-    /// [`RunWorkflowError::ActionDispatcherMissing`] — this entry point does
-    /// not provide an SCM dispatcher (e.g. a test harness that never
-    /// constructs one). Plan 2 wires this from `rupu-cli`; Plan 4's notify
-    /// hooks reuse the same [`execute_action_step`] helper this drives.
-    pub action_dispatcher: Option<Arc<rupu_mcp::ToolDispatcher>>,
+    /// What `action:` steps call their catalog tool with (spec W4 §3.3).
+    /// When `Some`, a workflow's `action:` steps execute for real with the
+    /// step's `with:` values (template-rendered first). `None` ⇒ any
+    /// `action:` step fails loudly with
+    /// [`RunWorkflowError::ActionServicesMissing`] (e.g. a test harness that
+    /// never constructs them). Gate `notify:` hooks and `on_reject` cleanup
+    /// steps reuse the same [`execute_action_step`].
+    pub action_services: Option<ActionServices>,
     /// Codename assignment for this run. `None` ⇒ `run_workflow` builds one;
     /// callers that also own a sub-agent dispatcher pass theirs so both share
     /// one `CrewNamer`.
@@ -5916,13 +5939,13 @@ async fn run_node(
         )
         .await
     } else if step.action.is_some() {
-        // Action steps never pause mid-run — a single dispatcher call is
+        // Action steps never pause mid-run — a single tool call is
         // either fast enough to run to completion or fails outright; no
         // cooperative-pause checkpoint shape exists for it.
-        match opts.action_dispatcher.as_ref() {
-            Some(dispatcher) => {
+        match opts.action_services.as_ref() {
+            Some(services) => {
                 execute_action_step(
-                    dispatcher,
+                    services,
                     step,
                     ctx,
                     render_mode(opts.strict_templates),
@@ -5932,7 +5955,7 @@ async fn run_node(
                 )
                 .await
             }
-            None => Err(RunWorkflowError::ActionDispatcherMissing {
+            None => Err(RunWorkflowError::ActionServicesMissing {
                 step: step.id.clone(),
             }),
         }
@@ -6197,11 +6220,10 @@ fn render_action_args(
         Some(other) => return walk(other, ctx, mode),
     };
 
-    let props: Option<serde_json::Map<String, serde_json::Value>> = rupu_mcp::tools::tool_catalog()
-        .into_iter()
-        .find(|spec| spec.name == tool)
-        .and_then(|spec| spec.input_schema.get("properties").cloned())
-        .and_then(|p| p.as_object().cloned());
+    let props: Option<serde_json::Map<String, serde_json::Value>> =
+        crate::workflow::action_tool(tool)
+            .and_then(|d| (d.input_schema)().get("properties").cloned())
+            .and_then(|p| p.as_object().cloned());
 
     let mut out = serde_json::Map::with_capacity(with_map.len());
     for (key, val) in with_map {
@@ -6350,9 +6372,9 @@ fn render_action_leaf(
     }
 }
 
-/// Execute one `action:` step through the in-process MCP dispatcher: render
-/// `with:` against `ctx`, call `dispatcher.call(tool, args)`, and package the
-/// outcome into a `StepResult` (kind `Action`).
+/// Execute one `action:` step through the tool catalog: render `with:`
+/// against `ctx`, call the step's tool ([`call_action_tool`]), and package
+/// the outcome into a `StepResult` (kind `Action`).
 ///
 /// Shared by the main step loop and the `on_reject` cleanup mirror
 /// (`run_reject_cleanup`) — and, per Plan 4's design, will also be the call
@@ -6362,7 +6384,7 @@ fn render_action_leaf(
 /// `StepResult` — this function only does the render + dispatch + package.
 ///
 /// `continue_on_error` mirrors the linear step's failure handling exactly:
-/// a dispatcher error becomes `Ok(StepResult { success: false, .. })` when
+/// a tool error becomes `Ok(StepResult { success: false, .. })` when
 /// `true`, or `Err(RunWorkflowError::Action)` when `false`. A `with:`
 /// template-render failure always propagates as `Err` regardless of
 /// `continue_on_error` — same as every other step shape's render failures,
@@ -6375,7 +6397,7 @@ fn render_action_leaf(
 /// today with no production writer yet) followed by an `Event::ToolAudit`
 /// record (spec §4a/§4b's catalog-call audit trail — `ToolAudit`, NOT
 /// `ActionEmitted`, is what the CP transcript panel actually renders a
-/// badge from). `allowed` is `false` only for a `McpError::PermissionDenied`
+/// badge from). `allowed` is `false` only for an [`ActionError::Denied`]
 /// (the call never reached the connector); any other dispatch error still
 /// reached the connector, so `allowed: true, applied: false`. Both lines
 /// are written once, after the dispatch call resolves and before the
@@ -6622,7 +6644,7 @@ fn write_run_step_transcript(
 }
 
 async fn execute_action_step(
-    dispatcher: &rupu_mcp::ToolDispatcher,
+    services: &ActionServices,
     step: &Step,
     ctx: &StepContext,
     mode: RenderMode,
@@ -6630,8 +6652,8 @@ async fn execute_action_step(
     transcript_dir: &Path,
     // The profile a `findings.record` call records under — this step's
     // `findings_profile`, else `defaults.findings_profile`, else `full`
-    // (`Workflow::action_findings_profile`). The dispatcher is built once
-    // per run, so the per-step value travels with the call.
+    // (`Workflow::action_findings_profile`). The action services are built
+    // once per run, so the per-step value travels with the call.
     findings_profile: rupu_coverage::FindingProfile,
 ) -> Result<StepResult, RunWorkflowError> {
     let tool = step
@@ -6646,36 +6668,20 @@ async fn execute_action_step(
     })?;
 
     let transcript_path = transcript_dir.join(format!("run_{}.jsonl", Ulid::new()));
-    // ISSUES.md I-79: narrow the run-scoped dispatcher to exactly this
-    // step's tool before dispatching. The dispatcher is built once per run
-    // with a `["*"]` allowlist (the tool is per-step and unknown at
-    // construction), and today nothing can reach it with any other tool —
-    // but that safety rests on an invariant enforced three modules away.
-    // Narrowing here makes it structural: even if a future caller reuses
-    // this dispatcher, an action step can still only invoke the tool named
-    // in the workflow source.
-    let call_result = dispatcher
-        .narrowed_to(tool)
-        .call_with_findings_profile(tool, args.clone(), findings_profile)
-        .await;
+    let call_result = call_action_tool(services, tool, args.clone(), findings_profile).await;
 
     let (allowed, applied, reason) = match &call_result {
         Ok(_) => (true, true, None),
-        Err(rupu_mcp::McpError::PermissionDenied { reason, .. }) => {
-            (false, false, Some(reason.clone()))
-        }
+        Err(ActionError::Denied { reason, .. }) => (false, false, Some(reason.clone())),
         Err(e) => (true, false, Some(e.to_string())),
     };
-    // `blocked` reuses `ToolDispatcher::is_blocked` (rupu-mcp) rather than
-    // re-deriving it from `allowed` — the SAME classifier the agent-tool-call
-    // audit path would use if action nodes had an agent grant to check.
     // An action node's tool is always explicit (it IS `step.action`), so
-    // `declared`/`granted` are always `true` here — there is no separate
-    // allowlist to narrow against. `restricted` is `false`: it means "the
-    // step had a non-empty `actions:` list", and T1's `ActionsOnActionStep`
-    // validation already forbids a non-empty `actions:` on an action step,
-    // so `true` here would contradict its own definition.
-    let tool_audit_blocked = rupu_mcp::ToolDispatcher::is_blocked(&call_result);
+    // `declared`/`granted` are always `true` here — its grant is that one
+    // tool. `restricted` is `false`: it means "the step had a non-empty
+    // `actions:` list", and `ActionsOnActionStep` validation already forbids
+    // a non-empty `actions:` on an action step, so `true` here would
+    // contradict its own definition.
+    let tool_audit_blocked = matches!(call_result, Err(ActionError::Denied { .. }));
     match JsonlWriter::create(&transcript_path) {
         Ok(mut writer) => {
             if let Err(e) = writer.write(&Event::ActionEmitted {
@@ -6747,12 +6753,78 @@ async fn execute_action_step(
     }
 }
 
+/// Call the catalog tool an `action:` step names (spec W4 §3.3): resolve
+/// the name (a legacy alias such as `findings.record` too), check it is one
+/// an action step may call, resolve its one-tool grant over the services the
+/// run's action context provides (honest absence: a tool whose service is
+/// missing is refused with the grant's `tool_unavailable` message), build its
+/// body and call it under the run's mode — the same `rupu_tools::call` path
+/// `rupu mcp serve` uses.
+pub async fn call_action_tool(
+    services: &ActionServices,
+    tool: &str,
+    args: serde_json::Value,
+    findings_profile: rupu_coverage::FindingProfile,
+) -> Result<String, ActionError> {
+    use rupu_tools::call::{call, CallOutcome};
+    let Some(d) = crate::workflow::action_tool(tool) else {
+        return Err(ActionError::Failed(format!("unknown tool: {tool}")));
+    };
+    // Parse-time validation refuses an ineligible tool; a step that skipped
+    // parsing (a direct call) is refused here too.
+    if !d.is_action_eligible() {
+        return Err(ActionError::Failed(format!(
+            "`{tool}` can't be called by an `action:` step"
+        )));
+    }
+    let mut ctx = services.context.clone();
+    ctx.services
+        .findings
+        .get_or_insert_with(Default::default)
+        .profile = findings_profile;
+    let declared = [d.name.to_string()];
+    let grant = rupu_tools::ToolCatalog::builtin()
+        .resolve_grant(rupu_tools::GrantInputs {
+            declared: Some(&declared),
+            step_actions: &[],
+            ambient: &[],
+            available: &ctx.services.provided(false),
+            alias_scope: rupu_tools::AliasScope::Everywhere,
+        })
+        .map_err(|e| ActionError::Failed(e.to_string()))?;
+    if let Some(u) = grant.unavailable.first() {
+        return Err(ActionError::Failed(u.notice_message()));
+    }
+    let Some(body) = rupu_tools::bodies::body(d.name, &ctx) else {
+        return Err(ActionError::Failed(format!(
+            "`{tool}` has no implementation in this run"
+        )));
+    };
+    let policy = rupu_tools::PermissionPolicy::unattended(services.mode);
+    match call(
+        &*body,
+        args,
+        &ctx,
+        &policy,
+        &mut rupu_tools::AllowAlways::default(),
+    )
+    .await
+    {
+        CallOutcome::Done(out) => Ok(out),
+        CallOutcome::Denied(reason) => Err(ActionError::Denied {
+            tool: tool.to_string(),
+            reason,
+        }),
+        CallOutcome::Failed(msg) => Err(ActionError::Failed(msg)),
+    }
+}
+
 /// Fire a gate's `notify:` hooks best-effort, right as the gate is about to
 /// actually park (never on auto-approve, never on a resume-suppressed
 /// gate — callers only reach here on the real pause path). Each hook is a
 /// throwaway `action:`-shaped step run through the same
 /// [`execute_action_step`] the main loop uses; every failure (missing
-/// dispatcher, render error, dispatch error) is logged and swallowed —
+/// action services, render error, tool error) is logged and swallowed —
 /// notify never changes the park outcome, never blocks it, and never
 /// surfaces as a run error.
 ///
@@ -6777,8 +6849,8 @@ async fn fire_notify_hooks(
     if notify.is_empty() {
         return;
     }
-    let Some(dispatcher) = opts.action_dispatcher.as_ref() else {
-        warn!(step = %step_id, "notify skipped: no action dispatcher");
+    let Some(services) = opts.action_services.as_ref() else {
+        warn!(step = %step_id, "notify skipped: no action services");
         return;
     };
     for n in notify {
@@ -6810,7 +6882,7 @@ async fn fire_notify_hooks(
         };
         let findings_profile = opts.workflow.action_findings_profile(&synth);
         match execute_action_step(
-            dispatcher,
+            services,
             &synth,
             ctx,
             mode,
@@ -7206,10 +7278,10 @@ async fn run_on_reject_chain(
                 );
             }
             let step_timer = std::time::Instant::now();
-            let outcome = match opts.action_dispatcher.as_ref() {
-                Some(dispatcher) => {
+            let outcome = match opts.action_services.as_ref() {
+                Some(services) => {
                     execute_action_step(
-                        dispatcher,
+                        services,
                         step,
                         &ctx,
                         render_mode(opts.strict_templates),
@@ -7219,7 +7291,7 @@ async fn run_on_reject_chain(
                     )
                     .await
                 }
-                None => Err(RunWorkflowError::ActionDispatcherMissing {
+                None => Err(RunWorkflowError::ActionServicesMissing {
                     step: step.id.clone(),
                 }),
             };
@@ -11312,7 +11384,7 @@ mod tests {
             strict_templates: false,
             event_sink: None,
             unit_dispatcher: Some(dispatcher),
-            action_dispatcher: None,
+            action_services: None,
             pause: None,
             naming: None,
         }
@@ -11326,8 +11398,8 @@ mod tests {
     /// through the same template machinery a string `with:` value gets —
     /// `walk`'s `Value::Array` arm recurses per-item rather than skipping
     /// arrays wholesale. Mirrors `issues.create`'s `labels:
-    /// Option<Vec<String>>` schema param (`crates/rupu-mcp/src/tools/
-    /// issues.rs`), the catalog tool with an array-typed field.
+    /// Option<Vec<String>>` schema param (`crates/rupu-tools/src/
+    /// issues/mod.rs`), the catalog tool with an array-typed field.
     #[test]
     fn render_action_args_renders_templates_inside_array_values() {
         let prior = vec![StepResult {
@@ -11906,7 +11978,7 @@ steps:
             strict_templates: false,
             event_sink: None,
             unit_dispatcher: None,
-            action_dispatcher: None,
+            action_services: None,
             pause: None,
             naming: None,
         };
@@ -12586,7 +12658,7 @@ steps:
             strict_templates: false,
             event_sink: Some(sink),
             unit_dispatcher: None,
-            action_dispatcher: None,
+            action_services: None,
             pause: None,
             naming: None,
         }
@@ -13093,7 +13165,7 @@ steps:
             strict_templates: false,
             event_sink: Some(sink1.clone()),
             unit_dispatcher: Some(dispatcher1.clone()),
-            action_dispatcher: None,
+            action_services: None,
             pause: Some(token),
             naming: None,
         };
@@ -13201,7 +13273,7 @@ steps:
             strict_templates: false,
             event_sink: Some(sink2.clone()),
             unit_dispatcher: Some(dispatcher2.clone()),
-            action_dispatcher: None,
+            action_services: None,
             pause: None,
             naming: None,
         };
@@ -13645,7 +13717,6 @@ loops:
 mod dag_scheduler_golden {
     use super::*;
     use rupu_agent::runner::{MockProvider, ScriptedTurn};
-    use rupu_mcp::{McpPermission, ToolDispatcher};
     use rupu_providers::types::StopReason;
     use rupu_scm::{
         Branch, Comment, CreatePr, Diff, FileContent, Platform, Pr, PrFilter, PrRef, Registry,
@@ -13758,13 +13829,15 @@ mod dag_scheduler_golden {
         }
     }
 
-    fn build_dispatcher() -> Arc<ToolDispatcher> {
+    fn build_action_services() -> ActionServices {
         let mut reg = Registry::empty();
         reg.insert_repo_connector(Platform::Github, Arc::new(FakeConnector));
-        Arc::new(ToolDispatcher::new(
-            Arc::new(reg),
-            McpPermission::new(PermissionMode::Bypass, vec!["*".into()]),
-        ))
+        let mut context = rupu_tools::ToolContext::default();
+        context.services.scm = Some(Arc::new(reg));
+        ActionServices {
+            context,
+            mode: PermissionMode::Bypass,
+        }
     }
 
     /// Minimal `(inputs, issue, event)` fixture each sample workflow needs
@@ -13950,7 +14023,7 @@ mod dag_scheduler_golden {
             strict_templates: false,
             event_sink: None,
             unit_dispatcher: None,
-            action_dispatcher: Some(build_dispatcher()),
+            action_services: Some(build_action_services()),
             pause: None,
             naming: None,
         };
@@ -14242,7 +14315,7 @@ steps:
             strict_templates: false,
             event_sink: None,
             unit_dispatcher: None,
-            action_dispatcher: None,
+            action_services: None,
             pause: None,
             naming: None,
         }
@@ -14734,7 +14807,7 @@ loops:
             strict_templates: false,
             event_sink: None,
             unit_dispatcher: None,
-            action_dispatcher: None,
+            action_services: None,
             pause: None,
             naming: None,
         }
@@ -14901,7 +14974,7 @@ loops:
             strict_templates: false,
             event_sink: None,
             unit_dispatcher: None,
-            action_dispatcher: None,
+            action_services: None,
             pause: None,
             naming: None,
         };
@@ -15156,7 +15229,7 @@ loops:
             strict_templates: false,
             event_sink: None,
             unit_dispatcher: None,
-            action_dispatcher: None,
+            action_services: None,
             pause: None,
             naming: None,
         }
@@ -15328,7 +15401,7 @@ loops:
             strict_templates: false,
             event_sink: None,
             unit_dispatcher: None,
-            action_dispatcher: None,
+            action_services: None,
             pause: None,
             naming: None,
         };
@@ -15540,7 +15613,7 @@ loops:
             strict_templates: false,
             event_sink: None,
             unit_dispatcher: None,
-            action_dispatcher: None,
+            action_services: None,
             pause,
             naming: None,
         }
@@ -15815,7 +15888,7 @@ loops:
             strict_templates: false,
             event_sink: None,
             unit_dispatcher: None,
-            action_dispatcher: None,
+            action_services: None,
             pause: None,
             naming: None,
         };
@@ -15928,7 +16001,7 @@ loops:
             strict_templates: false,
             event_sink: None,
             unit_dispatcher: None,
-            action_dispatcher: None,
+            action_services: None,
             pause: None,
             naming: None,
         };
@@ -15979,7 +16052,7 @@ loops:
             strict_templates: false,
             event_sink: None,
             unit_dispatcher: None,
-            action_dispatcher: None,
+            action_services: None,
             pause: None,
             naming: None,
         };
@@ -16135,7 +16208,7 @@ loops:
             strict_templates: false,
             event_sink: event_sink.map(|s| s as Arc<dyn crate::executor::EventSink>),
             unit_dispatcher: None,
-            action_dispatcher: None,
+            action_services: None,
             pause: None,
             naming: None,
         }
@@ -16505,7 +16578,7 @@ loops:
             strict_templates: false,
             event_sink: None,
             unit_dispatcher: None,
-            action_dispatcher: None,
+            action_services: None,
             pause: None,
             naming: None,
         };
@@ -16604,7 +16677,7 @@ loops:
             strict_templates: false,
             event_sink: None,
             unit_dispatcher: None,
-            action_dispatcher: None,
+            action_services: None,
             pause: None,
             naming: None,
         };
@@ -16757,7 +16830,7 @@ mod join_and_prune {
             strict_templates: false,
             event_sink: None,
             unit_dispatcher: None,
-            action_dispatcher: None,
+            action_services: None,
             pause: None,
             naming: None,
         }
@@ -17831,7 +17904,7 @@ steps:
             strict_templates: false,
             event_sink: None,
             unit_dispatcher: None,
-            action_dispatcher: None,
+            action_services: None,
             pause: None,
             naming: None,
         };
@@ -17917,7 +17990,7 @@ steps:
             strict_templates: false,
             event_sink: None,
             unit_dispatcher: None,
-            action_dispatcher: None,
+            action_services: None,
             pause: None,
             naming: None,
         };
@@ -17977,7 +18050,7 @@ steps:
             strict_templates: false,
             event_sink: None,
             unit_dispatcher: None,
-            action_dispatcher: None,
+            action_services: None,
             pause: None,
             naming: None,
         };
@@ -18064,7 +18137,7 @@ steps:
             strict_templates: false,
             event_sink: None,
             unit_dispatcher: None,
-            action_dispatcher: None,
+            action_services: None,
             pause: None,
             naming: None,
         };
@@ -18119,7 +18192,7 @@ steps:
             strict_templates: false,
             event_sink: None,
             unit_dispatcher: None,
-            action_dispatcher: None,
+            action_services: None,
             pause: None,
             naming: None,
         };
@@ -18193,7 +18266,7 @@ steps:
             strict_templates: false,
             event_sink: None,
             unit_dispatcher: None,
-            action_dispatcher: None,
+            action_services: None,
             pause: None,
             naming: None,
         };
@@ -18232,7 +18305,7 @@ steps:
             strict_templates: false,
             event_sink: None,
             unit_dispatcher: None,
-            action_dispatcher: None,
+            action_services: None,
             pause: None,
             naming: None,
         };
@@ -18362,7 +18435,7 @@ mod resume_and_cancel {
             strict_templates: false,
             event_sink: None,
             unit_dispatcher: None,
-            action_dispatcher: None,
+            action_services: None,
             pause,
             naming: None,
         }
@@ -19135,7 +19208,7 @@ mod agent_terminal_status {
             strict_templates: false,
             event_sink: Some(sink),
             unit_dispatcher: None,
-            action_dispatcher: None,
+            action_services: None,
             pause: None,
             naming: None,
         }
@@ -19591,7 +19664,7 @@ mod manual_pause_drain {
                 strict_templates: false,
                 event_sink: sink.map(|s| s as Arc<dyn crate::executor::EventSink>),
                 unit_dispatcher: Some(Arc::new(dispatcher)),
-                action_dispatcher: None,
+                action_services: None,
                 pause,
                 naming: None,
             }

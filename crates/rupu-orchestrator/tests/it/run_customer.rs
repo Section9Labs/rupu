@@ -99,7 +99,7 @@ async fn run_with(factory: Arc<dyn StepFactory>) -> (assert_fs::TempDir, Arc<Run
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };

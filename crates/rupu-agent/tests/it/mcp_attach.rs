@@ -1,5 +1,6 @@
-//! End-to-end: confirm AgentRunOpts.mcp_registry = Some(...) causes
-//! the MCP-backed tools to appear in the runner's tool registry.
+//! End-to-end: a run whose tool context carries an SCM registry offers the
+//! connector tools (`scm.*`, `issues.*`, …) its grant names — the catalog's
+//! own bodies, called directly (no MCP server in the agent loop, W4).
 
 use rupu_agent::run_agent;
 use rupu_agent::runner::{AgentRunOpts, CapturingMockProvider, ScriptedTurn};
@@ -7,12 +8,9 @@ use rupu_providers::types::StopReason;
 use rupu_scm::Registry;
 use std::sync::Arc;
 
-/// Structural contract: AgentRunOpts accepts mcp_registry: Some(Registry::empty())
-/// at the type level. This verifies the field wiring compiles and is accepted
-/// by run_agent without panicking. We use a CapturingMockProvider to confirm
-/// the MCP tool names actually appear in the outbound LlmRequest.tools list.
-/// Run one scripted turn with an MCP registry attached and return the tool
-/// names the provider was offered.
+/// Run one scripted turn with an SCM registry on the tool context and return
+/// the tool names the provider was offered (a `CapturingMockProvider` reads
+/// the outbound `LlmRequest.tools`).
 async fn offered_tools(agent_tools: Option<Vec<String>>) -> Vec<String> {
     let provider = CapturingMockProvider::new(vec![ScriptedTurn::AssistantText {
         text: "done".into(),

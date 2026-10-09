@@ -334,7 +334,7 @@ async fn synced_placed_step_edit_is_visible_to_downstream_local_step() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: Some(dispatcher.clone()),
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -428,7 +428,7 @@ async fn fanout_sync_disjoint_edits_merge() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: Some(dispatcher.clone()),
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };

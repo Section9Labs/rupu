@@ -169,4 +169,29 @@ impl ToolDescriptor {
     pub fn is_connector(&self) -> bool {
         self.needs.contains(&Service::Scm)
     }
+
+    /// The tool's namespace: `core` for the core fs/shell tools, the first
+    /// segment of a `namespace.verb` name (`scm` for `scm.prs.create`), and
+    /// `None` for the legacy unqualified dispatch names.
+    pub fn namespace(&self) -> Option<&'static str> {
+        if self.is_core() {
+            return Some("core");
+        }
+        self.name.split_once('.').map(|(ns, _)| ns)
+    }
+
+    /// True when an `action:` workflow step may call this tool: not a core
+    /// tool, not a `Spawn`, and needing only the services an action step
+    /// provides ([`ACTION_SERVICES`]). An action step has no agent, so it
+    /// can't start one; and it has no `concerns:` catalog, no engagement and
+    /// no dispatcher, so a tool needing one of those would always fail.
+    pub fn is_action_eligible(&self) -> bool {
+        !self.is_core()
+            && self.effect != Effect::Spawn
+            && self.needs.iter().all(|s| ACTION_SERVICES.contains(s))
+    }
 }
+
+/// The services an `action:` workflow step provides its tool: the run's SCM
+/// registry and the findings ledger of its workspace.
+pub const ACTION_SERVICES: &[Service] = &[Service::Scm, Service::Findings];

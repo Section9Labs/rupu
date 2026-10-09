@@ -14,7 +14,7 @@ A workflow can:
 - fan out one agent across many items with `for_each:`
 - fan out many specialist agents with `parallel:`
 - run structured review panels with `panel:`
-- call an MCP connector tool directly, no agent, with `action:`
+- call a connector or findings tool directly, no agent, with `action:`
 - route to different downstream steps with `branch:`
 - pause for human approval with `approval:`
 - run out of declaration order as an explicit graph with `next:`/`depends_on:`/`split:`/`join:`/`loops:`
@@ -301,7 +301,7 @@ Every step has an `id` and exactly one execution shape:
 - `for_each:` fan-out step
 - `parallel:` multi-agent fan-out step
 - `panel:` review step
-- `action:` connector step (no agent — calls an MCP tool directly)
+- `action:` connector step (no agent — calls a catalog tool directly)
 - `branch:` routing step
 - an orchestration node (`split:` or `join:` — pure routing, no work of its own)
 - a gate node (a standalone `approval:` block with none of the above)
@@ -390,7 +390,7 @@ Rules:
 
 - `parallel:` sub-steps inherit their parent step's profile; a sub-step has no `findings_profile` of its own.
 - An `action: findings.record` step resolves its profile as the step's own `findings_profile` → `defaults.findings_profile` → `full` (there is no agent frontmatter to consult). Gate `notify:` hooks have no step of their own and use `defaults.findings_profile` (else `full`).
-- `findings.record` needs different `with:` keys per profile, and a missing key is a parse error naming the step, the profile, and the keys: `full` needs `scope` and `report`; `summary` needs `scope`, `summary`, `severity`, and `rationale`. Only key presence is checked, so a value may be a `{{ … }}` template.
+- `findings.record` needs different `with:` keys per profile, and a missing key is a parse error naming the step, the profile, and the keys: `full` needs `scope` and `report`; `summary` needs `scope`, `summary`, `severity`, and `rationale` (with optional `code_excerpt` / `references`; an `evidence` object, the agent tool's form, works in place of the three). Only key presence is checked, so a value may be a `{{ … }}` template.
 - Sub-agents started through `dispatch_agent` resolve only from their own agent file; the dispatching step's value does not reach them.
 - Remote steps (`host:` / `distribute:`) follow the same order. The coordinator resolves the step's value, else `defaults.findings_profile`, and launches each unit with `rupu run --findings-profile <profile>`. When neither is set, the host resolves the agent's `findingsProfile` from its own copy of the agent file, then `full`. A fan-out unit retried on its fallback host keeps the profile.
 - A remote host that can't honour the profile refuses the launch; the unit doesn't run under a different profile. That covers an older tunnel node that didn't advertise support, a bucket whose pull workers haven't advertised it, and an HTTP host whose `/api/host/info` doesn't list it. An older SSH host's `rupu run` rejects the unknown flag, so the unit fails. One gap remains on bucket hosts: an old worker polling the same bucket as an upgraded one can't be detected and may still claim the unit.
@@ -594,7 +594,7 @@ Required fields:
 
 ## `action:` connector steps
 
-Use `action:` when a step should call an MCP catalog tool directly — no agent, no LLM turn at all.
+Use `action:` when a step should call a catalog tool directly — no agent, no LLM turn at all. The step runs the same tool an agent or `rupu mcp serve` would call, under the run's permission mode.
 
 ```yaml
 steps:
@@ -613,12 +613,13 @@ Fields:
 
 | Key | Type | Required | Notes |
 | --- | --- | --- | --- |
-| `action` | string | yes | Tool name from the MCP catalog (`scm.*`, `issues.*`, `github.*`, `gitlab.*` — see `GET /api/tools`) |
+| `action` | string | yes | A tool an action step may call: a connector tool (`scm.*`, `issues.*`, `github.*`, `gitlab.*`) or a findings tool (`findings.record` — the `findings.report` tool's action name — `findings.verify`, `findings.query`, `findings.tag`). `GET /api/tools` marks them `action_eligible` |
 | `with` | map | no | Parameters passed to the tool call; string values may be minijinja templates |
 
 Rules, all enforced at parse time:
 
-- `action:` must name a real tool in the catalog. An unknown name is a parse error.
+- `action:` must name a real tool in the catalog (a legacy alias works too). An unknown name is a parse error.
+- the tool must be one an action step may call: not a core fs/shell tool, not one that starts another run, and needing only the services an action step provides (the SCM registry and the findings ledger). Anything else (`bash`, `dispatch`, `coverage.mark`, `assets.mark`, `board.post`, …) is a parse error.
 - `with:`'s keys are validated against the tool's JSON Schema: an unknown key or a missing required key both fail parsing before the run ever starts.
 - `action:` is mutually exclusive with `agent:`/`prompt:`/`for_each:`/`parallel:`/`panel:`/`branch:`.
 - an `action:` step must not also carry a **non-empty** `actions:` allowlist. `actions:` narrows an *agent's* connector grant; an action step's tool call is already fully explicit, so there's nothing left to narrow — a non-empty `actions:` here is rejected as a parse error. An empty (or absent) `actions:` is legal, if redundant.
@@ -632,7 +633,7 @@ Typed `with:` values are coerced against the tool's declared schema type:
 Published output:
 
 - `steps.<id>.output` — the tool's return value, serialized as a JSON string
-- `steps.<id>.success` — whether the dispatcher call succeeded
+- `steps.<id>.success` — whether the tool call succeeded
 
 Because `output` is a JSON *string*, pull fields out of it with the `fromjson` filter documented under "Template filters" further down — `{{ (steps.fetch.output | fromjson).title }}`, not `{{ steps.fetch.output.title }}`.
 

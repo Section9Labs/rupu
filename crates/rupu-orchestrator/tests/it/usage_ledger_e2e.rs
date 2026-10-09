@@ -251,7 +251,7 @@ fn opts_for(
         strict_templates: false,
         event_sink: sink.map(|s| s as Arc<dyn rupu_orchestrator::executor::EventSink>),
         unit_dispatcher: dispatcher,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
     }
 }

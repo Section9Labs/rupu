@@ -121,7 +121,7 @@ async fn run(yaml: &str, mode: Option<&'static str>, dispatcher: Arc<Recorder>) 
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: Some(dispatcher),
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
     };
     run_workflow(opts).await.expect("workflow should complete");

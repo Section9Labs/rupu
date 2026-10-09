@@ -184,8 +184,13 @@ pub enum WorkflowParseError {
     ActionMutuallyExclusive { step: String },
     #[error("step `{step}`: `action:` must name a tool (e.g. scm.prs.create)")]
     ActionEmptyName { step: String },
-    #[error("step `{step}`: action `{tool}` is not a known MCP tool")]
+    #[error("step `{step}`: action `{tool}` is not a known tool")]
     ActionUnknownTool { step: String, tool: String },
+    /// A catalog tool an `action:` step can't call: a core fs/shell tool, a
+    /// spawn, or one needing a service an action step doesn't provide
+    /// (`rupu_tools::ToolDescriptor::is_action_eligible`).
+    #[error("step `{step}`: action `{tool}` can't be called by an `action:` step — only the connector (scm/issues/github/gitlab) and findings tools can")]
+    ActionToolNotEligible { step: String, tool: String },
     #[error("step `{step}`: action `{tool}` params invalid: {detail}")]
     ActionInvalidParams {
         step: String,
@@ -1497,9 +1502,10 @@ fn validate_cron_expression(expr: &str) -> Result<(), WorkflowParseError> {
     Ok(())
 }
 
-/// Parse-time validation of an action invocation against the static MCP
-/// catalog (spec §4.2): the tool must exist, `with:` keys must be schema
-/// properties, and required keys must be present. VALUES are mostly not
+/// Parse-time validation of an action invocation against the tool catalog
+/// (spec §4.2, W4 §3.3): the tool must exist and be one an action step may
+/// call, `with:` keys must be schema properties, and required keys must be
+/// present. VALUES are mostly not
 /// checked — they may be minijinja templates rendered at runtime (the
 /// dispatcher's typed serde parse re-validates then, and I-33's
 /// `render_action_args`/`render_action_leaf` in runner.rs coerce a
@@ -1515,14 +1521,24 @@ fn validate_action_step(
     tool: &str,
     with: Option<&serde_json::Value>,
 ) -> Result<(), WorkflowParseError> {
-    let catalog = rupu_mcp::tools::tool_catalog();
-    let Some(spec) = catalog.iter().find(|s| s.name == tool) else {
+    let Some(d) = action_tool(tool) else {
         return Err(WorkflowParseError::ActionUnknownTool {
             step: step_id.to_string(),
             tool: tool.to_string(),
         });
     };
-    let schema = &spec.input_schema;
+    // W4 §3.3: connector and findings tools only — never a core tool, a
+    // spawn, or a tool needing a service an action step can't provide.
+    if !d.is_action_eligible() {
+        return Err(WorkflowParseError::ActionToolNotEligible {
+            step: step_id.to_string(),
+            tool: tool.to_string(),
+        });
+    }
+    // The descriptor's schema: for `findings.report` the widest one (both
+    // profiles, both evidence forms); `validate_findings_record_actions`
+    // checks the keys each profile needs.
+    let schema = &(d.input_schema)();
     let props = schema.get("properties").and_then(|p| p.as_object());
     let empty = serde_json::Map::new();
     let with_map = match with {
@@ -1589,8 +1605,19 @@ fn validate_action_step(
     Ok(())
 }
 
-/// Each `actions:` entry must name a tool in the MCP catalog. Mirrors
-/// `validate_action_step`'s catalog lookup — same catalog, same crate dep.
+/// The catalog tool an `action:` names (canonical or a legacy alias:
+/// `findings.record` is `findings.report`).
+pub fn action_tool(name: &str) -> Option<&'static rupu_tools::ToolDescriptor> {
+    rupu_tools::ToolCatalog::builtin().resolve_name(name, rupu_tools::AliasScope::Everywhere)
+}
+
+/// True when the action `name` is `findings.report` (called `findings.record`
+/// in workflows): the one action tool a findings profile configures.
+pub fn is_findings_report_action(name: &str) -> bool {
+    action_tool(name).is_some_and(|d| d.name == rupu_tools::findings::report::DESCRIPTOR.name)
+}
+
+/// Each `actions:` entry must name a connector tool in the catalog.
 /// `actions:` is a NARROWING allowlist for an AGENT step; an `action:`
 /// step's tool is explicit, so a non-empty list there is a shape error
 /// (an EMPTY list stays legal — it is already present repo-wide).
@@ -1619,7 +1646,7 @@ fn validate_step_actions(step: &Step) -> Result<(), WorkflowParseError> {
     }
     // The same vocabulary the runner narrows with (W2): canonical names,
     // aliases, `ns.*` and `*`, each of which must name connector tools.
-    let catalog = rupu_agent::tool_catalog();
+    let catalog = rupu_tools::ToolCatalog::builtin();
     for tool in &step.actions {
         match catalog.resolve_actions(
             std::slice::from_ref(tool),
@@ -1965,7 +1992,7 @@ fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
         // the call accepts (see `Workflow::action_findings_profile`). On any
         // other tool it would parse and silently do nothing.
         if let Some(tool) = step.action.as_deref() {
-            if tool != "findings.record" {
+            if !is_findings_report_action(tool) {
                 return Err(WorkflowParseError::FindingsProfileOnNonFindingsAction {
                     step: step.id.clone(),
                     tool: tool.to_string(),
@@ -2015,23 +2042,30 @@ fn validate_findings_record_actions(wf: &Workflow) -> Result<(), WorkflowParseEr
         with: Option<&serde_json::Value>,
     ) -> Result<(), WorkflowParseError> {
         use rupu_coverage::FindingProfile;
-        let (name, required, hint): (&'static str, &[&str], &'static str) = match profile {
+        // Each requirement is a key, or alternatives any one of which will
+        // do: the summary profile's detail is the flat `rationale` (the
+        // step vocabulary) or an `evidence` object (the agent tool's).
+        let (name, required, hint): (&'static str, &[&[&str]], &'static str) = match profile {
             FindingProfile::Full => (
                 "full",
-                &["scope", "report"],
+                &[&["scope"], &["report"]],
                 "send a complete `report`, or set `findings_profile: summary` on the step (or `defaults.findings_profile: summary`) to record summary / severity / rationale",
             ),
             FindingProfile::Summary => (
                 "summary",
-                &["scope", "summary", "severity", "rationale"],
+                &[&["scope"], &["summary"], &["severity"], &["rationale", "evidence"]],
                 "send summary / severity / rationale, or set `findings_profile: full` to record a `report`",
             ),
         };
         let keys = with.and_then(serde_json::Value::as_object);
         let missing: Vec<String> = required
             .iter()
-            .filter(|k| !keys.is_some_and(|m| m.contains_key(**k)))
-            .map(|k| format!("`{k}`"))
+            .filter(|alts| {
+                !alts
+                    .iter()
+                    .any(|k| keys.is_some_and(|m| m.contains_key(*k)))
+            })
+            .map(|alts| format!("`{}`", alts[0]))
             .collect();
         if missing.is_empty() {
             return Ok(());
@@ -2043,9 +2077,9 @@ fn validate_findings_record_actions(wf: &Workflow) -> Result<(), WorkflowParseEr
             hint,
         })
     }
-    const TOOL: &str = "findings.record";
+    let is_report = |tool: Option<&str>| tool.is_some_and(is_findings_report_action);
     for step in &wf.steps {
-        if step.action.as_deref() == Some(TOOL) {
+        if is_report(step.action.as_deref()) {
             check(
                 &step.id,
                 wf.action_findings_profile(step),
@@ -2054,12 +2088,12 @@ fn validate_findings_record_actions(wf: &Workflow) -> Result<(), WorkflowParseEr
         }
         let Some(ap) = &step.approval else { continue };
         for sub in &ap.on_reject {
-            if sub.action.as_deref() == Some(TOOL) {
+            if is_report(sub.action.as_deref()) {
                 check(&sub.id, wf.action_findings_profile(sub), sub.with.as_ref())?;
             }
         }
         for na in &ap.notify {
-            if na.action == TOOL {
+            if is_report(Some(&na.action)) {
                 // A notify hook has no step of its own to set a profile on.
                 let profile = rupu_coverage::FindingProfile::resolve(
                     None,
@@ -3356,6 +3390,43 @@ steps:
             wf.action_findings_profile(&wf.steps[0]),
             rupu_coverage::FindingProfile::Full
         );
+    }
+
+    /// W4 §3.3: an `action:` step calls connector and findings tools only,
+    /// by canonical name or legacy alias.
+    #[test]
+    fn action_steps_call_only_eligible_catalog_tools() {
+        for tool in [
+            "bash",
+            "read_file",
+            "dispatch",
+            "coverage.mark",
+            "assets.mark",
+            "board.post",
+        ] {
+            let yaml = format!("name: w\nsteps:\n  - id: a\n    action: {tool}\n");
+            match Workflow::parse(&yaml) {
+                Err(WorkflowParseError::ActionToolNotEligible { step, tool: t }) => {
+                    assert_eq!((step.as_str(), t.as_str()), ("a", tool));
+                }
+                other => panic!("{tool}: expected ActionToolNotEligible, got {other:?}"),
+            }
+        }
+        // The canonical name, the legacy action name and the agent alias all
+        // name the one findings tool, with the profile's keys checked.
+        for tool in ["findings.report", "findings.record", "report_finding"] {
+            let yaml = format!(
+                "name: w\nsteps:\n  - id: a\n    action: {tool}\n    findings_profile: summary\n    with: {SUMMARY_WITH}\n"
+            );
+            Workflow::parse(&yaml).unwrap_or_else(|e| panic!("{tool}: {e}"));
+        }
+        // An `evidence` object stands in for the flat `rationale`.
+        let yaml = "name: w\nsteps:\n  - id: a\n    action: findings.record\n    findings_profile: summary\n    with: { scope: repo, summary: s, severity: high, evidence: { rationale: r } }\n";
+        Workflow::parse(yaml).unwrap();
+        assert!(Workflow::parse(
+            "name: w\nsteps:\n  - id: a\n    action: findings.verify\n    with: { finding_id: f, status: confirmed }\n"
+        )
+        .is_ok());
     }
 
     #[test]

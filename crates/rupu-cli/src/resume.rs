@@ -11,63 +11,11 @@
 
 use crate::paths;
 use anyhow::Context as _;
-use rupu_mcp::{McpPermission, ToolDispatcher};
 use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts, OrchestratorRunResult};
 use rupu_orchestrator::{RunStore, Workflow};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-/// Build the `action_dispatcher` every `OrchestratorRunOpts` construction
-/// site wires: an in-process MCP `ToolDispatcher` over the same SCM
-/// `Registry` and the run's permission mode.
-///
-/// **Mode** genuinely matches the agent path — the same `PermissionMode`
-/// the run's agent steps run under, decided by the same `PermissionPolicy`
-/// from each tool's effect, so a `readonly` run refuses external (and
-/// workspace-writing) tools here too.
-///
-/// The **tool allowlist** deliberately does NOT match the agent path, and
-/// this is not an oversight (ISSUES.md I-26). An agent step's surface is
-/// its resolved grant — `tools:` narrowed by `actions:`
-/// (`rupu_tools::ToolCatalog::resolve_grant`); this dispatcher passes `["*"]`
-/// instead, because
-/// it is built once per run while the tool it may call is per-step. That
-/// is sound rather than permissive, resting on three invariants:
-///
-/// 1. Every consumer of `opts.action_dispatcher` funnels into
-///    `execute_action_step`, whose only dispatch is
-///    `dispatcher.call_with_findings_profile(tool, …)` with `tool =
-///    step.action` (the profile only matters to `findings.record`).
-///    Agent-step tool calls never reach this dispatcher.
-/// 2. That tool is validated against the live MCP catalog at parse time by
-///    `validate_action_step` (`rupu-orchestrator`'s `workflow.rs`).
-/// 3. A step may not carry a non-empty `actions:` alongside `action:` —
-///    `WorkflowParseError::ActionsOnActionStep` rejects it, since an
-///    action step's tool is already explicit. So there is no per-step
-///    allowlist here to honor in the first place.
-///
-/// In short: the only tool this dispatcher can ever be asked for is one
-/// named explicitly in the workflow source and already catalog-checked.
-/// Narrowing the allowlist to that single tool anyway — so the guarantee
-/// is structural rather than an invariant enforced three modules away —
-/// is tracked as **I-79**.
-pub fn action_dispatcher_for(
-    registry: &Arc<rupu_scm::Registry>,
-    mode: rupu_tools::PermissionMode,
-    findings: Option<rupu_mcp::FindingsContext>,
-) -> Arc<ToolDispatcher> {
-    let dispatcher = ToolDispatcher::new(
-        Arc::clone(registry),
-        McpPermission::new(mode, vec!["*".into()]),
-    );
-    // Without this context `findings.record` is listed but refuses: an
-    // action step could observe a weakness and have nowhere to record it.
-    Arc::new(match findings {
-        Some(ctx) => dispatcher.with_findings(ctx),
-        None => dispatcher,
-    })
-}
 
 /// Result of a successful [`resume_run`], carrying everything the caller
 /// needs to render the post-resume status (re-pause vs completion) without
@@ -492,27 +440,8 @@ async fn rebuild_opts_from_disk(
             scope_name_override: None,
         });
     let naming = runtime.naming;
+    let runtime_action_services = runtime.action_services;
     let factory = runtime.factory;
-    let action_dispatcher = action_dispatcher_for(
-        &mcp_registry,
-        permission_mode,
-        Some(rupu_mcp::FindingsContext {
-            workspace_path: workspace_path.clone(),
-            scope_name: workflow.name.clone(),
-            run_id: run_id.to_string(),
-            model: cfg.default_model.clone().unwrap_or_default(),
-            surface: rupu_coverage::Surface::Workflow,
-            options: findings_base
-                .clone()
-                .with_profile(rupu_coverage::FindingProfile::resolve(
-                    None,
-                    workflow.defaults.findings_profile,
-                    None,
-                )),
-            codename: Some(rupu_codename::crew_for(run_id)),
-            provider: cfg.default_provider.clone(),
-        }),
-    );
 
     // Rebuild the `run:` step policy from the resolved mode + layered config
     // + workspace, exactly as the fresh-run path does
@@ -554,7 +483,7 @@ async fn rebuild_opts_from_disk(
         strict_templates: false,
         event_sink: event_sink_for_resume,
         unit_dispatcher,
-        action_dispatcher: Some(action_dispatcher),
+        action_services: Some(runtime_action_services),
         // `pause` is wired by `resume_run` (the approve-resume path), not
         // here: the reject-cleanup path runs uninterrupted by design (see
         // `run_reject_cleanup`), so it must keep `None`.

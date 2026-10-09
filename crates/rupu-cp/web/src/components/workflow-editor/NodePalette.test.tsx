@@ -103,9 +103,9 @@ describe('NodePalette', () => {
 
   describe('gate + connector cards (Task 5, next only)', () => {
     const TOOLS = [
-      { name: 'scm.prs.create', description: 'Open a PR', input_schema: {}, kind: 'write' as const },
-      { name: 'scm.prs.comment', description: 'Comment on a PR', input_schema: {}, kind: 'write' as const },
-      { name: 'issues.comment', description: 'Comment on an issue', input_schema: {}, kind: 'write' as const },
+      { name: 'scm.prs.create', description: 'Open a PR', input_schema: {}, aliases: [], namespace: 'scm', effect: 'external' as const, needs: ['scm'], action_eligible: true },
+      { name: 'scm.prs.comment', description: 'Comment on a PR', input_schema: {}, aliases: [], namespace: 'scm', effect: 'external' as const, needs: ['scm'], action_eligible: true },
+      { name: 'issues.comment', description: 'Comment on an issue', input_schema: {}, aliases: [], namespace: 'issues', effect: 'external' as const, needs: ['scm'], action_eligible: true },
     ];
 
     it('next offers a static Gate card that adds an approval_gate node', () => {
@@ -176,7 +176,7 @@ describe('NodePalette', () => {
           onAdd={() => {}}
           onDragStartKind={() => {}}
           variant="rail"
-          tools={[{ name: 'scm.prs.create', description: 'Open a PR', input_schema: {}, kind: 'write' }]}
+          tools={[{ name: 'scm.prs.create', description: 'Open a PR', input_schema: {}, aliases: [], namespace: 'scm', effect: 'external' as const, needs: ['scm'], action_eligible: true }]}
         />,
       );
       const connectorCard = container.querySelector('[aria-label="Add scm.prs.create action"]');
@@ -300,13 +300,13 @@ describe('NodePalette', () => {
           },
           required: ['title', 'base'],
         },
-        kind: 'write' as const,
+        aliases: [], namespace: null, effect: 'external' as const, needs: ['scm'], action_eligible: true,
       };
       const TOOL_WITHOUT_SCHEMA = {
         name: 'issues.comment',
         description: 'Comment on an issue.',
         input_schema: {},
-        kind: 'write' as const,
+        aliases: [], namespace: 'issues', effect: 'external' as const, needs: ['scm'], action_eligible: true,
       };
 
       it('clicking a connector chip SELECTS it and renders required params parsed from input_schema', () => {

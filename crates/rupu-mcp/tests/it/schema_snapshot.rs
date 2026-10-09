@@ -1,28 +1,15 @@
-//! Snapshot test for the tools/list response + jsonschema validity check.
+//! Snapshot of `rupu mcp serve`'s default `tools/list` + jsonschema validity.
 //!
 //! Run with `BLESS=1 cargo test -p rupu-mcp --test it schema_snapshot:: ...`
-//! to regenerate the snapshot file after intentionally adding/changing tools.
+//! to regenerate the snapshot file after intentionally changing the tools.
 
-use rupu_mcp::{serve_in_process, McpPermission, Transport};
-use rupu_scm::Registry;
-use std::sync::Arc;
+use crate::serve::{list, server};
 
 #[tokio::test]
 async fn tools_list_matches_snapshot() {
-    let registry = Arc::new(Registry::empty());
-    let permission = McpPermission::allow_all();
-    let (client, handle) = serve_in_process(registry, permission);
-
-    client
-        .send(serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/list",
-        }))
-        .await
-        .unwrap();
-    let resp = client.recv().await.unwrap().unwrap();
-    let tools = resp["result"]["tools"].clone();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (client, handle, _) = server(tmp.path(), None, rupu_tools::PermissionMode::Bypass);
+    let tools = serde_json::Value::Array(list(&client).await);
     let tools_pretty = serde_json::to_string_pretty(&tools).unwrap();
 
     let path = "tests/snapshots/tools_list.json";
@@ -37,28 +24,27 @@ async fn tools_list_matches_snapshot() {
     let expected: serde_json::Value =
         serde_json::from_str(&expected_raw).expect("snapshot is not valid JSON");
 
-    // Compare structurally (parsed serde_json::Value), not as raw strings.
-    // `schemars`/serde_json object-key ordering is not part of the
-    // catalog's contract and drifts across toolchains (ISSUES.md I-81) —
-    // what matters is the tool catalog's *content*, not its serialized
-    // field order. serde_json::Value equality ignores object-key order
-    // (objects compare as maps) while still catching any real content
-    // change: added/removed/renamed tools or fields, changed types,
-    // descriptions, schemas, or array order (tool list order, `required`
-    // arrays, `type` union order, etc. all still compare positionally).
+    // Compare structurally (parsed serde_json::Value), not as raw strings:
+    // object-key ordering is not part of the contract and drifts across
+    // toolchains (ISSUES.md I-81); array order (tool list order, `required`
+    // arrays) still compares positionally.
     assert_eq!(
         tools, expected,
         "tools/list snapshot drift — re-run with BLESS=1 to update if intentional"
     );
 
     drop(client);
-    let _ = handle.join.await;
+    let _ = handle.await;
 }
 
-#[test]
-fn every_tool_input_schema_compiles_as_jsonschema() {
-    for spec in rupu_mcp::tool_catalog() {
-        jsonschema::JSONSchema::compile(&spec.input_schema)
-            .unwrap_or_else(|e| panic!("tool {} has invalid input_schema: {e}", spec.name));
+#[tokio::test]
+async fn every_listed_input_schema_compiles_as_jsonschema() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (client, handle, _) = server(tmp.path(), Some(&["*"]), rupu_tools::PermissionMode::Bypass);
+    for tool in list(&client).await {
+        jsonschema::JSONSchema::compile(&tool["inputSchema"])
+            .unwrap_or_else(|e| panic!("tool {} has invalid inputSchema: {e}", tool["name"]));
     }
+    drop(client);
+    let _ = handle.await;
 }

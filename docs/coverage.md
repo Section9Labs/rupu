@@ -922,11 +922,10 @@ not gain any.
   findings and returns each finding's tags before and after. Both work only on
   the agent's own workspace, and `findings.tag` is allowed in `readonly` mode:
   it annotates the ledger and never touches the workspace's files.
-- **Workflow `action:` steps.** The MCP catalog has `findings.query` and
-  `findings.tag` (same inputs and results as the agent tools), and
-  `findings.record` accepts `tags`. These MCP tools are for `action:` steps
-  only: an agent is never offered them, even with
-  `tools: ["*"]`, and uses the builtins above instead.
+- **Workflow `action:` steps and `rupu mcp serve`.** They call the same
+  `findings.query` and `findings.tag` tools (one implementation, same inputs
+  and results), and `findings.report` (which a workflow calls as
+  `action: findings.record`) accepts `tags`.
 
   ```yaml
   - id: mark

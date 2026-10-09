@@ -1,5 +1,29 @@
-use rupu_agent::{builtin_tool, tool_catalog, ToolRegistry};
-use rupu_tools::{AliasScope, ToolCatalog};
+use rupu_agent::ToolRegistry;
+use rupu_tools::{AliasScope, Tool, ToolCatalog, ToolContext};
+use std::sync::Arc;
+
+/// The catalog body of `name` in a context that can dispatch.
+fn builtin_tool(name: &str) -> Option<Arc<dyn Tool>> {
+    let mut ctx = ToolContext::default();
+    ctx.services.dispatcher = Some(Arc::new(NoDispatch));
+    rupu_tools::bodies::body(name, &ctx)
+}
+
+#[derive(Debug)]
+struct NoDispatch;
+
+#[async_trait::async_trait]
+impl rupu_tools::AgentDispatcher for NoDispatch {
+    async fn dispatch(
+        &self,
+        _agent: &str,
+        _prompt: String,
+        _parent: &rupu_tools::RunIdentity,
+        _permission: rupu_tools::SpawnPermission,
+    ) -> Result<rupu_tools::DispatchOutcome, rupu_tools::DispatchError> {
+        unreachable!("never called")
+    }
+}
 
 const BUILTINS: [&str; 9] = [
     "ast_grep",
@@ -28,7 +52,6 @@ fn every_builtin_has_a_body_under_its_canonical_name() {
         assert_eq!(t.name(), name);
     }
     assert!(builtin_tool("teleport").is_none());
-    assert!(builtin_tool("findings.report").is_none(), "not a builtin");
 }
 
 #[test]
@@ -65,8 +88,8 @@ fn to_tool_definitions_match_the_registry() {
 }
 
 #[test]
-fn the_agent_catalog_adds_the_connector_tools_but_not_mcp_findings() {
-    let c = tool_catalog();
+fn the_catalog_holds_the_connector_tools_and_one_findings_report() {
+    let c = ToolCatalog::builtin();
     assert!(c.descriptor("scm.prs.get").is_some());
     assert!(c.descriptor("issues.comment").is_some());
     assert!(c.descriptor("github.workflows_dispatch").is_some());
@@ -84,5 +107,5 @@ fn the_agent_catalog_adds_the_connector_tools_but_not_mcp_findings() {
             .name,
         "findings.report"
     );
-    assert!(c.descriptors().count() > ToolCatalog::all().len());
+    assert_eq!(c.descriptors().count(), ToolCatalog::all().len());
 }

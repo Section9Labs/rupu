@@ -15,8 +15,8 @@ pub trait Transport: Send + Sync {
     async fn send(&self, msg: Value) -> Result<(), McpError>;
 }
 
-/// In-process transport: a pair of mpsc channels. Used by the agent
-/// runtime; no stdio, no serialization overhead.
+/// In-process transport: a pair of mpsc channels, for driving a server from
+/// the same process (tests); no stdio, no serialization overhead.
 #[derive(Clone)]
 pub struct InProcessTransport {
     inbox: Arc<TokioMutex<mpsc::UnboundedReceiver<Value>>>,

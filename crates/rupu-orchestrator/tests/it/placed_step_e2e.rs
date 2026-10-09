@@ -174,7 +174,7 @@ async fn placed_steps_run_remotely_and_chain() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: Some(dispatcher.clone()),
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -275,7 +275,7 @@ async fn no_host_control_runs_locally() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -387,7 +387,7 @@ async fn placed_steps_carry_coordinator_minted_codenames() {
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
         unit_dispatcher: Some(dispatcher.clone()),
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };

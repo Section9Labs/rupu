@@ -1407,11 +1407,35 @@ export interface AgentDetail extends AgentSummary {
 // MCP tool catalog (workflow-step editor connector cards)
 // ---------------------------------------------------------------------------
 
+/** One tool of the catalog (`GET /api/tools`, spec W4 §3.4). */
 export interface ToolSpec {
   name: string;
+  /** Legacy names the tool still answers to (`findings.record` for
+   *  `findings.report`). */
+  aliases: string[];
+  /** `core` for the core fs/shell tools, else the name's first segment;
+   *  `null` for the legacy unqualified dispatch names. */
+  namespace: string | null;
+  effect: 'read' | 'record' | 'write' | 'external' | 'spawn';
+  /** Services the tool can't run without (`scm`, `findings`, …). */
+  needs: string[];
   description: string;
   input_schema: unknown;
-  kind: 'read' | 'write';
+  /** Whether an `action:` workflow step may call it. */
+  action_eligible: boolean;
+}
+
+/** A connector tool (`scm.*`, `issues.*`, `github.*`, `gitlab.*`): one that
+ *  acts through the SCM registry — what a step's `actions:` narrows (mirrors
+ *  `rupu_tools::ToolDescriptor::is_connector`). */
+export function isConnectorTool(t: ToolSpec): boolean {
+  return t.needs.includes('scm');
+}
+
+/** The catalog tool `name` is: its canonical name or one of its aliases. */
+export function findTool(tools: ToolSpec[], name: string | undefined): ToolSpec | undefined {
+  if (!name) return undefined;
+  return tools.find((t) => t.name === name || t.aliases.includes(name));
 }
 
 // ---------------------------------------------------------------------------

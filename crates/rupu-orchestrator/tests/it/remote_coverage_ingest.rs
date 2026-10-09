@@ -137,7 +137,7 @@ async fn run_with(
         strict_templates: false,
         event_sink: Some(sink.clone()),
         unit_dispatcher: Some(dispatcher),
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };

@@ -1,27 +1,19 @@
 #![deny(clippy::all)]
 
-//! rupu-mcp — embedded MCP server for the unified SCM tool catalog.
+//! rupu-mcp — the MCP transport over the `rupu-tools` catalog (spec W4).
 //!
-//! Two transports:
-//!   - [`InProcessTransport`] — used by the agent runtime; tools dispatched
-//!     by direct calls without serialization round-trips.
-//!   - [`StdioTransport`] — used by `rupu mcp serve` (Plan 3 Task 1) for
-//!     external MCP-aware clients (Claude Desktop, Cursor).
+//! [`CatalogServer`] serves a resolved grant of the catalog over JSON-RPC:
+//! `tools/list` lists the granted tools, `tools/call` runs one through the
+//! same permission policy and tool bodies the agent loop and `action:`
+//! workflow steps use (`rupu_tools::call`). It owns no tools.
 //!
-//! Spec: docs/superpowers/specs/2026-05-03-rupu-slice-b2-scm-design.md §6.
+//! Transports: [`StdioTransport`] (`rupu mcp serve`, for Claude Desktop,
+//! Cursor, …) and [`InProcessTransport`] (tests).
 
-pub mod dispatcher;
 pub mod error;
-pub mod permission;
-pub mod schema;
 pub mod server;
-pub mod tools;
 pub mod transport;
 
-pub use dispatcher::ToolDispatcher;
-pub use error::McpError;
-pub use permission::McpPermission;
-pub use server::{serve_in_process, McpServer, ServeHandle};
-pub use tools::findings::FindingsContext;
-pub use tools::{tool_catalog, ToolKind, ToolSpec};
+pub use error::{McpError, ServeError};
+pub use server::{CatalogServer, MCP_DEFAULT_GRANT};
 pub use transport::{InProcessTransport, StdioTransport, Transport};

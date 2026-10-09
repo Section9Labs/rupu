@@ -13,7 +13,6 @@ workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_path_to_error.workspace = true
 serde_yaml.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -31,8 +30,6 @@ rupu-tools = { path = "../rupu-tools" }
 rupu-providers = { path = "../rupu-providers" }
 rupu-config = { path = "../rupu-config" }
 rupu-auth = { path = "../rupu-auth" }
-rupu-mcp = { path = "../rupu-mcp" }
-rupu-scm = { path = "../rupu-scm" }
 rupu-coverage = { path = "../rupu-coverage" }
 rupu-codename = { workspace = true }
 

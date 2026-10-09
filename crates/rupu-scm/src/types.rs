@@ -94,7 +94,7 @@ impl EventSourceRef {
 ///
 /// Shared by every call site that needs to route a `tracker` + `project`
 /// pair through the account rule engine's owner-rule tier —
-/// `rupu-mcp`'s `tools/issues.rs::project_repo` and `rupu-cli`'s
+/// the issue tools' `project_repo` (then in `rupu-mcp`, now `rupu-tools`) and `rupu-cli`'s
 /// `cmd/issues.rs::issue_ref_repo` had already written this split
 /// independently before `Registry::events_for_source` (Task 6) needed a
 /// third copy; this is the shared version they both now delegate to.

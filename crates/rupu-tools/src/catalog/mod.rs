@@ -1,18 +1,12 @@
-//! The tool catalog: the descriptor of every tool rupu defines, wherever its
-//! body still lives. Builtins carry their descriptor next to their body in
-//! this crate; the coverage/findings tools (bodies in `rupu-agent`) and the
-//! agentiflow tools (bodies in `rupu-agentiflow`) carry theirs here, so names,
-//! aliases and effects are final now and W4/W5 only move bodies.
+//! The tool catalog: the descriptor of every tool rupu defines. Every tool
+//! but the agentiflow ones carries its descriptor next to its body in this
+//! crate ([`crate::bodies`] builds the bodies); the agentiflow tools (bodies
+//! in `rupu-agentiflow` until W5) carry theirs in [`flow`].
 //!
-//! The MCP connector tools (`scm.*`, `issues.*`, …) are not listed: their
-//! descriptors are built from `rupu-mcp`'s catalog until W4 moves them in.
-//! A [`ToolCatalog`] value is this static list plus such extra descriptors
-//! ([`ToolCatalog::with`]); grant resolution ([`crate::grant`]) runs over a
-//! value, so `rupu-agent` hands it the connector descriptors (and a run's
-//! injected tools) until they live here.
+//! A [`ToolCatalog`] value is this static list plus extra descriptors
+//! ([`ToolCatalog::with`]): a run's injected tools. Grant resolution
+//! ([`crate::grant`]) runs over a value.
 
-pub mod coverage;
-pub mod findings;
 pub mod flow;
 
 use crate::descriptor::ToolDescriptor;
@@ -44,17 +38,36 @@ pub static ALL: &[&ToolDescriptor] = &[
     &crate::dispatch_agent::DESCRIPTOR,
     &crate::dispatch_agents_parallel::DESCRIPTOR,
     // coverage ledger
-    &coverage::COVERAGE_MARK,
-    &coverage::COVERAGE_STATUS,
-    &coverage::COVERAGE_REMAINING,
-    &coverage::COVERAGE_CONCERNS_SEARCH,
-    &coverage::COVERAGE_CONCERNS_DETAIL,
+    &crate::coverage::MARK,
+    &crate::coverage::STATUS,
+    &crate::coverage::REMAINING,
+    &crate::coverage::CONCERNS_SEARCH,
+    &crate::coverage::CONCERNS_DETAIL,
     // findings + assets
-    &findings::FINDINGS_REPORT,
-    &findings::FINDINGS_VERIFY,
-    &findings::FINDINGS_QUERY,
-    &findings::FINDINGS_TAG,
-    &findings::ASSETS_MARK,
+    &crate::findings::report::DESCRIPTOR,
+    &crate::findings::verify::DESCRIPTOR,
+    &crate::findings::query::DESCRIPTOR,
+    &crate::findings::tag::DESCRIPTOR,
+    &crate::assets::mark::DESCRIPTOR,
+    // connectors
+    &crate::scm::repos::LIST,
+    &crate::scm::repos::GET,
+    &crate::scm::branches::LIST,
+    &crate::scm::branches::CREATE,
+    &crate::scm::files::READ,
+    &crate::scm::prs::LIST,
+    &crate::scm::prs::GET,
+    &crate::scm::prs::DIFF,
+    &crate::scm::prs::COMMENT,
+    &crate::scm::prs::CREATE,
+    &crate::issues::LIST,
+    &crate::issues::GET,
+    &crate::issues::COMMENTS,
+    &crate::issues::COMMENT,
+    &crate::issues::CREATE,
+    &crate::issues::UPDATE_STATE,
+    &crate::github::WORKFLOWS_DISPATCH,
+    &crate::gitlab::PIPELINE_TRIGGER,
     // agentiflow
     &flow::BOARD_CLAIM,
     &flow::BOARD_RELEASE,

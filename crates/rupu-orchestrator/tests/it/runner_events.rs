@@ -96,7 +96,7 @@ async fn run_workflow_emits_run_and_step_events_in_order() {
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -194,7 +194,7 @@ steps:
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -254,7 +254,7 @@ steps:
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -399,7 +399,7 @@ steps:
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -528,7 +528,7 @@ steps:
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -591,7 +591,7 @@ async fn no_event_sink_does_not_emit_any_events() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -627,7 +627,7 @@ async fn every_agent_instance_is_announced_with_codename_provider_and_model() {
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -747,7 +747,7 @@ steps:
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };

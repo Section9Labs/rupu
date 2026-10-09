@@ -201,7 +201,7 @@ async fn distributed_fanout_round_robin_results_and_host_persisted() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: Some(dispatcher.clone()),
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -295,7 +295,7 @@ async fn local_fanout_control_produces_results_with_no_host_attribution() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -439,7 +439,7 @@ async fn placed_fanout_units_carry_minted_codenames_and_retry_is_attempt_two() {
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
         unit_dispatcher: Some(dispatcher.clone()),
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };

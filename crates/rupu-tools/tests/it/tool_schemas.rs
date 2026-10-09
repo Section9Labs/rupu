@@ -92,3 +92,57 @@ fn descriptions_are_non_empty() {
         );
     }
 }
+
+/// The connector tools moved from `rupu-mcp` into this crate (W4) with their
+/// names, descriptions and schemas unchanged: `connector_tools.json` is
+/// `rupu-mcp`'s `tools/list` snapshot of them from before the move.
+#[test]
+fn connector_tools_are_unchanged_by_the_move() {
+    let snapshot: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("../snapshots/connector_tools.json")).unwrap();
+    let connectors: Vec<_> = rupu_tools::ToolCatalog::all()
+        .iter()
+        .filter(|d| d.is_connector())
+        .collect();
+    assert_eq!(connectors.len(), snapshot.len());
+    for (d, want) in connectors.iter().zip(&snapshot) {
+        assert_eq!(d.name, want["name"], "catalog order");
+        assert_eq!(d.description, want["description"], "{}", d.name);
+        assert_eq!((d.input_schema)(), want["inputSchema"], "{}", d.name);
+    }
+}
+
+/// W4 §6.4: a summary-profile run's model sees today's summary schema, and a
+/// full-profile run today's full schema (snapshots of the schemas before
+/// findings got one implementation). Re-bless with `BLESS=1`.
+#[test]
+fn findings_report_schema_follows_the_runs_profile() {
+    use rupu_coverage::{FindingProfile, FindingWriteOptions};
+    use rupu_tools::findings::report::FindingsReportTool;
+    for (profile, file) in [
+        (FindingProfile::Summary, "findings_report_summary.json"),
+        (FindingProfile::Full, "findings_report_full.json"),
+    ] {
+        let got = FindingsReportTool::new(FindingWriteOptions::default().with_profile(profile))
+            .input_schema();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/snapshots")
+            .join(file);
+        if std::env::var("BLESS").is_ok() {
+            std::fs::write(&path, serde_json::to_string_pretty(&got).unwrap()).unwrap();
+        }
+        let want: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(got, want, "{file}");
+    }
+}
+
+/// Every catalog schema compiles as a JSON Schema (it is what `rupu mcp
+/// serve`, `/api/tools` and the provider requests carry).
+#[test]
+fn every_catalog_schema_compiles() {
+    for d in rupu_tools::ToolCatalog::all() {
+        jsonschema::JSONSchema::compile(&(d.input_schema)())
+            .unwrap_or_else(|e| panic!("{} has an invalid input_schema: {e}", d.name));
+    }
+}

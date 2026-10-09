@@ -9,11 +9,12 @@
 //! for the gate-only cases; a small `EchoFactory` covers the cases with a
 //! following linear step.
 
+use crate::support::action_services;
 use async_trait::async_trait;
 use rupu_agent::runner::MockProvider;
 use rupu_agent::runner::ScriptedTurn;
-use rupu_mcp::{McpPermission, ToolDispatcher};
 use rupu_orchestrator::executor::JsonlSink;
+use rupu_orchestrator::runner::ActionServices;
 use rupu_orchestrator::runner::{
     record_gate_decision, run_reject_cleanup, run_workflow, OrchestratorRunOpts, ResumeState,
     StepFactory,
@@ -206,21 +207,17 @@ impl RepoConnector for RecordingConnector {
     }
 }
 
-/// Builds a `ToolDispatcher` wired to a single `RecordingConnector` on
-/// `Platform::Github`, returning both so tests can assert on recorded calls
-/// after the run. Mirrors `dispatcher_with_connector` in `tests/it/action_step.rs`.
-fn dispatcher_with_connector(fail: bool) -> (Arc<ToolDispatcher>, Arc<RecordingConnector>) {
+/// Action services over a single `RecordingConnector` on `Platform::Github`,
+/// returned with it so tests can assert on recorded calls after the run.
+/// Mirrors `dispatcher_with_connector` in `tests/it/action_step.rs`.
+fn dispatcher_with_connector(fail: bool) -> (ActionServices, Arc<RecordingConnector>) {
     let connector = Arc::new(RecordingConnector {
         calls: Mutex::new(Vec::new()),
         fail,
     });
     let mut reg = Registry::empty();
     reg.insert_repo_connector(Platform::Github, connector.clone());
-    let dispatcher = Arc::new(ToolDispatcher::new(
-        Arc::new(reg),
-        McpPermission::new(PermissionMode::Bypass, vec!["*".into()]),
-    ));
-    (dispatcher, connector)
+    (action_services(reg, PermissionMode::Bypass), connector)
 }
 
 /// Read every event line out of a (flushed) `events.jsonl` file as raw JSON
@@ -273,7 +270,7 @@ async fn gate_auto_approve_completes_without_pausing() {
         strict_templates: false,
         event_sink: Some(sink.clone()),
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -349,7 +346,7 @@ async fn gate_without_auto_approve_parks_awaiting_approval() {
         strict_templates: false,
         event_sink: Some(sink.clone()),
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -415,7 +412,7 @@ async fn gate_approve_resume_continues_to_next_step() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -463,7 +460,7 @@ async fn gate_approve_resume_continues_to_next_step() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -543,7 +540,7 @@ async fn gate_as_last_step_approve_resume_completes_run() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -588,7 +585,7 @@ async fn gate_as_last_step_approve_resume_completes_run() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -657,7 +654,7 @@ async fn reject_runs_on_reject_cleanup_chain() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -719,7 +716,7 @@ async fn reject_runs_on_reject_cleanup_chain() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -826,7 +823,7 @@ async fn reject_cleanup_step_failure_does_not_change_terminal_outcome() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -868,7 +865,7 @@ async fn reject_cleanup_step_failure_does_not_change_terminal_outcome() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -929,7 +926,7 @@ async fn reject_cleanup_with_empty_on_reject_dispatches_nothing() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -985,7 +982,7 @@ async fn reject_cleanup_with_empty_on_reject_dispatches_nothing() {
         strict_templates: false,
         event_sink: Some(sink.clone()),
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -1050,7 +1047,7 @@ async fn reject_cleanup_does_not_record_the_gate_twice_on_a_retry() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -1115,7 +1112,7 @@ async fn reject_cleanup_does_not_record_the_gate_twice_on_a_retry() {
         strict_templates: false,
         event_sink: Some(sink),
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -1186,7 +1183,7 @@ async fn timeout_reject_records_via_timeout_not_human() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -1243,7 +1240,7 @@ async fn timeout_reject_records_via_timeout_not_human() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -1332,7 +1329,7 @@ async fn notify_fires_when_gate_parks() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: Some(dispatcher),
+        action_services: Some(dispatcher),
         pause: None,
         naming: None,
     };
@@ -1400,7 +1397,7 @@ steps:
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: Some(dispatcher),
+        action_services: Some(dispatcher),
         pause: None,
         naming: None,
     };
@@ -1445,7 +1442,7 @@ async fn notify_failure_does_not_block_the_park() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: Some(dispatcher),
+        action_services: Some(dispatcher),
         pause: None,
         naming: None,
     };
@@ -1467,7 +1464,7 @@ async fn notify_failure_does_not_block_the_park() {
 // Test 12 — no action dispatcher wired: notify is skipped (warned), the gate
 // still parks normally rather than erroring.
 #[tokio::test]
-async fn notify_skips_gracefully_with_no_action_dispatcher() {
+async fn notify_skips_gracefully_with_no_action_services() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Arc::new(RunStore::new(tmp.path().join("runs")));
     let wf = Workflow::parse(WF_GATE_NOTIFY).unwrap();
@@ -1490,7 +1487,7 @@ async fn notify_skips_gracefully_with_no_action_dispatcher() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -1566,7 +1563,7 @@ async fn reject_one_gate_of_a_multi_gate_set_runs_its_own_cleanup_leaves_sibling
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -1645,7 +1642,7 @@ async fn reject_one_gate_of_a_multi_gate_set_runs_its_own_cleanup_leaves_sibling
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -1751,7 +1748,7 @@ async fn reject_one_gate_of_a_multi_gate_set_runs_its_own_cleanup_leaves_sibling
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -1815,7 +1812,7 @@ steps:
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -1875,7 +1872,7 @@ steps:
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -1929,7 +1926,7 @@ async fn notify_hook_transcript_is_referenced_by_a_persisted_step_result() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: Some(dispatcher),
+        action_services: Some(dispatcher),
         pause: None,
         naming: None,
     };
@@ -2010,7 +2007,7 @@ async fn resuming_one_gates_path_does_not_refire_a_still_parked_siblings_notify(
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: Some(dispatcher.clone()),
+        action_services: Some(dispatcher.clone()),
         pause: None,
         naming: None,
     };

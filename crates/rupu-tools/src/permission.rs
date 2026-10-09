@@ -190,7 +190,7 @@ impl PermissionPolicy {
     }
 
     /// [`Self::decide`] for a tool known by canonical name and effect rather
-    /// than by descriptor (the MCP dispatcher's catalog entries).
+    /// than by descriptor.
     pub fn decide_call(
         &self,
         tool: &'static str,

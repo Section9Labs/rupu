@@ -1,11 +1,42 @@
-//! Descriptors of the coverage-ledger tools (bodies in `rupu-agent`'s
-//! `coverage_tools` until W4 moves them here).
+//! `coverage.*`: the coverage ledger of a run with a `concerns:` block.
+//! They read the run's flattened concern catalog from
+//! [`ToolServices::coverage_catalog`](crate::ToolServices::coverage_catalog)
+//! and write the ledger of the run's findings scope ([`crate::ledger`]).
 
+use crate::coverage_emit::attribution_from;
 use crate::descriptor::{Alias, Effect, Service, ToolDescriptor};
+use crate::output::{failed, ok};
+use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
+use async_trait::async_trait;
+use rupu_coverage::{
+    coverage_concerns_detail, coverage_concerns_search, coverage_mark, coverage_remaining,
+    coverage_status, CoverageConcernsDetailInput, CoverageConcernsSearchInput, CoverageMarkInput,
+    CoverageRemainingInput, CoverageStatusInput, FlatCatalog,
+};
 use serde_json::Value;
+use std::sync::Arc;
+use std::time::Instant;
+
+fn parse<T: serde::de::DeserializeOwned>(input: Value) -> Result<T, ToolError> {
+    serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))
+}
+
+/// The run's concern catalog. A run without one is never offered these
+/// tools (they need [`Service::Coverage`]).
+fn catalog(ctx: &ToolContext) -> Result<&Arc<FlatCatalog>, ToolError> {
+    ctx.services.coverage_catalog.as_ref().ok_or_else(|| {
+        ToolError::Execution(
+            "this run has no `concerns:` catalog, so coverage tools can't run".into(),
+        )
+    })
+}
+
+fn pretty<T: serde::Serialize>(v: &T, empty: &str) -> String {
+    serde_json::to_string_pretty(v).unwrap_or_else(|_| empty.to_string())
+}
 
 // was `coverage_mark`
-pub static COVERAGE_MARK: ToolDescriptor = ToolDescriptor {
+pub static MARK: ToolDescriptor = ToolDescriptor {
     name: "coverage.mark",
     aliases: &[Alias::any("coverage_mark")],
     effect: Effect::Record,
@@ -15,10 +46,10 @@ pub static COVERAGE_MARK: ToolDescriptor = ToolDescriptor {
      Status must be one of: clean | finding | not_applicable. \
      The file must have been read at the required min_strength first, \
      unless status is not_applicable.",
-    input_schema: coverage_mark_schema,
+    input_schema: mark_schema,
 };
 
-fn coverage_mark_schema() -> Value {
+fn mark_schema() -> Value {
     serde_json::json!({
         "type": "object",
         "required": ["concern_id", "file_path", "status", "evidence"],
@@ -60,8 +91,35 @@ fn coverage_mark_schema() -> Value {
     })
 }
 
+pub struct CoverageMarkTool;
+
+#[async_trait]
+impl Tool for CoverageMarkTool {
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &MARK
+    }
+
+    async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let started = Instant::now();
+        let parsed: CoverageMarkInput = parse(input)?;
+        let catalog = catalog(ctx)?;
+        let paths = crate::ledger::paths(ctx);
+        match coverage_mark(&paths, catalog, attribution_from(ctx), parsed).await {
+            Ok(out) => {
+                let text = if out.warnings.is_empty() {
+                    "ok".to_string()
+                } else {
+                    format!("ok\nwarnings:\n{}", out.warnings.join("\n"))
+                };
+                Ok(ok(text).timed(started))
+            }
+            Err(e) => Ok(failed(e.to_string()).timed(started)),
+        }
+    }
+}
+
 // was `coverage_status`
-pub static COVERAGE_STATUS: ToolDescriptor = ToolDescriptor {
+pub static STATUS: ToolDescriptor = ToolDescriptor {
     name: "coverage.status",
     aliases: &[Alias::any("coverage_status")],
     effect: Effect::Read,
@@ -69,10 +127,10 @@ pub static COVERAGE_STATUS: ToolDescriptor = ToolDescriptor {
     uses: &[],
     description: "Query existing coverage assertions. Optionally filter by concern_id, \
      file_path_prefix, or since timestamp. Returns a JSON array of assertion records.",
-    input_schema: coverage_status_schema,
+    input_schema: status_schema,
 };
 
-fn coverage_status_schema() -> Value {
+fn status_schema() -> Value {
     serde_json::json!({
         "type": "object",
         "properties": {
@@ -93,8 +151,27 @@ fn coverage_status_schema() -> Value {
     })
 }
 
+pub struct CoverageStatusTool;
+
+#[async_trait]
+impl Tool for CoverageStatusTool {
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &STATUS
+    }
+
+    async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let started = Instant::now();
+        let parsed: CoverageStatusInput = parse(input)?;
+        catalog(ctx)?;
+        match coverage_status(&crate::ledger::paths(ctx), parsed) {
+            Ok(assertions) => Ok(ok(pretty(&assertions, "[]")).timed(started)),
+            Err(e) => Ok(failed(e.to_string()).timed(started)),
+        }
+    }
+}
+
 // was `coverage_remaining`
-pub static COVERAGE_REMAINING: ToolDescriptor = ToolDescriptor {
+pub static REMAINING: ToolDescriptor = ToolDescriptor {
     name: "coverage.remaining",
     aliases: &[Alias::any("coverage_remaining")],
     effect: Effect::Read,
@@ -103,10 +180,10 @@ pub static COVERAGE_REMAINING: ToolDescriptor = ToolDescriptor {
     description: "List (concern_id, file_path) pairs that have been touched but not yet \
      asserted. Optionally filter by concern_id or min_strength. \
      Use this to discover what still needs coverage.mark calls.",
-    input_schema: coverage_remaining_schema,
+    input_schema: remaining_schema,
 };
 
-fn coverage_remaining_schema() -> Value {
+fn remaining_schema() -> Value {
     serde_json::json!({
         "type": "object",
         "properties": {
@@ -123,8 +200,27 @@ fn coverage_remaining_schema() -> Value {
     })
 }
 
+pub struct CoverageRemainingTool;
+
+#[async_trait]
+impl Tool for CoverageRemainingTool {
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &REMAINING
+    }
+
+    async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let started = Instant::now();
+        let parsed: CoverageRemainingInput = parse(input)?;
+        let catalog = catalog(ctx)?;
+        match coverage_remaining(&crate::ledger::paths(ctx), catalog, parsed) {
+            Ok(items) => Ok(ok(pretty(&items, "[]")).timed(started)),
+            Err(e) => Ok(failed(e.to_string()).timed(started)),
+        }
+    }
+}
+
 // was `coverage_concerns_search`
-pub static COVERAGE_CONCERNS_SEARCH: ToolDescriptor = ToolDescriptor {
+pub static CONCERNS_SEARCH: ToolDescriptor = ToolDescriptor {
     name: "coverage.concerns.search",
     aliases: &[Alias::any("coverage_concerns_search")],
     effect: Effect::Read,
@@ -133,10 +229,10 @@ pub static COVERAGE_CONCERNS_SEARCH: ToolDescriptor = ToolDescriptor {
     description: "Search the concern catalog by substring and/or filter. Returns up to `limit` \
 matching concerns in summary form (id, name, severity, summary) by default, or full \
 form if `form: 'full'`. Use when the catalog is too large to inline in the prompt.",
-    input_schema: coverage_concerns_search_schema,
+    input_schema: concerns_search_schema,
 };
 
-fn coverage_concerns_search_schema() -> Value {
+fn concerns_search_schema() -> Value {
     serde_json::json!({
         "type": "object",
         "properties": {
@@ -169,8 +265,24 @@ fn coverage_concerns_search_schema() -> Value {
     })
 }
 
+pub struct CoverageConcernsSearchTool;
+
+#[async_trait]
+impl Tool for CoverageConcernsSearchTool {
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &CONCERNS_SEARCH
+    }
+
+    async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let started = Instant::now();
+        let parsed: CoverageConcernsSearchInput = parse(input)?;
+        let results = coverage_concerns_search(catalog(ctx)?, parsed);
+        Ok(ok(pretty(&results, "[]")).timed(started))
+    }
+}
+
 // was `coverage_concerns_detail`
-pub static COVERAGE_CONCERNS_DETAIL: ToolDescriptor = ToolDescriptor {
+pub static CONCERNS_DETAIL: ToolDescriptor = ToolDescriptor {
     name: "coverage.concerns.detail",
     aliases: &[Alias::any("coverage_concerns_detail")],
     effect: Effect::Read,
@@ -178,10 +290,10 @@ pub static COVERAGE_CONCERNS_DETAIL: ToolDescriptor = ToolDescriptor {
     uses: &[],
     description: "Fetch full concern records by id. Use after coverage.concerns.search finds a \
 relevant concern and you need its full description, applicable_globs, or references.",
-    input_schema: coverage_concerns_detail_schema,
+    input_schema: concerns_detail_schema,
 };
 
-fn coverage_concerns_detail_schema() -> Value {
+fn concerns_detail_schema() -> Value {
     serde_json::json!({
         "type": "object",
         "required": ["concern_ids"],
@@ -189,4 +301,20 @@ fn coverage_concerns_detail_schema() -> Value {
             "concern_ids": { "type": "array", "items": { "type": "string" } }
         }
     })
+}
+
+pub struct CoverageConcernsDetailTool;
+
+#[async_trait]
+impl Tool for CoverageConcernsDetailTool {
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &CONCERNS_DETAIL
+    }
+
+    async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let started = Instant::now();
+        let parsed: CoverageConcernsDetailInput = parse(input)?;
+        let out = coverage_concerns_detail(catalog(ctx)?, parsed);
+        Ok(ok(pretty(&out, "{}")).timed(started))
+    }
 }

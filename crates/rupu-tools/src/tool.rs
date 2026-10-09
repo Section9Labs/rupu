@@ -177,7 +177,7 @@ impl Default for WorkspaceScope {
 /// The services a run provides its tools (P7: a granted tool whose service
 /// is absent is not offered, and the grant names it `tool_unavailable`).
 /// Built by the run assembler; the agent loop adds only the coverage writer
-/// it owns.
+/// and concern catalog it owns.
 #[derive(Clone, Default)]
 pub struct ToolServices {
     /// The in-process sub-agent dispatcher behind `dispatch_agent` /
@@ -195,6 +195,9 @@ pub struct ToolServices {
     /// File-touching builtins emit FileTouchEvents to it; `None` disables
     /// coverage capture.
     pub coverage_writer: Option<Arc<rupu_coverage::CoverageWriter>>,
+    /// The flattened concern catalog of a `concerns:` run, which the
+    /// `coverage.*` tools read. Set by the agent loop with the writer.
+    pub coverage_catalog: Option<Arc<rupu_coverage::FlatCatalog>>,
     /// Where this run's coverage is streamed for a coordinator to collect
     /// (`$RUPU_HOME/runs/<run_id>/coverage.jsonl`). Set by `rupu run` — the
     /// command every host connector launches — and shared with its
@@ -215,6 +218,43 @@ pub struct ToolServices {
     pub prompter: Option<Arc<dyn Prompter>>,
 }
 
+impl ToolServices {
+    /// The services these provide, for a grant (W2). Exact by construction:
+    /// a service is here only when [`crate::bodies::body`] can build every
+    /// tool needing it from a context holding these. `coverage` says the run
+    /// has a `concerns:` block (its catalog is flattened once the loop
+    /// starts, so it isn't in [`Self::coverage_catalog`] yet at assembly).
+    pub fn provided(&self, coverage: bool) -> crate::grant::ServiceSet {
+        use crate::descriptor::Service;
+        // The findings ledger lives in the workspace: every run can open it.
+        let mut s = crate::grant::ServiceSet::new().with(Service::Findings);
+        if coverage || self.coverage_catalog.is_some() {
+            s.insert(Service::Coverage);
+        }
+        if self
+            .findings
+            .as_ref()
+            .is_some_and(|f| f.engagement.is_some())
+        {
+            s.insert(Service::Engagement);
+        }
+        if self.scm.is_some() {
+            s.insert(Service::Scm);
+        }
+        if self.dispatcher.is_some() {
+            s.insert(Service::AgentDispatcher);
+        }
+        if self.netflow_sink.is_some() {
+            s.insert(Service::Netflow);
+        }
+        // The agentiflow services (message bus, run status, catalog, the
+        // unit launcher, the workflow generator) have no body in the catalog
+        // until W5/W7: their tools reach a run only injected, as self-served
+        // grants.
+        s
+    }
+}
+
 // Hand-written because the trait objects are not `Debug`.
 impl std::fmt::Debug for ToolServices {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -223,6 +263,10 @@ impl std::fmt::Debug for ToolServices {
             .field("scm", &self.scm.as_ref().map(|_| "<registry>"))
             .field("findings", &self.findings)
             .field("coverage_writer", &self.coverage_writer)
+            .field(
+                "coverage_catalog",
+                &self.coverage_catalog.as_ref().map(|_| "<catalog>"),
+            )
             .field("coverage_stream", &self.coverage_stream)
             .field(
                 "netflow_sink",
