@@ -16,6 +16,9 @@ rupu-netflow = { workspace = true }
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_path_to_error.workspace = true
+schemars.workspace = true
+anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
@@ -27,5 +30,7 @@ globwalk = "0.9"
 
 [dev-dependencies]
 tempfile.workspace = true
+jsonschema.workspace = true
+rupu-scm = { path = "../rupu-scm", features = ["test-helpers"] }
 assert_fs.workspace = true
 predicates.workspace = true

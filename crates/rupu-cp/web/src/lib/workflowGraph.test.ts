@@ -1919,6 +1919,11 @@ describe('findings_profile: validateGraph (mirrors workflow.rs parse rules)', ()
     expect(validateGraph(g)).toEqual({});
   });
 
+  it('accepts it on the canonical findings.report name too (W4: one findings tool)', () => {
+    const g = wf([{ id: 'rec', action: 'findings.report', with: { scope: 'repo' }, findings_profile: 'summary' }]);
+    expect(validateGraph(g)).toEqual({});
+  });
+
   it('flags it on an action step calling any other tool', () => {
     const g = wf([{ id: 'c', action: 'issues.comment', with: {}, findings_profile: 'summary' }]);
     const msg = (validateGraph(g).c ?? []).join(' ');

@@ -762,9 +762,9 @@ describe('StepForm — action body (Task 5)', () => {
       name: 'scm.prs.create',
       description: 'Open a PR',
       input_schema: { properties: { title: {}, base: {} } },
-      kind: 'write' as const,
+      aliases: [], namespace: 'scm', effect: 'external' as const, needs: ['scm'], action_eligible: true,
     },
-    { name: 'issues.comment', description: 'Comment', input_schema: { properties: { body: {} } }, kind: 'write' as const },
+    { name: 'issues.comment', description: 'Comment', input_schema: { properties: { body: {} } }, aliases: [], namespace: 'issues', effect: 'external' as const, needs: ['scm'], action_eligible: true },
   ];
 
   function ActionHarness({ spy }: { spy: (d: StepNodeData) => void }) {
@@ -825,13 +825,43 @@ describe('StepForm — action body (Task 5)', () => {
     expect(last.with).toEqual({ title: 3 });
     expect(typeof (last.with as Record<string, unknown>).title).toBe('number');
   });
+
+  it('a legacy alias selects its catalog tool and round-trips as written (W4)', () => {
+    const report = {
+      name: 'findings.report',
+      description: 'Record a finding',
+      input_schema: { properties: { scope: {}, rationale: {} } },
+      aliases: ['report_finding', 'findings.record'],
+      namespace: 'findings',
+      effect: 'record' as const,
+      needs: ['findings'],
+      action_eligible: true,
+    };
+    const node = nodeWith({ kind: 'action', action: 'findings.record', with: {} });
+    render(
+      <StepForm
+        node={node}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        tools={[...TOOLS, report]}
+        onChange={vi.fn()}
+      />,
+    );
+    expect(screen.getByLabelText('Action tool')).toHaveValue('findings.record');
+    // One option for the tool, under the name the step uses.
+    expect(screen.getByRole('option', { name: 'findings.record' })).toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: 'findings.report' })).not.toBeInTheDocument();
+    // Its schema's params render.
+    expect(screen.getByLabelText('With rationale')).toBeInTheDocument();
+  });
 });
 
 describe('StepForm — actions: picker (Task 3)', () => {
   const CATALOG = [
-    { name: 'issues.list', description: 'List issues', input_schema: {}, kind: 'read' as const },
-    { name: 'issues.create', description: 'Create an issue', input_schema: {}, kind: 'write' as const },
-    { name: 'scm.repos.list', description: 'List repos', input_schema: {}, kind: 'read' as const },
+    { name: 'issues.list', description: 'List issues', input_schema: {}, aliases: [], namespace: 'issues', effect: 'read' as const, needs: ['scm'], action_eligible: true },
+    { name: 'issues.create', description: 'Create an issue', input_schema: {}, aliases: [], namespace: 'issues', effect: 'external' as const, needs: ['scm'], action_eligible: true },
+    { name: 'scm.repos.list', description: 'List repos', input_schema: {}, aliases: [], namespace: 'scm', effect: 'read' as const, needs: ['scm'], action_eligible: true },
   ];
 
   const AGENTS_WITH_TOOLS: AgentSummary[] = [
@@ -861,6 +891,31 @@ describe('StepForm — actions: picker (Task 3)', () => {
 
     fireEvent.click(screen.getByLabelText('Action issues.list'));
     expect(spy).toHaveBeenLastCalledWith(expect.objectContaining({ actions: ['issues.list'] }));
+  });
+
+  it('offers only connector tools: `actions:` narrows nothing else (W4)', () => {
+    const query = {
+      name: 'findings.query',
+      description: 'Query findings',
+      input_schema: {},
+      aliases: ['query_findings'],
+      namespace: 'findings',
+      effect: 'read' as const,
+      needs: ['findings'],
+      action_eligible: true,
+    };
+    render(
+      <StepForm
+        node={nodeWith({ kind: 'step', agent: 'issue-reporter' })}
+        agents={AGENTS_WITH_TOOLS}
+        problems={[]}
+        exprContext={EXPR}
+        tools={[...CATALOG, query]}
+        onChange={vi.fn()}
+      />,
+    );
+    expect(screen.getByLabelText('Action issues.list')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Action findings.query')).not.toBeInTheDocument();
   });
 
   it('an action: step shows NO actions control (spec §3b)', () => {

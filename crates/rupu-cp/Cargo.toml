@@ -60,7 +60,6 @@ rupu-coverage = { path = "../rupu-coverage" }
 rupu-transcript = { path = "../rupu-transcript" }
 rupu-ast = { path = "../rupu-ast" }
 rupu-scm = { path = "../rupu-scm" }
-rupu-mcp = { path = "../rupu-mcp" }
 rupu-findings-report = { path = "../rupu-findings-report", default-features = false }
 rupu-codename = { workspace = true }
 # Agentiflows view: the run-dir record/def/unit readers (`api/agentiflows.rs`).

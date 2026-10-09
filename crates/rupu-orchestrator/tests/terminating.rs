@@ -109,7 +109,7 @@ fn opts(
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: dispatcher,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     }

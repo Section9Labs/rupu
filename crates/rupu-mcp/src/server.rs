@@ -1,41 +1,103 @@
-//! MCP server kernel — JSON-RPC 2.0 dispatch loop over a Transport.
+//! [`CatalogServer`]: JSON-RPC 2.0 over a [`Transport`], serving a resolved
+//! grant of the `rupu-tools` catalog.
 
-use crate::error::McpError;
-use crate::permission::McpPermission;
-use crate::transport::{InProcessTransport, Transport};
-use rupu_scm::Registry;
+use crate::error::{McpError, ServeError};
+use crate::transport::Transport;
+use rupu_tools::call::{call, CallOutcome};
+use rupu_tools::{
+    AliasScope, AllowAlways, GrantInputs, PermissionMode, PermissionPolicy, Tool, ToolCatalog,
+    ToolContext, Unavailable,
+};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::sync::Arc;
-use tokio::task::JoinHandle;
-use tracing::{debug, error, warn};
+use tokio::sync::Mutex;
+use tracing::{debug, warn};
 
-pub struct McpServer<T: Transport + 'static> {
-    registry: Arc<Registry>,
+/// What `rupu mcp serve` serves without `--tools`: the connector tools and
+/// the findings tools — the set the MCP server exposed before it became a
+/// transport over the catalog.
+pub const MCP_DEFAULT_GRANT: &[&str] = &["scm.*", "issues.*", "github.*", "gitlab.*", "findings.*"];
+
+/// Serves the tools of one grant, each called in `ctx` under `policy`.
+pub struct CatalogServer<T: Transport + 'static> {
+    /// Canonical name → body, for every tool the grant offers.
+    tools: BTreeMap<&'static str, Arc<dyn Tool>>,
+    ctx: ToolContext,
+    policy: PermissionPolicy,
+    always: Mutex<AllowAlways>,
     transport: T,
-    permission: McpPermission,
 }
 
-impl<T: Transport + 'static> McpServer<T> {
-    pub fn new(registry: Arc<Registry>, transport: T, permission: McpPermission) -> Self {
-        Self {
-            registry,
-            transport,
-            permission,
+impl<T: Transport + 'static> CatalogServer<T> {
+    /// A server for the grant `tools` (W2 grammar; `None` =
+    /// [`MCP_DEFAULT_GRANT`]) over the services `ctx` provides, calling each
+    /// tool under `mode` with no operator to prompt (ask = allow, with the
+    /// MCP client's own confirmation UX in front of it).
+    ///
+    /// Returns the tools the grant names but `ctx` can't serve (a launcher,
+    /// a message bus, …): not listed, and for the caller to report.
+    pub fn new(
+        transport: T,
+        ctx: ToolContext,
+        mode: PermissionMode,
+        tools: Option<&[String]>,
+    ) -> Result<(Self, Vec<Unavailable>), ServeError> {
+        let default: Vec<String> = MCP_DEFAULT_GRANT.iter().map(|s| s.to_string()).collect();
+        let grant = ToolCatalog::builtin().resolve_grant(GrantInputs {
+            declared: Some(tools.unwrap_or(&default)),
+            step_actions: &[],
+            ambient: &[],
+            available: &ctx.services.provided(false),
+            alias_scope: AliasScope::Everywhere,
+        })?;
+        let mut served = BTreeMap::new();
+        for name in grant.entries.keys() {
+            // `provided` and `bodies::body` keep the same accounting, so a
+            // granted tool always has a body here; if not, refuse to start
+            // rather than list a tool that can't run.
+            let body = rupu_tools::bodies::body(name, &ctx)
+                .ok_or_else(|| ServeError::NoBody(name.to_string()))?;
+            served.insert(*name, body);
         }
+        Ok((
+            Self {
+                tools: served,
+                ctx,
+                policy: PermissionPolicy::unattended(mode),
+                always: Mutex::new(AllowAlways::default()),
+                transport,
+            },
+            grant.unavailable,
+        ))
     }
 
+    /// The canonical names this server lists, in catalog order.
+    pub fn tool_names(&self) -> Vec<&'static str> {
+        ToolCatalog::all()
+            .iter()
+            .map(|d| d.name)
+            .filter(|n| self.tools.contains_key(n))
+            .collect()
+    }
+
+    /// Serve until the transport closes.
     pub async fn run(self) -> Result<(), McpError> {
         loop {
             let msg = match self.transport.recv().await? {
                 Some(m) => m,
                 None => return Ok(()),
             };
-            let id = msg.get("id").cloned().unwrap_or(Value::Null);
-            let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("");
-            let _params = msg.get("params").cloned().unwrap_or(Value::Null);
-
+            // A JSON-RPC notification (no `id`, e.g. `notifications/
+            // initialized`) is never answered.
+            let Some(id) = msg.get("id").cloned() else {
+                debug!(method = ?msg.get("method"), "notification");
+                continue;
+            };
+            let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+            let params = msg.get("params").cloned().unwrap_or(Value::Null);
             let response = match method {
-                "initialize" => Ok(json!({
+                "initialize" => json!({
                     "jsonrpc": "2.0",
                     "id": id,
                     "result": {
@@ -43,194 +105,66 @@ impl<T: Transport + 'static> McpServer<T> {
                         "serverInfo": { "name": "rupu", "version": env!("CARGO_PKG_VERSION") },
                         "capabilities": { "tools": {} },
                     },
-                })),
-                "tools/list" => Ok(json!({
+                }),
+                "tools/list" => json!({
                     "jsonrpc": "2.0",
                     "id": id,
-                    "result": { "tools": crate::tools::tool_catalog() },
-                })),
+                    "result": { "tools": self.list() },
+                }),
                 "tools/call" => {
-                    let name = _params
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let arguments = _params.get("arguments").cloned().unwrap_or(Value::Null);
-                    let dispatcher = crate::dispatcher::ToolDispatcher::new(
-                        self.registry.clone(),
-                        self.permission.clone(),
-                    );
-                    match dispatcher.call(&name, arguments).await {
-                        Ok(text) => Ok(json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": { "content": [{"type": "text", "text": text}] }
-                        })),
-                        Err(e) => {
-                            warn!(tool = %name, error = %e, "tool dispatch failed");
-                            Ok(json!({
-                                "jsonrpc": "2.0",
-                                "id": id,
-                                "result": {
-                                    "isError": true,
-                                    "content": [{"type": "text", "text": e.to_string()}]
-                                }
-                            }))
+                    let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+                    let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+                    let result = match self.call(name, arguments).await {
+                        Ok(text) => json!({ "content": [{"type": "text", "text": text}] }),
+                        Err(text) => {
+                            warn!(tool = %name, error = %text, "tool call failed");
+                            json!({
+                                "isError": true,
+                                "content": [{"type": "text", "text": text}]
+                            })
                         }
-                    }
+                    };
+                    json!({ "jsonrpc": "2.0", "id": id, "result": result })
                 }
-                other => {
-                    debug!(method = other, "unknown method");
-                    Err(McpError::UnknownTool(other.to_string()))
-                }
+                other => McpError::UnknownMethod(other.to_string()).to_jsonrpc(id),
             };
-
-            match response {
-                Ok(v) => self.transport.send(v).await?,
-                Err(e) => self.transport.send(e.to_jsonrpc(id)).await?,
-            }
+            self.transport.send(response).await?;
         }
     }
-}
 
-pub struct ServeHandle {
-    pub join: JoinHandle<Result<(), McpError>>,
-}
+    /// `tools/list`: each served tool with the schema its body offers in
+    /// this context.
+    fn list(&self) -> Vec<Value> {
+        self.tool_names()
+            .into_iter()
+            .map(|n| {
+                let t = &self.tools[n];
+                json!({
+                    "name": n,
+                    "description": t.description(),
+                    "inputSchema": t.input_schema(),
+                })
+            })
+            .collect()
+    }
 
-/// Spin up the MCP server in-process. Returns the client handle the
-/// agent runtime uses to send `tools/call` requests, plus a JoinHandle
-/// the caller drops at run end to tear down cleanly.
-pub fn serve_in_process(
-    registry: Arc<Registry>,
-    permission: McpPermission,
-) -> (InProcessTransport, ServeHandle) {
-    let (client_t, server_t) = InProcessTransport::pair();
-    let server = McpServer::new(registry, server_t, permission);
-    let join = tokio::spawn(async move {
-        if let Err(e) = server.run().await {
-            error!(error = %e, "mcp server failed");
-            return Err(e);
+    /// `tools/call`: the name (canonical or a legacy alias) must be one this
+    /// server serves.
+    async fn call(&self, name: &str, arguments: Value) -> Result<String, String> {
+        let Some(d) = ToolCatalog::builtin().resolve_name(name, AliasScope::Everywhere) else {
+            return Err(format!("unknown tool: {name}"));
+        };
+        let Some(tool) = self.tools.get(d.name) else {
+            return Err(format!(
+                "tool `{name}` is not served here (not in this server's --tools grant, or \
+                 it needs a service `rupu mcp serve` can't provide)"
+            ));
+        };
+        let mut always = self.always.lock().await;
+        match call(&**tool, arguments, &self.ctx, &self.policy, &mut always).await {
+            CallOutcome::Done(text) => Ok(text),
+            CallOutcome::Denied(reason) => Err(format!("permission denied: {reason}")),
+            CallOutcome::Failed(text) => Err(text),
         }
-        Ok(())
-    });
-    (client_t, ServeHandle { join })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::permission::McpPermission;
-    use crate::transport::Transport;
-
-    #[tokio::test]
-    async fn server_responds_to_initialize_and_tools_list() {
-        let registry = Arc::new(Registry::empty());
-        let (client, handle) = serve_in_process(registry, McpPermission::allow_all());
-
-        // initialize
-        client
-            .send(json!({
-                "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            }))
-            .await
-            .unwrap();
-        let resp = client.recv().await.unwrap().unwrap();
-        assert_eq!(resp["jsonrpc"], "2.0");
-        assert_eq!(resp["id"], 1);
-        assert_eq!(resp["result"]["serverInfo"]["name"], "rupu");
-
-        // tools/list
-        client
-            .send(json!({
-                "jsonrpc": "2.0", "id": 2, "method": "tools/list",
-            }))
-            .await
-            .unwrap();
-        let resp = client.recv().await.unwrap().unwrap();
-        assert_eq!(resp["id"], 2);
-        let tools = resp["result"]["tools"].as_array().unwrap();
-        assert!(
-            tools.len() >= 17,
-            "Tasks 11-13 add 17 tools (10 SCM + 5 issues + 2 extras); got {} entries",
-            tools.len()
-        );
-
-        // tools/call with unknown tool returns isError true (no panic)
-        client
-            .send(json!({
-                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-                "params": {"name": "scm.repo.typo", "arguments": {}}
-            }))
-            .await
-            .unwrap();
-        let resp = client.recv().await.unwrap().unwrap();
-        assert_eq!(resp["id"], 3);
-        assert_eq!(resp["result"]["isError"], true);
-
-        // unknown method → JSON-RPC error envelope
-        client
-            .send(json!({
-                "jsonrpc": "2.0", "id": 4, "method": "bogus/method",
-            }))
-            .await
-            .unwrap();
-        let resp = client.recv().await.unwrap().unwrap();
-        assert_eq!(resp["id"], 4);
-        assert_eq!(resp["error"]["code"], -32601);
-
-        drop(client);
-        let _ = handle.join.await;
-    }
-
-    #[tokio::test]
-    async fn unknown_tool_call_returns_error_is_error_true() {
-        let registry = Arc::new(Registry::empty());
-        let (client, handle) = serve_in_process(registry, McpPermission::allow_all());
-
-        client
-            .send(json!({
-                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                "params": {"name": "scm.repo.typo", "arguments": {}}
-            }))
-            .await
-            .unwrap();
-        let resp = client.recv().await.unwrap().unwrap();
-        assert_eq!(resp["id"], 1);
-        assert_eq!(resp["result"]["isError"], true);
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(
-            text.contains("unknown tool"),
-            "expected unknown-tool error, got: {text}"
-        );
-
-        drop(client);
-        let _ = handle.join.await;
-    }
-
-    #[tokio::test]
-    async fn permission_denied_for_tool_not_in_allowlist() {
-        let registry = Arc::new(Registry::empty());
-        let perm = McpPermission::new(
-            rupu_tools::PermissionMode::Bypass,
-            vec!["issues.*".into()], // only allows issues.* tools
-        );
-        let (client, handle) = serve_in_process(registry, perm);
-
-        client
-            .send(json!({
-                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                "params": {"name": "scm.repos.list", "arguments": {}}
-            }))
-            .await
-            .unwrap();
-        let resp = client.recv().await.unwrap().unwrap();
-        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(
-            text.contains("permission denied") || text.contains("PermissionDenied"),
-            "expected permission-denied, got: {text}"
-        );
-
-        drop(client);
-        let _ = handle.join.await;
     }
 }

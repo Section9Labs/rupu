@@ -1,5 +1,5 @@
 //! Action-step runtime (Plan 2, task 2): `action:` steps execute for real
-//! through the in-process MCP `ToolDispatcher`.
+//! through the tool catalog (`ActionServices`, spec W4 §3.3).
 //!
 //! Mirrors the harness shape of `tests/it/gate_node.rs`: a real disk-backed
 //! `RunStore`, `run_workflow` driven directly through its public
@@ -8,10 +8,11 @@
 //! every `comment_pr` call it receives so tests can assert on the exact
 //! (already-templated) body the dispatcher sent.
 
+use crate::support::{action_services, findings_action_services};
 use async_trait::async_trait;
 use rupu_agent::runner::{MockProvider, ScriptedTurn};
-use rupu_mcp::{McpPermission, ToolDispatcher};
 use rupu_orchestrator::executor::JsonlSink;
+use rupu_orchestrator::runner::{call_action_tool, ActionServices};
 use rupu_orchestrator::runner::{
     run_reject_cleanup, run_workflow, OrchestratorRunOpts, ResumeState, RunWorkflowError,
     StepFactory,
@@ -108,13 +109,12 @@ impl RepoConnector for RecordingConnector {
     }
 }
 
-/// Builds a `ToolDispatcher` wired to a single `RecordingConnector` on
-/// `Platform::Github`, returning both so tests can assert on recorded calls
-/// after the run.
+/// Action services over a single `RecordingConnector` on `Platform::Github`,
+/// returned with it so tests can assert on recorded calls after the run.
 fn dispatcher_with_connector(
     mode: PermissionMode,
     fail: bool,
-) -> (Arc<ToolDispatcher>, Arc<RecordingConnector>) {
+) -> (ActionServices, Arc<RecordingConnector>) {
     let connector = Arc::new(RecordingConnector {
         calls: Mutex::new(Vec::new()),
         fail,
@@ -124,11 +124,7 @@ fn dispatcher_with_connector(
     // coerced to the trait object while `connector` keeps the concrete
     // `Arc<RecordingConnector>` handle tests read `.calls` off of afterward.
     reg.insert_repo_connector(Platform::Github, connector.clone());
-    let dispatcher = Arc::new(ToolDispatcher::new(
-        Arc::new(reg),
-        McpPermission::new(mode, vec!["*".into()]),
-    ));
-    (dispatcher, connector)
+    (action_services(reg, mode), connector)
 }
 
 /// Records every `comment_issue` call it receives (as `(IssueRef, rendered
@@ -176,20 +172,16 @@ impl IssueConnector for RecordingIssueConnector {
     }
 }
 
-/// Builds a `ToolDispatcher` wired to a single `RecordingIssueConnector` on
-/// `IssueTracker::Github` (the sole connector, so `resolve_tracker`'s
-/// default-tracker fallback picks it with no `tracker:` in `with:`).
+/// Action services over a single `RecordingIssueConnector` on
+/// `IssueTracker::Github` (the sole connector, so the default-tracker
+/// fallback picks it with no `tracker:` in `with:`).
 fn dispatcher_with_issue_connector(
     mode: PermissionMode,
-) -> (Arc<ToolDispatcher>, Arc<RecordingIssueConnector>) {
+) -> (ActionServices, Arc<RecordingIssueConnector>) {
     let connector = Arc::new(RecordingIssueConnector::default());
     let mut reg = Registry::empty();
     reg.insert_issue_connector(IssueTracker::Github, connector.clone());
-    let dispatcher = Arc::new(ToolDispatcher::new(
-        Arc::new(reg),
-        McpPermission::new(mode, vec!["*".into()]),
-    ));
-    (dispatcher, connector)
+    (action_services(reg, mode), connector)
 }
 
 /// Echoes the rendered prompt back as the step's final assistant text —
@@ -322,7 +314,7 @@ async fn happy_path_action_step_dispatches_through_tool_dispatcher() {
         strict_templates: false,
         event_sink: Some(sink.clone()),
         unit_dispatcher: None,
-        action_dispatcher: Some(dispatcher),
+        action_services: Some(dispatcher),
         pause: None,
         naming: None,
     };
@@ -422,7 +414,7 @@ async fn templated_with_values_render_before_reaching_the_connector() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: Some(dispatcher),
+        action_services: Some(dispatcher),
         pause: None,
         naming: None,
     };
@@ -484,7 +476,7 @@ async fn templated_numeric_field_reaches_the_connector_as_a_json_number() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: Some(dispatcher),
+        action_services: Some(dispatcher),
         pause: None,
         naming: None,
     };
@@ -541,7 +533,7 @@ steps:
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: Some(dispatcher),
+        action_services: Some(dispatcher),
         pause: None,
         naming: None,
     };
@@ -605,7 +597,7 @@ steps:
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: Some(dispatcher),
+        action_services: Some(dispatcher),
         pause: None,
         naming: None,
     };
@@ -669,7 +661,7 @@ async fn connector_error_fails_the_run_by_default() {
         strict_templates: false,
         event_sink: Some(sink.clone()),
         unit_dispatcher: None,
-        action_dispatcher: Some(dispatcher),
+        action_services: Some(dispatcher),
         pause: None,
         naming: None,
     };
@@ -731,7 +723,7 @@ steps:
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: Some(dispatcher),
+        action_services: Some(dispatcher),
         pause: None,
         naming: None,
     };
@@ -828,7 +820,7 @@ async fn readonly_mode_blocks_write_tool_before_the_connector_is_called() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: Some(dispatcher),
+        action_services: Some(dispatcher),
         pause: None,
         naming: None,
     };
@@ -890,7 +882,7 @@ steps:
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: Some(dispatcher),
+        action_services: Some(dispatcher),
         pause: None,
         naming: None,
     };
@@ -935,7 +927,7 @@ steps:
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn missing_action_dispatcher_errors_naming_the_step() {
+async fn missing_action_services_errors_naming_the_step() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Arc::new(RunStore::new(tmp.path().join("runs")));
     let wf = Workflow::parse(WF_ACTION_FAILS).unwrap();
@@ -958,7 +950,7 @@ async fn missing_action_dispatcher_errors_naming_the_step() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -967,7 +959,7 @@ async fn missing_action_dispatcher_errors_naming_the_step() {
         .await
         .expect_err("no dispatcher wired must fail loudly, never silently no-op");
     assert!(
-        matches!(err, RunWorkflowError::ActionDispatcherMissing { ref step } if step == "comment"),
+        matches!(err, RunWorkflowError::ActionServicesMissing { ref step } if step == "comment"),
         "got: {err:?}"
     );
     assert!(err.to_string().contains("comment"), "got: {err}");
@@ -1021,7 +1013,7 @@ async fn on_reject_cleanup_dispatches_action_step_for_real() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -1073,7 +1065,7 @@ async fn on_reject_cleanup_dispatches_action_step_for_real() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: Some(dispatcher),
+        action_services: Some(dispatcher),
         pause: None,
         naming: None,
     };
@@ -1148,7 +1140,7 @@ steps:
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: Some(dispatcher),
+        action_services: Some(dispatcher),
         pause: None,
         naming: None,
     };
@@ -1198,21 +1190,11 @@ async fn step_level_findings_profile_reaches_findings_record() {
     let wf = Workflow::parse(WF_FINDINGS_SUMMARY_STEP).unwrap();
     // The run default is `full` (no `defaults.findings_profile`), exactly as
     // the CLI builds it; only the step says `summary`.
-    let dispatcher = Arc::new(
-        ToolDispatcher::new(
-            Arc::new(Registry::empty()),
-            McpPermission::new(PermissionMode::Bypass, vec!["*".into()]),
-        )
-        .with_findings(rupu_mcp::FindingsContext {
-            workspace_path: tmp.path().to_path_buf(),
-            scope_name: "findings-summary-step".into(),
-            run_id: "run_findings_profile".into(),
-            model: "mock-1".into(),
-            surface: rupu_coverage::Surface::Workflow,
-            options: rupu_coverage::FindingWriteOptions::default(),
-            codename: None,
-            provider: None,
-        }),
+    let dispatcher = findings_action_services(
+        tmp.path(),
+        "findings-summary-step",
+        "run_findings_profile",
+        "mock-1",
     );
     assert_eq!(
         rupu_coverage::FindingWriteOptions::default().profile,
@@ -1238,7 +1220,7 @@ async fn step_level_findings_profile_reaches_findings_record() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: Some(dispatcher),
+        action_services: Some(dispatcher),
         pause: None,
     };
 
@@ -1271,29 +1253,14 @@ async fn step_level_findings_profile_reaches_findings_record() {
 // with `all: true` feeds a `for_each`, one unit per matching finding.
 // ---------------------------------------------------------------------------
 
-fn findings_dispatcher(workspace: &Path, run_id: &str) -> Arc<ToolDispatcher> {
-    Arc::new(
-        ToolDispatcher::new(
-            Arc::new(Registry::empty()),
-            McpPermission::new(PermissionMode::Bypass, vec!["*".into()]),
-        )
-        .with_findings(rupu_mcp::FindingsContext {
-            workspace_path: workspace.to_path_buf(),
-            scope_name: "tag-fanout".into(),
-            run_id: run_id.into(),
-            model: "mock-1".into(),
-            surface: rupu_coverage::Surface::Workflow,
-            options: rupu_coverage::FindingWriteOptions::default(),
-            codename: None,
-            provider: None,
-        }),
-    )
+fn findings_dispatcher(workspace: &Path, run_id: &str) -> ActionServices {
+    findings_action_services(workspace, "tag-fanout", run_id, "mock-1")
 }
 
 async fn run_fanout(
     yaml: &str,
     tmp: &Path,
-    dispatcher: Arc<ToolDispatcher>,
+    dispatcher: ActionServices,
 ) -> rupu_orchestrator::runner::OrchestratorRunResult {
     let opts = OrchestratorRunOpts {
         run_step: Default::default(),
@@ -1314,7 +1281,7 @@ async fn run_fanout(
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: Some(dispatcher),
+        action_services: Some(dispatcher),
         pause: None,
     };
     run_workflow(opts).await.expect("workflow runs")
@@ -1322,29 +1289,31 @@ async fn run_fanout(
 
 /// Records `n` findings, tags the first `tagged` of them `needs-poc`, and
 /// returns the tagged ids in recording order.
-async fn seed_findings(d: &ToolDispatcher, n: usize, tagged: usize) -> Vec<String> {
+async fn seed_findings(d: &ActionServices, n: usize, tagged: usize) -> Vec<String> {
     let mut ids = Vec::new();
     for i in 0..n {
-        let out = d
-            .call_with_findings_profile(
-                "findings.record",
-                serde_json::json!({
-                    "scope": "host",
-                    "target_ref": format!("host-{i}.internal.example"),
-                    "summary": format!("Admin console {i} reachable without authentication"),
-                    "severity": "high",
-                    "rationale": "GET /admin returned 200 with no session.",
-                }),
-                rupu_coverage::FindingProfile::Summary,
-            )
-            .await
-            .expect("record");
+        let out = call_action_tool(
+            d,
+            "findings.record",
+            serde_json::json!({
+                "scope": "host",
+                "target_ref": format!("host-{i}.internal.example"),
+                "summary": format!("Admin console {i} reachable without authentication"),
+                "severity": "high",
+                "rationale": "GET /admin returned 200 with no session.",
+            }),
+            rupu_coverage::FindingProfile::Summary,
+        )
+        .await
+        .expect("record");
         ids.push(out.trim_start_matches("finding_id: ").trim().to_string());
     }
     let tagged_ids: Vec<String> = ids[..tagged].to_vec();
-    d.call(
+    call_action_tool(
+        d,
         "findings.tag",
         serde_json::json!({ "finding_ids": tagged_ids, "add": ["needs-poc"] }),
+        rupu_coverage::FindingProfile::Full,
     )
     .await
     .expect("tag");

@@ -3,7 +3,6 @@
 
 use crate::findings_without_coverage::opts_for;
 use chrono::Utc;
-use rupu_agent::coverage_tools::{QueryFindingsTool, TagFindingsTool};
 use rupu_agent::run_agent;
 use rupu_agent::runner::ScriptedTurn;
 use rupu_coverage::{
@@ -12,6 +11,7 @@ use rupu_coverage::{
     TagActor, TagLog,
 };
 use rupu_providers::types::StopReason;
+use rupu_tools::findings::{query::FindingsQueryTool, tag::FindingsTagTool};
 use rupu_tools::{Tool, ToolContext};
 
 fn seed(ws: &std::path::Path, id: &str, severity: Severity) {
@@ -137,7 +137,7 @@ async fn query_findings_pages_and_lists_the_vocabulary() {
     let ws = tmp.path().to_path_buf();
     seed(&ws, "fnd_a", Severity::High);
     seed(&ws, "fnd_b", Severity::Low);
-    let tag = TagFindingsTool::new(TagLog::for_workspace(&ws));
+    let tag = FindingsTagTool;
     let ctx = ToolContext::in_workspace(ws.clone());
     let out = tag
         .invoke(
@@ -148,7 +148,7 @@ async fn query_findings_pages_and_lists_the_vocabulary() {
         .unwrap();
     assert!(out.error.is_none(), "{:?}", out.error);
 
-    let q = QueryFindingsTool::new(ws.clone());
+    let q = FindingsQueryTool;
     let out = q
         .invoke(serde_json::json!({"q": "tag:needs-poc"}), &ctx)
         .await
@@ -176,7 +176,7 @@ async fn bad_input_is_an_error_the_agent_can_read() {
     let ws = tmp.path().to_path_buf();
     seed(&ws, "fnd_a", Severity::High);
     let ctx = ToolContext::in_workspace(ws.clone());
-    let tag = TagFindingsTool::new(TagLog::for_workspace(&ws));
+    let tag = FindingsTagTool;
     let out = tag
         .invoke(
             serde_json::json!({"finding_ids": ["fnd_nope"], "add": ["x"]}),
@@ -193,7 +193,7 @@ async fn bad_input_is_an_error_the_agent_can_read() {
         .await
         .unwrap();
     assert!(out.error.unwrap().contains("invalid tag"));
-    let q = QueryFindingsTool::new(ws);
+    let q = FindingsQueryTool;
     assert!(q
         .invoke(serde_json::json!({"tagz": ["x"]}), &ctx)
         .await
@@ -206,7 +206,7 @@ async fn a_bad_query_is_an_error_the_agent_can_read() {
     let ws = tmp.path().to_path_buf();
     seed(&ws, "fnd_a", Severity::High);
     let ctx = ToolContext::in_workspace(ws.clone());
-    let out = QueryFindingsTool::new(ws)
+    let out = FindingsQueryTool
         .invoke(serde_json::json!({"q": "project:x"}), &ctx)
         .await
         .unwrap();

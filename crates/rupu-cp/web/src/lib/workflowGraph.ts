@@ -1282,13 +1282,23 @@ function runsNoAgent(d: StepNodeData): boolean {
   return d.raw_passthrough?.run !== undefined && d.raw_passthrough.run !== null;
 }
 
+/** The names `findings.report` answers to as an `action:` (the catalog tool
+ *  and its legacy aliases; workflows conventionally say `findings.record`):
+ *  the one action tool a findings profile configures. */
+const FINDINGS_REPORT_NAMES = ['findings.report', 'findings.record', 'report_finding'];
+
+/** Whether the action `name` is `findings.report` (by any of its names). */
+export function isFindingsReportAction(name: string | undefined): boolean {
+  return name !== undefined && FINDINGS_REPORT_NAMES.includes(name);
+}
+
 /** The single problem (if any) with `d.findings_profile`, in the server's
  *  check order: an `action:` step on any tool but `findings.record`, then a
  *  step that runs no agent, then a remote step. `undefined` when the field is
  *  unset or legal. */
 function findingsProfileProblem(d: StepNodeData): string | undefined {
   if (d.findings_profile === undefined) return undefined;
-  if (d.kind === 'action' && d.action !== 'findings.record') {
+  if (d.kind === 'action' && !isFindingsReportAction(d.action)) {
     return `findings_profile only applies to \`action: findings.record\` (this step calls \`${d.action ?? ''}\`); remove it`;
   }
   if (runsNoAgent(d)) return 'findings_profile has no effect on a step that runs no agent; remove it';
@@ -1310,7 +1320,7 @@ export function acceptsFindingsProfile(d: StepNodeData): boolean {
     case 'panel':
       return true;
     case 'action':
-      return d.action === 'findings.record';
+      return isFindingsReportAction(d.action);
     default:
       return false;
   }

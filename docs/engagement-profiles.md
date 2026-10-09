@@ -206,9 +206,9 @@ Two tools write assets. Both write to the target's asset ledger,
 
 ### `findings.report` with an `asset`
 
-When an engagement is active, `findings.report` takes an optional `asset`. So does
-the MCP `findings.record` tool that a workflow `action:` step calls, with the same
-schema and handling:
+When an engagement is active, `findings.report` takes an optional `asset`. It is
+the same tool a workflow `action: findings.record` step calls, so the asset has
+the same schema and handling there:
 
 ```json
 {

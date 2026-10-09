@@ -115,7 +115,7 @@ async fn run(agent_file: Option<&str>) -> Outcome {
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };

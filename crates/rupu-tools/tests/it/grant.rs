@@ -3,38 +3,23 @@
 //! missing.
 
 use rupu_tools::{
-    AliasScope, AmbientGrant, Effect, GrantError, GrantInputs, GrantReason, ResolvedGrant, Service,
-    ServiceSet, ToolCatalog, ToolDescriptor, DEFAULT_GRANT,
+    AliasScope, AmbientGrant, GrantError, GrantInputs, GrantReason, ResolvedGrant, Service,
+    ServiceSet, ToolCatalog, DEFAULT_GRANT,
 };
-use serde_json::Value;
 use std::collections::BTreeSet;
 
-fn schema() -> Value {
-    serde_json::json!({"type": "object"})
+fn catalog() -> ToolCatalog {
+    ToolCatalog::builtin()
 }
 
-/// Two stand-in connector tools, as `rupu-agent` adds the MCP catalog's.
-static ISSUES_GET: ToolDescriptor = ToolDescriptor {
-    name: "issues.get",
-    aliases: &[],
-    effect: Effect::Read,
-    needs: &[Service::Scm],
-    uses: &[],
-    description: "",
-    input_schema: schema,
-};
-static SCM_PRS_GET: ToolDescriptor = ToolDescriptor {
-    name: "scm.prs.get",
-    aliases: &[],
-    effect: Effect::Read,
-    needs: &[Service::Scm],
-    uses: &[],
-    description: "",
-    input_schema: schema,
-};
-
-fn catalog() -> ToolCatalog {
-    ToolCatalog::builtin().with([&ISSUES_GET, &SCM_PRS_GET])
+/// The catalog's connector tools whose name starts with `prefix` (`""` for
+/// all of them).
+fn connectors(prefix: &str) -> BTreeSet<&'static str> {
+    ToolCatalog::all()
+        .iter()
+        .filter(|d| d.is_connector() && d.name.starts_with(prefix))
+        .map(|d| d.name)
+        .collect()
 }
 
 /// What a plain `rupu run` with an SCM registry and a dispatcher provides.
@@ -135,12 +120,8 @@ fn grant_grammar() {
     // omitted = DEFAULT_GRANT
     let g = resolve(None, &[]).unwrap();
     let mut want: BTreeSet<&str> = CORE.iter().copied().collect();
-    want.extend([
-        "dispatch_agent",
-        "dispatch_agents_parallel",
-        "issues.get",
-        "scm.prs.get",
-    ]);
+    want.extend(["dispatch_agent", "dispatch_agents_parallel"]);
+    want.extend(connectors(""));
     assert_eq!(offered(&g), want);
     assert!(g
         .entries
@@ -215,9 +196,14 @@ fn star_means_catalog_everywhere() {
     };
     assert_eq!(non_connector(&free), non_connector(&narrowed));
     assert!(CORE.iter().all(|t| free.offers(t)));
-    assert_eq!(connector(&free), set(&["issues.get", "scm.prs.get"]));
+    assert_eq!(connector(&free), connectors(""));
     assert_eq!(connector(&narrowed), set(&["issues.get"]));
-    assert_eq!(narrowed.narrowed, vec!["scm.prs.get"]);
+    let mut dropped = connectors("");
+    dropped.remove("issues.get");
+    assert_eq!(
+        narrowed.narrowed.iter().copied().collect::<BTreeSet<_>>(),
+        dropped
+    );
 }
 
 #[test]
@@ -237,12 +223,9 @@ fn actions_vocabulary() {
     let s = AliasScope::Everywhere;
     assert_eq!(
         c.resolve_actions(&strs(&["issues.*"]), s).unwrap(),
-        set(&["issues.get"])
+        connectors("issues.")
     );
-    assert_eq!(
-        c.resolve_actions(&strs(&["*"]), s).unwrap(),
-        set(&["issues.get", "scm.prs.get"])
-    );
+    assert_eq!(c.resolve_actions(&strs(&["*"]), s).unwrap(), connectors(""));
     assert!(matches!(
         c.resolve_actions(&strs(&["bash"]), s),
         Err(GrantError::NotConnector { .. })

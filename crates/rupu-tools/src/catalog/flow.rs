@@ -10,6 +10,30 @@ pub const MAX_READ_LIMIT: usize = 500;
 /// forever; the lead can join again to keep waiting.
 pub const MAX_JOIN_TIMEOUT_SECS: u64 = 3600;
 
+/// Every agentiflow descriptor: the catalog tools with no body in this crate
+/// yet ([`crate::bodies::body`] returns `None` for them).
+pub static ALL: &[&ToolDescriptor] = &[
+    &BOARD_CLAIM,
+    &BOARD_RELEASE,
+    &BOARD_POST,
+    &BOARD_READ,
+    &BOARD_DIRECTIVE,
+    &BOARD_RETRACT,
+    &MSG_SEND,
+    &AGENTS_LIST,
+    &AGENTS_GET,
+    &WORKFLOWS_LIST,
+    &WORKFLOWS_GET,
+    &CATALOG_SEARCH,
+    &GOAL_STATUS,
+    &GOAL_COVERAGE,
+    &BUDGET_STATUS,
+    &DISPATCH,
+    &RUN_WORKFLOW,
+    &WORKFLOWS_GENERATE,
+    &JOIN,
+];
+
 // was `board.claim`
 pub static BOARD_CLAIM: ToolDescriptor = ToolDescriptor {
     name: "board.claim",

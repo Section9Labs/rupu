@@ -1,12 +1,13 @@
-//! scm.repos.{list, get} tools.
+//! `scm.repos.{list, get}`.
 
+use crate::connector::{self, json, parse, resolve_platform, schema, ConnectorError};
+use crate::descriptor::{Effect, Service, ToolDescriptor};
+use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
+use async_trait::async_trait;
+use rupu_scm::{AccountError, AccountId, Platform, Registry, RepoRef};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
-
-use super::{ToolKind, ToolSpec};
-use crate::error::McpError;
-use rupu_scm::{AccountError, AccountId, Platform, Registry, RepoRef};
 
 #[derive(Deserialize, JsonSchema)]
 pub struct ListReposArgs {
@@ -30,31 +31,59 @@ pub struct GetRepoArgs {
     pub account: Option<String>,
 }
 
-pub fn specs() -> Vec<ToolSpec> {
-    vec![
-        ToolSpec {
-            name: "scm.repos.list",
-            description: "List repositories the authenticated user can access on the given platform. Omit `platform` to use [scm.default].",
-            input_schema: serde_json::to_value(schemars::schema_for!(ListReposArgs)).unwrap(),
-            kind: ToolKind::Read,
-        },
-        ToolSpec {
-            name: "scm.repos.get",
-            description: "Fetch a single repository (default branch, clone URLs, visibility, description).",
-            input_schema: serde_json::to_value(schemars::schema_for!(GetRepoArgs)).unwrap(),
-            kind: ToolKind::Read,
-        },
-    ]
+pub static LIST: ToolDescriptor = ToolDescriptor {
+    name: "scm.repos.list",
+    aliases: &[],
+    effect: Effect::Read,
+    needs: &[Service::Scm],
+    uses: &[],
+    description: "List repositories the authenticated user can access on the given platform. Omit `platform` to use [scm.default].",
+    input_schema: schema::<ListReposArgs>,
+};
+
+pub static GET: ToolDescriptor = ToolDescriptor {
+    name: "scm.repos.get",
+    aliases: &[],
+    effect: Effect::Read,
+    needs: &[Service::Scm],
+    uses: &[],
+    description: "Fetch a single repository (default branch, clone URLs, visibility, description).",
+    input_schema: schema::<GetRepoArgs>,
+};
+
+pub struct ReposListTool;
+
+#[async_trait]
+impl Tool for ReposListTool {
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &LIST
+    }
+
+    async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        connector::invoke(ctx, |reg| list(input, reg)).await
+    }
+}
+
+pub struct ReposGetTool;
+
+#[async_trait]
+impl Tool for ReposGetTool {
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &GET
+    }
+
+    async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        connector::invoke(ctx, |reg| get(input, reg)).await
+    }
 }
 
 /// A row of `scm.repos.list`'s response: the repo plus which configured
 /// account it came from. `account` is additive relative to the bare
-/// `Repo` shape returned before Arc 2 — every existing field of `Repo`
-/// is still present, flattened, so an agent that only reads
-/// `default_branch`/`clone_url_https`/etc. is unaffected; only an agent
-/// that needs to disambiguate two accounts of the same platform (e.g.
-/// to pass `account` back into `scm.repos.get`) needs to read the new
-/// field.
+/// `Repo` shape — every field of `Repo` is still present, flattened, so an
+/// agent that only reads `default_branch`/`clone_url_https`/etc. is
+/// unaffected; only an agent that needs to disambiguate two accounts of the
+/// same platform (e.g. to pass `account` back into `scm.repos.get`) needs to
+/// read the new field.
 #[derive(serde::Serialize)]
 struct RepoListEntry {
     account: String,
@@ -62,9 +91,8 @@ struct RepoListEntry {
     repo: rupu_scm::Repo,
 }
 
-pub async fn dispatch_list(args: Value, reg: &Registry) -> Result<String, McpError> {
-    let parsed: ListReposArgs =
-        serde_json::from_value(args).map_err(|e| McpError::InvalidArgs(e.to_string()))?;
+async fn list(args: Value, reg: &Registry) -> Result<String, ConnectorError> {
+    let parsed: ListReposArgs = parse(args)?;
 
     // `platform` is parsed (not defaulted) up front so the `account`
     // branch below can check it against the resolved account's real
@@ -73,7 +101,7 @@ pub async fn dispatch_list(args: Value, reg: &Registry) -> Result<String, McpErr
     let platform_arg = parsed
         .platform
         .as_deref()
-        .map(|s| s.parse::<Platform>().map_err(McpError::InvalidArgs))
+        .map(|s| s.parse::<Platform>().map_err(ConnectorError::InvalidArgs))
         .transpose()?;
 
     // "Account-scoped, no repo" (spec §6.2): there is no RepoRef to run
@@ -118,7 +146,7 @@ pub async fn dispatch_list(args: Value, reg: &Registry) -> Result<String, McpErr
             if let Some(requested) = platform_arg {
                 let actual = conn.platform();
                 if actual != requested {
-                    return Err(McpError::InvalidArgs(format!(
+                    return Err(ConnectorError::InvalidArgs(format!(
                         "account '{id}' is a {actual} account, not {requested}"
                     )));
                 }
@@ -172,16 +200,15 @@ pub async fn dispatch_list(args: Value, reg: &Registry) -> Result<String, McpErr
         }
     }
     if !failures.is_empty() && failures.len() == total {
-        return Err(McpError::Dispatch(rupu_scm::ScmError::Transient(
+        return Err(ConnectorError::Dispatch(rupu_scm::ScmError::Transient(
             anyhow::anyhow!("every configured account failed: {}", failures.join("; ")),
         )));
     }
-    Ok(serde_json::to_string(&entries).unwrap())
+    Ok(json(&entries))
 }
 
-pub async fn dispatch_get(args: Value, reg: &Registry) -> Result<String, McpError> {
-    let parsed: GetRepoArgs =
-        serde_json::from_value(args).map_err(|e| McpError::InvalidArgs(e.to_string()))?;
+async fn get(args: Value, reg: &Registry) -> Result<String, ConnectorError> {
+    let parsed: GetRepoArgs = parse(args)?;
     let platform = resolve_platform(parsed.platform.as_deref(), reg)?;
     let r = RepoRef {
         platform,
@@ -190,19 +217,5 @@ pub async fn dispatch_get(args: Value, reg: &Registry) -> Result<String, McpErro
     };
     let account = parsed.account.as_deref().map(AccountId::new);
     let (_account, conn) = reg.repo_for(&r, None, account.as_ref())?;
-    Ok(serde_json::to_string(&conn.get_repo(&r).await?).unwrap())
-}
-
-/// Resolve an optional platform argument. If `arg` is `Some`, parse it;
-/// otherwise fall back to `Registry::default_platform()` — the first
-/// registered platform that has any account with a live connector (not
-/// merely "the first `Platform` variant"), honoring `[scm.default]` when
-/// configured. See `default_platform`'s own doc for the exact tiers.
-pub(crate) fn resolve_platform(arg: Option<&str>, reg: &Registry) -> Result<Platform, McpError> {
-    match arg {
-        Some(s) => s.parse::<Platform>().map_err(McpError::InvalidArgs),
-        None => reg.default_platform().ok_or_else(|| {
-            McpError::InvalidArgs("no platform arg and no [scm.default] configured".into())
-        }),
-    }
+    Ok(json(&conn.get_repo(&r).await?))
 }

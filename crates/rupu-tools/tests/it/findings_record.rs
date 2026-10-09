@@ -1,31 +1,32 @@
-//! `findings.record` — the MCP-side path to the findings ledger.
-//!
-//! The agent-side `report_finding` builtin covers agent steps. An `action:`
-//! step is not an agent: it calls one MCP tool and has no builtin registry,
-//! so without this tool it can observe a weakness and have nowhere to put it.
+//! `findings.report` called as `findings.record`, the name an `action:`
+//! step uses, with the flat `rationale` / `code_excerpt` / `references` its
+//! `with:` sends (docs/workflow-format.md). One implementation serves this,
+//! the agent loop and `rupu mcp serve` (spec W4 §3.2).
 
-use rupu_mcp::{FindingsContext, McpPermission, ToolDispatcher};
-use rupu_scm::Registry;
+use crate::support::{findings_ctx, Caller};
 use std::sync::Arc;
 
-fn ctx(workspace: &std::path::Path) -> FindingsContext {
+fn ctx(workspace: &std::path::Path) -> rupu_tools::ToolContext {
     ctx_with(workspace, rupu_coverage::FindingProfile::Summary)
 }
 
 fn ctx_with(
     workspace: &std::path::Path,
     profile: rupu_coverage::FindingProfile,
-) -> FindingsContext {
-    FindingsContext {
-        workspace_path: workspace.to_path_buf(),
-        scope_name: "chimera-campaign".to_string(),
-        run_id: "run_mcp_test".to_string(),
-        model: "gpt-5.6-cyber".to_string(),
-        surface: rupu_coverage::Surface::Workflow,
-        options: rupu_coverage::FindingWriteOptions::default().with_profile(profile),
-        codename: Some("jade-reef".to_string()),
-        provider: Some("openai".to_string()),
-    }
+) -> rupu_tools::ToolContext {
+    findings_ctx(
+        workspace,
+        "chimera-campaign",
+        "run_mcp_test",
+        "gpt-5.6-cyber",
+        profile,
+        Some("jade-reef"),
+        Some("openai"),
+    )
+}
+
+fn options(ctx: &mut rupu_tools::ToolContext) -> &mut rupu_coverage::FindingWriteOptions {
+    ctx.services.findings.as_mut().expect("findings options")
 }
 
 fn host_finding() -> serde_json::Value {
@@ -42,8 +43,7 @@ fn host_finding() -> serde_json::Value {
 #[tokio::test]
 async fn records_a_host_finding_into_the_ledger() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
-        .with_findings(ctx(tmp.path()));
+    let dispatcher = Caller::new(ctx(tmp.path()));
 
     let out = dispatcher
         .call("findings.record", host_finding())
@@ -70,30 +70,13 @@ async fn records_a_host_finding_into_the_ledger() {
 }
 
 #[tokio::test]
-async fn refuses_when_the_server_has_no_run_context() {
-    // A dispatcher built without run context must NOT guess a workspace.
-    // Filing a finding against the wrong project is worse than failing.
-    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all());
-    let err = dispatcher
-        .call("findings.record", host_finding())
-        .await
-        .expect_err("must refuse without context");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("without run context"),
-        "error should say why, got: {msg}"
-    );
-}
-
-#[tokio::test]
 async fn locator_validation_applies_on_this_path_too() {
     // The same rule the agent builtin enforces. Two paths agreeing about a
     // contract only stays true when it is one path — both call
     // rupu_coverage::report_finding, so this asserts the shared enforcement
     // rather than a re-implementation.
     let tmp = tempfile::TempDir::new().unwrap();
-    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
-        .with_findings(ctx(tmp.path()));
+    let dispatcher = Caller::new(ctx(tmp.path()));
 
     let mut bad = host_finding();
     bad.as_object_mut().unwrap().remove("target_ref");
@@ -116,8 +99,7 @@ async fn locator_validation_applies_on_this_path_too() {
 #[tokio::test]
 async fn full_profile_records_a_report() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
-        .with_findings(ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full));
+    let dispatcher = Caller::new(ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full));
     let report: serde_json::Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../rupu-coverage/tests/fixtures/finding_report/valid_full.json"
@@ -147,8 +129,7 @@ async fn full_profile_records_a_report() {
 #[tokio::test]
 async fn full_profile_refuses_a_summary_only_call() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
-        .with_findings(ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full));
+    let dispatcher = Caller::new(ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full));
     let err = dispatcher
         .call("findings.record", host_finding())
         .await
@@ -167,8 +148,7 @@ async fn full_profile_refuses_a_summary_only_call() {
 #[tokio::test]
 async fn full_profile_requires_a_report() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
-        .with_findings(ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full));
+    let dispatcher = Caller::new(ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full));
     let err = dispatcher
         .call(
             "findings.record",
@@ -178,7 +158,7 @@ async fn full_profile_requires_a_report() {
         .expect_err("no report under full must be refused");
     let msg = err.to_string();
     assert!(msg.contains("`report` is required"), "{msg}");
-    assert!(msg.contains("findings.record tool schema"), "{msg}");
+    assert!(msg.contains("findings.report tool schema"), "{msg}");
 }
 
 #[tokio::test]
@@ -186,8 +166,7 @@ async fn full_profile_refuses_stray_excerpt_and_references() {
     // `code_excerpt` / `references` are derived from the report too; sending
     // them alongside a report must fail loudly, not be silently dropped.
     let tmp = tempfile::TempDir::new().unwrap();
-    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
-        .with_findings(ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full));
+    let dispatcher = Caller::new(ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full));
     let report: serde_json::Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../rupu-coverage/tests/fixtures/finding_report/valid_full.json"
@@ -215,8 +194,7 @@ async fn full_profile_refuses_stray_excerpt_and_references() {
 #[tokio::test]
 async fn full_profile_refuses_a_stray_code_excerpt() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
-        .with_findings(ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full));
+    let dispatcher = Caller::new(ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full));
     let report: serde_json::Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../rupu-coverage/tests/fixtures/finding_report/valid_full.json"
@@ -248,9 +226,8 @@ async fn error_mapping_does_not_rewrite_an_artifact_path_named_evidence() {
     let tmp = tempfile::TempDir::new().unwrap();
     let store = tempfile::TempDir::new().unwrap();
     let mut ctx = ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full);
-    ctx.options.artifact_root = Some(store.path().to_path_buf());
-    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
-        .with_findings(ctx);
+    options(&mut ctx).artifact_root = Some(store.path().to_path_buf());
+    let dispatcher = Caller::new(ctx);
     let mut report: serde_json::Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../rupu-coverage/tests/fixtures/finding_report/valid_full.json"
@@ -272,8 +249,7 @@ async fn error_mapping_does_not_rewrite_an_artifact_path_named_evidence() {
 #[tokio::test]
 async fn summary_profile_missing_rationale_names_rationale() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
-        .with_findings(ctx(tmp.path()));
+    let dispatcher = Caller::new(ctx(tmp.path()));
     let mut bad = host_finding();
     bad.as_object_mut().unwrap().remove("rationale");
     let err = dispatcher
@@ -288,8 +264,7 @@ async fn summary_profile_missing_rationale_names_rationale() {
 #[tokio::test]
 async fn summary_profile_refuses_a_report() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
-        .with_findings(ctx(tmp.path()));
+    let dispatcher = Caller::new(ctx(tmp.path()));
     let report: serde_json::Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../rupu-coverage/tests/fixtures/finding_report/valid_full.json"
@@ -310,8 +285,7 @@ async fn full_profile_refuses_an_agent_supplied_verification() {
     // Verification is the verdict of a later verification run; a step cannot
     // confirm the finding it is recording.
     let tmp = tempfile::TempDir::new().unwrap();
-    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
-        .with_findings(ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full));
+    let dispatcher = Caller::new(ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full));
     let mut report: serde_json::Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../rupu-coverage/tests/fixtures/finding_report/valid_full.json"
@@ -340,8 +314,7 @@ async fn a_per_call_profile_overrides_the_run_default() {
     // The dispatcher is built once per run with the run default (`full`);
     // an action step's own `findings_profile: summary` arrives per call.
     let tmp = tempfile::TempDir::new().unwrap();
-    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
-        .with_findings(ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full));
+    let dispatcher = Caller::new(ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full));
     dispatcher
         .call("findings.record", host_finding())
         .await
@@ -367,8 +340,7 @@ async fn a_per_call_profile_overrides_the_run_default() {
 #[tokio::test]
 async fn structural_errors_name_the_field_path() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
-        .with_findings(ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full));
+    let dispatcher = Caller::new(ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full));
     let mut report: serde_json::Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../rupu-coverage/tests/fixtures/finding_report/valid_full.json"
@@ -405,8 +377,7 @@ async fn structural_errors_name_the_field_path() {
 #[tokio::test]
 async fn record_accepts_declared_tags() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
-        .with_findings(ctx(tmp.path()));
+    let dispatcher = Caller::new(ctx(tmp.path()));
     let mut input = host_finding();
     input["tags"] = serde_json::json!(["Class:Authz", "needs-poc"]);
     dispatcher
@@ -422,9 +393,9 @@ async fn record_accepts_declared_tags() {
     assert_eq!(tags, ["class:authz", "needs-poc"]);
 }
 
-fn network_ctx(workspace: &std::path::Path) -> FindingsContext {
+fn network_ctx(workspace: &std::path::Path) -> rupu_tools::ToolContext {
     let mut ctx = ctx_with(workspace, rupu_coverage::FindingProfile::Full);
-    ctx.options.engagement = Some(Arc::new(
+    options(&mut ctx).engagement = Some(Arc::new(
         rupu_coverage::builtin_registry()
             .unwrap()
             .active_set(&["network".into()])
@@ -460,8 +431,7 @@ fn paths_for(workspace: &std::path::Path) -> rupu_coverage::CoveragePaths {
 #[tokio::test]
 async fn an_engagement_asset_is_routed_and_stamped() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
-        .with_findings(network_ctx(tmp.path()));
+    let dispatcher = Caller::new(network_ctx(tmp.path()));
     let out = dispatcher
         .call(
             "findings.record",
@@ -484,8 +454,7 @@ async fn an_engagement_asset_is_routed_and_stamped() {
 #[tokio::test]
 async fn an_engagement_asset_must_pass_its_profiles_completeness() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
-        .with_findings(network_ctx(tmp.path()));
+    let dispatcher = Caller::new(network_ctx(tmp.path()));
     // A service pinned to a host but no port fails `service_identified`.
     let err = dispatcher
         .call(
@@ -508,8 +477,7 @@ async fn an_engagement_asset_must_pass_its_profiles_completeness() {
 #[tokio::test]
 async fn an_asset_kind_no_active_profile_owns_is_refused() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
-        .with_findings(network_ctx(tmp.path()));
+    let dispatcher = Caller::new(network_ctx(tmp.path()));
     let mut input = service_finding(serde_json::json!([]));
     input["asset"]["kind"] = serde_json::json!("binary:function");
     let err = dispatcher
@@ -528,8 +496,7 @@ async fn an_asset_kind_no_active_profile_owns_is_refused() {
 async fn without_an_engagement_the_asset_is_ignored() {
     // The native code path, exactly as `report_finding` treats it.
     let tmp = tempfile::TempDir::new().unwrap();
-    let dispatcher = ToolDispatcher::new(Arc::new(Registry::default()), McpPermission::allow_all())
-        .with_findings(ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full));
+    let dispatcher = Caller::new(ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full));
     dispatcher
         .call(
             "findings.record",
@@ -542,14 +509,14 @@ async fn without_an_engagement_the_asset_is_ignored() {
     assert!(!paths.assets.exists(), "no engagement, no asset graph");
 }
 
-#[tokio::test]
-async fn the_record_schema_advertises_the_asset() {
-    let spec = rupu_mcp::tools::findings::specs()
-        .into_iter()
-        .find(|s| s.name == "findings.record")
+#[test]
+fn the_record_schema_advertises_the_asset() {
+    let d = rupu_tools::ToolCatalog::builtin()
+        .resolve_name("findings.record", rupu_tools::AliasScope::Everywhere)
         .unwrap();
+    assert_eq!(d.name, "findings.report");
     assert_eq!(
-        spec.input_schema["properties"]["asset"],
+        (d.input_schema)()["properties"]["asset"],
         rupu_coverage::asset_schema_property()
     );
 }

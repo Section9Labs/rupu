@@ -11,7 +11,6 @@ pub mod ledger;
 pub mod profile;
 pub mod report;
 pub mod rerun;
-pub mod tool_mappings;
 pub mod tools;
 
 #[cfg(feature = "gen")]
@@ -78,4 +77,3 @@ pub use report::{
     Verification, VerificationStatus,
 };
 pub use rerun::{plan_rerun, RerunError, RerunInvocation};
-pub use tool_mappings::{load_tool_mappings, ToolMapping, ToolMappings};

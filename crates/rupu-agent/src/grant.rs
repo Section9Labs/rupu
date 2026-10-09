@@ -4,9 +4,8 @@
 //! (`rupu_runtime::assembly`) is the one production caller; the agent loop
 //! builds its registry from the result and nothing else.
 
-use crate::tool_registry::tool_catalog;
 use rupu_tools::{
-    AliasScope, AmbientGrant, GrantError, GrantInputs, ResolvedGrant, Service, ServiceSet, Tool,
+    AliasScope, AmbientGrant, GrantError, GrantInputs, ResolvedGrant, Tool, ToolCatalog,
     ToolContext,
 };
 use std::sync::Arc;
@@ -27,45 +26,13 @@ pub struct RunGrantInputs<'a> {
     pub alias_scope: AliasScope,
 }
 
-/// The services a run provides, for its grant. Exact by construction: a
-/// service is here only when the agent loop can build every tool needing it
-/// from `ctx` (and `concerns`).
-pub fn run_services(ctx: &ToolContext, concerns: bool) -> ServiceSet {
-    let services = &ctx.services;
-    // The findings ledger lives in the workspace: every run can open it.
-    let mut s = ServiceSet::new().with(Service::Findings);
-    if concerns {
-        s.insert(Service::Coverage);
-    }
-    if services
-        .findings
-        .as_ref()
-        .is_some_and(|f| f.engagement.is_some())
-    {
-        s.insert(Service::Engagement);
-    }
-    if services.scm.is_some() {
-        s.insert(Service::Scm);
-    }
-    if services.dispatcher.is_some() {
-        s.insert(Service::AgentDispatcher);
-    }
-    if services.netflow_sink.is_some() {
-        s.insert(Service::Netflow);
-    }
-    // The agentiflow services (message bus, run status, catalog, the unit
-    // launcher, the workflow generator) have no body in the catalog until
-    // W5/W7: their tools reach a run only injected, as self-served grants.
-    s
-}
-
 /// Resolve a run's grant (W2): the agent's `tools:`, the step's `actions:`,
 /// the ambient grants (`concerns:`, an engagement, injected tools) and the
 /// run's services.
 pub fn resolve_run_grant(inputs: RunGrantInputs<'_>) -> Result<ResolvedGrant, GrantError> {
     let ctx = inputs.tool_context;
     let injected: Vec<_> = inputs.injected.iter().map(|t| t.descriptor()).collect();
-    let catalog = tool_catalog().with(injected.iter().copied());
+    let catalog = ToolCatalog::builtin().with(injected.iter().copied());
     let engagement = ctx
         .services
         .findings
@@ -87,7 +54,8 @@ pub fn resolve_run_grant(inputs: RunGrantInputs<'_>) -> Result<ResolvedGrant, Gr
         declared: inputs.declared,
         step_actions: inputs.step_actions,
         ambient: &ambient,
-        available: &run_services(ctx, inputs.concerns),
+        // `concerns` stands in for the concern catalog the loop flattens later.
+        available: &ctx.services.provided(inputs.concerns),
         alias_scope: inputs.alias_scope,
     })?;
     for tool in &grant.actions_not_granted {

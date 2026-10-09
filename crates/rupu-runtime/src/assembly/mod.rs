@@ -292,18 +292,22 @@ pub struct RunAssembler {
     bash: BashConfig,
 }
 
+/// A run's `[bash]` settings from the layered config.
+fn bash_config(config: &rupu_config::Config) -> BashConfig {
+    BashConfig {
+        env_allowlist: config.bash.env_allowlist.clone().unwrap_or_default(),
+        timeout_secs: config
+            .bash
+            .timeout_secs
+            .unwrap_or(BashConfig::DEFAULT_TIMEOUT_SECS),
+    }
+}
+
 impl RunAssembler {
     pub fn new(ctx: AssemblyContext) -> Self {
         let openai_compatible = provider_factory::openai_compatible_map(&ctx.config.providers);
         let limits_ctx = LimitsContext::from_config(&ctx.config, &ctx.global);
-        let bash = BashConfig {
-            env_allowlist: ctx.config.bash.env_allowlist.clone().unwrap_or_default(),
-            timeout_secs: ctx
-                .config
-                .bash
-                .timeout_secs
-                .unwrap_or(BashConfig::DEFAULT_TIMEOUT_SECS),
-        };
+        let bash = bash_config(&ctx.config);
         Self {
             ctx,
             openai_compatible,
@@ -314,6 +318,41 @@ impl RunAssembler {
 
     pub fn context(&self) -> &AssemblyContext {
         &self.ctx
+    }
+
+    /// The tool context of a caller that is not an agent run (spec W4
+    /// §3.3): an `action:` workflow step or `rupu mcp serve`. `identity` is
+    /// the caller's (an action step's workflow run, an MCP server session);
+    /// the workspace carries the config's `[bash]`, and the services are what
+    /// such a caller provides — the context's SCM registry, its findings base
+    /// options and its customer. No dispatcher, coverage or prompter: there
+    /// is no agent loop around these calls. `netflow_sink` is where a
+    /// subprocess's flows go (with the context's capture backend); a caller
+    /// with no run ledger to attribute them to passes
+    /// `rupu_netflow::NullSink` (see `crate::netflow`).
+    pub fn call_site_context(
+        &self,
+        identity: RunIdentity,
+        workspace: &WorkspaceBinding,
+        netflow_sink: Arc<dyn rupu_netflow::FlowSink>,
+    ) -> ToolContext {
+        ToolContext {
+            identity: Arc::new(identity),
+            workspace: WorkspaceScope {
+                id: workspace.id.clone(),
+                path: workspace.path.clone(),
+                bash: self.bash.clone(),
+            },
+            services: ToolServices {
+                scm: self.ctx.scm.clone(),
+                findings: Some(self.ctx.findings.clone()),
+                netflow_sink: Some(netflow_sink),
+                net_capture: self.ctx.net_capture.clone(),
+                customer: self.ctx.customer.clone(),
+                ..Default::default()
+            },
+            call: Default::default(),
+        }
     }
 
     /// This assembler with `findings` as its runs' base findings options —
@@ -575,7 +614,10 @@ impl RunAssembler {
                 dispatcher: spec.services.dispatcher.clone().filter(|_| d.launcher),
                 scm: self.ctx.scm.clone().filter(|_| d.scm),
                 findings: Some(findings),
+                // The agent loop sets the writer and the concern catalog it
+                // owns.
                 coverage_writer: None,
+                coverage_catalog: None,
                 coverage_stream: coverage_stream.clone(),
                 netflow_sink: Some(sink),
                 net_capture: self.ctx.net_capture.clone(),

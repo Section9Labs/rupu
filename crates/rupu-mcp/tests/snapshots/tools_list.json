@@ -1,5 +1,676 @@
 [
   {
+    "description": "Record a security or quality finding in this project's ledger. Returns the generated finding id (use it in coverage.mark calls and in another finding's cross_references). Under the full profile send a complete `report`; a rejected call lists every problem to fix.",
+    "inputSchema": {
+      "properties": {
+        "asset": {
+          "description": "The engagement asset this finding is about (only under an active engagement profile). Its `kind` routes the finding to the owning profile for completeness validation and stamps it into the asset graph. Omit on a plain code run.",
+          "properties": {
+            "coordinates": {
+              "description": "Locator coordinates pinning the asset, each {\"t\": <tag>, \"v\": <value>}. Tags: host, port, url, path, line_range, symbol, sha256, address, offset, commit, http_route, param, resource_id.",
+              "items": {
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "kind": {
+              "description": "Profile-namespaced asset kind, e.g. \"network:service\", \"binary:function\", \"web:route\".",
+              "type": "string"
+            },
+            "label": {
+              "description": "Optional human label; if omitted, the asset keeps its existing label (a new asset is labelled with its kind).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        "concern_id": {
+          "description": "Concern ID this finding relates to, if known.",
+          "type": "string"
+        },
+        "file_path": {
+          "description": "Workspace-relative path of the affected file, if applicable.",
+          "type": "string"
+        },
+        "line_range": {
+          "description": "Line range [start, end] within the file, if applicable.",
+          "items": {
+            "type": "integer"
+          },
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array"
+        },
+        "report": {
+          "description": "A complete security finding report, recorded once by the agent. Presentations and exports (Markdown, HTML, PDF) are generated from this report, so no separate report file is written. When information genuinely cannot be determined use the field's sentinel instead of omitting it: 'Unknown', 'Not Applicable', 'None Provided', 'None', or 'Not Provided — <justification>' as each field describes.",
+          "properties": {
+            "artifacts": {
+              "description": "Proof-of-concept files (scripts, outputs, harnesses) as workspace-relative paths; rupu stores them with the finding. Supply only 'path'.",
+              "items": {
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "path"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "attack_vector": {
+              "description": "How the surface is reached, including authentication or user interaction required, or 'Unknown'.",
+              "type": "string"
+            },
+            "blocks": {
+              "description": "Typed evidence blocks (engagement profiles): each an object with a 'kind' tag and that kind's fields, e.g. {\"kind\":\"scan_output\",\"tool\":\"nmap\",\"output\":\"...\"} or {\"kind\":\"http_exchange\",\"request\":\"...\",\"response\":\"...\"}. Optional; additive to 'evidence'.",
+              "items": {
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "text",
+                      "code_slice",
+                      "diff",
+                      "table",
+                      "image",
+                      "hexdump",
+                      "disasm",
+                      "decompile",
+                      "http_exchange",
+                      "scan_output",
+                      "pcap_ref"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "call_chain": {
+              "anyOf": [
+                {
+                  "items": {
+                    "properties": {
+                      "binary_va": {
+                        "description": "binary@VA for binary-only targets.",
+                        "type": "string"
+                      },
+                      "file": {
+                        "description": "Workspace-relative path.",
+                        "type": "string"
+                      },
+                      "gate": {
+                        "description": "Precondition crossed at this hop.",
+                        "type": "string"
+                      },
+                      "label": {
+                        "description": "Function or surface name.",
+                        "type": "string"
+                      },
+                      "lines": {
+                        "items": {
+                          "type": "integer"
+                        },
+                        "maxItems": 2,
+                        "minItems": 2,
+                        "type": "array"
+                      },
+                      "passes_because": {
+                        "description": "Why the gate passes.",
+                        "type": "string"
+                      },
+                      "role": {
+                        "enum": [
+                          "source",
+                          "hop",
+                          "sink"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "label",
+                      "role"
+                    ],
+                    "type": "object"
+                  },
+                  "minItems": 1,
+                  "type": "array"
+                },
+                {
+                  "type": "string"
+                }
+              ],
+              "description": "Ordered path from the externally reachable entry point to the sink, or 'Not Provided — <justification>'."
+            },
+            "category": {
+              "type": "string"
+            },
+            "ci_cd_detection": {
+              "anyOf": [
+                {
+                  "properties": {
+                    "body": {
+                      "description": "Markdown. The rule or test, verbatim.",
+                      "type": "string"
+                    },
+                    "command": {
+                      "type": "string"
+                    },
+                    "expect": {
+                      "description": "The failing signal.",
+                      "type": "string"
+                    },
+                    "stage": {
+                      "description": "pre-merge / nightly / release gate.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "stage",
+                    "body",
+                    "expect"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "type": "string"
+                }
+              ],
+              "description": "A pipeline check that fails the build when this class of issue is present, or 'Not Provided — <justification>'."
+            },
+            "classifications": {
+              "description": "Classifications across taxonomies (engagement profiles), e.g. {\"system\":\"CVE\",\"id\":\"CVE-2024-1234\"} or {\"system\":\"ATT&CK\",\"id\":\"T1190\"}. Optional; additive to 'cwe'.",
+              "items": {
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "system": {
+                    "type": "string"
+                  },
+                  "vector": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "system",
+                  "id"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "cross_references": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "None"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "items": {
+                    "properties": {
+                      "finding_id": {
+                        "type": "string"
+                      },
+                      "note": {
+                        "type": "string"
+                      },
+                      "relation": {
+                        "enum": [
+                          "duplicate",
+                          "sibling",
+                          "prerequisite",
+                          "supersedes"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "finding_id",
+                      "relation"
+                    ],
+                    "type": "object"
+                  },
+                  "minItems": 1,
+                  "type": "array"
+                }
+              ],
+              "description": "'None', or related findings by the fnd_ id a previous report_finding call returned."
+            },
+            "cwe": {
+              "description": "CWE ids, e.g. ['CWE-306']. May be empty.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "description": {
+              "description": "Markdown. What the issue is, where it occurs, why it is a weakness.",
+              "type": "string"
+            },
+            "evidence": {
+              "description": "Minimal annotated proof, one claim per entry.",
+              "items": {
+                "properties": {
+                  "artifact": {
+                    "description": "Path of an entry in artifacts that proves this claim.",
+                    "type": "string"
+                  },
+                  "binary_va": {
+                    "type": "string"
+                  },
+                  "claim": {
+                    "type": "string"
+                  },
+                  "excerpt": {
+                    "description": "Only the lines that matter.",
+                    "type": "string"
+                  },
+                  "file": {
+                    "description": "Workspace-relative path.",
+                    "type": "string"
+                  },
+                  "lang": {
+                    "description": "Language for highlighting, e.g. 'c', 'sh'.",
+                    "type": "string"
+                  },
+                  "lines": {
+                    "items": {
+                      "type": "integer"
+                    },
+                    "maxItems": 2,
+                    "minItems": 2,
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "claim"
+                ],
+                "type": "object"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            "impact": {
+              "description": "Markdown. What an attacker could achieve and why it matters.",
+              "type": "string"
+            },
+            "location": {
+              "properties": {
+                "input": {
+                  "description": "Markdown. Input surface, endpoint, parameter, or feature.",
+                  "type": "string"
+                },
+                "output": {
+                  "description": "Markdown. Affected area, response, or downstream system.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "input",
+                "output"
+              ],
+              "type": "object"
+            },
+            "ownership": {
+              "properties": {
+                "affected_component": {
+                  "description": "Exact feature/endpoint/module, or 'Unknown'.",
+                  "type": "string"
+                },
+                "owner": {
+                  "description": "Accountable team/service owner, or 'Unknown'. Never invent one.",
+                  "type": "string"
+                },
+                "product": {
+                  "description": "Named application/platform/service, or 'Unknown'.",
+                  "type": "string"
+                },
+                "source_repository": {
+                  "description": "Canonical repository (optionally with a path), 'Not Applicable' when no source-controlled code is involved, or 'Unknown'.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "owner",
+                "product",
+                "affected_component",
+                "source_repository"
+              ],
+              "type": "object"
+            },
+            "rating": {
+              "properties": {
+                "cvss_v3": {
+                  "description": "Base score, optionally with the vector string, or 'Unknown'. Never invent a score.",
+                  "type": "string"
+                },
+                "impact": {
+                  "enum": [
+                    "Low",
+                    "Medium",
+                    "High",
+                    "Critical"
+                  ],
+                  "type": "string"
+                },
+                "likelihood": {
+                  "enum": [
+                    "Low",
+                    "Medium",
+                    "High"
+                  ],
+                  "type": "string"
+                },
+                "risk_factor": {
+                  "enum": [
+                    "Low",
+                    "Medium",
+                    "High",
+                    "Critical"
+                  ],
+                  "type": "string"
+                },
+                "risk_rating": {
+                  "description": "Drives the finding's severity.",
+                  "enum": [
+                    "Low",
+                    "Medium",
+                    "High",
+                    "Critical"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "impact",
+                "likelihood",
+                "risk_rating",
+                "risk_factor",
+                "cvss_v3"
+              ],
+              "type": "object"
+            },
+            "recommended_patch": {
+              "anyOf": [
+                {
+                  "properties": {
+                    "diff": {
+                      "type": "string"
+                    },
+                    "notes": {
+                      "description": "Markdown. Alternatives or the equivalent source-level change.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "diff"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "type": "string"
+                }
+              ],
+              "description": "Minimal unified diff against the source repository (or a binary@VA pseudo-diff), or 'Not Provided — <justification>'."
+            },
+            "references": {
+              "description": "Markdown. CWE, OWASP category, control references, related tickets.",
+              "type": "string"
+            },
+            "regression_test": {
+              "anyOf": [
+                {
+                  "properties": {
+                    "body": {
+                      "type": "string"
+                    },
+                    "command": {
+                      "type": "string"
+                    },
+                    "expect_patched": {
+                      "type": "string"
+                    },
+                    "expect_vulnerable": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "body",
+                    "command",
+                    "expect_vulnerable",
+                    "expect_patched"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "type": "string"
+                }
+              ],
+              "description": "A deterministic test that fails on the vulnerable build and passes on the patched one, or 'Not Provided — <justification>'."
+            },
+            "remediation": {
+              "description": "Markdown. Specific corrective actions.",
+              "type": "string"
+            },
+            "replication_steps": {
+              "description": "Sequential, reproducible steps with exact payloads and commands.",
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            "root_cause": {
+              "description": "Markdown, one or two sentences. The single underlying defect, naming the exact variable, check, or assumption that is wrong — not the symptom.",
+              "type": "string"
+            },
+            "tickets": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "None Provided",
+                    "Unknown"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "items": {
+                    "properties": {
+                      "identifier": {
+                        "type": "string"
+                      },
+                      "notes": {
+                        "type": "string"
+                      },
+                      "type": {
+                        "description": "Jira / Bug / Remediation Tracker / Vulnerability Management / Other.",
+                        "type": "string"
+                      },
+                      "url": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "type",
+                      "identifier"
+                    ],
+                    "type": "object"
+                  },
+                  "minItems": 1,
+                  "type": "array"
+                }
+              ],
+              "description": "'None Provided' when no existing ticket is mentioned, 'Unknown' when one exists but its id is not given, or the tickets present in the evidence. Never invent a ticket."
+            },
+            "title": {
+              "description": "Short title specific to the vulnerable feature and target.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "title",
+            "ownership",
+            "tickets",
+            "rating",
+            "category",
+            "attack_vector",
+            "cwe",
+            "description",
+            "impact",
+            "location",
+            "root_cause",
+            "call_chain",
+            "evidence",
+            "remediation",
+            "recommended_patch",
+            "ci_cd_detection",
+            "regression_test",
+            "replication_steps",
+            "cross_references",
+            "references"
+          ],
+          "title": "rupu finding report",
+          "type": "object"
+        },
+        "scope": {
+          "description": "What the finding is about. Code scopes: 'line' (needs file_path + line_range), 'file' (needs file_path), 'repo' (the project as a whole). Target scopes, each needing target_ref: 'host' (a machine or IP), 'endpoint' (a specific service URL), 'resource' (a cloud resource by its own id). Pick the narrowest scope the evidence actually supports - claiming a whole host for a defect on one endpoint overstates it.",
+          "enum": [
+            "line",
+            "file",
+            "repo",
+            "host",
+            "endpoint",
+            "resource"
+          ],
+          "type": "string"
+        },
+        "tags": {
+          "description": "Free-form tags: lowercase a-z, 0-9 and . _ : / -, starting with a letter or digit, e.g. class:sqli, needs-poc. Reuse tags already in use where they fit (findings.query lists them).",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "type": "array"
+        },
+        "target_ref": {
+          "description": "What this finding is about when it is not a file: a host or IP (host), a URL (endpoint), or a cloud resource id such as an OCID/ARN/URN (resource). Required for those three scopes.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "scope",
+        "report"
+      ],
+      "type": "object"
+    },
+    "name": "findings.report"
+  },
+  {
+    "description": "Record your verdict on a finding that ANOTHER run filed: confirmed (you reproduced or independently established it), disputed (you showed it is wrong), or inconclusive (you could not decide). Your run and agent are recorded automatically. A finding cannot be verified by the run that filed it, and a finding without a full report cannot be verified. A later verdict replaces an earlier one.",
+    "inputSchema": {
+      "properties": {
+        "finding_id": {
+          "description": "The id of the finding to verify (as returned by findings.report).",
+          "type": "string"
+        },
+        "notes": {
+          "description": "What you did and saw: how you reproduced it, or why it does not hold.",
+          "type": "string"
+        },
+        "status": {
+          "description": "Your verdict.",
+          "enum": [
+            "confirmed",
+            "disputed",
+            "inconclusive"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "finding_id",
+        "status"
+      ],
+      "type": "object"
+    },
+    "name": "findings.verify"
+  },
+  {
+    "description": "List findings recorded in this project with a one-line query in `q` (e.g. `severity>=high tag:needs-poc -has:poc`). Returns one page of slim rows (id, title, severity, location, tags), `next_cursor`, `total`, and `tags_in_use` — reuse an existing tag where it fits. `all: true` returns every match unpaged, however many: page with `cursor` instead unless you need the whole set.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "all": {
+          "description": "Return every match in one answer, unpaged (no `limit`/`cursor`) and unbounded. For a workflow `for_each` over the rows; to read findings into a conversation, page instead.",
+          "type": "boolean"
+        },
+        "cursor": {
+          "description": "`next_cursor` from the previous page.",
+          "type": "string"
+        },
+        "limit": {
+          "description": "Rows per page (default 50).",
+          "maximum": 500,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "q": {
+          "description": "Findings query, e.g. `severity>=high tag:class:sqli -tag:false-positive -has:poc \"sql injection\"`. Tokens AND; `key:a,b` is any-of; `-` negates; keys: severity (>=,>,<=,<), tag, has (tags|report|poc|cwe), cwe, owner, product, verified, profile, scope, concern, agent, file (path prefix), run, id; bare words search title/summary/id/file. Empty matches everything.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "findings.query"
+  },
+  {
+    "description": "Add or remove tags on findings in this project, one or many at once. Tags are free-form: lowercase a-z, 0-9 and . _ : / -, starting with a letter or digit (e.g. class:sqli, needs-poc, status:triaged). Prefer tags already in use (findings.query lists them). An unknown finding id rejects the whole call; adding a tag a finding already has changes nothing. Returns each finding's tags before and after.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "add": {
+          "description": "Tags to add.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "finding_ids": {
+          "description": "Finding ids (fnd_…) from findings.query or findings.report.",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "remove": {
+          "description": "Tags to remove.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "finding_ids"
+      ],
+      "type": "object"
+    },
+    "name": "findings.tag"
+  },
+  {
     "description": "List repositories the authenticated user can access on the given platform. Omit `platform` to use [scm.default].",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -765,675 +1436,5 @@
       "type": "object"
     },
     "name": "gitlab.pipeline_trigger"
-  },
-  {
-    "description": "Record a security finding in this project's findings ledger, so it appears in the control plane rather than only in an external tracker. Use the narrowest scope the evidence supports. Under the full findings profile (the step's `findings_profile`, else the workflow default, else full) send `report` (a complete finding report) and omit summary/severity/rationale; under the summary profile send summary, severity and rationale. Under an active engagement profile, name the `asset` the finding is about: its kind routes the finding to the owning profile, whose completeness checks it must pass.",
-    "inputSchema": {
-      "properties": {
-        "asset": {
-          "description": "The engagement asset this finding is about (only under an active engagement profile). Its `kind` routes the finding to the owning profile for completeness validation and stamps it into the asset graph. Omit on a plain code run.",
-          "properties": {
-            "coordinates": {
-              "description": "Locator coordinates pinning the asset, each {\"t\": <tag>, \"v\": <value>}. Tags: host, port, url, path, line_range, symbol, sha256, address, offset, commit, http_route, param, resource_id.",
-              "items": {
-                "type": "object"
-              },
-              "type": "array"
-            },
-            "kind": {
-              "description": "Profile-namespaced asset kind, e.g. \"network:service\", \"binary:function\", \"web:route\".",
-              "type": "string"
-            },
-            "label": {
-              "description": "Optional human label; if omitted, the asset keeps its existing label (a new asset is labelled with its kind).",
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind"
-          ],
-          "type": "object"
-        },
-        "code_excerpt": {
-          "description": "Relevant excerpt, if any. Summary profile only.",
-          "type": "string"
-        },
-        "concern_id": {
-          "description": "Catalog concern id, when one applies.",
-          "type": "string"
-        },
-        "file_path": {
-          "description": "Workspace-relative path, for the code scopes.",
-          "type": "string"
-        },
-        "line_range": {
-          "description": "[start, end], required for scope 'line'.",
-          "items": {
-            "type": "integer"
-          },
-          "maxItems": 2,
-          "minItems": 2,
-          "type": "array"
-        },
-        "rationale": {
-          "description": "Why this is a weakness, and the evidence that establishes it. Summary profile only.",
-          "type": "string"
-        },
-        "references": {
-          "description": "Supporting links — an issue URL, an advisory. Summary profile only.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "report": {
-          "description": "A complete security finding report, recorded once by the agent. Presentations and exports (Markdown, HTML, PDF) are generated from this report, so no separate report file is written. When information genuinely cannot be determined use the field's sentinel instead of omitting it: 'Unknown', 'Not Applicable', 'None Provided', 'None', or 'Not Provided — <justification>' as each field describes.",
-          "properties": {
-            "artifacts": {
-              "description": "Proof-of-concept files (scripts, outputs, harnesses) as workspace-relative paths; rupu stores them with the finding. Supply only 'path'.",
-              "items": {
-                "properties": {
-                  "path": {
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "path"
-                ],
-                "type": "object"
-              },
-              "type": "array"
-            },
-            "attack_vector": {
-              "description": "How the surface is reached, including authentication or user interaction required, or 'Unknown'.",
-              "type": "string"
-            },
-            "blocks": {
-              "description": "Typed evidence blocks (engagement profiles): each an object with a 'kind' tag and that kind's fields, e.g. {\"kind\":\"scan_output\",\"tool\":\"nmap\",\"output\":\"...\"} or {\"kind\":\"http_exchange\",\"request\":\"...\",\"response\":\"...\"}. Optional; additive to 'evidence'.",
-              "items": {
-                "properties": {
-                  "kind": {
-                    "enum": [
-                      "text",
-                      "code_slice",
-                      "diff",
-                      "table",
-                      "image",
-                      "hexdump",
-                      "disasm",
-                      "decompile",
-                      "http_exchange",
-                      "scan_output",
-                      "pcap_ref"
-                    ],
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "kind"
-                ],
-                "type": "object"
-              },
-              "type": "array"
-            },
-            "call_chain": {
-              "anyOf": [
-                {
-                  "items": {
-                    "properties": {
-                      "binary_va": {
-                        "description": "binary@VA for binary-only targets.",
-                        "type": "string"
-                      },
-                      "file": {
-                        "description": "Workspace-relative path.",
-                        "type": "string"
-                      },
-                      "gate": {
-                        "description": "Precondition crossed at this hop.",
-                        "type": "string"
-                      },
-                      "label": {
-                        "description": "Function or surface name.",
-                        "type": "string"
-                      },
-                      "lines": {
-                        "items": {
-                          "type": "integer"
-                        },
-                        "maxItems": 2,
-                        "minItems": 2,
-                        "type": "array"
-                      },
-                      "passes_because": {
-                        "description": "Why the gate passes.",
-                        "type": "string"
-                      },
-                      "role": {
-                        "enum": [
-                          "source",
-                          "hop",
-                          "sink"
-                        ],
-                        "type": "string"
-                      }
-                    },
-                    "required": [
-                      "label",
-                      "role"
-                    ],
-                    "type": "object"
-                  },
-                  "minItems": 1,
-                  "type": "array"
-                },
-                {
-                  "type": "string"
-                }
-              ],
-              "description": "Ordered path from the externally reachable entry point to the sink, or 'Not Provided — <justification>'."
-            },
-            "category": {
-              "type": "string"
-            },
-            "ci_cd_detection": {
-              "anyOf": [
-                {
-                  "properties": {
-                    "body": {
-                      "description": "Markdown. The rule or test, verbatim.",
-                      "type": "string"
-                    },
-                    "command": {
-                      "type": "string"
-                    },
-                    "expect": {
-                      "description": "The failing signal.",
-                      "type": "string"
-                    },
-                    "stage": {
-                      "description": "pre-merge / nightly / release gate.",
-                      "type": "string"
-                    }
-                  },
-                  "required": [
-                    "stage",
-                    "body",
-                    "expect"
-                  ],
-                  "type": "object"
-                },
-                {
-                  "type": "string"
-                }
-              ],
-              "description": "A pipeline check that fails the build when this class of issue is present, or 'Not Provided — <justification>'."
-            },
-            "classifications": {
-              "description": "Classifications across taxonomies (engagement profiles), e.g. {\"system\":\"CVE\",\"id\":\"CVE-2024-1234\"} or {\"system\":\"ATT&CK\",\"id\":\"T1190\"}. Optional; additive to 'cwe'.",
-              "items": {
-                "properties": {
-                  "id": {
-                    "type": "string"
-                  },
-                  "system": {
-                    "type": "string"
-                  },
-                  "vector": {
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "system",
-                  "id"
-                ],
-                "type": "object"
-              },
-              "type": "array"
-            },
-            "cross_references": {
-              "anyOf": [
-                {
-                  "enum": [
-                    "None"
-                  ],
-                  "type": "string"
-                },
-                {
-                  "items": {
-                    "properties": {
-                      "finding_id": {
-                        "type": "string"
-                      },
-                      "note": {
-                        "type": "string"
-                      },
-                      "relation": {
-                        "enum": [
-                          "duplicate",
-                          "sibling",
-                          "prerequisite",
-                          "supersedes"
-                        ],
-                        "type": "string"
-                      }
-                    },
-                    "required": [
-                      "finding_id",
-                      "relation"
-                    ],
-                    "type": "object"
-                  },
-                  "minItems": 1,
-                  "type": "array"
-                }
-              ],
-              "description": "'None', or related findings by the fnd_ id a previous report_finding call returned."
-            },
-            "cwe": {
-              "description": "CWE ids, e.g. ['CWE-306']. May be empty.",
-              "items": {
-                "type": "string"
-              },
-              "type": "array"
-            },
-            "description": {
-              "description": "Markdown. What the issue is, where it occurs, why it is a weakness.",
-              "type": "string"
-            },
-            "evidence": {
-              "description": "Minimal annotated proof, one claim per entry.",
-              "items": {
-                "properties": {
-                  "artifact": {
-                    "description": "Path of an entry in artifacts that proves this claim.",
-                    "type": "string"
-                  },
-                  "binary_va": {
-                    "type": "string"
-                  },
-                  "claim": {
-                    "type": "string"
-                  },
-                  "excerpt": {
-                    "description": "Only the lines that matter.",
-                    "type": "string"
-                  },
-                  "file": {
-                    "description": "Workspace-relative path.",
-                    "type": "string"
-                  },
-                  "lang": {
-                    "description": "Language for highlighting, e.g. 'c', 'sh'.",
-                    "type": "string"
-                  },
-                  "lines": {
-                    "items": {
-                      "type": "integer"
-                    },
-                    "maxItems": 2,
-                    "minItems": 2,
-                    "type": "array"
-                  }
-                },
-                "required": [
-                  "claim"
-                ],
-                "type": "object"
-              },
-              "minItems": 1,
-              "type": "array"
-            },
-            "impact": {
-              "description": "Markdown. What an attacker could achieve and why it matters.",
-              "type": "string"
-            },
-            "location": {
-              "properties": {
-                "input": {
-                  "description": "Markdown. Input surface, endpoint, parameter, or feature.",
-                  "type": "string"
-                },
-                "output": {
-                  "description": "Markdown. Affected area, response, or downstream system.",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "input",
-                "output"
-              ],
-              "type": "object"
-            },
-            "ownership": {
-              "properties": {
-                "affected_component": {
-                  "description": "Exact feature/endpoint/module, or 'Unknown'.",
-                  "type": "string"
-                },
-                "owner": {
-                  "description": "Accountable team/service owner, or 'Unknown'. Never invent one.",
-                  "type": "string"
-                },
-                "product": {
-                  "description": "Named application/platform/service, or 'Unknown'.",
-                  "type": "string"
-                },
-                "source_repository": {
-                  "description": "Canonical repository (optionally with a path), 'Not Applicable' when no source-controlled code is involved, or 'Unknown'.",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "owner",
-                "product",
-                "affected_component",
-                "source_repository"
-              ],
-              "type": "object"
-            },
-            "rating": {
-              "properties": {
-                "cvss_v3": {
-                  "description": "Base score, optionally with the vector string, or 'Unknown'. Never invent a score.",
-                  "type": "string"
-                },
-                "impact": {
-                  "enum": [
-                    "Low",
-                    "Medium",
-                    "High",
-                    "Critical"
-                  ],
-                  "type": "string"
-                },
-                "likelihood": {
-                  "enum": [
-                    "Low",
-                    "Medium",
-                    "High"
-                  ],
-                  "type": "string"
-                },
-                "risk_factor": {
-                  "enum": [
-                    "Low",
-                    "Medium",
-                    "High",
-                    "Critical"
-                  ],
-                  "type": "string"
-                },
-                "risk_rating": {
-                  "description": "Drives the finding's severity.",
-                  "enum": [
-                    "Low",
-                    "Medium",
-                    "High",
-                    "Critical"
-                  ],
-                  "type": "string"
-                }
-              },
-              "required": [
-                "impact",
-                "likelihood",
-                "risk_rating",
-                "risk_factor",
-                "cvss_v3"
-              ],
-              "type": "object"
-            },
-            "recommended_patch": {
-              "anyOf": [
-                {
-                  "properties": {
-                    "diff": {
-                      "type": "string"
-                    },
-                    "notes": {
-                      "description": "Markdown. Alternatives or the equivalent source-level change.",
-                      "type": "string"
-                    }
-                  },
-                  "required": [
-                    "diff"
-                  ],
-                  "type": "object"
-                },
-                {
-                  "type": "string"
-                }
-              ],
-              "description": "Minimal unified diff against the source repository (or a binary@VA pseudo-diff), or 'Not Provided — <justification>'."
-            },
-            "references": {
-              "description": "Markdown. CWE, OWASP category, control references, related tickets.",
-              "type": "string"
-            },
-            "regression_test": {
-              "anyOf": [
-                {
-                  "properties": {
-                    "body": {
-                      "type": "string"
-                    },
-                    "command": {
-                      "type": "string"
-                    },
-                    "expect_patched": {
-                      "type": "string"
-                    },
-                    "expect_vulnerable": {
-                      "type": "string"
-                    }
-                  },
-                  "required": [
-                    "body",
-                    "command",
-                    "expect_vulnerable",
-                    "expect_patched"
-                  ],
-                  "type": "object"
-                },
-                {
-                  "type": "string"
-                }
-              ],
-              "description": "A deterministic test that fails on the vulnerable build and passes on the patched one, or 'Not Provided — <justification>'."
-            },
-            "remediation": {
-              "description": "Markdown. Specific corrective actions.",
-              "type": "string"
-            },
-            "replication_steps": {
-              "description": "Sequential, reproducible steps with exact payloads and commands.",
-              "items": {
-                "type": "string"
-              },
-              "minItems": 1,
-              "type": "array"
-            },
-            "root_cause": {
-              "description": "Markdown, one or two sentences. The single underlying defect, naming the exact variable, check, or assumption that is wrong — not the symptom.",
-              "type": "string"
-            },
-            "tickets": {
-              "anyOf": [
-                {
-                  "enum": [
-                    "None Provided",
-                    "Unknown"
-                  ],
-                  "type": "string"
-                },
-                {
-                  "items": {
-                    "properties": {
-                      "identifier": {
-                        "type": "string"
-                      },
-                      "notes": {
-                        "type": "string"
-                      },
-                      "type": {
-                        "description": "Jira / Bug / Remediation Tracker / Vulnerability Management / Other.",
-                        "type": "string"
-                      },
-                      "url": {
-                        "type": "string"
-                      }
-                    },
-                    "required": [
-                      "type",
-                      "identifier"
-                    ],
-                    "type": "object"
-                  },
-                  "minItems": 1,
-                  "type": "array"
-                }
-              ],
-              "description": "'None Provided' when no existing ticket is mentioned, 'Unknown' when one exists but its id is not given, or the tickets present in the evidence. Never invent a ticket."
-            },
-            "title": {
-              "description": "Short title specific to the vulnerable feature and target.",
-              "type": "string"
-            }
-          },
-          "required": [
-            "title",
-            "ownership",
-            "tickets",
-            "rating",
-            "category",
-            "attack_vector",
-            "cwe",
-            "description",
-            "impact",
-            "location",
-            "root_cause",
-            "call_chain",
-            "evidence",
-            "remediation",
-            "recommended_patch",
-            "ci_cd_detection",
-            "regression_test",
-            "replication_steps",
-            "cross_references",
-            "references"
-          ],
-          "title": "rupu finding report",
-          "type": "object"
-        },
-        "scope": {
-          "description": "What the finding is about. Code scopes: 'line' (needs file_path + line_range), 'file' (needs file_path), 'repo' (the project as a whole). Target scopes, each needing target_ref: 'host' (a machine or IP), 'endpoint' (a service URL), 'resource' (a cloud resource id such as an OCID/ARN/URN).",
-          "enum": [
-            "line",
-            "file",
-            "repo",
-            "host",
-            "endpoint",
-            "resource"
-          ],
-          "type": "string"
-        },
-        "severity": {
-          "description": "Summary profile only.",
-          "enum": [
-            "info",
-            "low",
-            "medium",
-            "high",
-            "critical"
-          ],
-          "type": "string"
-        },
-        "summary": {
-          "description": "One sentence stating the weakness. Summary profile only.",
-          "type": "string"
-        },
-        "tags": {
-          "description": "Free-form tags: lowercase a-z, 0-9 and . _ : / -, starting with a letter or digit, e.g. class:sqli, needs-poc. Reuse tags already in use where they fit (findings.query lists them).",
-          "items": {
-            "type": "string"
-          },
-          "maxItems": 32,
-          "type": "array"
-        },
-        "target_ref": {
-          "description": "The host, endpoint URL, or resource id — required for the target scopes.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "scope"
-      ],
-      "type": "object"
-    },
-    "name": "findings.record"
-  },
-  {
-    "description": "List this project's findings matching a one-line query `q` (e.g. `severity>=high tag:needs-poc`): one page of slim rows, `next_cursor`, `total`, and `tags_in_use`; with `all: true`, every match unpaged (for a workflow `for_each` over `rows`).",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "all": {
-          "description": "Return every match in one answer, unpaged (no `limit`/`cursor`) and unbounded. For a workflow `for_each` over the rows; to read findings into a conversation, page instead.",
-          "type": "boolean"
-        },
-        "cursor": {
-          "description": "`next_cursor` from the previous page.",
-          "type": "string"
-        },
-        "limit": {
-          "description": "Rows per page (default 50).",
-          "maximum": 500,
-          "minimum": 1,
-          "type": "integer"
-        },
-        "q": {
-          "description": "Findings query, e.g. `severity>=high tag:class:sqli -tag:false-positive -has:poc \"sql injection\"`. Tokens AND; `key:a,b` is any-of; `-` negates; keys: severity (>=,>,<=,<), tag, has (tags|report|poc|cwe), cwe, owner, product, verified, profile, scope, concern, agent, file (path prefix), run, id; bare words search title/summary/id/file. Empty matches everything.",
-          "type": "string"
-        }
-      },
-      "type": "object"
-    },
-    "name": "findings.query"
-  },
-  {
-    "description": "Add or remove free-form tags (lowercase a-z 0-9 . _ : / -) on one or more of this project's findings. An unknown id rejects the whole call; returns each finding's tags before and after.",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "add": {
-          "description": "Tags to add.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "finding_ids": {
-          "description": "Finding ids (fnd_…) from findings.query or findings.report.",
-          "items": {
-            "type": "string"
-          },
-          "minItems": 1,
-          "type": "array"
-        },
-        "remove": {
-          "description": "Tags to remove.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        }
-      },
-      "required": [
-        "finding_ids"
-      ],
-      "type": "object"
-    },
-    "name": "findings.tag"
   }
 ]

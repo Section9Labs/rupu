@@ -1464,8 +1464,8 @@ steps:
 
 // --- Parse-time catalog validation (Plan 2, Task 1) ---
 //
-// `issues.comment`'s real arg struct (CommentIssueArgs, rupu-mcp
-// crates/rupu-mcp/src/tools/issues.rs) is:
+// `issues.comment`'s real arg struct (CommentIssueArgs,
+// crates/rupu-tools/src/issues/mod.rs) is:
 //   tracker: Option<String>  (optional)
 //   project: String          (required)
 //   number: u64              (required)

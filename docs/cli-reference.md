@@ -28,6 +28,7 @@ These apply to every command.
   - [`rupu agent list`](#rupu-agent-list)
   - [`rupu agent show`](#rupu-agent-show)
   - [`rupu agent edit`](#rupu-agent-edit)
+  - [`rupu agent validate`](#rupu-agent-validate)
   - [`rupu agent create`](#rupu-agent-create)
 - [`rupu workflow`](#rupu-workflow)
   - [`rupu workflow list`](#rupu-workflow-list)
@@ -296,6 +297,7 @@ rupu agent [OPTIONS] <COMMAND>
 | [`list`](#rupu-agent-list) | List all available agents (global + project) |
 | [`show`](#rupu-agent-show) | Print an agent's frontmatter and body |
 | [`edit`](#rupu-agent-edit) | Open an agent file in `$VISUAL` / `$EDITOR`. Validates the frontmatter on save (warn-only) |
+| [`validate`](#rupu-agent-validate) | Check agent files: each must parse and its `tools:` must name known tools (an unknown name is a load error). Checks every file in the global and project agent dirs with `--all`, shadowed ones included. Exits nonzero when any check fails |
 | [`create`](#rupu-agent-create) | Scaffold a new agent file, then open it for editing. Prompts interactively for scope and name when omitted. With `--describe`, a model drafts the definition before you review it |
 
 <a id="rupu-agent-list"></a>
@@ -348,6 +350,23 @@ rupu agent edit [OPTIONS] <NAME>
 |---|---|
 | `--scope <SCOPE>` | Force the project shadow (`.rupu/agents/<name>.md`) or the global file (`<global>/agents/<name>.md`). Default: prefer project if it exists, else global [possible values: global, project] |
 | `--editor <EDITOR>` | Override the editor (e.g. `--editor "code --wait"`). Default: `$VISUAL` then `$EDITOR` then `vi` |
+
+<a id="rupu-agent-validate"></a>
+### `rupu agent validate`
+
+Check agent files: each must parse and its `tools:` must name known tools (an unknown name is a load error). Checks every file in the global and project agent dirs with `--all`, shadowed ones included. Exits nonzero when any check fails
+
+```
+rupu agent validate [OPTIONS] <NAME|--all>
+```
+
+| Argument | Description |
+|---|---|
+| `[NAME]` | Name of the agent (frontmatter `name:` or file stem) |
+
+| Option | Description |
+|---|---|
+| `--all` | Check every agent file in both layers |
 
 <a id="rupu-agent-create"></a>
 ### `rupu agent create`
@@ -1812,6 +1831,7 @@ rupu session start [OPTIONS] <AGENT> [TARGET] [PROMPT]
 | `--into <PATH>` | For repo targets: clone into this directory instead of `./<repo>/` |
 | `--detach` | Start the first turn without auto-attaching |
 | `--view <VIEW>` | Live renderer mode when auto-attaching [possible values: focused, compact, full] |
+| `--engagement-profile <ID>` | Engagement profile(s) every turn of the session runs under — the asset domain(s) findings are validated against (e.g. `network`, `binary`). Repeatable or comma-separated. Empty = the `code` path [aliases: --engagement-profiles] |
 
 <a id="rupu-session-list"></a>
 ### `rupu session list`
@@ -2099,6 +2119,8 @@ rupu mcp serve [OPTIONS]
 | Option | Description |
 |---|---|
 | `--transport <TRANSPORT>` | Transport. v0 ships stdio only; http returns NotWiredInV0 [default: stdio] [possible values: stdio, http] |
+| `--tools <TOOLS>` | The tools to serve, in the agent `tools:` grammar: exact names, legacy aliases, `ns.*`, `core.*` or `*` (comma-separated or repeated). Default: the connector and findings tools (`scm.*,issues.*,github.*,gitlab.*,findings.*`) |
+| `--mode <MODE>` | Permission mode each call is decided under: `bypass` (default — the MCP client's own confirmation UX is in front of every call), `readonly` (refuse workspace writes and external actions) or `ask` (no operator to prompt here, so it allows) [default: bypass] |
 
 <a id="rupu-coverage"></a>
 ### `rupu coverage`

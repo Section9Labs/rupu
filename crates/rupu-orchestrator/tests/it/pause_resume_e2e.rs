@@ -282,7 +282,7 @@ async fn run_pause_then_resume_completes() {
         strict_templates: false,
         event_sink: Some(recorder1.clone()),
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: Some(token),
         naming: None,
     };
@@ -444,7 +444,7 @@ async fn run_pause_then_resume_completes() {
         strict_templates: false,
         event_sink: Some(recorder2.clone()),
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -594,7 +594,7 @@ async fn workflow_pause_resume_runs_remaining_steps() {
         strict_templates: false,
         event_sink: Some(recorder1.clone()),
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: Some(token),
         naming: None,
     };
@@ -674,7 +674,7 @@ async fn workflow_pause_resume_runs_remaining_steps() {
         strict_templates: false,
         event_sink: Some(recorder2.clone()),
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -833,7 +833,7 @@ async fn fanout_pause_resumes_only_incomplete_units() {
         strict_templates: false,
         event_sink: Some(recorder1.clone()),
         unit_dispatcher: Some(dispatcher1.clone()),
-        action_dispatcher: None,
+        action_services: None,
         pause: Some(token),
         naming: None,
     };
@@ -941,7 +941,7 @@ async fn fanout_pause_resumes_only_incomplete_units() {
         strict_templates: false,
         event_sink: Some(recorder2.clone()),
         unit_dispatcher: Some(dispatcher2.clone()),
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -1048,7 +1048,7 @@ async fn fanout_unit_checkpoint_is_durable_while_siblings_still_run() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -1275,7 +1275,7 @@ async fn kill_mid_b(
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
-        action_dispatcher: None,
+        action_services: None,
         pause: None,
         naming: None,
     };
@@ -1440,7 +1440,7 @@ impl Killed {
             strict_templates: false,
             event_sink: Some(recorder.clone()),
             unit_dispatcher: None,
-            action_dispatcher: None,
+            action_services: None,
             pause: None,
             naming: None,
         };

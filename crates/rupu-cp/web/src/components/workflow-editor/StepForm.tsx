@@ -6,7 +6,7 @@
 // in an inline alert block at the top.
 
 import { useRef, useState } from 'react';
-import type { AgentSummary, ToolSpec } from '../../lib/api';
+import { findTool, isConnectorTool, type AgentSummary, type ToolSpec } from '../../lib/api';
 import {
   acceptsFindingsProfile,
   canConnect,
@@ -139,7 +139,7 @@ export default function StepForm({
     // `findings_profile` only means something on a step that runs an agent —
     // carry it into step/for_each/parallel/panel; drop it for branch/gate/
     // split/join, and for `action` (whose tool starts empty, so it isn't
-    // `findings.record` yet and the server would reject the field).
+    // `findings.report` yet and the server would reject the field).
     if (
       d.findings_profile !== undefined &&
       (kind === 'step' || kind === 'for_each' || kind === 'parallel' || kind === 'panel')
@@ -410,7 +410,7 @@ function groupToolsByPrefix(tools: ToolSpec[]): Array<[string, ToolSpec[]]> {
 function ActionsField({
   d,
   agents,
-  tools,
+  tools: catalog,
   patch,
 }: {
   d: StepNodeData;
@@ -419,6 +419,9 @@ function ActionsField({
   patch: (p: Partial<StepNodeData>) => void;
 }) {
   const selected = d.actions ?? [];
+  // `actions:` narrows connector tools only; any other tool would be a parse
+  // error (`ActionsNotConnector`).
+  const tools = catalog.filter(isConnectorTool);
   const agentName = d.agent;
   // `undefined` (no agent picked yet, or a picked agent /api/agents doesn't
   // know about) means "nothing to flag against" — every tool renders
@@ -1501,10 +1504,13 @@ function ActionFields({
   patch: (p: Partial<StepNodeData>) => void;
 }) {
   const withObj = d.with ?? {};
-  const selected = tools.find((t) => t.name === d.action);
-  // Tool option names: every catalog tool plus the current value if it's not in
-  // the list (so a step referencing an unknown/renamed tool still round-trips).
-  const names = tools.map((t) => t.name);
+  // The current value may be a legacy alias (`findings.record` for
+  // `findings.report`): it selects that tool, and its option keeps the
+  // alias so the step round-trips exactly as written.
+  const selected = findTool(tools, d.action);
+  const names = tools.map((t) => (t === selected && d.action ? d.action : t.name));
+  // Tool option names: every action-eligible tool plus the current value if
+  // it names none (so a step referencing an unknown tool still round-trips).
   const options = d.action && !names.includes(d.action) ? [d.action, ...names] : names;
   const paramKeys = toolParamKeys(selected);
   // Show any params the schema declares, PLUS any keys already set on `with:`

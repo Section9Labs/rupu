@@ -3787,27 +3787,8 @@ pub(crate) async fn resume_run(
             scope_name_override: None,
         });
     let naming = runtime.naming;
+    let runtime_action_services = runtime.action_services;
     let factory = runtime.factory;
-    let action_dispatcher = crate::resume::action_dispatcher_for(
-        &mcp_registry,
-        permission_mode,
-        Some(rupu_mcp::FindingsContext {
-            workspace_path: workspace_path.clone(),
-            scope_name: workflow.name.clone(),
-            run_id: run_id.to_string(),
-            model: cfg.default_model.clone().unwrap_or_default(),
-            surface: rupu_coverage::Surface::Workflow,
-            options: findings_base
-                .clone()
-                .with_profile(rupu_coverage::FindingProfile::resolve(
-                    None,
-                    workflow.defaults.findings_profile,
-                    None,
-                )),
-            codename: Some(rupu_codename::crew_for(run_id)),
-            provider: cfg.default_provider.clone(),
-        }),
-    );
 
     // A cooperatively-paused run may carry a persisted mid-step seed
     // transcript (written by `run_workflow` when a linear step's agent
@@ -3897,7 +3878,7 @@ pub(crate) async fn resume_run(
         strict_templates: false,
         event_sink: event_sink_for_resume,
         unit_dispatcher,
-        action_dispatcher: Some(action_dispatcher),
+        action_services: Some(runtime_action_services),
         pause: Some(pause_token.clone()),
         naming: Some(naming),
     };
@@ -5553,7 +5534,7 @@ async fn execute_workflow_invocation(
     };
 
     // The write options every finding-recording surface of this run shares:
-    // the dispatcher's sub-agents, the action steps' `FindingsContext`, and
+    // the dispatcher's sub-agents, the action steps' tool context, and
     // each agent step (its profile resolved per step). The engagement is
     // `None` — the native code path — unless `--engagement-profile` selected
     // one, so a run without the flag builds exactly what it always did.
@@ -5561,12 +5542,6 @@ async fn execute_workflow_invocation(
         engagement,
         ..crate::findings_opts::base_options(&global, &cfg.findings)
     };
-    // Coverage/findings scope: the workflow's own name, unless this run is an
-    // agentiflow unit (`--fleet-run-dir`), which pools into the agentiflow's.
-    let scope_name = overlay
-        .scope_name
-        .clone()
-        .unwrap_or_else(|| workflow.name.clone());
     // Process-wide subprocess-capture backend, warmed off the async runtime
     // (its first call blocks).
     let net_capture = crate::netflow_sink::net_capture(&cfg.netflow).await;
@@ -5609,27 +5584,8 @@ async fn execute_workflow_invocation(
             scope_name_override: overlay.scope_name.clone(),
         });
     let naming = runtime.naming;
+    let runtime_action_services = runtime.action_services;
     let factory = runtime.factory;
-    let action_dispatcher = crate::resume::action_dispatcher_for(
-        &mcp_registry,
-        permission_mode,
-        Some(rupu_mcp::FindingsContext {
-            workspace_path: ctx.workspace_path.clone(),
-            scope_name,
-            run_id: run_id.clone(),
-            model: cfg.default_model.clone().unwrap_or_default(),
-            surface: rupu_coverage::Surface::Workflow,
-            options: findings_base
-                .clone()
-                .with_profile(rupu_coverage::FindingProfile::resolve(
-                    None,
-                    workflow.defaults.findings_profile,
-                    None,
-                )),
-            codename: Some(rupu_codename::crew_for(&run_id)),
-            provider: cfg.default_provider.clone(),
-        }),
-    );
 
     let workflow_for_resume = workflow.clone();
     let workspace_path_for_resume = ctx.workspace_path.clone();
@@ -5684,7 +5640,7 @@ async fn execute_workflow_invocation(
         strict_templates,
         event_sink: event_sink_for_run,
         unit_dispatcher,
-        action_dispatcher: Some(Arc::clone(&action_dispatcher)),
+        action_services: Some(runtime_action_services.clone()),
         pause: Some(pause_token.clone()),
         naming: Some(Arc::clone(&naming)),
     };
@@ -5906,7 +5862,7 @@ async fn execute_workflow_invocation(
                         strict_templates,
                         event_sink: resume_event_sink,
                         unit_dispatcher: resume_unit_dispatcher,
-                        action_dispatcher: Some(Arc::clone(&action_dispatcher)),
+                        action_services: Some(runtime_action_services.clone()),
                         pause: Some(pause_token.clone()),
                         // Same run, same namer: the resumed half keeps the
                         // static-slot words and dispatch counters.

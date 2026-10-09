@@ -65,9 +65,9 @@ SaaS control plane and remote sandboxing are still out of scope here; SCM and is
 - Bitbucket, Linear, and Jira connectors.
 - General DAG scheduling beyond the current sequential-step engine.
 - ~~Workflow action effects (open PR, post comment). v0 logs `action_emitted` only.~~
-  **Shipped since** — `action:` steps now execute for real through the in-process MCP
-  tool layer (`docs/superpowers/plans/2026-07-23-rupu-gate-nodes-plan-2-action-execution.md`).
-- Workflow action effects beyond what the MCP connector catalog exposes (`action:` steps can only call catalog tools).
+  **Shipped since** — `action:` steps now execute for real through the tool catalog
+  (originally the in-process MCP tool layer; `docs/superpowers/plans/2026-07-23-rupu-gate-nodes-plan-2-action-execution.md`).
+- Workflow action effects beyond the action-eligible catalog tools (`action:` steps call connector and findings tools only).
 - Transcript compaction, resume from aborted run, concurrent-run locking.
 - SaaS control plane, remote runs, OAuth flows.
 - Sandbox / microVM / session save-restore.
@@ -265,7 +265,7 @@ Engine behavior per step (Slice A narrative — superseded, see below):
    of emitted events — it statically narrows which MCP connector tools (`scm.*`, `issues.*`,
    `github.*`, `gitlab.*`) the step's agent grant is allowed to call, at step-build time, via
    `narrow_agent_tools`; builtins are never touched. Standalone `action:` steps (as opposed to
-   narrowed agent steps) execute their tool call for real through the MCP `ToolDispatcher`.
+   narrowed agent steps) execute their tool call for real through the tool catalog.
    See `docs/workflow-format.md#actions` for the current, correct semantics — this is the
    same phantom validator ISSUES.md I-27 deleted and I-51 corrected elsewhere.
 4. On step failure, abort the workflow.

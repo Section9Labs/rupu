@@ -143,9 +143,10 @@ export default function WorkflowEditor({
   validity,
 }: WorkflowEditorProps) {
   const [graph, setGraph] = useState<WorkflowGraph>(() => seedGraph(draftYaml));
-  // MCP tool catalog for the connector ACTION cards + the action-body tool
-  // <select> (Task 5). Best-effort: a fetch failure just leaves no connector
-  // cards (the palette degrades to kind cards only).
+  // The tools an `action:` step may call (`action_eligible` in the catalog):
+  // the connector ACTION cards + the action-body tool <select> (Task 5).
+  // Best-effort: a fetch failure just leaves no connector cards (the palette
+  // degrades to kind cards only).
   const [tools, setTools] = useState<ToolSpec[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   // Defaults to the Blocks tab (the palette lives there — Task "Flow
@@ -287,13 +288,14 @@ export default function WorkflowEditor({
     return () => clearTimeout(handle);
   }, [draftYaml]);
 
-  // Fetch the MCP tool catalog once on mount (connector cards + action body).
+  // Fetch the tool catalog once on mount; the editor offers only the tools
+  // an `action:` step may call (connector cards + action body).
   useEffect(() => {
     let alive = true;
     api
       .getTools()
       .then((t) => {
-        if (alive) setTools(t);
+        if (alive) setTools(t.filter((tool) => tool.action_eligible));
       })
       .catch(() => {
         /* no catalog → palette degrades to kind cards only */

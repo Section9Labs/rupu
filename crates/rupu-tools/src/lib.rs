@@ -1,23 +1,38 @@
-//! rupu-tools — six tools the agent runtime can invoke.
+//! rupu-tools — every tool rupu's runs can call, and the one way to decide,
+//! grant and call them.
 //!
-//! - [`bash`] — execute a shell command in the workspace cwd.
-//! - [`read_file`] — read a file with line-numbered output.
-//! - [`write_file`] — create or overwrite a file.
-//! - [`edit_file`] — exact-match string replacement.
-//! - [`grep`] — search across the workspace (ripgrep-backed).
-//! - [`glob`] — file pattern matching.
+//! - core fs/shell: [`bash`], [`read_file`], [`write_file`], [`edit_file`],
+//!   [`grep`], [`glob`], [`ast_grep`];
+//! - sub-agent dispatch: [`dispatch_agent`], [`dispatch_agents_parallel`];
+//! - ledgers: [`coverage`], [`findings`], [`assets`];
+//! - connectors over the run's SCM registry: [`scm`], [`issues`],
+//!   [`github`], [`gitlab`].
 //!
 //! All tools implement the [`Tool`] trait and declare a
 //! [`ToolDescriptor`] (name, aliases, [`Effect`], needs). [`catalog`] lists
-//! every descriptor rupu defines. Permission is [`PermissionPolicy`]: a pure
-//! function of a descriptor's effect and the run's [`PermissionMode`] —
-//! tools themselves are not aware of permission state.
+//! every descriptor rupu defines; [`bodies::body`] builds a run's tool from
+//! its [`ToolContext`]. Permission is [`PermissionPolicy`]: a pure function of
+//! a descriptor's effect and the run's [`PermissionMode`] — tools themselves
+//! are not aware of permission state. The agent loop, `action:` workflow
+//! steps ([`call`]) and `rupu mcp serve` ([`call`]) are three callers of the
+//! same tools (spec W4).
 
+pub mod assets;
+pub mod bodies;
+pub mod call;
 pub mod catalog;
+pub mod connector;
+pub mod coverage;
 pub mod coverage_emit;
 pub mod descriptor;
+pub mod findings;
+pub mod github;
+pub mod gitlab;
 pub mod grant;
+pub mod issues;
+pub mod ledger;
 pub mod output;
+pub mod scm;
 pub mod tool;
 
 mod path_scope;
@@ -44,8 +59,9 @@ pub mod dispatch_agents_parallel;
 
 pub use ast_grep::AstGrepTool;
 pub use bash::BashTool;
+pub use call::CallOutcome;
 pub use catalog::ToolCatalog;
-pub use descriptor::{Alias, AliasScope, Effect, Service, ToolDescriptor};
+pub use descriptor::{Alias, AliasScope, Effect, Service, ToolDescriptor, ACTION_SERVICES};
 pub use dispatch_agent::DispatchAgentTool;
 pub use dispatch_agents_parallel::DispatchAgentsParallelTool;
 pub use edit_file::EditFileTool;
