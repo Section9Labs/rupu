@@ -12,6 +12,7 @@
 //! `credential_writes::request_termination()`'s process-wide flag, which is
 //! never cleared and would make every other run here abort as terminating.
 
+mod agent_skills;
 mod coverage_integration;
 mod engagement_e2e;
 mod findings_full_profile;

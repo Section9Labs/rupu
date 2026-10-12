@@ -163,6 +163,13 @@ struct Frontmatter {
     /// it: `full` (a complete report) or `summary`. Absent => `full`.
     #[serde(default, rename = "findingsProfile")]
     findings_profile: Option<rupu_coverage::FindingProfile>,
+    /// Skills this agent may load (`skills.load`): exact names, `global:x` /
+    /// `project:x`, `*` (every global skill) or `project:*`.
+    #[serde(default)]
+    skills: Option<Vec<String>>,
+    /// Skills whose bodies are always in this agent's system prompt.
+    #[serde(default, rename = "preloadSkills")]
+    preload_skills: Option<Vec<String>>,
     /// Ordered fallback chain tried when this agent's model cannot be used.
     /// Wins over the `[recovery].fallbacks` config table. Absent → the table.
     #[serde(default)]
@@ -211,6 +218,10 @@ pub struct AgentSpec {
     pub compact_at_percent: Option<u8>,
     /// Findings contract for this agent. See `findingsProfile` frontmatter.
     pub findings_profile: Option<rupu_coverage::FindingProfile>,
+    /// Skill grants from the `skills:` frontmatter key.
+    pub skills: Option<Vec<String>>,
+    /// Always-loaded skills from the `preloadSkills:` frontmatter key.
+    pub preload_skills: Option<Vec<String>>,
     /// Fallback chain from the `fallbacks:` frontmatter key.
     pub fallbacks: Option<Vec<rupu_config::FallbackEntry>>,
     pub system_prompt: String,
@@ -266,6 +277,8 @@ impl AgentSpec {
             context_window_tokens: fm.context_window_tokens,
             compact_at_percent: fm.compact_at_percent,
             findings_profile: fm.findings_profile,
+            skills: fm.skills,
+            preload_skills: fm.preload_skills,
             fallbacks: fm.fallbacks,
             system_prompt: body.to_string(),
             raw,
@@ -287,6 +300,27 @@ impl AgentSpec {
             Some(tools) => rupu_tools::ToolCatalog::builtin().validate_names(tools),
             None => Ok(()),
         }
+    }
+
+    pub fn declares_skills(&self) -> bool {
+        self.skills.as_ref().is_some_and(|v| !v.is_empty())
+            || self.preload_skills.as_ref().is_some_and(|v| !v.is_empty())
+    }
+
+    /// Resolve the agent's own skill keys against `catalog` (spec §2.1).
+    pub fn validate_skills(
+        &self,
+        catalog: &rupu_skills::SkillCatalog,
+    ) -> Result<(), rupu_skills::RunSkillsError> {
+        rupu_skills::resolve_run_skills(
+            catalog,
+            &[rupu_skills::SkillRequest {
+                reason: rupu_skills::SkillReason::Agent,
+                grants: self.skills.as_deref().unwrap_or_default(),
+                preload: self.preload_skills.as_deref().unwrap_or_default(),
+            }],
+        )
+        .map(|_| ())
     }
 }
 
@@ -338,6 +372,23 @@ You are a test agent.
         // Unknown value is rejected at parse time (clarifies the valid set).
         let s = "---\nname: a\nthinkingDisplay: verbose\n---\nbody\n";
         assert!(AgentSpec::parse(s).is_err());
+    }
+
+    #[test]
+    fn parses_skill_keys() {
+        let s = AgentSpec::parse(
+            "---\nname: a\nskills: [code-review, \"project:*\"]\npreloadSkills: [report-style]\n---\nbody\n",
+        )
+        .unwrap();
+        assert_eq!(
+            s.skills,
+            Some(vec!["code-review".to_string(), "project:*".to_string()])
+        );
+        assert_eq!(s.preload_skills, Some(vec!["report-style".to_string()]));
+        assert!(s.declares_skills());
+        assert!(!AgentSpec::parse("---\nname: b\n---\nbody\n")
+            .unwrap()
+            .declares_skills());
     }
 
     #[test]

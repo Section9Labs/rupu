@@ -3,10 +3,12 @@
 //! name (no merging — same `name:` means project replaces global).
 //!
 //! [`load_agent`] is what a run loads its agent with: it also checks the
-//! agent's `tools:` against the tool catalog ([`AgentSpec::validate_tools`]),
-//! so an unknown tool name fails the launch instead of silently leaving the
-//! agent without it. Listings ([`load_agents`], [`find_agent`]) parse only,
-//! so one bad file never hides the others; they show the error per agent.
+//! agent's `tools:` against the tool catalog ([`AgentSpec::validate_tools`])
+//! and its `skills:` / `preloadSkills:` against the installed skills
+//! ([`AgentSpec::validate_skills`]), so an unknown name fails the launch
+//! instead of silently leaving the agent without it. Listings
+//! ([`load_agents`], [`find_agent`]) parse only, so one bad file never hides
+//! the others; they show the error per agent.
 //! [`check_agent_files`] checks every file in both layers
 //! (`rupu agent validate`).
 
@@ -39,6 +41,10 @@ pub enum AgentLoadError {
         #[source]
         source: rupu_tools::GrantError,
     },
+    /// The agent's `skills:` / `preloadSkills:` don't resolve against the
+    /// installed skills, or the skills directories can't be read.
+    #[error("agent `{agent}`: skills: {message}")]
+    Skill { agent: String, message: String },
 }
 
 /// Load every agent under `<global>/agents/*.md` and (if `project` is
@@ -83,7 +89,8 @@ fn load_dir_into(dir: &Path, into: &mut BTreeMap<String, AgentSpec>) -> Result<(
 }
 
 /// Look up a single agent by name, to run it: [`find_agent`], plus the
-/// `tools:` check ([`AgentLoadError::UnknownTool`]). Returns `NotFound` if
+/// `tools:` check ([`AgentLoadError::UnknownTool`]) and the skills check
+/// ([`AgentLoadError::Skill`]). Returns `NotFound` if
 /// neither layer has it.
 pub fn load_agent(
     global: &Path,
@@ -96,7 +103,36 @@ pub fn load_agent(
             agent: spec.name.clone(),
             source,
         })?;
+    check_skills(&spec, global, project, &mut None)?;
     Ok(spec)
+}
+
+/// Resolve an agent's skill keys against the installed skills. The catalog
+/// is discovered on first need and reused across calls that share `catalog`.
+fn check_skills(
+    spec: &AgentSpec,
+    global: &Path,
+    project: Option<&Path>,
+    catalog: &mut Option<rupu_skills::SkillCatalog>,
+) -> Result<(), AgentLoadError> {
+    if !spec.declares_skills() {
+        return Ok(());
+    }
+    let err = |message: String| AgentLoadError::Skill {
+        agent: spec.name.clone(),
+        message,
+    };
+    let catalog = match catalog {
+        Some(c) => c,
+        None => {
+            let dirs = rupu_skills::LayerDirs::for_layers(global, project);
+            let found =
+                rupu_skills::SkillCatalog::discover(&dirs).map_err(|e| err(e.to_string()))?;
+            catalog.insert(found)
+        }
+    };
+    spec.validate_skills(catalog)
+        .map_err(|e| err(e.to_string()))
 }
 
 /// Look up a single agent by name without checking its `tools:` — for
@@ -132,12 +168,13 @@ pub struct AgentFileCheck {
 }
 
 /// Check every agent file in both layers (`<global>/agents/*.md`, then
-/// `<project>/agents/*.md`), shadowed or not: each must parse and its
-/// `tools:` must name known tools. Sorted by layer, then path. A missing
-/// `agents/` directory contributes nothing; an unreadable one is an `Io`
-/// error on a check for the directory itself.
+/// `<project>/agents/*.md`), shadowed or not: each must parse, its
+/// `tools:` must name known tools and its skill keys must resolve. Sorted by
+/// layer, then path. A missing `agents/` directory contributes nothing; an
+/// unreadable one is an `Io` error on a check for the directory itself.
 pub fn check_agent_files(global: &Path, project: Option<&Path>) -> Vec<AgentFileCheck> {
     let mut out = Vec::new();
+    let mut catalog = None;
     let layers = std::iter::once((global, AgentLayer::Global))
         .chain(project.map(|p| (p, AgentLayer::Project)));
     for (root, layer) in layers {
@@ -168,13 +205,13 @@ pub fn check_agent_files(global: &Path, project: Option<&Path>) -> Vec<AgentFile
         for path in paths {
             let (name, error) = match AgentSpec::parse_file(&path) {
                 Ok(spec) => {
-                    let err =
-                        spec.validate_tools()
-                            .err()
-                            .map(|source| AgentLoadError::UnknownTool {
-                                agent: spec.name.clone(),
-                                source,
-                            });
+                    let err = match spec.validate_tools() {
+                        Err(source) => Some(AgentLoadError::UnknownTool {
+                            agent: spec.name.clone(),
+                            source,
+                        }),
+                        Ok(()) => check_skills(&spec, global, project, &mut catalog).err(),
+                    };
                     (Some(spec.name), err)
                 }
                 Err(source) => (

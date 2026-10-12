@@ -7772,6 +7772,8 @@ fn session_agent_spec(global: &Path, session: &SessionRecord) -> rupu_agent::Age
         context_window_tokens: session.context_window_tokens,
         compact_at_percent: session.compact_at_percent,
         findings_profile: session.findings_profile,
+        skills: None,
+        preload_skills: None,
         fallbacks: session_agent_fallbacks(global, session),
         system_prompt: session.agent_system_prompt.clone(),
         raw: String::new(),
@@ -7808,6 +7810,9 @@ fn session_agent_fallbacks(
                 }
                 rupu_agent::AgentLoadError::UnknownTool { .. } => {
                     "the agent's `tools:` names an unknown tool".to_string()
+                }
+                rupu_agent::AgentLoadError::Skill { .. } => {
+                    "the agent's skill keys do not resolve".to_string()
                 }
             };
             tracing::warn!(
