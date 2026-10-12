@@ -5,8 +5,10 @@
 
 pub mod frontmatter;
 pub mod name;
+pub mod tree;
 
 pub use frontmatter::{
     parse_skill_md, Frontmatter, FrontmatterError, MAX_COMPATIBILITY_LEN, MAX_DESCRIPTION_LEN,
 };
 pub use name::{NameError, SkillName, MAX_NAME_LEN};
+pub use tree::{ContentHash, Stamp, TreeEntry, TreeError};
