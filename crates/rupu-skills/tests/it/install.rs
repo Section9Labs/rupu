@@ -255,6 +255,7 @@ fn install_all_skips_invalid_named_invalid_fails_before_writing() {
         dst.path(),
         Layer::Global,
         false,
+        &mut |_| Ok(()),
     );
     assert!(matches!(err, Err(InstallError::Invalid { name, .. }) if name == "bad"));
     assert!(
@@ -262,8 +263,15 @@ fn install_all_skips_invalid_named_invalid_fails_before_writing() {
         "nothing is written when a named skill is invalid"
     );
 
-    let report =
-        install_selected(&found, &Selection::All, dst.path(), Layer::Global, false).unwrap();
+    let report = install_selected(
+        &found,
+        &Selection::All,
+        dst.path(),
+        Layer::Global,
+        false,
+        &mut |_| Ok(()),
+    )
+    .unwrap();
     assert_eq!(
         report
             .installed
@@ -285,7 +293,14 @@ fn install_selected_checks_every_destination_before_writing() {
     write_skill(dst.path(), "b-two", "b-two", "already here");
     let found = find_skills(src.path()).unwrap();
     assert!(matches!(
-        install_selected(&found, &Selection::All, dst.path(), Layer::Global, false),
+        install_selected(
+            &found,
+            &Selection::All,
+            dst.path(),
+            Layer::Global,
+            false,
+            &mut |_| Ok(())
+        ),
         Err(InstallError::Exists(_))
     ));
     assert!(!dst.path().join("a-one").exists());
@@ -321,4 +336,131 @@ fn the_search_does_not_follow_symlinks_out_of_the_source() {
         found[0].error.as_deref(),
         Some("SKILL.md is a symlink that leaves the source")
     );
+}
+
+fn leftovers(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+/// A skill whose directory is not its name and whose symlink climbs back
+/// through that directory: it validates in place, and breaks once copied
+/// under its real name.
+#[cfg(unix)]
+pub fn breaks_when_staged(parent: &Path, dir: &str, name: &str) -> std::path::PathBuf {
+    let root = write_skill(parent, dir, name, "breaks when staged");
+    std::os::unix::fs::symlink(format!("../{dir}/SKILL.md"), root.join("link")).unwrap();
+    root
+}
+
+#[cfg(unix)]
+#[test]
+fn a_replacement_that_fails_staged_validation_leaves_the_old_skill() {
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    let good = write_skill(src.path(), "s", "s", "good");
+    install_one(&good, dst.path(), Layer::Global, false).unwrap();
+    let broken = breaks_when_staged(src.path(), "checkout", "s");
+    assert!(load_skill(&broken, Layer::Global).is_err_and(|e| e.to_string().contains("match")));
+    let got = install_one(&broken, dst.path(), Layer::Global, true);
+    assert!(
+        matches!(&got, Err(InstallError::Invalid { name, error }) if name == "s" && error.contains("link")),
+        "{got:?}"
+    );
+    assert_eq!(
+        load_skill(&dst.path().join("s"), Layer::Global)
+            .unwrap()
+            .frontmatter
+            .description,
+        "good"
+    );
+    assert_eq!(leftovers(dst.path()), vec!["s"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dangling_symlink_at_the_destination_counts_as_installed() {
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    let skill = write_skill(src.path(), "s", "s", "d");
+    std::os::unix::fs::symlink(dst.path().join("gone"), dst.path().join("s")).unwrap();
+    assert!(matches!(
+        install_one(&skill, dst.path(), Layer::Global, false),
+        Err(InstallError::Exists(_))
+    ));
+    assert_eq!(leftovers(dst.path()), vec!["s"], "no staging dir left");
+    let found = find_skills(src.path()).unwrap();
+    assert!(matches!(
+        install_selected(
+            &found,
+            &Selection::All,
+            dst.path(),
+            Layer::Global,
+            false,
+            &mut |_| Ok(())
+        ),
+        Err(InstallError::Exists(_))
+    ));
+
+    let got = install_one(&skill, dst.path(), Layer::Global, true).unwrap();
+    assert_eq!(got.outcome, InstallOutcome::Replaced);
+    assert!(load_skill(&dst.path().join("s"), Layer::Global).is_ok());
+    assert_eq!(leftovers(dst.path()), vec!["s"]);
+}
+
+#[test]
+fn an_interrupted_replace_is_put_back_before_the_next_install() {
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    let skill = write_skill(src.path(), "s", "s", "v1");
+    install_one(&skill, dst.path(), Layer::Global, false).unwrap();
+    write_skill(dst.path(), "s-tools", "s-tools", "another skill");
+    fs::rename(
+        dst.path().join("s-tools"),
+        dst.path().join(".replaced-s-tools-7"),
+    )
+    .unwrap();
+    fs::rename(dst.path().join("s"), dst.path().join(".replaced-s-4242")).unwrap();
+
+    write_skill(src.path(), "s", "s", "v2");
+    assert!(matches!(
+        install_one(&skill, dst.path(), Layer::Global, false),
+        Err(InstallError::Exists(_))
+    ));
+    assert_eq!(
+        load_skill(&dst.path().join("s"), Layer::Global)
+            .unwrap()
+            .frontmatter
+            .description,
+        "v1"
+    );
+    assert_eq!(leftovers(dst.path()), vec![".replaced-s-tools-7", "s"]);
+
+    fs::create_dir_all(dst.path().join(".replaced-s-9")).unwrap();
+    install_one(&skill, dst.path(), Layer::Global, true).unwrap();
+    assert_eq!(
+        leftovers(dst.path()),
+        vec![".replaced-s-tools-7", "s"],
+        "a backup next to an installed skill is stale"
+    );
+}
+
+#[test]
+fn naming_a_skill_twice_chooses_it_once() {
+    let t = tempfile::tempdir().unwrap();
+    collection(t.path());
+    let found = find_skills(t.path()).unwrap();
+    let got: Vec<&str> = choose(
+        &found,
+        &Selection::Named(vec!["pdf".into(), "docx".into(), "pdf".into()]),
+    )
+    .unwrap()
+    .iter()
+    .map(|f| f.name.as_str())
+    .collect();
+    assert_eq!(got, vec!["pdf", "docx"]);
 }

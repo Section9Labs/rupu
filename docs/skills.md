@@ -129,6 +129,10 @@ containing an absolute symlink is refused: an absolute target would stop
 resolving to the copy. Each copy keeps
 its file modes, so scripts stay executable, and is swapped in by rename, so a
 failed install, `--force` included, never damages the installed skill.
+If a crash interrupts a replace, the next install or update of that skill puts
+the old copy back from `.replaced-<name>-<pid>` first. When an install of
+several skills fails part way, the skills installed before the failure stay
+installed, with their source records.
 
 A skill's scripts need their own tools on the machine: a skill that runs
 `python3 scripts/render.py` needs `python3` wherever the agent runs, including

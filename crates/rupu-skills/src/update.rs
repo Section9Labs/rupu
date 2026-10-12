@@ -3,7 +3,7 @@
 //! no longer matches its record was edited locally and is left alone
 //! unless forced.
 
-use crate::install::{find_skills, install_one, source_hash};
+use crate::install::{find_skills, install_one, recover_replaced, source_hash};
 use crate::record::{list_records, now_secs, read_record, write_record, SourceRecord};
 use crate::skill::{load_skill, Layer};
 use crate::source::{resolve_inside, Fetch, FetchedTree, GitSource, SourceError};
@@ -56,6 +56,7 @@ fn update_one(
     trees: &mut HashMap<(String, Option<String>), Result<FetchedTree, String>>,
 ) -> Result<UpdateOutcome, String> {
     let installed_dir = skills_dir.join(name);
+    recover_replaced(skills_dir, name).map_err(|e| e.to_string())?;
     if !installed_dir.join("SKILL.md").is_file() {
         return Ok(UpdateOutcome::NotInstalled);
     }

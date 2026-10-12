@@ -183,18 +183,21 @@ pub fn choose<'a>(found: &'a [Found], sel: &Selection) -> Result<Vec<&'a Found>,
             [one] => Ok(vec![one]),
             _ => Err(InstallError::Several(names())),
         },
-        Selection::Named(wanted) => wanted
-            .iter()
-            .map(|w| {
-                found
-                    .iter()
-                    .find(|f| &f.name == w)
-                    .ok_or_else(|| InstallError::NameNotFound {
+        Selection::Named(wanted) => {
+            let mut chosen: Vec<&Found> = Vec::new();
+            for w in wanted {
+                if chosen.iter().any(|f| &f.name == w) {
+                    continue;
+                }
+                chosen.push(found.iter().find(|f| &f.name == w).ok_or_else(|| {
+                    InstallError::NameNotFound {
                         name: w.clone(),
                         found: names(),
-                    })
-            })
-            .collect(),
+                    }
+                })?);
+            }
+            Ok(chosen)
+        }
     }
 }
 
@@ -243,12 +246,15 @@ pub fn source_hash(source_dir: &Path) -> Result<(SkillName, ContentHash), Instal
     Ok((name, hash))
 }
 
+/// Install the chosen skills, calling `on_installed` right after each one
+/// lands, so a failure part way through leaves the earlier ones whole.
 pub fn install_selected(
     found: &[Found],
     sel: &Selection,
     skills_dir: &Path,
     layer: Layer,
     force: bool,
+    on_installed: &mut dyn FnMut(&Installed) -> Result<(), InstallError>,
 ) -> Result<InstallReport, InstallError> {
     let mut report = InstallReport::default();
     let mut ready = Vec::new();
@@ -262,19 +268,73 @@ pub fn install_selected(
         }
     }
     if !force {
-        if let Some((_, name)) = ready
-            .iter()
-            .find(|(_, n)| skills_dir.join(n.as_str()).exists())
-        {
-            return Err(InstallError::Exists(skills_dir.join(name.as_str())));
+        for (_, name) in &ready {
+            let dest = skills_dir.join(name.as_str());
+            if present(&dest)? {
+                return Err(InstallError::Exists(dest));
+            }
         }
     }
     for (f, _) in ready {
         let mut installed = install_one(&f.path, skills_dir, layer, force)?;
         installed.rel = f.rel.clone();
+        on_installed(&installed)?;
         report.installed.push(installed);
     }
     Ok(report)
+}
+
+/// Whether anything is at `path`, a dangling symlink included.
+fn present(path: &Path) -> Result<bool, InstallError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(io(path)(e)),
+    }
+}
+
+/// A replace renames the installed skill to `.replaced-<name>-<pid>`, then
+/// the new copy into place. A crash between the two renames leaves the
+/// skill only in the backup: put the newest one back. Once the skill is in
+/// place, any backup of it is stale.
+pub(crate) fn recover_replaced(skills_dir: &Path, name: &str) -> Result<(), InstallError> {
+    let prefix = format!(".replaced-{name}-");
+    let Ok(read) = std::fs::read_dir(skills_dir) else {
+        return Ok(());
+    };
+    let mut backups: Vec<(std::time::SystemTime, PathBuf)> = read
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .and_then(|n| n.strip_prefix(&prefix))
+                .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .map(|e| {
+            let at = e.metadata().and_then(|m| m.modified());
+            (at.unwrap_or(std::time::UNIX_EPOCH), e.path())
+        })
+        .collect();
+    backups.sort();
+    let dest = skills_dir.join(name);
+    if !present(&dest)? {
+        if let Some((_, newest)) = backups.pop() {
+            std::fs::rename(&newest, &dest).map_err(io(&newest))?;
+        }
+    }
+    for (_, stale) in backups {
+        let _ = std::fs::remove_dir_all(stale);
+    }
+    Ok(())
+}
+
+/// Removes a staging directory on every way out of `install_one`.
+struct Staging(PathBuf);
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 pub fn install_one(
@@ -286,40 +346,30 @@ pub fn install_one(
     let (name, entries) = check_source(source_dir)?;
     let root = source_dir.canonicalize().map_err(io(source_dir))?;
     let dest = skills_dir.join(name.as_str());
-    let exists = dest.exists();
+    recover_replaced(skills_dir, name.as_str())?;
+    let exists = present(&dest)?;
     if exists && !force {
         return Err(InstallError::Exists(dest));
     }
     std::fs::create_dir_all(skills_dir).map_err(io(skills_dir))?;
-    let pid = std::process::id();
-    let staging = skills_dir.join(format!(".staging-{name}-{pid}"));
-    let _ = std::fs::remove_dir_all(&staging);
-    let staged = staging.join(name.as_str());
-    let result = copy_tree(&root, &entries, &staged).and_then(|()| {
-        load_skill(&staged, layer).map_err(|e| InstallError::Invalid {
-            name: name.to_string(),
-            error: e.to_string(),
-        })
-    });
-    let staged_skill = match result {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&staging);
-            return Err(e);
-        }
+    let invalid = |error: String| InstallError::Invalid {
+        name: name.to_string(),
+        error,
     };
+    let pid = std::process::id();
+    let staging = Staging(skills_dir.join(format!(".staging-{name}-{pid}")));
+    let _ = std::fs::remove_dir_all(&staging.0);
+    let staged = staging.0.join(name.as_str());
+    copy_tree(&root, &entries, &staged)?;
+    let staged_skill = load_skill(&staged, layer).map_err(|e| invalid(e.to_string()))?;
     let content_hash = staged_skill
         .content_hash()
-        .map_err(|e| InstallError::Invalid {
-            name: name.to_string(),
-            error: e.to_string(),
-        })?;
+        .map_err(|e| invalid(e.to_string()))?;
     let outcome = if exists {
         let backup = skills_dir.join(format!(".replaced-{name}-{pid}"));
         std::fs::rename(&dest, &backup).map_err(io(&dest))?;
         if let Err(source) = std::fs::rename(&staged, &dest) {
             let _ = std::fs::rename(&backup, &dest);
-            let _ = std::fs::remove_dir_all(&staging);
             return Err(InstallError::Io { path: dest, source });
         }
         let _ = std::fs::remove_dir_all(&backup);
@@ -328,11 +378,8 @@ pub fn install_one(
         std::fs::rename(&staged, &dest).map_err(io(&dest))?;
         InstallOutcome::Created
     };
-    let _ = std::fs::remove_dir_all(&staging);
-    let installed = load_skill(&dest, layer).map_err(|e| InstallError::Invalid {
-        name: name.to_string(),
-        error: e.to_string(),
-    })?;
+    drop(staging);
+    let installed = load_skill(&dest, layer).map_err(|e| invalid(e.to_string()))?;
     Ok(Installed {
         name,
         path: dest,
@@ -418,14 +465,7 @@ pub fn install_from(
     if found.is_empty() {
         return Err(InstallError::NoSkill(tree.root.clone()));
     }
-    let report = install_selected(
-        &found,
-        &spec.selection,
-        spec.skills_dir,
-        spec.layer,
-        spec.force,
-    )?;
-    for inst in &report.installed {
+    let mut record = |inst: &Installed| {
         let (url, git_ref, path, local) = match spec.source {
             Source::Git(g) => {
                 let joined = match (&g.path, inst.rel.as_str()) {
@@ -456,12 +496,17 @@ pub fn install_from(
             content_hash: inst.content_hash.hex(),
             installed_at: now_secs(),
         };
-        write_record(spec.skills_dir, inst.name.as_str(), &rec).map_err(|source| {
-            InstallError::Io {
-                path: crate::record::record_path(spec.skills_dir, inst.name.as_str()),
-                source,
-            }
-        })?;
-    }
-    Ok(report)
+        write_record(spec.skills_dir, inst.name.as_str(), &rec).map_err(|source| InstallError::Io {
+            path: crate::record::record_path(spec.skills_dir, inst.name.as_str()),
+            source,
+        })
+    };
+    install_selected(
+        &found,
+        &spec.selection,
+        spec.skills_dir,
+        spec.layer,
+        spec.force,
+        &mut record,
+    )
 }

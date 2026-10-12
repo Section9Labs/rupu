@@ -332,7 +332,7 @@ Within the source (the repo root, or `<path>` inside it), every directory holdin
 - An explicitly named skill that is invalid fails the install before anything is written.
 - An installed skill is named by its frontmatter `name`, whatever its directory is called in the source.
 
-Each install validates first, refuses to overwrite without `--force`, refuses a tree containing a symlink that leaves it or an absolute symlink, preserves file modes so scripts stay executable, and swaps by rename, so a failed install never damages an installed skill.
+Each install validates first, refuses to overwrite without `--force`, refuses a tree containing a symlink that leaves it or an absolute symlink, preserves file modes so scripts stay executable, and swaps by rename, so a failed install never damages an installed skill. A replace moves the installed skill to `.replaced-<name>-<pid>` before renaming the new copy in; if a crash lands between the two renames, the next install or update of that name renames the backup back first. A skill named twice is installed once. Each skill's source record (§7.3) is written as soon as that skill lands, so a failure part way through a batch leaves the earlier skills installed and tracked.
 
 ### 7.3 Source records and `update`
 

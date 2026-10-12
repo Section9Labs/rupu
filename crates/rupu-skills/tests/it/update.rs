@@ -399,3 +399,64 @@ fn a_moved_skill_is_found_by_name_and_its_record_follows() {
         Some("tools/pdf")
     );
 }
+
+#[test]
+fn naming_a_skill_twice_installs_and_records_it_once() {
+    let (_repo, dst, f) = setup();
+    let source = gh(None);
+    let report = install_from(
+        &InstallSpec {
+            source: &source,
+            input: "o/skills",
+            selection: Selection::Named(vec!["pdf".into(), "pdf".into()]),
+            skills_dir: dst.path(),
+            layer: Layer::Global,
+            force: false,
+        },
+        &f,
+    )
+    .unwrap();
+    assert_eq!(report.installed.len(), 1);
+    assert!(read_record(dst.path(), "pdf").unwrap().is_some());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failure_mid_batch_keeps_the_earlier_skills_recorded() {
+    let (repo, dst, f) = setup();
+    let root = write_skill(&repo.path().join("skills"), "b-dir", "b-two", "d");
+    std::os::unix::fs::symlink("../b-dir/SKILL.md", root.join("link")).unwrap();
+    let source = gh(None);
+    let got = install_from(
+        &InstallSpec {
+            source: &source,
+            input: "o/skills",
+            selection: Selection::Named(vec!["pdf".into(), "b-two".into()]),
+            skills_dir: dst.path(),
+            layer: Layer::Global,
+            force: false,
+        },
+        &f,
+    );
+    assert!(got.is_err(), "{got:?}");
+    assert!(dst.path().join("pdf/SKILL.md").is_file());
+    assert!(read_record(dst.path(), "pdf").unwrap().is_some());
+    assert!(!dst.path().join("b-two").exists());
+}
+
+#[test]
+fn update_puts_back_a_skill_an_interrupted_replace_left_aside() {
+    let (_repo, dst, f) = setup();
+    install_pdf(dst.path(), &f);
+    fs::rename(
+        dst.path().join("pdf"),
+        dst.path().join(".replaced-pdf-4242"),
+    )
+    .unwrap();
+    assert_eq!(
+        update_skills(dst.path(), Layer::Global, &["pdf".into()], false, &f),
+        vec![("pdf".into(), UpdateOutcome::UpToDate)]
+    );
+    assert!(dst.path().join("pdf/SKILL.md").is_file());
+    assert!(!dst.path().join(".replaced-pdf-4242").exists());
+}
