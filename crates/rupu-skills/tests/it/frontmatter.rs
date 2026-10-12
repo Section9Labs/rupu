@@ -110,3 +110,49 @@ fn errors() {
         Err(FrontmatterError::Yaml(_))
     ));
 }
+
+#[test]
+fn block_scalar_description_is_trimmed() {
+    let text = format!(
+        "---\nname: a\ndescription: >\n  {}\n---\n",
+        "x".repeat(1024)
+    );
+    let (fm, _) = parse_skill_md(&text).unwrap();
+    assert_eq!(fm.description, "x".repeat(1024));
+
+    let (fm, _) =
+        parse_skill_md("---\nname: a\ndescription: |\n  Line one.\n  Line two.\n---\n").unwrap();
+    assert_eq!(fm.description, "Line one.\nLine two.");
+}
+
+#[test]
+fn whitespace_only_compatibility_is_empty() {
+    assert_eq!(
+        parse_skill_md("---\nname: a\ndescription: d\ncompatibility: \"   \"\n---\n"),
+        Err(FrontmatterError::CompatibilityLength(0))
+    );
+    let (fm, _) =
+        parse_skill_md("---\nname: a\ndescription: d\ncompatibility: \" uv \"\n---\n").unwrap();
+    assert_eq!(fm.compatibility.as_deref(), Some("uv"));
+}
+
+#[test]
+fn null_metadata_value_is_an_empty_string() {
+    let (fm, _) =
+        parse_skill_md("---\nname: a\ndescription: d\nmetadata:\n  author:\n  v: 2\n---\n")
+            .unwrap();
+    assert_eq!(fm.metadata.get("author").map(String::as_str), Some(""));
+    assert_eq!(fm.metadata.get("v").map(String::as_str), Some("2"));
+}
+
+#[test]
+fn closing_paren_ends_a_tool_token() {
+    let (fm, _) = parse_skill_md(
+        "---\nname: a\ndescription: d\nallowed-tools: Bash(git:*)Read Bash(a (b) c)Grep\n---\n",
+    )
+    .unwrap();
+    assert_eq!(
+        fm.allowed_tools,
+        vec!["Bash(git:*)", "Read", "Bash(a (b) c)", "Grep"]
+    );
+}

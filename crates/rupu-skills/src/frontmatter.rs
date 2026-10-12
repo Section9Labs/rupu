@@ -98,13 +98,15 @@ pub fn parse_skill_md(text: &str) -> Result<(Frontmatter, String), FrontmatterEr
         .ok_or(FrontmatterError::MissingName)?;
     let description = raw
         .description
-        .filter(|d| !d.trim().is_empty())
+        .map(|d| d.trim().to_owned())
+        .filter(|d| !d.is_empty())
         .ok_or(FrontmatterError::MissingDescription)?;
     let len = description.chars().count();
     if len > MAX_DESCRIPTION_LEN {
         return Err(FrontmatterError::DescriptionTooLong(len));
     }
-    if let Some(c) = &raw.compatibility {
+    let compatibility = raw.compatibility.map(|c| c.trim().to_owned());
+    if let Some(c) = &compatibility {
         let len = c.chars().count();
         if len == 0 || len > MAX_COMPATIBILITY_LEN {
             return Err(FrontmatterError::CompatibilityLength(len));
@@ -116,6 +118,7 @@ pub fn parse_skill_md(text: &str) -> Result<(Frontmatter, String), FrontmatterEr
             serde_yaml::Value::String(s) => s,
             serde_yaml::Value::Number(n) => n.to_string(),
             serde_yaml::Value::Bool(b) => b.to_string(),
+            serde_yaml::Value::Null => String::new(),
             _ => return Err(FrontmatterError::Metadata(k)),
         };
         metadata.insert(k, s);
@@ -134,7 +137,7 @@ pub fn parse_skill_md(text: &str) -> Result<(Frontmatter, String), FrontmatterEr
             name,
             description,
             license: raw.license,
-            compatibility: raw.compatibility,
+            compatibility,
             metadata,
             allowed_tools,
             disable_model_invocation: raw.disable_model_invocation,
@@ -143,8 +146,9 @@ pub fn parse_skill_md(text: &str) -> Result<(Frontmatter, String), FrontmatterEr
     ))
 }
 
-/// Split on whitespace and commas outside parentheses, so
-/// `Bash(git status:*) Read, Grep` is three entries, not five.
+/// Split on whitespace and commas outside parentheses, and after the `)`
+/// that closes them, so `Bash(git status:*) Read, Grep` and
+/// `Bash(git:*)Read` are entries, not fragments.
 fn split_tool_list(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -158,6 +162,9 @@ fn split_tool_list(s: &str) -> Vec<String> {
             ')' => {
                 depth = depth.saturating_sub(1);
                 cur.push(c);
+                if depth == 0 {
+                    out.push(std::mem::take(&mut cur));
+                }
             }
             c if depth == 0 && (c.is_whitespace() || c == ',') => {
                 if !cur.is_empty() {
