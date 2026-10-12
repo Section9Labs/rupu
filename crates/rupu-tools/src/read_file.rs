@@ -12,7 +12,7 @@
 
 use crate::coverage_emit::{attribution_from, emit};
 use crate::descriptor::{Effect, Service, ToolDescriptor};
-use crate::path_scope::{in_read_root, is_inside, is_readable};
+use crate::path_scope::Roots;
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -39,7 +39,7 @@ pub static DESCRIPTOR: ToolDescriptor = ToolDescriptor {
     needs: &[],
     uses: &[Service::Coverage],
     wildcard: true,
-    description: "Read a file from the workspace and return its contents prefixed by 1-based line numbers separated by tabs. Always use this before editing a file so you have current line numbers. Paths are relative to the workspace root; paths that escape the workspace (e.g. `../`) are rejected, and absolute paths are allowed only inside a skill's base directory (`skills.load` returns it).",
+    description: "Read a file from the workspace and return its contents prefixed by 1-based line numbers separated by tabs. Always use this before editing a file so you have current line numbers. Paths are relative to the workspace root and may not leave the workspace, except into a skill's base directory (`skills.load` returns it), which may be given as an absolute path.",
     input_schema: descriptor_schema,
 };
 
@@ -67,7 +67,8 @@ impl Tool for ReadFileTool {
         let i: Input =
             serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
         let abs = ctx.workspace.path.join(&i.path);
-        if !is_readable(&ctx.workspace, &abs) {
+        let roots = Roots::of(&ctx.workspace);
+        if !roots.is_readable(&abs) {
             return Ok(err_output(
                 started,
                 format!("path {} escapes workspace", i.path),
@@ -82,7 +83,7 @@ impl Tool for ReadFileTool {
                     writeln!(out, "{}\t{}", idx + 1, line).expect("write to String never fails");
                 }
                 let end_line = if line_count == 0 { 1 } else { line_count };
-                if is_inside(&ctx.workspace.path, &abs) && !in_read_root(&ctx.workspace, &abs) {
+                if roots.is_target(&abs) {
                     emit(
                         ctx,
                         FileTouchEvent::Read {

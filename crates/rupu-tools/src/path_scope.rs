@@ -36,20 +36,54 @@ fn resolve(candidate: &Path) -> Option<PathBuf> {
 
 /// True if `candidate` (relative or absolute) resolves into `root`.
 pub(crate) fn is_inside(root: &Path, candidate: &Path) -> bool {
-    let Ok(root) = root.canonicalize() else {
-        return false;
-    };
-    resolve(candidate).is_some_and(|p| p.starts_with(&root))
+    root.canonicalize()
+        .is_ok_and(|root| within(&root, candidate))
 }
 
-/// Inside the workspace or one of the run's read roots (spec §3.4). The
-/// read tools use this; `write_file` and `edit_file` keep `is_inside`.
-pub(crate) fn is_readable(ws: &WorkspaceScope, candidate: &Path) -> bool {
-    is_inside(&ws.path, candidate) || in_read_root(ws, candidate)
+/// [`is_inside`] for a `root` that is already canonical.
+pub(crate) fn within(root: &Path, candidate: &Path) -> bool {
+    resolve(candidate).is_some_and(|p| p.starts_with(root))
 }
 
-/// Inside one of the run's read roots: a skill's files, which are not
-/// target files, so reading them is never coverage (spec §3.4).
-pub(crate) fn in_read_root(ws: &WorkspaceScope, candidate: &Path) -> bool {
-    ws.read_roots.iter().any(|r| is_inside(r, candidate))
+/// A run's workspace and read roots (spec §3.4), canonicalized once for a
+/// tool call that checks many paths.
+pub(crate) struct Roots {
+    workspace: Option<PathBuf>,
+    read: Vec<PathBuf>,
+}
+
+impl Roots {
+    pub(crate) fn of(ws: &WorkspaceScope) -> Self {
+        Self {
+            workspace: ws.path.canonicalize().ok(),
+            read: ws
+                .read_roots
+                .iter()
+                .filter_map(|r| r.canonicalize().ok())
+                .collect(),
+        }
+    }
+
+    /// Inside the workspace or one of the read roots. The read tools use
+    /// this; `write_file` and `edit_file` keep `is_inside`.
+    pub(crate) fn is_readable(&self, candidate: &Path) -> bool {
+        resolve(candidate).is_some_and(|p| self.has_workspace(&p) || self.has_read_root(&p))
+    }
+
+    /// Inside the workspace and not under a read root: a target file, whose
+    /// reads are coverage. A skill's files never are, even a project skill's
+    /// inside the workspace.
+    pub(crate) fn is_target(&self, candidate: &Path) -> bool {
+        resolve(candidate).is_some_and(|p| self.has_workspace(&p) && !self.has_read_root(&p))
+    }
+
+    fn has_workspace(&self, resolved: &Path) -> bool {
+        self.workspace
+            .as_deref()
+            .is_some_and(|w| resolved.starts_with(w))
+    }
+
+    fn has_read_root(&self, resolved: &Path) -> bool {
+        self.read.iter().any(|r| resolved.starts_with(r))
+    }
 }

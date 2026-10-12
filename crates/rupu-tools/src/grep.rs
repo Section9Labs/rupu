@@ -86,7 +86,8 @@ impl Tool for GrepTool {
         // does not normalize `..`, so an agent-supplied path can leave the
         // workspace. Same guard the write tools use (ISSUES.md I-22), widened
         // to the run's read roots.
-        if !crate::path_scope::is_readable(&ctx.workspace, &search_path) {
+        let roots = crate::path_scope::Roots::of(&ctx.workspace);
+        if !roots.is_readable(&search_path) {
             return Ok(ToolOutput {
                 stdout: String::new(),
                 error: Some(format!(
@@ -143,14 +144,8 @@ impl Tool for GrepTool {
                     by_file.entry(rel_path).or_default().push(linenum);
                 }
             }
-            let in_workspace = crate::path_scope::is_inside(&ctx.workspace.path, &search_path);
             for (path, matched_lines) in by_file {
-                if !in_workspace
-                    || crate::path_scope::in_read_root(
-                        &ctx.workspace,
-                        &ctx.workspace.path.join(&path),
-                    )
-                {
+                if !roots.is_target(&ctx.workspace.path.join(&path)) {
                     continue;
                 }
                 let match_count = matched_lines.len() as u32;

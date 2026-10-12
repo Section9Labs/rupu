@@ -8,7 +8,7 @@
 
 use crate::coverage_emit::{attribution_from, emit};
 use crate::descriptor::{Effect, ToolDescriptor};
-use crate::path_scope::{in_read_root, is_inside};
+use crate::path_scope::{within, Roots};
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput, WorkspaceScope};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -78,8 +78,12 @@ impl Tool for GlobTool {
         // (`../*`, an absolute path) yields nothing outside the walk's base.
         // Matches under a read root are absolute; workspace matches relative.
         let mut matches = vec![];
+        let canonical_base = base.canonicalize().ok();
         for entry in walker.flatten() {
-            if entry.file_type().is_file() && is_inside(&base, entry.path()) {
+            let in_base = canonical_base
+                .as_deref()
+                .is_some_and(|b| within(b, entry.path()));
+            if entry.file_type().is_file() && in_base {
                 let shown = if from_root {
                     entry.path()
                 } else {
@@ -96,9 +100,10 @@ impl Tool for GlobTool {
         // Emit one FileTouchEvent per matched workspace path (success — walker
         // never returns a Rust-level error for non-matches, it simply yields
         // nothing). A skill's files are not target files.
+        let roots = Roots::of(&ctx.workspace);
         let touched = matches
             .iter()
-            .filter(|p| !from_root && !in_read_root(&ctx.workspace, &ctx.workspace.path.join(p)));
+            .filter(|p| !from_root && roots.is_target(&ctx.workspace.path.join(p)));
         for path in touched {
             emit(
                 ctx,

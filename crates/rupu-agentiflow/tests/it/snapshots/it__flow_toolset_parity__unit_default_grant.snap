@@ -137,7 +137,7 @@ expression: "unit_toolset(\"\").await"
       - body
     type: object
   name: msg.send
-- description: "Read a file from the workspace and return its contents prefixed by 1-based line numbers separated by tabs. Always use this before editing a file so you have current line numbers. Paths are relative to the workspace root; paths that escape the workspace (e.g. `../`) are rejected, and absolute paths are allowed only inside a skill's base directory (`skills.load` returns it)."
+- description: "Read a file from the workspace and return its contents prefixed by 1-based line numbers separated by tabs. Always use this before editing a file so you have current line numbers. Paths are relative to the workspace root and may not leave the workspace, except into a skill's base directory (`skills.load` returns it), which may be given as an absolute path."
   input_schema:
     properties:
       path:
