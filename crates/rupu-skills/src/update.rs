@@ -1,0 +1,136 @@
+//! `rupu skill update` (spec §7.3): re-fetch installed skills from their
+//! recorded source. One fetch per (url, ref); a skill whose installed copy
+//! no longer matches its record was edited locally and is left alone
+//! unless forced.
+
+use crate::install::{find_skills, install_one, source_hash};
+use crate::record::{list_records, now_secs, read_record, write_record, SourceRecord};
+use crate::skill::{load_skill, Layer};
+use crate::source::{Fetch, FetchedTree, GitSource};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateOutcome {
+    Updated { from: String, to: String },
+    UpToDate,
+    NoRecord,
+    LocallyModified,
+    NotInstalled,
+    Failed(String),
+}
+
+pub fn update_skills(
+    skills_dir: &Path,
+    layer: Layer,
+    names: &[String],
+    force: bool,
+    fetcher: &dyn Fetch,
+) -> Vec<(String, UpdateOutcome)> {
+    let names: Vec<String> = if names.is_empty() {
+        list_records(skills_dir)
+    } else {
+        names.to_vec()
+    };
+    let mut trees: HashMap<(String, Option<String>), Result<FetchedTree, String>> = HashMap::new();
+    names
+        .into_iter()
+        .map(|name| {
+            let outcome = update_one(skills_dir, layer, &name, force, fetcher, &mut trees)
+                .unwrap_or_else(UpdateOutcome::Failed);
+            (name, outcome)
+        })
+        .collect()
+}
+
+fn short(s: &str) -> String {
+    s.chars().take(12).collect()
+}
+
+fn update_one(
+    skills_dir: &Path,
+    layer: Layer,
+    name: &str,
+    force: bool,
+    fetcher: &dyn Fetch,
+    trees: &mut HashMap<(String, Option<String>), Result<FetchedTree, String>>,
+) -> Result<UpdateOutcome, String> {
+    let installed_dir = skills_dir.join(name);
+    if !installed_dir.join("SKILL.md").is_file() {
+        return Ok(UpdateOutcome::NotInstalled);
+    }
+    let Some(rec) = read_record(skills_dir, name).map_err(|e| e.to_string())? else {
+        return Ok(UpdateOutcome::NoRecord);
+    };
+    let installed = load_skill(&installed_dir, layer).map_err(|e| e.to_string())?;
+    let current = installed.content_hash().map_err(|e| e.to_string())?.hex();
+    if current != rec.content_hash && !force {
+        return Ok(UpdateOutcome::LocallyModified);
+    }
+
+    let (source_dir, commit) = match (&rec.local, &rec.url) {
+        (Some(dir), _) => (dir.clone(), None),
+        (None, Some(url)) => {
+            let key = (url.clone(), rec.git_ref.clone());
+            let tree = trees.entry(key).or_insert_with(|| {
+                fetcher
+                    .fetch(&GitSource {
+                        url: url.clone(),
+                        git_ref: rec.git_ref.clone(),
+                        path: None,
+                    })
+                    .map_err(|e| e.to_string())
+            });
+            let tree = tree.as_ref().map_err(Clone::clone)?;
+            (
+                locate(&tree.root, rec.path.as_deref(), name)?,
+                tree.commit.clone(),
+            )
+        }
+        (None, None) => return Err("source record has neither url nor local".into()),
+    };
+
+    let (source_name, new_hash) = source_hash(&source_dir).map_err(|e| e.to_string())?;
+    if source_name.as_str() != name {
+        return Err(format!(
+            "the source at {} is now named {source_name}; install it under that name",
+            source_dir.display()
+        ));
+    }
+    let new_rec = SourceRecord {
+        commit: commit.clone(),
+        content_hash: new_hash.hex(),
+        installed_at: now_secs(),
+        ..rec.clone()
+    };
+    if new_hash.hex() == current {
+        if new_rec.commit != rec.commit || new_rec.content_hash != rec.content_hash {
+            write_record(skills_dir, name, &new_rec).map_err(|e| e.to_string())?;
+        }
+        return Ok(UpdateOutcome::UpToDate);
+    }
+    install_one(&source_dir, skills_dir, layer, true).map_err(|e| e.to_string())?;
+    write_record(skills_dir, name, &new_rec).map_err(|e| e.to_string())?;
+    let label = |commit: &Option<String>, hash: &str| short(commit.as_deref().unwrap_or(hash));
+    Ok(UpdateOutcome::Updated {
+        from: label(&rec.commit, &rec.content_hash),
+        to: label(&commit, &new_hash.hex()),
+    })
+}
+
+/// The skill's directory in a fetched tree: its recorded path, or a search
+/// by name when the repository moved it.
+fn locate(root: &Path, path: Option<&str>, name: &str) -> Result<PathBuf, String> {
+    if let Some(p) = path {
+        let dir = root.join(p);
+        if dir.join("SKILL.md").is_file() {
+            return Ok(dir);
+        }
+    }
+    find_skills(root)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|f| f.name == name)
+        .map(|f| f.path)
+        .ok_or_else(|| format!("{name} is no longer in its source"))
+}

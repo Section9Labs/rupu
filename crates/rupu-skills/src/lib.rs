@@ -10,11 +10,13 @@ pub mod git;
 pub mod grant;
 pub mod install;
 pub mod name;
+pub mod record;
 pub mod render;
 pub mod skill;
 pub mod source;
 pub mod tools_map;
 pub mod tree;
+pub mod update;
 
 pub use catalog::{CatalogEntry, DiscoverError, LayerDirs, SkillCatalog};
 pub use frontmatter::{

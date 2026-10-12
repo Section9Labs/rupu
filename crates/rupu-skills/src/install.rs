@@ -356,3 +356,93 @@ fn symlink(_target: &str, at: &Path) -> Result<(), InstallError> {
         ),
     })
 }
+
+pub struct InstallSpec<'a> {
+    pub source: &'a crate::source::Source,
+    pub input: &'a str,
+    pub selection: Selection,
+    pub skills_dir: &'a Path,
+    pub layer: Layer,
+    pub force: bool,
+}
+
+fn open(
+    source: &crate::source::Source,
+    fetcher: &dyn crate::source::Fetch,
+) -> Result<crate::source::FetchedTree, InstallError> {
+    Ok(match source {
+        crate::source::Source::Local(p) => crate::source::FetchedTree::local(p.clone()),
+        crate::source::Source::Git(g) => fetcher.fetch(g)?,
+    })
+}
+
+pub fn list_source(
+    source: &crate::source::Source,
+    fetcher: &dyn crate::source::Fetch,
+) -> Result<Vec<Found>, InstallError> {
+    let tree = open(source, fetcher)?;
+    let found = find_skills(&tree.root)?;
+    if found.is_empty() {
+        return Err(InstallError::NoSkill(tree.root.clone()));
+    }
+    Ok(found)
+}
+
+pub fn install_from(
+    spec: &InstallSpec<'_>,
+    fetcher: &dyn crate::source::Fetch,
+) -> Result<InstallReport, InstallError> {
+    use crate::record::{now_secs, write_record, SourceRecord, RECORD_VERSION};
+    use crate::source::Source;
+    let tree = open(spec.source, fetcher)?;
+    let found = find_skills(&tree.root)?;
+    if found.is_empty() {
+        return Err(InstallError::NoSkill(tree.root.clone()));
+    }
+    let report = install_selected(
+        &found,
+        &spec.selection,
+        spec.skills_dir,
+        spec.layer,
+        spec.force,
+    )?;
+    for inst in &report.installed {
+        let (url, git_ref, path, local) = match spec.source {
+            Source::Git(g) => {
+                let joined = match (&g.path, inst.rel.as_str()) {
+                    (Some(p), "") => Some(p.clone()),
+                    (Some(p), r) => Some(format!("{p}/{r}")),
+                    (None, "") => None,
+                    (None, r) => Some(r.to_owned()),
+                };
+                (Some(g.url.clone()), g.git_ref.clone(), joined, None)
+            }
+            Source::Local(root) => {
+                let dir = if inst.rel.is_empty() {
+                    root.clone()
+                } else {
+                    root.join(&inst.rel)
+                };
+                (None, None, None, Some(dir))
+            }
+        };
+        let rec = SourceRecord {
+            version: RECORD_VERSION,
+            source: spec.input.to_owned(),
+            url,
+            git_ref,
+            path,
+            commit: tree.commit.clone(),
+            local,
+            content_hash: inst.content_hash.hex(),
+            installed_at: now_secs(),
+        };
+        write_record(spec.skills_dir, inst.name.as_str(), &rec).map_err(|source| {
+            InstallError::Io {
+                path: crate::record::record_path(spec.skills_dir, inst.name.as_str()),
+                source,
+            }
+        })?;
+    }
+    Ok(report)
+}

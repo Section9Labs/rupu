@@ -156,6 +156,15 @@ impl FetchedTree {
         }
     }
 
+    /// A tree already on disk, with the commit it stands for (if any).
+    pub fn local_with_commit(root: PathBuf, commit: Option<String>) -> Self {
+        Self {
+            root,
+            commit,
+            _guard: None,
+        }
+    }
+
     pub fn with_guard(root: PathBuf, commit: Option<String>, guard: tempfile::TempDir) -> Self {
         Self {
             root,
