@@ -49,10 +49,10 @@ impl Tool for SkillsLoadTool {
             .skills
             .as_ref()
             .ok_or_else(|| ToolError::Execution("this run has no skills".into()))?;
-        let Some(granted) = skills.get(name) else {
+        let Some(granted) = skills.get(name).filter(|g| g.model_loadable()) else {
             return Ok(failed(format!(
                 "no skill named {name:?} is available to this run; available: {}",
-                skills.names().join(", ")
+                skills.loadable_names().join(", ")
             ))
             .timed(started));
         };
@@ -64,6 +64,14 @@ impl Tool for SkillsLoadTool {
                 )
             }
         };
+        if fresh.root != granted.skill.root {
+            return Ok(failed(format!(
+                "skill {name:?} moved on disk since this run started (now at {}); \
+                 its files can't be read in this run",
+                fresh.root.display()
+            ))
+            .timed(started));
+        }
         let hash = match fresh.content_hash() {
             Ok(h) => h,
             Err(e) => {

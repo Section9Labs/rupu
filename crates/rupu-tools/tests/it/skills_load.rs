@@ -84,3 +84,83 @@ async fn an_edited_skill_comes_back_current_with_a_note() {
     assert!(out.stdout.ends_with("New text that is longer."));
     assert_eq!(out.structured.unwrap()["changed"], true);
 }
+
+/// Spec §3.2: granted with `disable-model-invocation: true` and not
+/// preloaded, a skill is reachable only by an operator, never by the model.
+#[tokio::test]
+async fn a_granted_skill_hidden_from_the_model_is_refused() {
+    let g = tempfile::tempdir().unwrap();
+    install(g.path(), "pdf", "x");
+    let dir = install(g.path(), "deploy", "x");
+    fs::write(
+        dir.join("SKILL.md"),
+        "---\nname: deploy\ndescription: d\ndisable-model-invocation: true\n---\nShip.\n",
+    )
+    .unwrap();
+    let c = ctx(g.path(), &["pdf", "deploy"]);
+    for name in ["deploy", "docx"] {
+        let out = rupu_tools::skills::SkillsLoadTool
+            .invoke(json!({ "name": name }), &c)
+            .await
+            .unwrap();
+        assert_eq!(
+            out.error.as_deref(),
+            Some(
+                format!("no skill named {name:?} is available to this run; available: pdf")
+                    .as_str()
+            ),
+        );
+    }
+}
+
+/// The run's read roots are fixed at start, so a global skill whose symlink
+/// now points elsewhere would hand the model a base directory it can't read.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_skill_moved_on_disk_since_the_run_started_fails_with_the_reason() {
+    let g = tempfile::tempdir().unwrap();
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (a, b) = (
+        install(a.path(), "pdf", "A."),
+        install(b.path(), "pdf", "B."),
+    );
+    fs::create_dir_all(g.path().join("skills")).unwrap();
+    let link = g.path().join("skills/pdf");
+    std::os::unix::fs::symlink(&a, &link).unwrap();
+    let c = ctx(g.path(), &["pdf"]);
+    fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&b, &link).unwrap();
+    let out = rupu_tools::skills::SkillsLoadTool
+        .invoke(json!({"name": "pdf"}), &c)
+        .await
+        .unwrap();
+    let now = b.canonicalize().unwrap();
+    assert_eq!(
+        out.error.as_deref(),
+        Some(
+            format!(
+                "skill \"pdf\" moved on disk since this run started (now at {}); its files can't be read in this run",
+                now.display()
+            )
+            .as_str()
+        ),
+    );
+}
+
+#[tokio::test]
+async fn a_skill_deleted_mid_run_fails() {
+    let g = tempfile::tempdir().unwrap();
+    let dir = install(g.path(), "pdf", "x");
+    let c = ctx(g.path(), &["pdf"]);
+    fs::remove_dir_all(&dir).unwrap();
+    let out = rupu_tools::skills::SkillsLoadTool
+        .invoke(json!({"name": "pdf"}), &c)
+        .await
+        .unwrap();
+    let err = out.error.unwrap();
+    assert!(
+        err.starts_with("skill \"pdf\" can no longer be loaded: "),
+        "{err}"
+    );
+    assert_eq!(out.stdout, "");
+}

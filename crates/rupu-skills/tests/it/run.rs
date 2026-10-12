@@ -234,3 +234,48 @@ fn star_loads_every_entry_of_its_layer() {
     repair_b(&g);
     assert!(!cat.get(rupu_skills::Layer::Global, "b").unwrap().is_valid());
 }
+
+/// Spec §3.2: a `disable-model-invocation` skill is reachable only by
+/// preload or an operator's invocation, so the model may load it only then.
+#[test]
+fn model_loadable_is_indexed_preloaded_or_operator() {
+    let g = tempfile::tempdir().unwrap();
+    let skills = g.path().join("skills");
+    write_skill(&skills, "open", "open", "Indexed.");
+    for name in ["hidden", "hidden-pre", "hidden-op"] {
+        let dir = write_skill(&skills, name, name, "x");
+        fs::write(
+            dir.join("SKILL.md"),
+            format!(
+                "---\nname: {name}\ndescription: x\ndisable-model-invocation: true\n---\nSteps.\n"
+            ),
+        )
+        .unwrap();
+    }
+    let agent = s(&["open", "hidden"]);
+    let preload = s(&["hidden-pre"]);
+    let operator = s(&["hidden-op"]);
+    let r = resolve_run_skills(
+        &catalog(g.path(), None),
+        &[
+            request(SkillReason::Agent, &agent, &preload),
+            request(SkillReason::Operator, &operator, &[]),
+        ],
+    )
+    .unwrap();
+    let rows: Vec<(&str, bool)> = r
+        .entries()
+        .iter()
+        .map(|g| (g.name(), g.model_loadable()))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("hidden", false),
+            ("hidden-op", true),
+            ("hidden-pre", true),
+            ("open", true),
+        ]
+    );
+    assert_eq!(r.loadable_names(), vec!["hidden-op", "hidden-pre", "open"]);
+}

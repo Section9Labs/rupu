@@ -51,6 +51,13 @@ impl GrantedSkill {
     pub fn name(&self) -> &str {
         self.skill.name.as_str()
     }
+
+    /// Whether `skills.load` may hand this skill to the model (spec §3.2):
+    /// a `disable-model-invocation` skill is reachable only by preload or an
+    /// operator's invocation.
+    pub fn model_loadable(&self) -> bool {
+        self.indexed || self.preload || self.reason == SkillReason::Operator
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -143,6 +150,15 @@ impl ResolvedSkills {
 
     pub fn names(&self) -> Vec<&str> {
         self.entries.iter().map(GrantedSkill::name).collect()
+    }
+
+    /// The granted skills the model may load, by name.
+    pub fn loadable_names(&self) -> Vec<&str> {
+        self.entries
+            .iter()
+            .filter(|g| g.model_loadable())
+            .map(GrantedSkill::name)
+            .collect()
     }
 
     /// Every granted skill's canonical root: the directories the fs read
