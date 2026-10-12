@@ -16,11 +16,18 @@ pub struct LayerDirs {
 
 impl LayerDirs {
     /// The `skills/` directories under the global `.rupu` and, when the run
-    /// has one, the project's.
+    /// has one, the project's. A project `.rupu` that IS the global dir
+    /// (`project_root_for` resolved to `$HOME`) is no project layer (R5).
     pub fn for_layers(global_rupu_dir: &Path, project_rupu_dir: Option<&Path>) -> Self {
+        let same = |p: &Path| match (p.canonicalize(), global_rupu_dir.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => p == global_rupu_dir,
+        };
         Self {
             global: Some(global_rupu_dir.join("skills")),
-            project: project_rupu_dir.map(|p| p.join("skills")),
+            project: project_rupu_dir
+                .filter(|p| !same(p))
+                .map(|p| p.join("skills")),
         }
     }
 

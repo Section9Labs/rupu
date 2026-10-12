@@ -178,3 +178,26 @@ fn layer_dirs_join_skills_under_each_rupu_dir() {
     assert_eq!(global_only.project, None);
     assert_eq!(global_only.skills_dir(Layer::Project), None);
 }
+
+#[test]
+fn a_project_layer_that_is_the_global_dir_is_dropped() {
+    let g = tempfile::tempdir().unwrap();
+    write_skill(&g.path().join("skills"), "only", "only", "d");
+    let dirs = rupu_skills::LayerDirs::for_layers(g.path(), Some(g.path()));
+    assert_eq!(dirs.project, None);
+    let cat = rupu_skills::SkillCatalog::discover(&dirs).unwrap();
+    assert_eq!(cat.named("only").count(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn skill_dir_is_the_path_as_found() {
+    let t = tempfile::tempdir().unwrap();
+    let real = write_skill(&t.path().join("elsewhere"), "linked", "linked", "d");
+    let skills = t.path().join("skills");
+    fs::create_dir_all(&skills).unwrap();
+    std::os::unix::fs::symlink(&real, skills.join("linked")).unwrap();
+    let s = rupu_skills::load_skill(&skills.join("linked"), rupu_skills::Layer::Global).unwrap();
+    assert_eq!(s.dir, skills.join("linked"));
+    assert_eq!(s.root, real.canonicalize().unwrap());
+}

@@ -4,6 +4,7 @@ mod grant;
 mod install;
 mod name;
 mod render;
+mod run;
 mod source;
 mod support;
 mod tree;

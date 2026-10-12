@@ -12,6 +12,7 @@ pub mod install;
 pub mod name;
 pub mod record;
 pub mod render;
+pub mod run;
 pub mod skill;
 pub mod source;
 pub mod tools_map;
@@ -24,6 +25,9 @@ pub use frontmatter::{
 };
 pub use grant::{parse_grants, resolve_grants, GrantParseError, ResolveError, SkillGrant};
 pub use name::{NameError, SkillName, MAX_NAME_LEN};
+pub use run::{
+    resolve_run_skills, GrantedSkill, ResolvedSkills, RunSkillsError, SkillReason, SkillRequest,
+};
 pub use skill::{load_skill, Layer, Skill, SkillError};
 pub use source::{parse_source, Fetch, FetchedTree, GitSource, Source, SourceError};
 pub use tree::{ContentHash, Stamp, TreeEntry, TreeError};

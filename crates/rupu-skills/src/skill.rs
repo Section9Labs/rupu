@@ -34,7 +34,11 @@ impl Layer {
 pub struct Skill {
     pub name: SkillName,
     pub layer: Layer,
+    /// The canonical directory: what the fs read tools are scoped to.
     pub root: PathBuf,
+    /// The directory as found (a symlinked global skill's link path), so a
+    /// reload validates the name against the right directory.
+    pub dir: PathBuf,
     pub frontmatter: Frontmatter,
     pub body: String,
     pub entries: Vec<TreeEntry>,
@@ -122,6 +126,7 @@ pub fn load_skill(dir: &Path, layer: Layer) -> Result<Skill, SkillError> {
         name,
         layer,
         root,
+        dir: dir.to_owned(),
         frontmatter,
         body,
         entries,
