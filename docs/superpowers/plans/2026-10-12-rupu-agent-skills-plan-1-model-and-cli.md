@@ -19,7 +19,7 @@
 - Integration tests: ONE binary per crate, `crates/<c>/tests/it/main.rs` listing modules. Never add a top-level `tests/*.rs`.
 - `rupu-cli` is thin: `cmd/skill.rs` parses args, calls `rupu-skills`, prints.
 - Name rule, verbatim from the spec: 1 to 64 chars, `a-z`, `0-9`, `-`, no leading, trailing or doubled `-`, equal to the directory name.
-- `description` is 1 to 1024 chars. `compatibility`, when present, is 1 to 500 chars. Characters are counted as `char`s.
+- `description` must not be empty; over 1024 chars is a warning, not an error, and the index cuts it at 1024 chars and appends `…`. `compatibility`, when present, must not be empty; over 500 chars is a warning, not an error. `rupu skill show` and `validate` print the warnings, and `validate` exits 0 on warnings alone. Characters are counted as `char`s (spec §1.1).
 - `*` covers the global layer only. `project:*` and exact names reach project skills. A bare name in both layers is an error.
 - The stamp and the content hash skip `.git` and `.DS_Store` entries at any depth.
 - Fixture skills are invented from scratch. Never adapt real assessment material (public repo).
