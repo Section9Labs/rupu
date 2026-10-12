@@ -1,5 +1,6 @@
 //! Workspace path-scope check shared by file-touching tools.
 
+use crate::tool::WorkspaceScope;
 use std::path::Path;
 
 /// True if `candidate` (relative or absolute) resolves into `root`.
@@ -22,4 +23,16 @@ pub(crate) fn is_inside(root: &Path, candidate: &Path) -> bool {
         return false;
     };
     cur.starts_with(&root)
+}
+
+/// Inside the workspace or one of the run's read roots (spec §3.4). The
+/// read tools use this; `write_file` and `edit_file` keep `is_inside`.
+pub(crate) fn is_readable(ws: &WorkspaceScope, candidate: &Path) -> bool {
+    is_inside(&ws.path, candidate) || in_read_root(ws, candidate)
+}
+
+/// Inside one of the run's read roots: a skill's files, which are not
+/// target files, so reading them is never coverage (spec §3.4).
+pub(crate) fn in_read_root(ws: &WorkspaceScope, candidate: &Path) -> bool {
+    ws.read_roots.iter().any(|r| is_inside(r, candidate))
 }

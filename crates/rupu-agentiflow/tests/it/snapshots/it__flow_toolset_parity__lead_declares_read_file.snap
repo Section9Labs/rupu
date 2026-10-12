@@ -590,7 +590,7 @@ expression: "lead_toolset(\"[read_file]\")"
       - body
     type: object
   name: msg.send
-- description: "Read a file from the workspace and return its contents prefixed by 1-based line numbers separated by tabs. Always use this before editing a file so you have current line numbers. Paths are relative to the workspace root; absolute paths and paths that escape the workspace (e.g. `../`) are rejected."
+- description: "Read a file from the workspace and return its contents prefixed by 1-based line numbers separated by tabs. Always use this before editing a file so you have current line numbers. Paths are relative to the workspace root; paths that escape the workspace (e.g. `../`) are rejected, and absolute paths are allowed only inside a skill's base directory (`skills.load` returns it)."
   input_schema:
     properties:
       path:

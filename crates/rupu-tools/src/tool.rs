@@ -162,6 +162,10 @@ pub struct WorkspaceScope {
     /// directory; `bash` runs with this as its cwd.
     pub path: PathBuf,
     pub bash: BashConfig,
+    /// The roots of the run's granted skills, which the fs read tools may
+    /// read even outside the workspace (spec §3.4). Never writable.
+    #[serde(default)]
+    pub read_roots: Vec<PathBuf>,
 }
 
 impl Default for WorkspaceScope {
@@ -170,6 +174,7 @@ impl Default for WorkspaceScope {
             id: String::new(),
             path: PathBuf::from("."),
             bash: BashConfig::default(),
+            read_roots: Vec::new(),
         }
     }
 }

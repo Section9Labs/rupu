@@ -348,6 +348,7 @@ impl RunAssembler {
                 id: workspace.id.clone(),
                 path: workspace.path.clone(),
                 bash: self.bash.clone(),
+                read_roots: Vec::new(),
             },
             services: ToolServices {
                 scm: self.ctx.scm.clone(),
@@ -615,6 +616,7 @@ impl RunAssembler {
                 id: spec.workspace.id.clone(),
                 path: spec.workspace.path.clone(),
                 bash: self.bash.clone(),
+                read_roots: Vec::new(),
             },
             services: ToolServices {
                 dispatcher: spec.services.dispatcher.clone().filter(|_| d.launcher),

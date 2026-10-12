@@ -2,7 +2,7 @@
 source: crates/rupu-agentiflow/tests/it/flow_toolset_parity.rs
 expression: "unit_toolset(\"\").await"
 ---
-- description: "Search the workspace by code STRUCTURE (syntax tree), not text, using ast-grep. Provide a `pattern` in ast-grep syntax and a `lang` (rust, python, typescript, go, …). Metavariables: `$VAR` matches one named node, `$$$` matches zero or more nodes. Example: pattern `impl $T for $S` with lang `rust` finds trait impls; pattern `async fn $NAME($$$) -> Result<$$$>` finds async fns returning Result. Output is `path:line:col: match` lines (1-based, workspace-relative). Prefer this over `grep` when you want syntactic matches (call sites, impls, signatures) instead of regex over raw text. Returns empty stdout (not an error) when there are no matches."
+- description: "Search the workspace by code STRUCTURE (syntax tree), not text, using ast-grep. Provide a `pattern` in ast-grep syntax and a `lang` (rust, python, typescript, go, …). Metavariables: `$VAR` matches one named node, `$$$` matches zero or more nodes. Example: pattern `impl $T for $S` with lang `rust` finds trait impls; pattern `async fn $NAME($$$) -> Result<$$$>` finds async fns returning Result. Output is `path:line:col: match` lines (1-based, workspace-relative). Prefer this over `grep` when you want syntactic matches (call sites, impls, signatures) instead of regex over raw text. `path` is relative to the workspace; an absolute `path` is allowed only inside a skill's base directory (`skills.load` returns it). Returns empty stdout (not an error) when there are no matches."
   input_schema:
     properties:
       lang:
@@ -101,7 +101,7 @@ expression: "unit_toolset(\"\").await"
       - new_string
     type: object
   name: edit_file
-- description: "List files in the workspace matching a glob pattern. Output is one path per line, sorted, relative to the workspace root. Supports `**` for recursive descent. Returns empty stdout when nothing matches."
+- description: "List files in the workspace matching a glob pattern. Output is one path per line, sorted, relative to the workspace root. Supports `**` for recursive descent. Patterns are relative to the workspace; an absolute pattern is allowed only inside a skill's base directory (`skills.load` returns it), and its matches are absolute. Returns empty stdout when nothing matches."
   input_schema:
     properties:
       pattern:
@@ -111,7 +111,7 @@ expression: "unit_toolset(\"\").await"
       - pattern
     type: object
   name: glob
-- description: "Search the workspace for a pattern using ripgrep. Output is `path:line:match` lines, gitignore-aware. Use this to locate symbols, callers, or any text across the workspace. Returns empty stdout (not an error) when there are no matches."
+- description: "Search the workspace for a pattern using ripgrep. Output is `path:line:match` lines, gitignore-aware. Use this to locate symbols, callers, or any text across the workspace. `path` is relative to the workspace; an absolute `path` is allowed only inside a skill's base directory (`skills.load` returns it). Returns empty stdout (not an error) when there are no matches."
   input_schema:
     properties:
       path:
@@ -137,7 +137,7 @@ expression: "unit_toolset(\"\").await"
       - body
     type: object
   name: msg.send
-- description: "Read a file from the workspace and return its contents prefixed by 1-based line numbers separated by tabs. Always use this before editing a file so you have current line numbers. Paths are relative to the workspace root; absolute paths and paths that escape the workspace (e.g. `../`) are rejected."
+- description: "Read a file from the workspace and return its contents prefixed by 1-based line numbers separated by tabs. Always use this before editing a file so you have current line numbers. Paths are relative to the workspace root; paths that escape the workspace (e.g. `../`) are rejected, and absolute paths are allowed only inside a skill's base directory (`skills.load` returns it)."
   input_schema:
     properties:
       path:

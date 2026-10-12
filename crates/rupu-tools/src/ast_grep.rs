@@ -101,8 +101,9 @@ Example: pattern `impl $T for $S` with lang `rust` finds trait impls; \
 pattern `async fn $NAME($$$) -> Result<$$$>` finds async fns returning Result. \
 Output is `path:line:col: match` lines (1-based, workspace-relative). \
 Prefer this over `grep` when you want syntactic matches (call sites, impls, \
-signatures) instead of regex over raw text. Returns empty stdout (not an error) \
-when there are no matches.",
+signatures) instead of regex over raw text. `path` is relative to the workspace; \
+an absolute `path` is allowed only inside a skill's base directory (`skills.load` \
+returns it). Returns empty stdout (not an error) when there are no matches.",
     input_schema: descriptor_schema,
 };
 
@@ -160,8 +161,9 @@ impl Tool for AstGrepTool {
             .unwrap_or_else(|| ctx.workspace.path.clone());
         // Containment: `join` replaces the base for an absolute argument and
         // does not normalize `..`, so an agent-supplied path can leave the
-        // workspace. Same guard the write tools use (ISSUES.md I-22).
-        if !crate::path_scope::is_inside(&ctx.workspace.path, &search_path) {
+        // workspace. Same guard the write tools use (ISSUES.md I-22), widened
+        // to the run's read roots.
+        if !crate::path_scope::is_readable(&ctx.workspace, &search_path) {
             return Ok(ToolOutput {
                 stdout: String::new(),
                 error: Some(format!(
@@ -314,7 +316,16 @@ impl Tool for AstGrepTool {
                 }
             }
 
+            let in_workspace = crate::path_scope::is_inside(&ctx.workspace.path, &search_path);
             for (path, matched_lines) in by_file {
+                if !in_workspace
+                    || crate::path_scope::in_read_root(
+                        &ctx.workspace,
+                        &ctx.workspace.path.join(&path),
+                    )
+                {
+                    continue;
+                }
                 let match_count = matched_lines.len() as u32;
                 emit(
                     ctx,
