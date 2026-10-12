@@ -1,0 +1,27 @@
+[package]
+name = "rupu-skills"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+git = ["dep:git2"]
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+walkdir = { workspace = true }
+thiserror = { workspace = true }
+tempfile = { workspace = true }
+git2 = { workspace = true, optional = true }
+
+[dev-dependencies]
+git2 = { workspace = true }
