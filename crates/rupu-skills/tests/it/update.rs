@@ -1,5 +1,5 @@
 use crate::support::write_skill;
-use rupu_skills::install::{install_from, list_source, InstallSpec, Selection};
+use rupu_skills::install::{install_from, list_source, InstallError, InstallSpec, Selection};
 use rupu_skills::record::{read_record, write_record, SourceRecord};
 use rupu_skills::update::{update_skills, UpdateOutcome};
 use rupu_skills::{Fetch, FetchedTree, GitSource, Layer, Source, SourceError};
@@ -438,10 +438,86 @@ fn a_failure_mid_batch_keeps_the_earlier_skills_recorded() {
         },
         &f,
     );
-    assert!(got.is_err(), "{got:?}");
+    let Err(InstallError::Partial { report, error }) = got else {
+        panic!("expected a partial install: {got:?}");
+    };
+    let landed: Vec<&str> = report.installed.iter().map(|i| i.name.as_str()).collect();
+    assert_eq!(landed, vec!["pdf"]);
+    assert!(
+        matches!(*error, InstallError::Invalid { ref name, .. } if name == "b-two"),
+        "{error:?}"
+    );
     assert!(dst.path().join("pdf/SKILL.md").is_file());
     assert!(read_record(dst.path(), "pdf").unwrap().is_some());
     assert!(!dst.path().join("b-two").exists());
+
+    let first = install_from(
+        &InstallSpec {
+            source: &source,
+            input: "o/skills",
+            selection: Selection::Named(vec!["b-two".into(), "docx".into()]),
+            skills_dir: dst.path(),
+            layer: Layer::Global,
+            force: false,
+        },
+        &f,
+    );
+    assert!(
+        matches!(first, Err(InstallError::Invalid { ref name, .. }) if name == "b-two"),
+        "nothing landed, so the error is not partial: {first:?}"
+    );
+    assert!(!dst.path().join("docx").exists());
+}
+
+#[test]
+fn a_project_install_from_outside_the_project_is_not_tracked() {
+    let project = tempfile::tempdir().unwrap();
+    let skills_dir = project.path().join(".rupu/skills");
+    let elsewhere = tempfile::tempdir().unwrap();
+    let outside = write_skill(elsewhere.path(), "notes", "notes", "v1");
+    let source = Source::Local(outside.canonicalize().unwrap());
+    let none = FakeFetch {
+        repo: PathBuf::new(),
+        commit: RefCell::new(String::new()),
+        calls: RefCell::new(0),
+    };
+    let report = install_from(
+        &InstallSpec {
+            source: &source,
+            input: outside.to_str().unwrap(),
+            selection: Selection::Default,
+            skills_dir: &skills_dir,
+            layer: Layer::Project,
+            force: false,
+        },
+        &none,
+    )
+    .unwrap();
+    assert_eq!(report.installed.len(), 1);
+    let untracked: Vec<&str> = report.untracked.iter().map(|n| n.as_str()).collect();
+    assert_eq!(untracked, vec!["notes"]);
+    assert!(skills_dir.join("notes/SKILL.md").is_file());
+    assert!(read_record(&skills_dir, "notes").unwrap().is_none());
+    assert_eq!(
+        update_skills(&skills_dir, Layer::Project, &["notes".into()], false, &none),
+        vec![("notes".into(), UpdateOutcome::NoRecord)]
+    );
+
+    let global = tempfile::tempdir().unwrap();
+    let report = install_from(
+        &InstallSpec {
+            source: &source,
+            input: outside.to_str().unwrap(),
+            selection: Selection::Default,
+            skills_dir: global.path(),
+            layer: Layer::Global,
+            force: false,
+        },
+        &none,
+    )
+    .unwrap();
+    assert!(report.untracked.is_empty());
+    assert!(read_record(global.path(), "notes").unwrap().is_some());
 }
 
 #[test]

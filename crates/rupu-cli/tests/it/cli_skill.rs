@@ -312,3 +312,86 @@ fn naming_a_skill_twice_installs_it_once() {
     assert_eq!(out.matches("installed pdf").count(), 1, "{out}");
     assert!(home.path().join("skills/.sources/pdf.json").is_file());
 }
+
+#[test]
+fn a_project_install_from_outside_the_project_is_not_tracked() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    fs::create_dir_all(project.path().join(".rupu")).unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let notes = skill_src(src.path(), "notes", "v1");
+    let out = ok(&rupu(
+        home.path(),
+        project.path(),
+        &["skill", "install", "--project", notes.to_str().unwrap()],
+    ));
+    assert!(out.contains("installed notes (project)"), "{out}");
+    assert!(
+        out.contains(
+            "note: notes is not tracked for update (its source is outside the project); \
+             reinstall it to update"
+        ),
+        "{out}"
+    );
+    assert!(project.path().join(".rupu/skills/notes/SKILL.md").is_file());
+    assert!(!project
+        .path()
+        .join(".rupu/skills/.sources/notes.json")
+        .exists());
+
+    let upd = ok(&rupu(
+        home.path(),
+        project.path(),
+        &["skill", "update", "--project", "notes"],
+    ));
+    assert!(upd.contains("notes: no source record"), "{upd}");
+
+    let vendored = skill_src(&project.path().join("vendor"), "inside", "v1");
+    let out = ok(&rupu(
+        home.path(),
+        project.path(),
+        &["skill", "install", "--project", vendored.to_str().unwrap()],
+    ));
+    assert!(!out.contains("note:"), "{out}");
+    assert!(project
+        .path()
+        .join(".rupu/skills/.sources/inside.json")
+        .is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_batch_that_fails_part_way_reports_what_landed() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    skill_src(&repo.path().join("skills"), "pdf", "PDF.");
+    let broken = repo.path().join("skills/b-dir");
+    fs::create_dir_all(&broken).unwrap();
+    fs::write(
+        broken.join("SKILL.md"),
+        "---\nname: b-two\ndescription: d\n---\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("../b-dir/SKILL.md", broken.join("link")).unwrap();
+    let out = rupu(
+        home.path(),
+        cwd.path(),
+        &[
+            "skill",
+            "install",
+            "--skill",
+            "pdf",
+            "--skill",
+            "b-two",
+            repo.path().to_str().unwrap(),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stdout}");
+    assert!(stdout.contains("installed pdf (global)"), "{stdout}");
+    assert!(stderr.contains("b-two"), "{stderr}");
+    assert!(home.path().join("skills/.sources/pdf.json").is_file());
+    assert!(!home.path().join("skills/b-two").exists());
+}

@@ -86,6 +86,19 @@ pub fn list_records(skills_dir: &Path) -> Vec<String> {
     names
 }
 
+/// Whether a project layer's record may name the local directory `local`.
+/// Project records are files a repository can carry: one naming a
+/// directory outside the project would let a cloned repository copy any
+/// directory on the machine into itself on `update`.
+pub(crate) fn inside_project(skills_dir: &Path, local: &Path) -> std::io::Result<bool> {
+    let local = local.canonicalize()?;
+    let project = skills_dir
+        .parent()
+        .and_then(Path::parent)
+        .and_then(|p| p.canonicalize().ok());
+    Ok(project.is_some_and(|p| local.starts_with(p)))
+}
+
 pub fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

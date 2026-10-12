@@ -46,10 +46,20 @@ pub struct Installed {
     pub rel: String,
 }
 
+/// Whether an install kept a source record for `update` (spec §7.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tracking {
+    Recorded,
+    /// A project-layer install from a local directory outside the project:
+    /// `update` would refuse its record, so none is written.
+    Untracked,
+}
+
 #[derive(Debug, Default)]
 pub struct InstallReport {
     pub installed: Vec<Installed>,
     pub skipped: Vec<(String, String)>,
+    pub untracked: Vec<SkillName>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -75,6 +85,13 @@ pub enum InstallError {
     },
     #[error(transparent)]
     Source(#[from] crate::source::SourceError),
+    /// A batch failed after `report.installed` had landed (and been
+    /// recorded, unless untracked); they stay installed.
+    #[error("{error}")]
+    Partial {
+        report: InstallReport,
+        error: Box<InstallError>,
+    },
 }
 
 fn io(path: &Path) -> impl FnOnce(std::io::Error) -> InstallError + '_ {
@@ -242,14 +259,15 @@ pub fn source_hash(source_dir: &Path) -> Result<(SkillName, ContentHash), Instal
 }
 
 /// Install the chosen skills, calling `on_installed` right after each one
-/// lands, so a failure part way through leaves the earlier ones whole.
+/// lands, so a failure part way through leaves the earlier ones whole and
+/// is returned as `Partial`.
 pub fn install_selected(
     found: &[Found],
     sel: &Selection,
     skills_dir: &Path,
     layer: Layer,
     force: bool,
-    on_installed: &mut dyn FnMut(&Installed) -> Result<(), InstallError>,
+    on_installed: &mut dyn FnMut(&Installed) -> Result<Tracking, InstallError>,
 ) -> Result<InstallReport, InstallError> {
     let mut report = InstallReport::default();
     let mut ready = Vec::new();
@@ -271,10 +289,25 @@ pub fn install_selected(
         }
     }
     for (f, _) in ready {
-        let mut installed = install_one(&f.path, skills_dir, layer, force)?;
-        installed.rel = f.rel.clone();
-        on_installed(&installed)?;
-        report.installed.push(installed);
+        let landed = install_one(&f.path, skills_dir, layer, force).and_then(|mut installed| {
+            installed.rel = f.rel.clone();
+            let tracking = on_installed(&installed);
+            if let Ok(Tracking::Untracked) = tracking {
+                report.untracked.push(installed.name.clone());
+            }
+            report.installed.push(installed);
+            tracking
+        });
+        if let Err(error) = landed {
+            return Err(if report.installed.is_empty() {
+                error
+            } else {
+                InstallError::Partial {
+                    report,
+                    error: Box::new(error),
+                }
+            });
+        }
     }
     Ok(report)
 }
@@ -453,7 +486,7 @@ pub fn install_from(
     spec: &InstallSpec<'_>,
     fetcher: &dyn crate::source::Fetch,
 ) -> Result<InstallReport, InstallError> {
-    use crate::record::{now_secs, write_record, SourceRecord, RECORD_VERSION};
+    use crate::record::{inside_project, now_secs, write_record, SourceRecord, RECORD_VERSION};
     use crate::source::Source;
     let tree = open(spec.source, fetcher)?;
     let found = find_skills(&tree.root)?;
@@ -477,6 +510,11 @@ pub fn install_from(
                 } else {
                     root.join(&inst.rel)
                 };
+                if spec.layer == Layer::Project
+                    && !inside_project(spec.skills_dir, &dir).map_err(io(&dir))?
+                {
+                    return Ok(Tracking::Untracked);
+                }
                 (None, None, None, Some(dir))
             }
         };
@@ -491,10 +529,13 @@ pub fn install_from(
             content_hash: inst.content_hash.hex(),
             installed_at: now_secs(),
         };
-        write_record(spec.skills_dir, inst.name.as_str(), &rec).map_err(|source| InstallError::Io {
-            path: crate::record::record_path(spec.skills_dir, inst.name.as_str()),
-            source,
-        })
+        write_record(spec.skills_dir, inst.name.as_str(), &rec).map_err(|source| {
+            InstallError::Io {
+                path: crate::record::record_path(spec.skills_dir, inst.name.as_str()),
+                source,
+            }
+        })?;
+        Ok(Tracking::Recorded)
     };
     install_selected(
         &found,

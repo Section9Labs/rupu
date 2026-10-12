@@ -4,7 +4,9 @@
 //! unless forced.
 
 use crate::install::{find_skills, install_one, recover_replaced, source_hash};
-use crate::record::{list_records, now_secs, read_record, write_record, SourceRecord};
+use crate::record::{
+    inside_project, list_records, now_secs, read_record, write_record, SourceRecord,
+};
 use crate::skill::{load_skill, Layer};
 use crate::source::{resolve_inside, Fetch, FetchedTree, GitSource, SourceError};
 use std::collections::HashMap;
@@ -71,8 +73,15 @@ fn update_one(
 
     let (source_dir, commit, path) = match (&rec.local, &rec.url) {
         (Some(dir), _) => {
-            if layer == Layer::Project {
-                inside_project(skills_dir, dir)?;
+            if layer == Layer::Project
+                && !inside_project(skills_dir, dir)
+                    .map_err(|e| format!("{}: {e}", dir.display()))?
+            {
+                return Err(format!(
+                    "the source record names {}, which is outside the project; a \
+                     project-layer record may only name a directory inside the project",
+                    dir.display()
+                ));
             }
             (dir.clone(), None, rec.path.clone())
         }
@@ -123,27 +132,6 @@ fn update_one(
         from: label(&rec.commit, &rec.content_hash),
         to: label(&commit, &new_hash.hex()),
     })
-}
-
-/// A project's records are files in the project: one may only name a
-/// directory inside it, or a repository could copy any directory on the
-/// machine into itself.
-fn inside_project(skills_dir: &Path, local: &Path) -> Result<(), String> {
-    let project = skills_dir
-        .parent()
-        .and_then(Path::parent)
-        .and_then(|p| p.canonicalize().ok());
-    let local_canon = local
-        .canonicalize()
-        .map_err(|e| format!("{}: {e}", local.display()))?;
-    match project {
-        Some(p) if local_canon.starts_with(&p) => Ok(()),
-        _ => Err(format!(
-            "the source record names {}, which is outside the project; a project-layer \
-             record may only name a directory inside the project",
-            local.display()
-        )),
-    }
 }
 
 /// The skill's directory in a fetched tree and its path there: the recorded

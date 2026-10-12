@@ -1,6 +1,7 @@
 use crate::support::write_skill;
 use rupu_skills::install::{
     choose, find_skills, install_one, install_selected, InstallError, InstallOutcome, Selection,
+    Tracking,
 };
 use rupu_skills::{load_skill, Layer};
 use std::fs;
@@ -255,7 +256,7 @@ fn install_all_skips_invalid_named_invalid_fails_before_writing() {
         dst.path(),
         Layer::Global,
         false,
-        &mut |_| Ok(()),
+        &mut |_| Ok(Tracking::Recorded),
     );
     assert!(matches!(err, Err(InstallError::Invalid { name, .. }) if name == "bad"));
     assert!(
@@ -269,7 +270,7 @@ fn install_all_skips_invalid_named_invalid_fails_before_writing() {
         dst.path(),
         Layer::Global,
         false,
-        &mut |_| Ok(()),
+        &mut |_| Ok(Tracking::Recorded),
     )
     .unwrap();
     assert_eq!(
@@ -299,7 +300,7 @@ fn install_selected_checks_every_destination_before_writing() {
             dst.path(),
             Layer::Global,
             false,
-            &mut |_| Ok(())
+            &mut |_| Ok(Tracking::Recorded)
         ),
         Err(InstallError::Exists(_))
     ));
@@ -401,7 +402,7 @@ fn a_dangling_symlink_at_the_destination_counts_as_installed() {
             dst.path(),
             Layer::Global,
             false,
-            &mut |_| Ok(())
+            &mut |_| Ok(Tracking::Recorded)
         ),
         Err(InstallError::Exists(_))
     ));

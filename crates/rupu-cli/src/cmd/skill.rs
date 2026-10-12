@@ -6,7 +6,9 @@ use crate::output::formats::OutputFormat;
 use crate::output::report::{self, CollectionOutput};
 use clap::Subcommand;
 use rupu_skills::git::GitFetcher;
-use rupu_skills::install::{install_from, list_source, InstallOutcome, InstallSpec, Selection};
+use rupu_skills::install::{
+    install_from, list_source, InstallError, InstallOutcome, InstallReport, InstallSpec, Selection,
+};
 use rupu_skills::record::read_record;
 use rupu_skills::tools_map::mapped_tools;
 use rupu_skills::update::{update_skills, UpdateOutcome};
@@ -428,7 +430,7 @@ fn install(
     } else {
         Selection::Default
     };
-    let report = install_from(
+    let installed = install_from(
         &InstallSpec {
             source: &source,
             input,
@@ -438,7 +440,21 @@ fn install(
             force,
         },
         &GitFetcher,
-    )?;
+    );
+    match installed {
+        Ok(report) => {
+            print_report(&report, layer);
+            Ok(())
+        }
+        Err(InstallError::Partial { report, error }) => {
+            print_report(&report, layer);
+            Err(error.into())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn print_report(report: &InstallReport, layer: Layer) {
     for i in &report.installed {
         let verb = match i.outcome {
             InstallOutcome::Created => "installed",
@@ -451,10 +467,15 @@ fn install(
             i.path.display()
         );
     }
+    for name in &report.untracked {
+        println!(
+            "note: {name} is not tracked for update (its source is outside the project); \
+             reinstall it to update"
+        );
+    }
     for (name, why) in &report.skipped {
         eprintln!("skipped {name}: {why}");
     }
-    Ok(())
 }
 
 fn update(names: Vec<String>, all: bool, project: bool, force: bool) -> anyhow::Result<bool> {
