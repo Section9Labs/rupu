@@ -87,8 +87,10 @@ Unlike agents, a project skill does not shadow a global one. The catalog keeps b
 
 Two fingerprints, so that a run start never reads a skill's whole tree:
 
-- **Stamp**: sha256 over the tree's `(relative path, size, mtime, mode)` entries in path order. It costs one `stat` per file. The index records it (§4), and a changed stamp is how a load knows the skill changed.
-- **Content hash**: sha256 over the tree's files in path order, each as `relative path, NUL, mode, NUL, byte length, NUL, bytes`. The mode covers the exec bit. Symlinks inside the tree (which §1.1 keeps inside it) hash as their target path. Empty directories don't count. It is computed only when a skill is loaded or preloaded, and `skill_load` records it as the version.
+Both walk the same entries: the tree's regular files and symlinks, skipping `.git` and `.DS_Store` at any depth, ordered by their `/`-joined relative path compared as bytes. Anything else in the tree (a FIFO, a socket, a device) and any symlink that leaves the tree or resolves into a skipped name refuses the skill. A file's mode is normalized git-style: `755` when any exec bit is set, else `644`, so a umask or `chmod g+w` changes neither fingerprint. Empty directories don't count.
+
+- **Stamp**: sha256 over each entry as `relative path, NUL`, then for a file `f, NUL, byte length, NUL, mtime in nanoseconds since the Unix epoch, NUL, mode in octal, LF` and for a symlink `l, NUL, target path, LF`. It costs one `stat` per file. The index records it (§4), and a changed stamp is how a load knows the skill changed. Because it reads no bytes, it misses a same-size edit whose mtime was put back (`cp -p`, `touch -r`), so `skill_changed` can be missed in that case.
+- **Content hash**: sha256 over each entry as `relative path, NUL`, then for a file `f, NUL, mode in octal, NUL, byte length, NUL, bytes` and for a symlink `l, NUL, target path`, each entry followed by an LF. It is computed only when a skill is loaded or preloaded, and `skill_load` records it as the version.
 
 There is no cross-run cache. Computing the content hash only on load keeps `skills: ["*"]` on a fan-out of 50 units from hashing every installed `assets/` 50 times.
 

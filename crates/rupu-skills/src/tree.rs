@@ -19,8 +19,16 @@ pub struct TreeEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntryKind {
-    File { len: u64, mtime_ns: u128, mode: u32 },
-    Symlink { target: String },
+    /// `mode` is git-style: `0o755` when any exec bit is set, else `0o644`,
+    /// so a umask or `chmod g+w` doesn't change the skill's version.
+    File {
+        len: u64,
+        mtime_ns: u128,
+        mode: u32,
+    },
+    Symlink {
+        target: String,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -34,6 +42,8 @@ pub enum TreeError {
     NotUtf8(PathBuf),
     #[error("symlink {rel}: {reason}")]
     BadSymlink { rel: String, reason: String },
+    #[error("{rel}: not a regular file, directory or symlink")]
+    NotRegular { rel: String },
 }
 
 macro_rules! fingerprint {
@@ -73,7 +83,6 @@ pub fn walk_tree(root: &Path) -> Result<Vec<TreeEntry>, TreeError> {
     let walker = walkdir::WalkDir::new(&root)
         .min_depth(1)
         .follow_links(false)
-        .sort_by_file_name()
         .into_iter()
         .filter_entry(|e| {
             !e.file_name()
@@ -92,10 +101,12 @@ pub fn walk_tree(root: &Path) -> Result<Vec<TreeEntry>, TreeError> {
         let path = entry.path();
         let rel = path
             .strip_prefix(&root)
-            .ok()
-            .and_then(Path::to_str)
+            .unwrap_or(path)
+            .components()
+            .map(|c| c.as_os_str().to_str())
+            .collect::<Option<Vec<_>>>()
             .ok_or_else(|| TreeError::NotUtf8(path.to_owned()))?
-            .replace('\\', "/");
+            .join("/");
         let ft = entry.file_type();
         if ft.is_dir() {
             continue;
@@ -110,10 +121,20 @@ pub fn walk_tree(root: &Path) -> Result<Vec<TreeEntry>, TreeError> {
                 rel: rel.clone(),
                 reason: format!("does not resolve ({e})"),
             })?;
-            if !resolved.starts_with(&root) {
+            let Ok(inside) = resolved.strip_prefix(&root) else {
                 return Err(TreeError::BadSymlink {
                     rel,
                     reason: format!("points outside the skill ({})", resolved.display()),
+                });
+            };
+            if let Some(ignored) = inside
+                .components()
+                .filter_map(|c| c.as_os_str().to_str())
+                .find(|c| IGNORED_NAMES.contains(c))
+            {
+                return Err(TreeError::BadSymlink {
+                    rel,
+                    reason: format!("points into ignored `{ignored}`"),
                 });
             }
             out.push(TreeEntry {
@@ -121,6 +142,9 @@ pub fn walk_tree(root: &Path) -> Result<Vec<TreeEntry>, TreeError> {
                 kind: EntryKind::Symlink { target },
             });
             continue;
+        }
+        if !ft.is_file() {
+            return Err(TreeError::NotRegular { rel });
         }
         let md = entry.metadata().map_err(|e| TreeError::Io {
             path: path.to_owned(),
@@ -140,18 +164,23 @@ pub fn walk_tree(root: &Path) -> Result<Vec<TreeEntry>, TreeError> {
             },
         });
     }
+    out.sort_by(|a, b| a.rel.cmp(&b.rel));
     Ok(out)
 }
 
 #[cfg(unix)]
 fn mode_of(md: &std::fs::Metadata) -> u32 {
     use std::os::unix::fs::PermissionsExt;
-    md.permissions().mode() & 0o777
+    if md.permissions().mode() & 0o111 != 0 {
+        0o755
+    } else {
+        0o644
+    }
 }
 
 #[cfg(not(unix))]
 fn mode_of(_: &std::fs::Metadata) -> u32 {
-    0
+    0o644
 }
 
 pub fn stamp(entries: &[TreeEntry]) -> Stamp {
