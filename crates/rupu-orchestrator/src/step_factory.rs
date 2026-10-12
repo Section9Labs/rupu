@@ -462,6 +462,7 @@ steps:
             .concerns
             .as_ref()
             .expect("concerns resolved")
+            .block
             .entries[0]
         {
             rupu_coverage::ConcernsEntry::Include(d) => d.include.clone(),
