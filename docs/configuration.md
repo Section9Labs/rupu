@@ -403,6 +403,17 @@ only.
 
 ---
 
+## `[coverage]`
+
+How a run's concern catalog is rendered into its system prompt; see
+[coverage.md](coverage.md#turning-it-on-the-concerns-block) for render modes.
+
+| Key                      | Type    | Default | Notes |
+|--------------------------|---------|---------|-------|
+| `full_mode_max_concerns` | integer | `80`    | Most concerns a run's flattened catalog may hold for its `mode: auto` includes to render in full; a larger catalog renders them as the one-line index the agent searches with `coverage.concerns.search` / `coverage.concerns.detail`. Includes that say `mode: full` or `mode: index` keep their mode |
+
+---
+
 ## `[update]`
 
 | Key       | Type   | Default   | Notes |

@@ -9,6 +9,7 @@
 
 pub mod autoflow_config;
 pub mod config;
+pub mod coverage_config;
 
 // `layer_files` is implemented in Task 8 (TDD); the module exists here so
 // that the lib re-export shape is stable from skeleton onward.
@@ -39,6 +40,7 @@ pub mod update_config;
 
 pub use autoflow_config::{AutoflowCheckout, AutoflowConfig};
 pub use config::{BashConfig, Config, UiConfig, UiCpConfig, UiPaletteConfig, UiSyntaxConfig};
+pub use coverage_config::CoverageConfig;
 pub use findings_config::FindingsConfig;
 pub use layer::{layer_files, layer_files_locked, LayerError, LayerPaths};
 pub use netflow_config::NetflowConfig;

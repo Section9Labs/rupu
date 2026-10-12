@@ -11,8 +11,8 @@ use crate::tool_registry::ToolRegistry;
 use async_trait::async_trait;
 use chrono::Utc;
 use rupu_coverage::{
-    flatten, render_prompt_section, write_snapshot, CoverageWriterHandle, FlatCatalog,
-    DEFAULT_FULL_MODE_THRESHOLD,
+    flatten, render_prompt_section, write_snapshot, ConcernsBlock, CoverageWriterHandle,
+    FlatCatalog,
 };
 use rupu_providers::overflow::{context_overflow_of, output_cap_overflow_of};
 use rupu_providers::provider::LlmProvider;
@@ -39,6 +39,15 @@ use thiserror::Error;
 struct CoverageBundle {
     catalog: Arc<FlatCatalog>,
     prompt_section: String,
+}
+
+/// A run's coverage concerns: the `concerns:` block and the catalog size
+/// above which its `auto` includes render in index mode
+/// (`[coverage].full_mode_max_concerns`).
+#[derive(Debug, Clone)]
+pub struct RunConcerns {
+    pub block: ConcernsBlock,
+    pub full_mode_max_concerns: usize,
 }
 
 const MAX_TOOL_RESULT_BYTES: usize = 256 * 1024;
@@ -1556,10 +1565,10 @@ pub struct AgentRunOpts {
     /// The run's identity, workspace and services.
     pub tool_context: ToolContext,
     pub pins: AgentPins,
-    /// Coverage concerns block. When `Some`, the runner flattens the
-    /// catalog, writes a snapshot, offers the coverage tools, and appends
-    /// the catalog to the system prompt.
-    pub concerns: Option<rupu_coverage::ConcernsBlock>,
+    /// Coverage concerns. When `Some`, the runner flattens the catalog,
+    /// writes a snapshot, offers the coverage tools, and appends the
+    /// catalog to the system prompt.
+    pub concerns: Option<RunConcerns>,
     pub max_turns: u32,
     pub stream: StreamOpts,
     pub hooks: Hooks,
@@ -1607,7 +1616,7 @@ struct Run {
     alias_scope: AliasScope,
     tool_context: ToolContext,
     pins: AgentPins,
-    concerns: Option<rupu_coverage::ConcernsBlock>,
+    concerns: Option<RunConcerns>,
     max_turns: u32,
     stream: StreamOpts,
     hooks: Hooks,
@@ -1901,7 +1910,11 @@ async fn run_agent_inner(
     // The handle is kept separate so it can be consumed (shutdown) at each
     // exit point, including early returns on provider/operator errors.
     let (coverage, coverage_handle): (Option<CoverageBundle>, Option<CoverageWriterHandle>) =
-        if let Some(block) = opts.concerns.clone() {
+        if let Some(RunConcerns {
+            block,
+            full_mode_max_concerns,
+        }) = opts.concerns.clone()
+        {
             let catalog = flatten(&block)
                 .map_err(|e| RunError::Coverage(format!("flatten coverage catalog: {e}")))?;
             let resolved_scope = opts.id.scope();
@@ -1940,7 +1953,7 @@ async fn run_agent_inner(
             }
             let handle = CoverageWriterHandle::spawn(paths.clone())
                 .map_err(|e| RunError::Coverage(format!("spawn coverage writer: {e}")))?;
-            let prompt_section = render_prompt_section(&catalog, DEFAULT_FULL_MODE_THRESHOLD);
+            let prompt_section = render_prompt_section(&catalog, full_mode_max_concerns);
             let bundle = CoverageBundle {
                 catalog: Arc::new(catalog),
                 prompt_section,

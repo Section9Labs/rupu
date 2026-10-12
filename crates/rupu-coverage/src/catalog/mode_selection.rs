@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 /// Default threshold for auto-selecting full vs index mode. A catalog
 /// with more than this many concerns auto-renders in index mode unless
 /// explicitly overridden per-include. Tunable via
-/// `[coverage].full_mode_max_concerns` in config.toml; the agent runner
-/// pulls that value separately.
+/// `[coverage].full_mode_max_concerns` in config.toml, which the run
+/// assembler (`rupu_runtime::assembly`) puts on the run's `RunConcerns`.
 pub const DEFAULT_FULL_MODE_THRESHOLD: usize = 80;
 
 /// Resolve each concern's `CatalogMode::Auto` into a concrete `Full`
