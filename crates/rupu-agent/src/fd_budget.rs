@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
 
-use crate::loader::{load_agent, AgentLoadError};
+use crate::loader::{load_agent, AgentLoadError, SkillCheckError};
 use crate::spec::{AgentSpec, AgentSpecParseError};
 
 /// Admission tuning. [`Policy::default`] is what production uses; tests
@@ -299,6 +299,12 @@ impl AgentLoadError {
                 source: AgentSpecParseError::Io(e),
                 ..
             } => is_fd_exhaustion(e),
+            AgentLoadError::Skill { source, .. } => match source {
+                SkillCheckError::Discover(rupu_skills::DiscoverError::Io { source, .. }) => {
+                    is_fd_exhaustion(source)
+                }
+                SkillCheckError::Resolve(e) => e.io_errors().any(is_fd_exhaustion),
+            },
             _ => false,
         }
     }
@@ -447,6 +453,53 @@ mod tests {
             source: std::io::Error::from(std::io::ErrorKind::NotFound),
         };
         assert!(!enoent.is_fd_exhaustion());
+    }
+
+    #[test]
+    fn classifies_fd_exhaustion_behind_a_skill_check() {
+        use crate::loader::SkillCheckError;
+        use rupu_skills::{
+            DiscoverError, EntryError, Layer, ResolveError, RunSkillsError, SkillError,
+        };
+        use std::sync::Arc;
+        let skill = |source| AgentLoadError::Skill {
+            agent: "a".into(),
+            key: "skills",
+            source,
+        };
+        let discover = |e| {
+            skill(SkillCheckError::Discover(DiscoverError::Io {
+                path: "skills".into(),
+                source: e,
+            }))
+        };
+        assert!(discover(emfile()).is_fd_exhaustion());
+        assert!(!discover(std::io::ErrorKind::NotFound.into()).is_fd_exhaustion());
+
+        let invalid = |error: SkillError| ResolveError::Invalid {
+            name: "x".into(),
+            layer: Layer::Global,
+            error: EntryError(Arc::new(error)),
+        };
+        let resolve = |errors| skill(SkillCheckError::Resolve(RunSkillsError::Resolve(errors)));
+        let io = |source| SkillError::Io {
+            path: "x/SKILL.md".into(),
+            source,
+        };
+        let walk = |source| {
+            SkillError::Tree(rupu_skills::TreeError::Io {
+                path: "x/scripts".into(),
+                source,
+            })
+        };
+        let unknown = ResolveError::Unknown {
+            entry: "y".into(),
+            suggestion: None,
+        };
+        assert!(resolve(vec![unknown.clone(), invalid(io(emfile()))]).is_fd_exhaustion());
+        assert!(resolve(vec![invalid(walk(emfile()))]).is_fd_exhaustion());
+        assert!(!resolve(vec![invalid(SkillError::ProjectSymlink)]).is_fd_exhaustion());
+        assert!(!resolve(vec![unknown]).is_fd_exhaustion());
     }
 
     #[test]

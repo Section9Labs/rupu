@@ -42,9 +42,23 @@ pub enum AgentLoadError {
         source: rupu_tools::GrantError,
     },
     /// The agent's `skills:` / `preloadSkills:` don't resolve against the
-    /// installed skills, or the skills directories can't be read.
-    #[error("agent `{agent}`: skills: {message}")]
-    Skill { agent: String, message: String },
+    /// installed skills, or the skills directories can't be read. `key` is
+    /// `preloadSkills` when the failure is that key's alone, else `skills`.
+    #[error("agent `{agent}`: {key}: {source}")]
+    Skill {
+        agent: String,
+        key: &'static str,
+        #[source]
+        source: SkillCheckError,
+    },
+}
+
+#[derive(Debug, Error)]
+pub enum SkillCheckError {
+    #[error(transparent)]
+    Discover(#[from] rupu_skills::DiscoverError),
+    #[error(transparent)]
+    Resolve(#[from] rupu_skills::RunSkillsError),
 }
 
 /// Load every agent under `<global>/agents/*.md` and (if `project` is
@@ -118,21 +132,48 @@ fn check_skills(
     if !spec.declares_skills() {
         return Ok(());
     }
-    let err = |message: String| AgentLoadError::Skill {
+    let grants = spec.skills.as_deref().unwrap_or_default();
+    let preload = spec.preload_skills.as_deref().unwrap_or_default();
+    let err = |key, source| AgentLoadError::Skill {
         agent: spec.name.clone(),
-        message,
+        key,
+        source,
     };
     let catalog = match catalog {
         Some(c) => c,
         None => {
             let dirs = rupu_skills::LayerDirs::for_layers(global, project);
-            let found =
-                rupu_skills::SkillCatalog::discover(&dirs).map_err(|e| err(e.to_string()))?;
+            let found = rupu_skills::SkillCatalog::discover(&dirs).map_err(|e| {
+                let key = if grants.is_empty() {
+                    "preloadSkills"
+                } else {
+                    "skills"
+                };
+                err(key, e.into())
+            })?;
             catalog.insert(found)
         }
     };
-    spec.validate_skills(catalog)
-        .map_err(|e| err(e.to_string()))
+    spec.validate_skills(catalog).map_err(|e| {
+        let alone = |grants: &[String], preload: &[String]| {
+            rupu_skills::resolve_run_skills(
+                catalog,
+                &[rupu_skills::SkillRequest {
+                    reason: rupu_skills::SkillReason::Agent,
+                    grants,
+                    preload,
+                }],
+            )
+        };
+        let preload_only =
+            alone(grants, &[]).is_ok() && alone(&[], preload).err().as_ref() == Some(&e);
+        let key = if preload_only {
+            "preloadSkills"
+        } else {
+            "skills"
+        };
+        err(key, e.into())
+    })
 }
 
 /// Look up a single agent by name without checking its `tools:` — for

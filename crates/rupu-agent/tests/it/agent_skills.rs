@@ -1,4 +1,4 @@
-use rupu_agent::{check_agent_files, load_agent, AgentLoadError};
+use rupu_agent::{check_agent_files, load_agent, AgentLoadError, SkillCheckError};
 use std::fs;
 use std::path::Path;
 
@@ -37,13 +37,94 @@ fn load_agent_refuses_an_unknown_skill_with_a_suggestion() {
     let g = tempfile::tempdir().unwrap();
     skill(&g.path().join("skills"), "code-review");
     agent(g.path(), "preloadSkills: [code-reviw]\n");
-    match load_agent(g.path(), None, "a") {
-        Err(AgentLoadError::Skill { agent, message }) => {
-            assert_eq!(agent, "a");
-            assert!(message.contains("did you mean code-review"), "{message}");
-        }
+    let err = load_agent(g.path(), None, "a").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "agent `a`: preloadSkills: unknown skill \"code-reviw\" (did you mean code-review?)"
+    );
+}
+
+fn load_err(global: &Path, project: Option<&Path>) -> String {
+    match load_agent(global, project, "a") {
+        Err(e @ AgentLoadError::Skill { .. }) => e.to_string(),
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn a_malformed_entry_names_its_key_once() {
+    let g = tempfile::tempdir().unwrap();
+    agent(g.path(), "skills: [\"Bad Name\"]\n");
+    assert_eq!(
+        load_err(g.path(), None),
+        "agent `a`: skills: entry \"Bad Name\": skill name may only contain a-z, 0-9 and '-'; found 'B'"
+    );
+    agent(g.path(), "preloadSkills: [\"Bad Name\"]\n");
+    assert_eq!(
+        load_err(g.path(), None),
+        "agent `a`: preloadSkills: entry \"Bad Name\": skill name may only contain a-z, 0-9 and '-'; found 'B'"
+    );
+}
+
+#[test]
+fn an_error_from_both_keys_is_reported_under_skills() {
+    let g = tempfile::tempdir().unwrap();
+    let p = tempfile::tempdir().unwrap();
+    skill(&g.path().join("skills"), "x");
+    skill(&p.path().join("skills"), "x");
+    agent(
+        g.path(),
+        "skills: [\"global:x\"]\npreloadSkills: [\"project:x\"]\n",
+    );
+    assert_eq!(
+        load_err(g.path(), Some(p.path())),
+        "agent `a`: skills: skill \"x\" is granted from both the global and the project layer; \
+         grant only one of global:x or project:x"
+    );
+    agent(g.path(), "skills: [nope]\npreloadSkills: [also-nope]\n");
+    assert_eq!(
+        load_err(g.path(), Some(p.path())),
+        "agent `a`: skills: unknown skill \"nope\"; unknown skill \"also-nope\""
+    );
+}
+
+#[test]
+fn a_skills_path_that_is_a_file_fails_only_agents_with_skill_keys() {
+    let g = tempfile::tempdir().unwrap();
+    fs::write(g.path().join("skills"), "not a directory").unwrap();
+    agent(g.path(), "");
+    assert!(load_agent(g.path(), None, "a").is_ok());
+    agent(g.path(), "skills: [x]\n");
+    let err = load_agent(g.path(), None, "a").unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            AgentLoadError::Skill {
+                key: "skills",
+                source: SkillCheckError::Discover(rupu_skills::DiscoverError::Io { path, .. }),
+                ..
+            } if *path == g.path().join("skills")
+        ),
+        "{err:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_broken_skill_the_agent_does_not_name_never_fails_it() {
+    let g = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    skill(&g.path().join("skills"), "healthy");
+    skill(&g.path().join("skills"), "broken");
+    std::os::unix::fs::symlink(outside.path(), g.path().join("skills/broken/escape")).unwrap();
+    agent(
+        g.path(),
+        "skills: [healthy]\npreloadSkills: [\"global:healthy\"]\n",
+    );
+    assert!(load_agent(g.path(), None, "a").is_ok());
+    agent(g.path(), "skills: [broken]\n");
+    let err = load_err(g.path(), None);
+    assert!(err.contains("points outside the skill"), "{err}");
 }
 
 #[test]
