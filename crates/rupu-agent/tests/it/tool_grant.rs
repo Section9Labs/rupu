@@ -266,7 +266,7 @@ async fn skills_offer_the_loader_as_an_ambient_grant() {
 #[tokio::test]
 async fn no_skills_no_loader_even_under_star() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let (offered, _) = run(
+    let (offered, events) = run(
         tmp.path(),
         Run {
             agent_tools: Some(strs(&["*"])),
@@ -278,6 +278,15 @@ async fn no_skills_no_loader_even_under_star() {
         !offered.iter().any(|o| o == "skills.load"),
         "offered: {offered:?}"
     );
+    let notices: Vec<&String> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Notice { kind, message } if kind == "tool_unavailable" => Some(message),
+            _ => None,
+        })
+        .filter(|m| m.contains("skills.load"))
+        .collect();
+    assert!(notices.is_empty(), "{notices:?}");
 }
 
 #[tokio::test]

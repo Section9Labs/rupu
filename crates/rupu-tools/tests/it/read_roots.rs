@@ -168,3 +168,105 @@ async fn a_read_root_inside_the_workspace_is_not_coverage() {
         .collect();
     assert_eq!(touched, [("glob".to_owned(), "target.md".to_owned())]);
 }
+
+/// Each case is a path the read tools must refuse even though it is spelled
+/// from under the read root `<skills>/pdf`.
+fn escapes(
+    skills: &std::path::Path,
+    root: &std::path::Path,
+    outside: &std::path::Path,
+) -> Vec<std::path::PathBuf> {
+    fs::create_dir_all(skills.join("pdf-evil")).unwrap();
+    fs::write(skills.join("pdf-evil/f"), "secret\n").unwrap();
+    fs::create_dir_all(skills.join("other")).unwrap();
+    fs::write(skills.join("other/f"), "secret\n").unwrap();
+    fs::write(outside.join("f"), "secret\n").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(outside.join("f"), root.join("link")).unwrap();
+    let mut paths = vec![skills.join("pdf-evil/f"), root.join("../other/f")];
+    if cfg!(unix) {
+        paths.push(root.join("link"));
+    }
+    paths
+}
+
+#[tokio::test]
+async fn read_file_refuses_what_only_looks_like_a_read_root() {
+    let (_ws, skills, root, ctx) = setup();
+    let outside = tempfile::tempdir().unwrap();
+    for path in escapes(skills.path(), &root, outside.path()) {
+        let out = rupu_tools::ReadFileTool
+            .invoke(json!({ "path": path }), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            out.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("escapes workspace"),
+            "{}: {:?}",
+            path.display(),
+            out.error
+        );
+        assert!(!out.stdout.contains("secret"), "{}", path.display());
+    }
+}
+
+#[tokio::test]
+async fn glob_refuses_what_only_looks_like_a_read_root() {
+    let (_ws, skills, root, ctx) = setup();
+    let outside = tempfile::tempdir().unwrap();
+    for path in escapes(skills.path(), &root, outside.path()) {
+        let pattern = path.with_file_name("*");
+        let out = rupu_tools::GlobTool
+            .invoke(json!({ "pattern": pattern }), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(out.stdout, "", "{}", pattern.display());
+    }
+}
+
+#[tokio::test]
+async fn ast_grep_under_a_read_root_writes_no_coverage_touch() {
+    if which::which("ast-grep").is_err() {
+        eprintln!("skipping: ast-grep not installed");
+        return;
+    }
+    let (ws, _s, root, mut ctx) = setup();
+    fs::write(root.join("helper.rs"), "fn helper() {}\n").unwrap();
+    let in_ws = ws.path().join("vendor/skills/lint");
+    fs::create_dir_all(&in_ws).unwrap();
+    fs::write(in_ws.join("helper.rs"), "fn helper() {}\n").unwrap();
+    ctx.workspace.read_roots.push(in_ws.canonicalize().unwrap());
+    fs::write(ws.path().join("target.rs"), "fn target() {}\n").unwrap();
+    let ledger = tempfile::tempdir().unwrap();
+    let paths = CoveragePaths::new(ledger.path(), "test-target");
+    let handle = CoverageWriterHandle::spawn(paths.clone()).unwrap();
+    {
+        ctx.services.coverage_writer = Some(handle.writer.clone());
+        for path in [json!(root), json!(".")] {
+            let out = rupu_tools::AstGrepTool
+                .invoke(
+                    json!({ "pattern": "fn $N() {}", "lang": "rust", "path": path }),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+            assert_eq!(out.error, None);
+            assert!(out.stdout.contains("helper.rs:1:1:"), "{}", out.stdout);
+        }
+        drop(ctx);
+    }
+    handle.shutdown().await;
+    let touched: Vec<String> = fs::read_to_string(&paths.files)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| {
+            serde_json::from_str::<serde_json::Value>(l).unwrap()["path"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(touched, ["target.rs"]);
+}
