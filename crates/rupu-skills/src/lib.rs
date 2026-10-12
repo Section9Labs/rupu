@@ -7,7 +7,9 @@ pub mod catalog;
 pub mod frontmatter;
 pub mod grant;
 pub mod name;
+pub mod render;
 pub mod skill;
+pub mod tools_map;
 pub mod tree;
 
 pub use catalog::{CatalogEntry, DiscoverError, LayerDirs, SkillCatalog};
