@@ -70,6 +70,17 @@ pub trait RunStatus: Send + Sync {
 
 The report types are the JSON shapes the tools return today, moved verbatim, so the model sees the same output. `rupu-agentiflow` implements the port as `FlowStatus` over `StatusCtx`'s contents. A future workflow `budget.status` would be a second implementation; it is not part of this card.
 
+### 3.3a Wildcards and authority tools (D22, added 2026-10-12)
+
+The W5 review found a regression. All 18 stock fleet agents declare `tools: ["*", …]`, so once a unit run provides `MessageBus` + `Catalog`, `*` would add `board.directive`, `board.retract` and the 5 roster tools. Any unit could then post standing directives, or retract the lead's (`board.retract` had no author check).
+
+**Decisions:**
+1. **`board.directive` and `board.retract` set `wildcard: false`** (a new `ToolDescriptor` field, default `true`). The grant resolver never expands `*` to them. They come only from an exact name, an alias, `board.*`, or an origin grant. The FlowLead origin grant names them, so the lead keeps them.
+2. **`board.retract` checks authorship.** A caller can retract only directives whose `author` equals its own participant. Anything else returns an explicit error (`not the author of directive <id>`). This is a bug fix in its own right, independent of wildcards.
+3. **The roster tools stay in `*`.** They are `Read`-effect and harmless (listing agent and workflow files), and D9's "`*` = every capability" holds for them. This is a **deliberate, documented behaviour change**: every `*` agent in any origin gains `agents.list`/`agents.get`/`workflows.list`/`workflows.get`/`catalog.search`. Record it in the PR body.
+
+**Test added:** `star_parity_per_origin` (`rupu-tools` or `rupu-runtime` it). A `tools: ["*"]` agent is resolved under every `Origin` with that origin's services, and the resolved set is snapshotted. It must never contain `board.directive` / `board.retract`, and it must contain the roster tools wherever `Catalog` is provided. This closes the gap the original parity snapshot left, because that one didn't use `*`.
+
 ### 3.4 Origin grants (via W2's `AmbientGrant`)
 
 These reproduce today's toolsets exactly, now with a recorded reason:
@@ -111,6 +122,8 @@ Already derived as of W1 (Section9Labs/rupu#809, see the as-built note under W1 
 `FleetToolCtx`, `StatusCtx`, `RosterCtx` as tool contexts · `fleet_tools`, `status_tools`, `roster_tools`, the superseded `fleet_dispatch_tools*` (`dispatch_tools.rs:83,99`) · the hardcoded `LEAD_AUTHOR` · the per-file `done`/`failed` helpers (if W1 left any).
 
 ## 6. Tests
+
+0. **`star_parity_per_origin`** and **`retract_requires_author`** (§3.3a).
 
 1. **`flow_toolset_parity`** (`rupu-agentiflow` it): the lead's and a unit's model-facing tool list (names + schemas) is identical before and after, apart from the `coverage.status` → `goal.coverage` canonical rename, whose old name still resolves for the lead.
 2. **`directive_author_is_caller`**: a non-lead agent granted `board.directive` in a flow writes a directive with `author = its participant`.

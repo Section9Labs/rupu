@@ -69,6 +69,8 @@ pub struct ToolDescriptor {
     pub needs: &'static [Service],
     pub description: &'static str,
     pub input_schema: fn() -> serde_json::Value,
+    /// D22 (added in W5): false = never granted by `*` (authority tools).
+    pub wildcard: bool,
 }
 ```
 
