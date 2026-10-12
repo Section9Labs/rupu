@@ -11,6 +11,7 @@ fn catalog() -> (tempfile::TempDir, tempfile::TempDir, SkillCatalog) {
     write_skill(g.path(), "bad", "not-bad", "g");
     write_skill(p.path(), "code-review", "code-review", "p");
     write_skill(p.path(), "local-only", "local-only", "p");
+    write_skill(p.path(), "broken-local", "not-broken-local", "p");
     let cat = SkillCatalog::discover(&LayerDirs {
         global: Some(g.path().into()),
         project: Some(p.path().into()),
@@ -111,7 +112,7 @@ fn unknown_and_invalid_names_report_every_error() {
         "unknown skill \"pdf-procesing\" (did you mean pdf-processing?)"
     );
     assert!(
-        matches!(&err[1], ResolveError::Invalid { entry, layer: Layer::Global, .. } if entry == "bad")
+        matches!(&err[1], ResolveError::Invalid { name, layer: Layer::Global, .. } if name == "bad")
     );
     assert_eq!(err[2].to_string(), "unknown skill \"nothing-like-it\"");
 }
@@ -135,5 +136,133 @@ fn duplicates_collapse() {
             ("code-review".into(), Layer::Global),
             ("pdf-processing".into(), Layer::Global)
         ]
+    );
+}
+
+fn unknown(entry: &str, suggestion: Option<&str>) -> ResolveError {
+    ResolveError::Unknown {
+        entry: entry.into(),
+        suggestion: suggestion.map(str::to_owned),
+    }
+}
+
+fn resolve_err(entries: &[&str], cat: &SkillCatalog) -> Vec<ResolveError> {
+    let entries: Vec<String> = entries.iter().map(|e| e.to_string()).collect();
+    resolve_grants(&parse_grants(&entries).unwrap(), cat).unwrap_err()
+}
+
+#[test]
+fn project_star_skips_an_invalid_project_skill() {
+    let (_g, _p, cat) = catalog();
+    assert!(!cat.get(Layer::Project, "broken-local").unwrap().is_valid());
+    let got = resolve_grants(&parse_grants(&["project:*".into()]).unwrap(), &cat).unwrap();
+    assert_eq!(
+        names(&got),
+        vec![
+            ("code-review".into(), Layer::Project),
+            ("local-only".into(), Layer::Project)
+        ]
+    );
+}
+
+#[test]
+fn a_qualified_grant_of_an_invalid_skill_is_invalid() {
+    let (_g, _p, cat) = catalog();
+    let err = resolve_err(&["project:broken-local"], &cat);
+    assert_eq!(err.len(), 1);
+    assert!(
+        matches!(&err[0], ResolveError::Invalid { name, layer: Layer::Project, .. } if name == "broken-local")
+    );
+}
+
+#[test]
+fn one_name_from_both_layers_is_an_error() {
+    let (_g, _p, cat) = catalog();
+    let both = vec![ResolveError::BothLayers {
+        name: "code-review".into(),
+    }];
+    assert_eq!(resolve_err(&["*", "project:*"], &cat), both);
+    assert_eq!(
+        resolve_err(&["global:code-review", "project:code-review"], &cat),
+        both
+    );
+    assert_eq!(
+        both[0].to_string(),
+        "skill \"code-review\" is granted from both the global and the project layer; \
+         grant only one of global:code-review or project:code-review"
+    );
+}
+
+#[test]
+fn did_you_mean_follows_the_layer() {
+    let (_g, _p, cat) = catalog();
+    assert_eq!(
+        resolve_err(&["project:pdf-processing"], &cat),
+        vec![unknown(
+            "project:pdf-processing",
+            Some("global:pdf-processing")
+        )]
+    );
+    assert_eq!(
+        resolve_err(&["project:pdf-processing"], &cat)[0].to_string(),
+        "unknown skill \"project:pdf-processing\" (did you mean global:pdf-processing?)"
+    );
+    assert_eq!(
+        resolve_err(&["project:local-onl"], &cat),
+        vec![unknown("project:local-onl", Some("project:local-only"))]
+    );
+    assert_eq!(
+        resolve_err(&["global:local-onl"], &cat),
+        vec![unknown("global:local-onl", Some("project:local-only"))]
+    );
+    assert_eq!(
+        resolve_err(&["global:code-reviw"], &cat),
+        vec![unknown("global:code-reviw", Some("global:code-review"))]
+    );
+    assert_eq!(
+        resolve_err(&["code-reviw"], &cat),
+        vec![unknown("code-reviw", Some("global:code-review"))]
+    );
+    assert_eq!(
+        resolve_err(&["local-onl"], &cat),
+        vec![unknown("local-onl", Some("local-only"))]
+    );
+}
+
+#[test]
+fn an_invalid_skill_is_never_suggested() {
+    let (_g, _p, cat) = catalog();
+    assert_eq!(resolve_err(&["bda"], &cat), vec![unknown("bda", None)]);
+    assert_eq!(
+        resolve_err(&["broken-locl"], &cat),
+        vec![unknown("broken-locl", None)]
+    );
+}
+
+#[test]
+fn a_suggestion_must_share_a_letter_position() {
+    let g = tempfile::tempdir().unwrap();
+    write_skill(g.path(), "js", "js", "g");
+    let cat = SkillCatalog::discover(&LayerDirs {
+        global: Some(g.path().into()),
+        project: None,
+    })
+    .unwrap();
+    assert_eq!(resolve_err(&["go"], &cat), vec![unknown("go", None)]);
+    assert_eq!(resolve_err(&["jx"], &cat), vec![unknown("jx", Some("js"))]);
+}
+
+#[test]
+fn repeated_errors_appear_once_in_first_seen_order() {
+    let (_g, _p, cat) = catalog();
+    assert_eq!(
+        resolve_err(&["nope", "nope"], &cat),
+        vec![unknown("nope", None)]
+    );
+    let err = resolve_err(&["nope", "bad", "nope", "global:bad"], &cat);
+    assert_eq!(err.len(), 2, "{err:?}");
+    assert_eq!(err[0], unknown("nope", None));
+    assert!(
+        matches!(&err[1], ResolveError::Invalid { name, layer: Layer::Global, .. } if name == "bad")
     );
 }

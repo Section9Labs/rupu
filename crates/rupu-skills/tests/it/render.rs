@@ -74,9 +74,118 @@ fn load_result_is_exact() {
         "This skill changed on disk since this run started; this is its current version.\n\
 Skill: pdf-processing (version abababababab)\n\
 Base directory: /h/.rupu/skills/pdf-processing\n\
-Files: SKILL.md, scripts/extract.py\n\
+Files: scripts/extract.py\n\
 Compatibility: Requires Python 3.12+\n\n\
 Step one."
+    );
+}
+
+#[test]
+fn a_multi_line_description_renders_on_one_index_line() {
+    let got = render_skills_section(
+        &[],
+        &[IndexItem {
+            name: "pdf-processing",
+            description: "Extract PDF text.\n  Use when\thandling PDFs.\n",
+        }],
+    )
+    .unwrap();
+    assert!(
+        got.ends_with("\n\n- pdf-processing: Extract PDF text. Use when handling PDFs."),
+        "{got:?}"
+    );
+}
+
+#[test]
+fn preloads_are_sorted_by_name() {
+    let got = render_skills_section(
+        &[
+            PreloadItem {
+                name: "zeta",
+                base_dir: Path::new("/z"),
+                body: "Z.",
+            },
+            PreloadItem {
+                name: "alpha",
+                base_dir: Path::new("/a"),
+                body: "A.",
+            },
+        ],
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        got,
+        "## Skill: alpha\n\nBase directory: /a\n\nA.\n\n## Skill: zeta\n\nBase directory: /z\n\nZ."
+    );
+}
+
+#[test]
+fn a_preload_with_an_empty_body_renders_its_header_only() {
+    let got = render_skills_section(
+        &[PreloadItem {
+            name: "empty",
+            base_dir: Path::new("/e"),
+            body: "",
+        }],
+        &[IndexItem {
+            name: "code-review",
+            description: "Review a diff.",
+        }],
+    )
+    .unwrap();
+    assert!(
+        got.starts_with("## Skill: empty\n\nBase directory: /e\n\n## Skills\n\n"),
+        "{got:?}"
+    );
+    assert_eq!(
+        render_skills_section(
+            &[PreloadItem {
+                name: "empty",
+                base_dir: Path::new("/e"),
+                body: "",
+            }],
+            &[],
+        )
+        .unwrap(),
+        "## Skill: empty\n\nBase directory: /e"
+    );
+}
+
+#[test]
+fn a_load_result_with_an_empty_body_ends_after_its_header() {
+    let got = render_load_result(&LoadView {
+        name: "notes",
+        version: ContentHash([0x01; 32]),
+        base_dir: Path::new("/h/.rupu/skills/notes"),
+        files: &["SKILL.md", "references/A.md"],
+        compatibility: Some("Any"),
+        changed_note: None,
+        body: "",
+    });
+    assert_eq!(
+        got,
+        "Skill: notes (version 010101010101)\n\
+Base directory: /h/.rupu/skills/notes\n\
+Files: references/A.md\n\
+Compatibility: Any"
+    );
+}
+
+#[test]
+fn a_load_result_with_only_skill_md_has_no_files_line() {
+    let got = render_load_result(&LoadView {
+        name: "solo",
+        version: ContentHash([0x02; 32]),
+        base_dir: Path::new("/s"),
+        files: &["SKILL.md"],
+        compatibility: None,
+        changed_note: None,
+        body: "Do it.",
+    });
+    assert_eq!(
+        got,
+        "Skill: solo (version 020202020202)\nBase directory: /s\n\nDo it."
     );
 }
 

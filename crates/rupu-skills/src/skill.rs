@@ -68,6 +68,8 @@ pub enum SkillError {
     NameMismatch { name: String, dir: String },
     #[error("a project skill directory may not be a symlink")]
     ProjectSymlink,
+    #[error("the project skills directory may not be a symlink")]
+    ProjectRootSymlink,
     #[error(transparent)]
     Tree(#[from] TreeError),
 }

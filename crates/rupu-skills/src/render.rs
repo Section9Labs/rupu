@@ -29,19 +29,26 @@ pub fn render_skills_section(
     let mut preloads: Vec<&PreloadItem<'_>> = preloads.iter().collect();
     preloads.sort_by_key(|p| p.name);
     for p in preloads {
-        parts.push(format!(
-            "## Skill: {}\n\nBase directory: {}\n\n{}",
+        let mut part = format!(
+            "## Skill: {}\n\nBase directory: {}",
             p.name,
-            p.base_dir.display(),
-            p.body
-        ));
+            p.base_dir.display()
+        );
+        if !p.body.is_empty() {
+            part.push_str("\n\n");
+            part.push_str(p.body);
+        }
+        parts.push(part);
     }
     if !index.is_empty() {
         let mut index: Vec<&IndexItem<'_>> = index.iter().collect();
         index.sort_by_key(|i| i.name);
         let lines: Vec<String> = index
             .iter()
-            .map(|i| format!("- {}: {}", i.name, i.description))
+            .map(|i| {
+                let description: Vec<&str> = i.description.split_whitespace().collect();
+                format!("- {}: {}", i.name, description.join(" "))
+            })
             .collect();
         parts.push(format!("{INDEX_HEADER}\n\n{}", lines.join("\n")));
     }
@@ -58,23 +65,27 @@ pub struct LoadView<'a> {
     pub body: &'a str,
 }
 
+/// `files` may include `SKILL.md`; it is left off the `Files:` line because
+/// its body is the result's own body.
 pub fn render_load_result(v: &LoadView<'_>) -> String {
-    let mut out = String::new();
-    if let Some(note) = v.changed_note {
-        out.push_str(note);
-        out.push('\n');
+    let mut lines: Vec<String> = Vec::new();
+    lines.extend(v.changed_note.map(str::to_owned));
+    lines.push(format!("Skill: {} (version {})", v.name, v.version.short()));
+    lines.push(format!("Base directory: {}", v.base_dir.display()));
+    let files: Vec<&str> = v
+        .files
+        .iter()
+        .copied()
+        .filter(|f| *f != "SKILL.md")
+        .collect();
+    if !files.is_empty() {
+        lines.push(format!("Files: {}", files.join(", ")));
     }
-    out.push_str(&format!(
-        "Skill: {} (version {})\n",
-        v.name,
-        v.version.short()
-    ));
-    out.push_str(&format!("Base directory: {}\n", v.base_dir.display()));
-    out.push_str(&format!("Files: {}\n", v.files.join(", ")));
-    if let Some(c) = v.compatibility {
-        out.push_str(&format!("Compatibility: {c}\n"));
+    lines.extend(v.compatibility.map(|c| format!("Compatibility: {c}")));
+    let mut out = lines.join("\n");
+    if !v.body.is_empty() {
+        out.push_str("\n\n");
+        out.push_str(v.body);
     }
-    out.push('\n');
-    out.push_str(v.body);
     out
 }

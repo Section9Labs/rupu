@@ -66,11 +66,14 @@ pub enum ResolveError {
         suggestion: Option<String>,
     },
     Invalid {
-        entry: String,
+        name: String,
         layer: Layer,
         error: String,
     },
     Ambiguous {
+        name: String,
+    },
+    BothLayers {
         name: String,
     },
 }
@@ -88,21 +91,18 @@ impl fmt::Display for ResolveError {
                 entry,
                 suggestion: None,
             } => write!(f, "unknown skill {entry:?}"),
-            ResolveError::Invalid {
-                entry,
-                layer,
-                error,
-            } => {
-                write!(
-                    f,
-                    "skill {entry:?} ({}) is invalid: {error}",
-                    layer.as_str()
-                )
+            ResolveError::Invalid { name, layer, error } => {
+                write!(f, "skill {name:?} ({}) is invalid: {error}", layer.as_str())
             }
             ResolveError::Ambiguous { name } => write!(
                 f,
                 "skill {name:?} is installed in both the global and the project layer; \
                  grant global:{name} or project:{name}"
+            ),
+            ResolveError::BothLayers { name } => write!(
+                f,
+                "skill {name:?} is granted from both the global and the project layer; \
+                 grant only one of global:{name} or project:{name}"
             ),
         }
     }
@@ -116,18 +116,19 @@ pub fn resolve_grants(
 ) -> Result<Vec<Arc<Skill>>, Vec<ResolveError>> {
     let mut picked: BTreeMap<(String, Layer), Arc<Skill>> = BTreeMap::new();
     let mut errors = Vec::new();
-    let mut take = |e: &CatalogEntry, entry: &str, errors: &mut Vec<ResolveError>| match &e.skill {
+    let mut take = |e: &CatalogEntry| match &e.skill {
         Ok(s) => {
             picked.insert((e.dir_name.clone(), e.layer), s.clone());
+            None
         }
-        Err(err) => errors.push(ResolveError::Invalid {
-            entry: entry.to_owned(),
+        Err(err) => Some(ResolveError::Invalid {
+            name: e.dir_name.clone(),
             layer: e.layer,
             error: err.to_string(),
         }),
     };
     for g in grants {
-        match g {
+        let err = match g {
             SkillGrant::AllGlobal | SkillGrant::AllProject => {
                 let layer = if *g == SkillGrant::AllGlobal {
                     Layer::Global
@@ -139,13 +140,15 @@ pub fn resolve_grants(
                     .iter()
                     .filter(|e| e.layer == layer && e.is_valid())
                 {
-                    take(e, &e.dir_name, &mut errors);
+                    take(e);
                 }
+                None
             }
             SkillGrant::Qualified(layer, name) => match catalog.get(*layer, name.as_str()) {
-                Some(e) => take(e, &format!("{}:{name}", layer.as_str()), &mut errors),
-                None => errors.push(unknown(
+                Some(e) => take(e),
+                None => Some(unknown(
                     &format!("{}:{name}", layer.as_str()),
+                    Some(*layer),
                     name.as_str(),
                     catalog,
                 )),
@@ -153,31 +156,61 @@ pub fn resolve_grants(
             SkillGrant::Name(name) => {
                 let found: Vec<&CatalogEntry> = catalog.named(name.as_str()).collect();
                 match found.as_slice() {
-                    [] => errors.push(unknown(name.as_str(), name.as_str(), catalog)),
-                    [one] => take(one, name.as_str(), &mut errors),
-                    _ => errors.push(ResolveError::Ambiguous {
+                    [] => Some(unknown(name.as_str(), None, name.as_str(), catalog)),
+                    [one] => take(one),
+                    _ => Some(ResolveError::Ambiguous {
                         name: name.to_string(),
                     }),
                 }
             }
+        };
+        errors.extend(err);
+    }
+    errors.extend(
+        picked
+            .keys()
+            .filter(|(name, layer)| {
+                *layer == Layer::Global && picked.contains_key(&(name.clone(), Layer::Project))
+            })
+            .map(|(name, _)| ResolveError::BothLayers { name: name.clone() }),
+    );
+    let mut unique: Vec<ResolveError> = Vec::with_capacity(errors.len());
+    for e in errors {
+        if !unique.contains(&e) {
+            unique.push(e);
         }
     }
-    if errors.is_empty() {
+    if unique.is_empty() {
         Ok(picked.into_values().collect())
     } else {
-        Err(errors)
+        Err(unique)
     }
 }
 
-fn unknown(entry: &str, name: &str, catalog: &SkillCatalog) -> ResolveError {
-    let limit = (name.len() / 3).max(2);
+/// Suggests the closest valid skill. A qualified grant is answered in the
+/// layer the match lives in; a bare grant is answered qualified when the
+/// match is in both layers, since the bare name would be ambiguous.
+fn unknown(entry: &str, layer: Option<Layer>, name: &str, catalog: &SkillCatalog) -> ResolveError {
+    let len = name.chars().count();
+    let limit = (len / 3).max(2);
     let suggestion = catalog
         .entries()
         .iter()
-        .map(|e| (edit_distance(name, &e.dir_name), &e.dir_name))
-        .filter(|(d, _)| *d <= limit)
+        .filter(|e| e.is_valid())
+        .map(|e| {
+            let d = edit_distance(name, &e.dir_name);
+            (d, Some(e.layer) != layer, &e.dir_name, e.layer)
+        })
+        .filter(|(d, ..)| *d <= limit && *d < len)
         .min()
-        .map(|(_, n)| n.clone());
+        .map(|(_, _, found, found_layer)| {
+            let in_both = catalog.named(found).filter(|e| e.is_valid()).count() > 1;
+            match layer {
+                Some(_) => format!("{}:{found}", found_layer.as_str()),
+                None if in_both => format!("global:{found}"),
+                None => found.clone(),
+            }
+        });
     ResolveError::Unknown {
         entry: entry.to_owned(),
         suggestion,

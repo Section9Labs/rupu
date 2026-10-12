@@ -73,29 +73,36 @@ impl SkillCatalog {
 }
 
 fn scan(dir: &Path, layer: Layer, out: &mut Vec<CatalogEntry>) -> Result<(), DiscoverError> {
+    let io = |source| DiscoverError::Io {
+        path: dir.to_owned(),
+        source,
+    };
     let read = match std::fs::read_dir(dir) {
         Ok(r) => r,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(source) => {
-            return Err(DiscoverError::Io {
-                path: dir.to_owned(),
-                source,
-            })
-        }
+        Err(source) => return Err(io(source)),
     };
+    // A symlinked project `skills/` would let a repo point every project
+    // skill's read root anywhere on the machine (spec §1.1).
+    let root_is_link = layer == Layer::Project
+        && std::fs::symlink_metadata(dir)
+            .map_err(io)?
+            .file_type()
+            .is_symlink();
     for item in read {
-        let item = item.map_err(|source| DiscoverError::Io {
-            path: dir.to_owned(),
-            source,
-        })?;
+        let item = item.map_err(io)?;
         let path = item.path();
         let Some(dir_name) = item.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if dir_name.starts_with('.') || !path.is_dir() {
+        if dir_name.starts_with('.') || !may_be_skill(&item)? {
             continue;
         }
-        let skill = load_skill(&path, layer).map(Arc::new);
+        let skill = if root_is_link {
+            Err(SkillError::ProjectRootSymlink)
+        } else {
+            load_skill(&path, layer).map(Arc::new)
+        };
         out.push(CatalogEntry {
             dir_name,
             layer,
@@ -104,4 +111,15 @@ fn scan(dir: &Path, layer: Layer, out: &mut Vec<CatalogEntry>) -> Result<(), Dis
         });
     }
     Ok(())
+}
+
+/// A directory, or a symlink that is not known to point at a file. A
+/// dangling or unreadable link is kept so `load_skill` reports its error.
+fn may_be_skill(item: &std::fs::DirEntry) -> Result<bool, DiscoverError> {
+    let kind = item.file_type().map_err(|source| DiscoverError::Io {
+        path: item.path(),
+        source,
+    })?;
+    Ok(kind.is_dir()
+        || (kind.is_symlink() && std::fs::metadata(item.path()).map_or(true, |m| m.is_dir())))
 }

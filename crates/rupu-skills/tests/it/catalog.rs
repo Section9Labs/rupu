@@ -13,7 +13,9 @@ fn load_skill_reads_everything() {
     assert_eq!(s.frontmatter.description, "PDF things.");
     assert_eq!(s.body, "Do the pdf-processing thing.");
     assert_eq!(s.files(), vec!["SKILL.md", "scripts/run.sh"]);
-    assert_eq!(s.content_hash().unwrap(), s.content_hash().unwrap());
+    let before = s.content_hash().unwrap();
+    fs::write(dir.join("scripts/run.sh"), "#!/bin/sh\necho OK\n").unwrap();
+    assert_ne!(s.content_hash().unwrap(), before);
 }
 
 #[test]
@@ -100,4 +102,59 @@ fn missing_layer_dirs_are_empty() {
     })
     .unwrap();
     assert!(cat.entries().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_project_skills_dir_invalidates_every_project_skill() {
+    let t = tempfile::tempdir().unwrap();
+    let real = t.path().join("real-skills");
+    write_skill(&real, "linked", "linked", "d");
+    let link = t.path().join("skills");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let cat = SkillCatalog::discover(&LayerDirs {
+        global: None,
+        project: Some(link.clone()),
+    })
+    .unwrap();
+    assert_eq!(cat.entries().len(), 1);
+    assert!(matches!(
+        cat.get(Layer::Project, "linked").unwrap().skill,
+        Err(SkillError::ProjectRootSymlink)
+    ));
+
+    let cat = SkillCatalog::discover(&LayerDirs {
+        global: Some(link),
+        project: None,
+    })
+    .unwrap();
+    assert!(cat.get(Layer::Global, "linked").unwrap().is_valid());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dangling_skill_symlink_is_listed_invalid_and_a_file_symlink_is_skipped() {
+    let t = tempfile::tempdir().unwrap();
+    let skills = t.path().join("skills");
+    write_skill(&skills, "real", "real", "d");
+    std::os::unix::fs::symlink(t.path().join("nowhere"), skills.join("gone")).unwrap();
+    fs::write(t.path().join("notes.md"), "x").unwrap();
+    std::os::unix::fs::symlink(t.path().join("notes.md"), skills.join("notes")).unwrap();
+
+    let cat = SkillCatalog::discover(&LayerDirs {
+        global: Some(skills),
+        project: None,
+    })
+    .unwrap();
+    let got: Vec<(String, bool)> = cat
+        .entries()
+        .iter()
+        .map(|e| (e.dir_name.clone(), e.is_valid()))
+        .collect();
+    assert_eq!(got, vec![("gone".into(), false), ("real".into(), true)]);
+    assert!(matches!(
+        cat.get(Layer::Global, "gone").unwrap().skill,
+        Err(SkillError::Io { .. })
+    ));
 }
