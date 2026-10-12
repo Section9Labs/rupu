@@ -14,6 +14,7 @@
 
 mod anthropic_prompt_cache;
 mod assembly;
+mod assembly_skills;
 mod dispatch;
 mod no_hand_built_run_opts;
 mod support;

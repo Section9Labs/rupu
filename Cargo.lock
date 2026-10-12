@@ -5005,6 +5005,7 @@ dependencies = [
  "rupu-netwatch",
  "rupu-providers",
  "rupu-scm",
+ "rupu-skills",
  "rupu-tools",
  "rupu-transcript",
  "rustix 1.1.4",

@@ -110,6 +110,11 @@ pub enum AssembleError {
     },
     #[error("tool grant: {0}")]
     Grant(#[from] GrantError),
+    /// The run's skills (the agent's and the launch's) don't resolve, or
+    /// the skills directories can't be read. Typed, so an fd-exhaustion
+    /// behind it stays classifiable.
+    #[error("skills: {0}")]
+    Skills(#[source] rupu_agent::SkillCheckError),
 }
 
 impl AssembleError {
@@ -119,6 +124,7 @@ impl AssembleError {
     pub fn into_run_error(self) -> rupu_agent::RunError {
         match self {
             AssembleError::Grant(e) => rupu_agent::RunError::ToolGrant(e.to_string()),
+            AssembleError::Skills(_) => rupu_agent::RunError::Preflight(self.to_string()),
             other => rupu_agent::RunError::Provider(other.to_string()),
         }
     }
@@ -131,7 +137,8 @@ impl AssembleError {
     /// ([`rupu_agent::record_unstarted_run`]):
     ///
     /// - a missing agent, verbatim, with where it was looked for;
-    /// - an undeclared provider, as its config error;
+    /// - an undeclared provider, or skills that don't resolve, as its
+    ///   config error;
     /// - a provider that did not build, as the auth error a first call on
     ///   it raised, with the `rupu auth login` hint.
     pub fn record_unstarted(self, run: rupu_agent::UnstartedRun<'_>) -> rupu_agent::RunError {
@@ -141,7 +148,9 @@ impl AssembleError {
             AssembleError::AgentLoad { .. } => ProviderError::Preflight(format!(
                 "{self}\n  Checked the project agents dir (.rupu/agents/) and the global agents dir."
             )),
-            AssembleError::UnknownProvider(_) => ProviderError::Preflight(self.to_string()),
+            AssembleError::UnknownProvider(_) | AssembleError::Skills(_) => {
+                ProviderError::Preflight(self.to_string())
+            }
             AssembleError::ProviderBuild {
                 provider, source, ..
             } => ProviderError::AuthConfig(format!(
@@ -486,10 +495,61 @@ impl RunAssembler {
         }
     }
 
+    /// The run's skills (spec §2.4): the agent's keys and the launch's own,
+    /// resolved in one pass against the global and project layers. `None`
+    /// when the run has none. Fails closed: a run never starts without a
+    /// skill it was given.
+    fn resolve_skills(
+        &self,
+        spec: &LaunchSpec,
+    ) -> Result<Option<Arc<rupu_skills::ResolvedSkills>>, AssembleError> {
+        let agent_grants = spec.agent.skills.as_deref().unwrap_or_default();
+        let agent_preload = spec.agent.preload_skills.as_deref().unwrap_or_default();
+        let o = &spec.overrides;
+        if agent_grants.is_empty()
+            && agent_preload.is_empty()
+            && o.skills.is_empty()
+            && o.preload_skills.is_empty()
+        {
+            return Ok(None);
+        }
+        let project = self.ctx.project_root.as_ref().map(|p| p.join(".rupu"));
+        let dirs = rupu_skills::LayerDirs::for_layers(&self.ctx.global, project.as_deref());
+        let catalog = rupu_skills::SkillCatalog::discover(&dirs)
+            .map_err(|e| AssembleError::Skills(e.into()))?;
+        let request = |reason, grants, preload| rupu_skills::SkillRequest {
+            reason,
+            grants,
+            preload,
+        };
+        let resolved = rupu_skills::resolve_run_skills(
+            &catalog,
+            &[
+                request(rupu_skills::SkillReason::Agent, agent_grants, agent_preload),
+                request(rupu_skills::SkillReason::Step, &o.skills, &o.preload_skills),
+            ],
+        )
+        .map_err(|e| AssembleError::Skills(e.into()))?;
+        Ok((!resolved.is_empty()).then(|| Arc::new(resolved)))
+    }
+
     /// Build the run `spec` describes.
     pub async fn assemble(&self, mut spec: LaunchSpec) -> Result<AssembledRun, AssembleError> {
         let d = defaults_for(&spec.origin);
         let cfg = &self.ctx.config;
+
+        // Before anything that needs cleaning up. As when its grant fails,
+        // the run's (empty) transcript exists, so whatever opens it finds
+        // the run that failed.
+        let skills = match self.resolve_skills(&spec) {
+            Ok(s) => s,
+            Err(e) => {
+                if let Err(w) = rupu_transcript::JsonlWriter::create(&spec.transcript_path) {
+                    tracing::warn!(error = %w, "create the transcript of a run whose skills failed");
+                }
+                return Err(e);
+            }
+        };
 
         // The run's netflow sink — built before the provider, which takes it.
         let (sink, netflow) = match spec.services.netflow.clone() {
@@ -616,7 +676,7 @@ impl RunAssembler {
                 id: spec.workspace.id.clone(),
                 path: spec.workspace.path.clone(),
                 bash: self.bash.clone(),
-                read_roots: Vec::new(),
+                read_roots: skills.as_ref().map(|s| s.read_roots()).unwrap_or_default(),
             },
             services: ToolServices {
                 dispatcher: spec.services.dispatcher.clone().filter(|_| d.launcher),
@@ -640,7 +700,7 @@ impl RunAssembler {
                     .clone()
                     .or_else(|| self.ctx.catalog.clone())
                     .filter(|_| d.catalog),
-                skills: None,
+                skills: skills.clone(),
             },
             call: Default::default(),
         };
@@ -700,7 +760,7 @@ impl RunAssembler {
             on_usage: chain_usage(ledger_hook, spec.hooks.on_usage.clone()),
         };
 
-        let system_prompt = system_prompt_for(agent, &spec.overrides);
+        let system_prompt = system_prompt_for(agent, &spec.overrides, skills.as_deref());
         let parent_run_id = spec.origin.parent_run_id().map(str::to_string);
         let LaunchSpec {
             agent,
@@ -744,12 +804,21 @@ impl RunAssembler {
 }
 
 /// The system prompt a run of `agent` sends: the agent's, with the site's
-/// `## Run target` section appended.
-pub fn system_prompt_for(agent: &rupu_agent::AgentSpec, overrides: &Overrides) -> String {
-    match overrides.system_prompt_suffix.as_deref() {
+/// `## Run target` section, then the run's skills section (spec §3.1).
+pub fn system_prompt_for(
+    agent: &rupu_agent::AgentSpec,
+    overrides: &Overrides,
+    skills: Option<&rupu_skills::ResolvedSkills>,
+) -> String {
+    let mut prompt = match overrides.system_prompt_suffix.as_deref() {
         Some(suffix) => format!("{}\n\n## Run target\n\n{suffix}", agent.system_prompt),
         None => agent.system_prompt.clone(),
+    };
+    if let Some(section) = skills.and_then(|s| s.prompt_section()) {
+        prompt.push_str("\n\n");
+        prompt.push_str(&section);
     }
+    prompt
 }
 
 /// The agent's own `permissionMode`. An unreadable one can't lower a

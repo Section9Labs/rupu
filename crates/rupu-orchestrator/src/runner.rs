@@ -10160,7 +10160,8 @@ async fn dispatch_one(
     // What an unstarted run's transcript records, kept before the spec moves.
     let agent = spec.agent.name.clone();
     let mode = spec.mode;
-    let system_prompt = rupu_runtime::assembly::system_prompt_for(&spec.agent, &spec.overrides);
+    let system_prompt =
+        rupu_runtime::assembly::system_prompt_for(&spec.agent, &spec.overrides, None);
     let prompt = spec.prompt.clone();
     let assembled = match assembler.assemble(spec).await {
         Ok(a) => a,
