@@ -244,3 +244,25 @@ fn skill_dir_is_the_path_as_found() {
     assert_eq!(s.dir, skills.join("linked"));
     assert_eq!(s.root, real.canonicalize().unwrap());
 }
+
+#[cfg(unix)]
+#[test]
+fn a_fifo_skill_md_is_refused_without_opening_it() {
+    let t = tempfile::tempdir().unwrap();
+    let dir = t.path().join("piped");
+    fs::create_dir_all(&dir).unwrap();
+    let status = std::process::Command::new("mkfifo")
+        .arg(dir.join("SKILL.md"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || tx.send(load_skill(&dir, Layer::Global).map(|_| ())));
+    let got = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("load_skill opened the FIFO and blocked");
+    assert!(
+        matches!(got, Err(SkillError::Tree(rupu_skills::TreeError::NotRegular { ref rel })) if rel == "SKILL.md"),
+        "{got:?}"
+    );
+}

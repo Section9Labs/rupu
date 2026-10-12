@@ -105,18 +105,26 @@ pub fn load_skill(dir: &Path, layer: Layer) -> Result<Skill, SkillError> {
     }
     let root = dir.canonicalize().map_err(io)?;
     let md_path = root.join("SKILL.md");
-    let text = match std::fs::read_to_string(&md_path) {
-        Ok(t) => t,
+    let md_io = |source| SkillError::Io {
+        path: md_path.clone(),
+        source,
+    };
+    // Opening a FIFO blocks until a writer appears; refuse anything but a
+    // regular file before opening it.
+    match std::fs::metadata(&md_path) {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => {
+            return Err(TreeError::NotRegular {
+                rel: "SKILL.md".into(),
+            }
+            .into())
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(SkillError::MissingSkillMd(dir.to_owned()))
         }
-        Err(source) => {
-            return Err(SkillError::Io {
-                path: md_path,
-                source,
-            })
-        }
-    };
+        Err(source) => return Err(md_io(source)),
+    }
+    let text = std::fs::read_to_string(&md_path).map_err(md_io)?;
     let (frontmatter, body) = parse_skill_md(&text)?;
     let name: SkillName = frontmatter
         .name
