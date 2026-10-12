@@ -63,6 +63,7 @@ pub static DESCRIPTOR: ToolDescriptor = ToolDescriptor {
     effect: Effect::Spawn,
     needs: &[Service::AgentDispatcher],
     uses: &[],
+    wildcard: true,
     description: "Run another agent synchronously as a tool call. Provide the child agent's name (must appear in this agent's dispatchableAgents frontmatter) and a prompt. The child runs to completion in its own context; you receive its final assistant text plus token + duration accounting. Use this to delegate review, search, or specialist tasks to a focused sub-agent.",
     input_schema: descriptor_schema,
 };

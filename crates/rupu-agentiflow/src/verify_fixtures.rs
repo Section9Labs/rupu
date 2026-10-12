@@ -1,4 +1,4 @@
-//! Test-only fixtures for the verification-gate tests (`status_tools`, `run`):
+//! Test-only fixtures for the verification-gate tests (`status`, `run`):
 //! a Full-profile finding carrying a report, which is the only kind of finding
 //! a verdict can be recorded on.
 

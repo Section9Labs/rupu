@@ -70,47 +70,6 @@ impl DispatchCtx {
     }
 }
 
-/// The lead's `dispatch` and `join` tools (the lead is depth 0).
-///
-/// `pool` is the definition's `pool.agents` (the only agents `dispatch` will
-/// start); `engagement` is the profile set every unit is bound to.
-///
-/// Superseded by [`fleet_unit_tools`], which bundles `dispatch`, `join` and
-/// `run_workflow` over ONE shared participant counter and is what the run
-/// loop uses. Kept for callers that want agent dispatch only; it does NOT
-/// offer `run_workflow`.
-pub fn fleet_dispatch_tools(
-    sup: Arc<FleetSupervisor>,
-    pool: Arc<Vec<String>>,
-    engagement: Vec<String>,
-) -> Vec<Arc<dyn Tool>> {
-    fleet_dispatch_tools_at_depth(sup, pool, engagement, 0)
-}
-
-/// [`fleet_dispatch_tools`] for a dispatcher at `depth` in the dispatch tree.
-/// A dispatcher at [`MAX_DEPTH`] or deeper gets a `dispatch` that always
-/// refuses.
-///
-/// Superseded by [`fleet_unit_tools`] (see [`fleet_dispatch_tools`]). It
-/// intentionally does NOT include `run_workflow`: a sub-lead built from it can
-/// dispatch agents and join, but cannot start a workflow unit. A future
-/// sub-lead that should be able to must add `run_workflow` explicitly.
-pub fn fleet_dispatch_tools_at_depth(
-    sup: Arc<FleetSupervisor>,
-    pool: Arc<Vec<String>>,
-    engagement: Vec<String>,
-    depth: u32,
-) -> Vec<Arc<dyn Tool>> {
-    let ctx = Arc::new(DispatchCtx {
-        sup,
-        pool,
-        engagement,
-        depth,
-        next: AtomicU32::new(0),
-    });
-    vec![Arc::new(DispatchTool(ctx.clone())), Arc::new(JoinTool(ctx))]
-}
-
 /// Where `run_workflow` looks up and vets a workflow.
 pub struct WorkflowToolCtx {
     /// The global rupu root (`~/.rupu`).
@@ -557,15 +516,14 @@ mod tests {
         depth: u32,
     ) -> (Arc<dyn Tool>, Arc<dyn Tool>) {
         let sup = Arc::new(FleetSupervisor::new(launcher, dir.to_path_buf()));
-        let mut v = fleet_dispatch_tools_at_depth(
+        let ctx = Arc::new(DispatchCtx {
             sup,
-            Arc::new(vec!["recon".to_string(), "exploit".to_string()]),
-            vec!["network".to_string()],
+            pool: Arc::new(vec!["recon".to_string(), "exploit".to_string()]),
+            engagement: vec!["network".to_string()],
             depth,
-        );
-        let join = v.pop().unwrap();
-        let dispatch = v.pop().unwrap();
-        (dispatch, join)
+            next: AtomicU32::new(0),
+        });
+        (Arc::new(DispatchTool(ctx.clone())), Arc::new(JoinTool(ctx)))
     }
 
     fn done_status(out: &str) -> UnitStatus {

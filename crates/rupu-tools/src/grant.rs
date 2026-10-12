@@ -16,7 +16,7 @@
 //! | `report_finding`, … | an alias, resolved to its canonical tool |
 //! | `findings.*`, `scm.*`, … | every tool in that namespace |
 //! | `core.*` | the unqualified core tools ([`crate::catalog::CORE_NAMES`]) |
-//! | `*` | the whole catalog |
+//! | `*` | the whole catalog, except the authority tools (`wildcard: false`: `board.directive`, `board.retract` — D22) |
 //! | anything else | a [`GrantError`] with a did-you-mean (D8) |
 //!
 //! A wildcard adds only tools this run can serve: one whose service is
@@ -82,7 +82,7 @@ impl fmt::Display for GrantReason {
 /// A grant the run's context adds on top of the agent's `tools:`. Ambient
 /// grants are never narrowed by `actions:` (none of them are connector
 /// tools).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AmbientGrant {
     /// Tool names (canonical or alias).
     pub tools: Vec<&'static str>,
@@ -119,9 +119,53 @@ impl AmbientGrant {
         }
     }
 
+    /// An agentiflow lead's coordination set (`origin:flow_lead`): the whole
+    /// board and mailbox, the flow's live status, the agent/workflow roster
+    /// and `findings.report`. (Its launch tools are injected until W7.)
+    pub fn flow_lead() -> Self {
+        Self {
+            tools: vec![
+                "board.claim",
+                "board.release",
+                "board.post",
+                "board.read",
+                "board.directive",
+                "board.retract",
+                "msg.send",
+                "goal.status",
+                "goal.coverage",
+                "budget.status",
+                "agents.list",
+                "agents.get",
+                "workflows.list",
+                "workflows.get",
+                "catalog.search",
+                "findings.report",
+            ],
+            reason: GrantReason::Origin("flow_lead"),
+            self_served: false,
+        }
+    }
+
+    /// A unit joining an agentiflow (`origin:flow_unit`): claim, release,
+    /// post and read on the board, and `msg.send`.
+    pub fn flow_unit() -> Self {
+        Self {
+            tools: vec![
+                "board.claim",
+                "board.release",
+                "board.post",
+                "board.read",
+                "msg.send",
+            ],
+            reason: GrantReason::Origin("flow_unit"),
+            self_served: false,
+        }
+    }
+
     /// Pre-built tools the launch site injected into the run (the agentiflow
-    /// board / mailbox / dispatch tools until W5 moves them into the
-    /// catalog). Self-served: the tool is its own implementation.
+    /// launch tools until W7 replaces them). Self-served: the tool is its own
+    /// implementation.
     pub fn injected(tools: Vec<&'static str>) -> Self {
         Self {
             tools,
@@ -523,7 +567,10 @@ impl ToolCatalog {
         field: &'static str,
     ) -> Result<Expansion, GrantError> {
         if entry == "*" {
-            return Ok(Expansion::Wildcard(self.descriptors().collect()));
+            // Every capability, but never authority over other agents (D22).
+            return Ok(Expansion::Wildcard(
+                self.descriptors().filter(|d| d.wildcard).collect(),
+            ));
         }
         if entry == CORE_NAMESPACE {
             return Ok(Expansion::Wildcard(

@@ -1,87 +1,105 @@
-//! Live status + steering tools for the agentiflow lead: re-check the goals, the
-//! coverage target and the budget on demand, and write a standing board
-//! directive.
+//! A flow's live status, as the [`RunStatus`] port behind the lead's
+//! `goal.status`, `goal.coverage` and `budget.status` catalog tools
+//! (`rupu-tools`, spec W5 §3.3): [`FlowStatus`].
 //!
 //! The round digest the lead is handed is a snapshot from the START of the
-//! round. `goal.status` and `goal.coverage` re-run the same pure evaluators
-//! ([`GoalEvaluator`], [`CoverageEvaluator`]) over the pooled scope, so they
-//! reflect findings and assets the lead (or a unit it just joined) JUST banked.
-//! `budget.status` re-reads the run's usage ledgers through the SAME
-//! [`UsageSource`] the envelope's budget enforcer meters and asks a
-//! [`BudgetEnforcer`] built from the SAME enforced [`Budget`] for the stage, so
-//! the lead sees the spend and the verdict the next round's check will act on.
+//! round. [`FlowStatus`] re-runs the same pure evaluators ([`GoalEvaluator`],
+//! [`CoverageEvaluator`]) over the pooled scope, so the tools reflect findings
+//! and assets the lead (or a unit it just joined) JUST banked. The budget is
+//! re-read through the SAME [`UsageSource`] the envelope's budget enforcer
+//! meters, and staged by a [`BudgetEnforcer`] built from the SAME enforced
+//! [`Budget`], so the lead sees the spend and the verdict the next round's
+//! check will act on ([`BudgetProbe`]).
 //!
-//! `board.directive` is the lead's steering write: a standing
-//! [`rupu_fleet::Directive`] that the units' `DirectiveCollector` delivers on
-//! every turn, and whose minted `id` it returns. `board.retract` lifts one by
-//! that id (an appended retraction folded on read; the board log is never
-//! rewritten).
-//!
-//! Error discipline matches `tools.rs` / `roster.rs`: a failure on a well-formed
-//! call is `Ok(ToolOutput { error: Some(..) })` so the model sees it and can
-//! react; `Err(ToolError::InvalidInput)` is reserved for arguments that cannot
-//! be parsed. An evaluation error on one goal is reported on THAT goal's row
-//! (an `error` field) and never aborts the others.
+//! An evaluation error on one goal is reported on THAT goal's row and never
+//! aborts the others.
 
 use crate::budget::{parse_duration, Budget, BudgetEnforcer, BudgetStage, UsageSource};
 use crate::coverage::{CoverageEvaluator, CoverageTarget};
 use crate::def::Goal;
 use crate::goal::{count_matching_findings, requires_verification, GoalEvaluator};
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rupu_coverage::{read_findings, ActiveSet, CoveragePaths};
-use rupu_fleet::{Board, Directive};
-use rupu_tools::output::{failed, ok_json, opt_str, req_str};
-use rupu_tools::{Tool, ToolContext, ToolDescriptor, ToolError, ToolOutput};
-use serde_json::{json, Map, Value};
+use rupu_tools::ports::{
+    BudgetReport, BudgetSet, BudgetState, GoalCoverageReport, GoalReport, GoalRow, GoalTally,
+    RoundsLine, TokensLine, UsdEnforcement, UsdLine, WallClockLine, WallClockTally,
+};
+use rupu_tools::{PortError, RunStatus};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-/// The role a `board.directive` is written as.
-const LEAD_AUTHOR: &str = "lead";
-
-/// What the status tools share: the definition's goals and coverage target, the
-/// pooled scope they are evaluated over, the board directives go to, and the
-/// budget's live view.
-struct StatusCtx {
+/// A flow's goals and coverage target, the pooled scope they are evaluated
+/// over, and its budget's live view: what an agentiflow hands its lead as
+/// the run's [`RunStatus`].
+pub struct FlowStatus {
     goals: Vec<Goal>,
     coverage: Option<CoverageTarget>,
     paths: CoveragePaths,
     active: Arc<ActiveSet>,
-    board: Arc<Board>,
     budget: BudgetProbe,
 }
 
-/// The five status/steering tools (`goal.status`, `goal.coverage`,
-/// `budget.status`, `board.directive`, `board.retract`), each holding a clone
-/// of the shared context.
-///
-/// `paths` is the run's POOLED scope (the one its units' findings are merged
-/// into), `active` the engagement's active profile set, `budget` the live view
-/// of the run's budget (see [`BudgetProbe`]).
-pub fn status_tools(
-    goals: Vec<Goal>,
-    coverage: Option<CoverageTarget>,
-    paths: CoveragePaths,
-    active: Arc<ActiveSet>,
-    board: Arc<Board>,
-    budget: BudgetProbe,
-) -> Vec<Arc<dyn Tool>> {
-    let ctx = Arc::new(StatusCtx {
-        goals,
-        coverage,
-        paths,
-        active,
-        board,
-        budget,
-    });
-    vec![
-        Arc::new(GoalStatus(ctx.clone())),
-        Arc::new(CoverageStatus(ctx.clone())),
-        Arc::new(BudgetStatus(ctx.clone())),
-        Arc::new(BoardDirective(ctx.clone())),
-        Arc::new(BoardRetract(ctx)),
-    ]
+impl FlowStatus {
+    /// `paths` is the run's POOLED scope (the one its units' findings are
+    /// merged into), `active` the engagement's active profile set, `budget`
+    /// the live view of the run's budget (see [`BudgetProbe`]).
+    pub fn new(
+        goals: Vec<Goal>,
+        coverage: Option<CoverageTarget>,
+        paths: CoveragePaths,
+        active: Arc<ActiveSet>,
+        budget: BudgetProbe,
+    ) -> Self {
+        Self {
+            goals,
+            coverage,
+            paths,
+            active,
+            budget,
+        }
+    }
+}
+
+impl RunStatus for FlowStatus {
+    fn goals(&self) -> Result<GoalReport, PortError> {
+        Ok(GoalReport(
+            self.goals
+                .iter()
+                .map(|g| GoalRow {
+                    id: g.id.clone(),
+                    objective: g.objective.clone(),
+                    required: g.required,
+                    result: GoalEvaluator::evaluate(g, &self.paths, &self.active)
+                        .map(|o| GoalTally {
+                            satisfied: o.met,
+                            current: o.current,
+                            target: o.target,
+                            detail: goal_detail(g, &self.paths, &o.detail),
+                        })
+                        .map_err(|e| e.to_string()),
+                })
+                .collect(),
+        ))
+    }
+
+    fn coverage(&self) -> Result<GoalCoverageReport, PortError> {
+        let Some(target) = &self.coverage else {
+            return Ok(GoalCoverageReport::NoTarget);
+        };
+        let o = CoverageEvaluator::evaluate(target, &self.paths, &self.active)
+            .map_err(|e| PortError::new(format!("could not evaluate coverage: {e}")))?;
+        Ok(GoalCoverageReport::Evaluated {
+            reach: target.reach,
+            depth: target.depth.clone(),
+            fraction: o.fraction,
+            satisfied: o.met,
+            per_kind: o.per_kind,
+        })
+    }
+
+    fn budget(&self) -> Result<BudgetReport, PortError> {
+        Ok(self.budget.report())
+    }
 }
 
 // ---- the budget's live view -------------------------------------------------
@@ -160,9 +178,9 @@ impl BudgetProbe {
 
     /// The `budget.status` report. Reads ledgers from disk: call it off the
     /// async runtime.
-    fn report(&self) -> Value {
+    fn report(&self) -> BudgetReport {
         let Some(declared) = self.declared.as_ref().filter(|b| sets_a_dimension(b)) else {
-            return json!({ "budget": null, "detail": "no budget set" });
+            return BudgetReport::NoBudget;
         };
         let spend = SpendSnapshot {
             usd: if declared.usd.is_some() {
@@ -182,84 +200,69 @@ impl BudgetProbe {
         // One dimension's own verdict, from the enforcer's own logic (an
         // enforcer over just that dimension), so it can never disagree with the
         // overall stage about what "soft" or "hard" means.
-        let state = |only: fn(&mut Budget, &Budget)| -> &'static str {
+        let state = |only: fn(&mut Budget, &Budget)| -> BudgetState {
             let mut b = Budget {
                 soft_at: self.soft_at,
                 ..Budget::default()
             };
             only(&mut b, declared);
-            stage_word(&BudgetEnforcer::new(b, self.started).stage(&spend, round, now))
+            stage_state(&BudgetEnforcer::new(b, self.started).stage(&spend, round, now))
         };
 
-        let mut out = Map::new();
         let stage = self.enforcer.stage(&spend, round, now);
-        out.insert("stage".into(), json!(stage_word(&stage)));
-        if let BudgetStage::Hard { dimension } = &stage {
-            out.insert("tripped".into(), json!(dimension));
-        }
-        if let Some(soft_at) = declared.soft_at {
-            out.insert("soft_at".into(), json!(soft_at));
-        }
-
-        if let Some(cap) = declared.usd {
-            let mut d = Map::new();
-            d.insert("cap".into(), json!(cap));
-            d.insert("spent".into(), json!(spend.usd));
-            if self.usd_enforced {
-                d.insert("enforced".into(), json!(true));
-                d.insert("state".into(), json!(state(|b, d| b.usd = d.usd)));
-                d.insert("remaining".into(), json!((cap - spend.usd).max(0.0)));
-            } else {
-                d.insert("enforced".into(), json!(false));
-                d.insert(
-                    "note".into(),
-                    json!(
-                        "not enforced: the lead's model has no price, so spend reads as $0 \
-                         (only priced models' spend is counted here); budget.tokens, \
-                         budget.rounds and budget.wall_clock still apply"
-                    ),
-                );
-            }
-            out.insert("usd".into(), Value::Object(d));
-        }
-        if let Some(cap) = declared.tokens {
-            out.insert(
-                "tokens".into(),
-                json!({
-                    "cap": cap,
-                    "spent": spend.tokens,
-                    "remaining": cap.saturating_sub(spend.tokens),
-                    "state": state(|b, d| b.tokens = d.tokens),
-                }),
-            );
-        }
-        if let Some(cap) = declared.rounds {
-            out.insert(
-                "rounds".into(),
-                json!({
-                    "cap": cap,
-                    "elapsed": round,
-                    "remaining": cap.saturating_sub(round),
-                    "state": state(|b, d| b.rounds = d.rounds),
-                }),
-            );
-        }
-        if let Some(cap) = &declared.wall_clock {
-            let elapsed = (now - self.started).num_seconds().max(0);
-            let row = match parse_duration(cap) {
-                Ok(d) => json!({
-                    "cap": cap,
-                    "cap_secs": d.num_seconds(),
-                    "elapsed_secs": elapsed,
-                    "remaining_secs": (d.num_seconds() - elapsed).max(0),
-                    "state": state(|b, d| b.wall_clock = d.wall_clock.clone()),
-                }),
-                // `Budget::validate` rejects this at launch; never reached.
-                Err(e) => json!({ "cap": cap, "error": e }),
-            };
-            out.insert("wall_clock".into(), row);
-        }
-        Value::Object(out)
+        BudgetReport::Set(BudgetSet {
+            stage: stage_state(&stage),
+            tripped: match &stage {
+                BudgetStage::Hard { dimension } => Some(dimension.clone()),
+                _ => None,
+            },
+            soft_at: declared.soft_at,
+            usd: declared.usd.map(|cap| UsdLine {
+                cap,
+                spent: spend.usd,
+                enforcement: if self.usd_enforced {
+                    UsdEnforcement::Enforced {
+                        state: state(|b, d| b.usd = d.usd),
+                        remaining: (cap - spend.usd).max(0.0),
+                    }
+                } else {
+                    UsdEnforcement::NotEnforced {
+                        note: "not enforced: the lead's model has no price, so spend reads as $0 \
+                               (only priced models' spend is counted here); budget.tokens, \
+                               budget.rounds and budget.wall_clock still apply"
+                            .into(),
+                    }
+                },
+            }),
+            tokens: declared.tokens.map(|cap| TokensLine {
+                cap,
+                spent: spend.tokens,
+                remaining: cap.saturating_sub(spend.tokens),
+                state: state(|b, d| b.tokens = d.tokens),
+            }),
+            rounds: declared.rounds.map(|cap| RoundsLine {
+                cap,
+                elapsed: round,
+                remaining: cap.saturating_sub(round),
+                state: state(|b, d| b.rounds = d.rounds),
+            }),
+            wall_clock: declared.wall_clock.as_ref().map(|cap| {
+                let elapsed = (now - self.started).num_seconds().max(0);
+                WallClockLine {
+                    cap: cap.clone(),
+                    tally: match parse_duration(cap) {
+                        Ok(d) => Ok(WallClockTally {
+                            cap_secs: d.num_seconds(),
+                            elapsed_secs: elapsed,
+                            remaining_secs: (d.num_seconds() - elapsed).max(0),
+                            state: state(|b, d| b.wall_clock = d.wall_clock.clone()),
+                        }),
+                        // `Budget::validate` rejects this at launch; never reached.
+                        Err(e) => Err(e),
+                    },
+                }
+            }),
+        })
     }
 }
 
@@ -269,25 +272,13 @@ fn sets_a_dimension(b: &Budget) -> bool {
     b.usd.is_some() || b.tokens.is_some() || b.rounds.is_some() || b.wall_clock.is_some()
 }
 
-fn stage_word(stage: &BudgetStage) -> &'static str {
+fn stage_state(stage: &BudgetStage) -> BudgetState {
     match stage {
-        BudgetStage::Ok => "ok",
-        BudgetStage::Soft => "soft",
-        BudgetStage::Hard { .. } => "hard",
+        BudgetStage::Ok => BudgetState::Ok,
+        BudgetStage::Soft => BudgetState::Soft,
+        BudgetStage::Hard { .. } => BudgetState::Hard,
     }
 }
-
-/// Run a blocking evaluation off the async runtime: the evaluators read whole
-/// ledgers from disk, which can be large.
-async fn blocking<T: Send + 'static>(
-    f: impl FnOnce() -> T + Send + 'static,
-) -> Result<T, ToolOutput> {
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| failed(format!("status evaluation did not complete: {e}")))
-}
-
-// ---- goal.status ------------------------------------------------------------
 
 /// The line `goal.status` reports for a goal the evaluator scored as `scored`.
 ///
@@ -323,182 +314,6 @@ fn goal_detail(goal: &Goal, paths: &CoveragePaths, scored: &str) -> String {
     format!("{scored} ({matched} matched, {verified} verified{ask})")
 }
 
-/// `goal.status` -> `[{id, objective, required, satisfied, current, target,
-/// detail}]`, or `{id, objective, required, error}` for a goal that could not be
-/// evaluated.
-struct GoalStatus(Arc<StatusCtx>);
-
-#[async_trait]
-impl Tool for GoalStatus {
-    fn descriptor(&self) -> &'static ToolDescriptor {
-        &rupu_tools::catalog::flow::GOAL_STATUS
-    }
-
-    async fn invoke(&self, _input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        let ctx = self.0.clone();
-        let rows = match blocking(move || {
-            ctx.goals
-                .iter()
-                .map(
-                    |g| match GoalEvaluator::evaluate(g, &ctx.paths, &ctx.active) {
-                        Ok(o) => json!({
-                            "id": g.id,
-                            "objective": g.objective,
-                            "required": g.required,
-                            "satisfied": o.met,
-                            "current": o.current,
-                            "target": o.target,
-                            "detail": goal_detail(g, &ctx.paths, &o.detail),
-                        }),
-                        Err(e) => json!({
-                            "id": g.id,
-                            "objective": g.objective,
-                            "required": g.required,
-                            "error": e.to_string(),
-                        }),
-                    },
-                )
-                .collect::<Vec<Value>>()
-        })
-        .await
-        {
-            Ok(rows) => rows,
-            Err(out) => return Ok(out),
-        };
-        Ok(ok_json(Value::Array(rows)))
-    }
-}
-
-// ---- goal.coverage ----------------------------------------------------------
-
-/// `goal.coverage` (formerly `coverage.status`) -> `{reach, depth, fraction, satisfied, per_kind}`, or
-/// `{coverage: null}` when the definition has no coverage target.
-struct CoverageStatus(Arc<StatusCtx>);
-
-#[async_trait]
-impl Tool for CoverageStatus {
-    fn descriptor(&self) -> &'static ToolDescriptor {
-        &rupu_tools::catalog::flow::GOAL_COVERAGE
-    }
-
-    async fn invoke(&self, _input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        let Some(target) = self.0.coverage.clone() else {
-            return Ok(ok_json(json!({ "coverage": null })));
-        };
-        let ctx = self.0.clone();
-        let evaluated = match blocking(move || {
-            CoverageEvaluator::evaluate(&target, &ctx.paths, &ctx.active).map(|o| {
-                let per_kind: serde_json::Map<String, Value> = o
-                    .per_kind
-                    .iter()
-                    .map(|(k, f)| (k.clone(), json!(f)))
-                    .collect();
-                json!({
-                    "reach": target.reach,
-                    "depth": target.depth,
-                    "fraction": o.fraction,
-                    "satisfied": o.met,
-                    "per_kind": per_kind,
-                })
-            })
-        })
-        .await
-        {
-            Ok(r) => r,
-            Err(out) => return Ok(out),
-        };
-        Ok(match evaluated {
-            Ok(v) => ok_json(v),
-            Err(e) => failed(format!("could not evaluate coverage: {e}")),
-        })
-    }
-}
-
-// ---- budget.status ----------------------------------------------------------
-
-/// `budget.status` -> `{stage, tripped?, soft_at?, usd?, tokens?, rounds?,
-/// wall_clock?}`, or `{budget: null, detail: "no budget set"}` when the flow
-/// sets no budget.
-struct BudgetStatus(Arc<StatusCtx>);
-
-#[async_trait]
-impl Tool for BudgetStatus {
-    fn descriptor(&self) -> &'static ToolDescriptor {
-        &rupu_tools::catalog::flow::BUDGET_STATUS
-    }
-
-    async fn invoke(&self, _input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        let ctx = self.0.clone();
-        Ok(match blocking(move || ctx.budget.report()).await {
-            Ok(report) => ok_json(report),
-            Err(out) => out,
-        })
-    }
-}
-
-// ---- board.directive --------------------------------------------------------
-
-/// `board.directive { body, addressed_to? }` -> `{ok: true, id, addressed_to}`:
-/// write a standing directive authored by the lead. The `id` is what
-/// `board.retract` takes to lift it again.
-struct BoardDirective(Arc<StatusCtx>);
-
-#[async_trait]
-impl Tool for BoardDirective {
-    fn descriptor(&self) -> &'static ToolDescriptor {
-        &rupu_tools::catalog::flow::BOARD_DIRECTIVE
-    }
-
-    async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        let body = req_str(&input, "body")?.to_string();
-        let addressed_to = opt_str(&input, "addressed_to")?;
-        let directive = Directive {
-            // Minted by the board.
-            id: String::new(),
-            author: LEAD_AUTHOR.to_string(),
-            ts: chrono::Utc::now().to_rfc3339(),
-            body,
-            addressed_to: addressed_to.clone(),
-        };
-        Ok(match self.0.board.put_directive(&directive) {
-            Ok(id) => ok_json(json!({ "ok": true, "id": id, "addressed_to": addressed_to })),
-            Err(e) => failed(format!("could not write directive: {e}")),
-        })
-    }
-}
-
-// ---- board.retract ----------------------------------------------------------
-
-/// `board.retract { id }` -> `{ok: true, retracted}`: lift a standing directive
-/// from the live set. The board log is append-only, so this appends a
-/// retraction; an id with no live directive behind it is reported and appends
-/// nothing.
-struct BoardRetract(Arc<StatusCtx>);
-
-#[async_trait]
-impl Tool for BoardRetract {
-    fn descriptor(&self) -> &'static ToolDescriptor {
-        &rupu_tools::catalog::flow::BOARD_RETRACT
-    }
-
-    async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        let id = req_str(&input, "id")?.to_string();
-        let live = match self.0.board.read_directives() {
-            Ok(live) => live,
-            Err(e) => return Ok(failed(format!("could not read directives: {e}"))),
-        };
-        if !live.iter().any(|d| d.id == id) {
-            return Ok(failed(format!(
-                "no live directive has id {id}: it is unknown or already retracted"
-            )));
-        }
-        Ok(match self.0.board.retract_directive(&id) {
-            Ok(()) => ok_json(json!({ "ok": true, "retracted": id })),
-            Err(e) => failed(format!("could not retract directive: {e}")),
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,6 +330,8 @@ mod tests {
         FindingRecord, FindingScope, Ledger, Locator, Severity, Surface, VerificationStatus,
     };
     use rupu_orchestrator::usage_ledger::{LedgerKind, LedgerRow, LEDGER_VERSION};
+    use rupu_tools::{ToolContext, ToolOutput};
+    use serde_json::{json, Value};
     use std::collections::BTreeMap;
     use std::io::Write as _;
     use std::path::PathBuf;
@@ -576,7 +393,6 @@ mod tests {
     struct Fx {
         _tmp: tempfile::TempDir,
         paths: CoveragePaths,
-        board_root: std::path::PathBuf,
         /// `<global>`: a launched unit's ledger is `<global>/runs/<id>/usage.jsonl`.
         global: PathBuf,
         /// The lead's ledger, `<run dir>/usage.jsonl`.
@@ -592,7 +408,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = CoveragePaths::new(&tmp.path().join("ws"), "pooled");
         paths.ensure_dir().unwrap();
-        let board_root = tmp.path().join("fleet");
         let global = tmp.path().join("global");
         let run_dir = tmp.path().join("af_run");
         std::fs::create_dir_all(&global).unwrap();
@@ -604,7 +419,6 @@ mod tests {
         Fx {
             _tmp: tmp,
             paths,
-            board_root,
             global,
             lead_usage: run_dir.join("usage.jsonl"),
             sup,
@@ -746,39 +560,45 @@ mod tests {
         append_record(paths, Ledger::Findings, &rec).unwrap();
     }
 
-    fn tools(fx: &Fx, goals: Vec<Goal>, coverage: Option<CoverageTarget>) -> Vec<Arc<dyn Tool>> {
-        status_tools(
+    /// The lead's status tools over a [`FlowStatus`], built the way a lead
+    /// round builds them: catalog bodies over a context carrying the port.
+    struct Kit(ToolContext);
+
+    fn kit(status: FlowStatus) -> Kit {
+        let mut ctx = ToolContext::default();
+        ctx.services.run_status = Some(Arc::new(status));
+        Kit(ctx)
+    }
+
+    fn tools(fx: &Fx, goals: Vec<Goal>, coverage: Option<CoverageTarget>) -> Kit {
+        kit(FlowStatus::new(
             goals,
             coverage,
             fx.paths.clone(),
             Arc::new(active()),
-            Arc::new(Board::new(&fx.board_root)),
             fx.probe(None, Budget::default()),
-        )
+        ))
     }
 
     /// The tools of a run whose definition (and enforcer) carry `budget`.
-    fn budget_tools(fx: &Fx, budget: Budget) -> Vec<Arc<dyn Tool>> {
-        status_tools(
+    fn budget_tools(fx: &Fx, budget: Budget) -> Kit {
+        kit(FlowStatus::new(
             vec![],
             None,
             fx.paths.clone(),
             Arc::new(active()),
-            Arc::new(Board::new(&fx.board_root)),
             fx.probe(Some(budget.clone()), budget),
-        )
+        ))
     }
 
-    async fn budget_report(ts: &[Arc<dyn Tool>]) -> Value {
+    async fn budget_report(ts: &Kit) -> Value {
         json_of(&call(ts, "budget.status", json!({})).await)
     }
 
-    async fn call(tools: &[Arc<dyn Tool>], name: &str, input: Value) -> ToolOutput {
-        tools
-            .iter()
-            .find(|t| t.name() == name)
+    async fn call(kit: &Kit, name: &str, input: Value) -> ToolOutput {
+        rupu_tools::bodies::body(name, &kit.0)
             .unwrap_or_else(|| panic!("no tool {name}"))
-            .invoke(input, &ToolContext::default())
+            .invoke(input, &kit.0)
             .await
             .unwrap()
     }
@@ -794,28 +614,10 @@ mod tests {
         // became `goal.coverage`; a lead prompt naming the old tool still
         // reaches it (a flow-lead-scoped alias).
         let fx = fx();
-        let mut reg = rupu_agent::ToolRegistry::new();
-        for t in tools(&fx, vec![], None) {
-            reg.insert(t);
-        }
+        let ts = tools(&fx, vec![], None);
+        let mut reg = rupu_agent::ToolRegistry::with_alias_scope(rupu_tools::AliasScope::FlowLead);
+        reg.insert(rupu_tools::bodies::body("goal.coverage", &ts.0).unwrap());
         assert_eq!(reg.get("coverage.status").unwrap().name(), "goal.coverage");
-    }
-
-    #[test]
-    fn exposes_the_five_tools() {
-        let fx = fx();
-        let mut names: Vec<_> = tools(&fx, vec![], None).iter().map(|t| t.name()).collect();
-        names.sort_unstable();
-        assert_eq!(
-            names,
-            [
-                "board.directive",
-                "board.retract",
-                "budget.status",
-                "goal.coverage",
-                "goal.status"
-            ]
-        );
     }
 
     #[tokio::test]
@@ -1078,202 +880,6 @@ mod tests {
         assert_eq!(v["per_kind"]["network:host"], 0.5);
     }
 
-    #[tokio::test]
-    async fn board_directive_writes_a_lead_directive_a_fresh_board_reads() {
-        let fx = fx();
-        let ts = tools(&fx, vec![], None);
-        let out = call(&ts, "board.directive", json!({ "body": "focus on auth" })).await;
-        let v = json_of(&out);
-        assert_eq!(v["ok"], true);
-
-        let ds = Board::new(&fx.board_root).read_directives().unwrap();
-        assert_eq!(ds.len(), 1);
-        assert_eq!(ds[0].author, "lead");
-        assert_eq!(ds[0].body, "focus on auth");
-        assert_eq!(ds[0].addressed_to, None);
-        assert!(chrono::DateTime::parse_from_rfc3339(&ds[0].ts).is_ok());
-    }
-
-    #[tokio::test]
-    async fn board_directive_can_be_addressed_and_blank_means_everyone() {
-        let fx = fx();
-        let ts = tools(&fx, vec![], None);
-        call(
-            &ts,
-            "board.directive",
-            json!({ "body": "stand down", "addressed_to": "scanner" }),
-        )
-        .await;
-        call(
-            &ts,
-            "board.directive",
-            json!({ "body": "regroup", "addressed_to": "  " }),
-        )
-        .await;
-        let ds = Board::new(&fx.board_root).read_directives().unwrap();
-        assert_eq!(ds[0].addressed_to.as_deref(), Some("scanner"));
-        assert_eq!(ds[1].addressed_to, None);
-    }
-
-    #[tokio::test]
-    async fn board_directive_rejects_a_blank_body_and_a_non_string_target() {
-        let fx = fx();
-        let ts = tools(&fx, vec![], None);
-        let tool = ts.iter().find(|t| t.name() == "board.directive").unwrap();
-        for bad in [
-            json!({}),
-            json!({ "body": "   " }),
-            json!({ "body": "x", "addressed_to": 7 }),
-        ] {
-            let err = tool
-                .invoke(bad.clone(), &ToolContext::default())
-                .await
-                .unwrap_err();
-            assert!(matches!(err, ToolError::InvalidInput(_)), "{bad}");
-        }
-        assert!(Board::new(&fx.board_root)
-            .read_directives()
-            .unwrap()
-            .is_empty());
-    }
-
-    #[tokio::test]
-    async fn board_directive_reports_a_store_failure_to_the_model() {
-        let fx = fx();
-        // The board root's parent is a FILE, so the directive log cannot be created.
-        let blocker = fx._tmp.path().join("blocker");
-        std::fs::write(&blocker, "x").unwrap();
-        let ts = status_tools(
-            vec![],
-            None,
-            fx.paths.clone(),
-            Arc::new(active()),
-            Arc::new(Board::new(blocker.join("fleet"))),
-            fx.probe(None, Budget::default()),
-        );
-        let out = call(&ts, "board.directive", json!({ "body": "x" })).await;
-        let err = out.error.expect("a store failure is reported, not raised");
-        assert!(err.starts_with("could not write directive:"), "{err}");
-    }
-
-    // ---- board.retract -------------------------------------------------------
-
-    /// The raw line count of the run's directive log.
-    fn directive_log_lines(fx: &Fx) -> usize {
-        std::fs::read_to_string(fx.board_root.join("board").join("directives.jsonl"))
-            .map(|t| t.lines().count())
-            .unwrap_or(0)
-    }
-
-    #[tokio::test]
-    async fn board_directive_returns_the_id_it_stored() {
-        let fx = fx();
-        let ts = tools(&fx, vec![], None);
-        let v = json_of(&call(&ts, "board.directive", json!({ "body": "focus on auth" })).await);
-        let id = v["id"].as_str().expect("the minted id is surfaced");
-        assert!(!id.is_empty());
-        let ds = Board::new(&fx.board_root).read_directives().unwrap();
-        assert_eq!(ds[0].id, id);
-    }
-
-    #[tokio::test]
-    async fn board_retract_lifts_a_directive_the_lead_wrote() {
-        let fx = fx();
-        let ts = tools(&fx, vec![], None);
-        let first =
-            json_of(&call(&ts, "board.directive", json!({ "body": "focus on auth" })).await);
-        call(
-            &ts,
-            "board.directive",
-            json!({ "body": "expand to staging" }),
-        )
-        .await;
-        let id = first["id"].as_str().unwrap();
-
-        let out = json_of(&call(&ts, "board.retract", json!({ "id": id })).await);
-        assert_eq!(out["ok"], true);
-        assert_eq!(out["retracted"], id);
-
-        // A fresh handle sees only what is still live; the log only grew.
-        let live = Board::new(&fx.board_root).read_directives().unwrap();
-        assert_eq!(live.len(), 1);
-        assert_eq!(live[0].body, "expand to staging");
-        assert_eq!(directive_log_lines(&fx), 3);
-    }
-
-    #[tokio::test]
-    async fn board_retract_of_an_unknown_or_already_retracted_id_reports_and_appends_nothing() {
-        let fx = fx();
-        let ts = tools(&fx, vec![], None);
-        let v = json_of(&call(&ts, "board.directive", json!({ "body": "x" })).await);
-        let id = v["id"].as_str().unwrap().to_string();
-
-        let out = call(&ts, "board.retract", json!({ "id": "no-such-id" })).await;
-        let err = out.error.expect("an unknown id is reported to the model");
-        assert!(err.contains("no-such-id"), "{err}");
-        assert_eq!(directive_log_lines(&fx), 1, "nothing was appended");
-
-        call(&ts, "board.retract", json!({ "id": id })).await;
-        assert_eq!(directive_log_lines(&fx), 2);
-        let again = call(&ts, "board.retract", json!({ "id": id })).await;
-        assert!(
-            again.error.is_some(),
-            "already retracted: nothing to retract"
-        );
-        assert_eq!(directive_log_lines(&fx), 2, "and nothing was appended");
-    }
-
-    #[tokio::test]
-    async fn board_retract_rejects_a_missing_or_blank_id() {
-        let fx = fx();
-        let ts = tools(&fx, vec![], None);
-        let tool = ts.iter().find(|t| t.name() == "board.retract").unwrap();
-        for bad in [json!({}), json!({ "id": "   " }), json!({ "id": 7 })] {
-            let err = tool
-                .invoke(bad.clone(), &ToolContext::default())
-                .await
-                .unwrap_err();
-            assert!(matches!(err, ToolError::InvalidInput(_)), "{bad}");
-        }
-        assert_eq!(directive_log_lines(&fx), 0);
-    }
-
-    #[tokio::test]
-    async fn board_retract_reports_a_store_failure_to_the_model() {
-        let fx = fx();
-        // The board root's parent is a FILE, so the directive log cannot be read.
-        let blocker = fx._tmp.path().join("blocker");
-        std::fs::write(&blocker, "x").unwrap();
-        let ts = status_tools(
-            vec![],
-            None,
-            fx.paths.clone(),
-            Arc::new(active()),
-            Arc::new(Board::new(blocker.join("fleet"))),
-            fx.probe(None, Budget::default()),
-        );
-        let out = call(&ts, "board.retract", json!({ "id": "x" })).await;
-        let err = out.error.expect("a store failure is reported, not raised");
-        assert!(err.starts_with("could not read directives:"), "{err}");
-    }
-
-    #[test]
-    fn the_directive_tools_describe_retraction() {
-        let fx = fx();
-        let ts = tools(&fx, vec![], None);
-        let directive = ts.iter().find(|t| t.name() == "board.directive").unwrap();
-        assert!(
-            !directive.description().contains("no retraction"),
-            "{}",
-            directive.description()
-        );
-        assert!(
-            directive.description().contains("board.retract"),
-            "{}",
-            directive.description()
-        );
-    }
-
     // ---- budget.status -------------------------------------------------------
 
     /// Seeds $5.00 / 1.7M billable tokens: the lead 1M in + 200k out ($2 + $2),
@@ -1463,7 +1069,7 @@ mod tests {
                 let v = budget_report(&ts).await;
                 assert_eq!(
                     v["stage"],
-                    stage_word(&want),
+                    stage_state(&want).as_str(),
                     "{b:?} round {round} +{secs}s"
                 );
                 match want {
@@ -1526,14 +1132,13 @@ mod tests {
             usd: None,
             ..declared.clone()
         };
-        let ts = status_tools(
+        let ts = kit(FlowStatus::new(
             vec![],
             None,
             fx.paths.clone(),
             Arc::new(active()),
-            Arc::new(Board::new(&fx.board_root)),
             fx.probe(Some(declared), enforced),
-        );
+        ));
         let v = budget_report(&ts).await;
         assert_eq!(v["stage"], "ok");
         assert_eq!(v["usd"]["enforced"], false);
@@ -1583,7 +1188,7 @@ mod tests {
                 fx.round.clone(),
                 Arc::new(t0),
             );
-            let report = probe.report();
+            let report = probe.report().to_json();
             (
                 meter.usd.load(Ordering::Relaxed),
                 meter.tokens.load(Ordering::Relaxed),

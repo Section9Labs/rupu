@@ -1,0 +1,163 @@
+---
+source: crates/rupu-agentiflow/tests/it/flow_toolset_parity.rs
+expression: "unit_toolset(\"\").await"
+---
+- description: "Search the workspace by code STRUCTURE (syntax tree), not text, using ast-grep. Provide a `pattern` in ast-grep syntax and a `lang` (rust, python, typescript, go, …). Metavariables: `$VAR` matches one named node, `$$$` matches zero or more nodes. Example: pattern `impl $T for $S` with lang `rust` finds trait impls; pattern `async fn $NAME($$$) -> Result<$$$>` finds async fns returning Result. Output is `path:line:col: match` lines (1-based, workspace-relative). Prefer this over `grep` when you want syntactic matches (call sites, impls, signatures) instead of regex over raw text. Returns empty stdout (not an error) when there are no matches."
+  input_schema:
+    properties:
+      lang:
+        description: "Language grammar to parse with, e.g. `rust`, `python`, `typescript`, `go`, `javascript`, `java`, `c`, `cpp`. Required."
+        type: string
+      path:
+        description: Optional sub-path within the workspace to restrict the search. Defaults to the whole workspace.
+        type: string
+      pattern:
+        description: "Structural pattern in ast-grep syntax. Metavariables: `$VAR` = one node, `$$$` = zero-or-more nodes. Example: `impl $T for $S`."
+        type: string
+    required:
+      - pattern
+      - lang
+    type: object
+  name: ast_grep
+- description: "Execute a shell command in the workspace directory. The command runs with a controlled environment (PATH, HOME, USER, TERM, LANG plus a per-workspace allowlist). Default timeout 120 seconds, configurable per-call. Use this for compilation, tests, git operations, and anything else that needs a shell. The cwd is locked to the workspace path; cd outside the workspace will produce an error from the shell, not an escape."
+  input_schema:
+    properties:
+      command:
+        description: "The shell command to execute, e.g. `cargo test`, `git diff HEAD`, `ls -la src/`."
+        type: string
+    required:
+      - command
+    type: object
+  name: bash
+- description: "Atomically claim a work unit so no other participant duplicates it. Returns granted, or the current holder when it is already claimed."
+  input_schema:
+    properties:
+      work_unit:
+        description: "Identifier of the unit of work to claim, e.g. host:1.1.2.2"
+        type: string
+    required:
+      - work_unit
+    type: object
+  name: board.claim
+- description: "Post to the shared board every participant can read: an observation, a question, an answer, a vote, or a note. Optionally address it to a participant id or role."
+  input_schema:
+    properties:
+      addressed_to:
+        description: Participant id or role this post is for; omit for everyone
+        type: string
+      body:
+        type: string
+      kind:
+        enum:
+          - observation
+          - question
+          - answer
+          - vote
+          - note
+        type: string
+    required:
+      - kind
+      - body
+    type: object
+  name: board.post
+- description: "Read the shared board's posts, oldest first, newest last. Returns the most recent posts (default 50); filter to those addressed to a participant id or role with addressed_to."
+  input_schema:
+    properties:
+      addressed_to:
+        description: Only posts addressed to this participant id or role
+        type: string
+      limit:
+        description: Maximum posts to return (the most recent ones); default 50
+        maximum: 500
+        minimum: 1
+        type: integer
+    type: object
+  name: board.read
+- description: "Release a work unit you previously claimed with board.claim, so another participant can take it."
+  input_schema:
+    properties:
+      work_unit:
+        description: Identifier of the claimed unit of work to release
+        type: string
+    required:
+      - work_unit
+    type: object
+  name: board.release
+- description: "Replace an exact string in a file. The `old_string` must match exactly once in the file; if it matches zero times or more than once, the edit fails. Pass enough surrounding context (a few lines before/after) to make `old_string` uniquely identifying. The file must already exist; for new files use `write_file`."
+  input_schema:
+    properties:
+      new_string:
+        description: Replacement substring.
+        type: string
+      old_string:
+        description: Exact substring to replace. Must match exactly once.
+        type: string
+      path:
+        description: Path relative to the workspace root.
+        type: string
+    required:
+      - path
+      - old_string
+      - new_string
+    type: object
+  name: edit_file
+- description: "List files in the workspace matching a glob pattern. Output is one path per line, sorted, relative to the workspace root. Supports `**` for recursive descent. Returns empty stdout when nothing matches."
+  input_schema:
+    properties:
+      pattern:
+        description: "Glob pattern, e.g. `src/**/*.rs` or `*.toml`."
+        type: string
+    required:
+      - pattern
+    type: object
+  name: glob
+- description: "Search the workspace for a pattern using ripgrep. Output is `path:line:match` lines, gitignore-aware. Use this to locate symbols, callers, or any text across the workspace. Returns empty stdout (not an error) when there are no matches."
+  input_schema:
+    properties:
+      path:
+        description: Optional sub-path within the workspace to restrict the search. Defaults to the whole workspace.
+        type: string
+      pattern:
+        description: "Regex pattern to search for. Ripgrep's default regex syntax (similar to PCRE)."
+        type: string
+    required:
+      - pattern
+    type: object
+  name: grep
+- description: "Send a message. `to` is a participant id, a role, \"parent\", or \"lead\" (delivered to exactly that inbox), or \"broadcast\" (every participant sees it once, from the moment it started listening; the broadcast log is capped per run, so don't spam it)."
+  input_schema:
+    properties:
+      body:
+        type: string
+      to:
+        description: "Recipient inbox: participant id, role, parent, lead or broadcast"
+        type: string
+    required:
+      - to
+      - body
+    type: object
+  name: msg.send
+- description: "Read a file from the workspace and return its contents prefixed by 1-based line numbers separated by tabs. Always use this before editing a file so you have current line numbers. Paths are relative to the workspace root; absolute paths and paths that escape the workspace (e.g. `../`) are rejected."
+  input_schema:
+    properties:
+      path:
+        description: "Path relative to the workspace root, e.g. `src/lib.rs` or `tests/foo.rs`."
+        type: string
+    required:
+      - path
+    type: object
+  name: read_file
+- description: "Create a file or overwrite an existing one in the workspace. Use this for new files; for edits to existing files prefer `edit_file` to preserve unrelated content. Intermediate directories are created as needed. Paths must be inside the workspace root."
+  input_schema:
+    properties:
+      content:
+        description: Full content of the file. Existing content is replaced.
+        type: string
+      path:
+        description: Path relative to the workspace root.
+        type: string
+    required:
+      - path
+      - content
+    type: object
+  name: write_file

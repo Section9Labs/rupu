@@ -83,6 +83,7 @@ pub static LIST: ToolDescriptor = ToolDescriptor {
     effect: Effect::Read,
     needs: &[Service::Scm],
     uses: &[],
+    wildcard: true,
     description: "List pull/merge requests on a repository. Optional filters: state (open/closed/merged), author, limit.",
     input_schema: schema::<ListPrsArgs>,
 };
@@ -93,6 +94,7 @@ pub static GET: ToolDescriptor = ToolDescriptor {
     effect: Effect::Read,
     needs: &[Service::Scm],
     uses: &[],
+    wildcard: true,
     description: "Fetch a single pull/merge request by number. Returns title, body, state, head/base branches, author, timestamps.",
     input_schema: schema::<GetPrArgs>,
 };
@@ -103,6 +105,7 @@ pub static DIFF: ToolDescriptor = ToolDescriptor {
     effect: Effect::Read,
     needs: &[Service::Scm],
     uses: &[],
+    wildcard: true,
     description: "Fetch the unified-diff patch for a pull/merge request. Returns patch text + per-file change counts.",
     input_schema: schema::<DiffPrArgs>,
 };
@@ -113,6 +116,7 @@ pub static COMMENT: ToolDescriptor = ToolDescriptor {
     effect: Effect::External,
     needs: &[Service::Scm],
     uses: &[],
+    wildcard: true,
     description: "Post a top-level comment on a pull/merge request.",
     input_schema: schema::<CommentPrArgs>,
 };
@@ -123,6 +127,7 @@ pub static CREATE: ToolDescriptor = ToolDescriptor {
     effect: Effect::External,
     needs: &[Service::Scm],
     uses: &[],
+    wildcard: true,
     description: "Open a pull/merge request from `head` branch into `base`. Set draft=true to open as a draft.",
     input_schema: schema::<CreatePrArgs>,
 };

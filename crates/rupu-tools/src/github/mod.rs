@@ -30,6 +30,7 @@ pub static WORKFLOWS_DISPATCH: ToolDescriptor = ToolDescriptor {
     effect: Effect::External,
     needs: &[Service::Scm],
     uses: &[],
+    wildcard: true,
     description: "Trigger a GitHub Actions workflow run via workflow_dispatch. Requires the workflow file to declare `on: workflow_dispatch:`.",
     input_schema: schema::<WorkflowsDispatchArgs>,
 };

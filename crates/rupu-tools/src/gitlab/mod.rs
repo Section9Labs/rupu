@@ -29,6 +29,7 @@ pub static PIPELINE_TRIGGER: ToolDescriptor = ToolDescriptor {
     effect: Effect::External,
     needs: &[Service::Scm],
     uses: &[],
+    wildcard: true,
     description: "Trigger a GitLab CI pipeline against a branch/tag with optional variables.",
     input_schema: schema::<PipelineTriggerArgs>,
 };

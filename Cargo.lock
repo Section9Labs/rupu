@@ -4572,6 +4572,7 @@ version = "0.83.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "insta",
  "rupu-agent",
  "rupu-codename",
  "rupu-config",
@@ -4997,6 +4998,7 @@ dependencies = [
  "rupu-codename",
  "rupu-config",
  "rupu-coverage",
+ "rupu-fleet",
  "rupu-netflow",
  "rupu-netwatch",
  "rupu-providers",
@@ -5063,6 +5065,7 @@ dependencies = [
  "jsonschema",
  "predicates",
  "rupu-coverage",
+ "rupu-fleet",
  "rupu-netflow",
  "rupu-scm",
  "schemars",

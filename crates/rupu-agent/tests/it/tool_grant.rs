@@ -343,6 +343,7 @@ fn an_unknown_name_fails_the_grant_before_any_run() {
         declared: Some(&declared),
         step_actions: &[],
         concerns: false,
+        origin: None,
         injected: &[],
         tool_context: &ctx,
         alias_scope: Default::default(),

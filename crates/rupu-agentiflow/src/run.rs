@@ -81,6 +81,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::budget::{parse_duration, Budget, BudgetStage, UsageSource};
+use crate::collectors::roster_collector;
 use crate::def::{AgentiflowDef, WorkflowsSpec};
 use crate::dispatch_tools::{fleet_unit_tools, WorkflowToolCtx};
 use crate::envelope::{
@@ -89,8 +90,7 @@ use crate::envelope::{
 use crate::error::AgentiflowError;
 use crate::lead::{LeadConfig, RunAgentLeadDriver};
 use crate::operator::OperatorQueue;
-use crate::roster::{roster_collector, roster_tools, RosterCtx};
-use crate::status_tools::{status_tools, BudgetProbe};
+use crate::status::{BudgetProbe, FlowStatus};
 use crate::subprocess::SubprocessUnitLauncher;
 use crate::supervisor::FleetSupervisor;
 use crate::unit::UnitLauncher;
@@ -223,8 +223,9 @@ pub struct LeadInputs {
     /// The lead's agent. Its `tools:` is the lead's grant exactly (the runner
     /// offers what it names): the launch site passes what the file declares,
     /// absent = `Some(vec![])`, which grants no builtins/MCP tools. The
-    /// engagement's ambient grant adds `findings.report` / `assets.mark` and
-    /// the board/mailbox tools are always-on `extra_tools`, so an empty list
+    /// origin's grant (`origin:flow_lead`) adds the board / mailbox, status
+    /// and roster tools and `findings.report`, the engagement's adds
+    /// `assets.mark`, and the launch tools are injected, so an empty list
     /// does not mean the lead is toolless.
     pub agent: rupu_agent::AgentSpec,
     /// [`LeadProvider::Assembled`] in production.
@@ -320,15 +321,10 @@ fn has_automatic_terminator(def: &AgentiflowDef, usd_priceable: bool) -> bool {
 /// written; `workflows: all` is resolved against the catalog as it stands at
 /// run start (a workflow added mid-run is not indexed, though `workflows.list`
 /// still shows it).
-fn pool_workflow_ids(spec: &WorkflowsSpec, ctx: &RosterCtx) -> Vec<String> {
+fn pool_workflow_ids(spec: &WorkflowsSpec, catalog: &dyn rupu_tools::CatalogPort) -> Vec<String> {
     match spec {
         WorkflowsSpec::List(ids) => ids.clone(),
-        WorkflowsSpec::All(_) => {
-            rupu_orchestrator::list_workflow_summaries(&ctx.global, ctx.project.as_deref())
-                .into_iter()
-                .map(|w| w.id)
-                .collect()
-        }
+        WorkflowsSpec::All(_) => catalog.workflows().into_iter().map(|w| w.id).collect(),
     }
 }
 
@@ -755,18 +751,13 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 ..assembler.context().findings.clone()
             };
             let assembler = Arc::new(assembler.with_findings(findings));
-            // The lead's coordination substrate: a file-backed board and mailboxes
-            // under the run dir, the tools that act on them, and the collectors that
-            // fold its inbox and standing directives into each turn. "lead" is the
-            // lead's participant id (the `to: "lead"` inbox other participants address).
-            let board = Arc::new(rupu_fleet::Board::new(run_dir.clone()));
-            let mailbox = Arc::new(rupu_fleet::Mailbox::new(run_dir.clone()));
-            let fleet_ctx = Arc::new(crate::tools::FleetToolCtx::new(
-                board.clone(),
-                mailbox.clone(),
-                "lead",
-            ));
-            let mut extra_tools = crate::tools::fleet_tools(fleet_ctx);
+            // The lead's coordination substrate: its bus on the file-backed board
+            // and mailboxes under the run dir (the `board.*` / `msg.send` catalog
+            // tools act through it), and the collectors that fold its inbox and
+            // standing directives into each turn. "lead" is the lead's participant
+            // id (the `to: "lead"` inbox other participants address). One bus for
+            // the whole run, so the lead's claims persist across rounds.
+            let bus = Arc::new(rupu_fleet::Bus::for_run_dir(&run_dir, "lead"));
 
             // Units: the lead's `dispatch` / `join` start and await pool agents
             // as process-isolated `rupu run`s through one supervisor, which also
@@ -798,42 +789,36 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
             // `run_workflow` loads and vets the workflow it is asked to start
             // from it. The pool's workflow ids are resolved ONCE against it, so
             // the roster index and `run_workflow`'s allowlist agree.
-            let roster_ctx = Arc::new(RosterCtx {
-                global: global.clone(),
-                project: Some(workspace.join(".rupu")),
-            });
-            let pool_workflows = pool_workflow_ids(&def.pool.workflows, &roster_ctx);
+            let project = Some(workspace.join(".rupu"));
+            let catalog: Arc<dyn rupu_tools::CatalogPort> = Arc::new(
+                rupu_orchestrator::FsCatalog::new(global.clone(), project.clone()),
+            );
+            let pool_workflows = pool_workflow_ids(&def.pool.workflows, catalog.as_ref());
             // `dispatch` / `join` / `run_workflow`: one participant counter, so a
             // pool agent and a pool workflow of the same name never share a
-            // `<name>#<n>`.
-            extra_tools.extend(fleet_unit_tools(
+            // `<name>#<n>`. The lead's only injected tools, until W7.
+            let extra_tools = fleet_unit_tools(
                 sup.clone(),
                 Arc::new(def.pool.agents.clone()),
                 def.engagement_profiles.clone(),
                 WorkflowToolCtx {
                     global: global.clone(),
-                    project: roster_ctx.project.clone(),
+                    project,
                     pool_workflows: pool_workflows.clone(),
                 },
                 run_dir.clone(),
                 generation,
-            ));
+            );
 
-            // Roster awareness + steering. The roster tools read the agent and
-            // workflow catalog (global + the workspace's `.rupu`); the status tools
-            // re-run the envelope's own evaluators over the pooled scope and let
-            // the lead write a standing board directive. All appended to the lead's
-            // always-on tools, never replacing the fleet / dispatch tools above.
-            extra_tools.extend(roster_tools(roster_ctx.clone()));
-            extra_tools.extend(status_tools(
+            // The lead's live status: the envelope's own evaluators over the
+            // pooled scope, and the very meter, enforced budget, clock and
+            // start the envelope runs against, so `budget.status` reports what
+            // the next round check will act on.
+            let run_status: Arc<dyn rupu_tools::RunStatus> = Arc::new(FlowStatus::new(
                 def.goals.clone(),
                 def.coverage.clone(),
                 status_paths,
                 findings_engagement.clone(),
-                board.clone(),
-                // The very meter, enforced budget, clock and start the
-                // envelope runs against, so `budget.status` reports what the
-                // next round check will act on.
                 BudgetProbe::new(
                     def.budget.clone(),
                     enforced,
@@ -844,13 +829,13 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 ),
             ));
 
-            let mut collectors = crate::collectors::lead_collectors(mailbox, board, "lead");
+            let mut collectors = crate::collectors::bus_collectors(&bus);
             // The lead's ambient index of what it can dispatch: its pool, resolved
             // against the catalog.
             collectors.push(roster_collector(
                 def.pool.agents.clone(),
                 pool_workflows,
-                roster_ctx,
+                catalog.clone(),
             ));
             let lead_cfg = LeadConfig {
                 assembler,
@@ -870,6 +855,9 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 // Resolved by the first round, then carried round to round.
                 limits: ModelLimits::unknown(),
                 extra_tools,
+                message_bus: Some(bus),
+                run_status: Some(run_status),
+                catalog: Some(catalog),
                 collectors,
                 // `rupu agentiflow send --now` interrupts through the same
                 // queue the envelope drains at each round boundary.
@@ -3268,10 +3256,8 @@ mod tests {
             "name: Sweep\nsteps:\n  - id: only\n    agent: recon\n    prompt: hi\n",
         )
         .unwrap();
-        let ctx = RosterCtx {
-            global: fx.global.clone(),
-            project: Some(fx.workspace.join(".rupu")),
-        };
+        let ctx =
+            rupu_orchestrator::FsCatalog::new(fx.global.clone(), Some(fx.workspace.join(".rupu")));
         // A list is passed through untouched, even for an id the catalog lacks
         // (the collector marks it `(not found)`).
         let listed = WorkflowsSpec::List(vec!["sweep".into(), "ghost".into()]);

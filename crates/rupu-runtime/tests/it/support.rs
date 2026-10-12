@@ -87,6 +87,7 @@ impl Home {
             scm: Some(Arc::new(rupu_scm::Registry::default())),
             findings: rupu_coverage::FindingWriteOptions::default(),
             net_capture: None,
+            catalog: Some(Arc::new(EmptyCatalog)),
         }
     }
 
@@ -183,4 +184,33 @@ pub fn run_start(path: &Path) -> (String, String) {
             _ => None,
         })
         .expect("a RunStart")
+}
+
+/// A catalog with nothing in it: what a site's `FsCatalog` is to the
+/// assembler (a port), without the orchestrator.
+pub struct EmptyCatalog;
+
+impl rupu_tools::CatalogPort for EmptyCatalog {
+    fn agents(&self) -> Result<Vec<rupu_tools::ports::AgentEntry>, rupu_tools::PortError> {
+        Ok(Vec::new())
+    }
+    fn workflows(&self) -> Vec<rupu_tools::ports::WorkflowEntry> {
+        Vec::new()
+    }
+}
+
+/// A flow's status port with no goals, no coverage target and no budget:
+/// what an agentiflow hands its lead, for tests that only need the service.
+pub struct NoStatus;
+
+impl rupu_tools::RunStatus for NoStatus {
+    fn goals(&self) -> Result<rupu_tools::ports::GoalReport, rupu_tools::PortError> {
+        Ok(Default::default())
+    }
+    fn coverage(&self) -> Result<rupu_tools::ports::GoalCoverageReport, rupu_tools::PortError> {
+        Ok(rupu_tools::ports::GoalCoverageReport::NoTarget)
+    }
+    fn budget(&self) -> Result<rupu_tools::ports::BudgetReport, rupu_tools::PortError> {
+        Ok(rupu_tools::ports::BudgetReport::NoBudget)
+    }
 }

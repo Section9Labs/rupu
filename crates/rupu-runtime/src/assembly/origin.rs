@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rupu_tools::{AliasScope, RunIdentity, Surface};
+use rupu_tools::{AliasScope, AmbientGrant, RunIdentity, Surface};
 
 use crate::usage_ledger::{LedgerTag, UsageLedger};
 
@@ -108,6 +108,13 @@ pub struct OriginDefaults {
     pub scm: bool,
     /// The in-process dispatcher is offered when the launch provides one.
     pub launcher: bool,
+    /// The agent/workflow catalog (`agents.*`, `catalog.search`, …) is
+    /// offered when the context or the launch provides one.
+    pub catalog: bool,
+    /// The grant the origin itself carries, on top of the agent's `tools:`
+    /// (W5 §3.4): an agentiflow lead's or unit's coordination set. Its tools
+    /// are offered only when the launch provides their services.
+    pub origin_grant: Option<AmbientGrant>,
     /// The run goes through machine-level admission.
     pub admission: bool,
 }
@@ -127,6 +134,8 @@ pub fn defaults_for(origin: &Origin) -> OriginDefaults {
             coverage_stream: CoverageStream::Own,
             scm: true,
             launcher: true,
+            catalog: true,
+            origin_grant: None,
             admission: true,
         },
         Origin::WorkflowStep {
@@ -155,6 +164,8 @@ pub fn defaults_for(origin: &Origin) -> OriginDefaults {
             coverage_stream: CoverageStream::None,
             scm: true,
             launcher: true,
+            catalog: true,
+            origin_grant: None,
             admission: true,
         },
         // A child reports where its parent does (R4) and is charged to the
@@ -170,6 +181,8 @@ pub fn defaults_for(origin: &Origin) -> OriginDefaults {
             coverage_stream: CoverageStream::Parent,
             scm: true,
             launcher: true,
+            catalog: true,
+            origin_grant: None,
             admission: true,
         },
         // Sessions key their ledger off the session id so several sessions
@@ -188,6 +201,8 @@ pub fn defaults_for(origin: &Origin) -> OriginDefaults {
             coverage_stream: CoverageStream::None,
             scm: true,
             launcher: true,
+            catalog: true,
+            origin_grant: None,
             admission: true,
         },
         Origin::FlowLead { flow_id, flow_dir } => OriginDefaults {
@@ -203,6 +218,8 @@ pub fn defaults_for(origin: &Origin) -> OriginDefaults {
             // The lead's launcher is the agentiflow's own unit supervisor
             // (W7 makes it the one launcher).
             launcher: false,
+            catalog: true,
+            origin_grant: Some(AmbientGrant::flow_lead()),
             admission: true,
         },
         // A fleet unit pools its findings under the agentiflow's scope and,
@@ -219,6 +236,8 @@ pub fn defaults_for(origin: &Origin) -> OriginDefaults {
             coverage_stream: CoverageStream::Own,
             scm: true,
             launcher: true,
+            catalog: true,
+            origin_grant: Some(AmbientGrant::flow_unit()),
             admission: true,
         },
     }

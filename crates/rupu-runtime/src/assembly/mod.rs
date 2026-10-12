@@ -59,6 +59,11 @@ pub struct AssemblyContext {
     pub findings: rupu_coverage::FindingWriteOptions,
     /// The process-wide subprocess-capture backend.
     pub net_capture: Option<Arc<dyn rupu_netflow::SubprocessCapture>>,
+    /// The agents and workflows the runs can draw on (`agents.*`,
+    /// `workflows.list` / `workflows.get`, `catalog.search`): the site's
+    /// `rupu_orchestrator::FsCatalog`. `None` = no `Service::Catalog`, so an
+    /// agent naming a roster tool gets a `tool_unavailable` notice.
+    pub catalog: Option<Arc<dyn rupu_tools::CatalogPort>>,
 }
 
 impl AssemblyContext {
@@ -76,6 +81,7 @@ impl AssemblyContext {
             scm: None,
             findings: rupu_coverage::FindingWriteOptions::default(),
             net_capture: None,
+            catalog: None,
         }
     }
 }
@@ -624,6 +630,14 @@ impl RunAssembler {
                 customer: self.ctx.customer.clone(),
                 // The agent loop sets it from the permission policy.
                 prompter: None,
+                message_bus: spec.services.message_bus.clone(),
+                run_status: spec.services.run_status.clone(),
+                catalog: spec
+                    .services
+                    .catalog
+                    .clone()
+                    .or_else(|| self.ctx.catalog.clone())
+                    .filter(|_| d.catalog),
             },
             call: Default::default(),
         };
@@ -633,6 +647,7 @@ impl RunAssembler {
             declared: agent.tools.as_deref(),
             step_actions: &d.step_actions,
             concerns: concerns.is_some(),
+            origin: d.origin_grant.as_ref(),
             injected: &spec.services.extra_tools,
             tool_context: &tool_context,
             alias_scope: d.alias_scope,

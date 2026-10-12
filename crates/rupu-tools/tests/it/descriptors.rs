@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// `impl Tool for` blocks in production code (before the file's test module),
-/// per tool home. W5 moves the agentiflow bodies into this crate and this
-/// list shrinks to it.
+/// per tool home. Since W5 every home is in this crate but the agentiflow
+/// launch tools, which W7 replaces.
 fn production_impls() -> usize {
     let homes: &[&str] = &[
         include_str!("../../src/bash.rs"),
@@ -36,10 +36,12 @@ fn production_impls() -> usize {
         include_str!("../../src/issues/mod.rs"),
         include_str!("../../src/github/mod.rs"),
         include_str!("../../src/gitlab/mod.rs"),
-        include_str!("../../../rupu-agentiflow/src/tools.rs"),
-        include_str!("../../../rupu-agentiflow/src/status_tools.rs"),
+        include_str!("../../src/board/mod.rs"),
+        include_str!("../../src/msg/mod.rs"),
+        include_str!("../../src/roster/mod.rs"),
+        include_str!("../../src/goal/mod.rs"),
+        include_str!("../../src/budget/mod.rs"),
         include_str!("../../../rupu-agentiflow/src/dispatch_tools.rs"),
-        include_str!("../../../rupu-agentiflow/src/roster.rs"),
     ];
     homes
         .iter()
@@ -151,10 +153,10 @@ fn non_shell_names_cover_legacy_and_canonical_but_never_real_commands() {
 
 /// Every descriptor whose body lives in this crate is built by
 /// `bodies::body` for a context that provides every service, and the body
-/// answers with that very descriptor. The agentiflow tools (bodies in
-/// `rupu-agentiflow` until W5) are the only ones without a body here.
+/// answers with that very descriptor. The agentiflow launch tools (bodies in
+/// `rupu-agentiflow` until W7) are the only ones without a body here.
 #[test]
-fn every_catalog_tool_but_the_flow_tools_has_a_body() {
+fn every_catalog_tool_but_the_launch_tools_has_a_body() {
     let ctx = full_context();
     for d in ToolCatalog::all() {
         let flow = rupu_tools::catalog::flow::ALL
@@ -162,7 +164,7 @@ fn every_catalog_tool_but_the_flow_tools_has_a_body() {
             .any(|f| std::ptr::eq(*f, *d));
         match rupu_tools::bodies::body(d.name, &ctx) {
             Some(t) => {
-                assert!(!flow, "{} is a flow tool with a body here", d.name);
+                assert!(!flow, "{} is a launch tool with a body here", d.name);
                 assert!(std::ptr::eq(t.descriptor(), *d), "{}", d.name);
             }
             None => assert!(flow, "{} has no body", d.name),
@@ -228,6 +230,12 @@ fn full_context() -> ToolContext {
         )),
         ..Default::default()
     });
+    s.message_bus = Some(Arc::new(rupu_fleet::Bus::for_run_dir(
+        std::path::Path::new("/nonexistent/af"),
+        "lead",
+    )));
+    s.run_status = Some(Arc::new(crate::support::StubStatus::default()));
+    s.catalog = Some(Arc::new(crate::support::StubCatalog::default()));
     ctx
 }
 
@@ -260,8 +268,9 @@ fn action_eligibility_is_connectors_and_findings() {
     assert_eq!(want.len(), 22);
 }
 
-/// W4 §6.6: no `impl Tool for` in production code outside this crate. Test
-/// modules may implement it (fakes); the agentiflow tools move in with W5.
+/// W4 §6.6 / W5 §7: no `impl Tool for` in production code outside this
+/// crate, but the agentiflow launch tools (`rupu-agentiflow`'s
+/// `dispatch_tools.rs`, until W7). Test modules may implement it (fakes).
 #[test]
 fn no_tool_is_implemented_outside_this_crate() {
     let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
@@ -269,11 +278,12 @@ fn no_tool_is_implemented_outside_this_crate() {
     for entry in std::fs::read_dir(&crates).unwrap() {
         let krate = entry.unwrap().path();
         let name = krate.file_name().unwrap().to_string_lossy().to_string();
-        if name == "rupu-tools" || name == "rupu-agentiflow" {
+        if name == "rupu-tools" {
             continue;
         }
         scan(&krate.join("src"), &mut offenders);
     }
+    offenders.retain(|p| !p.ends_with("rupu-agentiflow/src/dispatch_tools.rs"));
     assert!(
         offenders.is_empty(),
         "`impl Tool for` outside rupu-tools (production code): {offenders:?}"

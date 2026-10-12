@@ -93,6 +93,7 @@ pub static DESCRIPTOR: ToolDescriptor = ToolDescriptor {
     effect: Effect::Read,
     needs: &[],
     uses: &[],
+    wildcard: true,
     description: "Search the workspace by code STRUCTURE (syntax tree), not text, using ast-grep. \
 Provide a `pattern` in ast-grep syntax and a `lang` (rust, python, typescript, go, …). \
 Metavariables: `$VAR` matches one named node, `$$$` matches zero or more nodes. \

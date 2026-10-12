@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rupu_agent::{AgentSpec, Hooks, StreamOpts, TurnCollector, UserTurn};
-use rupu_tools::{AgentDispatcher, PermissionMode, Prompter, Tool};
+use rupu_tools::{AgentDispatcher, CatalogPort, PermissionMode, Prompter, RunStatus, Tool};
 
 use super::origin::Origin;
 
@@ -80,9 +80,21 @@ pub struct LaunchServices {
     /// run's sink exists before its SCM registry and provider). `None` = the
     /// assembler builds one for the run.
     pub netflow: Option<Arc<dyn rupu_netflow::FlowSink>>,
-    /// Pre-built tools injected into the run (`origin:injected`): the
-    /// agentiflow coordination tools until W5 moves them into the catalog.
+    /// Pre-built tools injected into the run (`origin:injected`): an
+    /// agentiflow lead's launch tools (`dispatch`, `join`, `run_workflow`,
+    /// `workflows.generate`) until W7 replaces them. Temporary.
     pub extra_tools: Vec<Arc<dyn Tool>>,
+    /// The run's address on its agentiflow's board and mailboxes
+    /// (`board.*`, `msg.send`): an agentiflow lead's or unit's, built by
+    /// the flow. Per run: it holds the run's participant id and claims.
+    pub message_bus: Option<Arc<rupu_fleet::Bus>>,
+    /// The flow's live goals, coverage and budget (`goal.*`,
+    /// `budget.status`): an agentiflow lead's.
+    pub run_status: Option<Arc<dyn RunStatus>>,
+    /// A catalog for this launch instead of the context's
+    /// ([`super::AssemblyContext::catalog`]): an agentiflow lead reads the
+    /// one rooted at its workspace.
+    pub catalog: Option<Arc<dyn CatalogPort>>,
     /// The run's provider, when the site prepared it early
     /// ([`super::RunAssembler::prepare_provider`], with `netflow` as its
     /// sink). `None` = the assembler builds it.

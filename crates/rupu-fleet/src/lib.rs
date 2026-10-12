@@ -1,14 +1,17 @@
 //! File-backed fleet comms substrate for agentiflows: a shared board
 //! (claims / posts / directives) and per-participant mailboxes. Pure store
 //! crate — no agent or provider dependency. Copies the atomicity and TTL-lease
-//! patterns from `rupu-workspace`'s autoflow claim store.
+//! patterns from `rupu-workspace`'s autoflow claim store. A run reaches it
+//! through its [`Bus`].
 
 mod board;
+mod bus;
 mod error;
 mod mailbox;
 mod types;
 
 pub use board::Board;
+pub use bus::{Bus, BusCaps, ClaimTable};
 pub use error::FleetError;
 pub use mailbox::Mailbox;
 pub use types::{

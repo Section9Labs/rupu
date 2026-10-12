@@ -14,6 +14,7 @@ pub static DESCRIPTOR: ToolDescriptor = ToolDescriptor {
     effect: Effect::Read,
     needs: &[Service::Findings],
     uses: &[],
+    wildcard: true,
     description: "List findings recorded in this project with a one-line query in `q` (e.g. \
      `severity>=high tag:needs-poc -has:poc`). Returns one page of slim rows (id, title, \
      severity, location, tags), `next_cursor`, `total`, and `tags_in_use` — reuse an \

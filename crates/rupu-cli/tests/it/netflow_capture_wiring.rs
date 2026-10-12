@@ -110,3 +110,30 @@ fn every_production_assembler_gets_the_capture() {
         assert!(seen > 0, "{rel}: expected a production assembler");
     }
 }
+
+/// W5 §3.1a: every production assembler hands its runs the agent/workflow
+/// catalog (`rupu_orchestrator::FsCatalog`), so an agent granted
+/// `agents.list` / `catalog.search` gets them wherever it runs. (A site that
+/// forgot would leave such an agent with a `tool_unavailable` notice.)
+#[test]
+fn every_production_assembler_gets_the_catalog() {
+    for rel in [
+        "crates/rupu-cli/src/cmd/run.rs",
+        "crates/rupu-cli/src/cmd/session.rs",
+        "crates/rupu-cli/src/cmd/workflow.rs",
+        "crates/rupu-cli/src/resume.rs",
+        "crates/rupu-cli/src/cmd/agentiflow.rs",
+    ] {
+        let src = production_source(rel);
+        let mut seen = 0;
+        for chunk in src.split("AssemblyContext {").skip(1) {
+            seen += 1;
+            let body = &chunk[..chunk.find("},").expect("literal end")];
+            assert!(
+                body.contains("catalog: Some("),
+                "{rel}: AssemblyContext without catalog: Some(..)"
+            );
+        }
+        assert!(seen > 0, "{rel}: expected a production assembler");
+    }
+}

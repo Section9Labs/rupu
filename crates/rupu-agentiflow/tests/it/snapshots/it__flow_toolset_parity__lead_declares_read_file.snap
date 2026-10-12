@@ -1,0 +1,653 @@
+---
+source: crates/rupu-agentiflow/tests/it/flow_toolset_parity.rs
+expression: "lead_toolset(\"[read_file]\")"
+---
+- description: "Get one agent's detail by name: description, provider, model, declared tools, the agents it may dispatch, and its permission mode."
+  input_schema:
+    properties:
+      name:
+        description: "The agent's name, as agents.list shows it"
+        type: string
+    required:
+      - name
+    type: object
+  name: agents.get
+- description: "List the agents you can draw on (global and project): each one's name, description and declared tools. `tools: null` means the agent uses the default tool set, not none. Use agents.get for one agent's detail."
+  input_schema:
+    properties: {}
+    type: object
+  name: agents.list
+- description: "Record how deeply an engagement asset has been examined, as a rung of its profile's coverage depth ladder (monotonic — a shallower rung after a deeper one keeps the deeper one). The effective rung is returned."
+  input_schema:
+    properties:
+      coordinates:
+        description: "Locator coordinates pinning the asset, each {\"t\": <tag>, \"v\": <value>}."
+        items:
+          type: object
+        type: array
+      depth:
+        description: "The depth-ladder rung reached, e.g. \"tested\"."
+        type: string
+      kind:
+        description: "Profile-namespaced asset kind, e.g. \"network:service\"."
+        type: string
+      label:
+        type: string
+    required:
+      - kind
+      - depth
+    type: object
+  name: assets.mark
+- description: "Atomically claim a work unit so no other participant duplicates it. Returns granted, or the current holder when it is already claimed."
+  input_schema:
+    properties:
+      work_unit:
+        description: "Identifier of the unit of work to claim, e.g. host:1.1.2.2"
+        type: string
+    required:
+      - work_unit
+    type: object
+  name: board.claim
+- description: "Steer the fleet: write a standing directive to the board. Units see it on every turn until you lift it, so post sparingly and keep each short and actionable. Returns the directive's `id`: pass it to `board.retract` once the instruction is obsolete. Omit `addressed_to` to address everyone; name a unit or role to address only it."
+  input_schema:
+    properties:
+      addressed_to:
+        description: A unit name or role to address; omit for everyone
+        type: string
+      body:
+        description: The directive text
+        type: string
+    required:
+      - body
+    type: object
+  name: board.directive
+- description: "Post to the shared board every participant can read: an observation, a question, an answer, a vote, or a note. Optionally address it to a participant id or role."
+  input_schema:
+    properties:
+      addressed_to:
+        description: Participant id or role this post is for; omit for everyone
+        type: string
+      body:
+        type: string
+      kind:
+        enum:
+          - observation
+          - question
+          - answer
+          - vote
+          - note
+        type: string
+    required:
+      - kind
+      - body
+    type: object
+  name: board.post
+- description: "Read the shared board's posts, oldest first, newest last. Returns the most recent posts (default 50); filter to those addressed to a participant id or role with addressed_to."
+  input_schema:
+    properties:
+      addressed_to:
+        description: Only posts addressed to this participant id or role
+        type: string
+      limit:
+        description: Maximum posts to return (the most recent ones); default 50
+        maximum: 500
+        minimum: 1
+        type: integer
+    type: object
+  name: board.read
+- description: "Release a work unit you previously claimed with board.claim, so another participant can take it."
+  input_schema:
+    properties:
+      work_unit:
+        description: Identifier of the claimed unit of work to release
+        type: string
+    required:
+      - work_unit
+    type: object
+  name: board.release
+- description: "Lift a standing directive: pass the `id` that `board.directive` returned (it is also shown in brackets on each standing directive you see each turn). Units stop seeing it from their next turn. An unknown or already retracted id is reported and changes nothing."
+  input_schema:
+    properties:
+      id:
+        description: "The `id` `board.directive` returned for the directive to lift"
+        type: string
+    required:
+      - id
+    type: object
+  name: board.retract
+- description: "Re-check the run's budget against what it has spent right now: the lead's own and every unit's usage so far, read fresh. `stage` is `ok`, `soft` (a dimension crossed its soft threshold: converge) or `hard` (a cap is reached and the run stops at the next round check; `tripped` names the dimension). Each dimension the flow sets is reported with its `cap`, what it has used (`spent` for `usd` / `tokens`, `elapsed` rounds completed before this one or `elapsed_secs` for `wall_clock`), what is `remaining` and its own `state`. A `usd` cap nothing can price carries `enforced: false` and a note. `{budget: null}` when the flow sets no budget."
+  input_schema:
+    properties: {}
+    type: object
+  name: budget.status
+- description: "Search the agent and workflow catalog: a case-insensitive substring match over agent name/description and workflow id/name/description. Each hit is tagged kind=agent|workflow. `warnings` is present when part of the catalog could not be read."
+  input_schema:
+    properties:
+      query:
+        description: Substring to look for (case-insensitive)
+        type: string
+    required:
+      - query
+    type: object
+  name: catalog.search
+- description: "Start a pool agent as an independent unit working on a prompt, in its own process. Returns a handle immediately without waiting; pass it to `join` to wait for the unit's result. Only agents in the flow's pool can be dispatched."
+  input_schema:
+    properties:
+      agent:
+        description: Name of a pool agent to run
+        type: string
+      prompt:
+        description: "The unit's task: what to do and what to report back"
+        type: string
+    required:
+      - agent
+      - prompt
+    type: object
+  name: dispatch
+- description: "Record a security or quality finding in this project's ledger. Returns the generated finding id (use it in coverage.mark calls and in another finding's cross_references). Under the full profile send a complete `report`; a rejected call lists every problem to fix."
+  input_schema:
+    properties:
+      asset:
+        description: "The engagement asset this finding is about (only under an active engagement profile). Its `kind` routes the finding to the owning profile for completeness validation and stamps it into the asset graph. Omit on a plain code run."
+        properties:
+          coordinates:
+            description: "Locator coordinates pinning the asset, each {\"t\": <tag>, \"v\": <value>}. Tags: host, port, url, path, line_range, symbol, sha256, address, offset, commit, http_route, param, resource_id."
+            items:
+              type: object
+            type: array
+          kind:
+            description: "Profile-namespaced asset kind, e.g. \"network:service\", \"binary:function\", \"web:route\"."
+            type: string
+          label:
+            description: "Optional human label; if omitted, the asset keeps its existing label (a new asset is labelled with its kind)."
+            type: string
+        required:
+          - kind
+        type: object
+      concern_id:
+        description: "Concern ID this finding relates to, if known."
+        type: string
+      file_path:
+        description: "Workspace-relative path of the affected file, if applicable."
+        type: string
+      line_range:
+        description: "Line range [start, end] within the file, if applicable."
+        items:
+          type: integer
+        maxItems: 2
+        minItems: 2
+        type: array
+      report:
+        description: "A complete security finding report, recorded once by the agent. Presentations and exports (Markdown, HTML, PDF) are generated from this report, so no separate report file is written. When information genuinely cannot be determined use the field's sentinel instead of omitting it: 'Unknown', 'Not Applicable', 'None Provided', 'None', or 'Not Provided — <justification>' as each field describes."
+        properties:
+          artifacts:
+            description: "Proof-of-concept files (scripts, outputs, harnesses) as workspace-relative paths; rupu stores them with the finding. Supply only 'path'."
+            items:
+              properties:
+                path:
+                  type: string
+              required:
+                - path
+              type: object
+            type: array
+          attack_vector:
+            description: "How the surface is reached, including authentication or user interaction required, or 'Unknown'."
+            type: string
+          blocks:
+            description: "Typed evidence blocks (engagement profiles): each an object with a 'kind' tag and that kind's fields, e.g. {\"kind\":\"scan_output\",\"tool\":\"nmap\",\"output\":\"...\"} or {\"kind\":\"http_exchange\",\"request\":\"...\",\"response\":\"...\"}. Optional; additive to 'evidence'."
+            items:
+              properties:
+                kind:
+                  enum:
+                    - text
+                    - code_slice
+                    - diff
+                    - table
+                    - image
+                    - hexdump
+                    - disasm
+                    - decompile
+                    - http_exchange
+                    - scan_output
+                    - pcap_ref
+                  type: string
+              required:
+                - kind
+              type: object
+            type: array
+          call_chain:
+            anyOf:
+              - items:
+                  properties:
+                    binary_va:
+                      description: binary@VA for binary-only targets.
+                      type: string
+                    file:
+                      description: Workspace-relative path.
+                      type: string
+                    gate:
+                      description: Precondition crossed at this hop.
+                      type: string
+                    label:
+                      description: Function or surface name.
+                      type: string
+                    lines:
+                      items:
+                        type: integer
+                      maxItems: 2
+                      minItems: 2
+                      type: array
+                    passes_because:
+                      description: Why the gate passes.
+                      type: string
+                    role:
+                      enum:
+                        - source
+                        - hop
+                        - sink
+                      type: string
+                  required:
+                    - label
+                    - role
+                  type: object
+                minItems: 1
+                type: array
+              - type: string
+            description: "Ordered path from the externally reachable entry point to the sink, or 'Not Provided — <justification>'."
+          category:
+            type: string
+          ci_cd_detection:
+            anyOf:
+              - properties:
+                  body:
+                    description: "Markdown. The rule or test, verbatim."
+                    type: string
+                  command:
+                    type: string
+                  expect:
+                    description: The failing signal.
+                    type: string
+                  stage:
+                    description: pre-merge / nightly / release gate.
+                    type: string
+                required:
+                  - stage
+                  - body
+                  - expect
+                type: object
+              - type: string
+            description: "A pipeline check that fails the build when this class of issue is present, or 'Not Provided — <justification>'."
+          classifications:
+            description: "Classifications across taxonomies (engagement profiles), e.g. {\"system\":\"CVE\",\"id\":\"CVE-2024-1234\"} or {\"system\":\"ATT&CK\",\"id\":\"T1190\"}. Optional; additive to 'cwe'."
+            items:
+              properties:
+                id:
+                  type: string
+                system:
+                  type: string
+                vector:
+                  type: string
+              required:
+                - system
+                - id
+              type: object
+            type: array
+          cross_references:
+            anyOf:
+              - enum:
+                  - None
+                type: string
+              - items:
+                  properties:
+                    finding_id:
+                      type: string
+                    note:
+                      type: string
+                    relation:
+                      enum:
+                        - duplicate
+                        - sibling
+                        - prerequisite
+                        - supersedes
+                      type: string
+                  required:
+                    - finding_id
+                    - relation
+                  type: object
+                minItems: 1
+                type: array
+            description: "'None', or related findings by the fnd_ id a previous report_finding call returned."
+          cwe:
+            description: "CWE ids, e.g. ['CWE-306']. May be empty."
+            items:
+              type: string
+            type: array
+          description:
+            description: "Markdown. What the issue is, where it occurs, why it is a weakness."
+            type: string
+          evidence:
+            description: "Minimal annotated proof, one claim per entry."
+            items:
+              properties:
+                artifact:
+                  description: Path of an entry in artifacts that proves this claim.
+                  type: string
+                binary_va:
+                  type: string
+                claim:
+                  type: string
+                excerpt:
+                  description: Only the lines that matter.
+                  type: string
+                file:
+                  description: Workspace-relative path.
+                  type: string
+                lang:
+                  description: "Language for highlighting, e.g. 'c', 'sh'."
+                  type: string
+                lines:
+                  items:
+                    type: integer
+                  maxItems: 2
+                  minItems: 2
+                  type: array
+              required:
+                - claim
+              type: object
+            minItems: 1
+            type: array
+          impact:
+            description: Markdown. What an attacker could achieve and why it matters.
+            type: string
+          location:
+            properties:
+              input:
+                description: "Markdown. Input surface, endpoint, parameter, or feature."
+                type: string
+              output:
+                description: "Markdown. Affected area, response, or downstream system."
+                type: string
+            required:
+              - input
+              - output
+            type: object
+          ownership:
+            properties:
+              affected_component:
+                description: "Exact feature/endpoint/module, or 'Unknown'."
+                type: string
+              owner:
+                description: "Accountable team/service owner, or 'Unknown'. Never invent one."
+                type: string
+              product:
+                description: "Named application/platform/service, or 'Unknown'."
+                type: string
+              source_repository:
+                description: "Canonical repository (optionally with a path), 'Not Applicable' when no source-controlled code is involved, or 'Unknown'."
+                type: string
+            required:
+              - owner
+              - product
+              - affected_component
+              - source_repository
+            type: object
+          rating:
+            properties:
+              cvss_v3:
+                description: "Base score, optionally with the vector string, or 'Unknown'. Never invent a score."
+                type: string
+              impact:
+                enum:
+                  - Low
+                  - Medium
+                  - High
+                  - Critical
+                type: string
+              likelihood:
+                enum:
+                  - Low
+                  - Medium
+                  - High
+                type: string
+              risk_factor:
+                enum:
+                  - Low
+                  - Medium
+                  - High
+                  - Critical
+                type: string
+              risk_rating:
+                description: "Drives the finding's severity."
+                enum:
+                  - Low
+                  - Medium
+                  - High
+                  - Critical
+                type: string
+            required:
+              - impact
+              - likelihood
+              - risk_rating
+              - risk_factor
+              - cvss_v3
+            type: object
+          recommended_patch:
+            anyOf:
+              - properties:
+                  diff:
+                    type: string
+                  notes:
+                    description: Markdown. Alternatives or the equivalent source-level change.
+                    type: string
+                required:
+                  - diff
+                type: object
+              - type: string
+            description: "Minimal unified diff against the source repository (or a binary@VA pseudo-diff), or 'Not Provided — <justification>'."
+          references:
+            description: "Markdown. CWE, OWASP category, control references, related tickets."
+            type: string
+          regression_test:
+            anyOf:
+              - properties:
+                  body:
+                    type: string
+                  command:
+                    type: string
+                  expect_patched:
+                    type: string
+                  expect_vulnerable:
+                    type: string
+                required:
+                  - body
+                  - command
+                  - expect_vulnerable
+                  - expect_patched
+                type: object
+              - type: string
+            description: "A deterministic test that fails on the vulnerable build and passes on the patched one, or 'Not Provided — <justification>'."
+          remediation:
+            description: Markdown. Specific corrective actions.
+            type: string
+          replication_steps:
+            description: "Sequential, reproducible steps with exact payloads and commands."
+            items:
+              type: string
+            minItems: 1
+            type: array
+          root_cause:
+            description: "Markdown, one or two sentences. The single underlying defect, naming the exact variable, check, or assumption that is wrong — not the symptom."
+            type: string
+          tickets:
+            anyOf:
+              - enum:
+                  - None Provided
+                  - Unknown
+                type: string
+              - items:
+                  properties:
+                    identifier:
+                      type: string
+                    notes:
+                      type: string
+                    type:
+                      description: Jira / Bug / Remediation Tracker / Vulnerability Management / Other.
+                      type: string
+                    url:
+                      type: string
+                  required:
+                    - type
+                    - identifier
+                  type: object
+                minItems: 1
+                type: array
+            description: "'None Provided' when no existing ticket is mentioned, 'Unknown' when one exists but its id is not given, or the tickets present in the evidence. Never invent a ticket."
+          title:
+            description: Short title specific to the vulnerable feature and target.
+            type: string
+        required:
+          - title
+          - ownership
+          - tickets
+          - rating
+          - category
+          - attack_vector
+          - cwe
+          - description
+          - impact
+          - location
+          - root_cause
+          - call_chain
+          - evidence
+          - remediation
+          - recommended_patch
+          - ci_cd_detection
+          - regression_test
+          - replication_steps
+          - cross_references
+          - references
+        title: rupu finding report
+        type: object
+      scope:
+        description: "What the finding is about. Code scopes: 'line' (needs file_path + line_range), 'file' (needs file_path), 'repo' (the project as a whole). Target scopes, each needing target_ref: 'host' (a machine or IP), 'endpoint' (a specific service URL), 'resource' (a cloud resource by its own id). Pick the narrowest scope the evidence actually supports - claiming a whole host for a defect on one endpoint overstates it."
+        enum:
+          - line
+          - file
+          - repo
+          - host
+          - endpoint
+          - resource
+        type: string
+      tags:
+        description: "Free-form tags: lowercase a-z, 0-9 and . _ : / -, starting with a letter or digit, e.g. class:sqli, needs-poc. Reuse tags already in use where they fit (findings.query lists them)."
+        items:
+          type: string
+        maxItems: 32
+        type: array
+      target_ref:
+        description: "What this finding is about when it is not a file: a host or IP (host), a URL (endpoint), or a cloud resource id such as an OCID/ARN/URN (resource). Required for those three scopes."
+        type: string
+    required:
+      - scope
+      - report
+    type: object
+  name: findings.report
+- description: "Re-check the engagement coverage target against the pooled assets right now. `reach` is the required fraction and `depth` the rung assets must have reached (null: the ladder's terminal rung); `fraction` is what has been reached so far, `satisfied` whether it meets `reach`, `per_kind` the per-asset-kind fractions. `{coverage: null}` when the flow sets no coverage target."
+  input_schema:
+    properties: {}
+    type: object
+  name: goal.coverage
+- description: "Re-check every goal against the pooled evidence right now (findings and assets banked since the round began count). Each goal reports `satisfied`, its `current`/`target` tally and a one-line `detail`; a goal that could not be evaluated carries an `error` instead. A findings goal that requires verification also reports in `detail` how many findings match it and how many of those are independently verified, and names the agent that must verify the rest (dispatch it)."
+  input_schema:
+    properties: {}
+    type: object
+  name: goal.status
+- description: "Wait for a dispatched unit to finish and return its result. Reports status `done` (with the unit's output and whether it succeeded), `failed`, or `running` / `pending` if it has not finished within the timeout (join again to keep waiting)."
+  input_schema:
+    properties:
+      handle:
+        description: "The handle `dispatch` returned"
+        type: string
+      timeout_secs:
+        description: "How long to wait, in seconds; default 300"
+        maximum: 3600
+        minimum: 0
+        type: integer
+    required:
+      - handle
+    type: object
+  name: join
+- description: "Send a message. `to` is a participant id, a role, \"parent\", or \"lead\" (delivered to exactly that inbox), or \"broadcast\" (every participant sees it once, from the moment it started listening; the broadcast log is capped per run, so don't spam it)."
+  input_schema:
+    properties:
+      body:
+        type: string
+      to:
+        description: "Recipient inbox: participant id, role, parent, lead or broadcast"
+        type: string
+    required:
+      - to
+      - body
+    type: object
+  name: msg.send
+- description: "Read a file from the workspace and return its contents prefixed by 1-based line numbers separated by tabs. Always use this before editing a file so you have current line numbers. Paths are relative to the workspace root; absolute paths and paths that escape the workspace (e.g. `../`) are rejected."
+  input_schema:
+    properties:
+      path:
+        description: "Path relative to the workspace root, e.g. `src/lib.rs` or `tests/foo.rs`."
+        type: string
+    required:
+      - path
+    type: object
+  name: read_file
+- description: "Start a pool workflow as an independent unit, in its own process. Returns a handle immediately without waiting; pass it to `join` to wait for the workflow's result. Only workflows in the flow's pool can be started, and only if every agent they dispatch is also in the pool. Workflows with an approval gate or a host / distribute placement cannot be run as a unit."
+  input_schema:
+    properties:
+      inputs:
+        additionalProperties:
+          type:
+            - string
+            - number
+            - boolean
+        description: "The workflow's declared inputs, as name: value pairs"
+        type: object
+      workflow:
+        description: Id of a pool workflow to run
+        type: string
+    required:
+      - workflow
+    type: object
+  name: run_workflow
+- description: "Author a NEW workflow for a described task and run it as an independent unit, in its own process. Returns a handle immediately without waiting; pass it to `join` to wait for the workflow's result. The workflow may only dispatch agents in this flow's pool; it runs unattended (no approval gates, no remote placement)."
+  input_schema:
+    properties:
+      description:
+        description: "What the workflow should do, in plain language"
+        type: string
+      inputs:
+        additionalProperties:
+          type:
+            - string
+            - number
+            - boolean
+        description: "Values for any inputs the generated workflow declares, as name: value pairs"
+        type: object
+    required:
+      - description
+    type: object
+  name: workflows.generate
+- description: "Get one workflow's summary by its `id` (the runnable file stem workflows.list shows, not the declared name): description, scope, declared inputs, step count."
+  input_schema:
+    properties:
+      id:
+        description: "The workflow's id, as workflows.list shows it"
+        type: string
+    required:
+      - id
+    type: object
+  name: workflows.get
+- description: "List the workflows you can run (global and project). `id` is the runnable identifier (the file stem); `name` is the declared display name. A workflow that failed to parse is listed with its parse_error."
+  input_schema:
+    properties: {}
+    type: object
+  name: workflows.list

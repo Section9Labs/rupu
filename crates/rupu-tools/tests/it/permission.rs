@@ -26,6 +26,7 @@ static TOOL_A: ToolDescriptor = ToolDescriptor {
     effect: Effect::Write,
     needs: &[],
     uses: &[],
+    wildcard: true,
     description: "a",
     input_schema: schema,
 };
@@ -36,6 +37,7 @@ static TOOL_B: ToolDescriptor = ToolDescriptor {
     effect: Effect::Write,
     needs: &[],
     uses: &[],
+    wildcard: true,
     description: "b",
     input_schema: schema,
 };

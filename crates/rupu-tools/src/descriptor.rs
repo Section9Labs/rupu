@@ -144,6 +144,13 @@ pub struct ToolDescriptor {
     /// otherwise (`read_file` emits coverage touches, `bash` reports flows to
     /// netflow). Never a reason to withhold the tool.
     pub uses: &'static [Service],
+    /// Whether `*` in a `tools:` list grants this tool. `false` for the
+    /// authority tools — the ones that let one agent direct others
+    /// (`board.directive`, `board.retract`): those are granted only by their
+    /// exact name, an alias, their own `ns.*`, or an origin / ambient grant,
+    /// so authority is always a deliberate, readable act in the agent file
+    /// (D22).
+    pub wildcard: bool,
     pub description: &'static str,
     /// The input JSON Schema. A tool whose schema depends on its run (the
     /// findings profile picks `findings.report`'s) overrides

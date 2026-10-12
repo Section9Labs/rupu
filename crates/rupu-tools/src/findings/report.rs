@@ -21,6 +21,7 @@ pub static DESCRIPTOR: ToolDescriptor = ToolDescriptor {
     effect: Effect::Record,
     needs: &[Service::Findings],
     uses: &[],
+    wildcard: true,
     description: "Record a security or quality finding in this project's ledger. Returns the \
      generated finding id (use it in coverage.mark calls and in another finding's \
      cross_references). Under the full profile send a complete `report`; a rejected \

@@ -42,6 +42,7 @@ pub static MARK: ToolDescriptor = ToolDescriptor {
     effect: Effect::Record,
     needs: &[Service::Coverage],
     uses: &[],
+    wildcard: true,
     description: "Record a coverage assertion for a (concern_id, file_path) pair. \
      Status must be one of: clean | finding | not_applicable. \
      The file must have been read at the required min_strength first, \
@@ -125,6 +126,7 @@ pub static STATUS: ToolDescriptor = ToolDescriptor {
     effect: Effect::Read,
     needs: &[Service::Coverage],
     uses: &[],
+    wildcard: true,
     description: "Query existing coverage assertions. Optionally filter by concern_id, \
      file_path_prefix, or since timestamp. Returns a JSON array of assertion records.",
     input_schema: status_schema,
@@ -177,6 +179,7 @@ pub static REMAINING: ToolDescriptor = ToolDescriptor {
     effect: Effect::Read,
     needs: &[Service::Coverage],
     uses: &[],
+    wildcard: true,
     description: "List (concern_id, file_path) pairs that have been touched but not yet \
      asserted. Optionally filter by concern_id or min_strength. \
      Use this to discover what still needs coverage.mark calls.",
@@ -226,6 +229,7 @@ pub static CONCERNS_SEARCH: ToolDescriptor = ToolDescriptor {
     effect: Effect::Read,
     needs: &[Service::Coverage],
     uses: &[],
+    wildcard: true,
     description: "Search the concern catalog by substring and/or filter. Returns up to `limit` \
 matching concerns in summary form (id, name, severity, summary) by default, or full \
 form if `form: 'full'`. Use when the catalog is too large to inline in the prompt.",
@@ -288,6 +292,7 @@ pub static CONCERNS_DETAIL: ToolDescriptor = ToolDescriptor {
     effect: Effect::Read,
     needs: &[Service::Coverage],
     uses: &[],
+    wildcard: true,
     description: "Fetch full concern records by id. Use after coverage.concerns.search finds a \
 relevant concern and you need its full description, applicable_globs, or references.",
     input_schema: concerns_detail_schema,

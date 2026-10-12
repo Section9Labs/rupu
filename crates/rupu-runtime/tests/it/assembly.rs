@@ -136,6 +136,7 @@ struct Derived {
     net_capture: bool,
     scm: bool,
     dispatcher: bool,
+    catalog: bool,
     customer: Option<String>,
     output_tokens: Option<u32>,
     context_window: Option<String>,
@@ -145,6 +146,9 @@ struct Derived {
     admission: bool,
     grant_offers_dispatch_agent: bool,
     grant_offers_issues_create: bool,
+    grant_offers_agents_list: bool,
+    /// The origin's own grant (W5 §3.4): its reason and tools.
+    origin_grant: Option<String>,
     narrowed: Vec<String>,
 }
 
@@ -181,6 +185,7 @@ fn derived(home: &Home, origin: &Origin, run: &AssembledRun) -> Derived {
         net_capture: s.net_capture.is_some(),
         scm: s.scm.is_some(),
         dispatcher: s.dispatcher.is_some(),
+        catalog: s.catalog.is_some(),
         customer: s.customer.clone(),
         output_tokens: o.limits.output.tokens,
         context_window: o.pins.context_window.map(|c| format!("{c:?}")),
@@ -190,6 +195,10 @@ fn derived(home: &Home, origin: &Origin, run: &AssembledRun) -> Derived {
         admission: defaults_for(origin).admission,
         grant_offers_dispatch_agent: o.grant.offers("dispatch_agent"),
         grant_offers_issues_create: o.grant.offers("issues.create"),
+        grant_offers_agents_list: o.grant.offers("agents.list"),
+        origin_grant: defaults_for(origin)
+            .origin_grant
+            .map(|g| format!("{}: {}", g.reason, g.tools.join(" "))),
         narrowed: o.grant.narrowed.iter().map(|n| n.to_string()).collect(),
     }
 }
@@ -249,6 +258,74 @@ async fn origin_matrix() {
         let _m = MockScript::set(DONE);
         let run = assembler.assemble(l).await.expect("assembles");
         rows.insert(name, derived(&home, &origin, &run));
+    }
+    insta::assert_yaml_snapshot!(rows);
+}
+
+/// W5 §3.3a / D22: a `tools: ["*"]` agent resolved under every origin, with
+/// the services that origin's owner provides (a lead: its bus and status; a
+/// fleet unit: its bus; every site: the catalog). `*` grants the roster tools
+/// wherever the catalog is provided, and never the authority tools — the
+/// lead holds `board.directive` / `board.retract` only through its origin
+/// grant.
+#[tokio::test]
+#[serial]
+async fn star_parity_per_origin() {
+    let home = Home::new();
+    let assembler = RunAssembler::new(home.context(config()));
+    let spec = agent(
+        &home,
+        "provider: anthropic\nmodel: claude-sonnet-4-6\ntools: [\"*\"]",
+    );
+    let flow_dir = home.global().join("agentiflows").join("af_1");
+    let mut rows = std::collections::BTreeMap::new();
+    for (name, origin) in origins(&home) {
+        let mut l = launch(&home, spec.clone(), origin.clone(), &format!("run_{name}"));
+        l.services.dispatcher = Some(Arc::new(NoDispatch));
+        match &origin {
+            Origin::FlowLead { .. } => {
+                l.services.message_bus =
+                    Some(Arc::new(rupu_fleet::Bus::for_run_dir(&flow_dir, "lead")));
+                l.services.run_status = Some(Arc::new(crate::support::NoStatus));
+            }
+            Origin::FlowUnit { participant, .. } => {
+                l.services.message_bus = Some(Arc::new(rupu_fleet::Bus::for_run_dir(
+                    &flow_dir,
+                    participant.clone(),
+                )));
+            }
+            _ => {}
+        }
+        let _m = MockScript::set(DONE);
+        let run = assembler.assemble(l).await.expect("assembles");
+        let grant = &run.opts.grant;
+        for authority in ["board.directive", "board.retract"] {
+            if let Some(e) = grant.entry(authority) {
+                assert!(
+                    matches!(origin, Origin::FlowLead { .. }),
+                    "{name}: `*` must never grant {authority}"
+                );
+                assert_eq!(e.reasons_string(), "origin:flow_lead", "{name}");
+            }
+        }
+        for roster in [
+            "agents.list",
+            "agents.get",
+            "workflows.list",
+            "workflows.get",
+            "catalog.search",
+        ] {
+            assert!(
+                grant.offers(roster),
+                "{name}: `*` with a catalog grants {roster}"
+            );
+        }
+        let entries: std::collections::BTreeMap<String, String> = grant
+            .entries
+            .values()
+            .map(|e| (e.canonical.to_string(), e.reasons_string()))
+            .collect();
+        rows.insert(name, entries);
     }
     insta::assert_yaml_snapshot!(rows);
 }

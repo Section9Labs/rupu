@@ -1577,8 +1577,8 @@ pub struct AgentRunOpts {
     /// Pre-built, run-scoped tools injected into this run: an ambient grant
     /// with reason `origin:injected` (already in `grant`), audited like any
     /// tool; the `PermissionPolicy` still gates each call. Empty for
-    /// ordinary runs; the agentiflow envelope uses it for its
-    /// board/mailbox/dispatch tools until W5 moves them into the catalog.
+    /// ordinary runs; an agentiflow lead's launch tools (`dispatch`, `join`,
+    /// `run_workflow`, `workflows.generate`) ride it until W7 replaces them.
     pub extra_tools: Vec<std::sync::Arc<dyn rupu_tools::Tool>>,
     pub transcript_path: PathBuf,
 }
@@ -1972,7 +1972,7 @@ async fn run_agent_inner(
 
     // The run's tool registry: one loop over the grant. Each entry takes its
     // body from an injected tool or the catalog (`rupu_tools::bodies`); the
-    // agentiflow tools reach a run only injected until W5.
+    // agentiflow launch tools reach a run only injected until W7.
     let mut registry = ToolRegistry::with_alias_scope(opts.alias_scope);
     for entry in grant.entries.values() {
         let name = entry.canonical;
@@ -3764,6 +3764,7 @@ mod on_tool_call_tests {
             effect: rupu_tools::Effect::Read,
             needs: &[],
             uses: &[],
+            wildcard: true,
             description: "returns pong",
             input_schema: ping_schema,
         };
