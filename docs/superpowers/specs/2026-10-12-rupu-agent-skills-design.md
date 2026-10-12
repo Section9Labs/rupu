@@ -180,6 +180,8 @@ pub struct GrantedSkill {
 
 The skills service (`ToolServices.skills: Option<Arc<ResolvedSkills>>`, `Service::Skills`, with its arm in `ToolServices::provided`) is present when `entries` is non-empty. `AmbientGrant::skills()` then offers `skills.load` as `Ambient("skills")`. An agent with no skills gets no loader tool and no index. `actions:` never narrows it, since it is not a connector tool.
 
+The assembler resolves `skills:` and `preloadSkills:` (and step skills) in ONE `resolve_grants` call over their union and marks preload by membership, so `skills: [global:x]` with `preloadSkills: [project:x]` is caught as binding `x` twice.
+
 ## 3. What the model sees
 
 ### 3.1 The index
@@ -342,14 +344,16 @@ Each install writes `<layer>/skills/.sources/<name>.json`, outside the skill's o
 
 ```json
 { "version": 1, "source": "anthropics/skills", "url": "https://github.com/anthropics/skills",
-  "ref": null, "path": "skills/pdf", "commit": "<sha>", "content_hash": "<sha256>", "installed_at": 1792000000 }
+  "path": "skills/pdf", "commit": "<sha>", "content_hash": "<sha256>", "installed_at": 1792000000 }
 ```
+
+An absent optional key is omitted, never written as `null`: this install named no `--ref`, so the record has no `ref`.
 
 A local install records `"local": "<canonical dir>"` instead of `url`/`ref`/`commit`. Project-layer records live in the repository, so a cloned repo could plant one; `update` therefore refuses a project record whose `path` leaves its clone or whose `local` is outside the project. For the same reason, a project-layer install from a local directory outside the project writes no record: the skill is installed untracked, the CLI says so, and `update` reports `no source record`.
 
-`update` trusts no record field. A recorded `path` must pass the same rules as `#<path>` and must resolve, through any symlink, inside the clone. A project-layer record's `local` must resolve inside the project: project records are files a repository can carry, and one naming `~/anything` would copy that directory into the project. A failed check fails that skill's update.
+`update` trusts no record field. A recorded `path` must pass the same rules as `#<path>` and must resolve, through any symlink, inside the clone. A project-layer record's `local` must resolve inside the project: project records are files a repository can carry, and one naming `~/anything` would copy that directory into the project. A failed check fails that skill's update. A requested name that is not a valid skill name fails before `update` touches the filesystem, and `--all` skips a `.sources/` file whose stem is not one.
 
-`update` re-fetches each named skill (`--all`: every skill in the layer with a record), clones each `(url, ref)` once, finds the skill at its recorded `path` (falling back to a search by name if the repo moved it) and replaces it. A skill installed at a pinned `--ref` stays on that ref; moving it is a new `install --ref`. Results per skill: `updated <old>→<new>`, `up to date`, `no source record`, or `locally modified`. The last is a skill whose current content hash differs from its record's, meaning someone edited the installed copy; `update` refuses it without `--force`.
+`update` re-fetches each named skill (`--all`: every skill in the layer with a record), clones each `(url, ref)` once, finds the skill at its recorded `path` (falling back to a search by name if the repo moved it) and replaces it. A skill installed at a pinned `--ref` stays on that ref; moving it is a new `install --ref`. Results per skill: `updated <old> → <new>`, `up to date`, `no source record`, or `locally modified`. The last is a skill whose current content hash differs from its record's, meaning someone edited the installed copy; `update` refuses it without `--force`.
 
 ## 8. Control plane
 
