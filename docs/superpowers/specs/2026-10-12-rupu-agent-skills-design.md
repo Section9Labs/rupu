@@ -345,7 +345,7 @@ Each install writes `<layer>/skills/.sources/<name>.json`, outside the skill's o
   "ref": null, "path": "skills/pdf", "commit": "<sha>", "content_hash": "<sha256>", "installed_at": 1792000000 }
 ```
 
-A local install records `"local": "<canonical dir>"` instead of `url`/`ref`/`commit`.
+A local install records `"local": "<canonical dir>"` instead of `url`/`ref`/`commit`. Project-layer records live in the repository, so a cloned repo could plant one; `update` therefore refuses a project record whose `path` leaves its clone or whose `local` is outside the project. For the same reason, a project-layer install from a local directory outside the project writes no record: the skill is installed untracked, the CLI says so, and `update` reports `no source record`.
 
 `update` trusts no record field. A recorded `path` must pass the same rules as `#<path>` and must resolve, through any symlink, inside the clone. A project-layer record's `local` must resolve inside the project: project records are files a repository can carry, and one naming `~/anything` would copy that directory into the project. A failed check fails that skill's update.
 
