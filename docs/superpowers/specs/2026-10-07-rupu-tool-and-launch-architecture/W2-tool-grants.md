@@ -36,7 +36,7 @@ A `tools:` entry is one of:
 | `report_finding`, `dispatch_agent`, … | an alias, resolved to its canonical tool |
 | `findings.*`, `scm.*`, `board.*` | every catalog tool in that namespace (prefix up to a `.`) |
 | `core.*` | the unqualified core tools (`bash`, `read_file`, `write_file`, `edit_file`, `grep`, `glob`, `ast_grep`) |
-| `*` | the whole catalog |
+| `*` | the whole catalog **except tools whose descriptor says `wildcard: false`** (D22: authority tools such as `board.directive` / `board.retract`; these need their exact name, an alias, their `ns.*`, or an origin grant) |
 | anything else | **load error** (D8): `unknown tool "repot_finding" in tools: (did you mean "report_finding" → findings.report?)` |
 
 **Omitted `tools:`** resolves to `DEFAULT_GRANT`, which reproduces today's no-list behaviour: `core.*`, `dispatch`, `join`, `scm.*`, `issues.*`, `github.*`, `gitlab.*`. The constant lives in `rupu-tools/src/grant.rs`, with a comment that this is a compatibility default.
