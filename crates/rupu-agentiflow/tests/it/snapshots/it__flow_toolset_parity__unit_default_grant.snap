@@ -19,7 +19,7 @@ expression: "unit_toolset(\"\").await"
       - lang
     type: object
   name: ast_grep
-- description: "Execute a shell command in the workspace directory. The command runs with a controlled environment (PATH, HOME, USER, TERM, LANG plus a per-workspace allowlist). Default timeout 120 seconds, configurable per-call. Use this for compilation, tests, git operations, and anything else that needs a shell. The cwd is locked to the workspace path; cd outside the workspace will produce an error from the shell, not an escape."
+- description: "Execute a shell command with `/bin/sh -c`, starting in the workspace directory. The command runs with a controlled environment (PATH, HOME, USER, TERM, LANG plus a per-workspace allowlist). A command that runs past the run's timeout (120 seconds unless configured) is killed and returns an error. Use this for compilation, tests, git operations, and anything else that needs a shell."
   input_schema:
     properties:
       command:
