@@ -395,3 +395,78 @@ fn a_batch_that_fails_part_way_reports_what_landed() {
     assert!(home.path().join("skills/.sources/pdf.json").is_file());
     assert!(!home.path().join("skills/b-two").exists());
 }
+
+fn project_with_skill(skill_md: &str) -> (tempfile::TempDir, tempfile::TempDir) {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let dir = project.path().join(".rupu/skills/evil");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("SKILL.md"), skill_md).unwrap();
+    (home, project)
+}
+
+#[test]
+fn project_text_never_reaches_the_terminal_raw() {
+    let (home, project) = project_with_skill(
+        "---\nname: evil\ndescription: \"Hi \\e]0;pwned\\a there\"\n\
+         license: \"MIT\\e[2J\"\nmetadata:\n  \"k\\e[31m\": \"v\\a\"\n---\n\nBody.\n",
+    );
+    fs::write(
+        project.path().join(".rupu/skills/evil/run\x1b[1m.sh"),
+        "echo\n",
+    )
+    .unwrap();
+    for args in [
+        &["skill", "list"][..],
+        &["skill", "show", "evil"][..],
+        &["--format", "csv", "skill", "list"][..],
+    ] {
+        let out = ok(&rupu(home.path(), project.path(), args));
+        assert!(out.contains("pwned"), "{args:?}: {out}");
+        assert!(
+            !out.bytes().any(|b| b == 0x1b || b == 0x07),
+            "{args:?}: {out:?}"
+        );
+    }
+}
+
+#[test]
+fn show_survives_a_malformed_source_record() {
+    let (home, project) = project_with_skill("---\nname: evil\ndescription: Fine.\n---\n\nBody.\n");
+    let sources = project.path().join(".rupu/skills/.sources");
+    fs::create_dir_all(&sources).unwrap();
+    fs::write(sources.join("evil.json"), "{not json").unwrap();
+    let out = ok(&rupu(
+        home.path(),
+        project.path(),
+        &["skill", "show", "evil"],
+    ));
+    assert!(out.contains("  source:        unreadable ("), "{out}");
+    assert!(out.contains("  description:   Fine."), "{out}");
+}
+
+#[test]
+fn a_qualified_show_still_notes_the_other_layer() {
+    let (home, project) =
+        project_with_skill("---\nname: evil\ndescription: Project copy.\n---\n\nBody.\n");
+    let global = home.path().join("skills/evil");
+    fs::create_dir_all(&global).unwrap();
+    fs::write(
+        global.join("SKILL.md"),
+        "---\nname: evil\ndescription: Global copy.\n---\n\nBody.\n",
+    )
+    .unwrap();
+    let out = ok(&rupu(
+        home.path(),
+        project.path(),
+        &["skill", "show", "global:evil"],
+    ));
+    assert!(
+        out.starts_with(
+            "evil is installed in both layers; grant it as global:evil or project:evil.\n"
+        ),
+        "{out}"
+    );
+    assert!(out.contains("Global copy."), "{out}");
+    assert!(!out.contains("Project copy."), "{out}");
+}

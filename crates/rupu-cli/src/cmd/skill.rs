@@ -3,18 +3,19 @@
 //! `docs/superpowers/specs/2026-10-12-rupu-agent-skills-design.md` §7.
 
 use crate::output::formats::OutputFormat;
+use crate::output::printer::sanitize_terminal_text;
 use crate::output::report::{self, CollectionOutput};
 use clap::Subcommand;
 use rupu_skills::git::GitFetcher;
 use rupu_skills::install::{
     install_from, list_source, InstallError, InstallOutcome, InstallReport, InstallSpec, Selection,
 };
-use rupu_skills::record::read_record;
+use rupu_skills::record::{read_record, SourceRecord};
 use rupu_skills::tools_map::mapped_tools;
 use rupu_skills::update::{update_skills, UpdateOutcome};
 use rupu_skills::{parse_source, CatalogEntry, Layer, LayerDirs, SkillCatalog};
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[derive(Subcommand, Debug)]
@@ -114,46 +115,40 @@ pub async fn handle(action: Action, format: Option<OutputFormat>) -> ExitCode {
     match result {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::from(1),
-        Err(e) => crate::output::diag::fail(e),
+        Err(e) => crate::output::diag::fail(sanitize_terminal_text(&e.to_string())),
     }
 }
 
-struct Layers {
-    global: PathBuf,
-    project: Option<PathBuf>,
+/// Skill text comes from SKILL.md files, tree walks and source records a
+/// cloned repository can carry, so every line this command prints goes
+/// through the terminal sanitizer.
+fn say(line: &str) {
+    println!("{}", sanitize_terminal_text(line));
 }
 
-impl Layers {
-    fn skills_dir(&self, layer: Layer) -> anyhow::Result<PathBuf> {
-        match layer {
-            Layer::Global => Ok(self.global.join("skills")),
-            Layer::Project => self
-                .project
-                .as_ref()
-                .map(|p| p.join("skills"))
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "not inside a rupu project (no `.rupu/` found). Run `rupu init` first, \
-                         or omit --project to use ~/.rupu/skills."
-                    )
-                }),
-        }
-    }
+fn say_err(line: &str) {
+    eprintln!("{}", sanitize_terminal_text(line));
 }
 
-fn layers() -> anyhow::Result<Layers> {
+fn layers() -> anyhow::Result<LayerDirs> {
     let global = crate::paths::global_dir()?;
     let cwd = std::env::current_dir()?;
     let root = crate::paths::project_root_for(&cwd)?;
     let project = rupu_workspace::project_layer_dir(&global, root.as_deref());
-    Ok(Layers { global, project })
+    Ok(LayerDirs::for_layers(&global, project.as_deref()))
 }
 
-fn catalog(l: &Layers) -> anyhow::Result<SkillCatalog> {
-    Ok(SkillCatalog::discover(&LayerDirs {
-        global: Some(l.global.join("skills")),
-        project: l.project.as_ref().map(|p| p.join("skills")),
-    })?)
+fn skills_dir(dirs: &LayerDirs, layer: Layer) -> anyhow::Result<&Path> {
+    dirs.skills_dir(layer).ok_or_else(|| {
+        anyhow::anyhow!(
+            "not inside a rupu project (no `.rupu/` found). Run `rupu init` first, \
+             or omit --project to use ~/.rupu/skills."
+        )
+    })
+}
+
+fn catalog(dirs: &LayerDirs) -> anyhow::Result<SkillCatalog> {
+    Ok(SkillCatalog::discover(dirs)?)
 }
 
 fn layer_flag(project: bool) -> Layer {
@@ -182,8 +177,11 @@ struct SkillsReport {
     rows: Vec<SkillRow>,
 }
 
+/// `report` is what JSON emits (serde escapes control characters there);
+/// `display` is the same rows sanitized for the table and CSV.
 struct SkillsOutput {
     report: SkillsReport,
+    display: Vec<SkillRow>,
 }
 
 impl CollectionOutput for SkillsOutput {
@@ -199,13 +197,13 @@ impl CollectionOutput for SkillsOutput {
     }
 
     fn csv_rows(&self) -> &[Self::CsvRow] {
-        &self.report.rows
+        &self.display
     }
 
     fn render_table(&self) -> anyhow::Result<()> {
         let mut table = crate::output::tables::new_table();
         table.set_header(vec!["NAME", "LAYER", "STATUS", "SOURCE", "DESCRIPTION"]);
-        for r in &self.report.rows {
+        for r in &self.display {
             let detail = if r.status == "ok" {
                 &r.description
             } else {
@@ -235,6 +233,19 @@ fn skills_dir_of(e: &CatalogEntry) -> PathBuf {
     e.path.parent().map(PathBuf::from).unwrap_or_default()
 }
 
+impl SkillRow {
+    fn sanitized(&self) -> Self {
+        Self {
+            name: sanitize_terminal_text(&self.name),
+            description: sanitize_terminal_text(&self.description),
+            source: sanitize_terminal_text(&self.source),
+            error: sanitize_terminal_text(&self.error),
+            path: sanitize_terminal_text(&self.path),
+            ..self.clone()
+        }
+    }
+}
+
 fn row(e: &CatalogEntry) -> SkillRow {
     let (status, description, error) = match &e.skill {
         Ok(s) => ("ok", s.frontmatter.description.clone(), String::new()),
@@ -258,12 +269,13 @@ fn row(e: &CatalogEntry) -> SkillRow {
 
 fn list(project_only: bool, format: Option<OutputFormat>) -> anyhow::Result<()> {
     let cat = catalog(&layers()?)?;
-    let rows = cat
+    let rows: Vec<SkillRow> = cat
         .entries()
         .iter()
         .filter(|e| !project_only || e.layer == Layer::Project)
         .map(row)
         .collect();
+    let display = rows.iter().map(SkillRow::sanitized).collect();
     report::emit_collection(
         format,
         &SkillsOutput {
@@ -272,6 +284,7 @@ fn list(project_only: bool, format: Option<OutputFormat>) -> anyhow::Result<()> 
                 version: 1,
                 rows,
             },
+            display,
         },
     )
 }
@@ -290,77 +303,89 @@ fn select<'a>(cat: &'a SkillCatalog, name: &'a str) -> Vec<&'a CatalogEntry> {
 fn show(name: &str) -> anyhow::Result<()> {
     let cat = catalog(&layers()?)?;
     let found = select(&cat, name);
-    anyhow::ensure!(!found.is_empty(), "no installed skill named {name:?}");
-    if found.len() > 1 {
-        println!(
-            "{name} is installed in both layers; grant it as global:{name} or project:{name}.\n"
-        );
+    let Some(first) = found.first() else {
+        anyhow::bail!("no installed skill named {name:?}");
+    };
+    let bare = &first.dir_name;
+    if cat.named(bare).count() > 1 {
+        say(&format!(
+            "{bare} is installed in both layers; grant it as global:{bare} or project:{bare}.\n"
+        ));
     }
     for e in found {
-        println!("{} ({})", e.dir_name, e.layer.as_str());
-        println!("  path:          {}", e.path.display());
-        if let Some(rec) = read_record(&skills_dir_of(e), &e.dir_name)? {
-            let at = match (&rec.url, &rec.local) {
-                (Some(url), _) => format!(
-                    "{url}{}{} @ {}",
-                    rec.git_ref
-                        .as_deref()
-                        .map(|r| format!(" ref {r}"))
-                        .unwrap_or_default(),
-                    rec.path
-                        .as_deref()
-                        .map(|p| format!(" #{p}"))
-                        .unwrap_or_default(),
-                    rec.commit
-                        .as_deref()
-                        .map(|c| &c[..c.len().min(12)])
-                        .unwrap_or("?")
-                ),
-                (None, Some(dir)) => dir.display().to_string(),
-                (None, None) => "?".into(),
-            };
-            println!("  source:        {} ({at})", rec.source);
+        say(&format!("{} ({})", e.dir_name, e.layer.as_str()));
+        say(&format!("  path:          {}", e.path.display()));
+        match read_record(&skills_dir_of(e), &e.dir_name) {
+            Ok(Some(rec)) => say(&format!(
+                "  source:        {} ({})",
+                rec.source,
+                record_at(&rec)
+            )),
+            Ok(None) => {}
+            Err(err) => say(&format!("  source:        unreadable ({err})")),
         }
         let s = match &e.skill {
             Ok(s) => s,
             Err(err) => {
-                println!("  INVALID:       {err}\n");
+                say(&format!("  INVALID:       {err}\n"));
                 continue;
             }
         };
         let fm = &s.frontmatter;
         for w in &fm.warnings {
-            println!("  warning:       {w}");
+            say(&format!("  warning:       {w}"));
         }
-        println!("  description:   {}", fm.description);
+        say(&format!("  description:   {}", fm.description));
         if let Some(l) = &fm.license {
-            println!("  license:       {l}");
+            say(&format!("  license:       {l}"));
         }
         if let Some(c) = &fm.compatibility {
-            println!("  compatibility: {c}");
+            say(&format!("  compatibility: {c}"));
         }
         if !fm.allowed_tools.is_empty() {
-            println!(
+            say(&format!(
                 "  allowed-tools: {} (rupu: {}; informational, never a grant)",
                 fm.allowed_tools.join(" "),
                 mapped_tools(&fm.allowed_tools).join(", ")
-            );
+            ));
         }
         if fm.disable_model_invocation {
-            println!("  model invocation: disabled (preload or operator invocation only)");
+            say("  model invocation: disabled (preload or operator invocation only)");
         }
         for (k, v) in &fm.metadata {
-            println!("  metadata.{k}: {v}");
+            say(&format!("  metadata.{k}: {v}"));
         }
-        println!("  stamp:         {}", s.stamp.short());
-        println!("  content:       {}", s.content_hash()?.short());
-        println!("  files:");
+        say(&format!("  stamp:         {}", s.stamp.short()));
+        say(&format!("  content:       {}", s.content_hash()?.short()));
+        say("  files:");
         for f in s.files() {
-            println!("    {f}");
+            say(&format!("    {f}"));
         }
-        println!();
+        say("");
     }
     Ok(())
+}
+
+fn record_at(rec: &SourceRecord) -> String {
+    match (&rec.url, &rec.local) {
+        (Some(url), _) => format!(
+            "{url}{}{} @ {}",
+            rec.git_ref
+                .as_deref()
+                .map(|r| format!(" ref {r}"))
+                .unwrap_or_default(),
+            rec.path
+                .as_deref()
+                .map(|p| format!(" #{p}"))
+                .unwrap_or_default(),
+            rec.commit
+                .as_deref()
+                .map(|c| &c[..c.len().min(12)])
+                .unwrap_or("?")
+        ),
+        (None, Some(dir)) => dir.display().to_string(),
+        (None, None) => "?".into(),
+    }
 }
 
 fn validate(name: Option<&str>, all: bool) -> anyhow::Result<bool> {
@@ -379,14 +404,22 @@ fn validate(name: Option<&str>, all: bool) -> anyhow::Result<bool> {
     for e in entries {
         match &e.skill {
             Ok(s) => {
-                println!("ok       {} ({})", e.dir_name, e.layer.as_str());
+                say(&format!("ok       {} ({})", e.dir_name, e.layer.as_str()));
                 for w in &s.frontmatter.warnings {
-                    println!("warn     {} ({}): {w}", e.dir_name, e.layer.as_str());
+                    say(&format!(
+                        "warn     {} ({}): {w}",
+                        e.dir_name,
+                        e.layer.as_str()
+                    ));
                 }
             }
             Err(err) => {
                 ok = false;
-                println!("INVALID  {} ({}): {err}", e.dir_name, e.layer.as_str());
+                say(&format!(
+                    "INVALID  {} ({}): {err}",
+                    e.dir_name,
+                    e.layer.as_str()
+                ));
             }
         }
     }
@@ -411,18 +444,18 @@ fn install(
                 None => f.description.unwrap_or_default(),
             };
             let at = if f.rel.is_empty() { ".".into() } else { f.rel };
-            println!(
+            say(&format!(
                 "{:<28} {:<36} {}",
                 f.name,
                 at,
                 detail.chars().take(70).collect::<String>()
-            );
+            ));
         }
         return Ok(());
     }
-    let l = layers()?;
+    let dirs = layers()?;
     let layer = layer_flag(project);
-    let skills_dir = l.skills_dir(layer)?;
+    let skills_dir = skills_dir(&dirs, layer)?;
     let selection = if all {
         Selection::All
     } else if !skills.is_empty() {
@@ -435,7 +468,7 @@ fn install(
             source: &source,
             input,
             selection,
-            skills_dir: &skills_dir,
+            skills_dir,
             layer,
             force,
         },
@@ -460,21 +493,21 @@ fn print_report(report: &InstallReport, layer: Layer) {
             InstallOutcome::Created => "installed",
             InstallOutcome::Replaced => "replaced",
         };
-        println!(
+        say(&format!(
             "{verb} {} ({}) at {}",
             i.name,
             layer.as_str(),
             i.path.display()
-        );
+        ));
     }
     for name in &report.untracked {
-        println!(
+        say(&format!(
             "note: {name} is not tracked for update (its source is outside the project); \
              reinstall it to update"
-        );
+        ));
     }
     for (name, why) in &report.skipped {
-        eprintln!("skipped {name}: {why}");
+        say_err(&format!("skipped {name}: {why}"));
     }
 }
 
@@ -483,15 +516,15 @@ fn update(names: Vec<String>, all: bool, project: bool, force: bool) -> anyhow::
         all || !names.is_empty(),
         "name skills to update or pass --all"
     );
-    let l = layers()?;
+    let dirs = layers()?;
     let layer = layer_flag(project);
-    let skills_dir = l.skills_dir(layer)?;
-    let results = update_skills(&skills_dir, layer, &names, force, &GitFetcher);
+    let skills_dir = skills_dir(&dirs, layer)?;
+    let results = update_skills(skills_dir, layer, &names, force, &GitFetcher);
     if results.is_empty() {
-        println!(
+        say(&format!(
             "no installed skills with a source record in the {} layer",
             layer.as_str()
-        );
+        ));
     }
     let mut ok = true;
     for (name, outcome) in results {
@@ -514,7 +547,7 @@ fn update(names: Vec<String>, all: bool, project: bool, force: bool) -> anyhow::
                 format!("failed: {e}")
             }
         };
-        println!("{name}: {line}");
+        say(&format!("{name}: {line}"));
     }
     Ok(ok)
 }
