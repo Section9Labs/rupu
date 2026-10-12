@@ -321,6 +321,8 @@ Skills are published the way the rest of the ecosystem installs them (`npx skill
 
 `--ref <branch|tag|commit>` picks a ref; it conflicts with a different ref in a tree URL. Only `https://` is fetched (`ssh`, `git@` and `file://` are refused: a local checkout is a path). The fetch is libgit2: a shallow clone of the default branch, or a full clone checked out at `--ref`. libgit2 runs no hooks and does not touch submodules.
 
+A tree URL that names a path takes no `#<path>` as well. The scheme is matched case-insensitively. A URL carrying credentials (`https://user:token@…`) is refused without echoing it, since the source record would store the token; private repositories are not supported yet (an authentication failure says so), and the operator clones one and installs the directory. A `#<path>`, tree-URL path or recorded path is relative, has no `..`, root or drive prefix, and must resolve inside the clone after symlinks: a repository can commit `skills -> /anywhere`.
+
 ### 7.2 Finding and choosing skills
 
 Within the source (the repo root, or `<path>` inside it), every directory holding a `SKILL.md` is a skill. The search descends through hidden directories (`.claude/skills/`, `.agents/skills/`, plugin folders), skips `.git` and `node_modules`, stops at each skill it finds, and goes at most 6 levels deep. Two skills with the same directory name in one source is an error naming both paths; the operator narrows with `#<path>`.
@@ -328,6 +330,7 @@ Within the source (the repo root, or `<path>` inside it), every directory holdin
 - One skill found: it is installed.
 - Several found: `--skill <name>` (repeatable) picks, `--all` takes every valid one (invalid ones are reported and skipped), and without either the command lists them and installs nothing. `--list` lists without installing in any case.
 - An explicitly named skill that is invalid fails the install before anything is written.
+- An installed skill is named by its frontmatter `name`, whatever its directory is called in the source.
 
 Each install validates first, refuses to overwrite without `--force`, refuses a tree containing a symlink that leaves it or an absolute symlink, preserves file modes so scripts stay executable, and swaps by rename, so a failed install never damages an installed skill.
 
@@ -341,6 +344,8 @@ Each install writes `<layer>/skills/.sources/<name>.json`, outside the skill's o
 ```
 
 A local install records `"local": "<canonical dir>"` instead of `url`/`ref`/`commit`.
+
+`update` trusts no record field. A recorded `path` must pass the same rules as `#<path>` and must resolve, through any symlink, inside the clone. A project-layer record's `local` must resolve inside the project: project records are files a repository can carry, and one naming `~/anything` would copy that directory into the project. A failed check fails that skill's update.
 
 `update` re-fetches each named skill (`--all`: every skill in the layer with a record), clones each `(url, ref)` once, finds the skill at its recorded `path` (falling back to a search by name if the repo moved it) and replaces it. A skill installed at a pinned `--ref` stays on that ref; moving it is a new `install --ref`. Results per skill: `updated <old>→<new>`, `up to date`, `no source record`, or `locally modified`. The last is a skill whose current content hash differs from its record's, meaning someone edited the installed copy; `update` refuses it without `--force`.
 

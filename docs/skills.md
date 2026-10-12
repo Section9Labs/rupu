@@ -94,6 +94,12 @@ installed as a path. The fetch is a shallow clone of the default branch, or a
 full clone checked out at `--ref`. No git hooks run and submodules are not
 fetched.
 
+A tree URL that already names a path takes no `#<path>`. A path must stay
+inside the repository, symlinks included. Private repositories are not
+supported yet, and a URL with credentials in it (`https://user:token@…`) is
+refused so the token never lands in the source record: clone the repository
+yourself and install from the directory.
+
 rupu searches the source for every directory holding a `SKILL.md`, through
 hidden folders such as `.claude/skills/`, up to 6 levels deep, skipping `.git`
 and `node_modules`. Then:
@@ -149,6 +155,12 @@ once, and replaces the installed copy. It prints one line per skill:
 | `up to date` | the source matches what is installed |
 | `no source record` | the skill was copied in by hand; reinstall it to track a source |
 | `locally modified` | the installed copy no longer matches its record, so someone edited it; `--force` replaces the edits |
+
+If the repository moved the skill, `update` finds it by name and the record
+follows it. A recorded path that leaves the repository, directly or through a
+symlink, fails the update. In the project layer a record's local directory
+must be inside the project; one that points elsewhere fails, so a cloned
+repository cannot copy a directory from elsewhere on your machine into itself.
 
 A skill installed at a pinned `--ref` stays on that ref. Moving it is a new
 `rupu skill install --ref`. `update` exits 1 when any skill was locally

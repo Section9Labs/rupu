@@ -6,7 +6,7 @@
 use crate::install::{find_skills, install_one, source_hash};
 use crate::record::{list_records, now_secs, read_record, write_record, SourceRecord};
 use crate::skill::{load_skill, Layer};
-use crate::source::{Fetch, FetchedTree, GitSource};
+use crate::source::{resolve_inside, Fetch, FetchedTree, GitSource, SourceError};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -68,8 +68,13 @@ fn update_one(
         return Ok(UpdateOutcome::LocallyModified);
     }
 
-    let (source_dir, commit) = match (&rec.local, &rec.url) {
-        (Some(dir), _) => (dir.clone(), None),
+    let (source_dir, commit, path) = match (&rec.local, &rec.url) {
+        (Some(dir), _) => {
+            if layer == Layer::Project {
+                inside_project(skills_dir, dir)?;
+            }
+            (dir.clone(), None, rec.path.clone())
+        }
         (None, Some(url)) => {
             let key = (url.clone(), rec.git_ref.clone());
             let tree = trees.entry(key).or_insert_with(|| {
@@ -82,10 +87,8 @@ fn update_one(
                     .map_err(|e| e.to_string())
             });
             let tree = tree.as_ref().map_err(Clone::clone)?;
-            (
-                locate(&tree.root, rec.path.as_deref(), name)?,
-                tree.commit.clone(),
-            )
+            let (dir, path) = locate(&tree.root, rec.path.as_deref(), name)?;
+            (dir, tree.commit.clone(), path)
         }
         (None, None) => return Err("source record has neither url nor local".into()),
     };
@@ -99,12 +102,15 @@ fn update_one(
     }
     let new_rec = SourceRecord {
         commit: commit.clone(),
+        path,
         content_hash: new_hash.hex(),
         installed_at: now_secs(),
         ..rec.clone()
     };
     if new_hash.hex() == current {
-        if new_rec.commit != rec.commit || new_rec.content_hash != rec.content_hash {
+        let moved = (&new_rec.commit, &new_rec.content_hash, &new_rec.path)
+            != (&rec.commit, &rec.content_hash, &rec.path);
+        if moved {
             write_record(skills_dir, name, &new_rec).map_err(|e| e.to_string())?;
         }
         return Ok(UpdateOutcome::UpToDate);
@@ -118,19 +124,46 @@ fn update_one(
     })
 }
 
-/// The skill's directory in a fetched tree: its recorded path, or a search
-/// by name when the repository moved it.
-fn locate(root: &Path, path: Option<&str>, name: &str) -> Result<PathBuf, String> {
+/// A project's records are files in the project: one may only name a
+/// directory inside it, or a repository could copy any directory on the
+/// machine into itself.
+fn inside_project(skills_dir: &Path, local: &Path) -> Result<(), String> {
+    let project = skills_dir
+        .parent()
+        .and_then(Path::parent)
+        .and_then(|p| p.canonicalize().ok());
+    let local_canon = local
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", local.display()))?;
+    match project {
+        Some(p) if local_canon.starts_with(&p) => Ok(()),
+        _ => Err(format!(
+            "the source record names {}, which is outside the project; a project-layer \
+             record may only name a directory inside the project",
+            local.display()
+        )),
+    }
+}
+
+/// The skill's directory in a fetched tree and its path there: the recorded
+/// path, or a search by name when the repository moved it.
+fn locate(
+    root: &Path,
+    path: Option<&str>,
+    name: &str,
+) -> Result<(PathBuf, Option<String>), String> {
     if let Some(p) = path {
-        let dir = root.join(p);
-        if dir.join("SKILL.md").is_file() {
-            return Ok(dir);
+        match resolve_inside(root, p) {
+            Ok(dir) if dir.join("SKILL.md").is_file() => return Ok((dir, Some(p.to_owned()))),
+            Ok(_) | Err(SourceError::PathMissing(_)) => {}
+            Err(e) => return Err(format!("the source record's path is invalid: {e}")),
         }
     }
-    find_skills(root)
+    let found = find_skills(root)
         .map_err(|e| e.to_string())?
         .into_iter()
         .find(|f| f.name == name)
-        .map(|f| f.path)
-        .ok_or_else(|| format!("{name} is no longer in its source"))
+        .ok_or_else(|| format!("{name} is no longer in its source"))?;
+    let rel = (!found.rel.is_empty()).then_some(found.rel);
+    Ok((found.path, rel))
 }

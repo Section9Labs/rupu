@@ -1,6 +1,6 @@
 use crate::support::write_skill;
 use rupu_skills::install::{install_from, list_source, InstallSpec, Selection};
-use rupu_skills::record::read_record;
+use rupu_skills::record::{read_record, write_record, SourceRecord};
 use rupu_skills::update::{update_skills, UpdateOutcome};
 use rupu_skills::{Fetch, FetchedTree, GitSource, Layer, Source, SourceError};
 use std::cell::RefCell;
@@ -266,4 +266,136 @@ fn a_renamed_upstream_skill_is_not_installed_under_its_new_name() {
     assert!(fs::read_to_string(dst.path().join("pdf/SKILL.md"))
         .unwrap()
         .contains("v1"));
+}
+
+fn install_pdf(dst: &std::path::Path, f: &FakeFetch) {
+    let source = gh(None);
+    install_from(
+        &InstallSpec {
+            source: &source,
+            input: "o/skills",
+            selection: Selection::Named(vec!["pdf".into()]),
+            skills_dir: dst,
+            layer: Layer::Global,
+            force: false,
+        },
+        f,
+    )
+    .unwrap();
+}
+
+fn tamper(dst: &std::path::Path, name: &str, edit: impl FnOnce(&mut SourceRecord)) {
+    let mut rec = read_record(dst, name).unwrap().unwrap();
+    edit(&mut rec);
+    write_record(dst, name, &rec).unwrap();
+}
+
+fn installed_description(dst: &std::path::Path) -> String {
+    fs::read_to_string(dst.join("pdf/SKILL.md")).unwrap()
+}
+
+#[test]
+fn a_recorded_path_that_leaves_the_clone_fails_the_update() {
+    let (repo, dst, f) = setup();
+    install_pdf(dst.path(), &f);
+    let elsewhere = tempfile::tempdir().unwrap();
+    let evil = write_skill(elsewhere.path(), "pdf", "pdf", "planted");
+    let dotdot = format!(
+        "../{}/pdf",
+        elsewhere.path().file_name().unwrap().to_str().unwrap()
+    );
+    assert!(repo.path().join(&dotdot).join("SKILL.md").is_file());
+
+    for path in [evil.to_str().unwrap().to_owned(), dotdot] {
+        tamper(dst.path(), "pdf", |r| r.path = Some(path.clone()));
+        let got = update_skills(dst.path(), Layer::Global, &["pdf".into()], true, &f);
+        assert!(
+            matches!(&got[0].1, UpdateOutcome::Failed(e) if e.contains("inside the repository")),
+            "{path}: {got:?}"
+        );
+        assert!(installed_description(dst.path()).contains("v1"), "{path}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_recorded_path_through_a_symlink_fails_the_update() {
+    let (repo, dst, f) = setup();
+    install_pdf(dst.path(), &f);
+    let elsewhere = tempfile::tempdir().unwrap();
+    write_skill(elsewhere.path(), "pdf", "pdf", "planted");
+    std::os::unix::fs::symlink(elsewhere.path(), repo.path().join("linked")).unwrap();
+    tamper(dst.path(), "pdf", |r| r.path = Some("linked/pdf".into()));
+    let got = update_skills(dst.path(), Layer::Global, &["pdf".into()], true, &f);
+    assert!(
+        matches!(&got[0].1, UpdateOutcome::Failed(e) if e.contains("inside the repository")),
+        "{got:?}"
+    );
+    assert!(installed_description(dst.path()).contains("v1"));
+}
+
+#[test]
+fn a_project_record_may_not_point_outside_the_project() {
+    let project = tempfile::tempdir().unwrap();
+    let skills_dir = project.path().join(".rupu/skills");
+    let inside = write_skill(&project.path().join("vendor"), "notes", "notes", "v1");
+    let source = Source::Local(inside.canonicalize().unwrap());
+    let none = FakeFetch {
+        repo: PathBuf::new(),
+        commit: RefCell::new(String::new()),
+        calls: RefCell::new(0),
+    };
+    install_from(
+        &InstallSpec {
+            source: &source,
+            input: "vendor/notes",
+            selection: Selection::Default,
+            skills_dir: &skills_dir,
+            layer: Layer::Project,
+            force: false,
+        },
+        &none,
+    )
+    .unwrap();
+    write_skill(&project.path().join("vendor"), "notes", "notes", "v2");
+    assert!(matches!(
+        update_skills(&skills_dir, Layer::Project, &[], false, &none)[0].1,
+        UpdateOutcome::Updated { .. }
+    ));
+
+    let elsewhere = tempfile::tempdir().unwrap();
+    let outside = write_skill(elsewhere.path(), "notes", "notes", "planted");
+    tamper(&skills_dir, "notes", |r| r.local = Some(outside.clone()));
+    let got = update_skills(&skills_dir, Layer::Project, &[], true, &none);
+    assert!(
+        matches!(&got[0].1, UpdateOutcome::Failed(e) if e.contains("outside the project")),
+        "{got:?}"
+    );
+    assert!(fs::read_to_string(skills_dir.join("notes/SKILL.md"))
+        .unwrap()
+        .contains("v2"));
+}
+
+#[test]
+fn a_moved_skill_is_found_by_name_and_its_record_follows() {
+    let (repo, dst, f) = setup();
+    install_pdf(dst.path(), &f);
+    fs::create_dir_all(repo.path().join("tools")).unwrap();
+    fs::rename(
+        repo.path().join("skills/pdf"),
+        repo.path().join("tools/pdf"),
+    )
+    .unwrap();
+    assert_eq!(
+        update_skills(dst.path(), Layer::Global, &["pdf".into()], false, &f),
+        vec![("pdf".into(), UpdateOutcome::UpToDate)]
+    );
+    assert_eq!(
+        read_record(dst.path(), "pdf")
+            .unwrap()
+            .unwrap()
+            .path
+            .as_deref(),
+        Some("tools/pdf")
+    );
 }

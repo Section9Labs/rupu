@@ -290,3 +290,35 @@ fn install_selected_checks_every_destination_before_writing() {
     ));
     assert!(!dst.path().join("a-one").exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn the_search_does_not_follow_symlinks_out_of_the_source() {
+    let outside = tempfile::tempdir().unwrap();
+    write_skill(outside.path(), "far", "far", "never found: behind a link");
+    fs::write(
+        outside.path().join("secret.md"),
+        "---\nname: leak\ndescription: outside text\n---\n",
+    )
+    .unwrap();
+    let src = tempfile::tempdir().unwrap();
+    write_skill(src.path(), "near", "near", "d");
+    std::os::unix::fs::symlink(outside.path(), src.path().join("linked")).unwrap();
+    fs::create_dir_all(src.path().join("leak")).unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("secret.md"),
+        src.path().join("leak/SKILL.md"),
+    )
+    .unwrap();
+
+    let found = find_skills(src.path()).unwrap();
+    let got: Vec<(&str, Option<&str>)> = found
+        .iter()
+        .map(|f| (f.name.as_str(), f.description.as_deref()))
+        .collect();
+    assert_eq!(got, vec![("leak", None), ("near", Some("d"))]);
+    assert_eq!(
+        found[0].error.as_deref(),
+        Some("SKILL.md is a symlink that leaves the source")
+    );
+}

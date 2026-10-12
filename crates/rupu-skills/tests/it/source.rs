@@ -122,3 +122,68 @@ fn refusals() {
         Err(SourceError::Unrecognized(_))
     ));
 }
+
+#[test]
+fn a_tree_url_path_and_a_hash_path_conflict() {
+    assert!(matches!(
+        parse_source(
+            "https://github.com/o/r/tree/main/skills/pdf#skills/docx",
+            None,
+            None
+        ),
+        Err(SourceError::PathConflict { .. })
+    ));
+    assert_eq!(
+        parse_source("https://github.com/o/r/tree/main#skills/docx", None, None).unwrap(),
+        git("https://github.com/o/r", Some("main"), Some("skills/docx"))
+    );
+}
+
+#[test]
+fn a_slashed_ref_conflict_says_how_to_name_it() {
+    let err = parse_source(
+        "https://github.com/o/r/tree/feature/x/skills/pdf",
+        Some("feature/x"),
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "the URL names ref \"feature\" but --ref says \"feature/x\"; a ref containing `/` \
+         can't be named in a tree URL: use https://github.com/o/r#skills/pdf --ref feature/x"
+    );
+    assert_eq!(
+        parse_source("https://github.com/o/r/tree/main/x", Some("dev"), None)
+            .unwrap_err()
+            .to_string(),
+        "the URL names ref \"main\" but --ref says \"dev\""
+    );
+}
+
+#[test]
+fn credentials_in_a_url_are_refused_without_echoing_them() {
+    for url in [
+        "https://user:s3cret@github.com/o/r",
+        "https://s3cret@gitlab.example.com/team/skills.git#tools",
+    ] {
+        let err = parse_source(url, None, None).unwrap_err();
+        assert_eq!(err, SourceError::Credentials);
+        assert!(!err.to_string().contains("s3cret"), "{err}");
+    }
+}
+
+#[test]
+fn the_scheme_is_case_insensitive() {
+    assert_eq!(
+        parse_source("HTTPS://github.com/o/r", None, None).unwrap(),
+        git("https://github.com/o/r", None, None)
+    );
+    assert_eq!(
+        parse_source("Https://github.com/o/r/tree/main/skills/pdf", None, None).unwrap(),
+        git("https://github.com/o/r", Some("main"), Some("skills/pdf"))
+    );
+    assert!(matches!(
+        parse_source("SSH://github.com/o/r", None, None),
+        Err(SourceError::UnsupportedScheme(_))
+    ));
+}

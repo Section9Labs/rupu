@@ -2,7 +2,7 @@
 //! The default branch is a shallow clone; a ref is a full clone checked
 //! out detached at that ref.
 
-use crate::source::{Fetch, FetchedTree, GitSource, SourceError};
+use crate::source::{resolve_inside, Fetch, FetchedTree, GitSource, SourceError};
 use std::path::Path;
 
 pub struct GitFetcher;
@@ -20,11 +20,10 @@ impl Fetch for GitFetcher {
 pub(crate) fn fetch_any(src: &GitSource) -> Result<FetchedTree, SourceError> {
     let guard = tempfile::tempdir().map_err(|e| SourceError::Clone(e.to_string()))?;
     let checkout = guard.path().join(repo_dir_name(&src.url));
-    let commit = clone_at(&src.url, &checkout, src.git_ref.as_deref())
-        .map_err(|e| SourceError::Clone(e.message().to_owned()))?;
+    let commit = clone_at(&src.url, &checkout, src.git_ref.as_deref()).map_err(clone_error)?;
     let root = match &src.path {
         Some(p) => {
-            let r = checkout.join(p);
+            let r = resolve_inside(&checkout, p)?;
             if !r.is_dir() {
                 return Err(SourceError::PathMissing(p.clone()));
             }
@@ -33,6 +32,19 @@ pub(crate) fn fetch_any(src: &GitSource) -> Result<FetchedTree, SourceError> {
         None => checkout,
     };
     Ok(FetchedTree::with_guard(root, Some(commit), guard))
+}
+
+fn clone_error(e: git2::Error) -> SourceError {
+    let auth = e.code() == git2::ErrorCode::Auth
+        || e.message().to_ascii_lowercase().contains("authentication");
+    if auth {
+        return SourceError::Clone(format!(
+            "{}; the repository is private or does not exist. Private repositories are not \
+             supported yet: clone it yourself and install from the directory",
+            e.message()
+        ));
+    }
+    SourceError::Clone(e.message().to_owned())
 }
 
 /// The clone's directory name: the repo's last URL segment, so a repo whose
@@ -186,5 +198,119 @@ mod tests {
         );
         assert_eq!(repo_dir_name("https://h/team/skills.git"), "skills");
         assert_eq!(repo_dir_name("https://h/"), "h");
+    }
+
+    fn url_of(dir: &Path) -> String {
+        format!("file://{}", dir.display())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_through_a_symlink_cannot_leave_the_clone() {
+        let outside = tempfile::tempdir().unwrap();
+        let skill = outside.path().join("b");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: b\ndescription: d\n---\n",
+        )
+        .unwrap();
+
+        let o = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(o.path()).unwrap();
+        std::fs::create_dir_all(o.path().join("a")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), o.path().join("skills")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), o.path().join("a/link")).unwrap();
+        std::fs::write(o.path().join("README.md"), "r\n").unwrap();
+        commit_all(&repo, "links");
+
+        for path in ["skills", "skills/b", "a/link/b"] {
+            let got = fetch_any(&GitSource {
+                url: url_of(o.path()),
+                git_ref: None,
+                path: Some(path.into()),
+            });
+            assert!(
+                matches!(&got, Err(SourceError::BadPath(p)) if p == path),
+                "{path}: {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tag_checkout_drops_files_added_after_the_tag() {
+        let (o, _, _) = origin();
+        let repo = git2::Repository::open(o.path()).unwrap();
+        std::fs::write(o.path().join("skills/s/later.md"), "added after v1\n").unwrap();
+        commit_all(&repo, "third");
+        let tag = fetch_any(&GitSource {
+            url: url_of(o.path()),
+            git_ref: Some("v1".into()),
+            path: Some("skills/s".into()),
+        })
+        .unwrap();
+        assert!(tag.root.join("SKILL.md").is_file());
+        assert!(!tag.root.join("later.md").exists());
+    }
+
+    #[test]
+    fn a_ref_names_a_branch_other_than_the_default() {
+        let (o, _, second) = origin();
+        let repo = git2::Repository::open(o.path()).unwrap();
+        let head = repo.find_commit(second).unwrap();
+        repo.branch("dev", &head, false).unwrap();
+        repo.set_head("refs/heads/dev").unwrap();
+        std::fs::write(
+            o.path().join("skills/s/SKILL.md"),
+            "---\nname: s\ndescription: on dev\n---\n",
+        )
+        .unwrap();
+        let dev = commit_all(&repo, "dev only");
+        let default = repo
+            .find_branch("master", git2::BranchType::Local)
+            .or_else(|_| repo.find_branch("main", git2::BranchType::Local));
+        repo.set_head(default.unwrap().get().name().unwrap())
+            .unwrap();
+
+        let got = fetch_any(&GitSource {
+            url: url_of(o.path()),
+            git_ref: Some("dev".into()),
+            path: Some("skills/s".into()),
+        })
+        .unwrap();
+        assert_eq!(got.commit.as_deref(), Some(dev.to_string().as_str()));
+        assert!(std::fs::read_to_string(got.root.join("SKILL.md"))
+            .unwrap()
+            .contains("on dev"));
+    }
+
+    #[test]
+    fn an_auth_failure_says_private_repositories_are_unsupported() {
+        let err = clone_error(git2::Error::new(
+            git2::ErrorCode::Auth,
+            git2::ErrorClass::Http,
+            "remote authentication required but no callback set",
+        ));
+        assert_eq!(
+            err.to_string(),
+            "fetch failed: remote authentication required but no callback set; the repository \
+             is private or does not exist. Private repositories are not supported yet: clone it \
+             yourself and install from the directory"
+        );
+        let other = clone_error(git2::Error::from_str("unexpected EOF"));
+        assert_eq!(other.to_string(), "fetch failed: unexpected EOF");
+    }
+
+    #[test]
+    #[ignore = "network: clones a public GitHub repository"]
+    fn https_shallow_clone_of_a_public_repo() {
+        let got = GitFetcher
+            .fetch(&GitSource {
+                url: "https://github.com/octocat/Hello-World".into(),
+                git_ref: None,
+                path: None,
+            })
+            .unwrap();
+        assert!(git2::Repository::open(&got.root).unwrap().is_shallow());
     }
 }

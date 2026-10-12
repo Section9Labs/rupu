@@ -84,9 +84,12 @@ fn io(path: &Path) -> impl FnOnce(std::io::Error) -> InstallError + '_ {
     }
 }
 
+/// Every skill under `root`. The search never follows a directory symlink,
+/// and a `SKILL.md` that resolves outside `root` is reported, not read.
 pub fn find_skills(root: &Path) -> Result<Vec<Found>, InstallError> {
+    let canon = root.canonicalize().map_err(io(root))?;
     let mut out = Vec::new();
-    search(root, "", 0, &mut out)?;
+    search(&canon, root, "", 0, &mut out)?;
     out.sort_by(|a, b| a.rel.cmp(&b.rel));
     let mut by_name: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
     for f in &out {
@@ -101,10 +104,16 @@ pub fn find_skills(root: &Path) -> Result<Vec<Found>, InstallError> {
     Ok(out)
 }
 
-fn search(dir: &Path, rel: &str, depth: usize, out: &mut Vec<Found>) -> Result<(), InstallError> {
+fn search(
+    root: &Path,
+    dir: &Path,
+    rel: &str,
+    depth: usize,
+    out: &mut Vec<Found>,
+) -> Result<(), InstallError> {
     let md = dir.join("SKILL.md");
     if md.is_file() {
-        out.push(describe(dir, rel, &md));
+        out.push(describe(root, dir, rel, &md));
         return Ok(());
     }
     if depth == MAX_SEARCH_DEPTH {
@@ -123,17 +132,27 @@ fn search(dir: &Path, rel: &str, depth: usize, out: &mut Vec<Found>) -> Result<(
         } else {
             format!("{rel}/{name}")
         };
-        search(&item.path(), &child_rel, depth + 1, out)?;
+        search(root, &item.path(), &child_rel, depth + 1, out)?;
     }
     Ok(())
 }
 
-fn describe(dir: &Path, rel: &str, md: &Path) -> Found {
+fn describe(root: &Path, dir: &Path, rel: &str, md: &Path) -> Found {
     let dir_name = dir
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default()
         .to_owned();
+    let inside = md.canonicalize().is_ok_and(|p| p.starts_with(root));
+    if !inside {
+        return Found {
+            name: dir_name,
+            rel: rel.to_owned(),
+            path: dir.to_owned(),
+            description: None,
+            error: Some("SKILL.md is a symlink that leaves the source".into()),
+        };
+    }
     let parsed = std::fs::read_to_string(md)
         .map_err(|e| e.to_string())
         .and_then(|t| parse_skill_md(&t).map_err(|e| e.to_string()));
