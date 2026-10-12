@@ -14,6 +14,24 @@ pub struct LayerDirs {
     pub project: Option<PathBuf>,
 }
 
+impl LayerDirs {
+    /// The `skills/` directories under the global `.rupu` and, when the run
+    /// has one, the project's.
+    pub fn for_layers(global_rupu_dir: &Path, project_rupu_dir: Option<&Path>) -> Self {
+        Self {
+            global: Some(global_rupu_dir.join("skills")),
+            project: project_rupu_dir.map(|p| p.join("skills")),
+        }
+    }
+
+    pub fn skills_dir(&self, layer: Layer) -> Option<&Path> {
+        match layer {
+            Layer::Global => self.global.as_deref(),
+            Layer::Project => self.project.as_deref(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct CatalogEntry {
     pub dir_name: String,

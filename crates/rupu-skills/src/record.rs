@@ -2,8 +2,10 @@
 //! own directory so it never moves the skill's fingerprints and is never
 //! readable through a run's read roots.
 
+use crate::name::SkillName;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 pub const RECORD_VERSION: u32 = 1;
 
@@ -67,7 +69,8 @@ pub fn read_record(skills_dir: &Path, name: &str) -> Result<Option<SourceRecord>
 }
 
 /// Names of installed skills that have a record. Orphaned records (the
-/// skill directory was deleted) are ignored.
+/// skill directory was deleted) and records whose file stem is not a valid
+/// skill name are ignored.
 pub fn list_records(skills_dir: &Path) -> Vec<String> {
     let Ok(read) = std::fs::read_dir(skills_dir.join(".sources")) else {
         return Vec::new();
@@ -80,6 +83,7 @@ pub fn list_records(skills_dir: &Path) -> Vec<String> {
                 .strip_suffix(".json")
                 .map(str::to_owned)
         })
+        .filter(|n| SkillName::from_str(n).is_ok())
         .filter(|n| skills_dir.join(n).join("SKILL.md").is_file())
         .collect();
     names.sort();

@@ -4,6 +4,7 @@
 //! unless forced.
 
 use crate::install::{find_skills, install_one, recover_replaced, source_hash};
+use crate::name::SkillName;
 use crate::record::{
     inside_project, list_records, now_secs, read_record, write_record, SourceRecord,
 };
@@ -11,6 +12,7 @@ use crate::skill::{load_skill, Layer};
 use crate::source::{resolve_inside, Fetch, FetchedTree, GitSource, SourceError};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateOutcome {
@@ -38,8 +40,11 @@ pub fn update_skills(
     names
         .into_iter()
         .map(|name| {
-            let outcome = update_one(skills_dir, layer, &name, force, fetcher, &mut trees)
-                .unwrap_or_else(UpdateOutcome::Failed);
+            let outcome = match SkillName::from_str(&name) {
+                Ok(valid) => update_one(skills_dir, layer, &valid, force, fetcher, &mut trees)
+                    .unwrap_or_else(UpdateOutcome::Failed),
+                Err(e) => UpdateOutcome::Failed(format!("not a valid skill name: {e}")),
+            };
             (name, outcome)
         })
         .collect()
@@ -52,11 +57,12 @@ fn short(s: &str) -> String {
 fn update_one(
     skills_dir: &Path,
     layer: Layer,
-    name: &str,
+    name: &SkillName,
     force: bool,
     fetcher: &dyn Fetch,
     trees: &mut HashMap<(String, Option<String>), Result<FetchedTree, String>>,
 ) -> Result<UpdateOutcome, String> {
+    let name = name.as_str();
     let installed_dir = skills_dir.join(name);
     recover_replaced(skills_dir, name).map_err(|e| e.to_string())?;
     if !installed_dir.join("SKILL.md").is_file() {

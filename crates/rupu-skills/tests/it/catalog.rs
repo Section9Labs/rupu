@@ -1,6 +1,7 @@
 use crate::support::write_skill;
 use rupu_skills::{load_skill, Layer, LayerDirs, SkillCatalog, SkillError};
 use std::fs;
+use std::path::{Path, PathBuf};
 
 #[test]
 fn load_skill_reads_everything() {
@@ -157,4 +158,23 @@ fn a_dangling_skill_symlink_is_listed_invalid_and_a_file_symlink_is_skipped() {
         cat.get(Layer::Global, "gone").unwrap().skill,
         Err(SkillError::Io { .. })
     ));
+}
+
+#[test]
+fn layer_dirs_join_skills_under_each_rupu_dir() {
+    let dirs = LayerDirs::for_layers(Path::new("/g/.rupu"), Some(Path::new("/p/.rupu")));
+    assert_eq!(dirs.global, Some(PathBuf::from("/g/.rupu/skills")));
+    assert_eq!(dirs.project, Some(PathBuf::from("/p/.rupu/skills")));
+    assert_eq!(
+        dirs.skills_dir(Layer::Global),
+        Some(Path::new("/g/.rupu/skills"))
+    );
+    assert_eq!(
+        dirs.skills_dir(Layer::Project),
+        Some(Path::new("/p/.rupu/skills"))
+    );
+
+    let global_only = LayerDirs::for_layers(Path::new("/g/.rupu"), None);
+    assert_eq!(global_only.project, None);
+    assert_eq!(global_only.skills_dir(Layer::Project), None);
 }

@@ -1,6 +1,6 @@
 use crate::support::write_skill;
 use rupu_skills::install::{install_from, list_source, InstallError, InstallSpec, Selection};
-use rupu_skills::record::{read_record, write_record, SourceRecord};
+use rupu_skills::record::{list_records, read_record, write_record, SourceRecord};
 use rupu_skills::update::{update_skills, UpdateOutcome};
 use rupu_skills::{Fetch, FetchedTree, GitSource, Layer, Source, SourceError};
 use std::cell::RefCell;
@@ -535,4 +535,59 @@ fn update_puts_back_a_skill_an_interrupted_replace_left_aside() {
     );
     assert!(dst.path().join("pdf/SKILL.md").is_file());
     assert!(!dst.path().join(".replaced-pdf-4242").exists());
+}
+
+#[test]
+fn an_invalid_name_fails_without_touching_the_filesystem() {
+    let (_repo, root, f) = setup();
+    let skills = root.path().join("a/b/skills");
+    fs::create_dir_all(&skills).unwrap();
+    let outside = write_skill(&root.path().join("a"), "x", "x", "outside");
+    let before = fs::read_to_string(outside.join("SKILL.md")).unwrap();
+
+    let got = update_skills(&skills, Layer::Global, &["../../x".into()], true, &f);
+
+    assert_eq!(
+        got,
+        vec![(
+            "../../x".to_owned(),
+            UpdateOutcome::Failed(
+                "not a valid skill name: skill name may only contain a-z, 0-9 and '-'; \
+                 found '.'"
+                    .into()
+            )
+        )]
+    );
+    assert_eq!(*f.calls.borrow(), 0);
+    assert_eq!(
+        fs::read_to_string(outside.join("SKILL.md")).unwrap(),
+        before
+    );
+    assert_eq!(
+        fs::read_dir(root.path().join("a")).unwrap().count(),
+        2,
+        "a/ holds only b/ and x/"
+    );
+}
+
+#[test]
+fn list_records_skips_a_record_whose_name_is_invalid() {
+    let t = tempfile::tempdir().unwrap();
+    let rec = SourceRecord {
+        version: 1,
+        source: "/somewhere".into(),
+        url: None,
+        git_ref: None,
+        path: None,
+        commit: None,
+        local: Some("/somewhere".into()),
+        content_hash: "h".into(),
+        installed_at: 0,
+    };
+    write_skill(t.path(), "good", "good", "d");
+    write_record(t.path(), "good", &rec).unwrap();
+    write_skill(t.path(), "Bad_Name", "Bad_Name", "d");
+    write_record(t.path(), "Bad_Name", &rec).unwrap();
+
+    assert_eq!(list_records(t.path()), vec!["good".to_owned()]);
 }
