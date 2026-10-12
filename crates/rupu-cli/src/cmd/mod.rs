@@ -34,6 +34,7 @@ pub mod retention;
 pub mod run;
 pub mod scm;
 pub mod session;
+pub mod skill;
 pub mod transcript;
 pub mod ui;
 pub mod update;
