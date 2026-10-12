@@ -252,9 +252,9 @@ impl AgentDispatcher for InProcessDispatcher {
             pause: None,
             services: LaunchServices {
                 dispatcher: Some(self.self_arc_dyn()),
-                netflow: None,
-                extra_tools: Vec::new(),
-                provider: None,
+                // A child has its own catalog from the assembler's context,
+                // and no message bus (it is not a flow participant).
+                ..Default::default()
             },
             collectors: Vec::new(),
         };

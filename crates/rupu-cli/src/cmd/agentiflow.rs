@@ -533,6 +533,12 @@ async fn launch(
     let findings = crate::findings_opts::base_options(global, &cfg.findings);
     let net_capture = crate::netflow_sink::net_capture(&cfg.netflow).await;
     let pricing = cfg.pricing.clone();
+    // The catalog the runs read (the lead itself reads the one rooted at
+    // its workspace, which `run_agentiflow` hands it).
+    let catalog = Arc::new(rupu_orchestrator::FsCatalog::for_project_root(
+        global,
+        project_root.as_deref(),
+    ));
     let assembler =
         rupu_runtime::assembly::RunAssembler::new(rupu_runtime::assembly::AssemblyContext {
             global: global.to_path_buf(),
@@ -543,6 +549,7 @@ async fn launch(
             scm: Some(scm),
             findings,
             net_capture: Some(net_capture),
+            catalog: Some(catalog),
         });
 
     // The lead's provider, built once now so a missing credential or bad

@@ -19,7 +19,11 @@ pub struct RunGrantInputs<'a> {
     pub step_actions: &'a [String],
     /// The run has a `concerns:` block (ambient `coverage.*`).
     pub concerns: bool,
-    /// Pre-built tools injected into the run (ambient `origin:injected`).
+    /// The grant the run's origin carries (an agentiflow lead's or unit's
+    /// coordination set, `origin:flow_lead` / `origin:flow_unit`).
+    pub origin: Option<&'a AmbientGrant>,
+    /// Pre-built tools injected into the run (ambient `origin:injected`):
+    /// the agentiflow launch tools until W7.
     pub injected: &'a [Arc<dyn Tool>],
     /// The run's identity, workspace and services.
     pub tool_context: &'a ToolContext,
@@ -27,8 +31,8 @@ pub struct RunGrantInputs<'a> {
 }
 
 /// Resolve a run's grant (W2): the agent's `tools:`, the step's `actions:`,
-/// the ambient grants (`concerns:`, an engagement, injected tools) and the
-/// run's services.
+/// the ambient grants (`concerns:`, an engagement, the origin's grant,
+/// injected tools) and the run's services.
 pub fn resolve_run_grant(inputs: RunGrantInputs<'_>) -> Result<ResolvedGrant, GrantError> {
     let ctx = inputs.tool_context;
     let injected: Vec<_> = inputs.injected.iter().map(|t| t.descriptor()).collect();
@@ -44,6 +48,9 @@ pub fn resolve_run_grant(inputs: RunGrantInputs<'_>) -> Result<ResolvedGrant, Gr
     }
     if engagement {
         ambient.push(AmbientGrant::engagement());
+    }
+    if let Some(origin) = inputs.origin {
+        ambient.push(origin.clone());
     }
     if !injected.is_empty() {
         ambient.push(AmbientGrant::injected(
@@ -85,6 +92,7 @@ pub fn with_grant(
         declared,
         step_actions,
         concerns: opts.concerns.is_some(),
+        origin: None,
         injected: &opts.extra_tools,
         tool_context: &opts.tool_context,
         alias_scope: opts.alias_scope,

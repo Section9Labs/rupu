@@ -216,6 +216,17 @@ pub struct ToolServices {
     /// The run's operator prompter, when it has one: a child run started by
     /// a call asks the same operator.
     pub prompter: Option<Arc<dyn Prompter>>,
+    /// The run's address on its flow's board and mailboxes, behind `board.*`
+    /// / `msg.send`. Built by the run's owner (an agentiflow lead or unit);
+    /// `None` outside a flow.
+    pub message_bus: Option<Arc<rupu_fleet::Bus>>,
+    /// A flow's live goals, coverage and budget, behind `goal.*` /
+    /// `budget.status`. Set by an agentiflow for its lead.
+    pub run_status: Option<Arc<dyn crate::ports::RunStatus>>,
+    /// The agents and workflows the run can draw on, behind `agents.*`,
+    /// `workflows.list` / `workflows.get` and `catalog.search`. Every launch
+    /// site provides one.
+    pub catalog: Option<Arc<dyn crate::ports::CatalogPort>>,
 }
 
 impl ToolServices {
@@ -247,10 +258,18 @@ impl ToolServices {
         if self.netflow_sink.is_some() {
             s.insert(Service::Netflow);
         }
-        // The agentiflow services (message bus, run status, catalog, the
-        // unit launcher, the workflow generator) have no body in the catalog
-        // until W5/W7: their tools reach a run only injected, as self-served
-        // grants.
+        if self.message_bus.is_some() {
+            s.insert(Service::MessageBus);
+        }
+        if self.run_status.is_some() {
+            s.insert(Service::RunStatus);
+        }
+        if self.catalog.is_some() {
+            s.insert(Service::Catalog);
+        }
+        // The agentiflow unit launcher and workflow generator have no body
+        // in the catalog until W7: their tools reach a run only injected, as
+        // self-served grants.
         s
     }
 }
@@ -278,6 +297,12 @@ impl std::fmt::Debug for ToolServices {
             )
             .field("customer", &self.customer)
             .field("prompter", &self.prompter.as_ref().map(|_| "<prompter>"))
+            .field("message_bus", &self.message_bus)
+            .field(
+                "run_status",
+                &self.run_status.as_ref().map(|_| "<run status>"),
+            )
+            .field("catalog", &self.catalog.as_ref().map(|_| "<catalog>"))
             .finish()
     }
 }

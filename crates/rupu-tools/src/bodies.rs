@@ -4,7 +4,9 @@
 //! set of bodies (spec W4 §3.3).
 
 use crate::tool::{Tool, ToolContext};
-use crate::{assets, coverage, findings, github, gitlab, issues, scm};
+use crate::{
+    assets, board, budget, coverage, findings, github, gitlab, goal, issues, msg, roster, scm,
+};
 use crate::{
     AstGrepTool, BashTool, DispatchAgentTool, DispatchAgentsParallelTool, EditFileTool, GlobTool,
     GrepTool, ReadFileTool, WriteFileTool,
@@ -13,16 +15,21 @@ use std::sync::Arc;
 
 /// The body of the catalog tool with canonical name `name` for the run `ctx`
 /// describes, or `None` when this crate holds no body for it (the agentiflow
-/// tools until W5) or the run lacks a service the tool can't run without:
-/// a connector tool without an SCM registry, a coverage tool without a
-/// concern catalog, `assets.mark` without an engagement, the dispatch pair
-/// without a dispatcher. [`crate::ToolServices::provided`] is the same
+/// launch tools until W7) or the run lacks a service the tool can't run
+/// without: a connector tool without an SCM registry, a coverage tool
+/// without a concern catalog, `assets.mark` without an engagement, the
+/// dispatch pair without a dispatcher, `board.*` / `msg.send` without a
+/// message bus, `goal.*` / `budget.status` without a run status, the roster
+/// without a catalog. [`crate::ToolServices::provided`] is the same
 /// accounting, so a grant resolved over it never offers a tool this can't
 /// build.
 pub fn body(name: &str, ctx: &ToolContext) -> Option<Arc<dyn Tool>> {
     let services = &ctx.services;
     let scm = services.scm.is_some();
     let coverage = services.coverage_catalog.is_some();
+    let bus = services.message_bus.is_some();
+    let status = services.run_status.is_some();
+    let catalog = services.catalog.is_some();
     let t: Arc<dyn Tool> = match name {
         // core
         "bash" => Arc::new(BashTool),
@@ -77,6 +84,24 @@ pub fn body(name: &str, ctx: &ToolContext) -> Option<Arc<dyn Tool>> {
         "issues.update_state" if scm => Arc::new(issues::IssuesUpdateStateTool),
         "github.workflows_dispatch" if scm => Arc::new(github::WorkflowsDispatchTool),
         "gitlab.pipeline_trigger" if scm => Arc::new(gitlab::PipelineTriggerTool),
+        // a flow's message bus
+        "board.claim" if bus => Arc::new(board::BoardClaimTool),
+        "board.release" if bus => Arc::new(board::BoardReleaseTool),
+        "board.post" if bus => Arc::new(board::BoardPostTool),
+        "board.read" if bus => Arc::new(board::BoardReadTool),
+        "board.directive" if bus => Arc::new(board::BoardDirectiveTool),
+        "board.retract" if bus => Arc::new(board::BoardRetractTool),
+        "msg.send" if bus => Arc::new(msg::MsgSendTool),
+        // the agent / workflow catalog
+        "agents.list" if catalog => Arc::new(roster::AgentsListTool),
+        "agents.get" if catalog => Arc::new(roster::AgentsGetTool),
+        "workflows.list" if catalog => Arc::new(roster::WorkflowsListTool),
+        "workflows.get" if catalog => Arc::new(roster::WorkflowsGetTool),
+        "catalog.search" if catalog => Arc::new(roster::CatalogSearchTool),
+        // a flow's live status
+        "goal.status" if status => Arc::new(goal::GoalStatusTool),
+        "goal.coverage" if status => Arc::new(goal::GoalCoverageTool),
+        "budget.status" if status => Arc::new(budget::BudgetStatusTool),
         _ => return None,
     };
     Some(t)

@@ -111,3 +111,49 @@ fn into_result(o: CallOutcome) -> Result<String, String> {
         CallOutcome::Denied(m) | CallOutcome::Failed(m) => Err(m),
     }
 }
+
+/// A [`rupu_tools::RunStatus`] answering with fixed reports.
+#[derive(Default)]
+pub struct StubStatus {
+    pub goals: rupu_tools::ports::GoalReport,
+    pub coverage: Option<rupu_tools::ports::GoalCoverageReport>,
+    pub budget: Option<rupu_tools::ports::BudgetReport>,
+}
+
+impl rupu_tools::RunStatus for StubStatus {
+    fn goals(&self) -> Result<rupu_tools::ports::GoalReport, rupu_tools::PortError> {
+        Ok(self.goals.clone())
+    }
+    fn coverage(&self) -> Result<rupu_tools::ports::GoalCoverageReport, rupu_tools::PortError> {
+        self.coverage
+            .clone()
+            .ok_or_else(|| rupu_tools::PortError::new("could not evaluate coverage: stub"))
+    }
+    fn budget(&self) -> Result<rupu_tools::ports::BudgetReport, rupu_tools::PortError> {
+        Ok(self
+            .budget
+            .clone()
+            .unwrap_or(rupu_tools::ports::BudgetReport::NoBudget))
+    }
+}
+
+/// A [`rupu_tools::CatalogPort`] over fixed entries; `agents_error` makes
+/// the agent listing fail the way one unparseable agent file does.
+#[derive(Default)]
+pub struct StubCatalog {
+    pub agents: Vec<rupu_tools::ports::AgentEntry>,
+    pub workflows: Vec<rupu_tools::ports::WorkflowEntry>,
+    pub agents_error: Option<String>,
+}
+
+impl rupu_tools::CatalogPort for StubCatalog {
+    fn agents(&self) -> Result<Vec<rupu_tools::ports::AgentEntry>, rupu_tools::PortError> {
+        match &self.agents_error {
+            Some(e) => Err(rupu_tools::PortError::new(e.clone())),
+            None => Ok(self.agents.clone()),
+        }
+    }
+    fn workflows(&self) -> Vec<rupu_tools::ports::WorkflowEntry> {
+        self.workflows.clone()
+    }
+}

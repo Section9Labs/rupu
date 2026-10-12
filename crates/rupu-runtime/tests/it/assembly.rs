@@ -136,6 +136,7 @@ struct Derived {
     net_capture: bool,
     scm: bool,
     dispatcher: bool,
+    catalog: bool,
     customer: Option<String>,
     output_tokens: Option<u32>,
     context_window: Option<String>,
@@ -145,6 +146,9 @@ struct Derived {
     admission: bool,
     grant_offers_dispatch_agent: bool,
     grant_offers_issues_create: bool,
+    grant_offers_agents_list: bool,
+    /// The origin's own grant (W5 §3.4): its reason and tools.
+    origin_grant: Option<String>,
     narrowed: Vec<String>,
 }
 
@@ -181,6 +185,7 @@ fn derived(home: &Home, origin: &Origin, run: &AssembledRun) -> Derived {
         net_capture: s.net_capture.is_some(),
         scm: s.scm.is_some(),
         dispatcher: s.dispatcher.is_some(),
+        catalog: s.catalog.is_some(),
         customer: s.customer.clone(),
         output_tokens: o.limits.output.tokens,
         context_window: o.pins.context_window.map(|c| format!("{c:?}")),
@@ -190,6 +195,10 @@ fn derived(home: &Home, origin: &Origin, run: &AssembledRun) -> Derived {
         admission: defaults_for(origin).admission,
         grant_offers_dispatch_agent: o.grant.offers("dispatch_agent"),
         grant_offers_issues_create: o.grant.offers("issues.create"),
+        grant_offers_agents_list: o.grant.offers("agents.list"),
+        origin_grant: defaults_for(origin)
+            .origin_grant
+            .map(|g| format!("{}: {}", g.reason, g.tools.join(" "))),
         narrowed: o.grant.narrowed.iter().map(|n| n.to_string()).collect(),
     }
 }

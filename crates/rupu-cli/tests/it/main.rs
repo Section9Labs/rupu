@@ -31,6 +31,7 @@ mod findings_import;
 mod findings_schema;
 mod findings_tags;
 mod fleet_bundle_coverage;
+mod flow_tools_outside_a_flow;
 mod host_features;
 mod init_create_skeleton;
 mod init_force;

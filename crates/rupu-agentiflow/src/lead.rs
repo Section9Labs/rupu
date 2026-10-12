@@ -317,9 +317,10 @@ pub struct LeadConfig {
     /// launch site passes `Some(..)` (absent = none), so an empty list grants
     /// NO builtins/MCP tools — there is deliberately no way to say "all
     /// builtins" by omission, because the lead runs unattended under bypass
-    /// permission on digest text an attacker can influence. (The
-    /// engagement's ambient grant adds `findings.report` / `assets.mark`,
-    /// and the board/mailbox `extra_tools` are always-on, so an empty list
+    /// permission on digest text an attacker can influence. (The origin's
+    /// grant, `origin:flow_lead`, adds the board / mailbox, status and roster
+    /// tools and `findings.report`; the engagement's ambient grant adds
+    /// `assets.mark`; the launch tools ride `extra_tools` — so an empty list
     /// is not "no tools at all".)
     pub agent: rupu_agent::AgentSpec,
     /// Turns the lead may take in ONE round; must be at least 1
@@ -359,11 +360,21 @@ pub struct LeadConfig {
     /// next, as a session does. `ModelLimits::unknown()` = resolved by the
     /// first round.
     pub limits: ModelLimits,
-    /// Always-on tools injected into every round's grant (as `origin:injected`,
-    /// so they need not be listed in the agent's `tools:`): the lead's
-    /// board / mailbox coordination tools. Shared `Arc`s -- the same instances
-    /// serve every round, so their per-run state (held claims) persists.
+    /// The lead's launch tools (`dispatch`, `join`, `run_workflow`,
+    /// `workflows.generate`), injected into every round's grant as
+    /// `origin:injected` until W7 replaces them. Shared `Arc`s -- the same
+    /// instances serve every round, so their participant counter persists.
     pub extra_tools: Vec<Arc<dyn rupu_tools::Tool>>,
+    /// The lead's address on the flow's board and mailboxes (participant
+    /// `lead`), behind its `board.*` / `msg.send` catalog tools. One bus for
+    /// every round, so the claims it holds persist across rounds.
+    pub message_bus: Option<Arc<rupu_fleet::Bus>>,
+    /// The flow's live goals, coverage and budget, behind `goal.*` /
+    /// `budget.status` ([`crate::FlowStatus`]).
+    pub run_status: Option<Arc<dyn rupu_tools::RunStatus>>,
+    /// The agent/workflow catalog the lead's roster tools read (global + the
+    /// workspace's `.rupu`).
+    pub catalog: Option<Arc<dyn rupu_tools::CatalogPort>>,
     /// Ambient-context collectors run before each of the lead's model calls
     /// (its inbox, the board's standing directives). Shared `Arc`s, cloned
     /// into every round's launch.
@@ -393,9 +404,10 @@ pub struct LeadConfig {
 /// (the agent's limits, recovery chain, frontmatter pins, MCP/SCM registry,
 /// findings base, netflow and usage ledger, like any run). It runs under
 /// bypass permission, so the tool gate is the run's grant: the agent's
-/// `tools:` (exactly that list; empty = no builtins/MCP), the engagement's
-/// ambient findings tools, and [`LeadConfig::extra_tools`], the caller's
-/// explicit always-on injections (the board / mailbox tools). Its launcher
+/// `tools:` (exactly that list; empty = no builtins/MCP), the origin's
+/// coordination set over [`LeadConfig::message_bus`] / `run_status` /
+/// `catalog`, the engagement's ambient findings tools, and
+/// [`LeadConfig::extra_tools`] (the launch tools, until W7). Its launcher
 /// is the agentiflow's own unit supervisor (the `dispatch` / `join` tools),
 /// not the in-process dispatcher. [`LeadConfig::collectors`] feed the lead's
 /// inbox and standing directives into each turn. No parent run, depth 0.
@@ -633,6 +645,9 @@ impl RunAgentLeadDriver {
             pause: Some(pause.clone()),
             services: LaunchServices {
                 extra_tools: self.cfg.extra_tools.clone(),
+                message_bus: self.cfg.message_bus.clone(),
+                run_status: self.cfg.run_status.clone(),
+                catalog: self.cfg.catalog.clone(),
                 provider,
                 ..Default::default()
             },
@@ -963,6 +978,9 @@ mod tests {
             },
             limits: rupu_providers::model_limits::ModelLimits::unknown(),
             extra_tools: Vec::new(),
+            message_bus: None,
+            run_status: None,
+            catalog: None,
             collectors: Vec::new(),
             steering_queue: None,
         }

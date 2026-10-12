@@ -1,9 +1,10 @@
-//! Library-level workflow lister.
+//! Library-level workflow lister, and [`FsCatalog`]: the agent/workflow
+//! catalog port every launch site gives its runs.
 //!
 //! `rupu-cli` and `rupu-cp` each carry a private copy of "scan the
 //! workflows directories"; this is the shared, parse-aware version a
-//! caller that wants to describe the available workflows (e.g. the
-//! agentiflow lead's roster) can use. It is deliberately tolerant: a
+//! caller that wants to describe the available workflows (the roster
+//! tools, through [`FsCatalog`]) can use. It is deliberately tolerant: a
 //! file that fails to parse is still listed, carrying its parse error,
 //! so one bad file never hides the rest of the catalog.
 
@@ -343,5 +344,76 @@ steps:
         let project = tmp.path().join("proj").join(".rupu");
         write(&project, "workflows/foo.yaml", "name: [unclosed\nsteps: {");
         assert!(load_workflow(&global, Some(&project), "foo").is_none());
+    }
+}
+
+/// The agent/workflow catalog on disk, as a [`rupu_tools::CatalogPort`]: what
+/// every launch site hands its assembler (`AssemblyContext::catalog`), so
+/// any run granted `agents.list`, `workflows.list`, `catalog.search`, … can
+/// read the agents and workflows it may draw on (W5 §3.1a).
+///
+/// Tolerant like the lister: a workflow that does not parse is listed with
+/// its parse error, and an agent file that does not parse fails only the
+/// agent listing — reported by the tools, never propagated, while
+/// `catalog.search` still searches the workflows.
+#[derive(Debug, Clone)]
+pub struct FsCatalog {
+    /// The global rupu root (`~/.rupu`).
+    global: std::path::PathBuf,
+    /// The project's `.rupu` DIRECTORY (not the project root), when there is
+    /// one.
+    project: Option<std::path::PathBuf>,
+}
+
+impl FsCatalog {
+    /// The catalog over `global` and the project `.rupu` directory `project`
+    /// (the `(global, project)` pair `rupu_agent::load_agents` and
+    /// [`list_workflow_summaries`] take).
+    pub fn new(global: impl Into<std::path::PathBuf>, project: Option<std::path::PathBuf>) -> Self {
+        Self {
+            global: global.into(),
+            project,
+        }
+    }
+
+    /// The catalog of a project whose ROOT is `project_root` (its agents and
+    /// workflows live under `<project_root>/.rupu/`).
+    pub fn for_project_root(global: &Path, project_root: Option<&Path>) -> Self {
+        Self::new(global, project_root.map(|p| p.join(".rupu")))
+    }
+}
+
+impl rupu_tools::CatalogPort for FsCatalog {
+    fn agents(&self) -> Result<Vec<rupu_tools::ports::AgentEntry>, rupu_tools::PortError> {
+        let agents = rupu_agent::load_agents(&self.global, self.project.as_deref())
+            .map_err(|e| rupu_tools::PortError::new(format!("could not load agents: {e}")))?;
+        Ok(agents
+            .into_iter()
+            .map(|a| rupu_tools::ports::AgentEntry {
+                name: a.name,
+                description: a.description,
+                provider: a.provider,
+                model: a.model,
+                tools: a.tools,
+                dispatchable_agents: a.dispatchable_agents,
+                permission_mode: a.permission_mode,
+                max_turns: a.max_turns,
+            })
+            .collect())
+    }
+
+    fn workflows(&self) -> Vec<rupu_tools::ports::WorkflowEntry> {
+        list_workflow_summaries(&self.global, self.project.as_deref())
+            .into_iter()
+            .map(|w| rupu_tools::ports::WorkflowEntry {
+                id: w.id,
+                name: w.name,
+                description: w.description,
+                scope: w.scope,
+                input_keys: w.input_keys,
+                step_count: w.step_count,
+                parse_error: w.parse_error,
+            })
+            .collect()
     }
 }

@@ -423,6 +423,10 @@ async fn rebuild_opts_from_disk(
                 scm: Some(Arc::clone(&mcp_registry)),
                 findings: findings_base.clone(),
                 net_capture: Some(net_capture),
+                catalog: Some(Arc::new(rupu_orchestrator::FsCatalog::for_project_root(
+                    &global,
+                    project_root.as_deref(),
+                ))),
             },
             workflow: workflow.clone(),
             run_id: run_id.to_string(),

@@ -31,6 +31,7 @@ rupu-auth = { path = "../rupu-auth" }
 rupu-agent = { path = "../rupu-agent" }
 rupu-config = { path = "../rupu-config" }
 rupu-tools = { path = "../rupu-tools" }
+rupu-fleet = { workspace = true }
 rupu-coverage = { path = "../rupu-coverage" }
 rupu-netflow = { workspace = true, features = ["http"] }
 rupu-netwatch = { workspace = true }

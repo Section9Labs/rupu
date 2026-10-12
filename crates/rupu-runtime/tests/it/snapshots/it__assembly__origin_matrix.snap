@@ -25,6 +25,7 @@ flow_lead:
   net_capture: false
   scm: true
   dispatcher: false
+  catalog: true
   customer: acme
   output_tokens: 1234
   context_window: OneMillion
@@ -34,6 +35,8 @@ flow_lead:
   admission: true
   grant_offers_dispatch_agent: false
   grant_offers_issues_create: true
+  grant_offers_agents_list: true
+  origin_grant: "origin:flow_lead: board.claim board.release board.post board.read board.directive board.retract msg.send goal.status goal.coverage budget.status agents.list agents.get workflows.list workflows.get catalog.search findings.report"
   narrowed: []
 flow_unit:
   surface: agentiflow
@@ -58,6 +61,7 @@ flow_unit:
   net_capture: false
   scm: true
   dispatcher: true
+  catalog: true
   customer: acme
   output_tokens: 1234
   context_window: OneMillion
@@ -67,6 +71,8 @@ flow_unit:
   admission: true
   grant_offers_dispatch_agent: true
   grant_offers_issues_create: true
+  grant_offers_agents_list: true
+  origin_grant: "origin:flow_unit: board.claim board.release board.post board.read msg.send"
   narrowed: []
 session_turn:
   surface: session
@@ -91,6 +97,7 @@ session_turn:
   net_capture: false
   scm: true
   dispatcher: true
+  catalog: true
   customer: acme
   output_tokens: 1234
   context_window: OneMillion
@@ -100,6 +107,8 @@ session_turn:
   admission: true
   grant_offers_dispatch_agent: true
   grant_offers_issues_create: true
+  grant_offers_agents_list: true
+  origin_grant: ~
   narrowed: []
 standalone:
   surface: agent
@@ -124,6 +133,7 @@ standalone:
   net_capture: false
   scm: true
   dispatcher: true
+  catalog: true
   customer: acme
   output_tokens: 1234
   context_window: OneMillion
@@ -133,6 +143,8 @@ standalone:
   admission: true
   grant_offers_dispatch_agent: true
   grant_offers_issues_create: true
+  grant_offers_agents_list: true
+  origin_grant: ~
   narrowed: []
 sub_agent:
   surface: workflow
@@ -157,6 +169,7 @@ sub_agent:
   net_capture: false
   scm: true
   dispatcher: true
+  catalog: true
   customer: acme
   output_tokens: 1234
   context_window: OneMillion
@@ -166,6 +179,8 @@ sub_agent:
   admission: true
   grant_offers_dispatch_agent: true
   grant_offers_issues_create: true
+  grant_offers_agents_list: true
+  origin_grant: ~
   narrowed: []
 workflow_step:
   surface: workflow
@@ -190,6 +205,7 @@ workflow_step:
   net_capture: false
   scm: true
   dispatcher: true
+  catalog: true
   customer: acme
   output_tokens: 1234
   context_window: OneMillion
@@ -199,6 +215,8 @@ workflow_step:
   admission: true
   grant_offers_dispatch_agent: true
   grant_offers_issues_create: true
+  grant_offers_agents_list: true
+  origin_grant: ~
   narrowed:
     - github.workflows_dispatch
     - gitlab.pipeline_trigger

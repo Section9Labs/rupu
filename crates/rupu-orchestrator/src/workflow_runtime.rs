@@ -66,6 +66,14 @@ impl WorkflowRuntime {
             system_prompt_suffix,
             scope_name_override,
         } = inputs;
+        // Every run of the workflow can read the agent/workflow catalog.
+        let mut context = context;
+        if context.catalog.is_none() {
+            context.catalog = Some(Arc::new(crate::catalog::FsCatalog::for_project_root(
+                &context.global,
+                context.project_root.as_deref(),
+            )));
+        }
         let assembler = Arc::new(RunAssembler::new(context));
         let action_services = action_services(
             &assembler,

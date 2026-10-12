@@ -3,7 +3,8 @@
 //! by a snapshot taken before the flow tools moved into the catalog. Moving
 //! them must not change a byte of it. (`coverage.status` was already renamed
 //! `goal.coverage` in W1, so the lead's list carries no rename either; its
-//! old name still resolves for the lead — `lead_resolves_coverage_status`.)
+//! old name still resolves for the lead — `status.rs`'s
+//! `the_legacy_coverage_status_name_resolves_to_goal_coverage_in_a_lead`.)
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -148,7 +149,7 @@ fn unit_launch(
     let s = rupu_agentiflow::FlowUnitServices::for_participant(run_dir, participant);
     (
         LaunchServices {
-            extra_tools: s.extra_tools,
+            message_bus: Some(s.message_bus),
             ..Default::default()
         },
         s.collectors,

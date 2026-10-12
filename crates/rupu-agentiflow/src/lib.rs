@@ -16,28 +16,26 @@ mod lead;
 mod operator;
 mod proc;
 pub mod reaper;
-mod roster;
 mod run;
-mod status_tools;
+mod status;
 mod subprocess;
 mod supervisor;
-mod tools;
 mod unit;
 mod usage;
 #[cfg(test)]
 mod verify_fixtures;
 
 pub use budget::{Budget, BudgetEnforcer, BudgetStage, UsageSource};
-pub use collectors::{lead_collectors, DirectiveCollector, MailboxCollector};
+pub use collectors::{
+    bus_collectors, lead_collectors, roster_collector, DirectiveCollector, MailboxCollector,
+    RosterCollector,
+};
 pub use coverage::{CoverageEvalError, CoverageEvaluator, CoverageOutcome, CoverageTarget};
 pub use def::{
     load_agentiflow_def, AgentiflowDef, AssetSelector, FindingSelector, Goal, GoalTarget, Pool,
     RoundConfig, Scope, ScopeRoot, VerifyCheck,
 };
-pub use dispatch_tools::{
-    fleet_dispatch_tools, fleet_dispatch_tools_at_depth, fleet_unit_tools, WorkflowToolCtx,
-    MAX_DEPTH,
-};
+pub use dispatch_tools::{fleet_unit_tools, WorkflowToolCtx, MAX_DEPTH};
 pub use envelope::{
     Digest, Envelope, EnvelopeConfig, EnvelopeOutcome, LeadDriver, RoundContext, RoundOutcome,
     StopReason,
@@ -55,15 +53,13 @@ pub use reaper::{
     finalize_failed, hard_stop, hard_stop_with, reap_orphaned_agentiflows,
     reap_orphaned_agentiflows_with, HardStopGrace, HardStopOutcome, ReapSummary,
 };
-pub use roster::{roster_collector, roster_tools, RosterCollector, RosterCtx};
 pub use run::{
     agentiflow_dir, new_run_id, run_agentiflow, AgentiflowRecord, GoalStatus, LeadInputs,
     RunAgentiflowOpts,
 };
-pub use status_tools::{status_tools, BudgetProbe};
+pub use status::{BudgetProbe, FlowStatus};
 pub use subprocess::SubprocessUnitLauncher;
 pub use supervisor::{units_on_disk, FleetSupervisor, UnitOnDisk};
-pub use tools::{fleet_tools, FleetToolCtx};
 pub use unit::{
     MockUnitLauncher, Spawned, UnitError, UnitId, UnitKind, UnitLauncher, UnitOutcome, UnitSpec,
     UnitStatus,

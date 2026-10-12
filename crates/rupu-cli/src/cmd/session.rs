@@ -7906,6 +7906,10 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
                 scm: Some(scm_registry),
                 findings,
                 net_capture: Some(net_capture),
+                catalog: Some(Arc::new(rupu_orchestrator::FsCatalog::for_project_root(
+                    &global,
+                    session.project_root.as_deref(),
+                ))),
             },
         ));
         let agent = session_agent_spec(&global, &session);
@@ -8052,8 +8056,8 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             services: rupu_runtime::assembly::LaunchServices {
                 dispatcher: Some(dispatcher),
                 netflow: Some(netflow_sink.clone()),
-                extra_tools: Vec::new(),
                 provider: Some(prepared),
+                ..Default::default()
             },
             collectors: Vec::new(),
         };

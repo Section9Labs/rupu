@@ -6,7 +6,10 @@
 //! - sub-agent dispatch: [`dispatch_agent`], [`dispatch_agents_parallel`];
 //! - ledgers: [`coverage`], [`findings`], [`assets`];
 //! - connectors over the run's SCM registry: [`scm`], [`issues`],
-//!   [`github`], [`gitlab`].
+//!   [`github`], [`gitlab`];
+//! - a flow's message bus: [`board`], [`msg`]; its live status through the
+//!   [`ports::RunStatus`] port: [`goal`], [`budget`]; the agent/workflow
+//!   catalog through the [`ports::CatalogPort`] port: [`roster`].
 //!
 //! All tools implement the [`Tool`] trait and declare a
 //! [`ToolDescriptor`] (name, aliases, [`Effect`], needs). [`catalog`] lists
@@ -18,7 +21,9 @@
 //! same tools (spec W4).
 
 pub mod assets;
+pub mod board;
 pub mod bodies;
+pub mod budget;
 pub mod call;
 pub mod catalog;
 pub mod connector;
@@ -28,10 +33,14 @@ pub mod descriptor;
 pub mod findings;
 pub mod github;
 pub mod gitlab;
+pub mod goal;
 pub mod grant;
 pub mod issues;
 pub mod ledger;
+pub mod msg;
 pub mod output;
+pub mod ports;
+pub mod roster;
 pub mod scm;
 pub mod tool;
 
@@ -75,6 +84,7 @@ pub use permission::{
     AllowAlways, Decision, DenyReason, PermissionMode, PermissionPolicy, PromptAnswer,
     PromptRequest, Prompter, UnknownMode,
 };
+pub use ports::{CatalogPort, PortError, RunStatus};
 pub use read_file::ReadFileTool;
 pub use tool::{
     AgentDispatcher, BashConfig, CallContext, DerivedEvent, DispatchError, DispatchOutcome,

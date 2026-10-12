@@ -1,7 +1,7 @@
 //! The tool catalog: the descriptor of every tool rupu defines. Every tool
-//! but the agentiflow ones carries its descriptor next to its body in this
-//! crate ([`crate::bodies`] builds the bodies); the agentiflow tools (bodies
-//! in `rupu-agentiflow` until W5) carry theirs in [`flow`].
+//! but the agentiflow launch tools carries its descriptor next to its body
+//! in this crate ([`crate::bodies`] builds the bodies); the launch tools
+//! (bodies in `rupu-agentiflow` until W7) carry theirs in [`flow`].
 //!
 //! A [`ToolCatalog`] value is this static list plus extra descriptors
 //! ([`ToolCatalog::with`]): a run's injected tools. Grant resolution
@@ -68,22 +68,25 @@ pub static ALL: &[&ToolDescriptor] = &[
     &crate::issues::UPDATE_STATE,
     &crate::github::WORKFLOWS_DISPATCH,
     &crate::gitlab::PIPELINE_TRIGGER,
-    // agentiflow
-    &flow::BOARD_CLAIM,
-    &flow::BOARD_RELEASE,
-    &flow::BOARD_POST,
-    &flow::BOARD_READ,
-    &flow::BOARD_DIRECTIVE,
-    &flow::BOARD_RETRACT,
-    &flow::MSG_SEND,
-    &flow::AGENTS_LIST,
-    &flow::AGENTS_GET,
-    &flow::WORKFLOWS_LIST,
-    &flow::WORKFLOWS_GET,
-    &flow::CATALOG_SEARCH,
-    &flow::GOAL_STATUS,
-    &flow::GOAL_COVERAGE,
-    &flow::BUDGET_STATUS,
+    // a flow's message bus
+    &crate::board::CLAIM,
+    &crate::board::RELEASE,
+    &crate::board::POST,
+    &crate::board::READ,
+    &crate::board::DIRECTIVE,
+    &crate::board::RETRACT,
+    &crate::msg::SEND,
+    // the agent / workflow catalog
+    &crate::roster::AGENTS_LIST,
+    &crate::roster::AGENTS_GET,
+    &crate::roster::WORKFLOWS_LIST,
+    &crate::roster::WORKFLOWS_GET,
+    &crate::roster::CATALOG_SEARCH,
+    // a flow's live status
+    &crate::goal::STATUS,
+    &crate::goal::COVERAGE,
+    &crate::budget::STATUS,
+    // agentiflow launch tools (W7 folds these into `dispatch` / `join`)
     &flow::DISPATCH,
     &flow::RUN_WORKFLOW,
     &flow::WORKFLOWS_GENERATE,

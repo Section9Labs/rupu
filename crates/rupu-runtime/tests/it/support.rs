@@ -87,6 +87,7 @@ impl Home {
             scm: Some(Arc::new(rupu_scm::Registry::default())),
             findings: rupu_coverage::FindingWriteOptions::default(),
             net_capture: None,
+            catalog: Some(Arc::new(EmptyCatalog)),
         }
     }
 
@@ -183,4 +184,17 @@ pub fn run_start(path: &Path) -> (String, String) {
             _ => None,
         })
         .expect("a RunStart")
+}
+
+/// A catalog with nothing in it: what a site's `FsCatalog` is to the
+/// assembler (a port), without the orchestrator.
+pub struct EmptyCatalog;
+
+impl rupu_tools::CatalogPort for EmptyCatalog {
+    fn agents(&self) -> Result<Vec<rupu_tools::ports::AgentEntry>, rupu_tools::PortError> {
+        Ok(Vec::new())
+    }
+    fn workflows(&self) -> Vec<rupu_tools::ports::WorkflowEntry> {
+        Vec::new()
+    }
 }

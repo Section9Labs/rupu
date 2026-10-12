@@ -860,6 +860,12 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                 // target clone only creates below (`with_findings`).
                 findings: crate::findings_opts::base_options(&global, &cfg.findings),
                 net_capture: Some(net_capture),
+                // The agents and workflows the run (and its sub-agents) can
+                // read through the roster tools.
+                catalog: Some(Arc::new(rupu_orchestrator::FsCatalog::for_project_root(
+                    &global,
+                    project_root.as_deref(),
+                ))),
             },
         );
 
@@ -989,19 +995,19 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         )?;
         let assembler = Arc::new(assembler.with_findings(findings_base));
 
-        // A fleet unit joins the agentiflow (its board, mailbox and findings
-        // scope); every other `rupu run` is standalone.
-        let (origin, fleet_tools, fleet_collectors) = match fleet {
+        // A fleet unit joins the agentiflow (its message bus, collectors and
+        // findings scope); every other `rupu run` is standalone.
+        let (origin, fleet_bus, fleet_collectors) = match fleet {
             Some((flow_dir, participant, services)) => (
                 rupu_runtime::assembly::Origin::FlowUnit {
                     flow_id: services.flow_id,
                     flow_dir,
                     participant,
                 },
-                services.extra_tools,
+                Some(services.message_bus),
                 services.collectors,
             ),
-            None => (rupu_runtime::assembly::Origin::Standalone, Vec::new(), Vec::new()),
+            None => (rupu_runtime::assembly::Origin::Standalone, None, Vec::new()),
         };
         let workspace = rupu_runtime::assembly::WorkspaceBinding {
             id: ws.id.clone(),
@@ -1124,8 +1130,9 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             services: rupu_runtime::assembly::LaunchServices {
                 dispatcher: Some(dispatcher),
                 netflow: Some(netflow_sink.clone()),
-                extra_tools: fleet_tools,
+                message_bus: fleet_bus,
                 provider: Some(prepared),
+                ..Default::default()
             },
             collectors: fleet_collectors,
         };
