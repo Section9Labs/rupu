@@ -276,16 +276,19 @@ mod tests {
     use crate::runner::{run_agent, tests::opts_for, MockProvider, ScriptedTurn};
     use rupu_providers::types::StopReason;
 
-    fn stride_concerns() -> rupu_coverage::ConcernsBlock {
-        rupu_coverage::ConcernsBlock {
-            entries: vec![rupu_coverage::ConcernsEntry::Include(
-                rupu_coverage::IncludeDirective {
-                    include: "stride".to_string(),
-                    overrides: vec![],
-                    mode: rupu_coverage::CatalogMode::Auto,
-                    filter: None,
-                },
-            )],
+    fn stride_concerns() -> crate::RunConcerns {
+        crate::RunConcerns {
+            block: rupu_coverage::ConcernsBlock {
+                entries: vec![rupu_coverage::ConcernsEntry::Include(
+                    rupu_coverage::IncludeDirective {
+                        include: "stride".to_string(),
+                        overrides: vec![],
+                        mode: rupu_coverage::CatalogMode::Auto,
+                        filter: None,
+                    },
+                )],
+            },
+            full_mode_max_concerns: rupu_coverage::DEFAULT_FULL_MODE_THRESHOLD,
         }
     }
 

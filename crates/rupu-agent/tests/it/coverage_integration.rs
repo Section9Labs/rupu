@@ -3,34 +3,34 @@
 //! the coverage tools injected into the agent's tool list.
 
 use rupu_agent::runner::{CapturingMockProvider, ScriptedTurn};
-use rupu_agent::{run_agent, AgentRunOpts};
+use rupu_agent::{run_agent, AgentRunOpts, RunConcerns};
 use rupu_coverage::{
     read_manifests, target_id, CatalogMode, ConcernsBlock, ConcernsEntry, CoveragePaths,
-    IncludeDirective, Surface,
+    IncludeDirective, Surface, DEFAULT_FULL_MODE_THRESHOLD,
 };
 use rupu_providers::types::StopReason;
 use rupu_tools::ToolContext;
 
-fn stride_block() -> ConcernsBlock {
-    ConcernsBlock {
-        entries: vec![ConcernsEntry::Include(IncludeDirective {
-            include: "stride".to_string(),
-            overrides: vec![],
-            mode: CatalogMode::Auto,
-            filter: None,
-        })],
+fn stride(mode: CatalogMode, full_mode_max_concerns: usize) -> RunConcerns {
+    RunConcerns {
+        block: ConcernsBlock {
+            entries: vec![ConcernsEntry::Include(IncludeDirective {
+                include: "stride".to_string(),
+                overrides: vec![],
+                mode,
+                filter: None,
+            })],
+        },
+        full_mode_max_concerns,
     }
 }
 
-fn stride_index_block() -> ConcernsBlock {
-    ConcernsBlock {
-        entries: vec![ConcernsEntry::Include(IncludeDirective {
-            include: "stride".to_string(),
-            overrides: vec![],
-            mode: CatalogMode::Index,
-            filter: None,
-        })],
-    }
+fn stride_block() -> RunConcerns {
+    stride(CatalogMode::Auto, DEFAULT_FULL_MODE_THRESHOLD)
+}
+
+fn stride_index_block() -> RunConcerns {
+    stride(CatalogMode::Index, DEFAULT_FULL_MODE_THRESHOLD)
 }
 
 #[tokio::test]
@@ -206,8 +206,8 @@ async fn agent_run_without_concerns_does_not_inject_coverage_tools() {
     );
 }
 
-#[tokio::test]
-async fn agent_run_with_concerns_injects_catalog_into_system_prompt() {
+/// The system prompt a one-turn run with `concerns` sends.
+async fn captured_system_prompt(concerns: RunConcerns) -> String {
     let tmp = tempfile::TempDir::new().unwrap();
     let workspace = tmp.path().to_path_buf();
 
@@ -244,7 +244,7 @@ async fn agent_run_with_concerns_injects_catalog_into_system_prompt() {
                 tc
             },
             pins: Default::default(),
-            concerns: Some(stride_block()),
+            concerns: Some(concerns),
             max_turns: 5,
             stream: rupu_agent::StreamOpts {
                 no_stream: true,
@@ -266,7 +266,12 @@ async fn agent_run_with_concerns_injects_catalog_into_system_prompt() {
 
     let requests = captured.lock().unwrap();
     assert_eq!(requests.len(), 1);
-    let system = requests[0].system.as_deref().unwrap_or("");
+    requests[0].system.clone().unwrap_or_default()
+}
+
+#[tokio::test]
+async fn agent_run_with_concerns_injects_catalog_into_system_prompt() {
+    let system = captured_system_prompt(stride_block()).await;
     assert!(
         system.starts_with("Base prompt."),
         "system prompt should start with original prompt"
@@ -275,6 +280,21 @@ async fn agent_run_with_concerns_injects_catalog_into_system_prompt() {
         system.contains("STRIDE") || system.contains("stride") || system.contains("Spoofing"),
         "system prompt should contain catalog content from render_full_mode"
     );
+}
+
+/// `[coverage].full_mode_max_concerns` reaches the render: STRIDE's six
+/// concerns render in full under the default threshold and in index mode
+/// under a threshold of 1, both from an `auto` include.
+#[tokio::test]
+async fn full_mode_max_concerns_decides_an_auto_include_render_mode() {
+    let full = captured_system_prompt(stride(CatalogMode::Auto, DEFAULT_FULL_MODE_THRESHOLD)).await;
+    assert!(full.contains("## Coverage Catalog\n"), "{full}");
+    assert!(!full.contains("## Coverage Catalog (index)"), "{full}");
+
+    let index = captured_system_prompt(stride(CatalogMode::Auto, 1)).await;
+    assert!(index.contains("## Coverage Catalog (index)"), "{index}");
+    assert!(!index.contains("## Coverage Catalog\n"), "{index}");
+    assert!(index.contains("concerns in index mode"), "{index}");
 }
 
 #[tokio::test]

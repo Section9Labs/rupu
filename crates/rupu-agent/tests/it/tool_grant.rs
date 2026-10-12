@@ -88,7 +88,10 @@ async fn run(workspace: &Path, r: Run) -> (Vec<String>, Vec<Event>) {
                 tc
             },
             pins: Default::default(),
-            concerns: r.concerns,
+            concerns: r.concerns.map(|block| rupu_agent::RunConcerns {
+                block,
+                full_mode_max_concerns: rupu_coverage::DEFAULT_FULL_MODE_THRESHOLD,
+            }),
             max_turns: 10,
             stream: rupu_agent::StreamOpts {
                 no_stream: true,

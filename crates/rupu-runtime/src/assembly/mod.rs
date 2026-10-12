@@ -642,7 +642,20 @@ impl RunAssembler {
             call: Default::default(),
         };
 
-        let concerns = spec.overrides.concerns.clone().or(agent.concerns.clone());
+        let concerns = spec
+            .overrides
+            .concerns
+            .clone()
+            .or(agent.concerns.clone())
+            .map(|block| rupu_agent::RunConcerns {
+                block,
+                full_mode_max_concerns: self
+                    .ctx
+                    .config
+                    .coverage
+                    .full_mode_max_concerns
+                    .unwrap_or(rupu_coverage::DEFAULT_FULL_MODE_THRESHOLD),
+            });
         let grant = rupu_agent::grant::resolve_run_grant(rupu_agent::grant::RunGrantInputs {
             declared: agent.tools.as_deref(),
             step_actions: &d.step_actions,

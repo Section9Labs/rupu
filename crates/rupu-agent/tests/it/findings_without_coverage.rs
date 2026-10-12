@@ -365,15 +365,18 @@ fn concerns_opts_for(
     turns: Vec<ScriptedTurn>,
 ) -> AgentRunOpts {
     let mut opts = opts_for(workspace, agent_tools.clone(), turns);
-    opts.concerns = Some(rupu_coverage::ConcernsBlock {
-        entries: vec![rupu_coverage::ConcernsEntry::Include(
-            rupu_coverage::IncludeDirective {
-                include: "stride".to_string(),
-                overrides: vec![],
-                mode: rupu_coverage::CatalogMode::Auto,
-                filter: None,
-            },
-        )],
+    opts.concerns = Some(rupu_agent::RunConcerns {
+        block: rupu_coverage::ConcernsBlock {
+            entries: vec![rupu_coverage::ConcernsEntry::Include(
+                rupu_coverage::IncludeDirective {
+                    include: "stride".to_string(),
+                    overrides: vec![],
+                    mode: rupu_coverage::CatalogMode::Auto,
+                    filter: None,
+                },
+            )],
+        },
+        full_mode_max_concerns: rupu_coverage::DEFAULT_FULL_MODE_THRESHOLD,
     });
     // `concerns:` adds the ambient coverage grant: resolve it again.
     rupu_agent::grant::with_grant(opts, agent_tools.as_deref(), &[]).expect("grant")

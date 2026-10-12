@@ -51,8 +51,8 @@ pub use recovery::{Hop, HopBuilder, RecoveryOpts};
 pub use runner::{
     compact_messages, record_unstarted_run, run_agent, run_agent_full, run_agent_with_limits,
     AgentPins, AgentRunOpts, CompactionError, CompactionOutcome, Hooks, MockProvider,
-    OnStreamEventCallback, OnToolCallCallback, OnUsageCallback, RunError, RunExit, RunResult,
-    ScriptedTurn, StreamOpts, UnstartedRun, UsageKind, UsageTurn, UserTurn,
+    OnStreamEventCallback, OnToolCallCallback, OnUsageCallback, RunConcerns, RunError, RunExit,
+    RunResult, ScriptedTurn, StreamOpts, UnstartedRun, UsageKind, UsageTurn, UserTurn,
 };
 pub use rupu_providers::types::StopReason;
 pub use spec::{AgentSpec, AgentSpecParseError};

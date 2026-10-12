@@ -90,7 +90,9 @@ coverage.mark; for each issue, call findings.report…
 **Render modes.** `full` inlines each concern's body into the prompt; `index`
 renders a compact one-line-per-concern table that the agent searches on demand
 (use it for large catalogs like the full CWE list so the prompt stays small);
-`auto` (default) picks based on catalog size.
+`auto` (default) picks based on catalog size: index when the flattened catalog
+holds more than `[coverage].full_mode_max_concerns` concerns (default 80; see
+[configuration.md](configuration.md#coverage)), full otherwise.
 
 ### Workflow-level concerns
 

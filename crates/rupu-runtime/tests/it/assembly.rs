@@ -469,3 +469,27 @@ async fn a_failed_grant_leaves_the_transcript_and_is_a_run_error() {
         rupu_agent::RunError::ToolGrant(m) if m.contains("repot_finding")
     ));
 }
+
+/// `[coverage].full_mode_max_concerns` is the threshold a run's concerns
+/// render with; unset, the default applies.
+#[tokio::test]
+#[serial]
+async fn coverage_threshold_comes_from_config() {
+    let home = Home::new();
+    let spec = agent(
+        &home,
+        "provider: anthropic\nmodel: claude-sonnet-4-6\nconcerns:\n  - include: stride",
+    );
+    for (set, want) in [
+        (Some(3), 3),
+        (None, rupu_coverage::DEFAULT_FULL_MODE_THRESHOLD),
+    ] {
+        let mut cfg = config();
+        cfg.coverage.full_mode_max_concerns = set;
+        let l = launch(&home, spec.clone(), Origin::Standalone, "run_cov");
+        let _m = MockScript::set(DONE);
+        let run = home.assembler(cfg).assemble(l).await.expect("assembles");
+        let concerns = run.opts.concerns.as_ref().expect("the agent's concerns");
+        assert_eq!(concerns.full_mode_max_concerns, want, "{set:?}");
+    }
+}
