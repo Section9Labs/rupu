@@ -143,34 +143,29 @@ fn describe(root: &Path, dir: &Path, rel: &str, md: &Path) -> Found {
         .and_then(|n| n.to_str())
         .unwrap_or_default()
         .to_owned();
-    let inside = md.canonicalize().is_ok_and(|p| p.starts_with(root));
-    if !inside {
-        return Found {
-            name: dir_name,
-            rel: rel.to_owned(),
-            path: dir.to_owned(),
-            description: None,
-            error: Some("SKILL.md is a symlink that leaves the source".into()),
-        };
-    }
-    let parsed = std::fs::read_to_string(md)
-        .map_err(|e| e.to_string())
-        .and_then(|t| parse_skill_md(&t).map_err(|e| e.to_string()));
-    match parsed {
-        Ok((fm, _)) => Found {
-            name: fm.name,
-            rel: rel.to_owned(),
-            path: dir.to_owned(),
-            description: Some(fm.description),
-            error: None,
+    let parsed = if md.canonicalize().is_ok_and(|p| p.starts_with(root)) {
+        std::fs::read_to_string(md)
+            .map_err(|e| e.to_string())
+            .and_then(|t| parse_skill_md(&t).map_err(|e| e.to_string()))
+    } else {
+        Err("SKILL.md is a symlink that leaves the source".into())
+    };
+    let (name, description, error) = match parsed {
+        Ok((fm, _)) => match fm.name.parse::<SkillName>() {
+            Ok(_) => (fm.name, Some(fm.description), None),
+            Err(e) => {
+                let error = format!("name {:?}: {e}", fm.name);
+                (fm.name, None, Some(error))
+            }
         },
-        Err(e) => Found {
-            name: dir_name,
-            rel: rel.to_owned(),
-            path: dir.to_owned(),
-            description: None,
-            error: Some(e),
-        },
+        Err(e) => (dir_name, None, Some(e)),
+    };
+    Found {
+        name,
+        rel: rel.to_owned(),
+        path: dir.to_owned(),
+        description,
+        error,
     }
 }
 

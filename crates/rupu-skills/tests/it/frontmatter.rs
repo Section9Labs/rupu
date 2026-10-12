@@ -88,19 +88,6 @@ fn errors() {
         parse_skill_md("---\nname: a\ndescription: \"\"\n---\n"),
         Err(FrontmatterError::MissingDescription)
     );
-    let long = format!("---\nname: a\ndescription: {}\n---\n", "x".repeat(1025));
-    assert_eq!(
-        parse_skill_md(&long),
-        Err(FrontmatterError::DescriptionTooLong(1025))
-    );
-    let compat = format!(
-        "---\nname: a\ndescription: d\ncompatibility: {}\n---\n",
-        "x".repeat(501)
-    );
-    assert_eq!(
-        parse_skill_md(&compat),
-        Err(FrontmatterError::CompatibilityLength(501))
-    );
     assert_eq!(
         parse_skill_md("---\nname: a\ndescription: d\nmetadata:\n  nested: [1, 2]\n---\n"),
         Err(FrontmatterError::Metadata("nested".into()))
@@ -129,7 +116,7 @@ fn block_scalar_description_is_trimmed() {
 fn whitespace_only_compatibility_is_empty() {
     assert_eq!(
         parse_skill_md("---\nname: a\ndescription: d\ncompatibility: \"   \"\n---\n"),
-        Err(FrontmatterError::CompatibilityLength(0))
+        Err(FrontmatterError::EmptyCompatibility)
     );
     let (fm, _) =
         parse_skill_md("---\nname: a\ndescription: d\ncompatibility: \" uv \"\n---\n").unwrap();
@@ -155,4 +142,32 @@ fn closing_paren_ends_a_tool_token() {
         fm.allowed_tools,
         vec!["Bash(git:*)", "Read", "Bash(a (b) c)", "Grep"]
     );
+}
+
+/// Published skills exceed the agentskills.io limits (anthropics/skills'
+/// `claude-api` description is 1068 characters), so going over is a
+/// warning, not an invalid skill.
+#[test]
+fn over_limit_lengths_are_warnings() {
+    let (fm, _) = parse_skill_md(&format!(
+        "---\nname: a\ndescription: {}\ncompatibility: {}\n---\n",
+        "x".repeat(1068),
+        "y".repeat(501)
+    ))
+    .unwrap();
+    assert_eq!(fm.description.chars().count(), 1068);
+    assert_eq!(
+        fm.warnings,
+        vec![
+            "`description` is 1068 characters; the agentskills.io limit is 1024",
+            "`compatibility` is 501 characters; the agentskills.io limit is 500",
+        ]
+    );
+    let (fm, _) = parse_skill_md(&format!(
+        "---\nname: a\ndescription: {}\ncompatibility: {}\n---\n",
+        "x".repeat(1024),
+        "y".repeat(500)
+    ))
+    .unwrap();
+    assert!(fm.warnings.is_empty(), "{:?}", fm.warnings);
 }

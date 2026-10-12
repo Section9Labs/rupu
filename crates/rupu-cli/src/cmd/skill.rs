@@ -327,6 +327,9 @@ fn show(name: &str) -> anyhow::Result<()> {
             }
         };
         let fm = &s.frontmatter;
+        for w in &fm.warnings {
+            println!("  warning:       {w}");
+        }
         println!("  description:   {}", fm.description);
         if let Some(l) = &fm.license {
             println!("  license:       {l}");
@@ -373,7 +376,12 @@ fn validate(name: Option<&str>, all: bool) -> anyhow::Result<bool> {
     let mut ok = true;
     for e in entries {
         match &e.skill {
-            Ok(_) => println!("ok       {} ({})", e.dir_name, e.layer.as_str()),
+            Ok(s) => {
+                println!("ok       {} ({})", e.dir_name, e.layer.as_str());
+                for w in &s.frontmatter.warnings {
+                    println!("warn     {} ({}): {w}", e.dir_name, e.layer.as_str());
+                }
+            }
             Err(err) => {
                 ok = false;
                 println!("INVALID  {} ({}): {err}", e.dir_name, e.layer.as_str());
@@ -396,7 +404,10 @@ fn install(
     let source = parse_source(input, git_ref, home.as_deref())?;
     if list_only {
         for f in list_source(&source, &GitFetcher)? {
-            let detail = f.error.or(f.description).unwrap_or_default();
+            let detail = match f.error {
+                Some(e) => format!("INVALID: {e}"),
+                None => f.description.unwrap_or_default(),
+            };
             let at = if f.rel.is_empty() { ".".into() } else { f.rel };
             println!(
                 "{:<28} {:<36} {}",

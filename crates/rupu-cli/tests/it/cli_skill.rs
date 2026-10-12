@@ -221,3 +221,94 @@ fn install_project_outside_a_project_is_refused() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("not inside a rupu project"));
 }
+
+#[test]
+fn an_over_limit_description_is_a_warning_not_a_failure() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let long = skill_src(src.path(), "wordy", &"x".repeat(1068));
+    ok(&rupu(
+        home.path(),
+        cwd.path(),
+        &["skill", "install", long.to_str().unwrap()],
+    ));
+
+    let out = rupu(home.path(), cwd.path(), &["skill", "validate", "--all"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    assert!(stdout.contains("ok       wordy (global)"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "warn     wordy (global): `description` is 1068 characters; the agentskills.io limit is 1024"
+        ),
+        "{stdout}"
+    );
+
+    let show = ok(&rupu(home.path(), cwd.path(), &["skill", "show", "wordy"]));
+    assert!(
+        show.contains("  warning:       `description` is 1068 characters"),
+        "{show}"
+    );
+}
+
+#[test]
+fn install_list_marks_invalid_skills() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    skill_src(&repo.path().join("skills"), "good", "Fine.");
+    let bad = repo.path().join("skills/bad");
+    fs::create_dir_all(&bad).unwrap();
+    fs::write(bad.join("SKILL.md"), "---\nname: bad\n---\n").unwrap();
+    let odd = repo.path().join("skills/odd");
+    fs::create_dir_all(&odd).unwrap();
+    fs::write(
+        odd.join("SKILL.md"),
+        "---\nname: Not_A_Name\ndescription: Looks fine.\n---\n",
+    )
+    .unwrap();
+
+    let listed = ok(&rupu(
+        home.path(),
+        cwd.path(),
+        &["skill", "install", "--list", repo.path().to_str().unwrap()],
+    ));
+    let line = |name: &str| {
+        listed
+            .lines()
+            .find(|l| l.starts_with(name))
+            .unwrap_or_else(|| panic!("no {name} row: {listed}"))
+            .to_owned()
+    };
+    assert!(
+        line("bad ").contains("INVALID: frontmatter has no `description`"),
+        "{listed}"
+    );
+    assert!(line("Not_A_Name ").contains("INVALID: name"), "{listed}");
+    assert!(line("good ").ends_with("Fine."), "{listed}");
+}
+
+#[test]
+fn naming_a_skill_twice_installs_it_once() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    skill_src(&repo.path().join("skills"), "pdf", "PDF.");
+    skill_src(&repo.path().join("skills"), "docx", "Word.");
+    let out = ok(&rupu(
+        home.path(),
+        cwd.path(),
+        &[
+            "skill",
+            "install",
+            "--skill",
+            "pdf",
+            "--skill",
+            "pdf",
+            repo.path().to_str().unwrap(),
+        ],
+    ));
+    assert_eq!(out.matches("installed pdf").count(), 1, "{out}");
+    assert!(home.path().join("skills/.sources/pdf.json").is_file());
+}

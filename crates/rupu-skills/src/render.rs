@@ -1,6 +1,7 @@
 //! The text a model sees (spec §3.1 to §3.3). Changing a string here
 //! changes every run's system prompt; the tests pin each byte.
 
+use crate::frontmatter::MAX_DESCRIPTION_LEN;
 use crate::tree::ContentHash;
 use std::path::Path;
 
@@ -46,8 +47,13 @@ pub fn render_skills_section(
         let lines: Vec<String> = index
             .iter()
             .map(|i| {
-                let description: Vec<&str> = i.description.split_whitespace().collect();
-                format!("- {}: {}", i.name, description.join(" "))
+                let words: Vec<&str> = i.description.split_whitespace().collect();
+                let joined = words.join(" ");
+                let mut description: String = joined.chars().take(MAX_DESCRIPTION_LEN).collect();
+                if description.len() < joined.len() {
+                    description.push('…');
+                }
+                format!("- {}: {description}", i.name)
             })
             .collect();
         parts.push(format!("{INDEX_HEADER}\n\n{}", lines.join("\n")));

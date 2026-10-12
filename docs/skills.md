@@ -45,13 +45,17 @@ A skill is a directory whose name is the skill's name and which contains
 | Field | Rule |
 |---|---|
 | `name` | Required. 1 to 64 chars, `a-z`, `0-9`, `-`, no leading, trailing or doubled `-`. Must equal the directory name. |
-| `description` | Required. 1 to 1024 chars. |
+| `description` | Required, not empty. Over 1024 chars is a warning; the index the model sees cuts it at 1024 chars. |
 | `license` | Optional, free text. |
-| `compatibility` | Optional, 1 to 500 chars. Shown by `rupu skill show`. |
+| `compatibility` | Optional, not empty when present. Over 500 chars is a warning. Shown by `rupu skill show`. |
 | `metadata` | Optional string-to-string map. Kept, not interpreted. A number such as `version: 1.0` is read as the string `"1.0"`. |
 | `allowed-tools` | Optional. A space-separated string, or a YAML list. Informational only: it is never a tool grant. |
 | `disable-model-invocation` | When `true` the skill is left out of the index the model sees. |
 | anything else | Accepted and ignored, since other harnesses add their own keys. |
+
+The 1024 and 500 limits come from the agentskills.io specification. Published
+skills go over them (Anthropic's `claude-api` skill has a 1068-character
+description), so rupu warns rather than rejecting the skill.
 
 The body after the frontmatter is the instructions. Paths in it are relative
 to the skill's directory. A UTF-8 BOM and CRLF line endings are accepted.
@@ -108,7 +112,8 @@ and `node_modules`. Then:
 - Several found: `--skill <name>` (repeatable) picks some, `--all` takes every
   valid one and reports the invalid ones it skipped, and with neither the
   command lists them and installs nothing.
-- `--list` lists the skills in the source and installs nothing.
+- `--list` lists the skills in the source and installs nothing. An invalid
+  skill's row reads `INVALID: <error>` in place of its description.
 
 ```sh
 rupu skill install anthropics/skills --list
@@ -192,7 +197,8 @@ and the skill's files. A bare name shows every layer that has it; prefix
 `global:` or `project:` to pick one.
 
 `validate` checks skills against the rules above and exits 1 when any is
-invalid.
+invalid. It prints a `warn` line for each warning, such as an over-limit
+description; warnings alone exit 0. `show` prints them too.
 
 ## Granting skills to agents
 

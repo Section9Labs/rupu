@@ -65,13 +65,15 @@ A skill is a directory whose name is the skill's name and which contains `SKILL.
 | Field | Rule rupu enforces |
 |---|---|
 | `name` | Required. 1 to 64 chars, `a-z`, `0-9`, `-`, no leading, trailing or doubled `-`. Must equal the directory name. |
-| `description` | Required. 1 to 1024 chars. |
+| `description` | Required, not empty. Over 1024 chars is a warning, not invalid; the index (§3.1) cuts it at 1024 chars and appends `…`. |
 | `license` | Optional, free text. |
-| `compatibility` | Optional, 1 to 500 chars. Shown by `rupu skill show` and in the load result. |
+| `compatibility` | Optional, not empty when present. Over 500 chars is a warning, not invalid. Shown by `rupu skill show` and in the load result. |
 | `metadata` | Optional string-to-string map. Kept, not interpreted. |
 | `allowed-tools` | Optional, experimental. A space-separated string per the specification; a YAML list is also accepted, since some harnesses write one. Read, never enforced as a grant (§3.5). |
 | `disable-model-invocation` | Claude Code extension. When `true` the skill is left out of the index (§3.2). |
 | anything else | Accepted and ignored. Unlike agent frontmatter, `SKILL.md` is not `deny_unknown_fields`: harnesses add their own keys, and rejecting them would break S1. |
+
+The two length limits are warnings because published skills exceed them (anthropics/skills' `claude-api` has a 1068-char description), and rejecting them would break S1. `rupu skill show` and `validate` print the warnings; `validate` still exits 0 on warnings alone.
 
 The body is the instructions. Paths in it are relative to the skill's directory.
 
@@ -196,7 +198,7 @@ skill are relative to the base directory that `skills.load` returns.
 - code-review: ...
 ```
 
-The order is by name, so the prompt is byte-stable for a given set. Concerns keep rendering in the runner (`crates/rupu-agent/src/runner.rs:1943`). Moving them is out of scope.
+Each description is folded onto one line, and one longer than 1024 chars is cut there with `…` appended (§1.1). The order is by name, so the prompt is byte-stable for a given set. Concerns keep rendering in the runner (`crates/rupu-agent/src/runner.rs:1943`). Moving them is out of scope.
 
 ### 3.2 Preloaded skills
 

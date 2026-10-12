@@ -227,3 +227,26 @@ fn allowed_tools_line_with_a_spaced_pattern_maps_to_two_tools() {
     .unwrap();
     assert_eq!(mapped_tools(&fm.allowed_tools), vec!["bash", "read_file"]);
 }
+
+#[test]
+fn an_over_limit_index_description_is_cut_at_1024_chars() {
+    let long = "é".repeat(1100);
+    let exact = "x".repeat(1024);
+    let out = render_skills_section(
+        &[],
+        &[
+            IndexItem {
+                name: "long",
+                description: &long,
+            },
+            IndexItem {
+                name: "exact",
+                description: &exact,
+            },
+        ],
+    )
+    .unwrap();
+    let lines: Vec<&str> = out.lines().rev().take(2).collect();
+    assert_eq!(lines[0], format!("- long: {}…", "é".repeat(1024)));
+    assert_eq!(lines[1], format!("- exact: {exact}"));
+}

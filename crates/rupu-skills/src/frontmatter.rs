@@ -5,6 +5,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// The agentskills.io limits. Published skills exceed them, so going over
+/// is a warning; the index cuts a description at `MAX_DESCRIPTION_LEN`.
 pub const MAX_DESCRIPTION_LEN: usize = 1024;
 pub const MAX_COMPATIBILITY_LEN: usize = 500;
 
@@ -17,6 +19,10 @@ pub struct Frontmatter {
     pub metadata: BTreeMap<String, String>,
     pub allowed_tools: Vec<String>,
     pub disable_model_invocation: bool,
+    /// Rules the skill breaks without being invalid, such as an over-limit
+    /// `description`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -31,10 +37,8 @@ pub enum FrontmatterError {
     MissingName,
     #[error("frontmatter has no `description` (or it is empty)")]
     MissingDescription,
-    #[error("`description` is {0} characters; the limit is 1024")]
-    DescriptionTooLong(usize),
-    #[error("`compatibility` is {0} characters; it must be 1 to 500")]
-    CompatibilityLength(usize),
+    #[error("`compatibility` is empty; give it text or leave it out")]
+    EmptyCompatibility,
     #[error("`metadata.{0}` must be a string, number or boolean")]
     Metadata(String),
 }
@@ -101,16 +105,22 @@ pub fn parse_skill_md(text: &str) -> Result<(Frontmatter, String), FrontmatterEr
         .map(|d| d.trim().to_owned())
         .filter(|d| !d.is_empty())
         .ok_or(FrontmatterError::MissingDescription)?;
-    let len = description.chars().count();
-    if len > MAX_DESCRIPTION_LEN {
-        return Err(FrontmatterError::DescriptionTooLong(len));
-    }
     let compatibility = raw.compatibility.map(|c| c.trim().to_owned());
-    if let Some(c) = &compatibility {
-        let len = c.chars().count();
-        if len == 0 || len > MAX_COMPATIBILITY_LEN {
-            return Err(FrontmatterError::CompatibilityLength(len));
+    if compatibility.as_deref() == Some("") {
+        return Err(FrontmatterError::EmptyCompatibility);
+    }
+    let mut warnings = Vec::new();
+    let mut over_limit = |field: &str, value: &str, limit: usize| {
+        let len = value.chars().count();
+        if len > limit {
+            warnings.push(format!(
+                "`{field}` is {len} characters; the agentskills.io limit is {limit}"
+            ));
         }
+    };
+    over_limit("description", &description, MAX_DESCRIPTION_LEN);
+    if let Some(c) = &compatibility {
+        over_limit("compatibility", c, MAX_COMPATIBILITY_LEN);
     }
     let mut metadata = BTreeMap::new();
     for (k, v) in raw.metadata {
@@ -141,6 +151,7 @@ pub fn parse_skill_md(text: &str) -> Result<(Frontmatter, String), FrontmatterEr
             metadata,
             allowed_tools,
             disable_model_invocation: raw.disable_model_invocation,
+            warnings,
         },
         body,
     ))
