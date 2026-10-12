@@ -57,27 +57,26 @@ impl ConfigPaths {
     }
 }
 
-/// The project layer's config file for `project_root`, or `None` when there
-/// is no project root or its `.rupu/` IS the global dir.
+/// The project layer's `.rupu/` for `project_root`, or `None` when there is
+/// no project root or its `.rupu/` IS the global dir (R5).
 ///
 /// `project_root_for` treats `~/.rupu` as a project marker, so a repo
-/// without its own `.rupu/` resolves to `$HOME`, whose "project config" is
-/// the global `config.toml` itself. Loading that file a second time as the
-/// project layer let global values outrank the customer layer (project beats
-/// customer), so the layer is dropped there. Paths are compared
-/// canonicalized, or raw when either side cannot be canonicalized.
-fn project_config_path(global: &Path, project_root: Option<&Path>) -> Option<PathBuf> {
-    let root = project_root?;
-    let project_dir = root.join(".rupu");
+/// without its own `.rupu/` resolves to `$HOME`, whose "project layer" is
+/// the global dir itself. Loading it a second time as the project layer let
+/// global values outrank the customer layer (project beats customer), so the
+/// layer is dropped there. Paths are compared canonicalized, or raw when
+/// either side cannot be canonicalized.
+pub fn project_layer_dir(global: &Path, project_root: Option<&Path>) -> Option<PathBuf> {
+    let project_dir = project_root?.join(".rupu");
     let same = match (project_dir.canonicalize(), global.canonicalize()) {
         (Ok(a), Ok(b)) => a == b,
         _ => project_dir == global,
     };
-    if same {
-        None
-    } else {
-        Some(project_dir.join("config.toml"))
-    }
+    (!same).then_some(project_dir)
+}
+
+fn project_config_path(global: &Path, project_root: Option<&Path>) -> Option<PathBuf> {
+    project_layer_dir(global, project_root).map(|d| d.join("config.toml"))
 }
 
 /// Layer paths for a load that serves a project. The customer is the one

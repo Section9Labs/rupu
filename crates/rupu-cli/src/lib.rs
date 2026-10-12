@@ -196,6 +196,11 @@ pub enum Cmd {
         #[command(subcommand)]
         action: cmd::fleet::Action,
     },
+    /// Agent Skills: install, update, list, show and validate SKILL.md skills.
+    Skill {
+        #[command(subcommand)]
+        action: cmd::skill::Action,
+    },
     /// Finding reports: the embedded report schema, and report exports.
     Findings {
         #[command(subcommand)]
@@ -465,6 +470,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Mcp { action } => cmd::mcp::handle(action).await,
         Cmd::Coverage { action } => cmd::coverage::handle(action, cli.format).await,
         Cmd::Fleet { action } => cmd::fleet::handle(action).await,
+        Cmd::Skill { action } => cmd::skill::handle(action, cli.format).await,
         Cmd::Findings { action } => cmd::findings::handle(action, cli.format).await,
         Cmd::Cron { action } => {
             cmd::cron::handle(action, cli.format, cli.absolute, cli.all_columns).await
@@ -543,6 +549,7 @@ fn ensure_output_format_supported(
             format,
             &[output::formats::OutputFormat::Table],
         ),
+        Cmd::Skill { action } => cmd::skill::ensure_output_format(action, format),
         Cmd::Findings { action } => cmd::findings::ensure_output_format(action, format),
         Cmd::Cron { action } => cmd::cron::ensure_output_format(action, format),
         Cmd::Webhook { .. } => output::formats::ensure_supported(

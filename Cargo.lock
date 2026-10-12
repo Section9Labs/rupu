@@ -4698,6 +4698,7 @@ dependencies = [
  "rupu-providers",
  "rupu-runtime",
  "rupu-scm",
+ "rupu-skills",
  "rupu-tools",
  "rupu-transcript",
  "rupu-update",
@@ -5051,6 +5052,21 @@ dependencies = [
  "toml",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "rupu-skills"
+version = "0.83.0"
+dependencies = [
+ "git2",
+ "hex",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "walkdir",
 ]
 
 [[package]]

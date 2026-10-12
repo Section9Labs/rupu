@@ -22,6 +22,7 @@ mod cli_list_customers;
 mod cli_man;
 mod cli_scm_bind_walkthrough;
 mod cli_session;
+mod cli_skill;
 mod cli_ui;
 mod cli_update_platform;
 mod cli_usage;

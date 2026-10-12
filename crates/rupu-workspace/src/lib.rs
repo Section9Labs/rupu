@@ -36,7 +36,7 @@ pub use autoflow_worktree::{
 };
 pub use config_paths::{
     config_paths, config_paths_for_customer, is_safe_definition_name, locate_workflow,
-    project_root_for, ConfigPaths,
+    project_layer_dir, project_root_for, ConfigPaths,
 };
 pub use customers::{
     validate_slug, validate_ws_id, Customer, CustomerError, CustomerMeta, CustomerStore, MetaPatch,

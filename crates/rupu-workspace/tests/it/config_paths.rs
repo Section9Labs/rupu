@@ -242,3 +242,22 @@ fn locate_workflow_takes_yml_with_yaml_winning() {
         Some(local_yml)
     );
 }
+
+#[test]
+fn project_layer_dir_drops_the_global_dir() {
+    let home = tempfile::tempdir().unwrap();
+    let global = home.path().join(".rupu");
+    std::fs::create_dir_all(&global).unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(repo.path().join(".rupu")).unwrap();
+
+    assert_eq!(
+        rupu_workspace::project_layer_dir(&global, Some(repo.path())),
+        Some(repo.path().join(".rupu"))
+    );
+    assert_eq!(
+        rupu_workspace::project_layer_dir(&global, Some(home.path())),
+        None
+    );
+    assert_eq!(rupu_workspace::project_layer_dir(&global, None), None);
+}
