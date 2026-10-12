@@ -32,8 +32,15 @@ flowchart LR
 |---|---|---|---|---|
 | `board.claim`, `board.release`, `board.post`, `board.read`, `msg.send` | `rupu-agentiflow/src/tools.rs` | `rupu-tools/src/board/`, `rupu-tools/src/msg/` | `MessageBus` | `rupu_fleet::{Board, Mailbox}` directly (D2) |
 | `board.directive`, `board.retract` | `status_tools.rs` | `rupu-tools/src/board/` | `MessageBus` | same. **Author = the caller's participant id**, no longer hardcoded `"lead"` |
-| `agents.list`, `agents.get`, `workflows.list`, `workflows.get`, `catalog.search` | `roster.rs` | `rupu-tools/src/catalog/` | `Catalog` | port `CatalogPort` (agent/workflow loading lives above `rupu-tools`). Adapter in `rupu-runtime/src/services/catalog.rs` over `load_agents` / `list_workflow_summaries` |
+| `agents.list`, `agents.get`, `workflows.list`, `workflows.get`, `catalog.search` | `roster.rs` | `rupu-tools/src/catalog/` | `Catalog` | port `CatalogPort` (agent/workflow loading lives above `rupu-tools`). Adapter `FsCatalog` in **`rupu-orchestrator/src/catalog.rs`** (next to `list_workflow_summaries`; the orchestrator already depends on `rupu-agent` + `rupu-tools`). Injected into the assembler as `Arc<dyn CatalogPort>` (see §3.1a) |
 | `goal.status`, `goal.coverage` (was `coverage.status`), `budget.status` | `status_tools.rs` | `rupu-tools/src/goal/`, `rupu-tools/src/budget/` | `RunStatus` | port `RunStatus`, implemented by `rupu-agentiflow` over its envelope (goals, `ActiveSet`, `BudgetProbe`) |
+
+### 3.1a Where the `CatalogPort` adapter lives (corrected 2026-10-12)
+
+`list_workflow_summaries` needs the workflow parser, so it lives in `rupu-orchestrator`. `rupu-orchestrator` depends on `rupu-runtime`, so an adapter in `rupu-runtime` would create a dependency cycle. Instead:
+- **The adapter is `FsCatalog` in `rupu-orchestrator/src/catalog.rs`**, built over `load_agents` + `list_workflow_summaries`. It takes over `roster.rs`'s tolerant loading: a single unparseable file is reported in the listing, and the listing still succeeds. It does not live in `rupu-agentiflow`, because workflow runs must be able to serve the catalog tools too.
+- **The assembler receives it as a port**, `AssemblyContext.catalog: Option<Arc<dyn CatalogPort>>`. This is the same injection W3a uses for `SubRunStore` / `DispatchEvents`. Every launch site sets it: `WorkflowRuntime::new` in the orchestrator, `rupu run` / `rupu session` in the CLI, and the agentiflow run.
+- **If a site doesn't set it,** `Service::Catalog` is absent, and an explicitly granted `agents.list` gets W2's `tool_unavailable` notice. It is never a silent drop. The `origin_matrix` snapshot pins which origins provide it: all of them.
 
 ### 3.2 The `MessageBus` service value
 
@@ -71,7 +78,7 @@ These reproduce today's toolsets exactly, now with a recorded reason:
 |---|---|---|
 | `FlowLead` | `board.*`, `msg.send`, `goal.*`, `budget.status`, `agents.*`, `workflows.list`, `workflows.get`, `catalog.search`, `findings.report` (today's lead auto-append, `run.rs:736`), plus the launch tools (agentiflow-owned until W7) | MessageBus (participant `lead`), RunStatus, Catalog, Launcher (W7) |
 | `FlowUnit` | `board.claim`, `board.release`, `board.post`, `board.read`, `msg.send` | MessageBus (participant `<agent>#<n>`) |
-| any other origin | — | Catalog (reading agent/workflow files is always possible) |
+| any other origin | — | Catalog (every launch site injects `FsCatalog`, §3.1a) |
 
 Because grants are now just names, an agent outside a flow can list `agents.list` (Catalog is always available) and get it. If it lists `board.post` outside a flow, it gets W2's `tool_unavailable` notice, until F1 gives every run a message bus.
 
@@ -93,7 +100,8 @@ Already derived as of W1 (Section9Labs/rupu#809, see the as-built note under W1 
 | `rupu-tools/src/ports.rs` | `CatalogPort`, `RunStatus` |
 | `rupu-tools/Cargo.toml` | `rupu-fleet` dependency |
 | `rupu-fleet/src/bus.rs` | **new**: `Bus`, `ClaimTable`, `BusCaps` |
-| `rupu-runtime/src/services/catalog.rs` | `CatalogPort` adapter |
+| `rupu-orchestrator/src/catalog.rs` | `FsCatalog: CatalogPort` (keeps `roster.rs`'s tolerant loading: one unparseable agent is reported, not fatal) |
+| `rupu-runtime/src/assembly/` | `AssemblyContext.catalog: Option<Arc<dyn CatalogPort>>`; `Service::Catalog` provided only when it is set |
 | `rupu-agentiflow/src/{tools,status_tools,roster}.rs` | **deleted** (except the `FlowStatus` impl, which moves to `status.rs`) |
 | `rupu-agentiflow/src/run.rs`, `cmd/run.rs` (`--fleet-*` path) | services + origin, not tools |
 | `rupu-agent/src/runner.rs` | `extra_tools` survives only for the launch tools (W7 deletes it) |
