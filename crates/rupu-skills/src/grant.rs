@@ -4,7 +4,7 @@
 
 use crate::catalog::{CatalogEntry, SkillCatalog};
 use crate::name::{NameError, SkillName};
-use crate::skill::{Layer, Skill};
+use crate::skill::{Layer, Skill, SkillError};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
@@ -20,9 +20,9 @@ pub enum SkillGrant {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum GrantParseError {
-    #[error("skills: entry {entry:?}: {source}")]
+    #[error("entry {entry:?}: {source}")]
     Name { entry: String, source: NameError },
-    #[error("skills: entry {entry:?}: unknown layer {prefix:?} (use global: or project:)")]
+    #[error("entry {entry:?}: unknown layer {prefix:?} (use global: or project:)")]
     UnknownLayer { entry: String, prefix: String },
 }
 
@@ -59,6 +59,25 @@ pub fn parse_grants(entries: &[String]) -> Result<Vec<SkillGrant>, GrantParseErr
     entries.iter().map(|e| e.parse()).collect()
 }
 
+/// A catalog entry's load error, shared with the catalog that cached it.
+/// Two are equal when they are the same entry's failure.
+#[derive(Debug, Clone)]
+pub struct EntryError(pub Arc<SkillError>);
+
+impl PartialEq for EntryError {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for EntryError {}
+
+impl fmt::Display for EntryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolveError {
     Unknown {
@@ -68,7 +87,7 @@ pub enum ResolveError {
     Invalid {
         name: String,
         layer: Layer,
-        error: String,
+        error: EntryError,
     },
     Ambiguous {
         name: String,
@@ -116,7 +135,7 @@ pub fn resolve_grants(
 ) -> Result<Vec<Arc<Skill>>, Vec<ResolveError>> {
     let mut picked: BTreeMap<(String, Layer), Arc<Skill>> = BTreeMap::new();
     let mut errors = Vec::new();
-    let mut take = |e: &CatalogEntry| match &e.skill {
+    let mut take = |e: &CatalogEntry| match e.load() {
         Ok(s) => {
             picked.insert((e.dir_name.clone(), e.layer), s.clone());
             None
@@ -124,7 +143,7 @@ pub fn resolve_grants(
         Err(err) => Some(ResolveError::Invalid {
             name: e.dir_name.clone(),
             layer: e.layer,
-            error: err.to_string(),
+            error: EntryError(err.clone()),
         }),
     };
     for g in grants {

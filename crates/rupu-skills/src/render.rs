@@ -139,6 +139,6 @@ pub fn render_reattach(items: &[ReattachItem<'_>], omitted: &[&str], missing: &[
     if !missing.is_empty() {
         out.push_str(&format!("\nNo longer installed: {}", missing.join(", ")));
     }
-    out.push_str("\n</skills-in-use>");
+    out.push_str(&format!("\n</{}", &REATTACH_MARKER[1..]));
     out
 }

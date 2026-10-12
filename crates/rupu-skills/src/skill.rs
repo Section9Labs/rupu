@@ -78,6 +78,18 @@ pub enum SkillError {
     Tree(#[from] TreeError),
 }
 
+impl SkillError {
+    /// The I/O error this load failed on, if it failed on one.
+    pub fn io_error(&self) -> Option<&std::io::Error> {
+        match self {
+            SkillError::Io { source, .. } | SkillError::Tree(TreeError::Io { source, .. }) => {
+                Some(source)
+            }
+            _ => None,
+        }
+    }
+}
+
 pub fn load_skill(dir: &Path, layer: Layer) -> Result<Skill, SkillError> {
     let io = |source| SkillError::Io {
         path: dir.to_owned(),

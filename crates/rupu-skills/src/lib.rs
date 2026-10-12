@@ -23,7 +23,9 @@ pub use catalog::{CatalogEntry, DiscoverError, LayerDirs, SkillCatalog};
 pub use frontmatter::{
     parse_skill_md, Frontmatter, FrontmatterError, MAX_COMPATIBILITY_LEN, MAX_DESCRIPTION_LEN,
 };
-pub use grant::{parse_grants, resolve_grants, GrantParseError, ResolveError, SkillGrant};
+pub use grant::{
+    parse_grants, resolve_grants, EntryError, GrantParseError, ResolveError, SkillGrant,
+};
 pub use name::{NameError, SkillName, MAX_NAME_LEN};
 pub use run::{
     resolve_run_skills, GrantedSkill, ResolvedSkills, RunSkillsError, SkillReason, SkillRequest,

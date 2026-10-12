@@ -9,7 +9,7 @@ use crate::grant::{parse_grants, resolve_grants, GrantParseError, ResolveError};
 use crate::render::{render_skills_section, IndexItem, PreloadItem};
 use crate::skill::{Layer, Skill};
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -66,7 +66,21 @@ pub enum RunSkillsError {
     Resolve(Vec<ResolveError>),
 }
 
-type Bound = BTreeSet<(String, Layer)>;
+impl RunSkillsError {
+    /// The I/O errors behind the skills that failed to load.
+    pub fn io_errors(&self) -> impl Iterator<Item = &std::io::Error> {
+        let resolve = match self {
+            RunSkillsError::Resolve(errors) => errors.as_slice(),
+            RunSkillsError::Parse(_) => &[],
+        };
+        resolve.iter().filter_map(|e| match e {
+            ResolveError::Invalid { error, .. } => error.0.io_error(),
+            _ => None,
+        })
+    }
+}
+
+type Bound = BTreeMap<(String, Layer), Arc<Skill>>;
 
 fn bind(entries: &[String], catalog: &SkillCatalog) -> Result<Bound, RunSkillsError> {
     if entries.is_empty() {
@@ -75,8 +89,8 @@ fn bind(entries: &[String], catalog: &SkillCatalog) -> Result<Bound, RunSkillsEr
     let skills =
         resolve_grants(&parse_grants(entries)?, catalog).map_err(RunSkillsError::Resolve)?;
     Ok(skills
-        .iter()
-        .map(|s| (s.name.as_str().to_owned(), s.layer))
+        .into_iter()
+        .map(|s| ((s.name.as_str().to_owned(), s.layer), s))
         .collect())
 }
 
@@ -89,36 +103,26 @@ pub fn resolve_run_skills(
         .flat_map(|r| r.grants.iter().chain(r.preload.iter()))
         .cloned()
         .collect();
-    if all.is_empty() {
-        return Ok(ResolvedSkills::default());
-    }
-    let skills = resolve_grants(&parse_grants(&all)?, catalog).map_err(RunSkillsError::Resolve)?;
-    let per_request = requests
-        .iter()
-        .map(|r| {
-            Ok((
-                r.reason,
-                bind(r.grants, catalog)?,
-                bind(r.preload, catalog)?,
-            ))
-        })
-        .collect::<Result<Vec<_>, RunSkillsError>>()?;
-    let entries = skills
-        .into_iter()
-        .map(|skill| {
-            let key = (skill.name.as_str().to_owned(), skill.layer);
-            let preload = per_request.iter().any(|(_, _, p)| p.contains(&key));
-            let reason = per_request
-                .iter()
-                .find(|(_, g, p)| g.contains(&key) || p.contains(&key))
-                .map_or(SkillReason::Agent, |(reason, ..)| *reason);
-            let indexed = !preload && !skill.frontmatter.disable_model_invocation;
-            GrantedSkill {
+    bind(&all, catalog)?;
+    let mut granted: BTreeMap<(String, Layer), GrantedSkill> = BTreeMap::new();
+    for r in requests {
+        let grants = bind(r.grants, catalog)?.into_iter().map(|b| (b, false));
+        let preloads = bind(r.preload, catalog)?.into_iter().map(|b| (b, true));
+        for ((key, skill), preload) in grants.chain(preloads) {
+            let g = granted.entry(key).or_insert_with(|| GrantedSkill {
                 skill,
-                preload,
-                indexed,
-                reason,
-            }
+                preload: false,
+                indexed: false,
+                reason: r.reason,
+            });
+            g.preload |= preload;
+        }
+    }
+    let entries = granted
+        .into_values()
+        .map(|mut g| {
+            g.indexed = !g.preload && !g.skill.frontmatter.disable_model_invocation;
+            g
         })
         .collect();
     Ok(ResolvedSkills { entries })

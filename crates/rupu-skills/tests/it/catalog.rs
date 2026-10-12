@@ -89,7 +89,7 @@ fn discover_keeps_both_layers_and_invalid_entries() {
     assert_eq!(cat.named("code-review").count(), 2);
     let proj = cat.get(Layer::Project, "code-review").unwrap();
     assert_eq!(
-        proj.skill.as_ref().unwrap().frontmatter.description,
+        proj.skill().unwrap().frontmatter.description,
         "project review"
     );
 }
@@ -121,7 +121,7 @@ fn a_symlinked_project_skills_dir_invalidates_every_project_skill() {
     .unwrap();
     assert_eq!(cat.entries().len(), 1);
     assert!(matches!(
-        cat.get(Layer::Project, "linked").unwrap().skill,
+        cat.get(Layer::Project, "linked").unwrap().skill(),
         Err(SkillError::ProjectRootSymlink)
     ));
 
@@ -155,7 +155,7 @@ fn a_dangling_skill_symlink_is_listed_invalid_and_a_file_symlink_is_skipped() {
         .collect();
     assert_eq!(got, vec![("gone".into(), false), ("real".into(), true)]);
     assert!(matches!(
-        cat.get(Layer::Global, "gone").unwrap().skill,
+        cat.get(Layer::Global, "gone").unwrap().skill(),
         Err(SkillError::Io { .. })
     ));
 }
@@ -187,6 +187,49 @@ fn a_project_layer_that_is_the_global_dir_is_dropped() {
     assert_eq!(dirs.project, None);
     let cat = rupu_skills::SkillCatalog::discover(&dirs).unwrap();
     assert_eq!(cat.named("only").count(), 1);
+
+    let canonical = g.path().canonicalize().unwrap();
+    let dirs = LayerDirs::for_layers(g.path(), Some(&canonical));
+    assert_eq!(dirs.project, None);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_project_layer_that_is_a_symlinked_global_dir_is_dropped() {
+    let t = tempfile::tempdir().unwrap();
+    let real = t.path().join("real-rupu");
+    write_skill(&real.join("skills"), "only", "only", "d");
+    let link = t.path().join("linked-rupu");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    for (global, project) in [(&link, &real), (&real, &link)] {
+        let dirs = LayerDirs::for_layers(global, Some(project));
+        assert_eq!(dirs.project, None, "{global:?} / {project:?}");
+        let cat = SkillCatalog::discover(&dirs).unwrap();
+        assert_eq!(cat.named("only").count(), 1);
+    }
+}
+
+#[test]
+fn discover_lists_entries_and_each_loads_on_first_use() {
+    let t = tempfile::tempdir().unwrap();
+    let skills = t.path().join("skills");
+    fs::create_dir_all(skills.join("late")).unwrap();
+
+    let cat = SkillCatalog::discover(&LayerDirs {
+        global: Some(skills.clone()),
+        project: None,
+    })
+    .unwrap();
+    let entry = cat.get(Layer::Global, "late").unwrap();
+    assert_eq!(entry.path, skills.join("late"));
+
+    write_skill(&skills, "late", "late", "Written after discovery.");
+    let first = entry.skill().unwrap().clone();
+    assert_eq!(first.frontmatter.description, "Written after discovery.");
+
+    fs::write(skills.join("late/SKILL.md"), "not a skill").unwrap();
+    assert!(std::sync::Arc::ptr_eq(entry.skill().unwrap(), &first));
+    assert!(entry.is_valid());
 }
 
 #[cfg(unix)]

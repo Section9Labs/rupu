@@ -4,7 +4,7 @@
 
 use crate::skill::{load_skill, Layer, Skill, SkillError};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// The two `skills/` directories. `project` is `None` when the run has no
 /// project layer (see `rupu_workspace::project_layer_dir`).
@@ -39,17 +39,37 @@ impl LayerDirs {
     }
 }
 
+/// One directory found in a layer's `skills/`. Discovery only lists it; the
+/// skill loads (SKILL.md read, tree walked) on the first `skill()` call and
+/// stays cached for the catalog's life, so a run pays only for the skills
+/// its grants name.
 #[derive(Debug)]
 pub struct CatalogEntry {
     pub dir_name: String,
     pub layer: Layer,
     pub path: PathBuf,
-    pub skill: Result<Arc<Skill>, SkillError>,
+    in_linked_root: bool,
+    loaded: OnceLock<Result<Arc<Skill>, Arc<SkillError>>>,
 }
 
 impl CatalogEntry {
+    pub fn skill(&self) -> Result<&Arc<Skill>, &SkillError> {
+        self.load().as_ref().map_err(|e| &**e)
+    }
+
     pub fn is_valid(&self) -> bool {
-        self.skill.is_ok()
+        self.skill().is_ok()
+    }
+
+    pub(crate) fn load(&self) -> &Result<Arc<Skill>, Arc<SkillError>> {
+        self.loaded.get_or_init(|| {
+            if self.in_linked_root {
+                return Err(Arc::new(SkillError::ProjectRootSymlink));
+            }
+            load_skill(&self.path, self.layer)
+                .map(Arc::new)
+                .map_err(Arc::new)
+        })
     }
 }
 
@@ -123,16 +143,12 @@ fn scan(dir: &Path, layer: Layer, out: &mut Vec<CatalogEntry>) -> Result<(), Dis
         if dir_name.starts_with('.') || !may_be_skill(&item)? {
             continue;
         }
-        let skill = if root_is_link {
-            Err(SkillError::ProjectRootSymlink)
-        } else {
-            load_skill(&path, layer).map(Arc::new)
-        };
         out.push(CatalogEntry {
             dir_name,
             layer,
             path,
-            skill,
+            in_linked_root: root_is_link,
+            loaded: OnceLock::new(),
         });
     }
     Ok(())

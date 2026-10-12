@@ -126,3 +126,111 @@ fn disable_model_invocation_is_granted_but_not_indexed() {
     assert!(!r.entries()[0].indexed);
     assert_eq!(r.prompt_section(), None);
 }
+
+fn request<'a>(
+    reason: SkillReason,
+    grants: &'a [String],
+    preload: &'a [String],
+) -> SkillRequest<'a> {
+    SkillRequest {
+        reason,
+        grants,
+        preload,
+    }
+}
+
+fn rows(r: &rupu_skills::ResolvedSkills) -> Vec<(&str, bool, bool, SkillReason)> {
+    r.entries()
+        .iter()
+        .map(|g| (g.name(), g.preload, g.indexed, g.reason))
+        .collect()
+}
+
+#[test]
+fn a_preload_from_a_later_request_keeps_the_first_reason() {
+    let g = tempfile::tempdir().unwrap();
+    write_skill(&g.path().join("skills"), "x", "x", "X.");
+    let cat = catalog(g.path(), None);
+    let x = s(&["x"]);
+    let r = resolve_run_skills(
+        &cat,
+        &[
+            request(SkillReason::Agent, &x, &[]),
+            request(SkillReason::Step, &[], &x),
+        ],
+    )
+    .unwrap();
+    assert_eq!(rows(&r), vec![("x", true, false, SkillReason::Agent)]);
+
+    let r = resolve_run_skills(&cat, &[request(SkillReason::Session, &x, &x)]).unwrap();
+    assert_eq!(rows(&r), vec![("x", true, false, SkillReason::Session)]);
+}
+
+#[test]
+fn star_never_grants_a_project_skill() {
+    let g = tempfile::tempdir().unwrap();
+    let p = tempfile::tempdir().unwrap();
+    write_skill(&g.path().join("skills"), "shared", "shared", "g");
+    write_skill(&p.path().join("skills"), "local-only", "local-only", "p");
+    let star = s(&["*"]);
+    let r = resolve_run_skills(
+        &catalog(g.path(), Some(p.path())),
+        &[request(SkillReason::Agent, &star, &[])],
+    )
+    .unwrap();
+    assert_eq!(r.names(), vec!["shared"]);
+}
+
+#[test]
+fn read_roots_are_the_canonical_skill_dirs() {
+    let g = tempfile::tempdir().unwrap();
+    let a = write_skill(&g.path().join("skills"), "a", "a", "A.");
+    let b = write_skill(&g.path().join("skills"), "b", "b", "B.");
+    let both = s(&["a", "b"]);
+    let r = resolve_run_skills(
+        &catalog(g.path(), None),
+        &[request(SkillReason::Agent, &both, &[])],
+    )
+    .unwrap();
+    assert_eq!(
+        r.read_roots(),
+        vec![a.canonicalize().unwrap(), b.canonicalize().unwrap()]
+    );
+}
+
+/// `b` is invalid while the run resolves, then repaired: an entry that was
+/// never loaded reads the repaired skill, one that was loaded keeps the
+/// error it cached.
+fn with_b_broken() -> (tempfile::TempDir, SkillCatalog) {
+    let g = tempfile::tempdir().unwrap();
+    write_skill(&g.path().join("skills"), "a", "a", "A.");
+    write_skill(&g.path().join("skills"), "b", "not-b", "B.");
+    let cat = catalog(g.path(), None);
+    (g, cat)
+}
+
+fn repair_b(g: &tempfile::TempDir) {
+    write_skill(&g.path().join("skills"), "b", "b", "B.");
+}
+
+#[test]
+fn a_run_loads_only_the_skills_it_names() {
+    let (g, cat) = with_b_broken();
+    let grants = s(&["a"]);
+    let preload = s(&["global:a"]);
+    let r = resolve_run_skills(&cat, &[request(SkillReason::Agent, &grants, &preload)]).unwrap();
+    assert_eq!(r.names(), vec!["a"]);
+    repair_b(&g);
+    let b = cat.get(rupu_skills::Layer::Global, "b").unwrap();
+    assert_eq!(b.skill().unwrap().frontmatter.description, "B.");
+}
+
+#[test]
+fn star_loads_every_entry_of_its_layer() {
+    let (g, cat) = with_b_broken();
+    let star = s(&["*"]);
+    let r = resolve_run_skills(&cat, &[request(SkillReason::Agent, &star, &[])]).unwrap();
+    assert_eq!(r.names(), vec!["a"]);
+    repair_b(&g);
+    assert!(!cat.get(rupu_skills::Layer::Global, "b").unwrap().is_valid());
+}
