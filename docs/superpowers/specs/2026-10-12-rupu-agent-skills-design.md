@@ -133,6 +133,8 @@ Grant grammar (S9):
 
 Skill names contain no `.`, so W2's `ns.*` form has no meaning here. Absent or empty means none (S2).
 
+A run binds each name once: a grant set that picks the same name from both layers (`["*", "project:*"]` over a name installed in both, or `global:x` with `project:x`) is an error, because the index would list the name twice and `skills.load` takes only a name.
+
 The collision rule is deliberate. If a bare name preferred the project copy, a repo could replace a global skill an agent relies on, scripts included. If it preferred the global copy, a project author could never override one. Refusing the ambiguity makes the author choose, and the transcript records the layer either way.
 
 Validation joins `validate_tools` in `load_agent` (`crates/rupu-agent/src/loader.rs:88`). A malformed entry, an unknown or invalid name, or an unqualified collision is `AgentLoadError::Skill`, with a did-you-mean. `check_agent_files` (`rupu agent validate`) checks the same. `load_agents` and `find_agent` still only parse. Every `AgentSpec` struct literal, `session_agent_spec` (`crates/rupu-cli/src/cmd/session.rs:7750`) among them, gains the fields.
