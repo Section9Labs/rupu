@@ -17,6 +17,7 @@ pub static DESCRIPTOR: ToolDescriptor = ToolDescriptor {
     effect: Effect::Record,
     needs: &[Service::Findings],
     uses: &[],
+    wildcard: true,
     description: "Record your verdict on a finding that ANOTHER run filed: confirmed (you \
      reproduced or independently established it), disputed (you showed it is wrong), \
      or inconclusive (you could not decide). Your run and agent are recorded \

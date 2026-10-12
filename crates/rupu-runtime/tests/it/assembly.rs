@@ -262,6 +262,74 @@ async fn origin_matrix() {
     insta::assert_yaml_snapshot!(rows);
 }
 
+/// W5 §3.3a / D22: a `tools: ["*"]` agent resolved under every origin, with
+/// the services that origin's owner provides (a lead: its bus and status; a
+/// fleet unit: its bus; every site: the catalog). `*` grants the roster tools
+/// wherever the catalog is provided, and never the authority tools — the
+/// lead holds `board.directive` / `board.retract` only through its origin
+/// grant.
+#[tokio::test]
+#[serial]
+async fn star_parity_per_origin() {
+    let home = Home::new();
+    let assembler = RunAssembler::new(home.context(config()));
+    let spec = agent(
+        &home,
+        "provider: anthropic\nmodel: claude-sonnet-4-6\ntools: [\"*\"]",
+    );
+    let flow_dir = home.global().join("agentiflows").join("af_1");
+    let mut rows = std::collections::BTreeMap::new();
+    for (name, origin) in origins(&home) {
+        let mut l = launch(&home, spec.clone(), origin.clone(), &format!("run_{name}"));
+        l.services.dispatcher = Some(Arc::new(NoDispatch));
+        match &origin {
+            Origin::FlowLead { .. } => {
+                l.services.message_bus =
+                    Some(Arc::new(rupu_fleet::Bus::for_run_dir(&flow_dir, "lead")));
+                l.services.run_status = Some(Arc::new(crate::support::NoStatus));
+            }
+            Origin::FlowUnit { participant, .. } => {
+                l.services.message_bus = Some(Arc::new(rupu_fleet::Bus::for_run_dir(
+                    &flow_dir,
+                    participant.clone(),
+                )));
+            }
+            _ => {}
+        }
+        let _m = MockScript::set(DONE);
+        let run = assembler.assemble(l).await.expect("assembles");
+        let grant = &run.opts.grant;
+        for authority in ["board.directive", "board.retract"] {
+            if let Some(e) = grant.entry(authority) {
+                assert!(
+                    matches!(origin, Origin::FlowLead { .. }),
+                    "{name}: `*` must never grant {authority}"
+                );
+                assert_eq!(e.reasons_string(), "origin:flow_lead", "{name}");
+            }
+        }
+        for roster in [
+            "agents.list",
+            "agents.get",
+            "workflows.list",
+            "workflows.get",
+            "catalog.search",
+        ] {
+            assert!(
+                grant.offers(roster),
+                "{name}: `*` with a catalog grants {roster}"
+            );
+        }
+        let entries: std::collections::BTreeMap<String, String> = grant
+            .entries
+            .values()
+            .map(|e| (e.canonical.to_string(), e.reasons_string()))
+            .collect();
+        rows.insert(name, entries);
+    }
+    insta::assert_yaml_snapshot!(rows);
+}
+
 /// R9: every origin goes through admission (the lend that keeps nested
 /// in-process children deadlock-free is unit-tested in `admission`).
 #[test]

@@ -16,7 +16,7 @@
 //! | `report_finding`, … | an alias, resolved to its canonical tool |
 //! | `findings.*`, `scm.*`, … | every tool in that namespace |
 //! | `core.*` | the unqualified core tools ([`crate::catalog::CORE_NAMES`]) |
-//! | `*` | the whole catalog |
+//! | `*` | the whole catalog, except the authority tools (`wildcard: false`: `board.directive`, `board.retract` — D22) |
 //! | anything else | a [`GrantError`] with a did-you-mean (D8) |
 //!
 //! A wildcard adds only tools this run can serve: one whose service is
@@ -567,7 +567,10 @@ impl ToolCatalog {
         field: &'static str,
     ) -> Result<Expansion, GrantError> {
         if entry == "*" {
-            return Ok(Expansion::Wildcard(self.descriptors().collect()));
+            // Every capability, but never authority over other agents (D22).
+            return Ok(Expansion::Wildcard(
+                self.descriptors().filter(|d| d.wildcard).collect(),
+            ));
         }
         if entry == CORE_NAMESPACE {
             return Ok(Expansion::Wildcard(

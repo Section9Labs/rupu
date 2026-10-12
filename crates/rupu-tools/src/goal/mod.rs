@@ -16,6 +16,7 @@ pub static STATUS: ToolDescriptor = ToolDescriptor {
     effect: Effect::Read,
     needs: &[Service::RunStatus],
     uses: &[],
+    wildcard: true,
     description: "Re-check every goal against the pooled evidence right now (findings and \
      assets banked since the round began count). Each goal reports `satisfied`, \
      its `current`/`target` tally and a one-line `detail`; a goal that could not \
@@ -37,6 +38,7 @@ pub static COVERAGE: ToolDescriptor = ToolDescriptor {
     effect: Effect::Read,
     needs: &[Service::RunStatus],
     uses: &[],
+    wildcard: true,
     description: "Re-check the engagement coverage target against the pooled assets right \
      now. `reach` is the required fraction and `depth` the rung assets must \
      have reached (null: the ladder's terminal rung); `fraction` is what has \

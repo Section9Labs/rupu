@@ -39,6 +39,7 @@ pub static DESCRIPTOR: ToolDescriptor = ToolDescriptor {
     effect: Effect::Write,
     needs: &[],
     uses: &[],
+    wildcard: true,
     description: "Replace an exact string in a file. The `old_string` must match exactly once in the file; if it matches zero times or more than once, the edit fails. Pass enough surrounding context (a few lines before/after) to make `old_string` uniquely identifying. The file must already exist; for new files use `write_file`.",
     input_schema: descriptor_schema,
 };

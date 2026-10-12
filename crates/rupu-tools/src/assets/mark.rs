@@ -16,6 +16,7 @@ pub static DESCRIPTOR: ToolDescriptor = ToolDescriptor {
     effect: Effect::Record,
     needs: &[Service::Findings, Service::Engagement],
     uses: &[],
+    wildcard: true,
     description: "Record how deeply an engagement asset has been examined, as a rung of \
      its profile's coverage depth ladder (monotonic — a shallower rung after \
      a deeper one keeps the deeper one). The effective rung is returned.",

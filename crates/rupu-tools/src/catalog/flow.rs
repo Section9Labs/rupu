@@ -22,6 +22,7 @@ pub static DISPATCH: ToolDescriptor = ToolDescriptor {
     effect: Effect::Spawn,
     needs: &[Service::Launcher],
     uses: &[],
+    wildcard: true,
     description: "Start a pool agent as an independent unit working on a prompt, in its own \
      process. Returns a handle immediately without waiting; pass it to `join` \
      to wait for the unit's result. Only agents in the flow's pool can be \
@@ -53,6 +54,7 @@ pub static RUN_WORKFLOW: ToolDescriptor = ToolDescriptor {
     effect: Effect::Spawn,
     needs: &[Service::Launcher],
     uses: &[],
+    wildcard: true,
     description: "Start a pool workflow as an independent unit, in its own process. Returns \
      a handle immediately without waiting; pass it to `join` to wait for the \
      workflow's result. Only workflows in the flow's pool can be started, and \
@@ -86,6 +88,7 @@ pub static WORKFLOWS_GENERATE: ToolDescriptor = ToolDescriptor {
     effect: Effect::Spawn,
     needs: &[Service::WorkflowGenerator],
     uses: &[],
+    wildcard: true,
     description: "Author a NEW workflow for a described task and run it as an independent \
      unit, in its own process. Returns a handle immediately without waiting; \
      pass it to `join` to wait for the workflow's result. The workflow may \
@@ -119,6 +122,7 @@ pub static JOIN: ToolDescriptor = ToolDescriptor {
     effect: Effect::Read,
     needs: &[Service::Launcher],
     uses: &[],
+    wildcard: true,
     description: "Wait for a dispatched unit to finish and return its result. Reports \
      status `done` (with the unit's output and whether it succeeded), `failed`, \
      or `running` / `pending` if it has not finished within the timeout (join \

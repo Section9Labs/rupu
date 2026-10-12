@@ -70,6 +70,7 @@ pub static DESCRIPTOR: ToolDescriptor = ToolDescriptor {
     effect: Effect::Spawn,
     needs: &[Service::AgentDispatcher],
     uses: &[],
+    wildcard: true,
     description: "Run several agents in parallel and aggregate their results. Provide a list of `agents`, each with `{ id, agent, prompt }`. Every agent must appear in this agent's dispatchableAgents allowlist. Returns a map keyed by `id` with each child's output, tokens, and transcript. Use this when N specialist reviews can run independently — for sequential or single-child dispatches use `dispatch_agent` instead.",
     input_schema: descriptor_schema,
 };

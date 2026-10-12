@@ -124,9 +124,15 @@ one of:
 | `report_finding`, `query_findings`, … | a legacy name, accepted forever as an alias of its canonical tool (see [Tool names](#tool-names)) |
 | `findings.*`, `scm.*`, `issues.*`, `board.*`, … | every tool in that namespace |
 | `core.*` | the core tools: `bash`, `read_file`, `write_file`, `edit_file`, `grep`, `glob`, `ast_grep` |
-| `*` | the whole catalog |
+| `*` | the whole catalog, except the authority tools `board.directive` and `board.retract` (see below) |
 
 There are no other wildcards (`scm*`, `coverage_*` are errors).
+
+**Authority is never implied by `*`.** `board.directive` and `board.retract`
+let one agent direct the others in an agentiflow, so `*` leaves them out: an
+agent gets them only by naming them (or `board.*`), and an agentiflow lead
+gets them from its origin grant. `board.retract` lifts only directives the
+caller wrote itself.
 
 **An unknown name is an error.** An agent whose `tools:` names a tool rupu
 doesn't know fails to load — `rupu run`, a workflow step, a sub-agent dispatch
@@ -144,8 +150,11 @@ fail). The CP's agent page shows the same error.
 may not have: the `scm.*` / `issues.*` / `github.*` / `gitlab.*` connector tools
 need configured SCM connectors, `dispatch_agent` / `dispatch_agents_parallel`
 need a sub-agent dispatcher, `coverage.*` needs a `concerns:` block,
-`assets.mark` an engagement profile, and the agentiflow tools (`board.*`,
-`msg.send`, `goal.*`, `dispatch`, `join`, …) an agentiflow run. A wildcard
+`assets.mark` an engagement profile, the board and mailbox tools (`board.*`,
+`msg.send`) an agentiflow lead or unit, and `goal.*`, `budget.status`,
+`dispatch` and `join` an agentiflow lead. The roster tools (`agents.list`,
+`agents.get`, `workflows.list`, `workflows.get`, `catalog.search`) read the
+agent and workflow files and work in every run. A wildcard
 silently leaves out a tool the run can't serve. A tool you name exactly that
 the run can't serve is left out too, and the run says so with a
 `tool_unavailable` notice in its transcript.
@@ -158,10 +167,11 @@ reusable agents an explicit `tools:` is better than the default.
 **Ambient grants.** The run's context adds tools the agent didn't list:
 a `concerns:` block adds the coverage tools and `findings.report`; an active
 engagement profile adds `findings.report` and `assets.mark`; an agentiflow
-adds its coordination tools. They're never hidden: every run's transcript opens
-with a `tool_grant` event listing exactly the tools the model was offered and
-why (`declared`, `declared:scm.*`, `default`, `ambient:concerns`,
-`ambient:engagement`, `origin:injected`), and every call is audited
+lead's or unit's origin adds its coordination tools. They're never hidden:
+every run's transcript opens with a `tool_grant` event listing exactly the
+tools the model was offered and why (`declared`, `declared:scm.*`, `default`,
+`ambient:concerns`, `ambient:engagement`, `origin:flow_lead`,
+`origin:flow_unit`, `origin:injected`), and every call is audited
 (`tool_audit`). See [transcript-schema.md](transcript-schema.md#tool_grant).
 
 `dispatch_agent` and `dispatch_agents_parallel` dispatch to child agents named

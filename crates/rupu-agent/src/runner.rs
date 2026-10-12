@@ -3764,6 +3764,7 @@ mod on_tool_call_tests {
             effect: rupu_tools::Effect::Read,
             needs: &[],
             uses: &[],
+            wildcard: true,
             description: "returns pong",
             input_schema: ping_schema,
         };

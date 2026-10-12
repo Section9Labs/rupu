@@ -23,6 +23,7 @@ pub static AGENTS_LIST: ToolDescriptor = ToolDescriptor {
     effect: Effect::Read,
     needs: &[Service::Catalog],
     uses: &[],
+    wildcard: true,
     description: "List the agents you can draw on (global and project): each one's name, \
      description and declared tools. `tools: null` means the agent uses the \
      default tool set, not none. Use agents.get for one agent's detail.",
@@ -39,6 +40,7 @@ pub static AGENTS_GET: ToolDescriptor = ToolDescriptor {
     effect: Effect::Read,
     needs: &[Service::Catalog],
     uses: &[],
+    wildcard: true,
     description: "Get one agent's detail by name: description, provider, model, declared \
      tools, the agents it may dispatch, and its permission mode.",
     input_schema: agents_get_schema,
@@ -60,6 +62,7 @@ pub static WORKFLOWS_LIST: ToolDescriptor = ToolDescriptor {
     effect: Effect::Read,
     needs: &[Service::Catalog],
     uses: &[],
+    wildcard: true,
     description: "List the workflows you can run (global and project). `id` is the runnable \
      identifier (the file stem); `name` is the declared display name. A \
      workflow that failed to parse is listed with its parse_error.",
@@ -76,6 +79,7 @@ pub static WORKFLOWS_GET: ToolDescriptor = ToolDescriptor {
     effect: Effect::Read,
     needs: &[Service::Catalog],
     uses: &[],
+    wildcard: true,
     description: "Get one workflow's summary by its `id` (the runnable file stem workflows.list \
      shows, not the declared name): description, scope, declared inputs, step count.",
     input_schema: workflows_get_schema,
@@ -97,6 +101,7 @@ pub static CATALOG_SEARCH: ToolDescriptor = ToolDescriptor {
     effect: Effect::Read,
     needs: &[Service::Catalog],
     uses: &[],
+    wildcard: true,
     description: "Search the agent and workflow catalog: a case-insensitive substring match \
      over agent name/description and workflow id/name/description. Each hit is \
      tagged kind=agent|workflow. `warnings` is present when part of the catalog \

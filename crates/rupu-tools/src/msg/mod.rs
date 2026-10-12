@@ -18,6 +18,7 @@ pub static SEND: ToolDescriptor = ToolDescriptor {
     effect: Effect::Record,
     needs: &[Service::MessageBus],
     uses: &[],
+    wildcard: true,
     description: "Send a message. `to` is a participant id, a role, \"parent\", or \
      \"lead\" (delivered to exactly that inbox), or \"broadcast\" (every \
      participant sees it once, from the moment it started listening; the \

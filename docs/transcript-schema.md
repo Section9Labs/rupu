@@ -367,7 +367,7 @@ The tools the run offered its model, and why. Written once, right after `run_sta
 
 | Field         | Type   | Description |
 |---------------|--------|-------------|
-| `entries`     | array  | `{tool, reasons}` per offered tool: its canonical name and every reason it is there — `declared` (named in `tools:`), `declared:<wildcard>` (matched `*`, `core.*`, `scm.*`, …), `default` (the agent has no `tools:`), `ambient:concerns`, `ambient:engagement`, `origin:injected` (a tool the launch site handed the run, e.g. an agentiflow's board tools) |
+| `entries`     | array  | `{tool, reasons}` per offered tool: its canonical name and every reason it is there — `declared` (named in `tools:`), `declared:<wildcard>` (matched `*`, `core.*`, `scm.*`, …), `default` (the agent has no `tools:`), `ambient:concerns`, `ambient:engagement`, `origin:flow_lead` / `origin:flow_unit` (an agentiflow lead's or unit's coordination tools), `origin:injected` (a tool the launch site handed the run: an agentiflow lead's launch tools) |
 | `narrowed`    | array? | Connector tools the step's `actions:` removed. Omitted when empty |
 | `unavailable` | array? | `{tool, missing}`: tools named exactly in `tools:` that this run can't serve, with the services it lacks. Each also gets a `tool_unavailable` notice. Omitted when empty |
 | `skipped`     | array? | `{tool, missing}`: tools a wildcard or the default grant matched that this run can't serve. Not offered, no notice. Omitted when empty |

@@ -13,6 +13,7 @@ pub static STATUS: ToolDescriptor = ToolDescriptor {
     effect: Effect::Read,
     needs: &[Service::RunStatus],
     uses: &[],
+    wildcard: true,
     description: "Re-check the run's budget against what it has spent right now: the \
      lead's own and every unit's usage so far, read fresh. `stage` is `ok`, \
      `soft` (a dimension crossed its soft threshold: converge) or `hard` (a \

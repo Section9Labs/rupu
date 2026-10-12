@@ -17,6 +17,7 @@ pub static DESCRIPTOR: ToolDescriptor = ToolDescriptor {
     effect: Effect::Record,
     needs: &[Service::Findings],
     uses: &[],
+    wildcard: true,
     description: "Add or remove tags on findings in this project, one or many at once. Tags are \
      free-form: lowercase a-z, 0-9 and . _ : / -, starting with a letter or digit (e.g. \
      class:sqli, needs-poc, status:triaged). Prefer tags already in use (findings.query \

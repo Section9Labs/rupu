@@ -37,6 +37,7 @@ pub static LIST: ToolDescriptor = ToolDescriptor {
     effect: Effect::Read,
     needs: &[Service::Scm],
     uses: &[],
+    wildcard: true,
     description: "List repositories the authenticated user can access on the given platform. Omit `platform` to use [scm.default].",
     input_schema: schema::<ListReposArgs>,
 };
@@ -47,6 +48,7 @@ pub static GET: ToolDescriptor = ToolDescriptor {
     effect: Effect::Read,
     needs: &[Service::Scm],
     uses: &[],
+    wildcard: true,
     description: "Fetch a single repository (default branch, clone URLs, visibility, description).",
     input_schema: schema::<GetRepoArgs>,
 };

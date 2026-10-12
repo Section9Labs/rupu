@@ -367,7 +367,9 @@ fn injected_tools_are_self_served() {
         vec![GrantReason::Origin("injected")]
     );
     assert!(!g.skipped.iter().any(|u| u.tool == "board.post"));
-    assert!(g.skipped.iter().any(|u| u.tool == "board.directive"));
+    assert!(g.skipped.iter().any(|u| u.tool == "board.claim"));
+    // An authority tool is not even considered by `*` (D22).
+    assert!(!g.skipped.iter().any(|u| u.tool == "board.directive"));
 }
 
 #[test]

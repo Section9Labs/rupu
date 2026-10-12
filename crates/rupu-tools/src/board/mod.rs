@@ -28,6 +28,7 @@ pub static CLAIM: ToolDescriptor = ToolDescriptor {
     effect: Effect::Record,
     needs: &[Service::MessageBus],
     uses: &[],
+    wildcard: true,
     description: "Atomically claim a work unit so no other participant duplicates it. \
      Returns granted, or the current holder when it is already claimed.",
     input_schema: board_claim_schema,
@@ -52,6 +53,7 @@ pub static RELEASE: ToolDescriptor = ToolDescriptor {
     effect: Effect::Record,
     needs: &[Service::MessageBus],
     uses: &[],
+    wildcard: true,
     description: "Release a work unit you previously claimed with board.claim, so another \
      participant can take it.",
     input_schema: board_release_schema,
@@ -76,6 +78,7 @@ pub static POST: ToolDescriptor = ToolDescriptor {
     effect: Effect::Record,
     needs: &[Service::MessageBus],
     uses: &[],
+    wildcard: true,
     description: "Post to the shared board every participant can read: an observation, a \
      question, an answer, a vote, or a note. Optionally address it to a \
      participant id or role.",
@@ -106,6 +109,7 @@ pub static READ: ToolDescriptor = ToolDescriptor {
     effect: Effect::Read,
     needs: &[Service::MessageBus],
     uses: &[],
+    wildcard: true,
     description: "Read the shared board's posts, oldest first, newest last. Returns the \
      most recent posts (default 50); filter to those addressed to a \
      participant id or role with addressed_to.",
@@ -136,6 +140,8 @@ pub static DIRECTIVE: ToolDescriptor = ToolDescriptor {
     effect: Effect::Record,
     needs: &[Service::MessageBus],
     uses: &[],
+    // Authority over other agents (D22): never granted by `*`.
+    wildcard: false,
     description: "Steer the fleet: write a standing directive to the board. Units see it on \
      every turn until you lift it, so post sparingly and keep each short and \
      actionable. Returns the directive's `id`: pass it to `board.retract` once \
@@ -164,6 +170,8 @@ pub static RETRACT: ToolDescriptor = ToolDescriptor {
     effect: Effect::Record,
     needs: &[Service::MessageBus],
     uses: &[],
+    // Authority over other agents (D22): never granted by `*`.
+    wildcard: false,
     description: "Lift a standing directive: pass the `id` that `board.directive` returned \
      (it is also shown in brackets on each standing directive you see each \
      turn). Units stop seeing it from their next turn. An unknown or already \
@@ -388,9 +396,10 @@ impl Tool for BoardDirectiveTool {
 }
 
 /// `board.retract { id }` -> `{ok: true, retracted}`: lift a standing
-/// directive from the live set. The board log is append-only, so this
-/// appends a retraction; an id with no live directive behind it is reported
-/// and appends nothing.
+/// directive the caller wrote from the live set. The board log is
+/// append-only, so this appends a retraction; an id with no live directive
+/// behind it, or a directive another participant wrote, is reported and
+/// appends nothing.
 pub struct BoardRetractTool;
 
 #[async_trait]
@@ -401,17 +410,26 @@ impl Tool for BoardRetractTool {
 
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let id = req_str(&input, "id")?.to_string();
-        let board = &bus(ctx)?.board;
-        let live = match board.read_directives() {
+        let bus = bus(ctx)?;
+        let live = match bus.board.read_directives() {
             Ok(live) => live,
             Err(e) => return Ok(failed(format!("could not read directives: {e}"))),
         };
-        if !live.iter().any(|d| d.id == id) {
+        let Some(directive) = live.iter().find(|d| d.id == id) else {
             return Ok(failed(format!(
                 "no live directive has id {id}: it is unknown or already retracted"
             )));
+        };
+        // A participant lifts only its own directives: another's standing
+        // instruction is not its to withdraw (D22).
+        if directive.author != bus.participant {
+            return Ok(failed(format!(
+                "not the author of directive {id}: it was written by {}, and only its \
+                 author can retract it",
+                directive.author
+            )));
         }
-        Ok(match board.retract_directive(&id) {
+        Ok(match bus.board.retract_directive(&id) {
             Ok(()) => ok_json(json!({ "ok": true, "retracted": id })),
             Err(e) => failed(format!("could not retract directive: {e}")),
         })

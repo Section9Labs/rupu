@@ -390,6 +390,34 @@ async fn board_retract_of_an_unknown_or_already_retracted_id_reports_and_appends
     );
 }
 
+/// D22: a participant retracts only directives it wrote. Another's is
+/// refused with an explicit error and stays live; nothing is appended.
+#[tokio::test]
+async fn retract_requires_author() {
+    let dir = tempfile::tempdir().unwrap();
+    let lead = on(dir.path(), "lead");
+    let unit = on(dir.path(), "recon#1");
+    let v = json_of(&call(&lead, "board.directive", json!({ "body": "focus on auth" })).await);
+    let id = v["id"].as_str().unwrap();
+
+    let out = call(&unit, "board.retract", json!({ "id": id })).await;
+    let err = out
+        .error
+        .expect("another participant's directive is refused");
+    assert!(
+        err.starts_with(&format!("not the author of directive {id}")),
+        "{err}"
+    );
+    assert!(err.contains("lead"), "{err}");
+    assert_eq!(Board::new(dir.path()).read_directives().unwrap().len(), 1);
+    assert_eq!(directive_log_lines(dir.path()), 1, "nothing was appended");
+
+    // Its author can.
+    let out = json_of(&call(&lead, "board.retract", json!({ "id": id })).await);
+    assert_eq!(out["retracted"], id);
+    assert!(Board::new(dir.path()).read_directives().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn board_retract_rejects_a_missing_or_blank_id() {
     let dir = tempfile::tempdir().unwrap();
@@ -655,6 +683,39 @@ async fn budget_status_renders_each_set_dimension() {
 }
 
 // ---- grants ------------------------------------------------------------------
+
+/// D22: `*` never grants the authority tools; their exact name and `board.*`
+/// do.
+#[test]
+fn star_never_grants_directive_or_retract() {
+    use rupu_tools::{AliasScope, GrantInputs, ToolCatalog};
+    let dir = tempfile::tempdir().unwrap();
+    let mut ctx = on(dir.path(), "recon#1");
+    ctx.services.catalog = Some(Arc::new(roster()));
+    let resolve = |declared: &[&str]| {
+        let declared: Vec<String> = declared.iter().map(|s| s.to_string()).collect();
+        ToolCatalog::builtin()
+            .resolve_grant(GrantInputs {
+                declared: Some(&declared),
+                step_actions: &[],
+                ambient: &[],
+                available: &ctx.services.provided(false),
+                alias_scope: AliasScope::Everywhere,
+            })
+            .unwrap()
+    };
+    let star = resolve(&["*"]);
+    assert!(star.offers("board.post") && star.offers("agents.list"));
+    assert!(!star.offers("board.directive") && !star.offers("board.retract"));
+    assert!(star.skipped.iter().all(|u| !u.tool.starts_with("board.")));
+    for explicit in [&["board.directive", "board.retract"][..], &["board.*"][..]] {
+        let g = resolve(explicit);
+        assert!(
+            g.offers("board.directive") && g.offers("board.retract"),
+            "{explicit:?}"
+        );
+    }
+}
 
 /// Outside a flow there is no message bus: an agent naming `board.post` is
 /// told it is unavailable, while the catalog tools (every launch site

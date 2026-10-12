@@ -39,6 +39,7 @@ pub static LIST: ToolDescriptor = ToolDescriptor {
     effect: Effect::Read,
     needs: &[Service::Scm],
     uses: &[],
+    wildcard: true,
     description: "List branches on a repository. Returns name, sha, and protected flag for each.",
     input_schema: schema::<ListBranchesArgs>,
 };
@@ -49,6 +50,7 @@ pub static CREATE: ToolDescriptor = ToolDescriptor {
     effect: Effect::External,
     needs: &[Service::Scm],
     uses: &[],
+    wildcard: true,
     description: "Create a new branch from a given SHA. Returns the new branch.",
     input_schema: schema::<CreateBranchArgs>,
 };

@@ -29,6 +29,7 @@ pub static READ: ToolDescriptor = ToolDescriptor {
     effect: Effect::Read,
     needs: &[Service::Scm],
     uses: &[],
+    wildcard: true,
     description: "Read a single file from a repository at an optional ref. Returns path, ref, content, and encoding.",
     input_schema: schema::<ReadFileArgs>,
 };

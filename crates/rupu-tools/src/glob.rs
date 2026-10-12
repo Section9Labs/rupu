@@ -33,6 +33,7 @@ pub static DESCRIPTOR: ToolDescriptor = ToolDescriptor {
     effect: Effect::Read,
     needs: &[],
     uses: &[],
+    wildcard: true,
     description: "List files in the workspace matching a glob pattern. Output is one path per line, sorted, relative to the workspace root. Supports `**` for recursive descent. Returns empty stdout when nothing matches.",
     input_schema: descriptor_schema,
 };

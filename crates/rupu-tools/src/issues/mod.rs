@@ -91,6 +91,7 @@ pub static LIST: ToolDescriptor = ToolDescriptor {
     effect: Effect::Read,
     needs: &[Service::Scm],
     uses: &[],
+    wildcard: true,
     description: "List issues on a tracker. Filters: state (open/closed), labels, author, limit.",
     input_schema: schema::<ListIssuesArgs>,
 };
@@ -101,6 +102,7 @@ pub static GET: ToolDescriptor = ToolDescriptor {
     effect: Effect::Read,
     needs: &[Service::Scm],
     uses: &[],
+    wildcard: true,
     description:
         "Fetch a single issue by number. Returns title, body, state, labels, author, timestamps.",
     input_schema: schema::<GetIssueArgs>,
@@ -114,6 +116,7 @@ pub static COMMENTS: ToolDescriptor = ToolDescriptor {
     effect: Effect::Read,
     needs: &[Service::Scm],
     uses: &[],
+    wildcard: true,
     description: "Read an issue's comment thread. Returns id, author, body, created_at, author_association per comment, oldest-first. author_association is GitHub's role for the commenter on this repo (e.g. OWNER, COLLABORATOR, CONTRIBUTOR, NONE) — use it to tell an authorized operator's comment apart from an arbitrary commenter's; it is null on trackers that don't expose an equivalent (GitLab, Linear, Jira). A `limit` truncates the NEWEST comments off the end, not the oldest — omitting `limit` returns only the oldest 100; hard ceiling 5000.",
     input_schema: schema::<ListCommentsArgs>,
 };
@@ -124,6 +127,7 @@ pub static COMMENT: ToolDescriptor = ToolDescriptor {
     effect: Effect::External,
     needs: &[Service::Scm],
     uses: &[],
+    wildcard: true,
     description: "Post a comment on an issue.",
     input_schema: schema::<CommentIssueArgs>,
 };
@@ -134,6 +138,7 @@ pub static CREATE: ToolDescriptor = ToolDescriptor {
     effect: Effect::External,
     needs: &[Service::Scm],
     uses: &[],
+    wildcard: true,
     description: "Open a new issue with title, body, and optional labels.",
     input_schema: schema::<CreateIssueArgs>,
 };
@@ -144,6 +149,7 @@ pub static UPDATE_STATE: ToolDescriptor = ToolDescriptor {
     effect: Effect::External,
     needs: &[Service::Scm],
     uses: &[],
+    wildcard: true,
     description: "Transition an issue's state to `open` or `closed`.",
     input_schema: schema::<UpdateIssueStateArgs>,
 };
