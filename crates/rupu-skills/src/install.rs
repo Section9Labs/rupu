@@ -73,6 +73,8 @@ pub enum InstallError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error(transparent)]
+    Source(#[from] crate::source::SourceError),
 }
 
 fn io(path: &Path) -> impl FnOnce(std::io::Error) -> InstallError + '_ {

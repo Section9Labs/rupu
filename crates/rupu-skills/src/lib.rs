@@ -5,11 +5,14 @@
 
 pub mod catalog;
 pub mod frontmatter;
+#[cfg(feature = "git")]
+pub mod git;
 pub mod grant;
 pub mod install;
 pub mod name;
 pub mod render;
 pub mod skill;
+pub mod source;
 pub mod tools_map;
 pub mod tree;
 
@@ -20,4 +23,5 @@ pub use frontmatter::{
 pub use grant::{parse_grants, resolve_grants, GrantParseError, ResolveError, SkillGrant};
 pub use name::{NameError, SkillName, MAX_NAME_LEN};
 pub use skill::{load_skill, Layer, Skill, SkillError};
+pub use source::{parse_source, Fetch, FetchedTree, GitSource, Source, SourceError};
 pub use tree::{ContentHash, Stamp, TreeEntry, TreeError};
