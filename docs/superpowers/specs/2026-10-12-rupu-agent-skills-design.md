@@ -296,12 +296,49 @@ Re-attached bodies are capped at a quarter of the model's input limit, or at 32 
 
 | Command | Does |
 |---|---|
-| `rupu skill list [--project]` | name, layer, description, and the error for invalid skills |
-| `rupu skill show <name>` | frontmatter, files, layer, stamp and content hash, and whether the other layer has the same name |
+| `rupu skill list [--project]` | name, layer, description, source, and the error for invalid skills |
+| `rupu skill show <name>` | frontmatter, files, layer, stamp and content hash, source record, and whether the other layer has the same name |
 | `rupu skill validate [<name>\|--all]` | §1.1 rules; exit 1 on any failure |
-| `rupu skill install <source> [--project] [--force] [--name <n>]` | copy a skill directory into the layer |
+| `rupu skill install <source> [--ref <r>] [--skill <n>]... [--all] [--list] [--project] [--force]` | find the skills in a source and copy the chosen ones into the layer |
+| `rupu skill update [<name>...\|--all] [--project] [--force]` | re-fetch installed skills from their recorded source |
 
-`install` takes a local directory, or a git URL with an optional `#<subdir>`. A URL is cloned shallow into a temp dir with hooks disabled, no submodules and `protocol.file.allow=never`, then copied. `install` validates before it writes, refuses to overwrite without `--force`, refuses a tree containing a symlink that leaves it, and preserves file modes so scripts stay executable. A source directory with several skills installs the one named by `--name`. There is no `remove`: deleting the directory is enough.
+There is no `remove`: deleting the directory is enough, and an orphaned source record is ignored.
+
+### 7.1 Sources
+
+Skills are published the way the rest of the ecosystem installs them (`npx skills add`, Claude Code plugin marketplaces): a git repository holding one or many skill directories, often under `skills/<name>/`. `install` accepts what people copy:
+
+| Source | Resolves to |
+|---|---|
+| an existing path (`./x`, `/abs/x`, `~/x`) | that local directory |
+| `owner/repo` | `https://github.com/owner/repo` |
+| `https://github.com/o/r/tree/<ref>/<path>` (or `/blob/<ref>/<path>/SKILL.md`) | that repo, ref and path. The ref is the first segment after `tree/`, so a branch with `/` in its name needs `--ref` and `#<path>` instead. |
+| any `https://` git URL, with optional `#<path>` | that repo and path |
+
+`--ref <branch|tag|commit>` picks a ref; it conflicts with a different ref in a tree URL. Only `https://` is fetched (`ssh`, `git@` and `file://` are refused: a local checkout is a path). The fetch is libgit2: a shallow clone of the default branch, or a full clone checked out at `--ref`. libgit2 runs no hooks and does not touch submodules.
+
+### 7.2 Finding and choosing skills
+
+Within the source (the repo root, or `<path>` inside it), every directory holding a `SKILL.md` is a skill. The search descends through hidden directories (`.claude/skills/`, `.agents/skills/`, plugin folders), skips `.git` and `node_modules`, stops at each skill it finds, and goes at most 6 levels deep. Two skills with the same directory name in one source is an error naming both paths; the operator narrows with `#<path>`.
+
+- One skill found: it is installed.
+- Several found: `--skill <name>` (repeatable) picks, `--all` takes every valid one (invalid ones are reported and skipped), and without either the command lists them and installs nothing. `--list` lists without installing in any case.
+- An explicitly named skill that is invalid fails the install before anything is written.
+
+Each install validates first, refuses to overwrite without `--force`, refuses a tree containing a symlink that leaves it or an absolute symlink, preserves file modes so scripts stay executable, and swaps by rename, so a failed install never damages an installed skill.
+
+### 7.3 Source records and `update`
+
+Each install writes `<layer>/skills/.sources/<name>.json`, outside the skill's own directory, so it never moves the skill's stamp or content hash and is never readable through a read root:
+
+```json
+{ "version": 1, "source": "anthropics/skills", "url": "https://github.com/anthropics/skills",
+  "ref": null, "path": "skills/pdf", "commit": "<sha>", "content_hash": "<sha256>", "installed_at": 1792000000 }
+```
+
+A local install records `"local": "<canonical dir>"` instead of `url`/`ref`/`commit`.
+
+`update` re-fetches each named skill (`--all`: every skill in the layer with a record), clones each `(url, ref)` once, finds the skill at its recorded `path` (falling back to a search by name if the repo moved it) and replaces it. A skill installed at a pinned `--ref` stays on that ref; moving it is a new `install --ref`. Results per skill: `updated <old>→<new>`, `up to date`, `no source record`, or `locally modified`. The last is a skill whose current content hash differs from its record's, meaning someone edited the installed copy; `update` refuses it without `--force`.
 
 ## 8. Control plane
 
@@ -358,7 +395,7 @@ Shipping skill content with a dispatch is a later option if this proves painful.
 
 ## 12. Plans
 
-1. **Model and CLI.** `rupu-skills` (model, validation, discovery, fingerprints, renderers) and `rupu skill list|show|validate|install`.
+1. **Model and CLI.** `rupu-skills` (model, validation, discovery, fingerprints, renderers, sources, source records) and `rupu skill list|show|validate|install|update`.
 2. **Runs.** Agent and step keys, load-time validation, `ResolvedSkills` in the assembler, the index and preload rendering, `Service::Skills` and `skills.load`, read roots, transcript events and notices, compaction re-attach and replay, and the placed-unit `--skill` flags and `agent.skills` capability. Covers every origin but sessions.
 3. **Sessions.** Record fields, `session start --skill`, `session send --skill`.
 4. **CP.** API fields and endpoints, then the web Library tab, agent picker, transcript rendering and session composer action (stops for the visual check).

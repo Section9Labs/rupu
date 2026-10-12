@@ -2,13 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** A new leaf crate `rupu-skills` that parses, validates, discovers, fingerprints, grants and renders agentskills.io skills, plus `rupu skill list|show|validate|install`.
+**Goal:** A new leaf crate `rupu-skills` that parses, validates, discovers, fingerprints, grants, renders, installs and updates agentskills.io skills, plus `rupu skill list|show|validate|install|update`.
 
-**Architecture:** `rupu-skills` has no rupu dependencies. It owns the `Skill` model and every pure rule the spec states (name rules, frontmatter, the grant grammar, the stamp and content hash, the prompt renderers). Plans 2 to 4 call it from `rupu-tools`, `rupu-agent`, `rupu-runtime` and the CP. A `git` cargo feature adds https git fetching for `install`, so only `rupu-cli` links `git2` through it. The CLI is a thin `cmd/skill.rs` over the crate. The layer directories come from one new `rupu_workspace::project_layer_dir`, so the R5 rule is the same one config loading uses.
+**Architecture:** `rupu-skills` has no rupu dependencies. It owns the `Skill` model and every pure rule the spec states (name rules, frontmatter, the grant grammar, the stamp and content hash, the prompt renderers). Plans 2 to 4 call it from `rupu-tools`, `rupu-agent`, `rupu-runtime` and the CP. Installs accept the sources people copy (a path, `owner/repo`, a GitHub tree URL, any https git URL), search the source for skills, and record where each came from so `update` can re-fetch it. A `git` cargo feature adds the libgit2 fetcher, so only `rupu-cli` links `git2` through it. The CLI is a thin `cmd/skill.rs` over the crate. The layer directories come from one new `rupu_workspace::project_layer_dir`, so the R5 rule is the same one config loading uses.
 
 **Tech Stack:** Rust 2021, `serde`/`serde_yaml`, `sha2` + `hex`, `walkdir`, `thiserror`, `git2` (feature `git`), `clap`, `assert_cmd`.
 
-**Spec:** `docs/superpowers/specs/2026-10-12-rupu-agent-skills-design.md` (§1 model, §2.1 grant grammar, §3.1 to §3.3 renderers, §3.5 tool map, §7 CLI). Read it before starting.
+**Spec:** `docs/superpowers/specs/2026-10-12-rupu-agent-skills-design.md` (§1 model, §2.1 grant grammar, §3.1 to §3.3 renderers, §3.5 tool map, §7 CLI, sources, search and `update`). Read it before starting.
 
 ## Global Constraints
 
@@ -32,7 +32,8 @@
 2. **A skill directory that is a git checkout or was opened in Finder** (`.git/`, `.DS_Store`) gets a stamp that does not move when git fetches or Finder writes. Pinned in Task 3.
 3. **`install --force` with a broken replacement** leaves the existing skill untouched. Pinned in Task 7.
 4. **`allowed-tools: Bash(git status:*) Read`**, with a space inside the parentheses, maps to `bash` and `read_file`, not to three garbage entries. Pinned in Task 6.
-5. **A `metadata:` value written as a YAML number** (`version: 1.0`) is accepted as the string `"1.0"`. Published skills do this often, and rejecting them breaks format compatibility. Pinned in Task 2.
+5. **A GitHub URL copied from the browser** (`https://github.com/o/r/tree/main/skills/pdf`) installs that one skill rather than failing to clone. Pinned in Task 8.
+6. **A `metadata:` value written as a YAML number** (`version: 1.0`) is accepted as the string `"1.0"`. Published skills do this often, and rejecting them breaks format compatibility. Pinned in Task 2.
 
 ---
 
@@ -50,8 +51,11 @@
 | `crates/rupu-skills/src/grant.rs` | `SkillGrant` grammar, `resolve_grants`, `ResolveError`, edit distance |
 | `crates/rupu-skills/src/render.rs` | skills section (preload + index), `skills.load` result text |
 | `crates/rupu-skills/src/tools_map.rs` | `allowed-tools` → rupu core tool names |
-| `crates/rupu-skills/src/install.rs` | `install_dir`, `InstallError` |
-| `crates/rupu-skills/src/git.rs` | `GitSource`, `parse_git_source`, `fetch` (feature `git`) |
+| `crates/rupu-skills/src/install.rs` | `find_skills`, `choose`, `install_selected`, `install_one`, `install_from`, `list_source`, `InstallError` |
+| `crates/rupu-skills/src/source.rs` | `Source`, `GitSource`, `parse_source`, `Fetch`, `FetchedTree`, `SourceError` |
+| `crates/rupu-skills/src/git.rs` | `GitFetcher` (feature `git`) |
+| `crates/rupu-skills/src/record.rs` | `SourceRecord`, `.sources/<name>.json` read/write |
+| `crates/rupu-skills/src/update.rs` | `update_skills`, `UpdateOutcome` |
 | `crates/rupu-skills/tests/it/*.rs` | one integration binary |
 | `crates/rupu-workspace/src/config_paths.rs` | `project_layer_dir` (R5), reused by `project_config_path` |
 | `crates/rupu-cli/src/cmd/skill.rs` | `rupu skill` subcommands |
@@ -93,21 +97,20 @@ rust-version.workspace = true
 workspace = true
 
 [features]
-git = ["dep:git2", "dep:tempfile"]
+git = ["dep:git2"]
 
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 walkdir = { workspace = true }
 thiserror = { workspace = true }
+tempfile = { workspace = true }
 git2 = { workspace = true, optional = true }
-tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
-serde_json = { workspace = true }
 git2 = { workspace = true }
 ```
 
@@ -1719,47 +1722,132 @@ git commit -m "feat(skills): render the skills section and load result"
 
 ---
 
-### Task 7: Install from a directory or an https git URL
+### Task 7: Find, choose and install skills from a directory
 
 **Files:**
-- Create: `crates/rupu-skills/src/install.rs`, `crates/rupu-skills/src/git.rs`
+- Create: `crates/rupu-skills/src/install.rs`
 - Modify: `crates/rupu-skills/src/lib.rs`, `crates/rupu-skills/tests/it/main.rs`
-- Test: `crates/rupu-skills/tests/it/install.rs`, unit tests inside `git.rs`
+- Test: `crates/rupu-skills/tests/it/install.rs`
 
 **Interfaces:**
-- Consumes: `load_skill`, `Layer`, `SkillError`, `EntryKind`, `Stamp`.
+- Consumes: `parse_skill_md`, `SkillName`, `load_skill`, `Layer`, `walk_tree`, `content_hash`, `EntryKind`, `Stamp`, `ContentHash`.
 - Produces:
-  - `InstallRequest<'a> { source: &'a Path, skills_dir: &'a Path, layer: Layer, name: Option<&'a str>, force: bool }`.
-  - `install_dir(req: &InstallRequest<'_>) -> Result<Installed, InstallError>`.
-  - `Installed { name: SkillName, path: PathBuf, outcome: InstallOutcome, stamp: Stamp }`; `InstallOutcome::{Created, Replaced}`.
-  - `InstallError::{NoSkill(PathBuf), Several(Vec<String>), NameNotFound { name: String, found: Vec<String> }, Invalid(SkillError), AbsoluteSymlink(String), Exists(PathBuf), Io { path: PathBuf, source: std::io::Error }}`.
-  - Feature `git`: `GitSource { url: String, subdir: Option<String> }`; `parse_git_source(s: &str) -> Option<Result<GitSource, SourceError>>` (`None` when `s` is not a URL); `fetch(src: &GitSource) -> Result<Fetched, SourceError>`; `Fetched { dir: tempfile::TempDir, path: PathBuf }`; `SourceError::{UnsupportedScheme(String), BadSubdir(String), Clone(String), SubdirMissing(String)}`.
+  - `MAX_SEARCH_DEPTH: usize = 6`.
+  - `Found { name: String, rel: String /* "" when the root is the skill */, path: PathBuf, description: Option<String>, error: Option<String> }`. `name` is the frontmatter `name` when it parses, else the directory name.
+  - `find_skills(root: &Path) -> Result<Vec<Found>, InstallError>`, sorted by `rel`.
+  - `Selection::{Default, Named(Vec<String>), All}`.
+  - `choose<'a>(found: &'a [Found], sel: &Selection) -> Result<Vec<&'a Found>, InstallError>`.
+  - `install_selected(found: &[Found], sel: &Selection, skills_dir: &Path, layer: Layer, force: bool) -> Result<InstallReport, InstallError>`.
+  - `install_one(source_dir: &Path, skills_dir: &Path, layer: Layer, force: bool) -> Result<Installed, InstallError>`.
+  - `source_hash(source_dir: &Path) -> Result<(SkillName, ContentHash), InstallError>`: validates a source skill and returns its name and content hash (Task 9 uses it).
+  - `InstallReport { installed: Vec<Installed>, skipped: Vec<(String, String)> }`.
+  - `Installed { name: SkillName, path: PathBuf, outcome: InstallOutcome, stamp: Stamp, content_hash: ContentHash, rel: String }`.
+  - `InstallOutcome::{Created, Replaced}`.
+  - `InstallError::{NoSkill(PathBuf), Several(Vec<String>), NameNotFound { name: String, found: Vec<String> }, DuplicateName { name: String, paths: Vec<String> }, Invalid { name: String, error: String }, AbsoluteSymlink { skill: String, rel: String }, Exists(PathBuf), Io { path: PathBuf, source: std::io::Error }}`. Task 8 adds `Source(SourceError)`.
 
 - [ ] **Step 1: Write the failing test** (`crates/rupu-skills/tests/it/install.rs`; add `mod install;`)
 
 ```rust
 use crate::support::write_skill;
-use rupu_skills::install::{install_dir, InstallError, InstallOutcome, InstallRequest};
+use rupu_skills::install::{
+    choose, find_skills, install_one, install_selected, InstallError, InstallOutcome, Selection,
+};
 use rupu_skills::{load_skill, Layer};
 use std::fs;
+use std::path::Path;
 
-fn req<'a>(source: &'a std::path::Path, skills_dir: &'a std::path::Path) -> InstallRequest<'a> {
-    InstallRequest { source, skills_dir, layer: Layer::Global, name: None, force: false }
+/// A repo shaped like the published skill collections: `skills/<name>/`,
+/// a template at the root, skills under `.claude/skills/`, and noise.
+fn collection(root: &Path) {
+    write_skill(&root.join("skills"), "pdf", "pdf", "PDF things.");
+    write_skill(&root.join("skills"), "docx", "docx", "Word things.");
+    write_skill(&root.join("skills/pdf"), "nested", "nested", "never found: inside a skill");
+    write_skill(root, "template", "template-skill", "A starting point.");
+    write_skill(&root.join(".claude/skills"), "hidden-one", "hidden-one", "From a plugin folder.");
+    write_skill(&root.join("node_modules"), "dep", "dep", "never found: node_modules");
+    write_skill(&root.join(".git"), "obj", "obj", "never found: .git");
+    fs::write(root.join("README.md"), "# skills\n").unwrap();
 }
 
 #[test]
-fn installs_a_single_skill_dir() {
+fn find_skills_searches_like_the_ecosystem() {
+    let t = tempfile::tempdir().unwrap();
+    collection(t.path());
+    let found = find_skills(t.path()).unwrap();
+    let got: Vec<(&str, &str)> = found.iter().map(|f| (f.name.as_str(), f.rel.as_str())).collect();
+    assert_eq!(
+        got,
+        vec![
+            ("hidden-one", ".claude/skills/hidden-one"),
+            ("docx", "skills/docx"),
+            ("pdf", "skills/pdf"),
+            ("template-skill", "template"),
+        ]
+    );
+    assert_eq!(found[2].description.as_deref(), Some("PDF things."));
+}
+
+#[test]
+fn a_root_skill_is_found_by_its_frontmatter_name() {
+    let t = tempfile::tempdir().unwrap();
+    let root = write_skill(t.path(), "repo-checkout", "report-style", "d");
+    let found = find_skills(&root).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!((found[0].name.as_str(), found[0].rel.as_str()), ("report-style", ""));
+}
+
+#[test]
+fn search_depth_is_bounded() {
+    let t = tempfile::tempdir().unwrap();
+    write_skill(&t.path().join("a/b/c/d/e/f"), "deep", "deep", "seven levels down");
+    write_skill(&t.path().join("a/b/c/d/e"), "ok", "ok", "six levels down");
+    let names: Vec<String> = find_skills(t.path()).unwrap().into_iter().map(|f| f.name).collect();
+    assert_eq!(names, vec!["ok"]);
+}
+
+#[test]
+fn duplicate_names_in_one_source_are_an_error() {
+    let t = tempfile::tempdir().unwrap();
+    write_skill(&t.path().join("a"), "same", "same", "d");
+    write_skill(&t.path().join("b"), "same", "same", "d");
+    assert!(matches!(
+        find_skills(t.path()),
+        Err(InstallError::DuplicateName { name, paths }) if name == "same" && paths == ["a/same", "b/same"]
+    ));
+}
+
+#[test]
+fn choose_by_selection() {
+    let t = tempfile::tempdir().unwrap();
+    collection(t.path());
+    let found = find_skills(t.path()).unwrap();
+    assert!(matches!(choose(&found, &Selection::Default), Err(InstallError::Several(v)) if v.len() == 4));
+    let one = choose(&found, &Selection::Named(vec!["pdf".into()])).unwrap();
+    assert_eq!(one[0].rel, "skills/pdf");
+    assert_eq!(choose(&found, &Selection::All).unwrap().len(), 4);
+    assert!(matches!(
+        choose(&found, &Selection::Named(vec!["xlsx".into()])),
+        Err(InstallError::NameNotFound { name, .. }) if name == "xlsx"
+    ));
+    let single = find_skills(&t.path().join("skills/pdf")).unwrap();
+    assert_eq!(choose(&single, &Selection::Default).unwrap().len(), 1);
+}
+
+#[test]
+fn install_one_names_the_skill_by_its_frontmatter() {
     let src = tempfile::tempdir().unwrap();
     let dst = tempfile::tempdir().unwrap();
-    let skill = write_skill(src.path(), "pdf-processing", "pdf-processing", "pdf");
-    fs::create_dir_all(skill.join(".git")).unwrap();
-    fs::write(skill.join(".git/HEAD"), "x").unwrap();
-    let got = install_dir(&req(&skill, dst.path())).unwrap();
+    let root = write_skill(src.path(), "repo-checkout", "report-style", "d");
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git/HEAD"), "x").unwrap();
+    let got = install_one(&root, dst.path(), Layer::Global, false).unwrap();
     assert_eq!(got.outcome, InstallOutcome::Created);
-    assert_eq!(got.path, dst.path().join("pdf-processing"));
+    assert_eq!(got.path, dst.path().join("report-style"));
     let installed = load_skill(&got.path, Layer::Global).unwrap();
     assert_eq!(installed.files(), vec!["SKILL.md", "scripts/run.sh"]);
-    assert!(!got.path.join(".git").exists(), ".git must not be copied");
+    assert_eq!(installed.content_hash().unwrap(), got.content_hash);
+    let leftovers: Vec<_> = fs::read_dir(dst.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(leftovers, vec![std::ffi::OsString::from("report-style")], "no staging dirs left");
 }
 
 #[cfg(unix)]
@@ -1770,23 +1858,9 @@ fn keeps_the_exec_bit() {
     let dst = tempfile::tempdir().unwrap();
     let skill = write_skill(src.path(), "s", "s", "d");
     fs::set_permissions(skill.join("scripts/run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
-    let got = install_dir(&req(&skill, dst.path())).unwrap();
+    let got = install_one(&skill, dst.path(), Layer::Global, false).unwrap();
     let mode = fs::metadata(got.path.join("scripts/run.sh")).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o755);
-}
-
-#[test]
-fn a_repo_of_several_skills_needs_a_name() {
-    let src = tempfile::tempdir().unwrap();
-    let dst = tempfile::tempdir().unwrap();
-    write_skill(src.path(), "a-skill", "a-skill", "d");
-    write_skill(src.path(), "b-skill", "b-skill", "d");
-    assert!(matches!(install_dir(&req(src.path(), dst.path())), Err(InstallError::Several(v)) if v == ["a-skill", "b-skill"]));
-    let mut r = req(src.path(), dst.path());
-    r.name = Some("b-skill");
-    assert_eq!(install_dir(&r).unwrap().name.as_str(), "b-skill");
-    r.name = Some("c-skill");
-    assert!(matches!(install_dir(&r), Err(InstallError::NameNotFound { .. })));
 }
 
 #[test]
@@ -1794,16 +1868,13 @@ fn refuses_existing_without_force_and_replaces_with_it() {
     let src = tempfile::tempdir().unwrap();
     let dst = tempfile::tempdir().unwrap();
     let skill = write_skill(src.path(), "s", "s", "first");
-    install_dir(&req(&skill, dst.path())).unwrap();
+    install_one(&skill, dst.path(), Layer::Global, false).unwrap();
     write_skill(src.path(), "s", "s", "second");
-    assert!(matches!(install_dir(&req(&skill, dst.path())), Err(InstallError::Exists(_))));
-    let mut r = req(&skill, dst.path());
-    r.force = true;
-    assert_eq!(install_dir(&r).unwrap().outcome, InstallOutcome::Replaced);
-    let now = load_skill(&dst.path().join("s"), Layer::Global).unwrap();
-    assert_eq!(now.frontmatter.description, "second");
+    assert!(matches!(install_one(&skill, dst.path(), Layer::Global, false), Err(InstallError::Exists(_))));
+    assert_eq!(install_one(&skill, dst.path(), Layer::Global, true).unwrap().outcome, InstallOutcome::Replaced);
+    assert_eq!(load_skill(&dst.path().join("s"), Layer::Global).unwrap().frontmatter.description, "second");
     let leftovers: Vec<_> = fs::read_dir(dst.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
-    assert_eq!(leftovers, vec![std::ffi::OsString::from("s")], "no temp or backup dirs left");
+    assert_eq!(leftovers, vec![std::ffi::OsString::from("s")], "no staging or backup dirs left");
 }
 
 #[test]
@@ -1811,13 +1882,10 @@ fn a_broken_replacement_leaves_the_old_skill_intact() {
     let src = tempfile::tempdir().unwrap();
     let dst = tempfile::tempdir().unwrap();
     let skill = write_skill(src.path(), "s", "s", "good");
-    install_dir(&req(&skill, dst.path())).unwrap();
+    install_one(&skill, dst.path(), Layer::Global, false).unwrap();
     fs::write(skill.join("SKILL.md"), "---\nname: s\n---\n").unwrap();
-    let mut r = req(&skill, dst.path());
-    r.force = true;
-    assert!(matches!(install_dir(&r), Err(InstallError::Invalid(_))));
-    let kept = load_skill(&dst.path().join("s"), Layer::Global).unwrap();
-    assert_eq!(kept.frontmatter.description, "good");
+    assert!(matches!(install_one(&skill, dst.path(), Layer::Global, true), Err(InstallError::Invalid { .. })));
+    assert_eq!(load_skill(&dst.path().join("s"), Layer::Global).unwrap().frontmatter.description, "good");
 }
 
 #[cfg(unix)]
@@ -1827,12 +1895,46 @@ fn absolute_internal_symlinks_are_refused_relative_ones_copied() {
     let dst = tempfile::tempdir().unwrap();
     let skill = write_skill(src.path(), "s", "s", "d");
     std::os::unix::fs::symlink("scripts/run.sh", skill.join("run")).unwrap();
-    let got = install_dir(&req(&skill, dst.path())).unwrap();
-    assert_eq!(fs::read_link(got.path.join("run")).unwrap(), std::path::Path::new("scripts/run.sh"));
+    let got = install_one(&skill, dst.path(), Layer::Global, false).unwrap();
+    assert_eq!(fs::read_link(got.path.join("run")).unwrap(), Path::new("scripts/run.sh"));
 
     let skill2 = write_skill(src.path(), "t", "t", "d");
     std::os::unix::fs::symlink(skill2.join("scripts/run.sh").canonicalize().unwrap(), skill2.join("run")).unwrap();
-    assert!(matches!(install_dir(&req(&skill2, dst.path())), Err(InstallError::AbsoluteSymlink(r)) if r == "run"));
+    assert!(matches!(
+        install_one(&skill2, dst.path(), Layer::Global, false),
+        Err(InstallError::AbsoluteSymlink { skill, rel }) if skill == "t" && rel == "run"
+    ));
+}
+
+#[test]
+fn install_all_skips_invalid_named_invalid_fails_before_writing() {
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    write_skill(src.path(), "good", "good", "d");
+    let bad = write_skill(src.path(), "bad", "bad", "d");
+    fs::write(bad.join("SKILL.md"), "---\nname: bad\n---\n").unwrap();
+    let found = find_skills(src.path()).unwrap();
+
+    let err = install_selected(&found, &Selection::Named(vec!["good".into(), "bad".into()]), dst.path(), Layer::Global, false);
+    assert!(matches!(err, Err(InstallError::Invalid { name, .. }) if name == "bad"));
+    assert!(!dst.path().join("good").exists(), "nothing is written when a named skill is invalid");
+
+    let report = install_selected(&found, &Selection::All, dst.path(), Layer::Global, false).unwrap();
+    assert_eq!(report.installed.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(), vec!["good"]);
+    assert_eq!(report.skipped.len(), 1);
+    assert_eq!(report.skipped[0].0, "bad");
+}
+
+#[test]
+fn install_selected_checks_every_destination_before_writing() {
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    write_skill(src.path(), "a-one", "a-one", "d");
+    write_skill(src.path(), "b-two", "b-two", "d");
+    write_skill(dst.path(), "b-two", "b-two", "already here");
+    let found = find_skills(src.path()).unwrap();
+    assert!(matches!(install_selected(&found, &Selection::All, dst.path(), Layer::Global, false), Err(InstallError::Exists(_))));
+    assert!(!dst.path().join("a-one").exists());
 }
 ```
 
@@ -1841,24 +1943,39 @@ fn absolute_internal_symlinks_are_refused_relative_ones_copied() {
 Run: `cargo test -p rupu-skills --test it install::`
 Expected: compile error, `install` not found.
 
-- [ ] **Step 3: Implement `install.rs`**
+- [ ] **Step 3: Implement** (`crates/rupu-skills/src/install.rs`)
 
 ```rust
-//! Copy a validated skill into a layer's `skills/` directory. Validation
-//! runs on the source before the destination is touched, and the swap is
-//! a rename, so a failed install never damages an installed skill.
+//! Find the skills in a source directory, choose some, and copy them into
+//! a layer's `skills/` directory (spec §7.2). Every chosen skill is
+//! validated, and every destination checked, before anything is written.
+//! Each copy is staged under its real name, validated again in place, and
+//! swapped in by rename, so a failed install never damages an installed
+//! skill.
 
+use crate::frontmatter::parse_skill_md;
 use crate::name::SkillName;
-use crate::skill::{load_skill, Layer, SkillError};
-use crate::tree::{EntryKind, Stamp};
+use crate::skill::{load_skill, Layer};
+use crate::tree::{self, ContentHash, EntryKind, Stamp, TreeEntry};
 use std::path::{Path, PathBuf};
 
-pub struct InstallRequest<'a> {
-    pub source: &'a Path,
-    pub skills_dir: &'a Path,
-    pub layer: Layer,
-    pub name: Option<&'a str>,
-    pub force: bool,
+pub const MAX_SEARCH_DEPTH: usize = 6;
+const SKIP_DIRS: &[&str] = &[".git", "node_modules"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Found {
+    pub name: String,
+    pub rel: String,
+    pub path: PathBuf,
+    pub description: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Selection {
+    Default,
+    Named(Vec<String>),
+    All,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1873,20 +1990,30 @@ pub struct Installed {
     pub path: PathBuf,
     pub outcome: InstallOutcome,
     pub stamp: Stamp,
+    pub content_hash: ContentHash,
+    pub rel: String,
+}
+
+#[derive(Debug, Default)]
+pub struct InstallReport {
+    pub installed: Vec<Installed>,
+    pub skipped: Vec<(String, String)>,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum InstallError {
-    #[error("no SKILL.md in {0} or its subdirectories")]
+    #[error("no SKILL.md found in {0}")]
     NoSkill(PathBuf),
-    #[error("the source holds several skills ({}); pick one with --name", .0.join(", "))]
+    #[error("the source holds several skills ({}); pick with --skill <name> or take them all with --all", .0.join(", "))]
     Several(Vec<String>),
     #[error("no skill named {name:?} in the source (found: {})", found.join(", "))]
     NameNotFound { name: String, found: Vec<String> },
-    #[error("the skill is invalid: {0}")]
-    Invalid(#[from] SkillError),
-    #[error("symlink {0} uses an absolute target; make it relative or replace it with the file")]
-    AbsoluteSymlink(String),
+    #[error("two skills named {name:?} in the source ({}); narrow the source with #<path>", paths.join(", "))]
+    DuplicateName { name: String, paths: Vec<String> },
+    #[error("skill {name:?} is invalid: {error}")]
+    Invalid { name: String, error: String },
+    #[error("skill {skill:?}: symlink {rel} uses an absolute target; make it relative or replace it with the file")]
+    AbsoluteSymlink { skill: String, rel: String },
     #[error("{0} already exists; pass --force to replace it")]
     Exists(PathBuf),
     #[error("{path}: {source}")]
@@ -1897,77 +2024,187 @@ fn io(path: &Path) -> impl FnOnce(std::io::Error) -> InstallError + '_ {
     move |source| InstallError::Io { path: path.to_owned(), source }
 }
 
-pub fn install_dir(req: &InstallRequest<'_>) -> Result<Installed, InstallError> {
-    let src = pick_source(req.source, req.name)?;
-    let skill = load_skill(&src, Layer::Global)?;
-    for e in &skill.entries {
+pub fn find_skills(root: &Path) -> Result<Vec<Found>, InstallError> {
+    let mut out = Vec::new();
+    search(root, "", 0, &mut out)?;
+    out.sort_by(|a, b| a.rel.cmp(&b.rel));
+    let mut by_name: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
+    for f in &out {
+        by_name.entry(&f.name).or_default().push(&f.rel);
+    }
+    if let Some((name, paths)) = by_name.into_iter().find(|(_, p)| p.len() > 1) {
+        return Err(InstallError::DuplicateName {
+            name: name.to_owned(),
+            paths: paths.into_iter().map(str::to_owned).collect(),
+        });
+    }
+    Ok(out)
+}
+
+fn search(dir: &Path, rel: &str, depth: usize, out: &mut Vec<Found>) -> Result<(), InstallError> {
+    let md = dir.join("SKILL.md");
+    if md.is_file() {
+        out.push(describe(dir, rel, &md));
+        return Ok(());
+    }
+    if depth == MAX_SEARCH_DEPTH {
+        return Ok(());
+    }
+    for item in std::fs::read_dir(dir).map_err(io(dir))? {
+        let item = item.map_err(io(dir))?;
+        let Some(name) = item.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if SKIP_DIRS.contains(&name.as_str()) || !item.file_type().map_err(io(dir))?.is_dir() {
+            continue;
+        }
+        let child_rel = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+        search(&item.path(), &child_rel, depth + 1, out)?;
+    }
+    Ok(())
+}
+
+fn describe(dir: &Path, rel: &str, md: &Path) -> Found {
+    let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_owned();
+    let parsed = std::fs::read_to_string(md)
+        .map_err(|e| e.to_string())
+        .and_then(|t| parse_skill_md(&t).map_err(|e| e.to_string()));
+    match parsed {
+        Ok((fm, _)) => Found {
+            name: fm.name,
+            rel: rel.to_owned(),
+            path: dir.to_owned(),
+            description: Some(fm.description),
+            error: None,
+        },
+        Err(e) => Found { name: dir_name, rel: rel.to_owned(), path: dir.to_owned(), description: None, error: Some(e) },
+    }
+}
+
+pub fn choose<'a>(found: &'a [Found], sel: &Selection) -> Result<Vec<&'a Found>, InstallError> {
+    let names = || found.iter().map(|f| f.name.clone()).collect::<Vec<_>>();
+    match sel {
+        Selection::All => Ok(found.iter().collect()),
+        Selection::Default => match found {
+            [] => Err(InstallError::Several(Vec::new())),
+            [one] => Ok(vec![one]),
+            _ => Err(InstallError::Several(names())),
+        },
+        Selection::Named(wanted) => wanted
+            .iter()
+            .map(|w| {
+                found.iter().find(|f| &f.name == w).ok_or_else(|| InstallError::NameNotFound {
+                    name: w.clone(),
+                    found: names(),
+                })
+            })
+            .collect(),
+    }
+}
+
+/// Validate a source skill: frontmatter, name, tree (no escaping symlinks)
+/// and no absolute symlinks. Returns its name and the entries to copy.
+fn check_source(dir: &Path) -> Result<(SkillName, Vec<TreeEntry>), InstallError> {
+    let fallback = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_owned();
+    let invalid = |error: String| InstallError::Invalid { name: fallback.clone(), error };
+    let text = std::fs::read_to_string(dir.join("SKILL.md")).map_err(|e| invalid(e.to_string()))?;
+    let (fm, _) = parse_skill_md(&text).map_err(|e| invalid(e.to_string()))?;
+    let name: SkillName = fm.name.parse().map_err(|e: crate::NameError| invalid(e.to_string()))?;
+    let entries = tree::walk_tree(dir).map_err(|e| InstallError::Invalid { name: name.to_string(), error: e.to_string() })?;
+    for e in &entries {
         if let EntryKind::Symlink { target } = &e.kind {
             if Path::new(target).is_absolute() {
-                return Err(InstallError::AbsoluteSymlink(e.rel.clone()));
+                return Err(InstallError::AbsoluteSymlink { skill: name.to_string(), rel: e.rel.clone() });
             }
         }
     }
-    std::fs::create_dir_all(req.skills_dir).map_err(io(req.skills_dir))?;
-    let dest = req.skills_dir.join(skill.name.as_str());
+    Ok((name, entries))
+}
+
+pub fn source_hash(source_dir: &Path) -> Result<(SkillName, ContentHash), InstallError> {
+    let (name, entries) = check_source(source_dir)?;
+    let root = source_dir.canonicalize().map_err(io(source_dir))?;
+    let hash = tree::content_hash(&root, &entries)
+        .map_err(|e| InstallError::Invalid { name: name.to_string(), error: e.to_string() })?;
+    Ok((name, hash))
+}
+
+pub fn install_selected(
+    found: &[Found],
+    sel: &Selection,
+    skills_dir: &Path,
+    layer: Layer,
+    force: bool,
+) -> Result<InstallReport, InstallError> {
+    let mut report = InstallReport::default();
+    let mut ready = Vec::new();
+    for f in choose(found, sel)? {
+        match check_source(&f.path) {
+            Ok((name, _)) => ready.push((f, name)),
+            Err(e) if *sel == Selection::All => report.skipped.push((f.name.clone(), e.to_string())),
+            Err(e) => return Err(e),
+        }
+    }
+    if !force {
+        if let Some((_, name)) = ready.iter().find(|(_, n)| skills_dir.join(n.as_str()).exists()) {
+            return Err(InstallError::Exists(skills_dir.join(name.as_str())));
+        }
+    }
+    for (f, _) in ready {
+        let mut installed = install_one(&f.path, skills_dir, layer, force)?;
+        installed.rel = f.rel.clone();
+        report.installed.push(installed);
+    }
+    Ok(report)
+}
+
+pub fn install_one(source_dir: &Path, skills_dir: &Path, layer: Layer, force: bool) -> Result<Installed, InstallError> {
+    let (name, entries) = check_source(source_dir)?;
+    let root = source_dir.canonicalize().map_err(io(source_dir))?;
+    let dest = skills_dir.join(name.as_str());
     let exists = dest.exists();
-    if exists && !req.force {
+    if exists && !force {
         return Err(InstallError::Exists(dest));
     }
+    std::fs::create_dir_all(skills_dir).map_err(io(skills_dir))?;
     let pid = std::process::id();
-    let tmp = req.skills_dir.join(format!(".install-{}-{pid}", skill.name));
-    let _ = std::fs::remove_dir_all(&tmp);
-    if let Err(e) = copy_tree(&skill.root, &skill.entries, &tmp) {
-        let _ = std::fs::remove_dir_all(&tmp);
-        return Err(e);
-    }
+    let staging = skills_dir.join(format!(".staging-{name}-{pid}"));
+    let _ = std::fs::remove_dir_all(&staging);
+    let staged = staging.join(name.as_str());
+    let result = copy_tree(&root, &entries, &staged).and_then(|()| {
+        load_skill(&staged, layer).map_err(|e| InstallError::Invalid { name: name.to_string(), error: e.to_string() })
+    });
+    let staged_skill = match result {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+    };
+    let content_hash = staged_skill.content_hash().map_err(|e| InstallError::Invalid {
+        name: name.to_string(),
+        error: e.to_string(),
+    })?;
     let outcome = if exists {
-        let backup = req.skills_dir.join(format!(".replaced-{}-{pid}", skill.name));
+        let backup = skills_dir.join(format!(".replaced-{name}-{pid}"));
         std::fs::rename(&dest, &backup).map_err(io(&dest))?;
-        if let Err(source) = std::fs::rename(&tmp, &dest) {
+        if let Err(source) = std::fs::rename(&staged, &dest) {
             let _ = std::fs::rename(&backup, &dest);
-            let _ = std::fs::remove_dir_all(&tmp);
+            let _ = std::fs::remove_dir_all(&staging);
             return Err(InstallError::Io { path: dest, source });
         }
         let _ = std::fs::remove_dir_all(&backup);
         InstallOutcome::Replaced
     } else {
-        std::fs::rename(&tmp, &dest).map_err(io(&dest))?;
+        std::fs::rename(&staged, &dest).map_err(io(&dest))?;
         InstallOutcome::Created
     };
-    let installed = load_skill(&dest, req.layer)?;
-    Ok(Installed { name: installed.name, path: dest, outcome, stamp: installed.stamp })
+    let _ = std::fs::remove_dir_all(&staging);
+    let installed = load_skill(&dest, layer).map_err(|e| InstallError::Invalid { name: name.to_string(), error: e.to_string() })?;
+    Ok(Installed { name, path: dest, outcome, stamp: installed.stamp, content_hash, rel: String::new() })
 }
 
-fn pick_source(source: &Path, name: Option<&str>) -> Result<PathBuf, InstallError> {
-    if source.join("SKILL.md").is_file() {
-        if let Some(n) = name {
-            let here = source.file_name().and_then(|f| f.to_str()).unwrap_or_default();
-            if n != here {
-                return Err(InstallError::NameNotFound { name: n.to_owned(), found: vec![here.to_owned()] });
-            }
-        }
-        return Ok(source.to_owned());
-    }
-    let mut found = Vec::new();
-    for item in std::fs::read_dir(source).map_err(io(source))? {
-        let item = item.map_err(io(source))?;
-        if item.path().join("SKILL.md").is_file() {
-            if let Some(n) = item.file_name().to_str() {
-                found.push(n.to_owned());
-            }
-        }
-    }
-    found.sort();
-    match (name, found.as_slice()) {
-        (_, []) => Err(InstallError::NoSkill(source.to_owned())),
-        (None, [one]) => Ok(source.join(one)),
-        (None, _) => Err(InstallError::Several(found)),
-        (Some(n), _) if found.iter().any(|f| f == n) => Ok(source.join(n)),
-        (Some(n), _) => Err(InstallError::NameNotFound { name: n.to_owned(), found }),
-    }
-}
-
-fn copy_tree(root: &Path, entries: &[crate::tree::TreeEntry], to: &Path) -> Result<(), InstallError> {
+fn copy_tree(root: &Path, entries: &[TreeEntry], to: &Path) -> Result<(), InstallError> {
     std::fs::create_dir_all(to).map_err(io(to))?;
     for e in entries {
         let dest = to.join(&e.rel);
@@ -1990,156 +2227,902 @@ fn symlink(target: &str, at: &Path) -> Result<(), InstallError> {
 }
 
 #[cfg(not(unix))]
-fn symlink(_target: &str, at: &Path) -> Result<(), InstallError> {
-    Err(InstallError::AbsoluteSymlink(at.display().to_string()))
+fn symlink(target: &str, at: &Path) -> Result<(), InstallError> {
+    Err(InstallError::AbsoluteSymlink { skill: at.display().to_string(), rel: target.to_owned() })
 }
 ```
 
-`std::fs::copy` copies permission bits on Unix, which keeps the exec bit. `walk_tree` already skips `.git`, so `copy_tree` never sees it.
+`std::fs::copy` copies permission bits on Unix, which keeps the exec bit. `walk_tree` already skips `.git`, so `copy_tree` never sees it. Staging and backup directories start with `.`, so `SkillCatalog::discover` never lists one left by a crash.
 
-- [ ] **Step 4: Run the install tests and watch them pass**
+`lib.rs`: add `pub mod install;`.
+
+- [ ] **Step 4: Run it and watch it pass**
 
 Run: `cargo test -p rupu-skills --test it install::`
-Expected: 6 passed.
+Expected: 12 passed.
 
-- [ ] **Step 5: Write `git.rs` with its unit tests** (behind `#[cfg(feature = "git")]` in `lib.rs`)
+- [ ] **Step 5: Commit**
+
+```bash
+rustfmt crates/rupu-skills/src/install.rs crates/rupu-skills/src/lib.rs crates/rupu-skills/tests/it/install.rs crates/rupu-skills/tests/it/main.rs
+git add crates/rupu-skills
+git commit -m "feat(skills): find, choose and install skills from a directory"
+```
+
+---
+
+### Task 8: Install sources and the git fetcher
+
+**Files:**
+- Create: `crates/rupu-skills/src/source.rs`, `crates/rupu-skills/src/git.rs`
+- Modify: `crates/rupu-skills/src/lib.rs`, `crates/rupu-skills/src/install.rs` (add `InstallError::Source`), `crates/rupu-skills/tests/it/main.rs`
+- Test: `crates/rupu-skills/tests/it/source.rs`, unit tests in `git.rs`
+
+**Interfaces:**
+- Produces:
+  - `Source::{Local(PathBuf), Git(GitSource)}`; `GitSource { url: String, git_ref: Option<String>, path: Option<String> }`; both `Debug + Clone + PartialEq + Eq`.
+  - `parse_source(input: &str, git_ref: Option<&str>, home: Option<&Path>) -> Result<Source, SourceError>`. `home` expands a leading `~/`.
+  - `SourceError::{NotFound(String), UnsupportedScheme(String), BadPath(String), RefConflict { url_ref: String, flag_ref: String }, Unrecognized(String), Clone(String), PathMissing(String)}`.
+  - `FetchedTree { root: PathBuf, commit: Option<String> }` plus a private temp-dir guard; `FetchedTree::local(root: PathBuf) -> Self`; `FetchedTree::with_guard(root: PathBuf, commit: Option<String>, guard: tempfile::TempDir) -> Self`.
+  - `trait Fetch { fn fetch(&self, src: &GitSource) -> Result<FetchedTree, SourceError>; }`.
+  - Feature `git`: `git::GitFetcher` (unit struct) implementing `Fetch`. It refuses any URL that isn't `https://`.
+  - `InstallError::Source(#[from] SourceError)`.
+
+- [ ] **Step 1: Write the failing test** (`crates/rupu-skills/tests/it/source.rs`; add `mod source;`)
 
 ```rust
-//! Fetch a skill source from an https git URL: a shallow clone into a temp
-//! dir with libgit2, which runs no hooks and does not touch submodules.
+use rupu_skills::source::{parse_source, GitSource, Source, SourceError};
+
+fn git(url: &str, git_ref: Option<&str>, path: Option<&str>) -> Source {
+    Source::Git(GitSource {
+        url: url.into(),
+        git_ref: git_ref.map(Into::into),
+        path: path.map(Into::into),
+    })
+}
+
+#[test]
+fn local_paths() {
+    let t = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(t.path().join("skills/x")).unwrap();
+    let canon = t.path().join("skills/x").canonicalize().unwrap();
+    let p = t.path().join("skills/x");
+    assert_eq!(parse_source(p.to_str().unwrap(), None, None).unwrap(), Source::Local(canon.clone()));
+    assert_eq!(parse_source("~/skills/x", None, Some(t.path())).unwrap(), Source::Local(canon));
+    assert!(matches!(parse_source("./definitely-not-here", None, None), Err(SourceError::NotFound(_))));
+}
+
+#[test]
+fn github_shorthand_and_urls() {
+    assert_eq!(parse_source("anthropics/skills", None, None).unwrap(), git("https://github.com/anthropics/skills", None, None));
+    assert_eq!(
+        parse_source("anthropics/skills#skills/pdf", None, None).unwrap(),
+        git("https://github.com/anthropics/skills", None, Some("skills/pdf"))
+    );
+    assert_eq!(
+        parse_source("https://github.com/anthropics/skills", Some("v2"), None).unwrap(),
+        git("https://github.com/anthropics/skills", Some("v2"), None)
+    );
+    assert_eq!(
+        parse_source("https://github.com/anthropics/skills/tree/main/skills/pdf", None, None).unwrap(),
+        git("https://github.com/anthropics/skills", Some("main"), Some("skills/pdf"))
+    );
+    assert_eq!(
+        parse_source("https://github.com/o/r/blob/v1/skills/pdf/SKILL.md", None, None).unwrap(),
+        git("https://github.com/o/r", Some("v1"), Some("skills/pdf"))
+    );
+    assert_eq!(
+        parse_source("https://gitlab.example.com/team/skills.git#tools/lint", None, None).unwrap(),
+        git("https://gitlab.example.com/team/skills.git", None, Some("tools/lint"))
+    );
+}
+
+#[test]
+fn refusals() {
+    assert!(matches!(parse_source("git@github.com:o/r.git", None, None), Err(SourceError::UnsupportedScheme(_))));
+    assert!(matches!(parse_source("ssh://github.com/o/r", None, None), Err(SourceError::UnsupportedScheme(_))));
+    assert!(matches!(parse_source("file:///tmp/r", None, None), Err(SourceError::UnsupportedScheme(_))));
+    assert!(matches!(parse_source("http://github.com/o/r", None, None), Err(SourceError::UnsupportedScheme(_))));
+    assert!(matches!(parse_source("o/r#../escape", None, None), Err(SourceError::BadPath(_))));
+    assert!(matches!(parse_source("o/r#/abs", None, None), Err(SourceError::BadPath(_))));
+    assert!(matches!(
+        parse_source("https://github.com/o/r/tree/main/x", Some("dev"), None),
+        Err(SourceError::RefConflict { .. })
+    ));
+    assert_eq!(
+        parse_source("https://github.com/o/r/tree/main/x", Some("main"), None).unwrap(),
+        git("https://github.com/o/r", Some("main"), Some("x"))
+    );
+    assert!(matches!(parse_source("just-a-word", None, None), Err(SourceError::Unrecognized(_))));
+}
+```
+
+- [ ] **Step 2: Run it and watch it fail**
+
+Run: `cargo test -p rupu-skills --test it source::`
+Expected: compile error, `source` module not found.
+
+- [ ] **Step 3: Implement `source.rs`**
+
+```rust
+//! What `rupu skill install` accepts (spec §7.1): a local directory, a
+//! GitHub `owner/repo`, a GitHub tree or blob URL, or any https git URL
+//! with an optional `#<path>`.
 
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    Local(PathBuf),
+    Git(GitSource),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitSource {
     pub url: String,
-    pub subdir: Option<String>,
+    pub git_ref: Option<String>,
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SourceError {
-    #[error("only https:// git URLs are supported ({0}); for a local checkout pass its directory")]
+    #[error("no such directory: {0}")]
+    NotFound(String),
+    #[error("only https:// git URLs are fetched ({0}); for a local checkout pass its directory")]
     UnsupportedScheme(String),
-    #[error("#{0}: the subdirectory must be a relative path without '..'")]
-    BadSubdir(String),
-    #[error("clone failed: {0}")]
+    #[error("#{0}: the path must be relative and must not contain '..'")]
+    BadPath(String),
+    #[error("the URL names ref {url_ref:?} but --ref says {flag_ref:?}")]
+    RefConflict { url_ref: String, flag_ref: String },
+    #[error("{0:?} is not a directory, owner/repo, or https git URL")]
+    Unrecognized(String),
+    #[error("fetch failed: {0}")]
     Clone(String),
     #[error("#{0} does not exist in the repository")]
-    SubdirMissing(String),
+    PathMissing(String),
 }
 
-pub struct Fetched {
-    pub dir: tempfile::TempDir,
-    pub path: PathBuf,
-}
-
-/// `None` when `s` is not a URL (treat it as a local path).
-pub fn parse_git_source(s: &str) -> Option<Result<GitSource, SourceError>> {
-    if !(s.contains("://") || s.starts_with("git@")) {
-        return None;
-    }
-    let (url, subdir) = match s.split_once('#') {
-        Some((u, d)) => (u, Some(d.trim_matches('/').to_owned())),
-        None => (s, None),
+pub fn parse_source(input: &str, git_ref: Option<&str>, home: Option<&Path>) -> Result<Source, SourceError> {
+    let expanded = match (input.strip_prefix("~/"), home) {
+        (Some(rest), Some(h)) => h.join(rest),
+        _ => PathBuf::from(input),
     };
-    if !url.starts_with("https://") {
-        return Some(Err(SourceError::UnsupportedScheme(url.to_owned())));
+    if expanded.is_dir() {
+        let canon = expanded.canonicalize().map_err(|_| SourceError::NotFound(input.to_owned()))?;
+        return Ok(Source::Local(canon));
     }
-    if let Some(d) = &subdir {
-        let p = Path::new(d);
-        if d.is_empty() || p.is_absolute() || p.components().any(|c| matches!(c, Component::ParentDir)) {
-            return Some(Err(SourceError::BadSubdir(d.clone())));
+    if input.starts_with('.') || input.starts_with('/') || input.starts_with('~') {
+        return Err(SourceError::NotFound(input.to_owned()));
+    }
+    if input.starts_with("git@") {
+        return Err(SourceError::UnsupportedScheme(input.to_owned()));
+    }
+    let (base, hash_path) = match input.split_once('#') {
+        Some((b, p)) => (b, Some(check_path(p)?)),
+        None => (input, None),
+    };
+    let flag_ref = git_ref.map(str::to_owned);
+    if let Some((scheme, _)) = base.split_once("://") {
+        if scheme != "https" {
+            return Err(SourceError::UnsupportedScheme(input.to_owned()));
         }
-    }
-    Some(Ok(GitSource { url: url.to_owned(), subdir }))
-}
-
-pub fn fetch(src: &GitSource) -> Result<Fetched, SourceError> {
-    let dir = tempfile::tempdir().map_err(|e| SourceError::Clone(e.to_string()))?;
-    clone_into(&src.url, dir.path(), true).map_err(|e| SourceError::Clone(e.message().to_owned()))?;
-    let path = match &src.subdir {
-        Some(d) => {
-            let p = dir.path().join(d);
-            if !p.is_dir() {
-                return Err(SourceError::SubdirMissing(d.clone()));
+        if let Some(tree) = github_tree(base)? {
+            let (url, url_ref, path) = tree;
+            if let Some(f) = &flag_ref {
+                if *f != url_ref {
+                    return Err(SourceError::RefConflict { url_ref, flag_ref: f.clone() });
+                }
             }
-            p
+            return Ok(Source::Git(GitSource { url, git_ref: Some(url_ref), path: hash_path.or(path) }));
         }
-        None => dir.path().to_owned(),
-    };
-    Ok(Fetched { dir, path })
+        return Ok(Source::Git(GitSource { url: base.trim_end_matches('/').to_owned(), git_ref: flag_ref, path: hash_path }));
+    }
+    let parts: Vec<&str> = base.split('/').collect();
+    let ok = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if parts.len() == 2 && parts.iter().all(|p| ok(p)) {
+        return Ok(Source::Git(GitSource {
+            url: format!("https://github.com/{}/{}", parts[0], parts[1]),
+            git_ref: flag_ref,
+            path: hash_path,
+        }));
+    }
+    Err(SourceError::Unrecognized(input.to_owned()))
 }
 
-fn clone_into(url: &str, dest: &Path, shallow: bool) -> Result<(), git2::Error> {
+fn check_path(p: &str) -> Result<String, SourceError> {
+    let trimmed = p.trim_end_matches('/');
+    let path = Path::new(trimmed);
+    if trimmed.is_empty() || p.starts_with('/') || path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(SourceError::BadPath(p.to_owned()));
+    }
+    Ok(trimmed.to_owned())
+}
+
+/// `https://github.com/o/r/tree/<ref>/<path>` or `.../blob/<ref>/<path>/SKILL.md`
+/// → (repo URL, ref, path). The ref is one segment; a ref with `/` needs
+/// `--ref` and `#<path>`.
+fn github_tree(url: &str) -> Result<Option<(String, String, Option<String>)>, SourceError> {
+    let Some(rest) = url.strip_prefix("https://github.com/") else {
+        return Ok(None);
+    };
+    let segs: Vec<&str> = rest.trim_end_matches('/').split('/').collect();
+    if segs.len() < 4 || !matches!(segs[2], "tree" | "blob") {
+        return Ok(None);
+    }
+    let repo = format!("https://github.com/{}/{}", segs[0], segs[1]);
+    let mut path_segs: Vec<&str> = segs[4..].to_vec();
+    if segs[2] == "blob" && path_segs.last() == Some(&"SKILL.md") {
+        path_segs.pop();
+    }
+    let path = if path_segs.is_empty() { None } else { Some(check_path(&path_segs.join("/"))?) };
+    Ok(Some((repo, segs[3].to_owned(), path)))
+}
+
+/// A fetched source tree: `root` is the repo root, or `<path>` inside it.
+pub struct FetchedTree {
+    pub root: PathBuf,
+    pub commit: Option<String>,
+    _guard: Option<tempfile::TempDir>,
+}
+
+impl FetchedTree {
+    pub fn local(root: PathBuf) -> Self {
+        Self { root, commit: None, _guard: None }
+    }
+
+    pub fn with_guard(root: PathBuf, commit: Option<String>, guard: tempfile::TempDir) -> Self {
+        Self { root, commit, _guard: Some(guard) }
+    }
+}
+
+/// How a git source is fetched. `git::GitFetcher` is the production one;
+/// tests pass their own.
+pub trait Fetch {
+    fn fetch(&self, src: &GitSource) -> Result<FetchedTree, SourceError>;
+}
+```
+
+`install.rs`: add to `InstallError`:
+
+```rust
+    #[error(transparent)]
+    Source(#[from] crate::source::SourceError),
+```
+
+- [ ] **Step 4: Implement `git.rs`** (behind `#[cfg(feature = "git")]` in `lib.rs`), with its unit tests
+
+```rust
+//! Fetch a git source with libgit2: no hooks, no submodules, https only.
+//! The default branch is a shallow clone; a ref is a full clone checked
+//! out detached at that ref.
+
+use crate::source::{Fetch, FetchedTree, GitSource, SourceError};
+use std::path::Path;
+
+pub struct GitFetcher;
+
+impl Fetch for GitFetcher {
+    fn fetch(&self, src: &GitSource) -> Result<FetchedTree, SourceError> {
+        if !src.url.starts_with("https://") {
+            return Err(SourceError::UnsupportedScheme(src.url.clone()));
+        }
+        fetch_any(src)
+    }
+}
+
+/// The fetch itself, without the scheme check (unit tests clone `file://`).
+pub(crate) fn fetch_any(src: &GitSource) -> Result<FetchedTree, SourceError> {
+    let guard = tempfile::tempdir().map_err(|e| SourceError::Clone(e.to_string()))?;
+    let checkout = guard.path().join(repo_dir_name(&src.url));
+    let commit = clone_at(&src.url, &checkout, src.git_ref.as_deref()).map_err(|e| SourceError::Clone(e.message().to_owned()))?;
+    let root = match &src.path {
+        Some(p) => {
+            let r = checkout.join(p);
+            if !r.is_dir() {
+                return Err(SourceError::PathMissing(p.clone()));
+            }
+            r
+        }
+        None => checkout,
+    };
+    Ok(FetchedTree::with_guard(root, Some(commit), guard))
+}
+
+/// The clone's directory name: the repo's last URL segment, so a repo whose
+/// root is a skill keeps a meaningful name in `--list` output.
+fn repo_dir_name(url: &str) -> String {
+    let last = url.trim_end_matches('/').rsplit('/').next().unwrap_or("source");
+    let name = last.trim_end_matches(".git");
+    if name.is_empty() || name.starts_with('.') {
+        "source".into()
+    } else {
+        name.into()
+    }
+}
+
+/// Clone `url` into `dest` and return the checked-out commit id.
+pub(crate) fn clone_at(url: &str, dest: &Path, git_ref: Option<&str>) -> Result<String, git2::Error> {
     let mut fo = git2::FetchOptions::new();
-    if shallow {
+    if git_ref.is_none() && url.starts_with("https://") {
         fo.depth(1);
     }
-    git2::build::RepoBuilder::new().fetch_options(fo).clone(url, dest)?;
-    Ok(())
+    let repo = git2::build::RepoBuilder::new().fetch_options(fo).clone(url, dest)?;
+    if let Some(r) = git_ref {
+        let obj = [r.to_owned(), format!("origin/{r}"), format!("refs/tags/{r}")]
+            .iter()
+            .find_map(|spec| repo.revparse_single(spec).ok())
+            .ok_or_else(|| git2::Error::from_str(&format!("ref {r:?} not found")))?;
+        let commit = obj.peel_to_commit()?;
+        repo.checkout_tree(commit.as_object(), Some(git2::build::CheckoutBuilder::new().force()))?;
+        repo.set_head_detached(commit.id())?;
+    }
+    let head = repo.head()?.peel_to_commit()?;
+    Ok(head.id().to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn parses_sources() {
-        assert!(parse_git_source("./skills/x").is_none());
-        assert_eq!(
-            parse_git_source("https://github.com/o/r#skills/pdf").unwrap().unwrap(),
-            GitSource { url: "https://github.com/o/r".into(), subdir: Some("skills/pdf".into()) }
-        );
-        assert!(matches!(parse_git_source("git@github.com:o/r"), Some(Err(SourceError::UnsupportedScheme(_)))));
-        assert!(matches!(parse_git_source("file:///tmp/r"), Some(Err(SourceError::UnsupportedScheme(_)))));
-        assert!(matches!(parse_git_source("https://h/r#../x"), Some(Err(SourceError::BadSubdir(_)))));
+    fn commit_all(repo: &git2::Repository, msg: &str) -> git2::Oid {
+        let mut idx = repo.index().unwrap();
+        idx.add_all(["*"], git2::IndexAddOption::DEFAULT, None).unwrap();
+        idx.write().unwrap();
+        let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("t", "t@example.invalid").unwrap();
+        let parents: Vec<git2::Commit> = repo.head().ok().and_then(|h| h.peel_to_commit().ok()).into_iter().collect();
+        let refs: Vec<&git2::Commit> = parents.iter().collect();
+        repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &refs).unwrap()
+    }
+
+    fn origin() -> (tempfile::TempDir, git2::Oid, git2::Oid) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let skill = dir.path().join("skills/s");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "---\nname: s\ndescription: first\n---\n").unwrap();
+        let first = commit_all(&repo, "first");
+        let obj = repo.find_object(first, None).unwrap();
+        repo.tag_lightweight("v1", &obj, false).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "---\nname: s\ndescription: second\n---\n").unwrap();
+        let second = commit_all(&repo, "second");
+        (dir, first, second)
     }
 
     #[test]
-    fn clones_a_local_repository() {
-        let origin = tempfile::tempdir().unwrap();
-        let repo = git2::Repository::init(origin.path()).unwrap();
-        std::fs::create_dir_all(origin.path().join("skills/s")).unwrap();
-        std::fs::write(origin.path().join("skills/s/SKILL.md"), "---\nname: s\ndescription: d\n---\n").unwrap();
-        let mut idx = repo.index().unwrap();
-        idx.add_path(Path::new("skills/s/SKILL.md")).unwrap();
-        let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
-        let sig = git2::Signature::now("t", "t@example.invalid").unwrap();
-        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap();
+    fn clones_head_and_a_tag() {
+        let (o, first, second) = origin();
+        let url = format!("file://{}", o.path().display());
 
-        let dest = tempfile::tempdir().unwrap();
-        let url = format!("file://{}", origin.path().display());
-        clone_into(&url, &dest.path().join("c"), false).unwrap();
-        assert!(dest.path().join("c/skills/s/SKILL.md").is_file());
+        let head = fetch_any(&GitSource { url: url.clone(), git_ref: None, path: Some("skills/s".into()) }).unwrap();
+        assert_eq!(head.commit.as_deref(), Some(second.to_string().as_str()));
+        assert!(std::fs::read_to_string(head.root.join("SKILL.md")).unwrap().contains("second"));
+
+        let tag = fetch_any(&GitSource { url, git_ref: Some("v1".into()), path: Some("skills/s".into()) }).unwrap();
+        assert_eq!(tag.commit.as_deref(), Some(first.to_string().as_str()));
+        assert!(std::fs::read_to_string(tag.root.join("SKILL.md")).unwrap().contains("first"));
+    }
+
+    #[test]
+    fn missing_path_and_scheme() {
+        let (o, _, _) = origin();
+        let url = format!("file://{}", o.path().display());
+        assert!(matches!(
+            fetch_any(&GitSource { url: url.clone(), git_ref: None, path: Some("nope".into()) }),
+            Err(SourceError::PathMissing(_))
+        ));
+        assert!(matches!(
+            GitFetcher.fetch(&GitSource { url, git_ref: None, path: None }),
+            Err(SourceError::UnsupportedScheme(_))
+        ));
+    }
+
+    #[test]
+    fn repo_dir_names() {
+        assert_eq!(repo_dir_name("https://github.com/o/report-style"), "report-style");
+        assert_eq!(repo_dir_name("https://h/team/skills.git"), "skills");
+        assert_eq!(repo_dir_name("https://h/"), "h");
     }
 }
 ```
 
-`lib.rs`: add `pub mod install;` and
+`clone_at` asks for `depth(1)` only over https: libgit2's local transport has no shallow support, and that is the only transport the unit tests use.
+
+`lib.rs`: add `pub mod source;`, `pub use source::{parse_source, Fetch, FetchedTree, GitSource, Source, SourceError};`, and
 
 ```rust
 #[cfg(feature = "git")]
 pub mod git;
 ```
 
-The unit test clones without `depth`, because libgit2's local transport does not support shallow fetches. The https path is the one `fetch` uses.
+- [ ] **Step 5: Run the tests and watch them pass**
 
-- [ ] **Step 6: Run the git tests**
-
+Run: `cargo test -p rupu-skills --test it source::`
+Expected: 3 passed.
 Run: `cargo test -p rupu-skills --features git --lib git::`
-Expected: 2 passed.
+Expected: 3 passed.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-rustfmt crates/rupu-skills/src/install.rs crates/rupu-skills/src/git.rs crates/rupu-skills/src/lib.rs crates/rupu-skills/tests/it/install.rs crates/rupu-skills/tests/it/main.rs
-git add crates/rupu-skills
-git commit -m "feat(skills): install skills from a directory or https git"
+rustfmt crates/rupu-skills/src/source.rs crates/rupu-skills/src/git.rs crates/rupu-skills/src/install.rs crates/rupu-skills/src/lib.rs crates/rupu-skills/tests/it/source.rs crates/rupu-skills/tests/it/main.rs
+git add crates/rupu-skills Cargo.lock
+git commit -m "feat(skills): parse install sources and fetch git sources"
 ```
 
 ---
 
-### Task 8: `project_layer_dir` and `rupu skill`
+### Task 9: Source records, `install_from` and `update`
+
+**Files:**
+- Create: `crates/rupu-skills/src/record.rs`, `crates/rupu-skills/src/update.rs`
+- Modify: `crates/rupu-skills/src/install.rs` (add `install_from`, `list_source`), `crates/rupu-skills/src/lib.rs`, `crates/rupu-skills/tests/it/main.rs`
+- Test: `crates/rupu-skills/tests/it/update.rs`
+
+**Interfaces:**
+- Consumes: `Source`, `GitSource`, `Fetch`, `FetchedTree`, `find_skills`, `install_selected`, `install_one`, `source_hash`, `load_skill`.
+- Produces:
+  - `SourceRecord { version: u32, source: String, url: Option<String>, git_ref: Option<String> /* JSON "ref" */, path: Option<String>, commit: Option<String>, local: Option<PathBuf>, content_hash: String, installed_at: u64 }`, `Serialize + Deserialize + Debug + Clone + PartialEq`.
+  - `record::record_path(skills_dir: &Path, name: &str) -> PathBuf` (`<skills_dir>/.sources/<name>.json`), `record::write_record(skills_dir: &Path, name: &str, rec: &SourceRecord) -> std::io::Result<()>`, `record::read_record(skills_dir: &Path, name: &str) -> Result<Option<SourceRecord>, RecordError>`, `record::list_records(skills_dir: &Path) -> Vec<String>`.
+  - `InstallSpec<'a> { source: &'a Source, input: &'a str, selection: Selection, skills_dir: &'a Path, layer: Layer, force: bool }`.
+  - `install_from(spec: &InstallSpec<'_>, fetcher: &dyn Fetch) -> Result<InstallReport, InstallError>`: fetches, finds, installs, writes a record per installed skill.
+  - `list_source(source: &Source, fetcher: &dyn Fetch) -> Result<Vec<Found>, InstallError>`.
+  - `UpdateOutcome::{Updated { from: String, to: String }, UpToDate, NoRecord, LocallyModified, NotInstalled, Failed(String)}`, `Debug + PartialEq + Eq`.
+  - `update_skills(skills_dir: &Path, layer: Layer, names: &[String], force: bool, fetcher: &dyn Fetch) -> Vec<(String, UpdateOutcome)>`. Empty `names` means every installed skill with a record.
+
+- [ ] **Step 1: Write the failing test** (`crates/rupu-skills/tests/it/update.rs`; add `mod update;`)
+
+```rust
+use crate::support::write_skill;
+use rupu_skills::install::{install_from, list_source, InstallSpec, Selection};
+use rupu_skills::record::read_record;
+use rupu_skills::update::{update_skills, UpdateOutcome};
+use rupu_skills::{Fetch, FetchedTree, GitSource, Layer, Source, SourceError};
+use std::cell::RefCell;
+use std::fs;
+use std::path::PathBuf;
+
+/// Serves one "repository" from a local directory, with a settable commit.
+struct FakeFetch {
+    repo: PathBuf,
+    commit: RefCell<String>,
+    calls: RefCell<usize>,
+}
+
+impl Fetch for FakeFetch {
+    fn fetch(&self, src: &GitSource) -> Result<FetchedTree, SourceError> {
+        *self.calls.borrow_mut() += 1;
+        let root = match &src.path {
+            Some(p) => self.repo.join(p),
+            None => self.repo.clone(),
+        };
+        Ok(FetchedTree::local_with_commit(root, Some(self.commit.borrow().clone())))
+    }
+}
+
+fn gh(path: Option<&str>) -> Source {
+    Source::Git(GitSource { url: "https://github.com/o/skills".into(), git_ref: None, path: path.map(Into::into) })
+}
+
+fn setup() -> (tempfile::TempDir, tempfile::TempDir, FakeFetch) {
+    let repo = tempfile::tempdir().unwrap();
+    write_skill(&repo.path().join("skills"), "pdf", "pdf", "v1");
+    write_skill(&repo.path().join("skills"), "docx", "docx", "v1");
+    let dst = tempfile::tempdir().unwrap();
+    let f = FakeFetch { repo: repo.path().to_owned(), commit: RefCell::new("c1".into()), calls: RefCell::new(0) };
+    (repo, dst, f)
+}
+
+#[test]
+fn install_from_git_writes_a_record() {
+    let (_repo, dst, f) = setup();
+    let source = gh(None);
+    let report = install_from(
+        &InstallSpec { source: &source, input: "o/skills", selection: Selection::Named(vec!["pdf".into()]), skills_dir: dst.path(), layer: Layer::Global, force: false },
+        &f,
+    )
+    .unwrap();
+    assert_eq!(report.installed.len(), 1);
+    let rec = read_record(dst.path(), "pdf").unwrap().unwrap();
+    assert_eq!(rec.source, "o/skills");
+    assert_eq!(rec.url.as_deref(), Some("https://github.com/o/skills"));
+    assert_eq!(rec.path.as_deref(), Some("skills/pdf"));
+    assert_eq!(rec.commit.as_deref(), Some("c1"));
+    assert_eq!(rec.content_hash, report.installed[0].content_hash.hex());
+    assert!(dst.path().join(".sources/pdf.json").is_file());
+}
+
+#[test]
+fn list_source_shows_every_skill() {
+    let (_repo, _dst, f) = setup();
+    let names: Vec<String> = list_source(&gh(None), &f).unwrap().into_iter().map(|x| x.name).collect();
+    assert_eq!(names, vec!["docx", "pdf"]);
+}
+
+#[test]
+fn update_moves_up_to_date_and_respects_local_edits() {
+    let (repo, dst, f) = setup();
+    let source = gh(None);
+    install_from(
+        &InstallSpec { source: &source, input: "o/skills", selection: Selection::All, skills_dir: dst.path(), layer: Layer::Global, force: false },
+        &f,
+    )
+    .unwrap();
+    *f.calls.borrow_mut() = 0;
+
+    assert_eq!(
+        update_skills(dst.path(), Layer::Global, &[], false, &f),
+        vec![("docx".into(), UpdateOutcome::UpToDate), ("pdf".into(), UpdateOutcome::UpToDate)]
+    );
+    assert_eq!(*f.calls.borrow(), 1, "one fetch per (url, ref)");
+
+    write_skill(&repo.path().join("skills"), "pdf", "pdf", "v2");
+    *f.commit.borrow_mut() = "c2".into();
+    let got = update_skills(dst.path(), Layer::Global, &["pdf".into()], false, &f);
+    assert_eq!(got, vec![("pdf".into(), UpdateOutcome::Updated { from: "c1".into(), to: "c2".into() })]);
+    let installed = fs::read_to_string(dst.path().join("pdf/SKILL.md")).unwrap();
+    assert!(installed.contains("v2"));
+    assert_eq!(read_record(dst.path(), "pdf").unwrap().unwrap().commit.as_deref(), Some("c2"));
+
+    fs::write(dst.path().join("docx/scripts/run.sh"), "echo edited\n").unwrap();
+    write_skill(&repo.path().join("skills"), "docx", "docx", "v2");
+    assert_eq!(
+        update_skills(dst.path(), Layer::Global, &["docx".into()], false, &f),
+        vec![("docx".into(), UpdateOutcome::LocallyModified)]
+    );
+    assert!(matches!(
+        update_skills(dst.path(), Layer::Global, &["docx".into()], true, &f)[0].1,
+        UpdateOutcome::Updated { .. }
+    ));
+}
+
+#[test]
+fn update_reports_unmanaged_and_missing_skills() {
+    let (_repo, dst, f) = setup();
+    write_skill(dst.path(), "hand-made", "hand-made", "placed by hand");
+    assert_eq!(
+        update_skills(dst.path(), Layer::Global, &["hand-made".into(), "ghost".into()], false, &f),
+        vec![("hand-made".into(), UpdateOutcome::NoRecord), ("ghost".into(), UpdateOutcome::NotInstalled)]
+    );
+    assert!(update_skills(dst.path(), Layer::Global, &[], false, &f).is_empty(), "--all covers recorded skills only");
+}
+
+#[test]
+fn local_sources_update_from_their_directory() {
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    let dir = write_skill(src.path(), "notes", "notes", "v1");
+    let source = Source::Local(dir.canonicalize().unwrap());
+    let none = FakeFetch { repo: PathBuf::new(), commit: RefCell::new(String::new()), calls: RefCell::new(0) };
+    install_from(
+        &InstallSpec { source: &source, input: dir.to_str().unwrap(), selection: Selection::Default, skills_dir: dst.path(), layer: Layer::Global, force: false },
+        &none,
+    )
+    .unwrap();
+    let rec = read_record(dst.path(), "notes").unwrap().unwrap();
+    assert_eq!(rec.local, Some(dir.canonicalize().unwrap()));
+    assert_eq!(rec.url, None);
+
+    write_skill(src.path(), "notes", "notes", "v2");
+    assert!(matches!(update_skills(dst.path(), Layer::Global, &[], false, &none)[0].1, UpdateOutcome::Updated { .. }));
+    assert_eq!(*none.calls.borrow(), 0, "a local source never fetches");
+}
+```
+
+`FetchedTree::local_with_commit` is a test-friendly constructor; add it to `source.rs` in Step 3.
+
+- [ ] **Step 2: Run it and watch it fail**
+
+Run: `cargo test -p rupu-skills --test it update::`
+Expected: compile error, `record` / `update` not found.
+
+- [ ] **Step 3: Implement**
+
+`source.rs`, in `impl FetchedTree`:
+
+```rust
+    /// A tree already on disk, with the commit it stands for (if any).
+    pub fn local_with_commit(root: PathBuf, commit: Option<String>) -> Self {
+        Self { root, commit, _guard: None }
+    }
+```
+
+`crates/rupu-skills/src/record.rs`:
+
+```rust
+//! Where an installed skill came from (spec §7.3), kept outside the skill's
+//! own directory so it never moves the skill's fingerprints and is never
+//! readable through a run's read roots.
+
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+pub const RECORD_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceRecord {
+    pub version: u32,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub git_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local: Option<PathBuf>,
+    pub content_hash: String,
+    pub installed_at: u64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RecordError {
+    #[error("{path}: {source}")]
+    Io { path: PathBuf, source: std::io::Error },
+    #[error("{path}: {source}")]
+    Json { path: PathBuf, source: serde_json::Error },
+}
+
+pub fn record_path(skills_dir: &Path, name: &str) -> PathBuf {
+    skills_dir.join(".sources").join(format!("{name}.json"))
+}
+
+pub fn write_record(skills_dir: &Path, name: &str, rec: &SourceRecord) -> std::io::Result<()> {
+    let path = record_path(skills_dir, name);
+    std::fs::create_dir_all(path.parent().expect("record path has a parent"))?;
+    let tmp = path.with_extension(format!("json.{}", std::process::id()));
+    std::fs::write(&tmp, serde_json::to_vec_pretty(rec).expect("record serializes"))?;
+    std::fs::rename(&tmp, &path)
+}
+
+pub fn read_record(skills_dir: &Path, name: &str) -> Result<Option<SourceRecord>, RecordError> {
+    let path = record_path(skills_dir, name);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(RecordError::Io { path, source }),
+    };
+    serde_json::from_slice(&bytes).map(Some).map_err(|source| RecordError::Json { path, source })
+}
+
+/// Names of installed skills that have a record. Orphaned records (the
+/// skill directory was deleted) are ignored.
+pub fn list_records(skills_dir: &Path) -> Vec<String> {
+    let Ok(read) = std::fs::read_dir(skills_dir.join(".sources")) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = read
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().to_str()?.strip_suffix(".json").map(str::to_owned))
+        .filter(|n| skills_dir.join(n).join("SKILL.md").is_file())
+        .collect();
+    names.sort();
+    names
+}
+
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+```
+
+Append to `install.rs`:
+
+```rust
+pub struct InstallSpec<'a> {
+    pub source: &'a crate::source::Source,
+    pub input: &'a str,
+    pub selection: Selection,
+    pub skills_dir: &'a Path,
+    pub layer: Layer,
+    pub force: bool,
+}
+
+fn open(source: &crate::source::Source, fetcher: &dyn crate::source::Fetch) -> Result<crate::source::FetchedTree, InstallError> {
+    Ok(match source {
+        crate::source::Source::Local(p) => crate::source::FetchedTree::local(p.clone()),
+        crate::source::Source::Git(g) => fetcher.fetch(g)?,
+    })
+}
+
+pub fn list_source(source: &crate::source::Source, fetcher: &dyn crate::source::Fetch) -> Result<Vec<Found>, InstallError> {
+    let tree = open(source, fetcher)?;
+    let found = find_skills(&tree.root)?;
+    if found.is_empty() {
+        return Err(InstallError::NoSkill(tree.root.clone()));
+    }
+    Ok(found)
+}
+
+pub fn install_from(spec: &InstallSpec<'_>, fetcher: &dyn crate::source::Fetch) -> Result<InstallReport, InstallError> {
+    use crate::record::{now_secs, write_record, SourceRecord, RECORD_VERSION};
+    use crate::source::Source;
+    let tree = open(spec.source, fetcher)?;
+    let found = find_skills(&tree.root)?;
+    if found.is_empty() {
+        return Err(InstallError::NoSkill(tree.root.clone()));
+    }
+    let report = install_selected(&found, &spec.selection, spec.skills_dir, spec.layer, spec.force)?;
+    for inst in &report.installed {
+        let (url, git_ref, path, local) = match spec.source {
+            Source::Git(g) => {
+                let joined = match (&g.path, inst.rel.as_str()) {
+                    (Some(p), "") => Some(p.clone()),
+                    (Some(p), r) => Some(format!("{p}/{r}")),
+                    (None, "") => None,
+                    (None, r) => Some(r.to_owned()),
+                };
+                (Some(g.url.clone()), g.git_ref.clone(), joined, None)
+            }
+            Source::Local(root) => {
+                let dir = if inst.rel.is_empty() { root.clone() } else { root.join(&inst.rel) };
+                (None, None, None, Some(dir))
+            }
+        };
+        let rec = SourceRecord {
+            version: RECORD_VERSION,
+            source: spec.input.to_owned(),
+            url,
+            git_ref,
+            path,
+            commit: tree.commit.clone(),
+            local,
+            content_hash: inst.content_hash.hex(),
+            installed_at: now_secs(),
+        };
+        write_record(spec.skills_dir, inst.name.as_str(), &rec).map_err(|source| InstallError::Io {
+            path: crate::record::record_path(spec.skills_dir, inst.name.as_str()),
+            source,
+        })?;
+    }
+    Ok(report)
+}
+```
+
+`crates/rupu-skills/src/update.rs`:
+
+```rust
+//! `rupu skill update` (spec §7.3): re-fetch installed skills from their
+//! recorded source. One fetch per (url, ref); a skill whose installed copy
+//! no longer matches its record was edited locally and is left alone
+//! unless forced.
+
+use crate::install::{find_skills, install_one, source_hash};
+use crate::record::{list_records, now_secs, read_record, write_record, SourceRecord};
+use crate::skill::{load_skill, Layer};
+use crate::source::{Fetch, FetchedTree, GitSource};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateOutcome {
+    Updated { from: String, to: String },
+    UpToDate,
+    NoRecord,
+    LocallyModified,
+    NotInstalled,
+    Failed(String),
+}
+
+pub fn update_skills(
+    skills_dir: &Path,
+    layer: Layer,
+    names: &[String],
+    force: bool,
+    fetcher: &dyn Fetch,
+) -> Vec<(String, UpdateOutcome)> {
+    let names: Vec<String> = if names.is_empty() { list_records(skills_dir) } else { names.to_vec() };
+    let mut trees: HashMap<(String, Option<String>), Result<FetchedTree, String>> = HashMap::new();
+    names
+        .into_iter()
+        .map(|name| {
+            let outcome = update_one(skills_dir, layer, &name, force, fetcher, &mut trees)
+                .unwrap_or_else(UpdateOutcome::Failed);
+            (name, outcome)
+        })
+        .collect()
+}
+
+fn short(s: &str) -> String {
+    s.chars().take(12).collect()
+}
+
+fn update_one(
+    skills_dir: &Path,
+    layer: Layer,
+    name: &str,
+    force: bool,
+    fetcher: &dyn Fetch,
+    trees: &mut HashMap<(String, Option<String>), Result<FetchedTree, String>>,
+) -> Result<UpdateOutcome, String> {
+    let installed_dir = skills_dir.join(name);
+    if !installed_dir.join("SKILL.md").is_file() {
+        return Ok(UpdateOutcome::NotInstalled);
+    }
+    let Some(rec) = read_record(skills_dir, name).map_err(|e| e.to_string())? else {
+        return Ok(UpdateOutcome::NoRecord);
+    };
+    let installed = load_skill(&installed_dir, layer).map_err(|e| e.to_string())?;
+    let current = installed.content_hash().map_err(|e| e.to_string())?.hex();
+    if current != rec.content_hash && !force {
+        return Ok(UpdateOutcome::LocallyModified);
+    }
+
+    let (source_dir, commit) = match (&rec.local, &rec.url) {
+        (Some(dir), _) => (dir.clone(), None),
+        (None, Some(url)) => {
+            let key = (url.clone(), rec.git_ref.clone());
+            let tree = trees.entry(key).or_insert_with(|| {
+                fetcher
+                    .fetch(&GitSource { url: url.clone(), git_ref: rec.git_ref.clone(), path: None })
+                    .map_err(|e| e.to_string())
+            });
+            let tree = tree.as_ref().map_err(Clone::clone)?;
+            (locate(&tree.root, rec.path.as_deref(), name)?, tree.commit.clone())
+        }
+        (None, None) => return Err("source record has neither url nor local".into()),
+    };
+
+    let (_, new_hash) = source_hash(&source_dir).map_err(|e| e.to_string())?;
+    let new_rec = SourceRecord {
+        commit: commit.clone(),
+        content_hash: new_hash.hex(),
+        installed_at: now_secs(),
+        ..rec.clone()
+    };
+    if new_hash.hex() == current {
+        if new_rec.commit != rec.commit {
+            write_record(skills_dir, name, &new_rec).map_err(|e| e.to_string())?;
+        }
+        return Ok(UpdateOutcome::UpToDate);
+    }
+    install_one(&source_dir, skills_dir, layer, true).map_err(|e| e.to_string())?;
+    write_record(skills_dir, name, &new_rec).map_err(|e| e.to_string())?;
+    let label = |commit: &Option<String>, hash: &str| short(commit.as_deref().unwrap_or(hash));
+    Ok(UpdateOutcome::Updated { from: label(&rec.commit, &rec.content_hash), to: label(&commit, &new_hash.hex()) })
+}
+
+/// The skill's directory in a fetched tree: its recorded path, or a search
+/// by name when the repository moved it.
+fn locate(root: &Path, path: Option<&str>, name: &str) -> Result<PathBuf, String> {
+    if let Some(p) = path {
+        let dir = root.join(p);
+        if dir.join("SKILL.md").is_file() {
+            return Ok(dir);
+        }
+    }
+    find_skills(root)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|f| f.name == name)
+        .map(|f| f.path)
+        .ok_or_else(|| format!("{name} is no longer in its source"))
+}
+```
+
+`lib.rs`: add `pub mod record; pub mod update;`.
+
+Note: the `pdf` record's path is `skills/pdf` and the fake fetch receives `path: None`, so `locate` joins `skills/pdf` onto the repo root. That is the production shape: `update` always clones the whole repo and uses the recorded path.
+
+- [ ] **Step 4: Run it and watch it pass**
+
+Run: `cargo test -p rupu-skills --test it update::`
+Expected: 5 passed.
+
+- [ ] **Step 5: Commit**
+
+```bash
+rustfmt crates/rupu-skills/src/record.rs crates/rupu-skills/src/update.rs crates/rupu-skills/src/install.rs crates/rupu-skills/src/source.rs crates/rupu-skills/src/lib.rs crates/rupu-skills/tests/it/update.rs crates/rupu-skills/tests/it/main.rs
+git add crates/rupu-skills Cargo.lock
+git commit -m "feat(skills): record install sources and update from them"
+```
+
+---
+
+### Task 10: `project_layer_dir` and `rupu skill`
 
 **Files:**
 - Modify: `crates/rupu-workspace/src/config_paths.rs` (`project_config_path`, new `project_layer_dir`), `crates/rupu-workspace/src/lib.rs` (re-export)
@@ -2149,7 +3132,7 @@ git commit -m "feat(skills): install skills from a directory or https git"
 - Test: `crates/rupu-workspace/tests/it/config_paths.rs`, `crates/rupu-cli/tests/it/cli_skill.rs`
 
 **Interfaces:**
-- Consumes: everything `rupu_skills` exports.
+- Consumes: everything `rupu_skills` exports, and `rupu_skills::git::GitFetcher`.
 - Produces: `rupu_workspace::project_layer_dir(global: &Path, project_root: Option<&Path>) -> Option<PathBuf>`, which returns the project's `.rupu/` or `None` under R5. Plan 2's assembler and Plan 4's CP use it for skill discovery.
 
 - [ ] **Step 1: Write the failing workspace test** (append to `crates/rupu-workspace/tests/it/config_paths.rs`)
@@ -2211,15 +3194,16 @@ Expected: all pass, the existing R5 tests included.
 - [ ] **Step 3: Write the failing CLI test** (`crates/rupu-cli/tests/it/cli_skill.rs`; add `mod cli_skill;` to `crates/rupu-cli/tests/it/main.rs` in alphabetical position)
 
 ```rust
-//! `rupu skill`: install, list, show and validate against an isolated
-//! RUPU_HOME and project.
+//! `rupu skill`: install, list, show, validate and update against an
+//! isolated RUPU_HOME and project, with local-directory sources (no
+//! network).
 
 use assert_cmd::Command;
 use serde_json::Value;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-fn skill_src(dir: &Path, name: &str, description: &str) -> std::path::PathBuf {
+fn skill_src(dir: &Path, name: &str, description: &str) -> PathBuf {
     let root = dir.join(name);
     fs::create_dir_all(root.join("scripts")).unwrap();
     fs::write(root.join("SKILL.md"), format!("---\nname: {name}\ndescription: {description}\n---\n\nBody.\n")).unwrap();
@@ -2275,12 +3259,56 @@ fn install_list_show_validate() {
             ("pdf-processing".into(), "global".into(), "ok".into()),
         ]
     );
+    assert_eq!(json["rows"][1]["source"].as_str(), Some(pdf.to_str().unwrap()));
 
     let show = ok(&rupu(home.path(), project.path(), &["skill", "show", "pdf-processing"]));
     assert!(show.contains("scripts/run.sh"), "{show}");
     assert!(show.contains("PDF things."), "{show}");
+    assert!(show.contains("source:"), "{show}");
 
     ok(&rupu(home.path(), project.path(), &["skill", "validate", "--all"]));
+}
+
+#[test]
+fn a_collection_needs_a_choice() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    skill_src(&repo.path().join("skills"), "pdf", "PDF.");
+    skill_src(&repo.path().join("skills"), "docx", "Word.");
+    let repo_arg = repo.path().to_str().unwrap();
+
+    let listed = ok(&rupu(home.path(), cwd.path(), &["skill", "install", "--list", repo_arg]));
+    assert!(listed.contains("pdf") && listed.contains("docx"), "{listed}");
+    assert!(!home.path().join("skills/pdf").exists());
+
+    let none = rupu(home.path(), cwd.path(), &["skill", "install", repo_arg]);
+    assert!(!none.status.success());
+    assert!(String::from_utf8_lossy(&none.stderr).contains("--skill"));
+
+    ok(&rupu(home.path(), cwd.path(), &["skill", "install", "--skill", "pdf", repo_arg]));
+    assert!(home.path().join("skills/pdf/SKILL.md").is_file());
+    assert!(!home.path().join("skills/docx").exists());
+
+    ok(&rupu(home.path(), cwd.path(), &["skill", "install", "--all", "--force", repo_arg]));
+    assert!(home.path().join("skills/docx/SKILL.md").is_file());
+}
+
+#[test]
+fn update_follows_a_local_source() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let notes = skill_src(src.path(), "notes", "v1");
+    ok(&rupu(home.path(), cwd.path(), &["skill", "install", notes.to_str().unwrap()]));
+
+    let same = ok(&rupu(home.path(), cwd.path(), &["skill", "update", "--all"]));
+    assert!(same.contains("notes: up to date"), "{same}");
+
+    skill_src(src.path(), "notes", "v2");
+    let moved = ok(&rupu(home.path(), cwd.path(), &["skill", "update", "notes"]));
+    assert!(moved.contains("notes: updated"), "{moved}");
+    assert!(fs::read_to_string(home.path().join("skills/notes/SKILL.md")).unwrap().contains("v2"));
 }
 
 #[test]
@@ -2324,7 +3352,7 @@ rupu-skills = { workspace = true, features = ["git"] }
 - In `enum Cmd`, after `Fleet`:
 
 ```rust
-    /// Agent Skills: install, list, show and validate SKILL.md skills.
+    /// Agent Skills: install, update, list, show and validate SKILL.md skills.
     Skill {
         #[command(subcommand)]
         action: cmd::skill::Action,
@@ -2344,9 +3372,12 @@ rupu-skills = { workspace = true, features = ["git"] }
 use crate::output::formats::OutputFormat;
 use crate::output::report::{self, CollectionOutput};
 use clap::Subcommand;
-use rupu_skills::install::{install_dir, InstallOutcome, InstallRequest};
+use rupu_skills::git::GitFetcher;
+use rupu_skills::install::{install_from, list_source, InstallOutcome, InstallSpec, Selection};
+use rupu_skills::record::read_record;
 use rupu_skills::tools_map::mapped_tools;
-use rupu_skills::{CatalogEntry, Layer, LayerDirs, SkillCatalog};
+use rupu_skills::update::{update_skills, UpdateOutcome};
+use rupu_skills::{parse_source, CatalogEntry, Layer, LayerDirs, SkillCatalog};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -2359,8 +3390,8 @@ pub enum Action {
         #[arg(long)]
         project: bool,
     },
-    /// Show one skill: frontmatter, files and fingerprints. Accepts
-    /// `global:<name>` / `project:<name>`.
+    /// Show one skill: frontmatter, files, fingerprints and source.
+    /// Accepts `global:<name>` / `project:<name>`.
     Show { name: String },
     /// Check skills against the Agent Skills format; exit 1 on any failure.
     Validate {
@@ -2368,20 +3399,42 @@ pub enum Action {
         #[arg(long, conflicts_with = "name")]
         all: bool,
     },
-    /// Install a skill from a directory or an https git URL
-    /// (`https://host/org/repo#path/to/skill`).
+    /// Install skills from a directory, `owner/repo`, a GitHub tree URL, or
+    /// an https git URL (`#path` narrows to a folder in the repository).
     Install {
         source: String,
+        /// Branch, tag or commit to install from.
+        #[arg(long = "ref")]
+        git_ref: Option<String>,
+        /// Install this skill from a source that holds several (repeatable).
+        #[arg(long = "skill")]
+        skills: Vec<String>,
+        /// Install every valid skill in the source.
+        #[arg(long, conflicts_with = "skills")]
+        all: bool,
+        /// List the skills in the source; install nothing.
+        #[arg(long)]
+        list: bool,
         /// Install into the current project's `.rupu/skills` instead of
         /// `~/.rupu/skills`.
         #[arg(long)]
         project: bool,
-        /// Replace an installed skill of the same name.
+        /// Replace installed skills of the same name.
         #[arg(long)]
         force: bool,
-        /// Which skill to install when the source holds several.
+    },
+    /// Re-fetch installed skills from the source they were installed from.
+    Update {
+        names: Vec<String>,
+        /// Every installed skill with a source record.
+        #[arg(long, conflicts_with = "names")]
+        all: bool,
+        /// The project layer instead of the global one.
         #[arg(long)]
-        name: Option<String>,
+        project: bool,
+        /// Replace skills whose installed copy was edited.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -2398,7 +3451,10 @@ pub async fn handle(action: Action, format: Option<OutputFormat>) -> ExitCode {
         Action::List { project } => list(project, format).map(|()| true),
         Action::Show { name } => show(&name).map(|()| true),
         Action::Validate { name, all } => validate(name.as_deref(), all),
-        Action::Install { source, project, force, name } => install(&source, project, force, name.as_deref()).map(|()| true),
+        Action::Install { source, git_ref, skills, all, list, project, force } => {
+            install(&source, git_ref.as_deref(), skills, all, list, project, force).map(|()| true)
+        }
+        Action::Update { names, all, project, force } => update(names, all, project, force),
     };
     match result {
         Ok(true) => ExitCode::from(0),
@@ -2410,6 +3466,20 @@ pub async fn handle(action: Action, format: Option<OutputFormat>) -> ExitCode {
 struct Layers {
     global: PathBuf,
     project: Option<PathBuf>,
+}
+
+impl Layers {
+    fn skills_dir(&self, layer: Layer) -> anyhow::Result<PathBuf> {
+        match layer {
+            Layer::Global => Ok(self.global.join("skills")),
+            Layer::Project => self.project.as_ref().map(|p| p.join("skills")).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "not inside a rupu project (no `.rupu/` found). Run `rupu init` first, \
+                     or omit --project to use ~/.rupu/skills."
+                )
+            }),
+        }
+    }
 }
 
 fn layers() -> anyhow::Result<Layers> {
@@ -2427,12 +3497,21 @@ fn catalog(l: &Layers) -> anyhow::Result<SkillCatalog> {
     })?)
 }
 
+fn layer_flag(project: bool) -> Layer {
+    if project {
+        Layer::Project
+    } else {
+        Layer::Global
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct SkillRow {
     name: String,
     layer: &'static str,
     status: &'static str,
     description: String,
+    source: String,
     error: String,
     path: String,
 }
@@ -2466,15 +3545,20 @@ impl CollectionOutput for SkillsOutput {
 
     fn render_table(&self) -> anyhow::Result<()> {
         let mut table = crate::output::tables::new_table();
-        table.set_header(vec!["NAME", "LAYER", "STATUS", "DESCRIPTION"]);
+        table.set_header(vec!["NAME", "LAYER", "STATUS", "SOURCE", "DESCRIPTION"]);
         for r in &self.report.rows {
             let detail = if r.status == "ok" { &r.description } else { &r.error };
-            let detail: String = detail.chars().take(80).collect();
-            table.add_row(vec![r.name.clone(), r.layer.into(), r.status.into(), detail]);
+            let detail: String = detail.chars().take(70).collect();
+            let source = if r.source.is_empty() { "-".to_owned() } else { r.source.clone() };
+            table.add_row(vec![r.name.clone(), r.layer.into(), r.status.into(), source, detail]);
         }
         println!("{table}");
         Ok(())
     }
+}
+
+fn skills_dir_of(e: &CatalogEntry) -> PathBuf {
+    e.path.parent().map(PathBuf::from).unwrap_or_default()
 }
 
 fn row(e: &CatalogEntry) -> SkillRow {
@@ -2482,11 +3566,17 @@ fn row(e: &CatalogEntry) -> SkillRow {
         Ok(s) => ("ok", s.frontmatter.description.clone(), String::new()),
         Err(err) => ("invalid", String::new(), err.to_string()),
     };
+    let source = read_record(&skills_dir_of(e), &e.dir_name)
+        .ok()
+        .flatten()
+        .map(|r| r.source)
+        .unwrap_or_default();
     SkillRow {
         name: e.dir_name.clone(),
         layer: e.layer.as_str(),
         status,
         description,
+        source,
         error,
         path: e.path.display().to_string(),
     }
@@ -2521,6 +3611,19 @@ fn show(name: &str) -> anyhow::Result<()> {
     for e in found {
         println!("{} ({})", e.dir_name, e.layer.as_str());
         println!("  path:          {}", e.path.display());
+        if let Some(rec) = read_record(&skills_dir_of(e), &e.dir_name)? {
+            let at = match (&rec.url, &rec.local) {
+                (Some(url), _) => format!(
+                    "{url}{}{} @ {}",
+                    rec.git_ref.as_deref().map(|r| format!(" ref {r}")).unwrap_or_default(),
+                    rec.path.as_deref().map(|p| format!(" #{p}")).unwrap_or_default(),
+                    rec.commit.as_deref().map(|c| &c[..c.len().min(12)]).unwrap_or("?")
+                ),
+                (None, Some(dir)) => dir.display().to_string(),
+                (None, None) => "?".into(),
+            };
+            println!("  source:        {} ({at})", rec.source);
+        }
         let s = match &e.skill {
             Ok(s) => s,
             Err(err) => {
@@ -2581,60 +3684,115 @@ fn validate(name: Option<&str>, all: bool) -> anyhow::Result<bool> {
     Ok(ok)
 }
 
-fn install(source: &str, project: bool, force: bool, name: Option<&str>) -> anyhow::Result<()> {
+fn install(
+    input: &str,
+    git_ref: Option<&str>,
+    skills: Vec<String>,
+    all: bool,
+    list_only: bool,
+    project: bool,
+    force: bool,
+) -> anyhow::Result<()> {
+    let home = dirs::home_dir();
+    let source = parse_source(input, git_ref, home.as_deref())?;
+    if list_only {
+        for f in list_source(&source, &GitFetcher)? {
+            let detail = f.error.or(f.description).unwrap_or_default();
+            let at = if f.rel.is_empty() { ".".into() } else { f.rel };
+            println!("{:<28} {:<36} {}", f.name, at, detail.chars().take(70).collect::<String>());
+        }
+        return Ok(());
+    }
     let l = layers()?;
-    let (root, layer) = if project {
-        let p = l.project.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "not inside a rupu project (no `.rupu/` found). Run `rupu init` first, \
-                 or omit --project to install into ~/.rupu/skills."
-            )
-        })?;
-        (p, Layer::Project)
+    let layer = layer_flag(project);
+    let skills_dir = l.skills_dir(layer)?;
+    let selection = if all {
+        Selection::All
+    } else if !skills.is_empty() {
+        Selection::Named(skills)
     } else {
-        (l.global.clone(), Layer::Global)
+        Selection::Default
     };
-    let fetched = match rupu_skills::git::parse_git_source(source) {
-        Some(src) => Some(rupu_skills::git::fetch(&src?)?),
-        None => None,
-    };
-    let src_path = match &fetched {
-        Some(f) => f.path.clone(),
-        None => PathBuf::from(source),
-    };
-    let done = install_dir(&InstallRequest {
-        source: &src_path,
-        skills_dir: &root.join("skills"),
-        layer,
-        name,
-        force,
-    })?;
-    let verb = match done.outcome {
-        InstallOutcome::Created => "installed",
-        InstallOutcome::Replaced => "replaced",
-    };
-    println!("{verb} {} ({}) at {}", done.name, layer.as_str(), done.path.display());
+    let report = install_from(
+        &InstallSpec { source: &source, input, selection, skills_dir: &skills_dir, layer, force },
+        &GitFetcher,
+    )?;
+    for i in &report.installed {
+        let verb = match i.outcome {
+            InstallOutcome::Created => "installed",
+            InstallOutcome::Replaced => "replaced",
+        };
+        println!("{verb} {} ({}) at {}", i.name, layer.as_str(), i.path.display());
+    }
+    for (name, why) in &report.skipped {
+        eprintln!("skipped {name}: {why}");
+    }
     Ok(())
+}
+
+fn update(names: Vec<String>, all: bool, project: bool, force: bool) -> anyhow::Result<bool> {
+    anyhow::ensure!(all || !names.is_empty(), "name skills to update or pass --all");
+    let l = layers()?;
+    let layer = layer_flag(project);
+    let skills_dir = l.skills_dir(layer)?;
+    let results = update_skills(&skills_dir, layer, &names, force, &GitFetcher);
+    if results.is_empty() {
+        println!("no installed skills with a source record in the {} layer", layer.as_str());
+    }
+    let mut ok = true;
+    for (name, outcome) in results {
+        let line = match outcome {
+            UpdateOutcome::Updated { from, to } => format!("updated {from} → {to}"),
+            UpdateOutcome::UpToDate => "up to date".into(),
+            UpdateOutcome::NoRecord => "no source record (installed by hand); reinstall it to track a source".into(),
+            UpdateOutcome::LocallyModified => {
+                ok = false;
+                "locally modified; pass --force to replace your edits".into()
+            }
+            UpdateOutcome::NotInstalled => {
+                ok = false;
+                "not installed".into()
+            }
+            UpdateOutcome::Failed(e) => {
+                ok = false;
+                format!("failed: {e}")
+            }
+        };
+        println!("{name}: {line}");
+    }
+    Ok(ok)
 }
 ```
 
-If `report::TABLE_JSON_CSV`, `report::TABLE_ONLY` or `crate::output::tables::new_table` are named differently, use the names `cmd/customer.rs` uses; the shapes above are copied from it.
+The CLI test's `contains("notes: updated")` matches the `{name}: updated {from} → {to}` line. If `dirs` is not already a `rupu-cli` dependency, use `crate::paths`' home lookup instead; `paths.rs` already calls `dirs::home_dir()`. If `report::TABLE_JSON_CSV`, `report::TABLE_ONLY` or `crate::output::tables::new_table` are named differently, use the names `cmd/customer.rs` uses; the shapes above are copied from it.
 
 - [ ] **Step 6: Run the CLI tests and watch them pass**
 
 Run: `cargo test -p rupu-cli --test it cli_skill::`
-Expected: 3 passed.
+Expected: 5 passed.
 
 Also run `cargo test -p rupu-cli --test it test_layout::`, which checks the new test file mutates no process state. Expected: pass.
 
 - [ ] **Step 7: Write `docs/skills.md`**
 
-Cover, in this order: what a skill is (link agentskills.io), the two layers and why `.claude/skills` is not read, the `SKILL.md` rules table (copy spec §1.1), `rupu skill install` (directory, https URL with `#subdir`, `--project`, `--force`, `--name`), `list`, `show`, `validate`, and a closing line saying that granting skills to agents arrives with the `skills:` frontmatter key (Plan 2) and linking the spec. Use an invented example skill (`report-style`).
+Cover, in this order:
+- What a skill is (link agentskills.io).
+- The two layers, and why `.claude/skills` is not read.
+- The `SKILL.md` rules table (copy spec §1.1).
+- Installing:
+  - the source table from spec §7.1, with `rupu skill install anthropics/skills --list` and `rupu skill install anthropics/skills --skill pdf` as examples;
+  - `--ref`, `--all`, `--project` and `--force`;
+  - a note that a skill's scripts need their own tools on the machine (and on any remote host an agent runs on).
+- `update`: source records, pinned refs, and locally modified skills.
+- `list`, `show` and `validate`.
+- A closing line saying that granting skills to agents arrives with the `skills:` frontmatter key (Plan 2), linking the spec.
+
+Use an invented example skill (`report-style`) for anything beyond the two `anthropics/skills` commands.
 
 Add to `CLAUDE.md`'s crate list, after `rupu-codename`:
 
 ```markdown
-- **`rupu-skills`** — Agent Skills (agentskills.io `SKILL.md` directories; spec `docs/superpowers/specs/2026-10-12-rupu-agent-skills-design.md`). Leaf crate (no rupu deps): `SkillName` rules, `parse_skill_md` (unknown keys accepted), `walk_tree` + `Stamp` (stat-only) / `ContentHash` (bytes, on load), `load_skill` / `SkillCatalog` over the global and project `skills/` dirs (both layers kept, no shadowing; project symlinked dirs invalid), the grant grammar (`*` = global only, `project:*`, `global:x` / `project:x`, a bare name in both layers is an error), the prompt renderers whose text is the model-facing contract, `allowed-tools` → core-tool map (never a grant), and `install_dir` (+ `git` feature: shallow https clone via libgit2). The project layer comes from `rupu_workspace::project_layer_dir` (R5). CLI: `rupu skill list|show|validate|install`.
+- **`rupu-skills`** — Agent Skills (agentskills.io `SKILL.md` directories; spec `docs/superpowers/specs/2026-10-12-rupu-agent-skills-design.md`). Leaf crate (no rupu deps): `SkillName` rules, `parse_skill_md` (unknown keys accepted), `walk_tree` + `Stamp` (stat-only) / `ContentHash` (bytes, on load), `load_skill` / `SkillCatalog` over the global and project `skills/` dirs (both layers kept, no shadowing; project symlinked dirs invalid), the grant grammar (`*` = global only, `project:*`, `global:x` / `project:x`, a bare name in both layers is an error), the prompt renderers whose text is the model-facing contract, `allowed-tools` → core-tool map (never a grant), install (`source::parse_source`: path / `owner/repo` / GitHub tree URL / https `#path` + `--ref`; `install::find_skills` searches up to 6 levels, skipping `.git`/`node_modules`; staged, validated, renamed in), source records in `<skills>/.sources/<name>.json` and `update::update_skills` (one fetch per url+ref; a locally edited copy is left alone without `--force`). The `git` feature adds `git::GitFetcher` (libgit2, https only, no hooks or submodules). The project layer comes from `rupu_workspace::project_layer_dir` (R5). CLI: `rupu skill list|show|validate|install|update`.
 ```
 
 - [ ] **Step 8: Lint the touched crates**
@@ -2648,7 +3806,7 @@ Expected: no warnings from touched files. Report pre-existing ones without fixin
 ```bash
 rustfmt crates/rupu-cli/src/cmd/skill.rs crates/rupu-cli/tests/it/cli_skill.rs crates/rupu-workspace/src/config_paths.rs
 git add crates/rupu-workspace crates/rupu-cli docs/skills.md CLAUDE.md Cargo.lock
-git commit -m "feat(cli): add rupu skill list, show, validate and install"
+git commit -m "feat(cli): add rupu skill list, show, validate, install and update"
 ```
 
 ---
@@ -2657,5 +3815,5 @@ git commit -m "feat(cli): add rupu skill list, show, validate and install"
 
 - `cargo test -p rupu-skills --test it` and `cargo test -p rupu-skills --features git --lib` pass.
 - `cargo test -p rupu-workspace --test it config_paths::` and `cargo test -p rupu-cli --test it cli_skill::` pass.
-- By hand, with a scratch `RUPU_HOME`: `rupu skill install` a real published skill from its https URL with `#<subdir>`, then `rupu skill show <name>` lists its scripts with their exec bit intact (`ls -l` on the installed copy), and `rupu skill validate --all` exits 0.
+- By hand, with a scratch `RUPU_HOME`: `rupu skill install anthropics/skills --list` lists the collection; `rupu skill install anthropics/skills --skill pdf` installs one skill, and its scripts keep their exec bit (`ls -l` on the installed copy); the browser URL `https://github.com/anthropics/skills/tree/main/skills/pdf` resolves to the same skill; `rupu skill update --all` reports it up to date; `rupu skill validate --all` exits 0.
 - Nothing in this plan touches agent loading, the assembler or any run. Those start in Plan 2.
