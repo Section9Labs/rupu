@@ -2782,6 +2782,31 @@ impl SessionInteractiveState {
                     ),
                 );
             }
+            TranscriptEvent::SkillIndex { skills } => {
+                self.push_line(
+                    crate::output::palette::Status::Active,
+                    retained_session_event_line_raw(
+                        crate::output::palette::Status::Active,
+                        "skills",
+                        &rupu_transcript::skills::skill_index_line(skills),
+                    ),
+                );
+            }
+            TranscriptEvent::SkillLoad {
+                name,
+                content_hash,
+                via,
+                ..
+            } => {
+                self.push_line(
+                    crate::output::palette::Status::Active,
+                    retained_session_event_line_raw(
+                        crate::output::palette::Status::Active,
+                        "skills",
+                        &rupu_transcript::skills::skill_load_line(name, via, content_hash),
+                    ),
+                );
+            }
             TranscriptEvent::GateRequested {
                 gate_id,
                 prompt,
@@ -5494,6 +5519,29 @@ fn transcript_event_lines(
                 Status::Active,
                 "tools",
                 &rupu_transcript::grant::tool_grant_line(entries, narrowed, unavailable),
+            ),
+            continuation: false,
+        }],
+        TranscriptEvent::SkillIndex { skills } => vec![SessionViewLine {
+            status: Status::Active,
+            text: retained_session_event_line_raw(
+                Status::Active,
+                "skills",
+                &rupu_transcript::skills::skill_index_line(skills),
+            ),
+            continuation: false,
+        }],
+        TranscriptEvent::SkillLoad {
+            name,
+            content_hash,
+            via,
+            ..
+        } => vec![SessionViewLine {
+            status: Status::Active,
+            text: retained_session_event_line_raw(
+                Status::Active,
+                "skills",
+                &rupu_transcript::skills::skill_load_line(name, via, content_hash),
             ),
             continuation: false,
         }],
@@ -10077,6 +10125,23 @@ mod tests {
                 tag: "future_event".into(),
                 data: serde_json::Value::Null,
             },
+            TranscriptEvent::SkillIndex {
+                skills: vec![rupu_transcript::SkillIndexEntry {
+                    name: "pdf".into(),
+                    layer: "global".into(),
+                    stamp: "ab".repeat(32),
+                    preload: true,
+                    indexed: true,
+                    reason: "agent".into(),
+                }],
+            },
+            TranscriptEvent::SkillLoad {
+                name: "pdf".into(),
+                layer: "global".into(),
+                content_hash: "cd".repeat(32),
+                base_dir: "/h/skills/pdf".into(),
+                via: "model".into(),
+            },
         ];
         for ev in &cases {
             assert!(
@@ -10097,6 +10162,8 @@ mod tests {
         assert!(find("fell back to anthropic/claude-opus-4-8"));
         assert!(find("served by fallback · model-a → model-b"));
         assert!(find("unrecognized event · future_event"));
+        assert!(find("1 skill: pdf (preloaded)"));
+        assert!(find("loaded skill pdf (cdcdcdcdcdcd) via model"));
         assert!(transcript_event_lines(
             &TranscriptEvent::ThinkingDelta {
                 content: "c".into()

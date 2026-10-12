@@ -76,7 +76,8 @@ with no `schema` key is version 1.
 | 2 | Enough to rebuild the exact conversation sent to the provider: the effective `system_prompt` on `run_start`, the `user_message`, each reasoning block as a `thinking` event with the provider's byte-exact `raw` block, the `seed` the run started from, every `compaction`, and `assistant_block` for reply blocks with no event of their own |
 
 Fields and events have been added within version 2 since it shipped (`outcome`, `recovery`,
-`assistant_block`, `customer`, `codename`, `cache_write_tokens`, `purpose`). A reader should
+`assistant_block`, `customer`, `codename`, `cache_write_tokens`, `purpose`, `skill_index`,
+`skill_load`). A reader should
 accept a missing optional key and an unknown event type (see
 [Unknown event types](#unknown-event-types)).
 
@@ -382,6 +383,50 @@ Services: `scm` (configured connectors), `agent_dispatcher` (sub-agent dispatch)
 
 ---
 
+### `skill_index`
+
+The skills the run bound. Written once, right after `tool_grant` and its notices, and only
+when the run has a skill.
+
+| Field    | Type  | Description |
+|----------|-------|-------------|
+| `skills` | array | One `{name, layer, stamp, preload, indexed, reason}` per bound skill |
+
+Each row:
+
+| Field     | Type   | Description |
+|-----------|--------|-------------|
+| `name`    | string | The name the skill binds in this run |
+| `layer`   | string | `global` or `project` |
+| `stamp`   | string | The skill's stamp at run start: a sha256 over its files' paths, sizes, mtimes and modes, no contents. A later load compares against it to notice an edit |
+| `preload` | bool   | The skill's body is in the system prompt |
+| `indexed` | bool   | The skill is listed in the model's skill index. `false` for a preloaded skill and for one marked `disable-model-invocation` |
+| `reason`  | string | Why the run has it: `agent`, `step`, `session` or `operator` |
+
+```json
+{"type":"skill_index","data":{"skills":[{"name":"pdf","layer":"global","stamp":"9f2c…","preload":false,"indexed":true,"reason":"agent"}]}}
+```
+
+---
+
+### `skill_load`
+
+A skill's content entered the conversation. Written for every load, whichever path made it.
+
+| Field          | Type   | Description |
+|----------------|--------|-------------|
+| `name`         | string | The skill's name in this run |
+| `layer`        | string | `global` or `project` |
+| `content_hash` | string | sha256 over the skill's files' paths, modes and bytes: the version that was loaded |
+| `base_dir`     | string | The skill's directory, which its relative file references resolve against |
+| `via`          | string | `model` (a `skills.load` call), `preload` (at run start), `operator` (a session operator invoked it), `reattach` (put back after a compaction) or `continuation` (carried over from the run this one continues) |
+
+```json
+{"type":"skill_load","data":{"name":"pdf","layer":"global","content_hash":"4b1e…","base_dir":"/home/me/.rupu/skills/pdf","via":"model"}}
+```
+
+---
+
 ### `gate_requested`
 
 Defined, but **not written by current rupu**: workflow approval gates are recorded on the
@@ -503,7 +548,7 @@ A runtime intervention worth showing that is not part of the conversation.
 
 | Field     | Type   | Description |
 |-----------|--------|-------------|
-| `kind`    | string | `model_limits` (the run's input and output limits and where each came from, written at start and on a fallback hop), `model_limits_clamped`, `context_trim`, `provider_retry`, `server_side_fallback_disabled`, `permission_mode_degraded` (ask mode with no operator to ask) or `tool_unavailable` (a tool named in `tools:` that this run can't serve; one per tool, right after `tool_grant`). Expect new kinds; render an unknown one by its `message` |
+| `kind`    | string | `model_limits` (the run's input and output limits and where each came from, written at start and on a fallback hop), `model_limits_clamped`, `context_trim`, `provider_retry`, `server_side_fallback_disabled`, `permission_mode_degraded` (ask mode with no operator to ask), `tool_unavailable` (a tool named in `tools:` that this run can't serve; one per tool, right after `tool_grant`), `skill_not_indexed` (a granted skill marked `disable-model-invocation` that isn't preloaded, so the model can't load it), `skill_changed` (a skill loaded at a newer version than the run's `skill_index` recorded), `skill_missing` (a loaded skill no longer installed when it was due to be re-attached), `skill_tools_missing` (a loaded skill's `allowed-tools` names tools the run wasn't granted) or `skill_reattach_truncated` (loaded skills that didn't fit under the re-attach cap after a compaction). Expect new kinds; render an unknown one by its `message` |
 | `message` | string | Human-readable text |
 
 ```json
@@ -658,13 +703,15 @@ run_start
 notice?                     # model_limits
 tool_grant                  # the tools offered, and why (W2)
 notice*                     # tool_unavailable, one per named tool the run can't serve
+skill_index?                # the skills bound, when the run has any
+skill_load*                 # preload
 seed?                       # a run seeded from earlier history
 user_message?
 (turn_start
    usage+                   # one per provider call; a compaction call adds one with purpose
    outcome?                 # a non-normal reply, ahead of the turn's content
    (thinking_delta* thinking | assistant_delta* assistant_message | assistant_block)*
-   (tool_call  tool_result  file_edit?  command_run?  tool_audit)*
+   (tool_call  tool_result  skill_load?  file_edit?  command_run?  tool_audit)*
  turn_end
  recovery*
  notice*  compaction?)*
@@ -697,5 +744,6 @@ continuing an interrupted step, a session's next turn). The rules:
 - A `compaction` replaces everything so far with its `messages`.
 
 A version 1 transcript rebuilds without reasoning blocks. Deltas, `usage`, `notice`,
-`outcome`, `tool_grant`, `tool_audit`, `net_flow` and unknown events don't affect the
-conversation.
+`outcome`, `tool_grant`, `tool_audit`, `skill_index`, `skill_load`, `net_flow` and unknown
+events don't affect the conversation. The skills a run loaded are folded from its
+`skill_load` events separately, so a continued run knows what to re-attach.

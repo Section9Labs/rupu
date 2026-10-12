@@ -355,6 +355,8 @@ fn reconstruct_with(
             | Event::RunComplete { .. }
             | Event::ToolAudit { .. }
             | Event::ToolGrant { .. }
+            | Event::SkillIndex { .. }
+            | Event::SkillLoad { .. }
             | Event::NetFlow { .. }
             | Event::Notice { .. }
             | Event::Outcome { .. }
