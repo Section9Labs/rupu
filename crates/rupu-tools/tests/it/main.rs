@@ -18,6 +18,7 @@ mod grant;
 mod grep;
 mod permission;
 mod read_file;
+mod skills_load;
 mod support;
 mod tool_schemas;
 mod write_file;

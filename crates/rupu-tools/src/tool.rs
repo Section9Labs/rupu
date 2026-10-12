@@ -227,6 +227,8 @@ pub struct ToolServices {
     /// `workflows.list` / `workflows.get` and `catalog.search`. Every launch
     /// site provides one.
     pub catalog: Option<Arc<dyn crate::ports::CatalogPort>>,
+    /// The skills this run was granted (spec §2.4); `skills.load` reads it.
+    pub skills: Option<Arc<rupu_skills::ResolvedSkills>>,
 }
 
 impl ToolServices {
@@ -267,6 +269,9 @@ impl ToolServices {
         if self.catalog.is_some() {
             s.insert(Service::Catalog);
         }
+        if self.skills.is_some() {
+            s.insert(Service::Skills);
+        }
         // The agentiflow unit launcher and workflow generator have no body
         // in the catalog until W7: their tools reach a run only injected, as
         // self-served grants.
@@ -303,6 +308,7 @@ impl std::fmt::Debug for ToolServices {
                 &self.run_status.as_ref().map(|_| "<run status>"),
             )
             .field("catalog", &self.catalog.as_ref().map(|_| "<catalog>"))
+            .field("skills", &self.skills.as_ref().map(|s| s.names()))
             .finish()
     }
 }

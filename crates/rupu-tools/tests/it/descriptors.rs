@@ -41,6 +41,7 @@ fn production_impls() -> usize {
         include_str!("../../src/roster/mod.rs"),
         include_str!("../../src/goal/mod.rs"),
         include_str!("../../src/budget/mod.rs"),
+        include_str!("../../src/skills/mod.rs"),
         include_str!("../../../rupu-agentiflow/src/dispatch_tools.rs"),
     ];
     homes
@@ -236,6 +237,7 @@ fn full_context() -> ToolContext {
     )));
     s.run_status = Some(Arc::new(crate::support::StubStatus::default()));
     s.catalog = Some(Arc::new(crate::support::StubCatalog::default()));
+    s.skills = Some(Arc::new(rupu_skills::ResolvedSkills::default()));
     ctx
 }
 

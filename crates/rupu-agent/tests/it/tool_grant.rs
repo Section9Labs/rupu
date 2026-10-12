@@ -17,6 +17,7 @@ struct Run {
     step_actions: Vec<String>,
     concerns: Option<ConcernsBlock>,
     scm: bool,
+    skills: Option<Arc<rupu_skills::ResolvedSkills>>,
     permission: PermissionPolicy,
     script: Vec<ScriptedTurn>,
 }
@@ -28,6 +29,7 @@ impl Default for Run {
             step_actions: Vec::new(),
             concerns: None,
             scm: false,
+            skills: None,
             permission: PermissionPolicy::bypass(),
             script: vec![done()],
         }
@@ -85,6 +87,7 @@ async fn run(workspace: &Path, r: Run) -> (Vec<String>, Vec<Event>) {
                 tc.workspace.id = "ws_grant".into();
                 tc.workspace.path = workspace.to_path_buf();
                 tc.services.scm = r.scm.then(|| Arc::new(rupu_scm::Registry::empty()));
+                tc.services.skills = r.skills;
                 tc
             },
             pins: Default::default(),
@@ -213,6 +216,68 @@ async fn ambient_is_visible() {
         assert_eq!(reasons_for(&events, t), ["ambient:concerns"], "{t}");
     }
     assert_eq!(reasons_for(&events, "read_file"), ["declared"]);
+}
+
+/// One global skill, `pdf`, installed under `global` and granted.
+fn one_skill(global: &Path) -> Arc<rupu_skills::ResolvedSkills> {
+    let dir = global.join("skills/pdf");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        "---\nname: pdf\ndescription: d\n---\nbody\n",
+    )
+    .unwrap();
+    let catalog =
+        rupu_skills::SkillCatalog::discover(&rupu_skills::LayerDirs::for_layers(global, None))
+            .unwrap();
+    Arc::new(
+        rupu_skills::resolve_run_skills(
+            &catalog,
+            &[rupu_skills::SkillRequest {
+                reason: rupu_skills::SkillReason::Agent,
+                grants: &strs(&["pdf"]),
+                preload: &[],
+            }],
+        )
+        .unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn skills_offer_the_loader_as_an_ambient_grant() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let global = tempfile::TempDir::new().unwrap();
+    let (offered, events) = run(
+        tmp.path(),
+        Run {
+            agent_tools: Some(strs(&["read_file"])),
+            skills: Some(one_skill(global.path())),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        offered.iter().any(|o| o == "skills.load"),
+        "offered: {offered:?}"
+    );
+    assert_eq!(reasons_for(&events, "skills.load"), ["ambient:skills"]);
+}
+
+#[tokio::test]
+async fn no_skills_no_loader_even_under_star() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (offered, _) = run(
+        tmp.path(),
+        Run {
+            agent_tools: Some(strs(&["*"])),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        !offered.iter().any(|o| o == "skills.load"),
+        "offered: {offered:?}"
+    );
 }
 
 #[tokio::test]

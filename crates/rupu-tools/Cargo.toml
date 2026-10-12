@@ -14,6 +14,7 @@ rupu-coverage = { path = "../rupu-coverage" }
 rupu-scm = { path = "../rupu-scm" }
 rupu-fleet = { workspace = true }
 rupu-netflow = { workspace = true }
+rupu-skills = { workspace = true }
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true

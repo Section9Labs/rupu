@@ -5085,6 +5085,7 @@ dependencies = [
  "rupu-fleet",
  "rupu-netflow",
  "rupu-scm",
+ "rupu-skills",
  "schemars",
  "serde",
  "serde_json",

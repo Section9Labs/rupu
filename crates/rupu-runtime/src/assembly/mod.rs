@@ -638,6 +638,7 @@ impl RunAssembler {
                     .clone()
                     .or_else(|| self.ctx.catalog.clone())
                     .filter(|_| d.catalog),
+                skills: None,
             },
             call: Default::default(),
         };

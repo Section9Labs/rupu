@@ -86,6 +86,8 @@ pub static ALL: &[&ToolDescriptor] = &[
     &crate::goal::STATUS,
     &crate::goal::COVERAGE,
     &crate::budget::STATUS,
+    // a run's skills
+    &crate::skills::LOAD,
     // agentiflow launch tools (W7 folds these into `dispatch` / `join`)
     &flow::DISPATCH,
     &flow::RUN_WORKFLOW,
