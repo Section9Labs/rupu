@@ -6,6 +6,7 @@
 pub mod catalog;
 pub mod frontmatter;
 pub mod grant;
+pub mod install;
 pub mod name;
 pub mod render;
 pub mod skill;
