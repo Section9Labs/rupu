@@ -50,6 +50,8 @@ pub struct Skill {
     pub body: String,
     pub entries: Vec<TreeEntry>,
     pub stamp: Stamp,
+    /// Came from the host's shipped-skill cache, not an installed layer.
+    pub shipped: bool,
 }
 
 impl Skill {
@@ -177,5 +179,6 @@ pub fn load_skill(dir: &Path, layer: Layer) -> Result<Skill, SkillError> {
         body,
         entries,
         stamp,
+        shipped: false,
     })
 }

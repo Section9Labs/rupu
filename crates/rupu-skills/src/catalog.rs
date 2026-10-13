@@ -22,6 +22,9 @@ pub struct OverlaySkill {
 pub struct LayerDirs {
     pub global: Option<PathBuf>,
     pub project: Option<PathBuf>,
+    /// Shipped skills, overlaying the installed ones with the same
+    /// (layer, name).
+    pub overlay: Vec<OverlaySkill>,
 }
 
 impl LayerDirs {
@@ -38,7 +41,13 @@ impl LayerDirs {
             project: project_rupu_dir
                 .filter(|p| !same(p))
                 .map(|p| p.join("skills")),
+            overlay: Vec::new(),
         }
+    }
+
+    pub fn with_overlay(mut self, overlay: Vec<OverlaySkill>) -> Self {
+        self.overlay = overlay;
+        self
     }
 
     pub fn skills_dir(&self, layer: Layer) -> Option<&Path> {
@@ -59,6 +68,7 @@ pub struct CatalogEntry {
     pub layer: Layer,
     pub path: PathBuf,
     in_linked_root: bool,
+    shipped: bool,
     loaded: OnceLock<Result<Arc<Skill>, Arc<SkillError>>>,
 }
 
@@ -86,7 +96,10 @@ impl CatalogEntry {
                 return Err(Arc::new(SkillError::ProjectRootSymlink));
             }
             load_skill(&self.path, self.layer)
-                .map(Arc::new)
+                .map(|mut s| {
+                    s.shipped = self.shipped;
+                    Arc::new(s)
+                })
                 .map_err(Arc::new)
         })
     }
@@ -130,6 +143,25 @@ impl SkillCatalog {
                 Ok(()) => entries.append(&mut found),
                 Err(e) => failed.push((layer, e)),
             }
+        }
+        // An overlay entry is only ever listed here; a bad directory is that
+        // entry's load error (`load_skill` also checks its name against the
+        // directory's), never a discovery failure.
+        entries.retain(|e| {
+            !dirs
+                .overlay
+                .iter()
+                .any(|o| o.layer == e.layer && o.name == e.dir_name)
+        });
+        for o in &dirs.overlay {
+            entries.push(CatalogEntry {
+                dir_name: o.name.clone(),
+                layer: o.layer,
+                path: o.dir.clone(),
+                in_linked_root: false,
+                shipped: true,
+                loaded: OnceLock::new(),
+            });
         }
         entries.sort_by(|a, b| (&a.dir_name, a.layer).cmp(&(&b.dir_name, b.layer)));
         (Self { entries }, failed)
@@ -181,6 +213,7 @@ fn scan(dir: &Path, layer: Layer, out: &mut Vec<CatalogEntry>) -> Result<(), Dis
             layer,
             path,
             in_linked_root: root_is_link,
+            shipped: false,
             loaded: OnceLock::new(),
         });
     }
