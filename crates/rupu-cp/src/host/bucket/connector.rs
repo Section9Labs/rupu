@@ -343,11 +343,13 @@ impl HostConnector for BucketHostConnector {
         }
         // Checked before `ship_through`, so the downgrade is never memoised:
         // a worker that upgrades later is picked up by the next unit.
-        if let Err(HostConnectorError::Unsupported(m)) = self
+        match self
             .require_worker_capability(CAP_AGENT_SKILL_BUNDLE, "shipped skills")
             .await
         {
-            return Ok(ShipOutcome::Unsupported(m));
+            Err(HostConnectorError::Unsupported(m)) => return Ok(ShipOutcome::Unsupported(m)),
+            Err(e) => return Err(e),
+            Ok(()) => {}
         }
         let who = self.host_id.clone();
         skill_ship::ship_through(&self.ship_memo, bundle, &who, |pending| async move {
@@ -934,6 +936,103 @@ mod tests {
         assert_eq!(counting.puts.load(Ordering::SeqCst), 1);
         conn.ship_skills(&bundle).await.unwrap();
         assert_eq!(counting.puts.load(Ordering::SeqCst), 1, "memoised");
+    }
+
+    /// A bucket whose worker listing fails: the capability was never
+    /// confirmed, so the ship is an error and nothing is put.
+    #[tokio::test]
+    async fn a_failed_capability_check_is_an_error_and_puts_nothing() {
+        struct NoList(ObjectStoreBucket);
+        #[async_trait::async_trait]
+        impl Bucket for NoList {
+            async fn put_job(&self, r: &str, b: &[u8]) -> Result<(), BucketError> {
+                self.0.put_job(r, b).await
+            }
+            async fn list_jobs(&self) -> Result<Vec<String>, BucketError> {
+                self.0.list_jobs().await
+            }
+            async fn claim_job(&self, r: &str, w: &str) -> Result<bool, BucketError> {
+                self.0.claim_job(r, w).await
+            }
+            async fn get_job(&self, r: &str) -> Result<Vec<u8>, BucketError> {
+                self.0.get_job(r).await
+            }
+            async fn put_control(&self, r: &str, s: u64, b: &[u8]) -> Result<(), BucketError> {
+                self.0.put_control(r, s, b).await
+            }
+            async fn list_control(&self, r: &str) -> Result<Vec<(u64, Vec<u8>)>, BucketError> {
+                self.0.list_control(r).await
+            }
+            async fn put_result(&self, r: &str, k: &str, b: &[u8]) -> Result<(), BucketError> {
+                self.0.put_result(r, k, b).await
+            }
+            async fn list_results(&self, r: &str) -> Result<Vec<(String, Vec<u8>)>, BucketError> {
+                self.0.list_results(r).await
+            }
+            async fn put_finished(&self, r: &str, s: &str) -> Result<(), BucketError> {
+                self.0.put_finished(r, s).await
+            }
+            async fn get_finished(&self, r: &str) -> Result<Option<String>, BucketError> {
+                self.0.get_finished(r).await
+            }
+            async fn probe(&self) -> Result<(), BucketError> {
+                self.0.probe().await
+            }
+            async fn put_worker_info(&self, i: &str, b: &[u8]) -> Result<(), BucketError> {
+                self.0.put_worker_info(i, b).await
+            }
+            async fn list_worker_info(&self) -> Result<Vec<Vec<u8>>, BucketError> {
+                Err(BucketError::Io("listing down".into()))
+            }
+            async fn artifact_exists(&self, s: &str) -> Result<bool, BucketError> {
+                self.0.artifact_exists(s).await
+            }
+            async fn put_artifact_file(
+                &self,
+                s: &str,
+                p: &std::path::Path,
+            ) -> Result<(), BucketError> {
+                self.0.put_artifact_file(s, p).await
+            }
+            async fn get_artifact_to_file(
+                &self,
+                s: &str,
+                d: &std::path::Path,
+                m: u64,
+            ) -> Result<(), BucketError> {
+                self.0.get_artifact_to_file(s, d, m).await
+            }
+            async fn put_skill(&self, h: &str, b: &[u8]) -> Result<(), BucketError> {
+                self.0.put_skill(h, b).await
+            }
+            async fn get_skill(&self, h: &str, m: u64) -> Result<Vec<u8>, BucketError> {
+                self.0.get_skill(h, m).await
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let run_store = Arc::new(RunStore::new(tmp.path().join("runs")));
+        let mirror = Arc::new(NodeMirror::new(Arc::clone(&run_store)));
+        let bucket: Arc<dyn Bucket> =
+            Arc::new(NoList(ObjectStoreBucket::new(Arc::new(InMemory::new()), "t/h")));
+        let conn = BucketHostConnector::new(
+            "h",
+            Arc::clone(&bucket),
+            mirror,
+            run_store,
+            Arc::new(crate::customers::CustomerPricing::flat(
+                rupu_config::PricingConfig::default(),
+            )),
+        );
+        let bundle = one_skill_bundle(tmp.path());
+        let hash = bundle.pack().unwrap()[0].hash.hex();
+        assert!(matches!(
+            conn.ship_skills(&bundle).await,
+            Err(HostConnectorError::Unreachable(_))
+        ));
+        assert!(matches!(
+            bucket.get_skill(&hash, u64::MAX).await,
+            Err(BucketError::NotFound(_))
+        ));
     }
 
     /// A pool with a worker lacking the capability: a visible downgrade,

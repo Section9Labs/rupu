@@ -299,6 +299,38 @@ impl ObjectStoreBucket {
         Ok(())
     }
 
+    /// Stream `path` into memory, failing as soon as MORE than `max_bytes`
+    /// have arrived (the object is untrusted; a head taken earlier may be stale).
+    async fn read_capped(
+        &self,
+        path: &Path,
+        hash: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, BucketError> {
+        let got = match self.store.get(path).await {
+            Ok(g) => g,
+            Err(object_store::Error::NotFound { .. }) => {
+                return Err(BucketError::NotFound(key_skill(hash)))
+            }
+            Err(e) => return Err(BucketError::Io(e.to_string())),
+        };
+        let mut stream = got.into_stream();
+        let mut out = Vec::new();
+        while let Some(chunk) = stream
+            .try_next()
+            .await
+            .map_err(|e| BucketError::Io(e.to_string()))?
+        {
+            if out.len() as u64 + chunk.len() as u64 > max_bytes {
+                return Err(BucketError::Io(format!(
+                    "skill {hash} exceeds {max_bytes} bytes"
+                )));
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
+    }
+
     /// List all objects under `dir_path` and collect into a `Vec<object_store::ObjectMeta>`.
     async fn list_all(
         &self,
@@ -529,13 +561,7 @@ impl Bucket for ObjectStoreBucket {
                 "skill {hash} exceeds {max_bytes} bytes ({size})"
             )));
         }
-        match self.get_bytes(&path).await? {
-            Some(b) if b.len() as u64 <= max_bytes => Ok(b),
-            Some(_) => Err(BucketError::Io(format!(
-                "skill {hash} exceeds {max_bytes} bytes"
-            ))),
-            None => Err(not_found()),
-        }
+        self.read_capped(&path, hash, max_bytes).await
     }
 }
 
@@ -616,6 +642,20 @@ mod tests {
             b.get_skill(&hash, 4).await,
             Err(BucketError::Io(m)) if m.contains("exceeds")
         ));
+    }
+
+    #[tokio::test]
+    async fn skill_read_is_capped_on_the_stream_not_just_the_head() {
+        let b = mem_bucket();
+        let hash = "12".repeat(32);
+        b.put_skill(&hash, b"0123456789").await.unwrap();
+        let path = b.path(&key_skill(&hash));
+        // Bypasses the head check, as a swapped object would.
+        assert!(matches!(
+            b.read_capped(&path, &hash, 9).await,
+            Err(BucketError::Io(m)) if m.contains("exceeds")
+        ));
+        assert_eq!(b.read_capped(&path, &hash, 10).await.unwrap(), b"0123456789");
     }
 
     #[tokio::test]
