@@ -297,7 +297,7 @@ and `rupu __skills receive`, not one per skill. Over HTTP the peer serves
 (layer, name, hash). The node answers `SkillsNeed` with the refs its cache
 lacks, the coordinator streams each archive as base64 `SkillChunk`s, and the
 node verifies and stores them and replies `SkillsStored`. The unit's `RunSpec`
-then carries the manifest. A node accepts at most 2 live offers per connection,
+then carries the manifest. A node accepts at most 4 live offers per connection,
 256 refs per offer and offer ids of at most 128 bytes. An offer that gets no
 frame for 120 seconds fails, and a connection has a byte budget for archives it
 holds before they are stored. The first problem in an offer fails that offer
@@ -308,8 +308,9 @@ never evicted.
 `skills/<hash>.tar` in the bucket and skips one that is already there. Before
 a worker starts the job it downloads every skill its cache lacks and verifies
 it. A missing or corrupt object fails the job, and the message names
-`layer:name`. A transient bucket read error leaves the job pending for the next
-tick. A skill over the size limit is refused with a typed `TooLarge` error.
+`layer:name`. A manifest of more than 256 skills fails the job too. A
+transient bucket read error leaves the job pending for the next tick. A skill
+over the size limit is refused with a typed `TooLarge` error.
 When a job fails, the worker writes `failure.txt` before the job's marker, and
 the coordinator copies its text into the run record's `error_message`.
 
