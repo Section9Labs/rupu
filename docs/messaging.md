@@ -87,7 +87,7 @@ that reached nobody is also an error the model sees.
 
 | Kind | Tool | What it does |
 |---|---|---|
-| `post` | `board.post` | Adds to the shared board, which anyone reads with `board.read`. A post with no `addressed_to` is a channel post. Posts are not pushed into turns |
+| `post` | `board.post` | Adds to the shared board, which anyone reads with `board.read`. A post with no `addressed_to` is a channel post and reaches nobody's inbox. An addressed post also lands in each resolved addressee's inbox (same inbox cap as a direct message), so the addressee sees it on its next turn, framed as a board post |
 | `direct` | `msg.send` | Lands in each recipient's inbox |
 | `broadcast` | `msg.send` to `broadcast` | Appended to the broadcast log; every participant reads it once |
 | `directive` | `board.directive` | A standing instruction, re-shown to the participants it addresses on every turn until it is lifted |

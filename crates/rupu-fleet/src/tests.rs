@@ -599,3 +599,72 @@ fn leave_all_ends_every_live_participant_once() {
     );
     assert_eq!(Bus::leave_all(tmp.path(), "stopped").unwrap(), 0);
 }
+
+#[test]
+fn an_addressed_post_reaches_the_addressee_inbox_and_the_board() {
+    let tmp = tempfile::tempdir().unwrap();
+    let lynx = joined(tmp.path(), "lynx#1", member("recon", "r1", None, None));
+    let otter = joined(tmp.path(), "otter#1", member("triage", "r2", None, None));
+    let to = Address::parse("lynx#1").unwrap();
+    let r = otter.post(PostKind::Question, Some(&to), "seen 10.0.0.5?").unwrap();
+    assert_eq!(r.delivery().resolved, vec!["lynx#1".to_string()]);
+    assert!(r.delivery().undelivered.is_empty());
+
+    // In lynx's inbox, marked as a post with its kind and the log id.
+    let inbox = lynx.mailbox.drain("lynx#1").unwrap();
+    assert_eq!(inbox.len(), 1);
+    assert_eq!(inbox[0].post_kind, Some(PostKind::Question));
+    assert_eq!(inbox[0].id.as_deref(), Some(r.message.id.as_str()));
+    assert_eq!(inbox[0].body, "seen 10.0.0.5?");
+
+    // Still on the board for everyone.
+    let posts = otter.board.read_posts().unwrap();
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0].addressed_to.as_deref(), Some("lynx#1"));
+    // The sender's own inbox stays empty.
+    assert!(otter.mailbox.drain("otter#1").unwrap().is_empty());
+}
+
+#[test]
+fn a_channel_post_reaches_no_inbox() {
+    let tmp = tempfile::tempdir().unwrap();
+    let lynx = joined(tmp.path(), "lynx#1", member("recon", "r1", None, None));
+    let otter = joined(tmp.path(), "otter#1", member("triage", "r2", None, None));
+    let r = otter.post(PostKind::Note, None, "status: scanning").unwrap();
+    assert!(r.delivery().resolved.is_empty());
+    assert!(lynx.mailbox.drain("lynx#1").unwrap().is_empty());
+    assert_eq!(otter.board.read_posts().unwrap().len(), 1);
+}
+
+#[test]
+fn an_addressed_post_to_a_role_reaches_every_live_member_and_respects_inbox_caps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = joined(tmp.path(), "lynx#1", member("recon", "r1", None, None));
+    let b = joined(tmp.path(), "lynx#2", member("recon", "r2", None, None));
+    let caps = BusCaps {
+        msg_cap: 1,
+        ..BusCaps::default()
+    };
+    let sender = Bus::open(tmp.path(), "otter#1").with_caps(caps);
+    sender.join(member("triage", "r3", None, None)).unwrap();
+    // Fill lynx#2's inbox first.
+    sender.send(&Address::parse("lynx#2").unwrap(), "busy").unwrap();
+
+    let r = sender
+        .post(PostKind::Observation, Some(&Address::parse("role:recon").unwrap()), "found it")
+        .unwrap();
+    assert_eq!(r.delivery().resolved, vec!["lynx#1".to_string()]);
+    assert_eq!(
+        r.delivery().undelivered,
+        vec![Undelivered {
+            to: "lynx#2".into(),
+            reason: Undeliverable::InboxFull
+        }]
+    );
+    assert_eq!(a.mailbox.drain("lynx#1").unwrap().len(), 1);
+    // lynx#2 has only the earlier direct message; the post is on the board.
+    let b_inbox = b.mailbox.drain("lynx#2").unwrap();
+    assert_eq!(b_inbox.len(), 1);
+    assert_eq!(b_inbox[0].post_kind, None);
+    assert_eq!(sender.board.read_posts().unwrap().len(), 1);
+}

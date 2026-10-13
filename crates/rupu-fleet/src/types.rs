@@ -155,4 +155,8 @@ pub struct FleetMessage {
     /// An operator message the operator marked urgent.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub urgent: bool,
+    /// Set when this is an addressed board post delivered to its addressee:
+    /// the post's kind. `None` for a direct message or a broadcast.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_kind: Option<PostKind>,
 }

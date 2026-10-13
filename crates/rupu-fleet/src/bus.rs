@@ -269,8 +269,11 @@ impl Bus {
         Ok(live.len())
     }
 
-    /// A board post, optionally addressed. Every participant can read it;
-    /// nothing delivers it into a turn. A post to `broadcast` is a channel
+    /// A board post, optionally addressed. Every participant can read it on
+    /// the board. An addressed post is also delivered to each resolved
+    /// addressee's inbox (an @mention reaches the one it names), under the
+    /// same inbox cap as a direct message; an unaddressed post is a channel
+    /// post and reaches nobody's inbox. A post to `broadcast` is a channel
     /// post (there is one broadcast, `send`'s).
     pub fn post(
         &self,
@@ -296,7 +299,11 @@ impl Bus {
                     kind,
                     body: m.body.clone(),
                     addressed_to: m.to.clone(),
-                })
+                })?;
+                if m.to.is_some() {
+                    self.deliver(m, false)?;
+                }
+                Ok(())
             },
         )
     }
@@ -360,6 +367,7 @@ impl Bus {
             ts: m.ts.clone(),
             body: m.body.clone(),
             urgent: m.urgent,
+            post_kind: m.post_kind,
         };
         if broadcast {
             if m.delivery.undelivered.is_empty() {
@@ -597,7 +605,8 @@ impl Bus {
                     resolved = resolution.recipients;
                 }
             }
-            MessageKind::Direct => {
+            // An addressed post lands in its addressees' inboxes too.
+            MessageKind::Direct | MessageKind::Post => {
                 for r in resolution.recipients {
                     if r != address::OPERATOR && self.mailbox.inbox_len(&r)? >= self.caps.msg_cap {
                         undelivered.push(Undelivered {
