@@ -90,6 +90,23 @@ fn tolerant_lookup_reports_the_agents_own_broken_file() {
 }
 
 #[test]
+fn tolerant_lookup_reports_a_file_it_could_not_read() {
+    // Any `.md` entry may hold the agent under another file name, so one
+    // that can't be read is an error (which an fd-exhaustion retry can
+    // classify), never NotFound. A directory stands in for an unreadable
+    // file: a permission seam doesn't bind under root.
+    let global = assert_fs::TempDir::new().unwrap();
+    std::fs::create_dir_all(global.child("agents").child("x.md").path()).unwrap();
+    match rupu_agent::find_agent_tolerant(global.path(), None, "hello") {
+        Err(rupu_agent::AgentLoadError::Parse {
+            path,
+            source: rupu_agent::AgentSpecParseError::Io(_),
+        }) => assert!(path.ends_with("x.md"), "{path}"),
+        other => panic!("expected the unreadable file's io error, got {other:?}"),
+    }
+}
+
+#[test]
 fn tolerant_lookup_follows_project_shadowing_and_frontmatter_names() {
     let global = assert_fs::TempDir::new().unwrap();
     let project = assert_fs::TempDir::new().unwrap();

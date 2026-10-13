@@ -285,7 +285,8 @@ pub fn find_agent(
 
 /// [`find_agent`] for a caller that needs only `name`: a file that fails to
 /// parse is skipped unless it is the agent's own (`<name>.md`), so an
-/// unrelated broken file never hides it. The project layer still shadows
+/// unrelated broken file never hides it; a file that can't be read is an
+/// error, since it may be the agent's. The project layer still shadows
 /// the global one by frontmatter name, and a layer whose own `<name>.md`
 /// fails to parse answers with that file's error. Tries `<name>.md` first,
 /// so the common case parses one file.
@@ -334,10 +335,17 @@ fn find_in_dir_tolerant(
         if path == own || path.extension().and_then(|s| s.to_str()) != Some("md") {
             continue;
         }
-        if let Ok(spec) = AgentSpec::parse_file(&path) {
-            if spec.name == name {
-                return Ok(Some(Ok(spec)));
+        match AgentSpec::parse_file(&path) {
+            Ok(spec) if spec.name == name => return Ok(Some(Ok(spec))),
+            // A file that can't be read may be the agent's: only a file that
+            // read but didn't parse is skipped.
+            Err(source @ AgentSpecParseError::Io(_)) => {
+                return Err(AgentLoadError::Parse {
+                    path: path.display().to_string(),
+                    source,
+                })
             }
+            Ok(_) | Err(_) => {}
         }
     }
     Ok(own_error.map(Err))
