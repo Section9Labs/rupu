@@ -3515,9 +3515,19 @@ steps:
         let run_store = Arc::new(rupu_orchestrator::runs::RunStore::new(
             store_dir.path().join("runs"),
         ));
+        // An older node is connected (it takes skills by name, not bundles);
+        // the receiver stays alive so the launch can send its frames.
+        let registry = Arc::new(rupu_cp::node::registry::NodeRegistry::new());
+        let (node_tx, _node_rx) = tokio::sync::mpsc::channel(16);
+        let _node_conn = registry.register_with_hello(
+            "h",
+            node_tx,
+            vec!["agent.skills".to_string()],
+            Some("0.0.1-test".into()),
+        );
         let tunnel = Arc::new(rupu_cp::host::tunnel::TunnelHostConnector::new(
             "h",
-            Arc::new(rupu_cp::node::registry::NodeRegistry::new()),
+            Arc::clone(&registry),
             Arc::new(rupu_cp::node::mirror::NodeMirror::new(Arc::clone(
                 &run_store,
             ))),

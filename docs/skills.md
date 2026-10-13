@@ -293,12 +293,36 @@ and `rupu __skills receive`, not one per skill. Over HTTP the peer serves
 `POST /api/skills/bundle/missing` and `PUT /api/skills/bundle/:hash`.
 `host: local` ships nothing.
 
+**Tunnel nodes.** The coordinator sends `SkillsOffer` with the skills' refs
+(layer, name, hash). The node answers `SkillsNeed` with the refs its cache
+lacks, the coordinator streams each archive as base64 `SkillChunk`s, and the
+node verifies and stores them and replies `SkillsStored`. The unit's `RunSpec`
+then carries the manifest. A node accepts at most 4 live offers per connection,
+256 refs per offer and offer ids of at most 128 bytes. An offer that gets no
+frame for 120 seconds fails, and a connection has a byte budget for archives it
+holds before they are stored. The first problem in an offer fails that offer
+with an error and stores nothing. The connection stays up. The node cache is
+never evicted.
+
+**Bucket workers.** The coordinator puts each missing skill as
+`skills/<hash>.tar` in the bucket and skips one that is already there. Before
+a worker starts the job it downloads every skill its cache lacks and verifies
+it. A missing or corrupt object fails the job, and the message names
+`layer:name`. A manifest of more than 256 skills fails the job too. A
+transient bucket read error leaves the job pending for the next tick. A skill
+over the size limit is refused with a typed `TooLarge` error.
+When a job fails, the worker writes `failure.txt` before the job's marker, and
+the coordinator copies its text into the run record's `error_message`.
+
 **Older hosts.** A host that does not advertise `agent.skill_bundle` is sent
 the unit by name, as before, and the run gets a warning that names the host
-and says the unit will use the host's installed copies. The coordinator
+and says the unit will use the host's installed copies. Over SSH and HTTP the coordinator
 remembers the downgrade for the life of its process. Over SSH the launch
-command itself checks the remote's `rupu __features`. A tunnel or bucket host
-does not receive shipped skills yet, so it gets the same downgrade.
+command itself checks the remote's `rupu __features`. A tunnel node
+advertises it in `Hello.capabilities` and a bucket worker in its marker. For
+tunnel and bucket the capability is re-checked on every unit and the downgrade
+is not remembered, so a node or worker that is upgraded starts receiving skills
+without a coordinator restart.
 
 **Errors.** Every coordinator-side failure for a placed unit's skills (resolve,
 pack, limit, transfer) and a skill missing on the host starts with

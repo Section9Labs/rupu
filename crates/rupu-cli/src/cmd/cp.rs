@@ -1785,6 +1785,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use crate::test_support::exec_ready_script;
+
     // ── T5b-2b-i correctness fix: the resume worker's gate-id round-trip ──
 
     /// [`resume_control`], rendered.
@@ -1936,54 +1938,6 @@ mod tests {
              (at {})",
             capture_path.display()
         );
-    }
-
-    /// A shell script standing in for the real `rupu` binary, ready to be
-    /// exec'd by the code under test.
-    ///
-    /// Written at `path` with `body` under a `#!/bin/sh` line that first
-    /// honours `RUPU_TEST_SCRIPT_DRYRUN` (set: exit 0 before doing
-    /// anything), made executable, and then exec'd once in that dry-run
-    /// mode — retried on `ExecutableFileBusy` for up to 5s — before it is
-    /// handed over. On Linux an exec fails with ETXTBSY while any process
-    /// holds the file open for writing: another test thread that forks
-    /// while `std::fs::write`'s descriptor is still open gives its child a
-    /// copy that lives until that child's own exec closes it (CLOEXEC),
-    /// and a `resume_one_run` / `run_gate_sweep` spawn landing in that
-    /// window fails as a plain spawn error — logged, the marker cleared,
-    /// nothing captured — which is what the CI failure at
-    /// `poll_captured_argv` was. Once one exec has succeeded no writer is
-    /// left (the descriptor is closed here, and the forked copies only ever
-    /// go away), so the spawn under test cannot hit it.
-    fn exec_ready_script(path: &std::path::Path, body: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::write(
-            path,
-            format!("#!/bin/sh\n[ -n \"$RUPU_TEST_SCRIPT_DRYRUN\" ] && exit 0\n{body}"),
-        )
-        .unwrap();
-        let mut perms = std::fs::metadata(path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(path, perms).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            match std::process::Command::new(path)
-                .env("RUPU_TEST_SCRIPT_DRYRUN", "1")
-                .status()
-            {
-                Ok(status) => {
-                    assert!(status.success(), "dry run of {}: {status}", path.display());
-                    return path.to_path_buf();
-                }
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::ExecutableFileBusy
-                        && std::time::Instant::now() < deadline =>
-                {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(e) => panic!("dry run of {}: {e}", path.display()),
-            }
-        }
     }
 
     /// [`exec_ready_script`] that appends its argv to `capture_path`.

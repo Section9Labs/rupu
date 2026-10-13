@@ -227,6 +227,7 @@ async fn mirror_create_append_finish_round_trip() {
     let mirror = NodeMirror::new(Arc::clone(&store));
 
     let spec = RunSpec {
+        skill_bundle: None,
         kind: RunSpecKind::Workflow,
         name: "smoke-workflow".to_string(),
         inputs: BTreeMap::new(),
@@ -313,6 +314,7 @@ async fn mirror_usage_lines_land_in_the_run_usage_ledger() {
     let mirror = NodeMirror::new(Arc::clone(&store));
 
     let spec = RunSpec {
+        skill_bundle: None,
         findings_profile: None,
         engagement_profiles: Vec::new(),
         skills: Vec::new(),
@@ -381,6 +383,7 @@ async fn mirror_replace_usage_ledger_swaps_the_file_atomically() {
     let store = Arc::new(RunStore::new(dir.path().to_path_buf()));
     let mirror = NodeMirror::new(Arc::clone(&store));
     let spec = RunSpec {
+        skill_bundle: None,
         findings_profile: None,
         engagement_profiles: Vec::new(),
         skills: Vec::new(),
@@ -479,6 +482,7 @@ async fn mirror_replace_usage_ledger_failure_removes_the_temp_file() {
     let store = Arc::new(RunStore::new(dir.path().to_path_buf()));
     let mirror = NodeMirror::new(Arc::clone(&store));
     let spec = RunSpec {
+        skill_bundle: None,
         findings_profile: None,
         engagement_profiles: Vec::new(),
         skills: Vec::new(),
@@ -539,6 +543,7 @@ async fn mirror_run_json_repins_cp_local_paths() {
     let mirror = NodeMirror::new(Arc::clone(&store));
 
     let spec = RunSpec {
+        skill_bundle: None,
         kind: RunSpecKind::Workflow,
         name: "repin-test".to_string(),
         inputs: BTreeMap::new(),
@@ -646,6 +651,7 @@ async fn mirror_run_json_nulls_resume_fields() {
     let mirror = NodeMirror::new(Arc::clone(&store));
 
     let spec = RunSpec {
+        skill_bundle: None,
         kind: RunSpecKind::Workflow,
         name: "resume-null-test".to_string(),
         inputs: BTreeMap::new(),
@@ -726,6 +732,7 @@ async fn mirror_run_json_preserves_final_output() {
     let mirror = NodeMirror::new(Arc::clone(&store));
 
     let spec = RunSpec {
+        skill_bundle: None,
         kind: RunSpecKind::Agent,
         name: "my-agent".to_string(),
         inputs: BTreeMap::new(),
@@ -832,6 +839,7 @@ async fn mirror_traversal_run_id_rejected_before_io() {
 
     // Smoke-check additional invalid patterns.
     let _spec = RunSpec {
+        skill_bundle: None,
         kind: RunSpecKind::Workflow,
         name: "x".into(),
         inputs: BTreeMap::new(),
@@ -880,6 +888,7 @@ async fn mirror_wrong_node_id_rejected() {
     let run_id = "run_SECTEST001";
 
     let spec = RunSpec {
+        skill_bundle: None,
         kind: RunSpecKind::Workflow,
         name: "sec-workflow".to_string(),
         inputs: BTreeMap::new(),
@@ -951,6 +960,7 @@ async fn mirror_legitimate_owner_can_append_and_finish() {
     let run_id = "run_LEGITPATH001";
 
     let spec = RunSpec {
+        skill_bundle: None,
         kind: RunSpecKind::Workflow,
         name: "legit-workflow".to_string(),
         inputs: BTreeMap::new(),
@@ -1449,6 +1459,120 @@ async fn ws_a_node_disconnecting_mid_pull_fails_it_promptly() {
     );
 }
 
+/// The next frame the node receives, keepalive pings skipped.
+async fn recv_non_ping(ws: &mut NodeWs) -> Frame {
+    loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), recv_frame(ws))
+            .await
+            .expect("timed out waiting for a frame")
+            .expect("connection closed");
+        if !matches!(frame, Frame::Ping {}) {
+            return frame;
+        }
+    }
+}
+
+/// A whole skill shipment over a real tunnel at real chunk size: the CP
+/// offers, the node's `SkillsNeed` reaches the connector through the read
+/// pump, a skill over `ARTIFACT_CHUNK_BYTES` arrives as two `SkillChunk`s
+/// that verify in a node cache, and `SkillsStored` completes the ship.
+#[tokio::test]
+async fn ws_skills_ship_through_the_read_pump_at_real_chunk_size() {
+    use rupu_cp::host::connector::HostConnector as _;
+    use rupu_cp::host::skill_ship::{ShipOutcome, SkillBundle};
+    use rupu_cp::node::protocol::ARTIFACT_CHUNK_BYTES;
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ws, connector) = connect_pull_capable_node(dir.path(), "node-ws-skills").await;
+    let root = dir.path().join("skills").join("big");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("SKILL.md"),
+        "---\nname: big\ndescription: A big skill.\n---\n\nUse the data.\n",
+    )
+    .unwrap();
+    let data: Vec<u8> = (0..ARTIFACT_CHUNK_BYTES + 4096)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    std::fs::write(root.join("data.bin"), &data).unwrap();
+    let bundle = SkillBundle::new(vec![Arc::new(
+        rupu_skills::load_skill(&root, rupu_skills::Layer::Global).unwrap(),
+    )]);
+    let packed = bundle.pack().unwrap();
+    assert!(packed[0].bytes.len() > ARTIFACT_CHUNK_BYTES);
+    let ship = tokio::spawn(async move { connector.ship_skills(&bundle).await });
+
+    let (id, offered) = match recv_non_ping(&mut ws).await {
+        Frame::SkillsOffer { id, skills } => (id, skills),
+        other => panic!("expected SkillsOffer, got {other:?}"),
+    };
+    assert_eq!(offered, vec![packed[0].reference()]);
+    send_frame(
+        &mut ws,
+        &Frame::SkillsNeed {
+            id: id.clone(),
+            skills: offered.clone(),
+            error: None,
+        },
+    )
+    .await;
+    let (mut archive, mut chunks) = (Vec::new(), 0u64);
+    loop {
+        match recv_non_ping(&mut ws).await {
+            Frame::SkillChunk {
+                id: cid,
+                layer,
+                name,
+                hash,
+                seq,
+                data_b64,
+                last,
+            } => {
+                assert_eq!(cid, id);
+                assert_eq!((layer, name, hash), {
+                    let r = &offered[0];
+                    (r.layer, r.name.clone(), r.content_hash.clone())
+                });
+                assert_eq!(seq, chunks, "chunks arrive in order");
+                chunks += 1;
+                use base64::Engine as _;
+                archive.extend(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(data_b64)
+                        .unwrap(),
+                );
+                if last {
+                    break;
+                }
+            }
+            other => panic!("expected SkillChunk, got {other:?}"),
+        }
+    }
+    assert_eq!(chunks, 2, "one full chunk and the rest");
+    assert!(archive == packed[0].bytes, "chunks reassemble to the pack");
+    // What a node does with it: verified and cached.
+    let stored = rupu_skills::ship::store(&dir.path().join("cache"), &offered[0], &archive)
+        .expect("the shipped archive verifies");
+    assert!(std::fs::read(stored.join("data.bin")).unwrap() == data);
+    send_frame(
+        &mut ws,
+        &Frame::SkillsStored {
+            id,
+            stored: offered.clone(),
+            error: None,
+        },
+    )
+    .await;
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), ship)
+        .await
+        .expect("ship did not finish")
+        .unwrap()
+        .expect("ship failed");
+    assert!(
+        matches!(&outcome, ShipOutcome::Shipped(m) if m.skills == offered),
+        "{outcome:?}"
+    );
+}
+
 // ── TunnelHostConnector ───────────────────────────────────────────────────────
 
 mod tunnel_connector {
@@ -1465,6 +1589,7 @@ mod tunnel_connector {
 
     fn make_spec(name: &str) -> RunSpec {
         RunSpec {
+            skill_bundle: None,
             kind: RunSpecKind::Workflow,
             name: name.to_string(),
             inputs: BTreeMap::new(),
@@ -2348,6 +2473,549 @@ mod tunnel_connector {
             .await
             .unwrap_err();
         assert!(matches!(err, HostConnectorError::Unreachable(_)), "{err:?}");
+    }
+
+    // ── ship_skills ──────────────────────────────────────────────────────────
+    //
+    // These play the node side: read the connector's frames off the channel
+    // and answer on the connection's offer table, where the read pump would
+    // deliver `SkillsNeed` / `SkillsStored`.
+
+    use rupu_cp::host::skill_ship::{ShipOutcome, SkillBundle};
+    use rupu_cp::node::OfferMsg;
+    use rupu_skills::ship::{PackedSkill, ShippedSkillRef};
+
+    fn write_skill(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let root = dir.join(name);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: The {name} skill.\n---\n\nDo {name}.\n"),
+        )
+        .unwrap();
+        root
+    }
+
+    fn bundle_of(dir: &std::path::Path, names: &[&str]) -> SkillBundle {
+        SkillBundle::new(
+            names
+                .iter()
+                .map(|n| {
+                    Arc::new(
+                        rupu_skills::load_skill(&write_skill(dir, n), rupu_skills::Layer::Global)
+                            .unwrap(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn capable(
+        node_id: &str,
+        dir: &std::path::Path,
+    ) -> (
+        TunnelHostConnector,
+        mpsc::Receiver<Frame>,
+        Arc<RunStore>,
+        Arc<rupu_cp::node::NodeConn>,
+    ) {
+        setup_with_capabilities(node_id, dir, rupu_cp::node::protocol::node_capabilities())
+    }
+
+    fn without_skill_bundle() -> Vec<String> {
+        rupu_cp::node::protocol::node_capabilities()
+            .into_iter()
+            .filter(|c| c != rupu_cp::node::protocol::CAP_AGENT_SKILL_BUNDLE)
+            .collect()
+    }
+
+    /// The next `SkillsOffer` on the channel: its id and refs.
+    async fn recv_offer(rx: &mut mpsc::Receiver<Frame>) -> (String, Vec<ShippedSkillRef>) {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for SkillsOffer")
+        {
+            Some(Frame::SkillsOffer { id, skills }) => (id, skills),
+            other => panic!("expected SkillsOffer, got {other:?}"),
+        }
+    }
+
+    /// Read offer `id`'s chunks for `needed` until each has its `last` one,
+    /// checking `seq` order; returns each ref's reassembled archive.
+    async fn recv_chunks(
+        rx: &mut mpsc::Receiver<Frame>,
+        id: &str,
+        needed: &[ShippedSkillRef],
+    ) -> Vec<(ShippedSkillRef, Vec<u8>)> {
+        use base64::Engine as _;
+        let mut got: Vec<(ShippedSkillRef, Vec<u8>, u64, bool)> = needed
+            .iter()
+            .map(|r| (r.clone(), Vec::new(), 0, false))
+            .collect();
+        while got.iter().any(|g| !g.3) {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("timed out waiting for SkillChunk")
+                .expect("channel closed");
+            let Frame::SkillChunk {
+                id: cid,
+                layer,
+                name,
+                hash,
+                seq,
+                data_b64,
+                last,
+            } = frame
+            else {
+                panic!("expected SkillChunk, got {frame:?}")
+            };
+            assert_eq!(cid, id);
+            let g = got
+                .iter_mut()
+                .find(|g| g.0.layer == layer && g.0.name == name && g.0.content_hash == hash)
+                .unwrap_or_else(|| panic!("chunk for {layer}:{name}, which was not needed"));
+            assert!(!g.3, "chunk after the last one");
+            assert_eq!(seq, g.2, "chunk out of order");
+            g.2 += 1;
+            g.1.extend(
+                base64::engine::general_purpose::STANDARD
+                    .decode(data_b64)
+                    .unwrap(),
+            );
+            g.3 = last;
+        }
+        got.into_iter().map(|(r, b, _, _)| (r, b)).collect()
+    }
+
+    /// Answer one whole offer: need `needed(offered)`, take its chunks, say
+    /// they're stored. Returns what was offered and what arrived.
+    async fn play_node(
+        rx: &mut mpsc::Receiver<Frame>,
+        node_conn: &rupu_cp::node::NodeConn,
+        needed: impl Fn(&[ShippedSkillRef]) -> Vec<ShippedSkillRef>,
+    ) -> (Vec<ShippedSkillRef>, Vec<(ShippedSkillRef, Vec<u8>)>) {
+        let (id, offered) = recv_offer(rx).await;
+        let needed = needed(&offered);
+        node_conn
+            .route_offer(
+                &id,
+                OfferMsg::Need {
+                    skills: needed.clone(),
+                    error: None,
+                },
+            )
+            .await;
+        let arrived = recv_chunks(rx, &id, &needed).await;
+        if !needed.is_empty() {
+            node_conn
+                .route_offer(
+                    &id,
+                    OfferMsg::Stored {
+                        stored: needed,
+                        error: None,
+                    },
+                )
+                .await;
+        }
+        (offered, arrived)
+    }
+
+    fn packed_of(bundle: &SkillBundle) -> Vec<Arc<PackedSkill>> {
+        bundle.pack().unwrap()
+    }
+
+    /// Offer → need → chunks → stored: the node is sent only what it lacks,
+    /// as the exact packed archive, and the unit launches with every skill.
+    #[tokio::test]
+    async fn ship_skills_sends_what_the_node_needs_and_returns_the_manifest() {
+        let dir = tempdir().unwrap();
+        let (conn, mut rx, _store, node_conn) = capable("node-ship-1", dir.path());
+        let bundle = bundle_of(dir.path(), &["pdf", "sql"]);
+        let packed = packed_of(&bundle);
+        let ship = {
+            let bundle = bundle.clone();
+            tokio::spawn(async move { conn.ship_skills(&bundle).await })
+        };
+        let (offered, arrived) = play_node(&mut rx, &node_conn, |offered| {
+            offered
+                .iter()
+                .filter(|r| r.name == "sql")
+                .cloned()
+                .collect()
+        })
+        .await;
+        assert_eq!(
+            offered,
+            packed.iter().map(|p| p.reference()).collect::<Vec<_>>()
+        );
+        let sql = packed.iter().find(|p| p.name == "sql").unwrap();
+        assert_eq!(arrived.len(), 1);
+        assert_eq!(arrived[0].0, sql.reference());
+        assert!(arrived[0].1 == sql.bytes, "chunks reassemble to the pack");
+        match ship.await.unwrap().unwrap() {
+            ShipOutcome::Shipped(m) => {
+                assert_eq!(m.skills, offered, "the manifest names every skill")
+            }
+            other => panic!("expected Shipped, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "nothing after the transfer");
+    }
+
+    /// A node that already holds everything needs nothing: no chunks, no
+    /// `SkillsStored` to wait for.
+    #[tokio::test]
+    async fn ship_skills_to_a_node_needing_nothing_sends_no_chunks() {
+        let dir = tempdir().unwrap();
+        let (conn, mut rx, _store, node_conn) = capable("node-ship-none", dir.path());
+        let bundle = bundle_of(dir.path(), &["pdf"]);
+        let ship = {
+            let bundle = bundle.clone();
+            tokio::spawn(async move { conn.ship_skills(&bundle).await })
+        };
+        play_node(&mut rx, &node_conn, |_| Vec::new()).await;
+        assert!(matches!(
+            ship.await.unwrap().unwrap(),
+            ShipOutcome::Shipped(_)
+        ));
+        assert!(rx.try_recv().is_err(), "no chunk was sent");
+    }
+
+    /// Twenty units bound for one node at once: one offer goes out, the rest
+    /// wait on the ship lock and find the skills confirmed. A later ship
+    /// sends nothing at all.
+    #[tokio::test]
+    async fn concurrent_ships_send_one_offer_and_a_later_ship_sends_none() {
+        let dir = tempdir().unwrap();
+        let (conn, mut rx, _store, node_conn) = capable("node-ship-20", dir.path());
+        let conn = Arc::new(conn);
+        let bundle = bundle_of(dir.path(), &["pdf", "sql"]);
+        let ships: Vec<_> = (0..20)
+            .map(|_| {
+                let (conn, bundle) = (Arc::clone(&conn), bundle.clone());
+                tokio::spawn(async move { conn.ship_skills(&bundle).await })
+            })
+            .collect();
+        play_node(&mut rx, &node_conn, |offered| offered.to_vec()).await;
+        for ship in ships {
+            assert!(matches!(
+                ship.await.unwrap().unwrap(),
+                ShipOutcome::Shipped(_)
+            ));
+        }
+        assert!(rx.try_recv().is_err(), "exactly one SkillsOffer");
+
+        assert!(matches!(
+            conn.ship_skills(&bundle).await.unwrap(),
+            ShipOutcome::Shipped(_)
+        ));
+        assert!(rx.try_recv().is_err(), "a second ship sends nothing");
+    }
+
+    /// An empty bundle needs nothing, whatever the node supports.
+    #[tokio::test]
+    async fn an_empty_bundle_is_not_needed() {
+        let dir = tempdir().unwrap();
+        let (conn, mut rx, _store, _node_conn) =
+            setup_with_capabilities("node-ship-empty", dir.path(), without_skill_bundle());
+        assert_eq!(
+            conn.ship_skills(&SkillBundle::default()).await.unwrap(),
+            ShipOutcome::NotNeeded
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// An offline node can't be shipped to.
+    #[tokio::test]
+    async fn ship_skills_to_an_offline_node_is_unreachable() {
+        let dir = tempdir().unwrap();
+        let run_store = Arc::new(RunStore::new(dir.path().join("runs")));
+        let conn = TunnelHostConnector::new(
+            "node-ship-offline",
+            Arc::new(NodeRegistry::new()),
+            Arc::new(NodeMirror::new(Arc::clone(&run_store))),
+            run_store,
+            std::sync::Arc::new(rupu_cp::customers::CustomerPricing::flat(
+                rupu_config::PricingConfig::default(),
+            )),
+        );
+        let err = conn
+            .ship_skills(&bundle_of(dir.path(), &["pdf"]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HostConnectorError::Unreachable(_)), "{err:?}");
+    }
+
+    /// A node without `agent.skill_bundle` is a visible downgrade with no
+    /// frame sent (an older node's frame parse is fatal) — and not memoised:
+    /// once it reconnects upgraded, the next ship offers.
+    #[tokio::test]
+    async fn an_incapable_node_downgrades_unmemoised_and_ships_once_upgraded() {
+        let dir = tempdir().unwrap();
+        let node_id = "node-ship-old";
+        let (conn, mut rx, _store, _node_conn) =
+            setup_with_capabilities(node_id, dir.path(), without_skill_bundle());
+        let bundle = bundle_of(dir.path(), &["pdf"]);
+        match conn.ship_skills(&bundle).await.unwrap() {
+            ShipOutcome::Unsupported(m) => assert_eq!(
+                m,
+                format!(
+                    "host {node_id}: node {node_id} (rupu 0.0.1-test) can't receive shipped \
+                     skills; upgrade rupu there"
+                )
+            ),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "no frame to an incapable node");
+
+        let (tx2, mut rx2) = mpsc::channel(16);
+        let upgraded = conn.registry.register_with_hello(
+            node_id,
+            tx2,
+            rupu_cp::node::protocol::node_capabilities(),
+            Some("9.9.9".into()),
+        );
+        let conn = Arc::new(conn);
+        let ship = {
+            let (conn, bundle) = (Arc::clone(&conn), bundle.clone());
+            tokio::spawn(async move { conn.ship_skills(&bundle).await })
+        };
+        play_node(&mut rx2, &upgraded, |offered| offered.to_vec()).await;
+        assert!(matches!(
+            ship.await.unwrap().unwrap(),
+            ShipOutcome::Shipped(_)
+        ));
+    }
+
+    /// The tunnel closing mid-offer fails the ship at once as `Unreachable`;
+    /// nothing was confirmed, so the next ship offers again.
+    #[tokio::test]
+    async fn a_disconnect_mid_offer_is_unreachable_and_a_retry_offers_again() {
+        let dir = tempdir().unwrap();
+        let (conn, mut rx, _store, node_conn) = capable("node-ship-drop", dir.path());
+        let conn = Arc::new(conn);
+        let bundle = bundle_of(dir.path(), &["pdf"]);
+        let ship = {
+            let (conn, bundle) = (Arc::clone(&conn), bundle.clone());
+            tokio::spawn(async move { conn.ship_skills(&bundle).await })
+        };
+        recv_offer(&mut rx).await;
+        node_conn.close_pulls();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), ship)
+            .await
+            .expect("the ship outlived the tunnel")
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Unreachable(m) if m.contains("node-ship-drop")),
+            "{err:?}"
+        );
+
+        let ship = {
+            let (conn, bundle) = (Arc::clone(&conn), bundle.clone());
+            tokio::spawn(async move { conn.ship_skills(&bundle).await })
+        };
+        let (offered, _) = play_node(&mut rx, &node_conn, |offered| offered.to_vec()).await;
+        assert_eq!(offered.len(), 1, "the retry offers the skill again");
+        assert!(matches!(
+            ship.await.unwrap().unwrap(),
+            ShipOutcome::Shipped(_)
+        ));
+    }
+
+    /// `SkillsStored` must list exactly what was needed: one missing a ref
+    /// fails the ship, and confirms nothing.
+    #[tokio::test]
+    async fn a_stored_answer_missing_a_ref_is_an_error() {
+        let dir = tempdir().unwrap();
+        let (conn, mut rx, _store, node_conn) = capable("node-ship-short", dir.path());
+        let conn = Arc::new(conn);
+        let bundle = bundle_of(dir.path(), &["pdf", "sql"]);
+        let ship = {
+            let (conn, bundle) = (Arc::clone(&conn), bundle.clone());
+            tokio::spawn(async move { conn.ship_skills(&bundle).await })
+        };
+        let (id, offered) = recv_offer(&mut rx).await;
+        node_conn
+            .route_offer(
+                &id,
+                OfferMsg::Need {
+                    skills: offered.clone(),
+                    error: None,
+                },
+            )
+            .await;
+        recv_chunks(&mut rx, &id, &offered).await;
+        node_conn
+            .route_offer(
+                &id,
+                OfferMsg::Stored {
+                    stored: offered[..1].to_vec(),
+                    error: None,
+                },
+            )
+            .await;
+        let err = ship.await.unwrap().unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Invalid(m)
+                if m.starts_with("host node-ship-short: ") && m.contains("sql")),
+            "{err:?}"
+        );
+
+        let ship = {
+            let (conn, bundle) = (Arc::clone(&conn), bundle.clone());
+            tokio::spawn(async move { conn.ship_skills(&bundle).await })
+        };
+        let (offered, _) = play_node(&mut rx, &node_conn, |offered| offered.to_vec()).await;
+        assert_eq!(offered.len(), 2, "nothing was confirmed");
+        assert!(matches!(
+            ship.await.unwrap().unwrap(),
+            ShipOutcome::Shipped(_)
+        ));
+    }
+
+    /// The node's errors fail the ship with its text: a refused offer
+    /// (`SkillsNeed` error) and a failed transfer (`SkillsStored` error).
+    #[tokio::test]
+    async fn a_node_error_fails_the_ship_with_its_text() {
+        let dir = tempdir().unwrap();
+        let (conn, mut rx, _store, node_conn) = capable("node-ship-err", dir.path());
+        let conn = Arc::new(conn);
+        let bundle = bundle_of(dir.path(), &["pdf"]);
+
+        let ship = {
+            let (conn, bundle) = (Arc::clone(&conn), bundle.clone());
+            tokio::spawn(async move { conn.ship_skills(&bundle).await })
+        };
+        let (id, _) = recv_offer(&mut rx).await;
+        node_conn
+            .route_offer(
+                &id,
+                OfferMsg::Need {
+                    skills: Vec::new(),
+                    error: Some("too many skill offers in flight".into()),
+                },
+            )
+            .await;
+        let err = ship.await.unwrap().unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Invalid(m)
+                if m == "host node-ship-err: too many skill offers in flight"),
+            "{err:?}"
+        );
+
+        let ship = {
+            let (conn, bundle) = (Arc::clone(&conn), bundle.clone());
+            tokio::spawn(async move { conn.ship_skills(&bundle).await })
+        };
+        let (id, offered) = recv_offer(&mut rx).await;
+        node_conn
+            .route_offer(
+                &id,
+                OfferMsg::Need {
+                    skills: offered.clone(),
+                    error: None,
+                },
+            )
+            .await;
+        recv_chunks(&mut rx, &id, &offered).await;
+        node_conn
+            .route_offer(
+                &id,
+                OfferMsg::Stored {
+                    stored: Vec::new(),
+                    error: Some("skill global:pdf: hash mismatch".into()),
+                },
+            )
+            .await;
+        let err = ship.await.unwrap().unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Invalid(m)
+                if m == "host node-ship-err: skill global:pdf: hash mismatch"),
+            "{err:?}"
+        );
+    }
+
+    /// A `SkillsNeed` naming a skill that wasn't offered is refused before a
+    /// byte is sent.
+    #[tokio::test]
+    async fn a_need_for_an_unoffered_skill_is_an_error() {
+        let dir = tempdir().unwrap();
+        let (conn, mut rx, _store, node_conn) = capable("node-ship-stray", dir.path());
+        let bundle = bundle_of(dir.path(), &["pdf"]);
+        let ship = {
+            let bundle = bundle.clone();
+            tokio::spawn(async move { conn.ship_skills(&bundle).await })
+        };
+        let (id, offered) = recv_offer(&mut rx).await;
+        let mut stray = offered[0].clone();
+        stray.name = "sql".into();
+        node_conn
+            .route_offer(
+                &id,
+                OfferMsg::Need {
+                    skills: vec![stray],
+                    error: None,
+                },
+            )
+            .await;
+        let err = ship.await.unwrap().unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Invalid(m) if m.contains("global:sql")),
+            "{err:?}"
+        );
+        assert!(rx.try_recv().is_err(), "no chunk was sent");
+    }
+
+    fn sample_manifest() -> rupu_skills::ship::SkillBundleManifest {
+        rupu_skills::ship::SkillBundleManifest {
+            version: rupu_skills::ship::SkillBundleManifest::VERSION,
+            skills: vec![ShippedSkillRef {
+                layer: rupu_skills::Layer::Global,
+                name: "pdf".into(),
+                content_hash: "ab".repeat(32),
+            }],
+        }
+    }
+
+    /// A shipped unit's manifest reaches a capable node in the Run frame.
+    #[tokio::test]
+    async fn launch_agent_carries_the_skill_bundle_to_a_capable_node() {
+        let dir = tempdir().unwrap();
+        let (conn, mut rx, _store, _node_conn) = capable("node-sb-1", dir.path());
+        let mut req = make_agent_req("recon");
+        req.skill_bundle = Some(sample_manifest());
+        let run_id = conn.launch_agent(req).await.expect("launch_agent");
+        match rx.recv().await.expect("should receive a frame") {
+            Frame::Run { run_id: fid, spec } => {
+                assert_eq!(fid, run_id);
+                assert_eq!(spec.skill_bundle, Some(sample_manifest()));
+            }
+            other => panic!("expected Frame::Run, got {other:?}"),
+        }
+    }
+
+    /// A node without `agent.skill_bundle` would drop the manifest and run
+    /// the unit without its shipped skills — refuse, leaving no mirror run
+    /// or frame behind.
+    #[tokio::test]
+    async fn launch_agent_refuses_a_skill_bundle_for_a_node_without_the_capability() {
+        let dir = tempdir().unwrap();
+        let (conn, mut rx, run_store, _node_conn) =
+            setup_with_capabilities("node-sb-old", dir.path(), without_skill_bundle());
+        let mut req = make_agent_req("recon");
+        req.skill_bundle = Some(sample_manifest());
+        let err = conn.launch_agent(req).await.unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Unsupported(m)
+                if m.starts_with("host node-sb-old: ") && m.contains("shipped skills")
+                    && m.contains("upgrade rupu")),
+            "{err:?}"
+        );
+        assert!(
+            run_store.list().unwrap().is_empty(),
+            "no orphaned mirror run"
+        );
+        assert!(rx.try_recv().is_err(), "no frame sent");
     }
 }
 
@@ -3525,6 +4193,7 @@ async fn mirror_transcript_append_finish_synthesizes_agent_step_result() {
     let mirror = NodeMirror::new(Arc::clone(&store));
 
     let spec = RunSpec {
+        skill_bundle: None,
         kind: RunSpecKind::Agent,
         name: "reviewer".to_string(),
         inputs: BTreeMap::new(),
@@ -3607,6 +4276,7 @@ async fn mirror_reset_transcript_makes_replay_idempotent() {
     let mirror = NodeMirror::new(Arc::clone(&store));
 
     let spec = RunSpec {
+        skill_bundle: None,
         kind: RunSpecKind::Agent,
         name: "reviewer".to_string(),
         inputs: BTreeMap::new(),

@@ -21,7 +21,7 @@ use rupu_cp::launcher::LaunchRequest;
 use rupu_cp::node::protocol::{RunSpec, RunSpecKind};
 use rupu_cp::node::NodeMirror;
 use rupu_orchestrator::{RunStatus, RunStore, StepKind};
-use tempfile::tempdir;
+use tempfile::{tempdir, TempDir};
 
 // ── poll_bucket_run ───────────────────────────────────────────────────────────
 
@@ -38,6 +38,7 @@ async fn poll_bucket_run_mirrors_and_finishes() {
 
     // Create the mirror run so the NodeMirror knows about it.
     let spec = RunSpec {
+        skill_bundle: None,
         kind: RunSpecKind::Workflow,
         name: "deploy".to_string(),
         inputs: BTreeMap::new(),
@@ -170,6 +171,7 @@ async fn poll_bucket_run_remirrors_run_json_each_tick() {
     let host_id = "host_REMIRROR01";
 
     let spec = RunSpec {
+        skill_bundle: None,
         kind: RunSpecKind::Workflow,
         name: "check".to_string(),
         inputs: BTreeMap::new(),
@@ -443,4 +445,116 @@ async fn bucket_dead_drop_e2e() {
         cancel_env.reason.is_none(),
         "cancel envelope must not carry a reason"
     );
+}
+
+// ── failure reasons ───────────────────────────────────────────────────────────
+
+/// A mirror run on `host_id` for `run_id`, and an empty in-memory bucket. The
+/// run store lives in the returned `TempDir`: keep it for the test's length.
+async fn failing_run(
+    run_id: &str,
+    host_id: &str,
+) -> (TempDir, Arc<RunStore>, NodeMirror, ObjectStoreBucket) {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(RunStore::new(dir.path().join("runs")));
+    let mirror = NodeMirror::new(Arc::clone(&store));
+    let spec = RunSpec {
+        skill_bundle: None,
+        kind: RunSpecKind::Agent,
+        name: "a".to_string(),
+        inputs: BTreeMap::new(),
+        prompt: None,
+        mode: None,
+        target: None,
+        findings_profile: None,
+        engagement_profiles: Vec::new(),
+        skills: Vec::new(),
+        preload_skills: Vec::new(),
+        codename: None,
+    };
+    mirror.create_run(run_id, host_id, &spec).await.unwrap();
+    let bucket = ObjectStoreBucket::new(Arc::new(InMemory::new()), "test/fail");
+    (dir, store, mirror, bucket)
+}
+
+/// A worker that failed a job writes `failure.txt` before the `failed` marker;
+/// the coordinator's run record carries it as `host <id>: <reason>`.
+#[tokio::test]
+async fn a_failed_run_carries_the_workers_reason() {
+    let (_dir, store, mirror, bucket) = failing_run("run_FAILREASON0001", "host_F").await;
+    bucket
+        .put_result(
+            "run_FAILREASON0001",
+            "failure.txt",
+            b"skill global:alpha: not found",
+        )
+        .await
+        .unwrap();
+    bucket
+        .put_finished("run_FAILREASON0001", "failed")
+        .await
+        .unwrap();
+
+    let done = poll_bucket_run(
+        &bucket,
+        &mirror,
+        "host_F",
+        "run_FAILREASON0001",
+        &mut HashSet::new(),
+    )
+    .await
+    .unwrap();
+
+    assert!(done);
+    let rec = store.load("run_FAILREASON0001").unwrap();
+    assert_eq!(rec.status, RunStatus::Failed);
+    assert_eq!(
+        rec.error_message.as_deref(),
+        Some("host host_F: skill global:alpha: not found")
+    );
+}
+
+/// No `failure.txt`: a failed run finishes exactly as before (no message), and
+/// a run that did not fail ignores one.
+#[tokio::test]
+async fn a_run_without_a_failure_object_finishes_as_before() {
+    let (_dir, store, mirror, bucket) = failing_run("run_NOREASON0000001", "host_F").await;
+    bucket
+        .put_finished("run_NOREASON0000001", "failed")
+        .await
+        .unwrap();
+    poll_bucket_run(
+        &bucket,
+        &mirror,
+        "host_F",
+        "run_NOREASON0000001",
+        &mut HashSet::new(),
+    )
+    .await
+    .unwrap();
+    let rec = store.load("run_NOREASON0000001").unwrap();
+    assert_eq!(rec.status, RunStatus::Failed);
+    assert_eq!(rec.error_message, None);
+
+    let (_dir, store, mirror, bucket) = failing_run("run_OKRUN0000000001", "host_F").await;
+    bucket
+        .put_result("run_OKRUN0000000001", "failure.txt", b"stale")
+        .await
+        .unwrap();
+    bucket
+        .put_finished("run_OKRUN0000000001", "completed")
+        .await
+        .unwrap();
+    poll_bucket_run(
+        &bucket,
+        &mirror,
+        "host_F",
+        "run_OKRUN0000000001",
+        &mut HashSet::new(),
+    )
+    .await
+    .unwrap();
+    let rec = store.load("run_OKRUN0000000001").unwrap();
+    assert_eq!(rec.status, RunStatus::Completed);
+    assert_eq!(rec.error_message, None);
 }

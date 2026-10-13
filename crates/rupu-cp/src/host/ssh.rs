@@ -2966,6 +2966,7 @@ impl HostConnector for SshHostConnector {
         let run_id = format!("run_{}", Ulid::new());
 
         let spec = RunSpec {
+            skill_bundle: None,
             kind: RunSpecKind::Workflow,
             name: req.workflow.clone(),
             inputs: req.inputs.clone(),
@@ -3029,6 +3030,7 @@ impl HostConnector for SshHostConnector {
         );
 
         let spec = RunSpec {
+            skill_bundle: None,
             kind: RunSpecKind::Agent,
             name: req.agent.clone(),
             inputs: std::collections::BTreeMap::new(),
@@ -6811,6 +6813,7 @@ mod tests {
         terminal: bool,
     ) {
         let spec = crate::node::protocol::RunSpec {
+            skill_bundle: None,
             kind: crate::node::protocol::RunSpecKind::Workflow,
             name: "wf".into(),
             inputs: std::collections::BTreeMap::new(),
@@ -7789,6 +7792,7 @@ mod tests {
 
         let run_id = "run_01TESTPUMP01";
         let spec = crate::node::protocol::RunSpec {
+            skill_bundle: None,
             kind: crate::node::protocol::RunSpecKind::Workflow,
             name: "test-wf".into(),
             inputs: std::collections::BTreeMap::new(),
@@ -8087,6 +8091,7 @@ mod tests {
         let fake = std::sync::Arc::new(fake);
         let (conn, store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
         let spec = crate::node::protocol::RunSpec {
+            skill_bundle: None,
             kind: crate::node::protocol::RunSpecKind::Agent,
             name: "sec".into(),
             inputs: std::collections::BTreeMap::new(),
@@ -8216,6 +8221,7 @@ mod tests {
 
         let run_id = "run_01TESTPUMPDEAD";
         let spec = crate::node::protocol::RunSpec {
+            skill_bundle: None,
             kind: crate::node::protocol::RunSpecKind::Agent,
             name: "dead-launch".into(),
             inputs: std::collections::BTreeMap::new(),
@@ -8290,6 +8296,7 @@ mod tests {
         let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
 
         let spec = crate::node::protocol::RunSpec {
+            skill_bundle: None,
             kind: crate::node::protocol::RunSpecKind::Agent,
             name: "died-before-preflight".into(),
             inputs: std::collections::BTreeMap::new(),
@@ -8361,6 +8368,7 @@ mod tests {
         let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
 
         let spec = crate::node::protocol::RunSpec {
+            skill_bundle: None,
             kind: crate::node::protocol::RunSpecKind::Agent,
             name: "slow-but-alive".into(),
             inputs: std::collections::BTreeMap::new(),
@@ -8417,6 +8425,7 @@ mod tests {
 
         let run_id = "run_01TESTPUMPALIVE";
         let spec = crate::node::protocol::RunSpec {
+            skill_bundle: None,
             kind: crate::node::protocol::RunSpecKind::Agent,
             name: "alive-but-quiet".into(),
             inputs: std::collections::BTreeMap::new(),
@@ -8473,6 +8482,7 @@ mod tests {
 
         let run_id = "run_01TESTPUMPWALL";
         let spec = crate::node::protocol::RunSpec {
+            skill_bundle: None,
             kind: crate::node::protocol::RunSpecKind::Agent,
             name: "started-then-killed".into(),
             inputs: std::collections::BTreeMap::new(),
@@ -8665,6 +8675,7 @@ mod tests {
         let (conn, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake));
 
         let spec = crate::node::protocol::RunSpec {
+            skill_bundle: None,
             kind: crate::node::protocol::RunSpecKind::Agent,
             name: "reviewer".into(),
             inputs: std::collections::BTreeMap::new(),
@@ -8762,6 +8773,7 @@ mod tests {
         let (conn, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake));
 
         let spec = crate::node::protocol::RunSpec {
+            skill_bundle: None,
             kind: crate::node::protocol::RunSpecKind::Workflow,
             name: "deploy".into(),
             inputs: std::collections::BTreeMap::new(),
@@ -8855,6 +8867,7 @@ mod tests {
         let (conn, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake));
 
         let spec = crate::node::protocol::RunSpec {
+            skill_bundle: None,
             kind: crate::node::protocol::RunSpecKind::Agent,
             name: "reviewer".into(),
             inputs: std::collections::BTreeMap::new(),
@@ -10179,6 +10192,7 @@ mod tests {
 
     fn agent_spec() -> crate::node::protocol::RunSpec {
         crate::node::protocol::RunSpec {
+            skill_bundle: None,
             kind: crate::node::protocol::RunSpecKind::Agent,
             name: "reviewer".into(),
             inputs: std::collections::BTreeMap::new(),
@@ -10195,6 +10209,7 @@ mod tests {
 
     fn workflow_spec() -> crate::node::protocol::RunSpec {
         crate::node::protocol::RunSpec {
+            skill_bundle: None,
             kind: crate::node::protocol::RunSpecKind::Workflow,
             name: "wf".into(),
             inputs: std::collections::BTreeMap::new(),

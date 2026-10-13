@@ -254,22 +254,6 @@ where
     })
 }
 
-/// What a transport that can't ship skills yet (tunnel, bucket) answers.
-pub(crate) fn not_built(host_id: &str) -> ShipOutcome {
-    ShipOutcome::Unsupported(format!(
-        "host {host_id}: shipping skills over this transport is not built yet"
-    ))
-}
-
-/// A launch carrying a skill bundle to a transport that can't deliver one:
-/// refused, so the unit never runs without the skills it was shipped.
-pub(crate) fn refuse_bundle_launch(host_id: &str) -> HostConnectorError {
-    HostConnectorError::Unsupported(format!(
-        "host {host_id}: shipped skills (skill_bundle) can't be delivered over this transport \
-         yet, so this launch is refused"
-    ))
-}
-
 /// `e` with `who` (the host) in front of its message.
 pub(crate) fn prefixed(e: HostConnectorError, who: &str) -> HostConnectorError {
     use HostConnectorError as E;

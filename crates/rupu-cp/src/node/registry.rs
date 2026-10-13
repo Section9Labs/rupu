@@ -52,6 +52,27 @@ pub enum PullMsg {
 /// waiter that is still writing earlier ones to disk.
 const PULL_CHANNEL_CAPACITY: usize = 8;
 
+// ── Skill offers ──────────────────────────────────────────────────────────────
+
+/// A node's answer to a [`Frame::SkillsOffer`], routed from the tunnel's read
+/// pump to the connector waiting on it.
+#[derive(Debug)]
+pub enum OfferMsg {
+    /// `SkillsNeed`: the offered skills the node lacks, or why it refused.
+    Need {
+        skills: Vec<rupu_skills::ship::ShippedSkillRef>,
+        error: Option<String>,
+    },
+    /// `SkillsStored`: every needed skill was stored, or the transfer failed.
+    Stored {
+        stored: Vec<rupu_skills::ship::ShippedSkillRef>,
+        error: Option<String>,
+    },
+}
+
+/// Per-offer channel depth: an offer gets at most a `Need` and a `Stored`.
+const OFFER_CHANNEL_CAPACITY: usize = 4;
+
 // ── NodeConn ──────────────────────────────────────────────────────────────────
 
 /// A live connection to a remote node.
@@ -71,6 +92,9 @@ pub struct NodeConn {
     /// In-flight artifact pulls on this connection, by request id: where
     /// the read pump delivers each `ArtifactChunk` / `ArtifactPullDone`.
     pulls: Mutex<HashMap<String, tokio::sync::mpsc::Sender<PullMsg>>>,
+    /// In-flight skill offers on this connection, by offer id: where the
+    /// read pump delivers each `SkillsNeed` / `SkillsStored`.
+    offers: Mutex<HashMap<String, tokio::sync::mpsc::Sender<OfferMsg>>>,
     /// Signalled by [`NodeRegistry::disconnect`]: the tunnel's pumps stop
     /// and the socket closes (the host was removed).
     kick: tokio::sync::Notify,
@@ -86,6 +110,7 @@ impl NodeConn {
             capabilities,
             rupu_version,
             pulls: Mutex::new(HashMap::new()),
+            offers: Mutex::new(HashMap::new()),
             kick: tokio::sync::Notify::new(),
         }
     }
@@ -151,16 +176,55 @@ impl NodeConn {
         }
     }
 
-    /// The tunnel closed: end every in-flight pull. Each waiter's channel
-    /// closes, so it fails at once instead of waiting out its idle timeout.
+    /// Register skill offer `id` and return the receiver its answers
+    /// arrive on.
+    pub fn begin_offer(&self, id: &str) -> tokio::sync::mpsc::Receiver<OfferMsg> {
+        let (tx, rx) = tokio::sync::mpsc::channel(OFFER_CHANNEL_CAPACITY);
+        self.offers
+            .lock()
+            .expect("offers lock poisoned")
+            .insert(id.to_string(), tx);
+        rx
+    }
+
+    /// Forget offer `id` (the waiting side finished or gave up).
+    pub fn end_offer(&self, id: &str) {
+        self.offers.lock().expect("offers lock poisoned").remove(id);
+    }
+
+    /// Deliver `msg` to offer `id`'s waiter; dropped if nobody is waiting.
+    /// Bounded like [`Self::route_pull`]: a waiter drops its receiver on
+    /// every exit, which fails the send at once.
+    pub async fn route_offer(&self, id: &str, msg: OfferMsg) {
+        let tx = self
+            .offers
+            .lock()
+            .expect("offers lock poisoned")
+            .get(id)
+            .cloned();
+        if let Some(tx) = tx {
+            let _ = tx.send(msg).await;
+        }
+    }
+
+    /// The tunnel closed: end every in-flight pull and skill offer. Each
+    /// waiter's channel closes, so it fails at once instead of waiting out
+    /// its idle timeout.
     pub fn close_pulls(&self) {
         self.pulls.lock().expect("pulls lock poisoned").clear();
+        self.offers.lock().expect("offers lock poisoned").clear();
     }
 
     /// How many pulls are registered on this connection.
     #[cfg(test)]
     pub(crate) fn pulls_in_flight(&self) -> usize {
         self.pulls.lock().expect("pulls lock poisoned").len()
+    }
+
+    /// How many skill offers are registered on this connection.
+    #[cfg(test)]
+    pub(crate) fn offers_in_flight(&self) -> usize {
+        self.offers.lock().expect("offers lock poisoned").len()
     }
 }
 

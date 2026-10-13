@@ -20,9 +20,8 @@ use object_store::{
 };
 
 use super::{
-    BucketError, Bucket,
-    key_artifact, key_claim, key_control, key_finished, key_job, key_result, key_worker_info,
-    prefix_control, prefix_results,
+    key_artifact, key_claim, key_control, key_finished, key_job, key_result, key_skill,
+    key_worker_info, prefix_control, prefix_results, Bucket, BucketError,
 };
 
 // ── artifact transfer tuning ──────────────────────────────────────────────────
@@ -299,6 +298,39 @@ impl ObjectStoreBucket {
         Ok(())
     }
 
+    /// Stream `path` into memory, failing as soon as MORE than `max_bytes`
+    /// have arrived (the object is untrusted; a head taken earlier may be stale).
+    async fn read_capped(
+        &self,
+        path: &Path,
+        hash: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, BucketError> {
+        let got = match self.store.get(path).await {
+            Ok(g) => g,
+            Err(object_store::Error::NotFound { .. }) => {
+                return Err(BucketError::NotFound(key_skill(hash)))
+            }
+            Err(e) => return Err(BucketError::Io(e.to_string())),
+        };
+        let mut stream = got.into_stream();
+        let mut out = Vec::new();
+        while let Some(chunk) = stream
+            .try_next()
+            .await
+            .map_err(|e| BucketError::Io(e.to_string()))?
+        {
+            if out.len() as u64 + chunk.len() as u64 > max_bytes {
+                return Err(BucketError::TooLarge {
+                    key: key_skill(hash),
+                    max: max_bytes,
+                });
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
+    }
+
     /// List all objects under `dir_path` and collect into a `Vec<object_store::ObjectMeta>`.
     async fn list_all(
         &self,
@@ -502,6 +534,36 @@ impl Bucket for ObjectStoreBucket {
         self.download_artifact_to_file(sha256, dest, max_bytes, ARTIFACT_RANGE_BYTES)
             .await
     }
+
+    async fn put_skill(&self, hash: &str, bytes: &[u8]) -> Result<(), BucketError> {
+        let path = self.path(&key_skill(hash));
+        let payload: PutPayload = Bytes::copy_from_slice(bytes).into();
+        let opts = PutOptions {
+            mode: PutMode::Create,
+            ..Default::default()
+        };
+        match self.store.put_opts(&path, payload, opts).await {
+            Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => Ok(()),
+            Err(e) => Err(BucketError::Io(e.to_string())),
+        }
+    }
+
+    async fn get_skill(&self, hash: &str, max_bytes: u64) -> Result<Vec<u8>, BucketError> {
+        let path = self.path(&key_skill(hash));
+        let not_found = || BucketError::NotFound(key_skill(hash));
+        let size = match self.store.head(&path).await {
+            Ok(meta) => meta.size,
+            Err(object_store::Error::NotFound { .. }) => return Err(not_found()),
+            Err(e) => return Err(BucketError::Io(e.to_string())),
+        };
+        if size > max_bytes {
+            return Err(BucketError::TooLarge {
+                key: key_skill(hash),
+                max: max_bytes,
+            });
+        }
+        self.read_capped(&path, hash, max_bytes).await
+    }
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -563,6 +625,41 @@ mod tests {
         );
         // Worker markers are not jobs.
         assert!(b.list_jobs().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn skill_put_is_create_if_absent_and_get_is_capped() {
+        let b = mem_bucket();
+        let hash = "ef".repeat(32);
+        assert!(matches!(
+            b.get_skill(&hash, 100).await,
+            Err(BucketError::NotFound(_))
+        ));
+        b.put_skill(&hash, b"first").await.unwrap();
+        // A second put is Ok and leaves the first object in place.
+        b.put_skill(&hash, b"second").await.unwrap();
+        assert_eq!(b.get_skill(&hash, 5).await.unwrap(), b"first");
+        assert!(matches!(
+            b.get_skill(&hash, 4).await,
+            Err(BucketError::TooLarge { max: 4, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn skill_read_is_capped_on_the_stream_not_just_the_head() {
+        let b = mem_bucket();
+        let hash = "12".repeat(32);
+        b.put_skill(&hash, b"0123456789").await.unwrap();
+        let path = b.path(&key_skill(&hash));
+        // Bypasses the head check, as a swapped object would.
+        assert!(matches!(
+            b.read_capped(&path, &hash, 9).await,
+            Err(BucketError::TooLarge { max: 9, .. })
+        ));
+        assert_eq!(
+            b.read_capped(&path, &hash, 10).await.unwrap(),
+            b"0123456789"
+        );
     }
 
     #[tokio::test]

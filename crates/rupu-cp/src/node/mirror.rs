@@ -529,8 +529,20 @@ impl NodeMirror {
         node_id: &str,
         status: &str,
     ) -> Result<(), MirrorError> {
+        self.finish_with_reason(run_id, node_id, status, None).await
+    }
+
+    /// [`Self::finish`], also recording why the run failed
+    /// (`RunRecord.error_message`) when the host said so.
+    pub async fn finish_with_reason(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        status: &str,
+        reason: Option<String>,
+    ) -> Result<(), MirrorError> {
         let (run_id, node_id, status) = (run_id.to_owned(), node_id.to_owned(), status.to_owned());
-        self.off_runtime(move |m| m.finish_blocking(&run_id, &node_id, &status))
+        self.off_runtime(move |m| m.finish_blocking(&run_id, &node_id, &status, reason))
             .await
     }
 
@@ -539,6 +551,7 @@ impl NodeMirror {
         run_id: &str,
         node_id: &str,
         status: &str,
+        reason: Option<String>,
     ) -> Result<(), MirrorError> {
         validate_run_id(run_id)?;
         let mut record = self.run_store.load(run_id)?;
@@ -546,6 +559,10 @@ impl NodeMirror {
             return Err(MirrorError::WrongNode(run_id.to_string()));
         }
         record.status = parse_status(status);
+        if reason.is_some() && record.status == RunStatus::Failed && record.error_message.is_none()
+        {
+            record.error_message = reason;
+        }
         record.finished_at = Some(Utc::now());
         record.active_step_id = None;
         record.active_step_transcript_path = None;
@@ -692,6 +709,7 @@ mod tests {
         ));
         let mirror = NodeMirror::new(std::sync::Arc::clone(&store));
         let spec = crate::node::protocol::RunSpec {
+            skill_bundle: None,
             kind: crate::node::protocol::RunSpecKind::Agent,
             name: "a".into(),
             inputs: Default::default(),
@@ -741,6 +759,7 @@ mod tests {
         ));
         let mirror = NodeMirror::new(std::sync::Arc::clone(&store));
         let spec = crate::node::protocol::RunSpec {
+            skill_bundle: None,
             kind: crate::node::protocol::RunSpecKind::Agent,
             name: "a".into(),
             inputs: Default::default(),
@@ -797,6 +816,7 @@ mod tests {
         ));
         let mirror = NodeMirror::new(std::sync::Arc::clone(&store));
         let spec = crate::node::protocol::RunSpec {
+            skill_bundle: None,
             kind: crate::node::protocol::RunSpecKind::Agent,
             name: "a".into(),
             inputs: Default::default(),
@@ -856,6 +876,7 @@ mod tests {
         ));
         let mirror = NodeMirror::new(std::sync::Arc::clone(&store));
         let spec = crate::node::protocol::RunSpec {
+            skill_bundle: None,
             kind: crate::node::protocol::RunSpecKind::Agent,
             name: "a".into(),
             inputs: Default::default(),
@@ -907,6 +928,7 @@ mod tests {
         ));
         let mirror = std::sync::Arc::new(NodeMirror::new(std::sync::Arc::clone(&store)));
         let spec = crate::node::protocol::RunSpec {
+            skill_bundle: None,
             kind: crate::node::protocol::RunSpecKind::Agent,
             name: "a".into(),
             inputs: Default::default(),

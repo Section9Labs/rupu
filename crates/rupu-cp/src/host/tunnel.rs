@@ -11,6 +11,10 @@
 //! - **Finding artifacts** are pulled over the same tunnel: `ArtifactPull`
 //!   down, ordered `ArtifactChunk`s + `ArtifactPullDone` up, routed to the
 //!   waiting pull by [`crate::node::NodeConn::route_pull`].
+//! - **Shipped skills** go the other way on the same tunnel: `SkillsOffer`
+//!   down, the node's `SkillsNeed` up, the needed archives as `SkillChunk`s
+//!   down, `SkillsStored` up — answers routed by
+//!   [`crate::node::NodeConn::route_offer`].
 
 #![deny(clippy::all)]
 
@@ -27,12 +31,13 @@ use crate::{
         read_transcript_file, spec_peer_codename, EventByteStream, HostCapabilities, HostConnector,
         HostConnectorError, HostInfo, OperatorMessageRequest, RunListQuery,
     },
-    host::skill_ship::{self, ShipOutcome, SkillBundle},
+    host::skill_ship::{self, ShipMemo, ShipOutcome, SkillBundle, Transfer},
     launcher::LaunchRequest,
     node::{
         protocol::{
-            Frame, RunSpec, RunSpecKind, CAP_AGENT_ENGAGEMENT_PROFILE, CAP_AGENT_FINDINGS_PROFILE,
-            CAP_AGENT_SKILLS, CAP_FINDINGS_ARTIFACT_PULL,
+            Frame, RunSpec, RunSpecKind, ARTIFACT_CHUNK_BYTES, CAP_AGENT_ENGAGEMENT_PROFILE,
+            CAP_AGENT_FINDINGS_PROFILE, CAP_AGENT_SKILLS, CAP_AGENT_SKILL_BUNDLE,
+            CAP_FINDINGS_ARTIFACT_PULL,
         },
         NodeMirror, NodeRegistry,
     },
@@ -55,6 +60,31 @@ struct PullRegistration<'a> {
 impl Drop for PullRegistration<'_> {
     fn drop(&mut self) {
         self.conn.end_pull(self.req);
+    }
+}
+
+/// [`PullRegistration`] for a skill offer.
+struct OfferRegistration<'a> {
+    conn: &'a crate::node::NodeConn,
+    id: &'a str,
+}
+
+impl Drop for OfferRegistration<'_> {
+    fn drop(&mut self) {
+        self.conn.end_offer(self.id);
+    }
+}
+
+/// `layer:name` of each ref, for messages.
+fn named(refs: &[rupu_skills::ship::ShippedSkillRef]) -> String {
+    let names: Vec<String> = refs
+        .iter()
+        .map(|r| format!("{}:{}", r.layer, r.name))
+        .collect();
+    if names.is_empty() {
+        "none".to_string()
+    } else {
+        names.join(", ")
     }
 }
 
@@ -81,6 +111,9 @@ pub struct TunnelHostConnector {
     /// responses: a mirrored run is priced like the same run on every other
     /// surface (its recorded customer's layer; a legacy one as unknown).
     pub pricing: Arc<crate::customers::CustomerPricing>,
+    /// The skills this node confirmed it holds, and the lock that makes
+    /// concurrent ships to it one offer.
+    ship_memo: ShipMemo,
 }
 
 impl TunnelHostConnector {
@@ -98,6 +131,7 @@ impl TunnelHostConnector {
             mirror,
             run_store,
             pricing,
+            ship_memo: ShipMemo::default(),
         }
     }
 
@@ -109,6 +143,200 @@ impl TunnelHostConnector {
         self.registry.get(&self.node_id).ok_or_else(|| {
             HostConnectorError::Unreachable(format!("node {} is not connected", self.node_id))
         })
+    }
+
+    /// Why `conn` can't take shipped skills.
+    fn no_skill_bundle(&self, conn: &crate::node::NodeConn) -> String {
+        format!(
+            "host {id}: node {id} (rupu {}) can't receive shipped skills; upgrade rupu there",
+            conn.rupu_version().unwrap_or("unknown version"),
+            id = self.node_id,
+        )
+    }
+
+    /// Send `frame` (a `what`) down the tunnel, held to the idle bound: the
+    /// tunnel's write channel is bounded, and a node that stopped reading
+    /// leaves it full.
+    async fn send_bounded(
+        &self,
+        conn: &crate::node::NodeConn,
+        frame: Frame,
+        what: &str,
+    ) -> Result<(), HostConnectorError> {
+        tokio::time::timeout(ARTIFACT_PULL_IDLE_TIMEOUT, conn.send(frame))
+            .await
+            .map_err(|_| {
+                HostConnectorError::Unreachable(format!(
+                    "host {id}: node {id} took no {what} frame for {}s (its tunnel is not draining)",
+                    ARTIFACT_PULL_IDLE_TIMEOUT.as_secs(),
+                    id = self.node_id,
+                ))
+            })?
+            .map_err(|_| {
+                HostConnectorError::Unreachable(format!(
+                    "host {id}: node {id} disconnected before a {what} frame could be sent",
+                    id = self.node_id,
+                ))
+            })
+    }
+
+    /// The node's next answer to a skill offer, within the idle bound.
+    async fn next_offer_msg(
+        &self,
+        rx: &mut tokio::sync::mpsc::Receiver<crate::node::OfferMsg>,
+    ) -> Result<crate::node::OfferMsg, HostConnectorError> {
+        tokio::time::timeout(ARTIFACT_PULL_IDLE_TIMEOUT, rx.recv())
+            .await
+            .map_err(|_| {
+                HostConnectorError::Unreachable(format!(
+                    "host {id}: node {id} did not answer a skill offer for {}s",
+                    ARTIFACT_PULL_IDLE_TIMEOUT.as_secs(),
+                    id = self.node_id,
+                ))
+            })?
+            .ok_or_else(|| self.offer_disconnected())
+    }
+
+    fn offer_disconnected(&self) -> HostConnectorError {
+        HostConnectorError::Unreachable(format!(
+            "host {id}: node {id} disconnected during a skill offer",
+            id = self.node_id,
+        ))
+    }
+
+    /// Ship `pending` over the tunnel: `SkillsOffer`, the node's
+    /// `SkillsNeed`, each needed archive as ordered `SkillChunk`s, then its
+    /// `SkillsStored`, which must name exactly the skills it was sent.
+    async fn offer(
+        &self,
+        pending: Vec<Arc<rupu_skills::ship::PackedSkill>>,
+    ) -> Result<Transfer, HostConnectorError> {
+        use crate::node::OfferMsg;
+        use base64::Engine as _;
+        let who = format!("host {}", self.node_id);
+        // Looked up again: the ship lock may have been waited on across a
+        // reconnect, and an older node's frame parse is fatal.
+        let conn = self.live_conn()?;
+        if !conn.supports(CAP_AGENT_SKILL_BUNDLE) {
+            return Err(HostConnectorError::Unsupported(self.no_skill_bundle(&conn)));
+        }
+        let id = format!("skills_{}", Ulid::new());
+        let mut rx = conn.begin_offer(&id);
+        let _registered = OfferRegistration {
+            conn: &conn,
+            id: &id,
+        };
+        let offered: Vec<_> = pending.iter().map(|p| p.reference()).collect();
+        self.send_bounded(
+            &conn,
+            Frame::SkillsOffer {
+                id: id.clone(),
+                skills: offered.clone(),
+            },
+            "SkillsOffer",
+        )
+        .await?;
+
+        let needed = match self.next_offer_msg(&mut rx).await? {
+            OfferMsg::Need { error: Some(e), .. } => {
+                return Err(HostConnectorError::Invalid(format!("{who}: {e}")))
+            }
+            OfferMsg::Need {
+                skills,
+                error: None,
+            } => skills,
+            OfferMsg::Stored { .. } => {
+                return Err(HostConnectorError::Invalid(format!(
+                    "{who}: answered a skill offer with SkillsStored before SkillsNeed"
+                )))
+            }
+        };
+        let mut sending: Vec<usize> = Vec::with_capacity(needed.len());
+        for r in &needed {
+            let Some(i) = offered.iter().position(|o| o == r) else {
+                return Err(HostConnectorError::Invalid(format!(
+                    "{who}: the node asked for skill {}:{} ({}), which was not offered",
+                    r.layer, r.name, r.content_hash
+                )));
+            };
+            if sending.contains(&i) {
+                return Err(HostConnectorError::Invalid(format!(
+                    "{who}: the node asked for skill {}:{} twice",
+                    r.layer, r.name
+                )));
+            }
+            sending.push(i);
+        }
+        if needed.is_empty() {
+            return Ok(Transfer::Done);
+        }
+
+        // A node that fails the offer mid-transfer says so at once; stop
+        // sending it chunks it would drop.
+        let mut early = None;
+        'send: for &i in &sending {
+            let p = &pending[i];
+            // An empty archive is one empty `last` chunk.
+            let parts = p.bytes.len().div_ceil(ARTIFACT_CHUNK_BYTES).max(1);
+            for seq in 0..parts {
+                let start = seq * ARTIFACT_CHUNK_BYTES;
+                let end = (start + ARTIFACT_CHUNK_BYTES).min(p.bytes.len());
+                let frame = Frame::SkillChunk {
+                    id: id.clone(),
+                    layer: p.layer,
+                    name: p.name.clone(),
+                    hash: p.hash.hex(),
+                    seq: seq as u64,
+                    data_b64: base64::engine::general_purpose::STANDARD
+                        .encode(&p.bytes[start..end]),
+                    last: seq + 1 == parts,
+                };
+                self.send_bounded(&conn, frame, "SkillChunk").await?;
+                match rx.try_recv() {
+                    Ok(msg) => {
+                        early = Some(msg);
+                        break 'send;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        return Err(self.offer_disconnected())
+                    }
+                }
+            }
+        }
+
+        let answer = match early {
+            Some(msg) => msg,
+            None => self.next_offer_msg(&mut rx).await?,
+        };
+        match answer {
+            OfferMsg::Stored { error: Some(e), .. } => {
+                Err(HostConnectorError::Invalid(format!("{who}: {e}")))
+            }
+            OfferMsg::Stored {
+                stored,
+                error: None,
+            } => {
+                let key = |r: &rupu_skills::ship::ShippedSkillRef| {
+                    (r.layer, r.name.clone(), r.content_hash.clone())
+                };
+                let mut want: Vec<_> = needed.iter().map(key).collect();
+                let mut got: Vec<_> = stored.iter().map(key).collect();
+                want.sort();
+                got.sort();
+                if want != got {
+                    return Err(HostConnectorError::Invalid(format!(
+                        "{who}: the node reported storing {} but was sent {}",
+                        named(&stored),
+                        named(&needed)
+                    )));
+                }
+                Ok(Transfer::Done)
+            }
+            OfferMsg::Need { .. } => Err(HostConnectorError::Invalid(format!(
+                "{who}: answered one skill offer with SkillsNeed twice"
+            ))),
+        }
     }
 }
 
@@ -128,6 +356,7 @@ impl HostConnector for TunnelHostConnector {
         let run_id = format!("run_{}", Ulid::new());
 
         let spec = RunSpec {
+            skill_bundle: None,
             kind: RunSpecKind::Workflow,
             name: req.workflow.clone(),
             inputs: req.inputs.clone(),
@@ -180,9 +409,6 @@ impl HostConnector for TunnelHostConnector {
         // under: it travels in the `Run` frame, which every node passes on as
         // `rupu run --run-id`. Validated before anything is created.
         let run_id = req.run_id_or_mint().map_err(HostConnectorError::Invalid)?;
-        if req.skill_bundle.is_some() {
-            return Err(skill_ship::refuse_bundle_launch(&self.node_id));
-        }
         let run = req
             .agent_run(&run_id)
             .map_err(HostConnectorError::Invalid)?;
@@ -193,6 +419,7 @@ impl HostConnector for TunnelHostConnector {
         let conn = self.live_conn()?;
 
         let spec = RunSpec {
+            skill_bundle: req.skill_bundle.clone(),
             kind: RunSpecKind::Agent,
             name: req.agent.clone(),
             inputs: std::collections::BTreeMap::new(),
@@ -250,6 +477,17 @@ impl HostConnector for TunnelHostConnector {
                 conn.rupu_version().unwrap_or("unknown version"),
             )));
         }
+        // And `RunSpec.skill_bundle`: an older node would run the unit
+        // without the skills shipped to it.
+        if req.skill_bundle.is_some() && !conn.supports(CAP_AGENT_SKILL_BUNDLE) {
+            return Err(HostConnectorError::Unsupported(format!(
+                "host {id}: node {id} (rupu {}) does not support shipped skills on agent \
+                 launches, so this run's shipped skills cannot be delivered; upgrade rupu \
+                 on that node",
+                conn.rupu_version().unwrap_or("unknown version"),
+                id = self.node_id,
+            )));
+        }
 
         self.mirror
             .create_run(&run_id, &self.node_id, &spec)
@@ -280,12 +518,19 @@ impl HostConnector for TunnelHostConnector {
         Ok(run_id)
     }
 
+    /// Offer the bundle over the tunnel. A node without
+    /// [`CAP_AGENT_SKILL_BUNDLE`] is the P5 downgrade, decided per call
+    /// (never memoised): the node may reconnect upgraded.
     async fn ship_skills(&self, bundle: &SkillBundle) -> Result<ShipOutcome, HostConnectorError> {
-        Ok(if bundle.is_empty() {
-            ShipOutcome::NotNeeded
-        } else {
-            skill_ship::not_built(&self.node_id)
-        })
+        if bundle.is_empty() {
+            return Ok(ShipOutcome::NotNeeded);
+        }
+        let conn = self.live_conn()?;
+        if !conn.supports(CAP_AGENT_SKILL_BUNDLE) {
+            return Ok(ShipOutcome::Unsupported(self.no_skill_bundle(&conn)));
+        }
+        let who = format!("host {}", self.node_id);
+        skill_ship::ship_through(&self.ship_memo, bundle, &who, |pending| self.offer(pending)).await
     }
 
     async fn start_session(&self, _req: SessionStartRequest) -> Result<String, HostConnectorError> {
@@ -578,61 +823,80 @@ mod tests {
         (connector, rx, node_conn)
     }
 
-    /// A tunnel can't deliver shipped skills yet: `ship_skills` says so, and a
-    /// launch that carries a bundle anyway is refused, not run without it.
-    #[tokio::test]
-    async fn shipped_skills_are_unsupported_and_a_bundle_launch_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let (connector, mut rx, _node_conn) = pull_capable(dir.path());
-        let skill = dir.path().join("pdf");
+    fn one_skill(dir: &std::path::Path) -> SkillBundle {
+        let skill = dir.join("pdf");
         std::fs::create_dir_all(&skill).unwrap();
         std::fs::write(
             skill.join("SKILL.md"),
             "---\nname: pdf\ndescription: PDFs.\n---\n\nBody.\n",
         )
         .unwrap();
-        let bundle = SkillBundle::new(vec![Arc::new(
+        SkillBundle::new(vec![Arc::new(
             rupu_skills::load_skill(&skill, rupu_skills::Layer::Global).unwrap(),
-        )]);
-        assert!(matches!(
-            connector.ship_skills(&bundle).await.unwrap(),
-            ShipOutcome::Unsupported(m) if m.contains("node-x")
-        ));
-        assert_eq!(
-            connector
-                .ship_skills(&SkillBundle::default())
-                .await
-                .unwrap(),
-            ShipOutcome::NotNeeded
-        );
+        )])
+    }
 
-        let err = connector
-            .launch_agent(AgentLaunchRequest {
-                agent: "sec".into(),
-                prompt: Some("go".into()),
-                mode: None,
-                target: None,
-                working_dir: None,
-                run_id: None,
-                findings_profile: None,
-                engagement_profiles: Vec::new(),
-                skills: Vec::new(),
-                preload_skills: Vec::new(),
-                skill_bundle: Some(rupu_skills::ship::SkillBundleManifest {
-                    version: 1,
+    /// A finished offer leaves no routing entry behind.
+    #[tokio::test]
+    async fn a_finished_offer_forgets_its_routing_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (connector, mut rx, node_conn) = pull_capable(dir.path());
+        let bundle = one_skill(dir.path());
+        let task = tokio::spawn(async move { connector.ship_skills(&bundle).await });
+        let Some(Frame::SkillsOffer { id, .. }) = rx.recv().await else {
+            panic!("expected SkillsOffer")
+        };
+        assert_eq!(node_conn.offers_in_flight(), 1);
+        node_conn
+            .route_offer(
+                &id,
+                crate::node::OfferMsg::Need {
                     skills: Vec::new(),
-                }),
-                codename: None,
-            })
+                    error: None,
+                },
+            )
+            .await;
+        assert!(matches!(
+            task.await.unwrap().unwrap(),
+            ShipOutcome::Shipped(_)
+        ));
+        assert_eq!(node_conn.offers_in_flight(), 0);
+    }
+
+    /// A ship whose future is dropped mid-offer (its task aborted) still
+    /// forgets its routing entry.
+    #[tokio::test]
+    async fn an_abandoned_offer_forgets_its_routing_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (connector, mut rx, node_conn) = pull_capable(dir.path());
+        let bundle = one_skill(dir.path());
+        let task = tokio::spawn(async move { connector.ship_skills(&bundle).await });
+        assert!(matches!(rx.recv().await, Some(Frame::SkillsOffer { .. })));
+        assert_eq!(node_conn.offers_in_flight(), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(node_conn.offers_in_flight(), 0);
+    }
+
+    /// A node that never answers fails the offer on the idle bound rather
+    /// than holding the ship lock forever. (Paused time.)
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_node_fails_the_offer_on_the_idle_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let (connector, mut rx, node_conn) = pull_capable(dir.path());
+        let bundle = one_skill(dir.path());
+        let task = tokio::spawn(async move { connector.ship_skills(&bundle).await });
+        assert!(matches!(rx.recv().await, Some(Frame::SkillsOffer { .. })));
+        let err = tokio::time::timeout(ARTIFACT_PULL_IDLE_TIMEOUT * 2, task)
             .await
+            .expect("the offer must give up on the idle bound")
+            .unwrap()
             .unwrap_err();
         assert!(
-            matches!(&err, HostConnectorError::Unsupported(m)
-                if m.starts_with("host node-x: ") && m.contains("skill_bundle")),
+            matches!(&err, HostConnectorError::Unreachable(m) if m.contains("node-x")),
             "{err:?}"
         );
-        assert!(rx.try_recv().is_err(), "nothing was sent to the node");
-        assert!(connector.run_store.list().unwrap().is_empty());
+        assert_eq!(node_conn.offers_in_flight(), 0);
     }
 
     /// A finished pull leaves no routing entry behind.

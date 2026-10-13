@@ -322,6 +322,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 .route_pull(&req, crate::node::PullMsg::Done(error))
                                 .await;
                         }
+                        Frame::SkillsNeed { id, skills, error } => {
+                            conn_r
+                                .route_offer(&id, crate::node::OfferMsg::Need { skills, error })
+                                .await;
+                        }
+                        Frame::SkillsStored { id, stored, error } => {
+                            conn_r
+                                .route_offer(&id, crate::node::OfferMsg::Stored { stored, error })
+                                .await;
+                        }
                         other => {
                             warn!(
                                 frame_type = ?std::mem::discriminant(&other),
@@ -355,9 +365,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     // `remove` uses `Arc::ptr_eq` so a newer reconnect (different Arc) is never
     // clobbered by a stale disconnect handler.
     state.node_registry.remove(&node_id, &conn);
-    // A connector awaiting a pull over this tunnel holds its own `Arc` of
-    // `conn`, so the routing table outlives the pumps: close it so each
-    // waiter fails now rather than after its idle timeout.
+    // A connector awaiting a pull or a skill offer over this tunnel holds its
+    // own `Arc` of `conn`, so the routing tables outlive the pumps: close them
+    // so each waiter fails now rather than after its idle timeout.
     conn.close_pulls();
     info!(node_id, "node_tunnel: node disconnected");
 }

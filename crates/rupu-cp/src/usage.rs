@@ -1046,6 +1046,7 @@ pub(crate) mod tests {
         let store = std::sync::Arc::new(RunStore::new(tmp.join("runs")));
         let mirror = crate::node::NodeMirror::new(std::sync::Arc::clone(&store));
         let spec = crate::node::protocol::RunSpec {
+            skill_bundle: None,
             kind: crate::node::protocol::RunSpecKind::Workflow,
             name: "wf".into(),
             inputs: Default::default(),

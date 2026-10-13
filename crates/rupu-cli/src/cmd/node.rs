@@ -10,8 +10,10 @@
 //! artifact files, stream `Artifact` frames back; `Cancel` → kill
 //! child; `Ping` → `Pong`; `ArtifactPull` → stream a finding-artifact blob
 //! from this node's store, one chunk per loop turn, round-robin across
-//! concurrent pulls.  Reconnects with exponential backoff (1 s … 60 s cap)
-//! on disconnect.
+//! concurrent pulls; `SkillsOffer` → answer `SkillsNeed` with the shipped
+//! skills this node's cache lacks, take their `SkillChunk`s, verify and
+//! cache them off the loop, then answer `SkillsStored`.  Reconnects with
+//! exponential backoff (1 s … 60 s cap) on disconnect.
 //!
 //! **Enroll mode** (`rupu node enroll <name>`):
 //! Mints a tunnel host + one-time token in the local host store and
@@ -34,15 +36,17 @@ use std::process::ExitCode;
 use anyhow::Context as _;
 use clap::Subcommand;
 use futures_util::{SinkExt, StreamExt};
+use rupu_cp::host::bucket::poller::FAILURE_KEY;
 use rupu_cp::host::bucket::{Bucket, BucketError, ControlEnvelope, ObjectStoreBucket};
 use rupu_cp::node::protocol::{
     ArtifactFile, Auth, Frame, RunSpec, ARTIFACT_CHUNK_BYTES, CAP_USAGE_LEDGER,
 };
 use rupu_runtime::argv::{RunArgv, WorkflowControl};
 use rupu_runtime::spawn::SpawnSpec;
+use rupu_skills::ship::{self, ShippedSkillRef};
 use rupu_workspace::{enroll_node, HostStore};
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use ulid::Ulid;
 
 // ---------------------------------------------------------------------------
@@ -496,6 +500,20 @@ async fn connect_and_run(
     exe: &Path,
     global: &Path,
 ) -> anyhow::Result<()> {
+    let skills = SkillReceiver::new(global);
+    connect_and_run_with(cp_url, token, node_id, exe, global, skills).await
+}
+
+/// [`connect_and_run`] receiving shipped skills through `skills` (tests
+/// pass small limits).
+async fn connect_and_run_with(
+    cp_url: &str,
+    token: &str,
+    node_id: &str,
+    exe: &Path,
+    global: &Path,
+    mut skills: SkillReceiver,
+) -> anyhow::Result<()> {
     // Dial the CP.
     let (ws_stream, _) = tokio_tungstenite::connect_async(cp_url)
         .await
@@ -564,6 +582,7 @@ async fn connect_and_run(
             }
         };
         tokio::pin!(wait);
+        let skill_deadline = skills.next_deadline();
 
         let maybe_msg = tokio::select! {
             biased;
@@ -571,6 +590,20 @@ async fn connect_and_run(
                 None => break,                            // server closed cleanly
                 Some(m) => Some(m.context("recv frame")?),
             },
+            Some(joined) = skills.stores.join_next_with_id(), if !skills.stores.is_empty() => {
+                if let Some(frame) = skills.stored(joined) {
+                    send_frame(&mut sink, &frame).await;
+                }
+                None
+            }
+            _ = tokio::time::sleep_until(skill_deadline.unwrap_or_else(tokio::time::Instant::now)),
+                if skill_deadline.is_some() =>
+            {
+                for frame in skills.expire(tokio::time::Instant::now()) {
+                    send_frame(&mut sink, &frame).await;
+                }
+                None
+            }
             _ = &mut wait => None,
         };
 
@@ -770,13 +803,44 @@ async fn connect_and_run(
                 info!(req = %req, sha256 = %sha256, "node: ArtifactPull received");
                 pulls.push_back(ArtifactPullStream::new(global, req, sha256));
             }
+            Frame::SkillsOffer {
+                id,
+                skills: offered,
+            } => {
+                info!(id = %id, skills = offered.len(), "node: SkillsOffer received");
+                let need = skills.offer(id, offered);
+                send_frame(&mut sink, &need).await;
+            }
+            Frame::SkillChunk {
+                id,
+                layer,
+                name,
+                hash,
+                seq,
+                data_b64,
+                last,
+            } => {
+                let chunk = SkillChunkIn {
+                    layer,
+                    name,
+                    hash,
+                    seq,
+                    data_b64,
+                    last,
+                };
+                if let Some(failed) = skills.chunk(id, chunk) {
+                    send_frame(&mut sink, &failed).await;
+                }
+            }
             Frame::Hello { .. }
             | Frame::Welcome { .. }
             | Frame::Pong {}
             | Frame::Artifact { .. }
             | Frame::RunFinished { .. }
             | Frame::ArtifactChunk { .. }
-            | Frame::ArtifactPullDone { .. } => {
+            | Frame::ArtifactPullDone { .. }
+            | Frame::SkillsNeed { .. }
+            | Frame::SkillsStored { .. } => {
                 warn!(
                     frame = %serde_json::to_string(&frame).unwrap_or_else(|_| "?".into()),
                     "node: unexpected server-sent frame type (ignored)"
@@ -1094,6 +1158,440 @@ impl ArtifactPullStream {
         let file = opened
             .map_err(|e| format!("artifact {} is not in this node's store: {e}", self.sha256))?;
         Ok(tokio::fs::File::from_std(file))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shipped skills (unit-testable)
+// ---------------------------------------------------------------------------
+
+/// What a skill's archive may hold past the skill's own bytes: tar headers
+/// and padding.
+const SKILL_ARCHIVE_SLACK: u64 = 64 << 10;
+
+/// Most skill refs one tunnel offer or one bucket job's manifest may list.
+const MAX_SHIPPED_SKILL_REFS: usize = 256;
+
+/// How many failed offer ids a connection remembers, so the rest of a failed
+/// offer's chunks are dropped quietly instead of each answering an error.
+const FAILED_OFFERS_KEPT: usize = 64;
+
+/// What one connection accepts from its CP. A CP ships one offer at a time
+/// per host, so these bound a misbehaving peer, not a working one.
+#[derive(Clone, Debug)]
+struct SkillLimits {
+    /// Offers being received at once.
+    max_offers: usize,
+    /// Refs in one offer.
+    max_refs: usize,
+    /// Bytes in an offer id.
+    max_id_len: usize,
+    /// One skill's archive is capped at `skill + slack`; one offer's at
+    /// `bundle + needed * slack`.
+    skill: u64,
+    bundle: u64,
+    slack: u64,
+    /// Archive bytes held across every offer until they are stored.
+    buffered: u64,
+    /// An offer still waiting on chunks fails this long after its last frame.
+    idle: std::time::Duration,
+}
+
+impl Default for SkillLimits {
+    fn default() -> Self {
+        Self {
+            max_offers: 4,
+            max_refs: MAX_SHIPPED_SKILL_REFS,
+            max_id_len: 128,
+            skill: ship::MAX_SHIPPED_SKILL_BYTES,
+            bundle: ship::MAX_BUNDLE_BYTES,
+            slack: SKILL_ARCHIVE_SLACK,
+            buffered: ship::MAX_BUNDLE_BYTES + MAX_SHIPPED_SKILL_REFS as u64 * SKILL_ARCHIVE_SLACK,
+            idle: std::time::Duration::from_secs(120),
+        }
+    }
+}
+
+type StoreFn = fn(&Path, &ShippedSkillRef, &[u8]) -> Result<PathBuf, ship::ShipError>;
+
+/// The skill offers a connection is receiving: `SkillsOffer` → `SkillsNeed`
+/// (what the cache lacks) → `SkillChunk`s → `SkillsStored`. Each needed
+/// skill's archive is reassembled in `seq` order under [`SkillLimits`], then
+/// verified and cached by [`ship::store`] on the blocking pool — `stores` is
+/// polled by the connection loop, so a store never holds up inbound frames.
+/// An offer's first failure (a bad chunk, a cap, its idle expiry, a failed
+/// store) ends it with one `SkillsStored` error; nothing here closes the
+/// connection, and everything here is dropped with it.
+struct SkillReceiver {
+    cache: PathBuf,
+    limits: SkillLimits,
+    offers: HashMap<String, SkillOffer>,
+    /// Offers that failed, most recent last.
+    failed: VecDeque<String>,
+    stores: tokio::task::JoinSet<Result<PathBuf, ship::ShipError>>,
+    /// Which offer's skill each running store is.
+    tasks: HashMap<tokio::task::Id, StoreTask>,
+    /// Archive bytes held now: receiving buffers plus running stores'.
+    buffered: u64,
+    /// Tells a store's result from a later offer reusing its id.
+    next_gen: u64,
+    store: StoreFn,
+}
+
+struct SkillOffer {
+    gen: u64,
+    needed: Vec<ShippedSkillRef>,
+    parts: Vec<SkillPart>,
+    /// Archive bytes received across `needed`, and their cap.
+    received: u64,
+    bundle_cap: u64,
+    /// When the offer fails unless another frame comes.
+    deadline: tokio::time::Instant,
+}
+
+enum SkillPart {
+    Receiving { next_seq: u64, bytes: Vec<u8> },
+    Storing,
+    Stored,
+}
+
+struct StoreTask {
+    id: String,
+    gen: u64,
+    index: usize,
+    bytes: u64,
+}
+
+/// One `SkillChunk` frame's fields after its offer id.
+struct SkillChunkIn {
+    layer: rupu_skills::Layer,
+    name: String,
+    hash: String,
+    seq: u64,
+    data_b64: String,
+    last: bool,
+}
+
+fn skill_who(layer: rupu_skills::Layer, name: &str) -> String {
+    format!("{layer}:{name}")
+}
+
+impl SkillReceiver {
+    fn new(global: &Path) -> Self {
+        Self {
+            cache: ship::cache_dir(global),
+            limits: SkillLimits::default(),
+            offers: HashMap::new(),
+            failed: VecDeque::new(),
+            stores: tokio::task::JoinSet::new(),
+            tasks: HashMap::new(),
+            buffered: 0,
+            next_gen: 0,
+            store: ship::store,
+        }
+    }
+
+    /// The `SkillsNeed` answering an offer: the skills the cache lacks, or
+    /// why the offer is refused.
+    fn offer(&mut self, id: String, skills: Vec<ShippedSkillRef>) -> Frame {
+        if let Err(error) = self.check_offer(&id, &skills) {
+            // An oversized id is a misbehaving peer's: log its length, not
+            // its bytes, and answer under an empty id, which no offer has.
+            let id = if id.len() > self.limits.max_id_len {
+                warn!(id_len = id.len(), %error, "node: skill offer refused");
+                String::new()
+            } else {
+                warn!(id = %id, %error, "node: skill offer refused");
+                id
+            };
+            return Frame::SkillsNeed {
+                id,
+                skills: Vec::new(),
+                error: Some(error),
+            };
+        }
+        let needed = ship::missing(&self.cache, &skills);
+        // A reused id is a new offer.
+        self.failed.retain(|f| f != &id);
+        if !needed.is_empty() {
+            let gen = self.next_gen;
+            self.next_gen += 1;
+            self.offers.insert(
+                id.clone(),
+                SkillOffer {
+                    gen,
+                    parts: needed
+                        .iter()
+                        .map(|_| SkillPart::Receiving {
+                            next_seq: 0,
+                            bytes: Vec::new(),
+                        })
+                        .collect(),
+                    received: 0,
+                    bundle_cap: self.limits.bundle + needed.len() as u64 * self.limits.slack,
+                    needed: needed.clone(),
+                    deadline: tokio::time::Instant::now() + self.limits.idle,
+                },
+            );
+        }
+        Frame::SkillsNeed {
+            id,
+            skills: needed,
+            error: None,
+        }
+    }
+
+    fn check_offer(&self, id: &str, skills: &[ShippedSkillRef]) -> Result<(), String> {
+        let l = &self.limits;
+        if id.len() > l.max_id_len {
+            return Err(format!(
+                "skill offer id is {} bytes, over the {}-byte limit",
+                id.len(),
+                l.max_id_len
+            ));
+        }
+        if self.offers.contains_key(id) {
+            return Err(format!("skill offer `{id}` is already open on this node"));
+        }
+        if self.offers.len() >= l.max_offers {
+            return Err("too many skill offers in flight".to_string());
+        }
+        if skills.len() > l.max_refs {
+            return Err(format!(
+                "skill offer `{id}` lists {} skills, over the limit of {}",
+                skills.len(),
+                l.max_refs
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for r in skills {
+            r.validate().map_err(|e| e.to_string())?;
+            if !seen.insert((r.layer, r.name.as_str())) {
+                return Err(format!(
+                    "skill {} is offered twice",
+                    skill_who(r.layer, &r.name)
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Take one chunk of offer `id`. A skill's last chunk sends its archive
+    /// to be stored; the answer, if any, is the offer's failure.
+    fn chunk(&mut self, id: String, c: SkillChunkIn) -> Option<Frame> {
+        if id.len() > self.limits.max_id_len {
+            // Answering would mean remembering it as failed.
+            debug!(
+                len = id.len(),
+                "node: skill chunk with an oversized offer id (dropped)"
+            );
+            return None;
+        }
+        let Some(offer) = self.offers.get_mut(&id) else {
+            if self.failed.contains(&id) {
+                debug!(id = %id, "node: chunk for a failed skill offer (dropped)");
+                return None;
+            }
+            let error = format!(
+                "skill {}: no skill offer `{id}` is open on this node",
+                skill_who(c.layer, &c.name)
+            );
+            return Some(self.fail(id, error));
+        };
+        offer.deadline = tokio::time::Instant::now() + self.limits.idle;
+        match offer.take(&id, c, &self.limits, &mut self.buffered) {
+            Err(error) => Some(self.fail(id, error)),
+            Ok(None) => None,
+            Ok(Some((index, bytes))) => {
+                let (r, cache, store) =
+                    (offer.needed[index].clone(), self.cache.clone(), self.store);
+                let task = StoreTask {
+                    id,
+                    gen: offer.gen,
+                    index,
+                    bytes: bytes.len() as u64,
+                };
+                let handle = self
+                    .stores
+                    .spawn_blocking(move || store(&cache, &r, &bytes));
+                self.tasks.insert(handle.id(), task);
+                None
+            }
+        }
+    }
+
+    /// Settle a finished store: the offer's `SkillsStored` once every
+    /// needed skill is stored, its failure (a store error or a panic), or
+    /// nothing yet. A store for an offer that has since failed is ignored.
+    fn stored(
+        &mut self,
+        joined: Result<(tokio::task::Id, Result<PathBuf, ship::ShipError>), tokio::task::JoinError>,
+    ) -> Option<Frame> {
+        let (task_id, result) = match joined {
+            Ok((task_id, stored)) => (task_id, stored.map(|_| ()).map_err(|e| e.to_string())),
+            Err(e) => (e.id(), Err(format!("storing it failed: {e}"))),
+        };
+        let Some(task) = self.tasks.remove(&task_id) else {
+            warn!(task = %task_id, "node: unknown skill store finished");
+            return None;
+        };
+        self.buffered -= task.bytes;
+        let offer = self
+            .offers
+            .get_mut(&task.id)
+            .filter(|o| o.gen == task.gen)?;
+        if let Err(error) = result {
+            let r = &offer.needed[task.index];
+            let error = format!("skill {}: {error}", skill_who(r.layer, &r.name));
+            return Some(self.fail(task.id, error));
+        }
+        offer.parts[task.index] = SkillPart::Stored;
+        if !offer.parts.iter().all(|p| matches!(p, SkillPart::Stored)) {
+            return None;
+        }
+        let offer = self.offers.remove(&task.id)?;
+        info!(id = %task.id, skills = offer.needed.len(), "node: shipped skills stored");
+        Some(Frame::SkillsStored {
+            id: task.id,
+            stored: offer.needed,
+            error: None,
+        })
+    }
+
+    /// When the next offer still waiting on chunks goes idle.
+    fn next_deadline(&self) -> Option<tokio::time::Instant> {
+        self.offers
+            .values()
+            .filter(|o| o.waiting_on().is_some())
+            .map(|o| o.deadline)
+            .min()
+    }
+
+    /// Fail every offer still waiting on chunks whose deadline has passed.
+    fn expire(&mut self, now: tokio::time::Instant) -> Vec<Frame> {
+        let idle: Vec<(String, String)> = self
+            .offers
+            .iter()
+            .filter(|(_, o)| o.deadline <= now)
+            .filter_map(|(id, o)| o.waiting_on().map(|who| (id.clone(), who)))
+            .collect();
+        idle.into_iter()
+            .map(|(id, who)| {
+                let error = format!(
+                    "offer idle for {:?} waiting on skill {who}",
+                    self.limits.idle
+                );
+                self.fail(id, error)
+            })
+            .collect()
+    }
+
+    /// End offer `id` with `error`, freeing its buffers and remembering it so
+    /// its remaining chunks are dropped. A store it has running finishes and
+    /// is ignored.
+    fn fail(&mut self, id: String, error: String) -> Frame {
+        warn!(id = %id, %error, "node: skill offer failed");
+        if let Some(offer) = self.offers.remove(&id) {
+            self.buffered -= offer.receiving_bytes();
+        }
+        if !self.failed.contains(&id) {
+            if self.failed.len() == FAILED_OFFERS_KEPT {
+                self.failed.pop_front();
+            }
+            self.failed.push_back(id.clone());
+        }
+        Frame::SkillsStored {
+            id,
+            stored: Vec::new(),
+            error: Some(error),
+        }
+    }
+}
+
+impl SkillOffer {
+    /// Append one chunk to the skill it names, counting it in the
+    /// connection's `buffered` bytes. `Ok(Some)` hands back a skill's whole
+    /// archive when the chunk was its last.
+    fn take(
+        &mut self,
+        id: &str,
+        c: SkillChunkIn,
+        limits: &SkillLimits,
+        buffered: &mut u64,
+    ) -> Result<Option<(usize, Vec<u8>)>, String> {
+        use base64::Engine as _;
+        let who = skill_who(c.layer, &c.name);
+        let index = self
+            .needed
+            .iter()
+            .position(|r| r.layer == c.layer && r.name == c.name && r.content_hash == c.hash)
+            .ok_or_else(|| format!("skill {who} ({}) was not asked for in offer `{id}`", c.hash))?;
+        let SkillPart::Receiving { next_seq, bytes } = &mut self.parts[index] else {
+            return Err(format!(
+                "skill {who}: chunk {} came after its last chunk",
+                c.seq
+            ));
+        };
+        if c.seq != *next_seq {
+            return Err(format!(
+                "skill {who}: chunk {} came where chunk {next_seq} was expected",
+                c.seq
+            ));
+        }
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(&c.data_b64)
+            .map_err(|e| format!("skill {who}: chunk {} is not base64: {e}", c.seq))?;
+        let len = data.len() as u64;
+        let skill_cap = limits.skill + limits.slack;
+        if bytes.len() as u64 + len > skill_cap {
+            return Err(format!(
+                "skill {who}: its archive is over the {skill_cap}-byte limit for a shipped skill"
+            ));
+        }
+        if self.received + len > self.bundle_cap {
+            return Err(format!(
+                "skill {who}: offer `{id}`'s archives are over the {}-byte limit for one unit",
+                self.bundle_cap
+            ));
+        }
+        if *buffered + len > limits.buffered {
+            return Err(format!(
+                "skill {who}: this node is holding {} bytes of shipped skills, and this chunk \
+                 would pass its {}-byte limit",
+                *buffered, limits.buffered
+            ));
+        }
+        bytes.extend_from_slice(&data);
+        *next_seq += 1;
+        self.received += len;
+        *buffered += len;
+        if !c.last {
+            return Ok(None);
+        }
+        let bytes = std::mem::take(bytes);
+        self.parts[index] = SkillPart::Storing;
+        Ok(Some((index, bytes)))
+    }
+
+    /// The first skill still receiving chunks, if any: an offer whose skills
+    /// are all being stored waits on this node, not on its CP.
+    fn waiting_on(&self) -> Option<String> {
+        self.needed
+            .iter()
+            .zip(&self.parts)
+            .find(|(_, p)| matches!(p, SkillPart::Receiving { .. }))
+            .map(|(r, _)| skill_who(r.layer, &r.name))
+    }
+
+    /// Bytes held in buffers still receiving.
+    fn receiving_bytes(&self) -> u64 {
+        self.parts
+            .iter()
+            .map(|p| match p {
+                SkillPart::Receiving { bytes, .. } => bytes.len() as u64,
+                SkillPart::Storing | SkillPart::Stored => 0,
+            })
+            .sum()
     }
 }
 
@@ -1514,12 +2012,26 @@ async fn finish_if_terminal(
 /// whose marker has not landed yet; the ones that still fail stay in `pending`
 /// for the next tick. A job nobody marked would stay claimed and unfinished
 /// forever.
-async fn flush_failed_markers(bucket: &dyn Bucket, pending: &mut Vec<String>) {
+///
+/// The reason goes out first, as the run's `failure.txt` result: the marker
+/// ends the coordinator's poll, so a reason written after it would be lost.
+/// (The key is neither `run.json` nor a `.jsonl` stream, which an older
+/// poller's `classify_key` skips as unknown.)
+async fn flush_failed_markers(bucket: &dyn Bucket, pending: &mut Vec<FailedJob>) {
     let mut still = Vec::new();
-    for rid in pending.drain(..) {
-        if let Err(e) = bucket.put_finished(&rid, "failed").await {
+    for job in pending.drain(..) {
+        let rid = &job.run_id;
+        if let Err(e) = bucket
+            .put_result(rid, FAILURE_KEY, job.reason.as_bytes())
+            .await
+        {
+            warn!(run_id = %rid, error = %e, "node pull: failure reason did not land; will retry");
+            still.push(job);
+            continue;
+        }
+        if let Err(e) = bucket.put_finished(rid, "failed").await {
             warn!(run_id = %rid, error = %e, "node pull: put_finished(failed) after a spawn failure did not land; will retry");
-            still.push(rid);
+            still.push(job);
         }
     }
     *pending = still;
@@ -1538,12 +2050,28 @@ struct PendingJobs {
     unfetched: Vec<String>,
     /// Claimed jobs that cannot run (spawn failed, spec unusable) whose
     /// `failed` marker has not landed yet ([`flush_failed_markers`]).
-    failed_unmarked: Vec<String>,
+    failed_unmarked: Vec<FailedJob>,
 }
 
 impl PendingJobs {
     fn is_empty(&self) -> bool {
         self.unfetched.is_empty() && self.failed_unmarked.is_empty()
+    }
+}
+
+/// A claimed job that cannot run, and why.
+#[derive(Debug, PartialEq, Eq)]
+struct FailedJob {
+    run_id: String,
+    reason: String,
+}
+
+impl FailedJob {
+    fn new(run_id: String, reason: impl Into<String>) -> Self {
+        Self {
+            run_id,
+            reason: reason.into(),
+        }
     }
 }
 
@@ -1588,7 +2116,7 @@ async fn bucket_tick(
     active: &mut HashMap<String, BucketRunState>,
     pending: &mut PendingJobs,
 ) -> ClaimOutcome {
-    let outcome = claim_new_jobs(bucket, exe, host_id, active, pending).await;
+    let outcome = claim_new_jobs(bucket, exe, host_id, global, active, pending).await;
     // First attempt right away; a marker that did not land is retried on
     // every later tick until it does.
     flush_failed_markers(bucket, &mut pending.failed_unmarked).await;
@@ -1606,13 +2134,14 @@ async fn claim_new_jobs(
     bucket: &dyn Bucket,
     exe: &Path,
     host_id: &str,
+    global: &Path,
     active: &mut HashMap<String, BucketRunState>,
     pending: &mut PendingJobs,
 ) -> ClaimOutcome {
     let mut outcome = ClaimOutcome::default();
     // Specs that could not be fetched on an earlier tick come first.
     for run_id in std::mem::take(&mut pending.unfetched) {
-        start_claimed_job(bucket, exe, run_id, active, pending).await;
+        start_claimed_job(bucket, exe, global, run_id, active, pending).await;
     }
     let job_ids = match bucket.list_jobs().await {
         Ok(ids) => ids,
@@ -1638,7 +2167,7 @@ async fn claim_new_jobs(
             }
         }
         info!(run_id = %run_id, "node pull: claimed job");
-        start_claimed_job(bucket, exe, run_id, active, pending).await;
+        start_claimed_job(bucket, exe, global, run_id, active, pending).await;
     }
     outcome
 }
@@ -1650,10 +2179,14 @@ async fn claim_new_jobs(
 /// - the job object is gone, or the spec does not deserialize: the job is
 ///   unusable and a retry cannot fix it, so it is marked `failed` (same as a
 ///   spawn failure) rather than ending the worker.
+/// - the spec carries a skill bundle: every skill the worker's cache lacks is
+///   downloaded first ([`fetch_bundle_skills`]); a transient bucket error
+///   parks the job in `pending.unfetched`, anything else marks it `failed`.
 /// - spawn fails: marked `failed`.
 async fn start_claimed_job(
     bucket: &dyn Bucket,
     exe: &Path,
+    global: &Path,
     run_id: String,
     active: &mut HashMap<String, BucketRunState>,
     pending: &mut PendingJobs,
@@ -1662,7 +2195,9 @@ async fn start_claimed_job(
         Ok(b) => b,
         Err(BucketError::NotFound(_)) => {
             warn!(run_id = %run_id, "node pull: claimed job has no spec object; marking it failed");
-            pending.failed_unmarked.push(run_id);
+            pending
+                .failed_unmarked
+                .push(FailedJob::new(run_id, "the job's spec object is missing"));
             return;
         }
         Err(e) => {
@@ -1675,10 +2210,28 @@ async fn start_claimed_job(
         Ok(spec) => spec,
         Err(e) => {
             warn!(run_id = %run_id, error = %e, "node pull: job spec is malformed; marking it failed");
-            pending.failed_unmarked.push(run_id);
+            pending.failed_unmarked.push(FailedJob::new(
+                run_id,
+                format!("the job spec is malformed: {e}"),
+            ));
             return;
         }
     };
+    if let Some(manifest) = &spec.skill_bundle {
+        match fetch_bundle_skills(bucket, global, manifest, MAX_SKILL_ARCHIVE_BYTES).await {
+            Ok(()) => {}
+            Err(SkillFetchError::Transient(e)) => {
+                warn!(run_id = %run_id, error = %e, "node pull: skill download failed; will retry next tick");
+                pending.unfetched.push(run_id);
+                return;
+            }
+            Err(SkillFetchError::Permanent(e)) => {
+                warn!(run_id = %run_id, error = %e, "node pull: the job's skills are unusable; marking it failed");
+                pending.failed_unmarked.push(FailedJob::new(run_id, e));
+                return;
+            }
+        }
+    }
     match spawn_run(exe, &run_id, &spec) {
         Ok(child) => {
             info!(run_id = %run_id, "node pull: run spawned");
@@ -1693,9 +2246,99 @@ async fn start_claimed_job(
         }
         Err(e) => {
             warn!(run_id = %run_id, error = %e, "node pull: spawn failed");
-            pending.failed_unmarked.push(run_id);
+            pending
+                .failed_unmarked
+                .push(FailedJob::new(run_id, format!("spawn failed: {e:#}")));
         }
     }
+}
+
+/// Why a job's skills could not be made available.
+#[derive(Debug)]
+enum SkillFetchError {
+    /// A bucket hiccup: the job stays claimed and is retried next tick.
+    Transient(String),
+    /// Retrying cannot help (invalid manifest, object gone, over the cap, a
+    /// tampered archive): the job fails.
+    Permanent(String),
+}
+
+/// What a worker accepts of one skill's archive (the tree cap plus tar framing).
+const MAX_SKILL_ARCHIVE_BYTES: u64 = rupu_skills::ship::MAX_SHIPPED_SKILL_BYTES + 64 * 1024;
+
+/// Download and cache every skill of `manifest` the worker's cache lacks. The
+/// run may start only when this returns `Ok`: each skill was verified against
+/// its manifest hash by `store` before it counted as cached.
+async fn fetch_bundle_skills(
+    bucket: &dyn Bucket,
+    global: &Path,
+    manifest: &rupu_skills::ship::SkillBundleManifest,
+    max_bytes: u64,
+) -> Result<(), SkillFetchError> {
+    use rupu_skills::ship;
+    manifest
+        .validate()
+        .map_err(|e| SkillFetchError::Permanent(format!("invalid skill bundle: {e}")))?;
+    if manifest.skills.len() > MAX_SHIPPED_SKILL_REFS {
+        return Err(SkillFetchError::Permanent(format!(
+            "invalid skill bundle: {} skills, over the limit of {MAX_SHIPPED_SKILL_REFS}",
+            manifest.skills.len()
+        )));
+    }
+    let cache = ship::cache_dir(global);
+    let missing = ship::missing(&cache, &manifest.skills);
+    // Two skills with identical content share a hash: one download, a store
+    // under each name. An archive is dropped once its last ref is stored.
+    let mut refs_left: HashMap<&str, usize> = HashMap::new();
+    for r in &missing {
+        *refs_left.entry(r.content_hash.as_str()).or_default() += 1;
+    }
+    let mut fetched: HashMap<String, std::sync::Arc<Vec<u8>>> = HashMap::new();
+    for r in &missing {
+        let what = format!("{}:{}", r.layer, r.name);
+        let left = refs_left
+            .get_mut(r.content_hash.as_str())
+            .expect("every missing ref was counted");
+        *left -= 1;
+        let cached = if *left == 0 {
+            fetched.remove(&r.content_hash)
+        } else {
+            fetched.get(&r.content_hash).cloned()
+        };
+        let bytes = match cached {
+            Some(b) => b,
+            None => {
+                let b = std::sync::Arc::new(download_skill(bucket, r, max_bytes, &what).await?);
+                if *left > 0 {
+                    fetched.insert(r.content_hash.clone(), b.clone());
+                }
+                b
+            }
+        };
+        let (c, r2) = (cache.clone(), r.clone());
+        tokio::task::spawn_blocking(move || ship::store(&c, &r2, &bytes))
+            .await
+            .map_err(|e| SkillFetchError::Permanent(format!("skill {what}: {e}")))?
+            .map_err(|e| SkillFetchError::Permanent(format!("skill {what}: {e}")))?;
+    }
+    Ok(())
+}
+
+/// One skill's archive from the bucket. Only an `Io` is worth another tick:
+/// an absent or over-cap object stays that way.
+async fn download_skill(
+    bucket: &dyn Bucket,
+    r: &rupu_skills::ship::ShippedSkillRef,
+    max_bytes: u64,
+    what: &str,
+) -> Result<Vec<u8>, SkillFetchError> {
+    bucket
+        .get_skill(&r.content_hash, max_bytes)
+        .await
+        .map_err(|e| match e {
+            BucketError::Io(m) => SkillFetchError::Transient(format!("skill {what}: {m}")),
+            e => SkillFetchError::Permanent(format!("skill {what}: {e}")),
+        })
 }
 
 /// Step 2: drain every active run — routine uploads, queued control messages,
@@ -2294,6 +2937,12 @@ mod tests {
             }
             std::fs::write(dest, body).map_err(|e| BucketError::Io(e.to_string()))
         }
+        async fn put_skill(&self, _: &str, _: &[u8]) -> Result<(), BucketError> {
+            unreachable!("the terminal pass never ships skills")
+        }
+        async fn get_skill(&self, _: &str, _: u64) -> Result<Vec<u8>, BucketError> {
+            unreachable!("the terminal pass never reads skills")
+        }
     }
 
     const RUN_JSON: &[u8] = b"{\"status\":\"completed\"}";
@@ -2705,6 +3354,8 @@ mod tests {
         fail_list_jobs: std::sync::atomic::AtomicBool,
         fail_claim_job: std::sync::atomic::AtomicBool,
         fail_get_job: std::sync::atomic::AtomicBool,
+        fail_get_skill: std::sync::atomic::AtomicBool,
+        get_skill_calls: std::sync::atomic::AtomicUsize,
     }
 
     impl FlakyJobBucket {
@@ -2714,6 +3365,8 @@ mod tests {
                 fail_list_jobs: Default::default(),
                 fail_claim_job: Default::default(),
                 fail_get_job: Default::default(),
+                fail_get_skill: Default::default(),
+                get_skill_calls: Default::default(),
             }
         }
 
@@ -2796,6 +3449,17 @@ mod tests {
                 .get_artifact_to_file(sha256, dest, max_bytes)
                 .await
         }
+        async fn put_skill(&self, hash: &str, bytes: &[u8]) -> Result<(), BucketError> {
+            self.inner.put_skill(hash, bytes).await
+        }
+        async fn get_skill(&self, hash: &str, max_bytes: u64) -> Result<Vec<u8>, BucketError> {
+            self.get_skill_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if Self::is_on(&self.fail_get_skill) {
+                return Err(BucketError::Io("injected get_skill failure".into()));
+            }
+            self.inner.get_skill(hash, max_bytes).await
+        }
     }
 
     /// A harmless stand-in for the `rupu` executable: exits at once, ignoring
@@ -2804,6 +3468,7 @@ mod tests {
 
     fn agent_job(name: &str) -> Vec<u8> {
         serde_json::to_vec(&RunSpec {
+            skill_bundle: None,
             kind: RunSpecKind::Agent,
             name: name.to_string(),
             inputs: BTreeMap::new(),
@@ -2991,6 +3656,531 @@ mod tests {
         assert!(pending.is_empty());
     }
 
+    /// A real packed skill `name` plus a job whose spec carries it as a bundle.
+    fn skill_job(
+        name: &str,
+    ) -> (
+        rupu_skills::ship::PackedSkill,
+        rupu_skills::ship::ShippedSkillRef,
+        Vec<u8>,
+    ) {
+        let src = tempdir().unwrap();
+        let dir = src.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: d\n---\nbody\n"),
+        )
+        .unwrap();
+        let skill = rupu_skills::load_skill(&dir, rupu_skills::Layer::Global).unwrap();
+        let packed = rupu_skills::ship::pack_skill(&skill).unwrap();
+        let r = packed.reference();
+        let mut spec: RunSpec = serde_json::from_slice(&agent_job("a")).unwrap();
+        spec.skill_bundle = Some(rupu_skills::ship::SkillBundleManifest {
+            version: 1,
+            skills: vec![r.clone()],
+        });
+        (packed, r, serde_json::to_vec(&spec).unwrap())
+    }
+
+    /// A stand-in `rupu` that records its argv (one arg per line, written
+    /// atomically) into the returned file; exec-ready before it is spawned.
+    fn argv_script(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let argv_file = dir.join("argv.txt");
+        let exe = crate::test_support::exec_ready_script(
+            &dir.join("fake-rupu"),
+            &format!(
+                "printf '%s\\n' \"$@\" > '{0}.tmp' && mv '{0}.tmp' '{0}'\n",
+                argv_file.display()
+            ),
+        );
+        (exe, argv_file)
+    }
+
+    /// The manifest a recorded `rupu run` argv carries as `--skill-bundle=`.
+    fn bundle_in_argv(argv_file: &Path) -> rupu_skills::ship::SkillBundleManifest {
+        let argv = std::fs::read_to_string(argv_file).unwrap();
+        let bundles: Vec<&str> = argv
+            .lines()
+            .filter_map(|a| a.strip_prefix("--skill-bundle="))
+            .collect();
+        assert_eq!(bundles.len(), 1, "{argv}");
+        serde_json::from_str(bundles[0]).unwrap()
+    }
+
+    /// The manifest a job's spec carries.
+    fn r_manifest(job: &[u8]) -> rupu_skills::ship::SkillBundleManifest {
+        let spec: RunSpec = serde_json::from_slice(job).unwrap();
+        spec.skill_bundle.unwrap()
+    }
+
+    /// The pieces a skill-bundle test needs: the worker's global dir, and its
+    /// `runs` root beside it (`tick` derives `global` from `runs_root`).
+    fn worker_dirs() -> (tempfile::TempDir, std::path::PathBuf) {
+        let global = tempdir().unwrap();
+        let runs = global.path().join("runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        (global, runs)
+    }
+
+    /// A job with a bundle: the missing skill is downloaded into the cache and
+    /// the run is spawned with `--skill-bundle=`.
+    #[tokio::test]
+    async fn a_job_with_a_skill_bundle_downloads_it_and_spawns_with_the_bundle() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let bucket = FlakyJobBucket::new();
+        let (packed, r, job) = skill_job("alpha");
+        bucket
+            .put_skill(&r.content_hash, &packed.bytes)
+            .await
+            .unwrap();
+        bucket.put_job("run_S", &job).await.unwrap();
+        let (global, runs) = worker_dirs();
+        let (exe, argv_file) = argv_script(global.path());
+        let (mut active, mut pending) = (HashMap::new(), PendingJobs::default());
+
+        bucket_tick(
+            &bucket,
+            &exe,
+            "host_1",
+            &runs,
+            global.path(),
+            &mut active,
+            &mut pending,
+        )
+        .await;
+
+        let cache = rupu_skills::ship::cache_dir(global.path());
+        assert!(rupu_skills::ship::cached_path(&cache, &r)
+            .join("SKILL.md")
+            .is_file());
+        assert!(active.contains_key("run_S") && pending.is_empty());
+        assert_eq!(bucket.get_skill_calls.load(SeqCst), 1);
+        let mut child = active.remove("run_S").unwrap().child;
+        child.wait().await.unwrap();
+        assert_eq!(bundle_in_argv(&argv_file), r_manifest(&job));
+    }
+
+    /// A skill already in the cache is not downloaded again.
+    #[tokio::test]
+    async fn a_cached_skill_is_not_downloaded() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let bucket = FlakyJobBucket::new();
+        let (packed, r, job) = skill_job("alpha");
+        bucket.put_job("run_S", &job).await.unwrap();
+        let (global, runs) = worker_dirs();
+        rupu_skills::ship::store(
+            &rupu_skills::ship::cache_dir(global.path()),
+            &r,
+            &packed.bytes,
+        )
+        .unwrap();
+        let (mut active, mut pending) = (HashMap::new(), PendingJobs::default());
+
+        tick(&bucket, &runs, &mut active, &mut pending).await;
+
+        assert_eq!(bucket.get_skill_calls.load(SeqCst), 0);
+        assert!(active.contains_key("run_S"));
+    }
+
+    /// An absent skill object fails the job (marked `failed`), naming
+    /// `layer:name`; nothing is cached and nothing spawns.
+    #[tokio::test]
+    async fn a_missing_skill_object_fails_the_job_naming_the_skill() {
+        let bucket = FlakyJobBucket::new();
+        let (_packed, _r, job) = skill_job("alpha");
+        bucket.put_job("run_S", &job).await.unwrap();
+        let (global, runs) = worker_dirs();
+        let (mut active, mut pending) = (HashMap::new(), PendingJobs::default());
+
+        tick(&bucket, &runs, &mut active, &mut pending).await;
+
+        assert!(active.is_empty() && pending.is_empty());
+        assert_eq!(
+            bucket.get_finished("run_S").await.unwrap().as_deref(),
+            Some("failed")
+        );
+        let spec: RunSpec = serde_json::from_slice(&job).unwrap();
+        let err = fetch_bundle_skills(
+            &bucket,
+            global.path(),
+            spec.skill_bundle.as_ref().unwrap(),
+            MAX_SKILL_ARCHIVE_BYTES,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, SkillFetchError::Permanent(m) if m.contains("global:alpha")),
+            "{err:?}"
+        );
+    }
+
+    /// An object whose bytes do not match the manifest hash fails the job and
+    /// caches nothing.
+    #[tokio::test]
+    async fn a_tampered_skill_fails_the_job_and_caches_nothing() {
+        let bucket = FlakyJobBucket::new();
+        let (_good, r, job) = skill_job("alpha");
+        let (other, _, _) = skill_job("beta");
+        // Valid archive, but of a different skill than the manifest names.
+        bucket
+            .put_skill(&r.content_hash, &other.bytes)
+            .await
+            .unwrap();
+        bucket.put_job("run_S", &job).await.unwrap();
+        let (global, runs) = worker_dirs();
+        let (mut active, mut pending) = (HashMap::new(), PendingJobs::default());
+
+        tick(&bucket, &runs, &mut active, &mut pending).await;
+
+        assert!(active.is_empty() && pending.is_empty());
+        assert_eq!(
+            bucket.get_finished("run_S").await.unwrap().as_deref(),
+            Some("failed")
+        );
+        let cache = rupu_skills::ship::cache_dir(global.path());
+        assert!(!rupu_skills::ship::cached_path(&cache, &r).exists());
+        let spec: RunSpec = serde_json::from_slice(&job).unwrap();
+        let err = fetch_bundle_skills(
+            &bucket,
+            global.path(),
+            spec.skill_bundle.as_ref().unwrap(),
+            MAX_SKILL_ARCHIVE_BYTES,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, SkillFetchError::Permanent(m) if m.contains("global:alpha")),
+            "{err:?}"
+        );
+    }
+
+    /// A transient `get_skill` error leaves the job claimed and pending; the
+    /// next tick downloads the skill and starts it.
+    #[tokio::test]
+    async fn a_transient_skill_download_error_is_retried_next_tick() {
+        let bucket = FlakyJobBucket::new();
+        let (packed, r, job) = skill_job("alpha");
+        bucket
+            .put_skill(&r.content_hash, &packed.bytes)
+            .await
+            .unwrap();
+        bucket.put_job("run_S", &job).await.unwrap();
+        FlakyJobBucket::set(&bucket.fail_get_skill, true);
+        let (_global, runs) = worker_dirs();
+        let (mut active, mut pending) = (HashMap::new(), PendingJobs::default());
+
+        tick(&bucket, &runs, &mut active, &mut pending).await;
+        assert!(active.is_empty());
+        assert_eq!(pending.unfetched, ["run_S"]);
+        assert!(pending.failed_unmarked.is_empty());
+
+        FlakyJobBucket::set(&bucket.fail_get_skill, false);
+        tick(&bucket, &runs, &mut active, &mut pending).await;
+        assert!(active.contains_key("run_S"), "started on the retry");
+        assert!(pending.is_empty());
+    }
+
+    /// A manifest that does not validate fails the job before any download.
+    #[tokio::test]
+    async fn an_invalid_skill_manifest_fails_the_job() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let bucket = FlakyJobBucket::new();
+        let (_p, _r, job) = skill_job("alpha");
+        let mut spec: RunSpec = serde_json::from_slice(&job).unwrap();
+        spec.skill_bundle.as_mut().unwrap().version = 9;
+        bucket
+            .put_job("run_S", &serde_json::to_vec(&spec).unwrap())
+            .await
+            .unwrap();
+        let (_global, runs) = worker_dirs();
+        let (mut active, mut pending) = (HashMap::new(), PendingJobs::default());
+
+        tick(&bucket, &runs, &mut active, &mut pending).await;
+
+        assert!(active.is_empty() && pending.is_empty());
+        assert_eq!(bucket.get_skill_calls.load(SeqCst), 0);
+        assert_eq!(
+            bucket.get_finished("run_S").await.unwrap().as_deref(),
+            Some("failed")
+        );
+    }
+
+    /// End to end across the real halves: the CP's bucket connector ships a
+    /// skill and launches a unit with the manifest; the real worker tick
+    /// downloads, verifies and caches it, and spawns the run with
+    /// `--skill-bundle=`. (Here rather than in rupu-cp's `bucket_e2e`: the
+    /// worker half lives in this crate.)
+    #[tokio::test]
+    async fn a_shipped_skill_reaches_the_worker_and_the_run_argv() {
+        use rupu_cp::agent_launcher::AgentLaunchRequest;
+        use rupu_cp::host::bucket::BucketHostConnector;
+        use rupu_cp::host::connector::HostConnector;
+        use rupu_cp::host::skill_ship::{ShipOutcome, SkillBundle};
+        use std::sync::Arc;
+        let bucket = Arc::new(ObjectStoreBucket::from_url("memory:///", None).unwrap());
+        let info = bucket_worker_info("w1");
+        bucket
+            .put_worker_info("w1", &serde_json::to_vec(&info).unwrap())
+            .await
+            .unwrap();
+        let cp = tempdir().unwrap();
+        let run_store = Arc::new(rupu_orchestrator::RunStore::new(cp.path().join("runs")));
+        let conn = BucketHostConnector::new(
+            "host_1",
+            bucket.clone(),
+            Arc::new(rupu_cp::node::NodeMirror::new(run_store.clone())),
+            run_store,
+            Arc::new(rupu_cp::customers::CustomerPricing::flat(
+                rupu_config::PricingConfig::default(),
+            )),
+        );
+
+        let src = tempdir().unwrap();
+        let dir = src.path().join("alpha");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: alpha\ndescription: d\n---\nbody\n",
+        )
+        .unwrap();
+        let skill = rupu_skills::load_skill(&dir, rupu_skills::Layer::Global).unwrap();
+        let bundle = SkillBundle::new(vec![Arc::new(skill)]);
+        let manifest = match conn.ship_skills(&bundle).await.unwrap() {
+            ShipOutcome::Shipped(m) => m,
+            other => panic!("{other:?}"),
+        };
+        let run_id = conn
+            .launch_agent(AgentLaunchRequest {
+                codename: None,
+                agent: "a".into(),
+                prompt: Some("hi".into()),
+                mode: None,
+                target: None,
+                working_dir: None,
+                run_id: None,
+                findings_profile: None,
+                engagement_profiles: Vec::new(),
+                skills: Vec::new(),
+                preload_skills: Vec::new(),
+                skill_bundle: Some(manifest.clone()),
+            })
+            .await
+            .unwrap();
+
+        let (global, runs) = worker_dirs();
+        let (exe, argv_file) = argv_script(global.path());
+        let (mut active, mut pending) = (HashMap::new(), PendingJobs::default());
+        bucket_tick(
+            bucket.as_ref(),
+            &exe,
+            "w1",
+            &runs,
+            global.path(),
+            &mut active,
+            &mut pending,
+        )
+        .await;
+
+        let cache = rupu_skills::ship::cache_dir(global.path());
+        assert!(rupu_skills::ship::cached_path(&cache, &manifest.skills[0])
+            .join("SKILL.md")
+            .is_file());
+        let mut child = active.remove(&run_id).expect("the run started").child;
+        child.wait().await.unwrap();
+        assert_eq!(bundle_in_argv(&argv_file), manifest);
+    }
+
+    /// An object over the worker's cap is a permanent failure naming the
+    /// skill, and nothing is cached. (The cap is a parameter so the test needs
+    /// no 32 MiB object.)
+    #[tokio::test]
+    async fn an_over_cap_skill_object_is_a_permanent_failure_and_caches_nothing() {
+        let bucket = FlakyJobBucket::new();
+        let (packed, r, job) = skill_job("alpha");
+        bucket
+            .put_skill(&r.content_hash, &packed.bytes)
+            .await
+            .unwrap();
+        let (global, _runs) = worker_dirs();
+        let manifest = r_manifest(&job);
+
+        let err = fetch_bundle_skills(&bucket, global.path(), &manifest, 16)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, SkillFetchError::Permanent(m) if m.contains("global:alpha")),
+            "{err:?}"
+        );
+        let cache = rupu_skills::ship::cache_dir(global.path());
+        assert!(!rupu_skills::ship::cached_path(&cache, &r).exists());
+    }
+
+    /// Three skills with one content hash cost one download, and all are
+    /// cached.
+    #[tokio::test]
+    async fn skills_sharing_a_hash_are_downloaded_once() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let bucket = FlakyJobBucket::new();
+        let (packed, r, job) = skill_job("alpha");
+        bucket
+            .put_skill(&r.content_hash, &packed.bytes)
+            .await
+            .unwrap();
+        let mut manifest = r_manifest(&job);
+        for name in ["beta", "gamma"] {
+            let mut twin = r.clone();
+            twin.name = name.into();
+            manifest.skills.push(twin);
+        }
+        let (global, _runs) = worker_dirs();
+
+        fetch_bundle_skills(&bucket, global.path(), &manifest, MAX_SKILL_ARCHIVE_BYTES)
+            .await
+            .unwrap();
+
+        assert_eq!(bucket.get_skill_calls.load(SeqCst), 1);
+        let cache = rupu_skills::ship::cache_dir(global.path());
+        assert!(rupu_skills::ship::missing(&cache, &manifest.skills).is_empty());
+    }
+
+    /// A manifest of more than 256 skills is refused before any download,
+    /// as a node refuses such an offer.
+    #[tokio::test]
+    async fn a_manifest_of_too_many_skills_is_refused() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let bucket = FlakyJobBucket::new();
+        let manifest = rupu_skills::ship::SkillBundleManifest {
+            version: rupu_skills::ship::SkillBundleManifest::VERSION,
+            skills: (0..257)
+                .map(|i| ShippedSkillRef {
+                    layer: rupu_skills::Layer::Global,
+                    name: format!("s{i}"),
+                    content_hash: "cd".repeat(32),
+                })
+                .collect(),
+        };
+        let (global, _runs) = worker_dirs();
+
+        let err = fetch_bundle_skills(&bucket, global.path(), &manifest, MAX_SKILL_ARCHIVE_BYTES)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, SkillFetchError::Permanent(m) if m.contains("257")),
+            "{err:?}"
+        );
+        assert_eq!(bucket.get_skill_calls.load(SeqCst), 0);
+    }
+
+    /// The reason a skill fetch fails reaches the coordinator: the worker
+    /// writes `failure.txt` then the `failed` marker, and the CP's poller sets
+    /// the mirror run's `error_message` to `host <id>: <reason>`.
+    #[tokio::test]
+    async fn a_skill_fetch_failure_reaches_the_coordinators_run_record() {
+        use rupu_cp::agent_launcher::AgentLaunchRequest;
+        use rupu_cp::host::bucket::{poll_bucket_run, BucketHostConnector};
+        use rupu_cp::host::connector::HostConnector;
+        use std::sync::Arc;
+        let bucket = Arc::new(ObjectStoreBucket::from_url("memory:///", None).unwrap());
+        bucket
+            .put_worker_info(
+                "w1",
+                &serde_json::to_vec(&bucket_worker_info("w1")).unwrap(),
+            )
+            .await
+            .unwrap();
+        let cp = tempdir().unwrap();
+        let run_store = Arc::new(rupu_orchestrator::RunStore::new(cp.path().join("runs")));
+        let mirror = Arc::new(rupu_cp::node::NodeMirror::new(run_store.clone()));
+        let conn = BucketHostConnector::new(
+            "host_1",
+            bucket.clone(),
+            mirror.clone(),
+            run_store.clone(),
+            Arc::new(rupu_cp::customers::CustomerPricing::flat(
+                rupu_config::PricingConfig::default(),
+            )),
+        );
+        let (_packed, r, _job) = skill_job("alpha");
+        // A manifest for a skill that was never put in the bucket.
+        let manifest = rupu_skills::ship::SkillBundleManifest {
+            version: 1,
+            skills: vec![r],
+        };
+        let run_id = conn
+            .launch_agent(AgentLaunchRequest {
+                codename: None,
+                agent: "a".into(),
+                prompt: Some("hi".into()),
+                mode: None,
+                target: None,
+                working_dir: None,
+                run_id: None,
+                findings_profile: None,
+                engagement_profiles: Vec::new(),
+                skills: Vec::new(),
+                preload_skills: Vec::new(),
+                skill_bundle: Some(manifest),
+            })
+            .await
+            .unwrap();
+        let (_global, runs) = worker_dirs();
+        let (mut active, mut pending) = (HashMap::new(), PendingJobs::default());
+
+        tick(bucket.as_ref(), &runs, &mut active, &mut pending).await;
+
+        let done = poll_bucket_run(
+            bucket.as_ref(),
+            &mirror,
+            "host_1",
+            &run_id,
+            &mut std::collections::HashSet::new(),
+        )
+        .await
+        .unwrap();
+        assert!(done);
+        let rec = run_store.load(&run_id).unwrap();
+        assert_eq!(rec.status, rupu_orchestrator::RunStatus::Failed);
+        let msg = rec.error_message.unwrap();
+        assert!(
+            msg.starts_with("host host_1: ") && msg.contains("global:alpha"),
+            "{msg}"
+        );
+    }
+
+    /// A spawn failure also says why.
+    #[tokio::test]
+    async fn a_spawn_failure_writes_its_reason() {
+        let bucket = FlakyJobBucket::new();
+        bucket.put_job("run_X", &agent_job("a")).await.unwrap();
+        let (global, runs) = worker_dirs();
+        let (mut active, mut pending) = (HashMap::new(), PendingJobs::default());
+
+        bucket_tick(
+            &bucket,
+            &global.path().join("no-such-rupu"),
+            "host_1",
+            &runs,
+            global.path(),
+            &mut active,
+            &mut pending,
+        )
+        .await;
+
+        assert!(active.is_empty() && pending.is_empty());
+        assert_eq!(
+            bucket.get_finished("run_X").await.unwrap().as_deref(),
+            Some("failed")
+        );
+        let results = bucket.inner.list_results("run_X").await.unwrap();
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert_eq!(results[0].0, FAILURE_KEY);
+        let reason = String::from_utf8(results[0].1.clone()).unwrap();
+        assert!(reason.starts_with("spawn failed"), "{reason}");
+    }
+
     /// A job whose spec does not deserialize is unusable and no retry fixes it:
     /// it is marked `failed` (as a spawn failure is) and the worker carries on.
     #[tokio::test]
@@ -3023,11 +4213,17 @@ mod tests {
     #[tokio::test]
     async fn a_failed_spawn_marker_that_did_not_land_is_retried() {
         let fb = FailingBucket::new();
-        let mut pending = vec!["run_a".to_string(), "run_b".to_string()];
+        let mut pending = vec![
+            FailedJob::new("run_a".into(), "because a"),
+            FailedJob::new("run_b".into(), "because b"),
+        ];
 
         flush_failed_markers(&fb.bucket, &mut pending).await;
         assert_eq!(
-            pending,
+            pending
+                .iter()
+                .map(|j| j.run_id.as_str())
+                .collect::<Vec<_>>(),
             ["run_a", "run_b"],
             "still unmarked: kept for the next tick"
         );
@@ -3035,10 +4231,15 @@ mod tests {
         fb.heal();
         flush_failed_markers(&fb.bucket, &mut pending).await;
         assert!(pending.is_empty());
-        for rid in ["run_a", "run_b"] {
+        for (rid, why) in [("run_a", "because a"), ("run_b", "because b")] {
             assert_eq!(
                 fb.bucket.get_finished(rid).await.unwrap().as_deref(),
                 Some("failed")
+            );
+            let results = fb.bucket.list_results(rid).await.unwrap();
+            assert_eq!(
+                results,
+                [(FAILURE_KEY.to_string(), why.as_bytes().to_vec())]
             );
         }
         // Nothing pending: nothing written, nothing to do.
@@ -3510,6 +4711,7 @@ mod tests {
 
     fn agent_spec() -> RunSpec {
         RunSpec {
+            skill_bundle: None,
             kind: RunSpecKind::Agent,
             name: "recon".to_string(),
             inputs: BTreeMap::new(),
@@ -4565,6 +5767,675 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // Shipped skills: SkillsOffer → SkillsNeed → SkillChunk → SkillsStored
+    // ------------------------------------------------------------------
+
+    /// A global skill `name` packed from a fresh directory under `src`.
+    fn packed_skill(src: &Path, name: &str) -> rupu_skills::ship::PackedSkill {
+        let dir = src.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!(
+                "---\nname: {name}\ndescription: The {name} skill.\n---\n\nDo the {name} thing.\n"
+            ),
+        )
+        .unwrap();
+        let skill = rupu_skills::load_skill(&dir, rupu_skills::Layer::Global).unwrap();
+        rupu_skills::ship::pack_skill(&skill).unwrap()
+    }
+
+    /// `bytes` as `parts` `SkillChunk`s of offer `id` naming `r`.
+    fn skill_chunks(
+        id: &str,
+        r: &rupu_skills::ship::ShippedSkillRef,
+        bytes: &[u8],
+        parts: usize,
+    ) -> Vec<Frame> {
+        use base64::Engine as _;
+        let size = bytes.len().div_ceil(parts).max(1);
+        let pieces: Vec<&[u8]> = bytes.chunks(size).collect();
+        let n = pieces.len();
+        pieces
+            .into_iter()
+            .enumerate()
+            .map(|(i, piece)| Frame::SkillChunk {
+                id: id.to_string(),
+                layer: r.layer,
+                name: r.name.clone(),
+                hash: r.content_hash.clone(),
+                seq: i as u64,
+                data_b64: base64::engine::general_purpose::STANDARD.encode(piece),
+                last: i + 1 == n,
+            })
+            .collect()
+    }
+
+    async fn send_all(ws: &mut CpWs, frames: &[Frame]) {
+        for f in frames {
+            ws.send(cp_text(f)).await.unwrap();
+        }
+    }
+
+    /// The node answers a Ping next: the connection is alive and nothing
+    /// else (no stray `SkillsStored`) was queued before the Pong.
+    async fn expect_pong(ws: &mut CpWs) {
+        ws.send(cp_text(&Frame::Ping {})).await.unwrap();
+        let f = next_cp_frame(ws).await;
+        assert!(matches!(f, Frame::Pong {}), "expected Pong, got {f:?}");
+    }
+
+    /// Offer `skills` as `id` and return the node's `SkillsNeed` answer.
+    async fn offer(
+        ws: &mut CpWs,
+        id: &str,
+        skills: Vec<rupu_skills::ship::ShippedSkillRef>,
+    ) -> (Vec<rupu_skills::ship::ShippedSkillRef>, Option<String>) {
+        ws.send(cp_text(&Frame::SkillsOffer {
+            id: id.to_string(),
+            skills,
+        }))
+        .await
+        .unwrap();
+        match next_cp_frame(ws).await {
+            Frame::SkillsNeed {
+                id: got,
+                skills,
+                error,
+            } if got == id => (skills, error),
+            other => panic!("expected SkillsNeed for {id}, got {other:?}"),
+        }
+    }
+
+    /// The next frame is offer `id`'s failure, naming `who`.
+    async fn expect_store_error(ws: &mut CpWs, id: &str, who: &str) {
+        match next_cp_frame(ws).await {
+            Frame::SkillsStored {
+                id: got,
+                stored,
+                error: Some(error),
+            } if got == id => {
+                assert!(stored.is_empty(), "{stored:?}");
+                assert!(error.contains(who), "{error:?} does not name {who}");
+            }
+            other => panic!("expected a SkillsStored error for {id}, got {other:?}"),
+        }
+    }
+
+    /// Run `cp` against a node rooted at `global` (whose Hello advertises
+    /// the skill bundle), within a minute.
+    async fn with_skill_node<F, Fut>(global: &Path, exe: &Path, cp: F)
+    where
+        F: FnOnce(CpWs) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let rx = SkillReceiver::new(global);
+        with_skill_receiver(global, exe, rx, cp).await;
+    }
+
+    /// [`with_skill_node`] with the node receiving skills through `rx`.
+    async fn with_skill_receiver<F, Fut>(global: &Path, exe: &Path, rx: SkillReceiver, cp: F)
+    where
+        F: FnOnce(CpWs) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/api/node/connect", listener.local_addr().unwrap());
+        let (g, e) = (global.to_path_buf(), exe.to_path_buf());
+        let node = tokio::spawn(async move {
+            connect_and_run_with(&url, "tok", "node-skill-test", &e, &g, rx).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(60), async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let hello = next_cp_frame(&mut ws).await;
+            assert!(
+                matches!(&hello, Frame::Hello { capabilities, .. }
+                    if capabilities.iter().any(|c| c == rupu_cp::node::protocol::CAP_AGENT_SKILL_BUNDLE)),
+                "{hello:?}"
+            );
+            ws.send(cp_text(&Frame::Welcome {
+                capabilities: vec![],
+            }))
+            .await
+            .unwrap();
+            cp(ws).await;
+        })
+        .await
+        .expect("the skill exchange never finished");
+        assert!(!node.is_finished(), "the node's connection ended");
+        node.abort();
+    }
+
+    /// An offer asks only for what the node lacks; the chunks of what it
+    /// lacked are verified and stored, and `SkillsStored` lists them. An
+    /// offer needing nothing is finished at once: no `SkillsStored` follows.
+    #[tokio::test]
+    async fn an_offer_ships_only_the_skills_the_node_lacks() {
+        let (global, src) = (tempdir().unwrap(), tempdir().unwrap());
+        let cache = rupu_skills::ship::cache_dir(global.path());
+        let (alpha, beta) = (
+            packed_skill(src.path(), "alpha"),
+            packed_skill(src.path(), "beta"),
+        );
+        rupu_skills::ship::store(&cache, &alpha.reference(), &alpha.bytes).unwrap();
+        let (a, b) = (alpha.reference(), beta.reference());
+
+        with_skill_node(global.path(), Path::new("/nonexistent/rupu"), |mut ws| {
+            let (a, b, bytes) = (a.clone(), b.clone(), beta.bytes.clone());
+            async move {
+                let (need, error) = offer(&mut ws, "o1", vec![a.clone(), b.clone()]).await;
+                assert_eq!((need, error), (vec![b.clone()], None));
+                let chunks = skill_chunks("o1", &b, &bytes, 2);
+                assert_eq!(chunks.len(), 2);
+                send_all(&mut ws, &chunks).await;
+                match next_cp_frame(&mut ws).await {
+                    Frame::SkillsStored { id, stored, error } => {
+                        assert_eq!((id.as_str(), stored, error), ("o1", vec![b.clone()], None));
+                    }
+                    other => panic!("expected SkillsStored, got {other:?}"),
+                }
+
+                let (need, error) = offer(&mut ws, "o2", vec![a, b]).await;
+                assert_eq!((need, error), (vec![], None));
+                expect_pong(&mut ws).await;
+            }
+        })
+        .await;
+
+        let md = cache.join(&b.content_hash).join("beta").join("SKILL.md");
+        assert!(md.is_file(), "{} was not stored", md.display());
+        assert!(rupu_skills::ship::missing(&cache, &[a, b]).is_empty());
+    }
+
+    /// Every bad transfer fails its offer with one `SkillsStored` error
+    /// naming the skill, stores nothing, and leaves the connection up.
+    #[tokio::test]
+    async fn a_bad_skill_transfer_fails_its_offer_and_keeps_the_connection() {
+        let (global, src) = (tempdir().unwrap(), tempdir().unwrap());
+        let cache = rupu_skills::ship::cache_dir(global.path());
+        let (beta, gamma) = (
+            packed_skill(src.path(), "beta"),
+            packed_skill(src.path(), "gamma"),
+        );
+        let (b, g) = (beta.reference(), gamma.reference());
+        let bytes = beta.bytes.clone();
+
+        with_skill_node(global.path(), Path::new("/nonexistent/rupu"), |mut ws| {
+            let (b, g) = (b.clone(), g.clone());
+            async move {
+                // A chunk for a skill the offer didn't need.
+                offer(&mut ws, "unasked", vec![b.clone()]).await;
+                send_all(&mut ws, &skill_chunks("unasked", &g, &gamma.bytes, 1)).await;
+                expect_store_error(&mut ws, "unasked", "global:gamma").await;
+                expect_pong(&mut ws).await;
+
+                // Chunks out of order.
+                offer(&mut ws, "order", vec![b.clone()]).await;
+                let mut chunks = skill_chunks("order", &b, &bytes, 2);
+                chunks.swap(0, 1);
+                send_all(&mut ws, &chunks).await;
+                expect_store_error(&mut ws, "order", "global:beta").await;
+                // The rest of a failed offer's chunks are dropped quietly.
+                expect_pong(&mut ws).await;
+
+                // A tampered archive fails verification.
+                offer(&mut ws, "tampered", vec![b.clone()]).await;
+                let mut tampered = bytes.clone();
+                let at = tampered
+                    .windows(4)
+                    .position(|w| w == b"beta")
+                    .expect("the archive holds SKILL.md as written");
+                tampered[at..at + 4].copy_from_slice(b"BETA");
+                send_all(&mut ws, &skill_chunks("tampered", &b, &tampered, 1)).await;
+                expect_store_error(&mut ws, "tampered", "global:beta").await;
+                expect_pong(&mut ws).await;
+
+                // An archive past the per-skill cap.
+                offer(&mut ws, "big", vec![b.clone()]).await;
+                let chunk = vec![0u8; ARTIFACT_CHUNK_BYTES];
+                let over = (rupu_skills::ship::MAX_SHIPPED_SKILL_BYTES as usize
+                    / ARTIFACT_CHUNK_BYTES)
+                    + 2;
+                for seq in 0..over {
+                    use base64::Engine as _;
+                    ws.send(cp_text(&Frame::SkillChunk {
+                        id: "big".into(),
+                        layer: b.layer,
+                        name: b.name.clone(),
+                        hash: b.content_hash.clone(),
+                        seq: seq as u64,
+                        data_b64: base64::engine::general_purpose::STANDARD.encode(&chunk),
+                        last: false,
+                    }))
+                    .await
+                    .unwrap();
+                }
+                expect_store_error(&mut ws, "big", "global:beta").await;
+                expect_pong(&mut ws).await;
+
+                // A chunk for an offer that was never made.
+                send_all(&mut ws, &skill_chunks("nope", &b, &bytes, 1)).await;
+                expect_store_error(&mut ws, "nope", "global:beta").await;
+                expect_pong(&mut ws).await;
+
+                // After all that, the skill still ships.
+                let (need, _) = offer(&mut ws, "good", vec![b.clone()]).await;
+                assert_eq!(need, vec![b.clone()]);
+                send_all(&mut ws, &skill_chunks("good", &b, &bytes, 3)).await;
+                assert!(matches!(next_cp_frame(&mut ws).await,
+                        Frame::SkillsStored { id, error: None, .. } if id == "good"),);
+            }
+        })
+        .await;
+
+        assert!(rupu_skills::ship::missing(&cache, std::slice::from_ref(&b)).is_empty());
+        assert_eq!(
+            rupu_skills::ship::missing(&cache, std::slice::from_ref(&g)),
+            vec![g]
+        );
+    }
+
+    /// A malformed offer is refused in its `SkillsNeed`, and the connection
+    /// stays up.
+    #[tokio::test]
+    async fn a_malformed_skill_offer_is_refused() {
+        let (global, src) = (tempdir().unwrap(), tempdir().unwrap());
+        let beta = packed_skill(src.path(), "beta");
+        let b = beta.reference();
+
+        with_skill_node(global.path(), Path::new("/nonexistent/rupu"), |mut ws| {
+            let b = b.clone();
+            async move {
+                let mut bad_hash = b.clone();
+                bad_hash.content_hash = "XYZ".into();
+                let mut bad_name = b.clone();
+                bad_name.name = "../escape".into();
+                for (id, skills, want) in [
+                    ("hash", vec![bad_hash], "global:beta"),
+                    ("name", vec![bad_name], "../escape"),
+                    ("twice", vec![b.clone(), b.clone()], "global:beta"),
+                ] {
+                    let (need, error) = offer(&mut ws, id, skills).await;
+                    assert!(need.is_empty(), "{id}: {need:?}");
+                    let error = error.unwrap_or_else(|| panic!("{id}: not refused"));
+                    assert!(error.contains(want), "{id}: {error}");
+                }
+                expect_pong(&mut ws).await;
+
+                // An offer reusing a live id is refused; the live one goes on.
+                let (need, error) = offer(&mut ws, "live", vec![b.clone()]).await;
+                assert_eq!((need, error), (vec![b.clone()], None));
+                let (need, error) = offer(&mut ws, "live", vec![b.clone()]).await;
+                assert!(need.is_empty());
+                assert!(error.unwrap().contains("live"));
+                send_all(&mut ws, &skill_chunks("live", &b, &beta.bytes, 1)).await;
+                assert!(
+                    matches!(next_cp_frame(&mut ws).await,
+                        Frame::SkillsStored { id, stored, error: None } if id == "live" && stored == vec![b.clone()]),
+                );
+                expect_pong(&mut ws).await;
+            }
+        })
+        .await;
+    }
+
+    /// A node receiver with `limits` in place of the real ones.
+    fn receiver_with(global: &Path, limits: SkillLimits) -> SkillReceiver {
+        SkillReceiver {
+            limits,
+            ..SkillReceiver::new(global)
+        }
+    }
+
+    /// A well-formed ref to a skill no cache holds.
+    fn fake_ref(name: &str) -> ShippedSkillRef {
+        ShippedSkillRef {
+            layer: rupu_skills::Layer::Global,
+            name: name.to_string(),
+            content_hash: "cd".repeat(32),
+        }
+    }
+
+    /// Chunk 0 of `r` in offer `id`: `n` bytes, not the last.
+    fn held_chunk(id: &str, r: &ShippedSkillRef, n: usize) -> Frame {
+        use base64::Engine as _;
+        Frame::SkillChunk {
+            id: id.to_string(),
+            layer: r.layer,
+            name: r.name.clone(),
+            hash: r.content_hash.clone(),
+            seq: 0,
+            data_b64: base64::engine::general_purpose::STANDARD.encode(vec![7u8; n]),
+            last: false,
+        }
+    }
+
+    /// The per-offer cap counts every needed skill's archive together (the
+    /// per-skill cap alone would let five 30 MiB skills through); shown at
+    /// small limits, which the real ones only scale.
+    #[tokio::test]
+    async fn an_offer_past_its_bundle_cap_fails() {
+        let global = tempdir().unwrap();
+        let rx = receiver_with(
+            global.path(),
+            SkillLimits {
+                skill: 100,
+                bundle: 150,
+                slack: 0,
+                ..SkillLimits::default()
+            },
+        );
+        let refs = vec![fake_ref("one"), fake_ref("two")];
+        with_skill_receiver(
+            global.path(),
+            Path::new("/nonexistent/rupu"),
+            rx,
+            |mut ws| {
+                let refs = refs.clone();
+                async move {
+                    let (need, error) = offer(&mut ws, "o", refs.clone()).await;
+                    assert_eq!((need, error), (refs.clone(), None));
+                    // Each skill is within its own cap; together they are not.
+                    send_all(&mut ws, &[held_chunk("o", &refs[0], 100)]).await;
+                    send_all(&mut ws, &[held_chunk("o", &refs[1], 60)]).await;
+                    expect_store_error(&mut ws, "o", "global:two").await;
+                    expect_pong(&mut ws).await;
+                }
+            },
+        )
+        .await;
+    }
+
+    /// At most four offers are received at once (room for two abandoned
+    /// ones beside a live ship); a fifth is refused while the first four
+    /// complete, and its turn comes once a slot frees.
+    #[tokio::test]
+    async fn a_fifth_concurrent_offer_is_refused() {
+        let (global, src) = (tempdir().unwrap(), tempdir().unwrap());
+        let skills: Vec<_> = ["alpha", "beta", "gamma", "delta", "epsilon"]
+            .iter()
+            .map(|n| packed_skill(src.path(), n))
+            .collect();
+        let refs: Vec<_> = skills.iter().map(|p| p.reference()).collect();
+        let bytes: Vec<_> = skills.iter().map(|p| p.bytes.clone()).collect();
+
+        with_skill_node(
+            global.path(),
+            Path::new("/nonexistent/rupu"),
+            |mut ws| async move {
+                for (i, id) in ["o1", "o2", "o3", "o4"].iter().enumerate() {
+                    let (need, error) = offer(&mut ws, id, vec![refs[i].clone()]).await;
+                    assert_eq!((need, error), (vec![refs[i].clone()], None));
+                }
+                let (need, error) = offer(&mut ws, "o5", vec![refs[4].clone()]).await;
+                assert!(need.is_empty());
+                assert_eq!(error.as_deref(), Some("too many skill offers in flight"));
+                expect_pong(&mut ws).await;
+
+                for (i, id) in ["o1", "o2", "o3", "o4"].iter().enumerate() {
+                    send_all(&mut ws, &skill_chunks(id, &refs[i], &bytes[i], 2)).await;
+                    match next_cp_frame(&mut ws).await {
+                        Frame::SkillsStored {
+                            id: got,
+                            stored,
+                            error: None,
+                        } => {
+                            assert_eq!((got.as_str(), stored), (*id, vec![refs[i].clone()]));
+                        }
+                        other => panic!("expected {id} stored, got {other:?}"),
+                    }
+                }
+                let (need, error) = offer(&mut ws, "o5", vec![refs[4].clone()]).await;
+                assert_eq!((need, error), (vec![refs[4].clone()], None));
+                expect_pong(&mut ws).await;
+            },
+        )
+        .await;
+    }
+
+    /// The bytes held across every offer are capped; a failed offer's
+    /// buffers no longer count.
+    #[tokio::test]
+    async fn the_connection_wide_budget_fails_an_offer() {
+        let global = tempdir().unwrap();
+        let rx = receiver_with(
+            global.path(),
+            SkillLimits {
+                skill: 1000,
+                bundle: 1000,
+                slack: 0,
+                buffered: 150,
+                ..SkillLimits::default()
+            },
+        );
+        let (x, y) = (fake_ref("x"), fake_ref("y"));
+        with_skill_receiver(
+            global.path(),
+            Path::new("/nonexistent/rupu"),
+            rx,
+            |mut ws| {
+                let (x, y) = (x.clone(), y.clone());
+                async move {
+                    offer(&mut ws, "o1", vec![x.clone()]).await;
+                    offer(&mut ws, "o2", vec![y.clone()]).await;
+                    send_all(&mut ws, &[held_chunk("o1", &x, 100)]).await;
+                    // o2 is within its own caps, but not the connection's.
+                    send_all(&mut ws, &[held_chunk("o2", &y, 60)]).await;
+                    expect_store_error(&mut ws, "o2", "global:y").await;
+                    expect_pong(&mut ws).await;
+
+                    // Fail o1 (a chunk out of order): its 100 bytes are freed.
+                    let mut wrong = held_chunk("o1", &x, 1);
+                    if let Frame::SkillChunk { seq, .. } = &mut wrong {
+                        *seq = 5;
+                    }
+                    send_all(&mut ws, &[wrong]).await;
+                    expect_store_error(&mut ws, "o1", "global:x").await;
+                    offer(&mut ws, "o3", vec![y.clone()]).await;
+                    send_all(&mut ws, &[held_chunk("o3", &y, 140)]).await;
+                    expect_pong(&mut ws).await;
+                }
+            },
+        )
+        .await;
+    }
+
+    /// An offer that stops getting chunks fails after its idle time and
+    /// frees its slot; its late chunks are dropped quietly.
+    #[tokio::test]
+    async fn an_idle_offer_expires_and_frees_its_slot() {
+        let global = tempdir().unwrap();
+        let rx = receiver_with(
+            global.path(),
+            SkillLimits {
+                max_offers: 1,
+                idle: std::time::Duration::from_millis(300),
+                ..SkillLimits::default()
+            },
+        );
+        let x = fake_ref("x");
+        with_skill_receiver(
+            global.path(),
+            Path::new("/nonexistent/rupu"),
+            rx,
+            |mut ws| {
+                let x = x.clone();
+                async move {
+                    let (need, _) = offer(&mut ws, "o1", vec![x.clone()]).await;
+                    assert_eq!(need, vec![x.clone()]);
+                    // A chunk restarts the clock; the slot is taken meanwhile.
+                    send_all(&mut ws, &[held_chunk("o1", &x, 10)]).await;
+                    let (_, error) = offer(&mut ws, "o2", vec![x.clone()]).await;
+                    assert_eq!(error.as_deref(), Some("too many skill offers in flight"));
+                    let started = std::time::Instant::now();
+                    match next_cp_frame(&mut ws).await {
+                        Frame::SkillsStored {
+                            id,
+                            stored,
+                            error: Some(error),
+                        } => {
+                            assert_eq!(id, "o1");
+                            assert!(stored.is_empty());
+                            assert!(
+                                error.contains("offer idle for 300ms")
+                                    && error.contains("global:x"),
+                                "{error}"
+                            );
+                        }
+                        other => panic!("expected o1 to expire, got {other:?}"),
+                    }
+                    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+                    expect_pong(&mut ws).await;
+                    let mut late = held_chunk("o1", &x, 1);
+                    if let Frame::SkillChunk { seq, .. } = &mut late {
+                        *seq = 1;
+                    }
+                    send_all(&mut ws, &[late]).await;
+                    expect_pong(&mut ws).await;
+                    let (need, error) = offer(&mut ws, "o2", vec![x.clone()]).await;
+                    assert_eq!((need, error), (vec![x.clone()], None));
+                    expect_pong(&mut ws).await;
+                }
+            },
+        )
+        .await;
+    }
+
+    /// An offer lists at most 256 skills.
+    #[tokio::test]
+    async fn an_offer_of_too_many_skills_is_refused() {
+        let global = tempdir().unwrap();
+        let refs: Vec<_> = (0..257).map(|i| fake_ref(&format!("s{i}"))).collect();
+        with_skill_node(
+            global.path(),
+            Path::new("/nonexistent/rupu"),
+            |mut ws| async move {
+                let (need, error) = offer(&mut ws, "many", refs.clone()).await;
+                assert!(need.is_empty());
+                assert!(error.unwrap().contains("257"));
+                expect_pong(&mut ws).await;
+                let (need, error) = offer(&mut ws, "most", refs[..256].to_vec()).await;
+                assert_eq!((need.len(), error), (256, None));
+                expect_pong(&mut ws).await;
+            },
+        )
+        .await;
+    }
+
+    /// An offer id is at most 128 bytes; the refusal of a longer one never
+    /// echoes it back, and a chunk naming one is dropped unanswered
+    /// (remembering it as failed would pin it).
+    #[tokio::test]
+    async fn an_oversized_offer_id_is_refused() {
+        let global = tempdir().unwrap();
+        let x = fake_ref("x");
+        with_skill_node(
+            global.path(),
+            Path::new("/nonexistent/rupu"),
+            |mut ws| async move {
+                // Multibyte, so a byte-count cut would split a char.
+                let long = "é".repeat(65);
+                ws.send(cp_text(&Frame::SkillsOffer {
+                    id: long.clone(),
+                    skills: vec![x.clone()],
+                }))
+                .await
+                .unwrap();
+                match next_cp_frame(&mut ws).await {
+                    Frame::SkillsNeed { id, skills, error } => {
+                        assert!(id.len() <= 128, "echoed a {}-byte id", id.len());
+                        assert!(skills.is_empty());
+                        assert!(error.unwrap().contains("128"));
+                    }
+                    other => panic!("expected SkillsNeed, got {other:?}"),
+                }
+                send_all(&mut ws, &[held_chunk(&long, &x, 1)]).await;
+                expect_pong(&mut ws).await;
+                let (need, error) = offer(&mut ws, &"i".repeat(128), vec![x.clone()]).await;
+                assert_eq!((need, error), (vec![x], None));
+                expect_pong(&mut ws).await;
+            },
+        )
+        .await;
+    }
+
+    fn panicking_store(
+        _: &Path,
+        _: &ShippedSkillRef,
+        _: &[u8],
+    ) -> Result<PathBuf, rupu_skills::ship::ShipError> {
+        panic!("the store blew up")
+    }
+
+    /// A store that panics fails its offer instead of leaving it storing
+    /// forever.
+    #[tokio::test]
+    async fn a_panicking_store_fails_its_offer() {
+        let global = tempdir().unwrap();
+        let rx = SkillReceiver {
+            store: panicking_store,
+            ..SkillReceiver::new(global.path())
+        };
+        let x = fake_ref("x");
+        with_skill_receiver(
+            global.path(),
+            Path::new("/nonexistent/rupu"),
+            rx,
+            |mut ws| {
+                let x = x.clone();
+                async move {
+                    offer(&mut ws, "o1", vec![x.clone()]).await;
+                    send_all(&mut ws, &skill_chunks("o1", &x, b"archive", 1)).await;
+                    expect_store_error(&mut ws, "o1", "global:x").await;
+                    expect_pong(&mut ws).await;
+                    // The offer is gone, so its id can be offered again.
+                    let (need, error) = offer(&mut ws, "o1", vec![x.clone()]).await;
+                    assert_eq!((need, error), (vec![x], None));
+                }
+            },
+        )
+        .await;
+    }
+
+    /// A `Run` frame carrying a skill bundle starts `rupu run` with it as
+    /// `--skill-bundle=<manifest json>`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_run_with_a_skill_bundle_passes_it_to_rupu_run() {
+        let (global, bin) = (tempdir().unwrap(), tempdir().unwrap());
+        let (exe, out) = argv_script(bin.path());
+        let manifest = rupu_skills::ship::SkillBundleManifest {
+            version: rupu_skills::ship::SkillBundleManifest::VERSION,
+            skills: vec![rupu_skills::ship::ShippedSkillRef {
+                layer: rupu_skills::Layer::Project,
+                name: "notes".into(),
+                content_hash: "ab".repeat(32),
+            }],
+        };
+        let mut spec = agent_spec();
+        spec.skill_bundle = Some(manifest.clone());
+
+        let out2 = out.clone();
+        with_skill_node(global.path(), &exe, |mut ws| async move {
+            ws.send(cp_text(&Frame::Run {
+                run_id: "run_BUNDLE".into(),
+                spec,
+            }))
+            .await
+            .unwrap();
+            while !out2.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+
+        let argv = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(argv.lines().next(), Some("run"), "{argv}");
+        assert_eq!(bundle_in_argv(&out), manifest);
+    }
+
+    // ------------------------------------------------------------------
     // Bucket worker marker
     // ------------------------------------------------------------------
 
@@ -4581,6 +6452,7 @@ mod tests {
                 rupu_cp::node::protocol::CAP_AGENT_FINDINGS_PROFILE.to_string(),
                 rupu_cp::node::protocol::CAP_AGENT_ENGAGEMENT_PROFILE.to_string(),
                 rupu_cp::node::protocol::CAP_AGENT_SKILLS.to_string(),
+                rupu_cp::node::protocol::CAP_AGENT_SKILL_BUNDLE.to_string(),
                 rupu_cp::node::protocol::CAP_RUN_CODENAME.to_string(),
             ]
         );
@@ -4620,6 +6492,7 @@ mod tests {
             ws.send(cp_text(&Frame::Run {
                 run_id: "run_drain".into(),
                 spec: RunSpec {
+                    skill_bundle: None,
                     kind: RunSpecKind::Workflow,
                     name: "wf".into(),
                     inputs: BTreeMap::new(),

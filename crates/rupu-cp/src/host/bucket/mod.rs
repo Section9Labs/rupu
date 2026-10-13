@@ -11,6 +11,7 @@
 //! runs/<run_id>/finished      — terminal status string written by the node
 //! nodes/<worker_id>.json      — a pull worker's self-description (version + capabilities)
 //! artifacts/<sha256>          — finding-artifact blobs a worker uploaded at run end
+//! skills/<hash>.tar           — a shipped skill's archive, put by the CP (content-addressed)
 //! ```
 
 use async_trait::async_trait;
@@ -68,6 +69,10 @@ pub enum BucketError {
     Io(String),
     #[error("not found: {0}")]
     NotFound(String),
+    /// An object is bigger than the cap the reader set. Retrying cannot help,
+    /// unlike every `Io`.
+    #[error("{key} exceeds {max} bytes")]
+    TooLarge { key: String, max: u64 },
 }
 
 // ── port trait ────────────────────────────────────────────────────────────────
@@ -143,6 +148,15 @@ pub trait Bucket: Send + Sync {
         dest: &std::path::Path,
         max_bytes: u64,
     ) -> Result<(), BucketError>;
+
+    /// Write a shipped skill's archive at `skills/<hash>.tar`, only if absent:
+    /// the key is its content hash, so an existing object is the same bytes
+    /// and the call is `Ok`.
+    async fn put_skill(&self, hash: &str, bytes: &[u8]) -> Result<(), BucketError>;
+
+    /// Fetch `skills/<hash>.tar`. `NotFound` when absent; `TooLarge` when
+    /// the object is over `max_bytes` (checked before any byte is read).
+    async fn get_skill(&self, hash: &str, max_bytes: u64) -> Result<Vec<u8>, BucketError>;
 }
 
 // ── key-layout helpers ────────────────────────────────────────────────────────
@@ -190,4 +204,9 @@ pub(crate) fn key_worker_info(worker_id: &str) -> String {
 /// `artifacts/<sha256>`
 pub(crate) fn key_artifact(sha256: &str) -> String {
     format!("artifacts/{sha256}")
+}
+
+/// `skills/<hash>.tar`
+pub(crate) fn key_skill(hash: &str) -> String {
+    format!("skills/{hash}.tar")
 }
