@@ -104,4 +104,9 @@ pub struct LaunchServices {
     /// ([`super::RunAssembler::prepare_provider`], with `netflow` as its
     /// sink). `None` = the assembler builds it.
     pub provider: Option<super::PreparedProvider>,
+    /// The run's skills, when the site resolved them already
+    /// ([`super::RunAssembler::resolve_skills`]): used instead of resolving
+    /// the agent's and the launch's. An agentiflow lead resolves its own once
+    /// per flow, so every round's system prompt is the same.
+    pub skills: Option<Arc<rupu_skills::ResolvedSkills>>,
 }

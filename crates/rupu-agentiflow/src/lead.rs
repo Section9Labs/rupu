@@ -431,6 +431,10 @@ pub struct RunAgentLeadDriver {
     /// The skills loaded into `history` (its latest round's), carried into
     /// the next round so its compactions re-attach them.
     loaded_skills: Vec<rupu_agent::LoadedSkill>,
+    /// The lead's skills, resolved by its first round and handed to every
+    /// round after, so each round's system prompt (preloaded bodies, index)
+    /// is the same. `None` until a round resolved them.
+    skills: Option<Option<Arc<rupu_skills::ResolvedSkills>>>,
     total_turns: u32,
     limits: ModelLimits,
     /// The running round's pause token (`None` between rounds), shared with
@@ -468,6 +472,7 @@ impl RunAgentLeadDriver {
             rt,
             history: Vec::new(),
             loaded_skills: Vec::new(),
+            skills: None,
             total_turns: 0,
             limits,
             round_token,
@@ -654,6 +659,7 @@ impl RunAgentLeadDriver {
                 run_status: self.cfg.run_status.clone(),
                 catalog: self.cfg.catalog.clone(),
                 provider,
+                skills: self.skills.clone().flatten(),
                 ..Default::default()
             },
             collectors: self.cfg.collectors.clone(),
@@ -664,6 +670,15 @@ impl RunAgentLeadDriver {
 
 impl LeadDriver for RunAgentLeadDriver {
     fn run_round(&mut self, ctx: &RoundContext) -> RoundOutcome {
+        if self.skills.is_none() {
+            // Once per flow. A failure leaves them unresolved: the round's
+            // assembly resolves them again and records why they failed.
+            let assembler = Arc::clone(&self.cfg.assembler);
+            self.skills = self
+                .rt
+                .block_on(assembler.resolve_skills(&self.cfg.agent, &Overrides::default()))
+                .ok();
+        }
         let (spec, pause, ceiling) = self.round_launch(ctx);
 
         let RunExit {
@@ -1144,6 +1159,45 @@ mod tests {
             text_of(&d.history[0]).contains("PDF STEPS"),
             "the re-attached body is in the compacted first message"
         );
+    }
+
+    fn system_prompt_of(path: &std::path::Path) -> String {
+        rupu_transcript::JsonlReader::iter(path)
+            .unwrap()
+            .flatten()
+            .find_map(|e| match e {
+                rupu_transcript::Event::RunStart { system_prompt, .. } => system_prompt,
+                _ => None,
+            })
+            .expect("a run_start with a system prompt")
+    }
+
+    /// The lead's skills resolve once per flow: a preloaded skill edited
+    /// between rounds leaves the next round's system prompt byte-identical,
+    /// so the prompt cache holds.
+    #[test]
+    fn the_leads_skills_resolve_once_per_flow() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill = dir.path().join("home/skills/style");
+        std::fs::create_dir_all(&skill).unwrap();
+        let write = |body: &str| {
+            std::fs::write(
+                skill.join("SKILL.md"),
+                format!("---\nname: style\ndescription: House style.\n---\n{body}\n"),
+            )
+            .unwrap()
+        };
+        write("STYLE ONE");
+        let mut cfg = lead_cfg(dir.path(), 5);
+        cfg.agent = lead_agent("preloadSkills: [style]\n");
+        let make = scripted_factory(vec![vec![text_turn("one")], vec![text_turn("two")]]);
+        let mut d = new_driver(cfg, make).unwrap();
+        assert_eq!(d.run_round(&round(0)), RoundOutcome::Yielded);
+        write("STYLE TWO");
+        assert_eq!(d.run_round(&round(1)), RoundOutcome::Yielded);
+        let first = system_prompt_of(&dir.path().join("lead.r0.jsonl"));
+        assert!(first.contains("STYLE ONE"), "{first}");
+        assert_eq!(system_prompt_of(&dir.path().join("lead.r1.jsonl")), first);
     }
 
     #[test]

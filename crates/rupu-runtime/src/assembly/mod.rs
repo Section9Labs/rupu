@@ -508,19 +508,22 @@ impl RunAssembler {
         }
     }
 
-    /// The run's skills (spec §2.4): the agent's keys and the launch's own,
-    /// resolved in one pass against the global and project layers. `None`
-    /// when the run has none. Fails closed: a run never starts without a
-    /// skill it was given. Discovery reads directories and a preload hashes
-    /// files, so it runs on the blocking pool, and an fd exhaustion in a
-    /// wide fan-out is retried the way the agent's load is.
-    async fn resolve_skills(
+    /// The skills a run of `agent` with `overrides` is given (spec §2.4):
+    /// the agent's keys and the launch's own, resolved in one pass against
+    /// the global and project layers. `None` when the run has none. Fails
+    /// closed: a run never starts without a skill it was given. Discovery
+    /// reads directories and a preload hashes files, so it runs on the
+    /// blocking pool, and an fd exhaustion in a wide fan-out is retried the
+    /// way the agent's load is. [`Self::assemble`] calls it unless the launch
+    /// brings its own ([`LaunchServices::skills`]).
+    pub async fn resolve_skills(
         &self,
-        spec: &LaunchSpec,
+        agent: &rupu_agent::AgentSpec,
+        overrides: &Overrides,
     ) -> Result<Option<Arc<rupu_skills::ResolvedSkills>>, AssembleError> {
-        let agent_grants = spec.agent.skills.clone().unwrap_or_default();
-        let agent_preload = spec.agent.preload_skills.clone().unwrap_or_default();
-        let o = &spec.overrides;
+        let agent_grants = agent.skills.clone().unwrap_or_default();
+        let agent_preload = agent.preload_skills.clone().unwrap_or_default();
+        let o = overrides;
         if agent_grants.is_empty()
             && agent_preload.is_empty()
             && o.skills.is_empty()
@@ -539,7 +542,7 @@ impl RunAssembler {
         let global = self.ctx.global.clone();
         let project = self.ctx.project_root.as_ref().map(|p| p.join(".rupu"));
         let resolved = rupu_agent::fd_budget::retry_on_fd_exhaustion(
-            &spec.agent.name,
+            &agent.name,
             &rupu_agent::fd_budget::Policy::default(),
             rupu_agent::fd_budget::grow,
             || {
@@ -566,7 +569,11 @@ impl RunAssembler {
         // Before anything that needs cleaning up. As when its grant fails,
         // the run's (empty) transcript exists, so whatever opens it finds
         // the run that failed.
-        let skills = match self.resolve_skills(&spec).await {
+        let resolved = match spec.services.skills.take() {
+            Some(skills) => Ok((!skills.is_empty()).then_some(skills)),
+            None => self.resolve_skills(&spec.agent, &spec.overrides).await,
+        };
+        let skills = match resolved {
             Ok(s) => s,
             Err(e) => {
                 if let Err(w) = rupu_transcript::JsonlWriter::create(&spec.transcript_path) {
