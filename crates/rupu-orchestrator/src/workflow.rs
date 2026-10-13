@@ -1287,6 +1287,27 @@ impl Workflow {
         agents
     }
 
+    /// Every tool an `action:` names, as written: action steps, gate
+    /// `notify:` hooks and `on_reject` cleanup steps.
+    pub fn action_tools(&self) -> std::collections::BTreeSet<String> {
+        fn walk(step: &Step, into: &mut std::collections::BTreeSet<String>) {
+            if let Some(action) = &step.action {
+                into.insert(action.clone());
+            }
+            if let Some(approval) = &step.approval {
+                into.extend(approval.notify.iter().map(|n| n.action.clone()));
+                for cleanup in &approval.on_reject {
+                    walk(cleanup, into);
+                }
+            }
+        }
+        let mut tools = std::collections::BTreeSet::new();
+        for step in &self.steps {
+            walk(step, &mut tools);
+        }
+        tools
+    }
+
     /// `true` when any step carries an `approval:` block — a standalone
     /// gate node or the legacy inline gate on an agent step — i.e. the
     /// run can park awaiting an operator decision.

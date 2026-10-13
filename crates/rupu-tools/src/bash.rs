@@ -60,9 +60,14 @@ impl Drop for CaptureGuard {
     }
 }
 
+/// Names, in a process a launched child spawned, the child's run: set on
+/// the child's own command by its launcher and inherited below it, so the
+/// sweep can tell a crashed child's leftover processes from strangers.
+pub const RUN_ID_ENV: &str = "RUPU_RUN_ID";
+
 /// Always-forwarded environment variables (in addition to the
 /// workspace-configured allowlist).
-const ALWAYS_ALLOWED_ENV: &[&str] = &["PATH", "HOME", "USER", "TERM", "LANG"];
+const ALWAYS_ALLOWED_ENV: &[&str] = &["PATH", "HOME", "USER", "TERM", "LANG", RUN_ID_ENV];
 
 /// Whether `word` is a `NAME=value` shell environment-assignment prefix.
 fn is_env_assignment(word: &str) -> bool {

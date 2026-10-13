@@ -1,10 +1,10 @@
 //! W5 §6 test 1: the lead's and a fleet unit's model-facing tool lists
 //! (name, description, input schema — what the provider is sent) are pinned
-//! by a snapshot taken before the flow tools moved into the catalog. Moving
-//! them must not change a byte of it. (`coverage.status` was already renamed
-//! `goal.coverage` in W1, so the lead's list carries no rename either; its
-//! old name still resolves for the lead — `status.rs`'s
-//! `the_legacy_coverage_status_name_resolves_to_goal_coverage_in_a_lead`.)
+//! by a snapshot. W5 moved the flow tools into the catalog without changing a
+//! byte; W7 changed the launch tools on purpose: the lead's `dispatch` /
+//! `join` / `workflows.generate` are the unified catalog tools (the old
+//! `run_workflow` is an alias of `dispatch`), and a unit, which now has the
+//! flow's launcher, gets `dispatch` / `join` from its default grant.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -13,8 +13,8 @@ use chrono::{DateTime, Utc};
 use rupu_agent::runner::CapturingMockProvider;
 use rupu_agent::{ScriptedTurn, StopReason};
 use rupu_agentiflow::{
-    run_agentiflow, AgentiflowDef, GenerationCapability, LeadInputs, LeadProvider,
-    MockUnitLauncher, ProviderFactory, RunAgentiflowOpts,
+    run_agentiflow, AgentiflowDef, GenerationCapability, LeadInputs, LeadProvider, ProviderFactory,
+    RunAgentiflowOpts,
 };
 use rupu_providers::{LlmProvider, LlmRequest};
 use rupu_runtime::assembly::{
@@ -128,7 +128,9 @@ fn lead_toolset(lead_tools: &str) -> Value {
             },
         },
         run_id: "af_parity".into(),
-        unit_launcher: Some(Arc::new(MockUnitLauncher::scripted(vec![]))),
+        process_backend: Some(Arc::new(rupu_launch::testing::ScriptedProcesses::scripted(
+            vec![],
+        ))),
         generation: Some(generation),
         pricing: Default::default(),
     })
@@ -137,8 +139,10 @@ fn lead_toolset(lead_tools: &str) -> Value {
 }
 
 /// The services `rupu run --fleet-run-dir <dir> --fleet-participant <p>`
-/// launches its unit with (`cmd/run.rs`).
+/// launches its unit with (`cmd/run.rs`): its bus and collectors, and a
+/// launcher like every `rupu run`'s.
 fn unit_launch(
+    global: &Path,
     run_dir: &Path,
     participant: &str,
 ) -> (
@@ -147,9 +151,23 @@ fn unit_launch(
     String,
 ) {
     let s = rupu_agentiflow::FlowUnitServices::for_participant(run_dir, participant);
+    let launcher = rupu_launch::RunLauncher::new(rupu_launch::LaunchEnv {
+        assembler: Arc::new(RunAssembler::new(AssemblyContext::minimal(
+            global.to_path_buf(),
+        ))),
+        store: Arc::new(rupu_orchestrator::RunStore::new(global.join("runs"))),
+        events: None,
+        namer: None,
+        backend: Arc::new(rupu_launch::testing::ScriptedProcesses::scripted(vec![])),
+        runtime: tokio::runtime::Handle::current(),
+        max_concurrent: 8,
+        generation: None,
+        project: None,
+    });
     (
         LaunchServices {
             message_bus: Some(s.message_bus),
+            launcher: Some(launcher),
             ..Default::default()
         },
         s.collectors,
@@ -170,7 +188,7 @@ async fn unit_toolset(unit_frontmatter: &str) -> Value {
     ))
     .unwrap();
     let (provider, captured) = capturing();
-    let (mut services, collectors, flow_id) = unit_launch(&run_dir, "recon#1");
+    let (mut services, collectors, flow_id) = unit_launch(&global, &run_dir, "recon#1");
     services.provider = Some(PreparedProvider::injected(
         "mock",
         "mock-1",
@@ -209,6 +227,7 @@ async fn unit_toolset(unit_frontmatter: &str) -> Value {
         pause: None,
         services,
         collectors,
+        link: None,
     };
     rupu_runtime::run_agent(&assembler, spec)
         .await
@@ -219,13 +238,13 @@ async fn unit_toolset(unit_frontmatter: &str) -> Value {
 }
 
 #[test]
-fn lead_toolset_is_unchanged() {
+fn lead_toolset_snapshot() {
     insta::assert_yaml_snapshot!("lead_no_declared_tools", lead_toolset("[]"));
     insta::assert_yaml_snapshot!("lead_declares_read_file", lead_toolset("[read_file]"));
 }
 
 #[tokio::test]
-async fn unit_toolset_is_unchanged() {
+async fn unit_toolset_snapshot() {
     insta::assert_yaml_snapshot!("unit_default_grant", unit_toolset("").await);
     insta::assert_yaml_snapshot!(
         "unit_declares_read_file",

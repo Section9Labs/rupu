@@ -50,6 +50,8 @@ base64.workspace = true
 
 # In-workspace
 rupu-orchestrator = { path = "../rupu-orchestrator" }
+# The children ledger (`children.jsonl`) the run detail and units view read.
+rupu-launch = { workspace = true }
 rupu-config = { path = "../rupu-config" }
 rupu-agent = { path = "../rupu-agent" }
 rupu-workspace = { path = "../rupu-workspace" }

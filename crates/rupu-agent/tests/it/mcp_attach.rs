@@ -61,7 +61,6 @@ async fn offered_tools(agent_tools: Option<Vec<String>>) -> Vec<String> {
             hooks: Default::default(),
             pause: None,
             collectors: Vec::new(),
-            extra_tools: Vec::new(),
             transcript_path: tmp.path().join("run.jsonl"),
         },
         agent_tools.as_deref(),
@@ -82,16 +81,16 @@ async fn mcp_registry_attaches_tools_to_run() {
     let tool_names: Vec<&str> = names.iter().map(String::as_str).collect();
 
     // The default grant: the core tools plus every MCP connector tool. The
-    // sub-agent dispatch pair needs a dispatcher, which this run has none
-    // of, so it is not offered (W2: a tool is offered only where it works).
+    // launch pair needs a launcher, which this run has none of, so it is not
+    // offered (W2: a tool is offered only where it works).
     assert!(
         tool_names.contains(&"bash"),
         "builtin bash should still be present: {tool_names:?}"
     );
-    for name in ["dispatch_agent", "dispatch_agents_parallel"] {
+    for name in ["dispatch", "join"] {
         assert!(
             !tool_names.contains(&name),
-            "{name} needs a dispatcher this run lacks: {tool_names:?}"
+            "{name} needs a launcher this run lacks: {tool_names:?}"
         );
     }
     assert!(

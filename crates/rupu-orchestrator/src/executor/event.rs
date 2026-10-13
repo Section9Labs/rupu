@@ -210,7 +210,13 @@ pub enum Event {
     /// loop).
     DispatchStarted {
         run_id: String,
+        /// The child's own run id (`sub_<ULID>` for a sub-agent, `run_<ULID>`
+        /// for a process child).
         sub_run_id: String,
+        /// How the child runs (`subagent`, `agent`, `workflow`; W7). Absent
+        /// in older event logs, which only ever held sub-agents.
+        #[serde(default = "subagent_kind")]
+        kind: String,
         agent: Option<String>,
         transcript_path: PathBuf,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -226,6 +232,8 @@ pub enum Event {
     DispatchCompleted {
         run_id: String,
         sub_run_id: String,
+        #[serde(default = "subagent_kind")]
+        kind: String,
         success: bool,
         tokens_in: u64,
         tokens_out: u64,
@@ -287,6 +295,12 @@ impl Event {
             Event::Unknown => "",
         }
     }
+}
+
+/// The kind a `DispatchStarted` / `DispatchCompleted` written before W7
+/// had: every child was an in-process sub-agent.
+fn subagent_kind() -> String {
+    "subagent".into()
 }
 
 #[cfg(test)]
@@ -485,11 +499,23 @@ mod tests {
         assert!(matches!(back, Event::StepResumed { .. }));
     }
 
+    /// A `dispatch_*` line written before W7 has no `kind`: it was a
+    /// sub-agent.
+    #[test]
+    fn a_dispatch_event_without_a_kind_reads_as_a_subagent() {
+        let line = r#"{"type":"dispatch_completed","run_id":"r","sub_run_id":"sub_1","success":true,"tokens_in":1,"tokens_out":2}"#;
+        match serde_json::from_str::<Event>(line).unwrap() {
+            Event::DispatchCompleted { kind, .. } => assert_eq!(kind, "subagent"),
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn dispatch_started_round_trips() {
         let ev = Event::DispatchStarted {
             run_id: "run_parent".into(),
             sub_run_id: "sub_child".into(),
+            kind: "subagent".into(),
             agent: Some("security-reviewer".into()),
             transcript_path: PathBuf::from("/runs/run_parent/sub_child.jsonl"),
             codename: None,
@@ -530,6 +556,7 @@ mod tests {
         let ev = Event::DispatchCompleted {
             run_id: "run_parent".into(),
             sub_run_id: "sub_child".into(),
+            kind: "subagent".into(),
             success: true,
             tokens_in: 12,
             tokens_out: 34,
@@ -637,6 +664,7 @@ mod tests {
         let dispatch = Event::DispatchCompleted {
             run_id: "r".into(),
             sub_run_id: "sub".into(),
+            kind: "subagent".into(),
             success: false,
             tokens_in: 0,
             tokens_out: 0,

@@ -79,7 +79,6 @@ fn opts(
             hooks: Default::default(),
             pause: None,
             collectors: Vec::new(),
-            extra_tools: Vec::new(),
             transcript_path: workspace.join("run.jsonl"),
         },
         (Some(vec!["report_finding".into()])).as_deref(),

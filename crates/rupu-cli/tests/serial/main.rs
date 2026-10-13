@@ -97,6 +97,7 @@ mod customer_cli;
 mod customer_layer;
 mod engagement_resume;
 mod host_local;
+mod launch_kinds;
 mod multi_gate_approve;
 mod netflow_run;
 mod netflow_subprocess_live;

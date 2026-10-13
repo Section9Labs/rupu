@@ -12,8 +12,9 @@
 use crate::runner::{StepFactory, StepLaunch, StepRequest};
 use crate::workflow::Workflow;
 use async_trait::async_trait;
+use rupu_runtime::argv::LaunchLink;
 use rupu_runtime::assembly::{AssembleError, RunAssembler};
-use rupu_tools::{AgentDispatcher, PermissionMode};
+use rupu_tools::{Launcher, PermissionMode, WorkflowGenerator};
 use std::sync::Arc;
 
 /// `StepFactory` impl that loads each step's `agent:` from the project-
@@ -30,9 +31,14 @@ pub struct DefaultStepFactory {
     /// Formatted `## Run target` text to append to each step's system prompt.
     /// `None` when no `--target` was supplied at workflow invocation.
     pub system_prompt_suffix: Option<String>,
-    /// The in-process sub-agent dispatcher every step's run is offered
-    /// (`dispatch_agent`). `None` = the steps can't dispatch.
-    pub dispatcher: Option<Arc<dyn AgentDispatcher>>,
+    /// The launcher every step's run is offered (`dispatch` / `join`).
+    /// `None` = the steps can't launch.
+    pub launcher: Option<Arc<dyn Launcher>>,
+    /// What `workflows.generate` authors with.
+    pub workflow_generator: Option<Arc<dyn WorkflowGenerator>>,
+    /// The run is a process child of another run: every step carries the
+    /// link (its depth, ceiling, caps and usage root).
+    pub link: Option<LaunchLink>,
     /// Coverage/findings scope every step reports under. `None` (the
     /// default for every ordinary workflow run) keeps the historical
     /// per-workflow scope — the workflow's own name. `Some(name)` is set
@@ -120,7 +126,9 @@ impl StepFactory for DefaultStepFactory {
         // Workflow-level concerns take precedence over agent-level concerns:
         // when the workflow declares `concerns:`, every step uses it.
         spec.overrides.concerns = self.workflow.concerns.clone();
-        spec.services.dispatcher = self.dispatcher.clone();
+        spec.services.launcher = self.launcher.clone();
+        spec.services.workflow_generator = self.workflow_generator.clone();
+        spec.link = self.link.clone();
         Ok(StepLaunch {
             assembler: Arc::clone(&self.assembler),
             spec,
@@ -137,6 +145,10 @@ impl StepFactory for DefaultStepFactory {
 
     fn system_prompt_suffix(&self) -> Option<&str> {
         self.system_prompt_suffix.as_deref()
+    }
+
+    fn launcher(&self) -> Option<Arc<dyn rupu_tools::Launcher>> {
+        self.launcher.clone()
     }
 
     fn engagement_profiles(&self) -> Vec<String> {
@@ -187,7 +199,9 @@ steps:
             assembler: Arc::new(RunAssembler::new(ctx)),
             mode: rupu_tools::PermissionMode::Bypass,
             system_prompt_suffix: None,
-            dispatcher: None,
+            launcher: None,
+            workflow_generator: None,
+            link: None,
             scope_name_override: None,
         }
     }

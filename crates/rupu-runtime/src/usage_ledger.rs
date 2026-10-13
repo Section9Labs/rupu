@@ -49,6 +49,11 @@ pub struct LedgerRow {
     /// Absent on rows written before it existed (reads as `0`).
     #[serde(default)]
     pub cache_write_tokens: u64,
+    /// A copy of a launched child's row in its root's ledger (W7, L5), for
+    /// a budget over the whole launch tree. The child's own ledger holds the
+    /// row that counts toward its run; a reader that sums runs skips these.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rollup: bool,
 }
 
 /// Where in the workflow an agent run sits. `step_id: None` = a dispatched
@@ -58,6 +63,8 @@ pub struct LedgerTag {
     pub step_id: Option<String>,
     pub unit_index: Option<usize>,
     pub unit_key: Option<String>,
+    /// The rows are [`LedgerRow::rollup`] copies.
+    pub rollup: bool,
 }
 
 /// Running totals for one unit, filled by its hook — the honest source for
@@ -186,6 +193,7 @@ impl UsageLedger {
                 output_tokens: u.output_tokens,
                 cached_tokens: u.cached_tokens,
                 cache_write_tokens: u.cache_write_tokens,
+                rollup: tag.rollup,
             });
         })
     }
@@ -217,6 +225,7 @@ mod tests {
                 step_id: Some("assess".into()),
                 unit_index: Some(2),
                 unit_key: Some("gw".into()),
+                rollup: false,
             },
             "run_A".into(),
             None,
@@ -340,6 +349,7 @@ mod tests {
             output_tokens: 2,
             cached_tokens: 0,
             cache_write_tokens: 0,
+            rollup: false,
         };
         let v = serde_json::to_value(&row).unwrap();
         assert_eq!(v["kind"], "compaction");

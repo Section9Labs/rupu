@@ -288,22 +288,12 @@ pub enum LeadProvider {
     },
 }
 
-/// Mints a provider for each `generate_workflow` call. Unlike
-/// [`ProviderFactory`] it is shared (`Arc`, `Fn`) because the tool holding it
-/// is invoked through `&self` and may be called many times in one run.
-pub type GenerationProviderFactory = Arc<dyn Fn() -> Box<dyn LlmProvider> + Send + Sync>;
+/// How the lead authors new workflows (`workflows.generate`): the
+/// provider/model and a factory minting a provider per call.
+pub type GenerationCapability = rupu_launch::Generation;
 
-/// How the lead authors new workflows: the provider/model to generate
-/// with and a factory that mints a provider for each generation call.
-/// Built by the launch site exactly like `make_provider` (`rupu agentiflow run`
-/// builds both, Plan 4-1); when absent, the lead is not offered
-/// `generate_workflow`.
-#[derive(Clone)]
-pub struct GenerationCapability {
-    pub provider: String,
-    pub model: String,
-    pub factory: GenerationProviderFactory,
-}
+/// Mints a provider for each generation call.
+pub type GenerationProviderFactory = rupu_launch::GenerationProviderFactory;
 
 /// Static configuration for a [`RunAgentLeadDriver`].
 pub struct LeadConfig {
@@ -319,9 +309,9 @@ pub struct LeadConfig {
     /// builtins" by omission, because the lead runs unattended under bypass
     /// permission on digest text an attacker can influence. (The origin's
     /// grant, `origin:flow_lead`, adds the board / mailbox, status and roster
-    /// tools and `findings.report`; the engagement's ambient grant adds
-    /// `assets.mark`; the launch tools ride `extra_tools` — so an empty list
-    /// is not "no tools at all".)
+    /// tools, `findings.report` and the launch tools; the engagement's
+    /// ambient grant adds `assets.mark` — so an empty list is not "no tools
+    /// at all".)
     pub agent: rupu_agent::AgentSpec,
     /// Turns the lead may take in ONE round; must be at least 1
     /// ([`RunAgentLeadDriver::new`] rejects 0, which would bust every round
@@ -360,11 +350,16 @@ pub struct LeadConfig {
     /// next, as a session does. `ModelLimits::unknown()` = resolved by the
     /// first round.
     pub limits: ModelLimits,
-    /// The lead's launch tools (`dispatch`, `join`, `run_workflow`,
-    /// `workflows.generate`), injected into every round's grant as
-    /// `origin:injected` until W7 replaces them. Shared `Arc`s -- the same
-    /// instances serve every round, so their participant counter persists.
-    pub extra_tools: Vec<Arc<dyn rupu_tools::Tool>>,
+    /// What the lead's `dispatch` / `join` start and watch units with: the
+    /// flow's launcher, one for every round, so a unit dispatched in one
+    /// round is joined in a later one. The flow stops the unjoined ones when
+    /// it winds down, never at a round's end.
+    pub launcher: Option<Arc<dyn rupu_tools::Launcher>>,
+    /// What `workflows.generate` authors with; `None` = not offered.
+    pub workflow_generator: Option<Arc<dyn rupu_tools::WorkflowGenerator>>,
+    /// The flow's pool: what the lead (and its in-process children) may
+    /// launch.
+    pub flow_pool: Option<rupu_tools::LaunchPool>,
     /// The lead's address on the flow's board and mailboxes (participant
     /// `lead`), behind its `board.*` / `msg.send` catalog tools. One bus for
     /// every round, so the claims it holds persist across rounds.
@@ -406,10 +401,9 @@ pub struct LeadConfig {
 /// bypass permission, so the tool gate is the run's grant: the agent's
 /// `tools:` (exactly that list; empty = no builtins/MCP), the origin's
 /// coordination set over [`LeadConfig::message_bus`] / `run_status` /
-/// `catalog`, the engagement's ambient findings tools, and
-/// [`LeadConfig::extra_tools`] (the launch tools, until W7). Its launcher
-/// is the agentiflow's own unit supervisor (the `dispatch` / `join` tools),
-/// not the in-process dispatcher. [`LeadConfig::collectors`] feed the lead's
+/// `catalog` / `launcher`, and the engagement's ambient findings tools. Its
+/// launcher is the flow's ([`LeadConfig::launcher`]), bound by the flow's
+/// pool. [`LeadConfig::collectors`] feed the lead's
 /// inbox and standing directives into each turn. No parent run, depth 0.
 ///
 /// ## Interrupts (`send --now`)
@@ -654,7 +648,9 @@ impl RunAgentLeadDriver {
             hooks: Default::default(),
             pause: Some(pause.clone()),
             services: LaunchServices {
-                extra_tools: self.cfg.extra_tools.clone(),
+                launcher: self.cfg.launcher.clone(),
+                workflow_generator: self.cfg.workflow_generator.clone(),
+                flow_pool: self.cfg.flow_pool.clone(),
                 message_bus: self.cfg.message_bus.clone(),
                 run_status: self.cfg.run_status.clone(),
                 catalog: self.cfg.catalog.clone(),
@@ -663,6 +659,7 @@ impl RunAgentLeadDriver {
                 ..Default::default()
             },
             collectors: self.cfg.collectors.clone(),
+            link: None,
         };
         (spec, pause, ceiling)
     }
@@ -1001,7 +998,9 @@ mod tests {
                 path: dir.to_path_buf(),
             },
             limits: rupu_providers::model_limits::ModelLimits::unknown(),
-            extra_tools: Vec::new(),
+            launcher: None,
+            workflow_generator: None,
+            flow_pool: None,
             message_bus: None,
             run_status: None,
             catalog: None,

@@ -27,8 +27,8 @@ pub enum Origin {
         /// workflow's name (an agentiflow-launched workflow unit).
         scope_override: Option<String>,
     },
-    /// An in-process child started by `dispatch_agent` /
-    /// `dispatch_agents_parallel` (W7: `dispatch kind: subagent`).
+    /// An in-process child started by `dispatch {kind: subagent}` (or a
+    /// legacy `dispatch_agent`).
     SubAgent { parent: ParentRun },
     /// One `rupu session` turn.
     SessionTurn {
@@ -106,7 +106,8 @@ pub struct OriginDefaults {
     pub coverage_stream: CoverageStream,
     /// The SCM/issue registry (MCP connector tools) is offered.
     pub scm: bool,
-    /// The in-process dispatcher is offered when the launch provides one.
+    /// The launcher (`dispatch` / `join`) is offered when the launch
+    /// provides one.
     pub launcher: bool,
     /// The agent/workflow catalog (`agents.*`, `catalog.search`, …) is
     /// offered when the context or the launch provides one.
@@ -160,6 +161,7 @@ pub fn defaults_for(origin: &Origin) -> OriginDefaults {
                 step_id: Some(step_id.clone()),
                 unit_index: unit.as_ref().map(|u| u.index),
                 unit_key: unit.as_ref().and_then(|u| u.key.clone()),
+                rollup: false,
             },
             coverage_stream: CoverageStream::None,
             scm: true,
@@ -215,16 +217,15 @@ pub fn defaults_for(origin: &Origin) -> OriginDefaults {
             ledger_tag: LedgerTag::default(),
             coverage_stream: CoverageStream::None,
             scm: true,
-            // The lead's launcher is the agentiflow's own unit supervisor
-            // (W7 makes it the one launcher).
-            launcher: false,
+            launcher: true,
             catalog: true,
             origin_grant: Some(AmbientGrant::flow_lead()),
             admission: true,
         },
-        // A fleet unit pools its findings under the agentiflow's scope and,
-        // until W7 passes `--usage-root`, meters itself in its own run
-        // directory, which the agentiflow folds into its budget.
+        // A fleet unit pools its findings under the agentiflow's scope. It
+        // keeps its own usage ledger; launched with `--usage-root` (the
+        // flow's ledger), [`super::RunAssembler::assemble`] also copies each
+        // of its calls there as a rollup row.
         Origin::FlowUnit { flow_id, .. } => OriginDefaults {
             surface: Surface::Agentiflow,
             scope_name: Some(flow_id.clone()),

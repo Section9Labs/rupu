@@ -49,7 +49,6 @@ async fn run_passes_all_default_tools_to_provider() {
             hooks: Default::default(),
             pause: None,
             collectors: Vec::new(),
-            extra_tools: Vec::new(),
             transcript_path: tmp.path().join("run.jsonl"),
         },
         None,
@@ -65,7 +64,7 @@ async fn run_passes_all_default_tools_to_provider() {
     assert_eq!(
         tools.len(),
         7,
-        "expected the 7 core tools (no dispatcher, no SCM registry), got {}",
+        "expected the 7 core tools (no launcher, no SCM registry), got {}",
         tools.len()
     );
 
@@ -144,7 +143,6 @@ async fn run_with_agent_tools_filter_passes_only_listed_tools() {
             hooks: Default::default(),
             pause: None,
             collectors: Vec::new(),
-            extra_tools: Vec::new(),
             transcript_path: tmp.path().join("run.jsonl"),
         },
         (Some(vec!["bash".into(), "read_file".into()])).as_deref(),

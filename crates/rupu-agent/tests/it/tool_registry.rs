@@ -2,37 +2,54 @@ use rupu_agent::ToolRegistry;
 use rupu_tools::{AliasScope, Tool, ToolCatalog, ToolContext};
 use std::sync::Arc;
 
-/// The catalog body of `name` in a context that can dispatch.
+/// The catalog body of `name` in a context that can launch children.
 fn builtin_tool(name: &str) -> Option<Arc<dyn Tool>> {
     let mut ctx = ToolContext::default();
-    ctx.services.dispatcher = Some(Arc::new(NoDispatch));
+    ctx.services.launcher = Some(Arc::new(NoLaunch));
     rupu_tools::bodies::body(name, &ctx)
 }
 
-#[derive(Debug)]
-struct NoDispatch;
+struct NoLaunch;
 
 #[async_trait::async_trait]
-impl rupu_tools::AgentDispatcher for NoDispatch {
-    async fn dispatch(
+impl rupu_tools::Launcher for NoLaunch {
+    async fn check(
         &self,
-        _agent: &str,
-        _prompt: String,
-        _parent: &rupu_tools::RunIdentity,
-        _permission: rupu_tools::SpawnPermission,
-    ) -> Result<rupu_tools::DispatchOutcome, rupu_tools::DispatchError> {
+        _req: &rupu_tools::ChildRequest,
+        _from: &ToolContext,
+    ) -> Result<(), rupu_tools::LaunchError> {
         unreachable!("never called")
+    }
+    async fn launch(
+        &self,
+        _req: rupu_tools::ChildRequest,
+        _from: &ToolContext,
+    ) -> Result<rupu_tools::ChildHandle, rupu_tools::LaunchError> {
+        unreachable!("never called")
+    }
+    async fn join(
+        &self,
+        _from: &rupu_tools::RunIdentity,
+        _which: rupu_tools::JoinSet,
+        _timeout: std::time::Duration,
+        _until: rupu_tools::Until,
+    ) -> Vec<rupu_tools::ChildStatus> {
+        unreachable!("never called")
+    }
+    async fn finish(&self, _from: &rupu_tools::RunIdentity, _how: rupu_tools::ParentEnd) {}
+    fn children(&self, _from: &rupu_tools::RunIdentity) -> Vec<rupu_tools::ChildStatus> {
+        Vec::new()
     }
 }
 
 const BUILTINS: [&str; 9] = [
     "ast_grep",
     "bash",
-    "dispatch_agent",
-    "dispatch_agents_parallel",
+    "dispatch",
     "edit_file",
     "glob",
     "grep",
+    "join",
     "read_file",
     "write_file",
 ];

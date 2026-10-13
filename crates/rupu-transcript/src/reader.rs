@@ -24,6 +24,13 @@ use thiserror::Error;
 /// thinking block) stay separate paragraphs in Markdown.
 const FRAGMENT_SEPARATOR: &str = "\n\n";
 
+/// The final answer of the transcript at `path` ([`final_turn_text`] over its
+/// events): a workflow step's output, a dispatched child's result. `None`
+/// when the file can't be opened or holds no assistant text.
+pub fn final_answer(path: &Path) -> Option<String> {
+    final_turn_text(JsonlReader::iter(path).ok()?.flatten())
+}
+
 /// The run's final answer text: every non-empty `AssistantMessage` written
 /// after the last `TurnStart`, joined by a blank line. A provider can end a
 /// turn with several text blocks (text, thinking, text), and the runner

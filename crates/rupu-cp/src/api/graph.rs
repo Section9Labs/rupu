@@ -998,6 +998,7 @@ mod tests {
         let dispatch = serde_json::to_string(&Event::DispatchStarted {
             run_id: "run_x".into(),
             sub_run_id: "sub_1".into(),
+            kind: "subagent".into(),
             agent: Some("helper".into()),
             transcript_path: "/t/s.jsonl".into(),
             codename: Some("jade-reef/heron>owl#1".into()),

@@ -83,6 +83,39 @@ expression: "unit_toolset(\"\").await"
       - work_unit
     type: object
   name: board.release
+- description: "Start a child run and get a handle back at once; the child works on its own. `kind` picks how it runs: `subagent` (the default: in this process, for a quick delegation such as reviewing a file), `agent` (its own `rupu run` process, for long or heavy work), or `workflow` (its own `rupu workflow run`). Name an agent from your dispatchable agents, a workflow from your dispatchable workflows, or pass a `file` that `workflows.generate` returned. Call `join` with the handle to collect the result, or pass `wait: true` to start the child and wait for it in one call. Children you never join are stopped when you finish."
+  input_schema:
+    properties:
+      file:
+        description: "Kind `workflow` only: a workflow file `workflows.generate` returned, instead of `name`"
+        type: string
+      inputs:
+        additionalProperties: true
+        description: "A workflow's declared inputs as name: value pairs; for an agent, structured inputs added to its prompt"
+        type: object
+      kind:
+        description: "How the child runs; default `subagent`"
+        enum:
+          - subagent
+          - agent
+          - workflow
+        type: string
+      name:
+        description: "The agent (or, for kind `workflow`, the workflow) to run"
+        type: string
+      prompt:
+        description: "An agent child's task: what to do and what to report back"
+        type: string
+      timeout_secs:
+        description: "With `wait`: how long to wait, in seconds; default 300"
+        maximum: 3600
+        minimum: 0
+        type: integer
+      wait:
+        description: Wait for the child to finish and return its result too; default false
+        type: boolean
+    type: object
+  name: dispatch
 - description: "Replace an exact string in a file. The `old_string` must match exactly once in the file; if it matches zero times or more than once, the edit fails. Pass enough surrounding context (a few lines before/after) to make `old_string` uniquely identifying. The file must already exist; for new files use `write_file`."
   input_schema:
     properties:
@@ -124,6 +157,27 @@ expression: "unit_toolset(\"\").await"
       - pattern
     type: object
   name: grep
+- description: "Wait for children you started with `dispatch` and collect their results. Name `handles` (omit them for every child you have not collected yet). Returns each child's status: `done` (with its output and whether it succeeded), `failed`, `abandoned`, or `running` / `pending` if it has not finished within the timeout (join again to keep waiting). `until: any` returns as soon as one of them finishes."
+  input_schema:
+    properties:
+      handles:
+        description: "Handles `dispatch` returned; omit for every child of this run not yet joined"
+        items:
+          type: string
+        type: array
+      timeout_secs:
+        description: "How long to wait, in seconds (0 = just look); default 300"
+        maximum: 3600
+        minimum: 0
+        type: integer
+      until:
+        description: "Return when all of them have finished (default), or any one"
+        enum:
+          - all
+          - any
+        type: string
+    type: object
+  name: join
 - description: "Send a message. `to` is a participant id, a role, \"parent\", or \"lead\" (delivered to exactly that inbox), or \"broadcast\" (every participant sees it once, from the moment it started listening; the broadcast log is capped per run, so don't spam it)."
   input_schema:
     properties:

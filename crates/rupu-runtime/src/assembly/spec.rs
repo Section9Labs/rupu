@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rupu_agent::{AgentSpec, Hooks, StreamOpts, TurnCollector, UserTurn};
-use rupu_tools::{AgentDispatcher, CatalogPort, PermissionMode, Prompter, RunStatus, Tool};
+use rupu_tools::{
+    CatalogPort, LaunchPool, Launcher, PermissionMode, Prompter, RunStatus, WorkflowGenerator,
+};
 
 use super::origin::Origin;
 
@@ -36,6 +38,10 @@ pub struct LaunchSpec {
     pub pause: Option<tokio_util::sync::CancellationToken>,
     pub services: LaunchServices,
     pub collectors: Vec<Arc<dyn TurnCollector>>,
+    /// A process child's link to the run that launched it
+    /// (`--launch-depth` & co., W7 D18): its depth, parent, ceiling, caps and
+    /// usage root. `None` for a top-level run.
+    pub link: Option<crate::argv::LaunchLink>,
 }
 
 /// The workspace a run acts in.
@@ -77,18 +83,18 @@ pub struct Overrides {
 /// Services the site provides (they belong to the root run, not this one).
 #[derive(Default)]
 pub struct LaunchServices {
-    /// The in-process sub-agent dispatcher
-    /// ([`crate::dispatch::InProcessDispatcher`]), offered when the origin's
-    /// defaults allow it.
-    pub dispatcher: Option<Arc<dyn AgentDispatcher>>,
+    /// The launcher behind `dispatch` / `join` (`rupu_launch::RunLauncher`),
+    /// offered when the origin's defaults allow it.
+    pub launcher: Option<Arc<dyn Launcher>>,
+    /// What `workflows.generate` authors with.
+    pub workflow_generator: Option<Arc<dyn WorkflowGenerator>>,
+    /// The agentiflow pool an agentiflow lead runs inside: what it (and its
+    /// in-process children) may launch.
+    pub flow_pool: Option<LaunchPool>,
     /// The run's netflow sink, when the site built it already (a top-level
     /// run's sink exists before its SCM registry and provider). `None` = the
     /// assembler builds one for the run.
     pub netflow: Option<Arc<dyn rupu_netflow::FlowSink>>,
-    /// Pre-built tools injected into the run (`origin:injected`): an
-    /// agentiflow lead's launch tools (`dispatch`, `join`, `run_workflow`,
-    /// `workflows.generate`) until W7 replaces them. Temporary.
-    pub extra_tools: Vec<Arc<dyn Tool>>,
     /// The run's address on its agentiflow's board and mailboxes
     /// (`board.*`, `msg.send`): an agentiflow lead's or unit's, built by
     /// the flow. Per run: it holds the run's participant id and claims.

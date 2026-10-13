@@ -27,8 +27,8 @@ use std::sync::Arc;
 
 use rupu_agent::{AgentRunOpts, Hooks, OnUsageCallback, RunExit};
 use rupu_tools::{
-    BashConfig, GrantError, ParentLink, PermissionMode, PermissionPolicy, RunIdentity, ToolContext,
-    ToolServices, WorkspaceScope,
+    BashConfig, GrantError, LaunchPool, LaunchScope, ParentLink, PermissionMode, PermissionPolicy,
+    RunIdentity, ToolContext, ToolServices, WorkspaceScope,
 };
 
 use crate::hop_builder::{recovery_opts, AgentOverrides};
@@ -353,7 +353,7 @@ impl RunAssembler {
     /// the caller's (an action step's workflow run, an MCP server session);
     /// the workspace carries the config's `[bash]`, and the services are what
     /// such a caller provides — the context's SCM registry, its findings base
-    /// options and its customer. No dispatcher, coverage or prompter: there
+    /// options and its customer. No launcher, coverage or prompter: there
     /// is no agent loop around these calls. `netflow_sink` is where a
     /// subprocess's flows go (with the context's capture backend); a caller
     /// with no run ledger to attribute them to passes
@@ -654,24 +654,45 @@ impl RunAssembler {
             },
         );
 
-        let parent = match &spec.origin {
-            Origin::SubAgent { parent } => Some(ParentLink {
-                run_id: parent.identity.run_id.clone(),
-                codename: parent.identity.codename.clone(),
-                root_run_id: parent
-                    .identity
-                    .parent
-                    .as_ref()
-                    .map(|p| p.root_run_id.clone())
-                    .unwrap_or_else(|| parent.identity.run_id.clone()),
-            }),
-            _ => None,
+        // Who launched this run: an in-process parent, or one across a
+        // process boundary (`--launch-*`, D18).
+        let (parent, depth) = match (&spec.origin, &spec.link) {
+            (Origin::SubAgent { parent }, _) => (
+                Some(ParentLink {
+                    run_id: parent.identity.run_id.clone(),
+                    codename: parent.identity.codename.clone(),
+                    root_run_id: parent
+                        .identity
+                        .parent
+                        .as_ref()
+                        .map(|p| p.root_run_id.clone())
+                        .unwrap_or_else(|| parent.identity.run_id.clone()),
+                }),
+                parent.identity.depth + 1,
+            ),
+            (_, Some(link)) => (
+                Some(ParentLink {
+                    run_id: link.parent_run.clone(),
+                    codename: spec
+                        .codename
+                        .as_deref()
+                        .and_then(|c| c.rsplit_once('>'))
+                        .map(|(p, _)| p.to_string()),
+                    root_run_id: link.root_run.clone(),
+                }),
+                link.depth,
+            ),
+            _ => (None, 0),
         };
-        let depth = match &spec.origin {
-            Origin::SubAgent { parent } => parent.identity.depth + 1,
-            _ => 0,
-        };
-        let identity = Arc::new(RunIdentity {
+
+        let (ledger, coverage_stream) = self.root_ledger_and_stream(&spec.origin, &spec.run_id);
+        let (launch, connector_cap) =
+            self.launch_scope(&spec, ledger.as_ref().map(|l| l.path().to_path_buf()));
+        // A process child (or a run under one) also copies each call to the
+        // launch tree's root ledger, for a budget over the tree (L5); its own
+        // ledger stays what every report reads.
+        let rollup = launch.rollup_root.clone().map(UsageLedger::open);
+        let identity = RunIdentity {
             run_id: spec.run_id.clone(),
             codename: spec.codename.clone(),
             agent: agent.name.clone(),
@@ -682,17 +703,17 @@ impl RunAssembler {
             surface: d.surface,
             scope_name: d.scope_name.clone(),
             step_id: d.step_id.clone(),
-            dispatchable_agents: agent.dispatchable_agents.clone(),
-        });
+            launch,
+        };
 
-        let permission = match spec.ceiling {
+        let ceiling = spec.ceiling.or(spec.link.as_ref().map(|l| l.ceiling));
+        let permission = match ceiling {
             Some(ceiling) => {
                 PermissionPolicy::for_child(ceiling, declared_mode(agent), spec.prompter.clone())
             }
             None => PermissionPolicy::new(spec.mode, spec.prompter.clone()),
         };
 
-        let (ledger, coverage_stream) = self.root_ledger_and_stream(&spec.origin, &spec.run_id);
         let findings =
             self.ctx
                 .findings
@@ -702,8 +723,8 @@ impl RunAssembler {
                     spec.overrides.findings_default,
                     agent.findings_profile,
                 ));
-        let tool_context = ToolContext {
-            identity: Arc::clone(&identity),
+        let mut tool_context = ToolContext {
+            identity: Arc::new(identity),
             workspace: WorkspaceScope {
                 id: spec.workspace.id.clone(),
                 path: spec.workspace.path.clone(),
@@ -711,7 +732,12 @@ impl RunAssembler {
                 read_roots: skills.as_ref().map(|s| s.read_roots()).unwrap_or_default(),
             },
             services: ToolServices {
-                dispatcher: spec.services.dispatcher.clone().filter(|_| d.launcher),
+                launcher: spec.services.launcher.clone().filter(|_| d.launcher),
+                workflow_generator: spec
+                    .services
+                    .workflow_generator
+                    .clone()
+                    .filter(|_| d.launcher),
                 scm: self.ctx.scm.clone().filter(|_| d.scm),
                 findings: Some(findings),
                 // The agent loop sets the writer and the concern catalog it
@@ -754,9 +780,9 @@ impl RunAssembler {
         let grant = rupu_agent::grant::resolve_run_grant(rupu_agent::grant::RunGrantInputs {
             declared: agent.tools.as_deref(),
             step_actions: &d.step_actions,
+            connector_cap: connector_cap.as_deref(),
             concerns: concerns.is_some(),
             origin: d.origin_grant.as_ref(),
-            injected: &spec.services.extra_tools,
             tool_context: &tool_context,
             alias_scope: d.alias_scope,
         });
@@ -776,12 +802,46 @@ impl RunAssembler {
             }
         };
 
+        // The connector tools this run ended up narrowed to are its
+        // children's cap.
+        let launch = &mut Arc::make_mut(&mut tool_context.identity).launch;
+        launch.connector_cap = grant
+            .connector_cap
+            .as_ref()
+            .map(|c| c.iter().map(|n| n.to_string()).collect());
+        launch.granted_connectors = grant
+            .entries
+            .values()
+            .filter(|e| e.descriptor.is_connector())
+            .map(|e| e.canonical.to_string())
+            .collect();
+
         let usage_ledger = ledger.as_ref().map(|l| l.path().to_path_buf());
+        let parent_run = spec
+            .origin
+            .parent_run_id()
+            .or(spec.link.as_ref().map(|l| l.parent_run.as_str()))
+            .map(str::to_string);
         let ledger_hook = ledger.map(|l| {
             l.hook(
                 d.ledger_tag.clone(),
                 spec.run_id.clone(),
-                spec.origin.parent_run_id().map(str::to_string),
+                parent_run.clone(),
+                spec.transcript_path.clone(),
+                agent.name.clone(),
+                None,
+            )
+        });
+        // In the root's ledger a launched run is attributed through its
+        // parent chain, never to a root step that shares its step id.
+        let rollup_hook = rollup.map(|l| {
+            l.hook(
+                crate::usage_ledger::LedgerTag {
+                    rollup: true,
+                    ..Default::default()
+                },
+                spec.run_id.clone(),
+                parent_run,
                 spec.transcript_path.clone(),
                 agent.name.clone(),
                 None,
@@ -789,7 +849,10 @@ impl RunAssembler {
         });
         let hooks = Hooks {
             on_tool_call: spec.hooks.on_tool_call.clone(),
-            on_usage: chain_usage(ledger_hook, spec.hooks.on_usage.clone()),
+            on_usage: chain_usage(
+                ledger_hook,
+                chain_usage(rollup_hook, spec.hooks.on_usage.clone()),
+            ),
         };
 
         let system_prompt = system_prompt_for(agent, &spec.overrides, skills.as_deref());
@@ -801,10 +864,17 @@ impl RunAssembler {
             overrides,
             stream,
             pause,
-            services,
-            collectors,
+            mut collectors,
             ..
         } = spec;
+        // A run that can launch hears about its unfinished children every
+        // turn (W7 §3.6).
+        if let Some(launcher) = &tool_context.services.launcher {
+            collectors.push(Arc::new(crate::children::ChildrenCollector::new(
+                Arc::clone(launcher),
+                Arc::clone(&tool_context.identity),
+            )));
+        }
 
         Ok(AssembledRun {
             opts: AgentRunOpts {
@@ -824,7 +894,6 @@ impl RunAssembler {
                 hooks,
                 pause,
                 collectors,
-                extra_tools: services.extra_tools,
                 transcript_path,
             },
             netflow,
@@ -833,6 +902,108 @@ impl RunAssembler {
             usage_ledger,
         })
     }
+}
+
+impl RunAssembler {
+    /// What the run `spec` may launch and where its children are recorded
+    /// (W7 §3.4), and the connector cap its grant is narrowed by. A child's
+    /// caps are what its parent may launch — in process the parent's own
+    /// scope, across one the `--launch-*` link.
+    fn launch_scope(
+        &self,
+        spec: &LaunchSpec,
+        usage_root: Option<PathBuf>,
+    ) -> (LaunchScope, Option<Vec<String>>) {
+        let flow_dir = match &spec.origin {
+            Origin::FlowLead { flow_dir, .. } | Origin::FlowUnit { flow_dir, .. } => {
+                Some(flow_dir.clone())
+            }
+            _ => None,
+        };
+        let (cap, pool, flow, connector_cap, rollup_root) = match (&spec.origin, &spec.link) {
+            (Origin::SubAgent { parent }, _) => {
+                let p = &parent.identity.launch;
+                (
+                    Some((p.agents.clone(), p.workflows.clone())),
+                    p.pool.clone(),
+                    p.flow.clone(),
+                    p.connector_cap.clone(),
+                    p.rollup_root.clone(),
+                )
+            }
+            (_, Some(link)) => (
+                Some((link.agents.clone(), link.workflows.clone())),
+                // A unit of a flow: the pool reached it as its parent's set.
+                flow_dir.as_ref().map(|_| LaunchPool {
+                    agents: link.agents.clone(),
+                    workflows: link.workflows.clone(),
+                }),
+                flow_dir.clone(),
+                link.actions.clone(),
+                link.usage_root.clone(),
+            ),
+            (Origin::FlowLead { .. }, None) => (
+                None,
+                spec.services.flow_pool.clone(),
+                flow_dir.clone(),
+                None,
+                None,
+            ),
+            _ => (None, None, flow_dir.clone(), None, None),
+        };
+        let agents = allowed(
+            spec.agent.dispatchable_agents.as_deref(),
+            pool.as_ref().map(|p| p.agents.as_slice()),
+            cap.as_ref().map(|c| c.0.as_slice()),
+        );
+        let workflows = allowed(
+            spec.agent.dispatchable_workflows.as_deref(),
+            pool.as_ref().map(|p| p.workflows.as_slice()),
+            cap.as_ref().map(|c| c.1.as_slice()),
+        );
+        let children_dir = match &spec.origin {
+            Origin::FlowLead { flow_dir, .. } => Some(flow_dir.clone()),
+            _ if spec.run_id.is_empty() => None,
+            _ => Some(self.ctx.global.join("runs").join(&spec.run_id)),
+        };
+        (
+            LaunchScope {
+                agents,
+                workflows,
+                pool,
+                connector_cap: None,
+                // Set from the grant, once it is resolved.
+                granted_connectors: Vec::new(),
+                children_dir,
+                usage_root,
+                rollup_root,
+                flow,
+            },
+            connector_cap,
+        )
+    }
+}
+
+/// What a run may launch (W7 §3.4): its own allowlist, its flow's pool when
+/// it is in one (intersected when both are set), within the cap its parent
+/// passed down. Neither declared nor in a flow = nothing.
+fn allowed(
+    declared: Option<&[String]>,
+    pool: Option<&[String]>,
+    cap: Option<&[String]>,
+) -> Vec<String> {
+    let mut out: Vec<String> = match (declared, pool) {
+        (Some(d), Some(p)) => d.iter().filter(|a| p.contains(a)).cloned().collect(),
+        (Some(d), None) => d.to_vec(),
+        (None, Some(p)) => p.to_vec(),
+        (None, None) => Vec::new(),
+    };
+    if let Some(c) = cap {
+        out.retain(|a| c.contains(a));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    out.retain(|a| seen.insert(a.clone()));
+    out
 }
 
 /// The system prompt a run of `agent` sends: the agent's, with the site's

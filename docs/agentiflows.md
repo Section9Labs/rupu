@@ -110,8 +110,8 @@ round:
 | `scope.authorized` | yes | Must be `true`. It is the operator's statement that the fleet may act on the targets unattended |
 | `scope.roots` | no | Root assets of the engagement: `kind` (a root asset kind of an active profile, such as `code:repo`, `network:host`, `web:site`) plus that kind's coordinates |
 | `scope.mode` | no | Accepted and stored, not acted on (section 10) |
-| `pool.agents` | yes | The only agents the lead may `dispatch` |
-| `pool.workflows` | no | A list of workflow names, or `all` for every workflow in the catalog at launch. The only workflows `run_workflow` may start |
+| `pool.agents` | yes | The only agents the lead (and its units) may `dispatch`. A lead or unit agent that also declares `dispatchableAgents` gets the intersection |
+| `pool.workflows` | no | A list of workflow names, or `all` for every workflow in the catalog at launch. The only workflows `dispatch {kind: workflow}` may start |
 | `round.lead_max_turns` | no | Turns the lead may take per round. Default `50`, minimum `1` |
 | `round.ceiling` | no | `{ rounds?, wall_clock? }`: a hard end to the run |
 | `trigger` | no | Accepted and stored, not acted on (section 10) |
@@ -220,10 +220,10 @@ engagement profile), plus these always-on fleet tools:
 
 | Group | Tools | Purpose |
 | --- | --- | --- |
-| Units | `dispatch { agent, prompt }` | Start a pool agent as a unit. Returns a handle at once |
-| | `run_workflow { workflow, inputs? }` | Start a pool workflow as a unit |
-| | `workflows.generate { description, inputs? }` | Write a new workflow and start it as a unit (only offered when generation is available, below) |
-| | `join { handle, timeout_secs? }` | Wait for a unit's result. Default 300 s, at most 3600 s per call |
+| Units | `dispatch { kind: "agent", name, prompt }` | Start a pool agent as a unit. Returns a handle at once |
+| | `dispatch { kind: "workflow", name \| file, inputs? }` | Start a pool workflow, or one `workflows.generate` wrote, as a unit |
+| | `workflows.generate { description }` | Write a new workflow and return its `file` (only offered when generation is available, below) |
+| | `join { handles?, timeout_secs?, until? }` | Wait for units' results. Default 300 s, at most 3600 s per call |
 | Board | `board.claim`, `board.release` | Claim a piece of work (a one-hour lease) so two participants don't duplicate it |
 | | `board.post`, `board.read` | Shared posts of kind `observation`, `question`, `answer`, `vote` or `note` |
 | | `msg.send` | Message one participant's inbox, or `broadcast` |
@@ -232,40 +232,64 @@ engagement profile), plus these always-on fleet tools:
 | Status | `goal.status`, `goal.coverage`, `budget.status` | Re-check goals, coverage and spend mid-round with the same evaluators and meter the envelope uses |
 | Roster | `agents.list`, `agents.get`, `workflows.list`, `workflows.get`, `catalog.search` | Browse the agents and workflows it can draw on |
 
+These are the same catalog `dispatch`, `join` and `workflows.generate` every
+agent run has (see [agent-format.md](agent-format.md#launching-children)), with
+the pool as the allowlist. The pre-unification calls still work and answer in
+their old shapes: `dispatch { agent, prompt }` (no `kind`) starts an agent
+unit and returns `{handle, participant}`, as does `run_workflow { workflow,
+inputs? }`; `generate_workflow { description, inputs? }` writes the workflow and
+starts it in one call (adding `generated_file`). `join { handle }` returns the
+old single-status shape.
+`dispatch` with no `kind` and a `name` is a `subagent`: it runs inside the
+coordinator's process, is not a participant on the board, and its usage is
+charged to the flow's ledger.
+
 Each lead turn also includes the lead's inbox, the standing directives, and a
 short index of the pool, so it knows what it can start without spending a turn
 on `agents.list`.
 
 ### Units
 
-A unit is a separate process:
+A unit is a separate process, started by the same launcher every `dispatch`
+goes through:
 
-- an **agent unit** is `rupu run <agent> --mode bypass ...`;
-- a **workflow unit** is `rupu workflow run <name> --mode bypass --plain ...`
-  (or `--file <path>` for a generated workflow).
+- an **agent unit** is `rupu run <agent> ...`;
+- a **workflow unit** is `rupu workflow run <name> --plain ...` (or `--file
+  <path>` for a generated workflow).
 
-Each unit gets a unique participant id (`<name>#<n>`) and the run's engagement
+A unit runs at the lead's permission mode (`bypass`), capped by its own agent's
+`permissionMode` when that is stricter. Each unit gets a participant id, the
+role part of its codename below the lead (`lynx#1`), and the run's engagement
 profiles. Agent units also get the board, mailbox and directive tools; workflow
 units are findings-only (their steps get no board tools). Its findings and assets
 are pooled with the lead's under one coverage scope, which is what the goals are
-evaluated against. Units don't get `dispatch`, `run_workflow` or
-`workflows.generate`, so they can't start units of their own (an agent's
-in-process `dispatch_agent` sub-agents still work).
+evaluated against.
 
-`dispatch` refuses an agent that is not in `pool.agents`. `run_workflow` checks,
-before anything starts, that the workflow is in the pool, parses, has no
-approval gate and no `host:`/`distribute:` placement, dispatches only pool
-agents, and that its inputs resolve. A refusal comes back to the lead as a tool
-error it can react to.
+A unit may start children of its own with `dispatch` when its `tools:` grants
+it (the default grant does). Its allowlist is the pool, so it can't reach an
+agent or workflow the lead couldn't, and the usual depth limit applies.
 
-`workflows.generate` writes a new workflow, applies the same checks, saves it as
-`<run dir>/generated/<name>-<ulid>.yaml`, and runs it as a unit. The generating
-provider is the first authenticated one in rupu's default generation order,
-falling back to the lead's own. When that provider has no credential, or
-authenticates with Anthropic OAuth (which can't be built where the tool runs),
-the tool isn't offered and a warning says why. An API key enables it.
+`dispatch` refuses an agent that is not in `pool.agents`. A workflow unit is
+checked before anything starts: it is in the pool, parses, has no approval gate
+and no `host:`/`distribute:` placement, runs only pool agents, and its inputs
+resolve. A refusal comes back to the lead as a tool error it can react to.
 
-When the run stops for any reason, every unit still running is sent SIGTERM.
+At most `[dispatch].max_concurrent_children` (default 8) units run at once,
+across rounds; more wait as `pending` until one finishes. A unit started in one
+round keeps running into the next.
+
+`workflows.generate` writes a new workflow, applies the same checks, and saves
+it as `<run dir>/generated/<name>-<ulid>.yaml`. The lead then runs it with
+`dispatch { kind: "workflow", file }`. The generating provider is the first
+authenticated one in rupu's default generation order, falling back to the
+lead's own. When that provider has no credential, or authenticates with
+Anthropic OAuth (which can't be built where the tool runs), the tool isn't
+offered and a warning says why. An API key enables it.
+
+Every unit is recorded in the run's children ledger (`<run dir>/children.jsonl`),
+which the control plane's unit list and the orphan reaper read.
+When the run stops for any reason, every unit still running is sent SIGTERM (to
+its process group, then SIGKILL after a grace) and recorded `abandoned`.
 
 ---
 
@@ -300,8 +324,10 @@ Every set dimension is enforced; unset ones never stop the run. A cap of `0` is
 exhausted immediately. When any dimension passes `soft_at`, the lead's digest
 says to converge: finish the highest-value work instead of opening new lines.
 
-Spend is metered once per round from the lead's ledger (`<run dir>/usage.jsonl`)
-plus each unit's own run ledger. Things to know:
+Spend is metered once per round from the run's ledger (`<run dir>/usage.jsonl`).
+The lead and any in-process sub-agents write it directly; each unit process, and
+every child it starts, also copies its calls there as rollup rows, besides
+keeping its own run ledger. Things to know:
 
 - `budget.usd` is enforced only when the **lead's** model has a price. If it
   doesn't, the cap is dropped with a warning at launch (it would read `$0`
@@ -309,8 +335,6 @@ plus each unit's own run ledger. Things to know:
   `[pricing.<provider>."<model>"]` entry to enforce it.
 - A unit on an unpriced model adds `$0` (with a warning the first time) but its
   tokens still count.
-- Sub-agents a unit starts with `dispatch_agent` are undercounted, so a cap can
-  trip later than the true spend.
 
 The running spend is written to the run record after every round, so
 `rupu agentiflow status` and the control plane show it live.
@@ -456,7 +480,8 @@ Each run gets a directory `~/.rupu/agentiflows/af_<ULID>/`:
 | `steering/` | Queued operator messages |
 | `board/` | `posts.jsonl`, `directives.jsonl` and `claims/` |
 | `mailboxes/` | Per-participant inboxes and the broadcast log |
-| `units/<run id>/unit.json` | One record per unit: kind, process group and last known status |
+| `children.jsonl` | The children ledger: a `started` line per unit (kind, name, run id, codename, participant, process group) and a `finished` line when it ends |
+| `units/<run id>/unit.json` | Runs started before the children ledger existed: one record per unit (kind, process group, last known status). Still read |
 | `generated/` | Workflows written by `workflows.generate` |
 | `detach.log` | stderr of a `--detach` run |
 
@@ -574,7 +599,6 @@ What is not built, or only partly built, today:
 - **No definition listing or dry-run validation.** There is no
   `rupu agentiflow` subcommand that lists or checks definitions; `run` validates
   at launch.
-- **Metering undercounts nested sub-agents** (section 5).
 
 ---
 

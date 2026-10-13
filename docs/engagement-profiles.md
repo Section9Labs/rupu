@@ -84,7 +84,7 @@ was examined, separately from any findings about it.
 
 | Surface | How | Notes |
 |---------|-----|-------|
-| `rupu run` | `--engagement-profile <id>` | Alias `--engagement-profiles`. Repeat the flag or pass a comma-separated list. Sub-agents started with `dispatch_agent` inherit the selection. |
+| `rupu run` | `--engagement-profile <id>` | Alias `--engagement-profiles`. Repeat the flag or pass a comma-separated list. Children started with `dispatch` (sub-agents, agent and workflow processes) inherit the selection. |
 | `rupu workflow run` | `--engagement-profile <id>` | Applies to every agent step and to `action: findings.record` steps. The selection is recorded on the run (`engagement_profiles` in `run.json`), so `rupu workflow resume`, `workflow approve` and a gate approved in the control plane continue under it. A recorded profile that no longer resolves fails the resume. |
 | Agentiflows | `engagement_profiles:` in the definition (required) | rupu validates the definition against the profiles, and passes the set to the lead and to every unit it launches (as `--engagement-profile`). See [agentiflows.md](agentiflows.md#4-engagement-profiles). |
 | CP agent launch API | `engagement_profiles: [..]` in the `POST /api/agents/:name/run` body | Passed to `rupu run --engagement-profile`, locally or on the chosen host (see the remote row). The web launcher doesn't offer it. |

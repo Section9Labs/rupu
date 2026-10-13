@@ -872,3 +872,94 @@ describe('ToolCard audit badge', () => {
     expect(screen.getByText('blocked').getAttribute('title')).toMatch(/readonly mode/);
   });
 });
+
+// W7 shapes (crates/rupu-tools/src/launch/{dispatch,join}.rs): `dispatch`
+// answers the child's handle, with its join entry under `result` when it
+// waited; `join` answers `{children: [entry…]}`.
+describe('parseSubrunOutput — W7 dispatch and join', () => {
+  it('reads an async dispatch (no result) as the launched child, with no outcome yet', () => {
+    const parsed = parseSubrunOutput(JSON.stringify({
+      handle: 'ch_1', kind: 'agent', name: 'scanner', run_id: 'run_X',
+      codename: 'otter-3/lead>lynx#1', transcript: '/t/run_X.jsonl',
+    }));
+    expect(parsed?.top).toEqual({
+      ok: null,
+      tokensUsed: null,
+      transcriptPath: '/t/run_X.jsonl',
+      subRunID: 'run_X',
+      error: null,
+      codename: 'otter-3/lead>lynx#1',
+      agent: 'scanner',
+    });
+    expect(parsed?.requests).toEqual([]);
+  });
+
+  it('reads a waited dispatch\'s result: success, summed tokens, error', () => {
+    const ok = parseSubrunOutput(JSON.stringify({
+      handle: 'ch_1', kind: 'subagent', name: 'reviewer', run_id: 'sub_Y', transcript: '/t/sub_Y.jsonl',
+      result: {
+        handle: 'ch_1', kind: 'subagent', name: 'reviewer', run_id: 'sub_Y', transcript: '/t/sub_Y.jsonl',
+        status: 'done', success: true, output: 'lgtm', tokens: { input: 1000, output: 234 }, duration_ms: 90,
+      },
+    }));
+    expect(ok?.top).toEqual({
+      ok: true,
+      tokensUsed: 1234,
+      transcriptPath: '/t/sub_Y.jsonl',
+      subRunID: 'sub_Y',
+      error: null,
+      codename: null,
+      agent: 'reviewer',
+      status: 'done',
+    });
+
+    const failed = parseSubrunOutput(JSON.stringify({
+      handle: 'ch_2', kind: 'agent', name: 'scanner', run_id: 'run_Z',
+      result: { handle: 'ch_2', kind: 'agent', name: 'scanner', run_id: 'run_Z', status: 'failed', error: 'agent not found' },
+    }));
+    expect(failed?.top?.ok).toBe(false);
+    expect(failed?.top?.error).toBe('agent not found');
+    expect(failed?.top?.status).toBe('failed');
+  });
+
+  it('reads join as one row per child, keyed by handle', () => {
+    const parsed = parseSubrunOutput(JSON.stringify({
+      children: [
+        { handle: 'ch_a', kind: 'subagent', name: 'a1', run_id: 'sub_a', transcript: '/t/a.jsonl', status: 'done', success: false, tokens: { input: 5, output: 5 } },
+        { handle: 'ch_b', kind: 'workflow', name: 'triage', run_id: 'run_b', status: 'running' },
+        { handle: 'ch_c', kind: 'agent', name: 'c1', run_id: 'run_c', status: 'abandoned', error: 'parent stopped' },
+        { handle: 'ch_d', kind: 'agent', name: 'd1', run_id: 'run_d', status: 'interrupted', error: 'its parent run paused without joining it' },
+      ],
+    }));
+    expect(parsed?.top).toBeNull();
+    expect(parsed?.requests.map((r) => [r.id, r.payload.ok, r.payload.status, r.payload.tokensUsed])).toEqual([
+      ['ch_a', false, 'done', 10],
+      ['ch_b', null, 'running', null],
+      ['ch_c', false, 'abandoned', null],
+      ['ch_d', null, 'interrupted', null],
+    ]);
+    expect(parsed?.requests[0].payload.transcriptPath).toBe('/t/a.jsonl');
+  });
+});
+
+it('a join card shows each child\'s state, and opens a finished child\'s transcript', () => {
+  const opened: string[] = [];
+  const tv: ToolView = {
+    tool: 'join',
+    kind: 'subrun',
+    input: {},
+    output: JSON.stringify({
+      children: [
+        { handle: 'ch_a', kind: 'subagent', name: 'a1', run_id: 'sub_a', transcript: '/t/a.jsonl', status: 'done', success: true, tokens: { input: 1000, output: 500 } },
+        { handle: 'ch_b', kind: 'agent', name: 'b1', run_id: 'run_b', status: 'running' },
+      ],
+    }),
+  };
+  render(<ToolCard tool={tv} onOpenTranscript={(p) => { opened.push(p); }} />);
+  expect(screen.getByText('ch_a')).not.toBeNull();
+  expect(screen.getByText('ch_b')).not.toBeNull();
+  expect(screen.getByText('1,500 tokens')).not.toBeNull();
+  expect(screen.getByText('running')).not.toBeNull();
+  screen.getByRole('button', { name: /View sub-run transcript/ }).click();
+  expect(opened).toEqual(['/t/a.jsonl']);
+});

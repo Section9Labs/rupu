@@ -3,6 +3,7 @@ pub mod agents;
 pub mod assets;
 pub mod autoflow_claims;
 pub mod autoflows;
+pub mod children;
 pub mod code;
 pub mod config;
 pub mod coverage;

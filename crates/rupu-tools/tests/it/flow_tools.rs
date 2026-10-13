@@ -698,6 +698,7 @@ fn star_never_grants_directive_or_retract() {
             .resolve_grant(GrantInputs {
                 declared: Some(&declared),
                 step_actions: &[],
+                connector_cap: None,
                 ambient: &[],
                 available: &ctx.services.provided(false),
                 alias_scope: AliasScope::Everywhere,
@@ -729,6 +730,7 @@ fn board_tools_need_a_bus_and_roster_tools_need_a_catalog() {
         .resolve_grant(GrantInputs {
             declared: Some(&declared),
             step_actions: &[],
+            connector_cap: None,
             ambient: &[],
             available: &ctx.services.provided(false),
             alias_scope: AliasScope::Everywhere,

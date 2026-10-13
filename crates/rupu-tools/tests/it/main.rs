@@ -16,6 +16,7 @@ mod flow_tools;
 mod glob;
 mod grant;
 mod grep;
+mod launch_tools;
 mod permission;
 mod read_file;
 mod read_roots;

@@ -9,9 +9,18 @@
 //
 // Route: /transcript (registered in App.tsx)
 
+import { useState } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
-import { ArrowLeft } from 'lucide-react';
+import { ArrowLeft, ChevronDown, ChevronRight } from 'lucide-react';
 import TranscriptPanel from '../components/TranscriptPanel';
+import ChildrenPanel from '../components/run/ChildrenPanel';
+
+/** The run id a standalone run's transcript (`<transcripts>/<run_id>.jsonl`)
+ *  is named after, or `null` for any other transcript. */
+function transcriptRunId(path: string): string | null {
+  const stem = (path.split('/').filter(Boolean).pop() ?? '').replace(/\.jsonl$/, '');
+  return /^run_[A-Za-z0-9_-]+$/.test(stem) ? stem : null;
+}
 
 export default function RunTranscript() {
   const [searchParams] = useSearchParams();
@@ -37,6 +46,7 @@ export default function RunTranscript() {
   // Derive a display label from the path: show the last path segment (filename)
   // so the header reads something meaningful even without a separate run_id param.
   const label = path.split('/').filter(Boolean).pop() ?? 'Transcript';
+  const childRunId = transcriptRunId(path);
 
   return (
     <div className="flex flex-col p-8 gap-4">
@@ -49,11 +59,36 @@ export default function RunTranscript() {
         </p>
       </header>
 
+      {/* The children ledger is local-only: no section for a remote run. */}
+      {childRunId && (!host || host === 'local') && <ChildrenSection runId={childRunId} />}
+
       {/* TranscriptPanel fills the remaining page height and handles its own scroll */}
       <div className="flex-1 min-h-0">
         <TranscriptPanel path={path} live={live} host={host} runId={run} />
       </div>
     </div>
+  );
+}
+
+/** Collapsible; hidden until the run turns out to have children. */
+function ChildrenSection({ runId }: { runId: string }) {
+  const [count, setCount] = useState(0);
+  const [open, setOpen] = useState(true);
+  return (
+    <section className={count > 0 ? 'rounded-xl border border-border bg-panel' : 'hidden'}>
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        className="flex w-full items-center gap-1.5 px-4 py-2 text-left text-sm font-medium text-ink"
+      >
+        {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+        Children ({count})
+      </button>
+      <div className={open ? 'px-4 pb-3' : 'hidden'}>
+        <ChildrenPanel key={runId} runId={runId} onCount={setCount} />
+      </div>
+    </section>
   );
 }
 

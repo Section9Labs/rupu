@@ -47,3 +47,34 @@ describe('RunTranscript query params', () => {
     expect(spy).toHaveBeenCalledWith('/t/run-1.jsonl', { host: undefined, run: undefined });
   });
 });
+
+describe('RunTranscript children', () => {
+  it('lists a standalone run\'s children under a collapsible section', async () => {
+    vi.spyOn(api, 'getTranscript').mockResolvedValue(EMPTY);
+    const children = vi.spyOn(api, 'getRunChildren').mockResolvedValue([
+      {
+        handle: 'ch_1', kind: 'subagent', name: 'helper', run_id: 'sub_1', parent_run_id: 'run_01ABC',
+        depth: 1, codename: null, address: null, status: 'done', success: true, error: null,
+        tokens: null, duration_ms: null, started_at: null, finished_at: null,
+        transcript_path: '/t/sub_1.jsonl', legacy: false,
+      },
+    ]);
+    const { findByRole, getByTestId } = renderAt('?path=%2Ft%2Frun_01ABC.jsonl');
+
+    const toggle = await findByRole('button', { name: /Children \(1\)/ });
+    expect(children).toHaveBeenCalledWith('run_01ABC', expect.any(AbortSignal));
+    expect(getByTestId('children-panel')).toHaveTextContent('helper');
+    toggle.click();
+    await waitFor(() => expect(toggle).toHaveAttribute('aria-expanded', 'false'));
+  });
+
+  it('asks for no children for a remote run or a transcript not named after a run', async () => {
+    vi.spyOn(api, 'getTranscript').mockResolvedValue(EMPTY);
+    const children = vi.spyOn(api, 'getRunChildren').mockResolvedValue([]);
+    renderAt('?path=%2Ft%2Frun_01ABC.jsonl&host=h&run=run_01ABC');
+    cleanup();
+    renderAt('?path=%2Ft%2Fsession-turn.jsonl');
+    await waitFor(() => expect(api.getTranscript).toHaveBeenCalledTimes(2));
+    expect(children).not.toHaveBeenCalled();
+  });
+});

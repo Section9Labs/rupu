@@ -12696,6 +12696,7 @@ mod tests {
                 output_tokens: output,
                 cached_tokens: 0,
                 cache_write_tokens: 0,
+                rollup: false,
             });
         }
 

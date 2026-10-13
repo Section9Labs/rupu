@@ -3,7 +3,8 @@
 //!
 //! - core fs/shell: [`bash`], [`read_file`], [`write_file`], [`edit_file`],
 //!   [`grep`], [`glob`], [`ast_grep`];
-//! - sub-agent dispatch: [`dispatch_agent`], [`dispatch_agents_parallel`];
+//! - child runs through the [`ports::Launcher`] port: [`launch`] (`dispatch`,
+//!   `join`, `workflows.generate`);
 //! - ledgers: [`coverage`], [`findings`], [`assets`];
 //! - connectors over the run's SCM registry: [`scm`], [`issues`],
 //!   [`github`], [`gitlab`];
@@ -37,6 +38,7 @@ pub mod gitlab;
 pub mod goal;
 pub mod grant;
 pub mod issues;
+pub mod launch;
 pub mod ledger;
 pub mod msg;
 pub mod output;
@@ -63,18 +65,12 @@ pub mod ast_grep;
 pub mod glob;
 // implemented in Task 24 (subprocess execution with timeout + env allowlist)
 pub mod bash;
-// sub-agent dispatch (spec 2026-05-08): single-child synchronous.
-pub mod dispatch_agent;
-// sub-agent dispatch (spec 2026-05-08): fan-out parallel.
-pub mod dispatch_agents_parallel;
 
 pub use ast_grep::AstGrepTool;
-pub use bash::BashTool;
+pub use bash::{BashTool, RUN_ID_ENV};
 pub use call::CallOutcome;
 pub use catalog::ToolCatalog;
 pub use descriptor::{Alias, AliasScope, Effect, Service, ToolDescriptor, ACTION_SERVICES};
-pub use dispatch_agent::DispatchAgentTool;
-pub use dispatch_agents_parallel::DispatchAgentsParallelTool;
 pub use edit_file::EditFileTool;
 pub use glob::GlobTool;
 pub use grant::{
@@ -86,11 +82,15 @@ pub use permission::{
     AllowAlways, Decision, DenyReason, PermissionMode, PermissionPolicy, PromptAnswer,
     PromptRequest, Prompter, UnknownMode,
 };
-pub use ports::{CatalogPort, PortError, RunStatus};
+pub use ports::{
+    CatalogPort, ChildHandle, ChildKind, ChildRequest, ChildState, ChildStatus, ChildTarget,
+    ChildTokens, GeneratedWorkflow, JoinSet, LaunchError, Launcher, ParentEnd, PortError,
+    RunStatus, Until, WorkflowGenerator, MAX_LAUNCH_DEPTH,
+};
 pub use read_file::ReadFileTool;
 pub use tool::{
-    AgentDispatcher, BashConfig, CallContext, DerivedEvent, DispatchError, DispatchOutcome,
-    ParentLink, RunIdentity, SpawnPermission, Surface, Tool, ToolContext, ToolError, ToolOutput,
-    ToolServices, WorkspaceScope,
+    BashConfig, CallContext, DerivedEvent, LaunchPool, LaunchScope, ParentLink, RunIdentity,
+    SpawnPermission, Surface, Tool, ToolContext, ToolError, ToolOutput, ToolServices,
+    WorkspaceScope,
 };
 pub use write_file::WriteFileTool;

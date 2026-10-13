@@ -1342,6 +1342,7 @@ async fn usage_endpoint_counts_inflight_step_from_ledger() {
         output_tokens: output,
         cached_tokens: 0,
         cache_write_tokens: 0,
+        rollup: false,
     };
     let mut ledger = Vec::new();
     for r in [row("u1", 1000, 100), row("u2", 2000, 200)] {
@@ -1821,6 +1822,7 @@ fn ledger_line(id: &str, step: &str, input: u64, output: u64) -> Vec<u8> {
         output_tokens: output,
         cached_tokens: 0,
         cache_write_tokens: 0,
+        rollup: false,
     };
     let mut line = serde_json::to_vec(&row).unwrap();
     line.push(b'\n');
@@ -1977,6 +1979,7 @@ fn agent_ledger_line(
         output_tokens: output,
         cached_tokens: 0,
         cache_write_tokens: 0,
+        rollup: false,
     };
     let mut line = serde_json::to_vec(&row).unwrap();
     line.push(b'\n');

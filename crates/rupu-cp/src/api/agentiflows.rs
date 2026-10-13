@@ -34,9 +34,8 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use rupu_agentiflow::{
-    agentiflow_dir, units_on_disk, AgentiflowDef, AgentiflowRecord, Budget,
-    CoverageTarget, Goal, GoalTarget, OperatorMessage, OperatorQueue, Pool, RoundConfig, UnitOnDisk,
-    UnitStatus,
+    agentiflow_dir, units_on_disk, AgentiflowDef, AgentiflowRecord, Budget, CoverageTarget, Goal,
+    GoalTarget, OperatorMessage, OperatorQueue, Pool, RoundConfig, UnitOnDisk, UnitStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -53,7 +52,10 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/agentiflows", get(list_agentiflows))
         .route("/api/agentiflows/:id", get(get_agentiflow))
-        .route("/api/agentiflows/:id/messages", get(get_agentiflow_messages))
+        .route(
+            "/api/agentiflows/:id/messages",
+            get(get_agentiflow_messages),
+        )
         .route("/api/agentiflows/:id/events", get(get_agentiflow_events))
         .route("/api/agentiflows/:id/steer", post(steer_agentiflow))
 }
@@ -196,7 +198,7 @@ struct UnitDto {
     agent: Option<String>,
     /// The roster name the lead addressed it by (`recon#1`).
     participant: Option<String>,
-    /// `agent` | `workflow`.
+    /// `agent` | `workflow` | `subagent` (a lead's in-process child).
     kind: &'static str,
     status: UnitStatusDto,
     /// The process group the unit leads, when recorded.
@@ -209,7 +211,7 @@ struct UnitDto {
 
 #[derive(Serialize)]
 struct UnitStatusDto {
-    /// `pending` | `running` | `done` | `failed`.
+    /// `pending` | `running` | `done` | `failed` | `abandoned`.
     state: &'static str,
     /// `done` only: whether the unit reported success.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -560,7 +562,60 @@ fn unit_status_dto(status: UnitStatus) -> UnitStatusDto {
     }
 }
 
+/// A child the flow's launcher recorded in `children.jsonl` (W7), as a unit.
+fn ledger_unit(s: &AppState, e: rupu_launch::ledger::ChildEntry) -> UnitDto {
+    let state = e.state();
+    let f = e.finished.as_ref();
+    let transcript = e
+        .started
+        .transcript
+        .clone()
+        .filter(|p| p.is_file())
+        .or_else(|| unit_transcript(s, &e.started.run_id));
+    let output = match state {
+        rupu_tools::ChildState::Done => transcript
+            .as_deref()
+            .and_then(rupu_transcript::final_answer),
+        _ => None,
+    };
+    let (codename, codename_derived) = crate::codename::named(
+        e.started.codename.as_deref(),
+        &e.started.run_id,
+        Some(&e.started.name),
+    );
+    UnitDto {
+        codename,
+        codename_derived,
+        agent: Some(e.started.name.clone()),
+        participant: e.started.address.clone(),
+        kind: e.started.kind.as_str(),
+        status: UnitStatusDto {
+            state: state.as_str(),
+            success: f.and_then(|f| f.success),
+            output,
+            error: f.and_then(|f| f.error.clone()),
+        },
+        pgid: e.started.pgid,
+        started_at: Some(e.started.at.to_rfc3339()),
+        transcript_path: transcript.map(|p| p.to_string_lossy().into_owned()),
+        unit_id: e.started.run_id,
+    }
+}
+
+/// The run's units: those a pre-W7 coordinator mirrored to
+/// `units/*/unit.json`, then the children its launcher recorded in
+/// `children.jsonl`.
 fn read_units(s: &AppState, run_dir: &std::path::Path) -> Vec<UnitDto> {
+    let mut units = read_legacy_units(s, run_dir);
+    units.extend(
+        rupu_launch::ledger::read(run_dir)
+            .into_iter()
+            .map(|e| ledger_unit(s, e)),
+    );
+    units
+}
+
+fn read_legacy_units(s: &AppState, run_dir: &std::path::Path) -> Vec<UnitDto> {
     units_on_disk(run_dir)
         .into_iter()
         .map(|u: UnitOnDisk| {

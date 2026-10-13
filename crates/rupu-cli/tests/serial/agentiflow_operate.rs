@@ -285,7 +285,9 @@ fn pids_in_group(pgid: u32) -> Vec<u32> {
                 return false;
             };
             let mut fields = rest.split_whitespace();
-            let live = fields.next().is_some_and(|state| state != "Z" && state != "X");
+            let live = fields
+                .next()
+                .is_some_and(|state| state != "Z" && state != "X");
             let pgrp = fields.nth(1).and_then(|f| f.parse::<u32>().ok());
             live && pgrp == Some(pgid)
         })
@@ -470,27 +472,29 @@ struct LiveUnit {
 }
 
 async fn live_unit(fx: &Fixture, run_id: &str, cleanup: &mut Cleanup) -> LiveUnit {
-    let units = fx.run_dir(run_id).join("units");
+    // The flow's children ledger names each unit it launched (W7).
+    let dir = fx.run_dir(run_id);
     let unit = poll(60, || {
-        for entry in std::fs::read_dir(&units).ok()?.filter_map(Result::ok) {
-            let unit_id = entry.file_name().to_string_lossy().into_owned();
-            let doc: Value =
-                serde_json::from_slice(&std::fs::read(entry.path().join("unit.json")).ok()?)
-                    .ok()?;
-            let pgid = u32::try_from(doc["pgid"].as_u64()?).ok()?;
+        for entry in rupu_launch::ledger::read(&dir) {
+            let Some(pgid) = entry.started.pgid else {
+                continue;
+            };
             // The unit is really running its script (not merely spawned) once
             // its bash tool's `sleep 300` is in its group. (Its transcript
             // cannot say so: a tool call is flushed after the tool returns.)
             // Without `pgrep`, a live group leader has to do.
             let running = group_runs(pgid, "sleep 300").unwrap_or(true);
             if running && pid_is_running(pgid) {
-                return Some(LiveUnit { id: unit_id, pgid });
+                return Some(LiveUnit {
+                    id: entry.started.run_id,
+                    pgid,
+                });
             }
         }
         None
     })
     .await
-    .unwrap_or_else(|| panic!("the lead's unit never came up under {units:?}"));
+    .unwrap_or_else(|| panic!("the lead's unit never came up in {}", dir.display()));
     cleanup.groups.push(unit.pgid);
     unit
 }

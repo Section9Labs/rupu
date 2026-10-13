@@ -116,10 +116,62 @@ pub struct RunIdentity {
     /// The workflow step that owns the run; `None` outside a workflow.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step_id: Option<String>,
-    /// The agents this run may dispatch (`dispatchableAgents:`). `None` =
-    /// none. Moves into the launcher's policy in W7.
+    /// What this run may launch and where its children are recorded (W7).
+    #[serde(default)]
+    pub launch: LaunchScope,
+}
+
+/// What a run may launch, and where its children are recorded (spec W7
+/// §3.4). Set once by the run assembler from the agent's
+/// `dispatchableAgents` / `dispatchableWorkflows`, the flow's pool and the cap
+/// its parent passed down; the launcher only reads it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchScope {
+    /// The agents a `dispatch` may name: the agent's own allowlist, its flow's
+    /// pool when it is in one (intersected when it declares both), within the
+    /// cap its parent passed down. Empty = none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<String>,
+    /// The workflows a `dispatch {kind: workflow}` may name, by the same rule.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workflows: Vec<String>,
+    /// The agentiflow pool this run is inside, which an in-process child
+    /// inherits; `None` outside a flow.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dispatchable_agents: Option<Vec<String>>,
+    pub pool: Option<LaunchPool>,
+    /// The connector tools this run is narrowed to (a step's `actions:`, or
+    /// the cap a parent passed down), which its children inherit as a cap.
+    /// `None` = not narrowed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector_cap: Option<Vec<String>>,
+    /// The connector tools this run's grant offers, narrowed or not: a
+    /// workflow it generates may call no other connector tool.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub granted_connectors: Vec<String>,
+    /// The directory whose `children.jsonl` records what this run launched.
+    /// `None` = this run can't launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub children_dir: Option<PathBuf>,
+    /// The usage ledger this run's in-process children are charged to (its
+    /// own, or its in-process root's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_root: Option<PathBuf>,
+    /// The ledger of the root of the whole launch tree, when this run is a
+    /// process child (or descends from one): each of its calls is also
+    /// written there as a rollup row, for a budget over the tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollup_root: Option<PathBuf>,
+    /// The agentiflow this run takes part in: a process child of it joins the
+    /// flow's board.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow: Option<PathBuf>,
+}
+
+/// An agentiflow's pool: the agents and workflows its runs may launch.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchPool {
+    pub agents: Vec<String>,
+    pub workflows: Vec<String>,
 }
 
 impl RunIdentity {
@@ -185,9 +237,11 @@ impl Default for WorkspaceScope {
 /// and concern catalog it owns.
 #[derive(Clone, Default)]
 pub struct ToolServices {
-    /// The in-process sub-agent dispatcher behind `dispatch_agent` /
-    /// `dispatch_agents_parallel`. `None` = this run can't dispatch.
-    pub dispatcher: Option<Arc<dyn AgentDispatcher>>,
+    /// The launcher behind `dispatch` / `join`. `None` = this run can't
+    /// start children.
+    pub launcher: Option<Arc<dyn crate::ports::Launcher>>,
+    /// What `workflows.generate` authors a workflow with.
+    pub workflow_generator: Option<Arc<dyn crate::ports::WorkflowGenerator>>,
     /// The SCM/issue registry behind the connector tools (`scm.*`,
     /// `issues.*`, …). `None` = no connector tools.
     pub scm: Option<Arc<rupu_scm::Registry>>,
@@ -261,8 +315,11 @@ impl ToolServices {
         if self.scm.is_some() {
             s.insert(Service::Scm);
         }
-        if self.dispatcher.is_some() {
-            s.insert(Service::AgentDispatcher);
+        if self.launcher.is_some() {
+            s.insert(Service::Launcher);
+        }
+        if self.workflow_generator.is_some() {
+            s.insert(Service::WorkflowGenerator);
         }
         if self.netflow_sink.is_some() {
             s.insert(Service::Netflow);
@@ -279,9 +336,6 @@ impl ToolServices {
         if self.skills.as_ref().is_some_and(|s| s.has_loadable()) {
             s.insert(Service::Skills);
         }
-        // The agentiflow unit launcher and workflow generator have no body
-        // in the catalog until W7: their tools reach a run only injected, as
-        // self-served grants.
         s
     }
 }
@@ -290,7 +344,11 @@ impl ToolServices {
 impl std::fmt::Debug for ToolServices {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ToolServices")
-            .field("dispatcher", &self.dispatcher)
+            .field("launcher", &self.launcher.as_ref().map(|_| "<launcher>"))
+            .field(
+                "workflow_generator",
+                &self.workflow_generator.as_ref().map(|_| "<generator>"),
+            )
             .field("scm", &self.scm.as_ref().map(|_| "<registry>"))
             .field("findings", &self.findings)
             .field("coverage_writer", &self.coverage_writer)
@@ -332,6 +390,10 @@ pub struct CallContext {
     ///
     /// [`Decision::Spawn`]: crate::permission::Decision::Spawn
     pub spawn_ceiling: Option<PermissionMode>,
+    /// The name the model called the tool by — its canonical name or a
+    /// legacy alias. A tool that answers its aliases in their old shapes
+    /// (`dispatch_agent`, `run_workflow`, …) reads it; `None` = canonical.
+    pub called_as: Option<String>,
 }
 
 /// Per-invocation context the runtime passes to every tool: who the run is,
@@ -397,85 +459,6 @@ impl std::fmt::Debug for SpawnPermission {
             .field("prompter", &self.prompter.as_ref().map(|_| "<prompter>"))
             .finish()
     }
-}
-
-/// Pluggable handle the orchestrator implements so dispatch tools can
-/// spawn child agent runs without rupu-tools depending on
-/// rupu-orchestrator (which would be circular). Most tools never
-/// touch this — only the new `dispatch_agent` family does.
-#[async_trait]
-pub trait AgentDispatcher: Send + Sync + std::fmt::Debug {
-    /// Spawn a child agent run synchronously. The dispatcher resolves
-    /// the agent file by name, allocates a sub-run id under the parent's
-    /// run, assembles the child (depth `parent.depth + 1`, the parent's
-    /// surface and findings scope) and runs it to completion. Returns the
-    /// child's outcome — final assistant text, tokens used, duration, and
-    /// the path to the persisted child transcript.
-    ///
-    /// `parent` is the dispatching run's identity; the child's
-    /// `<parent>><role>#n` codename is minted from its codename (`None`
-    /// leaves the child unnamed).
-    ///
-    /// `permission` caps the child (D7): it runs under
-    /// [`SpawnPermission::child_policy`] of its own declared
-    /// `permissionMode`, never above the parent's ceiling.
-    async fn dispatch(
-        &self,
-        agent_name: &str,
-        prompt: String,
-        parent: &RunIdentity,
-        permission: SpawnPermission,
-    ) -> Result<DispatchOutcome, DispatchError>;
-}
-
-/// Result of a successful child-agent dispatch.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DispatchOutcome {
-    /// Agent name as resolved by the dispatcher.
-    pub agent: String,
-    /// Sub-run id (`sub_<ULID>`).
-    pub sub_run_id: String,
-    /// The child's minted codename (`<parent>><role>#n`). `None` when
-    /// the parent had no codename to derive one from.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub codename: Option<String>,
-    /// Path to the persisted child transcript. The line-stream
-    /// printer uses this to render the child's run inline as a
-    /// child callout frame.
-    pub transcript_path: PathBuf,
-    /// Final assistant text from the child agent. Empty when the child
-    /// failed (spec 2026-10-01 §5.3): its last text is interim or cut off,
-    /// not an answer; `error` says why.
-    pub output: String,
-    /// True iff the child finished without an agent error.
-    pub success: bool,
-    /// Why the child failed — the error its run recorded (the outcome's
-    /// title plus the recovery hint). `None` on success.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    /// Total tokens consumed by the child run (in + out).
-    pub tokens_used: u64,
-    /// Wall-clock duration of the child run in milliseconds.
-    pub duration_ms: u64,
-}
-
-/// Errors a dispatcher can return. Tool-internal failures (allowlist
-/// rejection, depth-limit hit) are NOT modeled here — those surface
-/// as `error: Some(...)` on the dispatch tool's [`ToolOutput`] so the
-/// agent sees them as part of normal tool flow rather than as
-/// dispatcher-level failures.
-#[derive(Debug, Error)]
-pub enum DispatchError {
-    #[error("agent `{agent}` not found in any registered agent path")]
-    AgentNotFound { agent: String },
-    #[error("io: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("provider build failed: {0}")]
-    ProviderBuild(String),
-    #[error("child run failed: {0}")]
-    ChildRun(String),
-    #[error("run-store: {0}")]
-    RunStore(String),
 }
 
 /// What a tool returns. `stdout` is the human-readable result that

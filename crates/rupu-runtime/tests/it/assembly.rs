@@ -44,6 +44,7 @@ pub(crate) fn launch(
         pause: None,
         services: LaunchServices::default(),
         collectors: Vec::new(),
+        link: None,
     }
 }
 
@@ -140,7 +141,10 @@ struct Derived {
     netflow: bool,
     net_capture: bool,
     scm: bool,
-    dispatcher: bool,
+    launcher: bool,
+    /// What the run may launch, and where its children are recorded.
+    launch_agents: Vec<String>,
+    children_dir: Option<String>,
     catalog: bool,
     customer: Option<String>,
     output_tokens: Option<u32>,
@@ -149,7 +153,7 @@ struct Derived {
     hop_builder: bool,
     max_turns: u32,
     admission: bool,
-    grant_offers_dispatch_agent: bool,
+    grant_offers_dispatch: bool,
     grant_offers_issues_create: bool,
     grant_offers_agents_list: bool,
     /// The origin's own grant (W5 §3.4): its reason and tools.
@@ -189,7 +193,13 @@ fn derived(home: &Home, origin: &Origin, run: &AssembledRun) -> Derived {
         netflow: s.netflow_sink.is_some(),
         net_capture: s.net_capture.is_some(),
         scm: s.scm.is_some(),
-        dispatcher: s.dispatcher.is_some(),
+        launcher: s.launcher.is_some(),
+        launch_agents: id.launch.agents.clone(),
+        children_dir: id
+            .launch
+            .children_dir
+            .as_deref()
+            .map(|p| rel(home.root(), p)),
         catalog: s.catalog.is_some(),
         customer: s.customer.clone(),
         output_tokens: o.limits.output.tokens,
@@ -198,30 +208,13 @@ fn derived(home: &Home, origin: &Origin, run: &AssembledRun) -> Derived {
         hop_builder: o.recovery.hop_builder.is_some(),
         max_turns: o.max_turns,
         admission: defaults_for(origin).admission,
-        grant_offers_dispatch_agent: o.grant.offers("dispatch_agent"),
+        grant_offers_dispatch: o.grant.offers("dispatch"),
         grant_offers_issues_create: o.grant.offers("issues.create"),
         grant_offers_agents_list: o.grant.offers("agents.list"),
         origin_grant: defaults_for(origin)
             .origin_grant
             .map(|g| format!("{}: {}", g.reason, g.tools.join(" "))),
         narrowed: o.grant.narrowed.iter().map(|n| n.to_string()).collect(),
-    }
-}
-
-/// A dispatcher that never runs: the matrix only checks it is offered.
-#[derive(Debug)]
-struct NoDispatch;
-
-#[async_trait::async_trait]
-impl rupu_tools::AgentDispatcher for NoDispatch {
-    async fn dispatch(
-        &self,
-        _agent: &str,
-        _prompt: String,
-        _parent: &RunIdentity,
-        _permission: rupu_tools::SpawnPermission,
-    ) -> Result<rupu_tools::DispatchOutcome, rupu_tools::DispatchError> {
-        unreachable!("the matrix never dispatches")
     }
 }
 
@@ -256,7 +249,7 @@ async fn origin_matrix() {
     let mut rows = std::collections::BTreeMap::new();
     for (name, origin) in origins(&home) {
         let mut l = launch(&home, spec.clone(), origin.clone(), &format!("run_{name}"));
-        l.services.dispatcher = Some(Arc::new(NoDispatch));
+        l.services.launcher = Some(Arc::new(crate::support::NoLaunch));
         if matches!(origin, Origin::SubAgent { .. }) {
             l.ceiling = Some(PermissionMode::Ask);
         }
@@ -286,7 +279,7 @@ async fn star_parity_per_origin() {
     let mut rows = std::collections::BTreeMap::new();
     for (name, origin) in origins(&home) {
         let mut l = launch(&home, spec.clone(), origin.clone(), &format!("run_{name}"));
-        l.services.dispatcher = Some(Arc::new(NoDispatch));
+        l.services.launcher = Some(Arc::new(crate::support::NoLaunch));
         match &origin {
             Origin::FlowLead { .. } => {
                 l.services.message_bus =
@@ -346,7 +339,7 @@ fn admission_for_every_origin() {
 }
 
 /// R7: a session turn reaches a config-declared openai-compatible provider,
-/// is offered sub-agent dispatch when it declares `dispatchableAgents`, and
+/// is offered `dispatch` when it has a launcher, and
 /// runs under the session's engagement.
 #[tokio::test]
 #[serial]
@@ -381,7 +374,7 @@ async fn session_openai_compat_and_dispatch() {
         },
         "run_turn",
     );
-    l.services.dispatcher = Some(Arc::new(NoDispatch));
+    l.services.launcher = Some(Arc::new(crate::support::NoLaunch));
     let _m = MockScript::set(DONE);
     let run = assembler.assemble(l).await.unwrap();
     let id = run.opts.identity();
@@ -389,7 +382,7 @@ async fn session_openai_compat_and_dispatch() {
         (id.provider.as_str(), id.model.as_str()),
         ("oracle", "oracle-default")
     );
-    assert!(run.opts.grant.offers("dispatch_agent"));
+    assert!(run.opts.grant.offers("dispatch"));
     assert!(
         run.opts.grant.offers("assets.mark"),
         "the engagement's ambient grant"
@@ -497,4 +490,132 @@ async fn coverage_threshold_comes_from_config() {
         let concerns = run.opts.concerns.as_ref().expect("the agent's concerns");
         assert_eq!(concerns.full_mode_max_concerns, want, "{set:?}");
     }
+}
+
+/// W7 D18: a process child's `--launch-*` link sets what an in-process parent
+/// would — its depth, parent and root, the ceiling over its own
+/// `permissionMode`, the root's ledger it rolls up to, and the caps on what it may
+/// launch and which connector tools it may call.
+#[tokio::test]
+#[serial]
+async fn a_launch_link_carries_depth_ceiling_caps_and_the_usage_root() {
+    let home = Home::new();
+    let assembler = home.assembler(config());
+    let spec = agent(
+        &home,
+        "provider: anthropic\nmodel: claude-sonnet-4-6\npermissionMode: bypass\n\
+         tools: [\"*\"]\ndispatchableAgents: [inner, outsider]",
+    );
+    let root_ledger = home.runs().join("run_root").join("usage.jsonl");
+    let mut l = launch(&home, spec, Origin::Standalone, "run_child");
+    l.codename = Some("jade-reef/heron#1>lynx#1".into());
+    l.services.launcher = Some(Arc::new(crate::support::NoLaunch));
+    l.link = Some(rupu_runtime::argv::LaunchLink {
+        depth: 2,
+        ceiling: PermissionMode::Readonly,
+        parent_run: "run_parent".into(),
+        root_run: "run_root".into(),
+        usage_root: Some(root_ledger.clone()),
+        agents: vec!["inner".into()],
+        workflows: vec![],
+        actions: Some(vec!["issues.get".into()]),
+    });
+    let _m = MockScript::set(DONE);
+    let run = assembler.assemble(l).await.unwrap();
+    let id = run.opts.identity();
+    assert_eq!(id.depth, 2);
+    let parent = id.parent.as_ref().unwrap();
+    assert_eq!(
+        (parent.run_id.as_str(), parent.root_run_id.as_str()),
+        ("run_parent", "run_root")
+    );
+    assert_eq!(parent.codename.as_deref(), Some("jade-reef/heron#1"));
+    assert_eq!(run.opts.permission.mode(), PermissionMode::Readonly);
+    let own = home.runs().join("run_child").join("usage.jsonl");
+    assert_eq!(
+        run.usage_ledger.as_deref(),
+        Some(own.as_path()),
+        "its own ledger"
+    );
+    assert_eq!(id.launch.usage_root.as_deref(), Some(own.as_path()));
+    assert_eq!(
+        id.launch.rollup_root.as_deref(),
+        Some(root_ledger.as_path()),
+        "copies roll up to the root"
+    );
+    assert_eq!(
+        id.launch.agents,
+        vec!["inner".to_string()],
+        "outsider is capped away"
+    );
+    assert!(run.opts.grant.offers("issues.get"));
+    assert!(
+        !run.opts.grant.offers("issues.create"),
+        "the parent's connector cap"
+    );
+    assert_eq!(
+        id.launch.connector_cap,
+        Some(vec!["issues.get".to_string()]),
+        "passed on to its own children"
+    );
+}
+
+/// W7 §3.4: inside an agentiflow the pool is the allowlist (intersected with
+/// the agent's own when it declares one), and an in-process child inherits
+/// the pool and its parent's set as a cap.
+#[tokio::test]
+#[serial]
+async fn a_flow_pool_is_the_allowlist_and_children_inherit_it() {
+    let home = Home::new();
+    let assembler = home.assembler(config());
+    let flow_dir = home.global().join("agentiflows").join("af_1");
+    let lead_spec = agent(&home, "provider: anthropic\nmodel: claude-sonnet-4-6");
+    let mut l = launch(
+        &home,
+        lead_spec,
+        Origin::FlowLead {
+            flow_id: "af_1".into(),
+            flow_dir: flow_dir.clone(),
+        },
+        "af_1",
+    );
+    l.services.launcher = Some(Arc::new(crate::support::NoLaunch));
+    l.services.flow_pool = Some(rupu_tools::LaunchPool {
+        agents: vec!["recon".into(), "exploit".into()],
+        workflows: vec!["web-assess".into()],
+    });
+    let _m = MockScript::set(DONE);
+    let lead = assembler.assemble(l).await.unwrap();
+    let lead_id = lead.opts.identity();
+    assert_eq!(lead_id.launch.agents, vec!["recon", "exploit"]);
+    assert_eq!(lead_id.launch.workflows, vec!["web-assess"]);
+    assert_eq!(
+        lead_id.launch.children_dir.as_deref(),
+        Some(flow_dir.as_path())
+    );
+    assert_eq!(lead_id.launch.flow.as_deref(), Some(flow_dir.as_path()));
+
+    // A sub-agent of the lead that declares its own list: the pool ∩ it.
+    let child_spec = agent(
+        &home,
+        "provider: anthropic\nmodel: claude-sonnet-4-6\ndispatchableAgents: [exploit, outsider]",
+    );
+    let mut c = launch(
+        &home,
+        child_spec,
+        Origin::SubAgent {
+            parent: ParentRun {
+                identity: Arc::new(lead_id.clone()),
+                usage: None,
+                coverage_stream: None,
+            },
+        },
+        "sub_1",
+    );
+    c.ceiling = Some(PermissionMode::Bypass);
+    let child = assembler.assemble(c).await.unwrap();
+    let child_id = child.opts.identity();
+    assert_eq!(child_id.depth, 1);
+    assert_eq!(child_id.launch.agents, vec!["exploit"]);
+    assert_eq!(child_id.launch.flow.as_deref(), Some(flow_dir.as_path()));
 }

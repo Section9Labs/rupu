@@ -333,6 +333,11 @@ describe('buildTranscriptView — tool kinds', () => {
     return toolsOf(view.turns)[0].kind;
   }
 
+  it('classifies W7 dispatch and join as sub-run cards', () => {
+    expect(kindOf('dispatch')).toBe('subrun');
+    expect(kindOf('join')).toBe('subrun');
+  });
+
   it('maps tool names to kinds', () => {
     expect(kindOf('read_file')).toBe('read');
     expect(kindOf('grep')).toBe('grep');

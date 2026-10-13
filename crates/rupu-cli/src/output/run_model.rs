@@ -824,6 +824,7 @@ mod tests {
         v.apply(&Event::DispatchStarted {
             run_id: "r".into(),
             sub_run_id: "sub1".into(),
+            kind: "subagent".into(),
             agent: Some("scout".into()),
             transcript_path: "ts".into(),
             codename: Some("wren#1".into()),
@@ -1053,6 +1054,7 @@ mod tests {
         v.apply(&Event::DispatchStarted {
             run_id: "r".into(),
             sub_run_id: "sub1".into(),
+            kind: "subagent".into(),
             agent: Some("scout".into()),
             transcript_path: "ts".into(),
             codename: Some("wren#1".into()),
@@ -1062,6 +1064,7 @@ mod tests {
         v.apply(&Event::DispatchCompleted {
             run_id: "r".into(),
             sub_run_id: "sub1".into(),
+            kind: "subagent".into(),
             success: true,
             tokens_in: 1000,
             tokens_out: 200,

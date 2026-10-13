@@ -675,6 +675,7 @@ mod tests {
         v.apply(&Event::DispatchStarted {
             run_id: "r".into(),
             sub_run_id: sub_run_id.into(),
+            kind: "subagent".into(),
             agent: Some("scout".into()),
             transcript_path: format!("t-{sub_run_id}").into(),
             codename: Some(codename.into()),

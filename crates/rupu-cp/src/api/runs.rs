@@ -3452,6 +3452,7 @@ pub(crate) mod tests {
             output_tokens: 30,
             cached_tokens: 0,
             cache_write_tokens: 0,
+            rollup: false,
         };
         let mut line = serde_json::to_vec(&row).unwrap();
         line.push(b'\n');
@@ -4738,6 +4739,7 @@ pub(crate) mod tests {
             output_tokens: output,
             cached_tokens: 0,
             cache_write_tokens: cache_write,
+            rollup: false,
         };
         let mut line = serde_json::to_vec(&row).unwrap();
         line.push(b'\n');

@@ -125,7 +125,7 @@ lock toggles, and a raw TOML editor).
 | Key             | Type            | Default                          | Notes |
 |-----------------|-----------------|-----------------------------------|-------|
 | `timeout_secs`  | integer         | `120`                             | Timeout for a single `bash` tool invocation |
-| `env_allowlist` | array\<string\> | `[]`                              | Extra env vars forwarded into the bash subprocess, beyond the always-allowed `PATH`/`HOME`/`USER`/`TERM`/`LANG` |
+| `env_allowlist` | array\<string\> | `[]`                              | Extra env vars forwarded into the bash subprocess, beyond the always-allowed `PATH`/`HOME`/`USER`/`TERM`/`LANG` (and `RUPU_RUN_ID`, the run marker a launched child carries) |
 
 ---
 
@@ -288,6 +288,17 @@ schema — passing reasoning tokens again here would double-bill them.
 | `max_open_files` | integer | unset   | Soft open-file limit rupu raises itself to at startup, and the cap for automatic growth when a fan-out runs near the limit. Unset: raise to 10240 (capped at the hard limit) and grow on demand up to the hard limit / macOS `kern.maxfilesperproc`. Values above that cap are clamped with a warning (raising it needs root). Overridden by `--max-open-files` / `RUPU_MAX_OPEN_FILES`. Past the cap, new agent runs are paced (delayed, logged) until running ones release descriptors, instead of failing with "Too many open files". |
 | `max_concurrent_jobs` | integer | unset | Hard ceiling on how many local agent jobs run at once, enforced process-wide no matter what a workflow's `max_parallel:` or `max_concurrency:` declares — the machine-level bound that stops a wide fan-out or `split:` DAG from running the host out of memory. Unset: a RAM-derived default of `clamp(total_RAM_GB / 4, 4, 128)` (≈64 on a 256 GB host, 4 on a 16 GB laptop). Overridden by `RUPU_MAX_CONCURRENT_JOBS`. `0` means no ceiling. Does not throttle remote (`distribute:`) units — those are bounded by their own host's setting. |
 | `min_free_memory_mb` | integer | unset | Memory-watchdog headroom: a new local agent job is held back until at least this many MB of system memory is available, so an in-flight allocation spike can't push the machine over. Unset: a RAM-derived default of `max(total_RAM × 0.10, 4096)`. Overridden by `RUPU_MIN_FREE_MEMORY_MB`. `0` disables the watchdog (the ceiling still applies). A held-back job proceeds anyway after 60 s if memory never recovers, and logs a run warning either way. Available memory is read from `/proc/meminfo` (Linux) or `vm_stat` (macOS); where it can't be read, the watchdog does nothing. |
+
+---
+
+## `[dispatch]`
+
+Child runs an agent starts with `dispatch` (see
+[agent-format.md](agent-format.md#launching-children)).
+
+| Key                       | Type    | Default | Notes |
+|---------------------------|---------|---------|-------|
+| `max_concurrent_children` | integer | `8`     | How many children of one parent run run at once, all kinds together. More wait as `pending` until a slot frees. `0` is read as `1`. Applies per run, so an agentiflow's units count against its lead's limit. In-process sub-agents also wait for `[runtime]` admission |
 
 ---
 

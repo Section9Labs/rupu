@@ -14,7 +14,7 @@ use rupu_agent::{AgentSpec, MockProvider};
 use rupu_providers::model_limits::ModelLimits;
 use rupu_providers::LlmProvider;
 use rupu_runtime::assembly::{AssembleError, AssemblyContext, PreparedProvider, RunAssembler};
-use rupu_tools::{AgentDispatcher, PermissionMode};
+use rupu_tools::{Launcher, PermissionMode};
 
 use crate::runner::{StepLaunch, StepRequest};
 
@@ -65,8 +65,8 @@ pub struct MockRun {
     pub concerns: Option<rupu_coverage::ConcernsBlock>,
     /// The step's `actions:`.
     pub step_actions: Vec<String>,
-    /// The in-process sub-agent dispatcher the run is offered.
-    pub dispatcher: Option<Arc<dyn AgentDispatcher>>,
+    /// The launcher the run is offered.
+    pub launcher: Option<Arc<dyn Launcher>>,
     pub mode: PermissionMode,
     pub no_stream: bool,
     pub suppress_stream_stdout: bool,
@@ -89,7 +89,7 @@ impl Default for MockRun {
             limits: ModelLimits::unknown(),
             concerns: None,
             step_actions: Vec::new(),
-            dispatcher: None,
+            launcher: None,
             mode: PermissionMode::Bypass,
             no_stream: false,
             suppress_stream_stdout: false,
@@ -118,7 +118,7 @@ impl MockRun {
         spec.stream.no_stream = self.no_stream;
         spec.stream.suppress_stdout = self.suppress_stream_stdout;
         spec.services.provider = Some(provider);
-        spec.services.dispatcher = self.dispatcher;
+        spec.services.launcher = self.launcher;
         Ok(StepLaunch {
             assembler: self.assembler.unwrap_or_else(scratch_assembler),
             spec,

@@ -1,0 +1,24 @@
+name: dispatch-kinds-flow
+description: Smoke-test W7 dispatch inside an agentiflow — one agent unit and one sub-agent of dispatch-echo, joined, then one info finding.
+lead: dispatch-kinds-lead
+engagement_profiles: [code]
+
+goals:
+  - id: smoke
+    objective: "Dispatch both children, join them, and record one finding."
+    target: { findings: {}, count_gte: 1 }
+    required: true
+
+budget:
+  usd: 1
+  wall_clock: "15m"
+
+scope:
+  authorized: true
+
+pool:
+  agents: [dispatch-kinds-lead, dispatch-echo]
+
+round:
+  lead_max_turns: 12
+  ceiling: { rounds: 2, wall_clock: "15m" }

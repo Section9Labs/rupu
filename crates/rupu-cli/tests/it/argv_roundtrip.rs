@@ -12,8 +12,8 @@ use rupu_cli::cmd::{self, run::RunAction};
 use rupu_cli::{Cli, Cmd};
 use rupu_coverage::FindingProfile;
 use rupu_runtime::argv::{
-    AgentRun, AgentiflowRun, FlowAttach, RunArgv, SessionSend, SessionStart, SessionWorker,
-    WorkflowControl, WorkflowRef, WorkflowRun,
+    AgentRun, AgentiflowRun, FlowAttach, LaunchLink, RunArgv, SessionSend, SessionStart,
+    SessionWorker, WorkflowControl, WorkflowRef, WorkflowRun,
 };
 use rupu_tools::PermissionMode;
 
@@ -41,6 +41,38 @@ fn flow() -> FlowAttach {
         run_dir: PathBuf::from("/g/agentiflows/af_01X with space"),
         participant: "recon#1".into(),
     }
+}
+
+/// The links a launcher renders: every cap empty, full, and the optional
+/// parts present and absent.
+fn links() -> Vec<LaunchLink> {
+    let base = LaunchLink {
+        depth: 3,
+        ceiling: PermissionMode::Readonly,
+        parent_run: "run_01PARENT".into(),
+        root_run: "run_01ROOT".into(),
+        usage_root: Some(PathBuf::from("/g/runs/run 01ROOT/usage.jsonl")),
+        agents: vec!["recon".into(), "exploit".into()],
+        workflows: vec!["sweep".into()],
+        actions: Some(vec!["issues.get".into()]),
+    };
+    vec![
+        base.clone(),
+        LaunchLink {
+            depth: 1,
+            ceiling: PermissionMode::Bypass,
+            usage_root: None,
+            agents: vec![],
+            workflows: vec![],
+            actions: None,
+            ..base.clone()
+        },
+        LaunchLink {
+            ceiling: PermissionMode::Ask,
+            actions: Some(vec![]),
+            ..base
+        },
+    ]
 }
 
 fn agent_runs() -> Vec<RunArgv> {
@@ -80,6 +112,24 @@ fn agent_runs() -> Vec<RunArgv> {
     let mut tmp_only = AgentRun::new("recon", "run_01ROUNDTRIP");
     tmp_only.tmp_clone = true;
     out.push(RunArgv::Agent(tmp_only));
+    // A launched child, alone and alongside a flow.
+    for (i, link) in links().into_iter().enumerate() {
+        let mut r = AgentRun::new("recon", "run_01ROUNDTRIP");
+        r.codename = Some("cobalt-harbor/heron>lynx#1".into());
+        r.prompt = Some(PROMPTS[i % PROMPTS.len()].into());
+        r.flow = (i % 2 == 0).then(flow);
+        r.launch = Some(link);
+        out.push(RunArgv::Agent(r));
+    }
+    // A launched child continued from its interrupted run: no prompt.
+    for link in links() {
+        let mut r = AgentRun::new("recon", "run_01ROUNDTRIPNEXT");
+        r.codename = Some("cobalt-harbor/heron>lynx#1".into());
+        r.mode = Some(PermissionMode::Bypass);
+        r.continue_from = Some("run_01ROUNDTRIP".into());
+        r.launch = Some(link);
+        out.push(RunArgv::Agent(r));
+    }
     out
 }
 
@@ -114,6 +164,22 @@ fn workflow_runs() -> Vec<RunArgv> {
         }
         out.push(RunArgv::Workflow(r));
     }
+    for link in links() {
+        let mut r = WorkflowRun::new(WorkflowRef::Name("web-assess".into()), "run_01ROUNDTRIP");
+        r.plain = true;
+        r.codename = Some("cobalt-harbor/heron>sweep#1".into());
+        r.launch = Some(link);
+        out.push(RunArgv::Workflow(r));
+    }
+    // A named workflow child runs the file its parent vetted, under the
+    // catalog id it was vetted as.
+    let mut r = WorkflowRun::new(
+        WorkflowRef::File(PathBuf::from("/home/.rupu/workflows/sweep.yaml")),
+        "run_01ROUNDTRIP",
+    );
+    r.workflow_name = Some("sweep".into());
+    r.launch = links().pop();
+    out.push(RunArgv::Workflow(r));
     out
 }
 
@@ -229,6 +295,8 @@ fn back(cli: Cli) -> RunArgv {
                 engagement_profiles: a.engagement_profiles,
                 tmp_clone: a.tmp,
                 flow: flow_of(a.fleet_run_dir, a.fleet_participant),
+                continue_from: a.continue_from,
+                launch: a.launch.link(),
             })
         }
         Cmd::Workflow { action } => match action {
@@ -243,6 +311,9 @@ fn back(cli: Cli) -> RunArgv {
                 fleet_run_dir,
                 fleet_participant,
                 file,
+                workflow_name,
+                codename,
+                launch,
                 ..
             } => RunArgv::Workflow(WorkflowRun {
                 workflow: match (name, file) {
@@ -250,6 +321,7 @@ fn back(cli: Cli) -> RunArgv {
                     (None, Some(file)) => WorkflowRef::File(file),
                     other => panic!("clap let a name AND a file through: {other:?}"),
                 },
+                workflow_name: workflow_name.map(|n| *n),
                 target,
                 run_id: run_id.expect("every workflow run carries its id"),
                 mode: mode(m),
@@ -257,6 +329,8 @@ fn back(cli: Cli) -> RunArgv {
                 plain,
                 engagement_profiles,
                 flow: flow_of(fleet_run_dir, fleet_participant),
+                codename: codename.map(|c| c.to_string()),
+                launch: launch.link(),
             }),
             cmd::workflow::Action::Approve {
                 run_id,

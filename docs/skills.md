@@ -247,8 +247,8 @@ unit) gets its skills the same way:
   with the skills the interrupted run had loaded, and re-attach them at their
   next compaction. An agentiflow lead carries them from round to round.
 
-A sub-agent started with `dispatch_agent` gets its own agent's skills, not its
-parent's. Sessions don't support skills yet: `rupu session start` refuses an
+A child started with `dispatch` (any kind, or a legacy name like
+`dispatch_agent`) gets its own agent's skills, not its parent's. Sessions don't support skills yet: `rupu session start` refuses an
 agent that declares them.
 
 The transcript records what the run had and used. `skill_index` lists the

@@ -9,6 +9,11 @@ use std::time::Duration;
 /// shuts down) and on SIGTERM (the handler thread, before the re-raise).
 pub const CREDENTIAL_WRITE_DRAIN: Duration = Duration::from_secs(10);
 
+/// How long a signalled process gives the children its runs launched to
+/// stop before it SIGKILLs them (alongside the credential drain, so the two
+/// stay under the launcher's own `TERM_GRACE` for this process).
+pub const CHILD_STOP_GRACE: Duration = Duration::from_secs(5);
+
 /// How long the SIGTERM handler thread waits for each of its own stderr
 /// lines — `SIGTERM received`, the drain's `waiting for N …` and `gave up`
 /// — to land before it moves on ([`say_detached`]): long enough that each
@@ -327,6 +332,7 @@ fn register_signal_actions_at(fail: Option<InstallFailure>) -> std::io::Result<b
 #[cfg(unix)]
 fn on_sigterm(drain: Duration) -> ! {
     rupu_providers::credential_writes::request_termination();
+    let children = stop_children_detached();
     say_detached(
         || {
             tracing::info!(
@@ -336,8 +342,70 @@ fn on_sigterm(drain: Duration) -> ! {
         Some(SIGTERM_STDERR_GRACE),
     );
     drain_credential_writes_blocking(drain);
+    if let Some(children) = children {
+        let _ = children.join();
+    }
     die_by_sigterm()
 }
+
+/// Stop the children this process's runs launched ([`CHILD_STOP_GRACE`]),
+/// on a thread of its own so the credential drain runs alongside. Each
+/// child sits in its own process group, so nothing else reaches it; its own
+/// SIGTERM handler stops its children in turn. `None` if no thread could be
+/// spawned: the children are then left for the orphan reaper.
+fn stop_children_detached() -> Option<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("rupu-stop-children".into())
+        .spawn(|| {
+            rupu_launch::reaper::stop_live_children(
+                CHILD_STOP_GRACE,
+                "its parent process was stopped by a signal",
+            );
+        })
+        .ok()
+}
+
+/// SIGINT for a command that runs agents (`rupu run`, `rupu workflow
+/// run|resume`): mark the process stopped by a signal (an end a run records
+/// meanwhile is that stop's), stop the children its runs launched, then die
+/// by SIGINT as before. Without it a Ctrl-C ends the process at once and its
+/// children, each in its own process group, keep running.
+#[cfg(unix)]
+pub fn install_sigint_child_stop() {
+    use signal_hook::consts::SIGINT;
+    let mut signals = match signal_hook::iterator::Signals::new([SIGINT]) {
+        Ok(signals) => signals,
+        Err(e) => {
+            eprintln!(
+                "rupu: could not install the SIGINT handler ({e}); a Ctrl-C leaves this run's \
+                 children running"
+            );
+            return;
+        }
+    };
+    let spawned = std::thread::Builder::new()
+        .name("rupu-sigint".into())
+        .spawn(move || {
+            if signals.forever().next().is_some() {
+                rupu_providers::credential_writes::mark_sigint();
+                if let Some(children) = stop_children_detached() {
+                    let _ = children.join();
+                }
+                let _ = signal_hook::low_level::emulate_default_handler(SIGINT);
+                std::process::abort();
+            }
+        });
+    if let Err(e) = spawned {
+        eprintln!(
+            "rupu: could not start the SIGINT handler ({e}); a Ctrl-C leaves this run's children \
+             running"
+        );
+    }
+}
+
+/// No-op off unix.
+#[cfg(not(unix))]
+pub fn install_sigint_child_stop() {}
 
 /// Default disposition back, then the signal again: death by SIGTERM.
 /// signal-hook's `emulate_default_handler` restores the disposition,

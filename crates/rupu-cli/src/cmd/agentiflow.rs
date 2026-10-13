@@ -45,7 +45,7 @@ use rupu_agentiflow::{
 };
 use rupu_auth::CredentialResolver;
 use rupu_runtime::argv::{AgentiflowRun, RunArgv};
-use rupu_runtime::provider_factory::{self, FactoryError, ProviderConfig};
+use rupu_runtime::provider_factory;
 use rupu_runtime::spawn::{SpawnSpec, SpawnStdio};
 use serde::Serialize;
 use std::path::Path;
@@ -428,7 +428,7 @@ fn log_tail(log: &Path) -> String {
 /// finish.
 ///
 /// Detached like the CP's launchers and the fleet's unit launcher
-/// (`SubprocessUnitLauncher`), through `rupu_runtime::spawn`: its own process
+/// (`rupu_launch::Subprocess`), through `rupu_runtime::spawn`: its own process
 /// group (so a Ctrl-C at this terminal or this process exiting does not take the run
 /// down), stdin/stdout null, and `RUPU_HOME` pinned to the home this process
 /// resolved so the child records the run where the id printed here is looked
@@ -601,8 +601,8 @@ async fn launch(
             provider: LeadProvider::Assembled,
         },
         run_id: run_id.clone(),
-        // Production: a `SubprocessUnitLauncher` over this binary.
-        unit_launcher: None,
+        // Production: `rupu_launch::Subprocess` over this binary.
+        process_backend: None,
         generation,
         // The layered `[pricing]` config (global, then project, with the
         // `[providers.*].kind` account map attached by the loader) over the
@@ -629,14 +629,8 @@ async fn launch(
     }
 }
 
-/// The lead's `generate_workflow` capability, or `None` when it cannot be
-/// offered.
-///
-/// The generating provider is the first authenticated one in
-/// `DEFAULT_GEN_MODELS` order (falling back to the lead's own). Its credential
-/// is resolved once here and the factory builds from it synchronously (see the
-/// module docs); a provider that can only be built asynchronously, or has no
-/// credential, leaves the tool unoffered rather than half-working.
+/// The lead's `workflows.generate` capability, or `None` when it cannot be
+/// offered ([`rupu_launch::Generation::resolve`]).
 async fn generation_capability(
     resolver: Arc<dyn CredentialResolver>,
     cfg: &rupu_config::Config,
@@ -644,74 +638,9 @@ async fn generation_capability(
     lead_model: &str,
     sink: Arc<dyn rupu_netflow::FlowSink>,
 ) -> anyhow::Result<Option<GenerationCapability>> {
-    let (gen_provider, gen_model) = rupu_orchestrator::pick_default_gen_model(resolver.as_ref())
+    rupu_launch::Generation::resolve(resolver, cfg, lead_provider, lead_model, sink)
         .await
-        .unwrap_or_else(|| (lead_provider.to_string(), lead_model.to_string()));
-    // The operator's `[providers.<name>]` settings and no agent-level
-    // overrides (as the `agent generate` / `workflow generate` call sites
-    // build it).
-    let gen_pc = ProviderConfig::for_agent(
-        &gen_provider,
-        &cfg.providers,
-        Default::default(),
-        Some(cfg.recovery.server_side_fallback),
-    );
-
-    let (gen_mode, gen_cred) = match resolver.get(&gen_provider, None).await {
-        Ok(resolved) => resolved,
-        Err(e) => {
-            tracing::warn!(
-                provider = %gen_provider,
-                error = %e,
-                "workflows.generate is unavailable: no credential for the generating provider \
-                 (run `rupu auth login --account {gen_provider} --mode <api-key|sso>`)"
-            );
-            return Ok(None);
-        }
-    };
-    let kind = gen_pc.kind.as_deref().unwrap_or(&gen_provider).to_string();
-    let refresher = resolver.oauth_refresher(&gen_provider, &kind);
-
-    let build = {
-        let (provider, model, pc, sink) = (gen_provider.clone(), gen_model.clone(), gen_pc, sink);
-        move || {
-            provider_factory::build_provider_from_credential(
-                &provider,
-                &model,
-                gen_mode,
-                &gen_cred,
-                refresher.clone(),
-                &pc,
-                sink.clone(),
-            )
-        }
-    };
-    match build() {
-        Ok(_) => {
-            Ok(Some(GenerationCapability {
-                provider: gen_provider.clone(),
-                model: gen_model,
-                factory: Arc::new(move || {
-                    build()
-                    .unwrap_or_else(|e| {
-                        panic!("generation provider `{gen_provider}` built at launch but not now: {e}")
-                    })
-                    .1
-                }),
-            }))
-        }
-        Err(FactoryError::RequiresAsyncBootstrap { provider }) => {
-            tracing::warn!(
-                provider = %provider,
-                "workflows.generate is unavailable: `{provider}` authenticates with Anthropic OAuth, \
-                 which cannot be built where the tool runs (use an API key to enable it: \
-                 `rupu auth login --account {provider} --mode api-key`)"
-            );
-            Ok(None)
-        }
-        Err(e) => Err(anyhow::Error::new(e)
-            .context(format!("build the generation provider `{gen_provider}`"))),
-    }
+        .map_err(|e| anyhow::Error::new(e).context("build the generation provider"))
 }
 
 /// Why `load_agentiflow_def` returned `None`: it folds "no such file" and
@@ -1001,8 +930,9 @@ struct StatusBudget {
 }
 
 /// The tokens a run's ledgers hold, for a record that carries no spend: the
-/// lead's `usage.jsonl` plus the `usage.jsonl` of every unit the run
-/// launched (`units/<id>/` under the run dir names each one; its ledger is
+/// flow's `usage.jsonl` (the lead's calls, and a rollup copy of every call a
+/// child it launched made, W7) plus, for a run from before the children
+/// ledger, the `usage.jsonl` of every unit under `units/<id>/` (its ledger is
 /// `<global>/runs/<id>/usage.jsonl`). Best-effort, like the fold itself: a
 /// ledger that is missing or unreadable adds nothing.
 fn ledger_tokens(global: &Path, run_dir: &Path) -> u64 {
@@ -1873,7 +1803,9 @@ async fn serve_loop(
 }
 
 /// One orphan sweep, off the async runtime (the reaper blocks on file IO and,
-/// for a run with live units, on their SIGTERM grace). Returns what it reaped;
+/// for a run with live units, on their SIGTERM grace): orphaned agentiflows,
+/// then every run's process children whose launching process died
+/// (`children.jsonl`, W7). Returns the agentiflows it reaped;
 /// reporting that is the caller's (`serve` prints it, `cp serve` logs it). A
 /// sweep that did not finish is logged and reads as one that reaped nothing:
 /// nothing here can fail the caller. Shared by `agentiflow serve` and `cp
@@ -1881,7 +1813,13 @@ async fn serve_loop(
 pub(crate) async fn reap_orphans(global: &Path) -> ReapSummary {
     let global = global.to_path_buf();
     match tokio::task::spawn_blocking(move || {
-        rupu_agentiflow::reap_orphaned_agentiflows(&global, Utc::now())
+        let flows = rupu_agentiflow::reap_orphaned_agentiflows(&global, Utc::now());
+        let children =
+            rupu_launch::reaper::reap_orphaned_children(&global, rupu_launch::TERM_GRACE);
+        for (dir, handle) in &children.reaped {
+            tracing::info!(run = %dir.display(), %handle, "stopped an orphaned child run");
+        }
+        flows
     })
     .await
     {
@@ -2998,6 +2936,7 @@ pool:
             output_tokens: output,
             cached_tokens: 0,
             cache_write_tokens: 0,
+            rollup: false,
         };
         format!("{}\n", serde_json::to_string(&row).unwrap())
     }

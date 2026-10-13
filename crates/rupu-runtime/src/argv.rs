@@ -74,6 +74,12 @@ pub struct AgentRun {
     pub tmp_clone: bool,
     /// Join an agentiflow's board as a pool unit.
     pub flow: Option<FlowAttach>,
+    /// `--continue <run id>`: continue that interrupted run of the agent
+    /// instead of starting from a prompt.
+    pub continue_from: Option<String>,
+    /// A child a parent run launched (W7): its depth, ceiling, caps and
+    /// usage root (hidden flags).
+    pub launch: Option<LaunchLink>,
 }
 
 impl AgentRun {
@@ -91,6 +97,8 @@ impl AgentRun {
             engagement_profiles: Vec::new(),
             tmp_clone: false,
             flow: None,
+            continue_from: None,
+            launch: None,
         }
     }
 }
@@ -99,10 +107,17 @@ impl AgentRun {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowRun {
     pub workflow: WorkflowRef,
+    /// The catalog id a [`WorkflowRef::File`] was looked up under
+    /// (`--workflow-name`, hidden): the run is named by it, not by the
+    /// file's own `name:`.
+    pub workflow_name: Option<String>,
     /// Positional run target. clap refuses one together with
     /// [`WorkflowRef::File`].
     pub target: Option<String>,
     pub run_id: String,
+    /// The codename the launching run minted (`--codename`, hidden): the
+    /// workflow run's root, under which its steps are named.
+    pub codename: Option<String>,
     pub mode: Option<PermissionMode>,
     /// `--input k=v`, rendered in key order.
     pub inputs: BTreeMap<String, String>,
@@ -111,6 +126,7 @@ pub struct WorkflowRun {
     pub plain: bool,
     pub engagement_profiles: Vec<String>,
     pub flow: Option<FlowAttach>,
+    pub launch: Option<LaunchLink>,
 }
 
 impl WorkflowRun {
@@ -119,15 +135,44 @@ impl WorkflowRun {
     pub fn new(workflow: WorkflowRef, run_id: impl Into<String>) -> Self {
         Self {
             workflow,
+            workflow_name: None,
             target: None,
             run_id: run_id.into(),
+            codename: None,
             mode: None,
             inputs: BTreeMap::new(),
             plain: false,
             engagement_profiles: Vec::new(),
             flow: None,
+            launch: None,
         }
     }
+}
+
+/// What a launched child takes from the run that started it, across the
+/// process boundary (spec W7 §3.4, D18): `--launch-depth`,
+/// `--launch-ceiling`, `--parent-run`, `--root-run`, `--usage-root`, and the
+/// caps `--launch-agents=` / `--launch-workflows=` / `--launch-actions=`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LaunchLink {
+    /// The child's depth (its parent's + 1).
+    pub depth: u32,
+    /// The parent's permission ceiling: the child runs at
+    /// `min(ceiling, its own permissionMode)`.
+    pub ceiling: PermissionMode,
+    pub parent_run: String,
+    /// The root of the launch tree.
+    pub root_run: String,
+    /// The root run's usage ledger: the child copies each row it charges to
+    /// its own ledger there, as a rollup row.
+    pub usage_root: Option<PathBuf>,
+    /// The parent's dispatchable agents: the child's cap.
+    pub agents: Vec<String>,
+    /// The parent's dispatchable workflows: the child's cap.
+    pub workflows: Vec<String>,
+    /// The connector tools the parent was narrowed to; `None` = not
+    /// narrowed (an empty list allows none).
+    pub actions: Option<Vec<String>>,
 }
 
 /// Which workflow a [`WorkflowRun`] runs.
@@ -322,7 +367,9 @@ impl RunArgv {
                 if r.tmp_clone {
                     a.push("--tmp");
                 }
+                a.opt_flag_value("--continue", r.continue_from.as_deref());
                 a.flow(r.flow.as_ref());
+                a.launch(r.launch.as_ref());
             }
             Self::Workflow(r) => {
                 a.push("workflow");
@@ -334,8 +381,10 @@ impl RunArgv {
                         a.push(path.as_os_str());
                     }
                 }
+                a.opt_flag_value("--workflow-name", r.workflow_name.as_deref());
                 a.opt_positional(r.target.as_deref());
                 a.flag_value("--run-id", &r.run_id);
+                a.opt_flag_value("--codename", r.codename.as_deref());
                 a.opt_flag_value("--mode", r.mode.map(PermissionMode::as_str));
                 if r.plain {
                     a.push("--plain");
@@ -347,6 +396,7 @@ impl RunArgv {
                     a.flag_value("--engagement-profile", id);
                 }
                 a.flow(r.flow.as_ref());
+                a.launch(r.launch.as_ref());
             }
             Self::WorkflowControl(c) => {
                 a.push("workflow");
@@ -481,6 +531,13 @@ impl RunArgv {
     pub fn for_peer(&self, features: &FeatureSet) -> (RunArgv, Vec<Downgrade>) {
         let mut out = self.clone();
         let mut downgrades = Vec::new();
+        // No peer advertises `workflow run --codename`: only a local launch
+        // carries it.
+        if let Self::Workflow(r) = &mut out {
+            if let Some(codename) = r.codename.take() {
+                downgrades.push(Downgrade::CodenameDropped { codename });
+            }
+        }
         if let Self::Agent(r) = &mut out {
             if let Some(c) = r.codename.clone() {
                 match features.codename {
@@ -548,6 +605,27 @@ impl Args {
             self.push("--fleet-run-dir");
             self.push(f.run_dir.as_os_str());
             self.flag_value("--fleet-participant", &f.participant);
+        }
+    }
+
+    /// The caps are one `--flag=a,b` element each, so an empty one is still
+    /// one element (an empty cap allows nothing).
+    fn launch(&mut self, link: Option<&LaunchLink>) {
+        let Some(l) = link else {
+            return;
+        };
+        self.flag_value("--launch-depth", &l.depth.to_string());
+        self.flag_value("--launch-ceiling", l.ceiling.as_str());
+        self.flag_value("--parent-run", &l.parent_run);
+        self.flag_value("--root-run", &l.root_run);
+        if let Some(p) = &l.usage_root {
+            self.push("--usage-root");
+            self.push(p.as_os_str());
+        }
+        self.push(format!("--launch-agents={}", l.agents.join(",")));
+        self.push(format!("--launch-workflows={}", l.workflows.join(",")));
+        if let Some(a) = &l.actions {
+            self.push(format!("--launch-actions={}", a.join(",")));
         }
     }
 }
@@ -645,6 +723,38 @@ mod tests {
                 "--input",
                 "k=v",
             ]
+        );
+    }
+
+    /// A launched workflow carries the codename its parent minted; no peer
+    /// advertises the flag, so one is dropped (and said so) for a peer.
+    #[test]
+    fn a_workflow_run_carries_its_codename_locally_only() {
+        let mut r = WorkflowRun::new(WorkflowRef::Name("audit".into()), "run_X");
+        r.codename = Some("jade-reef/heron>audit#1".into());
+        let argv = RunArgv::Workflow(r);
+        assert_eq!(
+            strs(&argv),
+            [
+                "workflow",
+                "run",
+                "audit",
+                "--run-id",
+                "run_X",
+                "--codename",
+                "jade-reef/heron>audit#1"
+            ]
+        );
+        let (peer, downgrades) = argv.for_peer(&FeatureSet::current());
+        let RunArgv::Workflow(peer) = peer else {
+            panic!()
+        };
+        assert_eq!(peer.codename, None);
+        assert_eq!(
+            downgrades,
+            [Downgrade::CodenameDropped {
+                codename: "jade-reef/heron>audit#1".into()
+            }]
         );
     }
 
@@ -825,5 +935,42 @@ mod tests {
             want.extend(strs(&argv));
             assert_eq!(got, want);
         }
+    }
+
+    #[test]
+    fn a_launch_link_renders_hidden_flags_with_one_element_per_cap() {
+        let mut run = AgentRun::new("recon", "run_1");
+        run.launch = Some(LaunchLink {
+            depth: 3,
+            ceiling: PermissionMode::Readonly,
+            parent_run: "run_p".into(),
+            root_run: "run_r".into(),
+            usage_root: Some(PathBuf::from("/g/runs/run_r/usage.jsonl")),
+            agents: vec!["a".into(), "b".into()],
+            workflows: vec![],
+            actions: Some(vec![]),
+        });
+        assert_eq!(
+            strs(&RunArgv::Agent(run)),
+            [
+                "run",
+                "recon",
+                "--run-id",
+                "run_1",
+                "--launch-depth",
+                "3",
+                "--launch-ceiling",
+                "readonly",
+                "--parent-run",
+                "run_p",
+                "--root-run",
+                "run_r",
+                "--usage-root",
+                "/g/runs/run_r/usage.jsonl",
+                "--launch-agents=a,b",
+                "--launch-workflows=",
+                "--launch-actions=",
+            ]
+        );
     }
 }

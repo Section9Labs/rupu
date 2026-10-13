@@ -33,17 +33,10 @@ use std::fmt;
 
 /// What an agent with no `tools:` list gets. This is a compatibility
 /// default: it reproduces the registry such an agent had before grants
-/// existed — every builtin (the core tools and the sub-agent dispatch pair)
-/// and every connector tool. W7 replaces the dispatch pair with
-/// `dispatch` / `join`.
+/// existed — every builtin (the core tools and sub-agent dispatch, now the
+/// launch pair) and every connector tool.
 pub const DEFAULT_GRANT: &[&str] = &[
-    "core.*",
-    "dispatch_agent",
-    "dispatch_agents_parallel",
-    "scm.*",
-    "issues.*",
-    "github.*",
-    "gitlab.*",
+    "core.*", "dispatch", "join", "scm.*", "issues.*", "github.*", "gitlab.*",
 ];
 
 /// The `tools:` entry that grants the core tools.
@@ -62,9 +55,11 @@ pub enum GrantReason {
     /// Granted by the run's context, not the agent file (`concerns`,
     /// `engagement`).
     Ambient(&'static str),
-    /// Granted by how the run was started (`injected`: a pre-built tool the
-    /// launch site handed the runner).
+    /// Granted by how the run was started (`flow_lead`, `flow_unit`).
     Origin(&'static str),
+    /// Granted because another granted tool is unusable without it: `join`
+    /// with `dispatch`, which returns before its child ends.
+    Implied(&'static str),
 }
 
 impl fmt::Display for GrantReason {
@@ -75,6 +70,7 @@ impl fmt::Display for GrantReason {
             GrantReason::Default => f.write_str("default"),
             GrantReason::Ambient(r) => write!(f, "ambient:{r}"),
             GrantReason::Origin(r) => write!(f, "origin:{r}"),
+            GrantReason::Implied(by) => write!(f, "implied:{by}"),
         }
     }
 }
@@ -87,10 +83,6 @@ pub struct AmbientGrant {
     /// Tool names (canonical or alias).
     pub tools: Vec<&'static str>,
     pub reason: GrantReason,
-    /// The launch site handed the runner these tools already built, with
-    /// whatever they serve from captured inside them: they are offered
-    /// without checking the run's [`ServiceSet`].
-    pub self_served: bool,
 }
 
 impl AmbientGrant {
@@ -106,7 +98,6 @@ impl AmbientGrant {
                 "findings.report",
             ],
             reason: GrantReason::Ambient("concerns"),
-            self_served: false,
         }
     }
 
@@ -115,7 +106,6 @@ impl AmbientGrant {
         Self {
             tools: vec!["findings.report", "assets.mark"],
             reason: GrantReason::Ambient("engagement"),
-            self_served: false,
         }
     }
 
@@ -124,13 +114,13 @@ impl AmbientGrant {
         Self {
             tools: vec!["skills.load"],
             reason: GrantReason::Ambient("skills"),
-            self_served: false,
         }
     }
 
     /// An agentiflow lead's coordination set (`origin:flow_lead`): the whole
     /// board and mailbox, the flow's live status, the agent/workflow roster
-    /// and `findings.report`. (Its launch tools are injected until W7.)
+    /// `findings.report`, and the launch tools (`dispatch`, `join`,
+    /// `workflows.generate`).
     pub fn flow_lead() -> Self {
         Self {
             tools: vec![
@@ -150,9 +140,11 @@ impl AmbientGrant {
                 "workflows.get",
                 "catalog.search",
                 "findings.report",
+                "dispatch",
+                "join",
+                "workflows.generate",
             ],
             reason: GrantReason::Origin("flow_lead"),
-            self_served: false,
         }
     }
 
@@ -168,18 +160,6 @@ impl AmbientGrant {
                 "msg.send",
             ],
             reason: GrantReason::Origin("flow_unit"),
-            self_served: false,
-        }
-    }
-
-    /// Pre-built tools the launch site injected into the run (the agentiflow
-    /// launch tools until W7 replaces them). Self-served: the tool is its own
-    /// implementation.
-    pub fn injected(tools: Vec<&'static str>) -> Self {
-        Self {
-            tools,
-            reason: GrantReason::Origin("injected"),
-            self_served: true,
         }
     }
 }
@@ -230,6 +210,10 @@ pub struct GrantInputs<'a> {
     pub declared: Option<&'a [String]>,
     /// The step's `actions:`; empty = no narrowing.
     pub step_actions: &'a [String],
+    /// The connector tools a parent run narrowed its children to (W7, L4):
+    /// connector tools outside it are narrowed away like `actions:` does.
+    /// `None` = no cap; an empty cap allows no connector tool.
+    pub connector_cap: Option<&'a [String]>,
     pub ambient: &'a [AmbientGrant],
     /// Which services this run provides.
     pub available: &'a ServiceSet,
@@ -307,6 +291,10 @@ pub struct ResolvedGrant {
     /// does not cover. The step can't add them (no escalation), but it is
     /// very likely an authoring mistake.
     pub actions_not_granted: Vec<&'static str>,
+    /// The connector tools this run is narrowed to — its `actions:` within
+    /// the cap its parent passed down — which its own children inherit as
+    /// their cap (W7). `None` = not narrowed.
+    pub connector_cap: Option<BTreeSet<&'static str>>,
 }
 
 impl ResolvedGrant {
@@ -335,14 +323,12 @@ impl ResolvedGrant {
     }
 
     /// Offer `d` for `reason`, or record why not.
-    /// `available` is `None` for a self-served grant, which needs nothing
-    /// from the run.
     fn offer(
         &mut self,
         d: &'static ToolDescriptor,
         reason: GrantReason,
         named: bool,
-        available: Option<&ServiceSet>,
+        available: &ServiceSet,
     ) {
         if let Some(entry) = self.entries.get_mut(d.name) {
             if !entry.reasons.contains(&reason) {
@@ -350,7 +336,7 @@ impl ResolvedGrant {
             }
             return;
         }
-        let missing = available.map_or_else(Vec::new, |a| a.missing_for(d));
+        let missing = available.missing_for(d);
         if missing.is_empty() {
             self.skipped.retain(|u| u.tool != d.name);
             self.entries.insert(
@@ -501,11 +487,9 @@ impl ToolCatalog {
             };
             match expansion {
                 Expansion::Exact(d) if is_default => {
-                    g.offer(d, GrantReason::Default, false, Some(inputs.available))
+                    g.offer(d, GrantReason::Default, false, inputs.available)
                 }
-                Expansion::Exact(d) => {
-                    g.offer(d, GrantReason::Declared, true, Some(inputs.available))
-                }
+                Expansion::Exact(d) => g.offer(d, GrantReason::Declared, true, inputs.available),
                 Expansion::Wildcard(ds) => {
                     let reason = if is_default {
                         GrantReason::Default
@@ -513,15 +497,31 @@ impl ToolCatalog {
                         GrantReason::DeclaredWildcard(entry.to_string())
                     };
                     for d in ds {
-                        g.offer(d, reason.clone(), false, Some(inputs.available));
+                        g.offer(d, reason.clone(), false, inputs.available);
                     }
                 }
             }
         }
 
-        if !inputs.step_actions.is_empty() {
-            let actions = self.resolve_actions(inputs.step_actions, scope)?;
-            let keep = |name: &str, connector: bool| !connector || actions.contains(name);
+        let actions = if inputs.step_actions.is_empty() {
+            None
+        } else {
+            Some(self.resolve_actions(inputs.step_actions, scope)?)
+        };
+        // A parent's cap: names it resolved itself, so an unknown one is
+        // dropped rather than an error here.
+        let cap: Option<BTreeSet<&'static str>> = inputs.connector_cap.map(|c| {
+            c.iter()
+                .filter_map(|n| self.resolve_name(n, scope).map(|d| d.name))
+                .collect()
+        });
+        let effective = match (&actions, cap) {
+            (Some(a), Some(c)) => Some(a.intersection(&c).copied().collect()),
+            (Some(a), None) => Some(a.clone()),
+            (None, c) => c,
+        };
+        if let Some(allowed) = &effective {
+            let keep = |name: &str, connector: bool| !connector || allowed.contains(name);
             let mut narrowed = Vec::new();
             g.entries.retain(|name, e| {
                 let k = keep(name, e.descriptor.is_connector());
@@ -543,6 +543,8 @@ impl ToolCatalog {
             narrowed.sort_unstable();
             narrowed.dedup();
             g.narrowed = narrowed;
+        }
+        if let Some(actions) = actions {
             g.actions_not_granted = actions
                 .iter()
                 .copied()
@@ -550,6 +552,7 @@ impl ToolCatalog {
                 .collect();
             g.actions = Some(actions);
         }
+        g.connector_cap = effective;
 
         for a in inputs.ambient {
             for name in &a.tools {
@@ -560,8 +563,16 @@ impl ToolCatalog {
                         name: name.to_string(),
                         suggestion: None,
                     })?;
-                let available = (!a.self_served).then_some(inputs.available);
-                g.offer(d, a.reason.clone(), false, available);
+                g.offer(d, a.reason.clone(), false, inputs.available);
+            }
+        }
+        let (dispatch, join) = (
+            crate::launch::dispatch::DESCRIPTOR.name,
+            crate::launch::join::DESCRIPTOR.name,
+        );
+        if g.offers(dispatch) && !g.offers(join) {
+            if let Some(d) = self.descriptor(join) {
+                g.offer(d, GrantReason::Implied(dispatch), false, inputs.available);
             }
         }
         Ok(g)

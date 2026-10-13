@@ -670,7 +670,7 @@ fn resolve_ledger_paths(workspace: &StdPath, global_dir: &StdPath, id: &str) -> 
 ///
 /// Sub-agent ids come from [`RunStore::sub_run_ids_recursive`], which
 /// walks the WHOLE dispatch tree (a sub-agent can itself dispatch
-/// sub-agents up to `rupu-tools::dispatch_agent::MAX_DEPTH`), not just
+/// sub-agents up to `rupu-tools::MAX_LAUNCH_DEPTH`), not just
 /// the first level — before this, there was no way to discover a
 /// sub-agent's id from its parent at all, so its ledger (and its
 /// ledger-only `Dropped` count) was reachable only at global scope, with

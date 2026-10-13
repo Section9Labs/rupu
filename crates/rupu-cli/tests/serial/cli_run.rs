@@ -13,7 +13,7 @@ const MOCK_SCRIPT: &str = r#"
 /// process-side `MockProvider` instance is built fresh from this same
 /// `RUPU_MOCK_PROVIDER_SCRIPT` JSON (one for the parent's own agent
 /// loop, one for the child's, built independently inside
-/// `CliAgentDispatcher::dispatch`) — so both turn sequences start at
+/// the launcher's sub-agent dispatch) — so both turn sequences start at
 /// index 0 of this same two-turn script:
 ///   turn 0: a `dispatch_agent` tool_use targeting `child`.
 ///   turn 1: a final assistant text.
@@ -291,7 +291,7 @@ async fn rupu_run_bare_dispatches_child_agent_via_dispatch_agent_tool() {
 
     // The dispatch created a child sub-run under
     // `<runs_root>/<run_id>/sub/<sub_run_id>/transcript.jsonl` —
-    // exactly the layout `CliAgentDispatcher::dispatch` and
+    // exactly the layout the launcher's sub-agent dispatch and
     // `RunStore::create_sub_run` document (spec § 5.1). This directory
     // only exists if `ToolContext.dispatcher` was actually `Some(..)`
     // for the bare run — the thing this change wires up.

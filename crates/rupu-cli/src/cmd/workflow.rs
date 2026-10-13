@@ -178,7 +178,8 @@ async fn run_workflow_catching_panic(
 ) -> Result<Result<OrchestratorRunResult, RunWfErr>, RunnerPanic> {
     use futures_util::FutureExt as _;
     let store = opts.run_store.clone();
-    let panic = match std::panic::AssertUnwindSafe(run_workflow(opts))
+    // Boxed: the run future is too large for a small (test) thread stack.
+    let panic = match std::panic::AssertUnwindSafe(Box::pin(run_workflow(opts)))
         .catch_unwind()
         .await
     {
@@ -332,6 +333,9 @@ use std::sync::{Arc, Mutex};
 use tracing::warn;
 use ulid::Ulid;
 
+// Parsed once per process: `Run`'s size (its hidden `--launch-*` flags)
+// costs nothing worth a box.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 pub enum Action {
     /// List all workflows (global + project).
@@ -458,6 +462,24 @@ pub enum Action {
         /// name from the catalog. The workflow is not added to the catalog.
         #[arg(long, value_name = "PATH", conflicts_with = "target")]
         file: Option<PathBuf>,
+        /// The catalog id the launching run looked `--file` up under: the
+        /// run is named by it instead of the file's `name:`. Internal.
+        #[arg(long, hide = true, value_name = "ID", requires = "file")]
+        // Boxed, like `codename`: `Cmd`'s largest variant is this one.
+        workflow_name: Option<Box<String>>,
+        /// The run's codename, minted by the run that launched it: its steps
+        /// are named under it. Internal.
+        #[arg(
+            long,
+            hide = true,
+            value_name = "CODENAME",
+            value_parser = |s: &str| crate::cmd::run::parse_codename(s).map(Box::new)
+        )]
+        // Boxed: `Cmd`'s largest variant is already this one.
+        codename: Option<Box<rupu_codename::Codename>>,
+        /// Set when another run launched this one (`--launch-*`, hidden).
+        #[command(flatten)]
+        launch: crate::cmd::launch_link::LaunchLinkArgs,
     },
     /// List recent workflow runs from the persistent run-store
     /// (`<global>/runs/`). Newest first.
@@ -689,8 +711,14 @@ pub async fn handle(
             // board tools, so the id itself is not used here.
             fleet_participant: _,
             file,
+            workflow_name,
+            codename,
+            launch,
         } => match FleetRunOverlay::from_flags(engagement_profiles, fleet_run_dir.as_deref()) {
-            Ok(overlay) => {
+            Ok(mut overlay) => {
+                overlay.workflow_name = workflow_name.map(|n| *n);
+                overlay.link = launch.link();
+                overlay.codename = codename.map(|c| *c);
                 run(
                     file.as_deref(),
                     name.as_deref(),
@@ -3789,7 +3817,11 @@ pub(crate) async fn resume_run(
             // A resumed run is never an agentiflow unit (workflow units
             // refuse gated workflows), so it keeps the workflow's own scope.
             scope_name_override: None,
-        });
+            launcher: Some(Arc::new(rupu_launch::Launchers::local(&global, &cfg)?)),
+            link: store.read_launch_link(run_id),
+            // The root codename it was launched under, as recorded.
+            codename: record.codename.as_deref().and_then(|c| c.parse().ok()),
+        })?;
     let naming = runtime.naming;
     let runtime_action_services = runtime.action_services;
     let factory = runtime.factory;
@@ -3927,7 +3959,7 @@ pub(crate) async fn resume_run(
         )
         .await
     } else {
-        run_workflow(opts).await
+        Box::pin(run_workflow(opts)).await
     };
     let result = match outcome {
         Ok(result) => result,
@@ -4654,12 +4686,16 @@ async fn run_with_outcome(
             (p, body)
         }
     };
-    let workflow = Workflow::parse(&body).map_err(|e| match file {
+    let mut workflow = Workflow::parse(&body).map_err(|e| match file {
         Some(f) => anyhow::anyhow!("--file {}: {e}", f.display()),
         None => anyhow::Error::new(e),
     })?;
-    // A file-sourced workflow is named by its own `name:`; a catalog one by
-    // the name it was looked up under.
+    if let Some(id) = &overlay.workflow_name {
+        workflow.name = id.clone();
+    }
+    // A file-sourced workflow is named by its own `name:` (or the catalog id
+    // its launcher looked it up under); a catalog one by the name it was
+    // looked up under.
     let name: String = match (file, name) {
         (None, Some(n)) => n.to_string(),
         _ => workflow.name.clone(),
@@ -5368,6 +5404,14 @@ pub(crate) struct FleetRunOverlay {
     /// workflow's name: the agentiflow run dir's name. `None` = the
     /// workflow's own name.
     pub scope_name: Option<String>,
+    /// Set when another run launched this one (`--launch-*`): every step
+    /// carries its depth, ceiling, caps and usage root.
+    pub link: Option<rupu_runtime::argv::LaunchLink>,
+    /// The codename the launching run minted (`--codename`).
+    pub codename: Option<rupu_codename::Codename>,
+    /// The catalog id the launching run looked `--file` up under
+    /// (`--workflow-name`): the run's name.
+    pub workflow_name: Option<String>,
 }
 
 impl FleetRunOverlay {
@@ -5395,6 +5439,9 @@ impl FleetRunOverlay {
         Ok(Self {
             engagement_profiles,
             scope_name,
+            link: None,
+            codename: None,
+            workflow_name: None,
         })
     }
 }
@@ -5586,7 +5633,14 @@ async fn execute_workflow_invocation(
             mode: permission_mode,
             system_prompt_suffix: ctx.system_prompt_suffix.clone(),
             scope_name_override: overlay.scope_name.clone(),
-        });
+            launcher: Some(Arc::new(rupu_launch::Launchers::local(&global, &cfg)?)),
+            link: overlay.link.clone(),
+            codename: overlay.codename.clone(),
+        })?;
+    // A launched workflow keeps its link across a resume.
+    if let Some(link) = &overlay.link {
+        run_store.write_launch_link(&run_id, link)?;
+    }
     let naming = runtime.naming;
     let runtime_action_services = runtime.action_services;
     let factory = runtime.factory;

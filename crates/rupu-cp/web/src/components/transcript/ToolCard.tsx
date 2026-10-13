@@ -40,6 +40,7 @@ import { Badge } from '../ui/Badge';
 import { AgentName } from '../codename/AgentName';
 import { SubrunIdentityContext } from './subrunIdentity';
 import { formatDuration } from '../../lib/duration';
+import type { ChildState } from '../../lib/api';
 
 // ---------------------------------------------------------------------------
 // Public helper — exported for unit tests
@@ -451,12 +452,15 @@ function GlobBody({ tool }: { tool: ToolView }) {
 // ---------------------------------------------------------------------------
 
 /**
- * Fields one dispatched sub-run reports on the wire. The producers are
- * `crates/rupu-tools/src/dispatch_agent.rs` (`ok` / `tokens_used` /
- * `transcript_path` / `sub_run_id`, all top-level) and
- * `dispatch_agents_parallel.rs` (same fields per request under `results`,
- * with `error` replacing them on a failed dispatch). There is no `status`
- * or `total_tokens` field — those were never emitted.
+ * Fields one dispatched sub-run reports on the wire. The legacy producers are
+ * `dispatch_agent` (`ok` / `tokens_used` / `transcript_path` / `sub_run_id`,
+ * all top-level) and `dispatch_agents_parallel` (same fields per request
+ * under `results`, with `error` replacing them on a failed dispatch); neither
+ * has a `status` or `total_tokens` field. W7's `dispatch` answers `{handle,
+ * kind, name, run_id, codename?, transcript?, result?}` with a `join` entry as
+ * `result` (when it waited), and `join` answers `{children: [entry…]}`; an
+ * entry carries `status` / `success` / `tokens: {input, output}` / `error`
+ * (crates/rupu-tools/src/launch/{dispatch,join}.rs).
  */
 export interface SubrunPayload {
   ok: boolean | null;
@@ -468,6 +472,8 @@ export interface SubrunPayload {
   codename: string | null;
   /** The dispatched agent's name. */
   agent: string | null;
+  /** The child's state, on the W7 shapes only (the legacy ones have none). */
+  status?: ChildState;
 }
 
 export interface ParsedSubrunOutput {
@@ -477,18 +483,58 @@ export interface ParsedSubrunOutput {
   requests: Array<{ id: string; payload: SubrunPayload }>;
 }
 
+const CHILD_STATES: readonly ChildState[] = [
+  'pending',
+  'running',
+  'done',
+  'failed',
+  'abandoned',
+  'interrupted',
+];
+
+function str(v: unknown): string | null {
+  return typeof v === 'string' && v ? v : null;
+}
+
+function childState(v: unknown): ChildState | undefined {
+  return CHILD_STATES.find((s) => s === v);
+}
+
+/** A W7 entry's `ok`: only a finished child has one. */
+function okFromState(status: ChildState | undefined, success: unknown): boolean | null {
+  if (status === 'failed' || status === 'abandoned') return false;
+  if (typeof success !== 'boolean') return null;
+  return status === undefined || status === 'done' ? success : null;
+}
+
 function subrunPayloadFromRecord(rec: Record<string, unknown>): SubrunPayload | null {
-  const ok = typeof rec.ok === 'boolean' ? rec.ok : null;
-  const tokensUsed = typeof rec.tokens_used === 'number' ? rec.tokens_used : null;
-  const transcriptPath = typeof rec.transcript_path === 'string' ? rec.transcript_path : null;
-  const subRunID = typeof rec.sub_run_id === 'string' ? rec.sub_run_id : null;
-  const error = typeof rec.error === 'string' ? rec.error : null;
-  if (ok === null && tokensUsed === null && transcriptPath === null && subRunID === null && error === null) {
+  // `dispatch {wait: true}` nests its join entry under `result`; a join
+  // entry (and every legacy shape) carries its outcome at the top level.
+  const outcome = isRecord(rec.result) ? rec.result : rec;
+  const status = childState(outcome.status);
+  const ok = typeof rec.ok === 'boolean' ? rec.ok : okFromState(status, outcome.success);
+  const tokens = isRecord(outcome.tokens) ? outcome.tokens : null;
+  const tokensUsed =
+    typeof rec.tokens_used === 'number'
+      ? rec.tokens_used
+      : tokens && typeof tokens.input === 'number' && typeof tokens.output === 'number'
+        ? tokens.input + tokens.output
+        : null;
+  const transcriptPath =
+    str(rec.transcript_path) ?? str(rec.transcript) ?? str(outcome.transcript) ?? null;
+  const subRunID = str(rec.sub_run_id) ?? str(rec.run_id);
+  const error = str(rec.error) ?? str(outcome.error);
+  if (
+    ok === null && tokensUsed === null && transcriptPath === null && subRunID === null &&
+    error === null && status === undefined
+  ) {
     return null;
   }
-  const codename = typeof rec.codename === 'string' && rec.codename ? rec.codename : null;
-  const agent = typeof rec.agent === 'string' && rec.agent ? rec.agent : null;
-  return { ok, tokensUsed, transcriptPath, subRunID, error, codename, agent };
+  const codename = str(rec.codename);
+  const agent = str(rec.agent) ?? str(rec.name);
+  const payload: SubrunPayload = { ok, tokensUsed, transcriptPath, subRunID, error, codename, agent };
+  if (status) payload.status = status;
+  return payload;
 }
 
 /**
@@ -511,6 +557,14 @@ export function parseSubrunOutput(output: string | undefined): ParsedSubrunOutpu
       if (payload) requests.push({ id, payload });
     }
   }
+  // `join`: one entry per child, keyed by its handle.
+  if (Array.isArray(parsed.children)) {
+    parsed.children.forEach((entry, i) => {
+      if (!isRecord(entry)) return;
+      const payload = subrunPayloadFromRecord(entry);
+      if (payload) requests.push({ id: str(entry.handle) ?? String(i), payload });
+    });
+  }
 
   if (!top && requests.length === 0) return null;
   return { top, requests };
@@ -524,7 +578,9 @@ function SubrunPayloadRow({
   payload: SubrunPayload;
   onOpenTranscript?: (path: string) => void;
 }) {
-  const { ok, tokensUsed, transcriptPath, error } = payload;
+  const { ok, tokensUsed, transcriptPath, error, status } = payload;
+  const unfinished =
+    status === 'pending' || status === 'running' || status === 'abandoned' || status === 'interrupted';
   // Prefer the run's dispatch_started identity (it alone carries
   // provider/model); fall back to the tool output's codename/agent.
   const known = useContext(SubrunIdentityContext).get(payload.subRunID ?? '');
@@ -543,10 +599,19 @@ function SubrunPayloadRow({
             />
           </span>
         )}
-        {ok !== null && (
-          <Badge tone={ok ? 'green' : 'red'} className="px-2 font-mono">
-            {ok ? 'ok' : 'failed'}
+        {unfinished ? (
+          <Badge
+            tone={status === 'abandoned' ? 'amber' : status === 'interrupted' ? 'sky' : 'neutral'}
+            className="px-2 font-mono"
+          >
+            {status}
           </Badge>
+        ) : (
+          ok !== null && (
+            <Badge tone={ok ? 'green' : 'red'} className="px-2 font-mono">
+              {ok ? 'ok' : 'failed'}
+            </Badge>
+          )
         )}
         {tokensUsed !== null && (
           <Badge tone="neutral" className="px-2 font-mono">

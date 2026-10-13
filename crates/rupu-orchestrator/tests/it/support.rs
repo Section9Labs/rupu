@@ -16,7 +16,9 @@ pub fn step_factory(global: &Path, workflow: Workflow) -> Arc<dyn StepFactory> {
         )),
         mode: rupu_tools::PermissionMode::Bypass,
         system_prompt_suffix: None,
-        dispatcher: None,
+        launcher: None,
+        workflow_generator: None,
+        link: None,
         scope_name_override: None,
     })
 }

@@ -76,7 +76,6 @@ pub(crate) fn opts_for(
             hooks: Default::default(),
             pause: None,
             collectors: Vec::new(),
-            extra_tools: Vec::new(),
             transcript_path: workspace.join("run.jsonl"),
         },
         agent_tools.as_deref(),

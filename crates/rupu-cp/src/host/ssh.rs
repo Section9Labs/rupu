@@ -8124,6 +8124,16 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
+        // The terminal `run.json` is mirrored before the transcript catch-up
+        // and `finish`: wait for finish's step-result row before reading
+        // what it leaves behind.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while run_store.read_step_results(run_id).unwrap().is_empty()
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
         // Transcript lines land in the mirrored transcript, next to the runs
         // dir the way the coordinator's own layout puts them.
         let transcript_path = tmp
