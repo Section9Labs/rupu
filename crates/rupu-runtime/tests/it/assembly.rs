@@ -85,6 +85,7 @@ fn origins(home: &Home) -> Vec<(&'static str, Origin)> {
                 }),
                 step_actions: vec!["issues.*".into()],
                 scope_override: None,
+                messaging: None,
             },
         ),
         (
@@ -282,12 +283,11 @@ async fn star_parity_per_origin() {
         l.services.launcher = Some(Arc::new(crate::support::NoLaunch));
         match &origin {
             Origin::FlowLead { .. } => {
-                l.services.message_bus =
-                    Some(Arc::new(rupu_fleet::Bus::for_run_dir(&flow_dir, "lead")));
+                l.services.message_bus = Some(Arc::new(rupu_fleet::Bus::open(&flow_dir, "lead")));
                 l.services.run_status = Some(Arc::new(crate::support::NoStatus));
             }
             Origin::FlowUnit { participant, .. } => {
-                l.services.message_bus = Some(Arc::new(rupu_fleet::Bus::for_run_dir(
+                l.services.message_bus = Some(Arc::new(rupu_fleet::Bus::open(
                     &flow_dir,
                     participant.clone(),
                 )));
@@ -618,4 +618,60 @@ async fn a_flow_pool_is_the_allowlist_and_children_inherit_it() {
     assert_eq!(child_id.depth, 1);
     assert_eq!(child_id.launch.agents, vec!["exploit"]);
     assert_eq!(child_id.launch.flow.as_deref(), Some(flow_dir.as_path()));
+}
+
+/// Every run with a space has a bus on it, which costs nothing until it is
+/// used; it is offered the messaging tools only when it takes part (spec
+/// F1a FD1): its agent names one, or someone already joined its space.
+#[tokio::test]
+#[serial]
+async fn a_run_takes_part_in_its_space_only_when_asked_or_already_active() {
+    let home = Home::new();
+    let assembler = home.assembler(config());
+    let tools = |run: &rupu_runtime::assembly::AssembledRun| {
+        let s = &run.opts.tool_context.services;
+        (
+            s.message_space.is_some(),
+            s.message_bus.is_some(),
+            run.opts.grant.offers("msg.send"),
+        )
+    };
+
+    let quiet = agent(&home, "provider: anthropic\nmodel: claude-sonnet-4-6\ntools: ['*']");
+    let _m = MockScript::set(DONE);
+    let run = assembler
+        .assemble(launch(&home, quiet.clone(), Origin::Standalone, "run_quiet"))
+        .await
+        .unwrap();
+    assert_eq!(tools(&run), (true, false, false), "`*` alone never takes part");
+    assert!(!home.runs().join("run_quiet").join("messages").exists());
+
+    let named = agent(&home, "provider: anthropic\nmodel: claude-sonnet-4-6\ntools: [msg.send]");
+    let run = assembler
+        .assemble(launch(&home, named, Origin::Standalone, "run_named"))
+        .await
+        .unwrap();
+    assert_eq!(tools(&run), (true, true, true));
+    assert!(
+        !home.runs().join("run_named").join("messages").exists(),
+        "joined lazily, on its first message"
+    );
+
+    // Someone joined `run_quiet`'s space (its child): a later run of it
+    // takes part, and joins as it starts.
+    let child = rupu_fleet::Bus::open(&home.runs().join("run_quiet").join("messages"), "heron>lynx#1");
+    child
+        .join(rupu_fleet::Member {
+            agent: "helper".into(),
+            run_id: "run_child".into(),
+            kind: "subagent".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let run = assembler
+        .assemble(launch(&home, quiet, Origin::Standalone, "run_quiet"))
+        .await
+        .unwrap();
+    assert_eq!(tools(&run), (true, true, true));
+    assert!(run.opts.tool_context.services.message_space.as_ref().unwrap().is_joined());
 }

@@ -282,6 +282,7 @@ async fn allowlist_inherited() {
                 unit: None,
                 step_actions: Vec::new(),
                 scope_override: None,
+                messaging: None,
             },
             run_id: "run_step".into(),
             transcript_path: home.root().join("step.jsonl"),

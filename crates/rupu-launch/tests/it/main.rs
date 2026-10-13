@@ -3,6 +3,7 @@
 //! (`RUPU_MOCK_PROVIDER_SCRIPT`) are `#[serial]`.
 
 mod continuation;
+mod messaging;
 mod subagent;
 mod support;
 mod w7;

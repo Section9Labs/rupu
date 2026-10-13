@@ -42,8 +42,8 @@ pub mod spec;
 pub mod tool_registry;
 
 pub use collector::{
-    Cadence, CollectorPipeline, CommandCollector, Injection, InjectionKind, TurnCollector,
-    TurnContext,
+    Cadence, CollectorPipeline, CommandCollector, Delivered, InjectedMessage, Injection,
+    InjectionKind, TurnCollector, TurnContext,
 };
 pub use fd_budget::load_agent_admitted;
 pub use loader::{

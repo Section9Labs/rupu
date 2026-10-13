@@ -1,3 +1,4 @@
+use crate::address::mailbox_dir_name;
 use crate::error::FleetError;
 use crate::types::FleetMessage;
 use std::io::Write;
@@ -16,11 +17,32 @@ impl Mailbox {
         Self { root: root.into() }
     }
 
+    /// The mailbox directory of `participant`: its address-derived name
+    /// (`lynx#1` → `lynx_1`, [`mailbox_dir_name`]), or — in a space written
+    /// before addresses were codenames — the sanitized name it already has
+    /// (`recon#1` → `recon-1`), so a flow carried across the upgrade keeps
+    /// reading the inbox it was written to.
+    fn participant_dir(&self, participant: &str) -> PathBuf {
+        let root = self.root.join("mailboxes");
+        let current = root.join(mailbox_dir_name(participant));
+        if current.exists() {
+            return current;
+        }
+        let legacy = root.join(sanitize(participant));
+        if legacy != current && legacy.exists() {
+            return legacy;
+        }
+        current
+    }
+
+    /// Whether `participant` has a mailbox directory yet, under either name:
+    /// how a space with no participant registry finds its participants.
+    pub fn has_mailbox(&self, participant: &str) -> bool {
+        self.participant_dir(participant).exists()
+    }
+
     fn inbox_path(&self, participant: &str) -> PathBuf {
-        self.root
-            .join("mailboxes")
-            .join(sanitize(participant))
-            .join("inbox.jsonl")
+        self.participant_dir(participant).join("inbox.jsonl")
     }
 
     /// Take the per-participant advisory lock that serializes `send` against
@@ -62,10 +84,7 @@ impl Mailbox {
     }
 
     fn lock_path(&self, participant: &str) -> PathBuf {
-        self.root
-            .join("mailboxes")
-            .join(sanitize(participant))
-            .join(".lock")
+        self.participant_dir(participant).join(".lock")
     }
 
     fn broadcast_log_path(&self) -> PathBuf {
@@ -76,10 +95,40 @@ impl Mailbox {
     }
 
     fn broadcast_cursor_path(&self, participant: &str) -> PathBuf {
-        self.root
-            .join("mailboxes")
-            .join(sanitize(participant))
-            .join("broadcast.cursor")
+        self.participant_dir(participant).join("broadcast.cursor")
+    }
+
+    /// The messages waiting in `participant`'s inbox. The bus checks it
+    /// before it logs a send, so an inbox at its cap is recorded as such.
+    pub fn inbox_len(&self, participant: &str) -> Result<usize, FleetError> {
+        count_lines(&self.inbox_path(participant))
+    }
+
+    /// The lines in the broadcast log.
+    pub fn broadcast_len(&self) -> Result<usize, FleetError> {
+        count_lines(&self.broadcast_log_path())
+    }
+
+    /// Start `participant`'s broadcast cursor at the log's current end, if
+    /// it has none yet. Unlike [`Mailbox::read_broadcast`] it never consumes
+    /// anything: a participant re-joining keeps what is waiting for it.
+    pub fn register_broadcast_cursor(&self, participant: &str) -> Result<(), FleetError> {
+        let lock_path = self.lock_path(participant);
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| FleetError::Io {
+                action: format!("create mailbox dir {}", parent.display()),
+                source: e,
+            })?;
+        }
+        let _lock = Self::lock_exclusive(&lock_path)?;
+        let cursor_path = self.broadcast_cursor_path(participant);
+        if read_cursor(&cursor_path)?.is_none() {
+            write_cursor(
+                &cursor_path,
+                complete_log_lines(&self.broadcast_log_path())?.len(),
+            )?;
+        }
+        Ok(())
     }
 
     pub fn send(&self, to: &str, msg: &FleetMessage, cap: usize) -> Result<(), FleetError> {
@@ -337,6 +386,8 @@ fn read_messages(path: &Path) -> Result<Vec<FleetMessage>, FleetError> {
     Ok(out)
 }
 
+/// The directory name participants had before addresses were codenames;
+/// read only to find a legacy space's inboxes.
 fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -358,6 +409,7 @@ mod tests {
             from: "lead".into(),
             ts: "2026-10-01T00:00:00Z".into(),
             body: body.into(),
+            ..Default::default()
         }
     }
 

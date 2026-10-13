@@ -164,6 +164,27 @@ impl AmbientGrant {
     }
 }
 
+/// What a workflow's `messaging: true` grants every agent step and unit
+/// (spec F1a §7): the board and `msg.send`, without the authority tools.
+pub const WORKFLOW_MESSAGING: &[&str] = &[
+    "board.claim",
+    "board.release",
+    "board.post",
+    "board.read",
+    "msg.send",
+];
+
+impl AmbientGrant {
+    /// A workflow's `messaging:` key (`ambient:workflow_messaging`): the
+    /// tools it names, canonical, from [`ToolCatalog::resolve_messaging`].
+    pub fn workflow_messaging(tools: Vec<&'static str>) -> Self {
+        Self {
+            tools,
+            reason: GrantReason::Ambient("workflow_messaging"),
+        }
+    }
+}
+
 /// The services a run provides. A tool is offered only when every service
 /// its descriptor `needs` is here.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -388,6 +409,12 @@ pub enum GrantError {
     },
     /// An `actions:` entry that names no connector tool. `actions:` narrows
     /// connector tools only, so the entry would do nothing.
+    /// A `messaging: { tools: [...] }` entry that names no message-space
+    /// tool.
+    #[error(
+        "\"{name}\" in messaging: is not a messaging tool; messaging: grants only board.* and msg.* tools"
+    )]
+    NotMessaging { name: String },
     #[error(
         "\"{name}\" in actions: is not a connector tool; actions: narrows only connector \
          (scm/issues) tools, so it would have no effect"
@@ -460,6 +487,51 @@ impl ToolCatalog {
             out.extend(connectors.into_iter().map(|d| d.name));
         }
         Ok(out)
+    }
+
+    /// Resolve a workflow's `messaging: { tools: [...] }` to the canonical
+    /// tools it grants. Exact names, aliases and `ns.*` only, each naming a
+    /// tool that needs the message bus ([`GrantError::NotMessaging`]).
+    pub fn resolve_messaging(&self, names: &[String]) -> Result<Vec<&'static str>, GrantError> {
+        let mut out: Vec<&'static str> = Vec::new();
+        for n in names {
+            if n.trim() == "*" {
+                return Err(GrantError::NotMessaging { name: n.clone() });
+            }
+            let descs = match self.expand(n, AliasScope::Everywhere, "messaging:")? {
+                Expansion::Exact(d) => vec![d],
+                Expansion::Wildcard(ds) => ds,
+            };
+            if descs.is_empty()
+                || descs
+                    .iter()
+                    .any(|d| !d.needs.contains(&Service::MessageBus))
+            {
+                return Err(GrantError::NotMessaging { name: n.clone() });
+            }
+            for d in descs {
+                if !out.contains(&d.name) {
+                    out.push(d.name);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether `declared` asks for a tool that needs `service` by name: an
+    /// exact name, an alias or its `ns.*` — never through `*`, which asks
+    /// for whatever the run happens to provide.
+    pub fn names_service(&self, declared: &[String], service: Service) -> bool {
+        declared.iter().any(|n| {
+            if matches!(n.trim(), "*" | "core.*") {
+                return false;
+            }
+            match self.expand(n, AliasScope::Everywhere, "tools:") {
+                Ok(Expansion::Exact(d)) => d.needs.contains(&service),
+                Ok(Expansion::Wildcard(ds)) => ds.iter().any(|d| d.needs.contains(&service)),
+                Err(_) => false,
+            }
+        })
     }
 
     /// Compute what an agent may call (§3 of the W2 card).

@@ -138,9 +138,9 @@ fn lead_toolset(lead_tools: &str) -> Value {
     toolset(&captured)
 }
 
-/// The services `rupu run --fleet-run-dir <dir> --fleet-participant <p>`
-/// launches its unit with (`cmd/run.rs`): its bus and collectors, and a
-/// launcher like every `rupu run`'s.
+/// The services `rupu run --message-space <dir> --participant <p>` launches
+/// its unit with (`cmd/run.rs`): its bus (the assembler attaches its message
+/// collectors), and a launcher like every `rupu run`'s.
 fn unit_launch(
     global: &Path,
     run_dir: &Path,
@@ -150,7 +150,11 @@ fn unit_launch(
     Vec<Arc<dyn rupu_agent::TurnCollector>>,
     String,
 ) {
-    let s = rupu_agentiflow::FlowUnitServices::for_participant(run_dir, participant);
+    let s = rupu_agentiflow::FlowUnitServices::for_participant(
+        run_dir,
+        participant,
+        Default::default(),
+    );
     let launcher = rupu_launch::RunLauncher::new(rupu_launch::LaunchEnv {
         assembler: Arc::new(RunAssembler::new(AssemblyContext::minimal(
             global.to_path_buf(),
@@ -170,7 +174,7 @@ fn unit_launch(
             launcher: Some(launcher),
             ..Default::default()
         },
-        s.collectors,
+        Vec::new(),
         s.flow_id,
     )
 }

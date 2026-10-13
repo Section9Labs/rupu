@@ -226,7 +226,7 @@ engagement profile), plus these always-on fleet tools:
 | | `join { handles?, timeout_secs?, until? }` | Wait for units' results. Default 300 s, at most 3600 s per call |
 | Board | `board.claim`, `board.release` | Claim a piece of work (a one-hour lease) so two participants don't duplicate it |
 | | `board.post`, `board.read` | Shared posts of kind `observation`, `question`, `answer`, `vote` or `note` |
-| | `msg.send` | Message one participant's inbox, or `broadcast` |
+| | `msg.send` | Message a participant, a `role:`, the `lead`, `parent`, or `broadcast` (see [messaging.md](messaging.md)) |
 | Steering | `board.directive` | Write a standing directive every agent unit sees on every turn. Returns an id |
 | | `board.retract { id }` | Lift a directive. Retraction is appended to the log; the board is never rewritten |
 | Status | `goal.status`, `goal.coverage`, `budget.status` | Re-check goals, coverage and spend mid-round with the same evaluators and meter the envelope uses |
@@ -480,6 +480,7 @@ Each run gets a directory `~/.rupu/agentiflows/af_<ULID>/`:
 | `steering/` | Queued operator messages |
 | `board/` | `posts.jsonl`, `directives.jsonl` and `claims/` |
 | `mailboxes/` | Per-participant inboxes and the broadcast log |
+| `log.jsonl`, `participants.jsonl` | The flow's message log and participant registry ([messaging.md](messaging.md)). A flow recorded before they existed has neither |
 | `children.jsonl` | The children ledger: a `started` line per unit (kind, name, run id, codename, participant, process group) and a `finished` line when it ends |
 | `units/<run id>/unit.json` | Runs started before the children ledger existed: one record per unit (kind, process group, last known status). Still read |
 | `generated/` | Workflows written by `workflows.generate` |

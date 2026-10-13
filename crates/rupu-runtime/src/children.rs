@@ -37,6 +37,7 @@ impl TurnCollector for ChildrenCollector {
             cadence: Cadence::EveryTurn,
             priority: 60,
             content: render(&children),
+            messages: Vec::new(),
         }]
     }
 }

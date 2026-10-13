@@ -21,6 +21,7 @@ mod fs_catalog;
 mod gate_node;
 mod gate_sweep_smoke;
 mod linear_runner;
+mod messaging;
 mod multi_gate_path_scoped;
 mod outcome_cause;
 mod pause_agent_run;

@@ -4548,6 +4548,7 @@ dependencies = [
  "rupu-codename",
  "rupu-config",
  "rupu-coverage",
+ "rupu-fleet",
  "rupu-netflow",
  "rupu-providers",
  "rupu-scm",

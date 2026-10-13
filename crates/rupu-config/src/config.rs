@@ -82,6 +82,8 @@ pub struct Config {
     pub recovery: crate::recovery_config::RecoveryConfig,
     #[serde(default)]
     pub dispatch: crate::runtime_config::DispatchConfig,
+    #[serde(default)]
+    pub messaging: crate::runtime_config::MessagingConfig,
 }
 
 /// Terminal-output rendering preferences. Consumed by

@@ -226,8 +226,8 @@ async fn every_dispatch_gets_a_unique_participant_and_the_flow_engagement() {
         assert_eq!(run.engagement_profiles, ["network"]);
         assert_eq!(run.mode, Some(PermissionMode::Bypass));
         assert_eq!(run.prompt.as_deref(), Some("go"));
-        let flow = run.flow.unwrap();
-        assert_eq!(flow.run_dir, f.run_dir);
+        let space = run.message_space.unwrap();
+        assert_eq!(space.dir, f.run_dir);
         assert!(run.codename.unwrap().starts_with(&format!("{LEAD}>")));
     }
 }

@@ -1212,6 +1212,34 @@ fn transcript_event_lines(
                 ),
             )]
         }
+        TranscriptEvent::Message {
+            direction,
+            kind,
+            from,
+            to,
+            body,
+            ..
+        } => {
+            vec![transcript_event_line(
+                Status::Active,
+                0,
+                false,
+                transcript_event_text(Status::Active, "message", &rupu_transcript::messages::message_line(*direction, kind, from, to.as_deref(), body)),
+            )]
+        }
+        TranscriptEvent::Injected {
+            source,
+            cadence,
+            content,
+            ..
+        } => {
+            vec![transcript_event_line(
+                Status::Active,
+                0,
+                false,
+                transcript_event_text(Status::Active, "injected", &rupu_transcript::messages::injected_line(source, cadence, content)),
+            )]
+        }
         TranscriptEvent::SkillLoad { name, content_hash, via, .. } => {
             vec![transcript_event_line(
                 Status::Active,
@@ -1727,6 +1755,40 @@ pub(crate) fn render_pretty_transcript_event(
                 Status::Active,
                 "skills",
                 Some(&rupu_transcript::skills::skill_index_line(skills)),
+            );
+        }
+        TranscriptEvent::Message {
+            direction,
+            kind,
+            from,
+            to,
+            body,
+            ..
+        } => {
+            printer.sideband_event(
+                Status::Active,
+                "message",
+                Some(&rupu_transcript::messages::message_line(
+                    *direction,
+                    kind,
+                    from,
+                    to.as_deref(),
+                    body,
+                )),
+            );
+        }
+        TranscriptEvent::Injected {
+            source,
+            cadence,
+            content,
+            ..
+        } => {
+            printer.sideband_event(
+                Status::Active,
+                "injected",
+                Some(&rupu_transcript::messages::injected_line(
+                    source, cadence, content,
+                )),
             );
         }
         TranscriptEvent::SkillLoad {

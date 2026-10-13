@@ -75,7 +75,7 @@ pub use edit_file::EditFileTool;
 pub use glob::GlobTool;
 pub use grant::{
     AmbientGrant, GrantEntry, GrantError, GrantInputs, GrantReason, ResolvedGrant, ServiceSet,
-    Unavailable, DEFAULT_GRANT,
+    Unavailable, DEFAULT_GRANT, WORKFLOW_MESSAGING,
 };
 pub use grep::GrepTool;
 pub use permission::{

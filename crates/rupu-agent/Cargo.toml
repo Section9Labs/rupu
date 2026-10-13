@@ -35,6 +35,7 @@ rupu-codename = { workspace = true }
 rupu-skills = { workspace = true }
 
 [dev-dependencies]
+rupu-fleet = { workspace = true }
 tempfile.workspace = true
 # Paused-clock tests (`start_paused`) for the provider retry backoff.
 tokio = { workspace = true, features = ["test-util"] }

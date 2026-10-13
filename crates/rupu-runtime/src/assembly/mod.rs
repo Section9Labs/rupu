@@ -38,6 +38,15 @@ use crate::provider_factory::{
 };
 use crate::usage_ledger::UsageLedger;
 
+/// A run's bus on its message space, and how the run takes part.
+struct SpaceBus {
+    bus: Arc<rupu_fleet::Bus>,
+    /// Offered the messaging tools.
+    takes_part: bool,
+    /// Joins as it starts, rather than on its first message or child.
+    joins_at_start: bool,
+}
+
 /// What a [`RunAssembler`] is built from: the config a process (or one root
 /// run) runs under and the resources its runs share.
 pub struct AssemblyContext {
@@ -696,6 +705,8 @@ impl RunAssembler {
             None => PermissionPolicy::new(spec.mode, spec.prompter.clone()),
         };
 
+        let space = self.message_space(&spec);
+        let message_bus = space.as_ref().map(|s| Arc::clone(&s.bus));
         let findings =
             self.ctx
                 .findings
@@ -732,7 +743,11 @@ impl RunAssembler {
                 customer: self.ctx.customer.clone(),
                 // The agent loop sets it from the permission policy.
                 prompter: None,
-                message_bus: spec.services.message_bus.clone(),
+                message_bus: space
+                    .as_ref()
+                    .filter(|s| s.takes_part)
+                    .map(|s| Arc::clone(&s.bus)),
+                message_space: message_bus.clone(),
                 run_status: spec.services.run_status.clone(),
                 catalog: spec
                     .services
@@ -839,6 +854,10 @@ impl RunAssembler {
 
         let system_prompt = system_prompt_for(agent, &spec.overrides, skills.as_deref());
         let parent_run_id = spec.origin.parent_run_id().map(str::to_string);
+        let parent_run_id_for_space = tool_context.identity.parent.as_ref().map(|p| p.run_id.clone());
+        let launched = spec.link.is_some();
+        let spec_origin = spec.origin.clone();
+        let joins_at_start = space.as_ref().is_some_and(|s| s.joins_at_start);
         let LaunchSpec {
             agent,
             transcript_path,
@@ -849,6 +868,40 @@ impl RunAssembler {
             mut collectors,
             ..
         } = spec;
+        // A run in a message space joins it and hears what is said in it
+        // before every model call (spec F1a §3.1, §5).
+        if let Some(bus) = &message_bus {
+            let member = rupu_fleet::Member {
+                codename: tool_context.identity.codename.clone(),
+                agent: agent.name.clone(),
+                run_id: tool_context.identity.run_id.clone(),
+                step_id: tool_context.identity.step_id.clone(),
+                unit: match &spec_origin {
+                    Origin::WorkflowStep { unit: Some(u), .. } => {
+                        Some(u.key.clone().unwrap_or_else(|| u.index.to_string()))
+                    }
+                    _ => None,
+                },
+                kind: crate::services::messaging::member_kind(&spec_origin, launched).into(),
+                parent_run_id: parent_run_id_for_space.clone(),
+            };
+            // A run handed a bus, a workflow step taking part, and a run whose
+            // space is already active join at start; any other run's space
+            // is created lazily, on its first message or child (FD1).
+            if joins_at_start {
+                let joining = Arc::clone(bus);
+                match tokio::task::spawn_blocking(move || joining.join(member)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "could not join the run's message space")
+                    }
+                    Err(e) => tracing::warn!(error = %e, "could not join the run's message space"),
+                }
+            } else {
+                bus.prepare(member);
+            }
+            collectors.extend(crate::services::messaging::collectors(bus));
+        }
         // A run that can launch hears about its unfinished children every
         // turn (W7 §3.6).
         if let Some(launcher) = &tool_context.services.launcher {
@@ -887,6 +940,52 @@ impl RunAssembler {
 }
 
 impl RunAssembler {
+    /// The run's bus on its message space (spec F1a): the one the site
+    /// handed it (an agentiflow's lead and units, a child sharing its
+    /// parent's), else one on its origin's own space. It takes part — is
+    /// offered the messaging tools — when its workflow sets `messaging:`, its
+    /// agent names a messaging tool (not through `*`), or someone already
+    /// joined the space; otherwise the bus is only where its children meet
+    /// it.
+    fn message_space(&self, spec: &LaunchSpec) -> Option<SpaceBus> {
+        if let Some(bus) = &spec.services.message_bus {
+            return Some(SpaceBus {
+                bus: Arc::clone(bus),
+                takes_part: true,
+                joins_at_start: true,
+            });
+        }
+        let space =
+            crate::services::messaging::space_dir(&self.ctx.global, &spec.origin, &spec.run_id)?;
+        let workflow = matches!(
+            spec.origin,
+            Origin::WorkflowStep {
+                messaging: Some(_),
+                ..
+            }
+        );
+        let named = spec.agent.tools.as_deref().is_some_and(|tools| {
+            rupu_tools::ToolCatalog::builtin()
+                .names_service(tools, rupu_tools::Service::MessageBus)
+        });
+        let active = crate::services::messaging::is_active(&space);
+        let step = matches!(spec.origin, Origin::WorkflowStep { .. });
+        let address =
+            crate::services::messaging::address_of(spec.codename.as_deref(), &spec.run_id);
+        let bus = rupu_fleet::Bus::open(&space, address)
+            .with_caps(crate::services::messaging::caps(&self.ctx.config));
+        // A session's agent stays reachable between its turns.
+        let bus = match spec.origin {
+            Origin::SessionTurn { .. } => bus.staying(),
+            _ => bus,
+        };
+        Some(SpaceBus {
+            bus: Arc::new(bus),
+            takes_part: workflow || named || active,
+            joins_at_start: workflow || active || (named && step),
+        })
+    }
+
     /// What the run `spec` may launch and where its children are recorded
     /// (W7 §3.4), and the connector cap its grant is narrowed by. A child's
     /// caps are what its parent may launch — in process the parent's own

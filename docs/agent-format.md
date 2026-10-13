@@ -153,7 +153,9 @@ fail). The CP's agent page shows the same error.
 may not have: the `scm.*` / `issues.*` / `github.*` / `gitlab.*` connector tools
 need configured SCM connectors, `coverage.*` needs a `concerns:` block,
 `assets.mark` an engagement profile, the board and mailbox tools (`board.*`,
-`msg.send`) an agentiflow lead or unit, `goal.*` and `budget.status` an
+`msg.send`) a message space, which every run has when its agent names one of
+them, its workflow sets `messaging:`, or it is in an agentiflow or a parent's
+space (see [messaging.md](messaging.md)), `goal.*` and `budget.status` an
 agentiflow lead, and `workflows.generate` a provider to author with. `dispatch`
 and `join` work in every agent run: `rupu run`, a workflow step, a session
 turn, a sub-agent, an agentiflow lead or unit. The roster tools (`agents.list`,

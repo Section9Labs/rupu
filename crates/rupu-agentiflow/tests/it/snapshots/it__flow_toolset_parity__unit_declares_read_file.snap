@@ -4,6 +4,7 @@ expression: "unit_toolset(\"tools: [read_file]\\n\").await"
 ---
 - description: "Atomically claim a work unit so no other participant duplicates it. Returns granted, or the current holder when it is already claimed."
   input_schema:
+    additionalProperties: false
     properties:
       work_unit:
         description: "Identifier of the unit of work to claim, e.g. host:1.1.2.2"
@@ -12,11 +13,12 @@ expression: "unit_toolset(\"tools: [read_file]\\n\").await"
       - work_unit
     type: object
   name: board.claim
-- description: "Post to the shared board every participant can read: an observation, a question, an answer, a vote, or a note. Optionally address it to a participant id or role."
+- description: "Post to the shared board every participant can read: an observation, a question, an answer, a vote, or a note. Optionally address it to a participant (lynx#1), role:<agent>, step:<id>, parent or lead. Returns the post's `id` and who it was resolved to."
   input_schema:
+    additionalProperties: false
     properties:
       addressed_to:
-        description: Participant id or role this post is for; omit for everyone
+        description: "Who this post is for: a participant (lynx#1), role:<agent>, step:<id>, parent or lead; omit for everyone"
         type: string
       body:
         type: string
@@ -35,6 +37,7 @@ expression: "unit_toolset(\"tools: [read_file]\\n\").await"
   name: board.post
 - description: "Read the shared board's posts, oldest first, newest last. Returns the most recent posts (default 50); filter to those addressed to a participant id or role with addressed_to."
   input_schema:
+    additionalProperties: false
     properties:
       addressed_to:
         description: Only posts addressed to this participant id or role
@@ -48,6 +51,7 @@ expression: "unit_toolset(\"tools: [read_file]\\n\").await"
   name: board.read
 - description: "Release a work unit you previously claimed with board.claim, so another participant can take it."
   input_schema:
+    additionalProperties: false
     properties:
       work_unit:
         description: Identifier of the claimed unit of work to release
@@ -56,13 +60,14 @@ expression: "unit_toolset(\"tools: [read_file]\\n\").await"
       - work_unit
     type: object
   name: board.release
-- description: "Send a message. `to` is a participant id, a role, \"parent\", or \"lead\" (delivered to exactly that inbox), or \"broadcast\" (every participant sees it once, from the moment it started listening; the broadcast log is capped per run, so don't spam it)."
+- description: "Send a message. `to` is a participant (lynx#1) or its full codename, role:<agent> or step:<id> (every live participant running it), \"parent\", \"lead\", \"operator\", or \"broadcast\" (every participant sees it once, from the moment it started listening; the broadcast log is capped, so don't spam it). Recipients see it before their next model call. Returns the message's `id` and who it reached; `undelivered` says who it didn't, and why."
   input_schema:
+    additionalProperties: false
     properties:
       body:
         type: string
       to:
-        description: "Recipient inbox: participant id, role, parent, lead or broadcast"
+        description: "Recipient: a participant, role:<agent>, step:<id>, parent, lead, operator or broadcast"
         type: string
     required:
       - to

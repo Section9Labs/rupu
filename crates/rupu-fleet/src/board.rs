@@ -663,6 +663,7 @@ mod tests {
 
         board
             .post(&BoardPost {
+                id: None,
                 author: "recon".into(),
                 ts: "2026-10-01T00:00:00Z".into(),
                 kind: PostKind::Observation,
@@ -672,6 +673,7 @@ mod tests {
             .unwrap();
         board
             .post(&BoardPost {
+                id: None,
                 author: "lead".into(),
                 ts: "2026-10-01T00:01:00Z".into(),
                 kind: PostKind::Note,

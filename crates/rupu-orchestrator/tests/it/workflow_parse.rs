@@ -1587,3 +1587,31 @@ steps:
     let err = Workflow::parse(yaml).unwrap_err();
     assert!(err.to_string().contains("nope.nope"), "got: {err}");
 }
+
+#[test]
+fn messaging_key_grants_the_message_space_tools() {
+    let wf = |messaging: &str| {
+        Workflow::parse(&format!(
+            "name: w\n{messaging}\nsteps:\n  - id: s\n    agent: a\n    prompt: p\n"
+        ))
+    };
+    assert_eq!(wf("").unwrap().messaging_tools(), None);
+    assert_eq!(wf("messaging: false").unwrap().messaging_tools(), None);
+    assert_eq!(
+        wf("messaging: true").unwrap().messaging_tools(),
+        Some(rupu_tools::WORKFLOW_MESSAGING.to_vec())
+    );
+    assert_eq!(
+        wf("messaging: { tools: [board.read, msg.*] }")
+            .unwrap()
+            .messaging_tools(),
+        Some(vec!["board.read", "msg.send"])
+    );
+    for bad in ["read_file", "*", "board.pots"] {
+        let err = wf(&format!("messaging: {{ tools: [{bad:?}] }}")).unwrap_err();
+        assert!(
+            err.to_string().starts_with("workflow `messaging:`"),
+            "{bad}: {err}"
+        );
+    }
+}

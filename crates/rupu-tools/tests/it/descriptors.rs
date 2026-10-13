@@ -198,7 +198,7 @@ fn full_context() -> ToolContext {
         )),
         ..Default::default()
     });
-    s.message_bus = Some(Arc::new(rupu_fleet::Bus::for_run_dir(
+    s.message_bus = Some(Arc::new(rupu_fleet::Bus::open(
         std::path::Path::new("/nonexistent/af"),
         "lead",
     )));

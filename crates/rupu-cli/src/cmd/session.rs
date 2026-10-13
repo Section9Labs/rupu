@@ -2924,6 +2924,38 @@ impl SessionInteractiveState {
                     ),
                 );
             }
+            TranscriptEvent::Message {
+                direction,
+                kind,
+                from,
+                to,
+                body,
+                ..
+            } => {
+                self.push_line(
+                    crate::output::palette::Status::Active,
+                    retained_session_event_line_raw(
+                        crate::output::palette::Status::Active,
+                        "message",
+                        &rupu_transcript::messages::message_line(*direction, kind, from, to.as_deref(), body),
+                    ),
+                );
+            }
+            TranscriptEvent::Injected {
+                source,
+                cadence,
+                content,
+                ..
+            } => {
+                self.push_line(
+                    crate::output::palette::Status::Active,
+                    retained_session_event_line_raw(
+                        crate::output::palette::Status::Active,
+                        "injected",
+                        &rupu_transcript::messages::injected_line(source, cadence, content),
+                    ),
+                );
+            }
             TranscriptEvent::SkillLoad {
                 name,
                 content_hash,
@@ -5661,6 +5693,28 @@ fn transcript_event_lines(
                 "skills",
                 &rupu_transcript::skills::skill_index_line(skills),
             ),
+            continuation: false,
+        }],
+        TranscriptEvent::Message {
+            direction,
+            kind,
+            from,
+            to,
+            body,
+            ..
+        } => vec![SessionViewLine {
+            status: Status::Active,
+            text: retained_session_event_line_raw(Status::Active, "message", &rupu_transcript::messages::message_line(*direction, kind, from, to.as_deref(), body)),
+            continuation: false,
+        }],
+        TranscriptEvent::Injected {
+            source,
+            cadence,
+            content,
+            ..
+        } => vec![SessionViewLine {
+            status: Status::Active,
+            text: retained_session_event_line_raw(Status::Active, "injected", &rupu_transcript::messages::injected_line(source, cadence, content)),
             continuation: false,
         }],
         TranscriptEvent::SkillLoad {
