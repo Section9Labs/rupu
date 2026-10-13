@@ -627,9 +627,11 @@ fn reattach_block_keeps_the_most_recent_within_the_cap() {
     assert_eq!(r.changed, vec!["newer".to_string()]);
     assert_eq!(
         r.reattached,
-        vec![LoadedSkill {
+        vec![rupu_agent::Reattached {
             name: "newer".into(),
-            content_hash: newer_hash.clone()
+            layer: rupu_skills::Layer::Global,
+            content_hash: newer_hash.clone(),
+            base_dir: skills.get("newer").unwrap().skill.root.clone(),
         }]
     );
     assert_eq!(
@@ -768,4 +770,176 @@ async fn missing_frozen_skills_are_reported_at_run_start() {
             assert!(with_skills && index_at < first_missing);
         }
     }
+}
+
+/// Two missing and two omitted skills are each listed most recently loaded
+/// first.
+#[test]
+fn reattach_block_lists_missing_and_omitted_most_recent_first() {
+    let global = tempfile::tempdir().unwrap();
+    let gone_a = install(global.path(), "gone-a", "GONE A");
+    install(global.path(), "big-a", &"A".repeat(700));
+    let gone_b = install(global.path(), "gone-b", "GONE B");
+    install(global.path(), "big-b", &"B".repeat(700));
+    install(global.path(), "kept", &"K".repeat(700));
+    let skills = resolved(
+        global.path(),
+        &["gone-a", "big-a", "gone-b", "big-b", "kept"],
+    );
+    std::fs::remove_dir_all(&gone_a).unwrap();
+    std::fs::remove_dir_all(&gone_b).unwrap();
+    let loaded: Vec<LoadedSkill> = ["gone-a", "big-a", "gone-b", "big-b", "kept"]
+        .iter()
+        .map(|n| LoadedSkill {
+            name: n.to_string(),
+            content_hash: "4".repeat(64),
+        })
+        .collect();
+    let r = rupu_agent::reattach_block(&loaded, &skills, 1000).expect("a block");
+    assert_eq!(r.missing, vec!["gone-b".to_string(), "gone-a".to_string()]);
+    assert_eq!(r.omitted, vec!["big-b".to_string(), "big-a".to_string()]);
+    let names: Vec<&str> = r.reattached.iter().map(|x| x.name.as_str()).collect();
+    assert_eq!(names, vec!["kept"]);
+}
+
+/// An operator load the run's set doesn't grant is recorded (its body is in
+/// the message) and reported, but never joins the loaded set: nothing can
+/// re-attach it.
+#[tokio::test]
+async fn an_operator_load_outside_the_runs_set_is_reported_not_loaded() {
+    let global = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    let pdf = install(global.path(), "pdf", "PDF STEPS");
+    install(global.path(), "notes", "NOTE STEPS");
+    let transcript = ws.path().join("run.jsonl");
+    let provider = MockProvider::new(vec![read_turn("c1", 900), summary_turn(), done_turn()]);
+    let mut o = opts(
+        provider,
+        ws.path(),
+        transcript.clone(),
+        resolved(global.path(), &["notes"]),
+    );
+    o.prompt.operator_loads = vec![operator_load(&pdf)];
+    run_agent(o).await.unwrap();
+    let evs = events(&transcript);
+    assert_eq!(timeline(&evs), vec!["operator:pdf", "compaction"]);
+    assert_eq!(
+        notices(&evs, "skill_missing"),
+        vec![
+            "skill pdf was invoked by the operator but is not granted to this run; it is not \
+             re-attached"
+                .to_string()
+        ]
+    );
+    assert!(!compacted_first_messages(&evs)[0].contains(rupu_skills::render::REATTACH_MARKER));
+}
+
+/// An operator load from another root than the run's entry of that name is
+/// recorded as injected, with a notice; the run keeps its own entry, which
+/// is what compaction re-attaches.
+#[tokio::test]
+async fn an_operator_load_from_another_root_keeps_the_runs_entry() {
+    let global = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    install(global.path(), "pdf", "PDF STEPS");
+    let other = install(elsewhere.path(), "pdf", "OTHER PDF STEPS");
+    let skills = resolved(global.path(), &["pdf"]);
+    let root = skills.get("pdf").unwrap().skill.root.clone();
+    let mut load = operator_load(&other);
+    load.layer = "project".into();
+    let transcript = ws.path().join("run.jsonl");
+    let provider = MockProvider::new(vec![read_turn("c1", 900), summary_turn(), done_turn()]);
+    let mut o = opts(provider, ws.path(), transcript.clone(), skills);
+    o.prompt.operator_loads = vec![load.clone()];
+    run_agent(o).await.unwrap();
+    let evs = events(&transcript);
+    assert_eq!(
+        timeline(&evs),
+        vec!["operator:pdf", "compaction", "reattach:pdf"]
+    );
+    let bases: Vec<(String, String)> = evs
+        .iter()
+        .filter_map(|e| match e {
+            Event::SkillLoad {
+                via,
+                base_dir,
+                layer,
+                ..
+            } => Some((format!("{via}:{layer}"), base_dir.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        bases,
+        vec![
+            ("operator:project".to_string(), load.base_dir.clone()),
+            ("reattach:global".to_string(), root.display().to_string()),
+        ]
+    );
+    assert_eq!(
+        notices(&evs, "skill_changed"),
+        vec![
+            format!(
+                "skill pdf was invoked from {} (project) but this run grants it from {} \
+                 (global); compaction re-attaches the granted one",
+                load.base_dir,
+                root.display()
+            ),
+            "skill pdf changed on disk since it was loaded; its current version was re-attached"
+                .to_string(),
+        ]
+    );
+    let first = &compacted_first_messages(&evs)[0];
+    assert!(first.contains("\nPDF STEPS"), "{first}");
+    assert!(!first.contains("OTHER PDF STEPS"), "{first}");
+}
+
+/// A carried loaded set that names a skill twice seeds it once, at the
+/// later entry.
+#[tokio::test]
+async fn a_carried_set_naming_a_skill_twice_seeds_it_once() {
+    let global = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    install(global.path(), "pdf", "PDF STEPS");
+    let transcript = ws.path().join("run.jsonl");
+    let provider = MockProvider::new(vec![read_turn("c1", 900), summary_turn(), done_turn()]);
+    let mut o = opts(
+        provider,
+        ws.path(),
+        transcript.clone(),
+        resolved(global.path(), &["pdf"]),
+    );
+    o.prompt.loaded_skills = vec![
+        LoadedSkill {
+            name: "pdf".into(),
+            content_hash: "0".repeat(64),
+        },
+        LoadedSkill {
+            name: "pdf".into(),
+            content_hash: "1".repeat(64),
+        },
+    ];
+    run_agent(o).await.unwrap();
+    let evs = events(&transcript);
+    assert_eq!(
+        timeline(&evs),
+        vec!["continuation:pdf", "compaction", "reattach:pdf"]
+    );
+    let seeded: Vec<&String> = evs
+        .iter()
+        .filter_map(|e| match e {
+            Event::SkillLoad {
+                via, content_hash, ..
+            } if via == "continuation" => Some(content_hash),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(seeded, vec![&"1".repeat(64)]);
+    assert_eq!(
+        compacted_first_messages(&evs)[0]
+            .matches("PDF STEPS")
+            .count(),
+        1
+    );
 }

@@ -645,9 +645,8 @@ async fn reattach_skills(messages: &mut [Message], run: &mut Run) -> Vec<Event> 
     }
     let cap = run.limits.input.tokens.map_or(32 * 1024, |t| t as usize);
     let loaded = run.loaded_skills.clone();
-    let reread = Arc::clone(&skills);
     let Some(reattach) =
-        tokio::task::spawn_blocking(move || crate::reattach_block(&loaded, &reread, cap))
+        tokio::task::spawn_blocking(move || crate::reattach_block(&loaded, &skills, cap))
             .await
             .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))
     else {
@@ -669,14 +668,11 @@ async fn reattach_skills(messages: &mut [Message], run: &mut Run) -> Vec<Event> 
                 ),
             });
         }
-        // Re-attached only from where the set found it, so the grant's
-        // layer and root are the skill's.
-        let g = skills.get(name).expect("a re-attached skill is in the set");
         events.push(Event::SkillLoad {
             name: name.clone(),
-            layer: g.skill.layer.as_str().to_owned(),
+            layer: r.layer.as_str().to_owned(),
             content_hash: r.content_hash.clone(),
-            base_dir: g.skill.root.display().to_string(),
+            base_dir: r.base_dir.display().to_string(),
             via: "reattach".into(),
         });
     }
@@ -2212,6 +2208,7 @@ async fn run_agent_inner(
     )?;
     record_operator_loads(
         &mut writer,
+        opts.tool_context.services.skills.as_deref(),
         &opts.prompt.operator_loads,
         &mut opts.loaded_skills,
     )?;
@@ -3711,13 +3708,19 @@ fn write_skill_index(
 /// (`via: continuation`, at the version the conversation holds), so every
 /// transcript carries its own set; one it no longer grants is dropped with
 /// a notice. A skill this run preloads is dropped quietly: its body is in
-/// the system prompt.
+/// the system prompt. A name the carried set holds twice is seeded once, at
+/// its later entry.
 fn seed_loaded_skills(
     writer: &mut JsonlWriter,
     skills: Option<&rupu_skills::ResolvedSkills>,
     loaded: &mut Vec<LoadedSkill>,
 ) -> Result<(), RunError> {
-    for seeded in std::mem::take(loaded) {
+    let carried = std::mem::take(loaded);
+    for (at, seeded) in carried.iter().enumerate() {
+        if carried[at + 1..].iter().any(|l| l.name == seeded.name) {
+            continue;
+        }
+        let seeded = seeded.clone();
         match skills.and_then(|s| s.get(&seeded.name)) {
             Some(g) if g.preload => {}
             Some(g) => {
@@ -3744,9 +3747,14 @@ fn seed_loaded_skills(
 }
 
 /// A `skill_load { via: operator }` per skill the operator injected into
-/// this turn, each moved to the end of `loaded` at the injected version.
+/// this turn (its body is in the message whatever the run grants), each
+/// moved to the end of `loaded` at the injected version. Only the run's
+/// set can re-attach a skill, so one it doesn't grant stays out of
+/// `loaded` with a notice, and one injected from another root than the
+/// set's is noted: compaction re-attaches the set's.
 fn record_operator_loads(
     writer: &mut JsonlWriter,
+    skills: Option<&rupu_skills::ResolvedSkills>,
     loads: &[OperatorLoad],
     loaded: &mut Vec<LoadedSkill>,
 ) -> Result<(), RunError> {
@@ -3758,6 +3766,28 @@ fn record_operator_loads(
             base_dir: l.base_dir.clone(),
             via: "operator".into(),
         })?;
+        let Some(g) = skills.and_then(|s| s.get(&l.name)) else {
+            writer.write(&Event::Notice {
+                kind: "skill_missing".into(),
+                message: format!(
+                    "skill {} was invoked by the operator but is not granted to this run; it is \
+                     not re-attached",
+                    l.name
+                ),
+            })?;
+            continue;
+        };
+        let (layer, root) = (g.skill.layer.as_str(), g.skill.root.display().to_string());
+        if l.layer != layer || l.base_dir != root {
+            writer.write(&Event::Notice {
+                kind: "skill_changed".into(),
+                message: format!(
+                    "skill {} was invoked from {} ({}) but this run grants it from {root} \
+                     ({layer}); compaction re-attaches the granted one",
+                    l.name, l.base_dir, l.layer
+                ),
+            })?;
+        }
         loaded.retain(|e| e.name != l.name);
         loaded.push(LoadedSkill {
             name: l.name.clone(),

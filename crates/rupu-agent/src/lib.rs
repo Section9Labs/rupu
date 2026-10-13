@@ -58,6 +58,6 @@ pub use runner::{
     UserTurn,
 };
 pub use rupu_providers::types::StopReason;
-pub use skills_reattach::{reattach_block, Reattach};
+pub use skills_reattach::{reattach_block, Reattach, Reattached};
 pub use spec::{AgentSpec, AgentSpecParseError};
 pub use tool_registry::ToolRegistry;

@@ -261,6 +261,7 @@ impl ContinuationTarget for crate::runner::UserTurn {
         note: String,
     ) {
         self.message = note;
+        self.operator_loads.clear();
         self.initial_messages = messages;
         self.seed_source = Some(seed_source);
         self.loaded_skills = loaded_skills;
@@ -1096,6 +1097,30 @@ mod tests {
         // A recovery continuation is a continuation: its coverage manifest
         // points `rupu coverage rerun` at the run with the real prompt.
         assert_eq!(continued_from(&opts.prompt), Some(Path::new("/t/a.jsonl")));
+    }
+
+    /// A continuation replaces the turn's message, and with it the bodies of
+    /// any skills the operator injected there: their loads go too.
+    #[test]
+    fn a_continuation_drops_the_operator_loads_of_the_message_it_replaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![]);
+        let mut opts = opts_for(Box::new(provider), tmp.path(), tmp.path().join("t.jsonl"));
+        opts.prompt.message = "<skill name=\"pdf\">…</skill>\n\nsummarise".into();
+        opts.prompt.operator_loads = vec![crate::OperatorLoad {
+            name: "pdf".into(),
+            layer: "global".into(),
+            content_hash: "0".repeat(64),
+            base_dir: "/skills/pdf".into(),
+        }];
+        apply_continuation(
+            &mut opts.prompt,
+            vec![Message::user("first")],
+            PathBuf::from("/t/c.jsonl"),
+            Vec::new(),
+        );
+        assert_eq!(opts.prompt.message, CONTINUATION_NOTE);
+        assert_eq!(opts.prompt.operator_loads, Vec::new());
     }
 
     /// A seeded run with an ordinary prompt (a session's next turn) is not a

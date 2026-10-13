@@ -5,7 +5,8 @@
 
 use crate::runner::LoadedSkill;
 use rupu_skills::render::{render_reattach, ReattachItem};
-use rupu_skills::ResolvedSkills;
+use rupu_skills::{Layer, ResolvedSkills};
+use std::path::PathBuf;
 
 /// What a re-attach puts back and what it leaves out.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,7 +16,7 @@ pub struct Reattach {
     pub block: String,
     /// The skills whose bodies are in `block`, in load order, at their
     /// current version.
-    pub reattached: Vec<LoadedSkill>,
+    pub reattached: Vec<Reattached>,
     /// Of `reattached`, the names whose version differs from the one loaded.
     pub changed: Vec<String>,
     /// Loaded skills no longer installed where they were found, most
@@ -28,6 +29,16 @@ pub struct Reattach {
     /// missing or omitted skill stays, so a reinstall or a later re-attach
     /// brings it back.
     pub loaded: Vec<LoadedSkill>,
+}
+
+/// A skill [`Reattach::block`] put back: what its `skill_load
+/// { via: reattach }` records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reattached {
+    pub name: String,
+    pub layer: Layer,
+    pub content_hash: String,
+    pub base_dir: PathBuf,
 }
 
 /// Re-reads each loaded skill at its current version and renders the
@@ -92,9 +103,11 @@ pub fn reattach_block(
         if loaded[at].content_hash != hash {
             changed.push(name.clone());
         }
-        reattached.push(LoadedSkill {
+        reattached.push(Reattached {
             name,
+            layer: skill.layer,
             content_hash: hash,
+            base_dir: skill.root,
         });
     }
     let mut after: Vec<LoadedSkill> = loaded
@@ -102,7 +115,10 @@ pub fn reattach_block(
         .filter(|l| !reattached.iter().any(|r| r.name == l.name))
         .cloned()
         .collect();
-    after.extend(reattached.iter().cloned());
+    after.extend(reattached.iter().map(|r| LoadedSkill {
+        name: r.name.clone(),
+        content_hash: r.content_hash.clone(),
+    }));
     Some(Reattach {
         block,
         reattached,
