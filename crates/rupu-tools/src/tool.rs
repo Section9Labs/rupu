@@ -233,6 +233,8 @@ pub struct ToolServices {
     /// site provides one.
     pub catalog: Option<Arc<dyn crate::ports::CatalogPort>>,
     /// The skills this run was granted (spec §2.4); `skills.load` reads it.
+    /// `Service::Skills` is provided only when the model may load one of
+    /// them.
     pub skills: Option<Arc<rupu_skills::ResolvedSkills>>,
 }
 
@@ -274,7 +276,7 @@ impl ToolServices {
         if self.catalog.is_some() {
             s.insert(Service::Catalog);
         }
-        if self.skills.is_some() {
+        if self.skills.as_ref().is_some_and(|s| s.has_loadable()) {
             s.insert(Service::Skills);
         }
         // The agentiflow unit launcher and workflow generator have no body

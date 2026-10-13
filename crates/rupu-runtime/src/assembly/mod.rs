@@ -112,9 +112,45 @@ pub enum AssembleError {
     Grant(#[from] GrantError),
     /// The run's skills (the agent's and the launch's) don't resolve, or
     /// the skills directories can't be read. Typed, so an fd-exhaustion
-    /// behind it stays classifiable.
-    #[error("skills: {0}")]
-    Skills(#[source] rupu_agent::SkillCheckError),
+    /// behind it stays classifiable. `looked_in` is the layers searched, so
+    /// an unknown skill's message names where to install it.
+    #[error("skills: {source}{}", install_hint(source, looked_in))]
+    Skills {
+        source: rupu_agent::SkillCheckError,
+        looked_in: rupu_skills::LayerDirs,
+    },
+}
+
+/// For a skill that is not installed: where the run looked, and the fix.
+fn install_hint(source: &rupu_agent::SkillCheckError, dirs: &rupu_skills::LayerDirs) -> String {
+    let rupu_agent::SkillCheckError::Resolve(rupu_skills::RunSkillsError::Resolve(errors)) = source
+    else {
+        return String::new();
+    };
+    if !errors
+        .iter()
+        .any(|e| matches!(e, rupu_skills::ResolveError::Unknown { .. }))
+    {
+        return String::new();
+    }
+    let looked: Vec<String> = [&dirs.global, &dirs.project]
+        .into_iter()
+        .flatten()
+        .map(|d| d.display().to_string())
+        .collect();
+    format!(
+        " (looked in {}; install it with `rupu skill install`)",
+        looked.join(" and ")
+    )
+}
+
+impl rupu_agent::fd_budget::FdExhaustion for AssembleError {
+    fn is_fd_exhaustion(&self) -> bool {
+        match self {
+            AssembleError::Skills { source, .. } => source.is_fd_exhaustion(),
+            _ => false,
+        }
+    }
 }
 
 impl AssembleError {
@@ -124,7 +160,7 @@ impl AssembleError {
     pub fn into_run_error(self) -> rupu_agent::RunError {
         match self {
             AssembleError::Grant(e) => rupu_agent::RunError::ToolGrant(e.to_string()),
-            AssembleError::Skills(_) => rupu_agent::RunError::Preflight(self.to_string()),
+            AssembleError::Skills { .. } => rupu_agent::RunError::Preflight(self.to_string()),
             other => rupu_agent::RunError::Provider(other.to_string()),
         }
     }
@@ -148,7 +184,7 @@ impl AssembleError {
             AssembleError::AgentLoad { .. } => ProviderError::Preflight(format!(
                 "{self}\n  Checked the project agents dir (.rupu/agents/) and the global agents dir."
             )),
-            AssembleError::UnknownProvider(_) | AssembleError::Skills(_) => {
+            AssembleError::UnknownProvider(_) | AssembleError::Skills { .. } => {
                 ProviderError::Preflight(self.to_string())
             }
             AssembleError::ProviderBuild {
@@ -498,13 +534,15 @@ impl RunAssembler {
     /// The run's skills (spec §2.4): the agent's keys and the launch's own,
     /// resolved in one pass against the global and project layers. `None`
     /// when the run has none. Fails closed: a run never starts without a
-    /// skill it was given.
-    fn resolve_skills(
+    /// skill it was given. Discovery reads directories and a preload hashes
+    /// files, so it runs on the blocking pool, and an fd exhaustion in a
+    /// wide fan-out is retried the way the agent's load is.
+    async fn resolve_skills(
         &self,
         spec: &LaunchSpec,
     ) -> Result<Option<Arc<rupu_skills::ResolvedSkills>>, AssembleError> {
-        let agent_grants = spec.agent.skills.as_deref().unwrap_or_default();
-        let agent_preload = spec.agent.preload_skills.as_deref().unwrap_or_default();
+        let agent_grants = spec.agent.skills.clone().unwrap_or_default();
+        let agent_preload = spec.agent.preload_skills.clone().unwrap_or_default();
         let o = &spec.overrides;
         if agent_grants.is_empty()
             && agent_preload.is_empty()
@@ -513,23 +551,33 @@ impl RunAssembler {
         {
             return Ok(None);
         }
+        let requests = Arc::new([
+            (rupu_skills::SkillReason::Agent, agent_grants, agent_preload),
+            (
+                rupu_skills::SkillReason::Step,
+                o.skills.clone(),
+                o.preload_skills.clone(),
+            ),
+        ]);
+        let global = self.ctx.global.clone();
         let project = self.ctx.project_root.as_ref().map(|p| p.join(".rupu"));
-        let dirs = rupu_skills::LayerDirs::for_layers(&self.ctx.global, project.as_deref());
-        let catalog = rupu_skills::SkillCatalog::discover(&dirs)
-            .map_err(|e| AssembleError::Skills(e.into()))?;
-        let request = |reason, grants, preload| rupu_skills::SkillRequest {
-            reason,
-            grants,
-            preload,
-        };
-        let resolved = rupu_skills::resolve_run_skills(
-            &catalog,
-            &[
-                request(rupu_skills::SkillReason::Agent, agent_grants, agent_preload),
-                request(rupu_skills::SkillReason::Step, &o.skills, &o.preload_skills),
-            ],
+        let resolved = rupu_agent::fd_budget::retry_on_fd_exhaustion(
+            &spec.agent.name,
+            &rupu_agent::fd_budget::Policy::default(),
+            rupu_agent::fd_budget::grow,
+            || {
+                let (global, project, requests) =
+                    (global.clone(), project.clone(), Arc::clone(&requests));
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        resolve_run_skills(&global, project.as_deref(), &requests[..])
+                    })
+                    .await
+                    .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))
+                }
+            },
         )
-        .map_err(|e| AssembleError::Skills(e.into()))?;
+        .await?;
         Ok((!resolved.is_empty()).then(|| Arc::new(resolved)))
     }
 
@@ -541,7 +589,7 @@ impl RunAssembler {
         // Before anything that needs cleaning up. As when its grant fails,
         // the run's (empty) transcript exists, so whatever opens it finds
         // the run that failed.
-        let skills = match self.resolve_skills(&spec) {
+        let skills = match self.resolve_skills(&spec).await {
             Ok(s) => s,
             Err(e) => {
                 if let Err(w) = rupu_transcript::JsonlWriter::create(&spec.transcript_path) {
@@ -819,6 +867,29 @@ pub fn system_prompt_for(
         prompt.push_str(&section);
     }
     prompt
+}
+
+/// Discover the layers and resolve `requests` against them (blocking IO).
+fn resolve_run_skills(
+    global: &std::path::Path,
+    project: Option<&std::path::Path>,
+    requests: &[(rupu_skills::SkillReason, Vec<String>, Vec<String>)],
+) -> Result<rupu_skills::ResolvedSkills, AssembleError> {
+    let dirs = rupu_skills::LayerDirs::for_layers(global, project);
+    let failed = |source: rupu_agent::SkillCheckError| AssembleError::Skills {
+        source,
+        looked_in: dirs.clone(),
+    };
+    let catalog = rupu_skills::SkillCatalog::discover(&dirs).map_err(|e| failed(e.into()))?;
+    let requests: Vec<rupu_skills::SkillRequest<'_>> = requests
+        .iter()
+        .map(|(reason, grants, preload)| rupu_skills::SkillRequest {
+            reason: *reason,
+            grants,
+            preload,
+        })
+        .collect();
+    rupu_skills::resolve_run_skills(&catalog, &requests).map_err(|e| failed(e.into()))
 }
 
 /// The agent's own `permissionMode`. An unreadable one can't lower a

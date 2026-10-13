@@ -279,3 +279,52 @@ fn model_loadable_is_indexed_preloaded_or_operator() {
     );
     assert_eq!(r.loadable_names(), vec!["hidden-op", "hidden-pre", "open"]);
 }
+
+/// A preloaded skill's body goes into the system prompt at resolve time, so
+/// its content hash is taken then too; an indexed skill is hashed when the
+/// model loads it.
+#[test]
+fn a_preloaded_skill_carries_its_content_hash() {
+    let g = tempfile::tempdir().unwrap();
+    let pre = write_skill(&g.path().join("skills"), "pre", "pre", "P.");
+    write_skill(&g.path().join("skills"), "idx", "idx", "I.");
+    let (grants, preload) = (s(&["idx"]), s(&["pre"]));
+    let r = resolve_run_skills(
+        &catalog(g.path(), None),
+        &[request(SkillReason::Agent, &grants, &preload)],
+    )
+    .unwrap();
+    let want = rupu_skills::load_skill(&pre, rupu_skills::Layer::Global)
+        .unwrap()
+        .content_hash()
+        .unwrap();
+    assert_eq!(r.get("pre").unwrap().content_hash, Some(want));
+    assert_eq!(r.get("idx").unwrap().content_hash, None);
+}
+
+/// A preloaded skill whose files can't be read fails the run's skills: its
+/// body would enter the prompt with no version to record.
+#[test]
+fn a_preloaded_skill_that_cannot_be_hashed_fails_resolution() {
+    let g = tempfile::tempdir().unwrap();
+    let pre = write_skill(&g.path().join("skills"), "pre", "pre", "P.");
+    let cat = catalog(g.path(), None);
+    cat.get(rupu_skills::Layer::Global, "pre")
+        .unwrap()
+        .skill()
+        .unwrap();
+    fs::remove_file(pre.join("scripts/run.sh")).unwrap();
+    let preload = s(&["pre"]);
+    let err = resolve_run_skills(&cat, &[request(SkillReason::Agent, &[], &preload)]).unwrap_err();
+    assert!(
+        matches!(&err, rupu_skills::RunSkillsError::Hash { name, .. } if name == "pre"),
+        "{err:?}"
+    );
+    assert!(
+        err.to_string()
+            .starts_with("skill \"pre\" (global) can't be read: "),
+        "{err}"
+    );
+    let kinds: Vec<_> = err.io_errors().map(|e| e.kind()).collect();
+    assert_eq!(kinds, vec![std::io::ErrorKind::NotFound]);
+}

@@ -108,6 +108,15 @@ fn agent_naming_a_missing_skill(provider: &str) -> rupu_agent::AgentSpec {
     .unwrap()
 }
 
+/// The assembler's message for an agent naming the uninstalled `missing`,
+/// in a run with no project layer.
+fn unknown_missing(home: &Home) -> String {
+    format!(
+        "skills: unknown skill \"missing\" (looked in {}; install it with `rupu skill install`)",
+        home.global().join("skills").display()
+    )
+}
+
 #[tokio::test]
 #[serial]
 async fn agent_skills_reach_the_prompt_and_the_grant() {
@@ -230,9 +239,7 @@ async fn an_unknown_skill_fails_assembly() {
         "run_bad",
     );
     match assembler.assemble(l).await {
-        Err(e @ AssembleError::Skills(_)) => {
-            assert_eq!(e.to_string(), "skills: unknown skill \"missing\"")
-        }
+        Err(e @ AssembleError::Skills { .. }) => assert_eq!(e.to_string(), unknown_missing(&home)),
         Err(other) => panic!("{other}"),
         Ok(_) => panic!("assembled a run with an unknown skill"),
     }
@@ -252,7 +259,7 @@ async fn skills_fail_before_the_provider_is_built() {
         "run_first",
     );
     match assembler.assemble(l).await {
-        Err(AssembleError::Skills(_)) => {}
+        Err(AssembleError::Skills { .. }) => {}
         Err(other) => panic!("{other}"),
         Ok(_) => panic!("assembled a run with an unknown skill"),
     }
@@ -278,9 +285,7 @@ async fn failed_skills_leave_the_transcript_and_are_a_run_error() {
     };
     assert!(transcript.exists(), "the failed run's transcript exists");
     match err.into_run_error() {
-        rupu_agent::RunError::Preflight(m) => {
-            assert_eq!(m, "skills: unknown skill \"missing\"")
-        }
+        rupu_agent::RunError::Preflight(m) => assert_eq!(m, unknown_missing(&home)),
         other => panic!("{other}"),
     }
 }
@@ -317,7 +322,7 @@ async fn failed_skills_record_the_unstarted_run() {
         prompt: &prompt,
     });
     assert!(
-        matches!(&run_err, rupu_agent::RunError::Preflight(m) if m == "skills: unknown skill \"missing\""),
+        matches!(&run_err, rupu_agent::RunError::Preflight(m) if *m == unknown_missing(&home)),
         "{run_err}"
     );
     let closed = events(&transcript)
@@ -327,7 +332,7 @@ async fn failed_skills_record_the_unstarted_run() {
             _ => None,
         })
         .expect("a run_complete with an error");
-    assert_eq!(closed, "skills: unknown skill \"missing\"");
+    assert_eq!(closed, unknown_missing(&home));
 }
 
 #[tokio::test]
@@ -576,4 +581,410 @@ async fn a_skill_edited_since_the_run_started_loads_its_new_version() {
                 .to_string()
         ]
     );
+}
+
+/// The skill_load of the transcript's preloaded skills.
+fn preload_hashes(evs: &[Event]) -> Vec<(String, String)> {
+    skill_loads(evs)
+        .into_iter()
+        .filter(|l| l.4 == "preload")
+        .map(|l| (l.0, l.2))
+        .collect()
+}
+
+/// A preloaded skill edited between assembly and the run: the recorded
+/// version is the one whose body the system prompt carries (taken when the
+/// run resolved its skills), never the edited one.
+#[tokio::test]
+#[serial]
+async fn a_preload_records_the_version_its_prompt_body_has() {
+    let home = Home::new();
+    let dir = home.skill("report-style", "House style.", "Old style.");
+    let assembler = home.assembler(config());
+    let spec = agent(
+        &home,
+        "provider: anthropic\nmodel: claude-sonnet-4-6\npreloadSkills: [report-style]",
+    );
+    let l = launch(&home, spec, Origin::Standalone, "run_pre_edit");
+    let path = l.transcript_path.clone();
+    let _m = MockScript::set(DONE);
+    let run = assembler.assemble(l).await.unwrap();
+    let before = installed(&home, "report-style").content_hash().unwrap();
+    rewrite(&dir, "report-style", "", "New style.");
+    run.run().await.result.unwrap();
+    let evs = events(&path);
+    let prompt = run_start_prompt(&evs);
+    assert!(prompt.contains("Old style."), "{prompt}");
+    assert!(!prompt.contains("New style."), "{prompt}");
+    assert_eq!(
+        preload_hashes(&evs),
+        vec![("report-style".to_string(), before.hex())]
+    );
+}
+
+/// An unknown skill in a run with a project layer names both directories.
+#[tokio::test]
+#[serial]
+async fn an_unknown_skill_names_both_layers_it_looked_in() {
+    let home = Home::new();
+    let project = home.root().join("proj");
+    std::fs::create_dir_all(project.join(".rupu")).unwrap();
+    let mut ctx = home.context(config());
+    ctx.project_root = Some(project.clone());
+    let assembler = rupu_runtime::assembly::RunAssembler::new(ctx);
+    let l = launch(
+        &home,
+        agent_naming_a_missing_skill("anthropic"),
+        Origin::Standalone,
+        "run_both",
+    );
+    let err = match assembler.assemble(l).await {
+        Err(e) => e,
+        Ok(_) => panic!("assembled a run with an unknown skill"),
+    };
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "skills: unknown skill \"missing\" (looked in {} and {}; install it with `rupu skill install`)",
+            home.global().join("skills").display(),
+            project.join(".rupu/skills").display()
+        )
+    );
+}
+
+/// Only an unknown skill gets the install hint.
+#[tokio::test]
+#[serial]
+async fn an_ambiguous_skill_gets_no_install_hint() {
+    let home = Home::new();
+    home.skill("x", "Global x.", "g");
+    let project = home.root().join("proj");
+    let local = project.join(".rupu/skills/x");
+    std::fs::create_dir_all(&local).unwrap();
+    std::fs::write(
+        local.join("SKILL.md"),
+        "---\nname: x\ndescription: p\n---\np\n",
+    )
+    .unwrap();
+    let mut ctx = home.context(config());
+    ctx.project_root = Some(project);
+    let assembler = rupu_runtime::assembly::RunAssembler::new(ctx);
+    let spec = rupu_agent::AgentSpec::parse(
+        "---\nname: probe\nprovider: anthropic\nmodel: claude-sonnet-4-6\nskills: [x]\n---\nx\n",
+    )
+    .unwrap();
+    let err = match assembler
+        .assemble(launch(&home, spec, Origin::Standalone, "run_amb"))
+        .await
+    {
+        Err(e) => e,
+        Ok(_) => panic!("assembled an ambiguous grant"),
+    };
+    assert_eq!(
+        err.to_string(),
+        "skills: skill \"x\" is installed in both the global and the project layer; \
+         grant global:x or project:x"
+    );
+}
+
+/// A run whose every skill is `disable-model-invocation` and not preloaded
+/// keeps its skills (index row, read roots) but is not offered the loader,
+/// not even under `*`.
+#[tokio::test]
+#[serial]
+async fn a_run_with_no_model_loadable_skill_gets_no_loader() {
+    let home = Home::new();
+    let dir = home.skill("deploy", "Deploy.", "x");
+    rewrite(
+        &dir,
+        "deploy",
+        "disable-model-invocation: true\n",
+        "Ship it.",
+    );
+    let assembler = home.assembler(config());
+    let spec = agent(
+        &home,
+        "provider: anthropic\nmodel: claude-sonnet-4-6\ntools: [\"*\"]\nskills: [deploy]",
+    );
+    let l = launch(&home, spec, Origin::Standalone, "run_noload");
+    let path = l.transcript_path.clone();
+    let _m = MockScript::set(DONE);
+    let run = assembler.assemble(l).await.unwrap();
+    assert!(run.opts.tool_context.services.skills.is_some());
+    assert_eq!(
+        run.opts.tool_context.workspace.read_roots,
+        vec![dir.canonicalize().unwrap()]
+    );
+    run.run().await.result.unwrap();
+    let evs = events(&path);
+    assert!(offered(&evs).iter().all(|e| e.tool != "skills.load"));
+    assert_eq!(skill_index(&evs).len(), 1);
+}
+
+/// Spec §3.1: the agent's body, then `## Run target`, then the skills
+/// section; and the same agent and skills assemble a byte-identical prompt.
+#[tokio::test]
+#[serial]
+async fn the_skills_section_follows_the_run_target_and_is_byte_stable() {
+    let home = Home::new();
+    home.skill("report-style", "House style.", "Write plainly.");
+    home.skill("code-review", "Review a diff.", "x");
+    let assembler = home.assembler(config());
+    let spec = agent(
+        &home,
+        "provider: anthropic\nmodel: claude-sonnet-4-6\nskills: [code-review]\npreloadSkills: [report-style]",
+    );
+    let prompt_of = |run_id: &str| {
+        let mut l = launch(&home, spec.clone(), Origin::Standalone, run_id);
+        l.overrides.system_prompt_suffix = Some("repo: acme/widgets".into());
+        l
+    };
+    let _m = MockScript::set(DONE);
+    let first = assembler.assemble(prompt_of("run_a")).await.unwrap();
+    let second = assembler.assemble(prompt_of("run_b")).await.unwrap();
+    let prompt = first.opts.system_prompt.clone();
+    assert_eq!(prompt, second.opts.system_prompt);
+    let style = installed(&home, "report-style");
+    assert_eq!(
+        prompt,
+        format!(
+            "you are probe.\n\n\n## Run target\n\nrepo: acme/widgets\n\n## Skill: report-style\n\n\
+             Base directory: {}\n\nWrite plainly.\n\n## Skills\n\n\
+             Each skill below holds instructions, and sometimes scripts and reference files,\n\
+             for one kind of task. When a task matches a skill's description, call\n\
+             `skills.load` with its name before you start, and follow it. Paths inside a\n\
+             skill are relative to the base directory that `skills.load` returns.\n\n\
+             - code-review: Review a diff.",
+            style.root.display()
+        )
+    );
+}
+
+/// A child `dispatch_agent` launches gets its own agent's skills, never its
+/// parent's: no index, no loader, and the parent's skill files are outside
+/// what its read tools reach (spec §2.3).
+#[tokio::test]
+#[serial]
+async fn a_sub_agent_does_not_inherit_its_parents_skills() {
+    let home = Home::new();
+    let dir = home.skill("pdf", "PDF things.", "x");
+    let reference = dir.canonicalize().unwrap().join("references/REF.md");
+    home.agent(
+        "child",
+        "provider: anthropic\nmodel: claude-haiku-4-5\ntools: [\"*\"]",
+    );
+    let spec = agent(
+        &home,
+        "provider: anthropic\nmodel: claude-sonnet-4-6\ntools: [dispatch_agent]\n\
+         dispatchableAgents: [child]\nskills: [pdf]",
+    );
+    let assembler = home.assembler(config());
+    let mut l = launch(&home, spec, Origin::Standalone, "run_parent");
+    let root = assembler.dispatch_root(&l.origin, &l.run_id, home.binding());
+    l.services.dispatcher = Some(rupu_runtime::dispatch::InProcessDispatcher::new(
+        assembler.clone(),
+        std::sync::Arc::new(crate::support::DirSubRuns(home.runs())),
+        root,
+        None,
+    ));
+    let parent_path = l.transcript_path.clone();
+    let child_turns = script(vec![tool_use(
+        "k1",
+        "read_file",
+        serde_json::json!({ "path": reference }),
+    )]);
+    let _m = MockScript::set(
+        &serde_json::json!({
+            "turns": serde_json::from_str::<serde_json::Value>(&script(vec![tool_use(
+                "p1",
+                "dispatch_agent",
+                serde_json::json!({ "agent": "child", "prompt": "go" }),
+            )]))
+            .unwrap(),
+            "models": {
+                "claude-haiku-4-5": serde_json::from_str::<serde_json::Value>(&child_turns).unwrap()
+            }
+        })
+        .to_string(),
+    );
+    rupu_runtime::run_agent(&assembler, l)
+        .await
+        .unwrap()
+        .result
+        .unwrap();
+    assert_eq!(skill_index(&events(&parent_path)).len(), 1);
+    let child_path = walk(&home.runs())
+        .into_iter()
+        .find(|p| p.ends_with("transcript.jsonl"))
+        .expect("the child's transcript");
+    let evs = events(&child_path);
+    assert!(!run_start_prompt(&evs).contains("## Skill"));
+    assert!(!evs.iter().any(|e| matches!(e, Event::SkillIndex { .. })));
+    assert!(offered(&evs).iter().all(|e| e.tool != "skills.load"));
+    let read = evs
+        .iter()
+        .find_map(|e| match e {
+            Event::ToolResult { error, .. } => Some(error.clone()),
+            _ => None,
+        })
+        .expect("the child's read_file result");
+    assert!(
+        read.is_some(),
+        "the parent's skill files are not the child's to read"
+    );
+}
+
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walk(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// A project skill granted by its exact name reaches the run: indexed,
+/// recorded with its layer, its root a read root.
+#[tokio::test]
+#[serial]
+async fn a_project_skill_granted_exactly_reaches_the_run() {
+    let home = Home::new();
+    let project = home.root().join("proj");
+    let local = project.join(".rupu/skills/house-rules");
+    std::fs::create_dir_all(&local).unwrap();
+    std::fs::write(
+        local.join("SKILL.md"),
+        "---\nname: house-rules\ndescription: This repo's rules.\n---\nFollow them.\n",
+    )
+    .unwrap();
+    let mut ctx = home.context(config());
+    ctx.project_root = Some(project);
+    let assembler = std::sync::Arc::new(rupu_runtime::assembly::RunAssembler::new(ctx));
+    let spec = rupu_agent::AgentSpec::parse(
+        "---\nname: probe\nprovider: anthropic\nmodel: claude-sonnet-4-6\nskills: [\"project:house-rules\"]\n---\nyou are probe.\n",
+    )
+    .unwrap();
+    let l = launch(&home, spec, Origin::Standalone, "run_project");
+    let path = l.transcript_path.clone();
+    let _m = MockScript::set(DONE);
+    let run = assembler.assemble(l).await.unwrap();
+    assert_eq!(
+        run.opts.tool_context.workspace.read_roots,
+        vec![local.canonicalize().unwrap()]
+    );
+    run.run().await.result.unwrap();
+    let evs = events(&path);
+    assert!(run_start_prompt(&evs).contains("- house-rules: This repo's rules."));
+    let index = skill_index(&evs);
+    assert_eq!(
+        (index[0].name.as_str(), index[0].layer.as_str()),
+        ("house-rules", "project")
+    );
+}
+
+/// R5: a project whose `.rupu` is the global dir has no project layer, so
+/// a global skill binds once by its bare name instead of being ambiguous.
+#[tokio::test]
+#[serial]
+async fn a_project_rupu_that_is_the_global_dir_is_no_second_layer() {
+    let home = Home::new();
+    let user = home.root().join("user");
+    let global = user.join(".rupu");
+    let d = global.join("skills/pdf");
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(
+        d.join("SKILL.md"),
+        "---\nname: pdf\ndescription: PDF.\n---\nx\n",
+    )
+    .unwrap();
+    let mut ctx = home.context(config());
+    ctx.global = global;
+    ctx.project_root = Some(user);
+    let assembler = rupu_runtime::assembly::RunAssembler::new(ctx);
+    let spec = rupu_agent::AgentSpec::parse(
+        "---\nname: probe\nprovider: anthropic\nmodel: claude-sonnet-4-6\nskills: [pdf]\n---\nx\n",
+    )
+    .unwrap();
+    let _m = MockScript::set(DONE);
+    let run = assembler
+        .assemble(launch(&home, spec, Origin::Standalone, "run_r5"))
+        .await
+        .unwrap();
+    let skills = run.opts.tool_context.services.skills.as_ref().unwrap();
+    assert_eq!(skills.names(), vec!["pdf"]);
+    assert_eq!(skills.entries()[0].skill.layer, rupu_skills::Layer::Global);
+}
+
+/// A `skills.load` that fails (a name the run was not given) records no
+/// load: the loaded set and the transcript hold only what entered the
+/// conversation.
+#[tokio::test]
+#[serial]
+async fn a_failed_skills_load_records_no_load() {
+    let home = Home::new();
+    home.skill("pdf", "PDF things.", "x");
+    let assembler = home.assembler(config());
+    let spec = agent(
+        &home,
+        "provider: anthropic\nmodel: claude-sonnet-4-6\nskills: [pdf]",
+    );
+    let l = launch(&home, spec, Origin::Standalone, "run_badload");
+    let path = l.transcript_path.clone();
+    let _m = MockScript::set(&script(vec![tool_use(
+        "c1",
+        "skills.load",
+        serde_json::json!({ "name": "nope" }),
+    )]));
+    rupu_runtime::run_agent(&assembler, l)
+        .await
+        .unwrap()
+        .result
+        .unwrap();
+    let evs = events(&path);
+    let error = evs
+        .iter()
+        .find_map(|e| match e {
+            Event::ToolResult { error, .. } => error.clone(),
+            _ => None,
+        })
+        .expect("the load failed");
+    assert!(error.contains("available: pdf"), "{error}");
+    assert!(skill_loads(&evs).is_empty());
+}
+
+/// A workflow step's run gets its agent's skills like any run.
+#[tokio::test]
+#[serial]
+async fn a_workflow_step_run_gets_its_agents_skills() {
+    let home = Home::new();
+    home.skill("code-review", "Review a diff.", "x");
+    let assembler = home.assembler(config());
+    let spec = agent(
+        &home,
+        "provider: anthropic\nmodel: claude-sonnet-4-6\nskills: [code-review]",
+    );
+    let origin = Origin::WorkflowStep {
+        workflow_run_id: String::new(),
+        workflow_name: "review".into(),
+        step_id: "assess".into(),
+        unit: None,
+        step_actions: Vec::new(),
+        scope_override: None,
+    };
+    let l = launch(&home, spec, origin, "run_wf_step");
+    let path = l.transcript_path.clone();
+    let _m = MockScript::set(DONE);
+    rupu_runtime::run_agent(&assembler, l)
+        .await
+        .unwrap()
+        .result
+        .unwrap();
+    let evs = events(&path);
+    assert!(run_start_prompt(&evs).contains("- code-review: Review a diff."));
+    assert!(offered(&evs).iter().any(|e| e.tool == "skills.load"));
+    assert_eq!(skill_index(&evs)[0].reason, "agent");
 }

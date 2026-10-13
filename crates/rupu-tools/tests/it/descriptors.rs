@@ -237,8 +237,38 @@ fn full_context() -> ToolContext {
     )));
     s.run_status = Some(Arc::new(crate::support::StubStatus::default()));
     s.catalog = Some(Arc::new(crate::support::StubCatalog::default()));
-    s.skills = Some(Arc::new(rupu_skills::ResolvedSkills::default()));
+    let global = tempfile::tempdir().unwrap();
+    let skill = global.path().join("skills/pdf");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: pdf\ndescription: d\n---\nx\n",
+    )
+    .unwrap();
+    s.skills = Some(crate::support::resolved(global.path(), &["pdf"]));
     ctx
+}
+
+/// `skills.load` needs a skill the model may load (spec §2.4): a run whose
+/// every granted skill is `disable-model-invocation` and not preloaded keeps
+/// its skills but is not offered the loader.
+#[test]
+fn skills_load_needs_a_model_loadable_skill() {
+    let mut ctx = ToolContext::default();
+    ctx.services.skills = Some(Arc::new(rupu_skills::ResolvedSkills::default()));
+    assert!(rupu_tools::bodies::body("skills.load", &ctx).is_none());
+    assert!(!ctx
+        .services
+        .provided(false)
+        .missing_for(&rupu_tools::skills::LOAD)
+        .is_empty());
+    let full = full_context();
+    assert!(rupu_tools::bodies::body("skills.load", &full).is_some());
+    assert!(full
+        .services
+        .provided(false)
+        .missing_for(&rupu_tools::skills::LOAD)
+        .is_empty());
 }
 
 /// Which tools an `action:` step may call (W4 §3.3): the connector tools and

@@ -5,9 +5,10 @@
 //! membership and the reason is the first request that names the skill.
 
 use crate::catalog::SkillCatalog;
-use crate::grant::{parse_grants, resolve_grants, GrantParseError, ResolveError};
+use crate::grant::{parse_grants, resolve_grants, EntryError, GrantParseError, ResolveError};
 use crate::render::{render_skills_section, IndexItem, PreloadItem};
-use crate::skill::{Layer, Skill};
+use crate::skill::{Layer, Skill, SkillError};
+use crate::tree::ContentHash;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -45,6 +46,9 @@ pub struct GrantedSkill {
     pub preload: bool,
     pub indexed: bool,
     pub reason: SkillReason,
+    /// The version of the body the system prompt carries: `Some` exactly
+    /// for a preloaded skill, hashed when the run resolved it.
+    pub content_hash: Option<ContentHash>,
 }
 
 impl GrantedSkill {
@@ -71,19 +75,31 @@ pub enum RunSkillsError {
     Parse(#[from] GrantParseError),
     #[error("{}", .0.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))]
     Resolve(Vec<ResolveError>),
+    /// A preloaded skill's files could not be read to version its body.
+    #[error("skill {name:?} ({}) can't be read: {error}", layer.as_str())]
+    Hash {
+        name: String,
+        layer: Layer,
+        error: EntryError,
+    },
 }
 
 impl RunSkillsError {
     /// The I/O errors behind the skills that failed to load.
     pub fn io_errors(&self) -> impl Iterator<Item = &std::io::Error> {
-        let resolve = match self {
-            RunSkillsError::Resolve(errors) => errors.as_slice(),
-            RunSkillsError::Parse(_) => &[],
+        let (resolve, hash) = match self {
+            RunSkillsError::Resolve(errors) => (errors.as_slice(), None),
+            RunSkillsError::Parse(_) => (&[][..], None),
+            RunSkillsError::Hash { error, .. } => (&[][..], Some(error)),
         };
-        resolve.iter().filter_map(|e| match e {
-            ResolveError::Invalid { error, .. } => error.0.io_error(),
-            _ => None,
-        })
+        resolve
+            .iter()
+            .filter_map(|e| match e {
+                ResolveError::Invalid { error, .. } => Some(error),
+                _ => None,
+            })
+            .chain(hash)
+            .filter_map(|e| e.0.io_error())
     }
 }
 
@@ -121,6 +137,7 @@ pub fn resolve_run_skills(
                 preload: false,
                 indexed: false,
                 reason: r.reason,
+                content_hash: None,
             });
             g.preload |= preload;
         }
@@ -129,9 +146,17 @@ pub fn resolve_run_skills(
         .into_values()
         .map(|mut g| {
             g.indexed = !g.preload && !g.skill.frontmatter.disable_model_invocation;
-            g
+            if g.preload {
+                let hash = g.skill.content_hash().map_err(|e| RunSkillsError::Hash {
+                    name: g.name().to_owned(),
+                    layer: g.skill.layer,
+                    error: EntryError(Arc::new(SkillError::Tree(e))),
+                })?;
+                g.content_hash = Some(hash);
+            }
+            Ok(g)
         })
-        .collect();
+        .collect::<Result<_, RunSkillsError>>()?;
     Ok(ResolvedSkills { entries })
 }
 
@@ -150,6 +175,11 @@ impl ResolvedSkills {
 
     pub fn names(&self) -> Vec<&str> {
         self.entries.iter().map(GrantedSkill::name).collect()
+    }
+
+    /// Whether the model may load any of them: what offers `skills.load`.
+    pub fn has_loadable(&self) -> bool {
+        self.entries.iter().any(GrantedSkill::model_loadable)
     }
 
     /// The granted skills the model may load, by name.

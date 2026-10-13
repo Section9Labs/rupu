@@ -289,23 +289,35 @@ pub fn is_fd_exhaustion(e: &std::io::Error) -> bool {
     )
 }
 
-impl AgentLoadError {
+/// An error that may mean only that the process ran out of file
+/// descriptors, which [`retry_on_fd_exhaustion`] retries.
+pub trait FdExhaustion: std::fmt::Display {
+    fn is_fd_exhaustion(&self) -> bool;
+}
+
+impl FdExhaustion for AgentLoadError {
     /// Whether this load failed only because the process ran out of file
     /// descriptors (the agent file itself may be perfectly fine).
-    pub fn is_fd_exhaustion(&self) -> bool {
+    fn is_fd_exhaustion(&self) -> bool {
         match self {
             AgentLoadError::Io { source, .. } => is_fd_exhaustion(source),
             AgentLoadError::Parse {
                 source: AgentSpecParseError::Io(e),
                 ..
             } => is_fd_exhaustion(e),
-            AgentLoadError::Skill { source, .. } => match source {
-                SkillCheckError::Discover(rupu_skills::DiscoverError::Io { source, .. }) => {
-                    is_fd_exhaustion(source)
-                }
-                SkillCheckError::Resolve(e) => e.io_errors().any(is_fd_exhaustion),
-            },
+            AgentLoadError::Skill { source, .. } => source.is_fd_exhaustion(),
             _ => false,
+        }
+    }
+}
+
+impl FdExhaustion for SkillCheckError {
+    fn is_fd_exhaustion(&self) -> bool {
+        match self {
+            SkillCheckError::Discover(rupu_skills::DiscoverError::Io { source, .. }) => {
+                is_fd_exhaustion(source)
+            }
+            SkillCheckError::Resolve(e) => e.io_errors().any(is_fd_exhaustion),
         }
     }
 }
@@ -373,16 +385,20 @@ pub async fn admit_with(
 
 /// Retry `load` while it fails with fd exhaustion, backing off between
 /// attempts. Any other error (or success) returns immediately.
-pub async fn retry_on_fd_exhaustion<T>(
+pub async fn retry_on_fd_exhaustion<T, E, Fut>(
     label: &str,
     policy: &Policy,
     mut grow: impl FnMut() -> bool,
-    mut load: impl FnMut() -> Result<T, AgentLoadError>,
-) -> Result<T, AgentLoadError> {
+    mut load: impl FnMut() -> Fut,
+) -> Result<T, E>
+where
+    E: FdExhaustion,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
     let mut backoff = policy.initial_backoff;
     let mut attempt = 1;
     loop {
-        match load() {
+        match load().await {
             Err(e) if e.is_fd_exhaustion() && attempt < policy.load_attempts => {
                 tracing::warn!(
                     agent = label,
@@ -410,7 +426,10 @@ pub async fn load_agent_admitted(
 ) -> Result<AgentSpec, AgentLoadError> {
     let policy = Policy::default();
     admit_with(name, &policy, fd_usage, grow).await;
-    retry_on_fd_exhaustion(name, &policy, grow, || load_agent(global, project, name)).await
+    retry_on_fd_exhaustion(name, &policy, grow, || {
+        std::future::ready(load_agent(global, project, name))
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -564,14 +583,39 @@ mod tests {
             &fast(),
             || false,
             || {
-                if calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                std::future::ready(if calls.fetch_add(1, Ordering::SeqCst) < 2 {
                     Err(AgentLoadError::Io {
                         path: "d".into(),
                         source: emfile(),
                     })
                 } else {
                     Ok(7)
-                }
+                })
+            },
+        )
+        .await;
+        assert_eq!(out.unwrap(), 7);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// A run's skills resolve after its agent loaded; an EMFILE behind
+    /// them is retried like the agent load's, not a failed unit.
+    #[tokio::test]
+    async fn retries_a_skill_check_that_hit_emfile() {
+        let calls = AtomicU32::new(0);
+        let out = retry_on_fd_exhaustion(
+            "a",
+            &fast(),
+            || false,
+            || {
+                std::future::ready(if calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                    Err(SkillCheckError::Discover(rupu_skills::DiscoverError::Io {
+                        path: "skills".into(),
+                        source: emfile(),
+                    }))
+                } else {
+                    Ok(7)
+                })
             },
         )
         .await;
@@ -588,7 +632,7 @@ mod tests {
             || false,
             || {
                 calls.fetch_add(1, Ordering::SeqCst);
-                Err(AgentLoadError::NotFound("a".into()))
+                std::future::ready(Err(AgentLoadError::NotFound("a".into())))
             },
         )
         .await;
@@ -602,10 +646,10 @@ mod tests {
             || false,
             || {
                 calls.fetch_add(1, Ordering::SeqCst);
-                Err(AgentLoadError::Io {
+                std::future::ready(Err(AgentLoadError::Io {
                     path: "d".into(),
                     source: emfile(),
-                })
+                }))
             },
         )
         .await;

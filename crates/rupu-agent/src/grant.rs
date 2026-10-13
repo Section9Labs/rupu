@@ -49,7 +49,12 @@ pub fn resolve_run_grant(inputs: RunGrantInputs<'_>) -> Result<ResolvedGrant, Gr
     if engagement {
         ambient.push(AmbientGrant::engagement());
     }
-    if ctx.services.skills.is_some() {
+    if ctx
+        .services
+        .skills
+        .as_ref()
+        .is_some_and(|s| s.has_loadable())
+    {
         ambient.push(AmbientGrant::skills());
     }
     if let Some(origin) = inputs.origin {

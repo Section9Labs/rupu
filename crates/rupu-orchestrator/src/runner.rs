@@ -10158,6 +10158,8 @@ async fn dispatch_one(
     agent_started(&provider, &model);
 
     // What an unstarted run's transcript records, kept before the spec moves.
+    // Its prompt has no skills section: the skills resolve inside `assemble`,
+    // and a failed assembly drops them with its error.
     let agent = spec.agent.name.clone();
     let mode = spec.mode;
     let system_prompt =

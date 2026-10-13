@@ -3527,12 +3527,13 @@ fn write_skill_index(
         .collect();
     writer.write(&Event::SkillIndex { skills: rows })?;
     for g in skills.entries() {
-        if g.preload {
-            let content_hash = g.skill.content_hash().map(|h| h.hex()).unwrap_or_default();
+        // A preloaded skill's hash was taken when the run resolved it, the
+        // version its body in the system prompt has.
+        if let Some(hash) = g.content_hash {
             writer.write(&Event::SkillLoad {
                 name: g.name().to_owned(),
                 layer: g.skill.layer.as_str().to_owned(),
-                content_hash,
+                content_hash: hash.hex(),
                 base_dir: g.skill.root.display().to_string(),
                 via: "preload".into(),
             })?;

@@ -417,7 +417,7 @@ A skill's content entered the conversation. Written for every load, whichever pa
 |----------------|--------|-------------|
 | `name`         | string | The skill's name in this run |
 | `layer`        | string | `global` or `project` |
-| `content_hash` | string | sha256 over the skill's files' paths, modes and bytes: the version that was loaded. Empty on a `preload` load whose files couldn't be read to hash at run start |
+| `content_hash` | string | sha256 over the skill's files' paths, modes and bytes: the version that was loaded. A `preload` load's is taken when the run resolves its skills, so it is the version of the body in `run_start.system_prompt` |
 | `base_dir`     | string | The skill's directory, which its relative file references resolve against |
 | `via`          | string | `model` (a `skills.load` call), `preload` (at run start), `operator` (a session operator invoked it), `reattach` (put back after a compaction) or `continuation` (carried over from the run this one continues) |
 

@@ -178,7 +178,7 @@ pub struct GrantedSkill {
 }
 ```
 
-The skills service (`ToolServices.skills: Option<Arc<ResolvedSkills>>`, `Service::Skills`, with its arm in `ToolServices::provided`) is present when `entries` is non-empty. `AmbientGrant::skills()` then offers `skills.load` as `Ambient("skills")`. An agent with no skills gets no loader tool and no index. `actions:` never narrows it, since it is not a connector tool.
+`ToolServices.skills: Option<Arc<ResolvedSkills>>` is set when `entries` is non-empty, and the read roots and preloaded bodies follow from it. `Service::Skills` (its arm in `ToolServices::provided`) is provided, and `AmbientGrant::skills()` offers `skills.load` as `Ambient("skills")`, only when at least one entry is model-loadable: indexed, preloaded or an operator's. A run whose every skill is `disable-model-invocation` and not preloaded keeps its skills but gets no loader. An agent with no skills gets no loader tool and no index. `actions:` never narrows it, since it is not a connector tool.
 
 The assembler resolves `skills:` and `preloadSkills:` (and step skills) in ONE `resolve_grants` call over their union and marks preload by membership, so `skills: [global:x]` with `preloadSkills: [project:x]` is caught as binding `x` twice.
 
