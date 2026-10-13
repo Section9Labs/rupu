@@ -13,7 +13,6 @@ pub mod net_capture;
 pub mod netflow;
 pub mod provider_factory;
 mod run_envelope;
-pub mod signal;
 pub mod spawn;
 pub mod usage_ledger;
 mod wake;

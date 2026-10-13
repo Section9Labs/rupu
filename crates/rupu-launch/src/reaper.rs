@@ -127,7 +127,7 @@ pub fn reset_stopping() {
 pub fn stop_live_children(grace: Duration, why: &str) -> Vec<(PathBuf, String)> {
     begin_stopping();
     let deadline = Instant::now() + grace;
-    let mut stopped = Vec::new();
+    let mut stopped = abandon_cancelled_runs(grace);
     loop {
         let dirs: Vec<PathBuf> = live().iter().cloned().collect();
         let left = deadline.saturating_duration_since(Instant::now());
@@ -323,6 +323,9 @@ const MAX_NESTING: usize = 8;
 /// process gone — and, below each, its own children.
 struct Abandon<'a> {
     why: &'a str,
+    /// Every unfinished child, its launching process alive or not: an
+    /// operator ended the run they hang from.
+    all: bool,
     seen: BTreeSet<(PathBuf, String)>,
     targets: Vec<Target>,
 }
@@ -331,6 +334,7 @@ impl<'a> Abandon<'a> {
     fn new(why: &'a str) -> Self {
         Self {
             why,
+            all: false,
             seen: BTreeSet::new(),
             targets: Vec::new(),
         }
@@ -367,7 +371,7 @@ impl<'a> Abandon<'a> {
 
     fn dir(&mut self, dir: &Path, depth: usize) {
         for c in ledger::read(dir) {
-            let orphaned = c.finished.is_none() && parent_gone(&c.started);
+            let orphaned = c.finished.is_none() && (self.all || parent_gone(&c.started));
             if c.continued_by.is_none() && (c.is_interrupted() || orphaned) {
                 self.child(dir, &c, depth);
             }
@@ -387,6 +391,36 @@ impl<'a> Abandon<'a> {
 pub fn abandon_unfinished(dir: &Path, why: &str, grace: Duration) -> Vec<(PathBuf, String)> {
     let mut abandon = Abandon::new(why);
     abandon.dir(dir, 0);
+    abandon.finish(grace)
+}
+
+/// Every workflow run a runner of this process executes that an operator
+/// cancelled: what its attempts launched, down the tree, is stopped and
+/// recorded `abandoned` — the cancel reaches the runner as a signal, but
+/// nothing continues a cancelled run. `RunStore::cancel` records the cancel
+/// before it signals the runner.
+fn abandon_cancelled_runs(grace: Duration) -> Vec<(PathBuf, String)> {
+    let why = "its workflow run was cancelled";
+    let mut abandon = Abandon {
+        all: true,
+        ..Abandon::new(why)
+    };
+    for run_dir in rupu_orchestrator::runs::local_runner_dirs() {
+        let (Some(runs), Some(run_id)) = (
+            run_dir.parent(),
+            run_dir.file_name().and_then(|n| n.to_str()),
+        ) else {
+            continue;
+        };
+        let cancelled = RunStore::new(runs.to_path_buf())
+            .load(run_id)
+            .is_ok_and(|r| r.status == RunStatus::Cancelled);
+        if cancelled {
+            for dir in below(global_of(&run_dir), ChildKind::Workflow, run_id) {
+                abandon.dir(&dir, 1);
+            }
+        }
+    }
     abandon.finish(grace)
 }
 

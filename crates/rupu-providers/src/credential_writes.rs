@@ -165,6 +165,24 @@ pub fn terminating() -> bool {
     terminating_slot().load(Ordering::SeqCst)
 }
 
+/// Set once SIGINT has arrived: the process ends by the signal's default
+/// action once the children its runs launched are stopped.
+static SIGINT: AtomicBool = AtomicBool::new(false);
+
+/// Mark the process as being stopped by SIGINT; never cleared.
+pub fn mark_sigint() {
+    SIGINT.store(true, Ordering::SeqCst);
+}
+
+/// Whether this process is being stopped by a signal: SIGTERM
+/// ([`terminating`]) or SIGINT ([`mark_sigint`]). An end a run records
+/// meanwhile is recorded as that stop
+/// (`rupu_transcript::StopCause::StoppedBySignal`), not as a failure of its
+/// own.
+pub fn stopped_by_signal() -> bool {
+    SIGINT.load(Ordering::SeqCst) || terminating()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

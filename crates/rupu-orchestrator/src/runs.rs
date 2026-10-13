@@ -1224,6 +1224,11 @@ const RUN_JSON_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2
 static LOCAL_RUNNERS: std::sync::LazyLock<std::sync::Mutex<std::collections::BTreeSet<PathBuf>>> =
     std::sync::LazyLock::new(Default::default);
 
+/// The run directories runners of this process are executing.
+pub fn local_runner_dirs() -> Vec<PathBuf> {
+    local_runners().iter().cloned().collect()
+}
+
 fn local_runners() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<PathBuf>> {
     LOCAL_RUNNERS
         .lock()
@@ -3873,17 +3878,6 @@ impl RunStore {
             | RunStatus::AwaitingApproval => {
                 let pid = record.runner_pid;
                 let was_running = pid.is_some_and(pid_is_running);
-                // Only signal a pid that is live AND is NOT our own
-                // process: a `runner_pid` naming the caller (say `cp
-                // serve`) must never SIGTERM it — that would take down the
-                // whole control plane. Resumes run in their own detached
-                // processes, so this only guards a misrecorded pid; the
-                // run is still marked `Cancelled` below (see `cancel`).
-                if let Some(pid) =
-                    pid.filter(|pid| pid_is_running(*pid) && *pid != std::process::id())
-                {
-                    let _ = terminate_pid(pid);
-                }
                 record.status = RunStatus::Cancelled;
                 record.finished_at = Some(now);
                 record.error_message = Some(reason.to_string());
@@ -3905,6 +3899,19 @@ impl RunStore {
                         finished_at: now,
                     },
                 );
+                // Signalled once the record says `Cancelled`: the runner's
+                // signal handler reads it to end what the run launched for
+                // good rather than leave it to be continued. Only a pid that
+                // is live AND is NOT our own process: a `runner_pid` naming
+                // the caller (say `cp serve`) must never SIGTERM it — that
+                // would take down the whole control plane. Resumes run in
+                // their own detached processes, so this only guards a
+                // misrecorded pid; the run is still marked `Cancelled`.
+                if let Some(pid) =
+                    pid.filter(|pid| pid_is_running(*pid) && *pid != std::process::id())
+                {
+                    let _ = terminate_pid(pid);
+                }
                 Ok(CancelOutcome::MarkedCancelled { pid, was_running })
             }
         }

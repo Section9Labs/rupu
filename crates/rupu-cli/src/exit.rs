@@ -387,7 +387,7 @@ pub fn install_sigint_child_stop() {
         .name("rupu-sigint".into())
         .spawn(move || {
             if signals.forever().next().is_some() {
-                rupu_runtime::signal::mark_sigint();
+                rupu_providers::credential_writes::mark_sigint();
                 if let Some(children) = stop_children_detached() {
                     let _ = children.join();
                 }

@@ -846,11 +846,15 @@ impl RunError {
         }
     }
 
-    /// The typed cause a record of this failure carries: its outcome, or
-    /// the signal stop for a run ended by SIGTERM.
+    /// The typed cause a record of this failure carries: the signal stop
+    /// for a run ended by SIGTERM, or any failure while its process is
+    /// being stopped by a signal (SIGTERM or SIGINT), else its outcome.
     pub fn cause(&self) -> Option<rupu_transcript::OutcomeRecord> {
         match self {
             RunError::Terminating => Some(rupu_transcript::StopCause::StoppedBySignal.record()),
+            _ if rupu_providers::credential_writes::stopped_by_signal() => {
+                Some(rupu_transcript::StopCause::StoppedBySignal.record())
+            }
             other => other.outcome().cloned(),
         }
     }
@@ -2016,7 +2020,9 @@ pub async fn run_agent_full(opts: AgentRunOpts) -> RunExit {
     // `abandoned`.
     if let Some(launcher) = opts.tool_context.services.launcher.clone() {
         let how = match &result {
-            _ if rupu_providers::credential_writes::terminating() => rupu_tools::ParentEnd::Paused,
+            _ if rupu_providers::credential_writes::stopped_by_signal() => {
+                rupu_tools::ParentEnd::Paused
+            }
             Ok(r) if r.paused => rupu_tools::ParentEnd::Paused,
             Ok(r) if r.terminal_error().is_none() => rupu_tools::ParentEnd::Completed,
             _ => rupu_tools::ParentEnd::Failed,

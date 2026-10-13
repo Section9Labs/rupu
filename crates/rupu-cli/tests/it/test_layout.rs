@@ -18,6 +18,9 @@ const OWN_BINARY: &[&str] = &[
     "crates/rupu-agent/tests/terminating_fallback_refusal.rs",
     "crates/rupu-agent/tests/terminating_overflow.rs",
     "crates/rupu-orchestrator/tests/terminating.rs",
+    // Raises `credential_writes::mark_sigint()`'s flag, process-wide and
+    // never cleared.
+    "crates/rupu-agent/tests/stopped_by_sigint.rs",
 ];
 
 /// Calls that change state every thread and every spawned child sees.

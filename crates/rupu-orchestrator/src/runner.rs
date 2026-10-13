@@ -1609,7 +1609,7 @@ pub async fn run_workflow(
             &opts.workflow,
             &step_results,
             path_scoped,
-            rupu_runtime::signal::stopped_by_signal(),
+            rupu_providers::credential_writes::stopped_by_signal(),
         );
         let served_decisions = !applied.is_empty();
         // Never over an on-disk `Cancelled` (the cancel-vs-completion race:
@@ -1646,11 +1646,11 @@ pub async fn run_workflow(
         break outcome;
     };
 
-    // Children its attempts left interrupted are continued by a resume; once
-    // the run ends for good, nothing will. One stopped by a signal is
-    // continued like a paused one.
-    let ended = (cancel_preserved || !matches!(outcome, Ok(InnerOutcome::Paused { .. })))
-        && !rupu_providers::credential_writes::terminating();
+    let ended = ends_for_good(
+        cancel_preserved,
+        matches!(outcome, Ok(InnerOutcome::Paused { .. })),
+        rupu_providers::credential_writes::stopped_by_signal(),
+    );
     if let Some(launcher) = opts
         .factory
         .launcher()
@@ -1715,7 +1715,7 @@ pub async fn run_workflow(
             &opts.workflow,
             &step_results,
             path_scoped,
-            rupu_runtime::signal::stopped_by_signal(),
+            rupu_providers::credential_writes::stopped_by_signal(),
         )
         .done_status(),
     };
@@ -1805,7 +1805,7 @@ enum RunEnd {
 
 impl RunEnd {
     /// `signalled`: the process is being stopped by a signal
-    /// ([`rupu_runtime::signal::stopped_by_signal`]), so a failure is that
+    /// ([`rupu_providers::credential_writes::stopped_by_signal`]), so a failure is that
     /// stop's.
     fn of(
         outcome: &Result<InnerOutcome, RunWorkflowError>,
@@ -1934,9 +1934,36 @@ impl RunEnd {
     }
 }
 
+/// Whether a run's end leaves nothing a resume continues, so the children
+/// its attempts left interrupted are abandoned: an operator's cancel always
+/// (it reaches the runner as SIGTERM too); otherwise any end but a pause or
+/// a stop by a signal (SIGTERM or SIGINT), which a resume continues.
+fn ends_for_good(cancelled: bool, paused: bool, stopped_by_signal: bool) -> bool {
+    cancelled || (!paused && !stopped_by_signal)
+}
+
 #[cfg(test)]
 mod run_end_tests {
     use super::*;
+
+    #[test]
+    fn only_a_cancel_or_an_unsignalled_end_is_for_good() {
+        let cases = [
+            ((false, false, false), true),
+            ((false, true, false), false),
+            ((false, false, true), false),
+            ((false, true, true), false),
+            ((true, false, true), true),
+            ((true, true, false), true),
+        ];
+        for ((cancelled, paused, signalled), for_good) in cases {
+            assert_eq!(
+                ends_for_good(cancelled, paused, signalled),
+                for_good,
+                "cancelled {cancelled}, paused {paused}, signalled {signalled}"
+            );
+        }
+    }
 
     fn failed_record(signalled: bool) -> crate::runs::RunRecord {
         let wf =

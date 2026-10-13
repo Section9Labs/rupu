@@ -1107,3 +1107,103 @@ fn a_signalled_parent_continues_its_workflow_child_and_what_it_launched() {
         .expect("the step's join");
     assert!(output.contains("grand answer"), "{output}");
 }
+
+/// An operator's `rupu workflow cancel` of a running workflow ends what its
+/// step launched for good. The cancel reaches the runner as SIGTERM, but it
+/// is not a stop anything continues from: the step's child is recorded
+/// `abandoned`, not `interrupted`, and its process is gone.
+#[test]
+fn cancelling_a_workflow_run_abandons_what_its_steps_launched() {
+    const GRAND_MODEL: &str = "claude-opus-4-7";
+    let _env = ENV_LOCK.blocking_lock();
+    let home = Home::new();
+    home.agent(
+        "child",
+        CHILD_MODEL,
+        "tools: [dispatch, join]\ndispatchableAgents: [grand]\n",
+    );
+    home.agent("grand", GRAND_MODEL, "");
+    home.workflow(
+        "sweep",
+        "name: sweep\nsteps:\n  - id: scan\n    agent: child\n    prompt: scan it\n",
+    );
+    let script = format!(
+        r#"{{ "turns": [], "models": {{ "{CHILD_MODEL}": [{}], "{GRAND_MODEL}": [{}] }} }}"#,
+        [
+            tool(
+                "c1",
+                "dispatch",
+                r#"{"kind": "agent", "name": "grand", "prompt": "go"}"#,
+            ),
+            slow(&text("never")),
+        ]
+        .join(","),
+        slow(&text("never")),
+    );
+    let wf_run = "run_01W7CANCELLEDWF00000000000";
+    let rupu = |args: &[&str]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rupu"));
+        cmd.args(args)
+            .env("RUPU_HOME", &home.global)
+            .env("RUPU_MOCK_PROVIDER_SCRIPT", &script)
+            .current_dir(&home.project)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        cmd
+    };
+    let mut runner = rupu(&[
+        "workflow", "run", "sweep", "--run-id", wf_run, "--plain", "--mode", "bypass",
+    ])
+    .spawn()
+    .expect("spawn rupu workflow run");
+    let runs = rupu_orchestrator::RunStore::new(home.global.join("runs"));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let step_run = loop {
+        if let Some(a) = runs
+            .read_attempts(wf_run)
+            .ok()
+            .and_then(|a| a.first().cloned())
+        {
+            break a.agent_run_id;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the workflow's step never started"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let grand = home.wait_for_child(&step_run);
+    while !has_event(&home.transcript(&grand.started.run_id), "user_message") {
+        assert!(Instant::now() < deadline, "the grandchild never started");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let cancelled = rupu(&["workflow", "cancel", wf_run]).status().unwrap();
+    assert!(cancelled.success());
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while runner.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the runner never exited");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let grand_pid = grand.started.pid.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while rupu_launch::proc::pid_is_running(grand_pid) && !rupu_launch::proc::is_zombie(grand_pid) {
+        assert!(
+            Instant::now() < deadline,
+            "the step's child survived the cancel"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let below = home.children(&step_run);
+    assert_eq!(
+        below[0].state(),
+        ChildState::Abandoned,
+        "{:?}",
+        below[0].finished
+    );
+    assert_eq!(
+        runs.load(wf_run).unwrap().status,
+        rupu_orchestrator::RunStatus::Cancelled
+    );
+}
