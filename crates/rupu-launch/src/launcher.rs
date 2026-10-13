@@ -260,7 +260,7 @@ enum Work {
     /// whose children it takes on, when it continues one.
     Subagent {
         spec: Box<rupu_agent::AgentSpec>,
-        prompt: UserTurn,
+        prompt: Box<UserTurn>,
         ceiling: PermissionMode,
         continues: Option<String>,
     },
@@ -1316,7 +1316,7 @@ impl RunLauncher {
                         .run_subagent(
                             Arc::clone(&task_child),
                             *spec,
-                            prompt,
+                            *prompt,
                             ceiling,
                             from,
                             continues,
@@ -1555,7 +1555,7 @@ impl RunLauncher {
                 let child = self.continued(&prior, sub, Some(transcript), launch, from);
                 let work = Work::Subagent {
                     spec: Box::new(spec),
-                    prompt,
+                    prompt: Box::new(prompt),
                     ceiling: mode,
                     continues: Some(prior.run_id.clone()),
                 };
@@ -1641,7 +1641,7 @@ impl RunLauncher {
                 let child = self.continued(prior, sub, Some(transcript), launch, from);
                 let work = Work::Subagent {
                     spec: Box::new(spec),
-                    prompt: UserTurn::new(request.prompt.unwrap_or_default()),
+                    prompt: Box::new(UserTurn::new(request.prompt.unwrap_or_default())),
                     ceiling: mode,
                     continues: None,
                 };
@@ -2049,7 +2049,7 @@ impl Launcher for RunLauncher {
                 },
             ) => Work::Subagent {
                 spec,
-                prompt: UserTurn::new(prompt),
+                prompt: Box::new(UserTurn::new(prompt)),
                 ceiling: mode,
                 continues: None,
             },
