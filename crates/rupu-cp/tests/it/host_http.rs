@@ -642,6 +642,8 @@ fn profiled_agent_req(
         run_id: None,
         findings_profile: profile,
         engagement_profiles: Vec::new(),
+        skills: Vec::new(),
+        preload_skills: Vec::new(),
         codename: None,
     }
 }

@@ -134,6 +134,8 @@ impl HostConnector for TunnelHostConnector {
             target: req.target.clone(),
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
 
@@ -194,6 +196,8 @@ impl HostConnector for TunnelHostConnector {
             target: req.target.clone(),
             findings_profile: req.findings_profile,
             engagement_profiles: req.engagement_profiles.clone(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: spec_peer_codename(
                 &run,
                 conn.capabilities(),

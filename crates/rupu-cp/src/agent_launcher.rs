@@ -40,6 +40,15 @@ pub struct AgentLaunchRequest {
     /// advertised `agent.engagement_profile`) refuses the launch rather than
     /// run the agent on the `code` path.
     pub engagement_profiles: Vec<String>,
+    /// The placed unit's workflow-step skills — `rupu run --skill`, one flag
+    /// per entry, on top of the agent's own. The executing host resolves
+    /// them against its own skill layers. Same contract as
+    /// `findings_profile`: every connector delivers them, or refuses the
+    /// launch when its peer hasn't advertised `agent.skills`.
+    pub skills: Vec<String>,
+    /// The step's `preload_skills:` — `rupu run --preload-skill`. Same
+    /// contract as `skills`.
+    pub preload_skills: Vec<String>,
     /// Codename minted by a placed unit's coordinator — `rupu run
     /// --codename`. Best-effort: a codename is only a display name, so a peer
     /// that can't take it never blocks the launch. An SSH remote predating
@@ -86,6 +95,8 @@ impl AgentLaunchRequest {
         run.prompt = self.prompt.clone();
         run.findings_profile = self.findings_profile;
         run.engagement_profiles = self.engagement_profiles.clone();
+        run.skills = self.skills.clone();
+        run.preload_skills = self.preload_skills.clone();
         run.tmp_clone = self.target.is_some();
         Ok(run)
     }
@@ -134,6 +145,8 @@ mod tests {
             run_id: Some("run_01COORD".into()),
             findings_profile: None,
             engagement_profiles: vec!["network".into()],
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: Some("cobalt-harbor/heron#412".into()),
         }
     }

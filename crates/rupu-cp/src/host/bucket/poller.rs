@@ -276,6 +276,8 @@ mod tests {
                     target: None,
                     findings_profile: None,
                     engagement_profiles: Vec::new(),
+                    skills: Vec::new(),
+                    preload_skills: Vec::new(),
                     codename: None,
                 },
             )
@@ -330,6 +332,8 @@ mod tests {
                     target: None,
                     findings_profile: None,
                     engagement_profiles: Vec::new(),
+                    skills: Vec::new(),
+                    preload_skills: Vec::new(),
                     codename: None,
                 },
             )

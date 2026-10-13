@@ -109,6 +109,17 @@ pub struct RunSpec {
     /// known to honour it — see [`CAP_AGENT_ENGAGEMENT_PROFILE`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub engagement_profiles: Vec<String>,
+    /// Agent runs only: the placed unit's workflow-step skills, `rupu run
+    /// --skill` (one flag per entry). Absent on the wire when empty.
+    ///
+    /// Same rule as `findings_profile`: a sender sets it only for an
+    /// executor that advertised [`CAP_AGENT_SKILLS`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
+    /// Agent runs only: `rupu run --preload-skill` (one flag per entry).
+    /// Same rule as `skills`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preload_skills: Vec<String>,
     /// Agent runs only: `rupu run --codename`, the coordinator-minted name.
     /// Absent on the wire when `None`.
     ///
@@ -125,9 +136,10 @@ pub struct RunSpec {
 impl RunSpec {
     /// The `rupu run` / `rupu workflow run` an executor (`rupu node`, `rupu
     /// node pull`) starts for this spec under `run_id`. Refuses a field the
-    /// command can't honour rather than launch without it: `findings_profile`
-    /// and `engagement_profiles` are agent-run fields (`rupu workflow run`
-    /// resolves profiles per step from the workflow file), as is a mode word
+    /// command can't honour rather than launch without it: `findings_profile`,
+    /// `engagement_profiles`, `skills` and `preload_skills` are agent-run
+    /// fields (`rupu workflow run` resolves them per step from the workflow
+    /// file), as is a mode word
     /// that isn't one. A codename on a workflow spec is ignored (logged): a
     /// workflow run's crew is derived from its run id.
     pub fn run_argv(&self, run_id: &str) -> Result<rupu_runtime::argv::RunArgv, String> {
@@ -144,6 +156,12 @@ impl RunSpec {
                 if !self.engagement_profiles.is_empty() {
                     return Err(format!(
                         "run spec for workflow `{}` carries engagement_profiles, which apply to agent runs only",
+                        self.name
+                    ));
+                }
+                if !self.skills.is_empty() || !self.preload_skills.is_empty() {
+                    return Err(format!(
+                        "run spec for workflow `{}` carries skills, which apply to agent runs only",
                         self.name
                     ));
                 }
@@ -170,6 +188,8 @@ impl RunSpec {
                 run.prompt = self.prompt.clone();
                 run.findings_profile = self.findings_profile;
                 run.engagement_profiles = self.engagement_profiles.clone();
+                run.skills = self.skills.clone();
+                run.preload_skills = self.preload_skills.clone();
                 run.tmp_clone = self.target.is_some();
                 Ok(RunArgv::Agent(run))
             }
@@ -189,6 +209,13 @@ pub const CAP_AGENT_FINDINGS_PROFILE: &str = "agent.findings_profile";
 /// A connector refuses a launch that carries an engagement for a peer that
 /// has not advertised it, rather than let the unit run on the `code` path.
 pub const CAP_AGENT_ENGAGEMENT_PROFILE: &str = "agent.engagement_profile";
+
+/// `Hello.capabilities` / host feature / bucket marker entry: this
+/// executor's `rupu run` takes `--skill` / `--preload-skill`, so a placed
+/// unit's workflow-step skills reach it ([`RunSpec::skills`]; HTTP: the
+/// agent-run body's `skills`). A connector refuses a unit with step skills
+/// on a peer that hasn't advertised it.
+pub const CAP_AGENT_SKILLS: &str = "agent.skills";
 
 /// `Hello.capabilities` / bucket marker / host feature entry: this executor
 /// puts [`RunSpec::codename`] (HTTP: the agent-run body's `codename`) on its
@@ -239,6 +266,7 @@ pub fn node_capabilities() -> Vec<String> {
     vec![
         CAP_AGENT_FINDINGS_PROFILE.to_string(),
         CAP_AGENT_ENGAGEMENT_PROFILE.to_string(),
+        CAP_AGENT_SKILLS.to_string(),
         CAP_FINDINGS_ARTIFACT_PULL.to_string(),
         CAP_RUN_CODENAME.to_string(),
     ]
@@ -266,6 +294,7 @@ pub fn host_features() -> Vec<String> {
     vec![
         CAP_AGENT_FINDINGS_PROFILE.to_string(),
         CAP_AGENT_ENGAGEMENT_PROFILE.to_string(),
+        CAP_AGENT_SKILLS.to_string(),
         CAP_WORKFLOW_RESUME_IF_UNFINISHED.to_string(),
         CAP_RUN_COVERAGE_STREAM.to_string(),
         CAP_FINDINGS_ARTIFACT_BLOB.to_string(),
@@ -310,6 +339,7 @@ pub fn bucket_worker_capabilities() -> Vec<String> {
     vec![
         CAP_AGENT_FINDINGS_PROFILE.to_string(),
         CAP_AGENT_ENGAGEMENT_PROFILE.to_string(),
+        CAP_AGENT_SKILLS.to_string(),
         CAP_RUN_CODENAME.to_string(),
     ]
 }
@@ -360,6 +390,8 @@ mod tests {
                 target: None,
                 findings_profile: None,
                 engagement_profiles: Vec::new(),
+                skills: Vec::new(),
+                preload_skills: Vec::new(),
                 codename: None,
             },
         };
@@ -575,6 +607,7 @@ mod tests {
             vec![
                 CAP_AGENT_FINDINGS_PROFILE.to_string(),
                 CAP_AGENT_ENGAGEMENT_PROFILE.to_string(),
+                CAP_AGENT_SKILLS.to_string(),
                 CAP_RUN_CODENAME.to_string(),
             ]
         );
@@ -592,6 +625,21 @@ mod tests {
         ] {
             assert!(
                 caps.iter().any(|c| c == CAP_AGENT_ENGAGEMENT_PROFILE),
+                "{surface}: {caps:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_executor_surface_advertises_skills_support() {
+        assert_eq!(CAP_AGENT_SKILLS, "agent.skills");
+        for (surface, caps) in [
+            ("tunnel node", node_capabilities()),
+            ("host features", host_features()),
+            ("bucket worker", bucket_worker_capabilities()),
+        ] {
+            assert!(
+                caps.iter().any(|c| c == CAP_AGENT_SKILLS),
                 "{surface}: {caps:?}"
             );
         }
@@ -625,6 +673,8 @@ mod tests {
             target: Some("github:o/r".into()),
             findings_profile: Some(rupu_coverage::FindingProfile::Summary),
             engagement_profiles: vec!["network".into()],
+            skills: vec!["pdf".into(), "project:notes".into()],
+            preload_skills: vec!["house-style".into()],
             codename: Some("cobalt-harbor/heron#412".into()),
         }
     }
@@ -660,6 +710,26 @@ mod tests {
             Some(rupu_coverage::FindingProfile::Summary)
         );
         assert_eq!(run.engagement_profiles, ["network"]);
+        assert_eq!(run.skills, ["pdf", "project:notes"]);
+        assert_eq!(run.preload_skills, ["house-style"]);
+        let args = RunArgv::Agent(run.clone()).to_args();
+        let skill_flags: Vec<&str> = args
+            .iter()
+            .map(|a| a.to_str().unwrap())
+            .skip_while(|a| *a != "--skill")
+            .take(6)
+            .collect();
+        assert_eq!(
+            skill_flags,
+            [
+                "--skill",
+                "pdf",
+                "--skill",
+                "project:notes",
+                "--preload-skill",
+                "house-style"
+            ]
+        );
         assert!(run.tmp_clone, "a targeted placed run clones into a tmpdir");
 
         let mut wf = agent_spec();
@@ -674,6 +744,13 @@ mod tests {
             .unwrap_err()
             .contains("engagement_profiles"));
         wf.engagement_profiles.clear();
+        assert_eq!(
+            wf.run_argv("run_Z").unwrap_err(),
+            "run spec for workflow `recon` carries skills, which apply to agent runs only"
+        );
+        wf.skills.clear();
+        assert!(wf.run_argv("run_Z").unwrap_err().contains("carries skills"));
+        wf.preload_skills.clear();
         let RunArgv::Workflow(run) = wf.run_argv("run_Z").unwrap() else {
             panic!("a workflow spec is a `rupu workflow run`");
         };
@@ -696,6 +773,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
         let json = serde_json::to_string(&spec).unwrap();
@@ -704,6 +783,22 @@ mod tests {
         let json = serde_json::to_string(&spec).unwrap();
         assert!(
             json.contains(r#""engagement_profiles":["network","web"]"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<RunSpec>(&json).unwrap(), spec);
+    }
+
+    #[test]
+    fn run_spec_skills_are_absent_on_the_wire_when_empty() {
+        let mut spec = agent_spec();
+        spec.skills.clear();
+        spec.preload_skills.clear();
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(!json.contains("skills"), "{json}");
+        let spec = agent_spec();
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(
+            json.contains(r#""skills":["pdf","project:notes"],"preload_skills":["house-style"]"#),
             "{json}"
         );
         assert_eq!(serde_json::from_str::<RunSpec>(&json).unwrap(), spec);

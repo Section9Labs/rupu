@@ -2620,6 +2620,8 @@ impl HostConnector for SshHostConnector {
             target: req.target.clone(),
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
 
@@ -2681,6 +2683,8 @@ impl HostConnector for SshHostConnector {
             target: req.target.clone(),
             findings_profile: req.findings_profile,
             engagement_profiles: req.engagement_profiles.clone(),
+            skills: req.skills.clone(),
+            preload_skills: req.preload_skills.clone(),
             codename: None,
         };
 
@@ -6268,6 +6272,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
         conn.mirror
@@ -7244,6 +7250,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
         conn.mirror
@@ -7335,6 +7343,8 @@ mod tests {
                 run_id: Some(run_id.into()),
                 findings_profile: None,
                 engagement_profiles: Vec::new(),
+                skills: Vec::new(),
+                preload_skills: Vec::new(),
                 codename: None,
             })
             .await
@@ -7537,6 +7547,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -7664,6 +7676,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
         conn.mirror
@@ -7736,6 +7750,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
         conn.mirror
@@ -7805,6 +7821,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
         conn.mirror
@@ -7859,6 +7877,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
         conn.mirror
@@ -7913,6 +7933,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
         conn.mirror
@@ -8103,6 +8125,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
         conn.mirror
@@ -8198,6 +8222,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
         conn.mirror
@@ -8289,6 +8315,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
         conn.mirror
@@ -8727,6 +8755,8 @@ mod tests {
                     run_id: None,
                     findings_profile: None,
                     engagement_profiles: Vec::new(),
+                    skills: Vec::new(),
+                    preload_skills: Vec::new(),
                 })
                 .await
                 .expect("launch_agent");
@@ -9026,6 +9056,8 @@ mod tests {
                 run_id: None,
                 findings_profile: None,
                 engagement_profiles: Vec::new(),
+                skills: Vec::new(),
+                preload_skills: Vec::new(),
             })
             .await
             .unwrap();
@@ -9062,6 +9094,8 @@ mod tests {
                 run_id: Some("run_01MINTEDBYCOORD".into()),
                 findings_profile: None,
                 engagement_profiles: Vec::new(),
+                skills: Vec::new(),
+                preload_skills: Vec::new(),
             })
             .await
             .unwrap();
@@ -9092,6 +9126,8 @@ mod tests {
                 run_id: Some("run_01PROFILED".into()),
                 findings_profile: Some(rupu_coverage::FindingProfile::Summary),
                 engagement_profiles: Vec::new(),
+                skills: Vec::new(),
+                preload_skills: Vec::new(),
                 codename: None,
             })
             .await
@@ -9123,6 +9159,8 @@ mod tests {
             run_id: Some("run_01ENGAGED".into()),
             findings_profile: None,
             engagement_profiles: vec!["network".into(), "web".into()],
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         })
         .await
@@ -9153,6 +9191,8 @@ mod tests {
                 run_id: Some("../evil".into()),
                 findings_profile: None,
                 engagement_profiles: Vec::new(),
+                skills: Vec::new(),
+                preload_skills: Vec::new(),
             })
             .await
             .unwrap_err();
@@ -9430,6 +9470,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         }
     }
@@ -9444,6 +9486,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         }
     }

@@ -221,6 +221,8 @@ impl HostConnector for BucketHostConnector {
             target: req.target.clone(),
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
 
@@ -287,6 +289,8 @@ impl HostConnector for BucketHostConnector {
             target: req.target.clone(),
             findings_profile: req.findings_profile,
             engagement_profiles: req.engagement_profiles.clone(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename,
         };
 
@@ -558,6 +562,8 @@ mod tests {
                 run_id: None,
                 findings_profile: None,
                 engagement_profiles: Vec::new(),
+                skills: Vec::new(),
+                preload_skills: Vec::new(),
             })
             .await
             .unwrap();
@@ -593,6 +599,8 @@ mod tests {
             run_id: None,
             findings_profile: profile,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         }
     }

@@ -970,6 +970,8 @@ async fn run_agent_with(
         run_id,
         findings_profile,
         engagement_profiles,
+        skills: Vec::new(),
+        preload_skills: Vec::new(),
     };
     launcher.launch(req).await.map_err(|e| match e {
         AgentLaunchError::Invalid(m) => ApiError::bad_request(m),
@@ -1115,6 +1117,8 @@ async fn run_agent(
             run_id,
             findings_profile,
             engagement_profiles,
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
         };
         let run_id = conn.launch_agent(req).await.map_err(|e| match e {
             HostConnectorError::NotFound(m) => ApiError::not_found(m),

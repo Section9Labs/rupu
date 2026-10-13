@@ -1230,6 +1230,8 @@ mod launch_agent_tests {
                 run_id: None,
                 findings_profile: Some(rupu_coverage::FindingProfile::Summary),
                 engagement_profiles: Vec::new(),
+                skills: Vec::new(),
+                preload_skills: Vec::new(),
                 codename: None,
             })
             .await
@@ -1263,6 +1265,8 @@ mod launch_agent_tests {
             run_id: None,
             findings_profile: None,
             engagement_profiles: vec!["network".into()],
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         })
         .await

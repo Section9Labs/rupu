@@ -55,6 +55,8 @@ mod tests {
             run_id: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
         }
     }
 

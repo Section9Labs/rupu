@@ -349,6 +349,10 @@ impl UnitDispatcher for FleetUnitDispatcher {
                 findings_profile: unit.findings_profile,
                 // Likewise: delivered as `--engagement-profile`, or refused.
                 engagement_profiles: unit.engagement_profiles,
+                // Likewise: delivered as `--skill` / `--preload-skill`, or
+                // refused.
+                skills: unit.skills,
+                preload_skills: unit.preload_skills,
             })
             .await
         {
@@ -1211,6 +1215,8 @@ mod tests {
             workspace: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             mode: None,
             codename: None,
         }
@@ -2785,6 +2791,30 @@ steps:
             d.dispatch_unit(unit, "h1").await.unwrap();
             let launched = conn.launched.lock().unwrap().clone().expect("launched");
             assert_eq!(launched.engagement_profiles, ids);
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_passes_the_units_skills_to_launch_agent() {
+        for (skills, preload) in [
+            (
+                vec!["pdf".to_string(), "project:notes".to_string()],
+                vec!["house-style".to_string()],
+            ),
+            (vec![], vec![]),
+        ] {
+            let conn = Arc::new(FakeConnector::completed());
+            let d = FleetUnitDispatcher::from_connector(
+                Arc::clone(&conn) as Arc<dyn HostConnector>,
+                PathBuf::from("/g"),
+            );
+            let mut unit = make_unit();
+            unit.skills = skills.clone();
+            unit.preload_skills = preload.clone();
+            d.dispatch_unit(unit, "h1").await.unwrap();
+            let launched = conn.launched.lock().unwrap().clone().expect("launched");
+            assert_eq!(launched.skills, skills);
+            assert_eq!(launched.preload_skills, preload);
         }
     }
 
