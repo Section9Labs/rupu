@@ -2087,6 +2087,8 @@ mod tests {
             system_prompt: None,
             codename: None,
             customer: None,
+            launch_skills: Vec::new(),
+            launch_preload_skills: Vec::new(),
         };
         let usage = rupu_transcript::Event::Usage {
             provider: "anthropic".into(),

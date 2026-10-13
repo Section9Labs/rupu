@@ -62,6 +62,8 @@ fn write_transcript_rec(
         system_prompt: None,
         codename: None,
         customer,
+        launch_skills: Vec::new(),
+        launch_preload_skills: Vec::new(),
     })
     .unwrap();
     w.write(&Event::RunComplete {

@@ -760,6 +760,125 @@ fn a_continued_run_keeps_its_launch_skills_unless_the_flags_name_others() {
     assert!(!prompt.contains("X-PRELOADED-BODY"), "{prompt}");
 }
 
+fn add_skill(home: &Path, name: &str, body: &str) {
+    let dir = home.join("skills").join(name);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: The {name} skill.\n---\n\n{body}\n"),
+    )
+    .unwrap();
+}
+
+fn run_ok(out: &std::process::Output) {
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_continued_run_keeps_a_launch_preload_of_an_agent_skill() {
+    let home = home_with_agent_and_skills(&[("x", "X-PRELOADED-BODY")]);
+    fs::write(
+        home.path().join("agents/b.md"),
+        "---\nname: b\nprovider: anthropic\nmodel: claude-sonnet-4-6\nskills: [x]\n---\nhi\n",
+    )
+    .unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let base = ["run", "b", "--mode", "readonly", "--run-id"];
+    run_ok(&mock_run(
+        home.path(),
+        cwd.path(),
+        &[&base[..], &["run_overlap", "--preload-skill", "x", "go"]].concat(),
+    ));
+    let (rows, prompt) = skill_index_and_prompt(&transcript_events(home.path(), "run_overlap"));
+    assert_eq!(
+        rows,
+        vec![("x".into(), "global".into(), true, "agent".into())]
+    );
+    assert!(prompt.contains("X-PRELOADED-BODY"), "{prompt}");
+    interrupt(home.path(), "run_overlap");
+
+    run_ok(&mock_run(
+        home.path(),
+        cwd.path(),
+        &[&base[..], &["run_overlap_2", "--continue", "run_overlap"]].concat(),
+    ));
+    let (rows, prompt) = skill_index_and_prompt(&transcript_events(home.path(), "run_overlap_2"));
+    assert_eq!(
+        rows,
+        vec![("x".into(), "global".into(), true, "agent".into())]
+    );
+    assert!(prompt.contains("X-PRELOADED-BODY"), "{prompt}");
+}
+
+#[test]
+fn a_continued_star_launch_grants_a_skill_installed_since() {
+    let home = home_with_agent_and_skills(&[("x", "X-BODY")]);
+    let cwd = tempfile::tempdir().unwrap();
+    let base = ["run", "a", "--mode", "readonly", "--run-id"];
+    run_ok(&mock_run(
+        home.path(),
+        cwd.path(),
+        &[&base[..], &["run_star", "--skill", "*", "go"]].concat(),
+    ));
+    let events = transcript_events(home.path(), "run_star");
+    let start = events.iter().find(|e| e["type"] == "run_start").unwrap();
+    assert_eq!(start["data"]["launch_skills"], serde_json::json!(["*"]));
+    assert_eq!(skill_index_and_prompt(&events).0, vec![row("x", false)]);
+    interrupt(home.path(), "run_star");
+
+    add_skill(home.path(), "y", "Y-BODY");
+    run_ok(&mock_run(
+        home.path(),
+        cwd.path(),
+        &[&base[..], &["run_star_2", "--continue", "run_star"]].concat(),
+    ));
+    let events = transcript_events(home.path(), "run_star_2");
+    let start = events.iter().find(|e| e["type"] == "run_start").unwrap();
+    assert_eq!(start["data"]["launch_skills"], serde_json::json!(["*"]));
+    assert_eq!(
+        skill_index_and_prompt(&events).0,
+        vec![row("x", false), row("y", false)]
+    );
+}
+
+#[test]
+fn a_continued_launch_skill_that_no_longer_resolves_names_where_it_came_from() {
+    let home = home_with_agent_and_skills(&[("x", "X-BODY")]);
+    let cwd = tempfile::tempdir().unwrap();
+    let base = ["run", "a", "--mode", "readonly", "--run-id"];
+    run_ok(&mock_run(
+        home.path(),
+        cwd.path(),
+        &[&base[..], &["run_gone", "--skill", "x", "go"]].concat(),
+    ));
+    interrupt(home.path(), "run_gone");
+    fs::remove_dir_all(home.path().join("skills/x")).unwrap();
+
+    let out = mock_run(
+        home.path(),
+        cwd.path(),
+        &[&base[..], &["run_gone_2", "--continue", "run_gone"]].concat(),
+    );
+    assert!(!out.status.success());
+    let message = format!(
+        "skills: unknown skill \"x\" (looked in {}; install it with `rupu skill install`)\n  \
+         The launch skills (--skill x) came from run run_gone, which this run continues; \
+         pass --skill or --preload-skill to name others.",
+        home.path().join("skills").display()
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(&message), "{stderr}");
+    let record: Value = serde_json::from_str(
+        &fs::read_to_string(home.path().join("runs/run_gone_2/run.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record["error_message"], message.as_str());
+}
+
 #[test]
 fn a_bad_skill_flag_fails_before_the_target_is_cloned() {
     let home = home_with_agent_and_skills(&[]);

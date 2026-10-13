@@ -931,6 +931,8 @@ pub fn record_unstarted_run(
             system_prompt,
             codename: run.codename.map(str::to_string),
             customer: Some(run.customer.map(str::to_string)),
+            launch_skills: Vec::new(),
+            launch_preload_skills: Vec::new(),
         })?;
         writer.write(&Event::Notice {
             kind: "model_limits".into(),
@@ -2199,6 +2201,8 @@ async fn run_agent_inner(
         // Always recorded: `null` when the run has no customer, so a
         // later assignment of the project never re-attributes it.
         customer: Some(opts.tool_context.services.customer.clone()),
+        launch_skills: opts.id.launch_skills.clone(),
+        launch_preload_skills: opts.id.launch_preload_skills.clone(),
     })?;
     // One notice per run, before the first turn: what the run resolved, and
     // where each number came from (spec 2026-09-30 §6.6).

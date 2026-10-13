@@ -7529,6 +7529,8 @@ async fn run_compact_request(
         system_prompt: None,
         codename: None,
         customer: session.customer.clone(),
+        launch_skills: Vec::new(),
+        launch_preload_skills: Vec::new(),
     })?;
     writer.flush()?;
 
@@ -8964,6 +8966,8 @@ mod tests {
                 schema: None,
                 system_prompt: None,
                 customer: None,
+                launch_skills: Vec::new(),
+                launch_preload_skills: Vec::new(),
             })
             .unwrap()];
             for _ in 0..*turns {
@@ -9066,6 +9070,8 @@ mod tests {
                 system_prompt: None,
                 codename: None,
                 customer: None,
+                launch_skills: Vec::new(),
+                launch_preload_skills: Vec::new(),
             })
             .unwrap(),
         );
@@ -11865,6 +11871,8 @@ mod tests {
                     schema: None,
                     system_prompt: None,
                     customer: None,
+                    launch_skills: Vec::new(),
+                    launch_preload_skills: Vec::new(),
                 },
                 usage_event(6_000, 50, None),
                 TranscriptEvent::RunComplete {
@@ -11921,6 +11929,8 @@ mod tests {
                     schema: None,
                     system_prompt: None,
                     customer: None,
+                    launch_skills: Vec::new(),
+                    launch_preload_skills: Vec::new(),
                 },
                 usage_event(6_000, 50, None),
                 TranscriptEvent::RunComplete {

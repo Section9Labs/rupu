@@ -738,6 +738,9 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     // A continued run keeps the skills its launch gave the run it continues
     // (`--skill` / `--preload-skill`), unless this launch names its own.
     let mut launch_skills = (args.skills.clone(), args.preload_skills.clone());
+    // The run these launch skills were carried from, so a failure to
+    // resolve them says where they came from.
+    let mut skills_carried_from: Option<String> = None;
     let mut resume_from: Option<ResumeFrom> = match args.continue_from.as_deref() {
         None => None,
         Some(prev) => {
@@ -774,6 +777,9 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             }
             if args.skills.is_empty() && args.preload_skills.is_empty() {
                 launch_skills = rupu_agent::continuation::launch_skills(&prev_path)?;
+                if !launch_skills.0.is_empty() || !launch_skills.1.is_empty() {
+                    skills_carried_from = Some(prev.to_string());
+                }
             }
             let prepared = if args.model.is_some() || args.provider.is_some() {
                 prepare_recovery_continuation(&prev_path)?
@@ -939,8 +945,8 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                 .as_ref()
                 .map(crate::run_target::format_run_target_for_prompt),
             findings_profile: args.findings_profile,
-            skills: launch_skills.0,
-            preload_skills: launch_skills.1,
+            skills: launch_skills.0.clone(),
+            preload_skills: launch_skills.1.clone(),
             ..Default::default()
         };
 
@@ -1204,15 +1210,23 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         // failure, not an early exit. As `assemble` does for its own
         // failures, the run's transcript exists, empty.
         let assembled = match skills_failure {
-            None => assembler.assemble(launch).await,
+            None => assembler.assemble(launch).await.map_err(|e| e.into_run_error()),
             Some(e) => {
                 if let Err(w) = rupu_transcript::JsonlWriter::create(&transcript_path) {
                     warn!(error = %w, "create the transcript of a run whose skills failed");
                 }
-                Err(e)
+                Err(match (e.into_run_error(), &skills_carried_from) {
+                    (rupu_agent::RunError::Preflight(m), Some(prev)) => {
+                        rupu_agent::RunError::Preflight(format!(
+                            "{m}\n  The launch skills ({}) came from run {prev}, which this run \
+                             continues; pass --skill or --preload-skill to name others.",
+                            launch_flags(&launch_skills)
+                        ))
+                    }
+                    (e, _) => e,
+                })
             }
-        }
-        .map_err(|e| e.into_run_error());
+        };
 
         // Spawn the agent in a background task and tail the transcript with
         // the line-stream printer while it runs.
@@ -1488,6 +1502,14 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     }
 
     body_result
+}
+
+/// `skills` / `preload_skills` entries as the `rupu run` flags that name
+/// them.
+fn launch_flags((skills, preload): &(Vec<String>, Vec<String>)) -> String {
+    let skills = skills.iter().map(|s| format!("--skill {s}"));
+    let preload = preload.iter().map(|s| format!("--preload-skill {s}"));
+    skills.chain(preload).collect::<Vec<_>>().join(" ")
 }
 
 /// What `rupu run --continue` picks up: the rebuilt conversation, the

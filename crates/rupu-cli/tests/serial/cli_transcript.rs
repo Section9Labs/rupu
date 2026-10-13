@@ -36,6 +36,8 @@ fn write_transcript_started_at(
         system_prompt: None,
         codename: None,
         customer: None,
+        launch_skills: Vec::new(),
+        launch_preload_skills: Vec::new(),
     })
     .unwrap();
     w.write(&Event::RunComplete {
@@ -73,6 +75,8 @@ fn write_transcript(
         system_prompt: None,
         codename: None,
         customer: None,
+        launch_skills: Vec::new(),
+        launch_preload_skills: Vec::new(),
     })
     .unwrap();
     w.write(&Event::RunComplete {
@@ -108,6 +112,8 @@ fn write_transcript_with_assistant(
         system_prompt: None,
         codename: None,
         customer: None,
+        launch_skills: Vec::new(),
+        launch_preload_skills: Vec::new(),
     })
     .unwrap();
     w.write(&Event::AssistantMessage {

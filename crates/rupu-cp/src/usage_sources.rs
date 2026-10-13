@@ -380,6 +380,8 @@ mod tests {
             schema: None,
             system_prompt: None,
             customer,
+            launch_skills: Vec::new(),
+            launch_preload_skills: Vec::new(),
         };
         let mut line = serde_json::to_vec(&ev).unwrap();
         line.push(b'\n');

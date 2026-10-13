@@ -147,6 +147,8 @@ fn write_transcript_rec(
         system_prompt: None,
         codename: None,
         customer,
+        launch_skills: Vec::new(),
+        launch_preload_skills: Vec::new(),
     };
     let usage = rupu_transcript::Event::Usage {
         provider: "anthropic".into(),
