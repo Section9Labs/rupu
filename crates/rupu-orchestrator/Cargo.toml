@@ -36,6 +36,7 @@ rupu-netflow = { workspace = true }
 rupu-providers = { path = "../rupu-providers" }
 rupu-runtime = { path = "../rupu-runtime" }
 rupu-scm = { path = "../rupu-scm" }
+rupu-skills = { workspace = true }
 rupu-tools = { path = "../rupu-tools" }
 rupu-transcript = { path = "../rupu-transcript" }
 

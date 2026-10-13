@@ -224,6 +224,10 @@ pub enum WorkflowParseError {
     FindingsProfileOnNonAgentStep { step: String },
     #[error("step `{step}`: `findings_profile` only applies to `action: findings.record` (this step calls `{tool}`); remove it")]
     FindingsProfileOnNonFindingsAction { step: String, tool: String },
+    #[error("step `{step}`: skills: apply only to steps that run an agent")]
+    SkillsOnNonAgentStep { step: String },
+    #[error("step `{step}`: skills: {message}")]
+    BadSkillEntry { step: String, message: String },
     #[error("step `{step}`: edge target `{target}` is not a known step")]
     EdgeTargetUnknown { step: String, target: String },
     #[error("step `{step}`: an edge cannot target its own step")]
@@ -1151,6 +1155,14 @@ pub struct Step {
     /// profile `findings.record` records under (step → defaults → `full`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub findings_profile: Option<rupu_coverage::FindingProfile>,
+    /// Skills every agent this step launches may load, on top of each
+    /// agent's own (spec §2.2). Syntax is checked here; existence where the
+    /// agent runs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
+    /// Skills whose bodies are in every launched agent's system prompt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preload_skills: Vec<String>,
     /// Explicit successor edge(s). Empty in a legacy (edge-free) workflow,
     /// where flow follows list order. Non-empty makes this an explicit graph.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1364,6 +1376,7 @@ impl Workflow {
             }
             validate_step_shape(step)?;
             validate_step_actions(step)?;
+            validate_step_skills(step)?;
         }
         validate_findings_record_actions(&wf)?;
         for (name, def) in &wf.inputs {
@@ -1846,6 +1859,7 @@ fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
             }
             validate_step_shape(sub)?; // linear (or Plan-2 action) rules apply
             validate_step_actions(sub)?;
+            validate_step_skills(sub)?;
         }
     } else if let Some(run) = &step.run {
         // NOTE: `for_each` is deliberately absent from this list — a
@@ -2022,20 +2036,7 @@ fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
         }
         // A step that runs no agent has no findings contract to configure.
         // (An `action: findings.record` step is the exception, handled above.)
-        // Branch / standalone gate / `run:` / bare `split`/`join` nodes are
-        // classified with the same predicates the shape validation above
-        // uses. (A `loop:<name>` supernode is synthesized at run time and
-        // never appears in parsed YAML, so it cannot carry this field.)
-        let runs_no_agent = step.branch.is_some()
-            || is_approval_gate(step)
-            || step.run.is_some()
-            || ((step.split.is_some() || step.join.is_some())
-                && step.agent.is_none()
-                && step.prompt.is_none()
-                && step.for_each.is_none()
-                && step.parallel.is_none()
-                && step.panel.is_none());
-        if runs_no_agent {
+        if runs_no_agent(step) {
             return Err(WorkflowParseError::FindingsProfileOnNonAgentStep {
                 step: step.id.clone(),
             });
@@ -2046,6 +2047,48 @@ fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
         // the launch.
     }
 
+    Ok(())
+}
+
+/// Whether `step` is a node that launches no agent and calls no tool:
+/// branch / standalone gate / `run:` / bare `split`/`join` nodes, classified
+/// with the same predicates the shape validation uses. (A `loop:<name>`
+/// supernode is synthesized at run time and never appears in parsed YAML.)
+fn runs_no_agent(step: &Step) -> bool {
+    step.branch.is_some()
+        || is_approval_gate(step)
+        || step.run.is_some()
+        || ((step.split.is_some() || step.join.is_some())
+            && step.agent.is_none()
+            && step.prompt.is_none()
+            && step.for_each.is_none()
+            && step.parallel.is_none()
+            && step.panel.is_none())
+}
+
+/// A step's `skills:` / `preload_skills:` (spec §2.2): only on a step that
+/// launches an agent, and well-formed entries. Whether each is installed is
+/// decided where the agent runs, so a workflow's validity never depends on
+/// the host parsing it.
+fn validate_step_skills(step: &Step) -> Result<(), WorkflowParseError> {
+    if step.skills.is_empty() && step.preload_skills.is_empty() {
+        return Ok(());
+    }
+    if runs_no_agent(step) || step.action.is_some() {
+        return Err(WorkflowParseError::SkillsOnNonAgentStep {
+            step: step.id.clone(),
+        });
+    }
+    let all: Vec<String> = step
+        .skills
+        .iter()
+        .chain(&step.preload_skills)
+        .cloned()
+        .collect();
+    rupu_skills::parse_grants(&all).map_err(|e| WorkflowParseError::BadSkillEntry {
+        step: step.id.clone(),
+        message: e.to_string(),
+    })?;
     Ok(())
 }
 
@@ -3650,6 +3693,67 @@ steps:
         Workflow::parse(parallel).expect("parallel step");
         let panel = "name: w\nsteps:\n  - id: a\n    findings_profile: summary\n    panel:\n      panelists: [x]\n      subject: s\n";
         Workflow::parse(panel).expect("panel step");
+    }
+
+    #[test]
+    fn step_skills_parse_and_round_trip() {
+        let wf = Workflow::parse(
+            "name: w\nsteps:\n  - id: a\n    agent: reviewer\n    prompt: go\n    skills: [code-review, \"project:*\"]\n    preload_skills: [report-style]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            wf.steps[0].skills,
+            vec!["code-review".to_string(), "project:*".to_string()]
+        );
+        assert_eq!(wf.steps[0].preload_skills, vec!["report-style".to_string()]);
+        let yaml = serde_yaml::to_string(&wf.steps[0]).unwrap();
+        assert!(yaml.contains("skills:"), "{yaml}");
+        assert!(yaml.contains("preload_skills:"), "{yaml}");
+        let plain =
+            Workflow::parse("name: w\nsteps:\n  - id: a\n    agent: r\n    prompt: go\n").unwrap();
+        let yaml = serde_yaml::to_string(&plain.steps[0]).unwrap();
+        assert!(!yaml.contains("skills"), "{yaml}");
+    }
+
+    #[test]
+    fn step_skills_are_refused_where_no_agent_runs_and_on_bad_syntax() {
+        let refused = |raw: &str| match Workflow::parse(raw) {
+            Err(WorkflowParseError::SkillsOnNonAgentStep { step }) => step,
+            other => panic!("expected SkillsOnNonAgentStep, got {other:?}"),
+        };
+        let gate =
+            "name: w\nsteps:\n  - id: g\n    approval:\n      required: true\n    skills: [x]\n";
+        assert_eq!(refused(gate), "g");
+        let run = "name: w\nsteps:\n  - id: r\n    run: { cmd: echo }\n    preload_skills: [x]\n";
+        assert_eq!(refused(run), "r");
+        let action = "name: w\nsteps:\n  - id: c\n    action: issues.comment\n    with: { project: o/r, number: 1, body: hi }\n    skills: [x]\n";
+        assert_eq!(refused(action), "c");
+        let cleanup = "name: w\nsteps:\n  - id: gate\n    approval:\n      required: true\n      on_reject:\n        - id: cleanup\n          action: issues.comment\n          with: { project: o/r, number: 1, body: hi }\n          skills: [x]\n";
+        assert_eq!(refused(cleanup), "cleanup");
+
+        let bad =
+            "name: w\nsteps:\n  - id: a\n    agent: r\n    prompt: go\n    skills: [Bad_Name]\n";
+        match Workflow::parse(bad) {
+            Err(e @ WorkflowParseError::BadSkillEntry { .. }) => {
+                assert!(e.to_string().starts_with("step `a`: skills: "), "{e}")
+            }
+            other => panic!("expected BadSkillEntry, got {other:?}"),
+        }
+        let bad_preload = "name: w\nsteps:\n  - id: a\n    agent: r\n    prompt: go\n    preload_skills: [\"nosuch:x\"]\n";
+        assert!(matches!(
+            Workflow::parse(bad_preload),
+            Err(WorkflowParseError::BadSkillEntry { .. })
+        ));
+
+        let placed = "name: w\nsteps:\n  - id: a\n    agent: r\n    prompt: go\n    host: mini\n    skills: [x]\n";
+        assert!(
+            Workflow::parse(placed).is_ok(),
+            "skills travel to placed units; no refusal"
+        );
+        let panel = "name: w\nsteps:\n  - id: a\n    skills: [x]\n    panel:\n      panelists: [p]\n      subject: s\n";
+        Workflow::parse(panel).expect("a panel runs agents");
+        let parallel = "name: w\nsteps:\n  - id: a\n    preload_skills: [x]\n    parallel:\n      - id: s1\n        agent: p\n        prompt: p\n";
+        Workflow::parse(parallel).expect("a parallel step runs agents");
     }
 
     // ── §3b-bis: remote (host:/distribute:) steps fail closed ────────────────

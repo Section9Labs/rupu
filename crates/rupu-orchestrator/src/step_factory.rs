@@ -122,6 +122,8 @@ impl StepFactory for DefaultStepFactory {
         );
         spec.overrides.system_prompt_suffix = self.system_prompt_suffix.clone();
         spec.overrides.findings_profile = step.findings_profile;
+        spec.overrides.skills = step.skills.clone();
+        spec.overrides.preload_skills = step.preload_skills.clone();
         spec.overrides.findings_default = self.workflow.defaults.findings_profile;
         // Workflow-level concerns take precedence over agent-level concerns:
         // when the workflow declares `concerns:`, every step uses it.
@@ -311,6 +313,69 @@ steps:
             }
             _ => panic!("a step's origin"),
         }
+    }
+
+    /// Every agent a step launches gets the step's skills: the runner sends
+    /// a parallel sub-step, a panelist and a panel's `fix_with` agent with
+    /// the parent step's id and the agent that actually runs.
+    #[tokio::test]
+    async fn step_skills_reach_every_agent_the_step_launches() {
+        const SKILLED: &str = r#"
+name: w
+steps:
+  - id: linear
+    agent: ag
+    prompt: p
+    skills: [code-review]
+    preload_skills: [report-style]
+  - id: fan
+    skills: [code-review]
+    preload_skills: [report-style]
+    parallel:
+      - id: s1
+        agent: sub
+        prompt: p
+  - id: review
+    skills: [code-review]
+    preload_skills: [report-style]
+    panel:
+      panelists: [panelist]
+      subject: s
+      gate:
+        until_no_findings_at_severity_or_above: high
+        fix_with: fixer
+        max_iterations: 2
+  - id: bare
+    agent: ag
+    prompt: p
+"#;
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["ag", "sub", "panelist", "fixer"] {
+            write(tmp.path(), name, "");
+        }
+        let f = factory_with(SKILLED, context(tmp.path()));
+        for (step, agent) in [
+            ("linear", "ag"),
+            ("fan", "sub"),
+            ("review", "panelist"),
+            ("review", "fixer"),
+        ] {
+            let l = launch(&f, tmp.path(), step, agent).await;
+            assert_eq!(l.spec.agent.name, agent);
+            assert_eq!(
+                l.spec.overrides.skills,
+                vec!["code-review".to_string()],
+                "{step}/{agent}"
+            );
+            assert_eq!(
+                l.spec.overrides.preload_skills,
+                vec!["report-style".to_string()],
+                "{step}/{agent}"
+            );
+        }
+        let bare = launch(&f, tmp.path(), "bare", "ag").await;
+        assert!(bare.spec.overrides.skills.is_empty());
+        assert!(bare.spec.overrides.preload_skills.is_empty());
     }
 
     #[tokio::test]

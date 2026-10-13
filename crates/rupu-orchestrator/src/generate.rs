@@ -144,7 +144,8 @@ has type (string|int|bool), required (bool), description, optional default. Refe
 prompts as {{ inputs.<key> }}.\n  steps: (required list)\n\nEach linear step needs:\n  - id: \
 <unique id>\n    agent: <one of the available agent names>\n    prompt: |\n      <multi-line \
 instruction; may reference {{ inputs.x }} and {{ steps.<id>.output }}>\n    actions: []        \
-# optional allow-list of tool actions\n\nOther step shapes (used in place of a plain linear step when the\
+# optional allow-list of tool actions\n    skills: []         # optional: skills every agent of this step may load\n    \
+preload_skills: []  # optional: skills always in their prompt\n\nOther step shapes (used in place of a plain linear step when the\
 description calls for it):\n\
   - `for_each: <minijinja list expr>` plus `agent`/`prompt` \u{2014} fan one agent over a list; \
 inside the prompt use {{ item }}. Optional `max_parallel: <int>` caps concurrency (default 1).\n\
