@@ -62,7 +62,8 @@ with retry attempts dropped, so a retried step keeps its address:
 | an agentiflow unit | `cobalt-harbor/heron>lynx#1` | `lynx#1` |
 
 `participants.jsonl` records every `joined` and `left`, with the run's agent, run id, step and
-parent. An agentiflow's lead and a session stay joined between rounds and turns.
+parent. An agentiflow's lead and a session stay joined between rounds and turns; `rupu session
+stop` and `rupu session archive` record the session's participants as `left`.
 
 A message's `to` is one of these:
 

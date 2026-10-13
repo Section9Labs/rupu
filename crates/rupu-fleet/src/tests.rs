@@ -560,3 +560,42 @@ fn no_run_joins_at_a_fixed_address_but_lead() {
         .is_empty());
     joined(tmp.path(), "lead", member("lead", "af_1", None, None));
 }
+
+#[test]
+fn leave_all_ends_every_live_participant_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert_eq!(Bus::leave_all(tmp.path(), "stopped").unwrap(), 0);
+    assert!(
+        !tmp.path().join("participants.jsonl").exists(),
+        "a space with no roster stays unwritten"
+    );
+    joined(tmp.path(), "lynx#1", member("recon", "r1", None, None));
+    joined(tmp.path(), "otter#1", member("triage", "r2", None, None))
+        .leave("done")
+        .unwrap();
+    let staying = Bus::open(tmp.path(), "heron").staying();
+    staying.join(member("reader", "r3", None, None)).unwrap();
+
+    assert_eq!(Bus::leave_all(tmp.path(), "stopped").unwrap(), 2);
+    let roster = staying.roster().unwrap();
+    assert!(roster.participants().all(|p| !p.live));
+    let lefts: Vec<(String, String)> = std::fs::read_to_string(staying.participants_path())
+        .unwrap()
+        .lines()
+        .filter_map(|l| match serde_json::from_str(l).unwrap() {
+            ParticipantEvent::Left {
+                address, status, ..
+            } => Some((address, status)),
+            ParticipantEvent::Joined { .. } => None,
+        })
+        .collect();
+    assert_eq!(
+        lefts,
+        [
+            ("otter#1".to_string(), "done".to_string()),
+            ("lynx#1".to_string(), "stopped".to_string()),
+            ("heron".to_string(), "stopped".to_string()),
+        ]
+    );
+    assert_eq!(Bus::leave_all(tmp.path(), "stopped").unwrap(), 0);
+}

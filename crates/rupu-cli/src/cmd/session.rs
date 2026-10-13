@@ -6997,6 +6997,7 @@ async fn archive(session_id: &str) -> anyhow::Result<()> {
         write_session(&global, scope, &session)?;
     }
     ensure_session_not_running(&session, "archive")?;
+    leave_session_space(&global, scope, &session.session_id, "archived");
     move_session_owned_transcripts(&mut session, SessionScope::Archived)?;
     move_session_scope(
         &global,
@@ -7411,6 +7412,26 @@ fn reactivate_stopped(session: &mut SessionRecord) -> bool {
     true
 }
 
+/// Record every participant of the session's message space as having left
+/// with `status`: its agent stays joined between turns, and a stopped or
+/// archived session takes none.
+fn leave_session_space(global: &Path, scope: SessionScope, session_id: &str, status: &str) {
+    let origin = rupu_runtime::assembly::Origin::SessionTurn {
+        session_id: session_id.to_string(),
+        session_dir: session_dir(global, scope, session_id),
+    };
+    let Some(space) = rupu_runtime::services::messaging::space_dir(global, &origin, "") else {
+        return;
+    };
+    if let Err(e) = rupu_fleet::Bus::leave_all(&space, status) {
+        tracing::warn!(
+            session = session_id,
+            error = %e,
+            "could not record the session leaving its message space"
+        );
+    }
+}
+
 fn stop_session_in_place(global: &Path, session_id: &str) -> anyhow::Result<()> {
     let (mut session, scope) = read_session(global, session_id)?;
     ensure_active_scope(scope, "session stop")?;
@@ -7433,6 +7454,7 @@ fn stop_session_in_place(global: &Path, session_id: &str) -> anyhow::Result<()> 
     // of the last turn that actually completed and was folded into
     // `message_history`) is still exactly reconstructible into the current
     // `message_history` and remains a valid seed source for the next turn.
+    leave_session_space(global, scope, session_id, "stopped");
     session.status = SessionStatus::Stopped;
     session.updated_at = Utc::now();
     session.last_error = Some("stopped by operator".into());
@@ -12218,6 +12240,75 @@ mod tests {
             ])
             .unwrap(),
             "replay keeps turn 2's prompt — it joined message_history"
+        );
+    }
+
+    /// A session's agent stays joined between turns; stopping or archiving
+    /// the session ends it, so the roster stops showing it live.
+    #[tokio::test]
+    async fn stopping_or_archiving_a_session_ends_its_participants() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let global = tmp.path().join("global");
+        let left = |id: &str, scope: SessionScope| -> Vec<(String, bool, String)> {
+            let space = session_dir(&global, scope, id).join("messages");
+            let roster = rupu_fleet::Bus::open(&space, "operator").roster().unwrap();
+            let status = std::fs::read_to_string(space.join("participants.jsonl"))
+                .unwrap()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<rupu_fleet::ParticipantEvent>(l).ok())
+                .filter_map(|e| match e {
+                    rupu_fleet::ParticipantEvent::Left { status, .. } => Some(status),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            roster
+                .participants()
+                .map(|p| (p.address.clone(), p.live, status.clone()))
+                .collect()
+        };
+        for id in ["ses_leave_stop", "ses_leave_arch"] {
+            let mut record = test_session_record();
+            record.session_id = id.into();
+            record.status = SessionStatus::Idle;
+            record.active_run_id = None;
+            record.active_transcript_path = None;
+            record.active_pid = None;
+            record.worker_pid = None;
+            record.transcripts_dir = global.join("sessions").join(id).join("transcripts");
+            record.last_transcript_path = None;
+            record.runs = Vec::new();
+            write_session(&global, SessionScope::Active, &record).unwrap();
+            let space = session_dir(&global, SessionScope::Active, id).join("messages");
+            rupu_fleet::Bus::open(&space, "heron")
+                .staying()
+                .join(rupu_fleet::Member {
+                    agent: "issue-reader".into(),
+                    run_id: format!("run_{id}"),
+                    kind: "session_turn".into(),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+
+        stop_session_in_place(&global, "ses_leave_stop").unwrap();
+        assert_eq!(
+            left("ses_leave_stop", SessionScope::Active),
+            [("heron".to_string(), false, "stopped".to_string())]
+        );
+
+        let old_home = std::env::var_os("RUPU_HOME");
+        std::env::set_var("RUPU_HOME", &global);
+        let archived = archive("ses_leave_arch").await;
+        match old_home {
+            Some(v) => std::env::set_var("RUPU_HOME", v),
+            None => std::env::remove_var("RUPU_HOME"),
+        }
+        archived.unwrap();
+        assert_eq!(
+            left("ses_leave_arch", SessionScope::Archived),
+            [("heron".to_string(), false, "archived".to_string())]
         );
     }
 

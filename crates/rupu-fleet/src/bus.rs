@@ -18,7 +18,9 @@ use crate::log::{
     Undelivered,
 };
 use crate::mailbox::Mailbox;
-use crate::participants::{Member, ParticipantEvent, Resolution, Roster, Sender, Undeliverable};
+use crate::participants::{
+    Member, Participant, ParticipantEvent, Resolution, Roster, Sender, Undeliverable,
+};
 use crate::types::{BoardPost, ClaimGuard, Directive, FleetMessage, PostKind};
 use std::collections::HashMap;
 use std::io::Write;
@@ -234,6 +236,37 @@ impl Bus {
                 at: now(),
             },
         )
+    }
+
+    /// Record that every participant still live in the space at `space`
+    /// left with `status`: its runs ended without leaving (a session stopped
+    /// or archived between turns). Returns how many it recorded; a space
+    /// with no participants is left unwritten.
+    pub fn leave_all(space: &Path, status: &str) -> Result<usize, BusError> {
+        let bus = Bus::open(space, address::OPERATOR);
+        if !bus.participants_path().exists() {
+            return Ok(0);
+        }
+        let _lock = bus.lock()?;
+        let live: Vec<Participant> = bus
+            .roster()?
+            .participants()
+            .filter(|p| p.live)
+            .cloned()
+            .collect();
+        let at = now();
+        for p in &live {
+            append(
+                &bus.participants_path(),
+                &ParticipantEvent::Left {
+                    address: p.address.clone(),
+                    run_id: p.member.run_id.clone(),
+                    status: status.to_string(),
+                    at: at.clone(),
+                },
+            )?;
+        }
+        Ok(live.len())
     }
 
     /// A board post, optionally addressed. Every participant can read it;
