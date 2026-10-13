@@ -21,7 +21,7 @@ use object_store::{
 
 use super::{
     BucketError, Bucket,
-    key_artifact, key_claim, key_control, key_finished, key_job, key_result, key_worker_info,
+    key_artifact, key_claim, key_control, key_finished, key_job, key_result, key_skill, key_worker_info,
     prefix_control, prefix_results,
 };
 
@@ -502,6 +502,41 @@ impl Bucket for ObjectStoreBucket {
         self.download_artifact_to_file(sha256, dest, max_bytes, ARTIFACT_RANGE_BYTES)
             .await
     }
+
+    async fn put_skill(&self, hash: &str, bytes: &[u8]) -> Result<(), BucketError> {
+        let path = self.path(&key_skill(hash));
+        let payload: PutPayload = Bytes::copy_from_slice(bytes).into();
+        let opts = PutOptions {
+            mode: PutMode::Create,
+            ..Default::default()
+        };
+        match self.store.put_opts(&path, payload, opts).await {
+            Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => Ok(()),
+            Err(e) => Err(BucketError::Io(e.to_string())),
+        }
+    }
+
+    async fn get_skill(&self, hash: &str, max_bytes: u64) -> Result<Vec<u8>, BucketError> {
+        let path = self.path(&key_skill(hash));
+        let not_found = || BucketError::NotFound(key_skill(hash));
+        let size = match self.store.head(&path).await {
+            Ok(meta) => meta.size,
+            Err(object_store::Error::NotFound { .. }) => return Err(not_found()),
+            Err(e) => return Err(BucketError::Io(e.to_string())),
+        };
+        if size > max_bytes {
+            return Err(BucketError::Io(format!(
+                "skill {hash} exceeds {max_bytes} bytes ({size})"
+            )));
+        }
+        match self.get_bytes(&path).await? {
+            Some(b) if b.len() as u64 <= max_bytes => Ok(b),
+            Some(_) => Err(BucketError::Io(format!(
+                "skill {hash} exceeds {max_bytes} bytes"
+            ))),
+            None => Err(not_found()),
+        }
+    }
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -563,6 +598,24 @@ mod tests {
         );
         // Worker markers are not jobs.
         assert!(b.list_jobs().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn skill_put_is_create_if_absent_and_get_is_capped() {
+        let b = mem_bucket();
+        let hash = "ef".repeat(32);
+        assert!(matches!(
+            b.get_skill(&hash, 100).await,
+            Err(BucketError::NotFound(_))
+        ));
+        b.put_skill(&hash, b"first").await.unwrap();
+        // A second put is Ok and leaves the first object in place.
+        b.put_skill(&hash, b"second").await.unwrap();
+        assert_eq!(b.get_skill(&hash, 5).await.unwrap(), b"first");
+        assert!(matches!(
+            b.get_skill(&hash, 4).await,
+            Err(BucketError::Io(m)) if m.contains("exceeds")
+        ));
     }
 
     #[tokio::test]

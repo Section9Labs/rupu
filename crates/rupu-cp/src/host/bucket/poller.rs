@@ -250,6 +250,12 @@ mod tests {
                 .get_artifact_to_file(sha256, dest, max_bytes)
                 .await
         }
+        async fn put_skill(&self, hash: &str, bytes: &[u8]) -> Result<(), BucketError> {
+            self.inner.put_skill(hash, bytes).await
+        }
+        async fn get_skill(&self, hash: &str, max_bytes: u64) -> Result<Vec<u8>, BucketError> {
+            self.inner.get_skill(hash, max_bytes).await
+        }
     }
 
     /// The node writes its last result object and then the finished marker. A

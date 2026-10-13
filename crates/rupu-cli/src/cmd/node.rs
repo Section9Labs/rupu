@@ -2780,6 +2780,12 @@ mod tests {
             }
             std::fs::write(dest, body).map_err(|e| BucketError::Io(e.to_string()))
         }
+        async fn put_skill(&self, _: &str, _: &[u8]) -> Result<(), BucketError> {
+            unreachable!("the terminal pass never ships skills")
+        }
+        async fn get_skill(&self, _: &str, _: u64) -> Result<Vec<u8>, BucketError> {
+            unreachable!("the terminal pass never reads skills")
+        }
     }
 
     const RUN_JSON: &[u8] = b"{\"status\":\"completed\"}";
@@ -3281,6 +3287,12 @@ mod tests {
             self.inner
                 .get_artifact_to_file(sha256, dest, max_bytes)
                 .await
+        }
+        async fn put_skill(&self, hash: &str, bytes: &[u8]) -> Result<(), BucketError> {
+            self.inner.put_skill(hash, bytes).await
+        }
+        async fn get_skill(&self, hash: &str, max_bytes: u64) -> Result<Vec<u8>, BucketError> {
+            self.inner.get_skill(hash, max_bytes).await
         }
     }
 

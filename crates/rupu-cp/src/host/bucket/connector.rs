@@ -22,13 +22,13 @@ use crate::{
             read_transcript_file, spec_peer_codename, EventByteStream, HostCapabilities,
             HostConnector, HostConnectorError, HostInfo, OperatorMessageRequest, RunListQuery,
         },
-        skill_ship::{self, ShipOutcome, SkillBundle},
+        skill_ship::{self, ShipMemo, ShipOutcome, SkillBundle, Transfer},
     },
     launcher::LaunchRequest,
     node::{
         protocol::{
             RunSpec, RunSpecKind, CAP_AGENT_ENGAGEMENT_PROFILE, CAP_AGENT_FINDINGS_PROFILE,
-            CAP_AGENT_SKILLS,
+            CAP_AGENT_SKILLS, CAP_AGENT_SKILL_BUNDLE,
         },
         NodeMirror,
     },
@@ -51,6 +51,7 @@ pub struct BucketHostConnector {
     mirror: Arc<NodeMirror>,
     run_store: Arc<RunStore>,
     pricing: Arc<crate::customers::CustomerPricing>,
+    ship_memo: ShipMemo,
 }
 
 impl BucketHostConnector {
@@ -68,6 +69,7 @@ impl BucketHostConnector {
             mirror,
             run_store,
             pricing,
+            ship_memo: ShipMemo::default(),
         }
     }
 
@@ -252,8 +254,14 @@ impl HostConnector for BucketHostConnector {
 
     async fn launch_agent(&self, req: AgentLaunchRequest) -> Result<String, HostConnectorError> {
         // Before the mirror run exists, so a refusal leaves nothing behind.
+        // An older worker would drop `RunSpec.skill_bundle` and run the unit
+        // without the skills shipped to it.
         if req.skill_bundle.is_some() {
-            return Err(skill_ship::refuse_bundle_launch(&self.host_id));
+            self.require_worker_capability(
+                CAP_AGENT_SKILL_BUNDLE,
+                "this run's shipped skills cannot be delivered",
+            )
+            .await?;
         }
         if let Some(profile) = req.findings_profile {
             self.require_worker_capability(
@@ -295,7 +303,7 @@ impl HostConnector for BucketHostConnector {
         };
 
         let spec = RunSpec {
-            skill_bundle: None,
+            skill_bundle: req.skill_bundle.clone(),
             kind: RunSpecKind::Agent,
             name: req.agent.clone(),
             inputs: std::collections::BTreeMap::new(),
@@ -330,11 +338,33 @@ impl HostConnector for BucketHostConnector {
     }
 
     async fn ship_skills(&self, bundle: &SkillBundle) -> Result<ShipOutcome, HostConnectorError> {
-        Ok(if bundle.is_empty() {
-            ShipOutcome::NotNeeded
-        } else {
-            skill_ship::not_built(&self.host_id)
+        if bundle.is_empty() {
+            return Ok(ShipOutcome::NotNeeded);
+        }
+        // Checked before `ship_through`, so the downgrade is never memoised:
+        // a worker that upgrades later is picked up by the next unit.
+        if let Err(HostConnectorError::Unsupported(m)) = self
+            .require_worker_capability(CAP_AGENT_SKILL_BUNDLE, "shipped skills")
+            .await
+        {
+            return Ok(ShipOutcome::Unsupported(m));
+        }
+        let who = self.host_id.clone();
+        skill_ship::ship_through(&self.ship_memo, bundle, &who, |pending| async move {
+            for p in &pending {
+                self.bucket
+                    .put_skill(&p.hash.hex(), &p.bytes)
+                    .await
+                    .map_err(|e| {
+                        HostConnectorError::Unreachable(format!(
+                            "host {}: shipping skill {}: {e}",
+                            self.host_id, p.name
+                        ))
+                    })?;
+            }
+            Ok(Transfer::Done)
         })
+        .await
     }
 
     async fn start_session(&self, _req: SessionStartRequest) -> Result<String, HostConnectorError> {
@@ -759,24 +789,169 @@ mod tests {
         assert!(run_store.list().unwrap().is_empty());
     }
 
-    /// A bucket can't deliver shipped skills yet: `ship_skills` says so, and
-    /// a launch that carries a bundle anyway is refused, not run without it.
-    #[tokio::test]
-    async fn shipped_skills_are_unsupported_and_a_bundle_launch_is_refused() {
-        let (conn, run_store, bucket, tmp) = make_conn();
-        let skill = tmp.path().join("pdf");
+    fn one_skill_bundle(tmp: &std::path::Path) -> SkillBundle {
+        let skill = tmp.join("pdf");
         std::fs::create_dir_all(&skill).unwrap();
         std::fs::write(
             skill.join("SKILL.md"),
             "---\nname: pdf\ndescription: PDFs.\n---\n\nBody.\n",
         )
         .unwrap();
-        let bundle = SkillBundle::new(vec![Arc::new(
+        SkillBundle::new(vec![Arc::new(
             rupu_skills::load_skill(&skill, rupu_skills::Layer::Global).unwrap(),
-        )]);
+        )])
+    }
+
+    /// Workers that advertise `agent.skill_bundle`: each skill lands at
+    /// `skills/<hash>.tar`, a second ship puts nothing, and the manifest the
+    /// launch carries reaches the job's `RunSpec`.
+    #[tokio::test]
+    async fn skills_are_shipped_once_and_the_bundle_rides_the_job() {
+        let (conn, _run_store, bucket, tmp) = make_conn();
+        put_worker(&bucket, "w1", &[CAP_AGENT_SKILL_BUNDLE]).await;
+        let bundle = one_skill_bundle(tmp.path());
+        let packed = bundle.pack().unwrap();
+        let hash = packed[0].hash.hex();
+
+        let manifest = match conn.ship_skills(&bundle).await.unwrap() {
+            ShipOutcome::Shipped(m) => m,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            bucket.get_skill(&hash, u64::MAX).await.unwrap(),
+            packed[0].bytes
+        );
+
+        assert_eq!(super::super::key_skill(&hash), format!("skills/{hash}.tar"));
         assert!(matches!(
             conn.ship_skills(&bundle).await.unwrap(),
-            ShipOutcome::Unsupported(m) if m.contains("host_bucket_1")
+            ShipOutcome::Shipped(m) if m == manifest
+        ));
+
+        let mut req = profile_req(None);
+        req.skill_bundle = Some(manifest.clone());
+        let run_id = conn.launch_agent(req).await.unwrap();
+        let job: RunSpec = serde_json::from_slice(&bucket.get_job(&run_id).await.unwrap()).unwrap();
+        assert_eq!(job.skill_bundle, Some(manifest));
+    }
+
+    /// A second ship puts nothing: a bucket that counts `put_skill` calls.
+    #[tokio::test]
+    async fn a_second_ship_puts_nothing() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counting {
+            inner: ObjectStoreBucket,
+            puts: AtomicUsize,
+        }
+        // Only the methods the connector touches on this path are forwarded.
+        #[async_trait::async_trait]
+        impl Bucket for Counting {
+            async fn put_job(&self, r: &str, b: &[u8]) -> Result<(), BucketError> {
+                self.inner.put_job(r, b).await
+            }
+            async fn list_jobs(&self) -> Result<Vec<String>, BucketError> {
+                self.inner.list_jobs().await
+            }
+            async fn claim_job(&self, r: &str, w: &str) -> Result<bool, BucketError> {
+                self.inner.claim_job(r, w).await
+            }
+            async fn get_job(&self, r: &str) -> Result<Vec<u8>, BucketError> {
+                self.inner.get_job(r).await
+            }
+            async fn put_control(&self, r: &str, s: u64, b: &[u8]) -> Result<(), BucketError> {
+                self.inner.put_control(r, s, b).await
+            }
+            async fn list_control(&self, r: &str) -> Result<Vec<(u64, Vec<u8>)>, BucketError> {
+                self.inner.list_control(r).await
+            }
+            async fn put_result(&self, r: &str, k: &str, b: &[u8]) -> Result<(), BucketError> {
+                self.inner.put_result(r, k, b).await
+            }
+            async fn list_results(&self, r: &str) -> Result<Vec<(String, Vec<u8>)>, BucketError> {
+                self.inner.list_results(r).await
+            }
+            async fn put_finished(&self, r: &str, s: &str) -> Result<(), BucketError> {
+                self.inner.put_finished(r, s).await
+            }
+            async fn get_finished(&self, r: &str) -> Result<Option<String>, BucketError> {
+                self.inner.get_finished(r).await
+            }
+            async fn probe(&self) -> Result<(), BucketError> {
+                self.inner.probe().await
+            }
+            async fn put_worker_info(&self, i: &str, b: &[u8]) -> Result<(), BucketError> {
+                self.inner.put_worker_info(i, b).await
+            }
+            async fn list_worker_info(&self) -> Result<Vec<Vec<u8>>, BucketError> {
+                self.inner.list_worker_info().await
+            }
+            async fn artifact_exists(&self, s: &str) -> Result<bool, BucketError> {
+                self.inner.artifact_exists(s).await
+            }
+            async fn put_artifact_file(
+                &self,
+                s: &str,
+                p: &std::path::Path,
+            ) -> Result<(), BucketError> {
+                self.inner.put_artifact_file(s, p).await
+            }
+            async fn get_artifact_to_file(
+                &self,
+                s: &str,
+                d: &std::path::Path,
+                m: u64,
+            ) -> Result<(), BucketError> {
+                self.inner.get_artifact_to_file(s, d, m).await
+            }
+            async fn put_skill(&self, h: &str, b: &[u8]) -> Result<(), BucketError> {
+                self.puts.fetch_add(1, Ordering::SeqCst);
+                self.inner.put_skill(h, b).await
+            }
+            async fn get_skill(&self, h: &str, m: u64) -> Result<Vec<u8>, BucketError> {
+                self.inner.get_skill(h, m).await
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let run_store = Arc::new(RunStore::new(tmp.path().join("runs")));
+        let mirror = Arc::new(NodeMirror::new(Arc::clone(&run_store)));
+        let counting = Arc::new(Counting {
+            inner: ObjectStoreBucket::new(Arc::new(InMemory::new()), "t/h"),
+            puts: AtomicUsize::new(0),
+        });
+        let bucket: Arc<dyn Bucket> = counting.clone();
+        let conn = BucketHostConnector::new(
+            "h",
+            Arc::clone(&bucket),
+            mirror,
+            run_store,
+            Arc::new(crate::customers::CustomerPricing::flat(
+                rupu_config::PricingConfig::default(),
+            )),
+        );
+        put_worker(&bucket, "w1", &[CAP_AGENT_SKILL_BUNDLE]).await;
+        let bundle = one_skill_bundle(tmp.path());
+        conn.ship_skills(&bundle).await.unwrap();
+        assert_eq!(counting.puts.load(Ordering::SeqCst), 1);
+        conn.ship_skills(&bundle).await.unwrap();
+        assert_eq!(counting.puts.load(Ordering::SeqCst), 1, "memoised");
+    }
+
+    /// A pool with a worker lacking the capability: a visible downgrade,
+    /// nothing put, nothing memoised (a later upgrade is honoured), and a
+    /// launch carrying a bundle is refused before any job or mirror run.
+    #[tokio::test]
+    async fn an_incapable_pool_downgrades_and_refuses_a_bundle_launch() {
+        let (conn, run_store, bucket, tmp) = make_conn();
+        put_worker(&bucket, "old", &[]).await;
+        let bundle = one_skill_bundle(tmp.path());
+        let hash = bundle.pack().unwrap()[0].hash.hex();
+        assert!(matches!(
+            conn.ship_skills(&bundle).await.unwrap(),
+            ShipOutcome::Unsupported(m) if m.contains("host_bucket_1") && m.contains("old")
+        ));
+        assert!(matches!(
+            bucket.get_skill(&hash, u64::MAX).await,
+            Err(BucketError::NotFound(_))
         ));
 
         let mut req = profile_req(None);
@@ -786,12 +961,18 @@ mod tests {
         });
         let err = conn.launch_agent(req).await.unwrap_err();
         assert!(
-            matches!(&err, HostConnectorError::Unsupported(m)
-                if m.starts_with("host host_bucket_1: ") && m.contains("skill_bundle")),
+            matches!(&err, HostConnectorError::Unsupported(m) if m.contains("skills")),
             "{err:?}"
         );
         assert!(bucket.list_jobs().await.unwrap().is_empty());
         assert!(run_store.list().unwrap().is_empty());
+
+        // The pool upgrades: the next ship goes through.
+        put_worker(&bucket, "old", &[CAP_AGENT_SKILL_BUNDLE]).await;
+        assert!(matches!(
+            conn.ship_skills(&bundle).await.unwrap(),
+            ShipOutcome::Shipped(_)
+        ));
     }
 
     #[tokio::test]
@@ -1135,6 +1316,12 @@ mod tests {
             _max_bytes: u64,
         ) -> Result<(), BucketError> {
             unimplemented!("FailingBucket::get_artifact_to_file")
+        }
+        async fn put_skill(&self, _hash: &str, _bytes: &[u8]) -> Result<(), BucketError> {
+            unimplemented!("FailingBucket::put_skill")
+        }
+        async fn get_skill(&self, _hash: &str, _max_bytes: u64) -> Result<Vec<u8>, BucketError> {
+            unimplemented!("FailingBucket::get_skill")
         }
     }
 
