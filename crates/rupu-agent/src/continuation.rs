@@ -31,6 +31,8 @@ pub enum Continuation {
         /// The outcome the run failed on, when it is a failed run resumed by
         /// [`prepare_recovery_continuation`]; `None` for an interruption.
         stopped_on: Option<OutcomeRecord>,
+        /// The skills the conversation had loaded ([`crate::replay::loaded_skills`]).
+        loaded_skills: Vec<crate::LoadedSkill>,
     },
     /// The run ended in failure — not an interruption. Start fresh.
     /// `seeded_from` is the transcript it was seeded from, when it was itself
@@ -164,6 +166,7 @@ fn prepare(transcript: &Path, recovery: bool) -> Result<Continuation, Continuati
             messages,
             seed_source: transcript.to_path_buf(),
             stopped_on,
+            loaded_skills: crate::replay::loaded_skills(&events),
         }),
     }
 }
@@ -197,15 +200,29 @@ fn final_assistant_text(events: &[Event]) -> String {
 ///
 /// [`UserTurn`]: crate::runner::UserTurn
 pub trait ContinuationTarget {
-    /// Seed with `messages` by reference to `seed_source`, and send `note`.
-    fn seed_continuation(&mut self, messages: Vec<Message>, seed_source: PathBuf, note: String);
+    /// Seed with `messages` by reference to `seed_source`, carrying the
+    /// skills the conversation had loaded, and send `note`.
+    fn seed_continuation(
+        &mut self,
+        messages: Vec<Message>,
+        seed_source: PathBuf,
+        loaded_skills: Vec<crate::LoadedSkill>,
+        note: String,
+    );
 }
 
 impl ContinuationTarget for crate::runner::UserTurn {
-    fn seed_continuation(&mut self, messages: Vec<Message>, seed_source: PathBuf, note: String) {
+    fn seed_continuation(
+        &mut self,
+        messages: Vec<Message>,
+        seed_source: PathBuf,
+        loaded_skills: Vec<crate::LoadedSkill>,
+        note: String,
+    ) {
         self.message = note;
         self.initial_messages = messages;
         self.seed_source = Some(seed_source);
+        self.loaded_skills = loaded_skills;
     }
 }
 
@@ -223,13 +240,14 @@ pub fn apply_continuation(
     target: &mut impl ContinuationTarget,
     messages: Vec<Message>,
     seed_source: PathBuf,
+    loaded_skills: Vec<crate::LoadedSkill>,
 ) {
     let note = if ends_with_note(&messages) {
         String::new()
     } else {
         CONTINUATION_NOTE.to_string()
     };
-    apply_continuation_with(target, messages, seed_source, note);
+    apply_continuation_with(target, messages, seed_source, loaded_skills, note);
 }
 
 /// [`apply_continuation`] with the caller's `note` as the user message —
@@ -239,9 +257,10 @@ pub fn apply_continuation_with(
     target: &mut impl ContinuationTarget,
     messages: Vec<Message>,
     seed_source: PathBuf,
+    loaded_skills: Vec<crate::LoadedSkill>,
     note: String,
 ) {
-    target.seed_continuation(messages, seed_source, note);
+    target.seed_continuation(messages, seed_source, loaded_skills, note);
 }
 
 /// Does `messages` already end in a user turn carrying [`CONTINUATION_NOTE`]?
@@ -619,7 +638,7 @@ mod tests {
         let captured = provider.captured.clone();
         let mut opts = opts_for(Box::new(provider), tmp.path(), second.clone());
         opts.prompt.message = "this must be replaced".into();
-        apply_continuation(&mut opts.prompt, messages, seed_source);
+        apply_continuation(&mut opts.prompt, messages, seed_source, Vec::new());
         assert_eq!(opts.prompt.message, CONTINUATION_NOTE);
         run_agent(opts).await.unwrap();
 
@@ -686,7 +705,7 @@ mod tests {
         opts.tool_context.identity_mut().run_id = "run_second".into();
         opts.concerns = Some(stride_concerns());
         let mut opts = crate::grant::with_grant(opts, None, &[]).expect("grant");
-        apply_continuation(&mut opts.prompt, messages, seed_source);
+        apply_continuation(&mut opts.prompt, messages, seed_source, Vec::new());
         run_agent(opts).await.unwrap();
 
         let paths = rupu_coverage::CoveragePaths::new(
@@ -726,7 +745,7 @@ mod tests {
         let captured = provider.captured.clone();
         let dir = dest.parent().unwrap();
         let mut opts = opts_for(Box::new(provider), dir, dest.to_path_buf());
-        apply_continuation(&mut opts.prompt, messages, seed_source);
+        apply_continuation(&mut opts.prompt, messages, seed_source, Vec::new());
         run_agent(opts).await.unwrap();
         let sent = captured.lock().unwrap()[0].messages.clone();
         sent
@@ -805,6 +824,7 @@ mod tests {
             &mut opts.prompt,
             messages.clone(),
             PathBuf::from("/t/b.jsonl"),
+            Vec::new(),
         );
         assert_eq!(opts.prompt.message, "");
         assert_eq!(
@@ -881,6 +901,7 @@ mod tests {
                 messages,
                 seed_source,
                 stopped_on,
+                ..
             } => {
                 assert_eq!(seed_source, t);
                 assert_eq!(
@@ -971,6 +992,7 @@ mod tests {
             &mut opts.prompt,
             messages.clone(),
             PathBuf::from("/t/a.jsonl"),
+            Vec::new(),
             note.clone(),
         );
         assert_eq!(opts.prompt.message, note);
@@ -995,6 +1017,7 @@ mod tests {
             &mut opts.prompt,
             vec![Message::user("first")],
             PathBuf::from("/t/a.jsonl"),
+            Vec::new(),
             "A previous attempt at this task stopped early; carry on".into(),
         );
         assert_eq!(continued_from(&opts.prompt), None);

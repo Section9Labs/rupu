@@ -20,6 +20,7 @@ use rupu_providers::reply_error::ApiErrorBody;
 use rupu_providers::types::{
     ContentBlock, LlmRequest, LlmResponse, Message, Role, Stop, StopReason, StreamEvent, Usage,
 };
+use rupu_skills::render::REATTACH_MARKER;
 use rupu_tools::{
     AliasScope, AllowAlways, Decision, DenyReason, DerivedEvent, PermissionMode, PermissionPolicy,
     ResolvedGrant, RunIdentity, Service, Surface, Tool, ToolContext,
@@ -492,16 +493,17 @@ self-contained.";
         });
     }
 
-    // Extract task text from messages[0].
+    // Extract task text from messages[0]. A block of re-attached skills is
+    // not task text: the next re-attach puts the skills back, once (spec
+    // 2026-10-12 §6).
     let task_text: String = messages[0]
         .content
         .iter()
-        .filter_map(|b| {
-            if let ContentBlock::Text { text } = b {
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } if !text.starts_with(REATTACH_MARKER) => {
                 Some(text.as_str())
-            } else {
-                None
             }
+            _ => None,
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -576,6 +578,7 @@ async fn compact_context(
             let middle_len = outcome.summarized_messages;
             record_compaction_usage(opts, writer, &outcome.usage);
             *messages = outcome.messages;
+            let reattached = reattach_skills(messages, opts);
             let post = serde_json::to_value(&*messages).unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "failed to serialize post-compaction messages");
                 serde_json::Value::Null
@@ -590,6 +593,11 @@ async fn compact_context(
                 .and_then(|_| writer.flush())
             {
                 tracing::warn!(error = %e, "failed to write compaction event to transcript");
+            }
+            for event in &reattached {
+                if let Err(e) = writer.write(event) {
+                    tracing::warn!(error = %e, "failed to write a skill re-attach event");
+                }
             }
             tracing::info!(
                 middle_len,
@@ -615,6 +623,106 @@ async fn compact_context(
             false
         }
     }
+}
+
+/// Spec 2026-10-12 §6: put the run's loaded skills back into the rebuilt
+/// first message after compaction summarised them away, read at their
+/// current version, most recently loaded first, capped at a quarter of the
+/// input limit (in characters, at ~4 per token: the token count itself; 32
+/// KiB when the limit is unknown). Returns the events that record it, for
+/// after the `Compaction` event: a `skill_load { via: reattach }` per
+/// re-attached skill (in load order, so a replay folds the loaded set into
+/// this one's order), and the `skill_changed` / `skill_missing` /
+/// `skill_reattach_truncated` notices. A missing skill stays in the loaded
+/// set: reinstalled, it comes back at the next compaction.
+fn reattach_skills(messages: &mut [Message], run: &mut Run) -> Vec<Event> {
+    let Some(skills) = run.tool_context.services.skills.clone() else {
+        return Vec::new();
+    };
+    if run.loaded_skills.is_empty() || messages.is_empty() {
+        return Vec::new();
+    }
+    let cap = run.limits.input.tokens.map_or(32 * 1024, |t| t as usize);
+    let mut fresh = Vec::new();
+    let mut omitted = Vec::new();
+    let mut missing = Vec::new();
+    let mut used = 0usize;
+    for (at, loaded) in run.loaded_skills.iter().enumerate().rev() {
+        // As `skills.load` reads it: from where the run found it, refused
+        // when it moved (its files are outside the run's read roots).
+        let current = skills.get(&loaded.name).and_then(|g| {
+            let skill = rupu_skills::load_skill(&g.skill.dir, g.skill.layer).ok()?;
+            let hash = skill.content_hash().ok()?;
+            (skill.root == g.skill.root).then_some((skill, hash))
+        });
+        let Some((skill, hash)) = current else {
+            missing.push(loaded.name.clone());
+            continue;
+        };
+        if used + skill.body.len() > cap {
+            omitted.push(loaded.name.clone());
+            continue;
+        }
+        used += skill.body.len();
+        fresh.push((at, skill, hash));
+    }
+    let items: Vec<rupu_skills::render::ReattachItem<'_>> = fresh
+        .iter()
+        .map(|(_, s, _)| rupu_skills::render::ReattachItem {
+            name: s.name.as_str(),
+            base_dir: &s.root,
+            body: &s.body,
+        })
+        .collect();
+    let omitted_ref: Vec<&str> = omitted.iter().map(String::as_str).collect();
+    let missing_ref: Vec<&str> = missing.iter().map(String::as_str).collect();
+    let block = rupu_skills::render::render_reattach(&items, &omitted_ref, &missing_ref);
+    messages[0].content.push(ContentBlock::Text { text: block });
+
+    let mut events = Vec::new();
+    fresh.sort_by_key(|(at, ..)| *at);
+    for (_, skill, hash) in fresh {
+        let name = skill.name.as_str().to_owned();
+        let hash = hash.hex();
+        if run
+            .loaded_skills
+            .iter()
+            .any(|l| l.name == name && l.content_hash != hash)
+        {
+            events.push(Event::Notice {
+                kind: "skill_changed".into(),
+                message: format!(
+                    "skill {name} changed on disk since it was loaded; its current version was \
+                     re-attached"
+                ),
+            });
+        }
+        events.push(Event::SkillLoad {
+            name: name.clone(),
+            layer: skill.layer.as_str().to_owned(),
+            content_hash: hash.clone(),
+            base_dir: skill.root.display().to_string(),
+            via: "reattach".into(),
+        });
+        run.loaded_skills.retain(|l| l.name != name);
+        run.loaded_skills.push(LoadedSkill {
+            name,
+            content_hash: hash,
+        });
+    }
+    for name in &missing {
+        events.push(Event::Notice {
+            kind: "skill_missing".into(),
+            message: format!("skill {name} is no longer installed and was not re-attached"),
+        });
+    }
+    if !omitted.is_empty() {
+        events.push(Event::Notice {
+            kind: "skill_reattach_truncated".into(),
+            message: format!("not re-attached for space: {}", omitted.join(", ")),
+        });
+    }
+    events
 }
 
 /// Record a compaction summariser call's usage. The call is billed like any
@@ -1448,6 +1556,10 @@ pub struct UserTurn {
     pub seed_source: Option<PathBuf>,
     /// Absolute turn index for the first turn in this run.
     pub turn_index_offset: u32,
+    /// The skills the conversation this run continues had loaded (spec
+    /// 2026-10-12 §6): the run starts with them as its loaded set, so its
+    /// compactions re-attach them.
+    pub loaded_skills: Vec<LoadedSkill>,
 }
 
 impl UserTurn {
@@ -1661,6 +1773,7 @@ impl Run {
         // A child run a tool call starts asks the run's own operator.
         tool_context.services.prompter = permission.prompter().cloned();
         let id = Arc::clone(&tool_context.identity);
+        let loaded_skills = prompt.loaded_skills.clone();
         Self {
             provider_name: id.provider.clone(),
             model: id.model.clone(),
@@ -1683,7 +1796,7 @@ impl Run {
             collectors,
             extra_tools,
             transcript_path,
-            loaded_skills: Vec::new(),
+            loaded_skills,
         }
     }
 
@@ -1870,6 +1983,10 @@ pub struct RunExit {
     pub result: Result<RunResult, RunError>,
     pub final_limits: rupu_providers::model_limits::ModelLimits,
     pub messages: Vec<Message>,
+    /// The skills loaded into the conversation as the run ended, most
+    /// recently loaded last: what a run that carries `messages` on (an
+    /// agentiflow lead's next round) starts with.
+    pub loaded_skills: Vec<LoadedSkill>,
 }
 
 /// [`run_agent_with_limits`], plus the run's final conversation.
@@ -1881,6 +1998,7 @@ pub async fn run_agent_full(opts: AgentRunOpts) -> RunExit {
         result,
         final_limits: opts.limits.clone(),
         messages,
+        loaded_skills: opts.loaded_skills.clone(),
     }
 }
 
@@ -2062,6 +2180,11 @@ async fn run_agent_inner(
     if let Some(skills) = &opts.tool_context.services.skills {
         write_skill_index(&mut writer, skills)?;
     }
+    seed_loaded_skills(
+        &mut writer,
+        opts.tool_context.services.skills.as_deref(),
+        &mut opts.loaded_skills,
+    )?;
     writer.flush()?;
 
     // Wire coverage into tool context. Attribution needs nothing here: the
@@ -3546,6 +3669,43 @@ fn write_skill_index(
                     g.name()
                 ),
             })?;
+        }
+    }
+    Ok(())
+}
+
+/// A continued run's loaded set (spec 2026-10-12 §6): each skill the run it
+/// continues had loaded that this run grants is recorded as loaded
+/// (`via: continuation`, at the version the conversation holds), so every
+/// transcript carries its own set; one it no longer grants is dropped with
+/// a notice. A skill this run preloads is dropped quietly: its body is in
+/// the system prompt.
+fn seed_loaded_skills(
+    writer: &mut JsonlWriter,
+    skills: Option<&rupu_skills::ResolvedSkills>,
+    loaded: &mut Vec<LoadedSkill>,
+) -> Result<(), RunError> {
+    for seeded in std::mem::take(loaded) {
+        match skills.and_then(|s| s.get(&seeded.name)) {
+            Some(g) if g.preload => {}
+            Some(g) => {
+                writer.write(&Event::SkillLoad {
+                    name: seeded.name.clone(),
+                    layer: g.skill.layer.as_str().to_owned(),
+                    content_hash: seeded.content_hash.clone(),
+                    base_dir: g.skill.root.display().to_string(),
+                    via: "continuation".into(),
+                })?;
+                loaded.push(seeded);
+            }
+            None => writer.write(&Event::Notice {
+                kind: "skill_missing".into(),
+                message: format!(
+                    "skill {} was loaded by the run this one continues but is not granted to \
+                     this run; it is not re-attached",
+                    seeded.name
+                ),
+            })?,
         }
     }
     Ok(())
@@ -5997,6 +6157,7 @@ mod pause_tests {
                     initial_messages,
                     seed_source: None,
                     turn_index_offset: 0,
+                    loaded_skills: Vec::new(),
                 },
                 provider,
                 limits: rupu_providers::model_limits::ModelLimits::unknown(),

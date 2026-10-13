@@ -8116,6 +8116,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
                 initial_messages: session.message_history.clone(),
                 seed_source,
                 turn_index_offset: session.total_turns,
+                loaded_skills: Vec::new(),
             },
             workspace,
             mode,
@@ -8149,6 +8150,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             result: outcome,
             final_limits,
             messages: exit_messages,
+            ..
         } = match assembler.assemble(launch).await {
             Ok(run) => run.run().await,
             Err(e) => rupu_agent::RunExit {
@@ -8158,6 +8160,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
                     .clone()
                     .unwrap_or_else(rupu_providers::model_limits::ModelLimits::unknown),
                 messages: Vec::new(),
+                loaded_skills: Vec::new(),
             },
         };
         // The turn's cached tokens: the provider-reported total summed over

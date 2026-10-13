@@ -8079,6 +8079,7 @@ async fn run_linear_step(
             messages,
             user_message,
             seed_source: None,
+            loaded_skills: Vec::new(),
         });
     let mut resumption = match plan.and_then(AttemptResumePlan::of) {
         Some(p) => Some(resolve_attempt_resumption(p, step.host.as_deref()).await),
@@ -9987,6 +9988,9 @@ struct ContinuationSeed {
     /// continues it *by reference* (`rupu_agent::continuation`). `None` for a
     /// plain seed.
     seed_source: Option<PathBuf>,
+    /// The skills the interrupted conversation had loaded; empty for a plain
+    /// seed.
+    loaded_skills: Vec<rupu_agent::LoadedSkill>,
 }
 
 impl ContinuationSeed {
@@ -10005,11 +10009,13 @@ impl ContinuationSeed {
             Ok(Continuation::Resume {
                 messages,
                 seed_source,
+                loaded_skills,
                 ..
             }) => Ok(Self {
                 messages,
                 user_message: String::new(),
                 seed_source: Some(seed_source),
+                loaded_skills,
             }),
             Ok(Continuation::Finished { .. }) => {
                 Err("the interrupted attempt finished after the resume was planned".to_string())
@@ -10028,9 +10034,12 @@ impl ContinuationSeed {
             // Picking up an interrupted run by reference: `apply_continuation`
             // owns the note that goes on top of the conversation, including
             // not stacking a second one onto a continuation that died early.
-            Some(source) => {
-                rupu_agent::continuation::apply_continuation(prompt, self.messages, source)
-            }
+            Some(source) => rupu_agent::continuation::apply_continuation(
+                prompt,
+                self.messages,
+                source,
+                self.loaded_skills,
+            ),
             None => {
                 prompt.initial_messages = self.messages;
                 prompt.message = self.user_message;

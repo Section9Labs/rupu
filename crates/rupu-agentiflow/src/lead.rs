@@ -428,6 +428,9 @@ pub struct RunAgentLeadDriver {
     provider: LeadProvider,
     rt: tokio::runtime::Runtime,
     history: Vec<Message>,
+    /// The skills loaded into `history` (its latest round's), carried into
+    /// the next round so its compactions re-attach them.
+    loaded_skills: Vec<rupu_agent::LoadedSkill>,
     total_turns: u32,
     limits: ModelLimits,
     /// The running round's pause token (`None` between rounds), shared with
@@ -464,6 +467,7 @@ impl RunAgentLeadDriver {
             provider,
             rt,
             history: Vec::new(),
+            loaded_skills: Vec::new(),
             total_turns: 0,
             limits,
             round_token,
@@ -624,6 +628,7 @@ impl RunAgentLeadDriver {
                 initial_messages: self.history.clone(),
                 seed_source: None,
                 turn_index_offset: self.total_turns,
+                loaded_skills: self.loaded_skills.clone(),
             },
             workspace: self.cfg.workspace.clone(),
             // Unattended; the grant is the gate (see the type's docs).
@@ -665,6 +670,7 @@ impl LeadDriver for RunAgentLeadDriver {
             result,
             final_limits,
             messages,
+            loaded_skills,
         } = {
             // Armed only for the run itself: the slot is cleared again before
             // the result is looked at, and on unwind.
@@ -680,6 +686,7 @@ impl LeadDriver for RunAgentLeadDriver {
                         result: Err(e.into_run_error()),
                         final_limits: limits,
                         messages: Vec::new(),
+                        loaded_skills: Vec::new(),
                     },
                 }
             })
@@ -717,6 +724,7 @@ impl LeadDriver for RunAgentLeadDriver {
                 // an errored-but-completed run still holds the round's work.
                 self.total_turns = self.total_turns.saturating_add(run.turns);
                 self.history = run.final_messages;
+                self.loaded_skills = loaded_skills;
                 outcome
             }
             Err(e) => {
@@ -727,6 +735,7 @@ impl LeadDriver for RunAgentLeadDriver {
                 // everything.
                 if !messages.is_empty() {
                     self.history = messages;
+                    self.loaded_skills = loaded_skills;
                 }
                 RoundOutcome::Error(e.to_string())
             }
@@ -1031,6 +1040,110 @@ mod tests {
         ms.iter()
             .map(|m| serde_json::to_value(m).unwrap())
             .collect()
+    }
+
+    /// A tool call billed at `input` tokens; over the fixture's 500-token
+    /// threshold it compacts the conversation before the next request.
+    fn tool_turn(id: &str, name: &str, input: serde_json::Value, tokens: u32) -> ScriptedTurn {
+        ScriptedTurn::AssistantBlocksWithUsage {
+            content: vec![ContentBlock::ToolUse {
+                id: id.into(),
+                name: name.into(),
+                input,
+            }],
+            stop: rupu_agent::StopReason::ToolUse,
+            usage: rupu_providers::types::Usage {
+                input_tokens: tokens,
+                output_tokens: 1,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// `via:name` of every `skill_load`, and each compaction, in a round's
+    /// transcript.
+    fn skill_timeline(path: &std::path::Path) -> Vec<String> {
+        rupu_transcript::JsonlReader::iter(path)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| match e {
+                rupu_transcript::Event::SkillLoad { name, via, .. } => {
+                    Some(format!("{via}:{name}"))
+                }
+                rupu_transcript::Event::Compaction { .. } => Some("compaction".into()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A skill the lead loaded in round 0 stays loaded across rounds: each
+    /// round starts with it (and records it), and a compaction in a later
+    /// round re-attaches it (spec 2026-10-12 §6).
+    #[test]
+    fn a_skill_loaded_in_one_round_is_reattached_in_a_later_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill = dir.path().join("home/skills/pdf");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: pdf\ndescription: PDF things.\n---\nPDF STEPS\n",
+        )
+        .unwrap();
+        let mut cfg = lead_cfg(dir.path(), 5);
+        cfg.agent = lead_agent("skills: [pdf]\n");
+        cfg.limits = rupu_providers::model_limits::ModelLimits::unknown()
+            .with_input(1000)
+            .with_percent(50);
+        let summary = ScriptedTurn::AssistantText {
+            text: "SUMMARY".into(),
+            stop: rupu_agent::StopReason::EndTurn,
+            input_tokens: 1,
+            output_tokens: 1,
+        };
+        let make = scripted_factory(vec![
+            vec![
+                tool_turn(
+                    "c1",
+                    "skills.load",
+                    serde_json::json!({ "name": "pdf" }),
+                    10,
+                ),
+                text_turn("Loaded."),
+            ],
+            vec![text_turn("Round one done.")],
+            vec![
+                tool_turn("c2", "read_file", serde_json::json!({ "path": "x" }), 900),
+                summary,
+                text_turn("Round two done."),
+            ],
+        ]);
+        let mut d = new_driver(cfg, make).unwrap();
+        for n in 0..3 {
+            assert_eq!(d.run_round(&round(n)), RoundOutcome::Yielded, "round {n}");
+        }
+        assert_eq!(
+            d.loaded_skills
+                .iter()
+                .map(|l| l.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pdf"]
+        );
+        assert_eq!(
+            skill_timeline(&dir.path().join("lead.r0.jsonl")),
+            vec!["model:pdf"]
+        );
+        assert_eq!(
+            skill_timeline(&dir.path().join("lead.r1.jsonl")),
+            vec!["continuation:pdf"]
+        );
+        assert_eq!(
+            skill_timeline(&dir.path().join("lead.r2.jsonl")),
+            vec!["continuation:pdf", "compaction", "reattach:pdf"]
+        );
+        assert!(
+            text_of(&d.history[0]).contains("PDF STEPS"),
+            "the re-attached body is in the compacted first message"
+        );
     }
 
     #[test]

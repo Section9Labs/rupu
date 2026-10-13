@@ -30,6 +30,7 @@ mod runner_model_limits;
 mod runner_outcomes;
 mod runner_tools_in_request;
 mod runner_usage_hook;
+mod skills_compaction;
 mod spec;
 mod spec_auth_field;
 mod tool_grant;
