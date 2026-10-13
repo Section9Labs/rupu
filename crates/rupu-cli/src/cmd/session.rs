@@ -10451,6 +10451,7 @@ mod tests {
                 preload: true,
                 indexed: false,
                 reason: "agent".into(),
+                shipped: false,
             }],
         });
         state.push_transcript_event(&TranscriptEvent::SkillLoad {
@@ -10846,6 +10847,7 @@ mod tests {
                     preload: true,
                     indexed: false,
                     reason: "agent".into(),
+                    shipped: false,
                 }],
             },
             TranscriptEvent::SkillLoad {

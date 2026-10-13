@@ -215,6 +215,10 @@ pub struct UnitOutcome {
     pub workspace_delta: Option<WorkspaceDelta>,
     /// What the unit recorded; see [`UnitCoverage`].
     pub coverage: UnitCoverage,
+    /// What the dispatch downgraded without failing the unit (a host that
+    /// can't take shipped skills runs with its installed copies); each is a
+    /// `StepWarning`.
+    pub warnings: Vec<String>,
 }
 
 /// What a remote unit recorded (spec
@@ -245,6 +249,8 @@ pub enum UnitCoverage {
 pub struct UnitFailure {
     pub error: RunError,
     pub coverage: UnitCoverage,
+    /// As [`UnitOutcome::warnings`]: surfaced even though the unit failed.
+    pub warnings: Vec<String>,
 }
 
 impl From<RunError> for UnitFailure {
@@ -252,6 +258,7 @@ impl From<RunError> for UnitFailure {
         Self {
             error,
             coverage: UnitCoverage::NotLaunched,
+            warnings: Vec::new(),
         }
     }
 }
@@ -7790,6 +7797,35 @@ fn take_coverage(r: &mut Result<UnitOutcome, UnitFailure>) -> UnitCoverage {
     std::mem::replace(slot, UnitCoverage::NotLaunched)
 }
 
+/// Surface what a remote unit's dispatch downgraded ([`UnitOutcome::warnings`])
+/// as `StepWarning`s, on success and failure alike.
+fn emit_unit_warnings(
+    r: &mut Result<UnitOutcome, UnitFailure>,
+    sink: Option<&Arc<dyn crate::executor::EventSink>>,
+    workflow_run_id: &str,
+    step_id: &str,
+    index: Option<usize>,
+) {
+    let warnings = std::mem::take(match r {
+        Ok(o) => &mut o.warnings,
+        Err(f) => &mut f.warnings,
+    });
+    for message in warnings {
+        warn!(step = %step_id, %message, "remote unit");
+        if let Some(sink) = sink {
+            sink.emit(
+                workflow_run_id,
+                &crate::executor::Event::StepWarning {
+                    run_id: workflow_run_id.to_string(),
+                    step_id: step_id.to_string(),
+                    index,
+                    message,
+                },
+            );
+        }
+    }
+}
+
 /// What a warning adds when the unit returned a workspace-sync delta, which
 /// then keeps its own copy of the unit's coverage.
 const SYNCED_COPY_KEPT: &str = "the unit's workspace-sync delta keeps its own copy";
@@ -8034,6 +8070,13 @@ async fn dispatch_placed_step(
         transcript_path.to_path_buf(),
     );
     let mut result = dispatch_unit_unless_terminating(dispatcher.as_ref(), unit, host).await;
+    emit_unit_warnings(
+        &mut result,
+        opts.event_sink.as_ref(),
+        workflow_run_id,
+        &step.id,
+        None,
+    );
     // Merge BEFORE the delta applies: whether a complete stream merged decides
     // whether the delta keeps its `.rupu/coverage/`. Only a success's delta
     // applies here.
@@ -9331,6 +9374,13 @@ async fn run_fanout_step(
                                     &host,
                                 )
                                 .await;
+                                emit_unit_warnings(
+                                    &mut result,
+                                    event_sink.as_ref(),
+                                    &workflow_run_id,
+                                    &step_id,
+                                    Some(idx),
+                                );
                                 // Merged here, before the step applies its
                                 // units' deltas after the join.
                                 let synced_delta = carries_delta(&result);
@@ -9484,6 +9534,13 @@ async fn run_fanout_step(
                                             retry_host,
                                         )
                                         .await;
+                                        emit_unit_warnings(
+                                            &mut retry_result,
+                                            event_sink.as_ref(),
+                                            &workflow_run_id,
+                                            &step_id,
+                                            Some(idx),
+                                        );
                                         let retry_synced_delta = carries_delta(&retry_result);
                                         let retry_stream_whole = ingest_remote_unit_coverage(
                                             &workspace_path,
@@ -11588,6 +11645,7 @@ mod tests {
                 return Err(RunError::Provider("host down".into()).into());
             }
             Ok(UnitOutcome {
+                warnings: Vec::new(),
                 output: format!("out-{}-on-{host}", unit.index),
                 success: true,
                 error: None,
@@ -11783,6 +11841,7 @@ steps:
                 return Err(RunError::Provider("host down".into()).into());
             }
             Ok(UnitOutcome {
+                warnings: Vec::new(),
                 output: format!("out-{}-on-{host}", unit.index),
                 success: true,
                 error: None,
@@ -12256,6 +12315,7 @@ steps:
             _host: &str,
         ) -> Result<UnitOutcome, UnitFailure> {
             Ok(UnitOutcome {
+                warnings: Vec::new(),
                 output: String::new(),
                 success: false,
                 error: Some("boom".into()),
@@ -12425,6 +12485,7 @@ steps:
                 .unwrap()
                 .push(unit.workspace.is_some());
             Ok(UnitOutcome {
+                warnings: Vec::new(),
                 output: format!("out-{}", unit.index),
                 success: true,
                 error: None,
@@ -13029,6 +13090,7 @@ steps:
                 self.token.cancel();
             }
             Ok(UnitOutcome {
+                warnings: Vec::new(),
                 output: format!("out-{}-on-{host}", unit.index),
                 success: true,
                 error: None,
@@ -19113,6 +19175,7 @@ steps:
             let is_first = self.calls.lock().unwrap().is_empty();
             self.calls.lock().unwrap().push(unit.index);
             let outcome = UnitOutcome {
+                warnings: Vec::new(),
                 output: format!("out-{}", unit.index),
                 success: true,
                 error: None,
@@ -19148,6 +19211,7 @@ steps:
         ) -> Result<UnitOutcome, UnitFailure> {
             self.calls.lock().unwrap().push(unit.index);
             Ok(UnitOutcome {
+                warnings: Vec::new(),
                 output: format!("out-{}", unit.index),
                 success: true,
                 error: None,
@@ -19818,6 +19882,7 @@ mod manual_pause_drain {
                 tokio::time::sleep(*delay).await;
             }
             Ok(UnitOutcome {
+                warnings: Vec::new(),
                 output: format!("out-{}", unit.step_id),
                 success: true,
                 error: None,

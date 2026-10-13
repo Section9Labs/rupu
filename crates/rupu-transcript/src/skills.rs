@@ -4,14 +4,25 @@
 use crate::event::SkillIndexEntry;
 
 /// One line for a `skill_index`: how many skills the run bound, each marked
-/// preloaded or not indexed when it is either.
+/// preloaded, not indexed or shipped when it is any of them.
 pub fn skill_index_line(entries: &[SkillIndexEntry]) -> String {
     let names: Vec<String> = entries
         .iter()
-        .map(|e| match (e.preload, e.indexed) {
-            (true, _) => format!("{} (preloaded)", e.name),
-            (false, true) => e.name.clone(),
-            (false, false) => format!("{} (not indexed)", e.name),
+        .map(|e| {
+            let mut tags = Vec::new();
+            if e.preload {
+                tags.push("preloaded");
+            } else if !e.indexed {
+                tags.push("not indexed");
+            }
+            if e.shipped {
+                tags.push("shipped");
+            }
+            if tags.is_empty() {
+                e.name.clone()
+            } else {
+                format!("{} ({})", e.name, tags.join(", "))
+            }
         })
         .collect();
     let noun = if entries.len() == 1 {
@@ -48,6 +59,7 @@ mod tests {
             preload,
             indexed,
             reason: "agent".into(),
+            shipped: false,
         };
         assert_eq!(
             skill_index_line(&[

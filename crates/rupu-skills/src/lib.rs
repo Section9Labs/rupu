@@ -13,13 +13,14 @@ pub mod name;
 pub mod record;
 pub mod render;
 pub mod run;
+pub mod ship;
 pub mod skill;
 pub mod source;
 pub mod tools_map;
 pub mod tree;
 pub mod update;
 
-pub use catalog::{CatalogEntry, DiscoverError, LayerDirs, SkillCatalog};
+pub use catalog::{CatalogEntry, DiscoverError, LayerDirs, OverlaySkill, SkillCatalog};
 pub use frontmatter::{
     parse_skill_md, Frontmatter, FrontmatterError, MAX_COMPATIBILITY_LEN, MAX_DESCRIPTION_LEN,
 };

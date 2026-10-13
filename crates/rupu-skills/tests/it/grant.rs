@@ -15,6 +15,7 @@ fn catalog() -> (tempfile::TempDir, tempfile::TempDir, SkillCatalog) {
     let cat = SkillCatalog::discover(&LayerDirs {
         global: Some(g.path().into()),
         project: Some(p.path().into()),
+        overlay: Vec::new(),
     })
     .unwrap();
     (g, p, cat)
@@ -246,6 +247,7 @@ fn a_suggestion_must_share_a_letter_position() {
     let cat = SkillCatalog::discover(&LayerDirs {
         global: Some(g.path().into()),
         project: None,
+        overlay: Vec::new(),
     })
     .unwrap();
     assert_eq!(resolve_err(&["go"], &cat), vec![unknown("go", None)]);

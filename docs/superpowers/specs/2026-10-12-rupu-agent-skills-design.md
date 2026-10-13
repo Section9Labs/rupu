@@ -379,7 +379,7 @@ The check sits on the sending side because the receiving side can't make it: a n
 
 An older host whose rupu predates this spec cannot parse a synced agent file with `skills:`, because agent frontmatter is `deny_unknown_fields`. The unit fails with that parse error. This is true of every frontmatter key added before, and updating the host is the fix.
 
-Shipping skill content with a dispatch is a later option if this proves painful. It would follow the customer layer's remote-shipping design.
+Shipping skill content with a dispatch is specified in `docs/superpowers/specs/2026-10-13-rupu-skills-on-placed-units-design.md`: SSH and HTTP hosts receive a placed unit's skills, and the host-installed rules above apply to what is not shipped.
 
 ## 10. Errors
 

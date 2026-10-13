@@ -42,6 +42,7 @@ mod runs;
 mod server;
 mod sessions_host;
 mod sessions_live;
+mod skill_ship;
 mod source;
 mod sse;
 mod supplied_identity;

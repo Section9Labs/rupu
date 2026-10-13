@@ -31,6 +31,12 @@ impl Layer {
     }
 }
 
+impl std::fmt::Display for Layer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug)]
 pub struct Skill {
     pub name: SkillName,
@@ -44,6 +50,8 @@ pub struct Skill {
     pub body: String,
     pub entries: Vec<TreeEntry>,
     pub stamp: Stamp,
+    /// Came from the host's shipped-skill cache, not an installed layer.
+    pub shipped: bool,
 }
 
 impl Skill {
@@ -171,5 +179,6 @@ pub fn load_skill(dir: &Path, layer: Layer) -> Result<Skill, SkillError> {
         body,
         entries,
         stamp,
+        shipped: false,
     })
 }

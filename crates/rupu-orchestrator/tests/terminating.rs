@@ -54,6 +54,7 @@ impl UnitDispatcher for TerminatingDispatcher {
         self.calls.lock().unwrap().push(unit.index);
         credential_writes::request_termination();
         Ok(UnitOutcome {
+            warnings: Vec::new(),
             output: format!("out-{}-on-{host}", unit.index),
             success: true,
             error: None,

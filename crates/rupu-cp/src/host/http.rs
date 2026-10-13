@@ -7,6 +7,7 @@
 #![deny(clippy::all)]
 
 use futures_util::StreamExt as _;
+use rupu_skills::ship::{PackedSkill, ShippedSkillRef};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,10 +17,11 @@ use crate::{
         spec_peer_codename, EventByteStream, HostCapabilities, HostConnector, HostConnectorError,
         HostInfo, RunKind, RunListQuery, MAX_WORKSPACE_BYTES,
     },
+    host::skill_ship::{prefixed, ship_through, ShipMemo, ShipOutcome, SkillBundle, Transfer},
     launcher::LaunchRequest,
     node::protocol::{
         CAP_AGENT_ENGAGEMENT_PROFILE, CAP_AGENT_FINDINGS_PROFILE, CAP_AGENT_SKILLS,
-        CAP_RUN_SUPPLIED_RUN_ID, CAP_SESSION_SKILLS,
+        CAP_AGENT_SKILL_BUNDLE, CAP_RUN_SUPPLIED_RUN_ID, CAP_SESSION_SKILLS,
     },
     session_sender::SendMessageRequest,
     session_starter::SessionStartRequest,
@@ -35,6 +37,10 @@ const ARTIFACT_PULL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// whole [`ARTIFACT_PULL_TIMEOUT`]. The SSH and tunnel pulls use the same 60 s.
 const ARTIFACT_PULL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Whole-transfer bound for one shipped skill's `PUT` (up to 32 MiB), in
+/// place of the client's 30 s total timeout.
+const SKILL_PUT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
 // ── Struct ────────────────────────────────────────────────────────────────────
 
 /// Remote-host connector: forwards every [`HostConnector`] call as an HTTP
@@ -49,6 +55,9 @@ pub struct HttpHostConnector {
     /// remote predating it); `None` until it was first read. What the
     /// synchronous [`HostConnector::honours_supplied_run_id`] answers from.
     features_seen: std::sync::Mutex<Option<Vec<String>>>,
+    /// The shipped skills this remote confirmed it holds — see
+    /// [`HostConnector::ship_skills`].
+    ship_memo: ShipMemo,
 }
 
 /// What `/api/host/info` said about the remote.
@@ -113,6 +122,7 @@ impl HttpHostConnector {
             token,
             artifact_idle: ARTIFACT_PULL_IDLE_TIMEOUT,
             features_seen: std::sync::Mutex::new(None),
+            ship_memo: ShipMemo::default(),
         }
     }
 
@@ -149,6 +159,7 @@ impl HttpHostConnector {
             token,
             artifact_idle: ARTIFACT_PULL_IDLE_TIMEOUT,
             features_seen: std::sync::Mutex::new(None),
+            ship_memo: ShipMemo::default(),
         }
     }
 
@@ -259,6 +270,83 @@ impl HttpHostConnector {
             ))),
         }
     }
+
+    /// Send the skills of `pending` the remote lacks: `POST
+    /// /api/skills/bundle/missing`, then a `PUT /api/skills/bundle/:hash` per
+    /// missing one. A remote not advertising [`CAP_AGENT_SKILL_BUNDLE`] is
+    /// a [`Transfer::Downgrade`], which the memo remembers for the
+    /// connector's life.
+    async fn ship_pending(
+        &self,
+        pending: Vec<Arc<PackedSkill>>,
+    ) -> Result<Transfer, HostConnectorError> {
+        let who = format!("remote host {}", self.base_url);
+        let info = self.peer_info().await.map_err(|e| prefixed(e, &who))?;
+        if let Err(e) = Self::require_in(
+            &info,
+            CAP_AGENT_SKILL_BUNDLE,
+            "shipped skills",
+            &self.base_url,
+        ) {
+            return match e {
+                HostConnectorError::Unsupported(m) => Ok(Transfer::Downgrade(m)),
+                e => Err(e),
+            };
+        }
+        let refs: Vec<ShippedSkillRef> = pending.iter().map(|p| p.reference()).collect();
+        let resp = self
+            .send(
+                self.client
+                    .post(self.url("/api/skills/bundle/missing"))
+                    .json(&serde_json::json!({ "skills": refs })),
+            )
+            .await
+            .map_err(|e| prefixed(e, &who))?;
+        #[derive(serde::Deserialize)]
+        struct Missing {
+            missing: Vec<ShippedSkillRef>,
+        }
+        let missing: Missing = resp.json().await.map_err(|e| {
+            HostConnectorError::Remote(
+                0,
+                format!("{who}: bad /api/skills/bundle/missing reply: {e}"),
+            )
+        })?;
+        for r in &missing.missing {
+            let Some(p) = refs.iter().position(|x| x == r).map(|i| &pending[i]) else {
+                return Err(HostConnectorError::Remote(
+                    0,
+                    format!(
+                        "{who}: /api/skills/bundle/missing named {}:{}, which was not asked",
+                        r.layer, r.name
+                    ),
+                ));
+            };
+            let resp = self
+                .send(
+                    self.client
+                        .put(self.url(&format!("/api/skills/bundle/{}", r.content_hash)))
+                        .query(&[("layer", r.layer.to_string()), ("name", r.name.clone())])
+                        .header("Content-Type", "application/x-tar")
+                        .timeout(SKILL_PUT_TIMEOUT)
+                        .body(p.bytes.clone()),
+                )
+                .await
+                .map_err(|e| prefixed(e, &who))?;
+            let stored =
+                extract_string_field(resp.json().await, "stored").map_err(|e| prefixed(e, &who))?;
+            if stored != r.content_hash {
+                return Err(HostConnectorError::Remote(
+                    0,
+                    format!(
+                        "{who}: stored {stored} for {}:{} ({})",
+                        r.layer, r.name, r.content_hash
+                    ),
+                ));
+            }
+        }
+        Ok(Transfer::Done)
+    }
 }
 
 // ── Trait impl ────────────────────────────────────────────────────────────────
@@ -343,6 +431,7 @@ impl HostConnector for HttpHostConnector {
         let needs_info = req.findings_profile.is_some()
             || !req.engagement_profiles.is_empty()
             || has_skills
+            || req.skill_bundle.is_some()
             || req.run_id.is_some()
             || req.codename.is_some();
         let info = if needs_info {
@@ -377,6 +466,14 @@ impl HostConnector for HttpHostConnector {
                 &self.base_url,
             )?;
         }
+        if let (true, Some(info)) = (req.skill_bundle.is_some(), &info) {
+            Self::require_in(
+                info,
+                CAP_AGENT_SKILL_BUNDLE,
+                "this run's shipped skills cannot be delivered",
+                &self.base_url,
+            )?;
+        }
         let (features, version): (&[String], Option<&str>) = match &info {
             Some(PeerInfo::Info(body)) => (&body.features, body.version.as_deref()),
             _ => (&[], None),
@@ -398,6 +495,10 @@ impl HostConnector for HttpHostConnector {
         if !req.preload_skills.is_empty() {
             body["preload_skills"] = serde_json::json!(req.preload_skills);
         }
+        if let Some(m) = &req.skill_bundle {
+            body["skill_bundle"] = serde_json::to_value(m)
+                .map_err(|e| HostConnectorError::Invalid(format!("skill bundle: {e}")))?;
+        }
         // A remote that doesn't advertise `run.supplied_run_id` mints its own
         // id, and the one it returns is the one used either way.
         if let Some(id) = &req.run_id {
@@ -416,6 +517,14 @@ impl HostConnector for HttpHostConnector {
             )
             .await?;
         extract_string_field(resp.json().await, "run_id")
+    }
+
+    async fn ship_skills(&self, bundle: &SkillBundle) -> Result<ShipOutcome, HostConnectorError> {
+        let who = format!("remote host {}", self.base_url);
+        ship_through(&self.ship_memo, bundle, &who, |pending| {
+            self.ship_pending(pending)
+        })
+        .await
     }
 
     async fn start_session(&self, req: SessionStartRequest) -> Result<String, HostConnectorError> {

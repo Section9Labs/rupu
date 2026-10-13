@@ -482,6 +482,7 @@ async fn rebuild_opts_from_disk(
     let unit_dispatcher = crate::fleet_unit_dispatcher::build_dispatcher_if_needed(
         &workflow,
         &global,
+        project_root.as_deref(),
         Arc::clone(&store_arc),
         cfg.pricing.clone(),
     );

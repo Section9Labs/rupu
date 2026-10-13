@@ -49,6 +49,12 @@ pub struct AgentLaunchRequest {
     /// The step's `preload_skills:` — `rupu run --preload-skill`. Same
     /// contract as `skills`.
     pub preload_skills: Vec<String>,
+    /// The skills the coordinator shipped for this unit: `rupu run
+    /// --skill-bundle`, resolved on the host against its skill cache. SSH
+    /// sends it in the argv behind an in-command `agent.skill_bundle` gate,
+    /// HTTP in the body to a peer advertising that feature, and the local
+    /// connector forwards it; tunnel and bucket refuse a launch carrying one.
+    pub skill_bundle: Option<rupu_skills::ship::SkillBundleManifest>,
     /// Codename minted by a placed unit's coordinator — `rupu run
     /// --codename`. Best-effort: a codename is only a display name, so a peer
     /// that can't take it never blocks the launch. An SSH remote predating
@@ -97,6 +103,12 @@ impl AgentLaunchRequest {
         run.engagement_profiles = self.engagement_profiles.clone();
         run.skills = self.skills.clone();
         run.preload_skills = self.preload_skills.clone();
+        run.skill_bundle = self
+            .skill_bundle
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| format!("skill bundle: {e}"))?;
         run.tmp_clone = self.target.is_some();
         Ok(run)
     }
@@ -147,6 +159,7 @@ mod tests {
             engagement_profiles: vec!["network".into()],
             skills: vec!["pdf".into(), "sql".into()],
             preload_skills: vec!["house-style".into()],
+            skill_bundle: None,
             codename: Some("cobalt-harbor/heron#412".into()),
         }
     }

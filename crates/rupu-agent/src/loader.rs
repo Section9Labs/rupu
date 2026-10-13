@@ -140,13 +140,24 @@ pub fn load_agent(
     project: Option<&Path>,
     name: &str,
 ) -> Result<AgentSpec, AgentLoadError> {
+    load_agent_in(global, project, name, &[])
+}
+
+/// [`load_agent`] where the skills `overlay` (a placed unit's shipped
+/// skills) stand in for the installed ones of the same layer and name.
+pub fn load_agent_in(
+    global: &Path,
+    project: Option<&Path>,
+    name: &str,
+    overlay: &[rupu_skills::OverlaySkill],
+) -> Result<AgentSpec, AgentLoadError> {
     let spec = find_agent(global, project, name)?;
     spec.validate_tools()
         .map_err(|source| AgentLoadError::UnknownTool {
             agent: spec.name.clone(),
             source,
         })?;
-    let dirs = rupu_skills::LayerDirs::for_layers(global, project);
+    let dirs = rupu_skills::LayerDirs::for_layers(global, project).with_overlay(overlay.to_vec());
     check_skills(&spec, &dirs, &mut None, SkillCheck::Names)?;
     Ok(spec)
 }
@@ -270,6 +281,74 @@ pub fn find_agent(
         .into_iter()
         .find(|a| a.name == name)
         .ok_or_else(|| AgentLoadError::NotFound(name.to_string()))
+}
+
+/// [`find_agent`] for a caller that needs only `name`: a file that fails to
+/// parse is skipped unless it is the agent's own (`<name>.md`), so an
+/// unrelated broken file never hides it; a file that can't be read is an
+/// error, since it may be the agent's. The project layer still shadows
+/// the global one by frontmatter name, and a layer whose own `<name>.md`
+/// fails to parse answers with that file's error. Tries `<name>.md` first,
+/// so the common case parses one file.
+pub fn find_agent_tolerant(
+    global: &Path,
+    project: Option<&Path>,
+    name: &str,
+) -> Result<AgentSpec, AgentLoadError> {
+    for root in project.into_iter().chain(std::iter::once(global)) {
+        if let Some(found) = find_in_dir_tolerant(&root.join("agents"), name)? {
+            return found;
+        }
+    }
+    Err(AgentLoadError::NotFound(name.to_string()))
+}
+
+/// `name` in `dir`: `None` when the layer has no definition of it, else the
+/// agent or its own file's parse error.
+fn find_in_dir_tolerant(
+    dir: &Path,
+    name: &str,
+) -> Result<Option<Result<AgentSpec, AgentLoadError>>, AgentLoadError> {
+    if !dir.is_dir() {
+        return Ok(None);
+    }
+    let io = |e| AgentLoadError::Io {
+        path: dir.display().to_string(),
+        source: e,
+    };
+    let own = dir.join(format!("{name}.md"));
+    let mut own_error = None;
+    if own.is_file() {
+        match AgentSpec::parse_file(&own) {
+            Ok(spec) if spec.name == name => return Ok(Some(Ok(spec))),
+            Ok(_) => {}
+            Err(source) => {
+                own_error = Some(AgentLoadError::Parse {
+                    path: own.display().to_string(),
+                    source,
+                })
+            }
+        }
+    }
+    for entry in std::fs::read_dir(dir).map_err(io)? {
+        let path = entry.map_err(io)?.path();
+        if path == own || path.extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
+        match AgentSpec::parse_file(&path) {
+            Ok(spec) if spec.name == name => return Ok(Some(Ok(spec))),
+            // A file that can't be read may be the agent's: only a file that
+            // read but didn't parse is skipped.
+            Err(source @ AgentSpecParseError::Io(_)) => {
+                return Err(AgentLoadError::Parse {
+                    path: path.display().to_string(),
+                    source,
+                })
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+    Ok(own_error.map(Err))
 }
 
 /// Which layer an agent file was found in.

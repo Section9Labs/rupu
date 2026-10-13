@@ -73,6 +73,9 @@ pub struct AgentRun {
     pub skills: Vec<String>,
     /// `--preload-skill`, repeated: a workflow step's `preload_skills:`.
     pub preload_skills: Vec<String>,
+    /// `--skill-bundle=<json>`: the manifest of the shipped skills this run
+    /// resolves against (a placed unit's).
+    pub skill_bundle: Option<String>,
     /// `--tmp`: clone a repo/PR target into an auto-deleted tmpdir. The CP and
     /// placed launches set it whenever there is a target.
     pub tmp_clone: bool,
@@ -102,6 +105,7 @@ impl AgentRun {
             engagement_profiles: Vec::new(),
             skills: Vec::new(),
             preload_skills: Vec::new(),
+            skill_bundle: None,
             tmp_clone: false,
             message_space: None,
             continue_from: None,
@@ -391,6 +395,9 @@ impl RunArgv {
                 }
                 for s in &r.preload_skills {
                     a.flag_value("--preload-skill", s);
+                }
+                if let Some(b) = &r.skill_bundle {
+                    a.push(format!("--skill-bundle={b}"));
                 }
                 if let Some(p) = &r.prompt {
                     a.push(format!("--prompt={p}"));
@@ -691,6 +698,27 @@ mod tests {
         r.prompt = Some("- scan\nit's \"all\"".into());
         r.engagement_profiles = vec!["network".into(), "web".into()];
         RunArgv::Agent(r)
+    }
+
+    #[test]
+    fn a_skill_bundle_is_one_element_after_the_preload_skills() {
+        let mut r = AgentRun::new("triage", "run_X");
+        r.preload_skills = vec!["house-style".into()];
+        r.prompt = Some("hi".into());
+        let none = RunArgv::Agent(r.clone()).to_args();
+        assert!(none
+            .iter()
+            .all(|a| !a.to_string_lossy().starts_with("--skill-bundle")));
+        let json = r#"{"version":1,"skills":[]}"#;
+        r.skill_bundle = Some(json.into());
+        let args = strs(&RunArgv::Agent(r));
+        let at: Vec<usize> = (0..args.len())
+            .filter(|&i| args[i].starts_with("--skill-bundle="))
+            .collect();
+        assert_eq!(at.len(), 1);
+        assert_eq!(args[at[0]], format!("--skill-bundle={json}"));
+        assert_eq!(args[at[0] - 1], "house-style");
+        assert_eq!(args[at[0] + 1], "--prompt=hi");
     }
 
     #[test]

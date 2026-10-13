@@ -9,9 +9,14 @@
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
-use axum::extract::{Path, Query, State};
-use axum::{routing::get, Json, Router};
+use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::{
+    routing::{get, post, put},
+    Json, Router,
+};
 use rupu_skills::record::RecordError;
+use rupu_skills::ship::{self, ShipError, ShippedSkillRef, MAX_SHIPPED_SKILL_BYTES};
 use rupu_skills::tools_map::mapped_tools;
 use rupu_skills::{CatalogEntry, Layer, LayerDirs, SkillCatalog};
 use serde::{Deserialize, Serialize};
@@ -21,6 +26,69 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/skills", get(list_skills))
         .route("/api/skills/:layer/:name", get(get_skill))
+        // Shipped skill content (placed units). The static `bundle` segment
+        // wins over `:layer`, so the routes above keep serving.
+        .route("/api/skills/bundle/missing", post(bundle_missing))
+        .route(
+            "/api/skills/bundle/:hash",
+            put(bundle_put).layer(DefaultBodyLimit::max(
+                MAX_SHIPPED_SKILL_BYTES as usize + (64 << 10),
+            )),
+        )
+}
+
+#[derive(Deserialize)]
+struct MissingBody {
+    skills: Vec<ShippedSkillRef>,
+}
+
+/// A `ShipError` caused by the request is a 400; a disk failure is a 500.
+fn ship_err(e: ShipError) -> ApiError {
+    match e {
+        ShipError::Io { .. } => ApiError::internal(e.to_string()),
+        other => ApiError::bad_request(other.to_string()),
+    }
+}
+
+async fn bundle_missing(
+    State(s): State<AppState>,
+    Json(body): Json<MissingBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    for r in &body.skills {
+        r.validate().map_err(ship_err)?;
+    }
+    let cache = ship::cache_dir(&s.global_dir);
+    let missing = tokio::task::spawn_blocking(move || ship::missing(&cache, &body.skills))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(serde_json::json!({ "missing": missing })))
+}
+
+#[derive(Deserialize)]
+struct PutQuery {
+    layer: String,
+    name: String,
+}
+
+async fn bundle_put(
+    State(s): State<AppState>,
+    Path(hash): Path<String>,
+    Query(q): Query<PutQuery>,
+    body: Bytes,
+) -> ApiResult<Json<serde_json::Value>> {
+    let layer = Layer::parse(&q.layer)
+        .ok_or_else(|| ApiError::bad_request(format!("unknown layer {:?}", q.layer)))?;
+    let r = ShippedSkillRef {
+        layer,
+        name: q.name,
+        content_hash: hash.clone(),
+    };
+    let cache = ship::cache_dir(&s.global_dir);
+    tokio::task::spawn_blocking(move || ship::store(&cache, &r, &body))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .map_err(ship_err)?;
+    Ok(Json(serde_json::json!({ "stored": hash })))
 }
 
 #[derive(Debug, Serialize)]
@@ -667,5 +735,95 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, _) = get(&s, "/api/skills/global/pdf?ws_id=nope").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    fn packed(tmp: &tempfile::TempDir) -> rupu_skills::ship::PackedSkill {
+        let dir = tmp.path().join("src");
+        install(&dir, "pdf", "name: pdf\ndescription: PDFs.\n", "Body.");
+        rupu_skills::ship::pack_skill(
+            &rupu_skills::load_skill(&dir.join("pdf"), Layer::Global).unwrap(),
+        )
+        .unwrap()
+    }
+
+    async fn send(s: &AppState, req: Request<Body>) -> (StatusCode, serde_json::Value) {
+        let resp = routes().with_state(s.clone()).oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    fn missing_req(r: &ShippedSkillRef) -> Request<Body> {
+        Request::post("/api/skills/bundle/missing")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::json!({ "skills": [r] }).to_string()))
+            .unwrap()
+    }
+
+    fn put_req(hash: &str, name: &str, bytes: Vec<u8>) -> Request<Body> {
+        Request::put(format!(
+            "/api/skills/bundle/{hash}?layer=global&name={name}"
+        ))
+        .body(Body::from(bytes))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn missing_then_put_then_missing_is_empty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let p = packed(&tmp);
+        let r = p.reference();
+
+        let (st, json) = send(&s, missing_req(&r)).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(json["missing"].as_array().unwrap().len(), 1);
+
+        let (st, json) = send(&s, put_req(&r.content_hash, "pdf", p.bytes.clone())).await;
+        assert_eq!(st, StatusCode::OK, "{json}");
+        assert_eq!(json["stored"], r.content_hash);
+
+        let (_, json) = send(&s, missing_req(&r)).await;
+        assert_eq!(json["missing"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn a_tampered_body_or_hostile_name_is_a_400() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let p = packed(&tmp);
+        let r = p.reference();
+
+        let wrong = "0".repeat(64);
+        let (st, _) = send(&s, put_req(&wrong, "pdf", p.bytes.clone())).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        let (st, _) = send(&s, put_req(&r.content_hash, "pdf", b"not a tar".to_vec())).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        let (st, _) = send(&s, put_req(&r.content_hash, "..%2Fx", p.bytes.clone())).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        let (_, json) = send(&s, missing_req(&r)).await;
+        assert_eq!(
+            json["missing"].as_array().unwrap().len(),
+            1,
+            "nothing cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_bundle_routes_leave_the_skill_detail_route_serving() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        install(
+            &tmp.path().join("skills"),
+            "pdf",
+            "name: pdf\ndescription: Read PDFs.\n",
+            "Body.",
+        );
+        let (st, json) = get(&s, "/api/skills/global/pdf").await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(json["name"], "pdf");
     }
 }

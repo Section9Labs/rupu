@@ -157,6 +157,7 @@ async fn a_successful_placed_units_findings_land_under_the_coordinators_target()
     let (tmp, _sink) = run(
         PLACED,
         vec![Ok(UnitOutcome {
+            warnings: Vec::new(),
             output: "ok".into(),
             success: true,
             error: None,
@@ -175,6 +176,7 @@ async fn a_failed_units_findings_still_land() {
     let (tmp, _sink) = run(
         PLACED,
         vec![Err(UnitFailure {
+            warnings: Vec::new(),
             error: RunError::Provider("unit died".into()),
             coverage: UnitCoverage::Stream(stream_with_finding("f_failed")),
         })],
@@ -188,6 +190,7 @@ async fn unavailable_coverage_is_a_step_warning_not_a_failure() {
     let (tmp, sink) = run(
         PLACED,
         vec![Ok(UnitOutcome {
+            warnings: Vec::new(),
             output: "ok".into(),
             success: true,
             error: None,
@@ -217,6 +220,7 @@ async fn a_stream_without_a_begin_line_is_a_warning() {
     let (_tmp, sink) = run(
         PLACED,
         vec![Ok(UnitOutcome {
+            warnings: Vec::new(),
             output: "ok".into(),
             success: true,
             error: None,
@@ -239,10 +243,12 @@ async fn a_fan_out_primary_failure_and_its_retry_both_merge() {
         yaml,
         vec![
             Err(UnitFailure {
+                warnings: Vec::new(),
                 error: RunError::Provider("primary died".into()),
                 coverage: UnitCoverage::Stream(stream_with_finding("f_primary")),
             }),
             Ok(UnitOutcome {
+                warnings: Vec::new(),
                 output: "ok".into(),
                 success: true,
                 error: None,
@@ -277,6 +283,7 @@ async fn a_partial_stream_merges_and_warns_that_later_findings_may_be_missing() 
     let (tmp, sink) = run(
         PLACED,
         vec![Err(UnitFailure {
+            warnings: Vec::new(),
             error: RunError::Provider("poll failed".into()),
             coverage: UnitCoverage::Partial {
                 bytes: stream_with_finding("f_partial"),
@@ -303,6 +310,7 @@ async fn a_complete_stream_merges_without_a_warning() {
     let (tmp, sink) = run(
         PLACED,
         vec![Ok(UnitOutcome {
+            warnings: Vec::new(),
             output: "ok".into(),
             success: true,
             error: None,
@@ -323,6 +331,7 @@ async fn the_no_begin_line_warning_covers_an_old_host_and_a_lost_stream() {
     let (_tmp, sink) = run(
         PLACED,
         vec![Ok(UnitOutcome {
+            warnings: Vec::new(),
             output: "ok".into(),
             success: true,
             error: None,
@@ -411,8 +420,11 @@ impl UnitDispatcher for SyncByIndex {
     }
 }
 
+// What `dispatch_unit` returns, whose `UnitFailure` the lint finds large.
+#[allow(clippy::result_large_err)]
 fn synced_ok(file: &str, coverage: UnitCoverage) -> Result<UnitOutcome, UnitFailure> {
     Ok(UnitOutcome {
+        warnings: Vec::new(),
         output: "ok".into(),
         success: true,
         error: None,
@@ -619,6 +631,7 @@ async fn a_registry_hosts_artifact_merges_external_with_that_host() {
     let (tmp, _sink) = run(
         PLACED,
         vec![Ok(UnitOutcome {
+            warnings: Vec::new(),
             output: "ok".into(),
             success: true,
             error: None,
@@ -648,6 +661,7 @@ async fn a_local_units_artifact_stays_copied() {
     let (tmp, _sink) = run(
         yaml,
         vec![Ok(UnitOutcome {
+            warnings: Vec::new(),
             output: "ok".into(),
             success: true,
             error: None,
@@ -671,8 +685,11 @@ const SYNCED_COPY: &str = "the unit's workspace-sync delta keeps its own copy";
 /// What a no-stream warning says when the delta is the only copy.
 const DELTA_ONLY: &str = "arrive only through the unit's workspace-sync delta";
 
+// What `dispatch_unit` returns, whose `UnitFailure` the lint finds large.
+#[allow(clippy::result_large_err)]
 fn failed_with(coverage: UnitCoverage) -> Result<UnitOutcome, UnitFailure> {
     Err(UnitFailure {
+        warnings: Vec::new(),
         error: RunError::Provider("poll failed".into()),
         coverage,
     })
@@ -752,5 +769,99 @@ async fn a_stream_with_malformed_lines_keeps_its_delta_coverage() {
         std::fs::read_to_string(tmp.path().join(SCRATCH_COVERAGE)).unwrap(),
         "{}\n",
         "malformed lines: the delta's coverage must not be stripped"
+    );
+}
+
+// ── A unit's dispatch warnings ────────────────────────────────────────────
+
+/// `(step_id, index, message)` of every `StepWarning`.
+fn step_warnings(sink: &Collect) -> Vec<(String, Option<usize>, String)> {
+    sink.0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            Event::StepWarning {
+                step_id,
+                index,
+                message,
+                ..
+            } => Some((step_id.clone(), *index, message.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// What the dispatch downgraded (a host that can't take shipped skills) is a
+/// `StepWarning` on the placed step, and the unit still succeeds.
+#[tokio::test]
+async fn a_placed_units_dispatch_warnings_are_step_warnings() {
+    let (_tmp, sink) = run(
+        PLACED,
+        vec![Ok(UnitOutcome {
+            warnings: vec!["w".into()],
+            output: "ok".into(),
+            success: true,
+            error: None,
+            workspace_delta: None,
+            coverage: UnitCoverage::NotLaunched,
+        })],
+    )
+    .await;
+    assert_eq!(step_warnings(&sink), vec![("s".into(), None, "w".into())]);
+    assert!(
+        sink.0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, Event::StepCompleted { success: true, .. })),
+        "a dispatch warning never fails the unit"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_placed_units_dispatch_warnings_still_surface() {
+    let (_tmp, sink) = run(
+        PLACED,
+        vec![Err(UnitFailure {
+            warnings: vec!["w".into()],
+            error: RunError::Provider("unit died".into()),
+            coverage: UnitCoverage::NotLaunched,
+        })],
+    )
+    .await;
+    assert_eq!(step_warnings(&sink), vec![("s".into(), None, "w".into())]);
+}
+
+/// A fan-out unit's warnings carry its index, the primary's and the
+/// fallback host's alike.
+#[tokio::test]
+async fn a_fan_out_units_dispatch_warnings_carry_its_index() {
+    let yaml = "name: w\nsteps:\n  - id: fan\n    agent: sec\n    actions: []\n    for_each: \"only\"\n    prompt: \"p {{ item }}\"\n    distribute:\n      hosts: [host_01A, host_01B]\n";
+    let (_tmp, sink) = run(
+        yaml,
+        vec![
+            Err(UnitFailure {
+                warnings: vec!["primary".into()],
+                error: RunError::Provider("primary died".into()),
+                coverage: UnitCoverage::NotLaunched,
+            }),
+            Ok(UnitOutcome {
+                warnings: vec!["retry".into()],
+                output: "ok".into(),
+                success: true,
+                error: None,
+                workspace_delta: None,
+                coverage: UnitCoverage::NotLaunched,
+            }),
+        ],
+    )
+    .await;
+    assert_eq!(
+        step_warnings(&sink),
+        vec![
+            ("fan".into(), Some(0), "primary".into()),
+            ("fan".into(), Some(0), "retry".into()),
+        ]
     );
 }

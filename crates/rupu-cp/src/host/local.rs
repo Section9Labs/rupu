@@ -24,6 +24,7 @@ use crate::{
         HostCapabilities, HostConnector, HostConnectorError, HostInfo, RunKind, RunListQuery,
         RunStartEvidence,
     },
+    host::skill_ship::{ShipOutcome, SkillBundle},
     host::workspace_stage::{collect_from_dir, discard_from_dir, stage_to_dir},
     launcher::{LaunchRequest, RunLauncher},
     session_sender::{SendMessageRequest, SessionSender},
@@ -172,6 +173,11 @@ impl HostConnector for LocalHostConnector {
             .launch(req)
             .await
             .map_err(|e| HostConnectorError::Invalid(e.to_string()))
+    }
+
+    /// `host: local` runs where its skills are installed; nothing is packed.
+    async fn ship_skills(&self, _: &SkillBundle) -> Result<ShipOutcome, HostConnectorError> {
+        Ok(ShipOutcome::NotNeeded)
     }
 
     async fn start_session(&self, req: SessionStartRequest) -> Result<String, HostConnectorError> {
@@ -1232,6 +1238,7 @@ mod launch_agent_tests {
                 engagement_profiles: Vec::new(),
                 skills: Vec::new(),
                 preload_skills: Vec::new(),
+                skill_bundle: None,
                 codename: None,
             })
             .await
@@ -1267,6 +1274,7 @@ mod launch_agent_tests {
             engagement_profiles: vec!["network".into()],
             skills: Vec::new(),
             preload_skills: Vec::new(),
+            skill_bundle: None,
             codename: None,
         })
         .await
@@ -1307,6 +1315,7 @@ mod launch_agent_tests {
             engagement_profiles: Vec::new(),
             skills: vec!["pdf".into()],
             preload_skills: vec!["house-style".into()],
+            skill_bundle: None,
             codename: None,
         })
         .await
@@ -1314,6 +1323,67 @@ mod launch_agent_tests {
         let got = capture.0.lock().unwrap().clone().unwrap();
         assert_eq!(got.skills, ["pdf"]);
         assert_eq!(got.preload_skills, ["house-style"]);
+    }
+
+    /// `host: local` ships nothing, but a bundle a launch carries anyway
+    /// reaches the launcher, which renders it.
+    #[tokio::test]
+    async fn ships_nothing_and_forwards_a_skill_bundle_to_the_launcher() {
+        let tmp = tempfile::tempdir().unwrap();
+        let capture = Arc::new(Capture(Mutex::new(None)));
+        let conn = LocalHostConnector::new(
+            None,
+            Some(capture.clone()),
+            None,
+            None,
+            Arc::new(RunStore::new(tmp.path().join("runs"))),
+            tmp.path().to_path_buf(),
+        );
+        // A skill that can't be walked: a pack would fail, so this proves
+        // nothing is packed.
+        let missing = rupu_skills::Skill {
+            name: "pdf".parse().unwrap(),
+            layer: rupu_skills::Layer::Global,
+            root: tmp.path().join("gone"),
+            dir: tmp.path().join("gone"),
+            frontmatter: Default::default(),
+            body: String::new(),
+            entries: Vec::new(),
+            stamp: rupu_skills::Stamp([0; 32]),
+            shipped: false,
+        };
+        assert_eq!(
+            conn.ship_skills(&SkillBundle::new(vec![Arc::new(missing)]))
+                .await
+                .unwrap(),
+            ShipOutcome::NotNeeded
+        );
+        let manifest = rupu_skills::ship::SkillBundleManifest {
+            version: 1,
+            skills: vec![rupu_skills::ship::ShippedSkillRef {
+                layer: rupu_skills::Layer::Global,
+                name: "pdf".into(),
+                content_hash: "a".repeat(64),
+            }],
+        };
+        conn.launch_agent(AgentLaunchRequest {
+            agent: "recon".into(),
+            prompt: None,
+            mode: None,
+            target: None,
+            working_dir: None,
+            run_id: None,
+            findings_profile: None,
+            engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
+            skill_bundle: Some(manifest.clone()),
+            codename: None,
+        })
+        .await
+        .unwrap();
+        let got = capture.0.lock().unwrap().clone().unwrap();
+        assert_eq!(got.skill_bundle, Some(manifest));
     }
 }
 

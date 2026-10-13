@@ -77,6 +77,10 @@ pub struct SkillIndexEntry {
     pub preload: bool,
     pub indexed: bool,
     pub reason: String,
+    /// The skill came from a bundle shipped with the run (a placed unit),
+    /// not from the host's own skills directories.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shipped: bool,
 }
 
 fn is_zero_u32(v: &u32) -> bool {
@@ -848,6 +852,7 @@ mod tests {
                         preload: false,
                         indexed: true,
                         reason: "agent".into(),
+                        shipped: false,
                     }],
                 },
                 "skill_index",

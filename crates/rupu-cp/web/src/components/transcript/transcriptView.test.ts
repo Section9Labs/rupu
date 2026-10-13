@@ -755,7 +755,7 @@ describe('v2 blocks model', () => {
         data: {
           skills: [
             { name: 'pdf', layer: 'global', stamp: 's', preload: true, indexed: false, reason: 'agent' },
-            { name: 'xlsx', layer: 'project', stamp: 's', preload: false, indexed: true, reason: 'launch' },
+            { name: 'xlsx', layer: 'project', stamp: 's', preload: false, indexed: true, reason: 'launch', shipped: true },
           ],
         },
       },
@@ -770,7 +770,7 @@ describe('v2 blocks model', () => {
         label: 'tools',
         text: '2 tools: read_file, skills.load  ·  unavailable: board.post (needs message_bus)',
       },
-      { kind: 'meta', label: 'skills', text: '2 skills: pdf (preloaded), xlsx' },
+      { kind: 'meta', label: 'skills', text: '2 skills: pdf (preloaded), xlsx (shipped)' },
       { kind: 'meta', label: 'skills', text: 'loaded skill pdf (abababababab) via preload' },
     ]);
   });

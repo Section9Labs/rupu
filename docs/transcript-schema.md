@@ -404,6 +404,7 @@ Each row:
 | `preload` | bool   | The skill's body is in the system prompt |
 | `indexed` | bool   | The skill is listed in the model's skill index. `false` for a preloaded skill and for one marked `disable-model-invocation` |
 | `reason`  | string | Why the run has it: `agent` (the agent's `skills:` / `preloadSkills:`), `launch` (the launch's own: a workflow step's keys or `rupu run --skill`), `session` (`rupu session start --skill` / `--preload-skill`) or `operator` (a skill `rupu session send --skill` invoked in an earlier turn; never indexed). A transcript written before the rename says `step` for `launch`; readers take the value as written |
+| `shipped` | bool   | Optional. The skill came from the coordinator of a placed unit, not from the host's installed layers. Absent when false; older readers ignore it |
 
 ```json
 {"type":"skill_index","data":{"skills":[{"name":"pdf","layer":"global","stamp":"9f2c…","preload":false,"indexed":true,"reason":"agent"}]}}

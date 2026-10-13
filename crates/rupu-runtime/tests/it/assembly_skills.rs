@@ -179,6 +179,7 @@ async fn agent_skills_reach_the_prompt_and_the_grant() {
                 preload: false,
                 indexed: true,
                 reason: "agent".into(),
+                shipped: false,
             },
             SkillIndexEntry {
                 name: "report-style".into(),
@@ -187,6 +188,7 @@ async fn agent_skills_reach_the_prompt_and_the_grant() {
                 preload: true,
                 indexed: false,
                 reason: "agent".into(),
+                shipped: false,
             },
         ]
     );
@@ -1151,4 +1153,83 @@ async fn resolve_frozen_skills_thaws_against_the_sessions_layers() {
         .await
         .unwrap();
     assert!(none.is_none() && missing.is_empty());
+}
+
+fn shipped_pdf(dir: &std::path::Path) -> rupu_skills::OverlaySkill {
+    let d = dir.join("pdf");
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(
+        d.join("SKILL.md"),
+        "---\nname: pdf\ndescription: Shipped pdf.\n---\nshipped body\n",
+    )
+    .unwrap();
+    rupu_skills::OverlaySkill {
+        layer: rupu_skills::Layer::Global,
+        name: "pdf".into(),
+        dir: d,
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn a_shipped_overlay_skill_resolves_and_is_recorded_shipped() {
+    let home = Home::new();
+    let shipped = tempfile::tempdir().unwrap();
+    let overlay = shipped_pdf(shipped.path());
+    let assembler = home.assembler(config());
+    home.agent(
+        "probe",
+        "provider: anthropic\nmodel: claude-sonnet-4-6\nskills: [pdf]",
+    );
+    // The agent loads only because the overlay stands in for the install.
+    let spec = rupu_agent::load_agent_in(
+        &home.global(),
+        None,
+        "probe",
+        std::slice::from_ref(&overlay),
+    )
+    .unwrap();
+
+    let resolved = assembler
+        .resolve_skills(
+            &spec,
+            &rupu_runtime::assembly::Overrides {
+                skill_overlay: vec![overlay.clone()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .expect("a skill set");
+    let g = &resolved.entries()[0];
+    assert!(g.skill.shipped);
+    assert_eq!(g.skill.dir, overlay.dir);
+
+    let mut l = launch(&home, spec, Origin::Standalone, "run_shipped");
+    l.overrides.skill_overlay = vec![overlay];
+    let path = l.transcript_path.clone();
+    let _m = MockScript::set(DONE);
+    rupu_runtime::run_agent(&assembler, l)
+        .await
+        .unwrap()
+        .result
+        .unwrap();
+    let index = skill_index(&events(&path));
+    assert_eq!(index.len(), 1);
+    assert!(index[0].shipped);
+}
+
+#[tokio::test]
+async fn no_requested_skills_reads_no_layer() {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("skills"), "a file, not a directory").unwrap();
+    let dirs = rupu_skills::LayerDirs::for_layers(d.path(), None);
+    let requests = vec![
+        (rupu_skills::SkillReason::Agent, vec![], vec![]),
+        (rupu_skills::SkillReason::Launch, vec![], vec![]),
+    ];
+    let got = rupu_runtime::assembly::resolve_skill_requests(&dirs, "a", requests)
+        .await
+        .unwrap();
+    assert!(got.is_none());
 }

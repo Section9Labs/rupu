@@ -164,6 +164,7 @@ impl UnitDispatcher for MirrorDispatcher {
         let path = self.unit_transcript_path(host, &unit.run_id).unwrap();
         write_mirrored_transcript(&path, &unit.run_id);
         Ok(UnitOutcome {
+            warnings: Vec::new(),
             output: format!("out-{}-on-{host}", unit.index),
             success: true,
             error: None,

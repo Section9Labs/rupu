@@ -130,6 +130,7 @@ impl UnitDispatcher for RecordingDispatcher {
             .unwrap()
             .push((unit.index, host.to_string()));
         Ok(UnitOutcome {
+            warnings: Vec::new(),
             output: format!("out-{}-on-{host}", unit.index),
             success: true,
             error: None,
@@ -393,6 +394,7 @@ impl UnitDispatcher for FlakyCodenameDispatcher {
             return Err(RunError::Provider("host down".into()).into());
         }
         Ok(UnitOutcome {
+            warnings: Vec::new(),
             output: format!("out-{}-on-{host}", unit.index),
             success: true,
             error: None,

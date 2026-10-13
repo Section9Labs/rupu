@@ -108,4 +108,5 @@ mod resume_clears_web_marker;
 mod resume_recovers_interrupted;
 mod resume_system_prompt_suffix;
 mod run_from_file;
+mod skill_bundle_run;
 mod workflow_runs_no_side_effects;

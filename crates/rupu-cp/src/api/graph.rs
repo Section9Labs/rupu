@@ -1105,6 +1105,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::host::connector::HostConnector for MirrorBackedConnector {
+        async fn ship_skills(
+            &self,
+            _: &crate::host::skill_ship::SkillBundle,
+        ) -> Result<crate::host::skill_ship::ShipOutcome, crate::host::connector::HostConnectorError>
+        {
+            Ok(crate::host::skill_ship::ShipOutcome::NotNeeded)
+        }
+
         fn serves_runs_from_local_mirror(&self) -> bool {
             true
         }

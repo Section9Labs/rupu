@@ -55,5 +55,6 @@ mod run_model_limits;
 mod run_target_parse;
 mod session_context_gauge;
 mod sigterm_exit;
+mod skills_helper;
 mod test_layout;
 mod update_notice_env;

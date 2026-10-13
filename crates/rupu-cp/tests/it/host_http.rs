@@ -644,6 +644,7 @@ fn profiled_agent_req(
         engagement_profiles: Vec::new(),
         skills: Vec::new(),
         preload_skills: Vec::new(),
+        skill_bundle: None,
         codename: None,
     }
 }
@@ -1846,4 +1847,206 @@ async fn pull_finding_artifact_refuses_a_declared_oversize_before_writing() {
         !out.exists(),
         "an oversize declaration must not create dest"
     );
+}
+
+// ── Shipped skills over HTTP ──────────────────────────────────────────────────
+
+use rupu_cp::host::skill_ship::{manifest_of, ShipOutcome, SkillBundle};
+
+/// Skills installed on the coordinator, under `dir`.
+fn ship_bundle(dir: &std::path::Path, names: &[&str]) -> SkillBundle {
+    SkillBundle::new(
+        names
+            .iter()
+            .map(|n| {
+                let root = dir.join(n);
+                std::fs::create_dir_all(&root).unwrap();
+                std::fs::write(
+                    root.join("SKILL.md"),
+                    format!("---\nname: {n}\ndescription: {n} skill.\n---\n\nDo {n}.\n"),
+                )
+                .unwrap();
+                std::sync::Arc::new(
+                    rupu_skills::load_skill(&root, rupu_skills::Layer::Global).unwrap(),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn host_info_with(features: &[&str]) -> serde_json::Value {
+    serde_json::json!({
+        "version": "0.95.0",
+        "capabilities": {"backends": [], "scm_hosts": [], "permission_modes": []},
+        "features": features,
+    })
+}
+
+#[tokio::test]
+async fn ship_skills_downgrades_when_the_peer_lacks_the_feature() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server = httpmock::MockServer::start_async().await;
+    let info = server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(200)
+            .json_body(host_info_with(&["agent.skills"]));
+    });
+    let missing = server.mock(|when, then| {
+        when.method("POST").path("/api/skills/bundle/missing");
+        then.status(200)
+            .json_body(serde_json::json!({"missing": []}));
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    let out = c
+        .ship_skills(&ship_bundle(tmp.path(), &["pdf"]))
+        .await
+        .unwrap();
+    assert!(
+        matches!(&out, ShipOutcome::Unsupported(m)
+            if m.contains("shipped skills") && m.contains("0.95.0")),
+        "{out:?}"
+    );
+    missing.assert_hits(0);
+    // Remembered for the connector's life: the next unit asks nothing.
+    let again = c
+        .ship_skills(&ship_bundle(tmp.path(), &["pdf"]))
+        .await
+        .unwrap();
+    assert_eq!(again, out);
+    info.assert_hits(1);
+}
+
+#[tokio::test]
+async fn ship_skills_puts_only_what_the_peer_lacks_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bundle = ship_bundle(tmp.path(), &["pdf", "sql"]);
+    let packed = bundle.pack().unwrap();
+    let lacking = packed[1].reference();
+    let server = httpmock::MockServer::start_async().await;
+    let info = server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(200)
+            .json_body(host_info_with(&["agent.skill_bundle"]));
+    });
+    let asked = serde_json::json!({
+        "skills": packed.iter().map(|p| p.reference()).collect::<Vec<_>>()
+    });
+    let missing = server.mock(|when, then| {
+        when.method("POST")
+            .path("/api/skills/bundle/missing")
+            .json_body(asked.clone());
+        then.status(200)
+            .json_body(serde_json::json!({"missing": [lacking.clone()]}));
+    });
+    let put = server.mock(|when, then| {
+        when.method("PUT")
+            .path(format!("/api/skills/bundle/{}", lacking.content_hash))
+            .query_param("layer", "global")
+            .query_param("name", "sql")
+            .body(String::from_utf8_lossy(&packed[1].bytes).to_string());
+        then.status(200)
+            .json_body(serde_json::json!({"stored": lacking.content_hash.clone()}));
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+
+    let out = c.ship_skills(&bundle).await.unwrap();
+    assert_eq!(out, ShipOutcome::Shipped(manifest_of(&packed)));
+    put.assert_hits(1);
+
+    assert_eq!(c.ship_skills(&bundle).await.unwrap(), out);
+    info.assert_hits(1);
+    missing.assert_hits(1);
+    put.assert_hits(1);
+}
+
+#[tokio::test]
+async fn ship_skills_fails_on_a_put_the_peer_refuses_and_retries_later() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bundle = ship_bundle(tmp.path(), &["pdf"]);
+    let lacking = bundle.pack().unwrap()[0].reference();
+    let server = httpmock::MockServer::start_async().await;
+    server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(200)
+            .json_body(host_info_with(&["agent.skill_bundle"]));
+    });
+    let missing = server.mock(|when, then| {
+        when.method("POST").path("/api/skills/bundle/missing");
+        then.status(200)
+            .json_body(serde_json::json!({"missing": [lacking]}));
+    });
+    server.mock(|when, then| {
+        when.method("PUT");
+        then.status(400).body("hash mismatch");
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    let err = c.ship_skills(&bundle).await.unwrap_err();
+    assert!(
+        matches!(&err, HostConnectorError::Remote(400, m)
+            if m.contains("hash mismatch") && m.contains(&server.base_url())),
+        "{err:?}"
+    );
+    let _ = c.ship_skills(&bundle).await;
+    missing.assert_hits(2);
+}
+
+/// End to end against a real remote CP: the skill lands in its cache, and the
+/// launch that follows hands the manifest to the remote's agent launcher.
+#[tokio::test]
+async fn shipped_skills_reach_a_real_remote_cp_and_ride_the_launch() {
+    let coord = tempfile::tempdir().unwrap();
+    let remote = tempfile::tempdir().unwrap();
+    let launcher = std::sync::Arc::new(CapturingAgentLauncher {
+        last: std::sync::Mutex::new(None),
+    });
+    let addr = serve_cp(cp_state(&remote).with_agent_launcher(Some(launcher.clone()))).await;
+    let c = HttpHostConnector::new(format!("http://{addr}"), None);
+
+    let bundle = ship_bundle(coord.path(), &["pdf"]);
+    let ShipOutcome::Shipped(manifest) = c.ship_skills(&bundle).await.unwrap() else {
+        panic!("a current remote takes shipped skills")
+    };
+    let r = &manifest.skills[0];
+    let cached = rupu_skills::ship::cached_path(&rupu_skills::ship::cache_dir(remote.path()), r);
+    assert!(cached.join("SKILL.md").is_file(), "{}", cached.display());
+
+    let mut req = profiled_agent_req(None);
+    req.skill_bundle = Some(manifest.clone());
+    assert_eq!(c.launch_agent(req).await.unwrap(), "run_REMOTE");
+    let got = launcher
+        .last
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("remote launched");
+    assert_eq!(got.skill_bundle, Some(manifest));
+}
+
+/// A remote predating the field would drop `skill_bundle` and run the unit
+/// without its shipped skills, so the launch is refused.
+#[tokio::test]
+async fn launch_agent_refuses_a_skill_bundle_the_remote_does_not_advertise() {
+    let server = httpmock::MockServer::start_async().await;
+    server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(200)
+            .json_body(host_info_with(&["agent.skills"]));
+    });
+    let post = server.mock(|when, then| {
+        when.method("POST").path("/api/agents/sec/run");
+        then.status(200)
+            .json_body(serde_json::json!({"run_id": "run_X"}));
+    });
+    let mut req = profiled_agent_req(None);
+    req.skill_bundle = Some(rupu_skills::ship::SkillBundleManifest {
+        version: 1,
+        skills: Vec::new(),
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    let err = c.launch_agent(req).await.unwrap_err();
+    assert!(
+        matches!(&err, HostConnectorError::Unsupported(m) if m.contains("shipped skills")),
+        "{err:?}"
+    );
+    post.assert_hits(0);
 }

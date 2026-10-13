@@ -36,6 +36,7 @@ pub mod run;
 pub mod scm;
 pub mod session;
 pub mod skill;
+pub mod skills_helper;
 pub mod transcript;
 pub mod ui;
 pub mod update;

@@ -85,6 +85,7 @@ impl UnitDispatcher for PlacedSyncDispatcher {
     ) -> Result<UnitOutcome, UnitFailure> {
         *self.saw_workspace_path.lock().unwrap() = unit.workspace.is_some();
         Ok(UnitOutcome {
+            warnings: Vec::new(),
             output: "REMOTE-EDITED".to_string(),
             success: true,
             error: None,
@@ -239,6 +240,7 @@ impl UnitDispatcher for FanoutSyncDispatcher {
         let filename = FANOUT_FILES[idx].to_string();
         let content = FANOUT_CONTENTS[idx].to_vec();
         Ok(UnitOutcome {
+            warnings: Vec::new(),
             output: format!("out-{idx}"),
             success: true,
             error: None,

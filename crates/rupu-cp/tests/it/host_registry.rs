@@ -29,6 +29,13 @@ struct StubLocal;
 
 #[async_trait::async_trait]
 impl HostConnector for StubLocal {
+    async fn ship_skills(
+        &self,
+        _: &rupu_cp::host::skill_ship::SkillBundle,
+    ) -> Result<rupu_cp::host::skill_ship::ShipOutcome, HostConnectorError> {
+        Ok(rupu_cp::host::skill_ship::ShipOutcome::NotNeeded)
+    }
+
     async fn info(&self) -> Result<HostInfo, HostConnectorError> {
         Ok(HostInfo {
             reachable: true,

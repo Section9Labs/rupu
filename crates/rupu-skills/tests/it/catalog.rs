@@ -1,5 +1,5 @@
 use crate::support::write_skill;
-use rupu_skills::{load_skill, Layer, LayerDirs, SkillCatalog, SkillError};
+use rupu_skills::{load_skill, Layer, LayerDirs, OverlaySkill, SkillCatalog, SkillError};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -70,6 +70,7 @@ fn discover_keeps_both_layers_and_invalid_entries() {
     let cat = SkillCatalog::discover(&LayerDirs {
         global: Some(g.path().to_owned()),
         project: Some(p.path().to_owned()),
+        overlay: Vec::new(),
     })
     .unwrap();
     let got: Vec<(String, Layer, bool)> = cat
@@ -100,6 +101,7 @@ fn missing_layer_dirs_are_empty() {
     let cat = SkillCatalog::discover(&LayerDirs {
         global: Some(t.path().join("absent")),
         project: None,
+        overlay: Vec::new(),
     })
     .unwrap();
     assert!(cat.entries().is_empty());
@@ -117,6 +119,7 @@ fn a_symlinked_project_skills_dir_invalidates_every_project_skill() {
     let cat = SkillCatalog::discover(&LayerDirs {
         global: None,
         project: Some(link.clone()),
+        overlay: Vec::new(),
     })
     .unwrap();
     assert_eq!(cat.entries().len(), 1);
@@ -128,6 +131,7 @@ fn a_symlinked_project_skills_dir_invalidates_every_project_skill() {
     let cat = SkillCatalog::discover(&LayerDirs {
         global: Some(link),
         project: None,
+        overlay: Vec::new(),
     })
     .unwrap();
     assert!(cat.get(Layer::Global, "linked").unwrap().is_valid());
@@ -146,6 +150,7 @@ fn a_dangling_skill_symlink_is_listed_invalid_and_a_file_symlink_is_skipped() {
     let cat = SkillCatalog::discover(&LayerDirs {
         global: Some(skills),
         project: None,
+        overlay: Vec::new(),
     })
     .unwrap();
     let got: Vec<(String, bool)> = cat
@@ -218,6 +223,7 @@ fn discover_lists_entries_and_each_loads_on_first_use() {
     let cat = SkillCatalog::discover(&LayerDirs {
         global: Some(skills.clone()),
         project: None,
+        overlay: Vec::new(),
     })
     .unwrap();
     let entry = cat.get(Layer::Global, "late").unwrap();
@@ -311,6 +317,7 @@ fn discover_readable_keeps_the_layers_it_can_read() {
     let dirs = LayerDirs {
         global: Some(global),
         project: Some(project.clone()),
+        overlay: Vec::new(),
     };
 
     let (cat, failed) = SkillCatalog::discover_readable(&dirs);
@@ -341,6 +348,7 @@ fn an_entry_reads_its_install_record() {
     let dirs = LayerDirs {
         global: Some(skills.clone()),
         project: None,
+        overlay: Vec::new(),
     };
     let cat = SkillCatalog::discover(&dirs).unwrap();
     let pdf = cat.get(Layer::Global, "pdf").unwrap();
@@ -393,6 +401,7 @@ fn a_symlinked_project_root_reads_no_record() {
     let cat = SkillCatalog::discover(&LayerDirs {
         global: None,
         project: Some(link),
+        overlay: Vec::new(),
     })
     .unwrap();
     assert_eq!(
@@ -403,4 +412,91 @@ fn a_symlinked_project_root_reads_no_record() {
             .to_string(),
         "the project skills directory may not be a symlink"
     );
+}
+
+fn overlay_of(tmp: &Path, name: &str, desc: &str, layer: Layer) -> OverlaySkill {
+    let dir = write_skill(&tmp.join(format!("ov-{layer:?}")), name, name, desc);
+    OverlaySkill {
+        layer,
+        name: name.into(),
+        dir,
+    }
+}
+
+#[test]
+fn a_shipped_global_skill_replaces_the_installed_one() {
+    let home = tempfile::tempdir().unwrap();
+    write_skill(&home.path().join("skills"), "pdf", "pdf", "Installed.");
+    let dirs = LayerDirs::for_layers(home.path(), None).with_overlay(vec![overlay_of(
+        home.path(),
+        "pdf",
+        "Shipped.",
+        Layer::Global,
+    )]);
+    let cat = SkillCatalog::discover(&dirs).unwrap();
+    let s = cat.get(Layer::Global, "pdf").unwrap().skill().unwrap();
+    assert_eq!(s.frontmatter.description, "Shipped.");
+    assert!(s.shipped);
+    assert_eq!(cat.named("pdf").count(), 1);
+}
+
+#[test]
+fn star_covers_overlay_global_but_not_overlay_project() {
+    let home = tempfile::tempdir().unwrap();
+    let dirs = LayerDirs::for_layers(home.path(), None).with_overlay(vec![
+        overlay_of(home.path(), "a", "A.", Layer::Global),
+        overlay_of(home.path(), "b", "B.", Layer::Project),
+    ]);
+    let cat = SkillCatalog::discover(&dirs).unwrap();
+    let grants = rupu_skills::parse_grants(&["*".into()]).unwrap();
+    let got = rupu_skills::resolve_grants(&grants, &cat).unwrap();
+    let names: Vec<_> = got.iter().map(|s| s.name.as_str().to_string()).collect();
+    assert_eq!(names, ["a"]);
+}
+
+#[test]
+fn a_bare_name_bound_by_an_overlay_project_skill_and_an_installed_global_is_ambiguous() {
+    let home = tempfile::tempdir().unwrap();
+    write_skill(&home.path().join("skills"), "pdf", "pdf", "Installed.");
+    let dirs = LayerDirs::for_layers(home.path(), None).with_overlay(vec![overlay_of(
+        home.path(),
+        "pdf",
+        "P.",
+        Layer::Project,
+    )]);
+    let cat = SkillCatalog::discover(&dirs).unwrap();
+    let grants = rupu_skills::parse_grants(&["pdf".into()]).unwrap();
+    assert!(rupu_skills::resolve_grants(&grants, &cat).is_err());
+}
+
+#[test]
+fn installed_skills_load_unshipped() {
+    let home = tempfile::tempdir().unwrap();
+    write_skill(&home.path().join("skills"), "pdf", "pdf", "Installed.");
+    let cat = SkillCatalog::discover(&LayerDirs::for_layers(home.path(), None)).unwrap();
+    assert!(
+        !cat.get(Layer::Global, "pdf")
+            .unwrap()
+            .skill()
+            .unwrap()
+            .shipped
+    );
+}
+
+#[test]
+fn an_overlay_dir_named_for_another_skill_is_an_invalid_entry() {
+    let home = tempfile::tempdir().unwrap();
+    // Directory `pdf`, frontmatter name `evil`: content shipped under a name
+    // it does not carry.
+    let dir = write_skill(&home.path().join("ov"), "pdf", "evil", "Spoof.");
+    let dirs = LayerDirs::for_layers(home.path(), None).with_overlay(vec![OverlaySkill {
+        layer: Layer::Global,
+        name: "pdf".into(),
+        dir,
+    }]);
+    let cat = SkillCatalog::discover(&dirs).unwrap();
+    let e = cat.get(Layer::Global, "pdf").unwrap();
+    assert!(matches!(e.skill(), Err(SkillError::NameMismatch { .. })));
+    let grants = rupu_skills::parse_grants(&["pdf".into()]).unwrap();
+    assert!(rupu_skills::resolve_grants(&grants, &cat).is_err());
 }

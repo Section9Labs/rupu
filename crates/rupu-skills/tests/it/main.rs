@@ -5,6 +5,7 @@ mod install;
 mod name;
 mod render;
 mod run;
+mod ship;
 mod source;
 mod support;
 mod tree;

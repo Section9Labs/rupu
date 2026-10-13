@@ -13,6 +13,7 @@ use axum::{
     Json, Router,
 };
 use rupu_agent::loader::{find_agent, load_agents, AgentLoadError};
+use rupu_skills::ship::SkillBundleManifest;
 use rupu_workspace::{RepoRegistryStore, WorkspaceStore};
 use serde::{Deserialize, Serialize};
 use std::path::{Path as FsPath, PathBuf};
@@ -997,6 +998,10 @@ struct AgentRunBody {
     /// Optional preloaded skills — `rupu run --preload-skill`, as `skills`.
     #[serde(default)]
     preload_skills: Vec<String>,
+    /// The skills a coordinator shipped for a placed unit (`rupu run
+    /// --skill-bundle`). Validated; a malformed manifest is a 400.
+    #[serde(default)]
+    skill_bundle: Option<SkillBundleManifest>,
     /// Optional run id to execute under (`run_<…>`), minted by a
     /// coordinator that needs to know it before the run starts — honoured
     /// because `/api/host/info` advertises `run.supplied_run_id`. A malformed
@@ -1068,6 +1073,16 @@ fn parse_findings_profile(
         .transpose()
 }
 
+fn parse_skill_bundle(
+    bundle: Option<SkillBundleManifest>,
+) -> Result<Option<SkillBundleManifest>, ApiError> {
+    if let Some(m) = &bundle {
+        m.validate()
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    }
+    Ok(bundle)
+}
+
 /// Testable core: map the body + a concrete launcher to a run id.
 async fn run_agent_with(
     name: &str,
@@ -1078,6 +1093,7 @@ async fn run_agent_with(
     let engagement_profiles = parse_engagement_profiles(body.engagement_profiles)?;
     let skills = parse_skill_entries("skills", body.skills)?;
     let preload_skills = parse_skill_entries("preload_skills", body.preload_skills)?;
+    let skill_bundle = parse_skill_bundle(body.skill_bundle)?;
     let (run_id, codename) = parse_supplied_identity(body.run_id, body.codename)?;
     let req = AgentLaunchRequest {
         codename,
@@ -1091,6 +1107,7 @@ async fn run_agent_with(
         engagement_profiles,
         skills,
         preload_skills,
+        skill_bundle,
     };
     launcher.launch(req).await.map_err(|e| match e {
         AgentLaunchError::Invalid(m) => ApiError::bad_request(m),
@@ -1226,6 +1243,7 @@ async fn run_agent(
         let engagement_profiles = parse_engagement_profiles(b.engagement_profiles)?;
         let skills = parse_skill_entries("skills", b.skills)?;
         let preload_skills = parse_skill_entries("preload_skills", b.preload_skills)?;
+        let skill_bundle = parse_skill_bundle(b.skill_bundle)?;
         let (run_id, codename) = parse_supplied_identity(b.run_id, b.codename)?;
         let conn = crate::api::runs::resolve_host(&s, &host)?;
         let req = AgentLaunchRequest {
@@ -1240,6 +1258,7 @@ async fn run_agent(
             engagement_profiles,
             skills,
             preload_skills,
+            skill_bundle,
         };
         let run_id = conn.launch_agent(req).await.map_err(|e| match e {
             HostConnectorError::NotFound(m) => ApiError::not_found(m),
@@ -1499,6 +1518,7 @@ mod tests {
             engagement_profiles: Vec::new(),
             skills: Vec::new(),
             preload_skills: Vec::new(),
+            skill_bundle: None,
             run_id: None,
             codename: None,
         };
@@ -1574,6 +1594,50 @@ mod tests {
         let err = run_agent_with("recon", body, mock.clone())
             .await
             .expect_err("a blank id must be refused");
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert!(mock.last.lock().unwrap().is_none(), "nothing launched");
+    }
+
+    #[tokio::test]
+    async fn run_agent_forwards_a_valid_skill_bundle() {
+        let mock = Arc::new(MockAgent {
+            last: Mutex::new(None),
+        });
+        let hash = "a".repeat(64);
+        let body: AgentRunBody = serde_json::from_value(serde_json::json!({
+            "skill_bundle": {
+                "version": 1,
+                "skills": [{ "layer": "global", "name": "pdf", "content_hash": hash }]
+            }
+        }))
+        .unwrap();
+        run_agent_with("recon", body, mock.clone())
+            .await
+            .expect("ok");
+        let got = mock.last.lock().unwrap().take().unwrap();
+        let m = got.skill_bundle.clone().expect("forwarded");
+        assert_eq!(m.skills[0].name, "pdf");
+        let run = got.agent_run("run_X").unwrap();
+        let rendered: SkillBundleManifest =
+            serde_json::from_str(&run.skill_bundle.expect("rendered")).unwrap();
+        assert_eq!(rendered, m);
+    }
+
+    #[tokio::test]
+    async fn run_agent_rejects_a_bad_skill_bundle_before_launching() {
+        let mock = Arc::new(MockAgent {
+            last: Mutex::new(None),
+        });
+        let body: AgentRunBody = serde_json::from_value(serde_json::json!({
+            "skill_bundle": {
+                "version": 1,
+                "skills": [{ "layer": "global", "name": "pdf", "content_hash": "xyz" }]
+            }
+        }))
+        .unwrap();
+        let err = run_agent_with("recon", body, mock.clone())
+            .await
+            .expect_err("a bad hash must be refused");
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
         assert!(mock.last.lock().unwrap().is_none(), "nothing launched");
     }
@@ -1744,6 +1808,7 @@ mod tests {
             engagement_profiles: Vec::new(),
             skills: Vec::new(),
             preload_skills: Vec::new(),
+            skill_bundle: None,
             run_id: None,
             codename: None,
         };
@@ -1787,6 +1852,7 @@ mod tests {
             engagement_profiles: Vec::new(),
             skills: Vec::new(),
             preload_skills: Vec::new(),
+            skill_bundle: None,
             run_id: None,
             codename: None,
         };
@@ -1831,6 +1897,7 @@ mod tests {
             engagement_profiles: Vec::new(),
             skills: Vec::new(),
             preload_skills: Vec::new(),
+            skill_bundle: None,
             run_id: None,
             codename: None,
         };
@@ -1879,6 +1946,7 @@ mod tests {
             engagement_profiles: Vec::new(),
             skills: Vec::new(),
             preload_skills: Vec::new(),
+            skill_bundle: None,
             run_id: None,
             codename: None,
         };
@@ -1935,6 +2003,7 @@ mod tests {
             engagement_profiles: Vec::new(),
             skills: Vec::new(),
             preload_skills: Vec::new(),
+            skill_bundle: None,
             run_id: None,
             codename: None,
         };
@@ -1982,6 +2051,7 @@ mod tests {
             engagement_profiles: Vec::new(),
             skills: Vec::new(),
             preload_skills: Vec::new(),
+            skill_bundle: None,
             run_id: None,
             codename: None,
         };
@@ -2017,6 +2087,7 @@ mod tests {
             engagement_profiles: Vec::new(),
             skills: Vec::new(),
             preload_skills: Vec::new(),
+            skill_bundle: None,
             run_id: None,
             codename: None,
         };
@@ -2053,6 +2124,7 @@ mod tests {
             engagement_profiles: Vec::new(),
             skills: Vec::new(),
             preload_skills: Vec::new(),
+            skill_bundle: None,
             run_id: None,
             codename: None,
         };

@@ -1270,6 +1270,7 @@ fn rerun_args(invocation: &rupu_coverage::RerunInvocation) -> crate::cmd::run::A
         engagement_profiles: Vec::new(),
         skills: invocation.skills.clone(),
         preload_skills: invocation.preload_skills.clone(),
+        skill_bundle: None,
         continue_from: None,
         model: None,
         provider: None,

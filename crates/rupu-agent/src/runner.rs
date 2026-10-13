@@ -3839,6 +3839,7 @@ fn write_skill_index(
             preload: g.preload,
             indexed: g.indexed,
             reason: g.reason.as_str().to_owned(),
+            shipped: g.skill.shipped,
         })
         .collect();
     writer.write(&Event::SkillIndex { skills: rows })?;

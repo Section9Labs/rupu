@@ -2981,6 +2981,7 @@ mod tests {
                     preload: true,
                     indexed: false,
                     reason: "agent".into(),
+                    shipped: false,
                 }],
             },
             TranscriptEvent::SkillLoad {

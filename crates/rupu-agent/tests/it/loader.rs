@@ -58,3 +58,63 @@ fn parse_error_includes_path() {
     let msg = format!("{err}");
     assert!(msg.contains("bad.md"), "error should reference path: {msg}");
 }
+
+// ── find_agent_tolerant ─────────────────────────────────────────────────────
+
+const BROKEN: &str = "---\nname: [not a name\n---\n";
+
+#[test]
+fn tolerant_lookup_skips_an_unrelated_broken_file() {
+    let global = assert_fs::TempDir::new().unwrap();
+    write_agent(&global.child("agents"), "hello", HELLO);
+    write_agent(&global.child("agents"), "x", BROKEN);
+    assert!(rupu_agent::find_agent(global.path(), None, "hello").is_err());
+    let got = rupu_agent::find_agent_tolerant(global.path(), None, "hello").unwrap();
+    assert_eq!(got.name, "hello");
+    assert!(matches!(
+        rupu_agent::find_agent_tolerant(global.path(), None, "nobody"),
+        Err(rupu_agent::AgentLoadError::NotFound(n)) if n == "nobody"
+    ));
+}
+
+#[test]
+fn tolerant_lookup_reports_the_agents_own_broken_file() {
+    let global = assert_fs::TempDir::new().unwrap();
+    write_agent(&global.child("agents"), "hello", BROKEN);
+    match rupu_agent::find_agent_tolerant(global.path(), None, "hello") {
+        Err(rupu_agent::AgentLoadError::Parse { path, .. }) => {
+            assert!(path.ends_with("hello.md"), "{path}")
+        }
+        other => panic!("expected the agent's parse error, got {other:?}"),
+    }
+}
+
+#[test]
+fn tolerant_lookup_reports_a_file_it_could_not_read() {
+    // Any `.md` entry may hold the agent under another file name, so one
+    // that can't be read is an error (which an fd-exhaustion retry can
+    // classify), never NotFound. A directory stands in for an unreadable
+    // file: a permission seam doesn't bind under root.
+    let global = assert_fs::TempDir::new().unwrap();
+    std::fs::create_dir_all(global.child("agents").child("x.md").path()).unwrap();
+    match rupu_agent::find_agent_tolerant(global.path(), None, "hello") {
+        Err(rupu_agent::AgentLoadError::Parse {
+            path,
+            source: rupu_agent::AgentSpecParseError::Io(_),
+        }) => assert!(path.ends_with("x.md"), "{path}"),
+        other => panic!("expected the unreadable file's io error, got {other:?}"),
+    }
+}
+
+#[test]
+fn tolerant_lookup_follows_project_shadowing_and_frontmatter_names() {
+    let global = assert_fs::TempDir::new().unwrap();
+    let project = assert_fs::TempDir::new().unwrap();
+    write_agent(&global.child("agents"), "hello", HELLO);
+    // The project's copy lives under another file name: the frontmatter
+    // name is what shadows.
+    write_agent(&project.child("agents"), "renamed", HELLO2);
+    let got =
+        rupu_agent::find_agent_tolerant(global.path(), Some(project.path()), "hello").unwrap();
+    assert!(got.system_prompt.contains("HELLO TWO"));
+}

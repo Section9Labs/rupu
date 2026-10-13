@@ -19,12 +19,14 @@ use rupu_cp::{
             RunStartEvidence,
         },
         registry::HostRegistry,
+        skill_ship::{ShipOutcome, SkillBundle},
     },
 };
 use rupu_orchestrator::runner::{
     PreparedWorkspace, UnitCoverage, UnitDispatch, UnitDispatcher, UnitFailure, UnitOutcome,
     WorkspaceConflict, WorkspaceDelta,
 };
+use rupu_skills::{ship::SkillBundleManifest, SkillReason};
 
 // ── Poll constants ─────────────────────────────────────────────────────────────
 
@@ -157,6 +159,51 @@ fn host_err_to_run_err(e: HostConnectorError) -> RunError {
     RunError::Provider(e.to_string())
 }
 
+/// What a unit whose skills shipped launches with: the manifest, and the
+/// step's skill entries as they resolved on the coordinator (`layer:name`),
+/// so a host whose own layers would read a bare name or `*` differently —
+/// a bare name it holds in both layers is ambiguous there — runs exactly
+/// the shipped set.
+struct ShippedSkills {
+    manifest: SkillBundleManifest,
+    skills: Vec<String>,
+    preload_skills: Vec<String>,
+}
+
+impl ShippedSkills {
+    fn new(manifest: SkillBundleManifest, step: Option<&rupu_skills::ResolvedSkills>) -> Self {
+        let (mut skills, mut preload_skills) = (Vec::new(), Vec::new());
+        for g in step.map(|s| s.entries()).unwrap_or_default() {
+            let entry = format!("{}:{}", g.skill.layer, g.name());
+            if g.preload {
+                preload_skills.push(entry);
+            } else {
+                skills.push(entry);
+            }
+        }
+        Self {
+            manifest,
+            skills,
+            preload_skills,
+        }
+    }
+}
+
+/// How every P5 downgrade warning ends, whichever transport said why.
+const DOWNGRADE: &str = "; the unit uses that host's installed skills";
+
+/// `msg` led by `host <id>: `, unless it already is. A connector may name
+/// its peer another way (HTTP by its base URL), so every placed-unit failure
+/// names the host id the workflow placed it on.
+fn prefix_host(host: &str, msg: &str) -> String {
+    let prefix = format!("host {host}: ");
+    if msg.starts_with(&prefix) {
+        msg.to_string()
+    } else {
+        format!("{prefix}{msg}")
+    }
+}
+
 /// Why a read taken before the unit was seen terminal can be short: the unit
 /// may still be writing its stream on the host.
 const SNAPSHOT_REASON: &str =
@@ -248,72 +295,163 @@ impl Resolver {
 
 /// Dispatches remote fan-out units through the [`HostRegistry`].
 ///
-/// Production path: `new(registry, global)` — resolves the connector from the
-/// registry on every `dispatch_unit` call.
-/// Test/seam path: `from_connector(conn, global)` — bypasses registry
-/// resolution.
+/// Production path: `new(registry, global, project)` — resolves the
+/// connector from the registry on every `dispatch_unit` call.
+/// Test/seam path: `from_connector(conn, global, project)` — bypasses
+/// registry resolution.
 pub struct FleetUnitDispatcher {
     resolver: Resolver,
     /// The CP global dir: `NodeMirror` mirrors a placed unit's transcript to
     /// `<global>/transcripts/<run_id>.jsonl` (PR #646), which is what
-    /// `unit_transcript_path` hands the runner.
+    /// `unit_transcript_path` hands the runner. Also the global layer a
+    /// unit's agent and skills are resolved in before they are shipped.
     global: PathBuf,
+    /// The workflow's project root, whose `.rupu/` is the project layer a
+    /// unit's agent and skills are resolved in.
+    project: Option<PathBuf>,
 }
 
 impl FleetUnitDispatcher {
     /// Production constructor: resolves the connector via `registry` per call.
-    pub fn new(registry: Arc<HostRegistry>, global: PathBuf) -> Self {
+    pub fn new(registry: Arc<HostRegistry>, global: PathBuf, project: Option<PathBuf>) -> Self {
         Self {
             resolver: Resolver::Registry(registry),
             global,
+            project,
         }
     }
 
     /// Seam constructor for tests: always uses `conn`, skipping registry lookup.
-    pub fn from_connector(conn: Arc<dyn HostConnector>, global: PathBuf) -> Self {
+    pub fn from_connector(
+        conn: Arc<dyn HostConnector>,
+        global: PathBuf,
+        project: Option<PathBuf>,
+    ) -> Self {
         Self {
             resolver: Resolver::Fixed(conn),
             global,
+            project,
         }
     }
-}
 
-#[async_trait]
-impl UnitDispatcher for FleetUnitDispatcher {
-    /// Pack the coordinator workspace once for a whole step.
-    ///
-    /// Two things are load-bearing here and neither was true when this pack
-    /// lived inside `dispatch_unit`:
-    ///
-    /// 1. **It runs once per step, not once per unit.** The caller
-    ///    (`run_fanout_step` / `dispatch_placed_step`) owns the "one logical
-    ///    moment" all of a step's units stage from, so it owns the pack.
-    /// 2. **It runs on the blocking pool.** `rupu_workspace::pack` is a fully
-    ///    synchronous tree walk + tar/git pack — measured at ~64 s for a
-    ///    51 MB / 3,345-file workspace. Awaiting nothing while occupying a
-    ///    runtime worker thread for a minute starves the poll loops and the
-    ///    SSH tail pumps that keep every OTHER in-flight unit alive, so with
-    ///    P concurrent packs P worker threads went dark at once. The CLI is
-    ///    `#[tokio::main]` multi-thread; `spawn_blocking` is where this
-    ///    belongs.
-    async fn prepare_workspace(
+    /// P1: resolve on the coordinator what the unit is granted — its agent's
+    /// keys, when this coordinator has the agent, plus the step's — and ship
+    /// those skills to the host. What the unit launches with, or `None` when
+    /// nothing ships or the host can't take shipped skills (P5: a warning,
+    /// and the host's installed copies). Fails, before anything is staged or
+    /// launched, when a skill doesn't resolve here, as a local run would, or
+    /// the transfer fails.
+    async fn ship_unit_skills(
         &self,
-        workspace_path: &Path,
-    ) -> Result<PreparedWorkspace, RunError> {
-        let ws = workspace_path.to_path_buf();
-        let payload = tokio::task::spawn_blocking(move || rupu_workspace::pack(&ws))
+        conn: &Arc<dyn HostConnector>,
+        unit: &UnitDispatch,
+        warnings: &mut Vec<String>,
+    ) -> Result<Option<ShippedSkills>, RunError> {
+        let project = self.project.as_ref().map(|root| root.join(".rupu"));
+        let mut requests = Vec::with_capacity(2);
+        if let Some(agent) = self.coordinator_agent(&unit.agent, warnings).await {
+            requests.push((
+                SkillReason::Agent,
+                agent.skills.unwrap_or_default(),
+                agent.preload_skills.unwrap_or_default(),
+            ));
+        }
+        requests.push((
+            SkillReason::Launch,
+            unit.skills.clone(),
+            unit.preload_skills.clone(),
+        ));
+        let dirs = rupu_skills::LayerDirs::for_layers(&self.global, project.as_deref());
+        let (dirs, agent) = (&dirs, unit.agent.as_str());
+        let resolve = move |requests| async move {
+            rupu_runtime::assembly::resolve_skill_requests(dirs, agent, requests)
+                .await
+                .map_err(|e| RunError::Provider(e.to_string()))
+        };
+        let Some(resolved) = resolve(requests).await? else {
+            return Ok(None);
+        };
+        let bundle = SkillBundle::new(
+            resolved
+                .entries()
+                .iter()
+                .map(|g| Arc::clone(&g.skill))
+                .collect(),
+        );
+        match conn
+            .ship_skills(&bundle)
             .await
-            .map_err(|e| RunError::Provider(format!("workspace pack task failed: {e}")))?
-            .map_err(|e| RunError::Provider(e.to_string()))?;
-        Ok(PreparedWorkspace::new(encode_payload(&payload)))
+            .map_err(host_err_to_run_err)?
+        {
+            ShipOutcome::Shipped(manifest) => {
+                // The step's own set, alone: the union above keeps the first
+                // request's reason and ORs preload across requests.
+                let step = resolve(vec![(
+                    SkillReason::Launch,
+                    unit.skills.clone(),
+                    unit.preload_skills.clone(),
+                )])
+                .await?;
+                Ok(Some(ShippedSkills::new(manifest, step.as_deref())))
+            }
+            ShipOutcome::NotNeeded => Ok(None),
+            ShipOutcome::Unsupported(why) => {
+                warnings.push(format!("{why}{DOWNGRADE}"));
+                Ok(None)
+            }
+        }
     }
 
-    async fn dispatch_unit(
+    /// This coordinator's copy of `name`, whose skill keys ship with the unit.
+    /// `None` when it has none (the step's skills still ship); when its own
+    /// file can't be read, also a warning naming it, since the agent's skills
+    /// then come from the host's installed copies. Another agent's broken
+    /// file changes nothing.
+    async fn coordinator_agent(
         &self,
+        name: &str,
+        warnings: &mut Vec<String>,
+    ) -> Option<rupu_agent::AgentSpec> {
+        let found = rupu_agent::fd_budget::retry_on_fd_exhaustion(
+            name,
+            &rupu_agent::fd_budget::Policy::default(),
+            rupu_agent::fd_budget::grow,
+            || {
+                let global = self.global.clone();
+                let project = self.project.as_ref().map(|root| root.join(".rupu"));
+                let name = name.to_string();
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        rupu_agent::find_agent_tolerant(&global, project.as_deref(), &name)
+                    })
+                    .await
+                    .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))
+                }
+            },
+        )
+        .await;
+        match found {
+            Ok(agent) => Some(agent),
+            Err(rupu_agent::AgentLoadError::NotFound(_)) => None,
+            Err(e) => {
+                warnings.push(format!(
+                    "the coordinator could not read agent `{name}` ({e}), so its skills are not \
+                     shipped; the host's installed copies are used for them"
+                ));
+                None
+            }
+        }
+    }
+
+    /// Launch the unit (staging its workspace first when it syncs one) and
+    /// poll the mirrored run until it is terminal.
+    async fn launch_and_wait(
+        &self,
+        conn: &Arc<dyn HostConnector>,
         unit: UnitDispatch,
         host: &str,
+        skill_bundle: Option<SkillBundleManifest>,
     ) -> Result<UnitOutcome, UnitFailure> {
-        let conn = self.resolver.resolve(host)?;
         let unit_run_id = unit.run_id.clone();
 
         // When the unit runs in `Sync` mode, stage the step's ALREADY-PACKED
@@ -353,6 +491,9 @@ impl UnitDispatcher for FleetUnitDispatcher {
                 // refused.
                 skills: unit.skills,
                 preload_skills: unit.preload_skills,
+                // What `ship_skills` confirmed the host holds; `None` when
+                // nothing ships or the host can't take shipped skills (P5).
+                skill_bundle,
             })
             .await
         {
@@ -466,8 +607,9 @@ impl UnitDispatcher for FleetUnitDispatcher {
                     // its coverage stream after this read is not collected,
                     // so the stream is Partial and the runner says so.
                     let why = format!("the coordinator's poll of the run failed ({e})");
-                    let coverage = collect_coverage(&conn, &run_id, Some(&why)).await;
+                    let coverage = collect_coverage(conn, &run_id, Some(&why)).await;
                     return Err(UnitFailure {
+                        warnings: Vec::new(),
                         error: host_err_to_run_err(e),
                         coverage,
                     });
@@ -497,7 +639,7 @@ impl UnitDispatcher for FleetUnitDispatcher {
                 // failed unit's findings are still real. Collected before the
                 // delta so a delta error below still carries it. Partial when
                 // the transport cannot confirm the copy is whole.
-                let coverage = collect_coverage(&conn, &run_id, None).await;
+                let coverage = collect_coverage(conn, &run_id, None).await;
 
                 let output = run["final_output"].as_str().unwrap_or("").to_string();
                 let success = status == "completed";
@@ -519,6 +661,7 @@ impl UnitDispatcher for FleetUnitDispatcher {
                             Ok(b) => b,
                             Err(e) => {
                                 return Err(UnitFailure {
+                                    warnings: Vec::new(),
                                     error: host_err_to_run_err(e),
                                     coverage,
                                 })
@@ -528,6 +671,7 @@ impl UnitDispatcher for FleetUnitDispatcher {
                             Ok(d) => d,
                             Err(e) => {
                                 return Err(UnitFailure {
+                                    warnings: Vec::new(),
                                     error: host_err_to_run_err(e),
                                     coverage,
                                 })
@@ -543,6 +687,7 @@ impl UnitDispatcher for FleetUnitDispatcher {
                 };
 
                 return Ok(UnitOutcome {
+                    warnings: Vec::new(),
                     output,
                     success,
                     error,
@@ -584,7 +729,7 @@ impl UnitDispatcher for FleetUnitDispatcher {
             UnitCoverage::NotLaunched
         } else {
             collect_coverage(
-                &conn,
+                conn,
                 &run_id,
                 Some("the coordinator stopped waiting at its wall-clock budget"),
             )
@@ -592,6 +737,7 @@ impl UnitDispatcher for FleetUnitDispatcher {
         };
 
         Err(UnitFailure {
+            warnings: Vec::new(),
             error: RunError::Provider(match (never_started, last_startup_err) {
                 // Never started: the run was launched but the host never showed
                 // any sign of it. Say that, rather than "timed out polling" — the
@@ -655,6 +801,75 @@ impl UnitDispatcher for FleetUnitDispatcher {
             }),
             coverage,
         })
+    }
+}
+
+#[async_trait]
+impl UnitDispatcher for FleetUnitDispatcher {
+    /// Pack the coordinator workspace once for a whole step.
+    ///
+    /// Two things are load-bearing here and neither was true when this pack
+    /// lived inside `dispatch_unit`:
+    ///
+    /// 1. **It runs once per step, not once per unit.** The caller
+    ///    (`run_fanout_step` / `dispatch_placed_step`) owns the "one logical
+    ///    moment" all of a step's units stage from, so it owns the pack.
+    /// 2. **It runs on the blocking pool.** `rupu_workspace::pack` is a fully
+    ///    synchronous tree walk + tar/git pack — measured at ~64 s for a
+    ///    51 MB / 3,345-file workspace. Awaiting nothing while occupying a
+    ///    runtime worker thread for a minute starves the poll loops and the
+    ///    SSH tail pumps that keep every OTHER in-flight unit alive, so with
+    ///    P concurrent packs P worker threads went dark at once. The CLI is
+    ///    `#[tokio::main]` multi-thread; `spawn_blocking` is where this
+    ///    belongs.
+    async fn prepare_workspace(
+        &self,
+        workspace_path: &Path,
+    ) -> Result<PreparedWorkspace, RunError> {
+        let ws = workspace_path.to_path_buf();
+        let payload = tokio::task::spawn_blocking(move || rupu_workspace::pack(&ws))
+            .await
+            .map_err(|e| RunError::Provider(format!("workspace pack task failed: {e}")))?
+            .map_err(|e| RunError::Provider(e.to_string()))?;
+        Ok(PreparedWorkspace::new(encode_payload(&payload)))
+    }
+
+    /// Ships the unit's skills, then launches it and waits for it. Every
+    /// failure after `host` resolves, and the error of a remote run that
+    /// failed, names the host ([`prefix_host`]); so does each warning.
+    async fn dispatch_unit(
+        &self,
+        unit: UnitDispatch,
+        host: &str,
+    ) -> Result<UnitOutcome, UnitFailure> {
+        let conn = self.resolver.resolve(host)?;
+        let mut warnings = Vec::new();
+        let mut unit = unit;
+        let result = match self.ship_unit_skills(&conn, &unit, &mut warnings).await {
+            Ok(Some(shipped)) => {
+                unit.skills = shipped.skills;
+                unit.preload_skills = shipped.preload_skills;
+                self.launch_and_wait(&conn, unit, host, Some(shipped.manifest))
+                    .await
+            }
+            Ok(None) => self.launch_and_wait(&conn, unit, host, None).await,
+            Err(e) => Err(e.into()),
+        };
+        let warnings: Vec<String> = warnings.iter().map(|w| prefix_host(host, w)).collect();
+        match result {
+            Ok(mut outcome) => {
+                outcome.error = outcome.error.map(|e| prefix_host(host, &e));
+                outcome.warnings.extend(warnings);
+                Ok(outcome)
+            }
+            Err(mut failure) => {
+                if let RunError::Provider(m) = &failure.error {
+                    failure.error = RunError::Provider(prefix_host(host, m));
+                }
+                failure.warnings.extend(warnings);
+                Err(failure)
+            }
+        }
     }
 
     /// Bridge the orchestrator's opaque deltas to the `rupu-workspace` codec and
@@ -777,6 +992,7 @@ fn local_agent_launcher() -> Option<Arc<dyn rupu_cp::agent_launcher::AgentLaunch
 pub fn build_dispatcher_if_needed(
     workflow: &rupu_orchestrator::Workflow,
     global: &Path,
+    project_root: Option<&Path>,
     run_store: Arc<rupu_orchestrator::runs::RunStore>,
     pricing: rupu_config::PricingConfig,
 ) -> Option<Arc<dyn UnitDispatcher>> {
@@ -815,6 +1031,7 @@ pub fn build_dispatcher_if_needed(
     Some(Arc::new(FleetUnitDispatcher::new(
         Arc::new(registry),
         global.to_path_buf(),
+        project_root.map(Path::to_path_buf),
     )))
 }
 
@@ -876,6 +1093,20 @@ mod tests {
         /// When set, `get_run` fails once the `non_terminal_polls` have been
         /// served — a host that stops answering after the run was observed.
         poll_error_after_running: bool,
+        /// What `ship_skills` answers.
+        ship: ShipScript,
+        /// The skill names of every bundle `ship_skills` was handed, sorted.
+        shipped: std::sync::Mutex<Vec<Vec<String>>>,
+        /// When set, `launch_agent` fails as an unreachable host would.
+        launch_error: Option<&'static str>,
+    }
+
+    /// What a fake's `ship_skills` answers.
+    #[derive(Clone)]
+    enum ShipScript {
+        Answer(rupu_cp::host::skill_ship::ShipOutcome),
+        Unreachable(&'static str),
+        Unsupported(&'static str),
     }
 
     impl FakeConnector {
@@ -900,6 +1131,9 @@ mod tests {
                 coverage_incomplete: false,
                 delta: None,
                 poll_error_after_running: false,
+                ship: ShipScript::Answer(rupu_cp::host::skill_ship::ShipOutcome::NotNeeded),
+                shipped: Default::default(),
+                launch_error: None,
             }
         }
 
@@ -939,6 +1173,9 @@ mod tests {
                 coverage_incomplete: false,
                 delta: None,
                 poll_error_after_running: false,
+                ship: ShipScript::Answer(rupu_cp::host::skill_ship::ShipOutcome::NotNeeded),
+                shipped: Default::default(),
+                launch_error: None,
             }
         }
 
@@ -963,6 +1200,25 @@ mod tests {
 
     #[async_trait]
     impl HostConnector for FakeConnector {
+        async fn ship_skills(
+            &self,
+            bundle: &rupu_cp::host::skill_ship::SkillBundle,
+        ) -> Result<
+            rupu_cp::host::skill_ship::ShipOutcome,
+            rupu_cp::host::connector::HostConnectorError,
+        > {
+            self.calls.lock().unwrap().push("ship_skills");
+            let mut names: Vec<String> =
+                bundle.skills().iter().map(|s| s.name.to_string()).collect();
+            names.sort();
+            self.shipped.lock().unwrap().push(names);
+            match &self.ship {
+                ShipScript::Answer(a) => Ok(a.clone()),
+                ShipScript::Unreachable(m) => Err(HostConnectorError::Unreachable(m.to_string())),
+                ShipScript::Unsupported(m) => Err(HostConnectorError::Unsupported(m.to_string())),
+            }
+        }
+
         async fn info(&self) -> Result<HostInfo, HostConnectorError> {
             unimplemented!()
         }
@@ -973,8 +1229,12 @@ mod tests {
             &self,
             req: AgentLaunchRequest,
         ) -> Result<String, HostConnectorError> {
+            self.calls.lock().unwrap().push("launch_agent");
             *self.launched.lock().unwrap() = Some(req);
-            Ok(self.run_id.to_string())
+            match self.launch_error {
+                Some(m) => Err(HostConnectorError::Unreachable(m.to_string())),
+                None => Ok(self.run_id.to_string()),
+            }
         }
         async fn start_session(
             &self,
@@ -1120,6 +1380,16 @@ mod tests {
 
     #[async_trait]
     impl HostConnector for UnreachableConnector {
+        async fn ship_skills(
+            &self,
+            _: &rupu_cp::host::skill_ship::SkillBundle,
+        ) -> Result<
+            rupu_cp::host::skill_ship::ShipOutcome,
+            rupu_cp::host::connector::HostConnectorError,
+        > {
+            Ok(rupu_cp::host::skill_ship::ShipOutcome::NotNeeded)
+        }
+
         async fn info(&self) -> Result<HostInfo, HostConnectorError> {
             unimplemented!()
         }
@@ -1260,7 +1530,7 @@ mod tests {
         // Enough polls to fail the old code (which aborted on the very first
         // error) without making the test itself slow.
         let conn = Arc::new(FakeConnector::completed_after_startup_delay(5));
-        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"), None);
         let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
         assert!(
             out.success,
@@ -1272,7 +1542,7 @@ mod tests {
     #[tokio::test]
     async fn fleet_dispatch_reads_final_output_from_mirror() {
         let conn = Arc::new(FakeConnector::completed());
-        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"), None);
         let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
         assert_eq!(out.output, "fake-out");
         assert!(out.success);
@@ -1291,6 +1561,7 @@ mod tests {
         let d = FleetUnitDispatcher::from_connector(
             Arc::clone(&conn) as Arc<dyn HostConnector>,
             PathBuf::from("/g"),
+            None,
         );
         let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
         assert!(out.success);
@@ -1316,7 +1587,7 @@ mod tests {
     #[tokio::test]
     async fn fleet_dispatch_failed_run_surfaces_error_message() {
         let conn = Arc::new(FakeConnector::failed());
-        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"), None);
         let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
         assert!(!out.success);
         let err = out.error.expect("failed run must have an error field");
@@ -1331,6 +1602,7 @@ mod tests {
         let d = FleetUnitDispatcher::from_connector(
             Arc::clone(&conn) as Arc<dyn HostConnector>,
             PathBuf::from("/g"),
+            None,
         );
         let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
         assert_eq!(out.coverage, UnitCoverage::Stream(b"stream".to_vec()));
@@ -1340,7 +1612,7 @@ mod tests {
     async fn a_failed_unit_still_carries_its_coverage() {
         let mut conn = FakeConnector::failed();
         conn.coverage = b"stream".to_vec();
-        let d = FleetUnitDispatcher::from_connector(Arc::new(conn), PathBuf::from("/g"));
+        let d = FleetUnitDispatcher::from_connector(Arc::new(conn), PathBuf::from("/g"), None);
         let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
         assert!(!out.success);
         assert_eq!(out.coverage, UnitCoverage::Stream(b"stream".to_vec()));
@@ -1352,7 +1624,7 @@ mod tests {
     async fn a_connector_that_cannot_deliver_is_unavailable() {
         let mut conn = FakeConnector::completed();
         conn.coverage_fails = true;
-        let d = FleetUnitDispatcher::from_connector(Arc::new(conn), PathBuf::from("/g"));
+        let d = FleetUnitDispatcher::from_connector(Arc::new(conn), PathBuf::from("/g"), None);
         let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
         assert!(
             matches!(&out.coverage, UnitCoverage::Unavailable(m) if m.contains("down") && !m.contains("h1")),
@@ -1368,7 +1640,7 @@ mod tests {
         let mut conn = FakeConnector::completed();
         conn.coverage = b"tailed".to_vec();
         conn.coverage_incomplete = true;
-        let d = FleetUnitDispatcher::from_connector(Arc::new(conn), PathBuf::from("/g"));
+        let d = FleetUnitDispatcher::from_connector(Arc::new(conn), PathBuf::from("/g"), None);
         let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
         assert!(
             matches!(&out.coverage, UnitCoverage::Partial { bytes, reason }
@@ -1383,6 +1655,7 @@ mod tests {
         let d = FleetUnitDispatcher::from_connector(
             Arc::new(UnreachableConnector),
             PathBuf::from("/g"),
+            None,
         );
         let err = d.dispatch_unit(make_unit(), "h1").await.unwrap_err();
         assert_eq!(err.coverage, UnitCoverage::NotLaunched);
@@ -1394,7 +1667,7 @@ mod tests {
     async fn a_delta_collection_failure_still_carries_the_coverage() {
         let mut conn = FakeConnector::completed();
         conn.coverage = b"stream".to_vec();
-        let d = FleetUnitDispatcher::from_connector(Arc::new(conn), PathBuf::from("/g"));
+        let d = FleetUnitDispatcher::from_connector(Arc::new(conn), PathBuf::from("/g"), None);
         let mut unit = make_unit();
         let ws = tempfile::tempdir().unwrap();
         std::fs::write(ws.path().join("f.txt"), "hi").unwrap();
@@ -1411,7 +1684,7 @@ mod tests {
         let mut conn = FakeConnector::completed();
         conn.coverage = b"stream".to_vec();
         conn.delta = Some(Vec::new());
-        let d = FleetUnitDispatcher::from_connector(Arc::new(conn), PathBuf::from("/g"));
+        let d = FleetUnitDispatcher::from_connector(Arc::new(conn), PathBuf::from("/g"), None);
         let mut unit = make_unit();
         let ws = tempfile::tempdir().unwrap();
         std::fs::write(ws.path().join("f.txt"), "hi").unwrap();
@@ -1430,7 +1703,7 @@ mod tests {
         conn.non_terminal_polls = std::sync::atomic::AtomicU32::new(1);
         conn.poll_error_after_running = true;
         conn.coverage = b"partial".to_vec();
-        let d = FleetUnitDispatcher::from_connector(Arc::new(conn), PathBuf::from("/g"));
+        let d = FleetUnitDispatcher::from_connector(Arc::new(conn), PathBuf::from("/g"), None);
 
         let err = d.dispatch_unit(make_unit(), "h1").await.unwrap_err();
         assert!(err.to_string().contains("host went away"), "{err}");
@@ -1449,7 +1722,7 @@ mod tests {
     async fn a_wall_timeout_on_a_started_run_carries_its_coverage() {
         let mut conn = FakeConnector::alive_but_unobservable_for(u32::MAX);
         conn.coverage = b"partial".to_vec();
-        let d = FleetUnitDispatcher::from_connector(Arc::new(conn), PathBuf::from("/g"));
+        let d = FleetUnitDispatcher::from_connector(Arc::new(conn), PathBuf::from("/g"), None);
 
         let err = d.dispatch_unit(make_unit(), "h1").await.unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
@@ -1471,6 +1744,7 @@ mod tests {
         let d = FleetUnitDispatcher::from_connector(
             Arc::clone(&conn) as Arc<dyn HostConnector>,
             PathBuf::from("/g"),
+            None,
         );
 
         let err = d.dispatch_unit(make_unit(), "h1").await.unwrap_err();
@@ -1506,7 +1780,7 @@ mod tests {
     #[tokio::test]
     async fn fleet_dispatch_unreachable_host_errors() {
         let conn = Arc::new(UnreachableConnector);
-        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"), None);
         let result = d.dispatch_unit(make_unit(), "h1").await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
@@ -1534,6 +1808,7 @@ steps:
         let got = build_dispatcher_if_needed(
             &wf,
             dir.path(),
+            None,
             store,
             rupu_config::PricingConfig::default(),
         );
@@ -1561,6 +1836,7 @@ steps:
         let got = build_dispatcher_if_needed(
             &wf,
             dir.path(),
+            None,
             store,
             rupu_config::PricingConfig::default(),
         );
@@ -1627,6 +1903,16 @@ steps:
 
     #[async_trait]
     impl HostConnector for StagingRecorder {
+        async fn ship_skills(
+            &self,
+            _: &rupu_cp::host::skill_ship::SkillBundle,
+        ) -> Result<
+            rupu_cp::host::skill_ship::ShipOutcome,
+            rupu_cp::host::connector::HostConnectorError,
+        > {
+            Ok(rupu_cp::host::skill_ship::ShipOutcome::NotNeeded)
+        }
+
         async fn info(&self) -> Result<HostInfo, HostConnectorError> {
             unimplemented!()
         }
@@ -1757,6 +2043,7 @@ steps:
         let d = FleetUnitDispatcher::from_connector(
             Arc::clone(&conn) as Arc<dyn HostConnector>,
             PathBuf::from("/g"),
+            None,
         );
 
         // ONE pack for the whole step — exactly what `run_fanout_step` does.
@@ -1827,6 +2114,7 @@ steps:
         let d = FleetUnitDispatcher::from_connector(
             Arc::clone(&conn) as Arc<dyn HostConnector>,
             PathBuf::from("/g"),
+            None,
         );
 
         let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
@@ -1857,7 +2145,7 @@ steps:
     async fn workspace_sync_on_unsupported_transport_errors() {
         // UnreachableConnector inherits the default stage_workspace = Unsupported.
         let conn = Arc::new(UnreachableConnector);
-        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"), None);
         let mut unit = make_unit();
         // Use a real dir so `pack` succeeds and `stage_workspace` (the default
         // Unsupported impl) is the genuine failure point.
@@ -1881,7 +2169,7 @@ steps:
     #[tokio::test]
     async fn apply_bridges_to_workspace_codec() {
         let conn = Arc::new(FakeConnector::completed());
-        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"), None);
         let ws = tempfile::tempdir().unwrap();
         // Build two disjoint tar-mode orchestrator deltas via the same encode
         // path the dispatcher uses (payload = wire-encoded one-file tar delta).
@@ -1946,7 +2234,7 @@ steps:
     #[tokio::test]
     async fn apply_workspace_deltas_merges_each_units_tag_log() {
         let conn = Arc::new(FakeConnector::completed());
-        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"), None);
         let ws = tempfile::tempdir().unwrap();
         let log = rupu_coverage::TagLog::for_workspace(ws.path());
         let shared = tag_line("tge_shared", "fnd_a", "shared");
@@ -1993,7 +2281,7 @@ steps:
     #[tokio::test]
     async fn apply_workspace_deltas_keeps_the_files_when_the_tag_merge_fails() {
         let conn = Arc::new(FakeConnector::completed());
-        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"), None);
         let ws = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(ws.path().join(rupu_workspace::TAG_LOG_PATH)).unwrap();
         let line = tag_line("tge_u1", "fnd_b", "from-unit");
@@ -2019,7 +2307,7 @@ steps:
     #[tokio::test]
     async fn strip_delta_coverage_bridges_to_the_workspace_codec() {
         let conn = Arc::new(FakeConnector::completed());
-        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"), None);
         let mut buf = Vec::new();
         {
             let mut b = tar::Builder::new(&mut buf);
@@ -2064,7 +2352,7 @@ steps:
     #[tokio::test]
     async fn strip_delta_coverage_reports_an_undecodable_payload() {
         let conn = Arc::new(FakeConnector::completed());
-        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"), None);
         let bad = rupu_orchestrator::runner::WorkspaceDelta {
             changed: vec![],
             deleted: vec![],
@@ -2079,7 +2367,7 @@ steps:
     #[tokio::test]
     async fn apply_workspace_deltas_conflict_on_overlapping_paths() {
         let conn = Arc::new(FakeConnector::completed());
-        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"), None);
         let ws = tempfile::tempdir().unwrap();
         // Two deltas that both claim to change "shared.txt".
         let a = rupu_orchestrator::runner::WorkspaceDelta {
@@ -2131,6 +2419,16 @@ steps:
 
     #[async_trait]
     impl HostConnector for StageOkLaunchFailsConnector {
+        async fn ship_skills(
+            &self,
+            _: &rupu_cp::host::skill_ship::SkillBundle,
+        ) -> Result<
+            rupu_cp::host::skill_ship::ShipOutcome,
+            rupu_cp::host::connector::HostConnectorError,
+        > {
+            Ok(rupu_cp::host::skill_ship::ShipOutcome::NotNeeded)
+        }
+
         async fn info(&self) -> Result<HostInfo, HostConnectorError> {
             unimplemented!()
         }
@@ -2241,6 +2539,7 @@ steps:
         let d = FleetUnitDispatcher::from_connector(
             Arc::clone(&conn) as Arc<dyn HostConnector>,
             PathBuf::from("/g"),
+            None,
         );
 
         let mut unit = make_unit();
@@ -2278,6 +2577,16 @@ steps:
 
     #[async_trait]
     impl HostConnector for StageOkPollNeverTerminalConnector {
+        async fn ship_skills(
+            &self,
+            _: &rupu_cp::host::skill_ship::SkillBundle,
+        ) -> Result<
+            rupu_cp::host::skill_ship::ShipOutcome,
+            rupu_cp::host::connector::HostConnectorError,
+        > {
+            Ok(rupu_cp::host::skill_ship::ShipOutcome::NotNeeded)
+        }
+
         async fn info(&self) -> Result<HostInfo, HostConnectorError> {
             unimplemented!()
         }
@@ -2395,7 +2704,7 @@ steps:
     #[tokio::test(start_paused = true)]
     async fn placed_run_outliving_the_old_poll_budget_still_completes() {
         let conn = Arc::new(FakeConnector::completed_after_non_terminal_polls(400));
-        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"), None);
         let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
         assert!(
             out.success,
@@ -2412,6 +2721,7 @@ steps:
         let d = FleetUnitDispatcher::from_connector(
             Arc::clone(&conn) as Arc<dyn HostConnector>,
             PathBuf::from("/g"),
+            None,
         );
 
         let mut unit = make_unit();
@@ -2445,6 +2755,7 @@ steps:
         let d = FleetUnitDispatcher::from_connector(
             Arc::clone(&conn) as Arc<dyn HostConnector>,
             PathBuf::from("/g"),
+            None,
         );
 
         let err = d
@@ -2496,6 +2807,7 @@ steps:
         let d = FleetUnitDispatcher::from_connector(
             Arc::clone(&conn) as Arc<dyn HostConnector>,
             PathBuf::from("/g"),
+            None,
         );
 
         let t0 = tokio::time::Instant::now();
@@ -2551,7 +2863,7 @@ steps:
     #[tokio::test(start_paused = true)]
     async fn run_observed_after_a_realistic_startup_delay_still_completes() {
         let conn = Arc::new(FakeConnector::completed_after_startup_delay(66));
-        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"), None);
 
         let t0 = tokio::time::Instant::now();
         let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
@@ -2582,7 +2894,7 @@ steps:
         let mut fake = FakeConnector::completed_after_startup_delay(5);
         fake.non_terminal_polls = std::sync::atomic::AtomicU32::new(400);
         let conn = Arc::new(fake);
-        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"), None);
 
         let t0 = tokio::time::Instant::now();
         let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
@@ -2633,6 +2945,7 @@ steps:
         let d = FleetUnitDispatcher::from_connector(
             Arc::clone(&conn) as Arc<dyn HostConnector>,
             PathBuf::from("/g"),
+            None,
         );
 
         let t0 = tokio::time::Instant::now();
@@ -2667,7 +2980,7 @@ steps:
     #[tokio::test(start_paused = true)]
     async fn transport_with_no_start_probe_still_fails_at_the_startup_deadline() {
         let conn = Arc::new(FakeConnector::with_unknown_evidence(u32::MAX));
-        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"), None);
 
         let t0 = tokio::time::Instant::now();
         let err = d
@@ -2703,7 +3016,7 @@ steps:
         let mut fake = FakeConnector::completed_after_startup_delay(u32::MAX);
         fake.launch_stderr = Some("[error] save worker record: io rename ...: No such file");
         let conn = Arc::new(fake);
-        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"), None);
 
         let err = d
             .dispatch_unit(make_unit(), "h1")
@@ -2726,6 +3039,7 @@ steps:
         let d = FleetUnitDispatcher::from_connector(
             Arc::clone(&conn) as Arc<dyn HostConnector>,
             PathBuf::from("/g"),
+            None,
         );
 
         let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
@@ -2744,6 +3058,7 @@ steps:
         let d = FleetUnitDispatcher::from_connector(
             Arc::clone(&conn) as Arc<dyn HostConnector>,
             PathBuf::from("/g"),
+            None,
         );
         let mut unit = make_unit();
         unit.run_id = "run_01UNITID".into();
@@ -2769,6 +3084,7 @@ steps:
             let d = FleetUnitDispatcher::from_connector(
                 Arc::clone(&conn) as Arc<dyn HostConnector>,
                 PathBuf::from("/g"),
+                None,
             );
             let mut unit = make_unit();
             unit.findings_profile = profile;
@@ -2785,6 +3101,7 @@ steps:
             let d = FleetUnitDispatcher::from_connector(
                 Arc::clone(&conn) as Arc<dyn HostConnector>,
                 PathBuf::from("/g"),
+                None,
             );
             let mut unit = make_unit();
             unit.engagement_profiles = ids.clone();
@@ -2794,8 +3111,17 @@ steps:
         }
     }
 
+    /// With nothing shipped, the step's entries reach the host as given: the
+    /// host resolves them against its own layers.
     #[tokio::test]
     async fn dispatch_passes_the_units_skills_to_launch_agent() {
+        // Installed where the coordinator resolves them, as a step's skills
+        // must be (an uninstalled one fails the unit before launch).
+        let g = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        write_skill(&g.path().join("skills"), "pdf");
+        write_skill(&g.path().join("skills"), "house-style");
+        write_skill(&root.path().join(".rupu/skills"), "notes");
         for (skills, preload) in [
             (
                 vec!["pdf".to_string(), "project:notes".to_string()],
@@ -2806,7 +3132,8 @@ steps:
             let conn = Arc::new(FakeConnector::completed());
             let d = FleetUnitDispatcher::from_connector(
                 Arc::clone(&conn) as Arc<dyn HostConnector>,
-                PathBuf::from("/g"),
+                g.path().to_path_buf(),
+                Some(root.path().to_path_buf()),
             );
             let mut unit = make_unit();
             unit.skills = skills.clone();
@@ -2830,6 +3157,7 @@ steps:
             let d = FleetUnitDispatcher::from_connector(
                 Arc::clone(&conn) as Arc<dyn HostConnector>,
                 PathBuf::from("/g"),
+                None,
             );
             let mut unit = make_unit();
             unit.mode = mode;
@@ -2842,7 +3170,7 @@ steps:
     #[test]
     fn unit_transcript_path_is_the_mirror_layout_for_hosts_that_honour_the_run_id() {
         let conn = Arc::new(FakeConnector::completed()); // honours_supplied_run_id → true
-        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"), None);
         assert_eq!(
             d.unit_transcript_path("h1", "run_01X"),
             Some(PathBuf::from("/g/transcripts/run_01X.jsonl"))
@@ -2855,7 +3183,512 @@ steps:
         // defaults: it mints its own id (like an HTTP host predating
         // `run.supplied_run_id`) and has no mirror here — no path either way.
         let conn = Arc::new(UnreachableConnector);
-        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"));
+        let d = FleetUnitDispatcher::from_connector(conn, PathBuf::from("/g"), None);
         assert_eq!(d.unit_transcript_path("h1", "run_01X"), None);
+    }
+
+    // ── Shipping a unit's skills ──────────────────────────────────────────────
+
+    fn write_skill(skills_dir: &Path, name: &str) {
+        let d = skills_dir.join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: The {name} skill.\n---\nbody\n"),
+        )
+        .unwrap();
+    }
+
+    fn write_agent(rupu_dir: &Path, name: &str, frontmatter: &str) {
+        std::fs::create_dir_all(rupu_dir.join("agents")).unwrap();
+        std::fs::write(
+            rupu_dir.join("agents").join(format!("{name}.md")),
+            format!("---\nname: {name}\n{frontmatter}---\nprompt\n"),
+        )
+        .unwrap();
+    }
+
+    /// A coordinator global dir holding `pdf` and `notes`, and (when
+    /// `with_agent`) the unit's agent `a` granting `pdf`.
+    fn coordinator(with_agent: bool) -> tempfile::TempDir {
+        let g = tempfile::tempdir().unwrap();
+        write_skill(&g.path().join("skills"), "pdf");
+        write_skill(&g.path().join("skills"), "notes");
+        if with_agent {
+            write_agent(g.path(), "a", "skills: [pdf]\n");
+        }
+        g
+    }
+
+    fn unit_with_skills(skills: &[&str]) -> UnitDispatch {
+        let mut unit = make_unit();
+        unit.skills = skills.iter().map(ToString::to_string).collect();
+        unit
+    }
+
+    fn manifest() -> rupu_skills::ship::SkillBundleManifest {
+        rupu_skills::ship::SkillBundleManifest {
+            version: rupu_skills::ship::SkillBundleManifest::VERSION,
+            skills: vec![rupu_skills::ship::ShippedSkillRef {
+                layer: rupu_skills::Layer::Global,
+                name: "pdf".into(),
+                content_hash: "0".repeat(64),
+            }],
+        }
+    }
+
+    fn shipping(answer: ShipScript) -> Arc<FakeConnector> {
+        let mut c = FakeConnector::completed();
+        c.ship = answer;
+        Arc::new(c)
+    }
+
+    fn the_provider_message(e: &RunError) -> &str {
+        match e {
+            RunError::Provider(m) => m,
+            other => panic!("expected a provider error, got {other:?}"),
+        }
+    }
+
+    /// The agent's own skills and the step's are resolved on the coordinator
+    /// and shipped; the launch carries the manifest the host confirmed.
+    #[tokio::test]
+    async fn a_units_agent_and_step_skills_ship_and_the_launch_carries_the_manifest() {
+        let g = coordinator(true);
+        let conn = shipping(ShipScript::Answer(
+            rupu_cp::host::skill_ship::ShipOutcome::Shipped(manifest()),
+        ));
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            g.path().to_path_buf(),
+            None,
+        );
+        let out = d
+            .dispatch_unit(unit_with_skills(&["notes"]), "h")
+            .await
+            .unwrap();
+        assert_eq!(
+            *conn.shipped.lock().unwrap(),
+            vec![vec!["notes".to_string(), "pdf".to_string()]]
+        );
+        let launched = conn.launched.lock().unwrap().clone().expect("launched");
+        assert_eq!(launched.skill_bundle, Some(manifest()));
+        assert_eq!(launched.skills, vec!["global:notes".to_string()]);
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        let calls = conn.calls.lock().unwrap().clone();
+        let at = |c: &str| calls.iter().position(|x| *x == c).unwrap();
+        assert!(at("ship_skills") < at("launch_agent"), "{calls:?}");
+    }
+
+    /// The step's skill entries as the launch with a shipped bundle carries
+    /// them, for a coordinator with `global` and the root `project` dirs.
+    async fn shipped_step_entries(
+        g: &Path,
+        root: Option<&Path>,
+        skills: &[&str],
+        preload: &[&str],
+    ) -> (Vec<String>, Vec<String>) {
+        let conn = shipping(ShipScript::Answer(
+            rupu_cp::host::skill_ship::ShipOutcome::Shipped(manifest()),
+        ));
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            g.to_path_buf(),
+            root.map(Path::to_path_buf),
+        );
+        let mut unit = unit_with_skills(skills);
+        unit.preload_skills = preload.iter().map(ToString::to_string).collect();
+        d.dispatch_unit(unit, "h").await.unwrap();
+        let launched = conn.launched.lock().unwrap().clone().expect("launched");
+        assert_eq!(launched.skill_bundle, Some(manifest()));
+        (launched.skills, launched.preload_skills)
+    }
+
+    /// S9 on the host: a bare name the coordinator bound in one layer goes as
+    /// that layer's entry, so a host holding the name in both layers runs the
+    /// shipped skill instead of failing on an ambiguous bare name.
+    #[tokio::test]
+    async fn a_shipped_units_bare_step_entries_go_layer_qualified() {
+        let g = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        write_skill(&g.path().join("skills"), "house-style");
+        write_skill(&root.path().join(".rupu/skills"), "notes");
+        assert_eq!(
+            shipped_step_entries(g.path(), Some(root.path()), &["notes"], &["house-style"]).await,
+            (
+                vec!["project:notes".to_string()],
+                vec!["global:house-style".to_string()]
+            )
+        );
+    }
+
+    /// `*` goes as the global skills it bound on the coordinator.
+    #[tokio::test]
+    async fn a_shipped_units_star_goes_as_the_globals_it_bound() {
+        let g = coordinator(false);
+        assert_eq!(
+            shipped_step_entries(g.path(), None, &["*"], &[]).await,
+            (
+                vec!["global:notes".to_string(), "global:pdf".to_string()],
+                vec![]
+            )
+        );
+    }
+
+    /// A skill the agent preloads and the step only grants goes as the
+    /// step's grant: the step's set is its own, not the union's.
+    #[tokio::test]
+    async fn a_shipped_units_step_entries_are_the_steps_own() {
+        let g = coordinator(false);
+        write_agent(g.path(), "a", "preloadSkills: [pdf]\nskills: [notes]\n");
+        assert_eq!(
+            shipped_step_entries(g.path(), None, &["pdf", "notes"], &[]).await,
+            (
+                vec!["global:notes".to_string(), "global:pdf".to_string()],
+                vec![]
+            )
+        );
+    }
+
+    /// The project layer is the workflow root's `.rupu/`: its agent and its
+    /// skills are what ship.
+    #[tokio::test]
+    async fn a_project_agent_and_project_skills_ship_from_the_roots_rupu_dir() {
+        let g = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join(".rupu");
+        write_skill(&project.join("skills"), "proj");
+        write_agent(&project, "a", "preloadSkills: [\"project:proj\"]\n");
+        let conn = shipping(ShipScript::Answer(
+            rupu_cp::host::skill_ship::ShipOutcome::Shipped(manifest()),
+        ));
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            g.path().to_path_buf(),
+            Some(root.path().to_path_buf()),
+        );
+        d.dispatch_unit(make_unit(), "h").await.unwrap();
+        assert_eq!(
+            *conn.shipped.lock().unwrap(),
+            vec![vec!["proj".to_string()]]
+        );
+    }
+
+    /// P5: a host that can't take shipped skills runs the unit by name with
+    /// its installed copies, and the run is told so.
+    #[tokio::test]
+    async fn a_host_that_cant_take_shipped_skills_launches_by_name_with_a_warning() {
+        let g = coordinator(true);
+        let conn = shipping(ShipScript::Answer(
+            rupu_cp::host::skill_ship::ShipOutcome::Unsupported(
+                "host h: does not take shipped skills".into(),
+            ),
+        ));
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            g.path().to_path_buf(),
+            None,
+        );
+        let out = d
+            .dispatch_unit(unit_with_skills(&["notes"]), "h")
+            .await
+            .unwrap();
+        let launched = conn.launched.lock().unwrap().clone().expect("launched");
+        assert_eq!(launched.skill_bundle, None);
+        assert_eq!(launched.skills, vec!["notes".to_string()]);
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        assert!(
+            out.warnings[0].starts_with("host h: "),
+            "{:?}",
+            out.warnings
+        );
+        assert_eq!(
+            out.warnings[0].matches("host h: ").count(),
+            1,
+            "never prefixed twice: {:?}",
+            out.warnings
+        );
+    }
+
+    /// P5: every transport's downgrade reaches the run as the same warning —
+    /// led by the host id, ending with the host's installed skills — whatever
+    /// text the connector gave.
+    #[tokio::test]
+    async fn every_transports_downgrade_warns_the_same_way() {
+        async fn warnings(conn: Arc<dyn HostConnector>, g: &Path) -> Vec<String> {
+            let d = FleetUnitDispatcher::from_connector(conn, g.to_path_buf(), None);
+            match d.dispatch_unit(unit_with_skills(&["notes"]), "h").await {
+                Ok(out) => out.warnings,
+                Err(failure) => failure.warnings,
+            }
+        }
+        let g = coordinator(false);
+        let server = httpmock::MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method("GET").path("/api/host/info");
+            then.status(200).json_body(serde_json::json!({
+                "version": "0.95.0",
+                "capabilities": {"backends": [], "scm_hosts": [], "permission_modes": []},
+                "features": ["agent.skills"],
+            }));
+        });
+        let http = Arc::new(rupu_cp::host::http::HttpHostConnector::new(
+            server.base_url(),
+            None,
+        ));
+        let store_dir = tempfile::tempdir().unwrap();
+        let run_store = Arc::new(rupu_orchestrator::runs::RunStore::new(
+            store_dir.path().join("runs"),
+        ));
+        let tunnel = Arc::new(rupu_cp::host::tunnel::TunnelHostConnector::new(
+            "h",
+            Arc::new(rupu_cp::node::registry::NodeRegistry::new()),
+            Arc::new(rupu_cp::node::mirror::NodeMirror::new(Arc::clone(
+                &run_store,
+            ))),
+            run_store,
+            Arc::new(rupu_cp::customers::CustomerPricing::flat(
+                rupu_config::PricingConfig::default(),
+            )),
+        ));
+        for (transport, conn) in [
+            ("http", http as Arc<dyn HostConnector>),
+            ("tunnel", tunnel as Arc<dyn HostConnector>),
+        ] {
+            let w = warnings(conn, g.path()).await;
+            assert_eq!(w.len(), 1, "{transport}: {w:?}");
+            assert!(w[0].starts_with("host h: "), "{transport}: {w:?}");
+            assert!(
+                w[0].ends_with("; the unit uses that host's installed skills"),
+                "{transport}: {w:?}"
+            );
+            assert_eq!(
+                w[0].matches("installed skills").count(),
+                1,
+                "{transport}: {w:?}"
+            );
+        }
+    }
+
+    /// P1: with no copy of the unit's agent, only the step's skills ship.
+    #[tokio::test]
+    async fn without_the_units_agent_only_the_steps_skills_ship() {
+        let g = coordinator(false);
+        let conn = shipping(ShipScript::Answer(
+            rupu_cp::host::skill_ship::ShipOutcome::Shipped(manifest()),
+        ));
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            g.path().to_path_buf(),
+            None,
+        );
+        d.dispatch_unit(unit_with_skills(&["notes"]), "h")
+            .await
+            .unwrap();
+        assert_eq!(
+            *conn.shipped.lock().unwrap(),
+            vec![vec!["notes".to_string()]]
+        );
+    }
+
+    /// A unit with no skills asks the host nothing and launches without a
+    /// bundle.
+    #[tokio::test]
+    async fn a_unit_without_skills_ships_nothing() {
+        let g = tempfile::tempdir().unwrap();
+        write_agent(g.path(), "a", "");
+        let conn = shipping(ShipScript::Unreachable("must not be asked"));
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            g.path().to_path_buf(),
+            None,
+        );
+        d.dispatch_unit(make_unit(), "h").await.unwrap();
+        assert!(conn.shipped.lock().unwrap().is_empty());
+        let launched = conn.launched.lock().unwrap().clone().expect("launched");
+        assert_eq!(launched.skill_bundle, None);
+    }
+
+    /// A step skill the coordinator doesn't have fails the unit before
+    /// launch, as a local run would, naming the host and the skill.
+    #[tokio::test]
+    async fn a_step_skill_missing_on_the_coordinator_fails_before_launch() {
+        let g = coordinator(true);
+        let conn = shipping(ShipScript::Answer(
+            rupu_cp::host::skill_ship::ShipOutcome::Shipped(manifest()),
+        ));
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            g.path().to_path_buf(),
+            None,
+        );
+        let err = d
+            .dispatch_unit(unit_with_skills(&["ghost"]), "h")
+            .await
+            .unwrap_err();
+        let msg = the_provider_message(&err.error);
+        assert!(msg.starts_with("host h: "), "{msg}");
+        assert!(msg.contains("ghost"), "{msg}");
+        assert_eq!(err.coverage, UnitCoverage::NotLaunched);
+        assert!(conn.launched.lock().unwrap().is_none(), "no launch");
+        assert!(conn.shipped.lock().unwrap().is_empty(), "nothing shipped");
+    }
+
+    /// A transfer that fails is a launch failure, never a fallback to the
+    /// host's installed copies.
+    #[tokio::test]
+    async fn a_failed_transfer_fails_the_unit_before_launch() {
+        let g = coordinator(true);
+        let conn = shipping(ShipScript::Unreachable("pipe broke"));
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            g.path().to_path_buf(),
+            None,
+        );
+        let err = d.dispatch_unit(make_unit(), "h").await.unwrap_err();
+        let msg = the_provider_message(&err.error);
+        assert!(msg.starts_with("host h: "), "{msg}");
+        assert!(msg.contains("pipe broke"), "{msg}");
+        assert_eq!(err.coverage, UnitCoverage::NotLaunched);
+        assert!(conn.launched.lock().unwrap().is_none(), "no launch");
+    }
+
+    /// An `Err(Unsupported)` from the transfer (say, no `rupu` on the host)
+    /// is a failed launch, not the P5 downgrade.
+    #[tokio::test]
+    async fn an_unsupported_error_from_the_transfer_fails_the_unit_before_launch() {
+        let g = coordinator(true);
+        let conn = shipping(ShipScript::Unsupported("rupu not found"));
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            g.path().to_path_buf(),
+            None,
+        );
+        let err = d.dispatch_unit(make_unit(), "h").await.unwrap_err();
+        let msg = the_provider_message(&err.error);
+        assert!(msg.starts_with("host h: "), "{msg}");
+        assert!(msg.contains("rupu not found"), "{msg}");
+        assert_eq!(err.coverage, UnitCoverage::NotLaunched);
+        assert!(err.warnings.is_empty(), "{:?}", err.warnings);
+        assert!(conn.launched.lock().unwrap().is_none(), "no launch");
+    }
+
+    /// A host that needs nothing shipped (`host: local`) launches without a
+    /// manifest, the step's entries as given.
+    #[tokio::test]
+    async fn a_not_needed_answer_launches_without_a_bundle() {
+        let g = coordinator(true);
+        let conn = shipping(ShipScript::Answer(
+            rupu_cp::host::skill_ship::ShipOutcome::NotNeeded,
+        ));
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            g.path().to_path_buf(),
+            None,
+        );
+        let out = d
+            .dispatch_unit(unit_with_skills(&["notes"]), "h")
+            .await
+            .unwrap();
+        assert_eq!(conn.shipped.lock().unwrap().len(), 1, "it was asked");
+        let launched = conn.launched.lock().unwrap().clone().expect("launched");
+        assert_eq!(launched.skill_bundle, None);
+        assert_eq!(launched.skills, vec!["notes".to_string()]);
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    }
+
+    const BROKEN_AGENT: &str = "---\nname: [not a name\n---\n";
+
+    /// An unrelated agent file the coordinator can't parse changes nothing
+    /// for a unit: no warning, a normal launch.
+    #[tokio::test]
+    async fn an_unrelated_broken_agent_file_leaves_a_unit_alone() {
+        for with_agent in [true, false] {
+            let g = tempfile::tempdir().unwrap();
+            if with_agent {
+                write_agent(g.path(), "a", "");
+            }
+            std::fs::create_dir_all(g.path().join("agents")).unwrap();
+            std::fs::write(g.path().join("agents/x.md"), BROKEN_AGENT).unwrap();
+            let conn = shipping(ShipScript::Unreachable("must not be asked"));
+            let d = FleetUnitDispatcher::from_connector(
+                Arc::clone(&conn) as Arc<dyn HostConnector>,
+                g.path().to_path_buf(),
+                None,
+            );
+            let out = d.dispatch_unit(make_unit(), "h").await.unwrap();
+            assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+            assert!(conn.shipped.lock().unwrap().is_empty());
+            assert!(conn.launched.lock().unwrap().is_some(), "launched");
+        }
+    }
+
+    /// The unit's own agent file being unreadable is a warning naming that
+    /// file; the step's skills still ship.
+    #[tokio::test]
+    async fn the_units_own_broken_agent_file_is_a_warning_naming_it() {
+        let g = coordinator(false);
+        std::fs::create_dir_all(g.path().join("agents")).unwrap();
+        let own = g.path().join("agents/a.md");
+        std::fs::write(&own, BROKEN_AGENT).unwrap();
+        let conn = shipping(ShipScript::Answer(
+            rupu_cp::host::skill_ship::ShipOutcome::Shipped(manifest()),
+        ));
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            g.path().to_path_buf(),
+            None,
+        );
+        let out = d
+            .dispatch_unit(unit_with_skills(&["notes"]), "h")
+            .await
+            .unwrap();
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        assert!(
+            out.warnings[0].starts_with("host h: "),
+            "{:?}",
+            out.warnings
+        );
+        assert!(
+            out.warnings[0].contains(&own.display().to_string()),
+            "{:?}",
+            out.warnings
+        );
+        assert_eq!(
+            *conn.shipped.lock().unwrap(),
+            vec![vec!["notes".to_string()]]
+        );
+    }
+
+    /// A launch failure names the host exactly once.
+    #[tokio::test]
+    async fn a_launch_failure_is_prefixed_with_the_host_once() {
+        let mut c = FakeConnector::completed();
+        c.launch_error = Some("boom");
+        let d = FleetUnitDispatcher::from_connector(Arc::new(c), PathBuf::from("/g"), None);
+        let err = d.dispatch_unit(make_unit(), "h").await.unwrap_err();
+        let msg = the_provider_message(&err.error);
+        assert!(msg.starts_with("host h: "), "{msg}");
+        assert!(msg.ends_with("boom"), "{msg}");
+        assert_eq!(msg.matches("host h: ").count(), 1, "{msg}");
+    }
+
+    /// A remote run that failed names its host in the unit's error.
+    #[tokio::test]
+    async fn a_failed_remote_runs_error_names_the_host() {
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::new(FakeConnector::failed()),
+            PathBuf::from("/g"),
+            None,
+        );
+        let out = d.dispatch_unit(make_unit(), "h").await.unwrap();
+        assert_eq!(out.error.as_deref(), Some("host h: boom"));
+    }
+
+    #[test]
+    fn prefix_host_adds_the_prefix_once() {
+        assert_eq!(prefix_host("h", "boom"), "host h: boom");
+        assert_eq!(prefix_host("h", "host h: boom"), "host h: boom");
+        assert_eq!(prefix_host("h", "host h2: boom"), "host h: host h2: boom");
     }
 }
