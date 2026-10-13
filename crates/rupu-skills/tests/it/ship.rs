@@ -176,6 +176,18 @@ fn chained_symlinks_and_duplicates_are_refused_before_anything_is_written() {
             tar_multi(&[("f", Regular, None, b"1"), ("F", Regular, None, b"2")]),
         ),
         (
+            "ignored name",
+            tar_multi(&[
+                ("SKILL.md", Regular, None, b"x"),
+                (".git/a", Symlink, Some(".."), b""),
+                (".git/b", Symlink, Some("a/.."), b""),
+            ]),
+        ),
+        (
+            "ignored name, folded",
+            tar_multi(&[(".GIT/a", Regular, None, b"x")]),
+        ),
+        (
             "duplicate",
             tar_multi(&[("f", Regular, None, b"1"), ("f", Regular, None, b"2")]),
         ),
@@ -232,5 +244,31 @@ fn an_over_cap_skill_is_refused_by_pack() {
     assert!(matches!(
         pack_skill(&skill).unwrap_err(),
         ShipError::TooLarge { .. }
+    ));
+}
+
+#[test]
+fn names_differing_only_by_case_are_a_collision() {
+    use rupu_skills::ship::case_collision;
+    assert_eq!(
+        case_collision(&["README.md", "readme.md"]),
+        Some(("README.md".into(), "readme.md".into()))
+    );
+    assert!(case_collision(&["a", "A/x"]).is_some());
+    assert!(case_collision(&["A/x", "a/y"]).is_none());
+    assert!(case_collision(&["SKILL.md", "scripts/run.sh"]).is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn pack_refuses_a_case_collision() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = crate::support::write_skill(tmp.path(), "pdf", "pdf", "Read PDFs.");
+    std::fs::write(dir.join("README.md"), b"1").unwrap();
+    std::fs::write(dir.join("readme.md"), b"2").unwrap();
+    let skill = load_skill(&dir, Layer::Global).unwrap();
+    assert!(matches!(
+        pack_skill(&skill).unwrap_err(),
+        ShipError::CaseCollision { .. }
     ));
 }

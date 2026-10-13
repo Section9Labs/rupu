@@ -4,7 +4,9 @@
 //! verifies it before anything is kept.
 
 use crate::skill::{Layer, Skill};
-use crate::tree::{content_hash, walk_tree, ContentHash, ContentHasher, EntryKind, TreeError};
+use crate::tree::{
+    content_hash, walk_tree, ContentHash, ContentHasher, EntryKind, TreeError, IGNORED_NAMES,
+};
 use std::path::{Component, Path, PathBuf};
 
 pub const MAX_SHIPPED_SKILL_BYTES: u64 = 32 << 20;
@@ -24,6 +26,8 @@ pub enum ShipError {
     Tree { name: String, source: TreeError },
     #[error("skill {name}: symlink {rel} has an absolute target, which can't be shipped")]
     AbsoluteSymlink { name: String, rel: String },
+    #[error("skill {name}: {a} and {b} differ only by letter case, which can't be shipped")]
+    CaseCollision { name: String, a: String, b: String },
     #[error("skill {name} is {bytes} bytes, over the {limit}-byte limit for a shipped skill")]
     TooLarge {
         name: String,
@@ -79,6 +83,10 @@ pub fn pack_skill(skill: &Skill) -> Result<PackedSkill, ShipError> {
             }
         }
     }
+    let rels: Vec<&str> = entries.iter().map(|e| e.rel.as_str()).collect();
+    if let Some((a, b)) = case_collision(&rels) {
+        return Err(ShipError::CaseCollision { name, a, b });
+    }
     if total > MAX_SHIPPED_SKILL_BYTES {
         return Err(ShipError::TooLarge {
             name,
@@ -125,6 +133,25 @@ pub fn pack_skill(skill: &Skill) -> Result<PackedSkill, ShipError> {
     })
 }
 
+/// Two paths that are one on a case-insensitive filesystem: equal once
+/// case-folded, or one below the other's folded path.
+pub fn case_collision(rels: &[&str]) -> Option<(String, String)> {
+    let mut seen = std::collections::HashMap::new();
+    for r in rels {
+        if let Some(prev) = seen.insert(fold(Path::new(r)), *r) {
+            return Some(((*prev).to_owned(), (*r).to_owned()));
+        }
+    }
+    for r in rels {
+        for a in Path::new(r).ancestors().skip(1) {
+            if let Some(prev) = seen.get(&fold(a)) {
+                return Some(((*prev).to_owned(), (*r).to_owned()));
+            }
+        }
+    }
+    None
+}
+
 /// Unpack `bytes` into a new directory `dest` (its parent must exist),
 /// keeping it only if its content hash is `expected`. Any failure after
 /// `dest` is created leaves no `dest` behind; an existing `dest` is never
@@ -165,6 +192,14 @@ fn read_archive(bytes: &[u8]) -> Result<Vec<(PathBuf, Item)>, ShipError> {
         let rel = entry.path().map_err(tar_err)?.into_owned();
         if rel.is_absolute() || !rel.components().all(|c| matches!(c, Component::Normal(_))) {
             return Err(bad(format!("unsafe path {}", rel.display())));
+        }
+        // `walk_tree` never looks under these, so the final hash wouldn't
+        // cover what an archive put there.
+        if rel.components().any(|c| {
+            let c = c.as_os_str().to_string_lossy().to_lowercase();
+            IGNORED_NAMES.iter().any(|n| n.to_lowercase() == c)
+        }) {
+            return Err(bad(format!("{}: not part of a skill", rel.display())));
         }
         let item = match entry.header().entry_type() {
             tar::EntryType::Directory => Item::Dir,
