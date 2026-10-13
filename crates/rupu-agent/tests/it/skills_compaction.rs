@@ -515,7 +515,7 @@ async fn an_operator_load_is_recorded_and_reattached() {
     let global = tempfile::tempdir().unwrap();
     let ws = tempfile::tempdir().unwrap();
     let pdf = install(global.path(), "pdf", "PDF STEPS");
-    let frozen = rupu_skills::run::resolve_operator(&catalog(global.path()), "pdf").unwrap();
+    let frozen = rupu_skills::run::resolve_operator(&catalog(global.path()), &[], "pdf").unwrap();
     let (skills, missing) = rupu_skills::run::resolve_frozen(&catalog(global.path()), &[frozen]);
     assert!(missing.is_empty());
     let transcript = ws.path().join("run.jsonl");

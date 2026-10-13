@@ -189,19 +189,50 @@ pub struct FrozenSkill {
     pub content_hash: Option<String>,
 }
 
-/// The frozen entry's skill as installed now, or `None` when it is gone, no
-/// longer valid, or its record does not parse.
-fn thaw(catalog: &SkillCatalog, f: &FrozenSkill) -> Option<GrantedSkill> {
-    let skill = catalog.get(f.layer, &f.name)?.skill().ok()?.clone();
-    let baseline_stamp = Stamp::from_hex(&f.stamp)?;
+/// A frozen entry a turn can't be given, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingSkill {
+    pub name: String,
+    pub layer: Layer,
+    pub reason: MissingReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MissingReason {
+    #[error("removed")]
+    Removed,
+    #[error("invalid: {0}")]
+    Invalid(String),
+    #[error("corrupt record: bad stamp")]
+    BadStamp,
+    #[error("corrupt record: bad hash")]
+    BadHash,
+    #[error("corrupt record: preload and content hash disagree")]
+    PreloadHashMismatch,
+    /// The set already holds the skill of that name from `held`; a run
+    /// never binds one name from both layers.
+    #[error("the set already holds the {} skill of that name", held.as_str())]
+    Conflict { held: Layer },
+}
+
+/// The frozen entry's skill as installed now, or why it can't be given.
+fn thaw(catalog: &SkillCatalog, f: &FrozenSkill) -> Result<GrantedSkill, MissingReason> {
+    let entry = catalog
+        .get(f.layer, &f.name)
+        .ok_or(MissingReason::Removed)?;
+    let skill = entry
+        .skill()
+        .map_err(|e| MissingReason::Invalid(e.to_string()))?
+        .clone();
+    let baseline_stamp = Stamp::from_hex(&f.stamp).ok_or(MissingReason::BadStamp)?;
     let content_hash = match &f.content_hash {
-        Some(h) => Some(ContentHash::from_hex(h)?),
+        Some(h) => Some(ContentHash::from_hex(h).ok_or(MissingReason::BadHash)?),
         None => None,
     };
     if f.preload != content_hash.is_some() {
-        return None;
+        return Err(MissingReason::PreloadHashMismatch);
     }
-    Some(GrantedSkill {
+    Ok(GrantedSkill {
         skill,
         preload: f.preload,
         indexed: f.indexed,
@@ -212,21 +243,23 @@ fn thaw(catalog: &SkillCatalog, f: &FrozenSkill) -> Option<GrantedSkill> {
 }
 
 /// Rebuilds a frozen set from the skills installed now. Returns the set and
-/// the names of the entries that can no longer be given (removed, invalid,
-/// or a corrupt record): the caller reports them and runs without them.
+/// the entries that can no longer be given: the caller reports them and
+/// runs without them.
 pub fn resolve_frozen(
     catalog: &SkillCatalog,
     frozen: &[FrozenSkill],
-) -> (ResolvedSkills, Vec<String>) {
+) -> (ResolvedSkills, Vec<MissingSkill>) {
     ResolvedSkills::default().with_frozen(catalog, frozen)
 }
 
 /// An operator's invocation of one installed skill (spec §5.2): any valid
 /// skill in either layer, granted or not. The entry takes the grant
-/// grammar's names and prefixes; a wildcard, an unknown name or a bare name
-/// in both layers is refused.
+/// grammar's names and prefixes; a wildcard, an unknown name, a bare name
+/// in both layers, or a skill whose name `held` (the session's set) binds
+/// from the other layer is refused.
 pub fn resolve_operator(
     catalog: &SkillCatalog,
+    held: &[FrozenSkill],
     entry: &str,
 ) -> Result<FrozenSkill, RunSkillsError> {
     let grant: SkillGrant = entry.parse()?;
@@ -234,11 +267,23 @@ pub fn resolve_operator(
         return Err(RunSkillsError::Wildcard(entry.to_owned()));
     }
     let skills = resolve_grants(&[grant], catalog).map_err(RunSkillsError::Resolve)?;
-    let [skill] = skills.as_slice() else {
-        unreachable!("one named grant binds exactly one skill");
-    };
+    let skill = skills.first().ok_or_else(|| {
+        RunSkillsError::Resolve(vec![ResolveError::Unknown {
+            entry: entry.to_owned(),
+            suggestion: None,
+        }])
+    })?;
+    let name = skill.name.as_str();
+    if held
+        .iter()
+        .any(|h| h.name == name && h.layer != skill.layer)
+    {
+        return Err(RunSkillsError::Resolve(vec![ResolveError::BothLayers {
+            name: name.to_owned(),
+        }]));
+    }
     Ok(FrozenSkill {
-        name: skill.name.as_str().to_owned(),
+        name: name.to_owned(),
         layer: skill.layer,
         preload: false,
         indexed: false,
@@ -265,22 +310,32 @@ impl ResolvedSkills {
             .collect()
     }
 
-    /// Appends frozen entries (an operator's invocations) whose names the
-    /// set lacks. Returns the set and the names that can no longer be
-    /// given, as `resolve_frozen` does.
+    /// Appends frozen entries (an operator's invocations) the set lacks; an
+    /// entry the set holds already, in the same layer, is skipped. Returns
+    /// the set and the entries that can't be given, as `resolve_frozen`
+    /// does: one whose name the set binds from the other layer is a
+    /// [`MissingReason::Conflict`].
     pub fn with_frozen(
         mut self,
         catalog: &SkillCatalog,
         extra: &[FrozenSkill],
-    ) -> (Self, Vec<String>) {
+    ) -> (Self, Vec<MissingSkill>) {
         let mut missing = Vec::new();
         for f in extra {
-            if self.get(&f.name).is_some() {
-                continue;
-            }
-            match thaw(catalog, f) {
-                Some(g) => self.entries.push(g),
-                None => missing.push(f.name.clone()),
+            let thawed = match self.get(&f.name) {
+                Some(g) if g.skill.layer == f.layer => continue,
+                Some(g) => Err(MissingReason::Conflict {
+                    held: g.skill.layer,
+                }),
+                None => thaw(catalog, f),
+            };
+            match thawed {
+                Ok(g) => self.entries.push(g),
+                Err(reason) => missing.push(MissingSkill {
+                    name: f.name.clone(),
+                    layer: f.layer,
+                    reason,
+                }),
             }
         }
         (self, missing)

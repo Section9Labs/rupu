@@ -105,10 +105,19 @@ pub fn render_operator_injection(
     body: &str,
 ) -> String {
     format!(
-        "<skill name=\"{name}\" base=\"{}\" version=\"{}\">\n{body}\n</skill>",
-        base_dir.display(),
+        "<skill name=\"{}\" base=\"{}\" version=\"{}\">\n{body}\n</skill>",
+        attr(name),
+        attr(&base_dir.display().to_string()),
         version.short()
     )
+}
+
+/// `value` escaped for a double-quoted attribute.
+fn attr(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
 }
 
 /// Opens the block compaction re-attaches (spec §6). `compact_messages`

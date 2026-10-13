@@ -1,5 +1,8 @@
 use crate::support::write_skill;
-use rupu_skills::run::{resolve_run_skills, SkillReason, SkillRequest};
+use rupu_skills::run::{
+    resolve_run_skills, FrozenSkill, MissingReason, MissingSkill, SkillReason, SkillRequest,
+};
+use rupu_skills::Layer;
 use rupu_skills::{LayerDirs, SkillCatalog};
 use std::fs;
 
@@ -408,7 +411,15 @@ fn a_frozen_skill_that_was_removed_is_reported_missing() {
     fs::remove_dir_all(g.path().join("skills/gone")).unwrap();
     let (again, missing) = rupu_skills::run::resolve_frozen(&catalog(g.path(), None), &frozen);
     assert!(again.is_empty());
-    assert_eq!(missing, vec!["gone".to_string()]);
+    assert_eq!(
+        missing,
+        vec![MissingSkill {
+            name: "gone".into(),
+            layer: Layer::Global,
+            reason: MissingReason::Removed,
+        }]
+    );
+    assert_eq!(missing[0].reason.to_string(), "removed");
 }
 
 #[test]
@@ -430,7 +441,112 @@ fn a_frozen_entry_with_a_corrupt_stamp_is_reported_missing() {
     frozen[0].stamp = "not-hex".into();
     let (again, missing) = rupu_skills::run::resolve_frozen(&cat, &frozen);
     assert!(again.is_empty());
-    assert_eq!(missing, vec!["pdf".to_string()]);
+    assert_eq!(
+        missing,
+        vec![MissingSkill {
+            name: "pdf".into(),
+            layer: Layer::Global,
+            reason: MissingReason::BadStamp,
+        }]
+    );
+    assert_eq!(missing[0].reason.to_string(), "corrupt record: bad stamp");
+}
+
+/// A frozen preload of `pdf`, resolved against `cat`.
+fn frozen_preload(cat: &SkillCatalog) -> Vec<FrozenSkill> {
+    let preload = s(&["pdf"]);
+    resolve_run_skills(
+        cat,
+        &[SkillRequest {
+            reason: SkillReason::Agent,
+            grants: &[],
+            preload: &preload,
+        }],
+    )
+    .unwrap()
+    .freeze()
+}
+
+#[test]
+fn a_frozen_entry_with_a_corrupt_content_hash_is_reported_missing() {
+    let g = tempfile::tempdir().unwrap();
+    write_skill(&g.path().join("skills"), "pdf", "pdf", "d");
+    let cat = catalog(g.path(), None);
+    let mut frozen = frozen_preload(&cat);
+    frozen[0].content_hash = Some("zz".into());
+    let (again, missing) = rupu_skills::run::resolve_frozen(&cat, &frozen);
+    assert!(again.is_empty());
+    assert_eq!(
+        missing,
+        vec![MissingSkill {
+            name: "pdf".into(),
+            layer: Layer::Global,
+            reason: MissingReason::BadHash,
+        }]
+    );
+    assert_eq!(missing[0].reason.to_string(), "corrupt record: bad hash");
+}
+
+#[test]
+fn a_frozen_entry_whose_preload_and_hash_disagree_is_reported_missing() {
+    let g = tempfile::tempdir().unwrap();
+    write_skill(&g.path().join("skills"), "pdf", "pdf", "d");
+    let cat = catalog(g.path(), None);
+    let preloaded = frozen_preload(&cat);
+    let mut no_hash = preloaded.clone();
+    no_hash[0].content_hash = None;
+    let mut not_preloaded = preloaded;
+    not_preloaded[0].preload = false;
+    for frozen in [no_hash, not_preloaded] {
+        let (again, missing) = rupu_skills::run::resolve_frozen(&cat, &frozen);
+        assert!(again.is_empty());
+        assert_eq!(
+            missing,
+            vec![MissingSkill {
+                name: "pdf".into(),
+                layer: Layer::Global,
+                reason: MissingReason::PreloadHashMismatch,
+            }]
+        );
+        assert_eq!(
+            missing[0].reason.to_string(),
+            "corrupt record: preload and content hash disagree"
+        );
+    }
+}
+
+#[test]
+fn a_frozen_skill_that_became_invalid_is_reported_missing_with_its_error() {
+    let g = tempfile::tempdir().unwrap();
+    write_skill(&g.path().join("skills"), "pdf", "pdf", "d");
+    let cat = catalog(g.path(), None);
+    let grants = s(&["pdf"]);
+    let frozen = resolve_run_skills(
+        &cat,
+        &[SkillRequest {
+            reason: SkillReason::Agent,
+            grants: &grants,
+            preload: &[],
+        }],
+    )
+    .unwrap()
+    .freeze();
+    fs::write(
+        g.path().join("skills/pdf/SKILL.md"),
+        "---\nname: other\ndescription: d\n---\nx\n",
+    )
+    .unwrap();
+    let (again, missing) = rupu_skills::run::resolve_frozen(&catalog(g.path(), None), &frozen);
+    assert!(again.is_empty());
+    assert_eq!(missing.len(), 1);
+    assert_eq!(
+        (missing[0].name.as_str(), missing[0].layer),
+        ("pdf", Layer::Global)
+    );
+    assert_eq!(
+        missing[0].reason.to_string(),
+        "invalid: name \"other\" does not match its directory \"pdf\""
+    );
 }
 
 #[test]
@@ -442,7 +558,7 @@ fn operator_entries_resolve_any_installed_skill_but_not_wildcards() {
     write_skill(&g.path().join("skills"), "both", "both", "d");
     write_skill(&p.path().join("skills"), "both", "both", "d");
     let cat = catalog(g.path(), Some(p.path()));
-    let f = rupu_skills::run::resolve_operator(&cat, "notes").unwrap();
+    let f = rupu_skills::run::resolve_operator(&cat, &[], "notes").unwrap();
     assert_eq!(
         (f.layer, f.reason, f.preload, f.indexed),
         (
@@ -459,9 +575,9 @@ fn operator_entries_resolve_any_installed_skill_but_not_wildcards() {
         .unwrap();
     assert_eq!(f.stamp, notes.stamp.hex());
     assert_eq!(f.content_hash, None);
-    assert!(rupu_skills::run::resolve_operator(&cat, "global:pdf").is_ok());
+    assert!(rupu_skills::run::resolve_operator(&cat, &[], "global:pdf").is_ok());
     for wild in ["*", "global:*", "project:*"] {
-        let err = rupu_skills::run::resolve_operator(&cat, wild)
+        let err = rupu_skills::run::resolve_operator(&cat, &[], wild)
             .unwrap_err()
             .to_string();
         assert_eq!(
@@ -469,14 +585,14 @@ fn operator_entries_resolve_any_installed_skill_but_not_wildcards() {
             format!("skill entry {wild:?} is a wildcard; invoke one skill by name")
         );
     }
-    let amb = rupu_skills::run::resolve_operator(&cat, "both")
+    let amb = rupu_skills::run::resolve_operator(&cat, &[], "both")
         .unwrap_err()
         .to_string();
     assert!(
         amb.contains("both the global and the project layer"),
         "{amb}"
     );
-    let typo = rupu_skills::run::resolve_operator(&cat, "pdff")
+    let typo = rupu_skills::run::resolve_operator(&cat, &[], "pdff")
         .unwrap_err()
         .to_string();
     assert!(typo.contains("did you mean"), "{typo}");
@@ -499,17 +615,24 @@ fn with_frozen_appends_operator_entries_and_skips_present_names() {
     )
     .unwrap();
     let ops = vec![
-        rupu_skills::run::resolve_operator(&cat, "pdf").unwrap(),
-        rupu_skills::run::resolve_operator(&cat, "deploy").unwrap(),
+        rupu_skills::run::resolve_operator(&cat, &[], "pdf").unwrap(),
+        rupu_skills::run::resolve_operator(&cat, &[], "deploy").unwrap(),
     ];
     fs::remove_dir_all(g.path().join("skills/deploy")).unwrap();
     let (merged, missing) = r.clone().with_frozen(&catalog(g.path(), None), &ops);
-    assert_eq!(missing, vec!["deploy".to_string()]);
+    assert_eq!(
+        missing,
+        vec![MissingSkill {
+            name: "deploy".into(),
+            layer: Layer::Global,
+            reason: MissingReason::Removed,
+        }]
+    );
     assert_eq!(merged.names(), vec!["pdf"]);
     assert_eq!(merged.get("pdf").unwrap().reason, SkillReason::Agent);
 
     write_skill(&g.path().join("skills"), "deploy", "deploy", "d");
-    let ops = vec![rupu_skills::run::resolve_operator(&cat, "deploy").unwrap()];
+    let ops = vec![rupu_skills::run::resolve_operator(&cat, &[], "deploy").unwrap()];
     let (merged, missing) = r.with_frozen(&catalog(g.path(), None), &ops);
     assert!(missing.is_empty());
     assert_eq!(merged.names(), vec!["pdf", "deploy"]);
@@ -545,4 +668,75 @@ fn frozen_skills_round_trip_through_json() {
         serde_json::from_str::<Vec<rupu_skills::run::FrozenSkill>>(&json).unwrap(),
         frozen
     );
+}
+
+/// A session holding `global:x`, over a catalog with `x` in both layers.
+fn session_holding_global_x() -> (tempfile::TempDir, tempfile::TempDir, Vec<FrozenSkill>) {
+    let g = tempfile::tempdir().unwrap();
+    let p = tempfile::tempdir().unwrap();
+    write_skill(&g.path().join("skills"), "x", "x", "d");
+    write_skill(&p.path().join("skills"), "x", "x", "d");
+    let grants = s(&["global:x"]);
+    let held = resolve_run_skills(
+        &catalog(g.path(), Some(p.path())),
+        &[SkillRequest {
+            reason: SkillReason::Agent,
+            grants: &grants,
+            preload: &[],
+        }],
+    )
+    .unwrap()
+    .freeze();
+    (g, p, held)
+}
+
+#[test]
+fn an_operator_entry_binding_the_other_layer_of_a_held_name_is_refused() {
+    let (g, p, held) = session_holding_global_x();
+    let cat = catalog(g.path(), Some(p.path()));
+    let both = "skill \"x\" is granted from both the global and the project layer; \
+                grant only one of global:x or project:x";
+    let err = rupu_skills::run::resolve_operator(&cat, &held, "project:x").unwrap_err();
+    assert_eq!(err.to_string(), both);
+    // The held skill itself may be invoked.
+    let same = rupu_skills::run::resolve_operator(&cat, &held, "global:x").unwrap();
+    assert_eq!((same.name.as_str(), same.layer), ("x", Layer::Global));
+    // A bare name that now binds only the project's `x` is refused too.
+    fs::remove_dir_all(g.path().join("skills/x")).unwrap();
+    let cat = catalog(g.path(), Some(p.path()));
+    let err = rupu_skills::run::resolve_operator(&cat, &held, "x").unwrap_err();
+    assert_eq!(err.to_string(), both);
+}
+
+#[test]
+fn with_frozen_reports_a_same_name_entry_from_the_other_layer_as_a_conflict() {
+    let (g, p, held) = session_holding_global_x();
+    let cat = catalog(g.path(), Some(p.path()));
+    let project_x = rupu_skills::run::resolve_operator(&cat, &[], "project:x").unwrap();
+    let global_x = rupu_skills::run::resolve_operator(&cat, &[], "global:x").unwrap();
+    let (set, missing) = rupu_skills::run::resolve_frozen(&cat, &held);
+    assert!(missing.is_empty());
+    let (merged, missing) = set.with_frozen(&cat, &[global_x, project_x]);
+    assert_eq!(
+        missing,
+        vec![MissingSkill {
+            name: "x".into(),
+            layer: Layer::Project,
+            reason: MissingReason::Conflict {
+                held: Layer::Global
+            },
+        }]
+    );
+    assert_eq!(
+        missing[0].reason.to_string(),
+        "the set already holds the global skill of that name"
+    );
+    assert_eq!(merged.names(), vec!["x"]);
+    let x = merged.get("x").unwrap();
+    assert_eq!(
+        (x.skill.layer, x.reason),
+        (Layer::Global, SkillReason::Agent)
+    );
+    let project_root = fs::canonicalize(p.path().join("skills/x")).unwrap();
+    assert!(!merged.read_roots().contains(&project_root));
 }

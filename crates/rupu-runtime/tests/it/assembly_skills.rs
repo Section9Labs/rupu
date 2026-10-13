@@ -1071,8 +1071,12 @@ async fn an_empty_frozen_section_appends_nothing() {
 async fn resolve_skills_as_session_records_reason_session() {
     let home = Home::new();
     home.skill("code-review", "Review a diff.", "x");
+    home.skill("report-style", "House style.", "x");
     let assembler = home.assembler(config());
-    let spec = agent(&home, "provider: anthropic\nmodel: claude-sonnet-4-6");
+    let spec = agent(
+        &home,
+        "provider: anthropic\nmodel: claude-sonnet-4-6\nskills: [report-style]",
+    );
     let overrides = rupu_runtime::assembly::Overrides {
         skills: vec!["code-review".into()],
         ..Default::default()
@@ -1097,6 +1101,6 @@ async fn resolve_skills_as_session_records_reason_session() {
             .iter()
             .map(|e| (e.name.as_str(), e.reason.as_str()))
             .collect::<Vec<_>>(),
-        vec![("code-review", "session")]
+        vec![("code-review", "session"), ("report-style", "agent")]
     );
 }
