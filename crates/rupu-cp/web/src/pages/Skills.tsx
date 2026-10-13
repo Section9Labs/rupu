@@ -3,7 +3,7 @@
 // operations. Each row links to /skills/:layer/:name.
 
 import { useEffect, useState } from 'react';
-import { BookOpen } from 'lucide-react';
+import { AlertTriangle, BookOpen } from 'lucide-react';
 import { api, apiErrorMessage, type ProjectRow, type SkillRow } from '../lib/api';
 import { SectionHeader } from '../components/lists/SectionHeader';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
@@ -23,6 +23,7 @@ export default function Skills() {
   const [projects, setProjects] = useState<ProjectRow[]>([]);
   const [wsId, setWsId] = useState<string | null>(null);
   const [skills, setSkills] = useState<SkillRow[] | null>(null);
+  const [layerWarnings, setLayerWarnings] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -43,11 +44,13 @@ export default function Skills() {
   useEffect(() => {
     let cancelled = false;
     setSkills(null);
+    setLayerWarnings([]);
     api
-      .getSkills(wsId ?? undefined)
-      .then((rows) => {
+      .getSkillsListing(wsId ?? undefined)
+      .then((listing) => {
         if (cancelled) return;
-        setSkills(rows);
+        setSkills(listing.skills);
+        setLayerWarnings(listing.warnings);
         setError(null);
       })
       .catch((e: unknown) => {
@@ -89,6 +92,25 @@ export default function Skills() {
       </header>
 
       {error && <ErrorBanner className="mb-4">{error}</ErrorBanner>}
+
+      {layerWarnings.length > 0 && (
+        <div
+          role="status"
+          className="mb-4 flex items-start gap-2 rounded-lg border border-warn/30 bg-warn-bg px-4 py-2 text-sm text-warn"
+        >
+          <AlertTriangle size={16} className="mt-0.5 shrink-0" aria-hidden />
+          <div className="min-w-0">
+            <p className="font-medium">Some skills could not be listed</p>
+            <ul className="mt-1 space-y-1 font-mono text-ui">
+              {layerWarnings.map((w, i) => (
+                <li key={i} className="break-words">
+                  {w}
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      )}
 
       {skills === null ? (
         <div className="py-16 flex items-center justify-center">

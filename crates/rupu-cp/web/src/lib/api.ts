@@ -1430,6 +1430,12 @@ export interface SkillRow {
   both_layers: boolean;
 }
 
+/** `GET /api/skills`: the rows, and each layer the server could not read. */
+export interface SkillsListing {
+  skills: SkillRow[];
+  warnings: string[];
+}
+
 /** One skill in full. */
 export interface SkillDetail extends SkillRow {
   path: string;
@@ -3079,10 +3085,15 @@ export const api = {
   },
 
   // --- Skills ---
-  /** Installed skills: the global layer, plus `wsId`'s project layer. */
+  /** Installed skills: the global layer, plus `wsId`'s project layer. A layer
+   * the server could not read is left out of `skills` and named in `warnings`. */
+  async getSkillsListing(wsId?: string): Promise<SkillsListing> {
+    const res = await request<{ skills: SkillRow[]; warnings?: string[] }>(`/api/skills${wsQuery(wsId, '?')}`);
+    return { skills: res.skills, warnings: res.warnings ?? [] };
+  },
+  /** The rows of `getSkillsListing`, for the skill pickers. */
   async getSkills(wsId?: string): Promise<SkillRow[]> {
-    const res = await request<{ skills: SkillRow[] }>(`/api/skills${wsQuery(wsId, '?')}`);
-    return res.skills;
+    return (await api.getSkillsListing(wsId)).skills;
   },
   /** One installed skill. A project-layer skill needs its project's `wsId`. */
   getSkill(layer: SkillLayer, name: string, wsId?: string): Promise<SkillDetail> {

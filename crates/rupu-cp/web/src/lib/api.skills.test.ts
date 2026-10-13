@@ -49,6 +49,32 @@ describe('skills API', () => {
     ]);
   });
 
+  it('getSkillsListing returns the rows and the layers the server could not read', async () => {
+    const warning = 'project layer: /src/acme/.rupu/skills: permission denied';
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(jsonResponse({ skills: [PDF_ROW], warnings: [warning] }));
+
+    const listing = await api.getSkillsListing('w1');
+
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/skills?ws_id=w1');
+    expect(listing).toEqual({ skills: [PDF_ROW], warnings: [warning] });
+  });
+
+  it('getSkillsListing treats an absent warnings key as none', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({ skills: [PDF_ROW] }));
+
+    expect(await api.getSkillsListing()).toEqual({ skills: [PDF_ROW], warnings: [] });
+  });
+
+  it('getSkills still returns only the rows when the server reports warnings', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      jsonResponse({ skills: [PDF_ROW], warnings: ['global layer: /home/.rupu/skills: not a directory'] }),
+    );
+
+    expect(await api.getSkills()).toEqual([PDF_ROW]);
+  });
+
   it('getSkill fetches one entry by layer and name', async () => {
     const fetchMock = vi
       .spyOn(globalThis, 'fetch')
