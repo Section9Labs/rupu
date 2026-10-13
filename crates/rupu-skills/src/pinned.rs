@@ -5,12 +5,10 @@
 //! as `rupu skill install <source> --ref <commit>`, so `rupu skill update`
 //! knows where a fleet skill came from.
 
-use crate::install::{
-    find_skills, install_selected, record_path_of, Installed, Selection, Tracking,
-};
-use crate::record::{now_secs, read_record, write_record, SourceRecord, RECORD_VERSION};
+use crate::install::{find_skills, install_selected, write_git_record, Installed, Selection};
+use crate::record::read_record;
 use crate::skill::{load_skill, Layer};
-use crate::source::{parse_source, Fetch, GitSource, Source};
+use crate::source::{parse_git_source, Fetch, GitSource};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -46,7 +44,7 @@ pub struct PinReport {
 }
 
 impl PinReport {
-    /// The pins that did not end up installed.
+    /// The pins that failed: not installed, and not deliberately kept.
     pub fn missing(&self) -> Vec<&Pin> {
         self.results
             .iter()
@@ -124,25 +122,16 @@ pub fn install_pins(
         };
         for i in members {
             let pin = &pins[i];
-            let mut record = |inst: &Installed| -> Result<Tracking, crate::install::InstallError> {
-                let rec = SourceRecord {
-                    version: RECORD_VERSION,
-                    source: pin.source.clone(),
-                    url: Some(url.clone()),
-                    git_ref: Some(commit.clone()),
-                    path: record_path_of(None, &inst.rel),
-                    commit: tree.commit.clone(),
-                    local: None,
-                    content_hash: inst.content_hash.hex(),
-                    installed_at: now_secs(),
-                };
-                write_record(skills_dir, inst.name.as_str(), &rec).map_err(|source| {
-                    crate::install::InstallError::Io {
-                        path: crate::record::record_path(skills_dir, inst.name.as_str()),
-                        source,
-                    }
-                })?;
-                Ok(Tracking::Recorded)
+            let mut record = |inst: &Installed| {
+                write_git_record(
+                    skills_dir,
+                    inst,
+                    &pin.source,
+                    &url,
+                    Some(commit.as_str()),
+                    None,
+                    tree.commit.as_deref(),
+                )
             };
             if let Err(e) = install_selected(
                 &found,
@@ -169,16 +158,14 @@ pub fn install_pins(
     }
 }
 
-/// The https URL a pin's source names (`owner/repo` or a URL).
+/// The https URL a pin's source names (`owner/repo` or an https URL). A pin
+/// comes from a built-in profile, so this never looks at the filesystem: a
+/// directory named `owner/repo` in the working directory is not the pin.
 fn git_url(pin: &Pin) -> Result<String, String> {
-    match parse_source(&pin.source, Some(&pin.commit), None) {
-        Ok(Source::Git(g)) if g.path.is_none() => Ok(g.url),
-        Ok(Source::Git(_)) => Err(format!(
+    match parse_git_source(&pin.source, Some(&pin.commit)) {
+        Ok(g) if g.path.is_none() => Ok(g.url),
+        Ok(_) => Err(format!(
             "{}: a pinned source names a repository, not a path in it",
-            pin.source
-        )),
-        Ok(Source::Local(_)) => Err(format!(
-            "{}: a pinned source must be a git repository",
             pin.source
         )),
         Err(e) => Err(format!("{}: {e}", pin.source)),
@@ -235,5 +222,61 @@ fn kept_or_failed(force: bool, reason: String) -> Plan {
         Plan::Install(PinOutcome::Replaced)
     } else {
         Plan::Done(PinOutcome::Failed(reason))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::source::{parse_source, Source};
+
+    /// The only test in this binary that changes the working directory.
+    #[test]
+    fn a_pin_never_resolves_to_a_directory_in_the_working_directory() {
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cwd.path().join("Section9Labs/rupu-skills")).unwrap();
+        let before = std::env::current_dir().unwrap();
+        std::env::set_current_dir(cwd.path()).unwrap();
+        let pin = Pin {
+            name: "x".into(),
+            source: "Section9Labs/rupu-skills".into(),
+            tag: "v1.0.0".into(),
+            commit: "1".repeat(40),
+        };
+        let probe = parse_source(&pin.source, None, None);
+        let url = git_url(&pin);
+        std::env::set_current_dir(before).unwrap();
+        assert!(
+            matches!(probe, Ok(Source::Local(_))),
+            "the premise: parse_source takes the directory"
+        );
+        assert_eq!(
+            url.as_deref(),
+            Ok("https://github.com/Section9Labs/rupu-skills")
+        );
+    }
+
+    #[test]
+    fn a_pin_source_is_a_repository_url_only() {
+        let pin = |s: &str| Pin {
+            name: "x".into(),
+            source: s.into(),
+            tag: "v1".into(),
+            commit: "1".repeat(40),
+        };
+        let ok = |s: &str| git_url(&pin(s));
+        assert_eq!(
+            ok("https://example.com/o/r/"),
+            Ok("https://example.com/o/r".into())
+        );
+        for bad in [
+            "https://tok@example.com/o/r",
+            "https://example.com/o/r#skills",
+            "./local",
+            "git@github.com:o/r",
+            "nonsense",
+        ] {
+            assert!(ok(bad).is_err(), "{bad}");
+        }
     }
 }

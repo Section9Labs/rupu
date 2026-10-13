@@ -1,5 +1,5 @@
 use rupu_skills::pinned::{install_pins, KeptReason, Pin, PinOutcome};
-use rupu_skills::record::read_record;
+use rupu_skills::record::{read_record, write_record, SourceRecord};
 use rupu_skills::{Fetch, FetchedTree, GitSource, Layer, SourceError};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -340,4 +340,136 @@ fn a_non_skill_directory_of_the_same_name_is_kept() {
         vec![("network-recon".into(), PinOutcome::Replaced)]
     );
     assert!(dest.path().join("network-recon/SKILL.md").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dangling_symlink_at_the_name_is_kept() {
+    let src = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink("nowhere", dest.path().join("network-recon")).unwrap();
+    let f = FixtureFetch::new(src.path(), &["network-recon"], "v1", C1);
+    let r = install_pins(
+        &[pin("network-recon", C1)],
+        dest.path(),
+        Layer::Global,
+        false,
+        &f,
+    );
+    assert_eq!(
+        outcomes(&r),
+        vec![(
+            "network-recon".into(),
+            PinOutcome::Kept(KeptReason::OtherSource)
+        )]
+    );
+    assert!(f.fetches.borrow().is_empty());
+    assert!(std::fs::symlink_metadata(dest.path().join("network-recon"))
+        .unwrap()
+        .is_symlink());
+}
+
+#[test]
+fn a_skill_recorded_from_a_local_directory_is_kept() {
+    let src = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    write_skill(dest.path(), "network-recon", "network-recon", "mine");
+    let rec = SourceRecord {
+        version: 1,
+        source: "./my-network-recon".into(),
+        url: None,
+        git_ref: None,
+        path: None,
+        commit: None,
+        local: Some(PathBuf::from("/somewhere/my-network-recon")),
+        content_hash: "0".repeat(64),
+        installed_at: 0,
+    };
+    write_record(dest.path(), "network-recon", &rec).unwrap();
+    let f = FixtureFetch::new(src.path(), &["network-recon"], "v1", C1);
+    let r = install_pins(
+        &[pin("network-recon", C1)],
+        dest.path(),
+        Layer::Global,
+        false,
+        &f,
+    );
+    assert_eq!(
+        outcomes(&r),
+        vec![(
+            "network-recon".into(),
+            PinOutcome::Kept(KeptReason::OtherSource)
+        )]
+    );
+    assert!(f.fetches.borrow().is_empty());
+}
+
+#[test]
+fn an_unreadable_record_fails_the_pin_and_force_replaces_it() {
+    let src = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    write_skill(dest.path(), "network-recon", "network-recon", "mine");
+    std::fs::create_dir_all(dest.path().join(".sources")).unwrap();
+    std::fs::write(dest.path().join(".sources/network-recon.json"), "not json").unwrap();
+    let f = FixtureFetch::new(src.path(), &["network-recon"], "v1", C1);
+    let failed = install_pins(
+        &[pin("network-recon", C1)],
+        dest.path(),
+        Layer::Global,
+        false,
+        &f,
+    );
+    assert!(
+        matches!(failed.results[0].1, PinOutcome::Failed(_)),
+        "{:?}",
+        failed.results[0].1
+    );
+    assert_eq!(failed.missing().len(), 1);
+    assert!(f.fetches.borrow().is_empty());
+    let forced = install_pins(
+        &[pin("network-recon", C1)],
+        dest.path(),
+        Layer::Global,
+        true,
+        &f,
+    );
+    assert_eq!(
+        outcomes(&forced),
+        vec![("network-recon".into(), PinOutcome::Replaced)]
+    );
+    assert_eq!(
+        read_record(dest.path(), "network-recon")
+            .unwrap()
+            .unwrap()
+            .commit
+            .as_deref(),
+        Some(C1)
+    );
+}
+
+#[test]
+fn replacing_a_plain_file_leaves_no_backup_behind() {
+    let src = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    std::fs::write(dest.path().join("network-recon"), "a file in the way").unwrap();
+    let f = FixtureFetch::new(src.path(), &["network-recon"], "v1", C1);
+    let r = install_pins(
+        &[pin("network-recon", C1)],
+        dest.path(),
+        Layer::Global,
+        true,
+        &f,
+    );
+    assert_eq!(
+        outcomes(&r),
+        vec![("network-recon".into(), PinOutcome::Replaced)]
+    );
+    assert!(dest.path().join("network-recon/SKILL.md").is_file());
+    let debris: Vec<_> = std::fs::read_dir(dest.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".replaced-") || n.starts_with(".staging-"))
+        .collect();
+    assert!(debris.is_empty(), "{debris:?}");
 }
