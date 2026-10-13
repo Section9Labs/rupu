@@ -500,23 +500,30 @@ pub fn store(cache: &Path, r: &ShippedSkillRef, bytes: &[u8]) -> Result<PathBuf,
     let hash_dir = cache.join(&r.content_hash);
     // Two skills with identical content share a hash directory, so when it
     // already exists the staged skill moves into it instead.
-    let moved = if hash_dir.exists() {
-        std::fs::rename(&staged, &dest)
+    let first = if hash_dir.exists() {
+        std::fs::rename(&staged, &dest).map_err(|e| (dest.clone(), e))
     } else {
-        std::fs::rename(tmp.path(), &hash_dir)
-            .map(|()| {
-                // `tmp` now names a path that no longer exists; its drop is a no-op.
-            })
-            .or_else(|_| std::fs::rename(&staged, &dest))
+        match std::fs::rename(tmp.path(), &hash_dir) {
+            Ok(()) => {
+                // The temp dir is the hash dir now; nothing is left to remove.
+                tmp.keep();
+                Ok(())
+            }
+            Err(e) if hash_dir.exists() => {
+                // Another store created the hash dir first; join it.
+                std::fs::rename(&staged, &dest).map_err(|_| (hash_dir.clone(), e))
+            }
+            Err(e) => Err((hash_dir.clone(), e)),
+        }
     };
-    match moved {
+    match first {
         Ok(()) => {
             private_dir(&hash_dir)?;
             Ok(dest)
         }
         // Another store won the race.
         Err(_) if is_cached(cache, r) => Ok(dest),
-        Err(e) => Err(io(&dest)(e)),
+        Err((path, e)) => Err(io(&path)(e)),
     }
 }
 
@@ -582,6 +589,7 @@ pub fn decode_stream(
 ) -> Result<Vec<(ShippedSkillRef, Vec<u8>)>, ShipError> {
     let bad = |m: String| ShipError::Malformed(m);
     let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let mut total = 0u64;
     loop {
         let mut line = Vec::new();
@@ -612,6 +620,9 @@ pub fn decode_stream(
             content_hash: hash.to_owned(),
         };
         sref.validate()?;
+        if !seen.insert((sref.layer, sref.name.clone())) {
+            return Err(bad(format!("{}:{} streamed twice", sref.layer, sref.name)));
+        }
         total = total.saturating_add(len);
         if total > total_cap {
             return Err(ShipError::BundleTooLarge {

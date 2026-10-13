@@ -410,9 +410,20 @@ mod cache {
             got,
             vec![(ra.clone(), a.bytes.clone()), (rb, b.bytes.clone())]
         );
-        assert!(decode_stream(&mut &bytes[..], 10).is_err());
+        assert!(matches!(
+            decode_stream(&mut &bytes[..], 10),
+            Err(ShipError::BundleTooLarge { .. })
+        ));
         assert!(decode_stream(&mut &b"nonsense\n"[..], MAX_BUNDLE_BYTES).is_err());
         let short = &bytes[..bytes.len() - 5];
-        assert!(decode_stream(&mut &short[..], MAX_BUNDLE_BYTES).is_err());
+        assert!(matches!(
+            decode_stream(&mut &short[..], MAX_BUNDLE_BYTES),
+            Err(ShipError::Malformed(_))
+        ));
+        let twice = encode_stream(&[(&ra, &a.bytes[..]), (&ra, &a.bytes[..])]);
+        assert!(matches!(
+            decode_stream(&mut &twice[..], MAX_BUNDLE_BYTES),
+            Err(ShipError::Malformed(_))
+        ));
     }
 }
