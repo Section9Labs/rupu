@@ -205,65 +205,88 @@ fn read_archive(bytes: &[u8]) -> Result<Vec<(PathBuf, Item)>, ShipError> {
     }
     // Entries are later written through directories, so no path may repeat
     // and none may sit below a symlink or a file.
+    // Compared case-folded too: on a case-insensitive filesystem `A` and `a`
+    // are one path, and a skill differing only by case can't ship portably.
     let mut seen = std::collections::HashSet::new();
     for (rel, _) in &items {
-        if !seen.insert(rel.clone()) {
+        if !seen.insert(fold(rel)) {
             return Err(bad(format!("duplicate entry {}", rel.display())));
         }
     }
-    let blockers: std::collections::HashSet<&PathBuf> = items
+    let blockers: std::collections::HashSet<PathBuf> = items
         .iter()
         .filter(|(_, i)| !matches!(i, Item::Dir))
-        .map(|(r, _)| r)
+        .map(|(r, _)| fold(r))
         .collect();
     for (rel, _) in &items {
-        if rel
-            .ancestors()
-            .skip(1)
-            .any(|a| blockers.contains(&a.to_path_buf()))
-        {
+        if rel.ancestors().skip(1).any(|a| blockers.contains(&fold(a))) {
             return Err(bad(format!("{} is below a file or symlink", rel.display())));
         }
     }
     Ok(items)
 }
 
+fn fold(p: &Path) -> PathBuf {
+    p.components()
+        .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+        .collect()
+}
+
+/// An entry that collides with another path (a name that folds onto an
+/// existing one, say) is a bad archive, not an I/O fault.
+fn write_err(path: &Path) -> impl Fn(std::io::Error) -> ShipError + '_ {
+    move |e| match e.kind() {
+        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::NotADirectory => {
+            ShipError::Malformed(format!("{}: collides with another entry", path.display()))
+        }
+        _ => ShipError::Io {
+            path: path.to_owned(),
+            source: e,
+        },
+    }
+}
+
 fn unpack_into(bytes: &[u8], dest: &Path, expected: &ContentHash) -> Result<(), ShipError> {
     let items = read_archive(bytes)?;
+    // Phase 1, while `dest` holds no symlink: every directory (including each
+    // link's parent), then the files.
     for (rel, item) in &items {
         let target = dest.join(rel);
         match item {
-            Item::Dir => std::fs::create_dir_all(&target).map_err(io(&target))?,
-            Item::File { mode, data } => {
+            Item::Dir => std::fs::create_dir_all(&target).map_err(write_err(&target))?,
+            Item::File { .. } | Item::Link(_) => {
                 if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent).map_err(io(parent))?;
+                    std::fs::create_dir_all(parent).map_err(write_err(parent))?;
                 }
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&target)
-                    .map_err(io(&target))?;
-                std::io::Write::write_all(&mut file, data).map_err(io(&target))?;
-                drop(file);
-                set_mode(&target, *mode)?;
             }
-            Item::Link(_) => {}
         }
     }
-    // Links last: nothing is written through one.
+    for (rel, item) in &items {
+        if let Item::File { mode, data } = item {
+            let target = dest.join(rel);
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)
+                .map_err(write_err(&target))?;
+            std::io::Write::write_all(&mut file, data).map_err(io(&target))?;
+            drop(file);
+            set_mode(&target, *mode)?;
+        }
+    }
+    // Phase 2: only symlink creation, which resolves nothing but the parent
+    // that phase 1 made. A path that folds onto anything already there is
+    // EEXIST.
     for (rel, item) in &items {
         if let Item::Link(link) = item {
             let target = dest.join(rel);
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent).map_err(io(parent))?;
-            }
-            make_symlink(link, &target)?;
+            make_symlink(link, &target).map_err(|e| match e {
+                ShipError::Io { path, source } => write_err(&path)(source),
+                other => other,
+            })?;
         }
     }
-    let tree_err = |source| ShipError::Tree {
-        name: dest.display().to_string(),
-        source,
-    };
+    let tree_err = |e: TreeError| ShipError::Malformed(format!("unpacked skill is invalid: {e}"));
     let entries = walk_tree(dest).map_err(tree_err)?;
     let got = content_hash(dest, &entries).map_err(tree_err)?;
     if got != *expected {

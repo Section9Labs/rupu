@@ -164,6 +164,18 @@ fn chained_symlinks_and_duplicates_are_refused_before_anything_is_written() {
             ]),
         ),
         (
+            "case-fold chain",
+            tar_multi(&[
+                ("A", Symlink, Some("."), b""),
+                ("a/l", Symlink, Some(".."), b""),
+                ("a/L/x/y", Symlink, Some("z"), b""),
+            ]),
+        ),
+        (
+            "case-fold duplicate",
+            tar_multi(&[("f", Regular, None, b"1"), ("F", Regular, None, b"2")]),
+        ),
+        (
             "duplicate",
             tar_multi(&[("f", Regular, None, b"1"), ("f", Regular, None, b"2")]),
         ),
@@ -179,6 +191,7 @@ fn chained_symlinks_and_duplicates_are_refused_before_anything_is_written() {
         assert!(matches!(err, ShipError::Malformed(_)), "{what}: {err}");
         assert!(!dest.exists(), "{what}");
         assert!(!out.path().join("evil").exists(), "{what}");
+        assert!(!out.path().join("x").exists(), "{what}");
     }
 }
 
