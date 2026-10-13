@@ -244,13 +244,76 @@ checked when the step launches, so a missing skill fails that step before
 its agent runs, the way a missing agent does. The run's `skill_index`
 records step skills with reason `launch`, the same as `rupu run --skill`.
 
-A placed step (`host:` or `distribute:`) sends its skills to each unit as
-`rupu run --skill` / `--preload-skill`, and the unit resolves them against
-the host's own layers. The host must run a rupu that advertises
-`agent.skills`. An HTTP, tunnel or bucket host that doesn't is refused before
-anything runs. Over SSH, the launch command itself checks the remote's
-`rupu __features` and refuses when `agent.skills` is missing. A step without
-skills launches on any host.
+A placed step (`host:` or `distribute:`) sends its skills with the unit. See
+[Skills on placed units](#skills-on-placed-units).
+
+## Skills on placed units
+
+A placed unit runs `rupu run <agent>` on another host. The coordinator ships
+the skills the unit needs, and the host runs the unit with exactly those
+copies. The host does not need them installed. Design:
+[the placed-units spec](superpowers/specs/2026-10-13-rupu-skills-on-placed-units-design.md).
+
+**What ships.** The coordinator resolves the unit's skills the way a local run
+does: the `skills:` / `preloadSkills:` of its own copy of the agent, plus the
+step's `skills:` / `preload_skills:`. `*` means the coordinator's global layer.
+If a step skill is not installed on the coordinator, the unit fails before it
+is dispatched, as a local run would. If the coordinator has no copy of the
+agent, or its file does not load, only the step's skills ship. The second case
+adds a warning naming the file.
+
+**What the host does.** Each skill is packed as a tar and named by its content
+hash. The coordinator asks the host which hashes it lacks and sends only those.
+The host checks every tar before keeping it: no absolute or `..` paths, no
+symlink that leaves the skill, no entry that is not a file, directory or
+symlink, and the unpacked tree must hash to the name it was sent under. It
+keeps the copy in `<RUPU_HOME>/cache/skills/<hash>/<name>/` (mode 0700). The
+cache has no eviction.
+
+**Overlay.** A shipped skill replaces the host's installed skill with the same
+layer and name, so the coordinator's version wins. The host still loads the
+agent itself and resolves its grants, now over its global layer, its staged
+project layer and the shipped skills. The rules do not change: `*` is the
+global layer only, and a bare name bound in both layers is ambiguous. A grant
+nobody shipped still resolves from what the host has installed, and fails
+closed if the host has nothing. The unit's `skill_index` marks shipped skills
+`(shipped)`.
+
+**Limits.** A skill tree may be at most 32 MiB and one unit's bundle at most
+128 MiB. The coordinator refuses a unit over either limit before dispatch and
+names the skill and the limit.
+
+**Transfers.** Within one coordinator process, a host that confirmed a hash is
+not asked again, and the units of a fan-out bound for one host share one
+transfer. Over SSH a transfer is two commands per host, `rupu __skills missing`
+and `rupu __skills receive`, not one per skill. Over HTTP the peer serves
+`POST /api/skills/bundle/missing` and `PUT /api/skills/bundle/:hash`.
+`host: local` ships nothing.
+
+**Older hosts.** A host that does not advertise `agent.skill_bundle` is sent
+the unit by name, as before, and the run gets a warning that names the host
+and says the unit will use the host's installed copies. The coordinator
+remembers the downgrade for the life of its process. Over SSH the launch
+command itself checks the remote's `rupu __features`. A tunnel or bucket host
+does not receive shipped skills yet, so it gets the same downgrade.
+
+**Errors.** Every coordinator-side failure for a placed unit's skills (resolve,
+pack, limit, transfer) and a skill missing on the host starts with
+`host <id>: `.
+
+**Known limits.** Only the placed unit's own skills ship: its coordinator copy
+of the agent plus the step's. These still resolve from the host's installed
+layers:
+
+- children the unit launches on the host (`dispatch` of `kind: agent` or
+  `workflow`, in-process sub-agents, a `rupu run --continue` of a `sub_...`
+  run);
+- a `rupu coverage` rerun;
+- an agent whose own grants the coordinator did not ship.
+
+On the host, `rupu run --skill-bundle <json>` (hidden) carries the manifest.
+The run copies it into its run directory, so `rupu run --continue` finds the
+same shipped skills.
 
 ## How an agent uses its skills
 
@@ -415,4 +478,5 @@ a wildcard, ambiguous) comes back as the CLI's message.
 Session skills on a remote host need a rupu there that advertises
 `session.skills`; an older one is refused before anything is sent, with an
 "upgrade rupu there" message. Run skills on a remote host need
-`agent.skills`, as a placed workflow step does.
+`agent.skills`, as a placed workflow step does. Shipping a placed unit's
+skills is described in [Skills on placed units](#skills-on-placed-units).

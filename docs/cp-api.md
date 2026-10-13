@@ -288,7 +288,7 @@ without `rupu cp serve`.
 | GET | `/api/agents/:name` | Agent detail with its prompt and raw file. | `load_error` as in the list. |
 | PUT | `/api/agents/:name` | Overwrite an agent. | `scope_kind`, `scope_id`. Body `{raw}`. 400 for a malformed `skills:` / `preloadSkills:` entry (`skills: entry …`); a skill that isn't installed is accepted and shows in `load_error`. `POST /api/agents` checks the same. |
 | DELETE | `/api/agents/:name` | Delete an agent. | `scope_kind`, `scope_id`. |
-| POST | `/api/agents/:name/run` | Launch an agent run → `{run_id, host_id}`. | Body `AgentRunBody {prompt, mode, target, working_dir, host, scope_kind, scope_id, findings_profile, engagement_profiles, skills, preload_skills, run_id, codename}`. `engagement_profiles` (ids; blank → 400) becomes `rupu run --engagement-profile`; a remote host that does not advertise `agent.engagement_profile` refuses it. `skills` / `preload_skills` (skill grant entries; malformed → 400) become `rupu run --skill` / `--preload-skill`; a remote host that does not advertise `agent.skills` refuses them. `run_id` (a `run_…` id; malformed → 400) is the id the run executes under instead of a minted one (advertised as `run.supplied_run_id`); `codename` (malformed → 400) becomes the hidden `rupu run --codename` (advertised as `run.codename`). A coordinator sends either only to a host that advertises it, and a codename a host can't take never blocks the launch. |
+| POST | `/api/agents/:name/run` | Launch an agent run → `{run_id, host_id}`. | Body `AgentRunBody {prompt, mode, target, working_dir, host, scope_kind, scope_id, findings_profile, engagement_profiles, skills, preload_skills, run_id, codename}`. `engagement_profiles` (ids; blank → 400) becomes `rupu run --engagement-profile`; a remote host that does not advertise `agent.engagement_profile` refuses it. `skills` / `preload_skills` (skill grant entries; malformed → 400) become `rupu run --skill` / `--preload-skill`; a remote host that does not advertise `agent.skills` refuses them. `skill_bundle` (a manifest `{version, skills: [{layer, name, content_hash}]}`; invalid → 400) becomes `rupu run --skill-bundle`; a coordinator sets it for a placed unit after shipping the skills, and a remote host that does not advertise `agent.skill_bundle` refuses it. `run_id` (a `run_…` id; malformed → 400) is the id the run executes under instead of a minted one (advertised as `run.supplied_run_id`); `codename` (malformed → 400) becomes the hidden `rupu run --codename` (advertised as `run.codename`). A coordinator sends either only to a host that advertises it, and a codename a host can't take never blocks the launch. |
 | POST | `/api/agents/:name/session` | Start a session → `{session_id, host_id}`. | Body `SessionStartBody {prompt, mode, target, working_dir, host, scope_kind, scope_id, skills, preload_skills}`. `skills` / `preload_skills` (skill grant entries; malformed → 400) become `rupu session start --skill` / `--preload-skill`; a skill the session can't resolve is a 400 with the CLI's message. A remote host that does not advertise `session.skills` refuses them: 501, "upgrade rupu there". |
 | POST | `/api/agents/generate` | Draft an agent from a description. | Body `{description, provider?, model?}`. |
 
@@ -310,6 +310,16 @@ that project's layer (`.rupu/skills` in the workspace; none when the project's
 |--------|------|---------|-------|
 | GET | `/api/skills` | Every installed skill, as `rupu skill list` (`SkillsResponse`). | `ws_id`. Rows sorted by name, then layer. Each row loads its skill to show its status. |
 | GET | `/api/skills/:layer/:name` | One skill, as `rupu skill show` (`SkillDetail`). | `ws_id`, required for `project`. 400 for a layer other than `global` / `project`, or `project` without `ws_id`; 404 `no installed skill <layer>:<name>`; 500 when the skill's layer can't be read. |
+
+Hosts receive the skills of a placed unit through two more routes, behind the
+`agent.skill_bundle` feature in `/api/host/info` (see
+[Skills on placed units](skills.md#skills-on-placed-units)). They write only to
+`<RUPU_HOME>/cache/skills`.
+
+| Method | Path | Purpose | Notes |
+|--------|------|---------|-------|
+| POST | `/api/skills/bundle/missing` | Which shipped skills this host lacks. | Body `{skills: [{layer, name, content_hash}]}` → `{missing: [...]}`. 400 for a malformed ref. |
+| PUT | `/api/skills/bundle/:hash` | Store one packed skill (the tar is the body). | `layer`, `name`. The tar is vetted and must hash to `:hash`; 400 otherwise, nothing kept. A hash already cached is a success. Body limit is the per-skill cap (32 MiB). |
 
 `SkillsResponse` is `{skills: [SkillRow], warnings: [string]}`. A layer that
 can't be read is left out of `skills` and named in `warnings`
