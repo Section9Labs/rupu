@@ -183,7 +183,8 @@ prints the run id to stderr.
 
 The run is a loop of rounds. At the top of each round the envelope:
 
-1. drains operator steering messages (section 7);
+1. drains the operator's control queue, where a graceful `stop` waits
+   (section 7);
 2. evaluates every goal, the coverage target and the budget over the run's
    evidence;
 3. stops the run if a stop condition holds, checked in this order (first match
@@ -198,7 +199,7 @@ The run is a loop of rounds. At the top of each round the envelope:
    | `ceiling` | `round.ceiling.rounds` or `round.ceiling.wall_clock` is reached |
 
 4. otherwise hands the lead a digest (goal progress, coverage, budget stage,
-   steering, warnings) and lets it run one round of up to `lead_max_turns` turns.
+   a recap of the operator's messages since the last round, warnings) and lets it run one round of up to `lead_max_turns` turns.
    The opening round's message also carries the mission objective and the
    authorized scope: `scope.mode` and one line per `scope.roots` entry, its
    `kind` followed by its coordinates (`network:host host=10.0.0.5`).
@@ -402,8 +403,8 @@ agents that file findings should use the `full` findings profile
 | `rupu agentiflow status <id>` | One run: status, stop reason, rounds, goals, budget and spend |
 | `rupu agentiflow attach <id>` | Follow the run's event log and the lead's current-round transcript until it ends |
 | `rupu agentiflow attach <id> --no-follow` | Print what has been recorded so far and return (alias `--once`) |
-| `rupu agentiflow send <id> "<message>"` | Queue a steering message for the lead's next round |
-| `rupu agentiflow send <id> "<message>" --now` | Interrupt: cut the lead's current round short, then deliver the message |
+| `rupu agentiflow send <id> "<message>"` | Send the lead a message; it gets it before its next model call |
+| `rupu agentiflow send <id> "<message>" --now` | Urgent: also cut the lead's current round short |
 | `rupu agentiflow stop <id>` | Graceful stop at the next round boundary (units are stopped with it) |
 | `rupu agentiflow stop <id> --now` | Hard stop: signal the coordinator and its units immediately |
 | `rupu agentiflow serve` | Run the orphan reaper in the foreground (section 8) |
@@ -428,12 +429,16 @@ printed by the launching command and no run directory is left behind. If it is
 still starting after 30 seconds, the command says so and returns; the run keeps
 going in the background.
 
-**Steering.** A message is queued under the run's `steering/` directory and
-delivered to the lead as an operator instruction at the next round boundary.
-With `--now`, a watcher sees the message within about 200 ms and cuts the
-lead's round short at a safe point (an in-flight model call is abandoned, a
-running tool finishes); the next round starts at once with the message
-delivered. A run that has finished takes no messages.
+**Messages.** `send` writes an operator message to the lead in the run's
+message space ([messaging.md](messaging.md)) and prints its id. The lead gets
+it as an operator instruction before its next model call, mid-round included,
+and the next round's prompt recaps it. With `--now` the message is urgent: a
+watcher sees it within about 200 ms and cuts the lead's round short at a safe
+point (an in-flight model call is abandoned, a running tool finishes); the
+next round starts at once and its first model call carries the message. A run
+that isn't running, or whose coordinator is gone, takes no messages: `send`
+fails and says why. A steering message an older rupu queued under
+`steering/` is re-sent to the lead this way at the next round.
 
 **Stopping.** A plain `stop` queues a stop request: the envelope ends the run at
 the next round boundary as `operator_stop`. `stop --now` sends SIGTERM to the
@@ -474,10 +479,10 @@ Each run gets a directory `~/.rupu/agentiflows/af_<ULID>/`:
 | --- | --- |
 | `agentiflow.json` | The run record: status (`running`, `completed`, `failed`), stop reason, rounds, goal status, spend, coordinator pid. Rewritten atomically after each round and at the end |
 | `agentiflow.yaml` | The definition the run started from, so the run stays readable if the file is later edited |
-| `events.jsonl` | Append-only events: `run_started`, one `round` per finished round (budget stage, goals met, steering count, outcome, spend), `run_stopped` |
+| `events.jsonl` | Append-only events: `run_started`, one `round` per finished round (budget stage, goals met, `steering`: the operator messages its prompt recapped, outcome, spend), `run_stopped` |
 | `usage.jsonl` | The lead's usage ledger |
 | `lead/transcript.r<N>.jsonl` | The lead's transcript for round N |
-| `steering/` | Queued operator messages |
+| `steering/` | The operator's control queue: a graceful stop waiting for the round boundary |
 | `board/` | `posts.jsonl`, `directives.jsonl` and `claims/` |
 | `mailboxes/` | Per-participant inboxes and the broadcast log |
 | `log.jsonl`, `participants.jsonl` | The flow's message log and participant registry ([messaging.md](messaging.md)). A flow recorded before they existed has neither |
@@ -510,7 +515,7 @@ tabs:
 | Flow | The run as a graph: the lead's rounds as a spine with each round's units branching off it (described below), plus a Fleet list of every unit and its status |
 | Assets | Engagement assets (hosts, services, sites, routes, files) with their depth rung |
 | Findings | Findings filed by the lead and its units, in the shared findings table |
-| Messages | The board (posts and directives), with a box to send the lead a steering message, queued for the round boundary or sent mid-round. The send is refused, with an error, once the run has finished or its coordinator process is gone (a dead coordinator's run still reads `running` until the reaper, section 8, closes it) |
+| Messages | The board (posts and directives), with a box to send the lead a message, which it gets before its next model call (`now` also ends its round early). The send is refused, with an error, once the run has finished or its coordinator process is gone (a dead coordinator's run still reads `running` until the reaper, section 8, closes it) |
 | Transcript | The lead's transcript for the latest round, tailing live |
 | Events | `events.jsonl`, newest first |
 
@@ -565,7 +570,7 @@ The API behind it, all on the local host:
 | `GET /api/agentiflows` | Run list, newest first |
 | `GET /api/agentiflows/:id` | Record, definition snapshot, events, units, lead transcript paths |
 | `GET /api/agentiflows/:id/messages` | Board posts and directives |
-| `POST /api/agentiflows/:id/steer` | `{ message, now?, stop? }`: queue a steering message. 409 when nothing would read it: the run isn't `running`, or its recorded coordinator process is gone. 501 unless the server is `rupu cp serve` |
+| `POST /api/agentiflows/:id/steer` | `{ message, now?, stop? }`: send the lead an operator message (`now`: urgent), or with `stop` queue a graceful stop. 409 when nothing would read it: the run isn't `running`, or its recorded coordinator process is gone. 501 unless the server is `rupu cp serve` |
 | `GET /api/runs/:id/graph` | A workflow unit's own graph, fetched when you expand the unit in the Flow tab |
 | `GET /api/findings?run_id=<id>` | The run's findings (the lead's and every unit's) |
 | `GET /api/assets` | Asset inventory (`?ws_id=` / `?target=` to scope it) |

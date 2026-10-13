@@ -685,7 +685,7 @@ rupu agentiflow [OPTIONS] <COMMAND>
 | [`run`](#rupu-agentiflow-run) | Run an agentiflow in the foreground until its envelope stops it |
 | [`list`](#rupu-agentiflow-list) | List agentiflow runs, newest first |
 | [`status`](#rupu-agentiflow-status) | Show one agentiflow run: goals, budget, rounds and why it stopped |
-| [`send`](#rupu-agentiflow-send) | Send a steering message to a running agentiflow's lead |
+| [`send`](#rupu-agentiflow-send) | Send a message to a running agentiflow's lead, as its operator |
 | [`stop`](#rupu-agentiflow-stop) | Stop a running agentiflow |
 | [`attach`](#rupu-agentiflow-attach) | Watch an agentiflow run: its event log and its lead's current round |
 | [`serve`](#rupu-agentiflow-serve) | Supervise agentiflow runs: reap the ones whose coordinator died |
@@ -732,7 +732,7 @@ rupu agentiflow status [OPTIONS] <ID>
 <a id="rupu-agentiflow-send"></a>
 ### `rupu agentiflow send`
 
-Send a steering message to a running agentiflow's lead. The message is queued under the run's `steering/` directory and the envelope hands it to the lead at the next round boundary. `--now` marks it as an interrupt (for delivery mid-round); until the envelope acts on that mark, it is still delivered at the round boundary. A run that already finished takes no message.
+Send a message to a running agentiflow's lead, as its operator. The message goes into the run's message space and the lead receives it before its next model call, mid-round included; the next round's prompt recaps it. `--now` marks it urgent: it is put first, and the lead's current round ends early so the lead turns to it. A run that isn't running (finished, or its coordinator died) takes no message.
 
 ```
 rupu agentiflow send [OPTIONS] <ID> <MESSAGE>
@@ -745,12 +745,12 @@ rupu agentiflow send [OPTIONS] <ID> <MESSAGE>
 
 | Option | Description |
 |---|---|
-| `--now` | Mark the message as an interrupt (mid-round delivery). Delivered at the round boundary until the envelope acts on the mark |
+| `--now` | Mark the message urgent and end the lead's current round early |
 
 <a id="rupu-agentiflow-stop"></a>
 ### `rupu agentiflow stop`
 
-Stop a running agentiflow. By default the stop is graceful: it is queued like a steering message, and the envelope winds the run down at the next round boundary (the units it launched are stopped with it). `--now` is the hard stop: it SIGTERMs the coordinator (and, for a detached run, the process group it leads, so what its lead's tools started goes too), SIGTERMs every unit still running (SIGKILL for one that outlives a short grace), then records the run as failed (`operator_stop:now`) without waiting for the round.
+Stop a running agentiflow. By default the stop is graceful: it is queued for the envelope, which winds the run down at the next round boundary (the units it launched are stopped with it). `--now` is the hard stop: it SIGTERMs the coordinator (and, for a detached run, the process group it leads, so what its lead's tools started goes too), SIGTERMs every unit still running (SIGKILL for one that outlives a short grace), then records the run as failed (`operator_stop:now`) without waiting for the round.
 
 ```
 rupu agentiflow stop [OPTIONS] <ID>
