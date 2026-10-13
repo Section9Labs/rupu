@@ -74,7 +74,7 @@ A message's `to` is one of these:
 | `parent` | the run that launched the sender | `no_parent` |
 | `lead` | an agentiflow's lead | `no_lead` |
 | `operator` | the operator (read from the log; no agent drains it) | — |
-| `broadcast` | every participant but the sender, each once, from when it joined | — |
+| `broadcast` | every participant but the sender, each once, from when it joined | `no_live_participant`, and it is not added to the broadcast log |
 
 Roles and steps are resolved when the message is sent. A message to a participant that has
 left is logged as `participant_left`. A full inbox (256 waiting messages) is `inbox_full`, a
@@ -161,7 +161,9 @@ rupu message participants <run-id>
 
 `<run-id>` is a workflow run, an agentiflow (`af_…`), a session (`ses_…`) or a standalone run,
 by full id, compact form or a unique prefix. Without `--to`, a message goes to an agentiflow's
-`lead`, and to `broadcast` in any other run. `list --follow` tails the log until the run stops.
+`lead`, and to `broadcast` in any other run. A broadcast into a run with nobody else joined
+reaches no one, and `send` prints `not delivered to broadcast: no_live_participant`.
+`list --follow` tails the log until the run stops.
 `rupu agentiflow send <id> <text> [--now]` is shorthand for `rupu message send <id> --to lead
 [--urgent]`.
 

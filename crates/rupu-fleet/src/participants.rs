@@ -242,14 +242,12 @@ impl Roster {
                 Some(OPERATOR.into()),
                 Undeliverable::UnknownParticipant,
             ),
-            Address::Broadcast => Resolution {
-                to: to.to_string(),
-                recipients: self
-                    .live_except(sender.address)
+            Address::Broadcast => many(
+                to.to_string(),
+                self.live_except(sender.address)
                     .map(|p| p.address.clone())
                     .collect(),
-                undelivered: None,
-            },
+            ),
             Address::Role(role) => many(
                 to.to_string(),
                 self.live_except(sender.address)

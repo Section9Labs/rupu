@@ -638,6 +638,15 @@ mod tests {
         let line = send(g, &args(ID, Some("otter#9"), &["hi"]), caps).unwrap();
         let (_, missed) = line.split_once('\n').expect(&line);
         assert_eq!(missed, "not delivered to otter#9: unknown_participant");
+
+        // Everyone, when nobody is left to hear it.
+        lynx.leave("done").unwrap();
+        let line = send(g, &args(ID, None, &["anyone?"]), caps).unwrap();
+        assert_eq!(
+            line.lines().nth(1),
+            Some("not delivered to broadcast: no_live_participant"),
+            "{line}"
+        );
     }
 
     #[test]

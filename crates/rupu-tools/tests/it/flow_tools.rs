@@ -164,6 +164,7 @@ fn capped(root: &Path) -> ToolContext {
 #[tokio::test]
 async fn msg_send_broadcast_to_a_full_log_is_a_visible_error() {
     let dir = tempfile::tempdir().unwrap();
+    join(dir.path(), "worker-1", "recon");
     let ctx = capped(dir.path());
     let args = json!({"to":"broadcast","body":"hi"});
     assert!(call(&ctx, "msg.send", args.clone()).await.error.is_none());

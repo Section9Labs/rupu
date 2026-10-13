@@ -514,3 +514,28 @@ fn a_kind_parses_from_the_name_it_serializes_as() {
     }
     assert_eq!(MessageKind::parse("Direct"), None);
 }
+
+#[test]
+fn a_broadcast_into_an_empty_room_is_undelivered() {
+    let tmp = tempfile::tempdir().unwrap();
+    let alone = joined(tmp.path(), "lynx#1", member("recon", "r1", None, None));
+    let op = Bus::open(tmp.path(), "operator");
+    let empty_room = vec![Undelivered {
+        to: "broadcast".into(),
+        reason: Undeliverable::NoLiveParticipant,
+    }];
+    let r = alone.send(&Address::Broadcast, "anyone?").unwrap();
+    assert!(r.delivery().resolved.is_empty());
+    assert_eq!(r.delivery().undelivered, empty_room);
+    alone.leave("done").unwrap();
+    let r = op
+        .operator_send(operator("broadcast", "anyone?", false))
+        .unwrap();
+    assert_eq!(r.delivery().undelivered, empty_room);
+    assert_eq!(messages(&op).len(), 2, "both are logged");
+    assert_eq!(
+        op.mailbox.broadcast_len().unwrap(),
+        0,
+        "nothing reached the broadcast log"
+    );
+}
