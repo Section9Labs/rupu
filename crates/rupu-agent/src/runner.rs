@@ -1624,6 +1624,16 @@ struct Run {
     collectors: Vec<std::sync::Arc<dyn crate::collector::TurnCollector>>,
     extra_tools: Vec<std::sync::Arc<dyn rupu_tools::Tool>>,
     transcript_path: PathBuf,
+    /// The skills whose bodies the model was given, most recently loaded
+    /// last, one entry per name.
+    loaded_skills: Vec<LoadedSkill>,
+}
+
+/// A skill whose body entered the conversation, at the version it had.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadedSkill {
+    pub name: String,
+    pub content_hash: String,
 }
 
 impl Run {
@@ -1673,6 +1683,7 @@ impl Run {
             collectors,
             extra_tools,
             transcript_path,
+            loaded_skills: Vec::new(),
         }
     }
 
@@ -2048,6 +2059,9 @@ async fn run_agent_inner(
         message: opts.limits.describe(&opts.provider_name, Utc::now()),
     })?;
     write_tool_grant(&mut writer, &grant)?;
+    if let Some(skills) = &opts.tool_context.services.skills {
+        write_skill_index(&mut writer, skills)?;
+    }
     writer.flush()?;
 
     // Wire coverage into tool context. Attribution needs nothing here: the
@@ -3057,6 +3071,16 @@ async fn run_agent_inner(
                             duration_ms: started_tool.elapsed().as_millis() as u64,
                             structured: out.structured.clone(),
                         })?;
+                        if descriptor.name == rupu_tools::skills::LOAD.name && out.error.is_none() {
+                            if let Some(s) = out.structured.as_ref() {
+                                record_skill_load(
+                                    &mut writer,
+                                    &grant,
+                                    &mut opts.loaded_skills,
+                                    s,
+                                )?;
+                            }
+                        }
                         if let Some(d) = out.derived.clone() {
                             match d {
                                 DerivedEvent::FileEdit { path, kind, diff } => {
@@ -3479,6 +3503,100 @@ fn write_tool_grant(writer: &mut JsonlWriter, grant: &ResolvedGrant) -> Result<(
             message: u.notice_message(),
         })?;
     }
+    Ok(())
+}
+
+/// `skill_index`, then a `skill_load { via: preload }` per preloaded skill
+/// (its body is in the system prompt) and a `skill_not_indexed` notice per
+/// granted skill the model is never offered.
+fn write_skill_index(
+    writer: &mut JsonlWriter,
+    skills: &rupu_skills::ResolvedSkills,
+) -> Result<(), RunError> {
+    let rows = skills
+        .entries()
+        .iter()
+        .map(|g| rupu_transcript::SkillIndexEntry {
+            name: g.name().to_owned(),
+            layer: g.skill.layer.as_str().to_owned(),
+            stamp: g.skill.stamp.hex(),
+            preload: g.preload,
+            indexed: g.indexed,
+            reason: g.reason.as_str().to_owned(),
+        })
+        .collect();
+    writer.write(&Event::SkillIndex { skills: rows })?;
+    for g in skills.entries() {
+        if g.preload {
+            let content_hash = g.skill.content_hash().map(|h| h.hex()).unwrap_or_default();
+            writer.write(&Event::SkillLoad {
+                name: g.name().to_owned(),
+                layer: g.skill.layer.as_str().to_owned(),
+                content_hash,
+                base_dir: g.skill.root.display().to_string(),
+                via: "preload".into(),
+            })?;
+        } else if !g.indexed {
+            writer.write(&Event::Notice {
+                kind: "skill_not_indexed".into(),
+                message: format!(
+                    "skill {} is granted but marked disable-model-invocation, so the model is \
+                     never offered it; preload it or invoke it from a session",
+                    g.name()
+                ),
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// A successful `skills.load` (its `structured` keys): the `skill_load`
+/// event, a `skill_changed` notice when the skill changed since the run's
+/// index, a `skill_tools_missing` notice naming the tools it expects that
+/// the run was not granted, and the skill moved to the end of `loaded`.
+fn record_skill_load(
+    writer: &mut JsonlWriter,
+    grant: &ResolvedGrant,
+    loaded: &mut Vec<LoadedSkill>,
+    s: &serde_json::Value,
+) -> Result<(), RunError> {
+    let text = |k: &str| s[k].as_str().unwrap_or_default().to_owned();
+    let name = text("skill");
+    let content_hash = text("content_hash");
+    writer.write(&Event::SkillLoad {
+        name: name.clone(),
+        layer: text("layer"),
+        content_hash: content_hash.clone(),
+        base_dir: text("base_dir"),
+        via: "model".into(),
+    })?;
+    if s["changed"].as_bool() == Some(true) {
+        writer.write(&Event::Notice {
+            kind: "skill_changed".into(),
+            message: format!(
+                "skill {name} changed on disk since this run started; the model was given its \
+                 current version"
+            ),
+        })?;
+    }
+    let missing: Vec<&str> = s["allowed_tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t.as_str())
+        .filter(|t| !grant.offers(t))
+        .collect();
+    if !missing.is_empty() {
+        writer.write(&Event::Notice {
+            kind: "skill_tools_missing".into(),
+            message: format!(
+                "skill {name} expects tools this run was not granted: {}",
+                missing.join(", ")
+            ),
+        })?;
+    }
+    loaded.retain(|l| l.name != name);
+    loaded.push(LoadedSkill { name, content_hash });
     Ok(())
 }
 
@@ -6547,4 +6665,36 @@ mod reasoning_tests {
 #[cfg(test)]
 pub(crate) mod tests {
     pub(crate) use super::reasoning_tests::opts_for;
+}
+
+#[cfg(test)]
+mod skill_load_tests {
+    use super::*;
+
+    fn load(name: &str, hash: &str) -> serde_json::Value {
+        serde_json::json!({
+            "skill": name,
+            "layer": "global",
+            "content_hash": hash,
+            "base_dir": format!("/h/skills/{name}"),
+            "changed": false,
+            "allowed_tools": [],
+        })
+    }
+
+    #[test]
+    fn the_loaded_set_keeps_one_entry_per_skill_most_recent_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = JsonlWriter::create(dir.path().join("t.jsonl")).unwrap();
+        let grant = ResolvedGrant::default();
+        let mut loaded = Vec::new();
+        for (name, hash) in [("a", "h1"), ("b", "h2"), ("a", "h3")] {
+            record_skill_load(&mut writer, &grant, &mut loaded, &load(name, hash)).unwrap();
+        }
+        let entry = |name: &str, hash: &str| LoadedSkill {
+            name: name.into(),
+            content_hash: hash.into(),
+        };
+        assert_eq!(loaded, vec![entry("b", "h2"), entry("a", "h3")]);
+    }
 }
