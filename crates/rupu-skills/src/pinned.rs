@@ -187,9 +187,6 @@ fn git_url(pin: &Pin) -> Result<String, String> {
 
 fn plan(pin: &Pin, url: &str, skills_dir: &Path, layer: Layer, force: bool) -> Plan {
     let dir = skills_dir.join(&pin.name);
-    if !dir.join("SKILL.md").is_file() {
-        return Plan::Install(PinOutcome::Created);
-    }
     let kept = |reason| {
         if force {
             Plan::Install(PinOutcome::Replaced)
@@ -197,6 +194,18 @@ fn plan(pin: &Pin, url: &str, skills_dir: &Path, layer: Layer, force: bool) -> P
             Plan::Done(PinOutcome::Kept(reason))
         }
     };
+    // Anything at the path (a directory without SKILL.md, a file, a dangling
+    // symlink) is not "not installed": only an absent path is created.
+    match std::fs::symlink_metadata(&dir) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Plan::Install(PinOutcome::Created)
+        }
+        Err(e) => return kept_or_failed(force, e.to_string()),
+    }
+    if !dir.join("SKILL.md").is_file() {
+        return kept(KeptReason::OtherSource);
+    }
     let rec = match read_record(skills_dir, &pin.name) {
         Ok(Some(r)) if r.url.as_deref() == Some(url) => r,
         Ok(_) => return kept(KeptReason::OtherSource),
@@ -218,4 +227,13 @@ fn plan(pin: &Pin, url: &str, skills_dir: &Path, layer: Layer, force: bool) -> P
         return Plan::Done(PinOutcome::Skipped);
     }
     Plan::Install(PinOutcome::Updated { from: rec.commit })
+}
+
+/// A path that can't be inspected: refuse it, or replace it under `force`.
+fn kept_or_failed(force: bool, reason: String) -> Plan {
+    if force {
+        Plan::Install(PinOutcome::Replaced)
+    } else {
+        Plan::Done(PinOutcome::Failed(reason))
+    }
 }

@@ -298,3 +298,46 @@ fn a_pin_missing_from_the_fetched_tree_fails_alone() {
     assert_eq!(r.results[0].1, PinOutcome::Created);
     assert!(matches!(r.results[1].1, PinOutcome::Failed(_)));
 }
+
+#[test]
+fn a_non_skill_directory_of_the_same_name_is_kept() {
+    let src = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dest.path().join("network-recon")).unwrap();
+    std::fs::write(dest.path().join("network-recon/notes.txt"), "mine").unwrap();
+    let f = FixtureFetch::new(src.path(), &["network-recon"], "v1", C1);
+    let kept = install_pins(
+        &[pin("network-recon", C1)],
+        dest.path(),
+        Layer::Global,
+        false,
+        &f,
+    );
+    assert_eq!(
+        outcomes(&kept),
+        vec![(
+            "network-recon".into(),
+            PinOutcome::Kept(KeptReason::OtherSource)
+        )]
+    );
+    assert!(
+        f.fetches.borrow().is_empty(),
+        "nothing to install, nothing fetched"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dest.path().join("network-recon/notes.txt")).unwrap(),
+        "mine"
+    );
+    let forced = install_pins(
+        &[pin("network-recon", C1)],
+        dest.path(),
+        Layer::Global,
+        true,
+        &f,
+    );
+    assert_eq!(
+        outcomes(&forced),
+        vec![("network-recon".into(), PinOutcome::Replaced)]
+    );
+    assert!(dest.path().join("network-recon/SKILL.md").is_file());
+}
