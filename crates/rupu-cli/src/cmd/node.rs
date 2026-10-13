@@ -2074,7 +2074,7 @@ async fn bucket_tick(
     active: &mut HashMap<String, BucketRunState>,
     pending: &mut PendingJobs,
 ) -> ClaimOutcome {
-    let outcome = claim_new_jobs(bucket, exe, host_id, active, pending).await;
+    let outcome = claim_new_jobs(bucket, exe, host_id, global, active, pending).await;
     // First attempt right away; a marker that did not land is retried on
     // every later tick until it does.
     flush_failed_markers(bucket, &mut pending.failed_unmarked).await;
@@ -2092,13 +2092,14 @@ async fn claim_new_jobs(
     bucket: &dyn Bucket,
     exe: &Path,
     host_id: &str,
+    global: &Path,
     active: &mut HashMap<String, BucketRunState>,
     pending: &mut PendingJobs,
 ) -> ClaimOutcome {
     let mut outcome = ClaimOutcome::default();
     // Specs that could not be fetched on an earlier tick come first.
     for run_id in std::mem::take(&mut pending.unfetched) {
-        start_claimed_job(bucket, exe, run_id, active, pending).await;
+        start_claimed_job(bucket, exe, global, run_id, active, pending).await;
     }
     let job_ids = match bucket.list_jobs().await {
         Ok(ids) => ids,
@@ -2124,7 +2125,7 @@ async fn claim_new_jobs(
             }
         }
         info!(run_id = %run_id, "node pull: claimed job");
-        start_claimed_job(bucket, exe, run_id, active, pending).await;
+        start_claimed_job(bucket, exe, global, run_id, active, pending).await;
     }
     outcome
 }
@@ -2136,10 +2137,14 @@ async fn claim_new_jobs(
 /// - the job object is gone, or the spec does not deserialize: the job is
 ///   unusable and a retry cannot fix it, so it is marked `failed` (same as a
 ///   spawn failure) rather than ending the worker.
+/// - the spec carries a skill bundle: every skill the worker's cache lacks is
+///   downloaded first ([`fetch_bundle_skills`]); a transient bucket error
+///   parks the job in `pending.unfetched`, anything else marks it `failed`.
 /// - spawn fails: marked `failed`.
 async fn start_claimed_job(
     bucket: &dyn Bucket,
     exe: &Path,
+    global: &Path,
     run_id: String,
     active: &mut HashMap<String, BucketRunState>,
     pending: &mut PendingJobs,
@@ -2165,6 +2170,21 @@ async fn start_claimed_job(
             return;
         }
     };
+    if let Some(manifest) = &spec.skill_bundle {
+        match fetch_bundle_skills(bucket, global, manifest).await {
+            Ok(()) => {}
+            Err(SkillFetchError::Transient(e)) => {
+                warn!(run_id = %run_id, error = %e, "node pull: skill download failed; will retry next tick");
+                pending.unfetched.push(run_id);
+                return;
+            }
+            Err(SkillFetchError::Permanent(e)) => {
+                warn!(run_id = %run_id, error = %e, "node pull: the job's skills are unusable; marking it failed");
+                pending.failed_unmarked.push(run_id);
+                return;
+            }
+        }
+    }
     match spawn_run(exe, &run_id, &spec) {
         Ok(child) => {
             info!(run_id = %run_id, "node pull: run spawned");
@@ -2182,6 +2202,50 @@ async fn start_claimed_job(
             pending.failed_unmarked.push(run_id);
         }
     }
+}
+
+/// Why a job's skills could not be made available.
+#[derive(Debug)]
+enum SkillFetchError {
+    /// A bucket hiccup: the job stays claimed and is retried next tick.
+    Transient(String),
+    /// Retrying cannot help (invalid manifest, object gone, over the cap, a
+    /// tampered archive): the job fails.
+    Permanent(String),
+}
+
+/// Download and cache every skill of `manifest` the worker's cache lacks. The
+/// run may start only when this returns `Ok`: each skill was verified against
+/// its manifest hash by `store` before it counted as cached.
+async fn fetch_bundle_skills(
+    bucket: &dyn Bucket,
+    global: &Path,
+    manifest: &rupu_skills::ship::SkillBundleManifest,
+) -> Result<(), SkillFetchError> {
+    use rupu_skills::ship;
+    manifest
+        .validate()
+        .map_err(|e| SkillFetchError::Permanent(format!("invalid skill bundle: {e}")))?;
+    let cache = ship::cache_dir(global);
+    for r in ship::missing(&cache, &manifest.skills) {
+        let what = format!("{}:{}", r.layer, r.name);
+        let bytes = bucket
+            .get_skill(&r.content_hash, ship::MAX_SHIPPED_SKILL_BYTES + 64 * 1024)
+            .await
+            .map_err(|e| match e {
+                // The cap overrun is the one `Io` a retry cannot fix.
+                BucketError::Io(m) if !m.contains("exceeds") => {
+                    SkillFetchError::Transient(format!("skill {what}: {m}"))
+                }
+                e => SkillFetchError::Permanent(format!("skill {what}: {e}")),
+            })?;
+        let (c, r2) = (cache.clone(), r.clone());
+        tokio::task::spawn_blocking(move || ship::store(&c, &r2, &bytes))
+            .await
+            .map_err(|e| SkillFetchError::Permanent(format!("skill {what}: {e}")))?
+            .map_err(|e| SkillFetchError::Permanent(format!("skill {what}: {e}")))?;
+    }
+    Ok(())
 }
 
 /// Step 2: drain every active run — routine uploads, queued control messages,
@@ -3197,6 +3261,8 @@ mod tests {
         fail_list_jobs: std::sync::atomic::AtomicBool,
         fail_claim_job: std::sync::atomic::AtomicBool,
         fail_get_job: std::sync::atomic::AtomicBool,
+        fail_get_skill: std::sync::atomic::AtomicBool,
+        get_skill_calls: std::sync::atomic::AtomicUsize,
     }
 
     impl FlakyJobBucket {
@@ -3206,6 +3272,8 @@ mod tests {
                 fail_list_jobs: Default::default(),
                 fail_claim_job: Default::default(),
                 fail_get_job: Default::default(),
+                fail_get_skill: Default::default(),
+                get_skill_calls: Default::default(),
             }
         }
 
@@ -3292,6 +3360,11 @@ mod tests {
             self.inner.put_skill(hash, bytes).await
         }
         async fn get_skill(&self, hash: &str, max_bytes: u64) -> Result<Vec<u8>, BucketError> {
+            self.get_skill_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if Self::is_on(&self.fail_get_skill) {
+                return Err(BucketError::Io("injected get_skill failure".into()));
+            }
             self.inner.get_skill(hash, max_bytes).await
         }
     }
@@ -3488,6 +3561,330 @@ mod tests {
         tick(&bucket, runs_root.path(), &mut active, &mut pending).await;
         assert!(active.contains_key("run_G"), "spawned on the retry");
         assert!(pending.is_empty());
+    }
+
+    /// A real packed skill `name` plus a job whose spec carries it as a bundle.
+    fn skill_job(
+        name: &str,
+    ) -> (
+        rupu_skills::ship::PackedSkill,
+        rupu_skills::ship::ShippedSkillRef,
+        Vec<u8>,
+    ) {
+        let src = tempdir().unwrap();
+        let dir = src.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: d\n---\nbody\n"),
+        )
+        .unwrap();
+        let skill = rupu_skills::load_skill(&dir, rupu_skills::Layer::Global).unwrap();
+        let packed = rupu_skills::ship::pack_skill(&skill).unwrap();
+        let r = packed.reference();
+        let mut spec: RunSpec = serde_json::from_slice(&agent_job("a")).unwrap();
+        spec.skill_bundle = Some(rupu_skills::ship::SkillBundleManifest {
+            version: 1,
+            skills: vec![r.clone()],
+        });
+        (packed, r, serde_json::to_vec(&spec).unwrap())
+    }
+
+    /// The pieces a skill-bundle test needs: the worker's global dir, and its
+    /// `runs` root beside it (`tick` derives `global` from `runs_root`).
+    fn worker_dirs() -> (tempfile::TempDir, std::path::PathBuf) {
+        let global = tempdir().unwrap();
+        let runs = global.path().join("runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        (global, runs)
+    }
+
+    /// A job with a bundle: the missing skill is downloaded into the cache and
+    /// the run is spawned with `--skill-bundle=`.
+    #[tokio::test]
+    async fn a_job_with_a_skill_bundle_downloads_it_and_spawns_with_the_bundle() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let bucket = FlakyJobBucket::new();
+        let (packed, r, job) = skill_job("alpha");
+        bucket
+            .put_skill(&r.content_hash, &packed.bytes)
+            .await
+            .unwrap();
+        bucket.put_job("run_S", &job).await.unwrap();
+        let (global, runs) = worker_dirs();
+        // A stand-in exe that records its argv.
+        let argv_file = global.path().join("argv.txt");
+        let exe = global.path().join("fake-rupu");
+        std::fs::write(
+            &exe,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
+                argv_file.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let (mut active, mut pending) = (HashMap::new(), PendingJobs::default());
+
+        bucket_tick(
+            &bucket,
+            &exe,
+            "host_1",
+            &runs,
+            global.path(),
+            &mut active,
+            &mut pending,
+        )
+        .await;
+
+        let cache = rupu_skills::ship::cache_dir(global.path());
+        assert!(rupu_skills::ship::cached_path(&cache, &r)
+            .join("SKILL.md")
+            .is_file());
+        assert!(active.contains_key("run_S") && pending.is_empty());
+        assert_eq!(bucket.get_skill_calls.load(SeqCst), 1);
+        let mut child = active.remove("run_S").unwrap().child;
+        child.wait().await.unwrap();
+        let argv = std::fs::read_to_string(&argv_file).unwrap();
+        assert!(argv.contains("--skill-bundle="), "{argv}");
+    }
+
+    /// A skill already in the cache is not downloaded again.
+    #[tokio::test]
+    async fn a_cached_skill_is_not_downloaded() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let bucket = FlakyJobBucket::new();
+        let (packed, r, job) = skill_job("alpha");
+        bucket.put_job("run_S", &job).await.unwrap();
+        let (global, runs) = worker_dirs();
+        rupu_skills::ship::store(
+            &rupu_skills::ship::cache_dir(global.path()),
+            &r,
+            &packed.bytes,
+        )
+        .unwrap();
+        let (mut active, mut pending) = (HashMap::new(), PendingJobs::default());
+
+        tick(&bucket, &runs, &mut active, &mut pending).await;
+
+        assert_eq!(bucket.get_skill_calls.load(SeqCst), 0);
+        assert!(active.contains_key("run_S"));
+    }
+
+    /// An absent skill object fails the job (marked `failed`), naming
+    /// `layer:name`; nothing is cached and nothing spawns.
+    #[tokio::test]
+    async fn a_missing_skill_object_fails_the_job_naming_the_skill() {
+        let bucket = FlakyJobBucket::new();
+        let (_packed, _r, job) = skill_job("alpha");
+        bucket.put_job("run_S", &job).await.unwrap();
+        let (global, runs) = worker_dirs();
+        let (mut active, mut pending) = (HashMap::new(), PendingJobs::default());
+
+        tick(&bucket, &runs, &mut active, &mut pending).await;
+
+        assert!(active.is_empty() && pending.is_empty());
+        assert_eq!(
+            bucket.get_finished("run_S").await.unwrap().as_deref(),
+            Some("failed")
+        );
+        let spec: RunSpec = serde_json::from_slice(&job).unwrap();
+        let err = fetch_bundle_skills(&bucket, global.path(), spec.skill_bundle.as_ref().unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, SkillFetchError::Permanent(m) if m.contains("global:alpha")),
+            "{err:?}"
+        );
+    }
+
+    /// An object whose bytes do not match the manifest hash fails the job and
+    /// caches nothing.
+    #[tokio::test]
+    async fn a_tampered_skill_fails_the_job_and_caches_nothing() {
+        let bucket = FlakyJobBucket::new();
+        let (_good, r, job) = skill_job("alpha");
+        let (other, _, _) = skill_job("beta");
+        // Valid archive, but of a different skill than the manifest names.
+        bucket
+            .put_skill(&r.content_hash, &other.bytes)
+            .await
+            .unwrap();
+        bucket.put_job("run_S", &job).await.unwrap();
+        let (global, runs) = worker_dirs();
+        let (mut active, mut pending) = (HashMap::new(), PendingJobs::default());
+
+        tick(&bucket, &runs, &mut active, &mut pending).await;
+
+        assert!(active.is_empty() && pending.is_empty());
+        assert_eq!(
+            bucket.get_finished("run_S").await.unwrap().as_deref(),
+            Some("failed")
+        );
+        let cache = rupu_skills::ship::cache_dir(global.path());
+        assert!(!rupu_skills::ship::cached_path(&cache, &r).exists());
+        let spec: RunSpec = serde_json::from_slice(&job).unwrap();
+        let err = fetch_bundle_skills(&bucket, global.path(), spec.skill_bundle.as_ref().unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, SkillFetchError::Permanent(m) if m.contains("global:alpha")),
+            "{err:?}"
+        );
+    }
+
+    /// A transient `get_skill` error leaves the job claimed and pending; the
+    /// next tick downloads the skill and starts it.
+    #[tokio::test]
+    async fn a_transient_skill_download_error_is_retried_next_tick() {
+        let bucket = FlakyJobBucket::new();
+        let (packed, r, job) = skill_job("alpha");
+        bucket
+            .put_skill(&r.content_hash, &packed.bytes)
+            .await
+            .unwrap();
+        bucket.put_job("run_S", &job).await.unwrap();
+        FlakyJobBucket::set(&bucket.fail_get_skill, true);
+        let (_global, runs) = worker_dirs();
+        let (mut active, mut pending) = (HashMap::new(), PendingJobs::default());
+
+        tick(&bucket, &runs, &mut active, &mut pending).await;
+        assert!(active.is_empty());
+        assert_eq!(pending.unfetched, ["run_S"]);
+        assert!(pending.failed_unmarked.is_empty());
+
+        FlakyJobBucket::set(&bucket.fail_get_skill, false);
+        tick(&bucket, &runs, &mut active, &mut pending).await;
+        assert!(active.contains_key("run_S"), "started on the retry");
+        assert!(pending.is_empty());
+    }
+
+    /// A manifest that does not validate fails the job before any download.
+    #[tokio::test]
+    async fn an_invalid_skill_manifest_fails_the_job() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let bucket = FlakyJobBucket::new();
+        let (_p, _r, job) = skill_job("alpha");
+        let mut spec: RunSpec = serde_json::from_slice(&job).unwrap();
+        spec.skill_bundle.as_mut().unwrap().version = 9;
+        bucket
+            .put_job("run_S", &serde_json::to_vec(&spec).unwrap())
+            .await
+            .unwrap();
+        let (_global, runs) = worker_dirs();
+        let (mut active, mut pending) = (HashMap::new(), PendingJobs::default());
+
+        tick(&bucket, &runs, &mut active, &mut pending).await;
+
+        assert!(active.is_empty() && pending.is_empty());
+        assert_eq!(bucket.get_skill_calls.load(SeqCst), 0);
+        assert_eq!(
+            bucket.get_finished("run_S").await.unwrap().as_deref(),
+            Some("failed")
+        );
+    }
+
+    /// End to end across the real halves: the CP's bucket connector ships a
+    /// skill and launches a unit with the manifest; the real worker tick
+    /// downloads, verifies and caches it, and spawns the run with
+    /// `--skill-bundle=`. (Here rather than in rupu-cp's `bucket_e2e`: the
+    /// worker half lives in this crate.)
+    #[tokio::test]
+    async fn a_shipped_skill_reaches_the_worker_and_the_run_argv() {
+        use rupu_cp::agent_launcher::AgentLaunchRequest;
+        use rupu_cp::host::bucket::BucketHostConnector;
+        use rupu_cp::host::connector::HostConnector;
+        use rupu_cp::host::skill_ship::{ShipOutcome, SkillBundle};
+        use std::sync::Arc;
+        let bucket = Arc::new(ObjectStoreBucket::from_url("memory:///", None).unwrap());
+        let info = bucket_worker_info("w1");
+        bucket
+            .put_worker_info("w1", &serde_json::to_vec(&info).unwrap())
+            .await
+            .unwrap();
+        let cp = tempdir().unwrap();
+        let run_store = Arc::new(rupu_orchestrator::RunStore::new(cp.path().join("runs")));
+        let conn = BucketHostConnector::new(
+            "host_1",
+            bucket.clone(),
+            Arc::new(rupu_cp::node::NodeMirror::new(run_store.clone())),
+            run_store,
+            Arc::new(rupu_cp::customers::CustomerPricing::flat(
+                rupu_config::PricingConfig::default(),
+            )),
+        );
+
+        let src = tempdir().unwrap();
+        let dir = src.path().join("alpha");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: alpha\ndescription: d\n---\nbody\n",
+        )
+        .unwrap();
+        let skill = rupu_skills::load_skill(&dir, rupu_skills::Layer::Global).unwrap();
+        let bundle = SkillBundle::new(vec![Arc::new(skill)]);
+        let manifest = match conn.ship_skills(&bundle).await.unwrap() {
+            ShipOutcome::Shipped(m) => m,
+            other => panic!("{other:?}"),
+        };
+        let run_id = conn
+            .launch_agent(AgentLaunchRequest {
+                codename: None,
+                agent: "a".into(),
+                prompt: Some("hi".into()),
+                mode: None,
+                target: None,
+                working_dir: None,
+                run_id: None,
+                findings_profile: None,
+                engagement_profiles: Vec::new(),
+                skills: Vec::new(),
+                preload_skills: Vec::new(),
+                skill_bundle: Some(manifest.clone()),
+            })
+            .await
+            .unwrap();
+
+        let (global, runs) = worker_dirs();
+        let argv_file = global.path().join("argv.txt");
+        let exe = global.path().join("fake-rupu");
+        std::fs::write(
+            &exe,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n",
+                argv_file.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let (mut active, mut pending) = (HashMap::new(), PendingJobs::default());
+        bucket_tick(
+            bucket.as_ref(),
+            &exe,
+            "w1",
+            &runs,
+            global.path(),
+            &mut active,
+            &mut pending,
+        )
+        .await;
+
+        let cache = rupu_skills::ship::cache_dir(global.path());
+        assert!(rupu_skills::ship::cached_path(&cache, &manifest.skills[0])
+            .join("SKILL.md")
+            .is_file());
+        let mut child = active.remove(&run_id).expect("the run started").child;
+        child.wait().await.unwrap();
+        assert!(std::fs::read_to_string(&argv_file)
+            .unwrap()
+            .contains("--skill-bundle="));
     }
 
     /// A job whose spec does not deserialize is unusable and no retry fixes it:
