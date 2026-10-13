@@ -28,6 +28,7 @@ pub mod run_resolve;
 pub mod run_streams;
 pub mod runs;
 pub mod sessions;
+pub mod skills;
 pub mod source;
 pub mod tools;
 pub mod transcript;

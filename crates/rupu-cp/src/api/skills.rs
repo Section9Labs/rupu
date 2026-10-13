@@ -1,0 +1,468 @@
+//! Installed Agent Skills, read-only (spec
+//! `docs/superpowers/specs/2026-10-12-rupu-agent-skills-design.md` §8).
+//!
+//! `GET /api/skills` lists the global layer; `?ws_id=` adds that project's
+//! layer. Each row loads its skill to show its status, as `rupu skill list`
+//! does. `GET /api/skills/:layer/:name` shows one skill, as `rupu skill
+//! show` does.
+
+use crate::error::{ApiError, ApiResult};
+use crate::state::AppState;
+use axum::extract::{Path, Query, State};
+use axum::{routing::get, Json, Router};
+use rupu_skills::record::read_record;
+use rupu_skills::tools_map::mapped_tools;
+use rupu_skills::{CatalogEntry, Layer, LayerDirs, SkillCatalog};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+pub fn routes() -> Router<AppState> {
+    Router::new()
+        .route("/api/skills", get(list_skills))
+        .route("/api/skills/:layer/:name", get(get_skill))
+}
+
+#[derive(Debug, Serialize)]
+pub struct SkillRow {
+    pub name: String,
+    pub layer: &'static str,
+    /// `ok` or `invalid`.
+    pub status: &'static str,
+    pub description: Option<String>,
+    pub error: Option<String>,
+    pub warnings: Vec<String>,
+    pub stamp: Option<String>,
+    /// The `source` of the skill's install record, when it has one.
+    pub source: Option<String>,
+    /// The other layer has a skill of the same name.
+    pub both_layers: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SkillsResponse {
+    pub skills: Vec<SkillRow>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SkillDetail {
+    #[serde(flatten)]
+    pub row: SkillRow,
+    pub path: String,
+    pub license: Option<String>,
+    pub compatibility: Option<String>,
+    pub allowed_tools: Vec<String>,
+    pub mapped_tools: Vec<&'static str>,
+    pub disable_model_invocation: bool,
+    pub metadata: BTreeMap<String, String>,
+    /// The skill's files other than `SKILL.md`, relative to its root.
+    pub files: Vec<String>,
+    pub content_hash: Option<String>,
+    /// `SKILL.md` without its frontmatter.
+    pub body: Option<String>,
+    pub source_record: Option<serde_json::Value>,
+    /// Why the install record could not be read, when it couldn't.
+    pub source_error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SkillsQuery {
+    ws_id: Option<String>,
+}
+
+/// The layers a request reads: global, plus the project's when `ws_id`
+/// names a registered workspace.
+fn layers(s: &AppState, ws_id: Option<&str>) -> ApiResult<LayerDirs> {
+    let project = match ws_id {
+        None => None,
+        Some(id) => {
+            let w = crate::api::code::load_workspace(s, id)?;
+            rupu_workspace::project_layer_dir(&s.global_dir, Some(std::path::Path::new(&w.path)))
+        }
+    };
+    Ok(LayerDirs::for_layers(&s.global_dir, project.as_deref()))
+}
+
+fn discover(dirs: &LayerDirs) -> ApiResult<SkillCatalog> {
+    SkillCatalog::discover(dirs).map_err(|e| ApiError::internal(e.to_string()))
+}
+
+/// The layer's `skills/` directory, where the install records live.
+fn skills_dir_of(e: &CatalogEntry) -> &std::path::Path {
+    e.path.parent().unwrap_or(&e.path)
+}
+
+fn row(e: &CatalogEntry, cat: &SkillCatalog) -> SkillRow {
+    let (status, description, error, warnings, stamp) = match e.skill() {
+        Ok(s) => (
+            "ok",
+            Some(s.frontmatter.description.clone()),
+            None,
+            s.frontmatter.warnings.clone(),
+            Some(s.stamp.short()),
+        ),
+        Err(err) => ("invalid", None, Some(err.to_string()), Vec::new(), None),
+    };
+    SkillRow {
+        name: e.dir_name.clone(),
+        layer: e.layer.as_str(),
+        status,
+        description,
+        error,
+        warnings,
+        stamp,
+        source: read_record(skills_dir_of(e), &e.dir_name)
+            .ok()
+            .flatten()
+            .map(|r| r.source),
+        both_layers: cat.named(&e.dir_name).count() > 1,
+    }
+}
+
+fn detail(e: &CatalogEntry, cat: &SkillCatalog) -> SkillDetail {
+    let (source_record, source_error) = match read_record(skills_dir_of(e), &e.dir_name) {
+        Ok(rec) => (
+            rec.map(|r| serde_json::to_value(r).expect("a source record serializes")),
+            None,
+        ),
+        Err(err) => (None, Some(err.to_string())),
+    };
+    let mut out = SkillDetail {
+        row: row(e, cat),
+        path: e.path.display().to_string(),
+        license: None,
+        compatibility: None,
+        allowed_tools: Vec::new(),
+        mapped_tools: Vec::new(),
+        disable_model_invocation: false,
+        metadata: BTreeMap::new(),
+        files: Vec::new(),
+        content_hash: None,
+        body: None,
+        source_record,
+        source_error,
+    };
+    let Ok(s) = e.skill() else {
+        return out;
+    };
+    match s.content_hash() {
+        Ok(h) => out.content_hash = Some(h.short()),
+        Err(err) => out.row.warnings.push(format!("content hash: {err}")),
+    }
+    let fm = &s.frontmatter;
+    out.license = fm.license.clone();
+    out.compatibility = fm.compatibility.clone();
+    out.allowed_tools = fm.allowed_tools.clone();
+    out.mapped_tools = mapped_tools(&fm.allowed_tools);
+    out.disable_model_invocation = fm.disable_model_invocation;
+    out.metadata = fm.metadata.clone();
+    out.files = s
+        .files()
+        .into_iter()
+        .filter(|f| *f != "SKILL.md")
+        .map(str::to_owned)
+        .collect();
+    out.body = Some(s.body.clone());
+    out
+}
+
+async fn list_skills(
+    State(s): State<AppState>,
+    Query(q): Query<SkillsQuery>,
+) -> ApiResult<Json<SkillsResponse>> {
+    let dirs = layers(&s, q.ws_id.as_deref())?;
+    let skills = tokio::task::spawn_blocking(move || {
+        let cat = discover(&dirs)?;
+        Ok::<_, ApiError>(cat.entries().iter().map(|e| row(e, &cat)).collect())
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))??;
+    Ok(Json(SkillsResponse { skills }))
+}
+
+async fn get_skill(
+    State(s): State<AppState>,
+    Path((layer, name)): Path<(String, String)>,
+    Query(q): Query<SkillsQuery>,
+) -> ApiResult<Json<SkillDetail>> {
+    let layer = Layer::parse(&layer).ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "unknown layer {layer:?}; expected global or project"
+        ))
+    })?;
+    if layer == Layer::Project && q.ws_id.is_none() {
+        return Err(ApiError::bad_request(
+            "a project skill needs ?ws_id= naming its project",
+        ));
+    }
+    let dirs = layers(&s, q.ws_id.as_deref())?;
+    let found = tokio::task::spawn_blocking(move || {
+        let cat = discover(&dirs)?;
+        cat.get(layer, &name)
+            .map(|e| detail(e, &cat))
+            .ok_or_else(|| {
+                ApiError::not_found(format!("no installed skill {}:{name}", layer.as_str()))
+            })
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))??;
+    Ok(Json(found))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use http::{Request, StatusCode};
+    use http_body_util::BodyExt as _;
+    use std::path::Path as FsPath;
+    use tower::ServiceExt as _;
+
+    fn test_state(tmp: &tempfile::TempDir) -> AppState {
+        AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        )
+    }
+
+    fn install(skills_dir: &FsPath, dir: &str, frontmatter: &str, body: &str) {
+        let d = skills_dir.join(dir);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("SKILL.md"),
+            format!("---\n{frontmatter}---\n{body}\n"),
+        )
+        .unwrap();
+    }
+
+    fn register_workspace(tmp: &tempfile::TempDir, id: &str, root: &FsPath) {
+        std::fs::create_dir_all(tmp.path().join("workspaces")).unwrap();
+        std::fs::write(
+            tmp.path().join("workspaces").join(format!("{id}.toml")),
+            format!(
+                "id = \"{id}\"\npath = \"{}\"\ncreated_at = \"2026-01-01T00:00:00Z\"\n",
+                root.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    async fn get(s: &AppState, uri: &str) -> (StatusCode, serde_json::Value) {
+        let resp = routes()
+            .with_state(s.clone())
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    fn rows(json: &serde_json::Value) -> Vec<serde_json::Value> {
+        json["skills"].as_array().expect("skills array").clone()
+    }
+
+    #[tokio::test]
+    async fn the_global_list_shows_each_skill_and_its_source() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let global = tmp.path().join("skills");
+        install(
+            &global,
+            "pdf",
+            "name: pdf\ndescription: Read PDFs.\n",
+            "Use pdftotext.",
+        );
+
+        let (status, json) = get(&s, "/api/skills").await;
+        assert_eq!(status, StatusCode::OK);
+        let r = rows(&json);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0]["name"], "pdf");
+        assert_eq!(r[0]["layer"], "global");
+        assert_eq!(r[0]["status"], "ok");
+        assert_eq!(r[0]["description"], "Read PDFs.");
+        assert_eq!(r[0]["source"], serde_json::Value::Null);
+        assert_eq!(r[0]["both_layers"], false);
+        assert_eq!(r[0]["warnings"], serde_json::json!([]));
+        assert!(r[0]["stamp"].as_str().is_some_and(|s| !s.is_empty()));
+
+        std::fs::create_dir_all(global.join(".sources")).unwrap();
+        std::fs::write(
+            global.join(".sources/pdf.json"),
+            r#"{"version":1,"source":"github:acme/skills#pdf","content_hash":"ab","installed_at":1}"#,
+        )
+        .unwrap();
+        let (_, json) = get(&s, "/api/skills").await;
+        assert_eq!(rows(&json)[0]["source"], "github:acme/skills#pdf");
+    }
+
+    #[tokio::test]
+    async fn a_project_adds_its_layer_and_marks_names_in_both() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        install(
+            &tmp.path().join("skills"),
+            "pdf",
+            "name: pdf\ndescription: Global PDFs.\n",
+            "g",
+        );
+        let repo = tempfile::TempDir::new().unwrap();
+        let project = repo.path().join(".rupu/skills");
+        install(
+            &project,
+            "pdf",
+            "name: pdf\ndescription: Project PDFs.\n",
+            "p",
+        );
+        install(&project, "notes", "name: notes\ndescription: Notes.\n", "n");
+        register_workspace(&tmp, "ws1", repo.path());
+
+        let (_, json) = get(&s, "/api/skills").await;
+        assert_eq!(rows(&json).len(), 1, "no ws_id: the global layer only");
+
+        let (status, json) = get(&s, "/api/skills?ws_id=ws1").await;
+        assert_eq!(status, StatusCode::OK);
+        let r = rows(&json);
+        let keys: Vec<(String, String, bool)> = r
+            .iter()
+            .map(|r| {
+                (
+                    r["name"].as_str().unwrap().to_owned(),
+                    r["layer"].as_str().unwrap().to_owned(),
+                    r["both_layers"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                ("notes".into(), "project".into(), false),
+                ("pdf".into(), "global".into(), true),
+                ("pdf".into(), "project".into(), true),
+            ]
+        );
+        assert_eq!(r[2]["description"], "Project PDFs.");
+    }
+
+    #[tokio::test]
+    async fn an_invalid_project_skill_lists_with_its_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let repo = tempfile::TempDir::new().unwrap();
+        install(
+            &repo.path().join(".rupu/skills"),
+            "broken",
+            "name: other\ndescription: Misnamed.\n",
+            "b",
+        );
+        register_workspace(&tmp, "ws1", repo.path());
+
+        let (status, json) = get(&s, "/api/skills?ws_id=ws1").await;
+        assert_eq!(status, StatusCode::OK);
+        let r = rows(&json);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0]["name"], "broken");
+        assert_eq!(r[0]["status"], "invalid");
+        assert_eq!(r[0]["description"], serde_json::Value::Null);
+        assert_eq!(r[0]["stamp"], serde_json::Value::Null);
+        assert_eq!(
+            r[0]["error"],
+            "name \"other\" does not match its directory \"broken\""
+        );
+
+        let (status, json) = get(&s, "/api/skills/project/broken?ws_id=ws1").await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["status"], "invalid");
+        assert_eq!(json["body"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn a_long_description_lists_ok_with_a_warning() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let long = "a".repeat(1100);
+        install(
+            &tmp.path().join("skills"),
+            "wordy",
+            &format!("name: wordy\ndescription: {long}\n"),
+            "w",
+        );
+
+        let (_, json) = get(&s, "/api/skills").await;
+        let r = rows(&json);
+        assert_eq!(r[0]["status"], "ok");
+        assert_eq!(
+            r[0]["warnings"],
+            serde_json::json!([
+                "`description` is 1100 characters; the agentskills.io limit is 1024"
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn the_detail_shows_one_skill() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let global = tmp.path().join("skills");
+        install(
+            &global,
+            "pdf",
+            "name: pdf\ndescription: Read PDFs.\nlicense: MIT\nallowed-tools: Bash(pdftotext:*) Read\nmetadata:\n  owner: docs\n",
+            "Use pdftotext.",
+        );
+        std::fs::create_dir_all(global.join("pdf/scripts")).unwrap();
+        std::fs::write(global.join("pdf/scripts/extract.sh"), "echo hi\n").unwrap();
+
+        let (status, json) = get(&s, "/api/skills/global/pdf").await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["name"], "pdf");
+        assert_eq!(json["layer"], "global");
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["body"], "Use pdftotext.");
+        assert_eq!(json["files"], serde_json::json!(["scripts/extract.sh"]));
+        assert_eq!(json["license"], "MIT");
+        assert_eq!(
+            json["allowed_tools"],
+            serde_json::json!(["Bash(pdftotext:*)", "Read"])
+        );
+        assert_eq!(
+            json["mapped_tools"],
+            serde_json::json!(["bash", "read_file"])
+        );
+        assert_eq!(json["metadata"], serde_json::json!({"owner": "docs"}));
+        assert_eq!(json["disable_model_invocation"], false);
+        assert_eq!(json["source_record"], serde_json::Value::Null);
+        let dir =
+            rupu_skills::SkillCatalog::discover(&LayerDirs::for_layers(tmp.path(), None)).unwrap();
+        let expected = dir.get(Layer::Global, "pdf").unwrap().skill().unwrap();
+        assert_eq!(
+            json["content_hash"],
+            expected.content_hash().unwrap().short()
+        );
+        assert_eq!(json["stamp"], expected.stamp.short());
+
+        let (status, json) = get(&s, "/api/skills/global/nope").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json["error"], "no installed skill global:nope");
+
+        let (status, _) = get(&s, "/api/skills/team/pdf").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, _) = get(&s, "/api/skills/project/pdf").await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a project skill needs ws_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_workspace_is_not_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let (status, _) = get(&s, "/api/skills?ws_id=nope").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = get(&s, "/api/skills/global/pdf?ws_id=nope").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+}
