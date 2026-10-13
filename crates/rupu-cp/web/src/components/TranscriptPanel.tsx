@@ -9,7 +9,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { AlertTriangle } from 'lucide-react';
-import { api } from '../lib/api';
+import { api, apiErrorMessage } from '../lib/api';
 import type { TranscriptEvent } from '../lib/transcript';
 import { cn } from '../lib/cn';
 import { formatDuration } from '../lib/duration';
@@ -133,7 +133,7 @@ export default function TranscriptPanel({
       })
       .catch((err: unknown) => {
         if (cancelled) return;
-        setErrorMsg(err instanceof Error ? err.message : String(err));
+        setErrorMsg(apiErrorMessage(err));
         setState('error');
       });
 

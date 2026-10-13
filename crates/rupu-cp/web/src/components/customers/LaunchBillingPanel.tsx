@@ -3,6 +3,7 @@ import { AlertTriangle } from 'lucide-react';
 import {
   api,
   ApiError,
+  apiErrorMessage,
   type CustomerRef,
   type ManifestEntry,
   type PreviewBody,
@@ -93,7 +94,7 @@ export function LaunchBillingPanel({
           // A remote host runs on its own config: a failure to resolve the
           // control plane's doesn't stop the launch.
           const blocked = is409 && !remote;
-          const message = e instanceof Error ? e.message : 'Could not preview the accounts';
+          const message = e instanceof Error ? apiErrorMessage(e) : 'Could not preview the accounts';
           setResult({ kind: 'error', message, blocked, remote: is409 && remote });
           setPending(false);
           report({ customer: undefined, blocked });

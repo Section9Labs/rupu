@@ -14,7 +14,7 @@ import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, waitFor, fireEvent, act } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { api } from '../lib/api';
+import { api, ApiError } from '../lib/api';
 import type { TranscriptEvent, TranscriptResponse } from '../lib/transcript';
 import TranscriptPanel, { mergeSnapshotAndStream } from './TranscriptPanel';
 
@@ -113,6 +113,16 @@ describe('TranscriptPanel embedded mode', () => {
 
     expect((await screen.findAllByText('reviewer-agent'))[0]).toBeInTheDocument();
     expect(screen.queryByText(/unparsed/)).not.toBeInTheDocument();
+  });
+});
+
+describe('TranscriptPanel load errors', () => {
+  it("shows the server's error message, not the JSON body", async () => {
+    const body = '{"error":"path is outside the allowed roots"}';
+    vi.spyOn(api, 'getTranscript').mockRejectedValue(new ApiError(403, body, body));
+    renderPanel(false);
+    expect(await screen.findByText('Failed to load transcript')).toBeInTheDocument();
+    expect(screen.getByText('path is outside the allowed roots')).toBeInTheDocument();
   });
 });
 

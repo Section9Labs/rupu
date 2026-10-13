@@ -206,6 +206,7 @@ const skillColumns: Column<SkillRow>[] = [
   {
     key: 'description',
     header: 'Description',
+    fit: true,
     render: (s) =>
       s.description ? (
         <span className="block max-w-md truncate text-ui leading-snug text-ink-dim" title={s.description}>

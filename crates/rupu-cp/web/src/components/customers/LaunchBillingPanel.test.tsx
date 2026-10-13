@@ -87,6 +87,15 @@ describe('LaunchBillingPanel', () => {
     expect(onResult).toHaveBeenLastCalledWith({ customer: undefined, blocked: true });
   });
 
+  it('shows the error field of a JSON error body, not the JSON', async () => {
+    vi.spyOn(api, 'launchPreview').mockRejectedValue(
+      new ApiError(409, '{"error":"agent `a` could not be loaded"}', '{"error":"agent `a` could not be loaded"}'),
+    );
+    render(<LaunchBillingPanel body={{ agent: 'a' }} onResult={vi.fn()} />);
+    await flush();
+    expect(screen.getByRole('alert')).toHaveTextContent(/^agent `a` could not be loaded$/);
+  });
+
   it('a 400 shows the message without blocking', async () => {
     vi.spyOn(api, 'launchPreview').mockRejectedValue(new ApiError(400, 'bad name'));
     const onResult = vi.fn();
