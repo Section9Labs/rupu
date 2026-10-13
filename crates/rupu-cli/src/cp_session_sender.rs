@@ -1,9 +1,10 @@
 //! `SubprocessSessionSender` — the `cp serve` adapter for rupu-cp's
-//! [`SessionSender`] port. It shells `rupu session send --detach -- <id>
-//! "<prompt>"`, which enqueues the turn + ensures the session worker, prints
-//! `run: <run_id>` to stdout, and exits promptly (the turn runs async in a
-//! separate worker). We parse that `run: …` line and return the run id so the
-//! web UI can navigate to the new run immediately.
+//! [`SessionSender`] port. It shells `rupu session send --detach [--skill
+//! <s>]… -- <id> ["<prompt>"]`, which resolves the skills, enqueues the turn +
+//! ensures the session worker, prints `run: <run_id>` to stdout, and exits
+//! promptly (the turn runs async in a separate worker). We parse that
+//! `run: …` line and return the run id so the web UI can navigate to the new
+//! run immediately.
 
 use rupu_cp::session_sender::{SendError, SendMessageRequest, SessionSender};
 use rupu_runtime::argv::{RunArgv, SessionSend};
@@ -30,21 +31,27 @@ fn parse_run_id(stdout: &str) -> Option<String> {
     None
 }
 
+/// The `rupu session send --detach` for `req`.
+fn session_send_argv(req: &SendMessageRequest) -> RunArgv {
+    RunArgv::SessionSend(SessionSend {
+        session_id: req.session_id.clone(),
+        prompt: req.prompt.clone(),
+        detach: true,
+        skills: req.skills.clone(),
+    })
+}
+
 #[async_trait::async_trait]
 impl SessionSender for SubprocessSessionSender {
     async fn send(&self, req: SendMessageRequest) -> Result<String, SendError> {
-        if req.prompt.trim().is_empty() {
-            return Err(SendError::Invalid("prompt is empty".into()));
+        if req.prompt.as_deref().is_none_or(|p| p.trim().is_empty()) && req.skills.is_empty() {
+            return Err(SendError::Invalid(
+                "a send needs a prompt or a skill".into(),
+            ));
         }
 
-        let argv = RunArgv::SessionSend(SessionSend {
-            session_id: req.session_id.clone(),
-            prompt: Some(req.prompt.clone()),
-            detach: true,
-            skills: Vec::new(),
-        });
         let out = tokio::process::Command::new(&self.exe)
-            .args(argv.to_args())
+            .args(session_send_argv(&req).to_args())
             .output()
             .await
             .map_err(|e| SendError::Spawn(e.to_string()))?;
@@ -56,7 +63,13 @@ impl SessionSender for SubprocessSessionSender {
             } else {
                 stderr
             };
-            return Err(SendError::Spawn(msg));
+            // Exit 1 is the command refusing the request (an unknown or
+            // ambiguous skill, a stopped session): the caller's to fix.
+            return Err(if out.status.code() == Some(1) {
+                SendError::Invalid(msg)
+            } else {
+                SendError::Spawn(msg)
+            });
         }
 
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -70,8 +83,93 @@ impl SessionSender for SubprocessSessionSender {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::path::Path;
+
+    /// A stand-in `rupu` in `dir` that prints `stderr` and exits 1, the way
+    /// the real binary fails a command (`output::diag::fail`, no colour
+    /// when stderr is not a terminal).
+    pub(crate) fn failing_rupu(dir: &Path, stderr: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(dir.join("stderr.txt"), stderr).unwrap();
+        let exe = dir.join("rupu");
+        std::fs::write(
+            &exe,
+            "#!/bin/sh\ncat \"$(dirname \"$0\")/stderr.txt\" >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        exe
+    }
+
+    fn send_req(prompt: Option<&str>, skills: &[&str]) -> SendMessageRequest {
+        SendMessageRequest {
+            session_id: "ses_1".into(),
+            prompt: prompt.map(Into::into),
+            skills: skills.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn argv(req: &SendMessageRequest) -> Vec<String> {
+        session_send_argv(req)
+            .to_args()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn the_skills_ride_the_argv_before_the_separator() {
+        assert_eq!(
+            argv(&send_req(Some("hi"), &["pdf"])),
+            ["session", "send", "--detach", "--skill", "pdf", "--", "ses_1", "hi"]
+        );
+    }
+
+    #[test]
+    fn a_skill_only_send_renders_no_prompt() {
+        assert_eq!(
+            argv(&send_req(None, &["pdf"])),
+            ["session", "send", "--detach", "--skill", "pdf", "--", "ses_1"]
+        );
+    }
+
+    /// `session send --skill` resolves the operator's entries itself and
+    /// exits 1 on a typo: that is the request's fault, so it comes back as
+    /// `Invalid` (a 400) carrying the CLI's own message.
+    #[tokio::test]
+    async fn a_refused_skill_is_invalid_with_the_clis_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("global");
+        let skill = global.join("skills").join("pdf");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: pdf\ndescription: The pdf skill.\n---\nRead PDFs.\n",
+        )
+        .unwrap();
+        let refusal = rupu_runtime::assembly::resolve_operator_skills(
+            &rupu_skills::LayerDirs::for_layers(&global, None),
+            &[],
+            &["pdff".to_string()],
+        )
+        .await
+        .expect_err("a typo is refused");
+        let message = format!("[error] {refusal}");
+        assert!(
+            message.contains("unknown skill \"pdff\" (did you mean pdf?)"),
+            "{message}"
+        );
+
+        let sender = SubprocessSessionSender {
+            exe: failing_rupu(tmp.path(), &format!("{message}\n")),
+        };
+        match sender.send(send_req(None, &["pdff"])).await {
+            Err(SendError::Invalid(m)) => assert_eq!(m, message),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
 
     #[test]
     fn parse_run_id_finds_run_line() {

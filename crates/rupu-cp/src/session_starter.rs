@@ -8,6 +8,12 @@ pub struct SessionStartRequest {
     /// Working directory for the session (project/dir target). When `None` the
     /// session executes in the cp-serve process's cwd.
     pub working_dir: Option<String>,
+    /// `rupu session start --skill`, one flag per entry: skills the session
+    /// is given beside its agent's. Well-formed (`parse_grants`); whether
+    /// each is installed is the starting `rupu`'s call.
+    pub skills: Vec<String>,
+    /// `rupu session start --preload-skill`, as `skills`.
+    pub preload_skills: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]

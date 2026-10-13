@@ -19,7 +19,7 @@ use crate::{
     launcher::LaunchRequest,
     node::protocol::{
         CAP_AGENT_ENGAGEMENT_PROFILE, CAP_AGENT_FINDINGS_PROFILE, CAP_AGENT_SKILLS,
-        CAP_RUN_SUPPLIED_RUN_ID,
+        CAP_RUN_SUPPLIED_RUN_ID, CAP_SESSION_SKILLS,
     },
     session_sender::SendMessageRequest,
     session_starter::SessionStartRequest,
@@ -419,12 +419,26 @@ impl HostConnector for HttpHostConnector {
     }
 
     async fn start_session(&self, req: SessionStartRequest) -> Result<String, HostConnectorError> {
-        let body = serde_json::json!({
+        if !req.skills.is_empty() || !req.preload_skills.is_empty() {
+            self.require_feature(
+                CAP_SESSION_SKILLS,
+                "this session's skills cannot be delivered",
+            )
+            .await?;
+        }
+        let mut body = serde_json::json!({
             "prompt": req.prompt,
             "mode": req.mode,
             "target": req.target,
             "working_dir": req.working_dir,
         });
+        // Only when set: a start without skills stays what it was.
+        if !req.skills.is_empty() {
+            body["skills"] = serde_json::json!(req.skills);
+        }
+        if !req.preload_skills.is_empty() {
+            body["preload_skills"] = serde_json::json!(req.preload_skills);
+        }
         let resp = self
             .send(
                 self.client
@@ -439,7 +453,12 @@ impl HostConnector for HttpHostConnector {
         &self,
         req: SendMessageRequest,
     ) -> Result<String, HostConnectorError> {
-        let body = serde_json::json!({ "prompt": req.prompt });
+        let mut body = serde_json::json!({ "prompt": req.prompt });
+        if !req.skills.is_empty() {
+            self.require_feature(CAP_SESSION_SKILLS, "this turn's skills cannot be invoked")
+                .await?;
+            body["skills"] = serde_json::json!(req.skills);
+        }
         let resp = self
             .send(
                 self.client

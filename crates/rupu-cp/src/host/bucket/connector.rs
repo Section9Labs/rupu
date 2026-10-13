@@ -895,6 +895,8 @@ mod tests {
                 mode: None,
                 target: None,
                 working_dir: None,
+                skills: Vec::new(),
+                preload_skills: Vec::new(),
             })
             .await
             .unwrap_err();

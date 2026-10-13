@@ -2,7 +2,12 @@
 #[derive(Debug, Clone)]
 pub struct SendMessageRequest {
     pub session_id: String,
-    pub prompt: String,
+    /// `None` only when the turn invokes `skills`.
+    pub prompt: Option<String>,
+    /// `rupu session send --skill`, one flag per entry: skills the operator
+    /// invokes in this turn. Each names one skill (no wildcard); the
+    /// sending `rupu` resolves it against the session's layers.
+    pub skills: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]

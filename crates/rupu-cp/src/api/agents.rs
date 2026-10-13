@@ -1283,6 +1283,31 @@ struct SessionStartBody {
     scope_kind: Option<String>,
     #[serde(default)]
     scope_id: Option<String>,
+    /// Optional skills the session is given beside its agent's —
+    /// `rupu session start --skill`, one flag per entry. A malformed entry
+    /// is a 400; one the host doesn't have fails the start. On the
+    /// remote-proxy path a peer that does not advertise `session.skills`
+    /// refuses the start.
+    #[serde(default)]
+    skills: Vec<String>,
+    /// Optional preloaded skills — `rupu session start --preload-skill`.
+    #[serde(default)]
+    preload_skills: Vec<String>,
+}
+
+impl SessionStartBody {
+    /// The request for agent `name`, its skill entries checked.
+    fn into_request(self, name: &str) -> Result<SessionStartRequest, ApiError> {
+        Ok(SessionStartRequest {
+            agent: name.to_string(),
+            prompt: self.prompt,
+            mode: self.mode,
+            target: self.target,
+            working_dir: self.working_dir,
+            skills: parse_skill_entries("skills", self.skills)?,
+            preload_skills: parse_skill_entries("preload_skills", self.preload_skills)?,
+        })
+    }
 }
 
 /// Testable core: map the body + a concrete starter to a session id.
@@ -1291,13 +1316,7 @@ async fn start_session_with(
     body: SessionStartBody,
     starter: Arc<dyn SessionStarter>,
 ) -> Result<String, ApiError> {
-    let req = SessionStartRequest {
-        agent: name.to_string(),
-        prompt: body.prompt,
-        mode: body.mode,
-        target: body.target,
-        working_dir: body.working_dir,
-    };
+    let req = body.into_request(name)?;
     starter.start(req).await.map_err(|e| match e {
         SessionStartError::Invalid(m) => ApiError::bad_request(m),
         SessionStartError::Spawn(m) => ApiError::internal(m),
@@ -1324,17 +1343,14 @@ async fn start_session(
     if host != "local" {
         // Remote: scope fields, if present, are silently ignored — see
         // `run_agent`'s doc comment.
+        let req = b.into_request(&name)?;
         let conn = crate::api::runs::resolve_host(&s, &host)?;
-        let req = SessionStartRequest {
-            agent: name.clone(),
-            prompt: b.prompt,
-            mode: b.mode,
-            target: b.target,
-            working_dir: b.working_dir,
-        };
         let session_id = conn.start_session(req).await.map_err(|e| match e {
             HostConnectorError::NotFound(m) => ApiError::not_found(m),
             HostConnectorError::Invalid(m) => ApiError::bad_request(m),
+            // e.g. the host can't take the session's `skills` — refused,
+            // not failed.
+            HostConnectorError::Unsupported(m) => ApiError::not_available(m),
             other => ApiError::internal(other.to_string()),
         })?;
         return Ok(Json(
@@ -2049,6 +2065,8 @@ mod tests {
             host: None,
             scope_kind: Some("project".into()),
             scope_id: Some("ws_a".into()),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
         };
         let _ = start_session(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -2092,6 +2110,8 @@ mod tests {
             host: None,
             scope_kind: Some("global".into()),
             scope_id: None,
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
         };
         let _ = start_session(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -2128,6 +2148,8 @@ mod tests {
             host: None,
             scope_kind: Some("project".into()),
             scope_id: Some("ws_a".into()),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
         };
         let err = start_session(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -2161,6 +2183,8 @@ mod tests {
             host: Some(host.id.clone()),
             scope_kind: Some("project".into()),
             scope_id: Some("ws_unknown_locally".into()),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
         };
         let resp = start_session(State(s), Path("triage".into()), Some(Json(body)))
             .await
@@ -2859,6 +2883,8 @@ mod tests {
             host: None,
             scope_kind: None,
             scope_id: None,
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
         };
         let id = start_session_with("triage", body, mock.clone())
             .await
@@ -2868,6 +2894,42 @@ mod tests {
         assert_eq!(got.agent, "triage");
         assert_eq!(got.prompt.as_deref(), Some("hi"));
         assert_eq!(got.working_dir.as_deref(), Some("/tmp/p"));
+    }
+
+    #[tokio::test]
+    async fn start_session_forwards_the_skills() {
+        let mock = Arc::new(MockStarter {
+            last: Mutex::new(None),
+        });
+        let body: SessionStartBody = serde_json::from_value(serde_json::json!({
+            "prompt": "hi",
+            "skills": ["pdf", "project:notes"],
+            "preload_skills": ["house-style"]
+        }))
+        .unwrap();
+        start_session_with("triage", body, mock.clone())
+            .await
+            .expect("ok");
+        let got = mock.last.lock().unwrap().clone().unwrap();
+        assert_eq!(got.skills, ["pdf", "project:notes"]);
+        assert_eq!(got.preload_skills, ["house-style"]);
+    }
+
+    #[tokio::test]
+    async fn start_session_rejects_a_malformed_skill_before_starting() {
+        let mock = Arc::new(MockStarter {
+            last: Mutex::new(None),
+        });
+        let body: SessionStartBody = serde_json::from_value(serde_json::json!({
+            "skills": ["--mode"]
+        }))
+        .unwrap();
+        let err = start_session_with("triage", body, mock.clone())
+            .await
+            .expect_err("a malformed skill must be refused");
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert!(err.1.starts_with("skills: "), "{}", err.1);
+        assert!(mock.last.lock().unwrap().is_none(), "nothing started");
     }
 
     #[tokio::test]
