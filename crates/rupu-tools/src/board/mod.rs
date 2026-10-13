@@ -83,8 +83,9 @@ pub static POST: ToolDescriptor = ToolDescriptor {
     wildcard: true,
     description: "Post to the shared board every participant can read: an observation, a \
      question, an answer, a vote, or a note. Optionally address it to a \
-     participant (lynx#1), role:<agent>, step:<id>, parent or lead. Returns the \
-     post's `id` and who it was resolved to.",
+     participant (lynx#1), role:<agent>, step:<id>, parent or lead: an addressed \
+     post also lands in each addressee's inbox, so they see it on their next \
+     turn. Returns the post's `id` and who it was delivered to.",
     input_schema: board_post_schema,
 };
 

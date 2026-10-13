@@ -140,6 +140,8 @@ impl MessageCollector {
         let me = &self.bus.participant;
         let (source, kind, priority) = if broadcast {
             (format!("broadcast:{me}"), "broadcast", BROADCAST_PRIORITY)
+        } else if m.post_kind.is_some() {
+            (format!("mailbox:{me}"), "post", DIRECT_PRIORITY)
         } else {
             (format!("mailbox:{me}"), "direct", DIRECT_PRIORITY)
         };
@@ -147,7 +149,13 @@ impl MessageCollector {
             Some(to) if to != me.as_str() && !broadcast => format!(" to {to}"),
             _ => String::new(),
         };
-        let content = format!("from {}{to} at {}: {}", m.from, m.ts, m.body);
+        // An addressed board post: say so, and its kind, so the recipient
+        // knows it is also on the board for everyone.
+        let lead = match m.post_kind {
+            Some(k) if !broadcast => format!("board post ({}) ", k.as_str()),
+            _ => String::new(),
+        };
+        let content = format!("{lead}from {}{to} at {}: {}", m.from, m.ts, m.body);
         self.message(m, InjectionKind::Message, kind, source, priority, content)
     }
 
@@ -430,6 +438,41 @@ mod tests {
                 },
             }]
         );
+    }
+
+    #[test]
+    fn an_addressed_post_is_delivered_as_a_post_and_a_channel_post_is_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reader = joined(tmp.path(), "otter", "triage", None);
+        let sender = joined(tmp.path(), "lynx", "recon", None);
+        let c = MessageCollector {
+            bus: Arc::clone(&reader),
+        };
+        sender
+            .post(rupu_fleet::PostKind::Note, None, "channel only")
+            .unwrap();
+        let post = sender
+            .post(
+                rupu_fleet::PostKind::Question,
+                Some(&Address::parse("otter").unwrap()),
+                "is 10.0.0.5 in scope?",
+            )
+            .unwrap();
+
+        let got = c.collect(&ctx());
+        assert_eq!(got.len(), 1, "only the addressed post reaches the inbox");
+        let p = &got[0];
+        assert_eq!(p.cadence, Cadence::Once);
+        assert_eq!(p.priority, DIRECT_PRIORITY);
+        assert_eq!(p.source, "mailbox:otter");
+        assert_eq!(
+            p.content.split(" at ").next(),
+            Some("board post (question) from lynx")
+        );
+        assert_eq!(p.messages[0].id, post.id());
+        assert_eq!(p.messages[0].kind, "post");
+        // Delivered once.
+        assert!(c.collect(&ctx()).is_empty());
     }
 
     #[test]
