@@ -3,10 +3,13 @@
 //! The pack's hash is the hash of exactly the bytes archived, and unpack
 //! verifies it before anything is kept.
 
+use crate::catalog::OverlaySkill;
+use crate::name::SkillName;
 use crate::skill::{Layer, Skill};
 use crate::tree::{
     content_hash, walk_tree, ContentHash, ContentHasher, EntryKind, TreeError, IGNORED_NAMES,
 };
+use std::io::{BufRead, Read};
 use std::path::{Component, Path, PathBuf};
 
 pub const MAX_SHIPPED_SKILL_BYTES: u64 = 32 << 20;
@@ -51,6 +54,8 @@ pub enum ShipError {
         name: String,
         hash: String,
     },
+    #[error("skill bundle manifest: {0}")]
+    Manifest(String),
 }
 
 fn io(path: &Path) -> impl Fn(std::io::Error) -> ShipError + '_ {
@@ -376,4 +381,253 @@ fn make_symlink(_: &Path, at: &Path) -> Result<(), ShipError> {
         "{}: symlinks can't be unpacked on this platform",
         at.display()
     )))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ShippedSkillRef {
+    pub layer: Layer,
+    pub name: String,
+    /// 64 lowercase hex digits.
+    pub content_hash: String,
+}
+
+impl ShippedSkillRef {
+    fn validate(&self) -> Result<(), ShipError> {
+        let bad = |m: String| ShipError::Manifest(m);
+        self.name
+            .parse::<SkillName>()
+            .map_err(|e| bad(format!("skill name {:?}: {e}", self.name)))?;
+        let hex_ok = self.content_hash.len() == 64
+            && self
+                .content_hash
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        if !hex_ok {
+            return Err(bad(format!(
+                "{}:{}: content hash is not 64 lowercase hex digits",
+                self.layer, self.name
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct SkillBundleManifest {
+    pub version: u32,
+    pub skills: Vec<ShippedSkillRef>,
+}
+
+impl SkillBundleManifest {
+    pub const VERSION: u32 = 1;
+
+    /// Every name is a valid `SkillName`, every hash 64 lowercase hex, no
+    /// (layer, name) twice, version == 1.
+    pub fn validate(&self) -> Result<(), ShipError> {
+        if self.version != Self::VERSION {
+            return Err(ShipError::Manifest(format!(
+                "version {} is not supported (expected {})",
+                self.version,
+                Self::VERSION
+            )));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for r in &self.skills {
+            r.validate()?;
+            if !seen.insert((r.layer, r.name.as_str())) {
+                return Err(ShipError::Manifest(format!(
+                    "{}:{} listed twice",
+                    r.layer, r.name
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl PackedSkill {
+    pub fn reference(&self) -> ShippedSkillRef {
+        ShippedSkillRef {
+            layer: self.layer,
+            name: self.name.clone(),
+            content_hash: self.hash.hex(),
+        }
+    }
+}
+
+/// `<global>/cache/skills`.
+pub fn cache_dir(global: &Path) -> PathBuf {
+    global.join("cache").join("skills")
+}
+
+/// `<cache>/<hash>/<name>`.
+pub fn cached_path(cache: &Path, r: &ShippedSkillRef) -> PathBuf {
+    cache.join(&r.content_hash).join(&r.name)
+}
+
+fn is_cached(cache: &Path, r: &ShippedSkillRef) -> bool {
+    cached_path(cache, r).join("SKILL.md").is_file()
+}
+
+/// The refs whose skill isn't in the cache. A leftover temp directory
+/// (dot-prefixed) is never looked at, so it never counts as cached.
+pub fn missing(cache: &Path, refs: &[ShippedSkillRef]) -> Vec<ShippedSkillRef> {
+    refs.iter()
+        .filter(|r| !is_cached(cache, r))
+        .cloned()
+        .collect()
+}
+
+/// Unpack `bytes` into the cache under `r`'s hash and name, verifying the
+/// hash first. Storing what is already cached is a no-op; of concurrent
+/// stores of one skill, one wins and the rest return its directory.
+pub fn store(cache: &Path, r: &ShippedSkillRef, bytes: &[u8]) -> Result<PathBuf, ShipError> {
+    r.validate()?;
+    let dest = cached_path(cache, r);
+    if is_cached(cache, r) {
+        return Ok(dest);
+    }
+    let expected = ContentHash::from_hex(&r.content_hash)
+        .ok_or_else(|| ShipError::Manifest(format!("{}: bad content hash", r.name)))?;
+    std::fs::create_dir_all(cache).map_err(io(cache))?;
+    private_dir(cache)?;
+    let tmp = tempfile::Builder::new()
+        .prefix(".tmp-")
+        .tempdir_in(cache)
+        .map_err(io(cache))?;
+    let staged = tmp.path().join(&r.name);
+    unpack_skill(bytes, &staged, &expected)?;
+    let hash_dir = cache.join(&r.content_hash);
+    // Two skills with identical content share a hash directory, so when it
+    // already exists the staged skill moves into it instead.
+    let moved = if hash_dir.exists() {
+        std::fs::rename(&staged, &dest)
+    } else {
+        std::fs::rename(tmp.path(), &hash_dir)
+            .map(|()| {
+                // `tmp` now names a path that no longer exists; its drop is a no-op.
+            })
+            .or_else(|_| std::fs::rename(&staged, &dest))
+    };
+    match moved {
+        Ok(()) => {
+            private_dir(&hash_dir)?;
+            Ok(dest)
+        }
+        // Another store won the race.
+        Err(_) if is_cached(cache, r) => Ok(dest),
+        Err(e) => Err(io(&dest)(e)),
+    }
+}
+
+#[cfg(unix)]
+fn private_dir(path: &Path) -> Result<(), ShipError> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(io(path))
+}
+
+#[cfg(not(unix))]
+fn private_dir(_: &Path) -> Result<(), ShipError> {
+    Ok(())
+}
+
+/// The overlay a unit's skills resolve against, or `NotCached` for the first gap.
+pub fn overlay_for(cache: &Path, m: &SkillBundleManifest) -> Result<Vec<OverlaySkill>, ShipError> {
+    m.validate()?;
+    m.skills
+        .iter()
+        .map(|r| {
+            if is_cached(cache, r) {
+                Ok(OverlaySkill {
+                    layer: r.layer,
+                    name: r.name.clone(),
+                    dir: cached_path(cache, r),
+                })
+            } else {
+                Err(ShipError::NotCached {
+                    layer: r.layer,
+                    name: r.name.clone(),
+                    hash: r.content_hash.clone(),
+                })
+            }
+        })
+        .collect()
+}
+
+/// stdin framing for `rupu __skills receive`: per skill, a line
+/// `<hash> <layer> <name> <len>\n` then `<len>` bytes.
+pub fn encode_stream(skills: &[(&ShippedSkillRef, &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (r, bytes) in skills {
+        out.extend_from_slice(
+            format!(
+                "{} {} {} {}\n",
+                r.content_hash,
+                r.layer,
+                r.name,
+                bytes.len()
+            )
+            .as_bytes(),
+        );
+        out.extend_from_slice(bytes);
+    }
+    out
+}
+
+const MAX_HEADER_BYTES: u64 = 512;
+
+pub fn decode_stream(
+    r: &mut impl std::io::BufRead,
+    total_cap: u64,
+) -> Result<Vec<(ShippedSkillRef, Vec<u8>)>, ShipError> {
+    let bad = |m: String| ShipError::Malformed(m);
+    let mut out = Vec::new();
+    let mut total = 0u64;
+    loop {
+        let mut line = Vec::new();
+        let n = std::io::Read::take(&mut *r, MAX_HEADER_BYTES + 1)
+            .read_until(b'\n', &mut line)
+            .map_err(|e| bad(format!("stream: {e}")))?;
+        if n == 0 {
+            return Ok(out);
+        }
+        if line.last() != Some(&b'\n') {
+            return Err(bad("stream header is unterminated or too long".into()));
+        }
+        line.pop();
+        let line = String::from_utf8(line).map_err(|_| bad("stream header is not UTF-8".into()))?;
+        let parts: Vec<&str> = line.split(' ').collect();
+        let [hash, layer, name, len] = parts[..] else {
+            return Err(bad(format!(
+                "stream header {line:?} is not `<hash> <layer> <name> <len>`"
+            )));
+        };
+        let layer = Layer::parse(layer).ok_or_else(|| bad(format!("unknown layer {layer:?}")))?;
+        let len: u64 = len
+            .parse()
+            .map_err(|_| bad(format!("bad length {len:?}")))?;
+        let sref = ShippedSkillRef {
+            layer,
+            name: name.to_owned(),
+            content_hash: hash.to_owned(),
+        };
+        sref.validate()?;
+        total = total.saturating_add(len);
+        if total > total_cap {
+            return Err(ShipError::BundleTooLarge {
+                bytes: total,
+                limit: total_cap,
+            });
+        }
+        let mut data = Vec::new();
+        let got = std::io::Read::take(&mut *r, len)
+            .read_to_end(&mut data)
+            .map_err(|e| bad(format!("stream: {e}")))?;
+        if got as u64 != len {
+            return Err(bad(format!(
+                "{name}: stream ended after {got} of {len} bytes"
+            )));
+        }
+        out.push((sref, data));
+    }
 }

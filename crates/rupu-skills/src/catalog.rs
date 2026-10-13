@@ -7,6 +7,15 @@ use crate::skill::{load_skill, Layer, Skill, SkillError};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
+/// A skill shipped from another host, living in the host cache: it overlays
+/// the installed skill with the same (layer, name).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlaySkill {
+    pub layer: Layer,
+    pub name: String,
+    pub dir: PathBuf,
+}
+
 /// The two `skills/` directories. `project` is `None` when the run has no
 /// project layer (see `rupu_workspace::project_layer_dir`).
 #[derive(Debug, Clone, Default)]
