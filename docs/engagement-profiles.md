@@ -461,11 +461,28 @@ assigns them to that kind and the file fails to parse.
 | `enumerates` | string list | The bare kind ids that agentiflow coverage goals count by default |
 | `depth_ladder` | string list | Ordered rungs, shallowest first. `assets.mark` accepts only these. The last rung is the default target depth for a coverage goal. |
 
-**`[bundle]`** holds `agents`, `workflows` and `tools`, all string lists. It's
-descriptive metadata: it names the definitions an engagement of this kind
-typically uses, and never grants anything. rupu does not load or check the
-names in your own profile's bundle; the built-in bundles are kept in step with
-the stock fleet by a test.
+**`[bundle]`** holds `agents`, `workflows` and `tools`, all string lists, and
+`skills`, an array of tables. It's descriptive metadata: it names the
+definitions an engagement of this kind typically uses, and never grants
+anything. rupu does not load or check the names in your own profile's bundle;
+the built-in bundles are kept in step with the stock fleet by a test.
+
+Each `skills` entry is `{ name, source, tag, commit }`, the skill that
+`rupu skill install` would be given, pinned. `source` is `owner/repo` or an
+https git URL, and `name` is the skill's directory in that source. `commit` is
+what gets fetched, so it must be a full 40-character lowercase SHA; a tag or
+branch can move and is refused. `tag` names the release the commit belongs to
+and is shown only, never fetched. As with the rest of the bundle, a bundled
+skill grants nothing, and `rupu fleet install` installs the skills of the
+built-in bundles.
+
+```toml
+[bundle]
+agents = ["recon"]
+skills = [
+  { name = "network-recon", source = "Section9Labs/rupu-skills", tag = "v1.0.0", commit = "0123456789abcdef0123456789abcdef01234567" },
+]
+```
 
 ### Predicates
 
