@@ -376,11 +376,12 @@ fn reconstruct_with(
             // one was sent with that turn's request only.
             Event::Injected {
                 source,
+                kind,
                 cadence,
                 content,
                 ..
             } if cadence == crate::collector::Cadence::Once.as_str() => {
-                messages.push(crate::collector::wrap(source, content));
+                messages.push(crate::collector::wrap_for(kind, source, content));
             }
             // Non-conversation events.
             Event::RunStart { .. }
