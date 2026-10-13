@@ -65,7 +65,8 @@ pub struct ToolGrantMissing {
 /// (`global` / `project`), its stamp at run start (a later load compares
 /// against it), whether its body is preloaded, whether the model's index
 /// lists it (`false` when preloaded or `disable-model-invocation`), and why
-/// the run has it (`agent`, `step`, `session`, `operator`).
+/// the run has it (`agent`, `launch`, `session`, `operator`; transcripts
+/// written before the rename say `step` for `launch`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillIndexEntry {
     pub name: String,

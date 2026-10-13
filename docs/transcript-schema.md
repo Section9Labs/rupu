@@ -401,7 +401,7 @@ Each row:
 | `stamp`   | string | The skill's stamp at run start: a sha256 over its files' paths, sizes, mtimes and modes, no contents. A later load compares against it to notice an edit |
 | `preload` | bool   | The skill's body is in the system prompt |
 | `indexed` | bool   | The skill is listed in the model's skill index. `false` for a preloaded skill and for one marked `disable-model-invocation` |
-| `reason`  | string | Why the run has it: `agent`, `step`, `session` or `operator` |
+| `reason`  | string | Why the run has it: `agent` (the agent's `skills:` / `preloadSkills:`), `launch` (the launch's own: a workflow step's keys or `rupu run --skill`), `session` or `operator`. A transcript written before the rename says `step` for `launch`; readers take the value as written |
 
 ```json
 {"type":"skill_index","data":{"skills":[{"name":"pdf","layer":"global","stamp":"9f2c…","preload":false,"indexed":true,"reason":"agent"}]}}

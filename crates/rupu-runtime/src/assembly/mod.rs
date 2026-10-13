@@ -534,7 +534,7 @@ impl RunAssembler {
         let requests = Arc::new([
             (rupu_skills::SkillReason::Agent, agent_grants, agent_preload),
             (
-                rupu_skills::SkillReason::Step,
+                rupu_skills::SkillReason::Launch,
                 o.skills.clone(),
                 o.preload_skills.clone(),
             ),

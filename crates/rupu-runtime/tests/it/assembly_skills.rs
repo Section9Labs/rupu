@@ -358,7 +358,7 @@ async fn launch_overrides_add_skills() {
     assert_eq!(index.len(), 1);
     assert_eq!(
         (index[0].name.as_str(), index[0].reason.as_str()),
-        ("code-review", "step")
+        ("code-review", "launch")
     );
 }
 
