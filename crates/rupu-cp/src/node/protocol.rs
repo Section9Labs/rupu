@@ -74,6 +74,41 @@ pub enum Frame {
         req: String,
         error: Option<String>,
     },
+    /// CP→node: the skills (by layer, name and content hash) a coming unit
+    /// will run with. Sent only to a node that advertised
+    /// [`CAP_AGENT_SKILL_BUNDLE`] — an older node's frame parse is fatal.
+    SkillsOffer {
+        id: String,
+        skills: Vec<rupu_skills::ship::ShippedSkillRef>,
+    },
+    /// node→CP: answers a [`Frame::SkillsOffer`] with the skills it does not
+    /// have cached; `error` set ⇒ the offer was refused.
+    SkillsNeed {
+        id: String,
+        skills: Vec<rupu_skills::ship::ShippedSkillRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// CP→node: one chunk of a needed skill's archive (base64), in `seq`
+    /// order; `last` closes that skill.
+    SkillChunk {
+        id: String,
+        layer: rupu_skills::Layer,
+        name: String,
+        hash: String,
+        seq: u64,
+        data_b64: String,
+        last: bool,
+    },
+    /// node→CP: every needed skill was verified and stored (`stored`), or the
+    /// transfer failed (`error`).
+    SkillsStored {
+        id: String,
+        #[serde(default)]
+        stored: Vec<rupu_skills::ship::ShippedSkillRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -131,6 +166,15 @@ pub struct RunSpec {
     /// (`rupu_runtime::argv::RunArgv::for_peer`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codename: Option<String>,
+    /// Agent runs only: the manifest of the shipped skills the unit runs with,
+    /// `rupu run --skill-bundle` (the manifest as JSON). Absent on the wire
+    /// when `None`.
+    ///
+    /// Same rule as `skills`: an executor predating this field would drop it,
+    /// so a sender sets it only for an executor that advertised
+    /// [`CAP_AGENT_SKILL_BUNDLE`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_bundle: Option<rupu_skills::ship::SkillBundleManifest>,
 }
 
 impl RunSpec {
@@ -165,6 +209,12 @@ impl RunSpec {
                         self.name
                     ));
                 }
+                if self.skill_bundle.is_some() {
+                    return Err(format!(
+                        "run spec for workflow `{}` carries skills, which apply to agent runs only",
+                        self.name
+                    ));
+                }
                 if let Some(codename) = &self.codename {
                     tracing::warn!(
                         run_id,
@@ -190,6 +240,12 @@ impl RunSpec {
                 run.engagement_profiles = self.engagement_profiles.clone();
                 run.skills = self.skills.clone();
                 run.preload_skills = self.preload_skills.clone();
+                run.skill_bundle = self
+                    .skill_bundle
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|e| format!("skill bundle: {e}"))?;
                 run.tmp_clone = self.target.is_some();
                 Ok(RunArgv::Agent(run))
             }
@@ -217,9 +273,11 @@ pub const CAP_AGENT_ENGAGEMENT_PROFILE: &str = "agent.engagement_profile";
 /// on a peer that hasn't advertised it.
 pub const CAP_AGENT_SKILLS: &str = "agent.skills";
 
-/// Host feature entry: this executor caches shipped skill content (`rupu
-/// __skills`, `/api/skills/bundle/*`) and `rupu run` takes `--skill-bundle`,
-/// so a placed unit runs with the coordinator's skills.
+/// Host feature / `Hello.capabilities` / bucket marker entry: this executor
+/// caches shipped skill content (SSH: `rupu __skills`; HTTP:
+/// `/api/skills/bundle/*`; tunnel: [`Frame::SkillsOffer`] and friends;
+/// bucket: the worker's offer/chunk objects) and `rupu run` takes
+/// `--skill-bundle`, so a placed unit runs with the coordinator's skills.
 pub const CAP_AGENT_SKILL_BUNDLE: &str = "agent.skill_bundle";
 
 /// Host feature entry (HTTP only; no other transport runs sessions): this
@@ -279,6 +337,7 @@ pub fn node_capabilities() -> Vec<String> {
         CAP_AGENT_FINDINGS_PROFILE.to_string(),
         CAP_AGENT_ENGAGEMENT_PROFILE.to_string(),
         CAP_AGENT_SKILLS.to_string(),
+        CAP_AGENT_SKILL_BUNDLE.to_string(),
         CAP_FINDINGS_ARTIFACT_PULL.to_string(),
         CAP_RUN_CODENAME.to_string(),
     ]
@@ -361,6 +420,7 @@ pub fn bucket_worker_capabilities() -> Vec<String> {
         CAP_AGENT_FINDINGS_PROFILE.to_string(),
         CAP_AGENT_ENGAGEMENT_PROFILE.to_string(),
         CAP_AGENT_SKILLS.to_string(),
+        CAP_AGENT_SKILL_BUNDLE.to_string(),
         CAP_RUN_CODENAME.to_string(),
     ]
 }
@@ -403,6 +463,7 @@ mod tests {
         let run_frame = Frame::Run {
             run_id: "r1".to_string(),
             spec: RunSpec {
+                skill_bundle: None,
                 kind: RunSpecKind::Workflow,
                 name: "wf".to_string(),
                 inputs: BTreeMap::new(),
@@ -633,6 +694,7 @@ mod tests {
                 CAP_AGENT_FINDINGS_PROFILE.to_string(),
                 CAP_AGENT_ENGAGEMENT_PROFILE.to_string(),
                 CAP_AGENT_SKILLS.to_string(),
+                CAP_AGENT_SKILL_BUNDLE.to_string(),
                 CAP_RUN_CODENAME.to_string(),
             ]
         );
@@ -666,17 +728,138 @@ mod tests {
         }
     }
 
-    /// Only `host_features()` (HTTP + SSH) can receive shipped skills in Plan 1.
+    /// Every surface that can receive shipped skills advertises the bundle.
     #[test]
-    fn only_host_features_advertise_the_skill_bundle() {
+    fn every_executor_surface_advertises_the_skill_bundle() {
         assert_eq!(CAP_AGENT_SKILL_BUNDLE, "agent.skill_bundle");
-        assert!(host_features().iter().any(|c| c == CAP_AGENT_SKILL_BUNDLE));
-        for caps in [node_capabilities(), bucket_worker_capabilities()] {
+        for (surface, caps) in [
+            ("tunnel node", node_capabilities()),
+            ("host features", host_features()),
+            ("bucket worker", bucket_worker_capabilities()),
+        ] {
             assert!(
-                !caps.iter().any(|c| c == CAP_AGENT_SKILL_BUNDLE),
-                "{caps:?}"
+                caps.iter().any(|c| c == CAP_AGENT_SKILL_BUNDLE),
+                "{surface}: {caps:?}"
             );
         }
+    }
+
+    fn sample_manifest() -> rupu_skills::ship::SkillBundleManifest {
+        serde_json::from_str(
+            r#"{"version":1,"skills":[{"layer":"global","name":"pdf","content_hash":"abc"}]}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn skill_frames_round_trip_with_their_type_tags() {
+        let r = rupu_skills::ship::ShippedSkillRef {
+            layer: rupu_skills::Layer::Global,
+            name: "pdf".into(),
+            content_hash: "abc".into(),
+        };
+        for (tag, frame) in [
+            (
+                "skills_offer",
+                Frame::SkillsOffer {
+                    id: "o1".into(),
+                    skills: vec![r.clone()],
+                },
+            ),
+            (
+                "skills_need",
+                Frame::SkillsNeed {
+                    id: "o1".into(),
+                    skills: vec![r.clone()],
+                    error: None,
+                },
+            ),
+            (
+                "skill_chunk",
+                Frame::SkillChunk {
+                    id: "o1".into(),
+                    layer: rupu_skills::Layer::Project,
+                    name: "pdf".into(),
+                    hash: "abc".into(),
+                    seq: 3,
+                    data_b64: "AAAA".into(),
+                    last: true,
+                },
+            ),
+            (
+                "skills_stored",
+                Frame::SkillsStored {
+                    id: "o1".into(),
+                    stored: vec![r.clone()],
+                    error: Some("boom".into()),
+                },
+            ),
+        ] {
+            let json = serde_json::to_string(&frame).unwrap();
+            assert!(json.contains(&format!(r#""type":"{tag}""#)), "{json}");
+            assert_eq!(serde_json::from_str::<Frame>(&json).unwrap(), frame);
+        }
+        // `error` is absent on the wire when none, and `stored` defaults empty.
+        let json = serde_json::to_string(&Frame::SkillsNeed {
+            id: "o".into(),
+            skills: vec![],
+            error: None,
+        })
+        .unwrap();
+        assert!(!json.contains("error"), "{json}");
+        let f: Frame = serde_json::from_str(r#"{"type":"skills_stored","id":"o"}"#).unwrap();
+        assert_eq!(
+            f,
+            Frame::SkillsStored {
+                id: "o".into(),
+                stored: vec![],
+                error: None
+            }
+        );
+    }
+
+    #[test]
+    fn run_spec_skill_bundle_is_absent_on_the_wire_when_none() {
+        let json = serde_json::to_string(&agent_spec()).unwrap();
+        assert!(!json.contains("skill_bundle"), "{json}");
+    }
+
+    #[test]
+    fn agent_run_spec_renders_one_skill_bundle_flag() {
+        let mut spec = agent_spec();
+        let m = sample_manifest();
+        spec.skill_bundle = Some(m.clone());
+        let json = serde_json::to_string(&spec).unwrap();
+        assert_eq!(serde_json::from_str::<RunSpec>(&json).unwrap(), spec);
+        let argv = spec.run_argv("run_B").unwrap();
+        let args: Vec<String> = argv
+            .to_args()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let flags: Vec<&String> = args
+            .iter()
+            .filter(|a| a.starts_with("--skill-bundle="))
+            .collect();
+        assert_eq!(flags.len(), 1, "{args:?}");
+        let body = flags[0].strip_prefix("--skill-bundle=").unwrap();
+        assert_eq!(
+            serde_json::from_str::<rupu_skills::ship::SkillBundleManifest>(body).unwrap(),
+            m
+        );
+    }
+
+    #[test]
+    fn workflow_run_spec_with_a_skill_bundle_is_refused() {
+        let mut spec = agent_spec();
+        spec.kind = RunSpecKind::Workflow;
+        spec.findings_profile = None;
+        spec.engagement_profiles.clear();
+        spec.skills.clear();
+        spec.preload_skills.clear();
+        spec.skill_bundle = Some(sample_manifest());
+        let err = spec.run_argv("run_W").unwrap_err();
+        assert!(err.contains("skill"), "{err}");
     }
 
     #[test]
@@ -714,6 +897,7 @@ mod tests {
 
     fn agent_spec() -> RunSpec {
         RunSpec {
+            skill_bundle: None,
             kind: RunSpecKind::Agent,
             name: "recon".into(),
             inputs: BTreeMap::new(),
@@ -814,6 +998,7 @@ mod tests {
     #[test]
     fn run_spec_engagement_profiles_are_absent_on_the_wire_when_empty() {
         let mut spec = RunSpec {
+            skill_bundle: None,
             kind: RunSpecKind::Agent,
             name: "recon".into(),
             inputs: BTreeMap::new(),

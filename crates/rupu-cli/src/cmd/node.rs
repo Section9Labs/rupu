@@ -42,7 +42,7 @@ use rupu_runtime::argv::{RunArgv, WorkflowControl};
 use rupu_runtime::spawn::SpawnSpec;
 use rupu_workspace::{enroll_node, HostStore};
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use ulid::Ulid;
 
 // ---------------------------------------------------------------------------
@@ -770,13 +770,18 @@ async fn connect_and_run(
                 info!(req = %req, sha256 = %sha256, "node: ArtifactPull received");
                 pulls.push_back(ArtifactPullStream::new(global, req, sha256));
             }
+            Frame::SkillsOffer { id, .. } | Frame::SkillChunk { id, .. } => {
+                debug!(id = %id, "node: skill-shipping frame received (not handled yet; ignored)");
+            }
             Frame::Hello { .. }
             | Frame::Welcome { .. }
             | Frame::Pong {}
             | Frame::Artifact { .. }
             | Frame::RunFinished { .. }
             | Frame::ArtifactChunk { .. }
-            | Frame::ArtifactPullDone { .. } => {
+            | Frame::ArtifactPullDone { .. }
+            | Frame::SkillsNeed { .. }
+            | Frame::SkillsStored { .. } => {
                 warn!(
                     frame = %serde_json::to_string(&frame).unwrap_or_else(|_| "?".into()),
                     "node: unexpected server-sent frame type (ignored)"
@@ -2804,6 +2809,7 @@ mod tests {
 
     fn agent_job(name: &str) -> Vec<u8> {
         serde_json::to_vec(&RunSpec {
+            skill_bundle: None,
             kind: RunSpecKind::Agent,
             name: name.to_string(),
             inputs: BTreeMap::new(),
@@ -3510,6 +3516,7 @@ mod tests {
 
     fn agent_spec() -> RunSpec {
         RunSpec {
+            skill_bundle: None,
             kind: RunSpecKind::Agent,
             name: "recon".to_string(),
             inputs: BTreeMap::new(),
@@ -4581,6 +4588,7 @@ mod tests {
                 rupu_cp::node::protocol::CAP_AGENT_FINDINGS_PROFILE.to_string(),
                 rupu_cp::node::protocol::CAP_AGENT_ENGAGEMENT_PROFILE.to_string(),
                 rupu_cp::node::protocol::CAP_AGENT_SKILLS.to_string(),
+                rupu_cp::node::protocol::CAP_AGENT_SKILL_BUNDLE.to_string(),
                 rupu_cp::node::protocol::CAP_RUN_CODENAME.to_string(),
             ]
         );
@@ -4620,6 +4628,7 @@ mod tests {
             ws.send(cp_text(&Frame::Run {
                 run_id: "run_drain".into(),
                 spec: RunSpec {
+                    skill_bundle: None,
                     kind: RunSpecKind::Workflow,
                     name: "wf".into(),
                     inputs: BTreeMap::new(),

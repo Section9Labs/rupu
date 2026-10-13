@@ -692,6 +692,7 @@ mod tests {
         ));
         let mirror = NodeMirror::new(std::sync::Arc::clone(&store));
         let spec = crate::node::protocol::RunSpec {
+            skill_bundle: None,
             kind: crate::node::protocol::RunSpecKind::Agent,
             name: "a".into(),
             inputs: Default::default(),
@@ -741,6 +742,7 @@ mod tests {
         ));
         let mirror = NodeMirror::new(std::sync::Arc::clone(&store));
         let spec = crate::node::protocol::RunSpec {
+            skill_bundle: None,
             kind: crate::node::protocol::RunSpecKind::Agent,
             name: "a".into(),
             inputs: Default::default(),
@@ -797,6 +799,7 @@ mod tests {
         ));
         let mirror = NodeMirror::new(std::sync::Arc::clone(&store));
         let spec = crate::node::protocol::RunSpec {
+            skill_bundle: None,
             kind: crate::node::protocol::RunSpecKind::Agent,
             name: "a".into(),
             inputs: Default::default(),
@@ -856,6 +859,7 @@ mod tests {
         ));
         let mirror = NodeMirror::new(std::sync::Arc::clone(&store));
         let spec = crate::node::protocol::RunSpec {
+            skill_bundle: None,
             kind: crate::node::protocol::RunSpecKind::Agent,
             name: "a".into(),
             inputs: Default::default(),
@@ -907,6 +911,7 @@ mod tests {
         ));
         let mirror = std::sync::Arc::new(NodeMirror::new(std::sync::Arc::clone(&store)));
         let spec = crate::node::protocol::RunSpec {
+            skill_bundle: None,
             kind: crate::node::protocol::RunSpecKind::Agent,
             name: "a".into(),
             inputs: Default::default(),

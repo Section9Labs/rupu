@@ -216,6 +216,7 @@ impl HostConnector for BucketHostConnector {
         let run_id = format!("run_{}", Ulid::new());
 
         let spec = RunSpec {
+            skill_bundle: None,
             kind: RunSpecKind::Workflow,
             name: req.workflow.clone(),
             inputs: req.inputs.clone(),
@@ -294,6 +295,7 @@ impl HostConnector for BucketHostConnector {
         };
 
         let spec = RunSpec {
+            skill_bundle: None,
             kind: RunSpecKind::Agent,
             name: req.agent.clone(),
             inputs: std::collections::BTreeMap::new(),

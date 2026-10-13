@@ -38,6 +38,7 @@ async fn poll_bucket_run_mirrors_and_finishes() {
 
     // Create the mirror run so the NodeMirror knows about it.
     let spec = RunSpec {
+        skill_bundle: None,
         kind: RunSpecKind::Workflow,
         name: "deploy".to_string(),
         inputs: BTreeMap::new(),
@@ -170,6 +171,7 @@ async fn poll_bucket_run_remirrors_run_json_each_tick() {
     let host_id = "host_REMIRROR01";
 
     let spec = RunSpec {
+        skill_bundle: None,
         kind: RunSpecKind::Workflow,
         name: "check".to_string(),
         inputs: BTreeMap::new(),

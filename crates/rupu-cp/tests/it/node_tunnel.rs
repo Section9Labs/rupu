@@ -227,6 +227,7 @@ async fn mirror_create_append_finish_round_trip() {
     let mirror = NodeMirror::new(Arc::clone(&store));
 
     let spec = RunSpec {
+        skill_bundle: None,
         kind: RunSpecKind::Workflow,
         name: "smoke-workflow".to_string(),
         inputs: BTreeMap::new(),
@@ -313,6 +314,7 @@ async fn mirror_usage_lines_land_in_the_run_usage_ledger() {
     let mirror = NodeMirror::new(Arc::clone(&store));
 
     let spec = RunSpec {
+        skill_bundle: None,
         findings_profile: None,
         engagement_profiles: Vec::new(),
         skills: Vec::new(),
@@ -381,6 +383,7 @@ async fn mirror_replace_usage_ledger_swaps_the_file_atomically() {
     let store = Arc::new(RunStore::new(dir.path().to_path_buf()));
     let mirror = NodeMirror::new(Arc::clone(&store));
     let spec = RunSpec {
+        skill_bundle: None,
         findings_profile: None,
         engagement_profiles: Vec::new(),
         skills: Vec::new(),
@@ -479,6 +482,7 @@ async fn mirror_replace_usage_ledger_failure_removes_the_temp_file() {
     let store = Arc::new(RunStore::new(dir.path().to_path_buf()));
     let mirror = NodeMirror::new(Arc::clone(&store));
     let spec = RunSpec {
+        skill_bundle: None,
         findings_profile: None,
         engagement_profiles: Vec::new(),
         skills: Vec::new(),
@@ -539,6 +543,7 @@ async fn mirror_run_json_repins_cp_local_paths() {
     let mirror = NodeMirror::new(Arc::clone(&store));
 
     let spec = RunSpec {
+        skill_bundle: None,
         kind: RunSpecKind::Workflow,
         name: "repin-test".to_string(),
         inputs: BTreeMap::new(),
@@ -646,6 +651,7 @@ async fn mirror_run_json_nulls_resume_fields() {
     let mirror = NodeMirror::new(Arc::clone(&store));
 
     let spec = RunSpec {
+        skill_bundle: None,
         kind: RunSpecKind::Workflow,
         name: "resume-null-test".to_string(),
         inputs: BTreeMap::new(),
@@ -726,6 +732,7 @@ async fn mirror_run_json_preserves_final_output() {
     let mirror = NodeMirror::new(Arc::clone(&store));
 
     let spec = RunSpec {
+        skill_bundle: None,
         kind: RunSpecKind::Agent,
         name: "my-agent".to_string(),
         inputs: BTreeMap::new(),
@@ -832,6 +839,7 @@ async fn mirror_traversal_run_id_rejected_before_io() {
 
     // Smoke-check additional invalid patterns.
     let _spec = RunSpec {
+        skill_bundle: None,
         kind: RunSpecKind::Workflow,
         name: "x".into(),
         inputs: BTreeMap::new(),
@@ -880,6 +888,7 @@ async fn mirror_wrong_node_id_rejected() {
     let run_id = "run_SECTEST001";
 
     let spec = RunSpec {
+        skill_bundle: None,
         kind: RunSpecKind::Workflow,
         name: "sec-workflow".to_string(),
         inputs: BTreeMap::new(),
@@ -951,6 +960,7 @@ async fn mirror_legitimate_owner_can_append_and_finish() {
     let run_id = "run_LEGITPATH001";
 
     let spec = RunSpec {
+        skill_bundle: None,
         kind: RunSpecKind::Workflow,
         name: "legit-workflow".to_string(),
         inputs: BTreeMap::new(),
@@ -1465,6 +1475,7 @@ mod tunnel_connector {
 
     fn make_spec(name: &str) -> RunSpec {
         RunSpec {
+            skill_bundle: None,
             kind: RunSpecKind::Workflow,
             name: name.to_string(),
             inputs: BTreeMap::new(),
@@ -3525,6 +3536,7 @@ async fn mirror_transcript_append_finish_synthesizes_agent_step_result() {
     let mirror = NodeMirror::new(Arc::clone(&store));
 
     let spec = RunSpec {
+        skill_bundle: None,
         kind: RunSpecKind::Agent,
         name: "reviewer".to_string(),
         inputs: BTreeMap::new(),
@@ -3607,6 +3619,7 @@ async fn mirror_reset_transcript_makes_replay_idempotent() {
     let mirror = NodeMirror::new(Arc::clone(&store));
 
     let spec = RunSpec {
+        skill_bundle: None,
         kind: RunSpecKind::Agent,
         name: "reviewer".to_string(),
         inputs: BTreeMap::new(),
