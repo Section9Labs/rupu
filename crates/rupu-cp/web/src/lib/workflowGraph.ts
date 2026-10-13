@@ -115,6 +115,12 @@ export interface StepNodeData {
   // where it is actually allowed (see `findingsProfileProblem`). Unset means
   // the key is omitted (inherit: defaults -> agent frontmatter -> full).
   findings_profile?: 'full' | 'summary';
+  // `Step.skills` / `Step.preload_skills` (workflow.rs, spec §2.2) — skills
+  // every agent this step launches may load, and those preloaded into its
+  // prompt. Omitted on emit when empty; `acceptsSkills` says where the server
+  // takes them.
+  skills?: string[];
+  preload_skills?: string[];
   // Any step-level keys we don't model (e.g. `contract:`) are captured verbatim
   // here on load and spread back on emit, so unmodeled config is never dropped.
   raw_passthrough?: Record<string, unknown>;
@@ -326,6 +332,10 @@ function parseStepData(raw: unknown, i: number): StepNodeData {
   // error surfaces instead of the editor silently dropping it.
   const fp = asString(o.findings_profile);
   if (fp === 'full' || fp === 'summary') data.findings_profile = fp;
+  const skills = asStringArray(o.skills);
+  if (skills && skills.length > 0) data.skills = skills;
+  const preloadSkills = asStringArray(o.preload_skills);
+  if (preloadSkills && preloadSkills.length > 0) data.preload_skills = preloadSkills;
   if (forEach !== undefined) data.for_each = forEach;
   const mp = asNumber(o.max_parallel);
   if (mp !== undefined) data.max_parallel = mp;
@@ -402,6 +412,8 @@ const MODELLED_STEP_KEYS = new Set<string>([
   'split',
   'join',
   'findings_profile',
+  'skills',
+  'preload_skills',
 ]);
 
 // Keys this module models on a `branch:` block. Everything else is captured
@@ -1135,6 +1147,8 @@ function nodeToStepObject(d: StepNodeData): Record<string, unknown> {
   // `findings_profile` is kind-independent in the model (validateGraph, not
   // the serializer, decides where it is legal) — omitted when unset.
   if (d.findings_profile) o.findings_profile = d.findings_profile;
+  if (d.skills && d.skills.length > 0) o.skills = d.skills;
+  if (d.preload_skills && d.preload_skills.length > 0) o.preload_skills = d.preload_skills;
 
   // Approval applies to any step kind. A gate NODE ALWAYS emits an `approval:`
   // block (it is the node's identity); other kinds emit only when there's an
@@ -1326,6 +1340,13 @@ export function acceptsFindingsProfile(d: StepNodeData): boolean {
   }
 }
 
+/** Whether the server accepts `skills` / `preload_skills` on this step
+ *  (workflow.rs `validate_step_skills`): any step that launches an agent,
+ *  remote ones included, but never an `action:` step. */
+export function acceptsSkills(d: StepNodeData): boolean {
+  return !runsNoAgent(d) && d.kind !== 'action';
+}
+
 // ── validateGraph ─────────────────────────────────────────────────────────────
 
 /** Return a map of nodeId → human-readable problems. Only nodes that HAVE
@@ -1382,6 +1403,10 @@ export function validateGraph(g: WorkflowGraph): Record<string, string[]> {
 
     const fpProblem = findingsProfileProblem(d);
     if (fpProblem !== undefined) add(n.id, fpProblem);
+
+    if ((d.skills?.length || d.preload_skills?.length) && !acceptsSkills(d)) {
+      add(n.id, '`skills`/`preload_skills` apply only to steps that run an agent; remove them');
+    }
 
     // A `notify` row with no `action` (backend `NotifyAction.action` is
     // required) 400s on save rather than failing validation up-front.
