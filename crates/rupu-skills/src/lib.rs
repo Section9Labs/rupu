@@ -24,7 +24,8 @@ pub use frontmatter::{
     parse_skill_md, Frontmatter, FrontmatterError, MAX_COMPATIBILITY_LEN, MAX_DESCRIPTION_LEN,
 };
 pub use grant::{
-    parse_grants, resolve_grants, EntryError, GrantParseError, ResolveError, SkillGrant,
+    check_grant_names, parse_grants, resolve_grants, EntryError, GrantParseError, ResolveError,
+    SkillGrant,
 };
 pub use name::{NameError, SkillName, MAX_NAME_LEN};
 pub use run::{

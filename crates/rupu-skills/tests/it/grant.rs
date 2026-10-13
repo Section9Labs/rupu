@@ -266,3 +266,34 @@ fn repeated_errors_appear_once_in_first_seen_order() {
         matches!(&err[1], ResolveError::Invalid { name, layer: Layer::Global, .. } if name == "bad")
     );
 }
+
+fn check(entries: &[&str], cat: &SkillCatalog) -> Result<(), String> {
+    let entries: Vec<String> = entries.iter().map(|e| e.to_string()).collect();
+    rupu_skills::check_grant_names(&entries, cat).map_err(|e| e.to_string())
+}
+
+#[test]
+fn a_name_check_reads_only_the_listing() {
+    let (_g, _p, cat) = catalog();
+    assert_eq!(check(&["bad", "project:broken-local", "*"], &cat), Ok(()));
+    assert_eq!(
+        check(&["pdf-procesing"], &cat),
+        Err("unknown skill \"pdf-procesing\" (did you mean pdf-processing?)".into())
+    );
+    assert_eq!(
+        check(&["global:local-only"], &cat),
+        Err("unknown skill \"global:local-only\" (did you mean project:local-only?)".into())
+    );
+    assert_eq!(
+        check(&["code-review"], &cat),
+        Err(
+            "skill \"code-review\" is installed in both the global and the project layer; \
+             grant global:code-review or project:code-review"
+                .into()
+        )
+    );
+    assert_eq!(
+        check(&["Bad Name"], &cat),
+        Err("entry \"Bad Name\": skill name may only contain a-z, 0-9 and '-'; found 'B'".into())
+    );
+}

@@ -554,10 +554,11 @@ pub struct StepLaunch {
 /// (`rupu_runtime::assembly::PreparedProvider::injected`).
 #[async_trait]
 pub trait StepFactory: Send + Sync {
-    /// The launch for `request`, or why there is none — today only
-    /// [`AssembleError::AgentLoad`]: the step's agent file is missing or
-    /// does not parse. The orchestrator records that as the step's failed
-    /// run ([`AssembleError::record_unstarted`]).
+    /// The launch for `request`, or why there is none:
+    /// [`AssembleError::AgentLoad`] (the step's agent file is missing or
+    /// does not parse) or [`AssembleError::Skills`] (it names a skill that
+    /// is not installed). The orchestrator records that as the step's
+    /// failed run ([`AssembleError::record_unstarted`]).
     async fn launch_for_step(&self, _request: StepRequest) -> Result<StepLaunch, AssembleError>;
 
     /// The permission mode (`ask` / `bypass` / `readonly`) this factory's

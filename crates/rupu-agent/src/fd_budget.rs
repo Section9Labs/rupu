@@ -485,6 +485,7 @@ mod tests {
             agent: "a".into(),
             key: "skills",
             source,
+            looked_in: Default::default(),
         };
         let discover = |e| {
             skill(SkillCheckError::Discover(DiscoverError::Io {

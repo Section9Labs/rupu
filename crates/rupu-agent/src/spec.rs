@@ -306,22 +306,6 @@ impl AgentSpec {
         self.skills.as_ref().is_some_and(|v| !v.is_empty())
             || self.preload_skills.as_ref().is_some_and(|v| !v.is_empty())
     }
-
-    /// Resolve the agent's own skill keys against `catalog` (spec §2.1).
-    pub fn validate_skills(
-        &self,
-        catalog: &rupu_skills::SkillCatalog,
-    ) -> Result<(), rupu_skills::RunSkillsError> {
-        rupu_skills::resolve_run_skills(
-            catalog,
-            &[rupu_skills::SkillRequest {
-                reason: rupu_skills::SkillReason::Agent,
-                grants: self.skills.as_deref().unwrap_or_default(),
-                preload: self.preload_skills.as_deref().unwrap_or_default(),
-            }],
-        )
-        .map(|_| ())
-    }
 }
 
 #[cfg(test)]

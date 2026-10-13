@@ -40,7 +40,11 @@ fn load_agent_refuses_an_unknown_skill_with_a_suggestion() {
     let err = load_agent(g.path(), None, "a").unwrap_err();
     assert_eq!(
         err.to_string(),
-        "agent `a`: preloadSkills: unknown skill \"code-reviw\" (did you mean code-review?)"
+        format!(
+            "agent `a`: preloadSkills: unknown skill \"code-reviw\" (did you mean code-review?) \
+             (looked in {}; install it with `rupu skill install`)",
+            g.path().join("skills").display()
+        )
     );
 }
 
@@ -70,21 +74,48 @@ fn a_malformed_entry_names_its_key_once() {
 fn an_error_from_both_keys_is_reported_under_skills() {
     let g = tempfile::tempdir().unwrap();
     let p = tempfile::tempdir().unwrap();
-    skill(&g.path().join("skills"), "x");
-    skill(&p.path().join("skills"), "x");
-    agent(
-        g.path(),
-        "skills: [\"global:x\"]\npreloadSkills: [\"project:x\"]\n",
-    );
-    assert_eq!(
-        load_err(g.path(), Some(p.path())),
-        "agent `a`: skills: skill \"x\" is granted from both the global and the project layer; \
-         grant only one of global:x or project:x"
-    );
     agent(g.path(), "skills: [nope]\npreloadSkills: [also-nope]\n");
     assert_eq!(
         load_err(g.path(), Some(p.path())),
-        "agent `a`: skills: unknown skill \"nope\"; unknown skill \"also-nope\""
+        format!(
+            "agent `a`: skills: unknown skill \"nope\"; unknown skill \"also-nope\" \
+             (looked in {} and {}; install it with `rupu skill install`)",
+            g.path().join("skills").display(),
+            p.path().join("skills").display()
+        )
+    );
+}
+
+/// Loading an agent checks only that its skills are installed: whether
+/// each is valid, and whether the set binds a name twice, is the run
+/// assembler's to say, so a launch reads no skill twice.
+/// `rupu agent validate` still resolves them in full.
+#[test]
+fn a_load_checks_names_and_validate_resolves() {
+    let g = tempfile::tempdir().unwrap();
+    let p = tempfile::tempdir().unwrap();
+    skill(&g.path().join("skills"), "x");
+    skill(&p.path().join("skills"), "x");
+    let invalid = g.path().join("skills/invalid");
+    fs::create_dir_all(&invalid).unwrap();
+    fs::write(invalid.join("SKILL.md"), "no frontmatter\n").unwrap();
+    agent(
+        g.path(),
+        "skills: [\"global:x\", invalid]\npreloadSkills: [\"project:x\"]\n",
+    );
+    assert!(load_agent(g.path(), Some(p.path()), "a").is_ok());
+    let checks = check_agent_files(g.path(), Some(p.path()));
+    let err = checks[0].error.as_ref().unwrap().to_string();
+    assert!(
+        err.starts_with("agent `a`: skills: skill \"invalid\" (global) is invalid"),
+        "{err}"
+    );
+    assert!(
+        err.ends_with(
+            "skill \"x\" is granted from both the global and the project layer; \
+             grant only one of global:x or project:x"
+        ),
+        "{err}"
     );
 }
 
@@ -123,7 +154,8 @@ fn a_broken_skill_the_agent_does_not_name_never_fails_it() {
     );
     assert!(load_agent(g.path(), None, "a").is_ok());
     agent(g.path(), "skills: [broken]\n");
-    let err = load_err(g.path(), None);
+    let checks = check_agent_files(g.path(), None);
+    let err = checks[0].error.as_ref().unwrap().to_string();
     assert!(err.contains("points outside the skill"), "{err}");
 }
 

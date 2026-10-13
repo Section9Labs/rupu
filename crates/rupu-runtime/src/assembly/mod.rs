@@ -114,34 +114,11 @@ pub enum AssembleError {
     /// the skills directories can't be read. Typed, so an fd-exhaustion
     /// behind it stays classifiable. `looked_in` is the layers searched, so
     /// an unknown skill's message names where to install it.
-    #[error("skills: {source}{}", install_hint(source, looked_in))]
+    #[error("skills: {source}{}", source.install_hint(looked_in))]
     Skills {
         source: rupu_agent::SkillCheckError,
         looked_in: rupu_skills::LayerDirs,
     },
-}
-
-/// For a skill that is not installed: where the run looked, and the fix.
-fn install_hint(source: &rupu_agent::SkillCheckError, dirs: &rupu_skills::LayerDirs) -> String {
-    let rupu_agent::SkillCheckError::Resolve(rupu_skills::RunSkillsError::Resolve(errors)) = source
-    else {
-        return String::new();
-    };
-    if !errors
-        .iter()
-        .any(|e| matches!(e, rupu_skills::ResolveError::Unknown { .. }))
-    {
-        return String::new();
-    }
-    let looked: Vec<String> = [&dirs.global, &dirs.project]
-        .into_iter()
-        .flatten()
-        .map(|d| d.display().to_string())
-        .collect();
-    format!(
-        " (looked in {}; install it with `rupu skill install`)",
-        looked.join(" and ")
-    )
 }
 
 impl rupu_agent::fd_budget::FdExhaustion for AssembleError {
