@@ -887,6 +887,9 @@ pub struct UnstartedRun<'a> {
     /// The agent's system prompt; `None` when the agent did not load.
     pub system_prompt: Option<&'a str>,
     pub prompt: &'a UserTurn,
+    /// The launch's own skill entries, as written (`RunStart.launch_skills`).
+    pub launch_skills: &'a [String],
+    pub launch_preload_skills: &'a [String],
 }
 
 /// Record a run that never started — no provider was built, so nothing was
@@ -931,8 +934,8 @@ pub fn record_unstarted_run(
             system_prompt,
             codename: run.codename.map(str::to_string),
             customer: Some(run.customer.map(str::to_string)),
-            launch_skills: Vec::new(),
-            launch_preload_skills: Vec::new(),
+            launch_skills: run.launch_skills.to_vec(),
+            launch_preload_skills: run.launch_preload_skills.to_vec(),
         })?;
         writer.write(&Event::Notice {
             kind: "model_limits".into(),

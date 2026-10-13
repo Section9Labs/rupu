@@ -10347,6 +10347,8 @@ async fn dispatch_one(
                 customer: factory.customer(),
                 system_prompt: None,
                 prompt: &prompt,
+                launch_skills: &[],
+                launch_preload_skills: &[],
             }));
         }
     };
@@ -10372,6 +10374,8 @@ async fn dispatch_one(
     let system_prompt =
         rupu_runtime::assembly::system_prompt_for(&spec.agent, &spec.overrides, None);
     let prompt = spec.prompt.clone();
+    let launch_skills = spec.overrides.skills.clone();
+    let launch_preload_skills = spec.overrides.preload_skills.clone();
     let assembled = match assembler.assemble(spec).await {
         Ok(a) => a,
         Err(e) => {
@@ -10387,6 +10391,8 @@ async fn dispatch_one(
                 customer: assembler.context().customer.as_deref(),
                 system_prompt: Some(&system_prompt),
                 prompt: &prompt,
+                launch_skills: &launch_skills,
+                launch_preload_skills: &launch_preload_skills,
             }))
         }
     };

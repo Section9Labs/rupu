@@ -320,6 +320,8 @@ async fn failed_skills_record_the_unstarted_run() {
         customer: None,
         system_prompt: Some("x"),
         prompt: &prompt,
+        launch_skills: &[],
+        launch_preload_skills: &[],
     });
     assert!(
         matches!(&run_err, rupu_agent::RunError::Preflight(m) if *m == unknown_missing(&home)),
@@ -333,6 +335,49 @@ async fn failed_skills_record_the_unstarted_run() {
         })
         .expect("a run_complete with an error");
     assert_eq!(closed, unknown_missing(&home));
+}
+
+/// A site that resolves a launch's skills before assembling it (`rupu run`,
+/// before a clone) records a failure as `assemble` does: the run's
+/// transcript exists, empty. A launch whose skills resolve writes nothing.
+#[tokio::test]
+#[serial]
+async fn skills_resolved_for_a_launch_record_a_failure_as_assemble_does() {
+    let home = Home::new();
+    home.skill("pdf", "Read PDFs.", "Use pdftotext.");
+    let assembler = home.assembler(config());
+    let transcript = home.global().join("transcripts/run_early.jsonl");
+
+    let err = match assembler
+        .resolve_skills_for_launch(
+            &agent_naming_a_missing_skill("anthropic"),
+            &rupu_runtime::assembly::Overrides::default(),
+            &transcript,
+        )
+        .await
+    {
+        Ok(_) => panic!("an unknown skill must not resolve"),
+        Err(e) => e,
+    };
+    assert_eq!(err.to_string(), unknown_missing(&home));
+    assert_eq!(std::fs::read_to_string(&transcript).unwrap(), "");
+
+    std::fs::remove_file(&transcript).unwrap();
+    let overrides = rupu_runtime::assembly::Overrides {
+        skills: vec!["pdf".into()],
+        ..Default::default()
+    };
+    let skills = assembler
+        .resolve_skills_for_launch(
+            &agent(&home, "provider: anthropic"),
+            &overrides,
+            &transcript,
+        )
+        .await
+        .unwrap()
+        .expect("the launch's skill");
+    assert_eq!(skills.names(), ["pdf"]);
+    assert!(!transcript.exists(), "a resolved launch writes nothing");
 }
 
 #[tokio::test]

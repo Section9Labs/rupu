@@ -378,7 +378,8 @@ async fn a_step_whose_agent_names_an_invalid_skill_fails_its_assembly() {
 
 /// A step naming a skill that is not installed fails that step with a
 /// recorded, unstarted run, the way an agent naming one does: the agent
-/// itself loads, so the run's assembly refuses it.
+/// itself loads, so the run's assembly refuses it. Its `run_start` records
+/// the skill the step asked for, as written.
 #[tokio::test]
 async fn a_step_naming_a_missing_skill_records_an_unstarted_run() {
     const SKILLED: &str = r#"
@@ -409,11 +410,13 @@ steps:
         o.events,
         events("anthropic", "claude-sonnet-4-6", &error, Value::Null)
     );
-    let mut transcript = vec![run_start(
+    let mut start = run_start(
         "anthropic",
         "claude-sonnet-4-6",
         Some("hi\n\n\nYour call sign in this run is `gazelle` (crew `tan-tower`). Sign any comments, issues or PR notes you post with it."),
-    )];
+    );
+    start["data"]["launch_skills"] = json!(["missing"]);
+    let mut transcript = vec![start];
     transcript.extend(preamble());
     transcript.push(json!({"data": {"duration_ms": V, "error": message, "run_id": V, "status": "error", "total_tokens": 0}, "type": "run_complete"}));
     assert_eq!(o.transcript, transcript, "{}", dump(&o));

@@ -959,11 +959,13 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         // The skills are resolved before the clone too, but a skill that
         // doesn't resolve is a failed run, recorded below like any assembly
         // failure: it skips the clone instead of failing the command.
-        let (resolved_skills, skills_failure) =
-            match assembler.resolve_skills(&spec, &overrides).await {
-                Ok(skills) => (skills, None),
-                Err(e) => (None, Some(e)),
-            };
+        let (resolved_skills, skills_failure) = match assembler
+            .resolve_skills_for_launch(&spec, &overrides, &transcript_path)
+            .await
+        {
+            Ok(skills) => (skills, None),
+            Err(e) => (None, Some(e)),
+        };
 
         // Construct ONE LineStreamPrinter for the whole run. Keeping a
         // single instance means a single MultiProgress + ticker — earlier
@@ -1207,25 +1209,19 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         };
         // A run that cannot be assembled (its grant fails, its skills don't
         // resolve) is a failed run: recorded in run.json like any other
-        // failure, not an early exit. As `assemble` does for its own
-        // failures, the run's transcript exists, empty.
+        // failure, not an early exit.
         let assembled = match skills_failure {
             None => assembler.assemble(launch).await.map_err(|e| e.into_run_error()),
-            Some(e) => {
-                if let Err(w) = rupu_transcript::JsonlWriter::create(&transcript_path) {
-                    warn!(error = %w, "create the transcript of a run whose skills failed");
+            Some(e) => Err(match (e.into_run_error(), &skills_carried_from) {
+                (rupu_agent::RunError::Preflight(m), Some(prev)) => {
+                    rupu_agent::RunError::Preflight(format!(
+                        "{m}\n  The launch skills ({}) came from run {prev}, which this run \
+                         continues; pass --skill or --preload-skill to name others.",
+                        launch_flags(&launch_skills)
+                    ))
                 }
-                Err(match (e.into_run_error(), &skills_carried_from) {
-                    (rupu_agent::RunError::Preflight(m), Some(prev)) => {
-                        rupu_agent::RunError::Preflight(format!(
-                            "{m}\n  The launch skills ({}) came from run {prev}, which this run \
-                             continues; pass --skill or --preload-skill to name others.",
-                            launch_flags(&launch_skills)
-                        ))
-                    }
-                    (e, _) => e,
-                })
-            }
+                (e, _) => e,
+            }),
         };
 
         // Spawn the agent in a background task and tail the transcript with
