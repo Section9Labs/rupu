@@ -159,6 +159,39 @@ fn host_err_to_run_err(e: HostConnectorError) -> RunError {
     RunError::Provider(e.to_string())
 }
 
+/// What a unit whose skills shipped launches with: the manifest, and the
+/// step's skill entries as they resolved on the coordinator (`layer:name`),
+/// so a host whose own layers would read a bare name or `*` differently —
+/// a bare name it holds in both layers is ambiguous there — runs exactly
+/// the shipped set.
+struct ShippedSkills {
+    manifest: SkillBundleManifest,
+    skills: Vec<String>,
+    preload_skills: Vec<String>,
+}
+
+impl ShippedSkills {
+    fn new(manifest: SkillBundleManifest, step: Option<&rupu_skills::ResolvedSkills>) -> Self {
+        let (mut skills, mut preload_skills) = (Vec::new(), Vec::new());
+        for g in step.map(|s| s.entries()).unwrap_or_default() {
+            let entry = format!("{}:{}", g.skill.layer, g.name());
+            if g.preload {
+                preload_skills.push(entry);
+            } else {
+                skills.push(entry);
+            }
+        }
+        Self {
+            manifest,
+            skills,
+            preload_skills,
+        }
+    }
+}
+
+/// How every P5 downgrade warning ends, whichever transport said why.
+const DOWNGRADE: &str = "; the unit uses that host's installed skills";
+
 /// `msg` led by `host <id>: `, unless it already is. A connector may name
 /// its peer another way (HTTP by its base URL), so every placed-unit failure
 /// names the host id the workflow placed it on.
@@ -303,17 +336,17 @@ impl FleetUnitDispatcher {
 
     /// P1: resolve on the coordinator what the unit is granted — its agent's
     /// keys, when this coordinator has the agent, plus the step's — and ship
-    /// those skills to the host. The manifest the unit launches with, or
-    /// `None` when nothing ships or the host can't take shipped skills (P5:
-    /// a warning, and the host's installed copies). Fails, before anything
-    /// is staged or launched, when a skill doesn't resolve here, as a local
-    /// run would, or the transfer fails.
+    /// those skills to the host. What the unit launches with, or `None` when
+    /// nothing ships or the host can't take shipped skills (P5: a warning,
+    /// and the host's installed copies). Fails, before anything is staged or
+    /// launched, when a skill doesn't resolve here, as a local run would, or
+    /// the transfer fails.
     async fn ship_unit_skills(
         &self,
         conn: &Arc<dyn HostConnector>,
         unit: &UnitDispatch,
         warnings: &mut Vec<String>,
-    ) -> Result<Option<SkillBundleManifest>, RunError> {
+    ) -> Result<Option<ShippedSkills>, RunError> {
         let project = self.project.as_ref().map(|root| root.join(".rupu"));
         let mut requests = Vec::with_capacity(2);
         if let Some(agent) = self.coordinator_agent(&unit.agent, warnings).await {
@@ -329,11 +362,13 @@ impl FleetUnitDispatcher {
             unit.preload_skills.clone(),
         ));
         let dirs = rupu_skills::LayerDirs::for_layers(&self.global, project.as_deref());
-        let Some(resolved) =
-            rupu_runtime::assembly::resolve_skill_requests(&dirs, &unit.agent, requests)
+        let (dirs, agent) = (&dirs, unit.agent.as_str());
+        let resolve = move |requests| async move {
+            rupu_runtime::assembly::resolve_skill_requests(dirs, agent, requests)
                 .await
-                .map_err(|e| RunError::Provider(e.to_string()))?
-        else {
+                .map_err(|e| RunError::Provider(e.to_string()))
+        };
+        let Some(resolved) = resolve(requests).await? else {
             return Ok(None);
         };
         let bundle = SkillBundle::new(
@@ -348,10 +383,20 @@ impl FleetUnitDispatcher {
             .await
             .map_err(host_err_to_run_err)?
         {
-            ShipOutcome::Shipped(manifest) => Ok(Some(manifest)),
+            ShipOutcome::Shipped(manifest) => {
+                // The step's own set, alone: the union above keeps the first
+                // request's reason and ORs preload across requests.
+                let step = resolve(vec![(
+                    SkillReason::Launch,
+                    unit.skills.clone(),
+                    unit.preload_skills.clone(),
+                )])
+                .await?;
+                Ok(Some(ShippedSkills::new(manifest, step.as_deref())))
+            }
             ShipOutcome::NotNeeded => Ok(None),
             ShipOutcome::Unsupported(why) => {
-                warnings.push(why);
+                warnings.push(format!("{why}{DOWNGRADE}"));
                 Ok(None)
             }
         }
@@ -799,8 +844,15 @@ impl UnitDispatcher for FleetUnitDispatcher {
     ) -> Result<UnitOutcome, UnitFailure> {
         let conn = self.resolver.resolve(host)?;
         let mut warnings = Vec::new();
+        let mut unit = unit;
         let result = match self.ship_unit_skills(&conn, &unit, &mut warnings).await {
-            Ok(skill_bundle) => self.launch_and_wait(&conn, unit, host, skill_bundle).await,
+            Ok(Some(shipped)) => {
+                unit.skills = shipped.skills;
+                unit.preload_skills = shipped.preload_skills;
+                self.launch_and_wait(&conn, unit, host, Some(shipped.manifest))
+                    .await
+            }
+            Ok(None) => self.launch_and_wait(&conn, unit, host, None).await,
             Err(e) => Err(e.into()),
         };
         let warnings: Vec<String> = warnings.iter().map(|w| prefix_host(host, w)).collect();
@@ -3059,8 +3111,8 @@ steps:
         }
     }
 
-    /// The step's entries reach the host as given, whatever ships: the
-    /// host's own agent resolves them against the overlay (P2).
+    /// With nothing shipped, the step's entries reach the host as given: the
+    /// host resolves them against its own layers.
     #[tokio::test]
     async fn dispatch_passes_the_units_skills_to_launch_agent() {
         // Installed where the coordinator resolves them, as a step's skills
@@ -3221,11 +3273,81 @@ steps:
         );
         let launched = conn.launched.lock().unwrap().clone().expect("launched");
         assert_eq!(launched.skill_bundle, Some(manifest()));
-        assert_eq!(launched.skills, vec!["notes".to_string()]);
+        assert_eq!(launched.skills, vec!["global:notes".to_string()]);
         assert!(out.warnings.is_empty(), "{:?}", out.warnings);
         let calls = conn.calls.lock().unwrap().clone();
         let at = |c: &str| calls.iter().position(|x| *x == c).unwrap();
         assert!(at("ship_skills") < at("launch_agent"), "{calls:?}");
+    }
+
+    /// The step's skill entries as the launch with a shipped bundle carries
+    /// them, for a coordinator with `global` and the root `project` dirs.
+    async fn shipped_step_entries(
+        g: &Path,
+        root: Option<&Path>,
+        skills: &[&str],
+        preload: &[&str],
+    ) -> (Vec<String>, Vec<String>) {
+        let conn = shipping(ShipScript::Answer(
+            rupu_cp::host::skill_ship::ShipOutcome::Shipped(manifest()),
+        ));
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            g.to_path_buf(),
+            root.map(Path::to_path_buf),
+        );
+        let mut unit = unit_with_skills(skills);
+        unit.preload_skills = preload.iter().map(ToString::to_string).collect();
+        d.dispatch_unit(unit, "h").await.unwrap();
+        let launched = conn.launched.lock().unwrap().clone().expect("launched");
+        assert_eq!(launched.skill_bundle, Some(manifest()));
+        (launched.skills, launched.preload_skills)
+    }
+
+    /// S9 on the host: a bare name the coordinator bound in one layer goes as
+    /// that layer's entry, so a host holding the name in both layers runs the
+    /// shipped skill instead of failing on an ambiguous bare name.
+    #[tokio::test]
+    async fn a_shipped_units_bare_step_entries_go_layer_qualified() {
+        let g = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        write_skill(&g.path().join("skills"), "house-style");
+        write_skill(&root.path().join(".rupu/skills"), "notes");
+        assert_eq!(
+            shipped_step_entries(g.path(), Some(root.path()), &["notes"], &["house-style"]).await,
+            (
+                vec!["project:notes".to_string()],
+                vec!["global:house-style".to_string()]
+            )
+        );
+    }
+
+    /// `*` goes as the global skills it bound on the coordinator.
+    #[tokio::test]
+    async fn a_shipped_units_star_goes_as_the_globals_it_bound() {
+        let g = coordinator(false);
+        assert_eq!(
+            shipped_step_entries(g.path(), None, &["*"], &[]).await,
+            (
+                vec!["global:notes".to_string(), "global:pdf".to_string()],
+                vec![]
+            )
+        );
+    }
+
+    /// A skill the agent preloads and the step only grants goes as the
+    /// step's grant: the step's set is its own, not the union's.
+    #[tokio::test]
+    async fn a_shipped_units_step_entries_are_the_steps_own() {
+        let g = coordinator(false);
+        write_agent(g.path(), "a", "preloadSkills: [pdf]\nskills: [notes]\n");
+        assert_eq!(
+            shipped_step_entries(g.path(), None, &["pdf", "notes"], &[]).await,
+            (
+                vec!["global:notes".to_string(), "global:pdf".to_string()],
+                vec![]
+            )
+        );
     }
 
     /// The project layer is the workflow root's `.rupu/`: its agent and its
@@ -3259,8 +3381,7 @@ steps:
         let g = coordinator(true);
         let conn = shipping(ShipScript::Answer(
             rupu_cp::host::skill_ship::ShipOutcome::Unsupported(
-                "host h: does not take shipped skills; the unit uses the host's installed copies"
-                    .into(),
+                "host h: does not take shipped skills".into(),
             ),
         ));
         let d = FleetUnitDispatcher::from_connector(
@@ -3287,6 +3408,66 @@ steps:
             "never prefixed twice: {:?}",
             out.warnings
         );
+    }
+
+    /// P5: every transport's downgrade reaches the run as the same warning —
+    /// led by the host id, ending with the host's installed skills — whatever
+    /// text the connector gave.
+    #[tokio::test]
+    async fn every_transports_downgrade_warns_the_same_way() {
+        async fn warnings(conn: Arc<dyn HostConnector>, g: &Path) -> Vec<String> {
+            let d = FleetUnitDispatcher::from_connector(conn, g.to_path_buf(), None);
+            match d.dispatch_unit(unit_with_skills(&["notes"]), "h").await {
+                Ok(out) => out.warnings,
+                Err(failure) => failure.warnings,
+            }
+        }
+        let g = coordinator(false);
+        let server = httpmock::MockServer::start_async().await;
+        server.mock(|when, then| {
+            when.method("GET").path("/api/host/info");
+            then.status(200).json_body(serde_json::json!({
+                "version": "0.95.0",
+                "capabilities": {"backends": [], "scm_hosts": [], "permission_modes": []},
+                "features": ["agent.skills"],
+            }));
+        });
+        let http = Arc::new(rupu_cp::host::http::HttpHostConnector::new(
+            server.base_url(),
+            None,
+        ));
+        let store_dir = tempfile::tempdir().unwrap();
+        let run_store = Arc::new(rupu_orchestrator::runs::RunStore::new(
+            store_dir.path().join("runs"),
+        ));
+        let tunnel = Arc::new(rupu_cp::host::tunnel::TunnelHostConnector::new(
+            "h",
+            Arc::new(rupu_cp::node::registry::NodeRegistry::new()),
+            Arc::new(rupu_cp::node::mirror::NodeMirror::new(Arc::clone(
+                &run_store,
+            ))),
+            run_store,
+            Arc::new(rupu_cp::customers::CustomerPricing::flat(
+                rupu_config::PricingConfig::default(),
+            )),
+        ));
+        for (transport, conn) in [
+            ("http", http as Arc<dyn HostConnector>),
+            ("tunnel", tunnel as Arc<dyn HostConnector>),
+        ] {
+            let w = warnings(conn, g.path()).await;
+            assert_eq!(w.len(), 1, "{transport}: {w:?}");
+            assert!(w[0].starts_with("host h: "), "{transport}: {w:?}");
+            assert!(
+                w[0].ends_with("; the unit uses that host's installed skills"),
+                "{transport}: {w:?}"
+            );
+            assert_eq!(
+                w[0].matches("installed skills").count(),
+                1,
+                "{transport}: {w:?}"
+            );
+        }
     }
 
     /// P1: with no copy of the unit's agent, only the step's skills ship.

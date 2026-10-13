@@ -2078,7 +2078,7 @@ impl SshHostConnector {
         {
             return Ok(Transfer::Downgrade(format!(
                 "{who}: rupu there predates shipped skills (no {CAP_AGENT_SKILL_BUNDLE}); upgrade \
-                 rupu there. The unit uses that host's installed skills."
+                 rupu there"
             )));
         }
         if let Some(refusal) = self.skills_gate_refusal(&out.stdout) {
@@ -10644,7 +10644,7 @@ mod tests {
             assert!(
                 matches!(&out, ShipOutcome::Unsupported(m)
                     if m.contains("host_abc") && m.contains("agent.skill_bundle")
-                        && m.contains("installed skills")),
+                        && !m.contains("installed skills")),
                 "{out:?}"
             );
             assert!(exec.receives.lock().unwrap().is_empty());

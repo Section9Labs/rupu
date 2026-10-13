@@ -276,8 +276,11 @@ agent itself and resolves its grants, now over its global layer, its staged
 project layer and the shipped skills. The rules do not change: `*` is the
 global layer only, and a bare name bound in both layers is ambiguous. A grant
 nobody shipped still resolves from what the host has installed, and fails
-closed if the host has nothing. The unit's `skill_index` marks shipped skills
-`(shipped)`.
+closed if the host has nothing. The step's own `skills:` and
+`preload_skills:` go to the host as the `layer:name` entries they resolved to
+on the coordinator, so `*` or a bare name means the same skills there even
+when the host's layers would read it differently. The unit's `skill_index`
+marks shipped skills `(shipped)`.
 
 **Limits.** A skill tree may be at most 32 MiB and one unit's bundle at most
 128 MiB. The coordinator refuses a unit over either limit before dispatch and

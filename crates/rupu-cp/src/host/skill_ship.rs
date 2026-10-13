@@ -150,7 +150,9 @@ pub enum ShipOutcome {
     /// Nothing to ship: no skills, or the unit runs where they are installed.
     NotNeeded,
     /// The host can't take shipped skills; the unit runs with the skills it
-    /// has installed. The text names the host and why.
+    /// has installed. The text says why; the fleet dispatcher's warning adds
+    /// that the unit uses the host's installed skills, the same for every
+    /// transport.
     Unsupported(String),
 }
 
