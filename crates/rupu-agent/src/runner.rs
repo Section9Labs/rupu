@@ -495,16 +495,18 @@ self-contained.";
 
     // Extract task text from messages[0]. A block of re-attached skills is
     // not task text: the next re-attach puts the skills back, once (spec
-    // 2026-10-12 §6).
+    // 2026-10-12 §6). It always follows the task text, so the first text
+    // block is kept whatever it starts with.
     let task_text: String = messages[0]
         .content
         .iter()
         .filter_map(|b| match b {
-            ContentBlock::Text { text } if !text.starts_with(REATTACH_MARKER) => {
-                Some(text.as_str())
-            }
+            ContentBlock::Text { text } => Some(text.as_str()),
             _ => None,
         })
+        .enumerate()
+        .filter(|(i, text)| *i == 0 || !text.starts_with(REATTACH_MARKER))
+        .map(|(_, text)| text)
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -5791,6 +5793,44 @@ mod compaction_tests {
         assert_eq!(hooked[0].kind, UsageKind::Compaction);
         assert_eq!(hooked[0].input_tokens, 700);
         assert_eq!(hooked[0].output_tokens, 11);
+    }
+
+    /// The task text keeps a first block that merely starts like the
+    /// re-attach marker (an operator's prompt): only a marker block after
+    /// it is dropped.
+    #[tokio::test]
+    async fn compaction_drops_only_a_reattach_block_after_the_task() {
+        let dense_chunk = "x".repeat(1000);
+        let task = format!("{REATTACH_MARKER} is how my notes start. {dense_chunk}");
+        let mut first = text_msg(Role::User, &task);
+        first.content.push(ContentBlock::Text {
+            text: format!("{REATTACH_MARKER}\nSKILL BODY"),
+        });
+        let mut msgs = vec![first];
+        for i in 0..5 {
+            msgs.push(text_msg(
+                Role::Assistant,
+                &format!("assistant {i}: {dense_chunk}"),
+            ));
+            msgs.push(text_msg(Role::User, &format!("user {i}: {dense_chunk}")));
+        }
+        let mut provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
+            text: "SUMMARY".to_string(),
+            stop: StopReason::EndTurn,
+            input_tokens: 500,
+            output_tokens: 10,
+        }]);
+        let outcome = compact_messages(&msgs, &mut provider, "mock-1", 800, 900)
+            .await
+            .expect("no provider error")
+            .expect("should compact");
+        let ContentBlock::Text { text } = &outcome.messages[0].content[0] else {
+            panic!("expected a text block");
+        };
+        assert_eq!(
+            text,
+            &format!("{task}\n\n## Summary of prior work\nSUMMARY")
+        );
     }
 
     #[tokio::test]
