@@ -1,14 +1,12 @@
 //! Fixtures for the run-assembly tests: a throwaway `RUPU_HOME` with agents,
-//! an assembler over it, a sub-run store and a recorder for the dispatcher's
-//! live events, and the `RUPU_MOCK_PROVIDER_SCRIPT` seam (callers are
+//! an assembler over it, and the `RUPU_MOCK_PROVIDER_SCRIPT` seam (callers are
 //! `#[serial]`, see `main.rs`).
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use rupu_runtime::assembly::{AssemblyContext, RunAssembler, WorkspaceBinding};
-use rupu_runtime::dispatch::{DispatchDone, DispatchEvents, DispatchedChild, SubRunStore};
-use rupu_tools::{PermissionMode, RunIdentity, SpawnPermission};
+use rupu_tools::RunIdentity;
 
 /// A one-turn answer.
 pub const DONE: &str = r#"[{ "AssistantText": { "text": "child done", "stop": "end_turn" } }]"#;
@@ -124,85 +122,11 @@ pub fn config() -> rupu_config::Config {
     }
 }
 
-/// `<runs>/<parent>/sub/<sub_id>/transcript.jsonl`, the run store's layout.
-pub struct DirSubRuns(pub PathBuf);
-
-impl SubRunStore for DirSubRuns {
-    fn create_sub_run(
-        &self,
-        parent_run_id: &str,
-        _agent: &str,
-    ) -> std::io::Result<(String, PathBuf)> {
-        let id = format!("sub_{}", ulid::Ulid::new());
-        let dir = self.0.join(parent_run_id).join("sub").join(&id);
-        std::fs::create_dir_all(&dir)?;
-        let transcript = dir.join("transcript.jsonl");
-        std::fs::File::create(&transcript)?;
-        Ok((id, transcript))
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum Seen {
-    Started(String, DispatchedChild),
-    Completed(String, DispatchDone),
-}
-
-#[derive(Default)]
-pub struct Recorder(pub Mutex<Vec<Seen>>);
-
-impl DispatchEvents for Recorder {
-    fn started(&self, parent_run_id: &str, child: &DispatchedChild) {
-        self.0
-            .lock()
-            .unwrap()
-            .push(Seen::Started(parent_run_id.into(), child.clone()));
-    }
-    fn completed(&self, parent_run_id: &str, done: &DispatchDone) {
-        self.0
-            .lock()
-            .unwrap()
-            .push(Seen::Completed(parent_run_id.into(), done.clone()));
-    }
-}
-
-/// The dispatching parent: a top-level `rupu run` named `parent`.
-pub fn parent(codename: Option<&str>) -> RunIdentity {
-    RunIdentity {
-        run_id: "parent_run_1".into(),
-        codename: codename.map(str::to_string),
-        agent: "parent".into(),
-        provider: "anthropic".into(),
-        model: "claude-sonnet-4-6".into(),
-        ..Default::default()
-    }
-}
-
-pub fn bypass() -> SpawnPermission {
-    SpawnPermission {
-        ceiling: PermissionMode::Bypass,
-        prompter: None,
-    }
-}
-
 pub fn events(path: &Path) -> Vec<rupu_transcript::Event> {
     rupu_transcript::JsonlReader::iter(path)
         .unwrap()
         .filter_map(Result::ok)
         .collect()
-}
-
-/// `(provider, model)` of a transcript's `RunStart`.
-pub fn run_start(path: &Path) -> (String, String) {
-    events(path)
-        .into_iter()
-        .find_map(|e| match e {
-            rupu_transcript::Event::RunStart {
-                provider, model, ..
-            } => Some((provider, model)),
-            _ => None,
-        })
-        .expect("a RunStart")
 }
 
 /// A catalog with nothing in it: what a site's `FsCatalog` is to the
@@ -231,5 +155,40 @@ impl rupu_tools::RunStatus for NoStatus {
     }
     fn budget(&self) -> Result<rupu_tools::ports::BudgetReport, rupu_tools::PortError> {
         Ok(rupu_tools::ports::BudgetReport::NoBudget)
+    }
+}
+
+/// A launcher that never launches: the assembly tests only check it is
+/// offered.
+pub struct NoLaunch;
+
+#[async_trait::async_trait]
+impl rupu_tools::Launcher for NoLaunch {
+    async fn check(
+        &self,
+        _req: &rupu_tools::ChildRequest,
+        _from: &rupu_tools::ToolContext,
+    ) -> Result<(), rupu_tools::LaunchError> {
+        unreachable!("never launches")
+    }
+    async fn launch(
+        &self,
+        _req: rupu_tools::ChildRequest,
+        _from: &rupu_tools::ToolContext,
+    ) -> Result<rupu_tools::ChildHandle, rupu_tools::LaunchError> {
+        unreachable!("never launches")
+    }
+    async fn join(
+        &self,
+        _from: &RunIdentity,
+        _which: rupu_tools::JoinSet,
+        _timeout: std::time::Duration,
+        _until: rupu_tools::Until,
+    ) -> Vec<rupu_tools::ChildStatus> {
+        Vec::new()
+    }
+    async fn finish(&self, _from: &RunIdentity, _how: rupu_tools::ParentEnd) {}
+    fn children(&self, _from: &RunIdentity) -> Vec<rupu_tools::ChildStatus> {
+        Vec::new()
     }
 }

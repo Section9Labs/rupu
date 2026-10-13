@@ -61,11 +61,11 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use serde_json::json;
 
-use crate::proc::{
+use crate::legacy_units::units_on_disk;
+use crate::run::{agentiflow_dir, AgentiflowRecord, EventLog};
+use rupu_launch::proc::{
     is_zombie, kill_group, leads_own_group, pid_is_running, terminate_group, terminate_pid,
 };
-use crate::run::{agentiflow_dir, AgentiflowRecord, EventLog};
-use crate::supervisor::units_on_disk;
 
 /// How long a SIGTERMed process group (a unit's, or a hard-stopped coordinator's)
 /// gets to exit before SIGKILL.
@@ -386,6 +386,16 @@ pub fn hard_stop_with(
 /// standing. One pass, bounded: neither a sweep nor a hard stop may hang on a
 /// unit that will not die.
 fn wind_down_units(run_dir: &Path, grace: Duration) {
+    // The children the flow's launcher recorded (`children.jsonl`): the
+    // coordinator that launched them is gone or being stopped, so every
+    // unfinished one is stopped and recorded `abandoned`.
+    rupu_launch::reaper::stop_children(
+        run_dir,
+        true,
+        grace,
+        "the agentiflow's coordinator stopped",
+    );
+    // Units a pre-W7 coordinator launched (`units/*/unit.json`).
     let mut signalled: Vec<u32> = Vec::new();
     for unit in units_on_disk(run_dir) {
         if unit.status.is_terminal() {

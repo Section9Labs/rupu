@@ -1073,6 +1073,48 @@ describe('RunDetail — Cycles tab', () => {
   });
 });
 
+describe('RunDetail — Children tab', () => {
+  function stubApi() {
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(GRAPH);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+  }
+
+  const CHILD = {
+    handle: 'ch_1', kind: 'agent', name: 'scanner', run_id: 'run_child', parent_run_id: 'run-1',
+    depth: 1, codename: null, address: null, status: 'done', success: true, error: null,
+    tokens: null, duration_ms: null, started_at: null, finished_at: null,
+    transcript_path: '/t/run_child.jsonl', legacy: false,
+  } as const;
+
+  it('loads the children the first time the tab opens and counts them in its label', async () => {
+    stubApi();
+    const children = vi
+      .spyOn(api, 'getRunChildren')
+      .mockResolvedValue([CHILD, { ...CHILD, handle: 'ch_2', run_id: 'run_wf', kind: 'workflow', name: 'triage' }]);
+    renderPage();
+
+    const tabBtn = await screen.findByRole('button', { name: 'Children' });
+    expect(children).not.toHaveBeenCalled();
+    fireEvent.click(tabBtn);
+
+    expect(await screen.findByRole('button', { name: 'Children (2)' })).toBeInTheDocument();
+    expect(children).toHaveBeenCalledWith('run-1', expect.any(AbortSignal));
+    expect(screen.getByTestId('children-panel')).toHaveTextContent('triage');
+  });
+
+  it('has no Children tab for a remote run', async () => {
+    stubApi();
+    const children = vi.spyOn(api, 'getRunChildren').mockResolvedValue([]);
+    renderRemotePage();
+
+    await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument());
+    expect(screen.queryByRole('button', { name: /^Children/ })).not.toBeInTheDocument();
+    expect(children).not.toHaveBeenCalled();
+  });
+});
+
 // ---- Failed / unpersisted run ---------------------------------------------
 
 // Mirrors the shape `synthesize_unpersisted_run` + `unpersisted_run_dag`

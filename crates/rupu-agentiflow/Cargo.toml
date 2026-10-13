@@ -54,6 +54,9 @@ rupu-orchestrator = { path = "../rupu-orchestrator" }
 rupu-config = { path = "../rupu-config" }
 # The lead's and the run's codenames, minted at flow start. A leaf crate.
 rupu-codename = { workspace = true }
+# The launcher the lead's `dispatch` / `join` start and watch units with
+# (W7). rupu-launch does not depend on rupu-agentiflow.
+rupu-launch = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

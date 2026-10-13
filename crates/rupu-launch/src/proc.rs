@@ -1,12 +1,12 @@
-//! Process liveness + termination for fleet units (`kill(2)` via rustix).
+//! Process liveness + termination for launched process children and the
+//! agentiflow coordinator (`kill(2)` via rustix).
 //!
-//! These mirror `rupu-orchestrator::runs::{pid_is_running, terminate_pid}`. They
-//! are kept as a small local copy so unit control stays a thin `kill(2)`
-//! wrapper in this crate; the semantics (EPERM = alive, never signal
-//! ourselves, pid 0 / out-of-range = not a process) are kept identical.
+//! These mirror `rupu-orchestrator::runs::{pid_is_running, terminate_pid}`;
+//! the semantics (EPERM = alive, never signal ourselves, pid 0 / out-of-range
+//! = not a process) are kept identical.
 
 #[cfg(not(unix))]
-compile_error!("agentiflow unit control is unix-only");
+compile_error!("process child control is unix-only");
 
 /// Convert a recorded `u32` pid into a rustix `Pid`.
 ///
@@ -45,7 +45,7 @@ pub fn pid_is_running(pid: u32) -> bool {
 /// ancestor (e.g. CI's `docker run … cargo test`). Always `false` off Linux,
 /// where the supported inits reap.
 #[cfg(target_os = "linux")]
-pub(crate) fn is_zombie(pid: u32) -> bool {
+pub fn is_zombie(pid: u32) -> bool {
     std::fs::read_to_string(format!("/proc/{pid}/stat"))
         .ok()
         .and_then(|stat| {
@@ -60,7 +60,7 @@ pub(crate) fn is_zombie(pid: u32) -> bool {
 /// Off Linux the supported inits reap, so an exited process does not linger as
 /// a zombie worth distinguishing from a vanished one.
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn is_zombie(_pid: u32) -> bool {
+pub fn is_zombie(_pid: u32) -> bool {
     false
 }
 
@@ -104,6 +104,135 @@ pub fn leads_own_group(pid: u32) -> bool {
         return false;
     };
     rustix::process::getpgid(Some(target)).is_ok_and(|pgid| pgid == target)
+}
+
+/// Whether any process is still in group `pgid` (`kill(-pgid, 0)`). A
+/// group's id is not reused as a new process's pid while it has members, so
+/// a group whose leader exited is still the one the leader made.
+pub fn group_has_members(pgid: u32) -> bool {
+    rustix_pid(pgid).is_some_and(|g| rustix::process::test_kill_process_group(g).is_ok())
+}
+
+/// The processes in group `pgid`, read from `/proc/*/stat` (each one's
+/// `pgrp`).
+#[cfg(target_os = "linux")]
+pub fn group_members(pgid: u32) -> Vec<u32> {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    dir.flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    // `pgrp`, field 5, counted after the parenthesised
+                    // command name (which may itself contain `)`).
+                    let (_, rest) = stat.rsplit_once(')')?;
+                    rest.split_whitespace().nth(5 - 3)?.parse::<u32>().ok()
+                })
+                == Some(pgid)
+        })
+        .collect()
+}
+
+/// The processes in group `pgid`, as `ps` lists them.
+#[cfg(not(target_os = "linux"))]
+pub fn group_members(pgid: u32) -> Vec<u32> {
+    let Ok(out) = std::process::Command::new("/bin/ps")
+        .args(["-A", "-o", "pid=,pgid="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut cols = line.split_whitespace().map(str::parse::<u32>);
+            match (cols.next(), cols.next()) {
+                (Some(Ok(pid)), Some(Ok(g))) if g == pgid => Some(pid),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Whether `pid`'s environment holds exactly the entry `entry`
+/// (`NAME=value`), read from `/proc/<pid>/environ`. `false` when it can't be
+/// read.
+#[cfg(target_os = "linux")]
+pub fn carries_env(pid: u32, entry: &str) -> bool {
+    std::fs::read(format!("/proc/{pid}/environ"))
+        .is_ok_and(|env| env.split(|b| *b == 0).any(|e| e == entry.as_bytes()))
+}
+
+/// Whether `pid`'s environment holds exactly the entry `entry`
+/// (`NAME=value`), as `ps -E` shows it (after the command's arguments). The
+/// kernel hides the environment of Apple's own binaries (`/bin/sh`,
+/// `/bin/sleep`, …) from other processes, so for those this is `false`.
+#[cfg(not(target_os = "linux"))]
+pub fn carries_env(pid: u32, entry: &str) -> bool {
+    std::process::Command::new("/bin/ps")
+        .args(["-wwE", "-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .is_ok_and(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .split_whitespace()
+                .any(|t| t == entry)
+        })
+}
+
+/// Whether any process in group `pgid` carries `entry` in its environment
+/// ([`carries_env`]): what ties a group whose leader is gone to the child
+/// that made it.
+pub fn group_carries_env(pgid: u32, entry: &str) -> bool {
+    group_members(pgid)
+        .into_iter()
+        .any(|pid| carries_env(pid, entry))
+}
+
+/// When `pid` started, as the platform tells it: a process that later reuses
+/// the pid has a different one. Comparable only on this host. `None` when
+/// there is no such process (or the platform gives no start time).
+#[cfg(target_os = "linux")]
+pub fn start_stamp(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `starttime`, field 22, counted after the parenthesised command name
+    // (which may itself contain `)`): field 3 is the first after it.
+    let (_, rest) = stat.rsplit_once(')')?;
+    rest.split_whitespace().nth(22 - 3)?.parse().ok()
+}
+
+#[cfg(target_os = "macos")]
+pub fn start_stamp(pid: u32) -> Option<u64> {
+    use libproc::bsd_info::BSDInfo;
+    let info = libproc::proc_pid::pidinfo::<BSDInfo>(i32::try_from(pid).ok()?, 0).ok()?;
+    info.pbi_start_tvsec
+        .checked_mul(1_000_000)?
+        .checked_add(info.pbi_start_tvusec)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn start_stamp(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// This process's own [`start_stamp`], read once.
+pub fn own_start_stamp() -> Option<u64> {
+    static STAMP: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *STAMP.get_or_init(|| start_stamp(std::process::id()))
+}
+
+/// Whether `pid` is still the process whose start was `recorded`: a pid
+/// recorded with no start time can't be told apart, so it passes.
+pub fn same_process(pid: u32, recorded: Option<u64>) -> bool {
+    recorded.is_none_or(|r| start_stamp(pid) == Some(r))
+}
+
+/// Whether the process `pid`, recorded with start time `recorded`, is still
+/// running: alive, not a zombie, and not a later process that reused the pid.
+pub fn process_alive(pid: u32, recorded: Option<u64>) -> bool {
+    pid_is_running(pid) && !is_zombie(pid) && same_process(pid, recorded)
 }
 
 /// A process-group id as a rustix `Pid`, or `None` when signalling it could
@@ -210,6 +339,17 @@ mod tests {
         assert!(!leads_own_group(leader.id()));
         assert!(!leads_own_group(0));
         assert!(!leads_own_group(u32::MAX));
+    }
+
+    #[test]
+    fn a_start_stamp_names_one_process() {
+        let me = start_stamp(std::process::id()).expect("this platform gives start times");
+        assert_eq!(own_start_stamp(), Some(me));
+        assert!(same_process(std::process::id(), Some(me)));
+        assert!(!same_process(std::process::id(), Some(me + 1)));
+        assert!(same_process(std::process::id(), None));
+        assert_eq!(start_stamp(0x7fff_fffe), None);
+        assert!(!process_alive(0x7fff_fffe, None));
     }
 
     #[test]

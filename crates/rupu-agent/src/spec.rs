@@ -134,6 +134,10 @@ struct Frontmatter {
     /// `docs/superpowers/specs/2026-05-08-rupu-sub-agent-dispatch-design.md`.
     #[serde(default, rename = "dispatchableAgents")]
     dispatchable_agents: Option<Vec<String>>,
+    /// Per-agent allowlist of workflows this agent can start with
+    /// `dispatch {kind: workflow}`.
+    #[serde(default, rename = "dispatchableWorkflows")]
+    dispatchable_workflows: Option<Vec<String>>,
     /// Coverage concerns block. When present, the runner flattens the
     /// catalog, writes a snapshot to `.rupu/coverage/<target>/catalog.yaml`,
     /// injects the 4 coverage tools, and prepends the catalog to the
@@ -203,9 +207,12 @@ pub struct AgentSpec {
     /// Reasoning display hint (`thinking.display`). See the `thinkingDisplay`
     /// frontmatter field.
     pub thinking_display: Option<ThinkingDisplay>,
-    /// Per-agent allowlist of children this agent can dispatch via
-    /// `dispatch_agent` / `dispatch_agents_parallel`.
+    /// Per-agent allowlist of the agents this agent can start with
+    /// `dispatch` (any kind but `workflow`).
     pub dispatchable_agents: Option<Vec<String>>,
+    /// Per-agent allowlist of the workflows this agent can start with
+    /// `dispatch {kind: workflow}`.
+    pub dispatchable_workflows: Option<Vec<String>>,
     /// Coverage concerns block parsed from `concerns:` frontmatter.
     pub concerns: Option<ConcernsBlock>,
     /// Optional agent pin for the per-request output-token cap, overriding the
@@ -272,6 +279,7 @@ impl AgentSpec {
             anthropic_speed: fm.anthropic_speed,
             thinking_display: fm.thinking_display,
             dispatchable_agents: fm.dispatchable_agents,
+            dispatchable_workflows: fm.dispatchable_workflows,
             concerns: fm.concerns,
             max_tokens: fm.max_tokens,
             context_window_tokens: fm.context_window_tokens,

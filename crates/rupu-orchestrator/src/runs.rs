@@ -1094,6 +1094,15 @@ pub fn known_transcript_from_event_line(line: &str) -> Option<KnownTranscript> {
     if !matches!(ty, "step_working" | "unit_started" | "dispatch_started") {
         return None;
     }
+    // A process child (`agent` / `workflow`, W7) is charged to the root's
+    // ledger by rows that name its transcripts; only an in-process sub-agent
+    // is known by its event alone. (A stopped process child may never have
+    // written a transcript at all.)
+    if ty == "dispatch_started"
+        && v.get("kind").and_then(|k| k.as_str()).unwrap_or("subagent") != "subagent"
+    {
+        return None;
+    }
     let path = PathBuf::from(v.get("transcript_path")?.as_str()?);
     let step = if ty == "dispatch_started" {
         None
@@ -1197,7 +1206,7 @@ pub struct RunStore {
 }
 
 /// Defensive ceiling on [`RunStore::sub_run_ids_recursive`]'s descent,
-/// independent of `rupu-tools::dispatch_agent::MAX_DEPTH` (currently 5,
+/// independent of `rupu-tools::MAX_LAUNCH_DEPTH` (currently 5,
 /// the real ceiling on how deep an actual dispatch tree can ever grow —
 /// this crate has no dependency on `rupu-tools` and must not gain one
 /// just for a constant). This exists purely so a hand-edited or
@@ -1399,6 +1408,49 @@ impl RunStore {
         Ok((sub_run_id, transcript))
     }
 
+    /// Record that the run `run_id` is a process child of another run
+    /// (`<runs>/<run_id>/launch.json`), so a resume keeps its depth,
+    /// ceiling, caps and usage root (W7 D18).
+    pub fn write_launch_link(
+        &self,
+        run_id: &str,
+        link: &rupu_runtime::argv::LaunchLink,
+    ) -> Result<(), RunStoreError> {
+        let dir = self.run_dir(run_id);
+        std::fs::create_dir_all(&dir)?;
+        let bytes = serde_json::to_vec_pretty(link).map_err(std::io::Error::other)?;
+        std::fs::write(dir.join("launch.json"), bytes)?;
+        Ok(())
+    }
+
+    /// The link [`Self::write_launch_link`] recorded for `run_id`; `None` for
+    /// a run nobody launched.
+    pub fn read_launch_link(&self, run_id: &str) -> Option<rupu_runtime::argv::LaunchLink> {
+        let bytes = std::fs::read(self.run_dir(run_id).join("launch.json")).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    /// The transcript of the sub-run `sub_run_id`, under whichever run
+    /// dispatched it (`<runs>/<parent>/sub/<sub_run_id>/transcript.jsonl`):
+    /// what `rupu run --continue <sub_…>` continues (W7, L13). `None` for an
+    /// id that is not a plain `sub_` id or that no run holds.
+    pub fn find_sub_run(&self, sub_run_id: &str) -> Option<PathBuf> {
+        let plain = sub_run_id.starts_with("sub_")
+            && sub_run_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        if !plain {
+            return None;
+        }
+        std::fs::read_dir(&self.root)
+            .ok()?
+            .filter_map(Result::ok)
+            .map(|parent| {
+                self.sub_run_transcript(&parent.file_name().to_string_lossy(), sub_run_id)
+            })
+            .find(|t| t.is_file())
+    }
+
     /// Immediate sub-run ids of `run_id` — one directory-listing level of
     /// `<runs>/<run_id>/sub/`, the exact directory [`Self::create_sub_run`]
     /// writes into (see [`Self::sub_run_dir`]). This is the public
@@ -1479,7 +1531,7 @@ impl RunStore {
 
     /// Every sub-run id reachable from `run_id`, at any depth: a
     /// dispatched sub-agent can itself dispatch sub-agents (up to
-    /// `rupu-tools::dispatch_agent::MAX_DEPTH`, currently 5 — this crate
+    /// `rupu-tools::MAX_LAUNCH_DEPTH`, currently 5 — this crate
     /// has no dependency on `rupu-tools` and must not gain one just to
     /// reference that constant, so [`MAX_SUB_RUN_RECURSION_DEPTH`] below
     /// is deliberately its own, more generous, backstop rather than a
@@ -3914,7 +3966,8 @@ impl RunStore {
         // Called by both `cp serve`'s gate sweep and an operator's `workflow
         // resume`, so the reason names neither.
         let error = format!("runner process {pid} is no longer alive; run marked failed");
-        self.finalize_failed(&mut current, error, now)?;
+        let cause = rupu_transcript::StopCause::RunnerDied.record();
+        self.finalize_failed(&mut current, error, Some(cause), now)?;
         *record = current;
         Ok(true)
     }
@@ -3945,24 +3998,27 @@ impl RunStore {
         {
             return Ok(false);
         }
-        self.finalize_failed(&mut current, error.to_string(), now)?;
+        self.finalize_failed(&mut current, error.to_string(), None, now)?;
         Ok(true)
     }
 
     /// The `Failed` transition [`reap_if_orphaned`](Self::reap_if_orphaned)
     /// and [`fail_in_flight`](Self::fail_in_flight) make for a runner that
-    /// is gone: status, finish time, error, no runner and no active step,
-    /// written, then the terminal `RunFailed` event watchers end on. The
-    /// caller holds the run lock and decided on `current` as it is on disk.
+    /// is gone: status, finish time, error and its typed cause, no runner
+    /// and no active step, written, then the terminal `RunFailed` event
+    /// watchers end on. The caller holds the run lock and decided on
+    /// `current` as it is on disk.
     fn finalize_failed(
         &self,
         current: &mut RunRecord,
         error: String,
+        cause: Option<rupu_transcript::OutcomeRecord>,
         now: DateTime<Utc>,
     ) -> Result<(), RunStoreError> {
         current.status = RunStatus::Failed;
         current.finished_at = Some(now);
         current.error_message = Some(error.clone());
+        current.cause = cause;
         current.runner_pid = None;
         current.active_step_id = None;
         current.active_step_kind = None;
@@ -4363,21 +4419,33 @@ fn transcript_codename(path: &Path) -> Option<String> {
     }
 }
 
-/// The run store allocates in-process children's sub-runs for the run
-/// assembler's dispatcher (`<runs>/<parent>/sub/<sub_run_id>/`).
-impl rupu_runtime::dispatch::SubRunStore for RunStore {
-    fn create_sub_run(
-        &self,
-        parent_run_id: &str,
-        agent: &str,
-    ) -> std::io::Result<(String, PathBuf)> {
-        RunStore::create_sub_run(self, parent_run_id, agent).map_err(std::io::Error::other)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W7: a process child's `dispatch_started` names no transcript the
+    /// usage fold should find (the root's ledger rows do); a sub-agent's
+    /// still does, and an event from before `kind` existed is a sub-agent.
+    #[test]
+    fn only_a_subagents_dispatch_started_is_a_known_transcript() {
+        let line = |kind: Option<&str>| {
+            let mut v = serde_json::json!({
+                "type": "dispatch_started",
+                "run_id": "r",
+                "sub_run_id": "c",
+                "agent": "a",
+                "transcript_path": "/t/c.jsonl",
+            });
+            if let Some(k) = kind {
+                v["kind"] = serde_json::json!(k);
+            }
+            v.to_string()
+        };
+        assert!(known_transcript_from_event_line(&line(None)).is_some());
+        assert!(known_transcript_from_event_line(&line(Some("subagent"))).is_some());
+        assert!(known_transcript_from_event_line(&line(Some("agent"))).is_none());
+        assert!(known_transcript_from_event_line(&line(Some("workflow"))).is_none());
+    }
     use chrono::Utc;
     use rupu_runtime::{
         ArtifactKind, ArtifactManifest, ArtifactRef, ExecutionRequest, RepoBinding, RunContext,
@@ -4796,6 +4864,7 @@ mod tests {
             &OrchEvent::DispatchStarted {
                 run_id: rec.id.clone(),
                 sub_run_id: "sub_Z".into(),
+                kind: "subagent".into(),
                 agent: Some("lynx".into()),
                 transcript_path: PathBuf::from("/x/sub_Z.jsonl"),
                 codename: Some("jade-reef/heron>lynx#1>ferret#2".into()),
@@ -8047,6 +8116,14 @@ mod tests {
         // `workflow resume`; the reason must not name either actor.
         assert!(err.contains("no longer alive"), "error: {err}");
         assert!(!err.contains("gate sweep"), "error names an actor: {err}");
+        assert_eq!(
+            reloaded
+                .cause
+                .as_ref()
+                .and_then(rupu_transcript::StopCause::of),
+            Some(rupu_transcript::StopCause::RunnerDied),
+            "a dead runner is no failure of the run's own"
+        );
         assert!(reloaded.runner_pid.is_none());
         assert!(reloaded.active_step_id.is_none());
         assert!(reloaded.active_step_agent.is_none());
@@ -8143,6 +8220,10 @@ mod tests {
         assert_eq!(
             failed.error_message.as_deref(),
             Some("workflow runner panicked: boom")
+        );
+        assert_eq!(
+            failed.cause, None,
+            "a panicked runner is the run's own failure"
         );
         assert!(failed.runner_pid.is_none());
         assert!(failed.active_step_id.is_none());

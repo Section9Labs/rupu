@@ -49,7 +49,7 @@ pub use pricing_config::{ModelPricing, PricingConfig};
 pub use provider_config::{CustomModel, ProviderConfig};
 pub use recovery_config::{FallbackEntry, RecoveryConfig};
 pub use resolve::{resolve, KeyProvenance, KeySource, LockOwner, Resolved};
-pub use runtime_config::RuntimeConfig;
+pub use runtime_config::{DispatchConfig, RuntimeConfig};
 pub use scm_config::{
     IssuesDefault, IssuesSection, ScmDefault, ScmPlatformConfig, ScmRule, ScmSection,
 };

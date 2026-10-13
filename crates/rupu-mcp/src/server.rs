@@ -47,6 +47,7 @@ impl<T: Transport + 'static> CatalogServer<T> {
         let grant = ToolCatalog::builtin().resolve_grant(GrantInputs {
             declared: Some(tools.unwrap_or(&default)),
             step_actions: &[],
+            connector_cap: None,
             ambient: &[],
             available: &ctx.services.provided(false),
             alias_scope: AliasScope::Everywhere,

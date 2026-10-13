@@ -1,19 +1,15 @@
 //! The tool catalog: the descriptor of every tool rupu defines. Every tool
-//! but the agentiflow launch tools carries its descriptor next to its body
-//! in this crate ([`crate::bodies`] builds the bodies); the launch tools
-//! (bodies in `rupu-agentiflow` until W7) carry theirs in [`flow`].
+//! carries its descriptor next to its body in this crate ([`crate::bodies`]
+//! builds the bodies).
 //!
 //! A [`ToolCatalog`] value is this static list plus extra descriptors
 //! ([`ToolCatalog::with`]): a run's injected tools. Grant resolution
 //! ([`crate::grant`]) runs over a value.
 
-pub mod flow;
-
 use crate::descriptor::ToolDescriptor;
 
 /// The unqualified core fs/shell tools (D11). Every other tool is
-/// `namespace.verb`, apart from the legacy-named dispatch tools W7 folds into
-/// `dispatch`.
+/// `namespace.verb`, apart from the launch pair `dispatch` / `join`.
 pub const CORE_NAMES: &[&str] = &[
     "bash",
     "read_file",
@@ -34,9 +30,10 @@ pub static ALL: &[&ToolDescriptor] = &[
     &crate::grep::DESCRIPTOR,
     &crate::glob::DESCRIPTOR,
     &crate::ast_grep::DESCRIPTOR,
-    // sub-agent dispatch (W7 folds these into `dispatch`)
-    &crate::dispatch_agent::DESCRIPTOR,
-    &crate::dispatch_agents_parallel::DESCRIPTOR,
+    // child runs
+    &crate::launch::dispatch::DESCRIPTOR,
+    &crate::launch::join::DESCRIPTOR,
+    &crate::launch::generate::DESCRIPTOR,
     // coverage ledger
     &crate::coverage::MARK,
     &crate::coverage::STATUS,
@@ -88,11 +85,6 @@ pub static ALL: &[&ToolDescriptor] = &[
     &crate::budget::STATUS,
     // a run's skills
     &crate::skills::LOAD,
-    // agentiflow launch tools (W7 folds these into `dispatch` / `join`)
-    &flow::DISPATCH,
-    &flow::RUN_WORKFLOW,
-    &flow::WORKFLOWS_GENERATE,
-    &flow::JOIN,
 ];
 
 /// The catalog's queries. The associated functions ([`Self::all`],

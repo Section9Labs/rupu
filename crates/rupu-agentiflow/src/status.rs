@@ -318,8 +318,6 @@ fn goal_detail(goal: &Goal, paths: &CoveragePaths, scored: &str) -> String {
 mod tests {
     use super::*;
     use crate::def::{AssetSelector, FindingSelector, GoalTarget};
-    use crate::supervisor::FleetSupervisor;
-    use crate::unit::{MockUnitLauncher, UnitKind, UnitSpec, UnitStatus};
     use crate::usage::LedgerUsageSource;
     use crate::verify_fixtures::full_finding;
     use chrono::Utc;
@@ -393,11 +391,9 @@ mod tests {
     struct Fx {
         _tmp: tempfile::TempDir,
         paths: CoveragePaths,
-        /// `<global>`: a launched unit's ledger is `<global>/runs/<id>/usage.jsonl`.
-        global: PathBuf,
-        /// The lead's ledger, `<run dir>/usage.jsonl`.
+        /// The flow's ledger, `<run dir>/usage.jsonl`: the lead's spend and
+        /// every unit's.
         lead_usage: PathBuf,
-        sup: Arc<FleetSupervisor>,
         /// The round the lead is in, as `run_agentiflow` publishes it.
         round: Arc<AtomicU32>,
         /// Seconds past [`t0`] the injected clock reads.
@@ -408,20 +404,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let paths = CoveragePaths::new(&tmp.path().join("ws"), "pooled");
         paths.ensure_dir().unwrap();
-        let global = tmp.path().join("global");
         let run_dir = tmp.path().join("af_run");
-        std::fs::create_dir_all(&global).unwrap();
         std::fs::create_dir_all(&run_dir).unwrap();
-        let sup = Arc::new(FleetSupervisor::new(
-            Arc::new(MockUnitLauncher::scripted(vec![UnitStatus::Running])),
-            run_dir.clone(),
-        ));
         Fx {
             _tmp: tmp,
             paths,
-            global,
             lead_usage: run_dir.join("usage.jsonl"),
-            sup,
             round: Arc::new(AtomicU32::new(0)),
             clock: Arc::new(AtomicI64::new(0)),
         }
@@ -461,6 +449,7 @@ mod tests {
             output_tokens: output,
             cached_tokens: 0,
             cache_write_tokens: 0,
+            rollup: false,
         }
     }
 
@@ -481,33 +470,19 @@ mod tests {
             append_row(&self.lead_usage, &ledger_row(id, input, output));
         }
 
-        /// Launch a unit through the supervisor and have it spend `input` tokens.
-        fn unit_spends(&self, participant: &str, id: &str, input: u64) {
-            let unit = self
-                .sup
-                .dispatch(UnitSpec {
-                    agent: "recon".into(),
-                    prompt: "scan".into(),
-                    engagement: vec![],
-                    participant: participant.into(),
-                    kind: UnitKind::Agent,
-                    inputs: vec![],
-                    workflow_file: None,
-                })
-                .unwrap();
-            let dir = self.global.join("runs").join(unit);
-            std::fs::create_dir_all(&dir).unwrap();
-            append_row(&dir.join("usage.jsonl"), &ledger_row(id, input, 0));
+        /// A unit spent `input` tokens, copied to the flow's ledger as a
+        /// rollup row (as `--usage-root` copies it).
+        fn unit_spends(&self, _participant: &str, id: &str, input: u64) {
+            let row = LedgerRow {
+                rollup: true,
+                ..ledger_row(id, input, 0)
+            };
+            append_row(&self.lead_usage, &row);
         }
 
         /// The ledger-backed meter `run_agentiflow` hands the envelope.
         fn source(&self) -> Arc<LedgerUsageSource> {
-            Arc::new(LedgerUsageSource::new(
-                self.lead_usage.clone(),
-                self.sup.clone(),
-                self.global.clone(),
-                pricing(),
-            ))
+            Arc::new(LedgerUsageSource::new(self.lead_usage.clone(), pricing()))
         }
 
         fn at(&self, round: u32, secs_after_start: i64) {

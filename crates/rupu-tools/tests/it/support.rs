@@ -177,3 +177,148 @@ pub fn resolved(global: &Path, grants: &[&str]) -> Arc<rupu_skills::ResolvedSkil
         .unwrap(),
     )
 }
+
+/// A [`rupu_tools::Launcher`] whose children are scripted: every launch is
+/// recorded and gets the next handle; `join` answers each handle with the
+/// status the test scripted for its name (`Done` with `"<name> done"` when
+/// none was), and `check` refuses the names in `refuse`.
+#[derive(Default)]
+pub struct ScriptedLauncher {
+    pub launched: std::sync::Mutex<Vec<rupu_tools::ChildRequest>>,
+    pub statuses: std::collections::BTreeMap<String, rupu_tools::ChildStatus>,
+    pub refuse: Vec<String>,
+    pub address: Option<String>,
+}
+
+impl ScriptedLauncher {
+    /// A finished child of `name`, as a sub-agent run reports it.
+    pub fn done(name: &str, output: &str, success: bool) -> rupu_tools::ChildStatus {
+        rupu_tools::ChildStatus {
+            handle: String::new(),
+            kind: rupu_tools::ChildKind::Subagent,
+            name: name.into(),
+            run_id: "sub_01GOLDEN".into(),
+            codename: Some("cobalt-harbor/heron#1>lynx#1".into()),
+            address: None,
+            transcript: Some("/runs/run_P/sub/sub_01GOLDEN/transcript.jsonl".into()),
+            state: rupu_tools::ChildState::Done,
+            success: Some(success),
+            output: Some(output.into()),
+            error: (!success).then(|| "refused · no fallback left".to_string()),
+            cause: None,
+            tokens: Some(rupu_tools::ChildTokens {
+                input: 40,
+                output: 2,
+            }),
+            duration_ms: Some(7),
+            elapsed: std::time::Duration::ZERO,
+        }
+    }
+
+    fn handle_of(i: usize) -> String {
+        format!("ch_{i}")
+    }
+
+    fn name_of(req: &rupu_tools::ChildRequest) -> String {
+        req.target.label()
+    }
+}
+
+#[async_trait::async_trait]
+impl rupu_tools::Launcher for ScriptedLauncher {
+    async fn check(
+        &self,
+        req: &rupu_tools::ChildRequest,
+        _from: &ToolContext,
+    ) -> Result<(), rupu_tools::LaunchError> {
+        let name = Self::name_of(req);
+        if self.refuse.contains(&name) {
+            return Err(rupu_tools::LaunchError::new(
+                "agent_not_dispatchable",
+                format!("`{name}` is not dispatchable"),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn launch(
+        &self,
+        req: rupu_tools::ChildRequest,
+        from: &ToolContext,
+    ) -> Result<rupu_tools::ChildHandle, rupu_tools::LaunchError> {
+        self.check(&req, from).await?;
+        let mut launched = self.launched.lock().unwrap();
+        launched.push(req.clone());
+        Ok(rupu_tools::ChildHandle {
+            handle: Self::handle_of(launched.len() - 1),
+            kind: req.kind,
+            name: Self::name_of(&req),
+            run_id: format!("run_{}", launched.len()),
+            codename: None,
+            address: self.address.clone(),
+            transcript: None,
+        })
+    }
+
+    async fn join(
+        &self,
+        _from: &rupu_tools::RunIdentity,
+        which: rupu_tools::JoinSet,
+        _timeout: std::time::Duration,
+        _until: rupu_tools::Until,
+    ) -> Vec<rupu_tools::ChildStatus> {
+        let launched = self.launched.lock().unwrap().clone();
+        let handles: Vec<String> = match which {
+            rupu_tools::JoinSet::All => (0..launched.len()).map(Self::handle_of).collect(),
+            rupu_tools::JoinSet::Handles(h) => h,
+        };
+        handles
+            .into_iter()
+            .map(|h| {
+                let i: usize = h.trim_start_matches("ch_").parse().unwrap_or(usize::MAX);
+                let Some(req) = launched.get(i) else {
+                    return rupu_tools::ChildStatus {
+                        handle: h,
+                        state: rupu_tools::ChildState::Failed,
+                        error: Some("unknown handle".into()),
+                        ..Self::done("?", "", false)
+                    };
+                };
+                let name = Self::name_of(req);
+                let mut s = self
+                    .statuses
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_else(|| Self::done(&name, &format!("{name} done"), true));
+                s.handle = h;
+                s.kind = req.kind;
+                s
+            })
+            .collect()
+    }
+
+    async fn finish(&self, _from: &rupu_tools::RunIdentity, _how: rupu_tools::ParentEnd) {}
+
+    fn children(&self, _from: &rupu_tools::RunIdentity) -> Vec<rupu_tools::ChildStatus> {
+        Vec::new()
+    }
+}
+
+/// A [`rupu_tools::WorkflowGenerator`] that "saves" one fixed workflow.
+pub struct StubGenerator;
+
+#[async_trait::async_trait]
+impl rupu_tools::WorkflowGenerator for StubGenerator {
+    async fn generate(
+        &self,
+        _description: &str,
+        _from: &ToolContext,
+    ) -> Result<rupu_tools::GeneratedWorkflow, rupu_tools::LaunchError> {
+        Ok(rupu_tools::GeneratedWorkflow {
+            file: "/runs/run_P/generated/triage-01.yaml".into(),
+            name: "triage".into(),
+            steps: 2,
+            input_keys: vec!["target".into()],
+        })
+    }
+}

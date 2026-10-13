@@ -1,0 +1,12 @@
+name: dispatch-kinds
+description: >
+  Smoke-test W7 dispatch kinds — the `dispatch-kinds` step starts
+  `dispatch-echo` as a sub-agent and as an agent process and joins both.
+  The CP run detail's Children tab should list both children.
+steps:
+  - id: kinds
+    agent: dispatch-kinds
+    actions: []
+    prompt: |
+      Run the dispatch kinds smoke test: one sub-agent and one agent child of
+      `dispatch-echo`, join both, report each one.

@@ -846,6 +846,15 @@ impl RunError {
         }
     }
 
+    /// The typed cause a record of this failure carries: its outcome, or
+    /// the signal stop for a run ended by SIGTERM.
+    pub fn cause(&self) -> Option<rupu_transcript::OutcomeRecord> {
+        match self {
+            RunError::Terminating => Some(rupu_transcript::StopCause::StoppedBySignal.record()),
+            other => other.outcome().cloned(),
+        }
+    }
+
     /// The rung-3 hint behind this failure, when the ladder ran out on it.
     pub fn hint(&self) -> Option<&str> {
         match self {
@@ -992,8 +1001,9 @@ pub fn record_unstarted_run(
 }
 
 /// The run's exit once SIGTERM has arrived: close the transcript as
-/// `Aborted` (saying why) and hand back [`RunError::Terminating`] — or the
-/// transcript error, if even that could not be written.
+/// `Aborted` (saying why, with the stop as its typed cause) and hand back
+/// [`RunError::Terminating`] — or the transcript error, if even that could
+/// not be written.
 fn terminated(
     writer: &mut JsonlWriter,
     run_id: &str,
@@ -1007,7 +1017,7 @@ fn terminated(
             total_tokens,
             duration_ms: started.elapsed().as_millis() as u64,
             error: Some("terminating (SIGTERM)".into()),
-            outcome: None,
+            outcome: Some(rupu_transcript::StopCause::StoppedBySignal.record()),
         })
         .and_then(|_| writer.flush());
     match closed {
@@ -1707,12 +1717,6 @@ pub struct AgentRunOpts {
     /// Pre-turn collectors (spec §8). Empty = no injection. Run off the
     /// async runtime via spawn_blocking.
     pub collectors: Vec<std::sync::Arc<dyn crate::collector::TurnCollector>>,
-    /// Pre-built, run-scoped tools injected into this run: an ambient grant
-    /// with reason `origin:injected` (already in `grant`), audited like any
-    /// tool; the `PermissionPolicy` still gates each call. Empty for
-    /// ordinary runs; an agentiflow lead's launch tools (`dispatch`, `join`,
-    /// `run_workflow`, `workflows.generate`) ride it until W7 replaces them.
-    pub extra_tools: Vec<std::sync::Arc<dyn rupu_tools::Tool>>,
     pub transcript_path: PathBuf,
 }
 
@@ -1746,7 +1750,6 @@ struct Run {
     hooks: Hooks,
     pause: Option<tokio_util::sync::CancellationToken>,
     collectors: Vec<std::sync::Arc<dyn crate::collector::TurnCollector>>,
-    extra_tools: Vec<std::sync::Arc<dyn rupu_tools::Tool>>,
     transcript_path: PathBuf,
     /// The skills whose bodies the model was given, most recently loaded
     /// last, one entry per name.
@@ -1779,7 +1782,6 @@ impl Run {
             hooks,
             pause,
             collectors,
-            extra_tools,
             transcript_path,
         } = opts;
         // A child run a tool call starts asks the run's own operator.
@@ -1806,7 +1808,6 @@ impl Run {
             hooks,
             pause,
             collectors,
-            extra_tools,
             transcript_path,
             loaded_skills,
         }
@@ -2009,6 +2010,19 @@ pub async fn run_agent_full(opts: AgentRunOpts) -> RunExit {
     let mut opts = Run::new(opts);
     let mut messages: Vec<Message> = Vec::new();
     let result = run_agent_inner(&mut opts, &mut messages).await;
+    // The children it never joined are stopped (W7 §3.6), however the run
+    // ended: recorded `interrupted` when it paused or its process is being
+    // stopped by a signal (whoever continues it continues them), else
+    // `abandoned`.
+    if let Some(launcher) = opts.tool_context.services.launcher.clone() {
+        let how = match &result {
+            _ if rupu_providers::credential_writes::terminating() => rupu_tools::ParentEnd::Paused,
+            Ok(r) if r.paused => rupu_tools::ParentEnd::Paused,
+            Ok(r) if r.terminal_error().is_none() => rupu_tools::ParentEnd::Completed,
+            _ => rupu_tools::ParentEnd::Failed,
+        };
+        launcher.finish(&opts.id, how).await;
+    }
     RunExit {
         result,
         final_limits: opts.limits.clone(),
@@ -2127,19 +2141,12 @@ async fn run_agent_inner(
             .map_err(|e| RunError::Coverage(format!("ensure findings dir: {e}")))?;
     }
 
-    // The run's tool registry: one loop over the grant. Each entry takes its
-    // body from an injected tool or the catalog (`rupu_tools::bodies`); the
-    // agentiflow launch tools reach a run only injected until W7.
+    // The run's tool registry: one loop over the grant, each body from the
+    // catalog (`rupu_tools::bodies`).
     let mut registry = ToolRegistry::with_alias_scope(opts.alias_scope);
     for entry in grant.entries.values() {
         let name = entry.canonical;
-        let body: Option<Arc<dyn Tool>> = opts
-            .extra_tools
-            .iter()
-            .find(|t| t.name() == name)
-            .cloned()
-            .or_else(|| rupu_tools::bodies::body(name, &opts.tool_context));
-        match body {
+        match rupu_tools::bodies::body(name, &opts.tool_context) {
             Some(t) => registry.insert(t),
             None => {
                 // The grant offered a tool whose services this run
@@ -3196,6 +3203,7 @@ async fn run_agent_inner(
                 call_ctx.call = rupu_tools::CallContext {
                     tool_call_id: Some(call_id.clone()),
                     spawn_ceiling,
+                    called_as: Some(tool_name.clone()),
                 };
                 let invoke_result = tool.invoke(input.clone(), &call_ctx).await;
                 let blocked = matches!(invoke_result, Err(rupu_tools::ToolError::PermissionDenied));
@@ -3904,7 +3912,6 @@ mod on_tool_call_tests {
                 },
                 pause: None,
                 collectors: Vec::new(),
-                extra_tools: Vec::new(),
                 transcript_path,
             },
             None,
@@ -4037,7 +4044,6 @@ mod on_tool_call_tests {
                 hooks: Default::default(),
                 pause: None,
                 collectors: Vec::new(),
-                extra_tools: Vec::new(),
                 transcript_path,
             },
             None,
@@ -4059,133 +4065,6 @@ mod on_tool_call_tests {
         assert_eq!(l.finished_runs, vec!["run_netcap".to_string()]);
     }
 
-    #[tokio::test]
-    async fn extra_tools_are_registered_and_bypass_the_agent_tools_filter() {
-        // A trivial always-on tool.
-        struct Ping;
-        fn ping_schema() -> serde_json::Value {
-            serde_json::json!({"type":"object","properties":{}})
-        }
-        static PING: rupu_tools::ToolDescriptor = rupu_tools::ToolDescriptor {
-            name: "ping",
-            aliases: &[],
-            effect: rupu_tools::Effect::Read,
-            needs: &[],
-            uses: &[],
-            wildcard: true,
-            description: "returns pong",
-            input_schema: ping_schema,
-        };
-        #[async_trait::async_trait]
-        impl rupu_tools::Tool for Ping {
-            fn descriptor(&self) -> &'static rupu_tools::ToolDescriptor {
-                &PING
-            }
-            async fn invoke(
-                &self,
-                _input: serde_json::Value,
-                _ctx: &rupu_tools::ToolContext,
-            ) -> Result<rupu_tools::ToolOutput, rupu_tools::ToolError> {
-                Ok(rupu_tools::ToolOutput {
-                    stdout: "pong".into(),
-                    error: None,
-                    duration_ms: 0,
-                    derived: None,
-                    structured: None,
-                })
-            }
-        }
-
-        let tmp_dir = tempfile::tempdir().expect("tmpdir");
-        let transcript_path = tmp_dir.path().join("run_test_extra_tools.jsonl");
-
-        // turn 1: call ping; turn 2: stop.
-        let provider = MockProvider::new(vec![
-            ScriptedTurn::AssistantToolUse {
-                text: None,
-                tool_id: "call_ping_1".into(),
-                tool_name: "ping".into(),
-                tool_input: serde_json::json!({}),
-                stop: StopReason::ToolUse,
-            },
-            ScriptedTurn::AssistantText {
-                text: "done".into(),
-                stop: StopReason::EndTurn,
-                input_tokens: 1,
-                output_tokens: 1,
-            },
-        ]);
-
-        let opts = crate::grant::with_grant(
-            AgentRunOpts {
-                system_prompt: "test".into(),
-                prompt: crate::UserTurn::new("test prompt"),
-                provider: Box::new(provider),
-                limits: rupu_providers::model_limits::ModelLimits::unknown(),
-                recovery: Default::default(),
-                permission: rupu_tools::PermissionPolicy::bypass(),
-                grant: Default::default(),
-                alias_scope: Default::default(),
-                tool_context: {
-                    let mut tc = rupu_tools::ToolContext::in_workspace(tmp_dir.path());
-                    tc.identity = std::sync::Arc::new(rupu_tools::RunIdentity {
-                        agent: "test-agent".into(),
-                        provider: "mock".into(),
-                        model: "mock-1".into(),
-                        run_id: "run_test_extra_tools".into(),
-                        step_id: Some("s1".into()),
-                        ..Default::default()
-                    });
-                    tc.workspace.id = "ws_test".into();
-                    tc.workspace.path = tmp_dir.path().to_path_buf();
-                    tc
-                },
-                pins: Default::default(),
-                concerns: None,
-                max_turns: 5,
-                stream: crate::StreamOpts {
-                    no_stream: true,
-                    suppress_stdout: false,
-                    on_stream_event: None,
-                },
-                hooks: Default::default(),
-                pause: None,
-                collectors: Vec::new(),
-                extra_tools: vec![Arc::new(Ping)],
-                transcript_path,
-            },
-            (Some(vec![])).as_deref(),
-            &Vec::new(),
-        )
-        .expect("grant");
-
-        let exit = run_agent_full(opts).await;
-        let run = exit.result.expect("run ok");
-        let saw_pong = run.final_messages.iter().any(|m| {
-            m.content.iter().any(|b| {
-                matches!(
-                    b,
-                    rupu_providers::types::ContentBlock::ToolResult { content, is_error: false, .. }
-                        if content.contains("pong")
-                )
-            })
-        });
-        assert!(
-            saw_pong,
-            "the injected tool ran despite an empty agent_tools: {:?}",
-            run.final_messages
-        );
-    }
-
-    /// Regression: an engagement agent with an explicit `tools:` allowlist
-    /// that omits every coverage tool, and no `concerns:` block, still gets
-    /// `asset_mark` and `report_finding`. They are ambient grants of the
-    /// active `--engagement-profile` (`ambient:engagement` in the run's
-    /// `tool_grant`), not a `tools:` opt-in — like the concerns-block
-    /// coverage tools and the injected tools. Before the fix a network recon agent (the normal
-    /// shape: `tools: [bash, ...]`, no concerns) silently lost `asset_mark`;
-    /// the model ran it as a shell command and the assets never reached the
-    /// ledger.
     #[tokio::test]
     async fn engagement_tools_bypass_the_agent_tools_allowlist() {
         let tmp_dir = tempfile::tempdir().expect("tmpdir");
@@ -4289,7 +4168,6 @@ mod on_tool_call_tests {
                 hooks: Default::default(),
                 pause: None,
                 collectors: Vec::new(),
-                extra_tools: Vec::new(),
                 transcript_path,
             },
             (Some(vec!["bash".to_string()])).as_deref(),
@@ -4410,7 +4288,6 @@ mod on_tool_call_tests {
                 },
                 pause: None,
                 collectors: Vec::new(),
-                extra_tools: Vec::new(),
                 transcript_path: transcript_path.clone(),
             },
             (Some(vec!["read_file".to_string()])).as_deref(),
@@ -4530,7 +4407,6 @@ mod on_tool_call_tests {
                 },
                 pause: None,
                 collectors: Vec::new(),
-                extra_tools: Vec::new(),
                 transcript_path,
             },
             None,
@@ -4602,7 +4478,6 @@ mod on_tool_call_tests {
                 hooks: Default::default(),
                 pause: None,
                 collectors: Vec::new(),
-                extra_tools: Vec::new(),
                 transcript_path: transcript.clone(),
             },
             None,
@@ -4700,7 +4575,6 @@ mod on_tool_call_tests {
                 hooks: Default::default(),
                 pause: None,
                 collectors: Vec::new(),
-                extra_tools: Vec::new(),
                 transcript_path,
             },
             None,
@@ -4772,7 +4646,6 @@ mod on_tool_call_tests {
                 hooks: Default::default(),
                 pause: None,
                 collectors: Vec::new(),
-                extra_tools: Vec::new(),
                 transcript_path: transcript_path.clone(),
             },
             None,
@@ -4866,7 +4739,6 @@ mod on_tool_call_tests {
                     hooks: Default::default(),
                     pause: None,
                     collectors: Vec::new(),
-                    extra_tools: Vec::new(),
                     transcript_path: transcript_path.clone(),
                 },
                 None,
@@ -5141,6 +5013,12 @@ pub enum ScriptedTurn {
     /// The provider panics mid-send with this message: for a caller's
     /// handling of a task that panicked (a workflow runner's, say).
     Panic(String),
+    /// `turn`, answered after `ms`: a model call still in flight when a test
+    /// stops or kills the run.
+    Slow {
+        ms: u64,
+        turn: Box<ScriptedTurn>,
+    },
 }
 
 fn default_mock_tokens() -> u32 {
@@ -5193,14 +5071,19 @@ impl LlmProvider for MockProvider {
         // network blip — mapping it to `Http` made the send loop retry it,
         // draining the single scripted turn on attempt 2 and surfacing
         // "mock script exhausted" instead of the test's own message (I-4).
-        let turn = next.ok_or_else(|| {
+        let mut turn = next.ok_or_else(|| {
             rupu_providers::ProviderError::Other(anyhow::anyhow!("mock script exhausted"))
         })?;
+        while let ScriptedTurn::Slow { ms, turn: later } = turn {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            turn = *later;
+        }
         match turn {
             ScriptedTurn::ProviderError(e) => {
                 Err(rupu_providers::ProviderError::Other(anyhow::anyhow!(e)))
             }
             ScriptedTurn::Panic(message) => panic!("{message}"),
+            ScriptedTurn::Slow { .. } => unreachable!("unwrapped above"),
             ScriptedTurn::Reply {
                 content,
                 stop,
@@ -5655,7 +5538,6 @@ mod compaction_tests {
                 hooks: Default::default(),
                 pause: None,
                 collectors: Vec::new(),
-                extra_tools: Vec::new(),
                 transcript_path: transcript_path.to_path_buf(),
             },
             None,
@@ -6244,7 +6126,6 @@ mod pause_tests {
                 hooks: Default::default(),
                 pause,
                 collectors: Vec::new(),
-                extra_tools: Vec::new(),
                 transcript_path,
             },
             None,
@@ -6578,7 +6459,6 @@ mod reasoning_tests {
                 hooks: Default::default(),
                 pause: None,
                 collectors: Vec::new(),
-                extra_tools: Vec::new(),
                 transcript_path,
             },
             None,

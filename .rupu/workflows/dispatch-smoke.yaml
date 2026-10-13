@@ -1,9 +1,8 @@
 name: dispatch-smoke
 description: >
   Smoke-test sub-agent dispatch — the `dispatch-smoke` parent fans out three
-  `dispatch-echo` children in parallel and reports each reply. Dispatch is only
-  wired under `rupu workflow run` (a bare `rupu run` disables it), so this
-  workflow is the entry point. Run with `--mode bypass` to skip per-tool prompts.
+  `dispatch-echo` children in parallel and reports each reply, through the
+  legacy `dispatch_agents_parallel` name. `rupu run dispatch-smoke` works too.
 steps:
   - id: smoke
     agent: dispatch-smoke

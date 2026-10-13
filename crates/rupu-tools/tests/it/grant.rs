@@ -22,13 +22,13 @@ fn connectors(prefix: &str) -> BTreeSet<&'static str> {
         .collect()
 }
 
-/// What a plain `rupu run` with an SCM registry and a dispatcher provides.
+/// What a plain `rupu run` with an SCM registry and a launcher provides.
 fn plain_run() -> ServiceSet {
     [
         Service::Findings,
         Service::Netflow,
         Service::Scm,
-        Service::AgentDispatcher,
+        Service::Launcher,
     ]
     .into_iter()
     .collect()
@@ -53,6 +53,7 @@ fn resolve_with(
     catalog().resolve_grant(GrantInputs {
         declared: declared.as_deref(),
         step_actions: &actions,
+        connector_cap: None,
         ambient,
         available,
         alias_scope: AliasScope::Everywhere,
@@ -120,7 +121,7 @@ fn grant_grammar() {
     // omitted = DEFAULT_GRANT
     let g = resolve(None, &[]).unwrap();
     let mut want: BTreeSet<&str> = CORE.iter().copied().collect();
-    want.extend(["dispatch_agent", "dispatch_agents_parallel"]);
+    want.extend(["dispatch", "join"]);
     want.extend(connectors(""));
     assert_eq!(offered(&g), want);
     assert!(g
@@ -316,17 +317,14 @@ fn services_gate_exactly() {
     let g = resolve_with(Some(&["core.*"]), &[], &[], &ServiceSet::new()).unwrap();
     assert_eq!(offered(&g), CORE.iter().copied().collect());
 
-    // The sub-agent dispatch pair needs the in-process dispatcher.
-    let no_dispatcher: ServiceSet = [Service::Findings].into_iter().collect();
-    let g = resolve_with(Some(&["*", "dispatch_agent"]), &[], &[], &no_dispatcher).unwrap();
-    assert!(!g.offers("dispatch_agent"));
+    // The launch pair needs the launcher; a legacy name grants `dispatch`.
+    let no_launcher: ServiceSet = [Service::Findings].into_iter().collect();
+    let g = resolve_with(Some(&["*", "dispatch_agent"]), &[], &[], &no_launcher).unwrap();
+    assert!(!g.offers("dispatch"));
     assert_eq!(g.unavailable.len(), 1);
-    assert_eq!(g.unavailable[0].tool, "dispatch_agent");
-    assert_eq!(g.unavailable[0].missing, vec![Service::AgentDispatcher]);
-    assert!(g
-        .skipped
-        .iter()
-        .any(|u| u.tool == "dispatch_agents_parallel"));
+    assert_eq!(g.unavailable[0].tool, "dispatch");
+    assert_eq!(g.unavailable[0].missing, vec![Service::Launcher]);
+    assert!(g.skipped.iter().any(|u| u.tool == "join"));
 
     // `assets.mark` needs an engagement; `findings.report` does not.
     let g = resolve(Some(&["asset_mark", "report_finding"]), &[]).unwrap();
@@ -341,35 +339,64 @@ fn services_gate_exactly() {
     .unwrap();
     assert_eq!(offered(&g), set(&["assets.mark"]));
 
-    // The flow `dispatch` is the unit launcher, not the sub-agent
-    // dispatcher: a run with only the latter doesn't offer it.
+    // A run with a launcher offers the launch pair to `*`, but not
+    // `workflows.generate` without a generator.
     let g = resolve(Some(&["*"]), &[]).unwrap();
-    assert!(g.offers("dispatch_agent"));
-    assert!(!g.offers("dispatch") && !g.offers("join"));
+    assert!(g.offers("dispatch") && g.offers("join"));
+    assert!(!g.offers("workflows.generate"));
 }
 
+/// A parent's connector cap (W7, L4) narrows a child's connector tools like
+/// a step's `actions:` does, within the child's own `actions:`, and is what
+/// the child passes on.
 #[test]
-fn injected_tools_are_self_served() {
-    // A unit's injected board tools are offered although the run provides
-    // no message bus, and `*` does not drag in the board tools that were
-    // not injected.
-    let g = resolve_with(
-        Some(&["*"]),
-        &[],
-        &[AmbientGrant::injected(vec!["board.post", "board.read"])],
-        &plain_run(),
-    )
-    .unwrap();
-    assert!(g.offers("board.post") && g.offers("board.read"));
-    assert!(!g.offers("board.directive"));
-    assert_eq!(
-        g.entries["board.post"].reasons,
-        vec![GrantReason::Origin("injected")]
-    );
-    assert!(!g.skipped.iter().any(|u| u.tool == "board.post"));
-    assert!(g.skipped.iter().any(|u| u.tool == "board.claim"));
-    // An authority tool is not even considered by `*` (D22).
-    assert!(!g.skipped.iter().any(|u| u.tool == "board.directive"));
+fn a_connector_cap_narrows_connectors_and_is_passed_on() {
+    let declared = strs(&["issues.*", "read_file"]);
+    let cap = strs(&["issues.get"]);
+    let g = catalog()
+        .resolve_grant(GrantInputs {
+            declared: Some(&declared),
+            step_actions: &[],
+            connector_cap: Some(&cap),
+            ambient: &[],
+            available: &plain_run(),
+            alias_scope: AliasScope::Everywhere,
+        })
+        .unwrap();
+    assert_eq!(offered(&g), set(&["issues.get", "read_file"]));
+    assert!(g.narrowed.contains(&"issues.create"));
+    assert_eq!(g.connector_cap, Some(set(&["issues.get"])));
+    assert_eq!(g.actions, None, "a cap is not the step's own actions:");
+
+    // Within a step's own `actions:`; an empty cap allows no connector.
+    let actions = strs(&["issues.get", "issues.list"]);
+    let g = catalog()
+        .resolve_grant(GrantInputs {
+            declared: Some(&declared),
+            step_actions: &actions,
+            connector_cap: Some(&cap),
+            ambient: &[],
+            available: &plain_run(),
+            alias_scope: AliasScope::Everywhere,
+        })
+        .unwrap();
+    assert_eq!(offered(&g), set(&["issues.get", "read_file"]));
+    assert_eq!(g.connector_cap, Some(set(&["issues.get"])));
+    let g = catalog()
+        .resolve_grant(GrantInputs {
+            declared: Some(&declared),
+            step_actions: &[],
+            connector_cap: Some(&[]),
+            ambient: &[],
+            available: &plain_run(),
+            alias_scope: AliasScope::Everywhere,
+        })
+        .unwrap();
+    assert_eq!(offered(&g), set(&["read_file"]));
+
+    // No cap and no actions: not narrowed, nothing passed on.
+    let g = resolve(Some(&["issues.*"]), &[]).unwrap();
+    assert_eq!(g.connector_cap, None);
 }
 
 #[test]
@@ -393,4 +420,36 @@ fn flow_lead_alias_scope() {
             .name,
         "coverage.status"
     );
+}
+
+/// `dispatch` is async, so a run granted it by any route (a legacy alias
+/// here) is granted `join` too, to collect what it starts.
+#[test]
+fn dispatch_brings_join() {
+    for declared in [
+        &["dispatch_agent"][..],
+        &["dispatch"],
+        &["run_workflow", "bash"],
+    ] {
+        let g = resolve(Some(declared), &[]).unwrap();
+        assert!(g.offers("dispatch"), "{declared:?}");
+        assert_eq!(
+            g.entries["join"].reasons,
+            vec![GrantReason::Implied("dispatch")],
+            "{declared:?}"
+        );
+        assert_eq!(g.entries["join"].reasons_string(), "implied:dispatch");
+    }
+    // Declared as well: its own reason, nothing implied.
+    let g = resolve(Some(&["dispatch", "join"]), &[]).unwrap();
+    assert_eq!(g.entries["join"].reasons, vec![GrantReason::Declared]);
+    // No launcher, no dispatch: no join either.
+    let g = resolve_with(
+        Some(&["dispatch_agent"]),
+        &[],
+        &[],
+        &ServiceSet::new().with(Service::Scm),
+    )
+    .unwrap();
+    assert!(!g.offers("join"));
 }

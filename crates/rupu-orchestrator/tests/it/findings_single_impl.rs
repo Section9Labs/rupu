@@ -71,7 +71,6 @@ fn agent_opts(ctx: ToolContext, turns: Vec<ScriptedTurn>, transcript: &Path) -> 
             hooks: Default::default(),
             pause: None,
             collectors: Vec::new(),
-            extra_tools: Vec::new(),
             transcript_path: transcript.to_path_buf(),
         },
         Some(&["findings.*".to_string()]),

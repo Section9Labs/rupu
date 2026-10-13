@@ -1369,3 +1369,35 @@ async fn for_each_fans_out_over_every_finding_a_tag_query_matches() {
         .output
         .contains(&format!("poc {}", it.item["id"].as_str().unwrap()))));
 }
+
+/// A launched workflow's `action:` step stays within the connector tools its
+/// parent was narrowed to: a tool outside the cap is refused before it runs.
+#[tokio::test]
+async fn an_action_outside_the_launch_connector_cap_is_refused() {
+    let (mut d, connector) = dispatcher_with_issue_connector(PermissionMode::Bypass);
+    d.context.identity_mut().launch.connector_cap = Some(vec!["issues.get".into()]);
+    let err = call_action_tool(
+        &d,
+        "issues.comment",
+        serde_json::json!({ "project": "acme/w", "number": 1, "body": "hi" }),
+        rupu_coverage::FindingProfile::Full,
+    )
+    .await
+    .expect_err("outside the cap");
+    assert!(
+        matches!(&err, rupu_orchestrator::runner::ActionError::Denied { tool, .. } if tool == "issues.comment"),
+        "{err}"
+    );
+    assert!(connector.calls.lock().unwrap().is_empty());
+
+    d.context.identity_mut().launch.connector_cap = Some(vec!["issues.comment".into()]);
+    call_action_tool(
+        &d,
+        "issues.comment",
+        serde_json::json!({ "project": "acme/w", "number": 1, "body": "hi" }),
+        rupu_coverage::FindingProfile::Full,
+    )
+    .await
+    .expect("inside the cap");
+    assert_eq!(connector.calls.lock().unwrap().len(), 1);
+}

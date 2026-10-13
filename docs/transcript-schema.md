@@ -8,7 +8,7 @@
 ## Overview
 
 Every agent run rupu executes (a standalone `rupu run`, each workflow step and fan-out unit,
-each sub-agent started with `dispatch_agent`, each session turn) writes an append-only log in
+each child started with `dispatch`, each session turn) writes an append-only log in
 JSONL format. Each line is one event. A workflow run's own records (`run.json`,
 `step_results.jsonl`, `events.jsonl`) live in the run store and point at each step's transcript. `rupu transcript list` globs JSONL files and reads the `run_start` event from
 each for metadata — only that first event, which is what lets it sort thousands of transcripts
@@ -368,14 +368,14 @@ The tools the run offered its model, and why. Written once, right after `run_sta
 
 | Field         | Type   | Description |
 |---------------|--------|-------------|
-| `entries`     | array  | `{tool, reasons}` per offered tool: its canonical name and every reason it is there — `declared` (named in `tools:`), `declared:<wildcard>` (matched `*`, `core.*`, `scm.*`, …), `default` (the agent has no `tools:`), `ambient:concerns`, `ambient:engagement`, `origin:flow_lead` / `origin:flow_unit` (an agentiflow lead's or unit's coordination tools), `origin:injected` (a tool the launch site handed the run: an agentiflow lead's launch tools) |
+| `entries`     | array  | `{tool, reasons}` per offered tool: its canonical name and every reason it is there — `declared` (named in `tools:`), `declared:<wildcard>` (matched `*`, `core.*`, `scm.*`, …), `default` (the agent has no `tools:`), `ambient:concerns`, `ambient:engagement`, `origin:flow_lead` / `origin:flow_unit` (an agentiflow lead's or unit's coordination tools; a lead's include `dispatch`, `join` and `workflows.generate`), `implied:dispatch` (`join`, added because `dispatch` is granted) |
 | `narrowed`    | array? | Connector tools the step's `actions:` removed. Omitted when empty |
 | `unavailable` | array? | `{tool, missing}`: tools named exactly in `tools:` that this run can't serve, with the services it lacks. Each also gets a `tool_unavailable` notice. Omitted when empty |
 | `skipped`     | array? | `{tool, missing}`: tools a wildcard or the default grant matched that this run can't serve. Not offered, no notice. Omitted when empty |
 
-Services: `scm` (configured connectors), `agent_dispatcher` (sub-agent dispatch), `launcher`
-(agentiflow units), `findings`, `engagement`, `coverage` (a `concerns:` block), `message_bus`,
-`run_status`, `catalog`, `workflow_generator`, `netflow`.
+Services: `scm` (configured connectors), `launcher` (`dispatch` / `join`, every child kind),
+`findings`, `engagement`, `coverage` (a `concerns:` block), `message_bus`, `run_status`,
+`catalog`, `workflow_generator` (`workflows.generate`), `netflow`.
 
 ```json
 {"type":"tool_grant","data":{"entries":[{"tool":"read_file","reasons":["declared"]},{"tool":"findings.report","reasons":["ambient:concerns"]}],"unavailable":[{"tool":"board.post","missing":["message_bus"]}]}}
@@ -675,7 +675,7 @@ Emitted once at the very end of a run. Its presence signals a clean (non-aborted
 | `total_tokens` | u64              | Cumulative tokens across all turns              |
 | `duration_ms`  | u64              | Total wall-clock duration, in ms                |
 | `error`        | string, optional | Error description when `status` is `error`      |
-| `outcome`      | OutcomeRecord, optional | The outcome the run failed on, when it ended because the recovery ladder ran out (see `outcome`) |
+| `outcome`      | OutcomeRecord, optional | The outcome the run failed on, when it ended because the recovery ladder ran out (see `outcome`); or, on an `aborted` run stopped by SIGTERM, the stop: class `stopped_by_signal` (warning). A workflow `run.json`'s `cause` carries the same record when its run failed while its process was stopped by a signal, or `runner_died` when the reaper finalized a run whose runner had died. A run whose cause is one of these did not fail on its own: whoever continues its parent continues it |
 
 ```json
 {"type":"run_complete","data":{"run_id":"run_01HXX3Y7K8NQ","status":"ok","total_tokens":4096,"duration_ms":12340}}

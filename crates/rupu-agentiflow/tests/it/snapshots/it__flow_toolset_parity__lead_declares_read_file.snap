@@ -130,18 +130,37 @@ expression: "lead_toolset(\"[read_file]\")"
       - query
     type: object
   name: catalog.search
-- description: "Start a pool agent as an independent unit working on a prompt, in its own process. Returns a handle immediately without waiting; pass it to `join` to wait for the unit's result. Only agents in the flow's pool can be dispatched."
+- description: "Start a child run and get a handle back at once; the child works on its own. `kind` picks how it runs: `subagent` (the default: in this process, for a quick delegation such as reviewing a file), `agent` (its own `rupu run` process, for long or heavy work), or `workflow` (its own `rupu workflow run`). Name an agent from your dispatchable agents, a workflow from your dispatchable workflows, or pass a `file` that `workflows.generate` returned. Call `join` with the handle to collect the result, or pass `wait: true` to start the child and wait for it in one call. Children you never join are stopped when you finish."
   input_schema:
     properties:
-      agent:
-        description: Name of a pool agent to run
+      file:
+        description: "Kind `workflow` only: a workflow file `workflows.generate` returned, instead of `name`"
+        type: string
+      inputs:
+        additionalProperties: true
+        description: "A workflow's declared inputs as name: value pairs; for an agent, structured inputs added to its prompt"
+        type: object
+      kind:
+        description: "How the child runs; default `subagent`"
+        enum:
+          - subagent
+          - agent
+          - workflow
+        type: string
+      name:
+        description: "The agent (or, for kind `workflow`, the workflow) to run"
         type: string
       prompt:
-        description: "The unit's task: what to do and what to report back"
+        description: "An agent child's task: what to do and what to report back"
         type: string
-    required:
-      - agent
-      - prompt
+      timeout_secs:
+        description: "With `wait`: how long to wait, in seconds; default 300"
+        maximum: 3600
+        minimum: 0
+        type: integer
+      wait:
+        description: Wait for the child to finish and return its result too; default false
+        type: boolean
     type: object
   name: dispatch
 - description: "Record a security or quality finding in this project's ledger. Returns the generated finding id (use it in coverage.mark calls and in another finding's cross_references). Under the full profile send a complete `report`; a rejected call lists every problem to fix."
@@ -562,19 +581,25 @@ expression: "lead_toolset(\"[read_file]\")"
     properties: {}
     type: object
   name: goal.status
-- description: "Wait for a dispatched unit to finish and return its result. Reports status `done` (with the unit's output and whether it succeeded), `failed`, or `running` / `pending` if it has not finished within the timeout (join again to keep waiting)."
+- description: "Wait for children you started with `dispatch` and collect their results. Name `handles` (omit them for every child you have not collected yet). Returns each child's status: `done` (with its output and whether it succeeded), `failed`, `abandoned`, or `running` / `pending` if it has not finished within the timeout (join again to keep waiting). `until: any` returns as soon as one of them finishes."
   input_schema:
     properties:
-      handle:
-        description: "The handle `dispatch` returned"
-        type: string
+      handles:
+        description: "Handles `dispatch` returned; omit for every child of this run not yet joined"
+        items:
+          type: string
+        type: array
       timeout_secs:
-        description: "How long to wait, in seconds; default 300"
+        description: "How long to wait, in seconds (0 = just look); default 300"
         maximum: 3600
         minimum: 0
         type: integer
-    required:
-      - handle
+      until:
+        description: "Return when all of them have finished (default), or any one"
+        enum:
+          - all
+          - any
+        type: string
     type: object
   name: join
 - description: "Send a message. `to` is a participant id, a role, \"parent\", or \"lead\" (delivered to exactly that inbox), or \"broadcast\" (every participant sees it once, from the moment it started listening; the broadcast log is capped per run, so don't spam it)."
@@ -600,38 +625,12 @@ expression: "lead_toolset(\"[read_file]\")"
       - path
     type: object
   name: read_file
-- description: "Start a pool workflow as an independent unit, in its own process. Returns a handle immediately without waiting; pass it to `join` to wait for the workflow's result. Only workflows in the flow's pool can be started, and only if every agent they dispatch is also in the pool. Workflows with an approval gate or a host / distribute placement cannot be run as a unit."
-  input_schema:
-    properties:
-      inputs:
-        additionalProperties:
-          type:
-            - string
-            - number
-            - boolean
-        description: "The workflow's declared inputs, as name: value pairs"
-        type: object
-      workflow:
-        description: Id of a pool workflow to run
-        type: string
-    required:
-      - workflow
-    type: object
-  name: run_workflow
-- description: "Author a NEW workflow for a described task and run it as an independent unit, in its own process. Returns a handle immediately without waiting; pass it to `join` to wait for the workflow's result. The workflow may only dispatch agents in this flow's pool; it runs unattended (no approval gates, no remote placement)."
+- description: "Author a NEW workflow for a described task and save it. Returns the saved `file`, the workflow's `name`, its step count and its declared inputs; run it with `dispatch {kind: \"workflow\", file}`. The workflow may only use agents you can dispatch, and it runs unattended (no approval gates, no remote placement)."
   input_schema:
     properties:
       description:
         description: "What the workflow should do, in plain language"
         type: string
-      inputs:
-        additionalProperties:
-          type:
-            - string
-            - number
-            - boolean
-        description: "Values for any inputs the generated workflow declares, as name: value pairs"
-        type: object
     required:
       - description
     type: object

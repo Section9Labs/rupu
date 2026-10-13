@@ -1,5 +1,5 @@
-//! The token fold: sums the usage ledgers (`usage.jsonl`) of an agentiflow's
-//! lead and of every unit it launched into per-model and grand totals, and
+//! The token fold: sums usage ledgers (`usage.jsonl`) into per-model and
+//! grand totals, and
 //! [`LedgerUsageSource`], the budget enforcer's [`UsageSource`] built on it
 //! (`budget.tokens` from the folded tokens, `budget.usd` from those tokens
 //! priced through the layered `[pricing]` config).
@@ -12,26 +12,22 @@
 //! `LedgerRow.id` across ALL the files read, so a line seen twice (a re-read, a
 //! mirror replay, one row present in two ledgers) counts once.
 //!
-//! # Known limitation: dispatched sub-agents are not counted
-//!
-//! A unit's own LLM calls are in its `usage.jsonl`, but the sub-agents a unit
-//! launches through `dispatch_agent` are not: that dispatcher has no usage
-//! ledger (a gap that predates the agentiflow fold). The fold therefore
-//! UNDERCOUNTS the spend of any unit that dispatches sub-agents, and a
-//! `budget.tokens` / `budget.usd` cap trips later than the true spend. See the
-//! `dispatch_agent` entry in `TODO.md`.
+//! An agentiflow's spend is its own ledger (`<run dir>/usage.jsonl`): the
+//! lead writes it, an in-process sub-agent is charged to it, and a unit
+//! process (launched with `--usage-root`) and its own children copy each call
+//! there as a [`LedgerRow::rollup`] row besides their own ledger (W7, L5).
+//! Rollup rows count here; the CP's reports skip them.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use rupu_config::pricing::lookup;
 use rupu_config::PricingConfig;
 use rupu_orchestrator::usage_ledger::LedgerRow;
 
 use crate::budget::UsageSource;
-use crate::supervisor::FleetSupervisor;
 
 /// A token count, in the ledger's own terms.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -152,16 +148,10 @@ pub(crate) fn usd_is_priceable(pricing: &PricingConfig, provider: &str, model: &
     lookup(pricing, provider, model, "").is_some()
 }
 
-/// The ledger-backed [`UsageSource`] for a running agentiflow: what the lead
-/// and every unit it has launched have spent, read from their `usage.jsonl`
-/// ledgers on every query.
-///
-/// - the lead's ledger is `lead_usage` (`<run dir>/usage.jsonl`, written by the
-///   lead driver's `on_usage` hook);
-/// - each unit's is `<global>/runs/<unit id>/usage.jsonl`, found through
-///   [`FleetSupervisor::launched_unit_run_dirs`] (a fleet-attached `rupu run`
-///   writes it), so units that finished still count and a unit the supervisor
-///   has not launched yet adds nothing.
+/// The ledger-backed [`UsageSource`] for a running agentiflow: what its lead
+/// and every child it launched have spent, read from the flow's
+/// `usage.jsonl` on every query (the lead's own rows, and each child's,
+/// charged there through its root ledger).
 ///
 /// Tokens are [`Tokens::billable`] (input + output; cache reads and writes are
 /// subsets of input). USD prices each `(provider, model)` bucket's input /
@@ -170,50 +160,28 @@ pub(crate) fn usd_is_priceable(pricing: &PricingConfig, provider: &str, model: &
 /// is then invisible to a `budget.usd` cap).
 ///
 /// The envelope queries each dimension once per round, and each query re-folds
-/// the ledgers (the files are small and rounds are minutes apart); there is no
-/// cache to go stale against a unit still writing.
+/// the ledger (it is small and rounds are minutes apart); there is no cache to
+/// go stale against a unit still writing.
 pub struct LedgerUsageSource {
-    lead_usage: PathBuf,
-    supervisor: Arc<FleetSupervisor>,
-    global: PathBuf,
+    ledger: PathBuf,
     pricing: PricingConfig,
     /// `(provider, model)` pairs already warned about as unpriced.
     warned_unpriced: Mutex<BTreeSet<(String, String)>>,
 }
 
 impl LedgerUsageSource {
-    pub fn new(
-        lead_usage: PathBuf,
-        supervisor: Arc<FleetSupervisor>,
-        global: PathBuf,
-        pricing: PricingConfig,
-    ) -> Self {
+    pub fn new(ledger: PathBuf, pricing: PricingConfig) -> Self {
         Self {
-            lead_usage,
-            supervisor,
-            global,
+            ledger,
             pricing,
             warned_unpriced: Mutex::new(BTreeSet::new()),
         }
     }
 
-    /// Every ledger this run's spend lives in: the lead's, then each launched
-    /// unit's (oldest first).
-    fn ledger_paths(&self) -> Vec<PathBuf> {
-        let mut paths = vec![self.lead_usage.clone()];
-        paths.extend(
-            self.supervisor
-                .launched_unit_run_dirs(&self.global)
-                .into_iter()
-                .map(|dir| dir.join("usage.jsonl")),
-        );
-        paths
-    }
-
-    /// Fold the lead's and every launched unit's ledger once. Both budget
-    /// dimensions are derived from one of these.
+    /// Fold the flow's ledger once. Both budget dimensions are derived from
+    /// one of these.
     pub fn fold_all(&self) -> TokenTotals {
-        fold_tokens(&self.ledger_paths())
+        fold_tokens(std::slice::from_ref(&self.ledger))
     }
 
     /// The USD cost of `totals`: each `(provider, model)` bucket priced on its
@@ -292,6 +260,7 @@ mod tests {
             output_tokens: output,
             cached_tokens: cached,
             cache_write_tokens: cache_write,
+            rollup: false,
         }
     }
 
@@ -483,20 +452,7 @@ mod tests {
     // ---- LedgerUsageSource ---------------------------------------------------
 
     use crate::budget::{Budget, BudgetEnforcer, BudgetStage};
-    use crate::unit::{MockUnitLauncher, UnitKind, UnitSpec, UnitStatus};
     use rupu_config::ModelPricing;
-
-    fn unit_spec(participant: &str) -> UnitSpec {
-        UnitSpec {
-            agent: "recon".into(),
-            prompt: "scan".into(),
-            engagement: vec![],
-            participant: participant.into(),
-            kind: UnitKind::Agent,
-            inputs: vec![],
-            workflow_file: None,
-        }
-    }
 
     /// `[pricing.priced."m"]`: $2 / Mtok in, $10 / Mtok out, $0.5 / Mtok cache
     /// reads, $4 / Mtok cache writes.
@@ -518,7 +474,6 @@ mod tests {
         _tmp: tempfile::TempDir,
         global: PathBuf,
         lead_usage: PathBuf,
-        sup: Arc<FleetSupervisor>,
     }
 
     impl Rig {
@@ -528,34 +483,33 @@ mod tests {
             let run_dir = tmp.path().join("af_run");
             std::fs::create_dir_all(&global).unwrap();
             std::fs::create_dir_all(&run_dir).unwrap();
-            let sup = Arc::new(FleetSupervisor::new(
-                Arc::new(MockUnitLauncher::scripted(vec![UnitStatus::Running])),
-                run_dir.clone(),
-            ));
             Rig {
                 lead_usage: run_dir.join("usage.jsonl"),
                 _tmp: tmp,
                 global,
-                sup,
             }
         }
 
         fn source(&self, pricing: PricingConfig) -> LedgerUsageSource {
-            LedgerUsageSource::new(
-                self.lead_usage.clone(),
-                self.sup.clone(),
-                self.global.clone(),
-                pricing,
-            )
+            LedgerUsageSource::new(self.lead_usage.clone(), pricing)
         }
 
-        /// Launch a unit and seed its `usage.jsonl` under `<global>/runs/<id>/`.
-        fn unit_with(&self, participant: &str, rows: &[LedgerRow]) -> String {
-            let id = self.sup.dispatch(unit_spec(participant)).unwrap();
-            let dir = self.global.join("runs").join(&id);
-            std::fs::create_dir_all(&dir).unwrap();
-            write_ledger(&dir.join("usage.jsonl"), rows);
-            id
+        /// A unit's calls, copied to the flow's ledger as rollup rows the
+        /// way a unit launched with `--usage-root` copies them.
+        fn unit_with(&self, _participant: &str, rows: &[LedgerRow]) {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.lead_usage)
+                .unwrap();
+            for r in rows {
+                let r = LedgerRow {
+                    rollup: true,
+                    ..r.clone()
+                };
+                f.write_all(&line(&r)).unwrap();
+            }
         }
     }
 
@@ -568,9 +522,7 @@ mod tests {
         );
         rig.unit_with("recon#1", &[row("01B", "priced", "m", 500, 50, 10, 0)]);
         rig.unit_with("recon#2", &[row("01C", "other", "x", 300, 30, 0, 0)]);
-        // A launched unit that never called a model has no ledger: it adds nothing.
-        rig.sup.dispatch(unit_spec("recon#3")).unwrap();
-        // A run dir the supervisor did not launch is not this flow's spend.
+        // A run's own ledger outside the flow is not this flow's spend.
         let stray = rig.global.join("runs").join("run_stranger");
         std::fs::create_dir_all(&stray).unwrap();
         write_ledger(

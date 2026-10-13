@@ -150,7 +150,6 @@ fn opts(
             hooks: Default::default(),
             pause: None,
             collectors: Vec::new(),
-            extra_tools: Vec::new(),
             transcript_path: transcript,
         },
         Some(&["read_file".to_string()]),

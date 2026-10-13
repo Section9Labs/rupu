@@ -141,7 +141,8 @@ async fn run_with_pause_channel(
     });
     opts.pause = Some(pause_token);
 
-    let result = run_workflow(opts).await;
+    // Boxed: the run future is too large for a small (test) thread stack.
+    let result = Box::pin(run_workflow(opts)).await;
     // Stop the poller the moment the run reaches any terminal/parked state so
     // it never outlives its run (mirrors the fresh-run path's `.abort()`).
     if let Some(handle) = pause_poller {
@@ -268,6 +269,17 @@ pub(crate) fn resume_config_paths(
     }
 }
 
+/// The run's workflow snapshot, named as the run recorded it (a launched
+/// workflow child runs under the catalog id its parent vetted, not its
+/// file's `name:`). An empty recorded name keeps the snapshot's.
+fn workflow_as_recorded(body: &str, recorded_name: &str) -> anyhow::Result<Workflow> {
+    let mut workflow = Workflow::parse(body)?;
+    if !recorded_name.is_empty() {
+        workflow.name = recorded_name.to_string();
+    }
+    Ok(workflow)
+}
+
 /// Shared disk-rebuild step for [`resume_run`] (approve-resume) and
 /// [`build_reject_cleanup_opts`] (reject-cleanup): reload the persisted
 /// workflow snapshot + prior step results and reconstruct the full
@@ -300,7 +312,7 @@ async fn rebuild_opts_from_disk(
     let body = store
         .read_workflow_snapshot(run_id)
         .map_err(|e| anyhow::anyhow!("read workflow snapshot: {e}"))?;
-    let workflow = Workflow::parse(&body)?;
+    let workflow = workflow_as_recorded(&body, &record.workflow_name)?;
     let prior_records = store
         .read_step_results(run_id)
         .map_err(|e| anyhow::anyhow!("read step results: {e}"))?;
@@ -442,7 +454,12 @@ async fn rebuild_opts_from_disk(
             // A resumed run is never an agentiflow unit (workflow units
             // refuse gated workflows), so it keeps the workflow's own scope.
             scope_name_override: None,
-        });
+            launcher: Some(Arc::new(rupu_launch::Launchers::local(&global, &cfg)?)),
+            // A launched workflow keeps its link (`launch.json`).
+            link: store_arc.read_launch_link(run_id),
+            // The root codename it was launched under, as recorded.
+            codename: record.codename.as_deref().and_then(|c| c.parse().ok()),
+        })?;
     let naming = runtime.naming;
     let runtime_action_services = runtime.action_services;
     let factory = runtime.factory;
@@ -501,6 +518,17 @@ async fn rebuild_opts_from_disk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A resumed run keeps the name it ran under: a launched workflow child's
+    /// is the catalog id its parent vetted, not its file's `name:`.
+    #[test]
+    fn a_resumed_workflow_keeps_its_recorded_name() {
+        let body = "name: from-the-file\nsteps:\n  - id: a\n    agent: x\n    prompt: go\n";
+        let wf = workflow_as_recorded(body, "sweep").unwrap();
+        assert_eq!(wf.name, "sweep");
+        let legacy = workflow_as_recorded(body, "").unwrap();
+        assert_eq!(legacy.name, "from-the-file");
+    }
 
     fn store_with_run(tmp: &Path) -> RunStore {
         std::fs::create_dir_all(tmp.join("runs/run_1")).unwrap();

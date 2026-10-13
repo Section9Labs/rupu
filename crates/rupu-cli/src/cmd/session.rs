@@ -415,6 +415,8 @@ struct SessionRecord {
     anthropic_speed: Option<Speed>,
     #[serde(default)]
     dispatchable_agents: Option<Vec<String>>,
+    #[serde(default)]
+    dispatchable_workflows: Option<Vec<String>>,
     /// The session agent's `findingsProfile` frontmatter, snapshotted at
     /// session creation like the other agent-spec fields above. Absent ⇒
     /// `full`.
@@ -1753,6 +1755,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         anthropic_context_management: spec.anthropic_context_management,
         anthropic_speed: spec.anthropic_speed,
         dispatchable_agents: spec.dispatchable_agents.clone(),
+        dispatchable_workflows: spec.dispatchable_workflows.clone(),
         findings_profile: spec.findings_profile,
         engagement_profiles: args.engagement_profiles.clone(),
         workspace_id: ws.id,
@@ -7841,6 +7844,7 @@ fn session_agent_spec(
         anthropic_speed: session.anthropic_speed,
         thinking_display: session.thinking_display,
         dispatchable_agents: session.dispatchable_agents.clone(),
+        dispatchable_workflows: session.dispatchable_workflows.clone(),
         concerns: session.concerns.clone(),
         max_tokens: session.max_tokens,
         context_window_tokens: session.context_window_tokens,
@@ -8096,15 +8100,17 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             id: session.workspace_id.clone(),
             path: session.workspace_path.clone(),
         };
-        // Sub-agent dispatch (`dispatchableAgents:`): children anchor under
-        // `<runs>/<turn run id>/sub/`.
-        let dispatcher = rupu_runtime::dispatch::InProcessDispatcher::new(
-            Arc::clone(&assembler),
-            Arc::new(rupu_orchestrator::RunStore::new(global.join("runs")))
-                as Arc<dyn rupu_runtime::dispatch::SubRunStore>,
-            assembler.dispatch_root(&origin, &args.run_id, workspace.clone()),
-            None,
-        );
+        // Children (`dispatch`): sub-agents anchor under `<runs>/<turn run
+        // id>/sub/`, and every child is recorded in that dir's
+        // `children.jsonl`. A turn's unjoined children are stopped when it
+        // ends.
+        let launcher = rupu_launch::Launchers::local(&global, &assembler.context().config)?
+            .launcher(
+                Arc::clone(&assembler),
+                Arc::new(rupu_orchestrator::RunStore::new(global.join("runs"))),
+                None,
+                None,
+            );
         let launch = rupu_runtime::assembly::LaunchSpec {
             agent,
             origin,
@@ -8131,12 +8137,14 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             hooks: Default::default(),
             pause: None,
             services: rupu_runtime::assembly::LaunchServices {
-                dispatcher: Some(dispatcher),
+                launcher: Some(launcher.clone()),
+                workflow_generator: Some(launcher),
                 netflow: Some(netflow_sink.clone()),
                 provider: Some(prepared),
                 ..Default::default()
             },
             collectors: Vec::new(),
+            link: None,
         };
 
         // The run's final limits come back on an `Err` too, so a limit
@@ -10664,6 +10672,7 @@ mod tests {
             anthropic_context_management: None,
             anthropic_speed: None,
             dispatchable_agents: None,
+            dispatchable_workflows: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
             workspace_id: "ws_test".into(),

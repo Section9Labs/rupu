@@ -267,7 +267,7 @@ pub fn provider_config_for(
 
 /// [`resolve_kind`] for every declared `[providers.<name>]`, keyed by name.
 /// Mirrors [`openai_compatible_map`] / [`provider_tuning_map`] — for callers
-/// (`CliAgentDispatcher`, `DefaultStepFactory`) that resolve their whole
+/// (the run assembler, `DefaultStepFactory`) that resolve their whole
 /// config once up front into pre-resolved maps rather than holding the raw
 /// `rupu_config::Config` and calling [`resolve_kind`] per dispatch.
 ///

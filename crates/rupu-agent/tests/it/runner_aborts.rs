@@ -44,7 +44,6 @@ fn opts(
             hooks: Default::default(),
             pause: None,
             collectors: Vec::new(),
-            extra_tools: Vec::new(),
             transcript_path: transcript,
         },
         None,

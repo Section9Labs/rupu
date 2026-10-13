@@ -354,6 +354,8 @@ function classify(tool: string): ToolKind {
     // `rupu-orchestrator`'s `write_run_step_transcript`).
     case 'run':
       return 'terminal';
+    case 'dispatch':
+    case 'join':
     case 'dispatch_agent':
     case 'dispatch_agents_parallel':
       return 'subrun';

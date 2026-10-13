@@ -14,7 +14,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { Archive, ArrowLeft, FileText, GitBranch, ListOrdered, Network as NetworkIcon, Pause, ShieldAlert, Trash2 } from 'lucide-react';
+import { Archive, ArrowLeft, FileText, GitBranch, GitFork, ListOrdered, Network as NetworkIcon, Pause, ShieldAlert, Trash2 } from 'lucide-react';
 import {
   api,
   ApiError,
@@ -41,6 +41,7 @@ import StepTranscriptBrowser from '../components/run/StepTranscriptBrowser';
 import RunUsageTimeline from '../components/charts/RunUsageTimeline';
 import AutoflowPanel from '../components/AutoflowPanel';
 import CyclesTab from '../components/run/CyclesTab';
+import ChildrenPanel from '../components/run/ChildrenPanel';
 import NetflowExplorer from '../components/netflow/explorer/NetflowExplorer';
 import { buildRunGraphModel, collectWarnings, type GraphNode, type RunGraphModel } from '../lib/runGraphModel';
 import { layoutGraph, type Pos } from '../lib/graphLayout';
@@ -62,7 +63,7 @@ import { parseCallHash, useToolCallAnchor } from '../lib/toolCallAnchor';
 
 const MAX_EVENTS = 2000;
 
-type Tab = 'transcript' | 'events' | 'findings' | 'cycles' | 'netflow';
+type Tab = 'transcript' | 'events' | 'findings' | 'children' | 'cycles' | 'netflow';
 
 /** Padding around the run's own span for the Network tab's default
  *  window (the approved mockup's ±5 minutes) — see the render-site
@@ -206,6 +207,12 @@ export default function RunDetail() {
   const [findingsError, setFindingsError] = useState<string | null>(null);
   const findingsRequestedRef = useRef(false);
 
+  // The children ledger is local-only (`/api/runs/:id/children` has no
+  // `?host=`), so a remote run has no Children tab. `null` = not loaded yet;
+  // the panel itself loads on first open and polls while it is shown.
+  const remote = !!host && host !== 'local';
+  const [childrenCount, setChildrenCount] = useState<number | null>(null);
+
   // Netflow lives entirely inside <NetflowExplorer> now (the v3 one-
   // surface-every-scope component) — mounted with `key={run.id}` under the
   // Network tab, so its fetch/reset/window state needs no plumbing here.
@@ -303,6 +310,7 @@ export default function RunDetail() {
     setFindings(null);
     setFindingsError(null);
     findingsRequestedRef.current = false;
+    setChildrenCount(null);
     setAutoflowCtx(null);
 
     fetchRunGraphWithRetry(id, () => cancelled, host)
@@ -368,6 +376,9 @@ export default function RunDetail() {
   useEffect(() => {
     if (tab === 'cycles' && !autoflowCtx) setTab('transcript');
   }, [tab, autoflowCtx]);
+  useEffect(() => {
+    if (tab === 'children' && remote) setTab('transcript');
+  }, [tab, remote]);
 
   // Lazy-load this run's findings the first time the Findings tab is opened.
   // Keyed on (id, tab); the ref guard ensures a single fetch per run id.
@@ -1299,6 +1310,14 @@ export default function RunDetail() {
           <TabButton active={tab === 'transcript'} onClick={() => setTab('transcript')} icon={FileText} label="Transcript" />
           <TabButton active={tab === 'events'} onClick={() => setTab('events')} icon={ListOrdered} label="Events" />
           <TabButton active={tab === 'findings'} onClick={() => setTab('findings')} icon={ShieldAlert} label={findingsCount > 0 ? `Findings (${findingsCount})` : 'Findings'} />
+          {!remote && (
+            <TabButton
+              active={tab === 'children'}
+              onClick={() => setTab('children')}
+              icon={GitFork}
+              label={childrenCount === null ? 'Children' : `Children (${childrenCount})`}
+            />
+          )}
           <TabButton active={tab === 'netflow'} onClick={() => setTab('netflow')} icon={NetworkIcon} label="Network" />
           {autoflowCtx && (
             <TabButton active={tab === 'cycles'} onClick={() => setTab('cycles')} icon={GitBranch} label="Cycles" />
@@ -1402,6 +1421,11 @@ export default function RunDetail() {
                 </ListCard>
               </div>
             )}
+          </div>
+        )}
+        {tab === 'children' && !remote && (
+          <div className="h-full min-h-0 overflow-auto">
+            <ChildrenPanel runId={run.id} onCount={setChildrenCount} />
           </div>
         )}
         {tab === 'cycles' && autoflowCtx && (

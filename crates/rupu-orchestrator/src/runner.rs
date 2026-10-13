@@ -32,7 +32,7 @@ use async_trait::async_trait;
 use rupu_agent::{RunError, RunResult};
 use rupu_providers::types::Message;
 use rupu_runtime::assembly::{AssembleError, LaunchSpec, RunAssembler, UnitKey, WorkspaceBinding};
-use rupu_transcript::{Event, JsonlReader, JsonlWriter};
+use rupu_transcript::{Event, JsonlWriter};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -537,6 +537,7 @@ impl StepRequest {
             pause: None,
             services: Default::default(),
             collectors: Vec::new(),
+            link: None,
         }
     }
 }
@@ -596,6 +597,12 @@ pub trait StepFactory: Send + Sync {
     /// Recorded on the run's `RunRecord` at launch so a resume rebuilds the
     /// same prompts (W3, R8). Defaulted like `customer`.
     fn system_prompt_suffix(&self) -> Option<&str> {
+        None
+    }
+
+    /// The launcher the steps it builds start children with: `run_workflow`
+    /// tells it when the run ends for good. Defaulted like `customer`.
+    fn launcher(&self) -> Option<Arc<dyn rupu_tools::Launcher>> {
         None
     }
 }
@@ -1597,7 +1604,13 @@ pub async fn run_workflow(
             _ => Vec::new(),
         };
         let applied = gate_book.applied();
-        let end = RunEnd::of(&outcome, &opts.workflow, &step_results, path_scoped);
+        let end = RunEnd::of(
+            &outcome,
+            &opts.workflow,
+            &step_results,
+            path_scoped,
+            rupu_runtime::signal::stopped_by_signal(),
+        );
         let served_decisions = !applied.is_empty();
         // Never over an on-disk `Cancelled` (the cancel-vs-completion race:
         // `RunStore::cancel` from the CLI or `cp serve` writes `Cancelled`
@@ -1632,6 +1645,19 @@ pub async fn run_workflow(
         }
         break outcome;
     };
+
+    // Children its attempts left interrupted are continued by a resume; once
+    // the run ends for good, nothing will. One stopped by a signal is
+    // continued like a paused one.
+    let ended = (cancel_preserved || !matches!(outcome, Ok(InnerOutcome::Paused { .. })))
+        && !rupu_providers::credential_writes::terminating();
+    if let Some(launcher) = opts
+        .factory
+        .launcher()
+        .filter(|_| ended && opts.run_store.is_some())
+    {
+        launcher.end_interrupted(&run_id).await;
+    }
 
     // Map the inner outcome onto what the caller sees: the gates the run is
     // parked at (as persisted — a gate parked before this resume keeps its
@@ -1684,7 +1710,14 @@ pub async fn run_workflow(
     }
     let done_status = match &written {
         Some(rec) => rec.status,
-        None => RunEnd::of(&outcome, &opts.workflow, &step_results, path_scoped).done_status(),
+        None => RunEnd::of(
+            &outcome,
+            &opts.workflow,
+            &step_results,
+            path_scoped,
+            rupu_runtime::signal::stopped_by_signal(),
+        )
+        .done_status(),
     };
 
     // Emit terminal run events (skip for Paused — StepAwaitingApproval
@@ -1764,17 +1797,22 @@ enum RunEnd {
     },
     Failed {
         error: String,
-        /// The typed cause, when an agent failed on a classified outcome.
+        /// The typed cause: an agent's classified outcome, or the signal
+        /// that stopped the run.
         cause: Option<rupu_transcript::OutcomeRecord>,
     },
 }
 
 impl RunEnd {
+    /// `signalled`: the process is being stopped by a signal
+    /// ([`rupu_runtime::signal::stopped_by_signal`]), so a failure is that
+    /// stop's.
     fn of(
         outcome: &Result<InnerOutcome, RunWorkflowError>,
         wf: &Workflow,
         step_results: &[StepResult],
         path_scoped: bool,
+        signalled: bool,
     ) -> Self {
         match outcome {
             Ok(InnerOutcome::Done) => match rejected_outcome(wf, step_results, path_scoped) {
@@ -1803,7 +1841,11 @@ impl RunEnd {
             },
             Err(e) => RunEnd::Failed {
                 error: e.to_string(),
-                cause: e.outcome().cloned(),
+                cause: if signalled {
+                    Some(rupu_transcript::StopCause::StoppedBySignal.record())
+                } else {
+                    e.outcome().cloned()
+                },
             },
         }
     }
@@ -1889,6 +1931,47 @@ impl RunEnd {
             rec.resume_claimed_at = None;
             rec.resume_claimed_by = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod run_end_tests {
+    use super::*;
+
+    fn failed_record(signalled: bool) -> crate::runs::RunRecord {
+        let wf =
+            Workflow::parse("name: w\nsteps:\n  - id: a\n    agent: x\n    prompt: go\n").unwrap();
+        let mut rec: crate::runs::RunRecord = serde_json::from_value(serde_json::json!({
+            "id": "run_1",
+            "workflow_name": "w",
+            "status": "running",
+            "inputs": {},
+            "workspace_id": "ws",
+            "workspace_path": "/w",
+            "transcript_dir": "/w/t",
+            "started_at": "2026-10-12T00:00:00Z",
+        }))
+        .unwrap();
+        let outcome = Err(RunWorkflowError::RunCancelled { aborted: 0 });
+        RunEnd::of(&outcome, &wf, &[], false, signalled).apply(&mut rec, false);
+        rec
+    }
+
+    /// A run that ends failed while its process is stopped by a signal
+    /// records the stop as its typed cause; one that fails otherwise does
+    /// not.
+    #[test]
+    fn a_run_failed_while_stopped_by_a_signal_records_the_stop() {
+        let stopped = failed_record(true);
+        assert_eq!(stopped.status, crate::runs::RunStatus::Failed);
+        assert_eq!(
+            stopped
+                .cause
+                .as_ref()
+                .and_then(rupu_transcript::StopCause::of),
+            Some(rupu_transcript::StopCause::StoppedBySignal)
+        );
+        assert_eq!(failed_record(false).cause, None);
     }
 }
 
@@ -6804,6 +6887,9 @@ pub async fn call_action_tool(
         .resolve_grant(rupu_tools::GrantInputs {
             declared: Some(&declared),
             step_actions: &[],
+            // A launched workflow's action steps stay within its parent's
+            // connector cap (W7, L4).
+            connector_cap: ctx.identity.launch.connector_cap.as_deref(),
             ambient: &[],
             available: &ctx.services.provided(false),
             alias_scope: rupu_tools::AliasScope::Everywhere,
@@ -6811,6 +6897,13 @@ pub async fn call_action_tool(
         .map_err(|e| ActionError::Failed(e.to_string()))?;
     if let Some(u) = grant.unavailable.first() {
         return Err(ActionError::Failed(u.notice_message()));
+    }
+    if !grant.offers(d.name) {
+        return Err(ActionError::Denied {
+            tool: tool.to_string(),
+            reason: "outside the connector tools this run's launching parent was narrowed to"
+                .into(),
+        });
     }
     let Some(body) = rupu_tools::bodies::body(d.name, &ctx) else {
         return Err(ActionError::Failed(format!(
@@ -7437,6 +7530,7 @@ async fn run_on_reject_chain(
                 transcript_path: transcript_path.clone(),
                 on_tool_call: None,
             },
+            None,
             None,
             None,
             AgentAnnounce {
@@ -8116,6 +8210,8 @@ async fn run_linear_step(
         .and_then(|r| r.seed.take())
         .or(paused_seed);
 
+    // Read before this attempt's own row lands.
+    let replaces = replaced_attempts(opts, workflow_run_id, &step.id).remove(&None);
     persist_active_step(opts, workflow_run_id, step, Some(transcript_path.clone())).await;
     // Ledger row for this attempt, at its start (a placed step's host is
     // the step's `host:`). A continuation names the attempt it picks up.
@@ -8229,6 +8325,7 @@ async fn run_linear_step(
                 },
                 opts.pause.clone(),
                 resume_seed,
+                replaces,
                 AgentAnnounce {
                     sink: opts.event_sink.as_ref(),
                     workflow_run_id,
@@ -8860,6 +8957,9 @@ async fn run_fanout_step(
         }
     }
 
+    // Read before any unit's new row lands.
+    let mut replaced_units = replaced_attempts(opts, workflow_run_id, &step.id);
+
     // Pre-extract distribute hosts (if any) so we can compute per-unit
     // placement — both for the transcript path below and for the fallback
     // host used before entering each spawned task.
@@ -9017,6 +9117,7 @@ async fn run_fanout_step(
         let store_for_task = opts.run_store.clone();
         // How this unit resumes an interrupted attempt, if its plan says so.
         let resume_plan = dispatch_plans.remove(&idx);
+        let replaces = replaced_units.remove(&Some(idx));
 
         handles.push(tokio::spawn(async move {
             // Held for the duration of this item's run; dropping it
@@ -9421,6 +9522,7 @@ async fn run_fanout_step(
                         },
                         pause_for_task.clone(),
                         resume_seed,
+                        replaces,
                         AgentAnnounce {
                             sink: event_sink.as_ref(),
                             workflow_run_id: &workflow_run_id,
@@ -9823,6 +9925,7 @@ async fn run_parallel_step(
                 // Parallel sub-steps pause at the step boundary, not mid-unit.
                 None,
                 None,
+                None,
                 AgentAnnounce {
                     sink: event_sink.as_ref(),
                     workflow_run_id: &workflow_run_id,
@@ -9993,6 +10096,30 @@ struct FanoutItemOutcome {
     codename: Option<String>,
 }
 
+/// On a resume, the agent run of the latest earlier attempt of each of
+/// `step_id`'s units (`None`: the step's own attempt): what each new attempt
+/// replaces ([`dispatch_one`]'s `replaces`). Empty outside a resume.
+fn replaced_attempts(
+    opts: &OrchestratorRunOpts,
+    workflow_run_id: &str,
+    step_id: &str,
+) -> std::collections::BTreeMap<Option<usize>, String> {
+    let Some(store) = opts
+        .run_store
+        .as_ref()
+        .filter(|_| opts.resume_from.is_some())
+    else {
+        return Default::default();
+    };
+    store
+        .read_attempts(workflow_run_id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|a| a.step_id == step_id && a.sub_id.is_none())
+        .map(|a| (a.unit_index, a.agent_run_id))
+        .collect()
+}
+
 /// What [`dispatch_one`] seeds an agent run with when it picks up earlier work
 /// instead of starting from the rendered prompt.
 #[derive(Debug, Clone)]
@@ -10080,7 +10207,10 @@ impl ContinuationSeed {
 /// `Some` replaces the prompt so a paused-incomplete step re-runs from its
 /// persisted transcript with correct role alternation — or, when it carries
 /// a `seed_source`, so an interrupted run is continued from its transcript
-/// (see [`ContinuationSeed`]).
+/// (see [`ContinuationSeed`]). `replaces`, on a resume, is the agent run of
+/// the earlier attempt this one replaces: a run seeded from it continues the
+/// children it was given, under the same handles; any other records them
+/// `abandoned`.
 ///
 /// A run that cannot start — its agent did not load, its provider is not
 /// declared or did not build — is recorded as a failed run (transcript and
@@ -10109,6 +10239,7 @@ async fn dispatch_one(
     request: StepRequest,
     pause: Option<CancellationToken>,
     resume_seed: Option<ContinuationSeed>,
+    replaces: Option<String>,
     announce: AgentAnnounce<'_>,
     counters: Option<Arc<crate::usage_ledger::UnitTokenCounters>>,
 ) -> Result<RunResult, RunError> {
@@ -10180,6 +10311,7 @@ async fn dispatch_one(
     if let Some(counters) = counters {
         spec.hooks.on_usage = Some(counters.hook());
     }
+    let continues = resume_seed.is_some();
     if let Some(seed) = resume_seed {
         seed.apply(&mut spec.prompt);
     }
@@ -10212,6 +10344,19 @@ async fn dispatch_one(
             }))
         }
     };
+    // The children the replaced attempt was given: continued before this
+    // attempt's first turn when it continues that attempt's conversation,
+    // else nothing will join them.
+    if let Some(prior) = replaces {
+        let ctx = &assembled.opts.tool_context;
+        if let Some(launcher) = ctx.services.launcher.clone() {
+            if continues {
+                launcher.continue_children(&prior, ctx).await;
+            } else {
+                launcher.abandon_children(&prior, "its run restarted").await;
+            }
+        }
+    }
     // Machine-level admission: bound how many local agent jobs run at once and
     // hold this one back while system memory is under the headroom floor, so a
     // wide fan-out / `split:` DAG cannot drive the host out of memory. The
@@ -10299,20 +10444,17 @@ pub fn read_final_assistant_text(
     run_id: &str,
     step_id: &str,
 ) -> String {
-    let mut output = String::new();
     if !success {
-        return output;
+        return String::new();
     }
-    if let Ok(iter) = JsonlReader::iter(transcript_path) {
-        output = rupu_transcript::final_turn_text(iter.flatten()).unwrap_or_default();
-    } else {
+    if !transcript_path.is_file() {
         warn!(
             run_id = %run_id,
             "transcript missing after step {}; using empty output",
             step_id
         );
     }
-    output
+    rupu_transcript::final_answer(transcript_path).unwrap_or_default()
 }
 
 /// Parse the rendered `for_each:` string into a list of items. We
@@ -10838,6 +10980,7 @@ async fn dispatch_fixer(
         // Panel fixer runs pause at the step boundary, not mid-unit.
         None,
         None,
+        None,
         AgentAnnounce {
             sink: opts.event_sink.as_ref(),
             workflow_run_id,
@@ -11021,6 +11164,7 @@ async fn run_panel_iteration(
                     on_tool_call: None,
                 },
                 // Panel panelists pause at the step boundary, not mid-unit.
+                None,
                 None,
                 None,
                 AgentAnnounce {
@@ -16327,7 +16471,7 @@ loops:
 
         // Its transcript ran to completion (an aborted agent run leaves a
         // transcript with no `RunComplete`).
-        let has_run_complete = JsonlReader::iter(&side.transcript_path)
+        let has_run_complete = rupu_transcript::JsonlReader::iter(&side.transcript_path)
             .expect("side's transcript must exist")
             .any(|ev| matches!(ev, Ok(Event::RunComplete { .. })));
         assert!(

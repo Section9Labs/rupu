@@ -22,7 +22,6 @@ pub mod run_step;
 pub mod runner;
 pub mod runs;
 pub mod step_factory;
-pub mod subagents;
 pub mod templates;
 #[doc(hidden)]
 pub mod testing;
@@ -66,4 +65,7 @@ pub use workflow::{
     TimeoutAction, Trigger, TriggerKind, Workflow, WorkflowDefaults, WorkflowOutputContract,
     WorkflowParseError,
 };
-pub use workflow_runtime::{WorkflowRuntime, WorkflowRuntimeInputs};
+pub use workflow_runtime::{
+    LauncherFactory, WorkflowLauncherInputs, WorkflowRuntime, WorkflowRuntimeError,
+    WorkflowRuntimeInputs,
+};

@@ -5,21 +5,18 @@
 
 use crate::tool::{Tool, ToolContext};
 use crate::{
-    assets, board, budget, coverage, findings, github, gitlab, goal, issues, msg, roster, scm,
-    skills,
+    assets, board, budget, coverage, findings, github, gitlab, goal, issues, launch, msg, roster,
+    scm, skills,
 };
-use crate::{
-    AstGrepTool, BashTool, DispatchAgentTool, DispatchAgentsParallelTool, EditFileTool, GlobTool,
-    GrepTool, ReadFileTool, WriteFileTool,
-};
+use crate::{AstGrepTool, BashTool, EditFileTool, GlobTool, GrepTool, ReadFileTool, WriteFileTool};
 use std::sync::Arc;
 
 /// The body of the catalog tool with canonical name `name` for the run `ctx`
-/// describes, or `None` when this crate holds no body for it (the agentiflow
-/// launch tools until W7) or the run lacks a service the tool can't run
+/// describes, or `None` when the run lacks a service the tool can't run
 /// without: a connector tool without an SCM registry, a coverage tool
-/// without a concern catalog, `assets.mark` without an engagement, the
-/// dispatch pair without a dispatcher, `board.*` / `msg.send` without a
+/// without a concern catalog, `assets.mark` without an engagement,
+/// `dispatch` / `join` without a launcher, `workflows.generate` without a
+/// generator, `board.*` / `msg.send` without a
 /// message bus, `goal.*` / `budget.status` without a run status, the roster
 /// without a catalog, `skills.load` without a granted skill the model may load.
 /// [`crate::ToolServices::provided`] is the same accounting, so a grant
@@ -41,10 +38,11 @@ pub fn body(name: &str, ctx: &ToolContext) -> Option<Arc<dyn Tool>> {
         "grep" => Arc::new(GrepTool),
         "glob" => Arc::new(GlobTool),
         "ast_grep" => Arc::new(AstGrepTool),
-        // sub-agent dispatch
-        "dispatch_agent" if services.dispatcher.is_some() => Arc::new(DispatchAgentTool),
-        "dispatch_agents_parallel" if services.dispatcher.is_some() => {
-            Arc::new(DispatchAgentsParallelTool)
+        // child runs
+        "dispatch" if services.launcher.is_some() => Arc::new(launch::DispatchTool),
+        "join" if services.launcher.is_some() => Arc::new(launch::JoinTool),
+        "workflows.generate" if services.workflow_generator.is_some() => {
+            Arc::new(launch::WorkflowsGenerateTool)
         }
         // coverage ledger
         "coverage.mark" if coverage => Arc::new(coverage::CoverageMarkTool),

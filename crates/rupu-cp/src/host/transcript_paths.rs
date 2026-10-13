@@ -325,6 +325,7 @@ mod tests {
             Event::DispatchStarted {
                 run_id: id.into(),
                 sub_run_id: _sub_id.clone(),
+                kind: "subagent".into(),
                 agent: Some("reviewer".into()),
                 transcript_path: sub_transcript.clone(),
                 codename: None,

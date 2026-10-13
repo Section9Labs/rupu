@@ -356,3 +356,36 @@ fn assistant_block_line_names_each_kind() {
         "abandoned · reasoning"
     );
 }
+
+/// A run ended from outside it reads back as that stop from its own
+/// record, whatever its message says; a failure of its own is no stop.
+#[test]
+fn a_stop_cause_reads_back_from_the_record_it_rides() {
+    use rupu_transcript::StopCause;
+    for cause in [StopCause::StoppedBySignal, StopCause::RunnerDied] {
+        let line = serde_json::to_string(&Event::RunComplete {
+            run_id: "run_1".into(),
+            status: rupu_transcript::RunStatus::Error,
+            total_tokens: 0,
+            duration_ms: 1,
+            error: Some("anything at all".into()),
+            outcome: Some(cause.record()),
+        })
+        .unwrap();
+        let Event::RunComplete {
+            outcome: Some(back),
+            ..
+        } = serde_json::from_str::<Event>(&line).unwrap()
+        else {
+            panic!("{line}")
+        };
+        assert_eq!(StopCause::of(&back), Some(cause), "{line}");
+    }
+    assert_eq!(StopCause::of(&record()), None);
+    let named_like_one = OutcomeRecord {
+        title: "stopped_by_signal".into(),
+        detail: Some("runner_died".into()),
+        ..record()
+    };
+    assert_eq!(StopCause::of(&named_like_one), None);
+}

@@ -81,7 +81,19 @@ fn walk(wf: &Workflow, namer: &mut CrewNamer) -> BTreeMap<SlotKey, String> {
 
 impl RunNaming {
     pub fn open(wf: &Workflow, run_id: &str, run_dir: Option<&Path>) -> Self {
-        let crew = crew_for(run_id);
+        Self::open_under(wf, run_id, run_dir, None)
+    }
+
+    /// [`Self::open`] with the run named `root` (a codename its launching
+    /// run minted) instead of its own crew: its steps are `root>role`.
+    pub fn open_under(
+        wf: &Workflow,
+        run_id: &str,
+        run_dir: Option<&Path>,
+        root: Option<Codename>,
+    ) -> Self {
+        let root = root.unwrap_or_else(|| Codename::crew_only(crew_for(run_id)));
+        let crew = root.crew.clone();
         let mut fresh = CrewNamer::new(crew.clone());
         let slots = walk(wf, &mut fresh);
         let namer = match run_dir {
@@ -90,7 +102,7 @@ impl RunNaming {
         };
         Self {
             namer,
-            crew: Codename::crew_only(crew),
+            crew: root,
             slots,
         }
     }

@@ -130,7 +130,6 @@ pub async fn run_terminating(
                 hooks: Default::default(),
                 pause: None,
                 collectors: Vec::new(),
-                extra_tools: Vec::new(),
                 transcript_path: transcript.clone(),
             },
             None,

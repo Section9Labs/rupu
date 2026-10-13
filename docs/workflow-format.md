@@ -323,9 +323,11 @@ Common fields:
 
 `actions:` **does narrow tool access** — but only the connector portion of
 it (the `scm.*`, `issues.*`, `github.*` and `gitlab.*` tools). Every other tool
-(`bash`, `read_file`, the findings and coverage tools, `dispatch_agent`, …) is
+(`bash`, `read_file`, the findings and coverage tools, `dispatch`, …) is
 never touched by this field; it's governed entirely by the agent's own
-`tools:` and the run mode (`ask`/`bypass`/`readonly`).
+`tools:` and the run mode (`ask`/`bypass`/`readonly`). The narrowing does
+reach every child the step's agent starts with `dispatch`, in its process or
+its own: a child can't call a connector tool the step couldn't.
 
 Entries use the same grammar as an agent's `tools:` (see
 [agent-format.md](agent-format.md#tools)): an exact connector tool name, a
@@ -391,7 +393,7 @@ Rules:
 - `parallel:` sub-steps inherit their parent step's profile; a sub-step has no `findings_profile` of its own.
 - An `action: findings.record` step resolves its profile as the step's own `findings_profile` → `defaults.findings_profile` → `full` (there is no agent frontmatter to consult). Gate `notify:` hooks have no step of their own and use `defaults.findings_profile` (else `full`).
 - `findings.record` needs different `with:` keys per profile, and a missing key is a parse error naming the step, the profile, and the keys: `full` needs `scope` and `report`; `summary` needs `scope`, `summary`, `severity`, and `rationale` (with optional `code_excerpt` / `references`; an `evidence` object, the agent tool's form, works in place of the three). Only key presence is checked, so a value may be a `{{ … }}` template.
-- Sub-agents started through `dispatch_agent` resolve only from their own agent file; the dispatching step's value does not reach them.
+- Children started with `dispatch` resolve only from their own agent file (a workflow child from its own defaults); the dispatching step's value does not reach them.
 - Remote steps (`host:` / `distribute:`) follow the same order. The coordinator resolves the step's value, else `defaults.findings_profile`, and launches each unit with `rupu run --findings-profile <profile>`. When neither is set, the host resolves the agent's `findingsProfile` from its own copy of the agent file, then `full`. A fan-out unit retried on its fallback host keeps the profile.
 - A remote host that can't honour the profile refuses the launch; the unit doesn't run under a different profile. That covers an older tunnel node that didn't advertise support, a bucket whose pull workers haven't advertised it, and an HTTP host whose `/api/host/info` doesn't list it. An older SSH host's `rupu run` rejects the unknown flag, so the unit fails. One gap remains on bucket hosts: an old worker polling the same bucket as an upgraded one can't be detected and may still claim the unit.
 - Upgrade rupu on a remote host before adding `findingsProfile` to an agent it runs: an older release rejects agent files that contain `findingsProfile`, because agent frontmatter does not accept unknown keys.

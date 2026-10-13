@@ -111,6 +111,9 @@ pub struct Args {
     /// config default.
     #[arg(long, value_name = "PROVIDER")]
     pub provider: Option<String>,
+    /// Set when another run launched this one (`--launch-*`, hidden).
+    #[command(flatten)]
+    pub launch: crate::cmd::launch_link::LaunchLinkArgs,
 }
 
 fn parse_findings_profile(s: &str) -> Result<rupu_coverage::FindingProfile, String> {
@@ -119,7 +122,7 @@ fn parse_findings_profile(s: &str) -> Result<rupu_coverage::FindingProfile, Stri
 
 /// `--codename`: a codename with at least one segment. A malformed one is a
 /// usage error, never silently replaced by a derived name.
-fn parse_codename(s: &str) -> Result<rupu_codename::Codename, String> {
+pub(crate) fn parse_codename(s: &str) -> Result<rupu_codename::Codename, String> {
     s.parse::<rupu_codename::Codename>()
         .map_err(|e| e.to_string())
         .and_then(|c| {
@@ -664,8 +667,12 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     let global_mode = cfg.permission_mode.as_deref().and_then(parse);
     let mode = resolve_mode(cli_mode, agent_mode, project_mode, global_mode);
 
-    // Non-TTY + Ask = abort (spec rule).
-    if matches!(mode, PermissionMode::Ask) && !std::io::stdin().is_terminal() {
+    // Non-TTY + Ask = abort (spec rule) — except a run another run launched
+    // (W7): nobody is at its terminal, so `ask` runs unattended, as a
+    // workflow step's does (allowed, with a `permission_mode_degraded`
+    // notice).
+    let launched = args.launch.link().is_some();
+    if matches!(mode, PermissionMode::Ask) && !launched && !std::io::stdin().is_terminal() {
         anyhow::bail!(
             "non-tty + ask mode: rerun with `--mode bypass` or `--mode readonly`, \
              or run from an interactive terminal"
@@ -724,7 +731,20 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             use rupu_agent::continuation::{
                 prepare_continuation, prepare_recovery_continuation, transcript_agent, Continuation,
             };
-            let prev_path = transcripts.join(format!("{prev}.jsonl"));
+            // A sub-agent's transcript lives under the run that dispatched
+            // it (`<runs>/<parent>/sub/<sub_id>/`), wherever that is.
+            let prev_path = if prev.starts_with("sub_") {
+                rupu_orchestrator::RunStore::new(global.join("runs"))
+                    .find_sub_run(prev)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "no sub-run `{prev}` under {}",
+                            global.join("runs").display()
+                        )
+                    })?
+            } else {
+                transcripts.join(format!("{prev}.jsonl"))
+            };
             // The runner truncates its transcript when it starts, so a
             // `--run-id` that already has one would wipe it — the run
             // being continued (which the continued run seeds from, and
@@ -1015,27 +1035,29 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             path: workspace_path.clone(),
         };
 
-        // Sub-agent dispatch: any `dispatch_agent`/`dispatch_agents_parallel`
-        // call anchors its child sub-run(s) under `<runs>/<run_id>/sub/`, and
-        // charges this run's usage ledger. No event sink — bare `rupu run`
-        // uses the `LineStreamPrinter`, which renders dispatch children
-        // post-hoc from the parent transcript's tool_call/tool_result entries.
-        let dispatcher = rupu_runtime::dispatch::InProcessDispatcher::new(
-            Arc::clone(&assembler),
-            Arc::clone(&run_store) as Arc<dyn rupu_runtime::dispatch::SubRunStore>,
-            assembler.dispatch_root(&origin, &run_id, workspace.clone()),
-            None,
-        );
-        dispatcher.set_namer(rupu_codename::SharedNamer::open_or_init(
-            runs_root.join(&run_id).join("codenames.json"),
-            || {
-                let mut n = rupu_codename::CrewNamer::new(codename.crew.clone());
-                if let Some(seg) = codename.segments.last() {
-                    n.seed_role(&spec.name, &seg.role);
-                }
-                n
-            },
-        ));
+        // Children: `dispatch` starts them under this run (sub-agents under
+        // `<runs>/<run_id>/sub/`), named from this run's namer, recorded in
+        // `<runs>/<run_id>/children.jsonl` and charged to this run's usage
+        // ledger. No event sink — bare `rupu run` uses the
+        // `LineStreamPrinter`, which renders children from the parent
+        // transcript's tool calls.
+        let launch_link = args.launch.link();
+        let launcher = rupu_launch::Launchers::local(&global, &assembler.context().config)?
+            .launcher(
+                Arc::clone(&assembler),
+                Arc::clone(&run_store),
+                None,
+                Some(rupu_codename::SharedNamer::open_or_init(
+                    runs_root.join(&run_id).join("codenames.json"),
+                    || {
+                        let mut n = rupu_codename::CrewNamer::new(codename.crew.clone());
+                        if let Some(seg) = codename.segments.last() {
+                            n.seed_role(&spec.name, &seg.role);
+                        }
+                        n
+                    },
+                )),
+            );
 
         let backend_id = "local_checkout".to_string();
         let repo_ref = standalone_repo_ref(run_target.as_ref(), &workspace_path);
@@ -1076,11 +1098,15 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         };
         write_metadata(&metadata_path_for_run(&transcripts, &run_id), &metadata)?;
 
-        let permission = permission_policy(
-            mode,
-            Some(printer.multi_handle()),
-            workspace_path.display().to_string(),
-        );
+        let permission = if launched {
+            PermissionPolicy::unattended(mode)
+        } else {
+            permission_policy(
+                mode,
+                Some(printer.multi_handle()),
+                workspace_path.display().to_string(),
+            )
+        };
 
         let mut prompt = rupu_agent::UserTurn::new(user_message);
         match resume_from.take() {
@@ -1135,13 +1161,15 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             hooks: Default::default(),
             pause: None,
             services: rupu_runtime::assembly::LaunchServices {
-                dispatcher: Some(dispatcher),
+                launcher: Some(launcher.clone()),
+                workflow_generator: Some(launcher),
                 netflow: Some(netflow_sink.clone()),
                 message_bus: fleet_bus,
                 provider: Some(prepared),
                 ..Default::default()
             },
             collectors: fleet_collectors,
+            link: launch_link.clone(),
         };
         // A run that cannot be assembled (its grant fails) is a failed run:
         // recorded in run.json like any other failure, not an early exit.
@@ -1164,9 +1192,19 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         // since the agent is async and the printer is sync, we run the
         // printer in a background thread that polls the transcript while
         // the tokio task drives the agent.
+        // A continued run takes on the children the interrupted one was
+        // given before its first turn (W7): same handles, continued or
+        // restored as they ended.
+        let continues = args.continue_from.clone();
         let agent_task = tokio::spawn(async move {
             match assembled {
-                Ok(run) => run.run().await.result,
+                Ok(run) => {
+                    let ctx = &run.opts.tool_context;
+                    if let (Some(prior), Some(launcher)) = (&continues, &ctx.services.launcher) {
+                        launcher.continue_children(prior, ctx).await;
+                    }
+                    run.run().await.result
+                }
                 Err(e) => Err(e),
             }
         });
@@ -1447,7 +1485,7 @@ fn standalone_run_outcome(
             None => Ok(result),
             Some(err) => Err(RunFailure {
                 message: result.error.clone().unwrap_or_else(|| err.to_string()),
-                cause: err.outcome().cloned().map(Box::new),
+                cause: err.cause().map(Box::new),
             }),
         },
         // An outcome the ladder ran out on carries its rung-3 hint apart from
@@ -1457,7 +1495,7 @@ fn standalone_run_outcome(
                 Some(hint) => format!("{err}; {hint}"),
                 None => err.to_string(),
             },
-            cause: err.outcome().cloned().map(Box::new),
+            cause: err.cause().map(Box::new),
         }),
     }
 }
@@ -1764,6 +1802,22 @@ fn start_coverage_stream(coverage_stream: &std::path::Path, run_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `rupu run` stopped by SIGTERM records the stop as its run's typed
+    /// cause, so nothing reads it as a failure of its own.
+    #[test]
+    fn a_signal_stopped_run_records_the_stop_as_its_cause() {
+        let failure = standalone_run_outcome(Err(rupu_agent::RunError::Terminating))
+            .err()
+            .expect("a failure");
+        assert_eq!(
+            failure
+                .cause
+                .as_deref()
+                .and_then(rupu_transcript::StopCause::of),
+            Some(rupu_transcript::StopCause::StoppedBySignal)
+        );
+    }
 
     fn launch_args(argv: &[&str]) -> Result<Args, clap::Error> {
         parse_launch_args(argv.iter().map(|s| s.to_string()).collect())

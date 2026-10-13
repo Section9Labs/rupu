@@ -35,6 +35,54 @@ pub struct OutcomeRecord {
     pub wire: Value,
 }
 
+/// Why a run was ended from outside it rather than on its own. It rides the
+/// run's typed cause (a workflow `run.json`'s `cause`, a transcript
+/// `RunComplete.outcome`) as an [`OutcomeRecord`] of its own class: a run
+/// that ended so did not fail, it was interrupted, and whoever continues
+/// its parent continues it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopCause {
+    /// Its process was stopped by a signal (SIGTERM, SIGINT) and recorded
+    /// its end on the way out.
+    StoppedBySignal,
+    /// Its runner process died without recording an end; a reaper recorded
+    /// it.
+    RunnerDied,
+}
+
+impl StopCause {
+    const ALL: [StopCause; 2] = [StopCause::StoppedBySignal, StopCause::RunnerDied];
+
+    /// The outcome `class` it is recorded as.
+    pub fn class(self) -> &'static str {
+        match self {
+            StopCause::StoppedBySignal => "stopped_by_signal",
+            StopCause::RunnerDied => "runner_died",
+        }
+    }
+
+    pub fn record(self) -> OutcomeRecord {
+        let title = match self {
+            StopCause::StoppedBySignal => "stopped by a signal",
+            StopCause::RunnerDied => "its runner process died",
+        };
+        OutcomeRecord {
+            id: "stop".into(),
+            class: self.class().into(),
+            severity: Severity::Warning,
+            title: title.into(),
+            detail: None,
+            error_class: None,
+            wire: Value::Null,
+        }
+    }
+
+    /// The stop `o` records, if it records one.
+    pub fn of(o: &OutcomeRecord) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.class() == o.class)
+    }
+}
+
 /// A turn's stop as recorded on `TurnEnd`. Deserializes from a serialized
 /// `rupu_providers::Stop`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

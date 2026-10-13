@@ -1,11 +1,11 @@
 pub mod admission;
 pub mod argv;
-pub mod assembly;
 mod artifacts;
+pub mod assembly;
 mod autoflow_history;
 mod backend;
+pub mod children;
 pub mod credential_manifest;
-pub mod dispatch;
 pub mod file_cache;
 pub mod hop_builder;
 pub mod model_limits;
@@ -13,14 +13,15 @@ pub mod net_capture;
 pub mod netflow;
 pub mod provider_factory;
 mod run_envelope;
+pub mod signal;
 pub mod spawn;
 pub mod usage_ledger;
 mod wake;
 mod worker;
 
 pub use admission::{Admission, JobPermit, MemoryProbe, SystemMemoryProbe};
-pub use assembly::{run_agent, AssembleError, LaunchSpec, Origin, RunAssembler};
 pub use artifacts::{ArtifactKind, ArtifactManifest, ArtifactRef};
+pub use assembly::{run_agent, AssembleError, LaunchSpec, Origin, RunAssembler};
 pub use autoflow_history::{
     AutoflowCycleEvent, AutoflowCycleEventKind, AutoflowCycleMode, AutoflowCycleRecord,
     AutoflowHistoryEventRecord, AutoflowHistoryStore, AutoflowHistoryStoreError,

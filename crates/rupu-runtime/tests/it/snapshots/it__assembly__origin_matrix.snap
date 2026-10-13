@@ -24,7 +24,10 @@ flow_lead:
   netflow: true
   net_capture: false
   scm: true
-  dispatcher: false
+  launcher: true
+  launch_agents:
+    - helper
+  children_dir: "<home>/global/agentiflows/af_1"
   catalog: true
   customer: acme
   output_tokens: 1234
@@ -33,10 +36,10 @@ flow_lead:
   hop_builder: true
   max_turns: 9
   admission: true
-  grant_offers_dispatch_agent: false
+  grant_offers_dispatch: true
   grant_offers_issues_create: true
   grant_offers_agents_list: true
-  origin_grant: "origin:flow_lead: board.claim board.release board.post board.read board.directive board.retract msg.send goal.status goal.coverage budget.status agents.list agents.get workflows.list workflows.get catalog.search findings.report"
+  origin_grant: "origin:flow_lead: board.claim board.release board.post board.read board.directive board.retract msg.send goal.status goal.coverage budget.status agents.list agents.get workflows.list workflows.get catalog.search findings.report dispatch join workflows.generate"
   narrowed: []
 flow_unit:
   surface: agentiflow
@@ -60,7 +63,10 @@ flow_unit:
   netflow: true
   net_capture: false
   scm: true
-  dispatcher: true
+  launcher: true
+  launch_agents:
+    - helper
+  children_dir: "<home>/global/runs/run_flow_unit"
   catalog: true
   customer: acme
   output_tokens: 1234
@@ -69,7 +75,7 @@ flow_unit:
   hop_builder: true
   max_turns: 9
   admission: true
-  grant_offers_dispatch_agent: true
+  grant_offers_dispatch: true
   grant_offers_issues_create: true
   grant_offers_agents_list: true
   origin_grant: "origin:flow_unit: board.claim board.release board.post board.read msg.send"
@@ -96,7 +102,10 @@ session_turn:
   netflow: true
   net_capture: false
   scm: true
-  dispatcher: true
+  launcher: true
+  launch_agents:
+    - helper
+  children_dir: "<home>/global/runs/run_session_turn"
   catalog: true
   customer: acme
   output_tokens: 1234
@@ -105,7 +114,7 @@ session_turn:
   hop_builder: true
   max_turns: 9
   admission: true
-  grant_offers_dispatch_agent: true
+  grant_offers_dispatch: true
   grant_offers_issues_create: true
   grant_offers_agents_list: true
   origin_grant: ~
@@ -132,7 +141,10 @@ standalone:
   netflow: true
   net_capture: false
   scm: true
-  dispatcher: true
+  launcher: true
+  launch_agents:
+    - helper
+  children_dir: "<home>/global/runs/run_standalone"
   catalog: true
   customer: acme
   output_tokens: 1234
@@ -141,7 +153,7 @@ standalone:
   hop_builder: true
   max_turns: 9
   admission: true
-  grant_offers_dispatch_agent: true
+  grant_offers_dispatch: true
   grant_offers_issues_create: true
   grant_offers_agents_list: true
   origin_grant: ~
@@ -168,7 +180,9 @@ sub_agent:
   netflow: true
   net_capture: false
   scm: true
-  dispatcher: true
+  launcher: true
+  launch_agents: []
+  children_dir: "<home>/global/runs/run_sub_agent"
   catalog: true
   customer: acme
   output_tokens: 1234
@@ -177,7 +191,7 @@ sub_agent:
   hop_builder: true
   max_turns: 9
   admission: true
-  grant_offers_dispatch_agent: true
+  grant_offers_dispatch: true
   grant_offers_issues_create: true
   grant_offers_agents_list: true
   origin_grant: ~
@@ -204,7 +218,10 @@ workflow_step:
   netflow: true
   net_capture: false
   scm: true
-  dispatcher: true
+  launcher: true
+  launch_agents:
+    - helper
+  children_dir: "<home>/global/runs/run_workflow_step"
   catalog: true
   customer: acme
   output_tokens: 1234
@@ -213,7 +230,7 @@ workflow_step:
   hop_builder: true
   max_turns: 9
   admission: true
-  grant_offers_dispatch_agent: true
+  grant_offers_dispatch: true
   grant_offers_issues_create: true
   grant_offers_agents_list: true
   origin_grant: ~

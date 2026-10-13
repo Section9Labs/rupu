@@ -65,13 +65,22 @@ pub fn list_workflow_summaries(global: &Path, project: Option<&Path>) -> Vec<Wor
 /// over `<id>.yml` in one directory ([`WORKFLOW_EXTENSIONS`]), matching the
 /// lister.
 pub fn load_workflow(global: &Path, project: Option<&Path>, id: &str) -> Option<Workflow> {
+    Workflow::parse_file(&workflow_path(global, project, id)?).ok()
+}
+
+/// The file [`load_workflow`] reads for `id` (project shadows global), or
+/// `None` when there is none or `id` is not a plain name.
+pub fn workflow_path(
+    global: &Path,
+    project: Option<&Path>,
+    id: &str,
+) -> Option<std::path::PathBuf> {
     if id.is_empty() || id.contains(['/', '\\']) || id.contains("..") {
         return None;
     }
-    let path = project
+    project
         .and_then(|p| workflow_file(&p.join("workflows"), id))
-        .or_else(|| workflow_file(&global.join("workflows"), id))?;
-    Workflow::parse_file(&path).ok()
+        .or_else(|| workflow_file(&global.join("workflows"), id))
 }
 
 /// Workflow file extensions, in preference order (`.yaml` wins over `.yml`

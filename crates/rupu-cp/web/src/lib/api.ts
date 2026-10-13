@@ -1536,6 +1536,40 @@ export interface RunUsageResponse {
   points: UsageTimelinePoint[];
 }
 
+/** What a run launched: `subagent` (in-process), `agent` (its own process)
+ *  or `workflow`. */
+export type ChildKind = 'subagent' | 'agent' | 'workflow';
+
+/** `interrupted`: its parent paused or crashed; the run that continues the
+ *  parent continues it under the same handle. */
+export type ChildState = 'pending' | 'running' | 'done' | 'failed' | 'abandoned' | 'interrupted';
+
+/**
+ * One child of a run — `ChildDto` in `rupu-cp/src/api/children.rs`. Covers
+ * the run's own children, every step agent run's, and theirs:
+ * `parent_run_id` names the run that launched it.
+ */
+export interface RunChild {
+  /** `null` for a legacy sub-agent (pre-ledger, read from `sub/`). */
+  handle: string | null;
+  kind: ChildKind;
+  name: string;
+  run_id: string;
+  parent_run_id: string;
+  depth: number;
+  codename: string | null;
+  address: string | null;
+  status: ChildState;
+  success: boolean | null;
+  error: string | null;
+  tokens: { input: number; output: number } | null;
+  duration_ms: number | null;
+  started_at: string | null;
+  finished_at: string | null;
+  transcript_path: string | null;
+  legacy: boolean;
+}
+
 export interface SessionSummary {
   codename: string;
   codename_derived: boolean;
@@ -2829,6 +2863,15 @@ export const api = {
     }
     const qs = q.toString() ? `?${q}` : '';
     return request<RunUsageResponse>(`/api/runs/${encodeURIComponent(id)}/usage${qs}`);
+  },
+  /** Every child a LOCAL run launched, in launch order per parent. There is
+   *  no `?host=`: the endpoint reads this CP's run store only. */
+  async getRunChildren(id: string, signal?: AbortSignal): Promise<RunChild[]> {
+    const res = await request<{ children: RunChild[] }>(
+      `/api/runs/${encodeURIComponent(id)}/children`,
+      { signal },
+    );
+    return res.children;
   },
   getSessionUsageTimeline(id: string, opts?: { host?: string }): Promise<UsageTimelinePoint[]> {
     const qs = opts?.host ? `?host=${encodeURIComponent(opts.host)}` : '';

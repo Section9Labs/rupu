@@ -3,15 +3,14 @@
 //! tool's name or alias (except the flow-lead-scoped `coverage.status`).
 
 use rupu_tools::{
-    AliasScope, AstGrepTool, BashTool, DispatchAgentTool, DispatchAgentsParallelTool, EditFileTool,
-    GlobTool, GrepTool, ReadFileTool, Tool, ToolCatalog, ToolContext, WriteFileTool,
+    AliasScope, AstGrepTool, BashTool, EditFileTool, GlobTool, GrepTool, ReadFileTool, Tool,
+    ToolCatalog, ToolContext, WriteFileTool,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// `impl Tool for` blocks in production code (before the file's test module),
-/// per tool home. Since W5 every home is in this crate but the agentiflow
-/// launch tools, which W7 replaces.
+/// per tool home. Since W7 every home is in this crate.
 fn production_impls() -> usize {
     let homes: &[&str] = &[
         include_str!("../../src/bash.rs"),
@@ -21,8 +20,9 @@ fn production_impls() -> usize {
         include_str!("../../src/grep.rs"),
         include_str!("../../src/glob.rs"),
         include_str!("../../src/ast_grep.rs"),
-        include_str!("../../src/dispatch_agent.rs"),
-        include_str!("../../src/dispatch_agents_parallel.rs"),
+        include_str!("../../src/launch/dispatch.rs"),
+        include_str!("../../src/launch/join.rs"),
+        include_str!("../../src/launch/generate.rs"),
         include_str!("../../src/coverage/mod.rs"),
         include_str!("../../src/findings/report.rs"),
         include_str!("../../src/findings/verify.rs"),
@@ -42,7 +42,6 @@ fn production_impls() -> usize {
         include_str!("../../src/goal/mod.rs"),
         include_str!("../../src/budget/mod.rs"),
         include_str!("../../src/skills/mod.rs"),
-        include_str!("../../../rupu-agentiflow/src/dispatch_tools.rs"),
     ];
     homes
         .iter()
@@ -62,7 +61,7 @@ fn every_tool_impl_has_a_catalog_descriptor() {
          (or a descriptor was listed for a tool that no longer exists)"
     );
     // The builtins return the very descriptors the catalog lists.
-    let builtins: [&dyn Tool; 9] = [
+    let builtins: [&dyn Tool; 10] = [
         &BashTool,
         &ReadFileTool,
         &WriteFileTool,
@@ -70,8 +69,9 @@ fn every_tool_impl_has_a_catalog_descriptor() {
         &GrepTool,
         &GlobTool,
         &AstGrepTool,
-        &DispatchAgentTool,
-        &DispatchAgentsParallelTool,
+        &rupu_tools::launch::DispatchTool,
+        &rupu_tools::launch::JoinTool,
+        &rupu_tools::launch::WorkflowsGenerateTool,
     ];
     for t in builtins {
         assert!(
@@ -119,14 +119,11 @@ fn every_descriptor_has_a_schema_object_and_a_description() {
 }
 
 #[test]
-fn canonical_names_are_namespaced_except_core_and_legacy_dispatch() {
+fn canonical_names_are_namespaced_except_core_and_the_launch_pair() {
     for d in ToolCatalog::all() {
-        let legacy = matches!(
-            d.name,
-            "dispatch" | "join" | "run_workflow" | "dispatch_agent" | "dispatch_agents_parallel"
-        );
+        let launch = matches!(d.name, "dispatch" | "join");
         assert!(
-            d.is_core() || legacy || d.name.contains('.'),
+            d.is_core() || launch || d.name.contains('.'),
             "`{}` is neither core nor `namespace.verb`",
             d.name
         );
@@ -152,41 +149,26 @@ fn non_shell_names_cover_legacy_and_canonical_but_never_real_commands() {
     }
 }
 
-/// Every descriptor whose body lives in this crate is built by
-/// `bodies::body` for a context that provides every service, and the body
-/// answers with that very descriptor. The agentiflow launch tools (bodies in
-/// `rupu-agentiflow` until W7) are the only ones without a body here.
+/// Every descriptor is built by `bodies::body` for a context that provides
+/// every service, and the body answers with that very descriptor.
 #[test]
-fn every_catalog_tool_but_the_launch_tools_has_a_body() {
+fn every_catalog_tool_has_a_body() {
     let ctx = full_context();
     for d in ToolCatalog::all() {
-        let flow = rupu_tools::catalog::flow::ALL
-            .iter()
-            .any(|f| std::ptr::eq(*f, *d));
-        match rupu_tools::bodies::body(d.name, &ctx) {
-            Some(t) => {
-                assert!(!flow, "{} is a launch tool with a body here", d.name);
-                assert!(std::ptr::eq(t.descriptor(), *d), "{}", d.name);
-            }
-            None => assert!(flow, "{} has no body", d.name),
-        }
+        let t = rupu_tools::bodies::body(d.name, &ctx)
+            .unwrap_or_else(|| panic!("{} has no body", d.name));
+        assert!(std::ptr::eq(t.descriptor(), *d), "{}", d.name);
     }
 }
 
 /// `ToolServices::provided` and `bodies::body` agree: in a bare context
-/// (no registry, no catalog, no engagement, no dispatcher) a tool has a body
+/// (no registry, no catalog, no engagement, no launcher) a tool has a body
 /// exactly when the services it needs are provided.
 #[test]
 fn provided_services_match_the_bodies_that_build() {
     for (ctx, coverage) in [(ToolContext::default(), false), (full_context(), true)] {
         let provided = ctx.services.provided(coverage);
         for d in ToolCatalog::all() {
-            if rupu_tools::catalog::flow::ALL
-                .iter()
-                .any(|f| std::ptr::eq(*f, *d))
-            {
-                continue;
-            }
             assert_eq!(
                 rupu_tools::bodies::body(d.name, &ctx).is_some(),
                 provided.missing_for(d).is_empty(),
@@ -197,28 +179,13 @@ fn provided_services_match_the_bodies_that_build() {
     }
 }
 
-#[derive(Debug)]
-struct NoDispatch;
-
-#[async_trait::async_trait]
-impl rupu_tools::AgentDispatcher for NoDispatch {
-    async fn dispatch(
-        &self,
-        _agent: &str,
-        _prompt: String,
-        _parent: &rupu_tools::RunIdentity,
-        _permission: rupu_tools::SpawnPermission,
-    ) -> Result<rupu_tools::DispatchOutcome, rupu_tools::DispatchError> {
-        unreachable!("never called")
-    }
-}
-
 /// A context providing every service a body in this crate can need.
 fn full_context() -> ToolContext {
     let mut ctx = ToolContext::default();
     let s = &mut ctx.services;
     s.scm = Some(Arc::new(rupu_scm::Registry::default()));
-    s.dispatcher = Some(Arc::new(NoDispatch));
+    s.launcher = Some(Arc::new(crate::support::ScriptedLauncher::default()));
+    s.workflow_generator = Some(Arc::new(crate::support::StubGenerator));
     s.coverage_catalog = Some(Arc::new(
         rupu_coverage::flatten(&rupu_coverage::ConcernsBlock::default()).unwrap(),
     ));
@@ -300,9 +267,8 @@ fn action_eligibility_is_connectors_and_findings() {
     assert_eq!(want.len(), 22);
 }
 
-/// W4 §6.6 / W5 §7: no `impl Tool for` in production code outside this
-/// crate, but the agentiflow launch tools (`rupu-agentiflow`'s
-/// `dispatch_tools.rs`, until W7). Test modules may implement it (fakes).
+/// W4 §6.6 / W7 §7: no `impl Tool for` in production code outside this
+/// crate. Test modules may implement it (fakes).
 #[test]
 fn no_tool_is_implemented_outside_this_crate() {
     let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
@@ -315,7 +281,6 @@ fn no_tool_is_implemented_outside_this_crate() {
         }
         scan(&krate.join("src"), &mut offenders);
     }
-    offenders.retain(|p| !p.ends_with("rupu-agentiflow/src/dispatch_tools.rs"));
     assert!(
         offenders.is_empty(),
         "`impl Tool for` outside rupu-tools (production code): {offenders:?}"

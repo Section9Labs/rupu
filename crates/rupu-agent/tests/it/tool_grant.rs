@@ -104,7 +104,6 @@ async fn run(workspace: &Path, r: Run) -> (Vec<String>, Vec<Event>) {
             hooks: Default::default(),
             pause: None,
             collectors: Vec::new(),
-            extra_tools: Vec::new(),
             transcript_path: transcript.clone(),
         },
         r.agent_tools.as_deref(),
@@ -421,7 +420,7 @@ fn an_unknown_name_fails_the_grant_before_any_run() {
         step_actions: &[],
         concerns: false,
         origin: None,
-        injected: &[],
+        connector_cap: None,
         tool_context: &ctx,
         alias_scope: Default::default(),
     })

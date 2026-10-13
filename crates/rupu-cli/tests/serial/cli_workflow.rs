@@ -916,7 +916,7 @@ const DISPATCH_WORKFLOW_MOCK_SCRIPT: &str = r#"
 "#;
 
 /// Wiring: `rupu workflow run` hands ONE `RunNaming` to both the
-/// orchestrator and the `CliAgentDispatcher`. A sub-agent dispatched from
+/// orchestrator and the launcher. A sub-agent dispatched from
 /// a step is named `<step codename>><role>#1`, `DispatchStarted` carries
 /// that name plus the child's provider/model, the child's own transcript
 /// `RunStart` carries it, and the dispatch counter lands in the run's

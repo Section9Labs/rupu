@@ -5,10 +5,8 @@
 //! builds its registry from the result and nothing else.
 
 use rupu_tools::{
-    AliasScope, AmbientGrant, GrantError, GrantInputs, ResolvedGrant, Tool, ToolCatalog,
-    ToolContext,
+    AliasScope, AmbientGrant, GrantError, GrantInputs, ResolvedGrant, ToolCatalog, ToolContext,
 };
-use std::sync::Arc;
 
 /// What a run's grant is resolved from.
 pub struct RunGrantInputs<'a> {
@@ -17,26 +15,24 @@ pub struct RunGrantInputs<'a> {
     /// The workflow step's `actions:` (connector narrowing); empty outside
     /// a step.
     pub step_actions: &'a [String],
+    /// The connector cap a parent passed down (W7); `None` = no cap.
+    pub connector_cap: Option<&'a [String]>,
     /// The run has a `concerns:` block (ambient `coverage.*`).
     pub concerns: bool,
     /// The grant the run's origin carries (an agentiflow lead's or unit's
     /// coordination set, `origin:flow_lead` / `origin:flow_unit`).
     pub origin: Option<&'a AmbientGrant>,
-    /// Pre-built tools injected into the run (ambient `origin:injected`):
-    /// the agentiflow launch tools until W7.
-    pub injected: &'a [Arc<dyn Tool>],
     /// The run's identity, workspace and services.
     pub tool_context: &'a ToolContext,
     pub alias_scope: AliasScope,
 }
 
 /// Resolve a run's grant (W2): the agent's `tools:`, the step's `actions:`,
-/// the ambient grants (`concerns:`, an engagement, skills, the origin's
-/// grant, injected tools) and the run's services.
+/// the parent's connector cap, the ambient grants (`concerns:`, an
+/// engagement, skills, the origin's grant) and the run's services.
 pub fn resolve_run_grant(inputs: RunGrantInputs<'_>) -> Result<ResolvedGrant, GrantError> {
     let ctx = inputs.tool_context;
-    let injected: Vec<_> = inputs.injected.iter().map(|t| t.descriptor()).collect();
-    let catalog = ToolCatalog::builtin().with(injected.iter().copied());
+    let catalog = ToolCatalog::builtin();
     let engagement = ctx
         .services
         .findings
@@ -60,14 +56,10 @@ pub fn resolve_run_grant(inputs: RunGrantInputs<'_>) -> Result<ResolvedGrant, Gr
     if let Some(origin) = inputs.origin {
         ambient.push(origin.clone());
     }
-    if !injected.is_empty() {
-        ambient.push(AmbientGrant::injected(
-            injected.iter().map(|d| d.name).collect(),
-        ));
-    }
     let grant = catalog.resolve_grant(GrantInputs {
         declared: inputs.declared,
         step_actions: inputs.step_actions,
+        connector_cap: inputs.connector_cap,
         ambient: &ambient,
         // `concerns` stands in for the concern catalog the loop flattens later.
         available: &ctx.services.provided(inputs.concerns),
@@ -99,9 +91,9 @@ pub fn with_grant(
     opts.grant = resolve_run_grant(RunGrantInputs {
         declared,
         step_actions,
+        connector_cap: None,
         concerns: opts.concerns.is_some(),
         origin: None,
-        injected: &opts.extra_tools,
         tool_context: &opts.tool_context,
         alias_scope: opts.alias_scope,
     })?;

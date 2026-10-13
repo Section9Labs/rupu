@@ -14,7 +14,7 @@ use rupu_agent::{run_agent, AgentRunOpts, RunError};
 use rupu_providers::credential_writes;
 use rupu_providers::types::{LlmRequest, LlmResponse, StopReason};
 use rupu_providers::{LlmProvider, ProviderError, StreamEvent};
-use rupu_transcript::{Event, JsonlReader, RunStatus};
+use rupu_transcript::{Event, JsonlReader, RunStatus, StopCause};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -92,7 +92,6 @@ fn opts(
             hooks: Default::default(),
             pause: None,
             collectors: Vec::new(),
-            extra_tools: Vec::new(),
             transcript_path: transcript,
         },
         None,
@@ -167,6 +166,11 @@ async fn a_terminating_process_starts_no_tool_dispatch_and_no_llm_call() {
         )),
         "the transcript ends aborted, saying why: {evs:?}"
     );
+    assert_eq!(
+        stop_cause(&evs),
+        Some(StopCause::StoppedBySignal),
+        "{evs:?}"
+    );
 
     // Phase 2: the flag is up before the run starts: no LLM call at all.
     assert!(credential_writes::terminating());
@@ -188,7 +192,11 @@ async fn a_terminating_process_starts_no_tool_dispatch_and_no_llm_call() {
     ))
     .await;
     match res {
-        Err(RunError::Terminating) => {}
+        Err(e @ RunError::Terminating) => assert_eq!(
+            e.cause().as_ref().and_then(StopCause::of),
+            Some(StopCause::StoppedBySignal),
+            "the run's typed cause is the stop"
+        ),
         Err(other) => panic!("the run stops as terminating, got {other:?}"),
         Ok(_) => panic!("the run stops as terminating, but it completed"),
     }
@@ -206,4 +214,19 @@ async fn a_terminating_process_starts_no_tool_dispatch_and_no_llm_call() {
             ..
         }
     )));
+    assert_eq!(
+        stop_cause(&evs),
+        Some(StopCause::StoppedBySignal),
+        "{evs:?}"
+    );
+}
+
+/// The stop the transcript's `run_complete` records as its typed cause.
+fn stop_cause(evs: &[Event]) -> Option<StopCause> {
+    evs.iter().find_map(|e| match e {
+        Event::RunComplete {
+            outcome: Some(o), ..
+        } => StopCause::of(o),
+        _ => None,
+    })
 }

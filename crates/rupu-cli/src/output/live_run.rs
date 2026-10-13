@@ -1280,6 +1280,7 @@ mod tests {
         Event::DispatchStarted {
             run_id: "r".into(),
             sub_run_id: sub.into(),
+            kind: "subagent".into(),
             agent: Some("scout".into()),
             transcript_path: path.into(),
             codename: Some(codename.into()),

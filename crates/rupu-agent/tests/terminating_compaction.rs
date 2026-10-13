@@ -141,7 +141,6 @@ async fn a_terminating_process_starts_no_compaction_summariser_call() {
                 hooks: Default::default(),
                 pause: None,
                 collectors: Vec::new(),
-                extra_tools: Vec::new(),
                 transcript_path: transcript.clone(),
             },
             None,

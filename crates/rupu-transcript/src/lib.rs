@@ -17,7 +17,7 @@ pub use event::{
     Event, FileEditKind, RunMode, RunStatus, SkillIndexEntry, ToolGrantEntry, ToolGrantMissing,
 };
 pub use netflow_sink::TranscriptSink;
-pub use outcome::{OutcomeRecord, RecoveryAction, Severity, StopRecord};
-pub use reader::{final_turn_text, JsonlReader, ReadError, RunHead, RunSummary};
+pub use outcome::{OutcomeRecord, RecoveryAction, Severity, StopCause, StopRecord};
+pub use reader::{final_answer, final_turn_text, JsonlReader, ReadError, RunHead, RunSummary};
 pub use recorded::{Recorded, RecordedField};
 pub use writer::{JsonlWriter, WriteError};

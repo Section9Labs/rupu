@@ -31,9 +31,27 @@ pub struct RuntimeConfig {
     pub min_free_memory_mb: Option<u64>,
 }
 
+/// `[dispatch]` section of `config.toml` — how many children a run may have
+/// running at once (spec W7 §3.4).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DispatchConfig {
+    /// Children of one parent run that run at once; more wait for a slot.
+    /// Unset ⇒ 8. `0` is read as 1.
+    pub max_concurrent_children: Option<usize>,
+}
+
 #[cfg(test)]
 mod tests {
     use crate::Config;
+
+    #[test]
+    fn dispatch_section_parses() {
+        let cfg: Config = toml::from_str("[dispatch]\nmax_concurrent_children = 3\n").unwrap();
+        assert_eq!(cfg.dispatch.max_concurrent_children, Some(3));
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.dispatch.max_concurrent_children, None);
+    }
 
     #[test]
     fn runtime_section_defaults_are_unset() {

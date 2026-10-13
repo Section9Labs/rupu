@@ -351,6 +351,15 @@ pub async fn run(args: Vec<String>) -> ExitCode {
     ) {
         exit::install_sigterm_handler();
     }
+    if matches!(
+        cli.command,
+        Cmd::Run { .. }
+            | Cmd::Workflow {
+                action: cmd::workflow::Action::Run { .. } | cmd::workflow::Action::Resume { .. }
+            }
+    ) {
+        exit::install_sigint_child_stop();
+    }
     exit::hold_test_credential_write();
 
     // Run / Workflow Run+Resume / Watch / Session live views own a live

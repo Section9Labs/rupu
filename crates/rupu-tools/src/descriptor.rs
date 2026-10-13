@@ -49,13 +49,8 @@ impl Effect {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Service {
-    /// The agentiflow unit supervisor behind `dispatch` / `join` /
-    /// `run_workflow` (W7 makes it the one launcher for every child kind).
+    /// The launcher behind `dispatch` / `join`: every child kind.
     Launcher,
-    /// The in-process sub-agent dispatcher (`ToolContext::dispatcher`) behind
-    /// `dispatch_agent` / `dispatch_agents_parallel`. W7 folds it into
-    /// [`Service::Launcher`].
-    AgentDispatcher,
     Scm,
     Findings,
     /// An active engagement profile set: what `assets.mark` validates an
@@ -76,7 +71,6 @@ impl Service {
     pub fn as_str(self) -> &'static str {
         match self {
             Service::Launcher => "launcher",
-            Service::AgentDispatcher => "agent_dispatcher",
             Service::Scm => "scm",
             Service::Findings => "findings",
             Service::Engagement => "engagement",
@@ -182,7 +176,7 @@ impl ToolDescriptor {
 
     /// The tool's namespace: `core` for the core fs/shell tools, the first
     /// segment of a `namespace.verb` name (`scm` for `scm.prs.create`), and
-    /// `None` for the legacy unqualified dispatch names.
+    /// `None` for the unqualified launch pair (`dispatch`, `join`).
     pub fn namespace(&self) -> Option<&'static str> {
         if self.is_core() {
             return Some("core");
@@ -194,7 +188,7 @@ impl ToolDescriptor {
     /// tool, not a `Spawn`, and needing only the services an action step
     /// provides ([`ACTION_SERVICES`]). An action step has no agent, so it
     /// can't start one; and it has no `concerns:` catalog, no engagement and
-    /// no dispatcher, so a tool needing one of those would always fail.
+    /// no launcher, so a tool needing one of those would always fail.
     pub fn is_action_eligible(&self) -> bool {
         !self.is_core()
             && self.effect != Effect::Spawn

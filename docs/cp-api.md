@@ -138,7 +138,10 @@ its file — and the stream ends with a named `end` event (see below). The
 firehose has neither.
 
 - Run streams carry `rupu_orchestrator::executor::Event`, internally tagged:
-  `{"type": "step_started", ...}`.
+  `{"type": "step_started", ...}`. `dispatch_started` / `dispatch_completed`
+  (a step's agent started or finished a child run) carry the child's `kind`:
+  `subagent`, `agent` or `workflow`. Lines written before `kind` existed read
+  as `subagent`.
 - Transcript streams carry `rupu_transcript::Event`, adjacently tagged:
   `{"type": "...", "data": {...}}` (see [`transcript-schema.md`](transcript-schema.md)).
 
@@ -230,6 +233,7 @@ none, and a body that isn't the expected JSON is a 400.
 | GET | `/api/runs/:id/log` | SSE of the run's step events. | `host`. See [Server-sent events](#server-sent-events). |
 | GET | `/api/runs/:id/usage` | Live usage: totals, per-step, per-call points. | `host`, `since`, `epoch` — pass back the previous response's `epoch` to receive only new points. |
 | GET | `/api/runs/:id/usage-timeline` | Tokens per model call (`TurnPoint`). | `host`. |
+| GET | `/api/runs/:id/children` | Every child the run launched with `dispatch` (all kinds), from the run's and its steps' children ledgers (`children.jsonl`) and their children's, each with its `parent_run_id` and `depth`. Pre-ledger sub-agents are read from `sub/` and marked `legacy`. | Local runs only (no `host`). |
 | GET | `/api/runs/:id/autoflow` | Autoflow provenance: repo, issue, claim, prior cycles. | 404 means the run has no autoflow context. |
 | GET | `/api/runs/:id/coverage` | **Host-internal.** The run's raw `coverage.jsonl` (`application/x-ndjson`); empty when none. | Read by a coordinator merging a remote unit's findings (`run.coverage_stream` feature). |
 | GET | `/api/runs/:id/source` | A line-numbered slice of a file in the run's workspace (`SourceSlice`). | `path` (workspace-relative), `line`, `context` (default 20, max 200), `host`. A missing, binary, > 2 MiB or remote file is 200 with `available: false` and a `reason`. 400 on path traversal. |

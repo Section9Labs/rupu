@@ -139,6 +139,11 @@ impl LedgerFold {
         let Ok(row) = serde_json::from_str::<LedgerRow>(line) else {
             return; // garbled / foreign line: skipped
         };
+        // A launched child's copy for its root's budget: the child's own run
+        // counts the row (W7).
+        if row.rollup {
+            return;
+        }
         if !self.seen.insert(row.id.clone()) {
             return;
         }
@@ -1322,6 +1327,7 @@ mod tests {
             output_tokens: output,
             cached_tokens: 0,
             cache_write_tokens: 0,
+            rollup: false,
         };
         serde_json::to_string(&row).unwrap() + "\n"
     }
@@ -1392,20 +1398,26 @@ mod tests {
         // `apply_line` must skip (a tool_result event and a non-event line) —
         // the kind of content whose per-line owned-String materialisation was
         // the memory spike this fold now avoids.
-        append(&p, &event_json(&Event::RunStart {
-            codename: None,
-            run_id: "run_T".into(),
-            workspace_id: "ws".into(),
-            agent: "a".into(),
-            provider: "anthropic".into(),
-            model: "m".into(),
-            started_at: Utc::now(),
-            mode: rupu_transcript::RunMode::Ask,
-            schema: None,
-            system_prompt: None,
-            customer: None,
-        }));
-        append(&p, "{\"type\":\"tool_result\",\"blob\":\"xxxxxxxxxxxxxxxxxxxx\"}\n");
+        append(
+            &p,
+            &event_json(&Event::RunStart {
+                codename: None,
+                run_id: "run_T".into(),
+                workspace_id: "ws".into(),
+                agent: "a".into(),
+                provider: "anthropic".into(),
+                model: "m".into(),
+                started_at: Utc::now(),
+                mode: rupu_transcript::RunMode::Ask,
+                schema: None,
+                system_prompt: None,
+                customer: None,
+            }),
+        );
+        append(
+            &p,
+            "{\"type\":\"tool_result\",\"blob\":\"xxxxxxxxxxxxxxxxxxxx\"}\n",
+        );
         append(&p, &usage_line("anthropic", "m", 10, 5, None));
         append(&p, "not even json, a raw delta line\n");
         append(&p, &usage_line("anthropic", "m", 20, 7, None));
@@ -1420,7 +1432,11 @@ mod tests {
         std::fs::write(&p, "").unwrap();
         append(&p, &transcript_lines("a", "anthropic", "m", &[(1, 1)]));
         fold.drain(&p);
-        assert_eq!(fold.points.len(), 1, "reset cleared stale points before applying");
+        assert_eq!(
+            fold.points.len(),
+            1,
+            "reset cleared stale points before applying"
+        );
         assert_eq!(fold.resets, 1, "the shrink was counted as a reset");
     }
 
@@ -1582,6 +1598,47 @@ mod tests {
         );
         assert_eq!(step_total(&u, "s"), tok(17, 8));
         assert!(!u.partial);
+    }
+
+    /// W7: a launched child copies its calls into its root's ledger as
+    /// rollup rows; the child's own run counts them, so the root's doesn't.
+    #[test]
+    fn rollup_rows_are_not_counted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = run_store(tmp.path());
+        create_run(&store, "run_ROOT1", RunStatus::Running);
+        let t = tmp.path().join("transcripts/run_A.jsonl");
+        let own = ledger_line(
+            "01OWN",
+            Some("s"),
+            None,
+            "run_A",
+            None,
+            &t,
+            10,
+            5,
+            LedgerKind::Turn,
+        );
+        let copy = ledger_line(
+            "01COPY",
+            None,
+            None,
+            "run_child",
+            Some("run_A"),
+            &tmp.path().join("transcripts/run_child.jsonl"),
+            100,
+            50,
+            LedgerKind::Turn,
+        )
+        .replacen('{', "{\"rollup\":true,", 1);
+        append(
+            &store.usage_ledger_path("run_ROOT1"),
+            &format!("{own}{copy}"),
+        );
+
+        let u = UsageIndex::default().run_usage(&store, "run_ROOT1");
+        assert_eq!(total(&u), tok(10, 5));
+        assert_eq!(u.turns, 1);
     }
 
     #[test]

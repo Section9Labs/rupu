@@ -86,3 +86,24 @@ async fn env_allowlist_filters_inherited_env() {
     assert!(out.stdout.contains("hello-rupu-"), "got: {}", out.stdout);
     assert!(!out.stdout.contains("should-not-leak"));
 }
+
+/// The marker naming the launched child a process belongs to reaches every
+/// command a run's `bash` starts, whatever the allowlist: the sweep finds a
+/// crashed child's leftover tool processes by it.
+#[tokio::test]
+async fn the_run_marker_reaches_every_command() {
+    std::env::set_var(rupu_tools::RUN_ID_ENV, "run_marked");
+    let out = BashTool
+        .invoke(
+            json!({ "command": format!("echo marker=${}", rupu_tools::RUN_ID_ENV) }),
+            &ctx_with_timeout(10),
+        )
+        .await
+        .unwrap();
+    std::env::remove_var(rupu_tools::RUN_ID_ENV);
+    assert!(
+        out.stdout.contains("marker=run_marked"),
+        "got: {}",
+        out.stdout
+    );
+}
