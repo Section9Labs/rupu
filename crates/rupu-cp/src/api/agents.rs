@@ -192,14 +192,25 @@ fn save_agent_file_at(url_name: &str, raw: &str, dir: &FsPath) -> Result<PathBuf
 }
 
 /// Parse a raw `.md` about to be written, refusing (400) one that doesn't
-/// parse or whose `tools:` names an unknown tool — a file the runner would
+/// parse, whose `tools:` names an unknown tool — a file the runner would
 /// refuse to launch is never written (D8; the message carries the
-/// did-you-mean).
+/// did-you-mean) — or whose `skills:` / `preloadSkills:` hold a malformed
+/// entry. A skill that isn't installed is not refused: an agent may be
+/// saved before its skill is, and the name shows in its `load_error`.
 fn parse_agent_for_write(raw: &str) -> Result<rupu_agent::AgentSpec, ApiError> {
     let spec =
         rupu_agent::AgentSpec::parse(raw).map_err(|e| ApiError::bad_request(e.to_string()))?;
     spec.validate_tools()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    for (key, entries) in [
+        ("skills", &spec.skills),
+        ("preloadSkills", &spec.preload_skills),
+    ] {
+        if let Some(entries) = entries {
+            rupu_skills::parse_grants(entries)
+                .map_err(|e| ApiError::bad_request(format!("{key}: {e}")))?;
+        }
+    }
     Ok(spec)
 }
 
@@ -262,13 +273,14 @@ fn detail_from_spec(
     scope_kind: ScopeKind,
     slug: impl Into<String>,
     scope_id: Option<String>,
+    skills: &mut SkillLayers,
 ) -> AgentDetailDto {
     let system_prompt = spec.system_prompt.clone();
     let raw = spec.raw.clone();
     AgentDetailDto {
         system_prompt,
         raw,
-        summary: AgentDto::from_spec(spec, scope, scope_kind, slug, scope_id),
+        summary: AgentDto::from_spec(spec, scope, scope_kind, slug, scope_id, skills),
     }
 }
 
@@ -311,15 +323,21 @@ fn detail_from_spec(
 /// in the delete confirmation) and threads back on its own Delete call when
 /// no explicit scope is otherwise available.
 fn load_detail(s: &AppState, name: &str) -> ApiResult<AgentDetailDto> {
-    if let Some((path, _dir, scope, scope_kind, scope_id)) = resolve_agent_scoped(s, name) {
+    if let Some((path, dir, scope, scope_kind, scope_id)) = resolve_agent_scoped(s, name) {
         let spec = rupu_agent::AgentSpec::parse_file(&path)
             .map_err(|e| ApiError::internal(e.to_string()))?;
+        // A project agent lives in `<project>/.rupu/agents`.
+        let project = match scope_kind {
+            ScopeKind::Project => dir.parent(),
+            ScopeKind::Global => None,
+        };
         return Ok(detail_from_spec(
             spec,
             scope,
             scope_kind,
             name.to_string(),
             scope_id,
+            &mut SkillLayers::new(&s.global_dir, project),
         ));
     }
 
@@ -336,6 +354,7 @@ fn load_detail(s: &AppState, name: &str) -> ApiResult<AgentDetailDto> {
                 ScopeKind::Project,
                 slug,
                 Some(r.workspace.id),
+                &mut SkillLayers::new(&s.global_dir, Some(&rupu_dir)),
             ));
         }
     }
@@ -350,6 +369,7 @@ fn load_detail(s: &AppState, name: &str) -> ApiResult<AgentDetailDto> {
                 ScopeKind::Global,
                 slug,
                 None,
+                &mut SkillLayers::new(&s.global_dir, None),
             ))
         }
         Err(AgentLoadError::NotFound(_)) => {
@@ -402,6 +422,14 @@ pub(crate) struct AgentDto {
     /// list here the same as "nothing to flag against" (every step `actions:`
     /// entry is shown, none of them get the "not granted" flag).
     pub(crate) tools: Vec<String>,
+    /// The agent's frontmatter `skills:` grants, verbatim; absent when it
+    /// declares none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) skills: Vec<String>,
+    /// The agent's frontmatter `preloadSkills:`, verbatim; absent when it
+    /// declares none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) preload_skills: Vec<String>,
     /// `"project"` when the spec was loaded from `<project>/.rupu/agents`,
     /// else `"global"`. Defaults to `"global"` for the global-only endpoints.
     /// DISPLAY ONLY for a project row — it's a workspace path's basename and
@@ -460,24 +488,58 @@ pub(crate) struct AgentDto {
     pub(crate) last_run: Option<String>,
     /// Why this agent can't be launched, when it can't: its `tools:` names
     /// a tool no catalog tool answers to (W2's load-time check, the same one
-    /// `rupu agent validate` runs). Listed and shown anyway, so the operator
-    /// can see and fix it. Absent for a loadable agent.
+    /// `rupu agent validate` runs), or its `skills:` / `preloadSkills:` name
+    /// a skill that isn't installed in the layers of the scope it was listed
+    /// for (the check `rupu run` makes at load, with the install hint).
+    /// Listed and shown anyway, so the operator can see and fix it. Absent
+    /// for a loadable agent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) load_error: Option<String>,
+}
+
+/// The installed skills of one layer set (global, or global plus one
+/// project's), for checking agents' skill names: discovered on the first
+/// agent that declares skills, then reused for the rest of a listing.
+pub(crate) struct SkillLayers {
+    dirs: rupu_skills::LayerDirs,
+    catalog: Option<rupu_skills::SkillCatalog>,
+}
+
+impl SkillLayers {
+    /// `project` is the project's `.rupu` directory.
+    pub(crate) fn new(global: &FsPath, project: Option<&FsPath>) -> Self {
+        Self {
+            dirs: rupu_skills::LayerDirs::for_layers(global, project),
+            catalog: None,
+        }
+    }
+
+    /// Why `spec` can't be launched in these layers, if it can't: its
+    /// `tools:` first, then its skill names.
+    fn load_error(&mut self, spec: &rupu_agent::spec::AgentSpec) -> Option<String> {
+        if let Err(e) = spec.validate_tools() {
+            return Some(e.to_string());
+        }
+        rupu_agent::check_agent_skill_names(spec, &self.dirs, &mut self.catalog)
+            .err()
+            .map(|e| e.to_string())
+    }
 }
 
 impl AgentDto {
     /// Map a loaded [`rupu_agent::spec::AgentSpec`] to the wire DTO, tagging
     /// it with the given scope, file-stem slug, and (for a Project row) the
-    /// underlying workspace's unique id.
+    /// underlying workspace's unique id. `skills` are the layers of the
+    /// scope the agent is listed for.
     pub(crate) fn from_spec(
         spec: rupu_agent::spec::AgentSpec,
         scope: impl Into<String>,
         scope_kind: ScopeKind,
         slug: impl Into<String>,
         scope_id: Option<String>,
+        skills: &mut SkillLayers,
     ) -> Self {
-        let load_error = spec.validate_tools().err().map(|e| e.to_string());
+        let load_error = skills.load_error(&spec);
         AgentDto {
             load_error,
             name: spec.name,
@@ -489,6 +551,8 @@ impl AgentDto {
             max_tokens: spec.max_tokens,
             permission_mode: spec.permission_mode,
             tools: spec.tools.unwrap_or_default(),
+            skills: spec.skills.unwrap_or_default(),
+            preload_skills: spec.preload_skills.unwrap_or_default(),
             scope: scope.into(),
             scope_kind,
             scope_id,
@@ -588,6 +652,7 @@ fn agent_usage_rows(
 async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>> {
     let specs = load_agents(&s.global_dir, None).map_err(|e| ApiError::internal(e.to_string()))?;
     let global_slugs = agent_slug_map(&s.global_dir);
+    let mut global_skills = SkillLayers::new(&s.global_dir, None);
     let mut dtos: Vec<AgentDto> = specs
         .into_iter()
         .map(|spec| {
@@ -595,7 +660,14 @@ async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>
                 .get(&spec.name)
                 .cloned()
                 .unwrap_or_else(|| spec.name.clone());
-            AgentDto::from_spec(spec, "global", ScopeKind::Global, slug, None)
+            AgentDto::from_spec(
+                spec,
+                "global",
+                ScopeKind::Global,
+                slug,
+                None,
+                &mut global_skills,
+            )
         })
         .collect();
 
@@ -609,6 +681,7 @@ async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>
         match load_agents(&rupu_dir, None) {
             Ok(specs) => {
                 let slugs = agent_slug_map(&rupu_dir);
+                let mut skills = SkillLayers::new(&s.global_dir, Some(&rupu_dir));
                 project_dtos.extend(specs.into_iter().map(|spec| {
                     let slug = slugs
                         .get(&spec.name)
@@ -620,6 +693,7 @@ async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>
                         ScopeKind::Project,
                         slug,
                         Some(scope_id.clone()),
+                        &mut skills,
                     )
                 }));
             }
@@ -2964,6 +3038,125 @@ mod tests {
 
         let detail = load_detail(&s, "typo").expect("a broken agent's detail still loads");
         assert!(detail.summary.load_error.is_some());
+    }
+
+    fn install_skill(rupu_dir: &FsPath, name: &str) {
+        let d = rupu_dir.join("skills").join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: The {name} skill.\n---\nbody\n"),
+        )
+        .unwrap();
+    }
+
+    /// A malformed skill entry is refused on write, naming its key; nothing
+    /// is written.
+    #[test]
+    fn writing_an_agent_with_a_malformed_skill_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let raw = "---\nname: a\nskills: [\"team:pdf\"]\n---\nhi\n";
+        let err = save_agent_file(tmp.path(), "a", raw).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            err.1,
+            "skills: entry \"team:pdf\": unknown layer \"team\" (use global: or project:)"
+        );
+        let raw = "---\nname: b\npreloadSkills: [\"Bad Name\"]\n---\nhi\n";
+        let err = create_agent_file(tmp.path(), raw).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            err.1.starts_with("preloadSkills: entry \"Bad Name\": "),
+            "{}",
+            err.1
+        );
+        assert!(!tmp.path().join("agents/a.md").exists());
+        assert!(!tmp.path().join("agents/b.md").exists());
+    }
+
+    /// An agent may be saved before its skill is installed; the unresolved
+    /// name then shows as its load error, with the install hint.
+    #[tokio::test]
+    async fn writing_an_agent_with_an_unknown_skill_is_accepted_and_lists_its_load_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        install_skill(&s.global_dir, "pdf");
+        save_agent_file(
+            &s.global_dir,
+            "a",
+            "---\nname: a\nskills: [pdf, nope]\n---\nhi\n",
+        )
+        .expect("an unknown skill name is not refused on write");
+
+        let Json(rows) = list_agents(State(s.clone())).await.expect("ok");
+        let e = rows[0].load_error.as_deref().expect("a load error");
+        assert!(e.contains("unknown skill \"nope\""), "{e}");
+        assert!(e.contains("rupu skill install"), "{e}");
+        assert!(!e.contains("\"pdf\""), "{e}");
+
+        let detail = load_detail(&s, "a").expect("detail");
+        assert_eq!(detail.summary.load_error.as_deref(), Some(e));
+    }
+
+    #[tokio::test]
+    async fn an_agent_with_installed_skills_lists_them() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        install_skill(&s.global_dir, "pdf");
+        install_skill(&s.global_dir, "house-style");
+        save_agent_file(
+            &s.global_dir,
+            "a",
+            "---\nname: a\nskills: [pdf, \"global:*\"]\npreloadSkills: [house-style]\n---\nhi\n",
+        )
+        .unwrap();
+        save_agent_file(&s.global_dir, "plain", "---\nname: plain\n---\nhi\n").unwrap();
+
+        let Json(rows) = list_agents(State(s)).await.expect("ok");
+        let json = serde_json::to_value(&rows).unwrap();
+        assert_eq!(json[0]["name"], "a");
+        assert_eq!(json[0]["skills"], serde_json::json!(["pdf", "global:*"]));
+        assert_eq!(
+            json[0]["preload_skills"],
+            serde_json::json!(["house-style"])
+        );
+        assert!(json[0].get("load_error").is_none(), "{}", json[0]);
+        assert_eq!(json[1]["name"], "plain");
+        assert!(json[1].get("skills").is_none(), "{}", json[1]);
+        assert!(json[1].get("preload_skills").is_none(), "{}", json[1]);
+    }
+
+    /// A project agent's skills resolve against the global and the project
+    /// layer; a global agent in the global listing, against global only.
+    #[tokio::test]
+    async fn list_agents_checks_project_agents_against_the_project_layer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let repo = tempfile::TempDir::new().unwrap();
+        let rupu_dir = repo.path().join(".rupu");
+        install_skill(&rupu_dir, "notes");
+        register_workspace(&tmp, "ws1", repo.path());
+        save_agent_file_at(
+            "local",
+            "---\nname: local\nskills: [notes]\n---\nhi\n",
+            &rupu_dir.join("agents"),
+        )
+        .unwrap();
+        save_agent_file(
+            &s.global_dir,
+            "global-one",
+            "---\nname: global-one\nskills: [notes]\n---\nhi\n",
+        )
+        .unwrap();
+
+        let Json(rows) = list_agents(State(s.clone())).await.expect("ok");
+        let by_name = |n: &str| rows.iter().find(|r| r.name == n).unwrap();
+        assert_eq!(by_name("local").load_error, None);
+        let e = by_name("global-one").load_error.as_deref().unwrap();
+        assert!(e.contains("unknown skill \"notes\""), "{e}");
+
+        let detail = load_detail(&s, "local").expect("detail");
+        assert_eq!(detail.summary.load_error, None);
     }
 
     /// An agent whose frontmatter omits `tools:` entirely (unrestricted) still

@@ -146,8 +146,21 @@ pub fn load_agent(
             agent: spec.name.clone(),
             source,
         })?;
-    check_skills(&spec, global, project, &mut None, SkillCheck::Names)?;
+    let dirs = rupu_skills::LayerDirs::for_layers(global, project);
+    check_skills(&spec, &dirs, &mut None, SkillCheck::Names)?;
     Ok(spec)
+}
+
+/// [`load_agent`]'s skill check on its own: every name the agent's
+/// `skills:` / `preloadSkills:` give is installed in `dirs`. Reads only the
+/// directory listings. `catalog` is discovered on first need and reused
+/// across calls that share it, so a listing of many agents discovers once.
+pub fn check_agent_skill_names(
+    spec: &AgentSpec,
+    dirs: &rupu_skills::LayerDirs,
+    catalog: &mut Option<rupu_skills::SkillCatalog>,
+) -> Result<(), AgentLoadError> {
+    check_skills(spec, dirs, catalog, SkillCheck::Names)
 }
 
 /// How far [`check_skills`] goes.
@@ -163,8 +176,7 @@ enum SkillCheck {
 /// is discovered on first need and reused across calls that share `catalog`.
 fn check_skills(
     spec: &AgentSpec,
-    global: &Path,
-    project: Option<&Path>,
+    dirs: &rupu_skills::LayerDirs,
     catalog: &mut Option<rupu_skills::SkillCatalog>,
     check: SkillCheck,
 ) -> Result<(), AgentLoadError> {
@@ -173,7 +185,6 @@ fn check_skills(
     }
     let grants = spec.skills.as_deref().unwrap_or_default();
     let preload = spec.preload_skills.as_deref().unwrap_or_default();
-    let dirs = rupu_skills::LayerDirs::for_layers(global, project);
     let err = |key, source| AgentLoadError::Skill {
         agent: spec.name.clone(),
         key,
@@ -183,7 +194,7 @@ fn check_skills(
     let catalog = match catalog {
         Some(c) => c,
         None => {
-            let found = rupu_skills::SkillCatalog::discover(&dirs).map_err(|e| {
+            let found = rupu_skills::SkillCatalog::discover(dirs).map_err(|e| {
                 let key = if grants.is_empty() {
                     "preloadSkills"
                 } else {
@@ -286,6 +297,7 @@ pub struct AgentFileCheck {
 pub fn check_agent_files(global: &Path, project: Option<&Path>) -> Vec<AgentFileCheck> {
     let mut out = Vec::new();
     let mut catalog = None;
+    let dirs = rupu_skills::LayerDirs::for_layers(global, project);
     let layers = std::iter::once((global, AgentLayer::Global))
         .chain(project.map(|p| (p, AgentLayer::Project)));
     for (root, layer) in layers {
@@ -322,8 +334,7 @@ pub fn check_agent_files(global: &Path, project: Option<&Path>) -> Vec<AgentFile
                             source,
                         }),
                         Ok(()) => {
-                            check_skills(&spec, global, project, &mut catalog, SkillCheck::Resolve)
-                                .err()
+                            check_skills(&spec, &dirs, &mut catalog, SkillCheck::Resolve).err()
                         }
                     };
                     (Some(spec.name), err)
