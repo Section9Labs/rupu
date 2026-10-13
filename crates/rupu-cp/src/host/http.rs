@@ -7,6 +7,7 @@
 #![deny(clippy::all)]
 
 use futures_util::StreamExt as _;
+use rupu_runtime::services::operator::{MessagesView, OperatorSendReply, ViewQuery};
 use rupu_skills::ship::{PackedSkill, ShippedSkillRef};
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,13 +16,14 @@ use crate::{
     agent_launcher::AgentLaunchRequest,
     host::connector::{
         spec_peer_codename, EventByteStream, HostCapabilities, HostConnector, HostConnectorError,
-        HostInfo, RunKind, RunListQuery, MAX_WORKSPACE_BYTES,
+        HostInfo, OperatorMessageRequest, RunKind, RunListQuery, MAX_WORKSPACE_BYTES,
     },
+    host::messages::MessageRoute,
     host::skill_ship::{prefixed, ship_through, ShipMemo, ShipOutcome, SkillBundle, Transfer},
     launcher::LaunchRequest,
     node::protocol::{
         CAP_AGENT_ENGAGEMENT_PROFILE, CAP_AGENT_FINDINGS_PROFILE, CAP_AGENT_SKILLS,
-        CAP_AGENT_SKILL_BUNDLE, CAP_RUN_SUPPLIED_RUN_ID, CAP_SESSION_SKILLS,
+        CAP_AGENT_SKILL_BUNDLE, CAP_RUN_MESSAGES, CAP_RUN_SUPPLIED_RUN_ID, CAP_SESSION_SKILLS,
     },
     session_sender::SendMessageRequest,
     session_starter::SessionStartRequest,
@@ -249,6 +251,55 @@ impl HttpHostConnector {
     async fn require_feature(&self, feature: &str, what: &str) -> Result<(), HostConnectorError> {
         let info = self.peer_info().await?;
         Self::require_in(&info, feature, what, &self.base_url)
+    }
+
+    /// [`Self::require_feature`], answered from the `features` this connector
+    /// last read (the host probe re-reads them) and reading `/api/host/info`
+    /// only when it never has: for a call a page may poll.
+    async fn require_known_feature(
+        &self,
+        feature: &str,
+        what: &str,
+    ) -> Result<(), HostConnectorError> {
+        let seen = self
+            .features_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        match seen {
+            None => self.require_feature(feature, what).await,
+            Some(features) if features.iter().any(|f| f == feature) => Ok(()),
+            Some(_) => Err(HostConnectorError::Unsupported(format!(
+                "{what}: remote host {} does not advertise `{feature}`; upgrade rupu there",
+                self.base_url
+            ))),
+        }
+    }
+
+    /// `/api/<route>/<id>/messages` on the remote, once it advertises
+    /// [`CAP_RUN_MESSAGES`]. Its 404 names the id, and its 400 is the
+    /// caller's mistake.
+    async fn messages_request(
+        &self,
+        id: &str,
+        what: &str,
+        build: impl FnOnce(String) -> reqwest_middleware::RequestBuilder,
+    ) -> Result<reqwest::Response, HostConnectorError> {
+        let route = MessageRoute::of_id(id)
+            .ok_or_else(|| HostConnectorError::NotFound(format!("no run `{id}`")))?;
+        self.require_known_feature(CAP_RUN_MESSAGES, what).await?;
+        let url = self.url(&format!("/api/{}/{id}/messages", route.segment()));
+        self.send(build(url)).await.map_err(|e| match e {
+            HostConnectorError::NotFound(_) => HostConnectorError::NotFound(format!(
+                "remote host {} has no {} `{id}`",
+                self.base_url,
+                route.noun()
+            )),
+            HostConnectorError::Remote(400, body) => {
+                HostConnectorError::Invalid(crate::api::runs::remote_error_text(&body))
+            }
+            other => other,
+        })
     }
 
     /// [`Self::require_feature`] against an already-read [`PeerInfo`].
@@ -807,6 +858,46 @@ impl HostConnector for HttpHostConnector {
             complete: true,
         })
     }
+    async fn list_messages(
+        &self,
+        id: &str,
+        q: ViewQuery,
+    ) -> Result<MessagesView, HostConnectorError> {
+        let mut query: Vec<(&str, String)> = Vec::new();
+        if let Some(after) = q.after {
+            query.push(("after", after));
+        }
+        if q.limit != usize::MAX {
+            query.push(("limit", q.limit.to_string()));
+        }
+        if let Some(kinds) = q.kinds {
+            let kinds: Vec<&str> = kinds.iter().map(|k| k.as_str()).collect();
+            query.push(("kind", kinds.join(",")));
+        }
+        let resp = self
+            .messages_request(id, "this run's messages cannot be read", |url| {
+                self.client.get(url).query(&query)
+            })
+            .await?;
+        json_body(resp).await
+    }
+
+    /// The remote CP records its own viewer, if it has one; `msg.viewer`
+    /// has no field to travel in.
+    async fn send_operator_message(
+        &self,
+        id: &str,
+        msg: OperatorMessageRequest,
+    ) -> Result<OperatorSendReply, HostConnectorError> {
+        let body = serde_json::json!({ "to": msg.to, "body": msg.body, "urgent": msg.urgent });
+        let resp = self
+            .messages_request(id, "this run cannot be messaged", |url| {
+                self.client.post(url).json(&body)
+            })
+            .await?;
+        json_body(resp).await
+    }
+
     async fn pull_finding_artifact(
         &self,
         sha256: &str,
@@ -1147,6 +1238,19 @@ impl HostConnector for HttpHostConnector {
 /// Decode a JSON body (already `Result<Value, reqwest::Error>`) and extract a
 /// named `String` field, mapping both decode and missing-field failures to
 /// `HostConnectorError::Invalid`.
+/// A 2xx reply's body as `T`: a body that failed to arrive is a transport
+/// failure, one that arrived but is not `T` is `NotJson` (an older peer's web
+/// UI answering a route it lacks).
+async fn json_body<T: serde::de::DeserializeOwned>(
+    resp: reqwest::Response,
+) -> Result<T, HostConnectorError> {
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| HostConnectorError::Remote(0, e.to_string()))?;
+    serde_json::from_slice(&bytes).map_err(|e| HostConnectorError::NotJson(e.to_string()))
+}
+
 fn extract_string_field(
     result: Result<serde_json::Value, reqwest::Error>,
     field: &str,

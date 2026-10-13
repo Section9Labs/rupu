@@ -293,7 +293,7 @@ impl AppState {
     /// `Config::default()` if the file is absent, unparseable, or invalid, so
     /// a broken config never blocks CP startup — it just serves defaults
     /// until fixed.
-    fn resolve_global_config(global_dir: &std::path::Path) -> rupu_config::Config {
+    pub(crate) fn resolve_global_config(global_dir: &std::path::Path) -> rupu_config::Config {
         let path = global_dir.join("config.toml");
         match rupu_config::resolve(rupu_config::LayerPaths::global_only(&path)) {
             Ok(r) => r.config,

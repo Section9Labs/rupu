@@ -1346,6 +1346,21 @@ mod tests {
                 complete: !self.coverage_incomplete,
             })
         }
+        async fn list_messages(
+            &self,
+            _id: &str,
+            _q: rupu_runtime::services::operator::ViewQuery,
+        ) -> Result<rupu_runtime::services::operator::MessagesView, HostConnectorError> {
+            Err(HostConnectorError::Unsupported("fake".into()))
+        }
+        async fn send_operator_message(
+            &self,
+            _id: &str,
+            _msg: rupu_cp::host::connector::OperatorMessageRequest,
+        ) -> Result<rupu_runtime::services::operator::OperatorSendReply, HostConnectorError>
+        {
+            Err(HostConnectorError::Unsupported("fake".into()))
+        }
         async fn pull_finding_artifact(
             &self,
             _sha256: &str,
@@ -1456,6 +1471,21 @@ mod tests {
                 bytes: Vec::new(),
                 complete: true,
             })
+        }
+        async fn list_messages(
+            &self,
+            _id: &str,
+            _q: rupu_runtime::services::operator::ViewQuery,
+        ) -> Result<rupu_runtime::services::operator::MessagesView, HostConnectorError> {
+            Err(HostConnectorError::Unsupported("fake".into()))
+        }
+        async fn send_operator_message(
+            &self,
+            _id: &str,
+            _msg: rupu_cp::host::connector::OperatorMessageRequest,
+        ) -> Result<rupu_runtime::services::operator::OperatorSendReply, HostConnectorError>
+        {
+            Err(HostConnectorError::Unsupported("fake".into()))
         }
         async fn pull_finding_artifact(
             &self,
@@ -1987,6 +2017,21 @@ steps:
                 complete: true,
             })
         }
+        async fn list_messages(
+            &self,
+            _id: &str,
+            _q: rupu_runtime::services::operator::ViewQuery,
+        ) -> Result<rupu_runtime::services::operator::MessagesView, HostConnectorError> {
+            Err(HostConnectorError::Unsupported("fake".into()))
+        }
+        async fn send_operator_message(
+            &self,
+            _id: &str,
+            _msg: rupu_cp::host::connector::OperatorMessageRequest,
+        ) -> Result<rupu_runtime::services::operator::OperatorSendReply, HostConnectorError>
+        {
+            Err(HostConnectorError::Unsupported("fake".into()))
+        }
         async fn pull_finding_artifact(
             &self,
             _sha256: &str,
@@ -2498,6 +2543,21 @@ steps:
                 complete: true,
             })
         }
+        async fn list_messages(
+            &self,
+            _id: &str,
+            _q: rupu_runtime::services::operator::ViewQuery,
+        ) -> Result<rupu_runtime::services::operator::MessagesView, HostConnectorError> {
+            Err(HostConnectorError::Unsupported("fake".into()))
+        }
+        async fn send_operator_message(
+            &self,
+            _id: &str,
+            _msg: rupu_cp::host::connector::OperatorMessageRequest,
+        ) -> Result<rupu_runtime::services::operator::OperatorSendReply, HostConnectorError>
+        {
+            Err(HostConnectorError::Unsupported("fake".into()))
+        }
         async fn pull_finding_artifact(
             &self,
             _sha256: &str,
@@ -2653,6 +2713,21 @@ steps:
                 bytes: Vec::new(),
                 complete: true,
             })
+        }
+        async fn list_messages(
+            &self,
+            _id: &str,
+            _q: rupu_runtime::services::operator::ViewQuery,
+        ) -> Result<rupu_runtime::services::operator::MessagesView, HostConnectorError> {
+            Err(HostConnectorError::Unsupported("fake".into()))
+        }
+        async fn send_operator_message(
+            &self,
+            _id: &str,
+            _msg: rupu_cp::host::connector::OperatorMessageRequest,
+        ) -> Result<rupu_runtime::services::operator::OperatorSendReply, HostConnectorError>
+        {
+            Err(HostConnectorError::Unsupported("fake".into()))
         }
         async fn pull_finding_artifact(
             &self,

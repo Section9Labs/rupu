@@ -15,6 +15,7 @@ pub mod http;
 pub mod lazy_tail;
 pub mod listing_cache;
 pub mod local;
+pub mod messages;
 pub mod probe_cache;
 pub mod registry;
 #[cfg(test)]

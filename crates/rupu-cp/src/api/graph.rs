@@ -1186,6 +1186,21 @@ mod tests {
                 complete: true,
             })
         }
+        async fn list_messages(
+            &self,
+            _id: &str,
+            _q: rupu_runtime::services::operator::ViewQuery,
+        ) -> Result<rupu_runtime::services::operator::MessagesView, HostConnectorError> {
+            Err(HostConnectorError::Unsupported("fake".into()))
+        }
+        async fn send_operator_message(
+            &self,
+            _id: &str,
+            _msg: crate::host::connector::OperatorMessageRequest,
+        ) -> Result<rupu_runtime::services::operator::OperatorSendReply, HostConnectorError>
+        {
+            Err(HostConnectorError::Unsupported("fake".into()))
+        }
         async fn pull_finding_artifact(
             &self,
             _sha256: &str,

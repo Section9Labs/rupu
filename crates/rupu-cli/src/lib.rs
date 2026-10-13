@@ -916,6 +916,75 @@ mod arg_parse_tests {
         }
     }
 
+    /// The `rupu __message` argv an SSH coordinator sends to a remote whose
+    /// `rupu __features` lists `run.messages`, this build's clap reads as
+    /// sent: a body with quotes, a newline and a leading `-` is one value.
+    #[test]
+    fn the_ssh_message_argv_parses_as_sent() {
+        use cmd::message::HelperAction;
+        assert!(rupu_cp::node::protocol::FeaturesReport::current()
+            .supports(rupu_cp::node::protocol::CAP_RUN_MESSAGES));
+        let parse = |argv: Vec<String>| {
+            Cli::try_parse_from(std::iter::once("rupu".to_string()).chain(argv))
+                .unwrap()
+                .command
+        };
+        let body = "-it's \"done\"\nsecond line";
+        let send = rupu_cp::host::ssh::message_send_argv(
+            "run_01ABC",
+            &rupu_cp::host::connector::OperatorMessageRequest {
+                to: Some("step:scan".into()),
+                body: body.into(),
+                urgent: true,
+                viewer: Some("matt".into()),
+            },
+        );
+        match parse(send) {
+            Cmd::MessageHelper {
+                action:
+                    HelperAction::Send {
+                        id,
+                        body: got,
+                        to,
+                        urgent,
+                        viewer,
+                    },
+            } => {
+                assert_eq!(id, "run_01ABC");
+                assert_eq!(got, body);
+                assert_eq!(to.as_deref(), Some("step:scan"));
+                assert!(urgent);
+                assert_eq!(viewer.as_deref(), Some("matt"));
+            }
+            other => panic!("expected MessageHelper(Send), got {other:?}"),
+        }
+        let list = rupu_cp::host::ssh::message_list_argv(
+            "af_01ABC",
+            &rupu_runtime::services::operator::ViewQuery {
+                after: Some("msg_01A".into()),
+                limit: 7,
+                kinds: Some(vec![rupu_fleet::MessageKind::Operator]),
+            },
+        );
+        match parse(list) {
+            Cmd::MessageHelper {
+                action:
+                    HelperAction::List {
+                        id,
+                        after,
+                        limit,
+                        kind,
+                    },
+            } => {
+                assert_eq!(id, "af_01ABC");
+                assert_eq!(after.as_deref(), Some("msg_01A"));
+                assert_eq!(limit, Some(7));
+                assert_eq!(kind.as_deref(), Some("operator"));
+            }
+            other => panic!("expected MessageHelper(List), got {other:?}"),
+        }
+    }
+
     /// The subcommand an SSH coordinator runs to read this build's features
     /// is this one — renamed on one side only, every remote would look like
     /// it predates the features it has.

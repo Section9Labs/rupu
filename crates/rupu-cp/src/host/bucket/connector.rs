@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use rupu_orchestrator::runs::RunStore;
+use rupu_runtime::services::operator::{MessagesView, OperatorSendReply, ViewQuery};
 use ulid::Ulid;
 
 use crate::{
@@ -19,7 +20,7 @@ use crate::{
         connector::{
             blocking_host, mirror_get_run, mirror_list_runs, mirror_stream_run_events,
             read_transcript_file, spec_peer_codename, EventByteStream, HostCapabilities,
-            HostConnector, HostConnectorError, HostInfo, RunListQuery,
+            HostConnector, HostConnectorError, HostInfo, OperatorMessageRequest, RunListQuery,
         },
         skill_ship::{self, ShipOutcome, SkillBundle},
     },
@@ -430,6 +431,23 @@ impl HostConnector for BucketHostConnector {
             complete: true,
         })
     }
+    /// A bucket carries no messages.
+    async fn list_messages(
+        &self,
+        _id: &str,
+        _q: ViewQuery,
+    ) -> Result<MessagesView, HostConnectorError> {
+        Err(crate::host::messages::no_message_transport("bucket"))
+    }
+
+    async fn send_operator_message(
+        &self,
+        _id: &str,
+        _msg: OperatorMessageRequest,
+    ) -> Result<OperatorSendReply, HostConnectorError> {
+        Err(crate::host::messages::no_message_transport("bucket"))
+    }
+
     async fn pull_finding_artifact(
         &self,
         sha256: &str,
