@@ -248,7 +248,7 @@ In Claude Code, `allowed-tools` pre-approves tools while a skill is active. In r
 Two new events in `rupu-transcript` (the `Event` enum at `crates/rupu-transcript/src/event.rs:73`; both tags added to `KNOWN_EVENT_TAGS` at `:17`; both documented in `docs/transcript-schema.md`):
 
 - **`skill_index`**, written once at run start after `tool_grant`: one row per granted skill with name, layer, stamp, `preload`, `indexed` and reason.
-- **`skill_load`**: name, layer, content hash, base directory, and `via`: `model` (a `skills.load` call), `preload`, `operator` (§5.2) or `reattach` (§6). Written for every load, whichever path made it.
+- **`skill_load`**: name, layer, content hash, base directory, and `via`: `model` (a `skills.load` call), `preload`, `operator` (§5.2), `reattach` (§6) or `continuation` (a skill the continued run had loaded, carried into the new run at its start). Written for every load, whichever path made it.
 
 `skills.load` calls also get the usual `tool_audit` line. New notice kinds: `skill_not_indexed`, `skill_changed`, `skill_missing`, `skill_tools_missing`, `skill_reattach_truncated`. `rupu transcript` and the CP transcript view render both events with the shared one-line renderers, as `tool_grant` does.
 

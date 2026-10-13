@@ -8,5 +8,6 @@ mod final_turn_text;
 mod outcome_events;
 mod reader;
 mod roundtrip;
+mod skills_wire;
 mod usage_event;
 mod writer;

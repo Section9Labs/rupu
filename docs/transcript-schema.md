@@ -417,7 +417,7 @@ A skill's content entered the conversation. Written for every load, whichever pa
 |----------------|--------|-------------|
 | `name`         | string | The skill's name in this run |
 | `layer`        | string | `global` or `project` |
-| `content_hash` | string | sha256 over the skill's files' paths, modes and bytes: the version that was loaded |
+| `content_hash` | string | sha256 over the skill's files' paths, modes and bytes: the version that was loaded. Empty on a `preload` load whose files couldn't be read to hash at run start |
 | `base_dir`     | string | The skill's directory, which its relative file references resolve against |
 | `via`          | string | `model` (a `skills.load` call), `preload` (at run start), `operator` (a session operator invoked it), `reattach` (put back after a compaction) or `continuation` (carried over from the run this one continues) |
 
@@ -704,17 +704,17 @@ notice?                     # model_limits
 tool_grant                  # the tools offered, and why (W2)
 notice*                     # tool_unavailable, one per named tool the run can't serve
 skill_index?                # the skills bound, when the run has any
-skill_load*                 # preload
+(skill_load | notice)*      # preload and continuation loads; skill_not_indexed
 seed?                       # a run seeded from earlier history
 user_message?
 (turn_start
    usage+                   # one per provider call; a compaction call adds one with purpose
    outcome?                 # a non-normal reply, ahead of the turn's content
    (thinking_delta* thinking | assistant_delta* assistant_message | assistant_block)*
-   (tool_call  tool_result  skill_load?  file_edit?  command_run?  tool_audit)*
+   (tool_call  tool_result  (skill_load notice*)?  file_edit?  command_run?  tool_audit)*
  turn_end
  recovery*
- notice*  compaction?)*
+ (skill_load | notice)*  compaction?)*
 net_flow*                   # interleaved anywhere
 run_complete
 ```
@@ -723,7 +723,11 @@ Reasoning, text, tool calls and other blocks appear in the order the model produ
 `outcome` follows the turn's `usage` and precedes its content. Its `recovery` events follow it,
 usually after `turn_end`. A `notice` can appear wherever the runtime intervened; a hop to a
 fallback model writes a `notice` of kind `model_limits` just before its `fell_back` recovery,
-and a note sent back to the model is a `user_message`.
+and a note sent back to the model is a `user_message`. A successful `skills.load` writes its
+`skill_load` right after the call's `tool_result`, then any `skill_changed` or
+`skill_tools_missing` notice. Skills put back after a compaction are `skill_load` lines with
+`via: reattach`, alongside any `skill_changed`, `skill_missing` or `skill_reattach_truncated`
+notice.
 
 ---
 
