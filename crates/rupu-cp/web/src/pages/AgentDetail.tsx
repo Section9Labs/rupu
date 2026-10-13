@@ -5,7 +5,7 @@
 import { useEffect, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { ArrowLeft, Pencil, Trash2 } from 'lucide-react';
-import { api, scopeSelectorFor, type AgentDetail } from '../lib/api';
+import { api, scopeSelectorFor, skillNamesOf, type AgentDetail } from '../lib/api';
 import { cn } from '../lib/cn';
 import CodeHighlight from '../components/CodeHighlight';
 import AgentBuilder from '../components/agentBuilder/AgentBuilder';
@@ -29,6 +29,7 @@ export default function AgentDetailPage() {
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [skillNames, setSkillNames] = useState<string[]>([]);
 
   useEffect(() => {
     if (!name) return;
@@ -49,6 +50,25 @@ export default function AgentDetailPage() {
       cancelled = true;
     };
   }, [name]);
+
+  // The Skills card suggests what this agent's scope can see: the global
+  // layer, plus its project's for a project agent.
+  const skillsWsId = agent?.scope_kind === 'project' ? agent.scope_id ?? undefined : undefined;
+  useEffect(() => {
+    if (!editing) return;
+    let cancelled = false;
+    api
+      .getSkills(skillsWsId)
+      .then((rows) => {
+        if (!cancelled) setSkillNames(skillNamesOf(rows));
+      })
+      .catch(() => {
+        // Non-fatal — the Skills card just has no suggestions.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [editing, skillsWsId]);
 
   function startEdit() {
     if (!agent) return;
@@ -225,6 +245,7 @@ export default function AgentDetailPage() {
               error={saveError}
               onSubmit={saveFrom}
               onCancel={cancelEdit}
+              skillNames={skillNames}
             />
           </div>
         ) : agent.raw ? (

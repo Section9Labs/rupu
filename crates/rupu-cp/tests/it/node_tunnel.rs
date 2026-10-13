@@ -1729,6 +1729,8 @@ mod tunnel_connector {
                 mode: None,
                 target: None,
                 working_dir: None,
+                skills: Vec::new(),
+                preload_skills: Vec::new(),
             })
             .await
             .expect_err("start_session should fail");
@@ -1737,7 +1739,8 @@ mod tunnel_connector {
         let err = conn
             .send_session_turn(rupu_cp::session_sender::SendMessageRequest {
                 session_id: "s".into(),
-                prompt: "hi".into(),
+                prompt: Some("hi".into()),
+                skills: Vec::new(),
             })
             .await
             .expect_err("send_session_turn should fail");

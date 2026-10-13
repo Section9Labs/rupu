@@ -26,6 +26,8 @@ const Agents            = React.lazy(() => import('./pages/Agents'));
 const AgentNew          = React.lazy(() => import('./pages/AgentNew'));
 const AgentDetail       = React.lazy(() => import('./pages/AgentDetail'));
 const AutoflowsDefs     = React.lazy(() => import('./pages/AutoflowsDefs'));
+const Skills            = React.lazy(() => import('./pages/Skills'));
+const SkillDetail       = React.lazy(() => import('./pages/SkillDetail'));
 const Sessions          = React.lazy(() => import('./pages/Sessions'));
 const SessionDetail     = React.lazy(() => import('./pages/SessionDetail'));
 const Workers           = React.lazy(() => import('./pages/Workers'));
@@ -136,6 +138,8 @@ export function AppRoutes({ shell }: { shell: ShellVersion }) {
         <Route path="/agents/new" element={page(<AgentNew />)} />
         <Route path="/agents/:name" element={page(<AgentDetail />)} />
         <Route path="/autoflows" element={v2 ? <Navigate to="/library?tab=autoflows" replace /> : page(<AutoflowsDefs />)} />
+        <Route path="/skills" element={v2 ? <Navigate to="/library?tab=skills" replace /> : page(<Skills />)} />
+        <Route path="/skills/:layer/:name" element={page(<SkillDetail />)} />
         <Route path="/sessions" element={v2 ? <Navigate to="/activity?tab=sessions" replace /> : page(<Sessions />)} />
         <Route path="/sessions/:id" element={page(<SessionDetail />)} />
         <Route path="/hosts" element={v2 ? <Navigate to="/fleet" replace /> : page(<Hosts />)} />

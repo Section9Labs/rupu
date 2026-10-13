@@ -439,6 +439,7 @@ export default function WorkflowDetailPage() {
             onYamlChange={setDraftYaml}
             agents={agents}
             validity={validity}
+            wsId={detail.scope_kind === 'project' ? detail.scope_id ?? undefined : undefined}
           />
         </Suspense>
       </div>

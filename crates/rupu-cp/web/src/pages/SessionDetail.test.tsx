@@ -10,7 +10,7 @@ import '@testing-library/jest-dom/vitest';
 import { afterEach, beforeAll, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
-import { api, type SessionSummary } from '../lib/api';
+import { api, ApiError, type SessionSummary, type SkillRow } from '../lib/api';
 
 vi.mock('../components/charts/RunUsageTimeline', () => ({
   __esModule: true,
@@ -55,6 +55,7 @@ function stubApi(session: SessionSummary) {
   vi.spyOn(api, 'getSession').mockResolvedValue(session);
   vi.spyOn(api, 'getSessionUsageTimeline').mockResolvedValue([]);
   vi.spyOn(api, 'getSessionRuns').mockResolvedValue([]);
+  vi.spyOn(api, 'getSkills').mockResolvedValue([]);
 }
 
 function renderPage(search = '') {
@@ -84,7 +85,7 @@ describe('SessionDetail composer', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Send' }));
 
     // Trimmed prompt is sent with the route's session id (no host → undefined).
-    await waitFor(() => expect(sendSpy).toHaveBeenCalledWith('sess-1', 'hello there', undefined));
+    await waitFor(() => expect(sendSpy).toHaveBeenCalledWith('sess-1', 'hello there', undefined, undefined));
     // On success the textarea is cleared and a confirmation shows.
     await waitFor(() => expect(textarea.value).toBe(''));
     expect(screen.getByText(/Sent — turn queued/)).toBeInTheDocument();
@@ -224,5 +225,97 @@ describe('SessionDetail — codename', () => {
     stubApi(ACTIVE_SESSION);
     renderPage();
     await waitFor(() => expect(screen.getByText('cobalt-harbor')).toBeInTheDocument());
+  });
+});
+
+describe('SessionDetail composer — invoke a skill', () => {
+  const row = (name: string): SkillRow => ({
+    name,
+    layer: 'global',
+    status: 'ok',
+    description: null,
+    error: null,
+    warnings: [],
+    stamp: null,
+    source: null,
+    both_layers: false,
+  });
+
+  async function chooseSkill(name: string) {
+    const picker = await screen.findByTestId('session-invoke-skill');
+    await waitFor(() =>
+      expect(Array.from(picker.querySelectorAll('.ab-chip-ghost')).map((c) => c.textContent)).toContain(`+ ${name}`),
+    );
+    fireEvent.click(Array.from(picker.querySelectorAll('.ab-chip-ghost')).find((c) => c.textContent === `+ ${name}`)!);
+  }
+
+  it("suggests the session project's skills and sends a skill with no prompt", async () => {
+    stubApi({ ...ACTIVE_SESSION, workspace_id: 'ws-1' });
+    const getSkills = vi.spyOn(api, 'getSkills').mockResolvedValue([row('pdf')]);
+    const sendSpy = vi.spyOn(api, 'sendSessionMessage').mockResolvedValue({ run_id: 'run-9' });
+
+    renderPage();
+
+    const send = await screen.findByRole('button', { name: 'Send' });
+    expect(send).toBeDisabled();
+    await chooseSkill('pdf');
+    expect(getSkills).toHaveBeenCalledWith('ws-1');
+    expect(send).toBeEnabled();
+
+    fireEvent.click(send);
+
+    await waitFor(() => expect(sendSpy).toHaveBeenCalledWith('sess-1', '', undefined, ['pdf']));
+    await waitFor(() => expect(screen.queryByLabelText('remove pdf')).toBeNull());
+    expect(screen.getByText(/Sent — turn queued/)).toBeInTheDocument();
+  });
+
+  it('labels the invoke-skill input', async () => {
+    stubApi(ACTIVE_SESSION);
+
+    renderPage();
+
+    expect(await screen.findByLabelText('Invoke skill')).toHaveAttribute('placeholder', 'skill…');
+  });
+
+  it('sends the prompt and the skill together, and clears both', async () => {
+    stubApi(ACTIVE_SESSION);
+    vi.spyOn(api, 'getSkills').mockResolvedValue([row('pdf')]);
+    const sendSpy = vi.spyOn(api, 'sendSessionMessage').mockResolvedValue({ run_id: 'run-9' });
+
+    renderPage();
+
+    const textarea = (await screen.findByLabelText('Message this session')) as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: 'summarise q3.pdf' } });
+    await chooseSkill('pdf');
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+    await waitFor(() => expect(sendSpy).toHaveBeenCalledWith('sess-1', 'summarise q3.pdf', undefined, ['pdf']));
+    await waitFor(() => expect(textarea.value).toBe(''));
+    expect(screen.queryByLabelText('remove pdf')).toBeNull();
+  });
+
+  it("shows a refused send's message in the composer and keeps the chosen skill", async () => {
+    stubApi(ACTIVE_SESSION);
+    vi.spyOn(api, 'getSkills').mockResolvedValue([row('pdf')]);
+    const body = '{"error":"host mini predates session.skills; upgrade rupu there"}';
+    vi.spyOn(api, 'sendSessionMessage').mockRejectedValue(new ApiError(501, body, body));
+
+    renderPage();
+
+    await chooseSkill('pdf');
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/^host mini predates session.skills; upgrade rupu there$/);
+    expect(screen.getByLabelText('remove pdf')).toBeInTheDocument();
+  });
+
+  it('a remote session lists no local skills', async () => {
+    stubApi(ACTIVE_SESSION);
+    const getSkills = vi.spyOn(api, 'getSkills').mockResolvedValue([row('pdf')]);
+
+    renderPage('?host=h1');
+
+    await screen.findByTestId('session-invoke-skill');
+    expect(getSkills).not.toHaveBeenCalled();
   });
 });

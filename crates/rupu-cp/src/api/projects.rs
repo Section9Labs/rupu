@@ -541,13 +541,23 @@ async fn project_agents(
     State(s): State<AppState>,
     Path(ws_id): Path<String>,
 ) -> ApiResult<Json<Vec<AgentDto>>> {
-    let w = load_workspace(&s, &ws_id)?;
+    tokio::task::spawn_blocking(move || project_agent_rows(&s, &ws_id))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .map(Json)
+}
+
+/// [`project_agents`]' rows. Reads the disk.
+fn project_agent_rows(s: &AppState, ws_id: &str) -> ApiResult<Vec<AgentDto>> {
+    let w = load_workspace(s, ws_id)?;
     // The loader joins `agents` onto the project arg, so we pass `<path>/.rupu`.
     let rupu_dir = std::path::Path::new(&w.path).join(".rupu");
     let specs = rupu_agent::loader::load_agents(&s.global_dir, Some(&rupu_dir))
         .map_err(|e| ApiError::internal(e.to_string()))?;
     let global_slugs = crate::api::agents::agent_slug_map(&s.global_dir);
     let project_slugs = crate::api::agents::agent_slug_map(&rupu_dir);
+    // Every row is checked against the layers a run in this project sees.
+    let mut skills = crate::api::agents::SkillLayers::new(&s.global_dir, Some(&rupu_dir));
     let dtos = specs
         .into_iter()
         .map(|spec| {
@@ -567,10 +577,10 @@ async fn project_agents(
                 .cloned()
                 .unwrap_or_else(|| spec.name.clone());
             let scope_id = is_project.then(|| w.id.clone());
-            AgentDto::from_spec(spec, scope, scope_kind, slug, scope_id)
+            AgentDto::from_spec(spec, scope, scope_kind, slug, scope_id, &mut skills)
         })
         .collect();
-    Ok(Json(dtos))
+    Ok(dtos)
 }
 
 /// Merge a project-layer scan over a global-layer scan, where the project
@@ -666,6 +676,106 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             last_run_at: None,
         }
+    }
+
+    /// `GET /api/projects/:ws_id/agents` checks every listed agent's skills
+    /// against the global and that project's layer: the scope it lists for.
+    #[tokio::test]
+    async fn project_agents_check_skills_against_the_project_layer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
+        let repo = tempfile::TempDir::new().unwrap();
+        let rupu_dir = repo.path().join(".rupu");
+        let skill = rupu_dir.join("skills/notes");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: notes\ndescription: Notes.\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("workspaces")).unwrap();
+        std::fs::write(
+            tmp.path().join("workspaces/ws1.toml"),
+            format!(
+                "id = \"ws1\"\npath = \"{}\"\ncreated_at = \"2026-01-01T00:00:00Z\"\n",
+                repo.path().display()
+            ),
+        )
+        .unwrap();
+        for (dir, name, skills) in [
+            (rupu_dir.join("agents"), "local", "[notes]"),
+            (tmp.path().join("agents"), "shared", "[notes]"),
+            (rupu_dir.join("agents"), "missing", "[nope]"),
+        ] {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(format!("{name}.md")),
+                format!("---\nname: {name}\nskills: {skills}\n---\nhi\n"),
+            )
+            .unwrap();
+        }
+
+        let Json(rows) = project_agents(State(s), Path("ws1".into()))
+            .await
+            .expect("ok");
+        let by_name = |n: &str| rows.iter().find(|r| r.name == n).unwrap();
+        assert_eq!(by_name("local").load_error, None);
+        assert_eq!(by_name("shared").load_error, None);
+        let e = by_name("missing").load_error.as_deref().unwrap();
+        assert!(e.contains("unknown skill \"nope\""), "{e}");
+        assert!(e.contains(".rupu/skills"), "names the project layer: {e}");
+    }
+
+    /// A global agent granting a bare name installed in both layers is
+    /// launchable globally, but ambiguous in a project that has its own.
+    #[tokio::test]
+    async fn project_agents_report_a_name_installed_in_both_layers() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
+        let repo = tempfile::TempDir::new().unwrap();
+        for skills in [tmp.path().join("skills"), repo.path().join(".rupu/skills")] {
+            let d = skills.join("pdf");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("SKILL.md"),
+                "---\nname: pdf\ndescription: PDFs.\n---\nbody\n",
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(tmp.path().join("workspaces")).unwrap();
+        std::fs::write(
+            tmp.path().join("workspaces/ws1.toml"),
+            format!(
+                "id = \"ws1\"\npath = \"{}\"\ncreated_at = \"2026-01-01T00:00:00Z\"\n",
+                repo.path().display()
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("agents")).unwrap();
+        std::fs::write(
+            tmp.path().join("agents/reader.md"),
+            "---\nname: reader\nskills: [pdf]\n---\nhi\n",
+        )
+        .unwrap();
+
+        let Json(rows) = project_agents(State(s.clone()), Path("ws1".into()))
+            .await
+            .expect("ok");
+        assert_eq!(
+            rows[0].load_error.as_deref(),
+            Some(
+                "agent `reader`: skills: skill \"pdf\" is installed in both the global and \
+                 the project layer; grant global:pdf or project:pdf"
+            )
+        );
+        let Json(rows) = crate::api::agents::list_agents(State(s)).await.expect("ok");
+        assert_eq!(rows[0].load_error, None, "global scope: one pdf");
     }
 
     #[test]

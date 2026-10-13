@@ -992,6 +992,285 @@ async fn launch_agent_without_skills_posts_no_skills_keys() {
 
 // ── W6: supplied run id + codename over HTTP ──────────────────────────────────
 
+// ── session skills over HTTP ──────────────────────────────────────────────────
+
+struct CapturingSessions {
+    started: std::sync::Mutex<Option<rupu_cp::session_starter::SessionStartRequest>>,
+    sent: std::sync::Mutex<Option<rupu_cp::session_sender::SendMessageRequest>>,
+}
+
+impl CapturingSessions {
+    fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            started: std::sync::Mutex::new(None),
+            sent: std::sync::Mutex::new(None),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl rupu_cp::session_starter::SessionStarter for CapturingSessions {
+    async fn start(
+        &self,
+        req: rupu_cp::session_starter::SessionStartRequest,
+    ) -> Result<String, rupu_cp::session_starter::SessionStartError> {
+        *self.started.lock().unwrap() = Some(req);
+        Ok("ses_REMOTE".into())
+    }
+}
+
+#[async_trait::async_trait]
+impl rupu_cp::session_sender::SessionSender for CapturingSessions {
+    async fn send(
+        &self,
+        req: rupu_cp::session_sender::SendMessageRequest,
+    ) -> Result<String, rupu_cp::session_sender::SendError> {
+        *self.sent.lock().unwrap() = Some(req);
+        Ok("run_REMOTE".into())
+    }
+}
+
+/// A real remote CP serving sessions through `sessions`, with an active
+/// session `ses_1` on disk.
+async fn serve_session_cp(
+    tmp: &tempfile::TempDir,
+    sessions: std::sync::Arc<CapturingSessions>,
+) -> std::net::SocketAddr {
+    let dir = tmp.path().join("sessions").join("ses_1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("session.json"),
+        r#"{"session_id":"ses_1","status":"active"}"#,
+    )
+    .unwrap();
+    serve_cp(
+        cp_state(tmp)
+            .with_session_starter(Some(sessions.clone()))
+            .with_session_sender(Some(sessions)),
+    )
+    .await
+}
+
+fn skilled_session_start() -> rupu_cp::session_starter::SessionStartRequest {
+    rupu_cp::session_starter::SessionStartRequest {
+        agent: "triage".into(),
+        prompt: Some("hi".into()),
+        mode: None,
+        target: None,
+        working_dir: None,
+        skills: vec!["pdf".into()],
+        preload_skills: vec!["house-style".into()],
+    }
+}
+
+fn skill_only_send(skills: &[&str]) -> rupu_cp::session_sender::SendMessageRequest {
+    rupu_cp::session_sender::SendMessageRequest {
+        session_id: "ses_1".into(),
+        prompt: None,
+        skills: skills.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+#[tokio::test]
+async fn send_session_turn_delivers_skills_to_a_real_remote_cp() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sessions = CapturingSessions::new();
+    let addr = serve_session_cp(&tmp, sessions.clone()).await;
+
+    let c = HttpHostConnector::new(format!("http://{addr}"), None);
+    let id = c
+        .send_session_turn(skill_only_send(&["pdf"]))
+        .await
+        .unwrap();
+    assert_eq!(id, "run_REMOTE");
+    let got = sessions.sent.lock().unwrap().clone().expect("remote sent");
+    assert_eq!(got.session_id, "ses_1");
+    assert_eq!(got.prompt, None);
+    assert_eq!(got.skills, ["pdf"]);
+}
+
+#[tokio::test]
+async fn start_session_delivers_skills_to_a_real_remote_cp() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sessions = CapturingSessions::new();
+    let addr = serve_session_cp(&tmp, sessions.clone()).await;
+
+    let c = HttpHostConnector::new(format!("http://{addr}"), None);
+    let id = c.start_session(skilled_session_start()).await.unwrap();
+    assert_eq!(id, "ses_REMOTE");
+    let got = sessions
+        .started
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("remote started");
+    assert_eq!(got.agent, "triage");
+    assert_eq!(got.skills, ["pdf"]);
+    assert_eq!(got.preload_skills, ["house-style"]);
+}
+
+/// A remote predating `session.skills` would drop the keys and run the turn
+/// without the skill, so the connector refuses it and nothing reaches the
+/// peer. Through the coordinator's own API, the refusal is a 501 telling
+/// the operator to upgrade the remote.
+#[tokio::test]
+#[allow(clippy::disallowed_methods)] // a test client calling the coordinator's API
+async fn session_skills_are_refused_by_a_remote_without_session_skills() {
+    let remote = httpmock::MockServer::start_async().await;
+    remote.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(200).json_body(serde_json::json!({
+            "version": "0.90.0",
+            "capabilities": {"backends": [], "scm_hosts": [], "permission_modes": []},
+            "features": ["agent.findings_profile", "agent.engagement_profile", "agent.skills"]
+        }));
+    });
+    let send = remote.mock(|when, then| {
+        when.method("POST").path("/api/sessions/ses_1/send");
+        then.status(200)
+            .json_body(serde_json::json!({"run_id": "run_X"}));
+    });
+    let start = remote.mock(|when, then| {
+        when.method("POST").path("/api/agents/triage/session");
+        then.status(200)
+            .json_body(serde_json::json!({"session_id": "ses_X"}));
+    });
+
+    let c = HttpHostConnector::new(remote.base_url(), None);
+    for err in [
+        c.send_session_turn(skill_only_send(&["pdf"]))
+            .await
+            .unwrap_err(),
+        c.start_session(skilled_session_start()).await.unwrap_err(),
+    ] {
+        assert!(
+            matches!(&err, HostConnectorError::Unsupported(m)
+                if m.contains("0.90.0") && m.contains("skills") && m.contains("upgrade rupu")),
+            "{err:?}"
+        );
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let state = cp_state(&tmp);
+    let host = state
+        .hosts
+        .add_host("old-remote", &remote.base_url(), None)
+        .unwrap();
+    let addr = serve_cp(state).await;
+    let http = reqwest::Client::new();
+    for (url, body) in [
+        (
+            format!("http://{addr}/api/sessions/ses_1/send?host={}", host.id),
+            serde_json::json!({ "prompt": "", "skills": ["pdf"] }),
+        ),
+        (
+            format!("http://{addr}/api/agents/triage/session"),
+            serde_json::json!({ "host": host.id, "prompt": "hi", "skills": ["pdf"] }),
+        ),
+    ] {
+        let resp = http.post(&url).json(&body).send().await.unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::NOT_IMPLEMENTED, "{url}");
+        let text = resp.text().await.unwrap();
+        assert!(text.contains("upgrade rupu"), "{url}: {text}");
+    }
+
+    send.assert_hits(0);
+    start.assert_hits(0);
+}
+
+/// A remote that takes session skills but whose own CLI refuses one answers
+/// 400 with the CLI's message; through the coordinator that stays a 400 with
+/// that message, not a gateway error wrapping the remote's JSON.
+#[tokio::test]
+#[allow(clippy::disallowed_methods)] // a test client calling the coordinator's API
+async fn a_remote_refusing_a_session_skill_is_a_400_with_its_message() {
+    let remote = httpmock::MockServer::start_async().await;
+    remote.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(200).json_body(serde_json::json!({
+            "version": "0.95.0",
+            "capabilities": {"backends": [], "scm_hosts": [], "permission_modes": []},
+            "features": ["agent.skills", "session.skills"]
+        }));
+    });
+    let refusal = serde_json::json!({ "error": "unknown skill \"pdff\" (did you mean pdf?)" });
+    remote.mock(|when, then| {
+        when.method("POST").path("/api/sessions/ses_1/send");
+        then.status(400).json_body(refusal.clone());
+    });
+    remote.mock(|when, then| {
+        when.method("POST").path("/api/agents/triage/session");
+        then.status(400).json_body(refusal.clone());
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let state = cp_state(&tmp);
+    let host = state
+        .hosts
+        .add_host("mini", &remote.base_url(), None)
+        .unwrap();
+    let addr = serve_cp(state).await;
+    let http = reqwest::Client::new();
+    for (url, body) in [
+        (
+            format!("http://{addr}/api/sessions/ses_1/send?host={}", host.id),
+            serde_json::json!({ "skills": ["pdff"] }),
+        ),
+        (
+            format!("http://{addr}/api/agents/triage/session"),
+            serde_json::json!({ "host": host.id, "prompt": "hi", "skills": ["pdff"] }),
+        ),
+    ] {
+        let resp = http.post(&url).json(&body).send().await.unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "{url}");
+        let got: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            got["error"], "unknown skill \"pdff\" (did you mean pdf?)",
+            "{url}"
+        );
+    }
+}
+
+/// No skills ⇒ no feature check and no skills key, so an older remote sees
+/// exactly the send it always did.
+#[tokio::test]
+async fn a_session_send_without_skills_posts_no_skills_key() {
+    let server = httpmock::MockServer::start_async().await;
+    let info = server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(404);
+    });
+    let send = server.mock(|when, then| {
+        when.method("POST")
+            .path("/api/sessions/ses_1/send")
+            .json_body(serde_json::json!({ "prompt": "hi" }));
+        then.status(200)
+            .json_body(serde_json::json!({"run_id": "run_X"}));
+    });
+    let start = server.mock(|when, then| {
+        when.method("POST")
+            .path("/api/agents/triage/session")
+            .matches(|req| {
+                let body: serde_json::Value =
+                    serde_json::from_slice(req.body.as_deref().unwrap_or_default()).unwrap();
+                body.get("skills").is_none() && body.get("preload_skills").is_none()
+            });
+        then.status(200)
+            .json_body(serde_json::json!({"session_id": "ses_X"}));
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    let mut turn = skill_only_send(&[]);
+    turn.prompt = Some("hi".into());
+    assert_eq!(c.send_session_turn(turn).await.unwrap(), "run_X");
+    let mut req = skilled_session_start();
+    req.skills.clear();
+    req.preload_skills.clear();
+    assert_eq!(c.start_session(req).await.unwrap(), "ses_X");
+    info.assert_hits(0);
+    send.assert();
+    start.assert();
+}
+
 fn placed_agent_req() -> rupu_cp::agent_launcher::AgentLaunchRequest {
     let mut req = profiled_agent_req(None);
     req.run_id = Some("run_01COORD".into());

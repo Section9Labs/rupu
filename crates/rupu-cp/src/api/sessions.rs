@@ -1013,10 +1013,47 @@ async fn get_session_runs(
     Ok(Json(v))
 }
 
-/// Request body for `POST /api/sessions/:id/send`.
+/// Request body for `POST /api/sessions/:id/send`. A send carries a
+/// prompt, skills to invoke (`rupu session send --skill`), or both.
 #[derive(Deserialize)]
 struct SendBody {
-    prompt: String,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    skills: Vec<String>,
+}
+
+impl SendBody {
+    /// The request for session `id`: a blank prompt is none, and each skill
+    /// entry is well-formed and names one skill.
+    fn into_request(
+        self,
+        id: String,
+    ) -> Result<crate::session_sender::SendMessageRequest, ApiError> {
+        let prompt = self
+            .prompt
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty());
+        if prompt.is_none() && self.skills.is_empty() {
+            return Err(ApiError::bad_request("a send needs a prompt or a skill"));
+        }
+        let grants = rupu_skills::parse_grants(&self.skills)
+            .map_err(|e| ApiError::bad_request(format!("skills: {e}")))?;
+        if let Some((entry, _)) = self.skills.iter().zip(&grants).find(|(_, g)| {
+            matches!(
+                g,
+                rupu_skills::SkillGrant::AllGlobal | rupu_skills::SkillGrant::AllProject
+            )
+        }) {
+            let refusal = rupu_skills::RunSkillsError::Wildcard(entry.clone());
+            return Err(ApiError::bad_request(format!("skills: {refusal}")));
+        }
+        Ok(crate::session_sender::SendMessageRequest {
+            session_id: id,
+            prompt,
+            skills: self.skills,
+        })
+    }
 }
 
 /// Optional `?host=<id>` query param for `POST /api/sessions/:id/send`.
@@ -1032,7 +1069,8 @@ struct SendQuery {
 ///
 /// Without `?host=` (or `?host=local`): uses the configured [`SessionSender`].
 /// Returns the new run id plus `host_id: "local"`. 501 when no sender is
-/// installed; 400 on an empty prompt; 404 when the session is missing; 409
+/// installed; 400 when the body has neither a prompt nor a skill, or a skill
+/// entry is malformed or a wildcard; 404 when the session is missing; 409
 /// when the session is stopped.
 ///
 /// With `?host=<remote-id>`: proxies via [`HostConnector::send_session_turn`]
@@ -1047,22 +1085,16 @@ async fn send_session(
     Json(body): Json<SendBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::api::runs::validate_id(&id)?;
-    let prompt = body.prompt.trim().to_string();
-    if prompt.is_empty() {
-        return Err(ApiError::bad_request("prompt is empty"));
-    }
+    let req = body.into_request(id.clone())?;
 
     let host = q.host.as_deref().unwrap_or("local").to_string();
 
     if host != "local" {
         let conn = crate::api::runs::resolve_host(&s, &host)?;
-        let req = crate::session_sender::SendMessageRequest {
-            session_id: id,
-            prompt,
-        };
-        let run_id = conn.send_session_turn(req).await.map_err(|e| match e {
-            HostConnectorError::Invalid(m) => ApiError::bad_request(m),
-            other => crate::api::runs::host_read_error(&host, other),
+        let run_id = conn.send_session_turn(req).await.map_err(|e| {
+            crate::api::runs::host_session_request_error(e, |other| {
+                crate::api::runs::host_read_error(&host, other)
+            })
         })?;
         return Ok(Json(
             serde_json::json!({ "run_id": run_id, "host_id": host }),
@@ -1098,10 +1130,6 @@ async fn send_session(
         return Err(ApiError::not_found(format!("session {id} not found")));
     }
 
-    let req = crate::session_sender::SendMessageRequest {
-        session_id: id,
-        prompt,
-    };
     match sender.send(req).await {
         Ok(run_id) => Ok(Json(
             serde_json::json!({ "run_id": run_id, "host_id": "local" }),
@@ -1848,7 +1876,8 @@ mod tests {
             Path("sess1".into()),
             Query(SendQuery { host: None }),
             Json(SendBody {
-                prompt: "hi".into(),
+                prompt: Some("hi".into()),
+                skills: Vec::new(),
             }),
         )
         .await
@@ -1857,7 +1886,7 @@ mod tests {
 
         let captured = mock.last.lock().unwrap().clone().expect("request captured");
         assert_eq!(captured.session_id, "sess1");
-        assert_eq!(captured.prompt, "hi");
+        assert_eq!(captured.prompt.as_deref(), Some("hi"));
     }
 
     #[tokio::test]
@@ -1873,7 +1902,8 @@ mod tests {
             Path("sess1".into()),
             Query(SendQuery { host: None }),
             Json(SendBody {
-                prompt: "hi".into(),
+                prompt: Some("hi".into()),
+                skills: Vec::new(),
             }),
         )
         .await
@@ -1899,12 +1929,155 @@ mod tests {
             Path("sess1".into()),
             Query(SendQuery { host: None }),
             Json(SendBody {
-                prompt: "   ".into(),
+                prompt: Some("   ".into()),
+                skills: Vec::new(),
             }),
         )
         .await
         .expect_err("empty prompt should error");
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    /// POST `body` (the web's JSON) to an active local session `sess1`
+    /// through a capturing sender.
+    async fn send_json(
+        body: serde_json::Value,
+    ) -> (
+        ApiResult<Json<serde_json::Value>>,
+        Option<SendMessageRequest>,
+    ) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_active_session(tmp.path(), "sess1", "active");
+        let mock = Arc::new(MockSender {
+            last: Mutex::new(None),
+            run_id: "run_abc".into(),
+        });
+        let s = crate::state::AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        )
+        .with_session_sender(Some(mock.clone()));
+        let out = send_session(
+            State(s),
+            Path("sess1".into()),
+            Query(SendQuery { host: None }),
+            Json(serde_json::from_value(body).unwrap()),
+        )
+        .await;
+        let captured = mock.last.lock().unwrap().clone();
+        (out, captured)
+    }
+
+    #[tokio::test]
+    async fn send_session_forwards_operator_skills() {
+        let (out, captured) = send_json(serde_json::json!({
+            "prompt": "summarise x.pdf",
+            "skills": ["pdf", "project:notes"]
+        }))
+        .await;
+        assert_eq!(out.expect("ok").0["run_id"], "run_abc");
+        let captured = captured.expect("sent");
+        assert_eq!(captured.prompt.as_deref(), Some("summarise x.pdf"));
+        assert_eq!(captured.skills, ["pdf", "project:notes"]);
+    }
+
+    #[tokio::test]
+    async fn send_with_only_a_skill_and_no_prompt_is_accepted() {
+        let (out, captured) = send_json(serde_json::json!({
+            "prompt": "",
+            "skills": ["pdf"]
+        }))
+        .await;
+        assert_eq!(out.expect("ok").0["run_id"], "run_abc");
+        let captured = captured.expect("sent");
+        assert_eq!(captured.prompt, None);
+        assert_eq!(captured.skills, ["pdf"]);
+
+        let (out, captured) = send_json(serde_json::json!({ "skills": ["pdf"] })).await;
+        assert_eq!(out.expect("ok").0["run_id"], "run_abc");
+        assert_eq!(captured.expect("sent").prompt, None);
+    }
+
+    #[tokio::test]
+    async fn send_with_neither_prompt_nor_skill_is_400() {
+        for body in [
+            serde_json::json!({ "prompt": "  " }),
+            serde_json::json!({ "prompt": "", "skills": [] }),
+            serde_json::json!({}),
+        ] {
+            let (out, captured) = send_json(body.clone()).await;
+            let err = out.expect_err("nothing to send");
+            assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(err.1, "a send needs a prompt or a skill", "{body}");
+            assert!(captured.is_none(), "nothing sent for {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn send_with_a_wildcard_skill_is_400() {
+        for (entry, want) in [
+            (
+                "*",
+                "skills: skill entry \"*\" is a wildcard; invoke one skill by name",
+            ),
+            (
+                "project:*",
+                "skills: skill entry \"project:*\" is a wildcard; invoke one skill by name",
+            ),
+        ] {
+            let (out, captured) = send_json(serde_json::json!({
+                "prompt": "hi",
+                "skills": ["pdf", entry]
+            }))
+            .await;
+            let err = out.expect_err("a wildcard is refused");
+            assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+            assert_eq!(err.1, want);
+            assert!(captured.is_none(), "nothing sent");
+        }
+        let (out, captured) = send_json(serde_json::json!({ "skills": ["--mode"] })).await;
+        let err = out.expect_err("a malformed entry is refused");
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert!(err.1.starts_with("skills: "), "{}", err.1);
+        assert!(captured.is_none(), "nothing sent");
+    }
+
+    /// The local sender's refusal (the CLI resolving the operator's skills
+    /// and exiting 1) reaches the client as a 400 with the CLI's message.
+    #[tokio::test]
+    async fn a_refused_local_send_is_400_with_the_senders_message() {
+        struct Refusing;
+        #[async_trait::async_trait]
+        impl SessionSender for Refusing {
+            async fn send(&self, _req: SendMessageRequest) -> Result<String, SendError> {
+                Err(SendError::Invalid(
+                    "[error] skills: unknown skill \"pdff\" (did you mean pdf?)".into(),
+                ))
+            }
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_active_session(tmp.path(), "sess1", "active");
+        let s = crate::state::AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        )
+        .with_session_sender(Some(Arc::new(Refusing)));
+        let err = send_session(
+            State(s),
+            Path("sess1".into()),
+            Query(SendQuery { host: None }),
+            Json(SendBody {
+                prompt: None,
+                skills: vec!["pdff".into()],
+            }),
+        )
+        .await
+        .expect_err("refused");
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            err.1,
+            "[error] skills: unknown skill \"pdff\" (did you mean pdf?)"
+        );
     }
 
     // Minor finding: a remote CP-of-CP hop's own 409 refusal must surface as

@@ -9,6 +9,7 @@ import {
   FileText,
   IdCard,
   Layers,
+  Library,
   ListChecks,
   Send,
   Shield,
@@ -33,6 +34,7 @@ export const CARD_REGISTRY: CardMeta[] = [
   // Runtime
   { id: 'model', label: 'Model', yamlKeys: 'provider · model · auth', group: 'Runtime', icon: Cpu },
   { id: 'tools', label: 'Tools', yamlKeys: 'tools', group: 'Runtime', icon: Wrench },
+  { id: 'skills', label: 'Skills', yamlKeys: 'skills · preloadSkills', group: 'Runtime', icon: Library },
   { id: 'permission', label: 'Permission', yamlKeys: 'permissionMode', group: 'Runtime', icon: Shield },
   { id: 'reasoning', label: 'Reasoning', yamlKeys: 'effort · maxTurns · maxTokens', group: 'Runtime', icon: Brain },
   // Advanced

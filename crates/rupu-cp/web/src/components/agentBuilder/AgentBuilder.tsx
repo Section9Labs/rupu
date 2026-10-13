@@ -38,6 +38,7 @@ import Output from './cards/Output';
 import Dispatch from './cards/Dispatch';
 import Anthropic from './cards/Anthropic';
 import Concerns from './cards/Concerns';
+import Skills from './cards/Skills';
 import CodeHighlight from '../CodeHighlight';
 import CodeEditor from '../CodeEditor';
 import { Button } from '../ui/Button';
@@ -54,6 +55,8 @@ export interface AgentBuilderProps {
   aiModels?: ProviderModels[];
   onGenerate?: (body: GenerateBody) => Promise<GeneratedDef>;
   agentNames?: string[];
+  /** Installed skill names, the Skills card's suggestions. */
+  skillNames?: string[];
 }
 
 type Mode = 'cards' | 'raw' | 'ai';
@@ -65,6 +68,7 @@ type Mode = 'cards' | 'raw' | 'ai';
 const CARD_FIELDS: Partial<Record<string, (keyof AgentDraft)[]>> = {
   model: ['provider', 'auth', 'model'],
   tools: ['tools'],
+  skills: ['skills', 'preloadSkills'],
   permission: ['permissionMode'],
   reasoning: ['effort', 'maxTurns', 'maxTokens'],
   context: ['contextWindow', 'contextWindowTokens', 'compactAtPercent'],
@@ -77,7 +81,7 @@ const CARD_FIELDS: Partial<Record<string, (keyof AgentDraft)[]>> = {
 // Canvas render order preference: Identity/Model up front, Prompt last (the
 // body is usually the biggest thing and reads naturally at the end), the
 // rest of the registry in between.
-const CANVAS_ORDER = ['identity', 'model', 'tools', 'permission', 'reasoning', 'context', 'output', 'dispatch', 'anthropic', 'concerns', 'prompt'];
+const CANVAS_ORDER = ['identity', 'model', 'tools', 'skills', 'permission', 'reasoning', 'context', 'output', 'dispatch', 'anthropic', 'concerns', 'prompt'];
 
 function hasValue(v: unknown): boolean {
   if (v === undefined || v === null) return false;
@@ -134,6 +138,7 @@ function renderCardBody(
   draft: AgentDraft,
   patch: (p: Partial<AgentDraft>) => void,
   agentNames: string[] | undefined,
+  skillNames: string[] | undefined,
 ) {
   switch (id) {
     case 'identity':
@@ -144,6 +149,8 @@ function renderCardBody(
       return <Prompt draft={draft} patch={patch} />;
     case 'tools':
       return <Tools draft={draft} patch={patch} />;
+    case 'skills':
+      return <Skills draft={draft} patch={patch} skillNames={skillNames} />;
     case 'permission':
       return <Permission draft={draft} patch={patch} />;
     case 'reasoning':
@@ -188,6 +195,7 @@ export default function AgentBuilder({
   aiModels,
   onGenerate,
   agentNames,
+  skillNames,
 }: AgentBuilderProps) {
   const [draft, setDraft] = useState<AgentDraft>(() => parseAgent(initialRaw));
   const [order, setOrder] = useState<string[]>(() => computeInitialOrder(draft));
@@ -575,7 +583,7 @@ export default function AgentBuilder({
                           </button>
                         )}
                       </div>
-                      <div className="ab-card-body">{renderCardBody(id, draft, patch, agentNames)}</div>
+                      <div className="ab-card-body">{renderCardBody(id, draft, patch, agentNames, skillNames)}</div>
                     </div>
                   );
                 })}

@@ -6,7 +6,8 @@
 
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { api, type LaunchMode, type PreviewBody } from '../lib/api';
+import { api, apiErrorMessage, skillNamesOf, type LaunchMode, type PreviewBody } from '../lib/api';
+import { ChipsInput } from './agentBuilder/controls';
 import TargetPicker from './TargetPicker';
 import HostSelect from './HostSelect';
 import { Button } from './ui/Button';
@@ -50,6 +51,9 @@ export default function AgentLauncherSheet({
   const [host, setHost] = useState('local');
   const [launching, setLaunching] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [skills, setSkills] = useState<string[]>([]);
+  const [preloadSkills, setPreloadSkills] = useState<string[]>([]);
+  const [skillNames, setSkillNames] = useState<string[]>([]);
   // Which customer/accounts the launch would use, and whether it would fail.
   const [billing, setBilling] = useState<BillingState>({ customer: undefined, blocked: false });
   const previewBody = useMemo<PreviewBody>(
@@ -60,6 +64,31 @@ export default function AgentLauncherSheet({
     }),
     [agent, target, host],
   );
+
+  // Skill suggestions: the global layer, plus the chosen project's. This CP's
+  // listing says nothing about a remote host's skills, so a remote launch gets
+  // no suggestions (a typed name still goes through).
+  const skillsWsId = target.wsId;
+  const remoteHost = host !== 'local';
+  useEffect(() => {
+    if (remoteHost) {
+      setSkillNames([]);
+      return;
+    }
+    let cancelled = false;
+    api
+      .getSkills(skillsWsId)
+      .then((rows) => {
+        if (!cancelled) setSkillNames(skillNamesOf(rows));
+      })
+      .catch(() => {
+        // Non-fatal — the Skills section just has no suggestions.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [skillsWsId, remoteHost]);
+  const skillSuggestions = ['*', 'project:*', ...skillNames];
 
   // Esc-to-close; focus the dialog on open for keyboard users.
   useEffect(() => {
@@ -79,6 +108,8 @@ export default function AgentLauncherSheet({
       const opts = {
         ...buildAgentLaunch(prompt, mode, target),
         host: host !== 'local' ? host : undefined,
+        ...(skills.length > 0 ? { skills } : {}),
+        ...(preloadSkills.length > 0 ? { preload_skills: preloadSkills } : {}),
       };
       if (launchKind === 'session') {
         const res = await api.startSession(agent, opts);
@@ -91,7 +122,7 @@ export default function AgentLauncherSheet({
       }
       onClose();
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : (launchKind === 'session' ? 'Failed to start session' : 'Failed to launch run'));
+      setError(apiErrorMessage(e) || (launchKind === 'session' ? 'Failed to start session' : 'Failed to launch run'));
       setLaunching(false);
     }
   }
@@ -227,6 +258,45 @@ export default function AgentLauncherSheet({
               className="w-full"
             />
           </label>
+
+          {/* ── Skills ─────────────────────────────────────────────── */}
+          <details className="group" data-testid="launch-skills">
+            <summary className="cursor-pointer list-none text-ui font-semibold uppercase tracking-wide text-ink-dim hover:text-ink">
+              <span className="group-open:hidden">▸ Skills</span>
+              <span className="hidden group-open:inline">▾ Skills</span>
+              {skills.length + preloadSkills.length > 0 && (
+                <span className="ml-1 normal-case tracking-normal text-ink-mute">
+                  ({skills.length + preloadSkills.length})
+                </span>
+              )}
+            </summary>
+            <div className="mt-2 space-y-3">
+              <div data-testid="launch-skills-load" className="space-y-1">
+                <span className="block text-ui text-ink-dim">May load</span>
+                <ChipsInput
+                  list={skills}
+                  aria-label="Skills it may load"
+                  suggestions={skillSuggestions}
+                  placeholder="skill…"
+                  onChange={setSkills}
+                />
+              </div>
+              <div data-testid="launch-skills-preload" className="space-y-1">
+                <span className="block text-ui text-ink-dim">Always in the prompt (preload)</span>
+                <ChipsInput
+                  list={preloadSkills}
+                  aria-label="Skills always in its prompt"
+                  suggestions={skillSuggestions}
+                  placeholder="skill…"
+                  onChange={setPreloadSkills}
+                />
+              </div>
+              <p className="text-ui text-ink-mute">
+                Added to the agent&apos;s own skills. * means every global skill; project skills need their exact
+                name or project:*.
+              </p>
+            </div>
+          </details>
 
           <LaunchBillingPanel
             body={previewBody}

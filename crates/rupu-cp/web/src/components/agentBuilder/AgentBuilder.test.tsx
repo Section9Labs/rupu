@@ -7,7 +7,7 @@
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
-import { render, screen, cleanup, fireEvent } from '@testing-library/react';
+import { render, screen, cleanup, fireEvent, within } from '@testing-library/react';
 
 vi.mock('../CodeEditor', () => ({
   __esModule: true,
@@ -272,6 +272,36 @@ describe('AgentBuilder', () => {
     expect(screen.getByText('+ code-reviewer')).toBeInTheDocument();
     fireEvent.click(screen.getByText('+ code-reviewer'));
     expect(screen.getByTestId('ab-yaml')).toHaveTextContent('code-reviewer');
+  });
+
+  it('threads skillNames into the Skills card and writes the chosen skill', () => {
+    render(
+      <AgentBuilder
+        initialRaw={SAMPLE_RAW}
+        submitLabel="Create agent"
+        submitting={false}
+        error={null}
+        onSubmit={vi.fn()}
+        skillNames={['pdf']}
+      />,
+    );
+    fireEvent.click(screen.getByLabelText('add Skills card'));
+    fireEvent.click(within(screen.getByTestId('ab-skills')).getByText('+ pdf'));
+    expect(screen.getByTestId('ab-yaml')).toHaveTextContent('skills: - pdf');
+  });
+
+  it('opens the Skills card for an agent that declares skills', () => {
+    render(
+      <AgentBuilder
+        initialRaw={'---\nname: a\npreloadSkills: [house-style]\n---\n\nbody\n'}
+        submitLabel="Save"
+        submitting={false}
+        error={null}
+        onSubmit={vi.fn()}
+      />,
+    );
+    expect(screen.getByLabelText('remove Skills card')).toBeInTheDocument();
+    expect(within(screen.getByTestId('ab-preload-skills')).getByText('house-style')).toBeInTheDocument();
   });
 
   it('shows an empty-body warning without disabling submit', () => {

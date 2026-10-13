@@ -18,7 +18,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import yaml from 'js-yaml';
-import { api, type AgentSummary, type ToolSpec } from '../../lib/api';
+import { api, skillNamesOf, type AgentSummary, type ToolSpec } from '../../lib/api';
 import {
   convertInlineApprovalToGate,
   graphToWorkflowObject,
@@ -47,6 +47,9 @@ interface WorkflowEditorProps {
   agents: AgentSummary[];
   /** Live-validate result from the page (server-side parse check). */
   validity: { ok: boolean; error?: string } | null;
+  /** The workflow's project (`scope_id`), so the step form also suggests that
+   *  project's skills. Absent for a global workflow. */
+  wsId?: string;
 }
 
 /** Parse `draftYaml` into a laid-out graph. A non-object document (or a parse
@@ -141,6 +144,7 @@ export default function WorkflowEditor({
   onYamlChange,
   agents,
   validity,
+  wsId,
 }: WorkflowEditorProps) {
   const [graph, setGraph] = useState<WorkflowGraph>(() => seedGraph(draftYaml));
   // The tools an `action:` step may call (`action_eligible` in the catalog):
@@ -304,6 +308,23 @@ export default function WorkflowEditor({
       alive = false;
     };
   }, []);
+
+  // Installed skill names for the step form's skills field.
+  const [skillNames, setSkillNames] = useState<string[]>([]);
+  useEffect(() => {
+    let alive = true;
+    api
+      .getSkills(wsId)
+      .then((rows) => {
+        if (alive) setSkillNames(skillNamesOf(rows));
+      })
+      .catch(() => {
+        /* no listing → the skills field just has no suggestions */
+      });
+    return () => {
+      alive = false;
+    };
+  }, [wsId]);
 
   // Auto-dismiss the transient notice.
   useEffect(() => {
@@ -640,6 +661,7 @@ export default function WorkflowEditor({
                   edges={graph.edges}
                   tools={tools}
                   onConvertToGate={onConvertToGate}
+                  skillNames={skillNames}
                 />
               ) : (
                 <p className="text-lead text-ink-dim">Select a node to edit its step.</p>

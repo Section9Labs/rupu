@@ -8,7 +8,7 @@
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
-import { render, screen, cleanup, act, fireEvent } from '@testing-library/react';
+import { render, screen, cleanup, act, fireEvent, waitFor } from '@testing-library/react';
 import type { WorkflowGraph } from '../../lib/workflowGraph';
 
 // `onSelect` is surfaced as a per-node "select-<id>" button so tests can drive
@@ -84,8 +84,16 @@ vi.mock('./SplitPane', () => ({
 // Surfaces the selected node id + `onConvertToGate` so the Task 6 wiring test
 // below can drive the button without a real StepForm mount.
 vi.mock('./StepForm', () => ({
-  default: ({ node, onConvertToGate }: { node?: { id: string }; onConvertToGate?: () => void }) => (
-    <div data-testid="stepform" data-node-id={node?.id ?? ''}>
+  default: ({
+    node,
+    onConvertToGate,
+    skillNames,
+  }: {
+    node?: { id: string };
+    onConvertToGate?: () => void;
+    skillNames?: string[];
+  }) => (
+    <div data-testid="stepform" data-node-id={node?.id ?? ''} data-skill-names={(skillNames ?? []).join(',')}>
       {onConvertToGate && <button onClick={onConvertToGate}>Convert to gate node</button>}
     </div>
   ),
@@ -93,6 +101,7 @@ vi.mock('./StepForm', () => ({
 vi.mock('./WorkflowSettingsForm', () => ({ default: () => <div /> }));
 
 import WorkflowEditor from './WorkflowEditor';
+import { api, type SkillRow } from '../../lib/api';
 
 const VALID = 'name: wf\nsteps:\n  - id: a\n    agent: x\n    prompt: hi\n';
 
@@ -522,5 +531,37 @@ describe('WorkflowEditor commit is all-or-nothing (Task 4)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'commit-noop' }));
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(onYamlChange).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('WorkflowEditor — installed skills for the step form', () => {
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  const row = (name: string, layer: SkillRow['layer']): SkillRow => ({
+    name,
+    layer,
+    status: 'ok',
+    description: null,
+    error: null,
+    warnings: [],
+    stamp: null,
+    source: null,
+    both_layers: false,
+  });
+
+  it("fetches the workflow project's skills once and hands their names to the step form", async () => {
+    const getSkills = vi
+      .spyOn(api, 'getSkills')
+      .mockResolvedValue([row('pdf', 'global'), row('house-style', 'project')]);
+    render(<WorkflowEditor draftYaml={VALID} onYamlChange={() => {}} agents={[]} validity={null} wsId="w1" />);
+    fireEvent.click(screen.getByRole('button', { name: 'select-a' }));
+    await waitFor(() =>
+      expect(screen.getByTestId('stepform').getAttribute('data-skill-names')).toBe('house-style,pdf'),
+    );
+    expect(getSkills).toHaveBeenCalledTimes(1);
+    expect(getSkills).toHaveBeenCalledWith('w1');
   });
 });

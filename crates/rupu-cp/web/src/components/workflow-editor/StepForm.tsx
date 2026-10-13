@@ -7,8 +7,10 @@
 
 import { useRef, useState } from 'react';
 import { findTool, isConnectorTool, type AgentSummary, type ToolSpec } from '../../lib/api';
+import { ChipsInput } from '../agentBuilder/controls';
 import {
   acceptsFindingsProfile,
+  acceptsSkills,
   canConnect,
   hasInlineApproval,
   type GraphEdge,
@@ -53,6 +55,9 @@ interface StepFormProps {
    *  "Convert to gate node" button, which itself only renders when
    *  `hasInlineApproval(d)`. Omitted (or absent) → the button doesn't render. */
   onConvertToGate?: () => void;
+  /** Installed skill names (global, plus the workflow's project layer) the
+   *  skills field suggests. Defaults to none. */
+  skillNames?: string[];
 }
 
 /** Build a full ExprContext for a single field from the shared step context. */
@@ -110,6 +115,7 @@ export default function StepForm({
   edges = [],
   tools = [],
   onConvertToGate,
+  skillNames = [],
 }: StepFormProps) {
   const d = node.data;
 
@@ -145,6 +151,12 @@ export default function StepForm({
       (kind === 'step' || kind === 'for_each' || kind === 'parallel' || kind === 'panel')
     ) {
       base.findings_profile = d.findings_profile;
+    }
+    // `skills` / `preload_skills` go wherever an agent still runs; a gate,
+    // branch, action, run or split/join step would be refused with them.
+    if (acceptsSkills(base)) {
+      if (d.skills !== undefined) base.skills = d.skills;
+      if (d.preload_skills !== undefined) base.preload_skills = d.preload_skills;
     }
     // `next` is a GENERAL field (a node's outgoing successor edge), not
     // kind-specific — carry it across the switch EXCEPT to `branch` (its
@@ -258,6 +270,13 @@ export default function StepForm({
         <FindingsProfileField d={d} patch={patch} />
       )}
 
+      {/* ── skills ─────────────────────────────────────────────────── */}
+      {/* Like the findings profile: shown where the server accepts the keys,
+         and wherever a value is already set so it can be cleared. */}
+      {(acceptsSkills(d) || d.skills !== undefined || d.preload_skills !== undefined) && (
+        <SkillsField d={d} patch={patch} skillNames={skillNames} />
+      )}
+
       {/* ── common: when / continue_on_error / approval ─────────────── */}
       {/* branch/panel/approval_gate/split/join hide this block: nodeToStepObject
          never reads when/continue_on_error for branch/panel/split/join, a gate
@@ -334,6 +353,54 @@ function FindingsProfileField({
         <option value="summary">Summary</option>
       </select>
     </label>
+  );
+}
+
+// ── skills / preload_skills ──────────────────────────────────────────────────
+
+const SKILL_WILDCARDS = ['*', 'project:*'];
+
+/** Skills every agent this step launches may load, and those always in its
+ *  prompt. They add to each agent's own; an empty list omits the key. */
+function SkillsField({
+  d,
+  patch,
+  skillNames,
+}: {
+  d: StepNodeData;
+  patch: (p: Partial<StepNodeData>) => void;
+  skillNames: string[];
+}) {
+  const suggestions = [...SKILL_WILDCARDS, ...skillNames];
+  const orUnset = (next: string[]) => (next.length > 0 ? next : undefined);
+  return (
+    <div className="space-y-2" data-testid="step-skills">
+      <span className={labelCls}>Skills (optional)</span>
+      <div data-testid="step-skills-load" className="space-y-1">
+        <span className="block text-note text-ink-dim">May load</span>
+        <ChipsInput
+          list={d.skills ?? []}
+          aria-label="Skills it may load"
+          suggestions={suggestions}
+          placeholder="skill…"
+          onChange={(next) => patch({ skills: orUnset(next) })}
+        />
+      </div>
+      <div data-testid="step-skills-preload" className="space-y-1">
+        <span className="block text-note text-ink-dim">Always in the prompt (preload)</span>
+        <ChipsInput
+          list={d.preload_skills ?? []}
+          aria-label="Skills always in its prompt"
+          suggestions={suggestions}
+          placeholder="skill…"
+          onChange={(next) => patch({ preload_skills: orUnset(next) })}
+        />
+      </div>
+      <p className="text-note text-ink-mute">
+        Added to each agent&apos;s own skills. * means every global skill; project skills need their exact
+        name or project:*.
+      </p>
+    </div>
   );
 }
 

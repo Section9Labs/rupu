@@ -2,6 +2,7 @@
 //! kept: a project skill never shadows a global one (spec §1.2). Grants
 //! decide which one binds (`grant.rs`).
 
+use crate::record::{read_record, RecordError, SourceRecord};
 use crate::skill::{load_skill, Layer, Skill, SkillError};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -61,6 +62,15 @@ impl CatalogEntry {
         self.skill().is_ok()
     }
 
+    /// Where the skill was installed from, if it has a record. A skill in
+    /// a symlinked project `skills/` has its record refused unread.
+    pub fn record(&self) -> Result<Option<SourceRecord>, RecordError> {
+        if self.in_linked_root {
+            return Err(RecordError::LinkedRoot);
+        }
+        read_record(self.path.parent().unwrap_or(&self.path), &self.dir_name)
+    }
+
     pub(crate) fn load(&self) -> &Result<Arc<Skill>, Arc<SkillError>> {
         self.loaded.get_or_init(|| {
             if self.in_linked_root {
@@ -78,28 +88,42 @@ pub struct SkillCatalog {
     entries: Vec<CatalogEntry>,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum DiscoverError {
     #[error("{path}: {source}")]
     Io {
         path: PathBuf,
-        source: std::io::Error,
+        source: Arc<std::io::Error>,
     },
 }
 
 impl SkillCatalog {
     pub fn discover(dirs: &LayerDirs) -> Result<Self, DiscoverError> {
+        let (catalog, failed) = Self::discover_readable(dirs);
+        match failed.into_iter().next() {
+            Some((_, e)) => Err(e),
+            None => Ok(catalog),
+        }
+    }
+
+    /// The skills of every layer that can be read, and why each other
+    /// layer can't: a listing shows what it can.
+    pub fn discover_readable(dirs: &LayerDirs) -> (Self, Vec<(Layer, DiscoverError)>) {
         let mut entries = Vec::new();
+        let mut failed = Vec::new();
         for (dir, layer) in [
             (&dirs.global, Layer::Global),
             (&dirs.project, Layer::Project),
         ] {
-            if let Some(dir) = dir {
-                scan(dir, layer, &mut entries)?;
+            let Some(dir) = dir else { continue };
+            let mut found = Vec::new();
+            match scan(dir, layer, &mut found) {
+                Ok(()) => entries.append(&mut found),
+                Err(e) => failed.push((layer, e)),
             }
         }
         entries.sort_by(|a, b| (&a.dir_name, a.layer).cmp(&(&b.dir_name, b.layer)));
-        Ok(Self { entries })
+        (Self { entries }, failed)
     }
 
     pub fn entries(&self) -> &[CatalogEntry] {
@@ -120,7 +144,7 @@ impl SkillCatalog {
 fn scan(dir: &Path, layer: Layer, out: &mut Vec<CatalogEntry>) -> Result<(), DiscoverError> {
     let io = |source| DiscoverError::Io {
         path: dir.to_owned(),
-        source,
+        source: Arc::new(source),
     };
     let read = match std::fs::read_dir(dir) {
         Ok(r) => r,
@@ -159,7 +183,7 @@ fn scan(dir: &Path, layer: Layer, out: &mut Vec<CatalogEntry>) -> Result<(), Dis
 fn may_be_skill(item: &std::fs::DirEntry) -> Result<bool, DiscoverError> {
     let kind = item.file_type().map_err(|source| DiscoverError::Io {
         path: item.path(),
-        source,
+        source: Arc::new(source),
     })?;
     Ok(kind.is_dir()
         || (kind.is_symlink() && std::fs::metadata(item.path()).map_or(true, |m| m.is_dir())))

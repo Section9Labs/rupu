@@ -1,4 +1,6 @@
-use rupu_agent::{check_agent_files, load_agent, AgentLoadError, SkillCheckError};
+use rupu_agent::{
+    check_agent_files, check_agent_skills, load_agent, AgentLoadError, SkillCheckError,
+};
 use std::fs;
 use std::path::Path;
 
@@ -138,6 +140,53 @@ fn a_skills_path_that_is_a_file_fails_only_agents_with_skill_keys() {
         ),
         "{err:?}"
     );
+}
+
+/// A listing shares one discovery: a failed one is reported for every
+/// agent that declares skills, without reading the directory again.
+#[test]
+fn a_shared_check_discovers_once_even_when_it_fails() {
+    let g = tempfile::tempdir().unwrap();
+    fs::write(g.path().join("skills"), "not a directory").unwrap();
+    let dirs = rupu_skills::LayerDirs::for_layers(g.path(), None);
+    let spec = rupu_agent::AgentSpec::parse("---\nname: a\nskills: [x]\n---\nhi\n").unwrap();
+    let mut cache = None;
+    let first = check_agent_skills(&spec, &dirs, &mut cache)
+        .unwrap_err()
+        .to_string();
+
+    fs::remove_file(g.path().join("skills")).unwrap();
+    skill(&g.path().join("skills"), "x");
+    let again = check_agent_skills(&spec, &dirs, &mut cache)
+        .unwrap_err()
+        .to_string();
+    assert_eq!(again, first);
+    assert!(check_agent_skills(&spec, &dirs, &mut None).is_ok());
+}
+
+/// `check_agent_skills` loads each granted skill, as `rupu agent validate`
+/// does: an installed skill that doesn't load fails it.
+#[test]
+fn check_agent_skills_loads_the_granted_skills() {
+    let g = tempfile::tempdir().unwrap();
+    let d = g.path().join("skills/big");
+    fs::create_dir_all(&d).unwrap();
+    let huge = "a".repeat(rupu_skills::MAX_SKILL_MD_BYTES as usize);
+    fs::write(
+        d.join("SKILL.md"),
+        format!("---\nname: big\ndescription: d\n---\n{huge}\n"),
+    )
+    .unwrap();
+    let dirs = rupu_skills::LayerDirs::for_layers(g.path(), None);
+    let spec = rupu_agent::AgentSpec::parse("---\nname: a\nskills: [big]\n---\nhi\n").unwrap();
+    let err = check_agent_skills(&spec, &dirs, &mut None)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.starts_with("agent `a`: skills: skill \"big\" (global) is invalid: SKILL.md is "),
+        "{err}"
+    );
+    assert!(err.ends_with("bytes; the limit is 1048576 bytes"), "{err}");
 }
 
 #[cfg(unix)]

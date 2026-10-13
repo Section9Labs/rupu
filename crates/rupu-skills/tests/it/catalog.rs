@@ -299,3 +299,108 @@ fn an_oversized_skill_md_is_invalid() {
     fs::write(d.join("SKILL.md"), ok).unwrap();
     assert!(load_skill(&d, Layer::Global).is_ok());
 }
+
+/// One layer that can't be read leaves the other's skills, and says why.
+#[test]
+fn discover_readable_keeps_the_layers_it_can_read() {
+    let t = tempfile::tempdir().unwrap();
+    let global = t.path().join("global");
+    write_skill(&global, "pdf", "pdf", "d");
+    let project = t.path().join("project-skills");
+    fs::write(&project, "not a directory").unwrap();
+    let dirs = LayerDirs {
+        global: Some(global),
+        project: Some(project.clone()),
+    };
+
+    let (cat, failed) = SkillCatalog::discover_readable(&dirs);
+    let names: Vec<(&str, Layer)> = cat
+        .entries()
+        .iter()
+        .map(|e| (e.dir_name.as_str(), e.layer))
+        .collect();
+    assert_eq!(names, [("pdf", Layer::Global)]);
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].0, Layer::Project);
+    assert!(
+        failed[0]
+            .1
+            .to_string()
+            .starts_with(&format!("{}: ", project.display())),
+        "{}",
+        failed[0].1
+    );
+    assert!(SkillCatalog::discover(&dirs).is_err());
+}
+
+#[test]
+fn an_entry_reads_its_install_record() {
+    let t = tempfile::tempdir().unwrap();
+    let skills = t.path().join("skills");
+    write_skill(&skills, "pdf", "pdf", "d");
+    let dirs = LayerDirs {
+        global: Some(skills.clone()),
+        project: None,
+    };
+    let cat = SkillCatalog::discover(&dirs).unwrap();
+    let pdf = cat.get(Layer::Global, "pdf").unwrap();
+    assert!(pdf.record().unwrap().is_none());
+
+    fs::create_dir_all(skills.join(".sources")).unwrap();
+    fs::write(
+        skills.join(".sources/pdf.json"),
+        r#"{"version":1,"source":"github:acme/skills#pdf","content_hash":"ab","installed_at":1}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        pdf.record().unwrap().unwrap().source,
+        "github:acme/skills#pdf"
+    );
+
+    let padding = " ".repeat(rupu_skills::record::MAX_RECORD_BYTES as usize);
+    fs::write(
+        skills.join(".sources/pdf.json"),
+        format!(r#"{{"version":1,"source":"s","content_hash":"ab","installed_at":1}}{padding}"#),
+    )
+    .unwrap();
+    assert_eq!(
+        pdf.record().unwrap_err().to_string(),
+        format!(
+            "{}: the record is over {} bytes",
+            skills.join(".sources/pdf.json").display(),
+            rupu_skills::record::MAX_RECORD_BYTES
+        )
+    );
+}
+
+/// A project `skills/` that is a symlink points outside the repository:
+/// its records are not read, whatever is at the other end.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_project_root_reads_no_record() {
+    let t = tempfile::tempdir().unwrap();
+    let real = t.path().join("real-skills");
+    write_skill(&real, "pdf", "pdf", "d");
+    fs::create_dir_all(real.join(".sources")).unwrap();
+    fs::write(
+        real.join(".sources/pdf.json"),
+        r#"{"version":1,"source":"s","content_hash":"ab","installed_at":1}"#,
+    )
+    .unwrap();
+    let link = t.path().join("skills");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let cat = SkillCatalog::discover(&LayerDirs {
+        global: None,
+        project: Some(link),
+    })
+    .unwrap();
+    assert_eq!(
+        cat.get(Layer::Project, "pdf")
+            .unwrap()
+            .record()
+            .unwrap_err()
+            .to_string(),
+        "the project skills directory may not be a symlink"
+    );
+}

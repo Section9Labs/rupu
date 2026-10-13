@@ -41,11 +41,13 @@ export function ChipsInput({
   suggestions,
   placeholder,
   onChange,
+  'aria-label': ariaLabel,
 }: {
   list: string[];
   suggestions?: string[];
   placeholder?: string;
   onChange: (next: string[]) => void;
+  'aria-label'?: string;
 }) {
   const [draft, setDraft] = useState('');
 
@@ -82,6 +84,7 @@ export function ChipsInput({
       <span className="ab-addchip">
         <input
           value={draft}
+          aria-label={ariaLabel}
           placeholder={placeholder}
           onChange={(e) => setDraft(e.target.value)}
           onKeyDown={onKeyDown}

@@ -6,7 +6,7 @@
 
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { api, type ProviderModels } from '../lib/api';
+import { api, skillNamesOf, type ProviderModels } from '../lib/api';
 import AgentBuilder from '../components/agentBuilder/AgentBuilder';
 import { NEW_AGENT_TEMPLATE } from '../lib/agentBuilder/agentSpec';
 
@@ -16,6 +16,7 @@ export default function AgentNew() {
   const [error, setError] = useState<string | null>(null);
   const [models, setModels] = useState<ProviderModels[]>([]);
   const [agentNames, setAgentNames] = useState<string[]>([]);
+  const [skillNames, setSkillNames] = useState<string[]>([]);
 
   useEffect(() => {
     let cancelled = false;
@@ -35,6 +36,14 @@ export default function AgentNew() {
       .catch(() => {
         // Non-fatal — the Dispatch card's agent picker just has no
         // suggestions if this fails.
+      });
+    api
+      .getSkills()
+      .then((rows) => {
+        if (!cancelled) setSkillNames(skillNamesOf(rows));
+      })
+      .catch(() => {
+        // Non-fatal — the Skills card just has no suggestions.
       });
     return () => {
       cancelled = true;
@@ -66,6 +75,7 @@ export default function AgentNew() {
         aiModels={models}
         onGenerate={api.generateAgent}
         agentNames={agentNames}
+        skillNames={skillNames}
       />
     </div>
   );

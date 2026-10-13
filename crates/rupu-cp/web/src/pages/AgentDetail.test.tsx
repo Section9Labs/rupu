@@ -9,7 +9,7 @@
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
-import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { api, ApiError, type AgentDetail } from '../lib/api';
 
@@ -269,6 +269,51 @@ describe('AgentDetail under a customer scope', () => {
       </MemoryRouter>,
     );
     expect(await screen.findByText('Runs and spend on this page cover every customer.')).toBeInTheDocument();
+  });
+});
+
+describe('AgentDetail skills', () => {
+  it('editing a project agent suggests the skills its project can see', async () => {
+    vi.spyOn(api, 'getAgent').mockResolvedValue({
+      ...AGENT,
+      scope: 'my-project',
+      scope_kind: 'project',
+      scope_id: 'ws_a',
+    });
+    const getSkills = vi.spyOn(api, 'getSkills').mockResolvedValue([
+      { name: 'notes', layer: 'project', status: 'ok', description: null, error: null, warnings: [], stamp: null, source: null, both_layers: false },
+    ]);
+    renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit definition' }));
+    await waitFor(() => expect(getSkills).toHaveBeenCalledWith('ws_a'));
+    fireEvent.click(screen.getByLabelText('add Skills card'));
+    expect(await within(screen.getByTestId('ab-skills')).findByText('+ notes')).toBeInTheDocument();
+  });
+
+  it('saving an agent with an uninstalled skill shows the skill in its load error', async () => {
+    vi.spyOn(api, 'getAgent').mockResolvedValue(AGENT);
+    vi.spyOn(api, 'getSkills').mockResolvedValue([]);
+    const err = 'unknown skill "not-installed" in skills: (install it with `rupu skill install <source>`)';
+    const saveSpy = vi.spyOn(api, 'saveAgent').mockResolvedValue({
+      ...AGENT,
+      skills: ['not-installed'],
+      load_error: err,
+    });
+    renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit definition' }));
+    fireEvent.click(screen.getByLabelText('add Skills card'));
+    const input = within(screen.getByTestId('ab-skills')).getByRole('textbox');
+    fireEvent.change(input, { target: { value: 'not-installed' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => expect(saveSpy).toHaveBeenCalled());
+    expect(saveSpy.mock.calls[0][1]).toContain('skills:\n  - not-installed');
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent("This agent can't be launched:");
+    expect(alert).toHaveTextContent('unknown skill "not-installed"');
   });
 });
 

@@ -217,6 +217,13 @@ pub const CAP_AGENT_ENGAGEMENT_PROFILE: &str = "agent.engagement_profile";
 /// on a peer that hasn't advertised it.
 pub const CAP_AGENT_SKILLS: &str = "agent.skills";
 
+/// Host feature entry (HTTP only; no other transport runs sessions): this
+/// CP's session start and send endpoints take `skills` (and the start's
+/// `preload_skills`) to `rupu session start/send --skill`. A connector
+/// refuses a session start or send with skills on a peer that hasn't
+/// advertised it.
+pub const CAP_SESSION_SKILLS: &str = "session.skills";
+
 /// `Hello.capabilities` / bucket marker / host feature entry: this executor
 /// puts [`RunSpec::codename`] (HTTP: the agent-run body's `codename`) on its
 /// `rupu run` as `--codename`. Best-effort, unlike the profiles: a connector
@@ -295,6 +302,7 @@ pub fn host_features() -> Vec<String> {
         CAP_AGENT_FINDINGS_PROFILE.to_string(),
         CAP_AGENT_ENGAGEMENT_PROFILE.to_string(),
         CAP_AGENT_SKILLS.to_string(),
+        CAP_SESSION_SKILLS.to_string(),
         CAP_WORKFLOW_RESUME_IF_UNFINISHED.to_string(),
         CAP_RUN_COVERAGE_STREAM.to_string(),
         CAP_FINDINGS_ARTIFACT_BLOB.to_string(),
@@ -627,6 +635,17 @@ mod tests {
                 caps.iter().any(|c| c == CAP_AGENT_ENGAGEMENT_PROFILE),
                 "{surface}: {caps:?}"
             );
+        }
+    }
+
+    /// Only an HTTP host runs sessions, so only its feature list carries
+    /// `session.skills`.
+    #[test]
+    fn only_host_features_advertise_session_skills() {
+        assert_eq!(CAP_SESSION_SKILLS, "session.skills");
+        assert!(host_features().iter().any(|c| c == CAP_SESSION_SKILLS));
+        for caps in [node_capabilities(), bucket_worker_capabilities()] {
+            assert!(!caps.iter().any(|c| c == CAP_SESSION_SKILLS), "{caps:?}");
         }
     }
 

@@ -1261,6 +1261,135 @@ describe('StepForm — findings_profile (Plan 2 Task 9)', () => {
   });
 });
 
+describe('StepForm — skills', () => {
+  const field = () => screen.queryByTestId('step-skills');
+
+  function SkillsHarness({ initial, spy }: { initial: GraphNode; spy: (d: StepNodeData) => void }) {
+    const [node, setNode] = useState(initial);
+    return (
+      <StepForm
+        node={node}
+        agents={AGENTS}
+        problems={[]}
+        exprContext={EXPR}
+        skillNames={['pdf', 'house-style']}
+        onChange={(d) => {
+          spy(d);
+          setNode((n) => ({ ...n, id: d.id, data: d }));
+        }}
+      />
+    );
+  }
+
+  const last = (spy: ReturnType<typeof vi.fn>) => spy.mock.calls[spy.mock.calls.length - 1][0] as StepNodeData;
+
+  it('offers installed skills and the wildcards on an agent step; picking one emits skills', () => {
+    const spy = vi.fn();
+    render(<SkillsHarness initial={nodeWith({ kind: 'step', agent: 'planner', prompt: 'go' })} spy={spy} />);
+    const skills = screen.getByTestId('step-skills-load');
+    expect(Array.from(skills.querySelectorAll('.ab-chip-ghost')).map((c) => c.textContent)).toEqual([
+      '+ *',
+      '+ project:*',
+      '+ pdf',
+      '+ house-style',
+    ]);
+    fireEvent.click(screen.getAllByText('+ pdf')[0]);
+    expect(last(spy).skills).toEqual(['pdf']);
+
+    fireEvent.click(
+      Array.from(screen.getByTestId('step-skills-preload').querySelectorAll('.ab-chip-ghost')).find(
+        (c) => c.textContent === '+ pdf',
+      )!,
+    );
+    expect(last(spy).preload_skills).toEqual(['pdf']);
+    expect(last(spy).skills).toEqual(['pdf']);
+  });
+
+  it('labels the two skill inputs', () => {
+    const spy = vi.fn();
+    render(<SkillsHarness initial={nodeWith({ kind: 'step', agent: 'planner', prompt: 'go' })} spy={spy} />);
+    const preload = screen.getByLabelText('Skills always in its prompt');
+    fireEvent.change(preload, { target: { value: 'house-style' } });
+    fireEvent.keyDown(preload, { key: 'Enter' });
+    expect(last(spy).preload_skills).toEqual(['house-style']);
+    expect(screen.getByLabelText('Skills it may load')).toBeInTheDocument();
+  });
+
+  it('removing the last chip clears the key', () => {
+    const spy = vi.fn();
+    render(
+      <SkillsHarness initial={nodeWith({ kind: 'step', agent: 'planner', prompt: 'go', skills: ['pdf'] })} spy={spy} />,
+    );
+    fireEvent.click(screen.getByLabelText('remove pdf'));
+    expect(last(spy).skills).toBeUndefined();
+  });
+
+  it('editing another field of the step keeps skills and preload_skills', () => {
+    const spy = vi.fn();
+    render(
+      <SkillsHarness
+        initial={nodeWith({ kind: 'step', agent: 'planner', prompt: 'go', skills: ['pdf'], preload_skills: ['house-style'] })}
+        spy={spy}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText('Prompt'), { target: { value: 'rewritten' } });
+    expect(last(spy)).toEqual(
+      expect.objectContaining({ prompt: 'rewritten', skills: ['pdf'], preload_skills: ['house-style'] }),
+    );
+  });
+
+  it.each([
+    ['for_each', { kind: 'for_each', agent: 'planner', prompt: 'go', for_each: '{{ inputs.xs }}' }],
+    ['parallel', { kind: 'parallel', parallel: [] }],
+    ['panel', { kind: 'panel', panel: { panelists: [], subject: '' } }],
+    ['remote (host:) agent step', { kind: 'step', agent: 'planner', prompt: 'go', raw_passthrough: { host: 'box' } }],
+  ] as [string, Partial<StepNodeData>][])('renders for a %s step', (_name, data) => {
+    render(<SkillsHarness initial={nodeWith(data)} spy={vi.fn()} />);
+    expect(field()).not.toBeNull();
+  });
+
+  it.each([
+    ['approval gate', { kind: 'approval_gate', approvalRequired: true }],
+    ['branch', { kind: 'branch', condition: 'c', thenTargets: [], elseTargets: [] }],
+    ['action', { kind: 'action', action: 'issues.comment' }],
+    ['split', { kind: 'split', split: [] }],
+    ['join', { kind: 'join' }],
+  ] as [string, Partial<StepNodeData>][])('does not render for a %s step', (_name, data) => {
+    render(<SkillsHarness initial={nodeWith(data)} spy={vi.fn()} />);
+    expect(field()).toBeNull();
+  });
+
+  it('still renders on a gate that already carries skills, so they can be removed', () => {
+    const spy = vi.fn();
+    render(
+      <SkillsHarness initial={nodeWith({ kind: 'approval_gate', approvalRequired: true, skills: ['pdf'] })} spy={spy} />,
+    );
+    fireEvent.click(screen.getByLabelText('remove pdf'));
+    expect(last(spy).skills).toBeUndefined();
+    expect(last(spy).kind).toBe('approval_gate');
+  });
+
+  it('switchKind carries skills into agent kinds and drops them elsewhere', () => {
+    const initial = nodeWith({ kind: 'step', agent: 'planner', prompt: 'go', skills: ['pdf'], preload_skills: ['house-style'] });
+    const switchTo = (kind: string): StepNodeData => {
+      const spy = vi.fn();
+      const { unmount } = render(<SkillsHarness initial={initial} spy={spy} />);
+      fireEvent.change(screen.getByLabelText('Step kind'), { target: { value: kind } });
+      const d = last(spy);
+      unmount();
+      return d;
+    };
+    for (const kind of ['for_each', 'parallel', 'panel']) {
+      const d = switchTo(kind);
+      expect([d.skills, d.preload_skills]).toEqual([['pdf'], ['house-style']]);
+    }
+    for (const kind of ['branch', 'action', 'approval_gate', 'split', 'join', 'run']) {
+      const d = switchTo(kind);
+      expect([d.skills, d.preload_skills]).toEqual([undefined, undefined]);
+    }
+  });
+});
+
 describe('WorkflowSettingsForm', () => {
   it('editing the name emits a meta with rest preserved', () => {
     const spy = vi.fn();

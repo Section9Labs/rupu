@@ -10,7 +10,15 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { Archive, ArrowLeft, RotateCcw, Trash2 } from 'lucide-react';
-import { api, type SessionSummary, type SessionRunRow, type UsageTimelinePoint } from '../lib/api';
+import {
+  api,
+  apiErrorMessage,
+  skillNamesOf,
+  type SessionSummary,
+  type SessionRunRow,
+  type UsageTimelinePoint,
+} from '../lib/api';
+import { ChipsInput } from '../components/agentBuilder/controls';
 import { cn } from '../lib/cn';
 import { absoluteTime, relativeTime } from '../lib/time';
 import { sessionStatusDot, sessionStatusLabel, sessionStatusTone } from '../lib/sessionStatus';
@@ -48,6 +56,8 @@ export default function SessionDetailPage() {
 
   // Composer state
   const [prompt, setPrompt] = useState('');
+  const [invokeSkills, setInvokeSkills] = useState<string[]>([]);
+  const [skillNames, setSkillNames] = useState<string[]>([]);
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
   const [sendOk, setSendOk] = useState(false);
@@ -163,6 +173,27 @@ export default function SessionDetailPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, pollInterval, sessionActive, host]);
 
+  // Skills the composer suggests: the global layer plus the session's project.
+  // This CP's listing says nothing about a remote host's skills, so a remote
+  // session gets no suggestions (a typed name still goes through).
+  const sessionLoaded = session !== null;
+  const skillsWsId = session?.workspace_id || undefined;
+  useEffect(() => {
+    if (!sessionLoaded || host) return;
+    let cancelled = false;
+    api
+      .getSkills(skillsWsId)
+      .then((rows) => {
+        if (!cancelled) setSkillNames(skillNamesOf(rows));
+      })
+      .catch(() => {
+        /* no listing → no suggestions */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionLoaded, skillsWsId, host]);
+
   async function onArchive() {
     if (actionPending) return;
     setActionPending(true);
@@ -205,21 +236,22 @@ export default function SessionDetailPage() {
 
   const handleSend = () => {
     const text = prompt.trim();
-    if (!id || !text || sending) return;
+    if (!id || (!text && invokeSkills.length === 0) || sending) return;
     setSending(true);
     setSendError(null);
     setSendOk(false);
     api
-      .sendSessionMessage(id, text, host)
+      .sendSessionMessage(id, text, host, invokeSkills.length > 0 ? invokeSkills : undefined)
       .then(() => {
         setPrompt('');
+        setInvokeSkills([]);
         setSendOk(true);
         // Surface the new turn immediately rather than waiting for the poll —
         // its TranscriptPanel then streams live.
         reload();
       })
       .catch((e: unknown) => {
-        setSendError(e instanceof Error ? e.message : 'Failed to send message');
+        setSendError(apiErrorMessage(e) || 'Failed to send message');
       })
       .finally(() => setSending(false));
   };
@@ -424,6 +456,20 @@ export default function SessionDetailPage() {
             className="w-full resize-y rounded-lg border border-border bg-panel px-3 py-2 text-sm text-ink placeholder:text-ink-mute focus:outline-none focus:ring-2 focus:ring-brand-200 disabled:cursor-not-allowed disabled:bg-surface disabled:text-ink-dim"
           />
 
+          <div data-testid="session-invoke-skill" className="mt-2 flex items-center gap-2">
+            <span className="shrink-0 text-ui font-medium text-ink-dim">Invoke skill</span>
+            <ChipsInput
+              list={invokeSkills}
+              aria-label="Invoke skill"
+              suggestions={skillNames}
+              placeholder="skill…"
+              onChange={(next) => {
+                setInvokeSkills(next);
+                if (sendOk) setSendOk(false);
+              }}
+            />
+          </div>
+
           {sendError && (
             <div
               role="alert"
@@ -445,7 +491,7 @@ export default function SessionDetailPage() {
             </div>
             <Button
               onClick={handleSend}
-              disabled={sending || stopped || prompt.trim().length === 0}
+              disabled={sending || stopped || (prompt.trim().length === 0 && invokeSkills.length === 0)}
               className="px-4 text-sm disabled:opacity-50"
             >
               {sending ? 'Sending…' : 'Send'}

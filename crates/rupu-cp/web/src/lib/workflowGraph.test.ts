@@ -7,6 +7,7 @@ import {
   topoSort,
   canConnect,
   validateGraph,
+  acceptsSkills,
   hasInlineApproval,
   convertInlineApprovalToGate,
   loopOfStep,
@@ -2038,5 +2039,117 @@ describe('step skills survive the editor', () => {
     expect(steps[0].skills).toEqual(['pdf']);
     expect(steps[0].preload_skills).toEqual(['house-style']);
     expect(steps[1].skills).toEqual(['pdf']);
+  });
+});
+
+describe('step skills: modelled fields', () => {
+  it('parses skills and preload_skills into data, out of raw_passthrough, and re-emits them in order', () => {
+    const input = {
+      name: 'wf',
+      steps: [
+        {
+          id: 'a',
+          agent: 'x',
+          prompt: 'p',
+          findings_profile: 'summary',
+          skills: ['pdf', 'project:*'],
+          preload_skills: ['house-style'],
+        },
+      ],
+    };
+    const g = yamlToGraph(input);
+    expect(g.nodes[0].data.skills).toEqual(['pdf', 'project:*']);
+    expect(g.nodes[0].data.preload_skills).toEqual(['house-style']);
+    expect(g.nodes[0].data.raw_passthrough).toBeUndefined();
+    const res = graphToWorkflowObject(g);
+    if (!('obj' in res)) throw new Error('expected obj');
+    expect(JSON.stringify(res.obj)).toBe(JSON.stringify(input));
+  });
+
+  it('keeps both keys after another field of the step is edited', () => {
+    const g = yamlToGraph({
+      name: 'wf',
+      steps: [{ id: 'a', agent: 'x', prompt: 'p', skills: ['pdf'], preload_skills: ['house-style'] }],
+    });
+    const edited = {
+      ...g,
+      nodes: g.nodes.map((n) => ({ ...n, data: { ...n.data, prompt: 'rewritten', when: '{{ true }}' } })),
+    };
+    const res = graphToWorkflowObject(edited);
+    if (!('obj' in res)) throw new Error('expected obj');
+    const step = (res.obj.steps as Record<string, unknown>[])[0];
+    expect(step.prompt).toBe('rewritten');
+    expect(step.skills).toEqual(['pdf']);
+    expect(step.preload_skills).toEqual(['house-style']);
+  });
+
+  it('emits no key for empty arrays', () => {
+    const g = yamlToGraph({ name: 'wf', steps: [{ id: 'a', agent: 'x', prompt: 'p' }] });
+    g.nodes[0].data.skills = [];
+    g.nodes[0].data.preload_skills = [];
+    const res = graphToWorkflowObject(g);
+    if (!('obj' in res)) throw new Error('expected obj');
+    expect(JSON.stringify(res.obj)).not.toContain('skills');
+  });
+
+  it('round-trips on for_each, parallel and panel steps', () => {
+    expectRoundTrip({
+      name: 'wf',
+      steps: [
+        { id: 'fe', agent: 'x', prompt: 'p', for_each: '{{ inputs.items }}', skills: ['pdf'] },
+        { id: 'par', parallel: [{ id: 's', agent: 'x', prompt: 'p' }], preload_skills: ['house-style'] },
+        { id: 'pan', panel: { panelists: ['x'], subject: 's' }, skills: ['pdf'] },
+      ],
+    });
+  });
+
+  it('acceptsSkills mirrors the server: agent steps yes, gate/branch/action/run/split/join no', () => {
+    const g = yamlToGraph({
+      name: 'wf',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p' },
+        { id: 'fe', agent: 'x', prompt: 'p', for_each: '{{ inputs.items }}' },
+        { id: 'par', parallel: [{ id: 's', agent: 'x', prompt: 'p' }] },
+        { id: 'pan', panel: { panelists: ['x'], subject: 's' } },
+        { id: 'remote', agent: 'x', prompt: 'p', host: 'box' },
+        { id: 'gate', approval: { required: true } },
+        { id: 'br', branch: { condition: '{{ true }}', then: ['a'], else: ['fe'] } },
+        { id: 'act', action: 'issues.comment', with: {} },
+        { id: 'rec', action: 'findings.record', with: {} },
+        { id: 'cmd', run: { command: 'echo hi' } },
+        { id: 'sp', split: ['a', 'fe'] },
+        { id: 'jn', join: {} },
+      ],
+    });
+    const verdict = Object.fromEntries(g.nodes.map((n) => [n.id, acceptsSkills(n.data)]));
+    expect(verdict).toEqual({
+      a: true,
+      fe: true,
+      par: true,
+      pan: true,
+      remote: true,
+      gate: false,
+      br: false,
+      act: false,
+      rec: false,
+      cmd: false,
+      sp: false,
+      jn: false,
+    });
+  });
+
+  it('validateGraph flags skills on a step that runs no agent, in the server\'s words', () => {
+    const g = yamlToGraph({
+      name: 'wf',
+      steps: [
+        { id: 'a', agent: 'x', prompt: 'p', skills: ['pdf'] },
+        { id: 'gate', approval: { required: true }, skills: ['pdf'] },
+        { id: 'act', action: 'issues.comment', with: {}, preload_skills: ['pdf'] },
+      ],
+    });
+    const p = validateGraph(g);
+    expect(p.a).toBeUndefined();
+    expect(p.gate).toEqual(['`skills`/`preload_skills` apply only to steps that run an agent; remove them']);
+    expect(p.act).toEqual(['`skills`/`preload_skills` apply only to steps that run an agent; remove them']);
   });
 });

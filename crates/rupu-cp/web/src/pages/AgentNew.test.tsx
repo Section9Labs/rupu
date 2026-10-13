@@ -5,7 +5,7 @@
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { api } from '../lib/api';
 
@@ -72,6 +72,27 @@ describe('AgentNew (full-page Agent Builder)', () => {
     await waitFor(() =>
       expect(navigateMock).toHaveBeenCalledWith('/agents/my-cool-agent'),
     );
+  });
+
+  it('suggests the installed global skills on the Skills card', async () => {
+    vi.spyOn(api, 'getAgents').mockResolvedValue([]);
+    vi.spyOn(api, 'generateModels').mockResolvedValue([]);
+    const getSkills = vi.spyOn(api, 'getSkills').mockResolvedValue([
+      { name: 'pdf', layer: 'global', status: 'ok', description: null, error: null, warnings: [], stamp: null, source: null, both_layers: false },
+      { name: 'broken', layer: 'global', status: 'invalid', description: null, error: 'bad', warnings: [], stamp: null, source: null, both_layers: false },
+    ]);
+
+    render(
+      <MemoryRouter>
+        <AgentNew />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(getSkills).toHaveBeenCalledWith());
+    fireEvent.click(await screen.findByLabelText('add Skills card'));
+    const skills = screen.getByTestId('ab-skills');
+    expect(await within(skills).findByText('+ pdf')).toBeInTheDocument();
+    expect(within(skills).queryByText('+ broken')).not.toBeInTheDocument();
   });
 
   it('Cancel returns to the agents list', async () => {

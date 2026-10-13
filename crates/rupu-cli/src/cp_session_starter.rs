@@ -35,8 +35,8 @@ pub(crate) fn session_start_argv(
             .and(clone_dir)
             .map(std::path::PathBuf::from),
         detach: true,
-        skills: Vec::new(),
-        preload_skills: Vec::new(),
+        skills: req.skills.clone(),
+        preload_skills: req.preload_skills.clone(),
     }))
 }
 
@@ -87,12 +87,14 @@ impl SessionStarter for SubprocessSessionStarter {
             .map_err(|e| SessionStartError::Spawn(e.to_string()))?;
 
         if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            return Err(SessionStartError::Spawn(if err.is_empty() {
-                "session start failed".into()
+            let msg = crate::cp_session_sender::cli_failure(&out.stderr, "session start failed");
+            // Exit 1 is the command refusing the request (a skill that
+            // doesn't resolve, an unknown agent): the caller's to fix.
+            return Err(if out.status.code() == Some(1) {
+                SessionStartError::Invalid(msg)
             } else {
-                err
-            }));
+                SessionStartError::Spawn(msg)
+            });
         }
 
         parse_session_id(&String::from_utf8_lossy(&out.stdout))
@@ -102,8 +104,8 @@ impl SessionStarter for SubprocessSessionStarter {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_session_id, session_start_argv};
-    use rupu_cp::session_starter::SessionStartRequest;
+    use super::{parse_session_id, session_start_argv, SubprocessSessionStarter};
+    use rupu_cp::session_starter::{SessionStartError, SessionStartRequest, SessionStarter};
 
     fn req(
         target: Option<&str>,
@@ -117,6 +119,8 @@ mod tests {
             mode: mode.map(Into::into),
             target: target.map(Into::into),
             working_dir: wd.map(Into::into),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
         }
     }
 
@@ -176,6 +180,72 @@ mod tests {
             argv(&req(None, None, None, None), None),
             ["session", "start", "triage", "--detach"]
         );
+    }
+
+    #[test]
+    fn argv_carries_the_skills() {
+        let mut r = req(None, Some("hi"), None, None);
+        r.skills = vec!["pdf".into()];
+        r.preload_skills = vec!["house-style".into()];
+        assert_eq!(
+            argv(&r, None),
+            [
+                "session",
+                "start",
+                "triage",
+                "--detach",
+                "--prompt=hi",
+                "--skill",
+                "pdf",
+                "--preload-skill",
+                "house-style",
+            ]
+        );
+    }
+
+    /// `session start --skill` exits 1 when a skill doesn't resolve: the
+    /// request's fault, so it is `Invalid` (a 400) with the CLI's message.
+    #[tokio::test]
+    async fn a_refused_skill_is_invalid_with_the_clis_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("global");
+        let skill = global.join("skills").join("pdf");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: pdf\ndescription: The pdf skill.\n---\nRead PDFs.\n",
+        )
+        .unwrap();
+        let agent = rupu_agent::AgentSpec::parse(
+            "---\nname: triage\nprovider: anthropic\nmodel: claude-sonnet-4-6\n---\nTriage.\n",
+        )
+        .unwrap();
+        let refusal = rupu_runtime::assembly::resolve_agent_skills(
+            &rupu_skills::LayerDirs::for_layers(&global, None),
+            &agent,
+            &rupu_runtime::assembly::Overrides {
+                skills: vec!["pdff".into()],
+                ..Default::default()
+            },
+            rupu_skills::SkillReason::Session,
+        )
+        .await
+        .expect_err("a typo is refused");
+        let message = format!("[error] {refusal}");
+        assert!(
+            message.contains("unknown skill \"pdff\" (did you mean pdf?)"),
+            "{message}"
+        );
+
+        let starter = SubprocessSessionStarter {
+            exe: crate::cp_session_sender::tests::failing_rupu(tmp.path(), &format!("{message}\n")),
+        };
+        let mut r = req(None, None, None, Some(tmp.path().to_str().unwrap()));
+        r.skills = vec!["pdff".into()];
+        match starter.start(r).await {
+            Err(SessionStartError::Invalid(m)) => assert_eq!(m, refusal.to_string()),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
     }
 
     #[test]
