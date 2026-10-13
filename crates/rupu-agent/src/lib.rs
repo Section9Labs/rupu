@@ -32,6 +32,8 @@ pub mod recovery;
 pub mod runner;
 // The run's tool grant, resolved at assembly (W2/W3).
 pub mod grant;
+// Puts a conversation's loaded skills back after a compaction.
+pub mod skills_reattach;
 // implemented in Task 2
 pub mod spec;
 // implemented in Task 6
@@ -51,9 +53,11 @@ pub use recovery::{Hop, HopBuilder, RecoveryOpts};
 pub use runner::{
     compact_messages, record_unstarted_run, run_agent, run_agent_full, run_agent_with_limits,
     AgentPins, AgentRunOpts, CompactionError, CompactionOutcome, Hooks, LoadedSkill, MockProvider,
-    OnStreamEventCallback, OnToolCallCallback, OnUsageCallback, RunConcerns, RunError, RunExit,
-    RunResult, ScriptedTurn, StreamOpts, UnstartedRun, UsageKind, UsageTurn, UserTurn,
+    OnStreamEventCallback, OnToolCallCallback, OnUsageCallback, OperatorLoad, RunConcerns,
+    RunError, RunExit, RunResult, ScriptedTurn, StreamOpts, UnstartedRun, UsageKind, UsageTurn,
+    UserTurn,
 };
 pub use rupu_providers::types::StopReason;
+pub use skills_reattach::{reattach_block, Reattach};
 pub use spec::{AgentSpec, AgentSpecParseError};
 pub use tool_registry::ToolRegistry;

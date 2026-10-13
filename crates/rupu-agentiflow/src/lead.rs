@@ -628,6 +628,7 @@ impl RunAgentLeadDriver {
                 seed_source: None,
                 turn_index_offset: self.total_turns,
                 loaded_skills: self.loaded_skills.clone(),
+                operator_loads: Vec::new(),
             },
             workspace: self.cfg.workspace.clone(),
             // Unattended; the grant is the gate (see the type's docs).

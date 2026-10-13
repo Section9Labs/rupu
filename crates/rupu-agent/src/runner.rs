@@ -628,79 +628,39 @@ async fn compact_context(
 }
 
 /// Spec 2026-10-12 §6: put the run's loaded skills back into the rebuilt
-/// first message after compaction summarised them away, read at their
-/// current version, most recently loaded first, capped at a quarter of the
-/// input limit (in characters, at ~4 per token: the token count itself; 32
-/// KiB when the limit is unknown). Returns the events that record it, for
-/// after the `Compaction` event: a `skill_load { via: reattach }` per
-/// re-attached skill (in load order, so a replay folds the loaded set into
-/// this one's order), and the `skill_changed` / `skill_missing` /
-/// `skill_reattach_truncated` notices. A missing skill stays in the loaded
-/// set: reinstalled, it comes back at the next compaction.
+/// first message after compaction summarised them away
+/// ([`crate::reattach_block`]), capped at a quarter of the input limit (in
+/// characters, at ~4 per token: the token count itself; 32 KiB when the
+/// limit is unknown). Returns the events that record it, for after the
+/// `Compaction` event: a `skill_load { via: reattach }` per re-attached
+/// skill (in load order, so a replay folds the loaded set into this one's
+/// order), and the `skill_changed` / `skill_missing` /
+/// `skill_reattach_truncated` notices.
 async fn reattach_skills(messages: &mut [Message], run: &mut Run) -> Vec<Event> {
     let Some(skills) = run.tool_context.services.skills.clone() else {
         return Vec::new();
     };
-    if run.loaded_skills.is_empty() || messages.is_empty() {
+    if messages.is_empty() {
         return Vec::new();
     }
-    // As `skills.load` reads each: from where the run found it, refused
-    // when it moved (its files are outside the run's read roots). Reading
-    // the trees and hashing their files is blocking work.
-    let names: Vec<String> = run.loaded_skills.iter().map(|l| l.name.clone()).collect();
-    let current = tokio::task::spawn_blocking(move || {
-        names
-            .iter()
-            .map(|name| {
-                let g = skills.get(name)?;
-                let skill = rupu_skills::load_skill(&g.skill.dir, g.skill.layer).ok()?;
-                let hash = skill.content_hash().ok()?;
-                (skill.root == g.skill.root).then_some((skill, hash))
-            })
-            .collect::<Vec<_>>()
-    })
-    .await
-    .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()));
     let cap = run.limits.input.tokens.map_or(32 * 1024, |t| t as usize);
-    let mut fresh = Vec::new();
-    let mut omitted = Vec::new();
-    let mut missing = Vec::new();
-    let mut used = 0usize;
-    for (at, (loaded, current)) in run.loaded_skills.iter().zip(current).enumerate().rev() {
-        let Some((skill, hash)) = current else {
-            missing.push(loaded.name.clone());
-            continue;
-        };
-        if used + skill.body.len() > cap {
-            omitted.push(loaded.name.clone());
-            continue;
-        }
-        used += skill.body.len();
-        fresh.push((at, skill, hash));
-    }
-    let items: Vec<rupu_skills::render::ReattachItem<'_>> = fresh
-        .iter()
-        .map(|(_, s, _)| rupu_skills::render::ReattachItem {
-            name: s.name.as_str(),
-            base_dir: &s.root,
-            body: &s.body,
-        })
-        .collect();
-    let omitted_ref: Vec<&str> = omitted.iter().map(String::as_str).collect();
-    let missing_ref: Vec<&str> = missing.iter().map(String::as_str).collect();
-    let block = rupu_skills::render::render_reattach(&items, &omitted_ref, &missing_ref);
-    messages[0].content.push(ContentBlock::Text { text: block });
+    let loaded = run.loaded_skills.clone();
+    let reread = Arc::clone(&skills);
+    let Some(reattach) =
+        tokio::task::spawn_blocking(move || crate::reattach_block(&loaded, &reread, cap))
+            .await
+            .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))
+    else {
+        return Vec::new();
+    };
+    messages[0].content.push(ContentBlock::Text {
+        text: reattach.block,
+    });
 
     let mut events = Vec::new();
-    fresh.sort_by_key(|(at, ..)| *at);
-    for (_, skill, hash) in fresh {
-        let name = skill.name.as_str().to_owned();
-        let hash = hash.hex();
-        if run
-            .loaded_skills
-            .iter()
-            .any(|l| l.name == name && l.content_hash != hash)
-        {
+    for r in &reattach.reattached {
+        let name = &r.name;
+        if reattach.changed.contains(name) {
             events.push(Event::Notice {
                 kind: "skill_changed".into(),
                 message: format!(
@@ -709,31 +669,30 @@ async fn reattach_skills(messages: &mut [Message], run: &mut Run) -> Vec<Event> 
                 ),
             });
         }
+        // Re-attached only from where the set found it, so the grant's
+        // layer and root are the skill's.
+        let g = skills.get(name).expect("a re-attached skill is in the set");
         events.push(Event::SkillLoad {
             name: name.clone(),
-            layer: skill.layer.as_str().to_owned(),
-            content_hash: hash.clone(),
-            base_dir: skill.root.display().to_string(),
+            layer: g.skill.layer.as_str().to_owned(),
+            content_hash: r.content_hash.clone(),
+            base_dir: g.skill.root.display().to_string(),
             via: "reattach".into(),
         });
-        run.loaded_skills.retain(|l| l.name != name);
-        run.loaded_skills.push(LoadedSkill {
-            name,
-            content_hash: hash,
-        });
     }
-    for name in &missing {
+    for name in &reattach.missing {
         events.push(Event::Notice {
             kind: "skill_missing".into(),
             message: format!("skill {name} is no longer installed and was not re-attached"),
         });
     }
-    if !omitted.is_empty() {
+    if !reattach.omitted.is_empty() {
         events.push(Event::Notice {
             kind: "skill_reattach_truncated".into(),
-            message: format!("not re-attached for space: {}", omitted.join(", ")),
+            message: format!("not re-attached for space: {}", reattach.omitted.join(", ")),
         });
     }
+    run.loaded_skills = reattach.loaded;
     events
 }
 
@@ -1591,6 +1550,20 @@ pub struct UserTurn {
     /// 2026-10-12 §6): the run starts with them as its loaded set, so its
     /// compactions re-attach them.
     pub loaded_skills: Vec<LoadedSkill>,
+    /// Skills the operator invoked for this turn (spec 2026-10-12 §5.2):
+    /// their bodies are in `message`. Each is recorded as loaded at run
+    /// start and joins the loaded set.
+    pub operator_loads: Vec<OperatorLoad>,
+}
+
+/// A skill an operator injected into a turn's message, at the version
+/// injected.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OperatorLoad {
+    pub name: String,
+    pub layer: String,
+    pub content_hash: String,
+    pub base_dir: String,
 }
 
 impl UserTurn {
@@ -2220,6 +2193,11 @@ async fn run_agent_inner(
     seed_loaded_skills(
         &mut writer,
         opts.tool_context.services.skills.as_deref(),
+        &mut opts.loaded_skills,
+    )?;
+    record_operator_loads(
+        &mut writer,
+        &opts.prompt.operator_loads,
         &mut opts.loaded_skills,
     )?;
     writer.flush()?;
@@ -3681,7 +3659,7 @@ fn write_skill_index(
         .map(|g| rupu_transcript::SkillIndexEntry {
             name: g.name().to_owned(),
             layer: g.skill.layer.as_str().to_owned(),
-            stamp: g.skill.stamp.hex(),
+            stamp: g.baseline_stamp.hex(),
             preload: g.preload,
             indexed: g.indexed,
             reason: g.reason.as_str().to_owned(),
@@ -3746,6 +3724,30 @@ fn seed_loaded_skills(
                 ),
             })?,
         }
+    }
+    Ok(())
+}
+
+/// A `skill_load { via: operator }` per skill the operator injected into
+/// this turn, each moved to the end of `loaded` at the injected version.
+fn record_operator_loads(
+    writer: &mut JsonlWriter,
+    loads: &[OperatorLoad],
+    loaded: &mut Vec<LoadedSkill>,
+) -> Result<(), RunError> {
+    for l in loads {
+        writer.write(&Event::SkillLoad {
+            name: l.name.clone(),
+            layer: l.layer.clone(),
+            content_hash: l.content_hash.clone(),
+            base_dir: l.base_dir.clone(),
+            via: "operator".into(),
+        })?;
+        loaded.retain(|e| e.name != l.name);
+        loaded.push(LoadedSkill {
+            name: l.name.clone(),
+            content_hash: l.content_hash.clone(),
+        });
     }
     Ok(())
 }
@@ -6109,6 +6111,7 @@ mod pause_tests {
                     seed_source: None,
                     turn_index_offset: 0,
                     loaded_skills: Vec::new(),
+                    operator_loads: Vec::new(),
                 },
                 provider,
                 limits: rupu_providers::model_limits::ModelLimits::unknown(),

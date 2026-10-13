@@ -8125,6 +8125,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
                 seed_source,
                 turn_index_offset: session.total_turns,
                 loaded_skills: Vec::new(),
+                operator_loads: Vec::new(),
             },
             workspace,
             mode,

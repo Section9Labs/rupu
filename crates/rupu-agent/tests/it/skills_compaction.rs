@@ -492,3 +492,220 @@ async fn a_continued_run_drops_a_skill_it_is_no_longer_given() {
         ]
     );
 }
+
+fn catalog(global: &Path) -> rupu_skills::SkillCatalog {
+    rupu_skills::SkillCatalog::discover(&rupu_skills::LayerDirs::for_layers(global, None)).unwrap()
+}
+
+/// An operator's invocation: the version the session injected.
+fn operator_load(dir: &Path) -> rupu_agent::OperatorLoad {
+    let skill = rupu_skills::load_skill(dir, rupu_skills::Layer::Global).unwrap();
+    rupu_agent::OperatorLoad {
+        name: skill.name.as_str().to_owned(),
+        layer: "global".into(),
+        content_hash: skill.content_hash().unwrap().hex(),
+        base_dir: skill.root.display().to_string(),
+    }
+}
+
+/// A skill the operator invoked is recorded as loaded after the run's
+/// `skill_index`, and a later compaction re-attaches it like any other.
+#[tokio::test]
+async fn an_operator_load_is_recorded_and_reattached() {
+    let global = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    let pdf = install(global.path(), "pdf", "PDF STEPS");
+    let frozen = rupu_skills::run::resolve_operator(&catalog(global.path()), "pdf").unwrap();
+    let (skills, missing) = rupu_skills::run::resolve_frozen(&catalog(global.path()), &[frozen]);
+    assert!(missing.is_empty());
+    let transcript = ws.path().join("run.jsonl");
+    let provider = MockProvider::new(vec![read_turn("c1", 900), summary_turn(), done_turn()]);
+    let mut o = opts(provider, ws.path(), transcript.clone(), Arc::new(skills));
+    let load = operator_load(&pdf);
+    o.prompt.operator_loads = vec![load.clone()];
+    run_agent(o).await.unwrap();
+    let evs = events(&transcript);
+    assert_eq!(
+        timeline(&evs),
+        vec!["operator:pdf", "compaction", "reattach:pdf"]
+    );
+    let index_at = evs
+        .iter()
+        .position(|e| matches!(e, Event::SkillIndex { .. }))
+        .expect("skill_index");
+    let operator_at = evs
+        .iter()
+        .position(|e| matches!(e, Event::SkillLoad { via, .. } if via == "operator"))
+        .unwrap();
+    assert!(index_at < operator_at);
+    let Event::SkillLoad {
+        name,
+        layer,
+        content_hash,
+        base_dir,
+        ..
+    } = &evs[operator_at]
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        (name, layer, content_hash, base_dir),
+        (&load.name, &load.layer, &load.content_hash, &load.base_dir)
+    );
+    assert!(compacted_first_messages(&evs)[0].contains("PDF STEPS"));
+    assert!(notices(&evs, "skill_changed").is_empty());
+}
+
+/// An operator load replaces a continued conversation's entry of the same
+/// name: the set keeps one entry per skill, at the injected version.
+#[tokio::test]
+async fn an_operator_load_replaces_a_carried_entry_of_the_same_name() {
+    let global = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    let pdf = install(global.path(), "pdf", "PDF STEPS");
+    let transcript = ws.path().join("run.jsonl");
+    let provider = MockProvider::new(vec![read_turn("c1", 900), summary_turn(), done_turn()]);
+    let mut o = opts(
+        provider,
+        ws.path(),
+        transcript.clone(),
+        resolved(global.path(), &["pdf"]),
+    );
+    o.prompt.loaded_skills = vec![LoadedSkill {
+        name: "pdf".into(),
+        content_hash: "0".repeat(64),
+    }];
+    o.prompt.operator_loads = vec![operator_load(&pdf)];
+    run_agent(o).await.unwrap();
+    let evs = events(&transcript);
+    assert_eq!(
+        timeline(&evs),
+        vec![
+            "continuation:pdf",
+            "operator:pdf",
+            "compaction",
+            "reattach:pdf"
+        ]
+    );
+    // Re-attached against the operator's version, so nothing changed.
+    assert!(notices(&evs, "skill_changed").is_empty());
+}
+
+/// The shared helper keeps the most recently loaded skill that fits the cap
+/// and names the older one for the model to reload.
+#[test]
+fn reattach_block_keeps_the_most_recent_within_the_cap() {
+    let global = tempfile::tempdir().unwrap();
+    install(global.path(), "older", &"A".repeat(700));
+    let newer = install(global.path(), "newer", &"B".repeat(700));
+    let skills = resolved(global.path(), &["older", "newer"]);
+    let newer_hash = rupu_skills::load_skill(&newer, rupu_skills::Layer::Global)
+        .unwrap()
+        .content_hash()
+        .unwrap()
+        .hex();
+    let loaded = vec![
+        LoadedSkill {
+            name: "older".into(),
+            content_hash: "1".repeat(64),
+        },
+        LoadedSkill {
+            name: "newer".into(),
+            content_hash: "2".repeat(64),
+        },
+    ];
+    let r = rupu_agent::reattach_block(&loaded, &skills, 1000).expect("a block");
+    assert!(
+        r.block.starts_with(rupu_skills::render::REATTACH_MARKER),
+        "{}",
+        r.block
+    );
+    assert!(r.block.contains(&"B".repeat(700)), "{}", r.block);
+    assert!(!r.block.contains(&"A".repeat(700)), "{}", r.block);
+    assert_eq!(r.omitted, vec!["older".to_string()]);
+    assert!(r.missing.is_empty());
+    assert_eq!(r.changed, vec!["newer".to_string()]);
+    assert_eq!(
+        r.reattached,
+        vec![LoadedSkill {
+            name: "newer".into(),
+            content_hash: newer_hash.clone()
+        }]
+    );
+    assert_eq!(
+        r.loaded,
+        vec![
+            LoadedSkill {
+                name: "older".into(),
+                content_hash: "1".repeat(64)
+            },
+            LoadedSkill {
+                name: "newer".into(),
+                content_hash: newer_hash
+            }
+        ]
+    );
+    assert!(rupu_agent::reattach_block(&[], &skills, 1000).is_none());
+}
+
+/// A skill no longer installed stays in the loaded set (a reinstall brings
+/// it back at the next re-attach) and is listed in the block.
+#[test]
+fn reattach_block_keeps_a_missing_skill_loaded() {
+    let global = tempfile::tempdir().unwrap();
+    let gone = install(global.path(), "gone", "GONE STEPS");
+    let skills = resolved(global.path(), &["gone"]);
+    std::fs::remove_dir_all(&gone).unwrap();
+    let loaded = vec![LoadedSkill {
+        name: "gone".into(),
+        content_hash: "3".repeat(64),
+    }];
+    let r = rupu_agent::reattach_block(&loaded, &skills, 32 * 1024).expect("a block");
+    assert_eq!(r.missing, vec!["gone".to_string()]);
+    assert!(r.reattached.is_empty());
+    assert_eq!(r.loaded, loaded);
+    assert!(
+        r.block.contains("\nNo longer installed: gone\n"),
+        "{}",
+        r.block
+    );
+}
+
+/// A frozen set's `skill_index` rows carry the stamp the session recorded,
+/// not the skill's stamp now.
+#[tokio::test]
+async fn skill_index_rows_carry_the_baseline_stamp() {
+    let global = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    let pdf = install(global.path(), "pdf", "PDF STEPS");
+    let frozen = resolved(global.path(), &["pdf"]).freeze();
+    let baseline = frozen[0].stamp.clone();
+    std::fs::write(
+        pdf.join("SKILL.md"),
+        "---\nname: pdf\ndescription: d.\n---\nLONGER PDF STEPS NOW\n",
+    )
+    .unwrap();
+    let (skills, missing) = rupu_skills::run::resolve_frozen(&catalog(global.path()), &frozen);
+    assert!(missing.is_empty());
+    let live = skills.get("pdf").unwrap().skill.stamp.hex();
+    assert_ne!(live, baseline);
+    let transcript = ws.path().join("run.jsonl");
+    let provider = MockProvider::new(vec![done_turn()]);
+    run_agent(opts(
+        provider,
+        ws.path(),
+        transcript.clone(),
+        Arc::new(skills),
+    ))
+    .await
+    .unwrap();
+    let stamps: Vec<String> = events(&transcript)
+        .iter()
+        .filter_map(|e| match e {
+            Event::SkillIndex { skills } => Some(skills.iter().map(|s| s.stamp.clone())),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(stamps, vec![baseline]);
+}
