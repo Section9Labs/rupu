@@ -98,6 +98,10 @@ export interface AgentDraft {
   maxTokens?: number;
   contextWindowTokens?: number;
   compactAtPercent?: number;
+  /** Skills the agent may load: names, `*` (every global skill), `project:*`. */
+  skills?: string[];
+  /** Skills always in the agent's prompt. */
+  preloadSkills?: string[];
   body: string;
   /** Unknown frontmatter keys parsed from an existing file, preserved and
    *  re-emitted verbatim so editing never silently drops fields the UI
@@ -135,6 +139,8 @@ const KEY_ORDER: (keyof AgentDraft)[] = [
   'maxTokens',
   'contextWindowTokens',
   'compactAtPercent',
+  'skills',
+  'preloadSkills',
 ];
 
 function isPresent(v: unknown): boolean {
@@ -315,6 +321,8 @@ export function parseAgent(raw: string): AgentDraft {
   if (typeof fm.maxTokens === 'number') draft.maxTokens = fm.maxTokens;
   if (typeof fm.contextWindowTokens === 'number') draft.contextWindowTokens = fm.contextWindowTokens;
   if (typeof fm.compactAtPercent === 'number') draft.compactAtPercent = fm.compactAtPercent;
+  if (Array.isArray(fm.skills)) draft.skills = fm.skills as string[];
+  if (Array.isArray(fm.preloadSkills)) draft.preloadSkills = fm.preloadSkills as string[];
 
   const passthrough: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(fm)) {

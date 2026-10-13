@@ -64,6 +64,55 @@ describe('agentSpec', () => {
     expect(serializeAgent(back)).toContain('someFutureKey: 42');
   });
 
+  it('models skills and preloadSkills, round-tripping both', () => {
+    const raw = [
+      '---',
+      'name: reviewer',
+      'findingsProfile: full',
+      'skills:',
+      '  - pdf',
+      '  - project:*',
+      'preloadSkills:',
+      '  - house-style',
+      '---',
+      '',
+      'Review it.',
+      '',
+    ].join('\n');
+    const d = parseAgent(raw);
+    expect(d.skills).toEqual(['pdf', 'project:*']);
+    expect(d.preloadSkills).toEqual(['house-style']);
+    expect(d._passthrough).toEqual({ findingsProfile: 'full' });
+
+    const out = serializeAgent(d);
+    expect(yaml.load(splitFm(out).frontmatter)).toEqual({
+      name: 'reviewer',
+      findingsProfile: 'full',
+      skills: ['pdf', 'project:*'],
+      preloadSkills: ['house-style'],
+    });
+    expect(serializeAgent(parseAgent(out))).toBe(out);
+  });
+
+  it('places skills then preloadSkills after compactAtPercent, as the Rust Frontmatter does', () => {
+    const d = emptyDraft();
+    d.name = 'a';
+    d.preloadSkills = ['house-style'];
+    d.compactAtPercent = 80;
+    d.skills = ['pdf'];
+    d.body = 'b';
+    const keys = Object.keys(yaml.load(splitFm(serializeAgent(d)).frontmatter) as Record<string, unknown>);
+    expect(keys).toEqual(['name', 'compactAtPercent', 'skills', 'preloadSkills']);
+  });
+
+  it('omits empty skill lists', () => {
+    const d = emptyDraft();
+    d.name = 'a';
+    d.skills = [];
+    d.preloadSkills = [];
+    expect(serializeAgent(d)).toBe('---\nname: a\n---\n\n\n');
+  });
+
   it('emptyDraft has no present fields and serializes to just name + body', () => {
     const d = emptyDraft();
     expect(d.body).toBe('');

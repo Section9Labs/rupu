@@ -1449,6 +1449,11 @@ export interface SkillDetail extends SkillRow {
   source_record: unknown | null;
 }
 
+/** The names a skill picker offers: valid skills, deduplicated across layers. */
+export function skillNamesOf(rows: SkillRow[]): string[] {
+  return [...new Set(rows.filter((s) => s.status === 'ok').map((s) => s.name))].sort();
+}
+
 /** Launch/session-start skill entries, as body keys only when non-empty. */
 export interface SkillEntries {
   skills?: string[];
