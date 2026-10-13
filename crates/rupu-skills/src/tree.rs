@@ -239,3 +239,40 @@ pub fn content_hash(root: &Path, entries: &[TreeEntry]) -> Result<ContentHash, T
     }
     Ok(ContentHash(h.finalize().into()))
 }
+
+/// Feeds the bytes `content_hash` hashes, for a caller that already holds
+/// each file's bytes (a pack hashes exactly what it archives).
+pub struct ContentHasher(Sha256);
+
+impl Default for ContentHasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ContentHasher {
+    pub fn new() -> Self {
+        Self(Sha256::new())
+    }
+
+    pub fn file(&mut self, rel: &str, mode: u32, bytes: &[u8]) {
+        self.0.update(rel.as_bytes());
+        self.0.update([0]);
+        self.0
+            .update(format!("f\0{mode:o}\0{}\0", bytes.len()).as_bytes());
+        self.0.update(bytes);
+        self.0.update(b"\n");
+    }
+
+    pub fn symlink(&mut self, rel: &str, target: &str) {
+        self.0.update(rel.as_bytes());
+        self.0.update([0]);
+        self.0.update(b"l\0");
+        self.0.update(target.as_bytes());
+        self.0.update(b"\n");
+    }
+
+    pub fn finish(self) -> ContentHash {
+        ContentHash(self.0.finalize().into())
+    }
+}

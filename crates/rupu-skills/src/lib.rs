@@ -13,6 +13,7 @@ pub mod name;
 pub mod record;
 pub mod render;
 pub mod run;
+pub mod ship;
 pub mod skill;
 pub mod source;
 pub mod tools_map;
