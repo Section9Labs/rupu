@@ -192,6 +192,11 @@ impl MessageRoot {
         }
     }
 
+    /// The space's message log (which may not exist yet).
+    pub fn log_path(&self) -> PathBuf {
+        Bus::open(&self.space, address::OPERATOR).log_path()
+    }
+
     /// The root's own directory.
     fn dir(&self) -> &Path {
         match self.kind {

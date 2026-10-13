@@ -27,6 +27,7 @@ pub mod issues;
 pub mod launch_link;
 pub mod man;
 pub mod mcp;
+pub mod message;
 pub mod models;
 pub mod netflow;
 pub mod node;

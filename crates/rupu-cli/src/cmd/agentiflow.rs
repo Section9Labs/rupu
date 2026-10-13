@@ -1287,23 +1287,14 @@ fn send(
             OperatorSendError::NotLive(why) => anyhow!("{why}: it takes no message"),
             OperatorSendError::Bus(e) => anyhow!(e).context(format!("send to the lead of {id}")),
         })?;
-    let mut out = format!("sent {} to lead of {id}", receipt.id());
-    for u in &receipt.delivery().undelivered {
-        let reason = serde_json::to_value(u.reason)
-            .ok()
-            .and_then(|v| v.as_str().map(str::to_string))
-            .unwrap_or_default();
-        out.push_str(&format!("\nnot delivered to {}: {reason}", u.to));
-    }
-    Ok(out)
+    let mut lines = vec![format!("sent {} to lead of {id}", receipt.id())];
+    lines.extend(crate::cmd::message::undelivered_lines(&receipt));
+    Ok(lines.join("\n"))
 }
 
 fn send_cmd(fragment: &str, message: &str, now: bool) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
-    let pwd = std::env::current_dir()?;
-    let project_root = paths::project_root_for(&pwd)?;
-    let cfg = paths::load_config_for_display(&global, project_root.as_deref(), &pwd, true);
-    let caps = rupu_runtime::services::messaging::caps(&cfg);
+    let caps = crate::cmd::message::messaging_caps(&global)?;
     println!("{}", send(&global, fragment, message, now, caps)?);
     Ok(())
 }
