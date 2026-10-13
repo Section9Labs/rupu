@@ -1,8 +1,8 @@
 //! Grants are just names (W5 §6 test 3): a plain `rupu run` whose agent
 //! lists a roster tool gets it (every launch site provides the catalog). And
-//! every run can have a message space (spec F1a, FD1): one whose agent lists
-//! a board tool gets it, and its space is created on its first message — a
-//! run that never messages creates none.
+//! every run has a message space (spec F1a, F1b): one whose agent lists a
+//! board tool gets it; every run joins it as it starts, and its log is
+//! created by its first message.
 
 use assert_cmd::Command;
 use serde_json::Value;
@@ -110,11 +110,12 @@ fn board_tools_in_a_plain_run() {
     assert_eq!(sent.len(), 1, "{t:?}");
     assert_eq!(sent[0]["data"]["direction"], "sent");
     assert_eq!(sent[0]["data"]["id"], log[0]["id"]);
-    // The run joined on that post, and left as it ended.
+    // The run joined as it started, and left as it ended.
     let roster = std::fs::read_to_string(space.join("participants.jsonl")).unwrap();
     assert_eq!(roster.lines().count(), 2, "{roster}");
 
-    // A run that never messages creates no space.
+    // A run that never messages joins too, so the operator can reach it;
+    // its log waits for a first message.
     write_agent(dir.path(), "quiet", "[board.post]");
     run(
         dir.path(),
@@ -122,5 +123,16 @@ fn board_tools_in_a_plain_run() {
         "run_quiet",
         r#"[{"AssistantText":{"text":"done","stop":"end_turn"}}]"#,
     );
-    assert!(!dir.path().join(".rupu/runs/run_quiet/messages").exists());
+    let quiet = dir.path().join(".rupu/runs/run_quiet/messages");
+    let roster: Vec<Value> = std::fs::read_to_string(quiet.join("participants.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(roster.len(), 2, "{roster:?}");
+    assert_eq!(roster[0]["t"], "joined");
+    assert_eq!(roster[0]["run_id"], "run_quiet");
+    assert!(roster[0]["pid"].is_u64(), "{roster:?}");
+    assert_eq!(roster[1]["t"], "left");
+    assert!(!quiet.join("log.jsonl").exists());
 }

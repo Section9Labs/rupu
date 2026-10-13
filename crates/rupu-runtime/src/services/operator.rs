@@ -205,7 +205,7 @@ impl MessageRoot {
     /// `pid_alive` is the caller's liveness test
     /// (`rupu_orchestrator::runs::pid_is_running`).
     pub fn liveness(&self, global: &Path, pid_alive: &dyn Fn(u32) -> bool) -> Liveness {
-        let not = |why: String| Liveness::NotLive(why);
+        let not = Liveness::NotLive;
         let id = &self.id;
         match self.kind {
             RootKind::Agentiflow => {
