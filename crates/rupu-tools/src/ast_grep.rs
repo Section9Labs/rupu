@@ -164,7 +164,7 @@ impl Tool for AstGrepTool {
         // workspace. Same guard the write tools use (ISSUES.md I-22), widened
         // to the run's read roots.
         let roots = crate::path_scope::Roots::of(&ctx.workspace);
-        if !roots.is_readable(&search_path) {
+        let Some(resolved) = roots.readable(&search_path) else {
             return Ok(ToolOutput {
                 stdout: String::new(),
                 error: Some(format!(
@@ -175,7 +175,7 @@ impl Tool for AstGrepTool {
                 derived: None,
                 structured: None,
             });
-        }
+        };
 
         let out = Command::new(ast_grep)
             .arg("run")
@@ -184,7 +184,7 @@ impl Tool for AstGrepTool {
             .arg("--lang")
             .arg(&i.lang)
             .arg("--json=stream")
-            .arg(&search_path)
+            .arg(&resolved)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
@@ -232,6 +232,7 @@ impl Tool for AstGrepTool {
                 if raw_path.is_empty() {
                     continue;
                 }
+                let raw_path = &crate::path_scope::as_given(raw_path, &resolved, &search_path);
                 let start = obj.get("range").and_then(|r| r.get("start"));
                 let line0 = start.and_then(|s| s.get("line")).and_then(Value::as_u64);
                 let col0 = start.and_then(|s| s.get("column")).and_then(Value::as_u64);

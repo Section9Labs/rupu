@@ -8,7 +8,7 @@
 
 use crate::coverage_emit::{attribution_from, emit};
 use crate::descriptor::{Effect, ToolDescriptor};
-use crate::path_scope::{within, Roots};
+use crate::path_scope::{as_given, within, Roots};
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput, WorkspaceScope};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -68,31 +68,28 @@ impl Tool for GlobTool {
         let from_root = read_root.is_some();
         let (base, pattern) =
             read_root.unwrap_or_else(|| (ctx.workspace.path.clone(), i.pattern.clone()));
-        let walker = globwalk::GlobWalkerBuilder::from_patterns(&base, &[&pattern])
-            .max_depth(64)
-            .follow_links(false)
-            .build()
-            .map_err(|e| ToolError::Execution(e.to_string()))?;
 
         // Workspace scope, as the other fs tools: a pattern that climbs out
-        // (`../*`, an absolute path) yields nothing outside the walk's base.
-        // Matches under a read root are absolute; workspace matches relative.
+        // (`../*`, an absolute path) yields nothing outside the walk's base,
+        // which is walked where it resolves. Matches under a read root are
+        // absolute; workspace matches relative.
         let mut matches = vec![];
-        let canonical_base = base.canonicalize().ok();
-        for entry in walker.flatten() {
-            let in_base = canonical_base
-                .as_deref()
-                .is_some_and(|b| within(b, entry.path()));
-            if entry.file_type().is_file() && in_base {
-                let shown = if from_root {
-                    entry.path()
-                } else {
-                    entry
-                        .path()
-                        .strip_prefix(&ctx.workspace.path)
-                        .unwrap_or(entry.path())
-                };
-                matches.push(shown.display().to_string());
+        if let Ok(canonical_base) = base.canonicalize() {
+            let walker = globwalk::GlobWalkerBuilder::from_patterns(&canonical_base, &[&pattern])
+                .max_depth(64)
+                .follow_links(false)
+                .build()
+                .map_err(|e| ToolError::Execution(e.to_string()))?;
+            for entry in walker.flatten() {
+                if entry.file_type().is_file() && within(&canonical_base, entry.path()) {
+                    let path = entry.path().display().to_string();
+                    let shown = PathBuf::from(as_given(&path, &canonical_base, &base));
+                    let shown = match from_root {
+                        true => &shown,
+                        false => shown.strip_prefix(&ctx.workspace.path).unwrap_or(&shown),
+                    };
+                    matches.push(shown.display().to_string());
+                }
             }
         }
         matches.sort();

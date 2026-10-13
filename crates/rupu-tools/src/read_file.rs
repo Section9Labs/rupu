@@ -68,12 +68,12 @@ impl Tool for ReadFileTool {
             serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
         let abs = ctx.workspace.path.join(&i.path);
         let roots = Roots::of(&ctx.workspace);
-        if !roots.is_readable(&abs) {
+        let Some(abs) = roots.readable(&abs) else {
             return Ok(err_output(
                 started,
                 format!("path {} escapes workspace", i.path),
             ));
-        }
+        };
         match std::fs::read_to_string(&abs) {
             Ok(text) => {
                 let line_count = text.lines().count() as u32;

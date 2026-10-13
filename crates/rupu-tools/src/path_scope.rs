@@ -64,10 +64,12 @@ impl Roots {
         }
     }
 
-    /// Inside the workspace or one of the read roots. The read tools use
-    /// this; `write_file` and `edit_file` keep `is_inside`.
-    pub(crate) fn is_readable(&self, candidate: &Path) -> bool {
-        resolve(candidate).is_some_and(|p| self.has_workspace(&p) || self.has_read_root(&p))
+    /// Where `candidate` resolves, when that is inside the workspace or one
+    /// of the read roots: the path a read tool opens, so a link swapped
+    /// after this check can't redirect the read. `write_file` and
+    /// `edit_file` keep `is_inside`.
+    pub(crate) fn readable(&self, candidate: &Path) -> Option<PathBuf> {
+        resolve(candidate).filter(|p| self.has_workspace(p) || self.has_read_root(p))
     }
 
     /// Inside the workspace and not under a read root: a target file, whose
@@ -85,5 +87,18 @@ impl Roots {
 
     fn has_read_root(&self, resolved: &Path) -> bool {
         self.read.iter().any(|r| resolved.starts_with(r))
+    }
+}
+
+/// `shown`, a path a tool printed under the `resolved` path it opened, with
+/// that prefix put back as `given`: what the tool reports is spelled the way
+/// it was asked for.
+pub(crate) fn as_given(shown: &str, resolved: &Path, given: &Path) -> String {
+    let prefix = resolved.to_string_lossy();
+    match shown.strip_prefix(&*prefix) {
+        Some(rest) if rest.is_empty() || rest.starts_with(['/', ':']) => {
+            format!("{}{rest}", given.display())
+        }
+        _ => shown.to_owned(),
     }
 }

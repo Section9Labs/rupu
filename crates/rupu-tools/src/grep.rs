@@ -87,7 +87,7 @@ impl Tool for GrepTool {
         // workspace. Same guard the write tools use (ISSUES.md I-22), widened
         // to the run's read roots.
         let roots = crate::path_scope::Roots::of(&ctx.workspace);
-        if !roots.is_readable(&search_path) {
+        let Some(resolved) = roots.readable(&search_path) else {
             return Ok(ToolOutput {
                 stdout: String::new(),
                 error: Some(format!(
@@ -98,21 +98,25 @@ impl Tool for GrepTool {
                 derived: None,
                 structured: None,
             });
-        }
+        };
 
         let out = Command::new(rg)
             .arg("--with-filename")
             .arg("--line-number")
             .arg("--no-heading")
             .arg(&i.pattern)
-            .arg(&search_path)
+            .arg(&resolved)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
             .await
             .map_err(|e| ToolError::Execution(e.to_string()))?;
 
-        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        // rg prints each path under the one it searched: spell it as asked.
+        let stdout: String = String::from_utf8_lossy(&out.stdout)
+            .split_inclusive('\n')
+            .map(|line| crate::path_scope::as_given(line, &resolved, &search_path))
+            .collect();
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
 
         // ripgrep exit code: 0 = matches, 1 = no matches (success), 2+ = error
