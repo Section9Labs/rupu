@@ -609,6 +609,52 @@ impl RunAssembler {
         Ok(((!resolved.is_empty()).then(|| Arc::new(resolved)), missing))
     }
 
+    /// An operator's invocations for a session turn (spec 2026-10-12 §5.2),
+    /// each entry resolved against the same layers as
+    /// [`Self::resolve_frozen_skills`]: any valid installed skill, granted
+    /// or not. `held` is the session's frozen set; an entry this call
+    /// already resolved binds its name too, and one resolved twice is
+    /// returned once. A wildcard, an unknown or ambiguous name, or a name
+    /// held from the other layer fails the whole call.
+    pub async fn resolve_operator_skills(
+        &self,
+        held: &[rupu_skills::FrozenSkill],
+        entries: &[String],
+    ) -> Result<Vec<rupu_skills::FrozenSkill>, AssembleError> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dirs = rupu_skills::LayerDirs::for_layers(
+            &self.ctx.global,
+            self.ctx
+                .project_root
+                .as_ref()
+                .map(|p| p.join(".rupu"))
+                .as_deref(),
+        );
+        let (mut held, entries) = (held.to_vec(), entries.to_vec());
+        tokio::task::spawn_blocking(move || {
+            let failed = |source: rupu_agent::SkillCheckError| AssembleError::Skills {
+                source,
+                looked_in: dirs.clone(),
+            };
+            let catalog =
+                rupu_skills::SkillCatalog::discover(&dirs).map_err(|e| failed(e.into()))?;
+            let mut invoked: Vec<rupu_skills::FrozenSkill> = Vec::new();
+            for entry in &entries {
+                let f = rupu_skills::resolve_operator(&catalog, &held, entry)
+                    .map_err(|e| failed(e.into()))?;
+                if !invoked.contains(&f) {
+                    held.push(f.clone());
+                    invoked.push(f);
+                }
+            }
+            Ok(invoked)
+        })
+        .await
+        .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))
+    }
+
     /// [`Self::resolve_skills`] for the run whose transcript is
     /// `transcript_path`, recording a failure as [`Self::assemble`] does: as
     /// when its grant fails, the run's (empty) transcript exists, so whatever

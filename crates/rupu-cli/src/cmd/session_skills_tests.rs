@@ -80,6 +80,7 @@ async fn turn(global: &Path, session_id: &str, run_id: &str, script: &str) -> Ve
             session_id: session_id.into(),
             run_id: run_id.into(),
             prompt: format!("prompt for {run_id}"),
+            operator_skills: Vec::new(),
         }),
     )
     .await
@@ -368,4 +369,317 @@ async fn a_record_without_skill_fields_runs_unchanged() {
     assert!(keys(&path)
         .iter()
         .all(|k| !skill_keys.contains(&k.as_str())));
+}
+
+/// Runs one turn the operator invoked `invoked` in and returns its
+/// transcript.
+async fn operator_turn(
+    global: &Path,
+    session_id: &str,
+    run_id: &str,
+    prompt: &str,
+    invoked: Vec<rupu_skills::FrozenSkill>,
+) -> Vec<TranscriptEvent> {
+    with_mock_home(
+        global,
+        ACK,
+        run_turn(RunTurnArgs {
+            session_id: session_id.into(),
+            run_id: run_id.into(),
+            prompt: prompt.into(),
+            operator_skills: invoked,
+        }),
+    )
+    .await
+    .expect("the turn runs");
+    let (session, _) = read_session(global, session_id).unwrap();
+    JsonlReader::iter(session.transcripts_dir.join(format!("{run_id}.jsonl")))
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect()
+}
+
+/// What `session send --skill` resolves, as `send` resolves it.
+async fn invoke(
+    global: &Path,
+    session_id: &str,
+    entries: &[&str],
+) -> anyhow::Result<Vec<rupu_skills::FrozenSkill>> {
+    let (session, _) = read_session(global, session_id).unwrap();
+    let entries: Vec<String> = entries.iter().map(|s| s.to_string()).collect();
+    resolve_send_skills(global, &session, &entries).await
+}
+
+fn user_message(evs: &[TranscriptEvent]) -> String {
+    evs.iter()
+        .find_map(|e| match e {
+            TranscriptEvent::UserMessage { content } => Some(content.clone()),
+            _ => None,
+        })
+        .expect("a user message")
+}
+
+/// `(via, name)` of every `skill_load`.
+fn loads(evs: &[TranscriptEvent]) -> Vec<(String, String)> {
+    evs.iter()
+        .filter_map(|e| match e {
+            TranscriptEvent::SkillLoad { name, via, .. } => Some((via.clone(), name.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The result text of tool call `id`, and whether it failed.
+fn tool_result(evs: &[TranscriptEvent], id: &str) -> (String, Option<String>) {
+    evs.iter()
+        .find_map(|e| match e {
+            TranscriptEvent::ToolResult {
+                call_id,
+                output,
+                error,
+                ..
+            } if call_id == id => Some((output.clone(), error.clone())),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("a result for {id}"))
+}
+
+/// Spec 2026-10-12 §5.2: an invoked skill is injected ahead of the
+/// prompt, recorded as an operator load and frozen into the session with
+/// reason `operator`, unindexed. The next turn may load it and read its
+/// files; no turn's system prompt changes.
+#[tokio::test]
+async fn send_skill_injects_records_and_grants() {
+    let _guard = crate::test_support::ENV_LOCK.lock().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let pdf_dir = install_skill(&tmp.path().join("global"), "pdf", "PDF STEPS");
+    fs::write(pdf_dir.join("forms.md"), "FORM NOTES\n").unwrap();
+    let (global, record) = skill_session(&tmp, "ses_skills_send01", &agent(""), &[], &[]).await;
+    let first = turn(&global, &record.session_id, "run_send_1", ACK).await;
+
+    let invoked = invoke(&global, &record.session_id, &["pdf"]).await.unwrap();
+    let second = operator_turn(
+        &global,
+        &record.session_id,
+        "run_send_2",
+        "summarise x.pdf",
+        invoked,
+    )
+    .await;
+    let pdf = rupu_skills::load_skill(&pdf_dir, rupu_skills::Layer::Global).unwrap();
+    let version = pdf.content_hash().unwrap();
+    assert_eq!(
+        user_message(&second),
+        format!(
+            "<skill name=\"pdf\" base=\"{}\" version=\"{}\">\nPDF STEPS\n</skill>\n\n\
+             summarise x.pdf",
+            pdf.root.display(),
+            version.short()
+        )
+    );
+    assert_eq!(loads(&second), pairs(&[("operator", "pdf")]));
+    let (after, _) = read_session(&global, &record.session_id).unwrap();
+    assert_eq!(
+        after.skill_index,
+        vec![rupu_skills::FrozenSkill {
+            name: "pdf".into(),
+            layer: rupu_skills::Layer::Global,
+            preload: false,
+            indexed: false,
+            reason: rupu_skills::SkillReason::Operator,
+            stamp: pdf.stamp.hex(),
+            content_hash: None,
+        }]
+    );
+    assert_eq!(after.skill_prompt, None);
+    assert_eq!(
+        after.loaded_skills,
+        vec![rupu_agent::LoadedSkill {
+            name: "pdf".into(),
+            content_hash: version.hex(),
+        }]
+    );
+
+    let forms = pdf.root.join("forms.md");
+    let script = json!([
+        { "AssistantToolUse": {
+            "text": null, "tool_id": "c1", "tool_name": "skills.load",
+            "tool_input": { "name": "pdf" }, "stop": "tool_use"
+        } },
+        { "AssistantToolUse": {
+            "text": null, "tool_id": "c2", "tool_name": "read_file",
+            "tool_input": { "path": forms.display().to_string() }, "stop": "tool_use"
+        } },
+        { "AssistantText": { "text": "ack", "stop": "end_turn" } }
+    ])
+    .to_string();
+    let third = turn(&global, &record.session_id, "run_send_3", &script).await;
+    let (loaded, load_error) = tool_result(&third, "c1");
+    assert_eq!(load_error, None);
+    assert!(loaded.contains("PDF STEPS"), "{loaded}");
+    let (read, read_error) = tool_result(&third, "c2");
+    assert_eq!(read_error, None);
+    assert!(read.contains("FORM NOTES"), "{read}");
+
+    let prompt = system_prompt(&first);
+    assert_eq!(system_prompt(&second), prompt);
+    assert_eq!(system_prompt(&third), prompt);
+    assert!(!prompt.contains("pdf"), "{prompt}");
+}
+
+/// Review Focus 3: a typo is refused with a did-you-mean before anything
+/// is enqueued, and the session is left as it was.
+#[tokio::test]
+async fn send_skill_typo_is_refused_before_enqueue() {
+    let _guard = crate::test_support::ENV_LOCK.lock().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    install_skill(&tmp.path().join("global"), "pdf", "PDF STEPS");
+    let (global, record) = skill_session(&tmp, "ses_skills_typo01", &agent(""), &[], &[]).await;
+    let before = fs::read(session_record_path(
+        &global,
+        SessionScope::Active,
+        &record.session_id,
+    ))
+    .unwrap();
+    let err = with_mock_home(
+        &global,
+        ACK,
+        send(SendArgs {
+            session_id: record.session_id.clone(),
+            prompt: Some("hi".into()),
+            skills: vec!["pdff".into()],
+            detach: true,
+            view: None,
+        }),
+    )
+    .await
+    .expect_err("an unknown skill is refused");
+    assert!(
+        err.to_string()
+            .contains("unknown skill \"pdff\" (did you mean pdf?)"),
+        "{err}"
+    );
+    let queue = session_turn_queue_dir(&global, SessionScope::Active, &record.session_id);
+    assert!(
+        !queue.exists() || fs::read_dir(&queue).unwrap().next().is_none(),
+        "nothing was enqueued"
+    );
+    assert_eq!(
+        fs::read(session_record_path(
+            &global,
+            SessionScope::Active,
+            &record.session_id
+        ))
+        .unwrap(),
+        before
+    );
+}
+
+/// The operator may invoke a project skill by its bare name, and a skill
+/// marked `disable-model-invocation`, which exists for exactly this.
+#[tokio::test]
+async fn send_skill_accepts_project_and_disable_model_invocation_skills() {
+    let _guard = crate::test_support::ENV_LOCK.lock().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let manual = tmp.path().join("global/skills/manual");
+    fs::create_dir_all(&manual).unwrap();
+    fs::write(
+        manual.join("SKILL.md"),
+        "---\nname: manual\ndescription: d.\ndisable-model-invocation: true\n---\nMANUAL STEPS\n",
+    )
+    .unwrap();
+    let project = tmp.path().join("project");
+    install_skill(&project.join(".rupu"), "notes", "NOTE STEPS");
+    let (global, mut record) = skill_session(&tmp, "ses_skills_proj01", &agent(""), &[], &[]).await;
+    record.project_root = Some(project);
+    write_session(&global, SessionScope::Active, &record).unwrap();
+
+    let invoked = invoke(&global, &record.session_id, &["notes", "manual"])
+        .await
+        .unwrap();
+    let layers: Vec<(&str, rupu_skills::Layer)> =
+        invoked.iter().map(|f| (f.name.as_str(), f.layer)).collect();
+    assert_eq!(
+        layers,
+        vec![
+            ("notes", rupu_skills::Layer::Project),
+            ("manual", rupu_skills::Layer::Global)
+        ]
+    );
+    let evs = operator_turn(&global, &record.session_id, "run_proj_1", "", invoked).await;
+    let message = user_message(&evs);
+    assert!(message.starts_with("<skill name=\"notes\""), "{message}");
+    assert!(message.contains("NOTE STEPS"), "{message}");
+    assert!(
+        message.contains("\n</skill>\n\n<skill name=\"manual\""),
+        "{message}"
+    );
+    assert!(message.ends_with("MANUAL STEPS\n</skill>"), "{message}");
+    assert_eq!(
+        loads(&evs),
+        pairs(&[("operator", "notes"), ("operator", "manual")])
+    );
+    let next = turn(&global, &record.session_id, "run_proj_2", &load("manual")).await;
+    let (loaded, error) = tool_result(&next, "c1");
+    assert_eq!(error, None);
+    assert!(loaded.contains("MANUAL STEPS"), "{loaded}");
+}
+
+/// A wildcard names a set, a bare name in both layers names neither, and a
+/// name the session binds from one layer can't be invoked from the other.
+#[tokio::test]
+async fn send_skill_refuses_wildcards_and_ambiguous_names() {
+    let _guard = crate::test_support::ENV_LOCK.lock().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let project = tmp.path().join("project");
+    install_skill(&tmp.path().join("global"), "pdf", "GLOBAL PDF");
+    install_skill(&project.join(".rupu"), "pdf", "PROJECT PDF");
+    install_skill(&tmp.path().join("global"), "notes", "NOTE STEPS");
+    install_skill(&project.join(".rupu"), "notes", "PROJECT NOTES");
+    let (global, mut record) =
+        skill_session(&tmp, "ses_skills_wild01", &agent(""), &["notes"], &[]).await;
+    record.project_root = Some(project);
+    write_session(&global, SessionScope::Active, &record).unwrap();
+
+    let refused = |entries: &'static [&'static str]| {
+        let global = global.clone();
+        let id = record.session_id.clone();
+        async move {
+            invoke(&global, &id, entries)
+                .await
+                .expect_err("refused")
+                .to_string()
+        }
+    };
+    assert!(refused(&["*"])
+        .await
+        .contains("skill entry \"*\" is a wildcard; invoke one skill by name"));
+    assert!(refused(&["project:*"])
+        .await
+        .contains("skill entry \"project:*\" is a wildcard"));
+    let both = refused(&["pdf"]).await;
+    assert!(
+        both.contains(
+            "skill \"pdf\" is installed in both the global and the project layer; grant \
+             global:pdf or project:pdf"
+        ),
+        "{both}"
+    );
+    let bound = |name: &str| {
+        format!(
+            "skill \"{name}\" is granted from both the global and the project layer; grant only \
+             one of global:{name} or project:{name}"
+        )
+    };
+    let other_layer = refused(&["project:notes"]).await;
+    assert!(other_layer.contains(&bound("notes")), "{other_layer}");
+    let held_twice = refused(&["global:pdf", "project:pdf"]).await;
+    assert!(held_twice.contains(&bound("pdf")), "{held_twice}");
+
+    let ok = invoke(&global, &record.session_id, &["global:pdf", "global:pdf"])
+        .await
+        .unwrap();
+    let names: Vec<(&str, rupu_skills::Layer)> =
+        ok.iter().map(|f| (f.name.as_str(), f.layer)).collect();
+    assert_eq!(names, vec![("pdf", rupu_skills::Layer::Global)]);
 }

@@ -18,6 +18,8 @@ pub mod collector;
 pub mod fd_budget;
 // implemented in Task 3
 pub mod loader;
+// A session turn's message with the operator's invoked skills.
+pub mod operator_skills;
 // Classifies every reply and provider error into an outcome (response-outcomes plan 2).
 pub mod outcome;
 // implemented in Task 4
@@ -48,6 +50,7 @@ pub use loader::{
     check_agent_files, find_agent, load_agent, load_agents, AgentFileCheck, AgentLayer,
     AgentLoadError, SkillCheckError,
 };
+pub use operator_skills::operator_turn;
 pub use permission::{resolve_mode, PermissionPrompt};
 pub use recovery::{Hop, HopBuilder, RecoveryOpts};
 pub use runner::{

@@ -847,3 +847,32 @@ async fn an_old_session_turn_runs_without_skills_its_agent_now_declares() {
     )));
     assert!(!events.iter().any(|e| matches!(e, Event::SkillIndex { .. })));
 }
+
+/// `session send --skill` with a typo exits non-zero with a did-you-mean
+/// before anything is enqueued; the prompt may be left out when a skill is
+/// named, and is required otherwise.
+#[tokio::test]
+async fn session_send_refuses_an_unknown_skill_before_enqueue() {
+    let _guard = ENV_LOCK.lock().await;
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    write_session(&home, "ses_send_skill", "idle", None, false);
+    install_skill(&home, "pdf");
+    let record = home.join("sessions/ses_send_skill/session.json");
+    let before = std::fs::read(&record).unwrap();
+    rupu(&home, tmp.path())
+        .args(["session", "send", "--skill", "pdff", "ses_send_skill"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "unknown skill \"pdff\" (did you mean pdf?)",
+        ));
+    assert!(!home.join("sessions/ses_send_skill/queue").exists());
+    assert_eq!(std::fs::read(&record).unwrap(), before);
+    rupu(&home, tmp.path())
+        .args(["session", "send", "ses_send_skill"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("<PROMPT>"));
+}

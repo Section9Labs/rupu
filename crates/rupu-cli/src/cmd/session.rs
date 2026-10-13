@@ -207,8 +207,16 @@ pub struct SendArgs {
     /// Session id (`ses_<ULID>`), a unique prefix, or a codename.
     #[arg(add = ArgValueCompleter::new(active_session_ids))]
     pub session_id: String,
-    /// Follow-up prompt to send as the session's next turn.
-    pub prompt: String,
+    /// Follow-up prompt to send as the session's next turn. Optional when
+    /// the turn invokes a skill.
+    #[arg(required_unless_present = "skills")]
+    pub prompt: Option<String>,
+    /// A skill to invoke in this turn (`name`, `global:name` or
+    /// `project:name`): any installed skill, granted or not. Its
+    /// instructions go ahead of the prompt, and the session may load it
+    /// from then on. Repeatable.
+    #[arg(long = "skill", value_name = "SKILL")]
+    pub skills: Vec<String>,
     /// Start the turn without auto-attaching.
     #[arg(long)]
     pub detach: bool,
@@ -246,6 +254,10 @@ pub struct RunTurnArgs {
     pub run_id: String,
     #[arg(long)]
     pub prompt: String,
+    /// The skills the operator invoked in this turn, resolved when it was
+    /// sent; the worker carries them from the turn's request.
+    #[arg(skip)]
+    pub operator_skills: Vec<rupu_skills::FrozenSkill>,
 }
 
 #[derive(ClapArgs, Debug, Clone)]
@@ -374,6 +386,10 @@ struct SessionTurnRequest {
     /// the runner; only the transcript and run bookkeeping are used.
     #[serde(default)]
     compact: bool,
+    /// The skills `session send --skill` invoked, resolved at send time
+    /// (spec 2026-10-12 §5.2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    operator_skills: Vec<rupu_skills::FrozenSkill>,
 }
 
 impl SessionTurnRequest {
@@ -1823,7 +1839,15 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         loaded_skills: Vec::new(),
     };
     write_session(&global, SessionScope::Active, &session)?;
-    launch_turn(&global, &session_id, user_message, args.detach, args.view).await
+    launch_turn(
+        &global,
+        &session_id,
+        user_message,
+        Vec::new(),
+        args.detach,
+        args.view,
+    )
+    .await
 }
 
 async fn send(args: SendArgs) -> anyhow::Result<()> {
@@ -1836,24 +1860,44 @@ async fn send(args: SendArgs) -> anyhow::Result<()> {
     if session.status == SessionStatus::Stopped {
         anyhow::bail!("session {} is stopped", session.session_id);
     }
+    let operator_skills = resolve_send_skills(&global, &session, &args.skills).await?;
     launch_turn(
         &global,
         &session.session_id,
-        args.prompt,
+        args.prompt.unwrap_or_default(),
+        operator_skills,
         args.detach,
         args.view,
     )
     .await
 }
 
+/// The skills `session send --skill` invokes, resolved against the
+/// session's layers and its frozen set before anything is enqueued.
+async fn resolve_send_skills(
+    global: &Path,
+    session: &SessionRecord,
+    entries: &[String],
+) -> anyhow::Result<Vec<rupu_skills::FrozenSkill>> {
+    let assembler =
+        rupu_runtime::assembly::RunAssembler::new(rupu_runtime::assembly::AssemblyContext {
+            project_root: session.project_root.clone(),
+            ..rupu_runtime::assembly::AssemblyContext::minimal(global.to_path_buf())
+        });
+    Ok(assembler
+        .resolve_operator_skills(&session.skill_index, entries)
+        .await?)
+}
+
 async fn launch_turn(
     global: &Path,
     session_id: &str,
     prompt: String,
+    operator_skills: Vec<rupu_skills::FrozenSkill>,
     detach: bool,
     view: Option<LiveViewMode>,
 ) -> anyhow::Result<()> {
-    let run_id = launch_turn_detached(global, session_id, prompt)?;
+    let run_id = enqueue_turn_request(global, session_id, prompt, operator_skills)?;
 
     if detach {
         println!("session: {session_id}");
@@ -1866,10 +1910,15 @@ async fn launch_turn(
 }
 
 fn launch_turn_detached(global: &Path, session_id: &str, prompt: String) -> anyhow::Result<String> {
-    enqueue_turn_request(global, session_id, prompt)
+    enqueue_turn_request(global, session_id, prompt, Vec::new())
 }
 
-fn enqueue_turn_request(global: &Path, session_id: &str, prompt: String) -> anyhow::Result<String> {
+fn enqueue_turn_request(
+    global: &Path,
+    session_id: &str,
+    prompt: String,
+    operator_skills: Vec<rupu_skills::FrozenSkill>,
+) -> anyhow::Result<String> {
     let (mut session, scope) = read_session(global, session_id)?;
     ensure_active_scope(scope, "session send")?;
     if reconcile_stale_session(&mut session) {
@@ -1922,6 +1971,7 @@ fn enqueue_turn_request(global: &Path, session_id: &str, prompt: String) -> anyh
             transcript_path,
             enqueued_at,
             compact: false,
+            operator_skills,
         },
     )?;
     Ok(run_id)
@@ -1984,6 +2034,7 @@ fn enqueue_compact_request(global: &Path, session_id: &str) -> anyhow::Result<St
             transcript_path,
             enqueued_at,
             compact: true,
+            operator_skills: Vec::new(),
         },
     )?;
     Ok(run_id)
@@ -7410,6 +7461,7 @@ async fn run_worker(args: RunWorkerArgs) -> anyhow::Result<()> {
                     session_id: args.session_id.clone(),
                     run_id: request.run_id.clone(),
                     prompt: request.prompt.clone(),
+                    operator_skills: request.operator_skills.clone(),
                 })
                 .await
             };
@@ -7974,6 +8026,13 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
     // customer.
     session.customer = Some(turn_customer.clone());
     persist_session_customer(&global, &args.session_id, &session.customer)?;
+    // The skills the operator invoked join the session's frozen set before
+    // this turn thaws it, so its `skills.load` and read roots cover them
+    // (spec 2026-10-12 §5.2). The skills section is never re-rendered.
+    if !args.operator_skills.is_empty() {
+        session.skill_index =
+            persist_operator_skills(&global, &args.session_id, &args.operator_skills)?;
+    }
 
     paths::ensure_dir(&session.transcripts_dir)?;
     let transcript_path = session
@@ -8044,6 +8103,25 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         let (skills, missing_skills) = assembler
             .resolve_frozen_skills(&session.skill_index)
             .await?;
+        let (message, operator_loads) = if args.operator_skills.is_empty() {
+            (args.prompt.clone(), Vec::new())
+        } else {
+            let (skills, invoked, prompt) = (
+                skills.clone(),
+                args.operator_skills.clone(),
+                args.prompt.clone(),
+            );
+            let turn = tokio::task::spawn_blocking(move || {
+                rupu_agent::operator_turn(skills.as_deref(), &invoked, &prompt)
+            })
+            .await
+            .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))?;
+            anyhow::ensure!(
+                !turn.0.is_empty(),
+                "the skills this turn invoked are no longer installed, and it has no prompt"
+            );
+            turn
+        };
         // The session's limits: the value stored by an earlier turn
         // (including any limit learned from an overflow error), else resolved
         // now — the first turn — through this turn's provider (spec
@@ -8170,12 +8248,12 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             transcript_path: transcript_path.clone(),
             codename: Some(codename),
             prompt: rupu_agent::UserTurn {
-                message: args.prompt.clone(),
+                message,
                 initial_messages: session.message_history.clone(),
                 seed_source,
                 turn_index_offset: session.total_turns,
                 loaded_skills: session.loaded_skills.clone(),
-                operator_loads: Vec::new(),
+                operator_loads,
                 missing_skills,
             },
             workspace,
@@ -8507,6 +8585,31 @@ fn session_record_path(global: &Path, scope: SessionScope, session_id: &str) -> 
 /// Write `customer` onto `session_id`'s record before a turn or compaction
 /// runs: re-read first so a concurrent write is not clobbered (the request's
 /// finalize follows the same rule), and write only when it changed.
+/// Appends the operator's invocations to the session's frozen set (one the
+/// set holds already, in the same layer, is skipped) and writes the record;
+/// returns the set.
+fn persist_operator_skills(
+    global: &Path,
+    session_id: &str,
+    invoked: &[rupu_skills::FrozenSkill],
+) -> anyhow::Result<Vec<rupu_skills::FrozenSkill>> {
+    let (mut current, scope) = read_session(global, session_id)?;
+    let held = current.skill_index.len();
+    for f in invoked {
+        if !current
+            .skill_index
+            .iter()
+            .any(|h| h.name == f.name && h.layer == f.layer)
+        {
+            current.skill_index.push(f.clone());
+        }
+    }
+    if current.skill_index.len() != held {
+        write_session(global, scope, &current)?;
+    }
+    Ok(current.skill_index)
+}
+
 fn persist_session_customer(
     global: &Path,
     session_id: &str,
@@ -9555,6 +9658,7 @@ mod tests {
                 transcript_path: session.transcripts_dir.join("run_oldest.jsonl"),
                 enqueued_at: Utc::now(),
                 compact: false,
+                operator_skills: Vec::new(),
             },
         )
         .expect("enqueue oldest");
@@ -9570,6 +9674,7 @@ mod tests {
                 transcript_path: session.transcripts_dir.join("run_newest.jsonl"),
                 enqueued_at: Utc::now(),
                 compact: false,
+                operator_skills: Vec::new(),
             },
         )
         .expect("enqueue newest");
@@ -11013,6 +11118,7 @@ mod tests {
             session_id: record.session_id.clone(),
             run_id: run_id.into(),
             prompt: "hi".into(),
+            operator_skills: Vec::new(),
         };
         // Turn 1 with the project unassigned; then assign it; turn 2.
         let first = run_turn(turn("run_customer_1")).await;
@@ -11109,6 +11215,7 @@ mod tests {
             session_id: record.session_id.clone(),
             run_id: "run_customer_early".into(),
             prompt: "hi".into(),
+            operator_skills: Vec::new(),
         })
         .await;
         let after = read_session(&global, &record.session_id).expect("read").0;
@@ -11183,12 +11290,14 @@ mod tests {
             session_id: record.session_id.clone(),
             run_id: "run_seed_wiring_1".into(),
             prompt: "first prompt".into(),
+            operator_skills: Vec::new(),
         })
         .await;
         let turn2 = run_turn(RunTurnArgs {
             session_id: record.session_id.clone(),
             run_id: "run_seed_wiring_2".into(),
             prompt: "second prompt".into(),
+            operator_skills: Vec::new(),
         })
         .await;
 
@@ -11326,6 +11435,7 @@ mod tests {
             session_id: record.session_id.clone(),
             run_id: "run_seed_fb_1".into(),
             prompt: "first prompt".into(),
+            operator_skills: Vec::new(),
         })
         .await;
         turn1.expect("turn 1 completes");
@@ -11350,6 +11460,7 @@ mod tests {
             session_id: record.session_id.clone(),
             run_id: "run_seed_fb_2".into(),
             prompt: "second prompt".into(),
+            operator_skills: Vec::new(),
         })
         .await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
@@ -11460,6 +11571,7 @@ mod tests {
             session_id: record.session_id.clone(),
             run_id: "run_seed_fail_1".into(),
             prompt: "first prompt".into(),
+            operator_skills: Vec::new(),
         })
         .await;
 
@@ -11473,6 +11585,7 @@ mod tests {
             session_id: record.session_id.clone(),
             run_id: "run_seed_fail_2".into(),
             prompt: "second prompt".into(),
+            operator_skills: Vec::new(),
         })
         .await;
         // `run_turn` records a failed agent run in the session's own
@@ -11533,6 +11646,7 @@ mod tests {
             session_id: record.session_id.clone(),
             run_id: "run_seed_fail_3".into(),
             prompt: "third prompt".into(),
+            operator_skills: Vec::new(),
         })
         .await;
 
@@ -11709,6 +11823,7 @@ mod tests {
             session_id: record.session_id.clone(),
             run_id: "run_refused_1".into(),
             prompt: "do the thing".into(),
+            operator_skills: Vec::new(),
         })
         .await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
@@ -12052,6 +12167,7 @@ mod tests {
             transcript_path: record.transcripts_dir.join("run_compact02.jsonl"),
             enqueued_at: Utc::now(),
             compact: true,
+            operator_skills: Vec::new(),
         };
 
         with_mock_home(
@@ -12098,6 +12214,7 @@ mod tests {
             transcript_path: record.transcripts_dir.join("run_compact01.jsonl"),
             enqueued_at: Utc::now(),
             compact: true,
+            operator_skills: Vec::new(),
         };
 
         with_mock_home(
@@ -12150,6 +12267,7 @@ mod tests {
             transcript_path: record.transcripts_dir.join("run_compact_customer.jsonl"),
             enqueued_at: Utc::now(),
             compact: true,
+            operator_skills: Vec::new(),
         };
         let old_home = std::env::var_os("RUPU_HOME");
         std::env::set_var("RUPU_HOME", &global);
@@ -12217,6 +12335,7 @@ mod tests {
                     session_id: rec.session_id.clone(),
                     run_id: run_id.into(),
                     prompt: "go".into(),
+                    operator_skills: Vec::new(),
                 }),
             )
             .await
@@ -12299,6 +12418,7 @@ mod tests {
                     session_id: rec.session_id.clone(),
                     run_id: run_id.into(),
                     prompt: "go".into(),
+                    operator_skills: Vec::new(),
                 }),
             )
             .await
@@ -12352,6 +12472,7 @@ mod tests {
                 session_id: record.session_id.clone(),
                 run_id: "run_limits_note".into(),
                 prompt: "go".into(),
+                operator_skills: Vec::new(),
             }),
         )
         .await
@@ -12402,6 +12523,7 @@ mod tests {
                 session_id: record.session_id.clone(),
                 run_id: "run_limits_neg".into(),
                 prompt: "go".into(),
+                operator_skills: Vec::new(),
             }),
         )
         .await
@@ -12443,6 +12565,7 @@ mod tests {
                 session_id: record.session_id.clone(),
                 run_id: "run_limits_fail".into(),
                 prompt: "go".into(),
+                operator_skills: Vec::new(),
             }),
         )
         .await
@@ -12488,6 +12611,7 @@ mod tests {
                 session_id: record.session_id.clone(),
                 run_id: "run_cached".into(),
                 prompt: "go".into(),
+                operator_skills: Vec::new(),
             }),
         )
         .await
@@ -12587,6 +12711,7 @@ mod tests {
             session_id: record.session_id.clone(),
             run_id: "run_after_compact".into(),
             prompt: "post-compact prompt".into(),
+            operator_skills: Vec::new(),
         })
         .await;
 

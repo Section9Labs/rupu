@@ -39,8 +39,9 @@ impl SessionSender for SubprocessSessionSender {
 
         let argv = RunArgv::SessionSend(SessionSend {
             session_id: req.session_id.clone(),
-            prompt: req.prompt.clone(),
+            prompt: Some(req.prompt.clone()),
             detach: true,
+            skills: Vec::new(),
         });
         let out = tokio::process::Command::new(&self.exe)
             .args(argv.to_args())
