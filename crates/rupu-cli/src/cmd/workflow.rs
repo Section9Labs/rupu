@@ -2324,6 +2324,10 @@ async fn create(
             let available_agents = load_agent_specs(&global, project_agents_parent.as_deref())
                 .map(|specs| specs.into_iter().map(|s| s.name).collect::<Vec<_>>())
                 .unwrap_or_default();
+            let available_skills = rupu_orchestrator::generate::installed_skill_names(
+                &global,
+                project_agents_parent.as_deref(),
+            );
             println!("generating workflow `{name}` via {provider}/{model}\u{2026}");
             let req = rupu_orchestrator::GenerateRequest {
                 kind: rupu_orchestrator::GenKind::Workflow,
@@ -2331,6 +2335,7 @@ async fn create(
                 provider,
                 model,
                 available_agents,
+                available_skills,
             };
             // ISSUES.md I-74: pass the operator's `[providers.<name>]`
             // settings through instead of silently generating with none.

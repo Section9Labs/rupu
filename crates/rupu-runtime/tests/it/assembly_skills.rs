@@ -932,3 +932,32 @@ async fn an_oversized_skill_fails_assembly_with_its_size() {
         Ok(_) => panic!("assembled a run with an oversized skill"),
     }
 }
+
+/// The launch's own skills are recorded in the run's coverage manifest as
+/// written, so `rupu coverage rerun` passes them again; the agent's own are
+/// not (the rerun's agent grants them).
+#[tokio::test]
+#[serial]
+async fn the_coverage_manifest_records_the_launchs_skills() {
+    let home = Home::new();
+    home.skill("code-review", "Review a diff.", "x");
+    home.skill("house-style", "House style.", "y");
+    home.skill("pdf", "PDFs.", "z");
+    let assembler = home.assembler(config());
+    let spec = agent(
+        &home,
+        "provider: anthropic\nmodel: claude-sonnet-4-6\nskills: [pdf]\nconcerns:\n  - include: stride",
+    );
+    let mut l = launch(&home, spec, Origin::Standalone, "run_manifest_skills");
+    l.overrides.skills = vec!["code-review".into()];
+    l.overrides.preload_skills = vec!["house-style".into()];
+    let _m = MockScript::set(DONE);
+    let run = assembler.assemble(l).await.expect("assembles");
+    let paths = rupu_tools::ledger::paths(&run.opts.tool_context);
+    run.run().await.result.unwrap();
+    let manifest = rupu_coverage::find_manifest(&paths, "run_manifest_skills")
+        .unwrap()
+        .expect("the run's manifest");
+    assert_eq!(manifest.skills, vec!["code-review".to_string()]);
+    assert_eq!(manifest.preload_skills, vec!["house-style".to_string()]);
+}

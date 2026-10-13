@@ -2268,6 +2268,10 @@ impl WorkflowGenerator for RunLauncher {
             provider: generation.provider.clone(),
             model: generation.model.clone(),
             available_agents: id.launch.agents.clone(),
+            available_skills: rupu_orchestrator::generate::installed_skill_names(
+                self.global(),
+                self.project_rupu().as_deref(),
+            ),
         };
         let mut provider = (generation.factory)();
         let outcome =

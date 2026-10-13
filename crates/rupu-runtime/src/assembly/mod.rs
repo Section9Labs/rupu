@@ -704,6 +704,8 @@ impl RunAssembler {
             scope_name: d.scope_name.clone(),
             step_id: d.step_id.clone(),
             launch,
+            launch_skills: spec.overrides.skills.clone(),
+            launch_preload_skills: spec.overrides.preload_skills.clone(),
         };
 
         let ceiling = spec.ceiling.or(spec.link.as_ref().map(|l| l.ceiling));

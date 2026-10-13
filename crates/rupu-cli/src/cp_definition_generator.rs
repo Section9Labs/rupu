@@ -44,13 +44,15 @@ impl DefinitionGenerator for RuntimeDefinitionGenerator {
                 .await
                 .ok_or(GenDefError::NoCredentials)?,
         };
-        let (kind, available_agents) = match req.kind {
-            DefKind::Agent => (rupu_orchestrator::GenKind::Agent, vec![]),
+        let (kind, available_agents, available_skills) = match req.kind {
+            DefKind::Agent => (rupu_orchestrator::GenKind::Agent, vec![], vec![]),
             DefKind::Workflow => {
                 let agents = rupu_agent::load_agents(&self.global_dir, None)
                     .map(|specs| specs.into_iter().map(|s| s.name).collect())
                     .unwrap_or_default();
-                (rupu_orchestrator::GenKind::Workflow, agents)
+                let skills =
+                    rupu_orchestrator::generate::installed_skill_names(&self.global_dir, None);
+                (rupu_orchestrator::GenKind::Workflow, agents, skills)
             }
         };
         let gen_req = rupu_orchestrator::GenerateRequest {
@@ -59,6 +61,7 @@ impl DefinitionGenerator for RuntimeDefinitionGenerator {
             provider,
             model,
             available_agents,
+            available_skills,
         };
         // ISSUES.md I-74: honor `[providers.<name>]` here too. This path is
         // the CP's "generate a definition" button, so it previously ran with

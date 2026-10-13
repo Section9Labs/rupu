@@ -2111,6 +2111,8 @@ async fn run_agent_inner(
                 workspace_path: opts.workspace_path().to_path_buf(),
                 continued_from: crate::continuation::continued_from(&opts.prompt)
                     .map(|p| p.display().to_string()),
+                skills: opts.id.launch_skills.clone(),
+                preload_skills: opts.id.launch_preload_skills.clone(),
             };
             if let Err(e) = rupu_coverage::append_manifest(&paths, &manifest) {
                 tracing::warn!(error = %e, "failed to write coverage run manifest");

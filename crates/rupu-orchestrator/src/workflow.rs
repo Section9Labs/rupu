@@ -224,10 +224,15 @@ pub enum WorkflowParseError {
     FindingsProfileOnNonAgentStep { step: String },
     #[error("step `{step}`: `findings_profile` only applies to `action: findings.record` (this step calls `{tool}`); remove it")]
     FindingsProfileOnNonFindingsAction { step: String, tool: String },
-    #[error("step `{step}`: skills: apply only to steps that run an agent")]
+    #[error("step `{step}`: `skills`/`preload_skills` apply only to steps that run an agent")]
     SkillsOnNonAgentStep { step: String },
-    #[error("step `{step}`: skills: {message}")]
-    BadSkillEntry { step: String, message: String },
+    /// `key` is the step key holding the entry: `skills` or `preload_skills`.
+    #[error("step `{step}`: {key}: {message}")]
+    BadSkillEntry {
+        step: String,
+        key: &'static str,
+        message: String,
+    },
     #[error("step `{step}`: edge target `{target}` is not a known step")]
     EdgeTargetUnknown { step: String, target: String },
     #[error("step `{step}`: an edge cannot target its own step")]
@@ -2079,16 +2084,16 @@ fn validate_step_skills(step: &Step) -> Result<(), WorkflowParseError> {
             step: step.id.clone(),
         });
     }
-    let all: Vec<String> = step
-        .skills
-        .iter()
-        .chain(&step.preload_skills)
-        .cloned()
-        .collect();
-    rupu_skills::parse_grants(&all).map_err(|e| WorkflowParseError::BadSkillEntry {
-        step: step.id.clone(),
-        message: e.to_string(),
-    })?;
+    for (key, entries) in [
+        ("skills", &step.skills),
+        ("preload_skills", &step.preload_skills),
+    ] {
+        rupu_skills::parse_grants(entries).map_err(|e| WorkflowParseError::BadSkillEntry {
+            step: step.id.clone(),
+            key,
+            message: e.to_string(),
+        })?;
+    }
     Ok(())
 }
 
@@ -3740,10 +3745,21 @@ steps:
             other => panic!("expected BadSkillEntry, got {other:?}"),
         }
         let bad_preload = "name: w\nsteps:\n  - id: a\n    agent: r\n    prompt: go\n    preload_skills: [\"nosuch:x\"]\n";
-        assert!(matches!(
-            Workflow::parse(bad_preload),
-            Err(WorkflowParseError::BadSkillEntry { .. })
-        ));
+        assert_eq!(
+            Workflow::parse(bad_preload).unwrap_err().to_string(),
+            "step `a`: preload_skills: entry \"nosuch:x\": unknown layer \"nosuch\" \
+             (use global: or project:)"
+        );
+        let bad_name = "name: w\nsteps:\n  - id: a\n    agent: r\n    prompt: go\n    skills: [ok]\n    preload_skills: [Bad_Name]\n";
+        assert_eq!(
+            Workflow::parse(bad_name).unwrap_err().to_string(),
+            "step `a`: preload_skills: entry \"Bad_Name\": skill name may only contain \
+             a-z, 0-9 and '-'; found 'B'"
+        );
+        assert_eq!(
+            Workflow::parse(gate).unwrap_err().to_string(),
+            "step `g`: `skills`/`preload_skills` apply only to steps that run an agent"
+        );
 
         let placed = "name: w\nsteps:\n  - id: a\n    agent: r\n    prompt: go\n    host: mini\n    skills: [x]\n";
         assert!(
@@ -3754,6 +3770,12 @@ steps:
         Workflow::parse(panel).expect("a panel runs agents");
         let parallel = "name: w\nsteps:\n  - id: a\n    preload_skills: [x]\n    parallel:\n      - id: s1\n        agent: p\n        prompt: p\n";
         Workflow::parse(parallel).expect("a parallel step runs agents");
+        let on_sub = "name: w\nsteps:\n  - id: a\n    parallel:\n      - id: s1\n        agent: p\n        prompt: p\n        skills: [x]\n";
+        let err = Workflow::parse(on_sub).unwrap_err().to_string();
+        assert!(
+            err.contains("unknown field `skills`"),
+            "a sub-step takes its parent step's skills, never its own: {err}"
+        );
     }
 
     // ── §3b-bis: remote (host:/distribute:) steps fail closed ────────────────
