@@ -379,6 +379,15 @@ fn load_detail(s: &AppState, name: &str) -> ApiResult<AgentDetailDto> {
     }
 }
 
+/// [`load_detail`] on the blocking pool: it reads agent files and checks
+/// the agent's skills.
+async fn detail_off_runtime(s: &AppState, name: String) -> ApiResult<AgentDetailDto> {
+    let s = s.clone();
+    tokio::task::spawn_blocking(move || load_detail(&s, &name))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+}
+
 #[derive(Serialize)]
 pub(crate) struct AgentDto {
     pub(crate) name: String,
@@ -498,11 +507,13 @@ pub(crate) struct AgentDto {
 }
 
 /// The installed skills of one layer set (global, or global plus one
-/// project's), for checking agents' skill names: discovered on the first
-/// agent that declares skills, then reused for the rest of a listing.
+/// project's), for checking agents' skills: discovered on the first agent
+/// that declares skills, then reused for the rest of a listing, a failed
+/// discovery and each skill's load included. Its checks read the disk:
+/// call them off the async runtime.
 pub(crate) struct SkillLayers {
     dirs: rupu_skills::LayerDirs,
-    catalog: Option<rupu_skills::SkillCatalog>,
+    catalog: rupu_agent::SkillCatalogCache,
 }
 
 impl SkillLayers {
@@ -515,12 +526,13 @@ impl SkillLayers {
     }
 
     /// Why `spec` can't be launched in these layers, if it can't: its
-    /// `tools:` first, then its skill names.
+    /// `tools:` first, then its skills, checked as `rupu agent validate`
+    /// checks them (each granted skill loads and binds once).
     fn load_error(&mut self, spec: &rupu_agent::spec::AgentSpec) -> Option<String> {
         if let Err(e) = spec.validate_tools() {
             return Some(e.to_string());
         }
-        rupu_agent::check_agent_skill_names(spec, &self.dirs, &mut self.catalog)
+        rupu_agent::check_agent_skills(spec, &self.dirs, &mut self.catalog)
             .err()
             .map(|e| e.to_string())
     }
@@ -633,23 +645,10 @@ fn agent_usage_rows(
     (groups, last_runs)
 }
 
-/// `GET /api/agents` — global agent definitions plus one representative
-/// workspace per distinct repo among the registered projects'
-/// `<path>/.rupu/agents/*.md` (see [`distinct_repo_workspaces`]), sorted by
-/// name then scope. Many registered workspaces are autoflow run-worktrees of
-/// the same repo; scanning every registered workspace would otherwise emit
-/// one duplicate row per worktree.
-///
-/// Each row is tagged `scope: "global"` or the representative workspace's
-/// path basename. A project def shadows a same-named GLOBAL row; two
-/// different repos defining the same name both appear (distinguished by
-/// `scope`). With no registered projects this is byte-for-byte the prior
-/// global-only behavior.
-///
-/// A malformed project agent file only drops that project's rows (logged via
-/// `tracing::warn!`) rather than failing the whole list; the global scan's
-/// error behavior is unchanged.
-async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>> {
+/// Every agent row `list_agents` shows, before usage: global agents, then
+/// one representative workspace per repo, each checked against its scope's
+/// skill layers. Reads the disk.
+fn agent_rows(s: &AppState) -> ApiResult<Vec<AgentDto>> {
     let specs = load_agents(&s.global_dir, None).map_err(|e| ApiError::internal(e.to_string()))?;
     let global_slugs = agent_slug_map(&s.global_dir);
     let mut global_skills = SkillLayers::new(&s.global_dir, None);
@@ -671,8 +670,8 @@ async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>
         })
         .collect();
 
-    let workspaces = store(&s).list().unwrap_or_default();
-    let repos = distinct_repo_workspaces(workspaces, &repo_store(&s));
+    let workspaces = store(s).list().unwrap_or_default();
+    let repos = distinct_repo_workspaces(workspaces, &repo_store(s));
     let mut project_dtos: Vec<AgentDto> = Vec::new();
     for r in repos {
         let scope = r.scope;
@@ -707,6 +706,32 @@ async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>
     dtos.retain(|d| !project_names.contains(d.name.as_str()));
     dtos.extend(project_dtos);
     dtos.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.scope.cmp(&b.scope)));
+    Ok(dtos)
+}
+
+/// `GET /api/agents` — global agent definitions plus one representative
+/// workspace per distinct repo among the registered projects'
+/// `<path>/.rupu/agents/*.md` (see [`distinct_repo_workspaces`]), sorted by
+/// name then scope. Many registered workspaces are autoflow run-worktrees of
+/// the same repo; scanning every registered workspace would otherwise emit
+/// one duplicate row per worktree.
+///
+/// Each row is tagged `scope: "global"` or the representative workspace's
+/// path basename. A project def shadows a same-named GLOBAL row; two
+/// different repos defining the same name both appear (distinguished by
+/// `scope`). With no registered projects this is byte-for-byte the prior
+/// global-only behavior.
+///
+/// A malformed project agent file only drops that project's rows (logged via
+/// `tracing::warn!`) rather than failing the whole list; the global scan's
+/// error behavior is unchanged.
+pub(crate) async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>> {
+    let mut dtos = {
+        let s = s.clone();
+        tokio::task::spawn_blocking(move || agent_rows(&s))
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))??
+    };
 
     // Aggregate every run's transcript, grouped by agent, to attach usage.
     // The breakdown is keyed by agent NAME alone (transcript rows don't
@@ -784,7 +809,7 @@ async fn get_agent(
     Path(name): Path<String>,
 ) -> ApiResult<Json<AgentDetailDto>> {
     validate_stem(&name)?;
-    Ok(Json(load_detail(&s, &name)?))
+    Ok(Json(detail_off_runtime(&s, name).await?))
 }
 
 /// Request body for `PUT /api/agents/:name` and `POST /api/agents`: the full
@@ -852,7 +877,7 @@ async fn write_agent(
             }
         },
     }
-    Ok(Json(load_detail(&s, &name)?))
+    Ok(Json(detail_off_runtime(&s, name).await?))
 }
 
 /// `POST /api/agents` — create a new agent. The name is taken from the parsed
@@ -873,7 +898,7 @@ async fn create_agent(
         return Err(ApiError::conflict("agent already exists"));
     }
     create_agent_file(&s.global_dir, &body.raw)?;
-    Ok(Json(load_detail(&s, &spec.name)?))
+    Ok(Json(detail_off_runtime(&s, spec.name).await?))
 }
 
 /// `DELETE /api/agents/:name` — remove the agent definition whose file STEM
@@ -3158,6 +3183,42 @@ mod tests {
 
         let detail = load_detail(&s, "a").expect("detail");
         assert_eq!(detail.summary.load_error.as_deref(), Some(e));
+    }
+
+    /// A granted skill that is installed but doesn't load is a load error,
+    /// as `rupu agent validate` reports it and the launch fails on it.
+    #[tokio::test]
+    async fn an_agent_granted_an_invalid_skill_lists_its_load_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let d = s.global_dir.join("skills/broken");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("SKILL.md"),
+            "---\nname: other\ndescription: Misnamed.\n---\nbody\n",
+        )
+        .unwrap();
+        save_agent_file(
+            &s.global_dir,
+            "a",
+            "---\nname: a\nskills: [broken]\n---\nhi\n",
+        )
+        .unwrap();
+
+        let Json(rows) = list_agents(State(s.clone())).await.expect("ok");
+        assert_eq!(
+            rows[0].load_error.as_deref(),
+            Some(
+                "agent `a`: skills: skill \"broken\" (global) is invalid: \
+                 name \"other\" does not match its directory \"broken\""
+            )
+        );
+        let check = rupu_agent::check_agent_files(&s.global_dir, None);
+        assert_eq!(
+            check[0].error.as_ref().map(ToString::to_string).as_deref(),
+            rows[0].load_error.as_deref(),
+            "the same message `rupu agent validate` prints"
+        );
     }
 
     #[tokio::test]

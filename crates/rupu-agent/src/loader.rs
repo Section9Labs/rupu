@@ -151,16 +151,20 @@ pub fn load_agent(
     Ok(spec)
 }
 
-/// [`load_agent`]'s skill check on its own: every name the agent's
-/// `skills:` / `preloadSkills:` give is installed in `dirs`. Reads only the
-/// directory listings. `catalog` is discovered on first need and reused
-/// across calls that share it, so a listing of many agents discovers once.
-pub fn check_agent_skill_names(
+/// The installed skills a set of checks shares: discovered on the first
+/// agent that declares skills, then reused, a failed discovery included, so
+/// a listing of many agents discovers (and loads each skill) once.
+pub type SkillCatalogCache = Option<Result<rupu_skills::SkillCatalog, rupu_skills::DiscoverError>>;
+
+/// [`check_agent_files`]'s skill check on one agent (`rupu agent validate`):
+/// every skill its `skills:` / `preloadSkills:` grant loads and binds once
+/// in `dirs`.
+pub fn check_agent_skills(
     spec: &AgentSpec,
     dirs: &rupu_skills::LayerDirs,
-    catalog: &mut Option<rupu_skills::SkillCatalog>,
+    catalog: &mut SkillCatalogCache,
 ) -> Result<(), AgentLoadError> {
-    check_skills(spec, dirs, catalog, SkillCheck::Names)
+    check_skills(spec, dirs, catalog, SkillCheck::Resolve)
 }
 
 /// How far [`check_skills`] goes.
@@ -172,12 +176,12 @@ enum SkillCheck {
     Resolve,
 }
 
-/// Check an agent's skill keys against the installed skills. The catalog
-/// is discovered on first need and reused across calls that share `catalog`.
+/// Check an agent's skill keys against the installed skills, through the
+/// catalog the calls sharing `catalog` discover once.
 fn check_skills(
     spec: &AgentSpec,
     dirs: &rupu_skills::LayerDirs,
-    catalog: &mut Option<rupu_skills::SkillCatalog>,
+    catalog: &mut SkillCatalogCache,
     check: SkillCheck,
 ) -> Result<(), AgentLoadError> {
     if !spec.declares_skills() {
@@ -191,18 +195,15 @@ fn check_skills(
         source,
         looked_in: Box::new(dirs.clone()),
     };
-    let catalog = match catalog {
-        Some(c) => c,
-        None => {
-            let found = rupu_skills::SkillCatalog::discover(dirs).map_err(|e| {
-                let key = if grants.is_empty() {
-                    "preloadSkills"
-                } else {
-                    "skills"
-                };
-                err(key, e.into())
-            })?;
-            catalog.insert(found)
+    let catalog = match catalog.get_or_insert_with(|| rupu_skills::SkillCatalog::discover(dirs)) {
+        Ok(c) => &*c,
+        Err(e) => {
+            let key = if grants.is_empty() {
+                "preloadSkills"
+            } else {
+                "skills"
+            };
+            return Err(err(key, e.clone().into()));
         }
     };
     let check = |grants: &[String], preload: &[String]| match check {

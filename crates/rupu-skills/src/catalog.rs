@@ -78,12 +78,12 @@ pub struct SkillCatalog {
     entries: Vec<CatalogEntry>,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum DiscoverError {
     #[error("{path}: {source}")]
     Io {
         path: PathBuf,
-        source: std::io::Error,
+        source: Arc<std::io::Error>,
     },
 }
 
@@ -120,7 +120,7 @@ impl SkillCatalog {
 fn scan(dir: &Path, layer: Layer, out: &mut Vec<CatalogEntry>) -> Result<(), DiscoverError> {
     let io = |source| DiscoverError::Io {
         path: dir.to_owned(),
-        source,
+        source: Arc::new(source),
     };
     let read = match std::fs::read_dir(dir) {
         Ok(r) => r,
@@ -159,7 +159,7 @@ fn scan(dir: &Path, layer: Layer, out: &mut Vec<CatalogEntry>) -> Result<(), Dis
 fn may_be_skill(item: &std::fs::DirEntry) -> Result<bool, DiscoverError> {
     let kind = item.file_type().map_err(|source| DiscoverError::Io {
         path: item.path(),
-        source,
+        source: Arc::new(source),
     })?;
     Ok(kind.is_dir()
         || (kind.is_symlink() && std::fs::metadata(item.path()).map_or(true, |m| m.is_dir())))

@@ -490,7 +490,7 @@ mod tests {
         let discover = |e| {
             skill(SkillCheckError::Discover(DiscoverError::Io {
                 path: "skills".into(),
-                source: e,
+                source: Arc::new(e),
             }))
         };
         assert!(discover(emfile()).is_fd_exhaustion());
@@ -612,7 +612,7 @@ mod tests {
                 std::future::ready(if calls.fetch_add(1, Ordering::SeqCst) < 2 {
                     Err(SkillCheckError::Discover(rupu_skills::DiscoverError::Io {
                         path: "skills".into(),
-                        source: emfile(),
+                        source: std::sync::Arc::new(emfile()),
                     }))
                 } else {
                     Ok(7)

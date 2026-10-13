@@ -47,8 +47,8 @@ pub use collector::{
 };
 pub use fd_budget::load_agent_admitted;
 pub use loader::{
-    check_agent_files, check_agent_skill_names, find_agent, load_agent, load_agents,
-    AgentFileCheck, AgentLayer, AgentLoadError, SkillCheckError,
+    check_agent_files, check_agent_skills, find_agent, load_agent, load_agents, AgentFileCheck,
+    AgentLayer, AgentLoadError, SkillCatalogCache, SkillCheckError,
 };
 pub use operator_skills::operator_turn;
 pub use permission::{resolve_mode, PermissionPrompt};
