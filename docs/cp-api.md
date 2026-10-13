@@ -124,13 +124,14 @@ stream to see it take effect.
 
 ## Server-sent events
 
-Three endpoints stream `text/event-stream`:
+Four endpoints stream `text/event-stream`:
 
 | Endpoint | Frames |
 |----------|--------|
 | `GET /api/events/stream` | Without `run`: the **firehose** — every orchestrator run's step events, merged. With `run=<id>`: one run. |
 | `GET /api/runs/:id/log` | One run's step events. |
 | `GET /api/transcript/stream?path=…` | One transcript's events. |
+| `GET /api/{runs,sessions,agentiflows}/:id/messages/stream` | One message space's log. See [Messages](#messages). |
 
 Every frame is an unnamed `data:` line carrying one JSON event. On the one-run
 and transcript streams it also carries an `id:` — the event's line number in
@@ -265,6 +266,63 @@ none, and a body that isn't the expected JSON is a 400.
 | DELETE | `/api/sessions/:id` | Delete a session. | `host`. |
 
 Start a session with `POST /api/agents/:name/session`.
+
+## Messages
+
+The operator's side of a run's message space (see
+[`messaging.md`](messaging.md)): read what was said in it, and send into it as
+the operator, the way `rupu message list|send` does. The same three endpoints
+exist under each root that has a space:
+
+| Root | Path prefix | Id |
+|------|-------------|----|
+| A workflow run or a standalone `rupu run` | `/api/runs/:id/messages` | `run_…` |
+| A session | `/api/sessions/:id/messages` | `ses_…` |
+| An agentiflow | `/api/agentiflows/:id/messages` | `af_…` |
+
+An id is served only under the prefix its kind names: a session id under
+`/api/runs` is a 404, as is an unknown id.
+
+| Method | Path | Purpose | Notes |
+|--------|------|---------|-------|
+| GET | `…/messages` | The space: `MessagesView {participants, messages, legacy, space, next}`. | `after` (a message id; the page starts after it), `limit` (messages per page; all when absent), `kind` (comma-separated: `post`, `direct`, `broadcast`, `directive`, `retract`, `operator`; anything else is a 400), `host`. Each message is a log line with its `seen` receipts (`{by, turn, at}`) folded in. `space` is `absent` when nothing has joined or written yet. `legacy: true` is an agentiflow from before the log: its board posts and directives in the log's shape. |
+| POST | `…/messages` | Send as the operator. | `host`. Body `{to?, body, urgent?}` → `202 {id, delivery}`, where `delivery` is `{resolved, undelivered?}` and each undelivered recipient carries its reason (e.g. `participant_left`). `to` is a participant, a codename, `role:<agent>`, `step:<id>`, `lead` or `broadcast`; absent, it is an agentiflow's lead and everyone elsewhere. `urgent` puts the message first, and ends an agentiflow lead's round early. 400 an empty body or a bad address; 404 unknown id; 409 the run isn't running (finished, or its recorded runner process is gone), or its log is full; 501 without `rupu cp serve`. The message is recorded with `via: "cp"`. The CP has no per-person identity, so `viewer` is never set. |
+| GET | `…/messages/stream` | SSE tail of the space's log. | This host's runs only: with a remote `host` it is a 501 (poll `GET …/messages?host=` instead). See below. |
+
+`POST /api/agentiflows/:id/steer` is kept as an alias. Without `stop` it is
+exactly `POST /api/agentiflows/:id/messages {to: "lead", body: message, urgent:
+now}`, answered the same way. With `stop: true` it queues a graceful stop on
+the run's control queue instead (see [Agentiflows](#agentiflows)).
+
+The stream replays the log from the start, then tails it, as the other streams
+do. Each frame is an unnamed `data:` line with an `id:` (the line's number in
+the log; `Last-Event-ID` resumes after it). The data is one of:
+
+- `{"t": "msg", …}`: a message in the shape `GET` returns, with `seen: []`.
+- `{"t": "seen", "id", "by", "turn", "at"}`: a receipt for message `id`.
+
+The stream stays open after the run ends (a finished run's space can still be
+read); close it when you're done.
+
+```sh
+curl -X POST -H "Authorization: Bearer $CP_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"to": "step:review", "body": "skip the vendored code", "urgent": true}' \
+  "http://127.0.0.1:7878/api/runs/run_01JEXAMPLE0000000000000000/messages"
+# 202 {"id":"msg_01JEXAMPLE...","delivery":{"resolved":["heron#2"]}}
+```
+
+### Remote hosts
+
+With `host=<id>`, `GET` and `POST` go to that host. The stream does not.
+
+| Transport | Messages |
+|-----------|----------|
+| local | Served here. |
+| HTTP | Proxied to the host's own endpoints when its `/api/host/info` lists the `run.messages` feature. The coordinator answers from the features it last read (`/api/hosts` probes refresh them). It reads `/api/host/info` only for a host it has never read. A host that doesn't list it is a 501, "upgrade rupu there". The host's 400, 404 and 409 come back as the same status. |
+| SSH | One remote command runs `rupu __features`. Only when the report lists `run.messages` does it run the hidden `rupu __message list\|send`. Any other remote is a 501, naming why: `rupu` isn't on its PATH, or its rupu predates `run.messages`. The helper's refusals keep their status. |
+| Tunnel, bucket | 501 with a reason: these transports carry no messages. Message the run on its own host. |
+
+A host that can't be reached is a 502, as for any remote read.
 
 ## Launch, agents and workflows
 
@@ -452,7 +510,7 @@ An unknown `ws_id` is a 404 on every route except the list.
 | POST | `/api/hosts/node` | Enroll a tunnel node. | Body `{name}`. Returns `EnrollNodeResponse {host, command, token}`; the plaintext token is shown once, only its hash is stored. 400 empty name. |
 | DELETE | `/api/hosts/:id` | Remove a host. | 204; a tunnel host's live node connection is closed at once (its reconnect then fails enrollment). 400 for `local`; 404 unknown id. |
 | GET | `/api/workers` | Workers with run activity (`WorkerView`). | |
-| GET | `/api/host/info` | **Host-internal.** This host's version, capabilities and feature list (`HostInfoResponse`). | A coordinator's HTTP connector reads `features` before using an optional capability. |
+| GET | `/api/host/info` | **Host-internal.** This host's version, capabilities and feature list (`HostInfoResponse`). | A coordinator's HTTP connector reads `features` before using an optional capability (e.g. `run.messages`, [Messages](#messages)). |
 | GET | `/api/node/connect` | **Host-internal.** WebSocket for `rupu node` tunnel peers. | Outside the bearer check. See [Node tunnel](#node-tunnel). |
 
 ### Workspace sync (host-internal)
@@ -500,14 +558,14 @@ Bodies, status codes, attribution and `?customer=` semantics:
 
 ## Agentiflows
 
-Local host only.
+Local host only, except the message space ([Messages](#messages)), which takes `host`.
 
 | Method | Path | Purpose | Notes |
 |--------|------|---------|-------|
 | GET | `/api/agentiflows` | All agentiflow runs, newest first (`{rows}`). | |
 | GET | `/api/agentiflows/:id` | One run: record, definition, budget, events, units, lead transcripts (`AgentiflowDetail`). | 404 unknown or malformed id. |
-| GET | `/api/agentiflows/:id/messages` | The run's message board (`{posts, directives}`). | |
-| POST | `/api/agentiflows/:id/steer` | Queue an operator message for the lead. | Body `SteerRequest {message, now?, stop?}` → `{queued: true}`. 400 empty message; 404 unknown run; 409 when nothing would read it — the run isn't `running`, or its recorded coordinator process is gone (a dead coordinator leaves `running` on disk until the reaper closes it); 501 without `rupu cp serve`. |
+| GET | `/api/agentiflows/:id/messages` | The run's message space (`MessagesView`). | See [Messages](#messages). |
+| POST | `/api/agentiflows/:id/steer` | Message the lead, or stop the run. | Body `SteerRequest {message, now?, stop?}`. Without `stop`: the alias of `POST /api/agentiflows/:id/messages {to: "lead", body: message, urgent: now}`, with its answers (`202 {id, delivery}`). With `stop: true`: queues a graceful stop → `200 {queued: true}`; 400 empty message; 404 unknown run; 409 when nothing would read it — the run isn't `running`, or its recorded coordinator process is gone (a dead coordinator leaves `running` on disk until the reaper closes it); 501 without `rupu cp serve`. |
 
 ## Node tunnel
 
