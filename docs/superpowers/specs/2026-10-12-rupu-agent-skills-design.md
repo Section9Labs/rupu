@@ -147,9 +147,9 @@ Load-time validation is a convenience. The assembler resolves `ResolvedSkills` i
 
 `Step` (`crates/rupu-orchestrator/src/workflow.rs:1049`) gains `skills: Vec<String>` and `preload_skills: Vec<String>`. They add to the grant of every agent the step launches: the step's agent, its `for_each` units, its parallel and panel members, a panel gate's `fix_with` agent, and loop members. They never remove a skill.
 
-Workflow parsing stays pure: it checks only entry syntax, so a workflow's validity never depends on what a host has installed. Existence is checked when the step launches, in `DefaultStepFactory::launch_for_step`, the way a missing agent is (`AssembleError::AgentLoad`). The skills travel on `Origin::WorkflowStep` next to `step_actions` (`crates/rupu-orchestrator/src/step_factory.rs:101`).
+Workflow parsing stays pure: it checks only entry syntax, so a workflow's validity never depends on what a host has installed. Existence is checked when the step launches, in `DefaultStepFactory::launch_for_step`, the way a missing agent is (`AssembleError::AgentLoad`). The skills travel on `Overrides.skills` / `Overrides.preload_skills` and resolve with reason `step`, not on `Origin::WorkflowStep`. `rupu run --skill` (Plan 2b) fills the same fields, which is why they live on `Overrides` rather than on one origin.
 
-There is no workflow-level `skills:`. A workflow that wants a skill on every step names it per step, or on the agents. When yokoito replaces workflow definitions, its integration maps its own step key onto the same `Origin::WorkflowStep` fields.
+There is no workflow-level `skills:`. A workflow that wants a skill on every step names it per step, or on the agents. When yokoito replaces workflow definitions, its integration maps its own step key onto the same `Overrides` fields.
 
 ### 2.3 Other launch kinds
 
@@ -411,6 +411,8 @@ Shipping skill content with a dispatch is a later option if this proves painful.
 ## 12. Plans
 
 1. **Model and CLI.** `rupu-skills` (model, validation, discovery, fingerprints, renderers, sources, source records) and `rupu skill list|show|validate|install|update`.
-2. **Runs.** Agent and step keys, load-time validation, `ResolvedSkills` in the assembler, the index and preload rendering, `Service::Skills` and `skills.load`, read roots, transcript events and notices, compaction re-attach and replay, and the placed-unit `--skill` flags and `agent.skills` capability. Covers every origin but sessions.
+2. **Runs**, split in two:
+   - **2a, runs.** Agent keys, load-time validation, `ResolvedSkills` in the assembler, the index and preload rendering, `Service::Skills` and `skills.load`, read roots, transcript events and notices, compaction re-attach, and replay and continuation keeping the loaded set. Covers every origin but sessions, with skills from the agent (and `Overrides`). Until Plan 3, a session refuses an agent that declares skills.
+   - **2b, workflow steps and placed units.** Step `skills:` / `preloadSkills:`, the placed-unit `--skill` flags and the `agent.skills` capability.
 3. **Sessions.** Record fields, `session start --skill`, `session send --skill`.
 4. **CP.** API fields and endpoints, then the web Library tab, agent picker, transcript rendering and session composer action (stops for the visual check).
