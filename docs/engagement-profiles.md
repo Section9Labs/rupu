@@ -312,6 +312,13 @@ first). A file that already exists is kept, so your edits survive a reinstall;
 `OVERWROTE`. A project's own agent or workflow of the same name still shadows
 the global one.
 
+The fleet also includes the skills the bundles name. Each is pinned to a commit
+of `Section9Labs/rupu-skills` and installed by the same command into the same
+layer; `rupu fleet install --skills-from <dir>` installs them from a local
+checkout on a box without network access. See
+[Fleet skills](skills.md#fleet-skills) for the outcome lines and the offline
+recipe.
+
 The fleet is exactly what the built-in profiles' bundles name:
 
 | Profile | Agents | Workflows |

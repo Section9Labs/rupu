@@ -178,6 +178,55 @@ modified, missing or failed to update.
 There is no `remove`. Delete the skill's directory; an orphaned source record
 is ignored.
 
+## Fleet skills
+
+The [stock fleet](engagement-profiles.md#the-stock-fleet) is more than agents and
+workflows: the built-in engagement profiles' `[bundle]` also names skills, and
+each is pinned to a commit of `Section9Labs/rupu-skills`. `rupu fleet install`
+installs them into the same layer as the fleet's agents (global by default,
+`--project` for the project) and writes the usual source record for each, with
+the pinned commit as its `ref`. `rupu fleet list` shows the skills and their pins.
+
+```sh
+rupu fleet install                       # agents, workflows and skills
+rupu fleet install --force               # replace what is already there
+rupu fleet install --skills-from ./rupu-skills   # offline: see below
+```
+
+It prints one line per skill:
+
+| Result | Meaning |
+|---|---|
+| `CREATED` | the skill was not installed and is now, at its pin |
+| `SKIPPED` | the installed copy is already at the pin |
+| `UPDATED <old> → <new>` | the installed copy was an older pin of the same source and is now at the new one |
+| `OVERWROTE` | `--force` replaced an existing copy |
+| `KEPT` | a skill of that name is there that the install will not touch: either you edited it (`locally modified`), or it was installed from somewhere else (`installed from elsewhere`). `--force` replaces it |
+| `FAILED` | the skill could not be fetched or installed; the reason follows |
+
+`rupu skill update` keeps a fleet skill at its pin. A newer version of a fleet
+skill arrives with a newer rupu: take the release, then run `rupu fleet install`
+again.
+
+**Offline boxes.** On a connected machine, clone the repository and check out the
+pinned commit (`rupu fleet list` shows the first 12 characters of each pin, which `git checkout` accepts):
+
+```sh
+git clone https://github.com/Section9Labs/rupu-skills
+git -C rupu-skills checkout <commit>
+```
+
+Carry the directory to the offline box and run
+`rupu fleet install --skills-from rupu-skills`. The checkout must contain the
+pinned commit. Its working tree is ignored, and the skill's content comes from
+the commit itself, so untracked or edited files in the copy never reach an
+install.
+
+If any skill fails to install, the command still installs the others, then exits
+1 and names the ones that are missing. An agent that grants a missing skill does
+not launch until it is installed, so re-run `rupu fleet install` when the network
+is back, or use `--skills-from`.
+
 ## Listing, showing and validating
 
 ```sh
