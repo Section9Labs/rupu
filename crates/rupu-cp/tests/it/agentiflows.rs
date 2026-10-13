@@ -362,8 +362,8 @@ async fn steer_needs_a_live_coordinator_and_cp_serve() {
 
     let addr = spawn_server_with(tmp.path(), true).await;
     let (status, body) = steer(addr, LIVE).await;
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(body["queued"], true);
+    assert_eq!(status, 202, "{body}");
+    assert!(body["id"].as_str().unwrap().starts_with("msg_"), "{body}");
     let logged = || {
         rupu_fleet::Bus::open(&live, rupu_fleet::address::OPERATOR)
             .read_log(None, usize::MAX)
