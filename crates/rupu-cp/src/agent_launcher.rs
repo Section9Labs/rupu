@@ -50,9 +50,10 @@ pub struct AgentLaunchRequest {
     /// contract as `skills`.
     pub preload_skills: Vec<String>,
     /// The skills the coordinator shipped for this unit: `rupu run
-    /// --skill-bundle`, resolved on the host against its skill cache. Only
-    /// the local launch renders it so far; connectors deliver it in a later
-    /// task.
+    /// --skill-bundle`, resolved on the host against its skill cache. SSH
+    /// sends it in the argv behind an in-command `agent.skill_bundle` gate,
+    /// HTTP in the body to a peer advertising that feature, and the local
+    /// connector forwards it; tunnel and bucket refuse a launch carrying one.
     pub skill_bundle: Option<rupu_skills::ship::SkillBundleManifest>,
     /// Codename minted by a placed unit's coordinator — `rupu run
     /// --codename`. Best-effort: a codename is only a display name, so a peer

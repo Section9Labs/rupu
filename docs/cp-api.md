@@ -319,7 +319,7 @@ Hosts receive the skills of a placed unit through two more routes, behind the
 | Method | Path | Purpose | Notes |
 |--------|------|---------|-------|
 | POST | `/api/skills/bundle/missing` | Which shipped skills this host lacks. | Body `{skills: [{layer, name, content_hash}]}` → `{missing: [...]}`. 400 for a malformed ref. |
-| PUT | `/api/skills/bundle/:hash` | Store one packed skill (the tar is the body). | `layer`, `name`. The tar is vetted and must hash to `:hash`; 400 otherwise, nothing kept. A hash already cached is a success. Body limit is the per-skill cap (32 MiB). |
+| PUT | `/api/skills/bundle/:hash` | Store one packed skill (the tar is the body). | `layer`, `name`. The tar is vetted and must hash to `:hash`; 400 otherwise, nothing kept. A hash already cached is a success. Body limit is the per-skill cap (32 MiB) plus 64 KiB for the tar headers. |
 
 `SkillsResponse` is `{skills: [SkillRow], warnings: [string]}`. A layer that
 can't be read is left out of `skills` and named in `warnings`
