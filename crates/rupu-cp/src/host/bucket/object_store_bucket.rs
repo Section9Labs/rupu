@@ -322,9 +322,10 @@ impl ObjectStoreBucket {
             .map_err(|e| BucketError::Io(e.to_string()))?
         {
             if out.len() as u64 + chunk.len() as u64 > max_bytes {
-                return Err(BucketError::Io(format!(
-                    "skill {hash} exceeds {max_bytes} bytes"
-                )));
+                return Err(BucketError::TooLarge {
+                    key: key_skill(hash),
+                    max: max_bytes,
+                });
             }
             out.extend_from_slice(&chunk);
         }
@@ -557,9 +558,10 @@ impl Bucket for ObjectStoreBucket {
             Err(e) => return Err(BucketError::Io(e.to_string())),
         };
         if size > max_bytes {
-            return Err(BucketError::Io(format!(
-                "skill {hash} exceeds {max_bytes} bytes ({size})"
-            )));
+            return Err(BucketError::TooLarge {
+                key: key_skill(hash),
+                max: max_bytes,
+            });
         }
         self.read_capped(&path, hash, max_bytes).await
     }
@@ -640,7 +642,7 @@ mod tests {
         assert_eq!(b.get_skill(&hash, 5).await.unwrap(), b"first");
         assert!(matches!(
             b.get_skill(&hash, 4).await,
-            Err(BucketError::Io(m)) if m.contains("exceeds")
+            Err(BucketError::TooLarge { max: 4, .. })
         ));
     }
 
@@ -653,7 +655,7 @@ mod tests {
         // Bypasses the head check, as a swapped object would.
         assert!(matches!(
             b.read_capped(&path, &hash, 9).await,
-            Err(BucketError::Io(m)) if m.contains("exceeds")
+            Err(BucketError::TooLarge { max: 9, .. })
         ));
         assert_eq!(b.read_capped(&path, &hash, 10).await.unwrap(), b"0123456789");
     }

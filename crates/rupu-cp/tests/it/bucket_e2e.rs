@@ -446,3 +446,114 @@ async fn bucket_dead_drop_e2e() {
         "cancel envelope must not carry a reason"
     );
 }
+
+// ── failure reasons ───────────────────────────────────────────────────────────
+
+/// A mirror run on `host_id` for `run_id`, and an empty in-memory bucket.
+async fn failing_run(
+    run_id: &str,
+    host_id: &str,
+) -> (Arc<RunStore>, NodeMirror, ObjectStoreBucket) {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(RunStore::new(dir.keep().join("runs")));
+    let mirror = NodeMirror::new(Arc::clone(&store));
+    let spec = RunSpec {
+        skill_bundle: None,
+        kind: RunSpecKind::Agent,
+        name: "a".to_string(),
+        inputs: BTreeMap::new(),
+        prompt: None,
+        mode: None,
+        target: None,
+        findings_profile: None,
+        engagement_profiles: Vec::new(),
+        skills: Vec::new(),
+        preload_skills: Vec::new(),
+        codename: None,
+    };
+    mirror.create_run(run_id, host_id, &spec).await.unwrap();
+    let bucket = ObjectStoreBucket::new(Arc::new(InMemory::new()), "test/fail");
+    (store, mirror, bucket)
+}
+
+/// A worker that failed a job writes `failure.txt` before the `failed` marker;
+/// the coordinator's run record carries it as `host <id>: <reason>`.
+#[tokio::test]
+async fn a_failed_run_carries_the_workers_reason() {
+    let (store, mirror, bucket) = failing_run("run_FAILREASON0001", "host_F").await;
+    bucket
+        .put_result(
+            "run_FAILREASON0001",
+            "failure.txt",
+            b"skill global:alpha: not found",
+        )
+        .await
+        .unwrap();
+    bucket
+        .put_finished("run_FAILREASON0001", "failed")
+        .await
+        .unwrap();
+
+    let done = poll_bucket_run(
+        &bucket,
+        &mirror,
+        "host_F",
+        "run_FAILREASON0001",
+        &mut HashSet::new(),
+    )
+    .await
+    .unwrap();
+
+    assert!(done);
+    let rec = store.load("run_FAILREASON0001").unwrap();
+    assert_eq!(rec.status, RunStatus::Failed);
+    assert_eq!(
+        rec.error_message.as_deref(),
+        Some("host host_F: skill global:alpha: not found")
+    );
+}
+
+/// No `failure.txt`: a failed run finishes exactly as before (no message), and
+/// a run that did not fail ignores one.
+#[tokio::test]
+async fn a_run_without_a_failure_object_finishes_as_before() {
+    let (store, mirror, bucket) = failing_run("run_NOREASON0000001", "host_F").await;
+    bucket
+        .put_finished("run_NOREASON0000001", "failed")
+        .await
+        .unwrap();
+    poll_bucket_run(
+        &bucket,
+        &mirror,
+        "host_F",
+        "run_NOREASON0000001",
+        &mut HashSet::new(),
+    )
+    .await
+    .unwrap();
+    let rec = store.load("run_NOREASON0000001").unwrap();
+    assert_eq!(rec.status, RunStatus::Failed);
+    assert_eq!(rec.error_message, None);
+
+    let (store, mirror, bucket) = failing_run("run_OKRUN0000000001", "host_F").await;
+    bucket
+        .put_result("run_OKRUN0000000001", "failure.txt", b"stale")
+        .await
+        .unwrap();
+    bucket
+        .put_finished("run_OKRUN0000000001", "completed")
+        .await
+        .unwrap();
+    poll_bucket_run(
+        &bucket,
+        &mirror,
+        "host_F",
+        "run_OKRUN0000000001",
+        &mut HashSet::new(),
+    )
+    .await
+    .unwrap();
+    let rec = store.load("run_OKRUN0000000001").unwrap();
+    assert_eq!(rec.status, RunStatus::Completed);
+    assert_eq!(rec.error_message, None);
+}

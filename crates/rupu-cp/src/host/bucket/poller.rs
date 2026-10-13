@@ -48,14 +48,40 @@ pub async fn poll_bucket_run(
         // poller stops polling a finished run). Every object the node wrote
         // precedes the marker we just saw, so one re-list now sees them all.
         mirror_new_results(bucket, mirror, host_id, run_id, consumed).await?;
+        // A worker that failed a job before it ran (unusable skills, a spawn
+        // failure) says why in `failure.txt`, written before the marker.
+        let reason = if status == "failed" {
+            failure_reason(bucket, run_id).await
+        } else {
+            None
+        }
+        .map(|r| format!("host {host_id}: {r}"));
         mirror
-            .finish(run_id, host_id, &status)
+            .finish_with_reason(run_id, host_id, &status, reason)
             .await
             .with_context(|| format!("mirror.finish for run {run_id}"))?;
         return Ok(true);
     }
 
     Ok(false)
+}
+
+/// Result key of a worker's reason for failing a job. It is neither
+/// `run.json` nor a `.jsonl` stream, so [`classify_key`] (and an older
+/// poller's) skips it.
+pub const FAILURE_KEY: &str = "failure.txt";
+
+/// Longest failure reason the coordinator keeps.
+const MAX_FAILURE_REASON: usize = 4096;
+
+/// The worker's `failure.txt`, if it wrote one. Best effort: a read error just
+/// means the run fails without a reason, as it did before.
+async fn failure_reason(bucket: &dyn Bucket, run_id: &str) -> Option<String> {
+    let results = bucket.list_results(run_id).await.ok()?;
+    let (_, body) = results.into_iter().find(|(k, _)| k == FAILURE_KEY)?;
+    let text = String::from_utf8_lossy(&body);
+    let text: String = text.trim().chars().take(MAX_FAILURE_REASON).collect();
+    (!text.is_empty()).then_some(text)
 }
 
 /// List `run_id`'s result objects and mirror every one not yet in `consumed`.
@@ -256,6 +282,14 @@ mod tests {
         async fn get_skill(&self, hash: &str, max_bytes: u64) -> Result<Vec<u8>, BucketError> {
             self.inner.get_skill(hash, max_bytes).await
         }
+    }
+
+    /// The worker's failure reason is a result object an older poller must
+    /// skip: `classify_key` knows nothing about it (and `poll_bucket_run`
+    /// marks unknown keys consumed without mirroring them).
+    #[test]
+    fn the_failure_reason_key_is_skipped_by_the_stream_classifier() {
+        assert!(classify_key(FAILURE_KEY).is_none());
     }
 
     /// The node writes its last result object and then the finished marker. A

@@ -69,6 +69,10 @@ pub enum BucketError {
     Io(String),
     #[error("not found: {0}")]
     NotFound(String),
+    /// An object is bigger than the cap the reader set. Retrying cannot help,
+    /// unlike every `Io`.
+    #[error("{key} exceeds {max} bytes")]
+    TooLarge { key: String, max: u64 },
 }
 
 // ── port trait ────────────────────────────────────────────────────────────────
