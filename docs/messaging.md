@@ -18,11 +18,18 @@ Every root run can have one message space. Everything said in its run tree goes 
 | Root | Space directory | Created |
 |---|---|---|
 | agentiflow | `<RUPU_HOME>/agentiflows/af_<id>/` (the run dir) | at flow start |
-| workflow run | `<RUPU_HOME>/runs/<run_id>/messages/` | when its first step starts, if the workflow sets `messaging:`, a step's agent names a messaging tool, or the space already exists |
+| workflow run | `<RUPU_HOME>/runs/<run_id>/messages/` | when a step that takes part starts (the workflow sets `messaging:`, or the step's agent names a messaging tool), or on a step's first child |
 | `rupu session` | `<sessions>/<session_id>/messages/` | on the session's first message or first child |
 | standalone `rupu run` | `<RUPU_HOME>/runs/<run_id>/messages/` | on the run's first message or first child |
 
-A run that never sends a message and never launches a child creates nothing.
+A run that never sends a message and never launches a child creates nothing. A run that
+continues another (`rupu run --continue`) keeps that run's space, so it reads what was left in
+its inbox.
+
+A run takes part in its space, and is offered the messaging tools, when its agent names one in
+`tools:`, its workflow sets `messaging:`, or someone has already joined the space. Any other
+run still has the space: its children meet it there, and what they send `parent` reaches it
+before its next model call.
 
 ```
 <space>/
@@ -66,7 +73,7 @@ A message's `to` is one of these:
 | `parent` | the run that launched the sender | `no_parent` |
 | `lead` | an agentiflow's lead | `no_lead` |
 | `operator` | the operator (read from the log; no agent drains it) | — |
-| `broadcast` | every participant, each once, from when it joined | — |
+| `broadcast` | every participant but the sender, each once, from when it joined | — |
 
 Roles and steps are resolved when the message is sent. A message to a participant that has
 left is logged as `participant_left`. A full inbox (256 waiting messages) is `inbox_full`, a
@@ -132,8 +139,8 @@ steps:
 as `ambient:workflow_messaging`. It covers the workflow's own agent steps and units, not the
 children they launch: a child gets the tools its own `tools:` names.
 
-An agent can also opt in itself by naming a messaging tool in `tools:`. It joins the space
-whatever run it is in.
+An agent can also opt in itself by naming a messaging tool in `tools:` (by name, alias or
+`board.*` / `msg.*`; `*` alone doesn't). It takes part in the space of whatever run it is in.
 
 A lead-shaped step is just an agent granted `dispatch`, `board.directive` and `msg.send`. Its
 children join the workflow's space, see its directives, and can message `parent`.

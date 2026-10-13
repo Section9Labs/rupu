@@ -31,6 +31,7 @@ fn parent_in_space(home: &Home, agents: &[&str]) -> (ToolContext, Arc<Bus>) {
         ..Default::default()
     });
     ctx.services.message_bus = Some(Arc::clone(&bus));
+    ctx.services.message_space = Some(Arc::clone(&bus));
     (ctx, bus)
 }
 
@@ -150,4 +151,38 @@ async fn a_subagent_shares_the_space_in_process() {
     assert!(child.address.starts_with("heron>"), "{}", child.address);
     assert_eq!(child.member.parent_run_id.as_deref(), Some("parent_run_1"));
     assert!(!child.live);
+}
+
+/// A parent that takes no part in messaging (no messaging tools) still has
+/// a space its children meet it in: its first child creates it, and what
+/// the child sends `parent` reaches the parent (FD1).
+#[tokio::test]
+#[serial]
+async fn a_parent_without_messaging_tools_hears_its_child() {
+    let home = Home::new();
+    home.agent(
+        "reporter",
+        "provider: anthropic\nmodel: claude-sonnet-4-6\nmaxTurns: 3\ntools: [msg.send]",
+    );
+    let l = home.launcher(config(), None);
+    let _m = MockScript::set(
+        r#"[
+          { "AssistantToolUse": { "text": null, "tool_id": "m1", "tool_name": "msg.send", "tool_input": {"to": "parent", "body": "all clear"}, "stop": "tool_use" } },
+          { "AssistantText": { "text": "done", "stop": "end_turn" } }
+        ]"#,
+    );
+    let (mut ctx, bus) = parent_in_space(&home, &["reporter"]);
+    ctx.services.message_bus = None;
+    assert!(!bus.space().exists());
+    let status = run(
+        &l,
+        &ctx,
+        request(ChildKind::Subagent, "reporter", Some("go")),
+    )
+    .await;
+    assert_eq!(status.state, ChildState::Done, "{status:?}");
+    assert!(bus.is_joined());
+    let inbox = bus.mailbox.drain("heron").unwrap();
+    assert_eq!(inbox.len(), 1, "{inbox:?}");
+    assert_eq!(inbox[0].body, "all clear");
 }

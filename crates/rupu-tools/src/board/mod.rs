@@ -214,6 +214,23 @@ pub(crate) fn opt_address(input: &Value, key: &str) -> Result<Option<Address>, T
         .transpose()
 }
 
+/// Run a bus write off the async runtime: it holds the space's lock while
+/// it reads the roster and the recipients' inboxes.
+pub(crate) async fn on_bus<T: Send + 'static>(
+    bus: &Arc<Bus>,
+    write: impl FnOnce(&Bus) -> Result<T, BusError> + Send + 'static,
+) -> Result<T, BusError> {
+    let bus = Arc::clone(bus);
+    tokio::task::spawn_blocking(move || write(&bus))
+        .await
+        .unwrap_or_else(|e| {
+            Err(BusError::Io {
+                action: "message space write".into(),
+                source: std::io::Error::other(e.to_string()),
+            })
+        })
+}
+
 /// A write's result: `fields` plus the message's `id` and delivery, and the
 /// `message_sent` event the agent loop records. A message that reached none
 /// of its recipients is also an error the model sees, though it is logged.
@@ -360,10 +377,12 @@ impl Tool for BoardPostTool {
         let kind = parse_kind(req_str(&input, "kind")?)?;
         let body = req_str(&input, "body")?.to_string();
         let to = opt_address(&input, "addressed_to")?;
-        Ok(match bus(ctx)?.post(kind, to.as_ref(), &body) {
-            Ok(r) => sent(r, json!({ "posted": kind.as_str() })),
-            Err(e) => not_sent("board.post", e),
-        })
+        Ok(
+            match on_bus(bus(ctx)?, move |b| b.post(kind, to.as_ref(), &body)).await {
+                Ok(r) => sent(r, json!({ "posted": kind.as_str() })),
+                Err(e) => not_sent("board.post", e),
+            },
+        )
     }
 }
 
@@ -438,10 +457,12 @@ impl Tool for BoardDirectiveTool {
         let body = req_str(&input, "body")?.to_string();
         let to = opt_address(&input, "addressed_to")?;
         let addressed_to = to.as_ref().map(ToString::to_string);
-        Ok(match bus(ctx)?.directive(to.as_ref(), &body) {
-            Ok(r) => sent(r, json!({ "ok": true, "addressed_to": addressed_to })),
-            Err(e) => not_sent("board.directive", e),
-        })
+        Ok(
+            match on_bus(bus(ctx)?, move |b| b.directive(to.as_ref(), &body)).await {
+                Ok(r) => sent(r, json!({ "ok": true, "addressed_to": addressed_to })),
+                Err(e) => not_sent("board.directive", e),
+            },
+        )
     }
 }
 
@@ -480,7 +501,8 @@ impl Tool for BoardRetractTool {
                 directive.author
             )));
         }
-        Ok(match bus.retract(&id) {
+        let lift = id.clone();
+        Ok(match on_bus(bus, move |b| b.retract(&lift)).await {
             Ok(r) => sent(r, json!({ "ok": true, "retracted": id })),
             Err(e) => not_sent("board.retract", e),
         })

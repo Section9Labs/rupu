@@ -38,6 +38,15 @@ use crate::provider_factory::{
 };
 use crate::usage_ledger::UsageLedger;
 
+/// A run's bus on its message space, and how the run takes part.
+struct SpaceBus {
+    bus: Arc<rupu_fleet::Bus>,
+    /// Offered the messaging tools.
+    takes_part: bool,
+    /// Joins as it starts, rather than on its first message or child.
+    joins_at_start: bool,
+}
+
 /// What a [`RunAssembler`] is built from: the config a process (or one root
 /// run) runs under and the resources its runs share.
 pub struct AssemblyContext {
@@ -696,7 +705,8 @@ impl RunAssembler {
             None => PermissionPolicy::new(spec.mode, spec.prompter.clone()),
         };
 
-        let message_bus = self.message_bus(&spec);
+        let space = self.message_space(&spec);
+        let message_bus = space.as_ref().map(|s| Arc::clone(&s.bus));
         let findings =
             self.ctx
                 .findings
@@ -733,7 +743,11 @@ impl RunAssembler {
                 customer: self.ctx.customer.clone(),
                 // The agent loop sets it from the permission policy.
                 prompter: None,
-                message_bus: message_bus.clone(),
+                message_bus: space
+                    .as_ref()
+                    .filter(|s| s.takes_part)
+                    .map(|s| Arc::clone(&s.bus)),
+                message_space: message_bus.clone(),
                 run_status: spec.services.run_status.clone(),
                 catalog: spec
                     .services
@@ -843,8 +857,7 @@ impl RunAssembler {
         let parent_run_id_for_space = tool_context.identity.parent.as_ref().map(|p| p.run_id.clone());
         let launched = spec.link.is_some();
         let spec_origin = spec.origin.clone();
-        let joins_at_start = spec.services.message_bus.is_some()
-            || matches!(spec.origin, Origin::WorkflowStep { .. });
+        let joins_at_start = space.as_ref().is_some_and(|s| s.joins_at_start);
         let LaunchSpec {
             agent,
             transcript_path,
@@ -872,9 +885,9 @@ impl RunAssembler {
                 kind: crate::services::messaging::member_kind(&spec_origin, launched).into(),
                 parent_run_id: parent_run_id_for_space.clone(),
             };
-            // A workflow step's space is created at its start, and a run
-            // handed a bus joins a space that exists; a run's own space is
-            // created lazily, on its first message or child (FD1).
+            // A run handed a bus, a workflow step taking part, and a run whose
+            // space is already active join at start; any other run's space
+            // is created lazily, on its first message or child (FD1).
             if joins_at_start {
                 let joining = Arc::clone(bus);
                 match tokio::task::spawn_blocking(move || joining.join(member)).await {
@@ -929,28 +942,34 @@ impl RunAssembler {
 impl RunAssembler {
     /// The run's bus on its message space (spec F1a): the one the site
     /// handed it (an agentiflow's lead and units, a child sharing its
-    /// parent's), else one on its origin's own space when the run takes part
-    /// in it — its workflow's `messaging:` is set, its agent names a
-    /// messaging tool (not through `*`), or someone in the space already has.
-    fn message_bus(&self, spec: &LaunchSpec) -> Option<Arc<rupu_fleet::Bus>> {
+    /// parent's), else one on its origin's own space. It takes part — is
+    /// offered the messaging tools — when its workflow sets `messaging:`, its
+    /// agent names a messaging tool (not through `*`), or someone already
+    /// joined the space; otherwise the bus is only where its children meet
+    /// it.
+    fn message_space(&self, spec: &LaunchSpec) -> Option<SpaceBus> {
         if let Some(bus) = &spec.services.message_bus {
-            return Some(Arc::clone(bus));
+            return Some(SpaceBus {
+                bus: Arc::clone(bus),
+                takes_part: true,
+                joins_at_start: true,
+            });
         }
         let space =
             crate::services::messaging::space_dir(&self.ctx.global, &spec.origin, &spec.run_id)?;
-        let joins = matches!(
+        let workflow = matches!(
             spec.origin,
             Origin::WorkflowStep {
                 messaging: Some(_),
                 ..
             }
-        ) || spec.agent.tools.as_deref().is_some_and(|tools| {
+        );
+        let named = spec.agent.tools.as_deref().is_some_and(|tools| {
             rupu_tools::ToolCatalog::builtin()
                 .names_service(tools, rupu_tools::Service::MessageBus)
-        }) || crate::services::messaging::is_active(&space);
-        if !joins {
-            return None;
-        }
+        });
+        let active = crate::services::messaging::is_active(&space);
+        let step = matches!(spec.origin, Origin::WorkflowStep { .. });
         let address =
             crate::services::messaging::address_of(spec.codename.as_deref(), &spec.run_id);
         let bus = rupu_fleet::Bus::open(&space, address)
@@ -960,7 +979,11 @@ impl RunAssembler {
             Origin::SessionTurn { .. } => bus.staying(),
             _ => bus,
         };
-        Some(Arc::new(bus))
+        Some(SpaceBus {
+            bus: Arc::new(bus),
+            takes_part: workflow || named || active,
+            joins_at_start: workflow || active || (named && step),
+        })
     }
 
     /// What the run `spec` may launch and where its children are recorded

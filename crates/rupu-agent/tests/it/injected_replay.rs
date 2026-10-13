@@ -216,3 +216,94 @@ async fn injected_replay_roundtrip() {
         other => panic!("{other:?}"),
     }
 }
+
+/// A run that stopped after a message was delivered but before a model call
+/// saw it wrote no receipt; the run that continues it does, once its first
+/// call has seen the message in the rebuilt conversation.
+#[tokio::test]
+async fn a_continued_run_receipts_what_its_predecessor_never_saw() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("t.jsonl");
+    let provider = CapturingMockProvider::new(vec![
+        read_turn("c0"),
+        read_turn("c1"),
+        ScriptedTurn::AssistantText {
+            text: "done".into(),
+            stop: StopReason::EndTurn,
+            input_tokens: 1,
+            output_tokens: 1,
+        },
+    ]);
+    run_agent(opts(
+        provider,
+        tmp.path(),
+        Arc::new(Scripted::default()),
+        transcript.clone(),
+    ))
+    .await
+    .unwrap();
+    // Stopped right after turn 1's message was delivered, before its call.
+    let all = events(&transcript);
+    let cut = all
+        .iter()
+        .position(|e| matches!(e, Event::Injected { message_ids, .. } if message_ids == &["msg_1"]))
+        .unwrap();
+    let interrupted = tmp.path().join("interrupted.jsonl");
+    let mut w = rupu_transcript::JsonlWriter::create(&interrupted).unwrap();
+    for e in &all[..=cut] {
+        w.write(e).unwrap();
+    }
+    w.flush().unwrap();
+    let (messages, seed_source) =
+        match rupu_agent::continuation::prepare_continuation(&interrupted).unwrap() {
+            rupu_agent::continuation::Continuation::Resume {
+                messages,
+                seed_source,
+                ..
+            } => (messages, seed_source),
+            other => panic!("{other:?}"),
+        };
+
+    let space = tmp.path().join("messages");
+    let bus = Arc::new(rupu_fleet::Bus::open(&space, "reader"));
+    bus.join(rupu_fleet::Member {
+        agent: "reader".into(),
+        run_id: "run_next".into(),
+        kind: "standalone".into(),
+        ..Default::default()
+    })
+    .unwrap();
+    let mut next = opts(
+        CapturingMockProvider::new(vec![ScriptedTurn::AssistantText {
+            text: "done".into(),
+            stop: StopReason::EndTurn,
+            input_tokens: 1,
+            output_tokens: 1,
+        }]),
+        tmp.path(),
+        Arc::new(Scripted::default()),
+        tmp.path().join("next.jsonl"),
+    );
+    next.collectors.clear();
+    next.prompt = rupu_agent::UserTurn::new("");
+    rupu_agent::continuation::apply_continuation(
+        &mut next.prompt,
+        messages,
+        seed_source,
+        Vec::new(),
+    );
+    next.tool_context.services.message_space = Some(Arc::clone(&bus));
+    run_agent(next).await.unwrap();
+
+    let seen: Vec<(String, String)> = bus
+        .read_log(None, 100)
+        .unwrap()
+        .lines
+        .into_iter()
+        .filter_map(|l| match l {
+            rupu_fleet::LogLine::Seen { id, by, .. } => Some((id, by)),
+            rupu_fleet::LogLine::Msg(_) => None,
+        })
+        .collect();
+    assert_eq!(seen, vec![("msg_1".to_string(), "reader".to_string())]);
+}

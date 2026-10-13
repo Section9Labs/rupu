@@ -965,7 +965,7 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 },
                 rupu_tools::ParentEnd::Stopped,
             ));
-            if let Err(e) = bus.leave("done") {
+            if let Err(e) = bus.leave(&stop_code(&outcome.stop)) {
                 tracing::warn!(error = %e, "could not record the lead leaving the flow's message space");
             }
             // Drop the driver here, in the blocking context its runtime ran in, before

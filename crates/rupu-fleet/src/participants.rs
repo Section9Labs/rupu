@@ -92,6 +92,10 @@ pub struct Sender<'a> {
 pub struct Roster {
     by_address: BTreeMap<String, Participant>,
     order: Vec<String>,
+    /// Every run that ever joined, and the address it joined at: a run's
+    /// `parent` is found by run id, even after a later run (a session's next
+    /// turn) took the address over.
+    run_address: BTreeMap<String, String>,
 }
 
 impl Roster {
@@ -132,6 +136,8 @@ impl Roster {
                 if !self.by_address.contains_key(&address) {
                     self.order.push(address.clone());
                 }
+                self.run_address
+                    .insert(member.run_id.clone(), address.clone());
                 self.by_address.insert(
                     address.clone(),
                     Participant {
@@ -186,9 +192,11 @@ impl Roster {
     }
 
     /// Resolve `to` for `sender` (spec F1a §3.2). `legacy_inbox` says
-    /// whether a mailbox exists under a name: a space written before the
-    /// registry existed has no roster, and its participants are found by
-    /// their inbox directories (`recon#1` → `mailboxes/recon-1/`).
+    /// whether a mailbox exists under a name: participants of a space
+    /// written before the registry existed aren't in the roster, and are
+    /// found by their inbox directories (`recon#1` → `mailboxes/recon-1/`).
+    /// Every joined participant is in the roster, so the fallback only ever
+    /// finds those.
     pub fn resolve(
         &self,
         to: &Address,
@@ -253,11 +261,10 @@ impl Roster {
                     .collect(),
             ),
             Address::Parent => {
-                let parent = sender.parent_run_id.and_then(|run| {
-                    self.participants()
-                        .filter(|p| p.member.run_id == run)
-                        .last()
-                });
+                let parent = sender
+                    .parent_run_id
+                    .and_then(|run| self.run_address.get(run))
+                    .and_then(|address| self.by_address.get(address));
                 match parent {
                     None => one(to.to_string(), None, Undeliverable::NoParent),
                     Some(p) => {
@@ -271,7 +278,7 @@ impl Roster {
                     let (r, reason) = live_or_left(p);
                     one(LEAD.into(), r, reason)
                 }
-                None if self.is_empty() && legacy_inbox(LEAD) => {
+                None if legacy_inbox(LEAD) => {
                     one(LEAD.into(), Some(LEAD.into()), Undeliverable::NoLead)
                 }
                 None => one(LEAD.into(), None, Undeliverable::NoLead),
@@ -290,7 +297,9 @@ impl Roster {
                 if !role.is_empty() {
                     return many(name.clone(), role);
                 }
-                let legacy = self.is_empty() && legacy_inbox(name);
+                // A participant of a space written before the registry is
+                // found by its inbox directory (`recon#1` → `recon-1`).
+                let legacy = legacy_inbox(name);
                 one(
                     name.clone(),
                     legacy.then(|| name.clone()),

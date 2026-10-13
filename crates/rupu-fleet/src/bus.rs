@@ -247,13 +247,15 @@ impl Bus {
     }
 
     /// A board post, optionally addressed. Every participant can read it;
-    /// nothing delivers it into a turn.
+    /// nothing delivers it into a turn. A post to `broadcast` is a channel
+    /// post (there is one broadcast, `send`'s).
     pub fn post(
         &self,
         kind: PostKind,
         to: Option<&Address>,
         body: &str,
     ) -> Result<SendReceipt, BusError> {
+        let to = to.filter(|a| **a != Address::Broadcast);
         self.write(
             Draft {
                 kind: MessageKind::Post,
@@ -317,9 +319,10 @@ impl Bus {
         )
     }
 
-    /// A standing directive, to everyone (`None`) or to an address. Its id
-    /// is its log id, which `retract` takes.
+    /// A standing directive, to everyone (`None`, or `broadcast`) or to an
+    /// address. Its id is its log id, which `retract` takes.
     pub fn directive(&self, to: Option<&Address>, body: &str) -> Result<SendReceipt, BusError> {
+        let to = to.filter(|a| **a != Address::Broadcast);
         self.write(
             Draft {
                 kind: MessageKind::Directive,
@@ -443,16 +446,22 @@ impl Bus {
         };
         append(&log_path, &LogLine::Msg(message.clone()))?;
         #[cfg(test)]
-        if self
-            .fail_after_log
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(FleetError::Io {
-                action: "injected failure after the log line".into(),
-                source: std::io::Error::other("injected"),
-            });
-        }
-        apply(&message)?;
+        let apply = |m: &LogMessage| {
+            if self
+                .fail_after_log
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(FleetError::Io {
+                    action: "injected failure after the log line".into(),
+                    source: std::io::Error::other("injected"),
+                });
+            }
+            apply(m)
+        };
+        apply(&message).map_err(|e| FleetError::PartlyDelivered {
+            id: message.id.clone(),
+            source: Box::new(e),
+        })?;
         Ok(SendReceipt { message })
     }
 

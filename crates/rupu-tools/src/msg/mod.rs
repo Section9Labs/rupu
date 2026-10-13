@@ -2,7 +2,7 @@
 //! lead or the operator, or to everyone through the broadcast log, from the
 //! run's [`Bus`](rupu_fleet::Bus) participant.
 
-use crate::board::{bus, not_sent, sent};
+use crate::board::{bus, not_sent, on_bus, sent};
 use crate::descriptor::{Effect, Service, ToolDescriptor};
 use crate::output::{deny_unknown, req_str};
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
@@ -58,7 +58,7 @@ impl Tool for MsgSendTool {
         let to = Address::parse(req_str(&input, "to")?)
             .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
         let body = req_str(&input, "body")?.to_string();
-        Ok(match bus(ctx)?.send(&to, &body) {
+        Ok(match on_bus(bus(ctx)?, move |b| b.send(&to, &body)).await {
             Ok(r) => sent(r, json!({ "sent": true })),
             Err(e) => not_sent("msg.send", e),
         })

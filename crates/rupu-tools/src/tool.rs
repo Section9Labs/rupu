@@ -284,10 +284,16 @@ pub struct ToolServices {
     /// The run's operator prompter, when it has one: a child run started by
     /// a call asks the same operator.
     pub prompter: Option<Arc<dyn Prompter>>,
-    /// The run's address on its flow's board and mailboxes, behind `board.*`
-    /// / `msg.send`. Built by the run's owner (an agentiflow lead or unit);
-    /// `None` outside a flow.
+    /// The run's bus on its message space, behind `board.*` / `msg.send`:
+    /// set when the run takes part in the space (an agentiflow's lead or
+    /// unit, a child sharing its parent's, a workflow with `messaging:`, an
+    /// agent naming a messaging tool, a space someone already joined).
     pub message_bus: Option<Arc<rupu_fleet::Bus>>,
+    /// The same run's bus whether or not it is offered the tools: the space
+    /// its children join and its collectors read (spec F1a FD1). A run that
+    /// never messages and launches no child never joins it, so it costs
+    /// nothing.
+    pub message_space: Option<Arc<rupu_fleet::Bus>>,
     /// A flow's live goals, coverage and budget, behind `goal.*` /
     /// `budget.status`. Set by an agentiflow for its lead.
     pub run_status: Option<Arc<dyn crate::ports::RunStatus>>,
@@ -377,6 +383,7 @@ impl std::fmt::Debug for ToolServices {
             .field("customer", &self.customer)
             .field("prompter", &self.prompter.as_ref().map(|_| "<prompter>"))
             .field("message_bus", &self.message_bus)
+            .field("message_space", &self.message_space)
             .field(
                 "run_status",
                 &self.run_status.as_ref().map(|_| "<run status>"),

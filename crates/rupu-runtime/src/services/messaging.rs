@@ -59,6 +59,32 @@ pub fn is_active(space: &Path) -> bool {
     space.join("participants.jsonl").exists() || space.join("log.jsonl").exists()
 }
 
+/// Make `run_id`'s space the space of the run it continues (`rupu run
+/// --continue <prior>`): `<runs>/<run_id>/messages` becomes a link to
+/// `<runs>/<prior>/messages`, so the continued run reads the inbox the
+/// interrupted one never drained, under the same address, and a further
+/// continuation finds the same space. Nothing happens when the prior run
+/// had no space, or the new one already has one.
+pub fn adopt_space(global: &Path, prior_run_id: &str, run_id: &str) -> std::io::Result<()> {
+    let runs = global.join("runs");
+    let prior = runs.join(prior_run_id).join("messages");
+    let ours = runs.join(run_id).join("messages");
+    if !prior.exists() || ours.symlink_metadata().is_ok() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(runs.join(run_id))?;
+    let target = prior.canonicalize()?;
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, ours)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = target;
+        Ok(())
+    }
+}
+
 /// How a run of `origin` was started, as its `joined` line says.
 pub fn member_kind(origin: &Origin, launched: bool) -> &'static str {
     match origin {
@@ -160,7 +186,13 @@ impl TurnCollector for MessageCollector {
             Err(e) => tracing::warn!(inbox = %me, error = %e, "message collector: drain failed"),
         }
         match self.bus.mailbox.read_broadcast(me) {
-            Ok(messages) => out.extend(messages.into_iter().map(|m| self.injection(m, true))),
+            // Its own broadcasts aren't delivered back to the sender.
+            Ok(messages) => out.extend(
+                messages
+                    .into_iter()
+                    .filter(|m| &m.from != me)
+                    .map(|m| self.injection(m, true)),
+            ),
             Err(e) => {
                 tracing::warn!(participant = %me, error = %e, "message collector: broadcast read failed")
             }
@@ -230,6 +262,9 @@ impl TurnCollector for DirectiveCollector {
     }
 
     fn collect(&self, _ctx: &TurnContext) -> Vec<Injection> {
+        if !self.bus.is_joined() {
+            return Vec::new();
+        }
         let directives = match self.bus.board.read_directives() {
             Ok(d) => d,
             Err(e) => {
@@ -332,6 +367,14 @@ mod tests {
         assert_eq!(b.source, "broadcast:otter");
         assert_eq!(b.messages[0].id, bcast.id());
         assert!(c.collect(&ctx()).is_empty(), "delivered once");
+        // A sender doesn't hear its own broadcast back.
+        let echo = MessageCollector {
+            bus: Arc::clone(&sender),
+        };
+        assert!(echo
+            .collect(&ctx())
+            .iter()
+            .all(|i| i.source != "broadcast:lynx"));
 
         c.seen(&[direct.id().to_string()], 3);
         let receipts: Vec<LogLine> = reader
@@ -426,6 +469,32 @@ mod tests {
         let got = DirectiveCollector { bus: me }.collect(&ctx());
         assert_eq!(got[0].content, "standing directive from operator: old rule");
         assert!(got[0].messages.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_continued_run_adopts_its_priors_space_down_a_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let g = tmp.path();
+        adopt_space(g, "run_a", "run_b").unwrap();
+        assert!(
+            !g.join("runs/run_b/messages").exists(),
+            "no space, nothing to adopt"
+        );
+        let a = joined(&g.join("runs/run_a/messages"), "heron", "auditor", None);
+        let lynx = joined(
+            &g.join("runs/run_a/messages"),
+            "heron>lynx#1",
+            "recon",
+            None,
+        );
+        lynx.send(&Address::parse("heron").unwrap(), "late news")
+            .unwrap();
+        adopt_space(g, "run_a", "run_b").unwrap();
+        adopt_space(g, "run_b", "run_c").unwrap();
+        let c = Bus::open(&g.join("runs/run_c/messages"), "heron");
+        assert_eq!(c.mailbox.drain("heron").unwrap()[0].body, "late news");
+        assert!(a.roster().unwrap().get("heron>lynx#1").is_some());
     }
 
     #[test]

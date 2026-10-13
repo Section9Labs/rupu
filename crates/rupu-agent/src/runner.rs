@@ -2290,8 +2290,18 @@ async fn run_agent_inner(
         // content joins that assistant message (spec §5.4; replay applies
         // the same merge from `Recovery { merge_into_previous }`).
         let mut merge_next_assistant = false;
-        // What the collectors delivered: recorded, and awaiting receipts.
-        let mut injections = InjectionLog::default();
+        // What the collectors delivered: recorded, and awaiting receipts —
+        // with what the run this one continues delivered but never saw a
+        // model call for.
+        let mut injections = InjectionLog {
+            carried_unseen: match &opts.prompt.seed_source {
+                Some(seed) if opts.tool_context.services.message_space.is_some() => {
+                    unreceipted_messages(seed)
+                }
+                _ => Vec::new(),
+            },
+            ..InjectionLog::default()
+        };
         let loop_outcome = 'turns: loop {
             if turn_idx >= opts.max_turns {
                 break 'turns LoopOutcome::Status(
@@ -2819,6 +2829,19 @@ async fn run_agent_inner(
                 CallOutcome::Paused => break 'turns LoopOutcome::Paused,
             };
             // The call saw this turn's delivered messages: their receipts.
+            let carried = std::mem::take(&mut injections.carried_unseen);
+            if let (false, Some(bus)) = (
+                carried.is_empty(),
+                opts.tool_context.services.message_space.clone(),
+            ) {
+                let turn = turn_idx;
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Err(e) = bus.mark_seen(&carried, &bus.participant, turn) {
+                        tracing::warn!(error = %e, "could not write message receipts");
+                    }
+                })
+                .await;
+            }
             if let Some((pipeline, delivered, ids)) = injections.pending_seen.take() {
                 let turn = turn_idx;
                 let _ = tokio::task::spawn_blocking(move || {
@@ -3647,7 +3670,7 @@ async fn run_agent_inner(
     opts.tool_context.services.coverage_writer = None;
     // The run leaves its message space (spec F1a §3.1), unless it stays
     // joined between runs (an agentiflow lead's rounds, a session's turns).
-    if let Some(bus) = opts.tool_context.services.message_bus.clone() {
+    if let Some(bus) = opts.tool_context.services.message_space.clone() {
         if bus.leaves_on_exit() {
             let status = match &inner_result {
                 Ok(r) if r.paused => "paused",
@@ -3686,6 +3709,10 @@ struct InjectionLog {
     /// Messages already recorded as received (a standing directive is
     /// delivered every turn, received once).
     received: std::collections::HashSet<String>,
+    /// Messages the run this one continues received but never saw a model
+    /// call for (it stopped first): this run's first call sees them, in the
+    /// conversation it rebuilt.
+    carried_unseen: Vec<String>,
     /// This turn's newly delivered messages, for their receipts once the
     /// model call has seen them.
     pending_seen: Option<(
@@ -3693,6 +3720,28 @@ struct InjectionLog {
         Vec<crate::collector::Delivered>,
         Vec<String>,
     )>,
+}
+
+/// The messages `transcript` received with no model call after them: their
+/// receipts were never written. A missing or unreadable transcript has
+/// none.
+fn unreceipted_messages(transcript: &std::path::Path) -> Vec<String> {
+    let Ok(events) = rupu_transcript::JsonlReader::iter(transcript) else {
+        return Vec::new();
+    };
+    let mut pending = Vec::new();
+    for e in events.flatten() {
+        match e {
+            Event::Message {
+                id,
+                direction: rupu_transcript::MessageDirection::Received,
+                ..
+            } => pending.push(id),
+            Event::Usage { .. } => pending.clear(),
+            _ => {}
+        }
+    }
+    pending
 }
 
 /// Record one delivered injection: a `message { received }` per message it

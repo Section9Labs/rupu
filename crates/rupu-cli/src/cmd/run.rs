@@ -1089,7 +1089,15 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                     rupu_fleet::Bus::open(&dir, participant).with_caps(caps),
                 )),
             ),
-            None => (rupu_runtime::assembly::Origin::Standalone, None),
+            None => {
+                // A continued run keeps the space of the run it continues.
+                if let Some(prior) = args.continue_from.as_deref().filter(|p| !p.starts_with("sub_")) {
+                    if let Err(e) = rupu_runtime::services::messaging::adopt_space(&global, prior, &run_id) {
+                        warn!(error = %e, prior, "could not carry the continued run's message space over");
+                    }
+                }
+                (rupu_runtime::assembly::Origin::Standalone, None)
+            }
         };
         let workspace = rupu_runtime::assembly::WorkspaceBinding {
             id: ws.id.clone(),

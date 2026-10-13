@@ -335,3 +335,65 @@ fn a_prepared_run_joins_on_its_first_write_and_creates_nothing_before() {
     bus.leave("done").unwrap();
     assert!(!bus.roster().unwrap().get("heron").unwrap().live);
 }
+
+#[test]
+fn parent_resolves_by_run_after_a_later_run_takes_the_address() {
+    let tmp = tempfile::tempdir().unwrap();
+    // A session's first turn, its child, then the session's next turn.
+    joined(
+        tmp.path(),
+        "heron",
+        member("assistant", "turn_1", None, None),
+    );
+    let child = joined(
+        tmp.path(),
+        "heron>otter#1",
+        member("helper", "c1", None, Some("turn_1")),
+    );
+    joined(
+        tmp.path(),
+        "heron",
+        member("assistant", "turn_2", None, None),
+    );
+    let r = child.send(&Address::Parent, "done").unwrap();
+    assert_eq!(r.delivery().resolved, vec!["heron".to_string()]);
+}
+
+#[test]
+fn a_legacy_inbox_resolves_after_new_participants_join() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("mailboxes").join("recon-1")).unwrap();
+    let lead = joined(tmp.path(), "lead", member("lead-agent", "af", None, None));
+    let r = lead
+        .send(&Address::parse("recon#1").unwrap(), "hi")
+        .unwrap();
+    assert_eq!(r.delivery().resolved, vec!["recon#1".to_string()]);
+}
+
+#[test]
+fn broadcast_as_a_directive_or_post_address_means_everyone() {
+    let tmp = tempfile::tempdir().unwrap();
+    joined(tmp.path(), "lynx#1", member("recon", "r1", None, None));
+    let lead = joined(tmp.path(), "lead", member("lead-agent", "af", None, None));
+    let d = lead.directive(Some(&Address::Broadcast), "hold").unwrap();
+    assert_eq!(d.message.to, None);
+    assert_eq!(lead.board.read_directives().unwrap()[0].addressed_to, None);
+    let p = lead
+        .post(PostKind::Note, Some(&Address::Broadcast), "hi")
+        .unwrap();
+    assert_eq!(p.message.to, None);
+}
+
+#[test]
+fn a_failed_delivery_after_the_log_line_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    joined(tmp.path(), "lynx#1", member("recon", "r1", None, None));
+    let lead = joined(tmp.path(), "lead", member("lead-agent", "af", None, None));
+    lead.fail_after_log.store(true, Ordering::SeqCst);
+    let err = lead
+        .send(&Address::parse("lynx#1").unwrap(), "x")
+        .unwrap_err();
+    let id = messages(&lead).last().unwrap().id.clone();
+    assert!(err.to_string().contains(&id), "{err}");
+    assert!(err.to_string().contains("don't send it again"), "{err}");
+}

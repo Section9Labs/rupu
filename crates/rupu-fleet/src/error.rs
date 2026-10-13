@@ -26,6 +26,14 @@ pub enum FleetError {
     LogFull { max_bytes: u64 },
     #[error(transparent)]
     Address(#[from] crate::address::AddressError),
+    /// The message is in the log, but delivering it failed partway: some
+    /// recipients may have it. Sending it again would deliver it twice.
+    #[error("message {id} is logged but delivering it failed: {source}; some recipients may already have it, so don't send it again")]
+    PartlyDelivered {
+        id: String,
+        #[source]
+        source: Box<FleetError>,
+    },
     #[error(
         "'{channel}' is a broadcast channel, not a direct inbox; use broadcast_send/read_broadcast"
     )]
