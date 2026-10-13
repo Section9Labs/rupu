@@ -506,7 +506,7 @@ pub fn store(cache: &Path, r: &ShippedSkillRef, bytes: &[u8]) -> Result<PathBuf,
         match std::fs::rename(tmp.path(), &hash_dir) {
             Ok(()) => {
                 // The temp dir is the hash dir now; nothing is left to remove.
-                tmp.keep();
+                let _ = tmp.keep();
                 Ok(())
             }
             Err(e) if hash_dir.exists() => {
