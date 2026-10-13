@@ -492,3 +492,26 @@ fn run_names_where_a_missing_skill_was_looked_for() {
         "{stderr}"
     );
 }
+
+#[test]
+fn validate_names_an_oversized_skill_md() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let dir = home.path().join("skills/huge");
+    fs::create_dir_all(&dir).unwrap();
+    let text = format!(
+        "---\nname: huge\ndescription: d\n---\n{}\n",
+        "x".repeat(1 << 20)
+    );
+    fs::write(dir.join("SKILL.md"), &text).unwrap();
+    let out = rupu(home.path(), cwd.path(), &["skill", "validate", "--all"]);
+    assert_eq!(out.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "SKILL.md is {} bytes; the limit is 1048576 bytes",
+            text.len()
+        )),
+        "{stdout}"
+    );
+}

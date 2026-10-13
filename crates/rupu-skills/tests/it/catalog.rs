@@ -266,3 +266,36 @@ fn a_fifo_skill_md_is_refused_without_opening_it() {
         "{got:?}"
     );
 }
+
+/// A SKILL.md over 1 MiB fails closed with its size: the whole body would
+/// go into a prompt. Large assets beside it are fine.
+#[test]
+fn an_oversized_skill_md_is_invalid() {
+    let t = tempfile::tempdir().unwrap();
+    let d = write_skill(t.path(), "huge", "huge", "d");
+    let text = format!(
+        "---\nname: huge\ndescription: d\n---\n{}\n",
+        "x".repeat(1 << 20)
+    );
+    fs::write(d.join("SKILL.md"), &text).unwrap();
+    fs::write(d.join("scripts/blob.bin"), vec![0u8; 2 << 20]).unwrap();
+    let err = load_skill(&d, Layer::Global).unwrap_err();
+    assert!(
+        matches!(err, SkillError::TooLarge { bytes, limit: 1_048_576 } if bytes == text.len() as u64),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "SKILL.md is {} bytes; the limit is 1048576 bytes",
+            text.len()
+        )
+    );
+
+    let ok = format!(
+        "---\nname: huge\ndescription: d\n---\n{}\n",
+        "x".repeat(1000)
+    );
+    fs::write(d.join("SKILL.md"), ok).unwrap();
+    assert!(load_skill(&d, Layer::Global).is_ok());
+}

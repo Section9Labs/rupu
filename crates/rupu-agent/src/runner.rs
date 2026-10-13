@@ -578,7 +578,7 @@ async fn compact_context(
             let middle_len = outcome.summarized_messages;
             record_compaction_usage(opts, writer, &outcome.usage);
             *messages = outcome.messages;
-            let reattached = reattach_skills(messages, opts);
+            let reattached = reattach_skills(messages, opts).await;
             let post = serde_json::to_value(&*messages).unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "failed to serialize post-compaction messages");
                 serde_json::Value::Null
@@ -635,26 +635,36 @@ async fn compact_context(
 /// this one's order), and the `skill_changed` / `skill_missing` /
 /// `skill_reattach_truncated` notices. A missing skill stays in the loaded
 /// set: reinstalled, it comes back at the next compaction.
-fn reattach_skills(messages: &mut [Message], run: &mut Run) -> Vec<Event> {
+async fn reattach_skills(messages: &mut [Message], run: &mut Run) -> Vec<Event> {
     let Some(skills) = run.tool_context.services.skills.clone() else {
         return Vec::new();
     };
     if run.loaded_skills.is_empty() || messages.is_empty() {
         return Vec::new();
     }
+    // As `skills.load` reads each: from where the run found it, refused
+    // when it moved (its files are outside the run's read roots). Reading
+    // the trees and hashing their files is blocking work.
+    let names: Vec<String> = run.loaded_skills.iter().map(|l| l.name.clone()).collect();
+    let current = tokio::task::spawn_blocking(move || {
+        names
+            .iter()
+            .map(|name| {
+                let g = skills.get(name)?;
+                let skill = rupu_skills::load_skill(&g.skill.dir, g.skill.layer).ok()?;
+                let hash = skill.content_hash().ok()?;
+                (skill.root == g.skill.root).then_some((skill, hash))
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()));
     let cap = run.limits.input.tokens.map_or(32 * 1024, |t| t as usize);
     let mut fresh = Vec::new();
     let mut omitted = Vec::new();
     let mut missing = Vec::new();
     let mut used = 0usize;
-    for (at, loaded) in run.loaded_skills.iter().enumerate().rev() {
-        // As `skills.load` reads it: from where the run found it, refused
-        // when it moved (its files are outside the run's read roots).
-        let current = skills.get(&loaded.name).and_then(|g| {
-            let skill = rupu_skills::load_skill(&g.skill.dir, g.skill.layer).ok()?;
-            let hash = skill.content_hash().ok()?;
-            (skill.root == g.skill.root).then_some((skill, hash))
-        });
+    for (at, (loaded, current)) in run.loaded_skills.iter().zip(current).enumerate().rev() {
         let Some((skill, hash)) = current else {
             missing.push(loaded.name.clone());
             continue;

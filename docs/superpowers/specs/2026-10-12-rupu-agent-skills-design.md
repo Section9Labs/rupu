@@ -382,6 +382,7 @@ Shipping skill content with a dispatch is a later option if this proves painful.
 | Situation | Result |
 |---|---|
 | `skills:` or `preloadSkills:` names an unknown or invalid skill, or an unqualified name in both layers | agent load error with did-you-mean (`rupu agent validate` catches it); the assembler refuses the same at launch |
+| a `SKILL.md` over 1 MiB | the skill is invalid (`SkillError::TooLarge`, with its size): `rupu skill validate` shows it and a run granted it fails closed. The files beside it have no limit |
 | step `skills:` entry malformed | workflow parse error |
 | step `skills:` names a skill not installed | step recorded unstarted, like a missing agent |
 | skill missing on a remote host | unit recorded unstarted, message names the host and the fix |

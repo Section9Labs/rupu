@@ -56,8 +56,18 @@ impl Tool for SkillsLoadTool {
             ))
             .timed(started));
         };
-        let fresh = match rupu_skills::load_skill(&granted.skill.dir, granted.skill.layer) {
-            Ok(s) => s,
+        // Reading the tree and hashing every file is blocking work.
+        let (dir, layer) = (granted.skill.dir.clone(), granted.skill.layer);
+        let loaded = tokio::task::spawn_blocking(move || {
+            rupu_skills::load_skill(&dir, layer).map(|s| {
+                let hash = s.content_hash();
+                (s, hash)
+            })
+        })
+        .await
+        .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()));
+        let (fresh, hash) = match loaded {
+            Ok(l) => l,
             Err(e) => {
                 return Ok(
                     failed(format!("skill {name:?} can no longer be loaded: {e}")).timed(started),
@@ -72,7 +82,7 @@ impl Tool for SkillsLoadTool {
             ))
             .timed(started));
         }
-        let hash = match fresh.content_hash() {
+        let hash = match hash {
             Ok(h) => h,
             Err(e) => {
                 return Ok(

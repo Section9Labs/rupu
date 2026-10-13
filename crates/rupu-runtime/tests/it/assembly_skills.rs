@@ -988,3 +988,34 @@ async fn a_workflow_step_run_gets_its_agents_skills() {
     assert!(offered(&evs).iter().any(|e| e.tool == "skills.load"));
     assert_eq!(skill_index(&evs)[0].reason, "agent");
 }
+
+/// A run granted a skill whose SKILL.md is over the size limit fails
+/// closed, with the reason.
+#[tokio::test]
+#[serial]
+async fn an_oversized_skill_fails_assembly_with_its_size() {
+    let home = Home::new();
+    let dir = home.skill("huge", "d.", "x");
+    let text = format!(
+        "---\nname: huge\ndescription: d.\n---\n{}\n",
+        "x".repeat(1 << 20)
+    );
+    std::fs::write(dir.join("SKILL.md"), &text).unwrap();
+    let spec = agent(
+        &home,
+        "provider: anthropic\nmodel: claude-sonnet-4-6\nskills: [huge]",
+    );
+    let l = launch(&home, spec, Origin::Standalone, "run_huge");
+    match home.assembler(config()).assemble(l).await {
+        Err(e @ AssembleError::Skills { .. }) => assert_eq!(
+            e.to_string(),
+            format!(
+                "skills: skill \"huge\" (global) is invalid: SKILL.md is {} bytes; \
+                 the limit is 1048576 bytes",
+                text.len()
+            )
+        ),
+        Err(other) => panic!("{other}"),
+        Ok(_) => panic!("assembled a run with an oversized skill"),
+    }
+}

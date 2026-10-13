@@ -4,6 +4,7 @@ use crate::frontmatter::{parse_skill_md, Frontmatter, FrontmatterError};
 use crate::name::{NameError, SkillName};
 use crate::tree::{self, ContentHash, Stamp, TreeEntry, TreeError};
 use serde::Serialize;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -55,6 +56,11 @@ impl Skill {
     }
 }
 
+/// The largest SKILL.md a skill may have. Its body goes whole into a
+/// prompt (a preload, `skills.load`, a re-attach), so a bigger one is
+/// refused rather than read. The files beside it have no limit.
+pub const MAX_SKILL_MD_BYTES: u64 = 1 << 20;
+
 #[derive(Debug, thiserror::Error)]
 pub enum SkillError {
     #[error("no SKILL.md in {0}")]
@@ -64,6 +70,8 @@ pub enum SkillError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("SKILL.md is {bytes} bytes; the limit is {limit} bytes")]
+    TooLarge { bytes: u64, limit: u64 },
     #[error("SKILL.md: {0}")]
     Frontmatter(#[from] FrontmatterError),
     #[error("name {name:?}: {source}")]
@@ -111,7 +119,12 @@ pub fn load_skill(dir: &Path, layer: Layer) -> Result<Skill, SkillError> {
     };
     // Opening a FIFO blocks until a writer appears; refuse anything but a
     // regular file before opening it.
+    let too_large = |bytes| SkillError::TooLarge {
+        bytes,
+        limit: MAX_SKILL_MD_BYTES,
+    };
     match std::fs::metadata(&md_path) {
+        Ok(m) if m.is_file() && m.len() > MAX_SKILL_MD_BYTES => return Err(too_large(m.len())),
         Ok(m) if m.is_file() => {}
         Ok(_) => {
             return Err(TreeError::NotRegular {
@@ -124,7 +137,14 @@ pub fn load_skill(dir: &Path, layer: Layer) -> Result<Skill, SkillError> {
         }
         Err(source) => return Err(md_io(source)),
     }
-    let text = std::fs::read_to_string(&md_path).map_err(md_io)?;
+    // At most one byte over the limit, in case the file grew since.
+    let mut text = String::new();
+    std::fs::File::open(&md_path)
+        .and_then(|f| f.take(MAX_SKILL_MD_BYTES + 1).read_to_string(&mut text))
+        .map_err(md_io)?;
+    if text.len() as u64 > MAX_SKILL_MD_BYTES {
+        return Err(too_large(text.len() as u64));
+    }
     let (frontmatter, body) = parse_skill_md(&text)?;
     let name: SkillName = frontmatter
         .name
