@@ -10,6 +10,7 @@ pub mod git;
 pub mod grant;
 pub mod install;
 pub mod name;
+pub mod pinned;
 pub mod record;
 pub mod render;
 pub mod run;
@@ -29,6 +30,7 @@ pub use grant::{
     SkillGrant,
 };
 pub use name::{NameError, SkillName, MAX_NAME_LEN};
+pub use pinned::{install_pins, KeptReason, Pin, PinOutcome, PinReport};
 pub use run::{
     resolve_frozen, resolve_operator, resolve_run_skills, FrozenSkill, GrantedSkill, MissingReason,
     MissingSkill, ResolvedSkills, RunSkillsError, SkillReason, SkillRequest,

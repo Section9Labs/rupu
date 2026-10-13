@@ -482,6 +482,17 @@ pub fn list_source(
     Ok(found)
 }
 
+/// Where an installed skill sits in its git source, for its record: the
+/// source's `#path` joined with the skill's place under it.
+pub(crate) fn record_path_of(base: Option<&str>, rel: &str) -> Option<String> {
+    match (base, rel) {
+        (Some(p), "") => Some(p.to_owned()),
+        (Some(p), r) => Some(format!("{p}/{r}")),
+        (None, "") => None,
+        (None, r) => Some(r.to_owned()),
+    }
+}
+
 pub fn install_from(
     spec: &InstallSpec<'_>,
     fetcher: &dyn crate::source::Fetch,
@@ -495,15 +506,12 @@ pub fn install_from(
     }
     let mut record = |inst: &Installed| {
         let (url, git_ref, path, local) = match spec.source {
-            Source::Git(g) => {
-                let joined = match (&g.path, inst.rel.as_str()) {
-                    (Some(p), "") => Some(p.clone()),
-                    (Some(p), r) => Some(format!("{p}/{r}")),
-                    (None, "") => None,
-                    (None, r) => Some(r.to_owned()),
-                };
-                (Some(g.url.clone()), g.git_ref.clone(), joined, None)
-            }
+            Source::Git(g) => (
+                Some(g.url.clone()),
+                g.git_ref.clone(),
+                record_path_of(g.path.as_deref(), &inst.rel),
+                None,
+            ),
             Source::Local(root) => {
                 let dir = if inst.rel.is_empty() {
                     root.clone()
