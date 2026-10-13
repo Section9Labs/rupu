@@ -394,6 +394,16 @@ struct SessionTurnRequest {
 
 impl SessionTurnRequest {
     const VERSION: u32 = 1;
+
+    /// The turn the worker runs for this request.
+    fn turn_args(&self, session_id: &str) -> RunTurnArgs {
+        RunTurnArgs {
+            session_id: session_id.to_owned(),
+            run_id: self.run_id.clone(),
+            prompt: self.prompt.clone(),
+            operator_skills: self.operator_skills.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -7482,13 +7492,7 @@ async fn run_worker(args: RunWorkerArgs) -> anyhow::Result<()> {
             let result = if request.compact {
                 run_compact_request(&global, scope, &args.session_id, &request).await
             } else {
-                run_turn(RunTurnArgs {
-                    session_id: args.session_id.clone(),
-                    run_id: request.run_id.clone(),
-                    prompt: request.prompt.clone(),
-                    operator_skills: request.operator_skills.clone(),
-                })
-                .await
+                run_turn(request.turn_args(&args.session_id)).await
             };
             let _ = fs::remove_file(&claimed_path);
 
@@ -8116,13 +8120,6 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
     // customer.
     session.customer = Some(turn_customer.clone());
     persist_session_customer(&global, &args.session_id, &session.customer)?;
-    // The skills the operator invoked join the session's frozen set before
-    // this turn thaws it, so its `skills.load` and read roots cover them
-    // (spec 2026-10-12 §5.2). The skills section is never re-rendered.
-    if !args.operator_skills.is_empty() {
-        session.skill_index =
-            persist_operator_skills(&global, &args.session_id, &args.operator_skills)?;
-    }
 
     paths::ensure_dir(&session.transcripts_dir)?;
     let transcript_path = session
@@ -8187,36 +8184,57 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             },
         ));
         let agent = session_agent_spec(&global, &session)?;
-        // The session's frozen skills as installed now; one that can't be
-        // given is reported and the turn runs without it. The skills section
-        // is the one `session start` rendered, never re-rendered. Skills
-        // directories that can't be read fail the turn as a failed assembly
-        // would, below.
-        let (skills, missing_skills, skills_failure) =
-            match assembler.resolve_frozen_skills(&session.skill_index).await {
+        // The session's frozen skills as installed now, joined by the skills
+        // the operator invoked in this turn (spec 2026-10-12 §5.2); one that
+        // can't be given is reported and the turn runs without it. The skills
+        // section is the one `session start` rendered, never re-rendered.
+        // `refusal` fails the turn as a failed assembly would, below: skills
+        // directories that can't be read, an invoked name the session holds
+        // from the other layer, or nothing to send.
+        let frozen: Vec<rupu_skills::FrozenSkill> = session
+            .skill_index
+            .iter()
+            .chain(args.operator_skills.iter().filter(|f| {
+                !session
+                    .skill_index
+                    .iter()
+                    .any(|h| h.name == f.name && h.layer == f.layer)
+            }))
+            .cloned()
+            .collect();
+        let (skills, missing_skills, mut refusal) =
+            match assembler.resolve_frozen_skills(&frozen).await {
                 Ok((skills, missing)) => (skills, missing, None),
-                Err(e) => (None, Vec::new(), Some(e)),
+                Err(e) => (None, Vec::new(), Some(e.to_string())),
             };
-        let (message, operator_loads) =
-            if args.operator_skills.is_empty() || skills_failure.is_some() {
-                (args.prompt.clone(), Vec::new())
-            } else {
-                let (skills, invoked, prompt) = (
-                    skills.clone(),
-                    args.operator_skills.clone(),
-                    args.prompt.clone(),
-                );
-                let turn = tokio::task::spawn_blocking(move || {
-                    rupu_agent::operator_turn(skills.as_deref(), &invoked, &prompt)
-                })
-                .await
-                .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))?;
-                anyhow::ensure!(
-                    !turn.0.is_empty(),
-                    "the skills this turn invoked are no longer installed, and it has no prompt"
-                );
-                turn
-            };
+        if refusal.is_none() && !args.operator_skills.is_empty() {
+            if let Err(conflict) = persist_operator_skills(
+                &global,
+                &args.session_id,
+                &args.operator_skills,
+                skills.as_deref(),
+            )? {
+                refusal = Some(format!("skills: {conflict}"));
+            }
+        }
+        let (message, operator_loads) = if args.operator_skills.is_empty() || refusal.is_some() {
+            (args.prompt.clone(), Vec::new())
+        } else {
+            let (skills, invoked, prompt) = (
+                skills.clone(),
+                args.operator_skills.clone(),
+                args.prompt.clone(),
+            );
+            let turn = tokio::task::spawn_blocking(move || {
+                rupu_agent::operator_turn(skills.as_deref(), &invoked, &prompt)
+            })
+            .await
+            .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))?;
+            if turn.0.is_empty() {
+                refusal = Some(nothing_to_send(&args.operator_skills, &missing_skills));
+            }
+            turn
+        };
         // The session's limits: the value stored by an earlier turn
         // (including any limit learned from an overflow error), else resolved
         // now — the first turn — through this turn's provider (spec
@@ -8388,24 +8406,27 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             final_limits,
             messages: exit_messages,
             loaded_skills,
-        } = match skills_failure {
-            Some(e) => {
+        } = match refusal {
+            Some(refusal) => {
                 let (provider, model) = assembler.provider_model_of(&launch);
-                let error = e.record_unstarted(rupu_agent::UnstartedRun {
-                    transcript_path: &launch.transcript_path,
-                    run_id: &launch.run_id,
-                    workspace_id: &launch.workspace.id,
-                    agent: &launch.agent.name,
-                    provider: &provider,
-                    model: &model,
-                    mode,
-                    codename: launch.codename.as_deref(),
-                    customer: turn_customer.as_deref(),
-                    system_prompt: Some(&launch.agent.system_prompt),
-                    prompt: &launch.prompt,
-                    launch_skills: &[],
-                    launch_preload_skills: &[],
-                });
+                let error = rupu_agent::record_unstarted_run(
+                    rupu_agent::UnstartedRun {
+                        transcript_path: &launch.transcript_path,
+                        run_id: &launch.run_id,
+                        workspace_id: &launch.workspace.id,
+                        agent: &launch.agent.name,
+                        provider: &provider,
+                        model: &model,
+                        mode,
+                        codename: launch.codename.as_deref(),
+                        customer: turn_customer.as_deref(),
+                        system_prompt: Some(&launch.agent.system_prompt),
+                        prompt: &launch.prompt,
+                        launch_skills: &[],
+                        launch_preload_skills: &[],
+                    },
+                    rupu_providers::ProviderError::Preflight(refusal),
+                );
                 rupu_agent::RunExit {
                     result: Err(error),
                     final_limits: session
@@ -8706,24 +8727,47 @@ fn session_record_path(global: &Path, scope: SessionScope, session_id: &str) -> 
     session_dir(global, scope, session_id).join("session.json")
 }
 
-/// Write `customer` onto `session_id`'s record before a turn or compaction
-/// runs: re-read first so a concurrent write is not clobbered (the request's
-/// finalize follows the same rule), and write only when it changed.
-/// Appends the operator's invocations to the session's frozen set (one the
-/// set holds already, in the same layer, is skipped) and writes the record;
-/// returns the set.
+/// Appends to `session_id`'s frozen set the operator's invocations this
+/// turn gives (`given`, the turn's set), so later turns may load them and
+/// read their files; one the set holds already, in the same layer, is
+/// skipped, and one that no longer loads is left out, reported by this turn
+/// only. Re-reads the record first so a concurrent write is not clobbered.
+///
+/// The inner error refuses the turn, the record unchanged: the set holds an
+/// invoked name from the other layer, which two queued sends can each pass
+/// at send time, and a session never binds one name from both layers.
 fn persist_operator_skills(
     global: &Path,
     session_id: &str,
     invoked: &[rupu_skills::FrozenSkill],
-) -> anyhow::Result<Vec<rupu_skills::FrozenSkill>> {
+    given: Option<&rupu_skills::ResolvedSkills>,
+) -> anyhow::Result<Result<(), rupu_skills::RunSkillsError>> {
+    let gives = |name: &str, layer: rupu_skills::Layer| {
+        given
+            .and_then(|s| s.get(name))
+            .is_some_and(|g| g.skill.layer == layer)
+    };
     let (mut current, scope) = read_session(global, session_id)?;
-    let held = current.skill_index.len();
     for f in invoked {
-        if !current
+        if let Some(h) = current
             .skill_index
             .iter()
-            .any(|h| h.name == f.name && h.layer == f.layer)
+            .find(|h| h.name == f.name && h.layer != f.layer)
+        {
+            return Ok(Err(rupu_skills::RunSkillsError::HeldInOtherLayer {
+                name: f.name.clone(),
+                held: h.layer,
+                held_installed: gives(&h.name, h.layer),
+            }));
+        }
+    }
+    let held = current.skill_index.len();
+    for f in invoked {
+        if gives(&f.name, f.layer)
+            && !current
+                .skill_index
+                .iter()
+                .any(|h| h.name == f.name && h.layer == f.layer)
         {
             current.skill_index.push(f.clone());
         }
@@ -8731,9 +8775,33 @@ fn persist_operator_skills(
     if current.skill_index.len() != held {
         write_session(global, scope, &current)?;
     }
-    Ok(current.skill_index)
+    Ok(Ok(()))
 }
 
+/// Why a turn that invoked skills and has no prompt has nothing to send:
+/// each invoked skill the turn can't give, and why.
+fn nothing_to_send(
+    invoked: &[rupu_skills::FrozenSkill],
+    missing: &[rupu_skills::MissingSkill],
+) -> String {
+    let causes: Vec<String> = missing
+        .iter()
+        .filter(|m| {
+            invoked
+                .iter()
+                .any(|f| f.name == m.name && f.layer == m.layer)
+        })
+        .map(|m| format!("{} ({}): {}", m.name, m.layer.as_str(), m.reason))
+        .collect();
+    format!(
+        "this turn has no prompt, and none of the skills it invoked can be given: {}",
+        causes.join("; ")
+    )
+}
+
+/// Write `customer` onto `session_id`'s record before a turn or compaction
+/// runs: re-read first so a concurrent write is not clobbered (the request's
+/// finalize follows the same rule), and write only when it changed.
 fn persist_session_customer(
     global: &Path,
     session_id: &str,

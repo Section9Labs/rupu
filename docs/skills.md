@@ -342,6 +342,13 @@ is part of the session with reason `operator`: the model may load it again
 with `skills.load` and read its files. It is never added to the index, so the
 system prompt does not change.
 
+Sends can queue behind a running turn, so a turn checks its skills again when
+it runs. A skill removed since it was sent gets one `skill_missing` notice in
+that turn and is not added to the session. A turn fails, with a transcript
+that says why, when an earlier queued turn gave the session the same name
+from the other layer, or when it has no prompt and none of its skills can be
+given.
+
 The skills the model loaded survive turns and compaction. The session keeps
 its loaded set from turn to turn, and every compaction puts those skills back
 at their current version: the runner's own compaction during a turn,

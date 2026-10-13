@@ -919,6 +919,219 @@ async fn send_skill_refuses_wildcards_and_ambiguous_names() {
     assert_eq!(names, vec![("pdf", rupu_skills::Layer::Global)]);
 }
 
+/// The error a turn's transcript closed on.
+fn closing_error(evs: &[TranscriptEvent]) -> Option<String> {
+    evs.iter()
+        .find_map(|e| match e {
+            TranscriptEvent::RunComplete { status, error, .. } => Some((*status, error.clone())),
+            _ => None,
+        })
+        .filter(|(status, _)| *status == RunStatus::Error)
+        .and_then(|(_, error)| error)
+}
+
+fn held(record: &SessionRecord) -> Vec<(&str, rupu_skills::Layer)> {
+    record
+        .skill_index
+        .iter()
+        .map(|f| (f.name.as_str(), f.layer))
+        .collect()
+}
+
+/// Two sends queued before either turn runs both pass the send-time check,
+/// since the set gains a skill only when its turn runs. The second turn,
+/// which names the first one's skill from the other layer, fails with a
+/// transcript and leaves the set as the first turn left it, so no later
+/// turn inherits a name bound from both layers.
+#[tokio::test]
+async fn queued_sends_of_one_name_from_both_layers_fail_the_second_turn() {
+    let _guard = crate::test_support::ENV_LOCK.lock().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let project = tmp.path().join("project");
+    install_skill(&tmp.path().join("global"), "pdf", "GLOBAL PDF");
+    install_skill(&project.join(".rupu"), "pdf", "PROJECT PDF");
+    let (global, mut record) = skill_session(&tmp, "ses_skills_race01", &agent(""), &[], &[]).await;
+    record.project_root = Some(project);
+    write_session(&global, SessionScope::Active, &record).unwrap();
+    let id = record.session_id.clone();
+
+    let first = invoke(&global, &id, &["global:pdf"]).await.unwrap();
+    let second = invoke(&global, &id, &["project:pdf"]).await.unwrap();
+    operator_turn(&global, &id, "run_race_1", "one", first).await;
+    let evs = operator_turn(&global, &id, "run_race_2", "two", second).await;
+
+    let conflict = "skills: this session already has global:pdf; invoke global:pdf";
+    assert_eq!(closing_error(&evs).as_deref(), Some(conflict));
+    let (after, _) = read_session(&global, &id).unwrap();
+    assert_eq!(after.status, SessionStatus::Failed);
+    assert_eq!(after.last_error.as_deref(), Some(conflict));
+    assert_eq!(held(&after), vec![("pdf", rupu_skills::Layer::Global)]);
+
+    let next = turn(&global, &id, "run_race_3", ACK).await;
+    assert_eq!(notices(&next, "skill_missing"), Vec::<String>::new());
+}
+
+/// A skill removed between its send and its turn is reported by that turn
+/// once and is never frozen into the set, so no later turn reports it.
+#[tokio::test]
+async fn a_skill_removed_since_send_is_reported_once_and_not_frozen() {
+    let _guard = crate::test_support::ENV_LOCK.lock().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let pdf = install_skill(&tmp.path().join("global"), "pdf", "PDF STEPS");
+    let (global, record) = skill_session(&tmp, "ses_skills_gone01", &agent(""), &[], &[]).await;
+    let id = record.session_id.clone();
+
+    let invoked = invoke(&global, &id, &["pdf"]).await.unwrap();
+    fs::remove_dir_all(&pdf).unwrap();
+    let evs = operator_turn(&global, &id, "run_gone_1", "hi", invoked).await;
+    assert_eq!(
+        notices(&evs, "skill_missing"),
+        vec!["skill pdf (global) is not available to this run: removed".to_string()]
+    );
+    assert_eq!(user_message(&evs), "hi");
+    let (after, _) = read_session(&global, &id).unwrap();
+    assert_eq!(after.status, SessionStatus::Idle, "{:?}", after.last_error);
+    assert_eq!(held(&after), Vec::new());
+
+    let next = turn(&global, &id, "run_gone_2", ACK).await;
+    assert_eq!(notices(&next, "skill_missing"), Vec::<String>::new());
+}
+
+/// A turn with no prompt whose invoked skills all can't be given has
+/// nothing to send: it fails with a transcript naming why each can't be.
+#[tokio::test]
+async fn a_turn_with_no_prompt_and_no_skill_to_give_fails_with_a_transcript() {
+    let _guard = crate::test_support::ENV_LOCK.lock().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let pdf = install_skill(&tmp.path().join("global"), "pdf", "PDF STEPS");
+    let notes = install_skill(&tmp.path().join("global"), "notes", "NOTE STEPS");
+    let (global, record) = skill_session(&tmp, "ses_skills_empty01", &agent(""), &[], &[]).await;
+    let id = record.session_id.clone();
+
+    let invoked = invoke(&global, &id, &["pdf", "notes"]).await.unwrap();
+    fs::remove_dir_all(&pdf).unwrap();
+    fs::write(notes.join("SKILL.md"), "no frontmatter\n").unwrap();
+    let evs = operator_turn(&global, &id, "run_empty_1", "", invoked).await;
+
+    let error = closing_error(&evs).expect("the transcript closes on the failure");
+    assert!(
+        error.starts_with(
+            "this turn has no prompt, and none of the skills it invoked can be given: \
+             pdf (global): removed; notes (global): invalid: "
+        ),
+        "{error}"
+    );
+    let (after, _) = read_session(&global, &id).unwrap();
+    assert_eq!(after.status, SessionStatus::Failed);
+    assert_eq!(after.last_error.as_deref(), Some(error.as_str()));
+    assert_eq!(held(&after), Vec::new());
+}
+
+/// `session send --detach --skill` queues the turn with the skills it
+/// resolved, for the worker to run it with.
+#[tokio::test]
+async fn send_skill_queues_the_resolved_skills_for_the_worker() {
+    let _guard = crate::test_support::ENV_LOCK.lock().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let pdf_dir = install_skill(&tmp.path().join("global"), "pdf", "PDF STEPS");
+    let (global, mut record) =
+        skill_session(&tmp, "ses_skills_queue01", &agent(""), &[], &[]).await;
+    let mut worker = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    record.worker_pid = Some(worker.id());
+    record.worker_binary_mtime = current_binary_mtime();
+    write_session(&global, SessionScope::Active, &record).unwrap();
+
+    let sent = with_mock_home(
+        &global,
+        ACK,
+        send(SendArgs {
+            session_id: record.session_id.clone(),
+            prompt: None,
+            skills: vec!["pdf".into()],
+            detach: true,
+            view: None,
+        }),
+    )
+    .await;
+    let _ = worker.kill();
+    let _ = worker.wait();
+    sent.expect("the turn is queued");
+
+    let queue = session_turn_queue_dir(&global, SessionScope::Active, &record.session_id);
+    let requests: Vec<serde_json::Value> = fs::read_dir(&queue)
+        .unwrap()
+        .map(|e| serde_json::from_slice(&fs::read(e.unwrap().path()).unwrap()).unwrap())
+        .collect();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    let pdf = rupu_skills::load_skill(&pdf_dir, rupu_skills::Layer::Global).unwrap();
+    assert_eq!(requests[0]["prompt"], json!(""));
+    assert_eq!(
+        requests[0]["operator_skills"],
+        json!([{
+            "name": "pdf",
+            "layer": "global",
+            "preload": false,
+            "indexed": false,
+            "reason": "operator",
+            "stamp": pdf.stamp.hex(),
+        }])
+    );
+}
+
+fn queued_request(extra: serde_json::Value) -> SessionTurnRequest {
+    let mut request = json!({
+        "version": 1,
+        "request_id": "01KTEST0000000000000000001",
+        "run_id": "run_queued_1",
+        "prompt": "hi",
+        "transcript_path": "/sessions/ses_q/transcripts/run_queued_1.jsonl",
+        "enqueued_at": "2026-10-01T00:00:00Z",
+    });
+    request
+        .as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    serde_json::from_value(request).unwrap()
+}
+
+/// A request queued by a rupu that predates `--skill` still reads, as a
+/// turn that invoked nothing.
+#[test]
+fn a_queued_request_without_operator_skills_reads_as_invoking_none() {
+    let request = queued_request(json!({}));
+    assert_eq!(request.operator_skills, Vec::new());
+    let args = request.turn_args("ses_q");
+    assert_eq!(args.operator_skills, Vec::new());
+}
+
+/// The worker runs a queued request's turn with the skills it carries.
+#[test]
+fn the_worker_runs_a_queued_turn_with_its_invoked_skills() {
+    let pdf = rupu_skills::FrozenSkill {
+        name: "pdf".into(),
+        layer: rupu_skills::Layer::Project,
+        preload: false,
+        indexed: false,
+        reason: rupu_skills::SkillReason::Operator,
+        stamp: "ab".repeat(32),
+        content_hash: None,
+    };
+    let request = queued_request(json!({ "operator_skills": [pdf] }));
+    let args = request.turn_args("ses_q");
+    assert_eq!(
+        (
+            args.session_id.as_str(),
+            args.run_id.as_str(),
+            args.prompt.as_str()
+        ),
+        ("ses_q", "run_queued_1", "hi")
+    );
+    assert_eq!(args.operator_skills, vec![pdf]);
+}
+
 const SUMMARY: &str = r#"[{ "AssistantText": { "text": "Summary of prior work.", "stop": "end_turn", "input_tokens": 500, "output_tokens": 10 } }]"#;
 
 fn dense_history(len: usize) -> Vec<Message> {

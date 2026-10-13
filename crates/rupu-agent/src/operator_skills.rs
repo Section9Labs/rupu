@@ -9,8 +9,8 @@ use rupu_skills::{FrozenSkill, ResolvedSkills, TreeError};
 /// The turn's message, `invoked`'s skills injected ahead of `prompt` (an
 /// empty prompt adds nothing), and the loads that record them. Each skill
 /// is taken from `skills`, the turn's set, at its current version; one the
-/// set can't give (it holds every invoked entry the session froze unless
-/// that skill is gone) is left out, since the turn reports it missing.
+/// set can't give (it no longer loads) is left out, since the turn reports
+/// it missing.
 ///
 /// Hashes each skill's files: blocking work an async caller runs on
 /// `spawn_blocking`.
