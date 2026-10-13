@@ -227,3 +227,26 @@ fn check_agent_files_reports_skill_errors() {
         Some(AgentLoadError::Skill { .. })
     ));
 }
+
+#[test]
+fn load_agent_in_accepts_a_skill_that_exists_only_in_the_overlay() {
+    let g = tempfile::tempdir().unwrap();
+    let shipped = tempfile::tempdir().unwrap();
+    skill(shipped.path(), "pdf");
+    agent(g.path(), "skills: [pdf]\n");
+    let overlay = vec![rupu_skills::OverlaySkill {
+        layer: rupu_skills::Layer::Global,
+        name: "pdf".into(),
+        dir: shipped.path().join("pdf"),
+    }];
+    assert!(matches!(
+        load_agent(g.path(), None, "a"),
+        Err(AgentLoadError::Skill { .. })
+    ));
+    assert_eq!(
+        rupu_agent::load_agent_in(g.path(), None, "a", &overlay)
+            .unwrap()
+            .skills,
+        Some(vec!["pdf".into()])
+    );
+}

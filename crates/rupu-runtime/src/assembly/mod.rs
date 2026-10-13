@@ -533,7 +533,8 @@ impl RunAssembler {
                 .as_ref()
                 .map(|p| p.join(".rupu"))
                 .as_deref(),
-        );
+        )
+        .with_overlay(overrides.skill_overlay.clone());
         resolve_agent_skills(&dirs, agent, overrides, rupu_skills::SkillReason::Launch).await
     }
 
@@ -1133,12 +1134,28 @@ pub async fn resolve_agent_skills(
     {
         return Ok(None);
     }
-    let requests = Arc::new([
-        (rupu_skills::SkillReason::Agent, agent_grants, agent_preload),
-        (launch_reason, o.skills.clone(), o.preload_skills.clone()),
-    ]);
-    let resolved = rupu_agent::fd_budget::retry_on_fd_exhaustion(
+    resolve_skill_requests(
+        dirs,
         &agent.name,
+        vec![
+            (rupu_skills::SkillReason::Agent, agent_grants, agent_preload),
+            (launch_reason, o.skills.clone(), o.preload_skills.clone()),
+        ],
+    )
+    .await
+}
+
+/// Resolve `requests` (reason, grants, preload) in one pass against `dirs`
+/// on the blocking pool, retrying an fd exhaustion under `label`. `None`
+/// when nothing resolved.
+pub async fn resolve_skill_requests(
+    dirs: &rupu_skills::LayerDirs,
+    label: &str,
+    requests: Vec<(rupu_skills::SkillReason, Vec<String>, Vec<String>)>,
+) -> Result<Option<Arc<rupu_skills::ResolvedSkills>>, AssembleError> {
+    let requests = Arc::new(requests);
+    let resolved = rupu_agent::fd_budget::retry_on_fd_exhaustion(
+        label,
         &rupu_agent::fd_budget::Policy::default(),
         rupu_agent::fd_budget::grow,
         || {

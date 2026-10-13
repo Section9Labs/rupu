@@ -33,6 +33,12 @@ describe('skillIndexLine (port of rupu_transcript::skills::skill_index_line)', (
     expect(skillIndexLine([e('a', false, true)])).toBe('1 skill: a');
     expect(skillIndexLine([])).toBe('0 skills');
   });
+  it('marks shipped skills', () => {
+    const s = (preload: boolean, indexed: boolean) => ({ name: 'pdf', preload, indexed, shipped: true });
+    expect(skillIndexLine([s(false, true)])).toBe('1 skill: pdf (shipped)');
+    expect(skillIndexLine([s(true, false)])).toBe('1 skill: pdf (preloaded, shipped)');
+    expect(skillIndexLine([s(false, false)])).toBe('1 skill: pdf (not indexed, shipped)');
+  });
 });
 
 describe('skillLoadLine (port of rupu_transcript::skills::skill_load_line)', () => {

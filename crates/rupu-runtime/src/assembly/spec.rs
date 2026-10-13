@@ -63,6 +63,9 @@ pub struct Overrides {
     /// Appended to the agent's system prompt under `## Run target`.
     pub system_prompt_suffix: Option<String>,
     pub max_turns: Option<u32>,
+    /// A placed unit's shipped skills: they stand in for the installed
+    /// skills of the same layer and name.
+    pub skill_overlay: Vec<rupu_skills::OverlaySkill>,
     /// `--findings-profile` / a step's `findings_profile:`; wins over
     /// `findings_default` and the agent's own.
     pub findings_profile: Option<rupu_coverage::FindingProfile>,

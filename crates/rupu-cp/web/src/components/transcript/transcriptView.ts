@@ -552,6 +552,7 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
               name: asString(e.name) ?? '',
               preload: e.preload === true,
               indexed: e.indexed === true,
+              shipped: e.shipped === true,
             })),
           ),
         });

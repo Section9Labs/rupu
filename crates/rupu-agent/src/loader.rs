@@ -140,13 +140,24 @@ pub fn load_agent(
     project: Option<&Path>,
     name: &str,
 ) -> Result<AgentSpec, AgentLoadError> {
+    load_agent_in(global, project, name, &[])
+}
+
+/// [`load_agent`] where the skills `overlay` (a placed unit's shipped
+/// skills) stand in for the installed ones of the same layer and name.
+pub fn load_agent_in(
+    global: &Path,
+    project: Option<&Path>,
+    name: &str,
+    overlay: &[rupu_skills::OverlaySkill],
+) -> Result<AgentSpec, AgentLoadError> {
     let spec = find_agent(global, project, name)?;
     spec.validate_tools()
         .map_err(|source| AgentLoadError::UnknownTool {
             agent: spec.name.clone(),
             source,
         })?;
-    let dirs = rupu_skills::LayerDirs::for_layers(global, project);
+    let dirs = rupu_skills::LayerDirs::for_layers(global, project).with_overlay(overlay.to_vec());
     check_skills(&spec, &dirs, &mut None, SkillCheck::Names)?;
     Ok(spec)
 }
