@@ -39,7 +39,19 @@ pub enum RecordError {
         path: PathBuf,
         source: serde_json::Error,
     },
+    #[error("{path}: not a regular file")]
+    NotAFile { path: PathBuf },
+    #[error("{path}: the record is over {limit} bytes")]
+    TooLarge { path: PathBuf, limit: u64 },
+    /// The record of a skill in a symlinked project `skills/`, which is not
+    /// read: the link points outside the repository.
+    #[error("the project skills directory may not be a symlink")]
+    LinkedRoot,
 }
+
+/// The most of a record file [`read_record`] reads; a record is a few
+/// hundred bytes.
+pub const MAX_RECORD_BYTES: u64 = 64 * 1024;
 
 pub fn record_path(skills_dir: &Path, name: &str) -> PathBuf {
     skills_dir.join(".sources").join(format!("{name}.json"))
@@ -56,13 +68,31 @@ pub fn write_record(skills_dir: &Path, name: &str, rec: &SourceRecord) -> std::i
     std::fs::rename(&tmp, &path)
 }
 
+/// The record of skill `name` in `skills_dir`, if it has one. Reads a
+/// regular file of at most [`MAX_RECORD_BYTES`].
 pub fn read_record(skills_dir: &Path, name: &str) -> Result<Option<SourceRecord>, RecordError> {
+    use std::io::Read as _;
     let path = record_path(skills_dir, name);
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(RecordError::Io { path, source }),
+    let io = |source| RecordError::Io {
+        path: path.clone(),
+        source,
     };
+    match std::fs::metadata(&path) {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => return Err(RecordError::NotAFile { path }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(io(source)),
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(&path)
+        .and_then(|f| f.take(MAX_RECORD_BYTES + 1).read_to_end(&mut bytes))
+        .map_err(io)?;
+    if bytes.len() as u64 > MAX_RECORD_BYTES {
+        return Err(RecordError::TooLarge {
+            path,
+            limit: MAX_RECORD_BYTES,
+        });
+    }
     serde_json::from_slice(&bytes)
         .map(Some)
         .map_err(|source| RecordError::Json { path, source })

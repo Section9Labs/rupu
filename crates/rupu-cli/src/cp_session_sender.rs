@@ -41,6 +41,20 @@ fn session_send_argv(req: &SendMessageRequest) -> RunArgv {
     })
 }
 
+/// A failed `rupu` child's message for an API error body: its stderr,
+/// trimmed, without the `[error] ` label `output::diag::fail` gives it, or
+/// `fallback` when it printed nothing.
+pub(crate) fn cli_failure(stderr: &[u8], fallback: &str) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let text = text.trim();
+    let text = text.strip_prefix("[error] ").unwrap_or(text).trim_start();
+    if text.is_empty() {
+        fallback.to_string()
+    } else {
+        text.to_string()
+    }
+}
+
 #[async_trait::async_trait]
 impl SessionSender for SubprocessSessionSender {
     async fn send(&self, req: SendMessageRequest) -> Result<String, SendError> {
@@ -57,12 +71,7 @@ impl SessionSender for SubprocessSessionSender {
             .map_err(|e| SendError::Spawn(e.to_string()))?;
 
         if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            let msg = if stderr.is_empty() {
-                "session send failed".to_string()
-            } else {
-                stderr
-            };
+            let msg = cli_failure(&out.stderr, "session send failed");
             // Exit 1 is the command refusing the request (an unknown or
             // ambiguous skill, a stopped session): the caller's to fix.
             return Err(if out.status.code() == Some(1) {
@@ -137,7 +146,8 @@ pub(crate) mod tests {
 
     /// `session send --skill` resolves the operator's entries itself and
     /// exits 1 on a typo: that is the request's fault, so it comes back as
-    /// `Invalid` (a 400) carrying the CLI's own message.
+    /// `Invalid` (a 400) carrying the CLI's own message, without its
+    /// `[error] ` label.
     #[tokio::test]
     async fn a_refused_skill_is_invalid_with_the_clis_message() {
         let tmp = tempfile::tempdir().unwrap();
@@ -163,10 +173,10 @@ pub(crate) mod tests {
         );
 
         let sender = SubprocessSessionSender {
-            exe: failing_rupu(tmp.path(), &format!("{message}\n")),
+            exe: failing_rupu(tmp.path(), &format!("{message}  \n")),
         };
         match sender.send(send_req(None, &["pdff"])).await {
-            Err(SendError::Invalid(m)) => assert_eq!(m, message),
+            Err(SendError::Invalid(m)) => assert_eq!(m, refusal.to_string()),
             other => panic!("expected Invalid, got {other:?}"),
         }
     }

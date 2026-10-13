@@ -87,12 +87,7 @@ impl SessionStarter for SubprocessSessionStarter {
             .map_err(|e| SessionStartError::Spawn(e.to_string()))?;
 
         if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            let msg = if err.is_empty() {
-                "session start failed".into()
-            } else {
-                err
-            };
+            let msg = crate::cp_session_sender::cli_failure(&out.stderr, "session start failed");
             // Exit 1 is the command refusing the request (a skill that
             // doesn't resolve, an unknown agent): the caller's to fix.
             return Err(if out.status.code() == Some(1) {
@@ -248,7 +243,7 @@ mod tests {
         let mut r = req(None, None, None, Some(tmp.path().to_str().unwrap()));
         r.skills = vec!["pdff".into()];
         match starter.start(r).await {
-            Err(SessionStartError::Invalid(m)) => assert_eq!(m, message),
+            Err(SessionStartError::Invalid(m)) => assert_eq!(m, refusal.to_string()),
             other => panic!("expected Invalid, got {other:?}"),
         }
     }

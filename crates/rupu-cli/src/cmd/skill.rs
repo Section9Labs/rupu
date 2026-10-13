@@ -10,12 +10,12 @@ use rupu_skills::git::GitFetcher;
 use rupu_skills::install::{
     install_from, list_source, InstallError, InstallOutcome, InstallReport, InstallSpec, Selection,
 };
-use rupu_skills::record::{read_record, SourceRecord};
+use rupu_skills::record::SourceRecord;
 use rupu_skills::tools_map::mapped_tools;
 use rupu_skills::update::{update_skills, UpdateOutcome};
 use rupu_skills::{parse_source, CatalogEntry, Layer, LayerDirs, SkillCatalog};
 use serde::Serialize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 
 #[derive(Subcommand, Debug)]
@@ -228,11 +228,6 @@ impl CollectionOutput for SkillsOutput {
     }
 }
 
-/// The layer's `skills/` directory: the parent of the entry's skill dir.
-fn skills_dir_of(e: &CatalogEntry) -> PathBuf {
-    e.path.parent().map(PathBuf::from).unwrap_or_default()
-}
-
 impl SkillRow {
     fn sanitized(&self) -> Self {
         Self {
@@ -251,7 +246,8 @@ fn row(e: &CatalogEntry) -> SkillRow {
         Ok(s) => ("ok", s.frontmatter.description.clone(), String::new()),
         Err(err) => ("invalid", String::new(), err.to_string()),
     };
-    let source = read_record(&skills_dir_of(e), &e.dir_name)
+    let source = e
+        .record()
         .ok()
         .flatten()
         .map(|r| r.source)
@@ -315,7 +311,7 @@ fn show(name: &str) -> anyhow::Result<()> {
     for e in found {
         say(&format!("{} ({})", e.dir_name, e.layer.as_str()));
         say(&format!("  path:          {}", e.path.display()));
-        match read_record(&skills_dir_of(e), &e.dir_name) {
+        match e.record() {
             Ok(Some(rec)) => say(&format!(
                 "  source:        {} ({})",
                 rec.source,

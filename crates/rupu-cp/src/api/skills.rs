@@ -3,14 +3,15 @@
 //!
 //! `GET /api/skills` lists the global layer; `?ws_id=` adds that project's
 //! layer. Each row loads its skill to show its status, as `rupu skill list`
-//! does. `GET /api/skills/:layer/:name` shows one skill, as `rupu skill
-//! show` does.
+//! does; a layer that can't be read is skipped and named in the response's
+//! `warnings`. `GET /api/skills/:layer/:name` shows one skill, as `rupu
+//! skill show` does.
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
 use axum::{routing::get, Json, Router};
-use rupu_skills::record::read_record;
+use rupu_skills::record::RecordError;
 use rupu_skills::tools_map::mapped_tools;
 use rupu_skills::{CatalogEntry, Layer, LayerDirs, SkillCatalog};
 use serde::{Deserialize, Serialize};
@@ -32,7 +33,8 @@ pub struct SkillRow {
     pub error: Option<String>,
     pub warnings: Vec<String>,
     pub stamp: Option<String>,
-    /// The `source` of the skill's install record, when it has one.
+    /// The `source` of the skill's install record, when it has one. A
+    /// record that can't be read is a `warnings` entry.
     pub source: Option<String>,
     /// The other layer has a skill of the same name.
     pub both_layers: bool,
@@ -41,6 +43,9 @@ pub struct SkillRow {
 #[derive(Debug, Serialize)]
 pub struct SkillsResponse {
     pub skills: Vec<SkillRow>,
+    /// Each layer that couldn't be read, and why: its skills are missing
+    /// from `skills`.
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -70,7 +75,7 @@ struct SkillsQuery {
 }
 
 /// The layers a request reads: global, plus the project's when `ws_id`
-/// names a registered workspace.
+/// names a registered workspace. Reads the disk.
 fn layers(s: &AppState, ws_id: Option<&str>) -> ApiResult<LayerDirs> {
     let project = match ws_id {
         None => None,
@@ -82,17 +87,19 @@ fn layers(s: &AppState, ws_id: Option<&str>) -> ApiResult<LayerDirs> {
     Ok(LayerDirs::for_layers(&s.global_dir, project.as_deref()))
 }
 
-fn discover(dirs: &LayerDirs) -> ApiResult<SkillCatalog> {
-    SkillCatalog::discover(dirs).map_err(|e| ApiError::internal(e.to_string()))
-}
-
-/// The layer's `skills/` directory, where the install records live.
-fn skills_dir_of(e: &CatalogEntry) -> &std::path::Path {
-    e.path.parent().unwrap_or(&e.path)
+/// The skills of every layer that can be read, and a warning naming each
+/// that can't.
+fn discover(dirs: &LayerDirs) -> (SkillCatalog, Vec<(Layer, String)>) {
+    let (cat, failed) = SkillCatalog::discover_readable(dirs);
+    let failed = failed
+        .into_iter()
+        .map(|(layer, e)| (layer, format!("{} layer: {e}", layer.as_str())))
+        .collect();
+    (cat, failed)
 }
 
 fn row(e: &CatalogEntry, cat: &SkillCatalog) -> SkillRow {
-    let (status, description, error, warnings, stamp) = match e.skill() {
+    let (status, description, error, mut warnings, stamp) = match e.skill() {
         Ok(s) => (
             "ok",
             Some(s.frontmatter.description.clone()),
@@ -102,6 +109,15 @@ fn row(e: &CatalogEntry, cat: &SkillCatalog) -> SkillRow {
         ),
         Err(err) => ("invalid", None, Some(err.to_string()), Vec::new(), None),
     };
+    let source = match e.record() {
+        Ok(rec) => rec.map(|r| r.source),
+        // The skill's own error already says why.
+        Err(RecordError::LinkedRoot) => None,
+        Err(err) => {
+            warnings.push(format!("install record: {err}"));
+            None
+        }
+    };
     SkillRow {
         name: e.dir_name.clone(),
         layer: e.layer.as_str(),
@@ -110,16 +126,13 @@ fn row(e: &CatalogEntry, cat: &SkillCatalog) -> SkillRow {
         error,
         warnings,
         stamp,
-        source: read_record(skills_dir_of(e), &e.dir_name)
-            .ok()
-            .flatten()
-            .map(|r| r.source),
+        source,
         both_layers: cat.named(&e.dir_name).count() > 1,
     }
 }
 
 fn detail(e: &CatalogEntry, cat: &SkillCatalog) -> SkillDetail {
-    let (source_record, source_error) = match read_record(skills_dir_of(e), &e.dir_name) {
+    let (source_record, source_error) = match e.record() {
         Ok(rec) => (
             rec.map(|r| serde_json::to_value(r).expect("a source record serializes")),
             None,
@@ -169,14 +182,15 @@ async fn list_skills(
     State(s): State<AppState>,
     Query(q): Query<SkillsQuery>,
 ) -> ApiResult<Json<SkillsResponse>> {
-    let dirs = layers(&s, q.ws_id.as_deref())?;
-    let skills = tokio::task::spawn_blocking(move || {
-        let cat = discover(&dirs)?;
-        Ok::<_, ApiError>(cat.entries().iter().map(|e| row(e, &cat)).collect())
+    tokio::task::spawn_blocking(move || {
+        let (cat, failed) = discover(&layers(&s, q.ws_id.as_deref())?);
+        Ok(Json(SkillsResponse {
+            skills: cat.entries().iter().map(|e| row(e, &cat)).collect(),
+            warnings: failed.into_iter().map(|(_, w)| w).collect(),
+        }))
     })
     .await
-    .map_err(|e| ApiError::internal(e.to_string()))??;
-    Ok(Json(SkillsResponse { skills }))
+    .map_err(|e| ApiError::internal(e.to_string()))?
 }
 
 async fn get_skill(
@@ -194,18 +208,19 @@ async fn get_skill(
             "a project skill needs ?ws_id= naming its project",
         ));
     }
-    let dirs = layers(&s, q.ws_id.as_deref())?;
-    let found = tokio::task::spawn_blocking(move || {
-        let cat = discover(&dirs)?;
+    tokio::task::spawn_blocking(move || {
+        let (cat, failed) = discover(&layers(&s, q.ws_id.as_deref())?);
+        if let Some((_, w)) = failed.into_iter().find(|(l, _)| *l == layer) {
+            return Err(ApiError::internal(w));
+        }
         cat.get(layer, &name)
-            .map(|e| detail(e, &cat))
+            .map(|e| Json(detail(e, &cat)))
             .ok_or_else(|| {
                 ApiError::not_found(format!("no installed skill {}:{name}", layer.as_str()))
             })
     })
     .await
-    .map_err(|e| ApiError::internal(e.to_string()))??;
-    Ok(Json(found))
+    .map_err(|e| ApiError::internal(e.to_string()))?
 }
 
 #[cfg(test)]
@@ -285,6 +300,7 @@ mod tests {
         assert_eq!(r[0]["both_layers"], false);
         assert_eq!(r[0]["warnings"], serde_json::json!([]));
         assert!(r[0]["stamp"].as_str().is_some_and(|s| !s.is_empty()));
+        assert_eq!(json["warnings"], serde_json::json!([]));
 
         std::fs::create_dir_all(global.join(".sources")).unwrap();
         std::fs::write(
@@ -412,6 +428,18 @@ mod tests {
         );
         std::fs::create_dir_all(global.join("pdf/scripts")).unwrap();
         std::fs::write(global.join("pdf/scripts/extract.sh"), "echo hi\n").unwrap();
+        // The stamp reads each file's mode and mtime: fix both.
+        for f in ["pdf/SKILL.md", "pdf/scripts/extract.sh"] {
+            use std::os::unix::fs::PermissionsExt as _;
+            let path = global.join(f);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000))
+                .unwrap();
+        }
 
         let (status, json) = get(&s, "/api/skills/global/pdf").await;
         assert_eq!(status, StatusCode::OK, "{json}");
@@ -432,14 +460,8 @@ mod tests {
         assert_eq!(json["metadata"], serde_json::json!({"owner": "docs"}));
         assert_eq!(json["disable_model_invocation"], false);
         assert_eq!(json["source_record"], serde_json::Value::Null);
-        let dir =
-            rupu_skills::SkillCatalog::discover(&LayerDirs::for_layers(tmp.path(), None)).unwrap();
-        let expected = dir.get(Layer::Global, "pdf").unwrap().skill().unwrap();
-        assert_eq!(
-            json["content_hash"],
-            expected.content_hash().unwrap().short()
-        );
-        assert_eq!(json["stamp"], expected.stamp.short());
+        assert_eq!(json["content_hash"], "42b1931a0338");
+        assert_eq!(json["stamp"], "27961ea1b0d8");
 
         let (status, json) = get(&s, "/api/skills/global/nope").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -453,6 +475,187 @@ mod tests {
             status,
             StatusCode::BAD_REQUEST,
             "a project skill needs ws_id"
+        );
+    }
+
+    fn write_record(skills_dir: &FsPath, name: &str, text: &str) {
+        std::fs::create_dir_all(skills_dir.join(".sources")).unwrap();
+        std::fs::write(skills_dir.join(format!(".sources/{name}.json")), text).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_project_layer_that_cant_be_read_is_skipped_with_a_warning() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        install(
+            &tmp.path().join("skills"),
+            "pdf",
+            "name: pdf\ndescription: Read PDFs.\n",
+            "g",
+        );
+        let repo = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join(".rupu")).unwrap();
+        std::fs::write(repo.path().join(".rupu/skills"), "not a directory").unwrap();
+        register_workspace(&tmp, "ws1", repo.path());
+        let warning = format!(
+            "project layer: {}: Not a directory (os error 20)",
+            repo.path().join(".rupu/skills").display()
+        );
+
+        let (status, json) = get(&s, "/api/skills?ws_id=ws1").await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let r = rows(&json);
+        assert_eq!(r.len(), 1);
+        assert_eq!(
+            (&r[0]["name"], &r[0]["layer"]),
+            (&"pdf".into(), &"global".into())
+        );
+        assert_eq!(json["warnings"], serde_json::json!([warning]));
+
+        let (status, _) = get(&s, "/api/skills/global/pdf?ws_id=ws1").await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, json) = get(&s, "/api/skills/project/pdf?ws_id=ws1").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(json["error"], warning);
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_install_record_is_a_warning() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let global = tmp.path().join("skills");
+        install(&global, "pdf", "name: pdf\ndescription: Read PDFs.\n", "g");
+        write_record(&global, "pdf", "{not json");
+        let error = format!(
+            "{}: key must be a string at line 1 column 2",
+            global.join(".sources/pdf.json").display()
+        );
+
+        let (status, json) = get(&s, "/api/skills").await;
+        assert_eq!(status, StatusCode::OK);
+        let r = rows(&json);
+        assert_eq!(r[0]["status"], "ok");
+        assert_eq!(r[0]["source"], serde_json::Value::Null);
+        assert_eq!(
+            r[0]["warnings"],
+            serde_json::json!([format!("install record: {error}")])
+        );
+
+        let (_, json) = get(&s, "/api/skills/global/pdf").await;
+        assert_eq!(json["source_record"], serde_json::Value::Null);
+        assert_eq!(json["source_error"], error);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_install_record_is_not_read() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let global = tmp.path().join("skills");
+        install(&global, "pdf", "name: pdf\ndescription: Read PDFs.\n", "g");
+        write_record(&global, "pdf", &" ".repeat(64 * 1024 + 1));
+
+        let (_, json) = get(&s, "/api/skills/global/pdf").await;
+        assert_eq!(
+            json["source_error"],
+            format!(
+                "{}: the record is over 65536 bytes",
+                global.join(".sources/pdf.json").display()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_skill_lists_invalid() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        install(
+            &tmp.path().join("skills"),
+            "big",
+            "name: big\ndescription: Big.\n",
+            &"a".repeat(1 << 20),
+        );
+
+        let (status, json) = get(&s, "/api/skills").await;
+        assert_eq!(status, StatusCode::OK);
+        let r = rows(&json);
+        assert_eq!(r[0]["status"], "invalid");
+        assert_eq!(
+            r[0]["error"],
+            "SKILL.md is 1048613 bytes; the limit is 1048576 bytes"
+        );
+        let (status, json) = get(&s, "/api/skills/global/big").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["status"], "invalid");
+        assert_eq!(json["body"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn a_valid_project_skill_shows_its_body() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let repo = tempfile::TempDir::new().unwrap();
+        install(
+            &repo.path().join(".rupu/skills"),
+            "notes",
+            "name: notes\ndescription: Notes.\n",
+            "Write notes.",
+        );
+        register_workspace(&tmp, "ws1", repo.path());
+
+        let (status, json) = get(&s, "/api/skills/project/notes?ws_id=ws1").await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["layer"], "project");
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["body"], "Write notes.");
+        assert_eq!(json["description"], "Notes.");
+    }
+
+    /// A symlinked project skill, or a symlinked project `skills/`, lists
+    /// invalid; the linked root's records are not read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_project_skills_list_invalid() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let outside = tempfile::TempDir::new().unwrap();
+        install(
+            outside.path(),
+            "notes",
+            "name: notes\ndescription: Notes.\n",
+            "n",
+        );
+        write_record(outside.path(), "notes", "{not json");
+        let repo = tempfile::TempDir::new().unwrap();
+        let skills = repo.path().join(".rupu/skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("notes"), skills.join("notes")).unwrap();
+        register_workspace(&tmp, "ws1", repo.path());
+
+        let (_, json) = get(&s, "/api/skills?ws_id=ws1").await;
+        let r = rows(&json);
+        assert_eq!(r[0]["status"], "invalid");
+        assert_eq!(
+            r[0]["error"],
+            "a project skill directory may not be a symlink"
+        );
+
+        let repo = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join(".rupu")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), repo.path().join(".rupu/skills")).unwrap();
+        register_workspace(&tmp, "ws2", repo.path());
+
+        let (_, json) = get(&s, "/api/skills?ws_id=ws2").await;
+        let r = rows(&json);
+        assert_eq!(r[0]["status"], "invalid");
+        assert_eq!(
+            r[0]["error"],
+            "the project skills directory may not be a symlink"
+        );
+        assert_eq!(r[0]["warnings"], serde_json::json!([]), "no record read");
+        let (_, json) = get(&s, "/api/skills/project/notes?ws_id=ws2").await;
+        assert_eq!(
+            json["source_error"],
+            "the project skills directory may not be a symlink"
         );
     }
 
