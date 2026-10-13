@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
-fn record(id: &str, workflow_name: &str, status: RunStatus) -> RunRecord {
+pub(crate) fn record(id: &str, workflow_name: &str, status: RunStatus) -> RunRecord {
     RunRecord {
         customer: None,
         id: id.into(),

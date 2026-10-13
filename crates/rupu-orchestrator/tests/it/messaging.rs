@@ -32,7 +32,7 @@ steps:
 
 /// Wait (without blocking the task, which the parallel branches share)
 /// until `ready` holds: the other branch's progress. Bounded.
-async fn wait_for(what: &str, ready: &(dyn Fn() -> bool + Send + Sync)) {
+pub(crate) async fn wait_for(what: &str, ready: &(dyn Fn() -> bool + Send + Sync)) {
     let deadline = Instant::now() + Duration::from_secs(20);
     while !ready() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
@@ -41,7 +41,7 @@ async fn wait_for(what: &str, ready: &(dyn Fn() -> bool + Send + Sync)) {
 }
 
 /// The run's message space: the one `messages/` dir under the run store.
-fn space(global: &Path) -> Option<PathBuf> {
+pub(crate) fn space(global: &Path) -> Option<PathBuf> {
     std::fs::read_dir(global.join("runs"))
         .ok()?
         .flatten()
@@ -49,20 +49,20 @@ fn space(global: &Path) -> Option<PathBuf> {
         .find(|p| p.exists())
 }
 
-fn file_has(path: Option<PathBuf>, needle: &str) -> bool {
+pub(crate) fn file_has(path: Option<PathBuf>, needle: &str) -> bool {
     path.and_then(|p| std::fs::read_to_string(p).ok())
         .is_some_and(|t| t.contains(needle))
 }
 
-type Ready = Box<dyn Fn() -> bool + Send + Sync>;
+pub(crate) type Ready = Box<dyn Fn() -> bool + Send + Sync>;
 
 /// A scripted provider whose turns may each wait for the other branch
 /// first (`(what, ready)`), recording every request.
-struct Paced {
-    inner: MockProvider,
-    turn: usize,
-    before: Vec<Option<(&'static str, Ready)>>,
-    seen: Arc<Mutex<Vec<LlmRequest>>>,
+pub(crate) struct Paced {
+    pub(crate) inner: MockProvider,
+    pub(crate) turn: usize,
+    pub(crate) before: Vec<Option<(&'static str, Ready)>>,
+    pub(crate) seen: Arc<Mutex<Vec<LlmRequest>>>,
 }
 
 impl Paced {
@@ -103,7 +103,7 @@ impl LlmProvider for Paced {
     }
 }
 
-fn tool(id: &str, name: &str, input: Value) -> ScriptedTurn {
+pub(crate) fn tool(id: &str, name: &str, input: Value) -> ScriptedTurn {
     ScriptedTurn::AssistantToolUse {
         text: None,
         tool_id: id.into(),
@@ -113,7 +113,7 @@ fn tool(id: &str, name: &str, input: Value) -> ScriptedTurn {
     }
 }
 
-fn text(t: &str) -> ScriptedTurn {
+pub(crate) fn text(t: &str) -> ScriptedTurn {
     ScriptedTurn::AssistantText {
         text: t.into(),
         stop: StopReason::EndTurn,
@@ -189,7 +189,7 @@ impl StepFactory for Factory {
     }
 }
 
-fn events(path: &Path) -> Vec<rupu_transcript::Event> {
+pub(crate) fn events(path: &Path) -> Vec<rupu_transcript::Event> {
     rupu_transcript::JsonlReader::iter(path)
         .unwrap()
         .flatten()

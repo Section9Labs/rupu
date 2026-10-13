@@ -48,3 +48,5 @@ serial_test.workspace = true
 rupu-scm = { path = "../rupu-scm", features = ["test-helpers"] }
 # `findings_single_impl`: the same tool through `rupu mcp serve`.
 rupu-mcp = { path = "../rupu-mcp" }
+# `operator_messages`: the operator's messages into a workflow run.
+rupu-fleet = { workspace = true }
