@@ -807,6 +807,10 @@ export interface AgentiflowDetail {
   events: AgentiflowEvent[];
   units: AgentiflowUnit[];
   lead_transcripts: AgentiflowLeadTranscript[];
+  /** The coverage scope this engagement's assets pool under, so the Assets
+   *  tab shows only its own assets. Absent when the lead's workspace can't be
+   *  resolved (the tab then says so rather than showing every workspace's). */
+  asset_scope?: { ws_id: string; target_id: string } | null;
 }
 
 /** One board message — a fire-and-forget post the fleet writes to itself. */

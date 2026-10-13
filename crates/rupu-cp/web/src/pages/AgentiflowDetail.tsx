@@ -314,15 +314,25 @@ export default function AgentiflowDetail() {
           title="Assets"
           meta={<span className="text-note text-ink-mute">{record.engagement_profiles.join(', ') || 'engagement'}</span>}
         >
-          <AssetInventory
-            emptyHint={
-              <>
-                This engagement hasn’t recorded assets yet — a fleet records them with the{' '}
-                <span className="font-mono">assets.mark</span> tool as it discovers hosts, services, sites or routes. They
-                also appear on the <Link to="/assets" className="text-brand-600 hover:underline">Assets</Link> page.
-              </>
-            }
-          />
+          {detail.asset_scope ? (
+            <AssetInventory
+              wsId={detail.asset_scope.ws_id}
+              target={detail.asset_scope.target_id}
+              emptyHint={
+                <>
+                  This engagement hasn’t recorded assets yet — a fleet records them with the{' '}
+                  <span className="font-mono">assets.mark</span> tool as it discovers hosts, services, sites or routes.
+                  They also appear on the{' '}
+                  <Link to="/assets" className="text-brand-600 hover:underline">Assets</Link> page.
+                </>
+              }
+            />
+          ) : (
+            <Muted>
+              The engagement’s asset scope isn’t available yet — its lead hasn’t recorded a workspace. (Showing every
+              workspace’s assets here would mix in other engagements, so this stays empty until the scope resolves.)
+            </Muted>
+          )}
         </Panel>
       )}
 

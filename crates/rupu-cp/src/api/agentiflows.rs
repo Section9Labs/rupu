@@ -118,6 +118,23 @@ struct AgentiflowDetail {
     units: Vec<UnitDto>,
     /// The lead's per-round transcripts, ordered by round.
     lead_transcripts: Vec<LeadTranscriptDto>,
+    /// The coverage scope this engagement's findings and assets pool under, so
+    /// the Assets tab shows ONLY this engagement's assets (not every
+    /// workspace's). `null` when the lead's workspace can't be resolved — the
+    /// Assets tab then says so rather than falling back to every asset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    asset_scope: Option<AssetScopeDto>,
+}
+
+/// The coverage scope an agentiflow's findings/assets pool under. An
+/// agentiflow writes ALL its evidence under ONE coverage target —
+/// `target_id(workspace, <af id>)` inside the lead's workspace (the flow's id
+/// is the scope name; see `rupu_agentiflow::run`). The web Assets tab passes
+/// these to `GET /api/assets?ws_id=&target=`.
+#[derive(Serialize)]
+struct AssetScopeDto {
+    ws_id: String,
+    target_id: String,
 }
 
 /// The full `agentiflow.json` record, hand-mapped.
@@ -646,6 +663,35 @@ fn read_legacy_units(s: &AppState, run_dir: &std::path::Path) -> Vec<UnitDto> {
 /// Assemble the detail for `id`, or `None` when no such run directory has a
 /// record. A record that exists but cannot be parsed is an error, not a 404:
 /// the run is there, its state of record is unreadable.
+/// Resolve the [`AssetScopeDto`] for the run in `run_dir` (id `af_id`): the
+/// lead's workspace comes from its first-round `RunStart`, and the coverage
+/// target is `target_id(workspace_path, af_id)` (the flow's id is its scope
+/// name — see `rupu_agentiflow::run`). `None` when the lead transcript is
+/// absent/unreadable, carries no `RunStart`, or names a workspace this CP has
+/// no registered path for; callers then leave the Assets tab unscoped-but-safe
+/// rather than showing every workspace's assets.
+fn asset_scope(s: &AppState, run_dir: &std::path::Path, af_id: &str) -> Option<AssetScopeDto> {
+    let lead = read_lead_transcripts(run_dir).into_iter().next()?;
+    let ws_id = match rupu_transcript::JsonlReader::iter(std::path::Path::new(&lead.path))
+        .ok()?
+        .next()?
+    {
+        Ok(rupu_transcript::Event::RunStart { workspace_id, .. }) => workspace_id,
+        _ => return None,
+    };
+    let ws = rupu_workspace::WorkspaceStore {
+        root: s.global_dir.join("workspaces"),
+    }
+    .list()
+    .ok()?
+    .into_iter()
+    .find(|w| w.id == ws_id)?;
+    Some(AssetScopeDto {
+        ws_id,
+        target_id: rupu_coverage::target_id(std::path::Path::new(&ws.path), af_id),
+    })
+}
+
 fn load_detail(s: &AppState, id: &str) -> ApiResult<Option<AgentiflowDetail>> {
     let run_dir = agentiflow_dir(&s.global_dir).join(id);
     let mut record = match AgentiflowRecord::read(&run_dir) {
@@ -665,6 +711,7 @@ fn load_detail(s: &AppState, id: &str) -> ApiResult<Option<AgentiflowDetail>> {
         def: read_def(&run_dir).map(def_dto),
         units: read_units(s, &run_dir),
         lead_transcripts: read_lead_transcripts(&run_dir),
+        asset_scope: asset_scope(s, &run_dir, id),
         record: record_dto(record),
         events,
     }))
