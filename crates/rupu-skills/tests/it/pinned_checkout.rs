@@ -238,3 +238,44 @@ fn a_changed_file_outside_skills_is_irrelevant() {
     let tree = checkout(tmp.path()).fetch(&src(&c)).unwrap();
     assert!(!tree.root.join("NOTES.md").exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn an_outward_symlink_in_the_pinned_tree_fails_the_pin_and_writes_nothing() {
+    use rupu_skills::pinned::{install_pins, Pin, PinOutcome};
+    use rupu_skills::Layer;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo, _) = checkout_with_one_skill(tmp.path());
+    std::fs::write(tmp.path().join("outside.txt"), "not a skill file\n").unwrap();
+    std::os::unix::fs::symlink(
+        "../../../outside.txt",
+        tmp.path().join("skills/work-units/scripts/escape"),
+    )
+    .unwrap();
+    let c = commit_all(&repo);
+
+    let dest = tempfile::tempdir().unwrap();
+    let pin = Pin {
+        name: "work-units".into(),
+        source: "Section9Labs/rupu-skills".into(),
+        tag: "v1.0.0".into(),
+        commit: c,
+    };
+    let report = install_pins(
+        &[pin],
+        dest.path(),
+        Layer::Global,
+        false,
+        &checkout(tmp.path()),
+    );
+    match &report.results[0].1 {
+        PinOutcome::Failed(msg) => assert!(msg.contains("symlink"), "{msg}"),
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    let left: Vec<_> = std::fs::read_dir(dest.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(left.is_empty(), "skills dir should be untouched: {left:?}");
+}
