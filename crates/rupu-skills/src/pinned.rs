@@ -225,6 +225,67 @@ fn kept_or_failed(force: bool, reason: String) -> Plan {
     }
 }
 
+#[cfg(feature = "git")]
+mod checkout {
+    use crate::source::{Fetch, FetchedTree, GitSource, SourceError};
+    use std::path::PathBuf;
+
+    /// `rupu fleet install --skills-from <dir>`: a local checkout of the
+    /// pinned commit stands in for the network. Its HEAD must be the pin and
+    /// nothing under `skills/` may differ from that commit, because install
+    /// copies every file in a skill's directory.
+    pub struct PinnedCheckout {
+        pub dir: PathBuf,
+    }
+
+    impl Fetch for PinnedCheckout {
+        fn fetch(&self, src: &GitSource) -> Result<FetchedTree, SourceError> {
+            let shown = self.dir.display();
+            let err = |m: String| SourceError::Clone(m);
+            let want = src
+                .git_ref
+                .as_deref()
+                .ok_or_else(|| err("--skills-from serves pinned commits only".into()))?;
+            let repo = git2::Repository::open(&self.dir)
+                .map_err(|e| err(format!("{shown} is not a git checkout: {}", e.message())))?;
+            let head = repo
+                .head()
+                .and_then(|h| h.peel_to_commit())
+                .map_err(|e| err(format!("{shown}: {}", e.message())))?
+                .id()
+                .to_string();
+            if head != want {
+                return Err(err(format!(
+                    "{shown} is at {head}; the fleet pins {want}. Run `git -C {shown} checkout {want}`"
+                )));
+            }
+            let mut opts = git2::StatusOptions::new();
+            opts.include_untracked(true)
+                .recurse_untracked_dirs(true)
+                .include_ignored(true)
+                .recurse_ignored_dirs(true)
+                .pathspec("skills");
+            let statuses = repo
+                .statuses(Some(&mut opts))
+                .map_err(|e| err(format!("{shown}: {}", e.message())))?;
+            if let Some(dirty) = statuses
+                .iter()
+                .find(|s| s.status() != git2::Status::CURRENT)
+                .and_then(|s| s.path().map(str::to_owned))
+            {
+                return Err(err(format!(
+                    "{shown} has files under skills/ that are not in {want} ({dirty}); in that \
+                     directory run `git clean -fdx skills/` and `git checkout -- skills/`"
+                )));
+            }
+            Ok(FetchedTree::local_with_commit(self.dir.clone(), Some(head)))
+        }
+    }
+}
+
+#[cfg(feature = "git")]
+pub use checkout::PinnedCheckout;
+
 #[cfg(test)]
 mod tests {
     use super::*;
