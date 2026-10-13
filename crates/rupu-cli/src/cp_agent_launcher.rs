@@ -107,6 +107,34 @@ mod tests {
         assert!(args(&spec).contains(&"--codename".to_string()));
     }
 
+    /// A placed unit's step skills reach the child's `rupu run`.
+    #[test]
+    fn the_units_skills_are_on_the_argv() {
+        let mut r = req();
+        r.target = None;
+        r.skills = vec!["pdf".into(), "project:notes".into()];
+        r.preload_skills = vec!["house-style".into()];
+        let (spec, run_id) = spawn_spec("/bin/rupu".as_ref(), &r).unwrap();
+        assert_eq!(
+            args(&spec),
+            [
+                "run",
+                "triage",
+                "--run-id",
+                &run_id,
+                "--mode",
+                "bypass",
+                "--skill",
+                "pdf",
+                "--skill",
+                "project:notes",
+                "--preload-skill",
+                "house-style",
+                "--prompt=look at PR",
+            ]
+        );
+    }
+
     #[test]
     fn a_malformed_run_id_or_mode_is_refused() {
         let mut bad_id = req();

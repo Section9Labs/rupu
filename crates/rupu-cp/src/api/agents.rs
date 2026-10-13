@@ -888,6 +888,16 @@ struct AgentRunBody {
     /// advertise `agent.engagement_profile` refuses the launch.
     #[serde(default)]
     engagement_profiles: Vec<String>,
+    /// Optional skills on top of the agent's own — `rupu run --skill`, one
+    /// flag per entry (a placed unit's workflow-step `skills:`). A malformed
+    /// entry is a 400; one the host doesn't have fails the launched run.
+    /// Honoured on both paths; on the remote-proxy path a peer that does not
+    /// advertise `agent.skills` refuses the launch.
+    #[serde(default)]
+    skills: Vec<String>,
+    /// Optional preloaded skills — `rupu run --preload-skill`, as `skills`.
+    #[serde(default)]
+    preload_skills: Vec<String>,
     /// Optional run id to execute under (`run_<…>`), minted by a
     /// coordinator that needs to know it before the run starts — honoured
     /// because `/api/host/info` advertises `run.supplied_run_id`. A malformed
@@ -944,6 +954,14 @@ fn parse_engagement_profiles(raw: Vec<String>) -> Result<Vec<String>, ApiError> 
         .collect()
 }
 
+/// A body's skill entries: well-formed (`name`, `global:name`,
+/// `project:name`, `*`) or a 400 naming the field. They land on the
+/// child's command line.
+fn parse_skill_entries(field: &str, raw: Vec<String>) -> Result<Vec<String>, ApiError> {
+    rupu_skills::parse_grants(&raw).map_err(|e| ApiError::bad_request(format!("{field}: {e}")))?;
+    Ok(raw)
+}
+
 fn parse_findings_profile(
     raw: Option<&str>,
 ) -> Result<Option<rupu_coverage::FindingProfile>, ApiError> {
@@ -959,6 +977,8 @@ async fn run_agent_with(
 ) -> Result<String, ApiError> {
     let findings_profile = parse_findings_profile(body.findings_profile.as_deref())?;
     let engagement_profiles = parse_engagement_profiles(body.engagement_profiles)?;
+    let skills = parse_skill_entries("skills", body.skills)?;
+    let preload_skills = parse_skill_entries("preload_skills", body.preload_skills)?;
     let (run_id, codename) = parse_supplied_identity(body.run_id, body.codename)?;
     let req = AgentLaunchRequest {
         codename,
@@ -970,8 +990,8 @@ async fn run_agent_with(
         run_id,
         findings_profile,
         engagement_profiles,
-        skills: Vec::new(),
-        preload_skills: Vec::new(),
+        skills,
+        preload_skills,
     };
     launcher.launch(req).await.map_err(|e| match e {
         AgentLaunchError::Invalid(m) => ApiError::bad_request(m),
@@ -1105,6 +1125,8 @@ async fn run_agent(
         // with no scope fields at all.
         let findings_profile = parse_findings_profile(b.findings_profile.as_deref())?;
         let engagement_profiles = parse_engagement_profiles(b.engagement_profiles)?;
+        let skills = parse_skill_entries("skills", b.skills)?;
+        let preload_skills = parse_skill_entries("preload_skills", b.preload_skills)?;
         let (run_id, codename) = parse_supplied_identity(b.run_id, b.codename)?;
         let conn = crate::api::runs::resolve_host(&s, &host)?;
         let req = AgentLaunchRequest {
@@ -1117,14 +1139,14 @@ async fn run_agent(
             run_id,
             findings_profile,
             engagement_profiles,
-            skills: Vec::new(),
-            preload_skills: Vec::new(),
+            skills,
+            preload_skills,
         };
         let run_id = conn.launch_agent(req).await.map_err(|e| match e {
             HostConnectorError::NotFound(m) => ApiError::not_found(m),
             HostConnectorError::Invalid(m) => ApiError::bad_request(m),
-            // e.g. the host can't honour `findings_profile` or
-            // `engagement_profiles` — refused, not failed.
+            // e.g. the host can't honour `findings_profile`,
+            // `engagement_profiles` or `skills` — refused, not failed.
             HostConnectorError::Unsupported(m) => ApiError::not_available(m),
             other => ApiError::internal(other.to_string()),
         })?;
@@ -1359,6 +1381,8 @@ mod tests {
             scope_id: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             run_id: None,
             codename: None,
         };
@@ -1435,6 +1459,41 @@ mod tests {
             .await
             .expect_err("a blank id must be refused");
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert!(mock.last.lock().unwrap().is_none(), "nothing launched");
+    }
+
+    #[tokio::test]
+    async fn run_agent_forwards_the_skills() {
+        let mock = Arc::new(MockAgent {
+            last: Mutex::new(None),
+        });
+        let body: AgentRunBody = serde_json::from_value(serde_json::json!({
+            "skills": ["pdf", "project:notes"],
+            "preload_skills": ["house-style"]
+        }))
+        .unwrap();
+        run_agent_with("recon", body, mock.clone())
+            .await
+            .expect("ok");
+        let got = mock.last.lock().unwrap().clone().unwrap();
+        assert_eq!(got.skills, ["pdf", "project:notes"]);
+        assert_eq!(got.preload_skills, ["house-style"]);
+    }
+
+    #[tokio::test]
+    async fn run_agent_rejects_a_malformed_skill_before_launching() {
+        let mock = Arc::new(MockAgent {
+            last: Mutex::new(None),
+        });
+        let body = AgentRunBody {
+            preload_skills: vec!["--mode".into()],
+            ..AgentRunBody::default()
+        };
+        let err = run_agent_with("recon", body, mock.clone())
+            .await
+            .expect_err("a malformed skill must be refused");
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert!(err.1.starts_with("preload_skills: "), "{}", err.1);
         assert!(mock.last.lock().unwrap().is_none(), "nothing launched");
     }
 
@@ -1537,6 +1596,8 @@ mod tests {
             scope_id: Some("ws_a".into()),
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             run_id: None,
             codename: None,
         };
@@ -1578,6 +1639,8 @@ mod tests {
             scope_id: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             run_id: None,
             codename: None,
         };
@@ -1620,6 +1683,8 @@ mod tests {
             scope_id: Some("ws_a".into()),
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             run_id: None,
             codename: None,
         };
@@ -1666,6 +1731,8 @@ mod tests {
             scope_id: Some("ws_unknown_locally".into()),
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             run_id: None,
             codename: None,
         };
@@ -1720,6 +1787,8 @@ mod tests {
             scope_id: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             run_id: None,
             codename: None,
         };
@@ -1765,6 +1834,8 @@ mod tests {
             scope_id: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             run_id: None,
             codename: None,
         };
@@ -1798,6 +1869,8 @@ mod tests {
             scope_id: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             run_id: None,
             codename: None,
         };
@@ -1832,6 +1905,8 @@ mod tests {
             scope_id: Some("ws_missing".into()),
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             run_id: None,
             codename: None,
         };

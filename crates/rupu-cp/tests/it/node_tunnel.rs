@@ -1997,6 +1997,60 @@ mod tunnel_connector {
         assert!(rx.try_recv().is_err(), "no frame sent");
     }
 
+    /// A placed unit's workflow-step skills reach the node in the Run frame.
+    #[tokio::test]
+    async fn launch_agent_carries_the_skills_to_a_capable_node() {
+        let dir = tempdir().unwrap();
+        let (conn, mut rx, _run_store, _node_conn) = setup_with_capabilities(
+            "node-sk-1",
+            dir.path(),
+            rupu_cp::node::protocol::node_capabilities(),
+        );
+        let mut req = make_agent_req("recon");
+        req.skills = vec!["pdf".into()];
+        req.preload_skills = vec!["house-style".into()];
+        let run_id = conn.launch_agent(req).await.expect("launch_agent");
+
+        match rx.recv().await.expect("should receive a frame") {
+            Frame::Run { run_id: fid, spec } => {
+                assert_eq!(fid, run_id);
+                assert_eq!(spec.skills, ["pdf"]);
+                assert_eq!(spec.preload_skills, ["house-style"]);
+            }
+            other => panic!("expected Frame::Run, got {other:?}"),
+        }
+    }
+
+    /// A node that advertises the other launch features but not
+    /// `agent.skills` would drop the fields and run the unit without its
+    /// step's skills — refuse, and leave no mirror run or frame behind.
+    #[tokio::test]
+    async fn launch_agent_refuses_skills_for_a_node_without_the_capability() {
+        let dir = tempdir().unwrap();
+        let (conn, mut rx, run_store, _node_conn) = setup_with_capabilities(
+            "node-sk-old",
+            dir.path(),
+            vec![
+                rupu_cp::node::protocol::CAP_AGENT_FINDINGS_PROFILE.to_string(),
+                rupu_cp::node::protocol::CAP_AGENT_ENGAGEMENT_PROFILE.to_string(),
+            ],
+        );
+        let mut req = make_agent_req("recon");
+        req.preload_skills = vec!["house-style".into()];
+
+        let err = conn.launch_agent(req).await.unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Unsupported(m)
+                if m.contains("node-sk-old") && m.contains("skills") && m.contains("upgrade rupu")),
+            "{err:?}"
+        );
+        assert!(
+            run_store.list().unwrap().is_empty(),
+            "no orphaned mirror run"
+        );
+        assert!(rx.try_recv().is_err(), "no frame sent");
+    }
+
     // ── pull_finding_artifact ────────────────────────────────────────────────
     //
     // These play the node side by answering the `ArtifactPull` on the

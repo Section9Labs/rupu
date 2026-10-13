@@ -4815,6 +4815,7 @@ dependencies = [
  "rupu-providers",
  "rupu-runtime",
  "rupu-scm",
+ "rupu-skills",
  "rupu-tools",
  "rupu-transcript",
  "rupu-workspace",

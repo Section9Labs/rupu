@@ -18,7 +18,8 @@ use crate::{
     },
     launcher::LaunchRequest,
     node::protocol::{
-        CAP_AGENT_ENGAGEMENT_PROFILE, CAP_AGENT_FINDINGS_PROFILE, CAP_RUN_SUPPLIED_RUN_ID,
+        CAP_AGENT_ENGAGEMENT_PROFILE, CAP_AGENT_FINDINGS_PROFILE, CAP_AGENT_SKILLS,
+        CAP_RUN_SUPPLIED_RUN_ID,
     },
     session_sender::SendMessageRequest,
     session_starter::SessionStartRequest,
@@ -338,8 +339,10 @@ impl HostConnector for HttpHostConnector {
             .map_err(HostConnectorError::Invalid)?;
         // One `/api/host/info` read covers every field that needs the
         // remote's say-so, and none is made for a launch that needs none.
+        let has_skills = !req.skills.is_empty() || !req.preload_skills.is_empty();
         let needs_info = req.findings_profile.is_some()
             || !req.engagement_profiles.is_empty()
+            || has_skills
             || req.run_id.is_some()
             || req.codename.is_some();
         let info = if needs_info {
@@ -366,6 +369,14 @@ impl HostConnector for HttpHostConnector {
                 &self.base_url,
             )?;
         }
+        if let (true, Some(info)) = (has_skills, &info) {
+            Self::require_in(
+                info,
+                CAP_AGENT_SKILLS,
+                "this run's workflow-step skills cannot be delivered",
+                &self.base_url,
+            )?;
+        }
         let (features, version): (&[String], Option<&str>) = match &info {
             Some(PeerInfo::Info(body)) => (&body.features, body.version.as_deref()),
             _ => (&[], None),
@@ -380,6 +391,12 @@ impl HostConnector for HttpHostConnector {
         // Only when set: a body without an engagement stays what it was.
         if !req.engagement_profiles.is_empty() {
             body["engagement_profiles"] = serde_json::json!(req.engagement_profiles);
+        }
+        if !req.skills.is_empty() {
+            body["skills"] = serde_json::json!(req.skills);
+        }
+        if !req.preload_skills.is_empty() {
+            body["preload_skills"] = serde_json::json!(req.preload_skills);
         }
         // A remote that doesn't advertise `run.supplied_run_id` mints its own
         // id, and the one it returns is the one used either way.

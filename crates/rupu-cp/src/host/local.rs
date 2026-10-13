@@ -1282,6 +1282,39 @@ mod launch_agent_tests {
             ["network"]
         );
     }
+
+    /// Same hop for a placed unit's workflow-step skills.
+    #[tokio::test]
+    async fn launch_agent_forwards_the_skills_to_the_launcher() {
+        let tmp = tempfile::tempdir().unwrap();
+        let capture = Arc::new(Capture(Mutex::new(None)));
+        let conn = LocalHostConnector::new(
+            None,
+            Some(capture.clone()),
+            None,
+            None,
+            Arc::new(RunStore::new(tmp.path().join("runs"))),
+            tmp.path().to_path_buf(),
+        );
+        conn.launch_agent(AgentLaunchRequest {
+            agent: "recon".into(),
+            prompt: None,
+            mode: None,
+            target: None,
+            working_dir: None,
+            run_id: None,
+            findings_profile: None,
+            engagement_profiles: Vec::new(),
+            skills: vec!["pdf".into()],
+            preload_skills: vec!["house-style".into()],
+            codename: None,
+        })
+        .await
+        .unwrap();
+        let got = capture.0.lock().unwrap().clone().unwrap();
+        assert_eq!(got.skills, ["pdf"]);
+        assert_eq!(got.preload_skills, ["house-style"]);
+    }
 }
 
 #[cfg(test)]

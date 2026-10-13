@@ -64,6 +64,7 @@ rupu-ast = { path = "../rupu-ast" }
 rupu-scm = { path = "../rupu-scm" }
 rupu-findings-report = { path = "../rupu-findings-report", default-features = false }
 rupu-codename = { workspace = true }
+rupu-skills = { workspace = true }
 # Agentiflows view: the run-dir record/def/unit readers (`api/agentiflows.rs`).
 # rupu-agentiflow depends on neither rupu-cp nor rupu-cli, so this edge is acyclic.
 rupu-agentiflow = { path = "../rupu-agentiflow" }
