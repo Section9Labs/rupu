@@ -3434,34 +3434,7 @@ mod tests {
         assert_eq!(asn.org, "CLOUDFLARENET");
     }
 
-    /// Register `host_id` resolving to `conn`. A `Local` transport under a
-    /// non-`"local"` id is the registry's injection seam.
-    fn state_with_host(
-        tmp: &tempfile::TempDir,
-        host_id: &str,
-        conn: Arc<dyn crate::host::connector::HostConnector>,
-    ) -> AppState {
-        let host_store = rupu_workspace::HostStore {
-            root: tmp.path().join("hosts"),
-        };
-        host_store
-            .save(&rupu_workspace::Host {
-                id: host_id.into(),
-                name: host_id.into(),
-                transport: rupu_workspace::HostTransport::Local,
-                token_hash: None,
-                created_at: chrono::Utc::now().to_rfc3339(),
-                last_seen_at: None,
-            })
-            .unwrap();
-        let registry = Arc::new(crate::host::registry::HostRegistry::new(host_store, conn));
-        AppState::new(
-            tmp.path().to_path_buf(),
-            rupu_config::PricingConfig::default(),
-        )
-        .with_workspace_dir(tmp.path().to_path_buf())
-        .with_hosts(registry)
-    }
+    use crate::host::connector::testing::state_with_host;
 
     fn placed_run(id: &str, host_id: &str, workspace: &std::path::Path) -> RunRecord {
         let mut r = seed_record(id, "wf", workspace);
@@ -3483,6 +3456,7 @@ mod tests {
                     "flows": [remote_flow],
                     "dropped_total": 2,
                 }))),
+                ..Default::default()
             });
         let s = state_with_host(&tmp, "host_ssh", conn);
         let run = placed_run("run_placed", "host_ssh", tmp.path());
@@ -3506,6 +3480,7 @@ mod tests {
                 // Default: Unsupported — a remote whose rupu predates
                 // `netflow show`.
                 run_netflow: None,
+                ..Default::default()
             });
         let s = state_with_host(&tmp, "host_ssh", conn);
         let run = placed_run("run_placed", "host_ssh", tmp.path());

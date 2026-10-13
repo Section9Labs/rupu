@@ -905,7 +905,9 @@ fn a_bad_skill_flag_fails_before_the_target_is_cloned() {
         home.path().join("skills").display()
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains(&format!("[error] {message}")), "{stderr}");
+    // The skill error is all the run said: no `cloning` line, and no SCM
+    // error from a clone that was tried and failed.
+    assert_eq!(stderr.trim_end(), format!("[error] {message}"));
     assert!(!cwd.path().join("r").exists());
     let record: Value = serde_json::from_str(
         &fs::read_to_string(home.path().join("runs/run_badclone/run.json")).unwrap(),

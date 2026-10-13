@@ -1480,6 +1480,36 @@ mod tests {
         assert_eq!(got.preload_skills, ["house-style"]);
     }
 
+    /// A launch on a remote host (`host` set) hands the host's connector the
+    /// skills, not only a local launcher.
+    #[tokio::test]
+    async fn run_agent_forwards_the_skills_to_a_remote_host() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stub = Arc::new(crate::host::connector::testing::StubConnector {
+            launched: Some(Mutex::new(Vec::new())),
+            ..Default::default()
+        });
+        let s = crate::host::connector::testing::state_with_host(&tmp, "host_ssh", stub.clone());
+        let body: AgentRunBody = serde_json::from_value(serde_json::json!({
+            "host": "host_ssh",
+            "skills": ["pdf", "project:notes"],
+            "preload_skills": ["house-style"]
+        }))
+        .unwrap();
+        let Json(reply) = run_agent(State(s), Path("recon".into()), Some(Json(body)))
+            .await
+            .expect("ok");
+        assert_eq!(
+            reply,
+            serde_json::json!({ "run_id": "run_STUB", "host_id": "host_ssh" })
+        );
+        let launched = stub.launched.as_ref().unwrap().lock().unwrap();
+        assert_eq!(launched.len(), 1);
+        assert_eq!(launched[0].agent, "recon");
+        assert_eq!(launched[0].skills, ["pdf", "project:notes"]);
+        assert_eq!(launched[0].preload_skills, ["house-style"]);
+    }
+
     #[tokio::test]
     async fn run_agent_rejects_a_malformed_skill_before_launching() {
         let mock = Arc::new(MockAgent {

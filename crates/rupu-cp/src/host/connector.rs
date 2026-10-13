@@ -1382,6 +1382,40 @@ pub(crate) mod testing {
         /// Canned `run_netflow` reply. `None` → `Unsupported`, modelling a
         /// remote whose `rupu` predates `netflow show`.
         pub run_netflow: Option<Result<serde_json::Value, HostConnectorError>>,
+        /// `Some` → `launch_agent` records each request here and answers
+        /// `run_STUB`. `None` → not configured.
+        pub launched: Option<std::sync::Mutex<Vec<crate::agent_launcher::AgentLaunchRequest>>>,
+    }
+
+    /// An `AppState` whose host registry resolves `host_id` to `conn`. A
+    /// `Local` transport under a non-`"local"` id is the registry's
+    /// injection seam.
+    pub(crate) fn state_with_host(
+        tmp: &tempfile::TempDir,
+        host_id: &str,
+        conn: std::sync::Arc<dyn HostConnector>,
+    ) -> crate::state::AppState {
+        let host_store = rupu_workspace::HostStore {
+            root: tmp.path().join("hosts"),
+        };
+        host_store
+            .save(&rupu_workspace::Host {
+                id: host_id.into(),
+                name: host_id.into(),
+                transport: rupu_workspace::HostTransport::Local,
+                token_hash: None,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                last_seen_at: None,
+            })
+            .unwrap();
+        let registry =
+            std::sync::Arc::new(crate::host::registry::HostRegistry::new(host_store, conn));
+        crate::state::AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        )
+        .with_workspace_dir(tmp.path().to_path_buf())
+        .with_hosts(registry)
     }
 
     #[async_trait::async_trait]
@@ -1410,9 +1444,14 @@ pub(crate) mod testing {
         }
         async fn launch_agent(
             &self,
-            _req: crate::agent_launcher::AgentLaunchRequest,
+            req: crate::agent_launcher::AgentLaunchRequest,
         ) -> Result<String, HostConnectorError> {
-            unimplemented!("StubConnector: launch_agent not configured")
+            let launched = self
+                .launched
+                .as_ref()
+                .expect("StubConnector: launch_agent not configured");
+            launched.lock().unwrap().push(req);
+            Ok("run_STUB".into())
         }
         async fn start_session(
             &self,

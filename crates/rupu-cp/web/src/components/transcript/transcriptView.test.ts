@@ -755,7 +755,7 @@ describe('v2 blocks model', () => {
         data: {
           skills: [
             { name: 'pdf', layer: 'global', stamp: 's', preload: true, indexed: false, reason: 'agent' },
-            { name: 'xlsx', layer: 'project', stamp: 's', preload: false, indexed: true, reason: 'step' },
+            { name: 'xlsx', layer: 'project', stamp: 's', preload: false, indexed: true, reason: 'launch' },
           ],
         },
       },
