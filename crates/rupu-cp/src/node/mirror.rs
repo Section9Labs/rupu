@@ -700,6 +700,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
         mirror.create_run("run_C1", "node-1", &spec).await.unwrap();
@@ -747,6 +749,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
         mirror.create_run("run_C3", "node-1", &spec).await.unwrap();
@@ -801,6 +805,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
         mirror.create_run("run_C2", "node-1", &spec).await.unwrap();
@@ -858,6 +864,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
         mirror.create_run("run_C3", "node-1", &spec).await.unwrap();
@@ -907,6 +915,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
         mirror.create_run("run_A1", "node-1", &spec).await.unwrap();

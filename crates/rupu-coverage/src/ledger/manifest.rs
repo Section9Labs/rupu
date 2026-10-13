@@ -31,6 +31,13 @@ pub struct RunManifest {
     /// manifests written before continuation existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continued_from: Option<String>,
+    /// The skills the launch granted on top of the agent's own
+    /// (`rupu run --skill`, a workflow step's `skills:`), as written.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
+    /// The launch's `--preload-skill` / `preload_skills:` entries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preload_skills: Vec<String>,
 }
 
 /// Append a manifest row to `runs.jsonl` (creates the file if absent).
@@ -85,6 +92,8 @@ mod tests {
             scope_name: "reviewer".to_string(),
             workspace_path: std::path::PathBuf::from("/tmp/repo"),
             continued_from: None,
+            skills: vec![],
+            preload_skills: vec![],
         }
     }
 
@@ -112,6 +121,23 @@ mod tests {
             "run_b"
         );
         assert!(find_manifest(&paths, "nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn launch_skills_round_trip_and_are_absent_when_none() {
+        let line = serde_json::to_value(sample("run_plain")).unwrap();
+        assert!(line.get("skills").is_none() && line.get("preload_skills").is_none());
+        let with = RunManifest {
+            skills: vec!["pdf".to_string(), "project:*".to_string()],
+            preload_skills: vec!["house-style".to_string()],
+            ..sample("run_skills")
+        };
+        let line = serde_json::to_string(&with).unwrap();
+        assert!(
+            line.contains(r#""skills":["pdf","project:*"],"preload_skills":["house-style"]"#),
+            "{line}"
+        );
+        assert_eq!(serde_json::from_str::<RunManifest>(&line).unwrap(), with);
     }
 
     #[test]

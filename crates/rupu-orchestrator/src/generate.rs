@@ -51,6 +51,10 @@ pub struct GenerateRequest {
     /// workflows these are injected so generated steps reference agents
     /// that actually exist.
     pub available_agents: Vec<String>,
+    /// Installed skills, as grant entries ([`installed_skill_names`]). For
+    /// workflows these are the only names a step's `skills:` /
+    /// `preload_skills:` may use.
+    pub available_skills: Vec<String>,
 }
 
 /// A successfully generated, validated definition.
@@ -109,7 +113,11 @@ pub fn validate(kind: GenKind, content: &str) -> Result<(), String> {
 }
 
 /// Build the system prompt teaching the model the target file format.
-pub fn build_system_prompt(kind: GenKind, available_agents: &[String]) -> String {
+pub fn build_system_prompt(
+    kind: GenKind,
+    available_agents: &[String],
+    available_skills: &[String],
+) -> String {
     match kind {
         GenKind::Agent => AGENT_SYSTEM_PROMPT.to_string(),
         GenKind::Workflow => {
@@ -119,12 +127,64 @@ pub fn build_system_prompt(kind: GenKind, available_agents: &[String]) -> String
             } else {
                 available_agents.join(", ")
             };
+            let skills = if available_skills.is_empty() {
+                "(none installed \u{2014} leave `skills:` and `preload_skills:` empty)".to_string()
+            } else {
+                available_skills.join(", ")
+            };
             format!(
                 "{WORKFLOW_SYSTEM_PROMPT}\n\nAvailable agent names (use ONLY these for `agent:` \
-                 and panelist fields): {agents}"
+                 and panelist fields): {agents}\n\nInstalled skills (use ONLY these in `skills:` \
+                 and `preload_skills:`; leave both empty when none fits): {skills}"
             )
         }
     }
+}
+
+/// The skills installed in the global layer and, when given, the project's,
+/// as entries a step's `skills:` accepts: a bare name, or `global:<name>` /
+/// `project:<name>` for a name both layers have (a bare one would be
+/// ambiguous). Lists directories only; no skill is loaded. A layer whose
+/// `skills/` can't be read is skipped with a warning; the other still lists.
+pub fn installed_skill_names(
+    global_rupu_dir: &std::path::Path,
+    project_rupu_dir: Option<&std::path::Path>,
+) -> Vec<String> {
+    let both = rupu_skills::LayerDirs::for_layers(global_rupu_dir, project_rupu_dir);
+    let layers = [
+        rupu_skills::LayerDirs {
+            project: None,
+            ..both.clone()
+        },
+        rupu_skills::LayerDirs {
+            global: None,
+            ..both
+        },
+    ];
+    let mut found: Vec<(String, rupu_skills::Layer)> = Vec::new();
+    for dirs in &layers {
+        match rupu_skills::SkillCatalog::discover(dirs) {
+            Ok(catalog) => found.extend(
+                catalog
+                    .entries()
+                    .iter()
+                    .filter(|e| e.dir_name.parse::<rupu_skills::SkillName>().is_ok())
+                    .map(|e| (e.dir_name.clone(), e.layer)),
+            ),
+            Err(e) => tracing::warn!(error = %e, "skills layer unreadable; not listing its skills"),
+        }
+    }
+    found.sort();
+    found
+        .iter()
+        .map(|(name, layer)| {
+            if found.iter().filter(|(n, _)| n == name).count() > 1 {
+                format!("{}:{name}", layer.as_str())
+            } else {
+                name.clone()
+            }
+        })
+        .collect()
 }
 
 const AGENT_SYSTEM_PROMPT: &str = "You generate a rupu AGENT definition file. Output ONLY the \
@@ -144,7 +204,8 @@ has type (string|int|bool), required (bool), description, optional default. Refe
 prompts as {{ inputs.<key> }}.\n  steps: (required list)\n\nEach linear step needs:\n  - id: \
 <unique id>\n    agent: <one of the available agent names>\n    prompt: |\n      <multi-line \
 instruction; may reference {{ inputs.x }} and {{ steps.<id>.output }}>\n    actions: []        \
-# optional allow-list of tool actions\n\nOther step shapes (used in place of a plain linear step when the\
+# optional allow-list of tool actions\n    skills: []         # optional: skills every agent of this step may load\n    \
+preload_skills: []  # optional: skills always in their prompt\n\nOther step shapes (used in place of a plain linear step when the\
 description calls for it):\n\
   - `for_each: <minijinja list expr>` plus `agent`/`prompt` \u{2014} fan one agent over a list; \
 inside the prompt use {{ item }}. Optional `max_parallel: <int>` caps concurrency (default 1).\n\
@@ -226,7 +287,7 @@ pub async fn generate_definition_with_provider(
     req: &GenerateRequest,
     provider: &mut dyn rupu_providers::LlmProvider,
 ) -> Result<GenerateOutcome, GenerateError> {
-    let system = build_system_prompt(req.kind, &req.available_agents);
+    let system = build_system_prompt(req.kind, &req.available_agents, &req.available_skills);
     let mut messages = vec![Message::user(&format!(
         "Create a rupu {} from this description:\n\n{}",
         req.kind.noun(),
@@ -315,14 +376,82 @@ mod tests {
         let p = build_system_prompt(
             GenKind::Workflow,
             &["reviewer".to_string(), "fixer".to_string()],
+            &[],
         );
         assert!(p.contains("reviewer"));
         assert!(p.contains("fixer"));
     }
 
     #[test]
+    fn system_prompt_lists_installed_skills_for_workflows() {
+        let p = build_system_prompt(
+            GenKind::Workflow,
+            &["writer".to_string()],
+            &["code-review".to_string(), "project:pdf".to_string()],
+        );
+        assert!(
+            p.ends_with(
+                "Installed skills (use ONLY these in `skills:` and `preload_skills:`; \
+                 leave both empty when none fits): code-review, project:pdf"
+            ),
+            "{p}"
+        );
+        let none = build_system_prompt(GenKind::Workflow, &["writer".to_string()], &[]);
+        assert!(
+            none.ends_with(
+                "Installed skills (use ONLY these in `skills:` and `preload_skills:`; \
+                 leave both empty when none fits): (none installed \u{2014} leave `skills:` \
+                 and `preload_skills:` empty)"
+            ),
+            "{none}"
+        );
+    }
+
+    #[test]
+    fn installed_skill_names_qualify_only_a_name_both_layers_have() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("global");
+        let project = tmp.path().join("repo/.rupu");
+        for dir in [
+            global.join("skills/pdf"),
+            global.join("skills/shared"),
+            global.join("skills/Not_A_Name"),
+            project.join("skills/notes"),
+            project.join("skills/shared"),
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        assert_eq!(
+            installed_skill_names(&global, Some(&project)),
+            vec!["notes", "pdf", "global:shared", "project:shared"]
+        );
+        assert_eq!(installed_skill_names(&global, None), vec!["pdf", "shared"]);
+        assert!(installed_skill_names(&tmp.path().join("absent"), None).is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_skills_layer_hides_only_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("global");
+        let project = tmp.path().join("repo/.rupu");
+        std::fs::create_dir_all(global.join("skills/pdf")).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("skills"), "not a directory").unwrap();
+        assert_eq!(installed_skill_names(&global, Some(&project)), vec!["pdf"]);
+
+        let project = tmp.path().join("repo2/.rupu");
+        std::fs::create_dir_all(project.join("skills/notes")).unwrap();
+        std::fs::remove_dir_all(global.join("skills")).unwrap();
+        std::fs::write(global.join("skills"), "not a directory").unwrap();
+        assert_eq!(
+            installed_skill_names(&global, Some(&project)),
+            vec!["notes"]
+        );
+    }
+
+    #[test]
     fn workflow_prompt_teaches_full_format() {
-        let p = build_system_prompt(GenKind::Workflow, &["writer".to_string()]);
+        let p = build_system_prompt(GenKind::Workflow, &["writer".to_string()], &[]);
         for kw in [
             "for_each",
             "parallel",
@@ -386,6 +515,7 @@ mod tests {
             provider: "anthropic".into(),
             model: "claude-sonnet-4-6".into(),
             available_agents: vec!["writer".into()],
+            available_skills: vec![],
         };
         let out = generate_definition_with_provider(&req, &mut p)
             .await
@@ -411,6 +541,7 @@ mod tests {
             provider: "anthropic".into(),
             model: "claude-sonnet-4-6".into(),
             available_agents: vec![],
+            available_skills: vec![],
         };
         let out = generate_definition(&req, &resolver, &Default::default()).await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
@@ -439,6 +570,7 @@ mod tests {
             provider: "anthropic".into(),
             model: "claude-sonnet-4-6".into(),
             available_agents: vec![],
+            available_skills: vec![],
         };
         let out = generate_definition(&req, &resolver, &Default::default()).await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
@@ -467,6 +599,7 @@ mod tests {
             provider: "anthropic".into(),
             model: "claude-sonnet-4-6".into(),
             available_agents: vec![],
+            available_skills: vec![],
         };
         let out = generate_definition(&req, &resolver, &Default::default()).await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");

@@ -2812,6 +2812,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         })
         .unwrap()
@@ -3516,6 +3518,8 @@ mod tests {
             target: None,
             findings_profile: Some(rupu_coverage::FindingProfile::Summary),
             engagement_profiles: vec!["network".into(), "web".into()],
+            skills: vec!["pdf".into(), "project:notes".into()],
+            preload_skills: vec!["house-style".into()],
             codename: Some("cobalt-harbor/heron#412".to_string()),
         }
     }
@@ -3548,6 +3552,8 @@ mod tests {
             Some(rupu_coverage::FindingProfile::Summary)
         );
         assert_eq!(args.engagement_profiles, ["network", "web"]);
+        assert_eq!(args.skills, ["pdf", "project:notes"]);
+        assert_eq!(args.preload_skills, ["house-style"]);
         // An older CP's spec carries no codename: the run is its own crew.
         let mut old = agent_spec();
         old.codename = None;
@@ -4574,6 +4580,7 @@ mod tests {
             vec![
                 rupu_cp::node::protocol::CAP_AGENT_FINDINGS_PROFILE.to_string(),
                 rupu_cp::node::protocol::CAP_AGENT_ENGAGEMENT_PROFILE.to_string(),
+                rupu_cp::node::protocol::CAP_AGENT_SKILLS.to_string(),
                 rupu_cp::node::protocol::CAP_RUN_CODENAME.to_string(),
             ]
         );
@@ -4621,6 +4628,8 @@ mod tests {
                     target: None,
                     findings_profile: None,
                     engagement_profiles: Vec::new(),
+                    skills: Vec::new(),
+                    preload_skills: Vec::new(),
                     codename: None,
                 },
             }))

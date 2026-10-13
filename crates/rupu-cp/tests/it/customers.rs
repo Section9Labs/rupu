@@ -306,6 +306,8 @@ fn write_transcript_at(
         codename: None,
         // `None` = a legacy record (no key); see the tri-state tests.
         customer: customer.map(|c| Some(c.to_string())),
+        launch_skills: Vec::new(),
+        launch_preload_skills: Vec::new(),
     };
     let usage = rupu_transcript::Event::Usage {
         provider: "anthropic".into(),

@@ -55,6 +55,8 @@ mod tests {
             run_id: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
         }
     }
 
@@ -103,6 +105,34 @@ mod tests {
         assert_eq!(run.run_id, "run_01COORD");
         assert_eq!(run.codename.as_deref(), Some("cobalt-harbor/heron#412"));
         assert!(args(&spec).contains(&"--codename".to_string()));
+    }
+
+    /// A placed unit's step skills reach the child's `rupu run`.
+    #[test]
+    fn the_units_skills_are_on_the_argv() {
+        let mut r = req();
+        r.target = None;
+        r.skills = vec!["pdf".into(), "project:notes".into()];
+        r.preload_skills = vec!["house-style".into()];
+        let (spec, run_id) = spawn_spec("/bin/rupu".as_ref(), &r).unwrap();
+        assert_eq!(
+            args(&spec),
+            [
+                "run",
+                "triage",
+                "--run-id",
+                &run_id,
+                "--mode",
+                "bypass",
+                "--skill",
+                "pdf",
+                "--skill",
+                "project:notes",
+                "--preload-skill",
+                "house-style",
+                "--prompt=look at PR",
+            ]
+        );
     }
 
     #[test]

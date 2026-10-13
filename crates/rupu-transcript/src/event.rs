@@ -65,7 +65,8 @@ pub struct ToolGrantMissing {
 /// (`global` / `project`), its stamp at run start (a later load compares
 /// against it), whether its body is preloaded, whether the model's index
 /// lists it (`false` when preloaded or `disable-model-invocation`), and why
-/// the run has it (`agent`, `step`, `session`, `operator`).
+/// the run has it (`agent`, `launch`, `session`, `operator`; transcripts
+/// written before the rename say `step` for `launch`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillIndexEntry {
     pub name: String,
@@ -117,6 +118,16 @@ pub enum Event {
             skip_serializing_if = "Option::is_none"
         )]
         customer: crate::recorded::RecordedField,
+        /// The skill entries the run's launch granted on top of its agent's
+        /// (a workflow step's `skills:`, `rupu run --skill`), as written:
+        /// `*` stays `*`. `rupu run --continue` passes them again. Empty on
+        /// transcripts written before the field existed.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        launch_skills: Vec<String>,
+        /// The launch's `preload_skills:` / `--preload-skill` entries,
+        /// likewise.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        launch_preload_skills: Vec<String>,
     },
     TurnStart {
         turn_idx: u32,
@@ -907,6 +918,8 @@ mod tests {
             system_prompt: None,
             codename: None,
             customer: Some(Some("acme".into())),
+            launch_skills: Vec::new(),
+            launch_preload_skills: Vec::new(),
         };
         let s = serde_json::to_string(&e).unwrap();
         assert!(s.contains(r#""customer":"acme""#), "{s}");
@@ -942,6 +955,8 @@ mod tests {
             system_prompt: None,
             codename: None,
             customer: Some(None),
+            launch_skills: Vec::new(),
+            launch_preload_skills: Vec::new(),
         };
         // A recorded "no customer" is written as an explicit `null`, so a
         // reader can tell it from a transcript that predates customers.

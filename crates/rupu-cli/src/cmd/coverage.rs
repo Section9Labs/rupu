@@ -1236,7 +1236,23 @@ async fn run_rerun_in(target_id: &str, run_id: &str) -> ExitCode {
         invocation.agent_name, target_id
     );
 
-    let args = crate::cmd::run::Args {
+    let code = match crate::cmd::run::run_inner(rerun_args(&invocation)).await {
+        Ok(()) => ExitCode::from(0),
+        Err(e) => crate::output::diag::fail(e),
+    };
+
+    println!();
+    println!(
+        "rerun complete · diff against the original with:\n  \
+         rupu coverage diff {target_id} {run_id} latest"
+    );
+    code
+}
+
+/// The `rupu run` a rerun of `invocation` makes: the recorded agent, prompt,
+/// mode and launch skills.
+fn rerun_args(invocation: &rupu_coverage::RerunInvocation) -> crate::cmd::run::Args {
+    crate::cmd::run::Args {
         agent: invocation.agent_name.clone(),
         target: None,
         prompt: Some(invocation.user_prompt.clone()),
@@ -1252,24 +1268,15 @@ async fn run_rerun_in(target_id: &str, run_id: &str) -> ExitCode {
         // Rerun uses the code path unless/until the run manifest records the
         // engagement selection (follow-on); it never silently guesses one.
         engagement_profiles: Vec::new(),
+        skills: invocation.skills.clone(),
+        preload_skills: invocation.preload_skills.clone(),
         continue_from: None,
         model: None,
         provider: None,
         fleet_run_dir: None,
         fleet_participant: None,
         launch: Default::default(),
-    };
-    let code = match crate::cmd::run::run_inner(args).await {
-        Ok(()) => ExitCode::from(0),
-        Err(e) => crate::output::diag::fail(e),
-    };
-
-    println!();
-    println!(
-        "rerun complete · diff against the original with:\n  \
-         rupu coverage diff {target_id} {run_id} latest"
-    );
-    code
+    }
 }
 
 #[cfg(test)]
@@ -1520,6 +1527,8 @@ mod tests {
             scope_name: "ses_1".to_string(),
             workspace_path: tmp.path().to_path_buf(),
             continued_from: None,
+            skills: vec![],
+            preload_skills: vec![],
         };
         append_manifest(&paths, &m).unwrap();
         let loaded = find_manifest(&paths, "run_sess").unwrap().unwrap();
@@ -1527,6 +1536,41 @@ mod tests {
             plan_rerun(&loaded).is_err(),
             "session rerun must be rejected"
         );
+    }
+
+    #[test]
+    fn rerun_passes_the_recorded_launch_skills_back() {
+        use chrono::{DateTime, Utc};
+        use rupu_coverage::{
+            append_manifest, find_manifest, plan_rerun, ConcernsBlock, CoveragePaths, RunManifest,
+            Surface,
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(tmp.path(), "tgt");
+        let m = RunManifest {
+            run_id: "run_skills".to_string(),
+            started_at: DateTime::<Utc>::from_timestamp(1, 0).unwrap(),
+            surface: Surface::Agent,
+            agent_name: "reviewer".to_string(),
+            provider: "anthropic".to_string(),
+            model: "m".to_string(),
+            permission_mode: "readonly".to_string(),
+            user_prompt: "go".to_string(),
+            concerns: ConcernsBlock { entries: vec![] },
+            scope_name: "reviewer".to_string(),
+            workspace_path: tmp.path().to_path_buf(),
+            continued_from: None,
+            skills: vec!["x".to_string(), "project:*".to_string()],
+            preload_skills: vec!["house-style".to_string()],
+        };
+        append_manifest(&paths, &m).unwrap();
+        let loaded = find_manifest(&paths, "run_skills").unwrap().unwrap();
+        let args = rerun_args(&plan_rerun(&loaded).unwrap());
+        assert_eq!(args.agent, "reviewer");
+        assert_eq!(args.prompt.as_deref(), Some("go"));
+        assert_eq!(args.mode.as_deref(), Some("readonly"));
+        assert_eq!(args.skills, vec!["x".to_string(), "project:*".to_string()]);
+        assert_eq!(args.preload_skills, vec!["house-style".to_string()]);
     }
 
     #[test]
@@ -1758,6 +1802,8 @@ mod tests {
             scope_name: "a".to_string(),
             workspace_path: tmp.path().to_path_buf(),
             continued_from: None,
+            skills: vec![],
+            preload_skills: vec![],
         };
         append_manifest(&paths, &m).unwrap();
 

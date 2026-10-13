@@ -13,6 +13,36 @@ pub struct RuntimeDefinitionGenerator {
     pub global_dir: PathBuf,
 }
 
+impl RuntimeDefinitionGenerator {
+    /// A workflow request names the global layer's agents and skills; the CP
+    /// has no project layer here.
+    fn gen_request(
+        &self,
+        kind: DefKind,
+        description: String,
+        provider: String,
+        model: String,
+    ) -> rupu_orchestrator::GenerateRequest {
+        match kind {
+            DefKind::Agent => rupu_orchestrator::GenerateRequest {
+                kind: rupu_orchestrator::GenKind::Agent,
+                description,
+                provider,
+                model,
+                available_agents: vec![],
+                available_skills: vec![],
+            },
+            DefKind::Workflow => crate::cmd::workflow::workflow_gen_request(
+                &self.global_dir,
+                None,
+                description,
+                provider,
+                model,
+            ),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl DefinitionGenerator for RuntimeDefinitionGenerator {
     async fn generate(&self, req: GenerateDefRequest) -> Result<GeneratedDef, GenDefError> {
@@ -44,22 +74,7 @@ impl DefinitionGenerator for RuntimeDefinitionGenerator {
                 .await
                 .ok_or(GenDefError::NoCredentials)?,
         };
-        let (kind, available_agents) = match req.kind {
-            DefKind::Agent => (rupu_orchestrator::GenKind::Agent, vec![]),
-            DefKind::Workflow => {
-                let agents = rupu_agent::load_agents(&self.global_dir, None)
-                    .map(|specs| specs.into_iter().map(|s| s.name).collect())
-                    .unwrap_or_default();
-                (rupu_orchestrator::GenKind::Workflow, agents)
-            }
-        };
-        let gen_req = rupu_orchestrator::GenerateRequest {
-            kind,
-            description: req.description,
-            provider,
-            model,
-            available_agents,
-        };
+        let gen_req = self.gen_request(req.kind, req.description, provider, model);
         // ISSUES.md I-74: honor `[providers.<name>]` here too. This path is
         // the CP's "generate a definition" button, so it previously ran with
         // none of the operator's timeout/retry/concurrency/base_url settings.
@@ -115,6 +130,18 @@ impl DefinitionGenerator for RuntimeDefinitionGenerator {
 mod tests {
     use super::*;
     use crate::test_support::ENV_LOCK;
+
+    #[test]
+    fn a_workflow_request_carries_the_installed_skills() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("skills/pdf")).unwrap();
+        let adapter = RuntimeDefinitionGenerator {
+            global_dir: tmp.path().to_path_buf(),
+        };
+        let req = |kind| adapter.gen_request(kind, "d".into(), "p".into(), "m".into());
+        assert_eq!(req(DefKind::Workflow).available_skills, ["pdf"]);
+        assert!(req(DefKind::Agent).available_skills.is_empty());
+    }
 
     const VALID_AGENT_MD: &str = "---\nname: a\ndescription: d\nprovider: anthropic\nmodel: claude-sonnet-4-6\n---\n\nbody\n";
 

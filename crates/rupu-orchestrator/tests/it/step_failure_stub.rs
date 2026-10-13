@@ -91,6 +91,15 @@ async fn run(agent_file: Option<&str>) -> Outcome {
 
 /// [`run`], after `setup` prepares the global `.rupu`.
 async fn run_with(agent_file: Option<&str>, setup: impl FnOnce(&std::path::Path)) -> Outcome {
+    run_in(WF, agent_file, setup).await
+}
+
+/// [`run_with`] on the workflow `wf`, whose one step is `only` on `AGENT`.
+async fn run_in(
+    wf: &str,
+    agent_file: Option<&str>,
+    setup: impl FnOnce(&std::path::Path),
+) -> Outcome {
     let tmp = tempfile::tempdir().unwrap();
     let global = tmp.path().join("global");
     std::fs::create_dir_all(global.join("agents")).unwrap();
@@ -102,7 +111,7 @@ async fn run_with(agent_file: Option<&str>, setup: impl FnOnce(&std::path::Path)
     std::fs::create_dir_all(&workspace).unwrap();
     let store = Arc::new(RunStore::new(global.join("runs")));
     let sink = Arc::new(CollectSink::default());
-    let workflow = Workflow::parse(WF).unwrap();
+    let workflow = Workflow::parse(wf).unwrap();
     let factory = crate::support::step_factory(&global, workflow.clone());
     let run_id = "run_stubbed";
     let opts = OrchestratorRunOpts {
@@ -117,7 +126,7 @@ async fn run_with(agent_file: Option<&str>, setup: impl FnOnce(&std::path::Path)
         issue: None,
         issue_ref: None,
         run_store: Some(Arc::clone(&store)),
-        workflow_yaml: Some(WF.to_string()),
+        workflow_yaml: Some(wf.to_string()),
         resume_from: None,
         run_id_override: Some(run_id.to_string()),
         strict_templates: false,
@@ -365,6 +374,52 @@ async fn a_step_whose_agent_names_an_invalid_skill_fails_its_assembly() {
         last,
         &json!({"data": {"duration_ms": V, "error": message, "run_id": V, "status": "error", "total_tokens": 0}, "type": "run_complete"})
     );
+}
+
+/// A step naming a skill that is not installed fails that step with a
+/// recorded, unstarted run, the way an agent naming one does: the agent
+/// itself loads, so the run's assembly refuses it. Its `run_start` records
+/// the skill the step asked for, as written.
+#[tokio::test]
+async fn a_step_naming_a_missing_skill_records_an_unstarted_run() {
+    const SKILLED: &str = r#"
+name: stubbed
+steps:
+  - id: only
+    agent: AGENT
+    prompt: "go"
+    skills: [missing]
+"#;
+    let o = run_in(
+        SKILLED,
+        Some("---\nname: AGENT\nprovider: anthropic\nmodel: claude-sonnet-4-6\n---\nhi\n"),
+        |_| {},
+    )
+    .await;
+    let message = format!(
+        "skills: unknown skill \"missing\" (looked in {}; install it with `rupu skill install`)",
+        o.global.join("skills").display()
+    );
+    let error = format!("agent failure in step only: {message}");
+    assert_eq!(o.error, error, "{}", dump(&o));
+    assert_eq!(
+        o.step,
+        json!({"cause": null, "error": error, "status": "failed", "steps": []})
+    );
+    assert_eq!(
+        o.events,
+        events("anthropic", "claude-sonnet-4-6", &error, Value::Null)
+    );
+    let mut start = run_start(
+        "anthropic",
+        "claude-sonnet-4-6",
+        Some("hi\n\n\nYour call sign in this run is `gazelle` (crew `tan-tower`). Sign any comments, issues or PR notes you post with it."),
+    );
+    start["data"]["launch_skills"] = json!(["missing"]);
+    let mut transcript = vec![start];
+    transcript.extend(preamble());
+    transcript.push(json!({"data": {"duration_ms": V, "error": message, "run_id": V, "status": "error", "total_tokens": 0}, "type": "run_complete"}));
+    assert_eq!(o.transcript, transcript, "{}", dump(&o));
 }
 
 fn dump(o: &Outcome) -> String {

@@ -26,8 +26,8 @@ use crate::{
     launcher::LaunchRequest,
     node::{
         protocol::{
-            ArtifactFile, RunSpec, RunSpecKind, CAP_RUN_CODENAME_FLAG, CAP_RUN_LIST,
-            CAP_WORKFLOW_RESUME_IF_UNFINISHED, FEATURES_SUBCOMMAND,
+            ArtifactFile, RunSpec, RunSpecKind, CAP_AGENT_SKILLS, CAP_RUN_CODENAME_FLAG,
+            CAP_RUN_LIST, CAP_WORKFLOW_RESUME_IF_UNFINISHED, FEATURES_SUBCOMMAND,
         },
         NodeMirror,
     },
@@ -63,6 +63,39 @@ pub fn resume_argv(run_id: &str, if_unfinished: bool) -> RunArgv {
 /// Printed by a launch ([`SshHostConnector::detach_launch_argv`]) whose
 /// remote predates `--codename`, so the codename went as `RUPU_CODENAME`.
 const LAUNCH_CODENAME_ENV: &str = "rupu-launch: codename-env";
+
+/// Printed, instead of launching, by the skills gate
+/// ([`SshHostConnector::skills_gate`]) when the remote `rupu __features`
+/// doesn't list [`CAP_AGENT_SKILLS`]: its `rupu run` would reject `--skill`
+/// and the detached unit would die without a trace.
+const LAUNCH_SKILLS_UNSUPPORTED: &str = "rupu-launch: skills-unsupported";
+
+/// Printed, instead of launching, by the skills gate
+/// when `rupu` is not on the remote's non-interactive PATH, so the refusal
+/// names the missing binary rather than an old one.
+const LAUNCH_RUPU_NOT_FOUND: &str = "rupu-launch: rupu-not-found";
+
+/// Whether `argv` is an agent launch carrying workflow-step skills.
+fn carries_skills(argv: &RunArgv) -> bool {
+    matches!(
+        argv,
+        RunArgv::Agent(a) if !a.skills.is_empty() || !a.preload_skills.is_empty()
+    )
+}
+
+/// Captures the remote `rupu __features` report into `$f`, once per command.
+fn features_capture() -> String {
+    let probe = build_remote_command(&["rupu".to_string(), FEATURES_SUBCOMMAND.to_string()]);
+    format!("f=$({probe} 2>/dev/null)")
+}
+
+/// A shell test: the report in `$f` ([`features_capture`]) lists `feature`.
+fn features_list(feature: &str) -> String {
+    format!(
+        "printf '%s\\n' \"$f\" | grep -qF {}",
+        shell_escape(&format!("\"{feature}\""))
+    )
+}
 
 /// Printed by [`resume_command`] when it dispatched `--if-unfinished`.
 const RESUME_GUARDED: &str = "rupu-resume: if-unfinished";
@@ -1910,6 +1943,14 @@ impl SshHostConnector {
     /// two by its own `rupu __features` in the same ssh session — the same
     /// one-command pattern as [`resume_command`] — and the legacy branch
     /// prints [`LAUNCH_CODENAME_ENV`] so the launch can say which ran.
+    ///
+    /// The remote's feature report is captured once, into `$f`, and both
+    /// gates read it.
+    ///
+    /// A launch carrying workflow-step skills is wrapped in the skills gate
+    /// ([`Self::skills_gate`]) as a backstop: `launch_agent` has already
+    /// sent the same gate as its own command
+    /// ([`Self::skills_gate_command`]) before creating the mirror run.
     fn detach_launch_argv(
         argv: &RunArgv,
         run_id: &str,
@@ -1918,19 +1959,73 @@ impl SshHostConnector {
         let current = argv.to_shell("rupu");
         let (legacy, _) = argv.for_peer(&FeatureSet::shell_peer(Vec::<String>::new()));
         let legacy = legacy.to_shell("rupu");
-        if legacy == current {
+        let needs_skills = carries_skills(argv);
+        if legacy == current && !needs_skills {
             return Self::detach_launch(&current, run_id, working_dir);
         }
-        let probe = build_remote_command(&["rupu".to_string(), FEATURES_SUBCOMMAND.to_string()]);
-        let feature = shell_escape(&format!("\"{CAP_RUN_CODENAME_FLAG}\""));
-        Self::detach_launch_with(run_id, working_dir, |redirect| {
-            format!(
-                "if {probe} 2>/dev/null | grep -qF {feature}; then {}; else echo {}; {}; fi",
-                detach_fragment(&current, redirect),
-                shell_escape(LAUNCH_CODENAME_ENV),
-                detach_fragment(&legacy, redirect),
-            )
-        })
+        let launch = |redirect: &str| {
+            if legacy == current {
+                detach_fragment(&current, redirect)
+            } else {
+                format!(
+                    "if {}; then {}; else echo {}; {}; fi",
+                    features_list(CAP_RUN_CODENAME_FLAG),
+                    detach_fragment(&current, redirect),
+                    shell_escape(LAUNCH_CODENAME_ENV),
+                    detach_fragment(&legacy, redirect),
+                )
+            }
+        };
+        if !needs_skills {
+            return Self::detach_launch_with(run_id, working_dir, |redirect| {
+                format!("{}; {}", features_capture(), launch(redirect))
+            });
+        }
+        let launch = Self::detach_launch_with(run_id, working_dir, launch)?;
+        Ok(Self::skills_gate(&launch))
+    }
+
+    /// The skills gate: captures the remote's feature report into `$f` and
+    /// runs `then` only when it lists [`CAP_AGENT_SKILLS`]; otherwise it
+    /// prints [`LAUNCH_SKILLS_UNSUPPORTED`] and creates nothing. Skills
+    /// change what a run does, so there is no downgraded form to run
+    /// instead. A remote with no `rupu` on its non-interactive PATH prints
+    /// [`LAUNCH_RUPU_NOT_FOUND`] instead, so the refusal says what is wrong.
+    fn skills_gate(then: &str) -> String {
+        format!(
+            "if ! command -v rupu >/dev/null 2>&1; then echo {}; else {}; \
+             if {}; then {then}; else echo {}; fi; fi",
+            shell_escape(LAUNCH_RUPU_NOT_FOUND),
+            features_capture(),
+            features_list(CAP_AGENT_SKILLS),
+            shell_escape(LAUNCH_SKILLS_UNSUPPORTED),
+        )
+    }
+
+    /// [`Self::skills_gate`] with nothing to run: prints a marker exactly
+    /// when the launch's own gate would refuse.
+    fn skills_gate_command() -> String {
+        Self::skills_gate(":")
+    }
+
+    /// The refusal a skills-gate marker in `stdout` stands for.
+    fn skills_gate_refusal(&self, stdout: &str) -> Option<HostConnectorError> {
+        let printed = |marker: &str| stdout.lines().any(|l| l.trim() == marker);
+        if printed(LAUNCH_RUPU_NOT_FOUND) {
+            return Some(HostConnectorError::Unsupported(format!(
+                "host {}: rupu was not found on the remote's PATH (`command -v rupu` failed in a \
+                 non-interactive ssh session); install rupu there or put it on that PATH",
+                self.host_id
+            )));
+        }
+        if printed(LAUNCH_SKILLS_UNSUPPORTED) {
+            return Some(HostConnectorError::Unsupported(format!(
+                "host {} runs a rupu without workflow-step skills support, so this unit's \
+                 skills cannot be delivered; upgrade rupu there",
+                self.host_id
+            )));
+        }
+        None
     }
 
     fn detach_launch_with(
@@ -2620,6 +2715,8 @@ impl HostConnector for SshHostConnector {
             target: req.target.clone(),
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
 
@@ -2681,12 +2778,31 @@ impl HostConnector for SshHostConnector {
             target: req.target.clone(),
             findings_profile: req.findings_profile,
             engagement_profiles: req.engagement_profiles.clone(),
+            skills: req.skills.clone(),
+            preload_skills: req.preload_skills.clone(),
             codename: None,
         };
 
         // Build the remote command BEFORE creating the mirror run — see
         // `launch_run`.
         let detached = Self::detach_launch_argv(&argv, &run_id, req.working_dir.as_deref())?;
+
+        // A remote that can't take the skills refuses before the mirror run
+        // exists, as the other transports do: one extra command, only for a
+        // launch carrying skills.
+        if carries_skills(&argv) {
+            let out = self
+                .exec
+                .run(&Self::skills_gate_command())
+                .await
+                .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
+            if !out.success {
+                return Err(HostConnectorError::Unreachable(out.stderr));
+            }
+            if let Some(refusal) = self.skills_gate_refusal(&out.stdout) {
+                return Err(refusal);
+            }
+        }
 
         self.mirror
             .create_run(&run_id, &self.host_id, &spec)
@@ -2705,6 +2821,10 @@ impl HostConnector for SshHostConnector {
         if !out.success {
             let _ = self.mirror.finish(&run_id, &self.host_id, "failed").await;
             return Err(HostConnectorError::Unreachable(out.stderr));
+        }
+        if let Some(refusal) = self.skills_gate_refusal(&out.stdout) {
+            let _ = self.mirror.finish(&run_id, &self.host_id, "failed").await;
+            return Err(refusal);
         }
         if out.stdout.lines().any(|l| l.trim() == LAUNCH_CODENAME_ENV) {
             tracing::info!(
@@ -3779,6 +3899,149 @@ mod tests {
             };
             assert_eq!(got, want, "{features}");
         }
+    }
+
+    /// A launch carrying workflow-step skills runs only on a remote whose
+    /// `rupu __features` lists `agent.skills`, decided by the remote (through
+    /// a real shell against fake remotes, with a codename so the codename
+    /// gate shares the launch's one feature report) twice: by the gate
+    /// command sent before the mirror run exists, and again by the launch
+    /// command as a backstop. Any other remote prints
+    /// [`LAUNCH_SKILLS_UNSUPPORTED`], and a remote with no `rupu` on its PATH
+    /// prints [`LAUNCH_RUPU_NOT_FOUND`]; either command then runs nothing
+    /// and leaves no run directory behind.
+    #[test]
+    fn a_launch_with_skills_runs_only_on_a_remote_advertising_them() {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+        let report =
+            serde_json::to_string(&crate::node::protocol::FeaturesReport::current()).unwrap();
+        let mut run = rupu_runtime::argv::AgentRun::new("triage", "run_01SKILLS");
+        run.codename = Some("cobalt-harbor/heron#412".into());
+        run.skills = vec!["pdf".into()];
+        run.preload_skills = vec!["house-style".into()];
+        run.prompt = Some("go".into());
+        let cmd = SshHostConnector::detach_launch_argv(&RunArgv::Agent(run), "run_01SKILLS", None)
+            .unwrap();
+        let gate = SshHostConnector::skills_gate_command();
+        // (why, `__features` body, rupu on PATH, marker printed — none = launches)
+        let cases = [
+            ("current rupu", format!("echo '{report}'"), true, None),
+            (
+                "rupu listing other features",
+                r#"echo '{"features":["run.codename_flag","agent.findings_profile"]}'"#.to_string(),
+                true,
+                Some(LAUNCH_SKILLS_UNSUPPORTED),
+            ),
+            (
+                "rupu predating __features",
+                "echo \"error: unrecognized subcommand '__features'\" >&2; exit 2".to_string(),
+                true,
+                Some(LAUNCH_SKILLS_UNSUPPORTED),
+            ),
+            (
+                "no rupu on the PATH",
+                format!("echo '{report}'"),
+                false,
+                Some(LAUNCH_RUPU_NOT_FOUND),
+            ),
+        ];
+        for (why, features, on_path, marker) in cases {
+            let bin = tempfile::tempdir().unwrap();
+            let home = tempfile::tempdir().unwrap();
+            let seen = bin.path().join("seen");
+            let rupu = bin.path().join("rupu");
+            let probes = bin.path().join("probes");
+            std::fs::write(
+                &rupu,
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" = __features ]; then echo x >> '{p}'; {features}; exit 0; fi\n\
+                     printf '%s|' \"$@\" > '{s}.tmp'; mv '{s}.tmp' '{s}'\n",
+                    p = probes.display(),
+                    s = seen.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&rupu, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let path = if on_path {
+                format!("{}:/usr/bin:/bin", bin.path().display())
+            } else {
+                "/usr/bin:/bin".to_string()
+            };
+            let run_shell = |what: &str, command: &str| {
+                let _ = std::fs::remove_file(&probes);
+                let out = std::process::Command::new("/bin/sh")
+                    .arg("-c")
+                    .arg(command)
+                    .env("HOME", home.path())
+                    .env("PATH", &path)
+                    .output()
+                    .expect("the shell itself must run");
+                assert!(out.status.success(), "{why}, {what}: {out:?}");
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let printed: Vec<&str> = [LAUNCH_SKILLS_UNSUPPORTED, LAUNCH_RUPU_NOT_FOUND]
+                    .into_iter()
+                    .filter(|m| stdout.lines().any(|l| l.trim() == *m))
+                    .collect();
+                assert_eq!(
+                    printed,
+                    marker.into_iter().collect::<Vec<_>>(),
+                    "{why}, {what}: {out:?}"
+                );
+                if on_path {
+                    assert_eq!(
+                        std::fs::read_to_string(&probes).unwrap(),
+                        "x\n",
+                        "{why}, {what}: `rupu __features` runs once per command"
+                    );
+                }
+            };
+            run_shell("gate", &gate);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(!seen.exists(), "{why}: the gate launched the unit");
+            assert!(
+                !home.path().join(".rupu").exists(),
+                "{why}: the gate left files on the remote"
+            );
+            run_shell("launch", &cmd);
+            if marker.is_some() {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                assert!(!seen.exists(), "{why}: the unit ran without its skills");
+                assert!(
+                    !home.path().join(".rupu").exists(),
+                    "{why}: a refused launch left files on the remote"
+                );
+                continue;
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !seen.exists() {
+                assert!(std::time::Instant::now() < deadline, "{why}: never ran");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert_eq!(
+                std::fs::read_to_string(&seen).unwrap(),
+                "run|triage|--run-id|run_01SKILLS|--codename|cobalt-harbor/heron#412|\
+                 --skill|pdf|--preload-skill|house-style|--prompt=go|",
+                "{why}"
+            );
+            assert!(home
+                .path()
+                .join(".rupu/runs/run_01SKILLS/launch.log")
+                .is_file());
+        }
+    }
+
+    /// No skills: no `agent.skills` gate in the command.
+    #[test]
+    fn a_launch_without_skills_sends_no_skills_gate() {
+        use super::*;
+        let mut run = rupu_runtime::argv::AgentRun::new("triage", "run_01NOSKILLS");
+        run.codename = Some("cobalt-harbor/heron#412".into());
+        let cmd =
+            SshHostConnector::detach_launch_argv(&RunArgv::Agent(run), "run_01NOSKILLS", None)
+                .unwrap();
+        assert!(!cmd.contains(CAP_AGENT_SKILLS), "{cmd}");
+        assert!(!cmd.contains(LAUNCH_SKILLS_UNSUPPORTED), "{cmd}");
     }
 
     /// No codename: one command, no feature probe.
@@ -6268,6 +6531,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
         conn.mirror
@@ -7244,6 +7509,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
         conn.mirror
@@ -7335,6 +7602,8 @@ mod tests {
                 run_id: Some(run_id.into()),
                 findings_profile: None,
                 engagement_profiles: Vec::new(),
+                skills: Vec::new(),
+                preload_skills: Vec::new(),
                 codename: None,
             })
             .await
@@ -7537,6 +7806,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -7664,6 +7935,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
         conn.mirror
@@ -7736,6 +8009,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
         conn.mirror
@@ -7805,6 +8080,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
         conn.mirror
@@ -7859,6 +8136,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
         conn.mirror
@@ -7913,6 +8192,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
         conn.mirror
@@ -8103,6 +8384,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
         conn.mirror
@@ -8198,6 +8481,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
         conn.mirror
@@ -8289,6 +8574,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
         conn.mirror
@@ -8727,6 +9014,8 @@ mod tests {
                     run_id: None,
                     findings_profile: None,
                     engagement_profiles: Vec::new(),
+                    skills: Vec::new(),
+                    preload_skills: Vec::new(),
                 })
                 .await
                 .expect("launch_agent");
@@ -9026,11 +9315,17 @@ mod tests {
                 run_id: None,
                 findings_profile: None,
                 engagement_profiles: Vec::new(),
+                skills: Vec::new(),
+                preload_skills: Vec::new(),
             })
             .await
             .unwrap();
 
         let cmds = fake.commands.lock().unwrap();
+        assert!(
+            !cmds.contains(&SshHostConnector::skills_gate_command()),
+            "a launch without skills sends no skills gate: {cmds:?}"
+        );
         let launch = cmds
             .iter()
             .find(|c| c.contains("setsid"))
@@ -9062,6 +9357,8 @@ mod tests {
                 run_id: Some("run_01MINTEDBYCOORD".into()),
                 findings_profile: None,
                 engagement_profiles: Vec::new(),
+                skills: Vec::new(),
+                preload_skills: Vec::new(),
             })
             .await
             .unwrap();
@@ -9092,6 +9389,8 @@ mod tests {
                 run_id: Some("run_01PROFILED".into()),
                 findings_profile: Some(rupu_coverage::FindingProfile::Summary),
                 engagement_profiles: Vec::new(),
+                skills: Vec::new(),
+                preload_skills: Vec::new(),
                 codename: None,
             })
             .await
@@ -9123,6 +9422,8 @@ mod tests {
             run_id: Some("run_01ENGAGED".into()),
             findings_profile: None,
             engagement_profiles: vec!["network".into(), "web".into()],
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         })
         .await
@@ -9136,6 +9437,164 @@ mod tests {
             launch.contains("'--engagement-profile' 'network' '--engagement-profile' 'web'"),
             "the remote `rupu run` must carry the engagement: {launch}"
         );
+    }
+
+    fn skilled_launch(run_id: &str) -> crate::agent_launcher::AgentLaunchRequest {
+        crate::agent_launcher::AgentLaunchRequest {
+            agent: "recon".into(),
+            prompt: Some("enumerate".into()),
+            mode: None,
+            target: None,
+            working_dir: None,
+            run_id: Some(run_id.into()),
+            findings_profile: None,
+            engagement_profiles: Vec::new(),
+            skills: vec!["pdf".into()],
+            preload_skills: vec!["house-style".into()],
+            codename: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn launch_agent_passes_the_skills_to_the_remote_rupu_run_behind_the_gate() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn, _run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        conn.launch_agent(skilled_launch("run_01SKILLED"))
+            .await
+            .unwrap();
+        let cmds = fake.commands.lock().unwrap();
+        assert_eq!(
+            cmds.first(),
+            Some(&SshHostConnector::skills_gate_command()),
+            "the skills gate runs first, as its own command: {cmds:?}"
+        );
+        assert_eq!(
+            cmds.iter()
+                .filter(|c| c.contains(FEATURES_SUBCOMMAND))
+                .count(),
+            2,
+            "one gate command and one launch, nothing more: {cmds:?}"
+        );
+        let launch = cmds
+            .iter()
+            .find(|c| c.contains("'rupu' 'run' 'recon'"))
+            .unwrap_or_else(|| panic!("no agent launch in {cmds:?}"));
+        assert!(
+            launch.contains("'--skill' 'pdf' '--preload-skill' 'house-style'"),
+            "the remote `rupu run` must carry the skills: {launch}"
+        );
+        assert!(
+            launch.contains(&format!("grep -qF '\"{CAP_AGENT_SKILLS}\"'")),
+            "the launch must be gated on the remote's agent.skills: {launch}"
+        );
+    }
+
+    /// Prints `marker` on the launch (`rupu run`) when `on_launch` is set,
+    /// else on every other command (the skills gate); the rest succeed empty.
+    struct MarkerExec {
+        marker: &'static str,
+        on_launch: bool,
+        commands: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RemoteExec for MarkerExec {
+        async fn run(&self, remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+            self.commands.lock().unwrap().push(remote.to_string());
+            let is_launch = remote.contains("'rupu' 'run'");
+            Ok(RemoteOutput {
+                stdout: if is_launch == self.on_launch {
+                    format!("{}\n", self.marker)
+                } else {
+                    String::new()
+                },
+                stderr: String::new(),
+                success: true,
+            })
+        }
+        fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+            panic!("no tail pump for a refused launch")
+        }
+        async fn run_bytes(
+            &self,
+            _c: &str,
+            _s: Option<Vec<u8>>,
+        ) -> Result<Vec<u8>, RemoteExecError> {
+            unimplemented!("not used by launch_agent")
+        }
+    }
+
+    const SKILLS_REFUSALS: [(&str, &str, &str); 2] = [
+        (LAUNCH_SKILLS_UNSUPPORTED, "upgrade rupu", "PATH"),
+        (
+            LAUNCH_RUPU_NOT_FOUND,
+            "rupu was not found on the remote's PATH",
+            "upgrade",
+        ),
+    ];
+
+    /// The remote's own `rupu __features` lacked `agent.skills`, or the
+    /// remote had no `rupu` on its PATH, so the skills gate printed a marker:
+    /// the unit is refused with an error that says which, before any mirror
+    /// run exists or any launch is sent, and no tail pump starts.
+    #[tokio::test]
+    async fn launch_agent_refuses_a_remote_whose_skills_gate_printed_a_marker() {
+        for (marker, says, not_says) in SKILLS_REFUSALS {
+            let exec = std::sync::Arc::new(MarkerExec {
+                marker,
+                on_launch: false,
+                commands: Default::default(),
+            });
+            let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&exec));
+            let err = conn
+                .launch_agent(skilled_launch("run_01OLDREMOTE"))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, HostConnectorError::Unsupported(m)
+                    if m.contains("host_abc") && m.contains(says) && !m.contains(not_says)),
+                "{marker}: {err:?}"
+            );
+            assert_eq!(
+                *exec.commands.lock().unwrap(),
+                vec![SshHostConnector::skills_gate_command()],
+                "{marker}: the gate only, no launch"
+            );
+            assert!(
+                run_store.list().unwrap().is_empty(),
+                "{marker}: a refused launch left a mirror run"
+            );
+        }
+    }
+
+    /// The gate passed but the launch's own backstop printed a marker (the
+    /// remote's rupu changed between the two commands): the unit is refused
+    /// and its mirror run is finished failed rather than left running.
+    #[tokio::test]
+    async fn launch_agent_refuses_a_launch_whose_backstop_printed_a_marker() {
+        for (marker, says, not_says) in SKILLS_REFUSALS {
+            let exec = std::sync::Arc::new(MarkerExec {
+                marker,
+                on_launch: true,
+                commands: Default::default(),
+            });
+            let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&exec));
+            let err = conn
+                .launch_agent(skilled_launch("run_01RACED"))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, HostConnectorError::Unsupported(m)
+                    if m.contains("host_abc") && m.contains(says) && !m.contains(not_says)),
+                "{marker}: {err:?}"
+            );
+            assert_eq!(exec.commands.lock().unwrap().len(), 2, "gate, then launch");
+            assert_eq!(
+                run_store.load("run_01RACED").unwrap().status,
+                rupu_orchestrator::RunStatus::Failed,
+                "{marker}: no mirror run left running"
+            );
+        }
     }
 
     #[tokio::test]
@@ -9153,6 +9612,8 @@ mod tests {
                 run_id: Some("../evil".into()),
                 findings_profile: None,
                 engagement_profiles: Vec::new(),
+                skills: Vec::new(),
+                preload_skills: Vec::new(),
             })
             .await
             .unwrap_err();
@@ -9430,6 +9891,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         }
     }
@@ -9444,6 +9907,8 @@ mod tests {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         }
     }

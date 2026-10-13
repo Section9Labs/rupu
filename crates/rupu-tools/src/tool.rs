@@ -119,6 +119,15 @@ pub struct RunIdentity {
     /// What this run may launch and where its children are recorded (W7).
     #[serde(default)]
     pub launch: LaunchScope,
+    /// The skill entries the launch granted on top of the agent's (a
+    /// workflow step's `skills:`, `rupu run --skill`), as written. The run's
+    /// skills are resolved from the launch, not from this; it is kept so the
+    /// coverage manifest records what a rerun must pass again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launch_skills: Vec<String>,
+    /// The launch's `preload_skills:` / `--preload-skill` entries, likewise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launch_preload_skills: Vec<String>,
 }
 
 /// What a run may launch, and where its children are recorded (spec W7

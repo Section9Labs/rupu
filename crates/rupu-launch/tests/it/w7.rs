@@ -856,6 +856,93 @@ async fn a_generated_workflows_connector_actions_need_the_callers_grant() {
         .expect("findings need no connector");
 }
 
+/// A provider that records each request's system prompt, then answers like
+/// the `MockProvider` it wraps.
+struct RecordingProvider {
+    inner: rupu_agent::runner::MockProvider,
+    systems: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl rupu_providers::LlmProvider for RecordingProvider {
+    async fn send(
+        &mut self,
+        request: &rupu_providers::LlmRequest,
+    ) -> Result<rupu_providers::LlmResponse, rupu_providers::ProviderError> {
+        self.systems
+            .lock()
+            .unwrap()
+            .push(request.system.clone().unwrap_or_default());
+        self.inner.send(request).await
+    }
+
+    async fn stream(
+        &mut self,
+        request: &rupu_providers::LlmRequest,
+        on_event: &mut (dyn FnMut(rupu_providers::StreamEvent) + Send),
+    ) -> Result<rupu_providers::LlmResponse, rupu_providers::ProviderError> {
+        self.inner.stream(request, on_event).await
+    }
+
+    fn default_model(&self) -> &str {
+        self.inner.default_model()
+    }
+
+    fn provider_id(&self) -> rupu_providers::ProviderId {
+        self.inner.provider_id()
+    }
+}
+
+/// `workflows.generate` tells the model which skills are installed, in the
+/// global layer and the launcher's project `.rupu`, so a generated step's
+/// `skills:` names ones that exist.
+#[tokio::test]
+#[serial]
+async fn generate_offers_the_installed_skills_of_both_layers() {
+    use rupu_agent::runner::{MockProvider, ScriptedTurn};
+    use rupu_tools::WorkflowGenerator;
+    let home = kinds_home();
+    home.skill("pdf", "read pdfs");
+    let project = home.root().join("repo/.rupu");
+    std::fs::create_dir_all(project.join("skills/notes")).unwrap();
+    let systems = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = systems.clone();
+    let l = rupu_launch::RunLauncher::new(rupu_launch::LaunchEnv {
+        assembler: home.assembler(config()),
+        store: Arc::new(rupu_orchestrator::RunStore::new(home.runs())),
+        events: None,
+        namer: None,
+        backend: Arc::new(ScriptedProcesses::done("x")),
+        runtime: tokio::runtime::Handle::current(),
+        max_concurrent: 8,
+        generation: Some(rupu_launch::Generation {
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            factory: Arc::new(move || {
+                Box::new(RecordingProvider {
+                    inner: MockProvider::new(vec![ScriptedTurn::AssistantText {
+                        text: FINDINGS_WF.into(),
+                        stop: rupu_providers::types::StopReason::EndTurn,
+                        input_tokens: 1,
+                        output_tokens: 1,
+                    }]),
+                    systems: recorded.clone(),
+                }) as Box<dyn rupu_providers::LlmProvider>
+            }),
+        }),
+        project: Some(project),
+    });
+    let caller = assembled_caller(&home, &l, "[\"*\"]").await;
+    l.generate("record", &caller).await.expect("generated");
+    let systems = systems.lock().unwrap();
+    assert_eq!(systems.len(), 1);
+    assert!(
+        systems[0].ends_with("leave both empty when none fits): notes, pdf"),
+        "{}",
+        systems[0]
+    );
+}
+
 /// A recorded process child is signalled only when its pid and recorded
 /// start time confirm it. One recorded without a start time (it exited
 /// before its start could be read) can't be confirmed: its pid, now held by

@@ -78,7 +78,7 @@ fn links() -> Vec<LaunchLink> {
 fn agent_runs() -> Vec<RunArgv> {
     let mut out = Vec::new();
     // Every combination of the optional parts, each prompt in turn.
-    for mask in 0u32..(1 << 7) {
+    for mask in 0u32..(1 << 8) {
         let on = |bit: u32| mask & (1 << bit) != 0;
         let mut r = AgentRun::new("recon", "run_01ROUNDTRIP");
         if on(0) {
@@ -101,6 +101,10 @@ fn agent_runs() -> Vec<RunArgv> {
         }
         if on(6) {
             r.flow = Some(flow());
+        }
+        if on(7) {
+            r.skills = vec!["pdf".into(), "project:notes".into()];
+            r.preload_skills = vec!["house-style".into()];
         }
         r.prompt = match mask as usize % (PROMPTS.len() + 1) {
             0 => None,
@@ -293,6 +297,8 @@ fn back(cli: Cli) -> RunArgv {
                 prompt: a.prompt_flag,
                 findings_profile: a.findings_profile,
                 engagement_profiles: a.engagement_profiles,
+                skills: a.skills,
+                preload_skills: a.preload_skills,
                 tmp_clone: a.tmp,
                 flow: flow_of(a.fleet_run_dir, a.fleet_participant),
                 continue_from: a.continue_from,

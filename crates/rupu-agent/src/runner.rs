@@ -887,6 +887,9 @@ pub struct UnstartedRun<'a> {
     /// The agent's system prompt; `None` when the agent did not load.
     pub system_prompt: Option<&'a str>,
     pub prompt: &'a UserTurn,
+    /// The launch's own skill entries, as written (`RunStart.launch_skills`).
+    pub launch_skills: &'a [String],
+    pub launch_preload_skills: &'a [String],
 }
 
 /// Record a run that never started — no provider was built, so nothing was
@@ -931,6 +934,8 @@ pub fn record_unstarted_run(
             system_prompt,
             codename: run.codename.map(str::to_string),
             customer: Some(run.customer.map(str::to_string)),
+            launch_skills: run.launch_skills.to_vec(),
+            launch_preload_skills: run.launch_preload_skills.to_vec(),
         })?;
         writer.write(&Event::Notice {
             kind: "model_limits".into(),
@@ -2111,6 +2116,8 @@ async fn run_agent_inner(
                 workspace_path: opts.workspace_path().to_path_buf(),
                 continued_from: crate::continuation::continued_from(&opts.prompt)
                     .map(|p| p.display().to_string()),
+                skills: opts.id.launch_skills.clone(),
+                preload_skills: opts.id.launch_preload_skills.clone(),
             };
             if let Err(e) = rupu_coverage::append_manifest(&paths, &manifest) {
                 tracing::warn!(error = %e, "failed to write coverage run manifest");
@@ -2197,6 +2204,8 @@ async fn run_agent_inner(
         // Always recorded: `null` when the run has no customer, so a
         // later assignment of the project never re-attributes it.
         customer: Some(opts.tool_context.services.customer.clone()),
+        launch_skills: opts.id.launch_skills.clone(),
+        launch_preload_skills: opts.id.launch_preload_skills.clone(),
     })?;
     // One notice per run, before the first turn: what the run resolved, and
     // where each number came from (spec 2026-09-30 §6.6).

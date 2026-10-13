@@ -84,6 +84,47 @@ pub fn transcript_agent(transcript: &Path) -> Result<String, ContinuationError> 
         })
 }
 
+/// The skills `transcript`'s run was given by its launch, as the launch
+/// wrote them `(skills, preload_skills)`: `run_start`'s `launch_skills` /
+/// `launch_preload_skills`, so `*` stays `*` and a launch preload of a skill
+/// the agent also names is kept. A transcript written before those fields
+/// existed falls back to its `skill_index` rows with reason `launch` (`step`
+/// before the rename), layer-qualified. A new transcript with no launch
+/// skills has no such rows either, so the fallback gives it none. A
+/// continued run is given them again unless its own launch names skills.
+pub fn launch_skills(transcript: &Path) -> Result<(Vec<String>, Vec<String>), ContinuationError> {
+    let events = read_events(transcript)?;
+    let recorded = events.iter().find_map(|e| match e {
+        Event::RunStart {
+            launch_skills,
+            launch_preload_skills,
+            ..
+        } => Some((launch_skills.clone(), launch_preload_skills.clone())),
+        _ => None,
+    });
+    if let Some(recorded) = recorded.filter(|(s, p)| !s.is_empty() || !p.is_empty()) {
+        return Ok(recorded);
+    }
+    let mut skills = Vec::new();
+    let mut preload = Vec::new();
+    for event in events {
+        let Event::SkillIndex { skills: rows } = event else {
+            continue;
+        };
+        for row in rows {
+            if row.reason == "launch" || row.reason == "step" {
+                let entry = format!("{}:{}", row.layer, row.name);
+                if row.preload {
+                    preload.push(entry);
+                } else {
+                    skills.push(entry);
+                }
+            }
+        }
+    }
+    Ok((skills, preload))
+}
+
 /// Decide how to pick up the attempt recorded in `transcript`.
 ///
 /// | ends with                                | outcome    |
@@ -577,6 +618,57 @@ mod tests {
             prepare_continuation(&t),
             Err(ContinuationError::DanglingToolCall { .. })
         ));
+    }
+
+    fn skills_transcript(dir: &Path, launch: serde_json::Value) -> PathBuf {
+        let t = dir.join("skills.jsonl");
+        let mut start = serde_json::json!({
+            "run_id": "run_1", "workspace_id": "ws", "agent": "a", "provider": "anthropic",
+            "model": "m", "started_at": "2026-10-12T00:00:00Z", "mode": "readonly",
+        });
+        start
+            .as_object_mut()
+            .unwrap()
+            .extend(launch.as_object().unwrap().clone());
+        let row = |name: &str, preload: bool, reason: &str| {
+            serde_json::json!({
+                "name": name, "layer": "global", "stamp": "s", "preload": preload,
+                "indexed": !preload, "reason": reason,
+            })
+        };
+        write_lines(
+            &t,
+            &[
+                serde_json::json!({ "type": "run_start", "data": start }),
+                serde_json::json!({ "type": "skill_index", "data": { "skills": [
+                    row("pdf", true, "agent"), row("x", false, "step"), row("y", true, "launch"),
+                ] } }),
+            ],
+        );
+        t
+    }
+
+    #[test]
+    fn launch_skills_are_run_starts_entries_as_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = skills_transcript(
+            tmp.path(),
+            serde_json::json!({ "launch_skills": ["*"], "launch_preload_skills": ["pdf"] }),
+        );
+        assert_eq!(
+            launch_skills(&t).unwrap(),
+            (vec!["*".to_string()], vec!["pdf".to_string()])
+        );
+    }
+
+    #[test]
+    fn launch_skills_of_an_older_transcript_come_from_its_launch_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = skills_transcript(tmp.path(), serde_json::json!({}));
+        assert_eq!(
+            launch_skills(&t).unwrap(),
+            (vec!["global:x".to_string()], vec!["global:y".to_string()])
+        );
     }
 
     #[test]

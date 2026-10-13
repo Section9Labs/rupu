@@ -18,7 +18,10 @@ use std::sync::Arc;
 #[serde(rename_all = "lowercase")]
 pub enum SkillReason {
     Agent,
-    Step,
+    /// Given by the launch itself: a workflow step's `skills:`, or
+    /// `rupu run --skill` (an operator's, or a placed unit's carrying its
+    /// step's).
+    Launch,
     Session,
     Operator,
 }
@@ -27,7 +30,7 @@ impl SkillReason {
     pub fn as_str(self) -> &'static str {
         match self {
             SkillReason::Agent => "agent",
-            SkillReason::Step => "step",
+            SkillReason::Launch => "launch",
             SkillReason::Session => "session",
             SkillReason::Operator => "operator",
         }

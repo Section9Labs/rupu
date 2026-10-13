@@ -30,7 +30,7 @@ use crate::{
     node::{
         protocol::{
             Frame, RunSpec, RunSpecKind, CAP_AGENT_ENGAGEMENT_PROFILE, CAP_AGENT_FINDINGS_PROFILE,
-            CAP_FINDINGS_ARTIFACT_PULL,
+            CAP_AGENT_SKILLS, CAP_FINDINGS_ARTIFACT_PULL,
         },
         NodeMirror, NodeRegistry,
     },
@@ -134,6 +134,8 @@ impl HostConnector for TunnelHostConnector {
             target: req.target.clone(),
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
 
@@ -194,6 +196,8 @@ impl HostConnector for TunnelHostConnector {
             target: req.target.clone(),
             findings_profile: req.findings_profile,
             engagement_profiles: req.engagement_profiles.clone(),
+            skills: req.skills.clone(),
+            preload_skills: req.preload_skills.clone(),
             codename: spec_peer_codename(
                 &run,
                 conn.capabilities(),
@@ -226,6 +230,19 @@ impl HostConnector for TunnelHostConnector {
                 self.node_id,
                 conn.rupu_version().unwrap_or("unknown version"),
                 req.engagement_profiles.join(","),
+            )));
+        }
+        // And `RunSpec.skills`: an older node would run the unit without its
+        // step's skills.
+        if (!req.skills.is_empty() || !req.preload_skills.is_empty())
+            && !conn.supports(CAP_AGENT_SKILLS)
+        {
+            return Err(HostConnectorError::Unsupported(format!(
+                "node {} (rupu {}) does not support workflow-step skills on agent \
+                 launches, so this run's skills cannot be delivered; upgrade rupu on \
+                 that node",
+                self.node_id,
+                conn.rupu_version().unwrap_or("unknown version"),
             )));
         }
 

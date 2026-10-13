@@ -154,6 +154,12 @@ pub struct UnitDispatch {
     /// The dispatcher must deliver them to the host as `rupu run
     /// --engagement-profile` or refuse the launch. Empty ⇒ the `code` path.
     pub engagement_profiles: Vec<String>,
+    /// The step's `skills:` (on top of the agent's own). The dispatcher must
+    /// deliver them as `rupu run --skill` or refuse the launch.
+    pub skills: Vec<String>,
+    /// The step's `preload_skills:`. The dispatcher must deliver them as
+    /// `rupu run --preload-skill` or refuse the launch.
+    pub preload_skills: Vec<String>,
     /// The permission mode the unit must run under — the run's mode as
     /// [`remote_unit_permission_mode`] resolves it from
     /// [`StepFactory::permission_mode`]. The dispatcher delivers it to the
@@ -4320,6 +4326,8 @@ fn augment_workflow_with_loop_supernodes(wf: &Workflow) -> Workflow {
             host: None,
             workspace: None,
             findings_profile: None,
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             next: Vec::new(),
             depends_on: Vec::new(),
             split: None,
@@ -7009,6 +7017,8 @@ async fn fire_notify_hooks(
             host: None,
             workspace: None,
             findings_profile: None,
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             next: Vec::new(),
             depends_on: Vec::new(),
             split: None,
@@ -8004,6 +8014,8 @@ async fn dispatch_placed_step(
         workspace: prepared,
         findings_profile: remote_unit_findings_profile(step, &opts.workflow.defaults),
         engagement_profiles: opts.factory.engagement_profiles(),
+        skills: step.skills.clone(),
+        preload_skills: step.preload_skills.clone(),
         mode: remote_unit_permission_mode(opts.factory.permission_mode()),
         codename: codename.map(ToString::to_string),
     };
@@ -9085,6 +9097,8 @@ async fn run_fanout_step(
     let unit_findings_profile = remote_unit_findings_profile(step, &opts.workflow.defaults);
     // The run's engagement, shared by every unit (cloned into each task).
     let unit_engagement_profiles = opts.factory.engagement_profiles();
+    // The step's skills, shared by every unit and its retry.
+    let unit_skills = (step.skills.clone(), step.preload_skills.clone());
     // The run's mode, the same for every unit (and its retry); `Copy`.
     let unit_mode = remote_unit_permission_mode(opts.factory.permission_mode());
     let mut handles = Vec::with_capacity(total);
@@ -9111,6 +9125,7 @@ async fn run_fanout_step(
         let run_id_clone = run_id.clone();
         let transcript_clone = transcript_path.clone();
         let engagement_for_task = unit_engagement_profiles.clone();
+        let (skills_for_task, preload_skills_for_task) = unit_skills.clone();
         // Per-unit live-view events. Cloned into the task so emission
         // ordering reflects the unit's REAL start/finish under
         // `max_parallel` concurrency (the started/completed pair brackets
@@ -9289,6 +9304,8 @@ async fn run_fanout_step(
                                     workspace: unit_ws.clone(),
                                     findings_profile: unit_findings_profile,
                                     engagement_profiles: engagement_for_task.clone(),
+                                    skills: skills_for_task.clone(),
+                                    preload_skills: preload_skills_for_task.clone(),
                                     mode: unit_mode,
                                     codename: unit_codename.as_ref().map(ToString::to_string),
                                 };
@@ -9396,6 +9413,8 @@ async fn run_fanout_step(
                                             workspace: unit_ws.clone(),
                                             findings_profile: unit_findings_profile,
                                             engagement_profiles: engagement_for_task.clone(),
+                                            skills: skills_for_task.clone(),
+                                            preload_skills: preload_skills_for_task.clone(),
                                             mode: unit_mode,
                                             codename: unit_codename
                                                 .as_ref()
@@ -10328,6 +10347,8 @@ async fn dispatch_one(
                 customer: factory.customer(),
                 system_prompt: None,
                 prompt: &prompt,
+                launch_skills: &[],
+                launch_preload_skills: &[],
             }));
         }
     };
@@ -10353,6 +10374,8 @@ async fn dispatch_one(
     let system_prompt =
         rupu_runtime::assembly::system_prompt_for(&spec.agent, &spec.overrides, None);
     let prompt = spec.prompt.clone();
+    let launch_skills = spec.overrides.skills.clone();
+    let launch_preload_skills = spec.overrides.preload_skills.clone();
     let assembled = match assembler.assemble(spec).await {
         Ok(a) => a,
         Err(e) => {
@@ -10368,6 +10391,8 @@ async fn dispatch_one(
                 customer: assembler.context().customer.as_deref(),
                 system_prompt: Some(&system_prompt),
                 prompt: &prompt,
+                launch_skills: &launch_skills,
+                launch_preload_skills: &launch_preload_skills,
             }))
         }
     };

@@ -12,6 +12,10 @@ pub struct RerunInvocation {
     pub user_prompt: String,
     pub permission_mode: String,
     pub workspace_path: std::path::PathBuf,
+    /// The launch's own skills, passed again as `--skill`.
+    pub skills: Vec<String>,
+    /// The launch's own preloaded skills, passed again as `--preload-skill`.
+    pub preload_skills: Vec<String>,
 }
 
 /// Why a run can't be replayed.
@@ -44,7 +48,8 @@ fn run_id_of_transcript(path: &str) -> String {
 /// re-resolves `provider` / `model` / `concerns` from the agent's CURRENT
 /// frontmatter + config — it does NOT apply the manifest's recorded values
 /// for those. Only `agent_name` / `user_prompt` / `permission_mode` /
-/// `workspace_path` drive the replay. The other manifest fields are a record
+/// `workspace_path` and the launch's own `skills` / `preload_skills` drive
+/// the replay. The other manifest fields are a record
 /// of the original run (and the basis for a future higher-fidelity replay
 /// that pins them); a session/workflow rerun author must not assume they are
 /// authoritative for dispatch.
@@ -62,6 +67,8 @@ pub fn plan_rerun(manifest: &RunManifest) -> Result<RerunInvocation, RerunError>
                 user_prompt: manifest.user_prompt.clone(),
                 permission_mode: manifest.permission_mode.clone(),
                 workspace_path: manifest.workspace_path.clone(),
+                skills: manifest.skills.clone(),
+                preload_skills: manifest.preload_skills.clone(),
             }),
         },
         Surface::Session => Err(RerunError::UnsupportedSurface("session".to_string())),
@@ -97,6 +104,8 @@ mod tests {
             scope_name: "reviewer".to_string(),
             workspace_path: std::path::PathBuf::from("/tmp/repo"),
             continued_from: None,
+            skills: vec![],
+            preload_skills: vec![],
         }
     }
 

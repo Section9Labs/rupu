@@ -30,6 +30,8 @@ fn reads_complete_run_summary() {
                 system_prompt: None,
                 codename: None,
                 customer: None,
+                launch_skills: Vec::new(),
+                launch_preload_skills: Vec::new(),
             },
             Event::TurnStart { turn_idx: 0 },
             Event::TurnEnd {
@@ -75,6 +77,8 @@ fn missing_run_complete_reports_aborted() {
                 system_prompt: None,
                 codename: None,
                 customer: None,
+                launch_skills: Vec::new(),
+                launch_preload_skills: Vec::new(),
             },
             Event::TurnStart { turn_idx: 0 },
             // no TurnEnd, no RunComplete
@@ -102,6 +106,8 @@ fn truncated_last_line_does_not_crash() {
             system_prompt: None,
             codename: None,
             customer: None,
+            launch_skills: Vec::new(),
+            launch_preload_skills: Vec::new(),
         })
         .unwrap();
     }
@@ -203,6 +209,8 @@ fn head_reads_run_start_without_needing_the_rest_of_the_file() {
                 system_prompt: None,
                 codename: None,
                 customer: Some(Some("acme".into())),
+                launch_skills: Vec::new(),
+                launch_preload_skills: Vec::new(),
             },
             Event::TurnStart { turn_idx: 0 },
         ],

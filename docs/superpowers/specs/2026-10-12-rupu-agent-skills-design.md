@@ -147,7 +147,7 @@ Load-time validation is a convenience. The assembler resolves `ResolvedSkills` i
 
 `Step` (`crates/rupu-orchestrator/src/workflow.rs:1049`) gains `skills: Vec<String>` and `preload_skills: Vec<String>`. They add to the grant of every agent the step launches: the step's agent, its `for_each` units, its parallel and panel members, a panel gate's `fix_with` agent, and loop members. They never remove a skill.
 
-Workflow parsing stays pure: it checks only entry syntax, so a workflow's validity never depends on what a host has installed. Existence is checked when the step launches, in `DefaultStepFactory::launch_for_step`, the way a missing agent is (`AssembleError::AgentLoad`). The skills travel on `Overrides.skills` / `Overrides.preload_skills` and resolve with reason `step`, not on `Origin::WorkflowStep`. `rupu run --skill` (Plan 2b) fills the same fields, which is why they live on `Overrides` rather than on one origin.
+Workflow parsing stays pure: it checks only entry syntax, so a workflow's validity never depends on what a host has installed. Existence is checked when the step launches, in `DefaultStepFactory::launch_for_step`, the way a missing agent is (`AssembleError::AgentLoad`). The skills travel on `Overrides.skills` / `Overrides.preload_skills` and resolve with reason `launch`, not on `Origin::WorkflowStep`. `rupu run --skill` (Plan 2b) fills the same fields, which is why they live on `Overrides` rather than on one origin, and why the reason is `launch`: a placed unit's `--skill` (its step's) and an operator's are the same flag.
 
 There is no workflow-level `skills:`. A workflow that wants a skill on every step names it per step, or on the agents. When yokoito replaces workflow definitions, its integration maps its own step key onto the same `Overrides` fields.
 
@@ -174,7 +174,7 @@ pub struct GrantedSkill {
     pub stamp: Stamp,
     pub preload: bool,
     pub indexed: bool,        // false for disable-model-invocation and for preloaded skills
-    pub reason: SkillReason,  // Agent | Step | Session | Operator
+    pub reason: SkillReason,  // Agent | Launch | Session | Operator
 }
 ```
 
@@ -247,7 +247,7 @@ In Claude Code, `allowed-tools` pre-approves tools while a skill is active. In r
 
 Two new events in `rupu-transcript` (the `Event` enum at `crates/rupu-transcript/src/event.rs:73`; both tags added to `KNOWN_EVENT_TAGS` at `:17`; both documented in `docs/transcript-schema.md`):
 
-- **`skill_index`**, written once at run start after `tool_grant`: one row per granted skill with name, layer, stamp, `preload`, `indexed` and reason.
+- **`skill_index`**, written once at run start after `tool_grant`: one row per granted skill with name, layer, stamp, `preload`, `indexed` and reason (`agent`, `launch`, `session` or `operator`; a transcript written before the reason was renamed says `step` for `launch`).
 - **`skill_load`**: name, layer, content hash, base directory, and `via`: `model` (a `skills.load` call), `preload`, `operator` (§5.2), `reattach` (§6) or `continuation` (a skill the continued run had loaded, carried into the new run at its start). Written for every load, whichever path made it.
 
 `skills.load` calls also get the usual `tool_audit` line. New notice kinds: `skill_not_indexed`, `skill_changed`, `skill_missing`, `skill_tools_missing`, `skill_reattach_truncated`. `rupu transcript` and the CP transcript view render both events with the shared one-line renderers, as `tool_grant` does.
@@ -372,6 +372,8 @@ The coordinator sends a placed unit its agent's name, never its content (`crates
 - `skills: ["*"]` resolves to what the host has. The unit's `skill_index` event records which set that was.
 
 A step's own skills (§2.2) are not in the agent file, so they must travel with the dispatch. `UnitDispatch` (`crates/rupu-orchestrator/src/runner.rs:124`) gains `skills` and `preload_skills`. `RunArgv::Agent` gains a repeatable `--skill` and `--preload-skill`, held by `argv_roundtrip`. Peers advertise an `agent.skills` capability, and a connector refuses a unit with step skills when its peer did not advertise it. This is the contract `findings_profile` and `engagement_profiles` already follow: never a silent drop.
+
+The check sits on the sending side because the receiving side can't make it: a node's `RunSpec` ignores fields it doesn't know, so an older tunnel or bucket worker would drop the skills and run the unit without them. HTTP, tunnel and bucket connectors check the capability their peer last advertised. An SSH connector has no feature report until it runs a command, so a launch with step skills carries its own gate: the launch command runs the remote's `rupu __features` first and, when `agent.skills` is missing, prints a refusal marker instead of starting the run. The connector turns that marker into an `Unsupported` launch error. A launch without step skills sends no gate.
 
 An older host whose rupu predates this spec cannot parse a synced agent file with `skills:`, because agent frontmatter is `deny_unknown_fields`. The unit fails with that parse error. This is true of every frontmatter key added before, and updating the host is the fix.
 

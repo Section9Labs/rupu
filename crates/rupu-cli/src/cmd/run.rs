@@ -90,6 +90,15 @@ pub struct Args {
         value_delimiter = ','
     )]
     pub engagement_profiles: Vec<String>,
+    /// A skill this run may load, on top of the agent's own; repeat the flag
+    /// for several. A coordinator passes a workflow step's `skills:` this
+    /// way. `--continue` keeps the continued run's unless these are given.
+    #[arg(long = "skill", value_name = "SKILL")]
+    pub skills: Vec<String>,
+    /// A skill whose body goes in this run's system prompt; repeat the flag
+    /// for several.
+    #[arg(long = "preload-skill", value_name = "SKILL")]
+    pub preload_skills: Vec<String>,
     /// Continue an interrupted run of this agent from its transcript instead
     /// of starting fresh: the earlier conversation is rebuilt and the agent
     /// is told it was interrupted. A run that had already finished prints
@@ -725,6 +734,13 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     // With `--model`/`--provider`, a run that failed on an outcome is
     // continued too (`prepare_recovery_continuation`); the third element is
     // that outcome, `None` for an interrupted run.
+    //
+    // A continued run keeps the skills its launch gave the run it continues
+    // (`--skill` / `--preload-skill`), unless this launch names its own.
+    let mut launch_skills = (args.skills.clone(), args.preload_skills.clone());
+    // The run these launch skills were carried from, so a failure to
+    // resolve them says where they came from.
+    let mut skills_carried_from: Option<String> = None;
     let mut resume_from: Option<ResumeFrom> = match args.continue_from.as_deref() {
         None => None,
         Some(prev) => {
@@ -758,6 +774,12 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             let prev_agent = transcript_agent(&prev_path)?;
             if prev_agent != spec.name {
                 anyhow::bail!("run {prev} was agent `{prev_agent}`, not `{}`", spec.name);
+            }
+            if args.skills.is_empty() && args.preload_skills.is_empty() {
+                launch_skills = rupu_agent::continuation::launch_skills(&prev_path)?;
+                if !launch_skills.0.is_empty() || !launch_skills.1.is_empty() {
+                    skills_carried_from = Some(prev.to_string());
+                }
             }
             let prepared = if args.model.is_some() || args.provider.is_some() {
                 prepare_recovery_continuation(&prev_path)?
@@ -923,6 +945,8 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                 .as_ref()
                 .map(crate::run_target::format_run_target_for_prompt),
             findings_profile: args.findings_profile,
+            skills: launch_skills.0.clone(),
+            preload_skills: launch_skills.1.clone(),
             ..Default::default()
         };
 
@@ -932,6 +956,16 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         let prepared = assembler
             .prepare_provider(&spec, &overrides, netflow_sink.clone())
             .await?;
+        // The skills are resolved before the clone too, but a skill that
+        // doesn't resolve is a failed run, recorded below like any assembly
+        // failure: it skips the clone instead of failing the command.
+        let (resolved_skills, skills_failure) = match assembler
+            .resolve_skills_for_launch(&spec, &overrides, &transcript_path)
+            .await
+        {
+            Ok(skills) => (skills, None),
+            Err(e) => (None, Some(e)),
+        };
 
         // Construct ONE LineStreamPrinter for the whole run. Keeping a
         // single instance means a single MultiProgress + ticker — earlier
@@ -961,7 +995,8 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         // function exit, keeping the directory alive for the run. Modes 2
         // and 3 set it to None — the user owns cleanup.
         let _clone_guard: Option<tempfile::TempDir>;
-        let workspace_path: std::path::PathBuf = match run_target.as_ref() {
+        let clone_target = run_target.as_ref().filter(|_| skills_failure.is_none());
+        let workspace_path: std::path::PathBuf = match clone_target {
             Some(crate::run_target::RunTarget::Repo {
                 platform,
                 owner,
@@ -1166,17 +1201,28 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                 netflow: Some(netflow_sink.clone()),
                 message_bus: fleet_bus,
                 provider: Some(prepared),
+                skills: resolved_skills,
                 ..Default::default()
             },
             collectors: fleet_collectors,
             link: launch_link.clone(),
         };
-        // A run that cannot be assembled (its grant fails) is a failed run:
-        // recorded in run.json like any other failure, not an early exit.
-        let assembled = assembler
-            .assemble(launch)
-            .await
-            .map_err(|e| e.into_run_error());
+        // A run that cannot be assembled (its grant fails, its skills don't
+        // resolve) is a failed run: recorded in run.json like any other
+        // failure, not an early exit.
+        let assembled = match skills_failure {
+            None => assembler.assemble(launch).await.map_err(|e| e.into_run_error()),
+            Some(e) => Err(match (e.into_run_error(), &skills_carried_from) {
+                (rupu_agent::RunError::Preflight(m), Some(prev)) => {
+                    rupu_agent::RunError::Preflight(format!(
+                        "{m}\n  The launch skills ({}) came from run {prev}, which this run \
+                         continues; pass --skill or --preload-skill to name others.",
+                        launch_flags(&launch_skills)
+                    ))
+                }
+                (e, _) => e,
+            }),
+        };
 
         // Spawn the agent in a background task and tail the transcript with
         // the line-stream printer while it runs.
@@ -1452,6 +1498,14 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     }
 
     body_result
+}
+
+/// `skills` / `preload_skills` entries as the `rupu run` flags that name
+/// them.
+fn launch_flags((skills, preload): &(Vec<String>, Vec<String>)) -> String {
+    let skills = skills.iter().map(|s| format!("--skill {s}"));
+    let preload = preload.iter().map(|s| format!("--preload-skill {s}"));
+    skills.chain(preload).collect::<Vec<_>>().join(" ")
 }
 
 /// What `rupu run --continue` picks up: the rebuilt conversation, the
@@ -1832,6 +1886,28 @@ mod tests {
         assert_eq!(args.findings_profile, Some(Full));
         assert_eq!(args.agent, "sec");
         assert_eq!(launch_args(&["sec"]).unwrap().findings_profile, None);
+    }
+
+    #[test]
+    fn skill_flags_parse_repeated_in_either_position() {
+        let a = launch_args(&[
+            "--skill",
+            "pdf",
+            "sec",
+            "--preload-skill",
+            "house-style",
+            "--skill",
+            "project:notes",
+            "--prompt",
+            "go",
+        ])
+        .unwrap();
+        assert_eq!(a.agent, "sec");
+        assert_eq!(
+            a.skills,
+            vec!["pdf".to_string(), "project:notes".to_string()]
+        );
+        assert_eq!(a.preload_skills, vec!["house-style".to_string()]);
     }
 
     #[test]

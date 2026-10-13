@@ -534,7 +534,7 @@ impl RunAssembler {
         let requests = Arc::new([
             (rupu_skills::SkillReason::Agent, agent_grants, agent_preload),
             (
-                rupu_skills::SkillReason::Step,
+                rupu_skills::SkillReason::Launch,
                 o.skills.clone(),
                 o.preload_skills.clone(),
             ),
@@ -561,25 +561,38 @@ impl RunAssembler {
         Ok((!resolved.is_empty()).then(|| Arc::new(resolved)))
     }
 
+    /// [`Self::resolve_skills`] for the run whose transcript is
+    /// `transcript_path`, recording a failure as [`Self::assemble`] does: as
+    /// when its grant fails, the run's (empty) transcript exists, so whatever
+    /// opens it finds the run that failed. A site that resolves a launch's
+    /// skills before assembling it (`rupu run`, before a clone) calls this
+    /// and hands the result to the launch ([`LaunchServices::skills`]).
+    pub async fn resolve_skills_for_launch(
+        &self,
+        agent: &rupu_agent::AgentSpec,
+        overrides: &Overrides,
+        transcript_path: &std::path::Path,
+    ) -> Result<Option<Arc<rupu_skills::ResolvedSkills>>, AssembleError> {
+        let resolved = self.resolve_skills(agent, overrides).await;
+        if resolved.is_err() {
+            if let Err(w) = rupu_transcript::JsonlWriter::create(transcript_path) {
+                tracing::warn!(error = %w, "create the transcript of a run whose skills failed");
+            }
+        }
+        resolved
+    }
+
     /// Build the run `spec` describes.
     pub async fn assemble(&self, mut spec: LaunchSpec) -> Result<AssembledRun, AssembleError> {
         let d = defaults_for(&spec.origin);
         let cfg = &self.ctx.config;
 
-        // Before anything that needs cleaning up. As when its grant fails,
-        // the run's (empty) transcript exists, so whatever opens it finds
-        // the run that failed.
-        let resolved = match spec.services.skills.take() {
-            Some(skills) => Ok((!skills.is_empty()).then_some(skills)),
-            None => self.resolve_skills(&spec.agent, &spec.overrides).await,
-        };
-        let skills = match resolved {
-            Ok(s) => s,
-            Err(e) => {
-                if let Err(w) = rupu_transcript::JsonlWriter::create(&spec.transcript_path) {
-                    tracing::warn!(error = %w, "create the transcript of a run whose skills failed");
-                }
-                return Err(e);
+        // Before anything that needs cleaning up.
+        let skills = match spec.services.skills.take() {
+            Some(skills) => (!skills.is_empty()).then_some(skills),
+            None => {
+                self.resolve_skills_for_launch(&spec.agent, &spec.overrides, &spec.transcript_path)
+                    .await?
             }
         };
 
@@ -704,6 +717,8 @@ impl RunAssembler {
             scope_name: d.scope_name.clone(),
             step_id: d.step_id.clone(),
             launch,
+            launch_skills: spec.overrides.skills.clone(),
+            launch_preload_skills: spec.overrides.preload_skills.clone(),
         };
 
         let ceiling = spec.ceiling.or(spec.link.as_ref().map(|l| l.ceiling));

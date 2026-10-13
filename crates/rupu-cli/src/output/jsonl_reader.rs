@@ -313,6 +313,8 @@ mod tests {
             system_prompt: None,
             codename: None,
             customer: None,
+            launch_skills: Vec::new(),
+            launch_preload_skills: Vec::new(),
         };
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(f, "{}", serde_json::to_string(&ev).unwrap()).unwrap();

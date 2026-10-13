@@ -197,6 +197,8 @@ fn write_mirrored_transcript(path: &Path, run_id: &str) {
         schema: None,
         system_prompt: None,
         customer: None,
+        launch_skills: Vec::new(),
+        launch_preload_skills: Vec::new(),
     })
     .unwrap();
     for (input, output) in [(7u32, 3u32), (5, 2)] {

@@ -1370,6 +1370,8 @@ mod tests {
             schema: None,
             system_prompt: None,
             customer: None,
+            launch_skills: Vec::new(),
+            launch_preload_skills: Vec::new(),
         });
         for &(i, o) in turns {
             out += &usage_line(provider, model, i, o, None);
@@ -1412,6 +1414,8 @@ mod tests {
                 schema: None,
                 system_prompt: None,
                 customer: None,
+                launch_skills: Vec::new(),
+                launch_preload_skills: Vec::new(),
             }),
         );
         append(

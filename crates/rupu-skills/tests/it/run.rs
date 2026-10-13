@@ -46,7 +46,7 @@ fn preload_is_marked_by_membership_and_reason_by_first_request() {
                 preload: &[],
             },
             SkillRequest {
-                reason: SkillReason::Step,
+                reason: SkillReason::Launch,
                 grants: &[],
                 preload: &step_preload,
             },
@@ -62,7 +62,7 @@ fn preload_is_marked_by_membership_and_reason_by_first_request() {
         rows,
         vec![
             ("code-review", false, true, SkillReason::Agent),
-            ("report-style", true, false, SkillReason::Step),
+            ("report-style", true, false, SkillReason::Launch),
         ]
     );
     let section = r.prompt_section().unwrap();
@@ -156,7 +156,7 @@ fn a_preload_from_a_later_request_keeps_the_first_reason() {
         &cat,
         &[
             request(SkillReason::Agent, &x, &[]),
-            request(SkillReason::Step, &[], &x),
+            request(SkillReason::Launch, &[], &x),
         ],
     )
     .unwrap();

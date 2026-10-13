@@ -618,6 +618,7 @@ async fn create(
                 provider,
                 model,
                 available_agents: vec![],
+                available_skills: vec![],
             };
             // ISSUES.md I-74: pass the operator's `[providers.<name>]`
             // settings through instead of silently generating with none.

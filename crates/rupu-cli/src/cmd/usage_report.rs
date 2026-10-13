@@ -690,6 +690,8 @@ mod tests {
                 system_prompt: None,
                 codename: None,
                 customer: None,
+                launch_skills: Vec::new(),
+                launch_preload_skills: Vec::new(),
             })
             .unwrap();
         writer
@@ -1133,6 +1135,8 @@ mod tests {
             system_prompt: None,
             codename: None,
             customer: None,
+            launch_skills: Vec::new(),
+            launch_preload_skills: Vec::new(),
         };
         events[0] = Ok(run_start);
         let mut writer = JsonlWriter::create(&transcript_path).unwrap();

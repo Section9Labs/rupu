@@ -26,6 +26,7 @@ use crate::{
     node::{
         protocol::{
             RunSpec, RunSpecKind, CAP_AGENT_ENGAGEMENT_PROFILE, CAP_AGENT_FINDINGS_PROFILE,
+            CAP_AGENT_SKILLS,
         },
         NodeMirror,
     },
@@ -221,6 +222,8 @@ impl HostConnector for BucketHostConnector {
             target: req.target.clone(),
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         };
 
@@ -263,6 +266,13 @@ impl HostConnector for BucketHostConnector {
             )
             .await?;
         }
+        if !req.skills.is_empty() || !req.preload_skills.is_empty() {
+            self.require_worker_capability(
+                CAP_AGENT_SKILLS,
+                "this run's workflow-step skills cannot be delivered",
+            )
+            .await?;
+        }
 
         // A coordinator-minted id (a placed unit's) keys the job, and every
         // worker runs under its job's key (`rupu run --run-id`).
@@ -287,6 +297,8 @@ impl HostConnector for BucketHostConnector {
             target: req.target.clone(),
             findings_profile: req.findings_profile,
             engagement_profiles: req.engagement_profiles.clone(),
+            skills: req.skills.clone(),
+            preload_skills: req.preload_skills.clone(),
             codename,
         };
 
@@ -558,6 +570,8 @@ mod tests {
                 run_id: None,
                 findings_profile: None,
                 engagement_profiles: Vec::new(),
+                skills: Vec::new(),
+                preload_skills: Vec::new(),
             })
             .await
             .unwrap();
@@ -593,6 +607,8 @@ mod tests {
             run_id: None,
             findings_profile: profile,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         }
     }
@@ -659,6 +675,49 @@ mod tests {
         assert!(
             matches!(&err, HostConnectorError::Unsupported(m)
                 if m.contains("node_mid") && m.contains("`network`")),
+            "{err:?}"
+        );
+        // Refused before anything was written: no job, no orphaned mirror run.
+        assert!(bucket.list_jobs().await.unwrap().is_empty());
+        assert!(run_store.list().unwrap().is_empty());
+    }
+
+    fn skilled_req() -> AgentLaunchRequest {
+        let mut req = profile_req(None);
+        req.skills = vec!["pdf".into()];
+        req.preload_skills = vec!["house-style".into()];
+        req
+    }
+
+    #[tokio::test]
+    async fn launch_agent_carries_the_skills_to_a_capable_worker() {
+        let (conn, _run_store, bucket, _tmp) = make_conn();
+        put_worker(&bucket, "node_a", &[CAP_AGENT_SKILLS]).await;
+
+        let run_id = conn.launch_agent(skilled_req()).await.unwrap();
+
+        let spec: RunSpec =
+            serde_json::from_slice(&bucket.get_job(&run_id).await.unwrap()).unwrap();
+        assert_eq!(spec.skills, ["pdf"]);
+        assert_eq!(spec.preload_skills, ["house-style"]);
+    }
+
+    #[tokio::test]
+    async fn launch_agent_refuses_skills_when_a_worker_lacks_support() {
+        let (conn, run_store, bucket, _tmp) = make_conn();
+        put_worker(&bucket, "node_new", &[CAP_AGENT_SKILLS]).await;
+        // Advertises the other launch features, but predates skills.
+        put_worker(
+            &bucket,
+            "node_mid",
+            &[CAP_AGENT_FINDINGS_PROFILE, CAP_AGENT_ENGAGEMENT_PROFILE],
+        )
+        .await;
+
+        let err = conn.launch_agent(skilled_req()).await.unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Unsupported(m)
+                if m.contains("node_mid") && m.contains("skills") && m.contains("upgrade rupu")),
             "{err:?}"
         );
         // Refused before anything was written: no job, no orphaned mirror run.

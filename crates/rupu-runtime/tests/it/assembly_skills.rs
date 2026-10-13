@@ -320,6 +320,8 @@ async fn failed_skills_record_the_unstarted_run() {
         customer: None,
         system_prompt: Some("x"),
         prompt: &prompt,
+        launch_skills: &[],
+        launch_preload_skills: &[],
     });
     assert!(
         matches!(&run_err, rupu_agent::RunError::Preflight(m) if *m == unknown_missing(&home)),
@@ -333,6 +335,49 @@ async fn failed_skills_record_the_unstarted_run() {
         })
         .expect("a run_complete with an error");
     assert_eq!(closed, unknown_missing(&home));
+}
+
+/// A site that resolves a launch's skills before assembling it (`rupu run`,
+/// before a clone) records a failure as `assemble` does: the run's
+/// transcript exists, empty. A launch whose skills resolve writes nothing.
+#[tokio::test]
+#[serial]
+async fn skills_resolved_for_a_launch_record_a_failure_as_assemble_does() {
+    let home = Home::new();
+    home.skill("pdf", "Read PDFs.", "Use pdftotext.");
+    let assembler = home.assembler(config());
+    let transcript = home.global().join("transcripts/run_early.jsonl");
+
+    let err = match assembler
+        .resolve_skills_for_launch(
+            &agent_naming_a_missing_skill("anthropic"),
+            &rupu_runtime::assembly::Overrides::default(),
+            &transcript,
+        )
+        .await
+    {
+        Ok(_) => panic!("an unknown skill must not resolve"),
+        Err(e) => e,
+    };
+    assert_eq!(err.to_string(), unknown_missing(&home));
+    assert_eq!(std::fs::read_to_string(&transcript).unwrap(), "");
+
+    std::fs::remove_file(&transcript).unwrap();
+    let overrides = rupu_runtime::assembly::Overrides {
+        skills: vec!["pdf".into()],
+        ..Default::default()
+    };
+    let skills = assembler
+        .resolve_skills_for_launch(
+            &agent(&home, "provider: anthropic"),
+            &overrides,
+            &transcript,
+        )
+        .await
+        .unwrap()
+        .expect("the launch's skill");
+    assert_eq!(skills.names(), ["pdf"]);
+    assert!(!transcript.exists(), "a resolved launch writes nothing");
 }
 
 #[tokio::test]
@@ -358,7 +403,7 @@ async fn launch_overrides_add_skills() {
     assert_eq!(index.len(), 1);
     assert_eq!(
         (index[0].name.as_str(), index[0].reason.as_str()),
-        ("code-review", "step")
+        ("code-review", "launch")
     );
 }
 
@@ -931,4 +976,33 @@ async fn an_oversized_skill_fails_assembly_with_its_size() {
         Err(other) => panic!("{other}"),
         Ok(_) => panic!("assembled a run with an oversized skill"),
     }
+}
+
+/// The launch's own skills are recorded in the run's coverage manifest as
+/// written, so `rupu coverage rerun` passes them again; the agent's own are
+/// not (the rerun's agent grants them).
+#[tokio::test]
+#[serial]
+async fn the_coverage_manifest_records_the_launchs_skills() {
+    let home = Home::new();
+    home.skill("code-review", "Review a diff.", "x");
+    home.skill("house-style", "House style.", "y");
+    home.skill("pdf", "PDFs.", "z");
+    let assembler = home.assembler(config());
+    let spec = agent(
+        &home,
+        "provider: anthropic\nmodel: claude-sonnet-4-6\nskills: [pdf]\nconcerns:\n  - include: stride",
+    );
+    let mut l = launch(&home, spec, Origin::Standalone, "run_manifest_skills");
+    l.overrides.skills = vec!["code-review".into()];
+    l.overrides.preload_skills = vec!["house-style".into()];
+    let _m = MockScript::set(DONE);
+    let run = assembler.assemble(l).await.expect("assembles");
+    let paths = rupu_tools::ledger::paths(&run.opts.tool_context);
+    run.run().await.result.unwrap();
+    let manifest = rupu_coverage::find_manifest(&paths, "run_manifest_skills")
+        .unwrap()
+        .expect("the run's manifest");
+    assert_eq!(manifest.skills, vec!["code-review".to_string()]);
+    assert_eq!(manifest.preload_skills, vec!["house-style".to_string()]);
 }

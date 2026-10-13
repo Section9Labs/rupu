@@ -77,7 +77,7 @@ with no `schema` key is version 1.
 
 Fields and events have been added within version 2 since it shipped (`outcome`, `recovery`,
 `assistant_block`, `customer`, `codename`, `cache_write_tokens`, `purpose`, `skill_index`,
-`skill_load`). A reader should
+`skill_load`, `launch_skills`, `launch_preload_skills`). A reader should
 accept a missing optional key and an unknown event type (see
 [Unknown event types](#unknown-event-types)).
 
@@ -141,6 +141,8 @@ Emitted once at the very beginning of every run (agent or workflow step).
 | `system_prompt` | string, optional | The system prompt actually sent, after rupu appended its own sections (coverage catalog, run target, finding guidance) |
 | `codename`     | string, optional  | The agent instance's human codename (e.g. `amber-lantern/heron`, `cobalt-harbor/heron#412`); absent on transcripts that predate codenames |
 | `customer`     | string \| null, optional | The customer the run ran under. A slug; `null` = recorded as no customer; no key = the transcript predates customers |
+| `launch_skills` | string[], optional | The skill entries the launch granted on top of the agent's (a workflow step's `skills:`, `rupu run --skill`), as written: `*` stays `*`. Absent when the launch named none, and on transcripts that predate the field. `rupu run --continue` passes them again |
+| `launch_preload_skills` | string[], optional | The launch's `preload_skills:` / `--preload-skill` entries, likewise |
 
 `provider` and `model` are what the run was configured to use; a fallback hop appears later
 as a `notice` and a `recovery`, not here.
@@ -401,7 +403,7 @@ Each row:
 | `stamp`   | string | The skill's stamp at run start: a sha256 over its files' paths, sizes, mtimes and modes, no contents. A later load compares against it to notice an edit |
 | `preload` | bool   | The skill's body is in the system prompt |
 | `indexed` | bool   | The skill is listed in the model's skill index. `false` for a preloaded skill and for one marked `disable-model-invocation` |
-| `reason`  | string | Why the run has it: `agent`, `step`, `session` or `operator` |
+| `reason`  | string | Why the run has it: `agent` (the agent's `skills:` / `preloadSkills:`), `launch` (the launch's own: a workflow step's keys or `rupu run --skill`), `session` or `operator`. A transcript written before the rename says `step` for `launch`; readers take the value as written |
 
 ```json
 {"type":"skill_index","data":{"skills":[{"name":"pdf","layer":"global","stamp":"9f2c…","preload":false,"indexed":true,"reason":"agent"}]}}

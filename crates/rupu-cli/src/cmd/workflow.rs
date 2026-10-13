@@ -2240,6 +2240,28 @@ steps:
       {{ steps.<id>.output }}.
 "#;
 
+/// A workflow generation request naming the agents and skills installed in
+/// the global layer and, when given, the project's `.rupu`, so generated
+/// steps reference ones that exist. Shared with the CP's generator.
+pub(crate) fn workflow_gen_request(
+    global: &Path,
+    project_rupu: Option<&Path>,
+    description: String,
+    provider: String,
+    model: String,
+) -> rupu_orchestrator::GenerateRequest {
+    rupu_orchestrator::GenerateRequest {
+        kind: rupu_orchestrator::GenKind::Workflow,
+        description,
+        provider,
+        model,
+        available_agents: load_agent_specs(global, project_rupu)
+            .map(|specs| specs.into_iter().map(|s| s.name).collect())
+            .unwrap_or_default(),
+        available_skills: rupu_orchestrator::generate::installed_skill_names(global, project_rupu),
+    }
+}
+
 async fn create(
     name: Option<String>,
     scope: Option<String>,
@@ -2319,19 +2341,9 @@ async fn create(
                         )
                     })?,
             };
-            // Real agent names so generated steps reference agents that exist.
-            let project_agents_parent = project_root.as_ref().map(|p| p.join(".rupu"));
-            let available_agents = load_agent_specs(&global, project_agents_parent.as_deref())
-                .map(|specs| specs.into_iter().map(|s| s.name).collect::<Vec<_>>())
-                .unwrap_or_default();
             println!("generating workflow `{name}` via {provider}/{model}\u{2026}");
-            let req = rupu_orchestrator::GenerateRequest {
-                kind: rupu_orchestrator::GenKind::Workflow,
-                description: desc,
-                provider,
-                model,
-                available_agents,
-            };
+            let project_rupu = project_root.as_ref().map(|p| p.join(".rupu"));
+            let req = workflow_gen_request(&global, project_rupu.as_deref(), desc, provider, model);
             // ISSUES.md I-74: pass the operator's `[providers.<name>]`
             // settings through instead of silently generating with none.
             // (`gen_cfg` was loaded above, alongside the resolver.)
@@ -6307,6 +6319,30 @@ fn warn_if_ask_mode_is_effectively_bypass(mode: Option<&str>, mode_str: &str) {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+
+    #[test]
+    fn a_workflow_gen_request_names_both_layers_agents_and_skills() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("global");
+        let project = tmp.path().join("repo/.rupu");
+        std::fs::create_dir_all(global.join("agents")).unwrap();
+        std::fs::write(
+            global.join("agents/writer.md"),
+            "---\nname: writer\nprovider: anthropic\nmodel: m\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(global.join("skills/pdf")).unwrap();
+        std::fs::create_dir_all(project.join("skills/notes")).unwrap();
+        let req = super::workflow_gen_request(
+            &global,
+            Some(&project),
+            "d".into(),
+            "p".into(),
+            "m".into(),
+        );
+        assert_eq!(req.available_agents, ["writer"]);
+        assert_eq!(req.available_skills, ["notes", "pdf"]);
+    }
 
     /// `rupu workflow run`'s agentiflow-unit flags: the engagement selection
     /// (comma-separated or repeated, plus its plural alias) and the hidden

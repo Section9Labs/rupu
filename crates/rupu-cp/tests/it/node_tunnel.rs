@@ -235,6 +235,8 @@ async fn mirror_create_append_finish_round_trip() {
         target: None,
         findings_profile: None,
         engagement_profiles: Vec::new(),
+        skills: Vec::new(),
+        preload_skills: Vec::new(),
         codename: None,
     };
 
@@ -313,6 +315,8 @@ async fn mirror_usage_lines_land_in_the_run_usage_ledger() {
     let spec = RunSpec {
         findings_profile: None,
         engagement_profiles: Vec::new(),
+        skills: Vec::new(),
+        preload_skills: Vec::new(),
         codename: None,
         kind: RunSpecKind::Workflow,
         name: "smoke-workflow".to_string(),
@@ -379,6 +383,8 @@ async fn mirror_replace_usage_ledger_swaps_the_file_atomically() {
     let spec = RunSpec {
         findings_profile: None,
         engagement_profiles: Vec::new(),
+        skills: Vec::new(),
+        preload_skills: Vec::new(),
         codename: None,
         kind: RunSpecKind::Workflow,
         name: "smoke-workflow".to_string(),
@@ -475,6 +481,8 @@ async fn mirror_replace_usage_ledger_failure_removes_the_temp_file() {
     let spec = RunSpec {
         findings_profile: None,
         engagement_profiles: Vec::new(),
+        skills: Vec::new(),
+        preload_skills: Vec::new(),
         codename: None,
         kind: RunSpecKind::Workflow,
         name: "smoke-workflow".to_string(),
@@ -539,6 +547,8 @@ async fn mirror_run_json_repins_cp_local_paths() {
         target: None,
         findings_profile: None,
         engagement_profiles: Vec::new(),
+        skills: Vec::new(),
+        preload_skills: Vec::new(),
         codename: None,
     };
 
@@ -644,6 +654,8 @@ async fn mirror_run_json_nulls_resume_fields() {
         target: None,
         findings_profile: None,
         engagement_profiles: Vec::new(),
+        skills: Vec::new(),
+        preload_skills: Vec::new(),
         codename: None,
     };
 
@@ -722,6 +734,8 @@ async fn mirror_run_json_preserves_final_output() {
         target: None,
         findings_profile: None,
         engagement_profiles: Vec::new(),
+        skills: Vec::new(),
+        preload_skills: Vec::new(),
         codename: None,
     };
 
@@ -826,6 +840,8 @@ async fn mirror_traversal_run_id_rejected_before_io() {
         target: None,
         findings_profile: None,
         engagement_profiles: Vec::new(),
+        skills: Vec::new(),
+        preload_skills: Vec::new(),
         codename: None,
     };
     for bad in &[
@@ -872,6 +888,8 @@ async fn mirror_wrong_node_id_rejected() {
         target: None,
         findings_profile: None,
         engagement_profiles: Vec::new(),
+        skills: Vec::new(),
+        preload_skills: Vec::new(),
         codename: None,
     };
 
@@ -941,6 +959,8 @@ async fn mirror_legitimate_owner_can_append_and_finish() {
         target: None,
         findings_profile: None,
         engagement_profiles: Vec::new(),
+        skills: Vec::new(),
+        preload_skills: Vec::new(),
         codename: None,
     };
 
@@ -1453,6 +1473,8 @@ mod tunnel_connector {
             target: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             codename: None,
         }
     }
@@ -1478,6 +1500,8 @@ mod tunnel_connector {
             run_id: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
         }
     }
 
@@ -1964,6 +1988,60 @@ mod tunnel_connector {
         assert!(
             matches!(&err, HostConnectorError::Unsupported(m)
                 if m.contains("node-ep-old") && m.contains("`network`")),
+            "{err:?}"
+        );
+        assert!(
+            run_store.list().unwrap().is_empty(),
+            "no orphaned mirror run"
+        );
+        assert!(rx.try_recv().is_err(), "no frame sent");
+    }
+
+    /// A placed unit's workflow-step skills reach the node in the Run frame.
+    #[tokio::test]
+    async fn launch_agent_carries_the_skills_to_a_capable_node() {
+        let dir = tempdir().unwrap();
+        let (conn, mut rx, _run_store, _node_conn) = setup_with_capabilities(
+            "node-sk-1",
+            dir.path(),
+            rupu_cp::node::protocol::node_capabilities(),
+        );
+        let mut req = make_agent_req("recon");
+        req.skills = vec!["pdf".into()];
+        req.preload_skills = vec!["house-style".into()];
+        let run_id = conn.launch_agent(req).await.expect("launch_agent");
+
+        match rx.recv().await.expect("should receive a frame") {
+            Frame::Run { run_id: fid, spec } => {
+                assert_eq!(fid, run_id);
+                assert_eq!(spec.skills, ["pdf"]);
+                assert_eq!(spec.preload_skills, ["house-style"]);
+            }
+            other => panic!("expected Frame::Run, got {other:?}"),
+        }
+    }
+
+    /// A node that advertises the other launch features but not
+    /// `agent.skills` would drop the fields and run the unit without its
+    /// step's skills — refuse, and leave no mirror run or frame behind.
+    #[tokio::test]
+    async fn launch_agent_refuses_skills_for_a_node_without_the_capability() {
+        let dir = tempdir().unwrap();
+        let (conn, mut rx, run_store, _node_conn) = setup_with_capabilities(
+            "node-sk-old",
+            dir.path(),
+            vec![
+                rupu_cp::node::protocol::CAP_AGENT_FINDINGS_PROFILE.to_string(),
+                rupu_cp::node::protocol::CAP_AGENT_ENGAGEMENT_PROFILE.to_string(),
+            ],
+        );
+        let mut req = make_agent_req("recon");
+        req.preload_skills = vec!["house-style".into()];
+
+        let err = conn.launch_agent(req).await.unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Unsupported(m)
+                if m.contains("node-sk-old") && m.contains("skills") && m.contains("upgrade rupu")),
             "{err:?}"
         );
         assert!(
@@ -3451,6 +3529,8 @@ async fn mirror_transcript_append_finish_synthesizes_agent_step_result() {
         target: None,
         findings_profile: None,
         engagement_profiles: Vec::new(),
+        skills: Vec::new(),
+        preload_skills: Vec::new(),
         codename: None,
     };
     let run_id = "run_NODEMIRRTRANS01";
@@ -3531,6 +3611,8 @@ async fn mirror_reset_transcript_makes_replay_idempotent() {
         target: None,
         findings_profile: None,
         engagement_profiles: Vec::new(),
+        skills: Vec::new(),
+        preload_skills: Vec::new(),
         codename: None,
     };
     let run_id = "run_NODEMIRRTRANS02";
