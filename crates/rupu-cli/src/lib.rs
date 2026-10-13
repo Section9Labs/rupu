@@ -252,6 +252,12 @@ pub enum Cmd {
         #[command(subcommand)]
         action: cmd::workspace_helper::WorkspaceHelperAction,
     },
+    /// Internal: cache skills shipped to this host (placed-unit skills).
+    #[command(name = "__skills", hide = true)]
+    Skills {
+        #[command(subcommand)]
+        action: cmd::skills_helper::SkillsHelperAction,
+    },
     /// Internal: print this build's host features (SSH capability probe).
     #[command(name = "__features", hide = true)]
     Features,
@@ -495,6 +501,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Man => cmd::man::handle(),
         Cmd::ApplyUpdate(args) => cmd::apply_update::handle(args),
         Cmd::Workspace { action } => cmd::workspace_helper::handle(action).await,
+        Cmd::Skills { action } => cmd::skills_helper::handle(action).await,
         Cmd::Features => cmd::features_helper::handle(),
         Cmd::FindingsHelper { action } => cmd::findings_helper::handle(action).await,
     }
@@ -607,6 +614,11 @@ fn ensure_output_format_supported(
         ),
         Cmd::Workspace { .. } => output::formats::ensure_supported(
             "__workspace",
+            format,
+            &[output::formats::OutputFormat::Table],
+        ),
+        Cmd::Skills { .. } => output::formats::ensure_supported(
+            "__skills",
             format,
             &[output::formats::OutputFormat::Table],
         ),

@@ -392,7 +392,7 @@ pub struct ShippedSkillRef {
 }
 
 impl ShippedSkillRef {
-    fn validate(&self) -> Result<(), ShipError> {
+    pub fn validate(&self) -> Result<(), ShipError> {
         let bad = |m: String| ShipError::Manifest(m);
         self.name
             .parse::<SkillName>()

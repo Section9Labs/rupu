@@ -353,6 +353,7 @@ impl UnitDispatcher for FleetUnitDispatcher {
                 // refused.
                 skills: unit.skills,
                 preload_skills: unit.preload_skills,
+                skill_bundle: None,
             })
             .await
         {

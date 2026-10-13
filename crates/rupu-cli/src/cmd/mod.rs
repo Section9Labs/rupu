@@ -45,4 +45,5 @@ pub(crate) mod usage_report;
 pub mod watch;
 pub mod webhook;
 pub mod workflow;
+pub mod skills_helper;
 pub mod workspace_helper;

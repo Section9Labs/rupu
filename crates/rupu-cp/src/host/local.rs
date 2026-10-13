@@ -1232,6 +1232,7 @@ mod launch_agent_tests {
                 engagement_profiles: Vec::new(),
                 skills: Vec::new(),
                 preload_skills: Vec::new(),
+                skill_bundle: None,
                 codename: None,
             })
             .await
@@ -1267,6 +1268,7 @@ mod launch_agent_tests {
             engagement_profiles: vec!["network".into()],
             skills: Vec::new(),
             preload_skills: Vec::new(),
+            skill_bundle: None,
             codename: None,
         })
         .await
@@ -1307,6 +1309,7 @@ mod launch_agent_tests {
             engagement_profiles: Vec::new(),
             skills: vec!["pdf".into()],
             preload_skills: vec!["house-style".into()],
+            skill_bundle: None,
             codename: None,
         })
         .await

@@ -7604,6 +7604,7 @@ mod tests {
                 engagement_profiles: Vec::new(),
                 skills: Vec::new(),
                 preload_skills: Vec::new(),
+                skill_bundle: None,
                 codename: None,
             })
             .await
@@ -9016,6 +9017,7 @@ mod tests {
                     engagement_profiles: Vec::new(),
                     skills: Vec::new(),
                     preload_skills: Vec::new(),
+                    skill_bundle: None,
                 })
                 .await
                 .expect("launch_agent");
@@ -9317,6 +9319,7 @@ mod tests {
                 engagement_profiles: Vec::new(),
                 skills: Vec::new(),
                 preload_skills: Vec::new(),
+                skill_bundle: None,
             })
             .await
             .unwrap();
@@ -9359,6 +9362,7 @@ mod tests {
                 engagement_profiles: Vec::new(),
                 skills: Vec::new(),
                 preload_skills: Vec::new(),
+                skill_bundle: None,
             })
             .await
             .unwrap();
@@ -9391,6 +9395,7 @@ mod tests {
                 engagement_profiles: Vec::new(),
                 skills: Vec::new(),
                 preload_skills: Vec::new(),
+                skill_bundle: None,
                 codename: None,
             })
             .await
@@ -9424,6 +9429,7 @@ mod tests {
             engagement_profiles: vec!["network".into(), "web".into()],
             skills: Vec::new(),
             preload_skills: Vec::new(),
+            skill_bundle: None,
             codename: None,
         })
         .await
@@ -9451,6 +9457,7 @@ mod tests {
             engagement_profiles: Vec::new(),
             skills: vec!["pdf".into()],
             preload_skills: vec!["house-style".into()],
+            skill_bundle: None,
             codename: None,
         }
     }
@@ -9614,6 +9621,7 @@ mod tests {
                 engagement_profiles: Vec::new(),
                 skills: Vec::new(),
                 preload_skills: Vec::new(),
+                skill_bundle: None,
             })
             .await
             .unwrap_err();

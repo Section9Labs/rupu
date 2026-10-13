@@ -217,6 +217,11 @@ pub const CAP_AGENT_ENGAGEMENT_PROFILE: &str = "agent.engagement_profile";
 /// on a peer that hasn't advertised it.
 pub const CAP_AGENT_SKILLS: &str = "agent.skills";
 
+/// Host feature entry: this executor caches shipped skill content (`rupu
+/// __skills`, `/api/skills/bundle/*`) and `rupu run` takes `--skill-bundle`,
+/// so a placed unit runs with the coordinator's skills.
+pub const CAP_AGENT_SKILL_BUNDLE: &str = "agent.skill_bundle";
+
 /// Host feature entry (HTTP only; no other transport runs sessions): this
 /// CP's session start and send endpoints take `skills` (and the start's
 /// `preload_skills`) to `rupu session start/send --skill`. A connector
@@ -302,6 +307,7 @@ pub fn host_features() -> Vec<String> {
         CAP_AGENT_FINDINGS_PROFILE.to_string(),
         CAP_AGENT_ENGAGEMENT_PROFILE.to_string(),
         CAP_AGENT_SKILLS.to_string(),
+        CAP_AGENT_SKILL_BUNDLE.to_string(),
         CAP_SESSION_SKILLS.to_string(),
         CAP_WORKFLOW_RESUME_IF_UNFINISHED.to_string(),
         CAP_RUN_COVERAGE_STREAM.to_string(),
@@ -646,6 +652,19 @@ mod tests {
         assert!(host_features().iter().any(|c| c == CAP_SESSION_SKILLS));
         for caps in [node_capabilities(), bucket_worker_capabilities()] {
             assert!(!caps.iter().any(|c| c == CAP_SESSION_SKILLS), "{caps:?}");
+        }
+    }
+
+    /// Only `host_features()` (HTTP + SSH) can receive shipped skills in Plan 1.
+    #[test]
+    fn only_host_features_advertise_the_skill_bundle() {
+        assert_eq!(CAP_AGENT_SKILL_BUNDLE, "agent.skill_bundle");
+        assert!(host_features().iter().any(|c| c == CAP_AGENT_SKILL_BUNDLE));
+        for caps in [node_capabilities(), bucket_worker_capabilities()] {
+            assert!(
+                !caps.iter().any(|c| c == CAP_AGENT_SKILL_BUNDLE),
+                "{caps:?}"
+            );
         }
     }
 

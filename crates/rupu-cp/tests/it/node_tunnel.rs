@@ -1502,6 +1502,7 @@ mod tunnel_connector {
             engagement_profiles: Vec::new(),
             skills: Vec::new(),
             preload_skills: Vec::new(),
+            skill_bundle: None,
         }
     }
 
