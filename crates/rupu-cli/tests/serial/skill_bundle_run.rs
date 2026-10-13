@@ -45,6 +45,25 @@ fn ship_pdf(dir: &Path) -> SkillBundleManifest {
     }
 }
 
+/// Like [`ship_pdf`] with a different body, so a different hash.
+fn ship_other_pdf(dir: &Path) -> SkillBundleManifest {
+    let scratch = tempfile::tempdir().unwrap();
+    let root = scratch.path().join("pdf");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("SKILL.md"),
+        "---\nname: pdf\ndescription: Read PDFs.\n---\n\nDo the other pdf thing.\n",
+    )
+    .unwrap();
+    let packed = pack_skill(&load_skill(&root, Layer::Global).unwrap()).unwrap();
+    let r = packed.reference();
+    store(&cache_dir(&dir.join(".rupu")), &r, &packed.bytes).unwrap();
+    SkillBundleManifest {
+        version: SkillBundleManifest::VERSION,
+        skills: vec![r],
+    }
+}
+
 fn rupu(dir: &Path) -> Command {
     let mut cmd = Command::cargo_bin("rupu").unwrap();
     cmd.current_dir(dir)
@@ -123,6 +142,66 @@ async fn a_shipped_skill_runs_is_recorded_and_continues() {
         .assert()
         .success();
     assert!(shipped_pdf_indexed(dir.path(), "run_next"));
+    // The continued run records the bundle too, so it can be continued.
+    let next: SkillBundleManifest = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join(".rupu/runs/run_next/skill_bundle.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(next, manifest);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_explicit_bundle_wins_over_the_continued_runs() {
+    let _guard = ENV_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    home_with_agent(dir.path());
+    let manifest = ship_pdf(dir.path());
+    let json = serde_json::to_string(&manifest).unwrap();
+    rupu(dir.path())
+        .args([
+            "run",
+            "a",
+            "--mode",
+            "bypass",
+            "--run-id",
+            "run_one",
+            &format!("--skill-bundle={json}"),
+            "--prompt=hi",
+        ])
+        .assert()
+        .success();
+    let prev = transcript(dir.path(), "run_one");
+    let kept: Vec<String> = std::fs::read_to_string(&prev)
+        .unwrap()
+        .lines()
+        .take_while(|l| !l.contains("\"turn_start\""))
+        .map(String::from)
+        .collect();
+    std::fs::write(&prev, kept.join("\n") + "\n").unwrap();
+
+    // An explicit manifest naming a different (cached) pdf.
+    let other = ship_other_pdf(dir.path());
+    let other_json = serde_json::to_string(&other).unwrap();
+    assert_ne!(other, manifest);
+    rupu(dir.path())
+        .args([
+            "run",
+            "a",
+            "--mode",
+            "bypass",
+            "--run-id",
+            "run_two",
+            "--continue",
+            "run_one",
+            &format!("--skill-bundle={other_json}"),
+        ])
+        .assert()
+        .success();
+    let recorded: SkillBundleManifest = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join(".rupu/runs/run_two/skill_bundle.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(recorded, other);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -153,7 +232,10 @@ async fn a_malformed_bundle_names_the_flag() {
     let _guard = ENV_LOCK.lock().await;
     let dir = tempfile::tempdir().unwrap();
     home_with_agent(dir.path());
-    for bad in ["not json", r#"{"version":2,"skills":[]}"#] {
+    for (bad, detail) in [
+        ("not json", "expected"),
+        (r#"{"version":2,"skills":[]}"#, "version 2 is not supported"),
+    ] {
         rupu(dir.path())
             .args([
                 "run",
@@ -165,6 +247,7 @@ async fn a_malformed_bundle_names_the_flag() {
             ])
             .assert()
             .failure()
-            .stderr(predicate::str::contains("--skill-bundle"));
+            .stderr(predicate::str::contains("--skill-bundle"))
+            .stderr(predicate::str::contains(detail));
     }
 }

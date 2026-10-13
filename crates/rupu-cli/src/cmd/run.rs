@@ -1572,8 +1572,8 @@ fn skill_bundle_manifest(
 ) -> anyhow::Result<Option<rupu_skills::ship::SkillBundleManifest>> {
     use anyhow::Context;
     let parse = |json: &str, from: &str| -> anyhow::Result<_> {
-        let m: rupu_skills::ship::SkillBundleManifest =
-            serde_json::from_str(json).with_context(|| format!("{from}: not a skill manifest"))?;
+        let m: rupu_skills::ship::SkillBundleManifest = serde_json::from_str(json)
+            .map_err(|e| anyhow::anyhow!("{from}: not a skill manifest: {e}"))?;
         m.validate().map_err(|e| anyhow::anyhow!("{from}: {e}"))?;
         Ok(m)
     };
