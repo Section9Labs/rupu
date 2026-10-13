@@ -437,3 +437,67 @@ async fn events_feed_merges_coordinator_lifecycle_with_unit_lifecycle() {
     // A run id that names no run is a 404.
     assert_eq!(get(addr, "/api/agentiflows/af_missing/events").await.0, 404);
 }
+
+#[tokio::test]
+async fn detail_asset_scope_resolves_to_the_engagement_coverage_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let global = tmp.path();
+
+    // A registered workspace the lead ran in.
+    let ws_path = tmp.path().join("proj");
+    std::fs::create_dir_all(&ws_path).unwrap();
+    std::fs::create_dir_all(global.join("workspaces")).unwrap();
+    let ws_id = "ws_01SCOPETEST0000000000000000";
+    std::fs::write(
+        global.join("workspaces").join(format!("{ws_id}.toml")),
+        format!(
+            "id = {:?}\npath = {:?}\ncreated_at = {:?}\n",
+            ws_id,
+            ws_path.display().to_string(),
+            "2026-10-13T00:00:00+00:00"
+        ),
+    )
+    .unwrap();
+
+    // An af whose lead RunStart names that workspace.
+    let af = "af_01SCOPETEST0000000000000000";
+    let run = agentiflow_dir(global).join(af);
+    record(af, "2026-10-13T00:00:00Z", "running")
+        .write(&run)
+        .unwrap();
+    std::fs::create_dir_all(run.join("lead")).unwrap();
+    std::fs::write(
+        run.join("lead").join("transcript.r0.jsonl"),
+        json!({"type": "run_start", "data": {
+            "run_id": "lead_1", "workspace_id": ws_id, "agent": "lead",
+            "provider": "mock", "model": "m", "started_at": "2026-10-13T00:00:00Z",
+            "mode": "bypass"}})
+        .to_string()
+            + "\n",
+    )
+    .unwrap();
+
+    let addr = spawn_server(global).await;
+    let (status, d) = get(addr, &format!("/api/agentiflows/{af}")).await;
+    assert_eq!(status, 200, "{d}");
+    // Scoped to the engagement's own coverage target, not every workspace's.
+    assert_eq!(d["asset_scope"]["ws_id"], ws_id, "{d}");
+    assert_eq!(
+        d["asset_scope"]["target_id"].as_str().unwrap(),
+        rupu_coverage::target_id(&ws_path, af),
+        "{d}"
+    );
+
+    // No lead transcript → no scope at all (the tab says so; it never falls
+    // back to showing every workspace's assets).
+    let af2 = "af_01NOSCOPE00000000000000000";
+    record(af2, "2026-10-13T00:00:00Z", "running")
+        .write(&agentiflow_dir(global).join(af2))
+        .unwrap();
+    let (status2, d2) = get(addr, &format!("/api/agentiflows/{af2}")).await;
+    assert_eq!(status2, 200, "{d2}");
+    assert!(
+        d2.get("asset_scope").is_none() || d2["asset_scope"].is_null(),
+        "unscoped af must not carry an asset_scope: {d2}"
+    );
+}
