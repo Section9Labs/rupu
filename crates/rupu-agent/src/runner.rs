@@ -2290,6 +2290,8 @@ async fn run_agent_inner(
         // content joins that assistant message (spec §5.4; replay applies
         // the same merge from `Recovery { merge_into_previous }`).
         let mut merge_next_assistant = false;
+        // What the collectors delivered: recorded, and awaiting receipts.
+        let mut injections = InjectionLog::default();
         let loop_outcome = 'turns: loop {
             if turn_idx >= opts.max_turns {
                 break 'turns LoopOutcome::Status(
@@ -2316,14 +2318,40 @@ async fn run_agent_inner(
                 };
                 // Run collectors off the async runtime; a panicking collector
                 // degrades to "inject nothing this turn", never kills the run.
-                let assembly = tokio::task::spawn_blocking(move || pipeline.run(&ctx))
+                let run_pipeline = pipeline.clone();
+                let assembly = tokio::task::spawn_blocking(move || run_pipeline.run(&ctx))
                     .await
                     .unwrap_or_default();
-                for m in assembly.once {
-                    messages.push(m); // persist once-delivered injections
+                // Recorded in conversation order (spec F1a §6): each message
+                // received, then the injection that carries it.
+                let mut fresh: Vec<&crate::collector::Delivered> = Vec::new();
+                for d in &assembly.once {
+                    record_injection(&mut writer, d, &mut injections.received)?;
+                    messages.push(d.message.clone()); // persist once-delivered injections
+                    fresh.push(d);
+                }
+                let mut every_now = std::collections::HashSet::new();
+                for d in &assembly.every_turn {
+                    let key = (d.injection.source.clone(), d.injection.content.clone());
+                    if !injections.every_turn.contains(&key) {
+                        record_injection(&mut writer, d, &mut injections.received)?;
+                        fresh.push(d);
+                    }
+                    every_now.insert(key);
+                }
+                injections.every_turn = every_now;
+                let ids: Vec<String> = fresh
+                    .iter()
+                    .flat_map(|d| d.injection.messages.iter().map(|m| m.id.clone()))
+                    .collect();
+                if !ids.is_empty() {
+                    let fresh: Vec<crate::collector::Delivered> =
+                        fresh.into_iter().cloned().collect();
+                    injections.pending_seen = Some((pipeline, fresh, ids));
                 }
                 let mut tm = messages.clone();
-                tm.extend(assembly.every_turn); // transient for this turn only
+                // transient for this turn only
+                tm.extend(assembly.every_turn.into_iter().map(|d| d.message));
                 tm
             };
             let mut req = LlmRequest {
@@ -2790,6 +2818,15 @@ async fn run_agent_inner(
                 CallOutcome::Response(r) => *r,
                 CallOutcome::Paused => break 'turns LoopOutcome::Paused,
             };
+            // The call saw this turn's delivered messages: their receipts.
+            if let Some((pipeline, delivered, ids)) = injections.pending_seen.take() {
+                let turn = turn_idx;
+                let _ = tokio::task::spawn_blocking(move || {
+                    let refs: Vec<&crate::collector::Delivered> = delivered.iter().collect();
+                    pipeline.seen(&refs, &ids, turn);
+                })
+                .await;
+            }
             // I-48: reasoning tokens (Gemini's thoughtsTokenCount, reported
             // outside candidatesTokenCount) are real, billed tokens. Folding
             // them into the output figure here — where run totals and the
@@ -3234,6 +3271,31 @@ async fn run_agent_inner(
                                         stderr_bytes,
                                     })?;
                                 }
+                                DerivedEvent::MessageSent {
+                                    id,
+                                    from,
+                                    from_codename,
+                                    to,
+                                    kind,
+                                    body,
+                                    delivery,
+                                } => {
+                                    writer.write(&Event::Message {
+                                        id,
+                                        direction: rupu_transcript::MessageDirection::Sent,
+                                        from,
+                                        from_codename,
+                                        to,
+                                        kind,
+                                        body,
+                                        urgent: false,
+                                        via: rupu_transcript::MessageVia::Tool,
+                                        delivery: Some(delivery),
+                                    })?;
+                                }
+                                DerivedEvent::Notice { kind, message } => {
+                                    writer.write(&Event::Notice { kind, message })?;
+                                }
                             }
                         }
                         tool_results.push((call_id, clamped_stdout, out.error));
@@ -3583,6 +3645,27 @@ async fn run_agent_inner(
     // never sees EOF and the await hangs indefinitely.
     // -----------------------------------------------------------------------
     opts.tool_context.services.coverage_writer = None;
+    // The run leaves its message space (spec F1a §3.1), unless it stays
+    // joined between runs (an agentiflow lead's rounds, a session's turns).
+    if let Some(bus) = opts.tool_context.services.message_bus.clone() {
+        if bus.leaves_on_exit() {
+            let status = match &inner_result {
+                Ok(r) if r.paused => "paused",
+                Ok(r) => match r.status {
+                    RunStatus::Ok => "done",
+                    RunStatus::Error => "failed",
+                    RunStatus::Aborted => "aborted",
+                },
+                Err(_) => "failed",
+            };
+            if let Err(e) = tokio::task::spawn_blocking(move || bus.leave(status))
+                .await
+                .unwrap_or(Ok(()))
+            {
+                tracing::warn!(error = %e, "could not record the run leaving its message space");
+            }
+        }
+    }
     // Release the run's subprocess-capture state once, at run end.
     if let Some(cap) = &opts.tool_context.services.net_capture {
         cap.run_finished(&opts.id.run_id);
@@ -3592,6 +3675,60 @@ async fn run_agent_inner(
     }
 
     inner_result
+}
+
+/// The run's record of its collectors' injections (spec F1a §6).
+#[derive(Default)]
+struct InjectionLog {
+    /// The every-turn injections of the turn before, by source and content:
+    /// one is recorded again only when its content changes.
+    every_turn: std::collections::HashSet<(String, String)>,
+    /// Messages already recorded as received (a standing directive is
+    /// delivered every turn, received once).
+    received: std::collections::HashSet<String>,
+    /// This turn's newly delivered messages, for their receipts once the
+    /// model call has seen them.
+    pending_seen: Option<(
+        crate::collector::CollectorPipeline,
+        Vec<crate::collector::Delivered>,
+        Vec<String>,
+    )>,
+}
+
+/// Record one delivered injection: a `message { received }` per message it
+/// carries that the run hasn't recorded yet, then the `injected` event (at
+/// the position replay re-inserts a `once` injection).
+fn record_injection(
+    writer: &mut JsonlWriter,
+    d: &crate::collector::Delivered,
+    received: &mut std::collections::HashSet<String>,
+) -> Result<(), RunError> {
+    let inj = &d.injection;
+    for m in &inj.messages {
+        if !received.insert(m.id.clone()) {
+            continue;
+        }
+        writer.write(&Event::Message {
+            id: m.id.clone(),
+            direction: rupu_transcript::MessageDirection::Received,
+            from: m.from.clone(),
+            from_codename: m.from_codename.clone(),
+            to: m.to.clone(),
+            kind: m.kind.clone(),
+            body: m.body.clone(),
+            urgent: m.urgent,
+            via: rupu_transcript::MessageVia::Injected,
+            delivery: None,
+        })?;
+    }
+    writer.write(&Event::Injected {
+        source: inj.source.clone(),
+        kind: inj.kind.as_str().to_string(),
+        cadence: inj.cadence.as_str().to_string(),
+        content: inj.content.clone(),
+        message_ids: inj.messages.iter().map(|m| m.id.clone()).collect(),
+    })?;
+    Ok(())
 }
 
 /// The transcript's record of a run's permission mode.

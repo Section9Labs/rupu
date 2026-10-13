@@ -11,6 +11,8 @@
 //! too, and a `Recovery { merge_into_previous }` makes the next kept turn's
 //! assistant content join the previous assistant message (a `pause_turn`
 //! continuation) — both as the runner does (response-outcomes spec §5.4).
+//! A `once` `Injected` event re-inserts the collector context the runner
+//! added at that point (spec F1a §6).
 //!
 //! Legacy (v1) transcripts reconstruct without reasoning blocks — the v1
 //! `assistant_message.thinking` string has no `raw` payload to rebuild.
@@ -369,6 +371,17 @@ fn reconstruct_with(
                 merge_into_previous: true,
                 ..
             } => merge_next = true,
+            // A collector's `once` injection joined the conversation here,
+            // framed as the runner framed it (spec F1a §6). An `every_turn`
+            // one was sent with that turn's request only.
+            Event::Injected {
+                source,
+                cadence,
+                content,
+                ..
+            } if cadence == crate::collector::Cadence::Once.as_str() => {
+                messages.push(crate::collector::wrap(source, content));
+            }
             // Non-conversation events.
             Event::RunStart { .. }
             | Event::TurnStart { .. }
@@ -388,6 +401,8 @@ fn reconstruct_with(
             | Event::Notice { .. }
             | Event::Outcome { .. }
             | Event::Recovery { .. }
+            | Event::Message { .. }
+            | Event::Injected { .. }
             | Event::Unknown { .. } => {}
         }
     }
