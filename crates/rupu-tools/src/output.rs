@@ -64,3 +64,21 @@ pub fn opt_str(input: &Value, key: &str) -> Result<Option<String>, ToolError> {
         ))),
     }
 }
+
+/// Refuse any argument outside `known`: a tool whose schema says
+/// `additionalProperties: false` holds to it (a `from` the model slips into a
+/// message is an error, never silently ignored).
+pub fn deny_unknown(input: &Value, known: &[&str]) -> Result<(), ToolError> {
+    let Some(obj) = input.as_object() else {
+        return Err(ToolError::InvalidInput(
+            "arguments must be an object".into(),
+        ));
+    };
+    match obj.keys().find(|k| !known.contains(&k.as_str())) {
+        Some(k) => Err(ToolError::InvalidInput(format!(
+            "unknown field `{k}` (expected: {})",
+            known.join(", ")
+        ))),
+        None => Ok(()),
+    }
+}

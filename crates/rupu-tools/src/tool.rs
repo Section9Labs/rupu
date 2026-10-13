@@ -524,6 +524,25 @@ pub enum DerivedEvent {
         /// Total bytes written to stderr.
         stderr_bytes: u64,
     },
+    /// A messaging tool wrote a message into the run's message space; the
+    /// agent loop records it as a `message` event (`direction: sent`).
+    MessageSent {
+        /// The message's id in the space's log.
+        id: String,
+        from: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_codename: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to: Option<String>,
+        /// `post`, `direct`, `broadcast`, `directive`, `retract`.
+        kind: String,
+        body: String,
+        /// `resolved` / `undelivered`, as logged.
+        delivery: serde_json::Value,
+    },
+    /// Something the transcript should say beside the result (a
+    /// `messaging_full` notice); the agent loop writes it as a `notice`.
+    Notice { kind: String, message: String },
 }
 
 /// Render a lightweight unified diff for file edits.

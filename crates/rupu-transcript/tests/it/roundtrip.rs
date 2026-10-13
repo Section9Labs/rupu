@@ -169,3 +169,41 @@ fn roundtrip_run_complete_error_with_reason() {
         outcome: None,
     });
 }
+
+#[test]
+fn roundtrip_message_and_injected_with_a_pinned_wire_shape() {
+    use rupu_transcript::{MessageDirection, MessageVia};
+    let sent = Event::Message {
+        id: "msg_01".into(),
+        direction: MessageDirection::Sent,
+        from: "lynx#1".into(),
+        from_codename: Some("cobalt-harbor/lynx#1".into()),
+        to: Some("role:recon".into()),
+        kind: "direct".into(),
+        body: "hi".into(),
+        urgent: false,
+        via: MessageVia::Tool,
+        delivery: Some(serde_json::json!({"resolved": ["otter#1"]})),
+    };
+    assert_roundtrip(&sent);
+    assert_eq!(
+        serde_json::to_value(&sent).unwrap(),
+        serde_json::json!({"type": "message", "data": {
+            "id": "msg_01", "direction": "sent", "from": "lynx#1",
+            "from_codename": "cobalt-harbor/lynx#1", "to": "role:recon", "kind": "direct",
+            "body": "hi", "via": "tool", "delivery": {"resolved": ["otter#1"]}
+        }})
+    );
+    let injected = Event::Injected {
+        source: "mailbox:otter#1".into(),
+        kind: "message".into(),
+        cadence: "once".into(),
+        content: "from lynx#1 at t: hi".into(),
+        message_ids: vec!["msg_01".into()],
+    };
+    assert_roundtrip(&injected);
+    assert_eq!(
+        serde_json::to_value(&injected).unwrap()["type"],
+        serde_json::json!("injected")
+    );
+}

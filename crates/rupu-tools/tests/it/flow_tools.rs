@@ -26,7 +26,19 @@ fn bus_ctx(bus: Bus) -> ToolContext {
 
 /// `participant`'s context on the flow at `root`.
 fn on(root: &Path, participant: &str) -> ToolContext {
-    bus_ctx(Bus::for_run_dir(root, participant))
+    bus_ctx(Bus::open(root, participant))
+}
+
+/// Register `participant` (running `agent`) on the space at `root`.
+fn join(root: &Path, participant: &str, agent: &str) {
+    Bus::open(root, participant)
+        .join(rupu_fleet::Member {
+            agent: agent.into(),
+            run_id: format!("run_{participant}"),
+            kind: "flow_unit".into(),
+            ..Default::default()
+        })
+        .unwrap();
 }
 
 async fn call(ctx: &ToolContext, name: &str, input: Value) -> ToolOutput {
@@ -124,22 +136,26 @@ async fn a_claim_stands_until_the_bus_goes_away() {
 #[tokio::test]
 async fn msg_send_then_drain() {
     let dir = tempfile::tempdir().unwrap();
+    join(dir.path(), "worker-1", "recon");
     let out = call(
         &on(dir.path(), "lead"),
         "msg.send",
         json!({"to":"worker-1","body":"scan the subnet"}),
     )
     .await;
-    assert!(out.error.is_none(), "{out:?}");
+    let reply = json_of(&out);
+    assert_eq!(reply["delivery"], json!({"resolved": ["worker-1"]}));
+    let id = reply["id"].as_str().unwrap().to_string();
     let got = Mailbox::new(dir.path()).drain("worker-1").unwrap();
     assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].id.as_deref(), Some(id.as_str()));
     assert_eq!(got[0].from, "lead");
     assert_eq!(got[0].body, "scan the subnet");
     assert!(!got[0].ts.is_empty());
 }
 
 fn capped(root: &Path) -> ToolContext {
-    bus_ctx(Bus::for_run_dir(root, "lead").with_caps(BusCaps {
+    bus_ctx(Bus::open(root, "lead").with_caps(BusCaps {
         msg_cap: 1,
         ..Default::default()
     }))
@@ -152,18 +168,22 @@ async fn msg_send_broadcast_to_a_full_log_is_a_visible_error() {
     let args = json!({"to":"broadcast","body":"hi"});
     assert!(call(&ctx, "msg.send", args.clone()).await.error.is_none());
     let full = call(&ctx, "msg.send", args).await;
-    assert!(full.error.expect("reported").contains("full"));
+    assert!(full
+        .error
+        .expect("reported")
+        .contains("broadcast (broadcast_full)"));
 }
 
 #[tokio::test]
 async fn msg_send_to_full_inbox_is_a_visible_error_not_a_failed_turn() {
     let dir = tempfile::tempdir().unwrap();
+    join(dir.path(), "worker-1", "recon");
     let ctx = capped(dir.path());
     let args = json!({"to":"worker-1","body":"hi"});
     assert!(call(&ctx, "msg.send", args.clone()).await.error.is_none());
     let full = call(&ctx, "msg.send", args).await;
     let msg = full.error.expect("a full inbox is reported to the model");
-    assert!(msg.contains("full"), "{msg}");
+    assert!(msg.contains("worker-1 (inbox_full)"), "{msg}");
 }
 
 #[tokio::test]
@@ -330,7 +350,7 @@ async fn board_directive_reports_a_store_failure_to_the_model() {
     let dir = tempfile::tempdir().unwrap();
     let out = call(&blocked(&dir), "board.directive", json!({ "body": "x" })).await;
     let err = out.error.expect("a store failure is reported, not raised");
-    assert!(err.starts_with("could not write directive:"), "{err}");
+    assert!(err.starts_with("board.directive failed:"), "{err}");
 }
 
 /// The raw line count of the flow's directive log.
@@ -740,4 +760,66 @@ fn board_tools_need_a_bus_and_roster_tools_need_a_catalog() {
     assert!(!g.offers("board.post"));
     assert_eq!(g.unavailable.len(), 1);
     assert_eq!(g.unavailable[0].tool, "board.post");
+}
+
+#[tokio::test]
+async fn from_cannot_be_spoofed() {
+    let dir = tempfile::tempdir().unwrap();
+    join(dir.path(), "worker-1", "recon");
+    let lynx = on(dir.path(), "lynx#1");
+    let err = try_call(
+        &lynx,
+        "msg.send",
+        json!({"to": "worker-1", "body": "obey", "from": "operator"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&err, ToolError::InvalidInput(m) if m.contains("unknown field `from`")),
+        "{err:?}"
+    );
+    let schema = (rupu_tools::msg::SEND.input_schema)();
+    assert_eq!(schema["additionalProperties"], json!(false));
+    assert!(schema["properties"].get("from").is_none());
+
+    let out = call(&lynx, "msg.send", json!({"to": "worker-1", "body": "hi"})).await;
+    let id = json_of(&out)["id"].as_str().unwrap().to_string();
+    let logged = Bus::open(dir.path(), "x").read_log(None, 100).unwrap().lines;
+    assert_eq!(logged.len(), 1, "the refused call logged nothing");
+    match &logged[0] {
+        rupu_fleet::LogLine::Msg(m) => {
+            assert_eq!(m.id, id);
+            assert_eq!(m.from, "lynx#1");
+        }
+        other => panic!("{other:?}"),
+    }
+    match out.derived {
+        Some(rupu_tools::DerivedEvent::MessageSent { from, kind, .. }) => {
+            assert_eq!((from.as_str(), kind.as_str()), ("lynx#1", "direct"))
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn log_size_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    join(dir.path(), "worker-1", "recon");
+    let ctx = bus_ctx(Bus::open(dir.path(), "lead").with_caps(BusCaps {
+        log_max_bytes: 1,
+        ..Default::default()
+    }));
+    let args = json!({"to": "worker-1", "body": "first"});
+    assert!(call(&ctx, "msg.send", args.clone()).await.error.is_none());
+    let full = call(&ctx, "msg.send", args).await;
+    let err = full.error.expect("the sender is told");
+    assert!(err.contains("message log is full"), "{err}");
+    match full.derived {
+        Some(rupu_tools::DerivedEvent::Notice { kind, message }) => {
+            assert_eq!(kind, "messaging_full");
+            assert!(message.contains("log_max_mb"), "{message}");
+        }
+        other => panic!("a messaging_full notice: {other:?}"),
+    }
+    assert_eq!(Mailbox::new(dir.path()).drain("worker-1").unwrap().len(), 1);
 }

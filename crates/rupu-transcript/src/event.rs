@@ -42,6 +42,8 @@ const KNOWN_EVENT_TAGS: &[&str] = &[
     "tool_grant",
     "skill_index",
     "skill_load",
+    "message",
+    "injected",
 ];
 
 /// One tool in a [`Event::ToolGrant`]: its canonical name and why it was
@@ -441,6 +443,44 @@ pub enum Event {
         block: Value,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         abandoned: bool,
+    },
+    /// A message the run sent or received in its message space (spec F1a
+    /// §6). `sent` is written right after the messaging tool's
+    /// `tool_result`; `received` right before the model call that sees it
+    /// (`via: injected`), one event per message. `id` is the message's id in
+    /// the space's `log.jsonl`.
+    Message {
+        id: String,
+        direction: crate::messages::MessageDirection,
+        from: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_codename: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to: Option<String>,
+        /// `post`, `direct`, `broadcast`, `directive`, `retract`,
+        /// `operator`.
+        kind: String,
+        body: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        urgent: bool,
+        via: crate::messages::MessageVia,
+        /// Where a sent message went (`resolved`, `undelivered`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery: Option<Value>,
+    },
+    /// Context a collector put in front of the model (spec F1a §6). Every
+    /// `once` injection is written, at its position in the conversation, so
+    /// replay re-inserts it; an `every_turn` one only when its content
+    /// changed since the turn before. `content` is the collector's raw text,
+    /// before its injected-data framing.
+    Injected {
+        source: String,
+        kind: String,
+        /// `once` or `every_turn`.
+        cadence: String,
+        content: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        message_ids: Vec<String>,
     },
     /// Forward-compatibility catch-all: a line whose `type` this binary
     /// doesn't know. Keeps the payload so readers can render it and the CP

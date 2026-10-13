@@ -453,3 +453,29 @@ fn dispatch_brings_join() {
     .unwrap();
     assert!(!g.offers("join"));
 }
+
+#[test]
+fn messaging_grants_resolve_to_bus_tools_only() {
+    let cat = ToolCatalog::builtin();
+    let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        cat.resolve_messaging(&names(&["board.post", "msg.*"])).unwrap(),
+        vec!["board.post", "msg.send"]
+    );
+    for bad in ["read_file", "*", "agents.list"] {
+        assert!(
+            matches!(
+                cat.resolve_messaging(&names(&[bad])),
+                Err(rupu_tools::GrantError::NotMessaging { .. })
+            ),
+            "{bad}"
+        );
+    }
+    assert!(cat.resolve_messaging(&names(&["board.pots"])).is_err());
+
+    use rupu_tools::Service::MessageBus;
+    assert!(cat.names_service(&names(&["read_file", "msg.send"]), MessageBus));
+    assert!(cat.names_service(&names(&["board.*"]), MessageBus));
+    assert!(!cat.names_service(&names(&["*"]), MessageBus));
+    assert!(!cat.names_service(&names(&["core.*", "scm.*"]), MessageBus));
+}
