@@ -422,6 +422,10 @@ pub struct RunAgentLeadDriver {
     /// The skills loaded into `history` (its latest round's), carried into
     /// the next round so its compactions re-attach them.
     loaded_skills: Vec<rupu_agent::LoadedSkill>,
+    /// Messages in `history` no model call saw (a round cut short after
+    /// they were delivered): the next round's first call writes their
+    /// receipts.
+    unseen_messages: Vec<String>,
     /// The lead's skills, resolved by its first round and handed to every
     /// round after, so each round's system prompt (preloaded bodies, index)
     /// is the same. `None` until a round resolved them.
@@ -469,6 +473,7 @@ impl RunAgentLeadDriver {
             rt,
             history: Vec::new(),
             loaded_skills: Vec::new(),
+            unseen_messages: Vec::new(),
             skills: None,
             total_turns: 0,
             limits,
@@ -684,6 +689,7 @@ impl RunAgentLeadDriver {
                 loaded_skills: self.loaded_skills.clone(),
                 operator_loads: Vec::new(),
                 missing_skills: Vec::new(),
+                unseen_messages: self.unseen_messages.clone(),
             },
             workspace: self.cfg.workspace.clone(),
             // Unattended; the grant is the gate (see the type's docs).
@@ -739,6 +745,7 @@ impl LeadDriver for RunAgentLeadDriver {
             final_limits,
             messages,
             loaded_skills,
+            unseen_messages,
         } = {
             // Armed only for the run itself: the slot is cleared again before
             // the result is looked at, and on unwind.
@@ -760,6 +767,7 @@ impl LeadDriver for RunAgentLeadDriver {
                         final_limits: limits,
                         messages: Vec::new(),
                         loaded_skills: Vec::new(),
+                        unseen_messages: Vec::new(),
                     },
                 }
             })
@@ -798,6 +806,7 @@ impl LeadDriver for RunAgentLeadDriver {
                 self.total_turns = self.total_turns.saturating_add(run.turns);
                 self.history = run.final_messages;
                 self.loaded_skills = loaded_skills;
+                self.unseen_messages = unseen_messages;
                 outcome
             }
             Err(e) => {
@@ -809,6 +818,7 @@ impl LeadDriver for RunAgentLeadDriver {
                 if !messages.is_empty() {
                     self.history = messages;
                     self.loaded_skills = loaded_skills;
+                    self.unseen_messages = unseen_messages;
                 }
                 RoundOutcome::Error(e.to_string())
             }

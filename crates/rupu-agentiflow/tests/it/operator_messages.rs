@@ -211,8 +211,9 @@ impl Flow {
         requests.iter().map(|r| r.lock().unwrap().clone()).collect()
     }
 
-    /// Who saw each logged message (`seen` receipts), by message body.
-    fn seen(&self) -> Vec<(String, String)> {
+    /// Who saw each logged message (`seen` receipts) and on which turn, by
+    /// message body, in the order they were written.
+    fn seen(&self) -> Vec<(String, String, u32)> {
         let bus = rupu_fleet::Bus::open(&self.dir(), rupu_fleet::address::OPERATOR);
         let lines = bus.read_log(None, usize::MAX).unwrap().lines;
         let body = |id: &str| {
@@ -224,7 +225,7 @@ impl Flow {
         lines
             .iter()
             .filter_map(|l| match l {
-                LogLine::Seen { id, by, .. } => Some((body(id).unwrap(), by.clone())),
+                LogLine::Seen { id, by, turn, .. } => Some((body(id).unwrap(), by.clone(), *turn)),
                 LogLine::Msg(_) => None,
             })
             .collect()
@@ -276,7 +277,7 @@ fn lead_gets_operator_message_mid_round() {
     );
     assert_eq!(
         flow.seen(),
-        [("focus on auth".to_string(), "lead".to_string())]
+        [("focus on auth".to_string(), "lead".to_string(), 1)]
     );
     let rounds = flow.round_events();
     assert_eq!(rounds[0]["outcome"], "yielded");
@@ -289,15 +290,23 @@ fn lead_gets_operator_message_mid_round() {
     );
 
     // (b) An urgent message ends the round early, and the lead still gets
-    // it, on the call that follows: the next round's first.
+    // it, on the call that follows: the next round's first. The call it
+    // cut had been given an earlier message: that call never answered, so
+    // the next round's first call is the one that saw it.
     let flow = Flow::new("af_urgent");
     let began = Instant::now();
     let requests = flow.run(vec![
         (
-            vec![Before::SendAndHang {
-                body: "drop the web leg",
-            }],
-            vec![text("never sent")],
+            vec![
+                Before::Send {
+                    body: "keep notes",
+                    urgent: false,
+                },
+                Before::SendAndHang {
+                    body: "drop the web leg",
+                },
+            ],
+            vec![read_the_board(), text("never sent")],
         ),
         (vec![], vec![text("Pivoting.")]),
     ]);
@@ -309,16 +318,24 @@ fn lead_gets_operator_message_mid_round() {
     let [round0, round1] = requests.as_slice() else {
         panic!("{requests:?}")
     };
-    assert_eq!(round0.len(), 1, "round 0 ended at its first call");
+    assert_eq!(round0.len(), 2, "round 0 ended at its second call");
+    assert!(round0[1].contains("keep notes"), "{}", round0[1]);
+    assert!(round1[0].contains("keep notes"), "{}", round1[0]);
     assert!(round1[0].contains(OPERATOR_FRAME), "{}", round1[0]);
     assert!(
         round1[0].contains("URGENT: drop the web leg"),
         "{}",
         round1[0]
     );
+    let mut seen = flow.seen();
+    seen.sort();
     assert_eq!(
-        flow.seen(),
-        [("drop the web leg".to_string(), "lead".to_string())]
+        seen,
+        [
+            ("drop the web leg".to_string(), "lead".to_string(), 1),
+            ("keep notes".to_string(), "lead".to_string(), 1),
+        ],
+        "each seen once, by the lead, on round 1's first call"
     );
     let r0: Vec<serde_json::Value> =
         std::fs::read_to_string(flow.dir().join("lead/transcript.r0.jsonl"))
@@ -331,5 +348,5 @@ fn lead_gets_operator_message_mid_round() {
         .find(|e| e["type"] == "run_complete")
         .expect("round 0 completed");
     assert_eq!(complete["data"]["error"], "paused", "{complete}");
-    assert_eq!(flow.round_events()[1]["steering"], 1);
+    assert_eq!(flow.round_events()[1]["steering"], 2);
 }

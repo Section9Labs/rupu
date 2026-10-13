@@ -594,6 +594,10 @@ struct SessionRecord {
     /// as the latest turn ended: the next turn starts with them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     loaded_skills: Vec<rupu_agent::LoadedSkill>,
+    /// Messages in `message_history` no model call saw (the latest turn
+    /// failed first): the next turn's first call writes their receipts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    unseen_messages: Vec<String>,
 }
 
 impl SessionRecord {
@@ -1884,6 +1888,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         skill_index,
         skill_prompt,
         loaded_skills: Vec::new(),
+        unseen_messages: Vec::new(),
     };
     write_session(&global, SessionScope::Active, &session)?;
     launch_turn(
@@ -8505,6 +8510,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
                 loaded_skills: session.loaded_skills.clone(),
                 operator_loads,
                 missing_skills,
+                unseen_messages: session.unseen_messages.clone(),
             },
             workspace,
             mode,
@@ -8543,6 +8549,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             final_limits,
             messages: exit_messages,
             loaded_skills,
+            unseen_messages,
         } = match refusal {
             Some(refusal) => {
                 let (provider, model) = assembler.provider_model_of(&launch);
@@ -8572,6 +8579,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
                         .unwrap_or_else(rupu_providers::model_limits::ModelLimits::unknown),
                     messages: Vec::new(),
                     loaded_skills: session.loaded_skills.clone(),
+                    unseen_messages: session.unseen_messages.clone(),
                 }
             }
             None => match assembler.assemble(launch).await {
@@ -8584,6 +8592,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
                         .unwrap_or_else(rupu_providers::model_limits::ModelLimits::unknown),
                     messages: Vec::new(),
                     loaded_skills: session.loaded_skills.clone(),
+                    unseen_messages: session.unseen_messages.clone(),
                 },
             },
         };
@@ -8605,6 +8614,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         session.last_run_id = Some(args.run_id.clone());
         session.last_transcript_path = Some(transcript_path.clone());
         session.loaded_skills = loaded_skills;
+        session.unseen_messages = unseen_messages;
         // On success AND failure: the limits carry to every later turn
         // without refetching. The note stays with this turn's notice: it
         // describes this resolution, not the limits.
@@ -11393,6 +11403,7 @@ mod tests {
             skill_index: Vec::new(),
             skill_prompt: None,
             loaded_skills: Vec::new(),
+            unseen_messages: Vec::new(),
         }
     }
 
@@ -12207,6 +12218,97 @@ mod tests {
             ])
             .unwrap(),
             "replay keeps turn 2's prompt — it joined message_history"
+        );
+    }
+
+    /// A message delivered into a turn that failed before any model call saw
+    /// it is seen by the next turn's first call, which writes its receipt,
+    /// even when that turn seeds inline (a compaction dropped the seed
+    /// reference in between).
+    #[tokio::test]
+    async fn a_message_a_failed_turn_never_showed_the_model_is_receipted_by_the_next() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let global = tmp.path().join("global");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut record = test_session_record();
+        record.session_id = "ses_unseen01".into();
+        record.workspace_path = workspace;
+        record.project_root = None;
+        record.repo_ref = None;
+        record.issue_ref = None;
+        record.target = None;
+        record.workspace_strategy = None;
+        record.transcripts_dir = global
+            .join("sessions")
+            .join(&record.session_id)
+            .join("transcripts");
+        record.message_history = Vec::new();
+        record.history_source_transcript = None;
+        record.last_run_id = None;
+        record.last_transcript_path = None;
+        record.runs = Vec::new();
+        record.total_turns = 0;
+        write_session(&global, SessionScope::Active, &record).unwrap();
+        let space = session_dir(&global, SessionScope::Active, &record.session_id).join("messages");
+
+        let old_home = std::env::var_os("RUPU_HOME");
+        std::env::set_var("RUPU_HOME", &global);
+        let turn = |run_id: &str, script: &str| {
+            std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", script);
+            run_turn(RunTurnArgs {
+                session_id: record.session_id.clone(),
+                run_id: run_id.into(),
+                prompt: format!("prompt for {run_id}"),
+                operator_skills: Vec::new(),
+            })
+        };
+        let ack = r#"[{ "AssistantText": { "text": "ack", "stop": "end_turn" } }]"#;
+        turn("run_unseen_1", ack).await.expect("turn 1");
+        let sent = rupu_fleet::Bus::open(&space, rupu_fleet::address::OPERATOR)
+            .operator_send(rupu_fleet::OperatorMessage {
+                to: rupu_fleet::Address::Broadcast,
+                body: "mind the auth module".into(),
+                urgent: false,
+                via: rupu_fleet::OperatorVia::Cli,
+                viewer: None,
+            })
+            .unwrap();
+        assert_eq!(sent.delivery().undelivered, [], "the agent is joined");
+        turn("run_unseen_2", r#"[{ "ProviderError": "boom" }]"#)
+            .await
+            .expect("turn 2 is recorded as failed");
+        let (mut after2, _) = read_session(&global, &record.session_id).unwrap();
+        assert_eq!(after2.status, SessionStatus::Failed);
+        let turn3_first_call = after2.total_turns;
+        // What a compaction does to the seed reference.
+        after2.history_source_transcript = None;
+        write_session(&global, SessionScope::Active, &after2).unwrap();
+        let turn3 = turn("run_unseen_3", ack).await;
+
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        match old_home {
+            Some(v) => std::env::set_var("RUPU_HOME", v),
+            None => std::env::remove_var("RUPU_HOME"),
+        }
+        turn3.expect("turn 3");
+
+        let seen: Vec<(String, u32)> = rupu_fleet::Bus::open(&space, rupu_fleet::address::OPERATOR)
+            .read_log(None, usize::MAX)
+            .unwrap()
+            .lines
+            .into_iter()
+            .filter_map(|l| match l {
+                rupu_fleet::LogLine::Seen { id, turn, .. } if id == sent.id() => Some((id, turn)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [(sent.id().to_string(), turn3_first_call)],
+            "seen once, on turn 3's first call"
         );
     }
 
