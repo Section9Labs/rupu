@@ -122,6 +122,8 @@ pub struct SeenView {
 
 const AGENTIFLOWS: &str = "agentiflows";
 const RUNS: &str = "runs";
+/// `RunStore::archive_root`.
+const RUNS_ARCHIVE: &str = "runs-archive";
 /// `rupu-cli`'s `paths::sessions_dir` / `paths::archived_sessions_dir`.
 const SESSIONS: &str = "sessions";
 const SESSIONS_ARCHIVE: &str = "sessions-archive";
@@ -131,9 +133,9 @@ const AGENT_RUN_PREFIX: &str = "agent:";
 
 impl MessageRoot {
     /// The root `id` names exactly: an agentiflow run, a session (active,
-    /// else archived), or a run under `runs/` — a workflow run when its
-    /// `run.json` records a workflow, else a standalone `rupu run` (which
-    /// writes its record only as it ends).
+    /// else archived), or a run (active, else archived) — a workflow run
+    /// when its `run.json` records a workflow, else a standalone `rupu run`
+    /// (which writes its record only as it ends).
     pub fn resolve(global: &Path, id: &str) -> Result<Self, RootError> {
         let not_found = || RootError::NotFound(id.to_string());
         if id.is_empty() || id == "." || id == ".." || id.contains(['/', '\\']) {
@@ -154,10 +156,11 @@ impl MessageRoot {
                 return Ok(root(RootKind::Session, dir.join("messages")));
             }
         }
-        let run = global.join(RUNS).join(id);
-        if !run.is_dir() {
-            return Err(not_found());
-        }
+        let run = [RUNS, RUNS_ARCHIVE]
+            .iter()
+            .map(|runs| global.join(runs).join(id))
+            .find(|dir| dir.is_dir())
+            .ok_or_else(not_found)?;
         let kind = match read_json::<RunProjection>(&run.join("run.json")) {
             Some(r) if !r.workflow_name.starts_with(AGENT_RUN_PREFIX) => RootKind::Workflow,
             _ => RootKind::Standalone,
@@ -166,9 +169,9 @@ impl MessageRoot {
     }
 
     /// Every id [`MessageRoot::resolve`] could accept: the directory names
-    /// under `agentiflows/`, `sessions/`, `sessions-archive/` and `runs/`.
+    /// under `agentiflows/`, `sessions/`, `runs/` and their archives.
     pub fn candidates(global: &Path) -> Vec<String> {
-        [AGENTIFLOWS, SESSIONS, SESSIONS_ARCHIVE, RUNS]
+        [AGENTIFLOWS, SESSIONS, SESSIONS_ARCHIVE, RUNS, RUNS_ARCHIVE]
             .iter()
             .filter_map(|d| std::fs::read_dir(global.join(d)).ok())
             .flat_map(|entries| entries.flatten())
@@ -554,6 +557,10 @@ mod tests {
             json!({"workflow_name": "agent:recon", "status": "running"}),
         );
         std::fs::create_dir_all(g.join("runs/run_bare")).unwrap();
+        write(
+            &g.join("runs-archive/run_old/run.json"),
+            json!({"workflow_name": "review", "status": "completed"}),
+        );
 
         let got = |id: &str| {
             MessageRoot::resolve(g, id).map(|r| {
@@ -587,6 +594,10 @@ mod tests {
             got("run_bare"),
             Ok((RootKind::Standalone, "runs/run_bare/messages".into()))
         );
+        assert_eq!(
+            got("run_old"),
+            Ok((RootKind::Workflow, "runs-archive/run_old/messages".into()))
+        );
         for bad in ["run_none", "", "..", "../runs/run_wf", "flow.toml"] {
             assert_eq!(got(bad), Err(RootError::NotFound(bad.into())), "{bad:?}");
         }
@@ -594,7 +605,15 @@ mod tests {
         ids.sort();
         assert_eq!(
             ids,
-            ["af_1", "run_agent", "run_bare", "run_wf", "ses_1", "ses_2"]
+            [
+                "af_1",
+                "run_agent",
+                "run_bare",
+                "run_old",
+                "run_wf",
+                "ses_1",
+                "ses_2"
+            ]
         );
         assert_eq!(
             MessageRoot::resolve(g, "af_1").unwrap().default_recipient(),
