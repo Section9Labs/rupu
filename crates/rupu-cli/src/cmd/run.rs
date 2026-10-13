@@ -10,7 +10,7 @@ use crate::standalone_run_metadata::{
     metadata_path_for_run, write_metadata, StandaloneRunMetadata,
 };
 use clap::{Args as ClapArgs, Parser};
-use rupu_agent::{load_agent, resolve_mode};
+use rupu_agent::{load_agent_in, resolve_mode};
 use rupu_runtime::WorkerKind;
 use rupu_tools::{PermissionMode, PermissionPolicy, PromptAnswer, PromptRequest, Prompter};
 use std::io::IsTerminal;
@@ -113,6 +113,11 @@ pub struct Args {
     /// for several.
     #[arg(long = "preload-skill", value_name = "SKILL")]
     pub preload_skills: Vec<String>,
+    /// The manifest (JSON) of skills shipped to this host for the run; they
+    /// stand in for installed skills of the same layer and name. A
+    /// coordinator's placed-unit launch passes it.
+    #[arg(long = "skill-bundle", hide = true, value_name = "JSON")]
+    pub skill_bundle: Option<String>,
     /// Continue an interrupted run of this agent from its transcript instead
     /// of starting fresh: the earlier conversation is rebuilt and the agent
     /// is told it was interrupted. A run that had already finished prints
@@ -672,7 +677,21 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     // agents under `<project_root>/.rupu/agents/`, so the parent is
     // `<project_root>/.rupu`.
     let project_agents_parent = project_root.as_ref().map(|p| p.join(".rupu"));
-    let spec = load_agent(&global, project_agents_parent.as_deref(), &args.agent)?;
+    //
+    // The shipped skills (`--skill-bundle`, else the bundle of the run being
+    // continued) overlay the installed ones, so they are known before the
+    // agent's `skills:` are checked.
+    let skill_bundle = skill_bundle_manifest(&global, &args)?;
+    let skill_overlay = match &skill_bundle {
+        Some(m) => rupu_skills::ship::overlay_for(&rupu_skills::ship::cache_dir(&global), m)?,
+        None => Vec::new(),
+    };
+    let spec = load_agent_in(
+        &global,
+        project_agents_parent.as_deref(),
+        &args.agent,
+        &skill_overlay,
+    )?;
 
     // Resolve config (global + customer + project).
     let cfg_paths = paths::config_paths(&global, project_root.as_deref(), &pwd)?;
@@ -841,6 +860,11 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     // "nothing recorded". Written after the `--continue` checks, which must
     // not touch a run's files before they pass.
     start_coverage_stream(&coverage_stream, &run_id);
+    if let Some(m) = &skill_bundle {
+        let dir = global.join("runs").join(&run_id);
+        paths::ensure_dir(&dir)?;
+        std::fs::write(dir.join(SKILL_BUNDLE_FILE), serde_json::to_vec(m)?)?;
+    }
 
     // Netflow capture. Two destinations: this run's own ledger FILE
     // (`<run_id>.jsonl`, rooted at the project when one already has a
@@ -959,6 +983,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             findings_profile: args.findings_profile,
             skills: launch_skills.0.clone(),
             preload_skills: launch_skills.1.clone(),
+            skill_overlay,
             ..Default::default()
         };
 
@@ -1532,6 +1557,42 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     }
 
     body_result
+}
+
+/// The file in a run's directory holding its `--skill-bundle` manifest, so
+/// `--continue` runs with the same shipped skills.
+const SKILL_BUNDLE_FILE: &str = "skill_bundle.json";
+
+/// The manifest this run resolves shipped skills against: `--skill-bundle`,
+/// else (on `--continue`) the one the continued run recorded. A sub-run has
+/// none.
+fn skill_bundle_manifest(
+    global: &Path,
+    args: &Args,
+) -> anyhow::Result<Option<rupu_skills::ship::SkillBundleManifest>> {
+    use anyhow::Context;
+    let parse = |json: &str, from: &str| -> anyhow::Result<_> {
+        let m: rupu_skills::ship::SkillBundleManifest =
+            serde_json::from_str(json).with_context(|| format!("{from}: not a skill manifest"))?;
+        m.validate().map_err(|e| anyhow::anyhow!("{from}: {e}"))?;
+        Ok(m)
+    };
+    if let Some(json) = &args.skill_bundle {
+        return parse(json, "--skill-bundle").map(Some);
+    }
+    let Some(prev) = args
+        .continue_from
+        .as_deref()
+        .filter(|p| !p.starts_with("sub_"))
+    else {
+        return Ok(None);
+    };
+    let file = global.join("runs").join(prev).join(SKILL_BUNDLE_FILE);
+    match std::fs::read_to_string(&file) {
+        Ok(json) => parse(&json, &file.display().to_string()).map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", file.display())),
+    }
 }
 
 /// `skills` / `preload_skills` entries as the `rupu run` flags that name
