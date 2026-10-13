@@ -1734,3 +1734,185 @@ fn a_finished_runs_leftover_interrupted_children_are_abandoned() {
     assert_eq!(states, [ChildState::Abandoned, ChildState::Interrupted]);
     assert_eq!(ledger::read(&second)[0].state(), ChildState::Done);
 }
+
+/// A workflow child whose runner fails of a stop once `stop` is set: it
+/// writes its `run.json` `Failed` with the stop as its typed cause and exits.
+/// Its step left a child of its own `interrupted`.
+struct FailsOfAStop {
+    global: std::path::PathBuf,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+const STEP_RUN: &str = "step_run_of_the_child";
+
+impl rupu_launch::ProcessBackend for FailsOfAStop {
+    fn spawn(
+        &self,
+        launch: &rupu_launch::ProcessLaunch,
+    ) -> Result<Option<rupu_launch::SpawnedProcess>, String> {
+        use crate::support::{attempt_row, end_line, orphan_line, running_workflow};
+        running_workflow(&self.global, &launch.run_id);
+        attempt_row(&self.global, &launch.run_id, "scan", STEP_RUN);
+        let step = self.global.join("runs").join(STEP_RUN);
+        ledger::append(
+            &step,
+            &orphan_line("ch_grand", ChildKind::Agent, "run_grand"),
+        );
+        ledger::append(&step, &end_line("ch_grand", ChildState::Interrupted));
+        Ok(None)
+    }
+    fn poll(&self, run_id: &str) -> ProcState {
+        if !self.stop.load(std::sync::atomic::Ordering::SeqCst) {
+            return ProcState::Running;
+        }
+        let store = rupu_orchestrator::RunStore::new(self.global.join("runs"));
+        let mut rec = store.load(run_id).unwrap();
+        if rec.status != rupu_orchestrator::RunStatus::Failed {
+            rec.status = rupu_orchestrator::RunStatus::Failed;
+            rec.cause = Some(rupu_transcript::StopCause::StoppedBySignal.record());
+            rec.finished_at = Some(chrono::Utc::now());
+            store.update(&rec).unwrap();
+        }
+        ProcState::Failed("stopped by a signal".into())
+    }
+    fn terminate(&self, _: &str, _: rupu_launch::Stop) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn fails_of_a_stop(home: &Home) -> (Arc<FailsOfAStop>, Arc<std::sync::atomic::AtomicBool>) {
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let backend = Arc::new(FailsOfAStop {
+        global: home.global(),
+        stop: Arc::clone(&stop),
+    });
+    (backend, stop)
+}
+
+fn state_in(dir: &std::path::Path, handle: &str) -> ChildState {
+    ledger::read(dir)
+        .into_iter()
+        .find(|c| c.started.handle == handle)
+        .map(|c| c.state())
+        .expect("recorded")
+}
+
+/// A workflow child that fails of its parent's process being stopped by a
+/// signal (its runner records the stop as its cause) is `interrupted`, like
+/// one killed outright: what its step left `interrupted` stays so, a waiting
+/// `join` collecting that end leaves it continuable, and the run that
+/// continues the parent resumes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_workflow_child_failing_of_its_parents_stop_is_interrupted_and_continued() {
+    let home = kinds_home();
+    let _unstop = Unstop;
+    let (backend, stop) = fails_of_a_stop(&home);
+    let l1 = home.launcher_with(home.assembler(config()), backend, None);
+    let ctx1 = attempt(&home, "parent_run_1");
+    let h = l1
+        .launch(request(ChildKind::Workflow, "sweep", None), &ctx1)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    tokio::task::spawn_blocking(|| {
+        rupu_launch::reaper::stop_live_children(Duration::from_secs(5), "stopped")
+    })
+    .await
+    .unwrap();
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let st = join_one(&l1, &ctx1, &h.handle).await;
+    assert_eq!(st.state, ChildState::Interrupted, "{:?}", st.error);
+    let step = home.runs().join(STEP_RUN);
+    assert_eq!(state_in(&step, "ch_grand"), ChildState::Interrupted);
+    let parent = home.runs().join("parent_run_1");
+    assert_eq!(state_in(&parent, &h.handle), ChildState::Interrupted);
+    drop(l1);
+    rupu_launch::reaper::reset_stopping();
+
+    let after = Arc::new(ScriptedProcesses::done("continued answer"));
+    let l2 = home.launcher_with(home.assembler(config()), after.clone(), None);
+    let ctx2 = attempt(&home, "parent_run_2");
+    l2.continue_children("parent_run_1", &ctx2).await;
+    let st = join_one(&l2, &ctx2, &h.handle).await;
+    assert_eq!(
+        (st.state, st.output.as_deref()),
+        (ChildState::Done, Some("continued answer"))
+    );
+    assert_eq!(
+        after.spawned()[0].argv,
+        RunArgv::WorkflowControl(rupu_runtime::argv::WorkflowControl::Resume {
+            run_id: h.run_id.clone(),
+            mode: Some(PermissionMode::Bypass),
+            if_unfinished: false,
+        })
+    );
+}
+
+/// A workflow child stopped from outside while its parent goes on (its own
+/// records say a signal ended it) is `failed` to that parent, but what its
+/// step left is its parent's end to decide: kept while the parent runs (a
+/// reboot's stop may reach the parent next), `abandoned` once the parent
+/// ends for good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_workflow_child_stopped_from_outside_leaves_its_step_child_to_its_parents_end() {
+    let home = kinds_home();
+    let (backend, stop) = fails_of_a_stop(&home);
+    let l = home.launcher_with(home.assembler(config()), backend, None);
+    let ctx = attempt(&home, "parent_run_1");
+    let h = l
+        .launch(request(ChildKind::Workflow, "sweep", None), &ctx)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let st = join_one(&l, &ctx, &h.handle).await;
+    assert_eq!(st.state, ChildState::Failed);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let step = home.runs().join(STEP_RUN);
+    assert_eq!(state_in(&step, "ch_grand"), ChildState::Interrupted);
+
+    l.finish(&ctx.identity, ParentEnd::Completed).await;
+    assert_eq!(state_in(&step, "ch_grand"), ChildState::Abandoned);
+}
+
+/// A parent that crashed after collecting a child its own records say a
+/// stop ended (the reboot's signal reached the child first) still continues
+/// it: the `join` does not make it unrecoverable.
+#[tokio::test]
+#[serial]
+async fn a_joined_child_a_stop_ended_is_continued() {
+    use crate::support::{orphan_line, running_workflow};
+    let home = kinds_home();
+    let global = home.global();
+    running_workflow(&global, "run_wf");
+    let store = rupu_orchestrator::RunStore::new(home.runs());
+    let mut rec = store.load("run_wf").unwrap();
+    rec.status = rupu_orchestrator::RunStatus::Failed;
+    rec.cause = Some(rupu_transcript::StopCause::StoppedBySignal.record());
+    rec.finished_at = Some(chrono::Utc::now());
+    store.update(&rec).unwrap();
+    let dir = home.runs().join("parent_run_1");
+    ledger::append(&dir, &orphan_line("ch_1", ChildKind::Workflow, "run_wf"));
+    ledger::append(&dir, &crate::support::end_line("ch_1", ChildState::Failed));
+    ledger::append(
+        &dir,
+        &ledger::LedgerLine::Joined(ledger::Joined {
+            handle: "ch_1".into(),
+            at: chrono::Utc::now(),
+        }),
+    );
+
+    let after = Arc::new(ScriptedProcesses::done("continued answer"));
+    let l = home.launcher_with(home.assembler(config()), after.clone(), None);
+    let ctx = attempt(&home, "parent_run_2");
+    l.continue_children("parent_run_1", &ctx).await;
+    let st = join_one(&l, &ctx, "ch_1").await;
+    assert_eq!(
+        (st.state, st.output.as_deref()),
+        (ChildState::Done, Some("continued answer"))
+    );
+}

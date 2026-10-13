@@ -130,6 +130,10 @@ struct Inner {
     /// before it stops the child (`interrupted` when its parent paused or is
     /// being stopped by a signal).
     stop_as: Option<(ChildState, String, DateTime<Utc>)>,
+    /// It failed, but its own records say a stop ended it: what it left
+    /// below is its parent's end to decide (kept when the parent is stopped
+    /// too, `abandoned` when it ends for good).
+    below_pending: bool,
 }
 
 /// What a child's `started` line records beyond its handle (see
@@ -140,6 +144,28 @@ struct LaunchRecord {
     continues: Option<Box<PriorRun>>,
     prior_tokens: Option<ChildTokens>,
     tree: Option<PathBuf>,
+}
+
+/// `child` as its `started` line records it.
+fn started_of(child: &Child) -> Started {
+    Started {
+        codename: child.codename.clone(),
+        address: child.address.clone(),
+        transcript: child.transcript.clone(),
+        parent_start: crate::proc::own_start_stamp(),
+        request: child.launch.request.clone(),
+        continues: child.launch.continues.clone(),
+        prior_tokens: child.launch.prior_tokens,
+        tree: child.launch.tree.clone(),
+        ..Started::new(
+            &child.handle,
+            child.kind,
+            &child.name,
+            &child.run_id,
+            std::process::id(),
+            child.depth,
+        )
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -603,27 +629,7 @@ impl RunLauncher {
     /// The child's `started` line: written as it is launched, queued or not.
     fn record_launch(&self, child: &Child) {
         crate::reaper::track(&child.ledger_dir);
-        ledger::append(
-            &child.ledger_dir,
-            &LedgerLine::Started(Started {
-                codename: child.codename.clone(),
-                address: child.address.clone(),
-                transcript: child.transcript.clone(),
-                parent_start: crate::proc::own_start_stamp(),
-                request: child.launch.request.clone(),
-                continues: child.launch.continues.clone(),
-                prior_tokens: child.launch.prior_tokens,
-                tree: child.launch.tree.clone(),
-                ..Started::new(
-                    &child.handle,
-                    child.kind,
-                    &child.name,
-                    &child.run_id,
-                    std::process::id(),
-                    child.depth,
-                )
-            }),
-        );
+        ledger::append(&child.ledger_dir, &LedgerLine::Started(started_of(child)));
     }
 
     /// A process child's process, as it was spawned.
@@ -1079,8 +1085,9 @@ impl RunLauncher {
                 tokens,
                 ..End::stopped(&child, "its parent ended without joining it")
             },
-            // Killed with its parent's process: continued with it.
-            ProcState::Died(why) if crate::reaper::stopping() => End {
+            // Ended of its parent's process being stopped (killed outright,
+            // or its run recorded the stop as it failed): continued with it.
+            ProcState::Failed(why) | ProcState::Died(why) if crate::reaper::stopping() => End {
                 tokens,
                 ..End::interrupted(why)
             },
@@ -1092,7 +1099,11 @@ impl RunLauncher {
                 unreachable!("loop exits on a terminal state")
             }
         };
-        let for_good = end.state != ChildState::Interrupted;
+        let below_pending = end.state == ChildState::Failed
+            && stopped_at.is_none()
+            && self.stopped_from_outside(&started_of(&child)).await;
+        let for_good = end.state != ChildState::Interrupted && !below_pending;
+        lock(&child.st).below_pending = below_pending;
         self.settle(&child, end, started);
         if for_good {
             self.abandon_below(
@@ -1196,6 +1207,12 @@ impl RunLauncher {
                     }
                 }
                 self.settle(c, End::stopped(c, &why), c.born);
+            }
+            if state == ChildState::Abandoned {
+                for c in mine.iter().filter(|c| lock(&c.st).below_pending) {
+                    self.abandon_below(c.kind, &c.run_id, "its parent ended without continuing it")
+                        .await;
+                }
             }
             lock(&self.children).retain(|c| c.parent_run != run_id);
             lock(&self.slots).remove(run_id);
@@ -1342,6 +1359,7 @@ impl RunLauncher {
             joined,
             spawned: false,
             stop_as: None,
+            below_pending: false,
         });
         self.record_launch(&child);
         ledger::append(
@@ -2120,10 +2138,10 @@ impl Launcher for RunLauncher {
                     self.continue_child(&started, end.at, &from).await
                 }
                 // Recorded failed before its parent recorded the stop that
-                // ended it too (a reboot signals every process at once).
+                // ended it too (a reboot signals every process at once),
+                // even if the parent collected that end before it stopped.
                 Some(end)
                     if end.status == ChildState::Failed
-                        && !joined
                         && self.stopped_from_outside(&started).await =>
                 {
                     self.continue_child(&started, end.at, &from).await

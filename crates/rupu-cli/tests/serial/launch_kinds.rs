@@ -944,3 +944,166 @@ fn a_signalled_tree_is_continued_at_every_level() {
         .expect("the parent's join");
     assert!(output.contains("child answer"), "{output}");
 }
+
+/// A `rupu run` parent stopped by SIGTERM while it waits on a workflow
+/// child whose step has a child of its own. The workflow's runner fails of
+/// the stop, which is recorded `interrupted` (not `failed`, which would
+/// abandon the step's child), and the waiting `dispatch` collecting that end
+/// does not keep it from being continued: `rupu run --continue <parent>`
+/// resumes the workflow under the same handle, its step continues, and the
+/// step continues its own child.
+#[test]
+fn a_signalled_parent_continues_its_workflow_child_and_what_it_launched() {
+    const GRAND_MODEL: &str = "claude-opus-4-7";
+    let _env = ENV_LOCK.blocking_lock();
+    let home = Home::new();
+    home.agent(
+        "parent",
+        PARENT_MODEL,
+        "tools: [dispatch, join]\ndispatchableAgents: [child, grand]\ndispatchableWorkflows: [sweep]\n",
+    );
+    home.agent(
+        "child",
+        CHILD_MODEL,
+        "tools: [dispatch, join]\ndispatchableAgents: [grand]\n",
+    );
+    home.agent("grand", GRAND_MODEL, "");
+    home.workflow(
+        "sweep",
+        "name: sweep\nsteps:\n  - id: scan\n    agent: child\n    prompt: scan it\n",
+    );
+    let models = |parent: &[String], child: &[String], grand: &[String]| {
+        format!(
+            r#"{{ "turns": [], "models": {{ "{PARENT_MODEL}": [{}], "{CHILD_MODEL}": [{}], "{GRAND_MODEL}": [{}] }} }}"#,
+            parent.join(","),
+            child.join(","),
+            grand.join(",")
+        )
+    };
+    let first = models(
+        &[
+            tool(
+                "c1",
+                "dispatch",
+                r#"{"kind": "workflow", "name": "sweep", "wait": true, "timeout_secs": 150}"#,
+            ),
+            text("never"),
+        ],
+        &[
+            tool(
+                "c2",
+                "dispatch",
+                r#"{"kind": "agent", "name": "grand", "prompt": "go"}"#,
+            ),
+            slow(&text("never")),
+        ],
+        &[slow(&text("never"))],
+    );
+    let stopped = "run_01W7SIGNALLEDWFTREE000000";
+    let mut parent = home.spawn_run(
+        &first,
+        &["parent", "--mode", "bypass", "--run-id", stopped, "go"],
+    );
+    let child = home.wait_for_child(stopped);
+    let wf_run = child.started.run_id.clone();
+    let runs = rupu_orchestrator::RunStore::new(home.global.join("runs"));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let step_run = loop {
+        if let Some(a) = runs
+            .read_attempts(&wf_run)
+            .ok()
+            .and_then(|a| a.first().cloned())
+        {
+            break a.agent_run_id;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the workflow's step never started"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let grand = home.wait_for_child(&step_run);
+    while !has_event(&home.transcript(&grand.started.run_id), "user_message") {
+        assert!(Instant::now() < deadline, "the grandchild never started");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(i32::try_from(parent.id()).unwrap()).unwrap(),
+        rustix::process::Signal::TERM,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while parent.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the parent never exited");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let interrupted = home.children(stopped);
+    assert_eq!(
+        interrupted[0].state(),
+        ChildState::Interrupted,
+        "{:?}",
+        interrupted[0].finished
+    );
+    let below = home.children(&step_run);
+    assert_eq!(
+        below[0].state(),
+        ChildState::Interrupted,
+        "{:?}",
+        below[0].finished
+    );
+
+    let second = models(
+        &[
+            tool("c3", "join", r#"{"timeout_secs": 150}"#),
+            text("parent done"),
+        ],
+        &[
+            tool("c4", "join", r#"{"timeout_secs": 150}"#),
+            text("step answer"),
+        ],
+        &[text("grand answer")],
+    );
+    let continued = "run_01W7SIGNALLEDWFTREECONT00";
+    home.rupu_run(
+        &second,
+        &[
+            "parent",
+            "--mode",
+            "bypass",
+            "--run-id",
+            continued,
+            "--continue",
+            stopped,
+        ],
+    );
+
+    let now = home.children(continued);
+    assert_eq!(now.len(), 1);
+    assert_eq!(
+        (
+            now[0].started.handle.as_str(),
+            now[0].started.run_id.as_str()
+        ),
+        (child.started.handle.as_str(), wf_run.as_str())
+    );
+    assert_eq!(now[0].state(), ChildState::Done, "{:?}", now[0].finished);
+    let (output, _) = tool_results(&home.transcript(continued))
+        .pop()
+        .expect("the parent's join");
+    assert!(output.contains("step answer"), "{output}");
+    let steps = runs.read_attempts(&wf_run).unwrap();
+    let continued_step = steps.last().unwrap();
+    let below = home.children(&continued_step.agent_run_id);
+    assert_eq!(below.len(), 1, "{below:?}");
+    assert_eq!(below[0].started.handle, grand.started.handle);
+    assert_eq!(
+        below[0].state(),
+        ChildState::Done,
+        "{:?}",
+        below[0].finished
+    );
+    let (output, _) = tool_results(&continued_step.transcript_path)
+        .pop()
+        .expect("the step's join");
+    assert!(output.contains("grand answer"), "{output}");
+}
