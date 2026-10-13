@@ -27,7 +27,7 @@
 
 ## Review Focus
 
-1. **A dirty `--skills-from` checkout.** A checkout with `__pycache__/` or any untracked or ignored file under `skills/` (left by running the script tests) must be refused, because `install` copies every file in the skill directory; the refusal must say to run `git clean -fdx skills/`. Pinned in Task A3.
+1. **A dirty `--skills-from` checkout.** `install` copies every file in a skill directory, so a checkout's working tree must never be served: `__pycache__/`, untracked, modified, `skip-worktree` or `assume-unchanged` files must not reach an install. `PinnedCheckout` exports the pinned commit's tree from the object database (the checkout must contain the commit; its HEAD, index and working tree are ignored and untouched). Pinned in Task A3.
 2. **A hostname target that resolves to a private address.** `app.example.com` is in scope by name but DNS points it at 10.0.0.5; with no network entry allowing 10.0.0.5, the gate must refuse. Pinned in Task B1.
 3. **A skill installed by hand under a fleet skill's name.** `rupu skill install ./my-network-recon` then `rupu fleet install`: the user's skill is kept, never overwritten without `--force`. Pinned in Task A2.
 4. **One pin's fetch fails while another source succeeds.** The good skills install; the command exits 1 and lists only the missing ones. Pinned in Task A2.
@@ -632,7 +632,7 @@ git commit -m "feat(skills): install skills pinned to a commit"
 
 **Interfaces:**
 - Produces: `rupu_skills::pinned::PinnedCheckout { pub dir: PathBuf }` implementing `Fetch` (feature `git`).
-  `fetch(src)` requires `src.git_ref` (the pin), HEAD of `dir` == that commit, and no modified, staged, untracked or ignored path under `skills/`. Returns `FetchedTree::local_with_commit(dir, Some(head))`. Errors are `SourceError::Clone(<message>)`.
+  `fetch(src)` requires `src.git_ref` (the pin) and that `dir` contains that commit in its object database (HEAD, index and working tree are ignored); exports the commit's tree to a temp dir and returns `FetchedTree::with_guard(<export>, Some(pin), guard)`. (Superseded the working-tree-status design shown in the steps below; the shipped code and tests follow this contract.) Errors are `SourceError::Clone(<message>)`.
 
 - [ ] **Step 1: Write the failing tests:**
 
@@ -977,7 +977,7 @@ Expected: the agent/workflow lines as before, then `Skills:` / `(none)`; exit 0.
 
 - [ ] **Step 5: Docs.**
   - `python3 scripts/gen-cli-reference.py ./target/debug/rupu` regenerates `docs/cli-reference.md` (shows `--skills-from`).
-  - `docs/skills.md`: a new `## Fleet skills` section after `## Updating`: the stock fleet's skills come from the built-in profiles' `[bundle]`, each pinned to a commit of `Section9Labs/rupu-skills`; `rupu fleet install` installs them into the same layer as the fleet and writes normal source records (`ref` is the commit); the outcome lines (CREATED / SKIPPED / UPDATED / OVERWROTE / KEPT / FAILED) and what each means; `rupu skill update` keeps a fleet skill at its pin, and newer skills arrive with a newer rupu and another `rupu fleet install`; offline: `git clone https://github.com/Section9Labs/rupu-skills && git -C rupu-skills checkout <commit>` on a connected machine, carry it over, `rupu fleet install --skills-from rupu-skills` (HEAD must be the pin; nothing under `skills/` may differ); a failed fetch exits 1 and names the missing skills; agents that grant a missing skill do not launch.
+  - `docs/skills.md`: a new `## Fleet skills` section after `## Updating`: the stock fleet's skills come from the built-in profiles' `[bundle]`, each pinned to a commit of `Section9Labs/rupu-skills`; `rupu fleet install` installs them into the same layer as the fleet and writes normal source records (`ref` is the commit); the outcome lines (CREATED / SKIPPED / UPDATED / OVERWROTE / KEPT / FAILED) and what each means; `rupu skill update` keeps a fleet skill at its pin, and newer skills arrive with a newer rupu and another `rupu fleet install`; offline: `git clone https://github.com/Section9Labs/rupu-skills && git -C rupu-skills checkout <commit>` on a connected machine, carry it over, `rupu fleet install --skills-from rupu-skills` (the checkout must contain the pinned commit; its working tree is ignored and the content comes from the commit); a failed fetch exits 1 and names the missing skills; agents that grant a missing skill do not launch.
   - `docs/engagement-profiles.md` fleet section (near line 315): the fleet is also the bundles' skills; link to `docs/skills.md#fleet-skills`.
 
 - [ ] **Step 6: Commit**

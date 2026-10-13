@@ -230,10 +230,12 @@ mod checkout {
     use crate::source::{Fetch, FetchedTree, GitSource, SourceError};
     use std::path::PathBuf;
 
-    /// `rupu fleet install --skills-from <dir>`: a local checkout of the
-    /// pinned commit stands in for the network. Its HEAD must be the pin and
-    /// nothing under `skills/` may differ from that commit, because install
-    /// copies every file in a skill's directory.
+    /// `rupu fleet install --skills-from <dir>`: a local git checkout stands
+    /// in for the network. The checkout must contain the pinned commit; its
+    /// working tree, index and HEAD are never read. The commit's tree is
+    /// exported from the object database into a temporary directory, so
+    /// install copies exactly what the pin names (never a modified, staged,
+    /// untracked, ignored or `skip-worktree` file).
     pub struct PinnedCheckout {
         pub dir: PathBuf,
     }
@@ -248,37 +250,30 @@ mod checkout {
                 .ok_or_else(|| err("--skills-from serves pinned commits only".into()))?;
             let repo = git2::Repository::open(&self.dir)
                 .map_err(|e| err(format!("{shown} is not a git checkout: {}", e.message())))?;
-            let head = repo
-                .head()
-                .and_then(|h| h.peel_to_commit())
-                .map_err(|e| err(format!("{shown}: {}", e.message())))?
-                .id()
-                .to_string();
-            if head != want {
-                return Err(err(format!(
-                    "{shown} is at {head}; the fleet pins {want}. Run `git -C {shown} checkout {want}`"
-                )));
-            }
-            let mut opts = git2::StatusOptions::new();
-            opts.include_untracked(true)
-                .recurse_untracked_dirs(true)
-                .include_ignored(true)
-                .recurse_ignored_dirs(true)
-                .pathspec("skills");
-            let statuses = repo
-                .statuses(Some(&mut opts))
-                .map_err(|e| err(format!("{shown}: {}", e.message())))?;
-            if let Some(dirty) = statuses
-                .iter()
-                .find(|s| s.status() != git2::Status::CURRENT)
-                .and_then(|s| s.path().map(str::to_owned))
-            {
-                return Err(err(format!(
-                    "{shown} has files under skills/ that are not in {want} ({dirty}); in that \
-                     directory run `git clean -fdx skills/` and `git checkout -- skills/`"
-                )));
-            }
-            Ok(FetchedTree::local_with_commit(self.dir.clone(), Some(head)))
+            let missing = || {
+                err(format!(
+                    "{shown} does not contain commit {want}; run `git fetch --tags` in it on a \
+                     connected machine (or clone a fresher copy)"
+                ))
+            };
+            let commit = git2::Oid::from_str(want)
+                .ok()
+                .and_then(|oid| repo.find_commit(oid).ok())
+                .ok_or_else(missing)?;
+            let tmp = tempfile::tempdir()
+                .map_err(|e| err(format!("cannot create a temporary directory: {e}")))?;
+            let mut opts = git2::build::CheckoutBuilder::new();
+            opts.target_dir(tmp.path())
+                .update_index(false)
+                .force()
+                .recreate_missing(true);
+            repo.checkout_tree(commit.as_object(), Some(&mut opts))
+                .map_err(|e| err(format!("{shown}: cannot export {want}: {}", e.message())))?;
+            Ok(FetchedTree::with_guard(
+                tmp.path().to_path_buf(),
+                Some(want.to_owned()),
+                tmp,
+            ))
         }
     }
 }

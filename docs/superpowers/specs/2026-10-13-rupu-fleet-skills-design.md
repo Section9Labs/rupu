@@ -14,7 +14,7 @@ Success looks like this:
 - `rupu fleet install` on a connected machine installs the fleet's agents, workflows and
   skills, and `rupu skill update` knows where every fleet skill came from.
 - On an air-gapped engagement box, `rupu fleet install --skills-from <checkout>` does the same
-  from a local checkout of the pinned commit.
+  from a local git checkout that contains the pinned commit.
 - A `network-assessment` run discovers hosts and services with a scope-enforcing,
   rate-capped methodology, splits what it found into work units, and fans the service
   analysis out over them.
@@ -29,7 +29,7 @@ Success looks like this:
 | D1 | Skills live in the public repo `Section9Labs/rupu-skills`, not in the fleet templates. | matt, 2026-10-13 |
 | D2 | Each built-in profile's `[bundle]` names its skills with a source and a pin. | matt |
 | D3 | The pin is a commit. A bundle entry carries `tag` for display and `commit` for fetching; the source record stores the commit as its ref. A moved or deleted tag cannot change what runs. | matt (option A) |
-| D4 | `rupu fleet install` requires the skills. A failed fetch exits non-zero after writing agents and workflows. `--skills-from <dir>` installs from a local checkout whose HEAD is the pinned commit. | matt (option A) |
+| D4 | `rupu fleet install` requires the skills. A failed fetch exits non-zero after writing agents and workflows. `--skills-from <dir>` installs from a local git checkout that contains the pinned commit. | matt (option A) |
 | D5 | rupu-skills has its own semver (`v1.0.0`, …), independent of rupu, because other people may use it. Each skill declares `compatibility`; `COMPATIBILITY.md` lists tested clients. | matt (option B) |
 | D6 | This arc ships the cross-cutting skills and the network profile (Plan 1), then web and API (Plan 2). Binary, cloud and the other profiles are a later arc. | matt (option A) |
 | D7 | Skills are client-agnostic. rupu specifics live in a skill's `references/rupu.md`; a skill that only makes sense in rupu is named `rupu-*`. | follows from D5 |
@@ -137,9 +137,11 @@ skills directory, or the project's with `--project`.
   skill is missing, the command prints which, and the command to retry (with
   `--skills-from` for offline boxes), and exits 1. Agents and workflows already written stay.
 - **`--skills-from <dir>`** is a second `rupu_skills::Fetch` implementation, `PinnedCheckout`.
-  For each pinned (source, commit) it opens `<dir>` with git2 and requires HEAD to be the
-  pinned commit and the working tree to be clean (no modified, staged or untracked files under
-  `skills/`). It returns `FetchedTree::local_with_commit(<dir>, Some(<commit>))`. Because the
+  For each pinned (source, commit) it opens `<dir>` with git2 and requires the
+  pinned commit to be in its object database (else it says to `git fetch --tags`). HEAD, the
+  index and the working tree are ignored and left untouched: the commit's tree is exported into
+  a temporary directory, so modified, untracked, ignored or `skip-worktree` files can never be
+  installed. It returns `FetchedTree::with_guard(<export>, Some(<commit>), <tempdir>)`. Because the
   `Source` passed to `install_from` is still the git source, the record names the GitHub URL
   and the SHA, and `rupu skill update` works later from a connected machine. With one pinned
   commit across the fleet (the lockstep rule), one checkout serves every skill.
@@ -192,8 +194,9 @@ nmap lines.
   - a skill installed from another source is kept;
   - a fetched commit that differs from the pin installs nothing;
   - one failing tree does not stop another source's skills, and the report lists the missing.
-- `PinnedCheckout` against a temporary git repository built with git2: HEAD at the pin passes;
-  another HEAD, a modified file and an untracked file under `skills/` are each refused.
+- `PinnedCheckout` against a temporary git repository built with git2: a checkout whose HEAD is the pin, or a later commit, serves
+  the pin's content; a pin missing from the object database is refused; modified, untracked,
+  ignored and `skip-worktree` files in the working tree never appear in the export.
 - No offline end-to-end test of the `rupu fleet install` binary: the built-in pins name real
   commits, and a test-only pin override in production code is not worth it. `cmd/fleet.rs`
   stays thin (it calls `rupu_skills::pinned` and prints), and the networked pin check (§5.5)
