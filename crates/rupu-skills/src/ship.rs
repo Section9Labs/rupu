@@ -125,16 +125,21 @@ pub fn pack_skill(skill: &Skill) -> Result<PackedSkill, ShipError> {
     })
 }
 
-/// Unpack `bytes` into a new directory `dest`, keeping it only if its
-/// content hash is `expected`. Any failure leaves no `dest` behind.
+/// Unpack `bytes` into a new directory `dest` (its parent must exist),
+/// keeping it only if its content hash is `expected`. Any failure after
+/// `dest` is created leaves no `dest` behind; an existing `dest` is never
+/// touched.
 pub fn unpack_skill(bytes: &[u8], dest: &Path, expected: &ContentHash) -> Result<(), ShipError> {
-    if dest.exists() {
-        return Err(ShipError::Malformed(format!(
-            "{} already exists",
-            dest.display()
-        )));
+    match std::fs::create_dir(dest) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(ShipError::Malformed(format!(
+                "{} already exists",
+                dest.display()
+            )));
+        }
+        Err(e) => return Err(io(dest)(e)),
     }
-    std::fs::create_dir_all(dest).map_err(io(dest))?;
     let result = unpack_into(bytes, dest, expected);
     if result.is_err() {
         let _ = std::fs::remove_dir_all(dest);
@@ -142,42 +147,43 @@ pub fn unpack_skill(bytes: &[u8], dest: &Path, expected: &ContentHash) -> Result
     result
 }
 
-fn unpack_into(bytes: &[u8], dest: &Path, expected: &ContentHash) -> Result<(), ShipError> {
+enum Item {
+    Dir,
+    File { mode: u32, data: Vec<u8> },
+    Link(PathBuf),
+}
+
+/// Read and vet the whole archive before anything is written.
+fn read_archive(bytes: &[u8]) -> Result<Vec<(PathBuf, Item)>, ShipError> {
     let bad = |m: String| ShipError::Malformed(m);
+    let tar_err = |e: std::io::Error| ShipError::Malformed(format!("unreadable archive: {e}"));
     let mut archive = tar::Archive::new(bytes);
+    let mut items = Vec::new();
     let mut total = 0u64;
-    for entry in archive.entries().map_err(io(dest))? {
-        let mut entry = entry.map_err(io(dest))?;
-        let rel = entry.path().map_err(io(dest))?.into_owned();
+    for entry in archive.entries().map_err(tar_err)? {
+        let mut entry = entry.map_err(tar_err)?;
+        let rel = entry.path().map_err(tar_err)?.into_owned();
         if rel.is_absolute() || !rel.components().all(|c| matches!(c, Component::Normal(_))) {
             return Err(bad(format!("unsafe path {}", rel.display())));
         }
-        let kind = entry.header().entry_type();
-        let target = dest.join(&rel);
-        match kind {
-            tar::EntryType::Directory => {
-                std::fs::create_dir_all(&target).map_err(io(&target))?;
-            }
+        let item = match entry.header().entry_type() {
+            tar::EntryType::Directory => Item::Dir,
             tar::EntryType::Regular => {
-                total += entry.header().size().map_err(io(&target))?;
+                total += entry.header().size().map_err(tar_err)?;
                 if total > MAX_SHIPPED_SKILL_BYTES {
                     return Err(bad(format!(
                         "more than {MAX_SHIPPED_SKILL_BYTES} bytes of content"
                     )));
                 }
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent).map_err(io(parent))?;
-                }
                 let mode = entry.header().mode().unwrap_or(0o644);
-                let mut file = std::fs::File::create(&target).map_err(io(&target))?;
-                std::io::copy(&mut entry, &mut file).map_err(io(&target))?;
-                drop(file);
-                set_mode(&target, mode)?;
+                let mut data = Vec::new();
+                std::io::Read::read_to_end(&mut entry, &mut data).map_err(tar_err)?;
+                Item::File { mode, data }
             }
             tar::EntryType::Symlink => {
                 let link = entry
                     .link_name()
-                    .map_err(io(&target))?
+                    .map_err(tar_err)?
                     .ok_or_else(|| bad(format!("symlink {} has no target", rel.display())))?
                     .into_owned();
                 if link.is_absolute() || !stays_inside(&rel, &link) {
@@ -186,10 +192,7 @@ fn unpack_into(bytes: &[u8], dest: &Path, expected: &ContentHash) -> Result<(), 
                         rel.display()
                     )));
                 }
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent).map_err(io(parent))?;
-                }
-                make_symlink(&link, &target)?;
+                Item::Link(link)
             }
             other => {
                 return Err(bad(format!(
@@ -197,16 +200,72 @@ fn unpack_into(bytes: &[u8], dest: &Path, expected: &ContentHash) -> Result<(), 
                     rel.display()
                 )))
             }
+        };
+        items.push((rel, item));
+    }
+    // Entries are later written through directories, so no path may repeat
+    // and none may sit below a symlink or a file.
+    let mut seen = std::collections::HashSet::new();
+    for (rel, _) in &items {
+        if !seen.insert(rel.clone()) {
+            return Err(bad(format!("duplicate entry {}", rel.display())));
         }
     }
-    let entries = walk_tree(dest).map_err(|source| ShipError::Tree {
+    let blockers: std::collections::HashSet<&PathBuf> = items
+        .iter()
+        .filter(|(_, i)| !matches!(i, Item::Dir))
+        .map(|(r, _)| r)
+        .collect();
+    for (rel, _) in &items {
+        if rel
+            .ancestors()
+            .skip(1)
+            .any(|a| blockers.contains(&a.to_path_buf()))
+        {
+            return Err(bad(format!("{} is below a file or symlink", rel.display())));
+        }
+    }
+    Ok(items)
+}
+
+fn unpack_into(bytes: &[u8], dest: &Path, expected: &ContentHash) -> Result<(), ShipError> {
+    let items = read_archive(bytes)?;
+    for (rel, item) in &items {
+        let target = dest.join(rel);
+        match item {
+            Item::Dir => std::fs::create_dir_all(&target).map_err(io(&target))?,
+            Item::File { mode, data } => {
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent).map_err(io(parent))?;
+                }
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&target)
+                    .map_err(io(&target))?;
+                std::io::Write::write_all(&mut file, data).map_err(io(&target))?;
+                drop(file);
+                set_mode(&target, *mode)?;
+            }
+            Item::Link(_) => {}
+        }
+    }
+    // Links last: nothing is written through one.
+    for (rel, item) in &items {
+        if let Item::Link(link) = item {
+            let target = dest.join(rel);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent).map_err(io(parent))?;
+            }
+            make_symlink(link, &target)?;
+        }
+    }
+    let tree_err = |source| ShipError::Tree {
         name: dest.display().to_string(),
         source,
-    })?;
-    let got = content_hash(dest, &entries).map_err(|source| ShipError::Tree {
-        name: dest.display().to_string(),
-        source,
-    })?;
+    };
+    let entries = walk_tree(dest).map_err(tree_err)?;
+    let got = content_hash(dest, &entries).map_err(tree_err)?;
     if got != *expected {
         return Err(ShipError::HashMismatch {
             expected: expected.hex(),

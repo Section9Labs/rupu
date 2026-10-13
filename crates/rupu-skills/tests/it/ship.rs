@@ -123,6 +123,92 @@ fn unpack_refuses_escaping_paths_links_and_devices() {
     }
 }
 
+fn tar_multi(entries: &[(&str, tar::EntryType, Option<&str>, &[u8])]) -> Vec<u8> {
+    let mut b = tar::Builder::new(Vec::new());
+    for (path, kind, link, data) in entries {
+        let mut h = tar::Header::new_ustar();
+        h.set_entry_type(*kind);
+        h.set_mode(0o644);
+        h.set_size(data.len() as u64);
+        if let Some(l) = link {
+            h.set_link_name(l).unwrap();
+        }
+        h.as_old_mut().name[..path.len()].copy_from_slice(path.as_bytes());
+        h.set_cksum();
+        b.append(&h, *data).unwrap();
+    }
+    b.into_inner().unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn chained_symlinks_and_duplicates_are_refused_before_anything_is_written() {
+    use tar::EntryType::{Regular, Symlink};
+    let any = rupu_skills::ContentHash([0u8; 32]);
+    let cases = [
+        (
+            "chain",
+            tar_multi(&[
+                ("a", Symlink, Some("."), b""),
+                ("a/l", Symlink, Some(".."), b""),
+                ("a/l/evil", Regular, None, b"x"),
+            ]),
+        ),
+        (
+            "deep chain",
+            tar_multi(&[
+                ("a", Symlink, Some("."), b""),
+                ("a/l", Symlink, Some(".."), b""),
+                ("a/l/x", Symlink, Some(".."), b""),
+                ("a/l/x/evil", Regular, None, b"x"),
+            ]),
+        ),
+        (
+            "duplicate",
+            tar_multi(&[("f", Regular, None, b"1"), ("f", Regular, None, b"2")]),
+        ),
+        (
+            "below a file",
+            tar_multi(&[("f", Regular, None, b"1"), ("f/g", Regular, None, b"2")]),
+        ),
+    ];
+    for (what, bytes) in cases {
+        let out = tempfile::tempdir().unwrap();
+        let dest = out.path().join("pdf");
+        let err = unpack_skill(&bytes, &dest, &any).unwrap_err();
+        assert!(matches!(err, ShipError::Malformed(_)), "{what}: {err}");
+        assert!(!dest.exists(), "{what}");
+        assert!(!out.path().join("evil").exists(), "{what}");
+    }
+}
+
+#[test]
+fn a_truncated_archive_is_malformed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = crate::support::write_skill(tmp.path(), "pdf", "pdf", "Read PDFs.");
+    let packed = pack_skill(&load_skill(&dir, Layer::Global).unwrap()).unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let dest = out.path().join("pdf");
+    let cut = &packed.bytes[..packed.bytes.len() / 2 + 3];
+    let err = unpack_skill(cut, &dest, &packed.hash).unwrap_err();
+    assert!(matches!(err, ShipError::Malformed(_)), "{err}");
+    assert!(!dest.exists());
+}
+
+#[test]
+fn unpacking_into_an_existing_dest_fails_and_leaves_it_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = crate::support::write_skill(tmp.path(), "pdf", "pdf", "Read PDFs.");
+    let packed = pack_skill(&load_skill(&dir, Layer::Global).unwrap()).unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let dest = out.path().join("pdf");
+    std::fs::create_dir(&dest).unwrap();
+    std::fs::write(dest.join("keep"), b"k").unwrap();
+    let err = unpack_skill(&packed.bytes, &dest, &packed.hash).unwrap_err();
+    assert!(matches!(err, ShipError::Malformed(_)), "{err}");
+    assert_eq!(std::fs::read(dest.join("keep")).unwrap(), b"k");
+}
+
 #[test]
 fn an_over_cap_skill_is_refused_by_pack() {
     let tmp = tempfile::tempdir().unwrap();
