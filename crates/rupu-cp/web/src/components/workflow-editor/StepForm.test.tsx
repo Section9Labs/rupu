@@ -1288,15 +1288,19 @@ describe('StepForm — skills', () => {
     render(<SkillsHarness initial={nodeWith({ kind: 'step', agent: 'planner', prompt: 'go' })} spy={spy} />);
     const skills = screen.getByTestId('step-skills-load');
     expect(Array.from(skills.querySelectorAll('.ab-chip-ghost')).map((c) => c.textContent)).toEqual([
-      '+ pdf',
-      '+ house-style',
       '+ *',
       '+ project:*',
+      '+ pdf',
+      '+ house-style',
     ]);
     fireEvent.click(screen.getAllByText('+ pdf')[0]);
     expect(last(spy).skills).toEqual(['pdf']);
 
-    fireEvent.click(screen.getByTestId('step-skills-preload').querySelector('.ab-chip-ghost')!);
+    fireEvent.click(
+      Array.from(screen.getByTestId('step-skills-preload').querySelectorAll('.ab-chip-ghost')).find(
+        (c) => c.textContent === '+ pdf',
+      )!,
+    );
     expect(last(spy).preload_skills).toEqual(['pdf']);
     expect(last(spy).skills).toEqual(['pdf']);
   });

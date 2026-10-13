@@ -564,6 +564,30 @@ pub(crate) fn host_read_error(host_id: &str, e: HostConnectorError) -> ApiError 
     }
 }
 
+/// The message of a peer CP's error reply: its `{"error": …}` text when the
+/// body is that JSON, else the body as it came.
+pub(crate) fn remote_error_text(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+        .unwrap_or_else(|| body.to_string())
+}
+
+/// A session start or send a host refused: the caller's mistake stays a 400
+/// (the peer's own CLI refusing a skill included) and a conflict a 409, each
+/// with the peer's message; everything else is `fallback`'s.
+pub(crate) fn host_session_request_error(
+    e: HostConnectorError,
+    fallback: impl FnOnce(HostConnectorError) -> ApiError,
+) -> ApiError {
+    match e {
+        HostConnectorError::Invalid(m) => ApiError::bad_request(m),
+        HostConnectorError::Remote(400, m) => ApiError::bad_request(remote_error_text(&m)),
+        HostConnectorError::Remote(409, m) => ApiError::conflict(remote_error_text(&m)),
+        other => fallback(other),
+    }
+}
+
 /// The mapping for a remote run or session CONTROL (approve, reject, cancel,
 /// pause, resume, archive, restore, delete): one table for all of them.
 ///

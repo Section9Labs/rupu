@@ -371,7 +371,7 @@ function SkillsField({
   patch: (p: Partial<StepNodeData>) => void;
   skillNames: string[];
 }) {
-  const suggestions = [...skillNames, ...SKILL_WILDCARDS];
+  const suggestions = [...SKILL_WILDCARDS, ...skillNames];
   const orUnset = (next: string[]) => (next.length > 0 ? next : undefined);
   return (
     <div className="space-y-2" data-testid="step-skills">

@@ -88,7 +88,7 @@ export default function AgentLauncherSheet({
       cancelled = true;
     };
   }, [skillsWsId, remoteHost]);
-  const skillSuggestions = [...skillNames, '*', 'project:*'];
+  const skillSuggestions = ['*', 'project:*', ...skillNames];
 
   // Esc-to-close; focus the dialog on open for keyboard users.
   useEffect(() => {

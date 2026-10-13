@@ -69,7 +69,7 @@ pub fn write_record(skills_dir: &Path, name: &str, rec: &SourceRecord) -> std::i
 }
 
 /// The record of skill `name` in `skills_dir`, if it has one. Reads a
-/// regular file of at most [`MAX_RECORD_BYTES`].
+/// regular file (not a symlink) of at most [`MAX_RECORD_BYTES`].
 pub fn read_record(skills_dir: &Path, name: &str) -> Result<Option<SourceRecord>, RecordError> {
     use std::io::Read as _;
     let path = record_path(skills_dir, name);
@@ -77,7 +77,7 @@ pub fn read_record(skills_dir: &Path, name: &str) -> Result<Option<SourceRecord>
         path: path.clone(),
         source,
     };
-    match std::fs::metadata(&path) {
+    match std::fs::symlink_metadata(&path) {
         Ok(m) if m.is_file() => {}
         Ok(_) => return Err(RecordError::NotAFile { path }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),

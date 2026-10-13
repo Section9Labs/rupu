@@ -591,3 +591,32 @@ fn list_records_skips_a_record_whose_name_is_invalid() {
 
     assert_eq!(list_records(t.path()), vec!["good".to_owned()]);
 }
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_record_is_refused_unread() {
+    let elsewhere = tempfile::tempdir().unwrap();
+    let rec = SourceRecord {
+        version: 1,
+        source: "o/skills".into(),
+        url: None,
+        git_ref: None,
+        path: None,
+        commit: None,
+        local: None,
+        content_hash: "abc".into(),
+        installed_at: 0,
+    };
+    write_record(elsewhere.path(), "pdf", &rec).unwrap();
+    let skills = tempfile::tempdir().unwrap();
+    fs::create_dir_all(skills.path().join(".sources")).unwrap();
+    std::os::unix::fs::symlink(
+        elsewhere.path().join(".sources/pdf.json"),
+        skills.path().join(".sources/pdf.json"),
+    )
+    .unwrap();
+    assert!(matches!(
+        read_record(skills.path(), "pdf"),
+        Err(rupu_skills::record::RecordError::NotAFile { .. })
+    ));
+}

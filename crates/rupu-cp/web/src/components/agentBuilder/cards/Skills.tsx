@@ -12,7 +12,7 @@ export interface SkillsCardProps extends CardProps {
 const WILDCARDS = ['*', 'project:*'];
 
 export default function Skills({ draft, patch, skillNames }: SkillsCardProps) {
-  const suggestions = [...(skillNames ?? []), ...WILDCARDS];
+  const suggestions = [...WILDCARDS, ...(skillNames ?? [])];
   return (
     <>
       <LabeledRow

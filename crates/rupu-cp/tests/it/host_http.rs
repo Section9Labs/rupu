@@ -1178,6 +1178,59 @@ async fn session_skills_are_refused_by_a_remote_without_session_skills() {
     start.assert_hits(0);
 }
 
+/// A remote that takes session skills but whose own CLI refuses one answers
+/// 400 with the CLI's message; through the coordinator that stays a 400 with
+/// that message, not a gateway error wrapping the remote's JSON.
+#[tokio::test]
+#[allow(clippy::disallowed_methods)] // a test client calling the coordinator's API
+async fn a_remote_refusing_a_session_skill_is_a_400_with_its_message() {
+    let remote = httpmock::MockServer::start_async().await;
+    remote.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(200).json_body(serde_json::json!({
+            "version": "0.95.0",
+            "capabilities": {"backends": [], "scm_hosts": [], "permission_modes": []},
+            "features": ["agent.skills", "session.skills"]
+        }));
+    });
+    let refusal = serde_json::json!({ "error": "unknown skill \"pdff\" (did you mean pdf?)" });
+    remote.mock(|when, then| {
+        when.method("POST").path("/api/sessions/ses_1/send");
+        then.status(400).json_body(refusal.clone());
+    });
+    remote.mock(|when, then| {
+        when.method("POST").path("/api/agents/triage/session");
+        then.status(400).json_body(refusal.clone());
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let state = cp_state(&tmp);
+    let host = state
+        .hosts
+        .add_host("mini", &remote.base_url(), None)
+        .unwrap();
+    let addr = serve_cp(state).await;
+    let http = reqwest::Client::new();
+    for (url, body) in [
+        (
+            format!("http://{addr}/api/sessions/ses_1/send?host={}", host.id),
+            serde_json::json!({ "skills": ["pdff"] }),
+        ),
+        (
+            format!("http://{addr}/api/agents/triage/session"),
+            serde_json::json!({ "host": host.id, "prompt": "hi", "skills": ["pdff"] }),
+        ),
+    ] {
+        let resp = http.post(&url).json(&body).send().await.unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "{url}");
+        let got: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            got["error"], "unknown skill \"pdff\" (did you mean pdf?)",
+            "{url}"
+        );
+    }
+}
+
 /// No skills ⇒ no feature check and no skills key, so an older remote sees
 /// exactly the send it always did.
 #[tokio::test]

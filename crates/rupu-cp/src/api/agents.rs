@@ -1370,13 +1370,14 @@ async fn start_session(
         // `run_agent`'s doc comment.
         let req = b.into_request(&name)?;
         let conn = crate::api::runs::resolve_host(&s, &host)?;
-        let session_id = conn.start_session(req).await.map_err(|e| match e {
-            HostConnectorError::NotFound(m) => ApiError::not_found(m),
-            HostConnectorError::Invalid(m) => ApiError::bad_request(m),
-            // e.g. the host can't take the session's `skills` — refused,
-            // not failed.
-            HostConnectorError::Unsupported(m) => ApiError::not_available(m),
-            other => ApiError::internal(other.to_string()),
+        let session_id = conn.start_session(req).await.map_err(|e| {
+            crate::api::runs::host_session_request_error(e, |other| match other {
+                HostConnectorError::NotFound(m) => ApiError::not_found(m),
+                // e.g. the host can't take the session's `skills` — refused,
+                // not failed.
+                HostConnectorError::Unsupported(m) => ApiError::not_available(m),
+                other => ApiError::internal(other.to_string()),
+            })
         })?;
         return Ok(Json(
             serde_json::json!({ "session_id": session_id, "host_id": host }),

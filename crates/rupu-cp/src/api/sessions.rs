@@ -1091,9 +1091,10 @@ async fn send_session(
 
     if host != "local" {
         let conn = crate::api::runs::resolve_host(&s, &host)?;
-        let run_id = conn.send_session_turn(req).await.map_err(|e| match e {
-            HostConnectorError::Invalid(m) => ApiError::bad_request(m),
-            other => crate::api::runs::host_read_error(&host, other),
+        let run_id = conn.send_session_turn(req).await.map_err(|e| {
+            crate::api::runs::host_session_request_error(e, |other| {
+                crate::api::runs::host_read_error(&host, other)
+            })
         })?;
         return Ok(Json(
             serde_json::json!({ "run_id": run_id, "host_id": host }),
