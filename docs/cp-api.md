@@ -16,7 +16,7 @@ a peer needs is advertised in `GET /api/host/info` → `features`.
 - [Runs](#runs) · [Run control](#run-control) · [Run views](#run-views)
 - [Events and transcripts](#events-and-transcripts)
 - [Sessions](#sessions)
-- [Launch, agents and workflows](#launch-agents-and-workflows)
+- [Launch, agents and workflows](#launch-agents-and-workflows) · [Skills](#skills)
 - [Autoflows](#autoflows)
 - [Findings](#findings) · [Coverage and assets](#coverage-and-assets)
 - [Usage and dashboard](#usage-and-dashboard) · [Netflow](#netflow)
@@ -259,7 +259,7 @@ none, and a body that isn't the expected JSON is a 400.
 | GET | `/api/sessions/:id` | Session detail with usage and codename. | `host`. |
 | GET | `/api/sessions/:id/runs` | The session's turns for the chat view (`SessionRunRow`). | `host`. |
 | GET | `/api/sessions/:id/usage-timeline` | Tokens per model call. | `host`. |
-| POST | `/api/sessions/:id/send` | Send a prompt as the next turn. | Body `{prompt}` → `{run_id, host_id}`; watch the turn with `/api/transcript/stream`. 400 empty prompt; 409 session stopped; 501 without `cp serve`. |
+| POST | `/api/sessions/:id/send` | Send a prompt as the next turn, or invoke skills in it. | `host`. Body `{prompt?, skills?}` → `{run_id, host_id}`; watch the turn with `/api/transcript/stream`. `skills` (skill entries) become `rupu session send --skill`; the prompt may be empty when a skill is given. 400 with neither, a malformed or wildcard entry, or a skill the session can't take (unknown, ambiguous, held from the other layer; the body is the CLI's message); 404 unknown session; 409 session stopped; 501 without `cp serve`. A remote host that does not advertise `session.skills` refuses a send with skills: 501, "upgrade rupu there", and nothing reaches it. |
 | POST | `/api/sessions/:id/archive` | Archive a session. | `host`. |
 | POST | `/api/sessions/:id/restore` | Restore an archived session. | `host`. |
 | DELETE | `/api/sessions/:id` | Delete a session. | `host`. |
@@ -283,13 +283,13 @@ without `rupu cp serve`.
 | POST | `/api/workflows/validate` | Parse-check YAML without saving. | Body `{raw}`. 400 with the parse error. |
 | POST | `/api/workflows/generate` | Draft a workflow from a description with a model. | Body `{description, provider?, model?}`. |
 | GET | `/api/generate/models` | Providers and models available for generation. | |
-| GET | `/api/agents` | Agent definitions, global and per project (`AgentDto`). | |
+| GET | `/api/agents` | Agent definitions, global and per project (`AgentDto`). | Each row carries its frontmatter `skills` and `preload_skills` (omitted when empty) and, when it can't be launched, `load_error`: its `tools:` names an unknown tool, or a granted skill is not installed, does not load, or is ambiguous, checked as `rupu agent validate` checks it against the layers of the row's scope (global; global plus the project for a project agent). |
 | POST | `/api/agents` | Create an agent in the global layer. | Body `{raw}` (the `.md` file). 409 if the name exists. |
-| GET | `/api/agents/:name` | Agent detail with its prompt and raw file. | |
-| PUT | `/api/agents/:name` | Overwrite an agent. | `scope_kind`, `scope_id`. Body `{raw}`. |
+| GET | `/api/agents/:name` | Agent detail with its prompt and raw file. | `load_error` as in the list. |
+| PUT | `/api/agents/:name` | Overwrite an agent. | `scope_kind`, `scope_id`. Body `{raw}`. 400 for a malformed `skills:` / `preloadSkills:` entry (`skills: entry …`); a skill that isn't installed is accepted and shows in `load_error`. `POST /api/agents` checks the same. |
 | DELETE | `/api/agents/:name` | Delete an agent. | `scope_kind`, `scope_id`. |
 | POST | `/api/agents/:name/run` | Launch an agent run → `{run_id, host_id}`. | Body `AgentRunBody {prompt, mode, target, working_dir, host, scope_kind, scope_id, findings_profile, engagement_profiles, skills, preload_skills, run_id, codename}`. `engagement_profiles` (ids; blank → 400) becomes `rupu run --engagement-profile`; a remote host that does not advertise `agent.engagement_profile` refuses it. `skills` / `preload_skills` (skill grant entries; malformed → 400) become `rupu run --skill` / `--preload-skill`; a remote host that does not advertise `agent.skills` refuses them. `run_id` (a `run_…` id; malformed → 400) is the id the run executes under instead of a minted one (advertised as `run.supplied_run_id`); `codename` (malformed → 400) becomes the hidden `rupu run --codename` (advertised as `run.codename`). A coordinator sends either only to a host that advertises it, and a codename a host can't take never blocks the launch. |
-| POST | `/api/agents/:name/session` | Start a session → `{session_id, host_id}`. | Body `SessionStartBody {prompt, mode, target, working_dir, host, scope_kind, scope_id}`. |
+| POST | `/api/agents/:name/session` | Start a session → `{session_id, host_id}`. | Body `SessionStartBody {prompt, mode, target, working_dir, host, scope_kind, scope_id, skills, preload_skills}`. `skills` / `preload_skills` (skill grant entries; malformed → 400) become `rupu session start --skill` / `--preload-skill`; a skill the session can't resolve is a 400 with the CLI's message. A remote host that does not advertise `session.skills` refuses them: 501, "upgrade rupu there". |
 | POST | `/api/agents/generate` | Draft an agent from a description. | Body `{description, provider?, model?}`. |
 
 ```sh
@@ -298,6 +298,42 @@ curl -s -X POST -H "Authorization: Bearer $CP_TOKEN" -H 'Content-Type: applicati
   http://127.0.0.1:7878/api/workflows/review-pr/run
 # {"run_id":"01JEXAMPLE0000000000000000","host_id":"local"}
 ```
+
+## Skills
+
+Installed [Agent Skills](skills.md), read-only: installing and updating stay
+`rupu skill` operations. Both routes read the global layer and, with `ws_id`,
+that project's layer (`.rupu/skills` in the workspace; none when the project's
+`.rupu` is the global dir). An unknown `ws_id` is a 404.
+
+| Method | Path | Purpose | Notes |
+|--------|------|---------|-------|
+| GET | `/api/skills` | Every installed skill, as `rupu skill list` (`SkillsResponse`). | `ws_id`. Rows sorted by name, then layer. Each row loads its skill to show its status. |
+| GET | `/api/skills/:layer/:name` | One skill, as `rupu skill show` (`SkillDetail`). | `ws_id`, required for `project`. 400 for a layer other than `global` / `project`, or `project` without `ws_id`; 404 `no installed skill <layer>:<name>`; 500 when the skill's layer can't be read. |
+
+`SkillsResponse` is `{skills: [SkillRow], warnings: [string]}`. A layer that
+can't be read is left out of `skills` and named in `warnings`
+(`"project layer: <path>: <error>"`); the response is still 200. A row:
+
+| Field | |
+|---|---|
+| `name`, `layer` | The directory name and `global` / `project`. |
+| `status` | `ok` or `invalid`. |
+| `description`, `stamp` | For a valid skill; `stamp` is the short stamp. |
+| `error` | Why an invalid skill doesn't load (a name mismatch, a `SKILL.md` over 1 MiB, a symlinked project skill or project `skills/`, …). |
+| `warnings` | Frontmatter warnings (an over-limit description), and `install record: <error>` when the skill's install record can't be read. |
+| `source` | The install record's `source`, when there is a readable one. |
+| `both_layers` | The other layer has a skill of the same name, so a bare grant of it is ambiguous. |
+
+`SkillDetail` is the row's fields plus `path`, `license`, `compatibility`,
+`allowed_tools`, `mapped_tools` (the rupu tools `allowed-tools` maps to;
+informational, never a grant), `disable_model_invocation`, `metadata`, `files`
+(relative to the skill, without `SKILL.md`), `content_hash` (short), `body`
+(`SKILL.md` without its frontmatter), `source_record` (the install record as
+written) and `source_error` (why the record couldn't be read). The fields
+that need a loaded skill are empty for an invalid one. An install record is
+read only when it is a regular file of at most 64 KiB, and never through a
+symlinked project `skills/`.
 
 ## Autoflows
 
@@ -387,7 +423,7 @@ An unknown `ws_id` is a 404 on every route except the list.
 | GET | `/api/projects/:ws_id/sessions` | The project's sessions. | `offset`, `limit`. |
 | GET | `/api/projects/:ws_id/coverage` | Per-target coverage summary. | |
 | GET | `/api/projects/:ws_id/coverage/assessed` | Assessed percentage (`{assessed_pct}`). | Computed by a full audit; slower than the summary. |
-| GET | `/api/projects/:ws_id/agents` | Agents the project can use (project overrides global by name). | |
+| GET | `/api/projects/:ws_id/agents` | Agents the project can use (project overrides global by name). | Every row's `load_error` is checked against the global and this project's skill layers, so a bare skill name installed in both is ambiguous here. |
 | GET | `/api/projects/:ws_id/workflows` | Workflows the project can use. | |
 | GET | `/api/projects/:ws_id/autoflows` | Autoflow definitions the project can use. | |
 | GET | `/api/projects/:ws_id/tree` | One directory of the checkout (`TreeResult`). | `path` (workspace-relative). 400 for an absolute path, `..`, or a path leaving the workspace. Skips `.git`, `.rupu`, `node_modules`, `target`. |

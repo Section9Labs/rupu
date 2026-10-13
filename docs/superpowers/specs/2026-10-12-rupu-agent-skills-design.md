@@ -358,9 +358,10 @@ A local install records `"local": "<canonical dir>"` instead of `url`/`ref`/`com
 
 ## 8. Control plane
 
-- `GET /api/skills` (global + `?ws_id=` project): name, layer, description, stamp, error.
-- `AgentDto` (`crates/rupu-cp/src/api/agents.rs:363`) gains `skills` and `preload_skills`. `parse_agent_for_write` refuses malformed entries but not unknown names: an agent may be saved before its skill is installed, and the unresolved name shows in the agent's `load_error` as it does in `rupu agent validate`.
-- The web Library gets a Skills tab and the agent editor a skill picker. Transcript views render `skill_index` and `skill_load`. The session composer gets the operator-invoke action.
+- `GET /api/skills` (global, plus a project's layer with `?ws_id=`) lists every skill as `rupu skill list` does: name, layer, status, description, error, warnings, stamp, the install record's source, and whether the other layer has the same name. A layer that can't be read is left out and named in the response's top-level `warnings`; the other layer still lists. An install record that can't be read is a row warning, never hidden. `GET /api/skills/:layer/:name` shows one skill as `rupu skill show` does: its frontmatter, the rupu tools `allowed-tools` maps to, files, body, content hash and install record. Both are read-only; install and update stay CLI operations. A record is read only when it is a regular file of at most 64 KiB, and never through a symlinked project `skills/`.
+- `AgentDto` (`crates/rupu-cp/src/api/agents.rs`) gains `skills` and `preload_skills`. `parse_agent_for_write` refuses malformed entries but not unknown names: an agent may be saved before its skill is installed. The agent's `load_error` runs the check `rupu agent validate` runs (every granted skill installed, loadable, and bound once) against the layers of the scope it is listed for, so it agrees with `validate` and with the launch.
+- Session start and send carry skill entries down to `rupu session start --skill` / `--preload-skill` and `rupu session send --skill`. A send may have no prompt when it has a skill. A skill the CLI refuses comes back as a 400 with its message. A remote CP host gets session skills only when it advertises `session.skills`; otherwise the request is refused with 501 before anything reaches it.
+- The web Library gets a Skills tab and a skill page, the agent builder a Skills card, the workflow step form skill fields, the launcher a Skills section, and the session composer an "Invoke skill" control. Transcript views render `skill_index` and `skill_load`.
 
 The web work is GUI: it stops for matt's visual check before merge.
 

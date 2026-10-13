@@ -376,3 +376,43 @@ the turn without its skills. `session send` restarts a worker whose rupu
 binary is older than its own, judged by the binary's modification time, but
 it keeps the worker when that can't be read. After upgrading rupu, run
 `rupu session stop <id>` before using `--skill` on a running session.
+
+## In the control plane
+
+The control plane (`rupu cp serve`) shows installed skills and edits where
+they are granted. Installing and updating skills stay CLI operations. The
+routes are in [cp-api.md](cp-api.md#skills).
+
+The Library's skills tab lists the global layer, and the project picker adds
+that project's layer, like `rupu skill list`. Each row shows its layer,
+status, source and description; an invalid skill shows its error. A layer
+that can't be read (a project `.rupu/skills` that is a file, say) is left out
+with a warning, and the other layer still lists. A skill's page shows its
+description, compatibility, license, `allowed-tools` with the rupu tools they
+map to (informational, never a grant), metadata, files, body, content hash and
+install record. An install record that can't be read is shown as a warning
+rather than hidden. A record is read only when it is a regular file of at
+most 64 KiB, and never through a symlinked project `skills/`.
+
+An agent's `skills:` and `preloadSkills:` are edited in the agent builder's
+Skills card, with the installed names as suggestions. The control plane checks
+an agent's skills the way `rupu agent validate` does: against the global
+layer for a global agent and the global plus project layer for a project
+agent, every granted skill must be installed, load, and bind once. An agent
+that fails shows "This agent can't be launched" with the reason, and an
+unknown name comes with the install hint. Saving such an agent is allowed, so
+an agent can be written before its skills are installed; only a malformed
+entry is refused.
+
+A workflow step's `skills` and `preload_skills` are fields of the step form
+for any step that runs an agent. The launcher's Skills section adds skills to
+a run (`rupu run --skill` / `--preload-skill`) or a session
+(`rupu session start --skill` / `--preload-skill`). A session's composer has
+an "Invoke skill" control: a send with a skill and no prompt is allowed, as
+`rupu session send --skill` allows it. A skill name the CLI refuses (unknown,
+a wildcard, ambiguous) comes back as the CLI's message.
+
+Session skills on a remote host need a rupu there that advertises
+`session.skills`; an older one is refused before anything is sent, with an
+"upgrade rupu there" message. Run skills on a remote host need
+`agent.skills`, as a placed workflow step does.
