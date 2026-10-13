@@ -12,8 +12,8 @@ use rupu_cli::cmd::{self, run::RunAction};
 use rupu_cli::{Cli, Cmd};
 use rupu_coverage::FindingProfile;
 use rupu_runtime::argv::{
-    AgentRun, AgentiflowRun, FlowAttach, LaunchLink, RunArgv, SessionSend, SessionStart,
-    SessionWorker, WorkflowControl, WorkflowRef, WorkflowRun,
+    AgentRun, AgentiflowRun, FlowAttach, LaunchLink, MessageSpace, RunArgv, SessionSend,
+    SessionStart, SessionWorker, WorkflowControl, WorkflowRef, WorkflowRun,
 };
 use rupu_tools::PermissionMode;
 
@@ -41,6 +41,20 @@ fn flow() -> FlowAttach {
         run_dir: PathBuf::from("/g/agentiflows/af_01X with space"),
         participant: "recon#1".into(),
     }
+}
+
+/// A flow's space and another run's, both of which `rupu run` joins.
+fn spaces() -> [MessageSpace; 2] {
+    [
+        MessageSpace {
+            dir: PathBuf::from("/g/agentiflows/af_01X with space"),
+            participant: "recon#1".into(),
+        },
+        MessageSpace {
+            dir: PathBuf::from("/g/runs/run_01P/messages"),
+            participant: "lynx>otter#1".into(),
+        },
+    ]
 }
 
 /// The links a launcher renders: every cap empty, full, and the optional
@@ -100,7 +114,7 @@ fn agent_runs() -> Vec<RunArgv> {
             r.engagement_profiles = vec!["network".into(), "web".into()];
         }
         if on(6) {
-            r.flow = Some(flow());
+            r.message_space = Some(spaces()[mask as usize % 2].clone());
         }
         if on(7) {
             r.skills = vec!["pdf".into(), "project:notes".into()];
@@ -121,7 +135,7 @@ fn agent_runs() -> Vec<RunArgv> {
         let mut r = AgentRun::new("recon", "run_01ROUNDTRIP");
         r.codename = Some("cobalt-harbor/heron>lynx#1".into());
         r.prompt = Some(PROMPTS[i % PROMPTS.len()].into());
-        r.flow = (i % 2 == 0).then(flow);
+        r.message_space = (i % 2 == 0).then(|| spaces()[i % 4 / 2].clone());
         r.launch = Some(link);
         out.push(RunArgv::Agent(r));
     }
@@ -322,7 +336,10 @@ fn back(cli: Cli) -> RunArgv {
                 skills: a.skills,
                 preload_skills: a.preload_skills,
                 tmp_clone: a.tmp,
-                flow: flow_of(a.fleet_run_dir, a.fleet_participant),
+                message_space: flow_of(a.message_space, a.participant).map(|f| MessageSpace {
+                    dir: f.run_dir,
+                    participant: f.participant,
+                }),
                 continue_from: a.continue_from,
                 launch: a.launch.link(),
             })

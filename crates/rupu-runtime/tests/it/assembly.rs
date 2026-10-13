@@ -85,6 +85,7 @@ fn origins(home: &Home) -> Vec<(&'static str, Origin)> {
                 }),
                 step_actions: vec!["issues.*".into()],
                 scope_override: None,
+                messaging: None,
             },
         ),
         (
@@ -282,12 +283,11 @@ async fn star_parity_per_origin() {
         l.services.launcher = Some(Arc::new(crate::support::NoLaunch));
         match &origin {
             Origin::FlowLead { .. } => {
-                l.services.message_bus =
-                    Some(Arc::new(rupu_fleet::Bus::for_run_dir(&flow_dir, "lead")));
+                l.services.message_bus = Some(Arc::new(rupu_fleet::Bus::open(&flow_dir, "lead")));
                 l.services.run_status = Some(Arc::new(crate::support::NoStatus));
             }
             Origin::FlowUnit { participant, .. } => {
-                l.services.message_bus = Some(Arc::new(rupu_fleet::Bus::for_run_dir(
+                l.services.message_bus = Some(Arc::new(rupu_fleet::Bus::open(
                     &flow_dir,
                     participant.clone(),
                 )));

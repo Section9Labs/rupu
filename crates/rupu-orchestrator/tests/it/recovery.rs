@@ -78,6 +78,7 @@ impl Fx {
                 path: self.tmp.path().to_path_buf(),
             },
             transcript_path: self.transcript(name),
+            messaging: None,
             on_tool_call: None,
         })
         .expect("launch");

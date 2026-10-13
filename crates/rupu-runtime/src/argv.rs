@@ -76,8 +76,9 @@ pub struct AgentRun {
     /// `--tmp`: clone a repo/PR target into an auto-deleted tmpdir. The CP and
     /// placed launches set it whenever there is a target.
     pub tmp_clone: bool,
-    /// Join an agentiflow's board as a pool unit.
-    pub flow: Option<FlowAttach>,
+    /// Join a message space (`--message-space <dir> --participant <id>`):
+    /// a child sharing its parent's, an agentiflow's pool unit (spec F1a §7).
+    pub message_space: Option<MessageSpace>,
     /// `--continue <run id>`: continue that interrupted run of the agent
     /// instead of starting from a prompt.
     pub continue_from: Option<String>,
@@ -102,7 +103,7 @@ impl AgentRun {
             skills: Vec::new(),
             preload_skills: Vec::new(),
             tmp_clone: false,
-            flow: None,
+            message_space: None,
             continue_from: None,
             launch: None,
         }
@@ -190,11 +191,21 @@ pub enum WorkflowRef {
     File(PathBuf),
 }
 
-/// `--fleet-run-dir <dir> --fleet-participant <id>`: a unit joining an
-/// agentiflow.
+/// `--fleet-run-dir <dir> --fleet-participant <id>`: a workflow launched
+/// by an agentiflow, whose steps report into the flow's findings scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlowAttach {
     pub run_dir: PathBuf,
+    pub participant: String,
+}
+
+/// `--message-space <dir> --participant <id>`: the message space a `rupu run`
+/// joins and its address in it (an agentiflow's run dir, or another run's
+/// `messages/` dir). The old `--fleet-run-dir` / `--fleet-participant`
+/// spellings are its aliases.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageSpace {
+    pub dir: PathBuf,
     pub participant: String,
 }
 
@@ -388,7 +399,11 @@ impl RunArgv {
                     a.push("--tmp");
                 }
                 a.opt_flag_value("--continue", r.continue_from.as_deref());
-                a.flow(r.flow.as_ref());
+                if let Some(m) = &r.message_space {
+                    a.push("--message-space");
+                    a.push(m.dir.as_os_str());
+                    a.flag_value("--participant", &m.participant);
+                }
                 a.launch(r.launch.as_ref());
             }
             Self::Workflow(r) => {
@@ -690,8 +705,8 @@ mod tests {
         r.prompt = Some("look at PR".into());
         r.tmp_clone = true;
         r.codename = Some("jade-reef/numbat".into());
-        r.flow = Some(FlowAttach {
-            run_dir: "/g/agentiflows/af_1".into(),
+        r.message_space = Some(MessageSpace {
+            dir: "/g/agentiflows/af_1".into(),
             participant: "recon#1".into(),
         });
         assert_eq!(
@@ -720,9 +735,9 @@ mod tests {
                 "house-style",
                 "--prompt=look at PR",
                 "--tmp",
-                "--fleet-run-dir",
+                "--message-space",
                 "/g/agentiflows/af_1",
-                "--fleet-participant",
+                "--participant",
                 "recon#1",
             ]
         );
@@ -1008,8 +1023,8 @@ mod tests {
         let mut nasty = AgentRun::new("recon", "run_01ABC");
         nasty.target = Some("github:o/r#4".into());
         nasty.prompt = Some("- it's $HOME `id` \"q\" \\ \n second line; rm -rf /".into());
-        nasty.flow = Some(FlowAttach {
-            run_dir: "/tmp/a dir/with 'quotes'".into(),
+        nasty.message_space = Some(MessageSpace {
+            dir: "/tmp/a dir/with 'quotes'".into(),
             participant: "recon#1".into(),
         });
         let mut wf = WorkflowRun::new(WorkflowRef::Name("audit".into()), "run_X");

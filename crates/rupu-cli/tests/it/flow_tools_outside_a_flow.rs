@@ -1,7 +1,8 @@
-//! W5 §6 tests 3 and 4: grants are just names. A plain `rupu run` whose
-//! agent lists a roster tool gets it (every launch site provides the
-//! catalog), and one that lists a board tool is told it is unavailable —
-//! there is no message bus outside an agentiflow.
+//! Grants are just names (W5 §6 test 3): a plain `rupu run` whose agent
+//! lists a roster tool gets it (every launch site provides the catalog). And
+//! every run can have a message space (spec F1a, FD1): one whose agent lists
+//! a board tool gets it, and its space is created on its first message — a
+//! run that never messages creates none.
 
 use assert_cmd::Command;
 use serde_json::Value;
@@ -77,32 +78,49 @@ fn catalog_tools_anywhere() {
 }
 
 #[test]
-fn board_outside_flow_notice() {
+fn board_tools_in_a_plain_run() {
     let dir = tempfile::tempdir().unwrap();
     write_agent(dir.path(), "poster", "[board.post]");
     let t = run(
         dir.path(),
         "poster",
         "run_board",
-        r#"[{"AssistantText":{"text":"done","stop":"end_turn"}}]"#,
+        r#"[
+            {"AssistantToolUse":{"text":null,"tool_id":"t1","tool_name":"board.post","tool_input":{"kind":"note","body":"halfway there"},"stop":"tool_use"}},
+            {"AssistantText":{"text":"done","stop":"end_turn"}}
+        ]"#,
     );
 
     let grant = &events(&t, "tool_grant")[0]["data"];
     let entries = grant["entries"].as_array().unwrap();
-    assert!(
-        !entries.iter().any(|e| e["tool"] == "board.post"),
-        "{entries:?}"
-    );
-    assert_eq!(grant["unavailable"][0]["tool"], "board.post", "{grant}");
-    assert_eq!(grant["unavailable"][0]["missing"][0], "message_bus");
+    let post = entries.iter().find(|e| e["tool"] == "board.post");
+    assert_eq!(post.unwrap()["reasons"][0], "declared", "{entries:?}");
+    assert!(grant.get("unavailable").is_none(), "{grant}");
 
-    let notices: Vec<_> = events(&t, "notice")
-        .into_iter()
-        .filter(|n| n["data"]["kind"] == "tool_unavailable")
-        .collect();
-    assert_eq!(notices.len(), 1, "{t:?}");
-    assert!(notices[0]["data"]["message"]
-        .as_str()
+    let space = dir.path().join(".rupu/runs/run_board/messages");
+    let log: Vec<Value> = std::fs::read_to_string(space.join("log.jsonl"))
         .unwrap()
-        .contains("board.post"));
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(log.len(), 1, "{log:?}");
+    assert_eq!(log[0]["kind"], "post");
+    assert_eq!(log[0]["body"], "halfway there");
+    let sent = events(&t, "message");
+    assert_eq!(sent.len(), 1, "{t:?}");
+    assert_eq!(sent[0]["data"]["direction"], "sent");
+    assert_eq!(sent[0]["data"]["id"], log[0]["id"]);
+    // The run joined on that post, and left as it ended.
+    let roster = std::fs::read_to_string(space.join("participants.jsonl")).unwrap();
+    assert_eq!(roster.lines().count(), 2, "{roster}");
+
+    // A run that never messages creates no space.
+    write_agent(dir.path(), "quiet", "[board.post]");
+    run(
+        dir.path(),
+        "quiet",
+        "run_quiet",
+        r#"[{"AssistantText":{"text":"done","stop":"end_turn"}}]"#,
+    );
+    assert!(!dir.path().join(".rupu/runs/run_quiet/messages").exists());
 }

@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, RwLock};
+
 use std::time::Duration;
 
 /// The default `[messaging].log_max_mb`.
@@ -69,6 +70,18 @@ impl ClaimTable {
     }
 }
 
+/// Whether a run has joined its space (spec F1a §3.1, FD1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Presence {
+    /// Nobody said who the run is (a bare bus: tests, tools in isolation).
+    Absent,
+    /// The run will join on its first write or its first child: a
+    /// standalone run's or a session's own space is created lazily.
+    Pending(Member),
+    /// Its `joined` line is written.
+    Joined(Member),
+}
+
 /// One run's address in its message space.
 #[derive(Debug)]
 pub struct Bus {
@@ -80,8 +93,8 @@ pub struct Bus {
     pub claims: ClaimTable,
     pub caps: BusCaps,
     space: PathBuf,
-    /// Set by [`Bus::join`]: the run's codename, agent, step and parent.
-    member: RwLock<Option<Member>>,
+    /// Who the run is in the space, and whether it has joined yet.
+    presence: RwLock<Presence>,
     /// Whether the agent loop records the run as `left` when it ends. An
     /// agentiflow lead's rounds and a session's turns stay joined between
     /// runs.
@@ -102,7 +115,7 @@ impl Bus {
             claims: ClaimTable::default(),
             caps: BusCaps::default(),
             space: space.to_path_buf(),
-            member: RwLock::new(None),
+            presence: RwLock::new(Presence::Absent),
             leave_on_exit: true,
             #[cfg(test)]
             fail_after_log: Default::default(),
@@ -137,12 +150,39 @@ impl Bus {
         self.space.join("participants.jsonl")
     }
 
-    /// Who the run is, once it joined.
+    /// Who the run is, once it said (joined or not).
     pub fn member(&self) -> Option<Member> {
-        self.member
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        match &*self.presence.read().unwrap_or_else(|e| e.into_inner()) {
+            Presence::Absent => None,
+            Presence::Pending(m) | Presence::Joined(m) => Some(m.clone()),
+        }
+    }
+
+    /// Whether the run's `joined` line is written.
+    pub fn is_joined(&self) -> bool {
+        matches!(
+            &*self.presence.read().unwrap_or_else(|e| e.into_inner()),
+            Presence::Joined(_)
+        )
+    }
+
+    /// Say who the run is without joining yet: it joins on its first write
+    /// or when it launches a child into the space ([`Bus::ensure_joined`]),
+    /// so a run that never messages creates nothing (FD1).
+    pub fn prepare(&self, member: Member) {
+        let mut p = self.presence.write().unwrap_or_else(|e| e.into_inner());
+        if !matches!(*p, Presence::Joined(_)) {
+            *p = Presence::Pending(member);
+        }
+    }
+
+    /// Join now if the run was [prepared](Bus::prepare) and hasn't yet.
+    pub fn ensure_joined(&self) -> Result<(), BusError> {
+        let pending = match &*self.presence.read().unwrap_or_else(|e| e.into_inner()) {
+            Presence::Pending(m) => m.clone(),
+            Presence::Absent | Presence::Joined(_) => return Ok(()),
+        };
+        self.join(pending)
     }
 
     /// A bus for `participant` on the same space (a child sharing its
@@ -182,15 +222,17 @@ impl Bus {
                 },
             )?;
         }
-        *self.member.write().unwrap_or_else(|e| e.into_inner()) = Some(member);
-        self.mailbox.register_broadcast_cursor(&self.participant)
+        self.mailbox.register_broadcast_cursor(&self.participant)?;
+        *self.presence.write().unwrap_or_else(|e| e.into_inner()) = Presence::Joined(member);
+        Ok(())
     }
 
     /// Record that this run left the space with `status`. A run that never
     /// joined writes nothing.
     pub fn leave(&self, status: &str) -> Result<(), BusError> {
-        let Some(member) = self.member() else {
-            return Ok(());
+        let member = match &*self.presence.read().unwrap_or_else(|e| e.into_inner()) {
+            Presence::Joined(m) => m.clone(),
+            Presence::Absent | Presence::Pending(_) => return Ok(()),
         };
         let _lock = self.lock()?;
         append(
@@ -360,6 +402,7 @@ impl Bus {
         draft: Draft<'_>,
         apply: impl FnOnce(&LogMessage) -> Result<(), FleetError>,
     ) -> Result<SendReceipt, BusError> {
+        self.ensure_joined()?;
         let _lock = self.lock()?;
         let log_path = self.log_path();
         let size = std::fs::metadata(&log_path).map_or(0, |m| m.len());

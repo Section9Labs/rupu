@@ -1273,8 +1273,8 @@ fn rerun_args(invocation: &rupu_coverage::RerunInvocation) -> crate::cmd::run::A
         continue_from: None,
         model: None,
         provider: None,
-        fleet_run_dir: None,
-        fleet_participant: None,
+        message_space: None,
+        participant: None,
         launch: Default::default(),
     }
 }

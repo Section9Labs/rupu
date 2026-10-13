@@ -794,7 +794,15 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
             // standing directives into each turn. "lead" is the lead's participant
             // id (the `to: "lead"` inbox other participants address). One bus for
             // the whole run, so the lead's claims persist across rounds.
-            let bus = Arc::new(rupu_fleet::Bus::for_run_dir(&run_dir, "lead"));
+            // The lead stays joined across its rounds; the run records it
+            // leaving when the flow stops.
+            let bus = Arc::new(
+                rupu_fleet::Bus::open(&run_dir, rupu_fleet::address::LEAD)
+                    .with_caps(rupu_runtime::services::messaging::caps(
+                        &assembler.context().config,
+                    ))
+                    .staying(),
+            );
 
             // Spend: the flow's ledger, which the lead writes and every child
             // it launches is charged to (rollup copies from a unit process,
@@ -882,14 +890,15 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 ),
             ));
 
-            let mut collectors = crate::collectors::bus_collectors(&bus);
-            // The lead's ambient index of what it can dispatch: its pool, resolved
-            // against the catalog.
-            collectors.push(roster_collector(
+            // The lead's ambient index of what it can dispatch: its pool,
+            // resolved against the catalog. (Its messages and directives are
+            // delivered by the collectors the assembler gives every run in a
+            // message space.)
+            let collectors = vec![roster_collector(
                 def.pool.agents.clone(),
                 pool_workflows,
                 catalog.clone(),
-            ));
+            )];
             let lead_cfg = LeadConfig {
                 assembler,
                 agent: lead.agent,
@@ -910,7 +919,7 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 launcher: Some(lead_launcher),
                 workflow_generator,
                 flow_pool: Some(flow_pool),
-                message_bus: Some(bus),
+                message_bus: Some(Arc::clone(&bus)),
                 run_status: Some(run_status),
                 catalog: Some(catalog),
                 collectors,
@@ -956,6 +965,9 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 },
                 rupu_tools::ParentEnd::Stopped,
             ));
+            if let Err(e) = bus.leave("done") {
+                tracing::warn!(error = %e, "could not record the lead leaving the flow's message space");
+            }
             // Drop the driver here, in the blocking context its runtime ran in, before
             // anything else can return early.
             drop(lead);
@@ -1029,14 +1041,14 @@ mod tests {
     fn unit(launch: &ProcessLaunch) -> Unit {
         match &launch.argv {
             RunArgv::Agent(r) => {
-                let flow = r.flow.clone().expect("a unit joins its flow");
+                let space = r.message_space.clone().expect("a unit joins its flow");
                 Unit {
                     kind: ChildKind::Agent,
                     name: r.agent.clone(),
                     prompt: r.prompt.clone(),
                     engagement: r.engagement_profiles.clone(),
-                    participant: flow.participant,
-                    run_dir: flow.run_dir,
+                    participant: space.participant,
+                    run_dir: space.dir,
                     inputs: Vec::new(),
                     file: None,
                 }
@@ -2241,7 +2253,7 @@ mod tests {
         ));
         // (c) The tool ran for real: its success result came back to the model.
         assert!(
-            any_contains(&request_texts(&reqs[1]), "posted [note]"),
+            any_contains(&request_texts(&reqs[1]), "\"posted\":\"note\""),
             "{:?}",
             request_texts(&reqs[1])
         );
@@ -2260,6 +2272,7 @@ mod tests {
                     from: "worker-1".into(),
                     ts: "2026-10-05T11:59:00Z".into(),
                     body: "port 22 open on 10.0.0.5".into(),
+                    ..Default::default()
                 },
                 64,
             )
@@ -2468,6 +2481,7 @@ mod tests {
                 append_record(&paths, Ledger::Findings, &a_unit_finding("fnd_unit")).unwrap();
                 rupu_fleet::Board::new(run_dir.to_path_buf())
                     .post(&rupu_fleet::BoardPost {
+                        id: None,
                         author: spec.participant.clone(),
                         ts: "2026-10-05T12:00:01Z".into(),
                         kind: rupu_fleet::PostKind::Observation,

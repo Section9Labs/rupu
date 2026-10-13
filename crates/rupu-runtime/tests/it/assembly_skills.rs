@@ -932,6 +932,7 @@ async fn a_workflow_step_run_gets_its_agents_skills() {
         unit: None,
         step_actions: Vec::new(),
         scope_override: None,
+        messaging: None,
     };
     let l = launch(&home, spec, origin, "run_wf_step");
     let path = l.transcript_path.clone();

@@ -784,7 +784,10 @@ async fn from_cannot_be_spoofed() {
 
     let out = call(&lynx, "msg.send", json!({"to": "worker-1", "body": "hi"})).await;
     let id = json_of(&out)["id"].as_str().unwrap().to_string();
-    let logged = Bus::open(dir.path(), "x").read_log(None, 100).unwrap().lines;
+    let logged = Bus::open(dir.path(), "x")
+        .read_log(None, 100)
+        .unwrap()
+        .lines;
     assert_eq!(logged.len(), 1, "the refused call logged nothing");
     match &logged[0] {
         rupu_fleet::LogLine::Msg(m) => {
@@ -822,4 +825,30 @@ async fn log_size_cap() {
         other => panic!("a messaging_full notice: {other:?}"),
     }
     assert_eq!(Mailbox::new(dir.path()).drain("worker-1").unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn legacy_flow_reads() {
+    // An agentiflow written before the message log and the registry: the
+    // old post shape, and a unit's inbox under its sanitized `<agent>#n`
+    // name.
+    let dir = tempfile::tempdir().unwrap();
+    let flow = dir.path().join("agentiflows").join("af_old");
+    std::fs::create_dir_all(flow.join("board")).unwrap();
+    std::fs::write(
+        flow.join("board").join("posts.jsonl"),
+        "{\"author\":\"recon#1\",\"ts\":\"t\",\"kind\":\"observation\",\"body\":\"ssh is open\"}\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(flow.join("mailboxes").join("recon-1")).unwrap();
+
+    let lead = on(&flow, "lead");
+    let out = call(&lead, "board.read", json!({})).await;
+    assert_eq!(out.stdout, "t recon#1 [observation]: ssh is open");
+    let sent = json_of(&call(&lead, "msg.send", json!({"to": "recon#1", "body": "go on"})).await);
+    assert_eq!(sent["delivery"], json!({"resolved": ["recon#1"]}));
+    assert_eq!(
+        Mailbox::new(&flow).drain("recon#1").unwrap()[0].body,
+        "go on"
+    );
 }

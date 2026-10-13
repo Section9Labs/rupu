@@ -2035,6 +2035,32 @@ fn workflow_transcript_event_lines(
             indent: 0,
             kind: WorkflowViewLineKind::Event,
         }],
+        TxEvent::Message {
+            direction,
+            kind,
+            from,
+            to,
+            body,
+            ..
+        } => vec![WorkflowViewLine {
+            status: UiStatus::Active,
+            text: retained_workflow_event_line(UiStatus::Active, "message", &rupu_transcript::messages::message_line(*direction, kind, from, to.as_deref(), body)),
+            continuation: false,
+            indent: 0,
+            kind: WorkflowViewLineKind::Event,
+        }],
+        TxEvent::Injected {
+            source,
+            cadence,
+            content,
+            ..
+        } => vec![WorkflowViewLine {
+            status: UiStatus::Active,
+            text: retained_workflow_event_line(UiStatus::Active, "injected", &rupu_transcript::messages::injected_line(source, cadence, content)),
+            continuation: false,
+            indent: 0,
+            kind: WorkflowViewLineKind::Event,
+        }],
         TxEvent::SkillLoad {
             name,
             content_hash,

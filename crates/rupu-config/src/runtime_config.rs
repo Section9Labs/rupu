@@ -41,9 +41,27 @@ pub struct DispatchConfig {
     pub max_concurrent_children: Option<usize>,
 }
 
+/// `[messaging]` section of `config.toml` — a run's message space (spec
+/// F1a §4, FD3).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MessagingConfig {
+    /// Size past which a message space's log takes no more messages: a
+    /// further send fails to its sender with a `messaging_full` notice.
+    /// Unset ⇒ 64. The log is never trimmed.
+    pub log_max_mb: Option<u64>,
+}
+
 #[cfg(test)]
 mod tests {
     use crate::Config;
+
+    #[test]
+    fn messaging_section_parses() {
+        let cfg: Config = toml::from_str("[messaging]\nlog_max_mb = 8\n").unwrap();
+        assert_eq!(cfg.messaging.log_max_mb, Some(8));
+        assert!(toml::from_str::<Config>("[messaging]\nbogus = 1\n").is_err());
+    }
 
     #[test]
     fn dispatch_section_parses() {

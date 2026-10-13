@@ -1,10 +1,10 @@
 //! What a unit joining an agentiflow brings to its run (`rupu run
-//! --fleet-run-dir <dir> --fleet-participant <p>`): its message bus, the
-//! participant's ambient-context collectors, and the agentiflow's findings
-//! scope. The run assembler takes them as the launch's services and
-//! collectors (`rupu_runtime::assembly::Origin::FlowUnit`), and the origin's
-//! grant (`origin:flow_unit`) offers the board / mailbox catalog tools over
-//! the bus (W5).
+//! --message-space <dir> --participant <p>`): its message bus and the
+//! agentiflow's findings scope. The run assembler takes the bus as the
+//! launch's (`rupu_runtime::assembly::Origin::FlowUnit`), joins the run to
+//! the flow's space with it and attaches the collectors that deliver the
+//! unit's messages and directives; the origin's grant (`origin:flow_unit`)
+//! offers the board / mailbox catalog tools over it (W5, F1a).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -15,8 +15,6 @@ pub struct FlowUnitServices {
     /// `board.release` / `board.post` / `board.read` / `msg.send` act
     /// through it as `participant`.
     pub message_bus: Arc<rupu_fleet::Bus>,
-    /// The participant's inbox and the board's standing directives.
-    pub collectors: Vec<Arc<dyn rupu_agent::TurnCollector>>,
     /// The agentiflow id — the run dir's basename. Findings pool under
     /// `target_id(workspace, <id>)`, where the goal evaluator looks.
     pub flow_id: String,
@@ -26,11 +24,9 @@ impl FlowUnitServices {
     /// The services of `participant` in the agentiflow whose run dir is
     /// `run_dir`. The board and mailboxes are the SAME file-backed stores
     /// the lead created there.
-    pub fn for_participant(run_dir: &Path, participant: &str) -> Self {
-        let bus = Arc::new(rupu_fleet::Bus::for_run_dir(run_dir, participant));
+    pub fn for_participant(run_dir: &Path, participant: &str, caps: rupu_fleet::BusCaps) -> Self {
         Self {
-            collectors: crate::bus_collectors(&bus),
-            message_bus: bus,
+            message_bus: Arc::new(rupu_fleet::Bus::open(run_dir, participant).with_caps(caps)),
             flow_id: run_dir
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -47,10 +43,10 @@ mod tests {
     fn scopes_to_the_run_dir_and_brings_the_bus() {
         let tmp = tempfile::tempdir().unwrap();
         let run_dir = tmp.path().join("agentiflows").join("af_01TEST");
-        let s = FlowUnitServices::for_participant(&run_dir, "unit-x");
+        let s = FlowUnitServices::for_participant(&run_dir, "unit-x", Default::default());
         assert_eq!(s.flow_id, "af_01TEST");
         assert_eq!(s.message_bus.participant, "unit-x");
         assert_eq!(s.message_bus.board.root, run_dir);
-        assert!(!s.collectors.is_empty());
+        assert_eq!(s.message_bus.space(), run_dir);
     }
 }

@@ -26,6 +26,10 @@ pub enum Origin {
         /// The findings scope the run reports under, when not the
         /// workflow's name (an agentiflow-launched workflow unit).
         scope_override: Option<String>,
+        /// The workflow's `messaging:` tools (spec F1a §7), granted to the
+        /// step as `ambient:workflow_messaging`; `Some` also makes the step
+        /// join the run's message space.
+        messaging: Option<Vec<&'static str>>,
     },
     /// An in-process child started by `dispatch {kind: subagent}` (or a
     /// legacy `dispatch_agent`).
@@ -146,6 +150,7 @@ pub fn defaults_for(origin: &Origin) -> OriginDefaults {
             unit,
             step_actions,
             scope_override,
+            messaging,
         } => OriginDefaults {
             surface: Surface::Workflow,
             scope_name: Some(
@@ -167,7 +172,7 @@ pub fn defaults_for(origin: &Origin) -> OriginDefaults {
             scm: true,
             launcher: true,
             catalog: true,
-            origin_grant: None,
+            origin_grant: messaging.clone().map(AmbientGrant::workflow_messaging),
             admission: true,
         },
         // A child reports where its parent does (R4) and is charged to the

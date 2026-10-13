@@ -52,6 +52,10 @@ pub enum WorkflowParseError {
     InvalidMaxParallel { step: String, value: i64 },
     #[error("workflow: `max_concurrency` must be at least 1, got {value}")]
     InvalidMaxConcurrency { value: i64 },
+    /// `messaging: { tools: [...] }` names something that isn't a message
+    /// space tool.
+    #[error("workflow `messaging:`: {0}")]
+    Messaging(rupu_tools::GrantError),
     #[error(
         "step `{step}`: `parallel:` is mutually exclusive with `for_each:` and with the top-level `agent`/`prompt`"
     )]
@@ -1272,10 +1276,43 @@ pub struct Workflow {
     /// [`loop_internal_edges`], [`collapsed_graph_edges`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub loops: BTreeMap<String, LoopDef>,
+    /// Messaging for every agent step and unit (spec F1a §7): `true` grants
+    /// the board and `msg.send` ([`rupu_tools::WORKFLOW_MESSAGING`]),
+    /// `{ tools: [...] }` the message-space tools named, both as
+    /// `ambient:workflow_messaging`; set, the steps share the run's message
+    /// space. Children a step launches get only what their own `tools:` asks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messaging: Option<Messaging>,
     pub steps: Vec<Step>,
 }
 
+/// A workflow's `messaging:` key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Messaging {
+    /// `messaging: true` (or `false`, which is no messaging).
+    On(bool),
+    /// `messaging: { tools: [board.post, msg.send] }`.
+    Tools {
+        #[serde(default)]
+        tools: Vec<String>,
+    },
+}
+
 impl Workflow {
+    /// The message-space tools every agent step is granted, canonical;
+    /// `None` when the workflow has no `messaging:` (or `messaging: false`).
+    /// Valid by construction: [`Workflow::parse`] checks the names.
+    pub fn messaging_tools(&self) -> Option<Vec<&'static str>> {
+        match self.messaging.as_ref()? {
+            Messaging::On(false) => None,
+            Messaging::On(true) => Some(rupu_tools::WORKFLOW_MESSAGING.to_vec()),
+            Messaging::Tools { tools } => rupu_tools::ToolCatalog::builtin()
+                .resolve_messaging(tools)
+                .ok(),
+        }
+    }
+
     /// The findings profile an `action:` step's `findings.record` call
     /// records under: the step's own `findings_profile`, else
     /// `defaults.findings_profile`, else `full`. There is no agent
@@ -1358,6 +1395,11 @@ impl Workflow {
             if mc < 1 {
                 return Err(WorkflowParseError::InvalidMaxConcurrency { value: mc as i64 });
             }
+        }
+        if let Some(Messaging::Tools { tools }) = &wf.messaging {
+            rupu_tools::ToolCatalog::builtin()
+                .resolve_messaging(tools)
+                .map_err(WorkflowParseError::Messaging)?;
         }
         let mut seen = BTreeSet::new();
         for step in &wf.steps {

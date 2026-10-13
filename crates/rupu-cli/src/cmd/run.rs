@@ -65,16 +65,30 @@ pub struct Args {
     /// environment variable, which is still read for one release.
     #[arg(long, hide = true, value_name = "CODENAME", value_parser = parse_codename)]
     pub codename: Option<rupu_codename::Codename>,
-    /// Attach this run to an agentiflow's shared board + mailboxes: the
-    /// agentiflow run dir (`<global>/agentiflows/<id>`). Set by an
-    /// agentiflow lead when it spawns a pool unit; not for direct use.
-    /// Needs `--fleet-participant`.
-    #[arg(long, hide = true, value_name = "PATH", requires = "fleet_participant")]
-    pub fleet_run_dir: Option<std::path::PathBuf>,
-    /// This run's participant id on the agentiflow board (its inbox and the
-    /// owner of its claims). Needs `--fleet-run-dir`.
-    #[arg(long, hide = true, value_name = "ID", requires = "fleet_run_dir")]
-    pub fleet_participant: Option<String>,
+    /// Join a message space (spec F1a): its directory — an agentiflow's run
+    /// dir (`<global>/agentiflows/<id>`), whose pool unit the run then is,
+    /// or another run's `messages/` dir, whose child the run is. Set by the
+    /// run that launches this one; not for direct use. Needs
+    /// `--participant`. `--fleet-run-dir` is its old spelling.
+    #[arg(
+        long,
+        alias = "fleet-run-dir",
+        hide = true,
+        value_name = "PATH",
+        requires = "participant"
+    )]
+    pub message_space: Option<std::path::PathBuf>,
+    /// This run's address in the message space (its inbox, the author of
+    /// what it writes, the owner of its claims). Needs `--message-space`.
+    /// `--fleet-participant` is its old spelling.
+    #[arg(
+        long,
+        alias = "fleet-participant",
+        hide = true,
+        value_name = "ID",
+        requires = "message_space"
+    )]
+    pub participant: Option<String>,
     /// Findings contract for this run (`full` | `summary`), overriding the
     /// agent's `findingsProfile`. A placed workflow unit's coordinator
     /// passes its step's resolved profile this way.
@@ -143,18 +157,21 @@ pub(crate) fn parse_codename(s: &str) -> Result<rupu_codename::Codename, String>
         })
 }
 
-/// `--fleet-run-dir` and `--fleet-participant` come as a pair. clap already
+/// `--message-space` and `--participant` come as a pair. clap already
 /// refuses one without the other at parse time; this keeps `run_inner` honest
 /// for an `Args` built by hand.
-fn fleet_pair(args: &Args) -> anyhow::Result<Option<(&Path, &str)>> {
-    match (
-        args.fleet_run_dir.as_deref(),
-        args.fleet_participant.as_deref(),
-    ) {
+fn space_pair(args: &Args) -> anyhow::Result<Option<(&Path, &str)>> {
+    match (args.message_space.as_deref(), args.participant.as_deref()) {
         (Some(dir), Some(participant)) => Ok(Some((dir, participant))),
         (None, None) => Ok(None),
-        _ => anyhow::bail!("--fleet-run-dir and --fleet-participant must be given together"),
+        _ => anyhow::bail!("--message-space and --participant must be given together"),
     }
+}
+
+/// Whether a message space is an agentiflow's (its run dir) rather than
+/// another run's `messages/` dir: a run joining it is the flow's pool unit.
+fn is_flow_space(dir: &Path) -> bool {
+    dir.file_name().is_some_and(|n| n != "messages")
 }
 
 /// `rupu run <agent> [target] [prompt] …` — OR `rupu run pause|resume
@@ -641,13 +658,8 @@ struct RunListReport {
 
 pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     // Both-or-neither, refused before anything is touched.
-    let fleet = fleet_pair(&args)?.map(|(dir, participant)| {
-        (
-            dir.to_path_buf(),
-            participant.to_string(),
-            rupu_agentiflow::FlowUnitServices::for_participant(dir, participant),
-        )
-    });
+    let space =
+        space_pair(&args)?.map(|(dir, participant)| (dir.to_path_buf(), participant.to_string()));
     let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
 
@@ -1051,19 +1063,33 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         )?;
         let assembler = Arc::new(assembler.with_findings(findings_base));
 
-        // A fleet unit joins the agentiflow (its message bus, collectors and
-        // findings scope); every other `rupu run` is standalone.
-        let (origin, fleet_bus, fleet_collectors) = match fleet {
-            Some((flow_dir, participant, services)) => (
-                rupu_runtime::assembly::Origin::FlowUnit {
-                    flow_id: services.flow_id,
-                    flow_dir,
-                    participant,
-                },
-                Some(services.message_bus),
-                services.collectors,
+        // A run joining a message space: an agentiflow's pool unit (its
+        // bus and findings scope), or a child sharing its parent's space.
+        // Every other `rupu run` is standalone and has a space of its own.
+        let caps = rupu_runtime::services::messaging::caps(&cfg);
+        let (origin, space_bus) = match space {
+            Some((flow_dir, participant)) if is_flow_space(&flow_dir) => {
+                let services = rupu_agentiflow::FlowUnitServices::for_participant(
+                    &flow_dir,
+                    &participant,
+                    caps,
+                );
+                (
+                    rupu_runtime::assembly::Origin::FlowUnit {
+                        flow_id: services.flow_id,
+                        flow_dir,
+                        participant,
+                    },
+                    Some(services.message_bus),
+                )
+            }
+            Some((dir, participant)) => (
+                rupu_runtime::assembly::Origin::Standalone,
+                Some(Arc::new(
+                    rupu_fleet::Bus::open(&dir, participant).with_caps(caps),
+                )),
             ),
-            None => (rupu_runtime::assembly::Origin::Standalone, None, Vec::new()),
+            None => (rupu_runtime::assembly::Origin::Standalone, None),
         };
         let workspace = rupu_runtime::assembly::WorkspaceBinding {
             id: ws.id.clone(),
@@ -1199,12 +1225,12 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                 launcher: Some(launcher.clone()),
                 workflow_generator: Some(launcher),
                 netflow: Some(netflow_sink.clone()),
-                message_bus: fleet_bus,
+                message_bus: space_bus,
                 provider: Some(prepared),
                 skills: resolved_skills,
                 ..Default::default()
             },
-            collectors: fleet_collectors,
+            collectors: Vec::new(),
             link: launch_link.clone(),
         };
         // A run that cannot be assembled (its grant fails, its skills don't
@@ -1911,34 +1937,35 @@ mod tests {
     }
 
     #[test]
-    fn fleet_flags_parse_together() {
-        let a = launch_args(&[
-            "unit",
-            "--fleet-run-dir",
-            "/x/agentiflows/af_1",
-            "--fleet-participant",
-            "u",
-        ])
-        .unwrap();
-        assert_eq!(
-            a.fleet_run_dir.as_deref(),
-            Some(Path::new("/x/agentiflows/af_1"))
-        );
-        assert_eq!(a.fleet_participant.as_deref(), Some("u"));
-        assert!(fleet_pair(&a).unwrap().is_some());
+    fn message_space_flags_parse_together_under_both_spellings() {
+        for (space, participant) in [
+            ("--message-space", "--participant"),
+            ("--fleet-run-dir", "--fleet-participant"),
+        ] {
+            let a = launch_args(&["unit", space, "/x/agentiflows/af_1", participant, "u"]).unwrap();
+            assert_eq!(
+                a.message_space.as_deref(),
+                Some(Path::new("/x/agentiflows/af_1"))
+            );
+            assert_eq!(a.participant.as_deref(), Some("u"));
+            assert!(space_pair(&a).unwrap().is_some());
+        }
         let none = launch_args(&["unit"]).unwrap();
-        assert!(fleet_pair(&none).unwrap().is_none());
+        assert!(space_pair(&none).unwrap().is_none());
+        assert!(is_flow_space(Path::new("/g/agentiflows/af_1")));
+        assert!(!is_flow_space(Path::new("/g/runs/run_1/messages")));
     }
 
     #[test]
-    fn fleet_flags_refuse_one_without_the_other() {
+    fn message_space_flags_refuse_one_without_the_other() {
+        assert!(launch_args(&["unit", "--message-space", "/x"]).is_err());
+        assert!(launch_args(&["unit", "--participant", "u"]).is_err());
         assert!(launch_args(&["unit", "--fleet-run-dir", "/x"]).is_err());
-        assert!(launch_args(&["unit", "--fleet-participant", "u"]).is_err());
-        // An `Args` built by hand is refused by `fleet_pair` too.
+        // An `Args` built by hand is refused by `space_pair` too.
         let mut half = launch_args(&["unit"]).unwrap();
-        half.fleet_participant = Some("u".into());
-        let err = fleet_pair(&half).unwrap_err().to_string();
-        assert!(err.contains("--fleet-run-dir"), "{err}");
+        half.participant = Some("u".into());
+        let err = space_pair(&half).unwrap_err().to_string();
+        assert!(err.contains("--message-space"), "{err}");
     }
 
     #[test]

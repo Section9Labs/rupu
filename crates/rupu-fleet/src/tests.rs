@@ -317,3 +317,21 @@ fn legacy_flow_reads() {
         Undeliverable::UnknownParticipant
     );
 }
+
+#[test]
+fn a_prepared_run_joins_on_its_first_write_and_creates_nothing_before() {
+    let tmp = tempfile::tempdir().unwrap();
+    let space = tmp.path().join("messages");
+    let bus = Bus::open(&space, "heron");
+    bus.prepare(member("auditor", "r1", None, None));
+    assert!(!space.exists(), "nothing until the run writes");
+    assert!(!bus.is_joined());
+    bus.leave("done").unwrap();
+    assert!(!space.exists(), "a run that never joined never leaves");
+
+    bus.post(PostKind::Note, None, "first").unwrap();
+    assert!(bus.is_joined());
+    assert!(bus.roster().unwrap().get("heron").unwrap().live);
+    bus.leave("done").unwrap();
+    assert!(!bus.roster().unwrap().get("heron").unwrap().live);
+}
