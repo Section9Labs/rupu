@@ -40,7 +40,7 @@ pub use lead::{
     ProviderFactory, RunAgentLeadDriver,
 };
 pub use legacy_units::{units_on_disk, UnitKind, UnitOnDisk, UnitOutcome, UnitStatus};
-pub use operator::{OperatorMessage, OperatorQueue};
+pub use operator::{Control, OperatorQueue};
 pub use reaper::{
     finalize_failed, hard_stop, hard_stop_with, reap_orphaned_agentiflows,
     reap_orphaned_agentiflows_with, HardStopGrace, HardStopOutcome, ReapSummary,

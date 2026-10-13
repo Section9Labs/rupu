@@ -35,7 +35,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use rupu_agentiflow::{
     agentiflow_dir, units_on_disk, AgentiflowDef, AgentiflowRecord, Budget, CoverageTarget, Goal,
-    GoalTarget, OperatorMessage, OperatorQueue, Pool, RoundConfig, UnitOnDisk, UnitStatus,
+    GoalTarget, OperatorQueue, Pool, RoundConfig, UnitOnDisk, UnitStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -906,10 +906,10 @@ async fn get_agentiflow_events(
         .ok_or_else(|| ApiError::not_found(format!("no agentiflow run `{id}`")))
 }
 
-/// `POST /api/agentiflows/:id/steer` — queue an operator steering message for
-/// the lead, the same channel `rupu agentiflow send` writes. The lead drains
-/// the queue at the next round boundary (`now: true` also asks for a mid-round
-/// interrupt). A write, so `cp serve` only (501 otherwise). Refused (409)
+/// `POST /api/agentiflows/:id/steer` — send the lead an operator message
+/// through the run's message space, as `rupu agentiflow send` does (`now:
+/// true` marks it urgent, which ends the lead's round early), or with `stop:
+/// true` queue a graceful stop on the control queue. A write, so `cp serve` only (501 otherwise). Refused (409)
 /// unless a live coordinator will read it: the record must be `running` and
 /// its recorded `runner_pid` alive — a coordinator that died without
 /// finalizing leaves `running` on disk, and a message queued there is never
@@ -976,15 +976,40 @@ async fn steer_agentiflow(
         }
     };
     steerable(&id, &record)?;
-    let msg = OperatorMessage {
-        ts: Utc::now().to_rfc3339(),
+    if req.stop {
+        OperatorQueue::new(&run_dir)
+            .request_stop()
+            .map_err(|e| ApiError::internal(format!("could not queue a stop: {e}")))?;
+        return Ok(Json(SteerResponse { queued: true }));
+    }
+    use rupu_runtime::services::operator::{MessageRoot, OperatorSendError};
+    let root =
+        MessageRoot::resolve(&s.global_dir, &id).map_err(|e| ApiError::not_found(e.to_string()))?;
+    let msg = rupu_fleet::OperatorMessage {
+        to: rupu_fleet::Address::Lead,
         body,
-        stop: req.stop,
-        interrupt: req.now,
+        urgent: req.now,
+        via: rupu_fleet::OperatorVia::Cp,
+        viewer: None,
     };
-    OperatorQueue::new(&run_dir)
-        .enqueue(&msg)
-        .map_err(|e| ApiError::internal(format!("could not queue steering message: {e}")))?;
+    let caps = s
+        .config
+        .read()
+        .map(|c| rupu_runtime::services::messaging::caps(&c))
+        .unwrap_or_default();
+    root.operator_send(
+        &s.global_dir,
+        msg,
+        caps,
+        &rupu_agentiflow::coordinator_alive,
+    )
+    .map_err(|e| match e {
+        OperatorSendError::NotLive(why) => ApiError::conflict(why),
+        OperatorSendError::Bus(e @ rupu_fleet::FleetError::LogFull { .. }) => {
+            ApiError::conflict(e.to_string())
+        }
+        OperatorSendError::Bus(e) => ApiError::internal(format!("could not send the message: {e}")),
+    })?;
     Ok(Json(SteerResponse { queued: true }))
 }
 

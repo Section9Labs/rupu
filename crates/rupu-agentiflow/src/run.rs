@@ -14,12 +14,15 @@
 //!   usage.jsonl                the lead's usage ledger (one row per LLM call; metered
 //!                              with the units' own ledgers against `budget.usd` / `budget.tokens`)
 //!   lead/transcript.r<N>.jsonl the lead's transcript for round N
-//!   steering/*.json            the operator queue (OperatorQueue rooted at the run dir)
+//!   steering/*.json            the operator's control queue (OperatorQueue rooted at the run dir)
+//!   log.jsonl                  the message space's log (operator messages included)
+//!   participants.jsonl         who joined the space (the lead as the flow starts)
 //!   board/                     the coordination board (posts, claims, directives)
 //!   mailboxes/<participant>/   per-participant inboxes
 //! ```
 //!
-//! `board/` and `mailboxes/` are created lazily by the stores on first write.
+//! `log.jsonl`, `board/` and `mailboxes/` are created lazily by the stores on
+//! first write.
 //! The lead reaches them through always-on `board.*` / `msg.send` tools and
 //! reads them back each turn through the inbox / standing-directive collectors.
 //!
@@ -45,8 +48,8 @@
 //! - `run_started`: `id`, `name`, `goals` (count), `engagement_profiles`
 //! - `round`: written when a lead round FINISHES. `round` (zero-based index),
 //!   `budget` (`ok` / `soft` / `hard:<dimension>`), `converge` (bool),
-//!   `goals_met` / `goals_total` (as the round began), `steering` (messages
-//!   delivered), `outcome` (`yielded` / `turn_budget_hit` / `error`), `error`
+//!   `goals_met` / `goals_total` (as the round began), `steering` (the operator
+//!   messages the round's prompt recapped), `outcome` (`yielded` / `turn_budget_hit` / `error`), `error`
 //!   when the outcome is `error`, and `spent_usd` / `spent_tokens` (the run's
 //!   cumulative metered spend as the round ended: the lead's ledger plus every
 //!   launched unit's; see "Budget enforcement" on [`run_agentiflow`])
@@ -207,7 +210,7 @@ pub fn agentiflow_dir(global: &Path) -> PathBuf {
 }
 
 /// A fresh agentiflow id (`af_<ULID>`). The caller mints it so it can show
-/// the operator the id (and enqueue steering) before the run starts.
+/// the operator the id before the run starts.
 pub fn new_run_id() -> String {
     format!("af_{}", ulid::Ulid::new())
 }
@@ -542,7 +545,7 @@ impl LeadDriver for RecordingLead<'_> {
             "converge": d.converge,
             "goals_met": d.goals.iter().filter(|g| g.met).count(),
             "goals_total": d.goals.len(),
-            "steering": d.steering.len(),
+            "steering": d.operator_messages.len(),
             "outcome": outcome,
             "spent_usd": spend.usd,
             "spent_tokens": spend.tokens,
@@ -712,7 +715,7 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                     run_dir.display()
                 )));
             }
-            // `steering/` may already exist: an operator can queue a message for a run
+            // `steering/` may already exist: an operator can queue a stop for a run
             // they were told the id of before it started.
             std::fs::create_dir_all(run_dir.join("lead"))?;
 
@@ -740,10 +743,57 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 // the reaper and `stop` must signal, not the launching shell.
                 runner_pid: Some(std::process::id()),
             };
-            record.write(&run_dir)?;
+            let caps = rupu_runtime::services::messaging::caps(&assembler.context().config);
+            // The lead's coordination substrate: its bus on the file-backed board
+            // and mailboxes under the run dir (the `board.*` / `msg.send` catalog
+            // tools act through it), and the collectors that fold its inbox and
+            // standing directives into each turn. "lead" is the lead's participant
+            // id (the `to: "lead"` inbox other participants address). One bus for
+            // the whole run, so the lead's claims persist across rounds.
+            // The lead stays joined across its rounds; the run records it
+            // leaving when the flow stops.
+            let bus = Arc::new(
+                rupu_fleet::Bus::open(&run_dir, rupu_fleet::address::LEAD)
+                    .with_caps(caps)
+                    .staying(),
+            );
+            // The lead joins before the record says `running`, so from then on
+            // the operator reaches it, before its first round too. Each
+            // round's join (the assembler's) finds this member and writes
+            // nothing.
+            let member = rupu_fleet::Member {
+                codename: Some(lead_codename.clone()),
+                agent: lead.agent.name.clone(),
+                run_id: id.clone(),
+                step_id: None,
+                unit: None,
+                kind: rupu_runtime::services::messaging::member_kind(
+                    &rupu_runtime::Origin::FlowLead {
+                        flow_id: id.clone(),
+                        flow_dir: run_dir.clone(),
+                    },
+                    false,
+                )
+                .into(),
+                parent_run_id: None,
+                pid: Some(std::process::id()),
+            };
+            if let Err(e) = bus.join(member) {
+                tracing::warn!(error = %e, "could not join the lead to the flow's message space");
+            }
+            let leave_failed = || {
+                if let Err(e) = bus.leave("failed") {
+                    tracing::warn!(error = %e, "could not record the lead leaving the flow's message space");
+                }
+            };
+            if let Err(e) = record.write(&run_dir) {
+                leave_failed();
+                return Err(e.into());
+            }
 
             // From here a failure must not leave the record claiming `running`.
             let fail = |record: &mut AgentiflowRecord, e: std::io::Error| -> AgentiflowError {
+                leave_failed();
                 record.status = "failed".into();
                 record.stop_reason = Some(format!("error: {e}"));
                 record.ended_at = Some(now());
@@ -775,6 +825,7 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 cfg,
                 enforced.clone(),
                 OperatorQueue::new(&run_dir),
+                rupu_fleet::Bus::open(&run_dir, rupu_fleet::address::OPERATOR).with_caps(caps),
                 started,
             );
 
@@ -788,21 +839,6 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 ..assembler.context().findings.clone()
             };
             let assembler = Arc::new(assembler.with_findings(findings));
-            // The lead's coordination substrate: its bus on the file-backed board
-            // and mailboxes under the run dir (the `board.*` / `msg.send` catalog
-            // tools act through it), and the collectors that fold its inbox and
-            // standing directives into each turn. "lead" is the lead's participant
-            // id (the `to: "lead"` inbox other participants address). One bus for
-            // the whole run, so the lead's claims persist across rounds.
-            // The lead stays joined across its rounds; the run records it
-            // leaving when the flow stops.
-            let bus = Arc::new(
-                rupu_fleet::Bus::open(&run_dir, rupu_fleet::address::LEAD)
-                    .with_caps(rupu_runtime::services::messaging::caps(
-                        &assembler.context().config,
-                    ))
-                    .staying(),
-            );
 
             // Spend: the flow's ledger, which the lead writes and every child
             // it launches is charged to (rollup copies from a unit process,
@@ -923,9 +959,6 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 run_status: Some(run_status),
                 catalog: Some(catalog),
                 collectors,
-                // `rupu agentiflow send --now` interrupts through the same
-                // queue the envelope drains at each round boundary.
-                steering_queue: Some(OperatorQueue::new(&run_dir)),
             };
             let driver = match RunAgentLeadDriver::new(lead_cfg, lead.provider) {
                 Ok(d) => d,
@@ -1090,7 +1123,6 @@ mod tests {
             .expect("the child is in the ledger")
     }
     use crate::lead::ProviderFactory;
-    use crate::operator::OperatorMessage;
     use crate::verify_fixtures::full_finding;
     use rupu_agent::runner::CapturingMockProvider;
     use rupu_agent::{MockProvider, ScriptedTurn};
@@ -1574,19 +1606,34 @@ mod tests {
     }
 
     #[test]
+    fn the_lead_joins_its_space_once_as_the_flow_starts_and_leaves_at_its_end() {
+        let fx = fixture();
+        let id = "af_joined";
+        let out =
+            run_agentiflow(opts(&fx, def_with("round: { ceiling: { rounds: 2 } }"), id)).unwrap();
+        assert_eq!(out.rounds, 2);
+        let lines: Vec<Value> =
+            std::fs::read_to_string(run_dir(&fx, id).join("participants.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+        let events: Vec<(&str, &str)> = lines
+            .iter()
+            .map(|l| (l["t"].as_str().unwrap(), l["address"].as_str().unwrap()))
+            .collect();
+        assert_eq!(events, [("joined", "lead"), ("left", "lead")], "{lines:?}");
+        assert_eq!(lines[0]["kind"], "flow_lead");
+        assert_eq!(lines[0]["pid"], std::process::id());
+    }
+
+    #[test]
     fn an_operator_stop_enqueued_before_the_run_ends_it_at_round_zero() {
         let fx = fixture();
         let id = "af_opstop";
         // The operator queue is rooted at the run dir and exists before the
         // run starts (that is why the caller mints the id).
-        OperatorQueue::new(run_dir(&fx, id))
-            .enqueue(&OperatorMessage {
-                ts: "2026-10-05T12:00:00Z".into(),
-                body: "wrap up".into(),
-                stop: true,
-                interrupt: false,
-            })
-            .unwrap();
+        OperatorQueue::new(run_dir(&fx, id)).request_stop().unwrap();
 
         let out = run_agentiflow(opts(&fx, def_with(""), id)).unwrap();
         assert_eq!(out.stop, StopReason::OperatorStop);
@@ -1597,7 +1644,7 @@ mod tests {
         assert_eq!(rec.stop_reason.as_deref(), Some("operator_stop"));
         let evs = events(&fx, id);
         assert_eq!(kinds(&evs), ["run_started", "run_stopped"], "{evs:?}");
-        // The drained message was consumed from the steering queue.
+        // The stop was consumed from the queue.
         assert!(OperatorQueue::new(run_dir(&fx, id))
             .drain()
             .unwrap()
@@ -1656,14 +1703,7 @@ mod tests {
     }
 
     fn enqueue_stop(fx: &Fixture, id: &str) {
-        OperatorQueue::new(run_dir(fx, id))
-            .enqueue(&OperatorMessage {
-                ts: "2026-10-05T12:00:00Z".into(),
-                body: "stop".into(),
-                stop: true,
-                interrupt: false,
-            })
-            .unwrap();
+        OperatorQueue::new(run_dir(fx, id)).request_stop().unwrap();
     }
 
     #[test]

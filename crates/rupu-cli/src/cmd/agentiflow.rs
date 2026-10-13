@@ -40,8 +40,7 @@ use clap::Subcommand;
 use rupu_agentiflow::{
     agentiflow_dir, hard_stop, load_agentiflow_def, new_run_id, run_agentiflow, AgentiflowDef,
     AgentiflowRecord, Budget, CoverageTarget, EnvelopeOutcome, GenerationCapability, GoalTarget,
-    HardStopOutcome, LeadInputs, LeadProvider, OperatorMessage, OperatorQueue, ReapSummary,
-    RunAgentiflowOpts,
+    HardStopOutcome, LeadInputs, LeadProvider, OperatorQueue, ReapSummary, RunAgentiflowOpts,
 };
 use rupu_auth::CredentialResolver;
 use rupu_runtime::argv::{AgentiflowRun, RunArgv};
@@ -93,28 +92,26 @@ pub enum Action {
         /// a unique prefix / suffix of it.
         id: String,
     },
-    /// Send a steering message to a running agentiflow's lead.
+    /// Send a message to a running agentiflow's lead, as its operator.
     ///
-    /// The message is queued under the run's `steering/` directory and the
-    /// envelope hands it to the lead at the next round boundary. `--now` marks
-    /// it as an interrupt (for delivery mid-round); until the envelope acts on
-    /// that mark, it is still delivered at the round boundary. A run that
-    /// already finished takes no message.
+    /// The message goes into the run's message space and the lead receives it
+    /// before its next model call, mid-round included; the next round's
+    /// prompt recaps it. `--now` marks it urgent: it is put first, and the
+    /// lead's current round ends early so the lead turns to it. A run that
+    /// isn't running (finished, or its coordinator died) takes no message.
     Send {
         /// Run id (`af_...`): the full id, the compact form `list` prints, or
         /// a unique prefix / suffix of it.
         id: String,
         /// What to tell the lead.
         message: String,
-        /// Mark the message as an interrupt (mid-round delivery). Delivered at
-        /// the round boundary until the envelope acts on the mark.
+        /// Mark the message urgent and end the lead's current round early.
         #[arg(long)]
         now: bool,
     },
     /// Stop a running agentiflow.
     ///
-    /// By default the stop is graceful: it is queued like a steering message,
-    /// and the envelope winds the run down at the next round boundary (the
+    /// By default the stop is graceful: it is queued for the envelope, which winds the run down at the next round boundary (the
     /// units it launched are stopped with it). `--now` is the hard stop: it
     /// SIGTERMs the coordinator (and, for a detached run, the process group it
     /// leads, so what its lead's tools started goes too), SIGTERMs every unit
@@ -1252,7 +1249,7 @@ fn status_cmd(id: &str, format: Option<OutputFormat>) -> anyhow::Result<()> {
 // ---- `send` / `stop` --------------------------------------------------------
 
 /// Resolve `fragment` to a run and read its record. The run directory comes
-/// back with it: the steering queue lives there.
+/// back with it: the control queue lives there.
 fn load_run(
     global: &Path,
     fragment: &str,
@@ -1264,36 +1261,49 @@ fn load_run(
     Ok((id, run_dir, record))
 }
 
-fn enqueue_steering(run_dir: &Path, msg: &OperatorMessage) -> anyhow::Result<()> {
-    OperatorQueue::new(run_dir).enqueue(msg).with_context(|| {
-        format!(
-            "queue a message under {}",
-            run_dir.join("steering").display()
-        )
-    })
-}
-
-/// Queue a steering message for the run's lead. Returns the line to print.
-fn send(global: &Path, fragment: &str, message: &str, now: bool) -> anyhow::Result<String> {
-    let (id, run_dir, record) = load_run(global, fragment)?;
-    if record.status != "running" {
-        return Ok(format!("{id} already {}", record.status));
+/// Send `message` to the run's lead as the operator. Returns what to print:
+/// the message's id, and every recipient it did not reach and why.
+fn send(
+    global: &Path,
+    fragment: &str,
+    message: &str,
+    now: bool,
+    caps: rupu_fleet::BusCaps,
+) -> anyhow::Result<String> {
+    use rupu_runtime::services::operator::{MessageRoot, OperatorSendError};
+    let id = resolve_run_id(global, fragment)?;
+    let root = MessageRoot::resolve(global, &id)?;
+    let msg = rupu_fleet::OperatorMessage {
+        to: rupu_fleet::Address::Lead,
+        body: message.to_string(),
+        urgent: now,
+        via: rupu_fleet::OperatorVia::Cli,
+        viewer: None,
+    };
+    let receipt = root
+        .operator_send(global, msg, caps, &rupu_orchestrator::runs::pid_is_running)
+        .map_err(|e| match e {
+            OperatorSendError::NotLive(why) => anyhow!("{why}: it takes no message"),
+            OperatorSendError::Bus(e) => anyhow!(e).context(format!("send to the lead of {id}")),
+        })?;
+    let mut out = format!("sent {} to lead of {id}", receipt.id());
+    for u in &receipt.delivery().undelivered {
+        let reason = serde_json::to_value(u.reason)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        out.push_str(&format!("\nnot delivered to {}: {reason}", u.to));
     }
-    enqueue_steering(
-        &run_dir,
-        &OperatorMessage {
-            ts: Utc::now().to_rfc3339(),
-            body: message.to_string(),
-            stop: false,
-            interrupt: now,
-        },
-    )?;
-    Ok(format!("queued steering for {id}"))
+    Ok(out)
 }
 
 fn send_cmd(fragment: &str, message: &str, now: bool) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
-    println!("{}", send(&global, fragment, message, now)?);
+    let pwd = std::env::current_dir()?;
+    let project_root = paths::project_root_for(&pwd)?;
+    let cfg = paths::load_config_for_display(&global, project_root.as_deref(), &pwd, true);
+    let caps = rupu_runtime::services::messaging::caps(&cfg);
+    println!("{}", send(&global, fragment, message, now, caps)?);
     Ok(())
 }
 
@@ -1319,15 +1329,9 @@ fn stop(global: &Path, fragment: &str, now: bool) -> anyhow::Result<String> {
     if record.status != "running" {
         return Ok(format!("{id} already {}", record.status));
     }
-    enqueue_steering(
-        &run_dir,
-        &OperatorMessage {
-            ts: Utc::now().to_rfc3339(),
-            body: "operator stop".into(),
-            stop: true,
-            interrupt: false,
-        },
-    )?;
+    OperatorQueue::new(&run_dir)
+        .request_stop()
+        .with_context(|| format!("queue a stop under {}", run_dir.join("steering").display()))?;
     Ok(format!("requested graceful stop of {id}"))
 }
 
@@ -2520,10 +2524,10 @@ mod tests {
         use rupu_transcript::Event;
         assert_eq!(
             transcript_text(&Event::UserMessage {
-                content: "Operator steering:\n- focus on auth".into()
+                content: "Operator messages this round:\n- focus on auth".into()
             })
             .unwrap(),
-            "user: Operator steering:…"
+            "user: Operator messages this round:…"
         );
         assert_eq!(
             transcript_text(&Event::ToolCall {
@@ -3058,41 +3062,113 @@ pool:
 
     // ---- send / stop ---------------------------------------------------------
 
-    fn drained(global: &Path, id: &str) -> Vec<OperatorMessage> {
+    fn drained(global: &Path, id: &str) -> Vec<rupu_agentiflow::Control> {
         OperatorQueue::new(agentiflow_dir(global).join(id))
             .drain()
             .unwrap()
     }
 
-    #[test]
-    fn send_queues_a_steering_message_for_a_running_run() {
-        let tmp = seeded_global();
-        let g = tmp.path();
-        // The compact fragment `list` prints resolves, as it does for `status`.
-        let line = send(g, "01NEWER", "focus on auth", false).unwrap();
-        assert_eq!(line, "queued steering for af_01NEWER");
-        let line = send(g, "af_01NEWER", "drop that, now", true).unwrap();
-        assert_eq!(line, "queued steering for af_01NEWER");
-        let msgs = drained(g, "af_01NEWER");
-        assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[0].body, "focus on auth");
-        assert!(!msgs[0].stop && !msgs[0].interrupt);
-        assert_eq!(msgs[1].body, "drop that, now");
-        assert!(
-            !msgs[1].stop && msgs[1].interrupt,
-            "--now marks an interrupt"
-        );
-        assert!(chrono::DateTime::parse_from_rfc3339(&msgs[0].ts).is_ok());
+    fn caps() -> rupu_fleet::BusCaps {
+        rupu_fleet::BusCaps::default()
+    }
+
+    /// The flow's lead, joined to its space as a running flow's is.
+    fn join_lead(global: &Path, id: &str) -> rupu_fleet::Bus {
+        let bus =
+            rupu_fleet::Bus::open(&agentiflow_dir(global).join(id), rupu_fleet::address::LEAD);
+        bus.join(rupu_fleet::Member {
+            codename: None,
+            agent: "lead".into(),
+            run_id: id.into(),
+            step_id: None,
+            unit: None,
+            kind: "flow_lead".into(),
+            parent_run_id: None,
+            pid: None,
+        })
+        .unwrap();
+        bus
+    }
+
+    fn logged(bus: &rupu_fleet::Bus) -> Vec<rupu_fleet::LogMessage> {
+        bus.read_log(None, usize::MAX)
+            .unwrap()
+            .lines
+            .into_iter()
+            .filter_map(|l| match l {
+                rupu_fleet::LogLine::Msg(m) => Some(m),
+                rupu_fleet::LogLine::Seen { .. } => None,
+            })
+            .collect()
     }
 
     #[test]
-    fn send_and_stop_to_a_finished_run_say_so_and_queue_nothing() {
+    fn send_reaches_the_lead_through_the_message_space() {
         let tmp = seeded_global();
         let g = tmp.path();
+        let lead = join_lead(g, "af_01NEWER");
+        // The compact fragment `list` prints resolves, as it does for `status`.
+        let first = send(g, "01NEWER", "focus on auth", false, caps()).unwrap();
+        let second = send(g, "af_01NEWER", "drop that, now", true, caps()).unwrap();
+
+        let msgs = logged(&lead);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(first, format!("sent {} to lead of af_01NEWER", msgs[0].id));
+        assert_eq!(second, format!("sent {} to lead of af_01NEWER", msgs[1].id));
+        for m in &msgs {
+            assert_eq!(m.kind, rupu_fleet::MessageKind::Operator);
+            assert_eq!(m.from, "operator");
+            assert_eq!(m.via, Some(rupu_fleet::OperatorVia::Cli));
+            assert_eq!(m.delivery.resolved, ["lead"]);
+        }
+        assert_eq!(msgs[0].body, "focus on auth");
+        assert!(!msgs[0].urgent);
+        assert_eq!(msgs[1].body, "drop that, now");
+        assert!(msgs[1].urgent, "--now marks it urgent");
+        // In the lead's inbox, for its next model call; nothing queued.
+        assert_eq!(lead.mailbox.drain("lead").unwrap().len(), 2);
+        assert!(drained(g, "af_01NEWER").is_empty());
+    }
+
+    #[test]
+    fn send_says_who_a_message_did_not_reach() {
+        let tmp = seeded_global();
+        // The lead hasn't joined the space: logged, delivered to no one.
+        let line = send(tmp.path(), "af_01NEWER", "hello", false, caps()).unwrap();
+        let (sent, undelivered) = line.split_once('\n').expect("{line}");
+        assert!(sent.starts_with("sent msg_"), "{line}");
+        assert_eq!(undelivered, "not delivered to lead: no_lead");
+    }
+
+    #[test]
+    fn send_to_a_run_that_isnt_running_fails_naming_why() {
+        let tmp = seeded_global();
+        let g = tmp.path();
+        let msg = send(g, "af_01OLDER", "hello", false, caps())
+            .unwrap_err()
+            .to_string();
         assert_eq!(
-            send(g, "af_01OLDER", "hello", false).unwrap(),
-            "af_01OLDER already completed"
+            msg,
+            "agentiflow `af_01OLDER` is not running (completed): it takes no message"
         );
+        assert!(!agentiflow_dir(g).join("af_01OLDER/log.jsonl").exists());
+
+        // `running` on disk, but its coordinator is gone.
+        let dir = agentiflow_dir(g).join("af_01NEWER");
+        let mut rec = AgentiflowRecord::read(&dir).unwrap();
+        rec.runner_pid = Some(u32::MAX - 7);
+        rec.write(&dir).unwrap();
+        let msg = send(g, "af_01NEWER", "hello", true, caps())
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("is no longer running"), "{msg}");
+        assert!(!dir.join("log.jsonl").exists());
+    }
+
+    #[test]
+    fn stop_to_a_finished_run_says_so_and_queues_nothing() {
+        let tmp = seeded_global();
+        let g = tmp.path();
         for now in [false, true] {
             assert_eq!(
                 stop(g, "af_01OLDER", now).unwrap(),
@@ -3110,7 +3186,9 @@ pool:
     fn send_and_stop_refuse_an_unknown_or_ambiguous_run() {
         let tmp = seeded_global();
         let g = tmp.path();
-        let msg = send(g, "af_01MISSING", "x", false).unwrap_err().to_string();
+        let msg = send(g, "af_01MISSING", "x", false, caps())
+            .unwrap_err()
+            .to_string();
         assert!(
             msg.contains("no agentiflow run matches 'af_01MISSING'"),
             "{msg}"
@@ -3133,10 +3211,11 @@ pool:
             stop(g, "01NEWER", false).unwrap(),
             "requested graceful stop of af_01NEWER"
         );
-        let msgs = drained(g, "af_01NEWER");
-        assert_eq!(msgs.len(), 1);
-        assert!(msgs[0].stop && !msgs[0].interrupt);
-        assert_eq!(msgs[0].body, "operator stop");
+        let controls = drained(g, "af_01NEWER");
+        assert!(
+            matches!(controls.as_slice(), [rupu_agentiflow::Control::Stop { .. }]),
+            "{controls:?}"
+        );
         // The envelope, not the CLI, ends a graceful stop.
         let rec = AgentiflowRecord::read(&agentiflow_dir(g).join("af_01NEWER")).unwrap();
         assert_eq!(rec.status, "running");
