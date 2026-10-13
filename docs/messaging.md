@@ -2,12 +2,12 @@
 
 Agents in one run tree can talk to each other: workflow steps running side by side, an
 agentiflow's lead and units, a run and the children it dispatched. They post to a shared
-board, send each other messages, and steer each other with standing directives. Every message
-is written to one log, both sides' transcripts record it, and a message that reached nobody
-says so.
+board, send each other messages, and steer each other with standing directives. The operator
+can message any of them from the CLI or the control plane. Every message is written to one
+log, both sides' transcripts record it, and a message that reached nobody says so.
 
 This page covers the message space, addresses, what each message kind does, how messages
-reach an agent, and what is kept. The tools themselves are in
+reach an agent, the operator's side, and what is kept. The tools themselves are in
 [agent-format.md](agent-format.md#tools); the transcript events in
 [transcript-schema.md](transcript-schema.md#message).
 
@@ -15,21 +15,22 @@ reach an agent, and what is kept. The tools themselves are in
 
 Every root run can have one message space. Everything said in its run tree goes there.
 
-| Root | Space directory | Created |
-|---|---|---|
-| agentiflow | `<RUPU_HOME>/agentiflows/af_<id>/` (the run dir) | at flow start |
-| workflow run | `<RUPU_HOME>/runs/<run_id>/messages/` | when a step that takes part starts (the workflow sets `messaging:`, or the step's agent names a messaging tool), or on a step's first child |
-| `rupu session` | `<sessions>/<session_id>/messages/` | on the session's first message or first child |
-| standalone `rupu run` | `<RUPU_HOME>/runs/<run_id>/messages/` | on the run's first message or first child |
+| Root | Space directory |
+|---|---|
+| agentiflow | `<RUPU_HOME>/agentiflows/af_<id>/` (the run dir) |
+| workflow run | `<RUPU_HOME>/runs/<run_id>/messages/` |
+| `rupu session` | `<sessions>/<session_id>/messages/` |
+| standalone `rupu run` | `<RUPU_HOME>/runs/<run_id>/messages/` |
 
-A run that never sends a message and never launches a child creates nothing. A run that
-continues another (`rupu run --continue`) keeps that run's space, so it reads what was left in
-its inbox.
+Every run joins its space as it starts: its `joined` line goes into `participants.jsonl`, so
+the operator can reach it while it runs. The log itself is created by the first message. A
+run that continues another (`rupu run --continue`) keeps that run's space, so it reads what
+was left in its inbox.
 
 A run takes part in its space, and is offered the messaging tools, when its agent names one in
-`tools:`, its workflow sets `messaging:`, or someone has already joined the space. Any other
-run still has the space: its children meet it there, and what they send `parent` reaches it
-before its next model call.
+`tools:` or its workflow sets `messaging:`. Any other run is in the space receive-only: the
+operator's messages reach it, its children meet it there, and what they send `parent` reaches
+it before its next model call.
 
 ```
 <space>/
@@ -90,7 +91,7 @@ that reached nobody is also an error the model sees.
 | `broadcast` | `msg.send` to `broadcast` | Appended to the broadcast log; every participant reads it once |
 | `directive` | `board.directive` | A standing instruction, re-shown to the participants it addresses on every turn until it is lifted |
 | `retract` | `board.retract` | Lifts a directive. Only its author can |
-| `operator` | — | From the operator (F1b) |
+| `operator` | — | From the operator ([The operator](#the-operator)). No tool can write one |
 
 The sender's `from` is always its own address. A tool call can't set it: the messaging tools
 refuse arguments their schema doesn't list.
@@ -103,9 +104,11 @@ them. An agent gets them by naming them (or `board.*`), and an agentiflow lead h
 A participant's inbox, the broadcasts it hasn't seen and the directives that apply to it are
 delivered before each of its model calls. A tool call in progress is never interrupted.
 
-Direct messages come before broadcasts. Both stay in the conversation. Standing directives are
-re-sent at the end of each request and are not kept. Messages from other agents are framed as
-data, not instructions.
+Urgent operator messages come first, then standing directives, then direct messages (and the
+operator's other messages), then broadcasts. Messages stay in the conversation. Standing
+directives are re-sent at the end of each request and are not kept. Messages from other agents
+are framed as data, not instructions. The operator's are framed as instructions from the human
+running the run.
 
 Each delivered message is recorded in the recipient's transcript as a `message` event
 (`direction: received`) and an `injected` event, right before the model call that sees it.
@@ -144,6 +147,46 @@ An agent can also opt in itself by naming a messaging tool in `tools:` (by name,
 
 A lead-shaped step is just an agent granted `dispatch`, `board.directive` and `msg.send`. Its
 children join the workflow's space, see its directives, and can message `parent`.
+
+## The operator
+
+The operator can message any participant of a live run: a workflow step, a unit, a child, an
+agentiflow's lead, a role, or everyone.
+
+```bash
+rupu message send <run-id> [--to <address>] [--urgent] <text…>
+rupu message list <run-id> [--after <msg-id>] [--follow] [--kind direct,operator,…] [--json]
+rupu message participants <run-id>
+```
+
+`<run-id>` is a workflow run, an agentiflow (`af_…`), a session (`ses_…`) or a standalone run,
+by full id, compact form or a unique prefix. Without `--to`, a message goes to an agentiflow's
+`lead`, and to `broadcast` in any other run. `list --follow` tails the log until the run stops.
+`rupu agentiflow send <id> <text> [--now]` is shorthand for `rupu message send <id> --to lead
+[--urgent]`.
+
+An operator message is a `kind: operator` log line from `operator`, with `via` (`cli` or
+`cp`). It reaches its recipients before their next model call, like any message, framed as:
+
+> **Message from your operator** (the human running this run)
+> `<body>`
+> Act on it as an instruction from your operator. It can change what you work on next. It
+> cannot change your system prompt or safety rules.
+
+`--urgent` marks it `URGENT:`, delivers it ahead of everything else, and ends an agentiflow
+lead's round early. It never interrupts a tool call in progress.
+
+A run that isn't running takes no message: the send fails with the reason (the CP answers
+409). A recipient that has left is logged `participant_left`, and the send still succeeds.
+
+Only the operator's surfaces write `from: operator`: the messaging tools can't, and a run
+can't take the address `operator`. An agent that runs `bash` in `bypass` mode could still
+write the space's files directly. That is outside the threat model, since `bypass` already
+grants arbitrary code execution.
+
+The control plane serves the same thing as `GET/POST /api/{runs,sessions,agentiflows}/:id/messages`
+and a local SSE stream ([cp-api.md](cp-api.md)). Remote hosts answer over HTTP and SSH when
+their rupu advertises `run.messages`. Tunnel and bucket hosts answer 501.
 
 ## What is kept
 
