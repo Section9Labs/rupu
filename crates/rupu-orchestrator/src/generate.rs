@@ -144,25 +144,44 @@ pub fn build_system_prompt(
 /// The skills installed in the global layer and, when given, the project's,
 /// as entries a step's `skills:` accepts: a bare name, or `global:<name>` /
 /// `project:<name>` for a name both layers have (a bare one would be
-/// ambiguous). Lists directories only; no skill is loaded. Nothing when the
-/// skills directories can't be read.
+/// ambiguous). Lists directories only; no skill is loaded. A layer whose
+/// `skills/` can't be read is skipped with a warning; the other still lists.
 pub fn installed_skill_names(
     global_rupu_dir: &std::path::Path,
     project_rupu_dir: Option<&std::path::Path>,
 ) -> Vec<String> {
-    let dirs = rupu_skills::LayerDirs::for_layers(global_rupu_dir, project_rupu_dir);
-    let Ok(catalog) = rupu_skills::SkillCatalog::discover(&dirs) else {
-        return Vec::new();
-    };
-    let entries = catalog.entries();
-    entries
+    let both = rupu_skills::LayerDirs::for_layers(global_rupu_dir, project_rupu_dir);
+    let layers = [
+        rupu_skills::LayerDirs {
+            project: None,
+            ..both.clone()
+        },
+        rupu_skills::LayerDirs {
+            global: None,
+            ..both
+        },
+    ];
+    let mut found: Vec<(String, rupu_skills::Layer)> = Vec::new();
+    for dirs in &layers {
+        match rupu_skills::SkillCatalog::discover(dirs) {
+            Ok(catalog) => found.extend(
+                catalog
+                    .entries()
+                    .iter()
+                    .filter(|e| e.dir_name.parse::<rupu_skills::SkillName>().is_ok())
+                    .map(|e| (e.dir_name.clone(), e.layer)),
+            ),
+            Err(e) => tracing::warn!(error = %e, "skills layer unreadable; not listing its skills"),
+        }
+    }
+    found.sort();
+    found
         .iter()
-        .filter(|e| e.dir_name.parse::<rupu_skills::SkillName>().is_ok())
-        .map(|e| {
-            if catalog.named(&e.dir_name).count() > 1 {
-                format!("{}:{}", e.layer.as_str(), e.dir_name)
+        .map(|(name, layer)| {
+            if found.iter().filter(|(n, _)| n == name).count() > 1 {
+                format!("{}:{name}", layer.as_str())
             } else {
-                e.dir_name.clone()
+                name.clone()
             }
         })
         .collect()
@@ -408,6 +427,26 @@ mod tests {
         );
         assert_eq!(installed_skill_names(&global, None), vec!["pdf", "shared"]);
         assert!(installed_skill_names(&tmp.path().join("absent"), None).is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_skills_layer_hides_only_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("global");
+        let project = tmp.path().join("repo/.rupu");
+        std::fs::create_dir_all(global.join("skills/pdf")).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("skills"), "not a directory").unwrap();
+        assert_eq!(installed_skill_names(&global, Some(&project)), vec!["pdf"]);
+
+        let project = tmp.path().join("repo2/.rupu");
+        std::fs::create_dir_all(project.join("skills/notes")).unwrap();
+        std::fs::remove_dir_all(global.join("skills")).unwrap();
+        std::fs::write(global.join("skills"), "not a directory").unwrap();
+        assert_eq!(
+            installed_skill_names(&global, Some(&project)),
+            vec!["notes"]
+        );
     }
 
     #[test]
