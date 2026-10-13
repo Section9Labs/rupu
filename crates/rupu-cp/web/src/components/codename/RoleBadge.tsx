@@ -2,7 +2,7 @@ import { roleBadge } from '../../lib/codename';
 import type { BadgeShape } from '../../lib/codenamePalette.gen';
 import { useThemeMode } from './useThemeMode';
 
-function Shape({ shape, color }: { shape: BadgeShape; color: string }) {
+export function Shape({ shape, color }: { shape: BadgeShape; color: string }) {
   const fill = { fill: color };
   switch (shape) {
     case 'circle':

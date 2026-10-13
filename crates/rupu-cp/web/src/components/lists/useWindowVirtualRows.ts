@@ -30,13 +30,19 @@ export type VirtualSlot =
   | { kind: 'spacer'; key: string; px: number }
   | { kind: 'rows'; start: number; end: number };
 
-export function useWindowVirtualRows(keys: string[], enabled: boolean) {
-  const bodyRef = useRef<HTMLTableSectionElement | null>(null);
+export function useWindowVirtualRows<Body extends HTMLElement = HTMLTableSectionElement, Row extends HTMLElement = HTMLTableRowElement>(
+  keys: string[],
+  enabled: boolean,
+  /** A row kept mounted at its true position wherever the window is (an
+   *  anchor target being scrolled to), like the focused row. */
+  pinKey: string | null = null,
+) {
+  const bodyRef = useRef<Body | null>(null);
   const heights = useRef(new Map<string, number>());
-  const elements = useRef(new Map<string, HTMLTableRowElement>());
+  const elements = useRef(new Map<string, Row>());
   const targetKeys = useRef(new WeakMap<Element, string>());
   const observer = useRef<ResizeObserver | null>(null);
-  const refCallbacks = useRef(new Map<string, (el: HTMLTableRowElement | null) => void>());
+  const refCallbacks = useRef(new Map<string, (el: Row | null) => void>());
   const [viewport, setViewport] = useState({ top: 0, height: 0 });
   // Bumped when a measured height actually changed, to re-size the spacers.
   const [, setMeasureVersion] = useState(0);
@@ -47,8 +53,13 @@ export function useWindowVirtualRows(keys: string[], enabled: boolean) {
     const body = bodyRef.current;
     if (!enabled || !body) return;
     const rowKeyOf = (target: EventTarget | null): string | undefined => {
-      const tr = target instanceof Element ? target.closest('tr') : null;
-      return tr && body.contains(tr) ? targetKeys.current.get(tr) : undefined;
+      let el = target instanceof Element ? target : null;
+      while (el && el !== body) {
+        const key = targetKeys.current.get(el);
+        if (key !== undefined) return key;
+        el = el.parentElement;
+      }
+      return undefined;
     };
     const onFocusIn = (e: FocusEvent) => {
       const key = rowKeyOf(e.target);
@@ -178,7 +189,8 @@ export function useWindowVirtualRows(keys: string[], enabled: boolean) {
     if (px > 0) slots.push({ kind: 'spacer', key, px });
   };
   // A focused row outside [start, end) stays mounted at its true index.
-  const pinned = focusedKey === null ? -1 : keys.indexOf(focusedKey);
+  const pinnedKey = focusedKey ?? pinKey;
+  const pinned = pinnedKey === null ? -1 : keys.indexOf(pinnedKey);
   if (pinned >= 0 && pinned < start) {
     spacer('top', 0, pinned);
     slots.push({ kind: 'rows', start: pinned, end: pinned + 1 });

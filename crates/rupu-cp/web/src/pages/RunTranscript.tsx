@@ -9,11 +9,15 @@
 //
 // Route: /transcript (registered in App.tsx)
 
-import { useState } from 'react';
-import { useSearchParams, useNavigate } from 'react-router-dom';
+import { useMemo, useState } from 'react';
+import { useLocation, useSearchParams, useNavigate } from 'react-router-dom';
 import { ArrowLeft, ChevronDown, ChevronRight } from 'lucide-react';
 import TranscriptPanel from '../components/TranscriptPanel';
 import ChildrenPanel from '../components/run/ChildrenPanel';
+import MessageFeed from '../components/messages/MessageFeed';
+import { MessageLinksContext, type MessageLinks } from '../components/transcript/messageLinks';
+import { msgHash, parseMsgHash } from '../lib/messages';
+import { useMessageSpace } from '../lib/useMessageSpace';
 
 /** The run id a standalone run's transcript (`<transcripts>/<run_id>.jsonl`)
  *  is named after, or `null` for any other transcript. */
@@ -62,11 +66,66 @@ export default function RunTranscript() {
       {/* The children ledger is local-only: no section for a remote run. */}
       {childRunId && (!host || host === 'local') && <ChildrenSection runId={childRunId} />}
 
-      {/* TranscriptPanel fills the remaining page height and handles its own scroll */}
-      <div className="flex-1 min-h-0">
-        <TranscriptPanel path={path} live={live} host={host} runId={run} />
-      </div>
+      {childRunId ? (
+        <StandaloneRun runId={childRunId} path={path} live={live} host={host} run={run} />
+      ) : (
+        <div className="flex-1 min-h-0">
+          <TranscriptPanel path={path} live={live} host={host} runId={run} />
+        </div>
+      )}
     </div>
+  );
+}
+
+/** A standalone run's transcript, with its message space (spec F1c §3.3)
+ *  in a collapsible section above it once the run has one. */
+function StandaloneRun({ runId, path, live, host, run }: { runId: string; path: string; live: boolean; host?: string; run?: string }) {
+  const { hash, search } = useLocation();
+  const navigate = useNavigate();
+  const [open, setOpen] = useState(() => parseMsgHash(hash) !== null);
+  const messages = useMessageSpace({ route: 'runs', id: runId, host }, { live, load: live || open, reading: open });
+  const links = useMemo<MessageLinks>(
+    () => ({
+      openInFeed: (id) => {
+        setOpen(true);
+        navigate({ search, hash: msgHash(id) });
+      },
+    }),
+    [navigate, search],
+  );
+  const present = messages.space === 'present';
+  return (
+    <>
+      {present && (
+        <section className="rounded-xl border border-border bg-panel">
+          <button
+            type="button"
+            onClick={() => setOpen((o) => !o)}
+            aria-expanded={open}
+            className="flex w-full items-center gap-1.5 px-4 py-2 text-left text-sm font-medium text-ink"
+          >
+            {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+            Messages
+            {messages.unread > 0 && <span className="rounded-full bg-brand-600 px-1.5 text-[10px] font-semibold leading-4 text-white">{messages.unread}</span>}
+          </button>
+          {open && (
+            <div className="px-4 pb-3">
+              <MessageFeed
+                route="runs"
+                space={messages}
+                notLiveReason={live ? null : 'This run has finished: messages only reach a running run.'}
+                highlightId={parseMsgHash(hash)}
+              />
+            </div>
+          )}
+        </section>
+      )}
+      <div className="flex-1 min-h-0">
+        <MessageLinksContext.Provider value={present ? links : {}}>
+          <TranscriptPanel path={path} live={live} host={host} runId={run} />
+        </MessageLinksContext.Provider>
+      </div>
+    </>
   );
 }
 

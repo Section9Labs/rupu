@@ -14,7 +14,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { Archive, ArrowLeft, FileText, GitBranch, GitFork, ListOrdered, Network as NetworkIcon, Pause, ShieldAlert, Trash2 } from 'lucide-react';
+import { Archive, ArrowLeft, FileText, GitBranch, GitFork, ListOrdered, MessagesSquare, Network as NetworkIcon, Pause, ShieldAlert, Trash2 } from 'lucide-react';
 import {
   api,
   ApiError,
@@ -37,6 +37,11 @@ import RunGraph, { type NodeSelection } from '../components/RunGraph';
 import RunEventFeed, { type ConnectionState, type SeqEvent } from '../components/RunEventFeed';
 import RunWarningsBanner from '../components/RunWarningsBanner';
 import TranscriptPanel from '../components/TranscriptPanel';
+import MessageFeed from '../components/messages/MessageFeed';
+import { MessageLinksContext, type MessageLinks } from '../components/transcript/messageLinks';
+import { msgHash, parseMsgHash } from '../lib/messages';
+import { useMessageSpace } from '../lib/useMessageSpace';
+import type { SpaceParticipant } from '../lib/api';
 import StepTranscriptBrowser from '../components/run/StepTranscriptBrowser';
 import RunUsageTimeline from '../components/charts/RunUsageTimeline';
 import AutoflowPanel from '../components/AutoflowPanel';
@@ -63,7 +68,7 @@ import { parseCallHash, useToolCallAnchor } from '../lib/toolCallAnchor';
 
 const MAX_EVENTS = 2000;
 
-type Tab = 'transcript' | 'events' | 'findings' | 'children' | 'cycles' | 'netflow';
+type Tab = 'transcript' | 'events' | 'findings' | 'children' | 'cycles' | 'netflow' | 'messages';
 
 /** Padding around the run's own span for the Network tab's default
  *  window (the approved mockup's ±5 minutes) — see the render-site
@@ -83,6 +88,14 @@ function padIso(iso: string, deltaMs: number): string {
  * selection, so this is informational); `null` means "whole run".
  */
 type Selection = { stepId: string; unitIndex?: number } | null;
+
+/** The step (and fan-out unit) a message-space participant ran as. */
+function selectionOf(model: RunGraphModel, p: SpaceParticipant): Selection {
+  const node = p.step_id ? model.nodeById(p.step_id) : undefined;
+  if (!node) return null;
+  const unit = p.unit != null ? node.fanout?.units.find((u) => u.key === p.unit || String(u.index) === p.unit) : undefined;
+  return unit ? { stepId: node.id, unitIndex: unit.index } : { stepId: node.id };
+}
 
 /**
  * Per-gate approve/reject UI state for the MULTI-gate banner (Task 5b-2b,
@@ -166,7 +179,7 @@ export default function RunDetail() {
   const [searchParams] = useSearchParams();
   const host = searchParams.get('host') ?? undefined;
   const navigate = useNavigate();
-  const { hash } = useLocation();
+  const { hash, search } = useLocation();
 
   // Full graph state (used for both local and remote runs).
   const [graph, setGraph] = useState<RunGraphResponse | null>(null);
@@ -180,6 +193,15 @@ export default function RunDetail() {
   useEffect(() => {
     if (parseCallHash(hash) !== null) setTab('transcript');
   }, [hash]);
+  // A `#msg-<id>` link opened from elsewhere lands on the Messages tab; the
+  // in-page links set the tab themselves.
+  useEffect(() => {
+    if (parseMsgHash(hash) !== null) setTab('messages');
+  }, [id]);
+  const [messagesOpened, setMessagesOpened] = useState(false);
+  useEffect(() => {
+    if (tab === 'messages') setMessagesOpened(true);
+  }, [tab]);
 
   // Live state, fed by the single SSE subscription below.
   const [events, setEvents] = useState<SeqEvent[]>([]);
@@ -496,7 +518,6 @@ export default function RunDetail() {
   const positions = useMemo<Map<string, Pos>>(() => {
     if (!model) return new Map<string, Pos>();
     return layoutGraph(model);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nodeIdsKey]);
 
   // The effective run record from the graph.
@@ -586,6 +607,30 @@ export default function RunDetail() {
 
   const effectiveStatus = liveRunStatus ?? run?.status ?? 'pending';
   const isRunning = effectiveStatus === 'running' || effectiveStatus === 'pending';
+
+  // The run's message space: probed always (the tab shows only when there is
+  // one), read in full once the tab is opened, followed while the run is live
+  // so the tab can count what arrives.
+  const messages = useMessageSpace(
+    { route: 'runs', id, host },
+    { live: isRunning && !!run, load: (isRunning && !!run) || messagesOpened, reading: tab === 'messages' },
+  );
+  const messageLinks = useMemo<MessageLinks>(() => {
+    const openAt = (address: string, msgId: string) => {
+      const p = messages.participants.find((x) => x.address === address);
+      const sel = p && model ? selectionOf(model, p) : null;
+      if (sel) setSelection(sel);
+      setTab('transcript');
+      navigate({ search, hash: msgHash(msgId) });
+    };
+    return {
+      openInFeed: (msgId) => {
+        setTab('messages');
+        navigate({ search, hash: msgHash(msgId) });
+      },
+      openParticipant: openAt,
+    };
+  }, [messages.participants, model, navigate, search]);
 
   // Live usage (spec 2026-09-29 §7): polls GET /api/runs/:id/usage every 2s
   // while the run is live (and once more when it turns terminal). `runKnown`
@@ -1318,6 +1363,9 @@ export default function RunDetail() {
               label={childrenCount === null ? 'Children' : `Children (${childrenCount})`}
             />
           )}
+          {messages.space === 'present' && (
+            <TabButton active={tab === 'messages'} onClick={() => setTab('messages')} icon={MessagesSquare} label="Messages" badge={messages.unread} />
+          )}
           <TabButton active={tab === 'netflow'} onClick={() => setTab('netflow')} icon={NetworkIcon} label="Network" />
           {autoflowCtx && (
             <TabButton active={tab === 'cycles'} onClick={() => setTab('cycles')} icon={GitBranch} label="Cycles" />
@@ -1356,6 +1404,7 @@ export default function RunDetail() {
           </div>
         )}
         {tab === 'transcript' && (
+          <MessageLinksContext.Provider value={messages.space === 'present' ? messageLinks : {}}>
           <SubrunIdentityContext.Provider value={subrunIdentities}>
             <div className="flex h-full min-h-0 flex-col overflow-auto">
               {selection && selectedFanout ? (
@@ -1384,6 +1433,22 @@ export default function RunDetail() {
               )}
             </div>
           </SubrunIdentityContext.Provider>
+          </MessageLinksContext.Provider>
+        )}
+        {tab === 'messages' && (
+          <div className="h-full min-h-0 overflow-auto">
+            <MessageFeed
+              route="runs"
+              space={messages}
+              workflow
+              notLiveReason={isRunning ? null : `This run is ${effectiveStatus.replace(/_/g, ' ')}: messages only reach a running run.`}
+              openInTranscript={(m) => {
+                const p = messages.participants.find((x) => x.address === m.from);
+                return p && model && selectionOf(model, p) ? () => messageLinks.openParticipant?.(m.from, m.id) : null;
+              }}
+              highlightId={parseMsgHash(hash)}
+            />
+          </div>
         )}
         {tab === 'events' && (
           <div className="h-full min-h-0">

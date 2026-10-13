@@ -7,9 +7,9 @@
 //   • a secondary, collapsed "Session details" disclosure (usage chart + fields)
 // Route: /sessions/:id
 
-import { useEffect, useRef, useState } from 'react';
-import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { Archive, ArrowLeft, RotateCcw, Trash2 } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
+import { Archive, ArrowLeft, MessageCircle, MessagesSquare, RotateCcw, Trash2 } from 'lucide-react';
 import {
   api,
   apiErrorMessage,
@@ -30,6 +30,11 @@ import { Button } from '../components/ui/Button';
 import { Spinner } from '../components/ui/Spinner';
 import RunUsageTimeline from '../components/charts/RunUsageTimeline';
 import SessionConversation from '../components/session/SessionConversation';
+import MessageFeed from '../components/messages/MessageFeed';
+import { MessageLinksContext, type MessageLinks } from '../components/transcript/messageLinks';
+import { TabButton } from '../components/TabBar';
+import { msgHash, parseMsgHash } from '../lib/messages';
+import { useMessageSpace } from '../lib/useMessageSpace';
 
 // ---------------------------------------------------------------------------
 // Component
@@ -43,6 +48,29 @@ export default function SessionDetailPage() {
 
   const [session, setSession] = useState<SessionSummary | null>(null);
   const [sessionError, setSessionError] = useState<string | null>(null);
+
+  // The session's message space (spec F1c §3.3): a Messages view beside the
+  // conversation, shown when the space exists.
+  const { hash, search } = useLocation();
+  const [view, setView] = useState<'conversation' | 'messages'>(() => (parseMsgHash(hash) ? 'messages' : 'conversation'));
+  const [messagesOpened, setMessagesOpened] = useState(view === 'messages');
+  useEffect(() => {
+    if (view === 'messages') setMessagesOpened(true);
+  }, [view]);
+  const sessionLive = !!session && sessionStatusTone(session.status) !== 'stopped';
+  const messages = useMessageSpace(
+    { route: 'sessions', id, host },
+    { live: sessionLive, load: sessionLive || messagesOpened, reading: view === 'messages' },
+  );
+  const messageLinks = useMemo<MessageLinks>(
+    () => ({
+      openInFeed: (msgId) => {
+        setView('messages');
+        navigate({ search, hash: msgHash(msgId) });
+      },
+    }),
+    [navigate, search],
+  );
 
   // Archive / restore / delete action state.
   const [actionPending, setActionPending] = useState(false);
@@ -423,8 +451,36 @@ export default function SessionDetailPage() {
         </details>
       </header>
 
+      {messages.space === 'present' && (
+        <div className="flex shrink-0 items-center gap-1 border-b border-border bg-panel/40 px-6 py-1.5">
+          <TabButton active={view === 'conversation'} onClick={() => setView('conversation')} icon={MessageCircle} label="Conversation" />
+          <TabButton active={view === 'messages'} onClick={() => setView('messages')} icon={MessagesSquare} label="Messages" badge={messages.unread} />
+        </div>
+      )}
+
+      {view === 'messages' && messages.space === 'present' ? (
+        <div className="flex-1 overflow-y-auto px-6 py-4">
+          <MessageFeed
+            route="sessions"
+            space={messages}
+            notLiveReason={stopped ? 'This session is stopped: messages only reach a live session.' : null}
+            openInTranscript={(m) => {
+              const p = messages.participants.find((x) => x.address === m.from);
+              if (p?.kind !== 'session_turn') return null;
+              return () => {
+                setView('conversation');
+                navigate({ search, hash: msgHash(m.id) });
+              };
+            }}
+            highlightId={parseMsgHash(hash)}
+          />
+        </div>
+      ) : (
+      <>
       {/* Conversation — the growing, scrolling chat body. */}
-      <SessionConversation session={session} runs={runs ?? []} onTurnComplete={reload} />
+      <MessageLinksContext.Provider value={messages.space === 'present' ? messageLinks : {}}>
+        <SessionConversation session={session} runs={runs ?? []} onTurnComplete={reload} />
+      </MessageLinksContext.Provider>
 
       {/* Composer — pinned at the bottom. */}
       <div className="shrink-0 border-t border-border bg-panel px-6 py-3">
@@ -499,6 +555,8 @@ export default function SessionDetailPage() {
           </div>
         </div>
       </div>
+      </>
+      )}
     </div>
   );
 }

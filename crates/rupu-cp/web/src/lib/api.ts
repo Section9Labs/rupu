@@ -830,23 +830,6 @@ export interface AgentiflowDetail {
   asset_scope?: { ws_id: string; target_id: string } | null;
 }
 
-/** One board message — a fire-and-forget post the fleet writes to itself. */
-export interface AgentiflowBoardPost {
-  kind?: string;
-  author?: string;
-  addressed_to?: string | null;
-  ts?: string;
-  body?: string;
-  [k: string]: unknown;
-}
-
-/** `GET /api/agentiflows/:id/messages` — the engagement's board (how the
- *  agents talk to each other). */
-export interface AgentiflowMessages {
-  posts: AgentiflowBoardPost[];
-  directives: AgentiflowBoardPost[];
-}
-
 /** The endpoint family a message space is reached through: a `run_…` id
  *  under `runs`, `ses_…` under `sessions`, `af_…` under `agentiflows`. */
 export type MessageRoute = 'runs' | 'sessions' | 'agentiflows';
@@ -944,23 +927,6 @@ async function orUnavailable<T>(p: Promise<T>): Promise<T | MessagesUnavailable>
 
 function messagesPath(route: MessageRoute, id: string): string {
   return `/api/${route}/${encodeURIComponent(id)}/messages`;
-}
-
-/** The board MessageFeed renders, read from a space's view: its posts, and
- *  its directives with each retraction as `{retract: <id>}`. */
-export function boardOf(view: MessagesView): AgentiflowMessages {
-  const posts: AgentiflowBoardPost[] = [];
-  const directives: AgentiflowBoardPost[] = [];
-  for (const m of view.messages) {
-    if (m.kind === 'post') {
-      posts.push({ id: m.id, kind: m.post_kind, author: m.from, addressed_to: m.to, ts: m.ts, body: m.body });
-    } else if (m.kind === 'directive') {
-      directives.push({ id: m.id, author: m.from, addressed_to: m.to, ts: m.ts, body: m.body });
-    } else if (m.kind === 'retract' && m.refs?.retracts) {
-      directives.push({ retract: m.refs.retracts });
-    }
-  }
-  return { posts, directives };
 }
 
 /** One asset from `GET /api/assets` — a node in an engagement's asset graph
@@ -3146,12 +3112,6 @@ export const api = {
     return request<AgentiflowDetail>(`/api/agentiflows/${encodeURIComponent(id)}`, { signal: opts?.signal });
   },
 
-  /** The engagement's board — the messages the fleet posts to each other —
-   *  read from its message space (`boardOf`). */
-  async getAgentiflowMessages(id: string, opts?: Cancellable): Promise<AgentiflowMessages> {
-    return boardOf(await request<MessagesView>(messagesPath('agentiflows', id), { signal: opts?.signal }));
-  },
-
   /** A run's, session's or agentiflow's message space, here or on `host`.
    *  A host that can't serve it (501) is `unavailable`, with the reason. */
   getMessages(
@@ -3191,11 +3151,20 @@ export const api = {
     );
   },
 
-  /** The SSE URL of a space's live log on this host (remote hosts are
-   *  polled with `getMessages`). Each frame's data is a
-   *  `MessageStreamFrame`. */
-  messagesStreamUrl(route: MessageRoute, id: string): string {
-    return `${messagesPath(route, id)}/stream`;
+  /** Follow a space's log on this host (remote hosts are polled with
+   *  `getMessages`): every line from the start, then each as it is
+   *  appended. The browser reconnects with `Last-Event-ID` (a line number),
+   *  so a reconnect resumes rather than replays. */
+  subscribeMessages(
+    route: MessageRoute,
+    id: string,
+    handlers: { onFrame: (f: MessageStreamFrame) => void; onOpen?: () => void; onError?: (e: Event) => void },
+  ): () => void {
+    const es = new EventSource(`${messagesPath(route, id)}/stream`);
+    es.onmessage = (m) => handlers.onFrame(JSON.parse(m.data) as MessageStreamFrame);
+    if (handlers.onOpen) es.onopen = handlers.onOpen;
+    if (handlers.onError) es.onerror = handlers.onError;
+    return () => es.close();
   },
 
   /** The engagement's granular event feed: the coordinator lifecycle merged with
@@ -3203,16 +3172,6 @@ export const api = {
    *  Rendered through the shared RunEventFeed / EventCard. */
   getAgentiflowEvents(id: string, opts?: Cancellable): Promise<{ events: AgentiflowEvent[] }> {
     return request<{ events: AgentiflowEvent[] }>(`/api/agentiflows/${encodeURIComponent(id)}/events`, { signal: opts?.signal });
-  },
-
-  /** Message the lead (the `rupu agentiflow send` channel: the server sends
-   *  it as a message to `lead`), or with `stop` wind the run down. `now` asks
-   *  for mid-round delivery. */
-  async steerAgentiflow(id: string, body: { message: string; now?: boolean; stop?: boolean }): Promise<void> {
-    await request(`/api/agentiflows/${encodeURIComponent(id)}/steer`, {
-      method: 'POST',
-      body: JSON.stringify(body),
-    });
   },
 
   /** Engagement assets (hosts/services/sites/routes/files). Optionally scoped
