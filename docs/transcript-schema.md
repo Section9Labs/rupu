@@ -77,7 +77,7 @@ with no `schema` key is version 1.
 
 Fields and events have been added within version 2 since it shipped (`outcome`, `recovery`,
 `assistant_block`, `customer`, `codename`, `cache_write_tokens`, `purpose`, `skill_index`,
-`skill_load`, `launch_skills`, `launch_preload_skills`). A reader should
+`skill_load`, `launch_skills`, `launch_preload_skills`, `message`, `injected`). A reader should
 accept a missing optional key and an unknown event type (see
 [Unknown event types](#unknown-event-types)).
 
@@ -429,6 +429,53 @@ A skill's content entered the conversation. Written for every load, whichever pa
 
 ---
 
+### `message`
+
+A message the run sent or received in its message space (see [messaging.md](messaging.md)).
+`sent` is written right after the messaging tool's `tool_result`. `received` is written when a
+collector delivers it, right before the model call that sees it, one event per message, ahead
+of the `injected` event that carries it.
+
+| Field           | Type    | Description |
+|-----------------|---------|-------------|
+| `id`            | string  | The message's id in the space's `log.jsonl` (`msg_<ULID>`) |
+| `direction`     | string  | `sent` or `received` |
+| `from`          | string  | The sender's address (`lynx#1`, `lead`, `operator`) |
+| `from_codename` | string? | The sender's full codename |
+| `to`            | string? | The address it was sent to, as recorded (`role:recon`, `lynx#2`, `broadcast`); absent for an unaddressed post |
+| `kind`          | string  | `post`, `direct`, `broadcast`, `directive`, `retract` or `operator` |
+| `body`          | string  | The text |
+| `urgent`        | bool    | Absent unless true (operator messages) |
+| `via`           | string  | `tool` (the run called a messaging tool) or `injected` (a collector delivered it) |
+| `delivery`      | object? | On `sent`: `{resolved: [address…], undelivered: [{to, reason}…]}` as logged |
+
+```json
+{"type":"message","data":{"id":"msg_01J…","direction":"sent","from":"lynx#1","to":"role:recon","kind":"direct","body":"port 22 is open","via":"tool","delivery":{"resolved":["otter#1"]}}}
+```
+
+---
+
+### `injected`
+
+Context a collector put in front of the model. Every `once` injection is written, at the point
+it joined the conversation, so replay re-inserts it. An `every_turn` injection is written only
+when its content changed since the turn before, so a standing directive is one line, not one
+per turn.
+
+| Field         | Type     | Description |
+|---------------|----------|-------------|
+| `source`      | string   | Who it is from (`mailbox:lynx#1`, `broadcast:lynx#1`, `directive:board`, `roster`, `children`) |
+| `kind`        | string   | `message`, `directive`, `observation` or `status` |
+| `cadence`     | string   | `once` (kept in the conversation) or `every_turn` (sent with each request, never kept) |
+| `content`     | string   | The collector's text, before the injected-data framing the model sees |
+| `message_ids` | string[] | The messages it delivers; absent when none |
+
+```json
+{"type":"injected","data":{"source":"mailbox:otter#1","kind":"message","cadence":"once","content":"from lynx#1 at 2026-10-13T…: port 22 is open","message_ids":["msg_01J…"]}}
+```
+
+---
+
 ### `gate_requested`
 
 Defined, but **not written by current rupu**: workflow approval gates are recorded on the
@@ -550,7 +597,7 @@ A runtime intervention worth showing that is not part of the conversation.
 
 | Field     | Type   | Description |
 |-----------|--------|-------------|
-| `kind`    | string | `model_limits` (the run's input and output limits and where each came from, written at start and on a fallback hop), `model_limits_clamped`, `context_trim`, `provider_retry`, `server_side_fallback_disabled`, `permission_mode_degraded` (ask mode with no operator to ask), `tool_unavailable` (a tool named in `tools:` that this run can't serve; one per tool, right after `tool_grant`), `skill_not_indexed` (a granted skill marked `disable-model-invocation` that isn't preloaded, so the model can't load it), `skill_changed` (a skill loaded at a newer version than the run's `skill_index` recorded), `skill_missing` (a loaded skill no longer installed when it was due to be re-attached, or, at a session turn's start, a skill the session froze that can't be given now), `skill_tools_missing` (a loaded skill's `allowed-tools` names tools the run wasn't granted) or `skill_reattach_truncated` (loaded skills that didn't fit under the re-attach cap after a compaction). Expect new kinds; render an unknown one by its `message` |
+| `kind`    | string | `model_limits` (the run's input and output limits and where each came from, written at start and on a fallback hop), `model_limits_clamped`, `context_trim`, `provider_retry`, `server_side_fallback_disabled`, `permission_mode_degraded` (ask mode with no operator to ask), `tool_unavailable` (a tool named in `tools:` that this run can't serve; one per tool, right after `tool_grant`), `skill_not_indexed` (a granted skill marked `disable-model-invocation` that isn't preloaded, so the model can't load it), `skill_changed` (a skill loaded at a newer version than the run's `skill_index` recorded), `skill_missing` (a loaded skill no longer installed when it was due to be re-attached, or, at a session turn's start, a skill the session froze that can't be given now), `skill_tools_missing` (a loaded skill's `allowed-tools` names tools the run wasn't granted), `skill_reattach_truncated` (loaded skills that didn't fit under the re-attach cap after a compaction) or `messaging_full` (the run's message log reached `[messaging].log_max_mb`, so a send failed; written after that call's `tool_result`). Expect new kinds; render an unknown one by its `message` |
 | `message` | string | Human-readable text |
 
 ```json
@@ -710,10 +757,11 @@ skill_index?                # the skills bound, when the run has any
 seed?                       # a run seeded from earlier history
 user_message?
 (turn_start
+   (message* injected)*     # what the collectors delivered before this turn's model call
    usage+                   # one per provider call; a compaction call adds one with purpose
    outcome?                 # a non-normal reply, ahead of the turn's content
    (thinking_delta* thinking | assistant_delta* assistant_message | assistant_block)*
-   (tool_call  tool_result  (skill_load notice*)?  file_edit?  command_run?  tool_audit)*
+   (tool_call  tool_result  (skill_load notice*)?  file_edit?  command_run?  (message | notice)?  tool_audit)*
  turn_end
  recovery*
  (skill_load | notice)*  compaction?)*
@@ -748,9 +796,12 @@ continuing an interrupted step, a session's next turn). The rules:
 - Drop a turn with no `turn_end` (it was in flight) and a turn whose `turn_end` is
   `discarded`. A `recovery` with `merge_into_previous` joins the next turn's reply onto the
   previous assistant message.
+- An `injected` event with `cadence: once` adds its `content`, framed as the runner framed
+  it, as a user message at its position. An `every_turn` one was sent with that turn's request
+  only, so it adds nothing.
 - A `compaction` replaces everything so far with its `messages`.
 
 A version 1 transcript rebuilds without reasoning blocks. Deltas, `usage`, `notice`,
-`outcome`, `tool_grant`, `tool_audit`, `skill_index`, `skill_load`, `net_flow` and unknown
-events don't affect the conversation. The skills a run loaded are folded from its
+`outcome`, `tool_grant`, `tool_audit`, `skill_index`, `skill_load`, `message`, `net_flow`
+and unknown events don't affect the conversation. The skills a run loaded are folded from its
 `skill_load` events separately, so a continued run knows what to re-attach.

@@ -64,6 +64,7 @@ Resolution rules match agents:
 | `notifyIssue` | bool | no | `false` | Auto-comment only when the run target is an issue |
 | `concerns` | list | no | none | Coverage concern catalog for every agent step; replaces each step agent's own `concerns:` for this run (see `docs/coverage.md#workflow-level-concerns`) |
 | `max_concurrency` | integer | no | unbounded | Cap on nodes the graph scheduler runs at once (see [`max_concurrency:`](#max_concurrency)) |
+| `messaging` | bool or `{tools: [...]}` | no | off | Grants every agent step and unit the message-space tools (`true`: `board.claim`/`release`/`post`/`read` and `msg.send`; `{tools: [...]}`: the `board.*`/`msg.*` tools named) as `ambient:workflow_messaging`, and makes the steps share the run's message space (see [messaging.md](messaging.md)) |
 | `loops` | map | no | `{}` | Named bounded subgraph loops (see [`loops:`](#loops)) |
 | `steps` | array<Step> | yes | — | Ordered step list |
 

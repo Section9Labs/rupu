@@ -302,6 +302,16 @@ Child runs an agent starts with `dispatch` (see
 
 ---
 
+## `[messaging]`
+
+A run's message space (see [messaging.md](messaging.md)).
+
+| Key          | Type    | Default | Notes |
+|--------------|---------|---------|-------|
+| `log_max_mb` | integer | `64`    | Size past which a space's `log.jsonl` takes no more messages. A further send fails to its sender with an error and a `messaging_full` notice. The log is never trimmed. Receipts are still written |
+
+---
+
 ## `[policy]`
 
 | Key    | Type            | Default | Notes |
