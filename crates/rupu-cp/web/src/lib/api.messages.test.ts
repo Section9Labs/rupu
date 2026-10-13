@@ -28,7 +28,7 @@ const VIEW: MessagesView = {
       ts: '2026-10-07T22:16:00Z',
       kind: 'directive',
       from: 'lead',
-      to: 'broadcast',
+      to: null,
       body: 'stay in scope',
       delivery: { resolved: ['recon#1'] },
       seen: [{ by: 'recon#1', turn: 3, at: '2026-10-07T22:16:05Z' }],
@@ -54,6 +54,16 @@ const VIEW: MessagesView = {
       urgent: true,
       via: 'cp',
       delivery: { resolved: ['lead'] },
+      seen: [],
+    },
+    {
+      id: 'msg_5',
+      ts: '2026-10-07T22:19:00Z',
+      kind: 'directive',
+      from: 'lead',
+      to: 'recon#1',
+      body: 'skip the printers',
+      delivery: { resolved: ['recon#1'] },
       seen: [],
     },
   ],
@@ -136,8 +146,15 @@ describe('messages API', () => {
         },
       ],
       directives: [
-        { id: 'msg_2', author: 'lead', ts: '2026-10-07T22:16:00Z', body: 'stay in scope' },
+        { id: 'msg_2', author: 'lead', addressed_to: null, ts: '2026-10-07T22:16:00Z', body: 'stay in scope' },
         { retract: 'msg_2' },
+        {
+          id: 'msg_5',
+          author: 'lead',
+          addressed_to: 'recon#1',
+          ts: '2026-10-07T22:19:00Z',
+          body: 'skip the printers',
+        },
       ],
     });
 

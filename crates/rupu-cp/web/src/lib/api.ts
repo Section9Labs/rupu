@@ -955,7 +955,7 @@ export function boardOf(view: MessagesView): AgentiflowMessages {
     if (m.kind === 'post') {
       posts.push({ id: m.id, kind: m.post_kind, author: m.from, addressed_to: m.to, ts: m.ts, body: m.body });
     } else if (m.kind === 'directive') {
-      directives.push({ id: m.id, author: m.from, ts: m.ts, body: m.body });
+      directives.push({ id: m.id, author: m.from, addressed_to: m.to, ts: m.ts, body: m.body });
     } else if (m.kind === 'retract' && m.refs?.retracts) {
       directives.push({ retract: m.refs.retracts });
     }
