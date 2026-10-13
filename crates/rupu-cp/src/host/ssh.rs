@@ -64,16 +64,38 @@ pub fn resume_argv(run_id: &str, if_unfinished: bool) -> RunArgv {
 /// remote predates `--codename`, so the codename went as `RUPU_CODENAME`.
 const LAUNCH_CODENAME_ENV: &str = "rupu-launch: codename-env";
 
-/// Printed, instead of launching, by a launch carrying workflow-step skills
-/// ([`SshHostConnector::detach_launch_argv`]) whose remote `rupu __features`
+/// Printed, instead of launching, by the skills gate
+/// ([`SshHostConnector::skills_gate`]) when the remote `rupu __features`
 /// doesn't list [`CAP_AGENT_SKILLS`]: its `rupu run` would reject `--skill`
 /// and the detached unit would die without a trace.
 const LAUNCH_SKILLS_UNSUPPORTED: &str = "rupu-launch: skills-unsupported";
 
-/// Printed, instead of launching, by a launch carrying workflow-step skills
+/// Printed, instead of launching, by the skills gate
 /// when `rupu` is not on the remote's non-interactive PATH, so the refusal
 /// names the missing binary rather than an old one.
 const LAUNCH_RUPU_NOT_FOUND: &str = "rupu-launch: rupu-not-found";
+
+/// Whether `argv` is an agent launch carrying workflow-step skills.
+fn carries_skills(argv: &RunArgv) -> bool {
+    matches!(
+        argv,
+        RunArgv::Agent(a) if !a.skills.is_empty() || !a.preload_skills.is_empty()
+    )
+}
+
+/// Captures the remote `rupu __features` report into `$f`, once per command.
+fn features_capture() -> String {
+    let probe = build_remote_command(&["rupu".to_string(), FEATURES_SUBCOMMAND.to_string()]);
+    format!("f=$({probe} 2>/dev/null)")
+}
+
+/// A shell test: the report in `$f` ([`features_capture`]) lists `feature`.
+fn features_list(feature: &str) -> String {
+    format!(
+        "printf '%s\\n' \"$f\" | grep -qF {}",
+        shell_escape(&format!("\"{feature}\""))
+    )
+}
 
 /// Printed by [`resume_command`] when it dispatched `--if-unfinished`.
 const RESUME_GUARDED: &str = "rupu-resume: if-unfinished";
@@ -1925,13 +1947,10 @@ impl SshHostConnector {
     /// The remote's feature report is captured once, into `$f`, and both
     /// gates read it.
     ///
-    /// A launch carrying workflow-step skills is wrapped in a second gate,
-    /// checked before anything is written on the remote: it runs only when
-    /// the report lists [`CAP_AGENT_SKILLS`], and otherwise prints
-    /// [`LAUNCH_SKILLS_UNSUPPORTED`] and creates nothing. Skills change what
-    /// a run does, so there is no downgraded form to run instead. A remote
-    /// with no `rupu` on its non-interactive PATH prints
-    /// [`LAUNCH_RUPU_NOT_FOUND`] instead, so the refusal says what is wrong.
+    /// A launch carrying workflow-step skills is wrapped in the skills gate
+    /// ([`Self::skills_gate`]) as a backstop: `launch_agent` has already
+    /// sent the same gate as its own command
+    /// ([`Self::skills_gate_command`]) before creating the mirror run.
     fn detach_launch_argv(
         argv: &RunArgv,
         run_id: &str,
@@ -1940,28 +1959,17 @@ impl SshHostConnector {
         let current = argv.to_shell("rupu");
         let (legacy, _) = argv.for_peer(&FeatureSet::shell_peer(Vec::<String>::new()));
         let legacy = legacy.to_shell("rupu");
-        let needs_skills = matches!(
-            argv,
-            RunArgv::Agent(a) if !a.skills.is_empty() || !a.preload_skills.is_empty()
-        );
+        let needs_skills = carries_skills(argv);
         if legacy == current && !needs_skills {
             return Self::detach_launch(&current, run_id, working_dir);
         }
-        let probe = build_remote_command(&["rupu".to_string(), FEATURES_SUBCOMMAND.to_string()]);
-        let capture = format!("f=$({probe} 2>/dev/null)");
-        let lists = |feature: &str| {
-            format!(
-                "printf '%s\\n' \"$f\" | grep -qF {}",
-                shell_escape(&format!("\"{feature}\""))
-            )
-        };
         let launch = |redirect: &str| {
             if legacy == current {
                 detach_fragment(&current, redirect)
             } else {
                 format!(
                     "if {}; then {}; else echo {}; {}; fi",
-                    lists(CAP_RUN_CODENAME_FLAG),
+                    features_list(CAP_RUN_CODENAME_FLAG),
                     detach_fragment(&current, redirect),
                     shell_escape(LAUNCH_CODENAME_ENV),
                     detach_fragment(&legacy, redirect),
@@ -1970,17 +1978,54 @@ impl SshHostConnector {
         };
         if !needs_skills {
             return Self::detach_launch_with(run_id, working_dir, |redirect| {
-                format!("{capture}; {}", launch(redirect))
+                format!("{}; {}", features_capture(), launch(redirect))
             });
         }
         let launch = Self::detach_launch_with(run_id, working_dir, launch)?;
-        Ok(format!(
-            "if ! command -v rupu >/dev/null 2>&1; then echo {}; else {capture}; \
-             if {}; then {launch}; else echo {}; fi; fi",
+        Ok(Self::skills_gate(&launch))
+    }
+
+    /// The skills gate: captures the remote's feature report into `$f` and
+    /// runs `then` only when it lists [`CAP_AGENT_SKILLS`]; otherwise it
+    /// prints [`LAUNCH_SKILLS_UNSUPPORTED`] and creates nothing. Skills
+    /// change what a run does, so there is no downgraded form to run
+    /// instead. A remote with no `rupu` on its non-interactive PATH prints
+    /// [`LAUNCH_RUPU_NOT_FOUND`] instead, so the refusal says what is wrong.
+    fn skills_gate(then: &str) -> String {
+        format!(
+            "if ! command -v rupu >/dev/null 2>&1; then echo {}; else {}; \
+             if {}; then {then}; else echo {}; fi; fi",
             shell_escape(LAUNCH_RUPU_NOT_FOUND),
-            lists(CAP_AGENT_SKILLS),
+            features_capture(),
+            features_list(CAP_AGENT_SKILLS),
             shell_escape(LAUNCH_SKILLS_UNSUPPORTED),
-        ))
+        )
+    }
+
+    /// [`Self::skills_gate`] with nothing to run: prints a marker exactly
+    /// when the launch's own gate would refuse.
+    fn skills_gate_command() -> String {
+        Self::skills_gate(":")
+    }
+
+    /// The refusal a skills-gate marker in `stdout` stands for.
+    fn skills_gate_refusal(&self, stdout: &str) -> Option<HostConnectorError> {
+        let printed = |marker: &str| stdout.lines().any(|l| l.trim() == marker);
+        if printed(LAUNCH_RUPU_NOT_FOUND) {
+            return Some(HostConnectorError::Unsupported(format!(
+                "host {}: rupu was not found on the remote's PATH (`command -v rupu` failed in a \
+                 non-interactive ssh session); install rupu there or put it on that PATH",
+                self.host_id
+            )));
+        }
+        if printed(LAUNCH_SKILLS_UNSUPPORTED) {
+            return Some(HostConnectorError::Unsupported(format!(
+                "host {} runs a rupu without workflow-step skills support, so this unit's \
+                 skills cannot be delivered; upgrade rupu there",
+                self.host_id
+            )));
+        }
+        None
     }
 
     fn detach_launch_with(
@@ -2742,6 +2787,23 @@ impl HostConnector for SshHostConnector {
         // `launch_run`.
         let detached = Self::detach_launch_argv(&argv, &run_id, req.working_dir.as_deref())?;
 
+        // A remote that can't take the skills refuses before the mirror run
+        // exists, as the other transports do: one extra command, only for a
+        // launch carrying skills.
+        if carries_skills(&argv) {
+            let out = self
+                .exec
+                .run(&Self::skills_gate_command())
+                .await
+                .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
+            if !out.success {
+                return Err(HostConnectorError::Unreachable(out.stderr));
+            }
+            if let Some(refusal) = self.skills_gate_refusal(&out.stdout) {
+                return Err(refusal);
+            }
+        }
+
         self.mirror
             .create_run(&run_id, &self.host_id, &spec)
             .await
@@ -2760,22 +2822,9 @@ impl HostConnector for SshHostConnector {
             let _ = self.mirror.finish(&run_id, &self.host_id, "failed").await;
             return Err(HostConnectorError::Unreachable(out.stderr));
         }
-        let printed = |marker: &str| out.stdout.lines().any(|l| l.trim() == marker);
-        if printed(LAUNCH_RUPU_NOT_FOUND) {
+        if let Some(refusal) = self.skills_gate_refusal(&out.stdout) {
             let _ = self.mirror.finish(&run_id, &self.host_id, "failed").await;
-            return Err(HostConnectorError::Unsupported(format!(
-                "host {}: rupu was not found on the remote's PATH (`command -v rupu` failed in a \
-                 non-interactive ssh session); install rupu there or put it on that PATH",
-                self.host_id
-            )));
-        }
-        if printed(LAUNCH_SKILLS_UNSUPPORTED) {
-            let _ = self.mirror.finish(&run_id, &self.host_id, "failed").await;
-            return Err(HostConnectorError::Unsupported(format!(
-                "host {} runs a rupu without workflow-step skills support, so this unit's \
-                 skills cannot be delivered; upgrade rupu there",
-                self.host_id
-            )));
+            return Err(refusal);
         }
         if out.stdout.lines().any(|l| l.trim() == LAUNCH_CODENAME_ENV) {
             tracing::info!(
@@ -3853,12 +3902,14 @@ mod tests {
     }
 
     /// A launch carrying workflow-step skills runs only on a remote whose
-    /// `rupu __features` lists `agent.skills`, decided by the remote in the
-    /// one launch command (through a real shell against fake remotes, with a
-    /// codename so the codename gate shares the one feature report). Any
-    /// other remote prints [`LAUNCH_SKILLS_UNSUPPORTED`], and a remote with
-    /// no `rupu` on its PATH prints [`LAUNCH_RUPU_NOT_FOUND`]; either runs
-    /// nothing and leaves no run directory behind.
+    /// `rupu __features` lists `agent.skills`, decided by the remote (through
+    /// a real shell against fake remotes, with a codename so the codename
+    /// gate shares the launch's one feature report) twice: by the gate
+    /// command sent before the mirror run exists, and again by the launch
+    /// command as a backstop. Any other remote prints
+    /// [`LAUNCH_SKILLS_UNSUPPORTED`], and a remote with no `rupu` on its PATH
+    /// prints [`LAUNCH_RUPU_NOT_FOUND`]; either command then runs nothing
+    /// and leaves no run directory behind.
     #[test]
     fn a_launch_with_skills_runs_only_on_a_remote_advertising_them() {
         use super::*;
@@ -3872,6 +3923,7 @@ mod tests {
         run.prompt = Some("go".into());
         let cmd = SshHostConnector::detach_launch_argv(&RunArgv::Agent(run), "run_01SKILLS", None)
             .unwrap();
+        let gate = SshHostConnector::skills_gate_command();
         // (why, `__features` body, rupu on PATH, marker printed — none = launches)
         let cases = [
             ("current rupu", format!("echo '{report}'"), true, None),
@@ -3916,31 +3968,42 @@ mod tests {
             } else {
                 "/usr/bin:/bin".to_string()
             };
-            let out = std::process::Command::new("/bin/sh")
-                .arg("-c")
-                .arg(&cmd)
-                .env("HOME", home.path())
-                .env("PATH", path)
-                .output()
-                .expect("the launch shell itself must run");
-            assert!(out.status.success(), "{why}: {out:?}");
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let printed: Vec<&str> = [LAUNCH_SKILLS_UNSUPPORTED, LAUNCH_RUPU_NOT_FOUND]
-                .into_iter()
-                .filter(|m| stdout.lines().any(|l| l.trim() == *m))
-                .collect();
-            assert_eq!(
-                printed,
-                marker.into_iter().collect::<Vec<_>>(),
-                "{why}: {out:?}"
-            );
-            if on_path {
+            let run_shell = |what: &str, command: &str| {
+                let _ = std::fs::remove_file(&probes);
+                let out = std::process::Command::new("/bin/sh")
+                    .arg("-c")
+                    .arg(command)
+                    .env("HOME", home.path())
+                    .env("PATH", &path)
+                    .output()
+                    .expect("the shell itself must run");
+                assert!(out.status.success(), "{why}, {what}: {out:?}");
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let printed: Vec<&str> = [LAUNCH_SKILLS_UNSUPPORTED, LAUNCH_RUPU_NOT_FOUND]
+                    .into_iter()
+                    .filter(|m| stdout.lines().any(|l| l.trim() == *m))
+                    .collect();
                 assert_eq!(
-                    std::fs::read_to_string(&probes).unwrap(),
-                    "x\n",
-                    "{why}: `rupu __features` runs once per launch"
+                    printed,
+                    marker.into_iter().collect::<Vec<_>>(),
+                    "{why}, {what}: {out:?}"
                 );
-            }
+                if on_path {
+                    assert_eq!(
+                        std::fs::read_to_string(&probes).unwrap(),
+                        "x\n",
+                        "{why}, {what}: `rupu __features` runs once per command"
+                    );
+                }
+            };
+            run_shell("gate", &gate);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(!seen.exists(), "{why}: the gate launched the unit");
+            assert!(
+                !home.path().join(".rupu").exists(),
+                "{why}: the gate left files on the remote"
+            );
+            run_shell("launch", &cmd);
             if marker.is_some() {
                 std::thread::sleep(std::time::Duration::from_millis(300));
                 assert!(!seen.exists(), "{why}: the unit ran without its skills");
@@ -9259,6 +9322,10 @@ mod tests {
             .unwrap();
 
         let cmds = fake.commands.lock().unwrap();
+        assert!(
+            !cmds.contains(&SshHostConnector::skills_gate_command()),
+            "a launch without skills sends no skills gate: {cmds:?}"
+        );
         let launch = cmds
             .iter()
             .find(|c| c.contains("setsid"))
@@ -9396,6 +9463,18 @@ mod tests {
             .await
             .unwrap();
         let cmds = fake.commands.lock().unwrap();
+        assert_eq!(
+            cmds.first(),
+            Some(&SshHostConnector::skills_gate_command()),
+            "the skills gate runs first, as its own command: {cmds:?}"
+        );
+        assert_eq!(
+            cmds.iter()
+                .filter(|c| c.contains(FEATURES_SUBCOMMAND))
+                .count(),
+            2,
+            "one gate command and one launch, nothing more: {cmds:?}"
+        );
         let launch = cmds
             .iter()
             .find(|c| c.contains("'rupu' 'run' 'recon'"))
@@ -9410,43 +9489,62 @@ mod tests {
         );
     }
 
-    /// The remote's own `rupu __features` lacked `agent.skills`, or the
-    /// remote had no `rupu` on its PATH, so it printed a marker instead of
-    /// launching: the unit is refused with an error that says which, its
-    /// mirror run finished failed, and no tail pump starts.
-    #[tokio::test]
-    async fn launch_agent_refuses_a_remote_that_printed_a_skills_gate_marker() {
-        struct MarkerExec(&'static str, std::sync::Mutex<Vec<String>>);
-        #[async_trait::async_trait]
-        impl RemoteExec for MarkerExec {
-            async fn run(&self, remote: &str) -> Result<RemoteOutput, RemoteExecError> {
-                self.1.lock().unwrap().push(remote.to_string());
-                Ok(RemoteOutput {
-                    stdout: format!("{}\n", self.0),
-                    stderr: String::new(),
-                    success: true,
-                })
-            }
-            fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
-                panic!("no tail pump for a refused launch")
-            }
-            async fn run_bytes(
-                &self,
-                _c: &str,
-                _s: Option<Vec<u8>>,
-            ) -> Result<Vec<u8>, RemoteExecError> {
-                unimplemented!("not used by launch_agent")
-            }
+    /// Prints `marker` on the launch (`rupu run`) when `on_launch` is set,
+    /// else on every other command (the skills gate); the rest succeed empty.
+    struct MarkerExec {
+        marker: &'static str,
+        on_launch: bool,
+        commands: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RemoteExec for MarkerExec {
+        async fn run(&self, remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+            self.commands.lock().unwrap().push(remote.to_string());
+            let is_launch = remote.contains("'rupu' 'run'");
+            Ok(RemoteOutput {
+                stdout: if is_launch == self.on_launch {
+                    format!("{}\n", self.marker)
+                } else {
+                    String::new()
+                },
+                stderr: String::new(),
+                success: true,
+            })
         }
-        for (marker, says, not_says) in [
-            (LAUNCH_SKILLS_UNSUPPORTED, "upgrade rupu", "PATH"),
-            (
-                LAUNCH_RUPU_NOT_FOUND,
-                "rupu was not found on the remote's PATH",
-                "upgrade",
-            ),
-        ] {
-            let exec = std::sync::Arc::new(MarkerExec(marker, Default::default()));
+        fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+            panic!("no tail pump for a refused launch")
+        }
+        async fn run_bytes(
+            &self,
+            _c: &str,
+            _s: Option<Vec<u8>>,
+        ) -> Result<Vec<u8>, RemoteExecError> {
+            unimplemented!("not used by launch_agent")
+        }
+    }
+
+    const SKILLS_REFUSALS: [(&str, &str, &str); 2] = [
+        (LAUNCH_SKILLS_UNSUPPORTED, "upgrade rupu", "PATH"),
+        (
+            LAUNCH_RUPU_NOT_FOUND,
+            "rupu was not found on the remote's PATH",
+            "upgrade",
+        ),
+    ];
+
+    /// The remote's own `rupu __features` lacked `agent.skills`, or the
+    /// remote had no `rupu` on its PATH, so the skills gate printed a marker:
+    /// the unit is refused with an error that says which, before any mirror
+    /// run exists or any launch is sent, and no tail pump starts.
+    #[tokio::test]
+    async fn launch_agent_refuses_a_remote_whose_skills_gate_printed_a_marker() {
+        for (marker, says, not_says) in SKILLS_REFUSALS {
+            let exec = std::sync::Arc::new(MarkerExec {
+                marker,
+                on_launch: false,
+                commands: Default::default(),
+            });
             let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&exec));
             let err = conn
                 .launch_agent(skilled_launch("run_01OLDREMOTE"))
@@ -9457,9 +9555,42 @@ mod tests {
                     if m.contains("host_abc") && m.contains(says) && !m.contains(not_says)),
                 "{marker}: {err:?}"
             );
-            assert_eq!(exec.1.lock().unwrap().len(), 1, "one launch command only");
             assert_eq!(
-                run_store.load("run_01OLDREMOTE").unwrap().status,
+                *exec.commands.lock().unwrap(),
+                vec![SshHostConnector::skills_gate_command()],
+                "{marker}: the gate only, no launch"
+            );
+            assert!(
+                run_store.list().unwrap().is_empty(),
+                "{marker}: a refused launch left a mirror run"
+            );
+        }
+    }
+
+    /// The gate passed but the launch's own backstop printed a marker (the
+    /// remote's rupu changed between the two commands): the unit is refused
+    /// and its mirror run is finished failed rather than left running.
+    #[tokio::test]
+    async fn launch_agent_refuses_a_launch_whose_backstop_printed_a_marker() {
+        for (marker, says, not_says) in SKILLS_REFUSALS {
+            let exec = std::sync::Arc::new(MarkerExec {
+                marker,
+                on_launch: true,
+                commands: Default::default(),
+            });
+            let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&exec));
+            let err = conn
+                .launch_agent(skilled_launch("run_01RACED"))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, HostConnectorError::Unsupported(m)
+                    if m.contains("host_abc") && m.contains(says) && !m.contains(not_says)),
+                "{marker}: {err:?}"
+            );
+            assert_eq!(exec.commands.lock().unwrap().len(), 2, "gate, then launch");
+            assert_eq!(
+                run_store.load("run_01RACED").unwrap().status,
                 rupu_orchestrator::RunStatus::Failed,
                 "{marker}: no mirror run left running"
             );
