@@ -3007,7 +3007,7 @@ mod tunnel_connector {
         let err = conn.launch_agent(req).await.unwrap_err();
         assert!(
             matches!(&err, HostConnectorError::Unsupported(m)
-                if m.contains("node-sb-old") && m.contains("shipped skills")
+                if m.starts_with("host node-sb-old: ") && m.contains("shipped skills")
                     && m.contains("upgrade rupu")),
             "{err:?}"
         );

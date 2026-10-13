@@ -481,10 +481,11 @@ impl HostConnector for TunnelHostConnector {
         // without the skills shipped to it.
         if req.skill_bundle.is_some() && !conn.supports(CAP_AGENT_SKILL_BUNDLE) {
             return Err(HostConnectorError::Unsupported(format!(
-                "node {} (rupu {}) does not support shipped skills on agent launches, so \
-                 this run's shipped skills cannot be delivered; upgrade rupu on that node",
-                self.node_id,
+                "host {id}: node {id} (rupu {}) does not support shipped skills on agent \
+                 launches, so this run's shipped skills cannot be delivered; upgrade rupu \
+                 on that node",
                 conn.rupu_version().unwrap_or("unknown version"),
+                id = self.node_id,
             )));
         }
 
