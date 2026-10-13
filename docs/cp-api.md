@@ -318,7 +318,7 @@ With `host=<id>`, `GET` and `POST` go to that host. The stream does not.
 | Transport | Messages |
 |-----------|----------|
 | local | Served here. |
-| HTTP | Proxied to the host's own endpoints when its `/api/host/info` lists the `run.messages` feature. The coordinator answers from the features it last read (`/api/hosts` probes refresh them). It reads `/api/host/info` only for a host it has never read. A host that doesn't list it is a 501, "upgrade rupu there". The host's 400, 404 and 409 come back as the same status. |
+| HTTP | Proxied to the host's own endpoints when its `/api/host/info` lists the `run.messages` feature. The coordinator answers from the features it last read (`/api/hosts` probes refresh them), so a host upgraded since that read is still a 501 until the next `/api/hosts` probe picks up its `run.messages`. It reads `/api/host/info` only for a host it has never read. A host that doesn't list it is a 501, "upgrade rupu there". The host's 400, 404 and 409 come back as the same status. |
 | SSH | One remote command runs `rupu __features`. Only when the report lists `run.messages` does it run the hidden `rupu __message list\|send`. Any other remote is a 501, naming why: `rupu` isn't on its PATH, or its rupu predates `run.messages`. The helper's refusals keep their status. |
 | Tunnel, bucket | 501 with a reason: these transports carry no messages. Message the run on its own host. |
 
