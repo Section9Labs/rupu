@@ -60,7 +60,7 @@ pub(crate) struct ClaimRecord {
     pub token: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PostKind {
     Observation,
@@ -70,9 +70,24 @@ pub enum PostKind {
     Note,
 }
 
+impl PostKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PostKind::Observation => "observation",
+            PostKind::Question => "question",
+            PostKind::Answer => "answer",
+            PostKind::Vote => "vote",
+            PostKind::Note => "note",
+        }
+    }
+}
+
 /// An append-only board post.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoardPost {
+    /// The post's message-log id; absent on a post written before the log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub author: String,
     pub ts: String,
     pub kind: PostKind,
@@ -122,10 +137,19 @@ pub enum DirectiveEvent {
     Put(Directive),
 }
 
-/// A directed message delivered to a participant's inbox.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A directed message delivered to a participant's inbox (or appended to
+/// the broadcast log).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FleetMessage {
+    /// The message-log id; absent on a message written before the log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub from: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_codename: Option<String>,
+    /// The address it was sent to (`role:recon`, `lynx#1`, `broadcast`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
     pub ts: String,
     pub body: String,
 }

@@ -20,6 +20,17 @@ pub enum FleetError {
     Claimed { key: String, holder: String },
     #[error("inbox for {participant} is full (cap {cap})")]
     InboxFull { participant: String, cap: usize },
-    #[error("'{channel}' is a broadcast channel, not a direct inbox; use broadcast_send/read_broadcast")]
+    /// The message log reached `[messaging].log_max_mb`: nothing more can be
+    /// sent in this space.
+    #[error("the message log is full ({max_bytes} bytes, `[messaging].log_max_mb`): nothing more can be sent in this run")]
+    LogFull { max_bytes: u64 },
+    #[error(transparent)]
+    Address(#[from] crate::address::AddressError),
+    #[error(
+        "'{channel}' is a broadcast channel, not a direct inbox; use broadcast_send/read_broadcast"
+    )]
     NotAnInbox { channel: String },
 }
+
+/// What a [`crate::Bus`] write fails with.
+pub type BusError = FleetError;
