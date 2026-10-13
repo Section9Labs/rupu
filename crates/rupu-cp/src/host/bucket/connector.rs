@@ -21,6 +21,7 @@ use crate::{
             read_transcript_file, spec_peer_codename, EventByteStream, HostCapabilities,
             HostConnector, HostConnectorError, HostInfo, RunListQuery,
         },
+        skill_ship::{self, ShipOutcome, SkillBundle},
     },
     launcher::LaunchRequest,
     node::{
@@ -249,6 +250,9 @@ impl HostConnector for BucketHostConnector {
 
     async fn launch_agent(&self, req: AgentLaunchRequest) -> Result<String, HostConnectorError> {
         // Before the mirror run exists, so a refusal leaves nothing behind.
+        if req.skill_bundle.is_some() {
+            return Err(skill_ship::refuse_bundle_launch(&self.host_id));
+        }
         if let Some(profile) = req.findings_profile {
             self.require_worker_capability(
                 CAP_AGENT_FINDINGS_PROFILE,
@@ -320,6 +324,14 @@ impl HostConnector for BucketHostConnector {
         }
 
         Ok(run_id)
+    }
+
+    async fn ship_skills(&self, bundle: &SkillBundle) -> Result<ShipOutcome, HostConnectorError> {
+        Ok(if bundle.is_empty() {
+            ShipOutcome::NotNeeded
+        } else {
+            skill_ship::not_built(&self.host_id)
+        })
     }
 
     async fn start_session(&self, _req: SessionStartRequest) -> Result<String, HostConnectorError> {
@@ -723,6 +735,41 @@ mod tests {
             "{err:?}"
         );
         // Refused before anything was written: no job, no orphaned mirror run.
+        assert!(bucket.list_jobs().await.unwrap().is_empty());
+        assert!(run_store.list().unwrap().is_empty());
+    }
+
+    /// A bucket can't deliver shipped skills yet: `ship_skills` says so, and
+    /// a launch that carries a bundle anyway is refused, not run without it.
+    #[tokio::test]
+    async fn shipped_skills_are_unsupported_and_a_bundle_launch_is_refused() {
+        let (conn, run_store, bucket, tmp) = make_conn();
+        let skill = tmp.path().join("pdf");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: pdf\ndescription: PDFs.\n---\n\nBody.\n",
+        )
+        .unwrap();
+        let bundle = SkillBundle::new(vec![Arc::new(
+            rupu_skills::load_skill(&skill, rupu_skills::Layer::Global).unwrap(),
+        )]);
+        assert!(matches!(
+            conn.ship_skills(&bundle).await.unwrap(),
+            ShipOutcome::Unsupported(m) if m.contains("host_bucket_1")
+        ));
+
+        let mut req = profile_req(None);
+        req.skill_bundle = Some(rupu_skills::ship::SkillBundleManifest {
+            version: 1,
+            skills: Vec::new(),
+        });
+        let err = conn.launch_agent(req).await.unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Unsupported(m)
+                if m.starts_with("host host_bucket_1: ") && m.contains("skill_bundle")),
+            "{err:?}"
+        );
         assert!(bucket.list_jobs().await.unwrap().is_empty());
         assert!(run_store.list().unwrap().is_empty());
     }

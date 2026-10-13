@@ -26,6 +26,7 @@ use crate::{
         read_transcript_file, spec_peer_codename, EventByteStream, HostCapabilities, HostConnector,
         HostConnectorError, HostInfo, RunListQuery,
     },
+    host::skill_ship::{self, ShipOutcome, SkillBundle},
     launcher::LaunchRequest,
     node::{
         protocol::{
@@ -178,6 +179,9 @@ impl HostConnector for TunnelHostConnector {
         // under: it travels in the `Run` frame, which every node passes on as
         // `rupu run --run-id`. Validated before anything is created.
         let run_id = req.run_id_or_mint().map_err(HostConnectorError::Invalid)?;
+        if req.skill_bundle.is_some() {
+            return Err(skill_ship::refuse_bundle_launch(&self.node_id));
+        }
         let run = req
             .agent_run(&run_id)
             .map_err(HostConnectorError::Invalid)?;
@@ -273,6 +277,14 @@ impl HostConnector for TunnelHostConnector {
         }
 
         Ok(run_id)
+    }
+
+    async fn ship_skills(&self, bundle: &SkillBundle) -> Result<ShipOutcome, HostConnectorError> {
+        Ok(if bundle.is_empty() {
+            ShipOutcome::NotNeeded
+        } else {
+            skill_ship::not_built(&self.node_id)
+        })
     }
 
     async fn start_session(&self, _req: SessionStartRequest) -> Result<String, HostConnectorError> {
@@ -546,6 +558,63 @@ mod tests {
             )),
         );
         (connector, rx, node_conn)
+    }
+
+    /// A tunnel can't deliver shipped skills yet: `ship_skills` says so, and a
+    /// launch that carries a bundle anyway is refused, not run without it.
+    #[tokio::test]
+    async fn shipped_skills_are_unsupported_and_a_bundle_launch_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (connector, mut rx, _node_conn) = pull_capable(dir.path());
+        let skill = dir.path().join("pdf");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: pdf\ndescription: PDFs.\n---\n\nBody.\n",
+        )
+        .unwrap();
+        let bundle = SkillBundle::new(vec![Arc::new(
+            rupu_skills::load_skill(&skill, rupu_skills::Layer::Global).unwrap(),
+        )]);
+        assert!(matches!(
+            connector.ship_skills(&bundle).await.unwrap(),
+            ShipOutcome::Unsupported(m) if m.contains("node-x")
+        ));
+        assert_eq!(
+            connector
+                .ship_skills(&SkillBundle::default())
+                .await
+                .unwrap(),
+            ShipOutcome::NotNeeded
+        );
+
+        let err = connector
+            .launch_agent(AgentLaunchRequest {
+                agent: "sec".into(),
+                prompt: Some("go".into()),
+                mode: None,
+                target: None,
+                working_dir: None,
+                run_id: None,
+                findings_profile: None,
+                engagement_profiles: Vec::new(),
+                skills: Vec::new(),
+                preload_skills: Vec::new(),
+                skill_bundle: Some(rupu_skills::ship::SkillBundleManifest {
+                    version: 1,
+                    skills: Vec::new(),
+                }),
+                codename: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Unsupported(m)
+                if m.starts_with("host node-x: ") && m.contains("skill_bundle")),
+            "{err:?}"
+        );
+        assert!(rx.try_recv().is_err(), "nothing was sent to the node");
+        assert!(connector.run_store.list().unwrap().is_empty());
     }
 
     /// A finished pull leaves no routing entry behind.

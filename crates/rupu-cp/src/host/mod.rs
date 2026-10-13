@@ -19,6 +19,7 @@ pub mod probe_cache;
 pub mod registry;
 #[cfg(test)]
 pub(crate) mod runtime_liveness;
+pub mod skill_ship;
 pub mod ssh;
 pub mod summary_build;
 pub mod transcript_paths;

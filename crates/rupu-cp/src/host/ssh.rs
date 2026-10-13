@@ -14,6 +14,7 @@ use futures_util::stream::Stream;
 use futures_util::StreamExt as _;
 use rupu_orchestrator::runs::RunStore;
 use rupu_runtime::argv::{FeatureSet, RunArgv, WorkflowControl};
+use rupu_skills::ship::{encode_stream, PackedSkill};
 use ulid::Ulid;
 
 use crate::{
@@ -23,11 +24,15 @@ use crate::{
         EventByteStream, FeedGuard, HostCapabilities, HostConnector, HostConnectorError, HostInfo,
         RunKind, RunListQuery, RunStartEvidence, MAX_WORKSPACE_BYTES,
     },
+    host::skill_ship::{
+        manifest_of, pack_bundle, prefixed, ref_arg, ShipMemo, ShipOutcome, SkillBundle,
+    },
     launcher::LaunchRequest,
     node::{
         protocol::{
-            ArtifactFile, RunSpec, RunSpecKind, CAP_AGENT_SKILLS, CAP_RUN_CODENAME_FLAG,
-            CAP_RUN_LIST, CAP_WORKFLOW_RESUME_IF_UNFINISHED, FEATURES_SUBCOMMAND,
+            ArtifactFile, RunSpec, RunSpecKind, CAP_AGENT_SKILLS, CAP_AGENT_SKILL_BUNDLE,
+            CAP_RUN_CODENAME_FLAG, CAP_RUN_LIST, CAP_WORKFLOW_RESUME_IF_UNFINISHED,
+            FEATURES_SUBCOMMAND,
         },
         NodeMirror,
     },
@@ -75,6 +80,12 @@ const LAUNCH_SKILLS_UNSUPPORTED: &str = "rupu-launch: skills-unsupported";
 /// names the missing binary rather than an old one.
 const LAUNCH_RUPU_NOT_FOUND: &str = "rupu-launch: rupu-not-found";
 
+/// Printed, instead of answering, by the skill-bundle gate
+/// ([`SshHostConnector::skills_bundle_gate`]) when the remote `rupu
+/// __features` doesn't list [`CAP_AGENT_SKILL_BUNDLE`]: it can't cache
+/// shipped skills, so the unit runs with that host's installed ones.
+const SKILLS_BUNDLE_UNSUPPORTED: &str = "rupu-skills: bundle-unsupported";
+
 /// Whether `argv` is an agent launch carrying workflow-step skills.
 fn carries_skills(argv: &RunArgv) -> bool {
     matches!(
@@ -94,6 +105,20 @@ fn features_list(feature: &str) -> String {
     format!(
         "printf '%s\\n' \"$f\" | grep -qF {}",
         shell_escape(&format!("\"{feature}\""))
+    )
+}
+
+/// Runs `then` only when the remote's `rupu __features` lists `feature`,
+/// else prints `marker`; prints [`LAUNCH_RUPU_NOT_FOUND`] when the remote
+/// has no `rupu` on its non-interactive PATH.
+fn feature_gate(feature: &str, marker: &str, then: &str) -> String {
+    format!(
+        "if ! command -v rupu >/dev/null 2>&1; then echo {}; else {}; \
+         if {}; then {then}; else echo {}; fi; fi",
+        shell_escape(LAUNCH_RUPU_NOT_FOUND),
+        features_capture(),
+        features_list(feature),
+        shell_escape(marker),
     )
 }
 
@@ -1696,6 +1721,9 @@ pub(crate) struct SshHostConnector {
     /// `autoflow history`, `transcript list`, `session list`) — see
     /// [`crate::host::listing_cache`]. Cleared by every mutating method.
     listings: crate::host::listing_cache::ListingCache,
+    /// The shipped skills this host confirmed it holds — see
+    /// [`HostConnector::ship_skills`].
+    ship_memo: ShipMemo,
 }
 
 /// The dispatcher-facing side of one tail pump.
@@ -1826,6 +1854,7 @@ impl SshHostConnector {
             pumps: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             lazy,
             listings: Default::default(),
+            ship_memo: ShipMemo::default(),
         }
     }
 
@@ -1992,14 +2021,110 @@ impl SshHostConnector {
     /// instead. A remote with no `rupu` on its non-interactive PATH prints
     /// [`LAUNCH_RUPU_NOT_FOUND`] instead, so the refusal says what is wrong.
     fn skills_gate(then: &str) -> String {
-        format!(
-            "if ! command -v rupu >/dev/null 2>&1; then echo {}; else {}; \
-             if {}; then {then}; else echo {}; fi; fi",
-            shell_escape(LAUNCH_RUPU_NOT_FOUND),
-            features_capture(),
-            features_list(CAP_AGENT_SKILLS),
-            shell_escape(LAUNCH_SKILLS_UNSUPPORTED),
-        )
+        feature_gate(CAP_AGENT_SKILLS, LAUNCH_SKILLS_UNSUPPORTED, then)
+    }
+
+    /// [`Self::skills_gate`] for shipped skills: runs `then` only when the
+    /// remote lists [`CAP_AGENT_SKILL_BUNDLE`], else prints
+    /// [`SKILLS_BUNDLE_UNSUPPORTED`].
+    fn skills_bundle_gate(then: &str) -> String {
+        feature_gate(CAP_AGENT_SKILL_BUNDLE, SKILLS_BUNDLE_UNSUPPORTED, then)
+    }
+
+    /// Send the skills of `pending` this host lacks. One command asks
+    /// (`rupu __skills missing`, behind [`Self::skills_bundle_gate`]) and one
+    /// sends (`rupu __skills receive`, stdin is [`encode_stream`]'s framing):
+    /// `run_bytes` isn't duplex, so the two can't share a connection. A gate
+    /// refusal is recorded in `downgrade` and returned as an error, so the
+    /// memo confirms nothing.
+    async fn ship_pending(
+        &self,
+        pending: Vec<Arc<PackedSkill>>,
+        downgrade: &std::sync::Mutex<Option<String>>,
+    ) -> Result<(), HostConnectorError> {
+        let who = format!("host {}", self.host_id);
+        let refs: Vec<String> = pending.iter().map(|p| ref_arg(p)).collect();
+        let argv: Vec<String> = ["rupu", "__skills", "missing"]
+            .into_iter()
+            .map(String::from)
+            .chain(refs.iter().cloned())
+            .collect();
+        let out = self
+            .exec
+            .run(&Self::skills_bundle_gate(&build_remote_command(&argv)))
+            .await
+            .map_err(|e| HostConnectorError::Unreachable(format!("{who}: {e}")))?;
+        if let Some(refusal) = self.skills_gate_refusal(&out.stdout) {
+            return Err(refusal);
+        }
+        if out
+            .stdout
+            .lines()
+            .any(|l| l.trim() == SKILLS_BUNDLE_UNSUPPORTED)
+        {
+            let m = format!(
+                "{who}: rupu there predates shipped skills (no {CAP_AGENT_SKILL_BUNDLE}); upgrade \
+                 rupu there. The unit uses that host's installed skills."
+            );
+            *downgrade.lock().unwrap_or_else(|e| e.into_inner()) = Some(m.clone());
+            return Err(HostConnectorError::Unsupported(m));
+        }
+        if !out.success {
+            let msg = format!(
+                "{who}: `rupu __skills missing` failed: {}",
+                out.stderr.trim()
+            );
+            return Err(if is_ssh_transport_failure(&out.stderr) {
+                HostConnectorError::Unreachable(msg)
+            } else {
+                HostConnectorError::Remote(0, msg)
+            });
+        }
+        let mut lacking = Vec::new();
+        for line in out.stdout.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            let Some(i) = refs.iter().position(|r| r == line) else {
+                return Err(HostConnectorError::Remote(
+                    0,
+                    format!("{who}: `rupu __skills missing` named {line:?}, which was not asked"),
+                ));
+            };
+            lacking.push(&pending[i]);
+        }
+        if lacking.is_empty() {
+            return Ok(());
+        }
+        let sent: Vec<_> = lacking.iter().map(|p| p.reference()).collect();
+        let stream = encode_stream(
+            &sent
+                .iter()
+                .zip(&lacking)
+                .map(|(r, p)| (r, p.bytes.as_slice()))
+                .collect::<Vec<_>>(),
+        );
+        let receive = build_remote_command(&["rupu".into(), "__skills".into(), "receive".into()]);
+        let reply = self
+            .exec
+            .run_bytes(&receive, Some(stream))
+            .await
+            .map_err(|e| prefixed(map_remote_err(e), &who))?;
+        let reply = String::from_utf8_lossy(&reply);
+        let acked: std::collections::HashSet<&str> = reply
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("ok "))
+            .collect();
+        if let Some(r) = sent
+            .iter()
+            .find(|r| !acked.contains(r.content_hash.as_str()))
+        {
+            return Err(HostConnectorError::Remote(
+                0,
+                format!(
+                    "{who}: `rupu __skills receive` did not confirm {}:{} ({})",
+                    r.layer, r.name, r.content_hash
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// [`Self::skills_gate`] with nothing to run: prints a marker exactly
@@ -2836,6 +2961,23 @@ impl HostConnector for SshHostConnector {
 
         self.spawn_tail_pump(run_id.clone());
         Ok(run_id)
+    }
+
+    async fn ship_skills(&self, bundle: &SkillBundle) -> Result<ShipOutcome, HostConnectorError> {
+        if bundle.is_empty() {
+            return Ok(ShipOutcome::NotNeeded);
+        }
+        let packed = pack_bundle(bundle, &format!("host {}", self.host_id)).await?;
+        let downgrade = std::sync::Mutex::new(None);
+        let shipped = self
+            .ship_memo
+            .ship(&packed, |pending| self.ship_pending(pending, &downgrade))
+            .await;
+        if let Some(m) = downgrade.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            return Ok(ShipOutcome::Unsupported(m));
+        }
+        shipped?;
+        Ok(ShipOutcome::Shipped(manifest_of(&packed)))
     }
 
     async fn start_session(&self, _req: SessionStartRequest) -> Result<String, HostConnectorError> {
@@ -10381,6 +10523,268 @@ mod tests {
                 // Scratch dir is cleaned up by collect_from_dir.
                 assert!(!std::path::Path::new(&dir).exists());
             }
+        }
+    }
+
+    // ── Shipping a placed unit's skills ───────────────────────────────────────
+
+    mod ship_skills {
+        use super::*;
+        use crate::host::skill_ship::{ShipOutcome, SkillBundle};
+        use rupu_skills::ship::{decode_stream, MAX_BUNDLE_BYTES};
+
+        /// Scripted remote for `ship_skills`: `run` (the gate + `missing`
+        /// command) prints `missing_stdout`; `run_bytes` (`receive`) acks
+        /// every skill it decodes, or all but the last with `drop_ack`.
+        struct ShipExec {
+            missing_stdout: String,
+            drop_ack: bool,
+            runs: std::sync::Mutex<Vec<String>>,
+            receives: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
+        }
+
+        impl ShipExec {
+            fn new(missing_stdout: impl Into<String>) -> Arc<Self> {
+                Arc::new(Self {
+                    missing_stdout: missing_stdout.into(),
+                    drop_ack: false,
+                    runs: Default::default(),
+                    receives: Default::default(),
+                })
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl RemoteExec for ShipExec {
+            async fn run(&self, remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+                self.runs.lock().unwrap().push(remote.to_string());
+                let launch = remote.contains("'rupu' 'run'");
+                Ok(RemoteOutput {
+                    stdout: if launch {
+                        String::new()
+                    } else {
+                        self.missing_stdout.clone()
+                    },
+                    stderr: String::new(),
+                    success: true,
+                })
+            }
+            fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+                Ok(Box::pin(futures_util::stream::pending()))
+            }
+            async fn run_bytes(
+                &self,
+                cmd: &str,
+                stdin: Option<Vec<u8>>,
+            ) -> Result<Vec<u8>, RemoteExecError> {
+                let stdin = stdin.unwrap_or_default();
+                self.receives
+                    .lock()
+                    .unwrap()
+                    .push((cmd.to_string(), stdin.clone()));
+                let mut got = decode_stream(&mut &stdin[..], MAX_BUNDLE_BYTES).unwrap();
+                if self.drop_ack {
+                    got.pop();
+                }
+                Ok(got
+                    .iter()
+                    .map(|(r, _)| format!("ok {}\n", r.content_hash))
+                    .collect::<String>()
+                    .into_bytes())
+            }
+        }
+
+        fn bundle(dir: &Path, names: &[&str]) -> SkillBundle {
+            SkillBundle::new(
+                names
+                    .iter()
+                    .map(|n| {
+                        let root = dir.join(n);
+                        std::fs::create_dir_all(&root).unwrap();
+                        std::fs::write(
+                            root.join("SKILL.md"),
+                            format!("---\nname: {n}\ndescription: {n} skill.\n---\n\nDo {n}.\n"),
+                        )
+                        .unwrap();
+                        Arc::new(
+                            rupu_skills::load_skill(&root, rupu_skills::Layer::Global).unwrap(),
+                        )
+                    })
+                    .collect(),
+            )
+        }
+
+        fn ref_arg(b: &SkillBundle, i: usize) -> String {
+            let p = &b.pack().unwrap()[i];
+            format!("{}:{}:{}", p.hash.hex(), p.layer, p.name)
+        }
+
+        #[tokio::test]
+        async fn a_remote_without_the_feature_is_a_downgrade_naming_the_host() {
+            let tmp = tempfile::tempdir().unwrap();
+            let exec = ShipExec::new(format!("{SKILLS_BUNDLE_UNSUPPORTED}\n"));
+            let (conn, _store, _t) = make_conn(Arc::clone(&exec));
+            let out = conn
+                .ship_skills(&bundle(tmp.path(), &["pdf"]))
+                .await
+                .unwrap();
+            assert!(
+                matches!(&out, ShipOutcome::Unsupported(m)
+                    if m.contains("host_abc") && m.contains("agent.skill_bundle")
+                        && m.contains("installed skills")),
+                "{out:?}"
+            );
+            assert!(exec.receives.lock().unwrap().is_empty());
+            let runs = exec.runs.lock().unwrap();
+            assert_eq!(runs.len(), 1, "{runs:?}");
+            assert!(
+                runs[0].contains(&format!("grep -qF '\"{CAP_AGENT_SKILL_BUNDLE}\"'"))
+                    && runs[0].contains("'rupu' '__skills' 'missing'"),
+                "the missing query runs behind the feature gate: {}",
+                runs[0]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_remote_without_rupu_is_an_error() {
+            let tmp = tempfile::tempdir().unwrap();
+            let exec = ShipExec::new(format!("{LAUNCH_RUPU_NOT_FOUND}\n"));
+            let (conn, _store, _t) = make_conn(Arc::clone(&exec));
+            let err = conn
+                .ship_skills(&bundle(tmp.path(), &["pdf"]))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, HostConnectorError::Unsupported(m)
+                    if m.contains("host_abc") && m.contains("PATH")),
+                "{err:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn ships_only_what_the_host_lacks_and_lists_every_skill() {
+            let tmp = tempfile::tempdir().unwrap();
+            let b = bundle(tmp.path(), &["pdf", "sql"]);
+            let lacking = ref_arg(&b, 1);
+            let exec = ShipExec::new(format!("{lacking}\n"));
+            let (conn, _store, _t) = make_conn(Arc::clone(&exec));
+
+            let out = conn.ship_skills(&b).await.unwrap();
+            let packed = b.pack().unwrap();
+            assert_eq!(
+                out,
+                ShipOutcome::Shipped(crate::host::skill_ship::manifest_of(&packed))
+            );
+            let ShipOutcome::Shipped(m) = &out else {
+                unreachable!()
+            };
+            assert_eq!(m.skills.len(), 2, "the host's own copy is listed too");
+            {
+                let runs = exec.runs.lock().unwrap();
+                assert_eq!(runs.len(), 1);
+                assert!(runs[0].contains(&ref_arg(&b, 0)) && runs[0].contains(&lacking));
+                let receives = exec.receives.lock().unwrap();
+                assert_eq!(receives.len(), 1);
+                let (cmd, stdin) = &receives[0];
+                assert!(cmd.contains("'rupu' '__skills' 'receive'"), "{cmd}");
+                let sent = decode_stream(&mut &stdin[..], MAX_BUNDLE_BYTES).unwrap();
+                assert_eq!(sent.len(), 1);
+                assert_eq!(sent[0].0, packed[1].reference());
+                assert_eq!(sent[0].1, packed[1].bytes);
+            }
+
+            // Confirmed: a second ship of the same bundle asks nothing.
+            assert_eq!(conn.ship_skills(&b).await.unwrap(), out);
+            assert_eq!(exec.runs.lock().unwrap().len(), 1);
+            assert_eq!(exec.receives.lock().unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_host_lacking_nothing_gets_no_receive() {
+            let tmp = tempfile::tempdir().unwrap();
+            let exec = ShipExec::new("");
+            let (conn, _store, _t) = make_conn(Arc::clone(&exec));
+            let out = conn
+                .ship_skills(&bundle(tmp.path(), &["pdf"]))
+                .await
+                .unwrap();
+            assert!(matches!(out, ShipOutcome::Shipped(_)), "{out:?}");
+            assert!(exec.receives.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_receive_missing_an_ack_is_an_error_and_confirms_nothing() {
+            let tmp = tempfile::tempdir().unwrap();
+            let b = bundle(tmp.path(), &["pdf"]);
+            let exec = Arc::new(ShipExec {
+                missing_stdout: format!("{}\n", ref_arg(&b, 0)),
+                drop_ack: true,
+                runs: Default::default(),
+                receives: Default::default(),
+            });
+            let (conn, _store, _t) = make_conn(Arc::clone(&exec));
+            let err = conn.ship_skills(&b).await.unwrap_err();
+            assert!(
+                matches!(&err, HostConnectorError::Remote(_, m)
+                    if m.contains("host_abc") && m.contains("pdf")),
+                "{err:?}"
+            );
+            let _ = conn.ship_skills(&b).await;
+            assert_eq!(exec.receives.lock().unwrap().len(), 2, "retried");
+        }
+
+        #[tokio::test]
+        async fn a_missing_line_the_coordinator_never_sent_is_an_error() {
+            let tmp = tempfile::tempdir().unwrap();
+            let exec = ShipExec::new(format!("{}:global:other\n", "0".repeat(64)));
+            let (conn, _store, _t) = make_conn(Arc::clone(&exec));
+            let err = conn
+                .ship_skills(&bundle(tmp.path(), &["pdf"]))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, HostConnectorError::Remote(_, m) if m.contains("host_abc")),
+                "{err:?}"
+            );
+            assert!(exec.receives.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn an_empty_bundle_needs_nothing() {
+            let exec = ShipExec::new("");
+            let (conn, _store, _t) = make_conn(Arc::clone(&exec));
+            assert_eq!(
+                conn.ship_skills(&SkillBundle::default()).await.unwrap(),
+                ShipOutcome::NotNeeded
+            );
+            assert!(exec.runs.lock().unwrap().is_empty());
+        }
+
+        /// The manifest rides the launch: `agent_run()` renders it and
+        /// `to_shell` puts it on the remote `rupu run`.
+        #[tokio::test]
+        async fn launch_agent_carries_the_skill_bundle() {
+            let exec = ShipExec::new("");
+            let (conn, _store, _t) = make_conn(Arc::clone(&exec));
+            let mut req = skilled_launch("run_01BUNDLE");
+            req.skills.clear();
+            req.preload_skills.clear();
+            req.skill_bundle = Some(rupu_skills::ship::SkillBundleManifest {
+                version: 1,
+                skills: vec![rupu_skills::ship::ShippedSkillRef {
+                    layer: rupu_skills::Layer::Global,
+                    name: "pdf".into(),
+                    content_hash: "a".repeat(64),
+                }],
+            });
+            conn.launch_agent(req).await.unwrap();
+            let runs = exec.runs.lock().unwrap();
+            let launch = runs
+                .iter()
+                .find(|c| c.contains("'rupu' 'run' 'recon'"))
+                .unwrap_or_else(|| panic!("no agent launch in {runs:?}"));
+            assert!(launch.contains("'--skill-bundle={"), "{launch}");
+            assert!(launch.contains(&"a".repeat(64)), "{launch}");
         }
     }
 }

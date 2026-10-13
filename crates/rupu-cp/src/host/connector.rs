@@ -172,6 +172,19 @@ pub trait HostConnector: Send + Sync {
     /// Start a new agent run; returns the new run id.
     async fn launch_agent(&self, req: AgentLaunchRequest) -> Result<String, HostConnectorError>;
 
+    /// Make `bundle`'s skills available on this host before a placed unit
+    /// launches there (spec
+    /// 2026-10-13-rupu-skills-on-placed-units-design.md §4). `Shipped`
+    /// carries the manifest the launch passes as
+    /// [`AgentLaunchRequest::skill_bundle`]; `Unsupported` is the P5
+    /// downgrade (the unit runs with the host's installed skills); an `Err`
+    /// fails the unit's launch. Deliberately no default: every transport
+    /// must say whether it ships.
+    async fn ship_skills(
+        &self,
+        bundle: &crate::host::skill_ship::SkillBundle,
+    ) -> Result<crate::host::skill_ship::ShipOutcome, HostConnectorError>;
+
     /// Start a new agent session; returns the new session id.
     async fn start_session(&self, req: SessionStartRequest) -> Result<String, HostConnectorError>;
 
@@ -1420,6 +1433,14 @@ pub(crate) mod testing {
 
     #[async_trait::async_trait]
     impl HostConnector for StubConnector {
+        async fn ship_skills(
+            &self,
+            _: &crate::host::skill_ship::SkillBundle,
+        ) -> Result<crate::host::skill_ship::ShipOutcome, crate::host::connector::HostConnectorError>
+        {
+            Ok(crate::host::skill_ship::ShipOutcome::NotNeeded)
+        }
+
         async fn run_netflow(
             &self,
             _run_id: &str,
@@ -1526,6 +1547,16 @@ pub(crate) mod testing {
         struct Bare;
         #[async_trait::async_trait]
         impl HostConnector for Bare {
+            async fn ship_skills(
+                &self,
+                _: &crate::host::skill_ship::SkillBundle,
+            ) -> Result<
+                crate::host::skill_ship::ShipOutcome,
+                crate::host::connector::HostConnectorError,
+            > {
+                Ok(crate::host::skill_ship::ShipOutcome::NotNeeded)
+            }
+
             async fn info(&self) -> Result<HostInfo, HostConnectorError> {
                 unimplemented!()
             }

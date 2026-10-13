@@ -3134,6 +3134,14 @@ pub(crate) mod tests {
 
     #[async_trait::async_trait]
     impl crate::host::connector::HostConnector for ResumeHostConnector {
+        async fn ship_skills(
+            &self,
+            _: &crate::host::skill_ship::SkillBundle,
+        ) -> Result<crate::host::skill_ship::ShipOutcome, crate::host::connector::HostConnectorError>
+        {
+            Ok(crate::host::skill_ship::ShipOutcome::NotNeeded)
+        }
+
         async fn info(&self) -> Result<crate::host::connector::HostInfo, HostConnectorError> {
             unimplemented!("not exercised by this test")
         }
@@ -3999,6 +4007,14 @@ pub(crate) mod tests {
 
     #[async_trait::async_trait]
     impl crate::host::connector::HostConnector for FakeHostConnector {
+        async fn ship_skills(
+            &self,
+            _: &crate::host::skill_ship::SkillBundle,
+        ) -> Result<crate::host::skill_ship::ShipOutcome, crate::host::connector::HostConnectorError>
+        {
+            Ok(crate::host::skill_ship::ShipOutcome::NotNeeded)
+        }
+
         async fn info(&self) -> Result<crate::host::connector::HostInfo, HostConnectorError> {
             unimplemented!("not exercised by this test")
         }
@@ -4542,6 +4558,14 @@ pub(crate) mod tests {
 
     #[async_trait::async_trait]
     impl crate::host::connector::HostConnector for MirrorOnlyHostConnector {
+        async fn ship_skills(
+            &self,
+            _: &crate::host::skill_ship::SkillBundle,
+        ) -> Result<crate::host::skill_ship::ShipOutcome, crate::host::connector::HostConnectorError>
+        {
+            Ok(crate::host::skill_ship::ShipOutcome::NotNeeded)
+        }
+
         async fn info(&self) -> Result<crate::host::connector::HostInfo, HostConnectorError> {
             unimplemented!("not exercised by this test")
         }

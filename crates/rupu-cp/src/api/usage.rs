@@ -1495,6 +1495,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::host::connector::HostConnector for RollupOnlyConnector {
+        async fn ship_skills(
+            &self,
+            _: &crate::host::skill_ship::SkillBundle,
+        ) -> Result<crate::host::skill_ship::ShipOutcome, crate::host::connector::HostConnectorError>
+        {
+            Ok(crate::host::skill_ship::ShipOutcome::NotNeeded)
+        }
+
         async fn usage_rollup(
             &self,
             _since: &str,

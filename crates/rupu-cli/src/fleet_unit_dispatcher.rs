@@ -964,6 +964,16 @@ mod tests {
 
     #[async_trait]
     impl HostConnector for FakeConnector {
+        async fn ship_skills(
+            &self,
+            _: &rupu_cp::host::skill_ship::SkillBundle,
+        ) -> Result<
+            rupu_cp::host::skill_ship::ShipOutcome,
+            rupu_cp::host::connector::HostConnectorError,
+        > {
+            Ok(rupu_cp::host::skill_ship::ShipOutcome::NotNeeded)
+        }
+
         async fn info(&self) -> Result<HostInfo, HostConnectorError> {
             unimplemented!()
         }
@@ -1121,6 +1131,16 @@ mod tests {
 
     #[async_trait]
     impl HostConnector for UnreachableConnector {
+        async fn ship_skills(
+            &self,
+            _: &rupu_cp::host::skill_ship::SkillBundle,
+        ) -> Result<
+            rupu_cp::host::skill_ship::ShipOutcome,
+            rupu_cp::host::connector::HostConnectorError,
+        > {
+            Ok(rupu_cp::host::skill_ship::ShipOutcome::NotNeeded)
+        }
+
         async fn info(&self) -> Result<HostInfo, HostConnectorError> {
             unimplemented!()
         }
@@ -1628,6 +1648,16 @@ steps:
 
     #[async_trait]
     impl HostConnector for StagingRecorder {
+        async fn ship_skills(
+            &self,
+            _: &rupu_cp::host::skill_ship::SkillBundle,
+        ) -> Result<
+            rupu_cp::host::skill_ship::ShipOutcome,
+            rupu_cp::host::connector::HostConnectorError,
+        > {
+            Ok(rupu_cp::host::skill_ship::ShipOutcome::NotNeeded)
+        }
+
         async fn info(&self) -> Result<HostInfo, HostConnectorError> {
             unimplemented!()
         }
@@ -2132,6 +2162,16 @@ steps:
 
     #[async_trait]
     impl HostConnector for StageOkLaunchFailsConnector {
+        async fn ship_skills(
+            &self,
+            _: &rupu_cp::host::skill_ship::SkillBundle,
+        ) -> Result<
+            rupu_cp::host::skill_ship::ShipOutcome,
+            rupu_cp::host::connector::HostConnectorError,
+        > {
+            Ok(rupu_cp::host::skill_ship::ShipOutcome::NotNeeded)
+        }
+
         async fn info(&self) -> Result<HostInfo, HostConnectorError> {
             unimplemented!()
         }
@@ -2279,6 +2319,16 @@ steps:
 
     #[async_trait]
     impl HostConnector for StageOkPollNeverTerminalConnector {
+        async fn ship_skills(
+            &self,
+            _: &rupu_cp::host::skill_ship::SkillBundle,
+        ) -> Result<
+            rupu_cp::host::skill_ship::ShipOutcome,
+            rupu_cp::host::connector::HostConnectorError,
+        > {
+            Ok(rupu_cp::host::skill_ship::ShipOutcome::NotNeeded)
+        }
+
         async fn info(&self) -> Result<HostInfo, HostConnectorError> {
             unimplemented!()
         }
