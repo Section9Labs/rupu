@@ -393,7 +393,19 @@ struct SessionTurnRequest {
 }
 
 impl SessionTurnRequest {
-    const VERSION: u32 = 1;
+    /// The newest request version this rupu runs. A request is queued at
+    /// [`Self::written_version`].
+    const VERSION: u32 = 2;
+
+    /// 2 for a request that invokes skills, which a worker that predates
+    /// them would run without; else 1, so such a worker still runs it.
+    fn written_version(&self) -> u32 {
+        if self.operator_skills.is_empty() {
+            1
+        } else {
+            2
+        }
+    }
 
     /// The turn the worker runs for this request.
     fn turn_args(&self, session_id: &str) -> RunTurnArgs {
@@ -7487,60 +7499,10 @@ async fn run_worker(args: RunWorkerArgs) -> anyhow::Result<()> {
             break;
         }
 
-        if let Some((request, claimed_path)) =
+        if let Some((claimed, claimed_path)) =
             claim_next_session_turn_request(&global, scope, &args.session_id)?
         {
-            let transcript_path = request.transcript_path.clone();
-            session.status = SessionStatus::Running;
-            session.updated_at = Utc::now();
-            session.active_run_id = Some(request.run_id.clone());
-            session.active_transcript_path = Some(transcript_path.clone());
-            session.active_pid = Some(worker_pid);
-            session.last_error = None;
-            if let Some(run) = session
-                .runs
-                .iter_mut()
-                .find(|run| run.run_id == request.run_id)
-            {
-                run.pid = Some(worker_pid);
-                run.transcript_path = transcript_path.clone();
-            }
-            write_session(&global, scope, &session)?;
-            clear_session_live_usage(&global, scope, &args.session_id)?;
-
-            let result = if request.compact {
-                run_compact_request(&global, scope, &args.session_id, &request).await
-            } else {
-                run_turn(request.turn_args(&args.session_id)).await
-            };
-            let _ = fs::remove_file(&claimed_path);
-
-            if let Err(err) = result {
-                let (mut failed, scope) = read_session(&global, &args.session_id)?;
-                ensure_active_scope(scope, "session _worker")?;
-                if failed.worker_pid == Some(worker_pid) {
-                    failed.status = SessionStatus::Failed;
-                    failed.updated_at = Utc::now();
-                    failed.active_run_id = None;
-                    failed.active_transcript_path = None;
-                    failed.active_pid = None;
-                    failed.last_run_id = Some(request.run_id.clone());
-                    failed.last_transcript_path = Some(transcript_path.clone());
-                    failed.last_error = Some(err.to_string());
-                    if let Some(run) = failed
-                        .runs
-                        .iter_mut()
-                        .find(|run| run.run_id == request.run_id)
-                    {
-                        run.completed_at.get_or_insert(Utc::now());
-                        run.status.get_or_insert(RunStatus::Error);
-                        run.error.get_or_insert_with(|| err.to_string());
-                        run.transcript_path = transcript_path.clone();
-                    }
-                    write_session(&global, scope, &failed)?;
-                }
-                let _ = clear_session_live_usage(&global, scope, &args.session_id);
-            }
+            work_claimed_turn(&global, scope, session, worker_pid, claimed, &claimed_path).await?;
             continue;
         }
 
@@ -7559,6 +7521,107 @@ async fn run_worker(args: RunWorkerArgs) -> anyhow::Result<()> {
         let _ = clear_session_live_usage(&global, scope, &args.session_id);
     }
     Ok(())
+}
+
+/// Runs one claimed request as the session's worker (`worker_pid`): the
+/// session shows the turn running, then, when the turn fails, failed with
+/// its error. `claimed_path` is consumed either way.
+async fn work_claimed_turn(
+    global: &Path,
+    scope: SessionScope,
+    mut session: SessionRecord,
+    worker_pid: u32,
+    claimed: ClaimedTurn,
+    claimed_path: &Path,
+) -> anyhow::Result<()> {
+    let session_id = session.session_id.clone();
+    let run_id = claimed.run_id().to_owned();
+    let transcript_path = claimed.transcript_path().to_path_buf();
+    session.status = SessionStatus::Running;
+    session.updated_at = Utc::now();
+    session.active_run_id = Some(run_id.clone());
+    session.active_transcript_path = Some(transcript_path.clone());
+    session.active_pid = Some(worker_pid);
+    session.last_error = None;
+    if let Some(run) = session.runs.iter_mut().find(|run| run.run_id == run_id) {
+        run.pid = Some(worker_pid);
+        run.transcript_path = transcript_path.clone();
+    }
+    write_session(global, scope, &session)?;
+    clear_session_live_usage(global, scope, &session_id)?;
+
+    let result = match &claimed {
+        ClaimedTurn::Request(request) if request.compact => {
+            run_compact_request(global, scope, &session_id, request).await
+        }
+        ClaimedTurn::Request(request) => run_turn(request.turn_args(&session_id)).await,
+        ClaimedTurn::Newer {
+            version, prompt, ..
+        } => refuse_newer_turn(&session, *version, &run_id, prompt, &transcript_path),
+    };
+    let _ = fs::remove_file(claimed_path);
+
+    if let Err(err) = result {
+        let (mut failed, scope) = read_session(global, &session_id)?;
+        ensure_active_scope(scope, "session _worker")?;
+        if failed.worker_pid == Some(worker_pid) {
+            failed.status = SessionStatus::Failed;
+            failed.updated_at = Utc::now();
+            failed.active_run_id = None;
+            failed.active_transcript_path = None;
+            failed.active_pid = None;
+            failed.last_run_id = Some(run_id.clone());
+            failed.last_transcript_path = Some(transcript_path.clone());
+            failed.last_error = Some(err.to_string());
+            if let Some(run) = failed.runs.iter_mut().find(|run| run.run_id == run_id) {
+                run.completed_at.get_or_insert(Utc::now());
+                run.status.get_or_insert(RunStatus::Error);
+                run.error.get_or_insert_with(|| err.to_string());
+                run.transcript_path = transcript_path.clone();
+            }
+            write_session(global, scope, &failed)?;
+        }
+        let _ = clear_session_live_usage(global, scope, &session_id);
+    }
+    Ok(())
+}
+
+/// Fails a turn a newer rupu queued, with a transcript that says how to
+/// get a worker that can run it: `session stop` ends this one, and the
+/// next send starts one from the rupu on `PATH`.
+fn refuse_newer_turn(
+    session: &SessionRecord,
+    version: u32,
+    run_id: &str,
+    prompt: &str,
+    transcript_path: &Path,
+) -> anyhow::Result<()> {
+    let refusal = format!(
+        "this turn was queued by a newer rupu (turn request version {version}); restart the \
+         session worker: rupu session stop {}",
+        session.session_id
+    );
+    let customer = session.customer.clone().flatten();
+    let error = rupu_agent::record_unstarted_run(
+        rupu_agent::UnstartedRun {
+            transcript_path,
+            run_id,
+            workspace_id: &session.workspace_id,
+            agent: &session.agent_name,
+            provider: &session.provider_name,
+            model: &session.model,
+            mode: PermissionMode::parse(&session.permission_mode)
+                .unwrap_or(PermissionMode::Readonly),
+            codename: session.codename.as_deref(),
+            customer: customer.as_deref(),
+            system_prompt: Some(&session.agent_system_prompt),
+            prompt: &rupu_agent::UserTurn::new(prompt),
+            launch_skills: &[],
+            launch_preload_skills: &[],
+        },
+        rupu_providers::ProviderError::Preflight(refusal),
+    );
+    Err(error.into())
 }
 
 /// Execute an on-demand compaction pseudo-turn in the worker.
@@ -8885,6 +8948,10 @@ fn enqueue_session_turn_request(
     fs::create_dir_all(&dir)?;
     let path = session_turn_request_path(global, scope, session_id, &request.request_id);
     let tmp = path.with_extension("tmp");
+    let request = SessionTurnRequest {
+        version: request.written_version(),
+        ..request
+    };
     fs::write(&tmp, serde_json::to_vec_pretty(&request)?)?;
     fs::rename(&tmp, &path)?;
     Ok(())
@@ -8954,11 +9021,63 @@ fn persist_session_live_usage_snapshot(
     Ok(())
 }
 
+/// A turn request the worker claimed from the session's queue.
+enum ClaimedTurn {
+    Request(SessionTurnRequest),
+    /// Queued by a newer rupu: it may ask for what this worker can't read,
+    /// so the worker fails the turn rather than run it without that.
+    Newer {
+        version: u32,
+        run_id: String,
+        prompt: String,
+        transcript_path: PathBuf,
+    },
+}
+
+impl ClaimedTurn {
+    fn parse(bytes: &[u8]) -> anyhow::Result<Self> {
+        #[derive(Deserialize)]
+        struct Header {
+            version: u32,
+            run_id: String,
+            #[serde(default)]
+            prompt: String,
+            transcript_path: PathBuf,
+        }
+        let header: Header = serde_json::from_slice(bytes)?;
+        if header.version > SessionTurnRequest::VERSION {
+            return Ok(ClaimedTurn::Newer {
+                version: header.version,
+                run_id: header.run_id,
+                prompt: header.prompt,
+                transcript_path: header.transcript_path,
+            });
+        }
+        Ok(ClaimedTurn::Request(serde_json::from_slice(bytes)?))
+    }
+
+    fn run_id(&self) -> &str {
+        match self {
+            ClaimedTurn::Request(request) => &request.run_id,
+            ClaimedTurn::Newer { run_id, .. } => run_id,
+        }
+    }
+
+    fn transcript_path(&self) -> &Path {
+        match self {
+            ClaimedTurn::Request(request) => &request.transcript_path,
+            ClaimedTurn::Newer {
+                transcript_path, ..
+            } => transcript_path,
+        }
+    }
+}
+
 fn claim_next_session_turn_request(
     global: &Path,
     scope: SessionScope,
     session_id: &str,
-) -> anyhow::Result<Option<(SessionTurnRequest, PathBuf)>> {
+) -> anyhow::Result<Option<(ClaimedTurn, PathBuf)>> {
     let dir = session_turn_queue_dir(global, scope, session_id);
     if !dir.is_dir() {
         return Ok(None);
@@ -8975,7 +9094,7 @@ fn claim_next_session_turn_request(
         }
         let bytes = fs::read(&claimed)
             .with_context(|| format!("read session turn request {}", claimed.display()))?;
-        let request: SessionTurnRequest = serde_json::from_slice(&bytes)
+        let request = ClaimedTurn::parse(&bytes)
             .with_context(|| format!("parse session turn request {}", claimed.display()))?;
         return Ok(Some((request, claimed)));
     }
@@ -9973,6 +10092,9 @@ mod tests {
         .expect("claim request")
         .expect("request present");
 
+        let ClaimedTurn::Request(request) = request else {
+            panic!("a request this rupu runs");
+        };
         assert_eq!(request.run_id, "run_oldest");
         assert_eq!(request.prompt, "first");
         assert!(claimed_path

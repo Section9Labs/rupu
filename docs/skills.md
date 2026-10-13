@@ -362,4 +362,17 @@ version, so it continues a version 2 session but drops its skills the next
 time it writes the record: the session runs on without them. A rupu that
 knows session skills refuses a record from a newer rupu ("this session was
 written by a newer rupu; upgrade rupu to continue it") rather than write it
-back without the fields it doesn't know.
+back without the fields it doesn't know. `rupu session list` shows such a
+session with status `newer rupu` and a warning, and `rupu session prune`
+leaves it alone.
+
+A queued turn that invokes skills is written as turn request version 2; any
+other stays version 1, so an older worker still runs it. A worker that knows
+`--skill` fails a turn queued by a newer rupu, with a transcript ("this turn
+was queued by a newer rupu (turn request version <n>); restart the session
+worker: rupu session stop <id>"), rather than run it without what it asked
+for. A worker older than `--skill` can't refuse what it predates: it would run
+the turn without its skills. `session send` restarts a worker whose rupu
+binary is older than its own, judged by the binary's modification time, but
+it keeps the worker when that can't be read. After upgrading rupu, run
+`rupu session stop <id>` before using `--skill` on a running session.

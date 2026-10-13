@@ -1132,6 +1132,142 @@ fn the_worker_runs_a_queued_turn_with_its_invoked_skills() {
     assert_eq!(args.operator_skills, vec![pdf]);
 }
 
+/// A request is queued at the oldest version that carries it: one that
+/// invokes skills at 2, which a worker that predates `--skill` refuses
+/// rather than run without them; any other at 1, which such a worker runs.
+#[tokio::test]
+async fn a_request_is_queued_at_the_oldest_version_that_carries_it() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let global = tmp.path().join("global");
+    let pdf = rupu_skills::FrozenSkill {
+        name: "pdf".into(),
+        layer: rupu_skills::Layer::Global,
+        preload: false,
+        indexed: false,
+        reason: rupu_skills::SkillReason::Operator,
+        stamp: "ab".repeat(32),
+        content_hash: None,
+    };
+    let plain = queued_request(json!({ "version": SessionTurnRequest::VERSION }));
+    let mut with_skill = queued_request(json!({ "operator_skills": [pdf] }));
+    with_skill.request_id = "01KTEST0000000000000000002".into();
+    for request in [plain, with_skill] {
+        enqueue_session_turn_request(&global, SessionScope::Active, "ses_v", request).unwrap();
+    }
+    let queue = session_turn_queue_dir(&global, SessionScope::Active, "ses_v");
+    let mut versions: Vec<(String, u64)> = fs::read_dir(&queue)
+        .unwrap()
+        .map(|e| {
+            let v: serde_json::Value =
+                serde_json::from_slice(&fs::read(e.unwrap().path()).unwrap()).unwrap();
+            (
+                v["request_id"].as_str().unwrap().to_owned(),
+                v["version"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    versions.sort();
+    assert_eq!(
+        versions,
+        vec![
+            ("01KTEST0000000000000000001".to_owned(), 1),
+            ("01KTEST0000000000000000002".to_owned(), 2),
+        ]
+    );
+}
+
+/// Queues `request` (raw JSON) for `session_id`, claims it and has the
+/// worker run it, as `session _worker` does.
+async fn work_one(global: &Path, session_id: &str, request: serde_json::Value, script: &str) {
+    let queue = session_turn_queue_dir(global, SessionScope::Active, session_id);
+    fs::create_dir_all(&queue).unwrap();
+    fs::write(
+        queue.join("01KTEST.json"),
+        serde_json::to_vec(&request).unwrap(),
+    )
+    .unwrap();
+    let (claimed, path) = claim_next_session_turn_request(global, SessionScope::Active, session_id)
+        .unwrap()
+        .expect("a queued request");
+    let (mut session, scope) = read_session(global, session_id).unwrap();
+    session.worker_pid = Some(std::process::id());
+    write_session(global, scope, &session).unwrap();
+    with_mock_home(
+        global,
+        script,
+        work_claimed_turn(global, scope, session, std::process::id(), claimed, &path),
+    )
+    .await
+    .unwrap();
+    assert!(!path.exists(), "the claimed request is consumed");
+}
+
+/// A request a newer rupu queued is refused, never run without what this
+/// worker can't read: the turn fails with a transcript that says how to
+/// get a worker that can run it.
+#[tokio::test]
+async fn the_worker_refuses_a_request_a_newer_rupu_queued() {
+    let _guard = crate::test_support::ENV_LOCK.lock().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (global, record) = skill_session(&tmp, "ses_newer_req01", &agent(""), &[], &[]).await;
+    let id = record.session_id.clone();
+    let transcript = record.transcripts_dir.join("run_newer_1.jsonl");
+    let request = json!({
+        "version": 3,
+        "request_id": "01KTEST",
+        "run_id": "run_newer_1",
+        "prompt": "hi",
+        "transcript_path": transcript,
+        "enqueued_at": "2026-10-01T00:00:00Z",
+        "from_the_future": { "kept": true },
+    });
+    work_one(&global, &id, request, ACK).await;
+
+    let refusal = "this turn was queued by a newer rupu (turn request version 3); restart the \
+                   session worker: rupu session stop ses_newer_req01";
+    let evs: Vec<TranscriptEvent> = JsonlReader::iter(&transcript)
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    assert_eq!(closing_error(&evs).as_deref(), Some(refusal));
+    assert_eq!(user_message(&evs), "hi");
+    let (after, _) = read_session(&global, &id).unwrap();
+    assert_eq!(after.status, SessionStatus::Failed);
+    assert_eq!(after.last_error.as_deref(), Some(refusal));
+}
+
+/// A version-2 request (one that invokes skills) runs on this rupu, with
+/// its skills.
+#[tokio::test]
+async fn the_worker_runs_a_version_2_request() {
+    let _guard = crate::test_support::ENV_LOCK.lock().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    install_skill(&tmp.path().join("global"), "pdf", "PDF STEPS");
+    let (global, record) = skill_session(&tmp, "ses_v2_req01", &agent(""), &[], &[]).await;
+    let id = record.session_id.clone();
+    let invoked = invoke(&global, &id, &["pdf"]).await.unwrap();
+    let transcript = record.transcripts_dir.join("run_v2_1.jsonl");
+    let request = json!({
+        "version": 2,
+        "request_id": "01KTEST",
+        "run_id": "run_v2_1",
+        "prompt": "hi",
+        "transcript_path": transcript,
+        "enqueued_at": "2026-10-01T00:00:00Z",
+        "operator_skills": invoked,
+    });
+    work_one(&global, &id, request, ACK).await;
+
+    let evs: Vec<TranscriptEvent> = JsonlReader::iter(&transcript)
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    assert_eq!(closing_error(&evs), None);
+    assert_eq!(loads(&evs), pairs(&[("operator", "pdf")]));
+    let (after, _) = read_session(&global, &id).unwrap();
+    assert_eq!(after.status, SessionStatus::Idle, "{:?}", after.last_error);
+}
+
 const SUMMARY: &str = r#"[{ "AssistantText": { "text": "Summary of prior work.", "stop": "end_turn", "input_tokens": 500, "output_tokens": 10 } }]"#;
 
 fn dense_history(len: usize) -> Vec<Message> {
