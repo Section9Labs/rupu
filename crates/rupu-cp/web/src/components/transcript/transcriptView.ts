@@ -47,6 +47,12 @@
  *     a dedicated display (the RunDetail Netflow tab, fed from the separate
  *     per-run ledger API) — rendering it here too would flood nearly every
  *     turn with a redundant/misleading row, so it's a deliberate no-op.
+ *   • `message` (spec F1c §3.4) becomes a `message` block; a sent one
+ *     replaces, in place, the messaging tool card whose output names its id
+ *     (the card rides along as `raw`). `injected` becomes a chip block,
+ *     except one that only delivered messages this transcript records as
+ *     received (their bubbles show it). `self` is the sender of what the run
+ *     sent: its address in the space.
  *   • orphaned pairing targets (a `tool_result`/`file_edit`/`command_run`
  *     with no preceding `tool_call` to attach to in this snapshot) render as
  *     a standalone `tool` block instead of vanishing.
@@ -170,7 +176,23 @@ export type TurnBlock =
   | { kind: 'outcome'; severity: OutcomeSeverity; title: string; detail: string | null }
   | { kind: 'recovery'; text: string }
   | { kind: 'assistant_block'; text: string; abandoned: boolean; raw: unknown }
+  | { kind: 'message'; message: MessageView }
+  | { kind: 'injected'; source: string; injectedKind: string; cadence: string; content: string }
   | { kind: 'unknown'; type: string; data?: unknown };
+
+/** A message the run sent or received (`message` event, spec F1c §3.4). A
+ *  sent one carries the messaging tool call it came from, folded. */
+export interface MessageView {
+  id: string;
+  direction: 'sent' | 'received';
+  kind: string;
+  from: string;
+  to: string | null;
+  body: string;
+  urgent: boolean;
+  delivery: { resolved: string[]; undelivered?: { to: string; reason: string }[] } | null;
+  raw?: ToolView;
+}
 
 export interface TurnView {
   blocks: TurnBlock[];
@@ -185,6 +207,9 @@ export interface TurnView {
 
 export interface TranscriptView {
   header: TranscriptHeader | null;
+  /** The run's own address in its message space (the sender of what it
+   *  sent), when it sent anything. */
+  self: string | null;
   turns: TurnView[];
   footer: TranscriptFooter | null;
 }
@@ -318,6 +343,21 @@ function asReportFinding(
   return finding;
 }
 
+/** The message id a messaging tool's output names (`{"id": "msg_…", …}`). */
+function loggedId(output: string | undefined): string | null {
+  if (!output || !output.startsWith('{')) return null;
+  try {
+    return asString(asRecord(JSON.parse(output))?.id);
+  } catch {
+    return null;
+  }
+}
+
+function lastIndexWhere<T>(xs: T[], pred: (x: T) => boolean): number {
+  for (let i = xs.length - 1; i >= 0; i--) if (pred(xs[i])) return i;
+  return -1;
+}
+
 /**
  * The command a `command_run`'s argv represents. The agent `bash` tool
  * records `[sh, -c, <script>]`, where the script is the command; anything
@@ -424,10 +464,68 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
     return current ?? newTurn();
   }
 
+  // Messages the transcript records as received: an `injected` event that
+  // only delivered these is shown by their bubbles, not as a chip.
+  const received = new Set<string>();
+  for (const ev of events) {
+    if (ev.type !== 'message') continue;
+    const d = (ev.data ?? {}) as Record<string, unknown>;
+    if (d.direction === 'received' && typeof d.id === 'string') received.add(d.id);
+  }
+  let self: string | null = null;
+
   for (const ev of events) {
     const data = (ev.data ?? {}) as Record<string, unknown>;
 
     switch (ev.type) {
+      case 'message': {
+        const id = asString(data.id) ?? '';
+        const direction = data.direction === 'sent' ? 'sent' : 'received';
+        const delivery = asRecord(data.delivery);
+        const message: MessageView = {
+          id,
+          direction,
+          kind: asString(data.kind) ?? 'post',
+          from: asString(data.from) ?? '',
+          to: asString(data.to),
+          body: asString(data.body) ?? '',
+          urgent: data.urgent === true,
+          delivery: delivery
+            ? {
+                resolved: asStringArray(delivery.resolved),
+                undelivered: asRecordArray(delivery.undelivered).map((u) => ({ to: asString(u.to) ?? '', reason: asString(u.reason) ?? '' })),
+              }
+            : null,
+        };
+        const turn = ensureTurn();
+        if (direction === 'sent') {
+          if (self === null && message.from) self = message.from;
+          // The messaging tool's output names the id it logged: that card
+          // becomes this bubble, in its place.
+          const at = id ? lastIndexWhere(turn.blocks, (b) => b.kind === 'tool' && loggedId(b.view.output) === id) : -1;
+          if (at >= 0) {
+            message.raw = (turn.blocks[at] as Extract<TurnBlock, { kind: 'tool' }>).view;
+            turn.blocks[at] = { kind: 'message', message };
+            break;
+          }
+        }
+        turn.blocks.push({ kind: 'message', message });
+        break;
+      }
+
+      case 'injected': {
+        const ids = asStringArray(data.message_ids);
+        if (ids.length > 0 && ids.every((i) => received.has(i))) break;
+        ensureTurn().blocks.push({
+          kind: 'injected',
+          source: asString(data.source) ?? '',
+          injectedKind: asString(data.kind) ?? '',
+          cadence: asString(data.cadence) ?? '',
+          content: asString(data.content) ?? '',
+        });
+        break;
+      }
+
       case 'run_start': {
         header = {
           agent: asString(data.agent) ?? '',
@@ -827,8 +925,8 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
 
   // Finalize per-turn summaries.
   for (const turn of turns) {
-    const tools = turn.blocks.filter(
-      (b): b is Extract<TurnBlock, { kind: 'tool' }> => b.kind === 'tool',
+    const tools = turn.blocks.flatMap((b) =>
+      b.kind === 'tool' ? [b] : b.kind === 'message' && b.message.raw ? [{ kind: 'tool' as const, view: b.message.raw }] : [],
     );
     const hasError = tools.some((t) => t.view.error !== undefined);
     turn.summary = {
@@ -842,5 +940,5 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
   // only produced deltas) so empty shells don't render.
   const nonEmpty = turns.filter((t) => t.blocks.length > 0);
 
-  return { header, turns: nonEmpty, footer };
+  return { header, self, turns: nonEmpty, footer };
 }

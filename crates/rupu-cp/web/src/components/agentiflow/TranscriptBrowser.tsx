@@ -13,7 +13,7 @@
 // a workflow unit's sub-transcripts lazy-load `GET /api/runs/:id/graph` on
 // expand, and a filter box narrows the list.
 
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ChevronRight, ChevronDown, Search, Radio } from 'lucide-react';
 import TranscriptPanel from '../TranscriptPanel';
 import { AgentName } from '../codename/AgentName';
@@ -27,7 +27,7 @@ import type { AgentiflowDetail, AgentiflowUnit, RunGraphResponse, StepNodeDto } 
 type Mode = 'light' | 'dark';
 
 /** The transcript the right pane is showing. */
-interface Selection {
+export interface Selection {
   path: string;
   live: boolean;
   title: string;
@@ -136,7 +136,16 @@ function stepDot(r?: { success?: boolean; skipped?: boolean }): DotState {
 
 // ---------------------------------------------------------------------------
 
-export default function TranscriptBrowser({ detail, running }: { detail: AgentiflowDetail; running: boolean }) {
+export default function TranscriptBrowser({
+  detail,
+  running,
+  focus,
+}: {
+  detail: AgentiflowDetail;
+  running: boolean;
+  /** A transcript to show (a message's "open in transcript"). */
+  focus?: Selection | null;
+}) {
   const mode = useThemeMode();
   const { record } = detail;
   const { leadByRound, byRound, maxRound, liveRound } = useMemo(() => computeBuckets(detail, running), [detail, running]);
@@ -145,7 +154,10 @@ export default function TranscriptBrowser({ detail, running }: { detail: Agentif
   const [roundOverride, setRoundOverride] = useState<Record<number, boolean>>({});
   const [openUnits, setOpenUnits] = useState<Record<string, boolean>>({});
   const [subCache, setSubCache] = useState<Record<string, SubCache>>({});
-  const [sel, setSel] = useState<Selection | null>(null);
+  const [sel, setSel] = useState<Selection | null>(focus ?? null);
+  useEffect(() => {
+    if (focus) setSel(focus);
+  }, [focus]);
 
   // Default selection: the last lead round (what the old tab showed), live
   // while the engagement runs.

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { api, ApiError, boardOf, type MessagesView } from './api';
+import { api, ApiError, type MessageStreamFrame, type MessagesView } from './api';
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -129,37 +129,25 @@ describe('messages API', () => {
     expect(got).toEqual({ kind: 'sent', reply });
   });
 
-  it('messagesStreamUrl names the route', () => {
-    expect(api.messagesStreamUrl('sessions', 'ses_01A')).toBe('/api/sessions/ses_01A/messages/stream');
-  });
-
-  it('the agentiflow board is the view’s posts and directives, retractions folded as {retract}', async () => {
-    expect(boardOf(VIEW)).toEqual({
-      posts: [
-        {
-          id: 'msg_1',
-          kind: 'observation',
-          author: 'recon#1',
-          addressed_to: null,
-          ts: '2026-10-07T22:15:00Z',
-          body: 'port 22 open',
-        },
-      ],
-      directives: [
-        { id: 'msg_2', author: 'lead', addressed_to: null, ts: '2026-10-07T22:16:00Z', body: 'stay in scope' },
-        { retract: 'msg_2' },
-        {
-          id: 'msg_5',
-          author: 'lead',
-          addressed_to: 'recon#1',
-          ts: '2026-10-07T22:19:00Z',
-          body: 'skip the printers',
-        },
-      ],
-    });
-
-    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse(VIEW));
-    expect(await api.getAgentiflowMessages('af_01A')).toEqual(boardOf(VIEW));
-    expect(fetchMock.mock.calls[0][0]).toBe('/api/agentiflows/af_01A/messages');
+  it('subscribeMessages follows the route\'s stream and parses each frame', () => {
+    const opened: { url: string; es: { onmessage?: (m: { data: string }) => void; close: () => void } }[] = [];
+    class FakeEventSource {
+      onmessage?: (m: { data: string }) => void;
+      onopen?: () => void;
+      onerror?: () => void;
+      close = vi.fn();
+      constructor(url: string) {
+        opened.push({ url, es: this });
+      }
+    }
+    vi.stubGlobal('EventSource', FakeEventSource);
+    const frames: MessageStreamFrame[] = [];
+    const close = api.subscribeMessages('sessions', 'ses_01A', { onFrame: (f) => frames.push(f) });
+    expect(opened[0].url).toBe('/api/sessions/ses_01A/messages/stream');
+    opened[0].es.onmessage?.({ data: JSON.stringify({ t: 'seen', id: 'msg_1', by: 'heron', turn: 2, at: 'x' }) });
+    expect(frames).toEqual([{ t: 'seen', id: 'msg_1', by: 'heron', turn: 2, at: 'x' }]);
+    close();
+    expect(opened[0].es.close).toHaveBeenCalled();
+    vi.unstubAllGlobals();
   });
 });

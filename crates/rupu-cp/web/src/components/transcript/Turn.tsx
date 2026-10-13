@@ -9,16 +9,18 @@
  * Expanded: the same header (chevron down) then the body — every block in
  * `turn.blocks`, in order, dispatched by kind through `TurnBlockView`:
  * assistant/user markdown, a collapsible thinking block (or a redacted
- * marker), `ToolCard`s, gate/seed/notice/meta/compaction rows, and an `unknown`
+ * marker), `ToolCard`s, message bubbles and injected-context chips,
+ * gate/seed/notice/meta/compaction rows, and an `unknown`
  * fallback row so nothing silently vanishes.
  *
  * No `any`. Static Tailwind class strings only.
  */
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { ChevronRight, ChevronDown, Wrench, AlertTriangle } from 'lucide-react';
 import Markdown from './Markdown';
 import ToolCard from './ToolCard';
+import MessageBubble, { InjectedChip } from './MessageBubble';
 import type { TurnBlock, TurnView } from './transcriptView';
 import { cn } from '../../lib/cn';
 
@@ -42,6 +44,14 @@ const RESULT_LABEL: Record<TurnView['summary']['result'], string> = {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/** A turn that said nothing itself but messaged: its first message. */
+function messageSnippet(turn: TurnView): string {
+  const first = turn.blocks.find((b): b is Extract<TurnBlock, { kind: 'message' }> => b.kind === 'message');
+  if (!first) return '';
+  const { direction, from, to, body } = first.message;
+  return snippet(direction === 'sent' ? `→ ${to ?? 'channel'}: ${body}` : `${from}: ${body}`);
+}
+
 /** First ~100 chars of the assistant content, whitespace-flattened. */
 function snippet(content: string | undefined): string {
   if (!content) return '';
@@ -59,9 +69,15 @@ export default function Turn({
   onOpenTranscript,
   runId,
   host,
+  self,
+  highlightMsg,
 }: {
   turn: TurnView;
   defaultOpen: boolean;
+  /** The run's address in its message space (`TranscriptView.self`). */
+  self?: string | null;
+  /** The `#msg-` anchor: the turn holding it opens, the bubble rings. */
+  highlightMsg?: string | null;
   onOpenTranscript?: (path: string) => void;
   /** Run id threaded down to `ToolCard` for the source-preview affordance
    *  (ast_grep match headers, finding location chips). */
@@ -70,6 +86,10 @@ export default function Turn({
   host?: string;
 }) {
   const [open, setOpen] = useState(defaultOpen);
+  const holdsAnchor = !!highlightMsg && turn.blocks.some((b) => b.kind === 'message' && b.message.id === highlightMsg);
+  useEffect(() => {
+    if (holdsAnchor) setOpen(true);
+  }, [holdsAnchor]);
 
   const { toolCount, findingCount, result } = turn.summary;
   const firstAssistant = turn.blocks.find(
@@ -91,7 +111,7 @@ export default function Turn({
         )}
 
         <span className="min-w-0 flex-1 truncate text-note text-ink-dim">
-          {snippet(firstAssistant?.content) || (
+          {snippet(firstAssistant?.content) || messageSnippet(turn) || (
             <span className="italic text-ink-mute">no assistant message</span>
           )}
         </span>
@@ -136,6 +156,8 @@ export default function Turn({
               onOpenTranscript={onOpenTranscript}
               runId={runId}
               host={host}
+              self={self}
+              highlightMsg={highlightMsg}
             />
           ))}
         </div>
@@ -153,13 +175,28 @@ function TurnBlockView({
   onOpenTranscript,
   runId,
   host,
+  self,
+  highlightMsg,
 }: {
   block: TurnBlock;
   onOpenTranscript?: (path: string) => void;
   runId?: string;
   host?: string;
+  self?: string | null;
+  highlightMsg?: string | null;
 }) {
   switch (block.kind) {
+    case 'message':
+      return (
+        <MessageBubble
+          message={block.message}
+          self={self}
+          highlight={highlightMsg === block.message.id}
+          raw={block.message.raw ? <ToolCard tool={block.message.raw} onOpenTranscript={onOpenTranscript} runId={runId} host={host} /> : undefined}
+        />
+      );
+    case 'injected':
+      return <InjectedChip source={block.source} kind={block.injectedKind} cadence={block.cadence} content={block.content} />;
     case 'assistant':
       return (
         <div>

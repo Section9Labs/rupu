@@ -40,6 +40,10 @@ export type TranscriptEvent =
   // or a block abandoned at a mid-output server-side fallback): `block` is the
   // provider-neutral ContentBlock JSON.
   | { type: 'assistant_block'; data: { block: Record<string, unknown>; abandoned?: boolean } }
+  // A message the run sent or received in its message space (spec F1a §6).
+  | { type: 'message'; data: { id: string; direction: 'sent' | 'received'; from: string; from_codename?: string; to?: string | null; kind: string; body: string; urgent?: boolean; via: 'tool' | 'injected'; delivery?: unknown } }
+  // Context a collector put in front of the model; `content` is raw.
+  | { type: 'injected'; data: { source: string; kind: string; cadence: string; content: string; message_ids?: string[] } }
   // Catch-all for forward-compat: the server passes an unrecognized event's
   // `data` through verbatim; the view model keeps it on the `unknown` block.
   | { type: string; data: Record<string, unknown> };

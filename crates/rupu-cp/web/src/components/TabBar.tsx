@@ -23,11 +23,14 @@ export function TabButton({
   onClick,
   icon: Icon,
   label,
+  badge,
 }: {
   active: boolean;
   onClick: () => void;
   icon: LucideIcon;
   label: string;
+  /** A count beside the label (e.g. messages since the page opened). */
+  badge?: number;
 }) {
   return (
     <button
@@ -41,6 +44,9 @@ export function TabButton({
     >
       <Icon size={12} />
       {label}
+      {badge ? (
+        <span className="rounded-full bg-brand-600 px-1.5 text-[10px] font-semibold leading-4 text-white tabular-nums">{badge}</span>
+      ) : null}
     </button>
   );
 }

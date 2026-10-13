@@ -8,8 +8,8 @@
 // branching graph is a later pass. A `running` run re-fetches every 5 s (the
 // lead's transcript tails live over SSE on its own); Refresh re-fetches on demand.
 
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
-import { Link, useParams } from 'react-router-dom';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { ArrowLeft, CheckCircle2, Circle, RefreshCw } from 'lucide-react';
 import {
   api,
@@ -23,9 +23,12 @@ import { CrewChip } from '../components/codename/CrewChip';
 import { AgentName } from '../components/codename/AgentName';
 import AgentiflowGraph from '../components/agentiflow/AgentiflowGraph';
 import AssetInventory from '../components/agentiflow/AssetInventory';
-import MessageFeed from '../components/agentiflow/MessageFeed';
+import MessageFeed from '../components/messages/MessageFeed';
+import { MessageLinksContext, type MessageLinks } from '../components/transcript/messageLinks';
+import { msgHash, parseMsgHash } from '../lib/messages';
+import { useMessageSpace } from '../lib/useMessageSpace';
 import EngagementFindings from '../components/agentiflow/EngagementFindings';
-import TranscriptBrowser from '../components/agentiflow/TranscriptBrowser';
+import TranscriptBrowser, { type Selection as TranscriptSelection } from '../components/agentiflow/TranscriptBrowser';
 import AgentiflowEventFeed from '../components/agentiflow/AgentiflowEventFeed';
 import { Segmented } from '../components/ui/Segmented';
 import { Badge } from '../components/ui/Badge';
@@ -67,7 +70,9 @@ const TABS: { value: AfTab; label: string }[] = [
 ];
 
 export default function AgentiflowDetail() {
-  const [tab, setTab] = useState<AfTab>('flow');
+  const { hash, search } = useLocation();
+  const navigate = useNavigate();
+  const [tab, setTab] = useState<AfTab>(() => (parseMsgHash(hash) ? 'messages' : 'flow'));
   const { id = '' } = useParams<{ id: string }>();
   const [detail, setDetail] = useState<AgentiflowDetailData | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -115,6 +120,43 @@ export default function AgentiflowDetail() {
     const t = setInterval(() => void load(true), POLL_MS);
     return () => clearInterval(t);
   }, [running, load]);
+
+  const [messagesOpened, setMessagesOpened] = useState(tab === 'messages');
+  useEffect(() => {
+    if (tab === 'messages') setMessagesOpened(true);
+  }, [tab]);
+  const messages = useMessageSpace({ route: 'agentiflows', id }, { live: running, load: running || messagesOpened, reading: tab === 'messages' });
+  const [transcriptFocus, setTranscriptFocus] = useState<TranscriptSelection | null>(null);
+  // The transcript a participant's messages are in: a unit's own, or the
+  // lead's latest round.
+  const transcriptOf = useCallback(
+    (address: string): TranscriptSelection | null => {
+      if (!detail) return null;
+      if (address === 'lead') {
+        const last = detail.lead_transcripts[detail.lead_transcripts.length - 1];
+        return last ? { path: last.path, live: running, title: `Lead · round ${last.round}`, sub: `lead · round ${last.round}` } : null;
+      }
+      const unit = detail.units.find((u) => u.participant === address);
+      return unit?.transcript_path ? { path: unit.transcript_path, live: false, title: unit.codename, sub: unit.agent ?? unit.kind } : null;
+    },
+    [detail, running],
+  );
+  const messageLinks = useMemo<MessageLinks>(
+    () => ({
+      openInFeed: (msgId) => {
+        setTab('messages');
+        navigate({ search, hash: msgHash(msgId) });
+      },
+      openParticipant: (address, msgId) => {
+        const sel = transcriptOf(address);
+        if (!sel) return;
+        setTranscriptFocus(sel);
+        setTab('transcript');
+        navigate({ search, hash: msgHash(msgId) });
+      },
+    }),
+    [navigate, search, transcriptOf],
+  );
 
   if (notFound) {
     return (
@@ -266,7 +308,12 @@ export default function AgentiflowDetail() {
 
       {/* Profile-aware tabs — the same shape workflow runs + projects use. */}
       <div className="flex flex-wrap items-center gap-3">
-        <Segmented options={TABS} value={tab} onChange={(v) => setTab(v as AfTab)} ariaLabel="Agentiflow view" />
+        <Segmented
+          options={TABS.map((t) => (t.value === 'messages' && messages.unread > 0 ? { ...t, label: `Messages (${messages.unread})` } : t))}
+          value={tab}
+          onChange={(v) => setTab(v as AfTab)}
+          ariaLabel="Agentiflow view"
+        />
         <span className="text-meta text-ink-mute">
           profile{record.engagement_profiles.length === 1 ? '' : 's'}: {record.engagement_profiles.join(', ') || 'none'}
         </span>
@@ -343,14 +390,20 @@ export default function AgentiflowDetail() {
       )}
 
       {tab === 'messages' && (
-        <Panel title="Board" meta={<span className="text-meta text-ink-mute">how the fleet talks to itself</span>}>
-          <MessageFeed id={id} live={running} />
-        </Panel>
+        <MessageFeed
+          route="agentiflows"
+          space={messages}
+          notLiveReason={running ? null : `This agentiflow is ${record.status}: messages only reach a running flow.`}
+          openInTranscript={(m) => (transcriptOf(m.from) ? () => messageLinks.openParticipant?.(m.from, m.id) : null)}
+          highlightId={parseMsgHash(hash)}
+        />
       )}
 
       {tab === 'transcript' && (
         <section>
-          <TranscriptBrowser detail={detail} running={running} />
+          <MessageLinksContext.Provider value={messageLinks}>
+            <TranscriptBrowser detail={detail} running={running} focus={transcriptFocus} />
+          </MessageLinksContext.Provider>
         </section>
       )}
 

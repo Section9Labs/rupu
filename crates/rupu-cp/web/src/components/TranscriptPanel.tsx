@@ -7,7 +7,7 @@
 // (markdown assistant message + per-tool `ToolCard`s + finding cards).
 
 import { useEffect, useRef, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { AlertTriangle } from 'lucide-react';
 import { api, apiErrorMessage } from '../lib/api';
 import type { TranscriptEvent } from '../lib/transcript';
@@ -15,6 +15,7 @@ import { cn } from '../lib/cn';
 import { formatDuration } from '../lib/duration';
 import { Spinner } from './ui/Spinner';
 import { buildTranscriptView } from './transcript/transcriptView';
+import { parseMsgHash } from '../lib/messages';
 import Turn from './transcript/Turn';
 import { AgentName } from './codename/AgentName';
 
@@ -96,6 +97,7 @@ export default function TranscriptPanel({
   // don't affect it.
   const [partial, setPartial] = useState(false);
   const navigate = useNavigate();
+  const location = useLocation();
 
   // Open a sub-run transcript in the same transcript route (reuses the existing
   // `/transcript?path=…` page — no new global state). Sub-runs are completed
@@ -228,6 +230,9 @@ export default function TranscriptPanel({
   }, [path, live, host, runId]);
 
   const view = buildTranscriptView(mergeSnapshotAndStream(snapshot, stream));
+  // `#msg-<id>`: the turn holding the bubble opens and the bubble scrolls
+  // itself into view (Turn, MessageBubble).
+  const highlightMsg = parseMsgHash(location.hash);
 
   // ---- non-ready states ----------------------------------------------------
 
@@ -331,6 +336,8 @@ export default function TranscriptPanel({
             onOpenTranscript={openTranscript}
             runId={runId}
             host={host}
+            self={view.self}
+            highlightMsg={highlightMsg}
           />
         ))}
       </div>
