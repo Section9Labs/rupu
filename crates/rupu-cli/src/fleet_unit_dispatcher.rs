@@ -358,9 +358,10 @@ impl FleetUnitDispatcher {
     }
 
     /// This coordinator's copy of `name`, whose skill keys ship with the unit.
-    /// `None` when it has none (the step's skills still ship); when its agent
-    /// files can't be read, also a warning, since the agent's own skills then
-    /// come from the host's installed copies.
+    /// `None` when it has none (the step's skills still ship); when its own
+    /// file can't be read, also a warning naming it, since the agent's skills
+    /// then come from the host's installed copies. Another agent's broken
+    /// file changes nothing.
     async fn coordinator_agent(
         &self,
         name: &str,
@@ -376,7 +377,7 @@ impl FleetUnitDispatcher {
                 let name = name.to_string();
                 async move {
                     tokio::task::spawn_blocking(move || {
-                        rupu_agent::find_agent(&global, project.as_deref(), &name)
+                        rupu_agent::find_agent_tolerant(&global, project.as_deref(), &name)
                     })
                     .await
                     .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))
@@ -389,8 +390,8 @@ impl FleetUnitDispatcher {
             Err(rupu_agent::AgentLoadError::NotFound(_)) => None,
             Err(e) => {
                 warnings.push(format!(
-                    "the coordinator could not read agent `{name}` ({e}), so only the step's \
-                     skills are shipped; the agent's own come from the host's installed copies"
+                    "the coordinator could not read agent `{name}` ({e}), so its skills are not \
+                     shipped; the host's installed copies are used for them"
                 ));
                 None
             }
@@ -1053,6 +1054,7 @@ mod tests {
     enum ShipScript {
         Answer(rupu_cp::host::skill_ship::ShipOutcome),
         Unreachable(&'static str),
+        Unsupported(&'static str),
     }
 
     impl FakeConnector {
@@ -1161,6 +1163,7 @@ mod tests {
             match &self.ship {
                 ShipScript::Answer(a) => Ok(a.clone()),
                 ShipScript::Unreachable(m) => Err(HostConnectorError::Unreachable(m.to_string())),
+                ShipScript::Unsupported(m) => Err(HostConnectorError::Unsupported(m.to_string())),
             }
         }
 
@@ -3367,6 +3370,113 @@ steps:
         assert!(msg.contains("pipe broke"), "{msg}");
         assert_eq!(err.coverage, UnitCoverage::NotLaunched);
         assert!(conn.launched.lock().unwrap().is_none(), "no launch");
+    }
+
+    /// An `Err(Unsupported)` from the transfer (say, no `rupu` on the host)
+    /// is a failed launch, not the P5 downgrade.
+    #[tokio::test]
+    async fn an_unsupported_error_from_the_transfer_fails_the_unit_before_launch() {
+        let g = coordinator(true);
+        let conn = shipping(ShipScript::Unsupported("rupu not found"));
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            g.path().to_path_buf(),
+            None,
+        );
+        let err = d.dispatch_unit(make_unit(), "h").await.unwrap_err();
+        let msg = the_provider_message(&err.error);
+        assert!(msg.starts_with("host h: "), "{msg}");
+        assert!(msg.contains("rupu not found"), "{msg}");
+        assert_eq!(err.coverage, UnitCoverage::NotLaunched);
+        assert!(err.warnings.is_empty(), "{:?}", err.warnings);
+        assert!(conn.launched.lock().unwrap().is_none(), "no launch");
+    }
+
+    /// A host that needs nothing shipped (`host: local`) launches without a
+    /// manifest, the step's entries as given.
+    #[tokio::test]
+    async fn a_not_needed_answer_launches_without_a_bundle() {
+        let g = coordinator(true);
+        let conn = shipping(ShipScript::Answer(
+            rupu_cp::host::skill_ship::ShipOutcome::NotNeeded,
+        ));
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            g.path().to_path_buf(),
+            None,
+        );
+        let out = d
+            .dispatch_unit(unit_with_skills(&["notes"]), "h")
+            .await
+            .unwrap();
+        assert_eq!(conn.shipped.lock().unwrap().len(), 1, "it was asked");
+        let launched = conn.launched.lock().unwrap().clone().expect("launched");
+        assert_eq!(launched.skill_bundle, None);
+        assert_eq!(launched.skills, vec!["notes".to_string()]);
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    }
+
+    const BROKEN_AGENT: &str = "---\nname: [not a name\n---\n";
+
+    /// An unrelated agent file the coordinator can't parse changes nothing
+    /// for a unit: no warning, a normal launch.
+    #[tokio::test]
+    async fn an_unrelated_broken_agent_file_leaves_a_unit_alone() {
+        for with_agent in [true, false] {
+            let g = tempfile::tempdir().unwrap();
+            if with_agent {
+                write_agent(g.path(), "a", "");
+            }
+            std::fs::create_dir_all(g.path().join("agents")).unwrap();
+            std::fs::write(g.path().join("agents/x.md"), BROKEN_AGENT).unwrap();
+            let conn = shipping(ShipScript::Unreachable("must not be asked"));
+            let d = FleetUnitDispatcher::from_connector(
+                Arc::clone(&conn) as Arc<dyn HostConnector>,
+                g.path().to_path_buf(),
+                None,
+            );
+            let out = d.dispatch_unit(make_unit(), "h").await.unwrap();
+            assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+            assert!(conn.shipped.lock().unwrap().is_empty());
+            assert!(conn.launched.lock().unwrap().is_some(), "launched");
+        }
+    }
+
+    /// The unit's own agent file being unreadable is a warning naming that
+    /// file; the step's skills still ship.
+    #[tokio::test]
+    async fn the_units_own_broken_agent_file_is_a_warning_naming_it() {
+        let g = coordinator(false);
+        std::fs::create_dir_all(g.path().join("agents")).unwrap();
+        let own = g.path().join("agents/a.md");
+        std::fs::write(&own, BROKEN_AGENT).unwrap();
+        let conn = shipping(ShipScript::Answer(
+            rupu_cp::host::skill_ship::ShipOutcome::Shipped(manifest()),
+        ));
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            g.path().to_path_buf(),
+            None,
+        );
+        let out = d
+            .dispatch_unit(unit_with_skills(&["notes"]), "h")
+            .await
+            .unwrap();
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        assert!(
+            out.warnings[0].starts_with("host h: "),
+            "{:?}",
+            out.warnings
+        );
+        assert!(
+            out.warnings[0].contains(&own.display().to_string()),
+            "{:?}",
+            out.warnings
+        );
+        assert_eq!(
+            *conn.shipped.lock().unwrap(),
+            vec![vec!["notes".to_string()]]
+        );
     }
 
     /// A launch failure names the host exactly once.

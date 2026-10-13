@@ -283,6 +283,66 @@ pub fn find_agent(
         .ok_or_else(|| AgentLoadError::NotFound(name.to_string()))
 }
 
+/// [`find_agent`] for a caller that needs only `name`: a file that fails to
+/// parse is skipped unless it is the agent's own (`<name>.md`), so an
+/// unrelated broken file never hides it. The project layer still shadows
+/// the global one by frontmatter name, and a layer whose own `<name>.md`
+/// fails to parse answers with that file's error. Tries `<name>.md` first,
+/// so the common case parses one file.
+pub fn find_agent_tolerant(
+    global: &Path,
+    project: Option<&Path>,
+    name: &str,
+) -> Result<AgentSpec, AgentLoadError> {
+    for root in project.into_iter().chain(std::iter::once(global)) {
+        if let Some(found) = find_in_dir_tolerant(&root.join("agents"), name)? {
+            return found;
+        }
+    }
+    Err(AgentLoadError::NotFound(name.to_string()))
+}
+
+/// `name` in `dir`: `None` when the layer has no definition of it, else the
+/// agent or its own file's parse error.
+fn find_in_dir_tolerant(
+    dir: &Path,
+    name: &str,
+) -> Result<Option<Result<AgentSpec, AgentLoadError>>, AgentLoadError> {
+    if !dir.is_dir() {
+        return Ok(None);
+    }
+    let io = |e| AgentLoadError::Io {
+        path: dir.display().to_string(),
+        source: e,
+    };
+    let own = dir.join(format!("{name}.md"));
+    let mut own_error = None;
+    if own.is_file() {
+        match AgentSpec::parse_file(&own) {
+            Ok(spec) if spec.name == name => return Ok(Some(Ok(spec))),
+            Ok(_) => {}
+            Err(source) => {
+                own_error = Some(AgentLoadError::Parse {
+                    path: own.display().to_string(),
+                    source,
+                })
+            }
+        }
+    }
+    for entry in std::fs::read_dir(dir).map_err(io)? {
+        let path = entry.map_err(io)?.path();
+        if path == own || path.extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
+        if let Ok(spec) = AgentSpec::parse_file(&path) {
+            if spec.name == name {
+                return Ok(Some(Ok(spec)));
+            }
+        }
+    }
+    Ok(own_error.map(Err))
+}
+
 /// Which layer an agent file was found in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentLayer {
