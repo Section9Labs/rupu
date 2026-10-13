@@ -25,7 +25,7 @@ use crate::{
         RunKind, RunListQuery, RunStartEvidence, MAX_WORKSPACE_BYTES,
     },
     host::skill_ship::{
-        manifest_of, pack_bundle, prefixed, ref_arg, ShipMemo, ShipOutcome, SkillBundle,
+        prefixed, ref_arg, ship_through, ShipMemo, ShipOutcome, SkillBundle, Transfer,
     },
     launcher::LaunchRequest,
     node::{
@@ -108,17 +108,25 @@ fn features_list(feature: &str) -> String {
     )
 }
 
-/// Runs `then` only when the remote's `rupu __features` lists `feature`,
-/// else prints `marker`; prints [`LAUNCH_RUPU_NOT_FOUND`] when the remote
-/// has no `rupu` on its non-interactive PATH.
-fn feature_gate(feature: &str, marker: &str, then: &str) -> String {
+/// Runs `then` only when the remote's `rupu __features` lists every
+/// `(feature, marker)` feature, else prints the first missing one's marker;
+/// prints [`LAUNCH_RUPU_NOT_FOUND`] when the remote has no `rupu` on its
+/// non-interactive PATH. The report is captured once.
+fn feature_gate(checks: &[(&str, &str)], then: &str) -> String {
+    let gated = checks
+        .iter()
+        .rev()
+        .fold(then.to_string(), |inner, (feature, marker)| {
+            format!(
+                "if {}; then {inner}; else echo {}; fi",
+                features_list(feature),
+                shell_escape(marker)
+            )
+        });
     format!(
-        "if ! command -v rupu >/dev/null 2>&1; then echo {}; else {}; \
-         if {}; then {then}; else echo {}; fi; fi",
+        "if ! command -v rupu >/dev/null 2>&1; then echo {}; else {}; {gated}; fi",
         shell_escape(LAUNCH_RUPU_NOT_FOUND),
         features_capture(),
-        features_list(feature),
-        shell_escape(marker),
     )
 }
 
@@ -1979,7 +1987,11 @@ impl SshHostConnector {
     /// A launch carrying workflow-step skills is wrapped in the skills gate
     /// ([`Self::skills_gate`]) as a backstop: `launch_agent` has already
     /// sent the same gate as its own command
-    /// ([`Self::skills_gate_command`]) before creating the mirror run.
+    /// ([`Self::skills_gate_command`]) before creating the mirror run. A
+    /// launch carrying a skill bundle is gated on [`CAP_AGENT_SKILL_BUNDLE`]
+    /// the same way, in the launch command only: a dispatched unit's ship
+    /// already asked, and a direct launch, or a host rolled back since,
+    /// must be refused rather than die on an unknown flag.
     fn detach_launch_argv(
         argv: &RunArgv,
         run_id: &str,
@@ -1988,8 +2000,14 @@ impl SshHostConnector {
         let current = argv.to_shell("rupu");
         let (legacy, _) = argv.for_peer(&FeatureSet::shell_peer(Vec::<String>::new()));
         let legacy = legacy.to_shell("rupu");
-        let needs_skills = carries_skills(argv);
-        if legacy == current && !needs_skills {
+        let mut gates = Vec::new();
+        if carries_skills(argv) {
+            gates.push((CAP_AGENT_SKILLS, LAUNCH_SKILLS_UNSUPPORTED));
+        }
+        if matches!(argv, RunArgv::Agent(a) if a.skill_bundle.is_some()) {
+            gates.push((CAP_AGENT_SKILL_BUNDLE, SKILLS_BUNDLE_UNSUPPORTED));
+        }
+        if legacy == current && gates.is_empty() {
             return Self::detach_launch(&current, run_id, working_dir);
         }
         let launch = |redirect: &str| {
@@ -2005,13 +2023,13 @@ impl SshHostConnector {
                 )
             }
         };
-        if !needs_skills {
+        if gates.is_empty() {
             return Self::detach_launch_with(run_id, working_dir, |redirect| {
                 format!("{}; {}", features_capture(), launch(redirect))
             });
         }
         let launch = Self::detach_launch_with(run_id, working_dir, launch)?;
-        Ok(Self::skills_gate(&launch))
+        Ok(feature_gate(&gates, &launch))
     }
 
     /// The skills gate: captures the remote's feature report into `$f` and
@@ -2021,27 +2039,26 @@ impl SshHostConnector {
     /// instead. A remote with no `rupu` on its non-interactive PATH prints
     /// [`LAUNCH_RUPU_NOT_FOUND`] instead, so the refusal says what is wrong.
     fn skills_gate(then: &str) -> String {
-        feature_gate(CAP_AGENT_SKILLS, LAUNCH_SKILLS_UNSUPPORTED, then)
+        feature_gate(&[(CAP_AGENT_SKILLS, LAUNCH_SKILLS_UNSUPPORTED)], then)
     }
 
     /// [`Self::skills_gate`] for shipped skills: runs `then` only when the
     /// remote lists [`CAP_AGENT_SKILL_BUNDLE`], else prints
     /// [`SKILLS_BUNDLE_UNSUPPORTED`].
     fn skills_bundle_gate(then: &str) -> String {
-        feature_gate(CAP_AGENT_SKILL_BUNDLE, SKILLS_BUNDLE_UNSUPPORTED, then)
+        feature_gate(&[(CAP_AGENT_SKILL_BUNDLE, SKILLS_BUNDLE_UNSUPPORTED)], then)
     }
 
     /// Send the skills of `pending` this host lacks. One command asks
     /// (`rupu __skills missing`, behind [`Self::skills_bundle_gate`]) and one
     /// sends (`rupu __skills receive`, stdin is [`encode_stream`]'s framing):
-    /// `run_bytes` isn't duplex, so the two can't share a connection. A gate
-    /// refusal is recorded in `downgrade` and returned as an error, so the
-    /// memo confirms nothing.
+    /// `run_bytes` isn't duplex, so the two can't share a connection. The
+    /// gate's marker is a [`Transfer::Downgrade`], which the memo remembers
+    /// for the connector's life.
     async fn ship_pending(
         &self,
         pending: Vec<Arc<PackedSkill>>,
-        downgrade: &std::sync::Mutex<Option<String>>,
-    ) -> Result<(), HostConnectorError> {
+    ) -> Result<Transfer, HostConnectorError> {
         let who = format!("host {}", self.host_id);
         let refs: Vec<String> = pending.iter().map(|p| ref_arg(p)).collect();
         let argv: Vec<String> = ["rupu", "__skills", "missing"]
@@ -2054,20 +2071,18 @@ impl SshHostConnector {
             .run(&Self::skills_bundle_gate(&build_remote_command(&argv)))
             .await
             .map_err(|e| HostConnectorError::Unreachable(format!("{who}: {e}")))?;
-        if let Some(refusal) = self.skills_gate_refusal(&out.stdout) {
-            return Err(refusal);
-        }
         if out
             .stdout
             .lines()
             .any(|l| l.trim() == SKILLS_BUNDLE_UNSUPPORTED)
         {
-            let m = format!(
+            return Ok(Transfer::Downgrade(format!(
                 "{who}: rupu there predates shipped skills (no {CAP_AGENT_SKILL_BUNDLE}); upgrade \
                  rupu there. The unit uses that host's installed skills."
-            );
-            *downgrade.lock().unwrap_or_else(|e| e.into_inner()) = Some(m.clone());
-            return Err(HostConnectorError::Unsupported(m));
+            )));
+        }
+        if let Some(refusal) = self.skills_gate_refusal(&out.stdout) {
+            return Err(refusal);
         }
         if !out.success {
             let msg = format!(
@@ -2091,7 +2106,7 @@ impl SshHostConnector {
             lacking.push(&pending[i]);
         }
         if lacking.is_empty() {
-            return Ok(());
+            return Ok(Transfer::Done);
         }
         let sent: Vec<_> = lacking.iter().map(|p| p.reference()).collect();
         let stream = encode_stream(
@@ -2124,7 +2139,7 @@ impl SshHostConnector {
                 ),
             ));
         }
-        Ok(())
+        Ok(Transfer::Done)
     }
 
     /// [`Self::skills_gate`] with nothing to run: prints a marker exactly
@@ -2147,6 +2162,13 @@ impl SshHostConnector {
             return Some(HostConnectorError::Unsupported(format!(
                 "host {} runs a rupu without workflow-step skills support, so this unit's \
                  skills cannot be delivered; upgrade rupu there",
+                self.host_id
+            )));
+        }
+        if printed(SKILLS_BUNDLE_UNSUPPORTED) {
+            return Some(HostConnectorError::Unsupported(format!(
+                "host {} runs a rupu without shipped-skills support (no {CAP_AGENT_SKILL_BUNDLE}), \
+                 so this unit's shipped skills cannot be delivered; upgrade rupu there",
                 self.host_id
             )));
         }
@@ -2964,20 +2986,11 @@ impl HostConnector for SshHostConnector {
     }
 
     async fn ship_skills(&self, bundle: &SkillBundle) -> Result<ShipOutcome, HostConnectorError> {
-        if bundle.is_empty() {
-            return Ok(ShipOutcome::NotNeeded);
-        }
-        let packed = pack_bundle(bundle, &format!("host {}", self.host_id)).await?;
-        let downgrade = std::sync::Mutex::new(None);
-        let shipped = self
-            .ship_memo
-            .ship(&packed, |pending| self.ship_pending(pending, &downgrade))
-            .await;
-        if let Some(m) = downgrade.into_inner().unwrap_or_else(|e| e.into_inner()) {
-            return Ok(ShipOutcome::Unsupported(m));
-        }
-        shipped?;
-        Ok(ShipOutcome::Shipped(manifest_of(&packed)))
+        let who = format!("host {}", self.host_id);
+        ship_through(&self.ship_memo, bundle, &who, |pending| {
+            self.ship_pending(pending)
+        })
+        .await
     }
 
     async fn start_session(&self, _req: SessionStartRequest) -> Result<String, HostConnectorError> {
@@ -10645,6 +10658,32 @@ mod tests {
             );
         }
 
+        /// An old host is asked once per connector: a fan-out of units to it,
+        /// concurrent or later, runs the gate command exactly once, so it
+        /// never bursts ssh connections at the host.
+        #[tokio::test]
+        async fn a_downgrade_is_asked_once_per_host() {
+            let tmp = tempfile::tempdir().unwrap();
+            let exec = ShipExec::new(format!("{SKILLS_BUNDLE_UNSUPPORTED}\n"));
+            let (conn, _store, _t) = make_conn(Arc::clone(&exec));
+            let conn = Arc::new(conn);
+            let b = bundle(tmp.path(), &["pdf"]);
+            let tasks: Vec<_> = (0..20)
+                .map(|_| {
+                    let (conn, b) = (Arc::clone(&conn), b.clone());
+                    tokio::spawn(async move { conn.ship_skills(&b).await })
+                })
+                .collect();
+            for t in tasks {
+                let out = t.await.unwrap().unwrap();
+                assert!(matches!(out, ShipOutcome::Unsupported(_)), "{out:?}");
+            }
+            let out = conn.ship_skills(&b).await.unwrap();
+            assert!(matches!(out, ShipOutcome::Unsupported(m) if m.contains("host_abc")));
+            assert_eq!(exec.runs.lock().unwrap().len(), 1, "the gate ran once");
+            assert!(exec.receives.lock().unwrap().is_empty());
+        }
+
         #[tokio::test]
         async fn a_remote_without_rupu_is_an_error() {
             let tmp = tempfile::tempdir().unwrap();
@@ -10785,6 +10824,45 @@ mod tests {
                 .unwrap_or_else(|| panic!("no agent launch in {runs:?}"));
             assert!(launch.contains("'--skill-bundle={"), "{launch}");
             assert!(launch.contains(&"a".repeat(64)), "{launch}");
+            assert!(
+                launch.contains(&format!("grep -qF '\"{CAP_AGENT_SKILL_BUNDLE}\"'"))
+                    && launch.contains(SKILLS_BUNDLE_UNSUPPORTED),
+                "the launch is gated on the remote's agent.skill_bundle: {launch}"
+            );
+            assert_eq!(runs.len(), 1, "no separate pre-launch command: {runs:?}");
+        }
+
+        /// A launch carrying a bundle to a remote whose rupu can't take it (a
+        /// direct API launch, or a host rolled back after it confirmed the
+        /// skills): the launch's own gate prints the marker, and the unit is
+        /// refused naming the host, its mirror run finished failed.
+        #[tokio::test]
+        async fn launch_agent_refuses_a_bundle_the_remote_gate_refused() {
+            let exec = Arc::new(MarkerExec {
+                marker: SKILLS_BUNDLE_UNSUPPORTED,
+                on_launch: true,
+                commands: Default::default(),
+            });
+            let (conn, run_store, _t) = make_conn(Arc::clone(&exec));
+            let mut req = skilled_launch("run_01OLDBUNDLE");
+            req.skills.clear();
+            req.preload_skills.clear();
+            req.skill_bundle = Some(rupu_skills::ship::SkillBundleManifest {
+                version: 1,
+                skills: Vec::new(),
+            });
+            let err = conn.launch_agent(req).await.unwrap_err();
+            assert!(
+                matches!(&err, HostConnectorError::Unsupported(m)
+                    if m.contains("host_abc") && m.contains(CAP_AGENT_SKILL_BUNDLE)),
+                "{err:?}"
+            );
+            assert_eq!(exec.commands.lock().unwrap().len(), 1, "the launch only");
+            assert_eq!(
+                run_store.load("run_01OLDBUNDLE").unwrap().status,
+                rupu_orchestrator::RunStatus::Failed,
+                "no mirror run left running"
+            );
         }
     }
 }

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use rupu_cp::host::connector::HostConnectorError;
-use rupu_cp::host::skill_ship::{manifest_of, ShipMemo, SkillBundle};
+use rupu_cp::host::skill_ship::{manifest_of, ShipMemo, SkillBundle, Transfer};
 use rupu_skills::ship::{ShipError, MAX_SHIPPED_SKILL_BYTES};
 use rupu_skills::{load_skill, Layer};
 
@@ -42,7 +42,7 @@ async fn concurrent_ships_of_one_set_transfer_once() {
                     assert_eq!(pending.len(), 2);
                     calls.fetch_add(1, Ordering::SeqCst);
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                    Ok(())
+                    Ok(Transfer::Done)
                 })
                 .await
             })
@@ -55,7 +55,7 @@ async fn concurrent_ships_of_one_set_transfer_once() {
 
     memo.ship(&packed, |_| async {
         calls.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+        Ok(Transfer::Done)
     })
     .await
     .unwrap();
@@ -64,6 +64,40 @@ async fn concurrent_ships_of_one_set_transfer_once() {
         1,
         "a later ship transfers nothing"
     );
+}
+
+/// A host that can't take shipped skills is asked once per connector: every
+/// later ship, concurrent or not, answers the remembered downgrade.
+#[tokio::test]
+async fn a_downgrade_is_remembered() {
+    let tmp = tempfile::tempdir().unwrap();
+    let packed = bundle_of(tmp.path(), &["pdf"]).pack().unwrap();
+    let memo = Arc::new(ShipMemo::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let ship = |memo: Arc<ShipMemo>, calls: Arc<AtomicUsize>, packed: Vec<_>| async move {
+        memo.ship(&packed, |_| async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            Ok(Transfer::Downgrade("host h: too old".into()))
+        })
+        .await
+    };
+    let tasks: Vec<_> = (0..20)
+        .map(|_| tokio::spawn(ship(memo.clone(), calls.clone(), packed.clone())))
+        .collect();
+    for t in tasks {
+        assert_eq!(
+            t.await.unwrap().unwrap(),
+            Transfer::Downgrade("host h: too old".into())
+        );
+    }
+    assert_eq!(
+        ship(memo.clone(), calls.clone(), packed.clone())
+            .await
+            .unwrap(),
+        Transfer::Downgrade("host h: too old".into())
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -82,7 +116,7 @@ async fn a_failed_transfer_confirms_nothing() {
     memo.ship(&packed, |pending| {
         assert_eq!(pending.len(), 1);
         calls.fetch_add(1, Ordering::SeqCst);
-        async { Ok(()) }
+        async { Ok(Transfer::Done) }
     })
     .await
     .unwrap();
@@ -98,13 +132,15 @@ async fn only_the_unconfirmed_skills_are_transferred() {
     let tmp = tempfile::tempdir().unwrap();
     let both = bundle_of(tmp.path(), &["pdf", "sql"]).pack().unwrap();
     let memo = ShipMemo::default();
-    memo.ship(&both[..1], |_| async { Ok(()) }).await.unwrap();
+    memo.ship(&both[..1], |_| async { Ok(Transfer::Done) })
+        .await
+        .unwrap();
     memo.ship(&both, |pending| {
         assert_eq!(
             pending.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
             ["sql"]
         );
-        async { Ok(()) }
+        async { Ok(Transfer::Done) }
     })
     .await
     .unwrap();

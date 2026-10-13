@@ -17,7 +17,7 @@ use crate::{
         spec_peer_codename, EventByteStream, HostCapabilities, HostConnector, HostConnectorError,
         HostInfo, RunKind, RunListQuery, MAX_WORKSPACE_BYTES,
     },
-    host::skill_ship::{manifest_of, pack_bundle, prefixed, ShipMemo, ShipOutcome, SkillBundle},
+    host::skill_ship::{prefixed, ship_through, ShipMemo, ShipOutcome, SkillBundle, Transfer},
     launcher::LaunchRequest,
     node::protocol::{
         CAP_AGENT_ENGAGEMENT_PROFILE, CAP_AGENT_FINDINGS_PROFILE, CAP_AGENT_SKILLS,
@@ -274,13 +274,12 @@ impl HttpHostConnector {
     /// Send the skills of `pending` the remote lacks: `POST
     /// /api/skills/bundle/missing`, then a `PUT /api/skills/bundle/:hash` per
     /// missing one. A remote not advertising [`CAP_AGENT_SKILL_BUNDLE`] is
-    /// recorded in `downgrade` and returned as an error, so the memo confirms
-    /// nothing.
+    /// a [`Transfer::Downgrade`], which the memo remembers for the
+    /// connector's life.
     async fn ship_pending(
         &self,
         pending: Vec<Arc<PackedSkill>>,
-        downgrade: &std::sync::Mutex<Option<String>>,
-    ) -> Result<(), HostConnectorError> {
+    ) -> Result<Transfer, HostConnectorError> {
         let who = format!("remote host {}", self.base_url);
         let info = self.peer_info().await.map_err(|e| prefixed(e, &who))?;
         if let Err(e) = Self::require_in(
@@ -289,10 +288,10 @@ impl HttpHostConnector {
             "shipped skills",
             &self.base_url,
         ) {
-            if let HostConnectorError::Unsupported(m) = &e {
-                *downgrade.lock().unwrap_or_else(|e| e.into_inner()) = Some(m.clone());
-            }
-            return Err(e);
+            return match e {
+                HostConnectorError::Unsupported(m) => Ok(Transfer::Downgrade(m)),
+                e => Err(e),
+            };
         }
         let refs: Vec<ShippedSkillRef> = pending.iter().map(|p| p.reference()).collect();
         let resp = self
@@ -346,7 +345,7 @@ impl HttpHostConnector {
                 ));
             }
         }
-        Ok(())
+        Ok(Transfer::Done)
     }
 }
 
@@ -521,20 +520,11 @@ impl HostConnector for HttpHostConnector {
     }
 
     async fn ship_skills(&self, bundle: &SkillBundle) -> Result<ShipOutcome, HostConnectorError> {
-        if bundle.is_empty() {
-            return Ok(ShipOutcome::NotNeeded);
-        }
-        let packed = pack_bundle(bundle, &format!("remote host {}", self.base_url)).await?;
-        let downgrade = std::sync::Mutex::new(None);
-        let shipped = self
-            .ship_memo
-            .ship(&packed, |pending| self.ship_pending(pending, &downgrade))
-            .await;
-        if let Some(m) = downgrade.into_inner().unwrap_or_else(|e| e.into_inner()) {
-            return Ok(ShipOutcome::Unsupported(m));
-        }
-        shipped?;
-        Ok(ShipOutcome::Shipped(manifest_of(&packed)))
+        let who = format!("remote host {}", self.base_url);
+        ship_through(&self.ship_memo, bundle, &who, |pending| {
+            self.ship_pending(pending)
+        })
+        .await
     }
 
     async fn start_session(&self, req: SessionStartRequest) -> Result<String, HostConnectorError> {

@@ -1886,7 +1886,7 @@ fn host_info_with(features: &[&str]) -> serde_json::Value {
 async fn ship_skills_downgrades_when_the_peer_lacks_the_feature() {
     let tmp = tempfile::tempdir().unwrap();
     let server = httpmock::MockServer::start_async().await;
-    server.mock(|when, then| {
+    let info = server.mock(|when, then| {
         when.method("GET").path("/api/host/info");
         then.status(200)
             .json_body(host_info_with(&["agent.skills"]));
@@ -1907,6 +1907,13 @@ async fn ship_skills_downgrades_when_the_peer_lacks_the_feature() {
         "{out:?}"
     );
     missing.assert_hits(0);
+    // Remembered for the connector's life: the next unit asks nothing.
+    let again = c
+        .ship_skills(&ship_bundle(tmp.path(), &["pdf"]))
+        .await
+        .unwrap();
+    assert_eq!(again, out);
+    info.assert_hits(1);
 }
 
 #[tokio::test]

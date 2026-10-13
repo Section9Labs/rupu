@@ -150,11 +150,24 @@ pub enum ShipOutcome {
     Unsupported(String),
 }
 
-/// Per-connector memo: the skills this host confirmed it holds, plus a lock
-/// that makes concurrent ships to the host wait on one transfer.
+/// What a connector's transfer did with the skills it was handed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Transfer {
+    /// The host holds every one of them now.
+    Done,
+    /// The host can't take shipped skills; the text names it and why.
+    Downgrade(String),
+}
+
+/// Per-connector memo: the skills this host confirmed it holds, whether it
+/// said it can't take shipped skills at all, and a lock that makes
+/// concurrent ships to the host wait on one transfer. A connector lives as
+/// long as its registry entry, so a downgrade is asked once per host per
+/// process, never once per unit.
 #[derive(Default)]
 pub struct ShipMemo {
     confirmed: Mutex<HashSet<(String, String)>>,
+    downgrade: Mutex<Option<String>>,
     lock: tokio::sync::Mutex<()>,
 }
 
@@ -164,17 +177,27 @@ fn memo_key(p: &PackedSkill) -> (String, String) {
 
 impl ShipMemo {
     /// Calls `transfer` with the skills not yet confirmed — never when there
-    /// are none — and confirms them when it succeeds.
+    /// are none, or once the host answered [`Transfer::Downgrade`] — and
+    /// remembers what it answered: `Done` confirms them, `Downgrade` holds
+    /// for every later call. An error remembers nothing.
     pub async fn ship<F, Fut>(
         &self,
         packed: &[Arc<PackedSkill>],
         transfer: F,
-    ) -> Result<(), HostConnectorError>
+    ) -> Result<Transfer, HostConnectorError>
     where
         F: FnOnce(Vec<Arc<PackedSkill>>) -> Fut,
-        Fut: Future<Output = Result<(), HostConnectorError>>,
+        Fut: Future<Output = Result<Transfer, HostConnectorError>>,
     {
         let _held = self.lock.lock().await;
+        if let Some(m) = self
+            .downgrade
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            return Ok(Transfer::Downgrade(m));
+        }
         let pending: Vec<Arc<PackedSkill>> = {
             let confirmed = self.confirmed.lock().unwrap_or_else(|e| e.into_inner());
             packed
@@ -184,16 +207,45 @@ impl ShipMemo {
                 .collect()
         };
         if pending.is_empty() {
-            return Ok(());
+            return Ok(Transfer::Done);
         }
         let keys: Vec<_> = pending.iter().map(|p| memo_key(p)).collect();
-        transfer(pending).await?;
-        self.confirmed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .extend(keys);
-        Ok(())
+        let done = transfer(pending).await?;
+        match &done {
+            Transfer::Done => self
+                .confirmed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(keys),
+            Transfer::Downgrade(m) => {
+                *self.downgrade.lock().unwrap_or_else(|e| e.into_inner()) = Some(m.clone())
+            }
+        }
+        Ok(done)
     }
+}
+
+/// The one `ship_skills` of a transport that ships: pack `bundle` (a failure
+/// names `who`), then run `transfer` through `memo`. Each transport supplies
+/// only its transfer.
+pub async fn ship_through<F, Fut>(
+    memo: &ShipMemo,
+    bundle: &SkillBundle,
+    who: &str,
+    transfer: F,
+) -> Result<ShipOutcome, HostConnectorError>
+where
+    F: FnOnce(Vec<Arc<PackedSkill>>) -> Fut,
+    Fut: Future<Output = Result<Transfer, HostConnectorError>>,
+{
+    if bundle.is_empty() {
+        return Ok(ShipOutcome::NotNeeded);
+    }
+    let packed = pack_bundle(bundle, who).await?;
+    Ok(match memo.ship(&packed, transfer).await? {
+        Transfer::Done => ShipOutcome::Shipped(manifest_of(&packed)),
+        Transfer::Downgrade(m) => ShipOutcome::Unsupported(m),
+    })
 }
 
 /// What a transport that can't ship skills yet (tunnel, bucket) answers.
