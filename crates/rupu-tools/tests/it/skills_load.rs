@@ -164,3 +164,35 @@ async fn a_skill_deleted_mid_run_fails() {
     );
     assert_eq!(out.stdout, "");
 }
+
+/// A session's turn rebuilds its skills from the frozen set: the granted
+/// skill is the live one, so `changed` must compare against the baseline
+/// the session's index recorded, not the stamp this turn read.
+#[tokio::test]
+async fn changed_is_judged_against_the_frozen_baseline() {
+    let g = tempfile::tempdir().unwrap();
+    let dir = install(g.path(), "pdf", "Old.");
+    let frozen = resolved(g.path(), &["pdf"]).freeze();
+    fs::write(
+        dir.join("SKILL.md"),
+        "---\nname: pdf\ndescription: d\n---\nNew text that is longer.\n",
+    )
+    .unwrap();
+    let cat =
+        rupu_skills::SkillCatalog::discover(&rupu_skills::LayerDirs::for_layers(g.path(), None))
+            .unwrap();
+    let (skills, missing) = rupu_skills::run::resolve_frozen(&cat, &frozen);
+    assert!(missing.is_empty());
+    let mut c = ToolContext::in_workspace(g.path());
+    c.services.skills = Some(std::sync::Arc::new(skills));
+    let out = rupu_tools::skills::SkillsLoadTool
+        .invoke(json!({"name": "pdf"}), &c)
+        .await
+        .unwrap();
+    assert!(
+        out.stdout.starts_with(rupu_skills::render::CHANGED_NOTE),
+        "{}",
+        out.stdout
+    );
+    assert_eq!(out.structured.unwrap()["changed"], true);
+}

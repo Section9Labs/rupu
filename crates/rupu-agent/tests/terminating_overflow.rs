@@ -111,6 +111,8 @@ async fn a_terminating_process_starts_no_overflow_compaction_call() {
                     seed_source: None,
                     turn_index_offset: 0,
                     loaded_skills: Vec::new(),
+                    operator_loads: Vec::new(),
+                    missing_skills: Vec::new(),
                 },
                 provider: Box::new(provider),
                 limits: ModelLimits::fixed(2_000, 100),

@@ -18,6 +18,8 @@ pub mod collector;
 pub mod fd_budget;
 // implemented in Task 3
 pub mod loader;
+// A session turn's message with the operator's invoked skills.
+pub mod operator_skills;
 // Classifies every reply and provider error into an outcome (response-outcomes plan 2).
 pub mod outcome;
 // implemented in Task 4
@@ -32,6 +34,8 @@ pub mod recovery;
 pub mod runner;
 // The run's tool grant, resolved at assembly (W2/W3).
 pub mod grant;
+// Puts a conversation's loaded skills back after a compaction.
+pub mod skills_reattach;
 // implemented in Task 2
 pub mod spec;
 // implemented in Task 6
@@ -46,14 +50,17 @@ pub use loader::{
     check_agent_files, find_agent, load_agent, load_agents, AgentFileCheck, AgentLayer,
     AgentLoadError, SkillCheckError,
 };
+pub use operator_skills::operator_turn;
 pub use permission::{resolve_mode, PermissionPrompt};
 pub use recovery::{Hop, HopBuilder, RecoveryOpts};
 pub use runner::{
     compact_messages, record_unstarted_run, run_agent, run_agent_full, run_agent_with_limits,
     AgentPins, AgentRunOpts, CompactionError, CompactionOutcome, Hooks, LoadedSkill, MockProvider,
-    OnStreamEventCallback, OnToolCallCallback, OnUsageCallback, RunConcerns, RunError, RunExit,
-    RunResult, ScriptedTurn, StreamOpts, UnstartedRun, UsageKind, UsageTurn, UserTurn,
+    OnStreamEventCallback, OnToolCallCallback, OnUsageCallback, OperatorLoad, RunConcerns,
+    RunError, RunExit, RunResult, ScriptedTurn, StreamOpts, UnstartedRun, UsageKind, UsageTurn,
+    UserTurn,
 };
 pub use rupu_providers::types::StopReason;
+pub use skills_reattach::{reattach_block, Reattach, Reattached};
 pub use spec::{AgentSpec, AgentSpecParseError};
 pub use tool_registry::ToolRegistry;

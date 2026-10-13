@@ -499,7 +499,7 @@ A granted skill reaches the run as:
 
 A skill never widens the agent's `tools:` grant or its permission mode. A skill whose `allowed-tools` names a tool the run lacks still loads, with a `skill_tools_missing` notice. A skill marked `disable-model-invocation: true` is reachable only by preloading it; granted in `skills:` alone, it writes a `skill_not_indexed` notice, and when no granted skill is loadable the run gets no `skills.load`.
 
-A child started with `dispatch` (any kind, or a legacy name like `dispatch_agent`) gets its own agent file's skills, never its parent's. `rupu session start` refuses an agent that declares skills until sessions support them. A rupu release that predates these keys refuses to load an agent file that sets them, so upgrade remote hosts first.
+A child started with `dispatch` (any kind, or a legacy name like `dispatch_agent`) gets its own agent file's skills, never its parent's. A session fixes its agent's skills when it starts (see [skills.md](skills.md#skills-in-sessions)). A rupu release that predates these keys refuses to load an agent file that sets them, so upgrade remote hosts first.
 
 ### `maxTokens`
 

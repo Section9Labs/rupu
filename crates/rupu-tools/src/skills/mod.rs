@@ -90,7 +90,7 @@ impl Tool for SkillsLoadTool {
                 )
             }
         };
-        let changed = fresh.stamp != granted.skill.stamp;
+        let changed = fresh.stamp != granted.baseline_stamp;
         let files = fresh.files();
         let text = render_load_result(&LoadView {
             name,

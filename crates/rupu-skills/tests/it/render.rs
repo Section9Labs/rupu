@@ -274,3 +274,31 @@ No longer installed: gone\n\
     );
     assert!(got.starts_with(REATTACH_MARKER));
 }
+
+#[test]
+fn operator_injection_is_exact() {
+    let got = rupu_skills::render::render_operator_injection(
+        "pdf",
+        Path::new("/h/.rupu/skills/pdf"),
+        &ContentHash([0xab; 32]),
+        "Step one.",
+    );
+    assert_eq!(
+        got,
+        "<skill name=\"pdf\" base=\"/h/.rupu/skills/pdf\" version=\"abababababab\">\nStep one.\n</skill>"
+    );
+}
+
+#[test]
+fn operator_injection_escapes_its_attribute_values() {
+    let got = rupu_skills::render::render_operator_injection(
+        "pdf",
+        Path::new("/h/a \"b\" & <c>/pdf"),
+        &ContentHash([0xab; 32]),
+        "Step one.",
+    );
+    assert_eq!(
+        got,
+        "<skill name=\"pdf\" base=\"/h/a &quot;b&quot; &amp; &lt;c>/pdf\" version=\"abababababab\">\nStep one.\n</skill>"
+    );
+}

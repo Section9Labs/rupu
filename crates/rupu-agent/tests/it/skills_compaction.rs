@@ -492,3 +492,404 @@ async fn a_continued_run_drops_a_skill_it_is_no_longer_given() {
         ]
     );
 }
+
+fn catalog(global: &Path) -> rupu_skills::SkillCatalog {
+    rupu_skills::SkillCatalog::discover(&rupu_skills::LayerDirs::for_layers(global, None)).unwrap()
+}
+
+/// An operator's invocation: the version the session injected.
+fn operator_load(dir: &Path) -> rupu_agent::OperatorLoad {
+    let skill = rupu_skills::load_skill(dir, rupu_skills::Layer::Global).unwrap();
+    rupu_agent::OperatorLoad {
+        name: skill.name.as_str().to_owned(),
+        layer: "global".into(),
+        content_hash: skill.content_hash().unwrap().hex(),
+        base_dir: skill.root.display().to_string(),
+    }
+}
+
+/// A skill the operator invoked is recorded as loaded after the run's
+/// `skill_index`, and a later compaction re-attaches it like any other.
+#[tokio::test]
+async fn an_operator_load_is_recorded_and_reattached() {
+    let global = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    let pdf = install(global.path(), "pdf", "PDF STEPS");
+    let frozen = rupu_skills::run::resolve_operator(&catalog(global.path()), &[], "pdf").unwrap();
+    let (skills, missing) = rupu_skills::run::resolve_frozen(&catalog(global.path()), &[frozen]);
+    assert!(missing.is_empty());
+    let transcript = ws.path().join("run.jsonl");
+    let provider = MockProvider::new(vec![read_turn("c1", 900), summary_turn(), done_turn()]);
+    let mut o = opts(provider, ws.path(), transcript.clone(), Arc::new(skills));
+    let load = operator_load(&pdf);
+    o.prompt.operator_loads = vec![load.clone()];
+    run_agent(o).await.unwrap();
+    let evs = events(&transcript);
+    assert_eq!(
+        timeline(&evs),
+        vec!["operator:pdf", "compaction", "reattach:pdf"]
+    );
+    let index_at = evs
+        .iter()
+        .position(|e| matches!(e, Event::SkillIndex { .. }))
+        .expect("skill_index");
+    let operator_at = evs
+        .iter()
+        .position(|e| matches!(e, Event::SkillLoad { via, .. } if via == "operator"))
+        .unwrap();
+    assert!(index_at < operator_at);
+    let Event::SkillLoad {
+        name,
+        layer,
+        content_hash,
+        base_dir,
+        ..
+    } = &evs[operator_at]
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        (name, layer, content_hash, base_dir),
+        (&load.name, &load.layer, &load.content_hash, &load.base_dir)
+    );
+    assert!(compacted_first_messages(&evs)[0].contains("PDF STEPS"));
+    assert!(notices(&evs, "skill_changed").is_empty());
+}
+
+/// An operator load replaces a continued conversation's entry of the same
+/// name: the set keeps one entry per skill, at the injected version.
+#[tokio::test]
+async fn an_operator_load_replaces_a_carried_entry_of_the_same_name() {
+    let global = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    let pdf = install(global.path(), "pdf", "PDF STEPS");
+    let transcript = ws.path().join("run.jsonl");
+    let provider = MockProvider::new(vec![read_turn("c1", 900), summary_turn(), done_turn()]);
+    let mut o = opts(
+        provider,
+        ws.path(),
+        transcript.clone(),
+        resolved(global.path(), &["pdf"]),
+    );
+    o.prompt.loaded_skills = vec![LoadedSkill {
+        name: "pdf".into(),
+        content_hash: "0".repeat(64),
+    }];
+    o.prompt.operator_loads = vec![operator_load(&pdf)];
+    run_agent(o).await.unwrap();
+    let evs = events(&transcript);
+    assert_eq!(
+        timeline(&evs),
+        vec![
+            "continuation:pdf",
+            "operator:pdf",
+            "compaction",
+            "reattach:pdf"
+        ]
+    );
+    // Re-attached against the operator's version, so nothing changed.
+    assert!(notices(&evs, "skill_changed").is_empty());
+}
+
+/// The shared helper keeps the most recently loaded skill that fits the cap
+/// and names the older one for the model to reload.
+#[test]
+fn reattach_block_keeps_the_most_recent_within_the_cap() {
+    let global = tempfile::tempdir().unwrap();
+    install(global.path(), "older", &"A".repeat(700));
+    let newer = install(global.path(), "newer", &"B".repeat(700));
+    let skills = resolved(global.path(), &["older", "newer"]);
+    let newer_hash = rupu_skills::load_skill(&newer, rupu_skills::Layer::Global)
+        .unwrap()
+        .content_hash()
+        .unwrap()
+        .hex();
+    let loaded = vec![
+        LoadedSkill {
+            name: "older".into(),
+            content_hash: "1".repeat(64),
+        },
+        LoadedSkill {
+            name: "newer".into(),
+            content_hash: "2".repeat(64),
+        },
+    ];
+    let r = rupu_agent::reattach_block(&loaded, &skills, 1000).expect("a block");
+    assert!(
+        r.block.starts_with(rupu_skills::render::REATTACH_MARKER),
+        "{}",
+        r.block
+    );
+    assert!(r.block.contains(&"B".repeat(700)), "{}", r.block);
+    assert!(!r.block.contains(&"A".repeat(700)), "{}", r.block);
+    assert_eq!(r.omitted, vec!["older".to_string()]);
+    assert!(r.missing.is_empty());
+    assert_eq!(r.changed, vec!["newer".to_string()]);
+    assert_eq!(
+        r.reattached,
+        vec![rupu_agent::Reattached {
+            name: "newer".into(),
+            layer: rupu_skills::Layer::Global,
+            content_hash: newer_hash.clone(),
+            base_dir: skills.get("newer").unwrap().skill.root.clone(),
+        }]
+    );
+    assert_eq!(
+        r.loaded,
+        vec![
+            LoadedSkill {
+                name: "older".into(),
+                content_hash: "1".repeat(64)
+            },
+            LoadedSkill {
+                name: "newer".into(),
+                content_hash: newer_hash
+            }
+        ]
+    );
+    assert!(rupu_agent::reattach_block(&[], &skills, 1000).is_none());
+}
+
+/// A skill no longer installed stays in the loaded set (a reinstall brings
+/// it back at the next re-attach) and is listed in the block.
+#[test]
+fn reattach_block_keeps_a_missing_skill_loaded() {
+    let global = tempfile::tempdir().unwrap();
+    let gone = install(global.path(), "gone", "GONE STEPS");
+    let skills = resolved(global.path(), &["gone"]);
+    std::fs::remove_dir_all(&gone).unwrap();
+    let loaded = vec![LoadedSkill {
+        name: "gone".into(),
+        content_hash: "3".repeat(64),
+    }];
+    let r = rupu_agent::reattach_block(&loaded, &skills, 32 * 1024).expect("a block");
+    assert_eq!(r.missing, vec!["gone".to_string()]);
+    assert!(r.reattached.is_empty());
+    assert_eq!(r.loaded, loaded);
+    assert!(
+        r.block.contains("\nNo longer installed: gone\n"),
+        "{}",
+        r.block
+    );
+}
+
+/// A frozen set's `skill_index` rows carry the stamp the session recorded,
+/// not the skill's stamp now.
+#[tokio::test]
+async fn skill_index_rows_carry_the_baseline_stamp() {
+    let global = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    let pdf = install(global.path(), "pdf", "PDF STEPS");
+    let frozen = resolved(global.path(), &["pdf"]).freeze();
+    let baseline = frozen[0].stamp.clone();
+    std::fs::write(
+        pdf.join("SKILL.md"),
+        "---\nname: pdf\ndescription: d.\n---\nLONGER PDF STEPS NOW\n",
+    )
+    .unwrap();
+    let (skills, missing) = rupu_skills::run::resolve_frozen(&catalog(global.path()), &frozen);
+    assert!(missing.is_empty());
+    let live = skills.get("pdf").unwrap().skill.stamp.hex();
+    assert_ne!(live, baseline);
+    let transcript = ws.path().join("run.jsonl");
+    let provider = MockProvider::new(vec![done_turn()]);
+    run_agent(opts(
+        provider,
+        ws.path(),
+        transcript.clone(),
+        Arc::new(skills),
+    ))
+    .await
+    .unwrap();
+    let stamps: Vec<String> = events(&transcript)
+        .iter()
+        .filter_map(|e| match e {
+            Event::SkillIndex { skills } => Some(skills.iter().map(|s| s.stamp.clone())),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(stamps, vec![baseline]);
+}
+
+/// A session turn's frozen skills that can no longer be given (spec
+/// 2026-10-12 §5.1) are reported at run start, after the `skill_index`, and
+/// the run goes on without them; a turn left with no skills reports them
+/// too.
+#[tokio::test]
+async fn missing_frozen_skills_are_reported_at_run_start() {
+    let global = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    install(global.path(), "pdf", "PDF STEPS");
+    let missing = vec![
+        rupu_skills::MissingSkill {
+            name: "gone".into(),
+            layer: rupu_skills::Layer::Global,
+            reason: rupu_skills::MissingReason::Removed,
+        },
+        rupu_skills::MissingSkill {
+            name: "notes".into(),
+            layer: rupu_skills::Layer::Project,
+            reason: rupu_skills::MissingReason::BadStamp,
+        },
+    ];
+    let expected = vec![
+        "skill gone (global) is not available to this run: removed".to_string(),
+        "skill notes (project) is not available to this run: corrupt record: bad stamp".to_string(),
+    ];
+    for with_skills in [true, false] {
+        let transcript = ws.path().join(format!("run_{with_skills}.jsonl"));
+        let provider = MockProvider::new(vec![done_turn()]);
+        let grants: &[&str] = if with_skills { &["pdf"] } else { &[] };
+        let mut o = opts(
+            provider,
+            ws.path(),
+            transcript.clone(),
+            resolved(global.path(), grants),
+        );
+        if !with_skills {
+            o.tool_context.services.skills = None;
+        }
+        o.prompt.missing_skills = missing.clone();
+        run_agent(o).await.unwrap();
+        let evs = events(&transcript);
+        assert_eq!(notices(&evs, "skill_missing"), expected);
+        let first_missing = evs
+            .iter()
+            .position(|e| matches!(e, Event::Notice { kind, .. } if kind == "skill_missing"))
+            .unwrap();
+        let first_turn = evs
+            .iter()
+            .position(|e| matches!(e, Event::TurnStart { .. }))
+            .expect("a turn");
+        assert!(first_missing < first_turn);
+        if let Some(index_at) = evs
+            .iter()
+            .position(|e| matches!(e, Event::SkillIndex { .. }))
+        {
+            assert!(with_skills && index_at < first_missing);
+        }
+    }
+}
+
+/// A carried skill that is missing from a session turn's frozen set is
+/// reported once, by the run-start notice, and stays in the loaded set at
+/// its place: when it is installed again, the next turn re-attaches it.
+#[tokio::test]
+async fn a_carried_skill_missing_from_the_frozen_set_stays_loaded_with_one_notice() {
+    let global = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    install(global.path(), "pdf", "PDF STEPS");
+    let transcript = ws.path().join("run.jsonl");
+    let provider = MockProvider::new(vec![done_turn()]);
+    let mut o = opts(
+        provider,
+        ws.path(),
+        transcript.clone(),
+        resolved(global.path(), &["pdf"]),
+    );
+    let carried = vec![
+        LoadedSkill {
+            name: "gone".into(),
+            content_hash: "5".repeat(64),
+        },
+        LoadedSkill {
+            name: "pdf".into(),
+            content_hash: "6".repeat(64),
+        },
+    ];
+    o.prompt.loaded_skills = carried.clone();
+    o.prompt.missing_skills = vec![rupu_skills::MissingSkill {
+        name: "gone".into(),
+        layer: rupu_skills::Layer::Global,
+        reason: rupu_skills::MissingReason::Removed,
+    }];
+    let exit = rupu_agent::run_agent_full(o).await;
+    exit.result.unwrap();
+    let evs = events(&transcript);
+    assert_eq!(
+        notices(&evs, "skill_missing"),
+        vec!["skill gone (global) is not available to this run: removed".to_string()]
+    );
+    assert_eq!(timeline(&evs), vec!["continuation:pdf"]);
+    assert_eq!(exit.loaded_skills, carried);
+}
+
+/// Two missing and two omitted skills are each listed most recently loaded
+/// first.
+#[test]
+fn reattach_block_lists_missing_and_omitted_most_recent_first() {
+    let global = tempfile::tempdir().unwrap();
+    let gone_a = install(global.path(), "gone-a", "GONE A");
+    install(global.path(), "big-a", &"A".repeat(700));
+    let gone_b = install(global.path(), "gone-b", "GONE B");
+    install(global.path(), "big-b", &"B".repeat(700));
+    install(global.path(), "kept", &"K".repeat(700));
+    let skills = resolved(
+        global.path(),
+        &["gone-a", "big-a", "gone-b", "big-b", "kept"],
+    );
+    std::fs::remove_dir_all(&gone_a).unwrap();
+    std::fs::remove_dir_all(&gone_b).unwrap();
+    let loaded: Vec<LoadedSkill> = ["gone-a", "big-a", "gone-b", "big-b", "kept"]
+        .iter()
+        .map(|n| LoadedSkill {
+            name: n.to_string(),
+            content_hash: "4".repeat(64),
+        })
+        .collect();
+    let r = rupu_agent::reattach_block(&loaded, &skills, 1000).expect("a block");
+    assert_eq!(r.missing, vec!["gone-b".to_string(), "gone-a".to_string()]);
+    assert_eq!(r.omitted, vec!["big-b".to_string(), "big-a".to_string()]);
+    let names: Vec<&str> = r.reattached.iter().map(|x| x.name.as_str()).collect();
+    assert_eq!(names, vec!["kept"]);
+}
+
+/// A carried loaded set that names a skill twice seeds it once, at the
+/// later entry.
+#[tokio::test]
+async fn a_carried_set_naming_a_skill_twice_seeds_it_once() {
+    let global = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    install(global.path(), "pdf", "PDF STEPS");
+    let transcript = ws.path().join("run.jsonl");
+    let provider = MockProvider::new(vec![read_turn("c1", 900), summary_turn(), done_turn()]);
+    let mut o = opts(
+        provider,
+        ws.path(),
+        transcript.clone(),
+        resolved(global.path(), &["pdf"]),
+    );
+    o.prompt.loaded_skills = vec![
+        LoadedSkill {
+            name: "pdf".into(),
+            content_hash: "0".repeat(64),
+        },
+        LoadedSkill {
+            name: "pdf".into(),
+            content_hash: "1".repeat(64),
+        },
+    ];
+    run_agent(o).await.unwrap();
+    let evs = events(&transcript);
+    assert_eq!(
+        timeline(&evs),
+        vec!["continuation:pdf", "compaction", "reattach:pdf"]
+    );
+    let seeded: Vec<&String> = evs
+        .iter()
+        .filter_map(|e| match e {
+            Event::SkillLoad {
+                via, content_hash, ..
+            } if via == "continuation" => Some(content_hash),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(seeded, vec![&"1".repeat(64)]);
+    assert_eq!(
+        compacted_first_messages(&evs)[0]
+            .matches("PDF STEPS")
+            .count(),
+        1
+    );
+}

@@ -78,6 +78,10 @@ pub struct Overrides {
     pub skills: Vec<String>,
     /// The launch's own `preloadSkills:` entries.
     pub preload_skills: Vec<String>,
+    /// The skills section a session's first turn rendered, sent as it is
+    /// instead of one rendered from the run's skills, so every turn's
+    /// system prompt is the same bytes. `Some("")` sends none.
+    pub skill_section: Option<String>,
 }
 
 /// Services the site provides (they belong to the root run, not this one).

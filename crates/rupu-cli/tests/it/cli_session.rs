@@ -458,6 +458,114 @@ async fn session_list_reconciles_stale_running_workers() {
     assert!(persisted["active_run_id"].is_null());
 }
 
+/// Marks `session_id`'s record as written by a newer rupu: a later version
+/// and a field this rupu doesn't know. Returns the record's bytes.
+fn make_newer(home: &std::path::Path, root: &str, session_id: &str) -> Vec<u8> {
+    let path = home.join(root).join(session_id).join("session.json");
+    let mut payload: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    payload["version"] = 3.into();
+    payload["from_the_future"] = "kept".into();
+    std::fs::write(&path, serde_json::to_vec_pretty(&payload).unwrap()).unwrap();
+    std::fs::read(&path).unwrap()
+}
+
+/// A record a newer rupu wrote is listed, as that, with a warning, and
+/// never written back: its stale worker is not reconciled.
+#[tokio::test]
+async fn session_list_shows_a_newer_record_and_never_writes_it() {
+    let _guard = ENV_LOCK.lock().await;
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    write_session(&home, "ses_newer01", "running", Some(999_999), false);
+    write_session(&home, "ses_current01", "idle", None, false);
+    let before = make_newer(&home, "sessions", "ses_newer01");
+
+    let out = Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
+        .current_dir(tmp.path())
+        .args(["--format", "json", "session", "list"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let statuses: std::collections::BTreeMap<String, String> = report["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["session_id"].as_str().unwrap().to_owned(),
+                r["status"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        statuses,
+        [
+            ("ses_current01".to_owned(), "idle".to_owned()),
+            ("ses_newer01".to_owned(), "newer rupu".to_owned()),
+        ]
+        .into_iter()
+        .collect()
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("session ses_newer01 was written by a newer rupu (record version 3)"),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(home.join("sessions/ses_newer01/session.json")).unwrap(),
+        before,
+        "the record is never written"
+    );
+}
+
+/// `session prune` leaves an archived record a newer rupu wrote alone: what
+/// it owns may be named in fields this rupu doesn't know.
+#[tokio::test]
+async fn session_prune_skips_a_newer_record() {
+    let _guard = ENV_LOCK.lock().await;
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    write_session(&home, "ses_newer02", "idle", None, true);
+    rewrite_session_updated_at(
+        &home,
+        "sessions-archive",
+        "ses_newer02",
+        &(Utc::now() - chrono::Duration::days(45)).to_rfc3339(),
+    );
+    let before = make_newer(&home, "sessions-archive", "ses_newer02");
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
+        .current_dir(tmp.path())
+        .args([
+            "--format",
+            "json",
+            "session",
+            "prune",
+            "--older-than",
+            "30d",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ses_newer02").not())
+        .stderr(predicate::str::contains(
+            "session ses_newer02 was written by a newer rupu (record version 3)",
+        ));
+    assert_eq!(
+        std::fs::read(home.join("sessions-archive/ses_newer02/session.json")).unwrap(),
+        before
+    );
+}
+
 #[tokio::test]
 async fn session_archive_restore_round_trip_moves_owned_transcripts() {
     let _guard = ENV_LOCK.lock().await;
@@ -681,15 +789,6 @@ async fn session_prune_dry_run_uses_config_default() {
     assert!(home.join("sessions-archive/ses_cfg01").exists());
 }
 
-/// Until sessions carry skills (Agent Skills Plan 3), a session refuses an
-/// agent that declares them rather than run it without them.
-fn refusal(agent: &str) -> String {
-    format!(
-        "agent `{agent}` declares skills; sessions do not support skills yet (Agent Skills \
-         Plan 3) — run it with `rupu run`, or remove its skill keys"
-    )
-}
-
 fn write_agent(home: &std::path::Path, name: &str, keys: &str) {
     let agents = home.join("agents");
     std::fs::create_dir_all(&agents).unwrap();
@@ -710,55 +809,126 @@ fn install_skill(home: &std::path::Path, name: &str) {
     .unwrap();
 }
 
+const ACK: &str = r#"[{ "AssistantText": { "text": "ack", "stop": "end_turn" } }]"#;
+
+fn rupu(home: &std::path::Path, dir: &std::path::Path) -> Command {
+    let mut cmd = Command::cargo_bin("rupu").unwrap();
+    cmd.env("RUPU_HOME", home)
+        .env("RUPU_MOCK_PROVIDER_SCRIPT", ACK)
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
+        .current_dir(dir);
+    cmd
+}
+
+/// The one session record under `home`.
+fn only_session(home: &std::path::Path) -> serde_json::Value {
+    let dirs: Vec<_> = std::fs::read_dir(home.join("sessions"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(dirs.len(), 1, "{dirs:?}");
+    serde_json::from_str(&std::fs::read_to_string(dirs[0].join("session.json")).unwrap()).unwrap()
+}
+
+/// `session start` freezes the agent's skills and the `--skill` /
+/// `--preload-skill` ones (reason `session`) on the session record; an
+/// uninstalled skill is refused before anything is written.
 #[tokio::test]
-async fn session_start_refuses_an_agent_that_declares_skills() {
+async fn session_start_accepts_an_agent_that_declares_skills() {
     let _guard = ENV_LOCK.lock().await;
     let tmp = assert_fs::TempDir::new().unwrap();
     let home = tmp.path().join("home");
     let work = tmp.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
     install_skill(&home, "pdf");
-    // Installed, uninstalled and preloaded: each is refused the same way.
-    write_agent(&home, "with-skill", "skills: [pdf]");
+    install_skill(&home, "code-review");
     write_agent(&home, "with-missing", "skills: [not-installed]");
-    write_agent(&home, "with-preload", "preloadSkills: [pdf]");
-    for agent in ["with-skill", "with-missing", "with-preload"] {
-        Command::cargo_bin("rupu")
-            .unwrap()
-            .env("RUPU_HOME", &home)
-            .env_remove("FORCE_COLOR")
-            .env_remove("CLICOLOR_FORCE")
-            .current_dir(&work)
-            .args(["session", "start", agent, "--mode", "bypass"])
-            .assert()
-            .failure()
-            .stderr(predicate::str::contains(refusal(agent)));
-    }
+    rupu(&home, &work)
+        .args([
+            "session",
+            "start",
+            "with-missing",
+            "--mode",
+            "bypass",
+            "--detach",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "agent `with-missing`: skills: unknown skill \"not-installed\" (looked in",
+        ))
+        .stderr(predicate::str::contains(
+            "install it with `rupu skill install`",
+        ));
     assert!(
         !home.join("sessions").exists()
             || std::fs::read_dir(home.join("sessions"))
                 .unwrap()
                 .next()
-                .is_none()
+                .is_none(),
+        "nothing was written"
     );
+
+    write_agent(&home, "with-skill", "skills: [pdf]");
+    std::fs::remove_file(home.join("agents/with-missing.md")).unwrap();
+    rupu(&home, &work)
+        .args([
+            "session",
+            "start",
+            "with-skill",
+            "--mode",
+            "bypass",
+            "--detach",
+            "--skill",
+            "code-review",
+            "--preload-skill",
+            "code-review",
+        ])
+        .assert()
+        .success();
+    let record = only_session(&home);
+    let index: Vec<(String, String, bool)> = record["skill_index"]
+        .as_array()
+        .expect("a skill_index")
+        .iter()
+        .map(|f| {
+            (
+                f["name"].as_str().unwrap().to_owned(),
+                f["reason"].as_str().unwrap().to_owned(),
+                f["preload"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        index,
+        vec![
+            ("code-review".to_owned(), "session".to_owned(), true),
+            ("pdf".to_owned(), "agent".to_owned(), false),
+        ]
+    );
+    let prompt = record["skill_prompt"].as_str().expect("a skill_prompt");
+    assert!(prompt.starts_with("## Skill: code-review"), "{prompt}");
+    assert!(prompt.contains("- pdf: d."), "{prompt}");
+    let id = record["session_id"].as_str().unwrap().to_owned();
+    rupu(&home, &work)
+        .args(["session", "stop", &id])
+        .assert()
+        .success();
 }
 
-/// A session started before `session start` refused skills: its turn fails
-/// with the refusal instead of running the agent without them.
+/// A session started before sessions carried skills has no frozen set: its
+/// turn runs, without skills, even though its agent file now declares
+/// them.
 #[tokio::test]
-async fn a_session_turn_refuses_an_agent_that_declares_skills() {
+async fn an_old_session_turn_runs_without_skills_its_agent_now_declares() {
     let _guard = ENV_LOCK.lock().await;
     let tmp = assert_fs::TempDir::new().unwrap();
     let home = tmp.path().join("home");
     write_session(&home, "ses_skills", "idle", None, false);
     install_skill(&home, "pdf");
     write_agent(&home, "issue-reader", "skills: [pdf]");
-    Command::cargo_bin("rupu")
-        .unwrap()
-        .env("RUPU_HOME", &home)
-        .env_remove("FORCE_COLOR")
-        .env_remove("CLICOLOR_FORCE")
-        .current_dir(tmp.path())
+    rupu(&home, tmp.path())
         .args([
             "session",
             "_run-turn",
@@ -770,6 +940,47 @@ async fn a_session_turn_refuses_an_agent_that_declares_skills() {
             "hi",
         ])
         .assert()
+        .success();
+    let transcript = tmp.path().join("repo/.rupu/transcripts/run_skills1.jsonl");
+    let events: Vec<Event> = rupu_transcript::JsonlReader::iter(&transcript)
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::RunComplete {
+            status: RunStatus::Ok,
+            ..
+        }
+    )));
+    assert!(!events.iter().any(|e| matches!(e, Event::SkillIndex { .. })));
+}
+
+/// `session send --skill` with a typo exits non-zero with a did-you-mean
+/// before anything is enqueued; the prompt may be left out when a skill is
+/// named, and is required otherwise.
+#[tokio::test]
+async fn session_send_refuses_an_unknown_skill_before_enqueue() {
+    let _guard = ENV_LOCK.lock().await;
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    write_session(&home, "ses_send_skill", "idle", None, false);
+    install_skill(&home, "pdf");
+    let record = home.join("sessions/ses_send_skill/session.json");
+    let before = std::fs::read(&record).unwrap();
+    rupu(&home, tmp.path())
+        .args(["session", "send", "--skill", "pdff", "ses_send_skill"])
+        .assert()
         .failure()
-        .stderr(predicate::str::contains(refusal("issue-reader")));
+        .code(1)
+        .stderr(predicate::str::contains(
+            "unknown skill \"pdff\" (did you mean pdf?)",
+        ));
+    assert!(!home.join("sessions/ses_send_skill/queue").exists());
+    assert_eq!(std::fs::read(&record).unwrap(), before);
+    rupu(&home, tmp.path())
+        .args(["session", "send", "ses_send_skill"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("<PROMPT>"));
 }

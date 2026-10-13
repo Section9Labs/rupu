@@ -290,8 +290,8 @@ earlier run's launch skills; any skill flag replaces them all. Passing a flag
 is the only way to change them: a continued run can't drop them entirely.
 
 A child started with `dispatch` (any kind, or a legacy name like
-`dispatch_agent`) gets its own agent's skills, not its parent's. Sessions don't
-support skills yet: `rupu session start` refuses an agent that declares them.
+`dispatch_agent`) gets its own agent's skills, not its parent's. Sessions
+are covered in [Skills in sessions](#skills-in-sessions).
 
 The transcript records what the run had and used. `skill_index` lists the
 granted skills at run start, and a `skill_load` is written for every load, with
@@ -299,3 +299,80 @@ granted skills at run start, and a `skill_load` is written for every load, with
 [transcript-schema.md](transcript-schema.md#skill_index). Notices name what
 needs attention: `skill_not_indexed`, `skill_changed`, `skill_missing`,
 `skill_tools_missing` and `skill_reattach_truncated`.
+
+## Skills in sessions
+
+A session fixes its skills when it starts. `rupu session start` resolves the
+agent's `skills:` and `preloadSkills:` once, against the global layer and the
+session's project layer, and stores the set and the rendered skills section on
+the session. Every turn sends that same section, so the system prompt is
+byte-identical from turn to turn and the prompt cache holds. A preloaded
+skill's body is the one it had at start; a session that wants its newer
+version is a new session. A skill installed after the session started is not
+offered, even under `*`. A skill the model loads is read at its current
+version, and one edited since the session started loads with a
+`skill_changed` notice. A skill uninstalled mid-session is left out of each
+turn with a `skill_missing` notice, and the session keeps running.
+
+`rupu session start --skill <name>` and `--preload-skill <name>` (repeat the
+flag for several) add skills to the session on top of its agent's. Its
+`skill_index` records them with reason `session`.
+
+`rupu session send --skill <name> <id> [prompt]` (repeatable) invokes a skill
+in that turn. It takes any valid skill installed in the session's global or
+project layer, granted or not, including one marked
+`disable-model-invocation`, which exists for exactly this. The `global:` and
+`project:` prefixes work as in a grant. A bare name installed in both layers,
+a wildcard, an unknown name (with a did-you-mean) and a name the session holds
+from the other layer are refused before anything is sent. The prompt is
+optional when a skill is given. The skill's body goes ahead of the prompt in
+the turn's message:
+
+```
+<skill name="pdf" base="/Users/me/.rupu/skills/pdf" version="3f2a9c0d41b7">
+...the skill's instructions...
+</skill>
+
+summarise x.pdf
+```
+
+`version` is the first 12 hex digits of the skill's content hash. The turn's
+transcript records a `skill_load` with `via: operator`. From then on the skill
+is part of the session with reason `operator`: the model may load it again
+with `skills.load` and read its files. It is never added to the index, so the
+system prompt does not change.
+
+Sends can queue behind a running turn, so a turn checks its skills again when
+it runs. A skill removed since it was sent gets one `skill_missing` notice in
+that turn and is not added to the session. A turn fails, with a transcript
+that says why, when an earlier queued turn gave the session the same name
+from the other layer, or when it has no prompt and none of its skills can be
+given.
+
+The skills the model loaded survive turns and compaction. The session keeps
+its loaded set from turn to turn, and every compaction puts those skills back
+at their current version: the runner's own compaction during a turn,
+`rupu session compact`, and the compaction a running session's worker does on
+request. A loaded skill uninstalled for a while is named as missing and stays
+in the set, so it comes back once it is installed again.
+
+A session record that carries skills is written as version 2; one without
+skills stays version 1. A rupu older than session skills doesn't check the
+version, so it continues a version 2 session but drops its skills the next
+time it writes the record: the session runs on without them. A rupu that
+knows session skills refuses a record from a newer rupu ("this session was
+written by a newer rupu; upgrade rupu to continue it") rather than write it
+back without the fields it doesn't know. `rupu session list` shows such a
+session with status `newer rupu` and a warning, and `rupu session prune`
+leaves it alone.
+
+A queued turn that invokes skills is written as turn request version 2; any
+other stays version 1, so an older worker still runs it. A worker that knows
+`--skill` fails a turn queued by a newer rupu, with a transcript ("this turn
+was queued by a newer rupu (turn request version <n>); restart the session
+worker: rupu session stop <id>"), rather than run it without what it asked
+for. A worker older than `--skill` can't refuse what it predates: it would run
+the turn without its skills. `session send` restarts a worker whose rupu
+binary is older than its own, judged by the binary's modification time, but
+it keeps the worker when that can't be read. After upgrading rupu, run
+`rupu session stop <id>` before using `--skill` on a running session.

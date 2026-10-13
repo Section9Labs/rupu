@@ -218,9 +218,17 @@ fn controls() -> Vec<RunArgv> {
     out
 }
 
+/// Skill entries a session's argv carries, the first `n` of them.
+fn skills(n: usize) -> Vec<String> {
+    ["pdf", "project:notes"][..n]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
 fn sessions() -> Vec<RunArgv> {
     let mut out = Vec::new();
-    for mask in 0u32..(1 << 4) {
+    for mask in 0u32..(1 << 6) {
         let on = |bit: u32| mask & (1 << bit) != 0;
         let target = on(0).then(|| "github:o/r".to_string());
         out.push(RunArgv::SessionStart(SessionStart {
@@ -233,16 +241,30 @@ fn sessions() -> Vec<RunArgv> {
             mode: MODES[mask as usize % MODES.len()],
             prompt: on(2).then(|| PROMPTS[mask as usize % PROMPTS.len()].to_string()),
             detach: on(3),
+            skills: skills(if on(4) { 2 } else { 0 }),
+            preload_skills: skills(if on(5) { 1 } else { 0 }),
         }));
     }
+    let skill_sets = [skills(0), skills(1), skills(2)];
     for prompt in PROMPTS {
         for detach in [false, true] {
-            out.push(RunArgv::SessionSend(SessionSend {
-                session_id: "ses_01X".into(),
-                prompt: prompt.to_string(),
-                detach,
-            }));
+            for skills in &skill_sets {
+                out.push(RunArgv::SessionSend(SessionSend {
+                    session_id: "ses_01X".into(),
+                    prompt: Some(prompt.to_string()),
+                    detach,
+                    skills: skills.clone(),
+                }));
+            }
         }
+    }
+    for skills in &skill_sets[1..] {
+        out.push(RunArgv::SessionSend(SessionSend {
+            session_id: "ses_01X".into(),
+            prompt: None,
+            detach: true,
+            skills: skills.clone(),
+        }));
     }
     out.push(RunArgv::SessionWorker(SessionWorker {
         session_id: "ses_01X".into(),
@@ -384,12 +406,15 @@ fn back(cli: Cli) -> RunArgv {
                     prompt: s.prompt_flag,
                     into: s.into,
                     detach: s.detach,
+                    skills: s.skills,
+                    preload_skills: s.preload_skills,
                 })
             }
             cmd::session::Action::Send(s) => RunArgv::SessionSend(SessionSend {
                 session_id: s.session_id,
                 prompt: s.prompt,
                 detach: s.detach,
+                skills: s.skills,
             }),
             cmd::session::Action::RunWorker(w) => RunArgv::SessionWorker(SessionWorker {
                 session_id: w.session_id,

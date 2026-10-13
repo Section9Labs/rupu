@@ -35,6 +35,8 @@ pub(crate) fn session_start_argv(
             .and(clone_dir)
             .map(std::path::PathBuf::from),
         detach: true,
+        skills: Vec::new(),
+        preload_skills: Vec::new(),
     }))
 }
 

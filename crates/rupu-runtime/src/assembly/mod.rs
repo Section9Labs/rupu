@@ -508,57 +508,24 @@ impl RunAssembler {
         }
     }
 
-    /// The skills a run of `agent` with `overrides` is given (spec §2.4):
-    /// the agent's keys and the launch's own, resolved in one pass against
-    /// the global and project layers. `None` when the run has none. Fails
-    /// closed: a run never starts without a skill it was given. Discovery
-    /// reads directories and a preload hashes files, so it runs on the
-    /// blocking pool, and an fd exhaustion in a wide fan-out is retried the
-    /// way the agent's load is. [`Self::assemble`] calls it unless the launch
-    /// brings its own ([`LaunchServices::skills`]).
+    /// The skills a run of `agent` with `overrides` is given (spec §2.4),
+    /// resolved against this assembler's layers by [`resolve_agent_skills`]
+    /// with the launch's own entries as reason `launch`. [`Self::assemble`]
+    /// calls it unless the launch brings its own ([`LaunchServices::skills`]).
     pub async fn resolve_skills(
         &self,
         agent: &rupu_agent::AgentSpec,
         overrides: &Overrides,
     ) -> Result<Option<Arc<rupu_skills::ResolvedSkills>>, AssembleError> {
-        let agent_grants = agent.skills.clone().unwrap_or_default();
-        let agent_preload = agent.preload_skills.clone().unwrap_or_default();
-        let o = overrides;
-        if agent_grants.is_empty()
-            && agent_preload.is_empty()
-            && o.skills.is_empty()
-            && o.preload_skills.is_empty()
-        {
-            return Ok(None);
-        }
-        let requests = Arc::new([
-            (rupu_skills::SkillReason::Agent, agent_grants, agent_preload),
-            (
-                rupu_skills::SkillReason::Launch,
-                o.skills.clone(),
-                o.preload_skills.clone(),
-            ),
-        ]);
-        let global = self.ctx.global.clone();
-        let project = self.ctx.project_root.as_ref().map(|p| p.join(".rupu"));
-        let resolved = rupu_agent::fd_budget::retry_on_fd_exhaustion(
-            &agent.name,
-            &rupu_agent::fd_budget::Policy::default(),
-            rupu_agent::fd_budget::grow,
-            || {
-                let (global, project, requests) =
-                    (global.clone(), project.clone(), Arc::clone(&requests));
-                async move {
-                    tokio::task::spawn_blocking(move || {
-                        resolve_run_skills(&global, project.as_deref(), &requests[..])
-                    })
-                    .await
-                    .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))
-                }
-            },
-        )
-        .await?;
-        Ok((!resolved.is_empty()).then(|| Arc::new(resolved)))
+        let dirs = rupu_skills::LayerDirs::for_layers(
+            &self.ctx.global,
+            self.ctx
+                .project_root
+                .as_ref()
+                .map(|p| p.join(".rupu"))
+                .as_deref(),
+        );
+        resolve_agent_skills(&dirs, agent, overrides, rupu_skills::SkillReason::Launch).await
     }
 
     /// [`Self::resolve_skills`] for the run whose transcript is
@@ -1022,7 +989,8 @@ fn allowed(
 }
 
 /// The system prompt a run of `agent` sends: the agent's, with the site's
-/// `## Run target` section, then the run's skills section (spec §3.1).
+/// `## Run target` section, then the run's skills section (spec §3.1): the
+/// frozen one in [`Overrides::skill_section`] when the site has one.
 pub fn system_prompt_for(
     agent: &rupu_agent::AgentSpec,
     overrides: &Overrides,
@@ -1032,20 +1000,142 @@ pub fn system_prompt_for(
         Some(suffix) => format!("{}\n\n## Run target\n\n{suffix}", agent.system_prompt),
         None => agent.system_prompt.clone(),
     };
-    if let Some(section) = skills.and_then(|s| s.prompt_section()) {
+    let section = match &overrides.skill_section {
+        Some(frozen) => (!frozen.is_empty()).then(|| frozen.clone()),
+        None => skills.and_then(|s| s.prompt_section()),
+    };
+    if let Some(section) = section {
         prompt.push_str("\n\n");
         prompt.push_str(&section);
     }
     prompt
 }
 
+/// The skills a run of `agent` with `overrides` is given (spec §2.4): the
+/// agent's keys and the launch's own, recorded with `launch_reason` (a
+/// session's `--skill` entries are `Session`), resolved in one pass against
+/// `dirs`. `None` when the run has none. Fails closed: a run never starts
+/// without a skill it was given. Discovery reads directories and a preload
+/// hashes files, so it runs on the blocking pool, and an fd exhaustion in a
+/// wide fan-out is retried the way the agent's load is.
+pub async fn resolve_agent_skills(
+    dirs: &rupu_skills::LayerDirs,
+    agent: &rupu_agent::AgentSpec,
+    overrides: &Overrides,
+    launch_reason: rupu_skills::SkillReason,
+) -> Result<Option<Arc<rupu_skills::ResolvedSkills>>, AssembleError> {
+    let agent_grants = agent.skills.clone().unwrap_or_default();
+    let agent_preload = agent.preload_skills.clone().unwrap_or_default();
+    let o = overrides;
+    if agent_grants.is_empty()
+        && agent_preload.is_empty()
+        && o.skills.is_empty()
+        && o.preload_skills.is_empty()
+    {
+        return Ok(None);
+    }
+    let requests = Arc::new([
+        (rupu_skills::SkillReason::Agent, agent_grants, agent_preload),
+        (launch_reason, o.skills.clone(), o.preload_skills.clone()),
+    ]);
+    let resolved = rupu_agent::fd_budget::retry_on_fd_exhaustion(
+        &agent.name,
+        &rupu_agent::fd_budget::Policy::default(),
+        rupu_agent::fd_budget::grow,
+        || {
+            let (dirs, requests) = (dirs.clone(), Arc::clone(&requests));
+            async move {
+                tokio::task::spawn_blocking(move || resolve_run_skills(dirs, &requests[..]))
+                    .await
+                    .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))
+            }
+        },
+    )
+    .await?;
+    Ok((!resolved.is_empty()).then(|| Arc::new(resolved)))
+}
+
+/// A session's frozen skill set (spec 2026-10-12 §5.1) as installed now in
+/// `dirs`, the layers it was resolved in: the set (`None` when nothing in
+/// it can be given) and the entries that can't be, for the turn to report
+/// ([`rupu_agent::UserTurn::missing_skills`]). Fails only when the skills
+/// directories can't be read.
+pub async fn resolve_frozen_skills(
+    dirs: &rupu_skills::LayerDirs,
+    frozen: &[rupu_skills::FrozenSkill],
+) -> Result<
+    (
+        Option<Arc<rupu_skills::ResolvedSkills>>,
+        Vec<rupu_skills::MissingSkill>,
+    ),
+    AssembleError,
+> {
+    if frozen.is_empty() {
+        return Ok((None, Vec::new()));
+    }
+    let (dirs, frozen) = (dirs.clone(), frozen.to_vec());
+    let (resolved, missing) = tokio::task::spawn_blocking(move || {
+        let catalog =
+            rupu_skills::SkillCatalog::discover(&dirs).map_err(|e| AssembleError::Skills {
+                source: e.into(),
+                looked_in: dirs.clone(),
+            })?;
+        Ok::<_, AssembleError>(rupu_skills::resolve_frozen(&catalog, &frozen))
+    })
+    .await
+    .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))?;
+    Ok(((!resolved.is_empty()).then(|| Arc::new(resolved)), missing))
+}
+
+/// An operator's invocations for a session turn (spec 2026-10-12 §5.2),
+/// each entry resolved against `dirs`, the session's layers: any valid
+/// installed skill, granted or not. `held` is the session's frozen set; one
+/// resolved twice is returned once. A wildcard, an unknown or ambiguous
+/// name, a name held from the other layer, or one invoked from both layers
+/// fails the whole call.
+pub async fn resolve_operator_skills(
+    dirs: &rupu_skills::LayerDirs,
+    held: &[rupu_skills::FrozenSkill],
+    entries: &[String],
+) -> Result<Vec<rupu_skills::FrozenSkill>, AssembleError> {
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (dirs, held, entries) = (dirs.clone(), held.to_vec(), entries.to_vec());
+    tokio::task::spawn_blocking(move || {
+        let failed = |source: rupu_agent::SkillCheckError| AssembleError::Skills {
+            source,
+            looked_in: dirs.clone(),
+        };
+        let catalog = rupu_skills::SkillCatalog::discover(&dirs).map_err(|e| failed(e.into()))?;
+        let mut invoked: Vec<rupu_skills::FrozenSkill> = Vec::new();
+        for entry in &entries {
+            let f = rupu_skills::resolve_operator(&catalog, &held, entry)
+                .map_err(|e| failed(e.into()))?;
+            if invoked
+                .iter()
+                .any(|i| i.name == f.name && i.layer != f.layer)
+            {
+                let both = rupu_skills::ResolveError::BothLayers { name: f.name };
+                return Err(failed(
+                    rupu_skills::RunSkillsError::Resolve(vec![both]).into(),
+                ));
+            }
+            if !invoked.contains(&f) {
+                invoked.push(f);
+            }
+        }
+        Ok(invoked)
+    })
+    .await
+    .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))
+}
+
 /// Discover the layers and resolve `requests` against them (blocking IO).
 fn resolve_run_skills(
-    global: &std::path::Path,
-    project: Option<&std::path::Path>,
+    dirs: rupu_skills::LayerDirs,
     requests: &[(rupu_skills::SkillReason, Vec<String>, Vec<String>)],
 ) -> Result<rupu_skills::ResolvedSkills, AssembleError> {
-    let dirs = rupu_skills::LayerDirs::for_layers(global, project);
     let failed = |source: rupu_agent::SkillCheckError| AssembleError::Skills {
         source,
         looked_in: dirs.clone(),

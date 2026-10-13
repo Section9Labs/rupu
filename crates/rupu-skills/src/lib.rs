@@ -29,7 +29,8 @@ pub use grant::{
 };
 pub use name::{NameError, SkillName, MAX_NAME_LEN};
 pub use run::{
-    resolve_run_skills, GrantedSkill, ResolvedSkills, RunSkillsError, SkillReason, SkillRequest,
+    resolve_frozen, resolve_operator, resolve_run_skills, FrozenSkill, GrantedSkill, MissingReason,
+    MissingSkill, ResolvedSkills, RunSkillsError, SkillReason, SkillRequest,
 };
 pub use skill::{load_skill, Layer, Skill, SkillError, MAX_SKILL_MD_BYTES};
 pub use source::{parse_source, Fetch, FetchedTree, GitSource, Source, SourceError};

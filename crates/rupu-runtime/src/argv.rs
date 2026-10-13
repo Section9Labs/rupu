@@ -234,14 +234,22 @@ pub struct SessionStart {
     pub into: Option<PathBuf>,
     /// `--detach`: start the first turn without attaching.
     pub detach: bool,
+    /// `--skill`, repeated: skills every turn is given beside the agent's.
+    pub skills: Vec<String>,
+    /// `--preload-skill`, repeated: skills whose bodies go into the
+    /// session's system prompt.
+    pub preload_skills: Vec<String>,
 }
 
-/// `rupu session send <session_id> <prompt> …`.
+/// `rupu session send <session_id> [prompt] …`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSend {
     pub session_id: String,
-    pub prompt: String,
+    /// `None` only when the turn invokes `skills`.
+    pub prompt: Option<String>,
     pub detach: bool,
+    /// `--skill`, repeated: skills the operator invokes in this turn.
+    pub skills: Vec<String>,
 }
 
 /// `rupu session _worker --session-id <id>`.
@@ -467,6 +475,12 @@ impl RunArgv {
                     a.push("--into");
                     a.push(dir.as_os_str());
                 }
+                for skill in &s.skills {
+                    a.flag_value("--skill", skill);
+                }
+                for skill in &s.preload_skills {
+                    a.flag_value("--preload-skill", skill);
+                }
             }
             Self::SessionSend(s) => {
                 a.push("session");
@@ -474,11 +488,14 @@ impl RunArgv {
                 if s.detach {
                     a.push("--detach");
                 }
+                for skill in &s.skills {
+                    a.flag_value("--skill", skill);
+                }
                 // The prompt is positional: `--` keeps one starting with `-`
                 // from being read as a flag.
                 a.push("--");
                 a.push(&s.session_id);
-                a.push(&s.prompt);
+                a.opt_positional(s.prompt.as_deref());
             }
             Self::SessionWorker(w) => {
                 a.push("session");
@@ -840,12 +857,79 @@ mod tests {
     fn a_session_send_prompt_follows_the_separator() {
         let send = RunArgv::SessionSend(SessionSend {
             session_id: "ses_1".into(),
-            prompt: "--help me".into(),
+            prompt: Some("--help me".into()),
             detach: true,
+            skills: Vec::new(),
         });
         assert_eq!(
             strs(&send),
             ["session", "send", "--detach", "--", "ses_1", "--help me"]
+        );
+    }
+
+    #[test]
+    fn session_skills_render_as_repeated_flags_before_the_separator() {
+        let send = |prompt: Option<&str>| {
+            RunArgv::SessionSend(SessionSend {
+                session_id: "ses_1".into(),
+                prompt: prompt.map(str::to_owned),
+                detach: true,
+                skills: vec!["pdf".into(), "project:notes".into()],
+            })
+        };
+        assert_eq!(
+            strs(&send(Some("summarise x.pdf"))),
+            [
+                "session",
+                "send",
+                "--detach",
+                "--skill",
+                "pdf",
+                "--skill",
+                "project:notes",
+                "--",
+                "ses_1",
+                "summarise x.pdf"
+            ]
+        );
+        assert_eq!(
+            strs(&send(None)),
+            [
+                "session",
+                "send",
+                "--detach",
+                "--skill",
+                "pdf",
+                "--skill",
+                "project:notes",
+                "--",
+                "ses_1"
+            ]
+        );
+        let start = RunArgv::SessionStart(SessionStart {
+            agent: "triage".into(),
+            target: None,
+            mode: None,
+            prompt: None,
+            into: None,
+            detach: true,
+            skills: vec!["pdf".into()],
+            preload_skills: vec!["global:style".into(), "notes".into()],
+        });
+        assert_eq!(
+            strs(&start),
+            [
+                "session",
+                "start",
+                "triage",
+                "--detach",
+                "--skill",
+                "pdf",
+                "--preload-skill",
+                "global:style",
+                "--preload-skill",
+                "notes"
+            ]
         );
     }
 
@@ -935,8 +1019,9 @@ mod tests {
             RunArgv::Workflow(wf),
             RunArgv::SessionSend(SessionSend {
                 session_id: "ses_1".into(),
-                prompt: "-x 'y'".into(),
+                prompt: Some("-x 'y'".into()),
                 detach: true,
+                skills: vec!["pdf".into()],
             }),
         ] {
             let script = format!("printf '%s\\0' {}", argv.to_shell("rupu"));

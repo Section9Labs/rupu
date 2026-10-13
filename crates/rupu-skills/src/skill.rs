@@ -3,11 +3,11 @@
 use crate::frontmatter::{parse_skill_md, Frontmatter, FrontmatterError};
 use crate::name::{NameError, SkillName};
 use crate::tree::{self, ContentHash, Stamp, TreeEntry, TreeError};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Layer {
     Global,

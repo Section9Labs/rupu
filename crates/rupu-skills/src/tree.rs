@@ -58,6 +58,10 @@ macro_rules! fingerprint {
             pub fn short(&self) -> String {
                 self.hex()[..12].to_owned()
             }
+            /// `None` unless `s` is exactly 64 hex digits.
+            pub fn from_hex(s: &str) -> Option<Self> {
+                <[u8; 32] as hex::FromHex>::from_hex(s).ok().map(Self)
+            }
         }
 
         impl Serialize for $name {

@@ -256,41 +256,42 @@ Two new events in `rupu-transcript` (the `Event` enum at `crates/rupu-transcript
 
 ### 5.1 Fixed at start
 
-`SessionRecord` (`crates/rupu-cli/src/cmd/session.rs:376`) already snapshots the agent at start. It gains:
+`SessionRecord` (`crates/rupu-cli/src/cmd/session.rs`) already snapshots the agent at start. It gains three fields, each omitted when empty:
 
-- `agent_skills`, `agent_preload_skills`: the agent's keys.
-- `skill_index`: the resolved set, with names, layers, stamps and flags.
-- `skill_prompt`: the rendered skills section, preloaded bodies included, exactly as the first turn sent it.
-- `operator_skills`: skills the operator added later (§5.2).
-- `loaded_skills`: the run's loaded set (§6) as of the last turn, since each turn writes its own transcript (`crates/rupu-cli/src/cmd/session.rs:1848`).
+- `skill_index`: the frozen set, a list of `rupu_skills::FrozenSkill` entries (`name`, `layer`, `preload`, `indexed`, `reason`, `stamp`, and a preloaded skill's `content_hash`). `stamp` is the session's baseline for the skill. Entries are exact `layer:name` bindings: `resolve_frozen` rebuilds the turn's `ResolvedSkills` from them without re-expanding `*` and without recomputing the preload or index flags. A skill an operator invokes (§5.2) is appended here with reason `operator`; there is no separate `operator_skills` list.
+- `skill_prompt`: the rendered skills section, preloaded bodies included, exactly as `session start` rendered it. `None` when the session has no skills section.
+- `loaded_skills`: the loaded set (§6) as the latest turn left it, since each turn writes its own transcript.
 
-`rupu session start --skill <name>` (repeatable, like `--engagement-profile`) adds to the grant at start. Every turn appends the stored `skill_prompt` instead of rendering one, so the system prompt is byte-identical turn to turn and the prompt cache holds. That freezes preloaded bodies for the session's life; a session that wants a newer version of a preloaded skill is a new session. A skill installed after the session started is not offered, even under `*`. A skill the model loads that changed on disk loads at its new version with a `skill_changed` notice (S7).
+`rupu session start --skill <name>` and `--preload-skill <name>` (repeatable, like `--engagement-profile`) add to the set with reason `session`; the agent's keys keep reason `agent`. Every turn sends the stored `skill_prompt` (`Overrides.skill_section`) instead of rendering one, so the system prompt is byte-identical turn to turn and the prompt cache holds. That freezes preloaded bodies for the session's life; a session that wants a newer version of a preloaded skill is a new session. A skill installed after the session started is not offered, even under `*`. A skill the model loads that changed on disk since the session's baseline loads at its new version with a `skill_changed` notice (S7). A frozen skill that can no longer be given (uninstalled, invalid, or its record unreadable) is left out of the turn with a `skill_missing` notice at run start, and the turn runs. If it was loaded, it stays in `loaded_skills`, so a reinstall brings it back.
+
+A record that carries any of these fields is written as version 2, and a record without them stays version 1, which older rupus read as before. An older rupu does not check the version: it continues a version 2 session and drops its skills on its next write. A rupu that knows these fields refuses a record of a newer version than it reads.
 
 ### 5.2 Operator invocation
 
-`rupu session send --skill <name> [prompt]` (repeatable) invokes a skill in that turn:
+`rupu session send --skill <name> <id> [prompt]` (repeatable; the prompt is optional when a skill is given) invokes a skill in that turn:
 
-1. Look the name up in the session's catalog: the global layer plus the project layer of the session's `project_root`. Any valid installed skill qualifies (S6), granted or not, project skills included: the operator naming one is the opt-in that S9 otherwise requires of the grant. The `global:` and `project:` prefixes work as in §2.1, and an unqualified name in both layers refuses the send. An unknown name refuses it with a did-you-mean.
-2. Prepend the skill to the turn's user message, before the operator's prompt:
+1. `send` resolves each name before anything is enqueued (`rupu_skills::resolve_operator`, through the assembler's `resolve_operator_skills`), against the session's catalog: the global layer plus the project layer of the session's `project_root`. Any valid installed skill qualifies (S6), granted or not, project skills included: the operator naming one is the opt-in that S9 otherwise requires of the grant. The `global:` and `project:` prefixes work as in §2.1. A wildcard, an unqualified name in both layers, a name the session holds from the other layer, or one send naming both layers refuses the send. An unknown name refuses it with a did-you-mean.
+2. The resolved `FrozenSkill` entries (reason `operator`, `indexed: false`) ride the turn request. The turn appends them to `skill_index` before it thaws the set, so the same turn's read roots and `skills.load` cover them.
+3. The turn prepends each skill, read at its current version, to its user message, before the operator's prompt. Several are joined by a blank line, and a blank line separates them from the prompt:
 
    ```
-   <skill name="pdf-processing" base="/Users/x/.rupu/skills/pdf-processing" version="3f2a9c…">
+   <skill name="pdf-processing" base="/Users/x/.rupu/skills/pdf-processing" version="3f2a9c0d41b7">
    ...body...
    </skill>
    ```
 
-3. Write `skill_load { via: operator }`.
-4. Add the skill to `operator_skills`. From the next turn on, it is in the run's `ResolvedSkills` with reason `Operator`: the model may `skills.load` it again, and its root is a read root. It is not added to the index, so the system prompt does not change.
+   `version` is the first 12 hex digits of the skill's content hash (`rupu_skills::render::render_operator_injection`).
+4. The runner writes `skill_load { via: operator }` at run start (`UserTurn.operator_loads`) and the skill joins the loaded set. From then on, the model may `skills.load` it again, and its root is a read root. It is not added to the index, and `skill_prompt` is never re-rendered, so the system prompt does not change.
 
 A skill with `disable-model-invocation: true` is invocable this way. That flag exists for exactly this case.
 
-The CP session composer gets the same action in the CP plan (§8).
+The CP session composer and remote session hosts are Plan 4 (§8).
 
 ## 6. Compaction
 
 Compaction keeps the task text, a summary and the recent messages (`crates/rupu-agent/src/runner.rs:318`). A skill loaded early is summarised away. The agent keeps going without the instructions it was following.
 
-The runner keeps the run's **loaded set**: the skills whose latest `skill_load` is not `preload`. Replay rebuilds it from `skill_load` events, so a continued run has it too. A session seeds it from `loaded_skills` in its record (§5.1), because its earlier turns' events are in earlier transcripts.
+The runner keeps the run's **loaded set**: the skills whose latest `skill_load` is not `preload`. Replay rebuilds it from `skill_load` events, so a continued run has it too. A session seeds it from `loaded_skills` in its record (§5.1), because its earlier turns' events are in earlier transcripts. The session's own compaction paths (`rupu session compact` and the worker's compact pseudo-turn) re-attach through the same helper as the runner (`rupu_agent::reattach_block`) and store the loaded set it returns.
 
 `rebuild_compacted` (`crates/rupu-agent/src/runner.rs:318`) puts the re-attached skills in their own text block of the rebuilt first message, after the task-and-summary block. The block opens with a fixed `<skills-in-use>` marker. `compact_messages` builds its task text from `messages[0]`'s text blocks (`:486`), and it skips a block that opens with the marker, so a second compaction neither copies nor doubles the skills. The rebuilt message is in `Event::Compaction.messages`, so replay stays exact.
 
@@ -417,5 +418,5 @@ Shipping skill content with a dispatch is a later option if this proves painful.
 2. **Runs**, split in two:
    - **2a, runs.** Agent keys, load-time validation, `ResolvedSkills` in the assembler, the index and preload rendering, `Service::Skills` and `skills.load`, read roots, transcript events and notices, compaction re-attach, and replay and continuation keeping the loaded set. Covers every origin but sessions, with skills from the agent (and `Overrides`). Until Plan 3, a session refuses an agent that declares skills.
    - **2b, workflow steps and placed units.** Step `skills:` / `preloadSkills:`, the placed-unit `--skill` flags and the `agent.skills` capability.
-3. **Sessions.** Record fields, `session start --skill`, `session send --skill`.
+3. **Sessions** (complete). Record fields, `session start --skill` / `--preload-skill`, `session send --skill`, re-attach on session compaction.
 4. **CP.** API fields and endpoints, then the web Library tab, agent picker, transcript rendering and session composer action (stops for the visual check).

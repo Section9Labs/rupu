@@ -400,10 +400,10 @@ Each row:
 |-----------|--------|-------------|
 | `name`    | string | The name the skill binds in this run |
 | `layer`   | string | `global` or `project` |
-| `stamp`   | string | The skill's stamp at run start: a sha256 over its files' paths, sizes, mtimes and modes, no contents. A later load compares against it to notice an edit |
+| `stamp`   | string | The skill's stamp at run start: a sha256 over its files' paths, sizes, mtimes and modes, no contents. A later load compares against it to notice an edit. In a session turn it is the session's baseline, the stamp recorded when `rupu session start` froze the set (or when `session send --skill` added the skill), so an edit made since then is noticed in every later turn |
 | `preload` | bool   | The skill's body is in the system prompt |
 | `indexed` | bool   | The skill is listed in the model's skill index. `false` for a preloaded skill and for one marked `disable-model-invocation` |
-| `reason`  | string | Why the run has it: `agent` (the agent's `skills:` / `preloadSkills:`), `launch` (the launch's own: a workflow step's keys or `rupu run --skill`), `session` or `operator`. A transcript written before the rename says `step` for `launch`; readers take the value as written |
+| `reason`  | string | Why the run has it: `agent` (the agent's `skills:` / `preloadSkills:`), `launch` (the launch's own: a workflow step's keys or `rupu run --skill`), `session` (`rupu session start --skill` / `--preload-skill`) or `operator` (a skill `rupu session send --skill` invoked in an earlier turn; never indexed). A transcript written before the rename says `step` for `launch`; readers take the value as written |
 
 ```json
 {"type":"skill_index","data":{"skills":[{"name":"pdf","layer":"global","stamp":"9f2c…","preload":false,"indexed":true,"reason":"agent"}]}}
@@ -421,7 +421,7 @@ A skill's content entered the conversation. Written for every load, whichever pa
 | `layer`        | string | `global` or `project` |
 | `content_hash` | string | sha256 over the skill's files' paths, modes and bytes: the version that was loaded. A `preload` load's is taken when the run resolves its skills, so it is the version of the body in `run_start.system_prompt` |
 | `base_dir`     | string | The skill's directory, which its relative file references resolve against |
-| `via`          | string | `model` (a `skills.load` call), `preload` (at run start), `operator` (a session operator invoked it), `reattach` (put back after a compaction) or `continuation` (carried over from the run this one continues) |
+| `via`          | string | `model` (a `skills.load` call), `preload` (at run start), `operator` (`rupu session send --skill` put its body in the turn's message; written at run start), `reattach` (put back after a compaction) or `continuation` (carried over from the run this one continues) |
 
 ```json
 {"type":"skill_load","data":{"name":"pdf","layer":"global","content_hash":"4b1e…","base_dir":"/home/me/.rupu/skills/pdf","via":"model"}}
@@ -550,7 +550,7 @@ A runtime intervention worth showing that is not part of the conversation.
 
 | Field     | Type   | Description |
 |-----------|--------|-------------|
-| `kind`    | string | `model_limits` (the run's input and output limits and where each came from, written at start and on a fallback hop), `model_limits_clamped`, `context_trim`, `provider_retry`, `server_side_fallback_disabled`, `permission_mode_degraded` (ask mode with no operator to ask), `tool_unavailable` (a tool named in `tools:` that this run can't serve; one per tool, right after `tool_grant`), `skill_not_indexed` (a granted skill marked `disable-model-invocation` that isn't preloaded, so the model can't load it), `skill_changed` (a skill loaded at a newer version than the run's `skill_index` recorded), `skill_missing` (a loaded skill no longer installed when it was due to be re-attached), `skill_tools_missing` (a loaded skill's `allowed-tools` names tools the run wasn't granted) or `skill_reattach_truncated` (loaded skills that didn't fit under the re-attach cap after a compaction). Expect new kinds; render an unknown one by its `message` |
+| `kind`    | string | `model_limits` (the run's input and output limits and where each came from, written at start and on a fallback hop), `model_limits_clamped`, `context_trim`, `provider_retry`, `server_side_fallback_disabled`, `permission_mode_degraded` (ask mode with no operator to ask), `tool_unavailable` (a tool named in `tools:` that this run can't serve; one per tool, right after `tool_grant`), `skill_not_indexed` (a granted skill marked `disable-model-invocation` that isn't preloaded, so the model can't load it), `skill_changed` (a skill loaded at a newer version than the run's `skill_index` recorded), `skill_missing` (a loaded skill no longer installed when it was due to be re-attached, or, at a session turn's start, a skill the session froze that can't be given now), `skill_tools_missing` (a loaded skill's `allowed-tools` names tools the run wasn't granted) or `skill_reattach_truncated` (loaded skills that didn't fit under the re-attach cap after a compaction). Expect new kinds; render an unknown one by its `message` |
 | `message` | string | Human-readable text |
 
 ```json
@@ -706,7 +706,7 @@ notice?                     # model_limits
 tool_grant                  # the tools offered, and why (W2)
 notice*                     # tool_unavailable, one per named tool the run can't serve
 skill_index?                # the skills bound, when the run has any
-(skill_load | notice)*      # preload and continuation loads; skill_not_indexed
+(skill_load | notice)*      # preload, continuation and operator loads; skill_not_indexed, skill_missing
 seed?                       # a run seeded from earlier history
 user_message?
 (turn_start
@@ -729,7 +729,8 @@ and a note sent back to the model is a `user_message`. A successful `skills.load
 `skill_load` right after the call's `tool_result`, then any `skill_changed` or
 `skill_tools_missing` notice. Skills put back after a compaction are `skill_load` lines with
 `via: reattach`, alongside any `skill_changed`, `skill_missing` or `skill_reattach_truncated`
-notice.
+notice. A session's compact pseudo-turn (the compaction a running session's worker does on
+request) writes the same lines after its compaction `usage`; it has no `compaction` event.
 
 ---
 
