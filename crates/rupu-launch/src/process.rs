@@ -493,7 +493,7 @@ impl Drop for Subprocess {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proc::pid_is_running;
+    use crate::proc::{is_zombie, pid_is_running};
 
     use rupu_runtime::argv::{AgentRun, WorkflowRef, WorkflowRun};
 
@@ -620,27 +620,6 @@ mod tests {
             assert!(Instant::now() < deadline, "{what} (pid {pid}) survived");
             std::thread::sleep(Duration::from_millis(20));
         }
-    }
-
-    /// Whether `pid` has exited but not been reaped (`/proc/<pid>/stat` state
-    /// `Z`, or `X` while it is being torn down). The state follows the
-    /// parenthesised command name, which may itself contain `)`.
-    #[cfg(target_os = "linux")]
-    fn is_zombie(pid: u32) -> bool {
-        std::fs::read_to_string(format!("/proc/{pid}/stat"))
-            .ok()
-            .and_then(|stat| {
-                let (_, rest) = stat.rsplit_once(')')?;
-                rest.trim_start().chars().next()
-            })
-            .is_some_and(|state| state == 'Z' || state == 'X')
-    }
-
-    /// Off Linux the tests run under a reaping init (launchd), so a killed
-    /// grandchild's zombie window is brief and waiting it out is enough.
-    #[cfg(not(target_os = "linux"))]
-    fn is_zombie(_pid: u32) -> bool {
-        false
     }
 
     /// A launcher whose unit is `sh -c 'sleep 30 & echo $! > <file>; wait'`: a

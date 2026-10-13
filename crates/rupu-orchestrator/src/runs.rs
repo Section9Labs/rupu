@@ -4338,15 +4338,39 @@ impl From<RunStoreError> for PauseError {
 /// (any non-zero exit was "dead"), which could reap a run that was in
 /// fact still going. Only `ESRCH` — and any other error, conservatively —
 /// means "no such process".
+///
+/// A zombie is not running ([`is_zombie`]): it has exited and only waits
+/// for its parent to reap it, which a runner whose launcher died never gets
+/// where PID 1 reaps nothing (a container whose entry point is not an init).
 pub fn pid_is_running(pid: u32) -> bool {
-    let Some(pid) = rustix_pid(pid) else {
+    let Some(raw) = rustix_pid(pid) else {
         return false;
     };
-    match rustix::process::test_kill_process(pid) {
-        Ok(()) => true,
-        Err(rustix::io::Errno::PERM) => true,
+    match rustix::process::test_kill_process(raw) {
+        Ok(()) | Err(rustix::io::Errno::PERM) => !is_zombie(pid),
         Err(_) => false,
     }
+}
+
+/// Whether `pid` has exited but has not been reaped: `/proc/<pid>/stat`
+/// state `Z`, or `X` while it is being torn down. `kill(pid, 0)` succeeds
+/// for a zombie. Always `false` off Linux, where the supported inits reap.
+#[cfg(target_os = "linux")]
+pub fn is_zombie(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            // The state is the first field after the parenthesised command
+            // name, which may itself contain `)`, so split on the LAST one.
+            let (_, rest) = stat.rsplit_once(')')?;
+            rest.trim_start().chars().next()
+        })
+        .is_some_and(|state| state == 'Z' || state == 'X')
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn is_zombie(_pid: u32) -> bool {
+    false
 }
 
 /// Send SIGTERM to `pid`. Returns whether the signal was delivered.
@@ -8082,6 +8106,35 @@ mod tests {
             "pid 0 means `our whole process group` to kill(2) and must never \
              be treated as a live runner"
         );
+    }
+
+    /// A runner that exited but was never reaped (its launcher died, and
+    /// PID 1 reaps nothing) is not running: a run it left `Running` is
+    /// orphaned.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unreaped_runner_is_not_running() {
+        let mut exited = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = exited.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !is_zombie(pid) {
+            assert!(std::time::Instant::now() < deadline, "{pid} never exited");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!pid_is_running(pid));
+
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let mut rec = sample_record("run_reap_zombie_pid");
+        rec.status = RunStatus::Running;
+        rec.runner_pid = Some(pid);
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+        assert!(store.reap_if_orphaned(&mut rec, Utc::now()).unwrap());
+        assert_eq!(rec.status, RunStatus::Failed);
+        exited.wait().unwrap();
     }
 
     #[test]

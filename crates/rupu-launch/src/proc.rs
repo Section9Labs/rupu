@@ -34,35 +34,9 @@ pub fn pid_is_running(pid: u32) -> bool {
 }
 
 /// Whether `pid` has exited but has not yet been reaped (a zombie).
-///
-/// `kill(pid, 0)` succeeds for a zombie, so [`pid_is_running`] reports it alive
-/// forever; this reads `/proc/<pid>/stat` on Linux to tell the two apart. A
-/// zombie coordinator is as dead as a vanished one — its process has exited and
-/// will never run again — so the orphan reaper must treat it as dead, or a run
-/// whose coordinator was SIGKILLed is never reaped. A reaping init (systemd,
-/// launchd) collects a zombie within moments, so this only bites where PID 1
-/// reaps nothing: a container whose entry point is the coordinator's distant
-/// ancestor (e.g. CI's `docker run … cargo test`). Always `false` off Linux,
-/// where the supported inits reap.
-#[cfg(target_os = "linux")]
-pub fn is_zombie(pid: u32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .ok()
-        .and_then(|stat| {
-            // The state is the first field after the parenthesised command
-            // name, which may itself contain `)`, so split on the LAST one.
-            let (_, rest) = stat.rsplit_once(')')?;
-            rest.trim_start().chars().next()
-        })
-        .is_some_and(|state| state == 'Z' || state == 'X')
-}
-
-/// Off Linux the supported inits reap, so an exited process does not linger as
-/// a zombie worth distinguishing from a vanished one.
-#[cfg(not(target_os = "linux"))]
-pub fn is_zombie(_pid: u32) -> bool {
-    false
-}
+/// `kill(pid, 0)` succeeds for a zombie, so [`pid_is_running`] reports it
+/// alive; a zombie coordinator or child is as dead as a vanished one.
+pub use rupu_orchestrator::runs::is_zombie;
 
 /// Whether a coordinator with this pid is still running: it exists and is not
 /// a zombie ([`is_zombie`]) — the liveness the orphan reaper uses, for any

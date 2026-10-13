@@ -539,12 +539,12 @@ fn parent_end_stops_an_unjoined_process_child() {
 #[test]
 fn a_signalled_child_stops_its_own_children() {
     let _env = ENV_LOCK.blocking_lock();
-    for signal in ["TERM", "INT"] {
+    for signal in [rustix::process::Signal::TERM, rustix::process::Signal::INT] {
         signalled_child_stops_its_own_children(signal);
     }
 }
 
-fn signalled_child_stops_its_own_children(signal: &str) {
+fn signalled_child_stops_its_own_children(signal: rustix::process::Signal) {
     const GRAND_MODEL: &str = "claude-opus-4-7";
     let home = Home::new();
     home.agent(
@@ -592,19 +592,19 @@ fn signalled_child_stops_its_own_children(signal: &str) {
     let grand = home.wait_for_child(&child.started.run_id);
     let grand_pid = grand.started.pid.unwrap();
 
-    let group = format!("-{}", child.started.pgid.unwrap());
-    let sent = Command::new("kill")
-        .args(["-s", signal, "--", &group])
-        .status()
-        .unwrap();
-    assert!(sent.success(), "kill -s {signal} {group}");
+    let group = child.started.pgid.unwrap();
+    rustix::process::kill_process_group(
+        rustix::process::Pid::from_raw(i32::try_from(group).unwrap()).unwrap(),
+        signal,
+    )
+    .unwrap_or_else(|e| panic!("signal {signal:?} to group {group}: {e}"));
 
     let deadline = Instant::now() + Duration::from_secs(30);
     while rupu_launch::proc::pid_is_running(grand_pid) && !rupu_launch::proc::is_zombie(grand_pid) {
         if Instant::now() >= deadline {
             let _ = parent.kill();
             rupu_launch::proc::kill_group(grand_pid);
-            panic!("the grandchild {grand_pid} survived its parent's SIG{signal}");
+            panic!("the grandchild {grand_pid} survived its parent's {signal:?}");
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -810,7 +810,7 @@ fn continuing_a_crashed_parent_resumes_its_workflow_child() {
         ),
         (child.started.handle.as_str(), wf_run.as_str())
     );
-    assert_eq!(now[0].state(), ChildState::Done);
+    assert_eq!(now[0].state(), ChildState::Done, "{:?}", now[0].finished);
     let joined = tool_results(&home.transcript(continued));
     let (output, _) = joined.last().expect("the join's result");
     assert!(output.contains("step answer"), "{output}");

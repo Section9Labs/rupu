@@ -5,14 +5,20 @@
 use crate::paths;
 use std::panic;
 
+/// Installs the hook once per process: `run` is called once per in-process
+/// invocation (tests call it many times), and a hook chained per call would
+/// write one crash log per call for every later panic.
 pub fn install_panic_hook() {
-    let prev = panic::take_hook();
-    panic::set_hook(Box::new(move |info| {
-        if let Err(e) = write_crash_log(&format!("{info}")) {
-            eprintln!("rupu: failed to write crash log: {e}");
-        }
-        prev(info);
-    }));
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let prev = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            if let Err(e) = write_crash_log(&format!("{info}")) {
+                eprintln!("rupu: failed to write crash log: {e}");
+            }
+            prev(info);
+        }));
+    });
 }
 
 fn write_crash_log(info_display: &str) -> anyhow::Result<()> {
