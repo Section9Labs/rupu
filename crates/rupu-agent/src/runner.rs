@@ -340,6 +340,19 @@ pub(crate) fn rebuild_compacted(
 /// adds to the compacted history.
 const SUMMARY_MAX_TOKENS: u32 = 8192;
 
+/// System prompt of the compaction summariser call.
+const SUMMARY_SYSTEM: &str = "You condense agent conversations into notes the agent \
+continues from. You write the summary only; you never continue the conversation.";
+
+/// The user turn that ends the summariser call's history.
+const SUMMARY_INSTRUCTION: &str = "The conversation above is being compacted. Do not \
+continue it, answer its last message or call any tool: summarize the conversation so far \
+for continuation. Preserve, as concise structured notes: the objective/task; key decisions \
+and conclusions; findings and their locations; files/areas already examined; the current \
+state, including any request still being worked on; and any open threads or planned next \
+steps. Omit chit-chat and redundant tool output. This summary replaces the omitted turns, \
+so it must be self-contained.";
+
 /// Result of compacting a conversation: the new (shorter) message list and how
 /// many middle messages were replaced by the summary.
 pub struct CompactionOutcome {
@@ -411,17 +424,17 @@ pub async fn compact_messages(
         None => return Ok(None),
     };
 
-    // Build summary request.
-    let summary_prompt = "Summarize the conversation so far for continuation. \
-Preserve, as concise structured notes: the objective/task; key decisions and \
-conclusions; findings and their locations; files/areas already examined; the \
-current state; and any open threads or planned next steps. Omit chit-chat and \
-redundant tool output. This summary replaces the omitted turns, so it must be \
-self-contained.";
+    // The request ends with the instruction as its own user turn. Left in the
+    // system prompt only, the history's last turn is what the model answers:
+    // a pending user request gets acted on (a reply with no text, or one
+    // like "Sure!") instead of summarised, and a trailing assistant message
+    // is a prefill, which current models refuse with a 400.
+    let mut summary_messages = messages[..recent_start].to_vec();
+    push_user_turn(&mut summary_messages, SUMMARY_INSTRUCTION);
     let summary_req = LlmRequest {
         model: model.to_string(),
-        system: Some(summary_prompt.to_string()),
-        messages: messages[..recent_start].to_vec(),
+        system: Some(SUMMARY_SYSTEM.to_string()),
+        messages: summary_messages,
         max_tokens: Some(SUMMARY_MAX_TOKENS),
         tools: vec![],
         cell_id: None,
@@ -5862,6 +5875,161 @@ mod compaction_tests {
                 .expect("no provider error")
                 .expect("should compact");
         assert!(outcome.summarized_messages > 0);
+    }
+
+    /// The summariser as Claude behaves: a history ending on an assistant
+    /// message is a prefill, refused with a 400, and otherwise it answers the
+    /// last user turn — a summary only when that turn asks for one, else a
+    /// reply with nothing but thinking (no tools were declared to act with).
+    struct AnswersTheLastTurn;
+
+    #[async_trait]
+    impl LlmProvider for AnswersTheLastTurn {
+        async fn send(
+            &mut self,
+            req: &LlmRequest,
+        ) -> Result<LlmResponse, rupu_providers::ProviderError> {
+            let last = req.messages.last().expect("a non-empty history");
+            if last.role == Role::Assistant {
+                return Err(rupu_providers::ProviderError::Http(
+                    "400: This model does not support assistant message prefill.".into(),
+                ));
+            }
+            let asks_for_summary = matches!(
+                last.content.last(),
+                Some(ContentBlock::Text { text }) if text.contains("summarize")
+            );
+            let content = if asks_for_summary {
+                summary_text("Read notes.txt; the pending request is to run date.")
+            } else {
+                vec![ContentBlock::Reasoning {
+                    text: Some("The user wants me to run 'date' with bash.".into()),
+                    provider: "anthropic".into(),
+                    model: "claude-sonnet-4-6".into(),
+                    raw: serde_json::json!({"type": "thinking"}),
+                }]
+            };
+            Ok(LlmResponse {
+                id: "msg".into(),
+                model: req.model.clone(),
+                content,
+                stop: Stop::synthetic(StopReason::EndTurn, "anthropic"),
+                usage: Usage::default(),
+            })
+        }
+
+        async fn stream(
+            &mut self,
+            req: &LlmRequest,
+            _on_event: &mut (dyn FnMut(StreamEvent) + Send),
+        ) -> Result<LlmResponse, rupu_providers::ProviderError> {
+            self.send(req).await
+        }
+
+        fn default_model(&self) -> &str {
+            "claude-sonnet-4-6"
+        }
+
+        fn provider_id(&self) -> rupu_providers::ProviderId {
+            rupu_providers::ProviderId::Anthropic
+        }
+    }
+
+    fn tool_call(id: &str, command: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: id.into(),
+                name: "bash".into(),
+                input: serde_json::json!({ "command": command }),
+            }],
+        }
+    }
+
+    fn tool_output(id: &str, output: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: id.into(),
+                content: output.into(),
+                is_error: false,
+            }],
+        }
+    }
+
+    /// Two session turns that each called tools: the 10-message history
+    /// `rupu session compact --window 8000` failed on.
+    fn two_tool_turns() -> Vec<Message> {
+        vec![
+            text_msg(Role::User, "Read notes.txt, then count its bytes."),
+            tool_call("c1", "cat notes.txt"),
+            tool_output("c1", "the secret number is 42"),
+            tool_call("c2", "wc -c notes.txt"),
+            tool_output("c2", "24 notes.txt"),
+            text_msg(
+                Role::Assistant,
+                "The secret number is 42; the file is 24 bytes.",
+            ),
+            text_msg(Role::User, "Now run date and tell me the year."),
+            tool_call("c3", "date"),
+            tool_output("c3", "Tue Oct 13 2026"),
+            text_msg(Role::Assistant, "It is 2026."),
+        ]
+    }
+
+    #[tokio::test]
+    async fn compact_messages_summarises_a_history_ending_on_a_pending_request() {
+        // The summarised slice ends on the user's "Now run date" (its tool
+        // call stays verbatim with the recent pair). Asked only by the system
+        // prompt, the model answered that request with nothing but thinking:
+        // "compaction summary rejected: empty summary".
+        let msgs = two_tool_turns();
+        let outcome = compact_messages(
+            &msgs,
+            &mut AnswersTheLastTurn,
+            "claude-sonnet-4-6",
+            6400,
+            300,
+        )
+        .await
+        .expect("a summary, not a rejection")
+        .expect("should compact");
+        let ContentBlock::Text { text } = &outcome.messages[0].content[0] else {
+            panic!("expected a text block");
+        };
+        assert!(
+            text.contains("the pending request is to run date"),
+            "got: {text}"
+        );
+        assert_eq!(
+            serde_json::to_value(&outcome.messages[1..]).unwrap(),
+            serde_json::to_value(&msgs[7..]).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_messages_summarises_a_history_ending_on_an_assistant_reply() {
+        // A last turn with no tool call: the recent pair is its user prompt
+        // and the reply, so the summarised slice ends on an assistant message
+        // — a prefill, which current Claude models refuse with a 400.
+        let mut msgs = two_tool_turns();
+        msgs.push(text_msg(Role::User, "Thanks. Say bye."));
+        msgs.push(text_msg(Role::Assistant, "bye"));
+        let outcome = compact_messages(
+            &msgs,
+            &mut AnswersTheLastTurn,
+            "claude-sonnet-4-6",
+            6400,
+            300,
+        )
+        .await
+        .expect("a summary, not a provider error")
+        .expect("should compact");
+        assert_eq!(outcome.summarized_messages, 9);
+        assert_eq!(
+            serde_json::to_value(&outcome.messages[1..]).unwrap(),
+            serde_json::to_value(&msgs[10..]).unwrap()
+        );
     }
 
     #[tokio::test]
