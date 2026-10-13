@@ -6,6 +6,7 @@
 use crate::runner::LoadedSkill;
 use rupu_skills::render::{render_reattach, ReattachItem};
 use rupu_skills::{Layer, ResolvedSkills};
+use rupu_transcript::Event;
 use std::path::PathBuf;
 
 /// What a re-attach puts back and what it leaves out.
@@ -29,6 +30,50 @@ pub struct Reattach {
     /// missing or omitted skill stays, so a reinstall or a later re-attach
     /// brings it back.
     pub loaded: Vec<LoadedSkill>,
+}
+
+impl Reattach {
+    /// The transcript events that record this re-attach, for after the
+    /// compaction that made it: a `skill_load { via: reattach }` per
+    /// re-attached skill (in load order, so a replay folds the loaded set
+    /// into [`Self::loaded`]'s order), each after its `skill_changed`
+    /// notice, then a `skill_missing` notice per missing skill and one
+    /// `skill_reattach_truncated` for those left out.
+    pub fn events(&self) -> Vec<Event> {
+        let mut events = Vec::new();
+        for r in &self.reattached {
+            let name = &r.name;
+            if self.changed.contains(name) {
+                events.push(Event::Notice {
+                    kind: "skill_changed".into(),
+                    message: format!(
+                        "skill {name} changed on disk since it was loaded; its current version \
+                         was re-attached"
+                    ),
+                });
+            }
+            events.push(Event::SkillLoad {
+                name: name.clone(),
+                layer: r.layer.as_str().to_owned(),
+                content_hash: r.content_hash.clone(),
+                base_dir: r.base_dir.display().to_string(),
+                via: "reattach".into(),
+            });
+        }
+        for name in &self.missing {
+            events.push(Event::Notice {
+                kind: "skill_missing".into(),
+                message: format!("skill {name} is no longer installed and was not re-attached"),
+            });
+        }
+        if !self.omitted.is_empty() {
+            events.push(Event::Notice {
+                kind: "skill_reattach_truncated".into(),
+                message: format!("not re-attached for space: {}", self.omitted.join(", ")),
+            });
+        }
+        events
+    }
 }
 
 /// A skill [`Reattach::block`] put back: what its `skill_load

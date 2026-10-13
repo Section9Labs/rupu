@@ -631,11 +631,8 @@ async fn compact_context(
 /// first message after compaction summarised them away
 /// ([`crate::reattach_block`]), capped at a quarter of the input limit (in
 /// characters, at ~4 per token: the token count itself; 32 KiB when the
-/// limit is unknown). Returns the events that record it, for after the
-/// `Compaction` event: a `skill_load { via: reattach }` per re-attached
-/// skill (in load order, so a replay folds the loaded set into this one's
-/// order), and the `skill_changed` / `skill_missing` /
-/// `skill_reattach_truncated` notices.
+/// limit is unknown). Returns the events that record it
+/// ([`crate::Reattach::events`]), for after the `Compaction` event.
 async fn reattach_skills(messages: &mut [Message], run: &mut Run) -> Vec<Event> {
     let Some(skills) = run.tool_context.services.skills.clone() else {
         return Vec::new();
@@ -652,42 +649,10 @@ async fn reattach_skills(messages: &mut [Message], run: &mut Run) -> Vec<Event> 
     else {
         return Vec::new();
     };
+    let events = reattach.events();
     messages[0].content.push(ContentBlock::Text {
         text: reattach.block,
     });
-
-    let mut events = Vec::new();
-    for r in &reattach.reattached {
-        let name = &r.name;
-        if reattach.changed.contains(name) {
-            events.push(Event::Notice {
-                kind: "skill_changed".into(),
-                message: format!(
-                    "skill {name} changed on disk since it was loaded; its current version was \
-                     re-attached"
-                ),
-            });
-        }
-        events.push(Event::SkillLoad {
-            name: name.clone(),
-            layer: r.layer.as_str().to_owned(),
-            content_hash: r.content_hash.clone(),
-            base_dir: r.base_dir.display().to_string(),
-            via: "reattach".into(),
-        });
-    }
-    for name in &reattach.missing {
-        events.push(Event::Notice {
-            kind: "skill_missing".into(),
-            message: format!("skill {name} is no longer installed and was not re-attached"),
-        });
-    }
-    if !reattach.omitted.is_empty() {
-        events.push(Event::Notice {
-            kind: "skill_reattach_truncated".into(),
-            message: format!("not re-attached for space: {}", reattach.omitted.join(", ")),
-        });
-    }
     run.loaded_skills = reattach.loaded;
     events
 }

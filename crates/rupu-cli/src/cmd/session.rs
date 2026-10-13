@@ -7212,8 +7212,23 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
                 &outcome.usage,
             );
             let summarized = outcome.summarized_messages;
+            let mut messages = outcome.messages;
+            let input = window_override.or(session.effective_context_window());
+            let reattach = reattach_session_skills(&global, &session, &mut messages, input)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("compaction failed: re-attach the session's loaded skills: {e}")
+                })?;
+            if let Some((events, loaded)) = reattach {
+                for event in &events {
+                    if let TranscriptEvent::Notice { kind, message } = event {
+                        tracing::info!(session = %session_id, kind = %kind, "{message}");
+                    }
+                }
+                session.loaded_skills = loaded;
+            }
             let before = session.message_history.len();
-            session.message_history = outcome.messages;
+            session.message_history = messages;
             let after = session.message_history.len();
             // Compaction rewrites history in place with no transcript of its
             // own that reconstructs to the summarized result — the next
@@ -7725,7 +7740,10 @@ async fn run_compact_request(
         .unwrap_or_else(|| (total_chars / 2).max(1) as u32);
 
     let before = session.message_history.len();
-    match rupu_agent::compact_messages(
+    // The summary, with the session's loaded skills put back; a re-attach
+    // that can't read the skills fails the request like a failed summary,
+    // leaving the history as it was.
+    let compacted = match rupu_agent::compact_messages(
         &session.message_history,
         provider.as_mut(),
         &session.model,
@@ -7743,7 +7761,36 @@ async fn run_compact_request(
                 &outcome.usage,
             ))?;
             let summarized = outcome.summarized_messages;
-            session.message_history = outcome.messages;
+            let mut messages = outcome.messages;
+            let input = session.effective_context_window();
+            match reattach_session_skills(global, &session, &mut messages, input).await {
+                Ok(reattach) => Ok(Some((summarized, messages, reattach))),
+                Err(e) => Err(format!("re-attach the session's loaded skills: {e}")),
+            }
+        }
+        Ok(None) => Ok(None),
+        Err(e) => {
+            // A rejected summary was billed: record it in this pseudo-run's
+            // transcript like a successful compaction's usage.
+            if let rupu_agent::CompactionError::Rejected { usage, .. } = &e {
+                writer.write(&compaction_usage_event(
+                    &session.provider_name,
+                    &session.model,
+                    usage,
+                ))?;
+            }
+            Err(e.to_string())
+        }
+    };
+    match compacted {
+        Ok(Some((summarized, messages, reattach))) => {
+            if let Some((events, loaded)) = reattach {
+                for event in &events {
+                    writer.write(event)?;
+                }
+                session.loaded_skills = loaded;
+            }
+            session.message_history = messages;
             // Same reasoning as the offline `rupu session compact` path: the
             // compaction pseudo-transcript this function writes does NOT
             // reconstruct to the summarized history (it replays to an empty
@@ -7799,17 +7846,7 @@ async fn run_compact_request(
                 None,
             )?;
         }
-        Err(e) => {
-            let err_str = e.to_string();
-            // A rejected summary was billed: record it in this pseudo-run's
-            // transcript like a successful compaction's usage.
-            if let rupu_agent::CompactionError::Rejected { usage, .. } = &e {
-                writer.write(&compaction_usage_event(
-                    &session.provider_name,
-                    &session.model,
-                    usage,
-                ))?;
-            }
+        Err(err_str) => {
             writer.write(&TranscriptEvent::RunComplete {
                 run_id: request.run_id.clone(),
                 status: RunStatus::Error,
@@ -7861,8 +7898,9 @@ fn finalize_compact_run(
     s.active_pid = None;
     s.last_run_id = Some(request.run_id.clone());
     s.last_transcript_path = Some(request.transcript_path.clone());
-    // Persist compacted message history.
+    // Persist compacted message history, and the loaded skills it carries.
     s.message_history = session.message_history.clone();
+    s.loaded_skills = session.loaded_skills.clone();
     // Mirror `session.history_source_transcript` (cleared above on the
     // compacting branch, unchanged otherwise) onto the freshly re-read `s`
     // — otherwise `s`'s on-disk value would survive this write untouched
@@ -7905,12 +7943,7 @@ async fn freeze_session_skills(
     skills: Vec<String>,
     preload_skills: Vec<String>,
 ) -> anyhow::Result<(Vec<rupu_skills::FrozenSkill>, Option<String>)> {
-    // Resolution reads only the skill layers.
-    let assembler =
-        rupu_runtime::assembly::RunAssembler::new(rupu_runtime::assembly::AssemblyContext {
-            project_root: project_root.map(Path::to_path_buf),
-            ..rupu_runtime::assembly::AssemblyContext::minimal(global.to_path_buf())
-        });
+    let assembler = skill_layers(global, project_root);
     let overrides = rupu_runtime::assembly::Overrides {
         skills,
         preload_skills,
@@ -7920,6 +7953,53 @@ async fn freeze_session_skills(
         .resolve_skills_as(agent, &overrides, rupu_skills::SkillReason::Session)
         .await?;
     Ok(resolved.map_or((Vec::new(), None), |r| (r.freeze(), r.prompt_section())))
+}
+
+/// An assembler for reading a session's skill layers only: global and the
+/// project's `.rupu`.
+fn skill_layers(
+    global: &Path,
+    project_root: Option<&Path>,
+) -> rupu_runtime::assembly::RunAssembler {
+    rupu_runtime::assembly::RunAssembler::new(rupu_runtime::assembly::AssemblyContext {
+        project_root: project_root.map(Path::to_path_buf),
+        ..rupu_runtime::assembly::AssemblyContext::minimal(global.to_path_buf())
+    })
+}
+
+/// Puts the session's loaded skills back into `messages`, a history its
+/// compaction just rebuilt, the way a turn's own compaction does (spec
+/// 2026-10-12 §6, [`rupu_agent::reattach_block`]): each at its current
+/// version from the session's frozen set as installed now, most recently
+/// loaded first, capped at a quarter of `input_tokens` (32 KiB when it is
+/// unknown). Returns the events that record the re-attach and the loaded
+/// set after it; nothing when no skill is loaded.
+async fn reattach_session_skills(
+    global: &Path,
+    session: &SessionRecord,
+    messages: &mut [Message],
+    input_tokens: Option<u32>,
+) -> anyhow::Result<Option<(Vec<TranscriptEvent>, Vec<rupu_agent::LoadedSkill>)>> {
+    if session.loaded_skills.is_empty() || messages.is_empty() {
+        return Ok(None);
+    }
+    let (skills, _missing) = skill_layers(global, session.project_root.as_deref())
+        .resolve_frozen_skills(&session.skill_index)
+        .await?;
+    let skills = skills.unwrap_or_default();
+    let loaded = session.loaded_skills.clone();
+    let cap = input_tokens.map_or(32 * 1024, |t| t as usize);
+    let reattach =
+        tokio::task::spawn_blocking(move || rupu_agent::reattach_block(&loaded, &skills, cap))
+            .await
+            .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()));
+    Ok(reattach.map(|r| {
+        let events = r.events();
+        messages[0]
+            .content
+            .push(rupu_providers::types::ContentBlock::Text { text: r.block });
+        (events, r.loaded)
+    }))
 }
 
 /// The agent a session turn runs: the agent settings the session record

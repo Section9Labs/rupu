@@ -918,3 +918,205 @@ async fn send_skill_refuses_wildcards_and_ambiguous_names() {
         ok.iter().map(|f| (f.name.as_str(), f.layer)).collect();
     assert_eq!(names, vec![("pdf", rupu_skills::Layer::Global)]);
 }
+
+const SUMMARY: &str = r#"[{ "AssistantText": { "text": "Summary of prior work.", "stop": "end_turn", "input_tokens": 500, "output_tokens": 10 } }]"#;
+
+fn dense_history(len: usize) -> Vec<Message> {
+    let dense = "x".repeat(1000);
+    let mut history = vec![Message::user(&format!("task: {dense}"))];
+    for i in 0..len {
+        history.push(Message::assistant(&format!("assistant {i}: {dense}")));
+        history.push(Message::user(&format!("user {i}: {dense}")));
+    }
+    history
+}
+
+/// A session over `code-review` and `pdf` whose conversation loaded both,
+/// with a history long enough to compact under a 1,000-token window.
+async fn compactable_session(
+    tmp: &tempfile::TempDir,
+    session_id: &str,
+) -> (PathBuf, SessionRecord, PathBuf) {
+    let global = tmp.path().join("global");
+    let review = install_skill(&global, "code-review", "REVIEW STEPS");
+    let pdf = install_skill(&global, "pdf", "PDF STEPS");
+    let (global, mut record) = skill_session(
+        tmp,
+        session_id,
+        &agent("skills: [code-review, pdf]"),
+        &[],
+        &[],
+    )
+    .await;
+    let loaded = |dir: &Path| {
+        let skill = rupu_skills::load_skill(dir, rupu_skills::Layer::Global).unwrap();
+        rupu_agent::LoadedSkill {
+            name: skill.name.as_str().to_owned(),
+            content_hash: skill.content_hash().unwrap().hex(),
+        }
+    };
+    record.loaded_skills = vec![loaded(&pdf), loaded(&review)];
+    record.message_history = dense_history(5);
+    record.context_window_tokens = Some(1000);
+    fs::create_dir_all(&record.transcripts_dir).unwrap();
+    write_session(&global, SessionScope::Active, &record).unwrap();
+    (global, record, pdf)
+}
+
+fn history_len(global: &Path, session_id: &str) -> usize {
+    read_session(global, session_id)
+        .unwrap()
+        .0
+        .message_history
+        .len()
+}
+
+/// The re-attach blocks in the session's first message.
+fn reattach_blocks(global: &Path, session_id: &str) -> Vec<String> {
+    let (session, _) = read_session(global, session_id).unwrap();
+    session.message_history[0]
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text }
+                if text.starts_with(rupu_skills::render::REATTACH_MARKER) =>
+            {
+                Some(text.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn compact_request(record: &SessionRecord, run_id: &str) -> SessionTurnRequest {
+    SessionTurnRequest {
+        version: SessionTurnRequest::VERSION,
+        request_id: format!("req_{run_id}"),
+        run_id: run_id.into(),
+        prompt: "[compact]".into(),
+        transcript_path: record.transcripts_dir.join(format!("{run_id}.jsonl")),
+        enqueued_at: Utc::now(),
+        compact: true,
+        operator_skills: Vec::new(),
+    }
+}
+
+/// Appends dense turns so the next compaction has something to summarise.
+fn grow_history(global: &Path, session_id: &str) {
+    let (mut session, scope) = read_session(global, session_id).unwrap();
+    session
+        .message_history
+        .extend(dense_history(5).into_iter().skip(1));
+    write_session(global, scope, &session).unwrap();
+}
+
+/// Review Focus 2 (`rupu session compact`): the loaded skills are put back
+/// in the compacted first message, once, however often it compacts.
+#[tokio::test]
+async fn session_compact_reattaches_loaded_skills_once() {
+    let _guard = crate::test_support::ENV_LOCK.lock().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (global, record, _) = compactable_session(&tmp, "ses_skills_compact01").await;
+    for _ in 0..2 {
+        let before = history_len(&global, &record.session_id);
+        with_mock_home(&global, SUMMARY, compact(&record.session_id, None))
+            .await
+            .expect("compact completes");
+        assert!(
+            history_len(&global, &record.session_id) < before,
+            "it compacted"
+        );
+        let blocks = reattach_blocks(&global, &record.session_id);
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        assert!(
+            blocks[0].contains("## Skill: code-review\n"),
+            "{}",
+            blocks[0]
+        );
+        assert!(blocks[0].contains("REVIEW STEPS"), "{}", blocks[0]);
+        assert!(blocks[0].contains("PDF STEPS"), "{}", blocks[0]);
+        grow_history(&global, &record.session_id);
+    }
+    let (after, _) = read_session(&global, &record.session_id).unwrap();
+    assert_eq!(after.loaded_skills, record.loaded_skills);
+}
+
+/// Review Focus 2 (the worker's compact pseudo-turn): the same re-attach,
+/// recorded in the pseudo-turn's transcript.
+#[tokio::test]
+async fn compact_pseudo_turn_reattaches_loaded_skills_once() {
+    let _guard = crate::test_support::ENV_LOCK.lock().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (global, record, _) = compactable_session(&tmp, "ses_skills_compact02").await;
+    for run in ["run_compact_a", "run_compact_b"] {
+        let request = compact_request(&record, run);
+        let before = history_len(&global, &record.session_id);
+        with_mock_home(
+            &global,
+            SUMMARY,
+            run_compact_request(&global, SessionScope::Active, &record.session_id, &request),
+        )
+        .await
+        .expect("the pseudo-turn completes");
+        assert!(
+            history_len(&global, &record.session_id) < before,
+            "it compacted"
+        );
+        let blocks = reattach_blocks(&global, &record.session_id);
+        assert_eq!(blocks.len(), 1, "{blocks:?}");
+        assert!(blocks[0].contains("REVIEW STEPS"), "{}", blocks[0]);
+        let evs: Vec<TranscriptEvent> = JsonlReader::iter(&request.transcript_path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(
+            loads(&evs),
+            pairs(&[("reattach", "pdf"), ("reattach", "code-review")])
+        );
+        grow_history(&global, &record.session_id);
+    }
+    let (after, _) = read_session(&global, &record.session_id).unwrap();
+    assert_eq!(after.loaded_skills, record.loaded_skills);
+}
+
+/// A loaded skill uninstalled before compaction is named as no longer
+/// installed, reported, and kept in the loaded set for a reinstall.
+#[tokio::test]
+async fn compaction_names_a_loaded_skill_that_was_uninstalled() {
+    let _guard = crate::test_support::ENV_LOCK.lock().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (global, record, pdf) = compactable_session(&tmp, "ses_skills_compact03").await;
+    fs::remove_dir_all(&pdf).unwrap();
+
+    with_mock_home(&global, SUMMARY, compact(&record.session_id, None))
+        .await
+        .expect("compact completes");
+    let blocks = reattach_blocks(&global, &record.session_id);
+    assert_eq!(blocks.len(), 1, "{blocks:?}");
+    assert!(
+        blocks[0].contains("No longer installed: pdf"),
+        "{}",
+        blocks[0]
+    );
+    assert!(!blocks[0].contains("PDF STEPS"), "{}", blocks[0]);
+
+    grow_history(&global, &record.session_id);
+    let request = compact_request(&record, "run_compact_gone");
+    with_mock_home(
+        &global,
+        SUMMARY,
+        run_compact_request(&global, SessionScope::Active, &record.session_id, &request),
+    )
+    .await
+    .expect("the pseudo-turn completes");
+    let evs: Vec<TranscriptEvent> = JsonlReader::iter(&request.transcript_path)
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    assert_eq!(
+        notices(&evs, "skill_missing"),
+        vec!["skill pdf is no longer installed and was not re-attached".to_string()]
+    );
+    let (after, _) = read_session(&global, &record.session_id).unwrap();
+    assert_eq!(after.loaded_skills, record.loaded_skills);
+}
