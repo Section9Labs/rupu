@@ -1301,6 +1301,16 @@ describe('StepForm — skills', () => {
     expect(last(spy).skills).toEqual(['pdf']);
   });
 
+  it('labels the two skill inputs', () => {
+    const spy = vi.fn();
+    render(<SkillsHarness initial={nodeWith({ kind: 'step', agent: 'planner', prompt: 'go' })} spy={spy} />);
+    const preload = screen.getByLabelText('Skills always in its prompt');
+    fireEvent.change(preload, { target: { value: 'house-style' } });
+    fireEvent.keyDown(preload, { key: 'Enter' });
+    expect(last(spy).preload_skills).toEqual(['house-style']);
+    expect(screen.getByLabelText('Skills it may load')).toBeInTheDocument();
+  });
+
   it('removing the last chip clears the key', () => {
     const spy = vi.fn();
     render(

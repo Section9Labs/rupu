@@ -6,7 +6,7 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
 import { ArrowLeft } from 'lucide-react';
-import { api, type SkillDetail, type SkillLayer } from '../lib/api';
+import { api, apiErrorMessage, type SkillDetail, type SkillLayer } from '../lib/api';
 import Markdown from '../components/transcript/Markdown';
 import { Badge } from '../components/ui/Badge';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
@@ -30,7 +30,7 @@ export default function SkillDetailPage() {
         if (!cancelled) setSkill(s);
       })
       .catch((e: unknown) => {
-        if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load skill');
+        if (!cancelled) setError(apiErrorMessage(e));
       });
     return () => {
       cancelled = true;
@@ -57,7 +57,6 @@ export default function SkillDetailPage() {
     );
   }
 
-  const files = skill.files.filter((f) => f !== 'SKILL.md');
   const metadata = Object.entries(skill.metadata);
 
   return (
@@ -77,7 +76,10 @@ export default function SkillDetailPage() {
         </div>
         <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-note text-ink-mute">
           <span>
-            source <span className="font-mono text-ink-dim">{skill.source ?? '-'}</span>
+            source{' '}
+            <span className="font-mono text-ink-dim">
+              {skill.source ?? (skill.source_error ? `unreadable (${skill.source_error})` : '-')}
+            </span>
           </span>
           <span className="break-all font-mono">{skill.path}</span>
         </div>
@@ -89,8 +91,8 @@ export default function SkillDetailPage() {
         )}
         {skill.warnings.length > 0 && (
           <div className="mt-3 rounded-lg border border-warn/30 bg-warn-bg px-4 py-3 text-sm text-warn">
-            {skill.warnings.map((w) => (
-              <div key={w}>{w}</div>
+            {skill.warnings.map((w, i) => (
+              <div key={`${i}:${w}`}>{w}</div>
             ))}
           </div>
         )}
@@ -139,11 +141,11 @@ export default function SkillDetailPage() {
           )}
         </Fact>
         <Fact label="Files">
-          {files.length === 0 ? (
+          {skill.files.length === 0 ? (
             '-'
           ) : (
             <ul aria-label="Files" className="space-y-0.5">
-              {files.map((f) => (
+              {skill.files.map((f) => (
                 <li key={f} className="font-mono text-ui text-ink-dim">
                   {f}
                 </li>

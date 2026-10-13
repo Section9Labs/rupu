@@ -460,6 +460,7 @@ export default function SessionDetailPage() {
             <span className="shrink-0 text-ui font-medium text-ink-dim">Invoke skill</span>
             <ChipsInput
               list={invokeSkills}
+              aria-label="Invoke skill"
               suggestions={skillNames}
               placeholder="skill…"
               onChange={(next) => {

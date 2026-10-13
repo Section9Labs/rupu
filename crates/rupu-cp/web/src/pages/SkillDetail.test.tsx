@@ -3,7 +3,7 @@ import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, within } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
-import { api, type SkillDetail } from '../lib/api';
+import { api, ApiError, type SkillDetail } from '../lib/api';
 import SkillDetailPage from './SkillDetail';
 
 afterEach(() => {
@@ -29,10 +29,11 @@ function detail(over: Partial<SkillDetail>): SkillDetail {
     mapped_tools: ['bash', 'read_file'],
     disable_model_invocation: false,
     metadata: { owner: 'docs-team' },
-    files: ['SKILL.md', 'scripts/fill.py'],
+    files: ['scripts/fill.py', 'scripts/README.md'],
     content_hash: '9f8e7d6c',
     body: '# Filling PDFs\n\nRun `scripts/fill.py`.',
     source_record: null,
+    source_error: null,
     ...over,
   };
 }
@@ -66,13 +67,41 @@ describe('Skill detail', () => {
     expect(screen.getByText('9f8e7d6c')).toBeInTheDocument();
   });
 
-  it('lists the skill’s files without SKILL.md', async () => {
+  it('lists the skill’s files as the server reports them', async () => {
     vi.spyOn(api, 'getSkill').mockResolvedValue(detail({}));
 
     mount('/skills/global/pdf');
 
     const files = await screen.findByRole('list', { name: 'Files' });
-    expect(within(files).getAllByRole('listitem').map((li) => li.textContent)).toEqual(['scripts/fill.py']);
+    expect(within(files).getAllByRole('listitem').map((li) => li.textContent)).toEqual([
+      'scripts/fill.py',
+      'scripts/README.md',
+    ]);
+  });
+
+  it('shows an unreadable install record next to the source', async () => {
+    vi.spyOn(api, 'getSkill').mockResolvedValue(
+      detail({ source: null, source_error: 'source.json: expected value at line 1 column 1' }),
+    );
+
+    mount('/skills/global/pdf');
+
+    expect(
+      await screen.findByText('unreadable (source.json: expected value at line 1 column 1)'),
+    ).toBeInTheDocument();
+  });
+
+  it('renders every warning, repeated ones included, without a key collision', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(api, 'getSkill').mockResolvedValue(detail({ warnings: ['unknown key "x"', 'unknown key "x"'] }));
+
+    mount('/skills/global/pdf');
+
+    await screen.findByRole('heading', { level: 1, name: 'pdf' });
+    expect(screen.getAllByText('unknown key "x"')).toHaveLength(2);
+    expect(consoleError.mock.calls.map((c) => String(c[0]))).not.toContainEqual(
+      expect.stringMatching(/same key/),
+    );
   });
 
   it('passes ws_id for a project skill', async () => {
@@ -95,10 +124,11 @@ describe('Skill detail', () => {
   });
 
   it('shows a 404 as an error', async () => {
-    vi.spyOn(api, 'getSkill').mockRejectedValue(new Error('no installed skill "nope"'));
+    const body = '{"error":"no installed skill \\"nope\\""}';
+    vi.spyOn(api, 'getSkill').mockRejectedValue(new ApiError(404, body, body));
 
     mount('/skills/global/nope');
 
-    expect(await screen.findByRole('alert')).toHaveTextContent('no installed skill "nope"');
+    expect(await screen.findByRole('alert')).toHaveTextContent(/^no installed skill "nope"$/);
   });
 });

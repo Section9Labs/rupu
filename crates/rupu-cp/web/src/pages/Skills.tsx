@@ -4,7 +4,7 @@
 
 import { useEffect, useState } from 'react';
 import { BookOpen } from 'lucide-react';
-import { api, type ProjectRow, type SkillRow } from '../lib/api';
+import { api, apiErrorMessage, type ProjectRow, type SkillRow } from '../lib/api';
 import { SectionHeader } from '../components/lists/SectionHeader';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import { Badge } from '../components/ui/Badge';
@@ -53,7 +53,7 @@ export default function Skills() {
       .catch((e: unknown) => {
         if (cancelled) return;
         setSkills([]);
-        setError(e instanceof Error ? e.message : 'Failed to load skills');
+        setError(apiErrorMessage(e));
       });
     return () => {
       cancelled = true;

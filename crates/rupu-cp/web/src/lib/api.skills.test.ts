@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { api } from './api';
+import { api, skillNamesOf, type SkillRow } from './api';
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -113,5 +113,34 @@ describe('skills on launches and sends', () => {
     await api.sendSessionMessage('s1', 'hello');
 
     expect(sentBody(fetchMock)).toEqual({ prompt: 'hello' });
+  });
+});
+
+describe('skillNamesOf', () => {
+  const ok = (over: Partial<SkillRow>): SkillRow => ({ ...(PDF_ROW as SkillRow), ...over });
+
+  it('suggests valid skills by bare name, without duplicates', () => {
+    expect(
+      skillNamesOf([ok({ name: 'pdf' }), ok({ name: 'house-style' }), ok({ name: 'broken', status: 'invalid' })]),
+    ).toEqual(['house-style', 'pdf']);
+  });
+
+  it('qualifies a name installed in both layers, since a bare name is ambiguous', () => {
+    expect(
+      skillNamesOf([
+        ok({ name: 'pdf', layer: 'global', both_layers: true }),
+        ok({ name: 'pdf', layer: 'project', both_layers: true }),
+        ok({ name: 'notes', layer: 'project' }),
+      ]),
+    ).toEqual(['global:pdf', 'notes', 'project:pdf']);
+  });
+
+  it('qualifies only the valid copy when the other layer’s copy is invalid', () => {
+    expect(
+      skillNamesOf([
+        ok({ name: 'pdf', layer: 'global', both_layers: true }),
+        ok({ name: 'pdf', layer: 'project', both_layers: true, status: 'invalid' }),
+      ]),
+    ).toEqual(['global:pdf']);
   });
 });

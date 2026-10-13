@@ -65,9 +65,16 @@ export default function AgentLauncherSheet({
     [agent, target, host],
   );
 
-  // Skill suggestions: the global layer, plus the chosen project's.
+  // Skill suggestions: the global layer, plus the chosen project's. This CP's
+  // listing says nothing about a remote host's skills, so a remote launch gets
+  // no suggestions (a typed name still goes through).
   const skillsWsId = target.wsId;
+  const remoteHost = host !== 'local';
   useEffect(() => {
+    if (remoteHost) {
+      setSkillNames([]);
+      return;
+    }
     let cancelled = false;
     api
       .getSkills(skillsWsId)
@@ -80,7 +87,7 @@ export default function AgentLauncherSheet({
     return () => {
       cancelled = true;
     };
-  }, [skillsWsId]);
+  }, [skillsWsId, remoteHost]);
   const skillSuggestions = [...skillNames, '*', 'project:*'];
 
   // Esc-to-close; focus the dialog on open for keyboard users.
@@ -266,12 +273,19 @@ export default function AgentLauncherSheet({
             <div className="mt-2 space-y-3">
               <div data-testid="launch-skills-load" className="space-y-1">
                 <span className="block text-ui text-ink-dim">May load</span>
-                <ChipsInput list={skills} suggestions={skillSuggestions} placeholder="skill…" onChange={setSkills} />
+                <ChipsInput
+                  list={skills}
+                  aria-label="Skills it may load"
+                  suggestions={skillSuggestions}
+                  placeholder="skill…"
+                  onChange={setSkills}
+                />
               </div>
               <div data-testid="launch-skills-preload" className="space-y-1">
                 <span className="block text-ui text-ink-dim">Always in the prompt (preload)</span>
                 <ChipsInput
                   list={preloadSkills}
+                  aria-label="Skills always in its prompt"
                   suggestions={skillSuggestions}
                   placeholder="skill…"
                   onChange={setPreloadSkills}

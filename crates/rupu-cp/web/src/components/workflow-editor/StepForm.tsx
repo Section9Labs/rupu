@@ -380,6 +380,7 @@ function SkillsField({
         <span className="block text-note text-ink-dim">May load</span>
         <ChipsInput
           list={d.skills ?? []}
+          aria-label="Skills it may load"
           suggestions={suggestions}
           placeholder="skill…"
           onChange={(next) => patch({ skills: orUnset(next) })}
@@ -389,6 +390,7 @@ function SkillsField({
         <span className="block text-note text-ink-dim">Always in the prompt (preload)</span>
         <ChipsInput
           list={d.preload_skills ?? []}
+          aria-label="Skills always in its prompt"
           suggestions={suggestions}
           placeholder="skill…"
           onChange={(next) => patch({ preload_skills: orUnset(next) })}

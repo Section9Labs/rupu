@@ -378,6 +378,45 @@ describe('AgentLauncherSheet skills', () => {
     await waitFor(() => expect(getSkills).toHaveBeenLastCalledWith('ws-1'));
   });
 
+  it('labels the two skill inputs', async () => {
+    stubTargetPickerDeps();
+
+    render(<AgentLauncherSheet agent="triage" onClose={() => {}} />);
+
+    expect(screen.getByLabelText('Skills it may load')).toBeInTheDocument();
+    expect(screen.getByLabelText('Skills always in its prompt')).toBeInTheDocument();
+  });
+
+  it('suggests no local skills for a remote host, and still sends a typed one', async () => {
+    stubTargetPickerDeps();
+    vi.spyOn(api, 'getHosts').mockResolvedValue([
+      { id: 'local', name: 'Local', transport_kind: 'local', status: 'online', active_run_count: 0 },
+      { id: 'host_x', name: 'host_x', transport_kind: 'http_cp', status: 'online', active_run_count: 0 },
+    ]);
+    const getSkills = vi.spyOn(api, 'getSkills').mockResolvedValue([row('pdf')]);
+    const launchSpy = vi.spyOn(api, 'launchAgent').mockResolvedValue({ run_id: 'run-r' });
+
+    render(<AgentLauncherSheet agent="triage" onClose={() => {}} />);
+    const load = screen.getByTestId('launch-skills-load');
+    await waitFor(() => expect(load.textContent).toContain('+ pdf'));
+
+    await waitFor(() => expect(screen.getByRole('option', { name: 'host_x' })).toBeInTheDocument());
+    getSkills.mockClear();
+    fireEvent.change(screen.getByLabelText('Host'), { target: { value: 'host_x' } });
+
+    await waitFor(() => expect(load.textContent).not.toContain('+ pdf'));
+    expect(getSkills).not.toHaveBeenCalled();
+
+    const input = screen.getByLabelText('Skills it may load');
+    fireEvent.change(input, { target: { value: 'pdf' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    fireEvent.click(screen.getByRole('button', { name: 'Run' }));
+
+    await waitFor(() =>
+      expect(launchSpy).toHaveBeenCalledWith('triage', expect.objectContaining({ host: 'host_x', skills: ['pdf'] })),
+    );
+  });
+
   it('shows the server message, not its JSON, when a launch is refused', async () => {
     stubTargetPickerDeps();
     const body = '{"error":"skills: entry \\"Bad_Name\\": skill name may only contain lowercase letters"}';

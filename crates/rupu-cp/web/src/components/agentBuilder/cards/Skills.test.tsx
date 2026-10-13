@@ -38,6 +38,16 @@ describe('Skills card', () => {
     expect(patch).toHaveBeenCalledWith({ preloadSkills: ['house-style'] });
   });
 
+  it('labels each input for assistive tech', () => {
+    const patch = vi.fn();
+    render(<Skills draft={draft()} patch={patch} skillNames={[]} />);
+    const load = screen.getByLabelText('Skills it may load');
+    fireEvent.change(load, { target: { value: 'pdf' } });
+    fireEvent.keyDown(load, { key: 'Enter' });
+    expect(patch).toHaveBeenCalledWith({ skills: ['pdf'] });
+    expect(screen.getByLabelText('Skills always in its prompt')).toBeInTheDocument();
+  });
+
   it('removing a chip patches the list without it', () => {
     const patch = vi.fn();
     render(<Skills draft={draft({ preloadSkills: ['house-style', 'pdf'] })} patch={patch} />);

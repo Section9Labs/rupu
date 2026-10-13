@@ -269,6 +269,14 @@ describe('SessionDetail composer — invoke a skill', () => {
     expect(screen.getByText(/Sent — turn queued/)).toBeInTheDocument();
   });
 
+  it('labels the invoke-skill input', async () => {
+    stubApi(ACTIVE_SESSION);
+
+    renderPage();
+
+    expect(await screen.findByLabelText('Invoke skill')).toHaveAttribute('placeholder', 'skill…');
+  });
+
   it('sends the prompt and the skill together, and clears both', async () => {
     stubApi(ACTIVE_SESSION);
     vi.spyOn(api, 'getSkills').mockResolvedValue([row('pdf')]);

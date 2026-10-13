@@ -1447,11 +1447,18 @@ export interface SkillDetail extends SkillRow {
   /** The `SKILL.md` body; `null` when the skill did not load. */
   body: string | null;
   source_record: unknown | null;
+  /** Why the install record could not be read; `source` is then `null`. */
+  source_error: string | null;
 }
 
-/** The names a skill picker offers: valid skills, deduplicated across layers. */
+/** The names a skill picker offers: valid skills, deduplicated across layers.
+ *  A name installed in both layers is offered layer-qualified (`global:pdf`,
+ *  `project:pdf`): the server refuses the bare name as ambiguous. */
 export function skillNamesOf(rows: SkillRow[]): string[] {
-  return [...new Set(rows.filter((s) => s.status === 'ok').map((s) => s.name))].sort();
+  const names = rows
+    .filter((s) => s.status === 'ok')
+    .map((s) => (s.both_layers ? `${s.layer}:${s.name}` : s.name));
+  return [...new Set(names)].sort();
 }
 
 /** Launch/session-start skill entries, as body keys only when non-empty. */

@@ -3,7 +3,7 @@ import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, waitFor, fireEvent, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { api, type ProjectRow, type SkillRow } from '../lib/api';
+import { api, ApiError, type ProjectRow, type SkillRow } from '../lib/api';
 import Skills from './Skills';
 
 afterEach(() => {
@@ -93,10 +93,11 @@ describe('Skills list', () => {
 
   it('shows a load failure in an error banner', async () => {
     vi.spyOn(api, 'getProjects').mockResolvedValue([]);
-    vi.spyOn(api, 'getSkills').mockRejectedValue(new Error('boom'));
+    const body = '{"error":"workspace w9 not found"}';
+    vi.spyOn(api, 'getSkills').mockRejectedValue(new ApiError(404, body, body));
 
     mount();
 
-    expect(await screen.findByRole('alert')).toHaveTextContent('boom');
+    expect(await screen.findByRole('alert')).toHaveTextContent(/^workspace w9 not found$/);
   });
 });

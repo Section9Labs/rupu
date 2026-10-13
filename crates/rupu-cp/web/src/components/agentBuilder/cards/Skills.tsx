@@ -23,6 +23,7 @@ export default function Skills({ draft, patch, skillNames }: SkillsCardProps) {
         <div data-testid="ab-skills">
           <ChipsInput
             list={draft.skills ?? []}
+            aria-label="Skills it may load"
             suggestions={suggestions}
             placeholder="skill…"
             onChange={(next) => patch({ skills: next })}
@@ -33,6 +34,7 @@ export default function Skills({ draft, patch, skillNames }: SkillsCardProps) {
         <div data-testid="ab-preload-skills">
           <ChipsInput
             list={draft.preloadSkills ?? []}
+            aria-label="Skills always in its prompt"
             suggestions={suggestions}
             placeholder="skill…"
             onChange={(next) => patch({ preloadSkills: next })}
