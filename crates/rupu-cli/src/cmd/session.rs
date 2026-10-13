@@ -1894,12 +1894,7 @@ async fn resolve_send_skills(
     session: &SessionRecord,
     entries: &[String],
 ) -> anyhow::Result<Vec<rupu_skills::FrozenSkill>> {
-    let assembler =
-        rupu_runtime::assembly::RunAssembler::new(rupu_runtime::assembly::AssemblyContext {
-            project_root: session.project_root.clone(),
-            ..rupu_runtime::assembly::AssemblyContext::minimal(global.to_path_buf())
-        });
-    Ok(assembler
+    Ok(skill_layers(global, session.project_root.as_deref())
         .resolve_operator_skills(&session.skill_index, entries)
         .await?)
 }
@@ -7956,15 +7951,16 @@ async fn freeze_session_skills(
 }
 
 /// An assembler for reading a session's skill layers only: global and the
-/// project's `.rupu`.
+/// project's `.rupu`. It never assembles a run, so it carries none of the
+/// services (capture, catalog) `tests/it/netflow_capture_wiring.rs`
+/// requires of an assembler that does.
 fn skill_layers(
     global: &Path,
     project_root: Option<&Path>,
 ) -> rupu_runtime::assembly::RunAssembler {
-    rupu_runtime::assembly::RunAssembler::new(rupu_runtime::assembly::AssemblyContext {
-        project_root: project_root.map(Path::to_path_buf),
-        ..rupu_runtime::assembly::AssemblyContext::minimal(global.to_path_buf())
-    })
+    let mut ctx = rupu_runtime::assembly::AssemblyContext::minimal(global.to_path_buf());
+    ctx.project_root = project_root.map(Path::to_path_buf);
+    rupu_runtime::assembly::RunAssembler::new(ctx)
 }
 
 /// Puts the session's loaded skills back into `messages`, a history its
