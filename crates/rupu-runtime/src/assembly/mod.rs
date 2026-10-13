@@ -1127,13 +1127,6 @@ pub async fn resolve_agent_skills(
     let agent_grants = agent.skills.clone().unwrap_or_default();
     let agent_preload = agent.preload_skills.clone().unwrap_or_default();
     let o = overrides;
-    if agent_grants.is_empty()
-        && agent_preload.is_empty()
-        && o.skills.is_empty()
-        && o.preload_skills.is_empty()
-    {
-        return Ok(None);
-    }
     resolve_skill_requests(
         dirs,
         &agent.name,
@@ -1147,12 +1140,19 @@ pub async fn resolve_agent_skills(
 
 /// Resolve `requests` (reason, grants, preload) in one pass against `dirs`
 /// on the blocking pool, retrying an fd exhaustion under `label`. `None`
-/// when nothing resolved.
+/// when nothing is requested (the layers are not even read) or nothing
+/// resolved.
 pub async fn resolve_skill_requests(
     dirs: &rupu_skills::LayerDirs,
     label: &str,
     requests: Vec<(rupu_skills::SkillReason, Vec<String>, Vec<String>)>,
 ) -> Result<Option<Arc<rupu_skills::ResolvedSkills>>, AssembleError> {
+    if requests
+        .iter()
+        .all(|(_, g, p)| g.is_empty() && p.is_empty())
+    {
+        return Ok(None);
+    }
     let requests = Arc::new(requests);
     let resolved = rupu_agent::fd_budget::retry_on_fd_exhaustion(
         label,

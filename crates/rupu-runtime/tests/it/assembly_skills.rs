@@ -1218,3 +1218,18 @@ async fn a_shipped_overlay_skill_resolves_and_is_recorded_shipped() {
     assert_eq!(index.len(), 1);
     assert!(index[0].shipped);
 }
+
+#[tokio::test]
+async fn no_requested_skills_reads_no_layer() {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("skills"), "a file, not a directory").unwrap();
+    let dirs = rupu_skills::LayerDirs::for_layers(d.path(), None);
+    let requests = vec![
+        (rupu_skills::SkillReason::Agent, vec![], vec![]),
+        (rupu_skills::SkillReason::Launch, vec![], vec![]),
+    ];
+    let got = rupu_runtime::assembly::resolve_skill_requests(&dirs, "a", requests)
+        .await
+        .unwrap();
+    assert!(got.is_none());
+}

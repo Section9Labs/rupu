@@ -4,7 +4,7 @@
 use crate::event::SkillIndexEntry;
 
 /// One line for a `skill_index`: how many skills the run bound, each marked
-/// preloaded or not indexed when it is either.
+/// preloaded, not indexed or shipped when it is any of them.
 pub fn skill_index_line(entries: &[SkillIndexEntry]) -> String {
     let names: Vec<String> = entries
         .iter()
