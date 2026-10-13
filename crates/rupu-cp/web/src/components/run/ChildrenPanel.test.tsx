@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, render, screen, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import type { RunChild } from '../../lib/api';
-import ChildrenPanel from './ChildrenPanel';
+import ChildrenPanel, { ownSegment } from './ChildrenPanel';
 
 afterEach(() => {
   cleanup();
@@ -109,6 +109,12 @@ describe('ChildrenPanel', () => {
       await vi.advanceTimersByTimeAsync(10_000);
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('labels a child by its own codename segment', () => {
+    expect(ownSegment('plum-grotto/marlin>cicada#2')).toBe('cicada#2');
+    expect(ownSegment('plum-grotto/marlin>cicada#1>lynx#3')).toBe('lynx#3');
+    expect(ownSegment('jade-reef/heron#1')).toBe('heron#1');
   });
 
   it('says so when the run launched none', async () => {
