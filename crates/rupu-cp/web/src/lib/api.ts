@@ -62,6 +62,23 @@ export function apiErrorMessage(e: unknown): string {
   return String(e);
 }
 
+export type Failure = { kind: 'offline' | 'unavailable' | 'gone'; reason: string };
+
+/**
+ * The single-host paths answer 501 when a host cannot serve the request
+ * (e.g. an old remote rupu, a transport with no such surface), 404 when the
+ * host is no longer registered, and 502 when it gave no usable answer (spec
+ * §7.1). Anything else, including a network error, is treated as offline.
+ */
+export function classifyFailure(e: unknown): Failure {
+  const reason = apiErrorMessage(e);
+  if (e instanceof ApiError) {
+    if (e.status === 501) return { kind: 'unavailable', reason };
+    if (e.status === 404) return { kind: 'gone', reason };
+  }
+  return { kind: 'offline', reason };
+}
+
 // ---------------------------------------------------------------------------
 // Core fetch wrapper
 // ---------------------------------------------------------------------------
@@ -828,6 +845,122 @@ export interface AgentiflowBoardPost {
 export interface AgentiflowMessages {
   posts: AgentiflowBoardPost[];
   directives: AgentiflowBoardPost[];
+}
+
+/** The endpoint family a message space is reached through: a `run_…` id
+ *  under `runs`, `ses_…` under `sessions`, `af_…` under `agentiflows`. */
+export type MessageRoute = 'runs' | 'sessions' | 'agentiflows';
+
+export type MessageKind = 'post' | 'direct' | 'broadcast' | 'directive' | 'retract' | 'operator';
+
+/** Where a message went, decided when it was sent. */
+export interface MessageDelivery {
+  resolved: string[];
+  undelivered?: { to: string; reason: string }[];
+}
+
+/** A receipt: `by` saw the message on its turn `turn`. */
+export interface MessageSeen {
+  by: string;
+  turn: number;
+  at: string;
+}
+
+/** One message of a space's log, with its receipts. */
+export interface SpaceMessage {
+  id: string;
+  ts: string;
+  kind: MessageKind;
+  from: string;
+  from_codename?: string;
+  /** `null` only for an unaddressed board post (and a retraction). */
+  to: string | null;
+  post_kind?: string;
+  body: string;
+  urgent?: boolean;
+  refs?: { retracts?: string; reply_to?: string };
+  delivery: MessageDelivery;
+  /** Where an operator message was sent from. */
+  via?: 'cli' | 'cp';
+  viewer?: string;
+  seen: MessageSeen[];
+}
+
+export interface SpaceParticipant {
+  address: string;
+  codename?: string;
+  agent: string;
+  run_id: string;
+  step_id?: string;
+  unit?: string;
+  kind: string;
+  live: boolean;
+}
+
+/** `GET /api/{runs,sessions,agentiflows}/:id/messages`. */
+export interface MessagesView {
+  participants: SpaceParticipant[];
+  messages: SpaceMessage[];
+  /** An agentiflow from before the log: its board, in the log's shape. */
+  legacy: boolean;
+  space: 'present' | 'absent';
+  /** The `after` of the next page; absent at the end. */
+  next?: string | null;
+}
+
+/** `POST …/messages`' 202 body. */
+export interface OperatorSendReply {
+  id: string;
+  delivery: MessageDelivery;
+}
+
+/** One frame of `GET …/messages/stream`: a message (no receipts yet), or a
+ *  receipt for one sent earlier. */
+export type MessageStreamFrame =
+  | ({ t: 'msg' } & SpaceMessage)
+  | ({ t: 'seen'; id: string } & MessageSeen);
+
+/** A host that can't serve messages (a tunnel or bucket host, an older
+ *  rupu, a read-only CP): the server's 501, with its reason. */
+export interface MessagesUnavailable {
+  kind: 'unavailable';
+  reason: string;
+}
+
+export type MessagesResult = { kind: 'ok'; view: MessagesView } | MessagesUnavailable;
+export type MessageSendResult = { kind: 'sent'; reply: OperatorSendReply } | MessagesUnavailable;
+
+/** `p`'s value, or the 501 it failed with as `MessagesUnavailable`; any
+ *  other failure is rethrown. */
+async function orUnavailable<T>(p: Promise<T>): Promise<T | MessagesUnavailable> {
+  try {
+    return await p;
+  } catch (e) {
+    const failure = classifyFailure(e);
+    if (failure.kind === 'unavailable') return { kind: 'unavailable', reason: failure.reason };
+    throw e;
+  }
+}
+
+function messagesPath(route: MessageRoute, id: string): string {
+  return `/api/${route}/${encodeURIComponent(id)}/messages`;
+}
+
+/** The board MessageFeed renders, read from a space's view: its posts, and
+ *  its directives with each retraction as `{retract: <id>}`. */
+export function boardOf(view: MessagesView): AgentiflowMessages {
+  const posts: AgentiflowBoardPost[] = [];
+  const directives: AgentiflowBoardPost[] = [];
+  for (const m of view.messages) {
+    if (m.kind === 'post') {
+      posts.push({ id: m.id, kind: m.post_kind, author: m.from, addressed_to: m.to, ts: m.ts, body: m.body });
+    } else if (m.kind === 'directive') {
+      directives.push({ id: m.id, author: m.from, ts: m.ts, body: m.body });
+    } else if (m.kind === 'retract' && m.refs?.retracts) {
+      directives.push({ retract: m.refs.retracts });
+    }
+  }
+  return { posts, directives };
 }
 
 /** One asset from `GET /api/assets` — a node in an engagement's asset graph
@@ -3013,9 +3146,56 @@ export const api = {
     return request<AgentiflowDetail>(`/api/agentiflows/${encodeURIComponent(id)}`, { signal: opts?.signal });
   },
 
-  /** The engagement's board — the messages the fleet posts to each other. */
-  getAgentiflowMessages(id: string, opts?: Cancellable): Promise<AgentiflowMessages> {
-    return request<AgentiflowMessages>(`/api/agentiflows/${encodeURIComponent(id)}/messages`, { signal: opts?.signal });
+  /** The engagement's board — the messages the fleet posts to each other —
+   *  read from its message space (`boardOf`). */
+  async getAgentiflowMessages(id: string, opts?: Cancellable): Promise<AgentiflowMessages> {
+    return boardOf(await request<MessagesView>(messagesPath('agentiflows', id), { signal: opts?.signal }));
+  },
+
+  /** A run's, session's or agentiflow's message space, here or on `host`.
+   *  A host that can't serve it (501) is `unavailable`, with the reason. */
+  getMessages(
+    route: MessageRoute,
+    id: string,
+    opts?: { host?: string; after?: string; limit?: number; kinds?: MessageKind[] } & Cancellable,
+  ): Promise<MessagesResult> {
+    const q = new URLSearchParams();
+    if (opts?.host) q.set('host', opts.host);
+    if (opts?.after) q.set('after', opts.after);
+    if (opts?.limit != null) q.set('limit', String(opts.limit));
+    if (opts?.kinds?.length) q.set('kind', opts.kinds.join(','));
+    const qs = q.toString();
+    return orUnavailable(
+      request<MessagesView>(`${messagesPath(route, id)}${qs ? `?${qs}` : ''}`, { signal: opts?.signal }).then(
+        (view) => ({ kind: 'ok' as const, view }),
+      ),
+    );
+  },
+
+  /** Send into a message space as its operator (202). `to` defaults to an
+   *  agentiflow's lead, everyone elsewhere. Throws `ApiError` 409 when the
+   *  run isn't running, 400 for a bad address or an empty body; a 501 (no
+   *  `rupu cp serve`, or a host that can't take messages) is `unavailable`. */
+  sendMessage(
+    route: MessageRoute,
+    id: string,
+    body: { to?: string; body: string; urgent?: boolean },
+    opts?: { host?: string },
+  ): Promise<MessageSendResult> {
+    const qs = opts?.host ? `?host=${encodeURIComponent(opts.host)}` : '';
+    return orUnavailable(
+      request<OperatorSendReply>(`${messagesPath(route, id)}${qs}`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }).then((reply) => ({ kind: 'sent' as const, reply })),
+    );
+  },
+
+  /** The SSE URL of a space's live log on this host (remote hosts are
+   *  polled with `getMessages`). Each frame's data is a
+   *  `MessageStreamFrame`. */
+  messagesStreamUrl(route: MessageRoute, id: string): string {
+    return `${messagesPath(route, id)}/stream`;
   },
 
   /** The engagement's granular event feed: the coordinator lifecycle merged with
@@ -3025,8 +3205,9 @@ export const api = {
     return request<{ events: AgentiflowEvent[] }>(`/api/agentiflows/${encodeURIComponent(id)}/events`, { signal: opts?.signal });
   },
 
-  /** Queue a steering message for the lead (the `rupu agentiflow send` channel).
-   *  `now` asks for mid-round delivery; `stop` winds the run down after it. */
+  /** Message the lead (the `rupu agentiflow send` channel: the server sends
+   *  it as a message to `lead`), or with `stop` wind the run down. `now` asks
+   *  for mid-round delivery. */
   async steerAgentiflow(id: string, body: { message: string; now?: boolean; stop?: boolean }): Promise<void> {
     await request(`/api/agentiflows/${encodeURIComponent(id)}/steer`, {
       method: 'POST',
