@@ -70,6 +70,7 @@ const NAV_PAGES: PaletteItem[] = [
   { kind: 'page', id: 'workflows', title: 'Workflows',     to: '/workflows' },
   { kind: 'page', id: 'agents',    title: 'Agents',        to: '/agents' },
   { kind: 'page', id: 'autoflows', title: 'Autoflows',     to: '/autoflows' },
+  { kind: 'page', id: 'skills',    title: 'Skills',        to: '/skills' },
   { kind: 'page', id: 'sessions',  title: 'Sessions',      to: '/sessions' },
   { kind: 'page', id: 'projects',  title: 'Projects',      to: '/projects' },
   { kind: 'page', id: 'findings',  title: 'Findings',      to: '/findings' },

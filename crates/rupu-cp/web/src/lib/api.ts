@@ -1395,12 +1395,71 @@ export interface AgentSummary {
    *  one `rupu agent validate` runs; the message carries a did-you-mean).
    *  Absent for a loadable agent. */
   load_error?: string | null;
+  /** The agent's frontmatter `skills:` entries (names, `*`, `project:*`).
+   *  Omitted on the wire when empty. */
+  skills?: string[];
+  /** The agent's frontmatter `preloadSkills:` entries. Omitted when empty. */
+  preload_skills?: string[];
 }
 
 export interface AgentDetail extends AgentSummary {
   system_prompt: string;
   /** Full raw agent definition file (`.md` frontmatter + body). */
   raw: string;
+}
+
+// ---------------------------------------------------------------------------
+// Skills (`GET /api/skills`, `GET /api/skills/:layer/:name`)
+// ---------------------------------------------------------------------------
+
+export type SkillLayer = 'global' | 'project';
+
+/** One installed skill, as `rupu skill list` reports it. */
+export interface SkillRow {
+  name: string;
+  layer: SkillLayer;
+  /** `invalid` when the entry did not load; `error` says why. */
+  status: 'ok' | 'invalid';
+  description: string | null;
+  error: string | null;
+  warnings: string[];
+  stamp: string | null;
+  /** The install source record's `source`; `null` for a hand-placed skill. */
+  source: string | null;
+  /** The other layer installs a skill of the same name. */
+  both_layers: boolean;
+}
+
+/** One skill in full. */
+export interface SkillDetail extends SkillRow {
+  path: string;
+  license: string | null;
+  compatibility: string | null;
+  /** The skill's `allowed-tools` as written. Informational, never a grant. */
+  allowed_tools: string[];
+  /** The rupu tools `allowed_tools` maps to. */
+  mapped_tools: string[];
+  disable_model_invocation: boolean;
+  metadata: Record<string, string>;
+  /** Files in the skill directory, `SKILL.md` excluded. */
+  files: string[];
+  content_hash: string | null;
+  /** The `SKILL.md` body; `null` when the skill did not load. */
+  body: string | null;
+  source_record: unknown | null;
+}
+
+/** Launch/session-start skill entries, as body keys only when non-empty. */
+export interface SkillEntries {
+  skills?: string[];
+  preload_skills?: string[];
+}
+
+function skillKeys(opts: SkillEntries): SkillEntries {
+  return {
+    skills: opts.skills?.length ? opts.skills : undefined,
+    preload_skills: opts.preload_skills?.length ? opts.preload_skills : undefined,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -3005,6 +3064,19 @@ export const api = {
     return request<AutoflowDefRow[]>('/api/autoflows');
   },
 
+  // --- Skills ---
+  /** Installed skills: the global layer, plus `wsId`'s project layer. */
+  async getSkills(wsId?: string): Promise<SkillRow[]> {
+    const res = await request<{ skills: SkillRow[] }>(`/api/skills${wsQuery(wsId, '?')}`);
+    return res.skills;
+  },
+  /** One installed skill. A project-layer skill needs its project's `wsId`. */
+  getSkill(layer: SkillLayer, name: string, wsId?: string): Promise<SkillDetail> {
+    return request<SkillDetail>(
+      `/api/skills/${encodeURIComponent(layer)}/${encodeURIComponent(name)}${wsQuery(wsId, '?')}`,
+    );
+  },
+
   // --- Tools (MCP catalog) ---
   async getTools(): Promise<ToolSpec[]> {
     const res = await request<{ tools: ToolSpec[] }>('/api/tools');
@@ -3045,20 +3117,20 @@ export const api = {
   },
   launchAgent(
     agent: string,
-    opts: { prompt?: string; mode?: LaunchMode; target?: string; working_dir?: string; host?: string } = {},
+    opts: { prompt?: string; mode?: LaunchMode; target?: string; working_dir?: string; host?: string } & SkillEntries = {},
   ): Promise<LaunchResult> {
     return request<LaunchResult>(`/api/agents/${encodeURIComponent(agent)}/run`, {
       method: 'POST',
-      body: JSON.stringify({ prompt: opts.prompt, mode: opts.mode, target: opts.target, working_dir: opts.working_dir, host: opts.host }),
+      body: JSON.stringify({ prompt: opts.prompt, mode: opts.mode, target: opts.target, working_dir: opts.working_dir, host: opts.host, ...skillKeys(opts) }),
     });
   },
   startSession(
     agent: string,
-    opts: { prompt?: string; mode?: LaunchMode; target?: string; working_dir?: string; host?: string } = {},
+    opts: { prompt?: string; mode?: LaunchMode; target?: string; working_dir?: string; host?: string } & SkillEntries = {},
   ): Promise<{ session_id: string }> {
     return request<{ session_id: string }>(`/api/agents/${encodeURIComponent(agent)}/session`, {
       method: 'POST',
-      body: JSON.stringify({ prompt: opts.prompt, mode: opts.mode, target: opts.target, working_dir: opts.working_dir, host: opts.host }),
+      body: JSON.stringify({ prompt: opts.prompt, mode: opts.mode, target: opts.target, working_dir: opts.working_dir, host: opts.host, ...skillKeys(opts) }),
     });
   },
   /**
@@ -3251,14 +3323,16 @@ export const api = {
    * Send a message into a live session. Fire-and-forget — the session's worker
    * processes the turn asynchronously and a fresh run appears in the session's
    * turn-runs list shortly after. Resolves to the new run id.
-   * Errors: 400 (empty prompt) · 404 (no such session) · 409 (session stopped)
-   * · 501 (read-only deploy).
+   * `skills` invokes skills for this turn; the prompt may then be empty.
+   * Errors: 400 (neither prompt nor skill, or a malformed skill entry) · 404
+   * (no such session) · 409 (session stopped) · 501 (read-only deploy, or a
+   * remote host that predates `session.skills`).
    */
-  sendSessionMessage(id: string, prompt: string, host?: string): Promise<{ run_id: string }> {
+  sendSessionMessage(id: string, prompt: string, host?: string, skills?: string[]): Promise<{ run_id: string }> {
     const qs = host ? `?host=${encodeURIComponent(host)}` : '';
     return request<{ run_id: string }>(`/api/sessions/${encodeURIComponent(id)}/send${qs}`, {
       method: 'POST',
-      body: JSON.stringify({ prompt }),
+      body: JSON.stringify({ prompt, skills: skillKeys({ skills }).skills }),
     });
   },
   /** Archive an active session (hides it from the active list). */

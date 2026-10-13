@@ -2,6 +2,7 @@ import type { LucideIcon } from 'lucide-react';
 import {
   Activity,
   BookMarked,
+  BookOpen,
   Boxes,
   Building2,
   DollarSign,
@@ -77,6 +78,7 @@ export const sidebarNav: NavSection[] = [
       { to: '/agents',    label: 'Agents',    icon: Sparkles, enabled: true },
       { to: '/workflows', label: 'Workflows', icon: Workflow, enabled: true },
       { to: '/autoflows', label: 'Autoflows', icon: Repeat,   enabled: true },
+      { to: '/skills',    label: 'Skills',    icon: BookOpen, enabled: true },
     ],
   }},
   { kind: 'group', group: {
