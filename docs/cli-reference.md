@@ -54,6 +54,10 @@ These apply to every command.
   - [`rupu agentiflow stop`](#rupu-agentiflow-stop)
   - [`rupu agentiflow attach`](#rupu-agentiflow-attach)
   - [`rupu agentiflow serve`](#rupu-agentiflow-serve)
+- [`rupu message`](#rupu-message)
+  - [`rupu message list`](#rupu-message-list)
+  - [`rupu message send`](#rupu-message-send)
+  - [`rupu message participants`](#rupu-message-participants)
 - [`rupu autoflow`](#rupu-autoflow)
   - [`rupu autoflow list`](#rupu-autoflow-list)
   - [`rupu autoflow show`](#rupu-autoflow-show)
@@ -789,6 +793,77 @@ Supervise agentiflow runs: reap the ones whose coordinator died. A coordinator t
 ```
 rupu agentiflow serve [OPTIONS]
 ```
+
+<a id="rupu-message"></a>
+### `rupu message`
+
+Talk to a run as its operator: its message space's messages, participants, and sending into it
+
+```
+rupu message [OPTIONS] <COMMAND>
+```
+
+| Subcommand | Description |
+|---|---|
+| [`list`](#rupu-message-list) | Show what was said in a run's message space |
+| [`send`](#rupu-message-send) | Send a message into a running run's message space, as its operator |
+| [`participants`](#rupu-message-participants) | List the participants in a run's message space |
+
+<a id="rupu-message-list"></a>
+### `rupu message list`
+
+Show what was said in a run's message space. One line per message (`time from → to [kind] body`), then, indented, whom it could not reach and who saw it on which turn. `--follow` keeps printing new messages and receipts until the run stops, then says why; Ctrl-C leaves the run going. `--json` prints the whole view as one object or, with `--follow`, one message per line (printed again when its receipts change).
+
+```
+rupu message list [OPTIONS] <RUN_ID>
+```
+
+| Argument | Description |
+|---|---|
+| `<RUN_ID>` | Run id: a workflow run, an agentiflow (`af_...`), a session (`ses_...`) or a standalone run; the full id, the compact form a list prints, or a unique prefix / suffix of it |
+
+| Option | Description |
+|---|---|
+| `--after <MSG_ID>` | Only the messages after this one (`msg_...`) |
+| `--follow` | Keep printing new messages and receipts until the run stops |
+| `--kind <KINDS>` | Only these kinds, comma-separated: post, direct, broadcast, directive, retract, operator |
+| `--json` | Print JSON: the whole view, or with `--follow` one message per line |
+
+<a id="rupu-message-send"></a>
+### `rupu message send`
+
+Send a message into a running run's message space, as its operator. It goes to `--to` (a participant, a codename, `role:<agent>`, `step:<id>`, `lead` or `broadcast`); by default to an agentiflow's lead, and to everyone in any other run. Each recipient gets it before its next model call. `--urgent` puts it first, and ends an agentiflow lead's round early. A run that isn't running takes no message.
+
+```
+rupu message send [OPTIONS] <RUN_ID> <TEXT>...
+```
+
+| Argument | Description |
+|---|---|
+| `<RUN_ID>` | Run id: a workflow run, an agentiflow (`af_...`), a session (`ses_...`) or a standalone run; the full id, the compact form a list prints, or a unique prefix / suffix of it |
+| `<TEXT>...` | The message (its words are joined with spaces) |
+
+| Option | Description |
+|---|---|
+| `--to <ADDRESS>` | Who the message is for: a participant, a codename, `role:<agent>`, `step:<id>`, `lead` or `broadcast` |
+| `--urgent` | Put the message first; an agentiflow lead ends its round early |
+
+<a id="rupu-message-participants"></a>
+### `rupu message participants`
+
+List the participants in a run's message space
+
+```
+rupu message participants [OPTIONS] <RUN_ID>
+```
+
+| Argument | Description |
+|---|---|
+| `<RUN_ID>` | Run id: a workflow run, an agentiflow (`af_...`), a session (`ses_...`) or a standalone run; the full id, the compact form a list prints, or a unique prefix / suffix of it |
+
+| Option | Description |
+|---|---|
+| `--json` | Print the participants as JSON |
 
 <a id="rupu-autoflow"></a>
 ### `rupu autoflow`
