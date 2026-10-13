@@ -11267,6 +11267,42 @@ mod tests {
         assert!(plain.iter().any(|row| row.starts_with("│ streaming chunk")));
     }
 
+    /// `MessageRoot::liveness` reads a projection of `session.json`; this
+    /// pins it to the record `rupu session` writes.
+    #[test]
+    fn a_message_root_reads_the_session_record_live_unless_stopped_or_archived() {
+        use rupu_runtime::services::operator::{Liveness, MessageRoot, RootKind};
+        let tmp = tempfile::tempdir().unwrap();
+        let g = tmp.path();
+        let never = |_: u32| false;
+        let mut rec = test_session_record();
+        for (status, live) in [
+            (SessionStatus::Idle, true),
+            (SessionStatus::Running, true),
+            (SessionStatus::Failed, true),
+            (SessionStatus::Stopped, false),
+        ] {
+            rec.status = status;
+            write_session(g, SessionScope::Active, &rec).unwrap();
+            let root = MessageRoot::resolve(g, &rec.session_id).unwrap();
+            assert_eq!(root.kind, RootKind::Session);
+            assert_eq!(
+                root.liveness(g, &never) == Liveness::Live,
+                live,
+                "{status:?}"
+            );
+        }
+
+        rec.session_id = "ses_test02".into();
+        rec.status = SessionStatus::Idle;
+        write_session(g, SessionScope::Archived, &rec).unwrap();
+        let root = MessageRoot::resolve(g, "ses_test02").unwrap();
+        assert_eq!(
+            root.liveness(g, &never),
+            Liveness::NotLive("session `ses_test02` is archived".into())
+        );
+    }
+
     #[test]
     fn legacy_session_record_loads_without_codename() {
         let mut v = serde_json::to_value(test_session_record()).unwrap();
