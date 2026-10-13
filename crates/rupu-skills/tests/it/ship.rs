@@ -255,7 +255,16 @@ fn names_differing_only_by_case_are_a_collision() {
         Some(("README.md".into(), "readme.md".into()))
     );
     assert!(case_collision(&["a", "A/x"]).is_some());
-    assert!(case_collision(&["A/x", "a/y"]).is_none());
+    // Directories differing only by case are one directory on macOS.
+    assert_eq!(
+        case_collision(&["A/y", "a/x"]),
+        Some(("A/y".into(), "a/x".into()))
+    );
+    assert_eq!(
+        case_collision(&["d/Sub/y", "d/sub/x"]),
+        Some(("d/Sub/y".into(), "d/sub/x".into()))
+    );
+    assert!(case_collision(&["A/x", "A/y", "b/x"]).is_none());
     assert!(case_collision(&["SKILL.md", "scripts/run.sh"]).is_none());
 }
 

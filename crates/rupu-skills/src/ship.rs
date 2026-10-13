@@ -139,7 +139,8 @@ pub fn pack_skill(skill: &Skill) -> Result<PackedSkill, ShipError> {
 }
 
 /// Two paths that are one on a case-insensitive filesystem: equal once
-/// case-folded, or one below the other's folded path.
+/// case-folded, one below the other's folded path, or below directories
+/// spelled two ways (`A/y`, `a/x`).
 pub fn case_collision(rels: &[&str]) -> Option<(String, String)> {
     let mut seen = std::collections::HashMap::new();
     for r in rels {
@@ -147,10 +148,22 @@ pub fn case_collision(rels: &[&str]) -> Option<(String, String)> {
             return Some(((*prev).to_owned(), (*r).to_owned()));
         }
     }
+    let mut dirs: std::collections::HashMap<PathBuf, (&Path, &str)> =
+        std::collections::HashMap::new();
     for r in rels {
         for a in Path::new(r).ancestors().skip(1) {
-            if let Some(prev) = seen.get(&fold(a)) {
+            let key = fold(a);
+            if let Some(prev) = seen.get(&key) {
                 return Some(((*prev).to_owned(), (*r).to_owned()));
+            }
+            match dirs.get(&key) {
+                Some((spelled, prev)) if *spelled != a => {
+                    return Some(((*prev).to_owned(), (*r).to_owned()));
+                }
+                Some(_) => {}
+                None => {
+                    dirs.insert(key, (a, r));
+                }
             }
         }
     }
