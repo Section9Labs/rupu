@@ -103,6 +103,33 @@ impl TurnAccum {
     }
 }
 
+/// The run's loaded skills (spec 2026-10-12 §6): the latest `skill_load`
+/// per name, preloads excluded (their bodies live in the system prompt),
+/// most recently loaded last. The runner keeps its loaded set by the same
+/// rule, so a continued run starts with exactly the set its predecessor had.
+pub fn loaded_skills(events: &[Event]) -> Vec<crate::LoadedSkill> {
+    let mut out: Vec<crate::LoadedSkill> = Vec::new();
+    for e in events {
+        if let Event::SkillLoad {
+            name,
+            content_hash,
+            via,
+            ..
+        } = e
+        {
+            if via == "preload" {
+                continue;
+            }
+            out.retain(|l| &l.name != name);
+            out.push(crate::LoadedSkill {
+                name: name.clone(),
+                content_hash: content_hash.clone(),
+            });
+        }
+    }
+    out
+}
+
 /// Pure reconstruction: inline seeds only. A referenced seed errors with
 /// `SeedUnresolved` — callers with filesystem access use
 /// [`reconstruct_transcript`], which resolves chains.
@@ -355,6 +382,8 @@ fn reconstruct_with(
             | Event::RunComplete { .. }
             | Event::ToolAudit { .. }
             | Event::ToolGrant { .. }
+            | Event::SkillIndex { .. }
+            | Event::SkillLoad { .. }
             | Event::NetFlow { .. }
             | Event::Notice { .. }
             | Event::Outcome { .. }
@@ -372,6 +401,36 @@ mod tests {
     use super::*;
     use crate::runner::{run_agent, tests::opts_for, MockProvider, ScriptedTurn};
     use rupu_providers::types::{ContentBlock, Message, StopReason};
+
+    #[test]
+    fn loaded_skills_fold_latest_per_name_skipping_preload() {
+        let load = |name: &str, hash: &str, via: &str| Event::SkillLoad {
+            name: name.into(),
+            layer: "global".into(),
+            content_hash: hash.into(),
+            base_dir: String::new(),
+            via: via.into(),
+        };
+        let got = loaded_skills(&[
+            load("a", "1", "model"),
+            load("p", "9", "preload"),
+            load("b", "2", "model"),
+            load("a", "3", "reattach"),
+        ]);
+        assert_eq!(
+            got,
+            vec![
+                crate::LoadedSkill {
+                    name: "b".into(),
+                    content_hash: "2".into()
+                },
+                crate::LoadedSkill {
+                    name: "a".into(),
+                    content_hash: "3".into()
+                },
+            ]
+        );
+    }
 
     /// A failed run's transcript replays to exactly the conversation
     /// `run_agent_full` hands back, so a session can seed from it; anything

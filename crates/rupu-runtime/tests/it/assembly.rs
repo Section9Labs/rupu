@@ -16,12 +16,17 @@ use serial_test::serial;
 
 use crate::support::{config, Home, MockScript, DONE};
 
-fn agent(home: &Home, frontmatter: &str) -> rupu_agent::AgentSpec {
+pub(crate) fn agent(home: &Home, frontmatter: &str) -> rupu_agent::AgentSpec {
     home.agent("probe", frontmatter);
     rupu_agent::load_agent(&home.global(), None, "probe").unwrap()
 }
 
-fn launch(home: &Home, agent: rupu_agent::AgentSpec, origin: Origin, run_id: &str) -> LaunchSpec {
+pub(crate) fn launch(
+    home: &Home,
+    agent: rupu_agent::AgentSpec,
+    origin: Origin,
+    run_id: &str,
+) -> LaunchSpec {
     LaunchSpec {
         agent,
         origin,

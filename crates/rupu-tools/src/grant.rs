@@ -119,6 +119,15 @@ impl AmbientGrant {
         }
     }
 
+    /// A run with skills is offered the loader (spec §2.4).
+    pub fn skills() -> Self {
+        Self {
+            tools: vec!["skills.load"],
+            reason: GrantReason::Ambient("skills"),
+            self_served: false,
+        }
+    }
+
     /// An agentiflow lead's coordination set (`origin:flow_lead`): the whole
     /// board and mailbox, the flow's live status, the agent/workflow roster
     /// and `findings.report`. (Its launch tools are injected until W7.)

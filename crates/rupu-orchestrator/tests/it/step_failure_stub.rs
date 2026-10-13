@@ -68,6 +68,8 @@ fn scrub(v: &mut Value) {
 }
 
 struct Outcome {
+    /// The run's global `.rupu` (removed once the run returns).
+    global: std::path::PathBuf,
     error: String,
     step: Value,
     events: Vec<Value>,
@@ -84,9 +86,15 @@ steps:
 "#;
 
 async fn run(agent_file: Option<&str>) -> Outcome {
+    run_with(agent_file, |_| {}).await
+}
+
+/// [`run`], after `setup` prepares the global `.rupu`.
+async fn run_with(agent_file: Option<&str>, setup: impl FnOnce(&std::path::Path)) -> Outcome {
     let tmp = tempfile::tempdir().unwrap();
     let global = tmp.path().join("global");
     std::fs::create_dir_all(global.join("agents")).unwrap();
+    setup(&global);
     if let Some(body) = agent_file {
         std::fs::write(global.join("agents").join("AGENT.md"), body).unwrap();
     }
@@ -164,6 +172,7 @@ async fn run(agent_file: Option<&str>) -> Outcome {
         })
         .collect();
     Outcome {
+        global,
         error,
         step,
         events,
@@ -302,6 +311,60 @@ async fn a_step_on_an_undeclared_provider_fails_with_the_config_error() {
     assert_eq!(last["type"], "run_complete");
     assert_eq!(last["data"]["status"], "error");
     assert!(last["data"].get("outcome").is_none(), "{last}");
+}
+
+/// A step whose agent names a skill that is not installed fails before
+/// anything resolves a provider, with where it looked and the fix: not as
+/// an agent that was not found.
+#[tokio::test]
+async fn a_step_whose_agent_names_a_missing_skill_says_where_to_install_it() {
+    let o = run(Some("---\nname: AGENT\nskills: [nope]\n---\nhi\n")).await;
+    let message = format!(
+        "skills: unknown skill \"nope\" (looked in {}; install it with `rupu skill install`)",
+        o.global.join("skills").display()
+    );
+    let error = format!("agent failure in step only: {message}");
+    assert_eq!(o.error, error);
+    assert_eq!(
+        o.step,
+        json!({"cause": null, "error": error, "status": "failed", "steps": []})
+    );
+    assert_eq!(o.events, events("unresolved", "-", &error, Value::Null));
+    let mut transcript = vec![run_start("unresolved", "-", None)];
+    transcript.extend(preamble());
+    transcript.push(json!({"data": {"duration_ms": V, "error": message, "run_id": V, "status": "error", "total_tokens": 0}, "type": "run_complete"}));
+    assert_eq!(o.transcript, transcript, "{}", dump(&o));
+}
+
+/// A skill that is installed but invalid passes the agent's load (which
+/// checks names only) and fails the run's assembly, recorded the same way.
+#[tokio::test]
+async fn a_step_whose_agent_names_an_invalid_skill_fails_its_assembly() {
+    let o = run_with(
+        Some("---\nname: AGENT\nprovider: anthropic\nmodel: claude-sonnet-4-6\nskills: [broken]\n---\nhi\n"),
+        |global| {
+            let dir = global.join("skills/broken");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("SKILL.md"), "no frontmatter\n").unwrap();
+        },
+    )
+    .await;
+    let message = "skills: skill \"broken\" (global) is invalid: SKILL.md: SKILL.md must start with a `---` frontmatter line";
+    let error = format!("agent failure in step only: {message}");
+    assert_eq!(o.error, error, "{}", dump(&o));
+    assert_eq!(
+        o.step,
+        json!({"cause": null, "error": error, "status": "failed", "steps": []})
+    );
+    assert_eq!(
+        o.events,
+        events("anthropic", "claude-sonnet-4-6", &error, Value::Null)
+    );
+    let last = o.transcript.last().unwrap();
+    assert_eq!(
+        last,
+        &json!({"data": {"duration_ms": V, "error": message, "run_id": V, "status": "error", "total_tokens": 0}, "type": "run_complete"})
+    );
 }
 
 fn dump(o: &Outcome) -> String {

@@ -736,6 +736,40 @@ describe('v2 blocks model', () => {
     expect(gate).toMatchObject({ gateId: 'g1', decision: 'approve', decidedBy: 'matt' });
   });
 
+  it('tool_grant, skill_index and skill_load become meta rows with the shared one-line text', () => {
+    const view = buildTranscriptView([
+      {
+        type: 'tool_grant',
+        data: {
+          entries: [{ tool: 'read_file', reasons: ['declared'] }, { tool: 'skills.load', reasons: ['ambient:skills'] }],
+          unavailable: [{ tool: 'board.post', missing: ['message_bus'] }],
+        },
+      },
+      {
+        type: 'skill_index',
+        data: {
+          skills: [
+            { name: 'pdf', layer: 'global', stamp: 's', preload: true, indexed: false, reason: 'agent' },
+            { name: 'xlsx', layer: 'project', stamp: 's', preload: false, indexed: true, reason: 'step' },
+          ],
+        },
+      },
+      {
+        type: 'skill_load',
+        data: { name: 'pdf', layer: 'global', content_hash: 'ab'.repeat(32), base_dir: '/h/skills/pdf', via: 'preload' },
+      },
+    ]);
+    expect(view.turns.flatMap((t) => t.blocks)).toEqual([
+      {
+        kind: 'meta',
+        label: 'tools',
+        text: '2 tools: read_file, skills.load  ·  unavailable: board.post (needs message_bus)',
+      },
+      { kind: 'meta', label: 'skills', text: '2 skills: pdf (preloaded), xlsx' },
+      { kind: 'meta', label: 'skills', text: 'loaded skill pdf (abababababab) via preload' },
+    ]);
+  });
+
   it('an outcome event becomes an outcome block carrying severity, title and detail', () => {
     const view = buildTranscriptView([
       { type: 'turn_start', data: { turn_idx: 0 } },

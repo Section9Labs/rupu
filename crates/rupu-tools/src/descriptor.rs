@@ -67,6 +67,8 @@ pub enum Service {
     Catalog,
     WorkflowGenerator,
     Netflow,
+    /// The skills a run was granted (`skills.load`).
+    Skills,
 }
 
 impl Service {
@@ -84,6 +86,7 @@ impl Service {
             Service::Catalog => "catalog",
             Service::WorkflowGenerator => "workflow_generator",
             Service::Netflow => "netflow",
+            Service::Skills => "skills",
         }
     }
 }

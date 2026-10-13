@@ -86,16 +86,26 @@ impl StepFactory for DefaultStepFactory {
         // A missing or unparseable agent file fails the step loudly — never a
         // run on the default provider/model (a step naming a nonexistent
         // agent once ran on `anthropic` and billed it). A present agent that
-        // merely omits `provider:`/`model:` still defaults.
+        // merely omits `provider:`/`model:` still defaults. An agent that
+        // names a skill that is not installed is a skills failure, as it is
+        // when the run's assembly resolves them.
         let agent = rupu_agent::load_agent_admitted(
             &ctx.global,
             project_agents_parent.as_deref(),
             &request.agent_name,
         )
         .await
-        .map_err(|e| AssembleError::AgentLoad {
-            agent: request.agent_name.clone(),
-            message: e.to_string(),
+        .map_err(|e| match e {
+            rupu_agent::AgentLoadError::Skill {
+                source, looked_in, ..
+            } => AssembleError::Skills {
+                source,
+                looked_in: *looked_in,
+            },
+            e => AssembleError::AgentLoad {
+                agent: request.agent_name.clone(),
+                message: e.to_string(),
+            },
         })?;
 
         let mut spec = request.into_spec(

@@ -38,6 +38,7 @@ rupu-netwatch = { workspace = true }
 rupu-transcript = { path = "../rupu-transcript" }
 rupu-scm = { path = "../rupu-scm" }
 rupu-codename = { path = "../rupu-codename" }
+rupu-skills = { workspace = true }
 tokio-util.workspace = true
 
 [dev-dependencies]

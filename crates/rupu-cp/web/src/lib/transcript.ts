@@ -29,6 +29,9 @@ export type TranscriptEvent =
   | { type: 'user_message'; data: { content: string } }
   | { type: 'seed'; data: { message_count: number; sha256?: string; source_transcript?: string | null; messages?: unknown } }
   | { type: 'notice'; data: { kind: string; message: string } }
+  | { type: 'tool_grant'; data: { entries: { tool: string; reasons: string[] }[]; narrowed?: string[]; unavailable?: { tool: string; missing: string[] }[]; skipped?: { tool: string; missing: string[] }[] } }
+  | { type: 'skill_index'; data: { skills: { name: string; layer: string; stamp: string; preload: boolean; indexed: boolean; reason: string }[] } }
+  | { type: 'skill_load'; data: { name: string; layer: string; content_hash: string; base_dir: string; via: string } }
   | { type: 'compaction'; data: { seq: number; summarized_messages: number; backup_path?: string; messages?: unknown } }
   | { type: 'net_flow'; data: { flow: unknown } }
   | { type: 'outcome'; data: { turn_idx: number; outcome: OutcomeRecord } }

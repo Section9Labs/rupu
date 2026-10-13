@@ -202,6 +202,58 @@ description; warnings alone exit 0. `show` prints them too.
 
 ## Granting skills to agents
 
-Installing a skill makes it available; it does not give it to any agent.
-Granting skills arrives with the `skills:` agent frontmatter key, described in
-the [design spec](superpowers/specs/2026-10-12-rupu-agent-skills-design.md#2-granting-skills).
+Installing a skill makes it available; it does not give it to any agent. An
+agent names the skills it gets in its frontmatter:
+
+```yaml
+skills: [pdf, code-review]     # the model may load these
+preloadSkills: [house-style]   # always in the system prompt
+```
+
+`*` grants every valid global skill and never a project one; a project skill
+needs its exact name or `project:*`. A bare name installed in both layers is an
+error until it is written `global:<name>` or `project:<name>`. The full grammar
+is in [agent-format.md](agent-format.md#skills-and-preloadskills). An unknown
+or invalid skill fails the agent's load, and `rupu agent validate` catches it.
+
+## How an agent uses its skills
+
+Every run the agent starts (`rupu run`, a workflow step, an agentiflow lead or
+unit) gets its skills the same way:
+
+- **Index or preload.** A skill in `skills:` is listed under `## Skills` at the
+  end of the system prompt: its name and description, about a line each. A
+  skill in `preloadSkills:` has its whole body in the system prompt instead.
+  The section is rendered the same way for the same skills, so the prompt
+  cache holds across runs.
+- **`skills.load`.** When a task matches a listed skill, the model calls
+  `skills.load` with its name and gets its instructions, base directory and
+  file list. The skill is read from disk at that moment: one edited since the
+  run started loads at its new version, with a `skill_changed` notice. The
+  model can load only skills the agent was granted.
+- **Reading and running its files.** `read_file`, `grep`, `glob` and
+  `ast_grep` reach a granted skill's directory, even outside the workspace. A
+  skill's files are read-only to the model: `write_file` and `edit_file` refuse
+  them. Its scripts run through `bash`, under the run's permission mode
+  (`readonly` denies them, `ask` prompts) and `[bash]` settings. A skill never
+  adds a tool or raises the permission mode.
+- **Compaction.** Compaction summarises older turns, which would drop a skill's
+  instructions. The runner keeps the skills the model loaded and puts them back
+  at their current version, in the rebuilt first message, after every
+  compaction. They are capped at a quarter of the model's input limit, most
+  recently loaded first; a skill that doesn't fit is named, for the model to
+  load again. A skill uninstalled mid-run is named as missing.
+- **Continuing a run.** `rupu run --continue` and a resumed workflow step start
+  with the skills the interrupted run had loaded, and re-attach them at their
+  next compaction. An agentiflow lead carries them from round to round.
+
+A sub-agent started with `dispatch_agent` gets its own agent's skills, not its
+parent's. Sessions don't support skills yet: `rupu session start` refuses an
+agent that declares them.
+
+The transcript records what the run had and used. `skill_index` lists the
+granted skills at run start, and a `skill_load` is written for every load, with
+`via` set to `model`, `preload`, `reattach` or `continuation`. See
+[transcript-schema.md](transcript-schema.md#skill_index). Notices name what
+needs attention: `skill_not_indexed`, `skill_changed`, `skill_missing`,
+`skill_tools_missing` and `skill_reattach_truncated`.

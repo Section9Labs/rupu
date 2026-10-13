@@ -9,7 +9,7 @@
  * Expanded: the same header (chevron down) then the body — every block in
  * `turn.blocks`, in order, dispatched by kind through `TurnBlockView`:
  * assistant/user markdown, a collapsible thinking block (or a redacted
- * marker), `ToolCard`s, gate/seed/notice/compaction rows, and an `unknown`
+ * marker), `ToolCard`s, gate/seed/notice/meta/compaction rows, and an `unknown`
  * fallback row so nothing silently vanishes.
  *
  * No `any`. Static Tailwind class strings only.
@@ -217,6 +217,12 @@ function TurnBlockView({
       return (
         <div className="text-meta text-ink-mute">
           <span className="font-medium">{block.noticeKind}</span> · {block.message}
+        </div>
+      );
+    case 'meta':
+      return (
+        <div className="text-meta text-ink-mute">
+          <span className="font-medium">{block.label}</span> · {block.text}
         </div>
       );
     case 'compaction':

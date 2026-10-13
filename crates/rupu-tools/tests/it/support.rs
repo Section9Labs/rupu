@@ -157,3 +157,23 @@ impl rupu_tools::CatalogPort for StubCatalog {
         self.workflows.clone()
     }
 }
+
+/// A `ResolvedSkills` holding the global skills named in `grants`, all
+/// installed under `<global>/skills/` by the caller.
+pub fn resolved(global: &Path, grants: &[&str]) -> Arc<rupu_skills::ResolvedSkills> {
+    let cat =
+        rupu_skills::SkillCatalog::discover(&rupu_skills::LayerDirs::for_layers(global, None))
+            .unwrap();
+    let g: Vec<String> = grants.iter().map(|s| s.to_string()).collect();
+    Arc::new(
+        rupu_skills::resolve_run_skills(
+            &cat,
+            &[rupu_skills::SkillRequest {
+                reason: rupu_skills::SkillReason::Agent,
+                grants: &g,
+                preload: &[],
+            }],
+        )
+        .unwrap(),
+    )
+}

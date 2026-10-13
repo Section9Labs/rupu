@@ -247,7 +247,7 @@ impl SkillRow {
 }
 
 fn row(e: &CatalogEntry) -> SkillRow {
-    let (status, description, error) = match &e.skill {
+    let (status, description, error) = match e.skill() {
         Ok(s) => ("ok", s.frontmatter.description.clone(), String::new()),
         Err(err) => ("invalid", String::new(), err.to_string()),
     };
@@ -324,7 +324,7 @@ fn show(name: &str) -> anyhow::Result<()> {
             Ok(None) => {}
             Err(err) => say(&format!("  source:        unreadable ({err})")),
         }
-        let s = match &e.skill {
+        let s = match e.skill() {
             Ok(s) => s,
             Err(err) => {
                 say(&format!("  INVALID:       {err}\n"));
@@ -402,7 +402,7 @@ fn validate(name: Option<&str>, all: bool) -> anyhow::Result<bool> {
     );
     let mut ok = true;
     for e in entries {
-        match &e.skill {
+        match e.skill() {
             Ok(s) => {
                 say(&format!("ok       {} ({})", e.dir_name, e.layer.as_str()));
                 for w in &s.frontmatter.warnings {

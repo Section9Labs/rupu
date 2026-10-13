@@ -470,7 +470,7 @@ git commit -m "feat(skills): resolve a run's skills in one pass and render the r
 - Test: `crates/rupu-agent/tests/it/agent_skills.rs` (add to `tests/it/main.rs`), `spec.rs` unit tests
 
 **Interfaces:**
-- Produces: `AgentSpec.skills: Option<Vec<String>>`, `AgentSpec.preload_skills: Option<Vec<String>>`; `AgentSpec::declares_skills(&self) -> bool`; `AgentSpec::validate_skills(&self, catalog: &rupu_skills::SkillCatalog) -> Result<(), rupu_skills::RunSkillsError>`; `AgentLoadError::Skill { agent: String, message: String }`.
+- Produces: `AgentSpec.skills: Option<Vec<String>>`, `AgentSpec.preload_skills: Option<Vec<String>>`; `AgentSpec::declares_skills(&self) -> bool`; `AgentSpec::validate_skills(&self, catalog: &rupu_skills::SkillCatalog) -> Result<(), rupu_skills::RunSkillsError>`; `AgentLoadError::Skill { agent: String, key: &'static str, source: SkillCheckError }` (`SkillCheckError::{Discover, Resolve}`, typed so `is_fd_exhaustion` sees an EMFILE behind it; `key` is `preloadSkills` only when that key's entries alone fail). Discovery lists the skill directories only; each `CatalogEntry::skill()` loads on first use and caches for the catalog's life, so a check loads only the skills its grants name.
 
 - [ ] **Step 1: Write the failing tests**
 

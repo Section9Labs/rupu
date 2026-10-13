@@ -297,7 +297,9 @@ impl AgentDispatcher for InProcessDispatcher {
                     | AssembleError::ProviderBuild { .. } => {
                         DispatchError::ProviderBuild(e.to_string())
                     }
-                    AssembleError::Grant(_) => DispatchError::ChildRun(e.to_string()),
+                    AssembleError::Grant(_) | AssembleError::Skills { .. } => {
+                        DispatchError::ChildRun(e.to_string())
+                    }
                 });
             }
         };

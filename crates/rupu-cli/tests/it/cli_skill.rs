@@ -470,3 +470,48 @@ fn a_qualified_show_still_notes_the_other_layer() {
     assert!(out.contains("Global copy."), "{out}");
     assert!(!out.contains("Project copy."), "{out}");
 }
+
+#[test]
+fn run_names_where_a_missing_skill_was_looked_for() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    fs::create_dir_all(home.path().join("agents")).unwrap();
+    fs::write(
+        home.path().join("agents/a.md"),
+        "---\nname: a\nprovider: anthropic\nmodel: claude-sonnet-4-6\nskills: [nope]\n---\nhi\n",
+    )
+    .unwrap();
+    let out = rupu(home.path(), cwd.path(), &["run", "a", "go"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "agent `a`: skills: unknown skill \"nope\" (looked in {}; install it with `rupu skill install`)",
+            home.path().join("skills").display()
+        )),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn validate_names_an_oversized_skill_md() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let dir = home.path().join("skills/huge");
+    fs::create_dir_all(&dir).unwrap();
+    let text = format!(
+        "---\nname: huge\ndescription: d\n---\n{}\n",
+        "x".repeat(1 << 20)
+    );
+    fs::write(dir.join("SKILL.md"), &text).unwrap();
+    let out = rupu(home.path(), cwd.path(), &["skill", "validate", "--all"]);
+    assert_eq!(out.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "SKILL.md is {} bytes; the limit is 1048576 bytes",
+            text.len()
+        )),
+        "{stdout}"
+    );
+}

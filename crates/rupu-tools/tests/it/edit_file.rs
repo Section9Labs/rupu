@@ -70,3 +70,47 @@ async fn refuses_path_outside_workspace() {
         .unwrap();
     assert!(out.error.is_some());
 }
+
+#[tokio::test]
+async fn a_dotdot_through_a_missing_dir_cannot_escape() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let ws = tmp.child("ws");
+    ws.create_dir_all().unwrap();
+    tmp.child("outside/f").write_str("original").unwrap();
+    let out = EditFileTool
+        .invoke(
+            json!({ "path": "nope/../../outside/f", "old_string": "original", "new_string": "pwned" }),
+            &ctx(ws.path()),
+        )
+        .await
+        .unwrap();
+    assert!(
+        out.error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("escapes workspace"),
+        "{:?}",
+        out.error
+    );
+    assert!(
+        !ws.path().join("nope").exists(),
+        "the refusal created ws/nope"
+    );
+    tmp.child("outside/f").assert("original");
+}
+
+#[tokio::test]
+async fn a_dotdot_through_an_existing_dir_stays_allowed() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    tmp.child("sub").create_dir_all().unwrap();
+    tmp.child("file.txt").write_str("old").unwrap();
+    let out = EditFileTool
+        .invoke(
+            json!({ "path": "sub/../file.txt", "old_string": "old", "new_string": "new" }),
+            &ctx(tmp.path()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.error, None);
+    tmp.child("file.txt").assert("new");
+}

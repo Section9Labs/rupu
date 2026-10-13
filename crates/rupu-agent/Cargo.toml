@@ -32,6 +32,7 @@ rupu-config = { path = "../rupu-config" }
 rupu-auth = { path = "../rupu-auth" }
 rupu-coverage = { path = "../rupu-coverage" }
 rupu-codename = { workspace = true }
+rupu-skills = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true

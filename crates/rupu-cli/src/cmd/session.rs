@@ -1602,7 +1602,15 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
     let project_agents_parent = project_root.as_ref().map(|p| p.join(".rupu"));
-    let spec = load_agent(&global, project_agents_parent.as_deref(), &args.agent)?;
+    let spec = match load_agent(&global, project_agents_parent.as_deref(), &args.agent) {
+        Err(rupu_agent::AgentLoadError::Skill { agent, .. }) => {
+            anyhow::bail!(sessions_refuse_skills(&agent))
+        }
+        loaded => loaded?,
+    };
+    if spec.declares_skills() {
+        anyhow::bail!(sessions_refuse_skills(&spec.name));
+    }
 
     let cfg_paths = paths::config_paths(&global, project_root.as_deref(), &pwd)?;
     let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
@@ -2779,6 +2787,31 @@ impl SessionInteractiveState {
                         crate::output::palette::Status::Active,
                         "tools",
                         &rupu_transcript::grant::tool_grant_line(entries, narrowed, unavailable),
+                    ),
+                );
+            }
+            TranscriptEvent::SkillIndex { skills } => {
+                self.push_line(
+                    crate::output::palette::Status::Active,
+                    retained_session_event_line_raw(
+                        crate::output::palette::Status::Active,
+                        "skills",
+                        &rupu_transcript::skills::skill_index_line(skills),
+                    ),
+                );
+            }
+            TranscriptEvent::SkillLoad {
+                name,
+                content_hash,
+                via,
+                ..
+            } => {
+                self.push_line(
+                    crate::output::palette::Status::Active,
+                    retained_session_event_line_raw(
+                        crate::output::palette::Status::Active,
+                        "skills",
+                        &rupu_transcript::skills::skill_load_line(name, via, content_hash),
                     ),
                 );
             }
@@ -5497,6 +5530,29 @@ fn transcript_event_lines(
             ),
             continuation: false,
         }],
+        TranscriptEvent::SkillIndex { skills } => vec![SessionViewLine {
+            status: Status::Active,
+            text: retained_session_event_line_raw(
+                Status::Active,
+                "skills",
+                &rupu_transcript::skills::skill_index_line(skills),
+            ),
+            continuation: false,
+        }],
+        TranscriptEvent::SkillLoad {
+            name,
+            content_hash,
+            via,
+            ..
+        } => vec![SessionViewLine {
+            status: Status::Active,
+            text: retained_session_event_line_raw(
+                Status::Active,
+                "skills",
+                &rupu_transcript::skills::skill_load_line(name, via, content_hash),
+            ),
+            continuation: false,
+        }],
         TranscriptEvent::Compaction {
             seq,
             summarized_messages,
@@ -7739,6 +7795,15 @@ fn finalize_compact_run(
     Ok(())
 }
 
+/// Until sessions carry skills (Agent Skills Plan 3), a session refuses an
+/// agent that declares them rather than run it without them.
+fn sessions_refuse_skills(agent: &str) -> String {
+    format!(
+        "agent `{agent}` declares skills; sessions do not support skills yet (Agent Skills \
+         Plan 3) — run it with `rupu run`, or remove its skill keys"
+    )
+}
+
 /// The agent a session turn runs: the agent settings the session record
 /// snapshotted at `session start` (its prompt, tools, provider, model and
 /// pins), plus the fallback chain, which the record does not keep — each
@@ -7746,8 +7811,17 @@ fn finalize_compact_run(
 /// start` loaded it from. An agent that no longer loads (renamed, deleted,
 /// broken frontmatter) gets no chain, and the turn uses the
 /// `[recovery].fallbacks` table, the same as an agent that declares none.
-fn session_agent_spec(global: &Path, session: &SessionRecord) -> rupu_agent::AgentSpec {
-    rupu_agent::AgentSpec {
+/// An agent file that declares skills fails the turn (a session started
+/// before `session start` refused them), never runs without them.
+fn session_agent_spec(
+    global: &Path,
+    session: &SessionRecord,
+) -> anyhow::Result<rupu_agent::AgentSpec> {
+    let file = session_agent_file(global, session);
+    if file.as_ref().is_some_and(|f| f.declares_skills()) {
+        anyhow::bail!(sessions_refuse_skills(&session.agent_name));
+    }
+    Ok(rupu_agent::AgentSpec {
         name: session.agent_name.clone(),
         description: session.description.clone(),
         provider: Some(session.provider_name.clone()),
@@ -7772,27 +7846,26 @@ fn session_agent_spec(global: &Path, session: &SessionRecord) -> rupu_agent::Age
         context_window_tokens: session.context_window_tokens,
         compact_at_percent: session.compact_at_percent,
         findings_profile: session.findings_profile,
-        fallbacks: session_agent_fallbacks(global, session),
+        skills: None,
+        preload_skills: None,
+        fallbacks: file.and_then(|f| f.fallbacks),
         system_prompt: session.agent_system_prompt.clone(),
         raw: String::new(),
-    }
+    })
 }
 
-/// The session agent's `fallbacks:`, re-read from its agent file (see
-/// [`session_agent_spec`]); `None` when it no longer loads.
-fn session_agent_fallbacks(
-    global: &Path,
-    session: &SessionRecord,
-) -> Option<Vec<rupu_config::FallbackEntry>> {
+/// The session agent's file as it is now (see [`session_agent_spec`]);
+/// `None` when it no longer loads.
+fn session_agent_file(global: &Path, session: &SessionRecord) -> Option<rupu_agent::AgentSpec> {
     let project_agents_parent = session.project_root.as_ref().map(|p| p.join(".rupu"));
-    // Only the fallback chain is read here, so the agent's `tools:` aren't
-    // checked: the turn's own grant does that.
+    // Only the fallback chain and the skill keys are read here, so the
+    // agent's `tools:` aren't checked: the turn's own grant does that.
     match rupu_agent::find_agent(
         global,
         project_agents_parent.as_deref(),
         &session.agent_name,
     ) {
-        Ok(spec) => spec.fallbacks,
+        Ok(spec) => Some(spec),
         Err(e) => {
             // Loading one agent parses every file in the agent dirs, so a
             // broken file that is NOT this agent's also lands here: name the
@@ -7808,6 +7881,9 @@ fn session_agent_fallbacks(
                 }
                 rupu_agent::AgentLoadError::UnknownTool { .. } => {
                     "the agent's `tools:` names an unknown tool".to_string()
+                }
+                rupu_agent::AgentLoadError::Skill { .. } => {
+                    "the agent's skill keys do not resolve".to_string()
                 }
             };
             tracing::warn!(
@@ -7912,7 +7988,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
                 ))),
             },
         ));
-        let agent = session_agent_spec(&global, &session);
+        let agent = session_agent_spec(&global, &session)?;
         // The session's limits: the value stored by an earlier turn
         // (including any limit learned from an overflow error), else resolved
         // now — the first turn — through this turn's provider (spec
@@ -8040,6 +8116,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
                 initial_messages: session.message_history.clone(),
                 seed_source,
                 turn_index_offset: session.total_turns,
+                loaded_skills: Vec::new(),
             },
             workspace,
             mode,
@@ -8073,6 +8150,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             result: outcome,
             final_limits,
             messages: exit_messages,
+            ..
         } = match assembler.assemble(launch).await {
             Ok(run) => run.run().await,
             Err(e) => rupu_agent::RunExit {
@@ -8082,6 +8160,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
                     .clone()
                     .unwrap_or_else(rupu_providers::model_limits::ModelLimits::unknown),
                 messages: Vec::new(),
+                loaded_skills: Vec::new(),
             },
         };
         // The turn's cached tokens: the provider-reported total summed over
@@ -9706,6 +9785,58 @@ mod tests {
     }
 
     #[test]
+    fn retained_session_rows_show_tool_grant_and_skill_events() {
+        let session = test_session_record();
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Compact),
+        );
+        let mut state = SessionInteractiveState::new(
+            PathBuf::from("/tmp/repo/.rupu/transcripts/run_live123.jsonl"),
+            Some("run_live123".into()),
+            LiveViewMode::Compact,
+        );
+        state.push_transcript_event(&TranscriptEvent::ToolGrant {
+            entries: vec![rupu_transcript::ToolGrantEntry {
+                tool: "read_file".into(),
+                reasons: vec!["declared".into()],
+            }],
+            narrowed: vec![],
+            unavailable: vec![],
+            skipped: vec![],
+        });
+        state.push_transcript_event(&TranscriptEvent::SkillIndex {
+            skills: vec![rupu_transcript::SkillIndexEntry {
+                name: "pdf".into(),
+                layer: "global".into(),
+                stamp: "ab".repeat(32),
+                preload: true,
+                indexed: false,
+                reason: "agent".into(),
+            }],
+        });
+        state.push_transcript_event(&TranscriptEvent::SkillLoad {
+            name: "pdf".into(),
+            layer: "global".into(),
+            content_hash: "cd".repeat(32),
+            base_dir: "/h/skills/pdf".into(),
+            via: "preload".into(),
+        });
+
+        let rows = build_session_screen_rows_for_size(&session, &mut state, &prefs, 120, 20);
+        assert!(rows.iter().any(|row| row.contains("1 tool: read_file")));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("1 skill: pdf (preloaded)")));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("loaded skill pdf (cdcdcdcdcdcd) via preload")));
+    }
+
+    #[test]
     fn retained_session_header_shows_model_effort_totals_and_cost() {
         let session = SessionRecord {
             status: SessionStatus::Running,
@@ -10072,6 +10203,23 @@ mod tests {
                 tag: "future_event".into(),
                 data: serde_json::Value::Null,
             },
+            TranscriptEvent::SkillIndex {
+                skills: vec![rupu_transcript::SkillIndexEntry {
+                    name: "pdf".into(),
+                    layer: "global".into(),
+                    stamp: "ab".repeat(32),
+                    preload: true,
+                    indexed: false,
+                    reason: "agent".into(),
+                }],
+            },
+            TranscriptEvent::SkillLoad {
+                name: "pdf".into(),
+                layer: "global".into(),
+                content_hash: "cd".repeat(32),
+                base_dir: "/h/skills/pdf".into(),
+                via: "model".into(),
+            },
         ];
         for ev in &cases {
             assert!(
@@ -10092,6 +10240,8 @@ mod tests {
         assert!(find("fell back to anthropic/claude-opus-4-8"));
         assert!(find("served by fallback · model-a → model-b"));
         assert!(find("unrecognized event · future_event"));
+        assert!(find("1 skill: pdf (preloaded)"));
+        assert!(find("loaded skill pdf (cdcdcdcdcdcd) via model"));
         assert!(transcript_event_lines(
             &TranscriptEvent::ThinkingDelta {
                 content: "c".into()

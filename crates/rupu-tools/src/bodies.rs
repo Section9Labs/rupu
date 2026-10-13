@@ -6,6 +6,7 @@
 use crate::tool::{Tool, ToolContext};
 use crate::{
     assets, board, budget, coverage, findings, github, gitlab, goal, issues, msg, roster, scm,
+    skills,
 };
 use crate::{
     AstGrepTool, BashTool, DispatchAgentTool, DispatchAgentsParallelTool, EditFileTool, GlobTool,
@@ -20,9 +21,9 @@ use std::sync::Arc;
 /// without a concern catalog, `assets.mark` without an engagement, the
 /// dispatch pair without a dispatcher, `board.*` / `msg.send` without a
 /// message bus, `goal.*` / `budget.status` without a run status, the roster
-/// without a catalog. [`crate::ToolServices::provided`] is the same
-/// accounting, so a grant resolved over it never offers a tool this can't
-/// build.
+/// without a catalog, `skills.load` without a granted skill the model may load.
+/// [`crate::ToolServices::provided`] is the same accounting, so a grant
+/// resolved over it never offers a tool this can't build.
 pub fn body(name: &str, ctx: &ToolContext) -> Option<Arc<dyn Tool>> {
     let services = &ctx.services;
     let scm = services.scm.is_some();
@@ -30,6 +31,7 @@ pub fn body(name: &str, ctx: &ToolContext) -> Option<Arc<dyn Tool>> {
     let bus = services.message_bus.is_some();
     let status = services.run_status.is_some();
     let catalog = services.catalog.is_some();
+    let skills = services.skills.as_ref().is_some_and(|s| s.has_loadable());
     let t: Arc<dyn Tool> = match name {
         // core
         "bash" => Arc::new(BashTool),
@@ -102,6 +104,8 @@ pub fn body(name: &str, ctx: &ToolContext) -> Option<Arc<dyn Tool>> {
         "goal.status" if status => Arc::new(goal::GoalStatusTool),
         "goal.coverage" if status => Arc::new(goal::GoalCoverageTool),
         "budget.status" if status => Arc::new(budget::BudgetStatusTool),
+        // a run's skills
+        "skills.load" if skills => Arc::new(skills::SkillsLoadTool),
         _ => return None,
     };
     Some(t)

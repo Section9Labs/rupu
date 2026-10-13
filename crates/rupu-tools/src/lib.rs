@@ -9,7 +9,8 @@
 //!   [`github`], [`gitlab`];
 //! - a flow's message bus: [`board`], [`msg`]; its live status through the
 //!   [`ports::RunStatus`] port: [`goal`], [`budget`]; the agent/workflow
-//!   catalog through the [`ports::CatalogPort`] port: [`roster`].
+//!   catalog through the [`ports::CatalogPort`] port: [`roster`];
+//! - a run's granted skills: [`skills`].
 //!
 //! All tools implement the [`Tool`] trait and declare a
 //! [`ToolDescriptor`] (name, aliases, [`Effect`], needs). [`catalog`] lists
@@ -42,6 +43,7 @@ pub mod output;
 pub mod ports;
 pub mod roster;
 pub mod scm;
+pub mod skills;
 pub mod tool;
 
 mod path_scope;

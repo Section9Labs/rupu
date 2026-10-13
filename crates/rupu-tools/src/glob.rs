@@ -1,19 +1,21 @@
 //! `glob` tool — recursive pattern matching via `globwalk`.
 //!
 //! Returns a sorted, newline-separated list of matching file paths
-//! relative to the workspace root. Pattern syntax is glob-style with
-//! `**` for recursive descent. Matches outside the workspace root are
-//! dropped.
+//! relative to the workspace root, or absolute for a pattern under one of
+//! the run's read roots (a skill's directory). Pattern syntax is
+//! glob-style with `**` for recursive descent. Matches outside the walk's
+//! base are dropped.
 
 use crate::coverage_emit::{attribution_from, emit};
 use crate::descriptor::{Effect, ToolDescriptor};
-use crate::path_scope::is_inside;
-use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
+use crate::path_scope::{as_given, within, Roots};
+use crate::tool::{Tool, ToolContext, ToolError, ToolOutput, WorkspaceScope};
 use async_trait::async_trait;
 use chrono::Utc;
 use rupu_coverage::FileTouchEvent;
 use serde::Deserialize;
 use serde_json::Value;
+use std::path::PathBuf;
 use std::time::Instant;
 
 #[derive(Deserialize)]
@@ -34,7 +36,7 @@ pub static DESCRIPTOR: ToolDescriptor = ToolDescriptor {
     needs: &[],
     uses: &[],
     wildcard: true,
-    description: "List files in the workspace matching a glob pattern. Output is one path per line, sorted, relative to the workspace root. Supports `**` for recursive descent. Returns empty stdout when nothing matches.",
+    description: "List files in the workspace matching a glob pattern. Output is one path per line, sorted, relative to the workspace root. Supports `**` for recursive descent. Patterns are relative to the workspace; an absolute pattern is allowed only inside a skill's base directory (`skills.load` returns it), and its matches are absolute. Returns empty stdout when nothing matches.",
     input_schema: descriptor_schema,
 };
 
@@ -62,29 +64,44 @@ impl Tool for GlobTool {
         let i: Input =
             serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
 
-        let walker = globwalk::GlobWalkerBuilder::from_patterns(&ctx.workspace.path, &[&i.pattern])
-            .max_depth(64)
-            .follow_links(false)
-            .build()
-            .map_err(|e| ToolError::Execution(e.to_string()))?;
+        let read_root = read_root_pattern(&ctx.workspace, &i.pattern);
+        let from_root = read_root.is_some();
+        let (base, pattern) =
+            read_root.unwrap_or_else(|| (ctx.workspace.path.clone(), i.pattern.clone()));
 
         // Workspace scope, as the other fs tools: a pattern that climbs out
-        // (`../*`, an absolute path) yields nothing outside the workspace.
+        // (`../*`, an absolute path) yields nothing outside the walk's base,
+        // which is walked where it resolves. Matches under a read root are
+        // absolute; workspace matches relative.
         let mut matches = vec![];
-        for entry in walker.flatten() {
-            if entry.file_type().is_file() && is_inside(&ctx.workspace.path, entry.path()) {
-                let rel = entry
-                    .path()
-                    .strip_prefix(&ctx.workspace.path)
-                    .unwrap_or(entry.path());
-                matches.push(rel.display().to_string());
+        if let Ok(canonical_base) = base.canonicalize() {
+            let walker = globwalk::GlobWalkerBuilder::from_patterns(&canonical_base, &[&pattern])
+                .max_depth(64)
+                .follow_links(false)
+                .build()
+                .map_err(|e| ToolError::Execution(e.to_string()))?;
+            for entry in walker.flatten() {
+                if entry.file_type().is_file() && within(&canonical_base, entry.path()) {
+                    let path = entry.path().display().to_string();
+                    let shown = PathBuf::from(as_given(&path, &canonical_base, &base));
+                    let shown = match from_root {
+                        true => &shown,
+                        false => shown.strip_prefix(&ctx.workspace.path).unwrap_or(&shown),
+                    };
+                    matches.push(shown.display().to_string());
+                }
             }
         }
         matches.sort();
 
-        // Emit one FileTouchEvent per matched path (success — walker never
-        // returns a Rust-level error for non-matches, it simply yields nothing).
-        for path in &matches {
+        // Emit one FileTouchEvent per matched workspace path (success — walker
+        // never returns a Rust-level error for non-matches, it simply yields
+        // nothing). A skill's files are not target files.
+        let roots = Roots::of(&ctx.workspace);
+        let touched = matches
+            .iter()
+            .filter(|p| !from_root && roots.is_target(&ctx.workspace.path.join(p)));
+        for path in touched {
             emit(
                 ctx,
                 FileTouchEvent::Glob {
@@ -106,4 +123,15 @@ impl Tool for GlobTool {
             structured: None,
         })
     }
+}
+
+/// An absolute pattern under one of the run's read roots walks from that
+/// root; anything else walks the workspace.
+fn read_root_pattern(ws: &WorkspaceScope, pattern: &str) -> Option<(PathBuf, String)> {
+    ws.read_roots.iter().find_map(|root| {
+        let prefix = format!("{}/", root.display());
+        pattern
+            .strip_prefix(&prefix)
+            .map(|rest| (root.clone(), rest.to_owned()))
+    })
 }

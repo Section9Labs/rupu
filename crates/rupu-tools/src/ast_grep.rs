@@ -101,8 +101,9 @@ Example: pattern `impl $T for $S` with lang `rust` finds trait impls; \
 pattern `async fn $NAME($$$) -> Result<$$$>` finds async fns returning Result. \
 Output is `path:line:col: match` lines (1-based, workspace-relative). \
 Prefer this over `grep` when you want syntactic matches (call sites, impls, \
-signatures) instead of regex over raw text. Returns empty stdout (not an error) \
-when there are no matches.",
+signatures) instead of regex over raw text. `path` is relative to the workspace; \
+an absolute `path` is allowed only inside a skill's base directory (`skills.load` \
+returns it). Returns empty stdout (not an error) when there are no matches.",
     input_schema: descriptor_schema,
 };
 
@@ -160,8 +161,10 @@ impl Tool for AstGrepTool {
             .unwrap_or_else(|| ctx.workspace.path.clone());
         // Containment: `join` replaces the base for an absolute argument and
         // does not normalize `..`, so an agent-supplied path can leave the
-        // workspace. Same guard the write tools use (ISSUES.md I-22).
-        if !crate::path_scope::is_inside(&ctx.workspace.path, &search_path) {
+        // workspace. Same guard the write tools use (ISSUES.md I-22), widened
+        // to the run's read roots.
+        let roots = crate::path_scope::Roots::of(&ctx.workspace);
+        let Some(resolved) = roots.readable(&search_path) else {
             return Ok(ToolOutput {
                 stdout: String::new(),
                 error: Some(format!(
@@ -172,7 +175,7 @@ impl Tool for AstGrepTool {
                 derived: None,
                 structured: None,
             });
-        }
+        };
 
         let out = Command::new(ast_grep)
             .arg("run")
@@ -181,7 +184,7 @@ impl Tool for AstGrepTool {
             .arg("--lang")
             .arg(&i.lang)
             .arg("--json=stream")
-            .arg(&search_path)
+            .arg(&resolved)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
@@ -229,6 +232,7 @@ impl Tool for AstGrepTool {
                 if raw_path.is_empty() {
                     continue;
                 }
+                let raw_path = &crate::path_scope::as_given(raw_path, &resolved, &search_path);
                 let start = obj.get("range").and_then(|r| r.get("start"));
                 let line0 = start.and_then(|s| s.get("line")).and_then(Value::as_u64);
                 let col0 = start.and_then(|s| s.get("column")).and_then(Value::as_u64);
@@ -315,6 +319,9 @@ impl Tool for AstGrepTool {
             }
 
             for (path, matched_lines) in by_file {
+                if !roots.is_target(&ctx.workspace.path.join(&path)) {
+                    continue;
+                }
                 let match_count = matched_lines.len() as u32;
                 emit(
                     ctx,

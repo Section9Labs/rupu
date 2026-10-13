@@ -776,7 +776,8 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                     messages,
                     seed_source,
                     stopped_on,
-                } => Some((messages, seed_source, stopped_on)),
+                    loaded_skills,
+                } => Some((messages, seed_source, stopped_on, loaded_skills)),
             }
         }
     };
@@ -1086,7 +1087,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             None => {}
             // A failed run continued on another model: the note says why the
             // last attempt stopped and what this one runs on.
-            Some((messages, seed_source, Some(stopped_on))) => {
+            Some((messages, seed_source, Some(stopped_on), loaded_skills)) => {
                 let note = rupu_agent::recovery::recovery_retry_note(
                     &stopped_on.title,
                     &prepared.provider_name,
@@ -1096,11 +1097,17 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                     &mut prompt,
                     messages,
                     seed_source,
+                    loaded_skills,
                     note,
                 );
             }
-            Some((messages, seed_source, None)) => {
-                rupu_agent::continuation::apply_continuation(&mut prompt, messages, seed_source);
+            Some((messages, seed_source, None, loaded_skills)) => {
+                rupu_agent::continuation::apply_continuation(
+                    &mut prompt,
+                    messages,
+                    seed_source,
+                    loaded_skills,
+                );
             }
         }
 
@@ -1410,12 +1417,14 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
 }
 
 /// What `rupu run --continue` picks up: the rebuilt conversation, the
-/// transcript it is seeded from, and — for a failed run continued on another
-/// model — the outcome it failed on.
+/// transcript it is seeded from, — for a failed run continued on another
+/// model — the outcome it failed on, and the skills the conversation had
+/// loaded.
 type ResumeFrom = (
     Vec<rupu_providers::types::Message>,
     std::path::PathBuf,
     Option<rupu_transcript::OutcomeRecord>,
+    Vec<rupu_agent::LoadedSkill>,
 );
 
 /// A standalone run that did not do its job: the text recorded as the run's

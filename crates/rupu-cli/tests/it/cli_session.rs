@@ -678,3 +678,96 @@ async fn session_prune_dry_run_uses_config_default() {
 
     assert!(home.join("sessions-archive/ses_cfg01").exists());
 }
+
+/// Until sessions carry skills (Agent Skills Plan 3), a session refuses an
+/// agent that declares them rather than run it without them.
+fn refusal(agent: &str) -> String {
+    format!(
+        "agent `{agent}` declares skills; sessions do not support skills yet (Agent Skills \
+         Plan 3) — run it with `rupu run`, or remove its skill keys"
+    )
+}
+
+fn write_agent(home: &std::path::Path, name: &str, keys: &str) {
+    let agents = home.join("agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join(format!("{name}.md")),
+        format!("---\nname: {name}\nprovider: anthropic\nmodel: claude-sonnet-4-6\n{keys}\n---\nYou are a test agent.\n"),
+    )
+    .unwrap();
+}
+
+fn install_skill(home: &std::path::Path, name: &str) {
+    let dir = home.join("skills").join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: d.\n---\nx\n"),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn session_start_refuses_an_agent_that_declares_skills() {
+    let _guard = ENV_LOCK.lock().await;
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    install_skill(&home, "pdf");
+    // Installed, uninstalled and preloaded: each is refused the same way.
+    write_agent(&home, "with-skill", "skills: [pdf]");
+    write_agent(&home, "with-missing", "skills: [not-installed]");
+    write_agent(&home, "with-preload", "preloadSkills: [pdf]");
+    for agent in ["with-skill", "with-missing", "with-preload"] {
+        Command::cargo_bin("rupu")
+            .unwrap()
+            .env("RUPU_HOME", &home)
+            .env_remove("FORCE_COLOR")
+            .env_remove("CLICOLOR_FORCE")
+            .current_dir(&work)
+            .args(["session", "start", agent, "--mode", "bypass"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(refusal(agent)));
+    }
+    assert!(
+        !home.join("sessions").exists()
+            || std::fs::read_dir(home.join("sessions"))
+                .unwrap()
+                .next()
+                .is_none()
+    );
+}
+
+/// A session started before `session start` refused skills: its turn fails
+/// with the refusal instead of running the agent without them.
+#[tokio::test]
+async fn a_session_turn_refuses_an_agent_that_declares_skills() {
+    let _guard = ENV_LOCK.lock().await;
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    write_session(&home, "ses_skills", "idle", None, false);
+    install_skill(&home, "pdf");
+    write_agent(&home, "issue-reader", "skills: [pdf]");
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
+        .current_dir(tmp.path())
+        .args([
+            "session",
+            "_run-turn",
+            "--session-id",
+            "ses_skills",
+            "--run-id",
+            "run_skills1",
+            "--prompt",
+            "hi",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(refusal("issue-reader")));
+}

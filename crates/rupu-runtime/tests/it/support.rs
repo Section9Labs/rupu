@@ -70,6 +70,25 @@ impl Home {
         .unwrap();
     }
 
+    /// Install `<global>/skills/<name>` with a reference and a script.
+    pub fn skill(&self, name: &str, description: &str, body: &str) -> PathBuf {
+        let d = self.global().join("skills").join(name);
+        std::fs::create_dir_all(d.join("references")).unwrap();
+        std::fs::create_dir_all(d.join("scripts")).unwrap();
+        std::fs::write(
+            d.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {description}\n---\n{body}\n"),
+        )
+        .unwrap();
+        std::fs::write(d.join("references/REF.md"), "reference text\n").unwrap();
+        std::fs::write(
+            d.join("scripts/hello.sh"),
+            "#!/bin/sh\necho hello-from-skill\n",
+        )
+        .unwrap();
+        d
+    }
+
     pub fn binding(&self) -> WorkspaceBinding {
         WorkspaceBinding {
             id: "ws_test".into(),

@@ -34,6 +34,8 @@ rustix = { workspace = true, features = ["process"] }
 rupu-agent = { path = "../rupu-agent" }
 rupu-providers = { path = "../rupu-providers" }
 rupu-tools = { path = "../rupu-tools" }
+# The lead's skills, resolved once per flow. A leaf crate.
+rupu-skills = { workspace = true }
 # RunTriggerSource (the persisted record's `trigger`). rupu-runtime does not
 # depend on rupu-agentiflow, so this edge is acyclic too.
 rupu-runtime = { path = "../rupu-runtime" }

@@ -436,6 +436,7 @@ async fn run_pause_then_resume_completes() {
             paused_steps: vec![PausedStep {
                 step_id: "solo".into(),
                 seed_messages: seed,
+                loaded_skills: Vec::new(),
             }],
             rejected_reason: None,
             ..Default::default()
@@ -2181,6 +2182,7 @@ async fn a_continuation_wins_over_a_paused_step_seed() {
             vec![PausedStep {
                 step_id: "second".into(),
                 seed_messages: vec![Message::user("STALE-PAUSED-SEED")],
+                loaded_skills: Vec::new(),
             }],
         )
         .await;
@@ -2229,6 +2231,7 @@ async fn a_restart_leaves_a_paused_step_seed_in_charge() {
             vec![PausedStep {
                 step_id: "second".into(),
                 seed_messages: vec![Message::user("Process b")],
+                loaded_skills: Vec::new(),
             }],
         )
         .await;
@@ -2282,4 +2285,159 @@ async fn a_continued_step_is_not_gated_again() {
     );
     assert_eq!(step_outputs(&res)[1], ("second".into(), "b done".into()));
     assert!(sent_text(&factory.requests("Process b")[0]).contains(CONTINUATION_NOTE));
+}
+
+// ---------------------------------------------------------------------------
+// A paused step keeps the skills it loaded.
+// ---------------------------------------------------------------------------
+
+/// One step on `notes`-granted agents: each launch takes the next provider
+/// and records its transcript path.
+struct SkilledFactory {
+    providers: Mutex<Vec<Box<dyn LlmProvider>>>,
+    global: PathBuf,
+    transcripts: Arc<Mutex<Vec<PathBuf>>>,
+}
+#[async_trait]
+impl StepFactory for SkilledFactory {
+    async fn launch_for_step(
+        &self,
+        request: rupu_orchestrator::StepRequest,
+    ) -> Result<rupu_orchestrator::StepLaunch, rupu_runtime::assembly::AssembleError> {
+        self.transcripts
+            .lock()
+            .unwrap()
+            .push(request.transcript_path.clone());
+        rupu_orchestrator::testing::MockRun {
+            agent_name: request.agent_name.clone(),
+            agent_tools: Some(Vec::new()),
+            agent_skills: Some(vec!["notes".into()]),
+            provider: self.providers.lock().unwrap().remove(0),
+            no_stream: true,
+            suppress_stream_stdout: true,
+            assembler: Some(rupu_orchestrator::testing::assembler_at(&self.global)),
+            ..Default::default()
+        }
+        .launch(request)
+    }
+}
+
+/// A step that loaded a skill and paused mid-run resumes with that skill in
+/// its loaded set: the resumed attempt records it as carried over
+/// (`skill_load { via: continuation }`), so its compactions re-attach it.
+#[tokio::test]
+async fn a_paused_step_resumes_with_the_skills_it_loaded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let global = tmp.path().join("home");
+    let skill = global.join("skills/notes");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: notes\ndescription: Take notes.\n---\nWrite notes.\n",
+    )
+    .unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let wf = Workflow::parse(WF_SOLO).unwrap();
+    let token = CancellationToken::new();
+    let load = MockProvider::new(vec![ScriptedTurn::AssistantToolUse {
+        text: None,
+        tool_id: "t1".into(),
+        tool_name: "skills.load".into(),
+        tool_input: serde_json::json!({ "name": "notes" }),
+        stop: StopReason::ToolUse,
+    }]);
+    let transcripts = Arc::new(Mutex::new(Vec::new()));
+    let factory = |providers: Vec<Box<dyn LlmProvider>>| {
+        Arc::new(SkilledFactory {
+            providers: Mutex::new(providers),
+            global: global.clone(),
+            transcripts: Arc::clone(&transcripts),
+        })
+    };
+    let opts = |factory: Arc<SkilledFactory>, pause, resume_from| OrchestratorRunOpts {
+        run_step: Default::default(),
+        workflow: wf.clone(),
+        inputs: BTreeMap::new(),
+        workspace_id: "ws_skills".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory,
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(Arc::clone(&store)),
+        workflow_yaml: Some(WF_SOLO.to_string()),
+        resume_from,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        action_services: None,
+        pause,
+        naming: None,
+    };
+
+    let res1 = run_workflow(opts(
+        factory(vec![Box::new(CancelAfterInner {
+            inner: load,
+            token: token.clone(),
+        })]),
+        Some(token),
+        None,
+    ))
+    .await
+    .expect("phase 1 pauses");
+    let awaiting = res1.awaiting.clone().expect("the run pauses");
+    assert_eq!(awaiting.paused_steps.len(), 1);
+
+    // Resume the way `rupu workflow resume` does: from what is on disk.
+    let mut record = store.load(&res1.run_id).unwrap();
+    record.status = RunStatus::Running;
+    store.update(&record).unwrap();
+    let paused_steps = store.read_paused_seeds(&res1.run_id, None).unwrap();
+    assert_eq!(
+        paused_steps
+            .iter()
+            .map(|p| (p.step_id.as_str(), p.loaded_skills.len()))
+            .collect::<Vec<_>>(),
+        vec![("solo", 1)]
+    );
+    let done = MockProvider::new(vec![ScriptedTurn::AssistantText {
+        text: "done".into(),
+        stop: StopReason::EndTurn,
+        input_tokens: 1,
+        output_tokens: 1,
+    }]);
+    let res2 = run_workflow(opts(
+        factory(vec![Box::new(done)]),
+        None,
+        Some(ResumeState {
+            run_id: res1.run_id.clone(),
+            reason: PauseReason::Manual,
+            paused_steps,
+            ..Default::default()
+        }),
+    ))
+    .await
+    .expect("the resume completes");
+    assert!(res2.awaiting.is_none());
+
+    let resumed = transcripts.lock().unwrap()[1].clone();
+    let loads: Vec<(String, String)> = std::fs::read_to_string(resumed)
+        .unwrap()
+        .lines()
+        .filter_map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap();
+            (v["type"] == "skill_load").then(|| {
+                (
+                    v["data"]["name"].as_str().unwrap().to_string(),
+                    v["data"]["via"].as_str().unwrap().to_string(),
+                )
+            })
+        })
+        .collect();
+    assert_eq!(
+        loads,
+        vec![("notes".to_string(), "continuation".to_string())]
+    );
 }

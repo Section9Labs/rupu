@@ -95,3 +95,50 @@ pub fn render_load_result(v: &LoadView<'_>) -> String {
     }
     out
 }
+
+/// Opens the block compaction re-attaches (spec §6). `compact_messages`
+/// skips a text block that starts with it when it rebuilds the task text,
+/// so a second compaction never copies the block.
+pub const REATTACH_MARKER: &str = "<skills-in-use>";
+
+/// Leads a `skills.load` result for a skill that changed on disk since the
+/// run's index was built.
+pub const CHANGED_NOTE: &str =
+    "This skill changed on disk since this run started; this is its current version.";
+
+pub struct ReattachItem<'a> {
+    pub name: &'a str,
+    pub base_dir: &'a Path,
+    pub body: &'a str,
+}
+
+pub fn render_reattach(items: &[ReattachItem<'_>], omitted: &[&str], missing: &[&str]) -> String {
+    let mut out = format!(
+        "{REATTACH_MARKER}\nYou loaded these skills earlier in this run. Their instructions follow at their current version; keep following them."
+    );
+    for i in items {
+        out.push_str(&format!(
+            "\n\n## Skill: {}\n\nBase directory: {}",
+            i.name,
+            i.base_dir.display()
+        ));
+        if !i.body.is_empty() {
+            out.push_str("\n\n");
+            out.push_str(i.body);
+        }
+    }
+    if !omitted.is_empty() || !missing.is_empty() {
+        out.push('\n');
+    }
+    if !omitted.is_empty() {
+        out.push_str(&format!(
+            "\nNot re-attached for space (reload with `skills.load` when you need them): {}",
+            omitted.join(", ")
+        ));
+    }
+    if !missing.is_empty() {
+        out.push_str(&format!("\nNo longer installed: {}", missing.join(", ")));
+    }
+    out.push_str(&format!("\n</{}", &REATTACH_MARKER[1..]));
+    out
+}

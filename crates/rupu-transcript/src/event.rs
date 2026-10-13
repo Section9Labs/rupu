@@ -40,6 +40,8 @@ const KNOWN_EVENT_TAGS: &[&str] = &[
     "recovery",
     "assistant_block",
     "tool_grant",
+    "skill_index",
+    "skill_load",
 ];
 
 /// One tool in a [`Event::ToolGrant`]: its canonical name and why it was
@@ -57,6 +59,21 @@ pub struct ToolGrantEntry {
 pub struct ToolGrantMissing {
     pub tool: String,
     pub missing: Vec<String>,
+}
+
+/// One skill in a [`Event::SkillIndex`]: the name it binds, its layer
+/// (`global` / `project`), its stamp at run start (a later load compares
+/// against it), whether its body is preloaded, whether the model's index
+/// lists it (`false` when preloaded or `disable-model-invocation`), and why
+/// the run has it (`agent`, `step`, `session`, `operator`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillIndexEntry {
+    pub name: String,
+    pub layer: String,
+    pub stamp: String,
+    pub preload: bool,
+    pub indexed: bool,
+    pub reason: String,
 }
 
 fn is_zero_u32(v: &u32) -> bool {
@@ -277,6 +294,21 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         skipped: Vec<ToolGrantMissing>,
     },
+    /// The skills a run bound, written once after `tool_grant` when the
+    /// run has any.
+    SkillIndex {
+        skills: Vec<SkillIndexEntry>,
+    },
+    /// A skill's content entered the conversation. `via` is `model`
+    /// (`skills.load`), `preload`, `operator`, `reattach` (after a
+    /// compaction) or `continuation` (carried from a continued run).
+    SkillLoad {
+        name: String,
+        layer: String,
+        content_hash: String,
+        base_dir: String,
+        via: String,
+    },
     /// One outbound network flow attributed to this run.
     ///
     /// Phase 1 covers rupu's OWN egress — provider APIs, SCM connectors,
@@ -342,7 +374,9 @@ pub enum Event {
     /// A runtime intervention worth showing but not part of the
     /// conversation: `kind` ∈ {"context_trim", "provider_retry",
     /// "model_limits", "model_limits_clamped", "permission_mode_degraded",
-    /// "tool_unavailable"} today.
+    /// "tool_unavailable", "skill_not_indexed", "skill_changed",
+    /// "skill_missing", "skill_tools_missing", "skill_reattach_truncated"}
+    /// today.
     Notice {
         kind: String,
         message: String,
@@ -753,6 +787,29 @@ mod tests {
                     skipped: vec![],
                 },
                 "tool_grant",
+            ),
+            (
+                Event::SkillIndex {
+                    skills: vec![SkillIndexEntry {
+                        name: "pdf".into(),
+                        layer: "global".into(),
+                        stamp: "ab".repeat(32),
+                        preload: false,
+                        indexed: true,
+                        reason: "agent".into(),
+                    }],
+                },
+                "skill_index",
+            ),
+            (
+                Event::SkillLoad {
+                    name: "pdf".into(),
+                    layer: "global".into(),
+                    content_hash: "cd".repeat(32),
+                    base_dir: "/h/skills/pdf".into(),
+                    via: "model".into(),
+                },
+                "skill_load",
             ),
         ] {
             let s = serde_json::to_string(&e).unwrap();

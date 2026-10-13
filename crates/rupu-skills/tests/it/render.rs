@@ -250,3 +250,27 @@ fn an_over_limit_index_description_is_cut_at_1024_chars() {
     assert_eq!(lines[0], format!("- long: {}…", "é".repeat(1024)));
     assert_eq!(lines[1], format!("- exact: {exact}"));
 }
+
+#[test]
+fn reattach_block_is_exact() {
+    use rupu_skills::render::{render_reattach, ReattachItem, REATTACH_MARKER};
+    let got = render_reattach(
+        &[ReattachItem {
+            name: "pdf",
+            base_dir: Path::new("/h/skills/pdf"),
+            body: "Step one.",
+        }],
+        &["docx"],
+        &["gone"],
+    );
+    assert_eq!(
+        got,
+        "<skills-in-use>\n\
+You loaded these skills earlier in this run. Their instructions follow at their current version; keep following them.\n\n\
+## Skill: pdf\n\nBase directory: /h/skills/pdf\n\nStep one.\n\n\
+Not re-attached for space (reload with `skills.load` when you need them): docx\n\
+No longer installed: gone\n\
+</skills-in-use>"
+    );
+    assert!(got.starts_with(REATTACH_MARKER));
+}

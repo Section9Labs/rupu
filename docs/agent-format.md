@@ -77,6 +77,8 @@ Everything after the closing `---` is the system prompt.
 | `fallbacks` | array of `{model, provider?}` | no | `[recovery].fallbacks` from config, else none | Ordered fallback models tried when a reply cannot be used (a refusal, say). Wins over the config table; not merged with it. See [response-outcomes.md](response-outcomes.md#3-configuring-fallbacks) |
 | `maxTokens` | integer | no | discovered output cap | Per-request output-token cap. Overrides the cap discovered from the provider's model list; when neither is known, Anthropic gets `8192` and other providers get no cap (model max). `0` is ignored. Extended thinking (`effort`) draws from this budget |
 | `contextWindowTokens` | integer | no | discovered input limit | Input-token limit used for proactive compaction. Overrides the discovered limit; compaction is off only when neither is known. `0` is ignored |
+| `skills` | array\<string\> | no | none | Skills the model may load with `skills.load`; see [`skills` and `preloadSkills`](#skills-and-preloadskills) |
+| `preloadSkills` | array\<string\> | no | none | Skills whose whole body goes into the system prompt; implies granted |
 | `compactAtPercent` | integer | no | `80` | Percentage of the input limit at which compaction triggers; clamped to `[10, 95]`. When the output cap is known and shares the input window, compaction also triggers early enough that a full-length reply still fits |
 
 ---
@@ -455,6 +457,36 @@ fallbacks:
 ```
 
 The list replaces `[recovery].fallbacks` from `config.toml` for this agent; it is not merged with it, and `fallbacks: []` means no fallbacks. Unknown keys inside an entry are an error. A rupu release that predates `fallbacks:` refuses to load an agent file that sets it, so upgrade remote hosts before adding it. A cross-provider entry sends the conversation to that provider; see [response-outcomes.md](response-outcomes.md#3-configuring-fallbacks) for the ladder, the rung split and that data-handling note.
+
+### `skills` and `preloadSkills`
+
+Grant the agent [Agent Skills](skills.md) installed under `~/.rupu/skills/` or the project's `.rupu/skills/`. Installing a skill gives it to no agent: an agent without these keys has no skills, no skill index and no `skills.load` tool.
+
+```yaml
+skills: [pdf, code-review]     # listed in the prompt; the model loads one when a task matches it
+preloadSkills: [house-style]   # its whole body is in the system prompt from the start
+```
+
+Each entry is one of:
+
+| Entry | Grants |
+|---|---|
+| `code-review` | the skill of that name in whichever layer has it. If both the global and the project layer have it, the agent fails to load until the entry names a layer. |
+| `global:code-review`, `project:code-review` | that layer's skill |
+| `*` | every valid global skill (never a project skill) |
+| `project:*` | every valid project skill |
+
+A run binds each name once, so granting the same name from both layers (`global:x` and `project:x`, or `*` and `project:*` over a name in both) is an error. An unknown name, an invalid skill or a malformed entry fails the agent's load with a did-you-mean, and `rupu agent validate` reports the same. A skill deleted after the agent loaded fails the run at launch, with the directories rupu looked in.
+
+A granted skill reaches the run as:
+
+- **The index.** Each skill in `skills:` is listed under `## Skills` in the system prompt, after the agent's body and any `## Run target`, with its description. The model calls `skills.load` with a name to get the skill's instructions, base directory and file list.
+- **Preloaded bodies.** Each skill in `preloadSkills:` is rendered in full under `## Skill: <name>`, ahead of the index, and is not listed in it.
+- **Its files.** `read_file`, `grep`, `glob` and `ast_grep` may read under a granted skill's directory even outside the workspace; `write_file` and `edit_file` may not. A skill's scripts run through `bash`, under the run's permission mode.
+
+A skill never widens the agent's `tools:` grant or its permission mode. A skill whose `allowed-tools` names a tool the run lacks still loads, with a `skill_tools_missing` notice. A skill marked `disable-model-invocation: true` is reachable only by preloading it; granted in `skills:` alone, it writes a `skill_not_indexed` notice, and when no granted skill is loadable the run gets no `skills.load`.
+
+A sub-agent started with `dispatch_agent` gets its own agent file's skills, never its parent's. `rupu session start` refuses an agent that declares skills until sessions support them. A rupu release that predates these keys refuses to load an agent file that sets them, so upgrade remote hosts first.
 
 ### `maxTokens`
 

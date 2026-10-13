@@ -107,6 +107,7 @@ async fn a_terminating_process_starts_no_compaction_summariser_call() {
                     initial_messages: history(),
                     seed_source: None,
                     turn_index_offset: 0,
+                    loaded_skills: Vec::new(),
                 },
                 provider: Box::new(provider),
                 limits: ModelLimits::fixed(1_000, 100),

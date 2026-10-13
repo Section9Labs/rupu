@@ -31,8 +31,8 @@ pub struct RunGrantInputs<'a> {
 }
 
 /// Resolve a run's grant (W2): the agent's `tools:`, the step's `actions:`,
-/// the ambient grants (`concerns:`, an engagement, the origin's grant,
-/// injected tools) and the run's services.
+/// the ambient grants (`concerns:`, an engagement, skills, the origin's
+/// grant, injected tools) and the run's services.
 pub fn resolve_run_grant(inputs: RunGrantInputs<'_>) -> Result<ResolvedGrant, GrantError> {
     let ctx = inputs.tool_context;
     let injected: Vec<_> = inputs.injected.iter().map(|t| t.descriptor()).collect();
@@ -48,6 +48,14 @@ pub fn resolve_run_grant(inputs: RunGrantInputs<'_>) -> Result<ResolvedGrant, Gr
     }
     if engagement {
         ambient.push(AmbientGrant::engagement());
+    }
+    if ctx
+        .services
+        .skills
+        .as_ref()
+        .is_some_and(|s| s.has_loadable())
+    {
+        ambient.push(AmbientGrant::skills());
     }
     if let Some(origin) = inputs.origin {
         ambient.push(origin.clone());

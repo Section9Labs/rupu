@@ -139,7 +139,7 @@ A run binds each name once: a grant set that picks the same name from both layer
 
 The collision rule is deliberate. If a bare name preferred the project copy, a repo could replace a global skill an agent relies on, scripts included. If it preferred the global copy, a project author could never override one. Refusing the ambiguity makes the author choose, and the transcript records the layer either way.
 
-Validation joins `validate_tools` in `load_agent` (`crates/rupu-agent/src/loader.rs:88`). A malformed entry, an unknown or invalid name, or an unqualified collision is `AgentLoadError::Skill`, with a did-you-mean. `check_agent_files` (`rupu agent validate`) checks the same. `load_agents` and `find_agent` still only parse. Every `AgentSpec` struct literal, `session_agent_spec` (`crates/rupu-cli/src/cmd/session.rs:7750`) among them, gains the fields.
+Validation joins `validate_tools` in `load_agent` (`crates/rupu-agent/src/loader.rs:88`). It reads only the skills directories' listings: a malformed entry, a name no layer has, or an unqualified name in both layers is `AgentLoadError::Skill`, with a did-you-mean and, for an unknown name, where it looked and `rupu skill install`. Whether a named skill is valid, and whether the set binds a name twice, is the assembler's to say, so a launch loads each skill once. `check_agent_files` (`rupu agent validate`) resolves in full. `load_agents` and `find_agent` still only parse. Every `AgentSpec` struct literal, `session_agent_spec` (`crates/rupu-cli/src/cmd/session.rs:7750`) among them, gains the fields.
 
 Load-time validation is a convenience. The assembler resolves `ResolvedSkills` itself and fails closed (`AssembleError::Skill`, recorded through `record_unstarted`), because some specs never pass through `load_agent`: a session turn's spec is rebuilt from its record.
 
@@ -147,9 +147,9 @@ Load-time validation is a convenience. The assembler resolves `ResolvedSkills` i
 
 `Step` (`crates/rupu-orchestrator/src/workflow.rs:1049`) gains `skills: Vec<String>` and `preload_skills: Vec<String>`. They add to the grant of every agent the step launches: the step's agent, its `for_each` units, its parallel and panel members, a panel gate's `fix_with` agent, and loop members. They never remove a skill.
 
-Workflow parsing stays pure: it checks only entry syntax, so a workflow's validity never depends on what a host has installed. Existence is checked when the step launches, in `DefaultStepFactory::launch_for_step`, the way a missing agent is (`AssembleError::AgentLoad`). The skills travel on `Origin::WorkflowStep` next to `step_actions` (`crates/rupu-orchestrator/src/step_factory.rs:101`).
+Workflow parsing stays pure: it checks only entry syntax, so a workflow's validity never depends on what a host has installed. Existence is checked when the step launches, in `DefaultStepFactory::launch_for_step`, the way a missing agent is (`AssembleError::AgentLoad`). The skills travel on `Overrides.skills` / `Overrides.preload_skills` and resolve with reason `step`, not on `Origin::WorkflowStep`. `rupu run --skill` (Plan 2b) fills the same fields, which is why they live on `Overrides` rather than on one origin.
 
-There is no workflow-level `skills:`. A workflow that wants a skill on every step names it per step, or on the agents. When yokoito replaces workflow definitions, its integration maps its own step key onto the same `Origin::WorkflowStep` fields.
+There is no workflow-level `skills:`. A workflow that wants a skill on every step names it per step, or on the agents. When yokoito replaces workflow definitions, its integration maps its own step key onto the same `Overrides` fields.
 
 ### 2.3 Other launch kinds
 
@@ -178,7 +178,7 @@ pub struct GrantedSkill {
 }
 ```
 
-The skills service (`ToolServices.skills: Option<Arc<ResolvedSkills>>`, `Service::Skills`, with its arm in `ToolServices::provided`) is present when `entries` is non-empty. `AmbientGrant::skills()` then offers `skills.load` as `Ambient("skills")`. An agent with no skills gets no loader tool and no index. `actions:` never narrows it, since it is not a connector tool.
+`ToolServices.skills: Option<Arc<ResolvedSkills>>` is set when `entries` is non-empty, and the read roots and preloaded bodies follow from it. `Service::Skills` (its arm in `ToolServices::provided`) is provided, and `AmbientGrant::skills()` offers `skills.load` as `Ambient("skills")`, only when at least one entry is model-loadable: indexed, preloaded or an operator's. A run whose every skill is `disable-model-invocation` and not preloaded keeps its skills but gets no loader. An agent with no skills gets no loader tool and no index. `actions:` never narrows it, since it is not a connector tool.
 
 The assembler resolves `skills:` and `preloadSkills:` (and step skills) in ONE `resolve_grants` call over their union and marks preload by membership, so `skills: [global:x]` with `preloadSkills: [project:x]` is caught as binding `x` twice.
 
@@ -248,7 +248,7 @@ In Claude Code, `allowed-tools` pre-approves tools while a skill is active. In r
 Two new events in `rupu-transcript` (the `Event` enum at `crates/rupu-transcript/src/event.rs:73`; both tags added to `KNOWN_EVENT_TAGS` at `:17`; both documented in `docs/transcript-schema.md`):
 
 - **`skill_index`**, written once at run start after `tool_grant`: one row per granted skill with name, layer, stamp, `preload`, `indexed` and reason.
-- **`skill_load`**: name, layer, content hash, base directory, and `via`: `model` (a `skills.load` call), `preload`, `operator` (§5.2) or `reattach` (§6). Written for every load, whichever path made it.
+- **`skill_load`**: name, layer, content hash, base directory, and `via`: `model` (a `skills.load` call), `preload`, `operator` (§5.2), `reattach` (§6) or `continuation` (a skill the continued run had loaded, carried into the new run at its start). Written for every load, whichever path made it.
 
 `skills.load` calls also get the usual `tool_audit` line. New notice kinds: `skill_not_indexed`, `skill_changed`, `skill_missing`, `skill_tools_missing`, `skill_reattach_truncated`. `rupu transcript` and the CP transcript view render both events with the shared one-line renderers, as `tool_grant` does.
 
@@ -382,6 +382,7 @@ Shipping skill content with a dispatch is a later option if this proves painful.
 | Situation | Result |
 |---|---|
 | `skills:` or `preloadSkills:` names an unknown or invalid skill, or an unqualified name in both layers | agent load error with did-you-mean (`rupu agent validate` catches it); the assembler refuses the same at launch |
+| a `SKILL.md` over 1 MiB | the skill is invalid (`SkillError::TooLarge`, with its size): `rupu skill validate` shows it and a run granted it fails closed. The files beside it have no limit |
 | step `skills:` entry malformed | workflow parse error |
 | step `skills:` names a skill not installed | step recorded unstarted, like a missing agent |
 | skill missing on a remote host | unit recorded unstarted, message names the host and the fix |
@@ -411,6 +412,8 @@ Shipping skill content with a dispatch is a later option if this proves painful.
 ## 12. Plans
 
 1. **Model and CLI.** `rupu-skills` (model, validation, discovery, fingerprints, renderers, sources, source records) and `rupu skill list|show|validate|install|update`.
-2. **Runs.** Agent and step keys, load-time validation, `ResolvedSkills` in the assembler, the index and preload rendering, `Service::Skills` and `skills.load`, read roots, transcript events and notices, compaction re-attach and replay, and the placed-unit `--skill` flags and `agent.skills` capability. Covers every origin but sessions.
+2. **Runs**, split in two:
+   - **2a, runs.** Agent keys, load-time validation, `ResolvedSkills` in the assembler, the index and preload rendering, `Service::Skills` and `skills.load`, read roots, transcript events and notices, compaction re-attach, and replay and continuation keeping the loaded set. Covers every origin but sessions, with skills from the agent (and `Overrides`). Until Plan 3, a session refuses an agent that declares skills.
+   - **2b, workflow steps and placed units.** Step `skills:` / `preloadSkills:`, the placed-unit `--skill` flags and the `agent.skills` capability.
 3. **Sessions.** Record fields, `session start --skill`, `session send --skill`.
 4. **CP.** API fields and endpoints, then the web Library tab, agent picker, transcript rendering and session composer action (stops for the visual check).

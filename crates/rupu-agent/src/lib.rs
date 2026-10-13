@@ -44,13 +44,13 @@ pub use collector::{
 pub use fd_budget::load_agent_admitted;
 pub use loader::{
     check_agent_files, find_agent, load_agent, load_agents, AgentFileCheck, AgentLayer,
-    AgentLoadError,
+    AgentLoadError, SkillCheckError,
 };
 pub use permission::{resolve_mode, PermissionPrompt};
 pub use recovery::{Hop, HopBuilder, RecoveryOpts};
 pub use runner::{
     compact_messages, record_unstarted_run, run_agent, run_agent_full, run_agent_with_limits,
-    AgentPins, AgentRunOpts, CompactionError, CompactionOutcome, Hooks, MockProvider,
+    AgentPins, AgentRunOpts, CompactionError, CompactionOutcome, Hooks, LoadedSkill, MockProvider,
     OnStreamEventCallback, OnToolCallCallback, OnUsageCallback, RunConcerns, RunError, RunExit,
     RunResult, ScriptedTurn, StreamOpts, UnstartedRun, UsageKind, UsageTurn, UserTurn,
 };

@@ -38,7 +38,8 @@
  *     block shape.
  *   • `gate_requested` / `seed` / `user_message` / `notice` / `compaction` /
  *     `outcome` / `recovery` / `assistant_block` each become their own block
- *     kind. Anything else
+ *     kind; `tool_grant` / `skill_index` / `skill_load` become `meta` rows
+ *     carrying the CLI's one-line text (`lib/transcriptLines`). Anything else
  *     unrecognised becomes an `unknown` block carrying the raw event `type`
  *     and its `data` — nothing is ever
  *     silently dropped, EXCEPT `net_flow`: TranscriptSink appends one into
@@ -60,6 +61,7 @@
 
 import type { TranscriptEvent, OutcomeSeverity } from '../../lib/transcript';
 import { assistantBlockLine, recoveryLine } from '../../lib/outcome';
+import { skillIndexLine, skillLoadLine, toolGrantLine } from '../../lib/transcriptLines';
 
 // ---------------------------------------------------------------------------
 // View model
@@ -163,6 +165,7 @@ export type TurnBlock =
   | { kind: 'gate'; gateId: string; prompt: string; decision: string | null; decidedBy: string | null }
   | { kind: 'seed'; messageCount: number; sourceTranscript: string | null }
   | { kind: 'notice'; noticeKind: string; message: string }
+  | { kind: 'meta'; label: 'tools' | 'skills'; text: string }
   | { kind: 'compaction'; seq: number; summarized: number }
   | { kind: 'outcome'; severity: OutcomeSeverity; title: string; detail: string | null }
   | { kind: 'recovery'; text: string }
@@ -226,6 +229,14 @@ function asLineRange(v: unknown): [number, number] | undefined {
 function asStringArray(v: unknown): string[] {
   if (!Array.isArray(v)) return [];
   return v.filter((x): x is string => typeof x === 'string');
+}
+
+function asRecordArray(v: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(v)) return [];
+  return v.flatMap((x) => {
+    const r = asRecord(x);
+    return r ? [r] : [];
+  });
 }
 
 /**
@@ -510,6 +521,50 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
           kind: 'notice',
           noticeKind: asString(data.kind) ?? '',
           message: asString(data.message) ?? '',
+        });
+        break;
+      }
+
+      case 'tool_grant': {
+        ensureTurn().blocks.push({
+          kind: 'meta',
+          label: 'tools',
+          text: toolGrantLine(
+            asRecordArray(data.entries).map((e) => ({ tool: asString(e.tool) ?? '' })),
+            asStringArray(data.narrowed),
+            asRecordArray(data.unavailable).map((m) => ({
+              tool: asString(m.tool) ?? '',
+              missing: asStringArray(m.missing),
+            })),
+          ),
+        });
+        break;
+      }
+
+      case 'skill_index': {
+        ensureTurn().blocks.push({
+          kind: 'meta',
+          label: 'skills',
+          text: skillIndexLine(
+            asRecordArray(data.skills).map((e) => ({
+              name: asString(e.name) ?? '',
+              preload: e.preload === true,
+              indexed: e.indexed === true,
+            })),
+          ),
+        });
+        break;
+      }
+
+      case 'skill_load': {
+        ensureTurn().blocks.push({
+          kind: 'meta',
+          label: 'skills',
+          text: skillLoadLine(
+            asString(data.name) ?? '',
+            asString(data.via) ?? '',
+            asString(data.content_hash) ?? '',
+          ),
         });
         break;
       }

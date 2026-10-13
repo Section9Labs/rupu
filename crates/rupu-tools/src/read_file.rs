@@ -5,13 +5,14 @@
 //! were trained on that shape produce well-aligned line references.
 //!
 //! Workspace scope: paths that resolve outside the workspace root
-//! (e.g., via `../`) are refused with `error: Some("path X escapes
+//! (e.g., via `../`) and outside the run's read roots (its skills'
+//! directories) are refused with `error: Some("path X escapes
 //! workspace")` on the ToolOutput. The tool itself returns `Ok(...)` —
 //! the agent sees the error and decides what to do.
 
 use crate::coverage_emit::{attribution_from, emit};
 use crate::descriptor::{Effect, Service, ToolDescriptor};
-use crate::path_scope::is_inside;
+use crate::path_scope::Roots;
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -38,7 +39,7 @@ pub static DESCRIPTOR: ToolDescriptor = ToolDescriptor {
     needs: &[],
     uses: &[Service::Coverage],
     wildcard: true,
-    description: "Read a file from the workspace and return its contents prefixed by 1-based line numbers separated by tabs. Always use this before editing a file so you have current line numbers. Paths are relative to the workspace root; absolute paths and paths that escape the workspace (e.g. `../`) are rejected.",
+    description: "Read a file from the workspace and return its contents prefixed by 1-based line numbers separated by tabs. Always use this before editing a file so you have current line numbers. Paths are relative to the workspace root and may not leave the workspace, except into a skill's base directory (`skills.load` returns it), which may be given as an absolute path.",
     input_schema: descriptor_schema,
 };
 
@@ -66,12 +67,13 @@ impl Tool for ReadFileTool {
         let i: Input =
             serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
         let abs = ctx.workspace.path.join(&i.path);
-        if !is_inside(&ctx.workspace.path, &abs) {
+        let roots = Roots::of(&ctx.workspace);
+        let Some(abs) = roots.readable(&abs) else {
             return Ok(err_output(
                 started,
                 format!("path {} escapes workspace", i.path),
             ));
-        }
+        };
         match std::fs::read_to_string(&abs) {
             Ok(text) => {
                 let line_count = text.lines().count() as u32;
@@ -81,17 +83,19 @@ impl Tool for ReadFileTool {
                     writeln!(out, "{}\t{}", idx + 1, line).expect("write to String never fails");
                 }
                 let end_line = if line_count == 0 { 1 } else { line_count };
-                emit(
-                    ctx,
-                    FileTouchEvent::Read {
-                        path: i.path.clone(),
-                        line_range: [1, end_line],
-                        tool: "read_file".to_string(),
-                        attribution: attribution_from(ctx),
-                        at: Utc::now(),
-                    },
-                )
-                .await;
+                if roots.is_target(&abs) {
+                    emit(
+                        ctx,
+                        FileTouchEvent::Read {
+                            path: i.path.clone(),
+                            line_range: [1, end_line],
+                            tool: "read_file".to_string(),
+                            attribution: attribution_from(ctx),
+                            at: Utc::now(),
+                        },
+                    )
+                    .await;
+                }
                 Ok(ToolOutput {
                     stdout: out,
                     error: None,

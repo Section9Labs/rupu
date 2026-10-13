@@ -162,6 +162,10 @@ pub struct WorkspaceScope {
     /// directory; `bash` runs with this as its cwd.
     pub path: PathBuf,
     pub bash: BashConfig,
+    /// The roots of the run's granted skills, which the fs read tools may
+    /// read even outside the workspace (spec §3.4). Never writable.
+    #[serde(default)]
+    pub read_roots: Vec<PathBuf>,
 }
 
 impl Default for WorkspaceScope {
@@ -170,6 +174,7 @@ impl Default for WorkspaceScope {
             id: String::new(),
             path: PathBuf::from("."),
             bash: BashConfig::default(),
+            read_roots: Vec::new(),
         }
     }
 }
@@ -227,6 +232,10 @@ pub struct ToolServices {
     /// `workflows.list` / `workflows.get` and `catalog.search`. Every launch
     /// site provides one.
     pub catalog: Option<Arc<dyn crate::ports::CatalogPort>>,
+    /// The skills this run was granted (spec §2.4); `skills.load` reads it.
+    /// `Service::Skills` is provided only when the model may load one of
+    /// them.
+    pub skills: Option<Arc<rupu_skills::ResolvedSkills>>,
 }
 
 impl ToolServices {
@@ -267,6 +276,9 @@ impl ToolServices {
         if self.catalog.is_some() {
             s.insert(Service::Catalog);
         }
+        if self.skills.as_ref().is_some_and(|s| s.has_loadable()) {
+            s.insert(Service::Skills);
+        }
         // The agentiflow unit launcher and workflow generator have no body
         // in the catalog until W7: their tools reach a run only injected, as
         // self-served grants.
@@ -303,6 +315,7 @@ impl std::fmt::Debug for ToolServices {
                 &self.run_status.as_ref().map(|_| "<run status>"),
             )
             .field("catalog", &self.catalog.as_ref().map(|_| "<catalog>"))
+            .field("skills", &self.skills.as_ref().map(|s| s.names()))
             .finish()
     }
 }

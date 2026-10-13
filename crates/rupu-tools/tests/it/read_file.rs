@@ -56,3 +56,37 @@ async fn missing_path_input_is_invalid() {
     let res = tool.invoke(json!({}), &ctx(tmp.path())).await;
     assert!(res.is_err());
 }
+
+#[tokio::test]
+async fn a_dotdot_through_a_missing_dir_is_refused() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let ws = tmp.child("ws");
+    ws.create_dir_all().unwrap();
+    tmp.child("outside/f").write_str("secret").unwrap();
+    let out = ReadFileTool
+        .invoke(json!({ "path": "nope/../../outside/f" }), &ctx(ws.path()))
+        .await
+        .unwrap();
+    assert!(
+        out.error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("escapes workspace"),
+        "{:?}",
+        out.error
+    );
+    assert!(!out.stdout.contains("secret"));
+}
+
+#[tokio::test]
+async fn a_dotdot_through_an_existing_dir_still_reads() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    tmp.child("sub").create_dir_all().unwrap();
+    tmp.child("file.txt").write_str("inside\n").unwrap();
+    let out = ReadFileTool
+        .invoke(json!({ "path": "sub/../file.txt" }), &ctx(tmp.path()))
+        .await
+        .unwrap();
+    assert_eq!(out.error, None);
+    assert_eq!(out.stdout, "1\tinside\n");
+}
