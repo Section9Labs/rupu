@@ -362,15 +362,22 @@ async fn steer_needs_a_live_coordinator_and_cp_serve() {
 
     let addr = spawn_server_with(tmp.path(), true).await;
     let (status, body) = steer(addr, LIVE).await;
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(body["queued"], true);
-    assert_eq!(
-        rupu_agentiflow::OperatorQueue::new(&live)
-            .drain()
+    assert_eq!(status, 202, "{body}");
+    assert!(body["id"].as_str().unwrap().starts_with("msg_"), "{body}");
+    let logged = || {
+        rupu_fleet::Bus::open(&live, rupu_fleet::address::OPERATOR)
+            .read_log(None, usize::MAX)
             .unwrap()
-            .len(),
-        1
-    );
+            .lines
+    };
+    match logged().as_slice() {
+        [rupu_fleet::LogLine::Msg(m)] => {
+            assert_eq!(m.kind, rupu_fleet::MessageKind::Operator);
+            assert_eq!(m.body, "focus on auth");
+            assert_eq!(m.via, Some(rupu_fleet::OperatorVia::Cp));
+        }
+        other => panic!("{other:?}"),
+    }
 
     // `running` on disk but the coordinator is dead: nothing would drain it.
     rec.runner_pid = Some(dead_pid());
@@ -381,10 +388,7 @@ async fn steer_needs_a_live_coordinator_and_cp_serve() {
         .as_str()
         .unwrap()
         .contains("no longer running"));
-    assert!(rupu_agentiflow::OperatorQueue::new(&live)
-        .drain()
-        .unwrap()
-        .is_empty());
+    assert_eq!(logged().len(), 1, "nothing more was sent");
 
     // Finished, or unknown.
     seed(tmp.path());

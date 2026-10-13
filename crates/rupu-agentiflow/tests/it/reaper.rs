@@ -139,7 +139,7 @@ fn wait_until_dead(pgid: u32) {
 }
 
 /// A pid that is certainly not running: a child that has exited and been reaped.
-fn a_dead_pid() -> u32 {
+pub(crate) fn a_dead_pid() -> u32 {
     let mut child = Command::new("/bin/sh")
         .args(["-c", "exit 0"])
         .process_group(0)
@@ -155,7 +155,7 @@ fn run_dir(global: &TempDir, id: &str) -> PathBuf {
     agentiflow_dir(global.path()).join(id)
 }
 
-fn write_record(global: &TempDir, id: &str, status: &str, runner_pid: Option<u32>) {
+pub(crate) fn write_record(global: &TempDir, id: &str, status: &str, runner_pid: Option<u32>) {
     let rec = AgentiflowRecord {
         id: id.into(),
         name: "itest".into(),

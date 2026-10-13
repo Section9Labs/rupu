@@ -10,6 +10,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt as _};
 use rupu_orchestrator::runs::RunStore;
+use rupu_runtime::services::operator::{MessagesView, OperatorSendReply, ViewQuery};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -85,6 +86,19 @@ pub struct RunListQuery {
     pub limit: usize,
     /// Optional lifecycle group: `"active"` | `"completed"` | `"failed"`.
     pub lifecycle: Option<String>,
+}
+
+/// An operator message for [`HostConnector::send_operator_message`]: the
+/// body of `POST …/messages`, plus who sent it when the CP knows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorMessageRequest {
+    /// A participant, codename, `role:<agent>`, `step:<id>`, `lead` or
+    /// `broadcast`; `None` is the root's default recipient (an agentiflow's
+    /// lead, everyone elsewhere).
+    pub to: Option<String>,
+    pub body: String,
+    pub urgent: bool,
+    pub viewer: Option<String>,
 }
 
 // ── Error ─────────────────────────────────────────────────────────────────────
@@ -399,6 +413,25 @@ pub trait HostConnector: Send + Sync {
         dest: &Path,
         max_bytes: u64,
     ) -> Result<(), HostConnectorError>;
+
+    /// `id`'s message space as `GET …/messages` serves it (spec F1b §3.6):
+    /// `id` is a workflow, standalone, session or agentiflow id
+    /// ([`crate::host::messages::MessageRoute::of_id`]). A refusal the API
+    /// answers 409 is `Remote(409, _)`. No default: every transport must say
+    /// how, or refuse.
+    async fn list_messages(
+        &self,
+        id: &str,
+        q: ViewQuery,
+    ) -> Result<MessagesView, HostConnectorError>;
+
+    /// Send `msg` into `id`'s message space as its operator (`POST
+    /// …/messages`); errors as [`Self::list_messages`]'s. No default.
+    async fn send_operator_message(
+        &self,
+        id: &str,
+        msg: OperatorMessageRequest,
+    ) -> Result<OperatorSendReply, HostConnectorError>;
 
     /// Generic GET passthrough: issue `GET {base_url}{path_and_query}` (bearer
     /// token attached) and return the parsed JSON body.
@@ -1526,6 +1559,21 @@ pub(crate) mod testing {
                 complete: true,
             })
         }
+        async fn list_messages(
+            &self,
+            _id: &str,
+            _q: rupu_runtime::services::operator::ViewQuery,
+        ) -> Result<rupu_runtime::services::operator::MessagesView, HostConnectorError> {
+            Err(HostConnectorError::Unsupported("fake".into()))
+        }
+        async fn send_operator_message(
+            &self,
+            _id: &str,
+            _msg: crate::host::connector::OperatorMessageRequest,
+        ) -> Result<rupu_runtime::services::operator::OperatorSendReply, HostConnectorError>
+        {
+            Err(HostConnectorError::Unsupported("fake".into()))
+        }
         async fn pull_finding_artifact(
             &self,
             _sha256: &str,
@@ -1623,6 +1671,22 @@ pub(crate) mod testing {
                     bytes: Vec::new(),
                     complete: true,
                 })
+            }
+            async fn list_messages(
+                &self,
+                _id: &str,
+                _q: rupu_runtime::services::operator::ViewQuery,
+            ) -> Result<rupu_runtime::services::operator::MessagesView, HostConnectorError>
+            {
+                Err(HostConnectorError::Unsupported("fake".into()))
+            }
+            async fn send_operator_message(
+                &self,
+                _id: &str,
+                _msg: crate::host::connector::OperatorMessageRequest,
+            ) -> Result<rupu_runtime::services::operator::OperatorSendReply, HostConnectorError>
+            {
+                Err(HostConnectorError::Unsupported("fake".into()))
             }
             async fn pull_finding_artifact(
                 &self,

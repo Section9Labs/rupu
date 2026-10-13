@@ -1,5 +1,6 @@
 //! The envelope round loop: the deterministic supervisor that, once per
-//! round, drains operator steering, evaluates every goal / coverage / budget
+//! round, drains the operator's control queue, recaps the operator's
+//! messages to the lead, evaluates every goal / coverage / budget
 //! stop condition over the evidence on disk, and either winds the flow down or
 //! hands the lead a [`Digest`] and lets it run one round.
 //!
@@ -15,8 +16,8 @@
 //!    `required` goal is met. Non-required goals never gate.
 //! 2. [`StopReason::CoverageReached`] -- a coverage target is set and met.
 //! 3. [`StopReason::BudgetExhausted`] -- the budget is [`BudgetStage::Hard`].
-//! 4. [`StopReason::OperatorStop`] -- a message drained this round has
-//!    `stop == true`.
+//! 4. [`StopReason::OperatorStop`] -- the control queue held a stop this
+//!    round.
 //! 5. [`StopReason::Ceiling`] -- `round >= ceiling_rounds`, or the wall-clock
 //!    elapsed since `started` is `>= ceiling_wall_clock`.
 //!
@@ -41,8 +42,8 @@
 //! broken evaluator can never falsely end the flow as a success. The error is
 //! logged, handed to the lead that round in [`Digest::warnings`], and surfaced
 //! in the wind-down summary; the budget and ceilings still bound the flow. An
-//! operator-queue read failure is likewise logged, warned, and retried next
-//! round.
+//! operator-queue or message-log read failure is likewise logged, warned, and
+//! retried next round.
 
 use std::fmt;
 
@@ -53,10 +54,11 @@ use crate::budget::{Budget, BudgetEnforcer, BudgetStage, UsageSource};
 use crate::coverage::{CoverageEvaluator, CoverageOutcome, CoverageTarget};
 use crate::def::Goal;
 use crate::goal::{GoalEvaluator, GoalOutcome};
-use crate::operator::{OperatorMessage, OperatorQueue};
+use crate::operator::{Control, OperatorQueue};
+use rupu_fleet::{address, Address, Bus, LogLine, LogMessage, MessageKind, OperatorVia};
 
 /// What the envelope tells the lead at the start of a round: where every stop
-/// condition stands, plus any operator steering drained this round.
+/// condition stands, plus a recap of what the operator told it.
 #[derive(Debug, Clone)]
 pub struct Digest {
     /// One outcome per configured goal, in configuration order.
@@ -69,12 +71,14 @@ pub struct Digest {
     /// True when the budget is `Soft`: the lead should converge (wrap up the
     /// highest-value work) rather than open new lines of inquiry.
     pub converge: bool,
-    /// Operator messages drained this round, oldest first.
-    pub steering: Vec<OperatorMessage>,
+    /// The operator messages delivered to the lead since the previous round,
+    /// oldest first. A recap: the lead's collectors hand it each one before
+    /// its next model call.
+    pub operator_messages: Vec<LogMessage>,
     /// Non-fatal problems found while assessing this round (a goal or coverage
-    /// evaluation error, an unreadable operator queue). Evaluation errors read
-    /// as "not met" in `goals` / `coverage`; this is how the lead learns *why*
-    /// rather than seeing only a bare unmet outcome.
+    /// evaluation error, an unreadable operator queue or message log).
+    /// Evaluation errors read as "not met" in `goals` / `coverage`; this is how
+    /// the lead learns *why* rather than seeing only a bare unmet outcome.
     pub warnings: Vec<String>,
 }
 
@@ -163,8 +167,10 @@ struct Assessment {
     goals: Vec<GoalOutcome>,
     coverage: Option<CoverageOutcome>,
     budget: BudgetStage,
-    steering: Vec<OperatorMessage>,
-    /// Non-fatal problems this round (evaluator / queue errors).
+    /// The control queue held a stop.
+    stop: bool,
+    operator_messages: Vec<LogMessage>,
+    /// Non-fatal problems this round (evaluator / queue / log errors).
     warnings: Vec<String>,
 }
 
@@ -174,16 +180,23 @@ pub struct Envelope {
     cfg: EnvelopeConfig,
     budget: BudgetEnforcer,
     operator: OperatorQueue,
+    /// The operator's bus on the flow's message space.
+    space: Bus,
+    /// The last log message the recap has read past.
+    recapped: Option<String>,
     started: DateTime<Utc>,
 }
 
 impl Envelope {
+    /// `space` is the operator's bus on the flow's message space
+    /// (`Bus::open(run_dir, address::OPERATOR)`).
     pub fn new(
         paths: CoveragePaths,
         active: ActiveSet,
         cfg: EnvelopeConfig,
         budget: Budget,
         operator: OperatorQueue,
+        space: Bus,
         started: DateTime<Utc>,
     ) -> Self {
         // One instant: the budget's wall-clock dimension and the envelope's
@@ -196,6 +209,8 @@ impl Envelope {
             cfg,
             budget,
             operator,
+            space,
+            recapped: None,
             started,
         }
     }
@@ -234,7 +249,7 @@ impl Envelope {
                     coverage: a.coverage,
                     budget: a.budget,
                     converge,
-                    steering: a.steering,
+                    operator_messages: a.operator_messages,
                     warnings: a.warnings,
                 },
             };
@@ -247,20 +262,35 @@ impl Envelope {
         }
     }
 
-    /// Drain steering and evaluate goals, coverage, and budget for `round`.
-    /// Evaluation failures are reported as "not met" (fail closed) plus a
-    /// warning; they never abort the loop.
-    fn assess(&self, usage: &dyn UsageSource, round: u32, now: DateTime<Utc>) -> Assessment {
+    /// Drain the control queue, recap the operator's messages, and evaluate
+    /// goals, coverage, and budget for `round`. Evaluation failures are
+    /// reported as "not met" (fail closed) plus a warning; they never abort
+    /// the loop.
+    fn assess(&mut self, usage: &dyn UsageSource, round: u32, now: DateTime<Utc>) -> Assessment {
         let mut warnings = Vec::new();
 
-        let steering = match self.operator.drain() {
-            Ok(msgs) => msgs,
+        let mut stop = false;
+        match self.operator.drain() {
+            Ok(controls) => {
+                for control in controls {
+                    match control {
+                        Control::Stop { .. } => stop = true,
+                        Control::Steering { ts, body, urgent } => {
+                            self.resend_steering(&ts, body, urgent, &mut warnings)
+                        }
+                    }
+                }
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "agentiflow operator queue drain failed");
                 warnings.push(format!("operator queue unreadable: {e}"));
-                Vec::new()
             }
-        };
+        }
+        let operator_messages = self.recap().unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "agentiflow message log read failed");
+            warnings.push(format!("message log unreadable: {e}"));
+            Vec::new()
+        });
 
         let goals = self
             .cfg
@@ -304,9 +334,52 @@ impl Envelope {
             goals,
             coverage,
             budget,
-            steering,
+            stop,
+            operator_messages,
             warnings,
         }
+    }
+
+    /// Deliver a steering message an older binary queued to the lead the way
+    /// `rupu agentiflow send` now does, through the flow's message space.
+    fn resend_steering(&self, ts: &str, body: String, urgent: bool, warnings: &mut Vec<String>) {
+        let msg = rupu_fleet::OperatorMessage {
+            to: Address::Lead,
+            body,
+            urgent,
+            via: OperatorVia::Cli,
+            viewer: None,
+        };
+        match self.space.operator_send(msg) {
+            Ok(receipt) => tracing::info!(
+                id = receipt.id(),
+                queued_at = ts,
+                "re-sent a queued steering message to the lead through the message space"
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, queued_at = ts, "could not re-send a queued steering message to the lead");
+                warnings.push(format!(
+                    "an operator message queued at {ts} could not be delivered: {e}"
+                ));
+            }
+        }
+    }
+
+    /// The operator messages delivered to the lead that the log holds past
+    /// the last recap.
+    fn recap(&mut self) -> Result<Vec<LogMessage>, rupu_fleet::BusError> {
+        let page = self.space.read_log(self.recapped.as_deref(), usize::MAX)?;
+        let mut out = Vec::new();
+        for line in page.lines {
+            let LogLine::Msg(m) = line else { continue };
+            self.recapped = Some(m.id.clone());
+            if m.kind == MessageKind::Operator
+                && m.delivery.resolved.iter().any(|r| r == address::LEAD)
+            {
+                out.push(m);
+            }
+        }
+        Ok(out)
     }
 
     /// The stop disjunction, first match wins. See the module docs.
@@ -332,7 +405,7 @@ impl Envelope {
                 dimension: dimension.clone(),
             });
         }
-        if a.steering.iter().any(|m| m.stop) {
+        if a.stop {
             return Some(StopReason::OperatorStop);
         }
         let rounds_up = self.cfg.ceiling_rounds.is_some_and(|cap| round >= cap);
@@ -545,8 +618,46 @@ mod tests {
             cfg,
             budget,
             OperatorQueue::new(dir.path()),
+            Bus::open(dir.path(), address::OPERATOR),
             t0(),
         )
+    }
+
+    /// The lead, joined to the space under `dir` (as the flow joins it).
+    fn lead_bus(dir: &tempfile::TempDir) -> Bus {
+        joined(dir, address::LEAD)
+    }
+
+    fn joined(dir: &tempfile::TempDir, participant: &str) -> Bus {
+        let bus = Bus::open(dir.path(), participant);
+        bus.join(rupu_fleet::Member {
+            codename: None,
+            agent: participant.into(),
+            run_id: format!("run_{participant}"),
+            step_id: None,
+            unit: None,
+            kind: "flow_lead".into(),
+            parent_run_id: None,
+            pid: None,
+        })
+        .unwrap();
+        bus
+    }
+
+    fn operator_send(dir: &std::path::Path, to: Address, body: &str) {
+        Bus::open(dir, address::OPERATOR)
+            .operator_send(rupu_fleet::OperatorMessage {
+                to,
+                body: body.into(),
+                urgent: false,
+                via: OperatorVia::Cli,
+                viewer: None,
+            })
+            .unwrap();
+    }
+
+    fn bodies(ms: &[LogMessage]) -> Vec<&str> {
+        ms.iter().map(|m| m.body.as_str()).collect()
     }
 
     /// A frozen clock.
@@ -622,14 +733,7 @@ mod tests {
     fn stops_on_operator_stop_message() {
         let (dir, paths) = seed(&[]);
         let mut env = envelope(&dir, paths, cfg(vec![host_goal("g1", true)]), no_budget());
-        OperatorQueue::new(dir.path())
-            .enqueue(&OperatorMessage {
-                ts: "2026-10-04T12:00:00Z".into(),
-                body: "wrap it up".into(),
-                stop: true,
-                interrupt: false,
-            })
-            .unwrap();
+        OperatorQueue::new(dir.path()).request_stop().unwrap();
         let mut lead = MockLead { rounds: 0 };
         let out = env.run(&mut lead, &NO_SPEND, &fixed());
         assert_eq!(out.stop, StopReason::OperatorStop);
@@ -696,26 +800,89 @@ mod tests {
     }
 
     #[test]
-    fn non_stop_steering_reaches_the_lead_once() {
+    fn a_queued_steering_message_is_resent_to_the_lead_through_the_space() {
         let (dir, paths) = seed(&[]);
+        let lead_bus = lead_bus(&dir);
         let mut c = cfg(vec![host_goal("g1", true)]);
         c.ceiling_rounds = Some(2);
         let mut env = envelope(&dir, paths, c, no_budget());
-        OperatorQueue::new(dir.path())
-            .enqueue(&OperatorMessage {
-                ts: "2026-10-04T12:00:00Z".into(),
-                body: "focus on 10.0.0.1".into(),
-                stop: false,
-                interrupt: false,
-            })
-            .unwrap();
+        crate::operator::tests::queue_legacy_steering(dir.path(), "focus on 10.0.0.1", true);
         let mut lead = CapturingLead::default();
         let out = env.run(&mut lead, &NO_SPEND, &fixed());
         assert_eq!(out.stop, StopReason::Ceiling);
-        assert_eq!(lead.seen.len(), 2);
-        assert_eq!(lead.seen[0].digest.steering.len(), 1);
-        assert_eq!(lead.seen[0].digest.steering[0].body, "focus on 10.0.0.1");
-        assert!(lead.seen[1].digest.steering.is_empty(), "drained once");
+
+        // One operator message to the lead, keeping its `--now` mark...
+        let log = lead_bus.read_log(None, usize::MAX).unwrap().lines;
+        let [LogLine::Msg(m)] = log.as_slice() else {
+            panic!("{log:?}")
+        };
+        assert_eq!(m.kind, MessageKind::Operator);
+        assert_eq!(m.from, "operator");
+        assert_eq!(m.body, "focus on 10.0.0.1");
+        assert!(m.urgent);
+        assert_eq!(m.via, Some(OperatorVia::Cli));
+        assert_eq!(m.delivery.resolved, ["lead"]);
+        // ...in the lead's inbox, for its collector...
+        let inbox = lead_bus.mailbox.drain("lead").unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert!(inbox[0].urgent);
+        // ...recapped in the round it was re-sent before, and only that one.
+        assert_eq!(
+            bodies(&lead.seen[0].digest.operator_messages),
+            ["focus on 10.0.0.1"]
+        );
+        assert!(lead.seen[1].digest.operator_messages.is_empty());
+        assert!(OperatorQueue::new(dir.path()).drain().unwrap().is_empty());
+    }
+
+    /// Sends an operator message to the lead, one to everyone and one to a
+    /// unit while each listed round runs.
+    struct SendingLead {
+        dir: std::path::PathBuf,
+        during: Vec<u32>,
+        seen: Vec<RoundContext>,
+    }
+    impl LeadDriver for SendingLead {
+        fn run_round(&mut self, ctx: &RoundContext) -> RoundOutcome {
+            self.seen.push(ctx.clone());
+            if self.during.contains(&ctx.round) {
+                operator_send(&self.dir, Address::Lead, &format!("during {}", ctx.round));
+                operator_send(&self.dir, Address::Broadcast, "to everyone");
+                operator_send(&self.dir, Address::Named("lynx#1".into()), "to a unit");
+            }
+            RoundOutcome::Yielded
+        }
+    }
+
+    #[test]
+    fn the_recap_lists_the_operator_messages_to_the_lead_since_the_last_round() {
+        let (dir, paths) = seed(&[]);
+        let _lead = lead_bus(&dir);
+        let _unit = joined(&dir, "lynx#1");
+        let mut c = cfg(vec![host_goal("g1", true)]);
+        c.ceiling_rounds = Some(3);
+        let mut env = envelope(&dir, paths, c, no_budget());
+        operator_send(dir.path(), Address::Lead, "before the flow");
+        let mut lead = SendingLead {
+            dir: dir.path().to_path_buf(),
+            during: vec![0],
+            seen: Vec::new(),
+        };
+        env.run(&mut lead, &NO_SPEND, &fixed());
+        let recaps: Vec<Vec<&str>> = lead
+            .seen
+            .iter()
+            .map(|c| bodies(&c.digest.operator_messages))
+            .collect();
+        assert_eq!(
+            recaps,
+            [
+                vec!["before the flow"],
+                vec!["during 0", "to everyone"],
+                vec![]
+            ],
+            "the unit's message never reached the lead"
+        );
     }
 
     #[test]
@@ -742,14 +909,7 @@ mod tests {
         let mut c = cfg(vec![host_goal("g1", true)]);
         c.ceiling_rounds = Some(0);
         let mut env = envelope(&dir, paths, c, no_budget());
-        OperatorQueue::new(dir.path())
-            .enqueue(&OperatorMessage {
-                ts: "2026-10-04T12:00:00Z".into(),
-                body: "stop".into(),
-                stop: true,
-                interrupt: false,
-            })
-            .unwrap();
+        OperatorQueue::new(dir.path()).request_stop().unwrap();
         let out = env.run(&mut MockLead { rounds: 0 }, &NO_SPEND, &fixed());
         assert_eq!(out.stop, StopReason::OperatorStop);
     }
@@ -762,14 +922,7 @@ mod tests {
             ..no_budget()
         };
         let mut env = envelope(&dir, paths, cfg(vec![host_goal("g1", true)]), budget);
-        OperatorQueue::new(dir.path())
-            .enqueue(&OperatorMessage {
-                ts: "2026-10-04T12:00:00Z".into(),
-                body: "stop".into(),
-                stop: true,
-                interrupt: false,
-            })
-            .unwrap();
+        OperatorQueue::new(dir.path()).request_stop().unwrap();
         let usage = FixedUsage {
             usd: 5.0,
             tokens: 0,

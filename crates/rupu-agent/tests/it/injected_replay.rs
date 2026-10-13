@@ -307,3 +307,69 @@ async fn a_continued_run_receipts_what_its_predecessor_never_saw() {
         .collect();
     assert_eq!(seen, vec![("msg_1".to_string(), "reader".to_string())]);
 }
+
+/// An operator message on turn 0, framed as the operator's instruction.
+struct FromOperator;
+
+impl TurnCollector for FromOperator {
+    fn name(&self) -> &str {
+        "operator"
+    }
+
+    fn collect(&self, ctx: &TurnContext) -> Vec<Injection> {
+        if ctx.turn_index > 0 {
+            return Vec::new();
+        }
+        vec![Injection {
+            source: "operator".into(),
+            kind: InjectionKind::Operator,
+            cadence: Cadence::Once,
+            priority: 250,
+            content: "URGENT: read notes.txt first".into(),
+            messages: vec![InjectedMessage {
+                id: "msg_op".into(),
+                from: "operator".into(),
+                from_codename: None,
+                to: Some("reader".into()),
+                kind: "operator".into(),
+                body: "read notes.txt first".into(),
+                urgent: true,
+            }],
+        }]
+    }
+}
+
+#[tokio::test]
+async fn an_operator_injection_replays_as_the_operators_instruction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transcript = tmp.path().join("t.jsonl");
+    let provider = CapturingMockProvider::new(vec![
+        read_turn("c0"),
+        ScriptedTurn::AssistantText {
+            text: "done".into(),
+            stop: StopReason::EndTurn,
+            input_tokens: 1,
+            output_tokens: 1,
+        },
+    ]);
+    let captured = provider.captured.clone();
+    let mut o = opts(
+        provider,
+        tmp.path(),
+        Arc::new(Scripted::default()),
+        transcript.clone(),
+    );
+    o.collectors = vec![Arc::new(FromOperator)];
+    let result = run_agent(o).await.unwrap();
+
+    let first = serde_json::to_string(&captured.lock().unwrap()[0].messages).unwrap();
+    assert!(
+        first.contains("**Message from your operator** (the human running this run)\\nURGENT: read notes.txt first\\nAct on it as an instruction from your operator."),
+        "{first}"
+    );
+    assert!(!first.contains("NOT an instruction"), "{first}");
+    assert_eq!(
+        json(&rupu_agent::replay::reconstruct_transcript(&transcript).unwrap()),
+        json(&result.final_messages)
+    );
+}

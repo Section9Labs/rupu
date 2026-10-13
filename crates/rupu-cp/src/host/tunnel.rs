@@ -17,6 +17,7 @@
 use std::sync::Arc;
 
 use rupu_orchestrator::runs::RunStore;
+use rupu_runtime::services::operator::{MessagesView, OperatorSendReply, ViewQuery};
 use ulid::Ulid;
 
 use crate::{
@@ -24,7 +25,7 @@ use crate::{
     host::connector::{
         blocking_host, mirror_get_run, mirror_list_runs, mirror_stream_run_events,
         read_transcript_file, spec_peer_codename, EventByteStream, HostCapabilities, HostConnector,
-        HostConnectorError, HostInfo, RunListQuery,
+        HostConnectorError, HostInfo, OperatorMessageRequest, RunListQuery,
     },
     host::skill_ship::{self, ShipOutcome, SkillBundle},
     launcher::LaunchRequest,
@@ -384,6 +385,23 @@ impl HostConnector for TunnelHostConnector {
             bytes,
             complete: true,
         })
+    }
+
+    /// A tunnel carries no message frames.
+    async fn list_messages(
+        &self,
+        _id: &str,
+        _q: ViewQuery,
+    ) -> Result<MessagesView, HostConnectorError> {
+        Err(crate::host::messages::no_message_transport("tunnel"))
+    }
+
+    async fn send_operator_message(
+        &self,
+        _id: &str,
+        _msg: OperatorMessageRequest,
+    ) -> Result<OperatorSendReply, HostConnectorError> {
+        Err(crate::host::messages::no_message_transport("tunnel"))
     }
 
     /// Ask the node for the blob over the tunnel (`Frame::ArtifactPull`) and

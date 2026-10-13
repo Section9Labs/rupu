@@ -26,6 +26,10 @@ pub enum FleetError {
     LogFull { max_bytes: u64 },
     #[error(transparent)]
     Address(#[from] crate::address::AddressError),
+    /// A write the space refuses: an operator message to the operator, or
+    /// a run writing as `operator`.
+    #[error("{0}")]
+    Refused(String),
     /// The message is in the log, but delivering it failed partway: some
     /// recipients may have it. Sending it again would deliver it twice.
     #[error("message {id} is logged but delivering it failed: {source}; some recipients may already have it, so don't send it again")]

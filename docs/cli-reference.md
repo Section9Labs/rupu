@@ -54,6 +54,10 @@ These apply to every command.
   - [`rupu agentiflow stop`](#rupu-agentiflow-stop)
   - [`rupu agentiflow attach`](#rupu-agentiflow-attach)
   - [`rupu agentiflow serve`](#rupu-agentiflow-serve)
+- [`rupu message`](#rupu-message)
+  - [`rupu message list`](#rupu-message-list)
+  - [`rupu message send`](#rupu-message-send)
+  - [`rupu message participants`](#rupu-message-participants)
 - [`rupu autoflow`](#rupu-autoflow)
   - [`rupu autoflow list`](#rupu-autoflow-list)
   - [`rupu autoflow show`](#rupu-autoflow-show)
@@ -685,7 +689,7 @@ rupu agentiflow [OPTIONS] <COMMAND>
 | [`run`](#rupu-agentiflow-run) | Run an agentiflow in the foreground until its envelope stops it |
 | [`list`](#rupu-agentiflow-list) | List agentiflow runs, newest first |
 | [`status`](#rupu-agentiflow-status) | Show one agentiflow run: goals, budget, rounds and why it stopped |
-| [`send`](#rupu-agentiflow-send) | Send a steering message to a running agentiflow's lead |
+| [`send`](#rupu-agentiflow-send) | Send a message to a running agentiflow's lead, as its operator |
 | [`stop`](#rupu-agentiflow-stop) | Stop a running agentiflow |
 | [`attach`](#rupu-agentiflow-attach) | Watch an agentiflow run: its event log and its lead's current round |
 | [`serve`](#rupu-agentiflow-serve) | Supervise agentiflow runs: reap the ones whose coordinator died |
@@ -732,7 +736,7 @@ rupu agentiflow status [OPTIONS] <ID>
 <a id="rupu-agentiflow-send"></a>
 ### `rupu agentiflow send`
 
-Send a steering message to a running agentiflow's lead. The message is queued under the run's `steering/` directory and the envelope hands it to the lead at the next round boundary. `--now` marks it as an interrupt (for delivery mid-round); until the envelope acts on that mark, it is still delivered at the round boundary. A run that already finished takes no message.
+Send a message to a running agentiflow's lead, as its operator. The message goes into the run's message space and the lead receives it before its next model call, mid-round included; the next round's prompt recaps it. `--now` marks it urgent: it is put first, and the lead's current round ends early so the lead turns to it. A run that isn't running (finished, or its coordinator died) takes no message.
 
 ```
 rupu agentiflow send [OPTIONS] <ID> <MESSAGE>
@@ -745,12 +749,12 @@ rupu agentiflow send [OPTIONS] <ID> <MESSAGE>
 
 | Option | Description |
 |---|---|
-| `--now` | Mark the message as an interrupt (mid-round delivery). Delivered at the round boundary until the envelope acts on the mark |
+| `--now` | Mark the message urgent and end the lead's current round early |
 
 <a id="rupu-agentiflow-stop"></a>
 ### `rupu agentiflow stop`
 
-Stop a running agentiflow. By default the stop is graceful: it is queued like a steering message, and the envelope winds the run down at the next round boundary (the units it launched are stopped with it). `--now` is the hard stop: it SIGTERMs the coordinator (and, for a detached run, the process group it leads, so what its lead's tools started goes too), SIGTERMs every unit still running (SIGKILL for one that outlives a short grace), then records the run as failed (`operator_stop:now`) without waiting for the round.
+Stop a running agentiflow. By default the stop is graceful: it is queued for the envelope, which winds the run down at the next round boundary (the units it launched are stopped with it). `--now` is the hard stop: it SIGTERMs the coordinator (and, for a detached run, the process group it leads, so what its lead's tools started goes too), SIGTERMs every unit still running (SIGKILL for one that outlives a short grace), then records the run as failed (`operator_stop:now`) without waiting for the round.
 
 ```
 rupu agentiflow stop [OPTIONS] <ID>
@@ -789,6 +793,77 @@ Supervise agentiflow runs: reap the ones whose coordinator died. A coordinator t
 ```
 rupu agentiflow serve [OPTIONS]
 ```
+
+<a id="rupu-message"></a>
+### `rupu message`
+
+Talk to a run as its operator: its message space's messages, participants, and sending into it
+
+```
+rupu message [OPTIONS] <COMMAND>
+```
+
+| Subcommand | Description |
+|---|---|
+| [`list`](#rupu-message-list) | Show what was said in a run's message space |
+| [`send`](#rupu-message-send) | Send a message into a running run's message space, as its operator |
+| [`participants`](#rupu-message-participants) | List the participants in a run's message space |
+
+<a id="rupu-message-list"></a>
+### `rupu message list`
+
+Show what was said in a run's message space. One line per message (`time from → to [kind] body`), then, indented, whom it could not reach and who saw it on which turn. `--follow` keeps printing new messages and receipts until the run stops, then says why; Ctrl-C leaves the run going. `--json` prints the whole view as one object or, with `--follow`, one message per line (printed again when its receipts change).
+
+```
+rupu message list [OPTIONS] <RUN_ID>
+```
+
+| Argument | Description |
+|---|---|
+| `<RUN_ID>` | Run id: a workflow run, an agentiflow (`af_...`), a session (`ses_...`) or a standalone run; the full id, the compact form a list prints, or a unique prefix / suffix of it |
+
+| Option | Description |
+|---|---|
+| `--after <MSG_ID>` | Only the messages after this one (`msg_...`) |
+| `--follow` | Keep printing new messages and receipts until the run stops |
+| `--kind <KINDS>` | Only these kinds, comma-separated: post, direct, broadcast, directive, retract, operator |
+| `--json` | Print JSON: the whole view, or with `--follow` one message per line |
+
+<a id="rupu-message-send"></a>
+### `rupu message send`
+
+Send a message into a running run's message space, as its operator. It goes to `--to` (a participant, a codename, `role:<agent>`, `step:<id>`, `lead` or `broadcast`); by default to an agentiflow's lead, and to everyone in any other run. Each recipient gets it before its next model call. `--urgent` puts it first, and ends an agentiflow lead's round early. A run that isn't running takes no message.
+
+```
+rupu message send [OPTIONS] <RUN_ID> <TEXT>...
+```
+
+| Argument | Description |
+|---|---|
+| `<RUN_ID>` | Run id: a workflow run, an agentiflow (`af_...`), a session (`ses_...`) or a standalone run; the full id, the compact form a list prints, or a unique prefix / suffix of it |
+| `<TEXT>...` | The message (its words are joined with spaces) |
+
+| Option | Description |
+|---|---|
+| `--to <ADDRESS>` | Who the message is for: a participant, a codename, `role:<agent>`, `step:<id>`, `lead` or `broadcast` |
+| `--urgent` | Put the message first; an agentiflow lead ends its round early |
+
+<a id="rupu-message-participants"></a>
+### `rupu message participants`
+
+List the participants in a run's message space
+
+```
+rupu message participants [OPTIONS] <RUN_ID>
+```
+
+| Argument | Description |
+|---|---|
+| `<RUN_ID>` | Run id: a workflow run, an agentiflow (`af_...`), a session (`ses_...`) or a standalone run; the full id, the compact form a list prints, or a unique prefix / suffix of it |
+
+| Option | Description |
+|---|---|
+| `--json` | Print the participants as JSON |
 
 <a id="rupu-autoflow"></a>
 ### `rupu autoflow`

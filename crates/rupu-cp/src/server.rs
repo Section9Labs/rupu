@@ -34,6 +34,7 @@ async fn healthz() -> ([(HeaderName, String); 2], &'static str) {
 pub fn router(state: AppState, token: Option<String>) -> Router {
     let api = Router::new()
         .merge(crate::api::agentiflows::routes())
+        .merge(crate::api::messages::routes())
         .merge(crate::api::children::routes())
         .merge(crate::api::assets::routes())
         .merge(crate::api::autoflows::routes())

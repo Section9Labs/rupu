@@ -19,6 +19,10 @@ The operator can message **anyone in any run**: the lead, a specific agent, a ro
 
 ## 3. Design
 
+### 3.0 Every run joins its space at start (decided 2026-10-13, reverses FD1 for the roster)
+
+F1a only joined a run at start when its workflow set `messaging:`, its agent named a messaging tool, or the space was already active. Any other run joined on its first message or child. Such a run has no roster entry, so an operator send to `step:b`, a role or `broadcast` reached nobody, and its collectors delivered nothing until it joined. matt chose to have every run with a space join it as it starts (its `joined` line, with the process `pid`, plus a broadcast cursor). The log is still created by the first message. Taking part (being offered the messaging tools) no longer follows from "someone already joined": it is the workflow's `messaging:` or the agent naming a tool, so a plain run is in its space receive-only.
+
 ### 3.1 `Bus::operator_send`
 
 ```rust

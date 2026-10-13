@@ -38,13 +38,11 @@ use crate::provider_factory::{
 };
 use crate::usage_ledger::UsageLedger;
 
-/// A run's bus on its message space, and how the run takes part.
+/// A run's bus on its message space, and whether the run takes part.
 struct SpaceBus {
     bus: Arc<rupu_fleet::Bus>,
     /// Offered the messaging tools.
     takes_part: bool,
-    /// Joins as it starts, rather than on its first message or child.
-    joins_at_start: bool,
 }
 
 /// What a [`RunAssembler`] is built from: the config a process (or one root
@@ -858,7 +856,6 @@ impl RunAssembler {
         let parent_run_id_for_space = tool_context.identity.parent.as_ref().map(|p| p.run_id.clone());
         let launched = spec.link.is_some();
         let spec_origin = spec.origin.clone();
-        let joins_at_start = space.as_ref().is_some_and(|s| s.joins_at_start);
         let LaunchSpec {
             agent,
             transcript_path,
@@ -885,21 +882,17 @@ impl RunAssembler {
                 },
                 kind: crate::services::messaging::member_kind(&spec_origin, launched).into(),
                 parent_run_id: parent_run_id_for_space.clone(),
+                pid: Some(std::process::id()),
             };
-            // A run handed a bus, a workflow step taking part, and a run whose
-            // space is already active join at start; any other run's space
-            // is created lazily, on its first message or child (FD1).
-            if joins_at_start {
-                let joining = Arc::clone(bus);
-                match tokio::task::spawn_blocking(move || joining.join(member)).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        tracing::warn!(error = %e, "could not join the run's message space")
-                    }
-                    Err(e) => tracing::warn!(error = %e, "could not join the run's message space"),
+            // Every run joins as it starts, so the operator can reach any of
+            // them, messaging tools or not (F1b).
+            let joining = Arc::clone(bus);
+            match tokio::task::spawn_blocking(move || joining.join(member)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "could not join the run's message space")
                 }
-            } else {
-                bus.prepare(member);
+                Err(e) => tracing::warn!(error = %e, "could not join the run's message space"),
             }
             collectors.extend(crate::services::messaging::collectors(bus));
         }
@@ -944,16 +937,15 @@ impl RunAssembler {
     /// The run's bus on its message space (spec F1a): the one the site
     /// handed it (an agentiflow's lead and units, a child sharing its
     /// parent's), else one on its origin's own space. It takes part — is
-    /// offered the messaging tools — when its workflow sets `messaging:`, its
-    /// agent names a messaging tool (not through `*`), or someone already
-    /// joined the space; otherwise the bus is only where its children meet
-    /// it.
+    /// offered the messaging tools — when it was handed one, its workflow
+    /// sets `messaging:`, or its agent names a messaging tool (not through
+    /// `*`); otherwise the bus is where its children and the operator reach
+    /// it, receive-only.
     fn message_space(&self, spec: &LaunchSpec) -> Option<SpaceBus> {
         if let Some(bus) = &spec.services.message_bus {
             return Some(SpaceBus {
                 bus: Arc::clone(bus),
                 takes_part: true,
-                joins_at_start: true,
             });
         }
         let space =
@@ -969,8 +961,6 @@ impl RunAssembler {
             rupu_tools::ToolCatalog::builtin()
                 .names_service(tools, rupu_tools::Service::MessageBus)
         });
-        let active = crate::services::messaging::is_active(&space);
-        let step = matches!(spec.origin, Origin::WorkflowStep { .. });
         let address =
             crate::services::messaging::address_of(spec.codename.as_deref(), &spec.run_id);
         let bus = rupu_fleet::Bus::open(&space, address)
@@ -982,8 +972,7 @@ impl RunAssembler {
         };
         Some(SpaceBus {
             bus: Arc::new(bus),
-            takes_part: workflow || named || active,
-            joins_at_start: workflow || active || (named && step),
+            takes_part: workflow || named,
         })
     }
 

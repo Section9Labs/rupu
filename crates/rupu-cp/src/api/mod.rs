@@ -19,6 +19,7 @@ pub mod host_fanout;
 pub mod host_info;
 pub mod hosts;
 pub mod launch_preview;
+pub mod messages;
 pub mod models;
 pub mod netflow;
 pub mod projects;

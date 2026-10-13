@@ -5,14 +5,15 @@
 //! - `GET /api/agentiflows/:id` — one run: its record, the definition snapshot
 //!   it started from, the `events.jsonl` log, and the units (branches) it
 //!   dispatched.
-//! - `GET /api/agentiflows/:id/messages` — the run's board posts + directives.
-//! - `POST /api/agentiflows/:id/steer` — queue an operator message for the
-//!   lead (`cp serve` only; refused unless its coordinator is alive).
+//! - `POST /api/agentiflows/:id/steer` — message the lead, or queue a stop
+//!   (`cp serve` only; refused unless its coordinator is alive). A message is
+//!   `POST /api/agentiflows/:id/messages` to the lead (`crate::api::messages`,
+//!   which serves the run's messages too).
 //!
 //! The run-dir layout and `events.jsonl` line shapes are documented on
 //! `rupu_agentiflow::run`'s module docs; the readers here mirror
 //! `rupu-cli`'s `agentiflow list` / `agentiflow status` (`cmd/agentiflow.rs`)
-//! without depending on it. Apart from the steering queue, nothing here writes:
+//! without depending on it. Apart from steering, nothing here writes:
 //! the CP only observes a run the coordinator (or its reaper) owns.
 //!
 //! Transcripts are NOT served here. The lead's per-round transcripts
@@ -25,17 +26,19 @@
 
 use crate::{
     error::{ApiError, ApiResult},
+    host::messages::MessageRoute,
     state::AppState,
 };
 use axum::{
     extract::{Path, State},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use chrono::{DateTime, Utc};
 use rupu_agentiflow::{
     agentiflow_dir, units_on_disk, AgentiflowDef, AgentiflowRecord, Budget, CoverageTarget, Goal,
-    GoalTarget, OperatorMessage, OperatorQueue, Pool, RoundConfig, UnitOnDisk, UnitStatus,
+    GoalTarget, OperatorQueue, Pool, RoundConfig, UnitOnDisk, UnitStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -52,10 +55,6 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/agentiflows", get(list_agentiflows))
         .route("/api/agentiflows/:id", get(get_agentiflow))
-        .route(
-            "/api/agentiflows/:id/messages",
-            get(get_agentiflow_messages),
-        )
         .route("/api/agentiflows/:id/events", get(get_agentiflow_events))
         .route("/api/agentiflows/:id/steer", post(steer_agentiflow))
 }
@@ -757,46 +756,6 @@ async fn get_agentiflow(
         .ok_or_else(|| ApiError::not_found(format!("no agentiflow run `{id}`")))
 }
 
-/// `GET /api/agentiflows/:id/messages` — the engagement's board: the fleet's
-/// shared posts (fire-and-forget broadcasts + observations the agents write to
-/// each other) and the lead's directives, oldest first. This is the "message
-/// inbox" — how the fleet talks to itself during an engagement. Each line is
-/// returned as-is (`{kind, author, addressed_to?, ts, body}` for a post).
-#[derive(Serialize)]
-struct MessagesResponse {
-    posts: Vec<Value>,
-    directives: Vec<Value>,
-}
-
-async fn get_agentiflow_messages(
-    State(s): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<Json<MessagesResponse>> {
-    if !valid_run_id(&id) {
-        return Err(ApiError::not_found(format!("no agentiflow run `{id}`")));
-    }
-    let run_dir = agentiflow_dir(&s.global_dir).join(&id);
-    if !run_dir.is_dir() {
-        return Err(ApiError::not_found(format!("no agentiflow run `{id}`")));
-    }
-    let board = run_dir.join("board");
-    let read_jsonl = |p: std::path::PathBuf| -> Vec<Value> {
-        std::fs::read_to_string(&p)
-            .ok()
-            .map(|text| {
-                text.lines()
-                    .filter(|l| !l.trim().is_empty())
-                    .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    Ok(Json(MessagesResponse {
-        posts: read_jsonl(board.join("posts.jsonl")),
-        directives: read_jsonl(board.join("directives.jsonl")),
-    }))
-}
-
 /// `GET /api/agentiflows/:id/events` — the engagement's granular event feed: the
 /// coordinator lifecycle (`run_started` / `round` / `run_stopped`, from
 /// `events.jsonl`) MERGED with per-unit lifecycle — each dispatched unit's
@@ -906,28 +865,29 @@ async fn get_agentiflow_events(
         .ok_or_else(|| ApiError::not_found(format!("no agentiflow run `{id}`")))
 }
 
-/// `POST /api/agentiflows/:id/steer` — queue an operator steering message for
-/// the lead, the same channel `rupu agentiflow send` writes. The lead drains
-/// the queue at the next round boundary (`now: true` also asks for a mid-round
-/// interrupt). A write, so `cp serve` only (501 otherwise). Refused (409)
-/// unless a live coordinator will read it: the record must be `running` and
-/// its recorded `runner_pid` alive — a coordinator that died without
-/// finalizing leaves `running` on disk, and a message queued there is never
-/// drained ([`steerable`]).
+/// `POST /api/agentiflows/:id/steer` — the older spelling of a message to
+/// the lead: exactly `POST /api/agentiflows/:id/messages {to: lead, body:
+/// message, urgent: now}`, answered as that is (`202 {id, delivery}`). With
+/// `stop: true` it instead queues a graceful stop on the control queue
+/// (`200 {queued: true}`), refused (409) unless a live coordinator will read
+/// it: the record must be `running` and its recorded `runner_pid` alive — a
+/// coordinator that died without finalizing leaves `running` on disk, and a
+/// stop queued there is never drained ([`steerable`]). A write, so `cp serve`
+/// only (501 otherwise).
 #[derive(Deserialize)]
 struct SteerRequest {
     message: String,
     /// `send --now`: ask for mid-round delivery, not just the round boundary.
     #[serde(default)]
     now: bool,
-    /// Ask the envelope to wind the run down after this message.
+    /// Ask the envelope to wind the run down.
     #[serde(default)]
     stop: bool,
 }
 
-/// Whether `record`'s lead will drain a steering message: `running`, and its
-/// coordinator not known dead. A record with no `runner_pid` (owner unknown)
-/// is accepted — there is nothing to check it against.
+/// Whether `record`'s lead will drain a stop: `running`, and its coordinator
+/// not known dead. A record with no `runner_pid` (owner unknown) is accepted
+/// — there is nothing to check it against.
 fn steerable(id: &str, record: &AgentiflowRecord) -> ApiResult<()> {
     if record.status != "running" {
         return Err(ApiError::conflict(format!(
@@ -945,21 +905,23 @@ fn steerable(id: &str, record: &AgentiflowRecord) -> ApiResult<()> {
     Ok(())
 }
 
-#[derive(Serialize)]
-struct SteerResponse {
-    queued: bool,
-}
-
 async fn steer_agentiflow(
     State(s): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<SteerRequest>,
-) -> ApiResult<Json<SteerResponse>> {
+) -> ApiResult<Response> {
     if !valid_run_id(&id) {
         return Err(ApiError::not_found(format!("no agentiflow run `{id}`")));
     }
-    let body = req.message.trim().to_string();
-    if body.is_empty() {
+    if !req.stop {
+        let body = crate::api::messages::PostBody {
+            to: Some(rupu_fleet::Address::Lead.to_string()),
+            body: req.message,
+            urgent: req.now,
+        };
+        return crate::api::messages::post(MessageRoute::Agentiflows, &s, &id, None, body).await;
+    }
+    if req.message.trim().is_empty() {
         return Err(ApiError::bad_request("steering message is empty"));
     }
     crate::api::config::require_writable_to(&s, "steering an agentiflow")?;
@@ -976,16 +938,15 @@ async fn steer_agentiflow(
         }
     };
     steerable(&id, &record)?;
-    let msg = OperatorMessage {
-        ts: Utc::now().to_rfc3339(),
-        body,
-        stop: req.stop,
-        interrupt: req.now,
-    };
     OperatorQueue::new(&run_dir)
-        .enqueue(&msg)
-        .map_err(|e| ApiError::internal(format!("could not queue steering message: {e}")))?;
-    Ok(Json(SteerResponse { queued: true }))
+        .request_stop()
+        .map_err(|e| ApiError::internal(format!("could not queue a stop: {e}")))?;
+    Ok(Json(StopQueued { queued: true }).into_response())
+}
+
+#[derive(Serialize)]
+struct StopQueued {
+    queued: bool,
 }
 
 #[cfg(test)]

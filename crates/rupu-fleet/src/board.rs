@@ -227,55 +227,70 @@ impl Board {
         )
     }
 
-    /// The LIVE directives, oldest first: the directive log folded in file
-    /// order, a put adding (or, for an id already live, replacing in place) a
-    /// directive and a retraction removing it. An absent log yields an empty
-    /// list.
+    /// Every put and retraction in `directives.jsonl`, in file order. An
+    /// absent log is empty.
     ///
     /// Unlike the other logs this one tolerates a corrupt line: it is skipped
     /// and logged, so one bad line cannot silence every standing directive (nor
-    /// can it be mistaken for one). Directives with no id (legacy lines) are all
-    /// live, none retractable.
-    pub fn read_directives(&self) -> Result<Vec<Directive>, FleetError> {
+    /// can it be mistaken for one).
+    pub fn directive_events(&self) -> Result<Vec<DirectiveEvent>, FleetError> {
         let path = self.directives_path();
         let text = read_log_text(&path)?;
+        Ok(text
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim().is_empty())
+            .filter_map(
+                |(n, line)| match serde_json::from_str::<DirectiveEvent>(line) {
+                    Ok(event) => Some(event),
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            line = n + 1,
+                            error = %e,
+                            "skipping an unreadable directive log line"
+                        );
+                        None
+                    }
+                },
+            )
+            .collect())
+    }
+
+    /// The LIVE directives, oldest first: the directive log folded in file
+    /// order, a put adding (or, for an id already live, replacing in place) a
+    /// directive and a retraction removing it. An absent log yields an empty
+    /// list. Directives with no id (legacy lines) are all live, none
+    /// retractable.
+    pub fn read_directives(&self) -> Result<Vec<Directive>, FleetError> {
         // Slot per put, in file order; a retraction empties its slot, so the
         // survivors stay oldest-first without a re-sort.
         let mut slots: Vec<Option<Directive>> = Vec::new();
         let mut slot_of: HashMap<String, usize> = HashMap::new();
         let mut legacy = 0usize;
-        for (n, line) in text.lines().enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<DirectiveEvent>(line) {
-                Ok(DirectiveEvent::Put(d)) if !is_keyed(&d.id) => {
+        for event in self.directive_events()? {
+            match event {
+                DirectiveEvent::Put(d) if !is_keyed(&d.id) => {
                     legacy += 1;
                     slots.push(Some(d));
                 }
-                Ok(DirectiveEvent::Put(d)) => match slot_of.get(&d.id) {
+                DirectiveEvent::Put(d) => match slot_of.get(&d.id) {
                     Some(&slot) => slots[slot] = Some(d),
                     None => {
                         slot_of.insert(d.id.clone(), slots.len());
                         slots.push(Some(d));
                     }
                 },
-                Ok(DirectiveEvent::Retract { retract }) => {
+                DirectiveEvent::Retract { retract } => {
                     if let Some(slot) = slot_of.remove(&retract) {
                         slots[slot] = None;
                     }
                 }
-                Err(e) => tracing::warn!(
-                    path = %path.display(),
-                    line = n + 1,
-                    error = %e,
-                    "skipping an unreadable directive log line"
-                ),
             }
         }
         if legacy > 0 {
             tracing::debug!(
-                path = %path.display(),
+                path = %self.directives_path().display(),
                 legacy,
                 "directives without an id (written before ids existed) cannot be retracted"
             );

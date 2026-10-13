@@ -110,6 +110,7 @@ async fn a_terminating_process_starts_no_compaction_summariser_call() {
                     loaded_skills: Vec::new(),
                     operator_loads: Vec::new(),
                     missing_skills: Vec::new(),
+                    unseen_messages: Vec::new(),
                 },
                 provider: Box::new(provider),
                 limits: ModelLimits::fixed(1_000, 100),

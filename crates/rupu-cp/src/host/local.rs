@@ -14,6 +14,7 @@ use rupu_orchestrator::{
     runs::{CancelError, PauseError, RunStore},
     ApprovalError, RunStoreError,
 };
+use rupu_runtime::services::operator::{MessagesView, OperatorSendReply, ViewQuery};
 use rupu_runtime::{AutoflowHistoryStore, AutoflowHistoryStoreError};
 
 use crate::{
@@ -21,9 +22,10 @@ use crate::{
     api::runs::{query_run_detail, query_run_rows},
     host::connector::{
         blocking_host, open_run_events_tail, read_transcript_file, EventByteStream,
-        HostCapabilities, HostConnector, HostConnectorError, HostInfo, RunKind, RunListQuery,
-        RunStartEvidence,
+        HostCapabilities, HostConnector, HostConnectorError, HostInfo, OperatorMessageRequest,
+        RunKind, RunListQuery, RunStartEvidence,
     },
+    host::messages,
     host::skill_ship::{ShipOutcome, SkillBundle},
     host::workspace_stage::{collect_from_dir, discard_from_dir, stage_to_dir},
     launcher::{LaunchRequest, RunLauncher},
@@ -454,6 +456,39 @@ impl HostConnector for LocalHostConnector {
         )
         .blob_path(sha256);
         crate::host::connector::copy_blob_capped(&src, dest, max_bytes).await
+    }
+
+    async fn list_messages(
+        &self,
+        id: &str,
+        q: ViewQuery,
+    ) -> Result<MessagesView, HostConnectorError> {
+        let global = self.global_dir.clone();
+        let id = id.to_string();
+        blocking_host(move || {
+            messages::view(&global, &id, &q)
+                .map_err(|e| messages::connector_error(e, HostConnectorError::Internal))
+        })
+        .await
+    }
+
+    /// Under the `[messaging]` caps of the global config as it is on disk
+    /// now.
+    async fn send_operator_message(
+        &self,
+        id: &str,
+        msg: OperatorMessageRequest,
+    ) -> Result<OperatorSendReply, HostConnectorError> {
+        let global = self.global_dir.clone();
+        let id = id.to_string();
+        blocking_host(move || {
+            let caps = rupu_runtime::services::messaging::caps(
+                &crate::state::AppState::resolve_global_config(&global),
+            );
+            messages::send(&global, &id, msg, caps)
+                .map_err(|e| messages::connector_error(e, HostConnectorError::Internal))
+        })
+        .await
     }
 
     async fn stream_run_events(&self, run_id: &str) -> Result<EventByteStream, HostConnectorError> {

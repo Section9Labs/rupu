@@ -29,6 +29,10 @@ pub struct Member {
     /// The run that launched it: what its `parent` resolves to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_run_id: Option<String>,
+    /// The process the run lives in: whether a standalone run is still
+    /// running, when it has no record yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
 }
 
 /// One line of `participants.jsonl`.
@@ -238,14 +242,12 @@ impl Roster {
                 Some(OPERATOR.into()),
                 Undeliverable::UnknownParticipant,
             ),
-            Address::Broadcast => Resolution {
-                to: to.to_string(),
-                recipients: self
-                    .live_except(sender.address)
+            Address::Broadcast => many(
+                to.to_string(),
+                self.live_except(sender.address)
                     .map(|p| p.address.clone())
                     .collect(),
-                undelivered: None,
-            },
+            ),
             Address::Role(role) => many(
                 to.to_string(),
                 self.live_except(sender.address)
@@ -325,6 +327,7 @@ mod tests {
                 unit: None,
                 kind: "workflow_step".into(),
                 parent_run_id: None,
+                pid: None,
             },
             at: "t".into(),
         }

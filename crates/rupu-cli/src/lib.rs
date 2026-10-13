@@ -115,6 +115,12 @@ pub enum Cmd {
         #[command(subcommand)]
         action: cmd::agentiflow::Action,
     },
+    /// Talk to a run as its operator: its message space's messages,
+    /// participants, and sending into it.
+    Message {
+        #[command(subcommand)]
+        action: cmd::message::Action,
+    },
     /// Run autonomous workflows against persistent issue state.
     Autoflow {
         #[command(subcommand)]
@@ -261,6 +267,13 @@ pub enum Cmd {
     /// Internal: print this build's host features (SSH capability probe).
     #[command(name = "__features", hide = true)]
     Features,
+    /// Internal: read or write a run's message space as its operator (SSH
+    /// transport); the protocol is `cmd::message::HelperAction`'s.
+    #[command(name = "__message", hide = true)]
+    MessageHelper {
+        #[command(subcommand)]
+        action: cmd::message::HelperAction,
+    },
     /// Internal: stream a finding artifact from this host's store (SSH artifact pull).
     #[command(name = "__findings", hide = true)]
     FindingsHelper {
@@ -460,6 +473,9 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Agentiflow { action } => {
             cmd::agentiflow::handle(action, cli.format, cli.absolute, cli.all_columns).await
         }
+        Cmd::Message { action } => {
+            cmd::message::handle(action, cli.format, cli.absolute, cli.all_columns).await
+        }
         Cmd::Autoflow { action } => {
             cmd::autoflow::handle(action, cli.format, cli.absolute, cli.all_columns).await
         }
@@ -504,6 +520,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Skills { action } => cmd::skills_helper::handle(action).await,
         Cmd::Features => cmd::features_helper::handle(),
         Cmd::FindingsHelper { action } => cmd::findings_helper::handle(action).await,
+        Cmd::MessageHelper { action } => cmd::message::handle_helper(action),
     }
 }
 
@@ -532,6 +549,7 @@ fn ensure_output_format_supported(
         Cmd::Agent { action } => cmd::agent::ensure_output_format(action, format),
         Cmd::Workflow { action } => cmd::workflow::ensure_output_format(action, format),
         Cmd::Agentiflow { action } => cmd::agentiflow::ensure_output_format(action, format),
+        Cmd::Message { action } => cmd::message::ensure_output_format(action, format),
         Cmd::Autoflow { action } => cmd::autoflow::ensure_output_format(action, format),
         Cmd::Transcript { action } => cmd::transcript::ensure_output_format(action, format),
         Cmd::Config { .. } => output::formats::ensure_supported(
@@ -629,6 +647,11 @@ fn ensure_output_format_supported(
         ),
         Cmd::FindingsHelper { .. } => output::formats::ensure_supported(
             "__findings",
+            format,
+            &[output::formats::OutputFormat::Table],
+        ),
+        Cmd::MessageHelper { .. } => output::formats::ensure_supported(
+            "__message",
             format,
             &[output::formats::OutputFormat::Table],
         ),
@@ -890,6 +913,75 @@ mod arg_parse_tests {
                 assert!(if_unfinished);
             }
             other => panic!("expected Workflow(Resume), got {other:?}"),
+        }
+    }
+
+    /// The `rupu __message` argv an SSH coordinator sends to a remote whose
+    /// `rupu __features` lists `run.messages`, this build's clap reads as
+    /// sent: a body with quotes, a newline and a leading `-` is one value.
+    #[test]
+    fn the_ssh_message_argv_parses_as_sent() {
+        use cmd::message::HelperAction;
+        assert!(rupu_cp::node::protocol::FeaturesReport::current()
+            .supports(rupu_cp::node::protocol::CAP_RUN_MESSAGES));
+        let parse = |argv: Vec<String>| {
+            Cli::try_parse_from(std::iter::once("rupu".to_string()).chain(argv))
+                .unwrap()
+                .command
+        };
+        let body = "-it's \"done\"\nsecond line";
+        let send = rupu_cp::host::ssh::message_send_argv(
+            "run_01ABC",
+            &rupu_cp::host::connector::OperatorMessageRequest {
+                to: Some("step:scan".into()),
+                body: body.into(),
+                urgent: true,
+                viewer: Some("matt".into()),
+            },
+        );
+        match parse(send) {
+            Cmd::MessageHelper {
+                action:
+                    HelperAction::Send {
+                        id,
+                        body: got,
+                        to,
+                        urgent,
+                        viewer,
+                    },
+            } => {
+                assert_eq!(id, "run_01ABC");
+                assert_eq!(got, body);
+                assert_eq!(to.as_deref(), Some("step:scan"));
+                assert!(urgent);
+                assert_eq!(viewer.as_deref(), Some("matt"));
+            }
+            other => panic!("expected MessageHelper(Send), got {other:?}"),
+        }
+        let list = rupu_cp::host::ssh::message_list_argv(
+            "af_01ABC",
+            &rupu_runtime::services::operator::ViewQuery {
+                after: Some("msg_01A".into()),
+                limit: 7,
+                kinds: Some(vec![rupu_fleet::MessageKind::Operator]),
+            },
+        );
+        match parse(list) {
+            Cmd::MessageHelper {
+                action:
+                    HelperAction::List {
+                        id,
+                        after,
+                        limit,
+                        kind,
+                    },
+            } => {
+                assert_eq!(id, "af_01ABC");
+                assert_eq!(after.as_deref(), Some("msg_01A"));
+                assert_eq!(limit, Some(7));
+                assert_eq!(kind.as_deref(), Some("operator"));
+            }
+            other => panic!("expected MessageHelper(List), got {other:?}"),
         }
     }
 

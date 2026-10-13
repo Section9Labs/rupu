@@ -14,6 +14,9 @@ use futures_util::stream::Stream;
 use futures_util::StreamExt as _;
 use rupu_orchestrator::runs::RunStore;
 use rupu_runtime::argv::{FeatureSet, RunArgv, WorkflowControl};
+use rupu_runtime::services::operator::{
+    MessageErrorReply, MessagesView, OperatorSendReply, ViewQuery,
+};
 use rupu_skills::ship::{encode_stream, PackedSkill};
 use ulid::Ulid;
 
@@ -22,7 +25,7 @@ use crate::{
     host::connector::{
         blocking_host, mirror_stream_run_events, read_transcript_file, CoverageRead,
         EventByteStream, FeedGuard, HostCapabilities, HostConnector, HostConnectorError, HostInfo,
-        RunKind, RunListQuery, RunStartEvidence, MAX_WORKSPACE_BYTES,
+        OperatorMessageRequest, RunKind, RunListQuery, RunStartEvidence, MAX_WORKSPACE_BYTES,
     },
     host::skill_ship::{
         prefixed, ref_arg, ship_through, ShipMemo, ShipOutcome, SkillBundle, Transfer,
@@ -31,8 +34,8 @@ use crate::{
     node::{
         protocol::{
             ArtifactFile, RunSpec, RunSpecKind, CAP_AGENT_SKILLS, CAP_AGENT_SKILL_BUNDLE,
-            CAP_RUN_CODENAME_FLAG, CAP_RUN_LIST, CAP_WORKFLOW_RESUME_IF_UNFINISHED,
-            FEATURES_SUBCOMMAND,
+            CAP_RUN_CODENAME_FLAG, CAP_RUN_LIST, CAP_RUN_MESSAGES,
+            CAP_WORKFLOW_RESUME_IF_UNFINISHED, FEATURES_SUBCOMMAND,
         },
         NodeMirror,
     },
@@ -128,6 +131,71 @@ fn feature_gate(checks: &[(&str, &str)], then: &str) -> String {
         shell_escape(LAUNCH_RUPU_NOT_FOUND),
         features_capture(),
     )
+}
+
+/// Whether `stdout` has `marker` on a line of its own.
+fn printed(stdout: &str, marker: &str) -> bool {
+    stdout.lines().any(|l| l.trim() == marker)
+}
+
+/// Printed, instead of running `rupu __message`, by [`message_command`]'s
+/// gate when the remote `rupu __features` doesn't list [`CAP_RUN_MESSAGES`].
+const MESSAGES_UNSUPPORTED: &str = "rupu-message: unsupported";
+
+/// The one remote command an SSH messages call sends: `rupu <argv>`
+/// ([`message_list_argv`] / [`message_send_argv`]) behind [`feature_gate`]
+/// on [`CAP_RUN_MESSAGES`] — the remote decides in the same session, so a
+/// call costs it no extra connection. Every word is quoted on its own; a
+/// value rides as one `--flag=value` word, so a body with quotes, newlines or
+/// a leading `-` arrives intact.
+fn message_command(argv: &[String]) -> String {
+    let cmd: Vec<String> = std::iter::once("rupu".to_string())
+        .chain(argv.iter().cloned())
+        .collect();
+    feature_gate(
+        &[(CAP_RUN_MESSAGES, MESSAGES_UNSUPPORTED)],
+        &build_remote_command(&cmd),
+    )
+}
+
+/// The argv (after `rupu`) of the `rupu __message list` that reads `q` of
+/// `id`'s messages. Public so `rupu-cli` can check its own clap accepts it.
+#[doc(hidden)]
+pub fn message_list_argv(id: &str, q: &ViewQuery) -> Vec<String> {
+    let mut argv = vec!["__message".to_string(), "list".to_string(), id.to_string()];
+    if let Some(after) = &q.after {
+        argv.push(format!("--after={after}"));
+    }
+    if q.limit != usize::MAX {
+        argv.push(format!("--limit={}", q.limit));
+    }
+    if let Some(kinds) = &q.kinds {
+        let kinds: Vec<&str> = kinds.iter().map(|k| k.as_str()).collect();
+        argv.push(format!("--kind={}", kinds.join(",")));
+    }
+    argv
+}
+
+/// The argv (after `rupu`) of the `rupu __message send` that sends `msg`
+/// into `id`'s space. Public so `rupu-cli` can check its own clap accepts it.
+#[doc(hidden)]
+pub fn message_send_argv(id: &str, msg: &OperatorMessageRequest) -> Vec<String> {
+    let mut argv = vec![
+        "__message".to_string(),
+        "send".to_string(),
+        id.to_string(),
+        format!("--body={}", msg.body),
+    ];
+    if let Some(to) = &msg.to {
+        argv.push(format!("--to={to}"));
+    }
+    if msg.urgent {
+        argv.push("--urgent".to_string());
+    }
+    if let Some(viewer) = &msg.viewer {
+        argv.push(format!("--viewer={viewer}"));
+    }
+    argv
 }
 
 /// Printed by [`resume_command`] when it dispatched `--if-unfinished`.
@@ -2032,12 +2100,10 @@ impl SshHostConnector {
         Ok(feature_gate(&gates, &launch))
     }
 
-    /// The skills gate: captures the remote's feature report into `$f` and
-    /// runs `then` only when it lists [`CAP_AGENT_SKILLS`]; otherwise it
-    /// prints [`LAUNCH_SKILLS_UNSUPPORTED`] and creates nothing. Skills
-    /// change what a run does, so there is no downgraded form to run
-    /// instead. A remote with no `rupu` on its non-interactive PATH prints
-    /// [`LAUNCH_RUPU_NOT_FOUND`] instead, so the refusal says what is wrong.
+    /// The skills gate ([`feature_gate`] on [`CAP_AGENT_SKILLS`]): a remote
+    /// that doesn't list it prints [`LAUNCH_SKILLS_UNSUPPORTED`] and creates
+    /// nothing. Skills change what a run does, so there is no downgraded
+    /// form to run instead.
     fn skills_gate(then: &str) -> String {
         feature_gate(&[(CAP_AGENT_SKILLS, LAUNCH_SKILLS_UNSUPPORTED)], then)
     }
@@ -2142,6 +2208,57 @@ impl SshHostConnector {
         Ok(Transfer::Done)
     }
 
+    /// The refusal [`LAUNCH_RUPU_NOT_FOUND`] stands for.
+    fn rupu_not_found(&self) -> HostConnectorError {
+        HostConnectorError::Unsupported(format!(
+            "host {}: rupu was not found on the remote's PATH (`command -v rupu` failed in a \
+             non-interactive ssh session); install rupu there or put it on that PATH",
+            self.host_id
+        ))
+    }
+
+    /// Run `rupu __message <argv>` on the remote behind its feature gate
+    /// ([`message_command`]) and read what it printed: `T`, or its
+    /// `{"error": …}` reply, which keeps its code's status.
+    async fn message_call<T: serde::de::DeserializeOwned>(
+        &self,
+        argv: Vec<String>,
+    ) -> Result<T, HostConnectorError> {
+        let out = self
+            .exec
+            .run(&message_command(&argv))
+            .await
+            .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
+        if printed(&out.stdout, LAUNCH_RUPU_NOT_FOUND) {
+            return Err(self.rupu_not_found());
+        }
+        if printed(&out.stdout, MESSAGES_UNSUPPORTED) {
+            return Err(HostConnectorError::Unsupported(format!(
+                "host {}: the remote rupu predates `{CAP_RUN_MESSAGES}`; upgrade rupu there",
+                self.host_id
+            )));
+        }
+        let stdout = out.stdout.trim();
+        if let Ok(reply) = serde_json::from_str::<MessageErrorReply>(stdout) {
+            return Err(crate::host::messages::connector_error(reply.error, |m| {
+                HostConnectorError::Remote(500, format!("host {}: {m}", self.host_id))
+            }));
+        }
+        if out.success {
+            return serde_json::from_str(stdout).map_err(|e| {
+                HostConnectorError::Remote(0, format!("parse `rupu __message` output: {e}"))
+            });
+        }
+        let stderr = out.stderr.trim();
+        if is_ssh_transport_failure(stderr) {
+            return Err(HostConnectorError::Unreachable(stderr.to_string()));
+        }
+        Err(HostConnectorError::Remote(
+            0,
+            format!("`rupu __message` failed on host {}: {stderr}", self.host_id),
+        ))
+    }
+
     /// [`Self::skills_gate`] with nothing to run: prints a marker exactly
     /// when the launch's own gate would refuse.
     fn skills_gate_command() -> String {
@@ -2150,22 +2267,17 @@ impl SshHostConnector {
 
     /// The refusal a skills-gate marker in `stdout` stands for.
     fn skills_gate_refusal(&self, stdout: &str) -> Option<HostConnectorError> {
-        let printed = |marker: &str| stdout.lines().any(|l| l.trim() == marker);
-        if printed(LAUNCH_RUPU_NOT_FOUND) {
-            return Some(HostConnectorError::Unsupported(format!(
-                "host {}: rupu was not found on the remote's PATH (`command -v rupu` failed in a \
-                 non-interactive ssh session); install rupu there or put it on that PATH",
-                self.host_id
-            )));
+        if printed(stdout, LAUNCH_RUPU_NOT_FOUND) {
+            return Some(self.rupu_not_found());
         }
-        if printed(LAUNCH_SKILLS_UNSUPPORTED) {
+        if printed(stdout, LAUNCH_SKILLS_UNSUPPORTED) {
             return Some(HostConnectorError::Unsupported(format!(
                 "host {} runs a rupu without workflow-step skills support, so this unit's \
                  skills cannot be delivered; upgrade rupu there",
                 self.host_id
             )));
         }
-        if printed(SKILLS_BUNDLE_UNSUPPORTED) {
+        if printed(stdout, SKILLS_BUNDLE_UNSUPPORTED) {
             return Some(HostConnectorError::Unsupported(format!(
                 "host {} runs a rupu without shipped-skills support (no {CAP_AGENT_SKILL_BUNDLE}), \
                  so this unit's shipped skills cannot be delivered; upgrade rupu there",
@@ -3357,6 +3469,27 @@ impl HostConnector for SshHostConnector {
         let complete = self.mirror.coverage_complete(run_id).await;
         let bytes = crate::host::connector::mirror_unit_coverage(&self.run_store, run_id).await?;
         Ok(CoverageRead { bytes, complete })
+    }
+
+    /// Shells `rupu __message list` on the remote (no listing cache: a
+    /// message view is read when asked for, never on a page's poll of the
+    /// host list).
+    async fn list_messages(
+        &self,
+        id: &str,
+        q: ViewQuery,
+    ) -> Result<MessagesView, HostConnectorError> {
+        self.message_call(message_list_argv(id, &q)).await
+    }
+
+    /// Shells `rupu __message send`. A message changes nothing the listing
+    /// cache holds, so the cache is left alone.
+    async fn send_operator_message(
+        &self,
+        id: &str,
+        msg: OperatorMessageRequest,
+    ) -> Result<OperatorSendReply, HostConnectorError> {
+        self.message_call(message_send_argv(id, &msg)).await
     }
 
     async fn pull_finding_artifact(
@@ -10864,5 +10997,264 @@ mod tests {
                 "no mirror run left running"
             );
         }
+    }
+
+    // ── Operator messages (spec F1b §3.6) ─────────────────────────────────────
+
+    /// Runs each command through a real `/bin/sh` with `path` as its PATH:
+    /// what the remote login shell does with the one command a messages call
+    /// sends.
+    struct LocalShell {
+        path: String,
+    }
+
+    #[async_trait::async_trait]
+    impl RemoteExec for LocalShell {
+        async fn run(&self, remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(remote)
+                .env("PATH", &self.path)
+                .output()
+                .map_err(|e| RemoteExecError::Spawn(e.to_string()))?;
+            Ok(RemoteOutput {
+                stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                success: out.status.success(),
+            })
+        }
+        fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+            unimplemented!("not used by messages")
+        }
+        async fn run_bytes(
+            &self,
+            _c: &str,
+            _s: Option<Vec<u8>>,
+        ) -> Result<Vec<u8>, RemoteExecError> {
+            unimplemented!("not used by messages")
+        }
+    }
+
+    /// A fake remote `rupu` in a fresh bin dir: `__features` runs
+    /// `features`; `__message` writes its argv, one NUL-terminated word each,
+    /// to `<bin>/argv`, then runs `reply`.
+    fn fake_message_rupu(features: &str, reply: &str) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = tempfile::tempdir().unwrap();
+        let rupu = bin.path().join("rupu");
+        std::fs::write(
+            &rupu,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = __features ]; then {features}; exit 0; fi\n\
+                 printf '%s\\0' \"$@\" > '{argv}'\n{reply}\n",
+                argv = bin.path().join("argv").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&rupu, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    fn shell_conn(path: String) -> (SshHostConnector, tempfile::TempDir) {
+        let (conn, _store, tmp) = make_conn(std::sync::Arc::new(LocalShell { path }));
+        (conn, tmp)
+    }
+
+    fn recorded_argv(bin: &tempfile::TempDir) -> Option<Vec<String>> {
+        let raw = std::fs::read(bin.path().join("argv")).ok()?;
+        Some(
+            raw.split(|b| *b == 0)
+                .filter(|w| !w.is_empty())
+                .map(|w| String::from_utf8(w.to_vec()).unwrap())
+                .collect(),
+        )
+    }
+
+    /// A send reaches the remote `rupu __message send` as the words it was
+    /// given — a body with quotes, a newline, a `$` and a leading `-` is one
+    /// `--body=` word — and a list as its query's flags; each reply is read
+    /// back typed.
+    #[tokio::test]
+    async fn messages_reach_the_remote_helper_word_for_word() {
+        let report =
+            serde_json::to_string(&crate::node::protocol::FeaturesReport::current()).unwrap();
+        let reply = r#"{"id":"msg_01X","delivery":{"resolved":["lynx#1"]}}"#;
+        let bin = fake_message_rupu(&format!("echo '{report}'"), &format!("echo '{reply}'"));
+        let (conn, _tmp) = shell_conn(format!("{}:/usr/bin:/bin", bin.path().display()));
+        let body = "-it's \"done\"\nsecond line $HOME `x`";
+        let sent = conn
+            .send_operator_message(
+                "run_01MSG",
+                OperatorMessageRequest {
+                    to: Some("lynx#1".into()),
+                    body: body.into(),
+                    urgent: true,
+                    viewer: Some("matt".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(sent.id, "msg_01X");
+        assert_eq!(sent.delivery.resolved, vec!["lynx#1".to_string()]);
+        assert_eq!(
+            recorded_argv(&bin).unwrap(),
+            vec![
+                "__message".to_string(),
+                "send".into(),
+                "run_01MSG".into(),
+                format!("--body={body}"),
+                "--to=lynx#1".into(),
+                "--urgent".into(),
+                "--viewer=matt".into(),
+            ]
+        );
+
+        let view = r#"{"participants":[],"messages":[],"legacy":false,"space":"absent"}"#;
+        let bin = fake_message_rupu(&format!("echo '{report}'"), &format!("echo '{view}'"));
+        let (conn, _tmp) = shell_conn(format!("{}:/usr/bin:/bin", bin.path().display()));
+        let got = conn
+            .list_messages(
+                "af_01MSG",
+                ViewQuery {
+                    after: Some("msg_01A".into()),
+                    limit: 20,
+                    kinds: Some(vec![
+                        rupu_fleet::MessageKind::Direct,
+                        rupu_fleet::MessageKind::Operator,
+                    ]),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            got.space,
+            rupu_runtime::services::operator::SpacePresence::Absent
+        );
+        assert_eq!(
+            recorded_argv(&bin).unwrap(),
+            [
+                "__message",
+                "list",
+                "af_01MSG",
+                "--after=msg_01A",
+                "--limit=20",
+                "--kind=direct,operator"
+            ]
+        );
+        let all = ViewQuery {
+            after: None,
+            limit: usize::MAX,
+            kinds: None,
+        };
+        conn.list_messages("af_01MSG", all).await.unwrap();
+        assert_eq!(
+            recorded_argv(&bin).unwrap(),
+            ["__message", "list", "af_01MSG"]
+        );
+    }
+
+    /// Only a remote whose `rupu __features` lists `run.messages` runs `rupu
+    /// __message`; any other is `Unsupported` with why, and runs nothing.
+    #[tokio::test]
+    async fn messages_run_only_on_a_remote_advertising_them() {
+        let request = || OperatorMessageRequest {
+            to: None,
+            body: "x".into(),
+            urgent: false,
+            viewer: None,
+        };
+        let cases = [
+            (
+                "rupu listing other features",
+                r#"echo '{"features":["run.list"]}'"#,
+                true,
+                "predates `run.messages`",
+            ),
+            (
+                "rupu predating __features",
+                "echo \"error: unrecognized subcommand '__features'\" >&2; exit 2",
+                true,
+                "predates `run.messages`",
+            ),
+            (
+                "no rupu on the PATH",
+                r#"echo '{"features":["run.messages"]}'"#,
+                false,
+                "not found on the remote's PATH",
+            ),
+        ];
+        for (why, features, on_path, reason) in cases {
+            let bin = fake_message_rupu(features, "echo '{}'");
+            let path = if on_path {
+                format!("{}:/usr/bin:/bin", bin.path().display())
+            } else {
+                "/usr/bin:/bin".to_string()
+            };
+            let (conn, _tmp) = shell_conn(path);
+            let err = conn
+                .send_operator_message("run_01MSG", request())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, HostConnectorError::Unsupported(m) if m.contains(reason)),
+                "{why}: {err:?}"
+            );
+            assert_eq!(recorded_argv(&bin), None, "{why}: `__message` never ran");
+        }
+    }
+
+    /// The helper's `{"error": …}` reply (exit 3) keeps its code's status;
+    /// an ssh that never reached the remote is `Unreachable`.
+    #[tokio::test]
+    async fn a_remote_message_refusal_keeps_its_status() {
+        let report =
+            serde_json::to_string(&crate::node::protocol::FeaturesReport::current()).unwrap();
+        let refusal = |code: &str| {
+            let bin = fake_message_rupu(
+                &format!("echo '{report}'"),
+                &format!(r#"echo '{{"error":{{"code":"{code}","message":"why not"}}}}'; exit 3"#),
+            );
+            let (conn, tmp) = shell_conn(format!("{}:/usr/bin:/bin", bin.path().display()));
+            (conn, tmp, bin)
+        };
+        let send = OperatorMessageRequest {
+            to: None,
+            body: "x".into(),
+            urgent: false,
+            viewer: None,
+        };
+        let (conn, _t, _b) = refusal("not_live");
+        assert!(matches!(
+            conn.send_operator_message("run_01MSG", send.clone()).await,
+            Err(HostConnectorError::Remote(409, m)) if m == "why not"
+        ));
+        let (conn, _t, _b) = refusal("log_full");
+        assert!(matches!(
+            conn.send_operator_message("run_01MSG", send.clone()).await,
+            Err(HostConnectorError::Remote(409, _))
+        ));
+        let (conn, _t, _b) = refusal("not_found");
+        assert!(matches!(
+            conn.send_operator_message("run_01MSG", send.clone()).await,
+            Err(HostConnectorError::NotFound(m)) if m == "why not"
+        ));
+        let (conn, _t, _b) = refusal("invalid");
+        assert!(matches!(
+            conn.send_operator_message("run_01MSG", send.clone()).await,
+            Err(HostConnectorError::Invalid(_))
+        ));
+        let (conn, _t, _b) = refusal("internal");
+        assert!(matches!(
+            conn.send_operator_message("run_01MSG", send.clone()).await,
+            Err(HostConnectorError::Remote(500, m)) if m == "host host_abc: why not"
+        ));
+
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::new(FakeExec::offline(
+            "ssh: connect to host h port 22: Connection refused",
+        )));
+        assert!(matches!(
+            conn.send_operator_message("run_01MSG", send).await,
+            Err(HostConnectorError::Unreachable(_))
+        ));
     }
 }

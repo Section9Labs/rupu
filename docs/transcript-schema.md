@@ -465,10 +465,10 @@ per turn.
 
 | Field         | Type     | Description |
 |---------------|----------|-------------|
-| `source`      | string   | Who it is from (`mailbox:lynx#1`, `broadcast:lynx#1`, `directive:board`, `roster`, `children`) |
-| `kind`        | string   | `message`, `directive`, `observation` or `status` |
+| `source`      | string   | Who it is from (`mailbox:lynx#1`, `broadcast:lynx#1`, `directive:board`, `operator`, `roster`, `children`) |
+| `kind`        | string   | `message`, `directive`, `operator`, `observation` or `status`. `operator` is framed as the operator's instruction, everything else as data |
 | `cadence`     | string   | `once` (kept in the conversation) or `every_turn` (sent with each request, never kept) |
-| `content`     | string   | The collector's text, before the injected-data framing the model sees |
+| `content`     | string   | The collector's text, before the framing the model sees (an urgent operator message starts `URGENT: `) |
 | `message_ids` | string[] | The messages it delivers; absent when none |
 
 ```json

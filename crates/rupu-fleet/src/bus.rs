@@ -14,10 +14,13 @@ use crate::address::{self, Address};
 use crate::board::Board;
 use crate::error::{BusError, FleetError};
 use crate::log::{
-    self, Delivery, LogLine, LogMessage, LogPage, MessageKind, Refs, SendReceipt, Undelivered,
+    self, Delivery, LogLine, LogMessage, LogPage, MessageKind, OperatorVia, Refs, SendReceipt,
+    Undelivered,
 };
 use crate::mailbox::Mailbox;
-use crate::participants::{Member, ParticipantEvent, Resolution, Roster, Sender, Undeliverable};
+use crate::participants::{
+    Member, Participant, ParticipantEvent, Resolution, Roster, Sender, Undeliverable,
+};
 use crate::types::{BoardPost, ClaimGuard, Directive, FleetMessage, PostKind};
 use std::collections::HashMap;
 use std::io::Write;
@@ -70,16 +73,15 @@ impl ClaimTable {
     }
 }
 
-/// Whether a run has joined its space (spec F1a §3.1, FD1).
+/// A message from the operator (spec F1b §3.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Presence {
-    /// Nobody said who the run is (a bare bus: tests, tools in isolation).
-    Absent,
-    /// The run will join on its first write or its first child: a
-    /// standalone run's or a session's own space is created lazily.
-    Pending(Member),
-    /// Its `joined` line is written.
-    Joined(Member),
+pub struct OperatorMessage {
+    pub to: Address,
+    pub body: String,
+    pub urgent: bool,
+    pub via: OperatorVia,
+    /// Who sent it, when the surface knows (the CP's viewer).
+    pub viewer: Option<String>,
 }
 
 /// One run's address in its message space.
@@ -93,8 +95,9 @@ pub struct Bus {
     pub claims: ClaimTable,
     pub caps: BusCaps,
     space: PathBuf,
-    /// Who the run is in the space, and whether it has joined yet.
-    presence: RwLock<Presence>,
+    /// Who the run is in the space, once it joined (a bare bus — tests,
+    /// tools in isolation, the operator — never does).
+    member: RwLock<Option<Member>>,
     /// Whether the agent loop records the run as `left` when it ends. An
     /// agentiflow lead's rounds and a session's turns stay joined between
     /// runs.
@@ -115,7 +118,7 @@ impl Bus {
             claims: ClaimTable::default(),
             caps: BusCaps::default(),
             space: space.to_path_buf(),
-            presence: RwLock::new(Presence::Absent),
+            member: RwLock::new(None),
             leave_on_exit: true,
             #[cfg(test)]
             fail_after_log: Default::default(),
@@ -150,39 +153,20 @@ impl Bus {
         self.space.join("participants.jsonl")
     }
 
-    /// Who the run is, once it said (joined or not).
+    /// Who the run is, once it joined.
     pub fn member(&self) -> Option<Member> {
-        match &*self.presence.read().unwrap_or_else(|e| e.into_inner()) {
-            Presence::Absent => None,
-            Presence::Pending(m) | Presence::Joined(m) => Some(m.clone()),
-        }
+        self.member
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Whether the run's `joined` line is written.
     pub fn is_joined(&self) -> bool {
-        matches!(
-            &*self.presence.read().unwrap_or_else(|e| e.into_inner()),
-            Presence::Joined(_)
-        )
-    }
-
-    /// Say who the run is without joining yet: it joins on its first write
-    /// or when it launches a child into the space ([`Bus::ensure_joined`]),
-    /// so a run that never messages creates nothing (FD1).
-    pub fn prepare(&self, member: Member) {
-        let mut p = self.presence.write().unwrap_or_else(|e| e.into_inner());
-        if !matches!(*p, Presence::Joined(_)) {
-            *p = Presence::Pending(member);
-        }
-    }
-
-    /// Join now if the run was [prepared](Bus::prepare) and hasn't yet.
-    pub fn ensure_joined(&self) -> Result<(), BusError> {
-        let pending = match &*self.presence.read().unwrap_or_else(|e| e.into_inner()) {
-            Presence::Pending(m) => m.clone(),
-            Presence::Absent | Presence::Joined(_) => return Ok(()),
-        };
-        self.join(pending)
+        self.member
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
 
     /// A bus for `participant` on the same space (a child sharing its
@@ -205,8 +189,17 @@ impl Bus {
 
     /// Record that this run joined the space as `member`, and start its
     /// broadcast cursor. Idempotent for the same run: an agentiflow lead
-    /// joins once, however many rounds it runs.
+    /// joins once, however many rounds it runs. A run can't join at a fixed
+    /// address other than `lead`: it would shadow what that address means.
     pub fn join(&self, member: Member) -> Result<(), BusError> {
+        if [address::OPERATOR, address::BROADCAST, address::PARENT]
+            .contains(&self.participant.as_str())
+        {
+            return Err(FleetError::Refused(format!(
+                "a run can't join as `{}`: it is a fixed address",
+                self.participant
+            )));
+        }
         let _lock = self.lock()?;
         let roster = self.roster()?;
         let rejoin = roster
@@ -223,16 +216,15 @@ impl Bus {
             )?;
         }
         self.mailbox.register_broadcast_cursor(&self.participant)?;
-        *self.presence.write().unwrap_or_else(|e| e.into_inner()) = Presence::Joined(member);
+        *self.member.write().unwrap_or_else(|e| e.into_inner()) = Some(member);
         Ok(())
     }
 
     /// Record that this run left the space with `status`. A run that never
     /// joined writes nothing.
     pub fn leave(&self, status: &str) -> Result<(), BusError> {
-        let member = match &*self.presence.read().unwrap_or_else(|e| e.into_inner()) {
-            Presence::Joined(m) => m.clone(),
-            Presence::Absent | Presence::Pending(_) => return Ok(()),
+        let Some(member) = self.member() else {
+            return Ok(());
         };
         let _lock = self.lock()?;
         append(
@@ -244,6 +236,37 @@ impl Bus {
                 at: now(),
             },
         )
+    }
+
+    /// Record that every participant still live in the space at `space`
+    /// left with `status`: its runs ended without leaving (a session stopped
+    /// or archived between turns). Returns how many it recorded; a space
+    /// with no participants is left unwritten.
+    pub fn leave_all(space: &Path, status: &str) -> Result<usize, BusError> {
+        let bus = Bus::open(space, address::OPERATOR);
+        if !bus.participants_path().exists() {
+            return Ok(0);
+        }
+        let _lock = bus.lock()?;
+        let live: Vec<Participant> = bus
+            .roster()?
+            .participants()
+            .filter(|p| p.live)
+            .cloned()
+            .collect();
+        let at = now();
+        for p in &live {
+            append(
+                &bus.participants_path(),
+                &ParticipantEvent::Left {
+                    address: p.address.clone(),
+                    run_id: p.member.run_id.clone(),
+                    status: status.to_string(),
+                    at: at.clone(),
+                },
+            )?;
+        }
+        Ok(live.len())
     }
 
     /// A board post, optionally addressed. Every participant can read it;
@@ -263,6 +286,7 @@ impl Bus {
                 post_kind: Some(kind),
                 body,
                 refs: Refs::default(),
+                ..Draft::plain()
             },
             |m| {
                 self.board.post(&BoardPost {
@@ -292,31 +316,64 @@ impl Bus {
                 post_kind: None,
                 body,
                 refs: Refs::default(),
+                ..Draft::plain()
             },
-            |m| {
-                let line = FleetMessage {
-                    id: Some(m.id.clone()),
-                    from: m.from.clone(),
-                    from_codename: m.from_codename.clone(),
-                    to: m.to.clone(),
-                    ts: m.ts.clone(),
-                    body: m.body.clone(),
-                };
-                if kind == MessageKind::Broadcast {
-                    if m.delivery.undelivered.is_empty() {
-                        self.mailbox.broadcast_send(&line, self.caps.msg_cap)?;
-                    }
-                    return Ok(());
-                }
-                for r in &m.delivery.resolved {
-                    // The operator's messages are read from the log.
-                    if r != address::OPERATOR {
-                        self.mailbox.send(r, &line, self.caps.msg_cap)?;
-                    }
-                }
-                Ok(())
-            },
+            |m| self.deliver(m, kind == MessageKind::Broadcast),
         )
+    }
+
+    /// A message from the operator (spec F1b §3.1): a `kind: operator` log
+    /// line from `operator`, delivered as `send` delivers. The operator
+    /// never joins; no catalog tool reaches this, so an agent can never
+    /// speak as the operator (FD5).
+    pub fn operator_send(&self, msg: OperatorMessage) -> Result<SendReceipt, BusError> {
+        if msg.to == Address::Operator {
+            return Err(FleetError::Refused(
+                "the operator can't send a message to the operator".into(),
+            ));
+        }
+        let broadcast = msg.to == Address::Broadcast;
+        self.write_as(
+            address::OPERATOR,
+            Draft {
+                kind: MessageKind::Operator,
+                to: Some(&msg.to),
+                post_kind: None,
+                body: &msg.body,
+                refs: Refs::default(),
+                urgent: msg.urgent,
+                via: Some(msg.via),
+                viewer: msg.viewer.clone(),
+            },
+            |m| self.deliver(m, broadcast),
+        )
+    }
+
+    /// Put the logged message `m` where its recipients read it: the
+    /// broadcast log, or each resolved recipient's inbox.
+    fn deliver(&self, m: &LogMessage, broadcast: bool) -> Result<(), FleetError> {
+        let line = FleetMessage {
+            id: Some(m.id.clone()),
+            from: m.from.clone(),
+            from_codename: m.from_codename.clone(),
+            to: m.to.clone(),
+            ts: m.ts.clone(),
+            body: m.body.clone(),
+            urgent: m.urgent,
+        };
+        if broadcast {
+            if m.delivery.undelivered.is_empty() {
+                self.mailbox.broadcast_send(&line, self.caps.msg_cap)?;
+            }
+            return Ok(());
+        }
+        for r in &m.delivery.resolved {
+            // The operator's messages are read from the log.
+            if r != address::OPERATOR {
+                self.mailbox.send(r, &line, self.caps.msg_cap)?;
+            }
+        }
+        Ok(())
     }
 
     /// A standing directive, to everyone (`None`, or `broadcast`) or to an
@@ -330,6 +387,7 @@ impl Bus {
                 post_kind: None,
                 body,
                 refs: Refs::default(),
+                ..Draft::plain()
             },
             |m| {
                 self.board
@@ -357,6 +415,7 @@ impl Bus {
                     retracts: Some(directive.to_string()),
                     reply_to: None,
                 },
+                ..Draft::plain()
             },
             |_| self.board.retract_directive(directive),
         )
@@ -398,14 +457,31 @@ impl Bus {
         lock_exclusive(&self.space.join("log.jsonl.lock"))
     }
 
-    /// The one write path: under the log lock, check the size cap, resolve
-    /// the address, append the message, then update the working state.
+    /// A write by this run. `from: operator` is the operator's alone
+    /// ([`Bus::operator_send`]): a bus at that address writes nothing else,
+    /// so a log line from `operator` is always the operator's.
     fn write(
         &self,
         draft: Draft<'_>,
         apply: impl FnOnce(&LogMessage) -> Result<(), FleetError>,
     ) -> Result<SendReceipt, BusError> {
-        self.ensure_joined()?;
+        if self.participant == address::OPERATOR {
+            return Err(FleetError::Refused(
+                "a run can't write as `operator`: the operator's messages go through operator_send"
+                    .into(),
+            ));
+        }
+        self.write_as(&self.participant, draft, apply)
+    }
+
+    /// The one write path: under the log lock, check the size cap, resolve
+    /// the address, append the message, then update the working state.
+    fn write_as(
+        &self,
+        from: &str,
+        draft: Draft<'_>,
+        apply: impl FnOnce(&LogMessage) -> Result<(), FleetError>,
+    ) -> Result<SendReceipt, BusError> {
         let _lock = self.lock()?;
         let log_path = self.log_path();
         let size = std::fs::metadata(&log_path).map_or(0, |m| m.len());
@@ -422,27 +498,32 @@ impl Bus {
                 let resolution = roster.resolve(
                     to,
                     Sender {
-                        address: &self.participant,
+                        address: from,
                         parent_run_id: member.as_ref().and_then(|m| m.parent_run_id.as_deref()),
                     },
                     &|name| self.mailbox.has_mailbox(name),
                 );
                 let to_string = resolution.to.clone();
-                (Some(to_string), self.delivery(draft.kind, resolution)?)
+                (
+                    Some(to_string),
+                    self.delivery(draft.kind, &draft.to, resolution)?,
+                )
             }
         };
         let message = LogMessage {
             id: format!("msg_{}", ulid::Ulid::new()),
             ts: now(),
             kind: draft.kind,
-            from: self.participant.clone(),
+            from: from.to_string(),
             from_codename: member.and_then(|m| m.codename),
             to,
             post_kind: draft.post_kind,
             body: draft.body.to_string(),
-            urgent: false,
+            urgent: draft.urgent,
             refs: draft.refs,
             delivery,
+            via: draft.via,
+            viewer: draft.viewer,
         };
         append(&log_path, &LogLine::Msg(message.clone()))?;
         #[cfg(test)]
@@ -484,7 +565,18 @@ impl Bus {
 
     /// `resolution` with the backpressure caps applied: a recipient whose
     /// inbox is full, or a full broadcast log, is undelivered.
-    fn delivery(&self, kind: MessageKind, resolution: Resolution) -> Result<Delivery, BusError> {
+    fn delivery(
+        &self,
+        kind: MessageKind,
+        to: &Option<&Address>,
+        resolution: Resolution,
+    ) -> Result<Delivery, BusError> {
+        // An operator message travels as a broadcast or a direct message.
+        let kind = match kind {
+            MessageKind::Operator if *to == Some(&Address::Broadcast) => MessageKind::Broadcast,
+            MessageKind::Operator => MessageKind::Direct,
+            kind => kind,
+        };
         let mut undelivered: Vec<Undelivered> = resolution
             .undelivered
             .map(|reason| Undelivered {
@@ -532,6 +624,25 @@ struct Draft<'a> {
     post_kind: Option<PostKind>,
     body: &'a str,
     refs: Refs,
+    urgent: bool,
+    via: Option<OperatorVia>,
+    viewer: Option<String>,
+}
+
+impl Draft<'_> {
+    /// The fields only an operator message sets, unset.
+    fn plain() -> Self {
+        Draft {
+            kind: MessageKind::Post,
+            to: None,
+            post_kind: None,
+            body: "",
+            refs: Refs::default(),
+            urgent: false,
+            via: None,
+            viewer: None,
+        }
+    }
 }
 
 fn now() -> String {

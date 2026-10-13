@@ -19,7 +19,7 @@ use tokio::io::AsyncBufReadExt as _;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-fn seed_run(id: &str, status: RunStatus) -> RunRecord {
+pub(crate) fn seed_run(id: &str, status: RunStatus) -> RunRecord {
     RunRecord {
         customer: None,
         id: id.into(),

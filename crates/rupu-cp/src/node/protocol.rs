@@ -298,6 +298,12 @@ pub const CAP_WORKFLOW_RESUME_IF_UNFINISHED: &str = "workflow.resume_if_unfinish
 /// it predates the command ("needs a newer rupu").
 pub const CAP_RUN_LIST: &str = "run.list";
 
+/// Host feature: this build serves operator messaging — `GET`/`POST
+/// /api/{runs,sessions,agentiflows}/:id/messages` over HTTP, `rupu
+/// __message list|send` over SSH (spec F1b §3.6). A connector refuses to
+/// read or send messages through a peer that does not list it.
+pub const CAP_RUN_MESSAGES: &str = "run.messages";
+
 /// Every feature this build honours as a host — what `/api/host/info`
 /// serves as `features` and what `rupu __features` prints for an SSH
 /// coordinator. Same vocabulary as the tunnel `Hello.capabilities` and the
@@ -316,6 +322,7 @@ pub fn host_features() -> Vec<String> {
         CAP_RUN_CODENAME.to_string(),
         CAP_RUN_CODENAME_FLAG.to_string(),
         CAP_RUN_SUPPLIED_RUN_ID.to_string(),
+        CAP_RUN_MESSAGES.to_string(),
     ]
 }
 
@@ -530,6 +537,10 @@ mod tests {
             "{features:?}"
         );
         assert!(features.iter().any(|f| f == CAP_RUN_LIST), "{features:?}");
+        assert!(
+            features.iter().any(|f| f == CAP_RUN_MESSAGES),
+            "{features:?}"
+        );
     }
 
     #[test]

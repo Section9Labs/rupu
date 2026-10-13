@@ -260,7 +260,7 @@ enum Work {
     /// whose children it takes on, when it continues one.
     Subagent {
         spec: Box<rupu_agent::AgentSpec>,
-        prompt: UserTurn,
+        prompt: Box<UserTurn>,
         ceiling: PermissionMode,
         continues: Option<String>,
     },
@@ -355,17 +355,6 @@ impl Caller {
                 .and_then(Path::parent)
                 .map(Path::to_path_buf),
             bus: ctx.services.message_space.clone(),
-        }
-    }
-
-    /// A child is entering the caller's message space (launched, continued
-    /// or relaunched): the caller joins it now if it hasn't (FD1), so the
-    /// child's `parent` resolves.
-    fn join_space(&self) {
-        if let Some(bus) = &self.bus {
-            if let Err(e) = bus.ensure_joined() {
-                tracing::warn!(error = %e, "could not join the parent to its message space");
-            }
         }
     }
 
@@ -882,53 +871,51 @@ impl RunLauncher {
         continues: Option<String>,
     ) {
         let started = Instant::now();
-        let launch =
-            LaunchSpec {
-                agent: spec,
-                origin: Origin::SubAgent {
-                    parent: ParentRun {
-                        identity: Arc::clone(&from.identity),
-                        usage: from
-                            .identity
-                            .launch
-                            .usage_root
-                            .clone()
-                            .map(UsageLedger::open),
-                        coverage_stream: from.coverage_stream.clone(),
-                    },
+        let launch = LaunchSpec {
+            agent: spec,
+            origin: Origin::SubAgent {
+                parent: ParentRun {
+                    identity: Arc::clone(&from.identity),
+                    usage: from
+                        .identity
+                        .launch
+                        .usage_root
+                        .clone()
+                        .map(UsageLedger::open),
+                    coverage_stream: from.coverage_stream.clone(),
                 },
-                run_id: child.run_id.clone(),
-                transcript_path: child.transcript.clone().unwrap_or_default(),
-                codename: child.codename.clone(),
-                prompt,
-                workspace: from.workspace.clone(),
-                mode: ceiling,
-                ceiling: Some(ceiling),
-                prompter: from.prompter.clone(),
-                overrides: Overrides::default(),
-                // The parent's printer renders the child from its transcript.
-                stream: StreamOpts {
-                    suppress_stdout: true,
-                    ..StreamOpts::default()
-                },
-                hooks: Default::default(),
-                // `finish` stops an abandoned child at its next safe boundary.
-                pause: Some(child.stop.clone()),
-                services: LaunchServices {
-                    launcher: Some(Arc::clone(&self) as Arc<dyn Launcher>),
-                    workflow_generator: from.generator.clone(),
-                    // It shares its parent's message space.
-                    message_bus: from.bus.as_ref().zip(child.address.as_ref()).map(
-                        |(bus, address)| {
-                            from.join_space();
-                            Arc::new(bus.sibling(address.clone()))
-                        },
-                    ),
-                    ..Default::default()
-                },
-                collectors: Vec::new(),
-                link: None,
-            };
+            },
+            run_id: child.run_id.clone(),
+            transcript_path: child.transcript.clone().unwrap_or_default(),
+            codename: child.codename.clone(),
+            prompt,
+            workspace: from.workspace.clone(),
+            mode: ceiling,
+            ceiling: Some(ceiling),
+            prompter: from.prompter.clone(),
+            overrides: Overrides::default(),
+            // The parent's printer renders the child from its transcript.
+            stream: StreamOpts {
+                suppress_stdout: true,
+                ..StreamOpts::default()
+            },
+            hooks: Default::default(),
+            // `finish` stops an abandoned child at its next safe boundary.
+            pause: Some(child.stop.clone()),
+            services: LaunchServices {
+                launcher: Some(Arc::clone(&self) as Arc<dyn Launcher>),
+                workflow_generator: from.generator.clone(),
+                // It shares its parent's message space.
+                message_bus: from
+                    .bus
+                    .as_ref()
+                    .zip(child.address.as_ref())
+                    .map(|(bus, address)| Arc::new(bus.sibling(address.clone()))),
+                ..Default::default()
+            },
+            collectors: Vec::new(),
+            link: None,
+        };
         let (provider, model) = self
             .env
             .assembler
@@ -1329,7 +1316,7 @@ impl RunLauncher {
                         .run_subagent(
                             Arc::clone(&task_child),
                             *spec,
-                            prompt,
+                            *prompt,
                             ceiling,
                             from,
                             continues,
@@ -1568,7 +1555,7 @@ impl RunLauncher {
                 let child = self.continued(&prior, sub, Some(transcript), launch, from);
                 let work = Work::Subagent {
                     spec: Box::new(spec),
-                    prompt,
+                    prompt: Box::new(prompt),
                     ceiling: mode,
                     continues: Some(prior.run_id.clone()),
                 };
@@ -1654,7 +1641,7 @@ impl RunLauncher {
                 let child = self.continued(prior, sub, Some(transcript), launch, from);
                 let work = Work::Subagent {
                     spec: Box::new(spec),
-                    prompt: UserTurn::new(request.prompt.unwrap_or_default()),
+                    prompt: Box::new(UserTurn::new(request.prompt.unwrap_or_default())),
                     ceiling: mode,
                     continues: None,
                 };
@@ -1796,10 +1783,7 @@ impl RunLauncher {
     /// flow's.
     fn message_space(&self, child: &Child, from: &Caller) -> Option<MessageSpace> {
         let dir = match &from.bus {
-            Some(bus) => {
-                from.join_space();
-                bus.space().to_path_buf()
-            }
+            Some(bus) => bus.space().to_path_buf(),
             None => from.identity.launch.flow.clone()?,
         };
         Some(MessageSpace {
@@ -2010,14 +1994,12 @@ impl Launcher for RunLauncher {
             ChildKind::Workflow => (format!("run_{}", ulid::Ulid::new()), None),
         };
         // A child sharing the parent's space (a workflow child is its own):
-        // the parent joins it now if it hasn't (FD1), so the child's
-        // `parent` resolves, and the child's broadcast cursor starts at the
-        // space's current tip before it exists, so nothing broadcast before
-        // its first turn is swallowed as backlog.
+        // its broadcast cursor starts at the space's current tip before it
+        // exists, so nothing broadcast before its first turn is swallowed as
+        // backlog.
         if let (Some(bus), Some(address), false) =
             (&from.bus, &address, req.kind == ChildKind::Workflow)
         {
-            from.join_space();
             if let Err(e) = bus.mailbox.register_broadcast_cursor(address) {
                 tracing::warn!(participant = %address, error = %e, "could not register the child's broadcast cursor");
             }
@@ -2067,7 +2049,7 @@ impl Launcher for RunLauncher {
                 },
             ) => Work::Subagent {
                 spec,
-                prompt: UserTurn::new(prompt),
+                prompt: Box::new(UserTurn::new(prompt)),
                 ceiling: mode,
                 continues: None,
             },

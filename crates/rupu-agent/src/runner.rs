@@ -1532,6 +1532,10 @@ pub struct UserTurn {
     /// 2026-10-12 §5.1: a session's frozen set, thawed for this turn): each
     /// is reported at run start, and the run goes on without it.
     pub missing_skills: Vec<rupu_skills::MissingSkill>,
+    /// Messages delivered into the conversation this run continues that no
+    /// model call saw (its run stopped first): [`RunExit::unseen_messages`].
+    /// This run's first model call sees them, and writes their receipts.
+    pub unseen_messages: Vec<String>,
 }
 
 /// A skill an operator injected into a turn's message, at the version
@@ -1714,6 +1718,9 @@ struct Run {
     /// The skills whose bodies the model was given, most recently loaded
     /// last, one entry per name.
     loaded_skills: Vec<LoadedSkill>,
+    /// Messages in `messages` that no model call has seen yet: their
+    /// receipts are written after the next call.
+    unseen_messages: Vec<String>,
 }
 
 /// A skill whose body entered the conversation, at the version it had.
@@ -1748,6 +1755,7 @@ impl Run {
         tool_context.services.prompter = permission.prompter().cloned();
         let id = Arc::clone(&tool_context.identity);
         let loaded_skills = prompt.loaded_skills.clone();
+        let unseen_messages = prompt.unseen_messages.clone();
         Self {
             provider_name: id.provider.clone(),
             model: id.model.clone(),
@@ -1770,6 +1778,7 @@ impl Run {
             collectors,
             transcript_path,
             loaded_skills,
+            unseen_messages,
         }
     }
 
@@ -1963,6 +1972,11 @@ pub struct RunExit {
     /// recently loaded last: what a run that carries `messages` on (an
     /// agentiflow lead's next round) starts with.
     pub loaded_skills: Vec<LoadedSkill>,
+    /// Messages delivered into `messages` that no model call saw (the run
+    /// stopped first): a run that carries `messages` on is given them as
+    /// [`UserTurn::unseen_messages`], so its first call writes their
+    /// receipts.
+    pub unseen_messages: Vec<String>,
 }
 
 /// [`run_agent_with_limits`], plus the run's final conversation.
@@ -1990,6 +2004,7 @@ pub async fn run_agent_full(opts: AgentRunOpts) -> RunExit {
         final_limits: opts.limits.clone(),
         messages,
         loaded_skills: opts.loaded_skills.clone(),
+        unseen_messages: std::mem::take(&mut opts.unseen_messages),
     }
 }
 
@@ -2293,15 +2308,17 @@ async fn run_agent_inner(
         // What the collectors delivered: recorded, and awaiting receipts —
         // with what the run this one continues delivered but never saw a
         // model call for.
-        let mut injections = InjectionLog {
-            carried_unseen: match &opts.prompt.seed_source {
-                Some(seed) if opts.tool_context.services.message_space.is_some() => {
-                    unreceipted_messages(seed)
+        let mut injections = InjectionLog::default();
+        if let (Some(seed), Some(_)) = (
+            &opts.prompt.seed_source,
+            &opts.tool_context.services.message_space,
+        ) {
+            for id in unreceipted_messages(seed) {
+                if !opts.unseen_messages.contains(&id) {
+                    opts.unseen_messages.push(id);
                 }
-                _ => Vec::new(),
-            },
-            ..InjectionLog::default()
-        };
+            }
+        }
         let loop_outcome = 'turns: loop {
             if turn_idx >= opts.max_turns {
                 break 'turns LoopOutcome::Status(
@@ -2355,6 +2372,11 @@ async fn run_agent_inner(
                     .flat_map(|d| d.injection.messages.iter().map(|m| m.id.clone()))
                     .collect();
                 if !ids.is_empty() {
+                    for id in &ids {
+                        if !opts.unseen_messages.contains(id) {
+                            opts.unseen_messages.push(id.clone());
+                        }
+                    }
                     let fresh: Vec<crate::collector::Delivered> =
                         fresh.into_iter().cloned().collect();
                     injections.pending_seen = Some((pipeline, fresh, ids));
@@ -2828,8 +2850,18 @@ async fn run_agent_inner(
                 CallOutcome::Response(r) => *r,
                 CallOutcome::Paused => break 'turns LoopOutcome::Paused,
             };
-            // The call saw this turn's delivered messages: their receipts.
-            let carried = std::mem::take(&mut injections.carried_unseen);
+            // The call saw every delivered message: the collectors write
+            // their own deliveries' receipts, and the bus the rest (what the
+            // run this one continues delivered).
+            let pending = injections.pending_seen.take();
+            let carried: Vec<String> = std::mem::take(&mut opts.unseen_messages)
+                .into_iter()
+                .filter(|id| {
+                    pending
+                        .as_ref()
+                        .is_none_or(|(_, _, ids)| !ids.contains(id))
+                })
+                .collect();
             if let (false, Some(bus)) = (
                 carried.is_empty(),
                 opts.tool_context.services.message_space.clone(),
@@ -2842,7 +2874,7 @@ async fn run_agent_inner(
                 })
                 .await;
             }
-            if let Some((pipeline, delivered, ids)) = injections.pending_seen.take() {
+            if let Some((pipeline, delivered, ids)) = pending {
                 let turn = turn_idx;
                 let _ = tokio::task::spawn_blocking(move || {
                     let refs: Vec<&crate::collector::Delivered> = delivered.iter().collect();
@@ -3709,10 +3741,6 @@ struct InjectionLog {
     /// Messages already recorded as received (a standing directive is
     /// delivered every turn, received once).
     received: std::collections::HashSet<String>,
-    /// Messages the run this one continues received but never saw a model
-    /// call for (it stopped first): this run's first call sees them, in the
-    /// conversation it rebuilt.
-    carried_unseen: Vec<String>,
     /// This turn's newly delivered messages, for their receipts once the
     /// model call has seen them.
     pending_seen: Option<(
@@ -6457,6 +6485,7 @@ mod pause_tests {
                     loaded_skills: Vec::new(),
                     operator_loads: Vec::new(),
                     missing_skills: Vec::new(),
+                    unseen_messages: Vec::new(),
                 },
                 provider,
                 limits: rupu_providers::model_limits::ModelLimits::unknown(),

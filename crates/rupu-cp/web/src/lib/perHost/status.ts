@@ -1,26 +1,10 @@
 // Honest per-host state for list pages (spec §8): failure classification,
 // "waiting on …", "not included: …", and the freshness-strip mapping.
 
-import { ApiError, apiErrorMessage } from '../api';
 import type { HostFreshnessEntry } from '../../components/dashboard/HostFreshnessStrip';
 import type { HostSlice } from './types';
 
-export type Failure = { kind: 'offline' | 'unavailable' | 'gone'; reason: string };
-
-/**
- * The single-host list paths answer 501 when a host cannot serve the
- * listing (e.g. an old remote rupu), 404 when the host is no longer
- * registered, and 502 when it gave no usable answer (spec §7.1). Anything
- * else, including a network error, is treated as offline.
- */
-export function classifyFailure(e: unknown): Failure {
-  const reason = apiErrorMessage(e);
-  if (e instanceof ApiError) {
-    if (e.status === 501) return { kind: 'unavailable', reason };
-    if (e.status === 404) return { kind: 'gone', reason };
-  }
-  return { kind: 'offline', reason };
-}
+export { classifyFailure, type Failure } from '../api';
 
 export function waitingOn<T>(slices: readonly HostSlice<T>[]): string[] {
   return slices.filter((s) => s.state === 'loading' || s.catchingUp).map((s) => s.name);

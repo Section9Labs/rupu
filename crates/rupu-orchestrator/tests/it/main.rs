@@ -23,6 +23,7 @@ mod gate_sweep_smoke;
 mod linear_runner;
 mod messaging;
 mod multi_gate_path_scoped;
+mod operator_messages;
 mod outcome_cause;
 mod pause_agent_run;
 mod pause_resume_e2e;
