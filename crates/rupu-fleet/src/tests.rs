@@ -539,3 +539,24 @@ fn a_broadcast_into_an_empty_room_is_undelivered() {
         "nothing reached the broadcast log"
     );
 }
+
+#[test]
+fn no_run_joins_at_a_fixed_address_but_lead() {
+    let tmp = tempfile::tempdir().unwrap();
+    for fixed in ["operator", "broadcast", "parent"] {
+        let bus = Bus::open(tmp.path(), fixed);
+        assert!(
+            matches!(
+                bus.join(member("recon", "r1", None, None)),
+                Err(FleetError::Refused(_))
+            ),
+            "{fixed}"
+        );
+        assert!(!bus.is_joined(), "{fixed}");
+    }
+    assert!(Bus::open(tmp.path(), "operator")
+        .roster()
+        .unwrap()
+        .is_empty());
+    joined(tmp.path(), "lead", member("lead", "af_1", None, None));
+}

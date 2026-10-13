@@ -187,8 +187,17 @@ impl Bus {
 
     /// Record that this run joined the space as `member`, and start its
     /// broadcast cursor. Idempotent for the same run: an agentiflow lead
-    /// joins once, however many rounds it runs.
+    /// joins once, however many rounds it runs. A run can't join at a fixed
+    /// address other than `lead`: it would shadow what that address means.
     pub fn join(&self, member: Member) -> Result<(), BusError> {
+        if [address::OPERATOR, address::BROADCAST, address::PARENT]
+            .contains(&self.participant.as_str())
+        {
+            return Err(FleetError::Refused(format!(
+                "a run can't join as `{}`: it is a fixed address",
+                self.participant
+            )));
+        }
         let _lock = self.lock()?;
         let roster = self.roster()?;
         let rejoin = roster
