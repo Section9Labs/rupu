@@ -276,7 +276,8 @@ pub const CAP_AGENT_SKILLS: &str = "agent.skills";
 /// Host feature / `Hello.capabilities` / bucket marker entry: this executor
 /// caches shipped skill content (SSH: `rupu __skills`; HTTP:
 /// `/api/skills/bundle/*`; tunnel: [`Frame::SkillsOffer`] and friends;
-/// bucket: the worker's offer/chunk objects) and `rupu run` takes
+/// bucket: the CP's `skills/<hash>.tar` objects, which the worker downloads
+/// with `get_skill`) and `rupu run` takes
 /// `--skill-bundle`, so a placed unit runs with the coordinator's skills.
 pub const CAP_AGENT_SKILL_BUNDLE: &str = "agent.skill_bundle";
 

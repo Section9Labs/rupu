@@ -154,8 +154,8 @@ pub trait Bucket: Send + Sync {
     /// and the call is `Ok`.
     async fn put_skill(&self, hash: &str, bytes: &[u8]) -> Result<(), BucketError>;
 
-    /// Fetch `skills/<hash>.tar`. `NotFound` when absent; `Io` when the
-    /// object is over `max_bytes` (checked before any byte is read).
+    /// Fetch `skills/<hash>.tar`. `NotFound` when absent; `TooLarge` when
+    /// the object is over `max_bytes` (checked before any byte is read).
     async fn get_skill(&self, hash: &str, max_bytes: u64) -> Result<Vec<u8>, BucketError>;
 }
 

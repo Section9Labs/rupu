@@ -20,9 +20,8 @@ use object_store::{
 };
 
 use super::{
-    BucketError, Bucket,
-    key_artifact, key_claim, key_control, key_finished, key_job, key_result, key_skill, key_worker_info,
-    prefix_control, prefix_results,
+    key_artifact, key_claim, key_control, key_finished, key_job, key_result, key_skill,
+    key_worker_info, prefix_control, prefix_results, Bucket, BucketError,
 };
 
 // ── artifact transfer tuning ──────────────────────────────────────────────────
@@ -657,7 +656,10 @@ mod tests {
             b.read_capped(&path, &hash, 9).await,
             Err(BucketError::TooLarge { max: 9, .. })
         ));
-        assert_eq!(b.read_capped(&path, &hash, 10).await.unwrap(), b"0123456789");
+        assert_eq!(
+            b.read_capped(&path, &hash, 10).await.unwrap(),
+            b"0123456789"
+        );
     }
 
     #[tokio::test]
