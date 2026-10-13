@@ -145,8 +145,8 @@ mod tests {
             run_id: Some("run_01COORD".into()),
             findings_profile: None,
             engagement_profiles: vec!["network".into()],
-            skills: Vec::new(),
-            preload_skills: Vec::new(),
+            skills: vec!["pdf".into(), "sql".into()],
+            preload_skills: vec!["house-style".into()],
             codename: Some("cobalt-harbor/heron#412".into()),
         }
     }
@@ -161,6 +161,29 @@ mod tests {
         assert_eq!(run.mode, Some(rupu_tools::PermissionMode::Bypass));
         assert!(run.tmp_clone, "a target clones into a tmpdir");
         assert_eq!(run.engagement_profiles, ["network"]);
+        assert_eq!(run.skills, ["pdf", "sql"]);
+        assert_eq!(run.preload_skills, ["house-style"]);
+        let args: Vec<String> = rupu_runtime::argv::RunArgv::Agent(run)
+            .to_args()
+            .into_iter()
+            .map(|a| a.into_string().unwrap())
+            .collect();
+        let skill_args: Vec<&str> = args
+            .windows(2)
+            .filter(|w| w[0] == "--skill" || w[0] == "--preload-skill")
+            .flat_map(|w| [w[0].as_str(), w[1].as_str()])
+            .collect();
+        assert_eq!(
+            skill_args,
+            [
+                "--skill",
+                "pdf",
+                "--skill",
+                "sql",
+                "--preload-skill",
+                "house-style"
+            ]
+        );
     }
 
     #[test]
