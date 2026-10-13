@@ -1662,6 +1662,8 @@ export interface SessionSummary {
   /** Originating host id — `"local"` for local sessions; a remote host id for
    *  proxied sessions. Absent on older server versions (treat as `"local"`). */
   host_id?: string;
+  /** The registered workspace the session runs in; empty when it has none. */
+  workspace_id?: string;
 }
 
 /**

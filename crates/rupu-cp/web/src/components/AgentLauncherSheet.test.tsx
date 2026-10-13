@@ -8,7 +8,7 @@
 import '@testing-library/jest-dom/vitest';
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
-import { api, ApiError, type PreviewResponse } from '../lib/api';
+import { api, ApiError, type PreviewResponse, type SkillRow } from '../lib/api';
 import { WORKSPACE_ITEM, type TargetItem } from '../lib/targetItems';
 import { buildAgentLaunch } from './AgentLauncherSheet';
 
@@ -33,6 +33,7 @@ beforeEach(() => {
   vi.spyOn(api, 'getProjects').mockResolvedValue([]);
   vi.spyOn(api, 'getRepos').mockResolvedValue([]);
   vi.spyOn(api, 'launchPreview').mockResolvedValue(GLOBAL_PREVIEW);
+  vi.spyOn(api, 'getSkills').mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -281,5 +282,110 @@ describe('AgentLauncherSheet toggle', () => {
     fireEvent.change(picker, { target: { value: 'github:o/r' } });
     fireEvent.keyDown(picker, { key: 'Enter' });
     expect(await screen.findByText(/control plane's working directory/)).toBeInTheDocument();
+  });
+});
+
+describe('AgentLauncherSheet skills', () => {
+  const row = (name: string): SkillRow => ({
+    name,
+    layer: 'global',
+    status: 'ok',
+    description: null,
+    error: null,
+    warnings: [],
+    stamp: null,
+    source: null,
+    both_layers: false,
+  });
+
+  async function pickSkills() {
+    const section = screen.getByTestId('launch-skills');
+    expect(section).not.toHaveAttribute('open');
+    fireEvent.click(section.querySelector('summary')!);
+    expect(section).toHaveAttribute('open');
+    const load = screen.getByTestId('launch-skills-load');
+    await waitFor(() => expect(load.querySelector('.ab-chip-ghost')).not.toBeNull());
+    fireEvent.click(Array.from(load.querySelectorAll('.ab-chip-ghost')).find((c) => c.textContent === '+ pdf')!);
+    const preload = screen.getByTestId('launch-skills-preload');
+    fireEvent.click(
+      Array.from(preload.querySelectorAll('.ab-chip-ghost')).find((c) => c.textContent === '+ house-style')!,
+    );
+  }
+
+  it('sends the chosen skills with a run', async () => {
+    stubTargetPickerDeps();
+    vi.spyOn(api, 'getSkills').mockResolvedValue([row('pdf'), row('house-style')]);
+    const launchSpy = vi.spyOn(api, 'launchAgent').mockResolvedValue({ run_id: 'run-s' });
+
+    render(<AgentLauncherSheet agent="triage" onClose={() => {}} />);
+    await pickSkills();
+    fireEvent.click(screen.getByRole('button', { name: 'Run' }));
+
+    await waitFor(() =>
+      expect(launchSpy).toHaveBeenCalledWith('triage', {
+        mode: 'ask',
+        skills: ['pdf'],
+        preload_skills: ['house-style'],
+      }),
+    );
+  });
+
+  it('sends the chosen skills with a session', async () => {
+    stubTargetPickerDeps();
+    vi.spyOn(api, 'getSkills').mockResolvedValue([row('pdf'), row('house-style')]);
+    const sessionSpy = vi.spyOn(api, 'startSession').mockResolvedValue({ session_id: 'ses-s' });
+
+    render(<AgentLauncherSheet agent="triage" onClose={() => {}} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Session' }));
+    await pickSkills();
+    fireEvent.click(screen.getByRole('button', { name: 'Start session' }));
+
+    await waitFor(() =>
+      expect(sessionSpy).toHaveBeenCalledWith('triage', {
+        mode: 'bypass',
+        skills: ['pdf'],
+        preload_skills: ['house-style'],
+      }),
+    );
+  });
+
+  it('sends no skill keys when none are chosen', async () => {
+    stubTargetPickerDeps();
+    const launchSpy = vi.spyOn(api, 'launchAgent').mockResolvedValue({ run_id: 'run-n' });
+
+    render(<AgentLauncherSheet agent="triage" onClose={() => {}} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Run' }));
+
+    await waitFor(() => expect(launchSpy).toHaveBeenCalled());
+    const opts = launchSpy.mock.calls[0][1] as Record<string, unknown>;
+    expect(opts.skills).toBeUndefined();
+    expect(opts.preload_skills).toBeUndefined();
+  });
+
+  it("suggests the chosen project's skills", async () => {
+    stubTargetPickerDeps();
+    vi.spyOn(api, 'getProjects').mockResolvedValue([
+      { ws_id: 'ws-1', name: 'rupu', path: '/Code/rupu' } as never,
+    ]);
+    const getSkills = vi.spyOn(api, 'getSkills').mockResolvedValue([]);
+
+    render(<AgentLauncherSheet agent="triage" onClose={() => {}} />);
+    await waitFor(() => expect(getSkills).toHaveBeenCalledWith(undefined));
+    const picker = screen.getByPlaceholderText('search projects, repos, or a path…');
+    fireEvent.focus(picker);
+    fireEvent.change(picker, { target: { value: 'rupu' } });
+    fireEvent.mouseDown(await screen.findByRole('option', { name: /rupu/ }));
+    await waitFor(() => expect(getSkills).toHaveBeenLastCalledWith('ws-1'));
+  });
+
+  it('shows the server message, not its JSON, when a launch is refused', async () => {
+    stubTargetPickerDeps();
+    const body = '{"error":"skills: entry \\"Bad_Name\\": skill name may only contain lowercase letters"}';
+    vi.spyOn(api, 'launchAgent').mockRejectedValue(new ApiError(400, body, body));
+
+    render(<AgentLauncherSheet agent="triage" onClose={() => {}} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Run' }));
+
+    expect(await screen.findByText(/^skills: entry "Bad_Name": skill name may only contain/)).toBeInTheDocument();
   });
 });

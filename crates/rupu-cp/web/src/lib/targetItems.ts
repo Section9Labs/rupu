@@ -6,6 +6,8 @@ export interface TargetItem {
   label: string;
   sublabel?: string;
   resolved: { target?: string; working_dir?: string };
+  /** A project item's registered workspace id (its skills listing scope). */
+  wsId?: string;
 }
 
 export const WORKSPACE_ITEM: TargetItem = {
@@ -21,6 +23,7 @@ export function projectItems(projects: ProjectRow[]): TargetItem[] {
     label: p.name,
     sublabel: p.path,
     resolved: { working_dir: p.path },
+    wsId: p.ws_id,
   }));
 }
 
