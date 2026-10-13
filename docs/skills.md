@@ -247,9 +247,14 @@ unit) gets its skills the same way:
   with the skills the interrupted run had loaded, and re-attach them at their
   next compaction. An agentiflow lead carries them from round to round.
 
+`rupu run --skill <name>` and `--preload-skill <name>` (repeat the flag for
+several) give one run skills on top of its agent's; its `skill_index` records
+them with reason `launch`. `rupu run --continue` without either flag keeps the
+ones the continued run was given; with one, the flags replace them.
+
 A child started with `dispatch` (any kind, or a legacy name like
-`dispatch_agent`) gets its own agent's skills, not its parent's. Sessions don't support skills yet: `rupu session start` refuses an
-agent that declares them.
+`dispatch_agent`) gets its own agent's skills, not its parent's. Sessions don't
+support skills yet: `rupu session start` refuses an agent that declares them.
 
 The transcript records what the run had and used. `skill_index` lists the
 granted skills at run start, and a `skill_load` is written for every load, with

@@ -562,3 +562,237 @@ fn validate_names_an_oversized_skill_md() {
         "{stdout}"
     );
 }
+
+fn home_with_agent_and_skills(skills: &[(&str, &str)]) -> tempfile::TempDir {
+    let home = tempfile::tempdir().unwrap();
+    fs::create_dir_all(home.path().join("agents")).unwrap();
+    fs::write(
+        home.path().join("agents/a.md"),
+        "---\nname: a\nprovider: anthropic\nmodel: claude-sonnet-4-6\n---\nhi\n",
+    )
+    .unwrap();
+    for (name, body) in skills {
+        let dir = home.path().join("skills").join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: The {name} skill.\n---\n\n{body}\n"),
+        )
+        .unwrap();
+    }
+    home
+}
+
+fn mock_run(home: &Path, cwd: &Path, args: &[&str]) -> std::process::Output {
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", home)
+        .env(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[{"AssistantText":{"text":"ran","stop":"end_turn"}}]"#,
+        )
+        .env_remove("RUPU_LOG")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn transcript_events(home: &Path, run_id: &str) -> Vec<Value> {
+    fs::read_to_string(home.join("transcripts").join(format!("{run_id}.jsonl")))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+/// `(name, layer, preload, reason)` per `skill_index` row, and the system
+/// prompt the run sent.
+fn skill_index_and_prompt(events: &[Value]) -> (Vec<(String, String, bool, String)>, String) {
+    let rows = events
+        .iter()
+        .find(|e| e["type"] == "skill_index")
+        .map(|e| {
+            e["data"]["skills"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| {
+                    (
+                        r["name"].as_str().unwrap().to_owned(),
+                        r["layer"].as_str().unwrap().to_owned(),
+                        r["preload"].as_bool().unwrap(),
+                        r["reason"].as_str().unwrap().to_owned(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let prompt = events
+        .iter()
+        .find(|e| e["type"] == "run_start")
+        .and_then(|e| e["data"]["system_prompt"].as_str())
+        .unwrap_or_default()
+        .to_owned();
+    (rows, prompt)
+}
+
+fn row(name: &str, preload: bool) -> (String, String, bool, String) {
+    (name.into(), "global".into(), preload, "launch".into())
+}
+
+#[test]
+fn run_skill_flags_give_the_run_launch_skills() {
+    let home = home_with_agent_and_skills(&[("x", "X-PRELOADED-BODY"), ("y", "Y-BODY")]);
+    let cwd = tempfile::tempdir().unwrap();
+    let out = mock_run(
+        home.path(),
+        cwd.path(),
+        &[
+            "run",
+            "a",
+            "--mode",
+            "readonly",
+            "--run-id",
+            "run_flags",
+            "--preload-skill",
+            "x",
+            "--skill",
+            "y",
+            "go",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (rows, prompt) = skill_index_and_prompt(&transcript_events(home.path(), "run_flags"));
+    assert_eq!(rows, vec![row("x", true), row("y", false)]);
+    assert!(prompt.contains("## Skill: x"), "{prompt}");
+    assert!(prompt.contains("X-PRELOADED-BODY"), "{prompt}");
+    assert!(prompt.contains("- y: The y skill."), "{prompt}");
+    assert!(!prompt.contains("Y-BODY"), "{prompt}");
+}
+
+/// Cut a transcript back to before its first turn: what a runner killed
+/// while waiting on the model leaves behind.
+fn interrupt(home: &Path, run_id: &str) {
+    let path = home.join("transcripts").join(format!("{run_id}.jsonl"));
+    let kept: String = fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .take_while(|l| serde_json::from_str::<Value>(l).unwrap()["type"] != "turn_start")
+        .map(|l| format!("{l}\n"))
+        .collect();
+    fs::write(&path, kept).unwrap();
+}
+
+#[test]
+fn a_continued_run_keeps_its_launch_skills_unless_the_flags_name_others() {
+    let home = home_with_agent_and_skills(&[("x", "X-PRELOADED-BODY"), ("y", "Y-BODY")]);
+    let cwd = tempfile::tempdir().unwrap();
+    let first = mock_run(
+        home.path(),
+        cwd.path(),
+        &[
+            "run",
+            "a",
+            "--mode",
+            "readonly",
+            "--run-id",
+            "run_first",
+            "--preload-skill",
+            "x",
+            "go",
+        ],
+    );
+    assert!(first.status.success());
+    interrupt(home.path(), "run_first");
+
+    let kept = mock_run(
+        home.path(),
+        cwd.path(),
+        &[
+            "run",
+            "a",
+            "--mode",
+            "readonly",
+            "--run-id",
+            "run_kept",
+            "--continue",
+            "run_first",
+        ],
+    );
+    assert!(
+        kept.status.success(),
+        "{}",
+        String::from_utf8_lossy(&kept.stderr)
+    );
+    let (rows, prompt) = skill_index_and_prompt(&transcript_events(home.path(), "run_kept"));
+    assert_eq!(rows, vec![row("x", true)]);
+    assert!(prompt.contains("X-PRELOADED-BODY"), "{prompt}");
+
+    interrupt(home.path(), "run_kept");
+    let replaced = mock_run(
+        home.path(),
+        cwd.path(),
+        &[
+            "run",
+            "a",
+            "--mode",
+            "readonly",
+            "--run-id",
+            "run_replaced",
+            "--continue",
+            "run_kept",
+            "--skill",
+            "y",
+        ],
+    );
+    assert!(
+        replaced.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replaced.stderr)
+    );
+    let (rows, prompt) = skill_index_and_prompt(&transcript_events(home.path(), "run_replaced"));
+    assert_eq!(rows, vec![row("y", false)]);
+    assert!(!prompt.contains("X-PRELOADED-BODY"), "{prompt}");
+}
+
+#[test]
+fn a_bad_skill_flag_fails_before_the_target_is_cloned() {
+    let home = home_with_agent_and_skills(&[]);
+    let cwd = tempfile::tempdir().unwrap();
+    let out = mock_run(
+        home.path(),
+        cwd.path(),
+        &[
+            "run",
+            "a",
+            "github:octo/r",
+            "--mode",
+            "readonly",
+            "--run-id",
+            "run_badclone",
+            "--skill",
+            "typo",
+            "go",
+        ],
+    );
+    assert!(!out.status.success());
+    let message = format!(
+        "skills: unknown skill \"typo\" (looked in {}; install it with `rupu skill install`)",
+        home.path().join("skills").display()
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(&format!("[error] {message}")), "{stderr}");
+    assert!(!cwd.path().join("r").exists());
+    let record: Value = serde_json::from_str(
+        &fs::read_to_string(home.path().join("runs/run_badclone/run.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record["status"], "failed");
+    assert_eq!(record["error_message"], message.as_str());
+    assert!(home.path().join("transcripts/run_badclone.jsonl").is_file());
+}

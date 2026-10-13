@@ -90,11 +90,13 @@ pub struct Args {
         value_delimiter = ','
     )]
     pub engagement_profiles: Vec<String>,
-    /// A skill this run may load, on top of the agent's own (repeatable).
-    /// A coordinator passes a workflow step's `skills:` this way.
+    /// A skill this run may load, on top of the agent's own; repeat the flag
+    /// for several. A coordinator passes a workflow step's `skills:` this
+    /// way. `--continue` keeps the continued run's unless these are given.
     #[arg(long = "skill", value_name = "SKILL")]
     pub skills: Vec<String>,
-    /// A skill whose body goes in this run's system prompt (repeatable).
+    /// A skill whose body goes in this run's system prompt; repeat the flag
+    /// for several.
     #[arg(long = "preload-skill", value_name = "SKILL")]
     pub preload_skills: Vec<String>,
     /// Continue an interrupted run of this agent from its transcript instead
@@ -732,6 +734,10 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     // With `--model`/`--provider`, a run that failed on an outcome is
     // continued too (`prepare_recovery_continuation`); the third element is
     // that outcome, `None` for an interrupted run.
+    //
+    // A continued run keeps the skills its launch gave the run it continues
+    // (`--skill` / `--preload-skill`), unless this launch names its own.
+    let mut launch_skills = (args.skills.clone(), args.preload_skills.clone());
     let mut resume_from: Option<ResumeFrom> = match args.continue_from.as_deref() {
         None => None,
         Some(prev) => {
@@ -765,6 +771,9 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             let prev_agent = transcript_agent(&prev_path)?;
             if prev_agent != spec.name {
                 anyhow::bail!("run {prev} was agent `{prev_agent}`, not `{}`", spec.name);
+            }
+            if args.skills.is_empty() && args.preload_skills.is_empty() {
+                launch_skills = rupu_agent::continuation::launch_skills(&prev_path)?;
             }
             let prepared = if args.model.is_some() || args.provider.is_some() {
                 prepare_recovery_continuation(&prev_path)?
@@ -930,8 +939,8 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                 .as_ref()
                 .map(crate::run_target::format_run_target_for_prompt),
             findings_profile: args.findings_profile,
-            skills: args.skills.clone(),
-            preload_skills: args.preload_skills.clone(),
+            skills: launch_skills.0,
+            preload_skills: launch_skills.1,
             ..Default::default()
         };
 
@@ -941,6 +950,14 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         let prepared = assembler
             .prepare_provider(&spec, &overrides, netflow_sink.clone())
             .await?;
+        // The skills are resolved before the clone too, but a skill that
+        // doesn't resolve is a failed run, recorded below like any assembly
+        // failure: it skips the clone instead of failing the command.
+        let (resolved_skills, skills_failure) =
+            match assembler.resolve_skills(&spec, &overrides).await {
+                Ok(skills) => (skills, None),
+                Err(e) => (None, Some(e)),
+            };
 
         // Construct ONE LineStreamPrinter for the whole run. Keeping a
         // single instance means a single MultiProgress + ticker — earlier
@@ -970,7 +987,8 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         // function exit, keeping the directory alive for the run. Modes 2
         // and 3 set it to None — the user owns cleanup.
         let _clone_guard: Option<tempfile::TempDir>;
-        let workspace_path: std::path::PathBuf = match run_target.as_ref() {
+        let clone_target = run_target.as_ref().filter(|_| skills_failure.is_none());
+        let workspace_path: std::path::PathBuf = match clone_target {
             Some(crate::run_target::RunTarget::Repo {
                 platform,
                 owner,
@@ -1175,17 +1193,26 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                 netflow: Some(netflow_sink.clone()),
                 message_bus: fleet_bus,
                 provider: Some(prepared),
+                skills: resolved_skills,
                 ..Default::default()
             },
             collectors: fleet_collectors,
             link: launch_link.clone(),
         };
-        // A run that cannot be assembled (its grant fails) is a failed run:
-        // recorded in run.json like any other failure, not an early exit.
-        let assembled = assembler
-            .assemble(launch)
-            .await
-            .map_err(|e| e.into_run_error());
+        // A run that cannot be assembled (its grant fails, its skills don't
+        // resolve) is a failed run: recorded in run.json like any other
+        // failure, not an early exit. As `assemble` does for its own
+        // failures, the run's transcript exists, empty.
+        let assembled = match skills_failure {
+            None => assembler.assemble(launch).await,
+            Some(e) => {
+                if let Err(w) = rupu_transcript::JsonlWriter::create(&transcript_path) {
+                    warn!(error = %w, "create the transcript of a run whose skills failed");
+                }
+                Err(e)
+            }
+        }
+        .map_err(|e| e.into_run_error());
 
         // Spawn the agent in a background task and tail the transcript with
         // the line-stream printer while it runs.

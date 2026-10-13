@@ -84,6 +84,31 @@ pub fn transcript_agent(transcript: &Path) -> Result<String, ContinuationError> 
         })
 }
 
+/// The skills `transcript`'s run was given by its launch, as layer-qualified
+/// grant entries `(skills, preload_skills)`: its `skill_index` rows with
+/// reason `launch` (`step` in transcripts written before the rename). A
+/// continued run is given them again unless its own launch names skills.
+pub fn launch_skills(transcript: &Path) -> Result<(Vec<String>, Vec<String>), ContinuationError> {
+    let mut skills = Vec::new();
+    let mut preload = Vec::new();
+    for event in read_events(transcript)? {
+        let Event::SkillIndex { skills: rows } = event else {
+            continue;
+        };
+        for row in rows {
+            if row.reason == "launch" || row.reason == "step" {
+                let entry = format!("{}:{}", row.layer, row.name);
+                if row.preload {
+                    preload.push(entry);
+                } else {
+                    skills.push(entry);
+                }
+            }
+        }
+    }
+    Ok((skills, preload))
+}
+
 /// Decide how to pick up the attempt recorded in `transcript`.
 ///
 /// | ends with                                | outcome    |
