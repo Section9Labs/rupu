@@ -458,6 +458,114 @@ async fn session_list_reconciles_stale_running_workers() {
     assert!(persisted["active_run_id"].is_null());
 }
 
+/// Marks `session_id`'s record as written by a newer rupu: a later version
+/// and a field this rupu doesn't know. Returns the record's bytes.
+fn make_newer(home: &std::path::Path, root: &str, session_id: &str) -> Vec<u8> {
+    let path = home.join(root).join(session_id).join("session.json");
+    let mut payload: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    payload["version"] = 3.into();
+    payload["from_the_future"] = "kept".into();
+    std::fs::write(&path, serde_json::to_vec_pretty(&payload).unwrap()).unwrap();
+    std::fs::read(&path).unwrap()
+}
+
+/// A record a newer rupu wrote is listed, as that, with a warning, and
+/// never written back: its stale worker is not reconciled.
+#[tokio::test]
+async fn session_list_shows_a_newer_record_and_never_writes_it() {
+    let _guard = ENV_LOCK.lock().await;
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    write_session(&home, "ses_newer01", "running", Some(999_999), false);
+    write_session(&home, "ses_current01", "idle", None, false);
+    let before = make_newer(&home, "sessions", "ses_newer01");
+
+    let out = Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
+        .current_dir(tmp.path())
+        .args(["--format", "json", "session", "list"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let statuses: std::collections::BTreeMap<String, String> = report["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["session_id"].as_str().unwrap().to_owned(),
+                r["status"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        statuses,
+        [
+            ("ses_current01".to_owned(), "idle".to_owned()),
+            ("ses_newer01".to_owned(), "newer rupu".to_owned()),
+        ]
+        .into_iter()
+        .collect()
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("session ses_newer01 was written by a newer rupu (record version 3)"),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(home.join("sessions/ses_newer01/session.json")).unwrap(),
+        before,
+        "the record is never written"
+    );
+}
+
+/// `session prune` leaves an archived record a newer rupu wrote alone: what
+/// it owns may be named in fields this rupu doesn't know.
+#[tokio::test]
+async fn session_prune_skips_a_newer_record() {
+    let _guard = ENV_LOCK.lock().await;
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    write_session(&home, "ses_newer02", "idle", None, true);
+    rewrite_session_updated_at(
+        &home,
+        "sessions-archive",
+        "ses_newer02",
+        &(Utc::now() - chrono::Duration::days(45)).to_rfc3339(),
+    );
+    let before = make_newer(&home, "sessions-archive", "ses_newer02");
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
+        .current_dir(tmp.path())
+        .args([
+            "--format",
+            "json",
+            "session",
+            "prune",
+            "--older-than",
+            "30d",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ses_newer02").not())
+        .stderr(predicate::str::contains(
+            "session ses_newer02 was written by a newer rupu (record version 3)",
+        ));
+    assert_eq!(
+        std::fs::read(home.join("sessions-archive/ses_newer02/session.json")).unwrap(),
+        before
+    );
+}
+
 #[tokio::test]
 async fn session_archive_restore_round_trip_moves_owned_transcripts() {
     let _guard = ENV_LOCK.lock().await;

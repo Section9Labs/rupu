@@ -1396,10 +1396,20 @@ async fn list(
     let mut customers =
         rupu_cp::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
     for &scope in scopes {
-        for mut session in load_sessions_in_scope(&global, scope)? {
-            if scope == SessionScope::Active && reconcile_stale_session(&mut session) {
-                write_session(&global, scope, &session)?;
+        for stored in load_sessions_in_scope(&global, scope)? {
+            if let Some(warning) = stored.newer_warning() {
+                eprintln!("{warning}");
             }
+            let (session, status) = match stored {
+                StoredSession::Current(mut session) => {
+                    if scope == SessionScope::Active && reconcile_stale_session(&mut session) {
+                        write_session(&global, scope, &session)?;
+                    }
+                    let status = session.status.as_str().to_string();
+                    (session, status)
+                }
+                StoredSession::Newer { record, .. } => (*record, "newer rupu".to_string()),
+            };
             let customer = customers.attribute_for_listing(
                 rupu_transcript::Recorded::of(&session.customer),
                 &session.workspace_id,
@@ -1414,7 +1424,7 @@ async fn list(
                 ),
                 agent: session.agent_name.clone(),
                 scope: scope.as_str().to_string(),
-                status: session.status.as_str().to_string(),
+                status,
                 target: session.target.clone(),
                 active_run_id: session.active_run_id.clone(),
                 updated_at: session.updated_at.to_rfc3339(),
@@ -7005,10 +7015,19 @@ pub(crate) fn prune_archived_sessions(
     let global = paths::global_dir()?;
     let cutoff = session_prune_cutoff(older_than, &global)?;
     let mut rows = Vec::new();
-    for session in load_sessions_in_scope(&global, SessionScope::Archived)? {
-        if session.updated_at > cutoff {
+    for stored in load_sessions_in_scope(&global, SessionScope::Archived)? {
+        if stored.record().updated_at > cutoff {
             continue;
         }
+        let session = match stored {
+            StoredSession::Current(session) => session,
+            newer => {
+                if let Some(warning) = newer.newer_warning() {
+                    eprintln!("{warning}");
+                }
+                continue;
+            }
+        };
         rows.push(PrunedSession {
             session_id: session.session_id.clone(),
             scope: SessionScope::Archived.as_str().to_string(),
@@ -9041,16 +9060,64 @@ fn read_session(global: &Path, fragment: &str) -> anyhow::Result<(SessionRecord,
 /// A session record this rupu understands: one a newer rupu wrote may hold
 /// fields this one would drop when it writes the record back.
 fn parse_session_record(bytes: &[u8]) -> anyhow::Result<SessionRecord> {
+    match parse_stored_session(bytes)? {
+        StoredSession::Current(record) => Ok(record),
+        StoredSession::Newer { .. } => {
+            anyhow::bail!("this session was written by a newer rupu; upgrade rupu to continue it")
+        }
+    }
+}
+
+/// A session record as it sits on disk.
+enum StoredSession {
+    /// One this rupu reads and may write back.
+    Current(SessionRecord),
+    /// One a newer rupu wrote: it may be shown, never written back, and
+    /// what it owns may be named in fields this rupu doesn't know.
+    Newer {
+        version: u32,
+        record: Box<SessionRecord>,
+    },
+}
+
+impl StoredSession {
+    /// The warning a listing prints for a record it can only show.
+    fn newer_warning(&self) -> Option<String> {
+        match self {
+            StoredSession::Current(_) => None,
+            StoredSession::Newer { version, record } => Some(format!(
+                "warning: session {} was written by a newer rupu (record version {version}); \
+                 upgrade rupu to manage it",
+                record.session_id
+            )),
+        }
+    }
+
+    fn record(&self) -> &SessionRecord {
+        match self {
+            StoredSession::Current(record) => record,
+            StoredSession::Newer { record, .. } => record,
+        }
+    }
+}
+
+/// The one parse of a session record: its version decides whether this
+/// rupu may write it back.
+fn parse_stored_session(bytes: &[u8]) -> anyhow::Result<StoredSession> {
     #[derive(Deserialize)]
     struct Versioned {
         version: u32,
     }
     let Versioned { version } = serde_json::from_slice(bytes)?;
-    anyhow::ensure!(
-        version <= SessionRecord::VERSION,
-        "this session was written by a newer rupu; upgrade rupu to continue it"
-    );
-    Ok(serde_json::from_slice(bytes)?)
+    let record = serde_json::from_slice(bytes)?;
+    Ok(if version <= SessionRecord::VERSION {
+        StoredSession::Current(record)
+    } else {
+        StoredSession::Newer {
+            version,
+            record: Box::new(record),
+        }
+    })
 }
 
 /// Session directory names in one scope. Reads directory entries only —
@@ -9097,7 +9164,8 @@ fn resolve_session_fragment(
     if fragment.parse::<rupu_codename::Codename>().is_ok() {
         let mut crews = Vec::new();
         for scope in [SessionScope::Active, SessionScope::Archived] {
-            for rec in load_sessions_in_scope(global, scope).unwrap_or_default() {
+            for stored in load_sessions_in_scope(global, scope).unwrap_or_default() {
+                let rec = stored.record();
                 let shown = crate::output::codename::display_codename(
                     rec.codename.as_deref(),
                     &rec.session_id,
@@ -9108,7 +9176,7 @@ fn resolve_session_fragment(
                     .map(|c| c.crew)
                     .unwrap_or_else(|_| shown.split('/').next().unwrap_or("").to_string());
                 crews.push(crate::output::codename::CrewCandidate {
-                    id: rec.session_id,
+                    id: rec.session_id.clone(),
                     crew,
                     started_at: rec.created_at,
                 });
@@ -9147,7 +9215,7 @@ fn resolve_session_fragment(
 fn load_sessions_in_scope(
     global: &Path,
     scope: SessionScope,
-) -> anyhow::Result<Vec<SessionRecord>> {
+) -> anyhow::Result<Vec<StoredSession>> {
     let dir = match scope {
         SessionScope::Active => paths::sessions_dir(global),
         SessionScope::Archived => paths::archived_sessions_dir(global),
@@ -9163,8 +9231,10 @@ fn load_sessions_in_scope(
             continue;
         }
         let bytes = fs::read(&path)?;
-        let record: SessionRecord = serde_json::from_slice(&bytes)?;
-        out.push(record);
+        out.push(
+            parse_stored_session(&bytes)
+                .with_context(|| format!("read session record {}", path.display()))?,
+        );
     }
     Ok(out)
 }
