@@ -453,8 +453,8 @@ impl HostConnector for BucketHostConnector {
 
     /// The mirrored stream. Complete once the run is terminal: the worker
     /// writes its finished marker only after every coverage upload landed,
-    /// and the poller re-lists after seeing the marker before it finishes the
-    /// run here.
+    /// and the poll that finishes the run here lists after reading the
+    /// marker.
     async fn unit_coverage(
         &self,
         run_id: &str,
@@ -1012,8 +1012,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let run_store = Arc::new(RunStore::new(tmp.path().join("runs")));
         let mirror = Arc::new(NodeMirror::new(Arc::clone(&run_store)));
-        let bucket: Arc<dyn Bucket> =
-            Arc::new(NoList(ObjectStoreBucket::new(Arc::new(InMemory::new()), "t/h")));
+        let bucket: Arc<dyn Bucket> = Arc::new(NoList(ObjectStoreBucket::new(
+            Arc::new(InMemory::new()),
+            "t/h",
+        )));
         let conn = BucketHostConnector::new(
             "h",
             Arc::clone(&bucket),

@@ -21,7 +21,7 @@ use rupu_cp::launcher::LaunchRequest;
 use rupu_cp::node::protocol::{RunSpec, RunSpecKind};
 use rupu_cp::node::NodeMirror;
 use rupu_orchestrator::{RunStatus, RunStore, StepKind};
-use tempfile::tempdir;
+use tempfile::{tempdir, TempDir};
 
 // ── poll_bucket_run ───────────────────────────────────────────────────────────
 
@@ -449,13 +449,14 @@ async fn bucket_dead_drop_e2e() {
 
 // ── failure reasons ───────────────────────────────────────────────────────────
 
-/// A mirror run on `host_id` for `run_id`, and an empty in-memory bucket.
+/// A mirror run on `host_id` for `run_id`, and an empty in-memory bucket. The
+/// run store lives in the returned `TempDir`: keep it for the test's length.
 async fn failing_run(
     run_id: &str,
     host_id: &str,
-) -> (Arc<RunStore>, NodeMirror, ObjectStoreBucket) {
+) -> (TempDir, Arc<RunStore>, NodeMirror, ObjectStoreBucket) {
     let dir = tempdir().unwrap();
-    let store = Arc::new(RunStore::new(dir.keep().join("runs")));
+    let store = Arc::new(RunStore::new(dir.path().join("runs")));
     let mirror = NodeMirror::new(Arc::clone(&store));
     let spec = RunSpec {
         skill_bundle: None,
@@ -473,14 +474,14 @@ async fn failing_run(
     };
     mirror.create_run(run_id, host_id, &spec).await.unwrap();
     let bucket = ObjectStoreBucket::new(Arc::new(InMemory::new()), "test/fail");
-    (store, mirror, bucket)
+    (dir, store, mirror, bucket)
 }
 
 /// A worker that failed a job writes `failure.txt` before the `failed` marker;
 /// the coordinator's run record carries it as `host <id>: <reason>`.
 #[tokio::test]
 async fn a_failed_run_carries_the_workers_reason() {
-    let (store, mirror, bucket) = failing_run("run_FAILREASON0001", "host_F").await;
+    let (_dir, store, mirror, bucket) = failing_run("run_FAILREASON0001", "host_F").await;
     bucket
         .put_result(
             "run_FAILREASON0001",
@@ -517,7 +518,7 @@ async fn a_failed_run_carries_the_workers_reason() {
 /// a run that did not fail ignores one.
 #[tokio::test]
 async fn a_run_without_a_failure_object_finishes_as_before() {
-    let (store, mirror, bucket) = failing_run("run_NOREASON0000001", "host_F").await;
+    let (_dir, store, mirror, bucket) = failing_run("run_NOREASON0000001", "host_F").await;
     bucket
         .put_finished("run_NOREASON0000001", "failed")
         .await
@@ -535,7 +536,7 @@ async fn a_run_without_a_failure_object_finishes_as_before() {
     assert_eq!(rec.status, RunStatus::Failed);
     assert_eq!(rec.error_message, None);
 
-    let (store, mirror, bucket) = failing_run("run_OKRUN0000000001", "host_F").await;
+    let (_dir, store, mirror, bucket) = failing_run("run_OKRUN0000000001", "host_F").await;
     bucket
         .put_result("run_OKRUN0000000001", "failure.txt", b"stale")
         .await
