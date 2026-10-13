@@ -6,7 +6,7 @@
 //! knows where a fleet skill came from.
 
 use crate::install::{find_skills, install_selected, write_git_record, Installed, Selection};
-use crate::record::read_record;
+use crate::record::{read_record, write_record};
 use crate::skill::{load_skill, Layer};
 use crate::source::{parse_git_source, Fetch, GitSource};
 use std::collections::BTreeMap;
@@ -26,6 +26,10 @@ pub enum KeptReason {
     LocallyModified,
     /// No record, or a record naming another source: installed by hand.
     OtherSource,
+    /// Something is at the skill's path that is not a skill: a directory
+    /// without a `SKILL.md`, a plain file, a dangling symlink. The skill is
+    /// effectively missing.
+    NotASkill,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,11 +48,17 @@ pub struct PinReport {
 }
 
 impl PinReport {
-    /// The pins that failed: not installed, and not deliberately kept.
+    /// The pins that failed, or are blocked by something that is not a
+    /// skill: not installed, and not deliberately kept as a skill.
     pub fn missing(&self) -> Vec<&Pin> {
         self.results
             .iter()
-            .filter(|(_, o)| matches!(o, PinOutcome::Failed(_)))
+            .filter(|(_, o)| {
+                matches!(
+                    o,
+                    PinOutcome::Failed(_) | PinOutcome::Kept(KeptReason::NotASkill)
+                )
+            })
             .map(|(p, _)| p)
             .collect()
     }
@@ -191,7 +201,7 @@ fn plan(pin: &Pin, url: &str, skills_dir: &Path, layer: Layer, force: bool) -> P
         Err(e) => return kept_or_failed(force, e.to_string()),
     }
     if !dir.join("SKILL.md").is_file() {
-        return kept(KeptReason::OtherSource);
+        return kept(KeptReason::NotASkill);
     }
     let rec = match read_record(skills_dir, &pin.name) {
         Ok(Some(r)) if r.url.as_deref() == Some(url) => r,
@@ -211,6 +221,20 @@ fn plan(pin: &Pin, url: &str, skills_dir: &Path, layer: Layer, force: bool) -> P
         return kept(KeptReason::LocallyModified);
     }
     if rec.commit.as_deref() == Some(pin.commit.as_str()) {
+        // Already at the pin. A hand install of the same commit may have
+        // recorded a branch or tag (or none) as its ref, which a later
+        // `rupu skill update` would follow off the pin: record the pin.
+        if rec.git_ref.as_deref() != Some(pin.commit.as_str()) || rec.source != pin.source {
+            let mut fixed = rec;
+            fixed.git_ref = Some(pin.commit.clone());
+            fixed.source = pin.source.clone();
+            if let Err(e) = write_record(skills_dir, &pin.name, &fixed) {
+                return Plan::Done(PinOutcome::Failed(format!(
+                    "recording the pin of {}: {e}",
+                    pin.name
+                )));
+            }
+        }
         return Plan::Done(PinOutcome::Skipped);
     }
     Plan::Install(PinOutcome::Updated { from: rec.commit })
@@ -233,9 +257,11 @@ mod checkout {
     /// `rupu fleet install --skills-from <dir>`: a local git checkout stands
     /// in for the network. The checkout must contain the pinned commit; its
     /// working tree, index and HEAD are never read. The commit's tree is
-    /// exported from the object database into a temporary directory, so
-    /// install copies exactly what the pin names (never a modified, staged,
-    /// untracked, ignored or `skip-worktree` file).
+    /// exported from the object database into a temporary directory with
+    /// git's filters off, so install copies exactly the bytes the pin names
+    /// (never a modified, staged, untracked, ignored or `skip-worktree`
+    /// file, and no line-ending, `ident` or other filter from the checkout's
+    /// attributes or git config).
     pub struct PinnedCheckout {
         pub dir: PathBuf,
     }
@@ -265,6 +291,10 @@ mod checkout {
             let mut opts = git2::build::CheckoutBuilder::new();
             opts.target_dir(tmp.path())
                 .update_index(false)
+                // Byte-exact: no attributes (committed, untracked,
+                // `.git/info`), `core.autocrlf` or global config may change
+                // what is installed.
+                .disable_filters(true)
                 .force()
                 .recreate_missing(true);
             repo.checkout_tree(commit.as_object(), Some(&mut opts))

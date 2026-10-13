@@ -279,3 +279,42 @@ fn an_outward_symlink_in_the_pinned_tree_fails_the_pin_and_writes_nothing() {
         .collect();
     assert!(left.is_empty(), "skills dir should be untouched: {left:?}");
 }
+
+#[test]
+fn the_export_is_the_committed_bytes_whatever_the_checkout_configures() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = git2::Repository::init(tmp.path()).unwrap();
+    let skill = write_skill(
+        &tmp.path().join("skills"),
+        "work-units",
+        "work-units",
+        "split results",
+    );
+    let committed = "#!/bin/sh\n# $Id$\necho ok\n";
+    std::fs::write(skill.join("scripts/run.sh"), committed).unwrap();
+    let c = commit_all(&repo);
+    // Untracked attributes (and the other places git reads them from) must
+    // not change what gets installed.
+    std::fs::write(
+        tmp.path().join(".gitattributes"),
+        "*.sh text eol=crlf ident\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join(".git/info/attributes"),
+        "*.md text eol=crlf\n",
+    )
+    .unwrap();
+    git(tmp.path(), &["config", "core.autocrlf", "true"]);
+
+    let tree = checkout(tmp.path()).fetch(&src(&c)).unwrap();
+    let skill = tree.root.join("skills/work-units");
+    assert_eq!(
+        std::fs::read(skill.join("scripts/run.sh")).unwrap(),
+        committed.as_bytes()
+    );
+    assert_eq!(
+        std::fs::read(skill.join("SKILL.md")).unwrap(),
+        b"---\nname: work-units\ndescription: split results\n---\n\nDo the work-units thing.\n"
+    );
+}

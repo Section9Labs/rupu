@@ -121,9 +121,9 @@ fn install(args: InstallArgs) -> anyhow::Result<()> {
         let names: Vec<&str> = missing.iter().map(|p| p.name.as_str()).collect();
         anyhow::bail!(
             "fleet install: {} skill(s) not installed: {}. Agents that grant them will not \
-             launch. Re-run `rupu fleet install` once the cause is fixed (see the FAILED \
-             lines above), or on an offline box `rupu fleet install --skills-from <dir>` \
-             with {}",
+             launch. Re-run `rupu fleet install` once the cause is fixed (see the FAILED and \
+             `not a skill` lines above; `--force` replaces a non-skill in the way), or on an \
+             offline box `rupu fleet install --skills-from <dir>` with {}",
             missing.len(),
             names.join(", "),
             checkout_advice(&missing),
@@ -202,6 +202,9 @@ fn raw_pin_line(pin: &rupu_skills::pinned::Pin, o: &rupu_skills::pinned::PinOutc
         }
         PinOutcome::Kept(KeptReason::OtherSource) => {
             format!("KEPT skills/{n} (installed from elsewhere; --force replaces it)")
+        }
+        PinOutcome::Kept(KeptReason::NotASkill) => {
+            format!("KEPT skills/{n} (not a skill; --force replaces it)")
         }
         PinOutcome::Failed(e) => format!("FAILED skills/{n}: {e}"),
     }
@@ -347,6 +350,10 @@ mod tests {
         assert_eq!(
             line(PinOutcome::Kept(KeptReason::OtherSource)),
             "KEPT skills/net-recon (installed from elsewhere; --force replaces it)"
+        );
+        assert_eq!(
+            line(PinOutcome::Kept(KeptReason::NotASkill)),
+            "KEPT skills/net-recon (not a skill; --force replaces it)"
         );
         assert_eq!(
             line(PinOutcome::Failed("no route".into())),

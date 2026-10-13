@@ -127,21 +127,23 @@ skills directory, or the project's with `--project`.
   | On disk | Result | Line |
   |---|---|---|
   | not installed | install | `CREATED skills/<name>` |
-  | installed from the same source and commit | nothing | `SKIPPED skills/<name> (pinned)` |
+  | installed from the same source and commit | nothing (a record whose `ref` is not the pin is rewritten to it) | `SKIPPED skills/<name> (pinned)` |
   | installed from the same source at another commit, content matching its record | reinstall at the pin | `UPDATED skills/<name> <old12> → <new12>` |
   | content no longer matches its record (edited locally) | keep | `KEPT skills/<name> (locally modified; --force replaces it)` |
   | no record, or a record naming another source | keep | `KEPT skills/<name> (installed from elsewhere; --force replaces it)` |
+  | something that is not a skill (no `SKILL.md`: a directory, file, dangling symlink) | keep, counts as missing | `KEPT skills/<name> (not a skill; --force replaces it)` |
 
   `--force` replaces the kept ones, as it does for agents and workflows.
 - **Failure.** A failed fetch or install does not stop the other skills. At the end, if any
-  skill is missing, the command prints which, and the command to retry (with
+  skill is missing (a failed one, or one blocked by a non-skill), the command prints which, and the command to retry (with
   `--skills-from` for offline boxes), and exits 1. Agents and workflows already written stay.
 - **`--skills-from <dir>`** is a second `rupu_skills::Fetch` implementation, `PinnedCheckout`.
   For each pinned (source, commit) it opens `<dir>` with git2 and requires the
   pinned commit to be in its object database (else it says to `git fetch --tags`). HEAD, the
   index and the working tree are ignored and left untouched: the commit's tree is exported into
-  a temporary directory, so modified, untracked, ignored or `skip-worktree` files can never be
-  installed. It returns `FetchedTree::with_guard(<export>, Some(<commit>), <tempdir>)`. Because the
+  a temporary directory with git filters disabled, so modified, untracked, ignored or
+  `skip-worktree` files can never be installed and no attributes, `core.autocrlf` or git config
+  change the bytes (the https clone path disables them too, so both installs are identical). It returns `FetchedTree::with_guard(<export>, Some(<commit>), <tempdir>)`. Because the
   `Source` passed to `install_from` is still the git source, the record names the GitHub URL
   and the SHA, and `rupu skill update` works later from a connected machine. With one pinned
   commit across the fleet (the lockstep rule), one checkout serves every skill.

@@ -317,13 +317,14 @@ fn a_non_skill_directory_of_the_same_name_is_kept() {
         outcomes(&kept),
         vec![(
             "network-recon".into(),
-            PinOutcome::Kept(KeptReason::OtherSource)
+            PinOutcome::Kept(KeptReason::NotASkill)
         )]
     );
     assert!(
         f.fetches.borrow().is_empty(),
         "nothing to install, nothing fetched"
     );
+    assert_eq!(kept.missing().len(), 1, "a non-skill in the way is missing");
     assert_eq!(
         std::fs::read_to_string(dest.path().join("network-recon/notes.txt")).unwrap(),
         "mine"
@@ -340,6 +341,103 @@ fn a_non_skill_directory_of_the_same_name_is_kept() {
         vec![("network-recon".into(), PinOutcome::Replaced)]
     );
     assert!(dest.path().join("network-recon/SKILL.md").is_file());
+}
+
+#[test]
+fn a_plain_file_at_the_name_is_not_a_skill_and_is_missing() {
+    let src = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    std::fs::write(dest.path().join("network-recon"), "a file in the way").unwrap();
+    let f = FixtureFetch::new(src.path(), &["network-recon"], "v1", C1);
+    let r = install_pins(
+        &[pin("network-recon", C1)],
+        dest.path(),
+        Layer::Global,
+        false,
+        &f,
+    );
+    assert_eq!(
+        outcomes(&r),
+        vec![(
+            "network-recon".into(),
+            PinOutcome::Kept(KeptReason::NotASkill)
+        )]
+    );
+    assert_eq!(r.missing().len(), 1);
+    assert!(f.fetches.borrow().is_empty());
+    assert_eq!(
+        std::fs::read_to_string(dest.path().join("network-recon")).unwrap(),
+        "a file in the way"
+    );
+}
+
+#[test]
+fn a_kept_skill_is_not_missing() {
+    let src = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    write_skill(dest.path(), "network-recon", "network-recon", "my own");
+    let f = FixtureFetch::new(src.path(), &["network-recon"], "v1", C1);
+    let r = install_pins(
+        &[pin("network-recon", C1)],
+        dest.path(),
+        Layer::Global,
+        false,
+        &f,
+    );
+    assert!(matches!(
+        r.results[0].1,
+        PinOutcome::Kept(KeptReason::OtherSource)
+    ));
+    assert!(r.missing().is_empty());
+}
+
+#[test]
+fn a_hand_install_at_the_pinned_commit_is_re_pinned_not_left_on_its_branch() {
+    let src = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    let f = FixtureFetch::new(src.path(), &["work-units"], "v1", C1);
+    // The skill as a hand install of the same repository left it: the same
+    // bytes, the pinned commit, but no ref (`rupu skill update` would
+    // follow the default branch off the pin).
+    let skill_dir = write_skill(dest.path(), "work-units", "work-units", "work-units v1");
+    let hash = rupu_skills::load_skill(&skill_dir, Layer::Global)
+        .unwrap()
+        .content_hash()
+        .unwrap()
+        .hex();
+    for hand_ref in [None, Some("v1.0.0".to_owned())] {
+        let rec = SourceRecord {
+            version: 1,
+            source: "https://github.com/Section9Labs/rupu-skills".into(),
+            url: Some(URL.into()),
+            git_ref: hand_ref.clone(),
+            path: Some("skills/work-units".into()),
+            commit: Some(C1.into()),
+            local: None,
+            content_hash: hash.clone(),
+            installed_at: 7,
+        };
+        write_record(dest.path(), "work-units", &rec).unwrap();
+        let r = install_pins(
+            &[pin("work-units", C1)],
+            dest.path(),
+            Layer::Global,
+            false,
+            &f,
+        );
+        assert_eq!(
+            outcomes(&r),
+            vec![("work-units".into(), PinOutcome::Skipped)],
+            "{hand_ref:?}"
+        );
+        let got = read_record(dest.path(), "work-units").unwrap().unwrap();
+        assert_eq!(got.git_ref.as_deref(), Some(C1), "{hand_ref:?}");
+        assert_eq!(got.source, "Section9Labs/rupu-skills");
+        assert_eq!(got.commit.as_deref(), Some(C1));
+        assert_eq!(got.content_hash, hash);
+        assert_eq!(got.path.as_deref(), Some("skills/work-units"));
+    }
+    assert!(f.fetches.borrow().is_empty(), "no fetch, no copy");
 }
 
 #[cfg(unix)]
@@ -360,10 +458,11 @@ fn a_dangling_symlink_at_the_name_is_kept() {
         outcomes(&r),
         vec![(
             "network-recon".into(),
-            PinOutcome::Kept(KeptReason::OtherSource)
+            PinOutcome::Kept(KeptReason::NotASkill)
         )]
     );
     assert!(f.fetches.borrow().is_empty());
+    assert_eq!(r.missing().len(), 1, "a non-skill in the way is missing");
     assert!(std::fs::symlink_metadata(dest.path().join("network-recon"))
         .unwrap()
         .is_symlink());

@@ -198,36 +198,41 @@ It prints one line per skill:
 | Result | Meaning |
 |---|---|
 | `CREATED` | the skill was not installed and is now, at its pin |
-| `SKIPPED` | the installed copy is already at the pin |
+| `SKIPPED` | the installed copy is already at the pin (a hand install of the same commit has its recorded `ref` set to the pin, so `rupu skill update` does not follow a branch off it) |
 | `UPDATED <old> → <new>` | the installed copy was an older pin of the same source and is now at the new one |
 | `OVERWROTE` | `--force` replaced an existing copy |
 | `KEPT` | a skill of that name is there that the install will not touch: either you edited it (`locally modified`), or it was installed from somewhere else (`installed from elsewhere`). `--force` replaces it |
+| `KEPT … (not a skill)` | the path is taken by something that is not a skill (a directory without a `SKILL.md`, a plain file, a dangling symlink), so the skill is missing. This fails the command like `FAILED` does; `--force` replaces it |
 | `FAILED` | the skill could not be fetched or installed; the reason follows |
 
 `rupu skill update` keeps a fleet skill at its pin. A newer version of a fleet
 skill arrives with a newer rupu: take the release, then run `rupu fleet install`
 again.
 
-**Offline boxes.** On a connected machine, clone the repository and check out the
-pinned commit (`rupu fleet list` shows the first 12 characters of each pin, which `git checkout` accepts):
+**Offline boxes.** On a connected machine, clone the repository (the commit only
+has to be in the clone's object database; you do not check anything out):
 
 ```sh
 git clone https://github.com/Section9Labs/rupu-skills
-git -C rupu-skills checkout <commit>
 ```
 
 Carry the directory to the offline box and run
 `rupu fleet install --skills-from rupu-skills`. The checkout must contain the
-pinned commit. Its working tree is ignored, and the skill's content comes from
-the commit itself, so untracked or edited files in the copy never reach an
-install.
+pinned commit (`rupu fleet list` shows the first 12 characters of each pin). The
+install reads the commit's tree from the object database and never looks at the
+working tree, the index or HEAD, and none of the checkout's git filters apply:
+no `.gitattributes` (committed, untracked or in `.git/info`), no `core.autocrlf`
+and none of the user's git config. The installed bytes equal the commit's, and
+equal what an online install writes, so untracked or edited files in the copy
+never reach an install.
 
 A skill installed this way still records its upstream URL, so `rupu skill update`
 on that box re-fetches the pinned commit from the network. Offline it fails for
 that skill and changes nothing.
 
-If any skill fails to install, the command still installs the others, then exits
-1 and names the ones that are missing. An agent that grants a missing skill does
+If any skill fails to install or is blocked by something that is not a skill, the
+command still installs the others, then exits 1 and names the ones that are
+missing. An agent that grants a missing skill does
 not launch until it is installed, so re-run `rupu fleet install` when the network
 is back, or use `--skills-from`.
 
