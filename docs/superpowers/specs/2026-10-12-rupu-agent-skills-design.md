@@ -373,6 +373,8 @@ The coordinator sends a placed unit its agent's name, never its content (`crates
 
 A step's own skills (§2.2) are not in the agent file, so they must travel with the dispatch. `UnitDispatch` (`crates/rupu-orchestrator/src/runner.rs:124`) gains `skills` and `preload_skills`. `RunArgv::Agent` gains a repeatable `--skill` and `--preload-skill`, held by `argv_roundtrip`. Peers advertise an `agent.skills` capability, and a connector refuses a unit with step skills when its peer did not advertise it. This is the contract `findings_profile` and `engagement_profiles` already follow: never a silent drop.
 
+The check sits on the sending side because the receiving side can't make it: a node's `RunSpec` ignores fields it doesn't know, so an older tunnel or bucket worker would drop the skills and run the unit without them. HTTP, tunnel and bucket connectors check the capability their peer last advertised. An SSH connector has no feature report until it runs a command, so a launch with step skills carries its own gate: the launch command runs the remote's `rupu __features` first and, when `agent.skills` is missing, prints a refusal marker instead of starting the run. The connector turns that marker into an `Unsupported` launch error. A launch without step skills sends no gate.
+
 An older host whose rupu predates this spec cannot parse a synced agent file with `skills:`, because agent frontmatter is `deny_unknown_fields`. The unit fails with that parse error. This is true of every frontmatter key added before, and updating the host is the fix.
 
 Shipping skill content with a dispatch is a later option if this proves painful. It would follow the customer layer's remote-shipping design.

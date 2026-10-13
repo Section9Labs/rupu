@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import yaml from 'js-yaml';
 import {
   yamlToGraph,
   graphToWorkflowObject,
@@ -2011,5 +2012,31 @@ describe('findings_profile: validateGraph (mirrors workflow.rs parse rules)', ()
     expect(
       validateGraph(wf([{ id: 'r', agent: 'x', prompt: 'p', host: 'box' }], { defaults: { continue_on_error: true } })),
     ).toEqual({});
+  });
+});
+
+describe('step skills survive the editor', () => {
+  it('keeps skills and preload_skills through load, graph and dump', () => {
+    const source = [
+      'name: wf',
+      'steps:',
+      '  - id: a',
+      '    agent: x',
+      '    prompt: p',
+      '    skills: [pdf]',
+      '    preload_skills: [house-style]',
+      '  - id: b',
+      '    skills: [pdf]',
+      '    panel:',
+      '      panelists: [reviewer]',
+      '      subject: s',
+      '',
+    ].join('\n');
+    const res = graphToWorkflowObject(yamlToGraph(yaml.load(source) as Record<string, unknown>));
+    if (!('obj' in res)) throw new Error('expected obj');
+    const steps = (yaml.load(yaml.dump(res.obj)) as { steps: Record<string, unknown>[] }).steps;
+    expect(steps[0].skills).toEqual(['pdf']);
+    expect(steps[0].preload_skills).toEqual(['house-style']);
+    expect(steps[1].skills).toEqual(['pdf']);
   });
 });

@@ -216,6 +216,42 @@ error until it is written `global:<name>` or `project:<name>`. The full grammar
 is in [agent-format.md](agent-format.md#skills-and-preloadskills). An unknown
 or invalid skill fails the agent's load, and `rupu agent validate` catches it.
 
+## Skills on workflow steps
+
+A workflow step can give skills to the agents it launches, on top of each
+agent's own:
+
+```yaml
+steps:
+  - id: review
+    agent: reviewer
+    prompt: Review the PR.
+    skills: [pdf, "project:*"]      # the model may load these
+    preload_skills: [house-style]   # always in the system prompt
+```
+
+The entries use the same grammar as an agent's `skills:` (see
+[Granting skills to agents](#granting-skills-to-agents)). A step's skills
+only add: they never remove one the agent declares. They reach every agent
+the step launches: its own agent, each `for_each` unit, the members of a
+`parallel:` block, and a panel's panelists and its gate's `fix_with` fixer.
+A sub-step has no `skills:` of its own; it takes its parent step's.
+
+The keys are allowed only on a step that runs an agent. A gate, `action:`,
+`run:`, `branch:`, `split:` or `join:` step that names them fails to parse.
+Parsing checks each entry's syntax only. Whether the skill is installed is
+checked when the step launches, so a missing skill fails that step before
+its agent runs, the way a missing agent does. The run's `skill_index`
+records step skills with reason `launch`, the same as `rupu run --skill`.
+
+A placed step (`host:` or `distribute:`) sends its skills to each unit as
+`rupu run --skill` / `--preload-skill`, and the unit resolves them against
+the host's own layers. The host must run a rupu that advertises
+`agent.skills`. An HTTP, tunnel or bucket host that doesn't is refused before
+anything runs. Over SSH, the launch command itself checks the remote's
+`rupu __features` and refuses when `agent.skills` is missing. A step without
+skills launches on any host.
+
 ## How an agent uses its skills
 
 Every run the agent starts (`rupu run`, a workflow step, an agentiflow lead or

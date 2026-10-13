@@ -318,6 +318,8 @@ Common fields:
 | `approval` | object | all steps | Human pause before the step dispatches |
 | `contract` | object | linear steps | Optional documentation for a structured step output |
 | `findings_profile` | `full` \| `summary` | agent steps (`step`/`for_each`/`parallel`/`panel`) and `action: findings.record` steps | Findings contract for this step — see below |
+| `skills` | array<string> | agent steps (`step`/`for_each`/`parallel`/`panel`) | Skills every agent this step launches may load, on top of its own — see [skills.md](skills.md#skills-on-workflow-steps) |
+| `preload_skills` | array<string> | agent steps (`step`/`for_each`/`parallel`/`panel`) | Skills whose bodies are in every launched agent's system prompt |
 
 ### `actions`
 
