@@ -24,6 +24,7 @@ use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
+use crate::output::printer::sanitize_terminal_text;
 use crate::templates::FLEET_MANIFEST;
 
 #[derive(Subcommand, Debug)]
@@ -64,7 +65,8 @@ pub async fn handle(action: Action) -> ExitCode {
 }
 
 fn install(args: InstallArgs) -> anyhow::Result<()> {
-    let root = if args.project {
+    let global = crate::paths::global_dir()?;
+    let (root, layer) = if args.project {
         let pwd = std::env::current_dir()?;
         let project_root = crate::paths::project_root_for(&pwd)?.ok_or_else(|| {
             anyhow::anyhow!(
@@ -72,9 +74,16 @@ fn install(args: InstallArgs) -> anyhow::Result<()> {
                  or omit --project to install the fleet globally into ~/.rupu."
             )
         })?;
-        project_root.join(".rupu")
+        // The same rule the config and skill layers use: a project whose
+        // `.rupu/` is the global dir has no project layer.
+        let layer = if rupu_workspace::project_layer_dir(&global, Some(&project_root)).is_some() {
+            rupu_skills::Layer::Project
+        } else {
+            rupu_skills::Layer::Global
+        };
+        (project_root.join(".rupu"), layer)
     } else {
-        crate::paths::global_dir()?
+        (global, rupu_skills::Layer::Global)
     };
 
     let tally = install_into(&root, args.force)?;
@@ -89,13 +98,10 @@ fn install(args: InstallArgs) -> anyhow::Result<()> {
         println!("(re-run with --force to overwrite the skipped files)");
     }
 
-    let global = crate::paths::global_dir()?;
-    let layer = if args.project && !same_dir(&root, &global) {
-        rupu_skills::Layer::Project
-    } else {
-        rupu_skills::Layer::Global
-    };
     let pins = fleet_pins();
+    if pins.is_empty() && args.skills_from.is_some() {
+        println!("fleet install: no fleet skills to install; --skills-from ignored");
+    }
     let fetcher: Box<dyn rupu_skills::Fetch> = match &args.skills_from {
         Some(dir) => Box::new(rupu_skills::pinned::PinnedCheckout { dir: dir.clone() }),
         None => Box::new(rupu_skills::git::GitFetcher),
@@ -115,12 +121,12 @@ fn install(args: InstallArgs) -> anyhow::Result<()> {
         let names: Vec<&str> = missing.iter().map(|p| p.name.as_str()).collect();
         anyhow::bail!(
             "fleet install: {} skill(s) not installed: {}. Agents that grant them will not \
-             launch. Re-run `rupu fleet install` when the network is back, or on an offline \
-             box `rupu fleet install --skills-from <a checkout of {} containing commit {}>`",
+             launch. Re-run `rupu fleet install` once the cause is fixed (see the FAILED \
+             lines above), or on an offline box `rupu fleet install --skills-from <dir>` \
+             with {}",
             missing.len(),
             names.join(", "),
-            missing[0].source,
-            missing[0].commit,
+            checkout_advice(&missing),
         );
     }
     Ok(())
@@ -145,18 +151,36 @@ pub fn fleet_pins() -> Vec<rupu_skills::pinned::Pin> {
     by_name.into_values().collect()
 }
 
-fn same_dir(a: &Path, b: &Path) -> bool {
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(x), Ok(y)) => x == y,
-        _ => a == b,
+/// What `--skills-from` needs to contain: each distinct (source, commit)
+/// among the missing pins, in order of first appearance.
+fn checkout_advice(missing: &[&rupu_skills::pinned::Pin]) -> String {
+    let mut seen: Vec<(&str, &str)> = Vec::new();
+    for p in missing {
+        let key = (p.source.as_str(), p.commit.as_str());
+        if !seen.contains(&key) {
+            seen.push(key);
+        }
     }
+    seen.iter()
+        .map(|(s, c)| format!("a checkout of {s} containing commit {c}"))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
-fn short(c: &str) -> &str {
-    &c[..c.len().min(12)]
+/// The first 12 characters of a commit. Char-safe: a source record's
+/// commit is read from disk and is not validated.
+fn short(c: &str) -> String {
+    c.chars().take(12).collect()
 }
 
+/// One outcome line, safe to print: the commit text of a source record and
+/// the error text of a failed fetch are not ours, so control characters
+/// (ANSI escapes included) are neutralised.
 fn pin_line(pin: &rupu_skills::pinned::Pin, o: &rupu_skills::pinned::PinOutcome) -> String {
+    sanitize_terminal_text(&raw_pin_line(pin, o))
+}
+
+fn raw_pin_line(pin: &rupu_skills::pinned::Pin, o: &rupu_skills::pinned::PinOutcome) -> String {
     use rupu_skills::pinned::{KeptReason, PinOutcome};
     let n = &pin.name;
     match o {
@@ -164,7 +188,9 @@ fn pin_line(pin: &rupu_skills::pinned::Pin, o: &rupu_skills::pinned::PinOutcome)
         PinOutcome::Skipped => format!("SKIPPED skills/{n} (pinned {})", pin.tag),
         PinOutcome::Updated { from } => format!(
             "UPDATED skills/{n} {} → {} ({})",
-            from.as_deref().map(short).unwrap_or("unknown"),
+            from.as_deref()
+                .map(short)
+                .unwrap_or_else(|| "unknown".to_string()),
             short(&pin.commit),
             pin.tag
         ),
@@ -277,6 +303,96 @@ fn write_file(path: &Path, content: &str, force: bool) -> anyhow::Result<FileAct
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pin() -> rupu_skills::pinned::Pin {
+        rupu_skills::pinned::Pin {
+            name: "net-recon".into(),
+            source: "https://example.com/skills.git".into(),
+            tag: "v1.0.0".into(),
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
+        }
+    }
+
+    #[test]
+    fn pin_line_has_one_exact_form_per_outcome() {
+        use rupu_skills::pinned::{KeptReason, PinOutcome};
+        let p = pin();
+        let line = |o| pin_line(&p, &o);
+        assert_eq!(
+            line(PinOutcome::Created),
+            "CREATED skills/net-recon (v1.0.0 0123456789ab)"
+        );
+        assert_eq!(
+            line(PinOutcome::Skipped),
+            "SKIPPED skills/net-recon (pinned v1.0.0)"
+        );
+        assert_eq!(
+            line(PinOutcome::Updated {
+                from: Some("fedcba9876543210fedcba".into())
+            }),
+            "UPDATED skills/net-recon fedcba987654 → 0123456789ab (v1.0.0)"
+        );
+        assert_eq!(
+            line(PinOutcome::Updated { from: None }),
+            "UPDATED skills/net-recon unknown → 0123456789ab (v1.0.0)"
+        );
+        assert_eq!(
+            line(PinOutcome::Replaced),
+            "OVERWROTE skills/net-recon (v1.0.0 0123456789ab)"
+        );
+        assert_eq!(
+            line(PinOutcome::Kept(KeptReason::LocallyModified)),
+            "KEPT skills/net-recon (locally modified; --force replaces it)"
+        );
+        assert_eq!(
+            line(PinOutcome::Kept(KeptReason::OtherSource)),
+            "KEPT skills/net-recon (installed from elsewhere; --force replaces it)"
+        );
+        assert_eq!(
+            line(PinOutcome::Failed("no route".into())),
+            "FAILED skills/net-recon: no route"
+        );
+    }
+
+    #[test]
+    fn pin_line_survives_a_non_ascii_recorded_commit() {
+        // 11 ASCII bytes then a 3-byte char: byte 12 is inside the char.
+        let from = format!("{}€€€", "a".repeat(11));
+        let out = pin_line(
+            &pin(),
+            &rupu_skills::pinned::PinOutcome::Updated { from: Some(from) },
+        );
+        assert!(out.contains("aaaaaaaaaaa€ →"), "{out}");
+    }
+
+    #[test]
+    fn pin_line_neutralises_terminal_escapes() {
+        let out = pin_line(
+            &pin(),
+            &rupu_skills::pinned::PinOutcome::Failed("boom \x1b[31mred\x1b[0m".into()),
+        );
+        assert!(!out.contains('\x1b'), "{out:?}");
+        assert!(out.contains("\\x1b[31m"), "{out:?}");
+    }
+
+    #[test]
+    fn checkout_advice_lists_each_distinct_source_and_commit_once() {
+        let a = pin();
+        let mut b = pin();
+        b.name = "other".into();
+        let mut c = pin();
+        c.name = "third".into();
+        c.commit = "f".repeat(40);
+        let advice = checkout_advice(&[&a, &b, &c]);
+        assert_eq!(
+            advice,
+            format!(
+                "a checkout of https://example.com/skills.git containing commit {}; \
+                 a checkout of https://example.com/skills.git containing commit {}",
+                a.commit, c.commit
+            )
+        );
+    }
 
     #[test]
     fn fleet_pins_are_the_union_of_the_builtin_bundles_one_per_name() {

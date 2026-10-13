@@ -222,6 +222,10 @@ pinned commit. Its working tree is ignored, and the skill's content comes from
 the commit itself, so untracked or edited files in the copy never reach an
 install.
 
+A skill installed this way still records its upstream URL, so `rupu skill update`
+on that box re-fetches the pinned commit from the network. Offline it fails for
+that skill and changes nothing.
+
 If any skill fails to install, the command still installs the others, then exits
 1 and names the ones that are missing. An agent that grants a missing skill does
 not launch until it is installed, so re-run `rupu fleet install` when the network
