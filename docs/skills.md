@@ -286,7 +286,8 @@ unit) gets its skills the same way:
 `rupu run --skill <name>` and `--preload-skill <name>` (repeat the flag for
 several) give one run skills on top of its agent's; its `skill_index` records
 them with reason `launch`. `rupu run --continue` without either flag keeps the
-ones the continued run was given; with one, the flags replace them.
+earlier run's launch skills; any skill flag replaces them all. Passing a flag
+is the only way to change them: a continued run can't drop them entirely.
 
 A child started with `dispatch` (any kind, or a legacy name like
 `dispatch_agent`) gets its own agent's skills, not its parent's. Sessions don't
