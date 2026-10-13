@@ -521,6 +521,18 @@ impl RunAssembler {
         agent: &rupu_agent::AgentSpec,
         overrides: &Overrides,
     ) -> Result<Option<Arc<rupu_skills::ResolvedSkills>>, AssembleError> {
+        self.resolve_skills_as(agent, overrides, rupu_skills::SkillReason::Launch)
+            .await
+    }
+
+    /// [`Self::resolve_skills`], recording the launch's own entries with
+    /// `launch_reason`: a session's `--skill` entries are `Session`.
+    pub async fn resolve_skills_as(
+        &self,
+        agent: &rupu_agent::AgentSpec,
+        overrides: &Overrides,
+        launch_reason: rupu_skills::SkillReason,
+    ) -> Result<Option<Arc<rupu_skills::ResolvedSkills>>, AssembleError> {
         let agent_grants = agent.skills.clone().unwrap_or_default();
         let agent_preload = agent.preload_skills.clone().unwrap_or_default();
         let o = overrides;
@@ -533,11 +545,7 @@ impl RunAssembler {
         }
         let requests = Arc::new([
             (rupu_skills::SkillReason::Agent, agent_grants, agent_preload),
-            (
-                rupu_skills::SkillReason::Launch,
-                o.skills.clone(),
-                o.preload_skills.clone(),
-            ),
+            (launch_reason, o.skills.clone(), o.preload_skills.clone()),
         ]);
         let global = self.ctx.global.clone();
         let project = self.ctx.project_root.as_ref().map(|p| p.join(".rupu"));
@@ -1022,7 +1030,8 @@ fn allowed(
 }
 
 /// The system prompt a run of `agent` sends: the agent's, with the site's
-/// `## Run target` section, then the run's skills section (spec §3.1).
+/// `## Run target` section, then the run's skills section (spec §3.1): the
+/// frozen one in [`Overrides::skill_section`] when the site has one.
 pub fn system_prompt_for(
     agent: &rupu_agent::AgentSpec,
     overrides: &Overrides,
@@ -1032,7 +1041,11 @@ pub fn system_prompt_for(
         Some(suffix) => format!("{}\n\n## Run target\n\n{suffix}", agent.system_prompt),
         None => agent.system_prompt.clone(),
     };
-    if let Some(section) = skills.and_then(|s| s.prompt_section()) {
+    let section = match &overrides.skill_section {
+        Some(frozen) => (!frozen.is_empty()).then(|| frozen.clone()),
+        None => skills.and_then(|s| s.prompt_section()),
+    };
+    if let Some(section) = section {
         prompt.push_str("\n\n");
         prompt.push_str(&section);
     }

@@ -1006,3 +1006,97 @@ async fn the_coverage_manifest_records_the_launchs_skills() {
     assert_eq!(manifest.skills, vec!["code-review".to_string()]);
     assert_eq!(manifest.preload_skills, vec!["house-style".to_string()]);
 }
+
+/// A session's turns send the skills section its first turn rendered
+/// (`Overrides::skill_section`), not one rendered from the skills as they
+/// are now; the run still gets its skills and the loader.
+#[tokio::test]
+#[serial]
+async fn a_frozen_section_replaces_the_rendered_one() {
+    let home = Home::new();
+    home.skill("code-review", "Review a diff.", "x");
+    let assembler = home.assembler(config());
+    let spec = agent(
+        &home,
+        "provider: anthropic\nmodel: claude-sonnet-4-6\nskills: [code-review]",
+    );
+    let skills = assembler
+        .resolve_skills(&spec, &rupu_runtime::assembly::Overrides::default())
+        .await
+        .unwrap()
+        .expect("the agent's skill");
+    let mut l = launch(&home, spec, Origin::Standalone, "run_frozen");
+    l.services.skills = Some(skills);
+    l.overrides.skill_section = Some("## Skills\n\nFROZEN".into());
+    let path = l.transcript_path.clone();
+    let _m = MockScript::set(DONE);
+    let run = assembler.assemble(l).await.unwrap();
+    assert_eq!(
+        run.opts.system_prompt,
+        "you are probe.\n\n\n## Skills\n\nFROZEN"
+    );
+    run.run().await.result.unwrap();
+    let evs = events(&path);
+    let sent = run_start_prompt(&evs);
+    assert!(
+        sent.starts_with("you are probe.\n\n\n## Skills\n\nFROZEN")
+            && !sent.contains("- code-review:"),
+        "{sent}"
+    );
+    assert!(offered(&evs).iter().any(|e| e.tool == "skills.load"));
+    assert_eq!(skill_index(&evs)[0].name, "code-review");
+}
+
+/// An empty frozen section appends nothing, not even the separator.
+#[tokio::test]
+#[serial]
+async fn an_empty_frozen_section_appends_nothing() {
+    let home = Home::new();
+    home.skill("code-review", "Review a diff.", "x");
+    let assembler = home.assembler(config());
+    let spec = agent(
+        &home,
+        "provider: anthropic\nmodel: claude-sonnet-4-6\nskills: [code-review]",
+    );
+    let mut l = launch(&home, spec, Origin::Standalone, "run_frozen_empty");
+    l.overrides.skill_section = Some(String::new());
+    let _m = MockScript::set(DONE);
+    let run = assembler.assemble(l).await.unwrap();
+    assert_eq!(run.opts.system_prompt, "you are probe.\n");
+}
+
+/// A session's own `--skill` entries are recorded with reason `session`.
+#[tokio::test]
+#[serial]
+async fn resolve_skills_as_session_records_reason_session() {
+    let home = Home::new();
+    home.skill("code-review", "Review a diff.", "x");
+    let assembler = home.assembler(config());
+    let spec = agent(&home, "provider: anthropic\nmodel: claude-sonnet-4-6");
+    let overrides = rupu_runtime::assembly::Overrides {
+        skills: vec!["code-review".into()],
+        ..Default::default()
+    };
+    let skills = assembler
+        .resolve_skills_as(&spec, &overrides, rupu_skills::SkillReason::Session)
+        .await
+        .unwrap()
+        .expect("the session's skill");
+    let mut l = launch(&home, spec, Origin::Standalone, "run_session_reason");
+    l.services.skills = Some(skills);
+    let path = l.transcript_path.clone();
+    let _m = MockScript::set(DONE);
+    rupu_runtime::run_agent(&assembler, l)
+        .await
+        .unwrap()
+        .result
+        .unwrap();
+    let index = skill_index(&events(&path));
+    assert_eq!(
+        index
+            .iter()
+            .map(|e| (e.name.as_str(), e.reason.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("code-review", "session")]
+    );
+}
