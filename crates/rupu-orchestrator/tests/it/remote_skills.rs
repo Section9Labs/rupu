@@ -89,6 +89,7 @@ impl UnitDispatcher for SkillsRecorder {
             }
         }
         Ok(UnitOutcome {
+            warnings: Vec::new(),
             output: format!("ok {}", unit.index),
             success: true,
             error: None,

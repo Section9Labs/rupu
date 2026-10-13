@@ -125,6 +125,7 @@ impl UnitDispatcher for FlakyDispatcher {
             return Err(RunError::Provider("host down".into()).into());
         }
         Ok(UnitOutcome {
+            warnings: Vec::new(),
             output: format!("out-{}-on-{host}", unit.index),
             success: true,
             error: None,

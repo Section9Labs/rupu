@@ -3893,8 +3893,13 @@ pub(crate) async fn resume_run(
     // Clone the workflow for the live view before `opts` consumes it.
     let view_workflow = workflow.clone();
 
-    let unit_dispatcher =
-        build_dispatcher_if_needed(&workflow, &global, Arc::clone(&store), cfg.pricing.clone());
+    let unit_dispatcher = build_dispatcher_if_needed(
+        &workflow,
+        &global,
+        project_root.as_deref(),
+        Arc::clone(&store),
+        cfg.pricing.clone(),
+    );
 
     // Same cooperative-pause delivery as a fresh run: hand the resumed
     // (possibly detached) process a token + marker poller so it can be
@@ -5674,6 +5679,7 @@ async fn execute_workflow_invocation(
     let unit_dispatcher = build_dispatcher_if_needed(
         &workflow,
         &global,
+        ctx.project_root.as_deref(),
         Arc::clone(&run_store),
         cfg.pricing.clone(),
     );
@@ -5907,6 +5913,7 @@ async fn execute_workflow_invocation(
                     let resume_unit_dispatcher = build_dispatcher_if_needed(
                         &workflow_for_resume,
                         &global,
+                        ctx.project_root.as_deref(),
                         Arc::clone(&run_store_for_resume),
                         cfg.pricing.clone(),
                     );

@@ -755,6 +755,7 @@ impl UnitDispatcher for CancelFirstUnitDispatcher {
             .unwrap()
             .push((unit.index, host.to_string()));
         let outcome = UnitOutcome {
+            warnings: Vec::new(),
             output: format!("out-{}-on-{host}", unit.index),
             success: true,
             error: None,
@@ -793,6 +794,7 @@ impl UnitDispatcher for RecordingUnitDispatcher {
             .unwrap()
             .push((unit.index, host.to_string()));
         Ok(UnitOutcome {
+            warnings: Vec::new(),
             output: format!("out-{}-on-{host}", unit.index),
             success: true,
             error: None,

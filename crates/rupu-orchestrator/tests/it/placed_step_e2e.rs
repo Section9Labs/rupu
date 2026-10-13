@@ -102,6 +102,7 @@ impl UnitDispatcher for RecordingDispatcher {
             host.to_string(),
         ));
         Ok(UnitOutcome {
+            warnings: Vec::new(),
             output: format!("REMOTE[{}]", unit.rendered_prompt),
             success: true,
             error: None,
@@ -342,6 +343,7 @@ impl UnitDispatcher for CodenameDispatcher {
             .unwrap()
             .push((unit.step_id.clone(), unit.codename.clone()));
         Ok(UnitOutcome {
+            warnings: Vec::new(),
             output: "ok".into(),
             success: true,
             error: None,

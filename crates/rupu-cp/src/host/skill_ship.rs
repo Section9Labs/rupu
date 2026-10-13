@@ -34,6 +34,10 @@ impl SkillBundle {
         self.skills.is_empty()
     }
 
+    pub fn skills(&self) -> &[Arc<Skill>] {
+        &self.skills
+    }
+
     /// Packs every skill, refusing a skill over [`MAX_SHIPPED_SKILL_BYTES`]
     /// or a bundle over [`MAX_BUNDLE_BYTES`] before reading a byte. A pack is
     /// cached for the process until the skill's stat-only stamp changes.
