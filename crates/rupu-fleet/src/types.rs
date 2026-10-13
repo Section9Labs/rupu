@@ -152,4 +152,7 @@ pub struct FleetMessage {
     pub to: Option<String>,
     pub ts: String,
     pub body: String,
+    /// An operator message the operator marked urgent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub urgent: bool,
 }

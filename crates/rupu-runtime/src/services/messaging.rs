@@ -11,7 +11,8 @@
 //!
 //! A child shares its parent's space: an in-process sub-agent is handed a
 //! bus on it, a process `agent` child opens one from `--message-space`.
-//! Nothing is created until something is written.
+//! Every run joins its space as it starts (F1b), so the operator can reach
+//! it; the log is created by the first message.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -51,12 +52,6 @@ pub fn space_dir(global: &Path, origin: &Origin, run_id: &str) -> Option<PathBuf
         Origin::SessionTurn { session_dir, .. } => Some(session_dir.join("messages")),
         _ => None,
     }
-}
-
-/// Whether anyone has joined or written to the space at `space` yet: once
-/// one has, every later run of the root joins it too.
-pub fn is_active(space: &Path) -> bool {
-    space.join("participants.jsonl").exists() || space.join("log.jsonl").exists()
 }
 
 /// Make `run_id`'s space the space of the run it continues (`rupu run
@@ -399,16 +394,10 @@ mod tests {
     }
 
     #[test]
-    fn a_run_that_has_not_joined_reads_nothing_and_creates_nothing() {
+    fn a_bus_that_has_not_joined_reads_nothing_and_creates_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let space = tmp.path().join("messages");
         let bus = Arc::new(Bus::open(&space, "heron"));
-        bus.prepare(Member {
-            agent: "auditor".into(),
-            run_id: "r".into(),
-            kind: "standalone".into(),
-            ..Default::default()
-        });
         for c in collectors(&bus) {
             assert!(c.collect(&ctx()).is_empty());
         }

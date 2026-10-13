@@ -16,10 +16,11 @@ mod types;
 
 pub use address::{Address, AddressError};
 pub use board::Board;
-pub use bus::{Bus, BusCaps, ClaimTable, DEFAULT_LOG_MAX_MB};
+pub use bus::{Bus, BusCaps, ClaimTable, OperatorMessage, DEFAULT_LOG_MAX_MB};
 pub use error::{BusError, FleetError};
 pub use log::{
-    Delivery, LogLine, LogMessage, LogPage, MessageKind, Refs, SendReceipt, Undelivered,
+    Delivery, LogLine, LogMessage, LogPage, MessageKind, OperatorVia, Refs, SendReceipt,
+    Undelivered,
 };
 pub use mailbox::Mailbox;
 pub use participants::{

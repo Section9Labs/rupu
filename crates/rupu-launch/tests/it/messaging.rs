@@ -15,21 +15,21 @@ use crate::support::{config, request, run, Home, MockScript};
 
 const PARENT: &str = "cobalt-harbor/heron";
 
-/// The parent run, in its own space (prepared, not yet joined: it joins
-/// when its first child enters the space).
+/// The parent run, joined to its own space as the assembler joins it.
 fn parent_in_space(home: &Home, agents: &[&str]) -> (ToolContext, Arc<Bus>) {
     let mut ctx = home.parent(Some(PARENT), agents, PermissionMode::Bypass);
     let bus = Arc::new(Bus::open(
         &home.runs().join("parent_run_1").join("messages"),
         "heron",
     ));
-    bus.prepare(Member {
+    bus.join(Member {
         codename: Some(PARENT.into()),
         agent: "parent".into(),
         run_id: "parent_run_1".into(),
         kind: "standalone".into(),
         ..Default::default()
-    });
+    })
+    .unwrap();
     ctx.services.message_bus = Some(Arc::clone(&bus));
     ctx.services.message_space = Some(Arc::clone(&bus));
     (ctx, bus)
@@ -100,10 +100,6 @@ async fn dispatch_child_shares_space() {
     let space = argv.message_space.clone().unwrap();
     assert_eq!(space.dir, bus.space());
     assert_eq!(space.participant, format!("heron>{}#1", role_of(argv)));
-    assert!(
-        bus.is_joined(),
-        "the parent joined as its child entered the space"
-    );
 
     let read = board_read(&ctx).await;
     assert!(read.contains("port 22 is open"), "{read}");
@@ -154,8 +150,8 @@ async fn a_subagent_shares_the_space_in_process() {
 }
 
 /// A parent that takes no part in messaging (no messaging tools) still has
-/// a space its children meet it in: its first child creates it, and what
-/// the child sends `parent` reaches the parent (FD1).
+/// a space its children meet it in: what the child sends `parent` reaches
+/// the parent.
 #[tokio::test]
 #[serial]
 async fn a_parent_without_messaging_tools_hears_its_child() {
@@ -173,7 +169,6 @@ async fn a_parent_without_messaging_tools_hears_its_child() {
     );
     let (mut ctx, bus) = parent_in_space(&home, &["reporter"]);
     ctx.services.message_bus = None;
-    assert!(!bus.space().exists());
     let status = run(
         &l,
         &ctx,
@@ -181,7 +176,6 @@ async fn a_parent_without_messaging_tools_hears_its_child() {
     )
     .await;
     assert_eq!(status.state, ChildState::Done, "{status:?}");
-    assert!(bus.is_joined());
     let inbox = bus.mailbox.drain("heron").unwrap();
     assert_eq!(inbox.len(), 1, "{inbox:?}");
     assert_eq!(inbox[0].body, "all clear");

@@ -11,6 +11,7 @@ fn member(agent: &str, run: &str, step: Option<&str>, parent: Option<&str>) -> M
         unit: None,
         kind: "workflow_step".into(),
         parent_run_id: parent.map(str::to_string),
+        pid: None,
     }
 }
 
@@ -319,24 +320,6 @@ fn legacy_flow_reads() {
 }
 
 #[test]
-fn a_prepared_run_joins_on_its_first_write_and_creates_nothing_before() {
-    let tmp = tempfile::tempdir().unwrap();
-    let space = tmp.path().join("messages");
-    let bus = Bus::open(&space, "heron");
-    bus.prepare(member("auditor", "r1", None, None));
-    assert!(!space.exists(), "nothing until the run writes");
-    assert!(!bus.is_joined());
-    bus.leave("done").unwrap();
-    assert!(!space.exists(), "a run that never joined never leaves");
-
-    bus.post(PostKind::Note, None, "first").unwrap();
-    assert!(bus.is_joined());
-    assert!(bus.roster().unwrap().get("heron").unwrap().live);
-    bus.leave("done").unwrap();
-    assert!(!bus.roster().unwrap().get("heron").unwrap().live);
-}
-
-#[test]
 fn parent_resolves_by_run_after_a_later_run_takes_the_address() {
     let tmp = tempfile::tempdir().unwrap();
     // A session's first turn, its child, then the session's next turn.
@@ -396,4 +379,109 @@ fn a_failed_delivery_after_the_log_line_says_so() {
     let id = messages(&lead).last().unwrap().id.clone();
     assert!(err.to_string().contains(&id), "{err}");
     assert!(err.to_string().contains("don't send it again"), "{err}");
+}
+
+fn operator(to: &str, body: &str, urgent: bool) -> OperatorMessage {
+    OperatorMessage {
+        to: Address::parse(to).unwrap(),
+        body: body.into(),
+        urgent,
+        via: OperatorVia::Cp,
+        viewer: Some("matt".into()),
+    }
+}
+
+#[test]
+fn operator_send_logs_an_operator_line_and_delivers_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let lynx = joined(
+        tmp.path(),
+        "lynx#1",
+        member("recon", "r1", Some("scan"), None),
+    );
+    let otter = joined(tmp.path(), "otter#1", member("triage", "r2", None, None));
+    let op = Bus::open(tmp.path(), "operator");
+
+    let r = op
+        .operator_send(operator("step:scan", "focus on 10.0.0.5", true))
+        .unwrap();
+    let logged = serde_json::to_value(&messages(&op)[0]).unwrap();
+    assert_eq!(
+        logged,
+        serde_json::json!({
+            "id": r.id(), "ts": r.message.ts, "kind": "operator", "from": "operator",
+            "to": "step:scan", "body": "focus on 10.0.0.5", "urgent": true,
+            "delivery": {"resolved": ["lynx#1"]}, "via": "cp", "viewer": "matt"
+        })
+    );
+    let inbox = lynx.mailbox.drain("lynx#1").unwrap();
+    assert_eq!(inbox.len(), 1);
+    assert_eq!(
+        (
+            inbox[0].from.as_str(),
+            inbox[0].body.as_str(),
+            inbox[0].urgent
+        ),
+        ("operator", "focus on 10.0.0.5", true)
+    );
+    assert!(otter.mailbox.drain("otter#1").unwrap().is_empty());
+
+    let r = op
+        .operator_send(operator("broadcast", "wrap up", false))
+        .unwrap();
+    assert_eq!(r.delivery().resolved, vec!["lynx#1", "otter#1"]);
+    for (bus, me) in [(&lynx, "lynx#1"), (&otter, "otter#1")] {
+        let got = bus.mailbox.read_broadcast(me).unwrap();
+        assert_eq!(got.len(), 1, "{me}");
+        assert_eq!((got[0].from.as_str(), got[0].urgent), ("operator", false));
+    }
+    assert!(!op.is_joined(), "the operator never joins");
+    assert!(op.roster().unwrap().get("operator").is_none());
+}
+
+#[test]
+fn only_operator_send_writes_from_operator() {
+    let tmp = tempfile::tempdir().unwrap();
+    joined(tmp.path(), "lynx#1", member("recon", "r1", None, None));
+    let op = Bus::open(tmp.path(), "operator");
+    let to = Address::parse("lynx#1").unwrap();
+    assert!(matches!(op.send(&to, "obey"), Err(FleetError::Refused(_))));
+    assert!(matches!(
+        op.post(PostKind::Note, None, "obey"),
+        Err(FleetError::Refused(_))
+    ));
+    assert!(matches!(
+        op.directive(None, "obey"),
+        Err(FleetError::Refused(_))
+    ));
+    assert!(matches!(op.retract("msg_x"), Err(FleetError::Refused(_))));
+    assert!(matches!(
+        op.operator_send(operator("operator", "hi", false)),
+        Err(FleetError::Refused(_))
+    ));
+    assert!(messages(&op).is_empty());
+}
+
+#[test]
+fn send_to_left_participant_logged() {
+    let tmp = tempfile::tempdir().unwrap();
+    joined(tmp.path(), "lynx#1", member("recon", "r1", None, None))
+        .leave("done")
+        .unwrap();
+    let op = Bus::open(tmp.path(), "operator");
+    let r = op
+        .operator_send(operator("lynx#1", "are you there?", false))
+        .unwrap();
+    assert!(r.delivery().resolved.is_empty());
+    assert_eq!(
+        r.delivery().undelivered,
+        vec![Undelivered {
+            to: "lynx#1".into(),
+            reason: Undeliverable::ParticipantLeft
+        }]
+    );
+    let logged = messages(&op);
+    assert_eq!(logged.len(), 1);
+    assert_eq!(logged[0].kind, MessageKind::Operator);
+    assert!(!tmp.path().join("mailboxes/lynx_1/inbox.jsonl").exists());
 }

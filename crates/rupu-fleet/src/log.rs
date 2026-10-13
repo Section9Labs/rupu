@@ -92,6 +92,21 @@ pub struct LogMessage {
     #[serde(default, skip_serializing_if = "Refs::is_empty")]
     pub refs: Refs,
     pub delivery: Delivery,
+    /// Where an operator message was sent from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<OperatorVia>,
+    /// Who sent an operator message, when the sending surface knows (the
+    /// CP's viewer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewer: Option<String>,
+}
+
+/// The surface an operator message came through (spec F1b §3.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorVia {
+    Cli,
+    Cp,
 }
 
 /// One line of `log.jsonl`.

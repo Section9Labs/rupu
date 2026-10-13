@@ -620,12 +620,12 @@ async fn a_flow_pool_is_the_allowlist_and_children_inherit_it() {
     assert_eq!(child_id.launch.flow.as_deref(), Some(flow_dir.as_path()));
 }
 
-/// Every run with a space has a bus on it, which costs nothing until it is
-/// used; it is offered the messaging tools only when it takes part (spec
-/// F1a FD1): its agent names one, or someone already joined its space.
+/// Every run with a space joins it as it starts, so the operator can reach
+/// it (F1b); it is offered the messaging tools only when it takes part
+/// (spec F1a FD1): its agent names one. The log waits for a first message.
 #[tokio::test]
 #[serial]
-async fn a_run_takes_part_in_its_space_only_when_asked_or_already_active() {
+async fn every_run_joins_its_space_and_takes_part_only_when_asked() {
     let home = Home::new();
     let assembler = home.assembler(config());
     let tools = |run: &rupu_runtime::assembly::AssembledRun| {
@@ -636,15 +636,33 @@ async fn a_run_takes_part_in_its_space_only_when_asked_or_already_active() {
             run.opts.grant.offers("msg.send"),
         )
     };
+    let joined = |run: &rupu_runtime::assembly::AssembledRun, run_id: &str| {
+        let bus = run
+            .opts
+            .tool_context
+            .services
+            .message_space
+            .clone()
+            .unwrap();
+        assert!(bus.is_joined(), "{run_id}");
+        let roster = bus.roster().unwrap();
+        let me = roster
+            .participants()
+            .find(|p| p.member.run_id == run_id)
+            .unwrap_or_else(|| panic!("{run_id} joined"));
+        assert!(me.live);
+        assert_eq!(me.member.pid, Some(std::process::id()));
+        assert!(!bus.log_path().exists(), "{run_id}: no message yet, no log");
+    };
 
     let quiet = agent(&home, "provider: anthropic\nmodel: claude-sonnet-4-6\ntools: ['*']");
     let _m = MockScript::set(DONE);
     let run = assembler
-        .assemble(launch(&home, quiet.clone(), Origin::Standalone, "run_quiet"))
+        .assemble(launch(&home, quiet, Origin::Standalone, "run_quiet"))
         .await
         .unwrap();
     assert_eq!(tools(&run), (true, false, false), "`*` alone never takes part");
-    assert!(!home.runs().join("run_quiet").join("messages").exists());
+    joined(&run, "run_quiet");
 
     let named = agent(&home, "provider: anthropic\nmodel: claude-sonnet-4-6\ntools: [msg.send]");
     let run = assembler
@@ -652,26 +670,5 @@ async fn a_run_takes_part_in_its_space_only_when_asked_or_already_active() {
         .await
         .unwrap();
     assert_eq!(tools(&run), (true, true, true));
-    assert!(
-        !home.runs().join("run_named").join("messages").exists(),
-        "joined lazily, on its first message"
-    );
-
-    // Someone joined `run_quiet`'s space (its child): a later run of it
-    // takes part, and joins as it starts.
-    let child = rupu_fleet::Bus::open(&home.runs().join("run_quiet").join("messages"), "heron>lynx#1");
-    child
-        .join(rupu_fleet::Member {
-            agent: "helper".into(),
-            run_id: "run_child".into(),
-            kind: "subagent".into(),
-            ..Default::default()
-        })
-        .unwrap();
-    let run = assembler
-        .assemble(launch(&home, quiet, Origin::Standalone, "run_quiet"))
-        .await
-        .unwrap();
-    assert_eq!(tools(&run), (true, true, true));
-    assert!(run.opts.tool_context.services.message_space.as_ref().unwrap().is_joined());
+    joined(&run, "run_named");
 }
