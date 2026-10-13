@@ -182,6 +182,14 @@ pub struct StartArgs {
         value_delimiter = ','
     )]
     pub engagement_profiles: Vec<String>,
+    /// A skill every turn of the session is given beside the agent's own
+    /// (`name`, `global:name` or `project:name`). Repeatable.
+    #[arg(long = "skill", value_name = "SKILL")]
+    pub skills: Vec<String>,
+    /// A skill whose instructions go into the session's system prompt.
+    /// Repeatable.
+    #[arg(long = "preload-skill", value_name = "SKILL")]
+    pub preload_skills: Vec<String>,
 }
 
 #[derive(ClapArgs, Debug, Clone, Default)]
@@ -533,6 +541,21 @@ struct SessionRecord {
     /// stopped/crashed turns) and must never be used to derive a seed.
     #[serde(default)]
     history_source_transcript: Option<PathBuf>,
+    /// The session's skills, frozen by `session start` (spec 2026-10-12
+    /// §5.1): exactly the skills every turn is given, whatever is installed
+    /// later. Empty for a session with none, and for every session that
+    /// predates skills.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    skill_index: Vec<rupu_skills::FrozenSkill>,
+    /// The skills section `session start` rendered: sent as it is on every
+    /// turn, so each turn's system prompt is the first's. `None` when the
+    /// session has no skills section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    skill_prompt: Option<String>,
+    /// The skills the conversation has loaded, most recently loaded last,
+    /// as the latest turn ended: the next turn starts with them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    loaded_skills: Vec<rupu_agent::LoadedSkill>,
 }
 
 impl SessionRecord {
@@ -1604,15 +1627,15 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
     let project_agents_parent = project_root.as_ref().map(|p| p.join(".rupu"));
-    let spec = match load_agent(&global, project_agents_parent.as_deref(), &args.agent) {
-        Err(rupu_agent::AgentLoadError::Skill { agent, .. }) => {
-            anyhow::bail!(sessions_refuse_skills(&agent))
-        }
-        loaded => loaded?,
-    };
-    if spec.declares_skills() {
-        anyhow::bail!(sessions_refuse_skills(&spec.name));
-    }
+    let spec = load_agent(&global, project_agents_parent.as_deref(), &args.agent)?;
+    let (skill_index, skill_prompt) = freeze_session_skills(
+        &global,
+        project_root.as_deref(),
+        &spec,
+        args.skills.clone(),
+        args.preload_skills.clone(),
+    )
+    .await?;
 
     let cfg_paths = paths::config_paths(&global, project_root.as_deref(), &pwd)?;
     let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
@@ -1795,6 +1818,9 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         compact_at_percent: spec.compact_at_percent,
         model_limits: None,
         history_source_transcript: None,
+        skill_index,
+        skill_prompt,
+        loaded_skills: Vec::new(),
     };
     write_session(&global, SessionScope::Active, &session)?;
     launch_turn(&global, &session_id, user_message, args.detach, args.view).await
@@ -7800,13 +7826,33 @@ fn finalize_compact_run(
     Ok(())
 }
 
-/// Until sessions carry skills (Agent Skills Plan 3), a session refuses an
-/// agent that declares them rather than run it without them.
-fn sessions_refuse_skills(agent: &str) -> String {
-    format!(
-        "agent `{agent}` declares skills; sessions do not support skills yet (Agent Skills \
-         Plan 3) — run it with `rupu run`, or remove its skill keys"
-    )
+/// The skills a session starts with (spec 2026-10-12 §5.1): the agent's
+/// keys and `session start --skill` / `--preload-skill` (reason
+/// `session`), resolved once against the session's layers. Returns the
+/// frozen set and the skills section every turn sends; both empty when the
+/// session has none.
+async fn freeze_session_skills(
+    global: &Path,
+    project_root: Option<&Path>,
+    agent: &rupu_agent::AgentSpec,
+    skills: Vec<String>,
+    preload_skills: Vec<String>,
+) -> anyhow::Result<(Vec<rupu_skills::FrozenSkill>, Option<String>)> {
+    // Resolution reads only the skill layers.
+    let assembler =
+        rupu_runtime::assembly::RunAssembler::new(rupu_runtime::assembly::AssemblyContext {
+            project_root: project_root.map(Path::to_path_buf),
+            ..rupu_runtime::assembly::AssemblyContext::minimal(global.to_path_buf())
+        });
+    let overrides = rupu_runtime::assembly::Overrides {
+        skills,
+        preload_skills,
+        ..Default::default()
+    };
+    let resolved = assembler
+        .resolve_skills_as(agent, &overrides, rupu_skills::SkillReason::Session)
+        .await?;
+    Ok(resolved.map_or((Vec::new(), None), |r| (r.freeze(), r.prompt_section())))
 }
 
 /// The agent a session turn runs: the agent settings the session record
@@ -7816,16 +7862,13 @@ fn sessions_refuse_skills(agent: &str) -> String {
 /// start` loaded it from. An agent that no longer loads (renamed, deleted,
 /// broken frontmatter) gets no chain, and the turn uses the
 /// `[recovery].fallbacks` table, the same as an agent that declares none.
-/// An agent file that declares skills fails the turn (a session started
-/// before `session start` refused them), never runs without them.
+/// Its skill keys are not read: the session's skills are the set `session
+/// start` froze (`SessionRecord::skill_index`).
 fn session_agent_spec(
     global: &Path,
     session: &SessionRecord,
 ) -> anyhow::Result<rupu_agent::AgentSpec> {
     let file = session_agent_file(global, session);
-    if file.as_ref().is_some_and(|f| f.declares_skills()) {
-        anyhow::bail!(sessions_refuse_skills(&session.agent_name));
-    }
     Ok(rupu_agent::AgentSpec {
         name: session.agent_name.clone(),
         description: session.description.clone(),
@@ -7864,8 +7907,8 @@ fn session_agent_spec(
 /// `None` when it no longer loads.
 fn session_agent_file(global: &Path, session: &SessionRecord) -> Option<rupu_agent::AgentSpec> {
     let project_agents_parent = session.project_root.as_ref().map(|p| p.join(".rupu"));
-    // Only the fallback chain and the skill keys are read here, so the
-    // agent's `tools:` aren't checked: the turn's own grant does that.
+    // Only the fallback chain is read here, so the agent's `tools:` aren't
+    // checked: the turn's own grant does that.
     match rupu_agent::find_agent(
         global,
         project_agents_parent.as_deref(),
@@ -7995,6 +8038,12 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             },
         ));
         let agent = session_agent_spec(&global, &session)?;
+        // The session's frozen skills as installed now; one that can't be
+        // given is reported and the turn runs without it. The skills section
+        // is the one `session start` rendered, never re-rendered.
+        let (skills, missing_skills) = assembler
+            .resolve_frozen_skills(&session.skill_index)
+            .await?;
         // The session's limits: the value stored by an earlier turn
         // (including any limit learned from an overflow error), else resolved
         // now — the first turn — through this turn's provider (spec
@@ -8003,6 +8052,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         // assembler resolves again, a cache read unless stale.
         let overrides = rupu_runtime::assembly::Overrides {
             limits: session.model_limits.clone(),
+            skill_section: Some(session.skill_prompt.clone().unwrap_or_default()),
             ..Default::default()
         };
         let prepared = assembler
@@ -8124,8 +8174,9 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
                 initial_messages: session.message_history.clone(),
                 seed_source,
                 turn_index_offset: session.total_turns,
-                loaded_skills: Vec::new(),
+                loaded_skills: session.loaded_skills.clone(),
                 operator_loads: Vec::new(),
+                missing_skills,
             },
             workspace,
             mode,
@@ -8144,6 +8195,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
                 workflow_generator: Some(launcher),
                 netflow: Some(netflow_sink.clone()),
                 provider: Some(prepared),
+                skills,
                 ..Default::default()
             },
             collectors: Vec::new(),
@@ -8156,12 +8208,13 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         // and so does the conversation as it stood, so a failed turn keeps
         // its prompt and tool work (spec 2026-10-01 §7.3).
         // A turn that cannot be assembled (its grant fails) is a failed
-        // turn, recorded like any other.
+        // turn, recorded like any other, and keeps the session's loaded
+        // skills.
         let rupu_agent::RunExit {
             result: outcome,
             final_limits,
             messages: exit_messages,
-            ..
+            loaded_skills,
         } = match assembler.assemble(launch).await {
             Ok(run) => run.run().await,
             Err(e) => rupu_agent::RunExit {
@@ -8171,7 +8224,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
                     .clone()
                     .unwrap_or_else(rupu_providers::model_limits::ModelLimits::unknown),
                 messages: Vec::new(),
-                loaded_skills: Vec::new(),
+                loaded_skills: session.loaded_skills.clone(),
             },
         };
         // The turn's cached tokens: the provider-reported total summed over
@@ -8191,6 +8244,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         session.active_pid = None;
         session.last_run_id = Some(args.run_id.clone());
         session.last_transcript_path = Some(transcript_path.clone());
+        session.loaded_skills = loaded_skills;
         // On success AND failure: the limits carry to every later turn
         // without refetching. The note stays with this turn's notice: it
         // describes this resolution, not the limits.
@@ -8933,6 +8987,10 @@ fn session_prune_cutoff(
 // live here — see `terminate_pid`'s doc comment, and
 // `terminate_pid_refuses_to_signal_this_process` for the regression test).
 use rupu_orchestrator::runs::{pid_is_running, terminate_pid};
+
+#[cfg(test)]
+#[path = "session_skills_tests.rs"]
+mod skills_tests;
 
 #[cfg(test)]
 mod tests {
@@ -10653,7 +10711,7 @@ mod tests {
         assert!(rec.codename.is_none());
     }
 
-    fn test_session_record() -> SessionRecord {
+    pub(super) fn test_session_record() -> SessionRecord {
         SessionRecord {
             version: SessionRecord::VERSION,
             session_id: "ses_test01".into(),
@@ -10732,6 +10790,9 @@ mod tests {
             model_limits: None,
             history_source_transcript: None,
             customer: None,
+            skill_index: Vec::new(),
+            skill_prompt: None,
+            loaded_skills: Vec::new(),
         }
     }
 
@@ -11764,7 +11825,7 @@ mod tests {
 
     /// Run `f` with `RUPU_HOME` = `global` and the mock provider scripted
     /// to `script`, restoring both afterwards.
-    async fn with_mock_home<T>(
+    pub(super) async fn with_mock_home<T>(
         global: &Path,
         script: &str,
         f: impl std::future::Future<Output = T>,

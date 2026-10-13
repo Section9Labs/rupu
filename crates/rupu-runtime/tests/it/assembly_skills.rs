@@ -1104,3 +1104,41 @@ async fn resolve_skills_as_session_records_reason_session() {
         vec![("code-review", "session"), ("report-style", "agent")]
     );
 }
+
+/// A session turn thaws its frozen set against the assembler's layers:
+/// what is still installed is given, what is gone comes back with why.
+#[tokio::test]
+#[serial]
+async fn resolve_frozen_skills_thaws_against_the_assemblers_layers() {
+    let home = Home::new();
+    home.skill("code-review", "Review a diff.", "x");
+    home.skill("pdf", "Read a PDF.", "x");
+    let assembler = home.assembler(config());
+    let spec = agent(
+        &home,
+        "provider: anthropic\nmodel: claude-sonnet-4-6\nskills: [code-review, pdf]",
+    );
+    let frozen = assembler
+        .resolve_skills_as(
+            &spec,
+            &Default::default(),
+            rupu_skills::SkillReason::Session,
+        )
+        .await
+        .unwrap()
+        .expect("the agent's skills")
+        .freeze();
+    std::fs::remove_dir_all(home.global().join("skills/pdf")).unwrap();
+    let (skills, missing) = assembler.resolve_frozen_skills(&frozen).await.unwrap();
+    assert_eq!(skills.expect("code-review").names(), vec!["code-review"]);
+    assert_eq!(
+        missing,
+        vec![rupu_skills::MissingSkill {
+            name: "pdf".into(),
+            layer: rupu_skills::Layer::Global,
+            reason: rupu_skills::MissingReason::Removed,
+        }]
+    );
+    let (none, missing) = assembler.resolve_frozen_skills(&[]).await.unwrap();
+    assert!(none.is_none() && missing.is_empty());
+}

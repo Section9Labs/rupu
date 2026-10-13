@@ -709,3 +709,63 @@ async fn skill_index_rows_carry_the_baseline_stamp() {
         .collect();
     assert_eq!(stamps, vec![baseline]);
 }
+
+/// A session turn's frozen skills that can no longer be given (spec
+/// 2026-10-12 §5.1) are reported at run start, after the `skill_index`, and
+/// the run goes on without them; a turn left with no skills reports them
+/// too.
+#[tokio::test]
+async fn missing_frozen_skills_are_reported_at_run_start() {
+    let global = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    install(global.path(), "pdf", "PDF STEPS");
+    let missing = vec![
+        rupu_skills::MissingSkill {
+            name: "gone".into(),
+            layer: rupu_skills::Layer::Global,
+            reason: rupu_skills::MissingReason::Removed,
+        },
+        rupu_skills::MissingSkill {
+            name: "notes".into(),
+            layer: rupu_skills::Layer::Project,
+            reason: rupu_skills::MissingReason::BadStamp,
+        },
+    ];
+    let expected = vec![
+        "skill gone (global) is not available to this run: removed".to_string(),
+        "skill notes (project) is not available to this run: corrupt record: bad stamp".to_string(),
+    ];
+    for with_skills in [true, false] {
+        let transcript = ws.path().join(format!("run_{with_skills}.jsonl"));
+        let provider = MockProvider::new(vec![done_turn()]);
+        let grants: &[&str] = if with_skills { &["pdf"] } else { &[] };
+        let mut o = opts(
+            provider,
+            ws.path(),
+            transcript.clone(),
+            resolved(global.path(), grants),
+        );
+        if !with_skills {
+            o.tool_context.services.skills = None;
+        }
+        o.prompt.missing_skills = missing.clone();
+        run_agent(o).await.unwrap();
+        let evs = events(&transcript);
+        assert_eq!(notices(&evs, "skill_missing"), expected);
+        let first_missing = evs
+            .iter()
+            .position(|e| matches!(e, Event::Notice { kind, .. } if kind == "skill_missing"))
+            .unwrap();
+        let first_turn = evs
+            .iter()
+            .position(|e| matches!(e, Event::TurnStart { .. }))
+            .expect("a turn");
+        assert!(first_missing < first_turn);
+        if let Some(index_at) = evs
+            .iter()
+            .position(|e| matches!(e, Event::SkillIndex { .. }))
+        {
+            assert!(with_skills && index_at < first_missing);
+        }
+    }
+}

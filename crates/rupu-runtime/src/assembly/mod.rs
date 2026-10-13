@@ -569,6 +569,46 @@ impl RunAssembler {
         Ok((!resolved.is_empty()).then(|| Arc::new(resolved)))
     }
 
+    /// A session's frozen skill set (spec 2026-10-12 §5.1) as installed
+    /// now, against the same layers [`Self::resolve_skills_as`] resolved it
+    /// in: the set (`None` when nothing in it can be given) and the entries
+    /// that can't be, for the turn to report ([`rupu_agent::UserTurn::missing_skills`]).
+    /// Fails only when the skills directories can't be read.
+    pub async fn resolve_frozen_skills(
+        &self,
+        frozen: &[rupu_skills::FrozenSkill],
+    ) -> Result<
+        (
+            Option<Arc<rupu_skills::ResolvedSkills>>,
+            Vec<rupu_skills::MissingSkill>,
+        ),
+        AssembleError,
+    > {
+        if frozen.is_empty() {
+            return Ok((None, Vec::new()));
+        }
+        let dirs = rupu_skills::LayerDirs::for_layers(
+            &self.ctx.global,
+            self.ctx
+                .project_root
+                .as_ref()
+                .map(|p| p.join(".rupu"))
+                .as_deref(),
+        );
+        let frozen = frozen.to_vec();
+        let (resolved, missing) = tokio::task::spawn_blocking(move || {
+            let catalog =
+                rupu_skills::SkillCatalog::discover(&dirs).map_err(|e| AssembleError::Skills {
+                    source: e.into(),
+                    looked_in: dirs.clone(),
+                })?;
+            Ok::<_, AssembleError>(rupu_skills::resolve_frozen(&catalog, &frozen))
+        })
+        .await
+        .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))?;
+        Ok(((!resolved.is_empty()).then(|| Arc::new(resolved)), missing))
+    }
+
     /// [`Self::resolve_skills`] for the run whose transcript is
     /// `transcript_path`, recording a failure as [`Self::assemble`] does: as
     /// when its grant fails, the run's (empty) transcript exists, so whatever

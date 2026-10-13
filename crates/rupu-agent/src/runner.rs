@@ -1554,6 +1554,10 @@ pub struct UserTurn {
     /// their bodies are in `message`. Each is recorded as loaded at run
     /// start and joins the loaded set.
     pub operator_loads: Vec<OperatorLoad>,
+    /// Skills the conversation was given that can no longer be (spec
+    /// 2026-10-12 §5.1: a session's frozen set, thawed for this turn): each
+    /// is reported at run start, and the run goes on without it.
+    pub missing_skills: Vec<rupu_skills::MissingSkill>,
 }
 
 /// A skill an operator injected into a turn's message, at the version
@@ -2189,6 +2193,17 @@ async fn run_agent_inner(
     write_tool_grant(&mut writer, &grant)?;
     if let Some(skills) = &opts.tool_context.services.skills {
         write_skill_index(&mut writer, skills)?;
+    }
+    for m in &opts.prompt.missing_skills {
+        writer.write(&Event::Notice {
+            kind: "skill_missing".into(),
+            message: format!(
+                "skill {} ({}) is not available to this run: {}",
+                m.name,
+                m.layer.as_str(),
+                m.reason
+            ),
+        })?;
     }
     seed_loaded_skills(
         &mut writer,
@@ -6112,6 +6127,7 @@ mod pause_tests {
                     turn_index_offset: 0,
                     loaded_skills: Vec::new(),
                     operator_loads: Vec::new(),
+                    missing_skills: Vec::new(),
                 },
                 provider,
                 limits: rupu_providers::model_limits::ModelLimits::unknown(),
