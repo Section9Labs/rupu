@@ -2174,7 +2174,6 @@ async fn run_agent_inner(
     )?;
     record_operator_loads(
         &mut writer,
-        opts.tool_context.services.skills.as_deref(),
         &opts.prompt.operator_loads,
         &mut opts.loaded_skills,
     )?;
@@ -3717,14 +3716,11 @@ fn seed_loaded_skills(
 }
 
 /// A `skill_load { via: operator }` per skill the operator injected into
-/// this turn (its body is in the message whatever the run grants), each
-/// moved to the end of `loaded` at the injected version. Only the run's
-/// set can re-attach a skill, so one it doesn't grant stays out of
-/// `loaded` with a notice, and one injected from another root than the
-/// set's is noted: compaction re-attaches the set's.
+/// this turn, each moved to the end of `loaded` at the injected version.
+/// [`crate::operator_turn`] injects only skills the run's set gives, from
+/// that set's entry, so compaction re-attaches the skill that was injected.
 fn record_operator_loads(
     writer: &mut JsonlWriter,
-    skills: Option<&rupu_skills::ResolvedSkills>,
     loads: &[OperatorLoad],
     loaded: &mut Vec<LoadedSkill>,
 ) -> Result<(), RunError> {
@@ -3736,28 +3732,6 @@ fn record_operator_loads(
             base_dir: l.base_dir.clone(),
             via: "operator".into(),
         })?;
-        let Some(g) = skills.and_then(|s| s.get(&l.name)) else {
-            writer.write(&Event::Notice {
-                kind: "skill_missing".into(),
-                message: format!(
-                    "skill {} was invoked by the operator but is not granted to this run; it is \
-                     not re-attached",
-                    l.name
-                ),
-            })?;
-            continue;
-        };
-        let (layer, root) = (g.skill.layer.as_str(), g.skill.root.display().to_string());
-        if l.layer != layer || l.base_dir != root {
-            writer.write(&Event::Notice {
-                kind: "skill_changed".into(),
-                message: format!(
-                    "skill {} was invoked from {} ({}) but this run grants it from {root} \
-                     ({layer}); compaction re-attaches the granted one",
-                    l.name, l.base_dir, l.layer
-                ),
-            })?;
-        }
         loaded.retain(|e| e.name != l.name);
         loaded.push(LoadedSkill {
             name: l.name.clone(),

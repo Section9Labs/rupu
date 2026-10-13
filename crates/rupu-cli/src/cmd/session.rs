@@ -1420,7 +1420,7 @@ async fn list(
                     let status = session.status.as_str().to_string();
                     (session, status)
                 }
-                StoredSession::Newer { record, .. } => (*record, "newer rupu".to_string()),
+                StoredSession::Newer { record, .. } => (record, "newer rupu".to_string()),
             };
             let customer = customers.attribute_for_listing(
                 rupu_transcript::Recorded::of(&session.customer),
@@ -1926,9 +1926,11 @@ async fn resolve_send_skills(
     session: &SessionRecord,
     entries: &[String],
 ) -> anyhow::Result<Vec<rupu_skills::FrozenSkill>> {
-    Ok(skill_layers(global, session.project_root.as_deref())
-        .resolve_operator_skills(&session.skill_index, entries)
-        .await?)
+    let dirs = skill_dirs(global, session.project_root.as_deref());
+    let invoked =
+        rupu_runtime::assembly::resolve_operator_skills(&dirs, &session.skill_index, entries)
+            .await?;
+    Ok(invoked)
 }
 
 async fn launch_turn(
@@ -8024,29 +8026,25 @@ async fn freeze_session_skills(
     skills: Vec<String>,
     preload_skills: Vec<String>,
 ) -> anyhow::Result<(Vec<rupu_skills::FrozenSkill>, Option<String>)> {
-    let assembler = skill_layers(global, project_root);
     let overrides = rupu_runtime::assembly::Overrides {
         skills,
         preload_skills,
         ..Default::default()
     };
-    let resolved = assembler
-        .resolve_skills_as(agent, &overrides, rupu_skills::SkillReason::Session)
-        .await?;
+    let resolved = rupu_runtime::assembly::resolve_agent_skills(
+        &skill_dirs(global, project_root),
+        agent,
+        &overrides,
+        rupu_skills::SkillReason::Session,
+    )
+    .await?;
     Ok(resolved.map_or((Vec::new(), None), |r| (r.freeze(), r.prompt_section())))
 }
 
-/// An assembler for reading a session's skill layers only: global and the
-/// project's `.rupu`. It never assembles a run, so it carries none of the
-/// services (capture, catalog) `tests/it/netflow_capture_wiring.rs`
-/// requires of an assembler that does.
-fn skill_layers(
-    global: &Path,
-    project_root: Option<&Path>,
-) -> rupu_runtime::assembly::RunAssembler {
-    let mut ctx = rupu_runtime::assembly::AssemblyContext::minimal(global.to_path_buf());
-    ctx.project_root = project_root.map(Path::to_path_buf);
-    rupu_runtime::assembly::RunAssembler::new(ctx)
+/// A session's skill layers: global and the project's `.rupu`, the layers
+/// a turn's assembler resolves skills in.
+fn skill_dirs(global: &Path, project_root: Option<&Path>) -> rupu_skills::LayerDirs {
+    rupu_skills::LayerDirs::for_layers(global, project_root.map(|p| p.join(".rupu")).as_deref())
 }
 
 /// Puts the session's loaded skills back into `messages`, a history its
@@ -8065,9 +8063,11 @@ async fn reattach_session_skills(
     if session.loaded_skills.is_empty() || messages.is_empty() {
         return Ok(None);
     }
-    let (skills, _missing) = skill_layers(global, session.project_root.as_deref())
-        .resolve_frozen_skills(&session.skill_index)
-        .await?;
+    let (skills, _missing) = rupu_runtime::assembly::resolve_frozen_skills(
+        &skill_dirs(global, session.project_root.as_deref()),
+        &session.skill_index,
+    )
+    .await?;
     let skills = skills.unwrap_or_default();
     let loaded = session.loaded_skills.clone();
     let cap = input_tokens.map_or(32 * 1024, |t| t as usize);
@@ -8284,8 +8284,9 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             }))
             .cloned()
             .collect();
+        let dirs = skill_dirs(&global, session.project_root.as_deref());
         let (skills, missing_skills, mut refusal) =
-            match assembler.resolve_frozen_skills(&frozen).await {
+            match rupu_runtime::assembly::resolve_frozen_skills(&dirs, &frozen).await {
                 Ok((skills, missing)) => (skills, missing, None),
                 Err(e) => (None, Vec::new(), Some(e.to_string())),
             };
@@ -9193,10 +9194,7 @@ enum StoredSession {
     Current(SessionRecord),
     /// One a newer rupu wrote: it may be shown, never written back, and
     /// what it owns may be named in fields this rupu doesn't know.
-    Newer {
-        version: u32,
-        record: Box<SessionRecord>,
-    },
+    Newer { version: u32, record: SessionRecord },
 }
 
 impl StoredSession {
@@ -9232,10 +9230,7 @@ fn parse_stored_session(bytes: &[u8]) -> anyhow::Result<StoredSession> {
     Ok(if version <= SessionRecord::VERSION {
         StoredSession::Current(record)
     } else {
-        StoredSession::Newer {
-            version,
-            record: Box::new(record),
-        }
+        StoredSession::Newer { version, record }
     })
 }
 
