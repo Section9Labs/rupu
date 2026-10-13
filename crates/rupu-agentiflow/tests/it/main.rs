@@ -7,5 +7,6 @@
 mod flow_parity;
 mod flow_toolset_parity;
 mod message_root;
+mod operator_messages;
 mod reaper;
 mod round_prompt_scope;
