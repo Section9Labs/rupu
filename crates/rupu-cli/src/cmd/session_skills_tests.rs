@@ -341,34 +341,266 @@ async fn a_frozen_skill_removed_mid_session_is_dropped_with_a_notice() {
 }
 
 /// Review Focus 5: a record written before sessions carried skills runs
-/// its turn as before and is written back without skill keys.
+/// its turn as before and is written back without skill keys, still at
+/// version 1.
 #[tokio::test]
 async fn a_record_without_skill_fields_runs_unchanged() {
     let _guard = crate::test_support::ENV_LOCK.lock().await;
     let tmp = tempfile::TempDir::new().unwrap();
-    let (global, record) = skill_session(&tmp, "ses_skills_legacy01", &agent(""), &[], &[]).await;
-    let path = session_record_path(&global, SessionScope::Active, &record.session_id);
-    let keys = |path: &Path| -> Vec<String> {
-        let v: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
-        v.as_object().unwrap().keys().cloned().collect()
+    let global = tmp.path().join("global");
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let session_id = "ses_skills_legacy01";
+    let path = session_record_path(&global, SessionScope::Active, session_id);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let record = json!({
+        "version": 1,
+        "session_id": session_id,
+        "agent_name": "issue-reader",
+        "provider_name": "anthropic",
+        "model": "claude-sonnet-4-6",
+        "agent_system_prompt": "You are a test agent.",
+        "agent_tools": ["read_file"],
+        "max_turns": 50,
+        "permission_mode": "bypass",
+        "no_stream": false,
+        "workspace_id": "ws_test",
+        "workspace_path": workspace,
+        "transcripts_dir": global.join("sessions").join(session_id).join("transcripts"),
+        "created_at": "2026-10-01T00:00:00Z",
+        "updated_at": "2026-10-01T00:00:00Z",
+        "status": "idle",
+        "runs": [],
+    });
+    fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+    let raw = |path: &Path| -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
     };
     let skill_keys = ["skill_index", "skill_prompt", "loaded_skills"];
-    assert!(keys(&path)
-        .iter()
-        .all(|k| !skill_keys.contains(&k.as_str())));
 
-    let evs = turn(&global, &record.session_id, "run_legacy_1", ACK).await;
+    let evs = turn(&global, session_id, "run_legacy_1", ACK).await;
     assert!(!evs
         .iter()
         .any(|e| matches!(e, TranscriptEvent::SkillIndex { .. })));
     assert!(notices(&evs, "skill_missing").is_empty());
-    let prompt = system_prompt(&evs);
-    assert!(prompt.starts_with("You are a test agent."), "{prompt}");
-    assert!(!prompt.contains("## Skill"), "{prompt}");
-    assert!(keys(&path)
-        .iter()
+    assert_eq!(
+        system_prompt(&evs),
+        "You are a test agent.\n\nYour call sign in this run is `jackal` (crew \
+         `lilac-quarter`). Sign any comments, issues or PR notes you post with it."
+    );
+    let after = raw(&path);
+    assert!(after
+        .as_object()
+        .unwrap()
+        .keys()
         .all(|k| !skill_keys.contains(&k.as_str())));
+    assert_eq!(after["version"], 1);
+}
+
+/// A record that carries skills is written as version 2, which a rupu that
+/// predates skills would not know to keep; one without stays version 1.
+#[tokio::test]
+async fn a_record_with_skills_is_written_as_version_2() {
+    let _guard = crate::test_support::ENV_LOCK.lock().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    install_skill(&tmp.path().join("global"), "code-review", "REVIEW STEPS");
+    let (global, with) = skill_session(
+        &tmp,
+        "ses_skills_version01",
+        &agent("skills: [code-review]"),
+        &[],
+        &[],
+    )
+    .await;
+    let (_, without) = skill_session(&tmp, "ses_skills_version02", &agent(""), &[], &[]).await;
+    let version = |id: &str| -> serde_json::Value {
+        let path = session_record_path(&global, SessionScope::Active, id);
+        let v: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        v["version"].clone()
+    };
+    assert_eq!(version(&with.session_id), 2);
+    assert_eq!(version(&without.session_id), 1);
+}
+
+/// A record a newer rupu wrote is refused, so this one never writes it back
+/// without the fields it doesn't know.
+#[tokio::test]
+async fn a_record_from_a_newer_rupu_is_refused() {
+    let _guard = crate::test_support::ENV_LOCK.lock().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (global, record) = skill_session(&tmp, "ses_skills_newer01", &agent(""), &[], &[]).await;
+    let path = session_record_path(&global, SessionScope::Active, &record.session_id);
+    let mut v: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    v["version"] = json!(SessionRecord::VERSION + 1);
+    fs::write(&path, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+    let before = fs::read(&path).unwrap();
+    let newer = "this session was written by a newer rupu; upgrade rupu to continue it";
+
+    let err = with_mock_home(
+        &global,
+        ACK,
+        run_turn(RunTurnArgs {
+            session_id: record.session_id.clone(),
+            run_id: "run_newer_1".into(),
+            prompt: "hi".into(),
+            operator_skills: Vec::new(),
+        }),
+    )
+    .await
+    .expect_err("the turn is refused");
+    assert!(err.to_string().contains(newer), "{err}");
+    let err = with_mock_home(
+        &global,
+        ACK,
+        send(SendArgs {
+            session_id: record.session_id.clone(),
+            prompt: Some("hi".into()),
+            skills: Vec::new(),
+            detach: true,
+            view: None,
+        }),
+    )
+    .await
+    .expect_err("the send is refused");
+    assert!(err.to_string().contains(newer), "{err}");
+    assert_eq!(fs::read(&path).unwrap(), before);
+}
+
+/// A turn whose assembly fails (its grant names an unknown tool) is a
+/// failed turn that keeps the skills the session had loaded.
+#[tokio::test]
+async fn a_turn_whose_assembly_fails_keeps_the_loaded_skills() {
+    let _guard = crate::test_support::ENV_LOCK.lock().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    install_skill(&tmp.path().join("global"), "code-review", "REVIEW STEPS");
+    let (global, record) = skill_session(
+        &tmp,
+        "ses_skills_assembly01",
+        &agent("skills: [code-review]"),
+        &[],
+        &[],
+    )
+    .await;
+    turn(
+        &global,
+        &record.session_id,
+        "run_assembly_1",
+        &load("code-review"),
+    )
+    .await;
+    let (mut loaded, _) = read_session(&global, &record.session_id).unwrap();
+    assert_eq!(loaded.loaded_skills.len(), 1);
+    loaded.agent_tools = Some(vec!["no_such_tool".into()]);
+    write_session(&global, SessionScope::Active, &loaded).unwrap();
+
+    with_mock_home(
+        &global,
+        ACK,
+        run_turn(RunTurnArgs {
+            session_id: record.session_id.clone(),
+            run_id: "run_assembly_2".into(),
+            prompt: "again".into(),
+            operator_skills: Vec::new(),
+        }),
+    )
+    .await
+    .expect("a failed turn is recorded, not returned");
+    let (after, _) = read_session(&global, &record.session_id).unwrap();
+    assert_eq!(after.status, SessionStatus::Failed);
+    let error = after.last_error.clone().unwrap_or_default();
+    assert!(error.contains("no_such_tool"), "{error}");
+    assert_eq!(after.loaded_skills, loaded.loaded_skills);
+}
+
+/// A loaded skill uninstalled for a turn is reported once and stays loaded,
+/// so the turn after its reinstall re-attaches it.
+#[tokio::test]
+async fn a_loaded_skill_missing_for_a_turn_comes_back_on_reinstall() {
+    let _guard = crate::test_support::ENV_LOCK.lock().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = install_skill(&tmp.path().join("global"), "code-review", "REVIEW STEPS");
+    let (global, record) = skill_session(
+        &tmp,
+        "ses_skills_reinstall01",
+        &agent("skills: [code-review]"),
+        &[],
+        &[],
+    )
+    .await;
+    turn(
+        &global,
+        &record.session_id,
+        "run_reinstall_1",
+        &load("code-review"),
+    )
+    .await;
+    let (loaded, _) = read_session(&global, &record.session_id).unwrap();
+    fs::remove_dir_all(&dir).unwrap();
+    let gone = turn(&global, &record.session_id, "run_reinstall_2", ACK).await;
+    assert_eq!(
+        notices(&gone, "skill_missing"),
+        vec!["skill code-review (global) is not available to this run: removed".to_string()]
+    );
+    let (after_gone, _) = read_session(&global, &record.session_id).unwrap();
+    assert_eq!(after_gone.loaded_skills, loaded.loaded_skills);
+
+    install_skill(&global, "code-review", "REVIEW STEPS");
+    let back = turn(&global, &record.session_id, "run_reinstall_3", ACK).await;
+    assert!(notices(&back, "skill_missing").is_empty());
+    assert_eq!(loads(&back), pairs(&[("continuation", "code-review")]));
+}
+
+/// A skills directory that can't be read fails the turn the way a failed
+/// assembly does: recorded on the session, with a transcript that says why.
+#[tokio::test]
+async fn an_unreadable_skills_directory_fails_the_turn_with_a_transcript() {
+    let _guard = crate::test_support::ENV_LOCK.lock().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dir = install_skill(&tmp.path().join("global"), "code-review", "REVIEW STEPS");
+    let (global, record) = skill_session(
+        &tmp,
+        "ses_skills_unreadable01",
+        &agent("skills: [code-review]"),
+        &[],
+        &[],
+    )
+    .await;
+    fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    fs::write(global.join("skills"), "not a directory").unwrap();
+
+    with_mock_home(
+        &global,
+        ACK,
+        run_turn(RunTurnArgs {
+            session_id: record.session_id.clone(),
+            run_id: "run_unreadable_1".into(),
+            prompt: "hi".into(),
+            operator_skills: Vec::new(),
+        }),
+    )
+    .await
+    .expect("a failed turn is recorded, not returned");
+    let (after, _) = read_session(&global, &record.session_id).unwrap();
+    assert_eq!(after.status, SessionStatus::Failed);
+    let error = after.last_error.clone().unwrap_or_default();
+    assert!(error.starts_with("skills: "), "{error}");
+    let transcript = after.transcripts_dir.join("run_unreadable_1.jsonl");
+    let closed = JsonlReader::iter(&transcript)
+        .expect("the turn has a transcript")
+        .filter_map(Result::ok)
+        .find_map(|e| match e {
+            TranscriptEvent::RunComplete { status, error, .. } => Some((status, error)),
+            _ => None,
+        })
+        .expect("the transcript closes the run");
+    assert_eq!(closed.0, RunStatus::Error);
+    assert!(
+        closed
+            .1
+            .as_deref()
+            .is_some_and(|e| e.starts_with("skills: ")),
+        "{closed:?}"
+    );
 }
 
 /// Runs one turn the operator invoked `invoked` in and returns its
@@ -672,7 +904,10 @@ async fn send_skill_refuses_wildcards_and_ambiguous_names() {
         )
     };
     let other_layer = refused(&["project:notes"]).await;
-    assert!(other_layer.contains(&bound("notes")), "{other_layer}");
+    assert!(
+        other_layer.contains("this session already has global:notes; invoke global:notes"),
+        "{other_layer}"
+    );
     let held_twice = refused(&["global:pdf", "project:pdf"]).await;
     assert!(held_twice.contains(&bound("pdf")), "{held_twice}");
 

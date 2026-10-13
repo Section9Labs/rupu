@@ -612,10 +612,10 @@ impl RunAssembler {
     /// An operator's invocations for a session turn (spec 2026-10-12 §5.2),
     /// each entry resolved against the same layers as
     /// [`Self::resolve_frozen_skills`]: any valid installed skill, granted
-    /// or not. `held` is the session's frozen set; an entry this call
-    /// already resolved binds its name too, and one resolved twice is
-    /// returned once. A wildcard, an unknown or ambiguous name, or a name
-    /// held from the other layer fails the whole call.
+    /// or not. `held` is the session's frozen set; one resolved twice is
+    /// returned once. A wildcard, an unknown or ambiguous name, a name held
+    /// from the other layer, or one invoked from both layers fails the
+    /// whole call.
     pub async fn resolve_operator_skills(
         &self,
         held: &[rupu_skills::FrozenSkill],
@@ -632,7 +632,7 @@ impl RunAssembler {
                 .map(|p| p.join(".rupu"))
                 .as_deref(),
         );
-        let (mut held, entries) = (held.to_vec(), entries.to_vec());
+        let (held, entries) = (held.to_vec(), entries.to_vec());
         tokio::task::spawn_blocking(move || {
             let failed = |source: rupu_agent::SkillCheckError| AssembleError::Skills {
                 source,
@@ -644,8 +644,16 @@ impl RunAssembler {
             for entry in &entries {
                 let f = rupu_skills::resolve_operator(&catalog, &held, entry)
                     .map_err(|e| failed(e.into()))?;
+                if invoked
+                    .iter()
+                    .any(|i| i.name == f.name && i.layer != f.layer)
+                {
+                    let both = rupu_skills::ResolveError::BothLayers { name: f.name };
+                    return Err(failed(
+                        rupu_skills::RunSkillsError::Resolve(vec![both]).into(),
+                    ));
+                }
                 if !invoked.contains(&f) {
-                    held.push(f.clone());
                     invoked.push(f);
                 }
             }

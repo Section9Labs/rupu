@@ -772,6 +772,49 @@ async fn missing_frozen_skills_are_reported_at_run_start() {
     }
 }
 
+/// A carried skill that is missing from a session turn's frozen set is
+/// reported once, by the run-start notice, and stays in the loaded set at
+/// its place: when it is installed again, the next turn re-attaches it.
+#[tokio::test]
+async fn a_carried_skill_missing_from_the_frozen_set_stays_loaded_with_one_notice() {
+    let global = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    install(global.path(), "pdf", "PDF STEPS");
+    let transcript = ws.path().join("run.jsonl");
+    let provider = MockProvider::new(vec![done_turn()]);
+    let mut o = opts(
+        provider,
+        ws.path(),
+        transcript.clone(),
+        resolved(global.path(), &["pdf"]),
+    );
+    let carried = vec![
+        LoadedSkill {
+            name: "gone".into(),
+            content_hash: "5".repeat(64),
+        },
+        LoadedSkill {
+            name: "pdf".into(),
+            content_hash: "6".repeat(64),
+        },
+    ];
+    o.prompt.loaded_skills = carried.clone();
+    o.prompt.missing_skills = vec![rupu_skills::MissingSkill {
+        name: "gone".into(),
+        layer: rupu_skills::Layer::Global,
+        reason: rupu_skills::MissingReason::Removed,
+    }];
+    let exit = rupu_agent::run_agent_full(o).await;
+    exit.result.unwrap();
+    let evs = events(&transcript);
+    assert_eq!(
+        notices(&evs, "skill_missing"),
+        vec!["skill gone (global) is not available to this run: removed".to_string()]
+    );
+    assert_eq!(timeline(&evs), vec!["continuation:pdf"]);
+    assert_eq!(exit.loaded_skills, carried);
+}
+
 /// Two missing and two omitted skills are each listed most recently loaded
 /// first.
 #[test]

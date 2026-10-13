@@ -86,6 +86,14 @@ pub enum RunSkillsError {
     /// An operator invokes one skill; `*` and `project:*` name a set.
     #[error("skill entry {0:?} is a wildcard; invoke one skill by name")]
     Wildcard(String),
+    /// An operator entry names a skill the session holds from the other
+    /// layer; `held_installed` is whether the held one is still installed.
+    #[error("{}", held_in_other_layer(name, *held, *held_installed))]
+    HeldInOtherLayer {
+        name: String,
+        held: Layer,
+        held_installed: bool,
+    },
     /// A preloaded skill's files could not be read to version its body.
     #[error("skill {name:?} ({}) can't be read: {error}", layer.as_str())]
     Hash {
@@ -100,7 +108,9 @@ impl RunSkillsError {
     pub fn io_errors(&self) -> impl Iterator<Item = &std::io::Error> {
         let (resolve, hash) = match self {
             RunSkillsError::Resolve(errors) => (errors.as_slice(), None),
-            RunSkillsError::Parse(_) | RunSkillsError::Wildcard(_) => (&[][..], None),
+            RunSkillsError::Parse(_)
+            | RunSkillsError::Wildcard(_)
+            | RunSkillsError::HeldInOtherLayer { .. } => (&[][..], None),
             RunSkillsError::Hash { error, .. } => (&[][..], Some(error)),
         };
         resolve
@@ -112,6 +122,22 @@ impl RunSkillsError {
             .chain(hash)
             .filter_map(|e| e.0.io_error())
     }
+}
+
+fn held_in_other_layer(name: &str, held: Layer, held_installed: bool) -> String {
+    let held_ref = format!("{}:{name}", held.as_str());
+    if held_installed {
+        return format!("this session already has {held_ref}; invoke {held_ref}");
+    }
+    let other = match held {
+        Layer::Global => Layer::Project,
+        Layer::Project => Layer::Global,
+    };
+    format!(
+        "this session already has {held_ref}, which is no longer installed; \
+         it can't also take {}:{name}",
+        other.as_str()
+    )
 }
 
 type Bound = BTreeMap<(String, Layer), Arc<Skill>>;
@@ -274,13 +300,15 @@ pub fn resolve_operator(
         }])
     })?;
     let name = skill.name.as_str();
-    if held
+    if let Some(h) = held
         .iter()
-        .any(|h| h.name == name && h.layer != skill.layer)
+        .find(|h| h.name == name && h.layer != skill.layer)
     {
-        return Err(RunSkillsError::Resolve(vec![ResolveError::BothLayers {
+        return Err(RunSkillsError::HeldInOtherLayer {
             name: name.to_owned(),
-        }]));
+            held: h.layer,
+            held_installed: catalog.get(h.layer, name).is_some_and(|e| e.is_valid()),
+        });
     }
     Ok(FrozenSkill {
         name: name.to_owned(),

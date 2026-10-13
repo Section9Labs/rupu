@@ -694,18 +694,24 @@ fn session_holding_global_x() -> (tempfile::TempDir, tempfile::TempDir, Vec<Froz
 fn an_operator_entry_binding_the_other_layer_of_a_held_name_is_refused() {
     let (g, p, held) = session_holding_global_x();
     let cat = catalog(g.path(), Some(p.path()));
-    let both = "skill \"x\" is granted from both the global and the project layer; \
-                grant only one of global:x or project:x";
     let err = rupu_skills::run::resolve_operator(&cat, &held, "project:x").unwrap_err();
-    assert_eq!(err.to_string(), both);
+    assert_eq!(
+        err.to_string(),
+        "this session already has global:x; invoke global:x"
+    );
     // The held skill itself may be invoked.
     let same = rupu_skills::run::resolve_operator(&cat, &held, "global:x").unwrap();
     assert_eq!((same.name.as_str(), same.layer), ("x", Layer::Global));
-    // A bare name that now binds only the project's `x` is refused too.
+    // A bare name that now binds only the project's `x` is refused too, and
+    // the refusal says which `x` the session holds.
     fs::remove_dir_all(g.path().join("skills/x")).unwrap();
     let cat = catalog(g.path(), Some(p.path()));
     let err = rupu_skills::run::resolve_operator(&cat, &held, "x").unwrap_err();
-    assert_eq!(err.to_string(), both);
+    assert_eq!(
+        err.to_string(),
+        "this session already has global:x, which is no longer installed; \
+         it can't also take project:x"
+    );
 }
 
 #[test]

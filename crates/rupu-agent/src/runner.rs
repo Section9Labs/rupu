@@ -2204,6 +2204,7 @@ async fn run_agent_inner(
     seed_loaded_skills(
         &mut writer,
         opts.tool_context.services.skills.as_deref(),
+        &opts.prompt.missing_skills,
         &mut opts.loaded_skills,
     )?;
     record_operator_loads(
@@ -3708,11 +3709,14 @@ fn write_skill_index(
 /// (`via: continuation`, at the version the conversation holds), so every
 /// transcript carries its own set; one it no longer grants is dropped with
 /// a notice. A skill this run preloads is dropped quietly: its body is in
-/// the system prompt. A name the carried set holds twice is seeded once, at
-/// its later entry.
+/// the system prompt. One of `missing` (a session's frozen skill this turn
+/// can't give, already reported) stays in the set where it was, unrecorded,
+/// so the turn after a reinstall re-attaches it. A name the carried set
+/// holds twice is seeded once, at its later entry.
 fn seed_loaded_skills(
     writer: &mut JsonlWriter,
     skills: Option<&rupu_skills::ResolvedSkills>,
+    missing: &[rupu_skills::MissingSkill],
     loaded: &mut Vec<LoadedSkill>,
 ) -> Result<(), RunError> {
     let carried = std::mem::take(loaded);
@@ -3733,6 +3737,7 @@ fn seed_loaded_skills(
                 })?;
                 loaded.push(seeded);
             }
+            None if missing.iter().any(|m| m.name == seeded.name) => loaded.push(seeded),
             None => writer.write(&Event::Notice {
                 kind: "skill_missing".into(),
                 message: format!(

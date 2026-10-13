@@ -575,7 +575,22 @@ struct SessionRecord {
 }
 
 impl SessionRecord {
-    const VERSION: u32 = 1;
+    /// The newest record version this rupu reads. A record is written at
+    /// [`Self::written_version`].
+    const VERSION: u32 = 2;
+
+    /// 2 for a record that carries skills, which a rupu that predates them
+    /// would drop on its next write; else 1, so those rupus keep reading it.
+    fn written_version(&self) -> u32 {
+        let skills = !self.skill_index.is_empty()
+            || self.skill_prompt.is_some()
+            || !self.loaded_skills.is_empty();
+        if skills {
+            2
+        } else {
+            1
+        }
+    }
 
     /// The input limit compaction and the gauge use: the stored resolved value
     /// (which already reflects the agent pin — `resolve` applies pins first —
@@ -7980,11 +7995,10 @@ fn session_agent_file(global: &Path, session: &SessionRecord) -> Option<rupu_age
                 rupu_agent::AgentLoadError::NotFound(_) => {
                     "no agent by this name in the agent dirs".to_string()
                 }
-                rupu_agent::AgentLoadError::UnknownTool { .. } => {
-                    "the agent's `tools:` names an unknown tool".to_string()
-                }
-                rupu_agent::AgentLoadError::Skill { .. } => {
-                    "the agent's skill keys do not resolve".to_string()
+                // `find_agent` only parses, so neither arises here.
+                rupu_agent::AgentLoadError::UnknownTool { .. }
+                | rupu_agent::AgentLoadError::Skill { .. } => {
+                    "the agent's `tools:` or skill keys do not resolve".to_string()
                 }
             };
             tracing::warn!(
@@ -8099,29 +8113,34 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         let agent = session_agent_spec(&global, &session)?;
         // The session's frozen skills as installed now; one that can't be
         // given is reported and the turn runs without it. The skills section
-        // is the one `session start` rendered, never re-rendered.
-        let (skills, missing_skills) = assembler
-            .resolve_frozen_skills(&session.skill_index)
-            .await?;
-        let (message, operator_loads) = if args.operator_skills.is_empty() {
-            (args.prompt.clone(), Vec::new())
-        } else {
-            let (skills, invoked, prompt) = (
-                skills.clone(),
-                args.operator_skills.clone(),
-                args.prompt.clone(),
-            );
-            let turn = tokio::task::spawn_blocking(move || {
-                rupu_agent::operator_turn(skills.as_deref(), &invoked, &prompt)
-            })
-            .await
-            .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))?;
-            anyhow::ensure!(
-                !turn.0.is_empty(),
-                "the skills this turn invoked are no longer installed, and it has no prompt"
-            );
-            turn
-        };
+        // is the one `session start` rendered, never re-rendered. Skills
+        // directories that can't be read fail the turn as a failed assembly
+        // would, below.
+        let (skills, missing_skills, skills_failure) =
+            match assembler.resolve_frozen_skills(&session.skill_index).await {
+                Ok((skills, missing)) => (skills, missing, None),
+                Err(e) => (None, Vec::new(), Some(e)),
+            };
+        let (message, operator_loads) =
+            if args.operator_skills.is_empty() || skills_failure.is_some() {
+                (args.prompt.clone(), Vec::new())
+            } else {
+                let (skills, invoked, prompt) = (
+                    skills.clone(),
+                    args.operator_skills.clone(),
+                    args.prompt.clone(),
+                );
+                let turn = tokio::task::spawn_blocking(move || {
+                    rupu_agent::operator_turn(skills.as_deref(), &invoked, &prompt)
+                })
+                .await
+                .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))?;
+                anyhow::ensure!(
+                    !turn.0.is_empty(),
+                    "the skills this turn invoked are no longer installed, and it has no prompt"
+                );
+                turn
+            };
         // The session's limits: the value stored by an earlier turn
         // (including any limit learned from an overflow error), else resolved
         // now — the first turn — through this turn's provider (spec
@@ -8293,16 +8312,45 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             final_limits,
             messages: exit_messages,
             loaded_skills,
-        } = match assembler.assemble(launch).await {
-            Ok(run) => run.run().await,
-            Err(e) => rupu_agent::RunExit {
-                result: Err(e.into_run_error()),
-                final_limits: session
-                    .model_limits
-                    .clone()
-                    .unwrap_or_else(rupu_providers::model_limits::ModelLimits::unknown),
-                messages: Vec::new(),
-                loaded_skills: session.loaded_skills.clone(),
+        } = match skills_failure {
+            Some(e) => {
+                let (provider, model) = assembler.provider_model_of(&launch);
+                let error = e.record_unstarted(rupu_agent::UnstartedRun {
+                    transcript_path: &launch.transcript_path,
+                    run_id: &launch.run_id,
+                    workspace_id: &launch.workspace.id,
+                    agent: &launch.agent.name,
+                    provider: &provider,
+                    model: &model,
+                    mode,
+                    codename: launch.codename.as_deref(),
+                    customer: turn_customer.as_deref(),
+                    system_prompt: Some(&launch.agent.system_prompt),
+                    prompt: &launch.prompt,
+                    launch_skills: &[],
+                    launch_preload_skills: &[],
+                });
+                rupu_agent::RunExit {
+                    result: Err(error),
+                    final_limits: session
+                        .model_limits
+                        .clone()
+                        .unwrap_or_else(rupu_providers::model_limits::ModelLimits::unknown),
+                    messages: Vec::new(),
+                    loaded_skills: session.loaded_skills.clone(),
+                }
+            }
+            None => match assembler.assemble(launch).await {
+                Ok(run) => run.run().await,
+                Err(e) => rupu_agent::RunExit {
+                    result: Err(e.into_run_error()),
+                    final_limits: session
+                        .model_limits
+                        .clone()
+                        .unwrap_or_else(rupu_providers::model_limits::ModelLimits::unknown),
+                    messages: Vec::new(),
+                    loaded_skills: session.loaded_skills.clone(),
+                },
             },
         };
         // The turn's cached tokens: the provider-reported total summed over
@@ -8808,7 +8856,16 @@ fn write_session(
     fs::create_dir_all(&dir)?;
     let path = session_record_path(global, scope, &session.session_id);
     let tmp = path.with_extension("tmp");
-    fs::write(&tmp, serde_json::to_vec_pretty(session)?)?;
+    let version = session.written_version();
+    let bytes = if session.version == version {
+        serde_json::to_vec_pretty(session)?
+    } else {
+        serde_json::to_vec_pretty(&SessionRecord {
+            version,
+            ..session.clone()
+        })?
+    };
+    fs::write(&tmp, bytes)?;
     fs::rename(&tmp, &path)?;
     Ok(())
 }
@@ -8826,7 +8883,7 @@ fn read_session(global: &Path, fragment: &str) -> anyhow::Result<(SessionRecord,
         if path.is_file() {
             let bytes = fs::read(&path)
                 .with_context(|| format!("read session record {}", path.display()))?;
-            return Ok((serde_json::from_slice(&bytes)?, scope));
+            return Ok((parse_session_record(&bytes)?, scope));
         }
     }
 
@@ -8834,7 +8891,22 @@ fn read_session(global: &Path, fragment: &str) -> anyhow::Result<(SessionRecord,
     let path = session_record_path(global, scope, &id);
     let bytes =
         fs::read(&path).with_context(|| format!("read session record {}", path.display()))?;
-    Ok((serde_json::from_slice(&bytes)?, scope))
+    Ok((parse_session_record(&bytes)?, scope))
+}
+
+/// A session record this rupu understands: one a newer rupu wrote may hold
+/// fields this one would drop when it writes the record back.
+fn parse_session_record(bytes: &[u8]) -> anyhow::Result<SessionRecord> {
+    #[derive(Deserialize)]
+    struct Versioned {
+        version: u32,
+    }
+    let Versioned { version } = serde_json::from_slice(bytes)?;
+    anyhow::ensure!(
+        version <= SessionRecord::VERSION,
+        "this session was written by a newer rupu; upgrade rupu to continue it"
+    );
+    Ok(serde_json::from_slice(bytes)?)
 }
 
 /// Session directory names in one scope. Reads directory entries only —

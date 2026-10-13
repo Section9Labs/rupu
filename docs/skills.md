@@ -299,3 +299,13 @@ granted skills at run start, and a `skill_load` is written for every load, with
 [transcript-schema.md](transcript-schema.md#skill_index). Notices name what
 needs attention: `skill_not_indexed`, `skill_changed`, `skill_missing`,
 `skill_tools_missing` and `skill_reattach_truncated`.
+
+## Skills in sessions
+
+A session record that carries skills is written as version 2; one without
+skills stays version 1. A rupu older than session skills doesn't check the
+version, so it continues a version 2 session but drops its skills the next
+time it writes the record: the session runs on without them. A rupu that
+knows session skills refuses a record from a newer rupu ("this session was
+written by a newer rupu; upgrade rupu to continue it") rather than write it
+back without the fields it doesn't know.
