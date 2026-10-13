@@ -1252,6 +1252,10 @@ async fn run_rerun_in(target_id: &str, run_id: &str) -> ExitCode {
         // Rerun uses the code path unless/until the run manifest records the
         // engagement selection (follow-on); it never silently guesses one.
         engagement_profiles: Vec::new(),
+        // Nor does it record a launch's own `--skill`s: the rerun gets the
+        // agent's skills only.
+        skills: Vec::new(),
+        preload_skills: Vec::new(),
         continue_from: None,
         model: None,
         provider: None,

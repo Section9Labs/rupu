@@ -494,6 +494,53 @@ fn run_names_where_a_missing_skill_was_looked_for() {
 }
 
 #[test]
+fn run_skill_flag_names_where_a_missing_skill_was_looked_for() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    fs::create_dir_all(home.path().join("agents")).unwrap();
+    fs::write(
+        home.path().join("agents/a.md"),
+        "---\nname: a\nprovider: anthropic\nmodel: claude-sonnet-4-6\n---\nhi\n",
+    )
+    .unwrap();
+    let out = Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", home.path())
+        .env(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"[{"AssistantText":{"text":"ran","stop":"end_turn"}}]"#,
+        )
+        .env_remove("RUPU_LOG")
+        .current_dir(cwd.path())
+        .args([
+            "run",
+            "a",
+            "--mode",
+            "readonly",
+            "--run-id",
+            "run_skillflag",
+            "--skill",
+            "nope",
+            "go",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let message = format!(
+        "skills: unknown skill \"nope\" (looked in {}; install it with `rupu skill install`)",
+        home.path().join("skills").display()
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(&format!("[error] {message}")), "{stderr}");
+    let record: Value = serde_json::from_str(
+        &fs::read_to_string(home.path().join("runs/run_skillflag/run.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(record["status"], "failed");
+    assert_eq!(record["error_message"], message.as_str());
+}
+
+#[test]
 fn validate_names_an_oversized_skill_md() {
     let home = tempfile::tempdir().unwrap();
     let cwd = tempfile::tempdir().unwrap();

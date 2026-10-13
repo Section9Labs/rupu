@@ -69,6 +69,10 @@ pub struct AgentRun {
     pub prompt: Option<String>,
     pub findings_profile: Option<FindingProfile>,
     pub engagement_profiles: Vec<String>,
+    /// `--skill`, repeated: a workflow step's `skills:`.
+    pub skills: Vec<String>,
+    /// `--preload-skill`, repeated: a workflow step's `preload_skills:`.
+    pub preload_skills: Vec<String>,
     /// `--tmp`: clone a repo/PR target into an auto-deleted tmpdir. The CP and
     /// placed launches set it whenever there is a target.
     pub tmp_clone: bool,
@@ -95,6 +99,8 @@ impl AgentRun {
             prompt: None,
             findings_profile: None,
             engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
             tmp_clone: false,
             flow: None,
             continue_from: None,
@@ -360,6 +366,12 @@ impl RunArgv {
                 );
                 for id in &r.engagement_profiles {
                     a.flag_value("--engagement-profile", id);
+                }
+                for s in &r.skills {
+                    a.flag_value("--skill", s);
+                }
+                for s in &r.preload_skills {
+                    a.flag_value("--preload-skill", s);
                 }
                 if let Some(p) = &r.prompt {
                     a.push(format!("--prompt={p}"));
@@ -656,6 +668,8 @@ mod tests {
         r.mode = Some(PermissionMode::Bypass);
         r.findings_profile = Some(FindingProfile::Summary);
         r.engagement_profiles = vec!["network".into(), "web".into()];
+        r.skills = vec!["pdf".into(), "project:notes".into()];
+        r.preload_skills = vec!["house-style".into()];
         r.prompt = Some("look at PR".into());
         r.tmp_clone = true;
         r.codename = Some("jade-reef/numbat".into());
@@ -681,6 +695,12 @@ mod tests {
                 "network",
                 "--engagement-profile",
                 "web",
+                "--skill",
+                "pdf",
+                "--skill",
+                "project:notes",
+                "--preload-skill",
+                "house-style",
                 "--prompt=look at PR",
                 "--tmp",
                 "--fleet-run-dir",

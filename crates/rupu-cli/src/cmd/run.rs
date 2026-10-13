@@ -90,6 +90,13 @@ pub struct Args {
         value_delimiter = ','
     )]
     pub engagement_profiles: Vec<String>,
+    /// A skill this run may load, on top of the agent's own (repeatable).
+    /// A coordinator passes a workflow step's `skills:` this way.
+    #[arg(long = "skill", value_name = "SKILL")]
+    pub skills: Vec<String>,
+    /// A skill whose body goes in this run's system prompt (repeatable).
+    #[arg(long = "preload-skill", value_name = "SKILL")]
+    pub preload_skills: Vec<String>,
     /// Continue an interrupted run of this agent from its transcript instead
     /// of starting fresh: the earlier conversation is rebuilt and the agent
     /// is told it was interrupted. A run that had already finished prints
@@ -923,6 +930,8 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                 .as_ref()
                 .map(crate::run_target::format_run_target_for_prompt),
             findings_profile: args.findings_profile,
+            skills: args.skills.clone(),
+            preload_skills: args.preload_skills.clone(),
             ..Default::default()
         };
 
@@ -1832,6 +1841,28 @@ mod tests {
         assert_eq!(args.findings_profile, Some(Full));
         assert_eq!(args.agent, "sec");
         assert_eq!(launch_args(&["sec"]).unwrap().findings_profile, None);
+    }
+
+    #[test]
+    fn skill_flags_parse_repeated_in_either_position() {
+        let a = launch_args(&[
+            "--skill",
+            "pdf",
+            "sec",
+            "--preload-skill",
+            "house-style",
+            "--skill",
+            "project:notes",
+            "--prompt",
+            "go",
+        ])
+        .unwrap();
+        assert_eq!(a.agent, "sec");
+        assert_eq!(
+            a.skills,
+            vec!["pdf".to_string(), "project:notes".to_string()]
+        );
+        assert_eq!(a.preload_skills, vec!["house-style".to_string()]);
     }
 
     #[test]
