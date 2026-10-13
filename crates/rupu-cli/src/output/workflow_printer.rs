@@ -4972,7 +4972,7 @@ mod tests {
                     layer: "global".into(),
                     stamp: "ab".repeat(32),
                     preload: true,
-                    indexed: true,
+                    indexed: false,
                     reason: "agent".into(),
                 }],
             },

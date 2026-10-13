@@ -89,8 +89,12 @@ mod tests {
             "2 tools: bash, read_file  ·  narrowed by actions: scm.prs.get  ·  unavailable: board.post (needs message_bus)"
         );
         let many: Vec<_> = (0..14).map(|i| e(&format!("t{i}"))).collect();
-        assert!(tool_grant_line(&many, &[], &[]).ends_with("(+2 more)"));
+        assert_eq!(
+            tool_grant_line(&many, &[], &[]),
+            "14 tools: t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11 (+2 more)"
+        );
         assert_eq!(tool_grant_line(&[], &[], &[]), "0 tools");
+        assert_eq!(tool_grant_line(&[e("grep")], &[], &[]), "1 tool: grep");
     }
 
     #[test]

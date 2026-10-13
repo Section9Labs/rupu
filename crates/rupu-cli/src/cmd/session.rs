@@ -9759,6 +9759,58 @@ mod tests {
     }
 
     #[test]
+    fn retained_session_rows_show_tool_grant_and_skill_events() {
+        let session = test_session_record();
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Compact),
+        );
+        let mut state = SessionInteractiveState::new(
+            PathBuf::from("/tmp/repo/.rupu/transcripts/run_live123.jsonl"),
+            Some("run_live123".into()),
+            LiveViewMode::Compact,
+        );
+        state.push_transcript_event(&TranscriptEvent::ToolGrant {
+            entries: vec![rupu_transcript::ToolGrantEntry {
+                tool: "read_file".into(),
+                reasons: vec!["declared".into()],
+            }],
+            narrowed: vec![],
+            unavailable: vec![],
+            skipped: vec![],
+        });
+        state.push_transcript_event(&TranscriptEvent::SkillIndex {
+            skills: vec![rupu_transcript::SkillIndexEntry {
+                name: "pdf".into(),
+                layer: "global".into(),
+                stamp: "ab".repeat(32),
+                preload: true,
+                indexed: false,
+                reason: "agent".into(),
+            }],
+        });
+        state.push_transcript_event(&TranscriptEvent::SkillLoad {
+            name: "pdf".into(),
+            layer: "global".into(),
+            content_hash: "cd".repeat(32),
+            base_dir: "/h/skills/pdf".into(),
+            via: "preload".into(),
+        });
+
+        let rows = build_session_screen_rows_for_size(&session, &mut state, &prefs, 120, 20);
+        assert!(rows.iter().any(|row| row.contains("1 tool: read_file")));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("1 skill: pdf (preloaded)")));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("loaded skill pdf (cdcdcdcdcdcd) via preload")));
+    }
+
+    #[test]
     fn retained_session_header_shows_model_effort_totals_and_cost() {
         let session = SessionRecord {
             status: SessionStatus::Running,
@@ -10131,7 +10183,7 @@ mod tests {
                     layer: "global".into(),
                     stamp: "ab".repeat(32),
                     preload: true,
-                    indexed: true,
+                    indexed: false,
                     reason: "agent".into(),
                 }],
             },

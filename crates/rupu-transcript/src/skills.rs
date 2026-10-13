@@ -19,12 +19,18 @@ pub fn skill_index_line(entries: &[SkillIndexEntry]) -> String {
     } else {
         "skills"
     };
+    if names.is_empty() {
+        return format!("0 {noun}");
+    }
     format!("{} {noun}: {}", entries.len(), names.join(", "))
 }
 
-/// One line for a `skill_load`: the skill, a short content hash and how it
-/// was loaded.
+/// One line for a `skill_load`: the skill, a short content hash (when the
+/// load recorded one) and how it was loaded.
 pub fn skill_load_line(name: &str, via: &str, content_hash: &str) -> String {
+    if content_hash.is_empty() {
+        return format!("loaded skill {name} via {via}");
+    }
     let short: String = content_hash.chars().take(12).collect();
     format!("loaded skill {name} ({short}) via {via}")
 }
@@ -55,6 +61,15 @@ mod tests {
         assert_eq!(
             skill_load_line("pdf", "model", &"ab".repeat(32)),
             "loaded skill pdf (abababababab) via model"
+        );
+    }
+
+    #[test]
+    fn empty_index_and_unhashed_load_read_cleanly() {
+        assert_eq!(skill_index_line(&[]), "0 skills");
+        assert_eq!(
+            skill_load_line("pdf", "preload", ""),
+            "loaded skill pdf via preload"
         );
     }
 }

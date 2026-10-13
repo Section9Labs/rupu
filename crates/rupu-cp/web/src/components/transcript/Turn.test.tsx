@@ -152,6 +152,7 @@ describe('Turn', () => {
             { kind: 'user', content: 'do the task' },
             { kind: 'thinking', text: null, provider: 'anthropic' },
             { kind: 'notice', noticeKind: 'context_trim', message: 'trimmed to fit' },
+            { kind: 'meta', label: 'skills', text: 'loaded skill pdf (abababababab) via model' },
             { kind: 'compaction', seq: 1, summarized: 9 },
             { kind: 'unknown', type: 'hologram_projection' },
           ],
@@ -165,6 +166,8 @@ describe('Turn', () => {
     expect(screen.getByText(/4 prior messages/)).toBeInTheDocument();
     expect(screen.getByText('do the task')).toBeInTheDocument();
     expect(screen.getByText(/trimmed to fit/)).toBeInTheDocument();
+    expect(screen.getByText('skills')).toBeInTheDocument();
+    expect(screen.getByText(/loaded skill pdf \(abababababab\) via model/)).toBeInTheDocument();
     expect(screen.getByText(/summarized 9/)).toBeInTheDocument();
     expect(screen.getByText(/hologram_projection/)).toBeInTheDocument();
   });
