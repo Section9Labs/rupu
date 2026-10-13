@@ -5,16 +5,18 @@
 //! membership and the reason is the first request that names the skill.
 
 use crate::catalog::SkillCatalog;
-use crate::grant::{parse_grants, resolve_grants, EntryError, GrantParseError, ResolveError};
+use crate::grant::{
+    parse_grants, resolve_grants, EntryError, GrantParseError, ResolveError, SkillGrant,
+};
 use crate::render::{render_skills_section, IndexItem, PreloadItem};
 use crate::skill::{Layer, Skill, SkillError};
-use crate::tree::ContentHash;
-use serde::Serialize;
+use crate::tree::{ContentHash, Stamp};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SkillReason {
     Agent,
@@ -49,6 +51,9 @@ pub struct GrantedSkill {
     pub preload: bool,
     pub indexed: bool,
     pub reason: SkillReason,
+    /// What a change on disk is judged against: the stamp the run's index
+    /// recorded, which for a session turn is the one its first turn did.
+    pub baseline_stamp: Stamp,
     /// The version of the body the system prompt carries: `Some` exactly
     /// for a preloaded skill, hashed when the run resolved it.
     pub content_hash: Option<ContentHash>,
@@ -78,6 +83,9 @@ pub enum RunSkillsError {
     Parse(#[from] GrantParseError),
     #[error("{}", .0.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))]
     Resolve(Vec<ResolveError>),
+    /// An operator invokes one skill; `*` and `project:*` name a set.
+    #[error("skill entry {0:?} is a wildcard; invoke one skill by name")]
+    Wildcard(String),
     /// A preloaded skill's files could not be read to version its body.
     #[error("skill {name:?} ({}) can't be read: {error}", layer.as_str())]
     Hash {
@@ -92,7 +100,7 @@ impl RunSkillsError {
     pub fn io_errors(&self) -> impl Iterator<Item = &std::io::Error> {
         let (resolve, hash) = match self {
             RunSkillsError::Resolve(errors) => (errors.as_slice(), None),
-            RunSkillsError::Parse(_) => (&[][..], None),
+            RunSkillsError::Parse(_) | RunSkillsError::Wildcard(_) => (&[][..], None),
             RunSkillsError::Hash { error, .. } => (&[][..], Some(error)),
         };
         resolve
@@ -136,6 +144,7 @@ pub fn resolve_run_skills(
         let preloads = bind(r.preload, catalog)?.into_iter().map(|b| (b, true));
         for ((key, skill), preload) in grants.chain(preloads) {
             let g = granted.entry(key).or_insert_with(|| GrantedSkill {
+                baseline_stamp: skill.stamp,
                 skill,
                 preload: false,
                 indexed: false,
@@ -163,7 +172,120 @@ pub fn resolve_run_skills(
     Ok(ResolvedSkills { entries })
 }
 
+/// One entry of a resolved set as a session stores it (spec §5.1): exactly
+/// one skill in one layer, with the flags and versions its first turn had,
+/// so a later turn rebuilds the same set without re-expanding `*`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenSkill {
+    pub name: String,
+    pub layer: Layer,
+    pub preload: bool,
+    pub indexed: bool,
+    pub reason: SkillReason,
+    /// Hex; the baseline a later change is judged against.
+    pub stamp: String,
+    /// Hex; `Some` exactly for a preload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+}
+
+/// The frozen entry's skill as installed now, or `None` when it is gone, no
+/// longer valid, or its record does not parse.
+fn thaw(catalog: &SkillCatalog, f: &FrozenSkill) -> Option<GrantedSkill> {
+    let skill = catalog.get(f.layer, &f.name)?.skill().ok()?.clone();
+    let baseline_stamp = Stamp::from_hex(&f.stamp)?;
+    let content_hash = match &f.content_hash {
+        Some(h) => Some(ContentHash::from_hex(h)?),
+        None => None,
+    };
+    if f.preload != content_hash.is_some() {
+        return None;
+    }
+    Some(GrantedSkill {
+        skill,
+        preload: f.preload,
+        indexed: f.indexed,
+        reason: f.reason,
+        baseline_stamp,
+        content_hash,
+    })
+}
+
+/// Rebuilds a frozen set from the skills installed now. Returns the set and
+/// the names of the entries that can no longer be given (removed, invalid,
+/// or a corrupt record): the caller reports them and runs without them.
+pub fn resolve_frozen(
+    catalog: &SkillCatalog,
+    frozen: &[FrozenSkill],
+) -> (ResolvedSkills, Vec<String>) {
+    ResolvedSkills::default().with_frozen(catalog, frozen)
+}
+
+/// An operator's invocation of one installed skill (spec §5.2): any valid
+/// skill in either layer, granted or not. The entry takes the grant
+/// grammar's names and prefixes; a wildcard, an unknown name or a bare name
+/// in both layers is refused.
+pub fn resolve_operator(
+    catalog: &SkillCatalog,
+    entry: &str,
+) -> Result<FrozenSkill, RunSkillsError> {
+    let grant: SkillGrant = entry.parse()?;
+    if matches!(grant, SkillGrant::AllGlobal | SkillGrant::AllProject) {
+        return Err(RunSkillsError::Wildcard(entry.to_owned()));
+    }
+    let skills = resolve_grants(&[grant], catalog).map_err(RunSkillsError::Resolve)?;
+    let [skill] = skills.as_slice() else {
+        unreachable!("one named grant binds exactly one skill");
+    };
+    Ok(FrozenSkill {
+        name: skill.name.as_str().to_owned(),
+        layer: skill.layer,
+        preload: false,
+        indexed: false,
+        reason: SkillReason::Operator,
+        stamp: skill.stamp.hex(),
+        content_hash: None,
+    })
+}
+
 impl ResolvedSkills {
+    /// The set as a session stores it.
+    pub fn freeze(&self) -> Vec<FrozenSkill> {
+        self.entries
+            .iter()
+            .map(|g| FrozenSkill {
+                name: g.name().to_owned(),
+                layer: g.skill.layer,
+                preload: g.preload,
+                indexed: g.indexed,
+                reason: g.reason,
+                stamp: g.baseline_stamp.hex(),
+                content_hash: g.content_hash.map(|h| h.hex()),
+            })
+            .collect()
+    }
+
+    /// Appends frozen entries (an operator's invocations) whose names the
+    /// set lacks. Returns the set and the names that can no longer be
+    /// given, as `resolve_frozen` does.
+    pub fn with_frozen(
+        mut self,
+        catalog: &SkillCatalog,
+        extra: &[FrozenSkill],
+    ) -> (Self, Vec<String>) {
+        let mut missing = Vec::new();
+        for f in extra {
+            if self.get(&f.name).is_some() {
+                continue;
+            }
+            match thaw(catalog, f) {
+                Some(g) => self.entries.push(g),
+                None => missing.push(f.name.clone()),
+            }
+        }
+        (self, missing)
+    }
+
     pub fn entries(&self) -> &[GrantedSkill] {
         &self.entries
     }

@@ -96,6 +96,21 @@ pub fn render_load_result(v: &LoadView<'_>) -> String {
     out
 }
 
+/// The skill an operator invokes in a session turn, prepended to that
+/// turn's user message (spec §5.2).
+pub fn render_operator_injection(
+    name: &str,
+    base_dir: &Path,
+    version: &ContentHash,
+    body: &str,
+) -> String {
+    format!(
+        "<skill name=\"{name}\" base=\"{}\" version=\"{}\">\n{body}\n</skill>",
+        base_dir.display(),
+        version.short()
+    )
+}
+
 /// Opens the block compaction re-attaches (spec §6). `compact_messages`
 /// skips a text block that starts with it when it rebuilds the task text,
 /// so a second compaction never copies the block.
