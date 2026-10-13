@@ -31,6 +31,31 @@ pub enum LedgerLine {
     /// The run `by_run` took the child on under the same handle, continuing
     /// or restoring it: this ledger's record of it is closed for good.
     Continued(Continued),
+    /// The run `by_run` is taking the child on: until its `continued` or
+    /// `released` line no other run may ([`claim`]).
+    Claimed(Claimed),
+    /// `by_run` did not take the child on after all: its claim is lifted.
+    Released(Released),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Claimed {
+    pub handle: String,
+    pub by_run: String,
+    /// The ledger `by_run` records the child in once it takes it on.
+    pub dir: PathBuf,
+    /// The process making the claim, and its start time.
+    pub pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proc_start: Option<u64>,
+    pub at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Released {
+    pub handle: String,
+    pub by_run: String,
+    pub at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -220,6 +245,8 @@ pub struct ChildEntry {
     /// The run that took it on under the same handle: this record of it is
     /// closed, and that run's is its latest.
     pub continued_by: Option<String>,
+    /// The run taking it on, until it does or lets it go.
+    pub claim: Option<Claimed>,
 }
 
 impl ChildEntry {
@@ -260,30 +287,108 @@ pub fn append(dir: &Path, line: &LedgerLine) {
 }
 
 fn try_append(dir: &Path, line: &LedgerLine) -> std::io::Result<()> {
+    locked(dir, |f| match line {
+        LedgerLine::Finished(end) => {
+            let dropped = current(f, &end.handle)?.is_some_and(|e| {
+                e.has_final_end() || (end.status == ChildState::Interrupted && e.is_interrupted())
+            });
+            if dropped {
+                Ok(())
+            } else {
+                write_line(f, line)
+            }
+        }
+        _ => write_line(f, line),
+    })
+}
+
+/// `act` on `dir`'s ledger, opened for reading and appending, under its
+/// exclusive lock.
+fn locked<T>(
+    dir: &Path,
+    act: impl FnOnce(&mut std::fs::File) -> std::io::Result<T>,
+) -> std::io::Result<T> {
     std::fs::create_dir_all(dir)?;
-    let mut text = serde_json::to_string(line).map_err(std::io::Error::other)?;
-    text.push('\n');
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
         .append(true)
         .open(dir.join(CHILDREN_FILE))?;
     f.lock_exclusive()?;
-    let written = match line {
-        LedgerLine::Finished(end) => current(&mut f, &end.handle).and_then(|entry| {
-            let dropped = entry.is_some_and(|e| {
-                e.has_final_end() || (end.status == ChildState::Interrupted && e.is_interrupted())
-            });
-            if dropped {
-                Ok(())
-            } else {
-                f.write_all(text.as_bytes()).and_then(|()| f.flush())
-            }
-        }),
-        _ => f.write_all(text.as_bytes()).and_then(|()| f.flush()),
-    };
+    let done = act(&mut f);
     let _ = FileExt::unlock(&f);
-    written
+    done
+}
+
+fn write_line(f: &mut std::fs::File, line: &LedgerLine) -> std::io::Result<()> {
+    let mut text = serde_json::to_string(line).map_err(std::io::Error::other)?;
+    text.push('\n');
+    f.write_all(text.as_bytes())?;
+    f.flush()
+}
+
+/// Claim `handle` in `dir`'s ledger for run `by_run`, which records the
+/// child in `by_dir` once it takes it on: whether `by_run` may take it on.
+/// Under the ledger's lock, so of two runs continuing the same parent, one
+/// does. A child another run took on, or one a live run's claim holds, is
+/// not claimed. A claim whose process is gone is that run's when its ledger
+/// records the child (it started the child, then died before closing this
+/// record: the record is closed for it), else it never started it and the
+/// claim is taken over.
+pub fn claim(dir: &Path, handle: &str, by_run: &str, by_dir: &Path) -> bool {
+    let claimed = locked(dir, |f| {
+        let Some(entry) = current(f, handle)? else {
+            return Ok(false);
+        };
+        if entry.continued_by.is_some() {
+            return Ok(false);
+        }
+        if let Some(held) = entry.claim.filter(|c| c.by_run != by_run) {
+            if crate::proc::process_alive(held.pid, held.proc_start) {
+                return Ok(false);
+            }
+            if read(&held.dir).iter().any(|c| c.started.handle == handle) {
+                write_line(
+                    f,
+                    &LedgerLine::Continued(Continued {
+                        handle: handle.to_string(),
+                        by_run: held.by_run,
+                        at: Utc::now(),
+                    }),
+                )?;
+                return Ok(false);
+            }
+        }
+        write_line(
+            f,
+            &LedgerLine::Claimed(Claimed {
+                handle: handle.to_string(),
+                by_run: by_run.to_string(),
+                dir: by_dir.to_path_buf(),
+                pid: std::process::id(),
+                proc_start: crate::proc::own_start_stamp(),
+                at: Utc::now(),
+            }),
+        )?;
+        Ok(true)
+    });
+    claimed.unwrap_or_else(|e| {
+        tracing::warn!(dir = %dir.display(), handle, error = %e, "could not claim a child in the children ledger");
+        false
+    })
+}
+
+/// Lift `by_run`'s claim on `handle` in `dir`'s ledger: it did not take the
+/// child on.
+pub fn release(dir: &Path, handle: &str, by_run: &str) {
+    append(
+        dir,
+        &LedgerLine::Released(Released {
+            handle: handle.to_string(),
+            by_run: by_run.to_string(),
+            at: Utc::now(),
+        }),
+    );
 }
 
 fn current(f: &mut std::fs::File, handle: &str) -> std::io::Result<Option<ChildEntry>> {
@@ -317,6 +422,7 @@ fn fold(text: &str) -> Vec<ChildEntry> {
                         finished: None,
                         joined: false,
                         continued_by: None,
+                        claim: None,
                     },
                 );
             }
@@ -340,6 +446,22 @@ fn fold(text: &str) -> Vec<ChildEntry> {
             Ok(LedgerLine::Continued(c)) => {
                 if let Some(e) = by_handle.get_mut(&c.handle) {
                     e.continued_by.get_or_insert(c.by_run);
+                    e.claim = None;
+                }
+            }
+            Ok(LedgerLine::Claimed(c)) => {
+                if let Some(e) = by_handle
+                    .get_mut(&c.handle)
+                    .filter(|e| e.continued_by.is_none())
+                {
+                    e.claim = Some(c);
+                }
+            }
+            Ok(LedgerLine::Released(r)) => {
+                if let Some(e) = by_handle.get_mut(&r.handle) {
+                    if e.claim.as_ref().is_some_and(|c| c.by_run == r.by_run) {
+                        e.claim = None;
+                    }
                 }
             }
             Err(_) => continue,

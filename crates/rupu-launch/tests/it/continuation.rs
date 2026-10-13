@@ -754,3 +754,138 @@ async fn a_child_whose_runner_died_is_continued_after_its_parent_crashed() {
         [l] if matches!(&l.argv, RunArgv::WorkflowControl(WorkflowControl::Resume { run_id, .. }) if run_id == "run_died")
     ));
 }
+
+/// Parent `parent_run_1` crashed leaving workflow child `ch_1` interrupted.
+fn crashed_parent_with_a_workflow_child(home: &Home) {
+    running_workflow(&home.global(), "run_wf");
+    let dir = runs_dir(home, "parent_run_1");
+    ledger::append(&dir, &orphan_line("ch_1", ChildKind::Workflow, "run_wf"));
+    ledger::append(
+        &dir,
+        &crate::support::end_line("ch_1", ChildState::Interrupted),
+    );
+}
+
+fn running() -> Arc<ScriptedProcesses> {
+    Arc::new(ScriptedProcesses::scripted(vec![
+        rupu_launch::ProcState::Running,
+    ]))
+}
+
+/// Which of `runs` took `ch_1` on: the runs whose ledger records it.
+fn took(home: &Home, runs: &[&str]) -> Vec<String> {
+    runs.iter()
+        .filter(|r| {
+            ledger::read(&runs_dir(home, r))
+                .iter()
+                .any(|c| c.started.handle == "ch_1")
+        })
+        .map(|r| r.to_string())
+        .collect()
+}
+
+/// Two runs continuing the same crashed parent at once take its child on
+/// once: the first to claim it continues it, the other leaves it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn two_continuations_at_once_continue_a_child_once() {
+    let home = kinds_home();
+    crashed_parent_with_a_workflow_child(&home);
+    let (a, b) = (running(), running());
+    let l2 = home.launcher_with(home.assembler(config()), a.clone(), None);
+    let l3 = home.launcher_with(home.assembler(config()), b.clone(), None);
+    let (ctx2, ctx3) = (
+        attempt(&home, "parent_run_2"),
+        attempt(&home, "parent_run_3"),
+    );
+    tokio::join!(
+        l2.continue_children("parent_run_1", &ctx2),
+        l3.continue_children("parent_run_1", &ctx3)
+    );
+
+    assert_eq!(a.spawned().len() + b.spawned().len(), 1);
+    let took = took(&home, &["parent_run_2", "parent_run_3"]);
+    assert_eq!(took.len(), 1, "{took:?}");
+    assert_eq!(
+        entry(&home, "parent_run_1", "ch_1").continued_by,
+        Some(took[0].clone())
+    );
+}
+
+/// A continuation that crashed after claiming a child and before starting
+/// it leaves a claim no live run holds: the next continuation takes the
+/// child over. One that crashed after starting it left it in its own
+/// ledger: the claim stands as that run's, and the child is not started
+/// again.
+#[tokio::test]
+#[serial]
+async fn a_dead_runs_claim_is_taken_over_unless_it_started_the_child() {
+    let claim = |home: &Home, by: &str| {
+        ledger::LedgerLine::Claimed(ledger::Claimed {
+            handle: "ch_1".into(),
+            by_run: by.into(),
+            dir: runs_dir(home, by),
+            pid: 0x7fff_fffe,
+            proc_start: None,
+            at: chrono::Utc::now(),
+        })
+    };
+
+    let home = kinds_home();
+    crashed_parent_with_a_workflow_child(&home);
+    ledger::append(&runs_dir(&home, "parent_run_1"), &claim(&home, "parent_run_2"));
+    let backend = running();
+    let l = home.launcher_with(home.assembler(config()), backend.clone(), None);
+    l.continue_children("parent_run_1", &attempt(&home, "parent_run_3"))
+        .await;
+    assert_eq!(backend.spawned().len(), 1);
+    assert_eq!(
+        entry(&home, "parent_run_1", "ch_1").continued_by.as_deref(),
+        Some("parent_run_3")
+    );
+
+    let home = kinds_home();
+    crashed_parent_with_a_workflow_child(&home);
+    ledger::append(&runs_dir(&home, "parent_run_1"), &claim(&home, "parent_run_2"));
+    ledger::append(
+        &runs_dir(&home, "parent_run_2"),
+        &orphan_line("ch_1", ChildKind::Workflow, "run_wf"),
+    );
+    let backend = running();
+    let l = home.launcher_with(home.assembler(config()), backend.clone(), None);
+    l.continue_children("parent_run_1", &attempt(&home, "parent_run_3"))
+        .await;
+    assert!(backend.spawned().is_empty());
+    assert_eq!(
+        entry(&home, "parent_run_1", "ch_1").continued_by.as_deref(),
+        Some("parent_run_2")
+    );
+}
+
+/// A continuation whose start of a child is refused (its process is being
+/// stopped) releases its claim: the next continuation takes the child on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_refused_continuation_releases_its_claim() {
+    let home = kinds_home();
+    crashed_parent_with_a_workflow_child(&home);
+    tokio::task::spawn_blocking(|| {
+        rupu_launch::reaper::stop_live_children(Duration::ZERO, "stopped")
+    })
+    .await
+    .unwrap();
+    let refused = running();
+    let l = home.launcher_with(home.assembler(config()), refused.clone(), None);
+    l.continue_children("parent_run_1", &attempt(&home, "parent_run_2"))
+        .await;
+    rupu_launch::reaper::reset_stopping();
+    assert!(refused.spawned().is_empty());
+    let left = entry(&home, "parent_run_1", "ch_1");
+    assert_eq!((left.continued_by, left.claim), (None, None));
+
+    let backend = running();
+    let l = home.launcher_with(home.assembler(config()), backend.clone(), None);
+    l.continue_children("parent_run_1", &attempt(&home, "parent_run_3"))
+        .await;
+    assert_eq!(backend.spawned().len(), 1);
+}

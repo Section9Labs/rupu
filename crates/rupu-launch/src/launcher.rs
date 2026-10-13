@@ -2105,9 +2105,9 @@ impl Launcher for RunLauncher {
     }
 
     async fn continue_children(&self, prior_run: &str, to: &ToolContext) {
-        if to.identity.launch.children_dir.is_none() {
+        let Some(by_dir) = to.identity.launch.children_dir.clone() else {
             return;
-        }
+        };
         let from = Caller::of(to);
         let dir = self.global().join("runs").join(prior_run);
         // A crashed attempt recorded nothing: what it left running is
@@ -2128,35 +2128,51 @@ impl Launcher for RunLauncher {
             finished,
             joined,
             continued_by,
+            ..
         } in entries
         {
             if continued_by.is_some() || have.contains(&started.handle) {
                 continue;
             }
-            let taken = match finished {
-                Some(end) if end.status == ChildState::Interrupted => {
+            let Some(end) = finished else {
+                tracing::warn!(
+                    handle = %started.handle,
+                    run = prior_run,
+                    "a child's launching process is still running; it is not continued"
+                );
+                continue;
+            };
+            // Claimed before it is taken on, so of two runs continuing
+            // this one, one does.
+            let claimed = {
+                let (dir, handle, by_run, by_dir) = (
+                    dir.clone(),
+                    started.handle.clone(),
+                    to.identity.run_id.clone(),
+                    by_dir.clone(),
+                );
+                tokio::task::spawn_blocking(move || ledger::claim(&dir, &handle, &by_run, &by_dir))
+                    .await
+                    .unwrap_or(false)
+            };
+            if !claimed {
+                continue;
+            }
+            let taken = match end {
+                end if end.status == ChildState::Interrupted => {
                     self.continue_child(&started, end.at, &from).await
                 }
                 // Recorded failed before its parent recorded the stop that
                 // ended it too (a reboot signals every process at once),
                 // even if the parent collected that end before it stopped.
-                Some(end)
-                    if end.status == ChildState::Failed
-                        && self.stopped_from_outside(&started).await =>
+                end if end.status == ChildState::Failed
+                    && self.stopped_from_outside(&started).await =>
                 {
                     self.continue_child(&started, end.at, &from).await
                 }
-                Some(end) => {
+                end => {
                     self.restore(&started, end, joined, &from);
                     true
-                }
-                None => {
-                    tracing::warn!(
-                        handle = %started.handle,
-                        run = prior_run,
-                        "a child's launching process is still running; it is not continued"
-                    );
-                    false
                 }
             };
             if taken {
@@ -2168,6 +2184,8 @@ impl Launcher for RunLauncher {
                         at: Utc::now(),
                     }),
                 );
+            } else {
+                ledger::release(&dir, &started.handle, &to.identity.run_id);
             }
         }
     }
