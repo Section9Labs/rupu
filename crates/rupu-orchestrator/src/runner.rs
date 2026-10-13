@@ -1114,6 +1114,9 @@ pub struct PausedStep {
     /// `RunResult::final_messages`). Ends at the last complete message /
     /// tool result, ready to seed a resume.
     pub seed_messages: Vec<Message>,
+    /// The skills the paused agent had loaded (its `RunResult::loaded_skills`):
+    /// the resumed agent starts with them, so its compactions re-attach them.
+    pub loaded_skills: Vec<rupu_agent::LoadedSkill>,
 }
 
 impl PausedStep {
@@ -1121,13 +1124,18 @@ impl PausedStep {
     /// it paused mid-turn with a seed, nothing otherwise (a step-boundary
     /// pause has no seed, and a fan-out's finished units are checkpointed
     /// per unit to `unit_checkpoints.jsonl` instead).
-    fn list_for(step_id: &str, seed: &[Message]) -> Vec<PausedStep> {
+    fn list_for(
+        step_id: &str,
+        seed: &[Message],
+        loaded_skills: Vec<rupu_agent::LoadedSkill>,
+    ) -> Vec<PausedStep> {
         if seed.is_empty() {
             Vec::new()
         } else {
             vec![PausedStep {
                 step_id: step_id.to_string(),
                 seed_messages: seed.to_vec(),
+                loaded_skills,
             }]
         }
     }
@@ -1565,11 +1573,7 @@ pub async fn run_workflow(
                     }
                 }
                 if !paused_steps.is_empty() {
-                    let seeds: std::collections::BTreeMap<String, Vec<Message>> = paused_steps
-                        .iter()
-                        .map(|ps| (ps.step_id.clone(), ps.seed_messages.clone()))
-                        .collect();
-                    if let Err(e) = store.write_paused_seeds(&run_id, &seeds) {
+                    if let Err(e) = store.write_paused_seeds(&run_id, paused_steps) {
                         warn!(error = %e, "failed to persist paused-step seeds");
                     }
                 }
@@ -2060,6 +2064,8 @@ enum LinearStepOutcome {
         /// The paused agent's `final_messages` (transcript through the last
         /// complete message / tool result).
         seed: Vec<Message>,
+        /// The skills the paused agent had loaded.
+        loaded_skills: Vec<rupu_agent::LoadedSkill>,
     },
 }
 
@@ -4067,6 +4073,7 @@ async fn run_scheduler_scoped(
             NodeOutcome::Paused {
                 step_id,
                 seed,
+                loaded_skills,
                 fanout_completed_units,
             } => {
                 if cancel_state.cancelled_by_us.remove(&i) {
@@ -4078,7 +4085,7 @@ async fn run_scheduler_scoped(
                 // Mid-dispatch manual pause: note it (seed / fan-out
                 // checkpoint) and keep draining the other in-flight nodes
                 // — see `manual_pause`'s declaration.
-                let paused_steps = PausedStep::list_for(&step_id, &seed);
+                let paused_steps = PausedStep::list_for(&step_id, &seed, loaded_skills);
                 ManualPause::note(
                     &mut manual_pause,
                     step_id,
@@ -5819,10 +5826,11 @@ async fn run_steps_over(
             NodeOutcome::Paused {
                 step_id,
                 seed,
+                loaded_skills,
                 fanout_completed_units,
             } => {
                 return Ok(InnerOutcome::Paused {
-                    paused_steps: PausedStep::list_for(&step_id, &seed),
+                    paused_steps: PausedStep::list_for(&step_id, &seed, loaded_skills),
                     step_id,
                     prompt: String::new(),
                     timeout_seconds: None,
@@ -5861,6 +5869,8 @@ enum NodeOutcome {
     Paused {
         step_id: String,
         seed: Vec<Message>,
+        /// The skills the paused agent had loaded (empty for a fan-out).
+        loaded_skills: Vec<rupu_agent::LoadedSkill>,
         fanout_completed_units: std::collections::BTreeMap<usize, ItemResult>,
     },
 }
@@ -5921,6 +5931,7 @@ async fn run_node(
                 return Ok(NodeOutcome::Paused {
                     step_id,
                     seed: Vec::new(),
+                    loaded_skills: Vec::new(),
                     fanout_completed_units: completed_units,
                 });
             }
@@ -5966,7 +5977,11 @@ async fn run_node(
         // paused-incomplete step unwinds here into a manual-pause
         // checkpoint carrying the seed.
         match run_linear_step(run_id, step, ctx, opts, effective_continue_on_error).await {
-            Ok(LinearStepOutcome::Paused { step_id, seed }) => {
+            Ok(LinearStepOutcome::Paused {
+                step_id,
+                seed,
+                loaded_skills,
+            }) => {
                 // A `workspace: sync` workflow is refused loudly here too
                 // — checkpointing mid-step would drop in-flight deltas
                 // the same way a step-boundary/fan-out pause would.
@@ -5989,6 +6004,7 @@ async fn run_node(
                 return Ok(NodeOutcome::Paused {
                     step_id,
                     seed,
+                    loaded_skills,
                     fanout_completed_units: std::collections::BTreeMap::new(),
                 });
             }
@@ -8075,12 +8091,14 @@ async fn run_linear_step(
                 .and_then(|r| r.paused_steps.iter().find(|ps| ps.step_id == step.id))
         })
         .flatten()
-        .map(|ps| split_seed_for_resume(ps.seed_messages.clone()))
-        .map(|(messages, user_message)| ContinuationSeed {
-            messages,
-            user_message,
-            seed_source: None,
-            loaded_skills: Vec::new(),
+        .map(|ps| {
+            let (messages, user_message) = split_seed_for_resume(ps.seed_messages.clone());
+            ContinuationSeed {
+                messages,
+                user_message,
+                seed_source: None,
+                loaded_skills: ps.loaded_skills.clone(),
+            }
         });
     let mut resumption = match plan.and_then(AttemptResumePlan::of) {
         Some(p) => Some(resolve_attempt_resumption(p, step.host.as_deref()).await),
@@ -8229,6 +8247,7 @@ async fn run_linear_step(
                     return Ok(LinearStepOutcome::Paused {
                         step_id: step.id.clone(),
                         seed: rr.final_messages,
+                        loaded_skills: rr.loaded_skills,
                     });
                 }
                 // Safe as a bare `Ok(_)` ONLY because `dispatch_one` folds a
@@ -9989,8 +10008,7 @@ struct ContinuationSeed {
     /// continues it *by reference* (`rupu_agent::continuation`). `None` for a
     /// plain seed.
     seed_source: Option<PathBuf>,
-    /// The skills the interrupted conversation had loaded; empty for a plain
-    /// seed.
+    /// The skills the interrupted or paused conversation had loaded.
     loaded_skills: Vec<rupu_agent::LoadedSkill>,
 }
 
@@ -10044,6 +10062,7 @@ impl ContinuationSeed {
             None => {
                 prompt.initial_messages = self.messages;
                 prompt.message = self.user_message;
+                prompt.loaded_skills = self.loaded_skills;
             }
         }
     }
@@ -12750,6 +12769,7 @@ steps:
             paused_steps: vec![PausedStep {
                 step_id: "solo".into(),
                 seed_messages: awaiting.resume_seed,
+                loaded_skills: Vec::new(),
             }],
             rejected_reason: None,
             ..Default::default()
@@ -12981,6 +13001,7 @@ steps:
             paused_steps: vec![PausedStep {
                 step_id: "solo".into(),
                 seed_messages: seed.clone(),
+                loaded_skills: Vec::new(),
             }],
             rejected_reason: None,
             ..Default::default()
@@ -13055,6 +13076,7 @@ steps:
             paused_steps: vec![PausedStep {
                 step_id: "solo".into(),
                 seed_messages: seed.clone(),
+                loaded_skills: Vec::new(),
             }],
             rejected_reason: None,
             ..Default::default()
@@ -19690,13 +19712,7 @@ mod manual_pause_drain {
             let paused_steps = self
                 .store
                 .read_paused_seeds(run_id, record.awaiting_step_id.as_deref())
-                .unwrap()
-                .into_iter()
-                .map(|(step_id, seed_messages)| PausedStep {
-                    step_id,
-                    seed_messages,
-                })
-                .collect();
+                .unwrap();
             ResumeState {
                 run_id: run_id.to_string(),
                 prior_step_results: self

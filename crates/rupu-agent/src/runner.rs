@@ -1752,7 +1752,7 @@ struct Run {
 }
 
 /// A skill whose body entered the conversation, at the version it had.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LoadedSkill {
     pub name: String,
     pub content_hash: String,
@@ -1864,6 +1864,9 @@ pub struct RunResult {
     /// `None` for a success and for failures that are not outcomes
     /// (max turns, a pause).
     pub outcome: Option<rupu_transcript::OutcomeRecord>,
+    /// The skills loaded into the conversation as the run ended, most
+    /// recently loaded last: what a paused run's resume starts with.
+    pub loaded_skills: Vec<LoadedSkill>,
 }
 
 impl RunResult {
@@ -3573,6 +3576,7 @@ async fn run_agent_inner(
             error: terminal_error,
             final_limits: opts.limits.clone(),
             outcome: run_outcome,
+            loaded_skills: opts.loaded_skills.clone(),
         })
     }
     .await;

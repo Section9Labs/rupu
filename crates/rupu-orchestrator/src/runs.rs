@@ -1173,6 +1173,19 @@ pub enum ResumeGiveBack {
     Cancelled,
 }
 
+/// One step's entry in `paused_seeds.json`.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum StoredSeed {
+    Full {
+        seed_messages: Vec<Message>,
+        #[serde(default)]
+        loaded_skills: Vec<rupu_agent::LoadedSkill>,
+    },
+    /// What a binary that kept no loaded skills wrote: the bare messages.
+    Bare(Vec<Message>),
+}
+
 /// Filesystem-backed run store. One root directory; one
 /// sub-directory per run. The store is stateless — every method
 /// reads/writes from disk, so concurrent CLIs sharing the same
@@ -4072,8 +4085,9 @@ impl RunStore {
     }
 
     /// Persist the seed transcript of EVERY step that paused mid-turn
-    /// (keyed by step id) — a DAG run's manual-pause drain can catch
-    /// several concurrent steps pausing at once, which the single
+    /// (keyed by step id), with the skills it had loaded — a DAG run's
+    /// manual-pause drain can catch several concurrent steps pausing at
+    /// once, which the single
     /// [`write_paused_seed`](Self::write_paused_seed) sidecar (paired with
     /// `RunRecord.awaiting_step_id`) can't hold. `run_workflow` writes
     /// both: this one for [`read_paused_seeds`](Self::read_paused_seeds),
@@ -4081,34 +4095,70 @@ impl RunStore {
     pub fn write_paused_seeds(
         &self,
         run_id: &str,
-        seeds: &std::collections::BTreeMap<String, Vec<Message>>,
+        steps: &[crate::runner::PausedStep],
     ) -> Result<(), RunStoreError> {
-        write_atomic(&self.paused_seeds_path(run_id), &serde_json::to_vec(seeds)?)?;
+        let seeds: std::collections::BTreeMap<&str, StoredSeed> = steps
+            .iter()
+            .map(|ps| {
+                (
+                    ps.step_id.as_str(),
+                    StoredSeed::Full {
+                        seed_messages: ps.seed_messages.clone(),
+                        loaded_skills: ps.loaded_skills.clone(),
+                    },
+                )
+            })
+            .collect();
+        write_atomic(
+            &self.paused_seeds_path(run_id),
+            &serde_json::to_vec(&seeds)?,
+        )?;
         Ok(())
     }
 
-    /// Every persisted mid-turn seed, keyed by step id. Prefers the
+    /// Every persisted mid-turn seed, in step-id order. Prefers the
     /// multi-step `paused_seeds.json`; when absent (a run paused by a
     /// binary that predates it), falls back to the legacy single
     /// `paused_seed.json`, attributed to `legacy_step_id` (the record's
     /// `awaiting_step_id`). Empty — not an error — when neither exists, the
-    /// common case for a step-boundary pause.
+    /// common case for a step-boundary pause. A seed written before loaded
+    /// skills were kept reads with none.
     pub fn read_paused_seeds(
         &self,
         run_id: &str,
         legacy_step_id: Option<&str>,
-    ) -> Result<std::collections::BTreeMap<String, Vec<Message>>, RunStoreError> {
+    ) -> Result<Vec<crate::runner::PausedStep>, RunStoreError> {
         let path = self.paused_seeds_path(run_id);
         if path.is_file() {
             let body = std::fs::read(&path)?;
-            return Ok(serde_json::from_slice(&body)?);
+            let seeds: std::collections::BTreeMap<String, StoredSeed> =
+                serde_json::from_slice(&body)?;
+            return Ok(seeds
+                .into_iter()
+                .map(|(step_id, seed)| {
+                    let (seed_messages, loaded_skills) = match seed {
+                        StoredSeed::Full {
+                            seed_messages,
+                            loaded_skills,
+                        } => (seed_messages, loaded_skills),
+                        StoredSeed::Bare(messages) => (messages, Vec::new()),
+                    };
+                    crate::runner::PausedStep {
+                        step_id,
+                        seed_messages,
+                        loaded_skills,
+                    }
+                })
+                .collect());
         }
         let seed = self.read_paused_seed(run_id)?;
         Ok(match legacy_step_id {
-            Some(step_id) if !seed.is_empty() => {
-                std::collections::BTreeMap::from([(step_id.to_string(), seed)])
-            }
-            _ => std::collections::BTreeMap::new(),
+            Some(step_id) if !seed.is_empty() => vec![crate::runner::PausedStep {
+                step_id: step_id.to_string(),
+                seed_messages: seed,
+                loaded_skills: Vec::new(),
+            }],
+            _ => Vec::new(),
         })
     }
 
@@ -6524,21 +6574,54 @@ mod tests {
         let legacy = vec![Message::user("legacy")];
         store.write_paused_seed(&rec.id, &legacy).unwrap();
         let read = store.read_paused_seeds(&rec.id, Some("a")).unwrap();
-        assert_eq!(read.keys().collect::<Vec<_>>(), vec!["a"]);
+        let ids = |read: &[crate::runner::PausedStep]| {
+            read.iter().map(|p| p.step_id.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&read), vec!["a"]);
         assert!(store.read_paused_seeds(&rec.id, None).unwrap().is_empty());
 
-        // The multi-step map wins over the legacy file once present.
-        let seeds = BTreeMap::from([
-            ("a".to_string(), vec![Message::user("a")]),
-            (
-                "b".to_string(),
-                vec![Message::user("b"), Message::assistant("b1")],
-            ),
-        ]);
-        store.write_paused_seeds(&rec.id, &seeds).unwrap();
+        // The multi-step map wins over the legacy file once present, and
+        // keeps each step's loaded skills.
+        let notes = rupu_agent::LoadedSkill {
+            name: "notes".into(),
+            content_hash: "abc".into(),
+        };
+        let step = |id: &str, messages: Vec<Message>, loaded: Vec<rupu_agent::LoadedSkill>| {
+            crate::runner::PausedStep {
+                step_id: id.into(),
+                seed_messages: messages,
+                loaded_skills: loaded,
+            }
+        };
+        store
+            .write_paused_seeds(
+                &rec.id,
+                &[
+                    step("a", vec![Message::user("a")], Vec::new()),
+                    step(
+                        "b",
+                        vec![Message::user("b"), Message::assistant("b1")],
+                        vec![notes.clone()],
+                    ),
+                ],
+            )
+            .unwrap();
         let read = store.read_paused_seeds(&rec.id, Some("a")).unwrap();
-        assert_eq!(read.keys().collect::<Vec<_>>(), vec!["a", "b"]);
-        assert_eq!(read["b"].len(), 2);
+        assert_eq!(ids(&read), vec!["a", "b"]);
+        assert_eq!(read[1].seed_messages.len(), 2);
+        assert_eq!(read[1].loaded_skills, vec![notes]);
+
+        // A map written before loaded skills were kept: bare messages.
+        let bare = BTreeMap::from([("c".to_string(), vec![Message::user("c")])]);
+        std::fs::write(
+            store.paused_seeds_path(&rec.id),
+            serde_json::to_vec(&bare).unwrap(),
+        )
+        .unwrap();
+        let read = store.read_paused_seeds(&rec.id, None).unwrap();
+        assert_eq!(ids(&read), vec!["c"]);
+        assert_eq!(read[0].seed_messages.len(), 1);
+        assert!(read[0].loaded_skills.is_empty());
 
         // Clearing removes BOTH sidecars.
         store.clear_paused_seed(&rec.id).unwrap();

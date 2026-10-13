@@ -53,6 +53,8 @@ pub struct MockRun {
     pub agent_system_prompt: String,
     /// The agent's `tools:`; `None` = the default grant.
     pub agent_tools: Option<Vec<String>>,
+    /// The agent's `skills:`, resolved against the assembler's `RUPU_HOME`.
+    pub agent_skills: Option<Vec<String>>,
     pub dispatchable_agents: Option<Vec<String>>,
     pub provider: Box<dyn LlmProvider>,
     pub provider_name: String,
@@ -78,6 +80,7 @@ impl Default for MockRun {
             agent_name: "agent".into(),
             agent_system_prompt: "test".into(),
             agent_tools: None,
+            agent_skills: None,
             dispatchable_agents: None,
             provider: Box::new(MockProvider::new(Vec::new())),
             provider_name: "mock".into(),
@@ -100,6 +103,7 @@ impl MockRun {
     pub fn launch(self, request: StepRequest) -> Result<StepLaunch, AssembleError> {
         let mut agent = agent(&self.agent_name, &self.agent_system_prompt);
         agent.tools = self.agent_tools;
+        agent.skills = self.agent_skills;
         agent.dispatchable_agents = self.dispatchable_agents;
         agent.max_turns = Some(self.max_turns);
         agent.concerns = self.concerns;

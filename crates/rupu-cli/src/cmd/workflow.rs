@@ -3804,7 +3804,7 @@ pub(crate) async fn resume_run(
     let (reason, paused_steps) = if original_status == RunStatus::Paused {
         // Distinguish "no sidecar" (a step-boundary pause — expected empty)
         // from a real read/parse failure of an existing seed.
-        // `read_paused_seeds` returns an empty map for missing files and an
+        // `read_paused_seeds` returns no seeds for missing files and an
         // `Err` only for an IO/JSON failure; surface the latter loudly rather
         // than silently resuming from scratch and dropping mid-step
         // transcripts. Several seeds when a DAG run's manual-pause drain
@@ -3826,11 +3826,7 @@ pub(crate) async fn resume_run(
         }
         let paused_steps = seeds
             .into_iter()
-            .filter(|(_, seed)| !seed.is_empty())
-            .map(|(step_id, seed_messages)| rupu_orchestrator::PausedStep {
-                step_id,
-                seed_messages,
-            })
+            .filter(|ps| !ps.seed_messages.is_empty())
             .collect();
         (rupu_orchestrator::PauseReason::Manual, paused_steps)
     } else {
