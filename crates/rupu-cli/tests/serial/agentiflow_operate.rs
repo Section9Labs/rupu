@@ -5,8 +5,8 @@
 //! Every test drives the real `rupu` binary and then looks at what the run left
 //! on disk, or at the processes themselves: a command's exit code is never the
 //! assertion, because a `send` that queues nothing and a `stop` that signals no
-//! one both exit 0. Delivery is what is checked: the steering was consumed and
-//! reached the lead's prompt, the record went terminal, the coordinator and the
+//! one both exit 0. Delivery is what is checked: the message reached the lead's
+//! model call and the log has its receipt, the record went terminal, the coordinator and the
 //! unit's process group are gone, the log carries its terminal event.
 //!
 //! How the mock is made to take time. The mock provider has no delay turn, so a
@@ -385,15 +385,45 @@ fn event_of_type<'a>(transcript: &'a [Value], ty: &str) -> Option<&'a Value> {
     transcript.iter().find(|e| e["type"] == ty)
 }
 
-fn steering_files(run_dir: &Path) -> Vec<PathBuf> {
-    std::fs::read_dir(run_dir.join("steering"))
-        .map(|d| {
-            d.filter_map(Result::ok)
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|x| x == "json"))
-                .collect()
+/// Who the run's message log says saw each message: `(message id, by)`.
+fn seen_receipts(run_dir: &Path) -> Vec<(String, String)> {
+    json_lines(&run_dir.join("log.jsonl"))
+        .into_iter()
+        .filter(|l| l["t"] == "seen")
+        .map(|l| {
+            (
+                l["id"].as_str().unwrap().into(),
+                l["by"].as_str().unwrap().into(),
+            )
         })
-        .unwrap_or_default()
+        .collect()
+}
+
+/// The id `agentiflow send` printed (`sent <id> to lead of <run>`) when it
+/// printed nothing else: no recipient was missed.
+fn sent_id(stdout: &str, run: &str) -> String {
+    let line = stdout.trim();
+    let id = line
+        .strip_prefix("sent ")
+        .and_then(|rest| rest.strip_suffix(&format!(" to lead of {run}")))
+        .unwrap_or_else(|| panic!("unexpected send output: {line}"));
+    assert!(id.starts_with("msg_"), "{line}");
+    id.to_string()
+}
+
+/// The operator-framed injection carrying `text`, in any round's transcript.
+fn injected_in(run_dir: &Path, text: &str) -> Option<(u32, Value)> {
+    (0..32).find_map(|round| {
+        lead_transcript(run_dir, round)
+            .into_iter()
+            .find(|e| {
+                e["type"] == "injected"
+                    && e["data"]["content"]
+                        .as_str()
+                        .is_some_and(|c| c.contains(text))
+            })
+            .map(|e| (round, e))
+    })
 }
 
 /// `rupu --format json agentiflow status <id>`.
@@ -501,8 +531,8 @@ async fn live_unit(fx: &Fixture, run_id: &str, cleanup: &mut Cleanup) -> LiveUni
 
 // ---- tests ------------------------------------------------------------------------
 
-/// The core loop: a detached run keeps going on its own; a steering message
-/// reaches its lead and is consumed; a graceful stop ends it at a round
+/// The core loop: a detached run keeps going on its own; an operator message
+/// reaches its lead; a graceful stop ends it at a round
 /// boundary with the operator's reason.
 #[tokio::test(flavor = "multi_thread")]
 async fn detach_then_send_then_graceful_stop() {
@@ -522,46 +552,28 @@ async fn detach_then_send_then_graceful_stop() {
     .expect("status never read `running`");
     assert_eq!(status["id"], json!(id));
 
-    // ---- send: queued, then taken by the envelope and put in front of the lead
+    // ---- send: logged, then put in front of the lead's next model call -----
     let send = fx
         .rupu(&script, &["agentiflow", "send", &id, "focus on auth"])
         .output()
         .unwrap();
     assert!(send.status.success(), "{}", stderr_of(&send));
-    assert_eq!(
-        stdout_of(&send).trim(),
-        format!("queued steering for {id}"),
-        "{}",
-        stderr_of(&send)
-    );
+    let msg = sent_id(&stdout_of(&send), &id);
     assert!(
-        poll(60, || steering_files(&dir).is_empty().then_some(()))
-            .await
-            .is_some(),
-        "the queued steering was never consumed: {:?}",
-        steering_files(&dir)
+        poll(60, || seen_receipts(&dir)
+            .contains(&(msg.clone(), "lead".to_string()))
+            .then_some(()))
+        .await
+        .is_some(),
+        "the lead never saw {msg}: {:?}",
+        seen_receipts(&dir)
     );
-    // Consumed is not delivered: the message has to be in a round's prompt.
-    let delivered = poll(60, || {
-        (0..32).find_map(|round| {
-            let t = lead_transcript(&dir, round);
-            let prompt = t.iter().find(|e| {
-                e["type"] == "user_message"
-                    && e["data"]["content"]
-                        .as_str()
-                        .is_some_and(|c| c.contains("focus on auth"))
-            })?;
-            Some((round, prompt["data"]["content"].as_str()?.to_string()))
-        })
-    })
-    .await
-    .expect("no lead round was ever told `focus on auth`");
-    assert!(
-        delivered.1.contains("Operator steering"),
-        "the steering was not framed as the operator's: {}",
-        delivered.1
-    );
-    // The round event is written when the round that was told FINISHES.
+    // The receipt says a model call carried it: the transcript says how.
+    let (_, injected) = poll(60, || injected_in(&dir, "focus on auth"))
+        .await
+        .expect("no lead round was ever told `focus on auth`");
+    assert_eq!(injected["data"]["kind"], "operator", "{injected}");
+    // The round event of the round after is the one that recaps it.
     assert!(
         poll(60, || events(&dir)
             .iter()
@@ -575,7 +587,7 @@ async fn detach_then_send_then_graceful_stop() {
     assert_eq!(
         status_json(&fx, &script, &id)["status"],
         "running",
-        "steering is not a stop"
+        "a message is not a stop"
     );
 
     // ---- stop (graceful): the run ends itself, saying the operator did it ----
@@ -951,8 +963,8 @@ async fn attach_once_returns_at_once_on_a_running_run() {
     assert!(stop.status.success(), "{}", stderr_of(&stop));
 }
 
-/// `send --now` does not wait for the round boundary to be heard: it cuts the
-/// lead's round short, and the next round's prompt carries the message.
+/// `send --now` does not wait for the round to end: it cuts the lead's round
+/// short, and the next round's first model call carries the message.
 #[tokio::test(flavor = "multi_thread")]
 async fn send_now_interrupts_the_current_round() {
     let _guard = ENV_LOCK.lock().await;
@@ -996,7 +1008,7 @@ async fn send_now_interrupts_the_current_round() {
         .output()
         .unwrap();
     assert!(send.status.success(), "{}", stderr_of(&send));
-    assert_eq!(stdout_of(&send).trim(), format!("queued steering for {id}"));
+    let msg = sent_id(&stdout_of(&send), &id);
 
     // The run carries on to its ceiling: round 1, then done.
     let finished = poll(90, || {
@@ -1027,14 +1039,18 @@ async fn send_now_interrupts_the_current_round() {
         "round 0 ran past the interrupt: {r0:?}"
     );
 
-    // The message was delivered at the next boundary: round 1's prompt has it,
-    // and the queue is empty.
+    // The message was delivered by round 1's first model call, which its
+    // prompt recaps.
     let r1 = lead_transcript(&dir, 1);
     let prompt = event_of_type(&r1, "user_message").expect("round 1 has no prompt");
     let prompt = prompt["data"]["content"].as_str().unwrap();
-    assert!(prompt.contains("Operator steering"), "{prompt}");
+    assert!(prompt.contains("Operator messages this round"), "{prompt}");
     assert!(prompt.contains("stop poking auth"), "{prompt}");
-    assert!(steering_files(&dir).is_empty());
+    assert_eq!(
+        injected_in(&dir, "URGENT: stop poking auth").map(|(round, _)| round),
+        Some(1)
+    );
+    assert!(seen_receipts(&dir).contains(&(msg, "lead".to_string())));
     // Round 1, uninterrupted, ran to its own end.
     let complete = event_of_type(&r1, "run_complete").expect("round 1 never completed");
     assert_eq!(complete["data"]["status"], "ok", "{complete}");
@@ -1045,8 +1061,8 @@ async fn send_now_interrupts_the_current_round() {
         "{r1:?}"
     );
 
-    // The log tells the same story: round 0 yielded with nothing delivered,
-    // round 1 was told once.
+    // The log tells the same story: round 0 yielded with nothing recapped,
+    // round 1 recapped the message once.
     let rounds: Vec<Value> = events(&dir)
         .into_iter()
         .filter(|e| e["kind"] == "round")
