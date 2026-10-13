@@ -10,8 +10,8 @@
 use std::path::{Path, PathBuf};
 
 use rupu_fleet::{
-    address, Address, Bus, BusCaps, BusError, DirectiveEvent, LogLine, LogMessage, MessageKind,
-    OperatorMessage, Refs, Roster, SendReceipt,
+    address, Address, Bus, BusCaps, BusError, Delivery, DirectiveEvent, FleetError, LogLine,
+    LogMessage, MessageKind, OperatorMessage, Refs, Roster, SendReceipt,
 };
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +51,9 @@ pub enum Liveness {
 
 #[derive(Debug, thiserror::Error)]
 pub enum OperatorSendError {
+    /// The message itself is refused (an empty body).
+    #[error("{0}")]
+    Invalid(String),
     /// The root isn't running: nothing would read the message.
     #[error("{0}")]
     NotLive(String),
@@ -314,12 +317,119 @@ impl MessageRoot {
         caps: BusCaps,
         pid_alive: &dyn Fn(u32) -> bool,
     ) -> Result<SendReceipt, OperatorSendError> {
+        if msg.body.trim().is_empty() {
+            return Err(OperatorSendError::Invalid("the message is empty".into()));
+        }
         if let Liveness::NotLive(why) = self.liveness(global, pid_alive) {
             return Err(OperatorSendError::NotLive(why));
         }
         Ok(Bus::open(&self.space, address::OPERATOR)
             .with_caps(caps)
             .operator_send(msg)?)
+    }
+}
+
+/// `kinds`, comma-separated kind names (`direct,broadcast`), as the CLI's
+/// `--kind` and the CP's `?kind=` take them.
+pub fn parse_kinds(kinds: &str) -> Result<Vec<MessageKind>, String> {
+    kinds
+        .split(',')
+        .map(|k| {
+            MessageKind::parse(k.trim()).ok_or_else(|| {
+                let valid: Vec<&str> = MessageKind::ALL.iter().map(|k| k.as_str()).collect();
+                format!(
+                    "unknown message kind `{}`: expected {}",
+                    k.trim(),
+                    valid.join(", ")
+                )
+            })
+        })
+        .collect()
+}
+
+/// A sent operator message, on the wire: what `rupu __message send` prints
+/// and the CP's `POST …/messages` returns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorSendReply {
+    pub id: String,
+    pub delivery: Delivery,
+}
+
+impl From<&SendReceipt> for OperatorSendReply {
+    fn from(r: &SendReceipt) -> Self {
+        OperatorSendReply {
+            id: r.id().to_string(),
+            delivery: r.delivery().clone(),
+        }
+    }
+}
+
+/// Why an operator messaging call failed, on the wire: `rupu __message`
+/// prints `{"error": <this>}` ([`MessageErrorReply`]), and the CP answers
+/// with [`MessageErrorCode::http_status`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageError {
+    pub code: MessageErrorCode,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageErrorReply {
+    pub error: MessageError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageErrorCode {
+    /// No root has that id.
+    NotFound,
+    /// The root isn't running.
+    NotLive,
+    /// A bad address, kind or body.
+    Invalid,
+    /// The space's log reached `[messaging].log_max_mb`.
+    LogFull,
+    Internal,
+}
+
+impl MessageErrorCode {
+    pub fn http_status(self) -> u16 {
+        match self {
+            MessageErrorCode::NotFound => 404,
+            MessageErrorCode::NotLive | MessageErrorCode::LogFull => 409,
+            MessageErrorCode::Invalid => 400,
+            MessageErrorCode::Internal => 500,
+        }
+    }
+}
+
+impl MessageError {
+    pub fn new(code: MessageErrorCode, message: impl Into<String>) -> Self {
+        MessageError {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl From<&RootError> for MessageError {
+    fn from(e: &RootError) -> Self {
+        MessageError::new(MessageErrorCode::NotFound, e.to_string())
+    }
+}
+
+impl From<&OperatorSendError> for MessageError {
+    fn from(e: &OperatorSendError) -> Self {
+        let code = match e {
+            OperatorSendError::Invalid(_) => MessageErrorCode::Invalid,
+            OperatorSendError::NotLive(_) => MessageErrorCode::NotLive,
+            OperatorSendError::Bus(FleetError::LogFull { .. }) => MessageErrorCode::LogFull,
+            OperatorSendError::Bus(FleetError::Refused(_) | FleetError::Address(_)) => {
+                MessageErrorCode::Invalid
+            }
+            OperatorSendError::Bus(_) => MessageErrorCode::Internal,
+        };
+        MessageError::new(code, e.to_string())
     }
 }
 
@@ -936,5 +1046,66 @@ mod tests {
             v.messages[3].message.refs.retracts.as_deref(),
             Some("01DIR")
         );
+    }
+
+    #[test]
+    fn an_empty_message_is_invalid_before_liveness_is_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let g = tmp.path();
+        write(
+            &g.join("runs/run_1/run.json"),
+            json!({"workflow_name": "w", "status": "completed"}),
+        );
+        let root = MessageRoot::resolve(g, "run_1").unwrap();
+        let err = root
+            .operator_send(g, to("broadcast", " \n "), BusCaps::default(), &alive)
+            .unwrap_err();
+        assert_eq!(
+            MessageError::from(&err),
+            MessageError::new(MessageErrorCode::Invalid, "the message is empty")
+        );
+        assert!(!root.space.exists());
+    }
+
+    #[test]
+    fn kinds_parse_from_a_comma_list_and_name_the_valid_ones() {
+        assert_eq!(
+            parse_kinds("direct, operator").unwrap(),
+            [MessageKind::Direct, MessageKind::Operator]
+        );
+        assert_eq!(
+            parse_kinds("direct,shout").unwrap_err(),
+            "unknown message kind `shout`: expected post, direct, broadcast, directive, retract, operator"
+        );
+    }
+
+    #[test]
+    fn errors_carry_a_code_on_the_wire() {
+        let codes = |e: &OperatorSendError| MessageError::from(e).code;
+        assert_eq!(
+            codes(&OperatorSendError::NotLive("x".into())),
+            MessageErrorCode::NotLive
+        );
+        assert_eq!(
+            codes(&OperatorSendError::Bus(FleetError::LogFull {
+                max_bytes: 1
+            })),
+            MessageErrorCode::LogFull
+        );
+        assert_eq!(
+            codes(&OperatorSendError::Bus(FleetError::Refused("x".into()))),
+            MessageErrorCode::Invalid
+        );
+        let reply = MessageErrorReply {
+            error: MessageError::from(&RootError::NotFound("run_x".into())),
+        };
+        assert_eq!(
+            serde_json::to_value(&reply).unwrap(),
+            json!({"error": {
+                "code": "not_found",
+                "message": "no workflow run, agentiflow, session or run `run_x`"
+            }})
+        );
+        assert_eq!(MessageErrorCode::NotLive.http_status(), 409);
     }
 }

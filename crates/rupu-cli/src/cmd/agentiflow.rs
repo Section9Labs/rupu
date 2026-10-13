@@ -1283,6 +1283,7 @@ fn send(
     let receipt = root
         .operator_send(global, msg, caps, &rupu_orchestrator::runs::pid_is_running)
         .map_err(|e| match e {
+            OperatorSendError::Invalid(why) => anyhow!(why),
             OperatorSendError::NotLive(why) => anyhow!("{why}: it takes no message"),
             OperatorSendError::Bus(e) => anyhow!(e).context(format!("send to the lead of {id}")),
         })?;

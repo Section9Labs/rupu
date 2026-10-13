@@ -1004,6 +1004,7 @@ async fn steer_agentiflow(
         &rupu_agentiflow::coordinator_alive,
     )
     .map_err(|e| match e {
+        OperatorSendError::Invalid(why) => ApiError::bad_request(why),
         OperatorSendError::NotLive(why) => ApiError::conflict(why),
         OperatorSendError::Bus(e @ rupu_fleet::FleetError::LogFull { .. }) => {
             ApiError::conflict(e.to_string())

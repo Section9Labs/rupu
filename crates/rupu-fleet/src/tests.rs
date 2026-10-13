@@ -485,3 +485,32 @@ fn send_to_left_participant_logged() {
     assert_eq!(logged[0].kind, MessageKind::Operator);
     assert!(!tmp.path().join("mailboxes/lynx_1/inbox.jsonl").exists());
 }
+
+#[test]
+fn a_kind_parses_from_the_name_it_serializes_as() {
+    let names: Vec<String> = MessageKind::ALL
+        .iter()
+        .map(|k| {
+            serde_json::to_value(k)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "post",
+            "direct",
+            "broadcast",
+            "directive",
+            "retract",
+            "operator"
+        ]
+    );
+    for (k, name) in MessageKind::ALL.iter().zip(&names) {
+        assert_eq!(MessageKind::parse(name), Some(*k));
+    }
+    assert_eq!(MessageKind::parse("Direct"), None);
+}

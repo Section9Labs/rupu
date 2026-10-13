@@ -29,6 +29,20 @@ pub enum MessageKind {
 }
 
 impl MessageKind {
+    pub const ALL: [MessageKind; 6] = [
+        MessageKind::Post,
+        MessageKind::Direct,
+        MessageKind::Broadcast,
+        MessageKind::Directive,
+        MessageKind::Retract,
+        MessageKind::Operator,
+    ];
+
+    /// The kind [`MessageKind::as_str`] names.
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.as_str() == s)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             MessageKind::Post => "post",
