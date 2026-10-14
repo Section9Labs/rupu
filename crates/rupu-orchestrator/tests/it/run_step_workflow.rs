@@ -863,3 +863,151 @@ steps:
     assert!(checkpoints[0].success);
     assert_eq!(checkpoints[0].output.trim(), "fast done");
 }
+
+// ---------------------------------------------------------------------------
+// `for_each:` parsing and `read_file` resolution.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn for_each_run_with_malformed_json_fails_the_step_without_dispatching() {
+    // A `[`-prefixed value that doesn't parse used to fan out one unit per
+    // line, so a malformed units file dispatched its own fragments.
+    let yaml = r#"
+name: bench-fanout
+steps:
+  - id: score
+    for_each: |
+      [
+        {"id": "CB-001"},
+        {"id": "CB-002"
+      ]
+    run:
+      cmd: echo
+      args: ["{{ item }}"]
+"#;
+    let err = run_with(yaml, "ws_fanout_bad_json", bypass())
+        .await
+        .expect_err("a malformed JSON for_each must fail the run");
+    assert!(
+        matches!(
+            &err,
+            rupu_orchestrator::runner::RunWorkflowError::ForEachParse { step, .. } if step == "score"
+        ),
+        "got: {err:?}"
+    );
+    let msg = format!("{err}");
+    assert!(msg.contains("not a JSON array"), "got: {msg}");
+}
+
+#[tokio::test]
+async fn for_each_agent_with_malformed_json_fails_before_any_agent_launch() {
+    // `NoAgentFactory` panics on launch, so reaching the error proves no
+    // unit was dispatched.
+    let yaml = r#"
+name: agent-fanout
+steps:
+  - id: review
+    agent: reviewer
+    for_each: '["a", "b",'
+    prompt: "review {{ item }}"
+"#;
+    let err = run_with(yaml, "ws_fanout_agent_bad_json", bypass())
+        .await
+        .expect_err("a malformed JSON for_each must fail the run");
+    assert!(
+        matches!(
+            &err,
+            rupu_orchestrator::runner::RunWorkflowError::ForEachParse { step, .. } if step == "review"
+        ),
+        "got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn for_each_line_list_still_fans_out_per_line() {
+    let yaml = r#"
+name: bench-fanout
+steps:
+  - id: score
+    for_each: |
+      alpha
+
+      beta
+    run:
+      cmd: echo
+      args: ["{{ item }}"]
+"#;
+    let res = run_with(yaml, "ws_fanout_lines", bypass())
+        .await
+        .expect("run completes");
+    let outputs: Vec<&str> = res.step_results[0]
+        .items
+        .iter()
+        .map(|i| i.output.trim())
+        .collect();
+    assert_eq!(outputs, ["alpha", "beta"]);
+}
+
+#[tokio::test]
+async fn read_file_resolves_against_the_run_workspace_not_the_process_cwd() {
+    // The workspace is a tempdir; the test process runs from the crate dir.
+    // A cloned run target, `workflow resume` and `cp serve`'s resume worker
+    // are all in the same position.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let reports = tmp.path().join("reports");
+    std::fs::create_dir_all(&reports).unwrap();
+    std::fs::write(
+        reports.join("units.json"),
+        r#"[{"id": "U-1"}, {"id": "U-2"}]"#,
+    )
+    .unwrap();
+    assert_ne!(std::env::current_dir().unwrap(), tmp.path());
+
+    let yaml = r#"
+name: units-from-file
+steps:
+  - id: score
+    for_each: "{{ read_file('reports/units.json') }}"
+    run:
+      cmd: echo
+      args: ["{{ item.id }}"]
+"#;
+    let res = run_in(&tmp, yaml, "ws_read_file_workspace", bypass())
+        .await
+        .expect("run completes");
+    let outputs: Vec<&str> = res.step_results[0]
+        .items
+        .iter()
+        .map(|i| i.output.trim())
+        .collect();
+    assert_eq!(outputs, ["U-1", "U-2"]);
+}
+
+#[tokio::test]
+async fn malformed_units_file_read_through_read_file_fails_the_step() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        tmp.path().join("units.json"),
+        "[{\"id\": \"U-1\"},\n{\"id\"\n]",
+    )
+    .unwrap();
+    let yaml = r#"
+name: units-from-file
+steps:
+  - id: score
+    for_each: "{{ read_file('units.json') }}"
+    run:
+      cmd: echo
+      args: ["{{ item }}"]
+"#;
+    let err = run_in(&tmp, yaml, "ws_read_file_bad_json", bypass())
+        .await
+        .expect_err("a malformed units file must fail the run");
+    assert!(
+        matches!(
+            err,
+            rupu_orchestrator::runner::RunWorkflowError::ForEachParse { .. }
+        ),
+        "got: {err:?}"
+    );
+}

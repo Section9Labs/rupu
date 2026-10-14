@@ -128,3 +128,44 @@ fn fromjson_round_trips_with_tojson() {
     .unwrap();
     assert_eq!(out, r#"{"a":1}"#);
 }
+
+#[test]
+fn read_file_resolves_relative_paths_against_the_workdir() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("reports")).unwrap();
+    std::fs::write(dir.path().join("reports/units.json"), "[1, 2]").unwrap();
+    assert_ne!(std::env::current_dir().unwrap(), dir.path());
+
+    let ctx = StepContext::new().with_workdir(dir.path());
+    let out = render_step_prompt(
+        "{{ read_file('reports/units.json') }}",
+        &ctx,
+        RenderMode::Strict,
+    )
+    .unwrap();
+    assert_eq!(out, "[1, 2]");
+}
+
+#[test]
+fn read_file_keeps_an_absolute_path_and_names_the_resolved_path_on_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let abs = dir.path().join("abs.txt");
+    std::fs::write(&abs, "absolute").unwrap();
+    let ctx = StepContext::new().with_workdir("/no/such/rupu/workspace");
+
+    let out = render_step_prompt(
+        &format!("{{{{ read_file({:?}) }}}}", abs.to_string_lossy()),
+        &ctx,
+        RenderMode::Strict,
+    )
+    .unwrap();
+    assert_eq!(out, "absolute");
+
+    let err = render_step_prompt("{{ read_file('missing.json') }}", &ctx, RenderMode::Strict)
+        .expect_err("a missing file must fail the render");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("/no/such/rupu/workspace/missing.json"),
+        "got: {msg}"
+    );
+}
