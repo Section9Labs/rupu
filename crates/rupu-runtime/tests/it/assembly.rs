@@ -67,6 +67,7 @@ fn step_parent(home: &Home) -> ParentRun {
             home.runs().join("run_wf").join("usage.jsonl"),
         )),
         coverage_stream: Some(home.runs().join("run_root").join("coverage.jsonl")),
+        netflow_stream: None,
     }
 }
 
@@ -166,6 +167,9 @@ struct Derived {
     findings_artifact_root: Option<String>,
     usage_ledger: Option<String>,
     coverage_stream: Option<String>,
+    /// The root's netflow stream this run tees into, with the ledger id it
+    /// tags its lines with (spec 2026-10-14 remote netflow transport §N1).
+    netflow_stream: Option<String>,
     netflow: bool,
     net_capture: bool,
     scm: bool,
@@ -220,6 +224,10 @@ fn derived(home: &Home, origin: &Origin, run: &AssembledRun) -> Derived {
         findings_artifact_root: f.artifact_root.as_deref().map(|p| rel(home.root(), p)),
         usage_ledger: run.usage_ledger.as_deref().map(|p| rel(home.root(), p)),
         coverage_stream: s.coverage_stream.as_deref().map(|p| rel(home.root(), p)),
+        netflow_stream: s
+            .netflow_stream
+            .as_ref()
+            .map(|st| format!("{} as {}", rel(home.root(), &st.path), st.ledger_id)),
         netflow: s.netflow_sink.is_some(),
         net_capture: s.net_capture.is_some(),
         scm: s.scm.is_some(),
@@ -290,6 +298,97 @@ async fn origin_matrix() {
         rows.insert(name, derived(&home, &origin, &run));
     }
     insta::assert_yaml_snapshot!(rows);
+}
+
+/// Spec 2026-10-14 remote netflow transport §N1: a root that a coordinator
+/// launched begins `<runs>/<root>/netflow.jsonl`; a step of that run and a
+/// sub-agent of that step tee into it under their own ledger ids, while a
+/// run whose root never began a stream tees nowhere.
+#[tokio::test]
+#[serial]
+async fn a_begun_root_stream_is_teed_by_steps_and_sub_agents() {
+    let home = Home::new();
+    let assembler = RunAssembler::new(home.context(config()));
+    let spec = agent(&home, "provider: anthropic\nmodel: claude-sonnet-4-6");
+    let root_stream = home.runs().join("run_wf").join("netflow.jsonl");
+    rupu_netflow::stream::write_stream_begin(&root_stream, "run_wf").unwrap();
+
+    let step_origin = Origin::WorkflowStep {
+        workflow_run_id: "run_wf".into(),
+        workflow_name: "security-review".into(),
+        step_id: "assess".into(),
+        unit: None,
+        step_actions: Vec::new(),
+        scope_override: None,
+        messaging: MessagingSwitch::Default,
+    };
+    let _m = MockScript::set(DONE);
+    let step = assembler
+        .assemble(launch(&home, spec.clone(), step_origin, "run_step"))
+        .await
+        .expect("assembles");
+    let step_stream = step
+        .opts
+        .tool_context
+        .services
+        .netflow_stream
+        .clone()
+        .expect("a step of a begun root tees");
+    assert_eq!(step_stream.path, root_stream);
+    assert_eq!(step_stream.ledger_id, "run_step");
+
+    // A sub-agent of that step: the same file, its own id.
+    let mut child = launch(
+        &home,
+        spec.clone(),
+        Origin::SubAgent {
+            parent: ParentRun {
+                identity: Arc::clone(&step.opts.tool_context.identity),
+                usage: None,
+                coverage_stream: None,
+                netflow_stream: Some(step_stream.clone()),
+            },
+        },
+        "sub_1",
+    );
+    child.ceiling = Some(PermissionMode::Bypass);
+    let child = assembler.assemble(child).await.expect("assembles");
+    let child_stream = child
+        .opts
+        .tool_context
+        .services
+        .netflow_stream
+        .clone()
+        .expect("a sub-agent tees where its parent does");
+    assert_eq!(child_stream.path, root_stream);
+    assert_eq!(child_stream.ledger_id, "sub_1");
+
+    // A standalone run whose own directory holds no begun stream: none.
+    let solo = assembler
+        .assemble(launch(&home, spec.clone(), Origin::Standalone, "run_solo"))
+        .await
+        .expect("assembles");
+    assert_eq!(solo.opts.tool_context.services.netflow_stream, None);
+
+    // A step of a workflow run that never began one: none either.
+    let other = assembler
+        .assemble(launch(
+            &home,
+            spec,
+            Origin::WorkflowStep {
+                workflow_run_id: "run_other".into(),
+                workflow_name: "security-review".into(),
+                step_id: "assess".into(),
+                unit: None,
+                step_actions: Vec::new(),
+                scope_override: None,
+                messaging: MessagingSwitch::Default,
+            },
+            "run_other_step",
+        ))
+        .await
+        .expect("assembles");
+    assert_eq!(other.opts.tool_context.services.netflow_stream, None);
 }
 
 /// W5 §3.3a / D22: a `tools: ["*"]` agent resolved under every origin, with
@@ -628,6 +727,7 @@ async fn a_flow_pool_is_the_allowlist_and_children_inherit_it() {
                 identity: Arc::new(lead_id.clone()),
                 usage: None,
                 coverage_stream: None,
+                netflow_stream: None,
             },
         },
         "sub_1",
@@ -812,6 +912,7 @@ async fn workflow_messaging_off_reaches_the_steps_children() {
                 identity: Arc::clone(&step.opts.tool_context.identity),
                 usage: None,
                 coverage_stream: None,
+                netflow_stream: None,
             },
         },
         "run_step_off_child",
@@ -925,6 +1026,7 @@ async fn a_no_messaging_launch_has_messaging_off_and_caps_its_children() {
                 identity: Arc::clone(&run.opts.tool_context.identity),
                 usage: None,
                 coverage_stream: None,
+                netflow_stream: None,
             },
         },
         "run_placed_off_child",
@@ -989,6 +1091,7 @@ async fn a_messaging_tools_launch_narrows_its_tools_and_caps_nothing() {
                 identity: Arc::clone(&run.opts.tool_context.identity),
                 usage: None,
                 coverage_stream: None,
+                netflow_stream: None,
             },
         },
         "run_placed_tools_child",

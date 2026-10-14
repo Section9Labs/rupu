@@ -321,6 +321,72 @@ pub fn resolve_operator(
     })
 }
 
+/// An operator's prompt with its leading `/skill` tokens resolved: the
+/// skills it invokes, in order, and the prompt after them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlashTurn {
+    pub invoked: Vec<FrozenSkill>,
+    pub prompt: String,
+}
+
+/// Invokes skills the way Claude Code's `/skill-name args` does: each
+/// leading `/entry` token (the operator entry grammar, `/pdf` or
+/// `/project:pdf`) is resolved by [`resolve_operator`]. The first token that
+/// names no installed skill (`/tmp is full`, `/etc/passwd`) starts the
+/// prompt, so a prompt without one comes back unchanged. Any other refusal
+/// (an ambiguous name, one held from the other layer, one invoked from both
+/// layers) fails the call.
+pub fn resolve_slash(
+    catalog: &SkillCatalog,
+    held: &[FrozenSkill],
+    prompt: &str,
+) -> Result<SlashTurn, RunSkillsError> {
+    let mut invoked: Vec<FrozenSkill> = Vec::new();
+    let mut rest = prompt;
+    while let Some(token) = rest.trim_start().strip_prefix('/') {
+        let end = token.find(char::is_whitespace).unwrap_or(token.len());
+        let entry = &token[..end];
+        if !matches!(
+            entry.parse::<SkillGrant>(),
+            Ok(SkillGrant::Name(_) | SkillGrant::Qualified(..))
+        ) {
+            break;
+        }
+        let f = match resolve_operator(catalog, held, entry) {
+            Ok(f) => f,
+            Err(RunSkillsError::Resolve(errors))
+                if errors
+                    .iter()
+                    .all(|e| matches!(e, ResolveError::Unknown { .. })) =>
+            {
+                break
+            }
+            Err(e) => return Err(e),
+        };
+        if invoked
+            .iter()
+            .any(|i| i.name == f.name && i.layer != f.layer)
+        {
+            return Err(RunSkillsError::Resolve(vec![ResolveError::BothLayers {
+                name: f.name,
+            }]));
+        }
+        if !invoked.contains(&f) {
+            invoked.push(f);
+        }
+        rest = &token[end..];
+    }
+    let prompt = if invoked.is_empty() {
+        prompt
+    } else {
+        rest.trim_start()
+    };
+    Ok(SlashTurn {
+        invoked,
+        prompt: prompt.to_owned(),
+    })
+}
+
 impl ResolvedSkills {
     /// The set as a session stores it.
     pub fn freeze(&self) -> Vec<FrozenSkill> {

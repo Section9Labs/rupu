@@ -124,15 +124,6 @@ describe('skills on launches and sends', () => {
     expect(sentBody(fetchMock)).toEqual({ prompt: 'go' });
   });
 
-  it('sendSessionMessage sends a skill-only turn with an empty prompt', async () => {
-    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({ run_id: 'r2' }));
-
-    await api.sendSessionMessage('s1', '', 'h1', ['pdf']);
-
-    expect(fetchMock.mock.calls[0][0]).toBe('/api/sessions/s1/send?host=h1');
-    expect(sentBody(fetchMock)).toEqual({ prompt: '', skills: ['pdf'] });
-  });
-
   it('sendSessionMessage without skills posts only the prompt', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({ run_id: 'r2' }));
 

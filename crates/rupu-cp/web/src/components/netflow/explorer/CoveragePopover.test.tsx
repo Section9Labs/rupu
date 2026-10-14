@@ -57,7 +57,7 @@ describe('CoveragePopover', () => {
     expect(pill).toHaveTextContent(/subprocess capture unavailable/i);
     fireEvent.click(pill);
     expect(screen.getByText(/the lead and every run it launched, at any depth/i)).toBeInTheDocument();
-    expect(screen.getByText(/runs on a remote host \(host: or distribute:\) keeps its flows on that host/i)).toBeInTheDocument();
+    expect(screen.getByText(/runs on a remote host \(host: or distribute:\) appears once it finishes/i)).toBeInTheDocument();
     expect(screen.queryByText(/sub-agents this run dispatched/i)).not.toBeInTheDocument();
   });
 

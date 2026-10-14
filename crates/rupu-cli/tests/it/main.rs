@@ -49,6 +49,7 @@ mod netflow_capture_wiring;
 mod netflow_prune_live;
 mod no_stream_flag;
 mod output_line_stream;
+mod remote_netflow_e2e;
 mod run_continue;
 mod run_header;
 mod run_model_limits;

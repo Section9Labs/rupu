@@ -401,6 +401,18 @@ pub trait HostConnector: Send + Sync {
     /// transport must say how it delivers this, or refuse.
     async fn unit_coverage(&self, run_id: &str) -> Result<CoverageRead, HostConnectorError>;
 
+    /// Bring a unit's netflow stream to the coordinator, or say who does
+    /// (spec 2026-10-14-rupu-remote-netflow-transport-design.md §N2/§N3).
+    /// `terminal` is false for a snapshot read (a poll error after the run
+    /// was observed, the wall timeout). `runs_root` is the coordinator's
+    /// `<global>/runs`. Required: every transport must say how.
+    async fn land_run_netflow(
+        &self,
+        run_id: &str,
+        terminal: bool,
+        runs_root: &Path,
+    ) -> Result<NetflowLanding, HostConnectorError>;
+
     /// Stream the blob `sha256` from this host's finding-artifact store into
     /// `dest` (a temp file the caller created inside the coordinator's
     /// store), aborting once more than `max_bytes` (the recorded size) arrive.
@@ -1035,6 +1047,19 @@ pub(crate) fn spec_peer_codename(
     }
 }
 
+/// How a connector delivers a unit's netflow stream
+/// ([`HostConnector::land_run_netflow`], spec 2026-10-14 §N2/§N3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetflowLanding {
+    /// The connector's mirror lands it when the run turns terminal
+    /// (SSH, tunnel, bucket); read the landing record.
+    ByMirror,
+    /// The unit's ledgers are already on this machine (local).
+    NotNeeded,
+    /// The connector landed it now (HTTP); its record has this status.
+    Landed(rupu_netflow::land::LandingStatus),
+}
+
 /// A unit's coverage stream as its host connector read it
 /// ([`HostConnector::unit_coverage`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1559,6 +1584,14 @@ pub(crate) mod testing {
         ) -> Result<serde_json::Value, HostConnectorError> {
             unimplemented!("StubConnector: get_transcript not configured")
         }
+        async fn land_run_netflow(
+            &self,
+            _run_id: &str,
+            _terminal: bool,
+            _runs_root: &std::path::Path,
+        ) -> Result<NetflowLanding, HostConnectorError> {
+            Ok(NetflowLanding::NotNeeded)
+        }
         async fn unit_coverage(&self, _run_id: &str) -> Result<CoverageRead, HostConnectorError> {
             Ok(CoverageRead {
                 bytes: Vec::new(),
@@ -1668,6 +1701,14 @@ pub(crate) mod testing {
                 _p: &str,
             ) -> Result<serde_json::Value, HostConnectorError> {
                 unimplemented!()
+            }
+            async fn land_run_netflow(
+                &self,
+                _run_id: &str,
+                _terminal: bool,
+                _runs_root: &std::path::Path,
+            ) -> Result<NetflowLanding, HostConnectorError> {
+                Ok(NetflowLanding::NotNeeded)
             }
             async fn unit_coverage(
                 &self,

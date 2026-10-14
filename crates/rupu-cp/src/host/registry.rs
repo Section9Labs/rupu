@@ -178,11 +178,10 @@ impl HostRegistry {
                         None
                     }
                 };
-                Ok(Arc::new(HttpHostConnector::new_with_timeout(
-                    base_url.clone(),
-                    token,
-                    timeout,
-                )))
+                Ok(Arc::new(
+                    HttpHostConnector::new_with_timeout(base_url.clone(), token, timeout)
+                        .with_host_id(host.id.clone()),
+                ))
             }
             _ => self.resolve(host_id),
         }
@@ -368,7 +367,9 @@ impl HostRegistry {
                         None
                     }
                 };
-                Ok(Arc::new(HttpHostConnector::new(base_url.clone(), token)))
+                Ok(Arc::new(
+                    HttpHostConnector::new(base_url.clone(), token).with_host_id(host.id.clone()),
+                ))
             }
             HostTransport::Local => Ok(Arc::clone(&self.local)),
             HostTransport::Tunnel { node_id } => {
