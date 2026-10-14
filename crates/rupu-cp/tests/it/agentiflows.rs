@@ -336,6 +336,38 @@ fn dead_pid() -> u32 {
     pid
 }
 
+#[tokio::test]
+async fn children_endpoint_returns_the_flow_launch_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed(tmp.path());
+    let addr = spawn_server(tmp.path()).await;
+
+    let (status, body) = get(addr, &format!("/api/agentiflows/{DONE}/children")).await;
+    assert_eq!(status, 200);
+    let kids = body["children"].as_array().unwrap();
+    let ids: Vec<&str> = kids
+        .iter()
+        .map(|c| c["run_id"].as_str().unwrap())
+        .collect();
+    // Both legacy `units/` mirrors surface as children of the flow.
+    assert!(ids.contains(&UNIT_A) && ids.contains(&UNIT_B), "got {ids:?}");
+
+    let a = kids.iter().find(|c| c["run_id"] == UNIT_A).unwrap();
+    assert_eq!(a["parent_run_id"], DONE);
+    assert_eq!(a["kind"], "agent");
+    assert_eq!(a["status"], "done");
+    assert_eq!(a["legacy"], true);
+    // The codename UNIT_A's own transcript `RunStart` recorded.
+    assert_eq!(a["codename"], "topaz-pass/ferret");
+
+    let b = kids.iter().find(|c| c["run_id"] == UNIT_B).unwrap();
+    assert_eq!(b["status"], "failed");
+    assert_eq!(b["error"], "killed");
+
+    // An unknown id is a 404, like the other per-run endpoints.
+    assert_eq!(get(addr, "/api/agentiflows/af_missing/children").await.0, 404);
+}
+
 async fn steer(addr: SocketAddr, id: &str) -> (u16, Value) {
     let resp = reqwest::Client::new()
         .post(format!("http://{addr}/api/agentiflows/{id}/steer"))
