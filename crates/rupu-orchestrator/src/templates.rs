@@ -15,6 +15,7 @@
 use minijinja::{Environment, UndefinedBehavior, Value as MjValue};
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -119,6 +120,12 @@ pub struct StepContext {
     /// this is a strictly additive surface.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub loops: BTreeMap<String, LoopProgress>,
+    /// The directory `read_file('<relative path>')` resolves against: the
+    /// run's workspace, where the step's agents run. Not a template value.
+    /// `None` (a context rendered outside a run) resolves against the
+    /// process's current directory.
+    #[serde(skip)]
+    pub workdir: Option<PathBuf>,
 }
 
 /// Per-iteration metadata exposed to fan-out item prompts.
@@ -388,6 +395,13 @@ impl StepContext {
         self
     }
 
+    /// Set the directory `read_file` resolves relative paths against
+    /// (builder style).
+    pub fn with_workdir(mut self, workdir: impl Into<PathBuf>) -> Self {
+        self.workdir = Some(workdir.into());
+        self
+    }
+
     /// Bind a fan-out item + loop metadata into the context. The
     /// orchestrator clones the parent context per item and calls
     /// this so the item-prompt template can reference `{{item}}` /
@@ -504,18 +518,25 @@ pub fn render_step_prompt(
         RenderMode::Strict => UndefinedBehavior::Strict,
     });
     // `read_file('path')` — read a workspace file's contents into the template,
-    // resolved relative to the run's working directory. Lets control flow be
-    // driven by a file a prior step wrote (e.g.
+    // a relative path resolved against the run's workspace (`ctx.workdir`),
+    // never the rupu process's own directory: a cloned run target, a
+    // `workflow resume` and `cp serve`'s resume worker all run elsewhere. Lets
+    // control flow be driven by a file a prior step wrote (e.g.
     // `for_each: "{{ read_file('reports/units.json') }}"`) rather than by the
     // agent's chat output, which is far more deterministic. Errors loudly if the
     // file is missing so a fan-out never silently runs over nothing.
+    let workdir = ctx.workdir.clone();
     env.add_function(
         "read_file",
-        |path: String| -> Result<String, minijinja::Error> {
-            std::fs::read_to_string(&path).map_err(|e| {
+        move |path: String| -> Result<String, minijinja::Error> {
+            let resolved = match &workdir {
+                Some(dir) => dir.join(&path),
+                None => PathBuf::from(&path),
+            };
+            std::fs::read_to_string(&resolved).map_err(|e| {
                 minijinja::Error::new(
                     minijinja::ErrorKind::InvalidOperation,
-                    format!("read_file({path:?}) failed: {e}"),
+                    format!("read_file({path:?}) failed: {}: {e}", resolved.display()),
                 )
             })
         },

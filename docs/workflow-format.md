@@ -782,7 +782,8 @@ Use `for_each:` when one agent should process many independent items.
 Behavior:
 
 - `for_each:` renders to a list of items
-- if the rendered text starts with `[`, `rupu` parses it as a JSON / YAML array
+- if the rendered text starts with `[`, `rupu` parses it as a JSON array; if it
+  doesn't parse, the step fails with the parse error before any unit runs
 - otherwise, `rupu` treats each non-empty line as one item
 - to fan out over a list of objects from another step, render it with
   `| tojson` — e.g. every finding a query matches:
@@ -1214,7 +1215,7 @@ Workflow templates use minijinja. Missing variables render as empty strings.
 
 | Function | Returns | Notes |
 | --- | --- | --- |
-| `read_file('<path>')` | File contents as a string | Path is resolved against the run's working directory. Errors loudly (the run fails) if the file is missing. |
+| `read_file('<path>')` | File contents as a string | A relative path is resolved against the run's workspace — the directory its agents and `run:` steps work in (for a run target, the clone) — not the directory `rupu` was started from, so a resumed run reads the same file. Errors loudly (the run fails) if the file is missing. |
 
 ### Template filters
 

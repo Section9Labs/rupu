@@ -354,6 +354,12 @@ pub enum RunWorkflowError {
         #[source]
         source: RenderError,
     },
+    #[error("step {step}: `for_each:` rendered to a value starting with `[` that is not a JSON array: {source}")]
+    ForEachParse {
+        step: String,
+        #[source]
+        source: serde_json::Error,
+    },
     #[error("agent failure in step {step}: {source}")]
     Agent {
         step: String,
@@ -3233,6 +3239,7 @@ async fn run_scheduler_scoped(
                     opts.event.as_ref(),
                     opts.issue.as_ref(),
                     step_results,
+                    &opts.workspace_path,
                 )
             } else {
                 let combined: Vec<StepResult> = scope
@@ -3246,6 +3253,7 @@ async fn run_scheduler_scoped(
                     opts.event.as_ref(),
                     opts.issue.as_ref(),
                     &combined,
+                    &opts.workspace_path,
                 )
             };
             // `scope.loop_progress` (this call's own seed, non-empty only
@@ -4672,6 +4680,7 @@ async fn run_loop_node(
             opts.event.as_ref(),
             opts.issue.as_ref(),
             &feedback_history,
+            &opts.workspace_path,
         );
         until_ctx.loops = until_progress;
         let holds = render_when_expression(
@@ -5659,6 +5668,7 @@ async fn run_steps_over(
             opts.event.as_ref(),
             opts.issue.as_ref(),
             step_results,
+            &opts.workspace_path,
         );
 
         // `when:` gate. Evaluated against the same context the prompt
@@ -6205,8 +6215,9 @@ fn base_context_for_step(
     event: Option<&serde_json::Value>,
     issue: Option<&serde_json::Value>,
     prior: &[StepResult],
+    workdir: &Path,
 ) -> StepContext {
-    let mut ctx = StepContext::new();
+    let mut ctx = StepContext::new().with_workdir(workdir);
     ctx.inputs = inputs.clone();
     ctx.event = event.cloned();
     ctx.issue = issue.cloned();
@@ -7420,6 +7431,7 @@ async fn run_on_reject_chain(
                 opts.event.as_ref(),
                 opts.issue.as_ref(),
                 step_results,
+                &opts.workspace_path,
             );
             if let Some(sink) = opts.event_sink.as_ref() {
                 sink.emit(
@@ -7507,6 +7519,7 @@ async fn run_on_reject_chain(
             opts.event.as_ref(),
             opts.issue.as_ref(),
             step_results,
+            &opts.workspace_path,
         );
         let agent_name = step.agent.as_deref().unwrap_or_default();
         let prompt = step.prompt.as_deref().unwrap_or_default();
@@ -8513,7 +8526,11 @@ async fn run_fanout_run_step(
             step: step.id.clone(),
             source: e,
         })?;
-    let items = parse_fanout_items(&rendered_list);
+    let items =
+        parse_fanout_items(&rendered_list).map_err(|source| RunWorkflowError::ForEachParse {
+            step: step.id.clone(),
+            source,
+        })?;
     let total = items.len();
 
     if items.is_empty() {
@@ -8890,7 +8907,11 @@ async fn run_fanout_step(
             step: step.id.clone(),
             source: e,
         })?;
-    let items = parse_fanout_items(&rendered_list);
+    let items =
+        parse_fanout_items(&rendered_list).map_err(|source| RunWorkflowError::ForEachParse {
+            step: step.id.clone(),
+            source,
+        })?;
 
     if items.is_empty() {
         info!(step = %step.id, "for_each rendered to an empty list; recording as success with no items");
@@ -10580,29 +10601,23 @@ pub fn read_final_assistant_text(
 /// - JSON array (string starts with `[`): parsed via serde_json.
 ///   Items can be strings, numbers, bools, or objects — whatever
 ///   shape the workflow author provides — and are passed through to
-///   `{{item}}` verbatim.
+///   `{{item}}` verbatim. A value that starts with `[` but doesn't
+///   parse is an error: it is almost always a malformed units file,
+///   and fanning out over its lines would dispatch garbage.
 /// - One non-empty line per item otherwise. Lines are trimmed; blank
 ///   lines are skipped. This is the shape produced by minijinja's
 ///   `for x in xs` loops or by simple comma-less newline lists.
-fn parse_fanout_items(rendered: &str) -> Vec<serde_json::Value> {
+fn parse_fanout_items(rendered: &str) -> Result<Vec<serde_json::Value>, serde_json::Error> {
     let trimmed = rendered.trim();
-    if trimmed.is_empty() {
-        return Vec::new();
-    }
     if trimmed.starts_with('[') {
-        if let Ok(serde_json::Value::Array(arr)) = serde_json::from_str(trimmed) {
-            return arr;
-        }
-        // Fall through to line-mode if the string starts with `[`
-        // but isn't valid JSON — better to dispatch one item ("[bad")
-        // than swallow the value silently.
+        return serde_json::from_str(trimmed);
     }
-    trimmed
+    Ok(trimmed
         .lines()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| serde_json::Value::String(s.to_string()))
-        .collect()
+        .collect())
 }
 
 /// Field names a fan-out item may use to identify itself, in preference
@@ -11708,7 +11723,7 @@ mod tests {
             kind: crate::runs::StepKind::Linear,
             ..Default::default()
         }];
-        let ctx = base_context_for_step(&BTreeMap::new(), None, None, &prior);
+        let ctx = base_context_for_step(&BTreeMap::new(), None, None, &prior, Path::new("/w"));
         let with = serde_json::json!({
             "project": "acme/widget",
             "title": "found an issue",
