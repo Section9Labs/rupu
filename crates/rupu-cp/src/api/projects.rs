@@ -322,7 +322,6 @@ async fn get_project(
             let sessions = crate::api::sessions::collect_sessions_with(
                 &global,
                 crate::api::sessions::SessionScan {
-                    pricing: None,
                     workspace: Some(&ws),
                     fail_closed: true,
                 },
@@ -519,19 +518,18 @@ async fn project_sessions(
         crate::query::ListQuery::parse(q.q.as_deref(), crate::query::sessions::FIELDS)?,
     );
     let facets = crate::query::wants_facets(q.facets.as_deref());
-    // Scoped BEFORE usage is folded; each session is attributed to its
-    // customer and priced with that customer's pricing. Blocking IO.
-    let scoped: Vec<Value> = {
+    // Scoped and attributed to its customer, unpriced: only the sessions on
+    // the returned page fold their turns' usage, each priced with its
+    // customer's pricing. Blocking IO.
+    let (scoped, unpriced) = {
         let global = s.global_dir.clone();
-        let pricing = std::sync::Arc::clone(&s.customer_pricing);
         let fail_closed = filter.reads_customer();
         tokio::task::spawn_blocking(move || {
-            crate::api::sessions::collect_sessions_with(
+            crate::api::sessions::collect_unpriced_sessions(
                 &global,
                 // Unfiltered by customer, a session whose assignment can't
                 // be read is listed without customer keys.
                 crate::api::sessions::SessionScan {
-                    pricing: Some(&pricing),
                     workspace: Some(&ws_id),
                     fail_closed,
                 },
@@ -552,7 +550,9 @@ async fn project_sessions(
     crate::api::host_fanout::sort_values_newest_first(&mut probes, "updated_at");
     let merged = crate::query::filter_merged(probes, &filter, |_| true, facets);
     let headers = merged.headers();
-    let rows = crate::pagination::paginate(merged.rows, &q.page())
+    let rows = unpriced
+        .price_page(&s, crate::pagination::paginate(merged.rows, &q.page()))
+        .await?
         .into_iter()
         .map(|mut v| {
             if let Some(o) = v.as_object_mut() {
@@ -924,6 +924,35 @@ mod tests {
         };
         let v = serde_json::to_value(&detail).unwrap();
         assert!(v.get("usage").is_some());
+    }
+
+    #[tokio::test]
+    async fn the_project_session_list_prices_only_the_page_it_returns() {
+        use crate::api::sessions::tests::{folded_sessions, seed_session_with_turn};
+        let tmp = tempfile::TempDir::new().unwrap();
+        register_workspace(&tmp, "ws_p", &tmp.path().join("proj"));
+        let turns: Vec<(&str, std::path::PathBuf)> = ["ses_w3", "ses_w2", "ses_w1"]
+            .into_iter()
+            .zip([3, 2, 1])
+            .map(|(id, day)| (id, seed_session_with_turn(tmp.path(), id, "ws_p", day)))
+            .collect();
+        let listed = project_sessions(
+            State(test_state(&tmp)),
+            Path("ws_p".to_string()),
+            Query(ProjectListQuery {
+                offset: Some(2),
+                limit: Some(1),
+                q: Some("agent:agent".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(listed.rows.len(), 1);
+        assert_eq!(listed.rows[0]["session_id"], "ses_w1");
+        assert!(listed.rows[0]["usage"].is_object());
+        assert!(listed.rows[0].get("host_id").is_none());
+        assert_eq!(folded_sessions(&turns), ["ses_w1"]);
     }
 
     fn test_state(tmp: &tempfile::TempDir) -> AppState {

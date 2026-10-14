@@ -854,6 +854,18 @@ impl UsageIndex {
         )
     }
 
+    /// Whether the index has been asked for `run_id`'s usage in `store`.
+    #[cfg(test)]
+    pub(crate) fn has_run(&self, store: &RunStore, run_id: &str) -> bool {
+        lock(&self.runs).contains_key(&(store.root.clone(), run_id.to_string()))
+    }
+
+    /// Whether the index has folded the transcript at `path`.
+    #[cfg(test)]
+    pub(crate) fn has_file(&self, path: &Path) -> bool {
+        lock(&self.files).contains_key(path)
+    }
+
     fn file_fold(&self, path: &Path) -> Arc<Mutex<TranscriptFold>> {
         let mut map = lock(&self.files);
         Arc::clone(map.entry(path.to_path_buf()).or_default())

@@ -363,16 +363,10 @@ fn session_usage_from_totals(
     }
 }
 
-/// Which sessions a scan keeps, and whether it prices them.
+/// Which sessions a scan keeps.
 #[derive(Clone, Copy)]
 pub(crate) struct SessionScan<'a> {
-    /// `Some` → each session gets a `usage` block ([`session_usage`], which
-    /// folds its turns' transcripts), priced with the pricing of the customer
-    /// the session is attributed to; `None` → no usage is computed at all,
-    /// for callers that only count or list sessions.
-    pub(crate) pricing: Option<&'a crate::customers::CustomerPricing>,
-    /// `Some(w)` → only sessions whose `workspace_id == w`, filtered BEFORE
-    /// any usage is folded.
+    /// `Some(w)` → only sessions whose `workspace_id == w`.
     pub(crate) workspace: Option<&'a str>,
     /// `true` (a customer filter, a count or a rollup) → an assignment that
     /// cannot be read fails the scan; `false` (an unfiltered list) → that
@@ -403,23 +397,63 @@ fn session_customer(
     }
 }
 
-/// What a scan attributes and prices with — one per request.
-struct ScanCtx<'a> {
-    lookup: crate::customers::CustomerLookup,
-    prices: Option<crate::customers::PricingMemo<'a>>,
+/// A session a scan found, attributed to its customer (`who`; `None` when
+/// the attribution can't be read and the scan is not fail-closed).
+struct ScannedSession {
+    dto: SessionDto,
+    scope: String,
+    who: Option<crate::customers::Attribution>,
 }
 
-/// Scan `<root>` for `<id>/session.json` entries. Assigns `scope` to
-/// each successfully parsed session, attributes it to its customer
-/// (`customer` + `customer_derived`; neither when the attribution can't be
-/// read and the scan is not `fail_closed`) and pushes it onto `out`.
+impl ScannedSession {
+    /// Its list row: `scope`, `usage` when priced, `customer` +
+    /// `customer_derived` when known, and its codename. `None` (logged)
+    /// when the session doesn't serialize.
+    fn row(&self, usage: Option<&crate::usage::UsageSummary>) -> Option<serde_json::Value> {
+        let mut val = match serde_json::to_value(&self.dto) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %self.dto.session_id,
+                    error = %e,
+                    "failed to serialize session dto; skipping"
+                );
+                return None;
+            }
+        };
+        if let serde_json::Value::Object(ref mut map) = val {
+            map.insert(
+                "scope".to_string(),
+                serde_json::Value::String(self.scope.clone()),
+            );
+            if let Some(Ok(u)) = usage.map(serde_json::to_value) {
+                map.insert("usage".to_string(), u);
+            }
+            if let Some(who) = &self.who {
+                map.insert("customer".to_string(), serde_json::json!(who.slug));
+                map.insert(
+                    "customer_derived".to_string(),
+                    serde_json::json!(who.derived),
+                );
+            }
+        }
+        crate::codename::inject_codename(
+            &mut val,
+            &self.dto.session_id,
+            Some(&self.dto.agent_name),
+        );
+        Some(val)
+    }
+}
+
+/// Scan `<root>` for `<id>/session.json` entries, each attributed to its
+/// customer and given `scope`, onto `out`.
 fn scan_session_dir(
     root: &std::path::Path,
     scope: &str,
-    run_store: &rupu_orchestrator::runs::RunStore,
     scan: SessionScan<'_>,
-    ctx: &mut ScanCtx<'_>,
-    out: &mut Vec<serde_json::Value>,
+    lookup: &mut crate::customers::CustomerLookup,
+    out: &mut Vec<ScannedSession>,
 ) -> Result<(), ApiError> {
     if !root.is_dir() {
         return Ok(());
@@ -442,103 +476,161 @@ fn scan_session_dir(
         if scan.workspace.is_some_and(|w| dto.workspace_id != w) {
             continue;
         }
-        let who = session_customer(&mut ctx.lookup, &dto, scan.fail_closed)?;
-        // Each turn priced at its own attribution (R8).
-        let usage = match ctx.prices.as_mut() {
-            None => None,
-            Some(prices) => {
-                let lookup = &mut ctx.lookup;
-                Some(session_usage(&dto, run_store, prices, &mut |tp| {
-                    turn_price_key(lookup, &dto, tp, scan.fail_closed)
-                })?)
-            }
-        };
-        match serde_json::to_value(&dto) {
-            Ok(mut val) => {
-                if let serde_json::Value::Object(ref mut map) = val {
-                    map.insert(
-                        "scope".to_string(),
-                        serde_json::Value::String(scope.to_string()),
-                    );
-                    if let Some(Ok(u)) = usage.map(|u| serde_json::to_value(&u)) {
-                        map.insert("usage".to_string(), u);
-                    }
-                    if let Some(who) = &who {
-                        map.insert("customer".to_string(), serde_json::json!(who.slug));
-                        map.insert(
-                            "customer_derived".to_string(),
-                            serde_json::json!(who.derived),
-                        );
-                    }
-                }
-                crate::codename::inject_codename(&mut val, &dto.session_id, Some(&dto.agent_name));
-                out.push(val);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    session_dir = %dir.display(),
-                    error = %e,
-                    "failed to serialize session dto; skipping"
-                );
-            }
-        }
+        let who = session_customer(lookup, &dto, scan.fail_closed)?;
+        out.push(ScannedSession {
+            dto,
+            scope: scope.to_string(),
+            who,
+        });
     }
     Ok(())
 }
 
-/// Collect all sessions from both active and archive dirs, each attributed
-/// to its customer and priced with that customer's pricing. Each entry has
-/// an injected `"scope"` key (`"active"` or `"archived"`). `fail_closed`: an
-/// assignment that cannot be read fails the call; else that session carries
-/// no customer keys. Blocking IO (every session's turn transcripts are
-/// folded) — call from `spawn_blocking`.
+/// Every local session, active then archived, attributed. Blocking IO.
+fn scan_sessions(
+    global_dir: &std::path::Path,
+    scan: SessionScan<'_>,
+) -> Result<Vec<ScannedSession>, ApiError> {
+    let mut lookup =
+        crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(global_dir));
+    let mut sessions = Vec::new();
+    for (dir, scope) in [("sessions", "active"), ("sessions-archive", "archived")] {
+        scan_session_dir(
+            &global_dir.join(dir),
+            scope,
+            scan,
+            &mut lookup,
+            &mut sessions,
+        )?;
+    }
+    Ok(sessions)
+}
+
+/// Every local session's row, without `usage` (no transcript is folded),
+/// each with an injected `"scope"` (`"active"` or `"archived"`) and its
+/// customer: for callers that count sessions or list them unpriced.
+/// Blocking IO — call from `spawn_blocking`.
+pub(crate) fn collect_sessions_with(
+    global_dir: &std::path::Path,
+    scan: SessionScan<'_>,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    Ok(scan_sessions(global_dir, scan)?
+        .iter()
+        .filter_map(|ss| ss.row(None))
+        .collect())
+}
+
+/// [`collect_sessions_with`] for a list: the rows, unpriced, and the
+/// sessions behind them, to price the rows that land on the returned page
+/// ([`UnpricedSessions::price_page`]) — pricing folds every turn's
+/// transcript. Blocking IO — call from `spawn_blocking`.
+pub(crate) fn collect_unpriced_sessions(
+    global_dir: &std::path::Path,
+    scan: SessionScan<'_>,
+) -> Result<(Vec<serde_json::Value>, UnpricedSessions), ApiError> {
+    let mut rows = Vec::new();
+    let mut sessions = std::collections::HashMap::new();
+    for ss in scan_sessions(global_dir, scan)? {
+        if let Some(row) = ss.row(None) {
+            rows.push(row);
+            sessions.insert((ss.scope.clone(), ss.dto.session_id.clone()), ss);
+        }
+    }
+    Ok((
+        rows,
+        UnpricedSessions {
+            sessions,
+            fail_closed: scan.fail_closed,
+        },
+    ))
+}
+
+/// Local sessions a list holds unpriced, by `(scope, session_id)`.
+#[derive(Default)]
+pub(crate) struct UnpricedSessions {
+    sessions: std::collections::HashMap<(String, String), ScannedSession>,
+    /// An assignment a turn's price can't read fails the request.
+    fail_closed: bool,
+}
+
+impl UnpricedSessions {
+    /// Replace each local row of `rows` (no `host_id`, or `"local"`) with
+    /// the row its session lists priced: [`session_usage`], each turn at
+    /// its own customer's pricing. Blocking IO.
+    fn price(
+        mut self,
+        global_dir: &std::path::Path,
+        pricing: &crate::customers::CustomerPricing,
+        rows: &mut [serde_json::Value],
+    ) -> Result<(), ApiError> {
+        // Session turns' dispatch sub-runs live in the global run store.
+        let run_store = rupu_orchestrator::runs::RunStore::new(global_dir.join("runs"));
+        let mut lookup =
+            crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(global_dir));
+        let mut prices = crate::customers::PricingMemo::new(pricing);
+        for row in rows {
+            if row.get("host_id").is_some_and(|h| h != "local") {
+                continue;
+            }
+            let key = (
+                row["scope"].as_str().unwrap_or_default().to_string(),
+                row["session_id"].as_str().unwrap_or_default().to_string(),
+            );
+            let Some(ss) = self.sessions.remove(&key) else {
+                continue;
+            };
+            // Each turn priced at its own attribution (R8).
+            let usage = session_usage(&ss.dto, &run_store, &mut prices, &mut |tp| {
+                turn_price_key(&mut lookup, &ss.dto, tp, self.fail_closed)
+            })?;
+            let Some(mut priced) = ss.row(Some(&usage)) else {
+                continue;
+            };
+            if let Some(host) = row.get("host_id") {
+                priced["host_id"] = host.clone();
+            }
+            *row = priced;
+        }
+        Ok(())
+    }
+
+    /// [`Self::price`] the page `rows` on the blocking pool.
+    pub(crate) async fn price_page(
+        self,
+        s: &AppState,
+        mut rows: Vec<serde_json::Value>,
+    ) -> Result<Vec<serde_json::Value>, ApiError> {
+        if self.sessions.is_empty() {
+            return Ok(rows);
+        }
+        let global = s.global_dir.clone();
+        let pricing = std::sync::Arc::clone(&s.customer_pricing);
+        tokio::task::spawn_blocking(move || {
+            self.price(&global, &pricing, &mut rows)?;
+            Ok(rows)
+        })
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+    }
+}
+
+/// Every local session's row, priced: [`collect_unpriced_sessions`] with
+/// every row priced.
+#[cfg(test)]
 pub(crate) fn collect_sessions(
     global_dir: &std::path::Path,
     pricing: &crate::customers::CustomerPricing,
     fail_closed: bool,
 ) -> Result<Vec<serde_json::Value>, ApiError> {
-    collect_sessions_with(
+    let (mut rows, unpriced) = collect_unpriced_sessions(
         global_dir,
         SessionScan {
-            pricing: Some(pricing),
             workspace: None,
             fail_closed,
         },
-    )
-}
-
-/// [`collect_sessions`] with an explicit [`SessionScan`]: a workspace
-/// filter and/or no pricing. Blocking IO — call from `spawn_blocking`.
-pub(crate) fn collect_sessions_with(
-    global_dir: &std::path::Path,
-    scan: SessionScan<'_>,
-) -> Result<Vec<serde_json::Value>, ApiError> {
-    // Session turns' dispatch sub-runs live in the global run store.
-    let run_store = rupu_orchestrator::runs::RunStore::new(global_dir.join("runs"));
-    let mut ctx = ScanCtx {
-        lookup: crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(
-            global_dir,
-        )),
-        prices: scan.pricing.map(crate::customers::PricingMemo::new),
-    };
-    let mut sessions = Vec::new();
-    scan_session_dir(
-        &global_dir.join("sessions"),
-        "active",
-        &run_store,
-        scan,
-        &mut ctx,
-        &mut sessions,
     )?;
-    scan_session_dir(
-        &global_dir.join("sessions-archive"),
-        "archived",
-        &run_store,
-        scan,
-        &mut ctx,
-        &mut sessions,
-    )?;
-    Ok(sessions)
+    unpriced.price(global_dir, pricing, &mut rows)?;
+    Ok(rows)
 }
 
 #[derive(Deserialize, Default)]
@@ -635,7 +727,7 @@ async fn list_sessions(
             && range.contains_str(v.get("created_at").and_then(|x| x.as_str()))
     };
 
-    let mut rows = if host != "local" && host != "all" {
+    let (mut rows, unpriced) = if host != "local" && host != "all" {
         // ── Single remote host ─────────────────────────────────────────────
         let conn = crate::api::runs::resolve_host(&s, host)?;
         // Structured session listing — works for SSH hosts (which can't serve
@@ -647,16 +739,18 @@ async fn list_sessions(
         for row in &mut rows {
             crate::api::host_fanout::tag_session_row(host, remote_scope.as_deref(), row);
         }
-        rows
+        (rows, UnpricedSessions::default())
     } else {
         // ── Local sessions ─────────────────────────────────────────────────
-        // Blocking IO (every session's turn transcripts are folded for
-        // usage, and each workspace's assignment is read once).
-        let local_sessions = {
+        // Blocking IO (each workspace's assignment is read once). Unpriced:
+        // only the sessions on the returned page fold their turns' usage.
+        let (local_sessions, unpriced) = {
             let global = s.global_dir.clone();
-            let pricing = std::sync::Arc::clone(&s.customer_pricing);
-            let fail_closed = filter.reads_customer();
-            tokio::task::spawn_blocking(move || collect_sessions(&global, &pricing, fail_closed))
+            let scan = SessionScan {
+                workspace: None,
+                fail_closed: filter.reads_customer(),
+            };
+            tokio::task::spawn_blocking(move || collect_unpriced_sessions(&global, scan))
                 .await
                 .map_err(|e| ApiError::internal(e.to_string()))??
         };
@@ -667,11 +761,12 @@ async fn list_sessions(
                 v
             })
             .collect();
-        if host == "local" {
+        let rows = if host == "local" {
             local_values
         } else {
             fan_out_sessions(&s.hosts, remote_scope.as_deref(), local_values).await
-        }
+        };
+        (rows, unpriced)
     };
     // Newest-first by `updated_at` (most recently active first): the order
     // the web's per-host merge relies on. `collect_sessions` walks the
@@ -694,7 +789,9 @@ async fn list_sessions(
         facets: facets.then(|| {
             crate::query::facet_counts(&merged.scoped, crate::query::sessions::FIELDS, false)
         }),
-        rows: crate::pagination::paginate(merged.rows, &page),
+        rows: unpriced
+            .price_page(&s, crate::pagination::paginate(merged.rows, &page))
+            .await?,
     })
 }
 
@@ -1206,8 +1303,85 @@ async fn delete_session(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// An active session in `workspace` with one turn, updated `day` of
+    /// September 2026; the turn's transcript path.
+    pub(crate) fn seed_session_with_turn(
+        global: &std::path::Path,
+        id: &str,
+        workspace: &str,
+        day: u32,
+    ) -> std::path::PathBuf {
+        let transcript = global.join("transcripts").join(format!("{id}_t1.jsonl"));
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, "").unwrap();
+        let dir = global.join("sessions").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let at = format!("2026-09-{day:02}T12:00:00Z");
+        let session = serde_json::json!({
+            "session_id": id,
+            "agent_name": "agent",
+            "workspace_id": workspace,
+            "created_at": at,
+            "updated_at": at,
+            "customer": null,
+            "runs": [{"run_id": format!("{id}_t1"), "transcript_path": transcript}],
+        });
+        std::fs::write(dir.join("session.json"), session.to_string()).unwrap();
+        transcript
+    }
+
+    /// The sessions whose turns a list folded for usage.
+    pub(crate) fn folded_sessions(turns: &[(&str, std::path::PathBuf)]) -> Vec<String> {
+        turns
+            .iter()
+            .filter(|(_, t)| crate::usage_index::UsageIndex::global().has_file(t))
+            .map(|(id, _)| id.to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_session_list_prices_only_the_page_it_returns() {
+        for (host, q) in [
+            (Some("local"), None),
+            (Some("local"), Some("agent:agent")),
+            (None, None),
+            (None, Some("agent:agent")),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let turns: Vec<(&str, std::path::PathBuf)> = ["ses_p3", "ses_p2", "ses_p1"]
+                .into_iter()
+                .zip([3, 2, 1])
+                .map(|(id, day)| (id, seed_session_with_turn(tmp.path(), id, "", day)))
+                .collect();
+            let s = crate::state::AppState::new(
+                tmp.path().to_path_buf(),
+                rupu_config::PricingConfig::default(),
+            );
+            let listed = list_sessions(
+                State(s),
+                Query(SessionsQuery {
+                    offset: Some(1),
+                    limit: Some(1),
+                    host: host.map(String::from),
+                    q: q.map(String::from),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            let ids: Vec<&str> = listed
+                .rows
+                .iter()
+                .map(|r| r["session_id"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids, ["ses_p2"], "{host:?} {q:?}");
+            assert!(listed.rows[0]["usage"].is_object(), "{host:?} {q:?}");
+            assert_eq!(folded_sessions(&turns), ["ses_p2"], "{host:?} {q:?}");
+        }
+    }
 
     #[tokio::test]
     async fn single_remote_host_session_list_reports_unsupported_as_501() {
