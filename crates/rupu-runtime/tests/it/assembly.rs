@@ -905,7 +905,7 @@ async fn a_no_messaging_launch_has_messaging_off_and_caps_its_children() {
         "provider: anthropic\nmodel: claude-sonnet-4-6\ntools: [read_file, msg.send]",
     );
     let mut l = launch(&home, spec.clone(), Origin::Standalone, "run_placed_off");
-    l.overrides.messaging_off = true;
+    l.overrides.messaging = MessagingSwitch::Off;
     assert_eq!(MessagingGrant::resolve(&l, None), MessagingGrant::Off(OffReason::Launch));
     let _m = MockScript::set(DONE);
     let run = assembler.assemble(l).await.unwrap();
@@ -941,6 +941,74 @@ async fn a_no_messaging_launch_has_messaging_off_and_caps_its_children() {
     let on = assembler.assemble(on).await.unwrap();
     assert_eq!(messaging_of(&on), (true, true, true));
     assert!(!on.opts.identity().launch.messaging_off);
+}
+
+/// A placed unit of a `messaging: { tools: [msg.send] }` workflow runs as
+/// `rupu run --messaging-tool msg.send` on its host: it is offered only
+/// that tool, as `ambient:workflow_messaging`, and the sub-agents it
+/// launches are not capped (only off is a cap, D6).
+#[tokio::test]
+#[serial]
+async fn a_messaging_tools_launch_narrows_its_tools_and_caps_nothing() {
+    let home = Home::new();
+    let assembler = home.assembler(config());
+    let spec = agent(
+        &home,
+        "provider: anthropic\nmodel: claude-sonnet-4-6\ntools: [read_file]",
+    );
+    let mut l = launch(&home, spec, Origin::Standalone, "run_placed_tools");
+    l.overrides.messaging = MessagingSwitch::Tools(vec!["msg.send"]);
+    assert_eq!(
+        MessagingGrant::resolve(&l, None),
+        MessagingGrant::Tools(
+            vec!["msg.send"],
+            rupu_tools::GrantReason::Ambient("workflow_messaging")
+        )
+    );
+    let _m = MockScript::set(DONE);
+    let run = assembler.assemble(l).await.unwrap();
+    assert_eq!(messaging_of(&run), (true, true, true));
+    assert_eq!(
+        run.opts.grant.entry("msg.send").unwrap().reasons_string(),
+        "ambient:workflow_messaging"
+    );
+    assert!(
+        !run.opts.grant.offers("board.claim"),
+        "only the tools named"
+    );
+    assert!(!run.opts.identity().launch.messaging_off);
+
+    let mut c = launch(
+        &home,
+        agent(
+            &home,
+            "provider: anthropic\nmodel: claude-sonnet-4-6\ntools: [read_file]",
+        ),
+        Origin::SubAgent {
+            parent: ParentRun {
+                identity: Arc::clone(&run.opts.tool_context.identity),
+                usage: None,
+                coverage_stream: None,
+            },
+        },
+        "run_placed_tools_child",
+    );
+    let parent_bus = run
+        .opts
+        .tool_context
+        .services
+        .message_space
+        .clone()
+        .unwrap();
+    c.services.message_bus = Some(Arc::new(parent_bus.sibling("heron>otter#1")));
+    assert!(MessagingGrant::resolve(&c, None).takes_part());
+    let child = assembler.assemble(c).await.unwrap();
+    assert_eq!(messaging_of(&child), (true, true, true));
+    assert!(
+        child.opts.grant.offers("board.claim"),
+        "the child's default set"
+    );
+    assert!(!child.opts.identity().launch.messaging_off);
 }
 
 /// Spec F1d D3: an agentiflow's `messaging: false` turns the lead's
