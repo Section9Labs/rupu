@@ -631,3 +631,193 @@ async fn dry_run_does_not_double_report_when_the_project_root_is_home() {
 
     assert!(ledger.exists(), "dry-run must never delete");
 }
+
+/// A mocked openai-compatible endpoint that answers one chat completion, for
+/// the netflow-stream tests below (the same shape the ledger tests above
+/// mock inline).
+async fn mock_completion_server() -> httpmock::MockServer {
+    let server = httpmock::MockServer::start_async().await;
+    server
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/chat/completions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": "cmpl_1",
+                    "model": "mock-model",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "hello from mock"},
+                        "finish_reason": "stop"
+                    }]
+                }));
+        })
+        .await;
+    server
+}
+
+/// A hermetic `RUPU_HOME` with one `echo` agent on the mocked provider.
+fn stream_test_home(
+    tmp: &assert_fs::TempDir,
+    server: &httpmock::MockServer,
+) -> assert_fs::fixture::ChildPath {
+    let global = tmp.child(".rupu");
+    global.create_dir_all().unwrap();
+    global.child("agents").create_dir_all().unwrap();
+    global
+        .child("agents/echo.md")
+        .write_str("---\nname: echo\nprovider: netflowmock\nmaxTurns: 1\n---\nyou echo.")
+        .unwrap();
+    global
+        .child("config.toml")
+        .write_str(&format!(
+            "[providers.netflowmock]\nkind = \"openai-compatible\"\nbase_url = \"{}\"\ndefault_model = \"mock-model\"\nstream = false\n",
+            server.base_url(),
+        ))
+        .unwrap();
+    global
+}
+
+/// Every `netflow.jsonl` under `<global>/runs/`.
+fn netflow_streams_under(runs: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(dirs) = std::fs::read_dir(runs) else {
+        return Vec::new();
+    };
+    dirs.filter_map(|e| e.ok())
+        .map(|e| e.path().join("netflow.jsonl"))
+        .filter(|p| p.exists())
+        .collect()
+}
+
+/// Spec 2026-10-14 remote netflow transport §N1: a `rupu run --run-id` —
+/// what every coordinator launch renders — is a ROOT: it begins
+/// `<RUPU_HOME>/runs/<run_id>/netflow.jsonl` with a `begin` line before any
+/// flow, and every ledger line it then writes is teed into it under its own
+/// ledger id, so the coordinator reads the same provider request the ledger
+/// holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn rupu_run_with_a_run_id_begins_and_tees_its_netflow_stream() {
+    let _guard = ENV_LOCK.lock().await;
+    let server = mock_completion_server().await;
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let global = stream_test_home(&tmp, &server);
+    let auth_file = tmp.child("auth.json");
+    let pwd = tmp.child("work");
+    pwd.create_dir_all().unwrap();
+
+    std::env::set_var("RUPU_HOME", global.path());
+    std::env::set_var("RUPU_AUTH_FILE", auth_file.path());
+    std::env::set_var("RUPU_NETFLOWMOCK_API_KEY", "test-key");
+    std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+    std::env::set_current_dir(pwd.path()).unwrap();
+
+    let run_id = "run_T1";
+    let exit = rupu_cli::run(vec![
+        "rupu".into(),
+        "run".into(),
+        "echo".into(),
+        "--mode".into(),
+        "bypass".into(),
+        "--run-id".into(),
+        run_id.into(),
+        "say hi".into(),
+    ])
+    .await;
+    std::env::set_current_dir(tmp.path()).unwrap();
+    assert_eq!(
+        format!("{exit:?}"),
+        format!("{:?}", std::process::ExitCode::from(0)),
+        "rupu run should exit 0 against the mocked endpoint"
+    );
+
+    let stream = global
+        .path()
+        .join("runs")
+        .join(run_id)
+        .join("netflow.jsonl");
+    let text = std::fs::read_to_string(&stream)
+        .unwrap_or_else(|e| panic!("a --run-id root begins its netflow stream at {stream:?}: {e}"));
+    let first: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert_eq!(first["kind"], "begin", "the begin line goes first: {text}");
+    assert_eq!(first["v"], 1);
+    assert_eq!(first["run_id"], run_id);
+
+    // The ledger's lines are teed in, tagged with the run's ledger id, and
+    // they are the ledger's lines: the provider request is among them.
+    let parsed = rupu_netflow::land::parse_stream(text.as_bytes());
+    assert!(parsed.begin_seen);
+    assert_eq!(parsed.malformed, 0, "{text}");
+    let teed = parsed
+        .ledgers
+        .get(run_id)
+        .unwrap_or_else(|| panic!("lines tagged with the run's own ledger id: {text}"));
+    assert!(
+        teed.iter()
+            .any(|l| l.contains(r#""path":"/v1/chat/completions""#)),
+        "the provider request reaches the stream: {teed:?}"
+    );
+    let ledger = global
+        .path()
+        .join("netflow")
+        .join(format!("{run_id}.jsonl"));
+    let ledger_lines = std::fs::read_to_string(&ledger).unwrap();
+    assert_eq!(
+        ledger_lines.lines().count(),
+        teed.len(),
+        "every ledger line is teed: ledger={ledger_lines} stream={teed:?}"
+    );
+}
+
+/// The other half of the root rule: a `rupu run` from a terminal (no
+/// `--run-id`) is nobody's unit, so it begins no stream and tees nowhere —
+/// its ledger is written exactly as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn rupu_run_without_a_run_id_leaves_no_netflow_stream() {
+    let _guard = ENV_LOCK.lock().await;
+    let server = mock_completion_server().await;
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let global = stream_test_home(&tmp, &server);
+    let auth_file = tmp.child("auth.json");
+    let pwd = tmp.child("work");
+    pwd.create_dir_all().unwrap();
+
+    std::env::set_var("RUPU_HOME", global.path());
+    std::env::set_var("RUPU_AUTH_FILE", auth_file.path());
+    std::env::set_var("RUPU_NETFLOWMOCK_API_KEY", "test-key");
+    std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+    std::env::set_current_dir(pwd.path()).unwrap();
+
+    let exit = rupu_cli::run(vec![
+        "rupu".into(),
+        "run".into(),
+        "echo".into(),
+        "--mode".into(),
+        "bypass".into(),
+        "say hi".into(),
+    ])
+    .await;
+    std::env::set_current_dir(tmp.path()).unwrap();
+    assert_eq!(
+        format!("{exit:?}"),
+        format!("{:?}", std::process::ExitCode::from(0)),
+        "rupu run should exit 0 against the mocked endpoint"
+    );
+
+    let runs = global.path().join("runs");
+    assert_eq!(
+        netflow_streams_under(&runs),
+        Vec::<std::path::PathBuf>::new(),
+        "a terminal rupu run begins no netflow stream"
+    );
+    // ...while its ledger was still written, with the provider request.
+    let ledgers: Vec<_> = std::fs::read_dir(global.path().join("netflow"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| rupu_netflow::is_per_run_ledger_path(p))
+        .collect();
+    assert_eq!(ledgers.len(), 1, "{ledgers:?}");
+    let text = std::fs::read_to_string(&ledgers[0]).unwrap();
+    assert!(text.contains(r#""path":"/v1/chat/completions""#), "{text}");
+}

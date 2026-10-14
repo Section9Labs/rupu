@@ -21,6 +21,7 @@ flow_lead:
   findings_artifact_root: "<home>/global/findings/artifacts"
   usage_ledger: "<home>/global/agentiflows/af_1/usage.jsonl"
   coverage_stream: ~
+  netflow_stream: ~
   netflow: true
   net_capture: false
   scm: true
@@ -61,6 +62,7 @@ flow_unit:
   findings_artifact_root: "<home>/global/findings/artifacts"
   usage_ledger: "<home>/global/runs/run_flow_unit/usage.jsonl"
   coverage_stream: "<home>/global/runs/run_flow_unit/coverage.jsonl"
+  netflow_stream: ~
   netflow: true
   net_capture: false
   scm: true
@@ -101,6 +103,7 @@ session_turn:
   findings_artifact_root: "<home>/global/findings/artifacts"
   usage_ledger: "<home>/global/sessions/ses_1/usage.jsonl"
   coverage_stream: ~
+  netflow_stream: ~
   netflow: true
   net_capture: false
   scm: true
@@ -141,6 +144,7 @@ standalone:
   findings_artifact_root: "<home>/global/findings/artifacts"
   usage_ledger: "<home>/global/runs/run_standalone/usage.jsonl"
   coverage_stream: "<home>/global/runs/run_standalone/coverage.jsonl"
+  netflow_stream: ~
   netflow: true
   net_capture: false
   scm: true
@@ -181,6 +185,7 @@ sub_agent:
   findings_artifact_root: "<home>/global/findings/artifacts"
   usage_ledger: "<home>/global/runs/run_wf/usage.jsonl"
   coverage_stream: "<home>/global/runs/run_root/coverage.jsonl"
+  netflow_stream: ~
   netflow: true
   net_capture: false
   scm: true
@@ -220,6 +225,7 @@ workflow_step:
   findings_artifact_root: "<home>/global/findings/artifacts"
   usage_ledger: "<home>/global/runs/run_wf/usage.jsonl"
   coverage_stream: ~
+  netflow_stream: ~
   netflow: true
   net_capture: false
   scm: true
