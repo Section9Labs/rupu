@@ -4,8 +4,7 @@
 // reads it with `customersRange` and strips it before filtering.
 import { Building2, CalendarRange, CircleCheck, Hash, KeyRound, Archive } from 'lucide-react';
 import type { CustomerRow, DashboardRange } from '../../api';
-import { parseToken, tokenize } from '../../findingQuery/grammar';
-import { controlTerm } from '../control';
+import { controlTerm, withDefault } from '../control';
 import { rowField, type RowField } from '../rows';
 
 export const CUSTOMER_RANGES: DashboardRange[] = ['7d', '30d', 'all'];
@@ -41,10 +40,5 @@ export function customersRange(q: string): { range: DashboardRange; rest: string
  *  it names no `is:` (archived customers stay out unless asked for, even
  *  while another token is broken). */
 export function customersRowQuery(rest: string): string {
-  const t = tokenize(rest);
-  const namesIs = t.ok && t.tokens.some((x) => {
-    const p = parseToken(x.text, CUSTOMER_FIELDS);
-    return p.ok && p.terms[0]?.key === 'is';
-  });
-  return namesIs ? rest : `${rest} is:active`.trim();
+  return withDefault(rest, CUSTOMER_FIELDS, 'is', 'is:active');
 }

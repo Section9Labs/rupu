@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
-// AgentRuns — verifies the FilterBar slot order, that the lifecycle filter and
-// host select drive the server request (not client-side filtering), that the
-// agent subject cell renders the name + via/session sub-line, and that the
-// kit's loading/empty states are in place.
+// AgentRuns — every registered host with one request each and honest
+// per-host loading/offline state; the agent subject cell (name + via/session
+// sub-line); status normalization; kit loading/empty states; whole-row
+// navigation; the customer scope. The query line itself is
+// AgentRuns.query.test.tsx; row actions are AgentRuns.actions.test.tsx.
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
@@ -62,122 +63,23 @@ function renderPage() {
   );
 }
 
-describe('AgentRuns — FilterBar', () => {
-  it('renders FilterBar slots in the fixed order: filters (lifecycle pills), then scope (host select)', async () => {
-    stubDeps();
-    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([]);
-
-    renderPage();
-
-    const pills = await screen.findByRole('button', { name: 'Running' });
-    const hostSelect = screen.getByLabelText('Host filter');
-    // The pills group precedes the host select in document order.
-    expect(pills.compareDocumentPosition(hostSelect) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-  });
-
-  it('renders the three lifecycle pills with Running active by default', async () => {
-    stubDeps();
-    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([]);
-
-    renderPage();
-
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Running' })).toBeInTheDocument());
-    expect(screen.getByRole('button', { name: 'Completed' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Failed / Rejected' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Running' })).toHaveAttribute('aria-pressed', 'true');
-  });
-});
-
-describe('AgentRuns — lifecycle filter drives fetch params', () => {
-  it('defaults to lifecycle "active" (Running)', async () => {
-    stubDeps();
-    const runsSpy = vi.spyOn(api, 'getAgentRuns').mockResolvedValue([]);
-
-    renderPage();
-
-    await waitFor(() =>
-      expect(runsSpy).toHaveBeenCalledWith(expect.objectContaining({ lifecycle: 'active' })),
-    );
-  });
-
-  it('clicking "Completed" re-fetches with lifecycle: "completed"', async () => {
-    stubDeps();
-    const runsSpy = vi.spyOn(api, 'getAgentRuns').mockResolvedValue([]);
-
-    renderPage();
-    await waitFor(() => screen.getByRole('button', { name: 'Completed' }));
-
-    fireEvent.click(screen.getByRole('button', { name: 'Completed' }));
-
-    await waitFor(() =>
-      expect(runsSpy).toHaveBeenCalledWith(expect.objectContaining({ lifecycle: 'completed' })),
-    );
-  });
-
-  it('clicking "Failed / Rejected" re-fetches with lifecycle: "failed"', async () => {
-    stubDeps();
-    const runsSpy = vi.spyOn(api, 'getAgentRuns').mockResolvedValue([]);
-
-    renderPage();
-    await waitFor(() => screen.getByRole('button', { name: 'Failed / Rejected' }));
-
-    fireEvent.click(screen.getByRole('button', { name: 'Failed / Rejected' }));
-
-    await waitFor(() =>
-      expect(runsSpy).toHaveBeenCalledWith(expect.objectContaining({ lifecycle: 'failed' })),
-    );
-  });
-});
-
-describe('AgentRuns host filter — per-host loading (spec 2026-10-01)', () => {
-  it('defaults to All hosts and fetches every registered host with its own host param', async () => {
+describe('AgentRuns — per-host loading (spec 2026-10-01)', () => {
+  it('fetches every registered host with its own host param', async () => {
     stubDeps();
     const runsSpy = vi.spyOn(api, 'getAgentRuns').mockResolvedValue([]);
     renderPage();
     await waitFor(() => expect(callsFor(runsSpy, 'local')).toHaveLength(1));
     expect(callsFor(runsSpy, 'host_prod')).toHaveLength(1);
-    expect(screen.getByLabelText('Host filter')).toHaveValue('__all__');
   });
 
-  it('renders This host, All hosts, then registered (non-local) hosts', async () => {
-    stubDeps();
-    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([]);
-    renderPage();
-    await waitFor(() => expect(screen.getByRole('option', { name: 'prod' })).toBeInTheDocument());
-    const options = screen.getAllByRole('option') as HTMLOptionElement[];
-    expect(options.map((o) => o.textContent)).toEqual(['This host', 'All hosts', 'prod']);
-  });
-
-  it('This host fetches only local', async () => {
-    stubDeps();
-    const runsSpy = vi.spyOn(api, 'getAgentRuns').mockResolvedValue([]);
-    renderPage();
-    await waitFor(() => expect(screen.getByRole('option', { name: 'prod' })).toBeInTheDocument());
-    runsSpy.mockClear();
-    fireEvent.change(screen.getByLabelText('Host filter'), { target: { value: 'local' } });
-    await waitFor(() => expect(callsFor(runsSpy, 'local')).toHaveLength(1));
-    expect(callsFor(runsSpy, 'host_prod')).toHaveLength(0);
-  });
-
-  it('remote host option fetches with that host id', async () => {
-    stubDeps();
-    const runsSpy = vi.spyOn(api, 'getAgentRuns').mockResolvedValue([]);
-    renderPage();
-    await waitFor(() => expect(screen.getByRole('option', { name: 'prod' })).toBeInTheDocument());
-    fireEvent.change(screen.getByLabelText('Host filter'), { target: { value: 'host_prod' } });
-    await waitFor(() =>
-      expect(runsSpy).toHaveBeenCalledWith(expect.objectContaining({ host: 'host_prod' })),
-    );
-  });
-
-  it('paints local rows while a remote host is still loading, naming it in the strip', async () => {
+  it('paints local rows while a remote host is still loading', async () => {
     stubDeps();
     vi.spyOn(api, 'getAgentRuns').mockImplementation((p) =>
       p?.host === 'local' ? Promise.resolve([{ ...REMOTE_ROW, host_id: 'local' }]) : new Promise(() => {}),
     );
     renderPage();
     await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
-    expect(screen.getByText('loading…')).toBeInTheDocument();
+    expect(screen.queryByTestId('host-alert')).not.toBeInTheDocument();
   });
 
   it('shows an offline remote honestly without hiding local rows', async () => {
@@ -188,12 +90,12 @@ describe('AgentRuns host filter — per-host loading (spec 2026-10-01)', () => {
         : Promise.reject(new ApiError(502, 'x', '{"error":"host unreachable: timed out"}')),
     );
     renderPage();
-    await waitFor(() => expect(screen.getByText(/not included: prod \(offline\)/)).toBeInTheDocument());
+    expect(await screen.findByTestId('host-alert')).toHaveTextContent('prod offline: its runs are missing');
     expect(screen.getByText(/fix-bug/)).toBeInTheDocument();
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
-  it('names the hosts left out when every answering host has no agent runs', async () => {
+  it('says which host is missing when the hosts that answered have no agent runs', async () => {
     stubDeps();
     vi.spyOn(api, 'getAgentRuns').mockImplementation((p) =>
       p?.host === 'local'
@@ -201,10 +103,28 @@ describe('AgentRuns host filter — per-host loading (spec 2026-10-01)', () => {
         : Promise.reject(new ApiError(502, 'x', '{"error":"host unreachable: timed out"}')),
     );
     renderPage();
-    await waitFor(() =>
-      expect(screen.getByText('No agent runs on the hosts that answered')).toBeInTheDocument(),
+    await waitFor(() => expect(screen.getByText('No agent runs')).toBeInTheDocument());
+    expect(screen.getByTestId('host-alert')).toHaveTextContent('prod offline: its runs are missing');
+  });
+
+  it('names the host that is still loading while nothing has painted yet', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getAgentRuns').mockImplementation((p) =>
+      p?.host === 'local' ? Promise.resolve([]) : new Promise(() => {}),
     );
-    expect(screen.getByText(/Not included: prod/)).toBeInTheDocument();
+    renderPage();
+    await waitFor(() => expect(screen.getByText('Waiting on prod…')).toBeInTheDocument());
+    expect(screen.queryByText('No agent runs')).not.toBeInTheDocument();
+  });
+
+  it('says no host answered when every host failed', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getAgentRuns').mockRejectedValue(new ApiError(502, 'x', '{"error":"down"}'));
+    renderPage();
+    await waitFor(() => expect(screen.getByText('No hosts answered')).toBeInTheDocument());
+    expect(screen.getByTestId('host-alert')).toHaveTextContent(
+      'Local offline: its runs are missing · prod offline: its runs are missing',
+    );
   });
 
   it('Host column renders host_id from the row', async () => {
@@ -235,9 +155,6 @@ describe('AgentRuns — agent subject cell', () => {
     vi.spyOn(api, 'getAgentRuns').mockResolvedValue([SESSION_ROW]);
 
     renderPage();
-    // Source pill defaults to Standalone — switch to All to see the
-    // session-sourced fixture row.
-    fireEvent.click(await screen.findByRole('button', { name: 'All' }));
 
     await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
     expect(screen.getByText('session_turn')).toBeInTheDocument();
@@ -259,7 +176,6 @@ describe('AgentRuns — agent subject cell', () => {
     vi.spyOn(api, 'getAgentRuns').mockResolvedValue([SESSION_ROW]);
 
     renderPage();
-    fireEvent.click(await screen.findByRole('button', { name: 'All' }));
 
     const name = await screen.findByText(/review-pr/);
     // AgentName's inner span carries the full identity tooltip; the
@@ -306,21 +222,13 @@ describe('AgentRuns — status column', () => {
     vi.spyOn(api, 'getAgentRuns').mockResolvedValue([okRow]);
 
     renderPage();
-    // Source pill defaults to Standalone — switch to All to see the
-    // session-sourced fixture row.
-    fireEvent.click(await screen.findByRole('button', { name: 'All' }));
 
-    // "Completed" also names the (unrelated) lifecycle filter pill button, so
-    // disambiguate by tag: the status pill is a <span>, the filter is a
-    // <button>.
-    await waitFor(() => expect(screen.getAllByText('Completed').length).toBeGreaterThan(0));
-    const status = screen.getAllByText('Completed').find((el) => el.tagName === 'SPAN');
-    expect(status).toBeDefined();
+    const status = await screen.findByText('Completed');
     expect(status).toHaveClass('bg-status-done/10');
     // CheckCircle2 (the completed icon), never AlertCircle (the
     // unknown-status fallback) — proves the wire "ok" hit the real
     // descriptor, not StatusPill's fallback branch.
-    expect(status?.querySelector('svg')).toHaveClass('lucide-circle-check');
+    expect(status.querySelector('svg')).toHaveClass('lucide-circle-check');
   });
 
   it('normalizes a session-branch "error" wire status to the Failed pill', async () => {
@@ -329,9 +237,6 @@ describe('AgentRuns — status column', () => {
     vi.spyOn(api, 'getAgentRuns').mockResolvedValue([errorRow]);
 
     renderPage();
-    // Source pill defaults to Standalone — switch to All to see the
-    // session-sourced fixture row.
-    fireEvent.click(await screen.findByRole('button', { name: 'All' }));
 
     const status = await screen.findByText('Failed');
     expect(status.closest('span')).toHaveClass('bg-status-failed/10');
@@ -354,16 +259,30 @@ describe('AgentRuns — kit loading/empty states', () => {
     await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument());
   });
 
-  it('shows the kit EmptyState with the current copy when there are no rows', async () => {
+  it('says no agent run is running when there are no rows and no query', async () => {
     stubDeps();
     vi.spyOn(api, 'getAgentRuns').mockResolvedValue([]);
 
     renderPage();
 
-    await waitFor(() => expect(screen.getByText('No agent runs yet')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText('No agent runs')).toBeInTheDocument());
     expect(
-      screen.getByText('Standalone and session-bound agent invocations will appear here once they run.'),
+      screen.getByText(
+        'Standalone runs appear here once an agent runs. source:session lists session turns.',
+      ),
     ).toBeInTheDocument();
+  });
+
+  it('says nothing matches when a query keeps no run', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([]);
+    render(
+      <MemoryRouter initialEntries={['/?q=status:error']}>
+        {withCustomerScope(<AgentRuns />)}
+      </MemoryRouter>,
+    );
+    expect(await screen.findByText('No agent runs match the filter.')).toBeInTheDocument();
+    expect(screen.queryByText('No agent runs')).not.toBeInTheDocument();
   });
 
   it('shows the kit ErrorBanner when the fetch fails', async () => {
@@ -376,41 +295,12 @@ describe('AgentRuns — kit loading/empty states', () => {
   });
 });
 
-// ── Amendment #2 (2026-07-23 feedback round): Source FilterPills ───────────
-
-describe('AgentRuns — Source filter', () => {
-  it('defaults to Standalone: renders standalone rows, hides session rows', async () => {
+describe('AgentRuns — source', () => {
+  it('renders the session rows the server returns (the server filters by source, not the page)', async () => {
     stubDeps();
-    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([REMOTE_ROW, SESSION_ROW]);
+    vi.spyOn(api, 'getAgentRuns').mockImplementation(onlyHost('local', [{ ...REMOTE_ROW, host_id: 'local' }, SESSION_ROW]));
 
     renderPage();
-
-    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
-    expect(screen.queryByText(/review-pr/)).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Standalone' })).toHaveAttribute('aria-pressed', 'true');
-  });
-
-  it('clicking "Session" shows only session-sourced rows', async () => {
-    stubDeps();
-    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([REMOTE_ROW, SESSION_ROW]);
-
-    renderPage();
-    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
-
-    fireEvent.click(screen.getByRole('button', { name: 'Session' }));
-
-    await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
-    expect(screen.queryByText(/fix-bug/)).not.toBeInTheDocument();
-  });
-
-  it('clicking "All" shows both standalone and session rows', async () => {
-    stubDeps();
-    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([REMOTE_ROW, SESSION_ROW]);
-
-    renderPage();
-    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
-
-    fireEvent.click(screen.getByRole('button', { name: 'All' }));
 
     await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
     expect(screen.getByText(/fix-bug/)).toBeInTheDocument();
@@ -427,111 +317,10 @@ describe('AgentRuns — Source filter', () => {
     vi.spyOn(api, 'getAgentRuns').mockResolvedValue([REMOTE_ROW]);
 
     renderPage();
-    fireEvent.click(await screen.findByRole('button', { name: 'All' }));
 
     await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
     // One header row + exactly one data row.
     expect(screen.getAllByRole('row')).toHaveLength(2);
-  });
-});
-
-describe('AgentRuns — the Source filter while hosts are still loading or paging', () => {
-  /** `n` session-turn rows, newest first, one a minute, starting `from` minutes before noon. */
-  const sessionRows = (n: number, from = 0): AgentRunRow[] =>
-    Array.from({ length: n }, (_, i) => ({
-      ...SESSION_ROW,
-      run_id: `run-sess-${from + i}`,
-      started_at: new Date(Date.parse('2026-06-02T12:00:00Z') - (from + i) * 60_000).toISOString(),
-    }));
-
-  it('says it is still waiting, not "no match", when the default Standalone filter empties what loaded so far', async () => {
-    stubDeps();
-    vi.spyOn(api, 'getAgentRuns').mockImplementation((p) =>
-      p?.host === 'local' ? Promise.resolve(sessionRows(3)) : new Promise(() => {}),
-    );
-    renderPage();
-    await waitFor(() => expect(screen.getByText('No matches yet · Waiting on prod…')).toBeInTheDocument());
-    expect(screen.queryByText('No agent runs match this filter')).not.toBeInTheDocument();
-    // Said once: the footer below does not repeat who it is waiting on.
-    expect(screen.getAllByText(/waiting on prod/i)).toHaveLength(1);
-  });
-
-  it('keeps paging while the filter hides every loaded row, so a later page can match', async () => {
-    stubDeps();
-    // Page 0 is a full page of session turns; the first standalone run is further down.
-    const local = [...sessionRows(22), { ...REMOTE_ROW, host_id: 'local', started_at: '2026-06-01T00:00:00Z' }];
-    const spy = vi
-      .spyOn(api, 'getAgentRuns')
-      .mockImplementation((p) =>
-        Promise.resolve(p?.host === 'local' ? local.slice(p.offset ?? 0, (p.offset ?? 0) + (p.limit ?? 20)) : []),
-      );
-    renderPage();
-    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
-    expect(callsFor(spy, 'local').some((c) => ((c[0] as { offset?: number }).offset ?? 0) > 0)).toBe(true);
-  });
-});
-
-// ── Amendment #1 (2026-07-23 feedback round): Find on every table ──────────
-
-describe('AgentRuns — Find', () => {
-  it('typing narrows rows by agent name, run id, session id, or host id', async () => {
-    stubDeps();
-    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([REMOTE_ROW, SESSION_ROW]);
-
-    renderPage();
-    fireEvent.click(await screen.findByRole('button', { name: 'All' }));
-    await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
-
-    fireEvent.change(screen.getByPlaceholderText('Find agents…'), { target: { value: 'review' } });
-
-    await waitFor(() => expect(screen.queryByText(/fix-bug/)).not.toBeInTheDocument());
-    expect(screen.getByText(/review-pr/)).toBeInTheDocument();
-  });
-
-  it('footer shows "N matches of M loaded" while a query is active', async () => {
-    stubDeps();
-    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([REMOTE_ROW, SESSION_ROW]);
-
-    renderPage();
-    fireEvent.click(await screen.findByRole('button', { name: 'All' }));
-    await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
-
-    fireEvent.change(screen.getByPlaceholderText('Find agents…'), { target: { value: 'review' } });
-
-    await waitFor(() => expect(screen.getByText('1 matches of 2 loaded')).toBeInTheDocument());
-  });
-
-  it('Esc clears the query', async () => {
-    stubDeps();
-    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([REMOTE_ROW, SESSION_ROW]);
-
-    renderPage();
-    fireEvent.click(await screen.findByRole('button', { name: 'All' }));
-    await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
-
-    const input = screen.getByPlaceholderText('Find agents…') as HTMLInputElement;
-    fireEvent.change(input, { target: { value: 'review' } });
-    await waitFor(() => expect(screen.queryByText(/fix-bug/)).not.toBeInTheDocument());
-
-    fireEvent.keyDown(input, { key: 'Escape' });
-
-    await waitFor(() => expect(input.value).toBe(''));
-    expect(screen.getByText(/fix-bug/)).toBeInTheDocument();
-  });
-
-  it('composes with the Source pill: searching within Standalone narrows just that subset', async () => {
-    stubDeps();
-    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([REMOTE_ROW, SESSION_ROW]);
-
-    renderPage();
-    // Default Source is Standalone — fix-bug (standalone) is visible,
-    // review-pr (session) is not, regardless of the query below.
-    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
-
-    fireEvent.change(screen.getByPlaceholderText('Find agents…'), { target: { value: 'review' } });
-
-    await waitFor(() => expect(screen.queryByText(/fix-bug/)).not.toBeInTheDocument());
-    expect(screen.queryByText(/review-pr/)).not.toBeInTheDocument();
   });
 });
 
@@ -628,7 +417,6 @@ describe('AgentRuns — whole-row navigation (rowHref) goes to the transcript vi
         <LocationProbe />
       </MemoryRouter>,
     );
-    fireEvent.click(await screen.findByRole('button', { name: 'All' }));
     await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
 
     // Exact match — see the sibling "agent subject cell" test's comment for
@@ -662,17 +450,17 @@ describe('AgentRuns — Turns/Duration column order (table-standardization Task 
 });
 
 describe('AgentRuns — codenames', () => {
-  it('renders the crew chip and Find matches by codename', async () => {
+  it('renders the crew chip', async () => {
     stubDeps();
-    vi.spyOn(api, 'getAgentRuns').mockResolvedValue([
-      { ...REMOTE_ROW, codename: 'cobalt-harbor/heron#1' },
-      { ...SESSION_ROW, codename: 'amber-fjord/kite#1' },
-    ]);
+    vi.spyOn(api, 'getAgentRuns').mockImplementation(
+      onlyHost('local', [
+        { ...REMOTE_ROW, host_id: 'local', codename: 'cobalt-harbor/heron#1' },
+        { ...SESSION_ROW, codename: 'amber-fjord/kite#1' },
+      ]),
+    );
     renderPage();
     await waitFor(() => expect(screen.getByText('cobalt-harbor')).toBeInTheDocument());
-    fireEvent.change(screen.getByPlaceholderText('Find agents…'), { target: { value: 'cobalt' } });
-    await waitFor(() => expect(screen.queryByText('amber-fjord')).not.toBeInTheDocument());
-    expect(screen.getByText('cobalt-harbor')).toBeInTheDocument();
+    expect(screen.getByText('amber-fjord')).toBeInTheDocument();
   });
 
   it('shows the run provider/model next to the agent name', async () => {
@@ -681,7 +469,6 @@ describe('AgentRuns — codenames', () => {
       { ...SESSION_ROW, provider: 'anthropic', model: 'claude-sonnet-4-6' },
     ]);
     renderPage();
-    fireEvent.click(await screen.findByRole('button', { name: 'All' }));
     expect(
       await screen.findByText('heron#1 · review-pr · anthropic/claude-sonnet-4-6'),
     ).toBeInTheDocument();
@@ -693,17 +480,18 @@ describe('AgentRuns — codenames', () => {
       { ...SESSION_ROW, codename: '', provider: 'openai', model: 'gpt-5' },
     ]);
     renderPage();
-    fireEvent.click(await screen.findByRole('button', { name: 'All' }));
     expect(await screen.findByText('review-pr · openai/gpt-5')).toBeInTheDocument();
   });
 });
 
 describe('AgentRuns — the global customer scope', () => {
-  it('passes customer: "acme" on every per-host request and names hosts that can’t filter', async () => {
+  it('passes customer: "acme" beside the query on every per-host request and names hosts that can’t filter', async () => {
     stubDeps();
     const spy = vi.spyOn(api, 'getAgentRuns').mockImplementation((p) =>
       p?.host === 'host_prod'
-        ? Promise.reject(new ApiError(501, "host host_prod can't report a customer for every run", ''))
+        ? Promise.reject(
+            new ApiError(501, 'x', JSON.stringify({ error: "host host_prod can't report a customer for every run" })),
+          )
         : Promise.resolve([]),
     );
     render(
@@ -714,10 +502,37 @@ describe('AgentRuns — the global customer scope', () => {
     for (const host of ['local', 'host_prod']) {
       await waitFor(() => expect(callsFor(spy, host).length).toBeGreaterThan(0));
       expect(callsFor(spy, host)[0][0]).toEqual(
-        expect.objectContaining({ customer: 'acme', onHostsWithoutCustomer: expect.any(Function) }),
+        expect.objectContaining({
+          customer: 'acme',
+          q: 'source:standalone',
+          onHeaders: expect.any(Function),
+        }),
       );
     }
-    expect(await screen.findByTestId('hosts-without-customer')).toHaveTextContent(/^prod runs an older rupu/);
+    expect(await screen.findByTestId('host-alert')).toHaveTextContent("prod can't filter by customer: its runs are left out");
+  });
+
+  it('names the hosts the X-Rupu-Hosts-Without-Customer header lists, by name', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getAgentRuns').mockImplementation((p) => {
+      if (p?.host === 'local') p.onHeaders?.({ withoutCustomer: ['host_prod'], unfilterable: [] });
+      return Promise.resolve([]);
+    });
+    render(
+      <MemoryRouter initialEntries={[scopedEntry('acme')]}>
+        {withCustomerScope(<AgentRuns />)}
+      </MemoryRouter>,
+    );
+    expect(await screen.findByTestId('host-alert')).toHaveTextContent("prod can't filter by customer: its runs are left out");
+  });
+
+  it('an unscoped page sends no customer', async () => {
+    stubDeps();
+    const spy = vi.spyOn(api, 'getAgentRuns').mockImplementation(onlyHost('local', []));
+    renderPage();
+    await waitFor(() => expect(callsFor(spy, 'local').length).toBeGreaterThan(0));
+    expect(callsFor(spy, 'local')[0][0]).not.toHaveProperty('customer');
+    expect(screen.queryByTestId('host-alert')).not.toBeInTheDocument();
   });
 });
 

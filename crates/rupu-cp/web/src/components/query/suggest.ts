@@ -12,6 +12,8 @@ export interface FacetValue {
   value: string;
   /** Rows with the value; absent for a value offered without a count. */
   count?: number;
+  /** Shown beside the count (a host's name and state). */
+  detail?: string;
 }
 
 export interface Suggestion {
@@ -111,6 +113,7 @@ export function suggest(
     if (op !== ':' && prefix !== '') return [];
     const offered = facets?.[field.key] ?? [];
     const counts = new Map(offered.filter((f) => f.count !== undefined).map((f) => [f.value, f.count as number]));
+    const details = new Map(offered.filter((f) => f.detail).map((f) => [f.value, f.detail as string]));
     // Compare canonical forms, as the query does: `Needs-Poc` already chose
     // `needs-poc`, `79` already chose `CWE-79`, and `owner:"payments team"`
     // already chose "Payments Team".
@@ -134,7 +137,7 @@ export function suggest(
         id: `v:${x.value}`,
         kind: 'value' as const,
         label: x.value,
-        detail: counts.has(x.value) ? String(x.count) : undefined,
+        detail: [details.get(x.value), counts.has(x.value) ? String(x.count) : undefined].filter(Boolean).join(' · ') || undefined,
         insert: `${sign}${field.key}${op}${prefix}${quoteValue(x.value)}`,
         commit: true,
         field,

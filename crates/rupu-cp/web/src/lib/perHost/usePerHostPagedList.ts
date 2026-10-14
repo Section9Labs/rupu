@@ -25,9 +25,25 @@ export const REMOTE_POLL_MS = 60_000;
 
 const LOCAL_SEED: HostSeed = { id: 'local', name: 'Local', transport_kind: 'local' };
 
+/** Which of the registered hosts an every-host list queries: the ones
+ *  `include` names (all when null) except the ones `exclude` names. Ids
+ *  compare ignoring case. */
+export interface HostPick {
+  include: readonly string[] | null;
+  exclude: readonly string[];
+}
+
+export function picksHost(pick: HostPick | null | undefined, id: string): boolean {
+  if (!pick) return true;
+  const i = id.toLowerCase();
+  return (pick.include === null || pick.include.some((x) => x.toLowerCase() === i)) && !pick.exclude.some((x) => x.toLowerCase() === i);
+}
+
 export interface UsePerHostPagedListOptions<T> {
   /** One host id, or `null` for every registered host. */
   host: string | null;
+  /** With `host: null`, the registered hosts to query (all when absent). */
+  pick?: HostPick | null;
   fetch: (p: PerHostFetchParams) => Promise<T[]>;
   timeField: keyof T & string;
   idField: keyof T & string;
@@ -39,6 +55,8 @@ export interface UsePerHostPagedListOptions<T> {
 export interface UsePerHostPagedListResult<T> {
   rows: T[];
   slices: HostSlice<T>[];
+  /** Every registered host (with `host: null`), queried or not. */
+  registered: HostSeed[];
   /** True until the host list is known and at least one host has answered. */
   loading: boolean;
   /** Set when the host list could not be read, or when EVERY host failed. */
@@ -56,6 +74,7 @@ const toSeed = <T>(s: HostSlice<T>): HostSeed => ({ id: s.hostId, name: s.name, 
 
 export function usePerHostPagedList<T extends HostTagged>({
   host,
+  pick = null,
   fetch,
   timeField,
   idField,
@@ -69,9 +88,12 @@ export function usePerHostPagedList<T extends HostTagged>({
   fetchRef.current = fetch;
   const hostRef = useRef(host);
   hostRef.current = host;
+  const pickRef = useRef(pick);
+  pickRef.current = pick;
+  const picked = (hs: readonly HostSeed[]) => hs.filter((h) => picksHost(pickRef.current, h.id));
   const access = useMemo(() => rowAccess<T>(timeField, idField), [timeField, idField]);
 
-  const allDeps = [host, ...deps];
+  const allDeps = [host, pick ? JSON.stringify(pick) : null, ...deps];
   const prevDepsRef = useRef<unknown[]>([]);
   const genRef = useRef(0);
   if (allDeps.length !== prevDepsRef.current.length || allDeps.some((d, i) => !Object.is(d, prevDepsRef.current[i]))) {
@@ -81,6 +103,7 @@ export function usePerHostPagedList<T extends HostTagged>({
   const gen = genRef.current;
 
   const [slices, setSlices] = useState<HostSlice<T>[]>([]);
+  const [registered, setRegistered] = useState<HostSeed[]>([]);
   const [hostsKnown, setHostsKnown] = useState(false);
   const [listError, setListError] = useState<string | null>(null);
   const engineRef = useRef<PerHostListEngine<T> | null>(null);
@@ -112,13 +135,15 @@ export function usePerHostPagedList<T extends HostTagged>({
       api.getRegisteredHosts().then(
         (hs) => {
           if (engineRef.current !== engine) return;
-          engine.start(hs);
+          setRegistered(hs);
+          engine.start(picked(hs));
           setHostsKnown(true);
         },
         (e: unknown) => {
           if (engineRef.current !== engine) return;
           setListError(`Could not list hosts (${apiErrorMessage(e)}); showing this host only.`);
-          engine.start([LOCAL_SEED]);
+          setRegistered([LOCAL_SEED]);
+          engine.start(picked([LOCAL_SEED]));
           setHostsKnown(true);
         },
       );
@@ -172,7 +197,8 @@ export function usePerHostPagedList<T extends HostTagged>({
         if (engineRef.current !== engine) return;
         // The host list is readable again: "showing this host only" is no longer true.
         setListError(null);
-        engine.reconcile(hs);
+        setRegistered(hs);
+        engine.reconcile(picked(hs));
       },
       () => {
         if (engineRef.current === engine) engine.reconcile(engine.current.map(toSeed));
@@ -186,6 +212,7 @@ export function usePerHostPagedList<T extends HostTagged>({
   return {
     rows: merged.visible,
     slices,
+    registered,
     loading,
     error,
     hasMore: merged.hasMore,

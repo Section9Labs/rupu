@@ -16,7 +16,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-// Real SessionSummary fixture — active scope (default tab).
+// Real SessionSummary fixture — an active session (the list's default).
 const ACTIVE_SESSION: SessionSummary = {
     codename: 'cobalt-harbor/heron#1', codename_derived: false,
   session_id: 'sess-abc123',
@@ -99,20 +99,20 @@ describe('Sessions row archive/delete', () => {
     expect(del).not.toHaveBeenCalled();
   });
 
-  it('restores an archived session from the Archived tab row action', async () => {
+  it('restores an archived session (is:archived) from the row action', async () => {
     stubHosts();
-    // First call (active tab): empty; second call (archived tab): one archived session.
-    vi.spyOn(api, 'getSessions')
-      .mockResolvedValueOnce([])
-      .mockResolvedValue([ARCHIVED_SESSION]);
+    const list = vi.spyOn(api, 'getSessions').mockResolvedValue([ARCHIVED_SESSION]);
     const restore = vi.spyOn(api, 'restoreSession').mockResolvedValue();
 
-    renderPage();
-
-    // Switch to the Archived tab.
-    fireEvent.click(await screen.findByRole('button', { name: 'Archived' }));
+    render(
+      <MemoryRouter initialEntries={['/sessions?q=is:archived']}>
+        {withCustomerScope(<Sessions />)}
+      </MemoryRouter>,
+    );
 
     fireEvent.click(await screen.findByRole('button', { name: /restore session/i }));
+    expect(screen.queryByRole('button', { name: /archive session/i })).not.toBeInTheDocument();
+    expect(list).toHaveBeenCalledWith(expect.objectContaining({ q: 'is:archived' }));
     await waitFor(() => expect(restore).toHaveBeenCalledWith('sess-abc123', 'local'));
   });
 

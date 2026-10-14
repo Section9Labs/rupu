@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { api, ApiError, parseCustomerConflict, parseHostsWithoutCustomer } from './api';
+import { api, ApiError, parseCustomerConflict, parseHostsWithoutCustomer, queryErrorOf } from './api';
 
 function mockFetch(status: number, body: unknown) {
   const text = typeof body === 'string' ? body : JSON.stringify(body);
@@ -198,9 +198,6 @@ describe('X-Rupu-Hosts-Without-Customer', () => {
   it('hands the header to the sink of every scoped list it can name hosts on', async () => {
     const calls: Array<[string, (sink: (ids: string[]) => void) => Promise<unknown>]> = [
       ['runs', (sink) => api.getRuns({ customer: 'acme', onHostsWithoutCustomer: sink })],
-      ['workflows', (sink) => api.getWorkflowRuns({ customer: 'acme', onHostsWithoutCustomer: sink })],
-      ['agents', (sink) => api.getAgentRuns({ customer: 'acme', onHostsWithoutCustomer: sink })],
-      ['sessions', (sink) => api.getSessions({ customer: 'acme', onHostsWithoutCustomer: sink })],
       ['usage runs', (sink) => api.getUsageRuns(undefined, undefined, 'acme', sink)],
       ['outliers', (sink) => api.getUsageOutliers(undefined, 'acme', sink)],
     ];
@@ -213,21 +210,58 @@ describe('X-Rupu-Hosts-Without-Customer', () => {
     }
   });
 
-  it('reports [] when the header is absent, and nothing on a failure', async () => {
+  it('hands a query list both left-out-host headers', async () => {
+    const calls: Array<[string, (sink: (h: unknown) => void) => Promise<unknown>]> = [
+      ['workflows', (sink) => api.getWorkflowRuns({ customer: 'acme', onHeaders: sink })],
+      ['agents', (sink) => api.getAgentRuns({ q: 'status:ok', onHeaders: sink })],
+      ['sessions', (sink) => api.getSessions({ customer: 'acme', onHeaders: sink })],
+    ];
+    for (const [name, call] of calls) {
+      const fn = mockFetchWithHeader('mini', [{ id: 'r1' }]);
+      fn.mockResolvedValue({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        headers: new Headers({ 'X-Rupu-Hosts-Without-Customer': 'mini', 'X-Rupu-Hosts-Unfilterable': 'ssh:is,old:status' }),
+        text: () => Promise.resolve(JSON.stringify([{ id: 'r1' }])),
+      });
+      const sink = vi.fn();
+      expect(await call(sink), name).toEqual([{ id: 'r1' }]);
+      expect(sink, name).toHaveBeenCalledWith({
+        withoutCustomer: ['mini'],
+        unfilterable: [
+          { host: 'ssh', field: 'is' },
+          { host: 'old', field: 'status' },
+        ],
+      });
+    }
+  });
+
+  it('reports no hosts when the headers are absent, and nothing on a failure', async () => {
     mockFetchWithHeader(null);
     const sink = vi.fn();
-    await api.getWorkflowRuns({ customer: 'acme', onHostsWithoutCustomer: sink });
-    expect(sink).toHaveBeenCalledWith([]);
+    await api.getWorkflowRuns({ customer: 'acme', onHeaders: sink });
+    expect(sink).toHaveBeenCalledWith({ withoutCustomer: [], unfilterable: [] });
 
     vi.stubGlobal(
       'fetch',
       vi.fn().mockResolvedValue({ ok: false, status: 400, statusText: 'Bad', text: () => Promise.resolve('{"error":"customer: bad"}') }),
     );
     const failed = vi.fn();
-    await expect(api.getWorkflowRuns({ customer: 'BAD', onHostsWithoutCustomer: failed })).rejects.toMatchObject({
+    await expect(api.getWorkflowRuns({ customer: 'BAD', onHeaders: failed })).rejects.toMatchObject({
       status: 400,
     });
     expect(failed).not.toHaveBeenCalled();
+  });
+});
+
+describe('queryErrorOf', () => {
+  it('reads a list query parse error, and nothing else', () => {
+    const body = { error: 'unknown key `colour`', token: 1, code: 'unknown_key', start: 9, end: 19 };
+    expect(queryErrorOf(new ApiError(400, 'x', JSON.stringify(body)))).toEqual(body);
+    expect(queryErrorOf(new ApiError(400, 'x', '{"error":"customer: bad"}'))).toBeNull();
+    expect(queryErrorOf(new ApiError(502, 'x', JSON.stringify(body)))).toBeNull();
+    expect(queryErrorOf(new Error('x'))).toBeNull();
   });
 });
 

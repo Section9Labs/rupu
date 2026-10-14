@@ -144,7 +144,7 @@ describe('filterRows', () => {
     const r = filterRows(ROWS, 'colour:red', FIELDS);
     expect(r.rows.map((x) => x.id)).toEqual(['a', 'b', 'c', 'd']);
     expect(r.error).toBe('unknown key `colour` (quote the text to search for it)');
-    expect(filterRows(ROWS, 'level:huge', FIELDS).error).toBe('`huge` is not a level (one of low, medium, high, critical)');
+    expect(filterRows(ROWS, 'level:huge', FIELDS).error).toBe('`huge` is not a value of `level:` (one of low, medium, high, critical)');
   });
 });
 

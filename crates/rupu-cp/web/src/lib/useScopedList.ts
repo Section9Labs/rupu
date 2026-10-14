@@ -18,13 +18,14 @@
 //   cleared whenever `resetKey` changes (a different filter is a fresh list).
 
 import { useCallback, useMemo, useRef, useState } from 'react';
-import { ApiError, apiErrorMessage, type CustomerScope, type HostsWithoutCustomerSink } from './api';
+import { ApiError, apiErrorMessage, queryErrorOf, type CustomerScope, type HostsWithoutCustomerSink } from './api';
 import { useCustomerScope } from './customerScope';
 
 /** A 400 whose message is about the `customer` param: the backend rejected
- *  the scope (`customer: <why>`), not some other part of the request. */
+ *  the scope (`customer: <why>`), not some other part of the request (a list
+ *  query that names `customer` and doesn't parse is the query's error). */
 export function isScopeRejection(e: unknown): boolean {
-  return e instanceof ApiError && e.status === 400 && /customer/i.test(apiErrorMessage(e));
+  return e instanceof ApiError && e.status === 400 && queryErrorOf(e) === null && /customer/i.test(apiErrorMessage(e));
 }
 
 /** The one-line notice shown when the backend rejects the scope. */

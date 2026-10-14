@@ -1,10 +1,12 @@
-// Sessions list — agent sessions tracked by the control plane. Active /
-// Archived FilterPills group (Active is the default) + a host scope select;
-// fetch/paginate/poll is owned by `usePerHostPagedList` (per-host progressive
-// loading, spec 2026-10-01): All hosts by default, local paints at once and
-// each remote merges in as it answers. Active polls (local every 5 s, remotes
-// every 60 s, page 0 only, spliced back over the head of the list, same as
-// WorkflowRuns/AgentRuns' "Running" tab). Each row links to /sessions/:id.
+// Sessions list — agent sessions tracked by the control plane. One query
+// line filters the list, and the server evaluates it (`?q=` on every
+// request, `SESSION_FIELDS`); with no `is:` term it lists the active
+// sessions, as the Active pill did (`is:archived` the archive,
+// `is:active,archived` both). Fetch/paginate/poll is owned by
+// `usePerHostQueryList`: every host the query's `host:` terms allow, local
+// painting at once and each remote merging in as it answers; host health is
+// in the `host:` suggestions and one quiet line under the bar. Each row links
+// to /sessions/:id.
 //
 // Column order + status glyph now match the canonical run-table standard
 // (`docs/superpowers/plans/2026-07-24-rupu-cp-table-standardization.md`
@@ -15,38 +17,30 @@
 // exact-match-or-neutral-fallback (never coerces an unrecognized status onto
 // a real state; see `components/StatusPill.tsx`).
 //
-// Find (2026-07-23 operator feedback amendment #1): a `SearchInput` in the
-// FilterBar's search slot narrows the loaded rows client-side, live per
-// keystroke, over agent name / session id / host id — composing with (not
-// replacing) the Active/Archived pill above it.
-//
 // Customer scope (customers Plan 2B): the list follows the global scope
-// (`useScopedList`; `?customer=` on every per-host request), so the v1 route
-// and the v2 Activity tab both pick it up. A remote host that can't filter
-// (501) is an unavailable slice, and `HostsWithoutCustomerBanner` names it
-// along with the hosts the `X-Rupu-Hosts-Without-Customer` header lists. A
-// scope the backend rejects (400) is cleared with a notice.
+// (`useScopedList`; `?customer=` on every per-host request, AND-ed with the
+// query). A scope the backend rejects (400) is cleared with a notice.
 
 import { useCallback, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { MessageSquare, RefreshCw } from 'lucide-react';
-import { api, type SessionSummary } from '../lib/api';
+import { api, type ListQueryOpts, type SessionSummary } from '../lib/api';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import UsageBarChart from '../components/charts/UsageBarChart';
 import { Button } from '../components/ui/Button';
-import { FilterBar } from '../components/ui/FilterBar';
-import { FilterPills, type FilterPillOption } from '../components/ui/FilterPills';
-import { SearchInput } from '../components/ui/SearchInput';
 import { EmptyState } from '../components/ui/EmptyState';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
 import { Spinner } from '../components/ui/Spinner';
-import HostSelect, { ALL_HOSTS } from '../components/HostSelect';
 import { SessionStatusPill } from '../components/StatusPill';
 import { AgentName } from '../components/codename/AgentName';
 import { memberLabel } from '../lib/codename';
-import { usePerHostPagedList, type PerHostFetchParams } from '../lib/perHost/usePerHostPagedList';
-import { PerHostFooter, PerHostStrip, perHostFooterText } from '../components/lists/PerHostStatus';
-import { noHostAnswered, notIncluded, waitingLabel } from '../lib/perHost/status';
+import type { PerHostFetchParams } from '../lib/perHost/usePerHostPagedList';
+import { noHostAnswered, waitingLabel } from '../lib/perHost/status';
+import { usePerHostQueryList } from '../lib/query/usePerHostQueryList';
+import { SESSION_FIELDS, sessionsQuery } from '../lib/query/lists/sessions';
+import { ListQueryBar, NoMatches, useListQuery } from '../components/query/ListQueryBar';
+import { hostAlerts } from '../components/query/hostAlerts';
+import { ListFooter } from '../components/lists/ListFooter';
 import { cn } from '../lib/cn';
 import { durationBetween, relativeTime } from '../lib/time';
 import { formatTokens, formatCost } from '../lib/usage';
@@ -54,14 +48,6 @@ import { sessionStatusDisplayLabel } from '../lib/sessionStatus';
 import { shortId } from '../lib/shortId';
 import { useScopedList } from '../lib/useScopedList';
 import { PricingErrorMark } from '../components/customers/PricingErrorMark';
-import { HostsWithoutCustomerBanner } from '../components/customers/HostsWithoutCustomerBanner';
-
-type Tab = 'active' | 'archived';
-
-const TAB_OPTIONS: FilterPillOption[] = [
-  { value: 'active', label: 'Active' },
-  { value: 'archived', label: 'Archived' },
-];
 
 /** Build the detail link for a session, including ?host= for remote sessions
  *  (mirrors WorkflowRuns.tsx's `runHref`). */
@@ -75,64 +61,30 @@ function sessionHref(s: SessionSummary): string {
 
 export default function Sessions() {
   const navigate = useNavigate();
-  const [tab, setTab] = useState<Tab>('active');
-  // All hosts by default: local paints at once, each remote merges in as it
-  // answers (usePerHostPagedList). A picked host lists only that host.
-  const [hostFilter, setHostFilter] = useState<string>(ALL_HOSTS);
+  const [q, setQ] = useListQuery();
   // Row-action (archive/restore/delete) failures — kept separate from the
   // list-fetch error the hook owns, but shown in the same banner.
   const [actionError, setActionError] = useState<string | null>(null);
-  const [query, setQuery] = useState('');
-  const scoped = useScopedList(undefined, [tab, hostFilter]);
+  const scoped = useScopedList(undefined, []);
   const { customer } = scoped;
 
   const fetchRows = useCallback(
-    ({ host, offset, limit, signal }: PerHostFetchParams) =>
-      customer
-        ? scoped.guard(
-            api.getSessions({
-              scope: tab,
-              offset,
-              limit,
-              host,
-              signal,
-              customer,
-              onHostsWithoutCustomer: scoped.reportHosts(host, offset),
-            }),
-          )
-        : api.getSessions({ scope: tab, offset, limit, host, signal }),
-    [tab, customer, scoped.guard, scoped.reportHosts],
+    (p: PerHostFetchParams & ListQueryOpts) =>
+      customer ? scoped.guard(api.getSessions({ ...p, customer })) : api.getSessions(p),
+    [customer, scoped.guard],
   );
-  const { rows, slices, loading, error, hasMore, sentinelRef, refresh, refreshHost, removeRow, retryPaging, ended } =
-    usePerHostPagedList<SessionSummary>({
-      host: hostFilter === ALL_HOSTS ? null : hostFilter,
+  const { rows, slices, loading, error, hasMore, sentinelRef, refresh, refreshHost, removeRow, retryPaging, ended, facets, queryError, notes } =
+    usePerHostQueryList<SessionSummary>({
+      q: sessionsQuery(q),
+      fields: SESSION_FIELDS,
+      scope: [customer],
       fetch: fetchRows,
       timeField: 'updated_at',
       idField: 'session_id',
-      deps: [tab, customer],
-      poll: tab === 'active',
+      poll: true,
     });
-
-  // Find — case-insensitive substring across the fields this table actually
-  // renders: agent name (subject), session id, and host id. Composes with
-  // (narrows within) the Active/Archived pill above.
-  const q = query.trim().toLowerCase();
-  const visible = q
-    ? rows.filter((r) =>
-        [r.agent_name, r.session_id, r.host_id, r.codename]
-          .filter((v): v is string => Boolean(v))
-          .some((v) => v.toLowerCase().includes(q)),
-      )
-    : rows;
-
-  // Honest per-host states (spec §8): never claim "nothing" while a host is still loading, and
-  // keep the sentinel mounted whenever rows have loaded, even if Find hides all of them, so
-  // scrolling keeps loading (a later page may match).
+  // Never claim "nothing" while a host is still loading.
   const waiting = waitingLabel(slices);
-  const missing = notIncluded(slices);
-  // With every loaded row filtered out the page shows "No matches yet · Waiting on X…" itself, so
-  // the footer (still mounted, to keep paging) does not repeat it.
-  const listFooter = perHostFooterText({ slices, loading, hasMore, ended, count: rows.length, waitingShown: visible.length === 0 });
 
   // Row-level archive / restore / delete — each drops the row and re-syncs
   // just its host after success.
@@ -177,8 +129,8 @@ export default function Sessions() {
     }
   }
 
-  // Action column — changes shape based on the current tab (active vs archived).
-  const actionColumn = buildActionColumn(tab, navigate, handleRowArchive, handleRowRestore, handleRowDelete);
+  // Action column — an archived session restores, an active one archives.
+  const actionColumn = buildActionColumn(navigate, handleRowArchive, handleRowRestore, handleRowDelete);
   const columns: Column<SessionSummary>[] = [...SESSION_BASE_COLUMNS, actionColumn];
   const bannerError = error ?? actionError;
 
@@ -198,31 +150,16 @@ export default function Sessions() {
         </Button>
       </header>
 
-      <div className="mb-5">
-        <FilterBar
-          filters={<FilterPills options={TAB_OPTIONS} value={tab} onChange={(v) => setTab(v as Tab)} />}
-          search={
-            <SearchInput
-              aria-label="Find sessions"
-              placeholder="Find sessions…"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Escape') setQuery('');
-              }}
-            />
-          }
-          scope={<HostSelect allowAll ariaLabel="Host filter" value={hostFilter} onChange={setHostFilter} />}
-        />
-      </div>
-      <PerHostStrip slices={slices} />
-      {customer && (
-        <HostsWithoutCustomerBanner
-          className="mb-4"
-          hosts={slices.map((sl) => ({ id: sl.hostId, name: sl.name, state: sl.state, reason: sl.reason }))}
-          without={scoped.hostsWithoutCustomer}
-        />
-      )}
+      <ListQueryBar
+        value={q}
+        onChange={setQ}
+        fields={SESSION_FIELDS}
+        facets={facets}
+        label="Filter sessions"
+        placeholder="Active sessions · agent:recon · is:archived"
+        error={queryError}
+        alerts={hostAlerts(notes, 'sessions', retryPaging)}
+      />
 
       {bannerError && <ErrorBanner className="mb-4">{bannerError}</ErrorBanner>}
 
@@ -234,42 +171,23 @@ export default function Sessions() {
         <div className="py-16 flex items-center justify-center">
           <Spinner label={waiting} />
         </div>
+      ) : rows.length === 0 && noHostAnswered(slices) ? (
+        <EmptyState title="No hosts answered" hint="Every host is offline or can't serve this list; the line under the query says which." />
       ) : rows.length === 0 ? (
-        <EmptyState
-          icon={<MessageSquare size={20} />}
-          title={
-            noHostAnswered(slices)
-              ? 'No hosts answered'
-              : missing
-                ? 'No sessions on the hosts that answered'
-                : tab === 'active'
-                  ? 'No active sessions'
-                  : 'No archived sessions'
-          }
-          hint={
-            missing
-              ? `Not included: ${missing}.`
-              : tab === 'active'
-                ? 'Active sessions appear here once an agent conversation is started against this control plane.'
-                : 'Archived sessions appear here once an active conversation is closed.'
-          }
-        />
-      ) : visible.length === 0 ? (
-        <>
-          {waiting ? (
-            <div className="py-16 flex items-center justify-center">
-              <Spinner label={`No matches yet · ${waiting}`} />
-            </div>
-          ) : (
-            <EmptyState title="No matches" hint={`No sessions match "${query}".`} />
-          )}
-          <PerHostFooter sentinelRef={sentinelRef} text={listFooter} slices={slices} onRetry={retryPaging} />
-        </>
+        q.trim() ? (
+          <NoMatches noun="sessions" />
+        ) : (
+          <EmptyState
+            icon={<MessageSquare size={20} />}
+            title="No active sessions"
+            hint="Active sessions appear here once an agent conversation is started against this control plane; is:archived lists closed ones."
+          />
+        )
       ) : (
         <div className="space-y-6">
-          {visible.some((s) => s.usage) && (
+          {rows.some((s) => s.usage) && (
             <div className="bg-panel border border-border rounded-xl shadow-card px-4 py-3">
-              <UsageBarChart bars={visible.filter((s) => s.usage).map((s) => {
+              <UsageBarChart bars={rows.filter((s) => s.usage).map((s) => {
                 const hostSuffix = s.host_id && s.host_id !== 'local'
                   ? `?host=${encodeURIComponent(s.host_id)}`
                   : '';
@@ -287,16 +205,11 @@ export default function Sessions() {
               header re-sorts client-side. */}
           <SortableTable<SessionSummary>
             columns={columns}
-            rows={visible}
+            rows={rows}
             rowKey={(s) => `${s.host_id ?? 'local'}:${s.session_id}`}
             rowHref={sessionHref}
           />
-          <PerHostFooter
-            sentinelRef={sentinelRef}
-            text={q ? `${visible.length} matches of ${rows.length} loaded` : listFooter}
-            slices={slices}
-            onRetry={retryPaging}
-          />
+          <ListFooter sentinelRef={sentinelRef} loading={loading} hasMore={hasMore} ended={ended} count={rows.length} />
         </div>
       )}
     </div>
@@ -460,7 +373,6 @@ const SESSION_BASE_COLUMNS: Column<SessionSummary>[] = [
 
 /** Build the per-row action column. Recreated whenever the tab changes. */
 function buildActionColumn(
-  tab: Tab,
   navigate: ReturnType<typeof useNavigate>,
   onArchive: (id: string, host?: string) => void,
   onRestore: (id: string, host?: string) => void,
@@ -499,7 +411,7 @@ function buildActionColumn(
             active run
           </button>
         )}
-        {tab === 'active' ? (
+        {s.scope !== 'archived' ? (
           <Button
             variant="ring"
             onClick={() => onArchive(s.session_id, s.host_id)}

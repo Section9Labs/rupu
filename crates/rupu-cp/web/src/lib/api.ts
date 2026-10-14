@@ -138,6 +138,92 @@ async function requestMaybeReportingHosts<T>(
   return body;
 }
 
+/** The response header naming the hosts a list query left out because their
+ *  rows can't report a field it reads (other than `customer`), as
+ *  comma-separated `<host>:<field>` (docs/cp-api.md, `q`). */
+export const HOSTS_UNFILTERABLE_HEADER = 'X-Rupu-Hosts-Unfilterable';
+
+/** The hosts a list response says it left out. */
+export interface ListHeaders {
+  /** `X-Rupu-Hosts-Without-Customer`: host ids. */
+  withoutCustomer: string[];
+  /** `X-Rupu-Hosts-Unfilterable`: each host and the field it can't report. */
+  unfilterable: { host: string; field: string }[];
+}
+
+/** Value counts per facet field over a list's scope before `q`
+ *  (`field → value → rows`). */
+export type ServerFacets = Record<string, Record<string, number>>;
+
+/** A `?facets=1` answer's counts; `partial` when some remote host's rows were
+ *  read one page only. */
+export interface ListFacets {
+  facets: ServerFacets;
+  partial: boolean;
+}
+
+/** What a server-filtered list call takes beyond paging. */
+export interface ListQueryOpts {
+  /** The list query (`?q=`); blank sends none. */
+  q?: string;
+  /** Ask for `?facets=1` and receive its counts. */
+  onFacets?: (f: ListFacets) => void;
+  /** Receives the hosts the response says it left out. */
+  onHeaders?: (h: ListHeaders) => void;
+}
+
+export function parseListHeaders(headers: Headers | undefined): ListHeaders {
+  const unfilterable = (headers?.get(HOSTS_UNFILTERABLE_HEADER) ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((s) => {
+      const at = s.lastIndexOf(':');
+      return at < 0 ? { host: s, field: '' } : { host: s.slice(0, at), field: s.slice(at + 1) };
+    });
+  return { withoutCustomer: parseHostsWithoutCustomer(headers?.get(HOSTS_WITHOUT_CUSTOMER_HEADER)), unfilterable };
+}
+
+/** GET a server-filtered list: `query` plus the `q` / `facets` the options
+ *  ask for. The rows come back either way; a `?facets=1` answer's counts and
+ *  the left-out-host headers go to their sinks. */
+async function requestList<T>(path: string, query: URLSearchParams, opts: ListQueryOpts & Cancellable): Promise<T[]> {
+  if (opts.q?.trim()) query.set('q', opts.q.trim());
+  if (opts.onFacets) query.set('facets', '1');
+  const qs = query.toString();
+  const { body, headers } = await fetchJson<T[] | { rows: T[]; facets: ServerFacets; facets_partial?: boolean }>(
+    `${path}${qs ? `?${qs}` : ''}`,
+    { signal: opts.signal },
+  );
+  opts.onHeaders?.(parseListHeaders(headers));
+  if (Array.isArray(body)) return body;
+  opts.onFacets?.({ facets: body.facets ?? {}, partial: body.facets_partial === true });
+  return body.rows;
+}
+
+/** A list query the server could not parse: the 400 body
+ *  `{error, token, code, start, end}`. */
+export interface QueryErrorBody {
+  error: string;
+  token: number;
+  code: string;
+  start: number;
+  end: number;
+}
+
+/** The parse error a list request failed with, or null for any other failure. */
+export function queryErrorOf(e: unknown): QueryErrorBody | null {
+  if (!(e instanceof ApiError) || e.status !== 400) return null;
+  try {
+    const b = JSON.parse(e.body) as Partial<QueryErrorBody>;
+    return typeof b.error === 'string' && typeof b.token === 'number' && typeof b.code === 'string'
+      ? (b as QueryErrorBody)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 /** The bytes of a finding-report export response. A non-2xx throws an
  *  `ApiError`; a `Content-Disposition` filename comes back as the `File`'s
  *  name (a `File` is a `Blob`). Lives beside `request` because these
@@ -522,6 +608,8 @@ export interface RunListRow {
   /** Originating host id — `"local"` for runs on this CP; a remote host id
    *  for proxied runs. Absent on older server versions (treat as `"local"`). */
   host_id?: string;
+  /** True on a row from the archive (`is:archived`). */
+  archived?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -2678,12 +2766,11 @@ export interface Cancellable {
   signal?: AbortSignal;
 }
 
-function listQuery(params?: ListParams): string {
+function pageQuery(params?: ListParams): URLSearchParams {
   const q = new URLSearchParams();
   if (params?.offset != null) q.set('offset', String(params.offset));
   if (params?.limit != null) q.set('limit', String(params.limit));
-  const qs = q.toString();
-  return qs ? `?${qs}` : '';
+  return q;
 }
 
 // ---------------------------------------------------------------------------
@@ -3020,11 +3107,6 @@ export const api = {
       method: 'DELETE',
     });
   },
-  /** List archived runs. Pass `kind = 'workflow'` to restrict to workflow-kind only. */
-  getArchivedRuns(kind?: string): Promise<RunListRow[]> {
-    const qs = kind ? `?kind=${encodeURIComponent(kind)}` : '';
-    return request<RunListRow[]>(`/api/runs/archived${qs}`);
-  },
   getRunUsageTimeline(id: string, opts?: { host?: string }): Promise<UsageTimelinePoint[]> {
     const qs = opts?.host ? `?host=${encodeURIComponent(opts.host)}` : '';
     return request<UsageTimelinePoint[]>(`/api/runs/${encodeURIComponent(id)}/usage-timeline${qs}`);
@@ -3084,26 +3166,14 @@ export const api = {
     return request<SessionRunRow[]>(`/api/sessions/${encodeURIComponent(id)}/runs${qs}`);
   },
   getWorkflowRuns(
-    params?: ListParams & Cancellable & {
-      lifecycle?: 'active' | 'completed' | 'failed';
-      host?: string;
-      customer?: CustomerScope;
-      /** Receives the `X-Rupu-Hosts-Without-Customer` header's host ids. */
-      onHostsWithoutCustomer?: HostsWithoutCustomerSink;
-    },
+    params?: ListParams & Cancellable & ListQueryOpts & { host?: string; customer?: CustomerScope },
   ): Promise<RunListRow[]> {
     const q = new URLSearchParams();
     if (params?.offset != null) q.set('offset', String(params.offset));
     if (params?.limit != null) q.set('limit', String(params.limit));
-    if (params?.lifecycle) q.set('lifecycle', params.lifecycle);
     if (params?.host) q.set('host', params.host);
     setCustomer(q, params?.customer);
-    const qs = q.toString();
-    return requestMaybeReportingHosts<RunListRow[]>(
-      `/api/runs/workflows${qs ? `?${qs}` : ''}`,
-      { signal: params?.signal },
-      params?.onHostsWithoutCustomer,
-    );
+    return requestList<RunListRow>('/api/runs/workflows', q, params ?? {});
   },
   getAutoflowRuns(params?: ListParams & Cancellable & { host?: string }): Promise<AutoflowCycleRow[]> {
     const q = new URLSearchParams();
@@ -3222,26 +3292,14 @@ export const api = {
     });
   },
   getAgentRuns(
-    params?: ListParams & Cancellable & {
-      lifecycle?: 'active' | 'completed' | 'failed';
-      host?: string;
-      customer?: CustomerScope;
-      /** Receives the `X-Rupu-Hosts-Without-Customer` header's host ids. */
-      onHostsWithoutCustomer?: HostsWithoutCustomerSink;
-    },
+    params?: ListParams & Cancellable & ListQueryOpts & { host?: string; customer?: CustomerScope },
   ): Promise<AgentRunRow[]> {
     const q = new URLSearchParams();
     if (params?.offset != null) q.set('offset', String(params.offset));
     if (params?.limit != null) q.set('limit', String(params.limit));
-    if (params?.lifecycle) q.set('lifecycle', params.lifecycle);
     if (params?.host) q.set('host', params.host);
     setCustomer(q, params?.customer);
-    const qs = q.toString();
-    return requestMaybeReportingHosts<AgentRunRow[]>(
-      `/api/runs/agents${qs ? `?${qs}` : ''}`,
-      { signal: params?.signal },
-      params?.onHostsWithoutCustomer,
-    );
+    return requestList<AgentRunRow>('/api/runs/agents', q, params ?? {});
   },
   getAutoflowDefs(): Promise<AutoflowDefRow[]> {
     return request<AutoflowDefRow[]>('/api/autoflows');
@@ -3482,26 +3540,14 @@ export const api = {
 
   // --- Sessions ---
   getSessions(
-    params?: ListParams & Cancellable & {
-      scope?: 'active' | 'archived';
-      host?: string;
-      customer?: CustomerScope;
-      /** Receives the `X-Rupu-Hosts-Without-Customer` header's host ids. */
-      onHostsWithoutCustomer?: HostsWithoutCustomerSink;
-    },
+    params?: ListParams & Cancellable & ListQueryOpts & { host?: string; customer?: CustomerScope },
   ): Promise<SessionSummary[]> {
     const q = new URLSearchParams();
     if (params?.offset != null) q.set('offset', String(params.offset));
     if (params?.limit != null) q.set('limit', String(params.limit));
-    if (params?.scope) q.set('scope', params.scope);
     if (params?.host) q.set('host', params.host);
     setCustomer(q, params?.customer);
-    const qs = q.toString();
-    return requestMaybeReportingHosts<SessionSummary[]>(
-      `/api/sessions${qs ? `?${qs}` : ''}`,
-      { signal: params?.signal },
-      params?.onHostsWithoutCustomer,
-    );
+    return requestList<SessionSummary>('/api/sessions', q, params ?? {});
   },
   getSession(id: string, opts?: { host?: string }): Promise<SessionSummary> {
     const qs = opts?.host ? `?host=${encodeURIComponent(opts.host)}` : '';
@@ -3818,11 +3864,11 @@ export const api = {
   getProject(wsId: string): Promise<ProjectDetail> {
     return request<ProjectDetail>(`/api/projects/${encodeURIComponent(wsId)}`);
   },
-  getProjectRuns(wsId: string, params?: ListParams): Promise<RunListRow[]> {
-    return request<RunListRow[]>(`/api/projects/${encodeURIComponent(wsId)}/runs${listQuery(params)}`);
+  getProjectRuns(wsId: string, params?: ListParams & Cancellable & ListQueryOpts): Promise<RunListRow[]> {
+    return requestList<RunListRow>(`/api/projects/${encodeURIComponent(wsId)}/runs`, pageQuery(params), params ?? {});
   },
-  getProjectSessions(wsId: string, params?: ListParams): Promise<SessionSummary[]> {
-    return request<SessionSummary[]>(`/api/projects/${encodeURIComponent(wsId)}/sessions${listQuery(params)}`);
+  getProjectSessions(wsId: string, params?: ListParams & Cancellable & ListQueryOpts): Promise<SessionSummary[]> {
+    return requestList<SessionSummary>(`/api/projects/${encodeURIComponent(wsId)}/sessions`, pageQuery(params), params ?? {});
   },
   getProjectCoverage(wsId: string): Promise<ProjectCoverageRow[]> {
     return request<ProjectCoverageRow[]>(`/api/projects/${encodeURIComponent(wsId)}/coverage`);

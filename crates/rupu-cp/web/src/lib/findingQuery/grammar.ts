@@ -227,7 +227,7 @@ export function normalize(f: FieldSpec, v: string): { ok: true; value: string } 
       const l = asciiLower(v);
       return f.values.includes(l)
         ? { ok: true, value: l }
-        : { ok: false, message: `\`${v}\` is not a ${f.key} (one of ${f.values.join(', ')})` };
+        : { ok: false, message: `\`${v}\` is not a value of \`${f.key}:\` (one of ${f.values.join(', ')})` };
     }
     case 'tag': {
       const t = parseTag(v);

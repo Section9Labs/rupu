@@ -55,6 +55,21 @@ describe('usePerHostPagedList', () => {
     expect(result.current.slices.map((s) => s.state)).toEqual(['ok', 'ok']);
   });
 
+  it('asks only the hosts a pick allows, and still reports every registered host', async () => {
+    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL, REG_PROD]);
+    const fetch = vi.fn(() => Promise.resolve([] as Row[]));
+    const { result, rerender } = renderHook(({ exclude }: { exclude: string[] }) =>
+      usePerHostPagedList<Row>({ host: null, pick: { include: null, exclude }, fetch, timeField: 'started_at', idField: 'id', deps: [] }),
+      { initialProps: { exclude: ['LOCAL'] } },
+    );
+    await waitFor(() => expect(result.current.slices.map((s) => s.hostId)).toEqual(['host_prod']));
+    expect(fetch.mock.calls.map((c) => (c as unknown as [{ host: string }])[0].host)).toEqual(['host_prod']);
+    expect(result.current.registered.map((h) => h.id)).toEqual(['local', 'host_prod']);
+
+    rerender({ exclude: ['host_prod'] });
+    await waitFor(() => expect(result.current.slices.map((s) => s.hostId)).toEqual(['local']));
+  });
+
   it('single-host mode fetches without waiting on the host list, then shows the registered name', async () => {
     const hosts = deferred<RegisteredHostView[]>();
     vi.spyOn(api, 'getRegisteredHosts').mockReturnValue(hosts.promise);

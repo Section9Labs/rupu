@@ -46,13 +46,21 @@ describe('host param: getAgentRuns', () => {
     expect(fetchSpy.mock.calls[0][0]).toBe('/api/runs/agents?host=h1');
   });
 
-  it('combines lifecycle + host in query', async () => {
+  it('sends the list query as q, beside the host', async () => {
     mockFetch(200, []);
     const fetchSpy = vi.mocked(fetch);
-    await api.getAgentRuns({ lifecycle: 'active', host: 'h1' });
-    const url = fetchSpy.mock.calls[0][0] as string;
-    expect(url).toContain('lifecycle=active');
-    expect(url).toContain('host=h1');
+    await api.getAgentRuns({ host: 'h1', q: ' status:error since:7d ' });
+    expect(fetchSpy.mock.calls[0][0]).toBe('/api/runs/agents?host=h1&q=status%3Aerror+since%3A7d');
+  });
+
+  it('asks for facets when given a sink, and unwraps the rows', async () => {
+    mockFetch(200, { rows: [{ run_id: 'r1' }], facets: { status: { error: 2 } }, facets_partial: true });
+    const fetchSpy = vi.mocked(fetch);
+    const onFacets = vi.fn();
+    const rows = await api.getAgentRuns({ host: 'h1', onFacets });
+    expect(fetchSpy.mock.calls[0][0]).toBe('/api/runs/agents?host=h1&facets=1');
+    expect(rows).toEqual([{ run_id: 'r1' }]);
+    expect(onFacets).toHaveBeenCalledWith({ facets: { status: { error: 2 } }, partial: true });
   });
 });
 
@@ -125,13 +133,11 @@ describe('host param: getSessions', () => {
     expect(fetchSpy.mock.calls[0][0]).toBe('/api/sessions?host=h1');
   });
 
-  it('combines scope + host in query', async () => {
+  it('sends the list query as q, beside the host', async () => {
     mockFetch(200, []);
     const fetchSpy = vi.mocked(fetch);
-    await api.getSessions({ scope: 'active', host: 'h1' });
-    const url = fetchSpy.mock.calls[0][0] as string;
-    expect(url).toContain('scope=active');
-    expect(url).toContain('host=h1');
+    await api.getSessions({ host: 'h1', q: 'is:archived' });
+    expect(fetchSpy.mock.calls[0][0]).toBe('/api/sessions?host=h1&q=is%3Aarchived');
   });
 });
 

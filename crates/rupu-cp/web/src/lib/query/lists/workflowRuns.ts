@@ -1,14 +1,11 @@
 // The workflow-run list's query fields (`GET /api/runs/workflows?q=`,
 // `GET /api/projects/:ws_id/runs?q=`). The server evaluates them.
 import { Archive, CircleDot, Workflow, Zap } from 'lucide-react';
+import { parseToken, tokenize } from '../../findingQuery/grammar';
 import { serverField, type ServerField } from '../rows';
 import { CODENAME_FIELD, CUSTOMER_FIELD, HOST_FIELD, ID_FIELD, timeFields } from './shared';
 
 export const RUN_STATUSES = ['pending', 'running', 'awaiting_approval', 'paused', 'completed', 'failed', 'rejected', 'cancelled'];
-
-/** What the Workflow Runs page lists when the query names no `status:` (its
- *  old default, the Running tab). */
-export const ACTIVE_RUN_STATUSES = ['pending', 'running', 'awaiting_approval', 'paused'];
 
 export const WORKFLOW_RUN_FIELDS: ServerField[] = [
   serverField({ key: 'status', values: RUN_STATUSES, match: 'exact', facet: true, label: 'Status', description: 'status:failed · status:completed,cancelled', icon: CircleDot }),
@@ -21,3 +18,15 @@ export const WORKFLOW_RUN_FIELDS: ServerField[] = [
   ...timeFields('Started'),
   serverField({ key: 'is', values: ['archived'], match: 'exact', label: 'Is', description: 'is:archived (the archive, this host only)', icon: Archive }),
 ];
+
+/** Whether a positive `is:archived` term asks for the archive. */
+export function asksArchived(q: string): boolean {
+  const t = tokenize(q);
+  return (
+    t.ok &&
+    t.tokens.some((x) => {
+      const p = parseToken(x.text, WORKFLOW_RUN_FIELDS);
+      return p.ok && p.terms[0]?.key === 'is' && !p.terms[0].neg && p.terms[0].values.includes('archived');
+    })
+  );
+}

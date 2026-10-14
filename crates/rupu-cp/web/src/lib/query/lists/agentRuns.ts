@@ -1,12 +1,9 @@
 // The agent-run list's query fields (`GET /api/runs/agents?q=`). The server
 // evaluates them.
 import { Bot, CircleDot, Cpu, Layers, MessageSquare, Plug, Zap } from 'lucide-react';
+import { withDefault } from '../control';
 import { serverField, type ServerField } from '../rows';
 import { CODENAME_FIELD, CUSTOMER_FIELD, HOST_FIELD, ID_FIELD, timeFields } from './shared';
-
-/** What the Agent Runs page lists when the query names no `status:` (its old
- *  default, the Running tab: the server's `active` lifecycle). */
-export const ACTIVE_AGENT_RUN_STATUSES = ['running', 'awaiting_approval', 'pending'];
 
 export const AGENT_RUN_FIELDS: ServerField[] = [
   serverField({ key: 'status', match: 'exact', facet: true, label: 'Status', description: 'status:error · status:ok', icon: CircleDot }),
@@ -22,3 +19,8 @@ export const AGENT_RUN_FIELDS: ServerField[] = [
   CUSTOMER_FIELD,
   ...timeFields('Started'),
 ];
+
+/** The query the server gets: standalone runs when it names no `source:`. */
+export function agentRunsQuery(q: string): string {
+  return withDefault(q, AGENT_RUN_FIELDS, 'source', 'source:standalone');
+}

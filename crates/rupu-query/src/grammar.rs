@@ -355,7 +355,7 @@ fn normalize(def: &FieldDef, v: &str) -> Result<String, String> {
                 Ok(l)
             } else {
                 Err(format!(
-                    "`{v}` is not a {} (one of {})",
+                    "`{v}` is not a value of `{}:` (one of {})",
                     def.key,
                     def.values.join(", ")
                 ))

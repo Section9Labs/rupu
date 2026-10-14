@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { customersRange, customersRowQuery } from './lists/customers';
+import { WORKFLOW_RUN_FIELDS } from './lists/workflowRuns';
+import { withDefault } from './control';
 import { skillsProject } from './lists/skills';
 
 describe('control terms', () => {
@@ -19,5 +21,16 @@ describe('customersRowQuery', () => {
     expect(customersRowQuery('has:findings')).toBe('has:findings is:active');
     expect(customersRowQuery('has:')).toBe('has: is:active');
     expect(customersRowQuery('is:archived has:')).toBe('is:archived has:');
+  });
+});
+
+describe('withDefault', () => {
+  const F = WORKFLOW_RUN_FIELDS;
+  it('appends the default only when no token names the key', () => {
+    expect(withDefault('', F, 'status', 'status:running')).toBe('status:running');
+    expect(withDefault('trigger:cron', F, 'status', 'status:running')).toBe('trigger:cron status:running');
+    expect(withDefault('status:failed', F, 'status', 'status:running')).toBe('status:failed');
+    expect(withDefault('-status:failed', F, 'status', 'status:running')).toBe('-status:failed');
+    expect(withDefault('colour:red status:failed', F, 'status', 'status:running')).toBe('colour:red status:failed');
   });
 });
