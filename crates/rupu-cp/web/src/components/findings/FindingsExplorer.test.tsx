@@ -65,7 +65,7 @@ describe('FindingsExplorer', () => {
     renderExplorer('/runs/run_1?q=tag%3Aneeds-poc', { scope: { runId: 'run_1' }, onCount });
     await screen.findByText('Default admin token accepted');
     expect(urls(fetchMock)).toEqual(['/api/findings?run_id=run_1&q=tag%3Aneeds-poc']);
-    expect(onCount).toHaveBeenLastCalledWith(4);
+    await waitFor(() => expect(onCount).toHaveBeenLastCalledWith(4));
   });
 
   it('reloads the scope on its poll interval', async () => {
