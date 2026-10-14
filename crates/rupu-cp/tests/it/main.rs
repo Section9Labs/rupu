@@ -29,6 +29,7 @@ mod host_run_netflow;
 mod hosts_api;
 mod launch_preview;
 mod legacy_codenames;
+mod list_query;
 mod messages;
 mod models_api;
 mod netflow_api;

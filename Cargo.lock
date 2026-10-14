@@ -4815,6 +4815,7 @@ dependencies = [
  "rupu-netflow",
  "rupu-orchestrator",
  "rupu-providers",
+ "rupu-query",
  "rupu-runtime",
  "rupu-scm",
  "rupu-skills",
