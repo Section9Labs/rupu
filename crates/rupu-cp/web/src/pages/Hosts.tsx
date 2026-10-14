@@ -13,6 +13,8 @@ import { HostStatusBadge } from '../components/ui/HostStatusBadge';
 import { EmptyState } from '../components/ui/EmptyState';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
 import { Spinner } from '../components/ui/Spinner';
+import { ListQueryBar, NoMatches, useFilteredRows, useListQuery } from '../components/query/ListQueryBar';
+import { HOST_FIELDS } from '../lib/query/lists/hosts';
 
 // ---------------------------------------------------------------------------
 // Transport visual tokens (status handled by HostStatusBadge)
@@ -336,6 +338,9 @@ export default function Hosts() {
   }
 
   const columns = useMemo(() => buildColumns(handleRemove), [handleRemove]);
+  const [q, setQ] = useListQuery();
+  const loaded = useMemo(() => hosts ?? [], [hosts]);
+  const { rows, error: queryError, facets } = useFilteredRows(loaded, q, HOST_FIELDS);
 
   return (
     <div className="p-8">
@@ -658,14 +663,31 @@ export default function Hosts() {
         />
       ) : (
         <section>
-          <SectionHeader tone="muted" label="Hosts" count={hosts.length} />
-          <SortableTable<HostView>
-            columns={columns}
-            rows={hosts}
-            rowKey={(h) => h.id}
-            rowHref={(h) => `/hosts/${encodeURIComponent(h.id)}`}
-            initialSort={{ key: 'name', dir: 'asc' }}
+          <ListQueryBar
+            value={q}
+            onChange={setQ}
+            fields={HOST_FIELDS}
+            facets={facets}
+            total={loaded.length}
+            shown={rows.length}
+            error={queryError}
+            label="Filter hosts"
+            placeholder="Filter hosts… e.g. status:offline transport:ssh"
           />
+          {rows.length === 0 ? (
+            <NoMatches noun="hosts" />
+          ) : (
+            <>
+              <SectionHeader tone="muted" label="Hosts" count={rows.length} />
+              <SortableTable<HostView>
+                columns={columns}
+                rows={rows}
+                rowKey={(h) => h.id}
+                rowHref={(h) => `/hosts/${encodeURIComponent(h.id)}`}
+                initialSort={{ key: 'name', dir: 'asc' }}
+              />
+            </>
+          )}
         </section>
       )}
     </div>

@@ -10,6 +10,7 @@ import { MemoryRouter, useLocation } from 'react-router-dom';
 import { api, type HostView } from '../lib/api';
 
 import Hosts from './Hosts';
+import { commitQuery } from '../components/query/queryTestUtils';
 
 function LocationProbe() {
   const loc = useLocation();
@@ -439,5 +440,43 @@ describe('Hosts page', () => {
 
     // The host list should refresh (getHosts called a second time).
     await waitFor(() => expect(vi.mocked(api.getHosts)).toHaveBeenCalledTimes(2));
+  });
+});
+
+describe('Hosts query line', () => {
+  const ROWS = [LOCAL_HOST, REMOTE_HOST, TUNNEL_HOST];
+  const listed = () => ['local', 'prod-east', 'my-box'].filter((n) => screen.queryAllByText(n).some((el) => el.closest('tr')));
+
+  it('narrows the table to the query in ?q=', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue(ROWS);
+    render(
+      <MemoryRouter initialEntries={['/hosts?q=-transport:local status:online']}>
+        <Hosts />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(listed()).toEqual(['prod-east']));
+    expect(screen.getByTestId('query-count')).toHaveTextContent('1 of 3');
+  });
+
+  it('narrows the table as a query is committed', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue(ROWS);
+    render(
+      <MemoryRouter initialEntries={['/hosts']}>
+        <Hosts />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(listed()).toEqual(['local', 'prod-east', 'my-box']));
+    commitQuery('Filter hosts', 'status:offline');
+    await waitFor(() => expect(listed()).toEqual(['my-box']));
+  });
+
+  it('says so when the query keeps nothing', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue(ROWS);
+    render(
+      <MemoryRouter initialEntries={['/hosts?q=transport:bucket']}>
+        <Hosts />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByText('No hosts match the filter.')).toBeInTheDocument();
   });
 });
