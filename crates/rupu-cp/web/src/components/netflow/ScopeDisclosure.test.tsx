@@ -24,6 +24,7 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  SUBPROCESS_CAPTURE_LIMITS,
   disclosureText,
   netflowCoverageList,
   netflowEmptyStateHint,
@@ -31,6 +32,33 @@ import {
 } from './ScopeDisclosure';
 
 const SCOPES: NetflowScope[] = ['run', 'project', 'global'];
+const ALL_SCOPES: NetflowScope[] = ['run', 'project', 'global', 'agentiflow'];
+
+describe('remote-placed steps (remote netflow transport)', () => {
+  // A placed unit's netflow ledgers now land on the coordinator when the
+  // unit ends (spec 2026-10-14-rupu-remote-netflow-transport-design.md,
+  // N5), and a copy that is short or missing is listed as `incomplete`.
+  // No disclosure sentence may still say a remote host keeps its flows.
+  it('says a remote host\'s bash flows arrive when its unit finishes', () => {
+    expect(SUBPROCESS_CAPTURE_LIMITS).toContain(
+      "a remote host's bash flows arrive when its unit finishes",
+    );
+    expect(SUBPROCESS_CAPTURE_LIMITS).not.toContain('stay on that host');
+  });
+
+  it.each(ALL_SCOPES)('never says remote-placed flows are missing at %s scope', (scope) => {
+    const text = disclosureText(scope);
+    expect(text).not.toContain('keeps its flows on that host');
+    expect(text).not.toContain('so they are not included here');
+    expect(text).not.toContain('stay on that host');
+  });
+
+  it('says a remote step appears once it finishes, or is listed incomplete, at agentiflow scope', () => {
+    const text = disclosureText('agentiflow');
+    expect(text).toContain('appears once it finishes');
+    expect(text).toContain('listed as incomplete');
+  });
+});
 
 describe('netflowCoverageList', () => {
   it.each(SCOPES)('never claims CP fleet traffic at %s scope', (scope) => {
@@ -118,7 +146,7 @@ describe('bash subprocess coverage', () => {
     expect(text).toMatch(/no hostnames \(IP \+ ASN only\)/);
     expect(text).toMatch(/unconnected UDP has no destination/);
     expect(text).toMatch(/detached children and very short connections may be missed/);
-    expect(text).toMatch(/remote host's bash flows stay on that host/);
+    expect(text).toMatch(/a remote host's bash flows arrive when its unit finishes/);
   });
 
   it('keeps the existing provider/SCM coverage and non-HTTP limits', () => {

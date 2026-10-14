@@ -79,11 +79,15 @@ export const NETFLOW_COVERAGE_LIST =
 
 /** Honest limits of the subprocess (bash) capture — the gaps that make a
  *  quiet subprocess list "not seen" rather than "did nothing". Authored
- *  once, here, with the rest of the scope-limit wording. */
+ *  once, here, with the rest of the scope-limit wording. A remote host's
+ *  bash flows are no longer a gap: a placed unit's netflow ledgers land
+ *  on the coordinator when the unit ends (remote netflow transport spec,
+ *  N1–N3), and a copy that is short or missing is listed as `incomplete`
+ *  rather than silently absent. */
 export const SUBPROCESS_CAPTURE_LIMITS =
   'Subprocess flows carry no hostnames (IP + ASN only); unconnected UDP has no destination; ' +
   'detached children and very short connections may be missed; and a remote host\'s bash ' +
-  'flows stay on that host.';
+  'flows arrive when its unit finishes.';
 
 /** The run-scoped capture summary (`NetflowResponse.capture`), structurally
  *  typed here to keep this module free of a `lib/netflow.ts` dependency
@@ -137,14 +141,16 @@ const RUN_SCOPE_SUB_AGENT_NOTE =
 
 /** Agentiflow scope's addendum: the flow's lead and every run in its launch
  *  tree are folded into one total (`rupu-cp::api::netflow`'s "Agentiflow
- *  scope"). Every one of those runs is a local process, but a workflow the
- *  flow launched may place a `host:` or `distribute:` step on a remote host,
- *  whose ledger stays there. */
+ *  scope"). A workflow the flow launched may place a `host:` or
+ *  `distribute:` step on a remote host; that unit's ledgers land on the
+ *  coordinator when it ends (remote netflow transport spec, N3–N4), so
+ *  they appear here once it finishes, and a unit whose copy is short or
+ *  missing is listed in the response's `incomplete` sources. */
 const AGENTIFLOW_SCOPE_NOTE =
   ' Covers the whole engagement: the lead and every run it launched, at any depth ' +
   '(agents, sub-agents, and workflows with their steps), folded into one total. A step of a ' +
-  'workflow it launched that runs on a remote host (host: or distribute:) keeps its flows on ' +
-  'that host, so they are not included here.';
+  'workflow it launched that runs on a remote host (host: or distribute:) appears once it ' +
+  'finishes; one whose flows could not be collected is listed as incomplete.';
 
 /** Exported (previously private to `NetflowScopeDisclosure`) so the
  *  explorer's CoveragePopover can render the same single-sourced text —
