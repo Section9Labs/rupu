@@ -1459,6 +1459,58 @@ steps:
         assert_eq!(body["run"]["id"], "run_agent");
     }
 
+    /// A bare agent run records no step results and no events, so its one
+    /// node used to have no transcript ("No transcript yet for agent") however
+    /// many turns it ran. The node reads the transcript `rupu run` wrote.
+    #[tokio::test]
+    async fn run_graph_for_agent_run_points_its_node_at_the_transcript() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        )
+        .with_workspace_dir(tmp.path().to_path_buf());
+        let mut ok = run_record("run_ok", "agent:skill-author");
+        ok.final_output = Some("wrote four files".to_string());
+        s.run_store.create(ok, "").unwrap();
+        let mut failed = run_record("run_failed", "agent:skill-author");
+        failed.status = rupu_orchestrator::RunStatus::Failed;
+        failed.error_message = Some("max turns".to_string());
+        s.run_store.create(failed, "").unwrap();
+
+        let graph = |id: &str| {
+            let s = s.clone();
+            let id = id.to_string();
+            async move {
+                run_graph(State(s), Path(id), Query(RunDetailQuery { host: None }))
+                    .await
+                    .expect("agent-run graph")
+                    .0
+            }
+        };
+
+        let ok = graph("run_ok").await;
+        let results = ok["step_results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["step_id"], "agent");
+        assert_eq!(
+            results[0]["transcript_path"],
+            "/tmp/proj/.rupu/transcripts/run_ok.jsonl"
+        );
+        assert_eq!(results[0]["success"], true);
+        assert_eq!(results[0]["output"], "wrote four files");
+
+        let failed = graph("run_failed").await;
+        let results = failed["step_results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0]["transcript_path"],
+            "/tmp/proj/.rupu/transcripts/run_failed.jsonl"
+        );
+        assert_eq!(results[0]["success"], false);
+        assert_eq!(results[0]["error"], "max turns");
+    }
+
     /// A real workflow run still parses its snapshot into the full DAG.
     #[tokio::test]
     async fn run_graph_for_workflow_run_parses_snapshot() {
