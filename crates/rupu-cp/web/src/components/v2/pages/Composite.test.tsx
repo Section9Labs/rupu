@@ -72,6 +72,14 @@ describe('Composite', () => {
     expect(screen.getByRole('button', { name: 'beta' })).toHaveAttribute('aria-pressed', 'true');
   });
 
+  it('switching tabs drops the list query, keeps the other params', () => {
+    renderComposite('/x?tab=b&q=scope:global&host=local');
+    fireEvent.click(screen.getByRole('button', { name: 'alpha' }));
+    expect(screen.getByTestId('loc')).toHaveTextContent('/x?tab=a&host=local');
+    fireEvent.click(screen.getByRole('button', { name: 'alpha' }));
+    expect(screen.getByTestId('loc')).toHaveTextContent('/x?tab=a&host=local');
+  });
+
   it('clicking a segment updates ?tab= and swaps the body', () => {
     renderComposite('/x?tab=b');
     fireEvent.click(screen.getByRole('button', { name: 'alpha' }));
