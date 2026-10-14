@@ -830,12 +830,17 @@ async fn list(
         rupu_cp::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
     let customer_pricing = rupu_cp::customers::CustomerPricing::new(global.clone(), cfg.pricing);
     let mut prices = rupu_cp::customers::PricingMemo::new(&customer_pricing);
-    let rows: Vec<rupu_cp::api::runs::RunListRow> = all
+    let mut rows: Vec<rupu_cp::api::runs::RunListRow> = all
         .iter()
         .map(|r| {
             rupu_cp::api::runs::RunListRow::for_listing(r, &store, &mut customers, &mut prices)
         })
         .collect();
+    // An autoflow row's issue link and PR come from this host's claim store.
+    let claims = rupu_cp::api::autoflow_claims::ClaimIndex::load(&global);
+    for r in &mut rows {
+        claims.apply(r);
+    }
 
     let report = RunListReport {
         kind: "run_list",

@@ -3479,7 +3479,7 @@ pub(crate) mod tests {
     }
 
     /// A completed run record suitable for archive / delete tests.
-    fn terminal_record(id: &str) -> RunRecord {
+    pub(crate) fn terminal_record(id: &str) -> RunRecord {
         let mut rec = awaiting_record(id, "gate");
         rec.status = RunStatus::Completed;
         rec.awaiting_step_id = None;
