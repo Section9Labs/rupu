@@ -3,8 +3,6 @@ mod frontmatter;
 mod grant;
 mod install;
 mod name;
-mod pinned;
-mod pinned_checkout;
 mod render;
 mod run;
 mod ship;

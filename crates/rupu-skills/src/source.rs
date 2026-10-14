@@ -62,17 +62,6 @@ pub fn parse_source(
             .map_err(|_| SourceError::NotFound(input.to_owned()))?;
         return Ok(Source::Local(canon));
     }
-    parse_git_source(input, git_ref).map(Source::Git)
-}
-
-/// The git half of [`parse_source`]: `owner/repo`, an https URL (a GitHub
-/// tree URL too) and an optional `#<path>`. It never consults the
-/// filesystem, so a caller whose input must not depend on the working
-/// directory (a built-in profile's pin) uses it directly.
-pub(crate) fn parse_git_source(
-    input: &str,
-    git_ref: Option<&str>,
-) -> Result<GitSource, SourceError> {
     if input.starts_with('.') || input.starts_with('/') || input.starts_with('~') {
         return Err(SourceError::NotFound(input.to_owned()));
     }
@@ -111,17 +100,17 @@ pub(crate) fn parse_git_source(
                 }
                 (h, u) => h.or(u),
             };
-            return Ok(GitSource {
+            return Ok(Source::Git(GitSource {
                 url: tree.repo,
                 git_ref: Some(tree.git_ref),
                 path,
-            });
+            }));
         }
-        return Ok(GitSource {
+        return Ok(Source::Git(GitSource {
             url: base.trim_end_matches('/').to_owned(),
             git_ref: flag_ref,
             path: hash_path,
-        });
+        }));
     }
     let parts: Vec<&str> = base.split('/').collect();
     let ok = |s: &str| {
@@ -130,11 +119,11 @@ pub(crate) fn parse_git_source(
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     };
     if parts.len() == 2 && parts.iter().all(|p| ok(p)) {
-        return Ok(GitSource {
+        return Ok(Source::Git(GitSource {
             url: format!("https://github.com/{}/{}", parts[0], parts[1]),
             git_ref: flag_ref,
             path: hash_path,
-        });
+        }));
     }
     Err(SourceError::Unrecognized(input.to_owned()))
 }
