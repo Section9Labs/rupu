@@ -120,10 +120,20 @@ pub struct Args {
     pub skill_bundle: Option<String>,
     /// Turn this run's messaging tools off, and its children's, as an
     /// agent's `messaging: false` would. A placed unit's coordinator passes
-    /// it for a workflow whose messaging is off. `--continue` does not keep
-    /// it: give it again with `--continue`.
+    /// it for a workflow whose messaging is off.
     #[arg(long)]
     pub no_messaging: bool,
+    /// A messaging tool this run is offered, and only these; repeat the
+    /// flag for several (`--messaging-tool=` alone for none), as a
+    /// workflow's `messaging: { tools }` gives its steps. A placed unit's
+    /// coordinator passes them. Only `board.*` / `msg.*` tools.
+    #[arg(
+        long = "messaging-tool",
+        value_name = "NAME",
+        value_parser = parse_messaging_tool,
+        conflicts_with = "no_messaging"
+    )]
+    pub messaging_tools: Vec<String>,
     /// Continue an interrupted run of this agent from its transcript instead
     /// of starting fresh: the earlier conversation is rebuilt and the agent
     /// is told it was interrupted. A run that had already finished prints
@@ -152,6 +162,37 @@ pub struct Args {
 
 fn parse_findings_profile(s: &str) -> Result<rupu_coverage::FindingProfile, String> {
     s.parse()
+}
+
+/// `--messaging-tool`: a tool that needs the message bus, canonical or
+/// alias; empty stands for none.
+fn parse_messaging_tool(s: &str) -> Result<String, String> {
+    if !s.is_empty() {
+        rupu_tools::ToolCatalog::builtin()
+            .resolve_messaging(&[s.to_string()])
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(s.to_string())
+}
+
+impl Args {
+    /// The launch's messaging, from `--no-messaging` / `--messaging-tool`.
+    pub fn messaging(&self) -> rupu_runtime::argv::LaunchMessaging {
+        use rupu_runtime::argv::LaunchMessaging;
+        if self.no_messaging {
+            LaunchMessaging::Off
+        } else if self.messaging_tools.is_empty() {
+            LaunchMessaging::Default
+        } else {
+            LaunchMessaging::Tools(
+                self.messaging_tools
+                    .iter()
+                    .filter(|t| !t.is_empty())
+                    .cloned()
+                    .collect(),
+            )
+        }
+    }
 }
 
 /// `--codename`: a codename with at least one segment. A malformed one is a
@@ -991,7 +1032,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             skills: launch_skills.0.clone(),
             preload_skills: launch_skills.1.clone(),
             skill_overlay,
-            messaging_off: args.no_messaging,
+            messaging: args.messaging().resolve()?,
             ..Default::default()
         };
 
