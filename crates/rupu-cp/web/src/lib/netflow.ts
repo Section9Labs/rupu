@@ -450,8 +450,42 @@ export const fetchGlobalNetflow = (
 ): Promise<NetflowResponse> =>
   getJson<NetflowResponse>(appendRange('/api/netflow', range, filters));
 
-/** `scope` is `run:<id>` or `project:<id>`; omitted entirely for global —
- *  the same contract as `GET /api/netflow/graph`'s scope param. */
+/** A whole agentiflow's flows: its lead's and every run it launched. */
+export const fetchAgentiflowNetflow = (
+  id: string,
+  range?: NetflowRange,
+  filters?: NetflowFilters,
+): Promise<NetflowResponse> =>
+  getJson<NetflowResponse>(
+    appendRange(`/api/agentiflows/${encodeURIComponent(id)}/netflow`, range, filters),
+  );
+
+/** Padding around a run's own span for a Network tab's initial window, so
+ *  teardown flows stamped just past the end (or ahead of the start through
+ *  writer clock skew) aren't cut. */
+const SPAN_PAD_MS = 5 * 60_000;
+
+/** A run's span padded by five minutes each side, as a Network tab's
+ *  initial window. An unfinished run leaves the upper bound open; an
+ *  unparseable timestamp passes through as is (the server enforces its own
+ *  bounds). */
+export function spanWindow(
+  startedAt: string,
+  endedAt?: string | null,
+): { from: string; to?: string } {
+  const pad = (iso: string, deltaMs: number) => {
+    const t = Date.parse(iso);
+    return Number.isNaN(t) ? iso : new Date(t + deltaMs).toISOString();
+  };
+  return {
+    from: pad(startedAt, -SPAN_PAD_MS),
+    to: endedAt ? pad(endedAt, SPAN_PAD_MS) : undefined,
+  };
+}
+
+/** `scope` is `run:<id>`, `agentiflow:<id>` or `project:<id>`; omitted
+ *  entirely for global — the same contract as `GET /api/netflow/graph`'s
+ *  scope param. */
 export const fetchNetflowExplorer = (
   scope?: string,
   range?: NetflowRange,

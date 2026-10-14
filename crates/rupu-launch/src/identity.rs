@@ -8,11 +8,12 @@
 //! Whether the child's run ended is a separate question, answered by its own
 //! records ([`own_end`]): an agent's transcript, a workflow's `run.json`.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use rupu_orchestrator::{RunStatus, RunStore, RunStoreError};
-use rupu_tools::{ChildKind, ChildState, ChildTokens};
+use rupu_tools::{ChildKind, ChildState, ChildTokens, MAX_LAUNCH_DEPTH};
 use rupu_transcript::StopCause;
 
 use crate::ledger::{Finished, Started};
@@ -286,10 +287,85 @@ pub fn below(global: &Path, kind: ChildKind, run_id: &str) -> Vec<PathBuf> {
     }
 }
 
+/// Every child `dir`'s ledger records and, [`below`] each, every child it
+/// launched, down the whole tree, depth first in start order. Each run is
+/// listed once: a child taken on again under the same run id, or a ledger
+/// that names an ancestor, is not walked twice. A child at
+/// [`MAX_LAUNCH_DEPTH`] can't launch, so nothing below it is read. A
+/// missing ledger has no children.
+pub fn launch_tree(global: &Path, dir: &Path) -> Vec<Started> {
+    fn walk(global: &Path, dir: &Path, seen: &mut HashSet<String>, out: &mut Vec<Started>) {
+        for child in crate::ledger::read(dir) {
+            let s = child.started;
+            if !seen.insert(s.run_id.clone()) {
+                continue;
+            }
+            let dirs = if s.depth < MAX_LAUNCH_DEPTH {
+                below(global, s.kind, &s.run_id)
+            } else {
+                Vec::new()
+            };
+            out.push(s);
+            for d in dirs {
+                walk(global, &d, seen, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(global, dir, &mut HashSet::new(), &mut out);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::process::CommandExt;
+
+    fn launched(dir: &Path, run_id: &str, kind: ChildKind, depth: u32) {
+        crate::ledger::append(
+            dir,
+            &crate::ledger::LedgerLine::Started(Started::new(
+                &format!("ch_{run_id}"),
+                kind,
+                "recon",
+                run_id,
+                1,
+                depth,
+            )),
+        );
+    }
+
+    #[test]
+    fn a_launch_tree_lists_every_run_below_once() {
+        let global = tempfile::tempdir().unwrap();
+        let g = global.path();
+        let flow = g.join("agentiflows").join("af_tree");
+        let runs = g.join("runs");
+        launched(&flow, "run_child", ChildKind::Agent, 1);
+        launched(&flow, "run_side", ChildKind::Subagent, 1);
+        launched(&runs.join("run_child"), "run_grand", ChildKind::Agent, 2);
+        launched(&runs.join("run_grand"), "run_child", ChildKind::Agent, 3);
+        launched(
+            &runs.join("run_grand"),
+            "run_deep",
+            ChildKind::Agent,
+            MAX_LAUNCH_DEPTH,
+        );
+        launched(
+            &runs.join("run_deep"),
+            "run_past_limit",
+            ChildKind::Agent,
+            MAX_LAUNCH_DEPTH + 1,
+        );
+
+        let ids: Vec<String> = launch_tree(g, &flow)
+            .into_iter()
+            .map(|s| s.run_id)
+            .collect();
+
+        assert_eq!(ids, ["run_child", "run_grand", "run_deep", "run_side"]);
+        assert!(launch_tree(g, &g.join("missing")).is_empty());
+    }
 
     fn recorded(pid: u32, start: Option<u64>) -> Started {
         Started {

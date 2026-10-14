@@ -64,7 +64,7 @@
 // fires mid-run. See `resolver.rs`'s own comment on `refresh_inner` for
 // the same ruling stated at the call site.
 
-export type NetflowScope = 'run' | 'project' | 'global';
+export type NetflowScope = 'run' | 'project' | 'global' | 'agentiflow';
 
 /** Netflow's full coverage list — true at EVERY scope now (no scope adds
  *  anything on top of this one; see the header comment's "CP fleet
@@ -135,12 +135,23 @@ const RUN_SCOPE_SUB_AGENT_NOTE =
   ' Includes any sub-agents this run dispatched — at any depth, not just the first level — ' +
   'folded into the same totals, not shown as a separate scope.';
 
+/** Agentiflow scope's addendum: the flow's lead and every run in its launch
+ *  tree are folded into one total (`rupu-cp::api::netflow`'s "Agentiflow
+ *  scope"). Every one of those runs is a local process, but a workflow the
+ *  flow launched may place a `host:` or `distribute:` step on a remote host,
+ *  whose ledger stays there. */
+const AGENTIFLOW_SCOPE_NOTE =
+  ' Covers the whole engagement: the lead and every run it launched, at any depth ' +
+  '(agents, sub-agents, and workflows with their steps), folded into one total. A step of a ' +
+  'workflow it launched that runs on a remote host (host: or distribute:) keeps its flows on ' +
+  'that host, so they are not included here.';
+
 /** Exported (previously private to `NetflowScopeDisclosure`) so the
  *  explorer's CoveragePopover can render the same single-sourced text —
  *  run scope appends the sub-agent folding note here and nowhere else. */
 export function disclosureText(scope: NetflowScope, capture?: NetflowCaptureStatus | null): string {
   const coverage = netflowCoverageList(scope);
-  const captureText = scope === 'run' ? captureStatusText(capture) : '';
+  const captureText = scope === 'run' || scope === 'agentiflow' ? captureStatusText(capture) : '';
   return (
     `This covers rupu's own egress — ${coverage}. ` +
     `${SUBPROCESS_CAPTURE_LIMITS} ` +
@@ -149,6 +160,7 @@ export function disclosureText(scope: NetflowScope, capture?: NetflowCaptureStat
     `here too. Ledgers are kept indefinitely unless an operator runs rupu netflow prune — ` +
     `nothing here expires or rotates on its own.` +
     (scope === 'run' ? RUN_SCOPE_SUB_AGENT_NOTE : '') +
+    (scope === 'agentiflow' ? AGENTIFLOW_SCOPE_NOTE : '') +
     (captureText ? ` ${captureText}` : '')
   );
 }

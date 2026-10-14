@@ -87,6 +87,7 @@ use std::sync::{Arc, OnceLock};
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/runs/:id/netflow", get(get_run_netflow))
+        .route("/api/agentiflows/:id/netflow", get(get_agentiflow_netflow))
         .route("/api/projects/:id/netflow", get(get_project_netflow))
         .route("/api/netflow", get(get_global_netflow))
         .route("/api/netflow/graph", get(get_netflow_graph))
@@ -797,6 +798,24 @@ impl RunMetaIndex {
         });
     }
 
+    /// Map `ledger_id` to a run and workflow label that no `RunStore`
+    /// record carries (an agentiflow is not a workflow run), with its
+    /// lifetime for the timeline.
+    fn insert_synthetic(
+        &mut self,
+        ledger_id: &str,
+        run_label: &str,
+        workflow_label: &str,
+        start: chrono::DateTime<chrono::Utc>,
+        end: Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        self.map.insert(
+            ledger_id.to_string(),
+            (run_label.to_string(), workflow_label.to_string()),
+        );
+        self.spans.push(RunSpan { start, end });
+    }
+
     fn attribution(&self, ledger_id: &str) -> (Option<String>, Option<String>) {
         match self.map.get(ledger_id) {
             Some((run, wf)) => (Some(run.clone()), Some(wf.clone())),
@@ -1302,6 +1321,141 @@ fn collect_run_netflow(
     }
     resp.capture = summarize_capture(&ledgers);
     resp
+}
+
+// ── Agentiflow scope ──────────────────────────────────────────────────────
+//
+// An agentiflow is a lead plus the runs it launched, each writing its own
+// ledger: the lead's rounds under the flow's `af_` id, every child under its
+// own run id. The flow's picture is the union of those ledgers, folded into
+// one view named for the flow, the way run scope folds a run's steps and
+// sub-agents (`run_and_unit_ids`).
+
+/// The ledgers, transcripts and attribution of one agentiflow's netflow read.
+struct AgentiflowNetflowScope {
+    /// The flow's own id: every flow is tagged with it, and it is the one
+    /// key in `meta`.
+    tag: String,
+    /// Every ledger id to union: the flow's own and each run in its launch
+    /// tree, each expanded through [`run_and_unit_ids`].
+    ids: Vec<String>,
+    transcripts: Vec<PathBuf>,
+    /// Where the flow ran, for [`resolve_ledger_paths`].
+    workspace: PathBuf,
+    meta: RunMetaIndex,
+}
+
+/// `None` when `id` names no agentiflow (or can't name one). Disk reads only: run it through
+/// [`run_blocking`].
+fn agentiflow_netflow_scope(s: &AppState, id: &str) -> Option<AgentiflowNetflowScope> {
+    if !crate::api::agentiflows::valid_run_id(id) {
+        return None;
+    }
+    let run_dir = rupu_agentiflow::agentiflow_dir(&s.global_dir).join(id);
+    let record = rupu_agentiflow::AgentiflowRecord::read(&run_dir).ok()?;
+    let runs = crate::api::agentiflows::flow_runs(s, &run_dir);
+    let mut ids = run_and_unit_ids(&s.run_store, id);
+    for run_id in &runs.run_ids {
+        ids.extend(run_and_unit_ids(&s.run_store, run_id));
+    }
+    ids.sort();
+    ids.dedup();
+    let mut meta = RunMetaIndex::default();
+    meta.insert_synthetic(
+        id,
+        record.codename.as_deref().unwrap_or(&record.name),
+        &record.name,
+        record.started_at,
+        record.ended_at,
+    );
+    Some(AgentiflowNetflowScope {
+        tag: id.to_string(),
+        ids,
+        transcripts: runs.transcripts,
+        workspace: crate::api::agentiflows::flow_workspace(s, &run_dir)
+            .map_or_else(|| s.workspace_dir.clone(), |w| PathBuf::from(w.path)),
+        meta,
+    })
+}
+
+/// Every flow of the scope's ledgers in `range`, merged with its
+/// transcripts and tagged with the flow's id; and the ledgers' dropped
+/// count.
+fn agentiflow_flows_and_dropped(
+    reader: &dyn LedgerReader,
+    scope: &AgentiflowNetflowScope,
+    global_dir: &StdPath,
+    range: &rupu_netflow::ledger::TimeRange,
+) -> (Vec<(String, FlowRecord)>, u64) {
+    let mut all: Vec<FlowRecord> = Vec::new();
+    let mut dropped = 0u64;
+    for id in &scope.ids {
+        for ledger_path in resolve_ledger_paths(&scope.workspace, global_dir, id) {
+            let (f, d) = reader.flows_in_range(&ledger_path, range);
+            all.extend(f);
+            dropped += d;
+        }
+    }
+    let tagged = merge_with_transcript(all, &scope.transcripts)
+        .into_iter()
+        .filter(|f| range.contains(f.ts))
+        .map(|f| (scope.tag.clone(), f))
+        .collect();
+    (tagged, dropped)
+}
+
+/// [`collect_run_netflow`] for an agentiflow.
+fn collect_agentiflow_netflow(
+    reader: &dyn LedgerReader,
+    scope: &AgentiflowNetflowScope,
+    global_dir: &StdPath,
+    cache: &AsnCache,
+    range: &rupu_netflow::ledger::TimeRange,
+    filters: &ExplorerFilters,
+) -> NetflowResponse {
+    let (tagged, dropped) = agentiflow_flows_and_dropped(reader, scope, global_dir, range);
+    let table = load_asn_table(cache);
+    let mut resp = build_filtered_response(
+        tagged,
+        &scope.meta,
+        dropped,
+        table.as_deref(),
+        range,
+        filters,
+    );
+    let ledgers: Vec<_> = scope
+        .ids
+        .iter()
+        .flat_map(|id| resolve_ledger_paths(&scope.workspace, global_dir, id))
+        .map(|ledger_path| reader.capture_states(&ledger_path))
+        .collect();
+    resp.capture = summarize_capture(&ledgers);
+    resp
+}
+
+/// The explorer at agentiflow scope. Reads the ledgers unbounded, as run
+/// scope does: the histogram shows the whole history and the views window
+/// to `range` themselves.
+fn build_agentiflow_explorer(
+    reader: &dyn LedgerReader,
+    scope: &AgentiflowNetflowScope,
+    global_dir: &StdPath,
+    cache: &AsnCache,
+    range: &rupu_netflow::ledger::TimeRange,
+    filters: &ExplorerFilters,
+) -> ExplorerResponse {
+    let unbounded = rupu_netflow::ledger::TimeRange::unbounded();
+    let (tagged, dropped) = agentiflow_flows_and_dropped(reader, scope, global_dir, &unbounded);
+    let table = load_asn_table(cache);
+    let flows = to_explorer_flows(tagged, &scope.meta, table.as_deref());
+    build_explorer_response(
+        &flows,
+        dropped,
+        &scope.meta.spans,
+        table.is_some(),
+        range,
+        filters,
+    )
 }
 
 /// A registered workspace store, rooted at `<global_dir>/workspaces/` —
@@ -2128,6 +2282,26 @@ async fn get_netflow_explorer(
     if let Some(run_id) = q.scope.as_deref().and_then(|s| s.strip_prefix("run:")) {
         let resp = explorer_run_scope(&state, run_id, &range, &filters).await?;
         Ok(Json(resp))
+    } else if let Some(af_id) = q
+        .scope
+        .as_deref()
+        .and_then(|s| s.strip_prefix("agentiflow:"))
+    {
+        let af_id = af_id.to_string();
+        let resp = run_blocking(move || {
+            let scope = agentiflow_netflow_scope(&state, &af_id)?;
+            Some(build_agentiflow_explorer(
+                &*index_for(&state),
+                &scope,
+                &state.global_dir,
+                &state.asn_cache,
+                &range,
+                &filters,
+            ))
+        })
+        .await?;
+        resp.map(Json)
+            .ok_or_else(|| ApiError::not_found("agentiflow not found".to_string()))
     } else if let Some(project_id) = q.scope.as_deref().and_then(|s| s.strip_prefix("project:")) {
         let workspace = workspace_for_project(&state, project_id)?;
         let store = Arc::clone(&state.run_store);
@@ -2732,6 +2906,35 @@ fn urlencode_query_value(s: &str) -> String {
 
 fn urlencoding_rfc3339(dt: chrono::DateTime<chrono::Utc>) -> String {
     dt.to_rfc3339().replace('+', "%2B").replace(':', "%3A")
+}
+
+/// `GET /api/agentiflows/:id/netflow` — the flows list and capture summary
+/// of a whole agentiflow: its lead and every run in its launch tree, folded
+/// into one view (see "Agentiflow scope"). 404 when `id` names no
+/// agentiflow.
+async fn get_agentiflow_netflow(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<TimeRangeQuery>,
+) -> ApiResult<Json<NetflowResponse>> {
+    maybe_refresh_asn(&netflow_config(&s), &s.asn_cache);
+    let range = parse_time_range(&q.from, &q.to)?;
+    let filters = parse_filters(&q.workflow, &q.origin, &q.org, &q.host);
+    let af_id = id.clone();
+    let resp = run_blocking(move || {
+        let scope = agentiflow_netflow_scope(&s, &af_id)?;
+        Some(collect_agentiflow_netflow(
+            &*index_for(&s),
+            &scope,
+            &s.global_dir,
+            &s.asn_cache,
+            &range,
+            &filters,
+        ))
+    })
+    .await?;
+    resp.map(Json)
+        .ok_or_else(|| ApiError::not_found(format!("no agentiflow run `{id}`")))
 }
 
 /// `GET /api/runs/:id/netflow` — network flows attributed to one run

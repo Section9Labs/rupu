@@ -72,7 +72,7 @@ export function CoveragePopover({
         {droppedTotal > 0 && (
           <span className="font-semibold">· {droppedTotal} dropped</span>
         )}
-        {scope === 'run' && capture?.state === 'unavailable' && (
+        {(scope === 'run' || scope === 'agentiflow') && capture?.state === 'unavailable' && (
           <span className="font-semibold">· subprocess capture unavailable</span>
         )}
       </button>

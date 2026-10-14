@@ -2,13 +2,32 @@ import { describe, expect, it, vi } from 'vitest';
 import { ApiError } from './api';
 import type { HostRollup } from './netflow';
 import {
+  fetchAgentiflowNetflow,
   fetchGlobalNetflow,
   fetchNetflowExplorer,
   fetchProjectNetflow,
   fetchRunNetflow,
   formatBytes,
+  spanWindow,
   EMPTY_NETFLOW_FILTERS,
 } from './netflow';
+
+describe('spanWindow', () => {
+  it('pads a finished span by five minutes each side', () => {
+    expect(spanWindow('2026-10-07T00:00:00Z', '2026-10-07T01:00:00Z')).toEqual({
+      from: '2026-10-06T23:55:00.000Z',
+      to: '2026-10-07T01:05:00.000Z',
+    });
+  });
+
+  it('leaves an unfinished span open and passes junk through', () => {
+    expect(spanWindow('2026-10-07T00:00:00Z', null)).toEqual({
+      from: '2026-10-06T23:55:00.000Z',
+      to: undefined,
+    });
+    expect(spanWindow('not a time').from).toBe('not a time');
+  });
+});
 
 describe('formatBytes', () => {
   it('renders unknown as an em dash, never as 0 B', () => {
@@ -59,6 +78,32 @@ describe('fetch helpers', () => {
 
     await fetchNetflowExplorer('project:ws_1');
     expect(fetchMock).toHaveBeenCalledWith('/api/netflow/explorer?scope=project%3Aws_1');
+    vi.unstubAllGlobals();
+  });
+
+  it('encodes the agentiflow id into its own netflow path', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ flows: [], hosts: [], dropped_total: 0, asn_loaded: true }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await fetchAgentiflowNetflow('af_01ABC');
+    expect(fetchMock).toHaveBeenCalledWith('/api/agentiflows/af_01ABC/netflow');
+    vi.unstubAllGlobals();
+  });
+
+  it('carries the range into the agentiflow netflow query', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ flows: [], hosts: [], dropped_total: 0, asn_loaded: true }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await fetchAgentiflowNetflow('af_01ABC', { from: '2026-08-17T14:00:00.000Z' });
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/agentiflows/af_01ABC/netflow?from=2026-08-17T14%3A00%3A00.000Z',
+    );
     vi.unstubAllGlobals();
   });
 

@@ -2963,3 +2963,184 @@ async fn lines_appended_between_requests_reach_the_next_response() {
     assert_eq!(after, get(fresh, "/api/netflow").await);
     assert_eq!(explorer_after, get(fresh, "/api/netflow/explorer").await);
 }
+
+// ── Agentiflow scope ────────────────────────────────────────────────────────
+
+const AF_ID: &str = "af_01NETTEST0000000000000000";
+
+fn seed_agentiflow_record(global: &std::path::Path) -> std::path::PathBuf {
+    let run_dir = rupu_agentiflow::agentiflow_dir(global).join(AF_ID);
+    rupu_agentiflow::AgentiflowRecord {
+        id: AF_ID.into(),
+        name: "net-itest".into(),
+        engagement_profiles: vec!["network".into()],
+        trigger: rupu_runtime::RunTriggerSource::Agentiflow,
+        status: "completed".into(),
+        stop_reason: Some("goals_met".into()),
+        rounds: 1,
+        goals: vec![],
+        started_at: "2026-10-07T00:00:00Z".parse().unwrap(),
+        ended_at: Some("2026-10-07T01:00:00Z".parse().unwrap()),
+        codename: Some("cobalt-harbor".into()),
+        spent_usd: None,
+        spent_tokens: 0,
+        runner_pid: None,
+    }
+    .write(&run_dir)
+    .unwrap();
+    run_dir
+}
+
+fn one_flow(global: &std::path::Path, ledger_id: &str, host: &str) {
+    write_global_ledger(
+        global,
+        ledger_id,
+        &[LedgerLine::Flow(Box::new(flow(
+            None,
+            host,
+            Fidelity::Http,
+            None,
+        )))],
+    );
+}
+
+fn launched(dir: &std::path::Path, run_id: &str, depth: u32) {
+    rupu_launch::ledger::append(
+        dir,
+        &rupu_launch::ledger::LedgerLine::Started(rupu_launch::ledger::Started::new(
+            &format!("ch_{run_id}"),
+            rupu_tools::ChildKind::Agent,
+            "recon",
+            run_id,
+            1,
+            depth,
+        )),
+    );
+}
+
+async fn get_json(addr: std::net::SocketAddr, route: &str) -> (u16, serde_json::Value) {
+    let resp = reqwest::get(format!("http://{addr}{route}")).await.unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap_or(serde_json::Value::Null))
+}
+
+fn hosts_of(body: &serde_json::Value) -> Vec<String> {
+    let mut hosts: Vec<String> = body["flows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["host"].as_str().unwrap().to_string())
+        .collect();
+    hosts.sort();
+    hosts
+}
+
+#[tokio::test]
+async fn agentiflow_netflow_folds_the_whole_launch_tree() {
+    let global = tempfile::tempdir().unwrap();
+    let g = global.path();
+    let flow_dir = seed_agentiflow_record(g);
+    launched(&flow_dir, "run_af_child", 1);
+    launched(&g.join("runs").join("run_af_child"), "run_af_grand", 2);
+    one_flow(g, AF_ID, "lead.example");
+    one_flow(g, "run_af_child", "child.example");
+    one_flow(g, "run_af_grand", "grand.example");
+    one_flow(g, "run_unrelated", "unrelated.example");
+    let addr = serve(new_state(g)).await;
+
+    let (status, body) = get_json(addr, &format!("/api/agentiflows/{AF_ID}/netflow")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        hosts_of(&body),
+        ["child.example", "grand.example", "lead.example"]
+    );
+    for f in body["flows"].as_array().unwrap() {
+        assert_eq!(f["run_id"], "cobalt-harbor", "{f}");
+        assert_eq!(f["workflow"], "net-itest", "{f}");
+    }
+
+    let (status, exp) = get_json(
+        addr,
+        &format!("/api/netflow/explorer?scope=agentiflow:{AF_ID}"),
+    )
+    .await;
+    assert_eq!(status, 200, "{exp}");
+    assert_eq!(exp["kpis"]["flows"], 3, "{exp}");
+    let workflows: Vec<(String, u64)> = exp["sankey"]["workflows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| {
+            (
+                n["label"].as_str().unwrap().to_string(),
+                n["calls"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(workflows, [("net-itest".to_string(), 3)]);
+}
+
+#[tokio::test]
+async fn agentiflow_netflow_reads_a_pre_w7_flows_units() {
+    let global = tempfile::tempdir().unwrap();
+    let g = global.path();
+    let flow_dir = seed_agentiflow_record(g);
+    for unit in ["run_legacy_a", "run_legacy_b"] {
+        let dir = flow_dir.join("units").join(unit);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("unit.json"),
+            serde_json::json!({
+                "run_id": unit, "agent": "recon", "kind": "agent",
+                "status": {"state": "done", "success": true, "output": "ok"},
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+    one_flow(g, AF_ID, "lead.example");
+    one_flow(g, "run_legacy_a", "unit-a.example");
+    one_flow(g, "run_legacy_b", "unit-b.example");
+    one_flow(g, "run_unrelated", "unrelated.example");
+    let addr = serve(new_state(g)).await;
+
+    let (status, body) = get_json(addr, &format!("/api/agentiflows/{AF_ID}/netflow")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        hosts_of(&body),
+        ["lead.example", "unit-a.example", "unit-b.example"]
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_agentiflow_is_a_404() {
+    let global = tempfile::tempdir().unwrap();
+    let addr = serve(new_state(global.path())).await;
+    let (status, _) = get_json(addr, "/api/agentiflows/af_missing/netflow").await;
+    assert_eq!(status, 404);
+    let (status, _) = get_json(addr, "/api/netflow/explorer?scope=agentiflow:af_missing").await;
+    assert_eq!(status, 404);
+}
+
+#[tokio::test]
+async fn an_agentiflow_id_cannot_reach_outside_the_agentiflows_dir() {
+    let global = tempfile::tempdir().unwrap();
+    let run_dir = seed_agentiflow_record(global.path());
+    let outside = global.path().join("af_escaped");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::copy(
+        run_dir.join("agentiflow.json"),
+        outside.join("agentiflow.json"),
+    )
+    .unwrap();
+    let addr = serve(new_state(global.path())).await;
+
+    let (status, _) = get_json(
+        addr,
+        &format!("/api/netflow/explorer?scope=agentiflow:{AF_ID}"),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, _) = get_json(addr, "/api/netflow/explorer?scope=agentiflow:../af_escaped").await;
+    assert_eq!(status, 404);
+}
