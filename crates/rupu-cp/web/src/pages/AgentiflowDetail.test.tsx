@@ -259,6 +259,35 @@ describe('AgentiflowDetail', () => {
     expect(fetchAgentiflowNetflow).toHaveBeenCalledWith('af_01ABC', window, undefined);
   });
 
+  it('fetches a W7 unit output lazily when its Fleet row is expanded', async () => {
+    const lazyDetail: Detail = {
+      ...DETAIL,
+      units: [
+        {
+          ...DETAIL.units[0],
+          unit_id: 'unit_w7',
+          // A W7 unit: done, but the list carries no output (fetched on demand).
+          status: { state: 'done', success: true },
+        },
+      ],
+    };
+    vi.spyOn(api, 'getAgentiflow').mockResolvedValue(lazyDetail);
+    const getOutput = vi.spyOn(api, 'getAgentiflowUnitOutput').mockResolvedValue('the W7 answer');
+    renderDetail();
+    await screen.findByRole('heading', { name: 'rupu-self-review' });
+
+    const fleet = screen.getByRole('heading', { name: 'Fleet' }).closest('section')!;
+    // Nothing is fetched until the row is expanded.
+    expect(getOutput).not.toHaveBeenCalled();
+
+    const details = within(fleet).getByText('output').closest('details')!;
+    details.open = true;
+    fireEvent(details, new Event('toggle'));
+
+    await waitFor(() => expect(getOutput).toHaveBeenCalledWith('af_01ABC', 'unit_w7'));
+    expect(await within(fleet).findByText('the W7 answer')).toBeInTheDocument();
+  });
+
   it('falls back to the record alone without a definition snapshot', async () => {
     vi.spyOn(api, 'getAgentiflow').mockResolvedValue({ ...DETAIL, def: null, lead_transcripts: [] });
     renderDetail();

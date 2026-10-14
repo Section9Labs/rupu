@@ -368,6 +368,109 @@ async fn children_endpoint_returns_the_flow_launch_tree() {
     assert_eq!(get(addr, "/api/agentiflows/af_missing/children").await.0, 404);
 }
 
+/// Append a children-ledger `started` line for a W7 unit under the flow dir.
+fn ledger_unit_line(run_dir: &Path, run_id: &str) {
+    rupu_launch::ledger::append(
+        run_dir,
+        &rupu_launch::ledger::LedgerLine::Started(rupu_launch::ledger::Started::new(
+            &format!("ch_{run_id}"),
+            rupu_tools::ChildKind::Agent,
+            "recon",
+            run_id,
+            1,
+            1,
+        )),
+    );
+}
+
+/// Append a `finished` line (done) for that unit, with or without a recorded
+/// answer.
+fn ledger_finished(run_dir: &Path, run_id: &str, output: Option<&str>) {
+    rupu_launch::ledger::append(
+        run_dir,
+        &rupu_launch::ledger::LedgerLine::Finished(rupu_launch::ledger::Finished {
+            success: Some(true),
+            output: output.map(str::to_string),
+            ..rupu_launch::ledger::Finished::new(
+                &format!("ch_{run_id}"),
+                rupu_tools::ChildState::Done,
+                None,
+            )
+        }),
+    );
+}
+
+#[tokio::test]
+async fn unit_output_rides_the_ledger_and_falls_back_to_the_transcript() {
+    let tmp = tempfile::tempdir().unwrap();
+    let global = tmp.path();
+    let af = "af_01LAZYOUTPUT000000000000000";
+    let run = agentiflow_dir(global).join(af);
+    record(af, "2026-10-14T00:00:00Z", "completed")
+        .write(&run)
+        .unwrap();
+
+    // Unit A: its `finished` ledger line carries the answer, so it rides along
+    // in the list for free — no transcript read.
+    let a = "run_01LAZYUNITA0000000000000000";
+    ledger_unit_line(&run, a);
+    ledger_finished(&run, a, Some("answer from the ledger"));
+
+    // Unit B: finished, but its ledger line records no answer; its transcript
+    // has one. The list omits it; it is served on demand from the transcript.
+    let b = "run_01LAZYUNITB0000000000000000";
+    ledger_unit_line(&run, b);
+    ledger_finished(&run, b, None);
+    let transcripts = global.join("transcripts");
+    std::fs::create_dir_all(&transcripts).unwrap();
+    std::fs::write(
+        transcripts.join(format!("{b}.jsonl")),
+        "{\"type\":\"run_start\",\"data\":{\"run_id\":\"u\",\"workspace_id\":\"ws\",\
+         \"agent\":\"recon\",\"provider\":\"mock\",\"model\":\"m\",\
+         \"started_at\":\"2026-10-14T00:00:01Z\",\"mode\":\"bypass\"}}\n\
+         {\"type\":\"assistant_message\",\"data\":{\"content\":\"answer from the transcript\"}}\n",
+    )
+    .unwrap();
+    let addr = spawn_server(global).await;
+
+    let (_, detail) = get(addr, &format!("/api/agentiflows/{af}")).await;
+    let units = detail["units"].as_array().unwrap();
+    let ua = units.iter().find(|u| u["unit_id"] == a).unwrap();
+    let ub = units.iter().find(|u| u["unit_id"] == b).unwrap();
+    // A: the ledger answer rides the list.
+    assert_eq!(ua["status"]["output"], "answer from the ledger");
+    // B: no ledger answer → the list omits it (fetched on demand instead).
+    assert!(
+        ub["status"].get("output").is_none() || ub["status"]["output"].is_null(),
+        "a unit with no ledger output must be omitted from the list: {ub}"
+    );
+
+    // On demand, B's answer comes from its transcript.
+    let (st, body) = get(addr, &format!("/api/agentiflows/{af}/units/{b}/output")).await;
+    assert_eq!(st, 200);
+    assert_eq!(body["output"], "answer from the transcript");
+
+    // A unit id that is not under this flow is a 404.
+    assert_eq!(
+        get(addr, &format!("/api/agentiflows/{af}/units/run_nope/output"))
+            .await
+            .0,
+        404
+    );
+}
+
+#[tokio::test]
+async fn unit_output_falls_back_to_a_legacy_unit_json() {
+    // A legacy `units/*/unit.json` records its answer directly; the endpoint
+    // serves it even when the unit's transcript has no answer turn.
+    let tmp = tempfile::tempdir().unwrap();
+    seed(tmp.path());
+    let addr = spawn_server(tmp.path()).await;
+    let (st, body) = get(addr, &format!("/api/agentiflows/{DONE}/units/{UNIT_A}/output")).await;
+    assert_eq!(st, 200);
+    assert_eq!(body["output"], "found it");
+}
+
 async fn steer(addr: SocketAddr, id: &str) -> (u16, Value) {
     let resp = reqwest::Client::new()
         .post(format!("http://{addr}/api/agentiflows/{id}/steer"))

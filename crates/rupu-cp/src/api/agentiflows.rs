@@ -57,6 +57,10 @@ pub fn routes() -> Router<AppState> {
         .route("/api/agentiflows/:id", get(get_agentiflow))
         .route("/api/agentiflows/:id/events", get(get_agentiflow_events))
         .route("/api/agentiflows/:id/children", get(get_agentiflow_children))
+        .route(
+            "/api/agentiflows/:id/units/:unit_id/output",
+            get(get_agentiflow_unit_output),
+        )
         .route("/api/agentiflows/:id/steer", post(steer_agentiflow))
 }
 
@@ -594,12 +598,11 @@ fn ledger_unit(s: &AppState, e: rupu_launch::ledger::ChildEntry) -> UnitDto {
     let state = e.state();
     let f = e.finished.as_ref();
     let transcript = child_transcript(s, &e.started);
-    let output = match state {
-        rupu_tools::ChildState::Done => transcript
-            .as_deref()
-            .and_then(rupu_transcript::final_answer),
-        _ => None,
-    };
+    // The unit's answer is recorded in its `Finished` ledger line, so it rides
+    // along for free — the units list never reads a (possibly multi-MB)
+    // transcript. For the rare finished unit whose ledger line carries no
+    // output, the Fleet row fetches it on demand from the transcript
+    // (`GET …/units/:unit_id/output`).
     let (codename, codename_derived) = crate::codename::named(
         e.started.codename.as_deref(),
         &e.started.run_id,
@@ -614,7 +617,7 @@ fn ledger_unit(s: &AppState, e: rupu_launch::ledger::ChildEntry) -> UnitDto {
         status: UnitStatusDto {
             state: state.as_str(),
             success: f.and_then(|f| f.success),
-            output,
+            output: f.and_then(|f| f.output.clone()),
             error: f.and_then(|f| f.error.clone()),
         },
         pgid: e.started.pgid,
@@ -886,7 +889,15 @@ fn build_events(s: &AppState, id: &str) -> Option<EventsResponse> {
             if let Some(e) = &u.status.error {
                 ev["error"] = Value::String(snippet(e));
             }
-            if let Some(o) = &u.status.output {
+            // A unit's answer rides its ledger (or legacy `unit.json`) record,
+            // so it is already in hand; only a `done` unit whose record carries
+            // none is read from the transcript here, in the events path.
+            let output = u.status.output.clone().or_else(|| {
+                (u.status.state == "done")
+                    .then(|| unit_output(s, &run_dir, &u.unit_id))
+                    .flatten()
+            });
+            if let Some(o) = &output {
                 ev["output"] = Value::String(snippet(o));
             }
             out.push(ev);
@@ -993,6 +1004,65 @@ fn legacy_unit_children(
             }
         })
         .collect()
+}
+
+/// A unit's final answer, resolved on demand. The transcript's final turn is
+/// authoritative when the transcript is on disk (a W7 unit); a legacy
+/// `units/*/unit.json` records the answer directly, the fallback when there is
+/// no answer in (or no) transcript. `None` unless the unit finished with one.
+fn unit_output(s: &AppState, run_dir: &std::path::Path, unit_id: &str) -> Option<String> {
+    if let Some(t) = unit_transcript(s, unit_id) {
+        if let Some(answer) = rupu_transcript::final_answer(&t) {
+            return Some(answer);
+        }
+    }
+    units_on_disk(run_dir)
+        .into_iter()
+        .find(|u| u.unit_id == unit_id)
+        .and_then(|u| match u.status {
+            UnitStatus::Done(o) => Some(o.output),
+            _ => None,
+        })
+}
+
+/// `GET /api/agentiflows/:id/units/:unit_id/output` — one unit's final answer,
+/// read on demand so the units list (and its live poll) never pays the
+/// transcript read. `{ "output": string | null }`; `output` is null when the
+/// unit recorded no answer. 404 unless `unit_id` is a unit of this flow. Local
+/// reads only — no `?host=`.
+async fn get_agentiflow_unit_output(
+    State(s): State<AppState>,
+    Path((id, unit_id)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    if !valid_run_id(&id) {
+        return Err(ApiError::not_found(format!("no agentiflow run `{id}`")));
+    }
+    if unit_id.is_empty()
+        || !unit_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(ApiError::not_found(format!("`{unit_id}` is not a unit id")));
+    }
+    let run_dir = agentiflow_dir(&s.global_dir).join(&id);
+    if !run_dir.is_dir() {
+        return Err(ApiError::not_found(format!("no agentiflow run `{id}`")));
+    }
+    let output = tokio::task::spawn_blocking({
+        let unit_id = unit_id.clone();
+        move || {
+            // The unit must belong to this flow — the lookup is cheap now that
+            // the list no longer reads transcripts.
+            if !read_units(&s, &run_dir).iter().any(|u| u.unit_id == unit_id) {
+                return Err(());
+            }
+            Ok(unit_output(&s, &run_dir, &unit_id))
+        }
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("reading agentiflow {id} unit output panicked: {e}")))?
+    .map_err(|()| ApiError::not_found(format!("agentiflow `{id}` has no unit `{unit_id}`")))?;
+    Ok(Json(serde_json::json!({ "output": output })))
 }
 
 /// `POST /api/agentiflows/:id/steer` — the older spelling of a message to
