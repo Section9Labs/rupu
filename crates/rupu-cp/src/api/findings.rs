@@ -648,9 +648,10 @@ pub fn tag_findings_across(
 /// though the findings are already on disk.
 ///
 /// Every run the launch tree under `parent` holds (W7 `children.jsonl`
-/// ledgers, as the Children tab walks them) is in the set too: the agents a
-/// run dispatched and, for an agentiflow (`af_…`, not a [`RunStore`] run),
-/// its units and theirs.
+/// ledgers, walked as the Children tab walks them) is in the set too: the
+/// agents a run dispatched, every run of a child continued across a resume,
+/// and for an agentiflow (`af_…`, not a [`RunStore`] run) its units and
+/// theirs.
 pub fn resolve_run_scope(store: &RunStore, parent: &str) -> HashSet<String> {
     let mut set = HashSet::new();
     set.insert(parent.to_string());
@@ -660,13 +661,11 @@ pub fn resolve_run_scope(store: &RunStore, parent: &str) -> HashSet<String> {
     for id in sub_run_ids_from_events(store, parent) {
         set.insert(id);
     }
-    for child in launch_tree(store, parent) {
-        set.insert(child.run_id);
-    }
+    set.extend(launch_tree(store, parent));
     set
 }
 
-fn launch_tree(store: &RunStore, parent: &str) -> Vec<crate::api::children::ChildDto> {
+fn launch_tree(store: &RunStore, parent: &str) -> Vec<String> {
     use crate::api::children;
     // `parent` is a query value and becomes a directory name below.
     let is_id = !parent.is_empty()
@@ -677,14 +676,27 @@ fn launch_tree(store: &RunStore, parent: &str) -> Vec<crate::api::children::Chil
         return Vec::new();
     }
     if !parent.starts_with("af_") {
-        return children::children_of(store, parent);
+        return children::tree_run_ids(store, parent);
     }
     // The run store is `<global>/runs`; agentiflows sit beside it.
     let Some(global) = store.root.parent() else {
         return Vec::new();
     };
     let flow_dir = rupu_agentiflow::agentiflow_dir(global).join(parent);
-    children::with_descendants(store, children::ledger_units(&flow_dir, parent))
+    // Its units: the ledger's (W7) and the `units/` mirrors of a flow from
+    // before it.
+    let mut units: Vec<String> = rupu_launch::ledger::read(&flow_dir)
+        .into_iter()
+        .map(|e| e.started.run_id)
+        .collect();
+    units.extend(
+        rupu_agentiflow::units_on_disk(&flow_dir)
+            .into_iter()
+            .map(|u| u.unit_id),
+    );
+    let below = children::tree_run_ids_below(store, &units);
+    units.extend(below);
+    units
 }
 
 /// Sub-run ids recovered from the parent's `events.jsonl` (written live). Each
@@ -2661,6 +2673,54 @@ mod tests {
         let mut got: Vec<&str> = scope.iter().map(String::as_str).collect();
         got.sort_unstable();
         assert_eq!(got, ["af_flow", "run_grandchild", "run_unit1", "run_unit2"]);
+    }
+
+    /// A child a resumed step continued under the same handle declared
+    /// findings under both of its runs: both are in the scope, though the
+    /// Children tab lists the handle once.
+    #[test]
+    fn resolve_run_scope_holds_every_run_of_a_continued_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        std::fs::create_dir_all(store.root.join("run_wf")).unwrap();
+        let rows: String = ["step_a1", "step_a2"]
+            .iter()
+            .map(|a| {
+                format!(
+                    "{{\"step_id\":\"scan\",\"run_id\":\"{a}\",\"transcript_path\":\"/t\",\"output\":\"\",\"success\":true,\"skipped\":false,\"rendered_prompt\":\"go\",\"finished_at\":\"2026-10-12T00:00:00Z\"}}\n"
+                )
+            })
+            .collect();
+        std::fs::write(store.root.join("run_wf").join("step_results.jsonl"), rows).unwrap();
+        rupu_launch::ledger::append(&store.root.join("step_a1"), &started_line("ch_1", "run_c1"));
+        rupu_launch::ledger::append(&store.root.join("step_a2"), &started_line("ch_1", "run_c2"));
+
+        let scope = resolve_run_scope(&store, "run_wf");
+        assert!(scope.contains("run_c1"), "{scope:?}");
+        assert!(scope.contains("run_c2"), "{scope:?}");
+    }
+
+    /// A flow from before the children ledger mirrored its units under
+    /// `units/<run id>/unit.json`.
+    #[test]
+    fn resolve_run_scope_holds_a_pre_ledger_flows_units() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        let unit = rupu_agentiflow::agentiflow_dir(tmp.path())
+            .join("af_old")
+            .join("units")
+            .join("run_old_unit");
+        std::fs::create_dir_all(&unit).unwrap();
+        std::fs::write(
+            unit.join("unit.json"),
+            r#"{"run_id":"run_old_unit","agent":"recon","kind":"agent",
+               "participant":"recon#1","started_at":"2026-10-06T00:00:00+00:00",
+               "status":{"state":"done","success":true,"output":"ok"}}"#,
+        )
+        .unwrap();
+
+        let scope = resolve_run_scope(&store, "af_old");
+        assert!(scope.contains("run_old_unit"), "{scope:?}");
     }
 
     /// A standalone run's dispatched agents are in its scope.
