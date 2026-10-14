@@ -46,6 +46,8 @@ pub enum FoldEvent {
     Flow(Box<FlowRecord>),
     Patch { index: usize, patch: FlowPatch },
     Dropped(u64),
+    /// Dropped records since recovered: subtract from the dropped count.
+    Recovered(u64),
     Capture(CaptureEntry),
 }
 
@@ -94,6 +96,7 @@ impl LedgerFold {
                 },
             }),
             LedgerLine::Dropped { count, .. } => Some(FoldEvent::Dropped(count)),
+            LedgerLine::Recovered { count, .. } => Some(FoldEvent::Recovered(count)),
             LedgerLine::Capture {
                 ts,
                 state,
@@ -178,6 +181,10 @@ mod tests {
                 count: 3,
                 ts: chrono::DateTime::from_timestamp(250, 0).unwrap(),
             },
+            LedgerLine::Recovered {
+                count: 1,
+                ts: chrono::DateTime::from_timestamp(260, 0).unwrap(),
+            },
             LedgerLine::SocketComplete(SocketCompletion {
                 id: crate::FlowId::from_parts(2, 2),
                 duration_ms: 11,
@@ -222,6 +229,7 @@ mod tests {
                     Some(FoldEvent::Flow(f)) => flows.push(*f),
                     Some(FoldEvent::Patch { index, patch }) => patch.apply(&mut flows[index]),
                     Some(FoldEvent::Dropped(n)) => dropped += n,
+                    Some(FoldEvent::Recovered(n)) => dropped = dropped.saturating_sub(n),
                     Some(FoldEvent::Capture(_)) => captures += 1,
                     None => {}
                 }
@@ -249,7 +257,7 @@ mod tests {
     #[test]
     fn a_socket_completion_rewrites_the_earlier_flows_outcome() {
         let (flows, dropped, _) = fold_chunked(&ledger_text(), &[]);
-        assert_eq!(dropped, 3);
+        assert_eq!(dropped, 2);
         assert_eq!(flows[0].bytes_in, Some(7));
         assert!(flows[0].body_complete);
         assert_eq!(flows[1].outcome, Outcome::TransportError);

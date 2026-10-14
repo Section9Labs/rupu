@@ -1,8 +1,9 @@
 //! `rupu netflow prune` never deletes a live run's ledger, however old its
 //! mtime: an idle-but-live workflow run (non-terminal `run.json` with a
 //! live runner pid) and a standalone `rupu run` (metadata with a live pid)
-//! keep theirs, reported `skipped_live`; a finished run's and an unknown
-//! id's old ledgers are deleted as before.
+//! keep theirs, and so does every child they launched, reported
+//! `skipped_live`; a finished run's and an unknown id's old ledgers are
+//! deleted as before.
 
 use assert_cmd::Command;
 use std::path::Path;
@@ -34,6 +35,20 @@ fn run_json(home: &Path, id: &str, status: &str, pid: Option<u32>) {
     std::fs::write(dir.join("workflow.yaml"), "name: nightly\nsteps: []\n").unwrap();
 }
 
+fn launched(dir: &Path, run_id: &str) {
+    rupu_launch::ledger::append(
+        dir,
+        &rupu_launch::ledger::LedgerLine::Started(rupu_launch::ledger::Started::new(
+            &format!("ch_{run_id}"),
+            rupu_tools::ChildKind::Agent,
+            "recon",
+            run_id,
+            1,
+            1,
+        )),
+    );
+}
+
 #[test]
 fn prune_skips_ledgers_of_live_runs() {
     let home = tempfile::tempdir().unwrap();
@@ -45,6 +60,12 @@ fn prune_skips_ledgers_of_live_runs() {
     // Idle-but-live workflow run: Running, runner pid alive.
     run_json(home.path(), "run_wf_live", "running", Some(me));
     old_ledger(&netflow, "run_wf_live");
+    // An agent it launched keeps its own ledger under its own run id.
+    launched(
+        &home.path().join("runs").join("run_wf_live"),
+        "run_wf_child",
+    );
+    old_ledger(&netflow, "run_wf_child");
     // Paused workflow run: a resume appends to the same ledger.
     run_json(home.path(), "run_wf_paused", "paused", None);
     old_ledger(&netflow, "run_wf_paused");
@@ -68,6 +89,11 @@ fn prune_skips_ledgers_of_live_runs() {
     )
     .unwrap();
     old_ledger(&netflow, "run_sa_live");
+    launched(
+        &home.path().join("runs").join("run_sa_live"),
+        "run_sa_child",
+    );
+    old_ledger(&netflow, "run_sa_child");
     // No owner anywhere.
     old_ledger(&netflow, "run_unknown");
 
@@ -93,7 +119,13 @@ fn prune_skips_ledgers_of_live_runs() {
             .find(|r| r["run_id"] == id)
             .map(|r| r["status"].as_str().unwrap().to_string())
     };
-    for id in ["run_wf_live", "run_wf_paused", "run_sa_live"] {
+    for id in [
+        "run_wf_live",
+        "run_wf_child",
+        "run_wf_paused",
+        "run_sa_live",
+        "run_sa_child",
+    ] {
         assert_eq!(status_of(id).as_deref(), Some("skipped_live"), "{id}");
         assert!(netflow.join(format!("{id}.jsonl")).exists(), "{id} deleted");
     }

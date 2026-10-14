@@ -50,6 +50,15 @@ enum Out<'a> {
 /// Append `line` (a JSON object without its newline) as ONE write, holding the
 /// stream's lock file so writers in several tasks or processes never interleave.
 fn locked_append(path: &Path, line: &str) -> std::io::Result<()> {
+    let mut buf = String::with_capacity(line.len() + 1);
+    buf.push_str(line);
+    buf.push('\n');
+    locked_append_bytes(path, buf.as_bytes())
+}
+
+/// Append `buf` (whole newline-terminated lines) as ONE write under the
+/// stream's lock file.
+fn locked_append_bytes(path: &Path, buf: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -59,14 +68,11 @@ fn locked_append(path: &Path, line: &str) -> std::io::Result<()> {
         .write(true)
         .open(lock_path(path))?;
     lock.lock()?;
-    let mut buf = String::with_capacity(line.len() + 1);
-    buf.push_str(line);
-    buf.push('\n');
     let res = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-        .and_then(|mut f| f.write_all(buf.as_bytes()));
+        .and_then(|mut f| f.write_all(buf));
     let _ = lock.unlock();
     res
 }
@@ -107,4 +113,31 @@ pub fn write_stream_begin(path: &Path, run_id: &str) -> std::io::Result<()> {
 pub fn append_stream_line(path: &Path, ledger: &str, line: &LedgerLine) -> std::io::Result<()> {
     let line = serde_json::to_string(&Out::Line { ledger, line })?;
     locked_append(path, &line)
+}
+
+/// Tee already-serialized ledger lines (`lines`: newline-separated JSON, as
+/// written to the ledger) into the stream, tagged with `ledger`, in one
+/// locked write — the ledger backfill's batches. A blank or non-JSON line is
+/// skipped rather than written as a stream line the coordinator would count
+/// as malformed.
+pub fn append_stream_raw_lines(path: &Path, ledger: &str, lines: &[u8]) -> std::io::Result<()> {
+    let tag = serde_json::to_string(ledger)?;
+    let mut buf = Vec::with_capacity(lines.len() + 64);
+    for raw in lines.split(|b| *b == b'\n') {
+        let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+        if raw.iter().all(u8::is_ascii_whitespace)
+            || serde_json::from_slice::<&serde_json::value::RawValue>(raw).is_err()
+        {
+            continue;
+        }
+        buf.extend_from_slice(b"{\"kind\":\"line\",\"ledger\":");
+        buf.extend_from_slice(tag.as_bytes());
+        buf.extend_from_slice(b",\"line\":");
+        buf.extend_from_slice(raw);
+        buf.extend_from_slice(b"}\n");
+    }
+    if buf.is_empty() {
+        return Ok(());
+    }
+    locked_append_bytes(path, &buf)
 }

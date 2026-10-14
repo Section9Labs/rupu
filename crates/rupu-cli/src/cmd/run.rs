@@ -907,13 +907,19 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     // `shutdown()`, so the writer task's own periodic ticker is the
     // primary safety net, but a clean CLI exit should still flush
     // promptly rather than rely on that ticker's multi-second cadence).
-    let (netflow_sink, netflow_handle) = crate::netflow_sink::for_run(
+    let netflow = crate::netflow_sink::for_run(
         &global,
         project_root.as_deref(),
         &run_id,
         &transcript_path,
         netflow_stream,
     );
+    let netflow_sink = netflow.sink.clone();
+    // Shared with the body so it can finish the capture before the run's
+    // record turns terminal (below); whatever path skips that finishes it
+    // after the body.
+    let netflow = Arc::new(std::sync::Mutex::new(Some(netflow)));
+    let netflow_for_body = Arc::clone(&netflow);
 
     // Everything below that can generate outbound HTTP (provider build,
     // SCM registry discovery, repo clone, the agent run itself) is wrapped
@@ -1432,6 +1438,20 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         let run_result = standalone_run_outcome(run_result);
         let success = run_result.is_ok();
 
+        // Finish this run's netflow — flush the writer, write its `Dropped`
+        // line, backfill from the transcript, each teed into a coordinator's
+        // stream — BEFORE the record turns terminal: a coordinator pulls the
+        // stream once it sees a terminal run.json, and a line written after
+        // that would be missing from a copy it calls whole (spec 2026-10-14
+        // remote netflow transport §N2).
+        let finishing = netflow_for_body
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some(n) = finishing {
+            n.finish().await;
+        }
+
         // Write run.json so the run is observable via RunStore and the mirror
         // can carry final_output back to the central control-plane.
         {
@@ -1570,8 +1590,9 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     // for long-running daemons like `rupu cp serve`, not a substitute for
     // this for a one-shot CLI process that may exit within milliseconds
     // of the ticker's last check.
-    if let Some(handle) = netflow_handle {
-        handle.shutdown().await;
+    let leftover = netflow.lock().unwrap_or_else(|p| p.into_inner()).take();
+    if let Some(n) = leftover {
+        n.finish().await;
     }
 
     body_result

@@ -596,13 +596,13 @@ pub(crate) struct PrunedLedger {
 ///   terminal — `Paused`/`AwaitingApproval` included, since a resume keeps
 ///   appending to the same ledgers — unless it is `Running`/`Pending` with
 ///   a recorded runner pid that is dead (an orphan the reaper will
-///   finalize). Its id expands to its steps', fan-out units' and
-///   sub-agents' ids, plus every ledger a placed unit landed here
-///   ([`rupu_cp::api::netflow::netflow_ids`]);
+///   finalize). Its id expands to its steps', fan-out units', sub-agents'
+///   and launched children's ids, plus every ledger a placed unit landed
+///   here ([`rupu_cp::api::netflow::netflow_ids`]);
 /// - a standalone `rupu run` whose `<run_id>.meta.json` (project or global
 ///   transcripts dir) records a pid that is alive — the run writes its
 ///   `run.json` only when it ends, so the metadata pid is its one liveness
-///   signal — plus its sub-agents' ids. Metadata without a pid (written
+///   signal — expanded the same way. Metadata without a pid (written
 ///   before the field existed) carries no signal and protects nothing.
 ///
 /// Unreadable stores and metadata files are skipped: a run this cannot see
@@ -661,8 +661,11 @@ pub(crate) fn live_ledger_ids(
                 .pid
                 .is_some_and(rupu_orchestrator::runs::pid_is_running)
             {
-                live.extend(global_store.sub_run_ids_recursive(&meta.run_id));
-                live.insert(meta.run_id);
+                live.extend(rupu_cp::api::netflow::run_and_unit_ids(
+                    global,
+                    &global_store,
+                    &meta.run_id,
+                ));
             }
         }
     }

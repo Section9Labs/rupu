@@ -215,9 +215,9 @@ impl PreparedProvider {
 /// A run ready to start: its options, and what the assembler opened for it.
 pub struct AssembledRun {
     pub opts: AgentRunOpts,
-    /// The run's netflow ledger writer, when the assembler built the sink:
-    /// shut down when the run ends.
-    netflow: Option<rupu_netflow::NetflowWriterHandle>,
+    /// The run's netflow capture, when the assembler built the sink:
+    /// finished when the run ends.
+    netflow: Option<crate::netflow::RunNetflow>,
     /// The in-process parent this run borrows an admission slot from.
     parent_run_id: Option<String>,
     /// The run goes through admission ([`OriginDefaults::admission`]).
@@ -233,7 +233,7 @@ impl AssembledRun {
     }
 
     /// Take an admission slot (lending from an in-process parent) and run
-    /// the agent loop; flush the run's netflow ledger at the end.
+    /// the agent loop; finish the run's netflow capture at the end.
     pub async fn run(self) -> RunExit {
         self.admit().await.run().await
     }
@@ -277,7 +277,7 @@ impl AssembledRun {
 /// An assembled run holding its admission slot ([`AssembledRun::admit`]).
 pub struct AdmittedRun {
     opts: AgentRunOpts,
-    netflow: Option<rupu_netflow::NetflowWriterHandle>,
+    netflow: Option<crate::netflow::RunNetflow>,
     permit: Option<crate::admission::JobPermit>,
 }
 
@@ -288,8 +288,8 @@ impl AdmittedRun {
         self.permit.as_ref()
     }
 
-    /// Run the agent loop; release the slot and flush the run's netflow
-    /// ledger at the end.
+    /// Run the agent loop; release the slot and finish the run's netflow
+    /// capture at the end.
     pub async fn run(self) -> RunExit {
         let AdmittedRun {
             opts,
@@ -298,8 +298,8 @@ impl AdmittedRun {
         } = self;
         let exit = rupu_agent::run_agent_full(opts).await;
         drop(permit);
-        if let Some(h) = netflow {
-            h.shutdown().await;
+        if let Some(n) = netflow {
+            n.finish().await;
         }
         exit
     }
@@ -581,13 +581,16 @@ impl RunAssembler {
         // The run's netflow sink — built before the provider, which takes it.
         let (sink, netflow) = match spec.services.netflow.clone() {
             Some(sink) => (sink, None),
-            None => crate::netflow::for_run(
-                &self.ctx.global,
-                self.ctx.project_root.as_deref(),
-                &spec.run_id,
-                &spec.transcript_path,
-                netflow_stream.clone(),
-            ),
+            None => {
+                let netflow = crate::netflow::for_run(
+                    &self.ctx.global,
+                    self.ctx.project_root.as_deref(),
+                    &spec.run_id,
+                    &spec.transcript_path,
+                    netflow_stream.clone(),
+                );
+                (netflow.sink.clone(), Some(netflow))
+            }
         };
         let prepared = match spec.services.provider.take() {
             Some(p) => Ok(p),
@@ -605,8 +608,8 @@ impl RunAssembler {
         } = match prepared {
             Ok(p) => p,
             Err(e) => {
-                if let Some(h) = netflow {
-                    h.shutdown().await;
+                if let Some(n) = netflow {
+                    n.finish().await;
                 }
                 return Err(e);
             }
@@ -800,8 +803,8 @@ impl RunAssembler {
                 if let Err(w) = rupu_transcript::JsonlWriter::create(&spec.transcript_path) {
                     tracing::warn!(error = %w, "create the transcript of a run whose grant failed");
                 }
-                if let Some(h) = netflow {
-                    h.shutdown().await;
+                if let Some(n) = netflow {
+                    n.finish().await;
                 }
                 return Err(e.into());
             }

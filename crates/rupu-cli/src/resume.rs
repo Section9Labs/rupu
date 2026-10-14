@@ -370,13 +370,14 @@ async fn rebuild_opts_from_disk(
     // It tees into the stream it was launched under: its link's root, else
     // its own begun stream (spec 2026-10-14 remote netflow transport §N1).
     let launch_link = store.read_launch_link(run_id);
-    let (netflow_sink, _netflow_handle) = crate::netflow_sink::for_run(
+    let _netflow = crate::netflow_sink::for_run(
         &global,
         project_root.as_deref(),
         run_id,
         &transcripts.join(format!("{run_id}.jsonl")),
         crate::netflow_sink::root_stream(&global, launch_link.as_ref(), run_id),
     );
+    let netflow_sink = _netflow.sink.clone();
     let mcp_registry =
         Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg, netflow_sink).await);
 

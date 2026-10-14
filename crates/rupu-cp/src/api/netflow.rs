@@ -33,8 +33,12 @@
 //! a ledger-only read reports nothing for it — the run's own transcript,
 //! which the same sink always writes to independent of the ledger's fate,
 //! is the ONLY surviving record of that run's network activity.
-//! [`merge_with_transcript`] is what makes those flows reachable at all;
-//! see its doc for the dedup rule.
+//! A run that reaches its end copies those flows into its ledger
+//! (`rupu_runtime::netflow::RunNetflow::finish`), so every scope reads
+//! them there; [`merge_with_transcript`] is the fallback for a run that
+//! crashed or was killed first, at run and agentiflow scope, over the run's
+//! own transcripts and those of the children it launched (`run_tree`).
+//! See its doc for the dedup rule.
 //!
 //! ## Blocking I/O never runs on the async task
 //!
@@ -548,6 +552,10 @@ pub(crate) fn maybe_refresh_asn(cfg: &rupu_config::NetflowConfig, cache: &Arc<As
 /// file, so those flows are already in the ledger read (see the module
 /// doc).
 ///
+/// A run that reached its end has already had its transcript-only flows
+/// appended to its ledger (`rupu_runtime::netflow::RunNetflow::finish`);
+/// the merge still matters for one that crashed or was killed first.
+///
 /// On a normal run (ledger opened fine), every flow already exists in the
 /// ledger; the merge is then a no-op union — nothing new is added, because
 /// every transcript-side id the dedup below sees already has a ledger-side
@@ -705,10 +713,77 @@ fn resolve_ledger_paths(workspace: &StdPath, global_dir: &StdPath, id: &str) -> 
 /// is never silently read as "only what this run's own provider calls
 /// did" when it also includes what every agent it dispatched did.
 ///
+/// Every child a run launched (a `dispatch` of a sub-agent, agent or
+/// workflow) writes its own ledger under its own run id, so each collected
+/// id is also walked through [`rupu_launch::identity::launch_tree`] from its
+/// children ledger, `<global>/runs/<id>/children.jsonl`. That ledger is
+/// always under the GLOBAL runs dir, whichever store holds the run's own
+/// record, which is why this takes `global`. A `workflow` child's run
+/// record is in the global store too, and it is expanded like the root:
+/// its steps', fan-out units' and sub-agents' ids, each walked for the
+/// children it launched in turn. Every id is walked once, so a ledger that
+/// names an ancestor can't loop. Most ids launched nothing, and their walk
+/// is one failed open of a missing `children.jsonl`.
+///
 /// This is the inner walk of [`netflow_ids`], which every read path and
 /// `rupu netflow prune` call; nothing else should walk ids through this
 /// function alone, because it cannot see what a remote unit landed.
-pub fn run_and_unit_ids(store: &RunStore, run_id: &str) -> Vec<String> {
+pub fn run_and_unit_ids(global: &StdPath, store: &RunStore, run_id: &str) -> Vec<String> {
+    run_tree(global, store, run_id).ids
+}
+
+/// What a run's netflow read covers: every ledger id of [`run_and_unit_ids`],
+/// and the transcripts of the children the run launched.
+pub(crate) struct RunTree {
+    pub ids: Vec<String>,
+    /// Each launched agent's or sub-agent's transcript, and every transcript
+    /// of a launched workflow's run. A child's run end copies its
+    /// transcript's flows into its ledger
+    /// (`rupu_runtime::netflow::RunNetflow::finish`); one that crashed or
+    /// was killed never got there, and these are where its flows survive.
+    pub child_transcripts: Vec<PathBuf>,
+}
+
+/// [`run_and_unit_ids`]' walk, with the launched children's transcripts.
+pub(crate) fn run_tree(global: &StdPath, store: &RunStore, run_id: &str) -> RunTree {
+    let runs = global.join("runs");
+    let global_store = RunStore::new(runs.clone());
+    let mut ids = own_ids(store, run_id);
+    let mut child_transcripts = Vec::new();
+    let mut walked: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut pending = ids.clone();
+    while let Some(id) = pending.pop() {
+        if !walked.insert(id.clone()) {
+            continue;
+        }
+        for child in rupu_launch::identity::launch_tree(global, &runs.join(&id)) {
+            if child.kind == rupu_tools::ChildKind::Workflow {
+                child_transcripts.extend(crate::usage::run_transcript_paths(
+                    &global_store,
+                    &child.run_id,
+                ));
+                let units = own_ids(&global_store, &child.run_id);
+                pending.extend(units.iter().cloned());
+                ids.extend(units);
+            } else {
+                child_transcripts.extend(child.transcript);
+                ids.push(child.run_id);
+            }
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    child_transcripts.sort();
+    child_transcripts.dedup();
+    RunTree {
+        ids,
+        child_transcripts,
+    }
+}
+
+/// `run_id`, its step and fan-out item ids from `store`'s
+/// `step_results.jsonl`, and the legacy `sub/` sub-runs below each of them.
+fn own_ids(store: &RunStore, run_id: &str) -> Vec<String> {
     let mut ids = vec![run_id.to_string()];
     for record in store.read_step_results(run_id).unwrap_or_default() {
         ids.push(record.run_id);
@@ -718,7 +793,7 @@ pub fn run_and_unit_ids(store: &RunStore, run_id: &str) -> Vec<String> {
     }
     // Snapshot before extending: sub-agent recursion must run once PER id
     // already collected (the run itself and every step/fan-out-item id),
-    // not just the run's own id — see the doc comment above.
+    // not just the run's own id — see [`run_and_unit_ids`]'s doc comment.
     let base_ids = ids.clone();
     for id in &base_ids {
         if id.is_empty() {
@@ -727,8 +802,6 @@ pub fn run_and_unit_ids(store: &RunStore, run_id: &str) -> Vec<String> {
         ids.extend(store.sub_run_ids_recursive(id));
     }
     ids.retain(|id| !id.is_empty());
-    ids.sort();
-    ids.dedup();
     ids
 }
 
@@ -750,15 +823,30 @@ pub struct NetflowIds {
 /// `pub` so `rupu netflow prune` protects every ledger a live run owns
 /// with the same id walk the read side uses.
 pub fn netflow_ids(store: &RunStore, global_dir: &StdPath, run_id: &str) -> NetflowIds {
+    let (tree, gaps) = netflow_tree(global_dir, store, run_id);
+    NetflowIds {
+        ids: tree.ids,
+        gaps,
+    }
+}
+
+/// [`netflow_ids`] keeping [`run_tree`]'s launched-children transcripts,
+/// for the read paths that merge them (one walk, not two).
+pub(crate) fn netflow_tree(
+    global_dir: &StdPath,
+    store: &RunStore,
+    run_id: &str,
+) -> (RunTree, Vec<IncompleteSource>) {
     use rupu_netflow::land::{read_landing_record, read_roster, LandingStatus};
     let runs = global_dir.join("runs");
-    let mut ids = run_and_unit_ids(store, run_id);
+    let mut tree = run_tree(global_dir, store, run_id);
     let roster = read_roster(&store.root, run_id);
     let roster_hosts: HashMap<String, String> = roster
         .iter()
         .map(|l| (l.unit_run_id.clone(), l.host.clone()))
         .collect();
-    ids.extend(roster.into_iter().map(|l| l.unit_run_id));
+    tree.ids
+        .extend(roster.into_iter().map(|l| l.unit_run_id));
     let mut gaps = Vec::new();
     let mut landed = Vec::new();
     // Only a roster unit or the run itself (a wholly placed run) can carry a
@@ -797,11 +885,11 @@ pub fn netflow_ids(store: &RunStore, global_dir: &StdPath, run_id: &str) -> Netf
             }
         }
     }
-    ids.extend(landed);
-    ids.retain(|i| !i.is_empty());
-    ids.sort();
-    ids.dedup();
-    NetflowIds { ids, gaps }
+    tree.ids.extend(landed);
+    tree.ids.retain(|i| !i.is_empty());
+    tree.ids.sort();
+    tree.ids.dedup();
+    (tree, gaps)
 }
 
 /// True when a run's own landing record is complete — a wholly placed run
@@ -851,10 +939,6 @@ pub(crate) struct RunMetaIndex {
     /// What [`netflow_ids`] reported missing for every run folded in: a
     /// placed unit whose stream was short, unavailable or never collected.
     landing_gaps: Vec<IncompleteSource>,
-    /// Where landing records and the global run store live
-    /// (`<global_dir>/runs/<id>/netflow.landing.json`). Empty under
-    /// `Default` (tests only); production builds through [`Self::with_global`].
-    global_dir: PathBuf,
     /// Root run ids already folded in — the same run RECORD can appear in
     /// both the global store and a project-local one, and pushing its
     /// span twice would double-count it in the active-runs strip.
@@ -862,19 +946,11 @@ pub(crate) struct RunMetaIndex {
 }
 
 impl RunMetaIndex {
-    /// An empty index that reads landing records under `global_dir`.
-    fn with_global(global_dir: PathBuf) -> Self {
-        Self {
-            global_dir,
-            ..Self::default()
-        }
-    }
-
     /// Fold one run record (looked up in ITS OWN store — see
     /// [`project_run_meta`]'s "same store each record was discovered
     /// from" rule) into the index. A run id already folded is skipped
     /// entirely (see `seen_runs`).
-    fn insert_run(&mut self, store: &RunStore, record: &RunRecord) {
+    fn insert_run(&mut self, global: &StdPath, store: &RunStore, record: &RunRecord) {
         if !self.seen_runs.insert(record.id.clone()) {
             return;
         }
@@ -882,11 +958,11 @@ impl RunMetaIndex {
             .worker_id
             .as_deref()
             .filter(|w| !w.is_empty() && *w != "local")
-            .filter(|_| !run_landed_complete(&self.global_dir, &record.id))
+            .filter(|_| !run_landed_complete(global, &record.id))
         {
             self.remote_workers.insert(worker.to_string());
         }
-        let NetflowIds { ids, gaps } = netflow_ids(store, &self.global_dir, &record.id);
+        let NetflowIds { ids, gaps } = netflow_ids(store, global, &record.id);
         self.landing_gaps.extend(gaps);
         for id in ids {
             self.map
@@ -979,28 +1055,29 @@ impl RunMetaIndex {
 /// own k run ids (k ≤ total runs) found in either store,
 /// [`run_and_unit_ids`] then issues one `read_step_results` call (a small
 /// `step_results.jsonl` read, `Ok(vec![])` if the run never dispatched a
-/// step) plus one `sub_run_ids` `read_dir` per (run, step/item,
-/// sub-agent-at-any-depth) id — bounded in practice by how deep/wide any
-/// one run's dispatch tree actually grew (`MAX_SUB_RUN_RECURSION_DEPTH`
-/// backstops the pathological case), not by the total run count. This
+/// step) plus one `sub_run_ids` `read_dir` and one `children.jsonl` open
+/// per (run, step/item, sub-agent-at-any-depth) id, and a read per launched
+/// child — bounded in practice by how deep/wide any one run's dispatch
+/// tree actually grew (`MAX_SUB_RUN_RECURSION_DEPTH` and `MAX_LAUNCH_DEPTH`
+/// backstop the pathological case), not by the total run count. This
 /// walk used to run TWICE per project request (once for the fallback id
 /// set, once for attribution); it now runs once, with the fallback ids
 /// derived from the index ([`RunMetaIndex::ledger_ids`]).
 fn project_run_meta(
-    global_store: &RunStore,
     global_dir: &StdPath,
+    global_store: &RunStore,
     workspace: &StdPath,
 ) -> RunMetaIndex {
     let canonical = canonicalize_or_self(workspace);
-    let mut meta = RunMetaIndex::with_global(global_dir.to_path_buf());
+    let mut meta = RunMetaIndex::default();
     for r in global_store.list().unwrap_or_default() {
         if canonicalize_or_self(&r.workspace_path) == canonical {
-            meta.insert_run(global_store, &r);
+            meta.insert_run(global_dir, global_store, &r);
         }
     }
     let local_store = RunStore::new(canonical.join(".rupu").join("runs"));
     for r in local_store.list().unwrap_or_default() {
-        meta.insert_run(&local_store, &r);
+        meta.insert_run(global_dir, &local_store, &r);
     }
     meta
 }
@@ -1033,14 +1110,14 @@ fn global_meta_workspace_roots(global_dir: &StdPath) -> std::collections::HashSe
 /// — see [`RunMetaCache`] for why the full walk stopped running on every
 /// request.
 fn global_run_meta(global_dir: &StdPath, global_store: &RunStore) -> RunMetaIndex {
-    let mut meta = RunMetaIndex::with_global(global_dir.to_path_buf());
+    let mut meta = RunMetaIndex::default();
     for r in global_store.list().unwrap_or_default() {
-        meta.insert_run(global_store, &r);
+        meta.insert_run(global_dir, global_store, &r);
     }
     for root in global_meta_workspace_roots(global_dir) {
         let local_store = RunStore::new(root.join(".rupu").join("runs"));
         for r in local_store.list().unwrap_or_default() {
-            meta.insert_run(&local_store, &r);
+            meta.insert_run(global_dir, &local_store, &r);
         }
     }
     meta
@@ -1356,14 +1433,16 @@ pub fn run_scoped_flows_and_dropped_with(
         .filter(|f| range.contains(f.ts))
         .collect();
     let mut dropped = extra_dropped;
-    for id in netflow_ids(store, global_dir, run_id).ids {
-        for ledger_path in resolve_ledger_paths(workspace, global_dir, &id) {
+    let (tree, _) = netflow_tree(global_dir, store, run_id);
+    for id in &tree.ids {
+        for ledger_path in resolve_ledger_paths(workspace, global_dir, id) {
             let (f, d) = reader.flows_in_range(&ledger_path, range);
             all.extend(f);
             dropped += d;
         }
     }
-    let transcript_paths = crate::usage::run_transcript_paths(store, run_id);
+    let mut transcript_paths = crate::usage::run_transcript_paths(store, run_id);
+    transcript_paths.extend(tree.child_transcripts);
     // `merge_with_transcript` can add flows the ledger read never saw at
     // all (the degraded-sink recovery case — see its own doc comment), so
     // filtering only the ledger side above is not enough: an out-of-window
@@ -1411,9 +1490,9 @@ fn collect_run_netflow(
     // `netflow_ids`), so attribution is the run's own record; a
     // record that fails to load leaves run/workflow unattributed rather
     // than failing the read (the ledger may still be perfectly readable).
-    let mut meta = RunMetaIndex::with_global(global_dir.to_path_buf());
+    let mut meta = RunMetaIndex::default();
     if let Ok(record) = store.load(run_id) {
-        meta.insert_run(store, &record);
+        meta.insert_run(global_dir, store, &record);
     }
     let table = load_asn_table(cache);
     let tagged: Vec<(String, FlowRecord)> = merged
@@ -1473,15 +1552,20 @@ fn agentiflow_netflow_scope(s: &AppState, id: &str) -> Option<AgentiflowNetflowS
     let run_dir = rupu_agentiflow::agentiflow_dir(&s.global_dir).join(id);
     let record = rupu_agentiflow::AgentiflowRecord::read(&run_dir).ok()?;
     let runs = crate::api::agentiflows::flow_runs(s, &run_dir);
-    let NetflowIds { mut ids, mut gaps } = netflow_ids(&s.run_store, &s.global_dir, id);
-    for run_id in &runs.run_ids {
-        let child = netflow_ids(&s.run_store, &s.global_dir, run_id);
-        ids.extend(child.ids);
-        gaps.extend(child.gaps);
+    let mut transcripts = runs.transcripts;
+    let mut ids = Vec::new();
+    let mut gaps = Vec::new();
+    for run_id in std::iter::once(id).chain(runs.run_ids.iter().map(String::as_str)) {
+        let (tree, tree_gaps) = netflow_tree(&s.global_dir, &s.run_store, run_id);
+        ids.extend(tree.ids);
+        transcripts.extend(tree.child_transcripts);
+        gaps.extend(tree_gaps);
     }
     ids.sort();
     ids.dedup();
-    let mut meta = RunMetaIndex::with_global(s.global_dir.clone());
+    transcripts.sort();
+    transcripts.dedup();
+    let mut meta = RunMetaIndex::default();
     meta.insert_synthetic(
         id,
         record.codename.as_deref().unwrap_or(&record.name),
@@ -1493,7 +1577,7 @@ fn agentiflow_netflow_scope(s: &AppState, id: &str) -> Option<AgentiflowNetflowS
         tag: id.to_string(),
         ids,
         gaps,
-        transcripts: runs.transcripts,
+        transcripts,
         workspace: crate::api::agentiflows::flow_workspace(s, &run_dir)
             .map_or_else(|| s.workspace_dir.clone(), |w| PathBuf::from(w.path)),
         meta,
@@ -1791,7 +1875,7 @@ fn project_scoped_flows_meta_and_dropped(
     global_dir: &StdPath,
     range: &rupu_netflow::ledger::TimeRange,
 ) -> (Vec<(String, FlowRecord)>, RunMetaIndex, u64) {
-    let meta = project_run_meta(global_store, global_dir, workspace);
+    let meta = project_run_meta(global_dir, global_store, workspace);
     let files = project_ledger_files(&meta, workspace, global_dir);
     let (flows, dropped) = read_ledger_files(reader, &files, range);
     (flows, meta, dropped)
@@ -2452,7 +2536,7 @@ async fn get_netflow_explorer(
         let cache = Arc::clone(&state.asn_cache);
         let index = index_for(&state);
         let resp = run_blocking(move || {
-            let meta = project_run_meta(&store, &global_dir, &workspace);
+            let meta = project_run_meta(&global_dir, &store, &workspace);
             let files = project_ledger_files(&meta, &workspace, &global_dir);
             let summaries = scope_summaries(&index, &files);
             let table = load_asn_table(&cache);
@@ -2543,8 +2627,8 @@ async fn explorer_run_scope(
                     remote_flows,
                     remote_dropped,
                 );
-                let mut meta = RunMetaIndex::with_global(global_dir.clone());
-                meta.insert_run(&store, &run);
+                let mut meta = RunMetaIndex::default();
+                meta.insert_run(&global_dir, &store, &run);
                 let table = load_asn_table(&cache);
                 let tagged: Vec<(String, FlowRecord)> =
                     merged.into_iter().map(|f| (rid.clone(), f)).collect();
@@ -2586,9 +2670,9 @@ async fn explorer_run_scope(
                     remote_flows,
                     remote_dropped,
                 );
-                let mut meta = RunMetaIndex::with_global(global_dir.clone());
+                let mut meta = RunMetaIndex::default();
                 if let Ok(record) = store.load(&rid) {
-                    meta.insert_run(&store, &record);
+                    meta.insert_run(&global_dir, &store, &record);
                 }
                 let table = load_asn_table(&cache);
                 let tagged: Vec<(String, FlowRecord)> =
@@ -2795,9 +2879,9 @@ async fn remote_flows_unless_landed(
 /// When it is not, an empty index leaves run/workflow unattributed rather
 /// than failing the read — the same posture the `ProjectLocal` branch takes.
 fn meta_for_host_run(s: &AppState, run_id: &str) -> RunMetaIndex {
-    let mut meta = RunMetaIndex::with_global(s.global_dir.clone());
+    let mut meta = RunMetaIndex::default();
     if let Ok(record) = s.run_store.load(run_id) {
-        meta.insert_run(&s.run_store, &record);
+        meta.insert_run(&s.global_dir, &s.run_store, &record);
     }
     meta
 }
@@ -3907,8 +3991,8 @@ mod tests {
         here.worker_id = None;
 
         let mut meta = RunMetaIndex::default();
-        meta.insert_run(&store, &placed);
-        meta.insert_run(&store, &here);
+        meta.insert_run(tmp.path(), &store, &placed);
+        meta.insert_run(tmp.path(), &store, &here);
 
         let gap = scope_gap_from_workers(&meta);
 
@@ -3932,8 +4016,8 @@ mod tests {
         let plain = seed_record("run_here2", "wf", tmp.path());
 
         let mut meta = RunMetaIndex::default();
-        meta.insert_run(&store, &local);
-        meta.insert_run(&store, &plain);
+        meta.insert_run(tmp.path(), &store, &local);
+        meta.insert_run(tmp.path(), &store, &plain);
 
         assert!(scope_gap_from_workers(&meta).is_empty());
     }
@@ -4591,8 +4675,8 @@ mod tests {
 
         assert!(run_landed_complete(global.path(), "run_p"));
 
-        let mut meta = RunMetaIndex::with_global(global.path().to_path_buf());
-        meta.insert_run(&store, &run);
+        let mut meta = RunMetaIndex::default();
+        meta.insert_run(global.path(), &store, &run);
         assert!(
             meta.remote_workers.is_empty(),
             "a run whose ledgers landed whole is no longer a scope gap"
@@ -4616,8 +4700,8 @@ mod tests {
         store.create(run.clone(), "x: 1\n").unwrap();
 
         assert!(!run_landed_complete(global.path(), "run_p"));
-        let mut meta = RunMetaIndex::with_global(global.path().to_path_buf());
-        meta.insert_run(&store, &run);
+        let mut meta = RunMetaIndex::default();
+        meta.insert_run(global.path(), &store, &run);
         let gaps = scope_gap_from_workers(&meta);
         assert_eq!(gaps.len(), 1);
         assert_eq!(gaps[0].host_id, "host_ssh");
@@ -4678,7 +4762,7 @@ mod tests {
         for (scope, meta) in [
             (
                 "project",
-                project_run_meta(&store, global.path(), &workspace),
+                project_run_meta(global.path(), &store, &workspace),
             ),
             ("global", global_run_meta(global.path(), &store)),
         ] {

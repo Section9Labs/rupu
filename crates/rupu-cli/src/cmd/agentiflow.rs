@@ -276,13 +276,14 @@ async fn run_cmd(
     // An agentiflow is its own root and tees into no coordinator stream
     // (spec 2026-10-14 remote netflow transport §N1), so nothing beneath it
     // tees either.
-    let (netflow_sink, netflow_handle) = crate::netflow_sink::for_run(
+    let netflow = crate::netflow_sink::for_run(
         &global,
         project_root.as_deref(),
         &run_id,
         &run_dir.join("lead").join("netflow.jsonl"),
         None,
     );
+    let netflow_sink = netflow.sink.clone();
 
     let body = launch(
         def,
@@ -300,9 +301,7 @@ async fn run_cmd(
     .await;
 
     // Flush the ledger on the success AND failure paths (see `cmd/run.rs`).
-    if let Some(handle) = netflow_handle {
-        handle.shutdown().await;
-    }
+    netflow.finish().await;
     let (name, outcome) = body?;
 
     let record_code = AgentiflowRecord::read(&run_dir)

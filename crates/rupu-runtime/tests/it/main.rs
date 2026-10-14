@@ -18,6 +18,7 @@ mod assembly_skills;
 mod gemini_code_assist_project;
 mod hop_builder;
 mod model_limits;
+mod netflow_backfill;
 mod netflow_capture;
 mod no_hand_built_run_opts;
 mod oauth_refresh_persists;
