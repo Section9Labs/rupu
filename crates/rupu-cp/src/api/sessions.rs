@@ -690,7 +690,7 @@ async fn list_sessions(
         limit: q.limit,
     };
     Ok(crate::query::ListResponse {
-        headers: crate::query::unfilterable_headers(&merged.unfilterable),
+        headers: merged.headers(),
         facets: facets.then(|| {
             crate::query::facet_counts(&merged.scoped, crate::query::sessions::FIELDS, false)
         }),

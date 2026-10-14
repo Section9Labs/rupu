@@ -1040,6 +1040,7 @@ async fn list_agent_runs(
             return Err(crate::query::unfilterable_error(h, field).into());
         }
     }
+    let headers = merged.headers();
     let mut page_values = crate::pagination::paginate(merged.rows, &q.page());
 
     // Fill usage for local rows on this page only (remote rows already have it)
@@ -1070,7 +1071,7 @@ async fn list_agent_runs(
     }
 
     Ok(crate::query::ListResponse {
-        headers: crate::query::unfilterable_headers(&merged.unfilterable),
+        headers,
         facets: facets.then(|| {
             crate::query::facet_counts(&merged.scoped, crate::query::agent_runs::FIELDS, false)
         }),

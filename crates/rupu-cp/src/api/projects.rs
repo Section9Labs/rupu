@@ -551,6 +551,7 @@ async fn project_sessions(
     // walks the session dirs in `read_dir` order.
     crate::api::host_fanout::sort_values_newest_first(&mut probes, "updated_at");
     let merged = crate::query::filter_merged(probes, &filter, |_| true, facets);
+    let headers = merged.headers();
     let rows = crate::pagination::paginate(merged.rows, &q.page())
         .into_iter()
         .map(|mut v| {
@@ -561,7 +562,7 @@ async fn project_sessions(
         })
         .collect();
     Ok(crate::query::ListResponse {
-        headers: axum::http::HeaderMap::new(),
+        headers,
         facets: facets.then(|| {
             crate::query::facet_counts(&merged.scoped, crate::query::sessions::FIELDS, false)
         }),

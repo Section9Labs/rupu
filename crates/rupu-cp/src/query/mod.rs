@@ -174,6 +174,14 @@ pub struct Merged {
     pub unfilterable: Vec<Unfilterable>,
 }
 
+impl Merged {
+    /// The response headers naming the hosts left out
+    /// ([`unfilterable_headers`]).
+    pub fn headers(&self) -> axum::http::HeaderMap {
+        unfilterable_headers(&self.unfilterable)
+    }
+}
+
 /// Filter a merged, host-tagged (`host_id`) list: a host any of whose rows
 /// can't report a field `filter` reads is left out whole and named; every
 /// other row is kept when `scope` (the list's own params: lifecycle, dates,
@@ -435,6 +443,24 @@ mod tests {
         assert_eq!(ids(&scoped.unwrap()), ["a", "b"]);
         let no_key = vec![serde_json::json!({"id": "d", "status": "failed"})];
         assert_eq!(f.retain(no_key), Err(Unreportable { field: "customer" }));
+    }
+
+    #[test]
+    fn a_merged_list_names_the_hosts_it_left_out_in_its_headers() {
+        let f = RowFilter::new(
+            None,
+            ListQuery::parse(Some("customer:acme"), workflow_runs::FIELDS).unwrap(),
+        );
+        let rows = vec![
+            serde_json::json!({"id": "a", "host_id": "local", "customer": "acme"}),
+            serde_json::json!({"id": "b", "host_id": "old"}),
+        ];
+        let merged = filter_merged(rows, &f, |_| true, false);
+        assert_eq!(merged.rows.len(), 1);
+        assert_eq!(
+            merged.headers().get("x-rupu-hosts-without-customer").unwrap(),
+            "old"
+        );
     }
 
     #[test]
