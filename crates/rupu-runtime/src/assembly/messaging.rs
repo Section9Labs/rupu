@@ -30,11 +30,14 @@ pub enum OffReason {
     Agentiflow,
     /// The parent's cap: a child never has more than its parent (D6).
     Parent,
+    /// The launch's `--no-messaging`: a placed unit's coordinator passing
+    /// its workflow's switch or its own launch cap.
+    Launch,
 }
 
 impl MessagingGrant {
     /// Resolve `spec`'s messaging. Off when its agent, its workflow, its
-    /// agentiflow or its parent says off. Else its workflow's tools, a flow
+    /// agentiflow, its parent or its launch (`--no-messaging`) says off. Else its workflow's tools, a flow
     /// origin's (the messaging tools of `origin_grant`, which the grant
     /// already carries) or the default (D1).
     pub fn resolve(spec: &LaunchSpec, origin_grant: Option<&AmbientGrant>) -> Self {
@@ -56,6 +59,7 @@ impl MessagingGrant {
                 ..
             } => Self::Off(OffReason::Agentiflow),
             _ if parent_off => Self::Off(OffReason::Parent),
+            _ if spec.overrides.messaging_off => Self::Off(OffReason::Launch),
             Origin::WorkflowStep {
                 messaging: MessagingSwitch::Tools(tools),
                 ..

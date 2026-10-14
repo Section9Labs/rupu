@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rupu_runtime::assembly::{
-    defaults_for, AssembledRun, LaunchServices, LaunchSpec, Origin, Overrides, ParentRun,
-    RunAssembler, UnitKey,
+    defaults_for, AssembledRun, LaunchServices, LaunchSpec, MessagingGrant, OffReason, Origin,
+    Overrides, ParentRun, RunAssembler, UnitKey,
 };
 use rupu_runtime::usage_ledger::{LedgerRow, UsageLedger};
 use rupu_tools::{MessagingSwitch, PermissionMode, RunIdentity, Surface};
@@ -888,6 +888,57 @@ async fn a_process_child_of_an_opted_out_run_has_messaging_off() {
     let mut l = launch(&home, spec, Origin::Standalone, "run_child_on");
     l.link = Some(link(false));
     let on = assembler.assemble(l).await.unwrap();
+    assert_eq!(messaging_of(&on), (true, true, true));
+    assert!(!on.opts.identity().launch.messaging_off);
+}
+
+/// A placed unit of an opted-out workflow runs as `rupu run --no-messaging`
+/// on its host: the launch turns its messaging off (a tool its agent names
+/// is reported unavailable) and caps the sub-agents it launches.
+#[tokio::test]
+#[serial]
+async fn a_no_messaging_launch_has_messaging_off_and_caps_its_children() {
+    let home = Home::new();
+    let assembler = home.assembler(config());
+    let spec = agent(
+        &home,
+        "provider: anthropic\nmodel: claude-sonnet-4-6\ntools: [read_file, msg.send]",
+    );
+    let mut l = launch(&home, spec.clone(), Origin::Standalone, "run_placed_off");
+    l.overrides.messaging_off = true;
+    assert_eq!(MessagingGrant::resolve(&l, None), MessagingGrant::Off(OffReason::Launch));
+    let _m = MockScript::set(DONE);
+    let run = assembler.assemble(l).await.unwrap();
+    assert_eq!(messaging_of(&run), (true, false, false));
+    assert_eq!(
+        run.opts.grant.unavailable.iter().map(|u| u.tool).collect::<Vec<_>>(),
+        vec!["msg.send"]
+    );
+    assert!(run.opts.identity().launch.messaging_off);
+
+    let star = agent(&home, "provider: anthropic\nmodel: claude-sonnet-4-6\ntools: ['*']");
+    let mut c = launch(
+        &home,
+        star,
+        Origin::SubAgent {
+            parent: ParentRun {
+                identity: Arc::clone(&run.opts.tool_context.identity),
+                usage: None,
+                coverage_stream: None,
+            },
+        },
+        "run_placed_off_child",
+    );
+    let parent_bus = run.opts.tool_context.services.message_space.clone().unwrap();
+    c.services.message_bus = Some(Arc::new(parent_bus.sibling("heron>otter#1")));
+    assert_eq!(MessagingGrant::resolve(&c, None), MessagingGrant::Off(OffReason::Parent));
+    let child = assembler.assemble(c).await.unwrap();
+    assert_eq!(messaging_of(&child), (true, false, false));
+    assert!(child.opts.identity().launch.messaging_off);
+
+    let on = launch(&home, spec, Origin::Standalone, "run_placed_on");
+    assert!(MessagingGrant::resolve(&on, None).takes_part());
+    let on = assembler.assemble(on).await.unwrap();
     assert_eq!(messaging_of(&on), (true, true, true));
     assert!(!on.opts.identity().launch.messaging_off);
 }
