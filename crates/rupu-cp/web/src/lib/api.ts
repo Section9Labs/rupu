@@ -3244,31 +3244,18 @@ export const api = {
     const qs = q.toString();
     return request<AutoflowEventRow[]>(`/api/runs/autoflows/events${qs ? `?${qs}` : ''}`, { signal: params?.signal });
   },
-  /** Autoflow runs plus failed attempts, newest first (`GET /api/runs/autoflows/runs`).
-   *  Same parameters as `getWorkflowRuns`, plus `workflow` to narrow to one autoflow. */
+  /** Autoflow runs plus failed attempts, newest first (`GET /api/runs/autoflows/runs`):
+   *  `getWorkflowRuns`'s calling convention (`q`, facets, the left-out-host
+   *  headers) over the autoflow registry (`AUTOFLOW_RUN_FIELDS`). */
   getAutoflowRunList(
-    params?: ListParams & Cancellable & {
-      lifecycle?: 'active' | 'completed' | 'failed';
-      host?: string;
-      workflow?: string;
-      customer?: CustomerScope;
-      /** Receives the `X-Rupu-Hosts-Without-Customer` header's host ids. */
-      onHostsWithoutCustomer?: HostsWithoutCustomerSink;
-    },
+    params?: ListParams & Cancellable & ListQueryOpts & { host?: string; customer?: CustomerScope },
   ): Promise<AutoflowRunRow[]> {
     const q = new URLSearchParams();
     if (params?.offset != null) q.set('offset', String(params.offset));
     if (params?.limit != null) q.set('limit', String(params.limit));
-    if (params?.lifecycle) q.set('lifecycle', params.lifecycle);
     if (params?.host) q.set('host', params.host);
-    if (params?.workflow) q.set('workflow', params.workflow);
     setCustomer(q, params?.customer);
-    const qs = q.toString();
-    return requestMaybeReportingHosts<AutoflowRunRow[]>(
-      `/api/runs/autoflows/runs${qs ? `?${qs}` : ''}`,
-      { signal: params?.signal },
-      params?.onHostsWithoutCustomer,
-    );
+    return requestList<AutoflowRunRow>('/api/runs/autoflows/runs', q, params ?? {});
   },
   /** Recent autoflow failures that name no workflow, grouped by host and
    *  subject (`GET /api/runs/autoflows/problems`). */

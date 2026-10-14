@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
-// AutoflowRuns — one Workflows-shaped table (spec 2026-10-14, CP autoflow
-// runs as one table): autoflow-launched runs plus failed attempts, newest
-// first, per-host loading, a problems strip above, claim actions on an
-// attempt row that has no run to open.
+// AutoflowRuns — one Workflows-shaped table on the query line (spec
+// 2026-10-14, CP autoflow runs as one table): autoflow-launched runs plus
+// failed attempts, newest first, per-host loading, the server filtering by
+// `q`, a problems strip above, claim actions on an attempt row that has no
+// run to open.
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi, type Mock } from 'vitest';
@@ -10,6 +11,8 @@ import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/re
 import { MemoryRouter } from 'react-router-dom';
 import { api, ApiError, type AutoflowProblem, type AutoflowRunRow, type HostView } from '../../lib/api';
 import { callsFor, onlyHost } from '../../lib/perHost/testUtils';
+import { parseQuery } from '../../lib/findingQuery/grammar';
+import { AUTOFLOW_RUN_FIELDS } from '../../lib/query/lists/autoflowRuns';
 import AutoflowRuns from './AutoflowRuns';
 import { scopedEntry, withCustomerScope } from '../../lib/customerScopeTestUtils';
 
@@ -99,6 +102,10 @@ function renderPage(entry = '/') {
   );
 }
 
+/** The `q` each call to the list sent for `host` (null for none). */
+const sentQ = (host: string) =>
+  callsFor(api.getAutoflowRunList as never, host).map((c) => (c[0] as { q?: string } | undefined)?.q || null);
+
 describe('AutoflowRuns — one table', () => {
   it('shows one table: no Runs/Cycles/Claims switcher', async () => {
     stub([RUN]);
@@ -159,24 +166,43 @@ describe('AutoflowRuns — one table', () => {
     expect(focusable[0]).toHaveTextContent('fix-issue');
   });
 
-  it('the filter button next to a workflow refetches narrowed to it, shown as a removable chip', async () => {
+  it('the "Show only" button puts a workflow: term in the query, which every host is asked with', async () => {
     stub([RUN]);
     renderPage();
     fireEvent.click(await screen.findByRole('button', { name: 'Show only fix-issue runs' }));
-    await waitFor(() =>
-      expect((api.getAutoflowRunList as Mock).mock.calls.some((c) => c[0]?.workflow === 'fix-issue')).toBe(true),
-    );
-    const chip = screen.getByRole('button', { name: /workflow: fix-issue/ });
+    await waitFor(() => expect(sentQ('local')).toContain('workflow:fix-issue'));
+    await waitFor(() => expect(sentQ('host_prod')).toContain('workflow:fix-issue'));
+    // The term is a chip of the query line, removable like any other.
+    const chip = screen.getByRole('button', { name: 'Remove workflow: fix-issue' });
     expect(chip).toBeInTheDocument();
+    const sent = sentQ('local').filter((x): x is string => x !== null).map((x) => parseQuery(x, AUTOFLOW_RUN_FIELDS));
+    expect(sent.map((p) => p.ok && p.terms)).toEqual([[{ key: 'workflow', op: 'eq', neg: false, values: ['fix-issue'] }]]);
     fireEvent.click(chip);
-    await waitFor(() => expect(screen.queryByRole('button', { name: /workflow: fix-issue/ })).not.toBeInTheDocument());
+    await waitFor(() => expect(sentQ('local').slice(-1)).toEqual([null]));
+    expect(screen.queryByRole('button', { name: 'Remove workflow: fix-issue' })).not.toBeInTheDocument();
   });
 
-  it('renders the problems strip and hides it when empty', async () => {
+  it('the query reaches the server on every host, replacing the old find box', async () => {
+    stub([RUN, ATTEMPT]);
+    renderPage('/?q=issue:widgets%20kind:attempt');
+    await waitFor(() => expect(sentQ('host_prod')).toEqual(['issue:widgets kind:attempt']));
+    expect(sentQ('local')).toEqual(['issue:widgets kind:attempt']);
+    expect(screen.queryByLabelText('Find runs')).not.toBeInTheDocument();
+  });
+
+  it('renders the problems strip over the hosts the query asks, and hides it when empty', async () => {
     stub([RUN], [PROBLEM]);
     renderPage();
     expect(await screen.findByText(/24 cycles/)).toBeInTheDocument();
     expect(screen.getByText('config bad')).toBeInTheDocument();
+    cleanup();
+    vi.restoreAllMocks();
+    // `host:host_prod` asks prod alone: local's problem is not shown.
+    stub([RUN], [PROBLEM]);
+    renderPage('/?q=host:host_prod');
+    await waitFor(() => expect(callsFor(api.getAutoflowProblems as never, 'host_prod')).toHaveLength(1));
+    expect(callsFor(api.getAutoflowProblems as never, 'local')).toHaveLength(0);
+    expect(screen.queryByText(/cycles/)).not.toBeInTheDocument();
     cleanup();
     vi.restoreAllMocks();
     stub([RUN], []);
@@ -185,15 +211,17 @@ describe('AutoflowRuns — one table', () => {
     expect(screen.queryByText(/cycles/)).not.toBeInTheDocument();
   });
 
-  it('unavailable host slice: a 501 from one host is shown, not an error', async () => {
+  it('a host whose rows can\'t report autoflow (501) is named under the bar, not an error', async () => {
     vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
     vi.spyOn(api, 'getAutoflowProblems').mockResolvedValue([]);
     vi.spyOn(api, 'getAutoflowRunList').mockImplementation((p) =>
-      p?.host === 'host_prod' ? Promise.reject(new ApiError(501, 'unsupported')) : Promise.resolve([RUN]),
+      p?.host === 'host_prod'
+        ? Promise.reject(new ApiError(501, 'x', '{"error":"host host_prod can\'t report `autoflow` for every row"}'))
+        : Promise.resolve([RUN]),
     );
     renderPage();
     await waitFor(() => expect(screen.getByText('fix-issue')).toBeInTheDocument());
-    await waitFor(() => expect(screen.getAllByText(/unavailable/i).length).toBeGreaterThan(0));
+    expect(await screen.findByTestId('host-alert')).toHaveTextContent("prod can't filter by autoflow: its runs are left out");
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
@@ -204,16 +232,19 @@ describe('AutoflowRuns — one table', () => {
     expect(callsFor(api.getAutoflowRunList as never, 'host_prod')).toHaveLength(1);
   });
 
-  it('Find narrows over the issue ref and the attempt error too', async () => {
-    stub([RUN, ATTEMPT]);
-    renderPage();
-    await waitFor(() => expect(screen.getByText('dispatch failed: branch exists')).toBeInTheDocument());
-    fireEvent.change(screen.getByLabelText('Find runs'), { target: { value: 'branch exists' } });
-    expect(screen.getByText('dispatch failed: branch exists')).toBeInTheDocument();
-    expect(screen.queryByText('acme/widgets#42')).not.toBeInTheDocument();
-    fireEvent.change(screen.getByLabelText('Find runs'), { target: { value: 'widgets#42' } });
-    expect(screen.getByText('acme/widgets#42')).toBeInTheDocument();
-    expect(screen.queryByText('dispatch failed: branch exists')).not.toBeInTheDocument();
+  it('says nothing matches when a query keeps no row', async () => {
+    stub([]);
+    renderPage('/?q=kind:attempt');
+    expect(await screen.findByText('No autoflow runs match the filter.')).toBeInTheDocument();
+  });
+
+  it('is:archived lists the archive: a row restores instead of archiving', async () => {
+    stub([{ ...RUN, archived: true }]);
+    renderPage('/?q=is:archived');
+    await waitFor(() => expect(screen.getByText('fix-issue')).toBeInTheDocument());
+    expect(sentQ('local')).toEqual(['is:archived']);
+    expect(screen.getByRole('button', { name: 'Restore run run-9' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Archive run run-9' })).not.toBeInTheDocument();
   });
 
   it('under a customer scope the list is scoped and the page says attempts are left out', async () => {

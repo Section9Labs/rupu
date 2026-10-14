@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { ApiError } from '../api';
 import { emptySlice, type HostSlice } from './types';
-import { classifyFailure, noHostAnswered, notIncluded, pagingFailedHosts, toFreshnessEntries, waitingLabel } from './status';
+import { classifyFailure, noHostAnswered, pagingFailedHosts, toFreshnessEntries, waitingLabel } from './status';
 
 const s = (id: string, over: Partial<HostSlice<unknown>> = {}): HostSlice<unknown> => ({
   ...emptySlice({ id, name: id, transport_kind: 'ssh' }),
@@ -29,13 +29,6 @@ describe('labels', () => {
       'Waiting on mini, kuki…',
     );
     expect(waitingLabel([s('local', { state: 'ok' })])).toBeNull();
-  });
-
-  it('names hosts not included and why', () => {
-    expect(notIncluded([s('a', { state: 'offline' }), s('b', { state: 'unavailable' }), s('c', { state: 'ok' })])).toBe(
-      'a (offline), b (unavailable)',
-    );
-    expect(notIncluded([s('c', { state: 'ok' })])).toBeNull();
   });
 
   it('says when no host answered at all', () => {

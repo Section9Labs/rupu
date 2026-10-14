@@ -5,36 +5,38 @@
 // bounds "ongoing" to the past hour (`GET /api/runs/autoflows/problems`);
 // this component only loads and renders.
 //
-// Per host like the list it sits above: a picked host is asked alone; All
-// hosts asks every registered host and concatenates, skipping one that fails
-// (the list's own per-host strip says who is unavailable). Polled every 30 s.
-// Renders nothing while there is nothing to show.
+// Per host like the list it sits above: the registered hosts the query's
+// `host:` terms pick (`pick`; null = every one), each asked alone and the
+// answers concatenated, skipping a host that fails (the line under the
+// query bar says who is missing). Polled every 30 s. Renders nothing while
+// there is nothing to show.
 
 import { useEffect, useState } from 'react';
 import { AlertTriangle } from 'lucide-react';
 import { api, type AutoflowProblem } from '../../lib/api';
+import { picksHost, type HostPick } from '../../lib/perHost/usePerHostPagedList';
 import { relativeTime } from '../../lib/time';
 
 const POLL_MS = 30_000;
 
-async function loadProblems(host: string | null, signal: AbortSignal): Promise<AutoflowProblem[]> {
-  if (host) return api.getAutoflowProblems({ host, signal });
-  const hosts = await api.getRegisteredHosts();
+async function loadProblems(pick: HostPick | null, signal: AbortSignal): Promise<AutoflowProblem[]> {
+  const hosts = (await api.getRegisteredHosts()).filter((h) => picksHost(pick, h.id));
   const settled = await Promise.allSettled(hosts.map((h) => api.getAutoflowProblems({ host: h.id, signal })));
   return settled
     .flatMap((r) => (r.status === 'fulfilled' ? r.value : []))
     .sort((a, b) => b.last_seen.localeCompare(a.last_seen));
 }
 
-export function AutoflowProblems({ host }: { host: string | null }) {
+export function AutoflowProblems({ pick }: { pick: HostPick | null }) {
   const [problems, setProblems] = useState<AutoflowProblem[]>([]);
+  const pickKey = JSON.stringify(pick);
 
   useEffect(() => {
     const ctl = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     const tick = async () => {
       try {
-        const next = await loadProblems(host, ctl.signal);
+        const next = await loadProblems(pick, ctl.signal);
         if (!ctl.signal.aborted) setProblems(next);
       } catch {
         // A failed read keeps the last answer; the next tick tries again.
@@ -46,7 +48,7 @@ export function AutoflowProblems({ host }: { host: string | null }) {
       ctl.abort();
       if (timer) clearTimeout(timer);
     };
-  }, [host]);
+  }, [pickKey]);
 
   if (problems.length === 0) return null;
   return (

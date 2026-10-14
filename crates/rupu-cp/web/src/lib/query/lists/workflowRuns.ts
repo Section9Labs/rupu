@@ -19,13 +19,14 @@ export const WORKFLOW_RUN_FIELDS: ServerField[] = [
   serverField({ key: 'is', values: ['archived'], match: 'exact', label: 'Is', description: 'is:archived (the archive, this host only)', icon: Archive }),
 ];
 
-/** Whether a positive `is:archived` term asks for the archive. */
-export function asksArchived(q: string): boolean {
+/** Whether a positive `is:archived` term asks for the archive. `fields` is
+ *  the page's registry (a list that extends this one parses with its own). */
+export function asksArchived(q: string, fields: readonly ServerField[] = WORKFLOW_RUN_FIELDS): boolean {
   const t = tokenize(q);
   return (
     t.ok &&
     t.tokens.some((x) => {
-      const p = parseToken(x.text, WORKFLOW_RUN_FIELDS);
+      const p = parseToken(x.text, fields);
       return p.ok && p.terms[0]?.key === 'is' && !p.terms[0].neg && p.terms[0].values.includes('archived');
     })
   );

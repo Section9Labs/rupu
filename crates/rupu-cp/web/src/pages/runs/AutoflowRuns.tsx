@@ -5,33 +5,36 @@
 // issue cycle history is the run page's Cycles tab; claim actions live on
 // the run page and on an attempt row that has no run to open).
 //
-// Structure is `WorkflowRuns.tsx`'s — same components, header, spacing — with
-// the Workflows columns (`WORKFLOW_RUN_COLUMNS`) except: the Workflow name is
-// a button that narrows the table to that autoflow (a removable chip in the
-// filter bar), an attempt row shows its error under the name, an Issue
-// column follows (display ref → tracker, `PR ↗` when the run opened one),
-// and no trigger pills (every row is cron/event). An attempt row carries
-// `attempt`; one whose `id` is a history event id (no `run_recorded`)
-// expands in place — the error, cycle, worker, claim status, Requeue /
-// Release for its claim (local host only, as the claim endpoints are) —
-// while one whose `id` is an unrecorded run id (`run_recorded: false`) links
-// to the run page, which renders unpersisted runs from history.
+// Structure is `WorkflowRuns.tsx`'s — the query line, per-host loading, the
+// same components and header — with the Workflows columns
+// (`WORKFLOW_RUN_COLUMNS`) except: the Workflow cell carries the issue — or
+// an attempt's error — as its second line, and the actions column adds a
+// "show only this workflow" button (it puts `workflow:<name>` in the query)
+// and the run's PR link. An attempt row carries `attempt`; one whose `id` is
+// a history event id (no `run_recorded`) expands in place — the error,
+// cycle, worker, claim status, Requeue / Release for its claim (local host
+// only, as the claim endpoints are) — while one whose `id` is an unrecorded
+// run id (`run_recorded: false`) links to the run page, which renders
+// unpersisted runs from history.
 //
-// Fetch/paginate/poll is owned by `usePerHostPagedList` (per-host
-// progressive loading): All hosts by default, local paints at once and each
-// remote merges in as it answers; a host that can't report `autoflow` (501)
-// is an unavailable slice. Archived uses the local archive, narrowed
-// client-side to rows with a non-null `autoflow`. A problems strip
-// (`AutoflowProblems`) sits between the filter bar and the table.
+// One query line filters the list and the server evaluates it (`?q=` on
+// every request, `AUTOFLOW_RUN_FIELDS`: the workflow-run fields plus
+// `issue:`, `pr:`, `kind:` and `error:`), `is:archived` switching to the
+// local archive. Fetch/paginate/poll is owned by `usePerHostQueryList`:
+// every host the query's `host:` terms allow, local painting at once and
+// each remote merging in as it answers; a host that can't report `autoflow`
+// (an older rupu) is named in the line under the bar. The problems strip
+// (`AutoflowProblems`) sits between the bar and the table, over the same
+// hosts.
 //
 // Customer scope (customers Plan 2B): as Workflows, through the same per-host
 // engine (`?customer=<slug>`). Attempt rows record no customer, so the server
 // lists none while scoped; the page says so in one line.
 
-import { useCallback, useState } from 'react';
-import { ListFilter, RefreshCw, X } from 'lucide-react';
+import { useCallback, useMemo, useState } from 'react';
+import { ListFilter, RefreshCw } from 'lucide-react';
 import { shortIssueRef } from '../../lib/issueRef';
-import { api, type AutoflowRunRow } from '../../lib/api';
+import { api, type AutoflowRunRow, type ListQueryOpts } from '../../lib/api';
 import SortableTable, { type Column } from '../../components/lists/SortableTable';
 import { WORKFLOW_RUN_COLUMNS } from '../../components/runs/workflowRunColumns';
 import { AutoflowProblems } from '../../components/runs/AutoflowProblems';
@@ -39,37 +42,24 @@ import UsageBarChart from '../../components/charts/UsageBarChart';
 import { CrewChip } from '../../components/codename/CrewChip';
 import { parseCodename } from '../../lib/codename';
 import { Button } from '../../components/ui/Button';
-import { FilterBar } from '../../components/ui/FilterBar';
-import { FilterPills, type FilterPillOption } from '../../components/ui/FilterPills';
-import { SearchInput } from '../../components/ui/SearchInput';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { ErrorBanner } from '../../components/ui/ErrorBanner';
 import { Spinner } from '../../components/ui/Spinner';
-import HostSelect, { ALL_HOSTS } from '../../components/HostSelect';
-import { usePerHostPagedList, type PerHostFetchParams } from '../../lib/perHost/usePerHostPagedList';
-import { PerHostFooter, PerHostStrip, perHostFooterText } from '../../components/lists/PerHostStatus';
-import { noHostAnswered, notIncluded, waitingLabel } from '../../lib/perHost/status';
+import { ListQueryBar, NoMatches, useListQuery } from '../../components/query/ListQueryBar';
+import { hostAlerts } from '../../components/query/hostAlerts';
+import { ListFooter } from '../../components/lists/ListFooter';
+import { usePerHostQueryList } from '../../lib/query/usePerHostQueryList';
+import { AUTOFLOW_RUN_FIELDS } from '../../lib/query/lists/autoflowRuns';
+import { asksArchived } from '../../lib/query/lists/workflowRuns';
+import { hostPickOf } from '../../lib/query/serverList';
+import { withTerm } from '../../lib/findingQuery/shortcut';
+import type { PerHostFetchParams } from '../../lib/perHost/usePerHostPagedList';
+import { noHostAnswered, waitingLabel } from '../../lib/perHost/status';
 import { cn } from '../../lib/cn';
 import { runHref } from '../../lib/runs';
 import { shortId } from '../../lib/shortId';
 import { useRunCustomers, withCustomerColumn } from '../../components/customers/RunCustomer';
-import { HostsWithoutCustomerBanner } from '../../components/customers/HostsWithoutCustomerBanner';
 import { useScopedList } from '../../lib/useScopedList';
-
-/** The server's `lifecycle` values plus `all` (no `lifecycle` sent): attempts
- *  are listed under All and Failed only, so All is the default. */
-type Tab = 'all' | 'active' | 'completed' | 'failed';
-type Lifecycle = Tab | 'archived';
-
-const LIFECYCLE_OPTIONS: FilterPillOption[] = [
-  { value: 'all', label: 'All' },
-  { value: 'active', label: 'Running' },
-  { value: 'completed', label: 'Completed' },
-  { value: 'failed', label: 'Failed / Rejected' },
-  { value: 'archived', label: 'Archived' },
-];
-/** While scoped to a customer: the archive has no customer filter. */
-const SCOPED_LIFECYCLE_OPTIONS = LIFECYCLE_OPTIONS.filter((o) => o.value !== 'archived');
 
 /** A row's host for actions: the server tags every row; absent means local. */
 const hostOf = (r: AutoflowRunRow) => r.host_id ?? 'local';
@@ -77,87 +67,41 @@ const hostOf = (r: AutoflowRunRow) => r.host_id ?? 'local';
 /** An attempt whose `id` is a history event id: nothing to open, expands in place. */
 const expandsInPlace = (r: AutoflowRunRow) => r.attempt !== undefined && r.run_recorded === undefined;
 
+/** An attempt never ran: its usage, turns and duration are not zero, they
+ *  don't exist. Those cells show a dash instead of the server's zero fill. */
+const NO_USAGE_KEYS = new Set(['in', 'out', 'cached', 'cost', 'turns', 'duration']);
+
 export default function AutoflowRuns() {
-  const [tab, setTab] = useState<Tab>('all');
-  const [archivedPicked, setArchived] = useState(false);
-  const [workflow, setWorkflow] = useState<string | null>(null);
-  const [hostFilter, setHostFilter] = useState<string>(ALL_HOSTS);
-  const scoped = useScopedList(undefined, [tab, hostFilter, workflow]);
+  const [q, setQ] = useListQuery('q');
+  const scoped = useScopedList(undefined, []);
   const { customer } = scoped;
-  const archived = archivedPicked && !customer;
+  // Row-action (archive/restore/delete, claim) failures — kept separate from
+  // the list-fetch error the hook owns, but shown in the same banner.
   const [actionError, setActionError] = useState<string | null>(null);
   const [busyClaim, setBusyClaim] = useState<string | null>(null);
-  const [query, setQuery] = useState('');
+  const archive = asksArchived(q, AUTOFLOW_RUN_FIELDS);
+  // The hosts the query asks, for the problems strip too.
+  const pick = useMemo(() => hostPickOf(q, AUTOFLOW_RUN_FIELDS), [q]);
 
   const fetchRows = useCallback(
-    ({ host, offset, limit, signal }: PerHostFetchParams): Promise<AutoflowRunRow[]> => {
-      if (archived) {
-        // /api/runs/archived has no offset/limit and no autoflow filter: one
-        // fetch, narrowed here; later pages are empty so the host settles.
-        return offset === 0
-          ? api.getArchivedRuns('workflow').then((rows) =>
-              rows.filter((r) => r.autoflow && (!workflow || r.workflow_name === workflow)),
-            )
-          : Promise.resolve([]);
-      }
-      const lifecycle = tab === 'all' ? undefined : tab;
-      const wf = workflow ?? undefined;
-      if (!customer) return api.getAutoflowRunList({ lifecycle, offset, limit, host, signal, workflow: wf });
-      return scoped.guard(
-        api.getAutoflowRunList({
-          lifecycle,
-          offset,
-          limit,
-          host,
-          signal,
-          workflow: wf,
-          customer,
-          onHostsWithoutCustomer: scoped.reportHosts(host, offset),
-        }),
-      );
-    },
-    [archived, tab, workflow, customer, scoped.guard, scoped.reportHosts],
+    (p: PerHostFetchParams & ListQueryOpts): Promise<AutoflowRunRow[]> =>
+      customer ? scoped.guard(api.getAutoflowRunList({ ...p, customer })) : api.getAutoflowRunList(p),
+    [customer, scoped.guard],
   );
 
-  const { rows, slices, loading, error, hasMore, sentinelRef, refresh, refreshHost, removeRow, retryPaging, ended } =
-    usePerHostPagedList<AutoflowRunRow>({
-      host: archived ? 'local' : hostFilter === ALL_HOSTS ? null : hostFilter,
+  const { rows, slices, loading, error, hasMore, sentinelRef, refresh, refreshHost, removeRow, retryPaging, ended, facets, queryError, notes } =
+    usePerHostQueryList<AutoflowRunRow>({
+      q,
+      fields: AUTOFLOW_RUN_FIELDS,
+      scope: [customer],
       fetch: fetchRows,
       timeField: 'started_at',
       idField: 'id',
-      deps: [archived, tab, workflow, customer],
-      poll: !archived && tab === 'active',
+      poll: !archive,
     });
 
-  // Find — case-insensitive substring over what this table renders: workflow
-  // name, run id, host, codename, the issue refs and an attempt's error.
-  const q = query.trim().toLowerCase();
-  const visible = q
-    ? rows.filter((r) =>
-        [
-          r.workflow_name,
-          r.id,
-          r.host_id,
-          r.codename,
-          r.autoflow?.issue_display_ref,
-          r.autoflow?.issue_ref,
-          r.attempt?.detail,
-        ]
-          .filter((v): v is string => Boolean(v))
-          .some((v) => v.toLowerCase().includes(q)),
-      )
-    : rows;
-
-  const lifecycleValue: Lifecycle = archived ? 'archived' : tab;
-  function handleLifecycleChange(v: string) {
-    if (v === 'archived') {
-      setArchived(true);
-    } else {
-      setArchived(false);
-      setTab(v as Tab);
-    }
-  }
-
+  // Row-level archive / restore / delete — each drops the row and re-syncs
+  // just its host after success, on the host that owns the run.
   async function handleRowArchive(id: string, host: string) {
     try {
       await api.archiveRun(id, host);
@@ -244,8 +188,10 @@ export default function AutoflowRuns() {
     },
   };
 
-  // Show only this workflow, the run's PR, and Archive / Restore / Delete
-  // (run rows only — an attempt is not a run record).
+  // Show only this workflow (a `workflow:` term in the query), the run's PR,
+  // and Archive / Restore / Delete (run rows only — an attempt is not a run
+  // record). Its own real buttons: independently focusable, not swallowed by
+  // the row link; the wrapper cancels the link's navigation (I7).
   const actionColumn: Column<AutoflowRunRow> = {
     key: 'actions',
     header: '',
@@ -264,7 +210,7 @@ export default function AutoflowRuns() {
           className="rounded p-1 text-ink-mute hover:bg-surface-hover hover:text-ink"
           aria-label={`Show only ${r.workflow_name} runs`}
           title={`Show only ${r.workflow_name} runs`}
-          onClick={() => setWorkflow(r.workflow_name)}
+          onClick={() => setQ(withTerm(q, AUTOFLOW_RUN_FIELDS, 'workflow', [r.workflow_name]))}
         >
           <ListFilter size={12} />
         </button>
@@ -281,7 +227,7 @@ export default function AutoflowRuns() {
         )}
         {!r.attempt && (
           <>
-            {archived ? (
+            {r.archived ? (
               <Button variant="ring" onClick={() => void handleRowRestore(r.id, hostOf(r))} aria-label={`Restore run ${r.id}`}>
                 Restore
               </Button>
@@ -299,9 +245,6 @@ export default function AutoflowRuns() {
     ),
   };
 
-  // An attempt never ran: its usage, turns and duration are not zero, they
-  // don't exist. Those cells show a dash instead of the server's zero fill.
-  const NO_USAGE_KEYS = new Set(['in', 'out', 'cached', 'cost', 'turns', 'duration']);
   const dashForAttempts = (c: Column<AutoflowRunRow>): Column<AutoflowRunRow> =>
     NO_USAGE_KEYS.has(c.key)
       ? {
@@ -311,12 +254,13 @@ export default function AutoflowRuns() {
         }
       : c;
 
-  const customers = useRunCustomers(!customer && !archived ? rows.map((r) => r.customer) : []);
+  // The Customer column resolves slugs (archived customers load on first need).
+  const customers = useRunCustomers(!customer ? rows.map((r) => r.customer) : []);
   const baseColumns = (WORKFLOW_RUN_COLUMNS as Column<AutoflowRunRow>[]).flatMap((c) =>
     c.key === 'workflow' ? [workflowColumn] : [dashForAttempts(c)],
   );
   const columns: Column<AutoflowRunRow>[] = [
-    ...withCustomerColumn(baseColumns, customers, rows, !customer && !archived),
+    ...withCustomerColumn(baseColumns, customers, rows, !customer),
     actionColumn,
   ];
 
@@ -375,13 +319,11 @@ export default function AutoflowRuns() {
     );
   }
 
+  // A fresh action error must win over a stale fetch error from an earlier
+  // load, never the other way around.
   const bannerError = actionError ?? error;
+  // Never claim "nothing" while a host is still loading.
   const waiting = waitingLabel(slices);
-  const missing = notIncluded(slices);
-  const listFooter = perHostFooterText({ slices, loading, hasMore, ended, count: rows.length, waitingShown: visible.length === 0 });
-  const footer = (text: string) =>
-    !archived && <PerHostFooter sentinelRef={sentinelRef} text={text} slices={slices} onRetry={retryPaging} />;
-  const problemsHost = archived ? 'local' : hostFilter === ALL_HOSTS ? null : hostFilter;
 
   return (
     <div className="p-8">
@@ -398,62 +340,24 @@ export default function AutoflowRuns() {
         </Button>
       </header>
 
-      <div className="mb-5">
-        <FilterBar
-          filters={
-            <>
-              <FilterPills
-                options={customer ? SCOPED_LIFECYCLE_OPTIONS : LIFECYCLE_OPTIONS}
-                value={lifecycleValue}
-                onChange={handleLifecycleChange}
-              />
-              {workflow && (
-                <Button
-                  variant="ring"
-                  className="gap-1"
-                  onClick={() => setWorkflow(null)}
-                  aria-label={`workflow: ${workflow} — remove filter`}
-                >
-                  workflow: {workflow}
-                  <X size={11} aria-hidden />
-                </Button>
-              )}
-            </>
-          }
-          search={
-            <SearchInput
-              aria-label="Find runs"
-              placeholder="Find runs…"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Escape') setQuery('');
-              }}
-            />
-          }
-          scope={
-            !archived && (
-              <HostSelect allowAll ariaLabel="Host filter" value={hostFilter} onChange={setHostFilter} />
-            )
-          }
-        />
-      </div>
-      {!archived && <PerHostStrip slices={slices} />}
+      <ListQueryBar
+        value={q}
+        onChange={setQ}
+        fields={AUTOFLOW_RUN_FIELDS}
+        facets={facets}
+        label="Filter autoflow runs"
+        placeholder="Filter runs… e.g. status:failed since:7d · kind:attempt · issue:acme/api#7 · pr:any"
+        error={queryError}
+        alerts={hostAlerts(notes, 'runs', retryPaging)}
+      />
+
       {customer && (
-        <>
-          <HostsWithoutCustomerBanner
-            className="mb-4"
-            hosts={slices.map((sl) => ({ id: sl.hostId, name: sl.name, state: sl.state, reason: sl.reason }))}
-            without={scoped.hostsWithoutCustomer}
-          />
-          <p className="mb-4 text-note text-ink-mute">
-            Failed attempts aren’t listed while a customer is selected — they record no customer. Archived runs aren’t
-            listed either — the archive can’t be filtered by customer.
-          </p>
-        </>
+        <p className="mb-4 text-note text-ink-mute">
+          Failed attempts aren’t listed while a customer is selected — they record no customer.
+        </p>
       )}
 
-      <AutoflowProblems host={problemsHost} />
+      <AutoflowProblems pick={pick} />
 
       {bannerError && <ErrorBanner className="mb-4">{bannerError}</ErrorBanner>}
 
@@ -465,43 +369,28 @@ export default function AutoflowRuns() {
         <div className="py-16 flex items-center justify-center">
           <Spinner label={waiting} />
         </div>
+      ) : rows.length === 0 && noHostAnswered(slices) ? (
+        <EmptyState title="No hosts answered" hint="Every host is offline or can't serve this list; the line under the query says which." />
       ) : rows.length === 0 ? (
-        <EmptyState
-          title={
-            noHostAnswered(slices)
-              ? 'No hosts answered'
-              : missing
-                ? 'No autoflow runs on the hosts that answered'
-                : workflow
-                  ? `No autoflow runs of ${workflow}`
-                  : 'No autoflow runs yet'
-          }
-          hint={
-            missing
-              ? `Not included: ${missing}.`
-              : customer === 'none'
-                ? 'No autoflow runs without a customer yet.'
+        q.trim() ? (
+          <NoMatches noun="autoflow runs" />
+        ) : (
+          <EmptyState
+            title="No autoflow runs yet"
+            hint={
+              customer === 'none'
+                ? 'No autoflow run without a customer yet. is:archived lists the archive.'
                 : customer
-                  ? 'No autoflow runs are attributed to this customer yet.'
-                  : 'Runs will appear here once an autoflow launches a workflow, or an attempt to launch one fails.'
-          }
-        />
-      ) : visible.length === 0 ? (
-        <>
-          {waiting ? (
-            <div className="py-16 flex items-center justify-center">
-              <Spinner label={`No matches yet · ${waiting}`} />
-            </div>
-          ) : (
-            <EmptyState title="No matches" hint={`No runs match "${query}".`} />
-          )}
-          {footer(listFooter)}
-        </>
+                  ? 'No autoflow run is attributed to this customer yet. is:archived lists the archive.'
+                  : 'Runs appear here once an autoflow launches a workflow, or an attempt to launch one fails. is:archived lists the archive.'
+            }
+          />
+        )
       ) : (
         <div className="space-y-6">
           <div className="bg-panel border border-border rounded-xl shadow-card px-4 py-3 mb-4">
             <UsageBarChart
-              bars={visible
+              bars={rows
                 .filter((r) => !r.attempt)
                 .map((r) => ({
                   id: r.id,
@@ -516,13 +405,13 @@ export default function AutoflowRuns() {
           </div>
           <SortableTable<AutoflowRunRow>
             columns={columns}
-            rows={visible}
+            rows={rows}
             rowKey={(r) => `${hostOf(r)}:${r.id}`}
             rowHref={(r) => (expandsInPlace(r) ? undefined : runHref(r))}
             renderDetail={renderDetail}
             initialSort={{ key: 'started', dir: 'desc' }}
           />
-          {footer(q ? `${visible.length} matches of ${rows.length} loaded` : listFooter)}
+          <ListFooter sentinelRef={sentinelRef} loading={loading} hasMore={hasMore} ended={ended} count={rows.length} />
         </div>
       )}
     </div>
