@@ -2368,13 +2368,13 @@ rupu fleet [OPTIONS] <COMMAND>
 
 | Subcommand | Description |
 |---|---|
-| [`install`](#rupu-fleet-install) | Install the stock fleet (agents + workflows) onto disk |
-| [`list`](#rupu-fleet-list) | List the agents and workflows the stock fleet ships |
+| [`install`](#rupu-fleet-install) | Install the stock fleet (agents, workflows and bundled skills) onto disk |
+| [`list`](#rupu-fleet-list) | List the agents, workflows and skills the stock fleet ships |
 
 <a id="rupu-fleet-install"></a>
 ### `rupu fleet install`
 
-Install the stock fleet (agents + workflows) onto disk
+Install the stock fleet (agents, workflows and bundled skills) onto disk
 
 ```
 rupu fleet install [OPTIONS]
@@ -2384,11 +2384,12 @@ rupu fleet install [OPTIONS]
 |---|---|
 | `--force` | Overwrite fleet files that already exist (default: keep them) |
 | `--project` | Install into the current project's `.rupu/` instead of the global `~/.rupu` |
+| `--skills-from <DIR>` | Install the fleet's skills from a local checkout of Section9Labs/rupu-skills at the pinned commit (offline boxes), instead of fetching them |
 
 <a id="rupu-fleet-list"></a>
 ### `rupu fleet list`
 
-List the agents and workflows the stock fleet ships
+List the agents, workflows and skills the stock fleet ships
 
 ```
 rupu fleet list [OPTIONS]

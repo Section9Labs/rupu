@@ -10,7 +10,7 @@
 //!   2. Every fleet member is named by at least one profile bundle — no
 //!      orphaned agent/workflow ships without a profile that uses it.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use rupu_agent::AgentSpec;
 use rupu_cli::templates::FLEET_MANIFEST;
@@ -157,4 +157,105 @@ fn shipped_agents_validate() {
             c.error.unwrap()
         );
     }
+}
+
+fn fleet_agent_skills() -> BTreeMap<String, Vec<String>> {
+    FLEET_MANIFEST
+        .iter()
+        .filter_map(|t| {
+            let stem = t
+                .target_relpath
+                .strip_prefix("agents/")?
+                .trim_end_matches(".md");
+            let spec = AgentSpec::parse(t.content).expect("fleet agent parses");
+            let mut skills = spec.skills.clone().unwrap_or_default();
+            skills.extend(spec.preload_skills.clone().unwrap_or_default());
+            Some((stem.to_string(), skills))
+        })
+        .collect()
+}
+
+#[test]
+fn every_bundled_skill_is_well_formed_and_pinned_alike_across_profiles() {
+    let mut pin_of: BTreeMap<String, (String, String, String, String)> = BTreeMap::new();
+    for (id, profile) in builtin_profiles() {
+        for s in &profile.bundle.skills {
+            s.name
+                .parse::<rupu_skills::SkillName>()
+                .unwrap_or_else(|e| panic!("profile `{id}` bundles skill `{}`: {e}", s.name));
+            let this = (
+                s.name.clone(),
+                s.source.clone(),
+                s.tag.clone(),
+                s.commit.clone(),
+            );
+            if let Some(prev) = pin_of.insert(s.name.clone(), this.clone()) {
+                assert_eq!(
+                    prev, this,
+                    "profile `{id}` pins `{}` differently from another profile",
+                    s.name
+                );
+            }
+        }
+    }
+    let per_source: BTreeMap<String, BTreeSet<String>> =
+        pin_of
+            .values()
+            .fold(BTreeMap::new(), |mut m, (_, src, _, commit)| {
+                m.entry(src.clone()).or_default().insert(commit.clone());
+                m
+            });
+    for (src, commits) in per_source {
+        assert_eq!(
+            commits.len(),
+            1,
+            "every skill from `{src}` must share one pin, found {commits:?}"
+        );
+    }
+}
+
+#[test]
+fn fleet_agents_grant_only_bare_skill_names_their_profiles_bundle() {
+    let granted = fleet_agent_skills();
+    for (agent, skills) in &granted {
+        for s in skills {
+            s.parse::<rupu_skills::SkillName>().unwrap_or_else(|e| {
+                panic!(
+                    "fleet agent `{agent}` grants `{s}`: fleet agents grant bare skill names ({e})"
+                )
+            });
+        }
+    }
+    for (id, profile) in builtin_profiles() {
+        let bundled: BTreeSet<&str> = profile
+            .bundle
+            .skills
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        for agent in &profile.bundle.agents {
+            for s in granted.get(agent).into_iter().flatten() {
+                assert!(
+                    bundled.contains(s.as_str()),
+                    "profile `{id}` bundles agent `{agent}`, which grants skill `{s}`, but `{id}`'s [bundle] skills do not include it"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn every_bundled_skill_is_granted_by_some_fleet_agent() {
+    let granted: BTreeSet<String> = fleet_agent_skills().into_values().flatten().collect();
+    let orphans: Vec<String> = builtin_profiles()
+        .into_values()
+        .flat_map(|p| p.bundle.skills.into_iter().map(|s| s.name))
+        .filter(|n| !granted.contains(n))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    assert!(
+        orphans.is_empty(),
+        "bundled skills no fleet agent grants: {orphans:?}"
+    );
 }

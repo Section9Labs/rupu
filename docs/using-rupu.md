@@ -172,6 +172,10 @@ hand-authoring an agent per engagement. It ships, for example:
 - a generic `assessment-lead` (in the `network`, `web`, `api`, `pentest` and
   `redteam` bundles) written to be an agentiflow's `lead:`
 
+A `[bundle]` can also pin skills (`skills = [{ name, source, tag, commit }]`,
+where `commit` is a full SHA and is what gets fetched); `rupu fleet install`
+installs the skills of the built-in bundles.
+
 See `rupu fleet list` for the full set (18 agents, 3 workflows) and
 [engagement-profiles.md](engagement-profiles.md#the-stock-fleet) for the
 profile-by-profile table and how to run them. Existing files are kept (your edits

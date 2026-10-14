@@ -66,8 +66,8 @@ pub struct Coverage {
     pub depth_ladder: Vec<String>,
 }
 
-/// Launcher prefill only (never a tool grant): the agents, tools, and workflows
-/// an engagement typically uses.
+/// Launcher prefill only (never a tool or skill grant): the agents, tools,
+/// workflows and skills an engagement typically uses.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Bundle {
@@ -77,6 +77,37 @@ pub struct Bundle {
     pub tools: Vec<String>,
     #[serde(default)]
     pub workflows: Vec<String>,
+    /// The skills `rupu fleet install` installs for this profile's agents,
+    /// each pinned to a commit.
+    #[serde(default)]
+    pub skills: Vec<BundleSkill>,
+}
+
+/// One bundled skill: what `rupu skill install` would be given, pinned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BundleSkill {
+    /// The skill's directory name in the source.
+    pub name: String,
+    /// `owner/repo` or an https git URL.
+    pub source: String,
+    /// The release the commit belongs to. Shown, never fetched.
+    pub tag: String,
+    /// What is fetched: a full commit, so a moved tag changes nothing.
+    #[serde(deserialize_with = "full_commit")]
+    pub commit: String,
+}
+
+/// Accept only a full 40-character lowercase hex SHA: a tag or branch can move.
+fn full_commit<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let s = String::deserialize(d)?;
+    if s.len() == 40 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        Ok(s)
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "commit {s:?} must be a full 40-character lowercase hex SHA; a tag or branch can move"
+        )))
+    }
 }
 
 /// Parse a profile from TOML source.
@@ -173,5 +204,61 @@ includes = ["network", "web"]
         .unwrap();
         assert_eq!(p.includes, ["network", "web"]);
         assert!(p.asset_kinds.is_empty());
+    }
+
+    const PIN: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn bundle_skills_parse_with_a_full_commit() {
+        let p = parse_profile(&format!(
+            r#"
+id = "x"
+name = "x"
+
+[bundle]
+agents = ["recon"]
+skills = [
+  {{ name = "network-recon", source = "Section9Labs/rupu-skills", tag = "v1.0.0", commit = "{PIN}" }},
+]
+"#
+        ))
+        .unwrap();
+        assert_eq!(p.bundle.skills.len(), 1);
+        let s = &p.bundle.skills[0];
+        assert_eq!(s.name, "network-recon");
+        assert_eq!(s.source, "Section9Labs/rupu-skills");
+        assert_eq!(s.tag, "v1.0.0");
+        assert_eq!(s.commit, PIN);
+    }
+
+    #[test]
+    fn bundle_skills_default_to_empty() {
+        let p = parse_profile("id = \"x\"\nname = \"x\"\n[bundle]\nagents = [\"a\"]\n").unwrap();
+        assert!(p.bundle.skills.is_empty());
+    }
+
+    #[test]
+    fn a_bundle_skill_commit_must_be_a_full_lowercase_sha() {
+        for bad in [
+            "v1.0.0",
+            "main",
+            "0123456",
+            "0123456789ABCDEF0123456789ABCDEF01234567",
+            "0123456789abcdef0123456789abcdef0123456z",
+        ] {
+            let err = parse_profile(&format!(
+                "id = \"x\"\nname = \"x\"\n[bundle]\nskills = [{{ name = \"a\", source = \"o/r\", tag = \"t\", commit = \"{bad}\" }}]\n"
+            ));
+            let msg = format!("{}", err.expect_err(bad));
+            assert!(msg.contains("40-character"), "{bad}: {msg}");
+        }
+    }
+
+    #[test]
+    fn a_bundle_skill_rejects_unknown_keys() {
+        let err = parse_profile(&format!(
+            "id = \"x\"\nname = \"x\"\n[bundle]\nskills = [{{ name = \"a\", source = \"o/r\", tag = \"t\", commit = \"{PIN}\", ref = \"main\" }}]\n"
+        ));
+        assert!(err.is_err(), "deny_unknown_fields must reject `ref`");
     }
 }

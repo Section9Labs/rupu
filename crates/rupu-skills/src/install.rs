@@ -351,9 +351,19 @@ pub(crate) fn recover_replaced(skills_dir: &Path, name: &str) -> Result<(), Inst
         }
     }
     for (_, stale) in backups {
-        let _ = std::fs::remove_dir_all(stale);
+        remove_any(&stale);
     }
     Ok(())
+}
+
+/// Best-effort removal of a directory, a file or a symlink (a replaced
+/// skill's backup can be any of them), never following a symlink.
+fn remove_any(path: &Path) {
+    let _ = match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(_) => Ok(()),
+    };
 }
 
 /// Removes a staging directory on every way out of `install_one`.
@@ -400,7 +410,7 @@ pub fn install_one(
             let _ = std::fs::rename(&backup, &dest);
             return Err(InstallError::Io { path: dest, source });
         }
-        let _ = std::fs::remove_dir_all(&backup);
+        remove_any(&backup);
         InstallOutcome::Replaced
     } else {
         std::fs::rename(&staged, &dest).map_err(io(&dest))?;
@@ -482,11 +492,64 @@ pub fn list_source(
     Ok(found)
 }
 
+/// Where an installed skill sits in its git source, for its record: the
+/// source's `#path` joined with the skill's place under it.
+pub(crate) fn record_path_of(base: Option<&str>, rel: &str) -> Option<String> {
+    match (base, rel) {
+        (Some(p), "") => Some(p.to_owned()),
+        (Some(p), r) => Some(format!("{p}/{r}")),
+        (None, "") => None,
+        (None, r) => Some(r.to_owned()),
+    }
+}
+
+/// Writes the source record of a skill installed from a git source: the
+/// one record `rupu skill install` and a pinned install both leave.
+/// `base` is the source's `#path`; the skill's place under it comes from
+/// `inst.rel`.
+pub(crate) fn write_git_record(
+    skills_dir: &Path,
+    inst: &Installed,
+    source: &str,
+    url: &str,
+    git_ref: Option<&str>,
+    base: Option<&str>,
+    commit: Option<&str>,
+) -> Result<Tracking, InstallError> {
+    use crate::record::{now_secs, SourceRecord, RECORD_VERSION};
+    let rec = SourceRecord {
+        version: RECORD_VERSION,
+        source: source.to_owned(),
+        url: Some(url.to_owned()),
+        git_ref: git_ref.map(str::to_owned),
+        path: record_path_of(base, &inst.rel),
+        commit: commit.map(str::to_owned),
+        local: None,
+        content_hash: inst.content_hash.hex(),
+        installed_at: now_secs(),
+    };
+    store_record(skills_dir, inst, &rec)
+}
+
+fn store_record(
+    skills_dir: &Path,
+    inst: &Installed,
+    rec: &crate::record::SourceRecord,
+) -> Result<Tracking, InstallError> {
+    crate::record::write_record(skills_dir, inst.name.as_str(), rec).map_err(|source| {
+        InstallError::Io {
+            path: crate::record::record_path(skills_dir, inst.name.as_str()),
+            source,
+        }
+    })?;
+    Ok(Tracking::Recorded)
+}
+
 pub fn install_from(
     spec: &InstallSpec<'_>,
     fetcher: &dyn crate::source::Fetch,
 ) -> Result<InstallReport, InstallError> {
-    use crate::record::{inside_project, now_secs, write_record, SourceRecord, RECORD_VERSION};
+    use crate::record::{inside_project, now_secs, SourceRecord, RECORD_VERSION};
     use crate::source::Source;
     let tree = open(spec.source, fetcher)?;
     let found = find_skills(&tree.root)?;
@@ -494,48 +557,42 @@ pub fn install_from(
         return Err(InstallError::NoSkill(tree.root.clone()));
     }
     let mut record = |inst: &Installed| {
-        let (url, git_ref, path, local) = match spec.source {
+        let source = match spec.source {
             Source::Git(g) => {
-                let joined = match (&g.path, inst.rel.as_str()) {
-                    (Some(p), "") => Some(p.clone()),
-                    (Some(p), r) => Some(format!("{p}/{r}")),
-                    (None, "") => None,
-                    (None, r) => Some(r.to_owned()),
-                };
-                (Some(g.url.clone()), g.git_ref.clone(), joined, None)
+                return write_git_record(
+                    spec.skills_dir,
+                    inst,
+                    spec.input,
+                    &g.url,
+                    g.git_ref.as_deref(),
+                    g.path.as_deref(),
+                    tree.commit.as_deref(),
+                )
             }
-            Source::Local(root) => {
-                let dir = if inst.rel.is_empty() {
-                    root.clone()
-                } else {
-                    root.join(&inst.rel)
-                };
-                if spec.layer == Layer::Project
-                    && !inside_project(spec.skills_dir, &dir).map_err(io(&dir))?
-                {
-                    return Ok(Tracking::Untracked);
-                }
-                (None, None, None, Some(dir))
-            }
+            Source::Local(root) => root,
         };
+        let dir = if inst.rel.is_empty() {
+            source.clone()
+        } else {
+            source.join(&inst.rel)
+        };
+        if spec.layer == Layer::Project
+            && !inside_project(spec.skills_dir, &dir).map_err(io(&dir))?
+        {
+            return Ok(Tracking::Untracked);
+        }
         let rec = SourceRecord {
             version: RECORD_VERSION,
             source: spec.input.to_owned(),
-            url,
-            git_ref,
-            path,
+            url: None,
+            git_ref: None,
+            path: None,
             commit: tree.commit.clone(),
-            local,
+            local: Some(dir),
             content_hash: inst.content_hash.hex(),
             installed_at: now_secs(),
         };
-        write_record(spec.skills_dir, inst.name.as_str(), &rec).map_err(|source| {
-            InstallError::Io {
-                path: crate::record::record_path(spec.skills_dir, inst.name.as_str()),
-                source,
-            }
-        })?;
-        Ok(Tracking::Recorded)
+        store_record(spec.skills_dir, inst, &rec)
     };
     install_selected(
         &found,

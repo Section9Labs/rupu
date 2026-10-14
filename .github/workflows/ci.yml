@@ -343,6 +343,12 @@ jobs:
           docker run --rm -v "$PWD":/work -w /work alpine:3.21 \
             /work/target/linux-musl/release/rupu update --print-platform
 
+      # Every skill the built-in profiles pin must fetch at its commit and
+      # validate with this build. Needs network, so it is not a cargo test.
+      - name: Check the fleet's pinned skills
+        if: matrix.platform == 'linux-x64'
+        run: scripts/check-skill-pins.sh target/linux-musl/release/rupu
+
       # The container runs as root, so everything it wrote under target/ and
       # .cargo-musl is root-owned. The cache action runs as the runner user
       # and cannot read those, so its post-step would silently save nothing.
