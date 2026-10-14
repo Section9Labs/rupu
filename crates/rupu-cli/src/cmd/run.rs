@@ -28,7 +28,9 @@ pub struct Args {
     /// See `docs/scm.md#target-syntax` for the full grammar.
     /// Distinguished from `prompt` by parsing as a RunTarget.
     pub target: Option<String>,
-    /// Optional initial user message. Defaults to "go" if omitted.
+    /// Optional initial user message. Defaults to "go" if omitted. Leading
+    /// `/skill` tokens (`/pdf summarize it`) invoke those skills: their
+    /// instructions go ahead of the rest of the prompt.
     pub prompt: Option<String>,
     /// Explicit prompt flag (takes precedence over the positional `prompt`).
     /// Use this when the prompt should not be confused with a target string.
@@ -1100,7 +1102,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     };
     paths::ensure_dir(&transcripts)?;
     let transcript_path = transcripts.join(format!("{run_id}.jsonl"));
-    let launch_args = launch_argv(&args, &run_id);
+    let mut launch_args = launch_argv(&args, &run_id);
 
     // Every `rupu run` streams its coverage to a run-scoped file so a
     // coordinator can collect a placed unit's findings (spec
@@ -1114,7 +1116,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     // With `--model`/`--provider` on this command line, a run that failed on
     // an outcome is continued too (`prepare_recovery_continuation`); the
     // third element is that outcome, `None` for an interrupted run.
-    let launch_skills = (args.skills.clone(), args.preload_skills.clone());
+    let mut launch_skills = (args.skills.clone(), args.preload_skills.clone());
     let mut resume_from: Option<ResumeFrom> = match args.continue_from.as_deref().zip(prev_path) {
         None => None,
         Some((prev, prev_path)) => {
@@ -1143,9 +1145,13 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             match prepared {
                 Continuation::Finished { output } => {
                     // This run records nothing, but it is still a
-                    // `rupu run`: start its stream so a coordinator reads
-                    // "nothing recorded", not "host can't stream".
+                    // `rupu run`: start its streams so a coordinator reads
+                    // "nothing recorded", not "host can't stream" (the
+                    // netflow one only for a root — spec 2026-10-14 §N1).
                     start_coverage_stream(&coverage_stream, &run_id);
+                    if args.run_id.is_some() && args.launch.link().is_none() {
+                        crate::netflow_sink::start_root_stream(&global, &run_id);
+                    }
                     println!("{output}");
                     eprintln!(
                         "run {prev} had already finished — printed its recorded answer without calling the model"
@@ -1183,6 +1189,16 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     // "nothing recorded". Written after the `--continue` checks, which must
     // not touch a run's files before they pass.
     start_coverage_stream(&coverage_stream, &run_id);
+    // The netflow stream follows the same rule, for a ROOT only: a run a
+    // coordinator launched (`--run-id`) that no other run launched (no
+    // `--launch-*` link). A launched child tees into its root's stream
+    // instead, and a terminal `rupu run` tees nowhere (spec 2026-10-14
+    // remote netflow transport §N1).
+    let launch_link = args.launch.link();
+    if args.run_id.is_some() && launch_link.is_none() {
+        crate::netflow_sink::start_root_stream(&global, &run_id);
+    }
+    let netflow_stream = crate::netflow_sink::root_stream(&global, launch_link.as_ref(), &run_id);
 
     // Netflow capture. Two destinations: this run's own ledger FILE
     // (`<run_id>.jsonl`, rooted at the project when one already has a
@@ -1211,9 +1227,19 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     // `shutdown()`, so the writer task's own periodic ticker is the
     // primary safety net, but a clean CLI exit should still flush
     // promptly rather than rely on that ticker's multi-second cadence).
-    let netflow =
-        crate::netflow_sink::for_run(&global, project_root.as_deref(), &run_id, &transcript_path);
+    let netflow = crate::netflow_sink::for_run(
+        &global,
+        project_root.as_deref(),
+        &run_id,
+        &transcript_path,
+        netflow_stream,
+    );
     let netflow_sink = netflow.sink.clone();
+    // Shared with the body so it can finish the capture before the run's
+    // record turns terminal (below); whatever path skips that finishes it
+    // after the body.
+    let netflow = Arc::new(std::sync::Mutex::new(Some(netflow)));
+    let netflow_for_body = Arc::clone(&netflow);
 
     // Everything below that can generate outbound HTTP (provider build,
     // SCM registry discovery, repo clone, the agent run itself) is wrapped
@@ -1290,6 +1316,35 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             },
         };
 
+        // Leading `/skill` tokens invoke those skills (as a session turn
+        // takes them): each joins the launch's skills, recorded as a
+        // `--skill` so `--continue` keeps it, and its body goes ahead of the
+        // rest of the prompt below. A refusal fails the run with the
+        // launch's other skill failures.
+        let skill_dirs =
+            rupu_skills::LayerDirs::for_layers(&global, project_agents_parent.as_deref())
+                .with_overlay(skill_overlay.clone());
+        let (slash, slash_failure) =
+            match rupu_runtime::assembly::resolve_slash_skills(&skill_dirs, &[], &user_message)
+                .await
+            {
+                Ok(turn) => (turn, None),
+                Err(e) => (
+                    rupu_skills::SlashTurn {
+                        invoked: Vec::new(),
+                        prompt: user_message.clone(),
+                    },
+                    Some(e),
+                ),
+            };
+        for f in &slash.invoked {
+            let entry = format!("{}:{}", f.layer.as_str(), f.name);
+            if !launch_skills.0.contains(&entry) {
+                launch_args.extend(["--skill".to_string(), entry.clone()]);
+                launch_skills.0.push(entry);
+            }
+        }
+
         // `--provider` / `--model` override the agent and the config. A
         // `## Run target` section joins the system prompt when a target is
         // set.
@@ -1321,7 +1376,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             .resolve_skills_for_launch(&spec, &overrides, &transcript_path)
             .await
         {
-            Ok(skills) => (skills, None),
+            Ok(skills) => (skills, slash_failure),
             Err(e) => (None, Some(e)),
         };
 
@@ -1467,7 +1522,6 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         // ledger. No event sink — bare `rupu run` uses the
         // `LineStreamPrinter`, which renders children from the parent
         // transcript's tool calls.
-        let launch_link = args.launch.link();
         let launcher = rupu_launch::Launchers::local(&global, &assembler.context().config)?
             .launcher(
                 Arc::clone(&assembler),
@@ -1534,7 +1588,17 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             )
         };
 
-        let mut prompt = rupu_agent::UserTurn::new(user_message);
+        let mut prompt = rupu_agent::UserTurn::new(slash.prompt.clone());
+        if !slash.invoked.is_empty() && skills_failure.is_none() {
+            let (skills, invoked, text) = (resolved_skills.clone(), slash.invoked, slash.prompt);
+            let (message, loads) = tokio::task::spawn_blocking(move || {
+                rupu_agent::operator_turn(skills.as_deref(), &invoked, &text)
+            })
+            .await
+            .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))?;
+            prompt.message = message;
+            prompt.operator_loads = loads;
+        }
         match resume_from.take() {
             None => {}
             // A failed run continued on another model: the note says why the
@@ -1746,6 +1810,20 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         let run_result = standalone_run_outcome(run_result);
         let success = run_result.is_ok();
 
+        // Finish this run's netflow — flush the writer, write its `Dropped`
+        // line, backfill from the transcript, each teed into a coordinator's
+        // stream — BEFORE the record turns terminal: a coordinator pulls the
+        // stream once it sees a terminal run.json, and a line written after
+        // that would be missing from a copy it calls whole (spec 2026-10-14
+        // remote netflow transport §N2).
+        let finishing = netflow_for_body
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some(n) = finishing {
+            n.finish().await;
+        }
+
         // Write run.json so the run is observable via RunStore and the mirror
         // can carry final_output back to the central control-plane.
         {
@@ -1884,7 +1962,10 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     // for long-running daemons like `rupu cp serve`, not a substitute for
     // this for a one-shot CLI process that may exit within milliseconds
     // of the ticker's last check.
-    netflow.finish().await;
+    let leftover = netflow.lock().unwrap_or_else(|p| p.into_inner()).take();
+    if let Some(n) = leftover {
+        n.finish().await;
+    }
 
     body_result
 }

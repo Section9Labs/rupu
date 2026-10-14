@@ -16,14 +16,16 @@ use crate::{
     agent_launcher::AgentLaunchRequest,
     host::connector::{
         spec_peer_codename, EventByteStream, HostCapabilities, HostConnector, HostConnectorError,
-        HostInfo, OperatorMessageRequest, RunKind, RunListQuery, MAX_WORKSPACE_BYTES,
+        HostInfo, NetflowLanding, OperatorMessageRequest, RunKind, RunListQuery,
+        MAX_WORKSPACE_BYTES,
     },
     host::messages::MessageRoute,
     host::skill_ship::{prefixed, ship_through, ShipMemo, ShipOutcome, SkillBundle, Transfer},
     launcher::LaunchRequest,
     node::protocol::{
         messaging_capability, CAP_AGENT_ENGAGEMENT_PROFILE, CAP_AGENT_FINDINGS_PROFILE,
-        CAP_AGENT_SKILLS, CAP_AGENT_SKILL_BUNDLE, CAP_RUN_MESSAGES, CAP_RUN_SUPPLIED_RUN_ID,
+        CAP_AGENT_SKILLS, CAP_AGENT_SKILL_BUNDLE, CAP_RUN_MESSAGES, CAP_RUN_NETFLOW_STREAM,
+        CAP_RUN_SUPPLIED_RUN_ID,
         CAP_SESSION_SKILLS,
     },
     session_sender::SendMessageRequest,
@@ -61,6 +63,10 @@ pub struct HttpHostConnector {
     /// The shipped skills this remote confirmed it holds — see
     /// [`HostConnector::ship_skills`].
     ship_memo: ShipMemo,
+    /// The registry id this connector was built for ([`Self::with_host_id`]);
+    /// what a netflow landing record names as its host. `None` for a bare
+    /// connector, which names its base URL instead.
+    host_id: Option<String>,
 }
 
 /// What `/api/host/info` said about the remote.
@@ -126,7 +132,15 @@ impl HttpHostConnector {
             artifact_idle: ARTIFACT_PULL_IDLE_TIMEOUT,
             features_seen: std::sync::Mutex::new(None),
             ship_memo: ShipMemo::default(),
+            host_id: None,
         }
+    }
+
+    /// Name the registry host this connector serves, so what it records (a
+    /// netflow landing's `host`) carries the id every other view uses.
+    pub fn with_host_id(mut self, host_id: impl Into<String>) -> Self {
+        self.host_id = Some(host_id.into());
+        self
     }
 
     /// Like [`Self::new`], but bounds every request's connect + total time to
@@ -163,6 +177,7 @@ impl HttpHostConnector {
             artifact_idle: ARTIFACT_PULL_IDLE_TIMEOUT,
             features_seen: std::sync::Mutex::new(None),
             ship_memo: ShipMemo::default(),
+            host_id: None,
         }
     }
 
@@ -317,7 +332,7 @@ impl HttpHostConnector {
             ))),
             PeerInfo::Info(body) if body.features.iter().any(|f| f == feature) => Ok(()),
             PeerInfo::Info(body) => Err(HostConnectorError::Unsupported(format!(
-                "{what}: remote host {base_url} (rupu {}) does not support it; upgrade rupu there",
+                "{what}: remote host {base_url} (rupu {}) does not advertise `{feature}`; upgrade rupu there",
                 body.version.as_deref().unwrap_or("unknown version"),
             ))),
         }
@@ -834,8 +849,71 @@ impl HostConnector for HttpHostConnector {
             .await
     }
 
-    /// GET the remote CP's own local file. Complete once the run is terminal:
-    /// the remote serves the file its `rupu run` wrote, not a copy in transit.
+    /// GET the remote CP's own `runs/<id>/netflow.jsonl` and land it here
+    /// (spec 2026-10-14 §N2/§N3). The remote serves the file its `rupu run`
+    /// wrote, so a read of a terminal run is complete and a snapshot is
+    /// partial. A peer without [`CAP_RUN_NETFLOW_STREAM`] (an older rupu
+    /// answers the unknown path with its SPA) or a failed fetch is recorded
+    /// `unavailable` with the reason: missing netflow must never read as
+    /// "no flows". Only an invalid id or a landing I/O error is an `Err`.
+    async fn land_run_netflow(
+        &self,
+        run_id: &str,
+        terminal: bool,
+        runs_root: &std::path::Path,
+    ) -> Result<NetflowLanding, HostConnectorError> {
+        if !crate::host::connector::valid_run_id(run_id) {
+            return Err(HostConnectorError::Invalid(format!(
+                "invalid run id {run_id:?}"
+            )));
+        }
+        let fetched: Result<Vec<u8>, String> =
+            match self
+                .require_feature(
+                    CAP_RUN_NETFLOW_STREAM,
+                    "this unit's netflow cannot be collected",
+                )
+                .await
+            {
+                Err(e) => Err(e.to_string()),
+                Ok(()) => {
+                    let path = format!("/api/runs/{run_id}/netflow/stream");
+                    match self.send(self.client.get(self.url(&path))).await {
+                        Err(e) => Err(e.to_string()),
+                        Ok(resp) => resp.bytes().await.map(|b| b.to_vec()).map_err(|e| {
+                            HostConnectorError::Unreachable(e.to_string()).to_string()
+                        }),
+                    }
+                }
+            };
+        let (runs_root, run_id, host) = (
+            runs_root.to_path_buf(),
+            run_id.to_string(),
+            self.host_id.clone().unwrap_or_else(|| self.base_url.clone()),
+        );
+        let rec = tokio::task::spawn_blocking(move || match fetched {
+            Ok(bytes) => rupu_netflow::land::land_and_record(
+                &runs_root,
+                &run_id,
+                &host,
+                Some(&bytes),
+                terminal,
+                (!terminal).then(|| "read before the unit finished".to_string()),
+            ),
+            Err(why) => rupu_netflow::land::land_and_record(
+                &runs_root,
+                &run_id,
+                &host,
+                None,
+                false,
+                Some(why),
+            ),
+        })
+        .await
+        .map_err(|e| HostConnectorError::Internal(e.to_string()))?
+        .map_err(|e| HostConnectorError::Internal(e.to_string()))?;
+        Ok(NetflowLanding::Landed(rec.status))
+    }
     async fn unit_coverage(
         &self,
         run_id: &str,

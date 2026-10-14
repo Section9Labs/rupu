@@ -281,6 +281,12 @@ pub struct ToolServices {
     /// `dispatch_agent` children; `None` for in-process workflow steps and
     /// sessions, which already write the coordinator's ledgers directly.
     pub coverage_stream: Option<PathBuf>,
+    /// The coordinator-launched root's netflow stream this run tees its
+    /// ledger lines into (spec 2026-10-14 remote netflow transport §N1):
+    /// `runs/<root>/netflow.jsonl`, tagged with this run's ledger id. Set by
+    /// the run assembler; a sub-agent inherits the path under its own id.
+    /// `None` = the run's ledger is not streamed to a coordinator.
+    pub netflow_stream: Option<rupu_netflow::NetflowStream>,
     /// Where this run's network flows go, so the `bash` tool can attribute a
     /// child's connections to the run; `None` disables subprocess capture.
     pub netflow_sink: Option<Arc<dyn rupu_netflow::FlowSink>>,
@@ -381,6 +387,7 @@ impl std::fmt::Debug for ToolServices {
                 &self.coverage_catalog.as_ref().map(|_| "<catalog>"),
             )
             .field("coverage_stream", &self.coverage_stream)
+            .field("netflow_stream", &self.netflow_stream)
             .field(
                 "netflow_sink",
                 &self.netflow_sink.as_ref().map(|_| "<sink>"),

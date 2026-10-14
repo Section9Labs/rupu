@@ -160,6 +160,60 @@ fn settle_awaiting(result: &mut OrchestratorRunResult, runs_dir: &Path) {
 /// A panic out of a workflow runner: what it carried.
 type RunnerPanic = Box<dyn std::any::Any + Send>;
 
+/// A workflow root's own netflow — its SCM registry's and `action:` steps'
+/// flows, teed into a coordinator's stream when it is a placed root —
+/// finished BEFORE its record turns terminal, as `rupu run` finishes its
+/// own: a coordinator pulls the stream once it sees a terminal `run.json`,
+/// and a line written after that would be missing from a copy it calls
+/// whole (spec 2026-10-14 remote netflow transport §N2). [`RootNetflow::arm`]
+/// hands the runner the finish as a before-terminal hook
+/// ([`rupu_orchestrator::RunStore::add_before_terminal`]: run once, before
+/// the final terminal write, or at the end of a reject cleanup chain);
+/// [`RootNetflow::finish_leftover`] does it here when the runner never did
+/// (a pause, a run that failed before it started).
+pub(crate) struct RootNetflow {
+    store: Arc<rupu_orchestrator::RunStore>,
+    run_id: String,
+    slot: Arc<Mutex<Option<rupu_runtime::netflow::RunNetflow>>>,
+}
+
+impl RootNetflow {
+    pub(crate) fn arm(
+        store: Arc<rupu_orchestrator::RunStore>,
+        run_id: &str,
+        netflow: rupu_runtime::netflow::RunNetflow,
+    ) -> Self {
+        let slot = Arc::new(Mutex::new(Some(netflow)));
+        let hooked = Arc::clone(&slot);
+        store.add_before_terminal(
+            run_id,
+            Box::new(move || Box::pin(async move { finish_root_netflow(&hooked).await })),
+        );
+        Self {
+            store,
+            run_id: run_id.to_string(),
+            slot,
+        }
+    }
+
+    /// After the runner returned: finish the root's netflow unless the
+    /// runner already did, and drop the hooks still registered for the run
+    /// — nothing in this process ends it any more.
+    pub(crate) async fn finish_leftover(self) {
+        drop(self.store.take_before_terminal(&self.run_id));
+        finish_root_netflow(&self.slot).await;
+    }
+}
+
+/// Finish the netflow in `slot`, once: the first of the runner's hook and
+/// the launcher's leftover pass takes it.
+async fn finish_root_netflow(slot: &Mutex<Option<rupu_runtime::netflow::RunNetflow>>) {
+    let taken = slot.lock().unwrap_or_else(|p| p.into_inner()).take();
+    if let Some(netflow) = taken {
+        netflow.finish().await;
+    }
+}
+
 /// `run_workflow(opts)` for a caller that watches the run's status on disk
 /// to know when it is over — the attach printers return only on a parked or
 /// terminal status, the live view tails the run's events, the CP lists it —
@@ -3757,16 +3811,22 @@ pub(crate) async fn resume_run(
     // `resume.rs::rebuild_opts_from_disk`: this run's linear steps share
     // `<transcripts>/<run_id>.jsonl`, matching `DefaultStepFactory`'s own
     // per-step ledger naming, so this registry's sink lands in the same
-    // ledger every step's sink independently resolves to. The writer
-    // handle is intentionally left unheld — the sink Arc lives on inside
-    // `mcp_registry` for as long as this resumed run needs it.
-    let _netflow = crate::netflow_sink::for_run(
+    // ledger every step's sink independently resolves to. It is finished
+    // before the record turns terminal (`RootNetflow`).
+    // A resumed run tees into the stream it was launched under: its link's
+    // root, else its own already-begun stream (spec 2026-10-14 remote
+    // netflow transport §N1; a host-side resume never writes a second
+    // `begin`).
+    let launch_link = store.read_launch_link(run_id);
+    let netflow = crate::netflow_sink::for_run(
         &global,
         project_root.as_deref(),
         run_id,
         &transcripts.join(format!("{run_id}.jsonl")),
+        crate::netflow_sink::root_stream(&global, launch_link.as_ref(), run_id),
     );
-    let netflow_sink = _netflow.sink.clone();
+    let netflow_sink = netflow.sink.clone();
+    let root_netflow = RootNetflow::arm(Arc::clone(&store), run_id, netflow);
     let mcp_registry =
         Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg, netflow_sink).await);
 
@@ -3831,7 +3891,7 @@ pub(crate) async fn resume_run(
             // refuse gated workflows), so it keeps the workflow's own scope.
             scope_name_override: None,
             launcher: Some(Arc::new(rupu_launch::Launchers::local(&global, &cfg)?)),
-            link: store.read_launch_link(run_id),
+            link: launch_link.clone(),
             // The root codename it was launched under, as recorded.
             codename: record.codename.as_deref().and_then(|c| c.parse().ok()),
         })?;
@@ -3979,6 +4039,7 @@ pub(crate) async fn resume_run(
     } else {
         Box::pin(run_workflow(opts)).await
     };
+    root_netflow.finish_leftover().await;
     let result = match outcome {
         Ok(result) => result,
         Err(e) => {
@@ -4753,14 +4814,28 @@ async fn run_with_outcome(
     let run_id = run_id_override
         .clone()
         .unwrap_or_else(|| format!("run_{}", Ulid::new()));
+    // A coordinator-launched root (`--run-id`, no `--launch-*` link) begins
+    // its netflow stream before any flow is recorded; every step and unit
+    // then tees into it (spec 2026-10-14 remote netflow transport §N1).
+    if run_id_override.is_some() && overlay.link.is_none() {
+        crate::netflow_sink::start_root_stream(&global, &run_id);
+    }
     let transcripts_dir = paths::transcripts_dir(&global, project_root.as_deref());
-    let _netflow = crate::netflow_sink::for_run(
+    let netflow = crate::netflow_sink::for_run(
         &global,
         project_root.as_deref(),
         &run_id,
         &transcripts_dir.join(format!("{run_id}.jsonl")),
+        crate::netflow_sink::root_stream(&global, overlay.link.as_ref(), &run_id),
     );
-    let netflow_sink = _netflow.sink.clone();
+    let netflow_sink = netflow.sink.clone();
+    // Finished before the run's record turns terminal, with the one
+    // `execute_workflow_invocation` builds for the same run.
+    let root_netflow = RootNetflow::arm(
+        Arc::new(rupu_orchestrator::RunStore::new(global.join("runs"))),
+        &run_id,
+        netflow,
+    );
 
     // Build the SCM/issue registry once for the entire workflow run.
     // Cheap when no platforms are configured; missing credentials are
@@ -4904,7 +4979,7 @@ async fn run_with_outcome(
         RunTriggerSource::WorkflowCli
     };
 
-    execute_workflow_invocation(
+    let outcome = execute_workflow_invocation(
         name,
         workflow,
         body,
@@ -4941,7 +5016,9 @@ async fn run_with_outcome(
         },
         overlay,
     )
-    .await
+    .await;
+    root_netflow.finish_leftover().await;
+    outcome
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5544,15 +5621,16 @@ async fn execute_workflow_invocation(
     // linear steps will independently resolve the SAME
     // `<transcripts>/<run_id>.jsonl` via `DefaultStepFactory`, so this
     // registry's sink and every step's own sink converge on one ledger.
-    // The writer handle is intentionally left unheld — the sink Arc lives
-    // on inside `mcp_registry` for as long as this run needs it.
-    let _netflow = crate::netflow_sink::for_run(
+    // It is finished before the record turns terminal (`RootNetflow`,
+    // armed once the run store exists below).
+    let netflow = crate::netflow_sink::for_run(
         &global,
         ctx.project_root.as_deref(),
         &run_id,
         &transcripts.join(format!("{run_id}.jsonl")),
+        crate::netflow_sink::root_stream(&global, overlay.link.as_ref(), &run_id),
     );
-    let netflow_sink = _netflow.sink.clone();
+    let netflow_sink = netflow.sink.clone();
     let mcp_registry =
         Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg, netflow_sink).await);
 
@@ -5578,6 +5656,7 @@ async fn execute_workflow_invocation(
     let runs_dir = global.join("runs");
     paths::ensure_dir(&runs_dir)?;
     let run_store = Arc::new(rupu_orchestrator::RunStore::new(runs_dir.clone()));
+    let root_netflow = RootNetflow::arm(Arc::clone(&run_store), &run_id, netflow);
     run_store
         .write_run_envelope(&run_id, &run_envelope)
         .map_err(|e| anyhow::anyhow!("persist run envelope: {e}"))?;
@@ -5977,6 +6056,7 @@ async fn execute_workflow_invocation(
     // The run has finished (terminal or paused); the marker poller has no
     // further use — stop it so it never outlives the run.
     pause_poller.abort();
+    root_netflow.finish_leftover().await;
 
     // Shared completion summary: ONE truthful block for every interactive
     // path that reaches here — the alt-screen live view (its UI is torn down

@@ -168,6 +168,7 @@ async fn run_writer(
         }
     };
 
+    let mut tee = Tee::new(paths.stream.clone());
     let mut last_dropped = 0u64;
     // See `DROPPED_VISIBILITY_INTERVAL`'s doc comment: this is the ONLY
     // mechanism that surfaces loss for a run/turn whose writer never
@@ -194,14 +195,27 @@ async fn run_writer(
                 };
                 match req {
                     WriteRequest::Line(line) => {
-                        write_line(&mut file, &line, &dropped_counter).await;
+                        if let Some(json) = write_line(&mut file, &line, &dropped_counter).await {
+                            tee.push(&json);
+                        }
                         last_dropped =
-                            flush_dropped(&mut file, &dropped_counter, last_dropped).await;
+                            flush_dropped(&mut file, &mut tee, &dropped_counter, last_dropped)
+                                .await;
+                        // Flush the tee once the burst pauses (or the buffer
+                        // is large), not per line: one locked stream write
+                        // per ledger line could back the channel up during a
+                        // bash-capture burst and turn into real `Dropped`
+                        // loss in the ledger itself.
+                        if rx.is_empty() || tee.is_full() {
+                            tee.flush().await;
+                        }
                     }
                     WriteRequest::Flush(ack) => {
                         last_dropped =
-                            flush_dropped(&mut file, &dropped_counter, last_dropped).await;
+                            flush_dropped(&mut file, &mut tee, &dropped_counter, last_dropped)
+                                .await;
                         let _ = file.flush().await;
+                        tee.flush().await;
                         let _ = ack.send(());
                     }
                     WriteRequest::Stop => {
@@ -218,7 +232,14 @@ async fn run_writer(
                         rx.close();
                         while let Some(pending) = rx.recv().await {
                             if let WriteRequest::Line(line) = pending {
-                                write_line(&mut file, &line, &dropped_counter).await;
+                                if let Some(json) =
+                                    write_line(&mut file, &line, &dropped_counter).await
+                                {
+                                    tee.push(&json);
+                                    if tee.is_full() {
+                                        tee.flush().await;
+                                    }
+                                }
                             }
                         }
                         break;
@@ -226,13 +247,75 @@ async fn run_writer(
                 }
             }
             _ = ticker.tick() => {
-                last_dropped = flush_dropped(&mut file, &dropped_counter, last_dropped).await;
+                last_dropped =
+                    flush_dropped(&mut file, &mut tee, &dropped_counter, last_dropped).await;
+                tee.flush().await;
             }
         }
     }
 
-    flush_dropped(&mut file, &dropped_counter, last_dropped).await;
+    flush_dropped(&mut file, &mut tee, &dropped_counter, last_dropped).await;
     let _ = file.flush().await;
+    tee.flush().await;
+}
+
+/// Flush the tee buffer once it holds this many bytes, even mid-burst.
+const TEE_FLUSH_BYTES: usize = 64 * 1024;
+
+/// The tee into the root's stream. Ledger lines the ledger holds are pushed
+/// as they are written and flushed in batches — when the channel is
+/// momentarily empty, when the buffer passes [`TEE_FLUSH_BYTES`], on
+/// `Flush`, on `Stop`, after the final `Dropped` and on the ticker — each
+/// batch ONE locked write on the blocking pool, awaited so batches land in
+/// ledger order. A failure is logged and never returned: the ledger line is
+/// safe, and capture must never fail a run — a coordinator sees a short
+/// stream as `partial`, never as "no flows".
+struct Tee {
+    stream: Option<crate::stream::NetflowStream>,
+    buf: Vec<u8>,
+}
+
+impl Tee {
+    fn new(stream: Option<crate::stream::NetflowStream>) -> Self {
+        Self {
+            stream,
+            buf: Vec::new(),
+        }
+    }
+
+    /// Queue one newline-terminated ledger line the ledger now holds.
+    fn push(&mut self, json: &str) {
+        if self.stream.is_some() {
+            self.buf.extend_from_slice(json.as_bytes());
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.buf.len() >= TEE_FLUSH_BYTES
+    }
+
+    async fn flush(&mut self) {
+        let Some(s) = self.stream.as_ref() else {
+            return;
+        };
+        if self.buf.is_empty() {
+            return;
+        }
+        let (path, ledger) = (s.path.clone(), s.ledger_id.clone());
+        let batch = std::mem::take(&mut self.buf);
+        let res = tokio::task::spawn_blocking(move || {
+            crate::stream::append_stream_raw_lines(&path, &ledger, &batch)
+        })
+        .await;
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(
+                error = %e,
+                "netflow stream write failed; a coordinator will see this run's flows as partial"
+            ),
+            Err(e) => tracing::warn!(error = %e, "netflow stream write task failed"),
+        }
+    }
 }
 
 /// Compute how many records have been lost since `last_dropped`, write a
@@ -241,6 +324,7 @@ async fn run_writer(
 /// logic isn't duplicated.
 async fn flush_dropped(
     file: &mut tokio::fs::File,
+    tee: &mut Tee,
     dropped_counter: &AtomicU64,
     last_dropped: u64,
 ) -> u64 {
@@ -250,15 +334,23 @@ async fn flush_dropped(
             count: dropped - last_dropped,
             ts: chrono::Utc::now(),
         };
-        write_line(file, &line, dropped_counter).await;
+        if let Some(json) = write_line(file, &line, dropped_counter).await {
+            tee.push(&json);
+        }
     }
     dropped
 }
 
 /// Append one line. A failure here is REAL LOSS and must be counted —
 /// a full disk or revoked permission must not silently vanish a record any
-/// more than channel overflow may.
-async fn write_line(file: &mut tokio::fs::File, line: &LedgerLine, dropped: &AtomicU64) {
+/// more than channel overflow may. Returns the newline-terminated line the
+/// ledger now holds, so the caller tees exactly those bytes and nothing the
+/// ledger lost.
+async fn write_line(
+    file: &mut tokio::fs::File,
+    line: &LedgerLine,
+    dropped: &AtomicU64,
+) -> Option<String> {
     let json = match serde_json::to_string(line) {
         Ok(mut j) => {
             j.push('\n');
@@ -267,13 +359,15 @@ async fn write_line(file: &mut tokio::fs::File, line: &LedgerLine, dropped: &Ato
         Err(e) => {
             dropped.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(error = %e, "netflow ledger serialize failed; record lost");
-            return;
+            return None;
         }
     };
     if let Err(e) = file.write_all(json.as_bytes()).await {
         dropped.fetch_add(1, Ordering::Relaxed);
         tracing::warn!(error = %e, "netflow ledger write failed; record lost");
+        return None;
     }
+    Some(json)
 }
 
 #[cfg(test)]
@@ -534,5 +628,151 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    /// Spec §N1: every ledger line, the final `Dropped` included, is teed
+    /// into the configured stream tagged with this writer's ledger id.
+    #[tokio::test]
+    async fn ledger_lines_are_teed_into_a_configured_stream() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stream = crate::stream::stream_path(&tmp.path().join("runs"), "run_root");
+        crate::stream::write_stream_begin(&stream, "run_root").unwrap();
+        let paths = NetflowPaths::for_run(tmp.path(), "sub_1").with_stream(Some(
+            crate::stream::NetflowStream {
+                path: stream.clone(),
+                ledger_id: "sub_1".into(),
+            },
+        ));
+        let handle = NetflowWriterHandle::spawn_with_capacity_and_interval(
+            paths,
+            1,
+            std::time::Duration::from_millis(50),
+        )
+        .unwrap();
+        // Fill the capacity-1 channel so at least one record is dropped
+        // (current-thread runtime: the writer task runs only at the first
+        // real yield point, so the second and third `try_send` overflow),
+        // then shut down: the final `Dropped` line must be teed too.
+        let rec = flow(FlowId::from_parts(7, 7));
+        handle.writer.record(rec.clone()).await;
+        handle.writer.record(rec.clone()).await;
+        handle.writer.record(rec).await;
+        assert!(handle.writer.dropped() > 0, "the flood must overflow");
+        tokio::time::timeout(std::time::Duration::from_secs(10), handle.shutdown())
+            .await
+            .expect("writer shutdown deadlocked");
+
+        let parsed = crate::land::parse_stream(&std::fs::read(&stream).unwrap());
+        assert!(parsed.begin_seen);
+        let lines = &parsed.ledgers["sub_1"];
+        assert!(lines.iter().any(|l| l.contains(r#""type":"flow""#)));
+        assert!(
+            lines.iter().any(|l| l.contains(r#""type":"dropped""#)),
+            "the final Dropped line is teed too: {lines:?}"
+        );
+        let ledger = std::fs::read_to_string(tmp.path().join("sub_1.jsonl")).unwrap();
+        assert_eq!(
+            ledger.lines().count(),
+            lines.len(),
+            "every ledger line is teed, Dropped included"
+        );
+        for (ledger_line, teed) in ledger.lines().zip(lines) {
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(ledger_line).unwrap(),
+                serde_json::from_str::<serde_json::Value>(teed).unwrap(),
+                "a teed line is the ledger line, byte for byte in meaning"
+            );
+        }
+    }
+
+    /// The tee is batched (review finding 3: one locked stream write per
+    /// ledger line could back the channel up during a bash-capture burst),
+    /// so what matters is what the batches preserve: every ledger line, in
+    /// ledger order, after the root's `begin` line, byte for byte.
+    #[tokio::test]
+    async fn many_lines_are_teed_whole_and_in_ledger_order() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stream = crate::stream::stream_path(&tmp.path().join("runs"), "run_root");
+        crate::stream::write_stream_begin(&stream, "run_root").unwrap();
+        let paths = NetflowPaths::for_run(tmp.path(), "run_many").with_stream(Some(
+            crate::stream::NetflowStream {
+                path: stream.clone(),
+                ledger_id: "run_many".into(),
+            },
+        ));
+        const N: u64 = 2_000;
+        // Two ledger lines per iteration; the channel holds them all, so
+        // nothing is dropped and the yield below only lets the writer start.
+        let handle = NetflowWriterHandle::spawn_with_capacity(paths, 2 * N as usize + 8).unwrap();
+        // Current-thread runtime: every record is queued before the writer
+        // task first runs, so it drains a full channel in one go (the
+        // batch path), then more arrive after a yield (the empty-channel
+        // flush path), then a Flush and a Stop.
+        for i in 0..N / 2 {
+            let id = FlowId::from_parts(i, i as u128);
+            handle.writer.record(flow(id)).await;
+            handle.writer.complete(id, i, i).await;
+        }
+        tokio::task::yield_now().await;
+        for i in N / 2..N {
+            let id = FlowId::from_parts(i, i as u128);
+            handle.writer.record(flow(id)).await;
+            handle.writer.complete(id, i, i).await;
+        }
+        assert_eq!(handle.writer.dropped(), 0, "the channel is wide enough");
+        tokio::time::timeout(std::time::Duration::from_secs(30), handle.shutdown())
+            .await
+            .expect("writer shutdown deadlocked");
+
+        let ledger = std::fs::read_to_string(tmp.path().join("run_many.jsonl")).unwrap();
+        let ledger_lines: Vec<&str> = ledger.lines().collect();
+        assert_eq!(ledger_lines.len(), 2 * N as usize);
+
+        let raw = std::fs::read_to_string(&stream).unwrap();
+        let first: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert_eq!(first["kind"], "begin", "the begin line stays first");
+        let parsed = crate::land::parse_stream(raw.as_bytes());
+        assert_eq!(parsed.malformed, 0);
+        assert_eq!(parsed.unsafe_ids, 0);
+        assert_eq!(
+            parsed.ledgers.len(),
+            1,
+            "one ledger: {:?}",
+            parsed.ledgers.keys()
+        );
+        let teed = &parsed.ledgers["run_many"];
+        assert_eq!(teed.len(), ledger_lines.len(), "every ledger line is teed");
+        for (n, (ledger_line, teed)) in ledger_lines.iter().zip(teed).enumerate() {
+            assert_eq!(
+                ledger_line, teed,
+                "line {n} is teed byte for byte, in order"
+            );
+        }
+    }
+
+    /// A stream that cannot be written is logged, never counted as ledger
+    /// loss: the run's own ledger stays whole and no `Dropped` line appears.
+    #[tokio::test]
+    async fn a_failing_stream_never_drops_ledger_lines() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // The stream's parent is a FILE, so every stream write fails.
+        std::fs::write(tmp.path().join("blocker"), b"").unwrap();
+        let paths = NetflowPaths::for_run(tmp.path(), "run_x").with_stream(Some(
+            crate::stream::NetflowStream {
+                path: tmp.path().join("blocker").join("netflow.jsonl"),
+                ledger_id: "run_x".into(),
+            },
+        ));
+        let handle = NetflowWriterHandle::spawn(paths).unwrap();
+        handle.writer.record(flow(FlowId::from_parts(1, 1))).await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), handle.shutdown())
+            .await
+            .expect("writer shutdown deadlocked");
+        let ledger = std::fs::read_to_string(tmp.path().join("run_x.jsonl")).unwrap();
+        assert!(ledger.contains(r#""type":"flow""#));
+        assert!(
+            !ledger.contains(r#""type":"dropped""#),
+            "a stream failure is not ledger loss: {ledger}"
+        );
     }
 }
