@@ -169,6 +169,7 @@ fn result_order(key: &str) -> (&str, u64, &str) {
 /// - `unit_checkpoints*.jsonl`  → [`ArtifactFile::UnitCheckpoints`]
 /// - `usage*.jsonl`             → [`ArtifactFile::Usage`]
 /// - `coverage*.jsonl`          → [`ArtifactFile::Coverage`]
+/// - `netflow*.jsonl`           → [`ArtifactFile::Netflow`]
 /// - `run.json`                 → [`ArtifactFile::RunJson`]
 /// - anything else              → `None` (caller skips + marks consumed)
 fn classify_key(key: &str) -> Option<ArtifactFile> {
@@ -190,6 +191,9 @@ fn classify_key(key: &str) -> Option<ArtifactFile> {
         }
         if key.starts_with("coverage") {
             return Some(ArtifactFile::Coverage);
+        }
+        if key.starts_with("netflow") {
+            return Some(ArtifactFile::Netflow);
         }
     }
     None
@@ -509,6 +513,10 @@ mod tests {
         assert!(matches!(
             classify_key("coverage.0001.jsonl"),
             Some(ArtifactFile::Coverage)
+        ));
+        assert!(matches!(
+            classify_key("netflow.0001.jsonl"),
+            Some(ArtifactFile::Netflow)
         ));
         assert!(matches!(
             classify_key("run.json"),
