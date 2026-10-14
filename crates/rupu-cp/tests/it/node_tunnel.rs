@@ -347,6 +347,7 @@ async fn netflow_frames_land_when_the_run_finishes() {
                 skills: Vec::new(),
                 preload_skills: Vec::new(),
                 codename: None,
+                messaging: Default::default(),
             },
         )
         .await

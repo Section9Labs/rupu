@@ -8315,6 +8315,7 @@ mod tests {
             skills: Vec::new(),
             preload_skills: Vec::new(),
             skill_bundle: None,
+            messaging: Default::default(),
             codename: None,
         })
         .await
