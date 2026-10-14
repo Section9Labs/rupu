@@ -23,6 +23,7 @@ import { CrewChip } from '../components/codename/CrewChip';
 import { AgentName } from '../components/codename/AgentName';
 import AgentiflowGraph from '../components/agentiflow/AgentiflowGraph';
 import AssetInventory from '../components/agentiflow/AssetInventory';
+import ChildrenPanel from '../components/run/ChildrenPanel';
 import MessageFeed from '../components/messages/MessageFeed';
 import { MessageLinksContext, type MessageLinks } from '../components/transcript/messageLinks';
 import { msgHash, parseMsgHash } from '../lib/messages';
@@ -59,9 +60,10 @@ import {
 
 const POLL_MS = 5000;
 
-type AfTab = 'flow' | 'assets' | 'findings' | 'messages' | 'transcript' | 'events';
+type AfTab = 'flow' | 'children' | 'assets' | 'findings' | 'messages' | 'transcript' | 'events';
 const TABS: { value: AfTab; label: string }[] = [
   { value: 'flow', label: 'Flow' },
+  { value: 'children', label: 'Children' },
   { value: 'assets', label: 'Assets' },
   { value: 'findings', label: 'Findings' },
   { value: 'messages', label: 'Messages' },
@@ -122,6 +124,7 @@ export default function AgentiflowDetail() {
   }, [running, load]);
 
   const [messagesOpened, setMessagesOpened] = useState(tab === 'messages');
+  const [childrenCount, setChildrenCount] = useState<number | null>(null);
   useEffect(() => {
     if (tab === 'messages') setMessagesOpened(true);
   }, [tab]);
@@ -309,7 +312,11 @@ export default function AgentiflowDetail() {
       {/* Profile-aware tabs — the same shape workflow runs + projects use. */}
       <div className="flex flex-wrap items-center gap-3">
         <Segmented
-          options={TABS.map((t) => (t.value === 'messages' && messages.unread > 0 ? { ...t, label: `Messages (${messages.unread})` } : t))}
+          options={TABS.map((t) => {
+            if (t.value === 'messages' && messages.unread > 0) return { ...t, label: `Messages (${messages.unread})` };
+            if (t.value === 'children' && childrenCount !== null) return { ...t, label: `Children (${childrenCount})` };
+            return t;
+          })}
           value={tab}
           onChange={(v) => setTab(v as AfTab)}
           ariaLabel="Agentiflow view"
@@ -380,6 +387,23 @@ export default function AgentiflowDetail() {
               workspace’s assets here would mix in other engagements, so this stays empty until the scope resolves.)
             </Muted>
           )}
+        </Panel>
+      )}
+
+      {tab === 'children' && (
+        <Panel
+          title="Children"
+          meta={
+            <span className="text-meta text-ink-mute">
+              every agent, sub-agent and workflow launched under this flow
+            </span>
+          }
+        >
+          <ChildrenPanel
+            runId={id}
+            fetchChildren={(sig) => api.getAgentiflowChildren(id, sig)}
+            onCount={setChildrenCount}
+          />
         </Panel>
       )}
 

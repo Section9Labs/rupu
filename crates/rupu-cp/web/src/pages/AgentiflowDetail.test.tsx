@@ -175,6 +175,61 @@ describe('AgentiflowDetail', () => {
     expect(screen.getByText('provider: API error 401')).toBeInTheDocument();
   });
 
+  it('shows the Children tab — the deep launch tree under the flow', async () => {
+    vi.spyOn(api, 'getAgentiflow').mockResolvedValue(DETAIL);
+    const getChildren = vi.spyOn(api, 'getAgentiflowChildren').mockResolvedValue([
+      {
+        handle: 'u_recon',
+        kind: 'agent',
+        name: 'cellgw-recon',
+        run_id: 'run_recon',
+        parent_run_id: 'af_01ABC',
+        depth: 1,
+        codename: 'cobalt-harbor/heron>pipit#1',
+        address: 'pipit#1',
+        status: 'done',
+        success: true,
+        error: null,
+        tokens: { input: 10, output: 20 },
+        duration_ms: 1000,
+        started_at: '2026-10-07T15:07:08Z',
+        finished_at: '2026-10-07T15:07:09Z',
+        transcript_path: '/tmp/run_recon.jsonl',
+        legacy: false,
+      },
+      {
+        handle: 's_1',
+        kind: 'subagent',
+        name: 'port-scanner',
+        run_id: 'run_sub',
+        parent_run_id: 'run_recon',
+        depth: 2,
+        codename: 'cobalt-harbor/heron>pipit#1>otter#1',
+        address: null,
+        status: 'running',
+        success: null,
+        error: null,
+        tokens: null,
+        duration_ms: null,
+        started_at: '2026-10-07T15:07:08Z',
+        finished_at: null,
+        transcript_path: '/tmp/run_sub.jsonl',
+        legacy: false,
+      },
+    ]);
+    renderDetail();
+    await screen.findByRole('heading', { name: 'rupu-self-review' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Children' }));
+    const panel = await screen.findByTestId('children-panel');
+    expect(getChildren).toHaveBeenCalledWith('af_01ABC', expect.anything());
+    // The unit and its own sub-agent both appear (own-segment codenames).
+    expect(within(panel).getByText('pipit#1')).toBeInTheDocument();
+    expect(within(panel).getByText('otter#1')).toBeInTheDocument();
+    // The count rides on the tab label once loaded.
+    expect(await screen.findByRole('button', { name: 'Children (2)' })).toBeInTheDocument();
+  });
+
   it('falls back to the record alone without a definition snapshot', async () => {
     vi.spyOn(api, 'getAgentiflow').mockResolvedValue({ ...DETAIL, def: null, lead_transcripts: [] });
     renderDetail();

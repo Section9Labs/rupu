@@ -150,6 +150,41 @@ pub fn children_of(store: &RunStore, run_id: &str) -> Vec<ChildDto> {
             parents.push_back((item.run_id.clone(), 0));
         }
     }
+    walk_children(store, parents)
+}
+
+/// A flow's direct children from its OWN `children.jsonl` ledger (W7),
+/// re-parented to the flow `af_id`. An agentiflow is not a [`RunStore`] run,
+/// so its ledger is read here rather than reached through [`children_of`].
+pub fn ledger_units(af_dir: &Path, af_id: &str) -> Vec<ChildDto> {
+    ledger::read(af_dir)
+        .into_iter()
+        .map(|e| from_entry(e, af_id))
+        .collect()
+}
+
+/// `units` — a flow's direct children, already re-parented to it (from its
+/// ledger via [`ledger_units`] and/or its legacy `units/` mirrors) — followed
+/// by the whole launch tree under each one that is a local `rupu run` (its own
+/// `children.jsonl` and legacy `sub/`), in the same shape. Reuses the same
+/// breadth-first walk as [`children_of`]. A `units` entry is kept as given; the
+/// caller dedups the direct level, the walk dedups the descendants.
+pub fn with_descendants(store: &RunStore, units: Vec<ChildDto>) -> Vec<ChildDto> {
+    let mut parents: VecDeque<(String, u32)> = VecDeque::new();
+    for u in &units {
+        parents.push_back((u.run_id.clone(), u.depth));
+    }
+    let mut out = units;
+    out.extend(walk_children(store, parents));
+    out
+}
+
+/// Breadth-first over `parents` — each a run id whose `children.jsonl` to read,
+/// paired with the depth to stamp its legacy sub-agents at — collecting every
+/// child of every kind, in launch order per parent (parents breadth-first). A
+/// child a later attempt took on under the same handle is listed once, as its
+/// latest record says.
+fn walk_children(store: &RunStore, mut parents: VecDeque<(String, u32)>) -> Vec<ChildDto> {
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut out = Vec::new();
     // Each handle's latest record: where it is in `out`, and when it started.
@@ -250,6 +285,40 @@ mod tests {
         assert_eq!(
             got,
             [("ch_1".to_string(), "run_c2".to_string(), "done".to_string())]
+        );
+    }
+
+    /// An agentiflow is not a `RunStore` run: its direct children (the units
+    /// the lead launched) live in the flow directory's own `children.jsonl`,
+    /// re-parented to the flow, and each unit that is a `rupu run` contributes
+    /// its own launch tree below it.
+    #[test]
+    fn children_under_a_flow_are_its_units_and_their_descendants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        let af_dir = tmp.path().join("agentiflows").join("af_x");
+        // The flow's own ledger: two units the lead dispatched.
+        ledger::append(&af_dir, &started("u_recon", ChildKind::Agent, "run_recon", 1));
+        ledger::append(&af_dir, &started("u_wf", ChildKind::Workflow, "run_wf", 1));
+        // The recon unit is a real `rupu run` that dispatched its own
+        // sub-agent, recorded under its own run directory.
+        ledger::append(
+            &store.root.join("run_recon"),
+            &started("s_1", ChildKind::Subagent, "run_sub", 2),
+        );
+
+        let got = with_descendants(&store, ledger_units(&af_dir, "af_x"));
+        let rows: Vec<(&str, &str, &str)> = got
+            .iter()
+            .map(|c| (c.run_id.as_str(), c.parent_run_id.as_str(), c.kind.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("run_recon", "af_x", "agent"),
+                ("run_wf", "af_x", "workflow"),
+                ("run_sub", "run_recon", "subagent"),
+            ]
         );
     }
 

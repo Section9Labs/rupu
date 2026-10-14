@@ -3055,6 +3055,16 @@ export const api = {
     );
     return res.children;
   },
+  /** Every child under a LOCAL agentiflow: the units its lead launched and,
+   *  under each unit that is a `rupu run`, that run's own launch tree. Same
+   *  shape as `getRunChildren`; no `?host=`. */
+  async getAgentiflowChildren(id: string, signal?: AbortSignal): Promise<RunChild[]> {
+    const res = await request<{ children: RunChild[] }>(
+      `/api/agentiflows/${encodeURIComponent(id)}/children`,
+      { signal },
+    );
+    return res.children;
+  },
   getSessionUsageTimeline(id: string, opts?: { host?: string }): Promise<UsageTimelinePoint[]> {
     const qs = opts?.host ? `?host=${encodeURIComponent(opts.host)}` : '';
     return request<UsageTimelinePoint[]>(`/api/sessions/${encodeURIComponent(id)}/usage-timeline${qs}`);

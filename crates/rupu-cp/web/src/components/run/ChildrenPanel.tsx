@@ -169,9 +169,15 @@ const COLUMNS: Column<ChildRow>[] = [
 
 export default function ChildrenPanel({
   runId,
+  fetchChildren,
   onCount,
 }: {
+  /** Dependency key (the run or flow id); also the default fetch source. */
   runId: string;
+  /** Override the source — e.g. an agentiflow's children endpoint. Must be
+   *  keyed by `runId`: the load re-runs when `runId` changes, not when this
+   *  closure's identity does. */
+  fetchChildren?: (signal: AbortSignal) => Promise<RunChild[]>;
   /** Called with the number of children after every load. */
   onCount?: (n: number) => void;
 }) {
@@ -179,6 +185,8 @@ export default function ChildrenPanel({
   const [error, setError] = useState<string | null>(null);
   const onCountRef = useRef(onCount);
   onCountRef.current = onCount;
+  const fetchRef = useRef(fetchChildren);
+  fetchRef.current = fetchChildren;
 
   useEffect(() => {
     const controller = new AbortController();
@@ -187,7 +195,8 @@ export default function ChildrenPanel({
     setError(null);
     const load = async () => {
       try {
-        const next = await api.getRunChildren(runId, controller.signal);
+        const fetcher = fetchRef.current ?? ((sig: AbortSignal) => api.getRunChildren(runId, sig));
+        const next = await fetcher(controller.signal);
         if (controller.signal.aborted) return;
         setChildren(next);
         setError(null);

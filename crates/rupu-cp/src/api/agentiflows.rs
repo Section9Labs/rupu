@@ -56,6 +56,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/agentiflows", get(list_agentiflows))
         .route("/api/agentiflows/:id", get(get_agentiflow))
         .route("/api/agentiflows/:id/events", get(get_agentiflow_events))
+        .route("/api/agentiflows/:id/children", get(get_agentiflow_children))
         .route("/api/agentiflows/:id/steer", post(steer_agentiflow))
 }
 
@@ -863,6 +864,86 @@ async fn get_agentiflow_events(
     .map_err(|e| ApiError::internal(format!("reading agentiflow {id} events panicked: {e}")))?;
     resp.map(Json)
         .ok_or_else(|| ApiError::not_found(format!("no agentiflow run `{id}`")))
+}
+
+/// `GET /api/agentiflows/:id/children` — every child under the flow, of every
+/// kind, as the agentiflow's Children tab shows it: the units the lead
+/// launched (re-parented to the flow) and, under each unit that is a local
+/// `rupu run`, that run's own launch tree. Same `ChildrenResponse` shape as
+/// the run detail's `/api/runs/:id/children`. Local reads only — no `?host=`.
+async fn get_agentiflow_children(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<crate::api::children::ChildrenResponse>> {
+    if !valid_run_id(&id) {
+        return Err(ApiError::not_found(format!("no agentiflow run `{id}`")));
+    }
+    let run_dir = agentiflow_dir(&s.global_dir).join(&id);
+    if !run_dir.is_dir() {
+        return Err(ApiError::not_found(format!("no agentiflow run `{id}`")));
+    }
+    let children = tokio::task::spawn_blocking({
+        let id = id.clone();
+        move || {
+            use crate::api::children;
+            // Direct children come from both the legacy `units/` mirrors
+            // (pre-W7) and the `children.jsonl` ledger (W7); the ledger is the
+            // richer record, so it wins when a run id is in both. Each
+            // direct child's own launch tree is then walked below it.
+            let mut directs = legacy_unit_children(&s, &run_dir, &id);
+            let ledgered = children::ledger_units(&run_dir, &id);
+            let have: std::collections::HashSet<String> =
+                ledgered.iter().map(|c| c.run_id.clone()).collect();
+            directs.retain(|c| !have.contains(&c.run_id));
+            directs.extend(ledgered);
+            children::with_descendants(&s.run_store, directs)
+        }
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("reading agentiflow {id} children panicked: {e}")))?;
+    Ok(Json(crate::api::children::ChildrenResponse { children }))
+}
+
+/// A flow's legacy `units/*/unit.json` mirrors as children-tree rows
+/// (`ChildDto`), re-parented to the flow `af_id`. Pre-W7 units predate the
+/// `children.jsonl` ledger, so they carry no handle, tokens or duration and
+/// are marked `legacy`; each is a real `rupu run`, so its own descendants are
+/// still walked from its run directory by [`children::with_descendants`].
+fn legacy_unit_children(
+    s: &AppState,
+    run_dir: &std::path::Path,
+    af_id: &str,
+) -> Vec<crate::api::children::ChildDto> {
+    units_on_disk(run_dir)
+        .into_iter()
+        .map(|u: UnitOnDisk| {
+            let meta = read_unit_meta(run_dir, &u.unit_id);
+            let transcript = unit_transcript(s, &u.unit_id);
+            let stored = transcript.as_deref().and_then(stored_unit_codename);
+            let (codename, _derived) =
+                crate::codename::named(stored.as_deref(), &u.unit_id, meta.agent.as_deref());
+            let st = unit_status_dto(u.status);
+            crate::api::children::ChildDto {
+                handle: None,
+                kind: u.kind.as_str().to_string(),
+                name: meta.agent.clone().unwrap_or_default(),
+                run_id: u.unit_id,
+                parent_run_id: af_id.to_string(),
+                depth: 1,
+                codename: Some(codename),
+                address: meta.participant,
+                status: st.state.to_string(),
+                success: st.success,
+                error: st.error,
+                tokens: None,
+                duration_ms: None,
+                started_at: meta.started_at,
+                finished_at: None,
+                transcript_path: transcript.map(|p| p.to_string_lossy().into_owned()),
+                legacy: true,
+            }
+        })
+        .collect()
 }
 
 /// `POST /api/agentiflows/:id/steer` — the older spelling of a message to
