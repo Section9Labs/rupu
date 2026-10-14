@@ -223,6 +223,8 @@ fn launch_argv(args: &Args, run_id: &str) -> Vec<String> {
         skills,
         preload_skills,
         skill_bundle,
+        no_messaging,
+        messaging_tools,
         continue_from: _,
         model,
         provider,
@@ -281,6 +283,7 @@ fn launch_argv(args: &Args, run_id: &str) -> Vec<String> {
         ("engagement-profile", engagement_profiles),
         ("skill", skills),
         ("preload-skill", preload_skills),
+        ("messaging-tool", messaging_tools),
     ];
     for (flag, v) in values {
         out.extend(v.map(|v| format!("--{flag}={v}")));
@@ -291,6 +294,7 @@ fn launch_argv(args: &Args, run_id: &str) -> Vec<String> {
     for (flag, on) in [
         ("no-stream", no_stream),
         ("tmp", tmp),
+        ("no-messaging", no_messaging),
         ("launch-no-messaging", launch_no_messaging),
     ] {
         if *on {
@@ -306,7 +310,8 @@ fn launch_argv(args: &Args, run_id: &str) -> Vec<String> {
 /// `now`'s (the rebuilt conversation holds the prompt). A setting spelled by
 /// several flags takes them all from one side: the clone destination
 /// (`--into` / `--tmp`), the message space (`--message-space` /
-/// `--participant`) and the launch link (`--launch-*`).
+/// `--participant`), the messaging (`--no-messaging` /
+/// `--messaging-tool`) and the launch link (`--launch-*`).
 ///
 /// It names every field of [`Args`] with no `..`, as [`launch_argv`] does,
 /// so a new flag fails to compile until its merge is decided here.
@@ -337,6 +342,8 @@ fn restore_launch(recorded: Args, now: Args) -> Args {
         skills,
         preload_skills,
         skill_bundle,
+        no_messaging,
+        messaging_tools,
         continue_from,
         model,
         provider,
@@ -346,6 +353,7 @@ fn restore_launch(recorded: Args, now: Args) -> Args {
     let given = |id: &str| explicit.has(id);
     let dest = given("into") || given("tmp");
     let space = given("message_space") || given("participant");
+    let messaging = given("no_messaging") || given("messaging_tools");
     let linked = [
         "launch_depth",
         "launch_ceiling",
@@ -390,6 +398,8 @@ fn restore_launch(recorded: Args, now: Args) -> Args {
             recorded.preload_skills,
         ),
         skill_bundle: pick(given("skill_bundle"), skill_bundle, recorded.skill_bundle),
+        no_messaging: pick(messaging, no_messaging, recorded.no_messaging),
+        messaging_tools: pick(messaging, messaging_tools, recorded.messaging_tools),
         continue_from,
         model: pick(given("model"), model, recorded.model),
         provider: pick(given("provider"), provider, recorded.provider),
@@ -2841,6 +2851,7 @@ mod continue_restore_tests {
         "--skill=z",
         "--preload-skill=p",
         "--no-stream",
+        "--no-messaging",
         "--launch-no-messaging",
     ];
 
@@ -2867,6 +2878,53 @@ mod continue_restore_tests {
     fn a_recorded_command_parses_back_to_itself() {
         let again = parse(RECORDED);
         assert_eq!(launch_argv(&again, "run_1"), RECORDED);
+    }
+
+    /// A run launched with its messaging off (a placed unit's
+    /// `--no-messaging`) or narrowed (`--messaging-tool`) keeps it on a bare
+    /// continue; naming either on the continue replaces the run's messaging
+    /// as a whole, so the two never mix.
+    #[test]
+    fn a_continue_keeps_the_runs_messaging_unless_it_names_its_own() {
+        let bare = |rec: &[&str]| {
+            let merged = restore_launch(parse(rec), parse(&["a", "--continue", "run_1"]));
+            launch_argv(&merged, "run_2")
+        };
+        assert_eq!(
+            bare(&["a", "--no-messaging"]),
+            ["a", "--run-id=run_2", "--no-messaging"]
+        );
+        assert_eq!(
+            bare(&[
+                "a",
+                "--messaging-tool",
+                "msg.send",
+                "--messaging-tool",
+                "board.post"
+            ]),
+            [
+                "a",
+                "--run-id=run_2",
+                "--messaging-tool=msg.send",
+                "--messaging-tool=board.post"
+            ]
+        );
+        assert_eq!(
+            bare(&["a", "--messaging-tool="]),
+            ["a", "--run-id=run_2", "--messaging-tool="]
+        );
+        let narrowed = restore_launch(
+            parse(&["a", "--no-messaging"]),
+            parse(&["a", "--continue", "run_1", "--messaging-tool", "msg.send"]),
+        );
+        assert!(!narrowed.no_messaging);
+        assert_eq!(narrowed.messaging_tools, ["msg.send"]);
+        let off = restore_launch(
+            parse(&["a", "--messaging-tool", "msg.send"]),
+            parse(&["a", "--continue", "run_1", "--no-messaging"]),
+        );
+        assert!(off.no_messaging);
+        assert!(off.messaging_tools.is_empty());
     }
 
     #[test]
@@ -2940,6 +2998,7 @@ mod continue_restore_tests {
             "--engagement-profile=web",
             "--skill=s",
             "--preload-skill=q",
+            "--messaging-tool=msg.send",
             "--tmp",
         ];
         let now = parse(&[&given[..], &["--continue", "run_1"]].concat());
