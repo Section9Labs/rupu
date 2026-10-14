@@ -8,6 +8,7 @@ import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/re
 import { MemoryRouter } from 'react-router-dom';
 import { api, type AgentiflowRow } from '../../lib/api';
 import AgentiflowRuns from './AgentiflowRuns';
+import { commitQuery } from '../../components/query/queryTestUtils';
 
 afterEach(() => {
   cleanup();
@@ -76,5 +77,43 @@ describe('AgentiflowRuns', () => {
     await waitFor(() => expect(screen.getByText('rupu-self-review')).toBeInTheDocument());
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(spy).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('AgentiflowRuns query line', () => {
+  const ROWS: AgentiflowRow[] = [
+    ROW,
+    { ...ROW, id: 'af_2', name: 'net-sweep', codename: 'amber-quay', status: 'running', stop_reason: null, ended_at: null, runner_alive: false, engagement_profiles: ['network'] },
+    { ...ROW, id: 'af_3', name: 'old-sweep', codename: 'slate-pier', stop_reason: 'goals_met', goals_met: 3, started_at: '2026-01-01T00:00:00Z' },
+  ];
+  const listed = () => ['rupu-self-review', 'net-sweep', 'old-sweep'].filter((n) => screen.queryByText(n) !== null);
+  const mount = (entry: string) =>
+    render(
+      <MemoryRouter initialEntries={[entry]}>
+        <AgentiflowRuns />
+      </MemoryRouter>,
+    );
+
+  it('narrows the table to the query in ?q=', async () => {
+    vi.spyOn(api, 'getAgentiflows').mockResolvedValue(ROWS);
+    mount('/runs/agentiflows?q=status:completed since:7d');
+    await waitFor(() => expect(listed()).toEqual(['rupu-self-review']));
+    expect(screen.getByTestId('query-count')).toHaveTextContent('1 of 3');
+  });
+
+  it('narrows the table as a query is committed', async () => {
+    vi.spyOn(api, 'getAgentiflows').mockResolvedValue(ROWS);
+    mount('/runs/agentiflows');
+    await waitFor(() => expect(listed()).toEqual(['rupu-self-review', 'net-sweep', 'old-sweep']));
+    commitQuery('Filter agentiflows', 'stop:budget_exhausted,goals_met');
+    await waitFor(() => expect(listed()).toEqual(['rupu-self-review', 'old-sweep']));
+    commitQuery('Filter agentiflows', 'slate');
+    await waitFor(() => expect(listed()).toEqual(['old-sweep']));
+  });
+
+  it('says so when the query keeps nothing', async () => {
+    vi.spyOn(api, 'getAgentiflows').mockResolvedValue(ROWS);
+    mount('/runs/agentiflows?q=has:coordinator_gone profile:code');
+    expect(await screen.findByText('No agentiflows match the filter.')).toBeInTheDocument();
   });
 });

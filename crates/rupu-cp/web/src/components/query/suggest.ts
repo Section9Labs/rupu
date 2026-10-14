@@ -10,7 +10,8 @@ import type { QueryField } from '../../lib/findingQuery/fields';
 
 export interface FacetValue {
   value: string;
-  count: number;
+  /** Rows with the value; absent for a value offered without a count. */
+  count?: number;
 }
 
 export interface Suggestion {
@@ -108,7 +109,8 @@ export function suggest(
     if (op !== ':' && field.kind !== 'severity') return [];
     const { prefix, partial, chosen } = splitItem(rest);
     if (op !== ':' && prefix !== '') return [];
-    const counts = new Map((facets?.[field.key] ?? []).map((f) => [f.value, f.count]));
+    const offered = facets?.[field.key] ?? [];
+    const counts = new Map(offered.filter((f) => f.count !== undefined).map((f) => [f.value, f.count as number]));
     // Compare canonical forms, as the query does: `Needs-Poc` already chose
     // `needs-poc`, `79` already chose `CWE-79`, and `owner:"payments team"`
     // already chose "Payments Team".
@@ -118,7 +120,7 @@ export function suggest(
       return CASE_INSENSITIVE_TEXT.has(field.key) ? c.toLowerCase() : c;
     };
     const taken = new Set(['', ...chosen.map(canon)]);
-    const pool = (field.values.length > 0 ? field.values : [...counts.keys()]).filter((v) => !taken.has(canon(v)));
+    const pool = (field.values.length > 0 ? field.values : offered.map((f) => f.value)).filter((v) => !taken.has(canon(v)));
     return pool
       .map((value) => ({ value, hit: fuzzyScore(partial, value), count: counts.get(value) ?? 0 }))
       .filter((x) => x.hit !== null)

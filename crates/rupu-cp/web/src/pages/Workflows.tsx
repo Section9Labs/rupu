@@ -22,6 +22,8 @@ import { formatTokens, formatCost } from '../lib/usage';
 import { relativeTime } from '../lib/time';
 import { cn } from '../lib/cn';
 import { useInfiniteScroll } from '../lib/useInfiniteScroll';
+import { ListQueryBar, NoMatches, useFilteredRows, useListQuery } from '../components/query/ListQueryBar';
+import { WORKFLOW_FIELDS } from '../lib/query/lists/workflows';
 
 const STEP = 20;
 
@@ -113,7 +115,10 @@ export default function Workflows() {
   );
   const bannerError = error ?? actionError;
 
-  const sorted = (workflows ?? []).slice().sort((a, b) => a.name.localeCompare(b.name));
+  const [q, setQ] = useListQuery();
+  const all = useMemo(() => (workflows ?? []).slice().sort((a, b) => a.name.localeCompare(b.name)), [workflows]);
+  const { rows: sorted, error: queryError, facets } = useFilteredRows(all, q, WORKFLOW_FIELDS);
+  useEffect(() => setVisible(STEP), [q]);
   const shown = sorted.slice(0, visible);
   const { sentinelRef } = useInfiniteScroll({
     hasMore: visible < sorted.length,
@@ -144,7 +149,7 @@ export default function Workflows() {
         <div className="py-16 flex items-center justify-center">
           <Spinner label="Loading workflows…" />
         </div>
-      ) : sorted.length === 0 ? (
+      ) : all.length === 0 ? (
         <EmptyState
           icon={<WorkflowIcon size={20} />}
           title="No workflows found"
@@ -157,31 +162,48 @@ export default function Workflows() {
         />
       ) : (
         <section>
-          <div className="mb-4 rounded-xl border border-border bg-panel/50 p-4">
-            <UsageBarChart
-              bars={sorted.map((w) => ({
-                id: `${w.scope}:${w.name}`,
-                label: w.name,
-                input_tokens: w.usage?.input_tokens ?? 0,
-                output_tokens: w.usage?.output_tokens ?? 0,
-                cached_tokens: w.usage?.cached_tokens ?? 0,
-                cost_usd: w.usage?.cost_usd ?? null,
-                to: `/workflows/${encodeURIComponent(w.name)}`,
-              }))}
-            />
-          </div>
-          <SectionHeader tone="muted" label="Workflows" count={sorted.length} />
-          <SortableTable<WorkflowSummary>
-            columns={columns}
-            rows={shown}
-            rowKey={(w) => `${w.scope}:${w.name}`}
-            rowHref={(w) => `/workflows/${encodeURIComponent(w.name)}`}
-            initialSort={{ key: 'last_run', dir: 'desc' }}
+          <ListQueryBar
+            value={q}
+            onChange={setQ}
+            fields={WORKFLOW_FIELDS}
+            facets={facets}
+            total={all.length}
+            shown={sorted.length}
+            error={queryError}
+            label="Filter workflows"
+            placeholder="Filter workflows… e.g. scope:global autoflow:enabled since:7d"
           />
-          {sorted.length > visible && (
-            <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
-              scroll for more
-            </div>
+          {sorted.length === 0 ? (
+            <NoMatches noun="workflows" />
+          ) : (
+            <>
+              <div className="mb-4 rounded-xl border border-border bg-panel/50 p-4">
+                <UsageBarChart
+                  bars={sorted.map((w) => ({
+                    id: `${w.scope}:${w.name}`,
+                    label: w.name,
+                    input_tokens: w.usage?.input_tokens ?? 0,
+                    output_tokens: w.usage?.output_tokens ?? 0,
+                    cached_tokens: w.usage?.cached_tokens ?? 0,
+                    cost_usd: w.usage?.cost_usd ?? null,
+                    to: `/workflows/${encodeURIComponent(w.name)}`,
+                  }))}
+                />
+              </div>
+              <SectionHeader tone="muted" label="Workflows" count={sorted.length} />
+              <SortableTable<WorkflowSummary>
+                columns={columns}
+                rows={shown}
+                rowKey={(w) => `${w.scope}:${w.name}`}
+                rowHref={(w) => `/workflows/${encodeURIComponent(w.name)}`}
+                initialSort={{ key: 'last_run', dir: 'desc' }}
+              />
+              {sorted.length > visible && (
+                <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
+                  scroll for more
+                </div>
+              )}
+            </>
           )}
         </section>
       )}

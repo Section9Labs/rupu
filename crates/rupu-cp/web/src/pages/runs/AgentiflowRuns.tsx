@@ -7,7 +7,7 @@
 // Refresh button. A later pass can move this onto `usePerHostPagedList` once
 // the endpoint takes `?host=` / `offset` / `limit`.
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { RefreshCw } from 'lucide-react';
 import { api, apiErrorMessage, type AgentiflowRow } from '../../lib/api';
 import SortableTable, { type Column } from '../../components/lists/SortableTable';
@@ -21,6 +21,8 @@ import { Spinner } from '../../components/ui/Spinner';
 import { parseCodename } from '../../lib/codename';
 import { cn } from '../../lib/cn';
 import { relativeTime } from '../../lib/time';
+import { ListQueryBar, NoMatches, useFilteredRows, useListQuery } from '../../components/query/ListQueryBar';
+import { AGENTIFLOW_FIELDS } from '../../lib/query/lists/agentiflows';
 import {
   agentiflowHref,
   agentiflowPillStatus,
@@ -173,6 +175,10 @@ export default function AgentiflowRuns() {
     };
   }, [load]);
 
+  const [q, setQ] = useListQuery();
+  const loaded = useMemo(() => rows ?? [], [rows]);
+  const filtered = useFilteredRows(loaded, q, AGENTIFLOW_FIELDS);
+
   return (
     <div className="p-8">
       <header className="mb-6 flex items-center justify-between">
@@ -198,13 +204,30 @@ export default function AgentiflowRuns() {
           hint="Agentiflow runs appear here once you start one with `rupu agentiflow run`."
         />
       ) : (
-        <SortableTable<AgentiflowRow>
-          columns={COLUMNS}
-          rows={rows}
-          rowKey={(r) => r.id}
-          rowHref={(r) => agentiflowHref(r.id)}
-          initialSort={{ key: 'started', dir: 'desc' }}
-        />
+        <>
+          <ListQueryBar
+            value={q}
+            onChange={setQ}
+            fields={AGENTIFLOW_FIELDS}
+            facets={filtered.facets}
+            total={loaded.length}
+            shown={filtered.rows.length}
+            error={filtered.error}
+            label="Filter agentiflows"
+            placeholder="Filter agentiflows… e.g. status:running stop:budget_exhausted since:7d"
+          />
+          {filtered.rows.length === 0 ? (
+            <NoMatches noun="agentiflows" />
+          ) : (
+            <SortableTable<AgentiflowRow>
+              columns={COLUMNS}
+              rows={filtered.rows}
+              rowKey={(r) => r.id}
+              rowHref={(r) => agentiflowHref(r.id)}
+              initialSort={{ key: 'started', dir: 'desc' }}
+            />
+          )}
+        </>
       )}
     </div>
   );

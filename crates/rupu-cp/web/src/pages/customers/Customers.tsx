@@ -1,7 +1,8 @@
 // Customers — who the projects belong to. A list of customers with rollups
 // over a range (cost, runs, open findings), each opening its detail page, and
 // a footer that points at the projects no customer owns (they run on the
-// global config).
+// global config). One query filters it: `is:` picks active (the default) or
+// archived customers, and `range:` is the rollup window the server folds.
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
@@ -10,7 +11,6 @@ import {
   api,
   apiErrorMessage,
   type CustomerRow,
-  type DashboardRange,
   type ProjectRow,
 } from '../../lib/api';
 import { useCustomerScope } from '../../lib/customerScope';
@@ -20,27 +20,15 @@ import SortableTable, { type Column } from '../../components/lists/SortableTable
 import { Button } from '../../components/ui/Button';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { ErrorBanner } from '../../components/ui/ErrorBanner';
-import { SearchInput } from '../../components/ui/SearchInput';
-import { Segmented } from '../../components/ui/Segmented';
 import { Spinner } from '../../components/ui/Spinner';
 import { CustomerDot } from '../../components/customers/CustomerDot';
 import { CustomerFormDialog } from '../../components/customers/CustomerFormDialog';
 import { PricingErrorMark } from '../../components/customers/PricingErrorMark';
 import { RollupHostsWithoutCustomerBanner } from '../../components/customers/HostsWithoutCustomerBanner';
 import { StatTile as Tile } from '../../components/customers/StatTile';
-
-type StatusView = 'active' | 'archived' | 'all';
-
-const STATUS_OPTIONS = [
-  { value: 'active', label: 'Active' },
-  { value: 'archived', label: 'Archived' },
-  { value: 'all', label: 'All' },
-];
-const RANGE_OPTIONS = [
-  { value: '7d', label: '7d' },
-  { value: '30d', label: '30d' },
-  { value: 'all', label: 'all' },
-];
+import { ListQueryBar, NoMatches, useListQuery } from '../../components/query/ListQueryBar';
+import { filterRows, rowFacets } from '../../lib/query/rows';
+import { CUSTOMER_FIELDS, customersRange, customersRowQuery } from '../../lib/query/lists/customers';
 
 function costOf(r: CustomerRow): number {
   return r.rollup.usage.cost_usd ?? 0;
@@ -157,9 +145,9 @@ const COLUMNS: Column<CustomerRow>[] = [
 
 export default function Customers() {
   const { setScope } = useCustomerScope();
-  const [status, setStatus] = useState<StatusView>('active');
-  const [range, setRange] = useState<DashboardRange>('30d');
-  const [query, setQuery] = useState('');
+  const [q, setQ] = useListQuery();
+  const { range, rest, error: rangeError } = useMemo(() => customersRange(q), [q]);
+  const rowQuery = customersRowQuery(rest);
   const [rows, setRows] = useState<CustomerRow[] | null>(null);
   // True from the start of a fetch until it settles — rows from another range
   // are never shown while the next ones load.
@@ -172,7 +160,7 @@ export default function Customers() {
   const headerRef = useRef<HTMLElement>(null);
 
   // One fetch per range: `archived=1` returns active AND archived customers,
-  // and the Active / Archived / All views are derived from that list.
+  // and `is:` picks among them here.
   useEffect(() => {
     let cancelled = false;
     setError(null);
@@ -214,35 +202,28 @@ export default function Customers() {
     };
   }, [reloadNonce]);
 
-  const scoped = useMemo(
-    () =>
-      (rows ?? []).filter((r) =>
-        status === 'all' ? true : status === 'archived' ? r.archived : !r.archived,
-      ),
-    [rows, status],
-  );
   const archivedTotal = (rows ?? []).filter((r) => r.archived).length;
   const activeTotal = (rows ?? []).length - archivedTotal;
-  const visible = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return scoped;
-    return scoped.filter((r) => r.name.toLowerCase().includes(q) || r.slug.toLowerCase().includes(q));
-  }, [scoped, query]);
-
+  const filtered = useMemo(() => filterRows(rows ?? [], rowQuery, CUSTOMER_FIELDS), [rows, rowQuery]);
+  const visible = filtered.rows;
+  const facets = useMemo(() => rowFacets(rows ?? [], CUSTOMER_FIELDS), [rows]);
+  // With no `is:` the list is the active customers, so they are the whole.
+  const total = rowQuery === rest ? (rows ?? []).length : activeTotal;
+  // The tiles sum what the query shows.
   const stats = useMemo(() => {
-    const totalCost = scoped.reduce((s, r) => s + costOf(r), 0);
-    const top = scoped.reduce<CustomerRow | null>((t, r) => (t === null || costOf(r) > costOf(t) ? r : t), null);
-    const anyCost = scoped.some((r) => r.rollup.usage.cost_usd !== null);
+    const totalCost = visible.reduce((s, r) => s + costOf(r), 0);
+    const top = visible.reduce<CustomerRow | null>((t, r) => (t === null || costOf(r) > costOf(t) ? r : t), null);
+    const anyCost = visible.some((r) => r.rollup.usage.cost_usd !== null);
     // Unpriced work is left OUT of the headline total; a partial fold (some usage
     // unreadable — it can also report `runs: 0`) is IN it but understated.
-    const unpriced = scoped.filter((r) => r.rollup.usage.runs > 0 && !r.rollup.usage.priced);
-    const partial = scoped.filter((r) => r.rollup.usage.partial === true);
-    const priceError = scoped.find((r) => r.rollup.usage.pricing_error)?.rollup.usage.pricing_error;
-    const withFindings = scoped.filter((r) => r.rollup.findings_open > 0).length;
-    const findings = scoped.reduce((s, r) => s + r.rollup.findings_open, 0);
-    const hosts = [...new Set(scoped.flatMap((r) => r.rollup.hosts_without_customer ?? []))].sort();
+    const unpriced = visible.filter((r) => r.rollup.usage.runs > 0 && !r.rollup.usage.priced);
+    const partial = visible.filter((r) => r.rollup.usage.partial === true);
+    const priceError = visible.find((r) => r.rollup.usage.pricing_error)?.rollup.usage.pricing_error;
+    const withFindings = visible.filter((r) => r.rollup.findings_open > 0).length;
+    const findings = visible.reduce((s, r) => s + r.rollup.findings_open, 0);
+    const hosts = [...new Set(visible.flatMap((r) => r.rollup.hosts_without_customer ?? []))].sort();
     return { totalCost, top, anyCost, unpriced, partial, priceError, withFindings, findings, hosts };
-  }, [scoped]);
+  }, [visible]);
 
   // null `customer` = no customer; an ABSENT key can't say, so it is neither.
   const assigned = projects?.filter((p) => p.customer).length ?? 0;
@@ -284,30 +265,17 @@ export default function Customers() {
       {error && <ErrorBanner className="mb-4">{error}</ErrorBanner>}
 
       {loadedOnce && (
-        <div className="mb-3 flex flex-wrap items-center gap-3">
-          <div className="w-64">
-            <SearchInput
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Filter customers…"
-              aria-label="Filter customers"
-            />
-          </div>
-          <Segmented
-            ariaLabel="Customer status"
-            size="sm"
-            options={STATUS_OPTIONS}
-            value={status}
-            onChange={(v) => setStatus(v as StatusView)}
-          />
-          <Segmented
-            ariaLabel="Range"
-            size="sm"
-            options={RANGE_OPTIONS}
-            value={range}
-            onChange={(v) => setRange(v as DashboardRange)}
-          />
-        </div>
+        <ListQueryBar
+          value={q}
+          onChange={setQ}
+          fields={CUSTOMER_FIELDS}
+          facets={facets}
+          total={total}
+          shown={visible.length}
+          error={rangeError ?? filtered.error}
+          label="Filter customers"
+          placeholder="Filter customers… e.g. is:archived range:7d has:findings"
+        />
       )}
 
       {loading && (
@@ -363,15 +331,7 @@ export default function Customers() {
               action={<Button onClick={() => setCreating(true)}>New customer</Button>}
             />
           ) : visible.length === 0 ? (
-            <EmptyState
-              title={
-                query.trim()
-                  ? 'No customers match the filter'
-                  : status === 'archived'
-                    ? 'No archived customers'
-                    : 'No active customers'
-              }
-            />
+            rest.trim() ? <NoMatches noun="customers" /> : <EmptyState title="No active customers" />
           ) : (
             <SortableTable<CustomerRow>
               columns={COLUMNS}

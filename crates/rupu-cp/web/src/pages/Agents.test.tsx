@@ -22,6 +22,7 @@ vi.mock('../components/charts/UsageBarChart', () => ({
 }));
 
 import Agents from './Agents';
+import { commitQuery, firstCells } from '../components/query/queryTestUtils';
 import { scopedEntry, withCustomerScope } from '../lib/customerScopeTestUtils';
 
 afterEach(() => {
@@ -90,5 +91,46 @@ describe('Agents under a customer scope', () => {
 
     await waitFor(() => expect(screen.getByText('reviewer')).toBeInTheDocument());
     expect(screen.getByRole('note')).toHaveTextContent('Run counts and spend here cover every customer.');
+  });
+});
+
+describe('Agents query line', () => {
+  const ROWS: AgentSummary[] = [
+    { name: 'reviewer', scope: 'global', provider: 'anthropic', tools: ['bash'], usage: USAGE, run_count: 2 },
+    { name: 'my-project-fixer', scope: 'my-project', provider: 'openai', tools: ['bash', 'grep'], usage: USAGE, run_count: 0 },
+    { name: 'broken', scope: 'global', provider: 'anthropic', usage: USAGE, run_count: 0, load_error: 'unknown tool `bsh`' },
+  ];
+
+  it('narrows the table to the query in ?q=', async () => {
+    vi.spyOn(api, 'getAgents').mockResolvedValue(ROWS);
+    render(
+      <MemoryRouter initialEntries={['/agents?q=provider:anthropic -has:load_error']}>
+        {withCustomerScope(<Agents />)}
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(firstCells()).toEqual(['revieweranthropic']));
+    expect(screen.getByTestId('query-count')).toHaveTextContent('1 of 3');
+  });
+
+  it('narrows the table as a query is typed and committed', async () => {
+    vi.spyOn(api, 'getAgents').mockResolvedValue(ROWS);
+    render(
+      <MemoryRouter initialEntries={['/agents']}>
+        {withCustomerScope(<Agents />)}
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(firstCells()).toHaveLength(3));
+    commitQuery('Filter agents', 'tool:grep');
+    await waitFor(() => expect(firstCells()).toEqual(['my-project-fixeropenai']));
+  });
+
+  it('says so when the query keeps nothing', async () => {
+    vi.spyOn(api, 'getAgents').mockResolvedValue(ROWS);
+    render(
+      <MemoryRouter initialEntries={['/agents?q=nothing-like-this']}>
+        {withCustomerScope(<Agents />)}
+      </MemoryRouter>,
+    );
+    expect(await screen.findByText('No agents match the filter.')).toBeInTheDocument();
   });
 });

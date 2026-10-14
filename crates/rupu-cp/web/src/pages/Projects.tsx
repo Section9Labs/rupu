@@ -9,7 +9,7 @@
 // so no host is ever left out here. A scope the backend rejects (400) is
 // cleared with a notice.
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { GitBranch, GitFork, Github, Gitlab, HardDrive, Server } from 'lucide-react';
 import { api, type ProjectRow } from '../lib/api';
 import { projectProvider, providerLabel, type ProjectProvider } from '../lib/projectProvider';
@@ -24,6 +24,8 @@ import { useInfiniteScroll } from '../lib/useInfiniteScroll';
 import { useScopedList } from '../lib/useScopedList';
 import { CustomerChip } from '../components/customers/CustomerChip';
 import { PricingErrorMark } from '../components/customers/PricingErrorMark';
+import { ListQueryBar, NoMatches, useFilteredRows, useListQuery } from '../components/query/ListQueryBar';
+import { PROJECT_FIELDS } from '../lib/query/lists/projects';
 
 const STEP = 20;
 
@@ -54,7 +56,10 @@ export default function Projects() {
     };
   }, [customer, guard]);
 
-  const all = projects ?? [];
+  const [q, setQ] = useListQuery();
+  const loaded = useMemo(() => projects ?? [], [projects]);
+  const { rows: all, error: queryError, facets } = useFilteredRows(loaded, q, PROJECT_FIELDS);
+  useEffect(() => setVisible(STEP), [q]);
   const shown = all.slice(0, visible);
   const { sentinelRef } = useInfiniteScroll({
     hasMore: visible < all.length,
@@ -94,30 +99,47 @@ export default function Projects() {
 
       {projects !== null && projects.length > 0 && (
         <>
-          <div className="mb-4 rounded-xl border border-border bg-panel/50 p-4">
-            <UsageBarChart
-              bars={all.map((p) => ({
-                id: p.ws_id,
-                label: p.name,
-                input_tokens: p.usage?.input_tokens ?? 0,
-                output_tokens: p.usage?.output_tokens ?? 0,
-                cached_tokens: p.usage?.cached_tokens ?? 0,
-                cost_usd: p.usage?.cost_usd ?? null,
-                to: `/projects/${encodeURIComponent(p.ws_id)}`,
-              }))}
-            />
-          </div>
-          <SortableTable<ProjectRow>
-            columns={PROJECTS_PAGE_COLUMNS}
-            rows={shown}
-            rowKey={(p) => p.ws_id}
-            rowHref={(p) => `/projects/${encodeURIComponent(p.ws_id)}`}
-            initialSort={{ key: 'last_active', dir: 'desc' }}
+          <ListQueryBar
+            value={q}
+            onChange={setQ}
+            fields={PROJECT_FIELDS}
+            facets={facets}
+            total={loaded.length}
+            shown={all.length}
+            error={queryError}
+            label="Filter projects"
+            placeholder="Filter projects… e.g. provider:github customer:acme since:30d"
           />
-          {all.length > visible && (
-            <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
-              scroll for more
-            </div>
+          {all.length === 0 ? (
+            <NoMatches noun="projects" />
+          ) : (
+            <>
+              <div className="mb-4 rounded-xl border border-border bg-panel/50 p-4">
+                <UsageBarChart
+                  bars={all.map((p) => ({
+                    id: p.ws_id,
+                    label: p.name,
+                    input_tokens: p.usage?.input_tokens ?? 0,
+                    output_tokens: p.usage?.output_tokens ?? 0,
+                    cached_tokens: p.usage?.cached_tokens ?? 0,
+                    cost_usd: p.usage?.cost_usd ?? null,
+                    to: `/projects/${encodeURIComponent(p.ws_id)}`,
+                  }))}
+                />
+              </div>
+              <SortableTable<ProjectRow>
+                columns={PROJECTS_PAGE_COLUMNS}
+                rows={shown}
+                rowKey={(p) => p.ws_id}
+                rowHref={(p) => `/projects/${encodeURIComponent(p.ws_id)}`}
+                initialSort={{ key: 'last_active', dir: 'desc' }}
+              />
+              {all.length > visible && (
+                <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
+                  scroll for more
+                </div>
+              )}
+            </>
           )}
         </>
       )}

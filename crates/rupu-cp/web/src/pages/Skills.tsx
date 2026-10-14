@@ -1,8 +1,8 @@
-// Skills library — the installed skills (`GET /api/skills`), the global layer
-// plus a chosen project's. Read-only: install and update are `rupu skill`
-// operations. Each row links to /skills/:layer/:name.
+// Skills library — the installed skills (`GET /api/skills`): the global layer
+// plus the project a `project:` query term names. Read-only: install and
+// update are `rupu skill` operations. Each row links to /skills/:layer/:name.
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { AlertTriangle, BookOpen } from 'lucide-react';
 import { api, apiErrorMessage, type ProjectRow, type SkillRow } from '../lib/api';
 import { SectionHeader } from '../components/lists/SectionHeader';
@@ -10,9 +10,10 @@ import SortableTable, { type Column } from '../components/lists/SortableTable';
 import { Badge } from '../components/ui/Badge';
 import { EmptyState } from '../components/ui/EmptyState';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
-import { Select } from '../components/ui/Select';
 import { Spinner } from '../components/ui/Spinner';
 import { ScopeChip } from '../components/ScopeChip';
+import { ListQueryBar, NoMatches, useFilteredRows, useListQuery } from '../components/query/ListQueryBar';
+import { SKILL_FIELDS, skillsProject } from '../lib/query/lists/skills';
 
 export function skillHref(s: Pick<SkillRow, 'layer' | 'name'>, wsId?: string | null): string {
   const path = `/skills/${s.layer}/${encodeURIComponent(s.name)}`;
@@ -20,11 +21,11 @@ export function skillHref(s: Pick<SkillRow, 'layer' | 'name'>, wsId?: string | n
 }
 
 export default function Skills() {
-  const [projects, setProjects] = useState<ProjectRow[]>([]);
-  const [wsId, setWsId] = useState<string | null>(null);
+  const [projects, setProjects] = useState<ProjectRow[] | null>(null);
   const [skills, setSkills] = useState<SkillRow[] | null>(null);
   const [layerWarnings, setLayerWarnings] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [q, setQ] = useListQuery();
 
   useEffect(() => {
     let cancelled = false;
@@ -35,13 +36,24 @@ export default function Skills() {
       })
       .catch(() => {
         // The global layer still lists without the project choices.
+        if (!cancelled) setProjects([]);
       });
     return () => {
       cancelled = true;
     };
   }, []);
 
+  // `project:<name>` picks the project layer the server lists; the rest of
+  // the query filters the rows here.
+  const { project: projectName, rest, error: projectError } = useMemo(() => skillsProject(q), [q]);
+  const project = projectName === null ? null : (projects ?? []).find((p) => sameProject(p, projectName));
+  const unknownProject = projectName !== null && projects !== null && !project ? `no project named \`${projectName}\`` : null;
+  const wsId = project?.ws_id ?? null;
+  // A project query waits for the projects, so the global layer isn't fetched first.
+  const ready = projectName === null || projects !== null;
+
   useEffect(() => {
+    if (!ready) return;
     let cancelled = false;
     setSkills(null);
     setLayerWarnings([]);
@@ -61,34 +73,25 @@ export default function Skills() {
     return () => {
       cancelled = true;
     };
-  }, [wsId]);
+  }, [wsId, ready]);
 
-  const rows = skills ?? [];
+  const all = useMemo(() => skills ?? [], [skills]);
+  const filtered = useFilteredRows(all, rest, SKILL_FIELDS);
+  const facets = useMemo(
+    () => ({ ...filtered.facets, project: (projects ?? []).map((p) => ({ value: p.name })) }),
+    [filtered.facets, projects],
+  );
+  const queryError = projectError ?? unknownProject ?? filtered.error;
+  const rows = unknownProject ? [] : filtered.rows;
 
   return (
     <div className="p-8">
-      <header className="mb-6 flex items-start justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-semibold text-ink">Skills</h1>
-          <p className="mt-1 text-sm text-ink-dim">
-            Skills installed on this control plane — globally, and in the selected project.
-          </p>
-        </div>
-        <div className="flex shrink-0 items-center gap-2 text-ui text-ink-dim">
-          <span aria-hidden="true">Project</span>
-          <Select
-            aria-label="Project"
-            value={wsId ?? ''}
-            onChange={(e) => setWsId(e.target.value === '' ? null : e.target.value)}
-          >
-            <option value="">global only</option>
-            {projects.map((p) => (
-              <option key={p.ws_id} value={p.ws_id}>
-                {p.name}
-              </option>
-            ))}
-          </Select>
-        </div>
+      <header className="mb-6">
+        <h1 className="text-2xl font-semibold text-ink">Skills</h1>
+        <p className="mt-1 text-sm text-ink-dim">
+          Skills installed on this control plane — globally, and in a project named with{' '}
+          <span className="font-mono">project:</span>.
+        </p>
       </header>
 
       {error && <ErrorBanner className="mb-4">{error}</ErrorBanner>}
@@ -112,11 +115,23 @@ export default function Skills() {
         </div>
       )}
 
+      <ListQueryBar
+        value={q}
+        onChange={setQ}
+        fields={SKILL_FIELDS}
+        facets={facets}
+        total={all.length}
+        shown={rows.length}
+        error={queryError}
+        label="Filter skills"
+        placeholder="Filter skills… e.g. project:acme layer:project status:invalid"
+      />
+
       {skills === null ? (
         <div className="py-16 flex items-center justify-center">
           <Spinner label="Loading skills…" />
         </div>
-      ) : rows.length === 0 ? (
+      ) : all.length === 0 && !q.trim() ? (
         error ? null : (
           <EmptyState
             icon={<BookOpen size={20} />}
@@ -128,6 +143,8 @@ export default function Skills() {
             }
           />
         )
+      ) : rows.length === 0 ? (
+        <NoMatches noun="skills" />
       ) : (
         <section>
           <SectionHeader tone="muted" label="Skills" count={rows.length} />
@@ -142,6 +159,11 @@ export default function Skills() {
       )}
     </div>
   );
+}
+
+/** A `project:` value names a project by its name (ignoring case) or its id. */
+function sameProject(p: ProjectRow, value: string): boolean {
+  return p.name.toLowerCase() === value.toLowerCase() || p.ws_id === value;
 }
 
 const skillColumns: Column<SkillRow>[] = [

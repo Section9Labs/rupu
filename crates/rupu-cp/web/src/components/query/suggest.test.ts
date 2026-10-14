@@ -23,6 +23,14 @@ const facets = {
 };
 
 describe('suggest', () => {
+  it('offers a value given without a count, with no count shown', () => {
+    const s = suggest('project:', FINDING_FIELDS, { project: [{ value: 'shop-web' }, { value: 'api' }] });
+    expect(s.map((x) => [x.label, x.detail])).toEqual([
+      ['api', undefined],
+      ['shop-web', undefined],
+    ]);
+  });
+
   it('lists keys for an empty draft, completing to key:', () => {
     const s = suggest('', FINDING_FIELDS, facets);
     expect(s[0]).toMatchObject({ kind: 'key', label: 'severity', insert: 'severity:', commit: false });

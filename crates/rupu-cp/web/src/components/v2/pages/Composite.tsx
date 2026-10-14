@@ -1,7 +1,8 @@
 // Interim v2 destination page: a Segmented tab bar over existing page
 // bodies, so the 7-leaf IA is complete and capability-equal from Plan 1.
 // The active tab lives in the `?tab=` search param so redirects from old
-// routes can deep-link a specific tab and the URL stays shareable.
+// routes can deep-link a specific tab and the URL stays shareable. A tab's
+// list query (`?q=`) belongs to that tab, so switching tabs drops it.
 import { Suspense, type ReactNode } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { Segmented } from '../../ui/Segmented';
@@ -34,6 +35,7 @@ export function Composite({ title, tabs, defaultTab }: {
           onChange={(next) =>
             setParams((p) => {
               const q = new URLSearchParams(p);
+              if (next !== tab) q.delete('q');
               q.set('tab', next);
               return q;
             }, { replace: true })

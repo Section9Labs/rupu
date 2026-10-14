@@ -1,35 +1,18 @@
-// messageQuery — the Messages tab's filter, on the SAME grammar as the
-// findings query (`findingQuery/grammar`), evaluated client-side against a
-// space's log as `assetQuery` does for assets.
+// messageQuery — the Messages tab's filter: a `RowField` registry over a
+// space's log, evaluated client-side by `lib/query/rows`.
 //
 // Addresses (`from`, `to`, `involving`) match exactly, or by role word when
 // the value has no `#`: `from:pipit` is every `pipit#n`, `from:pipit#2` only
 // that one (never `pipit#20`). Everything compares ignoring case.
 
 import { AtSign, Bot, CircleAlert, Hash, ListTree, Send, Shapes, Users } from 'lucide-react';
-import { parseQuery, type Term } from './findingQuery/grammar';
-import type { QueryField } from './findingQuery/fields';
+import { filterRows, rowFacets, rowField, type Facets, type FilterResult, type RowField } from './query/rows';
 import type { MessageKind, SpaceMessage, SpaceParticipant } from './api';
 import { roleWordOf } from './messages';
 
 export const MESSAGE_KINDS: MessageKind[] = ['post', 'direct', 'broadcast', 'operator', 'directive', 'retract'];
 export const MESSAGE_FLAGS = ['urgent', 'undelivered', 'seen', 'unseen', 'reply'] as const;
 type Flag = (typeof MESSAGE_FLAGS)[number];
-
-type Facets = Record<string, { value: string; count: number }[]>;
-
-/** The query fields. Nothing in them depends on the loaded log: `kind` and
- *  `is` are closed sets, the rest are free text the facets suggest. */
-export const MESSAGE_FIELDS: QueryField[] = [
-  { key: 'kind', aliases: ['type'], kind: 'enum', values: [...MESSAGE_KINDS], label: 'Kind', description: 'kind:direct · kind:directive,retract', icon: Shapes },
-  { key: 'from', aliases: [], kind: 'text', values: [], label: 'From', description: 'from:pipit (every pipit#n) · from:pipit#2', icon: Send },
-  { key: 'to', aliases: [], kind: 'text', values: [], label: 'To', description: 'to:heron · to:role:recon', icon: AtSign },
-  { key: 'involving', aliases: ['who'], kind: 'text', values: [], label: 'Involving', description: 'involving:lynx#1 (sent or reached)', icon: Users },
-  { key: 'agent', aliases: ['role'], kind: 'text', values: [], label: 'Agent', description: "agent:recon (the sender's agent)", icon: Bot },
-  { key: 'step', aliases: [], kind: 'text', values: [], label: 'Step', description: "step:analyze (the sender's step)", icon: ListTree },
-  { key: 'is', aliases: [], kind: 'enum', values: [...MESSAGE_FLAGS], label: 'Is', description: 'is:urgent · is:undelivered · -is:seen', icon: CircleAlert },
-  { key: 'id', aliases: [], kind: 'text', values: [], label: 'Id', description: 'id:msg_…', icon: Hash },
-];
 
 function flags(m: SpaceMessage): Flag[] {
   const out: Flag[] = [];
@@ -40,33 +23,27 @@ function flags(m: SpaceMessage): Flag[] {
   return out;
 }
 
-function sender(m: SpaceMessage, participants: SpaceParticipant[]): SpaceParticipant | undefined {
-  return participants.find((p) => p.address === m.from);
-}
-
 const recipients = (m: SpaceMessage): string[] => [...(m.to ? [m.to] : []), ...m.delivery.resolved];
 
-function tally(vals: (string | undefined | null)[]): { value: string; count: number }[] {
-  const m = new Map<string, number>();
-  for (const v of vals) if (typeof v === 'string' && v !== '') m.set(v, (m.get(v) ?? 0) + 1);
-  return [...m].map(([value, count]) => ({ value, count })).sort((a, b) => b.count - a.count);
+/** The query fields over a log whose senders are `participants` (the sender's
+ *  agent and step come from its participant row). `kind` and `is` are closed
+ *  sets; the rest are free text the facets suggest. */
+export function messageFields(participants: SpaceParticipant[]): RowField<SpaceMessage>[] {
+  const sender = (m: SpaceMessage) => participants.find((p) => p.address === m.from);
+  return [
+    rowField({ key: 'kind', aliases: ['type'], values: [...MESSAGE_KINDS], match: 'exact', get: (m) => m.kind, facet: true, label: 'Kind', description: 'kind:direct · kind:directive,retract', icon: Shapes }),
+    rowField({ key: 'from', match: 'address', get: (m) => [m.from, m.from_codename], facet: (m) => m.from, label: 'From', description: 'from:pipit (every pipit#n) · from:pipit#2', icon: Send }),
+    rowField({ key: 'to', match: 'address', get: recipients, facet: (m) => m.delivery.resolved, label: 'To', description: 'to:heron · to:role:recon', icon: AtSign }),
+    rowField({ key: 'involving', aliases: ['who'], match: 'address', get: (m) => [m.from, ...recipients(m)], label: 'Involving', description: 'involving:lynx#1 (sent or reached)', icon: Users }),
+    rowField({ key: 'agent', aliases: ['role'], match: 'exact', get: (m) => sender(m)?.agent, facet: true, label: 'Agent', description: "agent:recon (the sender's agent)", icon: Bot }),
+    rowField({ key: 'step', match: 'exact', get: (m) => sender(m)?.step_id, facet: true, label: 'Step', description: "step:analyze (the sender's step)", icon: ListTree }),
+    rowField({ key: 'is', values: [...MESSAGE_FLAGS], match: 'exact', get: flags, facet: true, label: 'Is', description: 'is:urgent · is:undelivered · -is:seen', icon: CircleAlert }),
+    rowField({ key: 'id', match: 'exact', get: (m) => m.id, label: 'Id', description: 'id:msg_…', icon: Hash }),
+  ];
 }
 
-/** Values in use per field, with counts: feeds the QueryBar dropdown. */
-export function messageFacets(messages: SpaceMessage[], participants: SpaceParticipant[]): Facets {
-  const senders = messages.map((m) => sender(m, participants));
-  return {
-    kind: tally(messages.map((m) => m.kind)),
-    from: tally(messages.map((m) => m.from)),
-    to: tally(messages.flatMap((m) => m.delivery.resolved)),
-    involving: participants
-      .map((p) => ({ value: p.address, count: messages.filter((m) => matchesAddress(p.address, [m.from, ...recipients(m)])).length }))
-      .sort((a, b) => b.count - a.count),
-    agent: tally(senders.map((p) => p?.agent)),
-    step: tally(senders.map((p) => p?.step_id)),
-    is: tally(messages.flatMap(flags)),
-  };
-}
+/** The fields as the grammar sees them (chips, suggestions, shortcuts). */
+export const MESSAGE_FIELDS = messageFields([]);
 
 /** Whether `value` names one of `addresses`. */
 function matchesAddress(value: string, addresses: (string | undefined)[]): boolean {
@@ -75,43 +52,20 @@ function matchesAddress(value: string, addresses: (string | undefined)[]): boole
   return addresses.some((a) => a !== undefined && (a.toLowerCase() === v || (byRole && roleWordOf(a) === v)));
 }
 
-const eqCi = (value: string, x: string | undefined) => x !== undefined && x.toLowerCase() === value.toLowerCase();
-
-function valueMatches(m: SpaceMessage, key: string, value: string, participants: SpaceParticipant[]): boolean {
-  switch (key) {
-    case 'kind':
-      return m.kind === value;
-    case 'from':
-      return matchesAddress(value, [m.from, m.from_codename]);
-    case 'to':
-      return matchesAddress(value, recipients(m));
-    case 'involving':
-      return matchesAddress(value, [m.from, ...recipients(m)]);
-    case 'agent':
-      return eqCi(value, sender(m, participants)?.agent);
-    case 'step':
-      return eqCi(value, sender(m, participants)?.step_id);
-    case 'is':
-      return flags(m).includes(value as Flag);
-    case 'id':
-      return eqCi(value, m.id);
-    default: {
-      const v = value.toLowerCase();
-      return [m.body, m.from, m.to ?? ''].some((x) => x.toLowerCase().includes(v));
-    }
-  }
-}
-
-function termMatches(m: SpaceMessage, t: Term, participants: SpaceParticipant[]): boolean {
-  const hit = t.values.some((v) => valueMatches(m, t.key, v, participants));
-  return t.neg ? !hit : hit;
+/** Values in use per field, with counts: feeds the QueryBar dropdown. Every
+ *  participant is an `involving` value, counted over what it sent or reached. */
+export function messageFacets(messages: SpaceMessage[], participants: SpaceParticipant[]): Facets {
+  return {
+    ...rowFacets(messages, messageFields(participants)),
+    involving: participants
+      .map((p) => ({ value: p.address, count: messages.filter((m) => matchesAddress(p.address, [m.from, ...recipients(m)])).length }))
+      .sort((a, b) => b.count - a.count),
+  };
 }
 
 /** Filter a log by a query string. On a parse error nothing is filtered (the
- *  QueryBar shows the offending chip in red) and the message is returned. */
-export function filterMessages(messages: SpaceMessage[], q: string, participants: SpaceParticipant[]): { rows: SpaceMessage[]; error: string | null } {
-  if (!q.trim()) return { rows: messages, error: null };
-  const p = parseQuery(q, MESSAGE_FIELDS);
-  if (!p.ok) return { rows: messages, error: p.error.message };
-  return { rows: messages.filter((m) => p.terms.every((t) => termMatches(m, t, participants))), error: null };
+ *  QueryBar shows the offending chip in red) and the message is returned. Bare
+ *  words search the body, the sender and the addressee. */
+export function filterMessages(messages: SpaceMessage[], q: string, participants: SpaceParticipant[]): FilterResult<SpaceMessage> {
+  return filterRows(messages, q, messageFields(participants), { text: (m) => [m.body, m.from, m.to] });
 }
