@@ -842,6 +842,13 @@ async fn an_unreadable_assignment_fails_the_request() {
         "/api/findings?customer=none",
         "/api/usage/runs?customer=none",
         "/api/dashboard?host=local&customer=none",
+        // A `customer:` term reads the customer as `?customer=` does.
+        "/api/runs/workflows?q=customer:acme",
+        "/api/runs/workflows?host=local&q=customer:acme",
+        "/api/runs/workflows?q=-customer:acme",
+        "/api/runs/agents?q=customer:acme",
+        "/api/sessions?q=customer:acme",
+        "/api/projects/ws_acme/sessions?q=customer:acme",
         // Counts, rollups and prices fail closed unfiltered too. (`/api/usage`
         // marks the local host offline with the reason instead — its
         // per-host contract.)

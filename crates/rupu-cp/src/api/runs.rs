@@ -1050,6 +1050,9 @@ pub(crate) fn query_run_rows_windowed(
         mut unreportable,
     } = customers;
     let mut scoped = query.scoped.take();
+    // Fail-closed whenever the filter reads a customer: `?customer=` or a
+    // `customer:` term (`RowFilter::reads_customer`).
+    let fail_closed = filter.is_some() || query.query.is_some_and(|q| q.reads("customer"));
     let mut attributed: Vec<(RunRecord, Option<crate::customers::Attribution>)> =
         Vec::with_capacity(runs.len());
     for r in runs {
@@ -1057,7 +1060,7 @@ pub(crate) fn query_run_rows_windowed(
             // A mirrored worker run is attributed by what it recorded only
             // (`CustomerLookup::attribute_run`).
             Some(l) => l
-                .attribute_run(&r, filter.is_some())
+                .attribute_run(&r, fail_closed)
                 .map_err(RunRowsError::Customer)?,
             None => crate::customers::Attribution::recorded_only(crate::customers::Recorded::of(
                 &r.customer,

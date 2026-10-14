@@ -55,6 +55,11 @@ impl ListQuery {
         rupu_query::matches(row, &self.parsed, self.fields, self.now)
     }
 
+    /// Whether any term, negated or not, reads `key`.
+    pub fn reads(&self, key: &str) -> bool {
+        self.parsed.terms_on(key).next().is_some()
+    }
+
     /// Whether a non-negated term on `key` asks for `value`.
     pub fn asks_for(&self, key: &str, value: &str) -> bool {
         self.parsed
@@ -89,11 +94,7 @@ impl RowFilter {
     /// `customer:` term — so local rows must be attributed fail-closed (an
     /// unreadable assignment is a 500, never "no customer").
     pub fn reads_customer(&self) -> bool {
-        self.customer.is_some()
-            || self
-                .query
-                .as_ref()
-                .is_some_and(|q| q.parsed.terms_on("customer").next().is_some())
+        self.customer.is_some() || self.query.as_ref().is_some_and(|q| q.reads("customer"))
     }
 
     /// Whether `row` is in the list's scope: its `customer` key matches the
