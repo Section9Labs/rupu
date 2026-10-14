@@ -1,6 +1,6 @@
 // Activity strip — the full-range context histogram with drag-to-zoom,
-// beside the existing `TimeRangePicker` presets and the server-echo
-// `NetflowWindowReadout`.
+// beside the server-echo `NetflowWindowReadout`. The window itself is the
+// explorer's query (`since:` / `until:`); a drag writes it there.
 //
 // The histogram is ALWAYS the scope's whole retained history (server-
 // chosen bounds, `HistogramView.from/to`), never the applied window —
@@ -19,15 +19,11 @@ import { useThemeColors } from '../../../lib/useThemeColors';
 import type { HistogramView } from '../../../lib/netflow';
 import NetflowWindowReadout from '../NetflowWindowReadout';
 import type { NetflowWindowEcho } from '../ScopeDisclosure';
-import TimeRangePicker, { type TimeRangeValue } from '../TimeRangePicker';
 
 export interface ActivityStripProps {
   histogram: HistogramView;
-  range: TimeRangeValue;
-  /** Picker-initiated change (preset / custom apply). */
-  onRangeChange: (value: TimeRangeValue) => void;
-  /** Drag-initiated zoom — separate from `onRangeChange` so the owner can
-   *  push the outgoing window onto its zoom stack for "Zoom out". */
+  /** Drag-initiated zoom; the owner pushes the outgoing window onto its
+   *  zoom stack for "Zoom out". */
   onZoom: (fromIso: string, toIso: string) => void;
   /** The server's own `window` echo — `null` only before the first load. */
   appliedWindow: NetflowWindowEcho | null;
@@ -40,8 +36,6 @@ interface DragState {
 
 export function ActivityStrip({
   histogram,
-  range,
-  onRangeChange,
   onZoom,
   appliedWindow,
 }: ActivityStripProps) {
@@ -87,7 +81,7 @@ export function ActivityStrip({
   }
 
   // Overlay: the in-progress drag wins; otherwise the SERVER-echoed
-  // window (never local picker state), mapped into the histogram bounds.
+  // window (never the query's own reading of it), mapped into the histogram bounds.
   let overlay: { from: number; to: number } | null = null;
   if (drag) {
     overlay = { from: Math.min(drag.a, drag.b), to: Math.max(drag.a, drag.b) };
@@ -102,7 +96,6 @@ export function ActivityStrip({
   return (
     <div className="rounded-xl border border-border bg-panel px-4 pb-2.5 pt-3.5">
       <div className="mb-2 flex flex-wrap items-center justify-between gap-3">
-        <TimeRangePicker value={range} onChange={onRangeChange} />
         <div className="flex flex-wrap items-center gap-2">
           {appliedWindow && <NetflowWindowReadout appliedWindow={appliedWindow} />}
           {span !== null && (

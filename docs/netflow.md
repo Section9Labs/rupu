@@ -204,15 +204,23 @@ explorer at a different scope:
 | Surface | Scope |
 |---------|-------|
 | Run → **Network** tab | The run's ledger plus those of its fan-out units and sub-agents. Opens on the run's own time span and shows whether subprocess capture was active |
-| Project → **Network** tab | Every ledger in the project's `.rupu/netflow/`, plus the project's runs whose ledger fell back to the global directory. Opens on the last 24 hours |
-| **Network** page (global) | Every registered project and the global directory. Opens on the last 24 hours |
+| Project → **Network** tab | Every ledger in the project's `.rupu/netflow/`, plus the project's runs whose ledger fell back to the global directory. Opens on the shorter of the last hour and the project's latest run with flows |
+| **Network** page (global) | Every registered project and the global directory. Opens on the shorter of the last hour and the latest run with flows |
 
 There is no Network view on a workflow definition: a flow belongs to a run.
 
 The explorer has:
 
-- an **activity strip** across the whole retained range with a time-range
-  picker; drag across it to zoom, and the rest of the page follows the window;
+- a **query line**, the one place to narrow the view. `since:` and `until:`
+  set the window (`since:6h`, `since:2026-10-01`, an RFC 3339 time),
+  `window:all` reads every recorded flow, and `workflow:`, `origin:`
+  (`provider:anthropic`, `scm:github`, `subprocess:curl`), `org:` (`as15169`,
+  `unknown`) and `host:` (`api.github.com:443`) keep flows; a `-` in front
+  leaves them out (`-origin:provider:anthropic` hides the model traffic).
+  With no `since:` or `until:` the view opens small, on the window the table
+  above names, and a line under the query says which window that is;
+- an **activity strip** across the whole retained range; drag across it to
+  zoom, which writes the window into the query (Zoom out undoes it);
 - **KPIs**: flows, endpoints, networks (distinct organisations), error rate,
   bytes and p95 latency. Byte totals are marked partial when any flow in view
   had an unknown count;
@@ -220,8 +228,8 @@ The explorer has:
   such as `curl`) to the ASN organisations they reached, weighted by call
   count;
 - a **timeline** with one lane per endpoint, grouped by organisation;
-- **filters**: click a workflow, origin, organisation or host to filter every
-  section; chips show what is applied;
+- **click to filter**: click a workflow, origin, organisation or host to add it
+  to the query (click it again to take it out);
 - a **flow table**, sortable, with a detail panel per flow. Socket rows show
   the process (`curl (pid 4412)`), the transport and peer
   (`tcp → 203.0.113.7:443`), a dash for path and status, and a link to the

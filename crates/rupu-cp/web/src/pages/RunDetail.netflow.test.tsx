@@ -18,6 +18,7 @@ import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/re
 import { Link, MemoryRouter, Route, Routes } from 'react-router-dom';
 import { api, type RunGraphResponse, type FindingsResponse } from '../lib/api';
 import type { ExplorerResponse, NetflowResponse } from '../lib/netflow';
+import { commitQuery } from '../components/query/queryTestUtils';
 
 // ---- Mock the netflow API client — the SUT under test here ----------------
 
@@ -315,7 +316,7 @@ describe('RunDetail netflow tab', () => {
     fireEvent.click(screen.getByRole('button', { name: /network/i }));
     await screen.findByText('first-window-host.example.com');
 
-    // The second fetch (triggered by the range change below) never
+    // The second fetch (triggered by the window change below) never
     // resolves during this test's assertions, so the in-flight state is
     // observable.
     let resolveSecond!: (v: NetflowResponse) => void;
@@ -326,7 +327,7 @@ describe('RunDetail netflow tab', () => {
     );
     fetchNetflowExplorer.mockResolvedValueOnce(emptyExplorer());
 
-    fireEvent.click(screen.getByRole('button', { name: /last hour/i }));
+    commitQuery('Filter network flows', 'since:1h');
 
     // Deliberate v3 behavior change from the pre-explorer tab: a filter/
     // range change must NOT collapse the whole surface to a loading line —
@@ -340,7 +341,7 @@ describe('RunDetail netflow tab', () => {
     );
   });
 
-  it('clears a stale netflow error once a subsequent range change succeeds', async () => {
+  it('clears a stale netflow error once a subsequent window change succeeds', async () => {
     fetchRunNetflow.mockRejectedValueOnce(new Error('boom'));
     stubApi(GRAPH);
     renderPage();
@@ -352,7 +353,7 @@ describe('RunDetail netflow tab', () => {
     fetchRunNetflow.mockResolvedValueOnce(emptyFlows());
     fetchNetflowExplorer.mockResolvedValueOnce(emptyExplorer());
 
-    fireEvent.click(screen.getByRole('button', { name: /last hour/i }));
+    commitQuery('Filter network flows', 'since:1h');
 
     await waitFor(() => expect(screen.queryByText(/boom/i)).not.toBeInTheDocument());
     // Window WAS applied (the fixtures echo a bounded window) — the
