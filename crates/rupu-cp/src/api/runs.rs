@@ -1540,7 +1540,7 @@ impl UnpricedRuns {
 }
 
 /// What a filtered, page-by-page read of one host's run list found.
-enum FilteredRuns {
+pub(crate) enum FilteredRuns {
     Rows {
         /// The rows kept, tagged, in the host's order.
         matches: Vec<serde_json::Value>,
@@ -1562,7 +1562,7 @@ enum FilteredRuns {
 /// stops the read instead of looping. `scoped` also collects every in-scope
 /// row (and reads the whole list).
 #[allow(clippy::too_many_arguments)]
-async fn read_filtered_runs(
+pub(crate) async fn read_filtered_runs(
     conn: &dyn crate::host::connector::HostConnector,
     host_id: &str,
     kind: RunKind,

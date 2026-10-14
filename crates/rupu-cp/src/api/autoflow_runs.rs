@@ -296,12 +296,13 @@ pub fn problems(events: &[ProblemEvent], host_id: &str, cutoff: DateTime<Utc>) -
 }
 
 use crate::api::runs::{
-    autoflow_of, blocking, host_list_error, in_lifecycle, read_runs_where, resolve_host,
-    FilteredRuns, RunListRow, FAN_OUT_LIMIT,
+    autoflow_of, blocking, host_list_error, in_lifecycle, read_filtered_runs, resolve_host,
+    run_probe, FilteredRuns, RunListRow, FAN_OUT_LIMIT,
 };
-use crate::customers::{CustomerFilter, PriceBook};
+use crate::customers::{Attribution, CustomerFilter, PriceBook};
 use crate::error::{ApiError, ApiResult};
 use crate::host::connector::{HostConnector, HostConnectorError, RunKind};
+use crate::query::{self, ListError, ListQuery, ListResponse, RowFilter, Unfilterable};
 use crate::state::AppState;
 use axum::{
     extract::{Query, State},
@@ -320,8 +321,8 @@ pub fn routes() -> Router<AppState> {
         .route("/api/runs/autoflows/problems", get(list_autoflow_problems))
 }
 
-/// `GET /api/runs/autoflows/runs`'s parameters: `/api/runs/workflows`'s,
-/// plus `workflow=<name>` to narrow to one autoflow.
+/// `GET /api/runs/autoflows/runs`'s parameters: `/api/runs/workflows`'s
+/// (`q` on [`crate::query::autoflow_runs::FIELDS`]).
 #[derive(serde::Deserialize)]
 pub(crate) struct AutoflowRunsQuery {
     // Flat, not a flattened `PageQuery` — see `WorkflowRunsQuery`.
@@ -332,6 +333,8 @@ pub(crate) struct AutoflowRunsQuery {
     /// One host; absent → every registered host.
     #[serde(default)]
     host: Option<String>,
+    /// RFC 3339 bounds on `started_at`; `host=local` only, as on
+    /// `/api/runs/workflows` (`q=since:… until:…` filters every host).
     #[serde(default)]
     since: Option<String>,
     #[serde(default)]
@@ -339,9 +342,12 @@ pub(crate) struct AutoflowRunsQuery {
     /// `<slug>` | `none` — see `list_runs`.
     #[serde(default)]
     customer: Option<String>,
-    /// Only this workflow's runs and attempts.
+    /// `?q=` — the list query ([`crate::query::autoflow_runs::FIELDS`]).
     #[serde(default)]
-    workflow: Option<String>,
+    q: Option<String>,
+    /// `?facets=1` — answer `{rows, facets, facets_partial}`.
+    #[serde(default)]
+    facets: Option<String>,
 }
 
 impl AutoflowRunsQuery {
@@ -352,19 +358,74 @@ impl AutoflowRunsQuery {
         }
     }
 
-    fn range(&self) -> crate::pagination::DateRangeQuery {
-        crate::pagination::DateRangeQuery {
-            since: self.since.clone(),
-            until: self.until.clone(),
-        }
+    /// What the request lists, derived once.
+    fn listing(&self) -> Result<Listing, ListError> {
+        let filter = RowFilter::new(
+            CustomerFilter::parse(self.customer.as_deref())?,
+            ListQuery::parse(self.q.as_deref(), query::autoflow_runs::FIELDS)?,
+        )
+        .only(query::autoflow_runs::is_autoflow_row);
+        let archived = filter
+            .query
+            .as_ref()
+            .is_some_and(|q| q.asks_for("is", "archived"));
+        Ok(Listing {
+            lifecycle: self.lifecycle.clone(),
+            range: crate::pagination::DateRangeQuery {
+                since: self.since.clone(),
+                until: self.until.clone(),
+            },
+            filter,
+            facets: query::wants_facets(self.facets.as_deref()),
+            archived,
+        })
     }
 }
 
-/// Whether a request lists attempt rows at all: never under a customer
-/// scope (an attempt records no customer) and only under All or
-/// Failed·Rejected (an attempt is failed and can't be archived).
-fn lists_attempts(lifecycle: Option<&str>, filter: Option<&CustomerFilter>) -> bool {
-    filter.is_none() && matches!(lifecycle, None | Some("failed"))
+/// What one request lists: the rows every host's contribution is kept by.
+#[derive(Clone)]
+struct Listing {
+    pub lifecycle: Option<String>,
+    pub range: crate::pagination::DateRangeQuery,
+    /// The customer scope, the query and the autoflow predicate.
+    pub filter: RowFilter,
+    pub facets: bool,
+    /// `is:archived`: the local archive, no attempts, no remote host.
+    pub archived: bool,
+}
+
+impl Listing {
+    /// Whether attempt rows are listed at all: never from the archive (an
+    /// attempt can't be archived), never when the filter reads a customer
+    /// (an attempt records none) and only under All or Failed·Rejected (an
+    /// attempt failed). What the query keeps of them is the query's call.
+    fn attempts(&self) -> bool {
+        !self.archived
+            && !self.filter.reads_customer()
+            && matches!(self.lifecycle.as_deref(), None | Some("failed"))
+    }
+
+    fn facet_counts(&self, scoped: &[serde_json::Value]) -> Option<query::FacetCounts> {
+        self.facets
+            .then(|| query::facet_counts(scoped, query::autoflow_runs::FIELDS, false))
+    }
+
+    /// Whether the filter keeps `row`, collecting it into `scoped` (what
+    /// facets count) when it is in scope; `Err` names the field the row
+    /// can't report.
+    fn admit(
+        &self,
+        row: &serde_json::Value,
+        scoped: &mut Vec<serde_json::Value>,
+    ) -> Result<bool, rupu_query::Unreportable> {
+        if !self.filter.in_scope(row)? {
+            return Ok(false);
+        }
+        if self.facets {
+            scoped.push(row.clone());
+        }
+        self.filter.matches_query(row)
+    }
 }
 
 /// The history events of `since..until` under `global`; an unreadable or
@@ -388,198 +449,194 @@ fn history_events(
     }
 }
 
-/// What the local listing is asked for.
-pub(crate) struct LocalListQuery {
-    pub lifecycle: Option<String>,
-    pub range: crate::pagination::DateRangeQuery,
-    pub filter: Option<CustomerFilter>,
-    pub workflow: Option<String>,
-    /// `(offset, count)` of the merged list to return.
-    pub window: (usize, usize),
+/// A local run the list kept, attributed and unpriced: pricing folds its
+/// usage ledger, so only the runs on the returned page are priced.
+struct Unpriced {
+    record: RunRecord,
+    who: Option<Attribution>,
 }
 
-/// A run or an attempt before the page is cut: a run is priced only once it
-/// is on the page.
-enum Merged {
-    Run(Box<RunRecord>, Option<crate::customers::Attribution>),
-    Attempt(Box<AttemptRow>),
+/// One host's contribution: its rows (run rows and attempt rows, tagged,
+/// newest first; the local host's run rows are unpriced probes), the
+/// in-scope rows facets count, and the hosts named as unable to report a
+/// field the filter reads.
+#[derive(Default)]
+struct HostRows {
+    rows: Vec<serde_json::Value>,
+    scoped: Vec<serde_json::Value>,
+    unfilterable: Vec<Unfilterable>,
 }
 
-impl Merged {
-    fn key(&self) -> (DateTime<Utc>, &str) {
-        match self {
-            Self::Run(r, _) => (r.started_at, &r.id),
-            Self::Attempt(a) => (a.started_at, &a.id),
+/// The local host's rows plus what prices the run rows that land on the
+/// page ([`LocalRows::price`]).
+struct LocalRows {
+    rows: HostRows,
+    store: Arc<RunStore>,
+    claims: ClaimIndex,
+    unpriced: std::collections::HashMap<String, Unpriced>,
+    archived: bool,
+}
+
+impl LocalRows {
+    /// Replace each local run probe among `rows` (one page) with its priced
+    /// row; attempt rows and other hosts' rows stay. Blocking IO.
+    fn price(mut self, rows: &mut [serde_json::Value], prices: &mut dyn PriceBook) {
+        for v in rows.iter_mut() {
+            if v["host_id"] != "local" {
+                continue;
+            }
+            let Some(run) = v["id"].as_str().and_then(|id| self.unpriced.remove(id)) else {
+                continue;
+            };
+            let mut row = RunListRow::priced(&run.record, run.who, &self.store, prices);
+            self.claims.apply(&mut row);
+            *v = tag_local(row, self.archived);
         }
     }
 }
 
-/// The local host's autoflow runs and attempts, newest first, windowed
-/// AFTER the merge: the run records are read, kept by autoflow (the cached
-/// envelope), lifecycle, range, workflow and customer, merged with the
-/// attempt rows, cut to `window`, and only the runs on that page are
-/// priced. Returns the rows (tagged `host_id: "local"`) and, under a
-/// customer filter, the worker hosts of the mirrored runs left out because
-/// their customer can't be known.
-pub(crate) fn local_rows(
-    store: &RunStore,
-    global: &Path,
-    prices: &mut dyn PriceBook,
-    q: &LocalListQuery,
-) -> ApiResult<(Vec<serde_json::Value>, Vec<String>)> {
+/// A local row on the wire: `host_id: "local"` (and `archived: true` from
+/// the archive).
+fn tag_local(row: RunListRow, archived: bool) -> serde_json::Value {
+    let mut v = serde_json::to_value(row).expect("a run row serializes");
+    v["host_id"] = serde_json::json!("local");
+    if archived {
+        v["archived"] = serde_json::json!(true);
+    }
+    v
+}
+
+/// The local host's autoflow runs and attempts as the filter keeps them,
+/// newest first and UNPRICED: every run record of `store` is read, kept by
+/// lifecycle and range, attributed (fail-closed when the filter reads a
+/// customer), read by the registry as its probe — the row without usage,
+/// with its autoflow and claim fields — and kept by the filter; the attempt
+/// rows (when [`Listing::attempts`]) are kept by the same filter. Under a
+/// filter, a mirrored worker run whose customer or autoflow can't be known
+/// here is left out and its worker host named. Blocking IO.
+fn select_local(store: Arc<RunStore>, global: &Path, l: &Listing) -> ApiResult<LocalRows> {
     let mut lookup =
         crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(global));
-    let mut hosts: Vec<String> = Vec::new();
-    let lifecycle = q.lifecycle.as_deref();
-    let wanted_workflow = |name: &str| q.workflow.as_deref().is_none_or(|w| w == name);
-    let mut merged: Vec<Merged> = Vec::new();
+    let claims = ClaimIndex::load(global);
+    let mut rows = HostRows::default();
+    let mut unpriced = std::collections::HashMap::new();
+    let fail_closed = l.filter.reads_customer();
     for r in store
         .list()
         .map_err(|e| ApiError::internal(e.to_string()))?
     {
-        if !in_lifecycle(r.status, lifecycle)
-            || !q.range.contains(r.started_at)
-            || !wanted_workflow(&r.workflow_name)
-            || !matches!(autoflow_of(&r, store), Some(Some(_)))
-        {
+        if !in_lifecycle(r.status, l.lifecycle.as_deref()) || !l.range.contains(r.started_at) {
             continue;
         }
-        let who = lookup.attribute_run(&r, q.filter.is_some())?;
-        let keep = match (&q.filter, &who) {
-            (None, _) => true,
-            (Some(f), Some(w)) => f.matches(w.slug.as_deref()),
-            // A run whose customer can't be known here is left out of a
-            // filter — never "no customer" — and its host named.
-            (Some(_), None) => {
-                crate::customers::note_unreportable(&mut hosts, &r);
-                false
+        let who = lookup.attribute_run(&r, fail_closed)?;
+        let mut probe = run_probe(&r, &who, "local", l.archived);
+        if let Some(af) = autoflow_of(&r, &store) {
+            probe["autoflow"] = serde_json::to_value(af).expect("an autoflow serializes");
+        }
+        claims.apply_json(&mut probe);
+        match l.admit(&probe, &mut rows.scoped) {
+            Ok(true) => {
+                unpriced.insert(r.id.clone(), Unpriced { record: r, who });
+                rows.rows.push(probe);
             }
-        };
-        if keep {
-            merged.push(Merged::Run(Box::new(r), who));
+            Ok(false) => {}
+            Err(e) => {
+                if let Some(w) = r.worker_id.as_deref() {
+                    query::note_unfilterable(&mut rows.unfilterable, w, e.field);
+                }
+            }
         }
     }
-    let claims = crate::api::autoflow_claims::ClaimIndex::load(global);
-    if lists_attempts(lifecycle, q.filter.as_ref()) {
-        let events = history_events(global, q.range.since(), q.range.until());
-        merged.extend(
-            attempt_rows(&events, &|id| store.exists(id), true, &claims)
-                .into_iter()
-                .filter(|a| wanted_workflow(&a.workflow_name))
-                .map(|a| Merged::Attempt(Box::new(a))),
-        );
-    }
-    merged.sort_by(|a, b| b.key().cmp(&a.key()));
-    let (offset, count) = q.window;
-    let rows = merged
-        .into_iter()
-        .skip(offset)
-        .take(count)
-        .map(|m| {
-            let mut v = match m {
-                Merged::Run(r, who) => {
-                    let mut row = RunListRow::priced(&r, who, store, prices);
-                    claims.apply(&mut row);
-                    serde_json::to_value(row).unwrap()
-                }
-                Merged::Attempt(a) => serde_json::to_value(a).unwrap(),
-            };
+    if l.attempts() {
+        let events = history_events(global, l.range.since(), l.range.until());
+        for a in attempt_rows(&events, &|id| store.exists(id), true, &claims) {
+            let mut v = serde_json::to_value(a).expect("an attempt row serializes");
             v["host_id"] = serde_json::json!("local");
-            v
-        })
-        .collect();
-    Ok((rows, hosts))
+            if l.admit(&v, &mut rows.scoped) == Ok(true) {
+                rows.rows.push(v);
+            }
+        }
+    }
+    sort_newest_first(&mut rows.rows);
+    Ok(LocalRows {
+        rows,
+        store,
+        claims,
+        unpriced,
+        archived: l.archived,
+    })
 }
 
-/// [`local_rows`] on the blocking pool, priced per customer.
-async fn local_list(
-    s: &AppState,
-    q: LocalListQuery,
-) -> ApiResult<(Vec<serde_json::Value>, Vec<String>)> {
-    let store = Arc::clone(&s.run_store);
+/// [`select_local`] on the blocking pool, over the active store or — from
+/// the archive — a store at its root (an archived run's ledger lives there).
+async fn local_rows(s: &AppState, l: &Listing) -> ApiResult<LocalRows> {
+    let store = if l.archived {
+        Arc::new(RunStore::new(s.run_store.archive_root()))
+    } else {
+        Arc::clone(&s.run_store)
+    };
     let global = s.global_dir.clone();
+    let listing = l.clone();
+    blocking(move || select_local(store, &global, &listing)).await
+}
+
+/// Price the local run rows of `page` ([`LocalRows::price`]) on the
+/// blocking pool, per customer.
+async fn price_page(
+    s: &AppState,
+    local: LocalRows,
+    mut page: Vec<serde_json::Value>,
+) -> ApiResult<Vec<serde_json::Value>> {
     let customer_pricing = Arc::clone(&s.customer_pricing);
     blocking(move || {
         let mut prices = crate::customers::PricingMemo::new(&customer_pricing);
-        local_rows(&store, &global, &mut prices, &q)
+        local.price(&mut page, &mut prices);
+        Ok(page)
     })
     .await
 }
 
-/// The customer a remote row reports: `Some(None)` = none, `None` = the
-/// row doesn't say (no key, or not a slug) — see
-/// [`crate::customers::filter_remote_rows`].
-fn row_customer(row: &serde_json::Value) -> Option<Option<&str>> {
-    match row.as_object()?.get("customer")? {
-        serde_json::Value::Null => Some(None),
-        serde_json::Value::String(s) => Some(Some(s)),
-        _ => None,
-    }
-}
-
-/// The 501 for a host whose run rows don't carry what this listing filters
-/// on (an older rupu), the status `host_list_error` gives an `Unsupported`
-/// host, so the web shows it as "unavailable".
-fn autoflow_unsupported(host_id: &str, filter: Option<&CustomerFilter>) -> ApiError {
-    let what = if filter.is_some() {
-        "an autoflow and a customer"
-    } else {
-        "an autoflow"
-    };
-    ApiError::not_available(format!("host {host_id} can't report {what} for every run"))
-}
-
 /// One remote host's autoflow runs and attempts, newest first, enough for a
-/// window of `want` rows (the caller cuts the page). Runs: the host's whole
-/// run list (`RunKind::All`), page by page, keeping the rows whose
-/// `autoflow` is non-null (and that match the workflow and customer); a row
-/// without the `autoflow` key — or, under a filter, the `customer` key — is
-/// a 501. Attempts: the host's event rows' `cycle_failed` events naming a
-/// workflow; a host without that listing contributes runs only.
-async fn remote_list(
+/// window of `want` rows (the caller cuts the page). Runs: the host's run
+/// list (`RunKind::All`), page by page through [`read_filtered_runs`] until
+/// `want` rows match the filter — the autoflow predicate, the customer
+/// scope and the query; a host any of whose rows can't report a field the
+/// filter reads (no `autoflow` key: an older rupu) is named in
+/// `unfilterable` and contributes nothing. Attempts: the host's event rows'
+/// `cycle_failed` events naming a workflow, kept by the same filter; a host
+/// without that listing contributes runs only.
+async fn remote_rows(
     conn: &dyn HostConnector,
     host_id: &str,
-    lifecycle: Option<String>,
-    filter: Option<&CustomerFilter>,
-    workflow: Option<&str>,
+    l: &Listing,
     want: usize,
-) -> ApiResult<Vec<serde_json::Value>> {
-    let keep = |row: &serde_json::Value| -> Option<bool> {
-        let af = row.get("autoflow")?;
-        if af.is_null() {
-            return Some(false);
-        }
-        if workflow.is_some_and(|w| row["workflow_name"].as_str() != Some(w)) {
-            return Some(false);
-        }
-        match filter {
-            None => Some(true),
-            Some(f) => Some(f.matches(row_customer(row)?)),
-        }
-    };
-    let runs = match read_runs_where(
+) -> ApiResult<HostRows> {
+    let mut out = HostRows::default();
+    match read_filtered_runs(
         conn,
+        host_id,
         RunKind::All,
-        lifecycle.clone(),
-        &keep,
+        l.lifecycle.clone(),
+        &l.filter,
         FAN_OUT_LIMIT,
         want,
+        l.facets,
     )
     .await
     .map_err(host_list_error)?
     {
-        FilteredRuns::CannotReport => return Err(autoflow_unsupported(host_id, filter)),
-        FilteredRuns::Rows(rows) => rows,
-    };
-    let mut rows: Vec<serde_json::Value> = runs
-        .into_iter()
-        .map(|mut v| {
-            v["host_id"] = serde_json::json!(host_id);
-            crate::codename::inject_codename_row(&mut v, "id", None);
-            v
-        })
-        .collect();
-    if lists_attempts(lifecycle.as_deref(), filter) {
+        FilteredRuns::CannotReport(field) => {
+            out.unfilterable.push((host_id.to_string(), field));
+            return Ok(out);
+        }
+        FilteredRuns::Rows {
+            matches, scoped, ..
+        } => {
+            out.rows = matches;
+            out.scoped = scoped.unwrap_or_default();
+        }
+    }
+    if l.attempts() {
         let events = match conn.list_autoflow_events().await {
             Ok(events) => events,
             Err(HostConnectorError::Unsupported(_)) => Vec::new(),
@@ -592,19 +649,16 @@ async fn remote_list(
                 Vec::new()
             }
         };
-        rows.extend(
-            remote_attempt_rows(&events)
-                .into_iter()
-                .filter(|a| workflow.is_none_or(|w| a.workflow_name == w))
-                .map(|a| {
-                    let mut v = serde_json::to_value(a).unwrap();
-                    v["host_id"] = serde_json::json!(host_id);
-                    v
-                }),
-        );
+        for a in remote_attempt_rows(&events) {
+            let mut v = serde_json::to_value(a).expect("an attempt row serializes");
+            v["host_id"] = serde_json::json!(host_id);
+            if l.admit(&v, &mut out.scoped) == Ok(true) {
+                out.rows.push(v);
+            }
+        }
     }
-    sort_newest_first(&mut rows);
-    Ok(rows)
+    sort_newest_first(&mut out.rows);
+    Ok(out)
 }
 
 /// Newest first by `started_at`: every row's is serde's `DateTime<Utc>`
@@ -618,109 +672,124 @@ fn sort_newest_first(rows: &mut [serde_json::Value]) {
     });
 }
 
-/// `GET /api/runs/autoflows/runs[?host=][&lifecycle=][&since=&until=][&customer=][&workflow=]`
+/// `GET /api/runs/autoflows/runs[?host=][&lifecycle=][&since=&until=][&customer=][&q=][&facets=1]`
 ///
 /// Autoflow-launched runs (rows whose `autoflow` is non-null) merged with
 /// the failed attempts that never became a run, newest first, paged AFTER
 /// the merge. One host with `?host=`, else every registered host (a remote
-/// whose call fails is skipped, logged). Errors as `/api/runs/workflows`:
-/// 501 when the host can't serve the listing, 502 when it gave no usable
-/// answer, 404 for an unknown host id. Under a customer scope only runs
-/// list; the `X-Rupu-Hosts-Without-Customer` header names the hosts whose
-/// runs couldn't be attributed, as on Workflows.
+/// whose call fails is skipped, logged). `?customer=` and `?q=`
+/// ([`crate::query::autoflow_runs::FIELDS`]) filter together, before the
+/// page is cut and before any local run is priced (only the page's are).
+/// Errors as `/api/runs/workflows`: 501 when the host can't serve the
+/// listing or its rows can't report a field the filter reads (`autoflow`
+/// on an older rupu), 502 when it gave no usable answer, 404 for an unknown
+/// host id; on the fan-out such a host is skipped and named in
+/// `X-Rupu-Hosts-Unfilterable` (`X-Rupu-Hosts-Without-Customer` for
+/// `customer`). A `q` that doesn't parse is a 400 `{error, token, code,
+/// start, end}`. Attempt rows are listed only under All and Failed·Rejected
+/// and never while the filter reads a customer (an attempt records none);
+/// the query keeps or drops them like any row. `is:archived` lists the
+/// local archive's autoflow runs instead (no attempts; a remote host is a
+/// 501, named `<host>:is` on the fan-out). `?facets=1` answers
+/// `{rows, facets, facets_partial}`.
 async fn list_autoflow_run_rows(
     State(s): State<AppState>,
     Query(q): Query<AutoflowRunsQuery>,
-) -> ApiResult<(axum::http::HeaderMap, Json<Vec<serde_json::Value>>)> {
+) -> Result<ListResponse, ListError> {
     let page = q.page();
-    let filter = CustomerFilter::parse(q.customer.as_deref())?;
-    let want = page.offset().saturating_add(page.limit());
-    let local_query = |window| LocalListQuery {
-        lifecycle: q.lifecycle.clone(),
-        range: q.range(),
-        filter: filter.clone(),
-        workflow: q.workflow.clone(),
-        window,
-    };
-    if let Some(host_id) = &q.host {
-        if host_id == "local" {
-            let (rows, hosts) = local_list(&s, local_query((page.offset(), page.limit()))).await?;
-            return Ok((
-                crate::customers::hosts_without_customer_header(&hosts),
-                Json(rows),
-            ));
-        }
-        let conn = resolve_host(&s, host_id)?;
-        let rows = remote_list(
-            conn.as_ref(),
-            host_id,
-            q.lifecycle.clone(),
-            filter.as_ref(),
-            q.workflow.as_deref(),
-            want,
-        )
-        .await?;
-        return Ok((
-            axum::http::HeaderMap::new(),
-            Json(crate::pagination::paginate(rows, &page)),
-        ));
+    let l = q.listing()?;
+    let remote = q.host.as_deref().filter(|h| *h != "local");
+    if let (true, Some(host_id)) = (l.archived, remote) {
+        resolve_host(&s, host_id)?;
+        return Err(
+            ApiError::not_available(format!("host {host_id} can't list archived runs")).into(),
+        );
     }
-    // Fan-out: each host asked for `offset + limit` rows, merged, paged.
+    if q.host.as_deref() == Some("local") || l.archived {
+        let mut local = local_rows(&s, &l).await?;
+        let mut unfilterable = std::mem::take(&mut local.rows.unfilterable);
+        if l.archived && q.host.is_none() {
+            for h in s.hosts.list_hosts().into_iter().filter(|h| h.id != "local") {
+                query::note_unfilterable(&mut unfilterable, &h.id, "is");
+            }
+        }
+        let facets = l.facet_counts(&local.rows.scoped);
+        let rows = crate::pagination::paginate(std::mem::take(&mut local.rows.rows), &page);
+        return Ok(ListResponse {
+            headers: query::unfilterable_headers(&unfilterable),
+            rows: price_page(&s, local, rows).await?,
+            facets,
+        });
+    }
+    if let Some(host_id) = remote {
+        let conn = resolve_host(&s, host_id)?;
+        let want = page.offset().saturating_add(page.limit());
+        let got = remote_rows(conn.as_ref(), host_id, &l, want).await?;
+        if let Some((host, field)) = got.unfilterable.first() {
+            return Err(query::unfilterable_error(host, field).into());
+        }
+        return Ok(ListResponse {
+            headers: axum::http::HeaderMap::new(),
+            facets: l.facet_counts(&got.scoped),
+            rows: crate::pagination::paginate(got.rows, &page),
+        });
+    }
+    // Fan-out: every host's whole filtered list, merged, paged, the page's
+    // local runs priced.
     let futs: Vec<_> = s
         .hosts
         .list_hosts()
         .into_iter()
         .map(|h| {
             let host_id = h.id;
-            let lifecycle = q.lifecycle.clone();
-            let filter = filter.as_ref();
-            let workflow = q.workflow.as_deref();
-            let local_query = &local_query;
+            let l = &l;
             let s = &s;
             async move {
                 if host_id == "local" {
-                    return local_list(s, local_query((0, want))).await;
+                    return local_rows(s, l).await.map(Err);
                 }
                 let listed = match s.hosts.resolve(&host_id) {
-                    Ok(conn) => {
-                        remote_list(conn.as_ref(), &host_id, lifecycle, filter, workflow, want)
-                            .await
-                    }
+                    Ok(conn) => remote_rows(conn.as_ref(), &host_id, l, usize::MAX).await,
                     Err(e) => Err(host_list_error(e)),
                 };
-                match listed {
-                    Ok(rows) => Ok((rows, Vec::new())),
-                    Err(e) => {
-                        tracing::warn!(
-                            host_id,
-                            error = %e.1,
-                            "autoflow runs fan-out: host failed; skipping it"
-                        );
-                        Ok((Vec::new(), Vec::new()))
-                    }
-                }
+                Ok(Ok(listed.unwrap_or_else(|e| {
+                    tracing::warn!(
+                        host_id,
+                        error = %e.1,
+                        "autoflow runs fan-out: host failed; skipping it"
+                    );
+                    HostRows::default()
+                })))
             }
         })
         .collect();
-    let mut rows: Vec<serde_json::Value> = Vec::new();
-    let mut without_customer: Vec<String> = Vec::new();
-    for (host_rows, hosts) in join_all(futs)
-        .await
-        .into_iter()
-        .collect::<ApiResult<Vec<_>>>()?
-    {
-        rows.extend(host_rows);
-        for h in hosts {
-            if !without_customer.contains(&h) {
-                without_customer.push(h);
+    let mut merged = HostRows::default();
+    let mut local: Option<LocalRows> = None;
+    for host in join_all(futs).await {
+        let mut rows = match host? {
+            Ok(remote) => remote,
+            Err(mut l) => {
+                let rows = std::mem::take(&mut l.rows);
+                local = Some(l);
+                rows
             }
+        };
+        merged.rows.append(&mut rows.rows);
+        merged.scoped.append(&mut rows.scoped);
+        for (h, f) in rows.unfilterable {
+            query::note_unfilterable(&mut merged.unfilterable, &h, f);
         }
     }
-    sort_newest_first(&mut rows);
-    Ok((
-        crate::customers::hosts_without_customer_header(&without_customer),
-        Json(crate::pagination::paginate(rows, &page)),
-    ))
+    sort_newest_first(&mut merged.rows);
+    let mut rows = crate::pagination::paginate(merged.rows, &page);
+    if let Some(local) = local {
+        rows = price_page(&s, local, rows).await?;
+    }
+    Ok(ListResponse {
+        headers: query::unfilterable_headers(&merged.unfilterable),
+        facets: l.facet_counts(&merged.scoped),
+        rows,
+    })
 }
 
 /// `GET /api/runs/autoflows/problems`'s parameters.
@@ -1156,15 +1225,30 @@ mod tests {
             since: None,
             until: None,
             customer: None,
-            workflow: None,
+            q: None,
+            facets: None,
         }
     }
 
+    fn with_q(host: Option<&str>, q: &str) -> AutoflowRunsQuery {
+        let mut query = query(host);
+        query.q = Some(q.into());
+        query
+    }
+
+    async fn call(s: &AppState, q: AutoflowRunsQuery) -> Result<ListResponse, ListError> {
+        list_autoflow_run_rows(State(s.clone()), Query(q)).await
+    }
+
     async fn call_list(s: &AppState, q: AutoflowRunsQuery) -> Vec<serde_json::Value> {
-        let (_, axum::Json(rows)) = list_autoflow_run_rows(State(s.clone()), Query(q))
-            .await
-            .expect("list ok");
-        rows
+        call(s, q).await.expect("list ok").rows
+    }
+
+    fn api_error(e: ListError) -> ApiError {
+        match e {
+            ListError::Api(e) => e,
+            ListError::Query(e) => panic!("a query error: {e:?}"),
+        }
     }
 
     fn ids(rows: &[serde_json::Value]) -> Vec<String> {
@@ -1194,9 +1278,12 @@ mod tests {
         assert_eq!(rows[1]["autoflow"]["issue_ref"], "github:acme/api/issues/7");
         assert_eq!(rows[1]["host_id"], "local");
         assert!(rows[1].get("attempt").is_none());
+        // The page's run is priced: its usage is the folded one, not a probe's.
+        assert_eq!(rows[1]["usage"]["priced"], true);
         // The fan-out (no host) lists the same.
         let rows = call_list(&s, query(None)).await;
         assert_eq!(ids(&rows), [attempt.event_id, "run_af".to_string()]);
+        assert_eq!(rows[1]["usage"]["priced"], true);
     }
 
     #[tokio::test]
@@ -1236,6 +1323,20 @@ mod tests {
             ids(&call_list(&s, q).await),
             ["run_12".to_string(), a11.event_id.clone()]
         );
+        // So do `since:` / `until:` terms, on every host.
+        for host in [Some("local"), None] {
+            assert_eq!(
+                ids(&call_list(
+                    &s,
+                    with_q(
+                        host,
+                        "since:2026-10-01T10:30:00Z until:2026-10-01T12:30:00Z"
+                    )
+                )
+                .await),
+                ["run_12".to_string(), a11.event_id.clone()]
+            );
+        }
     }
 
     #[tokio::test]
@@ -1255,6 +1356,15 @@ mod tests {
         let mut q = query(Some("local"));
         q.lifecycle = Some("failed".into());
         assert_eq!(ids(&call_list(&s, q).await), [attempt.event_id.as_str()]);
+        // The query decides the same way.
+        assert_eq!(
+            ids(&call_list(&s, with_q(Some("local"), "status:completed")).await),
+            ["run_af"]
+        );
+        assert_eq!(
+            ids(&call_list(&s, with_q(None, "status:failed")).await),
+            [attempt.event_id.as_str()]
+        );
         // The run recorded no customer: `customer=none` keeps it, drops the attempt.
         let mut q = query(Some("local"));
         q.customer = Some("none".into());
@@ -1262,13 +1372,18 @@ mod tests {
         let mut q = query(None);
         q.customer = Some("none".into());
         assert_eq!(ids(&call_list(&s, q).await), ["run_af"]);
+        // A `customer:` term reads the customer too: no attempt is listed.
+        assert_eq!(
+            ids(&call_list(&s, with_q(Some("local"), "customer:none")).await),
+            ["run_af"]
+        );
         let mut q = query(Some("local"));
         q.customer = Some("acme".into());
         assert!(call_list(&s, q).await.is_empty());
     }
 
     #[tokio::test]
-    async fn workflow_param_narrows_runs_and_attempts() {
+    async fn workflow_term_narrows_runs_and_attempts() {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = state(&tmp);
         seed_run(
@@ -1289,16 +1404,217 @@ mod tests {
         s.run_store.create(other, "name: x\n").unwrap();
         let fix = seed_failure(&s, "2026-10-01T11:00:00Z", Some("fix-issue"), None, "a");
         seed_failure(&s, "2026-10-01T12:00:00Z", Some("triage"), None, "b");
-        let mut q = query(Some("local"));
-        q.workflow = Some("fix-issue".into());
-        assert_eq!(
-            ids(&call_list(&s, q).await),
-            [fix.event_id, "run_fix".to_string()]
-        );
+        for host in [Some("local"), None] {
+            assert_eq!(
+                ids(&call_list(&s, with_q(host, "workflow:fix-issue")).await),
+                [fix.event_id.clone(), "run_fix".to_string()]
+            );
+        }
+    }
+
+    /// A claim for `issue` on `run_id`, with a display ref, an issue URL and
+    /// (when given) a PR.
+    fn seed_claim(s: &AppState, issue: &str, display: &str, run_id: &str, pr: Option<&str>) {
+        let store = rupu_workspace::AutoflowClaimStore {
+            root: s.global_dir.join("autoflows").join("claims"),
+        };
+        let mut claim = crate::api::autoflow_claims::tests::seed_record(issue);
+        claim.issue_display_ref = Some(display.into());
+        claim.issue_url = Some(format!("https://example.test/{display}"));
+        claim.pr_url = pr.map(Into::into);
+        claim.last_run_id = Some(run_id.into());
+        store.save(&claim).unwrap();
     }
 
     #[tokio::test]
-    async fn remote_without_autoflow_key_is_501() {
+    async fn q_issue_matches_the_display_ref_and_the_ref() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = state(&tmp);
+        seed_run(
+            &s,
+            "run_7",
+            "2026-10-01T10:00:00Z",
+            Some("github:acme/api/issues/7"),
+        );
+        seed_run(
+            &s,
+            "run_8",
+            "2026-10-01T11:00:00Z",
+            Some("github:acme/widgets/issues/8"),
+        );
+        seed_claim(&s, "github:acme/api/issues/7", "acme/api#7", "run_7", None);
+        for host in [Some("local"), None] {
+            // The display ref (from the claim) and the ref (from the envelope).
+            assert_eq!(
+                ids(&call_list(&s, with_q(host, "issue:api#7")).await),
+                ["run_7"]
+            );
+            assert_eq!(
+                ids(&call_list(&s, with_q(host, "issue:issues/7")).await),
+                ["run_7"]
+            );
+            assert_eq!(
+                ids(&call_list(&s, with_q(host, "issue:widgets")).await),
+                ["run_8"]
+            );
+            // A bare word reaches the issue.
+            assert_eq!(ids(&call_list(&s, with_q(host, "api#7")).await), ["run_7"]);
+        }
+        let rows = call_list(&s, with_q(Some("local"), "issue:api#7")).await;
+        assert_eq!(rows[0]["autoflow"]["issue_display_ref"], "acme/api#7");
+    }
+
+    #[tokio::test]
+    async fn q_pr_any_and_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = state(&tmp);
+        seed_run(
+            &s,
+            "run_pr",
+            "2026-10-01T10:00:00Z",
+            Some("github:acme/api/issues/7"),
+        );
+        seed_run(
+            &s,
+            "run_nopr",
+            "2026-10-01T11:00:00Z",
+            Some("github:acme/api/issues/8"),
+        );
+        seed_claim(
+            &s,
+            "github:acme/api/issues/7",
+            "acme/api#7",
+            "run_pr",
+            Some("https://example.test/pr/9"),
+        );
+        seed_claim(
+            &s,
+            "github:acme/api/issues/8",
+            "acme/api#8",
+            "run_nopr",
+            None,
+        );
+        for host in [Some("local"), None] {
+            assert_eq!(
+                ids(&call_list(&s, with_q(host, "pr:any")).await),
+                ["run_pr"]
+            );
+            assert_eq!(
+                ids(&call_list(&s, with_q(host, "pr:none")).await),
+                ["run_nopr"]
+            );
+        }
+        let rows = call_list(&s, with_q(Some("local"), "pr:any")).await;
+        assert_eq!(rows[0]["autoflow"]["pr_url"], "https://example.test/pr/9");
+    }
+
+    #[tokio::test]
+    async fn q_kind_attempt_and_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = state(&tmp);
+        seed_run(
+            &s,
+            "run_af",
+            "2026-10-01T10:00:00Z",
+            Some("github:acme/api/issues/7"),
+        );
+        let boom = seed_failure(&s, "2026-10-01T12:00:00Z", Some("fix-issue"), None, "boom");
+        let branch = seed_failure(
+            &s,
+            "2026-10-01T13:00:00Z",
+            Some("fix-issue"),
+            None,
+            "dispatch failed: branch exists",
+        );
+        for host in [Some("local"), None] {
+            assert_eq!(
+                ids(&call_list(&s, with_q(host, "kind:attempt")).await),
+                [branch.event_id.clone(), boom.event_id.clone()]
+            );
+            assert_eq!(
+                ids(&call_list(&s, with_q(host, "kind:run")).await),
+                ["run_af"]
+            );
+            assert_eq!(
+                ids(&call_list(&s, with_q(host, "error:\"branch exists\"")).await),
+                [branch.event_id.as_str()]
+            );
+            assert_eq!(
+                ids(&call_list(&s, with_q(host, "boom")).await),
+                [boom.event_id.as_str()]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn facets_count_runs_and_attempts_before_the_query() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = state(&tmp);
+        seed_run(
+            &s,
+            "run_af",
+            "2026-10-01T10:00:00Z",
+            Some("github:acme/api/issues/7"),
+        );
+        seed_run(&s, "run_manual", "2026-10-01T11:00:00Z", None);
+        seed_failure(&s, "2026-10-01T12:00:00Z", Some("fix-issue"), None, "boom");
+        for host in [Some("local"), None] {
+            let mut q = with_q(host, "kind:attempt");
+            q.facets = Some("1".into());
+            let resp = call(&s, q).await.unwrap();
+            assert_eq!(resp.rows.len(), 1);
+            let facets = serde_json::to_value(&resp.facets.expect("facets").facets).unwrap();
+            // The manual run is outside the list: it counts nowhere.
+            assert_eq!(facets["kind"], serde_json::json!({"attempt": 1, "run": 1}));
+            assert_eq!(
+                facets["status"],
+                serde_json::json!({"completed": 1, "failed": 1})
+            );
+            assert_eq!(facets["pr"], serde_json::json!({"none": 2}));
+            assert_eq!(facets["host"], serde_json::json!({"local": 2}));
+        }
+        // Without `facets=1` there are none.
+        assert!(call(&s, query(Some("local")))
+            .await
+            .unwrap()
+            .facets
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn is_archived_lists_the_archives_autoflow_runs_without_attempts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = state(&tmp);
+        seed_run(
+            &s,
+            "run_af",
+            "2026-10-01T10:00:00Z",
+            Some("github:acme/api/issues/7"),
+        );
+        seed_run(
+            &s,
+            "run_live",
+            "2026-10-01T11:00:00Z",
+            Some("github:acme/api/issues/8"),
+        );
+        seed_run(&s, "run_manual", "2026-10-01T12:00:00Z", None);
+        seed_failure(&s, "2026-10-01T13:00:00Z", Some("fix-issue"), None, "boom");
+        s.run_store.archive("run_af").unwrap();
+        s.run_store.archive("run_manual").unwrap();
+        for host in [Some("local"), None] {
+            let resp = call(&s, with_q(host, "is:archived")).await.unwrap();
+            assert_eq!(ids(&resp.rows), ["run_af"]);
+            assert_eq!(resp.rows[0]["archived"], true);
+            assert_eq!(resp.rows[0]["host_id"], "local");
+            assert_eq!(resp.rows[0]["usage"]["priced"], true);
+        }
+        let rows = call_list(&s, query(Some("local"))).await;
+        assert_eq!(rows.len(), 2, "the live list: the attempt and run_live");
+        assert_eq!(rows[1]["id"], "run_live");
+    }
+
+    #[tokio::test]
+    async fn remote_without_autoflow_key_is_501_and_named_on_the_fan_out() {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = crate::api::runs::tests::state_with_fake_host(
             &tmp,
@@ -1307,11 +1623,47 @@ mod tests {
                           "codename": "c", "codename_derived": false, "customer": null}],
             }),
         );
-        let err = list_autoflow_run_rows(State(s), Query(query(Some("host_fake"))))
+        let err = api_error(call(&s, query(Some("host_fake"))).await.unwrap_err());
+        assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            err.1,
+            "host host_fake can't report `autoflow` for every row"
+        );
+        let resp = call(&s, query(None)).await.unwrap();
+        assert!(resp.rows.is_empty());
+        assert_eq!(
+            resp.headers
+                .get(crate::query::HOSTS_UNFILTERABLE_HEADER)
+                .unwrap(),
+            "host_fake:autoflow"
+        );
+        // A remote host has no archive to list.
+        let err = api_error(
+            call(&s, with_q(Some("host_fake"), "is:archived"))
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
+        let resp = call(&s, with_q(None, "is:archived")).await.unwrap();
+        assert_eq!(
+            resp.headers
+                .get(crate::query::HOSTS_UNFILTERABLE_HEADER)
+                .unwrap(),
+            "host_fake:is"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bad_q_is_a_400() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = state(&tmp);
+        let err = call(&s, with_q(Some("local"), "sevrity:high"))
             .await
             .unwrap_err();
-        assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
-        assert!(err.1.contains("host_fake"), "{}", err.1);
+        assert!(
+            matches!(err, ListError::Query(ref e) if serde_json::to_value(e.code).unwrap() == "unknown_key"),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
@@ -1331,6 +1683,7 @@ mod tests {
                 "runs": [
                     row("r_manual", "2026-10-01T13:00:00Z", serde_json::Value::Null),
                     row("r_af", "2026-10-01T10:00:00Z", serde_json::json!({"issue_ref": "github:acme/api/issues/7"})),
+                    row("r_pr", "2026-10-01T09:00:00Z", serde_json::json!({"issue_ref": "github:acme/api/issues/8", "pr_url": "https://example.test/pr/9"})),
                 ],
                 "autoflow_events": [
                     {"event_id": "afe_1", "cycle_id": "cyc_1", "at": "2026-10-01T12:00:00Z",
@@ -1345,20 +1698,47 @@ mod tests {
             }),
         );
         let rows = call_list(&s, query(Some("host_fake"))).await;
-        assert_eq!(ids(&rows), ["afe_1", "r_af"]);
+        assert_eq!(ids(&rows), ["afe_1", "r_af", "r_pr"]);
         assert_eq!(rows[0]["host_id"], "host_fake");
         assert_eq!(rows[0]["attempt"]["worker"], "prod");
         assert_eq!(rows[0]["autoflow"]["issue_display_ref"], "acme/api#8");
         assert_eq!(rows[1]["host_id"], "host_fake");
-        // A customer scope keeps the run (recorded none) and drops the attempt.
+        // A customer scope keeps the runs (recorded none) and drops the attempt.
         let mut q = query(Some("host_fake"));
         q.customer = Some("none".into());
-        assert_eq!(ids(&call_list(&s, q).await), ["r_af"]);
+        assert_eq!(ids(&call_list(&s, q).await), ["r_af", "r_pr"]);
         // The window applies to the merge: page two is the run.
         let mut q = query(Some("host_fake"));
         q.offset = Some(1);
         q.limit = Some(1);
         assert_eq!(ids(&call_list(&s, q).await), ["r_af"]);
+        // The query reads a remote row's autoflow and attempt like a local one's.
+        assert_eq!(
+            ids(&call_list(&s, with_q(Some("host_fake"), "pr:any")).await),
+            ["r_pr"]
+        );
+        assert_eq!(
+            ids(&call_list(&s, with_q(Some("host_fake"), "issue:api#8")).await),
+            ["afe_1"],
+            "the attempt's display ref"
+        );
+        assert_eq!(
+            ids(&call_list(&s, with_q(Some("host_fake"), "issue:issues/8")).await),
+            ["r_pr"],
+            "the run's ref"
+        );
+        assert_eq!(
+            ids(&call_list(&s, with_q(Some("host_fake"), "kind:attempt error:boom")).await),
+            ["afe_1"]
+        );
+        // The fan-out (local has nothing) names the host in the `host` facet.
+        let mut q = with_q(None, "kind:run");
+        q.facets = Some("1".into());
+        let resp = call(&s, q).await.unwrap();
+        assert_eq!(ids(&resp.rows), ["r_af", "r_pr"]);
+        let facets = serde_json::to_value(&resp.facets.unwrap().facets).unwrap();
+        assert_eq!(facets["kind"], serde_json::json!({"attempt": 1, "run": 2}));
+        assert_eq!(facets["host"], serde_json::json!({"host_fake": 3}));
     }
 
     #[tokio::test]
@@ -1426,20 +1806,17 @@ mod tests {
             seed_run(&s, id, started, Some("github:acme/api/issues/7"));
         }
         let mut prices = CountingPrices(crate::customers::FlatPricing(&s.pricing), 0);
-        let (rows, _) = local_rows(
-            &s.run_store,
-            &s.global_dir,
-            &mut prices,
-            &LocalListQuery {
-                lifecycle: None,
-                range: crate::pagination::DateRangeQuery::default(),
-                filter: None,
-                workflow: None,
-                window: (1, 1),
-            },
-        )
-        .unwrap();
+        let listing = with_q(Some("local"), "workflow:fix").listing().unwrap();
+        let mut local = select_local(Arc::clone(&s.run_store), &s.global_dir, &listing).unwrap();
+        assert_eq!(prices.1, 0, "selecting prices nothing");
+        let page = crate::pagination::PageQuery {
+            offset: Some(1),
+            limit: Some(1),
+        };
+        let mut rows = crate::pagination::paginate(std::mem::take(&mut local.rows.rows), &page);
+        local.price(&mut rows, &mut prices);
         assert_eq!(ids(&rows), ["run_b"]);
+        assert_eq!(rows[0]["usage"]["priced"], true);
         assert_eq!(prices.1, 1, "only the page's run is priced");
     }
 
