@@ -80,7 +80,7 @@ impl ClaimIndex {
     /// The claim fields for the run `run_id` of issue `issue_ref`, applied
     /// to `af`: the claim's display ref and URL, and its PR when this run is
     /// the claim's last.
-    fn fill(&self, run_id: &str, af: &mut crate::api::runs::RunAutoflow) {
+    pub(crate) fn fill(&self, run_id: &str, af: &mut crate::api::runs::RunAutoflow) {
         let Some(claim) = af.issue_ref.as_deref().and_then(|i| self.by_issue.get(i)) else {
             return;
         };
@@ -260,11 +260,11 @@ async fn requeue_claim(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use rupu_workspace::ClaimStatus;
 
-    fn seed_record(issue_ref: &str) -> AutoflowClaimRecord {
+    pub(crate) fn seed_record(issue_ref: &str) -> AutoflowClaimRecord {
         AutoflowClaimRecord {
             issue_ref: issue_ref.into(),
             repo_ref: "github:Section9Labs/rupu".into(),
