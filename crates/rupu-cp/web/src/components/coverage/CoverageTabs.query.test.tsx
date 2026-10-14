@@ -75,6 +75,28 @@ describe('Gap tab', () => {
     expect(screen.getByTestId('query-count')).toHaveTextContent('1 of 2');
   });
 
+  it('a negated file: term drops files, and a row keeps the gap files left', async () => {
+    vi.spyOn(api, 'getCoverageAudit').mockResolvedValue(REPORT);
+    renderAt(<CoverageGapTab target="t" />);
+    await screen.findByText('sqli');
+    commitQuery('Filter gaps', '-file:db');
+    expect(ids()).toEqual(['sqli', 'xss']);
+    fireEvent.click(screen.getByRole('button', { name: 'expand all' }));
+    expect(screen.getByText('src/api/a.rs')).toBeInTheDocument();
+    expect(screen.queryByText('src/db/b.rs')).not.toBeInTheDocument();
+    expect(screen.getByText('src/api/c.rs')).toBeInTheDocument();
+  });
+
+  it('file: terms AND per file: a row whose files each meet only one of them is gone', async () => {
+    vi.spyOn(api, 'getCoverageAudit').mockResolvedValue(REPORT);
+    renderAt(<CoverageGapTab target="t" />);
+    await screen.findByText('sqli');
+    commitQuery('Filter gaps', 'file:src file:db');
+    expect(ids()).toEqual(['sqli']);
+    commitQuery('Filter gaps', 'file:api file:db');
+    expect(screen.getByText('No gaps match the filter.')).toBeInTheDocument();
+  });
+
   it('says so when nothing matches', async () => {
     vi.spyOn(api, 'getCoverageAudit').mockResolvedValue(REPORT);
     renderAt(<CoverageGapTab target="t" />);

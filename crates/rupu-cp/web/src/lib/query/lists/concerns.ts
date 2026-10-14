@@ -3,9 +3,7 @@
 import { CircleCheck, FileCode2, FolderTree, Gauge, ListChecks, ShieldAlert, Tag } from 'lucide-react';
 import type { ConcernCoverage, CoverageConcern } from '../../api';
 import type { GapRow } from '../../coverageGap';
-import type { QueryField } from '../../findingQuery/fields';
-import { parseQuery } from '../../findingQuery/grammar';
-import { rowField, type RowField, type RowValue } from '../rows';
+import { filterRows, rowField, type FilterResult, type RowField, type RowValue } from '../rows';
 
 const SEVERITIES = ['info', 'low', 'medium', 'high', 'critical'];
 
@@ -58,15 +56,19 @@ export const GAP_FIELDS: RowField<GapRow>[] = [
 ];
 
 /**
- * The `files` a query's `file:` terms keep: each positive term keeps the
- * files containing one of its values, each negated term drops them. A query
- * that doesn't parse, or names no file, keeps every file.
+ * The gap rows `q` keeps, each listing only the gap files it keeps. The
+ * query is evaluated per gap file (a row standing for that one file), so
+ * `file:` terms select files: each file must meet every term, a negated one
+ * included. A row stays when at least one of its gap files does.
  */
-export function filesMatching(files: readonly string[], q: string, fields: readonly QueryField[]): string[] {
-  const p = parseQuery(q, fields);
-  if (!p.ok) return [...files];
-  const terms = p.terms.filter((t) => t.key === 'file');
-  return files.filter((f) =>
-    terms.every((t) => t.values.some((v) => f.toLowerCase().includes(v.toLowerCase())) !== t.neg),
-  );
+export function filterGapRows(rows: readonly GapRow[], q: string): FilterResult<GapRow> {
+  const origin = new Map<GapRow, GapRow>();
+  for (const r of rows) for (const f of r.gap_files) origin.set({ ...r, gap_files: [f] }, r);
+  const kept = filterRows([...origin.keys()], q, GAP_FIELDS);
+  const files = new Map<GapRow, string[]>();
+  for (const one of kept.rows) {
+    const r = origin.get(one)!;
+    files.set(r, [...(files.get(r) ?? []), ...one.gap_files]);
+  }
+  return { rows: [...files].map(([r, gap_files]) => ({ ...r, gap_files })), error: kept.error };
 }

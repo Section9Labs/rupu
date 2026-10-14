@@ -10,8 +10,9 @@ import CollapsibleRow from './CollapsibleRow';
 import SeverityChip from './SeverityChip';
 import CappedList from './CappedList';
 import ExpandCollapse from './ExpandCollapse';
-import { ListQueryBar, NoMatches, useFilteredRows, useListQuery } from '../query/ListQueryBar';
-import { GAP_FIELDS, filesMatching } from '../../lib/query/lists/concerns';
+import { ListQueryBar, NoMatches, useListQuery } from '../query/ListQueryBar';
+import { rowFacets } from '../../lib/query/rows';
+import { GAP_FIELDS, filterGapRows } from '../../lib/query/lists/concerns';
 
 export default function CoverageGapTab({ target, wsId }: { target: string; wsId?: string }) {
   const [report, setReport] = useState<AuditReport | null>(null);
@@ -37,9 +38,9 @@ export default function CoverageGapTab({ target, wsId }: { target: string; wsId?
 
   const all = useMemo(() => (report ? gapRows(report) : []), [report]);
   const [q, setQ] = useListQuery();
-  const { rows: kept, error: queryError, facets } = useFilteredRows(all, q, GAP_FIELDS);
-  // A row lists only the gap files its query's `file:` terms keep.
-  const rows = useMemo(() => kept.map((r) => ({ ...r, gap_files: filesMatching(r.gap_files, q, GAP_FIELDS) })), [kept, q]);
+  const facets = useMemo(() => rowFacets(all, GAP_FIELDS), [all]);
+  // A row lists only the gap files the query keeps.
+  const { rows, error: queryError } = useMemo(() => filterGapRows(all, q), [all, q]);
 
   function toggle(id: string) {
     setOpen((prev) => {
