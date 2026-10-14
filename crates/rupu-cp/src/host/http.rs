@@ -16,14 +16,16 @@ use crate::{
     agent_launcher::AgentLaunchRequest,
     host::connector::{
         spec_peer_codename, EventByteStream, HostCapabilities, HostConnector, HostConnectorError,
-        HostInfo, OperatorMessageRequest, RunKind, RunListQuery, MAX_WORKSPACE_BYTES,
+        HostInfo, NetflowLanding, OperatorMessageRequest, RunKind, RunListQuery,
+        MAX_WORKSPACE_BYTES,
     },
     host::messages::MessageRoute,
     host::skill_ship::{prefixed, ship_through, ShipMemo, ShipOutcome, SkillBundle, Transfer},
     launcher::LaunchRequest,
     node::protocol::{
         CAP_AGENT_ENGAGEMENT_PROFILE, CAP_AGENT_FINDINGS_PROFILE, CAP_AGENT_SKILLS,
-        CAP_AGENT_SKILL_BUNDLE, CAP_RUN_MESSAGES, CAP_RUN_SUPPLIED_RUN_ID, CAP_SESSION_SKILLS,
+        CAP_AGENT_SKILL_BUNDLE, CAP_RUN_MESSAGES, CAP_RUN_NETFLOW_STREAM, CAP_RUN_SUPPLIED_RUN_ID,
+        CAP_SESSION_SKILLS,
     },
     session_sender::SendMessageRequest,
     session_starter::SessionStartRequest,
@@ -316,7 +318,7 @@ impl HttpHostConnector {
             ))),
             PeerInfo::Info(body) if body.features.iter().any(|f| f == feature) => Ok(()),
             PeerInfo::Info(body) => Err(HostConnectorError::Unsupported(format!(
-                "{what}: remote host {base_url} (rupu {}) does not support it; upgrade rupu there",
+                "{what}: remote host {base_url} (rupu {}) does not advertise `{feature}`; upgrade rupu there",
                 body.version.as_deref().unwrap_or("unknown version"),
             ))),
         }
@@ -825,17 +827,70 @@ impl HostConnector for HttpHostConnector {
             .await
     }
 
-    /// GET the remote CP's own local file. Complete once the run is terminal:
-    /// the remote serves the file its `rupu run` wrote, not a copy in transit.
+    /// GET the remote CP's own `runs/<id>/netflow.jsonl` and land it here
+    /// (spec 2026-10-14 §N2/§N3). The remote serves the file its `rupu run`
+    /// wrote, so a read of a terminal run is complete and a snapshot is
+    /// partial. A peer without [`CAP_RUN_NETFLOW_STREAM`] (an older rupu
+    /// answers the unknown path with its SPA) or a failed fetch is recorded
+    /// `unavailable` with the reason: missing netflow must never read as
+    /// "no flows". Only an invalid id or a landing I/O error is an `Err`.
     async fn land_run_netflow(
         &self,
-        _run_id: &str,
-        _terminal: bool,
-        _runs_root: &std::path::Path,
-    ) -> Result<crate::host::connector::NetflowLanding, HostConnectorError> {
-        Err(HostConnectorError::Unsupported(
-            "netflow stream collection over HTTP is not implemented".into(),
-        ))
+        run_id: &str,
+        terminal: bool,
+        runs_root: &std::path::Path,
+    ) -> Result<NetflowLanding, HostConnectorError> {
+        if !crate::host::connector::valid_run_id(run_id) {
+            return Err(HostConnectorError::Invalid(format!(
+                "invalid run id {run_id:?}"
+            )));
+        }
+        let fetched: Result<Vec<u8>, String> =
+            match self
+                .require_feature(
+                    CAP_RUN_NETFLOW_STREAM,
+                    "this unit's netflow cannot be collected",
+                )
+                .await
+            {
+                Err(e) => Err(e.to_string()),
+                Ok(()) => {
+                    let path = format!("/api/runs/{run_id}/netflow/stream");
+                    match self.send(self.client.get(self.url(&path))).await {
+                        Err(e) => Err(e.to_string()),
+                        Ok(resp) => resp.bytes().await.map(|b| b.to_vec()).map_err(|e| {
+                            HostConnectorError::Unreachable(e.to_string()).to_string()
+                        }),
+                    }
+                }
+            };
+        let (runs_root, run_id, host) = (
+            runs_root.to_path_buf(),
+            run_id.to_string(),
+            self.base_url.clone(),
+        );
+        let rec = tokio::task::spawn_blocking(move || match fetched {
+            Ok(bytes) => rupu_netflow::land::land_and_record(
+                &runs_root,
+                &run_id,
+                &host,
+                Some(&bytes),
+                terminal,
+                (!terminal).then(|| "read before the unit finished".to_string()),
+            ),
+            Err(why) => rupu_netflow::land::land_and_record(
+                &runs_root,
+                &run_id,
+                &host,
+                None,
+                false,
+                Some(why),
+            ),
+        })
+        .await
+        .map_err(|e| HostConnectorError::Internal(e.to_string()))?
+        .map_err(|e| HostConnectorError::Internal(e.to_string()))?;
+        Ok(NetflowLanding::Landed(rec.status))
     }
     async fn unit_coverage(
         &self,
