@@ -149,7 +149,8 @@ pub struct StartArgs {
     pub agent: String,
     /// Optional target reference, e.g. `github:owner/repo#42`.
     pub target: Option<String>,
-    /// Optional initial user message. Defaults to `go` if omitted.
+    /// Optional initial user message. Defaults to `go` if omitted. Leading
+    /// `/skill` tokens invoke those skills in the first turn.
     pub prompt: Option<String>,
     /// Initial user message via flag (preferred over the positional `prompt`;
     /// lets a caller pass a prompt without it being parsed as a target).
@@ -208,7 +209,8 @@ pub struct SendArgs {
     #[arg(add = ArgValueCompleter::new(active_session_ids))]
     pub session_id: String,
     /// Follow-up prompt to send as the session's next turn. Optional when
-    /// the turn invokes a skill.
+    /// the turn invokes a skill. Leading `/skill` tokens (`/pdf summarize
+    /// it`) invoke those skills, as `--skill` does.
     #[arg(required_unless_present = "skills")]
     pub prompt: Option<String>,
     /// A skill to invoke in this turn (`name`, `global:name` or
@@ -1752,6 +1754,14 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
             }
         },
     };
+    // Leading `/skill` tokens invoke those skills in the first turn, as
+    // `session send` takes them.
+    let first_turn = rupu_runtime::assembly::resolve_slash_skills(
+        &skill_dirs(&global, project_root.as_deref()),
+        &skill_index,
+        &user_message,
+    )
+    .await?;
 
     let agent_system_prompt = match run_target.as_ref() {
         Some(t) => format!(
@@ -1901,8 +1911,8 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     launch_turn(
         &global,
         &session_id,
-        user_message,
-        Vec::new(),
+        first_turn.prompt,
+        first_turn.invoked,
         args.detach,
         args.view,
     )
@@ -1919,11 +1929,30 @@ async fn send(args: SendArgs) -> anyhow::Result<()> {
     if session.status == SessionStatus::Stopped {
         anyhow::bail!("session {} is stopped", session.session_id);
     }
-    let operator_skills = resolve_send_skills(&global, &session, &args.skills).await?;
+    let mut operator_skills = resolve_send_skills(&global, &session, &args.skills).await?;
+    // Leading `/skill` tokens in the prompt invoke skills too, after the
+    // `--skill` ones; a name either binds from the other layer is refused.
+    let held: Vec<rupu_skills::FrozenSkill> = session
+        .skill_index
+        .iter()
+        .chain(&operator_skills)
+        .cloned()
+        .collect();
+    let turn = rupu_runtime::assembly::resolve_slash_skills(
+        &skill_dirs(&global, session.project_root.as_deref()),
+        &held,
+        args.prompt.as_deref().unwrap_or_default(),
+    )
+    .await?;
+    for f in turn.invoked {
+        if !operator_skills.contains(&f) {
+            operator_skills.push(f);
+        }
+    }
     launch_turn(
         &global,
         &session.session_id,
-        args.prompt.unwrap_or_default(),
+        turn.prompt,
         operator_skills,
         args.detach,
         args.view,
@@ -1999,9 +2028,16 @@ fn enqueue_turn_request(
     }
     session.updated_at = enqueued_at;
     session.last_error = None;
+    // The turn as the operator wrote it: its invoked skills spelled `/name`.
+    let shown = operator_skills
+        .iter()
+        .map(|f| format!("/{}", f.name))
+        .chain((!prompt.is_empty()).then(|| prompt.clone()))
+        .collect::<Vec<_>>()
+        .join(" ");
     session.runs.push(SessionRunRecord {
         run_id: run_id.clone(),
-        prompt: prompt.clone(),
+        prompt: shown,
         transcript_path: transcript_path.clone(),
         started_at: enqueued_at,
         completed_at: None,
