@@ -10,6 +10,7 @@ import { MemoryRouter } from 'react-router-dom';
 import { api, type CoverageSummary } from '../lib/api';
 
 import Coverage from './Coverage';
+import { commitQuery, firstCells } from '../components/query/queryTestUtils';
 import { scopedEntry, withCustomerScope } from '../lib/customerScopeTestUtils';
 
 const TARGET: CoverageSummary = {
@@ -99,5 +100,36 @@ describe('Coverage — under a customer scope', () => {
     renderPage();
     await waitFor(() => expect(api.getCoverage).toHaveBeenCalledTimes(2));
     expect(screen.queryByRole('note')).not.toBeInTheDocument();
+  });
+});
+
+describe('Coverage query line', () => {
+  const ROWS: CoverageSummary[] = [
+    TARGET,
+    { ...TARGET, target_id: 'src/api.rs', findings: 0, has_catalog: false },
+    { ...TARGET, ws_id: 'ws-2', project: 'infra', target_id: 'deploy/main.tf', findings: 1 },
+  ];
+  const mount = (entry: string) =>
+    render(<MemoryRouter initialEntries={[entry]}>{withCustomerScope(<Coverage />)}</MemoryRouter>);
+
+  it('narrows the table to the query in ?q=', async () => {
+    vi.spyOn(api, 'getCoverage').mockResolvedValue(ROWS);
+    mount('/coverage?q=project:my-project has:findings');
+    await waitFor(() => expect(firstCells()).toEqual(['src/auth.rs']));
+    expect(screen.getByTestId('query-count')).toHaveTextContent('1 of 3');
+  });
+
+  it('narrows the table as a query is committed', async () => {
+    vi.spyOn(api, 'getCoverage').mockResolvedValue(ROWS);
+    mount('/coverage');
+    await waitFor(() => expect(firstCells()).toEqual(['deploy/main.tf', 'src/auth.rs', 'src/api.rs']));
+    commitQuery('Filter coverage', '-has:catalog');
+    await waitFor(() => expect(firstCells()).toEqual(['src/api.rs']));
+  });
+
+  it('says so when the query keeps nothing', async () => {
+    vi.spyOn(api, 'getCoverage').mockResolvedValue(ROWS);
+    mount('/coverage?q=target:nothing');
+    expect(await screen.findByText('No targets match the filter.')).toBeInTheDocument();
   });
 });

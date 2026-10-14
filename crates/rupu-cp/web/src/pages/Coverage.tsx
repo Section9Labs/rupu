@@ -3,7 +3,7 @@
 // most-interesting targets float to the top. Each row links to the per-target
 // detail view (/coverage/:target).
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { ShieldCheck, ShieldOff } from 'lucide-react';
 import { api, type CoverageSummary } from '../lib/api';
@@ -15,6 +15,8 @@ import { Spinner } from '../components/ui/Spinner';
 import { cn } from '../lib/cn';
 import { useInfiniteScroll } from '../lib/useInfiniteScroll';
 import { UnscopedNote } from '../components/customers/UnscopedNote';
+import { ListQueryBar, NoMatches, useFilteredRows, useListQuery } from '../components/query/ListQueryBar';
+import { COVERAGE_FIELDS } from '../lib/query/lists/coverage';
 
 const STEP = 20;
 
@@ -41,11 +43,14 @@ export default function Coverage() {
     };
   }, []);
 
-  const all = targets ?? [];
+  const [q, setQ] = useListQuery();
+  const loaded = useMemo(() => targets ?? [], [targets]);
+  const { rows: all, error: queryError, facets } = useFilteredRows(loaded, q, COVERAGE_FIELDS);
+  useEffect(() => setVisible(STEP), [q]);
 
   // Max assertion_lines across all targets — used to scale comparative bars
   // consistently across every project group.
-  const maxLines = all.reduce((m, t) => Math.max(m, t.assertion_lines), 1);
+  const maxLines = loaded.reduce((m, t) => Math.max(m, t.assertion_lines), 1);
 
   // Group targets by their owning project. Within a group, sort by findings ↓
   // then activity ↓. Groups are ordered by project name asc.
@@ -97,32 +102,49 @@ export default function Coverage() {
         <div className="py-16 flex items-center justify-center">
           <Spinner label="Loading coverage…" />
         </div>
-      ) : all.length === 0 ? (
+      ) : loaded.length === 0 ? (
         <EmptyState
           title="No coverage data"
           hint="Run an assessment workflow to start recording coverage assertions and findings."
         />
       ) : (
-        <div className="space-y-8">
-          {windowedGroups
-            .filter((g) => g.rows.length > 0)
-            .map((g) => (
-              <section key={g.project}>
-                <SectionHeader
-                  tone="muted"
-                  label={g.project}
-                  count={g.total}
-                  hint="sorted by findings ↓ then activity ↓"
-                />
-                <CoverageGroupTable rows={g.rows} maxLines={maxLines} />
-              </section>
-            ))}
-          {all.length > visible && (
-            <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
-              scroll for more
+        <>
+          <ListQueryBar
+            value={q}
+            onChange={setQ}
+            fields={COVERAGE_FIELDS}
+            facets={facets}
+            total={loaded.length}
+            shown={all.length}
+            error={queryError}
+            label="Filter coverage"
+            placeholder="Filter targets… e.g. project:shop-web has:findings"
+          />
+          {all.length === 0 ? (
+            <NoMatches noun="targets" />
+          ) : (
+            <div className="space-y-8">
+              {windowedGroups
+                .filter((g) => g.rows.length > 0)
+                .map((g) => (
+                  <section key={g.project}>
+                    <SectionHeader
+                      tone="muted"
+                      label={g.project}
+                      count={g.total}
+                      hint="sorted by findings ↓ then activity ↓"
+                    />
+                    <CoverageGroupTable rows={g.rows} maxLines={maxLines} />
+                  </section>
+                ))}
+              {all.length > visible && (
+                <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
+                  scroll for more
+                </div>
+              )}
             </div>
           )}
-        </div>
+        </>
       )}
     </div>
   );
