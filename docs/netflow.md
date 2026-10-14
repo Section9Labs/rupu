@@ -109,6 +109,7 @@ Ledgers are append-only JSONL. Each line has a `type`:
 | `socket_complete` | Finalises a socket flow when the socket closes: `id`, `duration_ms`, and the final `bytes_in`, `bytes_out`, `outcome` and `error` where known |
 | `capture` | Subprocess-capture state for the run: `state: active` with its `backend`, or `state: unavailable` with a `reason`, plus an optional loss `note` |
 | `dropped` | A `count` of records lost because the writer's buffer overflowed, and when |
+| `recovered` | A `count` of flows a `dropped` line counted that are back in the ledger, and when; subtracted from the dropped total |
 
 `complete` and `socket_complete` lines are folded into their flow when the
 ledger is read. A missing file reads as an empty ledger, and a malformed line
@@ -155,6 +156,14 @@ the ledger is read (below), so a newer dataset improves old records too.
 Flows observed during a run are also written to the run's transcript as
 `net_flow` events, which the CLI's transcript views show inline (see
 [transcript-schema.md](transcript-schema.md)).
+
+When a run ends, every flow its transcript holds and its ledger lacks (the
+writer could not open the ledger, or dropped the line) is appended to the
+ledger, followed by any `complete` / `socket_complete` line the ledger already
+had for it and a `recovered` line. A run that crashed or was killed never
+reaches its end. For such a run, its own view and its agentiflow's view
+still merge the transcripts of the run and of every run it launched, while
+project and global views show only what reached the ledger.
 
 ---
 

@@ -33,8 +33,12 @@
 //! a ledger-only read reports nothing for it — the run's own transcript,
 //! which the same sink always writes to independent of the ledger's fate,
 //! is the ONLY surviving record of that run's network activity.
-//! [`merge_with_transcript`] is what makes those flows reachable at all;
-//! see its doc for the dedup rule.
+//! A run that reaches its end copies those flows into its ledger
+//! (`rupu_runtime::netflow::RunNetflow::finish`), so every scope reads
+//! them there; [`merge_with_transcript`] is the fallback for a run that
+//! crashed or was killed first, at run and agentiflow scope, over the run's
+//! own transcripts and those of the children it launched (`run_tree`).
+//! See its doc for the dedup rule.
 //!
 //! ## Blocking I/O never runs on the async task
 //!
@@ -548,6 +552,10 @@ pub(crate) fn maybe_refresh_asn(cfg: &rupu_config::NetflowConfig, cache: &Arc<As
 /// file, so those flows are already in the ledger read (see the module
 /// doc).
 ///
+/// A run that reached its end has already had its transcript-only flows
+/// appended to its ledger (`rupu_runtime::netflow::RunNetflow::finish`);
+/// the merge still matters for one that crashed or was killed first.
+///
 /// On a normal run (ledger opened fine), every flow already exists in the
 /// ledger; the merge is then a no-op union — nothing new is added, because
 /// every transcript-side id the dedup below sees already has a ledger-side
@@ -720,9 +728,27 @@ fn resolve_ledger_paths(workspace: &StdPath, global_dir: &StdPath, id: &str) -> 
 /// `pub` so `rupu netflow prune` protects every ledger a live run owns
 /// with the same id walk the read side uses.
 pub fn run_and_unit_ids(global: &StdPath, store: &RunStore, run_id: &str) -> Vec<String> {
+    run_tree(global, store, run_id).ids
+}
+
+/// What a run's netflow read covers: every ledger id of [`run_and_unit_ids`],
+/// and the transcripts of the children the run launched.
+pub(crate) struct RunTree {
+    pub ids: Vec<String>,
+    /// Each launched agent's or sub-agent's transcript, and every transcript
+    /// of a launched workflow's run. A child's run end copies its
+    /// transcript's flows into its ledger
+    /// (`rupu_runtime::netflow::RunNetflow::finish`); one that crashed or
+    /// was killed never got there, and these are where its flows survive.
+    pub child_transcripts: Vec<PathBuf>,
+}
+
+/// [`run_and_unit_ids`]' walk, with the launched children's transcripts.
+pub(crate) fn run_tree(global: &StdPath, store: &RunStore, run_id: &str) -> RunTree {
     let runs = global.join("runs");
     let global_store = RunStore::new(runs.clone());
     let mut ids = own_ids(store, run_id);
+    let mut child_transcripts = Vec::new();
     let mut walked: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut pending = ids.clone();
     while let Some(id) = pending.pop() {
@@ -731,17 +757,27 @@ pub fn run_and_unit_ids(global: &StdPath, store: &RunStore, run_id: &str) -> Vec
         }
         for child in rupu_launch::identity::launch_tree(global, &runs.join(&id)) {
             if child.kind == rupu_tools::ChildKind::Workflow {
+                child_transcripts.extend(crate::usage::run_transcript_paths(
+                    &global_store,
+                    &child.run_id,
+                ));
                 let units = own_ids(&global_store, &child.run_id);
                 pending.extend(units.iter().cloned());
                 ids.extend(units);
             } else {
+                child_transcripts.extend(child.transcript);
                 ids.push(child.run_id);
             }
         }
     }
     ids.sort();
     ids.dedup();
-    ids
+    child_transcripts.sort();
+    child_transcripts.dedup();
+    RunTree {
+        ids,
+        child_transcripts,
+    }
 }
 
 /// `run_id`, its step and fan-out item ids from `store`'s
@@ -1286,14 +1322,16 @@ pub fn run_scoped_flows_and_dropped_with(
         .filter(|f| range.contains(f.ts))
         .collect();
     let mut dropped = extra_dropped;
-    for id in run_and_unit_ids(global_dir, store, run_id) {
-        for ledger_path in resolve_ledger_paths(workspace, global_dir, &id) {
+    let tree = run_tree(global_dir, store, run_id);
+    for id in &tree.ids {
+        for ledger_path in resolve_ledger_paths(workspace, global_dir, id) {
             let (f, d) = reader.flows_in_range(&ledger_path, range);
             all.extend(f);
             dropped += d;
         }
     }
-    let transcript_paths = crate::usage::run_transcript_paths(store, run_id);
+    let mut transcript_paths = crate::usage::run_transcript_paths(store, run_id);
+    transcript_paths.extend(tree.child_transcripts);
     // `merge_with_transcript` can add flows the ledger read never saw at
     // all (the degraded-sink recovery case — see its own doc comment), so
     // filtering only the ledger side above is not enough: an out-of-window
@@ -1396,12 +1434,17 @@ fn agentiflow_netflow_scope(s: &AppState, id: &str) -> Option<AgentiflowNetflowS
     let run_dir = rupu_agentiflow::agentiflow_dir(&s.global_dir).join(id);
     let record = rupu_agentiflow::AgentiflowRecord::read(&run_dir).ok()?;
     let runs = crate::api::agentiflows::flow_runs(s, &run_dir);
-    let mut ids = run_and_unit_ids(&s.global_dir, &s.run_store, id);
-    for run_id in &runs.run_ids {
-        ids.extend(run_and_unit_ids(&s.global_dir, &s.run_store, run_id));
+    let mut transcripts = runs.transcripts;
+    let mut ids = Vec::new();
+    for run_id in std::iter::once(id).chain(runs.run_ids.iter().map(String::as_str)) {
+        let tree = run_tree(&s.global_dir, &s.run_store, run_id);
+        ids.extend(tree.ids);
+        transcripts.extend(tree.child_transcripts);
     }
     ids.sort();
     ids.dedup();
+    transcripts.sort();
+    transcripts.dedup();
     let mut meta = RunMetaIndex::default();
     meta.insert_synthetic(
         id,
@@ -1413,7 +1456,7 @@ fn agentiflow_netflow_scope(s: &AppState, id: &str) -> Option<AgentiflowNetflowS
     Some(AgentiflowNetflowScope {
         tag: id.to_string(),
         ids,
-        transcripts: runs.transcripts,
+        transcripts,
         workspace: crate::api::agentiflows::flow_workspace(s, &run_dir)
             .map_or_else(|| s.workspace_dir.clone(), |w| PathBuf::from(w.path)),
         meta,

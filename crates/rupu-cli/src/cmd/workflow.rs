@@ -3760,12 +3760,13 @@ pub(crate) async fn resume_run(
     // ledger every step's sink independently resolves to. The writer
     // handle is intentionally left unheld — the sink Arc lives on inside
     // `mcp_registry` for as long as this resumed run needs it.
-    let (netflow_sink, _netflow_handle) = crate::netflow_sink::for_run(
+    let _netflow = crate::netflow_sink::for_run(
         &global,
         project_root.as_deref(),
         run_id,
         &transcripts.join(format!("{run_id}.jsonl")),
     );
+    let netflow_sink = _netflow.sink.clone();
     let mcp_registry =
         Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg, netflow_sink).await);
 
@@ -4753,12 +4754,13 @@ async fn run_with_outcome(
         .clone()
         .unwrap_or_else(|| format!("run_{}", Ulid::new()));
     let transcripts_dir = paths::transcripts_dir(&global, project_root.as_deref());
-    let (netflow_sink, _netflow_handle) = crate::netflow_sink::for_run(
+    let _netflow = crate::netflow_sink::for_run(
         &global,
         project_root.as_deref(),
         &run_id,
         &transcripts_dir.join(format!("{run_id}.jsonl")),
     );
+    let netflow_sink = _netflow.sink.clone();
 
     // Build the SCM/issue registry once for the entire workflow run.
     // Cheap when no platforms are configured; missing credentials are
@@ -5544,12 +5546,13 @@ async fn execute_workflow_invocation(
     // registry's sink and every step's own sink converge on one ledger.
     // The writer handle is intentionally left unheld — the sink Arc lives
     // on inside `mcp_registry` for as long as this run needs it.
-    let (netflow_sink, _netflow_handle) = crate::netflow_sink::for_run(
+    let _netflow = crate::netflow_sink::for_run(
         &global,
         ctx.project_root.as_deref(),
         &run_id,
         &transcripts.join(format!("{run_id}.jsonl")),
     );
+    let netflow_sink = _netflow.sink.clone();
     let mcp_registry =
         Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg, netflow_sink).await);
 

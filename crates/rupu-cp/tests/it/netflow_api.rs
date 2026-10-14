@@ -3281,3 +3281,80 @@ async fn a_launched_childs_flow_attributes_to_its_root_run_at_project_and_global
         assert_eq!(workflows, [("wf".to_string(), 1)], "{route}: {body}");
     }
 }
+
+fn transcript_flow(path: &std::path::Path, host: &str) {
+    let mut w = JsonlWriter::create(path).unwrap();
+    w.write(&TxEvent::NetFlow {
+        flow: Box::new(flow(None, host, Fidelity::Http, None)),
+    })
+    .unwrap();
+    w.flush().unwrap();
+}
+
+#[tokio::test]
+async fn run_netflow_reads_the_transcripts_of_the_children_a_run_launched() {
+    let global = tempfile::tempdir().unwrap();
+    let g = global.path();
+    let project = tempfile::tempdir().unwrap();
+    let state = new_state(g);
+    let store = &state.run_store;
+    store
+        .create(
+            seed_run("run_txp", project.path().to_path_buf()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+    store
+        .append_step_result(
+            "run_txp",
+            &seed_step("run_txp_step", project.path().join("t.jsonl")),
+        )
+        .unwrap();
+    let step_dir = g.join("runs").join("run_txp_step");
+    // An agent child that died before its run end, with no ledger: its
+    // flow is only in its transcript.
+    let agent_transcript = project.path().join("agent-child.jsonl");
+    transcript_flow(&agent_transcript, "agent-child.example");
+    let mut started = rupu_launch::ledger::Started::new(
+        "ch_run_txa",
+        rupu_tools::ChildKind::Agent,
+        "recon",
+        "run_txa",
+        1,
+        1,
+    );
+    started.transcript = Some(agent_transcript);
+    rupu_launch::ledger::append(
+        &step_dir,
+        &rupu_launch::ledger::LedgerLine::Started(started),
+    );
+    // A workflow child whose step's flow is only in the step's transcript.
+    launched_as(&step_dir, "run_txw", rupu_tools::ChildKind::Workflow, 1);
+    store
+        .create(
+            seed_run("run_txw", project.path().to_path_buf()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+    let workflow_step_transcript = project.path().join("workflow-child-step.jsonl");
+    transcript_flow(&workflow_step_transcript, "workflow-child-step.example");
+    store
+        .append_step_result(
+            "run_txw",
+            &seed_step("run_txw_step", workflow_step_transcript),
+        )
+        .unwrap();
+    one_flow(g, "run_txp_step", "step.example");
+    let addr = serve(state).await;
+
+    let (status, body) = get_json(addr, "/api/runs/run_txp/netflow").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        hosts_of(&body),
+        [
+            "agent-child.example",
+            "step.example",
+            "workflow-child-step.example"
+        ]
+    );
+}

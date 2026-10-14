@@ -32,10 +32,7 @@ pub fn for_run(
     project_root: Option<&Path>,
     run_id: &str,
     transcript_path: &Path,
-) -> (
-    Arc<dyn rupu_netflow::FlowSink>,
-    Option<rupu_netflow::NetflowWriterHandle>,
-) {
+) -> rupu_runtime::netflow::RunNetflow {
     rupu_runtime::netflow::for_run(global, project_root, run_id, transcript_path)
 }
 
@@ -116,17 +113,13 @@ mod tests {
         rupu_transcript::JsonlWriter::create(&t_a).unwrap();
         rupu_transcript::JsonlWriter::create(&t_b).unwrap();
 
-        let (sink_a, h_a) = for_run(&global, None, "run-a", &t_a);
-        let (sink_b, h_b) = for_run(&global, None, "run-b", &t_b);
+        let a = for_run(&global, None, "run-a", &t_a);
+        let b = for_run(&global, None, "run-b", &t_b);
 
-        rupu_netflow::FlowSink::record(sink_a.as_ref(), flow("a.example")).await;
-        rupu_netflow::FlowSink::record(sink_b.as_ref(), flow("b.example")).await;
-        if let Some(h) = h_a {
-            h.shutdown().await;
-        }
-        if let Some(h) = h_b {
-            h.shutdown().await;
-        }
+        rupu_netflow::FlowSink::record(a.sink.as_ref(), flow("a.example")).await;
+        rupu_netflow::FlowSink::record(b.sink.as_ref(), flow("b.example")).await;
+        a.finish().await;
+        b.finish().await;
 
         let a = rupu_netflow::ledger::read_flows(&global.join("netflow/run-a.jsonl")).unwrap();
         let b = rupu_netflow::ledger::read_flows(&global.join("netflow/run-b.jsonl")).unwrap();

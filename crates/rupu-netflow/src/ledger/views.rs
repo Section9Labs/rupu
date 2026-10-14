@@ -38,6 +38,7 @@ pub fn read_flows_and_dropped(path: &Path) -> std::io::Result<(Vec<FlowRecord>, 
             Some(super::fold::FoldEvent::Flow(f)) => flows.push(*f),
             Some(super::fold::FoldEvent::Patch { index, patch }) => patch.apply(&mut flows[index]),
             Some(super::fold::FoldEvent::Dropped(n)) => dropped += n,
+            Some(super::fold::FoldEvent::Recovered(n)) => dropped = dropped.saturating_sub(n),
             Some(super::fold::FoldEvent::Capture(_)) | None => {}
         }
     }
