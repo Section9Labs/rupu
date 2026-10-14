@@ -20,7 +20,6 @@ import {
   ApiError,
   isKnownRunEvent,
   type AutoflowRunContext,
-  type FindingsResponse,
   type RunEvent,
   type RunGraphResponse,
   type RunRecord,
@@ -30,9 +29,7 @@ import {
 import { StatusPill } from '../components/StatusPill';
 import { Button } from '../components/ui/Button';
 import { TabBar, TabButton } from '../components/TabBar';
-import { ListCard } from '../components/lists/ListCard';
-import { FindingMetrics } from '../components/findings/FindingMetrics';
-import { FindingRow } from '../components/findings/FindingRow';
+import { FindingsExplorer } from '../components/findings/FindingsExplorer';
 import RunGraph, { type NodeSelection } from '../components/RunGraph';
 import RunEventFeed, { type ConnectionState, type SeqEvent } from '../components/RunEventFeed';
 import RunWarningsBanner from '../components/RunWarningsBanner';
@@ -212,11 +209,9 @@ export default function RunDetail() {
   // Only populated for local runs (remote gating skips this fetch).
   const [series, setSeries] = useState<UsageTimelinePoint[]>([]);
 
-  // Scoped findings for THIS run — lazy-loaded when the Findings tab is first
-  // opened. `null` = not yet loaded / loading.
-  const [findings, setFindings] = useState<FindingsResponse | null>(null);
-  const [findingsError, setFindingsError] = useState<string | null>(null);
-  const findingsRequestedRef = useRef(false);
+  // This run's finding count for the tab label, reported by the Findings tab
+  // once it has been opened. `null` = not known yet.
+  const [findingsCount, setFindingsCount] = useState<number | null>(null);
 
   // The children ledger is local-only (`/api/runs/:id/children` has no
   // `?host=`), so a remote run has no Children tab. `null` = not loaded yet;
@@ -318,9 +313,7 @@ export default function RunDetail() {
     setActionPending(false);
     setActionError(null);
     seededSelRef.current = false;
-    setFindings(null);
-    setFindingsError(null);
-    findingsRequestedRef.current = false;
+    setFindingsCount(null);
     setChildrenCount(null);
     setAutoflowCtx(null);
 
@@ -390,29 +383,6 @@ export default function RunDetail() {
   useEffect(() => {
     if (tab === 'children' && remote) setTab('transcript');
   }, [tab, remote]);
-
-  // Lazy-load this run's findings the first time the Findings tab is opened.
-  // Keyed on (id, tab); the ref guard ensures a single fetch per run id.
-  useEffect(() => {
-    if (!id || tab !== 'findings' || findingsRequestedRef.current) return;
-    findingsRequestedRef.current = true;
-    let cancelled = false;
-    setFindings(null);
-    setFindingsError(null);
-    api
-      .getFindings({ runId: id })
-      .then((res) => {
-        if (cancelled) return;
-        setFindings(res);
-      })
-      .catch((e: unknown) => {
-        if (cancelled) return;
-        setFindingsError(e instanceof Error ? e.message : 'Failed to load findings');
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [id, tab]);
 
   // ONE SSE subscription per open run — shared by graph + feed.
   // Thread the host param for remote runs.
@@ -853,7 +823,6 @@ export default function RunDetail() {
     );
   }
 
-  const findingsCount = findings?.findings.length ?? 0;
   const selectedLabel = selection ? selection.stepId : 'whole run';
   // The selected agent's identity: the chosen unit's (fan-out/panel/parallel
   // instances live on units) or the linear step's own. Display-only — the
@@ -1343,7 +1312,7 @@ export default function RunDetail() {
         <TabBar>
           <TabButton active={tab === 'transcript'} onClick={() => setTab('transcript')} icon={FileText} label="Transcript" />
           <TabButton active={tab === 'events'} onClick={() => setTab('events')} icon={ListOrdered} label="Events" />
-          <TabButton active={tab === 'findings'} onClick={() => setTab('findings')} icon={ShieldAlert} label={findingsCount > 0 ? `Findings (${findingsCount})` : 'Findings'} />
+          <TabButton active={tab === 'findings'} onClick={() => setTab('findings')} icon={ShieldAlert} label={findingsCount ? `Findings (${findingsCount})` : 'Findings'} />
           {!remote && (
             <TabButton
               active={tab === 'children'}
@@ -1446,35 +1415,15 @@ export default function RunDetail() {
         )}
         {tab === 'findings' && (
           <div className="h-full min-h-0 overflow-auto">
-            {findingsError ? (
-              <div className="rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
-                {findingsError}
-              </div>
-            ) : findings === null ? (
-              <p className="text-sm text-ink-dim">Loading findings…</p>
-            ) : findings.findings.length === 0 ? (
-              <div className="space-y-1">
-                <p className="text-sm text-ink-mute">No findings recorded for this run.</p>
-                <p className="text-note text-ink-mute">
-                  (findings require a workflow with a coverage target)
-                </p>
-              </div>
-            ) : (
-              <div className="space-y-4">
-                <FindingMetrics summary={findings.summary} />
-                <ListCard>
-                  {findings.findings.map((f) => (
-                    <FindingRow
-                      key={`${f.target_id}/${f.id}`}
-                      finding={f}
-                      project={f.project}
-                      targetId={f.target_id}
-                      wsId={f.ws_id}
-                    />
-                  ))}
-                </ListCard>
-              </div>
-            )}
+            <FindingsExplorer
+              scope={{ runId: id }}
+              exportTitle="Run findings report"
+              onCount={setFindingsCount}
+              empty={{
+                title: 'No findings recorded for this run.',
+                hint: '(findings require a workflow with a coverage target)',
+              }}
+            />
           </div>
         )}
         {tab === 'children' && !remote && (

@@ -670,6 +670,39 @@ describe('RunDetail shell', () => {
 
 // ---- Remote host gating tests --------------------------------------------
 
+describe('RunDetail — Findings tab', () => {
+  function stubApi(findings: FindingsResponse) {
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(GRAPH);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+    return vi.spyOn(api, 'getFindings').mockResolvedValue(findings);
+  }
+
+  it("shows the run's findings in the explorer and counts them on the tab", async () => {
+    const finding = {
+      codename: 'cobalt-harbor/heron#1', codename_derived: false,
+      id: 'f1', scope: null, summary: 'Default admin token accepted', severity: 'high',
+      evidence: { rationale: '' }, declared_by: null, declared_at: '2026-10-01T00:00:00Z',
+      ws_id: 'ws-1', project: 'shop-web', target_id: 'tgt',
+    };
+    const spy = stubApi({ ...FINDINGS, findings: [finding], facets: { severity: [{ value: 'high', count: 1 }] } });
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'Findings' }));
+    expect(await screen.findByText('Default admin token accepted')).toBeInTheDocument();
+    expect(spy).toHaveBeenCalledWith({ runId: 'run-1' });
+    expect(screen.getByRole('combobox', { name: 'Filter findings' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Findings (1)' })).toBeInTheDocument();
+  });
+
+  it('says why a run has none', async () => {
+    stubApi(FINDINGS);
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'Findings' }));
+    expect(await screen.findByText('No findings recorded for this run.')).toBeInTheDocument();
+    expect(screen.getByText('(findings require a workflow with a coverage target)')).toBeInTheDocument();
+  });
+});
+
 describe('RunDetail — remote host (?host=)', () => {
   it('calls getRunGraph and getRunUsageTimeline with host, renders graph and usage', async () => {
     const REMOTE_GRAPH: RunGraphResponse = {
