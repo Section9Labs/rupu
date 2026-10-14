@@ -1,28 +1,18 @@
 // Situation Room — the center live stream. A newest-first column of editorial
 // EventCards merged from the SSE/history event firehose and the REST findings
-// list. A search box + filter chips (Findings / Agent activity / Awaiting /
-// Warnings / Errors) narrow the stream via the pure `filterStreamCards`.
-// Follows the top as new events land unless the operator scrolls down to read
-// history; a "Load older events" sentinel pages the event backlog.
+// list, under the page's query line (the page filters the cards; this only
+// lays them out). Follows the top as new events land unless the operator
+// scrolls down to read history; a "Load older events" sentinel pages the
+// event backlog.
 
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { cn } from '../../lib/cn';
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import type { StreamCard } from '../../lib/situationRoom/cards';
-import { filterStreamCards, type StreamFilter } from '../../lib/situationRoom/filter';
-import { SearchInput } from '../ui/SearchInput';
 import EventCard from './EventCard';
-
-const FILTERS: { key: StreamFilter; label: string }[] = [
-  { key: 'all', label: 'All' },
-  { key: 'finding', label: 'Findings' },
-  { key: 'activity', label: 'Activity' },
-  { key: 'await', label: 'Awaiting' },
-  { key: 'warning', label: 'Warnings' },
-  { key: 'error', label: 'Errors' },
-];
 
 export default function EventStream({
   cards,
+  filtered,
+  queryBar,
   freshKeys,
   resolve,
   onApprove,
@@ -31,7 +21,11 @@ export default function EventStream({
   loadingOlder,
   onLoadOlder,
 }: {
+  /** The cards the query keeps, newest first. */
   cards: StreamCard[];
+  /** Whether a query narrows them. */
+  filtered: boolean;
+  queryBar: ReactNode;
   freshKeys: ReadonlySet<string>;
   resolve: (card: StreamCard) => { label?: string; branch?: string; workflow?: string };
   onApprove: (runId: string) => Promise<void>;
@@ -40,18 +34,8 @@ export default function EventStream({
   loadingOlder: boolean;
   onLoadOlder: () => void;
 }) {
-  const [filter, setFilter] = useState<StreamFilter>('all');
-  const [query, setQuery] = useState('');
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [follow, setFollow] = useState(true);
-
-  const counts = useMemo(() => {
-    const c: Record<string, number> = { finding: 0, await: 0, error: 0, warning: 0, activity: 0 };
-    for (const card of cards) if (card.group in c) c[card.group] += 1;
-    return c;
-  }, [cards]);
-
-  const shown = useMemo(() => filterStreamCards(cards, filter, query), [cards, filter, query]);
 
   // Pin to the top on new events while following.
   useLayoutEffect(() => {
@@ -75,50 +59,21 @@ export default function EventStream({
   return (
     <div className="flex flex-1 flex-col min-h-0 min-w-0">
       <div className="border-b border-border px-5 py-2.5">
-        <div className="flex items-center gap-3">
+        <div className="mb-2 flex items-center gap-3">
           <h2 className="m-0 text-ui font-semibold uppercase tracking-[0.14em] text-ink-dim">Live stream</h2>
           <span className="font-mono text-note tabular-nums text-ink-mute">{cards.length} events</span>
-          <div className="ml-auto w-44 sm:w-56">
-            <SearchInput value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search events…" />
-          </div>
         </div>
-        <div className="mt-2 flex flex-wrap gap-1.5">
-          {FILTERS.map((ff) => {
-            const d = ff.key === 'all' ? undefined : counts[ff.key];
-            const active = filter === ff.key;
-            return (
-              <button
-                key={ff.key}
-                type="button"
-                aria-pressed={active}
-                onClick={() => setFilter(ff.key)}
-                className={cn(
-                  'inline-flex items-center gap-1 rounded-md border px-2.5 py-1 text-meta font-medium transition-colors',
-                  active
-                    ? 'border-brand-500/40 bg-brand-500/10 text-brand-700'
-                    : 'border-border text-ink-dim hover:border-ink-mute hover:text-ink',
-                )}
-              >
-                {ff.label}
-                {d != null && <span className="font-mono tabular-nums opacity-70">{d}</span>}
-              </button>
-            );
-          })}
-        </div>
+        {queryBar}
       </div>
 
       <div ref={scrollRef} className="flex-1 min-h-0 overflow-auto px-5 py-4">
         <div className="mx-auto flex max-w-[820px] flex-col">
-          {shown.length === 0 ? (
+          {cards.length === 0 ? (
             <div className="p-10 text-center text-note text-ink-dim">
-              {cards.length === 0
-                ? 'Waiting for events…'
-                : query.trim()
-                  ? `No events match "${query.trim()}".`
-                  : 'Nothing matches this filter.'}
+              {filtered ? 'No events match the filter.' : 'Waiting for events…'}
             </div>
           ) : (
-            shown.map((card) => {
+            cards.map((card) => {
               const r = resolve(card);
               return (
                 <EventCard

@@ -6,7 +6,8 @@
 
 import { describe, it, expect } from 'vitest';
 import { cardFromEvent, cardFromFinding, unitKeyIndex } from './cards';
-import { filterStreamCards } from './filter';
+import { filterRows } from '../query/rows';
+import { EVENT_FIELDS, eventRow } from '../query/lists/events';
 import type {
   FindingOut,
   StepAwaitingApprovalEvent,
@@ -73,14 +74,18 @@ describe('cardFromEvent', () => {
     expect(withCtx.group).toBe('warning');
   });
 
-  it('warnings narrow with their own group chip and stay out of the error group', () => {
-    const warn = cardFromEvent(
-      { type: 'step_warning', run_id: 'r1', step_id: 'sweep', message: 'coverage gap' } as StepWarningEvent, 1, 'w')!;
-    const err = cardFromEvent({ type: 'step_failed', run_id: 'r1', step_id: 'x', error: 'boom' } as StepFailedEvent, 2, 'e')!;
-    expect(filterStreamCards([warn, err], 'warning', '').map((c) => c.key)).toEqual(['w']);
-    expect(filterStreamCards([warn, err], 'error', '').map((c) => c.key)).toEqual(['e']);
+  it('warnings narrow with their own group and stay out of the error group', () => {
+    const warnEv = { type: 'step_warning', run_id: 'r1', step_id: 'sweep', message: 'coverage gap' } as StepWarningEvent;
+    const errEv = { type: 'step_failed', run_id: 'r1', step_id: 'x', error: 'boom' } as StepFailedEvent;
+    const rows = [
+      eventRow(cardFromEvent(warnEv, 1, 'w')!, warnEv, {}),
+      eventRow(cardFromEvent(errEv, 2, 'e')!, errEv, {}),
+    ];
+    const keys = (q: string) => filterRows(rows, q, EVENT_FIELDS).rows.map((r) => r.card.key);
+    expect(keys('group:warning')).toEqual(['w']);
+    expect(keys('group:error')).toEqual(['e']);
     // the message is searchable
-    expect(filterStreamCards([warn, err], 'all', 'coverage gap').map((c) => c.key)).toEqual(['w']);
+    expect(keys('"coverage gap"')).toEqual(['w']);
   });
 
   it('an agent step_started is a Scanning activity card attributed to the agent', () => {

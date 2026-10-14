@@ -9,9 +9,16 @@
 //   • ProjectRoster — right: one card per project (GET /api/projects), status +
 //                   current action folded from the stream, findings pips.
 //
-// Events carry only `run_id` (no project), so we resolve run_id → workspace_id
-// lazily via GET /api/runs/:id and cache it. Nothing is fabricated: a source
-// that fails to load degrades to zeros / "idle", never demo data.
+// Live events carry only `run_id` (no project), so we resolve run_id →
+// workspace_id lazily via GET /api/runs/:id and cache it; history rows come
+// with their run's workflow, project and codename. Nothing is fabricated: a
+// source that fails to load degrades to zeros / "idle", never demo data.
+//
+// The stream filters through the query line (`lib/query/lists/events.ts`).
+// The server filters the history it pages (`GET /api/events?q=`), so a query
+// reaches events the unfiltered pages never loaded; the page applies the
+// same query to everything it holds (live frames, the unfiltered history,
+// findings). The roster and pulse always read the unfiltered stream.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -29,6 +36,9 @@ import PulseStrip from '../components/situationRoom/PulseStrip';
 import EventStream from '../components/situationRoom/EventStream';
 import ProjectRoster from '../components/situationRoom/ProjectRoster';
 import { UnscopedNote } from '../components/customers/UnscopedNote';
+import { ListQueryBar, useFilteredRows, useListQuery } from '../components/query/ListQueryBar';
+import { EVENT_FIELDS, EVENT_HISTORY_NOTE, HISTORY_ATTRIBUTION_KEYS, eventRow, findingRow, type EventRow } from '../lib/query/lists/events';
+import { parseQuery } from '../lib/findingQuery/grammar';
 
 const PAGE_SIZE = 200;
 const MAX_EVENTS = 5000;
@@ -55,17 +65,34 @@ function stableStringify(v: unknown): string {
   }
   return JSON.stringify(v);
 }
-/** Content identity excluding `ts`/`pos` — the SSE firehose replays a run's
- *  already-written events (different `ts`, no `pos`), so those can't be part
- *  of identity. Used for history↔live dedup and as the stable React key. */
+/** Keys a history row carries that a live frame of the same event lacks. */
+const NOT_IDENTITY = new Set<string>(['ts', 'pos', ...HISTORY_ATTRIBUTION_KEYS]);
+
+/** Content identity excluding `ts`/`pos` and the history row's run
+ *  attribution — the SSE firehose replays a run's already-written events
+ *  (different `ts`, no `pos`, no attribution), so those can't be part of
+ *  identity. Used for history↔live dedup and as the stable React key. */
 function identityOf(ev: RunEvent): string {
   const raw = ev as Record<string, unknown>;
   const rest: Record<string, unknown> = {};
   for (const k of Object.keys(raw)) {
-    if (k === 'ts' || k === 'pos') continue;
+    if (NOT_IDENTITY.has(k)) continue;
     rest[k] = raw[k];
   }
   return stableStringify(rest);
+}
+
+/** History rows as items, skipping any `seen` already holds (and adding the
+ *  rest to it). */
+function tagRows(rows: RunEvent[], seen: Set<string>): EventItem[] {
+  const out: EventItem[] = [];
+  for (const ev of rows) {
+    const id = identityOf(ev);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push({ key: id, ts: tsOf(ev) ?? Date.now(), event: ev });
+  }
+  return out;
 }
 function tsOf(ev: RunEvent): number | undefined {
   const raw = ev as Record<string, unknown>;
@@ -118,18 +145,39 @@ export default function Events() {
     api.getEvents(PAGE_SIZE).then((rows) => {
       if (cancelled) return;
       seenRef.current = new Set();
-      const tagged: EventItem[] = [];
-      for (const ev of rows) {
-        const id = identityOf(ev);
-        if (seenRef.current.has(id)) continue;
-        seenRef.current.add(id);
-        tagged.push({ key: id, ts: tsOf(ev) ?? Date.now(), event: ev });
-      }
-      setItems(tagged);
+      setItems(tagRows(rows, seenRef.current));
       setHasMoreOlder(rows.length >= PAGE_SIZE);
     }).catch(() => {/* live SSE still populates the page */});
     return () => { cancelled = true; };
   }, []);
+
+  // ── the query, and the history the server filters by it ──
+  const [q, setQ] = useListQuery();
+  const query = useMemo(() => (q.trim() && parseQuery(q, EVENT_FIELDS).ok ? q : null), [q]);
+  const queryRef = useRef(query);
+  queryRef.current = query;
+  const [qItems, setQItems] = useState<EventItem[]>([]);
+  const qItemsRef = useRef<EventItem[]>([]);
+  qItemsRef.current = qItems;
+  const qSeenRef = useRef<Set<string>>(new Set());
+  const [qHasMoreOlder, setQHasMoreOlder] = useState(false);
+  const [qError, setQError] = useState<string | null>(null);
+  useEffect(() => {
+    qSeenRef.current = new Set();
+    setQItems([]);
+    setQHasMoreOlder(false);
+    setQError(null);
+    if (query === null) return;
+    let cancelled = false;
+    api.getEvents(PAGE_SIZE, undefined, undefined, undefined, query).then((rows) => {
+      if (cancelled) return;
+      setQItems(tagRows(rows, qSeenRef.current));
+      setQHasMoreOlder(rows.length >= PAGE_SIZE);
+    }).catch((e: unknown) => {
+      if (!cancelled) setQError(e instanceof Error ? e.message : String(e));
+    });
+    return () => { cancelled = true; };
+  }, [query]);
 
   // ── live SSE firehose ──
   useEffect(() => {
@@ -243,57 +291,100 @@ export default function Events() {
     }
   }, [items, runToWs, runStatus, dashboard]);
 
-  // ── load older event history (paged) ──
+  // ── load older event history (paged; the query's own pages under one) ──
   const loadOlder = useCallback(async () => {
-    const cur = itemsRef.current;
+    const q = queryRef.current;
+    const cur = q === null ? itemsRef.current : qItemsRef.current;
+    const setMore = q === null ? setHasMoreOlder : setQHasMoreOlder;
     if (cur.length === 0) return;
     const oldest = cur[cur.length - 1].event;
     const oldestTs = tsOf(oldest);
-    if (oldestTs == null) { setHasMoreOlder(false); return; }
+    if (oldestTs == null) { setMore(false); return; }
     setLoadingOlder(true);
     try {
-      const older = await api.getEvents(PAGE_SIZE, oldestTs, oldest.run_id, posOf(oldest));
-      if (older.length === 0) { setHasMoreOlder(false); return; }
-      const tagged: EventItem[] = [];
-      for (const ev of older) {
-        const id = identityOf(ev);
-        if (seenRef.current.has(id)) continue;
-        seenRef.current.add(id);
-        tagged.push({ key: id, ts: tsOf(ev) ?? Date.now(), event: ev });
+      const older = await api.getEvents(PAGE_SIZE, oldestTs, oldest.run_id, posOf(oldest), q ?? undefined);
+      if (q !== queryRef.current) return;
+      if (older.length === 0) { setMore(false); return; }
+      if (q === null) {
+        const tagged = tagRows(older, seenRef.current);
+        setItems((prev) => [...prev, ...tagged]);
+      } else {
+        const tagged = tagRows(older, qSeenRef.current);
+        setQItems((prev) => [...prev, ...tagged]);
       }
-      setItems((prev) => [...prev, ...tagged]);
-      if (older.length < PAGE_SIZE) setHasMoreOlder(false);
+      if (older.length < PAGE_SIZE) setMore(false);
     } catch {/* operator can scroll to retry */}
     finally { setLoadingOlder(false); }
   }, []);
 
   // ── derived view models ──
-  const eventCards = useMemo(() => {
-    const out: StreamCard[] = [];
-    const evs = items.map((i) => i.event);
-    const ctx = { crewByRun: runToCodename, unitKeys: unitKeyIndex(evs), agentUnits: agentUnitIndex(evs) };
-    for (const { key, ts, event } of items) {
-      const c = cardFromEvent(event, ts, key, ctx);
-      if (c) out.push(c);
-    }
-    return out;
-  }, [items, runToCodename]);
+  const wsById = useMemo(() => {
+    const m = new Map<string, ProjectRow>();
+    for (const p of projects) m.set(p.ws_id, p);
+    return m;
+  }, [projects]);
 
-  // The stream shows the most-recent findings only (getFindings can return
-  // hundreds across all projects); the roster + pulse still count the full set.
-  const findingCards = useMemo(
-    () =>
-      [...findings]
-        .sort((a, b) => Date.parse(b.declared_at) - Date.parse(a.declared_at))
-        .slice(0, STREAM_FINDINGS_CAP)
-        .map(cardFromFinding),
+  // What history rows said about their runs, for the live frames of the
+  // same runs (which carry no attribution of their own).
+  const historyAttribution = useMemo(() => {
+    const m = new Map<string, { project?: string; workflow?: string; runCodename?: string }>();
+    for (const { event } of [...items, ...qItems]) {
+      if (m.has(event.run_id)) continue;
+      const raw = event as Record<string, unknown>;
+      const str = (v: unknown) => (typeof v === 'string' && v !== '' ? v : undefined);
+      const a = { project: str(raw.project), workflow: str(raw.workflow), runCodename: str(raw.run_codename) };
+      if (a.project || a.workflow || a.runCodename) m.set(event.run_id, a);
+    }
+    return m;
+  }, [items, qItems]);
+
+  const rowsOf = useCallback(
+    (list: EventItem[]): EventRow[] => {
+      const out: EventRow[] = [];
+      const evs = list.map((i) => i.event);
+      const ctx = { crewByRun: runToCodename, unitKeys: unitKeyIndex(evs), agentUnits: agentUnitIndex(evs) };
+      for (const { key, ts, event } of list) {
+        const c = cardFromEvent(event, ts, key, ctx);
+        if (!c) continue;
+        const run = c.runId;
+        const ws = run ? runToWs.get(run) : undefined;
+        const learned = run ? historyAttribution.get(run) : undefined;
+        out.push(
+          eventRow(c, event, {
+            project: learned?.project ?? (ws ? wsById.get(ws)?.name : undefined),
+            workflow: learned?.workflow ?? (run ? runToWorkflow.get(run) : undefined),
+            runCodename: learned?.runCodename ?? (run ? runToCodename.get(run) : undefined),
+          }),
+        );
+      }
+      return out;
+    },
+    [runToCodename, runToWs, runToWorkflow, wsById, historyAttribution],
+  );
+
+  const eventRows = useMemo(() => rowsOf(items), [rowsOf, items]);
+  // Under a query: the server's matches merged with everything held.
+  const streamEventRows = useMemo(() => {
+    if (query === null) return eventRows;
+    const fromServer = new Set(qItems.map((i) => i.key));
+    return [...rowsOf(qItems), ...eventRows.filter((r) => !fromServer.has(r.card.key))];
+  }, [query, eventRows, rowsOf, qItems]);
+
+  const findingsByDate = useMemo(
+    () => [...findings].sort((a, b) => Date.parse(b.declared_at) - Date.parse(a.declared_at)).map(cardFromFinding),
     [findings],
   );
-
-  const cards = useMemo(
-    () => [...eventCards, ...findingCards].sort((a, b) => b.ts - a.ts),
-    [eventCards, findingCards],
+  // The stream shows the most-recent findings only (getFindings can return
+  // hundreds across all projects); a query searches every one. The roster +
+  // pulse count the full set either way.
+  const findingRows = useMemo(
+    () => (query === null ? findingsByDate.slice(0, STREAM_FINDINGS_CAP) : findingsByDate).map(findingRow),
+    [query, findingsByDate],
   );
+
+  const allRows = useMemo(() => [...streamEventRows, ...findingRows], [streamEventRows, findingRows]);
+  const { rows: matched, error: queryError, facets } = useFilteredRows(allRows, q, EVENT_FIELDS);
+  const cards = useMemo(() => matched.map((r) => r.card).sort((a, b) => b.ts - a.ts), [matched]);
 
   const activity = useMemo(
     () => reconcileActivity(deriveActivity(items), runStatus),
@@ -303,12 +394,6 @@ export default function Events() {
     () => buildRoster(projects, runToWs, activity, findings),
     [projects, runToWs, activity, findings],
   );
-
-  const wsById = useMemo(() => {
-    const m = new Map<string, ProjectRow>();
-    for (const p of projects) m.set(p.ws_id, p);
-    return m;
-  }, [projects]);
 
   const resolveProject = useCallback(
     (card: StreamCard): { label?: string; branch?: string; workflow?: string } => {
@@ -324,7 +409,7 @@ export default function Events() {
     [runToWs, runToWorkflow, wsById],
   );
 
-  const errors = useMemo(() => cards.filter((c) => c.group === 'error').length, [cards]);
+  const errors = useMemo(() => eventRows.filter((r) => r.card.group === 'error').length, [eventRows]);
   const projectsLiveCount = useMemo(() => roster.filter((r) => r.status !== 'idle').length, [roster]);
 
   const vitals = useMemo(
@@ -350,11 +435,28 @@ export default function Events() {
       <div className="flex flex-1 min-h-0">
         <EventStream
           cards={cards}
+          filtered={q.trim() !== ''}
+          queryBar={
+            <ListQueryBar
+              className="mb-0"
+              value={q}
+              onChange={setQ}
+              fields={EVENT_FIELDS}
+              facets={facets}
+              error={queryError}
+              alerts={[
+                ...(query !== null ? [EVENT_HISTORY_NOTE] : []),
+                ...(qError ? [`The filtered history couldn't load: ${qError}`] : []),
+              ]}
+              label="Filter events"
+              placeholder="Filter events… e.g. group:error workflow:nightly · agent:recon since:1h"
+            />
+          }
           freshKeys={freshKeys}
           resolve={resolveProject}
           onApprove={onApprove}
           onReject={onReject}
-          hasMoreOlder={hasMoreOlder}
+          hasMoreOlder={query === null ? hasMoreOlder : qHasMoreOlder}
           loadingOlder={loadingOlder}
           onLoadOlder={loadOlder}
         />
