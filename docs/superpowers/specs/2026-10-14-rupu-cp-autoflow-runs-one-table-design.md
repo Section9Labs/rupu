@@ -109,9 +109,15 @@ also serves `/api/runs` to an HTTP peer's coordinator) and `rupu run list`
 
 ### `GET /api/runs/autoflows/runs`
 
-Same parameters as `/api/runs/workflows` (`lifecycle`, `host`, `since` /
-`until`, `customer`, `offset` / `limit`), plus `workflow=<name>` until the
-query bar's `workflow:` field replaces it.
+Same parameters as `/api/runs/workflows` on the unified query line (`q`,
+`facets`, `host`, `customer`, `offset` / `limit`). `q` uses the autoflow-runs
+registry (`crates/rupu-cp/src/query/autoflow_runs.rs`): every workflow-run
+field (the same consts) plus `issue:`, `pr:any|none`, `kind:run|attempt` and
+`error:` (an attempt's failure text). A row without the `autoflow` key can't
+report `issue` / `pr` / the list's own scope, so that host is unfilterable
+(501 on `?host=`, named in `X-Rupu-Hosts-Unfilterable` on the fan-out).
+(Implemented on top of the unified-filter stack; the earlier `workflow=`
+parameter was retired in favour of a `workflow:` term.)
 
 Note: `/api/runs/workflows` lists MANUAL runs only (`workflow_only` drops any
 run with an `event` or `source_wake_id`), so autoflow runs never appear on
