@@ -1345,9 +1345,12 @@ struct AgentiflowNetflowScope {
     meta: RunMetaIndex,
 }
 
-/// `None` when `id` names no agentiflow. Disk reads only: run it through
+/// `None` when `id` names no agentiflow (or can't name one). Disk reads only: run it through
 /// [`run_blocking`].
 fn agentiflow_netflow_scope(s: &AppState, id: &str) -> Option<AgentiflowNetflowScope> {
+    if !crate::api::agentiflows::valid_run_id(id) {
+        return None;
+    }
     let run_dir = rupu_agentiflow::agentiflow_dir(&s.global_dir).join(id);
     let record = rupu_agentiflow::AgentiflowRecord::read(&run_dir).ok()?;
     let runs = crate::api::agentiflows::flow_runs(s, &run_dir);

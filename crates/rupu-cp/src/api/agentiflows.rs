@@ -253,7 +253,7 @@ struct LeadTranscriptDto {
 
 /// A valid agentiflow run id: `af_` + `[A-Za-z0-9_-]`, bounded. Anything else
 /// can neither name a run directory nor escape `agentiflows/`.
-fn valid_run_id(id: &str) -> bool {
+pub(crate) fn valid_run_id(id: &str) -> bool {
     id.len() <= MAX_RUN_ID_LEN
         && id.len() > RUN_DIR_PREFIX.len()
         && id.starts_with(RUN_DIR_PREFIX)

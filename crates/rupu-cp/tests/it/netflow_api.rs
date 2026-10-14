@@ -3121,3 +3121,26 @@ async fn an_unknown_agentiflow_is_a_404() {
     let (status, _) = get_json(addr, "/api/netflow/explorer?scope=agentiflow:af_missing").await;
     assert_eq!(status, 404);
 }
+
+#[tokio::test]
+async fn an_agentiflow_id_cannot_reach_outside_the_agentiflows_dir() {
+    let global = tempfile::tempdir().unwrap();
+    let run_dir = seed_agentiflow_record(global.path());
+    let outside = global.path().join("af_escaped");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::copy(
+        run_dir.join("agentiflow.json"),
+        outside.join("agentiflow.json"),
+    )
+    .unwrap();
+    let addr = serve(new_state(global.path())).await;
+
+    let (status, _) = get_json(
+        addr,
+        &format!("/api/netflow/explorer?scope=agentiflow:{AF_ID}"),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, _) = get_json(addr, "/api/netflow/explorer?scope=agentiflow:../af_escaped").await;
+    assert_eq!(status, 404);
+}
