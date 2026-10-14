@@ -499,6 +499,15 @@ pub struct RejectCleanupMarker {
 }
 
 impl RunRecord {
+    /// The transcript of a standalone agent run (`agent:<name>`), which
+    /// `rupu run` writes as `<transcript_dir>/<run id>.jsonl`. `None` for a
+    /// workflow run, whose transcripts are its steps'.
+    pub fn agent_run_transcript(&self) -> Option<PathBuf> {
+        self.workflow_name
+            .starts_with(AGENT_RUN_PREFIX)
+            .then(|| self.transcript_dir.join(format!("{}.jsonl", self.id)))
+    }
+
     /// The canonical awaiting-set, normalizing a legacy on-disk shape
     /// (empty `awaiting`, but `awaiting_step_id: Some(_)` — every
     /// `run.json` written before this field existed, and any record a

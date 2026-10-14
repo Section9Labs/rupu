@@ -18,7 +18,8 @@ use axum::{
     Json, Router,
 };
 use rupu_orchestrator::{
-    executor::Event, runs::RunStore, workflow_edges, workflow_has_explicit_edges, Workflow,
+    executor::Event, runs::RunStore, workflow_edges, workflow_has_explicit_edges,
+    StepResultRecord, Workflow,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
@@ -97,7 +98,10 @@ fn build_run_graph_json(
     };
 
     // 4. Step results and unit checkpoints — missing files = empty vecs.
-    let step_results = store.read_step_results(id).unwrap_or_default();
+    let mut step_results = store.read_step_results(id).unwrap_or_default();
+    if step_results.is_empty() {
+        step_results.extend(agent_run_result(&run));
+    }
     let checkpoints = store.read_unit_checkpoints(id).unwrap_or_default();
 
     // 5. Merge in units that exist only in the event stream.
@@ -712,6 +716,33 @@ pub fn agent_run_dag(workflow_name: &str) -> StepDag {
         }],
         edges: vec![],
     }
+}
+
+/// The step result of [`agent_run_dag`]'s node: a bare agent run records
+/// none, and no events, so this is the only way its node reaches the
+/// transcript `rupu run` wrote. `None` for a workflow run.
+fn agent_run_result(run: &rupu_orchestrator::RunRecord) -> Option<StepResultRecord> {
+    Some(StepResultRecord {
+        step_id: "agent".to_string(),
+        run_id: run.id.clone(),
+        transcript_path: run.agent_run_transcript()?,
+        output: run.final_output.clone().unwrap_or_default(),
+        success: run.status == rupu_orchestrator::RunStatus::Completed,
+        skipped: false,
+        rendered_prompt: String::new(),
+        kind: Default::default(),
+        items: Vec::new(),
+        findings: Vec::new(),
+        iterations: 0,
+        resolved: true,
+        finished_at: run.finished_at.unwrap_or(run.started_at),
+        loop_iteration: None,
+        run_outcome: None,
+        host: None,
+        codename: None,
+        error: run.error_message.clone(),
+        cause: run.cause.clone(),
+    })
 }
 
 /// Synthesize a single-node [`StepDag`] for a [`RunLocation::Unpersisted`]
@@ -1457,6 +1488,58 @@ steps:
         assert_eq!(steps[0]["kind"], "step");
         assert_eq!(steps[0]["agent"], "oracle-assessor-glm");
         assert_eq!(body["run"]["id"], "run_agent");
+    }
+
+    /// A bare agent run records no step results and no events, so its one
+    /// node used to have no transcript ("No transcript yet for agent") however
+    /// many turns it ran. The node reads the transcript `rupu run` wrote.
+    #[tokio::test]
+    async fn run_graph_for_agent_run_points_its_node_at_the_transcript() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        )
+        .with_workspace_dir(tmp.path().to_path_buf());
+        let mut ok = run_record("run_ok", "agent:skill-author");
+        ok.final_output = Some("wrote four files".to_string());
+        s.run_store.create(ok, "").unwrap();
+        let mut failed = run_record("run_failed", "agent:skill-author");
+        failed.status = rupu_orchestrator::RunStatus::Failed;
+        failed.error_message = Some("max turns".to_string());
+        s.run_store.create(failed, "").unwrap();
+
+        let graph = |id: &str| {
+            let s = s.clone();
+            let id = id.to_string();
+            async move {
+                run_graph(State(s), Path(id), Query(RunDetailQuery { host: None }))
+                    .await
+                    .expect("agent-run graph")
+                    .0
+            }
+        };
+
+        let ok = graph("run_ok").await;
+        let results = ok["step_results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["step_id"], "agent");
+        assert_eq!(
+            results[0]["transcript_path"],
+            "/tmp/proj/.rupu/transcripts/run_ok.jsonl"
+        );
+        assert_eq!(results[0]["success"], true);
+        assert_eq!(results[0]["output"], "wrote four files");
+
+        let failed = graph("run_failed").await;
+        let results = failed["step_results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0]["transcript_path"],
+            "/tmp/proj/.rupu/transcripts/run_failed.jsonl"
+        );
+        assert_eq!(results[0]["success"], false);
+        assert_eq!(results[0]["error"], "max turns");
     }
 
     /// A real workflow run still parses its snapshot into the full DAG.
