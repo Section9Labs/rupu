@@ -28,7 +28,9 @@ pub struct Args {
     /// See `docs/scm.md#target-syntax` for the full grammar.
     /// Distinguished from `prompt` by parsing as a RunTarget.
     pub target: Option<String>,
-    /// Optional initial user message. Defaults to "go" if omitted.
+    /// Optional initial user message. Defaults to "go" if omitted. Leading
+    /// `/skill` tokens (`/pdf summarize it`) invoke those skills: their
+    /// instructions go ahead of the rest of the prompt.
     pub prompt: Option<String>,
     /// Explicit prompt flag (takes precedence over the positional `prompt`).
     /// Use this when the prompt should not be confused with a target string.
@@ -1100,7 +1102,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     };
     paths::ensure_dir(&transcripts)?;
     let transcript_path = transcripts.join(format!("{run_id}.jsonl"));
-    let launch_args = launch_argv(&args, &run_id);
+    let mut launch_args = launch_argv(&args, &run_id);
 
     // Every `rupu run` streams its coverage to a run-scoped file so a
     // coordinator can collect a placed unit's findings (spec
@@ -1114,7 +1116,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     // With `--model`/`--provider` on this command line, a run that failed on
     // an outcome is continued too (`prepare_recovery_continuation`); the
     // third element is that outcome, `None` for an interrupted run.
-    let launch_skills = (args.skills.clone(), args.preload_skills.clone());
+    let mut launch_skills = (args.skills.clone(), args.preload_skills.clone());
     let mut resume_from: Option<ResumeFrom> = match args.continue_from.as_deref().zip(prev_path) {
         None => None,
         Some((prev, prev_path)) => {
@@ -1290,6 +1292,35 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             },
         };
 
+        // Leading `/skill` tokens invoke those skills (as a session turn
+        // takes them): each joins the launch's skills, recorded as a
+        // `--skill` so `--continue` keeps it, and its body goes ahead of the
+        // rest of the prompt below. A refusal fails the run with the
+        // launch's other skill failures.
+        let skill_dirs =
+            rupu_skills::LayerDirs::for_layers(&global, project_agents_parent.as_deref())
+                .with_overlay(skill_overlay.clone());
+        let (slash, slash_failure) =
+            match rupu_runtime::assembly::resolve_slash_skills(&skill_dirs, &[], &user_message)
+                .await
+            {
+                Ok(turn) => (turn, None),
+                Err(e) => (
+                    rupu_skills::SlashTurn {
+                        invoked: Vec::new(),
+                        prompt: user_message.clone(),
+                    },
+                    Some(e),
+                ),
+            };
+        for f in &slash.invoked {
+            let entry = format!("{}:{}", f.layer.as_str(), f.name);
+            if !launch_skills.0.contains(&entry) {
+                launch_args.extend(["--skill".to_string(), entry.clone()]);
+                launch_skills.0.push(entry);
+            }
+        }
+
         // `--provider` / `--model` override the agent and the config. A
         // `## Run target` section joins the system prompt when a target is
         // set.
@@ -1321,7 +1352,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             .resolve_skills_for_launch(&spec, &overrides, &transcript_path)
             .await
         {
-            Ok(skills) => (skills, None),
+            Ok(skills) => (skills, slash_failure),
             Err(e) => (None, Some(e)),
         };
 
@@ -1534,7 +1565,17 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             )
         };
 
-        let mut prompt = rupu_agent::UserTurn::new(user_message);
+        let mut prompt = rupu_agent::UserTurn::new(slash.prompt.clone());
+        if !slash.invoked.is_empty() && skills_failure.is_none() {
+            let (skills, invoked, text) = (resolved_skills.clone(), slash.invoked, slash.prompt);
+            let (message, loads) = tokio::task::spawn_blocking(move || {
+                rupu_agent::operator_turn(skills.as_deref(), &invoked, &text)
+            })
+            .await
+            .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))?;
+            prompt.message = message;
+            prompt.operator_loads = loads;
+        }
         match resume_from.take() {
             None => {}
             // A failed run continued on another model: the note says why the

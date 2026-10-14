@@ -746,3 +746,74 @@ fn with_frozen_reports_a_same_name_entry_from_the_other_layer_as_a_conflict() {
     let project_root = fs::canonicalize(p.path().join("skills/x")).unwrap();
     assert!(!merged.read_roots().contains(&project_root));
 }
+
+#[test]
+fn a_prompts_leading_slash_tokens_invoke_installed_skills() {
+    let g = tempfile::tempdir().unwrap();
+    let p = tempfile::tempdir().unwrap();
+    write_skill(&g.path().join("skills"), "pdf", "pdf", "d");
+    write_skill(&p.path().join("skills"), "notes", "notes", "d");
+    write_skill(&g.path().join("skills"), "both", "both", "d");
+    write_skill(&p.path().join("skills"), "both", "both", "d");
+    let cat = catalog(g.path(), Some(p.path()));
+    let slash = |prompt: &str| {
+        let t = rupu_skills::resolve_slash(&cat, &[], prompt).unwrap();
+        let names: Vec<String> = t
+            .invoked
+            .iter()
+            .map(|f| format!("{}:{}", f.layer.as_str(), f.name))
+            .collect();
+        (names, t.prompt)
+    };
+    let none: Vec<String> = Vec::new();
+
+    assert_eq!(
+        slash("/pdf summarize\nthe report"),
+        (
+            vec!["global:pdf".to_string()],
+            "summarize\nthe report".to_string()
+        )
+    );
+    assert_eq!(
+        slash("  /pdf /notes  go"),
+        (
+            vec!["global:pdf".to_string(), "project:notes".to_string()],
+            "go".to_string()
+        )
+    );
+    assert_eq!(
+        slash("/pdf"),
+        (vec!["global:pdf".to_string()], String::new())
+    );
+    assert_eq!(
+        slash("/project:both /pdf /pdf x"),
+        (
+            vec!["project:both".to_string(), "global:pdf".to_string()],
+            "x".to_string()
+        )
+    );
+    // A token that names no installed skill starts the prompt, unchanged.
+    assert_eq!(
+        slash("/tmp is full"),
+        (none.clone(), "/tmp is full".to_string())
+    );
+    assert_eq!(
+        slash("/pdf /tmp is full"),
+        (vec!["global:pdf".to_string()], "/tmp is full".to_string())
+    );
+    for text in ["/etc/passwd leaks", "/* all", "look at /pdf", "/Pdf x", ""] {
+        assert_eq!(slash(text), (none.clone(), text.to_string()), "{text:?}");
+    }
+
+    let amb = rupu_skills::resolve_slash(&cat, &[], "/both x")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        amb.contains("both the global and the project layer"),
+        "{amb}"
+    );
+    let twice = rupu_skills::resolve_slash(&cat, &[], "/global:both /project:both x")
+        .unwrap_err()
+        .to_string();
+    assert!(twice.contains("both"), "{twice}");
+}
