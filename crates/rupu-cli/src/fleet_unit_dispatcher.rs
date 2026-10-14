@@ -4014,6 +4014,7 @@ steps:
             reason: reason.map(str::to_string),
             ledgers: vec!["run_x".into()],
             at: chrono::Utc::now(),
+            bytes: 0,
         }
     }
 
