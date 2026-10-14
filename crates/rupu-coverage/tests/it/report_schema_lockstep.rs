@@ -26,6 +26,7 @@ fn rust_accepts(v: &Value) -> bool {
             &r,
             &ValidateCtx {
                 known_finding_ids: &[],
+                scope: None,
                 max_bytes: 262_144,
             },
         )
@@ -74,6 +75,31 @@ fn engagement_blocks_and_classifications_accepted_by_both() {
     });
     assert!(rust_accepts(&v), "rust rejected blocks+classifications");
     assert!(schema_accepts(&v), "schema rejected blocks+classifications");
+}
+
+#[test]
+fn every_block_kind_accepted_by_both() {
+    let v = mutated(|v| {
+        v["blocks"] = json!([
+            { "kind": "text", "text": "t" },
+            { "kind": "code_slice", "file": "src/a.rs", "excerpt": "x", "lang": "rust" },
+            { "kind": "code_slice", "excerpt": "x" },
+            { "kind": "diff", "diff": "-a\n+b" },
+            { "kind": "table", "headers": ["h"], "rows": [["r"]] },
+            { "kind": "image", "artifact": { "path": "shot.png" }, "caption": "c" },
+            { "kind": "hexdump", "base": 4096, "artifact": { "path": "dump.bin" }, "rendered": "00" },
+            { "kind": "disasm", "arch": "x86_64", "listing": [
+                { "address": 4096, "bytes": "90", "mnemonic": "nop" },
+                { "address": 4097, "bytes": "c3", "mnemonic": "ret", "ops": "" }
+            ] },
+            { "kind": "decompile", "lang": "c", "listing": "int f();" },
+            { "kind": "http_exchange", "request": "GET /", "response": "200" },
+            { "kind": "scan_output", "tool": "nmap", "output": "open" },
+            { "kind": "pcap_ref", "artifact": { "path": "cap.pcap" }, "summary": "s" },
+        ]);
+    });
+    assert!(rust_accepts(&v), "rust rejected a block kind");
+    assert!(schema_accepts(&v), "schema rejected a block kind");
 }
 
 #[test]
@@ -128,6 +154,41 @@ fn invalid_cases_rejected_by_both() {
         (
             "classification with empty system",
             mutated(|v| v["classifications"] = json!([{ "system": "", "id": "CVE-1" }])),
+        ),
+        (
+            "unknown block field",
+            mutated(|v| {
+                v["blocks"] = json!([{ "kind": "scan_output", "tool": "nmap", "output": "o", "exit_code": 0 }])
+            }),
+        ),
+        (
+            "block field from another kind",
+            mutated(
+                |v| v["blocks"] = json!([{ "kind": "http_exchange", "request": "GET /", "response": "200", "tool": "curl" }]),
+            ),
+        ),
+        (
+            "block missing its field",
+            mutated(|v| v["blocks"] = json!([{ "kind": "scan_output", "tool": "nmap" }])),
+        ),
+        (
+            "unknown block kind",
+            mutated(|v| v["blocks"] = json!([{ "kind": "video", "text": "t" }])),
+        ),
+        (
+            "unknown disasm line field",
+            mutated(|v| {
+                v["blocks"] = json!([{ "kind": "disasm", "arch": "arm", "listing": [
+                    { "address": 0, "bytes": "00", "mnemonic": "nop", "comment": "c" }
+                ] }])
+            }),
+        ),
+        (
+            "unknown block artifact field",
+            mutated(|v| {
+                v["blocks"] =
+                    json!([{ "kind": "image", "artifact": { "path": "a.png", "url": "u" } }])
+            }),
         ),
         (
             "classification missing id",

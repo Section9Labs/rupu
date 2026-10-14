@@ -10,5 +10,6 @@ mod determinism;
 mod end_to_end;
 mod finding_query_lockstep;
 mod finding_tags;
+mod report_finding_strict;
 mod report_schema_lockstep;
 mod verify_finding;

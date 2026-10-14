@@ -64,30 +64,308 @@
           "type": "string"
         },
         "blocks": {
-          "description": "Typed evidence blocks (engagement profiles): each an object with a 'kind' tag and that kind's fields, e.g. {\"kind\":\"scan_output\",\"tool\":\"nmap\",\"output\":\"...\"} or {\"kind\":\"http_exchange\",\"request\":\"...\",\"response\":\"...\"}. Optional; additive to 'evidence'.",
+          "description": "Typed evidence blocks (engagement profiles): each an object with a 'kind' tag and exactly that kind's fields, e.g. {\"kind\":\"scan_output\",\"tool\":\"nmap\",\"output\":\"...\"} or {\"kind\":\"http_exchange\",\"request\":\"...\",\"response\":\"...\"}. Optional; additive to 'evidence'.",
           "items": {
-            "properties": {
-              "kind": {
-                "enum": [
-                  "text",
-                  "code_slice",
-                  "diff",
-                  "table",
-                  "image",
-                  "hexdump",
-                  "disasm",
-                  "decompile",
-                  "http_exchange",
-                  "scan_output",
-                  "pcap_ref"
+            "anyOf": [
+              {
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "text"
+                    ],
+                    "type": "string"
+                  },
+                  "text": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "text"
                 ],
-                "type": "string"
+                "type": "object"
+              },
+              {
+                "properties": {
+                  "excerpt": {
+                    "type": "string"
+                  },
+                  "file": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "enum": [
+                      "code_slice"
+                    ],
+                    "type": "string"
+                  },
+                  "lang": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "excerpt"
+                ],
+                "type": "object"
+              },
+              {
+                "properties": {
+                  "diff": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "enum": [
+                      "diff"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "diff"
+                ],
+                "type": "object"
+              },
+              {
+                "properties": {
+                  "headers": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "kind": {
+                    "enum": [
+                      "table"
+                    ],
+                    "type": "string"
+                  },
+                  "rows": {
+                    "items": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "headers",
+                  "rows"
+                ],
+                "type": "object"
+              },
+              {
+                "properties": {
+                  "artifact": {
+                    "description": "The file this block shows, as a workspace-relative path; rupu stores it with the finding. Supply only 'path'.",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "path"
+                    ],
+                    "type": "object"
+                  },
+                  "caption": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "enum": [
+                      "image"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "artifact"
+                ],
+                "type": "object"
+              },
+              {
+                "properties": {
+                  "artifact": {
+                    "description": "The file this block shows, as a workspace-relative path; rupu stores it with the finding. Supply only 'path'.",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "path"
+                    ],
+                    "type": "object"
+                  },
+                  "base": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "kind": {
+                    "enum": [
+                      "hexdump"
+                    ],
+                    "type": "string"
+                  },
+                  "rendered": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "base",
+                  "artifact"
+                ],
+                "type": "object"
+              },
+              {
+                "properties": {
+                  "arch": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "enum": [
+                      "disasm"
+                    ],
+                    "type": "string"
+                  },
+                  "listing": {
+                    "items": {
+                      "properties": {
+                        "address": {
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "bytes": {
+                          "type": "string"
+                        },
+                        "mnemonic": {
+                          "type": "string"
+                        },
+                        "ops": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "address",
+                        "bytes",
+                        "mnemonic"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "arch",
+                  "listing"
+                ],
+                "type": "object"
+              },
+              {
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "decompile"
+                    ],
+                    "type": "string"
+                  },
+                  "lang": {
+                    "type": "string"
+                  },
+                  "listing": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "lang",
+                  "listing"
+                ],
+                "type": "object"
+              },
+              {
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "http_exchange"
+                    ],
+                    "type": "string"
+                  },
+                  "request": {
+                    "type": "string"
+                  },
+                  "response": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "request",
+                  "response"
+                ],
+                "type": "object"
+              },
+              {
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "scan_output"
+                    ],
+                    "type": "string"
+                  },
+                  "output": {
+                    "type": "string"
+                  },
+                  "tool": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "tool",
+                  "output"
+                ],
+                "type": "object"
+              },
+              {
+                "properties": {
+                  "artifact": {
+                    "description": "The file this block shows, as a workspace-relative path; rupu stores it with the finding. Supply only 'path'.",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "path"
+                    ],
+                    "type": "object"
+                  },
+                  "kind": {
+                    "enum": [
+                      "pcap_ref"
+                    ],
+                    "type": "string"
+                  },
+                  "summary": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "artifact",
+                  "summary"
+                ],
+                "type": "object"
               }
-            },
-            "required": [
-              "kind"
-            ],
-            "type": "object"
+            ]
           },
           "type": "array"
         },

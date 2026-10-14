@@ -2,8 +2,9 @@
 //! was drawn from; where that standard used prose for something with obvious
 //! structure (call chain, evidence, patch, tests) this uses the structure.
 //!
-//! Every struct is `deny_unknown_fields`: a misspelled field is a loud parse
-//! error back to the agent, never silently dropped content.
+//! Every struct, and every variant of the [`EvidenceBlock`] enum, is
+//! `deny_unknown_fields`: a misspelled field is a loud parse error back to the
+//! agent, never silently dropped content.
 
 use crate::catalog::types::Severity;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -234,7 +235,7 @@ pub struct DisasmLine {
 /// legacy `evidence` claim list; profile completeness checks the block kinds
 /// present via `has_block_kind`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
+#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
 pub enum EvidenceBlock {
     Text {
         text: String,
