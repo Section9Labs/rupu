@@ -18,7 +18,7 @@ Since F1b every run is in its space and the operator can reach it. The agents th
 | D4 | Agent frontmatter | New `messaging: false` in agent frontmatter. That agent gets no messaging tool wherever it runs. `messaging: false` together with a `tools:` entry naming a messaging tool (exact, alias, `board.*` / `msg.*`) is a load error: the file contradicts itself. Absent or `true` = the default. |
 | D5 | Precedence | Off wins. The run's messaging is off when any of these says off: its agent (D4), its workflow (D2), its agentiflow (D3), or its parent (D6). Off means the run's bus is not offered to its tools: `Service::MessageBus` is not provided, so the grant drops every messaging tool. A tool the agent names exactly is reported unavailable through W2's `tool_unavailable` notice, never silently. An origin grant is not exempt. |
 | D6 | Inheritance | Off is a launch cap, like the connector cap. A run whose messaging is off launches children with messaging off: a sub-agent through its parent's `RunIdentity.launch`, a process child through a new `LaunchLink` field, rendered `--launch-no-messaging`. A child never has more than its parent. A workflow child dispatched from an opted-out run inherits off too, although it is its own root. |
-| D7 | Unchanged | The space, the join at start, the operator's path, the Messages tab, the `*` rule (`*` still never names a messaging tool, D22, which no longer matters for a default-on run), cross-root messaging (FD6) and placed units (FD7). A placed unit runs as a standalone `rupu run` on its host, so it has its own space there and gets the default like any standalone run. Off does not reach it either: nothing carries the switch to a connector yet (a follow-up, which needs a capability-gated `AgentLaunchRequest` field). |
+| D7 | Unchanged | The space, the join at start, the operator's path, the Messages tab, the `*` rule (`*` still never names a messaging tool, D22, which no longer matters for a default-on run), cross-root messaging (FD6) and placed units (FD7). A placed unit runs as a standalone `rupu run` on its host, so it has its own space there and gets the default like any standalone run. Off reaches it: the coordinator sets `UnitDispatch.messaging_off` when the workflow's `messaging:` is `false` or the run was launched under the cap (`StepFactory::messaging_capped`, its link's `no_messaging`), the fleet dispatcher passes it on as `AgentLaunchRequest.messaging_off`, and the host runs `rupu run --no-messaging` (`Overrides.messaging_off`, `OffReason::Launch`, a cap its children inherit). Every connector delivers it or refuses the unit: capability `agent.no_messaging` (HTTP `features`, tunnel `Hello`, bucket worker marker), SSH gated in the launch command. A workflow's `messaging: { tools: [...] }` narrowing does not travel: a placed unit gets the default set. |
 
 ## 3. Data shape
 
@@ -49,6 +49,7 @@ Inputs: the origin (its default or origin grant), `Origin::WorkflowStep.messagin
 | `rupu-runtime/src/assembly/` | `MessagingGrant` resolution, `takes_part` from it, the default grant, the cap in `launch_scope` |
 | `rupu-runtime/src/argv.rs` + `rupu-cli/src/cmd/launch_link.rs` | `--launch-no-messaging` |
 | `rupu-launch` | pass the cap to every child kind, including continue and relaunch paths |
+| `rupu-orchestrator/src/runner.rs` + `rupu-cli/src/fleet_unit_dispatcher.rs` + `rupu-cp` connectors | `UnitDispatch.messaging_off` → `AgentLaunchRequest.messaging_off` → `rupu run --no-messaging` on the host, capability `agent.no_messaging` (D7) |
 | docs | `docs/messaging.md` (the "takes part" paragraph, "Turning it on in a workflow" becomes "Turning it off"), `docs/transcript-schema.md` if the grant reason is listed, F1 index FD2 row, CLAUDE.md |
 
 ## 5. Tests
@@ -60,6 +61,7 @@ Inputs: the origin (its default or origin grant), `Origin::WorkflowStep.messagin
 - Agent `messaging: false`: no tools in any origin. With a messaging tool in `tools:` the agent fails to load.
 - Agentiflow `messaging: false`: neither the lead nor a unit is offered any `board.*` / `msg.send`. `flow_toolset_parity` keeps today's lists when the key is absent.
 - `argv_roundtrip` covers `--launch-no-messaging`. A process child of an opted-out run has messaging off.
+- A placed unit of a `messaging: false` workflow, or of a run launched under the cap, is dispatched with `messaging_off`. `rupu run --no-messaging` has messaging off (`OffReason::Launch`) and caps its children. Every connector carries it, and HTTP, tunnel, bucket and SSH refuse a peer without `agent.no_messaging`.
 - The workflow editor and other web code that treat `messaging:` as opt-in follow the new meaning.
 
 ## 6. Non-goals
