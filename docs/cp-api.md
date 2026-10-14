@@ -113,6 +113,41 @@ parameters on top of that.
 - **`since`, `until`** — RFC 3339 timestamps bounding a list by start time.
 - **`scope_kind=global|project`, `scope_id=<ws_id>`** — pin a definition to the
   global layer or one project's `.rupu/`.
+- **`q=<query>`** — the one-line list query (the findings grammar:
+  `status:failed,cancelled -workflow:nightly since:7d "two words"`) on
+  `/api/runs/workflows`, `/api/runs/agents`, `/api/sessions` and
+  `/api/projects/:ws_id/{runs,sessions}`. A term's values OR, terms AND,
+  `-` negates, a bare word searches the list's text fields; comparisons are
+  case-insensitive. It filters before `offset`/`limit` cut the page and ANDs
+  with the list's other parameters (`lifecycle`, `scope`, `since`, `until`,
+  `customer`). Remote hosts' rows are filtered on this server, reading past
+  peer page clamps, as `customer` is: a host whose rows can't report a field
+  the query names (no `customer` key: an old peer) is a 501 on
+  `?host=<it>`, and left out of a fan-out and named in
+  `X-Rupu-Hosts-Without-Customer` (the `customer` field) or
+  `X-Rupu-Hosts-Unfilterable` (`<host>:<field>`, any other field). A `q`
+  that doesn't parse is a 400 `{error, token, code, start, end}` (token
+  index and char span). Time fields (`since`, `until`) take `30m`, `12h`,
+  `7d`, `2w` (back from now), a UTC date (`2026-10-01`, the whole day) or an
+  RFC 3339 time. Each list's fields, with their kind, values and match mode,
+  are in `crates/rupu-cp/tests/fixtures/list_query/<list>.fields.json`:
+
+  | List | Fields (match) | Bare words search |
+  |---|---|---|
+  | Workflow runs (`/api/runs/workflows`, `/api/projects/:ws_id/runs`) | `status` (one of the 8 run statuses), `workflow` (contains), `id` (prefix), `codename` (contains), `trigger` (`manual`/`cron`/`event`), `host`, `customer` (a slug or `none`), `since`, `until` (`started_at`), `is:archived` | workflow, id, codename |
+  | Agent runs (`/api/runs/agents`) | `status` (exact), `agent` (contains), `provider`, `model` (contains), `source` (`standalone`/`session`), `session` (prefix), `trigger` (`trigger_source`), `codename`, `id` (prefix), `host`, `customer`, `since`, `until` (`started_at`) | agent, codename, id |
+  | Sessions (`/api/sessions`, `/api/projects/:ws_id/sessions`) | `status` (`idle`/`running`/`failed`/`stopped`), `agent` (contains), `model` (contains), `provider`, `codename`, `id` (prefix), `host`, `customer`, `project` (alias `workspace`; the workspace id), `is:active`/`is:archived` (the session's `scope`), `since`, `until` (`created_at`) | agent, codename, id |
+
+  `is:archived` on `/api/runs/workflows` lists the archive instead (rows
+  carry `archived: true`); it is local only: a remote host is a 501, and on
+  a fan-out each remote host is named `<host>:is`. On `/api/sessions` it
+  reads each session's `scope` and asks remote hosts for their archived
+  sessions; `scope=` still works.
+- **`facets=1`** — on the same lists, answer `{rows, facets,
+  facets_partial}` instead of the bare array: `facets` counts each facet
+  field's values (`field → value → rows`) over the list's scope before `q`.
+  `facets_partial: true` when some remote host's rows were read one page only
+  (an unfiltered workflow-run listing), so its counts cover that page.
 
 ### Mutations are recorded, not done
 
@@ -202,9 +237,9 @@ curl -N -H "Authorization: Bearer $CP_TOKEN" \
 | Method | Path | Purpose | Notes |
 |--------|------|---------|-------|
 | GET | `/api/runs` | Every orchestrator run, newest first (`RunListRow` + `host_id`). | `offset`, `limit`, `host`, `customer`. |
-| GET | `/api/runs/workflows` | Manually launched workflow runs (no cron or event wake). | Also `lifecycle` (`active`, `completed`, `failed`), `since`, `until` (honoured on the local host). |
+| GET | `/api/runs/workflows` | Manually launched workflow runs (no cron or event wake). | Also `lifecycle` (`active`, `completed`, `failed`), `since`, `until` (honoured on the local host), `customer`, `q` (`is:archived` lists the archive), `facets`. |
 | GET | `/api/runs/archived` | Archived runs. | `kind=workflow` keeps manual runs only. Local only, unpaged. |
-| GET | `/api/runs/agents` | Standalone and session agent runs (`AgentRunRow`). | `offset`, `limit`, `lifecycle`, `host` (`all` default, `local`, or an id), `since`, `until`, `customer`. Offline hosts are skipped on fan-out. |
+| GET | `/api/runs/agents` | Standalone and session agent runs (`AgentRunRow`). | `offset`, `limit`, `lifecycle`, `host` (`all` default, `local`, or an id), `since`, `until`, `customer`, `q`, `facets`. Offline hosts are skipped on fan-out. |
 | GET | `/api/runs/autoflows` | Autoflow cycle ticks (`AutoflowCycleRow`). | `offset`, `limit`, `host`, `since`, `until`. |
 | GET | `/api/runs/autoflows/events` | Actionable autoflow events: run launched, awaiting a human, cycle failed (`AutoflowEventRow`). | Same parameters. |
 | GET | `/api/runs/:id` | Run detail: `{run, steps, usage}`. | `host`. 404 unknown. |
@@ -256,7 +291,7 @@ none, and a body that isn't the expected JSON is a 400.
 
 | Method | Path | Purpose | Notes |
 |--------|------|---------|-------|
-| GET | `/api/sessions` | Sessions, most recently updated first. | `offset`, `limit`, `scope` (`active` / `archived`), `host`, `since`, `until`, `customer`. |
+| GET | `/api/sessions` | Sessions, most recently updated first. | `offset`, `limit`, `scope` (`active` / `archived`), `host`, `since`, `until`, `customer`, `q`, `facets`. |
 | GET | `/api/sessions/:id` | Session detail with usage and codename. | `host`. |
 | GET | `/api/sessions/:id/runs` | The session's turns for the chat view (`SessionRunRow`). | `host`. |
 | GET | `/api/sessions/:id/usage-timeline` | Tokens per model call. | `host`. |
@@ -487,8 +522,8 @@ An unknown `ws_id` is a 404 on every route except the list.
 |--------|------|---------|-------|
 | GET | `/api/projects` | Projects with rollups (`ProjectRow`). | `customer`. |
 | GET | `/api/projects/:ws_id` | Project overview (`ProjectDetail`): run/session counts, coverage, 10 recent runs, usage. | |
-| GET | `/api/projects/:ws_id/runs` | The project's runs. | `offset`, `limit`. |
-| GET | `/api/projects/:ws_id/sessions` | The project's sessions. | `offset`, `limit`. |
+| GET | `/api/projects/:ws_id/runs` | The project's runs. | `offset`, `limit`, `q`, `facets`. |
+| GET | `/api/projects/:ws_id/sessions` | The project's sessions, most recently updated first. | `offset`, `limit`, `q`, `facets`. |
 | GET | `/api/projects/:ws_id/coverage` | Per-target coverage summary. | |
 | GET | `/api/projects/:ws_id/coverage/assessed` | Assessed percentage (`{assessed_pct}`). | Computed by a full audit; slower than the summary. |
 | GET | `/api/projects/:ws_id/agents` | Agents the project can use (project overrides global by name). | Every row's `load_error` is checked against the global and this project's skill layers, so a bare skill name installed in both is ambiguous here. |
