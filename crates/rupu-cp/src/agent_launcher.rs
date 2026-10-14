@@ -55,6 +55,13 @@ pub struct AgentLaunchRequest {
     /// HTTP in the body to a peer advertising that feature, and the local
     /// connector forwards it; tunnel and bucket refuse a launch carrying one.
     pub skill_bundle: Option<rupu_skills::ship::SkillBundleManifest>,
+    /// The run, and everything it launches, gets no messaging tools: `rupu
+    /// run --no-messaging`. A placed unit's coordinator sets it for a
+    /// workflow whose messaging is off, or for a run launched under that
+    /// cap. Same contract as `skills`: every connector delivers it, or
+    /// refuses the launch when its peer hasn't advertised
+    /// `agent.no_messaging` (SSH gates it in the launch command).
+    pub messaging_off: bool,
     /// Codename minted by a placed unit's coordinator — `rupu run
     /// --codename`. Best-effort: a codename is only a display name, so a peer
     /// that can't take it never blocks the launch. An SSH remote predating
@@ -110,6 +117,7 @@ impl AgentLaunchRequest {
             .transpose()
             .map_err(|e| format!("skill bundle: {e}"))?;
         run.tmp_clone = self.target.is_some();
+        run.messaging_off = self.messaging_off;
         Ok(run)
     }
 }
@@ -160,6 +168,7 @@ mod tests {
             skills: vec!["pdf".into(), "sql".into()],
             preload_skills: vec!["house-style".into()],
             skill_bundle: None,
+            messaging_off: true,
             codename: Some("cobalt-harbor/heron#412".into()),
         }
     }
@@ -176,6 +185,7 @@ mod tests {
         assert_eq!(run.engagement_profiles, ["network"]);
         assert_eq!(run.skills, ["pdf", "sql"]);
         assert_eq!(run.preload_skills, ["house-style"]);
+        assert!(run.messaging_off);
         let args: Vec<String> = rupu_runtime::argv::RunArgv::Agent(run)
             .to_args()
             .into_iter()
@@ -197,6 +207,11 @@ mod tests {
                 "house-style"
             ]
         );
+        assert_eq!(args.iter().filter(|a| *a == "--no-messaging").count(), 1);
+        let mut on = req();
+        on.messaging_off = false;
+        let args = rupu_runtime::argv::RunArgv::Agent(on.agent_run(&id).unwrap()).to_args();
+        assert!(!args.iter().any(|a| a == "--no-messaging"));
     }
 
     #[test]
