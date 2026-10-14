@@ -18,6 +18,10 @@ pub struct CoveragePaths {
     /// Where this run's coverage is also streamed (`rupu run` only). `None`
     /// for every other writer — the coordinator's own ledgers never stream.
     pub run_stream: Option<crate::ledger::stream::RunStream>,
+    /// The findings scope name this ledger's target id was derived from,
+    /// when the writer knows it (a tool call does). Only error messages
+    /// read it; the ledger's location is `root`.
+    pub scope_name: Option<String>,
 }
 
 impl CoveragePaths {
@@ -32,6 +36,7 @@ impl CoveragePaths {
             runs: root.join("runs.jsonl"),
             assets: root.join("assets.jsonl"),
             run_stream: None,
+            scope_name: None,
             root,
         }
     }
@@ -44,6 +49,12 @@ impl CoveragePaths {
     /// [`crate::ledger::stream::append_record`] mirrors into.
     pub fn with_run_stream(mut self, stream: Option<crate::ledger::stream::RunStream>) -> Self {
         self.run_stream = stream;
+        self
+    }
+
+    /// Name the findings scope this ledger belongs to.
+    pub fn with_scope_name(mut self, scope: &str) -> Self {
+        self.scope_name = Some(scope.to_string());
         self
     }
 

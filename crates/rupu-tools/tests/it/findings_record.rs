@@ -520,3 +520,197 @@ fn the_record_schema_advertises_the_asset() {
         rupu_coverage::asset_schema_property()
     );
 }
+
+#[tokio::test]
+async fn a_misspelled_top_level_key_is_refused() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dispatcher = Caller::new(ctx(tmp.path()));
+    let mut input = host_finding();
+    input["concern"] = serde_json::json!("authz");
+    let msg = dispatcher
+        .call("findings.report", input)
+        .await
+        .expect_err("an unknown key must be refused, not dropped");
+    assert!(msg.contains("unknown field `concern`"), "{msg}");
+    assert!(
+        msg.contains("concern_id"),
+        "the message lists the real keys: {msg}"
+    );
+    assert!(!paths_for(tmp.path()).findings.exists());
+}
+
+#[tokio::test]
+async fn a_misspelled_asset_key_is_refused() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dispatcher = Caller::new(network_ctx(tmp.path()));
+    let mut input = service_finding(serde_json::json!([
+        { "t": "host", "v": "198.51.100.7" },
+        { "t": "port", "v": { "number": 8443, "proto": "tcp" } }
+    ]));
+    input["asset"]["lable"] = serde_json::json!("admin console");
+    let msg = dispatcher
+        .call("findings.report", input)
+        .await
+        .expect_err("an unknown asset key must be refused");
+    assert!(msg.contains("asset"), "{msg}");
+    assert!(msg.contains("unknown field `lable`"), "{msg}");
+    assert!(!paths_for(tmp.path()).findings.exists());
+}
+
+#[tokio::test]
+async fn an_unknown_evidence_block_field_is_refused() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dispatcher = Caller::new(ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full));
+    let mut report = full_report();
+    report["blocks"] = serde_json::json!([
+        { "kind": "text", "text": "context" },
+        { "kind": "scan_output", "tool": "nmap", "output": "8443/tcp open", "exit_code": 0 }
+    ]);
+    let msg = dispatcher
+        .call(
+            "findings.report",
+            serde_json::json!({ "scope": "repo", "report": report }),
+        )
+        .await
+        .expect_err("an unknown block field must be refused");
+    assert!(msg.contains("report.blocks[1]"), "{msg}");
+    assert!(msg.contains("unknown field `exit_code`"), "{msg}");
+}
+
+#[tokio::test]
+async fn every_documented_key_is_still_accepted() {
+    // Summary profile, flat `action:` form: every summary key plus the flat
+    // evidence keys.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dispatcher = Caller::new(ctx(tmp.path()));
+    dispatcher
+        .call(
+            "findings.record",
+            serde_json::json!({
+                "scope": "line",
+                "file_path": "src/auth.rs",
+                "line_range": [10, 12],
+                "summary": "Token compared with ==",
+                "severity": "medium",
+                "concern_id": "authz",
+                "tags": ["timing"],
+                "rationale": "Non-constant-time comparison.",
+                "code_excerpt": "if token == expected {",
+                "references": ["https://example.invalid/ct"]
+            }),
+        )
+        .await
+        .expect("flat summary form records");
+    // Summary profile, `evidence` object form.
+    dispatcher
+        .call(
+            "findings.report",
+            serde_json::json!({
+                "scope": "endpoint",
+                "target_ref": "https://198.51.100.7:8443/admin",
+                "summary": "Admin console reachable",
+                "severity": "high",
+                "evidence": {
+                    "rationale": "Served without auth.",
+                    "code_excerpt": "HTTP/1.1 200 OK",
+                    "references": ["https://example.invalid/admin"]
+                }
+            }),
+        )
+        .await
+        .expect("evidence object form records");
+    // Full profile under an engagement, with an asset carrying every key.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let dispatcher = Caller::new(network_ctx(tmp.path()));
+    let mut input = service_finding(serde_json::json!([
+        { "t": "host", "v": "198.51.100.7" },
+        { "t": "port", "v": { "number": 8443, "proto": "tcp" } }
+    ]));
+    input["asset"]["label"] = serde_json::json!("admin console");
+    input["concern_id"] = serde_json::json!("exposure");
+    input["tags"] = serde_json::json!(["edge"]);
+    dispatcher
+        .call("findings.report", input)
+        .await
+        .expect("full form with an asset records");
+}
+
+#[tokio::test]
+async fn a_cross_reference_outside_the_scope_names_the_scope() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let other = Caller::new(findings_ctx(
+        tmp.path(),
+        "edge-recon",
+        "run_other",
+        "m",
+        rupu_coverage::FindingProfile::Full,
+        None,
+        None,
+    ));
+    let out = other
+        .call(
+            "findings.report",
+            serde_json::json!({ "scope": "repo", "report": full_report() }),
+        )
+        .await
+        .expect("seed finding in another scope");
+    let foreign = out.trim_start_matches("finding_id: ").to_string();
+
+    let dispatcher = Caller::new(ctx_with(tmp.path(), rupu_coverage::FindingProfile::Full));
+    let mut report = full_report();
+    report["cross_references"] =
+        serde_json::json!([{ "finding_id": foreign, "relation": "sibling" }]);
+    let msg = dispatcher
+        .call(
+            "findings.report",
+            serde_json::json!({ "scope": "repo", "report": report }),
+        )
+        .await
+        .expect_err("a cross-reference outside the scope is refused");
+    assert!(
+        msg.contains(&format!(
+            "`{foreign}` is not a finding in this run's findings scope `chimera-campaign`"
+        )),
+        "{msg}"
+    );
+    assert!(msg.contains("`references` or `description`"), "{msg}");
+    assert!(!msg.contains("in this project"), "{msg}");
+}
+
+#[tokio::test]
+async fn verifying_a_finding_outside_the_scope_names_the_scope() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let other = Caller::new(findings_ctx(
+        tmp.path(),
+        "edge-recon",
+        "run_other",
+        "m",
+        rupu_coverage::FindingProfile::Full,
+        None,
+        None,
+    ));
+    let out = other
+        .call(
+            "findings.report",
+            serde_json::json!({ "scope": "repo", "report": full_report() }),
+        )
+        .await
+        .expect("seed finding in another scope");
+    let foreign = out.trim_start_matches("finding_id: ").to_string();
+
+    let dispatcher = Caller::new(ctx(tmp.path()));
+    let msg = dispatcher
+        .call(
+            "findings.verify",
+            serde_json::json!({ "finding_id": foreign, "status": "confirmed" }),
+        )
+        .await
+        .expect_err("a finding in another scope cannot be verified here");
+    assert!(
+        msg.contains(&format!(
+            "`{foreign}` is not a finding in this run's findings scope `chimera-campaign`"
+        )),
+        "{msg}"
+    );
+    assert!(msg.contains("findings.query"), "{msg}");
+}

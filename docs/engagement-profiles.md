@@ -212,7 +212,8 @@ the same schema and handling there:
 
 ```json
 {
-  "scope": "edge-sweep",
+  "scope": "endpoint",
+  "target_ref": "https://198.51.100.20:8443/",
   "report": { "...": "a complete finding report" },
   "asset": {
     "kind": "network:service",

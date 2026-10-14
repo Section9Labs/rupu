@@ -429,7 +429,7 @@ fn dry_run_check(
     known: &[String],
     opts: &FindingWriteOptions,
 ) -> Result<(), ReportFindingError> {
-    check_full_report(report, known, opts)?;
+    check_full_report(report, known, paths.scope_name.as_deref(), opts)?;
     // What `prepare_full_report` would store, with `ClaimHashes::Skip`.
     let mut stored = report.clone();
     for claim in &mut stored.evidence {

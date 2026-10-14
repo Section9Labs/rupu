@@ -22,6 +22,7 @@ pub fn paths(ctx: &ToolContext) -> CoveragePaths {
     let scope = ctx.identity.scope();
     let workspace = &ctx.workspace.path;
     CoveragePaths::new(workspace, &target_id(workspace, scope))
+        .with_scope_name(scope)
         .with_run_stream(run_stream(ctx, scope))
 }
 

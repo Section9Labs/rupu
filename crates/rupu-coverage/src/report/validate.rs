@@ -34,11 +34,29 @@ impl fmt::Display for ReportValidationError {
 impl std::error::Error for ReportValidationError {}
 
 pub struct ValidateCtx<'a> {
-    /// `fnd_` ids already in this project's ledger; cross-references must
-    /// point at one of them.
+    /// `fnd_` ids already in the reporter's findings-scope ledger;
+    /// cross-references must point at one of them.
     pub known_finding_ids: &'a [String],
+    /// The name of that findings scope, when the caller knows it: named in
+    /// the error for a cross-reference outside it.
+    pub scope: Option<&'a str>,
     /// Serialized-size budget for the whole report.
     pub max_bytes: usize,
+}
+
+/// A cross-reference to an id outside the reporter's findings scope.
+/// `findings.query` reads every scope in the workspace, so the id may well be
+/// a real finding: say where it was looked for and where else it can go.
+fn not_in_scope(id: &str, scope: Option<&str>) -> String {
+    let scope = match scope {
+        Some(name) => format!("this run's findings scope `{name}`"),
+        None => "this findings scope".to_string(),
+    };
+    format!(
+        "`{id}` is not a finding in {scope}; cross_references can only name a finding \
+         recorded in the same scope (findings.query also lists other scopes). To relate a \
+         finding from another scope, name its id in `references` or `description` instead"
+    )
 }
 
 /// Why `p` is not an acceptable workspace-relative path, if it isn't.
@@ -256,10 +274,7 @@ pub fn validate_report(r: &FindingReport, ctx: &ValidateCtx) -> Result<(), Repor
                 if !ctx.known_finding_ids.iter().any(|k| k == &x.finding_id) {
                     c.err(
                         format!("report.cross_references[{i}].finding_id"),
-                        format!(
-                            "`{}` is not a finding in this project; use the id a previous findings.report call returned",
-                            x.finding_id
-                        ),
+                        not_in_scope(&x.finding_id, ctx.scope),
                     );
                 }
             }
@@ -330,6 +345,7 @@ mod tests {
     fn ctx() -> ValidateCtx<'static> {
         ValidateCtx {
             known_finding_ids: &[],
+            scope: None,
             max_bytes: 262_144,
         }
     }
@@ -418,6 +434,7 @@ mod tests {
             &r,
             &ValidateCtx {
                 known_finding_ids: &known,
+                scope: None,
                 max_bytes: 262_144,
             },
         );

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReportFindingInput {
     #[serde(default)]
     pub file_path: Option<String>,
@@ -45,6 +46,7 @@ pub struct ReportFindingInput {
 /// The asset a finding is about: a profile-namespaced `kind` and the locator
 /// coordinates that pin it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AssetRef {
     pub kind: String,
     #[serde(default)]
@@ -280,6 +282,7 @@ pub(crate) enum ClaimHashes {
 pub(crate) fn check_full_report(
     report: &crate::report::FindingReport,
     known: &[String],
+    scope: Option<&str>,
     opts: &crate::report::FindingWriteOptions,
 ) -> Result<(), ReportFindingError> {
     // `verification` is part of a stored record, but it is the
@@ -297,6 +300,7 @@ pub(crate) fn check_full_report(
         report,
         &crate::report::ValidateCtx {
             known_finding_ids: known,
+            scope,
             max_bytes: opts.report_max_bytes,
         },
     ) {
@@ -325,7 +329,7 @@ pub(crate) fn prepare_full_report(
     opts: &crate::report::FindingWriteOptions,
     hashes: ClaimHashes,
 ) -> Result<crate::report::FindingReport, ReportFindingError> {
-    check_full_report(&report, known, opts)?;
+    check_full_report(&report, known, paths.scope_name.as_deref(), opts)?;
     // A claim's hash is rupu's record of the file at write time, not
     // something the agent can assert: drop whatever it sent, then
     // hash what is actually there (or leave it unset).

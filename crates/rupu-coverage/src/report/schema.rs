@@ -42,13 +42,28 @@ fn strip_rupu_owned_fields(schema: &mut Value) {
     {
         claim.remove("sha256");
     }
-    if let Some(artifact) = props
-        .get_mut("artifacts")
-        .and_then(|a| a.get_mut("items"))
-        .and_then(|i| i.get_mut("properties"))
+    if let Some(artifact) = props.get_mut("artifacts").and_then(|a| a.get_mut("items")) {
+        keep_only_path(artifact);
+    }
+    if let Some(blocks) = props
+        .get_mut("blocks")
+        .and_then(|b| b.pointer_mut("/items/anyOf"))
+        .and_then(Value::as_array_mut)
+    {
+        for block in blocks {
+            if let Some(artifact) = block.pointer_mut("/properties/artifact") {
+                keep_only_path(artifact);
+            }
+        }
+    }
+}
+
+fn keep_only_path(artifact: &mut Value) {
+    if let Some(fields) = artifact
+        .get_mut("properties")
         .and_then(Value::as_object_mut)
     {
-        artifact.retain(|k, _| k == "path");
+        fields.retain(|k, _| k == "path");
     }
 }
 
@@ -140,6 +155,14 @@ mod tests {
             .keys()
             .collect();
         assert_eq!(artifact, vec!["path"]);
+        let block_artifacts: Vec<Vec<&String>> = s["properties"]["blocks"]["items"]["anyOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|b| b["properties"]["artifact"]["properties"].as_object())
+            .map(|p| p.keys().collect())
+            .collect();
+        assert_eq!(block_artifacts, vec![vec!["path"]; 3]);
         // The canonical schema still describes stored records in full.
         let c = canonical_schema();
         assert!(c["properties"]["verification"].is_object());

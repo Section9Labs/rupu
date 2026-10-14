@@ -134,10 +134,17 @@ impl Tool for FindingsVerifyTool {
                 status_word(status)
             ))
             .timed(started)),
+            Err(VerifyError::NotFound) => Ok(failed(format!(
+                "`{finding_id}` is not a finding in this run's findings scope `{}`; \
+                 findings.verify can only record a verdict on a finding in the same scope. \
+                 findings.query also lists findings from other scopes, which this run \
+                 cannot verify: give your verdict on one of those in your reply instead",
+                ctx.identity.scope()
+            ))
+            .timed(started)),
             // A refusal the agent can read and act on.
             Err(
-                e @ (VerifyError::NotFound
-                | VerifyError::Ambiguous
+                e @ (VerifyError::Ambiguous
                 | VerifyError::NoReport
                 | VerifyError::SelfVerification
                 | VerifyError::BadStatus
@@ -376,7 +383,10 @@ mod finding_verify_tests {
             )
             .await
             .unwrap();
-        assert!(out.error.unwrap().contains("no finding"));
+        assert!(out
+            .error
+            .unwrap()
+            .contains("`f_nope` is not a finding in this run's findings scope `t`"));
     }
 
     #[tokio::test]

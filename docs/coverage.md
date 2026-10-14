@@ -220,7 +220,13 @@ and are left out of the schema the agent is shown:
   `likelihood` is `Low`/`Medium`/`High`. `cwe` is a list of `CWE-<n>` ids and may be empty.
 - `evidence` needs at least one claim and `replication_steps` at least one step.
 - `file` values are workspace-relative and `lines` is `[start, end]` with `1 <= start <= end`.
-- `cross_references[].finding_id` must be an existing finding id.
+- `cross_references[].finding_id` must be a finding in the reporting run's own
+  findings scope. `findings.query` lists findings from every scope in the
+  workspace; to relate one from another scope, name its id in `references` or
+  `description`.
+- Unknown keys are rejected, at the top level of a `findings.report` call, in
+  `asset`, in the report, and in each evidence block (each block kind accepts
+  exactly its own fields).
 - The serialized report must fit `[findings].report_max_bytes` (default 256 KiB),
   so a pasted log cannot swell the ledger. The limit is checked again after
   artifact directories are expanded.

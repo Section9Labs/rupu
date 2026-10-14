@@ -38,6 +38,7 @@ fn assert_valid(r: &rupu_coverage::FindingReport, known: &[&str]) {
         r,
         &ValidateCtx {
             known_finding_ids: &known,
+            scope: None,
             max_bytes: 256 * 1024,
         },
     )
