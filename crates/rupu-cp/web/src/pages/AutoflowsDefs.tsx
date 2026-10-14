@@ -1,7 +1,8 @@
 // Build › Autoflows — autoflow-enabled workflow definitions.
-// Shows the static list of workflows that have autoflow triggers configured.
+// Shows the static list of workflows that have autoflow triggers configured,
+// filtered in the browser by the query line (`AUTOFLOW_DEF_FIELDS`).
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Inbox, RefreshCw } from 'lucide-react';
 import { api, scopeSelectorFor, type AutoflowDefRow } from '../lib/api';
 import { SectionHeader } from '../components/lists/SectionHeader';
@@ -14,6 +15,8 @@ import { Spinner } from '../components/ui/Spinner';
 import { ScopeChip } from '../components/ScopeChip';
 import { cn } from '../lib/cn';
 import { useInfiniteScroll } from '../lib/useInfiniteScroll';
+import { ListQueryBar, NoMatches, useFilteredRows, useListQuery } from '../components/query/ListQueryBar';
+import { AUTOFLOW_DEF_FIELDS } from '../lib/query/lists/autoflowDefs';
 
 const ENABLED_CLS = 'bg-ok-bg text-ok ring-ok/30';
 const DISABLED_CLS = 'bg-surface text-ink-mute ring-border';
@@ -193,9 +196,13 @@ export default function AutoflowsDefs() {
 
   const columns = defColumns(handleToggle);
 
-  const shown = (defs ?? []).slice(0, visible);
+  const [q, setQ] = useListQuery();
+  const all = useMemo(() => (defs ?? []).slice().sort((a, b) => a.name.localeCompare(b.name)), [defs]);
+  const { rows: matched, error: queryError, facets } = useFilteredRows(all, q, AUTOFLOW_DEF_FIELDS);
+  useEffect(() => setVisible(STEP), [q]);
+  const shown = matched.slice(0, visible);
   const { sentinelRef } = useInfiniteScroll({
-    hasMore: visible < (defs?.length ?? 0),
+    hasMore: visible < matched.length,
     loadMore: () => setVisible((v) => v + STEP),
   });
   const bannerError = error ?? actionError;
@@ -228,21 +235,38 @@ export default function AutoflowsDefs() {
           hint="Workflows with autoflow triggers configured (enabled or disabled) will appear here."
         />
       ) : (
-        <section>
-          <SectionHeader tone="muted" label="Autoflow Workflows" count={defs.length} />
-          <SortableTable<AutoflowDefRow>
-            columns={columns}
-            rows={shown}
-            rowKey={(d) => d.slug}
-            rowHref={(d) => `/workflows/${encodeURIComponent(d.slug)}`}
-            initialSort={{ key: 'name', dir: 'asc' }}
+        <>
+          <ListQueryBar
+            value={q}
+            onChange={setQ}
+            fields={AUTOFLOW_DEF_FIELDS}
+            facets={facets}
+            total={all.length}
+            shown={matched.length}
+            label="Filter autoflows"
+            placeholder="is:enabled · trigger:cron · name:nightly"
+            error={queryError}
           />
-          {defs.length > visible && (
-            <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
-              scroll for more
-            </div>
+          {matched.length === 0 ? (
+            <NoMatches noun="autoflows" />
+          ) : (
+            <section>
+              <SectionHeader tone="muted" label="Autoflow Workflows" count={matched.length} />
+              <SortableTable<AutoflowDefRow>
+                columns={columns}
+                rows={shown}
+                rowKey={(d) => d.slug}
+                rowHref={(d) => `/workflows/${encodeURIComponent(d.slug)}`}
+                initialSort={{ key: 'name', dir: 'asc' }}
+              />
+              {matched.length > visible && (
+                <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
+                  scroll for more
+                </div>
+              )}
+            </section>
           )}
-        </section>
+        </>
       )}
     </div>
   );

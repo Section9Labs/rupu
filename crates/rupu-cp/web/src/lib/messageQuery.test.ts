@@ -94,7 +94,7 @@ describe('filterMessages', () => {
     const r = filterMessages(MESSAGES, 'colour:red', PARTICIPANTS);
     expect(r.rows).toHaveLength(MESSAGES.length);
     expect(r.error).toBe('unknown key `colour` (quote the text to search for it)');
-    expect(filterMessages(MESSAGES, 'is:loud', PARTICIPANTS).error).toBe('`loud` is not a is (one of urgent, undelivered, seen, unseen, reply)');
+    expect(filterMessages(MESSAGES, 'is:loud', PARTICIPANTS).error).toBe('`loud` is not a value of `is:` (one of urgent, undelivered, seen, unseen, reply)');
   });
 });
 

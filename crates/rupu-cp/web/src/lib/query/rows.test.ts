@@ -1,6 +1,6 @@
 import { Hash } from 'lucide-react';
 import { describe, expect, it } from 'vitest';
-import { filterRows, parseTime, rowFacets, rowField, type RowField } from './rows';
+import { filterRows, rowFacets, rowField, type RowField } from './rows';
 
 interface Row {
   id: string;
@@ -29,7 +29,7 @@ const R = (over: Partial<Row> & { id: string }): Row => ({
 
 const ROWS: Row[] = [
   R({ id: 'a', name: 'Recon', status: 'Active', tools: ['bash', 'grep'], path: 'src/api/x.ts', level: 'high', from: 'pipit#1', at: '2026-10-14T11:00:00Z', runs: 3 }),
-  R({ id: 'b', name: 'service-analyst', status: 'archived', tools: ['bash'], path: 'src/web/y.ts', level: 'medium', from: 'pipit#20', at: new Date(2026, 9, 10, 12).toISOString(), runs: 12 }),
+  R({ id: 'b', name: 'service-analyst', status: 'archived', tools: ['bash'], path: 'src/web/y.ts', level: 'medium', from: 'pipit#20', at: '2026-10-10T12:00:00Z', runs: 12 }),
   R({ id: 'c', name: 'exploit-verifier', status: 'active', tools: [], path: 'lib/api/z.ts', level: 'low', from: 'heron', at: '2026-09-01T12:00:00Z', broken: true }),
   R({ id: 'd', name: 'reviewer', status: 'failed', tools: ['grep'], path: 'src/api/w.ts', level: 'critical', from: 'pipit#2' }),
 ];
@@ -123,18 +123,28 @@ describe('filterRows', () => {
     expect(ids('-since:7d')).toEqual(['c', 'd']);
   });
 
-  it('a time that names none matches nothing and says why', () => {
+  it('a time that names none is a parse error: it filters nothing and says why', () => {
     const r = filterRows(ROWS, 'since:soon', FIELDS, { now: NOW });
-    expect(r.rows).toEqual([]);
-    expect(r.error).toBe('`soon` is not a time (e.g. 7d, 12h, 2026-10-01)');
-    expect(filterRows(ROWS, 'until:2026-02-30', FIELDS, { now: NOW }).error).toBe('`2026-02-30` is not a time (e.g. 7d, 12h, 2026-10-01)');
+    expect(r.rows.map((x) => x.id)).toEqual(['a', 'b', 'c', 'd']);
+    expect(r.error).toBe('`soon` is not a time (expected 30m, 12h, 7d, 2w, 2026-10-01 or an RFC 3339 time)');
+    expect(filterRows(ROWS, 'until:2026-02-30', FIELDS, { now: NOW }).error).toBe(
+      '`2026-02-30` is not a time (expected 30m, 12h, 7d, 2w, 2026-10-01 or an RFC 3339 time)',
+    );
+  });
+
+  it('a bare date is its whole UTC day, wherever the browser is', () => {
+    const late = [R({ id: 'x', at: '2026-10-10T00:30:00+02:00' }), R({ id: 'y', at: '2026-10-10T23:59:59Z' })];
+    const at = (q: string) => filterRows(late, q, FIELDS, { now: NOW }).rows.map((x) => x.id);
+    expect(at('since:2026-10-10')).toEqual(['y']);
+    expect(at('until:2026-10-09')).toEqual(['x']);
+    expect(at('until:2026-10-10')).toEqual(['x', 'y']);
   });
 
   it('a parse error filters nothing and says why', () => {
     const r = filterRows(ROWS, 'colour:red', FIELDS);
     expect(r.rows.map((x) => x.id)).toEqual(['a', 'b', 'c', 'd']);
     expect(r.error).toBe('unknown key `colour` (quote the text to search for it)');
-    expect(filterRows(ROWS, 'level:huge', FIELDS).error).toBe('`huge` is not a level (one of low, medium, high, critical)');
+    expect(filterRows(ROWS, 'level:huge', FIELDS).error).toBe('`huge` is not a value of `level:` (one of low, medium, high, critical)');
   });
 });
 
@@ -157,14 +167,5 @@ describe('rowFacets', () => {
   it('counts what a facet function names', () => {
     const fields = [f({ key: 'name', get: (r) => r.name, match: 'exact', facet: (r) => r.level })];
     expect(rowFacets(ROWS, fields).name.map((x) => x.value)).toEqual(['high', 'medium', 'low', 'critical']);
-  });
-});
-
-describe('parseTime', () => {
-  it('reads relative units and local dates', () => {
-    expect(parseTime('30m', 'since', NOW)).toBe(NOW - 30 * 60_000);
-    expect(parseTime('2026-10-01', 'since', NOW)).toBe(new Date(2026, 9, 1).getTime());
-    expect(parseTime('2026-10-01', 'until', NOW)).toBe(new Date(2026, 9, 2).getTime() - 1);
-    expect(parseTime('yesterday', 'since', NOW)).toBeNull();
   });
 });

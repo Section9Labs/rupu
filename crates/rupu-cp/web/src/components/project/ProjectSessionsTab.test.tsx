@@ -1,10 +1,8 @@
 // @vitest-environment jsdom
-// ProjectSessionsTab — One Control Language migration (Phase 3, Task G).
-// Covers: the FilterBar renders with no host slot (project tabs are already
-// workspace-scoped); the Scope FilterPills group narrows the loaded rows
-// client-side; Find narrows further with the matches footer; fit/subject
-// table-rules columns; kit loading/empty/error states; the UsageBarChart
-// strip stays in place.
+// ProjectSessionsTab — the query line the server evaluates (`?q=` on
+// /api/projects/:ws_id/sessions, with no implicit `is:` default; facets on
+// the first page only; a 400 is the bar's error), fit/subject table-rules
+// columns, kit loading/empty/error states, the UsageBarChart strip.
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
@@ -12,6 +10,7 @@ import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/re
 import { MemoryRouter, useLocation } from 'react-router-dom';
 import { api, type SessionSummary } from '../../lib/api';
 import ProjectSessionsTab from './ProjectSessionsTab';
+import { listCalls, parseError, stubListFetch, type StubAnswer } from '../../lib/query/listFetchStub';
 
 function LocationProbe() {
   const loc = useLocation();
@@ -21,6 +20,7 @@ function LocationProbe() {
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 function usage(): NonNullable<SessionSummary['usage']> {
@@ -76,94 +76,6 @@ function renderTab(wsId = 'x') {
     </MemoryRouter>,
   );
 }
-
-describe('ProjectSessionsTab — FilterBar (no host slot)', () => {
-  it('renders the Scope FilterPills group and a Find input, with no HostSelect', async () => {
-    mockSessions();
-    renderTab();
-
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
-
-    expect(screen.getByRole('button', { name: 'All' })).toHaveAttribute('aria-pressed', 'true');
-    expect(screen.getByRole('button', { name: 'Active' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Archived' })).toBeInTheDocument();
-    expect(screen.getByPlaceholderText('Find sessions…')).toBeInTheDocument();
-    expect(screen.queryByLabelText('Host filter')).not.toBeInTheDocument();
-  });
-});
-
-describe('ProjectSessionsTab — Scope FilterPills narrows rows', () => {
-  it('renders all rows then narrows to Active, then Archived, then back to All', async () => {
-    mockSessions();
-    renderTab();
-
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
-    expect(screen.getByText('review-pr')).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole('button', { name: 'Active' }));
-    expect(screen.getByText('fix-bug')).toBeInTheDocument();
-    expect(screen.queryByText('review-pr')).not.toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole('button', { name: 'Archived' }));
-    expect(screen.queryByText('fix-bug')).not.toBeInTheDocument();
-    expect(screen.getByText('review-pr')).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole('button', { name: 'All' }));
-    expect(screen.getByText('fix-bug')).toBeInTheDocument();
-    expect(screen.getByText('review-pr')).toBeInTheDocument();
-  });
-});
-
-describe('ProjectSessionsTab — Find', () => {
-  it('typing narrows rows by agent name or session id', async () => {
-    mockSessions();
-    renderTab();
-    await waitFor(() => expect(screen.getByText('review-pr')).toBeInTheDocument());
-
-    fireEvent.change(screen.getByPlaceholderText('Find sessions…'), { target: { value: 'review' } });
-
-    await waitFor(() => expect(screen.queryByText('fix-bug')).not.toBeInTheDocument());
-    expect(screen.getByText('review-pr')).toBeInTheDocument();
-  });
-
-  it('footer shows "N matches of M loaded" while a query is active', async () => {
-    mockSessions();
-    renderTab();
-    await waitFor(() => expect(screen.getByText('review-pr')).toBeInTheDocument());
-
-    fireEvent.change(screen.getByPlaceholderText('Find sessions…'), { target: { value: 'review' } });
-
-    await waitFor(() => expect(screen.getByText('1 matches of 2 loaded')).toBeInTheDocument());
-  });
-
-  it('Esc clears the query', async () => {
-    mockSessions();
-    renderTab();
-    await waitFor(() => expect(screen.getByText('review-pr')).toBeInTheDocument());
-
-    const input = screen.getByPlaceholderText('Find sessions…') as HTMLInputElement;
-    fireEvent.change(input, { target: { value: 'review' } });
-    await waitFor(() => expect(screen.queryByText('fix-bug')).not.toBeInTheDocument());
-
-    fireEvent.keyDown(input, { key: 'Escape' });
-
-    await waitFor(() => expect(input.value).toBe(''));
-    expect(screen.getByText('fix-bug')).toBeInTheDocument();
-  });
-
-  it('composes with the Scope pill: query narrows within the active pill filter', async () => {
-    mockSessions();
-    renderTab();
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
-
-    fireEvent.click(screen.getByRole('button', { name: 'Active' }));
-    await waitFor(() => expect(screen.queryByText('review-pr')).not.toBeInTheDocument());
-
-    fireEvent.change(screen.getByPlaceholderText('Find sessions…'), { target: { value: 'zzz-no-match' } });
-
-    await waitFor(() => expect(screen.getByText('No matches')).toBeInTheDocument());
-  });
-});
 
 describe('ProjectSessionsTab — table rules (fit/subject columns)', () => {
   it('the agent column is the one flexible/truncating subject column', async () => {
@@ -315,14 +227,15 @@ describe('ProjectSessionsTab — kit loading/empty/error states', () => {
     );
   });
 
-  it('shows the kit EmptyState "no match" copy when a pill filter narrows to zero', async () => {
-    mockSessions([ROWS[0]]); // active only
-    renderTab();
-    await waitFor(() => expect(screen.getByText('fix-bug')).toBeInTheDocument());
-
-    fireEvent.click(screen.getByRole('button', { name: 'Archived' }));
-
-    await waitFor(() => expect(screen.getByText('No sessions match this filter')).toBeInTheDocument());
+  it('says nothing matches when a query keeps no session', async () => {
+    mockSessions([]);
+    render(
+      <MemoryRouter initialEntries={['/?q=is:archived']}>
+        <ProjectSessionsTab wsId="x" />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByText('No sessions match the filter.')).toBeInTheDocument();
+    expect(screen.queryByText('No sessions for this project yet')).not.toBeInTheDocument();
   });
 
   it('shows the kit ErrorBanner when the fetch fails', async () => {
@@ -340,5 +253,61 @@ describe('ProjectSessionsTab — pricing errors', () => {
     renderTab();
     expect(await screen.findByRole('img', { name: 'Pricing unavailable: acme layer broken', hidden: true })).toBeInTheDocument();
     expect(screen.getAllByRole('img', { name: /^Pricing unavailable/, hidden: true })).toHaveLength(1);
+  });
+});
+
+describe('ProjectSessionsTab — the query reaches the server', () => {
+  const PATH = '/api/projects/ws-1/sessions';
+
+  function mountQuery(answer: (u: URL) => StubAnswer | undefined, search = '') {
+    const urls = stubListFetch([], answer);
+    render(
+      <MemoryRouter initialEntries={[`/${search}`]}>
+        <ProjectSessionsTab wsId="ws-1" />
+      </MemoryRouter>,
+    );
+    return urls;
+  }
+  const sentQ = (urls: URL[]) => listCalls(urls, PATH).map((u) => u.searchParams.get('q'));
+
+  it.each([
+    ['', null],
+    ['?q=agent:recon', 'agent:recon'],
+    ['?q=is:archived', 'is:archived'],
+  ])('%s sends q=%s, with no implicit is: default', async (search, q) => {
+    const urls = mountQuery(() => ({ body: [] }), search);
+    await waitFor(() => expect(sentQ(urls)).toHaveLength(1));
+    expect(sentQ(urls)).toEqual([q]);
+  });
+
+  it('asks for facets on the first page only, and a new query reads from offset 0 without them', async () => {
+    const urls = mountQuery((u) =>
+      u.searchParams.get('facets') === '1'
+        ? { body: { rows: [ROWS[0]], facets: { is: { active: 1 } }, facets_partial: false } }
+        : { body: [ROWS[0]] },
+    );
+    await screen.findAllByText('fix-bug');
+    expect(listCalls(urls, PATH).map((u) => u.searchParams.get('facets'))).toEqual(['1']);
+
+    const input = screen.getByRole('combobox', { name: 'Filter sessions' });
+    fireEvent.change(input, { target: { value: 'status:failed' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    await waitFor(() => expect(sentQ(urls)).toEqual([null, 'status:failed']));
+    const last = listCalls(urls, PATH)[1];
+    expect(last.searchParams.get('offset')).toBe('0');
+    expect(last.searchParams.get('facets')).toBeNull();
+  });
+
+  it('shows the server’s parse error under the bar, not as a page error', async () => {
+    mountQuery(() => parseError('`provider` takes anthropic or openai'), '?q=provider:anthropic');
+    expect(await screen.findByText('`provider` takes anthropic or openai')).toBeInTheDocument();
+    expect(screen.getAllByRole('alert')).toHaveLength(1);
+    expect(screen.getByText('No sessions match the filter.')).toBeInTheDocument();
+  });
+
+  it('shows a client parse error at once and sends no request', async () => {
+    const urls = mountQuery(() => ({ body: [] }), '?q=is:closed');
+    expect(await screen.findByText('`closed` is not a value of `is:` (one of active, archived)')).toBeInTheDocument();
+    expect(listCalls(urls, PATH)).toEqual([]);
   });
 });

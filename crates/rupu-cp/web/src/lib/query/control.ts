@@ -30,3 +30,22 @@ export function controlTerm(q: string, fields: readonly FieldSpec[], key: string
   if (sole === null || sole.length !== 1) return { value: null, rest, error: usage };
   return { value: sole[0], rest, error: null };
 }
+
+/** Whether any token of `q` is a term on `key`, positive or negated. Read
+ *  token by token, so a broken token elsewhere doesn't hide it. */
+export function namesKey(q: string, fields: readonly FieldSpec[], key: string): boolean {
+  const t = tokenize(q);
+  return (
+    t.ok &&
+    t.tokens.some((x) => {
+      const p = parseToken(x.text, fields);
+      return p.ok && p.terms[0]?.key === key;
+    })
+  );
+}
+
+/** `q` with `term` appended when it names no `key`: a list's implicit
+ *  default (archived customers, finished runs stay out unless asked for). */
+export function withDefault(q: string, fields: readonly FieldSpec[], key: string, term: string): string {
+  return namesKey(q, fields, key) ? q : `${q} ${term}`.trim();
+}

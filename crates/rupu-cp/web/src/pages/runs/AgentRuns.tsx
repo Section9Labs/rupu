@@ -1,43 +1,33 @@
 // Agent run-stream page — standalone and session-bound agent runs.
 // No DAG graph (agent runs have no workflow DAG); shows transcript_path as text.
 // status and started_at are optional (standalone runs may lack them).
-// Three lifecycle pills (Running / Completed / Failed-Rejected) + a Source
-// pill group (All / Standalone / Session, defaulting to Standalone — an
-// agent-runs read is a standalone invocation by default; session work lives
-// on the Sessions page instead — 2026-07-23 operator feedback amendment #2)
-// + a Find search box. Fetch/paginate/poll is owned by `usePerHostPagedList`
-// (per-host progressive loading, spec 2026-10-01): All hosts by default,
-// local paints at once and each remote merges in as it answers. Running polls
-// (local every 5 s, remotes every 60 s, page 0 only, spliced back over the
-// head of the list — see the hook's docs for why that doesn't reset a
-// scrolled view).
+//
+// One query line filters the list, and the server evaluates it (`?q=` on
+// every request, `AGENT_RUN_FIELDS`). While the query doesn't name `source:`
+// it lists standalone runs (session work lives on the Sessions page —
+// 2026-07-23 operator feedback amendment #2). Fetch/paginate/poll is owned by
+// `usePerHostQueryList`: every host the query's `host:` terms allow, local
+// painting at once and each remote merging in as it answers; host health is
+// in the `host:` suggestions and one quiet line under the bar.
 //
 // Backend dedupe (`crates/rupu-cp/src/api/run_streams.rs`,
 // `dedupe_agent_runs_by_run_id`) already collapses a session-turn run's
 // standalone `.meta.json` row and its session.json `runs[]` row into ONE
-// merged row before this page ever sees it — the Source pill filters that
-// single merged row's `source` field, it does not need to dedupe anything
-// itself.
+// merged row before this page ever sees it.
 //
 // Customer scope (customers Plan 2B): the list follows the global scope
 // (`useScopedList`), or — embedded in a customer's Runs tab — a fixed
-// `customer` prop, which also drops the page header and padding. Either way the
-// filter goes through the same per-host engine (`?customer=<slug>`), so a
-// remote host that can't filter (501) shows as an unavailable slice, and
-// `HostsWithoutCustomerBanner` names it along with the hosts the
-// `X-Rupu-Hosts-Without-Customer` header lists. A scope the backend rejects
-// (400) is cleared with a notice.
+// `customer` prop, which also drops the page header and padding, and keeps
+// the query in `aq`. Either way `?customer=<slug>` ANDs with the query. A
+// scope the backend rejects (400) is cleared with a notice.
 
 import { useCallback, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { RefreshCw } from 'lucide-react';
-import { api, ApiError, type AgentRunRow, type RunStatusStr } from '../../lib/api';
+import { api, ApiError, type AgentRunRow, type ListQueryOpts, type RunStatusStr } from '../../lib/api';
 import SortableTable, { type Column } from '../../components/lists/SortableTable';
 import UsageBarChart from '../../components/charts/UsageBarChart';
 import { Button } from '../../components/ui/Button';
-import { FilterBar } from '../../components/ui/FilterBar';
-import { FilterPills, type FilterPillOption } from '../../components/ui/FilterPills';
-import { SearchInput } from '../../components/ui/SearchInput';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { ErrorBanner } from '../../components/ui/ErrorBanner';
 import { Spinner } from '../../components/ui/Spinner';
@@ -45,35 +35,21 @@ import { Badge } from '../../components/ui/Badge';
 import { StatusPill } from '../../components/StatusPill';
 import { AgentName } from '../../components/codename/AgentName';
 import { memberLabel } from '../../lib/codename';
-import HostSelect, { ALL_HOSTS } from '../../components/HostSelect';
 import { cn } from '../../lib/cn';
 import { shortId } from '../../lib/shortId';
 import { relativeTime } from '../../lib/time';
 import { formatTokens, formatCost } from '../../lib/usage';
 import { formatDuration } from '../../lib/duration';
-import { usePerHostPagedList, type PerHostFetchParams } from '../../lib/perHost/usePerHostPagedList';
-import { PerHostFooter, PerHostStrip, perHostFooterText } from '../../components/lists/PerHostStatus';
-import { noHostAnswered, notIncluded, waitingLabel } from '../../lib/perHost/status';
+import type { PerHostFetchParams } from '../../lib/perHost/usePerHostPagedList';
+import { noHostAnswered, waitingLabel } from '../../lib/perHost/status';
+import { usePerHostQueryList } from '../../lib/query/usePerHostQueryList';
+import { AGENT_RUN_FIELDS, agentRunsQuery } from '../../lib/query/lists/agentRuns';
+import { ListQueryBar, NoMatches, useListQuery } from '../../components/query/ListQueryBar';
+import { hostAlerts } from '../../components/query/hostAlerts';
+import { ListFooter } from '../../components/lists/ListFooter';
 import { PricingErrorMark } from '../../components/customers/PricingErrorMark';
-import { HostsWithoutCustomerBanner } from '../../components/customers/HostsWithoutCustomerBanner';
 import { useRunCustomers, withCustomerColumn } from '../../components/customers/RunCustomer';
 import { useScopedList } from '../../lib/useScopedList';
-
-type Tab = 'active' | 'completed' | 'failed';
-
-const LIFECYCLE_OPTIONS: { value: Tab; label: string }[] = [
-  { value: 'active', label: 'Running' },
-  { value: 'completed', label: 'Completed' },
-  { value: 'failed', label: 'Failed / Rejected' },
-];
-
-type SourceFilter = 'all' | 'standalone' | 'session';
-
-const SOURCE_OPTIONS: FilterPillOption[] = [
-  { value: 'all', label: 'All' },
-  { value: 'standalone', label: 'Standalone' },
-  { value: 'session', label: 'Session' },
-];
 
 // PID-reuse escape hatch (Plan 2 of the liveness-guard arc). `rupu transcript
 // archive|delete` refuses a standalone run whose metadata `pid` still looks
@@ -117,46 +93,27 @@ function confirmLivenessOverride(runId: string, e: ApiError): boolean {
 }
 
 export default function AgentRuns({ customer: fixedCustomer }: { customer?: string } = {}) {
-  const [tab, setTab] = useState<Tab>('active');
-  // Default 'standalone' — an agent-runs read is a standalone invocation by
-  // default; session-bound runs live on the Sessions page instead (operator
-  // feedback, 2026-07-23 amendment #2).
-  const [sourceFilter, setSourceFilter] = useState<SourceFilter>('standalone');
-  // All hosts by default: local paints at once, each remote merges in as it
-  // answers (usePerHostPagedList). A picked host lists only that host.
-  const [hostFilter, setHostFilter] = useState<string>(ALL_HOSTS);
-  const scoped = useScopedList(fixedCustomer, [tab, hostFilter]);
+  const [q, setQ] = useListQuery(fixedCustomer ? 'aq' : 'q');
+  const scoped = useScopedList(fixedCustomer, []);
   const { customer, embedded } = scoped;
   // Row-action (archive/restore/delete) failures — kept separate from the
   // list-fetch error the hook owns, but shown in the same banner.
   const [actionError, setActionError] = useState<string | null>(null);
-  const [query, setQuery] = useState('');
 
   const fetchRows = useCallback(
-    ({ host, offset, limit, signal }: PerHostFetchParams) =>
-      customer
-        ? scoped.guard(
-            api.getAgentRuns({
-              lifecycle: tab,
-              offset,
-              limit,
-              host,
-              signal,
-              customer,
-              onHostsWithoutCustomer: scoped.reportHosts(host, offset),
-            }),
-          )
-        : api.getAgentRuns({ lifecycle: tab, offset, limit, host, signal }),
-    [tab, customer, scoped.guard, scoped.reportHosts],
+    (p: PerHostFetchParams & ListQueryOpts) =>
+      customer ? scoped.guard(api.getAgentRuns({ ...p, customer })) : api.getAgentRuns(p),
+    [customer, scoped.guard],
   );
-  const { rows, slices, loading, error, hasMore, sentinelRef, refresh, refreshHost, removeRow, retryPaging, ended } =
-    usePerHostPagedList<AgentRunRow>({
-      host: hostFilter === ALL_HOSTS ? null : hostFilter,
+  const { rows, slices, loading, error, hasMore, sentinelRef, refresh, refreshHost, removeRow, retryPaging, ended, facets, queryError, notes } =
+    usePerHostQueryList<AgentRunRow>({
+      q: agentRunsQuery(q),
+      fields: AGENT_RUN_FIELDS,
+      scope: [customer],
       fetch: fetchRows,
       timeField: 'started_at',
       idField: 'run_id',
-      deps: [tab, customer],
-      poll: tab === 'active',
+      poll: true,
     });
 
   // Row-level actions (runs-section row-actions plan, Task 3). Keyed off
@@ -294,43 +251,17 @@ export default function AgentRuns({ customer: fixedCustomer }: { customer?: stri
   // around, or the operator sees the wrong banner for what just happened.
   const bannerError = actionError ?? error;
 
-  // Source pill — client-side (the wire payload already carries `source` per
-  // row; no extra server round-trip needed).
-  const bySource = rows.filter((r) => sourceFilter === 'all' || r.source === sourceFilter);
-
-  // Sort newest-first where started_at is available; runs without it sink to
-  // the bottom so that active/recent runs remain prominent. Feeds both the
-  // usage chart (left-to-right order) and the table's initial sort.
-  const sorted = [...bySource].sort((a, b) => {
+  // Newest-first where started_at is available; runs without it sink to the
+  // bottom so that active/recent runs remain prominent. Feeds both the usage
+  // chart (left-to-right order) and the table's initial sort.
+  const sorted = [...rows].sort((a, b) => {
     if (!a.started_at && !b.started_at) return 0;
     if (!a.started_at) return 1;
     if (!b.started_at) return -1;
     return Date.parse(b.started_at) - Date.parse(a.started_at);
   });
-
-  // Find — case-insensitive substring across the fields this table actually
-  // renders: agent name (subject), run/session ids, and host id. Composes
-  // with (narrows within) the lifecycle + Source pills above.
-  const q = query.trim().toLowerCase();
-  const visible = q
-    ? sorted.filter((r) =>
-        [r.agent, r.run_id, r.session_id, r.host_id, r.codename]
-          .filter((v): v is string => Boolean(v))
-          .some((v) => v.toLowerCase().includes(q)),
-      )
-    : sorted;
-
-  // Honest per-host states (spec §8): never claim "nothing" while a host is still loading, and
-  // keep the sentinel mounted whenever rows have loaded, even if the Source pill (default
-  // Standalone) or Find hides all of them, so scrolling keeps loading (a later page may match).
+  // Never claim "nothing" while a host is still loading.
   const waiting = waitingLabel(slices);
-  const missing = notIncluded(slices);
-  // With every loaded row filtered out the page shows "No matches yet · Waiting on X…" itself, so
-  // the footer (still mounted, to keep paging) does not repeat it.
-  const listFooter = perHostFooterText({ slices, loading, hasMore, ended, count: sorted.length, waitingShown: visible.length === 0 });
-  const footer = (text: string) => (
-    <PerHostFooter sentinelRef={sentinelRef} text={text} slices={slices} onRetry={retryPaging} />
-  );
 
   return (
     <div className={embedded ? undefined : 'p-8'}>
@@ -347,110 +278,65 @@ export default function AgentRuns({ customer: fixedCustomer }: { customer?: stri
         </Button>
       </header>
 
-      <FilterBar
-        filters={
-          <>
-            <FilterPills options={LIFECYCLE_OPTIONS} value={tab} onChange={(v) => setTab(v as Tab)} />
-            <FilterPills
-              label="Source"
-              options={SOURCE_OPTIONS}
-              value={sourceFilter}
-              onChange={(v) => setSourceFilter(v as SourceFilter)}
-            />
-          </>
-        }
-        search={
-          <SearchInput
-            aria-label="Find agents"
-            placeholder="Find agents…"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Escape') setQuery('');
-            }}
-          />
-        }
-        scope={<HostSelect allowAll ariaLabel="Host filter" value={hostFilter} onChange={setHostFilter} />}
+      <ListQueryBar
+        value={q}
+        onChange={setQ}
+        fields={AGENT_RUN_FIELDS}
+        facets={facets}
+        label="Filter agent runs"
+        placeholder="Filter standalone runs… e.g. is:running · is:failed since:7d · source:session"
+        error={queryError}
+        alerts={hostAlerts(notes, 'runs', retryPaging)}
       />
-      <div className="mt-3">
-        <PerHostStrip slices={slices} />
-      </div>
-      {customer && (
-        <HostsWithoutCustomerBanner
-          className="mt-3"
-          hosts={slices.map((sl) => ({ id: sl.hostId, name: sl.name, state: sl.state, reason: sl.reason }))}
-          without={scoped.hostsWithoutCustomer}
-        />
-      )}
 
-      <div className="mt-5">
-        {bannerError && <ErrorBanner className="mb-4">{bannerError}</ErrorBanner>}
+      {bannerError && <ErrorBanner className="mb-4">{bannerError}</ErrorBanner>}
 
-        {loading && rows.length === 0 ? (
-          <div className="py-16 flex items-center justify-center">
-            <Spinner label="Loading agent runs…" />
-          </div>
-        ) : rows.length === 0 && waiting ? (
-          <div className="py-16 flex items-center justify-center">
-            <Spinner label={waiting} />
-          </div>
-        ) : rows.length === 0 ? (
+      {loading && rows.length === 0 ? (
+        <div className="py-16 flex items-center justify-center">
+          <Spinner label="Loading agent runs…" />
+        </div>
+      ) : rows.length === 0 && waiting ? (
+        <div className="py-16 flex items-center justify-center">
+          <Spinner label={waiting} />
+        </div>
+      ) : rows.length === 0 && noHostAnswered(slices) ? (
+        <EmptyState title="No hosts answered" hint="Every host is offline or can't serve this list; the line under the query says which." />
+      ) : rows.length === 0 ? (
+        q.trim() ? (
+          <NoMatches noun="agent runs" />
+        ) : (
           <EmptyState
-            title={
-              noHostAnswered(slices)
-                ? 'No hosts answered'
-                : missing
-                  ? 'No agent runs on the hosts that answered'
-                  : 'No agent runs yet'
-            }
+            title="No agent runs"
             hint={
-              missing
-                ? `Not included: ${missing}.`
-                : customer === 'none'
-                  ? 'No agent runs without a customer yet.'
-                  : customer
-                    ? 'No agent runs are attributed to this customer yet.'
-                    : 'Standalone and session-bound agent invocations will appear here once they run.'
+              customer === 'none'
+                ? 'No standalone run without a customer yet. source:session lists session turns.'
+                : customer
+                  ? 'No standalone run is attributed to this customer yet. source:session lists session turns.'
+                  : 'Standalone runs appear here once an agent runs. source:session lists session turns.'
             }
           />
-        ) : visible.length === 0 ? (
-          <>
-            {waiting ? (
-              <div className="py-16 flex items-center justify-center">
-                <Spinner label={`No matches yet · ${waiting}`} />
-              </div>
-            ) : sorted.length === 0 ? (
-              <EmptyState
-                title="No agent runs match this filter"
-                hint="Try a different lifecycle, source, or host filter above."
-              />
-            ) : (
-              <EmptyState title="No matches" hint={`No agent runs match "${query}".`} />
-            )}
-            {footer(listFooter)}
-          </>
-        ) : (
-          <section>
-            <div className="bg-panel border border-border rounded-xl shadow-card px-4 py-3 mb-4">
-              <UsageBarChart bars={visible.map((r) => ({
-                id: r.run_id,
-                label: r.agent ?? r.run_id,
-                to: agentRunHref(r),
-                input_tokens: r.usage.input_tokens, output_tokens: r.usage.output_tokens,
-                cached_tokens: r.usage.cached_tokens, cost_usd: r.usage.cost_usd,
-              }))} />
-            </div>
-            <SortableTable<AgentRunRow>
-              columns={columns}
-              rows={visible}
-              rowKey={(r) => `${r.host_id ?? 'local'}:${r.run_id}`}
-              rowHref={agentRunHref}
-              initialSort={{ key: 'started', dir: 'desc' }}
-            />
-            {footer(q ? `${visible.length} matches of ${sorted.length} loaded` : listFooter)}
-          </section>
-        )}
-      </div>
+        )
+      ) : (
+        <section>
+          <div className="bg-panel border border-border rounded-xl shadow-card px-4 py-3 mb-4">
+            <UsageBarChart bars={sorted.map((r) => ({
+              id: r.run_id,
+              label: r.agent ?? r.run_id,
+              to: agentRunHref(r),
+              input_tokens: r.usage.input_tokens, output_tokens: r.usage.output_tokens,
+              cached_tokens: r.usage.cached_tokens, cost_usd: r.usage.cost_usd,
+            }))} />
+          </div>
+          <SortableTable<AgentRunRow>
+            columns={columns}
+            rows={sorted}
+            rowKey={(r) => `${r.host_id ?? 'local'}:${r.run_id}`}
+            rowHref={agentRunHref}
+            initialSort={{ key: 'started', dir: 'desc' }}
+          />
+          <ListFooter sentinelRef={sentinelRef} loading={loading} hasMore={hasMore} ended={ended} count={rows.length} />
+        </section>
+      )}
     </div>
   );
 }

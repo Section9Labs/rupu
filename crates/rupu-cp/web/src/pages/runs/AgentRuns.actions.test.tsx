@@ -86,12 +86,6 @@ function renderPage() {
   );
 }
 
-// Source pill defaults to Standalone — session-sourced fixtures only show up
-// once "All" (or "Session") is selected.
-async function showAll() {
-  fireEvent.click(await screen.findByRole('button', { name: 'All' }));
-}
-
 describe('AgentRuns — session-sourced row actions target the SESSION endpoint', () => {
   it('Archive calls api.archiveSession with session_id (not run_id) and the row host', async () => {
     stubDeps();
@@ -100,7 +94,6 @@ describe('AgentRuns — session-sourced row actions target the SESSION endpoint'
     vi.spyOn(window, 'confirm').mockReturnValue(true);
 
     renderPage();
-    await showAll();
     await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
 
     fireEvent.click(screen.getByLabelText(`Archive session ${SESSION_ROW.session_id}`));
@@ -119,7 +112,6 @@ describe('AgentRuns — session-sourced row actions target the SESSION endpoint'
     vi.spyOn(window, 'confirm').mockReturnValue(true);
 
     renderPage();
-    await showAll();
     await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
     expect(callsFor(runsSpy, 'local')).toHaveLength(1);
     expect(callsFor(runsSpy, 'host_prod')).toHaveLength(1);
@@ -137,7 +129,6 @@ describe('AgentRuns — session-sourced row actions target the SESSION endpoint'
     const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
 
     renderPage();
-    await showAll();
     await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
 
     fireEvent.click(screen.getByLabelText(`Archive session ${SESSION_ROW.session_id}`));
@@ -153,7 +144,6 @@ describe('AgentRuns — session-sourced row actions target the SESSION endpoint'
     vi.spyOn(window, 'confirm').mockReturnValue(false);
 
     renderPage();
-    await showAll();
     await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
 
     fireEvent.click(screen.getByLabelText(`Archive session ${SESSION_ROW.session_id}`));
@@ -167,7 +157,6 @@ describe('AgentRuns — session-sourced row actions target the SESSION endpoint'
     const restoreSpy = vi.spyOn(api, 'restoreSession').mockResolvedValue(undefined);
 
     renderPage();
-    await showAll();
     await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
 
     fireEvent.click(screen.getByLabelText(`Restore session ${SESSION_ROW.session_id}`));
@@ -184,7 +173,6 @@ describe('AgentRuns — session-sourced row actions target the SESSION endpoint'
     const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
 
     renderPage();
-    await showAll();
     await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
 
     fireEvent.click(screen.getByLabelText(`Delete session ${SESSION_ROW.session_id}`));
@@ -203,7 +191,6 @@ describe('AgentRuns — session-sourced row actions target the SESSION endpoint'
     vi.spyOn(window, 'confirm').mockReturnValue(false);
 
     renderPage();
-    await showAll();
     await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
 
     fireEvent.click(screen.getByLabelText(`Delete session ${SESSION_ROW.session_id}`));
@@ -460,7 +447,6 @@ describe('AgentRuns — action buttons never trigger row navigation', () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true);
 
     renderPage();
-    await showAll();
     await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
 
     const button = screen.getByLabelText(`Delete session ${SESSION_ROW.session_id}`);
@@ -483,7 +469,6 @@ describe('AgentRuns — shared session_id across multiple rows', () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true);
 
     renderPage();
-    await showAll();
     await waitFor(() =>
       expect(screen.getAllByLabelText(`Archive session ${SESSION_ROW.session_id}`)).toHaveLength(2),
     );

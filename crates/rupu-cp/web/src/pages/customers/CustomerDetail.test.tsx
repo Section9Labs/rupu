@@ -10,6 +10,7 @@ import {
   type AgentRunRow,
   type CustomerScope,
   type FindingOut,
+  type ListHeaders,
   type ProjectRow,
   type RunListRow,
   type UsageResponse,
@@ -566,11 +567,14 @@ describe('CustomerDetail Runs tab', () => {
     mount('/customers/acme/runs');
     expect(await screen.findByText('nightly-review')).toBeInTheDocument();
     expect(getWorkflowRuns).toHaveBeenCalledWith(
-      expect.objectContaining({ customer: 'acme', host: 'local', lifecycle: 'active' }),
+      expect.objectContaining({
+        customer: 'acme',
+        host: 'local',
+        q: '',
+      }),
     );
-    // Embedded: the page's own heading and the Archived state are not here.
+    // Embedded: the page's own heading is not here.
     expect(screen.queryByRole('heading', { name: 'Workflow Runs' })).not.toBeInTheDocument();
-    expect(screen.queryByText('Archived')).not.toBeInTheDocument();
   });
 
   it('the Agents toggle lists agent runs with the same customer', async () => {
@@ -586,35 +590,31 @@ describe('CustomerDetail Runs tab', () => {
     expect(await screen.findByText('nightly-review')).toBeInTheDocument();
   });
 
-  it('a remote host that cannot filter by customer shows as not included, never as zero', async () => {
+  it('a remote host that cannot filter by customer is named as left out, never counted as zero', async () => {
     vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([REG_LOCAL, REG_PROD]);
     getWorkflowRuns.mockImplementation((p?: { host?: string }) =>
       p?.host === 'host_prod'
-        ? Promise.reject(new ApiError(501, "host can't report a customer for every run", ''))
+        ? Promise.reject(
+            new ApiError(501, 'x', JSON.stringify({ error: "host host_prod can't report a customer for every run" })),
+          )
         : onlyHost('local', [RUN])(p),
     );
     mount('/customers/acme/runs');
     expect(await screen.findByText('nightly-review')).toBeInTheDocument();
-    expect(await screen.findByText(/not included: prod/)).toBeInTheDocument();
     expect(callsFor(getWorkflowRuns, 'host_prod')[0][0]).toEqual(expect.objectContaining({ customer: 'acme' }));
-    // …and the warn banner says why it is left out.
-    expect(screen.getByTestId('hosts-without-customer')).toHaveTextContent(
-      /prod runs an older rupu .* can’t tag every run with a customer — those runs are left out of this view, not counted as zero/,
-    );
-    // The archive can't be filtered by customer: a one-line hint says it isn't listed.
-    expect(screen.getByText(/Archived runs aren’t listed here/)).toBeInTheDocument();
+    expect(await screen.findByTestId('host-alert')).toHaveTextContent("prod can't filter by customer: its runs are left out");
   });
 
   it('names the hosts a run listing\'s X-Rupu-Hosts-Without-Customer header lists', async () => {
     getWorkflowRuns.mockImplementation(
-      (p?: { host?: string; onHostsWithoutCustomer?: (ids: string[]) => void }) => {
-        p?.onHostsWithoutCustomer?.(['worker-7']);
+      (p?: { host?: string; onHeaders?: (h: ListHeaders) => void }) => {
+        p?.onHeaders?.({ withoutCustomer: ['worker-7'], unfilterable: [] });
         return Promise.resolve([RUN]);
       },
     );
     mount('/customers/acme/runs');
     expect(await screen.findByText('nightly-review')).toBeInTheDocument();
-    expect(await screen.findByTestId('hosts-without-customer')).toHaveTextContent(/worker-7 runs an older rupu/);
+    expect(await screen.findByTestId('host-alert')).toHaveTextContent("worker-7 can't filter by customer: its runs are left out");
   });
 
   it('marks a run whose cost was priced at the global rates', async () => {

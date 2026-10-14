@@ -1,8 +1,8 @@
-// FilterBar — the ONE control-row layout for every list page. Fixed slot
-// order, never caller-configurable, so every page's filter row reads the
-// same way left-to-right:
+// FilterBar — the control row of a list page not yet on the query line
+// (components/query/ListQueryBar.tsx). Fixed slot order, never
+// caller-configurable, so the row reads the same way left-to-right:
 //
-//   [Segmented view] [FilterPills group(s)…] --- spacer --- [SearchInput?] [HostSelect]
+//   [Segmented view] [filter group(s)…] --- spacer --- [SearchInput?] [HostSelect]
 //
 // A page uses only the slots it needs; empty slots are omitted entirely (no
 // placeholder gap). One row, wraps on narrow viewports.
@@ -12,7 +12,7 @@ import type { ReactNode } from 'react';
 export interface FilterBarProps {
   /** The Segmented "which view" control, e.g. Runs/Cycles/Claims. */
   view?: ReactNode;
-  /** One or more FilterPills groups. */
+  /** One or more filter groups. */
   filters?: ReactNode;
   /** The SearchInput, when the page supports free-text filtering. */
   search?: ReactNode;

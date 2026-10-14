@@ -1,7 +1,8 @@
 // The standard list filter row: one full-width query line above a list's
 // table, with nothing beside it. Under it, quietly: why the query can't be
 // evaluated, one line per alert (an incomplete list), and "N of M" while a
-// query narrows the list. Every list page mounts it the same way.
+// query narrows a list the browser holds in full. Every list page mounts it
+// the same way.
 
 import { useMemo, type ReactNode } from 'react';
 import { useSearchParams } from 'react-router-dom';
@@ -16,10 +17,11 @@ export interface ListQueryBarProps {
   onChange: (q: string) => void;
   fields: readonly QueryField[];
   facets?: Record<string, FacetValue[]>;
-  /** Rows before the query. */
-  total: number;
+  /** Rows before the query; with `shown`, "N of M" while a query narrows
+   *  the list. A list the server filters knows neither and passes none. */
+  total?: number;
   /** Rows the query keeps. */
-  shown: number;
+  shown?: number;
   label: string;
   placeholder?: string;
   valueTone?: (key: string, value: string) => string | null;
@@ -44,7 +46,7 @@ export function ListQueryBar({
   alerts = [],
   className,
 }: ListQueryBarProps) {
-  const active = value.trim() !== '';
+  const active = value.trim() !== '' && total !== undefined && shown !== undefined;
   return (
     <div className={cn('mb-4', className)}>
       <QueryBar

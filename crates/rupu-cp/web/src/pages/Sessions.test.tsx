@@ -1,14 +1,14 @@
 // @vitest-environment jsdom
-// Sessions — verifies the FilterBar slot order, that the Active/Archived
-// FilterPills group and the host select drive the server request (not
-// client-side filtering), that the agent subject cell truncates with a
-// title tooltip, and that the kit's loading/empty/error states are in place.
+// Sessions — every registered host with one request each and honest
+// per-host loading/offline state; the agent subject cell truncating with a
+// title tooltip; the kit's loading/empty/error states; row navigation; the
+// customer scope. The query line itself is Sessions.query.test.tsx.
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
-import { api } from '../lib/api';
+import { api, ApiError } from '../lib/api';
 import type { SessionSummary } from '../lib/api';
 import { REG_LOCAL, REG_PROD, callsFor, onlyHost } from '../lib/perHost/testUtils';
 import Sessions from './Sessions';
@@ -49,105 +49,47 @@ function renderPage() {
   );
 }
 
-describe('Sessions — FilterBar', () => {
-  it('renders FilterBar slots in the fixed order: filters (Active/Archived pills), then scope (host select)', async () => {
-    stubDeps();
-    vi.spyOn(api, 'getSessions').mockResolvedValue([]);
-
-    renderPage();
-
-    const pills = await screen.findByRole('button', { name: 'Active' });
-    const hostSelect = screen.getByLabelText('Host filter');
-    // The pills group precedes the host select in document order.
-    expect(pills.compareDocumentPosition(hostSelect) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-  });
-
-  it('renders the Active/Archived pills with Active active by default', async () => {
-    stubDeps();
-    vi.spyOn(api, 'getSessions').mockResolvedValue([]);
-
-    renderPage();
-
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Active' })).toBeInTheDocument());
-    expect(screen.getByRole('button', { name: 'Archived' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Active' })).toHaveAttribute('aria-pressed', 'true');
-    expect(screen.getByRole('button', { name: 'Archived' })).toHaveAttribute('aria-pressed', 'false');
-  });
-});
-
-describe('Sessions — Active/Archived drives fetch', () => {
-  it('defaults to scope "active"', async () => {
-    stubDeps();
-    const sessionsSpy = vi.spyOn(api, 'getSessions').mockResolvedValue([]);
-
-    renderPage();
-
-    await waitFor(() =>
-      expect(sessionsSpy).toHaveBeenCalledWith(expect.objectContaining({ scope: 'active' })),
-    );
-  });
-
-  it('clicking "Archived" re-fetches with scope: "archived"', async () => {
-    stubDeps();
-    const sessionsSpy = vi.spyOn(api, 'getSessions').mockResolvedValue([]);
-
-    renderPage();
-    await waitFor(() => screen.getByRole('button', { name: 'Archived' }));
-
-    fireEvent.click(screen.getByRole('button', { name: 'Archived' }));
-
-    await waitFor(() =>
-      expect(sessionsSpy).toHaveBeenCalledWith(expect.objectContaining({ scope: 'archived' })),
-    );
-  });
-});
-
-describe('Sessions host filter — server-driven', () => {
-  it('defaults to All hosts and fetches every registered host with its own host param', async () => {
+describe('Sessions — per-host loading', () => {
+  it('fetches every registered host with its own host param', async () => {
     stubDeps();
     const sessionsSpy = vi.spyOn(api, 'getSessions').mockResolvedValue([]);
     renderPage();
     await waitFor(() => expect(callsFor(sessionsSpy, 'local')).toHaveLength(1));
     expect(callsFor(sessionsSpy, 'host_prod')).toHaveLength(1);
-    expect(screen.getByLabelText('Host filter')).toHaveValue('__all__');
   });
 
-  it('renders This host, registered (non-local) hosts, and All hosts — via the shared HostSelect', async () => {
+  it('shows an offline remote in the line under the bar without hiding local rows', async () => {
     stubDeps();
-    vi.spyOn(api, 'getSessions').mockResolvedValue([]);
-
-    renderPage();
-    await waitFor(() => expect(screen.getByRole('option', { name: 'prod' })).toBeInTheDocument());
-
-    const options = screen.getAllByRole('option') as HTMLOptionElement[];
-    expect(options.map((o) => o.textContent)).toEqual(['This host', 'All hosts', 'prod']);
-  });
-
-  it('This host fetches only local', async () => {
-    stubDeps();
-    const sessionsSpy = vi.spyOn(api, 'getSessions').mockResolvedValue([]);
-    renderPage();
-    await waitFor(() => expect(screen.getByRole('option', { name: 'prod' })).toBeInTheDocument());
-    sessionsSpy.mockClear();
-    fireEvent.change(screen.getByLabelText('Host filter'), { target: { value: 'local' } });
-    await waitFor(() => expect(callsFor(sessionsSpy, 'local')).toHaveLength(1));
-    expect(callsFor(sessionsSpy, 'host_prod')).toHaveLength(0);
-  });
-
-  it('remote host option fetches with that host id', async () => {
-    stubDeps();
-    const sessionsSpy = vi.spyOn(api, 'getSessions').mockResolvedValue([]);
-
-    renderPage();
-    await waitFor(() =>
-      expect(screen.getByRole('option', { name: 'prod' })).toBeInTheDocument(),
+    vi.spyOn(api, 'getSessions').mockImplementation((p) =>
+      p?.host === 'local'
+        ? Promise.resolve([{ ...REMOTE_SESSION, host_id: 'local' }])
+        : Promise.reject(new ApiError(502, 'x', '{"error":"host unreachable: timed out"}')),
     );
+    renderPage();
+    expect(await screen.findByTestId('host-alert')).toHaveTextContent('prod offline: its sessions are missing');
+    expect(screen.getByText(/fix-bug/)).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
 
-    fireEvent.change(screen.getByLabelText('Host filter'), { target: { value: 'host_prod' } });
-
-    await waitFor(() =>
-      expect(sessionsSpy).toHaveBeenCalledWith(expect.objectContaining({ host: 'host_prod' })),
+  it('says it is waiting on a host, not that there are no sessions, while that host loads', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getSessions').mockImplementation((p) =>
+      p?.host === 'local' ? Promise.resolve([]) : new Promise(() => {}),
     );
+    renderPage();
+    expect(await screen.findByText('Waiting on prod…')).toBeInTheDocument();
+    expect(screen.queryByText('No active sessions')).not.toBeInTheDocument();
+  });
+
+  it('says no host answered when every host failed', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getSessions').mockRejectedValue(new ApiError(502, 'x', '{"error":"down"}'));
+    renderPage();
+    expect(await screen.findByText('No hosts answered')).toBeInTheDocument();
+    expect(screen.getByTestId('host-alert')).toHaveTextContent(
+      'Local offline: its sessions are missing · prod offline: its sessions are missing',
+    );
+    expect(screen.queryByText('No active sessions')).not.toBeInTheDocument();
   });
 
   it('Host column renders host_id from the row', async () => {
@@ -222,22 +164,21 @@ describe('Sessions — kit loading/empty/error states', () => {
     await waitFor(() => expect(screen.getByText('No active sessions')).toBeInTheDocument());
     expect(
       screen.getByText(
-        'Active sessions appear here once an agent conversation is started against this control plane.',
+        'Active sessions appear here once an agent conversation is started against this control plane; is:archived lists closed ones.',
       ),
     ).toBeInTheDocument();
   });
 
-  it('shows the kit EmptyState with the archived copy on the Archived tab', async () => {
+  it('says nothing matches when a query keeps no session', async () => {
     stubDeps();
     vi.spyOn(api, 'getSessions').mockResolvedValue([]);
-
-    renderPage();
-    fireEvent.click(await screen.findByRole('button', { name: 'Archived' }));
-
-    await waitFor(() => expect(screen.getByText('No archived sessions')).toBeInTheDocument());
-    expect(
-      screen.getByText('Archived sessions appear here once an active conversation is closed.'),
-    ).toBeInTheDocument();
+    render(
+      <MemoryRouter initialEntries={['/sessions?q=is:archived']}>
+        {withCustomerScope(<Sessions />)}
+      </MemoryRouter>,
+    );
+    expect(await screen.findByText('No sessions match the filter.')).toBeInTheDocument();
+    expect(screen.queryByText('No active sessions')).not.toBeInTheDocument();
   });
 
   it('shows the kit ErrorBanner when the fetch fails', async () => {
@@ -385,112 +326,25 @@ describe('Sessions — whole-row navigation (rowHref)', () => {
   });
 });
 
-// ── Amendment #1 (2026-07-23 feedback round): Find on every table ──────────
-
-describe('Sessions — Find', () => {
-  const OTHER_SESSION: SessionSummary = {
-    ...REMOTE_SESSION,
-    session_id: 'sess-def456',
-    agent_name: 'review-pr',
-    host_id: 'local',
-  };
-
-  it('typing narrows rows by agent name, session id, or host id', async () => {
-    stubDeps();
-    vi.spyOn(api, 'getSessions').mockResolvedValue([REMOTE_SESSION, OTHER_SESSION]);
-
-    renderPage();
-    await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
-
-    fireEvent.change(screen.getByPlaceholderText('Find sessions…'), { target: { value: 'review' } });
-
-    await waitFor(() => expect(screen.queryByText(/fix-bug/)).not.toBeInTheDocument());
-    expect(screen.getByText(/review-pr/)).toBeInTheDocument();
-  });
-
-  it('footer shows "N matches of M loaded" while a query is active', async () => {
-    stubDeps();
-    vi.spyOn(api, 'getSessions').mockResolvedValue([REMOTE_SESSION, OTHER_SESSION]);
-
-    renderPage();
-    await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
-
-    fireEvent.change(screen.getByPlaceholderText('Find sessions…'), { target: { value: 'review' } });
-
-    await waitFor(() => expect(screen.getByText('1 matches of 2 loaded')).toBeInTheDocument());
-  });
-
-  it('Esc clears the query', async () => {
-    stubDeps();
-    vi.spyOn(api, 'getSessions').mockResolvedValue([REMOTE_SESSION, OTHER_SESSION]);
-
-    renderPage();
-    await waitFor(() => expect(screen.getByText(/review-pr/)).toBeInTheDocument());
-
-    const input = screen.getByPlaceholderText('Find sessions…') as HTMLInputElement;
-    fireEvent.change(input, { target: { value: 'review' } });
-    await waitFor(() => expect(screen.queryByText(/fix-bug/)).not.toBeInTheDocument());
-
-    fireEvent.keyDown(input, { key: 'Escape' });
-
-    await waitFor(() => expect(input.value).toBe(''));
-    expect(screen.getByText(/fix-bug/)).toBeInTheDocument();
-  });
-
-  it('composes with the Active/Archived pill: query narrows within the active tab only', async () => {
-    stubDeps();
-    const activeSpy = vi.spyOn(api, 'getSessions').mockResolvedValue([REMOTE_SESSION]);
-
-    renderPage();
-    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
-
-    fireEvent.change(screen.getByPlaceholderText('Find sessions…'), { target: { value: 'zzz-no-match' } });
-
-    await waitFor(() => expect(screen.getByText('No matches')).toBeInTheDocument());
-    // The query does not itself trigger a new server fetch — it stays
-    // client-side (Active/host params only).
-    expect(activeSpy).toHaveBeenCalledWith(expect.objectContaining({ scope: 'active' }));
-  });
-});
-
 describe('Sessions — codenames', () => {
-  it('renders the crew chip and Find matches by codename', async () => {
+  it('renders each session’s crew chip', async () => {
     stubDeps();
-    vi.spyOn(api, 'getSessions').mockResolvedValue([
-      { ...REMOTE_SESSION, codename: 'cobalt-harbor/heron#1' },
-      { ...REMOTE_SESSION, session_id: 'sess-zzz', agent_name: 'other', codename: 'amber-fjord/kite#1' },
-    ]);
-    renderPage();
-    await waitFor(() => expect(screen.getByText('cobalt-harbor')).toBeInTheDocument());
-    fireEvent.change(screen.getByPlaceholderText('Find sessions…'), { target: { value: 'cobalt' } });
-    await waitFor(() => expect(screen.queryByText('amber-fjord')).not.toBeInTheDocument());
-    expect(screen.getByText('cobalt-harbor')).toBeInTheDocument();
-  });
-});
-
-describe('Sessions — Find while a host is still loading', () => {
-  it('says who it is waiting on once, not again in the footer', async () => {
-    stubDeps();
-    vi.spyOn(api, 'getSessions').mockImplementation((p) =>
-      p?.host === 'local' ? Promise.resolve([{ ...REMOTE_SESSION, host_id: 'local' }]) : new Promise(() => {}),
+    vi.spyOn(api, 'getSessions').mockImplementation(
+      onlyHost('host_prod', [
+        { ...REMOTE_SESSION, codename: 'cobalt-harbor/heron#1' },
+        { ...REMOTE_SESSION, session_id: 'sess-zzz', agent_name: 'other', codename: 'amber-fjord/kite#1' },
+      ]),
     );
     renderPage();
-    await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
-
-    fireEvent.change(screen.getByPlaceholderText('Find sessions…'), { target: { value: 'zzz-no-match' } });
-
-    await waitFor(() => expect(screen.getByText('No matches yet · Waiting on prod…')).toBeInTheDocument());
-    expect(screen.getAllByText(/waiting on prod/i)).toHaveLength(1);
+    await waitFor(() => expect(screen.getByText('cobalt-harbor')).toBeInTheDocument());
+    expect(screen.getByText('amber-fjord')).toBeInTheDocument();
   });
 });
 
 describe('Sessions — the global customer scope', () => {
-  it('passes customer: "acme" on every per-host request and names hosts the header lists', async () => {
+  it('passes customer: "acme" on every per-host request, beside the query', async () => {
     stubDeps();
-    const spy = vi.spyOn(api, 'getSessions').mockImplementation((p) => {
-      if (p?.host === 'local') p.onHostsWithoutCustomer?.(['worker-7']);
-      return Promise.resolve([]);
-    });
+    const spy = vi.spyOn(api, 'getSessions').mockResolvedValue([]);
     render(
       <MemoryRouter initialEntries={[scopedEntry('acme')]}>
         {withCustomerScope(<Sessions />)}
@@ -498,9 +352,34 @@ describe('Sessions — the global customer scope', () => {
     );
     for (const host of ['local', 'host_prod']) {
       await waitFor(() => expect(callsFor(spy, host).length).toBeGreaterThan(0));
-      expect(callsFor(spy, host)[0][0]).toEqual(expect.objectContaining({ customer: 'acme', scope: 'active' }));
+      expect(callsFor(spy, host)[0][0]).toEqual(
+        expect.objectContaining({ customer: 'acme', q: 'is:active', onHeaders: expect.any(Function) }),
+      );
     }
-    expect(await screen.findByTestId('hosts-without-customer')).toHaveTextContent(/^worker-7 runs an older rupu/);
+  });
+
+  it('an unscoped page sends no customer', async () => {
+    stubDeps();
+    const spy = vi.spyOn(api, 'getSessions').mockResolvedValue([]);
+    renderPage();
+    await waitFor(() => expect(callsFor(spy, 'local').length).toBeGreaterThan(0));
+    expect(callsFor(spy, 'local')[0][0]).not.toHaveProperty('customer');
+  });
+
+  it('names the hosts the X-Rupu-Hosts-Without-Customer header lists, by name', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getSessions').mockImplementation((p) => {
+      if (p?.host === 'local') p.onHeaders?.({ withoutCustomer: ['host_prod'], unfilterable: [] });
+      return Promise.resolve([]);
+    });
+    render(
+      <MemoryRouter initialEntries={[scopedEntry('acme')]}>
+        {withCustomerScope(<Sessions />)}
+      </MemoryRouter>,
+    );
+    expect(await screen.findByTestId('host-alert')).toHaveTextContent(
+      "prod can't filter by customer: its sessions are left out",
+    );
   });
 
   it('marks a session cost priced at the wrong rates', async () => {

@@ -5,7 +5,10 @@
 // `rupu-coverage/tests/fixtures/finding_query/` (grammar.lockstep.test.ts).
 // Change both parsers and the fixtures together.
 
-export type FieldKind = 'severity' | 'tag' | 'cwe' | 'enum' | 'text';
+import { normalizeTime } from '../query/time';
+
+/** `time`: a span back from now, a UTC date or an RFC 3339 time (`../query/time.ts`). */
+export type FieldKind = 'severity' | 'tag' | 'cwe' | 'enum' | 'time' | 'text';
 export interface FieldSpec {
   key: string;
   aliases: string[];
@@ -224,7 +227,7 @@ export function normalize(f: FieldSpec, v: string): { ok: true; value: string } 
       const l = asciiLower(v);
       return f.values.includes(l)
         ? { ok: true, value: l }
-        : { ok: false, message: `\`${v}\` is not a ${f.key} (one of ${f.values.join(', ')})` };
+        : { ok: false, message: `\`${v}\` is not a value of \`${f.key}:\` (one of ${f.values.join(', ')})` };
     }
     case 'tag': {
       const t = parseTag(v);
@@ -236,6 +239,8 @@ export function normalize(f: FieldSpec, v: string): { ok: true; value: string } 
         ? { ok: false, message: `\`${v}\` is not a CWE id (expected 79 or CWE-79)` }
         : { ok: true, value: `CWE-${n}` };
     }
+    case 'time':
+      return normalizeTime(v);
     default:
       return { ok: true, value: v };
   }

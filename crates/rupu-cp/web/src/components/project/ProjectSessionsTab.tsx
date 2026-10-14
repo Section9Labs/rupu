@@ -1,11 +1,12 @@
 // Project Sessions tab body — paginated session list scoped to one project,
-// mirroring the standalone Sessions page (pages/Sessions.tsx) on the kit:
-// FilterBar + FilterPills (Scope) + SearchInput Find + usePagedList +
-// SortableTable fit/subject columns + kit empty/loading/error states.
+// mirroring the standalone Sessions page (pages/Sessions.tsx): one query line
+// the server evaluates (`?q=` on every request, `SESSION_FIELDS`), over
+// active and archived sessions alike unless the query names `is:`, +
+// usePagedList + SortableTable fit/subject columns + kit
+// empty/loading/error states.
 //
-// Project tabs are already workspace-scoped (the project IS the scope), so
-// there is no HostSelect slot here — unlike Sessions, which fans out across
-// hosts.
+// Project tabs are already workspace-scoped (the project IS the scope), and
+// the project's sessions are this host's.
 //
 // Ported from pages/ProjectSessions.tsx, reshaped into a self-contained
 // component keyed off the `wsId` prop. Rows render via the shared SortableTable.
@@ -16,53 +17,25 @@
 // `SessionStatusPill` is handed the raw wire value directly and does its own
 // exact-match-or-neutral-fallback (never coerces an unrecognized status onto
 // a real state).
-//
-// Find (parity with Sessions' 2026-07-23 amendment): a `SearchInput` in the
-// FilterBar's search slot narrows the loaded rows client-side, live per
-// keystroke, over agent name / session id — composing with (not replacing)
-// the Scope pill above it.
 
-import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { MessageSquare } from 'lucide-react';
 import { api, type SessionSummary } from '../../lib/api';
 import SortableTable, { type Column } from '../lists/SortableTable';
 import UsageBarChart from '../charts/UsageBarChart';
-import { FilterBar } from '../ui/FilterBar';
-import { FilterPills, type FilterPillOption } from '../ui/FilterPills';
-import { SearchInput } from '../ui/SearchInput';
 import { EmptyState } from '../ui/EmptyState';
 import { ErrorBanner } from '../ui/ErrorBanner';
 import { Spinner } from '../ui/Spinner';
 import { SessionStatusPill } from '../StatusPill';
-import { usePagedList } from '../../lib/usePagedList';
+import { ListQueryBar, NoMatches, useListQuery } from '../query/ListQueryBar';
+import { ListFooter } from '../lists/ListFooter';
+import { usePagedQueryList } from '../../lib/query/usePagedQueryList';
+import { SESSION_FIELDS } from '../../lib/query/lists/sessions';
 import { durationBetween, relativeTime } from '../../lib/time';
 import { formatTokens, formatCost } from '../../lib/usage';
 import { PricingErrorMark } from '../customers/PricingErrorMark';
-import { sessionStatusDisplayLabel, sessionStatusTone } from '../../lib/sessionStatus';
+import { sessionStatusDisplayLabel } from '../../lib/sessionStatus';
 import { shortId } from '../../lib/shortId';
-
-// --- Scope filter -----------------------------------------------------------
-
-type ScopeFilter = 'all' | 'active' | 'archived';
-
-const SCOPE_OPTIONS: FilterPillOption[] = [
-  { value: 'all', label: 'All' },
-  { value: 'active', label: 'Active' },
-  { value: 'archived', label: 'Archived' },
-];
-
-// A session is "archived" when its status tone resolves to `stopped`
-// (done / stopped / archived / exited per sessionStatusTone); everything
-// else — running / idle / neutral — is treated as "active".
-function isArchived(s: SessionSummary): boolean {
-  return sessionStatusTone(s.status) === 'stopped';
-}
-
-function matchesScope(s: SessionSummary, filter: ScopeFilter): boolean {
-  if (filter === 'all') return true;
-  return filter === 'archived' ? isArchived(s) : !isArchived(s);
-}
 
 /** Session duration in ms (created → last update); null when timestamps are bad. */
 function sessionDurationMs(s: SessionSummary): number | null {
@@ -225,52 +198,27 @@ function buildSessionColumns(navigate: ReturnType<typeof useNavigate>): Column<S
 export default function ProjectSessionsTab({ wsId }: { wsId: string }) {
   const navigate = useNavigate();
   const sessionColumns = buildSessionColumns(navigate);
-  const [scope, setScope] = useState<ScopeFilter>('all');
-  const [query, setQuery] = useState('');
-
-  const { rows, loading, error, hasMore, sentinelRef, ended } = usePagedList<SessionSummary>({
-    fetch: ({ offset, limit }) => api.getProjectSessions(wsId, { offset, limit }),
-    deps: [wsId],
+  const [q, setQ] = useListQuery();
+  const { rows, loading, error, hasMore, sentinelRef, ended, facets, queryError } = usePagedQueryList<SessionSummary>({
+    q,
+    fields: SESSION_FIELDS,
+    scope: [wsId],
+    fetch: (p) => api.getProjectSessions(wsId, p),
   });
 
-  const filtered = rows.filter((s) => matchesScope(s, scope));
-
-  // Find — case-insensitive substring across the fields this table actually
-  // renders: agent name (subject) and session id. Composes with (narrows
-  // within) the Scope pill above.
-  const q = query.trim().toLowerCase();
-  const visible = q
-    ? filtered.filter((s) =>
-        [s.agent_name, s.session_id]
-          .filter((v): v is string => Boolean(v))
-          .some((v) => v.toLowerCase().includes(q)),
-      )
-    : filtered;
-
-  const usageBars = visible.filter((s) => s.usage);
+  const usageBars = rows.filter((s) => s.usage);
 
   return (
     <div className="space-y-4">
-      <FilterBar
-        filters={
-          <FilterPills
-            label="Scope"
-            options={SCOPE_OPTIONS}
-            value={scope}
-            onChange={(v) => setScope(v as ScopeFilter)}
-          />
-        }
-        search={
-          <SearchInput
-            aria-label="Find sessions"
-            placeholder="Find sessions…"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Escape') setQuery('');
-            }}
-          />
-        }
+      <ListQueryBar
+        className="mb-0"
+        value={q}
+        onChange={setQ}
+        fields={SESSION_FIELDS}
+        facets={facets}
+        label="Filter sessions"
+        placeholder="is:active · agent:recon · status:failed"
+        error={queryError}
       />
 
       {error && <ErrorBanner>{error}</ErrorBanner>}
@@ -279,13 +227,12 @@ export default function ProjectSessionsTab({ wsId }: { wsId: string }) {
         <div className="py-12 flex items-center justify-center">
           <Spinner label="Loading sessions…" />
         </div>
-      ) : filtered.length === 0 ? (
-        <EmptyState
-          icon={<MessageSquare size={20} />}
-          title={rows.length === 0 ? 'No sessions for this project yet' : 'No sessions match this filter'}
-        />
-      ) : visible.length === 0 ? (
-        <EmptyState title="No matches" hint={`No sessions match "${query}".`} />
+      ) : rows.length === 0 ? (
+        q.trim() ? (
+          <NoMatches noun="sessions" />
+        ) : (
+          <EmptyState icon={<MessageSquare size={20} />} title="No sessions for this project yet" />
+        )
       ) : (
         <div className="space-y-4">
           {usageBars.length > 0 && (
@@ -308,22 +255,11 @@ export default function ProjectSessionsTab({ wsId }: { wsId: string }) {
               client-side. */}
           <SortableTable<SessionSummary>
             columns={sessionColumns}
-            rows={visible}
+            rows={rows}
             rowKey={(s) => s.session_id}
             rowHref={(s) => `/sessions/${encodeURIComponent(s.session_id)}`}
           />
-        </div>
-      )}
-
-      {visible.length > 0 && (loading || hasMore || ended) && (
-        <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
-          {q
-            ? `${visible.length} matches of ${filtered.length} loaded`
-            : loading
-              ? 'loading more…'
-              : hasMore
-                ? 'scroll for more'
-                : `— end of ${filtered.length} —`}
+          <ListFooter sentinelRef={sentinelRef} loading={loading} hasMore={hasMore} ended={ended} count={rows.length} />
         </div>
       )}
     </div>

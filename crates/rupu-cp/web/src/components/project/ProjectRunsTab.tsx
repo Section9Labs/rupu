@@ -1,80 +1,37 @@
 // Project Runs tab body — paginated run list scoped to one project, mirroring
-// the standalone WorkflowRuns page (pages/runs/WorkflowRuns.tsx) on the kit:
-// FilterBar + FilterPills (Status, Trigger) + SearchInput Find + usePagedList
-// + SortableTable fit/subject columns + StatusPill + EmptyState/ErrorBanner.
+// the standalone WorkflowRuns page (pages/runs/WorkflowRuns.tsx): one query
+// line the server evaluates (`?q=` on every request, `WORKFLOW_RUN_FIELDS`),
+// over every status unless the query names one, + usePagedList + SortableTable
+// fit/subject columns + StatusPill + EmptyState/ErrorBanner.
 //
-// Project tabs are already workspace-scoped (the project IS the scope), so
-// there is no HostSelect slot here — unlike WorkflowRuns, which fans out
-// across hosts.
-//
-// Ported from pages/ProjectRuns.tsx (fetch / load-more rendering), reshaped
-// into a self-contained component keyed off the `wsId` prop. Rows render via
-// the shared SortableTable.
+// Project tabs are already workspace-scoped (the project IS the scope), and
+// the project's runs are this host's.
 //
 // The usage graph above the table is `ProjectUsageTimeline` (Task U4) — the
 // project-scoped mount of the SAME interactive spend-over-time graph
 // `/usage` uses, replacing the old per-run `UsageBarChart` (one bar per run,
 // stacked by token type). See that component's doc comment for why it owns
 // its own fetch/state rather than sharing this tab's `runs`/filter state.
-//
-// Find (parity with WorkflowRuns' 2026-07-23 amendment): a `SearchInput` in
-// the FilterBar's search slot narrows the loaded rows client-side, live per
-// keystroke, over workflow name / run id / trigger — composing with (not
-// replacing) the status/trigger pills above it.
 
-import { useState } from 'react';
-import { api, type RunListRow, type RunStatusStr } from '../../lib/api';
+import { api, type RunListRow } from '../../lib/api';
 import { StatusPill } from '../StatusPill';
 import { TriggerChip } from '../TriggerChip';
 import { CrewChip } from '../codename/CrewChip';
 import SortableTable, { type Column } from '../lists/SortableTable';
-import { FilterBar } from '../ui/FilterBar';
-import { FilterPills, type FilterPillOption } from '../ui/FilterPills';
-import { SearchInput } from '../ui/SearchInput';
 import { EmptyState } from '../ui/EmptyState';
 import { ErrorBanner } from '../ui/ErrorBanner';
 import { Spinner } from '../ui/Spinner';
 import ProjectUsageTimeline from './ProjectUsageTimeline';
 import { PricingErrorMark } from '../customers/PricingErrorMark';
-import { usePagedList } from '../../lib/usePagedList';
+import { ListQueryBar, NoMatches, useListQuery } from '../query/ListQueryBar';
+import { ListFooter } from '../lists/ListFooter';
+import { usePagedQueryList } from '../../lib/query/usePagedQueryList';
+import { WORKFLOW_RUN_FIELDS } from '../../lib/query/lists/workflowRuns';
 import { durationBetween, relativeTime } from '../../lib/time';
 import { formatTokens, formatCost } from '../../lib/usage';
 import { formatDuration } from '../../lib/duration';
 import { shortId } from '../../lib/shortId';
 import { parseCodename } from '../../lib/codename';
-
-// --- Filter definitions -----------------------------------------------------
-
-type StatusFilter = 'all' | 'running' | 'completed' | 'failed';
-type TriggerFilter = 'all' | 'manual' | 'event' | 'cron';
-
-const STATUS_OPTIONS: FilterPillOption[] = [
-  { value: 'all', label: 'All' },
-  { value: 'running', label: 'Running' },
-  { value: 'completed', label: 'Completed' },
-  { value: 'failed', label: 'Failed' },
-];
-
-const TRIGGER_OPTIONS: FilterPillOption[] = [
-  { value: 'all', label: 'All' },
-  { value: 'manual', label: 'Manual' },
-  { value: 'event', label: 'Event' },
-  { value: 'cron', label: 'Cron' },
-];
-
-// Status grouping mirrors the run-status enum in StatusPill:
-//   running   → running | pending | awaiting_approval
-//   completed → completed
-//   failed    → failed | rejected
-const STATUS_GROUP: Record<Exclude<StatusFilter, 'all'>, ReadonlySet<RunStatusStr>> = {
-  running: new Set<RunStatusStr>(['running', 'pending', 'awaiting_approval']),
-  completed: new Set<RunStatusStr>(['completed']),
-  failed: new Set<RunStatusStr>(['failed', 'rejected']),
-};
-
-function matchesStatus(status: RunStatusStr, filter: StatusFilter): boolean {
-  return filter === 'all' || STATUS_GROUP[filter].has(status);
-}
 
 /** Run duration in ms — explicit duration_ms, else derived from start/finish. */
 function runDurationMs(run: RunListRow): number | null {
@@ -205,61 +162,25 @@ const RUN_COLUMNS: Column<RunListRow>[] = [
 ];
 
 export default function ProjectRunsTab({ wsId }: { wsId: string }) {
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
-  const [triggerFilter, setTriggerFilter] = useState<TriggerFilter>('all');
-  const [query, setQuery] = useState('');
-
-  const { rows, loading, error, hasMore, sentinelRef, ended } = usePagedList<RunListRow>({
-    fetch: ({ offset, limit }) => api.getProjectRuns(wsId, { offset, limit }),
-    deps: [wsId],
+  const [q, setQ] = useListQuery();
+  const { rows, loading, error, hasMore, sentinelRef, ended, facets, queryError } = usePagedQueryList<RunListRow>({
+    q,
+    fields: WORKFLOW_RUN_FIELDS,
+    scope: [wsId],
+    fetch: (p) => api.getProjectRuns(wsId, p),
   });
-
-  const filtered = rows.filter(
-    (r) => matchesStatus(r.status, statusFilter) && (triggerFilter === 'all' || r.trigger === triggerFilter),
-  );
-
-  // Find — case-insensitive substring across the fields this table actually
-  // renders: workflow name (subject), run id, and trigger. Composes with
-  // (narrows within) the status/trigger pills above.
-  const q = query.trim().toLowerCase();
-  const visible = q
-    ? filtered.filter((r) =>
-        [r.workflow_name, r.id, r.trigger, r.codename]
-          .filter((v): v is string => Boolean(v))
-          .some((v) => v.toLowerCase().includes(q)),
-      )
-    : filtered;
 
   return (
     <div className="space-y-4">
-      <FilterBar
-        filters={
-          <>
-            <FilterPills
-              label="Status"
-              options={STATUS_OPTIONS}
-              value={statusFilter}
-              onChange={(v) => setStatusFilter(v as StatusFilter)}
-            />
-            <FilterPills
-              label="Trigger"
-              options={TRIGGER_OPTIONS}
-              value={triggerFilter}
-              onChange={(v) => setTriggerFilter(v as TriggerFilter)}
-            />
-          </>
-        }
-        search={
-          <SearchInput
-            aria-label="Find runs"
-            placeholder="Find runs…"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Escape') setQuery('');
-            }}
-          />
-        }
+      <ListQueryBar
+        className="mb-0"
+        value={q}
+        onChange={setQ}
+        fields={WORKFLOW_RUN_FIELDS}
+        facets={facets}
+        label="Filter runs"
+        placeholder="status:failed · trigger:cron · since:7d"
+        error={queryError}
       />
 
       {/* The spend-over-time graph — Task U4: the SAME `/usage` graph,
@@ -275,32 +196,19 @@ export default function ProjectRunsTab({ wsId }: { wsId: string }) {
         <div className="py-12 flex items-center justify-center">
           <Spinner label="Loading runs…" />
         </div>
-      ) : filtered.length === 0 ? (
-        <EmptyState
-          title={rows.length === 0 ? 'No runs for this project yet' : 'No runs match this filter'}
-        />
-      ) : visible.length === 0 ? (
-        <EmptyState title="No matches" hint={`No runs match "${query}".`} />
+      ) : rows.length === 0 ? (
+        q.trim() ? <NoMatches noun="runs" /> : <EmptyState title="No runs for this project yet" />
       ) : (
-        <SortableTable<RunListRow>
-          columns={RUN_COLUMNS}
-          rows={visible}
-          rowKey={(r) => r.id}
-          rowHref={(r) => `/runs/${encodeURIComponent(r.id)}`}
-          initialSort={{ key: 'started', dir: 'desc' }}
-        />
-      )}
-
-      {visible.length > 0 && (loading || hasMore || ended) && (
-        <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
-          {q
-            ? `${visible.length} matches of ${filtered.length} loaded`
-            : loading
-              ? 'loading more…'
-              : hasMore
-                ? 'scroll for more'
-                : `— end of ${filtered.length} —`}
-        </div>
+        <>
+          <SortableTable<RunListRow>
+            columns={RUN_COLUMNS}
+            rows={rows}
+            rowKey={(r) => r.id}
+            rowHref={(r) => `/runs/${encodeURIComponent(r.id)}`}
+            initialSort={{ key: 'started', dir: 'desc' }}
+          />
+          <ListFooter sentinelRef={sentinelRef} loading={loading} hasMore={hasMore} ended={ended} count={rows.length} />
+        </>
       )}
     </div>
   );

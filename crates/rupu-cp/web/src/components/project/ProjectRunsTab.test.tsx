@@ -1,10 +1,8 @@
 // @vitest-environment jsdom
-// ProjectRunsTab — One Control Language migration (Phase 3, Task G).
-// Covers: the FilterBar renders with no host slot (project tabs are already
-// workspace-scoped); the Status/Trigger FilterPills groups narrow the loaded
-// rows client-side (composing with each other); Find narrows further with
-// the matches footer; fit/subject table-rules columns; kit loading/empty/
-// error states.
+// ProjectRunsTab — the query line the server evaluates (`?q=` on
+// /api/projects/:ws_id/runs, with no implicit default; facets on the first
+// page only; a 400 is the bar's error), fit/subject table-rules columns, kit
+// loading/empty/error states.
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
@@ -12,10 +10,12 @@ import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/re
 import { MemoryRouter } from 'react-router-dom';
 import { api, type RunListRow } from '../../lib/api';
 import ProjectRunsTab from './ProjectRunsTab';
+import { listCalls, parseError, stubListFetch, type StubAnswer } from '../../lib/query/listFetchStub';
 
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 function usage(): RunListRow['usage'] {
@@ -92,116 +92,6 @@ function renderTab(wsId = 'x') {
   );
 }
 
-describe('ProjectRunsTab — FilterBar (no host slot)', () => {
-  it('renders the Status and Trigger FilterPills groups and a Find input, with no HostSelect', async () => {
-    mockRuns();
-    renderTab();
-
-    await waitFor(() => expect(screen.getByText('wf-running-manual')).toBeInTheDocument());
-
-    const statusAll = screen.getAllByRole('button', { name: 'All' })[0];
-    expect(statusAll).toHaveAttribute('aria-pressed', 'true');
-    expect(screen.getByRole('button', { name: 'Running' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Manual' })).toBeInTheDocument();
-    expect(screen.getByPlaceholderText('Find runs…')).toBeInTheDocument();
-    expect(screen.queryByLabelText('Host filter')).not.toBeInTheDocument();
-  });
-});
-
-describe('ProjectRunsTab — Status/Trigger FilterPills narrow rows', () => {
-  it('renders all rows then narrows via status and trigger pills, composing the two groups', async () => {
-    mockRuns();
-    renderTab();
-
-    // All four rows show once loaded.
-    await waitFor(() => expect(screen.getByText('wf-running-manual')).toBeInTheDocument());
-    expect(screen.getByText('wf-completed-cron')).toBeInTheDocument();
-    expect(screen.getByText('wf-failed-event')).toBeInTheDocument();
-    expect(screen.getByText('wf-awaiting-manual')).toBeInTheDocument();
-
-    // Click "Running" status pill → only running-group rows
-    // (running + awaiting_approval), the other two drop out.
-    fireEvent.click(screen.getByRole('button', { name: 'Running' }));
-    expect(screen.getByText('wf-running-manual')).toBeInTheDocument();
-    expect(screen.getByText('wf-awaiting-manual')).toBeInTheDocument();
-    expect(screen.queryByText('wf-completed-cron')).not.toBeInTheDocument();
-    expect(screen.queryByText('wf-failed-event')).not.toBeInTheDocument();
-
-    // Add a Manual trigger filter → still both manual running-group rows.
-    fireEvent.click(screen.getByRole('button', { name: 'Manual' }));
-    expect(screen.getByText('wf-running-manual')).toBeInTheDocument();
-    expect(screen.getByText('wf-awaiting-manual')).toBeInTheDocument();
-    expect(screen.queryByText('wf-completed-cron')).not.toBeInTheDocument();
-    expect(screen.queryByText('wf-failed-event')).not.toBeInTheDocument();
-
-    // Reset status back to "All" (status group's All pill) → still Manual
-    // trigger filter narrows to the two manual rows of any status.
-    fireEvent.click(screen.getAllByRole('button', { name: 'All' })[0]);
-    expect(screen.getByText('wf-running-manual')).toBeInTheDocument();
-    expect(screen.getByText('wf-awaiting-manual')).toBeInTheDocument();
-    expect(screen.queryByText('wf-completed-cron')).not.toBeInTheDocument();
-    expect(screen.queryByText('wf-failed-event')).not.toBeInTheDocument();
-
-    // Reset trigger back to "All" too → all four rows back.
-    fireEvent.click(screen.getAllByRole('button', { name: 'All' })[1]);
-    expect(screen.getByText('wf-running-manual')).toBeInTheDocument();
-    expect(screen.getByText('wf-completed-cron')).toBeInTheDocument();
-    expect(screen.getByText('wf-failed-event')).toBeInTheDocument();
-    expect(screen.getByText('wf-awaiting-manual')).toBeInTheDocument();
-  });
-});
-
-describe('ProjectRunsTab — Find', () => {
-  it('typing narrows rows by workflow name, run id, or trigger', async () => {
-    mockRuns();
-    renderTab();
-    await waitFor(() => expect(screen.getByText('wf-completed-cron')).toBeInTheDocument());
-
-    fireEvent.change(screen.getByPlaceholderText('Find runs…'), { target: { value: 'cron' } });
-
-    await waitFor(() => expect(screen.queryByText('wf-running-manual')).not.toBeInTheDocument());
-    expect(screen.getByText('wf-completed-cron')).toBeInTheDocument();
-  });
-
-  it('footer shows "N matches of M loaded" while a query is active', async () => {
-    mockRuns();
-    renderTab();
-    await waitFor(() => expect(screen.getByText('wf-completed-cron')).toBeInTheDocument());
-
-    fireEvent.change(screen.getByPlaceholderText('Find runs…'), { target: { value: 'cron' } });
-
-    await waitFor(() => expect(screen.getByText('1 matches of 4 loaded')).toBeInTheDocument());
-  });
-
-  it('Esc clears the query', async () => {
-    mockRuns();
-    renderTab();
-    await waitFor(() => expect(screen.getByText('wf-completed-cron')).toBeInTheDocument());
-
-    const input = screen.getByPlaceholderText('Find runs…') as HTMLInputElement;
-    fireEvent.change(input, { target: { value: 'cron' } });
-    await waitFor(() => expect(screen.queryByText('wf-running-manual')).not.toBeInTheDocument());
-
-    fireEvent.keyDown(input, { key: 'Escape' });
-
-    await waitFor(() => expect(input.value).toBe(''));
-    expect(screen.getByText('wf-running-manual')).toBeInTheDocument();
-  });
-
-  it('composes with the pills: searching narrows within the active pill filter', async () => {
-    mockRuns();
-    renderTab();
-    await waitFor(() => expect(screen.getByText('wf-completed-cron')).toBeInTheDocument());
-
-    fireEvent.click(screen.getByRole('button', { name: 'Running' }));
-    await waitFor(() => expect(screen.queryByText('wf-completed-cron')).not.toBeInTheDocument());
-
-    fireEvent.change(screen.getByPlaceholderText('Find runs…'), { target: { value: 'cron' } });
-
-    await waitFor(() => expect(screen.getByText('No matches')).toBeInTheDocument());
-  });
-});
-
 describe('ProjectRunsTab — table rules (fit/subject columns)', () => {
   it('the workflow column is the one flexible/truncating subject column', async () => {
     mockRuns();
@@ -249,14 +139,15 @@ describe('ProjectRunsTab — kit loading/empty/error states', () => {
     await waitFor(() => expect(screen.getByText('No runs for this project yet')).toBeInTheDocument());
   });
 
-  it('shows the kit EmptyState "no match" copy when a pill filter narrows to zero', async () => {
-    mockRuns([ROWS[1]]); // completed/cron only
-    renderTab();
-    await waitFor(() => expect(screen.getByText('wf-completed-cron')).toBeInTheDocument());
-
-    fireEvent.click(screen.getByRole('button', { name: 'Running' }));
-
-    await waitFor(() => expect(screen.getByText('No runs match this filter')).toBeInTheDocument());
+  it('says nothing matches when a query keeps no run', async () => {
+    mockRuns([]);
+    render(
+      <MemoryRouter initialEntries={['/?q=status:failed']}>
+        <ProjectRunsTab wsId="x" />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByText('No runs match the filter.')).toBeInTheDocument();
+    expect(screen.queryByText('No runs for this project yet')).not.toBeInTheDocument();
   });
 
   it('shows the kit ErrorBanner when the fetch fails', async () => {
@@ -270,16 +161,14 @@ describe('ProjectRunsTab — kit loading/empty/error states', () => {
 });
 
 describe('ProjectRunsTab — codenames', () => {
-  it('renders crew names and Find matches by codename', async () => {
+  it('renders each run’s crew name', async () => {
     mockRuns([
       { ...ROWS[0], id: 'r-a', workflow_name: 'wf-a', codename: 'cobalt-harbor/heron#1' },
       { ...ROWS[1], id: 'r-b', workflow_name: 'wf-b', codename: 'amber-fjord/kite#1' },
     ]);
     renderTab();
     await waitFor(() => expect(screen.getByText('cobalt-harbor')).toBeInTheDocument());
-    fireEvent.change(screen.getByPlaceholderText('Find runs…'), { target: { value: 'cobalt' } });
-    await waitFor(() => expect(screen.queryByText('wf-b')).not.toBeInTheDocument());
-    expect(screen.getByText('wf-a')).toBeInTheDocument();
+    expect(screen.getByText('amber-fjord')).toBeInTheDocument();
   });
 });
 
@@ -289,5 +178,64 @@ describe('ProjectRunsTab — pricing errors', () => {
     renderTab();
     expect(await screen.findByRole('img', { name: 'Pricing unavailable: acme layer broken', hidden: true })).toBeInTheDocument();
     expect(screen.getAllByRole('img', { name: /^Pricing unavailable/, hidden: true })).toHaveLength(1);
+  });
+});
+
+describe('ProjectRunsTab — the query reaches the server', () => {
+  const PATH = '/api/projects/ws-1/runs';
+
+  function mountQuery(answer: (u: URL) => StubAnswer | undefined, search = '') {
+    vi.spyOn(api, 'getUsageRuns').mockResolvedValue([]);
+    const urls = stubListFetch([], answer);
+    render(
+      <MemoryRouter initialEntries={[`/${search}`]}>
+        <ProjectRunsTab wsId="ws-1" />
+      </MemoryRouter>,
+    );
+    return urls;
+  }
+  const sentQ = (urls: URL[]) => listCalls(urls, PATH).map((u) => u.searchParams.get('q'));
+
+  it.each([
+    ['', null],
+    ['?q=status:failed', 'status:failed'],
+    ['?q=trigger:cron since:7d', 'trigger:cron since:7d'],
+  ])('%s sends q=%s, with no implicit default', async (search, q) => {
+    const urls = mountQuery(() => ({ body: [] }), search);
+    await waitFor(() => expect(sentQ(urls)).toHaveLength(1));
+    expect(sentQ(urls)).toEqual([q]);
+  });
+
+  it('asks for facets on the first page only, and a new query reads from offset 0 without them', async () => {
+    const urls = mountQuery((u) =>
+      u.searchParams.get('facets') === '1'
+        ? { body: { rows: [ROWS[0]], facets: { status: { running: 1 } }, facets_partial: false } }
+        : { body: [ROWS[0]] },
+    );
+    await screen.findByText('wf-running-manual');
+    expect(listCalls(urls, PATH).map((u) => u.searchParams.get('facets'))).toEqual(['1']);
+
+    const input = screen.getByRole('combobox', { name: 'Filter runs' });
+    fireEvent.change(input, { target: { value: 'status:failed' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    await waitFor(() => expect(sentQ(urls)).toEqual([null, 'status:failed']));
+    const last = listCalls(urls, PATH)[1];
+    expect(last.searchParams.get('offset')).toBe('0');
+    expect(last.searchParams.get('facets')).toBeNull();
+  });
+
+  it('shows the server’s parse error under the bar, not as a page error', async () => {
+    mountQuery(() => parseError('`trigger` takes manual, cron or event'), '?q=trigger:cron');
+    expect(await screen.findByText('`trigger` takes manual, cron or event')).toBeInTheDocument();
+    expect(screen.getAllByRole('alert')).toHaveLength(1);
+    expect(screen.getByText('No runs match the filter.')).toBeInTheDocument();
+  });
+
+  it('shows a client parse error at once and sends no request', async () => {
+    const urls = mountQuery(() => ({ body: [] }), '?q=status:done');
+    expect(
+      await screen.findByText('`done` is not a value of `status:` (one of pending, running, awaiting_approval, paused, completed, failed, rejected, cancelled)'),
+    ).toBeInTheDocument();
+    expect(listCalls(urls, PATH)).toEqual([]);
   });
 });

@@ -1,32 +1,21 @@
 // Workflow run-stream page — execution history for workflow runs.
-// One lifecycle FilterPills group (Running / Completed / Failed-Rejected /
-// Archived — Archived is a 4th mutually-exclusive state, exactly matching
-// the old toggle-hides-tabs behavior) + a trigger FilterPills group (hidden
-// in Archived mode, same as the old code hid its trigger chips + host
-// select together) + a host scope select (hidden in Archived mode too).
 //
-// Fetch/paginate/poll is owned by `usePerHostPagedList` (per-host progressive
-// loading, spec 2026-10-01): All hosts by default, local paints at once and
-// each remote merges in as it answers. The active/Running lifecycle is the
-// only one that polls (local every 5 s, remotes every 60 s, page-0 only).
-// Archived has no server-side pagination (`/api/runs/archived` returns
-// everything in one shot); the fetcher returns `[]` for any offset > 0 so
-// the list settles as `ended` after that single page.
+// One query line filters the list, and the server evaluates it (`?q=` on
+// every request, `WORKFLOW_RUN_FIELDS`): `status:`, `trigger:`, `host:`,
+// `since:` and the rest, with `is:archived` switching to the archive. With no
+// query it lists every run, newest first.
 //
-// Find (2026-07-23 operator feedback amendment #1): a `SearchInput` in the
-// FilterBar's search slot narrows the loaded rows client-side, live per
-// keystroke, over workflow name / run id / host id — composing with (not
-// replacing) the lifecycle/trigger pills above it.
+// Fetch/paginate/poll is owned by `usePerHostQueryList` (per-host progressive
+// loading, spec 2026-10-01): every host the query's `host:` terms allow,
+// local painting at once and each remote merging in as it answers. Host
+// health is in the `host:` suggestions and one quiet line under the bar.
 //
 // Customer scope (customers Plan 2B): the list follows the global scope
 // (`useScopedList`), or — embedded in a customer's Runs tab — a fixed
-// `customer` prop, which also drops the page header and padding. Either way the
-// filter goes through the same per-host engine (`?customer=<slug>`), so a
-// remote host that can't filter (501) shows as an unavailable slice, and
-// `HostsWithoutCustomerBanner` names it along with the hosts the
-// `X-Rupu-Hosts-Without-Customer` header lists. The archived listing has no
-// customer filter, so while scoped there is no Archived state; a one-line
-// hint says so. A scope the backend rejects (400) is cleared with a notice.
+// `customer` prop, which also drops the page header and padding, and keeps
+// the query in `wq` so it doesn't follow the tab to Agent Runs. Either way
+// `?customer=<slug>` ANDs with the query. A scope the backend rejects (400)
+// is cleared with a notice.
 
 import { useCallback, useState } from 'react';
 import { RefreshCw } from 'lucide-react';
@@ -37,16 +26,17 @@ import { parseCodename } from '../../lib/codename';
 import SortableTable, { type Column } from '../../components/lists/SortableTable';
 import UsageBarChart from '../../components/charts/UsageBarChart';
 import { Button } from '../../components/ui/Button';
-import { FilterBar } from '../../components/ui/FilterBar';
-import { FilterPills, type FilterPillOption } from '../../components/ui/FilterPills';
-import { SearchInput } from '../../components/ui/SearchInput';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { ErrorBanner } from '../../components/ui/ErrorBanner';
 import { Spinner } from '../../components/ui/Spinner';
-import HostSelect, { ALL_HOSTS } from '../../components/HostSelect';
-import { usePerHostPagedList, type PerHostFetchParams } from '../../lib/perHost/usePerHostPagedList';
-import { PerHostFooter, PerHostStrip, perHostFooterText } from '../../components/lists/PerHostStatus';
-import { noHostAnswered, notIncluded, waitingLabel } from '../../lib/perHost/status';
+import { ListQueryBar, NoMatches, useListQuery } from '../../components/query/ListQueryBar';
+import { hostAlerts } from '../../components/query/hostAlerts';
+import { ListFooter } from '../../components/lists/ListFooter';
+import { usePerHostQueryList } from '../../lib/query/usePerHostQueryList';
+import { WORKFLOW_RUN_FIELDS, asksArchived } from '../../lib/query/lists/workflowRuns';
+import type { PerHostFetchParams } from '../../lib/perHost/usePerHostPagedList';
+import type { ListQueryOpts } from '../../lib/api';
+import { noHostAnswered, waitingLabel } from '../../lib/perHost/status';
 import { cn } from '../../lib/cn';
 import { durationBetween, relativeTime } from '../../lib/time';
 import { formatTokens, formatCost } from '../../lib/usage';
@@ -55,33 +45,7 @@ import { shortId } from '../../lib/shortId';
 import { runHref } from '../../lib/runs';
 import { useRunCustomers, withCustomerColumn } from '../../components/customers/RunCustomer';
 import { PricingErrorMark } from '../../components/customers/PricingErrorMark';
-import { HostsWithoutCustomerBanner } from '../../components/customers/HostsWithoutCustomerBanner';
 import { useScopedList } from '../../lib/useScopedList';
-
-type Tab = 'active' | 'completed' | 'failed';
-/** The lifecycle FilterPills group's value space: the three tabs plus the
- *  Archived state, which today is a separate boolean but behaves as (and
- *  always rendered as) a 4th mutually-exclusive state — selecting a tab
- *  always implies "not archived", and archived mode always hides the tabs. */
-type Lifecycle = Tab | 'archived';
-
-const LIFECYCLE_OPTIONS: FilterPillOption[] = [
-  { value: 'active', label: 'Running' },
-  { value: 'completed', label: 'Completed' },
-  { value: 'failed', label: 'Failed / Rejected' },
-  { value: 'archived', label: 'Archived' },
-];
-/** While scoped to a customer: the archive has no customer filter. */
-const SCOPED_LIFECYCLE_OPTIONS = LIFECYCLE_OPTIONS.filter((o) => o.value !== 'archived');
-
-type TriggerFilter = 'all' | 'manual' | 'cron' | 'event';
-
-const TRIGGER_OPTIONS: FilterPillOption[] = [
-  { value: 'all', label: 'All' },
-  { value: 'manual', label: 'Manual' },
-  { value: 'cron', label: 'Cron' },
-  { value: 'event', label: 'Event' },
-];
 
 const TRIGGER_CHIP_CLS: Record<string, string> = {
   manual: 'bg-surface text-ink ring-border',
@@ -104,82 +68,30 @@ function TriggerChip({ trigger }: { trigger: string }) {
 }
 
 export default function WorkflowRuns({ customer: fixedCustomer }: { customer?: string } = {}) {
-  const [tab, setTab] = useState<Tab>('active');
-  const [archivedPicked, setArchived] = useState(false);
-  const [filter, setFilter] = useState<TriggerFilter>('all');
-  // All hosts by default: local paints at once, each remote merges in as it
-  // answers (usePerHostPagedList). A picked host lists only that host.
-  const [hostFilter, setHostFilter] = useState<string>(ALL_HOSTS);
-  const scoped = useScopedList(fixedCustomer, [tab, hostFilter]);
+  const [q, setQ] = useListQuery(fixedCustomer ? 'wq' : 'q');
+  const scoped = useScopedList(fixedCustomer, []);
   const { customer, embedded } = scoped;
-  // The archived listing can't be filtered by customer: no Archived state while scoped.
-  const archived = archivedPicked && !customer;
   // Row-action (archive/restore/delete) failures — kept separate from the
   // list-fetch error the hook owns, but shown in the same banner.
   const [actionError, setActionError] = useState<string | null>(null);
-  const [query, setQuery] = useState('');
+  const archive = asksArchived(q);
 
   const fetchRows = useCallback(
-    ({ host, offset, limit, signal }: PerHostFetchParams): Promise<RunListRow[]> => {
-      if (archived) {
-        // /api/runs/archived has no offset/limit — it's a single fetch.
-        // Any page beyond the first returns empty so the host settles.
-        return offset === 0 ? api.getArchivedRuns('workflow') : Promise.resolve([]);
-      }
-      if (!customer) return api.getWorkflowRuns({ lifecycle: tab, offset, limit, host, signal });
-      return scoped.guard(
-        api.getWorkflowRuns({
-          lifecycle: tab,
-          offset,
-          limit,
-          host,
-          signal,
-          customer,
-          onHostsWithoutCustomer: scoped.reportHosts(host, offset),
-        }),
-      );
-    },
-    [archived, tab, customer, scoped.guard, scoped.reportHosts],
+    (p: PerHostFetchParams & ListQueryOpts): Promise<RunListRow[]> =>
+      customer ? scoped.guard(api.getWorkflowRuns({ ...p, customer })) : api.getWorkflowRuns(p),
+    [customer, scoped.guard],
   );
 
-  const { rows, slices, loading, error, hasMore, sentinelRef, refresh, refreshHost, removeRow, retryPaging, ended } =
-    usePerHostPagedList<RunListRow>({
-      // Archived is a local-only endpoint (`/api/runs/archived`).
-      host: archived ? 'local' : hostFilter === ALL_HOSTS ? null : hostFilter,
+  const { rows, slices, loading, error, hasMore, sentinelRef, refresh, refreshHost, removeRow, retryPaging, ended, facets, queryError, notes } =
+    usePerHostQueryList<RunListRow>({
+      q,
+      fields: WORKFLOW_RUN_FIELDS,
+      scope: [customer],
       fetch: fetchRows,
       timeField: 'started_at',
       idField: 'id',
-      deps: [archived, tab, customer],
-      poll: !archived && tab === 'active',
+      poll: !archive,
     });
-
-  // Trigger filter is client-side (cheap); the host filter picks which hosts load.
-  const filtered = rows.filter((r) => {
-    if (!archived && filter !== 'all' && r.trigger !== filter) return false;
-    return true;
-  });
-
-  // Find — case-insensitive substring across the fields this table actually
-  // renders: workflow name (subject), run id, and host id. Composes with
-  // (narrows within) the lifecycle/trigger pills above.
-  const q = query.trim().toLowerCase();
-  const visible = q
-    ? filtered.filter((r) =>
-        [r.workflow_name, r.id, r.host_id, r.codename]
-          .filter((v): v is string => Boolean(v))
-          .some((v) => v.toLowerCase().includes(q)),
-      )
-    : filtered;
-
-  const lifecycleValue: Lifecycle = archived ? 'archived' : tab;
-  function handleLifecycleChange(v: string) {
-    if (v === 'archived') {
-      setArchived(true);
-    } else {
-      setArchived(false);
-      setTab(v as Tab);
-    }
-  }
 
   // Row-level archive / restore / delete — each drops the row and re-syncs
   // just its host after success.
@@ -223,7 +135,7 @@ export default function WorkflowRuns({ customer: fixedCustomer }: { customer?: s
     }
   }
 
-  // Action column — changes shape based on archived mode.
+  // Action column — an archived row restores, any other archives.
   const actionColumn: Column<RunListRow> = {
     key: 'actions',
     header: '',
@@ -244,7 +156,7 @@ export default function WorkflowRuns({ customer: fixedCustomer }: { customer?: s
           e.stopPropagation();
         }}
       >
-        {archived ? (
+        {r.archived ? (
           <Button
             variant="ring"
             onClick={() => void handleRowRestore(r.id, r.host_id)}
@@ -273,26 +185,17 @@ export default function WorkflowRuns({ customer: fixedCustomer }: { customer?: s
   };
 
   // The Customer column resolves slugs (archived customers load on first need).
-  const customers = useRunCustomers(!customer && !archived ? rows.map((r) => r.customer) : []);
+  const customers = useRunCustomers(!customer ? rows.map((r) => r.customer) : []);
   const columns: Column<RunListRow>[] = [
-    ...withCustomerColumn(WORKFLOW_RUN_COLUMNS, customers, rows, !customer && !archived),
+    ...withCustomerColumn(WORKFLOW_RUN_COLUMNS, customers, rows, !customer),
     actionColumn,
   ];
   // A fresh action error (e.g. this click's Archive/Delete refusal) must win
   // over a stale fetch error from an earlier load — never the other way
   // around, or the operator sees the wrong banner for what just happened.
   const bannerError = actionError ?? error;
-
-  // Honest per-host states (spec §8): never claim "nothing" while a host is still loading, and
-  // keep the sentinel mounted whenever rows have loaded, even if the trigger pill or Find hides
-  // all of them, so scrolling keeps loading (a later page may match).
+  // Never claim "nothing" while a host is still loading.
   const waiting = waitingLabel(slices);
-  const missing = notIncluded(slices);
-  // With every loaded row filtered out the page shows "No matches yet · Waiting on X…" itself, so
-  // the footer (still mounted, to keep paging) does not repeat it.
-  const listFooter = perHostFooterText({ slices, loading, hasMore, ended, count: filtered.length, waitingShown: visible.length === 0 });
-  const footer = (text: string) =>
-    !archived && <PerHostFooter sentinelRef={sentinelRef} text={text} slices={slices} onRetry={retryPaging} />;
 
   return (
     <div className={embedded ? undefined : 'p-8'}>
@@ -309,60 +212,16 @@ export default function WorkflowRuns({ customer: fixedCustomer }: { customer?: s
         </Button>
       </header>
 
-      <div className="mb-5">
-        <FilterBar
-          filters={
-            <>
-              <FilterPills
-                options={customer ? SCOPED_LIFECYCLE_OPTIONS : LIFECYCLE_OPTIONS}
-                value={lifecycleValue}
-                onChange={handleLifecycleChange}
-              />
-              {!archived && (
-                <FilterPills
-                  options={TRIGGER_OPTIONS}
-                  value={filter}
-                  onChange={(v) => setFilter(v as TriggerFilter)}
-                />
-              )}
-            </>
-          }
-          search={
-            <SearchInput
-              aria-label="Find runs"
-              placeholder="Find runs…"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Escape') setQuery('');
-              }}
-            />
-          }
-          scope={
-            !archived && (
-              <HostSelect
-                allowAll
-                ariaLabel="Host filter"
-                value={hostFilter}
-                onChange={setHostFilter}
-              />
-            )
-          }
-        />
-      </div>
-      {!archived && <PerHostStrip slices={slices} />}
-      {customer && (
-        <>
-          <HostsWithoutCustomerBanner
-            className="mb-4"
-            hosts={slices.map((sl) => ({ id: sl.hostId, name: sl.name, state: sl.state, reason: sl.reason }))}
-            without={scoped.hostsWithoutCustomer}
-          />
-          <p className="mb-4 text-note text-ink-mute">
-            Archived runs aren’t listed here — the archive can’t be filtered by customer.
-          </p>
-        </>
-      )}
+      <ListQueryBar
+        value={q}
+        onChange={setQ}
+        fields={WORKFLOW_RUN_FIELDS}
+        facets={facets}
+        label="Filter workflow runs"
+        placeholder="Filter runs… e.g. status:running · status:failed since:7d · is:archived"
+        error={queryError}
+        alerts={hostAlerts(notes, 'runs', retryPaging)}
+      />
 
       {bannerError && <ErrorBanner className="mb-4">{bannerError}</ErrorBanner>}
 
@@ -374,42 +233,27 @@ export default function WorkflowRuns({ customer: fixedCustomer }: { customer?: s
         <div className="py-16 flex items-center justify-center">
           <Spinner label={waiting} />
         </div>
+      ) : rows.length === 0 && noHostAnswered(slices) ? (
+        <EmptyState title="No hosts answered" hint="Every host is offline or can't serve this list; the line under the query says which." />
       ) : rows.length === 0 ? (
-        <EmptyState
-          title={
-            noHostAnswered(slices)
-              ? 'No hosts answered'
-              : missing
-                ? 'No workflow runs on the hosts that answered'
-                : 'No workflow runs yet'
-          }
-          hint={
-            missing
-              ? `Not included: ${missing}.`
-              : customer === 'none'
-                ? 'No workflow runs without a customer yet.'
+        q.trim() ? (
+          <NoMatches noun="workflow runs" />
+        ) : (
+          <EmptyState
+            title="No workflow runs"
+            hint={
+              customer === 'none'
+                ? 'No workflow run without a customer yet. is:archived lists the archive.'
                 : customer
-                  ? 'No workflow runs are attributed to this customer yet.'
-                  : 'Workflow runs will appear here once you dispatch one from the CLI, the desktop app, or a scheduled trigger.'
-          }
-        />
-      ) : visible.length === 0 ? (
-        <>
-          {waiting ? (
-            <div className="py-16 flex items-center justify-center">
-              <Spinner label={`No matches yet · ${waiting}`} />
-            </div>
-          ) : filtered.length === 0 ? (
-            <EmptyState title="No runs match this filter" hint="Try selecting a different trigger or host filter above." />
-          ) : (
-            <EmptyState title="No matches" hint={`No runs match "${query}".`} />
-          )}
-          {footer(listFooter)}
-        </>
+                  ? 'No workflow run is attributed to this customer yet. is:archived lists the archive.'
+                  : 'Runs appear here once a workflow runs. is:archived lists the archive.'
+            }
+          />
+        )
       ) : (
         <div className="space-y-6">
           <div className="bg-panel border border-border rounded-xl shadow-card px-4 py-3 mb-4">
-            <UsageBarChart bars={visible.map((r) => ({
+            <UsageBarChart bars={rows.map((r) => ({
               id: r.id, label: r.workflow_name, to: runHref(r),
               input_tokens: r.usage.input_tokens, output_tokens: r.usage.output_tokens,
               cached_tokens: r.usage.cached_tokens, cost_usd: r.usage.cost_usd,
@@ -417,12 +261,12 @@ export default function WorkflowRuns({ customer: fixedCustomer }: { customer?: s
           </div>
           <SortableTable<RunListRow>
             columns={columns}
-            rows={visible}
+            rows={rows}
             rowKey={(r) => `${r.host_id ?? 'local'}:${r.id}`}
             rowHref={runHref}
             initialSort={{ key: 'started', dir: 'desc' }}
           />
-          {footer(q ? `${visible.length} matches of ${filtered.length} loaded` : listFooter)}
+          <ListFooter sentinelRef={sentinelRef} loading={loading} hasMore={hasMore} ended={ended} count={rows.length} />
         </div>
       )}
     </div>
