@@ -495,7 +495,7 @@ async fn resume_run(
 
 /// Upper-bound on rows fetched from each host during a fan-out list.
 /// Prevents unbounded merges while staying well above any realistic run count.
-const FAN_OUT_LIMIT: usize = 10_000;
+pub(crate) const FAN_OUT_LIMIT: usize = 10_000;
 
 /// Resolve a `host_id` string to a live connector, mapping unknown host → 404.
 pub(crate) fn resolve_host(
@@ -1798,7 +1798,7 @@ impl WorkflowRunsQuery {
 }
 
 /// Does this run's status fall in the given lifecycle group? `None` group → all.
-fn in_lifecycle(status: RunStatus, group: Option<&str>) -> bool {
+pub(crate) fn in_lifecycle(status: RunStatus, group: Option<&str>) -> bool {
     match group {
         Some("active") => matches!(
             status,
@@ -4045,7 +4045,10 @@ pub(crate) mod tests {
         assert!(!in_lifecycle(RunStatus::Cancelled, Some("active")));
     }
 
-    fn autoflow_envelope(run_id: &str, claim: Option<&str>) -> rupu_runtime::RunEnvelope {
+    pub(crate) fn autoflow_envelope(
+        run_id: &str,
+        claim: Option<&str>,
+    ) -> rupu_runtime::RunEnvelope {
         use rupu_runtime::*;
         RunEnvelope {
             version: RunEnvelope::VERSION,
