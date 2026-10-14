@@ -85,6 +85,17 @@ impl RowFilter {
         self.customer.is_some() || self.query.is_some()
     }
 
+    /// Whether the filter reads a row's customer — `?customer=` or a
+    /// `customer:` term — so local rows must be attributed fail-closed (an
+    /// unreadable assignment is a 500, never "no customer").
+    pub fn reads_customer(&self) -> bool {
+        self.customer.is_some()
+            || self
+                .query
+                .as_ref()
+                .is_some_and(|q| q.parsed.terms_on("customer").next().is_some())
+    }
+
     /// Whether `row` is in the list's scope: its `customer` key matches the
     /// customer filter. A row without the key (or a key that is neither a
     /// slug nor `null`) can't say.
@@ -92,11 +103,8 @@ impl RowFilter {
         let Some(f) = &self.customer else {
             return Ok(true);
         };
-        let customer = match row.get("customer") {
-            Some(Value::Null) => None,
-            Some(Value::String(s)) => Some(s.as_str()),
-            _ => return Err(Unreportable { field: "customer" }),
-        };
+        let customer =
+            crate::customers::row_customer(row).ok_or(Unreportable { field: "customer" })?;
         Ok(f.matches(customer))
     }
 
@@ -155,6 +163,52 @@ impl RowFilter {
 
 /// A host that couldn't be filtered: its id and the field its rows lack.
 pub type Unfilterable = (String, &'static str);
+
+/// What [`filter_merged`] kept.
+#[derive(Debug, Default)]
+pub struct Merged {
+    pub rows: Vec<Value>,
+    /// Every in-scope row before the query, when asked for (facets).
+    pub scoped: Vec<Value>,
+    pub unfilterable: Vec<Unfilterable>,
+}
+
+/// Filter a merged, host-tagged (`host_id`) list: a host any of whose rows
+/// can't report a field `filter` reads is left out whole and named; every
+/// other row is kept when `scope` (the list's own params: lifecycle, dates,
+/// scope) and `filter` keep it. Order is preserved.
+pub fn filter_merged(
+    rows: Vec<Value>,
+    filter: &RowFilter,
+    scope: impl Fn(&Value) -> bool,
+    facets: bool,
+) -> Merged {
+    let host_of = |row: &Value| row["host_id"].as_str().unwrap_or("local").to_string();
+    let mut out = Merged::default();
+    for row in &rows {
+        let read = filter.in_scope(row).and_then(|_| filter.matches_query(row));
+        if let Err(e) = read {
+            note_unfilterable(&mut out.unfilterable, &host_of(row), e.field);
+        }
+    }
+    for row in rows {
+        let host = host_of(&row);
+        if out.unfilterable.iter().any(|(h, _)| *h == host) {
+            continue;
+        }
+        if !scope(&row) || filter.in_scope(&row) != Ok(true) {
+            continue;
+        }
+        let hit = filter.matches_query(&row) == Ok(true);
+        if facets {
+            out.scoped.push(row.clone());
+        }
+        if hit {
+            out.rows.push(row);
+        }
+    }
+    out
+}
 
 /// The headers naming the hosts a fan-out left out: hosts that can't report
 /// `customer` in [`crate::customers::HOSTS_WITHOUT_CUSTOMER_HEADER`] (as
@@ -255,16 +309,6 @@ pub struct FacetCounts {
     pub partial: bool,
 }
 
-impl ListResponse {
-    pub fn rows(headers: axum::http::HeaderMap, rows: Vec<Value>) -> Self {
-        Self {
-            headers,
-            rows,
-            facets: None,
-        }
-    }
-}
-
 impl IntoResponse for ListResponse {
     fn into_response(self) -> Response {
         match self.facets {
@@ -312,11 +356,8 @@ pub(crate) fn opt<'a>(row: &'a Value, key: &str) -> Option<Vec<Cow<'a, str>>> {
 /// The row's `customer`: a slug, `none` for `null`; a row without the key
 /// can't report it.
 pub(crate) fn customer(row: &Value) -> Option<Vec<Cow<'_, str>>> {
-    match row.get("customer")? {
-        Value::Null => Some(vec![Cow::Borrowed("none")]),
-        Value::String(s) => Some(vec![Cow::Borrowed(s.as_str())]),
-        _ => None,
-    }
+    let slug = crate::customers::row_customer(row)?.unwrap_or("none");
+    Some(vec![Cow::Borrowed(slug)])
 }
 
 /// Field defs every list shares.

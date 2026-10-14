@@ -407,64 +407,166 @@ fn session_is_active(v: &Value) -> bool {
     false
 }
 
+/// `?offset=&limit=&q=&facets=` on a project's run and session lists.
+#[derive(serde::Deserialize, Default)]
+struct ProjectListQuery {
+    offset: Option<usize>,
+    limit: Option<usize>,
+    /// `?q=` — the list query (the workflow-run registry for runs, the
+    /// session registry for sessions).
+    #[serde(default)]
+    q: Option<String>,
+    /// `?facets=1` — answer `{rows, facets, facets_partial}`.
+    #[serde(default)]
+    facets: Option<String>,
+}
+
+impl ProjectListQuery {
+    fn page(&self) -> crate::pagination::PageQuery {
+        crate::pagination::PageQuery {
+            offset: self.offset,
+            limit: self.limit,
+        }
+    }
+}
+
 /// `GET /api/projects/:ws_id/runs` — scoped slim run list, newest-first.
 /// Each row carries its customer (recorded, else the project's current
 /// assignment) and is priced with that customer's pricing (spec §1); work
-/// with no customer at the global pricing.
+/// with no customer at the global pricing. `?q=`
+/// ([`crate::query::workflow_runs::FIELDS`]; `host:` reads `local`) keeps
+/// the runs it matches before the page is cut; a mirrored worker's legacy
+/// run, whose customer can't be known, is left out of a `customer:` term
+/// and its worker named in `X-Rupu-Hosts-Without-Customer`. A `q` that
+/// doesn't parse is a 400. `?facets=1` answers `{rows, facets,
+/// facets_partial}`.
 async fn project_runs(
     State(s): State<AppState>,
     Path(ws_id): Path<String>,
-    Query(page): Query<crate::pagination::PageQuery>,
-) -> ApiResult<Json<Vec<RunListRow>>> {
+    Query(q): Query<ProjectListQuery>,
+) -> Result<crate::query::ListResponse, crate::query::ListError> {
     // 404 when the project is unknown, mirroring the rollup endpoint.
     load_workspace(&s, &ws_id)?;
+    let query =
+        crate::query::ListQuery::parse(q.q.as_deref(), crate::query::workflow_runs::FIELDS)?;
+    let facets = crate::query::wants_facets(q.facets.as_deref());
+    let page = q.page();
     let runs = scoped_runs(&s, &ws_id)?; // already sorted newest-first
-    let page_runs = crate::pagination::paginate(runs, &page);
-    // The usage fold and the assignment read run on the blocking pool.
+                                         // The usage fold and the assignment reads run on the blocking pool.
     let store = std::sync::Arc::clone(&s.run_store);
     let customer_pricing = std::sync::Arc::clone(&s.customer_pricing);
     let global = s.global_dir.clone();
-    let rows = crate::api::runs::blocking(move || {
+    let (rows, scoped, hosts) = crate::api::runs::blocking(move || {
         let mut lookup =
             crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
         let mut prices = crate::customers::PricingMemo::new(&customer_pricing);
-        page_runs
-            .iter()
-            .map(|r| RunListRow::attributed(r, &store, &mut lookup, &mut prices))
-            .collect()
+        let mut kept = Vec::with_capacity(runs.len());
+        let mut scoped = Vec::new();
+        let mut hosts = Vec::new();
+        for r in runs {
+            let who = lookup.attribute_run(&r, true)?;
+            if query.is_some() || facets {
+                let probe = crate::api::runs::run_probe(&r, &who, "local", false);
+                let hit = match &query {
+                    None => true,
+                    Some(query) => query.matches(&probe).unwrap_or_else(|_| {
+                        crate::customers::note_unreportable(&mut hosts, &r);
+                        false
+                    }),
+                };
+                if facets {
+                    scoped.push(probe);
+                }
+                if !hit {
+                    continue;
+                }
+            }
+            kept.push((r, who));
+        }
+        let rows: Vec<Value> = crate::pagination::paginate(kept, &page)
+            .into_iter()
+            .map(|(r, who)| {
+                let row = RunListRow::priced(&r, who, &store, &mut prices);
+                serde_json::to_value(row).expect("a run row serializes")
+            })
+            .collect();
+        Ok((rows, scoped, hosts))
     })
     .await?;
-    Ok(Json(rows))
+    Ok(crate::query::ListResponse {
+        headers: crate::customers::hosts_without_customer_header(&hosts),
+        facets: facets.then(|| {
+            crate::query::facet_counts(&scoped, crate::query::workflow_runs::FIELDS, false)
+        }),
+        rows,
+    })
 }
 
-/// `GET /api/projects/:ws_id/sessions` — session DTOs scoped to the project.
+/// `GET /api/projects/:ws_id/sessions` — session DTOs scoped to the project,
+/// newest-first by `updated_at`.
+/// `?q=` ([`crate::query::sessions::FIELDS`]; `host:` reads `local`) keeps
+/// the sessions it matches before the page is cut (a `customer:` term
+/// attributes fail-closed); a `q` that doesn't parse is a 400. `?facets=1`
+/// answers `{rows, facets, facets_partial}`.
 async fn project_sessions(
     State(s): State<AppState>,
     Path(ws_id): Path<String>,
-    Query(page): Query<crate::pagination::PageQuery>,
-) -> ApiResult<Json<Vec<Value>>> {
+    Query(q): Query<ProjectListQuery>,
+) -> Result<crate::query::ListResponse, crate::query::ListError> {
     load_workspace(&s, &ws_id)?;
+    let filter = crate::query::RowFilter::new(
+        None,
+        crate::query::ListQuery::parse(q.q.as_deref(), crate::query::sessions::FIELDS)?,
+    );
+    let facets = crate::query::wants_facets(q.facets.as_deref());
     // Scoped BEFORE usage is folded; each session is attributed to its
     // customer and priced with that customer's pricing. Blocking IO.
     let scoped: Vec<Value> = {
         let global = s.global_dir.clone();
         let pricing = std::sync::Arc::clone(&s.customer_pricing);
+        let fail_closed = filter.reads_customer();
         tokio::task::spawn_blocking(move || {
             crate::api::sessions::collect_sessions_with(
                 &global,
-                // An unfiltered list: a session whose assignment can't be
-                // read is listed without customer keys.
+                // Unfiltered by customer, a session whose assignment can't
+                // be read is listed without customer keys.
                 crate::api::sessions::SessionScan {
                     pricing: Some(&pricing),
                     workspace: Some(&ws_id),
-                    fail_closed: false,
+                    fail_closed,
                 },
             )
         })
         .await
         .map_err(|e| ApiError::internal(e.to_string()))??
     };
-    Ok(Json(crate::pagination::paginate(scoped, &page)))
+    let mut probes: Vec<Value> = scoped
+        .into_iter()
+        .map(|mut v| {
+            v["host_id"] = json!("local");
+            v
+        })
+        .collect();
+    // Newest-first by `updated_at`, as `GET /api/sessions` pages: the scan
+    // walks the session dirs in `read_dir` order.
+    crate::api::host_fanout::sort_values_newest_first(&mut probes, "updated_at");
+    let merged = crate::query::filter_merged(probes, &filter, |_| true, facets);
+    let rows = crate::pagination::paginate(merged.rows, &q.page())
+        .into_iter()
+        .map(|mut v| {
+            if let Some(o) = v.as_object_mut() {
+                o.remove("host_id");
+            }
+            v
+        })
+        .collect();
+    Ok(crate::query::ListResponse {
+        headers: axum::http::HeaderMap::new(),
+        facets: facets.then(|| {
+            crate::query::facet_counts(&merged.scoped, crate::query::sessions::FIELDS, false)
+        }),
+        rows,
+    })
 }
 
 /// `GET /api/projects/:ws_id/coverage` — per-target coverage summary rows,

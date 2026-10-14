@@ -541,7 +541,7 @@ pub(crate) fn collect_sessions_with(
     Ok(sessions)
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct SessionsQuery {
     // Flat fields, NOT `#[serde(flatten)] PageQuery` — serde_urlencoded (axum
     // `Query`) cannot deserialize integers through a flattened struct.
@@ -564,6 +564,12 @@ struct SessionsQuery {
     /// `?customer=<slug>|none` — see `list_sessions`.
     #[serde(default)]
     customer: Option<String>,
+    /// `?q=` — the list query ([`crate::query::sessions::FIELDS`]).
+    #[serde(default)]
+    q: Option<String>,
+    /// `?facets=1` — answer `{rows, facets, facets_partial}`.
+    #[serde(default)]
+    facets: Option<String>,
 }
 
 impl SessionsQuery {
@@ -583,143 +589,113 @@ struct SessionHostQuery {
     host: Option<String>,
 }
 
-/// `GET /api/sessions[?host=<id>][&customer=<slug>|none]`
+/// `GET /api/sessions[?host=<id>][&customer=<slug>|none][&q=…]`
 ///
 /// `?customer=` keeps the sessions attributed to that customer (recorded on
 /// `session.json` — a slug or `null` — else, for a session that predates
 /// customers, the workspace's current assignment — `customer_derived`;
 /// `none` = no customer). Unfiltered, a session whose workspace assignment
-/// can't be read is listed without customer keys; under a filter that fails
-/// the request (500). Each session is priced with its
-/// customer's pricing. Local sessions are filtered
-/// before they are paged. A remote host's sessions are filtered on the
-/// coordinator by their `customer` key; a remote whose rows carry none is too
-/// old to say — 501 on `?host=<it>`, skipped on the fan-out and named in the
-/// `X-Rupu-Hosts-Without-Customer` header. A bad slug is a 400.
+/// can't be read is listed without customer keys; under a filter that reads
+/// a customer that fails the request (500). Each session is priced with its
+/// customer's pricing.
+///
+/// `?q=` ([`crate::query::sessions::FIELDS`]) keeps the sessions it
+/// matches, AND-ed with `scope` / `since` / `until` / `customer`, all before
+/// anything is paged; `is:active|archived` reads the session's `scope`
+/// (and `is:archived` asks the remote hosts for their archived sessions). A
+/// remote host's sessions are filtered on the coordinator; a remote whose
+/// rows can't report a field the filter reads (no `customer` key: too old
+/// to say) is a 501 on `?host=<it>`, and skipped on the fan-out, named in
+/// `X-Rupu-Hosts-Without-Customer` (or `X-Rupu-Hosts-Unfilterable`). A bad
+/// slug is a 400; a `q` that doesn't parse a 400 `{error, token, code,
+/// start, end}`. `?facets=1` answers `{rows, facets, facets_partial}`.
 async fn list_sessions(
     State(s): State<AppState>,
     Query(q): Query<SessionsQuery>,
-) -> ApiResult<(axum::http::HeaderMap, Json<Vec<serde_json::Value>>)> {
+) -> Result<crate::query::ListResponse, crate::query::ListError> {
     let host = q.host.as_deref().unwrap_or("all");
-    let filter = crate::customers::CustomerFilter::parse(q.customer.as_deref())?;
+    let filter = crate::query::RowFilter::new(
+        crate::customers::CustomerFilter::parse(q.customer.as_deref())?,
+        crate::query::ListQuery::parse(q.q.as_deref(), crate::query::sessions::FIELDS)?,
+    );
+    let facets = crate::query::wants_facets(q.facets.as_deref());
+    // The scope a remote host is asked for: the `scope` param, else the
+    // archive when the query asks for it alone.
+    let remote_scope = q.scope.clone().or_else(|| {
+        let query = filter.query.as_ref()?;
+        (query.asks_for("is", "archived") && !query.asks_for("is", "active"))
+            .then(|| "archived".to_string())
+    });
+    let scope_param = q.scope.clone();
+    let range = q.range();
+    let scope = move |v: &serde_json::Value| {
+        scope_param
+            .as_deref()
+            .is_none_or(|sc| v.get("scope").and_then(|x| x.as_str()) == Some(sc))
+            && range.contains_str(v.get("created_at").and_then(|x| x.as_str()))
+    };
 
-    // ── Single remote host ─────────────────────────────────────────────────────
-    if host != "local" && host != "all" {
+    let mut rows = if host != "local" && host != "all" {
+        // ── Single remote host ─────────────────────────────────────────────
         let conn = crate::api::runs::resolve_host(&s, host)?;
         // Structured session listing — works for SSH hosts (which can't serve
         // the generic `proxy_get_json` GET) by shelling `rupu session list`.
-        let rows = conn
-            .list_sessions(q.scope.as_deref())
+        let mut rows = conn
+            .list_sessions(remote_scope.as_deref())
             .await
             .map_err(crate::api::runs::host_list_error)?;
-        let mut rows = match &filter {
-            None => rows,
-            Some(f) => crate::customers::filter_remote_rows(rows, f)
-                .ok_or_else(|| crate::customers::customers_unsupported(host))?,
-        };
-        // Newest-first before paging: the connector returns the host's whole
-        // list in CLI / mirror order, and the web's per-host merge relies on
-        // each host's pages arriving ordered by `updated_at`.
-        sort_values_newest_first(&mut rows, "updated_at");
-        let page = crate::pagination::PageQuery {
-            offset: q.offset,
-            limit: q.limit,
-        };
-        return Ok((
-            axum::http::HeaderMap::new(),
-            Json(
-                crate::pagination::paginate(rows, &page)
-                    .into_iter()
-                    .map(|mut row| {
-                        row["host_id"] = serde_json::json!(host);
-                        crate::codename::inject_codename_row(
-                            &mut row,
-                            "session_id",
-                            Some("agent_name"),
-                        );
-                        row
-                    })
-                    .collect(),
-            ),
-        ));
-    }
-
-    // ── Collect local sessions ─────────────────────────────────────────────────
-    // Blocking IO (every session's turn transcripts are folded for usage, and
-    // each workspace's assignment is read once).
-    let local_sessions = {
-        let global = s.global_dir.clone();
-        let pricing = std::sync::Arc::clone(&s.customer_pricing);
-        let filter = filter.clone();
-        tokio::task::spawn_blocking(move || {
-            // Unfiltered: an unreadable assignment omits that session's
-            // customer keys; under a filter it fails the request.
-            let mut sessions = collect_sessions(&global, &pricing, filter.is_some())?;
-            if let Some(f) = &filter {
-                sessions.retain(|v| f.matches(v["customer"].as_str()));
-            }
-            Ok::<_, ApiError>(sessions)
-        })
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))??
-    };
-
-    let page = crate::pagination::PageQuery {
-        offset: q.offset,
-        limit: q.limit,
-    };
-
-    // ── Local-only path ────────────────────────────────────────────────────────
-    if host == "local" {
-        let mut sessions = local_sessions;
-        if let Some(scope) = q.scope.as_deref() {
-            sessions.retain(|v| v.get("scope").and_then(|x| x.as_str()) == Some(scope));
+        for row in &mut rows {
+            crate::api::host_fanout::tag_session_row(host, remote_scope.as_deref(), row);
         }
-        let range = q.range();
-        sessions.retain(|v| range.contains_str(v.get("created_at").and_then(|x| x.as_str())));
-        // `collect_sessions` walks the session dirs in `read_dir` order; page
-        // newest-first by `updated_at`, the order the fan-out path uses and the
-        // web's per-host merge relies on.
-        sort_values_newest_first(&mut sessions, "updated_at");
-        let paged: Vec<serde_json::Value> = crate::pagination::paginate(sessions, &page)
+        rows
+    } else {
+        // ── Local sessions ─────────────────────────────────────────────────
+        // Blocking IO (every session's turn transcripts are folded for
+        // usage, and each workspace's assignment is read once).
+        let local_sessions = {
+            let global = s.global_dir.clone();
+            let pricing = std::sync::Arc::clone(&s.customer_pricing);
+            let fail_closed = filter.reads_customer();
+            tokio::task::spawn_blocking(move || collect_sessions(&global, &pricing, fail_closed))
+                .await
+                .map_err(|e| ApiError::internal(e.to_string()))??
+        };
+        let local_values: Vec<serde_json::Value> = local_sessions
             .into_iter()
             .map(|mut v| {
                 v["host_id"] = serde_json::json!("local");
                 v
             })
             .collect();
-        return Ok((axum::http::HeaderMap::new(), Json(paged)));
+        if host == "local" {
+            local_values
+        } else {
+            fan_out_sessions(&s.hosts, remote_scope.as_deref(), local_values).await
+        }
+    };
+    // Newest-first by `updated_at` (most recently active first): the order
+    // the web's per-host merge relies on. `collect_sessions` walks the
+    // session dirs in `read_dir` order, and a connector returns the host's
+    // whole list in CLI / mirror order.
+    sort_values_newest_first(&mut rows, "updated_at");
+
+    let merged = crate::query::filter_merged(rows, &filter, scope, facets);
+    if host != "local" && host != "all" {
+        if let Some((h, field)) = merged.unfilterable.first() {
+            return Err(crate::query::unfilterable_error(h, field).into());
+        }
     }
-
-    // ── Fan-out path (host == "all") ───────────────────────────────────────────
-    let local_values: Vec<serde_json::Value> = local_sessions
-        .into_iter()
-        .map(|mut v| {
-            v["host_id"] = serde_json::json!("local");
-            v
-        })
-        .collect();
-
-    let (mut all_values, without_customer) =
-        fan_out_sessions(&s.hosts, q.scope.as_deref(), local_values, filter.as_ref()).await;
-
-    // Sort newest-first by updated_at (most recently active sessions first).
-    sort_values_newest_first(&mut all_values, "updated_at");
-
-    // Scope filter after merge.
-    if let Some(scope) = q.scope.as_deref() {
-        all_values.retain(|v| v.get("scope").and_then(|x| x.as_str()) == Some(scope));
-    }
-
-    // Date-range filter after merge, before paginate — same ordering as the
-    // local-only branch above.
-    let range = q.range();
-    all_values.retain(|v| range.contains_str(v.get("created_at").and_then(|x| x.as_str())));
-
-    Ok((
-        crate::customers::hosts_without_customer_header(&without_customer),
-        Json(crate::pagination::paginate(all_values, &page)),
-    ))
+    let page = crate::pagination::PageQuery {
+        offset: q.offset,
+        limit: q.limit,
+    };
+    Ok(crate::query::ListResponse {
+        headers: crate::query::unfilterable_headers(&merged.unfilterable),
+        facets: facets.then(|| {
+            crate::query::facet_counts(&merged.scoped, crate::query::sessions::FIELDS, false)
+        }),
+        rows: crate::pagination::paginate(merged.rows, &page),
+    })
 }
 
 async fn get_session(
@@ -1247,11 +1223,15 @@ mod tests {
                 since: None,
                 until: None,
                 customer: None,
+                ..Default::default()
             }),
         )
         .await
         .unwrap_err();
-        assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            axum::response::IntoResponse::into_response(err).status(),
+            axum::http::StatusCode::NOT_IMPLEMENTED
+        );
     }
 
     /// SSH bodies arrive unpriced (that connector has no pricing config);
@@ -2120,7 +2100,7 @@ mod tests {
             rupu_config::PricingConfig::default(),
         );
 
-        let (_, Json(rows)) = list_sessions(
+        let rows = list_sessions(
             State(s),
             Query(SessionsQuery {
                 offset: None,
@@ -2130,10 +2110,12 @@ mod tests {
                 since: Some("2026-08-05T00:00:00Z".into()),
                 until: Some("2026-08-15T00:00:00Z".into()),
                 customer: None,
+                ..Default::default()
             }),
         )
         .await
-        .expect("ok");
+        .expect("ok")
+        .rows;
 
         assert_eq!(rows.len(), 1, "only sess_mid falls in [Aug 5, Aug 15]");
         assert_eq!(rows[0]["session_id"], serde_json::json!("sess_mid"));
@@ -2192,18 +2174,19 @@ mod tests {
                     since: None,
                     until: None,
                     customer: None,
+                    ..Default::default()
                 }),
             )
         };
-        let (_, Json(all)) = page(0, 20).await.expect("ok");
+        let all = page(0, 20).await.expect("ok").rows;
         assert_eq!(
             session_ids(&all),
             ["sess_c", "sess_e", "sess_a", "sess_d", "sess_b"]
         );
         // Sorted BEFORE paging: page 0 is the newest two, page 1 the next.
-        let (_, Json(p0)) = page(0, 2).await.expect("ok");
+        let p0 = page(0, 2).await.expect("ok").rows;
         assert_eq!(session_ids(&p0), ["sess_c", "sess_e"]);
-        let (_, Json(p1)) = page(2, 2).await.expect("ok");
+        let p1 = page(2, 2).await.expect("ok").rows;
         assert_eq!(session_ids(&p1), ["sess_a", "sess_d"]);
     }
 
@@ -2231,12 +2214,13 @@ mod tests {
                     since: None,
                     until: None,
                     customer: None,
+                    ..Default::default()
                 }),
             )
         };
-        let (_, Json(p0)) = page(0, 2).await.expect("ok");
+        let p0 = page(0, 2).await.expect("ok").rows;
         assert_eq!(session_ids(&p0), ["sess_c", "sess_a"]);
-        let (_, Json(p1)) = page(2, 2).await.expect("ok");
+        let p1 = page(2, 2).await.expect("ok").rows;
         assert_eq!(session_ids(&p1), ["sess_d", "sess_b"]);
         assert!(p0.iter().all(|r| r["host_id"] == "host_fake"));
     }
@@ -2251,7 +2235,7 @@ mod tests {
             rupu_config::PricingConfig::default(),
         );
 
-        let (_, Json(rows)) = list_sessions(
+        let rows = list_sessions(
             State(s),
             Query(SessionsQuery {
                 offset: None,
@@ -2261,10 +2245,12 @@ mod tests {
                 since: None,
                 until: Some("not-a-timestamp".into()),
                 customer: None,
+                ..Default::default()
             }),
         )
         .await
-        .expect("a malformed until must degrade, never error");
+        .expect("a malformed until must degrade, never error")
+        .rows;
         assert_eq!(rows.len(), 1);
     }
 }

@@ -1354,15 +1354,21 @@ mod off_runtime_tests {
         assert!(recorded_none.as_object().unwrap().contains_key("customer"));
         assert!(recorded_none["customer"].is_null());
         assert_eq!(recorded_none["customer_derived"], false);
+        let filter_remote_rows =
+            |rows: Vec<serde_json::Value>, f: &crate::customers::CustomerFilter| {
+                crate::query::RowFilter::new(Some(f.clone()), None)
+                    .retain(rows)
+                    .ok()
+            };
         let ids = |rows: Option<Vec<serde_json::Value>>| {
             rows.map(|r| r.iter().map(|v| v["id"].clone()).collect::<Vec<_>>())
         };
         assert_eq!(
-            ids(crate::customers::filter_remote_rows(rows.clone(), &acme)),
+            ids(filter_remote_rows(rows.clone(), &acme)),
             Some(vec![serde_json::json!("run_acme")])
         );
         assert_eq!(
-            ids(crate::customers::filter_remote_rows(rows, &none)),
+            ids(filter_remote_rows(rows, &none)),
             Some(vec![serde_json::json!("run_none")])
         );
 
@@ -1372,7 +1378,7 @@ mod off_runtime_tests {
         let legacy = rows.iter().find(|r| r["id"] == "run_legacy").unwrap();
         assert!(!legacy.as_object().unwrap().contains_key("customer"));
         assert!(!legacy.as_object().unwrap().contains_key("customer_derived"));
-        assert!(crate::customers::filter_remote_rows(rows, &none).is_none());
+        assert!(filter_remote_rows(rows, &none).is_none());
     }
 
     /// `stream_run_events` on a mirror-backed connector (SSH, tunnel,

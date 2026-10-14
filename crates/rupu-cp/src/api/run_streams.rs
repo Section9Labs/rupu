@@ -210,19 +210,6 @@ struct AgentRunRow {
     session_customer: crate::customers::RecordedField,
 }
 
-impl AgentRunRow {
-    /// What this row is priced under: its attribution, else (a row whose
-    /// attribution could not be read — only ever a legacy one, since a
-    /// recorded slug or `null` needs no read) `Unknown`: the global rates,
-    /// flagged.
-    fn price_key(&self) -> crate::customers::PriceKey {
-        match &self.customer {
-            Some(c) => crate::customers::PriceKey::Customer(c.customer.clone()),
-            None => crate::customers::PriceKey::Unknown,
-        }
-    }
-}
-
 /// One actionable autoflow *event* — a single launched run or awaiting/failed
 /// signal, as opposed to a batch cycle tick.
 ///
@@ -807,7 +794,7 @@ fn collect_and_sort_local_agent_runs(global_dir: &std::path::Path) -> Vec<AgentR
     local_rows
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct AgentRunsQuery {
     // Flat fields, NOT `#[serde(flatten)] PageQuery` — serde_urlencoded (axum
     // `Query`) cannot deserialize integers through a flattened struct.
@@ -831,6 +818,12 @@ struct AgentRunsQuery {
     /// `?customer=<slug>|none` — see `list_agent_runs`.
     #[serde(default)]
     customer: Option<String>,
+    /// `?q=` — the list query ([`crate::query::agent_runs::FIELDS`]).
+    #[serde(default)]
+    q: Option<String>,
+    /// `?facets=1` — answer `{rows, facets, facets_partial}`.
+    #[serde(default)]
+    facets: Option<String>,
 }
 
 impl AgentRunsQuery {
@@ -881,7 +874,7 @@ fn agent_in_lifecycle(status: Option<&str>, group: Option<&str>) -> bool {
 // Shared fan-out helpers (re-exported from host_fanout)
 // ---------------------------------------------------------------------------
 
-use crate::api::host_fanout::{fan_out_via, fan_out_via_filtered, sort_values_newest_first};
+use crate::api::host_fanout::{fan_out_via, sort_values_newest_first};
 
 // ---------------------------------------------------------------------------
 // `GET /api/runs/agents`
@@ -957,9 +950,9 @@ async fn agent_runs_metrics(
 /// transcripts and session invocations, merged and sorted newest-first by
 /// `started_at`.
 ///
-/// `?host=local` or absent-with-no-remotes: returns only local runs.
-/// `?host=all` or absent-with-remotes: fans out across all registered hosts and
-/// tags every row with `host_id`.
+/// `?host=local`: returns only local runs.
+/// `?host=all` or absent: fans out across all registered hosts and tags
+/// every row with `host_id`.
 /// `?host=<remote-id>`: proxies to that host and tags rows.
 ///
 /// Missing directories return `[]` (no 500). Offline hosts contribute nothing
@@ -967,137 +960,87 @@ async fn agent_runs_metrics(
 ///
 /// `?customer=` keeps the runs attributed to that customer (recorded on the
 /// transcript's `RunStart`, a session turn falling back to its session's,
-/// else the workspace's current assignment; `none` = no customer). Local
-/// runs are filtered before they are paged. A remote host's rows are
-/// filtered on the coordinator by their `customer` key; a remote whose rows
-/// carry none is too old to say — 501 on `?host=<it>`, skipped on the
-/// fan-out and named in the `X-Rupu-Hosts-Without-Customer` header. A bad
-/// slug is a 400.
+/// else the workspace's current assignment; `none` = no customer), and
+/// `?q=` ([`crate::query::agent_runs::FIELDS`]) the runs it matches, AND-ed
+/// with `lifecycle` / `since` / `until`, all before anything is paged. A
+/// remote host's rows are filtered on the coordinator; a remote whose rows
+/// can't report a field the filter reads (no `customer` key: too old to
+/// say) is a 501 on `?host=<it>`, and skipped on the fan-out, named in
+/// `X-Rupu-Hosts-Without-Customer` (or `X-Rupu-Hosts-Unfilterable`). A bad
+/// slug is a 400; a `q` that doesn't parse a 400 `{error, token, code,
+/// start, end}`. `?facets=1` answers `{rows, facets, facets_partial}`.
 async fn list_agent_runs(
     State(s): State<AppState>,
     Query(q): Query<AgentRunsQuery>,
-) -> ApiResult<(axum::http::HeaderMap, Json<Vec<serde_json::Value>>)> {
+) -> Result<crate::query::ListResponse, crate::query::ListError> {
     let host = q.host.as_deref().unwrap_or("all");
-    let filter = crate::customers::CustomerFilter::parse(q.customer.as_deref())?;
+    let filter = crate::query::RowFilter::new(
+        crate::customers::CustomerFilter::parse(q.customer.as_deref())?,
+        crate::query::ListQuery::parse(q.q.as_deref(), crate::query::agent_runs::FIELDS)?,
+    );
+    let facets = crate::query::wants_facets(q.facets.as_deref());
+    let lifecycle = q.lifecycle.clone();
+    let range = q.range();
+    let scope = move |row: &serde_json::Value| {
+        agent_in_lifecycle(row["status"].as_str(), lifecycle.as_deref())
+            && range.contains_str(row["started_at"].as_str())
+    };
 
-    // ── Single remote host ────────────────────────────────────────────────────
-    if host != "local" && host != "all" {
+    let rows = if host != "local" && host != "all" {
+        // ── Single remote host ────────────────────────────────────────────
         let conn = crate::api::runs::resolve_host(&s, host)?;
-        // Structured agent-run listing — works for SSH hosts (which can't serve
-        // the generic proxy) by shelling `rupu transcript list`.
-        let rows = conn
+        // Structured agent-run listing — works for SSH hosts (which can't
+        // serve the generic proxy) by shelling `rupu transcript list`.
+        let mut rows = conn
             .list_agent_runs()
             .await
             .map_err(crate::api::runs::host_list_error)?;
-        let mut rows = match &filter {
-            None => rows,
-            Some(f) => crate::customers::filter_remote_rows(rows, f)
-                .ok_or_else(|| crate::customers::customers_unsupported(host))?,
-        };
-        let lifecycle = q.lifecycle.as_deref();
-        rows.retain(|r| agent_in_lifecycle(r.get("status").and_then(|v| v.as_str()), lifecycle));
-        // Newest-first before paging: the connector returns the host's whole
-        // list in CLI / mirror order, and the web's per-host merge relies on
-        // each host's pages arriving ordered by `started_at`.
-        sort_values_newest_first(&mut rows, "started_at");
-        return Ok((
-            axum::http::HeaderMap::new(),
-            Json(
-                crate::pagination::paginate(rows, &q.page())
-                    .into_iter()
-                    .map(|mut row| {
-                        row["host_id"] = serde_json::json!(host);
-                        crate::codename::inject_codename_row(&mut row, "run_id", Some("agent"));
-                        row
-                    })
-                    .collect(),
-            ),
-        ));
-    }
-
-    // ── Collect local runs ────────────────────────────────────────────────────
-    let mut local_rows = collect_and_sort_local_agent_runs(&s.global_dir);
-    // Attribute every row (each workspace's assignment read once), then keep
-    // the customer's — before anything is paged.
-    let mut lookup =
-        crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&s.global_dir));
-    attribute_agent_runs(&mut lookup, &mut local_rows, filter.is_some())?;
-    if let Some(f) = &filter {
-        // Fail-closed above: every row is attributed here.
-        local_rows.retain(|r| {
-            r.customer
-                .as_ref()
-                .is_some_and(|c| f.matches(c.customer.as_deref()))
-        });
-    }
-
-    // ── Local-only path ───────────────────────────────────────────────────────
-    if host == "local" {
-        let lifecycle = q.lifecycle.clone();
-        local_rows.retain(|r| agent_in_lifecycle(r.status.as_deref(), lifecycle.as_deref()));
-        let range = q.range();
-        local_rows.retain(|r| range.contains_str(r.started_at.as_deref()));
-        let mut page_rows = crate::pagination::paginate(local_rows, &q.page());
-        let wanted: Vec<(String, String, crate::customers::PriceKey)> = page_rows
-            .iter()
-            .filter_map(|r| Some((r.run_id.clone(), r.transcript_path.clone()?, r.price_key())))
-            .collect();
-        let mut metrics = agent_runs_metrics(&s, wanted).await.into_iter();
-        for row in &mut page_rows {
-            row.host_id = Some("local".to_string());
-            if row.transcript_path.is_some() {
-                let m = metrics.next().unwrap_or_default();
-                row.usage = m.usage;
-                row.turns = m.turns;
-                row.duration_ms = m.duration_ms;
-            }
+        for row in &mut rows {
+            row["host_id"] = serde_json::json!(host);
         }
-        return Ok((
-            axum::http::HeaderMap::new(),
-            Json(
-                page_rows
-                    .into_iter()
-                    .map(|r| serde_json::to_value(r).unwrap())
-                    .collect(),
-            ),
+        rows
+    } else {
+        // ── Local runs: attributed (each workspace's assignment read once;
+        // fail-closed when the filter reads a customer) ────────────────────
+        let mut local_rows = collect_and_sort_local_agent_runs(&s.global_dir);
+        let mut lookup = crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(
+            &s.global_dir,
         ));
-    }
-
-    // ── Fan-out path (host == "all") ──────────────────────────────────────────
-    let local_values: Vec<serde_json::Value> = local_rows
-        .into_iter()
-        .map(|mut r| {
-            r.host_id = Some("local".to_string());
-            serde_json::to_value(r).unwrap()
-        })
-        .collect();
-
-    let (mut all_values, without_customer) = fan_out_via_filtered(
-        &s.hosts,
-        local_values,
-        "agent_runs",
-        |c| async move { c.list_agent_runs().await },
-        filter.as_ref(),
-    )
-    .await;
-
-    sort_values_newest_first(&mut all_values, "started_at");
+        attribute_agent_runs(&mut lookup, &mut local_rows, filter.reads_customer())?;
+        let local_values: Vec<serde_json::Value> = local_rows
+            .into_iter()
+            .map(|mut r| {
+                r.host_id = Some("local".to_string());
+                serde_json::to_value(r).unwrap()
+            })
+            .collect();
+        if host == "local" {
+            local_values
+        } else {
+            fan_out_via(&s.hosts, local_values, "agent_runs", |c| async move {
+                c.list_agent_runs().await
+            })
+            .await
+        }
+    };
+    let mut rows = rows;
     // Rows from older remotes carry no codename; local rows already do (a
-    // no-op for them, flag preserved).
-    for row in &mut all_values {
+    // no-op for them, flag preserved). Before the filter: `codename:` reads it.
+    for row in &mut rows {
         crate::codename::inject_codename_row(row, "run_id", Some("agent"));
     }
+    // Newest-first before paging: a connector returns the host's whole list
+    // in CLI / mirror order, and the web's per-host merge relies on each
+    // host's pages arriving ordered by `started_at`.
+    sort_values_newest_first(&mut rows, "started_at");
 
-    // Lifecycle filter after merge
-    let lifecycle = q.lifecycle.as_deref();
-    all_values.retain(|row| agent_in_lifecycle(row["status"].as_str(), lifecycle));
-
-    // Date-range filter after merge, same "filter before paginate" ordering
-    // as the local-only branch above.
-    let range = q.range();
-    all_values.retain(|row| range.contains_str(row["started_at"].as_str()));
-
-    let mut page_values = crate::pagination::paginate(all_values, &q.page());
+    let merged = crate::query::filter_merged(rows, &filter, scope, facets);
+    if host != "local" && host != "all" {
+        if let Some((h, field)) = merged.unfilterable.first() {
+            return Err(crate::query::unfilterable_error(h, field).into());
+        }
+    }
+    let mut page_values = crate::pagination::paginate(merged.rows, &q.page());
 
     // Fill usage for local rows on this page only (remote rows already have it)
     let local_agent_run = |row: &serde_json::Value| {
@@ -1126,10 +1069,13 @@ async fn list_agent_runs(
         }
     }
 
-    Ok((
-        crate::customers::hosts_without_customer_header(&without_customer),
-        Json(page_values),
-    ))
+    Ok(crate::query::ListResponse {
+        headers: crate::query::unfilterable_headers(&merged.unfilterable),
+        facets: facets.then(|| {
+            crate::query::facet_counts(&merged.scoped, crate::query::agent_runs::FIELDS, false)
+        }),
+        rows: page_values,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2710,11 +2656,15 @@ mod tests {
                 since: None,
                 until: None,
                 customer: None,
+                ..Default::default()
             }),
         )
         .await
         .unwrap_err();
-        assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            axum::response::IntoResponse::into_response(err).status(),
+            axum::http::StatusCode::NOT_IMPLEMENTED
+        );
     }
 
     /// The web's per-host merge relies on each host's pages arriving
@@ -2766,7 +2716,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = state_with_unsorted_remote_lists(&tmp);
         for (offset, want) in NEWEST_FIRST_PAGES {
-            let (_, Json(rows)) = list_agent_runs(
+            let rows = list_agent_runs(
                 State(s.clone()),
                 Query(AgentRunsQuery {
                     offset: Some(offset),
@@ -2776,10 +2726,12 @@ mod tests {
                     since: None,
                     until: None,
                     customer: None,
+                    ..Default::default()
                 }),
             )
             .await
-            .expect("ok");
+            .expect("ok")
+            .rows;
             assert_eq!(row_ids(&rows, "run_id"), prefixed("run", want), "@{offset}");
         }
     }
@@ -2868,7 +2820,7 @@ mod tests {
                 rupu_config::PricingConfig::default(),
             )
             .with_hosts(registry.clone());
-            let (_, Json(rows)) = list_agent_runs(
+            let rows = list_agent_runs(
                 State(s),
                 Query(AgentRunsQuery {
                     offset: None,
@@ -2878,10 +2830,12 @@ mod tests {
                     since: None,
                     until: None,
                     customer: None,
+                    ..Default::default()
                 }),
             )
             .await
-            .expect("ok");
+            .expect("ok")
+            .rows;
             let by = |id: &str| rows.iter().find(|r| r["run_id"] == id).cloned().unwrap();
             let legacy = by("run_01J9ZQ3K4M5N6P7Q8R9S0T1V2W");
             assert_eq!(
@@ -2926,7 +2880,7 @@ mod tests {
             rupu_config::PricingConfig::default(),
         );
 
-        let (_, Json(rows)) = list_agent_runs(
+        let rows = list_agent_runs(
             State(s),
             Query(AgentRunsQuery {
                 offset: None,
@@ -2936,10 +2890,12 @@ mod tests {
                 since: Some("2026-08-05T00:00:00Z".into()),
                 until: Some("2026-08-15T00:00:00Z".into()),
                 customer: None,
+                ..Default::default()
             }),
         )
         .await
-        .expect("ok");
+        .expect("ok")
+        .rows;
 
         assert_eq!(rows.len(), 1, "only run_mid falls in [Aug 5, Aug 15]");
         assert_eq!(rows[0]["run_id"], serde_json::json!("run_mid"));
