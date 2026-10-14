@@ -7773,6 +7773,36 @@ fn record_attempt(
     }
 }
 
+/// Name a placed unit attempt in the workflow run's netflow roster before
+/// it is dispatched (spec 2026-10-14 §N3), so its flows — or the gap where
+/// they should be — are found even if this process dies before the unit
+/// ends. A local unit's ledgers are already here; an in-memory run has no
+/// store. Best-effort: a failure is logged.
+fn record_netflow_roster(
+    store: Option<&crate::runs::RunStore>,
+    workflow_run_id: &str,
+    unit_run_id: &str,
+    host: &str,
+    step_id: &str,
+    index: Option<usize>,
+) {
+    let Some(store) = store.filter(|_| !workflow_run_id.is_empty()) else {
+        return;
+    };
+    if host == "local" {
+        return;
+    }
+    let line = rupu_netflow::land::RosterLine {
+        unit_run_id: unit_run_id.to_string(),
+        host: host.to_string(),
+        step_id: step_id.to_string(),
+        index,
+    };
+    if let Err(e) = rupu_netflow::land::append_roster_line(&store.root, workflow_run_id, &line) {
+        warn!(step = %step_id, host, error = %e, "could not record the unit in the netflow roster");
+    }
+}
+
 /// Clear `step_id` as the run's active step if it still is — under the run
 /// lock, never over an on-disk `Cancelled`.
 async fn clear_active_step(opts: &OrchestratorRunOpts, workflow_run_id: &str, step_id: &str) {
@@ -8081,6 +8111,14 @@ async fn dispatch_placed_step(
         agent_name,
         run_id,
         transcript_path.to_path_buf(),
+    );
+    record_netflow_roster(
+        opts.run_store.as_deref(),
+        workflow_run_id,
+        run_id,
+        host,
+        &step.id,
+        None,
     );
     let mut result = dispatch_unit_unless_terminating(dispatcher.as_ref(), unit, host).await;
     emit_unit_warnings(
@@ -9389,6 +9427,14 @@ async fn run_fanout_step(
                                     &run_id_clone,
                                     transcript_clone.clone(),
                                 );
+                                record_netflow_roster(
+                                    store_for_task.as_deref(),
+                                    &workflow_run_id,
+                                    &run_id_clone,
+                                    &host,
+                                    &step_id,
+                                    Some(idx),
+                                );
                                 let mut result = dispatch_unit_unless_terminating(
                                     dispatcher.as_ref(),
                                     unit,
@@ -9548,6 +9594,14 @@ async fn run_fanout_step(
                                             &agent_name,
                                             &retry_run_id,
                                             transcript_path.clone(),
+                                        );
+                                        record_netflow_roster(
+                                            store_for_task.as_deref(),
+                                            &workflow_run_id,
+                                            &retry_run_id,
+                                            retry_host,
+                                            &step_id,
+                                            Some(idx),
                                         );
                                         let mut retry_result = dispatch_unit_unless_terminating(
                                             dispatcher.as_ref(),
