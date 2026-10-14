@@ -126,14 +126,22 @@ pub enum Event {
         customer: crate::recorded::RecordedField,
         /// The skill entries the run's launch granted on top of its agent's
         /// (a workflow step's `skills:`, `rupu run --skill`), as written:
-        /// `*` stays `*`. `rupu run --continue` passes them again. Empty on
-        /// transcripts written before the field existed.
+        /// `*` stays `*`. `rupu run --continue` of a run without
+        /// `launch_args` passes them again. Empty on transcripts written
+        /// before the field existed.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         launch_skills: Vec<String>,
         /// The launch's `preload_skills:` / `--preload-skill` entries,
         /// likewise.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         launch_preload_skills: Vec<String>,
+        /// The run's own `rupu run` arguments (the tokens after `run`), with
+        /// its effective values: the merged command for a continued run, no
+        /// prompt and no `--continue`. `rupu run --continue` restores them.
+        /// Empty for any other run, and on transcripts written before the
+        /// field existed.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        launch_args: Vec<String>,
     },
     TurnStart {
         turn_idx: u32,
@@ -965,6 +973,7 @@ mod tests {
             customer: Some(Some("acme".into())),
             launch_skills: Vec::new(),
             launch_preload_skills: Vec::new(),
+            launch_args: Vec::new(),
         };
         let s = serde_json::to_string(&e).unwrap();
         assert!(s.contains(r#""customer":"acme""#), "{s}");
@@ -1002,6 +1011,7 @@ mod tests {
             customer: Some(None),
             launch_skills: Vec::new(),
             launch_preload_skills: Vec::new(),
+            launch_args: Vec::new(),
         };
         // A recorded "no customer" is written as an explicit `null`, so a
         // reader can tell it from a transcript that predates customers.

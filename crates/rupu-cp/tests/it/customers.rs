@@ -308,6 +308,7 @@ fn write_transcript_at(
         customer: customer.map(|c| Some(c.to_string())),
         launch_skills: Vec::new(),
         launch_preload_skills: Vec::new(),
+        launch_args: Vec::new(),
     };
     let usage = rupu_transcript::Event::Usage {
         provider: "anthropic".into(),

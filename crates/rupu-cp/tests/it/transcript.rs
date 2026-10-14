@@ -25,6 +25,7 @@ fn write_two_event_jsonl(path: &std::path::Path) {
         customer: None,
         launch_skills: Vec::new(),
         launch_preload_skills: Vec::new(),
+        launch_args: Vec::new(),
     };
     let e1 = Event::AssistantMessage {
         content: "hello".into(),
@@ -173,6 +174,7 @@ fn write_one_event_jsonl(path: &std::path::Path) -> &'static str {
         customer: None,
         launch_skills: Vec::new(),
         launch_preload_skills: Vec::new(),
+        launch_args: Vec::new(),
     };
     std::fs::write(path, format!("{}\n", serde_json::to_string(&e).unwrap())).unwrap();
     "run_start"

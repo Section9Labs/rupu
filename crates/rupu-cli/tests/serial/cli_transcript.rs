@@ -38,6 +38,7 @@ fn write_transcript_started_at(
         customer: None,
         launch_skills: Vec::new(),
         launch_preload_skills: Vec::new(),
+        launch_args: Vec::new(),
     })
     .unwrap();
     w.write(&Event::RunComplete {
@@ -77,6 +78,7 @@ fn write_transcript(
         customer: None,
         launch_skills: Vec::new(),
         launch_preload_skills: Vec::new(),
+        launch_args: Vec::new(),
     })
     .unwrap();
     w.write(&Event::RunComplete {
@@ -114,6 +116,7 @@ fn write_transcript_with_assistant(
         customer: None,
         launch_skills: Vec::new(),
         launch_preload_skills: Vec::new(),
+        launch_args: Vec::new(),
     })
     .unwrap();
     w.write(&Event::AssistantMessage {

@@ -1495,6 +1495,7 @@ mod tests {
                 customer: None,
                 launch_skills: Vec::new(),
                 launch_preload_skills: Vec::new(),
+                launch_args: Vec::new(),
             },
             rupu_transcript::Event::Usage {
                 provider: "anthropic".into(),

@@ -128,6 +128,11 @@ pub struct RunIdentity {
     /// The launch's `preload_skills:` / `--preload-skill` entries, likewise.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub launch_preload_skills: Vec<String>,
+    /// A `rupu run`'s own arguments with its effective values, recorded on
+    /// `RunStart` so `rupu run --continue` restores them. Empty for any other
+    /// launch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launch_args: Vec<String>,
 }
 
 /// What a run may launch, and where its children are recorded (spec W7
