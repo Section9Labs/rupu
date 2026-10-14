@@ -187,11 +187,23 @@ export function toggleNetflowValue(q: string, key: NetflowDim, value: string): s
   ].join(' ');
 }
 
+function isWindowToken(raw: string): boolean {
+  const t = termOf(raw);
+  return t !== null && (t.key === 'since' || t.key === 'until' || t.key === 'window');
+}
+
+/** The query's window terms (`since:` / `until:` / `window:`), as written. */
+export function netflowWindowTerms(q: string): string[] {
+  return tokensOf(q).filter(isWindowToken);
+}
+
+/** The query with its window terms replaced by `terms`; every other term
+ *  stays as written. */
+export function withNetflowWindowTerms(q: string, terms: string[]): string {
+  return [...tokensOf(q).filter((raw) => !isWindowToken(raw)), ...terms].join(' ');
+}
+
 /** The query with its window replaced by `[from, to]` (a zoom). */
 export function withNetflowWindow(q: string, from: string, to: string): string {
-  const kept = tokensOf(q).filter((raw) => {
-    const t = termOf(raw);
-    return !(t && (t.key === 'since' || t.key === 'until' || t.key === 'window'));
-  });
-  return [...kept, `since:${from}`, `until:${to}`].join(' ');
+  return withNetflowWindowTerms(q, [`since:${from}`, `until:${to}`]);
 }

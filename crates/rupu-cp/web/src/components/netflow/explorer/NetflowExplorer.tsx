@@ -10,7 +10,8 @@
 // cross-filters are one query line (`lib/query/lists/netflow.ts` turns it
 // into the reads' params; graph clicks and drag-zooms write terms into it);
 // this component holds the query, the view switcher, the selected flow and
-// the zoom stack, and re-fetches when the query's params change, so KPIs,
+// the zoom stack (the window terms each zoom replaced, so a zoom out puts
+// back only the window and keeps every term written since), and re-fetches when the query's params change, so KPIs,
 // both visualizations, the org cards, and the table always describe the
 // same server-computed set. With no window in the query it opens on the
 // default (`defaultWindow`): the run's span on a run's tab, else the
@@ -45,8 +46,10 @@ import {
   defaultWindow,
   defaultWindowText,
   netflowRequest,
+  netflowWindowTerms,
   toggleNetflowValue,
   withNetflowWindow,
+  withNetflowWindowTerms,
   type NetflowDim,
 } from '../../../lib/query/lists/netflow';
 import type { FacetValue } from '../../query/suggest';
@@ -115,7 +118,7 @@ export function NetflowExplorer({
 }: NetflowExplorerProps) {
   const [q, setQ] = useListQuery('nq');
   const [view, setView] = useState<ViewMode>('topology');
-  const [zoomStack, setZoomStack] = useState<string[]>([]);
+  const [zoomStack, setZoomStack] = useState<string[][]>([]);
   const [selectedFlow, setSelectedFlow] = useState<FlowView | null>(null);
   const [explorer, setExplorer] = useState<ExplorerResponse | null>(null);
   const [flows, setFlows] = useState<NetflowResponse | null>(null);
@@ -253,18 +256,18 @@ export function NetflowExplorer({
     setQ(toggleNetflowValue(q, key, value));
   }
 
-  /** Drag- or cell-initiated zoom: push the current query so "Zoom out"
-   *  can unwind step by step. */
+  /** Drag- or cell-initiated zoom: push the window it replaces so "Zoom
+   *  out" can unwind step by step. */
   function zoomTo(fromIso: string, toIso: string) {
     setSelectedFlow(null);
-    setZoomStack((prev) => [...prev, q]);
+    setZoomStack((prev) => [...prev, netflowWindowTerms(q)]);
     setQ(withNetflowWindow(q, fromIso, toIso));
   }
 
   function zoomOut() {
     setSelectedFlow(null);
     if (zoomStack.length === 0) return;
-    setQ(zoomStack[zoomStack.length - 1]);
+    setQ(withNetflowWindowTerms(q, zoomStack[zoomStack.length - 1]));
     setZoomStack(zoomStack.slice(0, -1));
   }
 

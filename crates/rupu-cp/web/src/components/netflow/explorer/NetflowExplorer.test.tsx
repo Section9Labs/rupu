@@ -201,6 +201,27 @@ describe('NetflowExplorer: the query', () => {
     await waitFor(() => expect(fetchNetflowExplorer).toHaveBeenCalledTimes(3));
     expect(fetchNetflowExplorer).toHaveBeenLastCalledWith(undefined, HOUR, undefined);
   });
+
+  it('Zoom out restores the window only: a term written after the zoom stays', async () => {
+    renderExplorer({ scope: 'global' }, '/network?nq=since:2h');
+    await screen.findByText('Workflows');
+    fireEvent.click(screen.getByRole('button', { name: 'Timeline' }));
+    fireEvent.click(screen.getAllByTitle(/^2 calls/)[0]);
+    await waitFor(() => expect(fetchNetflowExplorer).toHaveBeenCalledTimes(2));
+
+    fireEvent.click(screen.getByRole('button', { name: /^api\.anthropic\.com:443/ }));
+    await waitFor(() => expect(fetchNetflowExplorer).toHaveBeenCalledTimes(3));
+
+    fireEvent.click(screen.getByRole('button', { name: /zoom out/i }));
+    await waitFor(() => expect(fetchNetflowExplorer).toHaveBeenCalledTimes(4));
+    expect(fetchNetflowExplorer).toHaveBeenLastCalledWith(
+      undefined,
+      { from: '2026-10-06T10:00:00.000Z' },
+      { ...EMPTY_NETFLOW_FILTERS, hosts: ['api.anthropic.com:443'] },
+    );
+    expect(screen.getByRole('button', { name: 'Remove since: 2h' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Remove host: api.anthropic.com:443' })).toBeInTheDocument();
+  });
 });
 
 describe('NetflowExplorer: loading and errors', () => {

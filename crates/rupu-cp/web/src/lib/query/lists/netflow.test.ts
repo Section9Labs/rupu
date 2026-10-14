@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { EMPTY_NETFLOW_FILTERS } from '../../netflow';
-import { defaultWindow, defaultWindowText, netflowRequest, toggleNetflowValue, withNetflowWindow } from './netflow';
+import {
+  defaultWindow,
+  defaultWindowText,
+  netflowRequest,
+  netflowWindowTerms,
+  toggleNetflowValue,
+  withNetflowWindow,
+  withNetflowWindowTerms,
+} from './netflow';
 
 const NOW = Date.parse('2026-10-06T12:00:00Z');
 
@@ -125,5 +133,16 @@ describe('withNetflowWindow', () => {
     expect(withNetflowWindow('since:1h origin:scm:github window:all', '2026-10-06T11:10:00.000Z', '2026-10-06T11:20:00.000Z')).toBe(
       'origin:scm:github since:2026-10-06T11:10:00.000Z until:2026-10-06T11:20:00.000Z',
     );
+  });
+});
+
+describe('netflowWindowTerms / withNetflowWindowTerms', () => {
+  it('reads the window terms as written, and puts them back over every other term', () => {
+    expect(netflowWindowTerms('since:2h origin:scm:github until:10m')).toEqual(['since:2h', 'until:10m']);
+    expect(netflowWindowTerms('origin:scm:github')).toEqual([]);
+    expect(withNetflowWindowTerms('origin:a since:2026-10-06T11:10:00.000Z until:2026-10-06T11:20:00.000Z host:b.com:443', ['since:2h'])).toBe(
+      'origin:a host:b.com:443 since:2h',
+    );
+    expect(withNetflowWindowTerms('since:1h org:x', [])).toBe('org:x');
   });
 });
