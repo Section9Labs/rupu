@@ -91,7 +91,7 @@ function projectLabel(workspacePath: string): string {
 type ClaimAction = 'requeue' | 'release';
 
 // Requeue / Release for the run's claim. The claim store is local-only (the
-// claim endpoints take no `host`), so RunDetail only mounts this for a local
+// claim endpoints take no `host`), so the panel renders this only for a local
 // run. Confirmation wording is the one the Claims table used.
 function ClaimActions({ claim }: { claim: AutoflowClaim }) {
   const [busy, setBusy] = useState<ClaimAction | null>(null);
