@@ -7,7 +7,7 @@
 // turn. The explainer panel up top makes that explicit so the list isn't
 // mistaken for a per-run process table.
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api, type WorkerView } from '../lib/api';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
@@ -17,19 +17,13 @@ import { ErrorBanner } from '../components/ui/ErrorBanner';
 import { Spinner } from '../components/ui/Spinner';
 import { cn } from '../lib/cn';
 import { relativeTime } from '../lib/time';
+import { ListQueryBar, NoMatches, useFilteredRows, useListQuery } from '../components/query/ListQueryBar';
+import { isWorkerStale, WORKER_FIELDS } from '../lib/query/lists/workers';
 
 // A worker is considered stale if it hasn't been seen in this many ms.
-const STALE_MS = 5 * 60 * 1000;
-
 /** Local short-id truncation (a shared helper is being added separately). */
 function shortId(id: string): string {
   return id.length > 12 ? `${id.slice(0, 10)}…` : id;
-}
-
-function isStale(lastSeen: string): boolean {
-  const t = Date.parse(lastSeen);
-  if (Number.isNaN(t)) return false;
-  return Date.now() - t > STALE_MS;
 }
 
 export default function Workers() {
@@ -52,6 +46,10 @@ export default function Workers() {
       cancelled = true;
     };
   }, []);
+
+  const [q, setQ] = useListQuery();
+  const loaded = useMemo(() => workers ?? [], [workers]);
+  const { rows, error: queryError, facets } = useFilteredRows(loaded, q, WORKER_FIELDS);
 
   return (
     <div className="p-8">
@@ -77,13 +75,30 @@ export default function Workers() {
         />
       ) : (
         <section>
-          <SectionHeader tone="muted" label="Workers" count={workers.length} />
-          <SortableTable<WorkerView>
-            columns={COLUMNS}
-            rows={workers}
-            rowKey={(w) => w.worker_id}
-            initialSort={{ key: 'name', dir: 'asc' }}
+          <ListQueryBar
+            value={q}
+            onChange={setQ}
+            fields={WORKER_FIELDS}
+            facets={facets}
+            total={loaded.length}
+            shown={rows.length}
+            error={queryError}
+            label="Filter workers"
+            placeholder="Filter workers… e.g. kind:cli status:stale"
           />
+          {rows.length === 0 ? (
+            <NoMatches noun="workers" />
+          ) : (
+            <>
+              <SectionHeader tone="muted" label="Workers" count={rows.length} />
+              <SortableTable<WorkerView>
+                columns={COLUMNS}
+                rows={rows}
+                rowKey={(w) => w.worker_id}
+                initialSort={{ key: 'name', dir: 'asc' }}
+              />
+            </>
+          )}
         </section>
       )}
     </div>
@@ -178,7 +193,7 @@ const COLUMNS: Column<WorkerView>[] = [
       return Number.isNaN(t) ? null : t;
     },
     render: (w) => {
-      const stale = isStale(w.last_seen_at);
+      const stale = isWorkerStale(w.last_seen_at);
       return (
         <div className="flex items-center gap-2 justify-end">
           <span className={cn('text-ui', stale ? 'text-warn' : 'text-ink-dim')}>
