@@ -197,3 +197,16 @@ All three CP netflow scopes, plus the agentiflow scope (which walks the same ids
 - **A coordinator-side abort's own gap.** A unit that was never collected reads as "not collected yet" and is not retried.
 - **Pruning landed ledgers on the coordinator.** `rupu netflow prune` treats them like any other ledger.
 - **macOS app.**
+
+## As built
+
+Where the build differs from the text above (the body is left as designed):
+
+- **The ledger writer opens its file eagerly.** The Problem section says a run with no network calls leaves no ledger file; the writer actually creates an empty one at start. The `begin` line is still what separates "no flows" from "not collected", because an older host writes no stream at all.
+- **Landing lives in `NodeMirror`, triggered by the run turning terminal.** The mirror lands its copy on the terminal `run.json` (before the status update, so a dispatcher polling `get_run` never sees a terminal run without a landing record) and in `finish`. That covers SSH, tunnel and bucket with one hook. A bucket poller that re-mirrors `run.json` every tick costs one record read once the landing is `complete`. An SSH copy pulled before terminal carries a `netflow.jsonl.partial` marker holding its reason. Tunnel and bucket copies are complete by transport order, so they carry no marker.
+- **Landed lines are byte-exact.** The stream's `line` is carried as raw JSON (`serde_json` `raw_value`), so a landed ledger holds exactly the host's bytes, including a line kind the coordinator doesn't know.
+- **`rupu run` finishes its netflow before its record turns terminal.** Origin/main's #863 added `RunNetflow::finish`, which flushes the writer and backfills the ledger from the transcript. `rupu run` now runs it before writing the terminal `run.json`, so a coordinator never pulls a stream still being written. The backfill tees its lines into the stream too.
+- **The id walk is built on #860's `run_tree`.** `netflow_ids` and `netflow_tree` add the roster and the landing records on top of the launched-children walk. Only the run itself and roster units are checked for a landing record, never every step id, to keep file opens off the project/global read path.
+- **The roster is the workflow run's own.** A workflow launched by a run (W7) keeps its placed units in its own `netflow.units.jsonl`; the launching run's walk reaches that workflow's units through `run_tree`, but not its roster. A missing landing for such a unit is therefore not listed as "not collected yet" at the launching run's scope (it is at the launched workflow's own scope).
+- **HTTP landings name the registry host id.** `HttpHostConnector::with_host_id`, set by the registry, is what the landing record's `host` carries.
+- **Placed-unit warnings carry the host.** The dispatcher now prefixes every warning `launch_and_wait` returns with `host <id>: `, not only the skill-shipping ones.
