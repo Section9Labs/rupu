@@ -11,8 +11,8 @@ export type TimeValue =
 
 const DAY_MS = 86_400_000;
 const UNIT_SECS: Record<string, bigint> = { m: 60n, h: 3_600n, d: 86_400n, w: 604_800n };
-/** chrono's `Duration` bound: `i64::MAX` milliseconds, in whole seconds. */
-const MAX_SPAN_SECS = 9_223_372_036_854_775n;
+/** rupu-query's `MAX_SPAN_DAYS` (10000 years), in seconds. */
+const MAX_SPAN_SECS = 3_652_425n * 86_400n;
 /** chrono's `NaiveDate` year range. */
 const MAX_YEAR = 262_143;
 
