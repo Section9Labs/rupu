@@ -801,6 +801,24 @@ async fn fan_out_list_runs(
     Ok(merged)
 }
 
+/// What a run row knows about the autoflow that launched it.
+///
+/// `issue_ref` comes from the run's `run_envelope.json` (`autoflow.claim_id`,
+/// else the record's `issue_ref`); the claim-derived fields are filled next to
+/// the host's claim store ([`crate::api::autoflow_claims::ClaimIndex`]).
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct RunAutoflow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_display_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_url: Option<String>,
+    /// The claim's PR, only on the claim's last run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_url: Option<String>,
+}
+
 /// One row of the runs list.
 ///
 /// `pub` (not `pub(crate)`) because `rupu-cli`'s `run list` emits `Vec<RunListRow>`
@@ -834,6 +852,36 @@ pub struct RunListRow {
     /// than counting the run as "no customer".
     #[serde(flatten)]
     pub customer: Option<crate::customers::RowCustomer>,
+    /// Whether an autoflow launched the run — see [`autoflow_of`]. `None` =
+    /// this host can't tell (no key on the wire); `Some(None)` = not launched
+    /// by an autoflow (`null`); `Some(Some(_))` = an autoflow run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autoflow: Option<Option<RunAutoflow>>,
+}
+
+/// The autoflow a run was launched by, from its `run_envelope.json`:
+/// `Some(Some(_))` for an autoflow run (its `issue_ref` the envelope's claim
+/// id, else the record's `issue_ref`), `Some(None)` for a run whose envelope
+/// names no autoflow or a local run that recorded no envelope (runs from
+/// before envelopes existed), and `None` — the row carries no key — for a
+/// mirrored worker run whose envelope this store may not hold, or an
+/// unreadable envelope (logged).
+pub fn autoflow_of(
+    r: &RunRecord,
+    store: &rupu_orchestrator::runs::RunStore,
+) -> Option<Option<RunAutoflow>> {
+    match store.read_run_envelope_cached(&r.id) {
+        Ok(Some(env)) => Some(env.autoflow.as_ref().map(|a| RunAutoflow {
+            issue_ref: a.claim_id.clone().or_else(|| r.issue_ref.clone()),
+            ..Default::default()
+        })),
+        Ok(None) if r.worker_id.is_none() => Some(None),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(run_id = %r.id, error = %e, "run envelope unreadable; autoflow unknown");
+            None
+        }
+    }
 }
 
 impl From<&RunRecord> for RunListRow {
@@ -860,6 +908,7 @@ impl From<&RunRecord> for RunListRow {
             usage: crate::usage::UsageSummary::default(),
             turns: 0,
             duration_ms: None,
+            autoflow: None,
         }
     }
 }
@@ -887,6 +936,7 @@ impl RunListRow {
         let mut row = Self::with_usage(r, store, prices.pricing_for(key.slug()));
         row.usage.pricing_error = key.pricing_error(prices);
         row.customer = who.map(Into::into);
+        row.autoflow = autoflow_of(r, store);
         row
     }
 
@@ -3995,6 +4045,145 @@ pub(crate) mod tests {
         assert!(!in_lifecycle(RunStatus::Cancelled, Some("active")));
     }
 
+    fn autoflow_envelope(run_id: &str, claim: Option<&str>) -> rupu_runtime::RunEnvelope {
+        use rupu_runtime::*;
+        RunEnvelope {
+            version: RunEnvelope::VERSION,
+            run_id: run_id.into(),
+            kind: RunKind::WorkflowRun,
+            workflow: WorkflowBinding {
+                name: "fix-issue".into(),
+                source_path: "x.yaml".into(),
+                fingerprint: "sha256:t".into(),
+            },
+            repo: None,
+            trigger: RunTrigger {
+                source: RunTriggerSource::Autoflow,
+                wake_id: None,
+                event_id: None,
+            },
+            inputs: Default::default(),
+            context: None,
+            execution: ExecutionRequest {
+                backend: None,
+                permission_mode: "bypass".into(),
+                workspace_strategy: None,
+                strict_templates: false,
+                attach_ui: false,
+            },
+            autoflow: Some(AutoflowEnvelope {
+                name: "fix-issue".into(),
+                claim_id: claim.map(Into::into),
+                priority: 0,
+            }),
+            correlation: None,
+            worker: None,
+        }
+    }
+
+    /// The listed row of run `id`, as JSON.
+    fn listed(s: &AppState, id: &str) -> serde_json::Value {
+        let rec = s.run_store.load(id).unwrap();
+        let row = RunListRow::priced(
+            &rec,
+            None,
+            &s.run_store,
+            &mut crate::customers::FlatPricing(&s.pricing),
+        );
+        serde_json::to_value(row).unwrap()
+    }
+
+    /// A run whose envelope was written before its record, the way a launch
+    /// records them.
+    fn create_with_envelope(s: &AppState, id: &str, env: &rupu_runtime::RunEnvelope) {
+        s.run_store.write_run_envelope(id, env).unwrap();
+        s.run_store
+            .create(terminal_record(id), "name: x\n")
+            .unwrap();
+    }
+
+    #[test]
+    fn autoflow_run_carries_its_issue() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        create_with_envelope(
+            &s,
+            "run_af",
+            &autoflow_envelope("run_af", Some("github:acme/api/issues/7")),
+        );
+        assert_eq!(
+            listed(&s, "run_af")["autoflow"],
+            serde_json::json!({"issue_ref": "github:acme/api/issues/7"})
+        );
+    }
+
+    #[test]
+    fn autoflow_run_without_claim_falls_back_to_the_records_issue_ref() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        s.run_store
+            .write_run_envelope("run_af_rec", &autoflow_envelope("run_af_rec", None))
+            .unwrap();
+        let mut rec = terminal_record("run_af_rec");
+        rec.issue_ref = Some("github:acme/api/issues/8".into());
+        s.run_store.create(rec, "name: x\n").unwrap();
+        assert_eq!(
+            listed(&s, "run_af_rec")["autoflow"],
+            serde_json::json!({"issue_ref": "github:acme/api/issues/8"})
+        );
+    }
+
+    #[test]
+    fn manual_run_with_envelope_is_null() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let mut env = autoflow_envelope("run_m", None);
+        env.autoflow = None;
+        create_with_envelope(&s, "run_m", &env);
+        let v = listed(&s, "run_m");
+        assert!(v.as_object().unwrap().contains_key("autoflow"));
+        assert_eq!(v["autoflow"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn no_envelope_local_run_is_not_autoflow() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        s.run_store
+            .create(terminal_record("run_old"), "name: x\n")
+            .unwrap();
+        let v = listed(&s, "run_old");
+        assert!(v.as_object().unwrap().contains_key("autoflow"));
+        assert_eq!(v["autoflow"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn mirrored_run_without_envelope_omits_the_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let mut rec = terminal_record("run_mirror");
+        rec.worker_id = Some("node_a".into());
+        s.run_store.create(rec, "name: x\n").unwrap();
+        assert!(!listed(&s, "run_mirror")
+            .as_object()
+            .unwrap()
+            .contains_key("autoflow"));
+    }
+
+    #[test]
+    fn unreadable_envelope_omits_the_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        s.run_store
+            .create(terminal_record("run_bad"), "name: x\n")
+            .unwrap();
+        std::fs::write(s.run_store.run_envelope_path("run_bad"), b"{nope").unwrap();
+        assert!(!listed(&s, "run_bad")
+            .as_object()
+            .unwrap()
+            .contains_key("autoflow"));
+    }
+
     #[test]
     fn run_list_row_serializes_usage() {
         let row = RunListRow {
@@ -4010,6 +4199,7 @@ pub(crate) mod tests {
             codename: "cobalt-harbor".into(),
             codename_derived: false,
             customer: Some(crate::customers::RowCustomer::default()),
+            autoflow: None,
         };
         let v = serde_json::to_value(&row).unwrap();
         assert!(v.get("usage").is_some());
