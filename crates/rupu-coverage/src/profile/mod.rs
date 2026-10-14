@@ -12,9 +12,7 @@ pub mod predicate;
 pub mod registry;
 
 pub use loader::{discover, expand_includes, include_closure, LoadError};
-pub use package::{
-    parse_profile, AssetKindDef, Bundle, BundleSkill, Coverage, EngagementProfile, ProfileError,
-};
+pub use package::{parse_profile, AssetKindDef, Bundle, Coverage, EngagementProfile, ProfileError};
 pub use predicate::{evaluate, CompletenessCheck, Predicate, PredicateError};
 pub use registry::{ActiveSet, ProfileRegistry, RegistryError};
 

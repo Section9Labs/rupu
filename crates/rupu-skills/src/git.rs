@@ -73,13 +73,8 @@ pub(crate) fn clone_at(
     if git_ref.is_none() && url.starts_with("https://") {
         fo.depth(1);
     }
-    // Byte-exact checkouts: no attributes, `core.autocrlf` or user config may
-    // change the bytes, so an online install equals an offline one.
-    let mut co = git2::build::CheckoutBuilder::new();
-    co.disable_filters(true);
     let repo = git2::build::RepoBuilder::new()
         .fetch_options(fo)
-        .with_checkout(co)
         .clone(url, dest)?;
     if let Some(r) = git_ref {
         let obj = [
@@ -93,11 +88,7 @@ pub(crate) fn clone_at(
         let commit = obj.peel_to_commit()?;
         repo.checkout_tree(
             commit.as_object(),
-            Some(
-                git2::build::CheckoutBuilder::new()
-                    .force()
-                    .disable_filters(true),
-            ),
+            Some(git2::build::CheckoutBuilder::new().force()),
         )?;
         repo.set_head_detached(commit.id())?;
     }
@@ -242,38 +233,6 @@ mod tests {
             assert!(
                 matches!(&got, Err(SourceError::BadPath(p)) if p == path),
                 "{path}: {got:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_clone_is_byte_exact_whatever_the_attributes_say() {
-        let o = tempfile::tempdir().unwrap();
-        let repo = git2::Repository::init(o.path()).unwrap();
-        std::fs::write(o.path().join(".gitattributes"), "*.sh text eol=crlf\n").unwrap();
-        std::fs::write(o.path().join("run.sh"), "#!/bin/sh\necho ok\n").unwrap();
-        let first = commit_all(&repo, "first");
-        let obj = repo.find_object(first, None).unwrap();
-        repo.tag_lightweight("v1", &obj, false).unwrap();
-        // A later commit that rewrites the script, so the tag checkout has
-        // to write it itself rather than inherit the clone's.
-        std::fs::write(o.path().join("run.sh"), "#!/bin/sh\necho later\n").unwrap();
-        commit_all(&repo, "second");
-
-        for (git_ref, want) in [
-            (None, "#!/bin/sh\necho later\n"),
-            (Some("v1".to_owned()), "#!/bin/sh\necho ok\n"),
-        ] {
-            let got = fetch_any(&GitSource {
-                url: url_of(o.path()),
-                git_ref: git_ref.clone(),
-                path: None,
-            })
-            .unwrap();
-            assert_eq!(
-                std::fs::read(got.root.join("run.sh")).unwrap(),
-                want.as_bytes(),
-                "ref {git_ref:?}"
             );
         }
     }

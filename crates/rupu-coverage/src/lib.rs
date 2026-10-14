@@ -32,8 +32,7 @@ pub use asset::{
 
 pub use profile::{
     builtin_profiles, builtin_registry, registry_with_overlay, ActiveSet, AssetKindDef, Bundle,
-    BundleSkill, CompletenessCheck, Coverage, EngagementProfile, Predicate, ProfileRegistry,
-    DEFAULT_PROFILE,
+    CompletenessCheck, Coverage, EngagementProfile, Predicate, ProfileRegistry, DEFAULT_PROFILE,
 };
 
 pub use audit::generate::audit as run_audit;
