@@ -247,6 +247,11 @@ async fn workflow_runs_q_ands_with_lifecycle_and_reads_time_and_text() {
     );
     assert_eq!(ids("-status:failed%20ALPHA", "").await, ["run_3", "run_1"]);
     assert_eq!(ids("id:run_5", "").await, ["run_5"]);
+    assert_eq!(
+        ids("since:3652425d", "").await,
+        ["run_6", "run_5", "run_4", "run_3", "run_2", "run_1"]
+    );
+    assert!(ids("until:3652425d", "").await.is_empty());
 }
 
 #[tokio::test]
@@ -275,6 +280,16 @@ async fn a_bad_q_is_a_400_naming_its_token_on_every_list() {
             body["error"],
             "unknown key `sevrity` (quote the text to search for it)"
         );
+        for key in ["since", "until"] {
+            let (status, _, body) = get(format!("{base}{path}?q=alpha%20{key}:100000000d")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {key}: {body}");
+            assert_eq!(body["code"], "bad_value", "{path} {key}: {body}");
+            assert_eq!(body["token"], 1, "{path} {key}: {body}");
+            assert_eq!(
+                body["error"],
+                "`100000000d` is too long a span (at most 10000 years)"
+            );
+        }
     }
 }
 
