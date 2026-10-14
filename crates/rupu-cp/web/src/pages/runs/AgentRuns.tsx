@@ -284,7 +284,7 @@ export default function AgentRuns({ customer: fixedCustomer }: { customer?: stri
         fields={AGENT_RUN_FIELDS}
         facets={facets}
         label="Filter agent runs"
-        placeholder="Filter standalone runs… e.g. status:running · status:error since:7d · source:session"
+        placeholder="Filter standalone runs… e.g. is:running · is:failed since:7d · source:session"
         error={queryError}
         alerts={hostAlerts(notes, 'runs', retryPaging)}
       />

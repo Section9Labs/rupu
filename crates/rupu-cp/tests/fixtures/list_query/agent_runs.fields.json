@@ -3,6 +3,7 @@
   {"aliases":[],"facet":true,"key":"agent","kind":"text","match":"contains","text":true,"values":[]},
   {"aliases":[],"facet":true,"key":"provider","kind":"text","match":"exact","text":false,"values":[]},
   {"aliases":[],"facet":true,"key":"model","kind":"text","match":"contains","text":false,"values":[]},
+  {"aliases":[],"facet":true,"key":"is","kind":"enum","match":"exact","text":false,"values":["running","completed","failed"]},
   {"aliases":[],"facet":true,"key":"source","kind":"enum","match":"exact","text":false,"values":["standalone","session"]},
   {"aliases":[],"facet":false,"key":"session","kind":"text","match":"prefix","text":false,"values":[]},
   {"aliases":[],"facet":true,"key":"trigger","kind":"text","match":"exact","text":false,"values":[]},
