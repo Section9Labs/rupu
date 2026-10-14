@@ -26,6 +26,7 @@ fn roundtrip_run_start() {
         customer: None,
         launch_skills: Vec::new(),
         launch_preload_skills: Vec::new(),
+        launch_args: Vec::new(),
     });
 }
 

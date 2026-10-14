@@ -81,10 +81,18 @@ pub struct Overrides {
     pub skills: Vec<String>,
     /// The launch's own `preloadSkills:` entries.
     pub preload_skills: Vec<String>,
+    /// `rupu run`'s own arguments with their effective values, recorded as
+    /// `RunStart.launch_args` for `rupu run --continue`.
+    pub launch_args: Vec<String>,
     /// The skills section a session's first turn rendered, sent as it is
     /// instead of one rendered from the run's skills, so every turn's
     /// system prompt is the same bytes. `Some("")` sends none.
     pub skill_section: Option<String>,
+    /// `rupu run --no-messaging` / `--messaging-tool`: a placed unit's
+    /// workflow `messaging:` switch. Off is [`super::OffReason::Launch`] (a
+    /// cap on everything the run launches), tools are its messaging tools
+    /// as `ambient:workflow_messaging`.
+    pub messaging: rupu_tools::MessagingSwitch,
 }
 
 /// Services the site provides (they belong to the root run, not this one).

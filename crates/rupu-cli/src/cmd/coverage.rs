@@ -1271,12 +1271,15 @@ fn rerun_args(invocation: &rupu_coverage::RerunInvocation) -> crate::cmd::run::A
         skills: invocation.skills.clone(),
         preload_skills: invocation.preload_skills.clone(),
         skill_bundle: None,
+        no_messaging: false,
+        messaging_tools: Vec::new(),
         continue_from: None,
         model: None,
         provider: None,
         message_space: None,
         participant: None,
         launch: Default::default(),
+        explicit: Default::default(),
     }
 }
 

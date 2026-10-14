@@ -57,6 +57,7 @@ fn write_usage_transcript(
             customer: None,
             launch_skills: Vec::new(),
             launch_preload_skills: Vec::new(),
+            launch_args: Vec::new(),
         })
         .unwrap();
     writer
@@ -699,6 +700,7 @@ fn usage_backfill_creates_sidecars_for_old_standalone_transcripts() {
             customer: None,
             launch_skills: Vec::new(),
             launch_preload_skills: Vec::new(),
+            launch_args: Vec::new(),
         })
         .unwrap();
     for event in events.into_iter().skip(1) {

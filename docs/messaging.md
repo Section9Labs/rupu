@@ -49,7 +49,9 @@ space. There is no messaging between roots.
 
 Placed units (`host:` / `distribute:`) run on another machine and are not in the
 coordinator's space. Each runs as a standalone `rupu run` on its host, with a space of its own
-there and the default tools. A workflow's `messaging:` key does not reach them.
+there and the default tools. A workflow's `messaging:` key reaches them: `false` as
+`rupu run --no-messaging`, `true` or `{ tools: [...] }` as one `rupu run --messaging-tool` per
+tool (see [Turning it off](#turning-it-off)).
 
 ## Participants and addresses
 
@@ -126,7 +128,8 @@ was sent, delivered messages included.
 
 ## Turning it off
 
-Messaging is on by default. Three places turn it off, and off wins over everything else.
+Messaging is on by default. A workflow, an agentiflow, an agent file and
+`rupu run --no-messaging` turn it off, and off wins over everything else.
 
 ```yaml
 name: quiet-review
@@ -138,10 +141,15 @@ steps:
 ```
 
 A workflow's `messaging: false` turns it off for every agent step and unit, and for every
-child they launch. Placed units are the exception: the key does not reach them (see above). An autoflow is a workflow with an `autoflow:` block, so the same key is its
-opt-out. `messaging: true` is the default set, written down. `messaging: { tools: [board.post,
+child they launch. A placed unit (`host:` / `distribute:`) is launched on its host with
+`rupu run --no-messaging`, so it is off there too. A host whose `rupu` predates the flag (it
+doesn't advertise `agent.no_messaging`) is refused the unit rather than run it with messaging
+on. An autoflow is a workflow with an `autoflow:` block, so the same key is its opt-out.
+`messaging: true` is the default set, written down. `messaging: { tools: [board.post,
 board.read, msg.send] }` grants only the tools named, recorded in each step's `tool_grant` as
-`ambient:workflow_messaging`. Only `board.*` and `msg.*` tools are accepted.
+`ambient:workflow_messaging`. Only `board.*` and `msg.*` tools are accepted. A placed unit is
+launched with `rupu run --messaging-tool <name>` per tool, so it gets the same list on its
+host; a host that doesn't advertise `agent.messaging_tools` is refused the unit.
 
 An agentiflow's definition takes `messaging: false` too: neither its lead nor any unit gets a
 messaging tool. The lead keeps its status, roster and launch tools.
@@ -150,11 +158,18 @@ An agent file's `messaging: false` turns it off for that agent wherever it runs.
 naming a messaging tool in `tools:` (by name, alias or `board.*` / `msg.*`) is a load error,
 since it contradicts itself.
 
+`rupu run --no-messaging` turns it off for one run and everything it launches, as the agent's
+`messaging: false` would. `rupu run --messaging-tool <name>` (repeatable) offers the run only
+the messaging tools named, as a workflow's `messaging: { tools }` offers its steps; a name that
+isn't a `board.*` / `msg.*` tool is a usage error. The two flags can't be given together. They
+are what a placed unit's coordinator passes.
+
 Off is inherited. A run whose messaging is off launches every child with it off: a sub-agent
 through its parent's launch scope, a process child through the internal `--launch-no-messaging`
-flag, a workflow child too, although it is a root of its own. A child of a run whose messaging
-is off has it off. Narrowing is not inherited: a child of a step with `messaging: { tools: [...] }`
-gets the default set.
+flag, a workflow child too, although it is a root of its own. A placed unit of a workflow
+launched that way has it off too. A child of a run whose messaging is off has it off.
+Narrowing is not inherited: a child of a step with `messaging: { tools: [...] }` gets the
+default set.
 
 When a run's messaging is off, a messaging tool its agent names in `tools:` is not offered. The
 run's transcript says so with a `tool_unavailable` notice. Nothing is dropped silently.

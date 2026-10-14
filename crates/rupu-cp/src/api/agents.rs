@@ -13,6 +13,7 @@ use axum::{
     Json, Router,
 };
 use rupu_agent::loader::{find_agent, load_agents, AgentLoadError};
+use rupu_runtime::argv::LaunchMessaging;
 use rupu_skills::ship::SkillBundleManifest;
 use rupu_workspace::{RepoRegistryStore, WorkspaceStore};
 use serde::{Deserialize, Serialize};
@@ -1002,6 +1003,15 @@ struct AgentRunBody {
     /// --skill-bundle`). Validated; a malformed manifest is a 400.
     #[serde(default)]
     skill_bundle: Option<SkillBundleManifest>,
+    /// Optional placed unit's workflow `messaging:` switch: `"off"` (the
+    /// run and everything it launches gets no messaging tools, `rupu run
+    /// --no-messaging`) or `{"tools": [...]}` (only these, `rupu run
+    /// --messaging-tool`; a name that isn't a messaging tool is a 400 on the
+    /// local path). Absent: the agent file decides. Honoured on both paths;
+    /// on the remote-proxy path a peer that does not advertise
+    /// `agent.no_messaging` / `agent.messaging_tools` refuses the launch.
+    #[serde(default)]
+    messaging: LaunchMessaging,
     /// Optional run id to execute under (`run_<…>`), minted by a
     /// coordinator that needs to know it before the run starts — honoured
     /// because `/api/host/info` advertises `run.supplied_run_id`. A malformed
@@ -1073,6 +1083,15 @@ fn parse_findings_profile(
         .transpose()
 }
 
+/// A body's `messaging`: its tool names are messaging tools this host
+/// knows, or a 400. They land on the child's command line, whose own check
+/// would otherwise fail the detached run.
+fn parse_messaging(raw: LaunchMessaging) -> Result<LaunchMessaging, ApiError> {
+    raw.resolve()
+        .map_err(|e| ApiError::bad_request(format!("messaging: {e}")))?;
+    Ok(raw)
+}
+
 fn parse_skill_bundle(
     bundle: Option<SkillBundleManifest>,
 ) -> Result<Option<SkillBundleManifest>, ApiError> {
@@ -1094,6 +1113,7 @@ async fn run_agent_with(
     let skills = parse_skill_entries("skills", body.skills)?;
     let preload_skills = parse_skill_entries("preload_skills", body.preload_skills)?;
     let skill_bundle = parse_skill_bundle(body.skill_bundle)?;
+    let messaging = parse_messaging(body.messaging)?;
     let (run_id, codename) = parse_supplied_identity(body.run_id, body.codename)?;
     let req = AgentLaunchRequest {
         codename,
@@ -1108,6 +1128,7 @@ async fn run_agent_with(
         skills,
         preload_skills,
         skill_bundle,
+        messaging,
     };
     launcher.launch(req).await.map_err(|e| match e {
         AgentLaunchError::Invalid(m) => ApiError::bad_request(m),
@@ -1259,12 +1280,14 @@ async fn run_agent(
             skills,
             preload_skills,
             skill_bundle,
+            messaging: b.messaging,
         };
         let run_id = conn.launch_agent(req).await.map_err(|e| match e {
             HostConnectorError::NotFound(m) => ApiError::not_found(m),
             HostConnectorError::Invalid(m) => ApiError::bad_request(m),
             // e.g. the host can't honour `findings_profile`,
-            // `engagement_profiles` or `skills` — refused, not failed.
+            // `engagement_profiles`, `skills` or `messaging` — refused,
+            // not failed.
             HostConnectorError::Unsupported(m) => ApiError::not_available(m),
             other => ApiError::internal(other.to_string()),
         })?;
@@ -1519,6 +1542,7 @@ mod tests {
             skills: Vec::new(),
             preload_skills: Vec::new(),
             skill_bundle: None,
+            messaging: Default::default(),
             run_id: None,
             codename: None,
         };
@@ -1621,6 +1645,47 @@ mod tests {
         let rendered: SkillBundleManifest =
             serde_json::from_str(&run.skill_bundle.expect("rendered")).unwrap();
         assert_eq!(rendered, m);
+    }
+
+    #[tokio::test]
+    async fn run_agent_forwards_messaging() {
+        let mock = Arc::new(MockAgent {
+            last: Mutex::new(None),
+        });
+        for (json, want) in [
+            (
+                serde_json::json!({ "messaging": "off" }),
+                LaunchMessaging::Off,
+            ),
+            (
+                serde_json::json!({ "messaging": { "tools": ["msg.send"] } }),
+                LaunchMessaging::Tools(vec!["msg.send".into()]),
+            ),
+            (serde_json::json!({}), LaunchMessaging::Default),
+        ] {
+            let body: AgentRunBody = serde_json::from_value(json).unwrap();
+            run_agent_with("recon", body, mock.clone())
+                .await
+                .expect("ok");
+            let got = mock.last.lock().unwrap().take().unwrap();
+            assert_eq!(got.messaging, want);
+            assert_eq!(got.agent_run("run_X").unwrap().messaging, want);
+        }
+    }
+
+    #[tokio::test]
+    async fn run_agent_rejects_a_tool_that_is_not_a_messaging_tool() {
+        let mock = Arc::new(MockAgent {
+            last: Mutex::new(None),
+        });
+        let body: AgentRunBody =
+            serde_json::from_value(serde_json::json!({ "messaging": { "tools": ["read_file"] } }))
+                .unwrap();
+        let err = run_agent_with("recon", body, mock.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert!(mock.last.lock().unwrap().is_none(), "nothing launched");
     }
 
     #[tokio::test]
@@ -1809,6 +1874,7 @@ mod tests {
             skills: Vec::new(),
             preload_skills: Vec::new(),
             skill_bundle: None,
+            messaging: Default::default(),
             run_id: None,
             codename: None,
         };
@@ -1853,6 +1919,7 @@ mod tests {
             skills: Vec::new(),
             preload_skills: Vec::new(),
             skill_bundle: None,
+            messaging: Default::default(),
             run_id: None,
             codename: None,
         };
@@ -1898,6 +1965,7 @@ mod tests {
             skills: Vec::new(),
             preload_skills: Vec::new(),
             skill_bundle: None,
+            messaging: Default::default(),
             run_id: None,
             codename: None,
         };
@@ -1947,6 +2015,7 @@ mod tests {
             skills: Vec::new(),
             preload_skills: Vec::new(),
             skill_bundle: None,
+            messaging: Default::default(),
             run_id: None,
             codename: None,
         };
@@ -2004,6 +2073,7 @@ mod tests {
             skills: Vec::new(),
             preload_skills: Vec::new(),
             skill_bundle: None,
+            messaging: Default::default(),
             run_id: None,
             codename: None,
         };
@@ -2052,6 +2122,7 @@ mod tests {
             skills: Vec::new(),
             preload_skills: Vec::new(),
             skill_bundle: None,
+            messaging: Default::default(),
             run_id: None,
             codename: None,
         };
@@ -2088,6 +2159,7 @@ mod tests {
             skills: Vec::new(),
             preload_skills: Vec::new(),
             skill_bundle: None,
+            messaging: Default::default(),
             run_id: None,
             codename: None,
         };
@@ -2125,6 +2197,7 @@ mod tests {
             skills: Vec::new(),
             preload_skills: Vec::new(),
             skill_bundle: None,
+            messaging: Default::default(),
             run_id: None,
             codename: None,
         };
@@ -3574,6 +3647,7 @@ mod tests {
             customer: None,
             launch_skills: Vec::new(),
             launch_preload_skills: Vec::new(),
+            launch_args: Vec::new(),
         };
         let mut line = serde_json::to_vec(&ev).unwrap();
         line.push(b'\n');

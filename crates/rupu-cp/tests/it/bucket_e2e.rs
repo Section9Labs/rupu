@@ -39,6 +39,7 @@ async fn poll_bucket_run_mirrors_and_finishes() {
     // Create the mirror run so the NodeMirror knows about it.
     let spec = RunSpec {
         skill_bundle: None,
+        messaging: Default::default(),
         kind: RunSpecKind::Workflow,
         name: "deploy".to_string(),
         inputs: BTreeMap::new(),
@@ -172,6 +173,7 @@ async fn poll_bucket_run_remirrors_run_json_each_tick() {
 
     let spec = RunSpec {
         skill_bundle: None,
+        messaging: Default::default(),
         kind: RunSpecKind::Workflow,
         name: "check".to_string(),
         inputs: BTreeMap::new(),
@@ -460,6 +462,7 @@ async fn failing_run(
     let mirror = NodeMirror::new(Arc::clone(&store));
     let spec = RunSpec {
         skill_bundle: None,
+        messaging: Default::default(),
         kind: RunSpecKind::Agent,
         name: "a".to_string(),
         inputs: BTreeMap::new(),

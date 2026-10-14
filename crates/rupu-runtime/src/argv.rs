@@ -79,6 +79,9 @@ pub struct AgentRun {
     /// `--tmp`: clone a repo/PR target into an auto-deleted tmpdir. The CP and
     /// placed launches set it whenever there is a target.
     pub tmp_clone: bool,
+    /// `--no-messaging` or `--messaging-tool`: a placed unit's coordinator
+    /// passing its workflow's `messaging:` switch.
+    pub messaging: LaunchMessaging,
     /// Join a message space (`--message-space <dir> --participant <id>`):
     /// a child sharing its parent's, an agentiflow's pool unit (spec F1a §7).
     pub message_space: Option<MessageSpace>,
@@ -107,9 +110,62 @@ impl AgentRun {
             preload_skills: Vec::new(),
             skill_bundle: None,
             tmp_clone: false,
+            messaging: LaunchMessaging::Default,
             message_space: None,
             continue_from: None,
             launch: None,
+        }
+    }
+}
+
+/// A launch's messaging, as a placed unit's coordinator passes its
+/// workflow's `messaging:` switch to the standalone `rupu run` the unit
+/// becomes (spec F1d D7). The resolved form is
+/// [`rupu_tools::MessagingSwitch`]; this one carries tool names as given,
+/// and the host resolves them ([`Self::resolve`]). On the wire (a node's
+/// `RunSpec`, the CP agent-run body) it is `"off"` or `{"tools": [...]}`,
+/// and absent for the default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchMessaging {
+    /// Nothing passed: the host decides from the agent file.
+    #[default]
+    Default,
+    /// `--messaging-tool <name>`, repeated (`--messaging-tool=` alone for
+    /// none): the run's messaging tools are only these, as a workflow's
+    /// `messaging: { tools }` gives its steps.
+    Tools(Vec<String>),
+    /// `--no-messaging`: no messaging tools, for the run and everything it
+    /// launches.
+    Off,
+}
+
+impl LaunchMessaging {
+    pub fn is_default(&self) -> bool {
+        *self == Self::Default
+    }
+
+    /// The switch the run resolves: tool names checked against the catalog
+    /// (only `board.*` / `msg.*`, canonical or alias).
+    pub fn resolve(&self) -> Result<rupu_tools::MessagingSwitch, rupu_tools::GrantError> {
+        Ok(match self {
+            Self::Default => rupu_tools::MessagingSwitch::Default,
+            Self::Tools(names) => rupu_tools::MessagingSwitch::Tools(
+                rupu_tools::ToolCatalog::builtin().resolve_messaging(names)?,
+            ),
+            Self::Off => rupu_tools::MessagingSwitch::Off,
+        })
+    }
+}
+
+impl From<&rupu_tools::MessagingSwitch> for LaunchMessaging {
+    fn from(switch: &rupu_tools::MessagingSwitch) -> Self {
+        match switch {
+            rupu_tools::MessagingSwitch::Default => Self::Default,
+            rupu_tools::MessagingSwitch::Tools(tools) => {
+                Self::Tools(tools.iter().map(ToString::to_string).collect())
+            }
+            rupu_tools::MessagingSwitch::Off => Self::Off,
         }
     }
 }
@@ -409,6 +465,18 @@ impl RunArgv {
                 }
                 if r.tmp_clone {
                     a.push("--tmp");
+                }
+                match &r.messaging {
+                    LaunchMessaging::Default => {}
+                    LaunchMessaging::Tools(tools) if tools.is_empty() => {
+                        a.push("--messaging-tool=");
+                    }
+                    LaunchMessaging::Tools(tools) => {
+                        for t in tools {
+                            a.flag_value("--messaging-tool", t);
+                        }
+                    }
+                    LaunchMessaging::Off => a.push("--no-messaging"),
                 }
                 a.opt_flag_value("--continue", r.continue_from.as_deref());
                 if let Some(m) = &r.message_space {
@@ -1156,5 +1224,95 @@ mod tests {
         assert!(!strs(&RunArgv::Agent(on))
             .iter()
             .any(|a| a == "--launch-no-messaging"));
+    }
+
+    /// A placed unit's workflow `messaging:` switch: off is the bare
+    /// `--no-messaging`, tools one `--messaging-tool <name>` each (none is
+    /// `--messaging-tool=`), the default nothing.
+    #[test]
+    fn an_agent_run_renders_its_messaging() {
+        let run = |m: LaunchMessaging| {
+            let mut r = AgentRun::new("recon", "run_1");
+            r.tmp_clone = true;
+            r.messaging = m;
+            RunArgv::Agent(r)
+        };
+        let off = run(LaunchMessaging::Off);
+        assert_eq!(
+            strs(&off),
+            ["run", "recon", "--run-id", "run_1", "--tmp", "--no-messaging"]
+        );
+        assert_eq!(
+            off.to_shell("rupu"),
+            "'rupu' 'run' 'recon' '--run-id' 'run_1' '--tmp' '--no-messaging'"
+        );
+        let tools = run(LaunchMessaging::Tools(vec![
+            "msg.send".into(),
+            "board.post".into(),
+        ]));
+        assert_eq!(
+            strs(&tools),
+            [
+                "run",
+                "recon",
+                "--run-id",
+                "run_1",
+                "--tmp",
+                "--messaging-tool",
+                "msg.send",
+                "--messaging-tool",
+                "board.post"
+            ]
+        );
+        assert_eq!(
+            strs(&run(LaunchMessaging::Tools(Vec::new()))),
+            [
+                "run",
+                "recon",
+                "--run-id",
+                "run_1",
+                "--tmp",
+                "--messaging-tool="
+            ]
+        );
+        assert_eq!(
+            strs(&run(LaunchMessaging::Default)),
+            ["run", "recon", "--run-id", "run_1", "--tmp"]
+        );
+    }
+
+    /// The wire form: absent is the default, `"off"`, `{"tools": [...]}`;
+    /// the host resolves names to canonical ones and refuses a non-messaging
+    /// tool.
+    #[test]
+    fn launch_messaging_wire_form_and_resolution() {
+        assert_eq!(
+            serde_json::to_string(&LaunchMessaging::Off).unwrap(),
+            r#""off""#
+        );
+        let tools = LaunchMessaging::Tools(vec!["msg.send".into()]);
+        assert_eq!(
+            serde_json::to_string(&tools).unwrap(),
+            r#"{"tools":["msg.send"]}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<LaunchMessaging>(r#"{"tools":["msg.send"]}"#).unwrap(),
+            tools
+        );
+        assert_eq!(
+            tools.resolve().unwrap(),
+            rupu_tools::MessagingSwitch::Tools(vec!["msg.send"])
+        );
+        assert_eq!(
+            LaunchMessaging::from(&rupu_tools::MessagingSwitch::Tools(vec!["board.post"])),
+            LaunchMessaging::Tools(vec!["board.post".into()])
+        );
+        assert!(LaunchMessaging::Tools(vec!["read_file".into()])
+            .resolve()
+            .is_err());
+        assert_eq!(
+            LaunchMessaging::Off.resolve().unwrap(),
+            rupu_tools::MessagingSwitch::Off
+        );
     }
 }

@@ -382,6 +382,7 @@ mod tests {
             customer,
             launch_skills: Vec::new(),
             launch_preload_skills: Vec::new(),
+            launch_args: Vec::new(),
         };
         let mut line = serde_json::to_vec(&ev).unwrap();
         line.push(b'\n');

@@ -175,14 +175,26 @@ pub struct RunSpec {
     /// [`CAP_AGENT_SKILL_BUNDLE`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_bundle: Option<rupu_skills::ship::SkillBundleManifest>,
+    /// Agent runs only: a placed unit's workflow `messaging:` switch,
+    /// `"off"` (`rupu run --no-messaging`) or `{"tools": [...]}` (`rupu run
+    /// --messaging-tool`). Absent on the wire for the default.
+    ///
+    /// Same rule as `skills`: an executor predating this field would drop
+    /// it, so a sender sets it only for an executor that advertised what it
+    /// needs ([`messaging_capability`]).
+    #[serde(
+        default,
+        skip_serializing_if = "rupu_runtime::argv::LaunchMessaging::is_default"
+    )]
+    pub messaging: rupu_runtime::argv::LaunchMessaging,
 }
 
 impl RunSpec {
     /// The `rupu run` / `rupu workflow run` an executor (`rupu node`, `rupu
     /// node pull`) starts for this spec under `run_id`. Refuses a field the
     /// command can't honour rather than launch without it: `findings_profile`,
-    /// `engagement_profiles`, `skills` and `preload_skills` are agent-run
-    /// fields (`rupu workflow run` resolves them per step from the workflow
+    /// `engagement_profiles`, `skills`, `preload_skills` and `messaging`
+    /// are agent-run fields (`rupu workflow run` resolves them per step from the workflow
     /// file), as is a mode word
     /// that isn't one. A codename on a workflow spec is ignored (logged): a
     /// workflow run's crew is derived from its run id.
@@ -212,6 +224,12 @@ impl RunSpec {
                 if self.skill_bundle.is_some() {
                     return Err(format!(
                         "run spec for workflow `{}` carries skills, which apply to agent runs only",
+                        self.name
+                    ));
+                }
+                if !self.messaging.is_default() {
+                    return Err(format!(
+                        "run spec for workflow `{}` carries messaging, which applies to agent runs only",
                         self.name
                     ));
                 }
@@ -247,6 +265,7 @@ impl RunSpec {
                     .transpose()
                     .map_err(|e| format!("skill bundle: {e}"))?;
                 run.tmp_clone = self.target.is_some();
+                run.messaging = self.messaging.clone();
                 Ok(RunArgv::Agent(run))
             }
         }
@@ -280,6 +299,42 @@ pub const CAP_AGENT_SKILLS: &str = "agent.skills";
 /// with `get_skill`) and `rupu run` takes
 /// `--skill-bundle`, so a placed unit runs with the coordinator's skills.
 pub const CAP_AGENT_SKILL_BUNDLE: &str = "agent.skill_bundle";
+
+/// Host feature / `Hello.capabilities` / bucket marker entry: this
+/// executor's `rupu run` takes `--no-messaging`, so a placed unit of a
+/// workflow whose messaging is off runs without messaging tools
+/// ([`RunSpec::messaging`] `"off"`; HTTP: the agent-run body's
+/// `messaging`). A connector refuses such a unit on a peer that hasn't
+/// advertised it; SSH gates it in the launch command.
+pub const CAP_AGENT_NO_MESSAGING: &str = "agent.no_messaging";
+
+/// Host feature / `Hello.capabilities` / bucket marker entry: this
+/// executor's `rupu run` takes `--messaging-tool`, so a placed unit of a
+/// workflow naming its messaging tools gets only those
+/// ([`RunSpec::messaging`] `{"tools": [...]}`; HTTP: the agent-run body's
+/// `messaging`). A connector refuses such a unit on a peer that hasn't
+/// advertised it; SSH gates it in the launch command.
+pub const CAP_AGENT_MESSAGING_TOOLS: &str = "agent.messaging_tools";
+
+/// What a launch's `messaging` needs its executor to have advertised, and
+/// the refusal when it hasn't: `None` for the default, which every
+/// executor runs.
+pub fn messaging_capability(
+    messaging: &rupu_runtime::argv::LaunchMessaging,
+) -> Option<(&'static str, &'static str)> {
+    use rupu_runtime::argv::LaunchMessaging;
+    match messaging {
+        LaunchMessaging::Default => None,
+        LaunchMessaging::Tools(_) => Some((
+            CAP_AGENT_MESSAGING_TOOLS,
+            "this run cannot run with only its workflow's messaging tools",
+        )),
+        LaunchMessaging::Off => Some((
+            CAP_AGENT_NO_MESSAGING,
+            "this run cannot run with its messaging off",
+        )),
+    }
+}
 
 /// Host feature entry (HTTP only; no other transport runs sessions): this
 /// CP's session start and send endpoints take `skills` (and the start's
@@ -349,6 +404,8 @@ pub fn node_capabilities() -> Vec<String> {
         CAP_AGENT_ENGAGEMENT_PROFILE.to_string(),
         CAP_AGENT_SKILLS.to_string(),
         CAP_AGENT_SKILL_BUNDLE.to_string(),
+        CAP_AGENT_NO_MESSAGING.to_string(),
+        CAP_AGENT_MESSAGING_TOOLS.to_string(),
         CAP_FINDINGS_ARTIFACT_PULL.to_string(),
         CAP_RUN_CODENAME.to_string(),
     ]
@@ -384,6 +441,8 @@ pub fn host_features() -> Vec<String> {
         CAP_AGENT_ENGAGEMENT_PROFILE.to_string(),
         CAP_AGENT_SKILLS.to_string(),
         CAP_AGENT_SKILL_BUNDLE.to_string(),
+        CAP_AGENT_NO_MESSAGING.to_string(),
+        CAP_AGENT_MESSAGING_TOOLS.to_string(),
         CAP_SESSION_SKILLS.to_string(),
         CAP_WORKFLOW_RESUME_IF_UNFINISHED.to_string(),
         CAP_RUN_COVERAGE_STREAM.to_string(),
@@ -433,6 +492,8 @@ pub fn bucket_worker_capabilities() -> Vec<String> {
         CAP_AGENT_ENGAGEMENT_PROFILE.to_string(),
         CAP_AGENT_SKILLS.to_string(),
         CAP_AGENT_SKILL_BUNDLE.to_string(),
+        CAP_AGENT_NO_MESSAGING.to_string(),
+        CAP_AGENT_MESSAGING_TOOLS.to_string(),
         CAP_RUN_CODENAME.to_string(),
     ]
 }
@@ -481,6 +542,7 @@ mod tests {
             run_id: "r1".to_string(),
             spec: RunSpec {
                 skill_bundle: None,
+                messaging: Default::default(),
                 kind: RunSpecKind::Workflow,
                 name: "wf".to_string(),
                 inputs: BTreeMap::new(),
@@ -712,6 +774,8 @@ mod tests {
                 CAP_AGENT_ENGAGEMENT_PROFILE.to_string(),
                 CAP_AGENT_SKILLS.to_string(),
                 CAP_AGENT_SKILL_BUNDLE.to_string(),
+                CAP_AGENT_NO_MESSAGING.to_string(),
+                CAP_AGENT_MESSAGING_TOOLS.to_string(),
                 CAP_RUN_CODENAME.to_string(),
             ]
         );
@@ -895,6 +959,90 @@ mod tests {
     }
 
     #[test]
+    fn every_executor_surface_advertises_the_messaging_flags() {
+        assert_eq!(CAP_AGENT_NO_MESSAGING, "agent.no_messaging");
+        assert_eq!(CAP_AGENT_MESSAGING_TOOLS, "agent.messaging_tools");
+        for (surface, caps) in [
+            ("tunnel node", node_capabilities()),
+            ("host features", host_features()),
+            ("bucket worker", bucket_worker_capabilities()),
+        ] {
+            for cap in [CAP_AGENT_NO_MESSAGING, CAP_AGENT_MESSAGING_TOOLS] {
+                assert!(caps.iter().any(|c| c == cap), "{surface} {cap}: {caps:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_launch_needs_the_capability_of_its_messaging() {
+        use rupu_runtime::argv::LaunchMessaging;
+        assert_eq!(messaging_capability(&LaunchMessaging::Default), None);
+        assert_eq!(
+            messaging_capability(&LaunchMessaging::Off).map(|c| c.0),
+            Some(CAP_AGENT_NO_MESSAGING)
+        );
+        assert_eq!(
+            messaging_capability(&LaunchMessaging::Tools(Vec::new())).map(|c| c.0),
+            Some(CAP_AGENT_MESSAGING_TOOLS)
+        );
+    }
+
+    #[test]
+    fn run_spec_messaging_is_absent_on_the_wire_by_default_and_renders_its_flags() {
+        use rupu_runtime::argv::{LaunchMessaging, RunArgv};
+        let mut spec = agent_spec();
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(!json.contains("messaging"), "{json}");
+        let old = r#"{"kind":"agent","name":"recon","prompt":null,"mode":null,"target":null}"#;
+        assert!(serde_json::from_str::<RunSpec>(old)
+            .unwrap()
+            .messaging
+            .is_default());
+        for (messaging, wire, flags) in [
+            (
+                LaunchMessaging::Off,
+                r#""messaging":"off""#,
+                vec!["--no-messaging"],
+            ),
+            (
+                LaunchMessaging::Tools(vec!["msg.send".into()]),
+                r#""messaging":{"tools":["msg.send"]}"#,
+                vec!["--messaging-tool", "msg.send"],
+            ),
+        ] {
+            spec.messaging = messaging.clone();
+            let json = serde_json::to_string(&spec).unwrap();
+            assert!(json.contains(wire), "{json}");
+            assert_eq!(serde_json::from_str::<RunSpec>(&json).unwrap(), spec);
+            let RunArgv::Agent(run) = spec.run_argv("run_M").unwrap() else {
+                panic!("an agent spec is a `rupu run`");
+            };
+            assert_eq!(run.messaging, messaging);
+            let args: Vec<String> = RunArgv::Agent(run)
+                .to_args()
+                .into_iter()
+                .map(|a| a.into_string().unwrap())
+                .collect();
+            assert!(
+                args.ends_with(&flags.iter().map(ToString::to_string).collect::<Vec<_>>()),
+                "{args:?}"
+            );
+        }
+
+        let mut wf = agent_spec();
+        wf.kind = RunSpecKind::Workflow;
+        wf.findings_profile = None;
+        wf.engagement_profiles.clear();
+        wf.skills.clear();
+        wf.preload_skills.clear();
+        wf.messaging = LaunchMessaging::Off;
+        assert_eq!(
+            wf.run_argv("run_W").unwrap_err(),
+            "run spec for workflow `recon` carries messaging, which applies to agent runs only"
+        );
+    }
+
+    #[test]
     fn every_executor_surface_advertises_taking_a_codename() {
         for (surface, caps) in [
             ("tunnel node", node_capabilities()),
@@ -915,6 +1063,7 @@ mod tests {
     fn agent_spec() -> RunSpec {
         RunSpec {
             skill_bundle: None,
+            messaging: Default::default(),
             kind: RunSpecKind::Agent,
             name: "recon".into(),
             inputs: BTreeMap::new(),
@@ -1016,6 +1165,7 @@ mod tests {
     fn run_spec_engagement_profiles_are_absent_on_the_wire_when_empty() {
         let mut spec = RunSpec {
             skill_bundle: None,
+            messaging: Default::default(),
             kind: RunSpecKind::Agent,
             name: "recon".into(),
             inputs: BTreeMap::new(),

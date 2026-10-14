@@ -1,6 +1,6 @@
 //! `rupu run --skill-bundle` runs with the shipped skills standing in for
-//! installed ones, records the manifest, and `--continue` reuses it (spec
-//! 2026-10-13 skills-on-placed-units, P2/P4).
+//! installed ones, records the manifest with the rest of its command, and
+//! `--continue` reuses it (spec 2026-10-13 skills-on-placed-units, P2/P4).
 
 use crate::ENV_LOCK;
 use assert_cmd::Command;
@@ -78,6 +78,38 @@ fn transcript(dir: &Path, run_id: &str) -> PathBuf {
         .join(format!("{run_id}.jsonl"))
 }
 
+/// The manifest the run recorded with its command (`run_start`'s
+/// `launch_args`), for `--continue` to restore.
+fn recorded_bundle(dir: &Path, run_id: &str) -> SkillBundleManifest {
+    let start = std::fs::read_to_string(transcript(dir, run_id))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .find(|e| e["type"] == "run_start")
+        .unwrap();
+    let json = start["data"]["launch_args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|a| a.as_str().unwrap().strip_prefix("--skill-bundle="))
+        .unwrap()
+        .to_string();
+    serde_json::from_str(&json).unwrap()
+}
+
+/// Cut a run's transcript back to before its first turn: an interrupted
+/// run, which `--continue` picks up (a finished one only prints its answer).
+fn interrupt(dir: &Path, run_id: &str) {
+    let prev = transcript(dir, run_id);
+    let kept: Vec<String> = std::fs::read_to_string(&prev)
+        .unwrap()
+        .lines()
+        .take_while(|l| !l.contains("\"turn_start\""))
+        .map(String::from)
+        .collect();
+    std::fs::write(&prev, kept.join("\n") + "\n").unwrap();
+}
+
 fn shipped_pdf_indexed(dir: &Path, run_id: &str) -> bool {
     std::fs::read_to_string(transcript(dir, run_id))
         .unwrap()
@@ -110,24 +142,10 @@ async fn a_shipped_skill_runs_is_recorded_and_continues() {
         .assert()
         .success();
     assert!(shipped_pdf_indexed(dir.path(), "run_shipped"));
-    let recorded: SkillBundleManifest = serde_json::from_str(
-        &std::fs::read_to_string(dir.path().join(".rupu/runs/run_shipped/skill_bundle.json"))
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(recorded, manifest);
+    assert_eq!(recorded_bundle(dir.path(), "run_shipped"), manifest);
 
-    // Continue it with no flag: the prior run's bundle carries over. A
-    // finished run only prints its answer, so cut the transcript back to
-    // before its first turn.
-    let prev = transcript(dir.path(), "run_shipped");
-    let kept: Vec<String> = std::fs::read_to_string(&prev)
-        .unwrap()
-        .lines()
-        .take_while(|l| !l.contains("\"turn_start\""))
-        .map(String::from)
-        .collect();
-    std::fs::write(&prev, kept.join("\n") + "\n").unwrap();
+    // Continue it with no flag: the prior run's bundle carries over.
+    interrupt(dir.path(), "run_shipped");
     rupu(dir.path())
         .args([
             "run",
@@ -143,11 +161,68 @@ async fn a_shipped_skill_runs_is_recorded_and_continues() {
         .success();
     assert!(shipped_pdf_indexed(dir.path(), "run_next"));
     // The continued run records the bundle too, so it can be continued.
-    let next: SkillBundleManifest = serde_json::from_str(
-        &std::fs::read_to_string(dir.path().join(".rupu/runs/run_next/skill_bundle.json")).unwrap(),
+    assert_eq!(recorded_bundle(dir.path(), "run_next"), manifest);
+}
+
+/// A run recorded before `launch_args` existed kept its bundle in its run
+/// directory (`skill_bundle.json`); a continue of it still finds it there.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_continue_of_a_run_recorded_before_launch_args_reads_its_saved_bundle() {
+    let _guard = ENV_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    home_with_agent(dir.path());
+    let manifest = ship_pdf(dir.path());
+    let json = serde_json::to_string(&manifest).unwrap();
+    rupu(dir.path())
+        .args([
+            "run",
+            "a",
+            "--mode",
+            "bypass",
+            "--run-id",
+            "run_old",
+            &format!("--skill-bundle={json}"),
+            "--prompt=hi",
+        ])
+        .assert()
+        .success();
+    interrupt(dir.path(), "run_old");
+    // What an older rupu left: no `launch_args`, the manifest on disk.
+    let prev = transcript(dir.path(), "run_old");
+    let lines: Vec<String> = std::fs::read_to_string(&prev)
+        .unwrap()
+        .lines()
+        .map(|l| {
+            let mut v: serde_json::Value = serde_json::from_str(l).unwrap();
+            if v["type"] == "run_start" {
+                v["data"].as_object_mut().unwrap().remove("launch_args");
+            }
+            v.to_string()
+        })
+        .collect();
+    std::fs::write(&prev, lines.join("\n") + "\n").unwrap();
+    std::fs::create_dir_all(dir.path().join(".rupu/runs/run_old")).unwrap();
+    std::fs::write(
+        dir.path().join(".rupu/runs/run_old/skill_bundle.json"),
+        &json,
     )
     .unwrap();
-    assert_eq!(next, manifest);
+
+    rupu(dir.path())
+        .args([
+            "run",
+            "a",
+            "--mode",
+            "bypass",
+            "--run-id",
+            "run_after",
+            "--continue",
+            "run_old",
+        ])
+        .assert()
+        .success();
+    assert!(shipped_pdf_indexed(dir.path(), "run_after"));
+    assert_eq!(recorded_bundle(dir.path(), "run_after"), manifest);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -170,14 +245,7 @@ async fn an_explicit_bundle_wins_over_the_continued_runs() {
         ])
         .assert()
         .success();
-    let prev = transcript(dir.path(), "run_one");
-    let kept: Vec<String> = std::fs::read_to_string(&prev)
-        .unwrap()
-        .lines()
-        .take_while(|l| !l.contains("\"turn_start\""))
-        .map(String::from)
-        .collect();
-    std::fs::write(&prev, kept.join("\n") + "\n").unwrap();
+    interrupt(dir.path(), "run_one");
 
     // An explicit manifest naming a different (cached) pdf.
     let other = ship_other_pdf(dir.path());
@@ -197,11 +265,7 @@ async fn an_explicit_bundle_wins_over_the_continued_runs() {
         ])
         .assert()
         .success();
-    let recorded: SkillBundleManifest = serde_json::from_str(
-        &std::fs::read_to_string(dir.path().join(".rupu/runs/run_two/skill_bundle.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(recorded, other);
+    assert_eq!(recorded_bundle(dir.path(), "run_two"), other);
 }
 
 #[tokio::test(flavor = "multi_thread")]

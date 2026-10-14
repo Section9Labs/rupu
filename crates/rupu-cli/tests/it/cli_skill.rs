@@ -689,7 +689,7 @@ fn interrupt(home: &Path, run_id: &str) {
 }
 
 #[test]
-fn a_continued_run_keeps_its_launch_skills_unless_the_flags_name_others() {
+fn a_continued_run_keeps_its_launch_skills_unless_a_flag_replaces_its_list() {
     let home = home_with_agent_and_skills(&[("x", "X-PRELOADED-BODY"), ("y", "Y-BODY")]);
     let cwd = tempfile::tempdir().unwrap();
     let first = mock_run(
@@ -755,9 +755,10 @@ fn a_continued_run_keeps_its_launch_skills_unless_the_flags_name_others() {
         "{}",
         String::from_utf8_lossy(&replaced.stderr)
     );
+    // `--skill` replaces the skill list only; the preload list is kept.
     let (rows, prompt) = skill_index_and_prompt(&transcript_events(home.path(), "run_replaced"));
-    assert_eq!(rows, vec![row("y", false)]);
-    assert!(!prompt.contains("X-PRELOADED-BODY"), "{prompt}");
+    assert_eq!(rows, vec![row("x", true), row("y", false)]);
+    assert!(prompt.contains("X-PRELOADED-BODY"), "{prompt}");
 }
 
 fn add_skill(home: &Path, name: &str, body: &str) {

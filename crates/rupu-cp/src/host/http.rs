@@ -23,8 +23,9 @@ use crate::{
     host::skill_ship::{prefixed, ship_through, ShipMemo, ShipOutcome, SkillBundle, Transfer},
     launcher::LaunchRequest,
     node::protocol::{
-        CAP_AGENT_ENGAGEMENT_PROFILE, CAP_AGENT_FINDINGS_PROFILE, CAP_AGENT_SKILLS,
-        CAP_AGENT_SKILL_BUNDLE, CAP_RUN_MESSAGES, CAP_RUN_NETFLOW_STREAM, CAP_RUN_SUPPLIED_RUN_ID,
+        messaging_capability, CAP_AGENT_ENGAGEMENT_PROFILE, CAP_AGENT_FINDINGS_PROFILE,
+        CAP_AGENT_SKILLS, CAP_AGENT_SKILL_BUNDLE, CAP_RUN_MESSAGES, CAP_RUN_NETFLOW_STREAM,
+        CAP_RUN_SUPPLIED_RUN_ID,
         CAP_SESSION_SKILLS,
     },
     session_sender::SendMessageRequest,
@@ -498,6 +499,7 @@ impl HostConnector for HttpHostConnector {
             || !req.engagement_profiles.is_empty()
             || has_skills
             || req.skill_bundle.is_some()
+            || !req.messaging.is_default()
             || req.run_id.is_some()
             || req.codename.is_some();
         let info = if needs_info {
@@ -540,6 +542,9 @@ impl HostConnector for HttpHostConnector {
                 &self.base_url,
             )?;
         }
+        if let (Some((feature, what)), Some(info)) = (messaging_capability(&req.messaging), &info) {
+            Self::require_in(info, feature, what, &self.base_url)?;
+        }
         let (features, version): (&[String], Option<&str>) = match &info {
             Some(PeerInfo::Info(body)) => (&body.features, body.version.as_deref()),
             _ => (&[], None),
@@ -564,6 +569,10 @@ impl HostConnector for HttpHostConnector {
         if let Some(m) = &req.skill_bundle {
             body["skill_bundle"] = serde_json::to_value(m)
                 .map_err(|e| HostConnectorError::Invalid(format!("skill bundle: {e}")))?;
+        }
+        if !req.messaging.is_default() {
+            body["messaging"] = serde_json::to_value(&req.messaging)
+                .map_err(|e| HostConnectorError::Invalid(format!("messaging: {e}")))?;
         }
         // A remote that doesn't advertise `run.supplied_run_id` mints its own
         // id, and the one it returns is the one used either way.

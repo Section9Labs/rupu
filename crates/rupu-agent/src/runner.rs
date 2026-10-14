@@ -869,6 +869,9 @@ pub fn record_unstarted_run(
             customer: Some(run.customer.map(str::to_string)),
             launch_skills: run.launch_skills.to_vec(),
             launch_preload_skills: run.launch_preload_skills.to_vec(),
+            // Only `rupu run` records its arguments; the sites that record an
+            // unstarted run (workflow steps, sessions) have none.
+            launch_args: Vec::new(),
         })?;
         writer.write(&Event::Notice {
             kind: "model_limits".into(),
@@ -2172,6 +2175,7 @@ async fn run_agent_inner(
         customer: Some(opts.tool_context.services.customer.clone()),
         launch_skills: opts.id.launch_skills.clone(),
         launch_preload_skills: opts.id.launch_preload_skills.clone(),
+        launch_args: opts.id.launch_args.clone(),
     })?;
     // One notice per run, before the first turn: what the run resolved, and
     // where each number came from (spec 2026-09-30 §6.6).

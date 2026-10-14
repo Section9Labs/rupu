@@ -329,6 +329,7 @@ mod tests {
                 host_id,
                 &crate::node::protocol::RunSpec {
                     skill_bundle: None,
+                    messaging: Default::default(),
                     kind: crate::node::protocol::RunSpecKind::Workflow,
                     name: "w".into(),
                     inputs: Default::default(),
@@ -383,6 +384,7 @@ mod tests {
                 host_id,
                 &crate::node::protocol::RunSpec {
                     skill_bundle: None,
+                    messaging: Default::default(),
                     kind: crate::node::protocol::RunSpecKind::Workflow,
                     name: "w".into(),
                     inputs: Default::default(),
@@ -435,6 +437,7 @@ mod tests {
                 host_id,
                 &crate::node::protocol::RunSpec {
                     skill_bundle: None,
+                    messaging: Default::default(),
                     kind: crate::node::protocol::RunSpecKind::Workflow,
                     name: "w".into(),
                     inputs: Default::default(),

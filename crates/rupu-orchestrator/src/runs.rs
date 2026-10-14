@@ -5010,6 +5010,7 @@ mod tests {
             customer: None,
             launch_skills: Vec::new(),
             launch_preload_skills: Vec::new(),
+            launch_args: Vec::new(),
         };
         std::fs::write(&tp, format!("{}\n", serde_json::to_string(&start).unwrap())).unwrap();
         tp

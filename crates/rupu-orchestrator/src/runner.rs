@@ -168,6 +168,12 @@ pub struct UnitDispatch {
     /// `None` only for a factory that tracks no single mode: the host then
     /// resolves the mode itself.
     pub mode: Option<rupu_tools::PermissionMode>,
+    /// The unit's messaging, [`remote_unit_messaging`]: off (no messaging
+    /// tools, nor for anything it launches) or only these tools. The
+    /// dispatcher must deliver it to the host as `rupu run --no-messaging` /
+    /// `--messaging-tool` or refuse the launch. The default ⇒ the host
+    /// decides from the agent file, as for any standalone run.
+    pub messaging: rupu_tools::MessagingSwitch,
 }
 
 /// The findings profile a remote (`host:` / `distribute:`) unit must run
@@ -182,6 +188,23 @@ pub(crate) fn remote_unit_findings_profile(
     defaults: &crate::workflow::WorkflowDefaults,
 ) -> Option<rupu_coverage::FindingProfile> {
     step.findings_profile.or(defaults.findings_profile)
+}
+
+/// A remote (`host:` / `distribute:`) unit's messaging (spec F1d D5-D7):
+/// off for the cap the run itself was launched under
+/// ([`StepFactory::messaging_capped`]), else its workflow's `messaging:`
+/// switch as a local step gets it (off, the tools it names, or the
+/// default). The agent's own `messaging: false` needs nothing here: the
+/// host loads the agent file.
+pub(crate) fn remote_unit_messaging(
+    workflow: &Workflow,
+    factory: &dyn StepFactory,
+) -> rupu_tools::MessagingSwitch {
+    if factory.messaging_capped() {
+        rupu_tools::MessagingSwitch::Off
+    } else {
+        workflow.messaging_switch()
+    }
 }
 
 /// The permission mode a remote (`host:` / `distribute:`) unit must run
@@ -626,6 +649,14 @@ pub trait StepFactory: Send + Sync {
     /// tells it when the run ends for good. Defaulted like `customer`.
     fn launcher(&self) -> Option<Arc<dyn rupu_tools::Launcher>> {
         None
+    }
+
+    /// The launch cap on this run's messaging: the run was launched by a
+    /// run whose messaging is off (its `LaunchLink.no_messaging`), so its
+    /// steps and units are off too. A local step reads it from its spec's
+    /// link; a placed unit needs it here. Defaulted like `customer`.
+    fn messaging_capped(&self) -> bool {
+        false
     }
 }
 
@@ -8162,6 +8193,7 @@ async fn dispatch_placed_step(
         skills: step.skills.clone(),
         preload_skills: step.preload_skills.clone(),
         mode: remote_unit_permission_mode(opts.factory.permission_mode()),
+        messaging: remote_unit_messaging(&opts.workflow, opts.factory.as_ref()),
         codename: codename.map(ToString::to_string),
     };
     announce_placed_agent(
@@ -9270,6 +9302,7 @@ async fn run_fanout_step(
     let unit_skills = (step.skills.clone(), step.preload_skills.clone());
     // The run's mode, the same for every unit (and its retry); `Copy`.
     let unit_mode = remote_unit_permission_mode(opts.factory.permission_mode());
+    let unit_messaging = remote_unit_messaging(&opts.workflow, opts.factory.as_ref());
     let mut handles = Vec::with_capacity(total);
     for (idx, item_value, rendered, run_id, transcript_path) in prepared {
         // Compute host placement for this unit. `None` → local inline path
@@ -9295,6 +9328,7 @@ async fn run_fanout_step(
         let transcript_clone = transcript_path.clone();
         let engagement_for_task = unit_engagement_profiles.clone();
         let (skills_for_task, preload_skills_for_task) = unit_skills.clone();
+        let messaging_for_task = unit_messaging.clone();
         // Per-unit live-view events. Cloned into the task so emission
         // ordering reflects the unit's REAL start/finish under
         // `max_parallel` concurrency (the started/completed pair brackets
@@ -9477,6 +9511,7 @@ async fn run_fanout_step(
                                     skills: skills_for_task.clone(),
                                     preload_skills: preload_skills_for_task.clone(),
                                     mode: unit_mode,
+                                    messaging: messaging_for_task.clone(),
                                     codename: unit_codename.as_ref().map(ToString::to_string),
                                 };
                                 announce_placed_agent(
@@ -9596,6 +9631,7 @@ async fn run_fanout_step(
                                             skills: skills_for_task.clone(),
                                             preload_skills: preload_skills_for_task.clone(),
                                             mode: unit_mode,
+                                            messaging: messaging_for_task.clone(),
                                             codename: unit_codename
                                                 .as_ref()
                                                 .map(ToString::to_string),

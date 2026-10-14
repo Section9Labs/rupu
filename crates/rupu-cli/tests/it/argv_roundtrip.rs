@@ -12,8 +12,8 @@ use rupu_cli::cmd::{self, run::RunAction};
 use rupu_cli::{Cli, Cmd};
 use rupu_coverage::FindingProfile;
 use rupu_runtime::argv::{
-    AgentRun, AgentiflowRun, FlowAttach, LaunchLink, MessageSpace, RunArgv, SessionSend,
-    SessionStart, SessionWorker, WorkflowControl, WorkflowRef, WorkflowRun,
+    AgentRun, AgentiflowRun, FlowAttach, LaunchLink, LaunchMessaging, MessageSpace, RunArgv,
+    SessionSend, SessionStart, SessionWorker, WorkflowControl, WorkflowRef, WorkflowRun,
 };
 use rupu_tools::PermissionMode;
 
@@ -97,7 +97,7 @@ fn links() -> Vec<LaunchLink> {
 fn agent_runs() -> Vec<RunArgv> {
     let mut out = Vec::new();
     // Every combination of the optional parts, each prompt in turn.
-    for mask in 0u32..(1 << 9) {
+    for mask in 0u32..(1 << 11) {
         let on = |bit: u32| mask & (1 << bit) != 0;
         let mut r = AgentRun::new("recon", "run_01ROUNDTRIP");
         if on(0) {
@@ -131,6 +131,7 @@ fn agent_runs() -> Vec<RunArgv> {
                 "a".repeat(64)
             ));
         }
+        r.messaging = messagings()[(mask as usize >> 9) % 4].clone();
         r.prompt = match mask as usize % (PROMPTS.len() + 1) {
             0 => None,
             i => Some(PROMPTS[i - 1].to_string()),
@@ -159,7 +160,25 @@ fn agent_runs() -> Vec<RunArgv> {
         r.launch = Some(link);
         out.push(RunArgv::Agent(r));
     }
+    // A placed unit continued with its workflow's messaging still set.
+    for messaging in messagings() {
+        let mut r = AgentRun::new("recon", "run_01ROUNDTRIPNEXT");
+        r.continue_from = Some("run_01ROUNDTRIP".into());
+        r.messaging = messaging;
+        out.push(RunArgv::Agent(r));
+    }
     out
+}
+
+/// A placed unit's workflow `messaging:` switch: the default, off, a
+/// narrowed list (an alias kept as given) and an empty one.
+fn messagings() -> [LaunchMessaging; 4] {
+    [
+        LaunchMessaging::Default,
+        LaunchMessaging::Off,
+        LaunchMessaging::Tools(vec!["msg.send".into(), "board.post".into()]),
+        LaunchMessaging::Tools(Vec::new()),
+    ]
 }
 
 fn workflow_runs() -> Vec<RunArgv> {
@@ -334,6 +353,7 @@ fn back(cli: Cli) -> RunArgv {
             };
             let a = cmd::run::parse_launch_args(argv).unwrap();
             assert_eq!(a.prompt, None, "the prompt is never positional");
+            let messaging = a.messaging();
             RunArgv::Agent(AgentRun {
                 agent: a.agent,
                 target: a.target,
@@ -348,6 +368,7 @@ fn back(cli: Cli) -> RunArgv {
                 preload_skills: a.preload_skills,
                 skill_bundle: a.skill_bundle,
                 tmp_clone: a.tmp,
+                messaging,
                 message_space: flow_of(a.message_space, a.participant).map(|f| MessageSpace {
                     dir: f.run_dir,
                     participant: f.participant,
@@ -509,4 +530,101 @@ fn the_env_form_drops_only_the_codename_flag() {
         want.codename = None;
         assert_eq!(got, want, "{full:?}");
     }
+}
+
+/// A placed unit's workflow `messaging:` switch on `rupu run`: off is the
+/// bare `--no-messaging`, tools one `--messaging-tool <name>` each, the
+/// default no flag; clap reads each back.
+#[test]
+fn messaging_flags_render_and_parse_back() {
+    let parsed = |argv: &RunArgv| {
+        let full: Vec<OsString> = std::iter::once(OsString::from("rupu"))
+            .chain(argv.to_args())
+            .collect();
+        let Cmd::Run { argv } = Cli::try_parse_from(&full).unwrap().command else {
+            panic!("not a run: {full:?}");
+        };
+        let RunAction::Launch(argv) = cmd::run::classify(argv).unwrap() else {
+            panic!("not a launch: {full:?}");
+        };
+        cmd::run::parse_launch_args(argv).unwrap()
+    };
+    let run = |m: LaunchMessaging| {
+        let mut r = AgentRun::new("recon", "run_01X");
+        r.messaging = m;
+        RunArgv::Agent(r)
+    };
+    let off = run(LaunchMessaging::Off);
+    assert_eq!(
+        off.to_args(),
+        ["run", "recon", "--run-id", "run_01X", "--no-messaging"].map(OsString::from)
+    );
+    let a = parsed(&off);
+    assert!(a.no_messaging);
+    assert_eq!(a.messaging(), LaunchMessaging::Off);
+
+    let tools = run(LaunchMessaging::Tools(vec!["msg.send".into()]));
+    assert_eq!(
+        tools.to_args(),
+        [
+            "run",
+            "recon",
+            "--run-id",
+            "run_01X",
+            "--messaging-tool",
+            "msg.send"
+        ]
+        .map(OsString::from)
+    );
+    let a = parsed(&tools);
+    assert_eq!(a.messaging_tools, ["msg.send"]);
+    assert_eq!(
+        a.messaging().resolve().unwrap(),
+        rupu_tools::MessagingSwitch::Tools(vec!["msg.send"])
+    );
+
+    let none = run(LaunchMessaging::Tools(Vec::new()));
+    assert_eq!(
+        parsed(&none).messaging().resolve().unwrap(),
+        rupu_tools::MessagingSwitch::Tools(Vec::new())
+    );
+
+    let default = run(LaunchMessaging::Default);
+    assert_eq!(
+        default.to_args(),
+        ["run", "recon", "--run-id", "run_01X"].map(OsString::from)
+    );
+    let a = parsed(&default);
+    assert!(!a.no_messaging && a.messaging_tools.is_empty());
+    assert_eq!(a.messaging(), LaunchMessaging::Default);
+}
+
+/// `--no-messaging` and `--messaging-tool` can't be given together, and a
+/// tool that isn't a messaging tool is a usage error before the run starts.
+#[test]
+fn messaging_flags_conflict_and_names_are_checked() {
+    let launch = |extra: &[&str]| {
+        let argv: Vec<String> = ["recon"]
+            .iter()
+            .chain(extra)
+            .map(ToString::to_string)
+            .collect();
+        cmd::run::parse_launch_args(argv)
+    };
+    let err = launch(&["--no-messaging", "--messaging-tool", "msg.send"]).unwrap_err();
+    assert_eq!(
+        err.kind(),
+        clap::error::ErrorKind::ArgumentConflict,
+        "{err}"
+    );
+    for bad in ["read_file", "*", "nonesuch"] {
+        let err = launch(&["--messaging-tool", bad]).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ValueValidation,
+            "{bad}: {err}"
+        );
+    }
+    let alias = launch(&["--messaging-tool", "board.*"]).unwrap();
+    assert_eq!(alias.messaging_tools, ["board.*"]);
 }

@@ -1372,6 +1372,7 @@ mod tests {
             customer: None,
             launch_skills: Vec::new(),
             launch_preload_skills: Vec::new(),
+            launch_args: Vec::new(),
         });
         for &(i, o) in turns {
             out += &usage_line(provider, model, i, o, None);
@@ -1416,6 +1417,7 @@ mod tests {
                 customer: None,
                 launch_skills: Vec::new(),
                 launch_preload_skills: Vec::new(),
+                launch_args: Vec::new(),
             }),
         );
         append(

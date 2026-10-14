@@ -30,11 +30,16 @@ pub enum OffReason {
     Agentiflow,
     /// The parent's cap: a child never has more than its parent (D6).
     Parent,
+    /// The launch's `--no-messaging` ([`super::Overrides::messaging`]): a
+    /// placed unit's coordinator passing its workflow's switch or its own
+    /// launch cap.
+    Launch,
 }
 
 impl MessagingGrant {
     /// Resolve `spec`'s messaging. Off when its agent, its workflow, its
-    /// agentiflow or its parent says off. Else its workflow's tools, a flow
+    /// agentiflow, its parent or its launch (`--no-messaging`) says off.
+    /// Else its launch's tools (`--messaging-tool`), its workflow's, a flow
     /// origin's (the messaging tools of `origin_grant`, which the grant
     /// already carries) or the default (D1).
     pub fn resolve(spec: &LaunchSpec, origin_grant: Option<&AmbientGrant>) -> Self {
@@ -46,21 +51,32 @@ impl MessagingGrant {
             (_, Some(link)) => link.no_messaging,
             _ => false,
         };
-        match &spec.origin {
-            Origin::WorkflowStep {
-                messaging: MessagingSwitch::Off,
-                ..
-            } => Self::Off(OffReason::Workflow),
-            Origin::FlowLead {
-                messaging_off: true,
-                ..
-            } => Self::Off(OffReason::Agentiflow),
+        match (&spec.origin, &spec.overrides.messaging) {
+            (
+                Origin::WorkflowStep {
+                    messaging: MessagingSwitch::Off,
+                    ..
+                },
+                _,
+            ) => Self::Off(OffReason::Workflow),
+            (
+                Origin::FlowLead {
+                    messaging_off: true,
+                    ..
+                },
+                _,
+            ) => Self::Off(OffReason::Agentiflow),
             _ if parent_off => Self::Off(OffReason::Parent),
-            Origin::WorkflowStep {
-                messaging: MessagingSwitch::Tools(tools),
-                ..
-            } => Self::Tools(tools.clone(), GrantReason::Ambient("workflow_messaging")),
-            Origin::FlowLead { .. } | Origin::FlowUnit { .. } => match origin_grant {
+            (_, MessagingSwitch::Off) => Self::Off(OffReason::Launch),
+            (_, MessagingSwitch::Tools(tools))
+            | (
+                Origin::WorkflowStep {
+                    messaging: MessagingSwitch::Tools(tools),
+                    ..
+                },
+                _,
+            ) => Self::Tools(tools.clone(), GrantReason::Ambient("workflow_messaging")),
+            (Origin::FlowLead { .. } | Origin::FlowUnit { .. }, _) => match origin_grant {
                 Some(g) => {
                     let catalog = ToolCatalog::builtin();
                     let tools = g

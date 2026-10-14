@@ -84,6 +84,19 @@ pub fn transcript_agent(transcript: &Path) -> Result<String, ContinuationError> 
         })
 }
 
+/// The `rupu run` arguments `transcript`'s run recorded (`run_start`'s
+/// `launch_args`), which `rupu run --continue` restores. Empty for a run
+/// `rupu run` did not launch and for a transcript written before the field.
+pub fn launch_args(transcript: &Path) -> Result<Vec<String>, ContinuationError> {
+    Ok(read_events(transcript)?
+        .into_iter()
+        .find_map(|e| match e {
+            Event::RunStart { launch_args, .. } => Some(launch_args),
+            _ => None,
+        })
+        .unwrap_or_default())
+}
+
 /// The skills `transcript`'s run was given by its launch, as the launch
 /// wrote them `(skills, preload_skills)`: `run_start`'s `launch_skills` /
 /// `launch_preload_skills`, so `*` stays `*` and a launch preload of a skill
@@ -670,6 +683,26 @@ mod tests {
             launch_skills(&t).unwrap(),
             (vec!["global:x".to_string()], vec!["global:y".to_string()])
         );
+    }
+
+    #[test]
+    fn launch_args_are_run_starts_tokens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = skills_transcript(
+            tmp.path(),
+            serde_json::json!({ "launch_args": ["a", "--mode=readonly", "--no-stream"] }),
+        );
+        assert_eq!(
+            launch_args(&t).unwrap(),
+            vec!["a", "--mode=readonly", "--no-stream"]
+        );
+    }
+
+    #[test]
+    fn launch_args_of_an_older_transcript_are_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = skills_transcript(tmp.path(), serde_json::json!({}));
+        assert!(launch_args(&t).unwrap().is_empty());
     }
 
     #[test]
