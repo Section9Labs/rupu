@@ -97,7 +97,7 @@ fn links() -> Vec<LaunchLink> {
 fn agent_runs() -> Vec<RunArgv> {
     let mut out = Vec::new();
     // Every combination of the optional parts, each prompt in turn.
-    for mask in 0u32..(1 << 9) {
+    for mask in 0u32..(1 << 10) {
         let on = |bit: u32| mask & (1 << bit) != 0;
         let mut r = AgentRun::new("recon", "run_01ROUNDTRIP");
         if on(0) {
@@ -131,6 +131,7 @@ fn agent_runs() -> Vec<RunArgv> {
                 "a".repeat(64)
             ));
         }
+        r.messaging_off = on(9);
         r.prompt = match mask as usize % (PROMPTS.len() + 1) {
             0 => None,
             i => Some(PROMPTS[i - 1].to_string()),
@@ -159,6 +160,11 @@ fn agent_runs() -> Vec<RunArgv> {
         r.launch = Some(link);
         out.push(RunArgv::Agent(r));
     }
+    // A placed unit continued with its workflow's messaging still off.
+    let mut r = AgentRun::new("recon", "run_01ROUNDTRIPNEXT");
+    r.continue_from = Some("run_01ROUNDTRIP".into());
+    r.messaging_off = true;
+    out.push(RunArgv::Agent(r));
     out
 }
 
@@ -348,6 +354,7 @@ fn back(cli: Cli) -> RunArgv {
                 preload_skills: a.preload_skills,
                 skill_bundle: a.skill_bundle,
                 tmp_clone: a.tmp,
+                messaging_off: a.no_messaging,
                 message_space: flow_of(a.message_space, a.participant).map(|f| MessageSpace {
                     dir: f.run_dir,
                     participant: f.participant,
@@ -509,4 +516,36 @@ fn the_env_form_drops_only_the_codename_flag() {
         want.codename = None;
         assert_eq!(got, want, "{full:?}");
     }
+}
+
+/// A placed unit of an opted-out workflow is `rupu run … --no-messaging`,
+/// which clap reads back as `no_messaging`; any other run has no such flag.
+#[test]
+fn no_messaging_is_one_bare_flag_only_when_off() {
+    let parsed = |argv: &RunArgv| {
+        let full: Vec<OsString> = std::iter::once(OsString::from("rupu"))
+            .chain(argv.to_args())
+            .collect();
+        let Cmd::Run { argv } = Cli::try_parse_from(&full).unwrap().command else {
+            panic!("not a run: {full:?}");
+        };
+        let RunAction::Launch(argv) = cmd::run::classify(argv).unwrap() else {
+            panic!("not a launch: {full:?}");
+        };
+        cmd::run::parse_launch_args(argv).unwrap()
+    };
+    let mut off = AgentRun::new("recon", "run_01X");
+    off.messaging_off = true;
+    let off = RunArgv::Agent(off);
+    assert_eq!(
+        off.to_args(),
+        ["run", "recon", "--run-id", "run_01X", "--no-messaging"].map(OsString::from)
+    );
+    assert!(parsed(&off).no_messaging);
+    let on = RunArgv::Agent(AgentRun::new("recon", "run_01X"));
+    assert_eq!(
+        on.to_args(),
+        ["run", "recon", "--run-id", "run_01X"].map(OsString::from)
+    );
+    assert!(!parsed(&on).no_messaging);
 }

@@ -28,7 +28,7 @@ use crate::{
     node::{
         protocol::{
             RunSpec, RunSpecKind, CAP_AGENT_ENGAGEMENT_PROFILE, CAP_AGENT_FINDINGS_PROFILE,
-            CAP_AGENT_SKILLS, CAP_AGENT_SKILL_BUNDLE,
+            CAP_AGENT_NO_MESSAGING, CAP_AGENT_SKILLS, CAP_AGENT_SKILL_BUNDLE,
         },
         NodeMirror,
     },
@@ -219,6 +219,7 @@ impl HostConnector for BucketHostConnector {
 
         let spec = RunSpec {
             skill_bundle: None,
+            messaging_off: false,
             kind: RunSpecKind::Workflow,
             name: req.workflow.clone(),
             inputs: req.inputs.clone(),
@@ -287,6 +288,13 @@ impl HostConnector for BucketHostConnector {
             )
             .await?;
         }
+        if req.messaging_off {
+            self.require_worker_capability(
+                CAP_AGENT_NO_MESSAGING,
+                "this run cannot run with its messaging off",
+            )
+            .await?;
+        }
 
         // A coordinator-minted id (a placed unit's) keys the job, and every
         // worker runs under its job's key (`rupu run --run-id`).
@@ -304,6 +312,7 @@ impl HostConnector for BucketHostConnector {
 
         let spec = RunSpec {
             skill_bundle: req.skill_bundle.clone(),
+            messaging_off: req.messaging_off,
             kind: RunSpecKind::Agent,
             name: req.agent.clone(),
             inputs: std::collections::BTreeMap::new(),
@@ -637,6 +646,7 @@ mod tests {
                 skills: Vec::new(),
                 preload_skills: Vec::new(),
                 skill_bundle: None,
+                messaging_off: false,
             })
             .await
             .unwrap();
@@ -675,6 +685,7 @@ mod tests {
             skills: Vec::new(),
             preload_skills: Vec::new(),
             skill_bundle: None,
+            messaging_off: false,
             codename: None,
         }
     }
@@ -744,6 +755,52 @@ mod tests {
             "{err:?}"
         );
         // Refused before anything was written: no job, no orphaned mirror run.
+        assert!(bucket.list_jobs().await.unwrap().is_empty());
+        assert!(run_store.list().unwrap().is_empty());
+    }
+
+    fn quiet_req() -> AgentLaunchRequest {
+        let mut req = profile_req(None);
+        req.messaging_off = true;
+        req
+    }
+
+    #[tokio::test]
+    async fn launch_agent_carries_messaging_off_to_a_capable_worker() {
+        let (conn, _run_store, bucket, _tmp) = make_conn();
+        put_worker(&bucket, "node_a", &[CAP_AGENT_NO_MESSAGING]).await;
+
+        let run_id = conn.launch_agent(quiet_req()).await.unwrap();
+
+        let spec: RunSpec =
+            serde_json::from_slice(&bucket.get_job(&run_id).await.unwrap()).unwrap();
+        assert!(spec.messaging_off);
+        let rupu_runtime::argv::RunArgv::Agent(run) = spec.run_argv(&run_id).unwrap() else {
+            panic!("an agent job is a `rupu run`");
+        };
+        assert!(run.messaging_off);
+    }
+
+    #[tokio::test]
+    async fn launch_agent_refuses_messaging_off_when_a_worker_lacks_support() {
+        let (conn, run_store, bucket, _tmp) = make_conn();
+        put_worker(&bucket, "node_new", &[CAP_AGENT_NO_MESSAGING]).await;
+        // Advertises the other launch features, but predates --no-messaging.
+        put_worker(
+            &bucket,
+            "node_mid",
+            &[CAP_AGENT_FINDINGS_PROFILE, CAP_AGENT_SKILLS],
+        )
+        .await;
+
+        let err = conn.launch_agent(quiet_req()).await.unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Unsupported(m)
+                if m.contains("node_mid")
+                    && m.contains("cannot run with its messaging off")
+                    && m.contains("upgrade rupu")),
+            "{err:?}"
+        );
         assert!(bucket.list_jobs().await.unwrap().is_empty());
         assert!(run_store.list().unwrap().is_empty());
     }

@@ -1271,6 +1271,7 @@ fn rerun_args(invocation: &rupu_coverage::RerunInvocation) -> crate::cmd::run::A
         skills: invocation.skills.clone(),
         preload_skills: invocation.preload_skills.clone(),
         skill_bundle: None,
+        no_messaging: false,
         continue_from: None,
         model: None,
         provider: None,

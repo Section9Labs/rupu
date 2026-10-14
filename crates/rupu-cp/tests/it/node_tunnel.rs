@@ -228,6 +228,7 @@ async fn mirror_create_append_finish_round_trip() {
 
     let spec = RunSpec {
         skill_bundle: None,
+        messaging_off: false,
         kind: RunSpecKind::Workflow,
         name: "smoke-workflow".to_string(),
         inputs: BTreeMap::new(),
@@ -315,6 +316,7 @@ async fn mirror_usage_lines_land_in_the_run_usage_ledger() {
 
     let spec = RunSpec {
         skill_bundle: None,
+        messaging_off: false,
         findings_profile: None,
         engagement_profiles: Vec::new(),
         skills: Vec::new(),
@@ -384,6 +386,7 @@ async fn mirror_replace_usage_ledger_swaps_the_file_atomically() {
     let mirror = NodeMirror::new(Arc::clone(&store));
     let spec = RunSpec {
         skill_bundle: None,
+        messaging_off: false,
         findings_profile: None,
         engagement_profiles: Vec::new(),
         skills: Vec::new(),
@@ -483,6 +486,7 @@ async fn mirror_replace_usage_ledger_failure_removes_the_temp_file() {
     let mirror = NodeMirror::new(Arc::clone(&store));
     let spec = RunSpec {
         skill_bundle: None,
+        messaging_off: false,
         findings_profile: None,
         engagement_profiles: Vec::new(),
         skills: Vec::new(),
@@ -544,6 +548,7 @@ async fn mirror_run_json_repins_cp_local_paths() {
 
     let spec = RunSpec {
         skill_bundle: None,
+        messaging_off: false,
         kind: RunSpecKind::Workflow,
         name: "repin-test".to_string(),
         inputs: BTreeMap::new(),
@@ -652,6 +657,7 @@ async fn mirror_run_json_nulls_resume_fields() {
 
     let spec = RunSpec {
         skill_bundle: None,
+        messaging_off: false,
         kind: RunSpecKind::Workflow,
         name: "resume-null-test".to_string(),
         inputs: BTreeMap::new(),
@@ -733,6 +739,7 @@ async fn mirror_run_json_preserves_final_output() {
 
     let spec = RunSpec {
         skill_bundle: None,
+        messaging_off: false,
         kind: RunSpecKind::Agent,
         name: "my-agent".to_string(),
         inputs: BTreeMap::new(),
@@ -840,6 +847,7 @@ async fn mirror_traversal_run_id_rejected_before_io() {
     // Smoke-check additional invalid patterns.
     let _spec = RunSpec {
         skill_bundle: None,
+        messaging_off: false,
         kind: RunSpecKind::Workflow,
         name: "x".into(),
         inputs: BTreeMap::new(),
@@ -889,6 +897,7 @@ async fn mirror_wrong_node_id_rejected() {
 
     let spec = RunSpec {
         skill_bundle: None,
+        messaging_off: false,
         kind: RunSpecKind::Workflow,
         name: "sec-workflow".to_string(),
         inputs: BTreeMap::new(),
@@ -961,6 +970,7 @@ async fn mirror_legitimate_owner_can_append_and_finish() {
 
     let spec = RunSpec {
         skill_bundle: None,
+        messaging_off: false,
         kind: RunSpecKind::Workflow,
         name: "legit-workflow".to_string(),
         inputs: BTreeMap::new(),
@@ -1590,6 +1600,7 @@ mod tunnel_connector {
     fn make_spec(name: &str) -> RunSpec {
         RunSpec {
             skill_bundle: None,
+            messaging_off: false,
             kind: RunSpecKind::Workflow,
             name: name.to_string(),
             inputs: BTreeMap::new(),
@@ -1628,6 +1639,7 @@ mod tunnel_connector {
             skills: Vec::new(),
             preload_skills: Vec::new(),
             skill_bundle: None,
+            messaging_off: false,
         }
     }
 
@@ -2171,6 +2183,62 @@ mod tunnel_connector {
         assert!(
             matches!(&err, HostConnectorError::Unsupported(m)
                 if m.contains("node-sk-old") && m.contains("skills") && m.contains("upgrade rupu")),
+            "{err:?}"
+        );
+        assert!(
+            run_store.list().unwrap().is_empty(),
+            "no orphaned mirror run"
+        );
+        assert!(rx.try_recv().is_err(), "no frame sent");
+    }
+
+    /// A placed unit of an opted-out workflow carries `messaging_off` in the
+    /// Run frame, which the node renders as `rupu run --no-messaging`.
+    #[tokio::test]
+    async fn launch_agent_carries_messaging_off_to_a_capable_node() {
+        let dir = tempdir().unwrap();
+        let (conn, mut rx, _run_store, _node_conn) = setup_with_capabilities(
+            "node-nm-1",
+            dir.path(),
+            rupu_cp::node::protocol::node_capabilities(),
+        );
+        let mut req = make_agent_req("recon");
+        req.messaging_off = true;
+        let run_id = conn.launch_agent(req).await.expect("launch_agent");
+
+        match rx.recv().await.expect("should receive a frame") {
+            Frame::Run { run_id: fid, spec } => {
+                assert_eq!(fid, run_id);
+                assert!(spec.messaging_off);
+            }
+            other => panic!("expected Frame::Run, got {other:?}"),
+        }
+    }
+
+    /// A node that advertises the other launch features but not
+    /// `agent.no_messaging` would drop the field and give the unit the
+    /// default messaging tools: refuse, and leave no mirror run or frame
+    /// behind.
+    #[tokio::test]
+    async fn launch_agent_refuses_messaging_off_for_a_node_without_the_capability() {
+        let dir = tempdir().unwrap();
+        let (conn, mut rx, run_store, _node_conn) = setup_with_capabilities(
+            "node-nm-old",
+            dir.path(),
+            vec![
+                rupu_cp::node::protocol::CAP_AGENT_FINDINGS_PROFILE.to_string(),
+                rupu_cp::node::protocol::CAP_AGENT_SKILLS.to_string(),
+            ],
+        );
+        let mut req = make_agent_req("recon");
+        req.messaging_off = true;
+
+        let err = conn.launch_agent(req).await.unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Unsupported(m)
+                if m.contains("node-nm-old")
+                    && m.contains("cannot run with its messaging off")
+                    && m.contains("upgrade rupu")),
             "{err:?}"
         );
         assert!(
@@ -4194,6 +4262,7 @@ async fn mirror_transcript_append_finish_synthesizes_agent_step_result() {
 
     let spec = RunSpec {
         skill_bundle: None,
+        messaging_off: false,
         kind: RunSpecKind::Agent,
         name: "reviewer".to_string(),
         inputs: BTreeMap::new(),
@@ -4277,6 +4346,7 @@ async fn mirror_reset_transcript_makes_replay_idempotent() {
 
     let spec = RunSpec {
         skill_bundle: None,
+        messaging_off: false,
         kind: RunSpecKind::Agent,
         name: "reviewer".to_string(),
         inputs: BTreeMap::new(),

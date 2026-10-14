@@ -494,6 +494,8 @@ impl FleetUnitDispatcher {
                 // What `ship_skills` confirmed the host holds; `None` when
                 // nothing ships or the host can't take shipped skills (P5).
                 skill_bundle,
+                // Delivered as `--no-messaging`, or refused.
+                messaging_off: unit.messaging_off,
             })
             .await
         {
@@ -1518,6 +1520,7 @@ mod tests {
             skills: Vec::new(),
             preload_skills: Vec::new(),
             mode: None,
+            messaging_off: false,
             codename: None,
         }
     }
@@ -3183,6 +3186,23 @@ steps:
             d.dispatch_unit(unit, "h1").await.unwrap();
             let launched = conn.launched.lock().unwrap().clone().expect("launched");
             assert_eq!(launched.engagement_profiles, ids);
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_passes_the_units_messaging_off_to_launch_agent() {
+        for off in [true, false] {
+            let conn = Arc::new(FakeConnector::completed());
+            let d = FleetUnitDispatcher::from_connector(
+                Arc::clone(&conn) as Arc<dyn HostConnector>,
+                PathBuf::from("/g"),
+                None,
+            );
+            let mut unit = make_unit();
+            unit.messaging_off = off;
+            d.dispatch_unit(unit, "h1").await.unwrap();
+            let launched = conn.launched.lock().unwrap().clone().expect("launched");
+            assert_eq!(launched.messaging_off, off);
         }
     }
 

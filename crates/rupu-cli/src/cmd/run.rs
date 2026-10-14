@@ -118,6 +118,12 @@ pub struct Args {
     /// coordinator's placed-unit launch passes it.
     #[arg(long = "skill-bundle", hide = true, value_name = "JSON")]
     pub skill_bundle: Option<String>,
+    /// Turn this run's messaging tools off, and its children's, as an
+    /// agent's `messaging: false` would. A placed unit's coordinator passes
+    /// it for a workflow whose messaging is off. `--continue` does not keep
+    /// it: give it again with `--continue`.
+    #[arg(long)]
+    pub no_messaging: bool,
     /// Continue an interrupted run of this agent from its transcript instead
     /// of starting fresh: the earlier conversation is rebuilt and the agent
     /// is told it was interrupted. A run that had already finished prints
@@ -985,6 +991,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             skills: launch_skills.0.clone(),
             preload_skills: launch_skills.1.clone(),
             skill_overlay,
+            messaging_off: args.no_messaging,
             ..Default::default()
         };
 

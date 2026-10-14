@@ -33,6 +33,7 @@ fn placed(run_id: &str, codename: Option<&str>) -> AgentLaunchRequest {
         skills: Vec::new(),
         preload_skills: Vec::new(),
         skill_bundle: None,
+        messaging_off: false,
         codename: codename.map(str::to_string),
     }
 }

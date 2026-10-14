@@ -58,6 +58,7 @@ mod tests {
             skills: Vec::new(),
             preload_skills: Vec::new(),
             skill_bundle: None,
+            messaging_off: false,
         }
     }
 
@@ -132,6 +133,28 @@ mod tests {
                 "--preload-skill",
                 "house-style",
                 "--prompt=look at PR",
+            ]
+        );
+    }
+
+    /// A placed unit of an opted-out workflow runs `rupu run --no-messaging`.
+    #[test]
+    fn a_units_messaging_off_is_on_the_argv() {
+        let mut r = req();
+        r.target = None;
+        r.messaging_off = true;
+        let (spec, run_id) = spawn_spec("/bin/rupu".as_ref(), &r).unwrap();
+        assert_eq!(
+            args(&spec),
+            [
+                "run",
+                "triage",
+                "--run-id",
+                &run_id,
+                "--mode",
+                "bypass",
+                "--prompt=look at PR",
+                "--no-messaging",
             ]
         );
     }

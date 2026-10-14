@@ -1002,6 +1002,13 @@ struct AgentRunBody {
     /// --skill-bundle`). Validated; a malformed manifest is a 400.
     #[serde(default)]
     skill_bundle: Option<SkillBundleManifest>,
+    /// Optional `true`: the run, and everything it launches, gets no
+    /// messaging tools (`rupu run --no-messaging`; a placed unit of a
+    /// workflow whose messaging is off). Honoured on both paths; on the
+    /// remote-proxy path a peer that does not advertise `agent.no_messaging`
+    /// refuses the launch.
+    #[serde(default)]
+    messaging_off: bool,
     /// Optional run id to execute under (`run_<…>`), minted by a
     /// coordinator that needs to know it before the run starts — honoured
     /// because `/api/host/info` advertises `run.supplied_run_id`. A malformed
@@ -1108,6 +1115,7 @@ async fn run_agent_with(
         skills,
         preload_skills,
         skill_bundle,
+        messaging_off: body.messaging_off,
     };
     launcher.launch(req).await.map_err(|e| match e {
         AgentLaunchError::Invalid(m) => ApiError::bad_request(m),
@@ -1259,12 +1267,14 @@ async fn run_agent(
             skills,
             preload_skills,
             skill_bundle,
+            messaging_off: b.messaging_off,
         };
         let run_id = conn.launch_agent(req).await.map_err(|e| match e {
             HostConnectorError::NotFound(m) => ApiError::not_found(m),
             HostConnectorError::Invalid(m) => ApiError::bad_request(m),
             // e.g. the host can't honour `findings_profile`,
-            // `engagement_profiles` or `skills` — refused, not failed.
+            // `engagement_profiles`, `skills` or `messaging_off` — refused,
+            // not failed.
             HostConnectorError::Unsupported(m) => ApiError::not_available(m),
             other => ApiError::internal(other.to_string()),
         })?;
@@ -1519,6 +1529,7 @@ mod tests {
             skills: Vec::new(),
             preload_skills: Vec::new(),
             skill_bundle: None,
+            messaging_off: false,
             run_id: None,
             codename: None,
         };
@@ -1621,6 +1632,26 @@ mod tests {
         let rendered: SkillBundleManifest =
             serde_json::from_str(&run.skill_bundle.expect("rendered")).unwrap();
         assert_eq!(rendered, m);
+    }
+
+    #[tokio::test]
+    async fn run_agent_forwards_messaging_off() {
+        let mock = Arc::new(MockAgent {
+            last: Mutex::new(None),
+        });
+        let body: AgentRunBody =
+            serde_json::from_value(serde_json::json!({ "messaging_off": true })).unwrap();
+        run_agent_with("recon", body, mock.clone())
+            .await
+            .expect("ok");
+        let got = mock.last.lock().unwrap().take().unwrap();
+        assert!(got.messaging_off);
+        assert!(got.agent_run("run_X").unwrap().messaging_off);
+        let body: AgentRunBody = serde_json::from_value(serde_json::json!({})).unwrap();
+        run_agent_with("recon", body, mock.clone())
+            .await
+            .expect("ok");
+        assert!(!mock.last.lock().unwrap().take().unwrap().messaging_off);
     }
 
     #[tokio::test]
@@ -1809,6 +1840,7 @@ mod tests {
             skills: Vec::new(),
             preload_skills: Vec::new(),
             skill_bundle: None,
+            messaging_off: false,
             run_id: None,
             codename: None,
         };
@@ -1853,6 +1885,7 @@ mod tests {
             skills: Vec::new(),
             preload_skills: Vec::new(),
             skill_bundle: None,
+            messaging_off: false,
             run_id: None,
             codename: None,
         };
@@ -1898,6 +1931,7 @@ mod tests {
             skills: Vec::new(),
             preload_skills: Vec::new(),
             skill_bundle: None,
+            messaging_off: false,
             run_id: None,
             codename: None,
         };
@@ -1947,6 +1981,7 @@ mod tests {
             skills: Vec::new(),
             preload_skills: Vec::new(),
             skill_bundle: None,
+            messaging_off: false,
             run_id: None,
             codename: None,
         };
@@ -2004,6 +2039,7 @@ mod tests {
             skills: Vec::new(),
             preload_skills: Vec::new(),
             skill_bundle: None,
+            messaging_off: false,
             run_id: None,
             codename: None,
         };
@@ -2052,6 +2088,7 @@ mod tests {
             skills: Vec::new(),
             preload_skills: Vec::new(),
             skill_bundle: None,
+            messaging_off: false,
             run_id: None,
             codename: None,
         };
@@ -2088,6 +2125,7 @@ mod tests {
             skills: Vec::new(),
             preload_skills: Vec::new(),
             skill_bundle: None,
+            messaging_off: false,
             run_id: None,
             codename: None,
         };
@@ -2125,6 +2163,7 @@ mod tests {
             skills: Vec::new(),
             preload_skills: Vec::new(),
             skill_bundle: None,
+            messaging_off: false,
             run_id: None,
             codename: None,
         };

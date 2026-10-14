@@ -79,6 +79,10 @@ pub struct AgentRun {
     /// `--tmp`: clone a repo/PR target into an auto-deleted tmpdir. The CP and
     /// placed launches set it whenever there is a target.
     pub tmp_clone: bool,
+    /// `--no-messaging`: the run, and everything it launches, gets no
+    /// messaging tools. A placed unit's coordinator sets it for a workflow
+    /// whose messaging is off.
+    pub messaging_off: bool,
     /// Join a message space (`--message-space <dir> --participant <id>`):
     /// a child sharing its parent's, an agentiflow's pool unit (spec F1a §7).
     pub message_space: Option<MessageSpace>,
@@ -107,6 +111,7 @@ impl AgentRun {
             preload_skills: Vec::new(),
             skill_bundle: None,
             tmp_clone: false,
+            messaging_off: false,
             message_space: None,
             continue_from: None,
             launch: None,
@@ -409,6 +414,9 @@ impl RunArgv {
                 }
                 if r.tmp_clone {
                     a.push("--tmp");
+                }
+                if r.messaging_off {
+                    a.push("--no-messaging");
                 }
                 a.opt_flag_value("--continue", r.continue_from.as_deref());
                 if let Some(m) = &r.message_space {
@@ -1156,5 +1164,24 @@ mod tests {
         assert!(!strs(&RunArgv::Agent(on))
             .iter()
             .any(|a| a == "--launch-no-messaging"));
+    }
+
+    /// A placed unit of a workflow whose messaging is off is launched with
+    /// the bare `--no-messaging`; any other run passes nothing.
+    #[test]
+    fn an_agent_run_renders_no_messaging_only_when_off() {
+        let mut off = AgentRun::new("recon", "run_1");
+        off.tmp_clone = true;
+        off.messaging_off = true;
+        assert_eq!(
+            strs(&RunArgv::Agent(off.clone())),
+            ["run", "recon", "--run-id", "run_1", "--tmp", "--no-messaging"]
+        );
+        assert_eq!(
+            RunArgv::Agent(off).to_shell("rupu"),
+            "'rupu' 'run' 'recon' '--run-id' 'run_1' '--tmp' '--no-messaging'"
+        );
+        let on = AgentRun::new("recon", "run_1");
+        assert_eq!(strs(&RunArgv::Agent(on)), ["run", "recon", "--run-id", "run_1"]);
     }
 }
