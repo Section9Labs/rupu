@@ -3,20 +3,19 @@
 import { useEffect, useMemo, useState } from 'react';
 import { api, type AuditReport } from '../../lib/api';
 import { gapRows } from '../../lib/coverageGap';
-import { filterGapRows } from '../../lib/coverageFilter';
 import { SectionHeader } from '../lists/SectionHeader';
 import { ListCard } from '../lists/ListCard';
 import { Spinner } from '../ui/Spinner';
 import CollapsibleRow from './CollapsibleRow';
 import SeverityChip from './SeverityChip';
 import CappedList from './CappedList';
-import ConcernControls from './ConcernControls';
+import ExpandCollapse from './ExpandCollapse';
+import { ListQueryBar, NoMatches, useFilteredRows, useListQuery } from '../query/ListQueryBar';
+import { GAP_FIELDS, filesMatching } from '../../lib/query/lists/concerns';
 
 export default function CoverageGapTab({ target, wsId }: { target: string; wsId?: string }) {
   const [report, setReport] = useState<AuditReport | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [severity, setSeverity] = useState('all');
-  const [fileQuery, setFileQuery] = useState('');
   const [open, setOpen] = useState<Set<string>>(new Set());
 
   useEffect(() => {
@@ -36,10 +35,11 @@ export default function CoverageGapTab({ target, wsId }: { target: string; wsId?
     };
   }, [target, wsId]);
 
-  const rows = useMemo(
-    () => (report ? filterGapRows(gapRows(report), { severity, fileQuery }) : []),
-    [report, severity, fileQuery],
-  );
+  const all = useMemo(() => (report ? gapRows(report) : []), [report]);
+  const [q, setQ] = useListQuery();
+  const { rows: kept, error: queryError, facets } = useFilteredRows(all, q, GAP_FIELDS);
+  // A row lists only the gap files its query's `file:` terms keep.
+  const rows = useMemo(() => kept.map((r) => ({ ...r, gap_files: filesMatching(r.gap_files, q, GAP_FIELDS) })), [kept, q]);
 
   function toggle(id: string) {
     setOpen((prev) => {
@@ -52,28 +52,36 @@ export default function CoverageGapTab({ target, wsId }: { target: string; wsId?
 
   if (error) return <p className="mt-4 text-sm text-err">{error}</p>;
   if (!report) return <div className="mt-4"><Spinner label="Loading…" /></div>;
-  if (gapRows(report).length === 0)
+  if (all.length === 0)
     return <p className="mt-4 text-sm text-ink-dim">No gaps — every in-scope file assessed.</p>;
 
   return (
     <section className="mt-6">
+      <ListQueryBar
+        value={q}
+        onChange={setQ}
+        fields={GAP_FIELDS}
+        facets={facets}
+        total={all.length}
+        shown={rows.length}
+        error={queryError}
+        label="Filter gaps"
+        placeholder="Filter gaps… e.g. severity>=high file:src/api"
+      />
       <SectionHeader
         tone="bad"
         label="Coverage gaps"
         count={rows.length}
         hint="concerns with unassessed files"
-      />
-      <ConcernControls
-        severity={severity}
-        onSeverity={setSeverity}
-        fileQuery={fileQuery}
-        onFileQuery={setFileQuery}
-        onExpandAll={() => setOpen(new Set(rows.map((r) => r.concern_id)))}
-        onCollapseAll={() => setOpen(new Set())}
-        total={rows.length}
+        trailing={
+          <ExpandCollapse
+            onExpandAll={() => setOpen(new Set(rows.map((r) => r.concern_id)))}
+            onCollapseAll={() => setOpen(new Set())}
+          />
+        }
       />
       {rows.length === 0 ? (
-        <p className="text-sm text-ink-dim pl-1">No concerns match the current filters.</p>
+        <NoMatches noun="gaps" />
       ) : (
         <ListCard>
           {rows.map((r) => (

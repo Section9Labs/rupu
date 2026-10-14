@@ -15,3 +15,10 @@ export function firstCells(): string[] {
     .filter((r) => r.querySelector('td'))
     .map((r) => r.querySelector('td')?.textContent ?? '');
 }
+
+/** Remove every committed chip of the query line. */
+export function clearQuery(): void {
+  for (let b = screen.queryAllByRole('button', { name: /^Remove / }); b.length > 0; b = screen.queryAllByRole('button', { name: /^Remove / })) {
+    fireEvent.click(b[0]);
+  }
+}
