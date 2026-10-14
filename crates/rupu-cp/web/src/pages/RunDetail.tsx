@@ -1305,7 +1305,7 @@ export default function RunDetail() {
         </section>
 
         {/* Autoflow panel — only when this run has an autoflow-history trail. */}
-        {autoflowCtx && <AutoflowPanel context={autoflowCtx} />}
+        {autoflowCtx && <AutoflowPanel context={autoflowCtx} host={host} />}
       </div>
 
       <div className="mt-4">
