@@ -6,6 +6,7 @@ members = [
     "crates/rupu-skills",
     "crates/rupu-app-canvas",
     "crates/rupu-coverage",
+    "crates/rupu-query",
     "crates/rupu-findings-report",
     "crates/rupu-transcript",
     "crates/rupu-runtime",
@@ -210,6 +211,9 @@ rupu-launch = { path = "crates/rupu-launch" }
 # Coverage harness (findings/ledgers/profiles) — consumed by the agentiflow
 # envelope for goal/coverage evaluation.
 rupu-coverage = { path = "crates/rupu-coverage" }
+
+# The one-line query grammar + row matcher (findings and every CP list).
+rupu-query = { path = "crates/rupu-query" }
 
 # The agentiflow envelope: deterministic goal/coverage/budget supervisor
 # driving a LeadDriver round loop.

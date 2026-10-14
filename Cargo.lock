@@ -5026,6 +5026,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rupu-query"
+version = "0.83.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "rupu-runtime"
 version = "0.83.0"
 dependencies = [
