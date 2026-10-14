@@ -635,6 +635,14 @@ impl HostConnector for TunnelHostConnector {
     /// The mirrored stream. Complete once the run is terminal: the node sends
     /// its coverage frames, final drain included, before `RunFinished` on the
     /// same socket, so they are mirrored before the run turns terminal here.
+    async fn land_run_netflow(
+        &self,
+        _run_id: &str,
+        _terminal: bool,
+        _runs_root: &std::path::Path,
+    ) -> Result<crate::host::connector::NetflowLanding, HostConnectorError> {
+        Ok(crate::host::connector::NetflowLanding::ByMirror)
+    }
     async fn unit_coverage(
         &self,
         run_id: &str,

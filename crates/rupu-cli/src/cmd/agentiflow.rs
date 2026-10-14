@@ -273,11 +273,15 @@ async fn run_cmd(
     // (no round transcript exists yet). Each round's own provider and `bash`
     // get a per-round sink from the assembler: the same ledger (it is keyed
     // by the run id), and that round's transcript.
+    // An agentiflow is its own root and tees into no coordinator stream
+    // (spec 2026-10-14 remote netflow transport §N1), so nothing beneath it
+    // tees either.
     let netflow = crate::netflow_sink::for_run(
         &global,
         project_root.as_deref(),
         &run_id,
         &run_dir.join("lead").join("netflow.jsonl"),
+        None,
     );
     let netflow_sink = netflow.sink.clone();
 

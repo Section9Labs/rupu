@@ -918,3 +918,76 @@ fn a_bad_skill_flag_fails_before_the_target_is_cloned() {
     assert_eq!(record["error_message"], message.as_str());
     assert!(home.path().join("transcripts/run_badclone.jsonl").is_file());
 }
+
+/// A prompt that starts with `/skill` invokes it, as `/skill args` does in
+/// Claude Code: the skill joins the launch's skills, its body goes ahead of
+/// the rest of the prompt and the run records it as an operator load. A
+/// `/` token that names no skill stays in the prompt.
+#[test]
+fn a_leading_slash_skill_in_the_prompt_invokes_it() {
+    let home = home_with_agent_and_skills(&[("y", "Y-BODY")]);
+    let cwd = tempfile::tempdir().unwrap();
+    let out = mock_run(
+        home.path(),
+        cwd.path(),
+        &[
+            "run",
+            "a",
+            "--mode",
+            "readonly",
+            "--run-id",
+            "run_slash",
+            "/y summarize /tmp",
+        ],
+    );
+    run_ok(&out);
+    let events = transcript_events(home.path(), "run_slash");
+    let (rows, _) = skill_index_and_prompt(&events);
+    assert_eq!(rows, vec![row("y", false)]);
+    let loads: Vec<(&str, &str)> = events
+        .iter()
+        .filter(|e| e["type"] == "skill_load")
+        .map(|e| {
+            (
+                e["data"]["name"].as_str().unwrap(),
+                e["data"]["via"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(loads, vec![("y", "operator")]);
+    let user = events
+        .iter()
+        .find(|e| e["type"] == "user_message")
+        .and_then(|e| e["data"]["content"].as_str())
+        .unwrap_or_default();
+    assert!(user.contains("Y-BODY"), "{user}");
+    assert!(user.ends_with("\n\nsummarize /tmp"), "{user}");
+
+    // `--continue` keeps the skill the prompt invoked.
+    interrupt(home.path(), "run_slash");
+    let out = mock_run(
+        home.path(),
+        cwd.path(),
+        &["run", "a", "--continue", "run_slash", "--run-id", "run_slash2"],
+    );
+    run_ok(&out);
+    let (rows, _) = skill_index_and_prompt(&transcript_events(home.path(), "run_slash2"));
+    assert_eq!(rows, vec![row("y", false)]);
+
+    let out = mock_run(
+        home.path(),
+        cwd.path(),
+        &[
+            "run",
+            "a",
+            "--mode",
+            "readonly",
+            "--run-id",
+            "run_path",
+            "/etc/hosts is odd",
+        ],
+    );
+    run_ok(&out);
+    let events = transcript_events(home.path(), "run_path");
+    assert!(!events.iter().any(|e| e["type"] == "skill_load"));
+}

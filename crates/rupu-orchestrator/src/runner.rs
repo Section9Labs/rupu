@@ -1665,6 +1665,14 @@ pub async fn run_workflow(
             rupu_providers::credential_writes::stopped_by_signal(),
         );
         let served_decisions = !applied.is_empty();
+        // What the run's launcher wants done before the record turns
+        // terminal (a workflow root finishing its own netflow, so a
+        // coordinator that pulls the stream on a terminal `run.json` gets
+        // the whole of it). Not at a pause: the run has not ended, and its
+        // launcher keeps recording into it.
+        if end.is_terminal() {
+            run_before_terminal(store, &run_id).await;
+        }
         // Never over an on-disk `Cancelled` (the cancel-vs-completion race:
         // `RunStore::cancel` from the CLI or `cp serve` writes `Cancelled`
         // while this run finishes), and never over decisions recorded since
@@ -1833,6 +1841,14 @@ pub async fn run_workflow(
     })
 }
 
+/// Run, in order, the hooks `run_id`'s launcher registered for its end
+/// ([`crate::RunStore::add_before_terminal`]); none is left registered.
+async fn run_before_terminal(store: &crate::runs::RunStore, run_id: &str) {
+    for hook in store.take_before_terminal(run_id) {
+        hook().await;
+    }
+}
+
 /// How a runner's pass ended, as its final write records it on the run
 /// ([`crate::RunStore::finish_runner`] applies it to the record as it is on
 /// disk, under the run lock). Owned, so the write can run on the blocking
@@ -1901,6 +1917,12 @@ impl RunEnd {
                 },
             },
         }
+    }
+
+    /// Whether this end writes a terminal status: the run is over, rather
+    /// than parked at a gate or paused.
+    fn is_terminal(&self) -> bool {
+        matches!(self, RunEnd::Done { .. } | RunEnd::Failed { .. })
     }
 
     /// The terminal status of a `Done` pass (`Completed` otherwise — only
@@ -2191,17 +2213,32 @@ fn cancel_requested(cancel: Option<&CancellationToken>) -> bool {
     cancel.is_some_and(|t| t.is_cancelled()) || rupu_providers::credential_writes::terminating()
 }
 
-/// [`UnitDispatcher::dispatch_unit`], unless the process is terminating
-/// (SIGTERM, with credential writes still draining): then the unit is not
-/// started at all — it would be killed mid-way on its host anyway.
-async fn dispatch_unit_unless_terminating(
+/// Name the unit in the workflow run's netflow roster
+/// ([`record_netflow_roster`]) and dispatch it
+/// ([`UnitDispatcher::dispatch_unit`]) — unless the process is terminating
+/// (SIGTERM, with credential writes still draining): then neither. The unit
+/// is not started at all, since it would be killed mid-way on its host
+/// anyway, and a unit that is never dispatched must not be listed as one
+/// whose flows are awaited.
+async fn dispatch_placed_unit(
     dispatcher: &dyn UnitDispatcher,
+    store: Option<&crate::runs::RunStore>,
+    workflow_run_id: &str,
     unit: UnitDispatch,
     host: &str,
+    index: Option<usize>,
 ) -> Result<UnitOutcome, UnitFailure> {
     if rupu_providers::credential_writes::terminating() {
         return Err(RunError::Terminating.into());
     }
+    record_netflow_roster(
+        store,
+        workflow_run_id,
+        &unit.run_id,
+        host,
+        &unit.step_id,
+        index,
+    );
     dispatcher.dispatch_unit(unit, host).await
 }
 
@@ -7273,6 +7310,31 @@ pub fn record_gate_decision(
 /// expiry with no operator involved at all (the gate sweep's own
 /// `ExpireThenCleanupReject` arm).
 pub async fn run_reject_cleanup(
+    opts: OrchestratorRunOpts,
+    rejected_step_id: &str,
+    reason: &str,
+    via: &str,
+    approver: Option<&str>,
+) -> Result<(), RunWorkflowError> {
+    // The chain is this run's last pass: its record is already `Rejected`,
+    // so whatever the launcher wanted done before the run ended runs when
+    // the chain is over, however it ended (see `BeforeTerminal`).
+    let store = opts.run_store.clone();
+    let run_id = opts
+        .resume_from
+        .as_ref()
+        .map(|r| r.run_id.clone())
+        .unwrap_or_default();
+    let out = run_reject_chain(opts, rejected_step_id, reason, via, approver).await;
+    if let Some(store) = store.filter(|_| !run_id.is_empty()) {
+        run_before_terminal(&store, &run_id).await;
+    }
+    out
+}
+
+/// [`run_reject_cleanup`]'s body: the gate's rejected result, then its
+/// `on_reject` chain.
+async fn run_reject_chain(
     mut opts: OrchestratorRunOpts,
     rejected_step_id: &str,
     reason: &str,
@@ -7804,6 +7866,36 @@ fn record_attempt(
     }
 }
 
+/// Name a placed unit attempt in the workflow run's netflow roster before
+/// it is dispatched (spec 2026-10-14 §N3), so its flows — or the gap where
+/// they should be — are found even if this process dies before the unit
+/// ends. A local unit's ledgers are already here; an in-memory run has no
+/// store. Best-effort: a failure is logged.
+fn record_netflow_roster(
+    store: Option<&crate::runs::RunStore>,
+    workflow_run_id: &str,
+    unit_run_id: &str,
+    host: &str,
+    step_id: &str,
+    index: Option<usize>,
+) {
+    let Some(store) = store.filter(|_| !workflow_run_id.is_empty()) else {
+        return;
+    };
+    if host == "local" {
+        return;
+    }
+    let line = rupu_netflow::land::RosterLine {
+        unit_run_id: unit_run_id.to_string(),
+        host: host.to_string(),
+        step_id: step_id.to_string(),
+        index,
+    };
+    if let Err(e) = rupu_netflow::land::append_roster_line(&store.root, workflow_run_id, &line) {
+        warn!(step = %step_id, host, error = %e, "could not record the unit in the netflow roster");
+    }
+}
+
 /// Clear `step_id` as the run's active step if it still is — under the run
 /// lock, never over an on-disk `Cancelled`.
 async fn clear_active_step(opts: &OrchestratorRunOpts, workflow_run_id: &str, step_id: &str) {
@@ -8114,7 +8206,15 @@ async fn dispatch_placed_step(
         run_id,
         transcript_path.to_path_buf(),
     );
-    let mut result = dispatch_unit_unless_terminating(dispatcher.as_ref(), unit, host).await;
+    let mut result = dispatch_placed_unit(
+        dispatcher.as_ref(),
+        opts.run_store.as_deref(),
+        workflow_run_id,
+        unit,
+        host,
+        None,
+    )
+    .await;
     emit_unit_warnings(
         &mut result,
         opts.event_sink.as_ref(),
@@ -9424,10 +9524,13 @@ async fn run_fanout_step(
                                     &run_id_clone,
                                     transcript_clone.clone(),
                                 );
-                                let mut result = dispatch_unit_unless_terminating(
+                                let mut result = dispatch_placed_unit(
                                     dispatcher.as_ref(),
+                                    store_for_task.as_deref(),
+                                    &workflow_run_id,
                                     unit,
                                     &host,
+                                    Some(idx),
                                 )
                                 .await;
                                 emit_unit_warnings(
@@ -9585,10 +9688,13 @@ async fn run_fanout_step(
                                             &retry_run_id,
                                             transcript_path.clone(),
                                         );
-                                        let mut retry_result = dispatch_unit_unless_terminating(
+                                        let mut retry_result = dispatch_placed_unit(
                                             dispatcher.as_ref(),
+                                            store_for_task.as_deref(),
+                                            &workflow_run_id,
                                             retry_unit,
                                             retry_host,
+                                            Some(idx),
                                         )
                                         .await;
                                         emit_unit_warnings(

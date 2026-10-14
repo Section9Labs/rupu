@@ -40,9 +40,11 @@ pub mod capture;
 pub mod ctx;
 #[cfg(feature = "http")]
 pub mod http;
+pub mod land;
 pub mod ledger;
 pub mod record;
 pub mod sink;
+pub mod stream;
 
 pub use asn::{AsnInfo, AsnTable};
 pub use capture::{CallAttribution, CaptureCall, NoopCapture, SubprocessCapture};
@@ -57,3 +59,4 @@ pub use record::{
     SocketCompletion,
 };
 pub use sink::{CaptureStateLine, FanoutSink, FlowSink, MemorySink, NullSink};
+pub use stream::{NetflowStream, STREAM_FILE as NETFLOW_STREAM_FILE};

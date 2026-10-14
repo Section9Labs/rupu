@@ -143,30 +143,6 @@ fn legacy_subagent(transcript: &Path, sub_run_id: &str, parent: &str, depth: u32
 /// launch order per parent (parents breadth-first). A child an attempt took
 /// on from an earlier one is listed once, as its latest record says.
 pub fn children_of(store: &RunStore, run_id: &str) -> Vec<ChildDto> {
-    latest_per_handle(walk(store, roots_of(store, run_id)))
-}
-
-/// Every run the launch tree under `run_id` holds: each child's run, a
-/// continued child's earlier runs too (the findings scope; each run records
-/// findings under its own id), unlike [`children_of`]'s one row per handle.
-pub fn tree_run_ids(store: &RunStore, run_id: &str) -> Vec<String> {
-    walk(store, roots_of(store, run_id))
-        .into_iter()
-        .map(|(c, _)| c.run_id)
-        .collect()
-}
-
-/// [`tree_run_ids`] below runs that are not [`RunStore`] runs' roots (a
-/// flow's units): every run under each of `runs`, not `runs` themselves.
-pub fn tree_run_ids_below(store: &RunStore, runs: &[String]) -> Vec<String> {
-    walk(store, runs.iter().map(|r| (r.clone(), 1)).collect())
-        .into_iter()
-        .map(|(c, _)| c.run_id)
-        .collect()
-}
-
-/// `run_id` and its steps' agent runs: where its launch tree starts.
-fn roots_of(store: &RunStore, run_id: &str) -> VecDeque<(String, u32)> {
     let mut parents: VecDeque<(String, u32)> = VecDeque::from([(run_id.to_string(), 0)]);
     for rec in store.read_step_results(run_id).unwrap_or_default() {
         parents.push_back((rec.run_id.clone(), 0));
@@ -174,7 +150,7 @@ fn roots_of(store: &RunStore, run_id: &str) -> VecDeque<(String, u32)> {
             parents.push_back((item.run_id.clone(), 0));
         }
     }
-    parents
+    walk_children(store, parents)
 }
 
 /// A flow's direct children from its OWN `children.jsonl` ledger (W7),
@@ -199,21 +175,21 @@ pub fn with_descendants(store: &RunStore, units: Vec<ChildDto>) -> Vec<ChildDto>
         parents.push_back((u.run_id.clone(), u.depth));
     }
     let mut out = units;
-    out.extend(latest_per_handle(walk(store, parents)));
+    out.extend(walk_children(store, parents));
     out
 }
 
 /// Breadth-first over `parents` — each a run id whose `children.jsonl` to read,
 /// paired with the depth to stamp its legacy sub-agents at — collecting every
-/// child of every kind, in launch order per parent (parents breadth-first),
-/// each with when it started (`None` for a legacy sub-agent). A child a later
-/// attempt took on under the same handle appears once per attempt.
-fn walk(
-    store: &RunStore,
-    mut parents: VecDeque<(String, u32)>,
-) -> Vec<(ChildDto, Option<chrono::DateTime<chrono::Utc>>)> {
+/// child of every kind, in launch order per parent (parents breadth-first). A
+/// child a later attempt took on under the same handle is listed once, as its
+/// latest record says.
+fn walk_children(store: &RunStore, mut parents: VecDeque<(String, u32)>) -> Vec<ChildDto> {
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut out = Vec::new();
+    // Each handle's latest record: where it is in `out`, and when it started.
+    let mut latest: std::collections::HashMap<String, (usize, chrono::DateTime<chrono::Utc>)> =
+        std::collections::HashMap::new();
     while let Some((parent, depth)) = parents.pop_front() {
         if parent.is_empty() || !seen.insert(parent.clone()) || seen.len() > MAX_RUNS_WALKED {
             continue;
@@ -224,44 +200,30 @@ fn walk(
             let at = e.started.at;
             let child = from_entry(e, &parent);
             parents.push_back((child.run_id.clone(), child.depth));
-            out.push((child, Some(at)));
+            if let Some(handle) = child.handle.clone() {
+                match latest.get(&handle) {
+                    Some(&(_, seen)) if seen >= at => continue,
+                    _ => {
+                        latest.insert(handle, (out.len(), at));
+                    }
+                }
+            }
+            out.push(child);
         }
         for sub in store.sub_run_ids(&parent) {
             if known.contains(&sub) {
                 continue;
             }
             let transcript = store.sub_run_transcript_path(&parent, &sub);
-            out.push((legacy_subagent(&transcript, &sub, &parent, depth + 1), None));
+            out.push(legacy_subagent(&transcript, &sub, &parent, depth + 1));
             parents.push_back((sub, depth + 1));
         }
     }
-    out
-}
-
-/// The Children tab's rows: a child a later attempt took on under the same
-/// handle is listed once, as its latest record says.
-fn latest_per_handle(
-    walked: Vec<(ChildDto, Option<chrono::DateTime<chrono::Utc>>)>,
-) -> Vec<ChildDto> {
-    // Each handle's latest record: where it is in `walked`, and when it started.
-    let mut latest: std::collections::HashMap<&str, (usize, chrono::DateTime<chrono::Utc>)> =
-        std::collections::HashMap::new();
-    for (i, (child, at)) in walked.iter().enumerate() {
-        if let (Some(handle), Some(at)) = (child.handle.as_deref(), at) {
-            match latest.get(handle) {
-                Some(&(_, seen)) if seen >= *at => {}
-                _ => {
-                    latest.insert(handle, (i, *at));
-                }
-            }
-        }
-    }
     let keep: BTreeSet<usize> = latest.values().map(|&(i, _)| i).collect();
-    walked
-        .into_iter()
+    out.into_iter()
         .enumerate()
-        .filter(|(i, (c, _))| c.handle.is_none() || keep.contains(i))
-        .map(|(_, (c, _))| c)
+        .filter(|(i, c)| c.handle.is_none() || keep.contains(i))
+        .map(|(_, c)| c)
         .collect()
 }
 

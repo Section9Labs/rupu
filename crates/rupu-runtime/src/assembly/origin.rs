@@ -75,6 +75,10 @@ pub struct ParentRun {
     pub usage: Option<UsageLedger>,
     /// The root `rupu run`'s coverage stream; children append to it.
     pub coverage_stream: Option<PathBuf>,
+    /// The parent's netflow stream (spec 2026-10-14 remote netflow
+    /// transport §N1); the child tees into the same file under its own
+    /// ledger id. `None` when the parent tees nowhere.
+    pub netflow_stream: Option<rupu_netflow::NetflowStream>,
 }
 
 /// Where a run's usage rows go.
@@ -102,6 +106,22 @@ pub enum CoverageStream {
     Parent,
 }
 
+/// Whose netflow stream a run tees its ledger lines into (spec 2026-10-14
+/// remote netflow transport §N1), when that stream has been begun. A run
+/// with a `LaunchLink` tees into its link's root instead, whatever its
+/// origin says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetflowStreamRoot {
+    /// Never tees.
+    None,
+    /// `<runs>/<run_id>/netflow.jsonl` — a root `rupu run`.
+    Own,
+    /// `<runs>/<workflow_run_id>/netflow.jsonl` — the workflow run's.
+    WorkflowRun,
+    /// The in-process parent's stream.
+    Parent,
+}
+
 /// Every default the launch sites used to disagree on, for one origin.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OriginDefaults {
@@ -114,6 +134,7 @@ pub struct OriginDefaults {
     pub usage: UsageRoot,
     pub ledger_tag: LedgerTag,
     pub coverage_stream: CoverageStream,
+    pub netflow_stream: NetflowStreamRoot,
     /// The SCM/issue registry (MCP connector tools) is offered.
     pub scm: bool,
     /// The launcher (`dispatch` / `join`) is offered when the launch
@@ -143,6 +164,7 @@ pub fn defaults_for(origin: &Origin) -> OriginDefaults {
             usage: UsageRoot::OwnRun,
             ledger_tag: LedgerTag::default(),
             coverage_stream: CoverageStream::Own,
+            netflow_stream: NetflowStreamRoot::Own,
             scm: true,
             launcher: true,
             catalog: true,
@@ -175,6 +197,7 @@ pub fn defaults_for(origin: &Origin) -> OriginDefaults {
                 rollup: false,
             },
             coverage_stream: CoverageStream::None,
+            netflow_stream: NetflowStreamRoot::WorkflowRun,
             scm: true,
             launcher: true,
             catalog: true,
@@ -192,6 +215,7 @@ pub fn defaults_for(origin: &Origin) -> OriginDefaults {
             usage: UsageRoot::Parent,
             ledger_tag: LedgerTag::default(),
             coverage_stream: CoverageStream::Parent,
+            netflow_stream: NetflowStreamRoot::Parent,
             scm: true,
             launcher: true,
             catalog: true,
@@ -212,6 +236,7 @@ pub fn defaults_for(origin: &Origin) -> OriginDefaults {
             usage: UsageRoot::Dir(session_dir.clone()),
             ledger_tag: LedgerTag::default(),
             coverage_stream: CoverageStream::None,
+            netflow_stream: NetflowStreamRoot::None,
             scm: true,
             launcher: true,
             catalog: true,
@@ -229,6 +254,7 @@ pub fn defaults_for(origin: &Origin) -> OriginDefaults {
             usage: UsageRoot::Dir(flow_dir.clone()),
             ledger_tag: LedgerTag::default(),
             coverage_stream: CoverageStream::None,
+            netflow_stream: NetflowStreamRoot::None,
             scm: true,
             launcher: true,
             catalog: true,
@@ -248,6 +274,7 @@ pub fn defaults_for(origin: &Origin) -> OriginDefaults {
             usage: UsageRoot::OwnRun,
             ledger_tag: LedgerTag::default(),
             coverage_stream: CoverageStream::Own,
+            netflow_stream: NetflowStreamRoot::None,
             scm: true,
             launcher: true,
             catalog: true,
