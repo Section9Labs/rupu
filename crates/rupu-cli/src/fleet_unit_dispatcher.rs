@@ -1518,6 +1518,7 @@ mod tests {
             skills: Vec::new(),
             preload_skills: Vec::new(),
             mode: None,
+            messaging_off: false,
             codename: None,
         }
     }

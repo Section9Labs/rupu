@@ -168,6 +168,11 @@ pub struct UnitDispatch {
     /// `None` only for a factory that tracks no single mode: the host then
     /// resolves the mode itself.
     pub mode: Option<rupu_tools::PermissionMode>,
+    /// The unit gets no messaging tools, nor does anything it launches:
+    /// [`remote_unit_messaging_off`]. The dispatcher must deliver it to the
+    /// host as `rupu run --no-messaging` or refuse the launch. `false` ⇒ the
+    /// host decides from the agent file, as for any standalone run.
+    pub messaging_off: bool,
 }
 
 /// The findings profile a remote (`host:` / `distribute:`) unit must run
@@ -182,6 +187,19 @@ pub(crate) fn remote_unit_findings_profile(
     defaults: &crate::workflow::WorkflowDefaults,
 ) -> Option<rupu_coverage::FindingProfile> {
     step.findings_profile.or(defaults.findings_profile)
+}
+
+/// Whether a remote (`host:` / `distribute:`) unit runs with its messaging
+/// off (spec F1d D5, D6): its workflow's `messaging: false`, or the cap the
+/// run itself was launched under ([`StepFactory::messaging_capped`]). The
+/// agent's own `messaging: false` needs nothing here: the host loads the
+/// agent file. A workflow's `messaging: { tools }` narrowing does not
+/// travel; the unit gets the host's default set.
+pub(crate) fn remote_unit_messaging_off(workflow: &Workflow, factory: &dyn StepFactory) -> bool {
+    matches!(
+        workflow.messaging_switch(),
+        rupu_tools::MessagingSwitch::Off
+    ) || factory.messaging_capped()
 }
 
 /// The permission mode a remote (`host:` / `distribute:`) unit must run
@@ -626,6 +644,14 @@ pub trait StepFactory: Send + Sync {
     /// tells it when the run ends for good. Defaulted like `customer`.
     fn launcher(&self) -> Option<Arc<dyn rupu_tools::Launcher>> {
         None
+    }
+
+    /// The launch cap on this run's messaging: the run was launched by a
+    /// run whose messaging is off (its `LaunchLink.no_messaging`), so its
+    /// steps and units are off too. A local step reads it from its spec's
+    /// link; a placed unit needs it here. Defaulted like `customer`.
+    fn messaging_capped(&self) -> bool {
+        false
     }
 }
 
@@ -8070,6 +8096,7 @@ async fn dispatch_placed_step(
         skills: step.skills.clone(),
         preload_skills: step.preload_skills.clone(),
         mode: remote_unit_permission_mode(opts.factory.permission_mode()),
+        messaging_off: remote_unit_messaging_off(&opts.workflow, opts.factory.as_ref()),
         codename: codename.map(ToString::to_string),
     };
     announce_placed_agent(
@@ -9170,6 +9197,7 @@ async fn run_fanout_step(
     let unit_skills = (step.skills.clone(), step.preload_skills.clone());
     // The run's mode, the same for every unit (and its retry); `Copy`.
     let unit_mode = remote_unit_permission_mode(opts.factory.permission_mode());
+    let unit_messaging_off = remote_unit_messaging_off(&opts.workflow, opts.factory.as_ref());
     let mut handles = Vec::with_capacity(total);
     for (idx, item_value, rendered, run_id, transcript_path) in prepared {
         // Compute host placement for this unit. `None` → local inline path
@@ -9377,6 +9405,7 @@ async fn run_fanout_step(
                                     skills: skills_for_task.clone(),
                                     preload_skills: preload_skills_for_task.clone(),
                                     mode: unit_mode,
+                                    messaging_off: unit_messaging_off,
                                     codename: unit_codename.as_ref().map(ToString::to_string),
                                 };
                                 announce_placed_agent(
@@ -9493,6 +9522,7 @@ async fn run_fanout_step(
                                             skills: skills_for_task.clone(),
                                             preload_skills: preload_skills_for_task.clone(),
                                             mode: unit_mode,
+                                            messaging_off: unit_messaging_off,
                                             codename: unit_codename
                                                 .as_ref()
                                                 .map(ToString::to_string),

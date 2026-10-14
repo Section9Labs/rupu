@@ -153,6 +153,10 @@ impl StepFactory for DefaultStepFactory {
         self.launcher.clone()
     }
 
+    fn messaging_capped(&self) -> bool {
+        self.link.as_ref().is_some_and(|l| l.no_messaging)
+    }
+
     fn engagement_profiles(&self) -> Vec<String> {
         self.assembler
             .context()
@@ -377,6 +381,30 @@ steps:
         let bare = launch(&f, tmp.path(), "bare", "ag").await;
         assert!(bare.spec.overrides.skills.is_empty());
         assert!(bare.spec.overrides.preload_skills.is_empty());
+    }
+
+    /// A workflow launched by a run whose messaging is off carries the cap
+    /// to its placed units through `messaging_capped`.
+    #[test]
+    fn the_links_messaging_cap_is_the_factorys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let link = |no_messaging| rupu_runtime::argv::LaunchLink {
+            depth: 1,
+            ceiling: rupu_tools::PermissionMode::Bypass,
+            parent_run: "run_p".into(),
+            root_run: "run_p".into(),
+            usage_root: None,
+            agents: vec![],
+            workflows: vec![],
+            actions: None,
+            no_messaging,
+        };
+        let mut f = factory_with(WF, context(tmp.path()));
+        assert!(!f.messaging_capped());
+        f.link = Some(link(false));
+        assert!(!f.messaging_capped());
+        f.link = Some(link(true));
+        assert!(f.messaging_capped());
     }
 
     #[tokio::test]
