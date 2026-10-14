@@ -1245,11 +1245,14 @@ async fn pump_catch_up_transcript(
 const LEDGER_USAGE: &str = "usage.jsonl";
 /// Section label (and file name) of the coverage stream in [`ledger_pull_command`].
 const LEDGER_COVERAGE: &str = "coverage.jsonl";
+/// Section label (and file name) of the netflow stream in [`ledger_pull_command`]
+/// (spec 2026-10-14-rupu-remote-netflow-transport-design.md §N2).
+const LEDGER_NETFLOW: &str = "netflow.jsonl";
 /// How every [`ledger_pull_command`] starts (tests route on it).
-const LEDGER_PULL_PREFIX: &str = "for f in usage.jsonl coverage.jsonl;";
+const LEDGER_PULL_PREFIX: &str = "for f in usage.jsonl coverage.jsonl netflow.jsonl;";
 
-/// The pump's terminal ledger pull: the run's `usage.jsonl` AND
-/// `coverage.jsonl` in ONE ssh invocation, framed like [`batch_cat_command`]
+/// The pump's terminal ledger pull: the run's `usage.jsonl`, `coverage.jsonl`
+/// AND `netflow.jsonl` in ONE ssh invocation, framed like [`batch_cat_command`]
 /// (`==> <label> <==`, body, synthetic newline) but with `cat`'s exit status
 /// in each trailer (`==> end <status> <==`), so [`split_ledger_pull`] can
 /// tell a whole file from one whose read failed part-way. The labels are the
@@ -1301,7 +1304,7 @@ fn split_ledger_pull(stdout: &str) -> std::collections::HashMap<String, String> 
     out
 }
 
-/// One-shot terminal pull of the run's two ledgers for the tail pump, in a
+/// One-shot terminal pull of the run's ledgers for the tail pump, in a
 /// single ssh round trip ([`ledger_pull_command`]), each atomically REPLACING
 /// its mirrored copy.
 ///
@@ -1326,6 +1329,18 @@ fn split_ledger_pull(stdout: &str) -> std::collections::HashMap<String, String> 
 /// unit, and ssh hosts may throttle connection bursts), and it runs BEFORE
 /// the transcript catch-up, whose `cat` of a large transcript can outlast
 /// [`PUMP_FINALIZE_TIMEOUT`].
+///
+/// **Netflow.** The run's netflow stream (spec 2026-10-14 §N2) is not
+/// tailed — nothing reads it before the run ends — so this pull is the ONLY
+/// way it reaches the coordinator. The copy replaces the mirror's and, when
+/// `run_terminal`, is confirmed whole; otherwise it is a snapshot the run may
+/// still be appending to, marked partial with the reason. The mirror lands
+/// either into the global netflow directory and writes the landing record as
+/// the terminal `run.json` is mirrored (or at `finish`), so the record exists
+/// before any reader sees the run terminal. A netflow section that did not
+/// arrive leaves no copy, and the mirror then records the run `unavailable`:
+/// an older host without the stream never looks like a unit that made no
+/// network calls.
 ///
 /// A section that did not arrive whole (the pull failed or was cut off, or
 /// the host's `cat` failed — an absent file, or a read error part-way), or
@@ -1376,6 +1391,21 @@ async fn pump_catch_up_ledgers(
             .await
         {
             tracing::warn!(host_id, run_id, error = %e, "terminal coverage replace failed");
+        }
+    }
+    // The netflow stream is never tailed, so there is no earlier copy to
+    // keep: a section that did not arrive (an older host without the file,
+    // a cat that failed part-way) writes nothing, and the mirror lands the
+    // run `unavailable` at terminal.
+    if let Some(netflow) = sections.get(LEDGER_NETFLOW).filter(|b| !b.is_empty()) {
+        let reason = (!run_terminal).then(|| {
+            "the host's run.json was not terminal when its netflow was pulled".to_string()
+        });
+        if let Err(e) = mirror
+            .replace_netflow(run_id, host_id, netflow, run_terminal, reason)
+            .await
+        {
+            tracing::warn!(host_id, run_id, error = %e, "terminal netflow replace failed");
         }
     }
 }
@@ -1628,7 +1658,9 @@ async fn pump_finalize_if_terminal(
     // reader must never see "terminal" next to the tailed (possibly short)
     // ledger. The replace only needs the run to exist with this worker id,
     // which `create_run` already guaranteed. The same round trip brings the
-    // complete coverage stream, ahead of the (possibly slow) transcript work.
+    // complete coverage and netflow streams, ahead of the (possibly slow)
+    // transcript work; mirroring the terminal `run.json` below is what lands
+    // the netflow copy and writes its landing record.
     pump_catch_up_ledgers(exec, mirror, run_id, host_id, true).await;
     let _ = mirror
         .append(run_id, host_id, ArtifactFile::RunJson, &trimmed)
@@ -2393,6 +2425,11 @@ impl SshHostConnector {
         );
         let cat_cmd = format!("cat $HOME/.rupu/runs/{run_id}/run.json");
         let cat_transcript_cmd = format!("cat $HOME/.rupu/transcripts/{run_id}.jsonl");
+        // The run's `netflow.jsonl` is deliberately NOT tailed: nothing reads
+        // it before the run ends, so the terminal ledger pull
+        // (`pump_catch_up_ledgers`) fetches it whole instead (spec
+        // 2026-10-14 §N2).
+        //
         // `==> <path> <==` suffix that identifies the transcript among the
         // tailed files. The directory component makes mis-attribution
         // impossible: none of the `runs/<run_id>/*.jsonl` artifacts can end
@@ -2679,8 +2716,10 @@ impl SshHostConnector {
                     // Same authoritative ledger pull as the terminal arm: rows
                     // still buffered in the dead stream are gone, so replace the
                     // mirrored ledgers with the remote's while we can reach it.
-                    // The coverage copy is complete only when the host's record
-                    // is terminal; otherwise the run may still be writing it.
+                    // The coverage and netflow copies are complete only when the
+                    // host's record is terminal; otherwise the run may still be
+                    // writing them (the netflow copy is then marked partial,
+                    // which `finish` lands as such).
                     pump_catch_up_ledgers(
                         exec.as_ref(),
                         &mirror,
@@ -4555,12 +4594,17 @@ mod tests {
         /// section: the file is absent (an older host with no coverage
         /// stream) or empty.
         cat_coverage_stdout: Option<String>,
+        /// The `netflow.jsonl` section of the same pull. `None` → an empty
+        /// section: the file is absent (an older host with no netflow
+        /// stream) or empty.
+        cat_netflow_stdout: Option<String>,
         /// When set, the ledger pull fails in the ssh transport (no stdout,
         /// exit 255) — a throttled or dropped connection.
         ledger_pull_fails: bool,
         /// The exit status each section's `cat` reports in its trailer
-        /// (`usage`, `coverage`); nonzero is a host-side read error mid-file.
-        ledger_cat_status: (i32, i32),
+        /// (`usage`, `coverage`, `netflow`); nonzero is a host-side read
+        /// error mid-file, or an absent file.
+        ledger_cat_status: (i32, i32, i32),
         /// If set, returned as stdout for the pump's batched terminal pull
         /// (`for p in …; do printf '==> %s <==' …; cat …; done`, Task 6).
         batch_cat_stdout: Option<String>,
@@ -4595,8 +4639,9 @@ mod tests {
                 cat_transcript_delay: None,
                 cat_usage_stdout: None,
                 cat_coverage_stdout: None,
+                cat_netflow_stdout: None,
                 ledger_pull_fails: false,
-                ledger_cat_status: (0, 0),
+                ledger_cat_status: (0, 0, 0),
                 batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
@@ -4618,8 +4663,9 @@ mod tests {
                 cat_transcript_delay: None,
                 cat_usage_stdout: None,
                 cat_coverage_stdout: None,
+                cat_netflow_stdout: None,
                 ledger_pull_fails: false,
-                ledger_cat_status: (0, 0),
+                ledger_cat_status: (0, 0, 0),
                 batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
@@ -4643,8 +4689,9 @@ mod tests {
                 cat_transcript_delay: None,
                 cat_usage_stdout: None,
                 cat_coverage_stdout: None,
+                cat_netflow_stdout: None,
                 ledger_pull_fails: false,
-                ledger_cat_status: (0, 0),
+                ledger_cat_status: (0, 0, 0),
                 batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
@@ -4668,8 +4715,9 @@ mod tests {
                 cat_transcript_delay: None,
                 cat_usage_stdout: None,
                 cat_coverage_stdout: None,
+                cat_netflow_stdout: None,
                 ledger_pull_fails: false,
-                ledger_cat_status: (0, 0),
+                ledger_cat_status: (0, 0, 0),
                 batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
@@ -4692,8 +4740,9 @@ mod tests {
                 cat_transcript_delay: None,
                 cat_usage_stdout: None,
                 cat_coverage_stdout: None,
+                cat_netflow_stdout: None,
                 ledger_pull_fails: false,
-                ledger_cat_status: (0, 0),
+                ledger_cat_status: (0, 0, 0),
                 batch_cat_stdout: None,
                 show_stdout: None,
                 launch_log_stdout: None,
@@ -4716,7 +4765,7 @@ mod tests {
                     success: false,
                 })
             } else if remote.starts_with(LEDGER_PULL_PREFIX) {
-                // The pump's terminal ledger pull: both sections, framed
+                // The pump's terminal ledger pull: every section, framed
                 // exactly as the real loop frames them.
                 if self.ledger_pull_fails {
                     return Ok(RemoteOutput {
@@ -4737,6 +4786,11 @@ mod tests {
                         LEDGER_COVERAGE,
                         &self.cat_coverage_stdout,
                         self.ledger_cat_status.1,
+                    ),
+                    (
+                        LEDGER_NETFLOW,
+                        &self.cat_netflow_stdout,
+                        self.ledger_cat_status.2,
                     ),
                 ] {
                     stdout.push_str(&format!("==> {label} <==\n"));
@@ -7957,7 +8011,7 @@ mod tests {
             FakeExec::with_cat_stdout(vec![], r#"{"status":"completed","final_output":"done."}"#);
         fake.cat_coverage_stdout = Some(format!("{tailed}{{\"trunc"));
         fake.cat_usage_stdout = Some(format!("{USAGE_ROW_1}\n"));
-        fake.ledger_cat_status = (1, 1);
+        fake.ledger_cat_status = (1, 1, 1);
         let fake = std::sync::Arc::new(fake);
         let (conn, store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -8038,31 +8092,32 @@ mod tests {
     /// terminal: the fallback still refreshes the mirrored stream from the
     /// host, but the run may still be writing it, so the copy is a snapshot —
     /// never marked complete.
+    /// A `FakeExec` whose tail stream is finite: it ends after its lines, so
+    /// the pump takes its stream-end fallback instead of the terminal probe.
+    struct EndingTailExec(std::sync::Arc<FakeExec>);
+
+    #[async_trait::async_trait]
+    impl RemoteExec for EndingTailExec {
+        async fn run(&self, c: &str) -> Result<RemoteOutput, RemoteExecError> {
+            self.0.run(c).await
+        }
+        fn spawn_lines(&self, c: &str) -> Result<LineStream, RemoteExecError> {
+            self.0.commands.lock().unwrap().push(c.to_string());
+            let lines: Vec<std::io::Result<String>> =
+                self.0.tail_lines.iter().cloned().map(Ok).collect();
+            Ok(Box::pin(futures_util::stream::iter(lines)))
+        }
+        async fn run_bytes(
+            &self,
+            c: &str,
+            stdin: Option<Vec<u8>>,
+        ) -> Result<Vec<u8>, RemoteExecError> {
+            self.0.run_bytes(c, stdin).await
+        }
+    }
+
     #[tokio::test]
     async fn the_stream_end_fallback_never_marks_a_non_terminal_runs_coverage_complete() {
-        /// A `FakeExec` whose tail stream is finite: it ends after its lines.
-        struct EndingTailExec(std::sync::Arc<FakeExec>);
-
-        #[async_trait::async_trait]
-        impl RemoteExec for EndingTailExec {
-            async fn run(&self, c: &str) -> Result<RemoteOutput, RemoteExecError> {
-                self.0.run(c).await
-            }
-            fn spawn_lines(&self, c: &str) -> Result<LineStream, RemoteExecError> {
-                self.0.commands.lock().unwrap().push(c.to_string());
-                let lines: Vec<std::io::Result<String>> =
-                    self.0.tail_lines.iter().cloned().map(Ok).collect();
-                Ok(Box::pin(futures_util::stream::iter(lines)))
-            }
-            async fn run_bytes(
-                &self,
-                c: &str,
-                stdin: Option<Vec<u8>>,
-            ) -> Result<Vec<u8>, RemoteExecError> {
-                self.0.run_bytes(c, stdin).await
-            }
-        }
-
         let run_id = "run_01COVSNAPSHOT";
         let run_json = format!(r#"{{"run_id":"{run_id}","status":"running"}}"#);
         let mut fake = FakeExec::with_cat_stdout(vec![], run_json);
@@ -8080,6 +8135,187 @@ mod tests {
         let read = conn.unit_coverage(run_id).await.unwrap();
         assert_eq!(String::from_utf8(read.bytes).unwrap(), snapshot);
         assert!(!read.complete, "a non-terminal run's copy is a snapshot");
+    }
+
+    /// Every line of a landed ledger file, parsed.
+    fn landed_lines(path: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    const NETFLOW_BEGIN: &str = r#"{"kind":"begin","v":1,"run_id":"run_01NFPUMP"}"#;
+    const NETFLOW_LINE_RUN: &str = r#"{"kind":"line","ledger":"run_01NFPUMP","line":{"type":"dropped","count":1,"ts":"2026-10-14T00:00:00Z"}}"#;
+    const NETFLOW_LINE_SUB: &str = r#"{"kind":"line","ledger":"sub_01NFCHILD","line":{"type":"dropped","count":2,"ts":"2026-10-14T00:00:01Z"}}"#;
+
+    /// The terminal ledger pull brings the host's netflow stream in the same
+    /// ssh round trip, and the mirror lands it as the terminal `run.json`
+    /// is mirrored (spec 2026-10-14 §N2/§N3): the record is complete, lists
+    /// every ledger the stream carried, and each ledger — a sub-agent's too —
+    /// is a file in the coordinator's global netflow directory.
+    #[tokio::test]
+    async fn terminal_pull_lands_the_netflow_stream_complete() {
+        let run_id = "run_01NFPUMP";
+        let mut fake =
+            FakeExec::with_cat_stdout(vec![], r#"{"status":"completed","final_output":"done."}"#);
+        fake.cat_netflow_stdout = Some(format!(
+            "{NETFLOW_BEGIN}\n{NETFLOW_LINE_RUN}\n{NETFLOW_LINE_SUB}\n"
+        ));
+        let fake = std::sync::Arc::new(fake);
+        let (conn, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake));
+        conn.launch_agent(crate::agent_launcher::AgentLaunchRequest {
+            agent: "sec".into(),
+            prompt: None,
+            mode: None,
+            target: None,
+            working_dir: None,
+            run_id: Some(run_id.into()),
+            findings_profile: None,
+            engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
+            skill_bundle: None,
+            codename: None,
+        })
+        .await
+        .unwrap();
+        wait_until_finished(&run_store, run_id).await;
+
+        let record = rupu_netflow::land::read_landing_record(&run_store.root, run_id)
+            .expect("the terminal pull landed a record");
+        assert_eq!(record.status, rupu_netflow::land::LandingStatus::Complete);
+        assert_eq!(record.host, conn.host_id);
+        assert_eq!(record.reason, None);
+        assert_eq!(record.ledgers, vec!["run_01NFPUMP", "sub_01NFCHILD"]);
+        let netflow_dir = rupu_netflow::global_netflow_dir(tmp.path());
+        // The landing carries each ledger line as raw JSON (key order is not
+        // significant), so compare parsed values, not bytes.
+        assert_eq!(
+            landed_lines(&netflow_dir.join("sub_01NFCHILD.jsonl")),
+            vec![serde_json::json!({"type":"dropped","count":2,"ts":"2026-10-14T00:00:01Z"})],
+            "the sub-agent's ledger lands under its own id, as raw lines"
+        );
+        assert!(netflow_dir.join("run_01NFPUMP.jsonl").exists());
+        assert_eq!(
+            std::fs::read_to_string(conn.mirror.netflow_path(run_id)).unwrap(),
+            format!("{NETFLOW_BEGIN}\n{NETFLOW_LINE_RUN}\n{NETFLOW_LINE_SUB}\n"),
+            "the mirrored stream is the host's file"
+        );
+        let cmds = fake.commands.lock().unwrap();
+        assert!(
+            cmds.iter().any(|c| c == &ledger_pull_command(run_id)),
+            "the netflow stream rides the terminal ledger pull: {cmds:?}"
+        );
+        // Spec §N2: SSH pulls the stream only at the end — nothing reads it
+        // before then, so it is not in the `tail -F` list.
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| c.starts_with("tail ") && c.contains("/netflow.jsonl")),
+            "netflow.jsonl must not be tailed: {cmds:?}"
+        );
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| c.starts_with("cat ") && c.contains("/netflow.jsonl")),
+            "no separate netflow cat: {cmds:?}"
+        );
+    }
+
+    /// The host's `cat` of `netflow.jsonl` failed (an older rupu that writes
+    /// no stream, so the file is absent): the section did not arrive, so no
+    /// copy is written and the mirror records the run `unavailable` at
+    /// terminal — never "the unit made no calls".
+    #[tokio::test]
+    async fn a_netflow_section_that_did_not_arrive_lands_unavailable() {
+        let run_id = "run_01NFABSENT";
+        let mut fake =
+            FakeExec::with_cat_stdout(vec![], r#"{"status":"completed","final_output":"done."}"#);
+        // The host has no file: `cat` exits 1 and prints nothing.
+        fake.ledger_cat_status = (0, 0, 1);
+        let fake = std::sync::Arc::new(fake);
+        let (conn, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake));
+        conn.mirror
+            .create_run(run_id, &conn.host_id, &workflow_spec())
+            .await
+            .unwrap();
+        conn.spawn_tail_pump(run_id.to_string());
+        wait_until_finished(&run_store, run_id).await;
+
+        let record = rupu_netflow::land::read_landing_record(&run_store.root, run_id)
+            .expect("a run that streamed nothing still gets a record");
+        assert_eq!(
+            record.status,
+            rupu_netflow::land::LandingStatus::Unavailable
+        );
+        assert_eq!(
+            record.reason.as_deref(),
+            Some(rupu_netflow::land::NOT_STREAMED_REASON)
+        );
+        assert!(record.ledgers.is_empty());
+        assert!(
+            !conn.mirror.netflow_path(run_id).exists(),
+            "a section that did not arrive writes no mirrored copy"
+        );
+        assert!(
+            !rupu_netflow::global_netflow_dir(tmp.path())
+                .join(format!("{run_id}.jsonl"))
+                .exists(),
+            "nothing lands for a run whose stream never arrived"
+        );
+        assert!(fake
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c == &ledger_pull_command(run_id)));
+    }
+
+    /// The tail stream ENDS (ssh dropped) while the host's record is not yet
+    /// terminal: the fallback still pulls the netflow stream, but the run
+    /// may still be writing it, so the copy is a snapshot. Its ledgers land,
+    /// and the record says `partial` with the reason, so every scope lists
+    /// the run incomplete rather than showing a short copy as whole.
+    #[tokio::test]
+    async fn a_netflow_copy_pulled_before_terminal_lands_partial() {
+        let run_id = "run_01NFSNAP";
+        let run_json = format!(r#"{{"run_id":"{run_id}","status":"running"}}"#);
+        let mut fake = FakeExec::with_cat_stdout(vec![], run_json);
+        let begin = format!(r#"{{"kind":"begin","v":1,"run_id":"{run_id}"}}"#);
+        let line = format!(
+            r#"{{"kind":"line","ledger":"{run_id}","line":{{"type":"dropped","count":1,"ts":"2026-10-14T00:00:00Z"}}}}"#
+        );
+        fake.cat_netflow_stdout = Some(format!("{begin}\n{line}\n"));
+        let exec = std::sync::Arc::new(EndingTailExec(std::sync::Arc::new(fake)));
+        let (conn, run_store, tmp) = make_conn(exec);
+        conn.mirror
+            .create_run(run_id, &conn.host_id, &workflow_spec())
+            .await
+            .unwrap();
+        conn.spawn_tail_pump(run_id.to_string());
+        wait_until_finished(&run_store, run_id).await;
+
+        let record = rupu_netflow::land::read_landing_record(&run_store.root, run_id)
+            .expect("the fallback's finish landed a record");
+        assert_eq!(record.status, rupu_netflow::land::LandingStatus::Partial);
+        assert!(
+            record
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("not terminal")),
+            "the reason names the non-terminal pull: {:?}",
+            record.reason
+        );
+        assert_eq!(record.ledgers, vec![run_id.to_string()]);
+        assert_eq!(
+            landed_lines(
+                &rupu_netflow::global_netflow_dir(tmp.path()).join(format!("{run_id}.jsonl"))
+            ),
+            vec![serde_json::json!({"type":"dropped","count":1,"ts":"2026-10-14T00:00:00Z"})],
+            "a partial copy still lands what it carried"
+        );
     }
 
     /// A terminal catch-up whose `cat` SUCCEEDS with nothing (the file
@@ -10271,22 +10507,27 @@ mod tests {
     /// The ledger pull expands `$HOME` remotely (unquoted run dir, quoted
     /// `"…/$f"`) and frames each file the way `split_batched_cat` reads.
     #[test]
-    fn ledger_pull_command_frames_both_ledgers_under_the_remote_run_dir() {
+    fn ledger_pull_command_frames_every_ledger_under_the_remote_run_dir() {
         let cmd = ledger_pull_command("run_01LEDGER");
         assert_eq!(
             cmd,
-            "for f in usage.jsonl coverage.jsonl; do printf '==> %s <==\\n' \"$f\"; \
+            "for f in usage.jsonl coverage.jsonl netflow.jsonl; do printf '==> %s <==\\n' \"$f\"; \
              cat \"$HOME/.rupu/runs/run_01LEDGER/$f\" 2>/dev/null; \
              printf '\\n==> end %s <==\\n' \"$?\"; done"
         );
         let framed = "==> usage.jsonl <==\n{\"u\":1}\n\n==> end 0 <==\n\
-                      ==> coverage.jsonl <==\n\n==> end 0 <==\n";
+                      ==> coverage.jsonl <==\n\n==> end 0 <==\n\
+                      ==> netflow.jsonl <==\n{\"kind\":\"begin\"}\n\n==> end 0 <==\n";
         let sections = split_ledger_pull(framed);
         assert_eq!(
             sections.get(LEDGER_USAGE).map(String::as_str),
             Some("{\"u\":1}\n")
         );
         assert_eq!(sections.get(LEDGER_COVERAGE).map(String::as_str), Some(""));
+        assert_eq!(
+            sections.get(LEDGER_NETFLOW).map(String::as_str),
+            Some("{\"kind\":\"begin\"}\n")
+        );
     }
 
     /// A section counts only when its trailer carries `cat`'s exit status 0:
