@@ -339,8 +339,8 @@ layers:
 - an agent whose own grants the coordinator did not ship.
 
 On the host, `rupu run --skill-bundle <json>` (hidden) carries the manifest.
-The run copies it into its run directory, so `rupu run --continue` finds the
-same shipped skills.
+The run records it with the rest of its command, so `rupu run --continue`
+runs with the same shipped skills.
 
 ## How an agent uses its skills
 
@@ -375,9 +375,10 @@ unit) gets its skills the same way:
 
 `rupu run --skill <name>` and `--preload-skill <name>` (repeat the flag for
 several) give one run skills on top of its agent's; its `skill_index` records
-them with reason `launch`. `rupu run --continue` without either flag keeps the
-earlier run's launch skills; any skill flag replaces them all. Passing a flag
-is the only way to change them: a continued run can't drop them entirely.
+them with reason `launch`. `rupu run --continue` restores the earlier run's
+launch skills with the rest of its command. `--skill` on the continue replaces
+the whole skill list and `--preload-skill` the whole preload list. Passing a
+flag is the only way to change them: a continued run can't drop them entirely.
 
 A child started with `dispatch` (any kind, or a legacy name like
 `dispatch_agent`) gets its own agent's skills, not its parent's. Sessions

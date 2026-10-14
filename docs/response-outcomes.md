@@ -291,8 +291,10 @@ which model it is continuing on.
 
 - It applies only to a run that ended in failure **with** an outcome recorded.
   A run that failed for another reason (max turns, say) cannot be continued this
-  way. Without `--model` or `--provider`, `--continue` still treats a failed run
-  as finished with an error and refuses it, as before.
+  way. Without `--model` or `--provider` on the continue command, `--continue`
+  still treats a failed run as finished with an error and refuses it, as
+  before. The model and provider a bare `--continue` restores from the original
+  command do not count.
 - `--model` and `--provider` override the agent's own `model:` and `provider:`
   for any `rupu run`, not only a continuation.
 - They also drop the agent's settings that were chosen for its own model. A

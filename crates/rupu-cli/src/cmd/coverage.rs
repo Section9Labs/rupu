@@ -1279,6 +1279,7 @@ fn rerun_args(invocation: &rupu_coverage::RerunInvocation) -> crate::cmd::run::A
         message_space: None,
         participant: None,
         launch: Default::default(),
+        explicit: Default::default(),
     }
 }
 

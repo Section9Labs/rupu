@@ -158,6 +158,12 @@ These apply to every command.
 - [`rupu fleet`](#rupu-fleet)
   - [`rupu fleet install`](#rupu-fleet-install)
   - [`rupu fleet list`](#rupu-fleet-list)
+- [`rupu skill`](#rupu-skill)
+  - [`rupu skill list`](#rupu-skill-list)
+  - [`rupu skill show`](#rupu-skill-show)
+  - [`rupu skill validate`](#rupu-skill-validate)
+  - [`rupu skill install`](#rupu-skill-install)
+  - [`rupu skill update`](#rupu-skill-update)
 - [`rupu findings`](#rupu-findings)
   - [`rupu findings schema`](#rupu-findings-schema)
   - [`rupu findings export`](#rupu-findings-export)
@@ -219,12 +225,14 @@ rupu run [OPTIONS] <AGENT> [TARGET] [PROMPT]
 | `--mode <MODE>` | Override permission mode (`ask` \| `bypass` \| `readonly`) |
 | `--no-stream` | Don't render tokens as they arrive; show each response once it is complete. The request still streams on the wire, so long responses can't hit the request timeout |
 | `--view <VIEW>` | Control live output density (`focused` \| `full`) [possible values: focused, compact, full] |
-| `--into <PATH>` | For `<platform>:<owner>/<repo>` targets: clone into this directory instead of the default `./<repo>/`. The directory must not already exist (refuse-by-default — pass an explicit path you own). Mutually exclusive with `--tmp` |
+| `--into <PATH>` | For `<platform>:<owner>/<repo>` targets: clone into this directory instead of the default `./<repo>/`. The directory must not already exist (refuse-by-default — pass an explicit path you own), except on `--continue`, which reuses the original run's checkout there. Mutually exclusive with `--tmp` |
 | `--tmp` | For `<platform>:<owner>/<repo>` targets: clone into a temporary directory that is auto-deleted on exit. Useful for one-shot agents that produce findings without modifying the repo. Mutually exclusive with `--into` |
 | `--run-id <RUN_ID>` | Pre-assign the run id (so a caller can reference the run before it starts) |
 | `--findings-profile <PROFILE>` | Findings contract for this run (`full` \| `summary`), overriding the agent's `findingsProfile`. A placed workflow unit's coordinator passes its step's resolved profile this way |
 | `--engagement-profile <ID>` | Engagement profile(s) for this run — the asset domain(s) findings are validated against (e.g. `network`, `binary`, or a composite like `pentest`). Repeatable or comma-separated. Empty = the `code` path [aliases: --engagement-profiles] |
-| `--continue <AGENT_RUN_ID>` | Continue an interrupted run of this agent from its transcript instead of starting fresh: the earlier conversation is rebuilt and the agent is told it was interrupted. A run that had already finished prints its recorded answer without calling the model. Run it from the same project as the original run. A sub-agent's `sub_…` id is accepted too (its transcript is found under the run that dispatched it). With `--model` or `--provider`, a run that failed on a provider-side outcome (a refusal, say) is continued too, on that model |
+| `--skill <SKILL>` | A skill this run may load, on top of the agent's own; repeat the flag for several. A coordinator passes a workflow step's `skills:` this way. `--continue` keeps the continued run's unless this is given, which replaces the whole list |
+| `--preload-skill <SKILL>` | A skill whose body goes in this run's system prompt; repeat the flag for several |
+| `--continue <AGENT_RUN_ID>` | Continue an interrupted run of this agent from its transcript instead of starting fresh: the earlier conversation is rebuilt and the agent is told it was interrupted. Every flag and the target the original run was launched with are restored (recorded as `RunStart.launch_args`); a flag given here replaces only its own setting. A repo target reuses the checkout the original run cloned. A run that had already finished prints its recorded answer without calling the model. Run it from the same directory as the original run. With `--model` or `--provider`, a run that failed on a provider-side outcome (a refusal, say) is continued too, on that model |
 | `--model <MODEL>` | Model for this run, overriding the agent's `model:` and the config default |
 | `--provider <PROVIDER>` | Provider for this run, overriding the agent's `provider:` and the config default |
 
@@ -1907,6 +1915,8 @@ rupu session start [OPTIONS] <AGENT> [TARGET] [PROMPT]
 | `--detach` | Start the first turn without auto-attaching |
 | `--view <VIEW>` | Live renderer mode when auto-attaching [possible values: focused, compact, full] |
 | `--engagement-profile <ID>` | Engagement profile(s) every turn of the session runs under — the asset domain(s) findings are validated against (e.g. `network`, `binary`). Repeatable or comma-separated. Empty = the `code` path [aliases: --engagement-profiles] |
+| `--skill <SKILL>` | A skill every turn of the session is given beside the agent's own (`name`, `global:name` or `project:name`). Repeatable |
+| `--preload-skill <SKILL>` | A skill whose instructions go into the session's system prompt. Repeatable |
 
 <a id="rupu-session-list"></a>
 ### `rupu session list`
@@ -2018,16 +2028,17 @@ rupu session prune [OPTIONS]
 Send a follow-up prompt to an existing session
 
 ```
-rupu session send [OPTIONS] <SESSION_ID> <PROMPT>
+rupu session send [OPTIONS] <SESSION_ID> [PROMPT]
 ```
 
 | Argument | Description |
 |---|---|
 | `<SESSION_ID>` | Session id (`ses_<ULID>`), a unique prefix, or a codename |
-| `<PROMPT>` | Follow-up prompt to send as the session's next turn |
+| `[PROMPT]` | Follow-up prompt to send as the session's next turn. Optional when the turn invokes a skill |
 
 | Option | Description |
 |---|---|
+| `--skill <SKILL>` | A skill to invoke in this turn (`name`, `global:name` or `project:name`): any installed skill, granted or not. Its instructions go ahead of the prompt, and the session may load it from then on. Repeatable |
 | `--detach` | Start the turn without auto-attaching |
 | `--view <VIEW>` | Live renderer mode when auto-attaching [possible values: focused, compact, full] |
 
@@ -2393,6 +2404,107 @@ List the agents and workflows the stock fleet ships
 ```
 rupu fleet list [OPTIONS]
 ```
+
+<a id="rupu-skill"></a>
+### `rupu skill`
+
+Agent Skills: install, update, list, show and validate SKILL.md skills
+
+```
+rupu skill [OPTIONS] <COMMAND>
+```
+
+| Subcommand | Description |
+|---|---|
+| [`list`](#rupu-skill-list) | List installed skills in both layers |
+| [`show`](#rupu-skill-show) | Show one skill: frontmatter, files, fingerprints and source. Accepts `global:<name>` / `project:<name>` |
+| [`validate`](#rupu-skill-validate) | Check skills against the Agent Skills format; exit 1 on any failure |
+| [`install`](#rupu-skill-install) | Install skills from a directory, `owner/repo`, a GitHub tree URL, or an https git URL (`#path` narrows to a folder in the repository) |
+| [`update`](#rupu-skill-update) | Re-fetch installed skills from the source they were installed from |
+
+<a id="rupu-skill-list"></a>
+### `rupu skill list`
+
+List installed skills in both layers
+
+```
+rupu skill list [OPTIONS]
+```
+
+| Option | Description |
+|---|---|
+| `--project` | Only the project layer |
+
+<a id="rupu-skill-show"></a>
+### `rupu skill show`
+
+Show one skill: frontmatter, files, fingerprints and source. Accepts `global:<name>` / `project:<name>`
+
+```
+rupu skill show [OPTIONS] <NAME>
+```
+
+| Argument | Description |
+|---|---|
+| `<NAME>` |  |
+
+<a id="rupu-skill-validate"></a>
+### `rupu skill validate`
+
+Check skills against the Agent Skills format; exit 1 on any failure
+
+```
+rupu skill validate [OPTIONS] [NAME]
+```
+
+| Argument | Description |
+|---|---|
+| `[NAME]` |  |
+
+| Option | Description |
+|---|---|
+| `--all` |  |
+
+<a id="rupu-skill-install"></a>
+### `rupu skill install`
+
+Install skills from a directory, `owner/repo`, a GitHub tree URL, or an https git URL (`#path` narrows to a folder in the repository)
+
+```
+rupu skill install [OPTIONS] <SOURCE>
+```
+
+| Argument | Description |
+|---|---|
+| `<SOURCE>` |  |
+
+| Option | Description |
+|---|---|
+| `--ref <GIT_REF>` | Branch, tag or commit to install from |
+| `--skill <SKILLS>` | Install this skill from a source that holds several (repeatable) |
+| `--all` | Install every valid skill in the source |
+| `--list` | List the skills in the source; install nothing |
+| `--project` | Install into the current project's `.rupu/skills` instead of `~/.rupu/skills` |
+| `--force` | Replace installed skills of the same name |
+
+<a id="rupu-skill-update"></a>
+### `rupu skill update`
+
+Re-fetch installed skills from the source they were installed from
+
+```
+rupu skill update [OPTIONS] [NAMES]...
+```
+
+| Argument | Description |
+|---|---|
+| `[NAMES]...` |  |
+
+| Option | Description |
+|---|---|
+| `--all` | Every installed skill with a source record |
+| `--project` | The project layer instead of the global one |
+| `--force` | Replace skills whose installed copy was edited |
 
 <a id="rupu-findings"></a>
 ### `rupu findings`

@@ -507,6 +507,7 @@ async fn a_finished_transcript_stream_is_numbered_resumable_and_ends() {
             customer: None,
             launch_skills: Vec::new(),
             launch_preload_skills: Vec::new(),
+            launch_args: Vec::new(),
         },
         T::AssistantMessage {
             content: "hi".into(),

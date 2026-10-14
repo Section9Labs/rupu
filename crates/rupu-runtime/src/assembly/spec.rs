@@ -81,6 +81,9 @@ pub struct Overrides {
     pub skills: Vec<String>,
     /// The launch's own `preloadSkills:` entries.
     pub preload_skills: Vec<String>,
+    /// `rupu run`'s own arguments with their effective values, recorded as
+    /// `RunStart.launch_args` for `rupu run --continue`.
+    pub launch_args: Vec<String>,
     /// The skills section a session's first turn rendered, sent as it is
     /// instead of one rendered from the run's skills, so every turn's
     /// system prompt is the same bytes. `Some("")` sends none.

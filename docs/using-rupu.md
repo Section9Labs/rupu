@@ -332,7 +332,8 @@ rupu run review-diff --continue run_01J...                       # interrupted: 
 rupu run review-diff --continue run_01J... --model <other-model>  # failed on a refusal / cut-off: try another model
 ```
 
-Run it from the same project as the original run. Which failures can be continued, and
+Run it from the same directory as the original run. A continue restores every flag
+of the original command; a flag you pass replaces just that one. Which failures can be continued, and
 on what, is covered in [response-outcomes.md](response-outcomes.md#continuing-a-failed-run-on-another-model)
 and [agent-format.md](agent-format.md#continuing-an-interrupted-run).
 

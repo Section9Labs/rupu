@@ -80,6 +80,7 @@ fn write_run_transcript(path: &std::path::Path, model: &str) {
         customer: None,
         launch_skills: Vec::new(),
         launch_preload_skills: Vec::new(),
+        launch_args: Vec::new(),
     };
     let usage = rupu_transcript::Event::Usage {
         provider: "internal-vllm".into(),
@@ -281,6 +282,7 @@ async fn usage_priced_only_reports_empty_unpriced_gap() {
                 customer: None,
                 launch_skills: Vec::new(),
                 launch_preload_skills: Vec::new(),
+                launch_args: Vec::new(),
             })
             .unwrap(),
             serde_json::to_string(&rupu_transcript::Event::Usage {
@@ -569,6 +571,7 @@ fn write_run_transcript_for(
         customer: None,
         launch_skills: Vec::new(),
         launch_preload_skills: Vec::new(),
+        launch_args: Vec::new(),
     };
     let usage = rupu_transcript::Event::Usage {
         provider: provider.into(),
@@ -1148,6 +1151,7 @@ fn write_fold_transcript(
         customer: None,
         launch_skills: Vec::new(),
         launch_preload_skills: Vec::new(),
+        launch_args: Vec::new(),
     }];
     for (input, output) in usages {
         events.push(rupu_transcript::Event::Usage {

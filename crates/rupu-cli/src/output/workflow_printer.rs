@@ -4746,6 +4746,7 @@ mod tests {
                     customer: None,
                     launch_skills: Vec::new(),
                     launch_preload_skills: Vec::new(),
+                    launch_args: Vec::new(),
                 },
                 TxEvent::AssistantMessage {
                     content: "Summarized the implementation plan.".into(),
@@ -5180,6 +5181,7 @@ mod tests {
                 customer: None,
                 launch_skills: Vec::new(),
                 launch_preload_skills: Vec::new(),
+                launch_args: Vec::new(),
             },
             TxEvent::AssistantMessage {
                 content: "## Child output\n\n- item one\n- item two".into(),
@@ -5321,6 +5323,7 @@ mod tests {
                 customer: None,
                 launch_skills: Vec::new(),
                 launch_preload_skills: Vec::new(),
+                launch_args: Vec::new(),
             },
             TxEvent::AssistantMessage {
                 content: "## Reviewer output\n\n- looks good".into(),
