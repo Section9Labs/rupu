@@ -246,7 +246,8 @@ fn event_own_ts_ms(ev: &Event) -> Option<i64> {
 
 /// What a history row says about its run, beyond the event: its workflow
 /// (not for an `agent:` record), its project (the workspace directory's
-/// name, as the projects list names it) and the run's codename.
+/// name, as the projects list names it) and the run's codename (derived for
+/// a legacy run, as `GET /api/runs/:id` names it).
 fn run_attribution(run: &RunRecord) -> serde_json::Map<String, serde_json::Value> {
     let mut out = serde_json::Map::new();
     if !run.workflow_name.is_empty() && !run.workflow_name.starts_with("agent:") {
@@ -255,9 +256,8 @@ fn run_attribution(run: &RunRecord) -> serde_json::Map<String, serde_json::Value
     if let Some(name) = run.workspace_path.file_name() {
         out.insert("project".into(), serde_json::json!(name.to_string_lossy()));
     }
-    if let Some(c) = run.codename.as_deref().filter(|c| !c.is_empty()) {
-        out.insert("run_codename".into(), serde_json::json!(c));
-    }
+    let (codename, _) = crate::codename::named(run.codename.as_deref(), &run.id, None);
+    out.insert("run_codename".into(), serde_json::json!(codename));
     out
 }
 
@@ -578,6 +578,30 @@ mod tests {
             collect_recent_events(&store, 10, EventsCursor::None, Some(&query("-group:error")))
                 .unwrap();
         assert!(rows.is_empty());
+    }
+
+    /// A legacy run (no stored codename) is named as `GET /api/runs/:id`
+    /// names it, so `codename:` matches its history as the page matches its
+    /// live frames, which take the run's name from that read.
+    #[test]
+    fn a_legacy_runs_rows_carry_its_derived_codename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        seed_run(&store, "run_old", ts(1_000));
+        write_events(&store, "run_old", &[step_failed("run_old", "scan")]);
+        let (derived, was_derived) = crate::codename::named(None, "run_old", None);
+        assert!(was_derived);
+
+        let rows = collect_recent_events(&store, 10, EventsCursor::None, None).unwrap();
+        assert_eq!(rows[0]["run_codename"], derived.as_str());
+        let rows = collect_recent_events(
+            &store,
+            10,
+            EventsCursor::None,
+            Some(&query(&format!("codename:{derived}"))),
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
     }
 
     #[test]

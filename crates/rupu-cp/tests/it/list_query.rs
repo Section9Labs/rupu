@@ -74,6 +74,32 @@ fn event_groups_match_their_fixture() {
     }
 }
 
+/// Event rows and the queries that keep them, as `GET /api/events` holds
+/// them; `src/lib/query/lists/events.lockstep.test.ts` holds the page's
+/// registry, over the cards it makes of the same rows, to the same answers.
+#[test]
+fn event_rows_match_their_fixture() {
+    let path = format!(
+        "{}/tests/fixtures/list_query/events.matches.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let fixture: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let rows = fixture["rows"].as_array().unwrap();
+    for case in fixture["cases"].as_array().unwrap() {
+        let q = case["q"].as_str().unwrap();
+        let query = rupu_cp::query::ListQuery::parse(Some(q), events::FIELDS)
+            .unwrap()
+            .unwrap();
+        let kept: Vec<Value> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| query.matches(r).unwrap())
+            .map(|(i, _)| Value::from(i))
+            .collect();
+        assert_eq!(Value::Array(kept), case["keep"], "{q}");
+    }
+}
+
 /// A time field matches by time, and only a time field does; an ordered
 /// field compares on its ladder.
 #[test]

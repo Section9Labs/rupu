@@ -1,12 +1,15 @@
-// The Live Events query against the server's: the registry spec and the
-// card group of every event type, as `crates/rupu-cp/tests/fixtures/
-// list_query/` records them. Fix the page, never the fixture.
+// The Live Events query against the server's: the registry spec, the card
+// group of every event type, and which event rows each query keeps, as
+// `crates/rupu-cp/tests/fixtures/list_query/` records them. Fix the page,
+// never the fixture.
 import { describe, expect, it } from 'vitest';
 import type { RunEvent } from '../../api';
 import { cardFromEvent } from '../../situationRoom/cards';
-import { EVENT_FIELDS } from './events';
+import { filterRows } from '../rows';
+import { EVENT_FIELDS, eventRow } from './events';
 import fields from '../../../../../tests/fixtures/list_query/events.fields.json';
 import groups from '../../../../../tests/fixtures/list_query/events.groups.json';
+import matches from '../../../../../tests/fixtures/list_query/events.matches.json';
 
 describe('the Live Events query matches the server', () => {
   it('has the same fields', () => {
@@ -44,5 +47,14 @@ describe('the Live Events query matches the server', () => {
       max_iterations: 2,
     } as unknown as RunEvent;
     expect(cardFromEvent(ev, 0, 'k')?.group).toBe(group);
+  });
+
+  it.each(matches.cases)('$q keeps the rows the server keeps', ({ q, keep }) => {
+    const rows = matches.rows.map((raw, i) => {
+      const ev = raw as unknown as RunEvent;
+      return eventRow(cardFromEvent(ev, raw.ts, String(i))!, ev, {});
+    });
+    const kept = filterRows(rows, q, EVENT_FIELDS, { now: Date.parse('2026-10-14T00:00:00Z') }).rows.map((r) => Number(r.card.key));
+    expect(kept).toEqual(keep);
   });
 });

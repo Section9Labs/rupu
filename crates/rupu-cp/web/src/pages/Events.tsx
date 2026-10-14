@@ -338,11 +338,14 @@ export default function Events() {
     return m;
   }, [items, qItems]);
 
+  // Every loaded event's unit_key, so a card the query keeps is labelled as
+  // fully as the same card unfiltered.
+  const unitKeys = useMemo(() => unitKeyIndex([...items, ...qItems].map((i) => i.event)), [items, qItems]);
+
   const rowsOf = useCallback(
     (list: EventItem[]): EventRow[] => {
       const out: EventRow[] = [];
-      const evs = list.map((i) => i.event);
-      const ctx = { crewByRun: runToCodename, unitKeys: unitKeyIndex(evs), agentUnits: agentUnitIndex(evs) };
+      const ctx = { crewByRun: runToCodename, unitKeys, agentUnits: agentUnitIndex(list.map((i) => i.event)) };
       for (const { key, ts, event } of list) {
         const c = cardFromEvent(event, ts, key, ctx);
         if (!c) continue;
@@ -359,7 +362,7 @@ export default function Events() {
       }
       return out;
     },
-    [runToCodename, runToWs, runToWorkflow, wsById, historyAttribution],
+    [runToCodename, unitKeys, runToWs, runToWorkflow, wsById, historyAttribution],
   );
 
   const eventRows = useMemo(() => rowsOf(items), [rowsOf, items]);

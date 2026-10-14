@@ -241,6 +241,17 @@ describe('Live Events: the query line', () => {
     expect(screen.queryByText('scan warning')).not.toBeInTheDocument();
   });
 
+  it("a card the query keeps names its unit from every loaded event, not only the query's", async () => {
+    const unit = { type: 'unit_started', run_id: 'run_u', step_id: 'sweep', index: 2, unit_key: 'repo-delta', codename: 'cobalt-harbor/heron#3', transcript_path: '/t/2.jsonl', ts: 1_000, pos: 0 } as TimedRunEvent;
+    const agent = { type: 'agent_started', run_id: 'run_u', step_id: 'sweep', unit_index: 2, codename: 'cobalt-harbor/heron#3', agent: 'recon', agent_run_id: 'run_a', transcript_path: '/t/2.jsonl', ts: 2_000, pos: 1 } as TimedRunEvent;
+    vi.spyOn(api, 'getEvents').mockImplementation(async (_l, _t, _r, _p, q) => (q ? [agent] : [unit, agent]));
+    vi.spyOn(api, 'subscribeEvents').mockImplementation(() => () => {});
+
+    renderAt('/events?q=type:agent_started');
+    await waitFor(() => expect(screen.getByText('1 events')).toBeInTheDocument());
+    expect(screen.getByText('repo-delta')).toBeInTheDocument();
+  });
+
   it('pages the filtered history with the query', async () => {
     const page = Array.from({ length: 200 }, (_, i) => stepFailed(`run_${i}`, 200_000 - i * 1000, i));
     const oldest = page[page.length - 1];

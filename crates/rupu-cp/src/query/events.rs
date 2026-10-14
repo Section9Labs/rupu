@@ -2,7 +2,9 @@
 //! `Event` plus `ts`, `pos` and its run's attribution: `workflow`,
 //! `project`, `run_codename`). The Live Events page evaluates the same
 //! registry over its stream cards, live frames and findings included
-//! (`web/src/lib/query/lists/events.ts`).
+//! (`web/src/lib/query/lists/events.ts`), reading an event card's own keys;
+//! `tests/fixtures/list_query/events.matches.json` holds both to the same
+//! answers.
 
 use std::borrow::Cow;
 
