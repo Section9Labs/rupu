@@ -82,6 +82,14 @@ impl HostConnector for StubLocal {
     async fn get_transcript(&self, _: &str) -> Result<serde_json::Value, HostConnectorError> {
         unimplemented!()
     }
+    async fn land_run_netflow(
+        &self,
+        _run_id: &str,
+        _terminal: bool,
+        _runs_root: &std::path::Path,
+    ) -> Result<rupu_cp::host::connector::NetflowLanding, HostConnectorError> {
+        Ok(rupu_cp::host::connector::NetflowLanding::NotNeeded)
+    }
     async fn unit_coverage(
         &self,
         _run_id: &str,

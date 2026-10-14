@@ -423,7 +423,7 @@ A skill's content entered the conversation. Written for every load, whichever pa
 | `layer`        | string | `global` or `project` |
 | `content_hash` | string | sha256 over the skill's files' paths, modes and bytes: the version that was loaded. A `preload` load's is taken when the run resolves its skills, so it is the version of the body in `run_start.system_prompt` |
 | `base_dir`     | string | The skill's directory, which its relative file references resolve against |
-| `via`          | string | `model` (a `skills.load` call), `preload` (at run start), `operator` (`rupu session send --skill` put its body in the turn's message; written at run start), `reattach` (put back after a compaction) or `continuation` (carried over from the run this one continues) |
+| `via`          | string | `model` (a `skills.load` call), `preload` (at run start), `operator` (a `/name` token at the start of the prompt, or `rupu session send --skill`, put its body in the turn's message; written at run start), `reattach` (put back after a compaction) or `continuation` (carried over from the run this one continues) |
 
 ```json
 {"type":"skill_load","data":{"name":"pdf","layer":"global","content_hash":"4b1e…","base_dir":"/home/me/.rupu/skills/pdf","via":"model"}}

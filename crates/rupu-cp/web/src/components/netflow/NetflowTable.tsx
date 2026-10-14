@@ -48,9 +48,9 @@ export interface NetflowTableProps {
   droppedTotal: number;
   /** Sources that own part of this scope's traffic but could not be read
    *  (`NetflowResponse.incomplete`). Non-empty means this list is short by
-   *  an unknown amount — a run placed on a remote host keeps its ledger
-   *  there, so an empty local answer for one is "we could not look", not
-   *  "no traffic". Rendered as a loud banner on BOTH the empty and the
+   *  an unknown amount — a remote host's flows reach this machine only
+   *  when its unit or run finishes, so a gap here (still running, or not
+   *  collected) is "we could not look", not "no traffic". Rendered as a loud banner on BOTH the empty and the
    *  populated path, unlike `droppedTotal`'s honesty-on-demand popover:
    *  a whole missing source changes what the numbers shown MEAN. */
   incomplete?: IncompleteSource[];

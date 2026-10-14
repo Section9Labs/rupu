@@ -17,7 +17,8 @@ mod pins;
 mod spec;
 
 pub use origin::{
-    defaults_for, CoverageStream, Origin, OriginDefaults, ParentRun, UnitKey, UsageRoot,
+    defaults_for, CoverageStream, NetflowStreamRoot, Origin, OriginDefaults, ParentRun, UnitKey,
+    UsageRoot,
 };
 pub use messaging::{MessagingGrant, OffReason};
 pub use pins::PinRule;
@@ -570,6 +571,13 @@ impl RunAssembler {
             }
         };
 
+        // The coordinator-launched root's netflow stream this run tees into
+        // (spec 2026-10-14 remote netflow transport §N1), when that stream
+        // has been begun: a process child's link names its root; else the
+        // origin's own (`Standalone`), its workflow run's or its in-process
+        // parent's. A site that built the sink itself owns that decision,
+        // but the stream is still recorded for the run's children.
+        let netflow_stream = self.netflow_stream(&spec, &d);
         // The run's netflow sink — built before the provider, which takes it.
         let (sink, netflow) = match spec.services.netflow.clone() {
             Some(sink) => (sink, None),
@@ -579,6 +587,7 @@ impl RunAssembler {
                     self.ctx.project_root.as_deref(),
                     &spec.run_id,
                     &spec.transcript_path,
+                    netflow_stream.clone(),
                 );
                 (netflow.sink.clone(), Some(netflow))
             }
@@ -742,6 +751,7 @@ impl RunAssembler {
                 coverage_writer: None,
                 coverage_catalog: None,
                 coverage_stream: coverage_stream.clone(),
+                netflow_stream,
                 netflow_sink: Some(sink),
                 net_capture: self.ctx.net_capture.clone(),
                 customer: self.ctx.customer.clone(),
@@ -937,6 +947,44 @@ impl RunAssembler {
 }
 
 impl RunAssembler {
+    /// The netflow stream the run `spec` tees its ledger lines into (spec
+    /// 2026-10-14 remote netflow transport §N1), if its root has begun one.
+    /// The candidate, in order: a `LaunchLink`'s root (its usage root's
+    /// directory); then by origin, the run's own directory (`Standalone`),
+    /// its workflow run's, or its in-process parent's stream under this
+    /// run's id. A session turn, a flow lead or a flow unit without a link
+    /// tees nowhere. `None` unless the candidate has a `begin` line.
+    fn netflow_stream(
+        &self,
+        spec: &LaunchSpec,
+        d: &OriginDefaults,
+    ) -> Option<rupu_netflow::NetflowStream> {
+        let runs = self.ctx.global.join("runs");
+        match (&spec.link, d.netflow_stream, &spec.origin) {
+            (Some(link), _, _) => crate::netflow::link_stream(link, &spec.run_id),
+            (None, NetflowStreamRoot::Own, _) => {
+                crate::netflow::stream_for(&runs.join(&spec.run_id), &spec.run_id)
+            }
+            (
+                None,
+                NetflowStreamRoot::WorkflowRun,
+                Origin::WorkflowStep {
+                    workflow_run_id, ..
+                },
+            ) if !workflow_run_id.is_empty() => {
+                crate::netflow::stream_for(&runs.join(workflow_run_id), &spec.run_id)
+            }
+            (None, NetflowStreamRoot::Parent, Origin::SubAgent { parent }) => parent
+                .netflow_stream
+                .as_ref()
+                .map(|s| rupu_netflow::NetflowStream {
+                    path: s.path.clone(),
+                    ledger_id: spec.run_id.clone(),
+                }),
+            _ => None,
+        }
+    }
+
     /// The run's bus on its message space (spec F1a): the one the site
     /// handed it (an agentiflow's lead and units, a child sharing its
     /// parent's), else one on its origin's own space. Whether the run takes
@@ -1219,6 +1267,34 @@ pub async fn resolve_operator_skills(
             }
         }
         Ok(invoked)
+    })
+    .await
+    .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))
+}
+
+/// The skills an operator's `prompt` invokes with leading `/skill` tokens
+/// ([`rupu_skills::resolve_slash`]), resolved against `dirs` and `held` as
+/// [`resolve_operator_skills`] resolves `--skill` entries, and the prompt
+/// after them. A prompt that starts with no `/` reads no skills directory.
+pub async fn resolve_slash_skills(
+    dirs: &rupu_skills::LayerDirs,
+    held: &[rupu_skills::FrozenSkill],
+    prompt: &str,
+) -> Result<rupu_skills::SlashTurn, AssembleError> {
+    if !prompt.trim_start().starts_with('/') {
+        return Ok(rupu_skills::SlashTurn {
+            invoked: Vec::new(),
+            prompt: prompt.to_owned(),
+        });
+    }
+    let (dirs, held, prompt) = (dirs.clone(), held.to_vec(), prompt.to_owned());
+    tokio::task::spawn_blocking(move || {
+        let failed = |source: rupu_agent::SkillCheckError| AssembleError::Skills {
+            source,
+            looked_in: dirs.clone(),
+        };
+        let catalog = rupu_skills::SkillCatalog::discover(&dirs).map_err(|e| failed(e.into()))?;
+        rupu_skills::resolve_slash(&catalog, &held, &prompt).map_err(|e| failed(e.into()))
     })
     .await
     .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))

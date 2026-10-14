@@ -155,8 +155,9 @@ export interface HostRollup {
  *  that could not be read.
  *
  *  Non-empty `incomplete` means the flows shown are INCOMPLETE by an unknown
- *  amount. A run placed on a remote host keeps its ledger there, so a
- *  local-only answer for one is not "no traffic", it is "we could not look" —
+ *  amount. A remote host's flows reach this machine only when its unit or
+ *  run finishes (and may fail to be collected), so a gap is not "no
+ *  traffic", it is "we could not look" —
  *  which is why this is rendered loudly rather than left to a popover. */
 export interface IncompleteSource {
   host_id: string;

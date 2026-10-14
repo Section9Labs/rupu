@@ -6,7 +6,9 @@
 
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { api, apiErrorMessage, skillNamesOf, type LaunchMode, type PreviewBody } from '../lib/api';
+import { api, apiErrorMessage, skillNamesOf, type LaunchMode, type PreviewBody, type SkillRow } from '../lib/api';
+import SlashSkillTextarea from './session/SlashSkillTextarea';
+import { slashSkillsOf } from '../lib/slashSkills';
 import { ChipsInput } from './agentBuilder/controls';
 import TargetPicker from './TargetPicker';
 import HostSelect from './HostSelect';
@@ -53,7 +55,7 @@ export default function AgentLauncherSheet({
   const [error, setError] = useState<string | null>(null);
   const [skills, setSkills] = useState<string[]>([]);
   const [preloadSkills, setPreloadSkills] = useState<string[]>([]);
-  const [skillNames, setSkillNames] = useState<string[]>([]);
+  const [skillRows, setSkillRows] = useState<SkillRow[]>([]);
   // Which customer/accounts the launch would use, and whether it would fail.
   const [billing, setBilling] = useState<BillingState>({ customer: undefined, blocked: false });
   const previewBody = useMemo<PreviewBody>(
@@ -72,14 +74,14 @@ export default function AgentLauncherSheet({
   const remoteHost = host !== 'local';
   useEffect(() => {
     if (remoteHost) {
-      setSkillNames([]);
+      setSkillRows([]);
       return;
     }
     let cancelled = false;
     api
       .getSkills(skillsWsId)
       .then((rows) => {
-        if (!cancelled) setSkillNames(skillNamesOf(rows));
+        if (!cancelled) setSkillRows(rows);
       })
       .catch(() => {
         // Non-fatal — the Skills section just has no suggestions.
@@ -88,7 +90,8 @@ export default function AgentLauncherSheet({
       cancelled = true;
     };
   }, [skillsWsId, remoteHost]);
-  const skillSuggestions = ['*', 'project:*', ...skillNames];
+  const skillSuggestions = useMemo(() => ['*', 'project:*', ...skillNamesOf(skillRows)], [skillRows]);
+  const slashSkills = useMemo(() => slashSkillsOf(skillRows), [skillRows]);
 
   // Esc-to-close; focus the dialog on open for keyboard users.
   useEffect(() => {
@@ -204,12 +207,13 @@ export default function AgentLauncherSheet({
             <span className="mb-1 block text-ui font-semibold uppercase tracking-wide text-ink-dim">
               Prompt
             </span>
-            <textarea
+            <SlashSkillTextarea
               value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
+              onChange={setPrompt}
+              skills={slashSkills}
               disabled={launching}
               rows={4}
-              placeholder="Describe what the agent should do…"
+              placeholder={slashSkills.length > 0 ? 'Describe what the agent should do… (/ for skills)' : 'Describe what the agent should do…'}
               aria-label="Prompt"
               className={fieldCls + ' resize-y'}
             />

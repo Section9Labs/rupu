@@ -33,6 +33,7 @@ mod remote_coverage_ingest;
 mod remote_engagement;
 mod remote_findings_profile;
 mod remote_messaging;
+mod remote_netflow_roster;
 mod remote_permission_mode;
 mod remote_skills;
 mod run_customer;

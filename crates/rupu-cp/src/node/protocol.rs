@@ -367,6 +367,15 @@ pub const CAP_MIRROR_COVERAGE: &str = "mirror.coverage";
 /// `GET /api/runs/:id/coverage`.
 pub const CAP_RUN_COVERAGE_STREAM: &str = "run.coverage_stream";
 
+/// `Welcome.capabilities` entry: this CP mirrors [`ArtifactFile::Netflow`];
+/// a node sends netflow frames only to a CP that advertised it (spec
+/// 2026-10-14-rupu-remote-netflow-transport-design.md §N2).
+pub const CAP_MIRROR_NETFLOW: &str = "mirror.netflow";
+
+/// HTTP `/api/host/info` `features` entry: this CP serves
+/// `GET /api/runs/:id/netflow/stream` (spec 2026-10-14 §N2).
+pub const CAP_RUN_NETFLOW_STREAM: &str = "run.netflow_stream";
+
 /// HTTP `/api/host/info` `features` entry: this CP serves
 /// `GET /api/findings/artifacts/:sha256` from its artifact store.
 pub const CAP_FINDINGS_ARTIFACT_BLOB: &str = "findings.artifact_blob";
@@ -376,6 +385,7 @@ pub fn cp_capabilities() -> Vec<String> {
     vec![
         CAP_USAGE_LEDGER.to_string(),
         CAP_MIRROR_COVERAGE.to_string(),
+        CAP_MIRROR_NETFLOW.to_string(),
     ]
 }
 
@@ -436,6 +446,7 @@ pub fn host_features() -> Vec<String> {
         CAP_SESSION_SKILLS.to_string(),
         CAP_WORKFLOW_RESUME_IF_UNFINISHED.to_string(),
         CAP_RUN_COVERAGE_STREAM.to_string(),
+        CAP_RUN_NETFLOW_STREAM.to_string(),
         CAP_FINDINGS_ARTIFACT_BLOB.to_string(),
         CAP_RUN_LIST.to_string(),
         CAP_RUN_CODENAME.to_string(),
@@ -513,6 +524,11 @@ pub enum ArtifactFile {
     /// to a CP that advertised [`CAP_MIRROR_COVERAGE`] — an older CP fails to
     /// parse an unknown variant.
     Coverage,
+    /// The run's netflow stream (`runs/<run_id>/netflow.jsonl`, spec
+    /// 2026-10-14-rupu-remote-netflow-transport-design.md §N1). Sent only to
+    /// a CP that advertised [`CAP_MIRROR_NETFLOW`] — an older CP fails to
+    /// parse an unknown variant.
+    Netflow,
 }
 
 #[cfg(test)]
@@ -1198,5 +1214,28 @@ mod tests {
         };
         let back: Frame = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
         assert_eq!(back, f);
+    }
+
+    #[test]
+    fn netflow_artifact_file_is_advertised_and_round_trips() {
+        assert_eq!(
+            serde_json::to_string(&ArtifactFile::Netflow).unwrap(),
+            "\"netflow\""
+        );
+        let f = Frame::Artifact {
+            run_id: "run_1".into(),
+            file: ArtifactFile::Netflow,
+            line: r#"{"kind":"begin","v":1,"run_id":"run_1"}"#.into(),
+        };
+        let back: Frame = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
+        assert_eq!(back, f);
+        assert!(cp_capabilities().iter().any(|c| c == CAP_MIRROR_NETFLOW));
+        assert!(host_features().iter().any(|f| f == CAP_RUN_NETFLOW_STREAM));
+        assert!(
+            !bucket_worker_capabilities()
+                .iter()
+                .any(|c| c == CAP_MIRROR_NETFLOW),
+            "a bucket worker is not a mirroring CP"
+        );
     }
 }
