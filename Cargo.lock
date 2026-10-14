@@ -4766,6 +4766,7 @@ dependencies = [
  "insta",
  "jsonschema",
  "quick-xml 0.36.2",
+ "rupu-query",
  "rustix 1.1.4",
  "serde",
  "serde_json",
@@ -4814,6 +4815,7 @@ dependencies = [
  "rupu-netflow",
  "rupu-orchestrator",
  "rupu-providers",
+ "rupu-query",
  "rupu-runtime",
  "rupu-scm",
  "rupu-skills",
@@ -5023,6 +5025,16 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "rupu-query"
+version = "0.83.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

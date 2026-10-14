@@ -31,6 +31,7 @@ glob.workspace = true
 sha2.workspace = true
 rustix.workspace = true
 quick-xml = { workspace = true, optional = true }
+rupu-query.workspace = true
 
 [dev-dependencies]
 serde_path_to_error.workspace = true

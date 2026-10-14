@@ -755,29 +755,16 @@ pub fn remote_aggregate_reason(host_id: &str) -> String {
     format!("host {host_id} can't be filtered by customer: its totals are summed remotely")
 }
 
-/// Keep the remote `rows` whose `customer` matches `filter`. `None` when any
-/// row lacks the `customer` key, or carries a value that is neither a string
-/// nor `null` (the host can't say whose that run is — never read as "no
-/// customer"); a `null` value is "no customer". An empty page is filterable
-/// and stays empty.
-pub fn filter_remote_rows(
-    rows: Vec<serde_json::Value>,
-    filter: &CustomerFilter,
-) -> Option<Vec<serde_json::Value>> {
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        let customer = match row.as_object()?.get("customer")? {
-            serde_json::Value::Null => None,
-            serde_json::Value::String(s) => Some(s.as_str()),
-            // A slug is a string: anything else is a row this coordinator
-            // cannot read, not "no customer".
-            _ => return None,
-        };
-        if filter.matches(customer) {
-            out.push(row);
-        }
+/// A wire row's customer: `Some(Some(slug))`, `Some(None)` for `null` (no
+/// customer), and `None` when the row lacks the key or carries a value that
+/// is neither a string nor `null` — the host can't say whose that run is,
+/// never read as "no customer".
+pub fn row_customer(row: &serde_json::Value) -> Option<Option<&str>> {
+    match row.as_object()?.get("customer")? {
+        serde_json::Value::Null => Some(None),
+        serde_json::Value::String(s) => Some(Some(s.as_str())),
+        _ => None,
     }
-    Some(out)
 }
 
 /// Record `r`'s worker as a host that can't report a customer for every
@@ -890,6 +877,11 @@ mod tests {
             json!({"id": "a", "customer": "acme"}),
             json!({"id": "n", "customer": null}),
         ];
+        let filter_remote_rows = |rows: Vec<serde_json::Value>, f: &CustomerFilter| {
+            crate::query::RowFilter::new(Some(f.clone()), None)
+                .retain(rows)
+                .ok()
+        };
         assert_eq!(filter_remote_rows(rows.clone(), &acme).unwrap().len(), 1);
         assert_eq!(filter_remote_rows(rows, &none).unwrap()[0]["id"], "n");
         for bad in [

@@ -1,0 +1,18 @@
+[package]
+name = "rupu-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+thiserror.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

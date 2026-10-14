@@ -22,6 +22,7 @@ pub mod net;
 pub mod node;
 pub mod pagination;
 pub mod path_guard;
+pub mod query;
 pub mod repos;
 pub mod server;
 pub mod session_mutator;

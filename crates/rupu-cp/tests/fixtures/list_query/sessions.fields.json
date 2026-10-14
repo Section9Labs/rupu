@@ -1,0 +1,14 @@
+[
+  {"aliases":[],"facet":true,"key":"status","kind":"enum","match":"exact","text":false,"values":["idle","running","failed","stopped"]},
+  {"aliases":[],"facet":true,"key":"agent","kind":"text","match":"contains","text":true,"values":[]},
+  {"aliases":[],"facet":true,"key":"model","kind":"text","match":"contains","text":false,"values":[]},
+  {"aliases":[],"facet":true,"key":"provider","kind":"text","match":"exact","text":false,"values":[]},
+  {"aliases":[],"facet":false,"key":"codename","kind":"text","match":"contains","text":true,"values":[]},
+  {"aliases":[],"facet":false,"key":"id","kind":"text","match":"prefix","text":true,"values":[]},
+  {"aliases":[],"facet":true,"key":"host","kind":"text","match":"exact","text":false,"values":[]},
+  {"aliases":[],"facet":true,"key":"customer","kind":"text","match":"exact","text":false,"values":[]},
+  {"aliases":["workspace"],"facet":true,"key":"project","kind":"text","match":"exact","text":false,"values":[]},
+  {"aliases":[],"facet":true,"key":"is","kind":"enum","match":"exact","text":false,"values":["active","archived"]},
+  {"aliases":[],"facet":false,"key":"since","kind":"time","match":"since","text":false,"values":[]},
+  {"aliases":[],"facet":false,"key":"until","kind":"time","match":"until","text":false,"values":[]}
+]
