@@ -18,7 +18,8 @@ use axum::{
     Json, Router,
 };
 use rupu_orchestrator::{
-    executor::Event, runs::RunStore, workflow_edges, workflow_has_explicit_edges, Workflow,
+    executor::Event, runs::RunStore, workflow_edges, workflow_has_explicit_edges,
+    StepResultRecord, Workflow,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
@@ -97,7 +98,10 @@ fn build_run_graph_json(
     };
 
     // 4. Step results and unit checkpoints — missing files = empty vecs.
-    let step_results = store.read_step_results(id).unwrap_or_default();
+    let mut step_results = store.read_step_results(id).unwrap_or_default();
+    if step_results.is_empty() {
+        step_results.extend(agent_run_result(&run));
+    }
     let checkpoints = store.read_unit_checkpoints(id).unwrap_or_default();
 
     // 5. Merge in units that exist only in the event stream.
@@ -712,6 +716,33 @@ pub fn agent_run_dag(workflow_name: &str) -> StepDag {
         }],
         edges: vec![],
     }
+}
+
+/// The step result of [`agent_run_dag`]'s node: a bare agent run records
+/// none, and no events, so this is the only way its node reaches the
+/// transcript `rupu run` wrote. `None` for a workflow run.
+fn agent_run_result(run: &rupu_orchestrator::RunRecord) -> Option<StepResultRecord> {
+    Some(StepResultRecord {
+        step_id: "agent".to_string(),
+        run_id: run.id.clone(),
+        transcript_path: run.agent_run_transcript()?,
+        output: run.final_output.clone().unwrap_or_default(),
+        success: run.status == rupu_orchestrator::RunStatus::Completed,
+        skipped: false,
+        rendered_prompt: String::new(),
+        kind: Default::default(),
+        items: Vec::new(),
+        findings: Vec::new(),
+        iterations: 0,
+        resolved: true,
+        finished_at: run.finished_at.unwrap_or(run.started_at),
+        loop_iteration: None,
+        run_outcome: None,
+        host: None,
+        codename: None,
+        error: run.error_message.clone(),
+        cause: run.cause.clone(),
+    })
 }
 
 /// Synthesize a single-node [`StepDag`] for a [`RunLocation::Unpersisted`]

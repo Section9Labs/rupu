@@ -556,7 +556,7 @@ fn collect_local_sources(
             workflow,
             agent: agent_run.unwrap_or_default().to_string(),
             session_id: None,
-            transcript_path: agent_run.map(|_| r.transcript_dir.join(format!("{}.jsonl", r.id))),
+            transcript_path: r.agent_run_transcript(),
             rows,
             partial: u.partial,
             price,
