@@ -10,6 +10,7 @@ import { MemoryRouter } from 'react-router-dom';
 import { api, type TemplateSummary } from '../lib/api';
 
 import CoverageTemplates from './CoverageTemplates';
+import { commitQuery } from '../components/query/queryTestUtils';
 import { scopedEntry, withCustomerScope } from '../lib/customerScopeTestUtils';
 
 const TEMPLATE: TemplateSummary = {
@@ -86,5 +87,37 @@ describe('CoverageTemplates — under a customer scope', () => {
     expect(await screen.findByRole('note')).toHaveTextContent(
       'Concern templates aren’t per customer — every customer shares this catalog.',
     );
+  });
+});
+
+describe('CoverageTemplates query line', () => {
+  const ROWS: TemplateSummary[] = [
+    TEMPLATE,
+    { name: 'stride', version: 1, description: 'Threat categories.', concern_count: 6, severity_breakdown: { medium: 4, low: 2 } },
+    { name: 'cwe-top-25', version: 3, description: 'Most dangerous weaknesses.', concern_count: 25, severity_breakdown: { high: 25 } },
+  ];
+  const mount = (entry: string) =>
+    render(<MemoryRouter initialEntries={[entry]}>{withCustomerScope(<CoverageTemplates />)}</MemoryRouter>);
+  const names = () => ['owasp-top-10', 'stride', 'cwe-top-25'].filter((n) => screen.queryByText(n) !== null);
+
+  it('narrows the table to the query in ?q=', async () => {
+    vi.spyOn(api, 'getCoverageTemplates').mockResolvedValue(ROWS);
+    mount('/coverage/templates?q=severity>=high version:3 -owasp');
+    await waitFor(() => expect(names()).toEqual(['cwe-top-25']));
+    expect(screen.getByTestId('query-count')).toHaveTextContent('1 of 3');
+  });
+
+  it('narrows the table as a query is committed', async () => {
+    vi.spyOn(api, 'getCoverageTemplates').mockResolvedValue(ROWS);
+    mount('/coverage/templates');
+    await waitFor(() => expect(names()).toHaveLength(3));
+    commitQuery('Filter templates', 'severity<high');
+    await waitFor(() => expect(names()).toEqual(['owasp-top-10', 'stride']));
+  });
+
+  it('says so when the query keeps nothing', async () => {
+    vi.spyOn(api, 'getCoverageTemplates').mockResolvedValue(ROWS);
+    mount('/coverage/templates?q=name:pci');
+    expect(await screen.findByText('No templates match the filter.')).toBeInTheDocument();
   });
 });

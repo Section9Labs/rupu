@@ -1,6 +1,6 @@
 // Global coverage Templates page — bundled concern templates (target-independent).
 // Route: /coverage/templates
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { ArrowLeft } from 'lucide-react';
 import { api, type TemplateSummary, type TemplateDetail } from '../lib/api';
@@ -10,6 +10,8 @@ import { ErrorBanner } from '../components/ui/ErrorBanner';
 import { Spinner } from '../components/ui/Spinner';
 import { SEVERITY_STYLE, type Severity } from '../lib/severity';
 import { UnscopedNote } from '../components/customers/UnscopedNote';
+import { ListQueryBar, NoMatches, useFilteredRows, useListQuery } from '../components/query/ListQueryBar';
+import { TEMPLATE_FIELDS } from '../lib/query/lists/templates';
 
 // Severity columns, most → least severe.
 const SEV_COLS: Severity[] = ['critical', 'high', 'medium', 'low', 'info'];
@@ -32,6 +34,10 @@ export default function CoverageTemplates() {
       cancelled = true;
     };
   }, []);
+
+  const [q, setQ] = useListQuery();
+  const loaded = useMemo(() => templates ?? [], [templates]);
+  const { rows, error: queryError, facets } = useFilteredRows(loaded, q, TEMPLATE_FIELDS);
 
   return (
     <div className="p-8">
@@ -59,8 +65,25 @@ export default function CoverageTemplates() {
         </div>
       ) : (
         <section className="mt-6">
-          <SectionHeader tone="muted" label="Templates" count={templates.length} />
-          <TemplatesTable templates={templates} />
+          <ListQueryBar
+            value={q}
+            onChange={setQ}
+            fields={TEMPLATE_FIELDS}
+            facets={facets}
+            total={loaded.length}
+            shown={rows.length}
+            error={queryError}
+            label="Filter templates"
+            placeholder="Filter templates… e.g. severity>=high owasp"
+          />
+          {rows.length === 0 && loaded.length > 0 ? (
+            <NoMatches noun="templates" />
+          ) : (
+            <>
+              <SectionHeader tone="muted" label="Templates" count={rows.length} />
+              <TemplatesTable templates={rows} />
+            </>
+          )}
         </section>
       )}
     </div>
