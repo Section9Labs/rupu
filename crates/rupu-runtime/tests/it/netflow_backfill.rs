@@ -98,10 +98,14 @@ async fn a_run_end_copies_a_transcript_only_flow_into_the_ledger_once() {
         0
     );
     assert_eq!(ledger_hosts(&paths.flows).len(), 1);
+    // The writer counted no loss, so there is none to take back.
+    assert!(!std::fs::read_to_string(&paths.flows)
+        .unwrap()
+        .contains("recovered"));
 }
 
 #[test]
-fn a_backfill_skips_flows_the_ledger_has_keeps_their_completions_and_mends_a_torn_tail() {
+fn a_backfill_restores_only_lost_flows_with_their_completions_and_loss_count() {
     let dir = tempfile::tempdir().unwrap();
     let paths = NetflowPaths::for_run(&dir.path().join("netflow"), "run_x");
     paths.ensure_dir().unwrap();
@@ -112,7 +116,13 @@ fn a_backfill_skips_flows_the_ledger_has_keeps_their_completions_and_mends_a_tor
         "kept.example",
     ))))
     .unwrap();
-    // The lost flow's line was dropped but its completion got through.
+    // The writer lost two lines: the lost flow's, and one more it never
+    // recovers. The flow's completion got through.
+    let dropped = serde_json::to_string(&rupu_netflow::LedgerLine::Dropped {
+        count: 2,
+        ts: chrono::Utc::now(),
+    })
+    .unwrap();
     let complete = serde_json::to_string(&rupu_netflow::LedgerLine::Complete {
         id: lost,
         bytes_in: 4096,
@@ -121,7 +131,7 @@ fn a_backfill_skips_flows_the_ledger_has_keeps_their_completions_and_mends_a_tor
     .unwrap();
     std::fs::write(
         &paths.flows,
-        format!("{line}\n{complete}\n{{\"type\":\"flow\",\"id\""),
+        format!("{line}\n{complete}\n{dropped}\n{{\"type\":\"flow\",\"id\""),
     )
     .unwrap();
     let transcript = dir.path().join("run_x.jsonl");
@@ -132,12 +142,12 @@ fn a_backfill_skips_flows_the_ledger_has_keeps_their_completions_and_mends_a_tor
         rupu_runtime::netflow::backfill_ledger(&paths, &transcript).unwrap(),
         1
     );
-    let flows: Vec<(String, String, Option<u64>, Option<u64>)> =
-        rupu_netflow::ledger::read_flows(&paths.flows)
-            .unwrap()
-            .into_iter()
-            .map(|f| (f.id.to_string(), f.host, f.bytes_in, f.duration_ms))
-            .collect();
+    let (flows, dropped) = rupu_netflow::ledger::read_flows_and_dropped(&paths.flows).unwrap();
+    assert_eq!(dropped, 1);
+    let flows: Vec<(String, String, Option<u64>, Option<u64>)> = flows
+        .into_iter()
+        .map(|f| (f.id.to_string(), f.host, f.bytes_in, f.duration_ms))
+        .collect();
     assert_eq!(
         flows,
         vec![

@@ -137,6 +137,7 @@ impl LedgerSummary {
                 }
             }
             FoldEvent::Dropped(n) => self.dropped += n,
+            FoldEvent::Recovered(n) => self.dropped = self.dropped.saturating_sub(*n),
             FoldEvent::Capture(c) => self.capture.push(c.clone()),
         }
     }
@@ -448,7 +449,7 @@ impl NetflowIndex {
             match ev {
                 FoldEvent::Flow(f) => resident.rows.push(*f),
                 FoldEvent::Patch { index, patch } => resident.rows.patch(index, &patch),
-                FoldEvent::Dropped(_) | FoldEvent::Capture(_) => {}
+                FoldEvent::Dropped(_) | FoldEvent::Recovered(_) | FoldEvent::Capture(_) => {}
             }
         }
         e.offset += used as u64;

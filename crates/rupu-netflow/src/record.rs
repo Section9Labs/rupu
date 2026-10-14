@@ -159,6 +159,14 @@ pub enum LedgerLine {
         count: u64,
         ts: DateTime<Utc>,
     },
+    /// `count` of the records a `Dropped` line above counted are back: the
+    /// run's end copied those flows from its transcript
+    /// (`rupu_runtime::netflow::backfill_ledger`). Never more than the
+    /// `Dropped` lines above it count, less the `Recovered` lines between.
+    Recovered {
+        count: u64,
+        ts: DateTime<Utc>,
+    },
     /// Finalizes a socket flow at close. Separate from `Complete` (the
     /// HTTP streamed-body finalizer) so the HTTP path is untouched. Any
     /// `Some` field overwrites the flow; `None` leaves it as written.
@@ -244,6 +252,10 @@ mod tests {
             LedgerLine::Dropped {
                 count: 7,
                 ts: chrono::Utc.timestamp_opt(1_700_000_001, 0).unwrap(),
+            },
+            LedgerLine::Recovered {
+                count: 2,
+                ts: chrono::Utc.timestamp_opt(1_700_000_002, 0).unwrap(),
             },
         ];
         for line in lines {

@@ -109,7 +109,9 @@ pub fn for_run(
 /// body's final size and duration are only in the ledger's `complete` (or
 /// `socket_complete`) line: one that reached the ledger without its flow
 /// line is appended again after the flow, and one that was lost too stays
-/// lost. A ledger whose last line is torn (a writer killed mid-line) gets
+/// lost. The ledger's `dropped` lines counted the flows it restores, so it
+/// ends with a `recovered` line taking them back off, never more than those
+/// lines still count. A ledger whose last line is torn (a writer killed mid-line) gets
 /// a newline first, so the torn line stays the only bad one.
 ///
 /// A run can record hundreds of thousands of flows, so both files are
@@ -129,10 +131,19 @@ pub fn backfill_ledger(
         return Ok(0);
     }
     let mut torn = false;
+    let mut unrecovered = 0u64;
     let mut patches: HashMap<rupu_netflow::FlowId, Vec<Vec<u8>>> = HashMap::new();
     for_each_line(&paths.flows, |line| {
         torn = line.last() != Some(&b'\n');
-        let Ok(LedgerIdLine { kind, id: Some(id) }) = serde_json::from_slice(line) else {
+        let Ok(LedgerIdLine { kind, id, count }) = serde_json::from_slice(line) else {
+            return;
+        };
+        match (kind, count) {
+            (LedgerKind::Dropped, Some(n)) => unrecovered += n,
+            (LedgerKind::Recovered, Some(n)) => unrecovered = unrecovered.saturating_sub(n),
+            _ => {}
+        }
+        let Some(id) = id else {
             return;
         };
         match kind {
@@ -179,6 +190,7 @@ pub fn backfill_ledger(
     if let Some(e) = failed {
         return Err(e);
     }
+    ledger.recovered(unrecovered.min(added as u64))?;
     ledger.flush()?;
     Ok(added)
 }
@@ -216,6 +228,21 @@ impl Appender<'_> {
         Ok(())
     }
 
+    /// A `recovered` line, so the ledger's dropped count stops counting
+    /// `count` flows it holds again.
+    fn recovered(&mut self, count: u64) -> std::io::Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        let line = rupu_netflow::LedgerLine::Recovered {
+            count,
+            ts: chrono::Utc::now(),
+        };
+        serde_json::to_writer(&mut self.buf, &line)?;
+        self.buf.push(b'\n');
+        Ok(())
+    }
+
     fn flush(&mut self) -> std::io::Result<()> {
         if self.buf.is_empty() {
             return Ok(());
@@ -247,14 +274,18 @@ struct LedgerIdLine {
     kind: LedgerKind,
     #[serde(default)]
     id: Option<rupu_netflow::FlowId>,
+    #[serde(default)]
+    count: Option<u64>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Clone, Copy, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum LedgerKind {
     Flow,
     Complete,
     SocketComplete,
+    Dropped,
+    Recovered,
     #[serde(other)]
     Other,
 }
