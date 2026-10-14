@@ -293,6 +293,44 @@ async fn collect_netflow(
     }
 }
 
+/// Why a unit that never ran on its host has no netflow.
+const NEVER_STARTED_REASON: &str = "the unit never started on the host";
+
+/// Record that a placed unit never ran on `host`, so its netflow roster line
+/// does not read "not collected yet" forever (spec 2026-10-14 §N3): no run
+/// means no stream and no mirror to land one, and the runner named the unit
+/// in the roster before dispatch. An `unavailable` record with the reason.
+/// Should the host turn out to have run it after all, a later mirror landing
+/// still wins: a record is never downgraded, and `unavailable` → `complete`
+/// is an upgrade. Best-effort: a failure is logged.
+async fn record_never_started(runs_root: &Path, run_id: &str, host: &str) {
+    let (root, id, host) = (
+        runs_root.to_path_buf(),
+        run_id.to_string(),
+        host.to_string(),
+    );
+    let written = tokio::task::spawn_blocking(move || {
+        rupu_netflow::land::land_and_record(
+            &root,
+            &id,
+            &host,
+            None,
+            false,
+            Some(NEVER_STARTED_REASON.to_string()),
+        )
+    })
+    .await;
+    match written {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            tracing::warn!(run_id, error = %e, "could not record that the unit never started")
+        }
+        Err(e) => {
+            tracing::warn!(run_id, error = %e, "could not record that the unit never started")
+        }
+    }
+}
+
 // ── Workspace-delta bridge ──────────────────────────────────────────────────
 //
 // The orchestrator's `WorkspaceDelta` is opaque: `payload` is whatever the
@@ -927,19 +965,30 @@ impl UnitDispatcher for FleetUnitDispatcher {
         unit: UnitDispatch,
         host: &str,
     ) -> Result<UnitOutcome, UnitFailure> {
-        let conn = self.resolver.resolve(host)?;
+        let unit_run_id = unit.run_id.clone();
         let mut warnings = Vec::new();
         let mut unit = unit;
-        let result = match self.ship_unit_skills(&conn, &unit, &mut warnings).await {
-            Ok(Some(shipped)) => {
-                unit.skills = shipped.skills;
-                unit.preload_skills = shipped.preload_skills;
-                self.launch_and_wait(&conn, unit, host, Some(shipped.manifest))
-                    .await
-            }
-            Ok(None) => self.launch_and_wait(&conn, unit, host, None).await,
+        let result = match self.resolver.resolve(host) {
+            Ok(conn) => match self.ship_unit_skills(&conn, &unit, &mut warnings).await {
+                Ok(Some(shipped)) => {
+                    unit.skills = shipped.skills;
+                    unit.preload_skills = shipped.preload_skills;
+                    self.launch_and_wait(&conn, unit, host, Some(shipped.manifest))
+                        .await
+                }
+                Ok(None) => self.launch_and_wait(&conn, unit, host, None).await,
+                Err(e) => Err(e.into()),
+            },
             Err(e) => Err(e.into()),
         };
+        // A unit that never ran on its host (`NotLaunched`: an unknown host,
+        // a refused skill shipment, a staging or launch error, a run the
+        // host never showed) has no stream for `collect_netflow` to land.
+        // Say so where the read side looks. A local unit has no roster line
+        // and its ledgers are already here.
+        if host != "local" && matches!(&result, Err(f) if f.coverage == UnitCoverage::NotLaunched) {
+            record_never_started(&self.runs_root, &unit_run_id, host).await;
+        }
         // Every warning names the host: the ones built here (skills) and the
         // ones `launch_and_wait` collected (netflow). `prefix_host` is
         // idempotent, so one already named is left alone.
@@ -4165,6 +4214,132 @@ steps:
             "{:?}",
             out.warnings
         );
+    }
+
+    // ── A unit that never ran on its host ─────────────────────────────────────
+    //
+    // The runner names every placed attempt in the netflow roster before it
+    // dispatches it. One that never starts on the host (a refused launch, a
+    // skill shipment that failed, a run the host never showed) has no stream
+    // to land and no mirror to land it, so without a record its roster line
+    // would read "not collected yet" forever. The dispatcher records why.
+
+    const NEVER_STARTED: &str = "the unit never started on the host";
+
+    fn never_started_record(runs_root: &Path, run_id: &str) -> rupu_netflow::land::LandingRecord {
+        rupu_netflow::land::read_landing_record(runs_root, run_id)
+            .expect("a unit that never started has a landing record")
+    }
+
+    #[tokio::test]
+    async fn a_launch_failure_records_why_no_netflow_landed() {
+        let g = tempfile::tempdir().unwrap();
+        let runs_root = g.path().join("runs");
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::new(UnreachableConnector),
+            g.path().to_path_buf(),
+            None,
+        )
+        .with_runs_root(runs_root.clone());
+        let err = d.dispatch_unit(make_unit(), "h1").await.unwrap_err();
+        assert_eq!(err.coverage, UnitCoverage::NotLaunched);
+        let rec = never_started_record(&runs_root, "r");
+        assert_eq!(rec.status, rupu_netflow::land::LandingStatus::Unavailable);
+        assert_eq!(rec.reason.as_deref(), Some(NEVER_STARTED));
+        assert_eq!(rec.host, "h1");
+        assert!(rec.ledgers.is_empty());
+        // The error already says the unit never started; no second warning.
+        assert!(
+            netflow_warnings(&err.warnings).is_empty(),
+            "{:?}",
+            err.warnings
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_skill_shipment_records_why_no_netflow_landed() {
+        let g = coordinator(true);
+        let runs_root = g.path().join("runs");
+        let conn = shipping(ShipScript::Unreachable("pipe broke"));
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            g.path().to_path_buf(),
+            None,
+        )
+        .with_runs_root(runs_root.clone());
+        let err = d.dispatch_unit(make_unit(), "h").await.unwrap_err();
+        assert_eq!(err.coverage, UnitCoverage::NotLaunched);
+        assert!(conn.launched.lock().unwrap().is_none(), "no launch");
+        let rec = never_started_record(&runs_root, "r");
+        assert_eq!(rec.status, rupu_netflow::land::LandingStatus::Unavailable);
+        assert_eq!(rec.reason.as_deref(), Some(NEVER_STARTED));
+        assert_eq!(rec.host, "h");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_run_that_never_started_records_why_no_netflow_landed() {
+        let g = tempfile::tempdir().unwrap();
+        let runs_root = g.path().join("runs");
+        let mut fake = FakeConnector::completed_after_startup_delay(u32::MAX);
+        fake.netflow = Some(rupu_cp::host::connector::NetflowLanding::ByMirror);
+        let conn = Arc::new(fake);
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            g.path().to_path_buf(),
+            None,
+        )
+        .with_runs_root(runs_root.clone());
+        let err = d.dispatch_unit(make_unit(), "h1").await.unwrap_err();
+        assert!(err.error.to_string().contains("never registered"));
+        assert_eq!(err.coverage, UnitCoverage::NotLaunched);
+        // Nothing to land, so the connector is not asked; the record is the
+        // dispatcher's own.
+        assert!(conn.netflow_calls.lock().unwrap().is_empty());
+        let rec = never_started_record(&runs_root, "r");
+        assert_eq!(rec.status, rupu_netflow::land::LandingStatus::Unavailable);
+        assert_eq!(rec.reason.as_deref(), Some(NEVER_STARTED));
+    }
+
+    /// The host may have run the unit after all (the dispatcher gave up on
+    /// a start it could not see): a mirror landing that got there first, or
+    /// turns up later, wins — the record is never downgraded.
+    #[tokio::test]
+    async fn a_never_started_record_does_not_downgrade_a_complete_landing() {
+        let g = tempfile::tempdir().unwrap();
+        let runs_root = g.path().join("runs");
+        let path = rupu_netflow::land::landing_record_path(&runs_root, "r");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let complete = landing_record(rupu_netflow::land::LandingStatus::Complete, None);
+        std::fs::write(&path, serde_json::to_vec(&complete).unwrap()).unwrap();
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::new(UnreachableConnector),
+            g.path().to_path_buf(),
+            None,
+        )
+        .with_runs_root(runs_root.clone());
+        let err = d.dispatch_unit(make_unit(), "h1").await.unwrap_err();
+        assert_eq!(err.coverage, UnitCoverage::NotLaunched);
+        let rec = never_started_record(&runs_root, "r");
+        assert_eq!(rec.status, rupu_netflow::land::LandingStatus::Complete);
+        assert_eq!(rec.ledgers, vec!["run_x".to_string()]);
+    }
+
+    /// A local unit's ledgers are already here and it has no roster line, so
+    /// there is nothing to explain.
+    #[tokio::test]
+    async fn a_local_unit_that_never_launched_records_nothing() {
+        let g = tempfile::tempdir().unwrap();
+        let runs_root = g.path().join("runs");
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::new(UnreachableConnector),
+            g.path().to_path_buf(),
+            None,
+        )
+        .with_runs_root(runs_root.clone());
+        let err = d.dispatch_unit(make_unit(), "local").await.unwrap_err();
+        assert_eq!(err.coverage, UnitCoverage::NotLaunched);
+        assert!(rupu_netflow::land::read_landing_record(&runs_root, "r").is_none());
+        assert!(!runs_root.exists(), "no run directory is made for it");
     }
 
     #[test]

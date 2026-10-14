@@ -1244,6 +1244,52 @@ fn local_runners() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// What a run's launcher does before the run's record turns terminal:
+/// [`RunStore::add_before_terminal`] registers one, and the runner of this
+/// process runs every registered hook once, in registration order, right
+/// before its final write of a terminal status (`run_workflow`), or at the
+/// end of the run's reject cleanup (`run_reject_cleanup`, whose record is
+/// already `Rejected`). A pause runs none: the run has not ended. A workflow
+/// root's launcher finishes the root's own netflow this way, so a
+/// coordinator that pulls the stream on a terminal `run.json` gets the whole
+/// of it (spec 2026-10-14 remote netflow transport §N2).
+pub type BeforeTerminal =
+    Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
+
+/// The before-terminal hooks of runs this process is executing, keyed like
+/// [`LOCAL_RUNNERS`] by run directory. Taken by the runner that ends the run.
+static BEFORE_TERMINAL: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, Vec<BeforeTerminal>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn before_terminal_hooks(
+) -> std::sync::MutexGuard<'static, std::collections::HashMap<PathBuf, Vec<BeforeTerminal>>> {
+    BEFORE_TERMINAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl RunStore {
+    /// Register `hook` to run before `run_id`'s record turns terminal (see
+    /// [`BeforeTerminal`]). A launcher that outlives the runner's pass takes
+    /// what it registered back with [`RunStore::take_before_terminal`] once
+    /// the run is paused or failed to start, and does the work itself.
+    pub fn add_before_terminal(&self, run_id: &str, hook: BeforeTerminal) {
+        before_terminal_hooks()
+            .entry(self.root.join(run_id))
+            .or_default()
+            .push(hook);
+    }
+
+    /// Every hook registered for `run_id` that has not run, in registration
+    /// order; none is registered afterwards.
+    pub fn take_before_terminal(&self, run_id: &str) -> Vec<BeforeTerminal> {
+        before_terminal_hooks()
+            .remove(&self.root.join(run_id))
+            .unwrap_or_default()
+    }
+}
+
 /// A runner of this process executing a run — held for the runner's whole
 /// lifetime ([`RunStore::claim_runner`], [`RunStore::register_runner`]).
 /// Dropping it unregisters the runner.
