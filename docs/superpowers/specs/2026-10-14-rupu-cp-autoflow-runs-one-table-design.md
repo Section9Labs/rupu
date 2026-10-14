@@ -43,13 +43,15 @@ table, newest first, row click opens the run.
 - **Filter bar**: the Workflows status pills (All / Running / Completed /
   Failed·Rejected / Archived), `HostSelect allowAll`, the find box, Refresh.
   When the unified query bar lands it replaces the pills and find box, with
-  the workflow-run fields (which then include `autoflow`, `issue`, `pr`) plus
-  the attempt fields.
-- **Columns**: Status, Autoflow, Workflow, Issue, Run, Trigger, Host, In,
-  Out, Cached, Cost, Turns, Duration, Started, Customer (as Workflows), row
-  actions (Archive / Delete, as Workflows; none on attempt rows).
-  - **Autoflow**: the autoflow's name. Clicking it narrows the table to that
-    autoflow (a removable chip in the filter bar).
+  the workflow-run fields plus `issue`, `pr` and the attempt fields.
+- **Columns**: Status, Workflow, Issue, Run, Trigger, Host, In, Out, Cached,
+  Cost, Turns, Duration, Started, Customer (as Workflows), row actions
+  (Archive / Delete, as Workflows; none on attempt rows).
+  - **Workflow** is the autoflow: an autoflow is a workflow with an
+    `autoflow:` block, and both launch sites record the workflow's name as the
+    autoflow's (`autoflow.rs`, `autoflow_name: Some(<workflow>.name)`), so the
+    mock's separate Autoflow column would repeat it. Clicking the name narrows
+    the table to that autoflow (a removable chip in the filter bar).
   - **Issue**: the issue's display ref linking to the tracker, plus a PR link
     when the run opened one. `—` for an autoflow with no issue (cron).
 - **Run rows**: identical to Workflows; click opens `/runs/:id`.
@@ -78,8 +80,7 @@ table, newest first, row click opens the run.
 
 ```
 autoflow: null | {
-  name: string,                 // run_envelope.json → autoflow.name
-  issue_ref?: string,           // RunRecord.issue_ref
+  issue_ref?: string,           // run_envelope.json → autoflow.claim_id, else RunRecord.issue_ref
   issue_display_ref?: string,   // the claim for issue_ref
   issue_url?: string,           // the claim for issue_ref
   pr_url?: string,              // the claim, only when its last_run_id is this run
@@ -103,8 +104,13 @@ autoflow: null | {
 ### `GET /api/runs/autoflows/runs`
 
 Same parameters as `/api/runs/workflows` (`lifecycle`, `host`, `since` /
-`until`, `customer`, `offset` / `limit`), plus `autoflow=<name>` until the
-query bar's `autoflow:` field replaces it. Returns, newest first and paged
+`until`, `customer`, `offset` / `limit`), plus `workflow=<name>` until the
+query bar's `workflow:` field replaces it.
+
+Note: `/api/runs/workflows` lists MANUAL runs only (`workflow_only` drops any
+run with an `event` or `source_wake_id`), so autoflow runs never appear on
+Runs → Workflows; this endpoint is their only list. It reads all runs
+(`RunKind::All`) and keeps those whose `autoflow` is non-null. Returns, newest first and paged
 after merging:
 
 - **Run rows**: workflow runs whose `autoflow` is non-null.
@@ -124,7 +130,7 @@ after merging:
   assignment; otherwise it carries no customer keys and is not shown under a
   scope.
 - **Remote hosts**: run rows via the existing `HostConnector::list_runs`
-  (workflow kind), filtered coordinator-side to rows with a non-null
+  (`RunKind::All`), filtered coordinator-side to rows with a non-null
   `autoflow`; a host whose rows lack the key answers 501 (shown
   "unavailable"). Attempt rows via the existing `list_autoflow_events`, which
   covers only that host's newest events — the same limit today's page has. A
@@ -176,13 +182,14 @@ remote run's panel says claim actions are local-only.
 ## Coordination with the unified-filter work
 
 - This work owns `RunListRow.autoflow`, landing in a small first PR.
-- `autoflow:`, `issue:`, `pr:` go into the workflow-run registries
-  (`crates/rupu-cp/src/query/workflow_runs.rs`, its fixture
-  `crates/rupu-cp/tests/fixtures/list_query/workflow_runs.fields.json`, web
-  `lib/query/lists/workflowRuns.ts`), so Runs → Workflows can filter by
-  autoflow too. Whichever of the two PRs merges second adds them.
-- The autoflow runs endpoint's `?q=` uses `rupu-query` and `WORKFLOW_RUN_FIELDS`
-  plus the attempt fields; no autoflow-only grammar.
+- Runs → Workflows lists manual runs only, so its rows always carry
+  `autoflow: null`; `issue:` / `pr:` are useless there. They go in an
+  autoflow-runs registry that extends the workflow-run one
+  (`WORKFLOW_RUN_FIELDS` + `issue`, `pr`, and the attempt fields), owned by
+  this work and added after PR B lands. (Revises the earlier agreement to put
+  them in the workflow-run registry.)
+- The autoflow runs endpoint's `?q=` uses `rupu-query` with that registry; no
+  autoflow-only grammar.
 
 ## Delivery
 
@@ -200,7 +207,7 @@ Server (`rupu-cp` `tests/it`, `rupu-runtime`):
   claim's last run.
 - `/api/runs/autoflows/runs`: runs and attempts merged newest first and paged
   after the merge; an attempt whose run exists is not listed twice; lifecycle,
-  `since`/`until`, `customer` and `autoflow` filters; a remote host whose rows
+  `since`/`until`, `customer` and `workflow` filters; a remote host whose rows
   lack `autoflow` → 501.
 - `/api/runs/autoflows/problems`: grouping, counts, first/last seen, events
   older than an hour dropped, events naming a workflow excluded.
@@ -208,7 +215,7 @@ Server (`rupu-cp` `tests/it`, `rupu-runtime`):
 
 Web (vitest):
 - One table; attempt row with no run id expands with the error and claim
-  actions; attempt row with a run id links to the run; clicking an autoflow
+  actions; attempt row with a run id links to the run; clicking a workflow
   name filters; the strip renders and hides when empty; per-host
   "unavailable" for a 501.
 - `AutoflowPanel` shows Requeue / Release for a local run, not for a remote
