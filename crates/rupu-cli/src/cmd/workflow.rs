@@ -3760,11 +3760,17 @@ pub(crate) async fn resume_run(
     // ledger every step's sink independently resolves to. The writer
     // handle is intentionally left unheld — the sink Arc lives on inside
     // `mcp_registry` for as long as this resumed run needs it.
+    // A resumed run tees into the stream it was launched under: its link's
+    // root, else its own already-begun stream (spec 2026-10-14 remote
+    // netflow transport §N1; a host-side resume never writes a second
+    // `begin`).
+    let launch_link = store.read_launch_link(run_id);
     let (netflow_sink, _netflow_handle) = crate::netflow_sink::for_run(
         &global,
         project_root.as_deref(),
         run_id,
         &transcripts.join(format!("{run_id}.jsonl")),
+        crate::netflow_sink::root_stream(&global, launch_link.as_ref(), run_id),
     );
     let mcp_registry =
         Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg, netflow_sink).await);
@@ -3830,7 +3836,7 @@ pub(crate) async fn resume_run(
             // refuse gated workflows), so it keeps the workflow's own scope.
             scope_name_override: None,
             launcher: Some(Arc::new(rupu_launch::Launchers::local(&global, &cfg)?)),
-            link: store.read_launch_link(run_id),
+            link: launch_link.clone(),
             // The root codename it was launched under, as recorded.
             codename: record.codename.as_deref().and_then(|c| c.parse().ok()),
         })?;
@@ -4752,12 +4758,19 @@ async fn run_with_outcome(
     let run_id = run_id_override
         .clone()
         .unwrap_or_else(|| format!("run_{}", Ulid::new()));
+    // A coordinator-launched root (`--run-id`, no `--launch-*` link) begins
+    // its netflow stream before any flow is recorded; every step and unit
+    // then tees into it (spec 2026-10-14 remote netflow transport §N1).
+    if run_id_override.is_some() && overlay.link.is_none() {
+        crate::netflow_sink::start_root_stream(&global, &run_id);
+    }
     let transcripts_dir = paths::transcripts_dir(&global, project_root.as_deref());
     let (netflow_sink, _netflow_handle) = crate::netflow_sink::for_run(
         &global,
         project_root.as_deref(),
         &run_id,
         &transcripts_dir.join(format!("{run_id}.jsonl")),
+        crate::netflow_sink::root_stream(&global, overlay.link.as_ref(), &run_id),
     );
 
     // Build the SCM/issue registry once for the entire workflow run.
@@ -5549,6 +5562,7 @@ async fn execute_workflow_invocation(
         ctx.project_root.as_deref(),
         &run_id,
         &transcripts.join(format!("{run_id}.jsonl")),
+        crate::netflow_sink::root_stream(&global, overlay.link.as_ref(), &run_id),
     );
     let mcp_registry =
         Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg, netflow_sink).await);

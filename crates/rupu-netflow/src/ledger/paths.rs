@@ -18,6 +18,10 @@ const NETFLOW_GITIGNORE: &str = "\
 pub struct NetflowPaths {
     pub root: PathBuf,
     pub flows: PathBuf,
+    /// The coordinator-launched root's stream every ledger line is also
+    /// teed into (spec 2026-10-14 remote netflow transport §N1); `None` =
+    /// the ledger alone.
+    pub stream: Option<crate::stream::NetflowStream>,
 }
 
 /// The project-local candidate ledger directory `project_root` would
@@ -125,7 +129,14 @@ impl NetflowPaths {
         Self {
             root: netflow_dir.to_path_buf(),
             flows: netflow_dir.join(format!("{run_id}.jsonl")),
+            stream: None,
         }
+    }
+
+    /// Tee every ledger line this writer writes into `stream` (spec §N1).
+    pub fn with_stream(mut self, stream: Option<crate::stream::NetflowStream>) -> Self {
+        self.stream = stream;
+        self
     }
 
     /// Create the ledger directory and make sure it is self-ignoring.

@@ -7760,11 +7760,14 @@ async fn run_compact_request(
     // `request.transcript_path`, RunStart/RunComplete below), so its sink
     // must not outlive it. See `crate::netflow_sink::for_run`'s doc
     // comment for the "one sink per run, never per daemon" rule.
+    // A session tees into no coordinator stream (spec 2026-10-14 remote
+    // netflow transport §N1: `SessionTurn` is never a placed root).
     let (netflow_sink, netflow_handle) = crate::netflow_sink::for_run(
         global,
         session.project_root.as_deref(),
         &request.run_id,
         &request.transcript_path,
+        None,
     );
 
     let provider_config = provider_factory::ProviderConfig::for_agent(
@@ -8303,11 +8306,14 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
     // reintroduce exactly the "first turn wins" defect this plan removes.
     // Must be built before the SCM registry / provider below so both take
     // this turn's real sink rather than a `NullSink` placeholder.
+    // A session tees into no coordinator stream (spec 2026-10-14 remote
+    // netflow transport §N1: `SessionTurn` is never a placed root).
     let (netflow_sink, netflow_handle) = crate::netflow_sink::for_run(
         &global,
         session.project_root.as_deref(),
         &args.run_id,
         &transcript_path,
+        None,
     );
 
     // Everything below that can fail via `?` is wrapped in this block so

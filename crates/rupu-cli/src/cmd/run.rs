@@ -820,9 +820,13 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             match prepared {
                 Continuation::Finished { output } => {
                     // This run records nothing, but it is still a
-                    // `rupu run`: start its stream so a coordinator reads
-                    // "nothing recorded", not "host can't stream".
+                    // `rupu run`: start its streams so a coordinator reads
+                    // "nothing recorded", not "host can't stream" (the
+                    // netflow one only for a root — spec 2026-10-14 §N1).
                     start_coverage_stream(&coverage_stream, &run_id);
+                    if args.run_id.is_some() && args.launch.link().is_none() {
+                        crate::netflow_sink::start_root_stream(&global, &run_id);
+                    }
                     println!("{output}");
                     eprintln!(
                         "run {prev} had already finished — printed its recorded answer without calling the model"
@@ -860,6 +864,16 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     // "nothing recorded". Written after the `--continue` checks, which must
     // not touch a run's files before they pass.
     start_coverage_stream(&coverage_stream, &run_id);
+    // The netflow stream follows the same rule, for a ROOT only: a run a
+    // coordinator launched (`--run-id`) that no other run launched (no
+    // `--launch-*` link). A launched child tees into its root's stream
+    // instead, and a terminal `rupu run` tees nowhere (spec 2026-10-14
+    // remote netflow transport §N1).
+    let launch_link = args.launch.link();
+    if args.run_id.is_some() && launch_link.is_none() {
+        crate::netflow_sink::start_root_stream(&global, &run_id);
+    }
+    let netflow_stream = crate::netflow_sink::root_stream(&global, launch_link.as_ref(), &run_id);
     if let Some(m) = &skill_bundle {
         let dir = global.join("runs").join(&run_id);
         paths::ensure_dir(&dir)?;
@@ -893,8 +907,13 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     // `shutdown()`, so the writer task's own periodic ticker is the
     // primary safety net, but a clean CLI exit should still flush
     // promptly rather than rely on that ticker's multi-second cadence).
-    let (netflow_sink, netflow_handle) =
-        crate::netflow_sink::for_run(&global, project_root.as_deref(), &run_id, &transcript_path);
+    let (netflow_sink, netflow_handle) = crate::netflow_sink::for_run(
+        &global,
+        project_root.as_deref(),
+        &run_id,
+        &transcript_path,
+        netflow_stream,
+    );
 
     // Everything below that can generate outbound HTTP (provider build,
     // SCM registry discovery, repo clone, the agent run itself) is wrapped
@@ -1135,7 +1154,6 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         // ledger. No event sink — bare `rupu run` uses the
         // `LineStreamPrinter`, which renders children from the parent
         // transcript's tool calls.
-        let launch_link = args.launch.link();
         let launcher = rupu_launch::Launchers::local(&global, &assembler.context().config)?
             .launcher(
                 Arc::clone(&assembler),

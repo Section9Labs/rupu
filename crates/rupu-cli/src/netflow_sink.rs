@@ -26,17 +26,53 @@ use std::path::Path;
 use std::sync::Arc;
 
 /// Build the netflow sink for one run — [`rupu_runtime::netflow::for_run`]
-/// (see there; the run assembler calls it for every run it builds).
+/// (see there; the run assembler calls it for every run it builds). `stream`
+/// is the root's netflow stream the ledger is teed into ([`root_stream`]),
+/// `None` for a run that tees nowhere (a session turn, an agentiflow).
 pub fn for_run(
     global: &Path,
     project_root: Option<&Path>,
     run_id: &str,
     transcript_path: &Path,
+    stream: Option<rupu_netflow::NetflowStream>,
 ) -> (
     Arc<dyn rupu_netflow::FlowSink>,
     Option<rupu_netflow::NetflowWriterHandle>,
 ) {
-    rupu_runtime::netflow::for_run(global, project_root, run_id, transcript_path)
+    rupu_runtime::netflow::for_run(global, project_root, run_id, transcript_path, stream)
+}
+
+/// Begin a coordinator-launched root's netflow stream,
+/// `<global>/runs/<run_id>/netflow.jsonl` (spec 2026-10-14 remote netflow
+/// transport §N1): a `rupu run` or `rupu workflow run` given `--run-id` and
+/// no launch link. The `begin` line goes first, even if the run records no
+/// flows — its absence is how a coordinator tells "this host can't stream"
+/// from "nothing recorded". A failure is logged, never returned: capture
+/// must not fail the run.
+pub fn start_root_stream(global: &Path, run_id: &str) {
+    let path = rupu_netflow::stream::stream_path(&global.join("runs"), run_id);
+    if let Err(e) = rupu_netflow::stream::write_stream_begin(&path, run_id) {
+        tracing::warn!(
+            error = %e,
+            path = %path.display(),
+            "could not start this run's netflow stream; a coordinator will report its flows as not collected"
+        );
+    }
+}
+
+/// The stream a `rupu run` / `rupu workflow run` (or resume) tees into: a
+/// launched run's root, named by its link's usage root, else the run's own
+/// directory. `Some` only when that stream has a `begin` line, so a run
+/// beneath a root that doesn't tee tees nowhere either (spec §N1).
+pub fn root_stream(
+    global: &Path,
+    link: Option<&rupu_runtime::argv::LaunchLink>,
+    run_id: &str,
+) -> Option<rupu_netflow::NetflowStream> {
+    match link {
+        Some(link) => rupu_runtime::netflow::link_stream(link, run_id),
+        None => rupu_runtime::netflow::stream_for(&global.join("runs").join(run_id), run_id),
+    }
 }
 
 /// The process's one subprocess network-capture backend, obtained OFF the
@@ -116,8 +152,8 @@ mod tests {
         rupu_transcript::JsonlWriter::create(&t_a).unwrap();
         rupu_transcript::JsonlWriter::create(&t_b).unwrap();
 
-        let (sink_a, h_a) = for_run(&global, None, "run-a", &t_a);
-        let (sink_b, h_b) = for_run(&global, None, "run-b", &t_b);
+        let (sink_a, h_a) = for_run(&global, None, "run-a", &t_a, None);
+        let (sink_b, h_b) = for_run(&global, None, "run-b", &t_b, None);
 
         rupu_netflow::FlowSink::record(sink_a.as_ref(), flow("a.example")).await;
         rupu_netflow::FlowSink::record(sink_b.as_ref(), flow("b.example")).await;
