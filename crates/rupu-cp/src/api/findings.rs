@@ -632,49 +632,94 @@ pub fn tag_findings_across(
 }
 
 /// The set of run ids a finding may be attributed to, for a Findings-tab query
-/// scoped to `parent`. A `for_each` / `panel` unit runs as its own sub-run, so
-/// its findings carry the UNIT's run id (`declared_by.run_id`), not `parent` —
-/// a bare parent match drops them.
+/// scoped to `parent` — a workflow run, a `rupu run`, or an agentiflow (`af_…`).
+/// A finding carries the run id of the agent that declared it
+/// (`declared_by.run_id`): a step's agent run, a fan-out or panel unit, a
+/// launched child of any kind, a flow's unit — never the root's. So the set is
+/// everything that ran as part of `parent`, down the whole tree:
+///   - an agentiflow's units, from its own `children.jsonl` (and the legacy
+///     `units/` mirrors) — a flow is not a [`RunStore`] run;
+///   - each id's launch tree, the way its netflow is read
+///     ([`crate::api::netflow::netflow_ids`]: steps, fan-out items, sub-agents,
+///     every child ledger below, a launched workflow expanded like the root,
+///     and the sub-runs a remote unit landed);
+///   - each workflow run's units still running ([`live_unit_ids`]), which no
+///     step result names yet.
 ///
-/// The set is `parent` unioned with every sub-run id we can resolve, from TWO
-/// sources so a **running** run is covered, not just a finished one:
-///   1. unit checkpoints — durable, but written only when a unit COMPLETES;
-///   2. the parent's `events.jsonl` — written LIVE: each `UnitStarted` /
-///      `StepWorking` carries the unit's `transcript_path`, whose file stem is
-///      the unit's run id. This is what catches in-flight units (and panel
-///      units, which are never checkpointed at all — see `graph.rs`).
-///
-/// Without (2), the Findings tab shows nothing for an in-progress run even
-/// though the findings are already on disk.
-pub fn resolve_run_scope(store: &RunStore, parent: &str) -> HashSet<String> {
-    let mut set = HashSet::new();
-    set.insert(parent.to_string());
-    for cp in store.read_unit_checkpoints(parent).unwrap_or_default() {
-        set.insert(cp.run_id);
+/// `global` is the dir whose `runs/` `store` is.
+pub fn resolve_run_scope(
+    global: &std::path::Path,
+    store: &RunStore,
+    parent: &str,
+) -> HashSet<String> {
+    if !is_plain_id(parent) {
+        return HashSet::from([parent.to_string()]);
     }
-    for id in sub_run_ids_from_events(store, parent) {
-        set.insert(id);
+    let mut pending = vec![parent.to_string()];
+    if crate::api::agentiflows::valid_run_id(parent) {
+        let flow_dir = rupu_agentiflow::agentiflow_dir(global).join(parent);
+        pending.extend(
+            rupu_agentiflow::units_on_disk(&flow_dir)
+                .into_iter()
+                .map(|u| u.unit_id),
+        );
+        pending.extend(
+            rupu_launch::identity::launch_tree(global, &flow_dir)
+                .into_iter()
+                .map(|s| s.run_id),
+        );
+    }
+    // A walk covers everything below the ids it returns, so an id already in
+    // the set is never walked again.
+    let mut set = HashSet::new();
+    while let Some(root) = pending.pop() {
+        if !is_plain_id(&root) || set.contains(&root) {
+            continue;
+        }
+        let tree = crate::api::netflow::netflow_ids(store, global, &root).ids;
+        for id in std::iter::once(root).chain(tree) {
+            if set.insert(id.clone()) {
+                pending.extend(live_unit_ids(store, &id));
+            }
+        }
     }
     set
 }
 
-/// Sub-run ids recovered from the parent's `events.jsonl` (written live). Each
-/// `UnitStarted` (and `StepWorking`) carries the unit's `transcript_path`; its
-/// file stem is the unit's run id — the id a finding declared by that unit
-/// agent is attributed to. A transcript stored under the nested sub-run layout
-/// (`.../<sub_id>/transcript.jsonl`) has a generic `transcript` stem, so fall
-/// back to the parent directory name there. Missing/garbled file → empty.
-fn sub_run_ids_from_events(store: &RunStore, parent: &str) -> Vec<String> {
-    let Ok(body) = std::fs::read_to_string(store.events_path(parent)) else {
-        return Vec::new();
-    };
-    body.lines()
-        .filter_map(rupu_orchestrator::runs::known_transcript_from_event_line)
-        // Findings scope: step/unit transcripts only. A `dispatch_started`
-        // child has no step id and was never part of this scope.
-        .filter(|k| k.step_id.is_some())
-        .map(|k| k.key)
-        .collect()
+/// A run id that names one directory: no separators, no `..`.
+fn is_plain_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// A workflow run's units known before their step results are, from TWO
+/// sources so a **running** run is covered, not just a finished one:
+///   1. unit checkpoints — durable, but written only when a unit COMPLETES;
+///   2. the run's `events.jsonl` — written LIVE: each `UnitStarted` /
+///      `StepWorking` carries the unit's `transcript_path`, whose file stem is
+///      the unit's run id. This is what catches in-flight units (and panel
+///      units, which are never checkpointed at all — see `graph.rs`).
+///
+/// A transcript stored under the nested sub-run layout
+/// (`.../<sub_id>/transcript.jsonl`) has a generic `transcript` stem, so the
+/// parent directory name is used there. Missing/garbled files → empty.
+fn live_unit_ids(store: &RunStore, run_id: &str) -> Vec<String> {
+    let mut ids: Vec<String> = store
+        .read_unit_checkpoints(run_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|cp| cp.run_id)
+        .collect();
+    if let Ok(body) = std::fs::read_to_string(store.events_path(run_id)) {
+        ids.extend(
+            body.lines()
+                .filter_map(rupu_orchestrator::runs::known_transcript_from_event_line)
+                .map(|k| k.key),
+        );
+    }
+    ids
 }
 
 /// `run_id → workflow_name` for each distinct, non-empty id in `run_ids` whose
@@ -726,17 +771,18 @@ pub fn finding_view(f: &FindingOut) -> rupu_coverage::FindingView<'_> {
 }
 
 /// The findings a parsed query selects, sorted severity (worst first), then
-/// newest, then id. Expands each `run:` value to the run plus its sub-runs
-/// ([`resolve_run_scope`]). It does NOT join `workflow_name`: callers run
+/// newest, then id. Expands each `run:` value to the run (or agentiflow) and
+/// everything that ran under it ([`resolve_run_scope`]). It does NOT join `workflow_name`: callers run
 /// [`join_workflow_names`] first, or `workflow:` matches nothing.
 /// `rupu findings list|tags` and `GET /api/findings` both go through this.
 pub fn query_findings(
+    global: &std::path::Path,
     store: &RunStore,
     mut findings: Vec<FindingOut>,
     q: &rupu_coverage::ParsedQuery,
 ) -> Vec<FindingOut> {
     if !q.terms.is_empty() {
-        findings = select_findings(store, findings, q);
+        findings = select_findings(global, store, findings, q);
     }
     findings.sort_by(|a, b| {
         rupu_coverage::severity_rank(b.record.severity)
@@ -749,6 +795,7 @@ pub fn query_findings(
 
 /// [`query_findings`]' filter step, for a query with at least one term.
 fn select_findings(
+    global: &std::path::Path,
     store: &RunStore,
     mut findings: Vec<FindingOut>,
     q: &rupu_coverage::ParsedQuery,
@@ -756,7 +803,7 @@ fn select_findings(
     let runs: rupu_coverage::RunScopes = rupu_coverage::run_values(q)
         .into_iter()
         .map(|r| {
-            let scope = resolve_run_scope(store, &r);
+            let scope = resolve_run_scope(global, store, &r);
             (r, scope)
         })
         .collect();
@@ -818,16 +865,14 @@ async fn list_findings(
     // leaves the finding's `workflow_name: None`.
     join_workflow_names(&s.run_store, &mut out);
 
-    // Resolve the run-id match SET when filtering by run: the parent unioned
-    // with its sub-runs (each `for_each`/`panel` unit is its own sub-run, and
-    // its findings carry the UNIT's run id). See [`resolve_run_scope`] — it
-    // draws sub-run ids from checkpoints AND the live event stream, so a
-    // RUNNING run's in-flight/panel findings aren't dropped. Only one level of
-    // fan-out is resolved (a unit that itself fans out isn't followed).
+    // Resolve the run-id match SET when filtering by run: the run (or
+    // agentiflow) and everything that ran under it, live units included — a
+    // finding carries the run id of the agent that declared it. See
+    // [`resolve_run_scope`].
     let run_ids: Option<HashSet<String>> = q
         .run_id
         .as_ref()
-        .map(|parent| resolve_run_scope(&s.run_store, parent));
+        .map(|parent| resolve_run_scope(&s.global_dir, &s.run_store, parent));
 
     let scoped = scope_by_run_set(out, &run_ids, &q.ws_id, &q.workflow).findings;
     // Facets describe the scope, before `q` narrows it.
@@ -838,7 +883,7 @@ async fn list_findings(
         .into_iter()
         .filter(|w| q.ws_id.as_ref() == Some(&w.ws_id) || scoped.iter().any(|f| f.ws_id == w.ws_id))
         .collect();
-    let filtered = query_findings(&s.run_store, scoped, &parsed);
+    let filtered = query_findings(&s.global_dir, &s.run_store, scoped, &parsed);
     let mut resp = build_response(filtered);
     // List rows never carry the report body; full-profile rows get a summary.
     resp.findings = resp
@@ -2122,7 +2167,7 @@ pub fn export_project_report(
     let run_ids = req
         .run_id
         .as_deref()
-        .map(|parent| resolve_run_scope(runs, parent));
+        .map(|parent| resolve_run_scope(global, runs, parent));
     // Number everything first, then select: a finding keeps the number it has
     // in the whole project whatever else is left out.
     let numbered = assign_numbers(
@@ -2593,7 +2638,7 @@ mod tests {
             .collect();
         std::fs::write(&ev_path, body).unwrap();
 
-        let scope = resolve_run_scope(&store, parent);
+        let scope = resolve_run_scope(tmp.path(), &store, parent);
         assert!(scope.contains("run_parent"), "parent always in scope");
         assert!(
             scope.contains("run_unit0"),
@@ -2624,11 +2669,115 @@ mod tests {
             codename: None,
         };
         std::fs::write(&ev_path, serde_json::to_string(&ev).unwrap() + "\n").unwrap();
-        let scope = resolve_run_scope(&store, parent);
+        let scope = resolve_run_scope(tmp.path(), &store, parent);
         assert!(
             scope.contains("sub_child"),
             "nested layout → dir name (was: {scope:?})"
         );
+    }
+
+    /// An agentiflow's Findings tab: its units are in the flow's own
+    /// `children.jsonl` (or, before W7, its `units/` mirrors), not in any
+    /// `RunStore` record — and everything they launched, down the tree, counts
+    /// too: a unit's sub-agent, a launched workflow's steps, a unit of that
+    /// workflow still running, and a child one of its steps launched.
+    #[test]
+    fn resolve_run_scope_covers_everything_under_an_agentiflow() {
+        use rupu_launch::ledger::{append, LedgerLine, Started};
+        use rupu_tools::ChildKind;
+        let launched = |dir: &std::path::Path, kind, run_id: &str, depth| {
+            append(
+                dir,
+                &LedgerLine::Started(Started::new(
+                    &format!("ch_{run_id}"),
+                    kind,
+                    "recon",
+                    run_id,
+                    1,
+                    depth,
+                )),
+            )
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        let flow = rupu_agentiflow::agentiflow_dir(tmp.path()).join("af_x");
+        launched(&flow, ChildKind::Agent, "run_recon", 1);
+        launched(&flow, ChildKind::Workflow, "run_wf", 1);
+        std::fs::create_dir_all(flow.join("units/run_old")).unwrap();
+        std::fs::write(
+            flow.join("units/run_old/unit.json"),
+            r#"{"run_id":"run_old","agent":"recon","kind":"agent","participant":"recon#1",
+               "started_at":"2026-10-06T00:00:00+00:00",
+               "status":{"state":"done","success":true,"output":"ok"}}"#,
+        )
+        .unwrap();
+        launched(
+            &store.root.join("run_recon"),
+            ChildKind::Subagent,
+            "sub_r",
+            2,
+        );
+        std::fs::create_dir_all(store.root.join("run_wf")).unwrap();
+        std::fs::write(
+            store.root.join("run_wf").join("step_results.jsonl"),
+            "{\"step_id\":\"scan\",\"run_id\":\"run_step\",\"transcript_path\":\"/t\",\"output\":\"\",\"success\":true,\"skipped\":false,\"rendered_prompt\":\"go\",\"finished_at\":\"2026-10-14T00:00:00Z\"}\n",
+        )
+        .unwrap();
+        launched(
+            &store.root.join("run_step"),
+            ChildKind::Agent,
+            "run_grand",
+            2,
+        );
+        let ev = Event::UnitStarted {
+            run_id: "run_wf".into(),
+            step_id: "fan".into(),
+            index: 0,
+            unit_key: "u".into(),
+            agent: None,
+            transcript_path: tmp.path().join("transcripts/run_live.jsonl"),
+            host: None,
+            codename: None,
+        };
+        std::fs::write(
+            store.events_path("run_wf"),
+            serde_json::to_string(&ev).unwrap() + "\n",
+        )
+        .unwrap();
+        launched(
+            &store.root.join("run_live"),
+            ChildKind::Subagent,
+            "sub_l",
+            3,
+        );
+
+        let mut scope: Vec<String> = resolve_run_scope(tmp.path(), &store, "af_x")
+            .into_iter()
+            .collect();
+        scope.sort();
+        assert_eq!(
+            scope,
+            [
+                "af_x",
+                "run_grand",
+                "run_live",
+                "run_old",
+                "run_recon",
+                "run_step",
+                "run_wf",
+                "sub_l",
+                "sub_r"
+            ]
+        );
+    }
+
+    /// An id that isn't one directory name is matched as given, never walked.
+    #[test]
+    fn resolve_run_scope_walks_no_path_outside_the_runs_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        let scope = resolve_run_scope(tmp.path(), &store, "../escape");
+        assert_eq!(scope, HashSet::from(["../escape".to_string()]));
     }
 
     /// `query_findings` joins provenance (project) and expands `run:` to the
@@ -2669,7 +2818,7 @@ mod tests {
         ];
         let ids = |q: &str| -> Vec<String> {
             let parsed = rupu_coverage::parse_query(q).unwrap();
-            query_findings(&store, all.clone(), &parsed)
+            query_findings(tmp.path(), &store, all.clone(), &parsed)
                 .into_iter()
                 .map(|f| f.record.id)
                 .collect()
@@ -2703,7 +2852,7 @@ mod tests {
         assert_eq!(all[2].workflow_name.as_deref(), Some("audit-flow"));
         let ids = |q: &str| -> Vec<String> {
             let parsed = rupu_coverage::parse_query(q).unwrap();
-            query_findings(&store, all.clone(), &parsed)
+            query_findings(tmp.path(), &store, all.clone(), &parsed)
                 .into_iter()
                 .map(|f| f.record.id)
                 .collect()

@@ -265,7 +265,7 @@ fn queried_findings(query: &[String]) -> anyhow::Result<Vec<cp_findings::Finding
     let runs = RunStore::new(global.join("runs"));
     let mut findings = cp_findings::collect_all_findings(&global);
     cp_findings::join_workflow_names(&runs, &mut findings);
-    Ok(cp_findings::query_findings(&runs, findings, &parsed))
+    Ok(cp_findings::query_findings(&global, &runs, findings, &parsed))
 }
 
 #[derive(serde::Serialize)]
