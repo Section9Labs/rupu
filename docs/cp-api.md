@@ -115,8 +115,8 @@ parameters on top of that.
   global layer or one project's `.rupu/`.
 - **`q=<query>`** — the one-line list query (the findings grammar:
   `status:failed,cancelled -workflow:nightly since:7d "two words"`) on
-  `/api/runs/workflows`, `/api/runs/agents`, `/api/sessions` and
-  `/api/projects/:ws_id/{runs,sessions}`. A term's values OR, terms AND,
+  `/api/runs/workflows`, `/api/runs/agents`, `/api/sessions`,
+  `/api/projects/:ws_id/{runs,sessions}` and `/api/events`. A term's values OR, terms AND,
   `-` negates, a bare word searches the list's text fields; comparisons are
   case-insensitive. It filters before `offset`/`limit` cut the page and ANDs
   with the list's other parameters (`lifecycle`, `scope`, `since`, `until`,
@@ -137,6 +137,7 @@ parameters on top of that.
   | Workflow runs (`/api/runs/workflows`, `/api/projects/:ws_id/runs`) | `status` (one of the 8 run statuses), `workflow` (contains), `id` (prefix), `codename` (contains), `trigger` (`manual`/`cron`/`event`), `host`, `customer` (a slug or `none`), `since`, `until` (`started_at`), `is:archived` | workflow, id, codename |
   | Agent runs (`/api/runs/agents`) | `status` (exact), `agent` (contains), `provider`, `model` (contains), `is` (`running`/`completed`/`failed`: the lifecycle group, a finished standalone run with no status is `completed`), `source` (`standalone`/`session`), `session` (prefix), `trigger` (`trigger_source`), `codename`, `id` (prefix), `host`, `customer`, `since`, `until` (`started_at`) | agent, codename, id |
   | Sessions (`/api/sessions`, `/api/projects/:ws_id/sessions`) | `status` (`idle`/`running`/`failed`/`stopped`), `agent` (contains), `model` (contains), `provider`, `codename`, `id` (prefix), `host`, `customer`, `project` (alias `workspace`; the workspace id), `is:active`/`is:archived` (the session's `scope`), `since`, `until` (`created_at`) | agent, codename, id |
+  | Events (`/api/events`) | `group` (`activity`/`await`/`warning`/`error`; `finding` is the page's findings, never an event), `type` (the event type), `run` (prefix), `project`, `workflow`, `agent`, `step` (contains), `codename` (the event's or its run's, contains), `provider`, `model`, `severity` (ordered; events carry none), `message` (the error, reason, warning or note), `since`, `until` (`ts`) | run, project, workflow, agent, step, codename, message |
 
   `is:archived` on `/api/runs/workflows` lists the archive instead (rows
   carry `archived: true`); it is local only: a remote host is a 501, and on
@@ -281,7 +282,7 @@ none, and a body that isn't the expected JSON is a 400.
 | Method | Path | Purpose | Notes |
 |--------|------|---------|-------|
 | GET | `/api/events/stream` | SSE firehose, or one run with `run`. | `run`, `host` (a remote host requires `run`). |
-| GET | `/api/events` | Recent step events, newest first, each with `ts` and `pos`. | `limit` (default 200), cursor `before_ts` (unix ms), `before_run`, `before_pos`. Scans the 20 newest runs. |
+| GET | `/api/events` | Recent step events, newest first, each with `ts`, `pos` and its run's `workflow`, `project` and `run_codename` when known. | `limit` (default 200), cursor `before_ts` (unix ms), `before_run`, `before_pos`, `q` (fields `group`, `type`, `run`, `project`, `workflow`, `agent`, `step`, `codename`, `provider`, `model`, `severity`, `message`, `since`, `until`). Scans the 20 newest runs, or the 20 newest a query's `run:`, `project:` and `workflow:` terms keep; `q` filters before `limit` cuts the page. |
 | GET | `/api/transcript` | Read a transcript: `{events, summary, unparsed, partial?}`. | `path` (a `.jsonl` under the global dir or a registered workspace), `host`, `run`. A missing local file is an empty 200. With `host` naming an SSH, tunnel or bucket host, a path that isn't one of that host's mirrored transcripts must lie under the same local roots (400 otherwise). For a remote run the coordinator's mirror is served; `partial: true` when the host couldn't be reached to finish it; 502 when unreachable with nothing cached. |
 | GET | `/api/transcript/stream` | SSE tail of a transcript. | `path`, `host`, `run` — `run` is required for a remote transcript not mirrored yet. 502 host unreachable. |
 | POST | `/api/transcripts/:id/archive` | Archive a standalone agent-run transcript. | `host`, `ignore_liveness` (skip the "still running" check when a PID was reused). 501 without `cp serve`. |
@@ -503,7 +504,12 @@ header naming hosts whose rows couldn't be attributed — see
 
 Netflow reads take `from` / `to` (inclusive RFC 3339) and comma-separated
 dimension filters `workflow`, `origin`, `org` and `host`. Here `host` filters
-by **remote endpoint** (`host:port`), not by registered rupu host.
+by **remote endpoint** (`host:port`), not by registered rupu host. Each
+dimension has an exclusion list too, `not_workflow`, `not_origin`, `not_org`
+and `not_host`: a flow whose key is listed is left out. An explorer response
+built with exclusions says `exclusions_applied: true`; for a run on an HTTP
+host older than the exclusions, the explorer answers 501 rather than relay an
+unfiltered view.
 
 | Method | Path | Purpose | Notes |
 |--------|------|---------|-------|
@@ -513,6 +519,7 @@ by **remote endpoint** (`host:port`), not by registered rupu host.
 | GET | `/api/netflow/graph` | Source → endpoint graph (`GraphView`). | `scope` (`run:<id>`, `project:<id>`, absent = global), `from`, `to`. Dimension filters are not applied. |
 | GET | `/api/netflow/explorer` | Explorer aggregates: sankey, timeline, histogram, KPIs. | `scope` plus the filters above. |
 | GET | `/api/netflow/index` | Resident netflow index status (size, budget, evictions). | |
+| GET | `/api/netflow/latest` | The most recently started run with flows: `{latest: {run_id, workflow, started_at, finished_at} \| null}`. | `scope` (`project:<id>`, absent = global; anything else is a 400). A ledger no run record accounts for counts as a run spanning its own flows (`run_id: null`). `finished_at` is null while the run is live. The Network page opens on this run's span or the last hour, whichever is shorter. |
 
 ## Projects and code
 

@@ -1,5 +1,5 @@
 //! `?q=` on the paged lists (`/api/runs/workflows`, `/api/runs/agents`,
-//! `/api/sessions`, `/api/projects/:id/{runs,sessions}`), and the registry
+//! `/api/sessions`, `/api/projects/:id/{runs,sessions}`, `/api/events`), and the registry
 //! fixtures the web's twin registries are checked against.
 //!
 //! Regenerate the fixtures after a deliberate registry change with
@@ -8,7 +8,7 @@
 // Throwaway in-process mock-server client, not rupu's egress.
 #![allow(clippy::disallowed_methods)]
 
-use rupu_cp::query::{agent_runs, sessions, workflow_runs, Fields};
+use rupu_cp::query::{agent_runs, events, sessions, workflow_runs, Fields};
 use serde_json::Value;
 
 fn fixture_matches(list: &str, fields: Fields) {
@@ -52,12 +52,65 @@ fn sessions_registry_matches_its_fixture() {
     fixture_matches("sessions", sessions::FIELDS);
 }
 
+#[test]
+fn events_registry_matches_its_fixture() {
+    fixture_matches("events", events::FIELDS);
+}
+
+/// The card group each event type answers to, as the Live Events page's
+/// `cardFromEvent` assigns it; `src/lib/query/lists/events.lockstep.test.ts`
+/// holds the page to the same table.
+#[test]
+fn event_groups_match_their_fixture() {
+    let path = format!(
+        "{}/tests/fixtures/list_query/events.groups.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let want: std::collections::BTreeMap<String, String> =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    for (event_type, group) in &want {
+        assert_eq!(events::group_of(event_type), group, "{event_type}");
+        assert!(events::GROUPS.contains(&group.as_str()), "{group}");
+    }
+}
+
+/// Event rows and the queries that keep them, as `GET /api/events` holds
+/// them; `src/lib/query/lists/events.lockstep.test.ts` holds the page's
+/// registry, over the cards it makes of the same rows, to the same answers.
+#[test]
+fn event_rows_match_their_fixture() {
+    let path = format!(
+        "{}/tests/fixtures/list_query/events.matches.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let fixture: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let rows = fixture["rows"].as_array().unwrap();
+    for case in fixture["cases"].as_array().unwrap() {
+        let q = case["q"].as_str().unwrap();
+        let query = rupu_cp::query::ListQuery::parse(Some(q), events::FIELDS)
+            .unwrap()
+            .unwrap();
+        let kept: Vec<Value> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| query.matches(r).unwrap())
+            .map(|(i, _)| Value::from(i))
+            .collect();
+        assert_eq!(Value::Array(kept), case["keep"], "{q}");
+    }
+}
+
 /// A time field matches by time, and only a time field does; an ordered
 /// field compares on its ladder.
 #[test]
 fn every_registry_pairs_kinds_with_their_match_modes() {
     use rupu_query::{FieldKind, MatchMode};
-    for fields in [workflow_runs::FIELDS, agent_runs::FIELDS, sessions::FIELDS] {
+    for fields in [
+        workflow_runs::FIELDS,
+        agent_runs::FIELDS,
+        sessions::FIELDS,
+        events::FIELDS,
+    ] {
         for f in fields {
             let time = matches!(f.def.kind, FieldKind::Time);
             let by_time = matches!(f.mode, MatchMode::Since | MatchMode::Until);
@@ -265,6 +318,7 @@ async fn a_bad_q_is_a_400_naming_its_token_on_every_list() {
         "/api/sessions",
         "/api/projects/ws_q/runs",
         "/api/projects/ws_q/sessions",
+        "/api/events",
     ] {
         let (status, _, body) = get(format!("{base}{path}?q=since:soon%20sevrity:high")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");

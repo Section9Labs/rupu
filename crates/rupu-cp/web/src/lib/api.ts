@@ -3800,16 +3800,19 @@ export const api = {
    * degrades to a strictly-less-than-`ts` filter that under-returns when
    * many events share one run's fallback `ts` (see `EventsCursor` in
    * `crates/rupu-cp/src/api/events.rs`); `run_id` + `pos` disambiguate
-   * those ties so no event is permanently skipped.
+   * those ties so no event is permanently skipped. `query` filters the
+   * history on the server (`?q=`, `lib/query/lists/events.ts`' fields).
    */
   getEvents(
     limit?: number,
     beforeTs?: number,
     beforeRunId?: string,
     beforePos?: number,
+    query?: string,
   ): Promise<TimedRunEvent[]> {
     const q = new URLSearchParams();
     if (limit != null) q.set('limit', String(limit));
+    if (query?.trim()) q.set('q', query);
     if (beforeTs != null) q.set('before_ts', String(beforeTs));
     if (beforeRunId != null) q.set('before_run', beforeRunId);
     if (beforePos != null) q.set('before_pos', String(beforePos));

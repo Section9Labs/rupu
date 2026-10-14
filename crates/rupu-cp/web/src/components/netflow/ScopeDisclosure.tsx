@@ -242,14 +242,11 @@ export function netflowWindowApplied(window?: NetflowWindowEcho | null): boolean
  *  scope", and only one of those two adjacent sentences could be true).
  *  Says flows "may still exist outside" rather than asserting they do —
  *  an empty windowed result is not proof the wider scope is empty, only
- *  that this window is. Names the actual clearing affordance ("All")
- *  rather than the vaguer "clear the range" (Minor finding, same round:
- *  the hint and the control it referred to used different words for the
- *  same action). */
+ *  that this window is. Names the query terms that widen it. */
 export function netflowRangeEmptyHint(): string {
   return (
-    `Flows may still exist outside the selected window — widen the range, or choose All to ` +
-    `see everything recorded.`
+    `Flows may still exist outside this window — widen it with since: or until:, or ` +
+    `window:all shows everything recorded.`
   );
 }
 

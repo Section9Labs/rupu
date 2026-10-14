@@ -182,9 +182,9 @@ working. The ⌘K palette jumps to any page, run or session.
 | `/runs/:id` | Live run view: the workflow's real graph (forks, joins, gates, actions, fan-out units), the focused step's transcript, events, findings and network tabs, and the run's controls. |
 | `/transcript?path=…` | A transcript on its own page, for agent runs, sessions and sub-agents with no workflow graph. Carries `host` and `run` for a remote transcript. |
 | `/sessions`, `/sessions/:id` | Session list and chat view. |
-| `/events` | Live Events: vitals strip, a merged stream of the event firehose and newly filed findings, and a per-project roster. |
+| `/events` | Live Events: vitals strip, a merged stream of the event firehose and newly filed findings, and a per-project roster. The query line filters the stream (`group:error`, `workflow:nightly`, `agent:recon since:1h`); the server filters the event history by it, so it reaches runs the unfiltered stream never loaded. |
 | `/usage` | Spend over time, pivoted by model, provider, agent, workflow, host or project; outlier panel. |
-| `/netflow` | Global network explorer. |
+| `/netflow` | Global network explorer. With no `since:` or `until:` in its query it opens on the shorter of the last hour and the latest run's span. |
 | `/agents`, `/agents/new`, `/agents/:name` | Agent definitions, the Agent Builder, and an agent's detail page (definition, recent runs, Edit / Delete / Run). |
 | `/workflows`, `/workflows/:name` | Workflow definitions and the visual workflow editor. |
 | `/autoflows` | Workflows with autoflow triggers, each with an enable/disable toggle. |

@@ -9,13 +9,9 @@ afterEach(() => {
 });
 
 describe('NetflowWindowReadout', () => {
-  // Built SOLELY from the server's `window` echo — never the picker's own
-  // state — so it can't drift the way a picker-derived summary could
-  // (whole-branch review round 1, "Also do"). It also answers the
-  // relative-preset pinning ambiguity: `TimeRangePicker`'s "Last hour"
-  // resolves against `now()` once, at click time, and never re-derives —
-  // this readout always shows the actual bounds that produced the data on
-  // screen, however long ago they were computed.
+  // Built SOLELY from the server's `window` echo, so it shows the bounds
+  // that produced the data on screen, however long ago a `since:1h` span
+  // was resolved.
 
   it('states both bounds when the server applied a fully-bounded window', () => {
     render(<NetflowWindowReadout appliedWindow={{ from: '2026-08-17T14:00:00.000Z', to: '2026-08-17T15:00:00.000Z' }} />);

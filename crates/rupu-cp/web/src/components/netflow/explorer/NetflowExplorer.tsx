@@ -6,41 +6,59 @@
 //
 // Layout + state owner. All aggregation is server-side
 // (`GET /api/netflow/explorer` + the filtered flows list — see
-// `rupu_netflow::ledger::explorer`'s module doc); this component only
-// holds view state (window, cross-filter sets, view switcher, selected
-// flow, zoom stack) and re-fetches when it changes, so KPIs, both
-// visualizations, the org cards, and the table always describe the same
-// server-computed set.
+// `rupu_netflow::ledger::explorer`'s module doc). The window and the
+// cross-filters are one query line (`lib/query/lists/netflow.ts` turns it
+// into the reads' params; graph clicks and drag-zooms write terms into it);
+// this component holds the query, the view switcher, the selected flow and
+// the zoom stack (the window terms each zoom replaced, so a zoom out puts
+// back only the window and keeps every term written since), and re-fetches when the query's params change, so KPIs,
+// both visualizations, the org cards, and the table always describe the
+// same server-computed set. With no window in the query it opens on the
+// default (`defaultWindow`): the run's span on a run's tab, else the
+// shorter of the last hour and the latest run's span.
 //
 // Two independent fetch effects — the aggregates (a few KB) and the flows
 // list (can be large) — each with its own error surface, so every section
 // renders as soon as its own response arrives; the server `window` echo is
 // threaded to every consumer that words an empty state or reads out the
-// window — never picker state. Mount this with a `key` of the scope id so a
-// scope-target change (e.g. RunDetail switching runs) resets all view
-// state instead of leaking the previous target's filters.
+// window — never the query's own reading of it. The query lives in the
+// URL's `nq`. Mount this with a `key` of the scope id so a scope-target
+// change (e.g. RunDetail switching runs) resets the rest of the view state.
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   fetchAgentiflowNetflow,
   fetchGlobalNetflow,
   fetchNetflowExplorer,
+  fetchNetflowLatest,
   fetchProjectNetflow,
   fetchRunNetflow,
   filtersAreEmpty,
-  EMPTY_NETFLOW_FILTERS,
   type ExplorerResponse,
   type FlowView,
+  type LatestRun,
   type NetflowFilters,
+  type NetflowRange,
   type NetflowResponse,
 } from '../../../lib/netflow';
+import {
+  NETFLOW_FIELDS,
+  defaultWindow,
+  defaultWindowText,
+  netflowRequest,
+  netflowWindowTerms,
+  toggleNetflowValue,
+  withNetflowWindow,
+  withNetflowWindowTerms,
+  type NetflowDim,
+} from '../../../lib/query/lists/netflow';
+import type { FacetValue } from '../../query/suggest';
+import { ListQueryBar, useListQuery } from '../../query/ListQueryBar';
 import { Segmented } from '../../ui/Segmented';
-import { netflowWindowApplied, type NetflowScope } from '../ScopeDisclosure';
+import { type NetflowScope } from '../ScopeDisclosure';
 import NetflowTable from '../NetflowTable';
-import TimeRangePicker, { presetValue, toNetflowRange, type TimeRangeValue } from '../TimeRangePicker';
 import ActivityStrip from './ActivityStrip';
 import CoveragePopover from './CoveragePopover';
-import FilterChips, { type FilterDim } from './FilterChips';
 import FlowDetailPanel from './FlowDetailPanel';
 import KpiStrip from './KpiStrip';
 import OrgCards from './OrgCards';
@@ -56,9 +74,10 @@ export interface NetflowExplorerProps {
   runId?: string;
   /** Required at `agentiflow` scope. */
   agentiflowId?: string;
-  /** Run and agentiflow scope: the run's own span, applied as the initial
-   *  window (the server still echoes whatever it actually enforced). An
-   *  unfinished run passes no `to`, leaving the upper bound open. */
+  /** Run and agentiflow scope: the run's own span, the window the explorer
+   *  opens on when the query names none (the server still echoes whatever
+   *  it actually enforced). An unfinished run passes no `to`, leaving the
+   *  upper bound open. */
   initialWindow?: { from?: string; to?: string };
 }
 
@@ -70,18 +89,24 @@ const VIEW_OPTIONS = [
 ];
 
 const PANEL_HINT: Record<ViewMode, string> = {
-  topology: 'Click any node to filter everything below. Ribbon width = calls; red = errors on the path.',
-  timeline: 'Same filters, over time. Click an endpoint to filter; click a cell to zoom the window.',
+  topology: 'Click any node to add it to the query. Ribbon width = calls; red = errors on the path.',
+  timeline: 'Same query, over time. Click an endpoint to add it; click a cell to zoom the window.',
 };
 
-const TOPO_DIM_TO_FILTER: Record<TopoDim, FilterDim> = {
-  wf: 'workflows',
-  or: 'origins',
-  org: 'orgs',
+const TOPO_DIM_TO_KEY: Record<TopoDim, NetflowDim> = {
+  wf: 'workflow',
+  or: 'origin',
+  org: 'org',
 };
 
-function toggleIn(list: string[], key: string): string[] {
-  return list.includes(key) ? list.filter((k) => k !== key) : [...list, key];
+/** The latest run, once asked for (global and project scope). */
+type Latest = { state: 'loading' } | { state: 'ready'; run: LatestRun | null } | { state: 'failed'; error: string };
+
+/** What the reads ask for: the query's params, its window or the default. */
+interface Applied {
+  range: NetflowRange;
+  filters?: NetflowFilters;
+  note: string | null;
 }
 
 export function NetflowExplorer({
@@ -91,16 +116,9 @@ export function NetflowExplorer({
   agentiflowId,
   initialWindow,
 }: NetflowExplorerProps) {
-  const [range, setRange] = useState<TimeRangeValue>(() =>
-    initialWindow && (initialWindow.from || initialWindow.to)
-      ? { preset: 'custom', from: initialWindow.from, to: initialWindow.to }
-      : scope === 'run' || scope === 'agentiflow'
-        ? { preset: 'all' }
-        : presetValue('24h', new Date()),
-  );
+  const [q, setQ] = useListQuery('nq');
   const [view, setView] = useState<ViewMode>('topology');
-  const [filters, setFilters] = useState<NetflowFilters>(EMPTY_NETFLOW_FILTERS);
-  const [zoomStack, setZoomStack] = useState<TimeRangeValue[]>([]);
+  const [zoomStack, setZoomStack] = useState<string[][]>([]);
   const [selectedFlow, setSelectedFlow] = useState<FlowView | null>(null);
   const [explorer, setExplorer] = useState<ExplorerResponse | null>(null);
   const [flows, setFlows] = useState<NetflowResponse | null>(null);
@@ -110,7 +128,7 @@ export function NetflowExplorer({
   // initial load has its own per-section loading state). Previous data
   // staying on screen is deliberate — but only honest with a visible
   // "Updating…" beside it, or whole-history numbers would render under a
-  // just-selected narrower label with nothing saying so.
+  // just-narrowed query with nothing saying so.
   const [explorerRefreshing, setExplorerRefreshing] = useState(false);
   const [flowsRefreshing, setFlowsRefreshing] = useState(false);
 
@@ -123,16 +141,49 @@ export function NetflowExplorer({
           ? `project:${projectId}`
           : undefined;
 
+  // A run's own tab opens on the run's span; global and project scope on
+  // the shorter of the last hour and the latest run's span.
+  const ownSpan = scope === 'run' || scope === 'agentiflow';
+  const [latest, setLatest] = useState<Latest>({ state: 'loading' });
+  useEffect(() => {
+    if (ownSpan) return;
+    let cancelled = false;
+    fetchNetflowLatest(scope === 'project' && projectId ? `project:${projectId}` : undefined)
+      .then((r) => !cancelled && setLatest({ state: 'ready', run: r.latest }))
+      .catch((e: unknown) => !cancelled && setLatest({ state: 'failed', error: e instanceof Error ? e.message : String(e) }));
+    return () => {
+      cancelled = true;
+    };
+  }, [ownSpan, scope, projectId]);
+
+  const request = useMemo(() => netflowRequest(q, Date.now()), [q]);
+  // A query that doesn't translate keeps what the last one asked for: the
+  // line shows why, the views stay put.
+  const lastApplied = useRef<Applied | null>(null);
+  const applied = useMemo<Applied | null>(() => {
+    if (!request.ok) return lastApplied.current;
+    const filters = filtersAreEmpty(request.filters) ? undefined : request.filters;
+    if (request.window !== 'default') return { range: request.range, filters, note: null };
+    if (!ownSpan && latest.state === 'loading') return null;
+    const now = Date.now();
+    const w = defaultWindow(now, ownSpan ? { span: initialWindow ?? {} } : { latest: latest.state === 'ready' ? latest.run : null });
+    const failed = latest.state === 'failed' ? ` (The latest run couldn't be read: ${latest.error}.)` : '';
+    return { range: w.range, filters, note: defaultWindowText(w, now) + failed };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [request, latest, ownSpan]);
+  lastApplied.current = applied;
+  const appliedKey = applied ? JSON.stringify([applied.range, applied.filters ?? null]) : null;
+
   // The aggregates and the flows list load independently: each section
   // renders as soon as its own response arrives. Previous data stays on
-  // screen during a refetch — a cross-filter click narrowing the set must
-  // not collapse the whole surface to a loading line and rebuild it.
+  // screen during a refetch — a narrowing query must not collapse the
+  // whole surface to a loading line and rebuild it.
   useEffect(() => {
+    if (!applied) return;
     let cancelled = false;
     setExplorerError(null);
     setExplorerRefreshing(true);
-    const f = filtersAreEmpty(filters) ? undefined : filters;
-    fetchNetflowExplorer(scopeParam, toNetflowRange(range), f)
+    fetchNetflowExplorer(scopeParam, applied.range, applied.filters)
       .then((e) => {
         if (cancelled) return;
         setExplorer(e);
@@ -147,22 +198,22 @@ export function NetflowExplorer({
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scope, projectId, runId, agentiflowId, range, filters]);
+  }, [scope, projectId, runId, agentiflowId, appliedKey]);
 
   useEffect(() => {
+    if (!applied) return;
     let cancelled = false;
     setFlowsError(null);
     setFlowsRefreshing(true);
-    const q = toNetflowRange(range);
-    const f = filtersAreEmpty(filters) ? undefined : filters;
+    const { range, filters } = applied;
     const flowsFetch =
       scope === 'run' && runId
-        ? fetchRunNetflow(runId, q, f)
+        ? fetchRunNetflow(runId, range, filters)
         : scope === 'agentiflow' && agentiflowId
-          ? fetchAgentiflowNetflow(agentiflowId, q, f)
+          ? fetchAgentiflowNetflow(agentiflowId, range, filters)
           : scope === 'project' && projectId
-            ? fetchProjectNetflow(projectId, q, f)
-            : fetchGlobalNetflow(q, f);
+            ? fetchProjectNetflow(projectId, range, filters)
+            : fetchGlobalNetflow(range, filters);
     flowsFetch
       .then((fl) => {
         if (cancelled) return;
@@ -178,66 +229,74 @@ export function NetflowExplorer({
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scope, projectId, runId, agentiflowId, range, filters]);
+  }, [scope, projectId, runId, agentiflowId, appliedKey]);
 
-  const orgLabels = useMemo(() => {
-    const m = new Map<string, string>();
-    for (const o of explorer?.sankey.orgs ?? []) m.set(o.id, o.label);
-    return m;
+  // Suggestions: the values the scope's aggregates hold, with their calls.
+  const facets = useMemo((): Record<string, FacetValue[]> => {
+    if (!explorer) return {};
+    const nodes = (xs: { id: string; label: string; calls: number }[]): FacetValue[] =>
+      xs.map((n) => ({ value: n.id, count: n.calls, detail: n.label !== n.id ? n.label : undefined }));
+    return {
+      workflow: nodes(explorer.sankey.workflows),
+      origin: nodes(explorer.sankey.origins),
+      org: nodes(explorer.sankey.orgs),
+      host: explorer.timeline.lanes.map((l) => ({ value: `${l.host}:${l.port}`, count: l.calls, detail: l.org })),
+    };
   }, [explorer]);
 
-  function toggleFilter(dim: FilterDim, key: string) {
-    setSelectedFlow(null);
-    setFilters((prev) => ({ ...prev, [dim]: toggleIn(prev[dim], key) }));
-  }
-
-  /** Picker-initiated range change: a new context, so the zoom stack resets. */
-  function changeRange(next: TimeRangeValue) {
+  /** A query edit: a new context, so the zoom stack resets. */
+  function changeQuery(next: string) {
     setSelectedFlow(null);
     setZoomStack([]);
-    setRange(next);
+    setQ(next);
   }
 
-  /** Drag- or cell-initiated zoom: push the current window so "Zoom out"
-   *  can unwind step by step. */
+  function toggle(key: NetflowDim, value: string) {
+    setSelectedFlow(null);
+    setQ(toggleNetflowValue(q, key, value));
+  }
+
+  /** Drag- or cell-initiated zoom: push the window it replaces so "Zoom
+   *  out" can unwind step by step. */
   function zoomTo(fromIso: string, toIso: string) {
     setSelectedFlow(null);
-    setZoomStack((prev) => [...prev, range]);
-    setRange({ preset: 'custom', from: fromIso, to: toIso });
+    setZoomStack((prev) => [...prev, netflowWindowTerms(q)]);
+    setQ(withNetflowWindow(q, fromIso, toIso));
   }
 
   function zoomOut() {
     setSelectedFlow(null);
-    setZoomStack((prev) => {
-      if (prev.length === 0) return prev;
-      setRange(prev[prev.length - 1]);
-      return prev.slice(0, -1);
-    });
+    if (zoomStack.length === 0) return;
+    setQ(withNetflowWindowTerms(q, zoomStack[zoomStack.length - 1]));
+    setZoomStack(zoomStack.slice(0, -1));
   }
 
-  function clearAll() {
-    setSelectedFlow(null);
-    setFilters(EMPTY_NETFLOW_FILTERS);
-    setZoomStack([]);
-    setRange({ preset: 'all' });
-  }
-
+  const filters = applied?.filters;
   const selectedTopo: Record<TopoDim, string[]> = {
-    wf: filters.workflows,
-    or: filters.origins,
-    org: filters.orgs,
+    wf: filters?.workflows ?? [],
+    or: filters?.origins ?? [],
+    org: filters?.orgs ?? [],
   };
 
-  const filtersActive = !filtersAreEmpty(filters);
+  const filtersActive = filters !== undefined;
   const updating =
     (explorerRefreshing && explorer !== null) || (flowsRefreshing && flows !== null);
-  // Nothing of the aggregates yet: their section is the loading line alone,
-  // exactly as before (a picker here would remount — losing an open custom
-  // edit — when the aggregates arrive).
+  // Nothing of the aggregates yet: their section is the loading line alone.
   const explorerLoading = explorer === null && !explorerError;
 
   return (
     <div className="space-y-4">
+      <ListQueryBar
+        className="mb-0"
+        value={q}
+        onChange={changeQuery}
+        fields={NETFLOW_FIELDS}
+        facets={facets}
+        label="Filter network flows"
+        placeholder="Filter flows… e.g. since:6h origin:provider:anthropic -host:api.github.com:443"
+        error={request.ok ? null : request.error}
+        alerts={applied?.note && request.ok ? [<span key="window" data-testid="netflow-default-window">{applied.note}</span>] : []}
+      />
       {(updating || (explorer && flows)) && (
         <div className="flex items-center justify-end gap-3">
           {updating && (
@@ -255,20 +314,15 @@ export function NetflowExplorer({
         </div>
       )}
       {explorerError ? (
-        // The picker stays reachable on an aggregates error — changing the
-        // window is the retry affordance.
-        <div className="space-y-3">
-          <TimeRangePicker value={range} onChange={changeRange} />
-          <p className="text-sm text-err">{explorerError}</p>
-        </div>
+        // The query stays reachable above an aggregates error — changing it
+        // is the retry affordance.
+        <p className="text-sm text-err">{explorerError}</p>
       ) : explorer === null ? (
         <p className="text-sm text-ink-dim">Loading network flows…</p>
       ) : (
         <>
           <ActivityStrip
             histogram={explorer.histogram}
-            range={range}
-            onRangeChange={changeRange}
             onZoom={zoomTo}
             appliedWindow={explorer.window}
           />
@@ -288,15 +342,15 @@ export function NetflowExplorer({
               <TopologyView
                 sankey={explorer.sankey}
                 selected={selectedTopo}
-                onToggle={(dim, key) => toggleFilter(TOPO_DIM_TO_FILTER[dim], key)}
+                onToggle={(dim, key) => toggle(TOPO_DIM_TO_KEY[dim], key)}
                 scope={scope}
                 appliedWindow={explorer.window}
               />
             ) : (
               <TimelineView
                 timeline={explorer.timeline}
-                selectedHosts={filters.hosts}
-                onToggleHost={(key) => toggleFilter('hosts', key)}
+                selectedHosts={filters?.hosts ?? []}
+                onToggleHost={(key) => toggle('host', key)}
                 onZoomBucket={zoomTo}
                 canZoomOut={zoomStack.length > 0}
                 onZoomOut={zoomOut}
@@ -308,18 +362,10 @@ export function NetflowExplorer({
           {view === 'topology' && (
             <OrgCards
               lanes={explorer.timeline.lanes}
-              selectedHosts={filters.hosts}
-              onToggleHost={(key) => toggleFilter('hosts', key)}
+              selectedHosts={filters?.hosts ?? []}
+              onToggleHost={(key) => toggle('host', key)}
             />
           )}
-          <FilterChips
-            filters={filters}
-            orgLabel={(key) => orgLabels.get(key) ?? key}
-            windowApplied={netflowWindowApplied(explorer.window)}
-            onRemove={toggleFilter}
-            onClearWindow={() => changeRange({ preset: 'all' })}
-            onClearAll={clearAll}
-          />
         </>
       )}
       {flowsError ? (

@@ -151,7 +151,7 @@ describe('Live Events (Situation Room) page', () => {
     // cursor (EventsCursor::Compound), so paging resumes past a boundary that
     // lands mid-run at a shared fallback ts.
     await waitFor(() =>
-      expect(api.getEvents).toHaveBeenCalledWith(expect.any(Number), oldest.ts, oldest.run_id, oldest.pos),
+      expect(api.getEvents).toHaveBeenCalledWith(expect.any(Number), oldest.ts, oldest.run_id, oldest.pos, undefined),
     );
   });
 
@@ -206,6 +206,74 @@ describe('Live Events (Situation Room) page', () => {
 
     emit?.({ type: 'run_failed', run_id: 'r1', error: 'after-error-xyz', finished_at: new Date().toISOString() });
     expect(await screen.findByText('after-error-xyz')).toBeInTheDocument();
+  });
+});
+
+function stepFailed(runId: string, ts: number, pos: number, extra: Record<string, string> = {}): TimedRunEvent {
+  return { type: 'step_failed', run_id: runId, step_id: 'scan', error: 'connection refused', ts, pos, ...extra } as TimedRunEvent;
+}
+
+describe('Live Events: the query line', () => {
+  function renderAt(url: string) {
+    return render(<MemoryRouter initialEntries={[url]}><Events /></MemoryRouter>);
+  }
+
+  it('asks the server for the filtered history and shows only what the query keeps', async () => {
+    const getEvents = vi.spyOn(api, 'getEvents').mockImplementation(async (_l, _t, _r, _p, q) =>
+      q ? [stepFailed('run_old', 1_000, 3, { workflow: 'nightly' })] : [runStarted('run_new', 9_000)],
+    );
+    let emit: ((e: RunEvent) => void) | undefined;
+    vi.spyOn(api, 'subscribeEvents').mockImplementation((onEvent) => { emit = onEvent; return () => {}; });
+
+    renderAt('/events?q=group:error%20workflow:nightly');
+    await screen.findByText('scan failed');
+    expect(getEvents).toHaveBeenCalledWith(200, undefined, undefined, undefined, 'group:error workflow:nightly');
+    expect(screen.queryByText('Workflow run started')).not.toBeInTheDocument();
+    expect(screen.getByText('1 events')).toBeInTheDocument();
+    expect(screen.getByText(/Event history holds the most recent runs the query's/)).toBeInTheDocument();
+
+    // A live frame the query doesn't keep stays out; the same event replayed
+    // live (no ts, pos or attribution) is the one already shown.
+    emit?.({ type: 'step_warning', run_id: 'run_old', step_id: 'scan', message: 'slow' } as RunEvent);
+    emit?.({ type: 'step_failed', run_id: 'run_old', step_id: 'scan', error: 'connection refused' } as RunEvent);
+    await waitFor(() => expect(screen.getByText('Live')).toBeInTheDocument());
+    expect(screen.getAllByText('scan failed')).toHaveLength(1);
+    expect(screen.queryByText('scan warning')).not.toBeInTheDocument();
+  });
+
+  it("a card the query keeps names its unit from every loaded event, not only the query's", async () => {
+    const unit = { type: 'unit_started', run_id: 'run_u', step_id: 'sweep', index: 2, unit_key: 'repo-delta', codename: 'cobalt-harbor/heron#3', transcript_path: '/t/2.jsonl', ts: 1_000, pos: 0 } as TimedRunEvent;
+    const agent = { type: 'agent_started', run_id: 'run_u', step_id: 'sweep', unit_index: 2, codename: 'cobalt-harbor/heron#3', agent: 'recon', agent_run_id: 'run_a', transcript_path: '/t/2.jsonl', ts: 2_000, pos: 1 } as TimedRunEvent;
+    vi.spyOn(api, 'getEvents').mockImplementation(async (_l, _t, _r, _p, q) => (q ? [agent] : [unit, agent]));
+    vi.spyOn(api, 'subscribeEvents').mockImplementation(() => () => {});
+
+    renderAt('/events?q=type:agent_started');
+    await waitFor(() => expect(screen.getByText('1 events')).toBeInTheDocument());
+    expect(screen.getByText('repo-delta')).toBeInTheDocument();
+  });
+
+  it('pages the filtered history with the query', async () => {
+    const page = Array.from({ length: 200 }, (_, i) => stepFailed(`run_${i}`, 200_000 - i * 1000, i));
+    const oldest = page[page.length - 1];
+    const getEvents = vi.spyOn(api, 'getEvents').mockImplementation(async (_l, before, _r, _p, q) =>
+      q && before === undefined ? page : [],
+    );
+    vi.spyOn(api, 'subscribeEvents').mockImplementation(() => () => {});
+
+    renderAt('/events?q=group:error');
+    fireEvent.click(await screen.findByText('Load older events'));
+    await waitFor(() =>
+      expect(getEvents).toHaveBeenCalledWith(200, oldest.ts, oldest.run_id, oldest.pos, 'group:error'),
+    );
+  });
+
+  it("a query that doesn't parse filters nothing and asks the server nothing", async () => {
+    const getEvents = vi.spyOn(api, 'getEvents').mockResolvedValue([runStarted('run_new', 9_000)]);
+    vi.spyOn(api, 'subscribeEvents').mockImplementation(() => () => {});
+    renderAt('/events?q=grop:error');
+    await screen.findByText('Workflow run started');
+    expect(getEvents).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('alert')).toHaveTextContent('unknown key `grop`');
   });
 });
 

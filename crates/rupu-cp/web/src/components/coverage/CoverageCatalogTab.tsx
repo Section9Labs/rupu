@@ -1,18 +1,18 @@
 // Catalog tab — the effective concern catalog snapshot, as collapsed rows.
 import { useEffect, useMemo, useState } from 'react';
 import { api, type FlatCatalog } from '../../lib/api';
-import { filterConcerns } from '../../lib/coverageFilter';
 import { SectionHeader } from '../lists/SectionHeader';
 import { ListCard } from '../lists/ListCard';
 import { Spinner } from '../ui/Spinner';
 import CollapsibleRow from './CollapsibleRow';
 import SeverityChip from './SeverityChip';
-import ConcernControls from './ConcernControls';
+import ExpandCollapse from './ExpandCollapse';
+import { ListQueryBar, NoMatches, useFilteredRows, useListQuery } from '../query/ListQueryBar';
+import { CATALOG_FIELDS, type CatalogRow } from '../../lib/query/lists/concerns';
 
 export default function CoverageCatalogTab({ target, wsId }: { target: string; wsId?: string }) {
   const [cat, setCat] = useState<FlatCatalog | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [severity, setSeverity] = useState('all');
   const [open, setOpen] = useState<Set<string>>(new Set());
 
   useEffect(() => {
@@ -32,7 +32,12 @@ export default function CoverageCatalogTab({ target, wsId }: { target: string; w
     };
   }, [target, wsId]);
 
-  const concerns = useMemo(() => (cat ? filterConcerns(cat.concerns, severity) : []), [cat, severity]);
+  const [q, setQ] = useListQuery();
+  const all = useMemo<CatalogRow[]>(
+    () => (cat ? cat.concerns.map((c) => ({ ...c, source: cat.sources[c.id] ?? 'inline' })) : []),
+    [cat],
+  );
+  const { rows: concerns, error: queryError, facets } = useFilteredRows(all, q, CATALOG_FIELDS);
 
   function toggle(id: string) {
     setOpen((prev) => {
@@ -50,14 +55,31 @@ export default function CoverageCatalogTab({ target, wsId }: { target: string; w
 
   return (
     <section className="mt-6">
-      <SectionHeader tone="muted" label="Catalog concerns" count={concerns.length} />
-      <ConcernControls
-        severity={severity}
-        onSeverity={setSeverity}
-        onExpandAll={() => setOpen(new Set(concerns.map((c) => c.id)))}
-        onCollapseAll={() => setOpen(new Set())}
-        total={concerns.length}
+      <ListQueryBar
+        value={q}
+        onChange={setQ}
+        fields={CATALOG_FIELDS}
+        facets={facets}
+        total={all.length}
+        shown={concerns.length}
+        error={queryError}
+        label="Filter concerns"
+        placeholder="Filter concerns… e.g. severity>=high tag:owasp-a03 source:inline"
       />
+      <SectionHeader
+        tone="muted"
+        label="Catalog concerns"
+        count={concerns.length}
+        trailing={
+          <ExpandCollapse
+            onExpandAll={() => setOpen(new Set(concerns.map((c) => c.id)))}
+            onCollapseAll={() => setOpen(new Set())}
+          />
+        }
+      />
+      {concerns.length === 0 ? (
+        <NoMatches noun="concerns" />
+      ) : (
       <ListCard>
         {concerns.map((c) => (
           <CollapsibleRow
@@ -69,7 +91,7 @@ export default function CoverageCatalogTab({ target, wsId }: { target: string; w
                 <span className="text-sm font-medium text-ink">{c.name}</span>
                 <span className="text-note font-mono text-ink-mute">{c.id}</span>
                 <SeverityChip severity={c.severity} />
-                <span className="text-meta text-ink-mute">{cat.sources[c.id] ?? 'inline'}</span>
+                <span className="text-meta text-ink-mute">{c.source}</span>
               </span>
             }
           >
@@ -93,6 +115,7 @@ export default function CoverageCatalogTab({ target, wsId }: { target: string; w
           </CollapsibleRow>
         ))}
       </ListCard>
+      )}
     </section>
   );
 }

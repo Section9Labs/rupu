@@ -2,8 +2,9 @@
 // Project Network tab — a thin mount of the shared <NetflowExplorer
 // scope="project">. This file exercises the tab's own contract: the
 // project scope param + project-id threading, the `key={wsId}` remount on
-// a project switch, the popover-carried disclosure, and the server-echo
-// empty-state branching. Explorer internals are covered by the explorer
+// a project switch, the project's latest run behind its default window,
+// the popover-carried disclosure, and the server-echo empty-state
+// branching. Explorer internals are covered by the explorer
 // component tests.
 
 import '@testing-library/jest-dom/vitest';
@@ -16,19 +17,27 @@ import {
   flowView,
 } from '../netflow/explorer/explorerFixtures';
 
-const { fetchProjectNetflow, fetchNetflowExplorer } = vi.hoisted(() => ({
+const { fetchProjectNetflow, fetchNetflowExplorer, fetchNetflowLatest } = vi.hoisted(() => ({
   fetchProjectNetflow: vi.fn(),
   fetchNetflowExplorer: vi.fn(),
+  fetchNetflowLatest: vi.fn(),
 }));
 vi.mock('../../lib/netflow', async () => {
   const actual = await vi.importActual<typeof import('../../lib/netflow')>('../../lib/netflow');
-  return { ...actual, fetchProjectNetflow, fetchNetflowExplorer };
+  return { ...actual, fetchProjectNetflow, fetchNetflowExplorer, fetchNetflowLatest };
 });
 
+import { MemoryRouter } from 'react-router-dom';
 import ProjectNetworkTab from './ProjectNetworkTab';
+import { commitQuery } from '../query/queryTestUtils';
 
 const NOW = new Date('2026-10-06T12:00:00Z');
+const HOUR = { from: '2026-10-06T11:00:00.000Z' };
 const DAY = { from: '2026-10-05T12:00:00.000Z' };
+
+const wrapper = ({ children }: { children: React.ReactNode }) => (
+  <MemoryRouter initialEntries={['/projects/ws-1/network']}>{children}</MemoryRouter>
+);
 
 afterEach(() => {
   vi.useRealTimers();
@@ -40,6 +49,8 @@ beforeEach(() => {
   vi.setSystemTime(NOW);
   fetchProjectNetflow.mockReset();
   fetchNetflowExplorer.mockReset();
+  fetchNetflowLatest.mockReset();
+  fetchNetflowLatest.mockResolvedValue({ latest: null });
   fetchProjectNetflow.mockResolvedValue(emptyFlowsResponse());
   fetchNetflowExplorer.mockResolvedValue(emptyExplorerResponse());
 });
@@ -50,19 +61,20 @@ describe('ProjectNetworkTab', () => {
       ...emptyFlowsResponse(),
       flows: [flowView({ run_id: 'run-1', workflow: 'review-wf' })],
     } satisfies NetflowResponse);
-    render(<ProjectNetworkTab wsId="ws-1" />);
+    render(<ProjectNetworkTab wsId="ws-1" />, { wrapper });
 
     await waitFor(() =>
-      expect(fetchNetflowExplorer).toHaveBeenCalledWith('project:ws-1', DAY, undefined),
+      expect(fetchNetflowExplorer).toHaveBeenCalledWith('project:ws-1', HOUR, undefined),
     );
-    expect(fetchProjectNetflow).toHaveBeenCalledWith('ws-1', DAY, undefined);
+    expect(fetchNetflowLatest).toHaveBeenCalledWith('project:ws-1');
+    expect(fetchProjectNetflow).toHaveBeenCalledWith('ws-1', HOUR, undefined);
     await screen.findByText('api.anthropic.com');
     // Attribution columns show at project scope too.
     expect(screen.getByText('review-wf')).toBeInTheDocument();
   });
 
   it('surfaces the scope disclosure through the coverage popover', async () => {
-    render(<ProjectNetworkTab wsId="ws-1" />);
+    render(<ProjectNetworkTab wsId="ws-1" />, { wrapper });
     await screen.findByRole('button', { name: /coverage & gaps/i });
 
     fireEvent.click(screen.getByRole('button', { name: /coverage & gaps/i }));
@@ -77,17 +89,18 @@ describe('ProjectNetworkTab', () => {
       ...emptyFlowsResponse(),
       dropped_total: 4,
     } satisfies NetflowResponse);
-    render(<ProjectNetworkTab wsId="ws-1" />);
+    render(<ProjectNetworkTab wsId="ws-1" />, { wrapper });
 
     await screen.findByText(/4 flows dropped/i);
   });
 
   it('re-fetches when wsId changes (key remount resets all view state)', async () => {
-    const { rerender } = render(<ProjectNetworkTab wsId="ws-1" />);
-    await waitFor(() => expect(fetchProjectNetflow).toHaveBeenCalledWith('ws-1', DAY, undefined));
+    const { rerender } = render(<ProjectNetworkTab wsId="ws-1" />, { wrapper });
+    await waitFor(() => expect(fetchProjectNetflow).toHaveBeenCalledWith('ws-1', HOUR, undefined));
 
     rerender(<ProjectNetworkTab wsId="ws-2" />);
-    await waitFor(() => expect(fetchProjectNetflow).toHaveBeenCalledWith('ws-2', DAY, undefined));
+    await waitFor(() => expect(fetchProjectNetflow).toHaveBeenCalledWith('ws-2', HOUR, undefined));
+    expect(fetchNetflowLatest).toHaveBeenCalledWith('project:ws-2');
   });
 
   it('threads the server-echoed window into the table, producing the range-aware empty state', async () => {
@@ -95,19 +108,18 @@ describe('ProjectNetworkTab', () => {
       ...emptyFlowsResponse(),
       window: { from: '2026-08-17T14:00:00Z', to: null },
     } satisfies NetflowResponse);
-    render(<ProjectNetworkTab wsId="ws-1" />);
+    render(<ProjectNetworkTab wsId="ws-1" />, { wrapper });
 
     await screen.findByText(/no network flows in this range/i);
   });
 
-  it('re-fetches with the new range when the time-range picker selection changes', async () => {
-    render(<ProjectNetworkTab wsId="ws-1" />);
+  it('re-fetches with the new range when the query names a window', async () => {
+    render(<ProjectNetworkTab wsId="ws-1" />, { wrapper });
     await waitFor(() => expect(fetchProjectNetflow).toHaveBeenCalledTimes(1));
 
-    fireEvent.click(screen.getByRole('button', { name: /last hour/i }));
+    commitQuery('Filter network flows', 'since:24h');
 
     await waitFor(() => expect(fetchProjectNetflow).toHaveBeenCalledTimes(2));
-    const [, range] = fetchProjectNetflow.mock.calls[1];
-    expect(range).toMatchObject({ from: expect.stringMatching(/T/) });
+    expect(fetchProjectNetflow).toHaveBeenLastCalledWith('ws-1', DAY, undefined);
   });
 });

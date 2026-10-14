@@ -231,3 +231,65 @@ async fn host_proxy_older_remote_dropped_rename_fails_closed_with_named_error() 
          (not a bare serde message), got: {message:?}"
     );
 }
+
+/// The explorer an HTTP host serves, empty, with or without the
+/// `exclusions_applied` echo a current peer adds.
+fn remote_explorer(exclusions_applied: bool) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "sankey": {"workflows": [], "origins": [], "orgs": [], "wf_origin": [], "origin_org": []},
+        "timeline": {"bucket_ms": 1000, "from": "1970-01-01T00:00:00Z", "to": "1970-01-01T00:00:00Z", "lanes": [], "runs": [], "runs_in_window": 0},
+        "histogram": {"from": null, "to": null, "bucket_ms": 0, "buckets": []},
+        "kpis": {"flows": 0, "endpoints": 0, "orgs": 0, "errors": 0, "bytes_in": null, "bytes_out": null, "bytes_partial": false},
+        "dropped_total": 0,
+        "asn_loaded": false,
+        "window": {"from": null, "to": null},
+    });
+    if exclusions_applied {
+        v["exclusions_applied"] = serde_json::json!(true);
+    }
+    v
+}
+
+/// A remote older than the `not_*` params ignores them and answers
+/// unfiltered; the explorer it relays can't be corrected here, so an
+/// excluding request to it fails, naming the host, rather than showing
+/// the excluded flows. A peer that applied them answers normally.
+#[tokio::test]
+async fn host_explorer_refuses_exclusions_an_older_remote_ignored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let run_id = "run_on_remote_host_exclusions";
+
+    let mock = httpmock::MockServer::start_async().await;
+    let (addr, host_id) = common::spawn_server_with_remote_host(tmp.path(), &mock.base_url()).await;
+    let _probe = common::mock_probe_hit(&mock, run_id);
+
+    let mut old = mock.mock(|when, then| {
+        when.method("GET").path("/api/netflow/explorer");
+        then.status(200).json_body(remote_explorer(false));
+    });
+    let url =
+        format!("http://{addr}/api/netflow/explorer?scope=run:{run_id}&not_host=a.example:443");
+    let resp = reqwest::get(&url).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["error"],
+        format!("host {host_id} can't exclude netflow keys (a `-` term); upgrade rupu there")
+    );
+
+    let unfiltered = reqwest::get(format!(
+        "http://{addr}/api/netflow/explorer?scope=run:{run_id}"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(unfiltered.status(), StatusCode::OK);
+
+    old.delete();
+    let _current = mock.mock(|when, then| {
+        when.method("GET")
+            .path("/api/netflow/explorer")
+            .query_param("not_host", "a.example:443");
+        then.status(200).json_body(remote_explorer(true));
+    });
+    assert_eq!(reqwest::get(&url).await.unwrap().status(), StatusCode::OK);
+}

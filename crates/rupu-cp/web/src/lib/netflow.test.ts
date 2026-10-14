@@ -259,20 +259,21 @@ describe('fetch helpers', () => {
     vi.unstubAllGlobals();
   });
 
-  it('appends the four cross-filter params comma-joined, and only when non-empty', async () => {
+  it('appends the cross-filter and exclusion params comma-joined, and only when non-empty', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({ flows: [], hosts: [], dropped_total: 0, asn_loaded: true, window: { from: null, to: null } }),
     });
     vi.stubGlobal('fetch', fetchMock);
     await fetchGlobalNetflow(undefined, {
+      ...EMPTY_NETFLOW_FILTERS,
       workflows: ['review-wf', 'unknown'],
       origins: ['provider:anthropic'],
-      orgs: [],
       hosts: ['api.github.com:443'],
+      not_orgs: ['as15169', 'unknown'],
     });
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/netflow?workflow=review-wf%2Cunknown&origin=provider%3Aanthropic&host=api.github.com%3A443',
+      '/api/netflow?workflow=review-wf%2Cunknown&origin=provider%3Aanthropic&host=api.github.com%3A443&not_org=as15169%2Cunknown',
     );
     vi.unstubAllGlobals();
   });

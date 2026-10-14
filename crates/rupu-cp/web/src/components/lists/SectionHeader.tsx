@@ -27,6 +27,7 @@ export function SectionHeader({
   count,
   hint,
   leading,
+  trailing,
 }: {
   tone: SectionTone;
   label: string;
@@ -34,6 +35,8 @@ export function SectionHeader({
   hint?: string;
   // Optional element rendered before the dot.
   leading?: React.ReactNode;
+  // Optional controls at the row's far end.
+  trailing?: React.ReactNode;
 }) {
   const t = TONE[tone];
   return (
@@ -43,6 +46,7 @@ export function SectionHeader({
       <h2 className={cn('text-sm font-semibold', t.text)}>{label}</h2>
       <span className="text-xs text-ink-mute tabular-nums">{count}</span>
       {hint && <span className="text-note text-ink-mute ml-1">{hint}</span>}
+      {trailing && <div className="ml-auto flex items-center gap-1">{trailing}</div>}
     </header>
   );
 }

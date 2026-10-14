@@ -27,7 +27,7 @@ use axum::{
 };
 use rupu_orchestrator::{
     executor::Event,
-    runs::{RunStore, RunStoreError},
+    runs::{RunRecord, RunStore, RunStoreError},
 };
 
 use crate::{
@@ -151,10 +151,16 @@ const MAX_RUNS_SCANNED: usize = 20;
 /// and `?before_pos=` (both present on every row this endpoint returns) so
 /// pagination resumes exactly at the last-returned event instead of at a
 /// `ts` boundary, and therefore never permanently skips same-`ts` siblings.
+///
+/// `?q=` filters the page with the query grammar (`crate::query::events`)
+/// before it is cut to `limit`, so a page holds `limit` matching events. Its
+/// `run:`, `project:` and `workflow:` terms first narrow which runs are read:
+/// the scan covers the [`MAX_RUNS_SCANNED`] most recent runs they keep. A
+/// query that doesn't parse is a 400 `{error, token, code, start, end}`.
 async fn recent_events(
     State(s): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+) -> Result<Json<Vec<serde_json::Value>>, crate::query::ListError> {
     let limit = params
         .get("limit")
         .and_then(|v| v.parse::<usize>().ok())
@@ -166,8 +172,12 @@ async fn recent_events(
         .get("before_pos")
         .and_then(|v| v.parse::<usize>().ok());
     let cursor = EventsCursor::from_parts(before_ts, before_run, before_pos);
+    let query = crate::query::ListQuery::parse(
+        params.get("q").map(String::as_str),
+        crate::query::events::FIELDS,
+    )?;
 
-    let rows = collect_recent_events(&s.run_store, limit, cursor)
+    let rows = collect_recent_events(&s.run_store, limit, cursor, query.as_ref())
         .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(rows))
 }
@@ -234,6 +244,23 @@ fn event_own_ts_ms(ev: &Event) -> Option<i64> {
     }
 }
 
+/// What a history row says about its run, beyond the event: its workflow
+/// (not for an `agent:` record), its project (the workspace directory's
+/// name, as the projects list names it) and the run's codename (derived for
+/// a legacy run, as `GET /api/runs/:id` names it).
+fn run_attribution(run: &RunRecord) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    if !run.workflow_name.is_empty() && !run.workflow_name.starts_with("agent:") {
+        out.insert("workflow".into(), serde_json::json!(run.workflow_name));
+    }
+    if let Some(name) = run.workspace_path.file_name() {
+        out.insert("project".into(), serde_json::json!(name.to_string_lossy()));
+    }
+    let (codename, _) = crate::codename::named(run.codename.as_deref(), &run.id, None);
+    out.insert("run_codename".into(), serde_json::json!(codename));
+    out
+}
+
 /// Core aggregation behind [`recent_events`], factored out so it is
 /// unit-testable without spinning up an axum server.
 ///
@@ -261,8 +288,25 @@ fn collect_recent_events(
     run_store: &RunStore,
     limit: usize,
     cursor: EventsCursor,
+    query: Option<&crate::query::ListQuery>,
 ) -> Result<Vec<serde_json::Value>, RunStoreError> {
     let runs = run_store.list()?;
+    let attributed: Vec<(&RunRecord, serde_json::Map<String, serde_json::Value>)> = runs
+        .iter()
+        .map(|run| (run, run_attribution(run)))
+        .filter(|(run, attr)| {
+            query.is_none_or(|q| {
+                let mut row = attr.clone();
+                row.insert("run_id".into(), serde_json::json!(run.id));
+                q.matches_on(
+                    &serde_json::Value::Object(row),
+                    crate::query::events::RUN_KEYS,
+                )
+                .unwrap_or(false)
+            })
+        })
+        .take(MAX_RUNS_SCANNED)
+        .collect();
 
     // (ts, run_id, pos-within-file, row). `run_id` + `pos` break ties
     // between events that share a `ts` (most commonly: every fallback-mtime
@@ -277,7 +321,7 @@ fn collect_recent_events(
         run_store.root.clone(),
     )));
 
-    for run in runs.iter().take(MAX_RUNS_SCANNED) {
+    for (run, attr) in attributed {
         // Codename-era runs are classified from the record in hand: they
         // never open a legacy namer.
         namers.note_record(run);
@@ -318,6 +362,12 @@ fn collect_recent_events(
             if let Some(obj) = row.as_object_mut() {
                 obj.insert("ts".to_string(), serde_json::json!(ts));
                 obj.insert("pos".to_string(), serde_json::json!(pos));
+                for (k, v) in &attr {
+                    obj.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
+            if query.is_some_and(|q| !q.matches(&row).unwrap_or(false)) {
+                continue;
             }
             candidates.push((ts, run.id.clone(), pos, row));
         }
@@ -341,10 +391,14 @@ mod tests {
     }
 
     fn seed_run(store: &RunStore, id: &str, started_at: DateTime<Utc>) {
+        seed_run_of(store, id, started_at, "test-workflow");
+    }
+
+    fn seed_run_of(store: &RunStore, id: &str, started_at: DateTime<Utc>, workflow: &str) {
         let record = RunRecord {
             customer: None,
             id: id.into(),
-            workflow_name: "test-workflow".into(),
+            workflow_name: workflow.into(),
             status: RunStatus::Completed,
             inputs: BTreeMap::new(),
             event: None,
@@ -458,13 +512,105 @@ mod tests {
         ]
     }
 
+    fn query(q: &str) -> crate::query::ListQuery {
+        crate::query::ListQuery::parse(Some(q), crate::query::events::FIELDS)
+            .unwrap()
+            .unwrap()
+    }
+
+    fn step_failed(run: &str, step: &str) -> Event {
+        Event::StepFailed {
+            run_id: run.into(),
+            step_id: step.into(),
+            error: "boom".into(),
+            cause: None,
+        }
+    }
+
+    /// A query filters before the page is cut, and its run terms choose the
+    /// runs read: a workflow that last ran behind more than
+    /// `MAX_RUNS_SCANNED` newer runs is still found.
+    #[test]
+    fn a_query_reaches_runs_behind_the_scan_window_and_filters_before_the_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        seed_run_of(&store, "run_rare", ts(1_000), "rare");
+        write_events(&store, "run_rare", &[step_failed("run_rare", "scan")]);
+        for i in 0..MAX_RUNS_SCANNED {
+            let id = format!("run_{i:02}");
+            seed_run(&store, &id, ts(2_000 + i as i64));
+            write_events(
+                &store,
+                &id,
+                &[step_failed(&id, "lint"), step_failed(&id, "build")],
+            );
+        }
+
+        let unfiltered = collect_recent_events(&store, 10_000, EventsCursor::None, None).unwrap();
+        assert!(unfiltered.iter().all(|r| r["run_id"] != "run_rare"));
+
+        let rows = collect_recent_events(
+            &store,
+            10,
+            EventsCursor::None,
+            Some(&query("workflow:rare")),
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["run_id"], "run_rare");
+        assert_eq!(rows[0]["workflow"], "rare");
+        assert_eq!(rows[0]["project"], "test-proj");
+
+        let rows = collect_recent_events(
+            &store,
+            3,
+            EventsCursor::None,
+            Some(&query("step:build group:error")),
+        )
+        .unwrap();
+        let steps: Vec<_> = rows
+            .iter()
+            .map(|r| r["step_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(steps, ["build", "build", "build"]);
+
+        let rows =
+            collect_recent_events(&store, 10, EventsCursor::None, Some(&query("-group:error")))
+                .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    /// A legacy run (no stored codename) is named as `GET /api/runs/:id`
+    /// names it, so `codename:` matches its history as the page matches its
+    /// live frames, which take the run's name from that read.
+    #[test]
+    fn a_legacy_runs_rows_carry_its_derived_codename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        seed_run(&store, "run_old", ts(1_000));
+        write_events(&store, "run_old", &[step_failed("run_old", "scan")]);
+        let (derived, was_derived) = crate::codename::named(None, "run_old", None);
+        assert!(was_derived);
+
+        let rows = collect_recent_events(&store, 10, EventsCursor::None, None).unwrap();
+        assert_eq!(rows[0]["run_codename"], derived.as_str());
+        let rows = collect_recent_events(
+            &store,
+            10,
+            EventsCursor::None,
+            Some(&query(&format!("codename:{derived}"))),
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
     #[test]
     fn recent_events_returns_newest_first_limited() {
         let tmp = tempfile::tempdir().unwrap();
         let store = RunStore::new(tmp.path().join("runs"));
         let [_t0, _t1, t2, t3] = seed_two_runs_four_events(&store);
 
-        let rows = collect_recent_events(&store, 2, EventsCursor::None).expect("collect");
+        let rows = collect_recent_events(&store, 2, EventsCursor::None, None).expect("collect");
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["ts"], serde_json::json!(t3));
         assert_eq!(rows[0]["type"], "run_completed");
@@ -483,7 +629,8 @@ mod tests {
         // Cursor at t2 (run_a's RunCompleted): only events strictly older
         // than t2 should come back — t1 (run_b RunStarted) then t0 (run_a
         // RunStarted), newest-first.
-        let rows = collect_recent_events(&store, 100, EventsCursor::TsOnly(t2)).expect("collect");
+        let rows =
+            collect_recent_events(&store, 100, EventsCursor::TsOnly(t2), None).expect("collect");
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["ts"], serde_json::json!(t1));
         assert_eq!(rows[0]["type"], "run_started");
@@ -508,7 +655,7 @@ mod tests {
         let newer = r#"{"type":"step_warped","run_id":"run_n","step_id":"s"}"#;
         std::fs::write(store.events_path("run_n"), format!("{known}\n{newer}\n")).unwrap();
 
-        let rows = collect_recent_events(&store, 100, EventsCursor::None).expect("collect");
+        let rows = collect_recent_events(&store, 100, EventsCursor::None, None).expect("collect");
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0]["type"], "run_started");
     }
@@ -518,7 +665,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = RunStore::new(tmp.path().join("runs"));
 
-        let rows = collect_recent_events(&store, 200, EventsCursor::None).expect("collect");
+        let rows = collect_recent_events(&store, 200, EventsCursor::None, None).expect("collect");
         assert!(rows.is_empty());
     }
 
@@ -550,7 +697,8 @@ mod tests {
             );
         }
 
-        let rows = collect_recent_events(&store, 10_000, EventsCursor::None).expect("collect");
+        let rows =
+            collect_recent_events(&store, 10_000, EventsCursor::None, None).expect("collect");
         // Bounded to at most MAX_RUNS_SCANNED runs' worth of events (one
         // event per run here), never the full `total_runs`.
         assert_eq!(rows.len(), MAX_RUNS_SCANNED);
@@ -597,7 +745,7 @@ mod tests {
         let mut cursor = EventsCursor::None;
         let mut pages = 0;
         loop {
-            let rows = collect_recent_events(&store, limit, cursor).expect("collect");
+            let rows = collect_recent_events(&store, limit, cursor, None).expect("collect");
             if rows.is_empty() {
                 break;
             }

@@ -1,0 +1,16 @@
+[
+  {"aliases":[],"facet":true,"key":"group","kind":"enum","match":"exact","text":false,"values":["finding","activity","await","warning","error"]},
+  {"aliases":[],"facet":true,"key":"type","kind":"text","match":"exact","text":false,"values":[]},
+  {"aliases":[],"facet":false,"key":"run","kind":"text","match":"prefix","text":true,"values":[]},
+  {"aliases":[],"facet":true,"key":"project","kind":"text","match":"contains","text":true,"values":[]},
+  {"aliases":[],"facet":true,"key":"workflow","kind":"text","match":"contains","text":true,"values":[]},
+  {"aliases":[],"facet":true,"key":"agent","kind":"text","match":"contains","text":true,"values":[]},
+  {"aliases":[],"facet":true,"key":"step","kind":"text","match":"contains","text":true,"values":[]},
+  {"aliases":[],"facet":false,"key":"codename","kind":"text","match":"contains","text":true,"values":[]},
+  {"aliases":[],"facet":true,"key":"provider","kind":"text","match":"exact","text":false,"values":[]},
+  {"aliases":[],"facet":true,"key":"model","kind":"text","match":"exact","text":false,"values":[]},
+  {"aliases":["sev"],"facet":true,"key":"severity","kind":"severity","match":"ordered","text":false,"values":["info","low","medium","high","critical"]},
+  {"aliases":[],"facet":false,"key":"message","kind":"text","match":"contains","text":true,"values":[]},
+  {"aliases":[],"facet":false,"key":"since","kind":"time","match":"since","text":false,"values":[]},
+  {"aliases":[],"facet":false,"key":"until","kind":"time","match":"until","text":false,"values":[]}
+]

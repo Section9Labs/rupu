@@ -15,8 +15,6 @@ function renderStrip(props: Partial<React.ComponentProps<typeof ActivityStrip>> 
   return render(
     <ActivityStrip
       histogram={HISTOGRAM}
-      range={{ preset: 'all' }}
-      onRangeChange={() => {}}
       onZoom={() => {}}
       appliedWindow={{ from: null, to: null }}
       {...props}
@@ -43,15 +41,14 @@ function mockChartRect() {
 }
 
 describe('ActivityStrip', () => {
-  it('renders the presets, the server-echo readout, and the histogram bounds', () => {
+  it('renders the server-echo readout and the drag hint, and no window control of its own', () => {
     renderStrip();
-    expect(screen.getByRole('button', { name: 'All' })).toBeInTheDocument();
+    expect(screen.queryAllByRole('button')).toHaveLength(0);
     expect(screen.getByText(/showing all recorded flows/i)).toBeInTheDocument();
     expect(screen.getByText(/drag on the chart to zoom/i)).toBeInTheDocument();
   });
 
-  it('reads the readout from the SERVER echo, not the picker state', () => {
-    // Picker says "all" but the echo carries a bound — the echo wins.
+  it('reads the readout from the SERVER echo', () => {
     renderStrip({ appliedWindow: { from: '2026-08-01T00:00:00Z', to: null } });
     expect(screen.getByText(/showing flows from/i)).toBeInTheDocument();
     expect(screen.queryByText(/showing all recorded flows/i)).not.toBeInTheDocument();

@@ -5,6 +5,7 @@
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, fireEvent, cleanup } from '@testing-library/react';
 import StepTranscriptBrowser from './StepTranscriptBrowser';
+import { commitQuery } from '../query/queryTestUtils';
 import type { UnitView } from '../../lib/runGraphModel';
 
 // Capture TranscriptPanel's props by rendering them as a marker element.
@@ -52,10 +53,10 @@ describe('StepTranscriptBrowser', () => {
     expect(panel.getAttribute('data-live')).toBe('false');
   });
 
-  it('narrows the left list to failed units when the failed pill is clicked', () => {
+  it('narrows the left list to the units the query keeps', () => {
     render(<StepTranscriptBrowser stepId="process_items" units={UNITS} />);
 
-    fireEvent.click(screen.getByText('failed (2)'));
+    commitQuery('Filter units', 'state:failed');
 
     // failed units remain
     expect(screen.getByTitle('item-c')).toBeTruthy();
@@ -65,10 +66,18 @@ describe('StepTranscriptBrowser', () => {
     expect(screen.queryByTitle('item-b')).toBeNull();
   });
 
+  it('finds a unit by a warning, and counts what it keeps', () => {
+    const units: UnitView[] = [UNITS[0], { ...UNITS[1], warnings: ['slow host'] }, UNITS[2], UNITS[3]];
+    render(<StepTranscriptBrowser stepId="process_items" units={units} />);
+    commitQuery('Filter units', 'has:warning');
+    expect(screen.getAllByRole('button', { pressed: true }).map((b) => b.textContent)).toEqual([expect.stringContaining('item-b')]);
+    expect(screen.getByTestId('query-count').textContent).toBe('1 of 4');
+  });
+
   it('re-selects the first visible unit after a filter removes the selection', () => {
     render(<StepTranscriptBrowser stepId="process_items" units={UNITS} />);
     // first selection is item-a (done, /0.jsonl); filtering to failed removes it
-    fireEvent.click(screen.getByText('failed (2)'));
+    commitQuery('Filter units', 'state:failed');
     const panel = screen.getByTestId('transcript-panel');
     expect(panel.getAttribute('data-path')).toBe('/runs/r1/units/2.jsonl');
   });

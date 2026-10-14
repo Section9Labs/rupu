@@ -332,12 +332,17 @@ export interface ExplorerResponse {
 
 /** The four cross-filter sets, keyed by the server's dimension keys
  *  (workflow names / `provider:x`,`scm:x` / `as<number>`,`unknown` /
- *  `host:port`). Empty array = dimension unfiltered. */
+ *  `host:port`), and the keys each dimension leaves out (`not_*`). Empty
+ *  array = dimension unfiltered. */
 export interface NetflowFilters {
   workflows: string[];
   origins: string[];
   orgs: string[];
   hosts: string[];
+  not_workflows: string[];
+  not_origins: string[];
+  not_orgs: string[];
+  not_hosts: string[];
 }
 
 export const EMPTY_NETFLOW_FILTERS: NetflowFilters = {
@@ -345,15 +350,14 @@ export const EMPTY_NETFLOW_FILTERS: NetflowFilters = {
   origins: [],
   orgs: [],
   hosts: [],
+  not_workflows: [],
+  not_origins: [],
+  not_orgs: [],
+  not_hosts: [],
 };
 
 export function filtersAreEmpty(f: NetflowFilters): boolean {
-  return (
-    f.workflows.length === 0 &&
-    f.origins.length === 0 &&
-    f.orgs.length === 0 &&
-    f.hosts.length === 0
-  );
+  return Object.values(f).every((xs) => xs.length === 0);
 }
 
 // (The bipartite `GraphView`/`GraphNode`/`GraphEdge` types and their
@@ -421,6 +425,10 @@ function appendRange(url: string, range?: NetflowRange, filters?: NetflowFilters
     if (filters.origins.length) params.set('origin', filters.origins.join(','));
     if (filters.orgs.length) params.set('org', filters.orgs.join(','));
     if (filters.hosts.length) params.set('host', filters.hosts.join(','));
+    if (filters.not_workflows.length) params.set('not_workflow', filters.not_workflows.join(','));
+    if (filters.not_origins.length) params.set('not_origin', filters.not_origins.join(','));
+    if (filters.not_orgs.length) params.set('not_org', filters.not_orgs.join(','));
+    if (filters.not_hosts.length) params.set('not_host', filters.not_hosts.join(','));
   }
   const qs = params.toString();
   if (!qs) return url;
@@ -483,6 +491,23 @@ export function spanWindow(
     to: endedAt ? pad(endedAt, SPAN_PAD_MS) : undefined,
   };
 }
+
+/** `rupu_cp::api::netflow::LatestRun`: a run with flows. `run_id` is null
+ *  for a ledger no run record accounts for (its span is its own flows);
+ *  `finished_at` is null while the run is live. */
+export interface LatestRun {
+  run_id: string | null;
+  workflow: string | null;
+  started_at: string;
+  finished_at: string | null;
+}
+
+/** The most recently started run with flows in a project (`project:<id>`)
+ *  or globally (no scope): the span the explorer opens on. */
+export const fetchNetflowLatest = (scope?: string): Promise<{ latest: LatestRun | null }> =>
+  getJson<{ latest: LatestRun | null }>(
+    scope ? `/api/netflow/latest?scope=${encodeURIComponent(scope)}` : '/api/netflow/latest',
+  );
 
 /** `scope` is `run:<id>`, `agentiflow:<id>` or `project:<id>`; omitted
  *  entirely for global — the same contract as `GET /api/netflow/graph`'s

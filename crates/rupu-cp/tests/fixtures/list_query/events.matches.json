@@ -1,0 +1,24 @@
+{
+  "rows": [
+    {"type": "step_failed", "run_id": "run_01J9", "step_id": "scan", "error": "connection refused", "ts": 1759752000000, "pos": 0, "workflow": "nightly", "project": "shop-web", "run_codename": "cobalt-harbor"},
+    {"type": "attempt_resumed", "run_id": "run_01J9", "step_id": "scan", "unit_index": 2, "mode": "continued", "reason": "transcript resumable", "ts": 1759752001000, "pos": 1, "workflow": "nightly", "project": "shop-web", "run_codename": "cobalt-harbor"},
+    {"type": "agent_started", "run_id": "run_01J9", "step_id": "scan", "unit_index": 0, "codename": "cobalt-harbor/heron#1", "codename_derived": false, "agent": "recon", "provider": "anthropic", "model": "claude-opus-4-1", "agent_run_id": "run_02", "transcript_path": "/t/0.jsonl", "ts": 1759752002000, "pos": 2, "workflow": "nightly", "project": "shop-web", "run_codename": "cobalt-harbor"},
+    {"type": "unit_started", "run_id": "run_01J9", "step_id": "sweep", "index": 1, "unit_key": "repo-a", "agent": "recon", "transcript_path": "/t/1.jsonl", "ts": 1759752003000, "pos": 3, "workflow": "nightly", "project": "shop-web", "run_codename": "cobalt-harbor"},
+    {"type": "dispatch_completed", "run_id": "run_01J9", "sub_run_id": "sub_01", "kind": "agent", "success": true, "tokens_in": 10, "tokens_out": 5, "ts": 1759752004000, "pos": 4, "workflow": "nightly", "project": "shop-web", "run_codename": "cobalt-harbor"}
+  ],
+  "cases": [
+    {"q": "step:scan", "keep": [0, 1, 2]},
+    {"q": "agent:recon", "keep": [2, 3]},
+    {"q": "-agent:recon", "keep": [0, 1, 4]},
+    {"q": "codename:heron", "keep": [2]},
+    {"q": "codename:cobalt", "keep": [0, 1, 2, 3, 4]},
+    {"q": "provider:anthropic model:claude-opus-4-1", "keep": [2]},
+    {"q": "message:resumable", "keep": [1]},
+    {"q": "refused", "keep": [0]},
+    {"q": "group:error", "keep": [0]},
+    {"q": "type:attempt_resumed", "keep": [1]},
+    {"q": "run:run_01 workflow:night project:shop", "keep": [0, 1, 2, 3, 4]},
+    {"q": "severity>=low", "keep": []},
+    {"q": "since:2025-10-06 until:2025-10-06", "keep": [0, 1, 2, 3, 4]}
+  ]
+}

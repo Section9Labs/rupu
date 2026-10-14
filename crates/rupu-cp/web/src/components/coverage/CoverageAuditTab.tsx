@@ -9,19 +9,19 @@ import {
   type AuditReport,
   type ConcernCoverage,
 } from '../../lib/api';
-import { filterConcerns } from '../../lib/coverageFilter';
 import { SectionHeader } from '../lists/SectionHeader';
 import { ListCard } from '../lists/ListCard';
 import { Spinner } from '../ui/Spinner';
 import CollapsibleRow from './CollapsibleRow';
 import SeverityChip from './SeverityChip';
 import CappedList from './CappedList';
-import ConcernControls from './ConcernControls';
+import ExpandCollapse from './ExpandCollapse';
+import { ListQueryBar, NoMatches, useFilteredRows, useListQuery } from '../query/ListQueryBar';
+import { AUDIT_FIELDS } from '../../lib/query/lists/concerns';
 
 export default function CoverageAuditTab({ target, wsId }: { target: string; wsId?: string }) {
   const [report, setReport] = useState<AuditReport | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [severity, setSeverity] = useState('all');
   const [open, setOpen] = useState<Set<string>>(new Set());
 
   useEffect(() => {
@@ -41,18 +41,16 @@ export default function CoverageAuditTab({ target, wsId }: { target: string; wsI
     };
   }, [target, wsId]);
 
-  const concerns = useMemo(
+  const all = useMemo(
     () =>
-      filterConcerns(
-        // SEV_ORDER puts critical at index 0, so ascending rank = critical→info.
-        [...(report?.concerns ?? [])].sort(
-          (a, b) =>
-            sevRank(normFindingSeverity(a.severity)) - sevRank(normFindingSeverity(b.severity)),
-        ),
-        severity,
+      // SEV_ORDER puts critical at index 0, so ascending rank = critical→info.
+      [...(report?.concerns ?? [])].sort(
+        (a, b) => sevRank(normFindingSeverity(a.severity)) - sevRank(normFindingSeverity(b.severity)),
       ),
-    [report, severity],
+    [report],
   );
+  const [q, setQ] = useListQuery();
+  const { rows: concerns, error: queryError, facets } = useFilteredRows(all, q, AUDIT_FIELDS);
 
   function toggle(id: string) {
     setOpen((prev) => {
@@ -77,18 +75,38 @@ export default function CoverageAuditTab({ target, wsId }: { target: string; wsI
       </div>
 
       <section>
-        <SectionHeader tone="progress" label="Per-concern coverage" count={concerns.length} />
-        {concerns.length === 0 ? (
-          <p className="text-sm text-ink-dim pl-1 mt-1">No catalog → no audit matrix.</p>
+        {all.length === 0 ? (
+          <>
+            <SectionHeader tone="progress" label="Per-concern coverage" count={0} />
+            <p className="text-sm text-ink-dim pl-1 mt-1">No catalog → no audit matrix.</p>
+          </>
         ) : (
           <>
-            <ConcernControls
-              severity={severity}
-              onSeverity={setSeverity}
-              onExpandAll={() => setOpen(new Set(concerns.map((c) => c.concern_id)))}
-              onCollapseAll={() => setOpen(new Set())}
-              total={concerns.length}
+            <ListQueryBar
+              value={q}
+              onChange={setQ}
+              fields={AUDIT_FIELDS}
+              facets={facets}
+              total={all.length}
+              shown={concerns.length}
+              error={queryError}
+              label="Filter concerns"
+              placeholder="Filter concerns… e.g. severity>=high has:gap file:src/api"
             />
+            <SectionHeader
+              tone="progress"
+              label="Per-concern coverage"
+              count={concerns.length}
+              trailing={
+                <ExpandCollapse
+                  onExpandAll={() => setOpen(new Set(concerns.map((c) => c.concern_id)))}
+                  onCollapseAll={() => setOpen(new Set())}
+                />
+              }
+            />
+            {concerns.length === 0 ? (
+              <NoMatches noun="concerns" />
+            ) : (
             <ListCard>
               {concerns.map((c) => (
                 <ConcernRow
@@ -99,6 +117,7 @@ export default function CoverageAuditTab({ target, wsId }: { target: string; wsI
                 />
               ))}
             </ListCard>
+            )}
           </>
         )}
       </section>

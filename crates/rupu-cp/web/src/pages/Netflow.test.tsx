@@ -5,9 +5,9 @@
 // scope, the coverage popover carries the scope disclosure + dropped
 // accounting (the v3 "honesty on demand" move), the all-dropped empty
 // case still gets the loud banner, empty-state wording branches on the
-// SERVER's window echo, and a preset change re-fetches with the new
-// range. Explorer internals (filters, views, zoom) are covered by the
-// explorer component tests.
+// SERVER's window echo, it opens on the default window, and a since: term
+// re-fetches with the new range. Explorer internals (filters, views, zoom)
+// are covered by the explorer component tests.
 
 import '@testing-library/jest-dom/vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
@@ -19,21 +19,32 @@ import {
   flowView,
 } from '../components/netflow/explorer/explorerFixtures';
 
-const { fetchGlobalNetflow, fetchNetflowExplorer } = vi.hoisted(() => ({
+const { fetchGlobalNetflow, fetchNetflowExplorer, fetchNetflowLatest } = vi.hoisted(() => ({
   fetchGlobalNetflow: vi.fn(),
   fetchNetflowExplorer: vi.fn(),
+  fetchNetflowLatest: vi.fn(),
 }));
 vi.mock('../lib/netflow', async () => {
   const actual = await vi.importActual<typeof import('../lib/netflow')>('../lib/netflow');
-  return { ...actual, fetchGlobalNetflow, fetchNetflowExplorer };
+  return { ...actual, fetchGlobalNetflow, fetchNetflowExplorer, fetchNetflowLatest };
 });
 
 import Netflow from './Netflow';
 import { MemoryRouter } from 'react-router-dom';
 import { scopedEntry, withCustomerScope } from '../lib/customerScopeTestUtils';
+import { commitQuery } from '../components/query/queryTestUtils';
 
 const NOW = new Date('2026-10-06T12:00:00Z');
+const HOUR = { from: '2026-10-06T11:00:00.000Z' };
 const DAY = { from: '2026-10-05T12:00:00.000Z' };
+
+function renderPage() {
+  return render(
+    <MemoryRouter initialEntries={['/netflow']}>
+      <Netflow />
+    </MemoryRouter>,
+  );
+}
 
 afterEach(() => {
   vi.useRealTimers();
@@ -45,17 +56,20 @@ beforeEach(() => {
   vi.setSystemTime(NOW);
   fetchGlobalNetflow.mockReset();
   fetchNetflowExplorer.mockReset();
+  fetchNetflowLatest.mockReset();
+  fetchNetflowLatest.mockResolvedValue({ latest: null });
   fetchGlobalNetflow.mockResolvedValue(emptyFlowsResponse());
   fetchNetflowExplorer.mockResolvedValue(emptyExplorerResponse());
 });
 
 describe('Netflow global page', () => {
   it('fetches global scope by omitting the scope param entirely', async () => {
-    render(<Netflow />);
+    renderPage();
     await waitFor(() =>
-      expect(fetchNetflowExplorer).toHaveBeenCalledWith(undefined, DAY, undefined),
+      expect(fetchNetflowExplorer).toHaveBeenCalledWith(undefined, HOUR, undefined),
     );
-    expect(fetchGlobalNetflow).toHaveBeenCalledWith(DAY, undefined);
+    expect(fetchNetflowLatest).toHaveBeenCalledWith(undefined);
+    expect(fetchGlobalNetflow).toHaveBeenCalledWith(HOUR, undefined);
   });
 
   it('renders the table once loaded, with Run/Workflow attribution columns at this scope', async () => {
@@ -63,7 +77,7 @@ describe('Netflow global page', () => {
       ...emptyFlowsResponse(),
       flows: [flowView({ run_id: 'run-9', workflow: 'review-wf' })],
     } satisfies NetflowResponse);
-    render(<Netflow />);
+    renderPage();
 
     await screen.findByText('api.anthropic.com');
     expect(screen.getByText('run-9')).toBeInTheDocument();
@@ -71,7 +85,7 @@ describe('Netflow global page', () => {
   });
 
   it('surfaces the scope disclosure through the coverage popover', async () => {
-    render(<Netflow />);
+    renderPage();
     await screen.findByRole('button', { name: /coverage & gaps/i });
 
     fireEvent.click(screen.getByRole('button', { name: /coverage & gaps/i }));
@@ -90,7 +104,7 @@ describe('Netflow global page', () => {
       flows: [flowView()],
       dropped_total: 12,
     } satisfies NetflowResponse);
-    render(<Netflow />);
+    renderPage();
     await screen.findByText('api.anthropic.com');
 
     fireEvent.click(screen.getByRole('button', { name: /coverage & gaps/i }));
@@ -103,7 +117,7 @@ describe('Netflow global page', () => {
       ...emptyFlowsResponse(),
       dropped_total: 9,
     } satisfies NetflowResponse);
-    render(<Netflow />);
+    renderPage();
 
     await screen.findByText(/9 flows dropped/i);
     expect(screen.getByText(/No network flows recorded/i)).toBeInTheDocument();
@@ -114,22 +128,20 @@ describe('Netflow global page', () => {
       ...emptyFlowsResponse(),
       window: { from: '2026-08-17T14:00:00Z', to: null },
     } satisfies NetflowResponse);
-    render(<Netflow />);
+    renderPage();
 
     await screen.findByText(/no network flows in this range/i);
   });
 
-  it('re-fetches with the new range when a preset is selected', async () => {
-    render(<Netflow />);
+  it('re-fetches with the new range when the query names a window', async () => {
+    renderPage();
     await waitFor(() => expect(fetchNetflowExplorer).toHaveBeenCalledTimes(1));
 
-    fireEvent.click(screen.getByRole('button', { name: /last hour/i }));
+    commitQuery('Filter network flows', 'since:24h');
 
     await waitFor(() => expect(fetchNetflowExplorer).toHaveBeenCalledTimes(2));
-    const [, range] = fetchNetflowExplorer.mock.calls[1];
-    expect(range).toMatchObject({ from: expect.stringMatching(/T/) });
-    const [flowsRange] = fetchGlobalNetflow.mock.calls[1];
-    expect(flowsRange).toMatchObject({ from: expect.stringMatching(/T/) });
+    expect(fetchNetflowExplorer).toHaveBeenLastCalledWith(undefined, DAY, undefined);
+    expect(fetchGlobalNetflow).toHaveBeenLastCalledWith(DAY, undefined);
   });
 });
 
