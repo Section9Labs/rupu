@@ -380,6 +380,18 @@ launch skills with the rest of its command. `--skill` on the continue replaces
 the whole skill list and `--preload-skill` the whole preload list. Passing a
 flag is the only way to change them: a continued run can't drop them entirely.
 
+A prompt that starts with `/name` invokes that skill, as `/skill-name args`
+does in Claude Code: `rupu run reviewer "/pdf summarise q3.pdf"`. Each leading
+`/` token is an operator entry (`/pdf`, `/project:pdf`) and the rest of the
+prompt follows the last one. The skill joins the run's launch skills (recorded
+as a `--skill` in its command, so `--continue` keeps it), its body
+goes ahead of the rest of the prompt (the block shown in
+[Skills in sessions](#skills-in-sessions)), and the transcript records a
+`skill_load` with `via: operator`. The first token that names no installed
+skill starts the prompt as text, so `/tmp is full` and `/etc/hosts` are sent
+unchanged. An ambiguous name or one named from both layers fails the run.
+`rupu session start` and `rupu session send` read the same tokens.
+
 A child started with `dispatch` (any kind, or a legacy name like
 `dispatch_agent`) gets its own agent's skills, not its parent's. Sessions
 are covered in [Skills in sessions](#skills-in-sessions).
@@ -426,6 +438,12 @@ the turn's message:
 
 summarise x.pdf
 ```
+
+A prompt that starts with `/name` does the same as `--skill name`
+(`rupu session send <id> "/pdf summarise x.pdf"`), as it does for
+`rupu run`, after any `--skill` entries. A token that names no installed
+skill starts the prompt as text. `rupu session start` takes `/name` in its
+first prompt the same way.
 
 `version` is the first 12 hex digits of the skill's content hash. The turn's
 transcript records a `skill_load` with `via: operator`. From then on the skill
@@ -498,10 +516,15 @@ entry is refused.
 A workflow step's `skills` and `preload_skills` are fields of the step form
 for any step that runs an agent. The launcher's Skills section adds skills to
 a run (`rupu run --skill` / `--preload-skill`) or a session
-(`rupu session start --skill` / `--preload-skill`). A session's composer has
-an "Invoke skill" control: a send with a skill and no prompt is allowed, as
-`rupu session send --skill` allows it. A skill name the CLI refuses (unknown,
-a wildcard, ambiguous) comes back as the CLI's message.
+(`rupu session start --skill` / `--preload-skill`). The session composer and
+the launcher's prompt open a menu of the installed skills when a message
+starts with `/`: arrows move, Enter or Tab writes `/name ` into the prompt,
+Escape closes it. The prompt is sent as typed and the CLI reads the `/`
+tokens. Below the box the composer says which skills the message invokes,
+and warns when a `/` token names no skill (it is sent as text). A remote host
+gets no menu, since this control plane can't list its skills; a typed `/name`
+still reaches a rupu there that reads `/` tokens. A skill the CLI refuses
+(ambiguous, held from the other layer) comes back as the CLI's message.
 
 Session skills on a remote host need a rupu there that advertises
 `session.skills`; an older one is refused before anything is sent, with an

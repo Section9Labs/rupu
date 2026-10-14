@@ -13,12 +13,10 @@ import { Archive, ArrowLeft, MessageCircle, MessagesSquare, RotateCcw, Trash2 } 
 import {
   api,
   apiErrorMessage,
-  skillNamesOf,
   type SessionSummary,
   type SessionRunRow,
   type UsageTimelinePoint,
 } from '../lib/api';
-import { ChipsInput } from '../components/agentBuilder/controls';
 import { cn } from '../lib/cn';
 import { absoluteTime, relativeTime } from '../lib/time';
 import { sessionStatusDot, sessionStatusLabel, sessionStatusTone } from '../lib/sessionStatus';
@@ -30,6 +28,8 @@ import { Button } from '../components/ui/Button';
 import { Spinner } from '../components/ui/Spinner';
 import RunUsageTimeline from '../components/charts/RunUsageTimeline';
 import SessionConversation from '../components/session/SessionConversation';
+import SlashSkillTextarea from '../components/session/SlashSkillTextarea';
+import { slashSkillsOf, type SlashSkill } from '../lib/slashSkills';
 import MessageFeed from '../components/messages/MessageFeed';
 import { MessageLinksContext, type MessageLinks } from '../components/transcript/messageLinks';
 import { TabButton } from '../components/TabBar';
@@ -84,8 +84,7 @@ export default function SessionDetailPage() {
 
   // Composer state
   const [prompt, setPrompt] = useState('');
-  const [invokeSkills, setInvokeSkills] = useState<string[]>([]);
-  const [skillNames, setSkillNames] = useState<string[]>([]);
+  const [skills, setSkills] = useState<SlashSkill[]>([]);
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
   const [sendOk, setSendOk] = useState(false);
@@ -201,9 +200,10 @@ export default function SessionDetailPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, pollInterval, sessionActive, host]);
 
-  // Skills the composer suggests: the global layer plus the session's project.
-  // This CP's listing says nothing about a remote host's skills, so a remote
-  // session gets no suggestions (a typed name still goes through).
+  // Skills the composer's `/` menu offers: the global layer plus the
+  // session's project. This CP's listing says nothing about a remote host's
+  // skills, so a remote session gets no menu (a typed `/name` still goes
+  // through).
   const sessionLoaded = session !== null;
   const skillsWsId = session?.workspace_id || undefined;
   useEffect(() => {
@@ -212,7 +212,7 @@ export default function SessionDetailPage() {
     api
       .getSkills(skillsWsId)
       .then((rows) => {
-        if (!cancelled) setSkillNames(skillNamesOf(rows));
+        if (!cancelled) setSkills(slashSkillsOf(rows));
       })
       .catch(() => {
         /* no listing → no suggestions */
@@ -264,15 +264,14 @@ export default function SessionDetailPage() {
 
   const handleSend = () => {
     const text = prompt.trim();
-    if (!id || (!text && invokeSkills.length === 0) || sending) return;
+    if (!id || !text || sending) return;
     setSending(true);
     setSendError(null);
     setSendOk(false);
     api
-      .sendSessionMessage(id, text, host, invokeSkills.length > 0 ? invokeSkills : undefined)
+      .sendSessionMessage(id, text, host)
       .then(() => {
         setPrompt('');
-        setInvokeSkills([]);
         setSendOk(true);
         // Surface the new turn immediately rather than waiting for the poll —
         // its TranscriptPanel then streams live.
@@ -493,11 +492,12 @@ export default function SessionDetailPage() {
           <label htmlFor="session-composer" className="sr-only">
             Message this session
           </label>
-          <textarea
+          <SlashSkillTextarea
             id="session-composer"
             value={prompt}
-            onChange={(e) => {
-              setPrompt(e.target.value);
+            skills={skills}
+            onChange={(next) => {
+              setPrompt(next);
               if (sendOk) setSendOk(false);
             }}
             onKeyDown={(e) => {
@@ -508,23 +508,9 @@ export default function SessionDetailPage() {
             }}
             disabled={sending || stopped}
             rows={2}
-            placeholder="Message this session…"
+            placeholder={skills.length > 0 ? 'Message this session… (/ for skills)' : 'Message this session…'}
             className="w-full resize-y rounded-lg border border-border bg-panel px-3 py-2 text-sm text-ink placeholder:text-ink-mute focus:outline-none focus:ring-2 focus:ring-brand-200 disabled:cursor-not-allowed disabled:bg-surface disabled:text-ink-dim"
           />
-
-          <div data-testid="session-invoke-skill" className="mt-2 flex items-center gap-2">
-            <span className="shrink-0 text-ui font-medium text-ink-dim">Invoke skill</span>
-            <ChipsInput
-              list={invokeSkills}
-              aria-label="Invoke skill"
-              suggestions={skillNames}
-              placeholder="skill…"
-              onChange={(next) => {
-                setInvokeSkills(next);
-                if (sendOk) setSendOk(false);
-              }}
-            />
-          </div>
 
           {sendError && (
             <div
@@ -547,7 +533,7 @@ export default function SessionDetailPage() {
             </div>
             <Button
               onClick={handleSend}
-              disabled={sending || stopped || (prompt.trim().length === 0 && invokeSkills.length === 0)}
+              disabled={sending || stopped || prompt.trim().length === 0}
               className="px-4 text-sm disabled:opacity-50"
             >
               {sending ? 'Sending…' : 'Send'}

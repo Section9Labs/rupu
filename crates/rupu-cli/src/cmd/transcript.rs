@@ -2386,12 +2386,15 @@ pub(crate) fn prune_archived_transcripts(
 }
 
 /// `rupu run` writes its coverage stream to `<global>/runs/<run_id>/` from the
-/// moment it starts, but only a run that finishes writes `run.json` there —
-/// and with it joins `RunStore`, which archives and deletes it. A run dir
-/// WITHOUT `run.json` (a launch that failed its pre-flight, a killed run)
+/// moment it starts — and, when a coordinator launched it, its netflow
+/// stream `netflow.jsonl` (spec 2026-10-14 remote netflow transport §N1),
+/// each with its `.lock` — but only a run that finishes writes `run.json`
+/// there — and with it joins `RunStore`, which archives and deletes it. A run
+/// dir WITHOUT `run.json` (a launch that failed its pre-flight, a killed run)
 /// belongs to nothing but the transcript, so it follows the transcript: moved
-/// on archive, removed on prune and delete. `None` for an id that is not a
-/// plain run id — it is joined onto a path that may be removed recursively.
+/// on archive, removed on prune and delete. The rule is the same whichever
+/// streams the dir holds. `None` for an id that is not a plain run id — it is
+/// joined onto a path that may be removed recursively.
 fn stream_only_run_dir(runs_root: &std::path::Path, run_id: &str) -> Option<PathBuf> {
     let plain = !run_id.is_empty()
         && run_id

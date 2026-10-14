@@ -74,7 +74,7 @@ pub async fn resume_run(
     via_timeout: bool,
 ) -> anyhow::Result<ResumeOutcome> {
     let awaited_step_id = awaited_step_id.to_string();
-    let (mut opts, prior_step_results) =
+    let (mut opts, prior_step_results, root_netflow) =
         rebuild_opts_from_disk(store, global, run_id, mode).await?;
     opts.resume_from = Some(rupu_orchestrator::ResumeState::from_approval_with_actor(
         run_id.to_string(),
@@ -83,7 +83,7 @@ pub async fn resume_run(
         approver.to_string(),
         via_timeout,
     ));
-    let result = run_with_pause_channel(opts, run_id).await?;
+    let result = run_with_pause_channel(opts, run_id, root_netflow).await?;
     Ok(ResumeOutcome {
         awaited_step_id,
         result,
@@ -107,13 +107,13 @@ pub async fn resume_decided(
     run_id: &str,
     mode: Option<&str>,
 ) -> anyhow::Result<OrchestratorRunResult> {
-    let (mut opts, prior_step_results) =
+    let (mut opts, prior_step_results, root_netflow) =
         rebuild_opts_from_disk(store, global, run_id, mode).await?;
     opts.resume_from = Some(rupu_orchestrator::ResumeState::from_decisions(
         run_id.to_string(),
         prior_step_results,
     ));
-    run_with_pause_channel(opts, run_id).await
+    run_with_pause_channel(opts, run_id, root_netflow).await
 }
 
 /// Re-enter `run_workflow` with `opts` (a resume), handing the run a
@@ -121,6 +121,7 @@ pub async fn resume_decided(
 async fn run_with_pause_channel(
     mut opts: OrchestratorRunOpts,
     run_id: &str,
+    root_netflow: crate::cmd::workflow::RootNetflow,
 ) -> anyhow::Result<OrchestratorRunResult> {
     // Hand the resumed (possibly detached) run a cooperative-pause channel,
     // the same one a fresh `rupu workflow run` wires — pre-fix the rebuild
@@ -148,6 +149,7 @@ async fn run_with_pause_channel(
     if let Some(handle) = pause_poller {
         handle.abort();
     }
+    root_netflow.finish_leftover().await;
     Ok(result?)
 }
 
@@ -180,7 +182,10 @@ pub async fn build_reject_cleanup_opts(
     reason: &str,
     mode: Option<&str>,
 ) -> anyhow::Result<(OrchestratorRunOpts, usize)> {
-    let (mut opts, prior_step_results) =
+    // The root's netflow is finished by the chain's end
+    // (`run_reject_cleanup` runs the run's before-terminal hooks), so the
+    // handle is not kept.
+    let (mut opts, prior_step_results, _root_netflow) =
         rebuild_opts_from_disk(store, global, run_id, mode).await?;
     let chain_len = opts
         .workflow
@@ -293,7 +298,11 @@ async fn rebuild_opts_from_disk(
     global: &Path,
     run_id: &str,
     mode: Option<&str>,
-) -> anyhow::Result<(OrchestratorRunOpts, Vec<rupu_orchestrator::StepResult>)> {
+) -> anyhow::Result<(
+    OrchestratorRunOpts,
+    Vec<rupu_orchestrator::StepResult>,
+    crate::cmd::workflow::RootNetflow,
+)> {
     let global = global.to_path_buf();
     paths::ensure_dir(&global)?;
     let runs_dir = global.join("runs");
@@ -361,19 +370,22 @@ async fn rebuild_opts_from_disk(
     // `DefaultStepFactory::launch_for_step`'s per-step ledger/
     // transcript naming for a linear step, which reuses the workflow's own
     // run id) — so this registry's sink and every step's own sink converge
-    // on the one ledger for this run. The writer handle is intentionally
-    // not held/shut down here: the sink Arc lives on inside `mcp_registry`
-    // (and every connector it hands out) for as long as the resumed run
-    // needs it, which is the same "drop the local handle, let the last
-    // sink holder's drop close the channel" pattern every other in-run
-    // sink build in this crate relies on.
-    let _netflow = crate::netflow_sink::for_run(
+    // on the one ledger for this run. It is finished before the record
+    // turns terminal, or at the end of a reject cleanup chain
+    // (`RootNetflow`; the caller finishes a leftover after a pause).
+    // It tees into the stream it was launched under: its link's root, else
+    // its own begun stream (spec 2026-10-14 remote netflow transport §N1).
+    let launch_link = store.read_launch_link(run_id);
+    let netflow = crate::netflow_sink::for_run(
         &global,
         project_root.as_deref(),
         run_id,
         &transcripts.join(format!("{run_id}.jsonl")),
+        crate::netflow_sink::root_stream(&global, launch_link.as_ref(), run_id),
     );
-    let netflow_sink = _netflow.sink.clone();
+    let netflow_sink = netflow.sink.clone();
+    let root_netflow =
+        crate::cmd::workflow::RootNetflow::arm(Arc::clone(&store_arc), run_id, netflow);
     let mcp_registry =
         Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg, netflow_sink).await);
 
@@ -514,7 +526,7 @@ async fn rebuild_opts_from_disk(
         naming: Some(naming),
     };
 
-    Ok((opts, prior_step_results))
+    Ok((opts, prior_step_results, root_netflow))
 }
 
 #[cfg(test)]
