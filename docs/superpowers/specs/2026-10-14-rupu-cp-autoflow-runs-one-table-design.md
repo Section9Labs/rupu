@@ -87,6 +87,12 @@ autoflow: null | {
 }
 ```
 
+`issue_ref` is set wherever the envelope is readable. The claim-derived
+fields need the host's claim store, so they are filled where rows are built
+next to it: the CP's local listings (the local connector's `list_runs`, which
+also serves `/api/runs` to an HTTP peer's coordinator) and `rupu run list`
+(SSH). A tunnel host's mirrored rows carry `issue_ref` only.
+
 - Serialized on every row from a rupu that knows the field: `null` = not
   launched by an autoflow (or no envelope recorded). A row WITHOUT the key
   comes from a host that can't report it; under an autoflow filter that host
@@ -125,16 +131,20 @@ after merging:
   Attempts appear only under All and Failed·Rejected (they can't be archived).
 - History is read for the requested time range, not a fixed event count —
   `AutoflowHistoryStore` gains a range read over its day directories.
-- **Customer scope**: run rows filter as on Workflows. An attempt carries the
-  customer of the workspace its claim names, when that workspace has an
-  assignment; otherwise it carries no customer keys and is not shown under a
-  scope.
+- **Customer scope**: run rows filter as on Workflows. Attempt rows carry no
+  customer (nothing about an attempt records one), so they are not listed
+  while a customer scope is set; the page says so in one line, as Workflows
+  does for its archive.
 - **Remote hosts**: run rows via the existing `HostConnector::list_runs`
   (`RunKind::All`), filtered coordinator-side to rows with a non-null
   `autoflow`; a host whose rows lack the key answers 501 (shown
   "unavailable"). Attempt rows via the existing `list_autoflow_events`, which
-  covers only that host's newest events — the same limit today's page has. A
-  connector without `list_autoflow_events` contributes runs only.
+  covers only that host's newest events — the same limit today's page has —
+  and only the `cycle_failed` kind (the coordinator can't check whether a
+  remote `run_launched` run was recorded). A connector without
+  `list_autoflow_events` contributes runs only.
+- The history event row (`/api/runs/autoflows/events`) gains an optional
+  `repo_ref`, so a remote host's problems can name the repo.
 - After PR B, the endpoint takes `?q=` through `rupu-query`, with the
   workflow-run registry plus the attempt fields.
 
