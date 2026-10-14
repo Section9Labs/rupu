@@ -443,8 +443,9 @@ async fn netflow_frames_land_when_the_run_finishes() {
         std::fs::read_to_string(run_store.root.join(run_id).join("netflow.jsonl")).unwrap(),
         format!("{}\n{}\n{}\n", lines[0], lines[1], lines[2])
     );
-    // (The lander carries each line as a `serde_json::Value`, so its key
-    // order may differ from the wire's; compare the JSON, not the bytes.)
+    // (The lander carries each line as a `serde_json::value::RawValue` and
+    // lands its bytes exactly; comparing parsed JSON keeps the assertion
+    // about the content rather than the wire's spacing.)
     let landed_lines = |name: &str| -> Vec<serde_json::Value> {
         std::fs::read_to_string(dir.path().join("netflow").join(name))
             .unwrap()

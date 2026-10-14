@@ -592,15 +592,27 @@ impl NodeMirror {
     /// otherwise; `unavailable` when no stream arrived. Best-effort: a
     /// failure is logged and the run's terminal update proceeds (the missing
     /// record reads as "not collected"). A run that already landed complete
-    /// is left alone, so a bucket poller re-mirroring `run.json` every tick
-    /// costs one small read.
+    /// is left alone while its mirrored copy is still the length that
+    /// landed (`LandingRecord.bytes`), so a bucket poller re-mirroring
+    /// `run.json` every tick costs one small read and one `metadata` call;
+    /// a copy that grew since (a host-side resume appended to the stream)
+    /// is landed again — complete replacing complete is allowed by the
+    /// never-downgrade rule.
     fn land_netflow_if_terminal(&self, run_id: &str, node_id: &str) {
         use rupu_netflow::land::{land_and_record, read_landing_record, LandingStatus};
         let root = &self.run_store.root;
-        if read_landing_record(root, run_id).is_some_and(|r| r.status == LandingStatus::Complete) {
-            return;
+        let stream_path = self.netflow_path(run_id);
+        if let Some(prev) =
+            read_landing_record(root, run_id).filter(|r| r.status == LandingStatus::Complete)
+        {
+            // A copy that can't be measured can't be landed either, and a
+            // missing one would be refused as a downgrade: skip both.
+            let grew = std::fs::metadata(&stream_path).is_ok_and(|m| m.len() != prev.bytes);
+            if !grew {
+                return;
+            }
         }
-        let stream = std::fs::read(self.netflow_path(run_id)).ok();
+        let stream = std::fs::read(&stream_path).ok();
         let partial = std::fs::read_to_string(self.netflow_partial_marker(run_id)).ok();
         let complete = partial.is_none();
         let reason = partial.map(|r| {
@@ -1070,17 +1082,8 @@ mod tests {
             .unwrap()
             .join("netflow/run_N6.jsonl");
         let mtime = std::fs::metadata(&ledger).unwrap().modified().unwrap();
-        // Make a re-landing observable: a later stream line would land if
-        // the poller's next tick re-landed the complete copy.
-        mirror
-            .append(
-                "run_N6",
-                "node_a",
-                ArtifactFile::Netflow,
-                r#"{"kind":"line","ledger":"run_N6","line":{"type":"dropped","count":9,"ts":"2026-10-14T00:00:02Z"}}"#,
-            )
-            .await
-            .unwrap();
+        // The copy did not grow: the poller's next tick and `finish` leave
+        // the complete landing alone.
         mirror
             .append("run_N6", "node_a", ArtifactFile::RunJson, &terminal)
             .await
@@ -1097,6 +1100,86 @@ mod tests {
             "the landed ledger was not rewritten"
         );
         assert_eq!(std::fs::read_to_string(&ledger).unwrap().lines().count(), 1);
+    }
+
+    /// Review finding 5: a mirrored copy that grew after a complete landing
+    /// (a host-side `workflow resume` appended to the stream, and the host
+    /// turned terminal again) is landed again — complete replacing
+    /// complete is allowed by the never-downgrade rule — so the coordinator
+    /// never keeps a stale complete ledger beside a longer copy.
+    #[tokio::test]
+    async fn a_copy_that_grew_after_a_complete_landing_is_re_landed() {
+        use rupu_netflow::land::{read_landing_record, LandingStatus};
+        let tmp = tempfile::tempdir().unwrap();
+        let (mirror, run_store) = mirror_with_run(tmp.path(), "run_N7", "node_a").await;
+        for l in [
+            r#"{"kind":"begin","v":1,"run_id":"run_N7"}"#,
+            r#"{"kind":"line","ledger":"run_N7","line":{"type":"dropped","count":1,"ts":"2026-10-14T00:00:00Z"}}"#,
+        ] {
+            mirror
+                .append("run_N7", "node_a", ArtifactFile::Netflow, l)
+                .await
+                .unwrap();
+        }
+        mirror
+            .finish("run_N7", "node_a", "completed")
+            .await
+            .unwrap();
+        let first = read_landing_record(&run_store.root, "run_N7").unwrap();
+        assert_eq!(first.status, LandingStatus::Complete);
+        assert_eq!(
+            first.bytes,
+            std::fs::metadata(mirror.netflow_path("run_N7"))
+                .unwrap()
+                .len(),
+            "the record holds the landed copy's length"
+        );
+        let ledger = run_store
+            .root
+            .parent()
+            .unwrap()
+            .join("netflow/run_N7.jsonl");
+        assert_eq!(std::fs::read_to_string(&ledger).unwrap().lines().count(), 1);
+
+        let later = r#"{"kind":"line","ledger":"run_N7","line":{"type":"dropped","count":9,"ts":"2026-10-14T00:00:02Z"}}"#;
+        mirror
+            .append("run_N7", "node_a", ArtifactFile::Netflow, later)
+            .await
+            .unwrap();
+        mirror
+            .finish("run_N7", "node_a", "completed")
+            .await
+            .unwrap();
+        let again = read_landing_record(&run_store.root, "run_N7").unwrap();
+        assert_eq!(again.status, LandingStatus::Complete);
+        assert!(
+            again.bytes > first.bytes,
+            "re-landed: {} > {}",
+            again.bytes,
+            first.bytes
+        );
+        assert_eq!(
+            again.bytes,
+            std::fs::metadata(mirror.netflow_path("run_N7"))
+                .unwrap()
+                .len()
+        );
+        let landed = std::fs::read_to_string(&ledger).unwrap();
+        assert_eq!(landed.lines().count(), 2, "{landed}");
+        assert!(
+            landed.contains(r#""count":9"#),
+            "the new line landed: {landed}"
+        );
+
+        // Mirrored again with no growth: left alone.
+        mirror
+            .finish("run_N7", "node_a", "completed")
+            .await
+            .unwrap();
+        assert_eq!(
+            read_landing_record(&run_store.root, "run_N7").unwrap(),
+            again
+        );
     }
 
     #[tokio::test]

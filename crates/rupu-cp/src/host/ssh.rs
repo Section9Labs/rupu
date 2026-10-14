@@ -8190,8 +8190,9 @@ mod tests {
         assert_eq!(record.reason, None);
         assert_eq!(record.ledgers, vec!["run_01NFPUMP", "sub_01NFCHILD"]);
         let netflow_dir = rupu_netflow::global_netflow_dir(tmp.path());
-        // The landing carries each ledger line as raw JSON (key order is not
-        // significant), so compare parsed values, not bytes.
+        // The landing carries each ledger line as a `serde_json::value::RawValue`
+        // and lands its bytes exactly; comparing parsed values keeps the
+        // assertion about the content rather than the fixture's spacing.
         assert_eq!(
             landed_lines(&netflow_dir.join("sub_01NFCHILD.jsonl")),
             vec![serde_json::json!({"type":"dropped","count":2,"ts":"2026-10-14T00:00:01Z"})],

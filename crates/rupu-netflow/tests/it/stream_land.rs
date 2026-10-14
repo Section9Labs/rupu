@@ -320,8 +320,9 @@ fn landing_record_round_trips_and_tolerates_missing_optional_keys() {
     .unwrap();
     let r = read_landing_record(&runs, "run_J").unwrap();
     assert_eq!(
-        (r.status, r.reason, r.ledgers),
-        (LandingStatus::Complete, None, vec![])
+        (r.status, r.reason, r.ledgers, r.bytes),
+        (LandingStatus::Complete, None, vec![], 0),
+        "a record written before `bytes` reads as 0 landed bytes"
     );
     std::fs::write(landing_record_path(&runs, "run_J"), b"{").unwrap();
     assert!(read_landing_record(&runs, "run_J").is_none());
@@ -333,10 +334,45 @@ fn landing_record_round_trips_and_tolerates_missing_optional_keys() {
     assert_eq!(json["status"], "unavailable");
     assert_eq!(json["v"], 1);
     assert_eq!(json["reason"], NOT_STREAMED_REASON);
+    assert_eq!(json["bytes"], 0, "no stream: 0 bytes landed");
     assert_eq!(
         serde_json::from_value::<LandingRecord>(json).unwrap(),
         written
     );
+}
+
+/// The record carries the landed stream's byte length, so a mirror can tell
+/// a copy that grew after a complete landing (a host-side resume) from the
+/// same copy mirrored again.
+#[test]
+fn landing_record_carries_the_landed_stream_length() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runs = tmp.path().join("runs");
+    let one = concat!(
+        r#"{"kind":"begin","v":1,"run_id":"run_B"}"#,
+        "\n",
+        r#"{"kind":"line","ledger":"run_B","line":{"type":"a"}}"#,
+        "\n",
+    );
+    let first = land_and_record(&runs, "run_B", "h", Some(one.as_bytes()), true, None).unwrap();
+    assert_eq!(first.bytes, one.len() as u64);
+    let two = format!(
+        "{one}{}\n",
+        r#"{"kind":"line","ledger":"run_B","line":{"type":"b"}}"#
+    );
+    let second = land_and_record(&runs, "run_B", "h", Some(two.as_bytes()), true, None).unwrap();
+    assert_eq!(
+        second.bytes,
+        two.len() as u64,
+        "a re-landing records the new length"
+    );
+    assert_eq!(
+        read_landing_record(&runs, "run_B").unwrap().bytes,
+        two.len() as u64
+    );
+    // A refused downgrade keeps the complete record's length too.
+    let kept = land_and_record(&runs, "run_B", "h", None, false, None).unwrap();
+    assert_eq!(kept.bytes, two.len() as u64);
 }
 
 #[test]

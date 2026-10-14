@@ -39,6 +39,12 @@ pub struct LandingRecord {
     pub reason: Option<String>,
     #[serde(default)]
     pub ledgers: Vec<String>,
+    /// The byte length of the stream this record landed (0 with no
+    /// stream). A mirror compares its copy's current length against it to
+    /// tell a copy that grew after a complete landing from the same copy
+    /// mirrored again. Absent on records written before it: reads as 0.
+    #[serde(default)]
+    pub bytes: u64,
     pub at: DateTime<Utc>,
 }
 
@@ -240,6 +246,7 @@ pub fn land_and_record(
                 why
             },
             ledgers,
+            bytes: stream.map_or(0, |s| s.len() as u64),
             at: Utc::now(),
         };
         let tmp = record_path.with_extension(format!("json.{}.tmp", std::process::id()));
