@@ -222,7 +222,7 @@ impl HostConnector for LocalHostConnector {
             let mut lookup =
                 crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&global));
             let mut prices = crate::customers::PricingMemo::new(&customer_pricing);
-            query_run_rows(
+            let mut rows = query_run_rows(
                 &store,
                 params.offset,
                 params.limit,
@@ -244,7 +244,14 @@ impl HostConnector for LocalHostConnector {
                     unreportable: None,
                 },
             )
-            .map_err(crate::api::runs::RunRowsError::into_host)
+            .map_err(crate::api::runs::RunRowsError::into_host)?;
+            // An autoflow row's issue link and PR come from this host's
+            // claim store, read once per listing.
+            let claims = crate::api::autoflow_claims::ClaimIndex::load(&global);
+            for r in &mut rows {
+                claims.apply(r);
+            }
+            Ok(rows)
         })
         .await?;
         // Convert typed rows to Value so the trait's return type is uniform
