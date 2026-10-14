@@ -3144,3 +3144,33 @@ async fn an_agentiflow_id_cannot_reach_outside_the_agentiflows_dir() {
     let (status, _) = get_json(addr, "/api/netflow/explorer?scope=agentiflow:../af_escaped").await;
     assert_eq!(status, 404);
 }
+
+#[tokio::test]
+async fn probe_run_netflow_includes_a_step_agents_launched_agent_child() {
+    let global = tempfile::tempdir().unwrap();
+    let g = global.path();
+    let project = tempfile::tempdir().unwrap();
+    let state = new_state(g);
+    state
+        .run_store
+        .create(
+            seed_run("run_probe_wf", project.path().to_path_buf()),
+            "name: wf\nsteps: []\n",
+        )
+        .unwrap();
+    state
+        .run_store
+        .append_step_result(
+            "run_probe_wf",
+            &seed_step("run_probe_step", project.path().join("t.jsonl")),
+        )
+        .unwrap();
+    launched(&g.join("runs").join("run_probe_step"), "run_probe_child", 1);
+    one_flow(g, "run_probe_step", "step.example");
+    one_flow(g, "run_probe_child", "child.example");
+    let addr = serve(state).await;
+
+    let (status, body) = get_json(addr, "/api/runs/run_probe_wf/netflow").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(hosts_of(&body), ["child.example", "step.example"]);
+}
