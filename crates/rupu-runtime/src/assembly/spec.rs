@@ -85,9 +85,11 @@ pub struct Overrides {
     /// instead of one rendered from the run's skills, so every turn's
     /// system prompt is the same bytes. `Some("")` sends none.
     pub skill_section: Option<String>,
-    /// `rupu run --no-messaging`: the run, and everything it launches, gets
-    /// no messaging tools ([`super::OffReason::Launch`]).
-    pub messaging_off: bool,
+    /// `rupu run --no-messaging` / `--messaging-tool`: a placed unit's
+    /// workflow `messaging:` switch. Off is [`super::OffReason::Launch`] (a
+    /// cap on everything the run launches), tools are its messaging tools
+    /// as `ambient:workflow_messaging`.
+    pub messaging: rupu_tools::MessagingSwitch,
 }
 
 /// Services the site provides (they belong to the root run, not this one).

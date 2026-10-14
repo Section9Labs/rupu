@@ -1,5 +1,5 @@
 //! A remote unit (`host:` / `distribute:`) runs as a standalone `rupu run` on
-//! its host, so a workflow's `messaging: false` (or the cap the run itself
+//! its host, so a workflow's `messaging:` switch (or the cap the run itself
 //! was launched under) has to travel on the `UnitDispatch` the runner hands
 //! the fleet dispatcher, or the host gives the unit the default messaging
 //! tools. These drive real workflows through `run_workflow` and assert what
@@ -12,6 +12,7 @@ use rupu_orchestrator::runner::{
     UnitFailure, UnitOutcome,
 };
 use rupu_orchestrator::{RunStore, Workflow};
+use rupu_tools::MessagingSwitch;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -35,8 +36,8 @@ impl StepFactory for CappedFactory {
     }
 }
 
-/// `(step_id, index, host, messaging_off)` of one dispatch.
-type Call = (String, usize, String, bool);
+/// `(step_id, index, host, messaging)` of one dispatch.
+type Call = (String, usize, String, MessagingSwitch);
 
 /// Records a [`Call`] per dispatch; fails the first dispatch to
 /// `fail_first_on` to exercise the fan-out retry.
@@ -80,7 +81,7 @@ impl UnitDispatcher for Recorder {
             unit.step_id.clone(),
             unit.index,
             host.to_string(),
-            unit.messaging_off,
+            unit.messaging.clone(),
         ));
         if self.fail_first_on.as_deref() == Some(host) {
             let mut failed = self.failed_once.lock().unwrap();
@@ -142,44 +143,62 @@ steps:
     )
 }
 
+fn review(messaging: MessagingSwitch) -> Vec<Call> {
+    vec![("review".into(), 0, "worker-1".into(), messaging)]
+}
+
 #[tokio::test]
 async fn a_placed_unit_of_an_opted_out_workflow_has_messaging_off() {
     let d = Arc::new(Recorder::new(None));
     run(&placed("messaging: false"), false, d.clone()).await;
-    assert_eq!(
-        d.calls(),
-        vec![("review".into(), 0, "worker-1".into(), true)]
-    );
+    assert_eq!(d.calls(), review(MessagingSwitch::Off));
 }
 
 #[tokio::test]
-async fn a_placed_unit_of_a_default_workflow_keeps_its_messaging() {
-    for messaging in ["", "messaging: true", "messaging:\n  tools: [msg.send]"] {
+async fn a_placed_unit_of_a_default_workflow_keeps_the_default() {
+    let d = Arc::new(Recorder::new(None));
+    run(&placed(""), false, d.clone()).await;
+    assert_eq!(d.calls(), review(MessagingSwitch::Default));
+}
+
+/// A workflow naming its tools (or `true`, its whole set) places its units
+/// with exactly that list, canonical, as its local steps get it.
+#[tokio::test]
+async fn a_placed_unit_of_a_narrowed_workflow_carries_its_tools() {
+    for (messaging, tools) in [
+        ("messaging:\n  tools: [msg.send]", vec!["msg.send"]),
+        (
+            "messaging:\n  tools: [board.post, msg.send]",
+            vec!["board.post", "msg.send"],
+        ),
+        ("messaging: true", rupu_tools::WORKFLOW_MESSAGING.to_vec()),
+    ] {
         let d = Arc::new(Recorder::new(None));
         run(&placed(messaging), false, d.clone()).await;
         assert_eq!(
             d.calls(),
-            vec![("review".into(), 0, "worker-1".into(), false)],
+            review(MessagingSwitch::Tools(tools)),
             "{messaging:?}"
         );
     }
 }
 
+/// The run's own launch cap wins over a workflow naming its tools.
 #[tokio::test]
 async fn a_capped_run_places_its_units_with_messaging_off() {
-    let d = Arc::new(Recorder::new(None));
-    run(&placed(""), true, d.clone()).await;
-    assert_eq!(
-        d.calls(),
-        vec![("review".into(), 0, "worker-1".into(), true)]
-    );
+    for messaging in ["", "messaging:\n  tools: [msg.send]"] {
+        let d = Arc::new(Recorder::new(None));
+        run(&placed(messaging), true, d.clone()).await;
+        assert_eq!(d.calls(), review(MessagingSwitch::Off), "{messaging:?}");
+    }
 }
 
 #[tokio::test]
-async fn every_distributed_unit_and_its_retry_carry_messaging_off() {
+async fn every_distributed_unit_and_its_retry_carry_the_messaging_tools() {
     let yaml = r#"
 name: distributed-messaging
-messaging: false
+messaging:
+  tools: [msg.send]
 steps:
   - id: fan
     agent: service-analyst
@@ -199,7 +218,9 @@ steps:
         "two units plus one retry expected: {calls:?}"
     );
     assert!(
-        calls.iter().all(|c| c.3),
-        "every dispatch must carry messaging off: {calls:?}"
+        calls
+            .iter()
+            .all(|c| c.3 == MessagingSwitch::Tools(vec!["msg.send"])),
+        "every dispatch must carry the workflow's tools: {calls:?}"
     );
 }

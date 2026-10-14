@@ -3469,7 +3469,7 @@ mod tests {
     fn agent_job(name: &str) -> Vec<u8> {
         serde_json::to_vec(&RunSpec {
             skill_bundle: None,
-            messaging_off: false,
+            messaging: Default::default(),
             kind: RunSpecKind::Agent,
             name: name.to_string(),
             inputs: BTreeMap::new(),
@@ -3965,7 +3965,7 @@ mod tests {
                 skills: Vec::new(),
                 preload_skills: Vec::new(),
                 skill_bundle: Some(manifest.clone()),
-                messaging_off: false,
+                messaging: Default::default(),
             })
             .await
             .unwrap();
@@ -4125,7 +4125,7 @@ mod tests {
                 skills: Vec::new(),
                 preload_skills: Vec::new(),
                 skill_bundle: Some(manifest),
-                messaging_off: false,
+                messaging: Default::default(),
             })
             .await
             .unwrap();
@@ -4715,7 +4715,7 @@ mod tests {
     fn agent_spec() -> RunSpec {
         RunSpec {
             skill_bundle: None,
-            messaging_off: false,
+            messaging: Default::default(),
             kind: RunSpecKind::Agent,
             name: "recon".to_string(),
             inputs: BTreeMap::new(),
@@ -4768,13 +4768,16 @@ mod tests {
             .is_none());
     }
 
-    /// A placed unit of an opted-out workflow: the job's `messaging_off`
-    /// becomes the run's `--no-messaging`; a job without it runs with none.
+    /// A placed unit's workflow `messaging:` switch: the job's `messaging`
+    /// becomes the run's `--no-messaging` / `--messaging-tool`, which the
+    /// real `rupu run` parser reads back; a job without it runs with none.
     #[test]
-    fn a_spec_with_messaging_off_runs_with_no_messaging() {
-        assert!(!parsed_run(&agent_spec().run_argv("run_01COORD").unwrap()).no_messaging);
+    fn a_spec_with_messaging_runs_with_its_flags() {
+        use rupu_runtime::argv::LaunchMessaging;
+        let none = parsed_run(&agent_spec().run_argv("run_01COORD").unwrap());
+        assert!(!none.no_messaging && none.messaging_tools.is_empty());
         let mut quiet = agent_spec();
-        quiet.messaging_off = true;
+        quiet.messaging = LaunchMessaging::Off;
         let argv = quiet.run_argv("run_01COORD").unwrap();
         assert_eq!(
             rendered(&argv)
@@ -4783,7 +4786,12 @@ mod tests {
                 .count(),
             1
         );
-        assert!(parsed_run(&argv).no_messaging);
+        assert_eq!(parsed_run(&argv).messaging(), LaunchMessaging::Off);
+        let mut narrow = agent_spec();
+        narrow.messaging = LaunchMessaging::Tools(vec!["msg.send".into()]);
+        let parsed = parsed_run(&narrow.run_argv("run_01COORD").unwrap());
+        assert!(!parsed.no_messaging);
+        assert_eq!(parsed.messaging_tools, ["msg.send"]);
     }
 
     #[test]
@@ -6476,6 +6484,7 @@ mod tests {
                 rupu_cp::node::protocol::CAP_AGENT_SKILLS.to_string(),
                 rupu_cp::node::protocol::CAP_AGENT_SKILL_BUNDLE.to_string(),
                 rupu_cp::node::protocol::CAP_AGENT_NO_MESSAGING.to_string(),
+                rupu_cp::node::protocol::CAP_AGENT_MESSAGING_TOOLS.to_string(),
                 rupu_cp::node::protocol::CAP_RUN_CODENAME.to_string(),
             ]
         );
@@ -6516,7 +6525,7 @@ mod tests {
                 run_id: "run_drain".into(),
                 spec: RunSpec {
                     skill_bundle: None,
-                    messaging_off: false,
+                    messaging: Default::default(),
                     kind: RunSpecKind::Workflow,
                     name: "wf".into(),
                     inputs: BTreeMap::new(),

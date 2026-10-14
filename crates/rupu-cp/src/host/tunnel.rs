@@ -35,8 +35,8 @@ use crate::{
     launcher::LaunchRequest,
     node::{
         protocol::{
-            Frame, RunSpec, RunSpecKind, ARTIFACT_CHUNK_BYTES, CAP_AGENT_ENGAGEMENT_PROFILE,
-            CAP_AGENT_FINDINGS_PROFILE, CAP_AGENT_NO_MESSAGING, CAP_AGENT_SKILLS,
+            messaging_capability, Frame, RunSpec, RunSpecKind, ARTIFACT_CHUNK_BYTES,
+            CAP_AGENT_ENGAGEMENT_PROFILE, CAP_AGENT_FINDINGS_PROFILE, CAP_AGENT_SKILLS,
             CAP_AGENT_SKILL_BUNDLE, CAP_FINDINGS_ARTIFACT_PULL,
         },
         NodeMirror, NodeRegistry,
@@ -357,7 +357,7 @@ impl HostConnector for TunnelHostConnector {
 
         let spec = RunSpec {
             skill_bundle: None,
-            messaging_off: false,
+            messaging: Default::default(),
             kind: RunSpecKind::Workflow,
             name: req.workflow.clone(),
             inputs: req.inputs.clone(),
@@ -421,7 +421,7 @@ impl HostConnector for TunnelHostConnector {
 
         let spec = RunSpec {
             skill_bundle: req.skill_bundle.clone(),
-            messaging_off: req.messaging_off,
+            messaging: req.messaging.clone(),
             kind: RunSpecKind::Agent,
             name: req.agent.clone(),
             inputs: std::collections::BTreeMap::new(),
@@ -490,15 +490,17 @@ impl HostConnector for TunnelHostConnector {
                 id = self.node_id,
             )));
         }
-        // And `RunSpec.messaging_off`: an older node would give the unit the
+        // And `RunSpec.messaging`: an older node would give the unit the
         // default messaging tools.
-        if req.messaging_off && !conn.supports(CAP_AGENT_NO_MESSAGING) {
-            return Err(HostConnectorError::Unsupported(format!(
-                "node {} (rupu {}) does not support --no-messaging on agent launches, so \
-                 this run cannot run with its messaging off; upgrade rupu on that node",
-                self.node_id,
-                conn.rupu_version().unwrap_or("unknown version"),
-            )));
+        if let Some((feature, what)) = messaging_capability(&req.messaging) {
+            if !conn.supports(feature) {
+                return Err(HostConnectorError::Unsupported(format!(
+                    "node {} (rupu {}) does not advertise {feature}, so {what}; upgrade \
+                     rupu on that node",
+                    self.node_id,
+                    conn.rupu_version().unwrap_or("unknown version"),
+                )));
+            }
         }
 
         self.mirror
