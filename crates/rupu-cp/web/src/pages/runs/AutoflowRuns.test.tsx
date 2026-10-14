@@ -106,7 +106,9 @@ describe('AutoflowRuns — one table', () => {
     await waitFor(() => expect(screen.getByText('fix-issue')).toBeInTheDocument());
     expect(screen.queryByText('Cycles')).not.toBeInTheDocument();
     expect(screen.queryByText('Claims')).not.toBeInTheDocument();
-    expect(screen.getByRole('link', { name: 'acme/widgets#42' })).toHaveAttribute('href', 'https://example.test/42');
+    // The issue rides the Workflow cell's second line (inside the row link);
+    // the PR link rides the actions column.
+    expect(screen.getByText('acme/widgets#42')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /PR/ })).toHaveAttribute('href', 'https://example.test/pr/7');
   });
 

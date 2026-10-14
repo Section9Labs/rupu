@@ -30,6 +30,7 @@
 
 import { useCallback, useState } from 'react';
 import { ListFilter, RefreshCw, X } from 'lucide-react';
+import { shortIssueRef } from '../../lib/issueRef';
 import { api, type AutoflowRunRow } from '../../lib/api';
 import SortableTable, { type Column } from '../../components/lists/SortableTable';
 import { WORKFLOW_RUN_COLUMNS } from '../../components/runs/workflowRunColumns';
@@ -209,121 +210,93 @@ export default function AutoflowRuns() {
     }
   }
 
-  // The Workflows columns, with the Workflow column swapped for one that also
-  // carries an attempt's error, a filter button after it, and an Issue
-  // column. The Workflow cell stays the row's link (the table's subject, so
-  // keyboard users reach the run); the filter and the issue links render
-  // their own controls, so those cells are `interactive`.
+  // The Workflows columns, unchanged in width: the Workflow cell (the row's
+  // link and the table's one flexible column) carries the issue — or an
+  // attempt's error — as a second line, and the "show only this workflow"
+  // filter and the PR link ride the actions column. Extra columns here would
+  // starve the Workflow column at ordinary widths (Workflows already leaves
+  // it ~180px at 1600px).
   const workflowColumn: Column<AutoflowRunRow> = {
     key: 'workflow',
     header: 'Workflow',
     subject: true,
     sortable: true,
     sortValue: (r) => r.workflow_name,
-    titleValue: (r) => r.workflow_name,
-    render: (r) => (
-      <>
-        <span className="inline-flex items-center gap-2">
-          {r.codename && <CrewChip crew={parseCodename(r.codename).crew} derived={r.codename_derived} />}
-          <span className="text-sm font-medium text-ink">{r.workflow_name}</span>
-        </span>
-        {r.attempt?.detail && <div className="text-note text-err truncate">{r.attempt.detail}</div>}
-      </>
-    ),
-  };
-  const filterColumn: Column<AutoflowRunRow> = {
-    key: 'only',
-    header: '',
-    fit: true,
-    interactive: true,
-    render: (r) => (
-      <button
-        type="button"
-        className="rounded p-1 text-ink-mute hover:bg-surface-hover hover:text-ink"
-        aria-label={`Show only ${r.workflow_name} runs`}
-        title={`Show only ${r.workflow_name} runs`}
-        onClick={(e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          setWorkflow(r.workflow_name);
-        }}
-      >
-        <ListFilter size={12} />
-      </button>
-    ),
-  };
-  const issueColumn: Column<AutoflowRunRow> = {
-    key: 'issue',
-    header: 'Issue',
-    fit: true,
-    interactive: true,
-    sortable: true,
-    sortValue: (r) => r.autoflow?.issue_display_ref ?? r.autoflow?.issue_ref ?? null,
+    titleValue: (r) => {
+      const issue = r.autoflow?.issue_display_ref ?? r.autoflow?.issue_ref;
+      return issue ? `${r.workflow_name} · ${issue}` : r.workflow_name;
+    },
     render: (r) => {
-      const af = r.autoflow;
-      const ref = af?.issue_display_ref ?? af?.issue_ref;
-      if (!ref && !af?.pr_url) return <span className="text-ink-mute">—</span>;
+      const issue = r.autoflow?.issue_display_ref ?? r.autoflow?.issue_ref;
       return (
-        <span className="inline-flex items-center gap-2 text-note">
-          {ref &&
-            (af?.issue_url ? (
-              <a
-                href={af.issue_url}
-                target="_blank"
-                rel="noreferrer"
-                className="text-brand-600 hover:underline"
-                onClick={(e) => e.stopPropagation()}
-              >
-                {ref}
-              </a>
-            ) : (
-              <span className="text-ink-dim">{ref}</span>
-            ))}
-          {af?.pr_url && (
-            <a
-              href={af.pr_url}
-              target="_blank"
-              rel="noreferrer"
-              className="text-brand-600 hover:underline"
-              onClick={(e) => e.stopPropagation()}
-            >
-              PR ↗
-            </a>
+        <>
+          <span className="inline-flex items-center gap-2">
+            {r.codename && <CrewChip crew={parseCodename(r.codename).crew} derived={r.codename_derived} />}
+            <span className="text-sm font-medium text-ink">{r.workflow_name}</span>
+          </span>
+          {r.attempt?.detail ? (
+            <div className="text-note text-err truncate">{r.attempt.detail}</div>
+          ) : (
+            issue && <div className="text-note text-ink-mute font-mono truncate">{shortIssueRef(issue)}</div>
           )}
-        </span>
+        </>
       );
     },
   };
 
-  // Archive / Restore / Delete — run rows only; an attempt is not a run record.
+  // Show only this workflow, the run's PR, and Archive / Restore / Delete
+  // (run rows only — an attempt is not a run record).
   const actionColumn: Column<AutoflowRunRow> = {
     key: 'actions',
     header: '',
     fit: true,
     interactive: true,
-    render: (r) =>
-      r.attempt ? null : (
-        <div
-          className="flex items-center justify-end gap-1"
-          onClick={(e) => {
-            e.preventDefault();
-            e.stopPropagation();
-          }}
+    render: (r) => (
+      <div
+        className="flex items-center justify-end gap-1"
+        onClick={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+        }}
+      >
+        <button
+          type="button"
+          className="rounded p-1 text-ink-mute hover:bg-surface-hover hover:text-ink"
+          aria-label={`Show only ${r.workflow_name} runs`}
+          title={`Show only ${r.workflow_name} runs`}
+          onClick={() => setWorkflow(r.workflow_name)}
         >
-          {archived ? (
-            <Button variant="ring" onClick={() => void handleRowRestore(r.id, hostOf(r))} aria-label={`Restore run ${r.id}`}>
-              Restore
+          <ListFilter size={12} />
+        </button>
+        {r.autoflow?.pr_url && (
+          <a
+            href={r.autoflow.pr_url}
+            target="_blank"
+            rel="noreferrer"
+            className="px-1 text-note text-brand-600 hover:underline"
+            onClick={(e) => e.stopPropagation()}
+          >
+            PR ↗
+          </a>
+        )}
+        {!r.attempt && (
+          <>
+            {archived ? (
+              <Button variant="ring" onClick={() => void handleRowRestore(r.id, hostOf(r))} aria-label={`Restore run ${r.id}`}>
+                Restore
+              </Button>
+            ) : (
+              <Button variant="ring" onClick={() => void handleRowArchive(r.id, hostOf(r))} aria-label={`Archive run ${r.id}`}>
+                Archive
+              </Button>
+            )}
+            <Button variant="ring-danger" onClick={() => void handleRowDelete(r.id, hostOf(r))} aria-label={`Delete run ${r.id}`}>
+              Delete
             </Button>
-          ) : (
-            <Button variant="ring" onClick={() => void handleRowArchive(r.id, hostOf(r))} aria-label={`Archive run ${r.id}`}>
-              Archive
-            </Button>
-          )}
-          <Button variant="ring-danger" onClick={() => void handleRowDelete(r.id, hostOf(r))} aria-label={`Delete run ${r.id}`}>
-            Delete
-          </Button>
-        </div>
-      ),
+          </>
+        )}
+      </div>
+    ),
   };
 
   // An attempt never ran: its usage, turns and duration are not zero, they
@@ -340,7 +313,7 @@ export default function AutoflowRuns() {
 
   const customers = useRunCustomers(!customer && !archived ? rows.map((r) => r.customer) : []);
   const baseColumns = (WORKFLOW_RUN_COLUMNS as Column<AutoflowRunRow>[]).flatMap((c) =>
-    c.key === 'workflow' ? [workflowColumn, filterColumn, issueColumn] : [dashForAttempts(c)],
+    c.key === 'workflow' ? [workflowColumn] : [dashForAttempts(c)],
   );
   const columns: Column<AutoflowRunRow>[] = [
     ...withCustomerColumn(baseColumns, customers, rows, !customer && !archived),
@@ -371,6 +344,20 @@ export default function AutoflowRuns() {
             <dt className="text-ink-mute">claim</dt>
             <dd className="font-mono text-ink-dim">{a.claim_status ?? '—'}</dd>
           </div>
+          {issueRef && (
+            <div className="flex gap-1.5">
+              <dt className="text-ink-mute">issue</dt>
+              <dd className="font-mono">
+                {r.autoflow?.issue_url ? (
+                  <a href={r.autoflow.issue_url} target="_blank" rel="noreferrer" className="text-brand-600 hover:underline">
+                    {r.autoflow.issue_display_ref ?? issueRef}
+                  </a>
+                ) : (
+                  <span className="text-ink-dim">{r.autoflow?.issue_display_ref ?? issueRef}</span>
+                )}
+              </dd>
+            </div>
+          )}
         </dl>
         {issueRef && local ? (
           <div className="flex items-center gap-1">

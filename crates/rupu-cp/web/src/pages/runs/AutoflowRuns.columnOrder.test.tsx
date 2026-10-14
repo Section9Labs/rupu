@@ -71,7 +71,7 @@ function renderPage() {
 }
 
 describe('AutoflowRuns — the Workflows column order', () => {
-  it('renders headers as Status, Workflow, (filter), Issue, Run, Trigger, Host, In, Out, Cached, Cost, Turns, Duration, Started', async () => {
+  it('renders the Workflows headers: Status, Workflow, Run, Trigger, Host, In, Out, Cached, Cost, Turns, Duration, Started', async () => {
     stubPage([RUN]);
     const { container } = renderPage();
     await waitFor(() => expect(screen.getByText('fix-issue')).toBeInTheDocument());
@@ -80,9 +80,7 @@ describe('AutoflowRuns — the Workflows column order', () => {
     expect(headers).toEqual([
       '', // leading expand column (an attempt with no run expands in place)
       'Status',
-      'Workflow',
-      '', // "show only this workflow" filter button
-      'Issue',
+      'Workflow', // its second line carries the issue (or an attempt's error)
       'Run',
       'Trigger',
       'Host',
@@ -93,7 +91,7 @@ describe('AutoflowRuns — the Workflows column order', () => {
       'Turns',
       'Duration',
       'Started',
-      '', // trailing row-actions column
+      '', // trailing column: show-only filter, PR link, row actions
     ]);
   });
 
