@@ -494,8 +494,9 @@ impl FleetUnitDispatcher {
                 // What `ship_skills` confirmed the host holds; `None` when
                 // nothing ships or the host can't take shipped skills (P5).
                 skill_bundle,
-                // Delivered as `--no-messaging`, or refused.
-                messaging_off: unit.messaging_off,
+                // Delivered as `--no-messaging` / `--messaging-tool`, or
+                // refused.
+                messaging: (&unit.messaging).into(),
             })
             .await
         {
@@ -1520,7 +1521,7 @@ mod tests {
             skills: Vec::new(),
             preload_skills: Vec::new(),
             mode: None,
-            messaging_off: false,
+            messaging: Default::default(),
             codename: None,
         }
     }
@@ -3190,8 +3191,17 @@ steps:
     }
 
     #[tokio::test]
-    async fn dispatch_passes_the_units_messaging_off_to_launch_agent() {
-        for off in [true, false] {
+    async fn dispatch_passes_the_units_messaging_to_launch_agent() {
+        use rupu_runtime::argv::LaunchMessaging;
+        use rupu_tools::MessagingSwitch;
+        for (switch, want) in [
+            (MessagingSwitch::Off, LaunchMessaging::Off),
+            (
+                MessagingSwitch::Tools(vec!["msg.send"]),
+                LaunchMessaging::Tools(vec!["msg.send".into()]),
+            ),
+            (MessagingSwitch::Default, LaunchMessaging::Default),
+        ] {
             let conn = Arc::new(FakeConnector::completed());
             let d = FleetUnitDispatcher::from_connector(
                 Arc::clone(&conn) as Arc<dyn HostConnector>,
@@ -3199,10 +3209,10 @@ steps:
                 None,
             );
             let mut unit = make_unit();
-            unit.messaging_off = off;
+            unit.messaging = switch;
             d.dispatch_unit(unit, "h1").await.unwrap();
             let launched = conn.launched.lock().unwrap().clone().expect("launched");
-            assert_eq!(launched.messaging_off, off);
+            assert_eq!(launched.messaging, want);
         }
     }
 

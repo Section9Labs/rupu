@@ -13,7 +13,7 @@ use std::task::{Context, Poll};
 use futures_util::stream::Stream;
 use futures_util::StreamExt as _;
 use rupu_orchestrator::runs::RunStore;
-use rupu_runtime::argv::{FeatureSet, RunArgv, WorkflowControl};
+use rupu_runtime::argv::{FeatureSet, LaunchMessaging, RunArgv, WorkflowControl};
 use rupu_runtime::services::operator::{
     MessageErrorReply, MessagesView, OperatorSendReply, ViewQuery,
 };
@@ -33,9 +33,9 @@ use crate::{
     launcher::LaunchRequest,
     node::{
         protocol::{
-            ArtifactFile, RunSpec, RunSpecKind, CAP_AGENT_NO_MESSAGING, CAP_AGENT_SKILLS,
-            CAP_AGENT_SKILL_BUNDLE, CAP_RUN_CODENAME_FLAG, CAP_RUN_LIST, CAP_RUN_MESSAGES,
-            CAP_WORKFLOW_RESUME_IF_UNFINISHED, FEATURES_SUBCOMMAND,
+            ArtifactFile, RunSpec, RunSpecKind, CAP_AGENT_MESSAGING_TOOLS, CAP_AGENT_NO_MESSAGING,
+            CAP_AGENT_SKILLS, CAP_AGENT_SKILL_BUNDLE, CAP_RUN_CODENAME_FLAG, CAP_RUN_LIST,
+            CAP_RUN_MESSAGES, CAP_WORKFLOW_RESUME_IF_UNFINISHED, FEATURES_SUBCOMMAND,
         },
         NodeMirror,
     },
@@ -83,6 +83,12 @@ const LAUNCH_SKILLS_UNSUPPORTED: &str = "rupu-launch: skills-unsupported";
 /// [`CAP_AGENT_NO_MESSAGING`]: its `rupu run` would reject `--no-messaging`.
 const LAUNCH_NO_MESSAGING_UNSUPPORTED: &str = "rupu-launch: no-messaging-unsupported";
 
+/// Printed, instead of launching, by the messaging-tools launch gate
+/// ([`LAUNCH_GATES`]) when the remote `rupu __features` doesn't list
+/// [`CAP_AGENT_MESSAGING_TOOLS`]: its `rupu run` would reject
+/// `--messaging-tool`.
+const LAUNCH_MESSAGING_TOOLS_UNSUPPORTED: &str = "rupu-launch: messaging-tools-unsupported";
+
 /// Printed, instead of launching, by a launch gate
 /// when `rupu` is not on the remote's non-interactive PATH, so the refusal
 /// names the missing binary rather than an old one.
@@ -115,7 +121,7 @@ struct LaunchGate {
 }
 
 /// Every launch gate, in the order a remote checks them.
-const LAUNCH_GATES: [LaunchGate; 3] = [
+const LAUNCH_GATES: [LaunchGate; 4] = [
     LaunchGate {
         feature: CAP_AGENT_SKILLS,
         marker: LAUNCH_SKILLS_UNSUPPORTED,
@@ -134,10 +140,18 @@ const LAUNCH_GATES: [LaunchGate; 3] = [
     LaunchGate {
         feature: CAP_AGENT_NO_MESSAGING,
         marker: LAUNCH_NO_MESSAGING_UNSUPPORTED,
-        needs: |a| a.messaging_off,
+        needs: |a| a.messaging == LaunchMessaging::Off,
         precheck: true,
         refusal: "--no-messaging support (no agent.no_messaging), so this unit cannot run \
                   with its messaging off",
+    },
+    LaunchGate {
+        feature: CAP_AGENT_MESSAGING_TOOLS,
+        marker: LAUNCH_MESSAGING_TOOLS_UNSUPPORTED,
+        needs: |a| matches!(a.messaging, LaunchMessaging::Tools(_)),
+        precheck: true,
+        refusal: "--messaging-tool support (no agent.messaging_tools), so this unit cannot \
+                  run with only its workflow's messaging tools",
     },
 ];
 
@@ -2105,7 +2119,7 @@ impl SshHostConnector {
     /// gates read it.
     ///
     /// A launch needing a feature is wrapped in its [`LAUNCH_GATES`] as a
-    /// backstop: for workflow-step skills and `--no-messaging`,
+    /// backstop: for workflow-step skills and the messaging flags,
     /// `launch_agent` has already sent the same gates as their own command
     /// ([`Self::launch_gate_command`]) before creating the mirror run. A
     /// skill bundle is gated in the launch command only: a dispatched
@@ -3003,7 +3017,7 @@ impl HostConnector for SshHostConnector {
 
         let spec = RunSpec {
             skill_bundle: None,
-            messaging_off: false,
+            messaging: Default::default(),
             kind: RunSpecKind::Workflow,
             name: req.workflow.clone(),
             inputs: req.inputs.clone(),
@@ -3068,7 +3082,7 @@ impl HostConnector for SshHostConnector {
 
         let spec = RunSpec {
             skill_bundle: None,
-            messaging_off: req.messaging_off,
+            messaging: req.messaging.clone(),
             kind: RunSpecKind::Agent,
             name: req.agent.clone(),
             inputs: std::collections::BTreeMap::new(),
@@ -3086,9 +3100,9 @@ impl HostConnector for SshHostConnector {
         // `launch_run`.
         let detached = Self::detach_launch_argv(&argv, &run_id, req.working_dir.as_deref())?;
 
-        // A remote that can't take the skills or `--no-messaging` refuses
-        // before the mirror run exists, as the other transports do: one
-        // extra command, only for a launch carrying either.
+        // A remote that can't take the skills or the messaging flags
+        // refuses before the mirror run exists, as the other transports do:
+        // one extra command, only for a launch carrying any.
         if let Some(gate) = Self::launch_gate_command(&argv) {
             let out = self
                 .exec
@@ -4268,7 +4282,7 @@ mod tests {
         run.codename = Some("cobalt-harbor/heron#412".into());
         run.skills = vec!["pdf".into()];
         run.prompt = Some("go".into());
-        run.messaging_off = true;
+        run.messaging = LaunchMessaging::Off;
         gated_launch_runs_only_where_advertised(
             run,
             &[
@@ -4283,6 +4297,28 @@ mod tests {
             ],
             "run|triage|--run-id|run_01QUIET|--codename|cobalt-harbor/heron#412|\
              --skill|pdf|--prompt=go|--no-messaging|",
+        );
+    }
+
+    /// A placed unit of a workflow naming its messaging tools
+    /// (`--messaging-tool`) runs only on a remote whose `rupu __features`
+    /// lists `agent.messaging_tools`: one listing only `agent.no_messaging`
+    /// is refused.
+    #[test]
+    fn a_messaging_tools_launch_runs_only_on_a_remote_advertising_it() {
+        use super::*;
+        let mut run = rupu_runtime::argv::AgentRun::new("triage", "run_01NARROW");
+        run.codename = Some("cobalt-harbor/heron#412".into());
+        run.prompt = Some("go".into());
+        run.messaging = LaunchMessaging::Tools(vec!["msg.send".into(), "board.post".into()]);
+        gated_launch_runs_only_where_advertised(
+            run,
+            &[(
+                r#"{"features":["run.codename_flag","agent.no_messaging"]}"#,
+                LAUNCH_MESSAGING_TOOLS_UNSUPPORTED,
+            )],
+            "run|triage|--run-id|run_01NARROW|--codename|cobalt-harbor/heron#412|\
+             --prompt=go|--messaging-tool|msg.send|--messaging-tool|board.post|",
         );
     }
 
@@ -6913,7 +6949,7 @@ mod tests {
     ) {
         let spec = crate::node::protocol::RunSpec {
             skill_bundle: None,
-            messaging_off: false,
+            messaging: Default::default(),
             kind: crate::node::protocol::RunSpecKind::Workflow,
             name: "wf".into(),
             inputs: std::collections::BTreeMap::new(),
@@ -7893,7 +7929,7 @@ mod tests {
         let run_id = "run_01TESTPUMP01";
         let spec = crate::node::protocol::RunSpec {
             skill_bundle: None,
-            messaging_off: false,
+            messaging: Default::default(),
             kind: crate::node::protocol::RunSpecKind::Workflow,
             name: "test-wf".into(),
             inputs: std::collections::BTreeMap::new(),
@@ -7998,7 +8034,7 @@ mod tests {
                 skills: Vec::new(),
                 preload_skills: Vec::new(),
                 skill_bundle: None,
-                messaging_off: false,
+                messaging: Default::default(),
                 codename: None,
             })
             .await
@@ -8194,7 +8230,7 @@ mod tests {
         let (conn, store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
         let spec = crate::node::protocol::RunSpec {
             skill_bundle: None,
-            messaging_off: false,
+            messaging: Default::default(),
             kind: crate::node::protocol::RunSpecKind::Agent,
             name: "sec".into(),
             inputs: std::collections::BTreeMap::new(),
@@ -8325,7 +8361,7 @@ mod tests {
         let run_id = "run_01TESTPUMPDEAD";
         let spec = crate::node::protocol::RunSpec {
             skill_bundle: None,
-            messaging_off: false,
+            messaging: Default::default(),
             kind: crate::node::protocol::RunSpecKind::Agent,
             name: "dead-launch".into(),
             inputs: std::collections::BTreeMap::new(),
@@ -8401,7 +8437,7 @@ mod tests {
 
         let spec = crate::node::protocol::RunSpec {
             skill_bundle: None,
-            messaging_off: false,
+            messaging: Default::default(),
             kind: crate::node::protocol::RunSpecKind::Agent,
             name: "died-before-preflight".into(),
             inputs: std::collections::BTreeMap::new(),
@@ -8474,7 +8510,7 @@ mod tests {
 
         let spec = crate::node::protocol::RunSpec {
             skill_bundle: None,
-            messaging_off: false,
+            messaging: Default::default(),
             kind: crate::node::protocol::RunSpecKind::Agent,
             name: "slow-but-alive".into(),
             inputs: std::collections::BTreeMap::new(),
@@ -8532,7 +8568,7 @@ mod tests {
         let run_id = "run_01TESTPUMPALIVE";
         let spec = crate::node::protocol::RunSpec {
             skill_bundle: None,
-            messaging_off: false,
+            messaging: Default::default(),
             kind: crate::node::protocol::RunSpecKind::Agent,
             name: "alive-but-quiet".into(),
             inputs: std::collections::BTreeMap::new(),
@@ -8590,7 +8626,7 @@ mod tests {
         let run_id = "run_01TESTPUMPWALL";
         let spec = crate::node::protocol::RunSpec {
             skill_bundle: None,
-            messaging_off: false,
+            messaging: Default::default(),
             kind: crate::node::protocol::RunSpecKind::Agent,
             name: "started-then-killed".into(),
             inputs: std::collections::BTreeMap::new(),
@@ -8784,7 +8820,7 @@ mod tests {
 
         let spec = crate::node::protocol::RunSpec {
             skill_bundle: None,
-            messaging_off: false,
+            messaging: Default::default(),
             kind: crate::node::protocol::RunSpecKind::Agent,
             name: "reviewer".into(),
             inputs: std::collections::BTreeMap::new(),
@@ -8883,7 +8919,7 @@ mod tests {
 
         let spec = crate::node::protocol::RunSpec {
             skill_bundle: None,
-            messaging_off: false,
+            messaging: Default::default(),
             kind: crate::node::protocol::RunSpecKind::Workflow,
             name: "deploy".into(),
             inputs: std::collections::BTreeMap::new(),
@@ -8978,7 +9014,7 @@ mod tests {
 
         let spec = crate::node::protocol::RunSpec {
             skill_bundle: None,
-            messaging_off: false,
+            messaging: Default::default(),
             kind: crate::node::protocol::RunSpecKind::Agent,
             name: "reviewer".into(),
             inputs: std::collections::BTreeMap::new(),
@@ -9430,7 +9466,7 @@ mod tests {
                     skills: Vec::new(),
                     preload_skills: Vec::new(),
                     skill_bundle: None,
-                    messaging_off: false,
+                    messaging: Default::default(),
                 })
                 .await
                 .expect("launch_agent");
@@ -9733,7 +9769,7 @@ mod tests {
                 skills: Vec::new(),
                 preload_skills: Vec::new(),
                 skill_bundle: None,
-                messaging_off: false,
+                messaging: Default::default(),
             })
             .await
             .unwrap();
@@ -9779,7 +9815,7 @@ mod tests {
                 skills: Vec::new(),
                 preload_skills: Vec::new(),
                 skill_bundle: None,
-                messaging_off: false,
+                messaging: Default::default(),
             })
             .await
             .unwrap();
@@ -9813,7 +9849,7 @@ mod tests {
                 skills: Vec::new(),
                 preload_skills: Vec::new(),
                 skill_bundle: None,
-                messaging_off: false,
+                messaging: Default::default(),
                 codename: None,
             })
             .await
@@ -9848,7 +9884,7 @@ mod tests {
             skills: Vec::new(),
             preload_skills: Vec::new(),
             skill_bundle: None,
-            messaging_off: false,
+            messaging: Default::default(),
             codename: None,
         })
         .await
@@ -9877,7 +9913,7 @@ mod tests {
             skills: vec!["pdf".into()],
             preload_skills: vec!["house-style".into()],
             skill_bundle: None,
-            messaging_off: false,
+            messaging: Default::default(),
             codename: None,
         }
     }
@@ -9890,83 +9926,122 @@ mod tests {
         SshHostConnector::launch_gate_command(&argv).expect("a precheck gate")
     }
 
-    fn quiet_launch(run_id: &str) -> crate::agent_launcher::AgentLaunchRequest {
+    fn messaging_launch(
+        run_id: &str,
+        messaging: LaunchMessaging,
+    ) -> crate::agent_launcher::AgentLaunchRequest {
         crate::agent_launcher::AgentLaunchRequest {
             skills: Vec::new(),
             preload_skills: Vec::new(),
-            messaging_off: true,
+            messaging,
             ..skilled_launch(run_id)
         }
     }
 
-    #[tokio::test]
-    async fn launch_agent_passes_no_messaging_to_the_remote_rupu_run_behind_the_gate() {
-        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
-        let (conn, _run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
-        conn.launch_agent(quiet_launch("run_01QUIET"))
-            .await
-            .unwrap();
-        let cmds = fake.commands.lock().unwrap();
-        let gate = precheck_of(&quiet_launch("run_01QUIET"));
-        assert!(
-            gate.contains(&format!("grep -qF '\"{CAP_AGENT_NO_MESSAGING}\"'"))
-                && !gate.contains(CAP_AGENT_SKILLS),
-            "{gate}"
-        );
-        assert_eq!(
-            cmds.first(),
-            Some(&gate),
-            "the gate runs first, as its own command: {cmds:?}"
-        );
-        assert_eq!(cmds.len(), 2, "one gate command and one launch: {cmds:?}");
-        let launch = &cmds[1];
-        assert!(
-            launch.contains("'--prompt=enumerate' '--no-messaging'"),
-            "the remote `rupu run` must carry --no-messaging: {launch}"
-        );
-        assert!(
-            launch.contains(&format!("grep -qF '\"{CAP_AGENT_NO_MESSAGING}\"'")),
-            "the launch must be gated on the remote's agent.no_messaging: {launch}"
-        );
+    /// Each messaging switch: the capability its gate checks, the flags on
+    /// the remote `rupu run`, its marker and its refusal.
+    fn messaging_gates() -> [(
+        LaunchMessaging,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+    ); 2] {
+        [
+            (
+                LaunchMessaging::Off,
+                CAP_AGENT_NO_MESSAGING,
+                "'--prompt=enumerate' '--no-messaging'",
+                LAUNCH_NO_MESSAGING_UNSUPPORTED,
+                "host host_abc runs a rupu without --no-messaging support (no \
+                 agent.no_messaging), so this unit cannot run with its messaging off; \
+                 upgrade rupu there",
+            ),
+            (
+                LaunchMessaging::Tools(vec!["msg.send".into()]),
+                CAP_AGENT_MESSAGING_TOOLS,
+                "'--prompt=enumerate' '--messaging-tool' 'msg.send'",
+                LAUNCH_MESSAGING_TOOLS_UNSUPPORTED,
+                "host host_abc runs a rupu without --messaging-tool support (no \
+                 agent.messaging_tools), so this unit cannot run with only its workflow's \
+                 messaging tools; upgrade rupu there",
+            ),
+        ]
     }
 
-    /// The remote's `rupu __features` lacked `agent.no_messaging`: refused
-    /// before any mirror run by the gate, or, when the remote changed after
-    /// the gate, by the launch's backstop with its mirror run finished failed.
     #[tokio::test]
-    async fn launch_agent_refuses_a_remote_lacking_no_messaging() {
-        for on_launch in [false, true] {
-            let exec = std::sync::Arc::new(MarkerExec {
-                marker: LAUNCH_NO_MESSAGING_UNSUPPORTED,
-                on_launch,
-                commands: Default::default(),
-            });
-            let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&exec));
-            let err = conn
-                .launch_agent(quiet_launch("run_01OLDQUIET"))
-                .await
-                .unwrap_err();
-            assert!(
-                matches!(&err, HostConnectorError::Unsupported(m)
-                    if m == "host host_abc runs a rupu without --no-messaging support (no \
-                             agent.no_messaging), so this unit cannot run with its messaging \
-                             off; upgrade rupu there"),
-                "{on_launch}: {err:?}"
-            );
-            if on_launch {
-                assert_eq!(exec.commands.lock().unwrap().len(), 2, "gate, then launch");
-                assert_eq!(
-                    run_store.load("run_01OLDQUIET").unwrap().status,
-                    rupu_orchestrator::RunStatus::Failed,
-                    "no mirror run left running"
-                );
+    async fn launch_agent_passes_messaging_to_the_remote_rupu_run_behind_the_gate() {
+        for (messaging, cap, flags, _, _) in messaging_gates() {
+            let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
+            let (conn, _run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+            let req = || messaging_launch("run_01QUIET", messaging.clone());
+            conn.launch_agent(req()).await.unwrap();
+            let cmds = fake.commands.lock().unwrap();
+            let gate = precheck_of(&req());
+            let other = if cap == CAP_AGENT_NO_MESSAGING {
+                CAP_AGENT_MESSAGING_TOOLS
             } else {
-                assert_eq!(
-                    *exec.commands.lock().unwrap(),
-                    vec![precheck_of(&quiet_launch("run_01OLDQUIET"))],
-                    "the gate only, no launch"
+                CAP_AGENT_NO_MESSAGING
+            };
+            assert!(
+                gate.contains(&format!("grep -qF '\"{cap}\"'"))
+                    && !gate.contains(CAP_AGENT_SKILLS)
+                    && !gate.contains(other),
+                "{gate}"
+            );
+            assert_eq!(
+                cmds.first(),
+                Some(&gate),
+                "the gate runs first, as its own command: {cmds:?}"
+            );
+            assert_eq!(cmds.len(), 2, "one gate command and one launch: {cmds:?}");
+            let launch = &cmds[1];
+            assert!(
+                launch.contains(flags),
+                "the remote `rupu run` must carry {flags}: {launch}"
+            );
+            assert!(
+                launch.contains(&format!("grep -qF '\"{cap}\"'")),
+                "the launch must be gated on the remote's {cap}: {launch}"
+            );
+        }
+    }
+
+    /// The remote's `rupu __features` lacked what the launch's messaging
+    /// needs: refused before any mirror run by the gate, or, when the remote
+    /// changed after the gate, by the launch's backstop with its mirror run
+    /// finished failed.
+    #[tokio::test]
+    async fn launch_agent_refuses_a_remote_lacking_the_messaging_flags() {
+        for (messaging, _, _, marker, refusal) in messaging_gates() {
+            for on_launch in [false, true] {
+                let exec = std::sync::Arc::new(MarkerExec {
+                    marker,
+                    on_launch,
+                    commands: Default::default(),
+                });
+                let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&exec));
+                let req = || messaging_launch("run_01OLDQUIET", messaging.clone());
+                let err = conn.launch_agent(req()).await.unwrap_err();
+                assert!(
+                    matches!(&err, HostConnectorError::Unsupported(m) if m == refusal),
+                    "{marker} {on_launch}: {err:?}"
                 );
-                assert!(run_store.list().unwrap().is_empty(), "no mirror run");
+                if on_launch {
+                    assert_eq!(exec.commands.lock().unwrap().len(), 2, "gate, then launch");
+                    assert_eq!(
+                        run_store.load("run_01OLDQUIET").unwrap().status,
+                        rupu_orchestrator::RunStatus::Failed,
+                        "no mirror run left running"
+                    );
+                } else {
+                    assert_eq!(
+                        *exec.commands.lock().unwrap(),
+                        vec![precheck_of(&req())],
+                        "the gate only, no launch"
+                    );
+                    assert!(run_store.list().unwrap().is_empty(), "no mirror run");
+                }
             }
         }
     }
@@ -10131,7 +10206,7 @@ mod tests {
                 skills: Vec::new(),
                 preload_skills: Vec::new(),
                 skill_bundle: None,
-                messaging_off: false,
+                messaging: Default::default(),
             })
             .await
             .unwrap_err();
@@ -10402,7 +10477,7 @@ mod tests {
     fn agent_spec() -> crate::node::protocol::RunSpec {
         crate::node::protocol::RunSpec {
             skill_bundle: None,
-            messaging_off: false,
+            messaging: Default::default(),
             kind: crate::node::protocol::RunSpecKind::Agent,
             name: "reviewer".into(),
             inputs: std::collections::BTreeMap::new(),
@@ -10420,7 +10495,7 @@ mod tests {
     fn workflow_spec() -> crate::node::protocol::RunSpec {
         crate::node::protocol::RunSpec {
             skill_bundle: None,
-            messaging_off: false,
+            messaging: Default::default(),
             kind: crate::node::protocol::RunSpecKind::Workflow,
             name: "wf".into(),
             inputs: std::collections::BTreeMap::new(),

@@ -645,7 +645,7 @@ fn profiled_agent_req(
         skills: Vec::new(),
         preload_skills: Vec::new(),
         skill_bundle: None,
-        messaging_off: false,
+        messaging: Default::default(),
         codename: None,
     }
 }
@@ -992,115 +992,157 @@ async fn launch_agent_without_skills_posts_no_skills_keys() {
     post.assert();
 }
 
-// ── --no-messaging over HTTP ──────────────────────────────────────────────────
+// ── messaging (--no-messaging / --messaging-tool) over HTTP ─────────────────
 
-fn quiet_agent_req() -> rupu_cp::agent_launcher::AgentLaunchRequest {
+fn messaging_agent_req(
+    messaging: rupu_runtime::argv::LaunchMessaging,
+) -> rupu_cp::agent_launcher::AgentLaunchRequest {
     let mut req = profiled_agent_req(None);
-    req.messaging_off = true;
+    req.messaging = messaging;
     req
 }
 
-/// End to end against a real remote CP: it advertises `agent.no_messaging`,
-/// takes `messaging_off` off the body and hands it to its own agent launcher
-/// (which puts `--no-messaging` on the `rupu run` argv).
-#[tokio::test]
-async fn launch_agent_delivers_messaging_off_to_a_real_remote_cp() {
-    let tmp = tempfile::tempdir().unwrap();
-    let launcher = std::sync::Arc::new(CapturingAgentLauncher {
-        last: std::sync::Mutex::new(None),
-    });
-    let state = rupu_cp::state::AppState::new(
-        tmp.path().to_path_buf(),
-        rupu_config::PricingConfig::default(),
-    )
-    .with_agent_launcher(Some(launcher.clone()));
-    let addr = serve_cp(state).await;
-
-    let c = HttpHostConnector::new(format!("http://{addr}"), None);
-    assert_eq!(
-        c.launch_agent(quiet_agent_req()).await.unwrap(),
-        "run_REMOTE"
-    );
-    let got = launcher
-        .last
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("remote launched");
-    assert!(got.messaging_off);
+/// Each switch: its body value, the feature it needs, the other messaging
+/// feature (which alone does not do) and the refusal.
+fn messaging_cases() -> [(
+    rupu_runtime::argv::LaunchMessaging,
+    serde_json::Value,
+    &'static str,
+    &'static str,
+    &'static str,
+); 2] {
+    use rupu_runtime::argv::LaunchMessaging;
+    [
+        (
+            LaunchMessaging::Off,
+            serde_json::json!("off"),
+            "agent.no_messaging",
+            "agent.messaging_tools",
+            "this run cannot run with its messaging off: remote host ",
+        ),
+        (
+            LaunchMessaging::Tools(vec!["msg.send".into()]),
+            serde_json::json!({"tools": ["msg.send"]}),
+            "agent.messaging_tools",
+            "agent.no_messaging",
+            "this run cannot run with only its workflow's messaging tools: remote host ",
+        ),
+    ]
 }
 
-/// The body carries `"messaging_off": true` to a remote advertising the
-/// feature.
+/// End to end against a real remote CP: it advertises both messaging
+/// features, takes `messaging` off the body and hands it to its own agent
+/// launcher (which puts the flags on the `rupu run` argv).
 #[tokio::test]
-async fn launch_agent_posts_messaging_off_to_a_remote_advertising_it() {
-    let server = httpmock::MockServer::start_async().await;
-    server.mock(|when, then| {
-        when.method("GET").path("/api/host/info");
-        then.status(200).json_body(serde_json::json!({
-            "version": "0.95.0",
-            "capabilities": {"backends": [], "scm_hosts": [], "permission_modes": []},
-            "features": ["agent.no_messaging"]
-        }));
-    });
-    let post = server.mock(|when, then| {
-        when.method("POST")
-            .path("/api/agents/sec/run")
-            .matches(|req| {
-                let body: serde_json::Value =
-                    serde_json::from_slice(req.body.as_deref().unwrap_or_default()).unwrap();
-                body.get("messaging_off") == Some(&serde_json::json!(true))
-            });
-        then.status(200)
-            .json_body(serde_json::json!({"run_id": "run_X"}));
-    });
-    let c = HttpHostConnector::new(server.base_url(), None);
-    assert_eq!(c.launch_agent(quiet_agent_req()).await.unwrap(), "run_X");
-    post.assert();
+async fn launch_agent_delivers_messaging_to_a_real_remote_cp() {
+    for (messaging, ..) in messaging_cases() {
+        let tmp = tempfile::tempdir().unwrap();
+        let launcher = std::sync::Arc::new(CapturingAgentLauncher {
+            last: std::sync::Mutex::new(None),
+        });
+        let state = rupu_cp::state::AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        )
+        .with_agent_launcher(Some(launcher.clone()));
+        let addr = serve_cp(state).await;
+
+        let c = HttpHostConnector::new(format!("http://{addr}"), None);
+        assert_eq!(
+            c.launch_agent(messaging_agent_req(messaging.clone()))
+                .await
+                .unwrap(),
+            "run_REMOTE"
+        );
+        let got = launcher
+            .last
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("remote launched");
+        assert_eq!(got.messaging, messaging);
+    }
 }
 
-/// A remote predating the field would ignore the body key and give the unit
-/// the default messaging tools, so the connector refuses one that does not
-/// advertise `agent.no_messaging`, or has no host info at all.
+/// The body carries `messaging` to a remote advertising its feature.
 #[tokio::test]
-async fn launch_agent_refuses_messaging_off_the_remote_does_not_advertise() {
-    for info in [
-        Some(serde_json::json!({
-            "version": "0.90.0",
-            "capabilities": {"backends": [], "scm_hosts": [], "permission_modes": []},
-            "features": ["agent.findings_profile", "agent.skills"]
-        })),
-        None,
-    ] {
+async fn launch_agent_posts_messaging_to_a_remote_advertising_it() {
+    for (messaging, wire, feature, ..) in messaging_cases() {
         let server = httpmock::MockServer::start_async().await;
         server.mock(|when, then| {
             when.method("GET").path("/api/host/info");
-            match &info {
-                Some(body) => then.status(200).json_body(body.clone()),
-                None => then.status(404),
-            };
+            then.status(200).json_body(serde_json::json!({
+                "version": "0.95.0",
+                "capabilities": {"backends": [], "scm_hosts": [], "permission_modes": []},
+                "features": [feature]
+            }));
         });
         let post = server.mock(|when, then| {
-            when.method("POST").path("/api/agents/sec/run");
+            when.method("POST")
+                .path("/api/agents/sec/run")
+                .json_body_partial(serde_json::json!({ "messaging": wire }).to_string());
             then.status(200)
                 .json_body(serde_json::json!({"run_id": "run_X"}));
         });
         let c = HttpHostConnector::new(server.base_url(), None);
-        let err = c.launch_agent(quiet_agent_req()).await.unwrap_err();
-        assert!(
-            matches!(&err, HostConnectorError::Unsupported(m)
-                if m.starts_with("this run cannot run with its messaging off: remote host ")
-                    && m.contains(&server.base_url())
-                    && m.contains("upgrade rupu")),
-            "{err:?}"
+        assert_eq!(
+            c.launch_agent(messaging_agent_req(messaging))
+                .await
+                .unwrap(),
+            "run_X"
         );
-        post.assert_hits(0);
+        post.assert();
     }
 }
 
-/// Messaging on ⇒ no `messaging_off` key in the body.
+/// A remote predating the field would ignore the body key and give the unit
+/// the default messaging tools, so the connector refuses one that does not
+/// advertise the feature the launch needs (advertising only the other
+/// messaging feature does not do), or has no host info at all.
 #[tokio::test]
-async fn launch_agent_with_messaging_on_posts_no_messaging_off_key() {
+async fn launch_agent_refuses_messaging_the_remote_does_not_advertise() {
+    for (messaging, _, _, other, refusal) in messaging_cases() {
+        for info in [
+            Some(serde_json::json!({
+                "version": "0.90.0",
+                "capabilities": {"backends": [], "scm_hosts": [], "permission_modes": []},
+                "features": ["agent.findings_profile", "agent.skills", other]
+            })),
+            None,
+        ] {
+            let server = httpmock::MockServer::start_async().await;
+            server.mock(|when, then| {
+                when.method("GET").path("/api/host/info");
+                match &info {
+                    Some(body) => then.status(200).json_body(body.clone()),
+                    None => then.status(404),
+                };
+            });
+            let post = server.mock(|when, then| {
+                when.method("POST").path("/api/agents/sec/run");
+                then.status(200)
+                    .json_body(serde_json::json!({"run_id": "run_X"}));
+            });
+            let c = HttpHostConnector::new(server.base_url(), None);
+            let err = c
+                .launch_agent(messaging_agent_req(messaging.clone()))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, HostConnectorError::Unsupported(m)
+                    if m.starts_with(refusal)
+                        && m.contains(&server.base_url())
+                        && m.contains("upgrade rupu")),
+                "{messaging:?}: {err:?}"
+            );
+            post.assert_hits(0);
+        }
+    }
+}
+
+/// The default ⇒ no `messaging` key in the body.
+#[tokio::test]
+async fn launch_agent_with_default_messaging_posts_no_messaging_key() {
     let server = httpmock::MockServer::start_async().await;
     let post = server.mock(|when, then| {
         when.method("POST")
@@ -1108,7 +1150,7 @@ async fn launch_agent_with_messaging_on_posts_no_messaging_off_key() {
             .matches(|req| {
                 let body: serde_json::Value =
                     serde_json::from_slice(req.body.as_deref().unwrap_or_default()).unwrap();
-                body.get("messaging_off").is_none()
+                body.get("messaging").is_none()
             });
         then.status(200)
             .json_body(serde_json::json!({"run_id": "run_X"}));

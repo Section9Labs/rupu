@@ -58,7 +58,7 @@ mod tests {
             skills: Vec::new(),
             preload_skills: Vec::new(),
             skill_bundle: None,
-            messaging_off: false,
+            messaging: Default::default(),
         }
     }
 
@@ -137,16 +137,23 @@ mod tests {
         );
     }
 
-    /// A placed unit of an opted-out workflow runs `rupu run --no-messaging`.
+    /// A placed unit's workflow `messaging:` switch is on the argv: `rupu
+    /// run --no-messaging` or `--messaging-tool <name>` each.
     #[test]
-    fn a_units_messaging_off_is_on_the_argv() {
-        let mut r = req();
-        r.target = None;
-        r.messaging_off = true;
-        let (spec, run_id) = spawn_spec("/bin/rupu".as_ref(), &r).unwrap();
-        assert_eq!(
-            args(&spec),
-            [
+    fn a_units_messaging_is_on_the_argv() {
+        use rupu_runtime::argv::LaunchMessaging;
+        for (messaging, flags) in [
+            (LaunchMessaging::Off, vec!["--no-messaging"]),
+            (
+                LaunchMessaging::Tools(vec!["msg.send".into()]),
+                vec!["--messaging-tool", "msg.send"],
+            ),
+        ] {
+            let mut r = req();
+            r.target = None;
+            r.messaging = messaging;
+            let (spec, run_id) = spawn_spec("/bin/rupu".as_ref(), &r).unwrap();
+            let want: Vec<&str> = [
                 "run",
                 "triage",
                 "--run-id",
@@ -154,9 +161,12 @@ mod tests {
                 "--mode",
                 "bypass",
                 "--prompt=look at PR",
-                "--no-messaging",
             ]
-        );
+            .into_iter()
+            .chain(flags)
+            .collect();
+            assert_eq!(args(&spec), want);
+        }
     }
 
     #[test]

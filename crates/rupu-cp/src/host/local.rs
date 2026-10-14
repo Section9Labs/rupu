@@ -1274,7 +1274,7 @@ mod launch_agent_tests {
                 skills: Vec::new(),
                 preload_skills: Vec::new(),
                 skill_bundle: None,
-                messaging_off: false,
+                messaging: Default::default(),
                 codename: None,
             })
             .await
@@ -1311,7 +1311,7 @@ mod launch_agent_tests {
             skills: Vec::new(),
             preload_skills: Vec::new(),
             skill_bundle: None,
-            messaging_off: false,
+            messaging: Default::default(),
             codename: None,
         })
         .await
@@ -1353,7 +1353,7 @@ mod launch_agent_tests {
             skills: vec!["pdf".into()],
             preload_skills: vec!["house-style".into()],
             skill_bundle: None,
-            messaging_off: false,
+            messaging: Default::default(),
             codename: None,
         })
         .await
@@ -1363,44 +1363,58 @@ mod launch_agent_tests {
         assert_eq!(got.preload_skills, ["house-style"]);
     }
 
-    /// Same hop for a placed unit of an opted-out workflow: the launcher
-    /// renders `--no-messaging` from the request's `agent_run`.
+    /// Same hop for a placed unit's workflow `messaging:` switch: the
+    /// launcher renders `--no-messaging` / `--messaging-tool` from the
+    /// request's `agent_run`.
     #[tokio::test]
-    async fn launch_agent_forwards_messaging_off_to_the_launcher() {
-        let tmp = tempfile::tempdir().unwrap();
-        let capture = Arc::new(Capture(Mutex::new(None)));
-        let conn = LocalHostConnector::new(
-            None,
-            Some(capture.clone()),
-            None,
-            None,
-            Arc::new(RunStore::new(tmp.path().join("runs"))),
-            tmp.path().to_path_buf(),
-        );
-        conn.launch_agent(AgentLaunchRequest {
-            agent: "recon".into(),
-            prompt: None,
-            mode: None,
-            target: None,
-            working_dir: None,
-            run_id: None,
-            findings_profile: None,
-            engagement_profiles: Vec::new(),
-            skills: Vec::new(),
-            preload_skills: Vec::new(),
-            skill_bundle: None,
-            messaging_off: true,
-            codename: None,
-        })
-        .await
-        .unwrap();
-        let got = capture.0.lock().unwrap().clone().unwrap();
-        assert!(got.messaging_off);
-        let args = rupu_runtime::argv::RunArgv::Agent(got.agent_run("run_1").unwrap()).to_args();
-        assert_eq!(
-            args,
-            ["run", "recon", "--run-id", "run_1", "--no-messaging"]
-        );
+    async fn launch_agent_forwards_messaging_to_the_launcher() {
+        for (messaging, flags) in [
+            (
+                rupu_runtime::argv::LaunchMessaging::Off,
+                vec!["--no-messaging"],
+            ),
+            (
+                rupu_runtime::argv::LaunchMessaging::Tools(vec!["msg.send".into()]),
+                vec!["--messaging-tool", "msg.send"],
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let capture = Arc::new(Capture(Mutex::new(None)));
+            let conn = LocalHostConnector::new(
+                None,
+                Some(capture.clone()),
+                None,
+                None,
+                Arc::new(RunStore::new(tmp.path().join("runs"))),
+                tmp.path().to_path_buf(),
+            );
+            conn.launch_agent(AgentLaunchRequest {
+                agent: "recon".into(),
+                prompt: None,
+                mode: None,
+                target: None,
+                working_dir: None,
+                run_id: None,
+                findings_profile: None,
+                engagement_profiles: Vec::new(),
+                skills: Vec::new(),
+                preload_skills: Vec::new(),
+                skill_bundle: None,
+                messaging: messaging.clone(),
+                codename: None,
+            })
+            .await
+            .unwrap();
+            let got = capture.0.lock().unwrap().clone().unwrap();
+            assert_eq!(got.messaging, messaging);
+            let args =
+                rupu_runtime::argv::RunArgv::Agent(got.agent_run("run_1").unwrap()).to_args();
+            let want: Vec<&str> = ["run", "recon", "--run-id", "run_1"]
+                .into_iter()
+                .chain(flags)
+                .collect();
+            assert_eq!(args, want);
+        }
     }
 
     /// `host: local` ships nothing, but a bundle a launch carries anyway
@@ -1456,7 +1470,7 @@ mod launch_agent_tests {
             skills: Vec::new(),
             preload_skills: Vec::new(),
             skill_bundle: Some(manifest.clone()),
-            messaging_off: false,
+            messaging: Default::default(),
             codename: None,
         })
         .await
