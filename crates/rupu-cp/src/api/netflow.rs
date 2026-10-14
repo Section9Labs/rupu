@@ -71,6 +71,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use rupu_netflow::land::{LandingRecord, LandingStatus, RosterLine};
 use rupu_netflow::{
     global_netflow_dir, is_per_run_ledger_path,
     ledger::explorer::{
@@ -80,6 +81,7 @@ use rupu_netflow::{
     project_local_netflow_dir, AsnInfo, AsnTable, FlowId, FlowRecord, NetflowPaths,
 };
 use rupu_orchestrator::runs::{RunRecord, RunStore};
+use rupu_runtime::file_cache::FileCache;
 use rupu_transcript::{Event as TranscriptEvent, JsonlReader};
 use rupu_workspace::WorkspaceStore;
 use serde::{Deserialize, Serialize};
@@ -837,27 +839,37 @@ pub(crate) fn netflow_tree(
     store: &RunStore,
     run_id: &str,
 ) -> (RunTree, Vec<IncompleteSource>) {
-    use rupu_netflow::land::{read_landing_record, read_roster, LandingStatus};
+    netflow_tree_in(record_caches(), global_dir, store, run_id)
+}
+
+/// [`netflow_tree`] reading its roster and landing records through
+/// `caches` (production: the process-wide [`record_caches`]).
+fn netflow_tree_in(
+    caches: &RecordCaches,
+    global_dir: &StdPath,
+    store: &RunStore,
+    run_id: &str,
+) -> (RunTree, Vec<IncompleteSource>) {
     let runs = global_dir.join("runs");
     let mut tree = run_tree(global_dir, store, run_id);
-    let roster = read_roster(&store.root, run_id);
-    let roster_hosts: HashMap<String, String> = roster
+    let roster = caches.roster_of(&store.root, run_id);
+    let roster_hosts: HashMap<&str, &str> = roster
         .iter()
-        .map(|l| (l.unit_run_id.clone(), l.host.clone()))
+        .map(|l| (l.unit_run_id.as_str(), l.host.as_str()))
         .collect();
     tree.ids
-        .extend(roster.into_iter().map(|l| l.unit_run_id));
+        .extend(roster.iter().map(|l| l.unit_run_id.clone()));
     let mut gaps = Vec::new();
     let mut landed = Vec::new();
     // Only a roster unit or the run itself (a wholly placed run) can carry a
-    // landing record — never read one per step id: every open counts at
-    // project/global scope (CP load-time rule).
-    let mut candidates: Vec<&str> = roster_hosts.keys().map(String::as_str).collect();
+    // landing record — never read one per step id: every stat counts at
+    // project/global scope (CP load-time rule), and an open far more.
+    let mut candidates: Vec<&str> = roster_hosts.keys().copied().collect();
     candidates.sort_unstable();
     candidates.insert(0, run_id);
     candidates.dedup();
     for id in candidates {
-        match read_landing_record(&runs, id) {
+        match caches.landing_of(&runs, id) {
             Some(r) => {
                 landed.extend(r.ledgers.iter().cloned());
                 if r.status != LandingStatus::Complete {
@@ -870,7 +882,7 @@ pub(crate) fn netflow_tree(
                         host_id: r.host.clone(),
                         reason: format!(
                             "netflow from unit run {id} {what}: {}",
-                            r.reason.unwrap_or_default()
+                            r.reason.clone().unwrap_or_default()
                         ),
                     });
                 }
@@ -878,7 +890,7 @@ pub(crate) fn netflow_tree(
             None => {
                 if let Some(host) = roster_hosts.get(id) {
                     gaps.push(IncompleteSource {
-                        host_id: host.clone(),
+                        host_id: (*host).to_string(),
                         reason: format!("netflow from unit run {id} was not collected yet"),
                     });
                 }
@@ -895,8 +907,91 @@ pub(crate) fn netflow_tree(
 /// True when a run's own landing record is complete — a wholly placed run
 /// whose ledgers are all local now and needs no live fetch.
 pub fn run_landed_complete(global_dir: &StdPath, run_id: &str) -> bool {
-    rupu_netflow::land::read_landing_record(&global_dir.join("runs"), run_id)
-        .is_some_and(|r| r.status == rupu_netflow::land::LandingStatus::Complete)
+    record_caches().run_landed_complete(&global_dir.join("runs"), run_id)
+}
+
+// ── Roster and landing-record parse cache ───────────────────────────────
+
+/// The per-run netflow records every scope's id walk ([`netflow_tree`])
+/// reads: a workflow run's roster of placed unit attempts
+/// (`netflow.units.jsonl`) and each candidate's landing record
+/// (`netflow.landing.json`). Project and global scope fold EVERY run in
+/// their stores through that walk on every request, so these are parsed
+/// once and re-validated by `stat` ([`FileCache`], the contract
+/// `RunStore::list` keeps for `run.json`): an unchanged file costs a stat,
+/// a missing one costs a stat and no entry, and a rewritten or appended
+/// one is re-read. Semantics match `rupu_netflow::land::{read_roster,
+/// read_landing_record}` exactly — a malformed roster line is skipped, a
+/// malformed record reads as `None` — and a malformed record is cached
+/// as absent so it, too, costs no open next time.
+pub(crate) struct RecordCaches {
+    roster: FileCache<Vec<RosterLine>>,
+    landing: FileCache<Option<Arc<LandingRecord>>>,
+}
+
+impl RecordCaches {
+    /// A cache that keeps parses of files unchanged for `settle` (tests;
+    /// production uses [`FileCache`]'s default window).
+    fn with_settle(settle: std::time::Duration) -> Self {
+        Self {
+            roster: FileCache::with_settle(settle),
+            landing: FileCache::with_settle(settle),
+        }
+    }
+
+    /// Every roster line of `workflow_run_id` (malformed lines skipped);
+    /// empty when the roster does not exist or cannot be read.
+    fn roster_of(&self, runs_root: &StdPath, workflow_run_id: &str) -> Arc<Vec<RosterLine>> {
+        let path = rupu_netflow::land::roster_path(runs_root, workflow_run_id);
+        self.roster
+            .read(&path, |bytes| {
+                Ok::<_, std::convert::Infallible>(parse_roster(bytes))
+            })
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    }
+
+    /// `run_id`'s landing record; `None` when absent, unreadable or
+    /// malformed.
+    fn landing_of(&self, runs_root: &StdPath, run_id: &str) -> Option<Arc<LandingRecord>> {
+        let path = rupu_netflow::land::landing_record_path(runs_root, run_id);
+        self.landing
+            .read(&path, |bytes| {
+                Ok::<_, std::convert::Infallible>(
+                    serde_json::from_slice::<LandingRecord>(bytes)
+                        .ok()
+                        .map(Arc::new),
+                )
+            })
+            .ok()
+            .flatten()
+            .and_then(|cached| (*cached).clone())
+    }
+
+    /// True when `run_id`'s own landing record is complete.
+    fn run_landed_complete(&self, runs_root: &StdPath, run_id: &str) -> bool {
+        self.landing_of(runs_root, run_id)
+            .is_some_and(|r| r.status == LandingStatus::Complete)
+    }
+}
+
+/// The process-wide [`RecordCaches`]: every netflow read path (CP
+/// endpoints, `rupu netflow show|prune`) walks the same run directories.
+fn record_caches() -> &'static RecordCaches {
+    static CACHES: OnceLock<RecordCaches> = OnceLock::new();
+    CACHES.get_or_init(|| RecordCaches::with_settle(rupu_runtime::file_cache::SETTLE))
+}
+
+/// `rupu_netflow::land::read_roster`'s parse over bytes already read: a
+/// non-UTF-8 file reads empty, a malformed line is skipped.
+fn parse_roster(bytes: &[u8]) -> Vec<RosterLine> {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<RosterLine>(l).ok())
+        .collect()
 }
 
 // ── Explorer attribution (run/workflow per ledger id) ───────────────────
@@ -951,6 +1046,17 @@ impl RunMetaIndex {
     /// from" rule) into the index. A run id already folded is skipped
     /// entirely (see `seen_runs`).
     fn insert_run(&mut self, global: &StdPath, store: &RunStore, record: &RunRecord) {
+        if self.seen_runs.contains(&record.id) {
+            return;
+        }
+        let ids = netflow_ids(store, global, &record.id);
+        self.insert_run_with(global, record, ids);
+    }
+
+    /// [`insert_run`](Self::insert_run) with the record's [`netflow_ids`]
+    /// already walked — run scope computes them once for its ledger read,
+    /// its gaps and its capture states, and folds the same walk in here.
+    fn insert_run_with(&mut self, global: &StdPath, record: &RunRecord, ids: NetflowIds) {
         if !self.seen_runs.insert(record.id.clone()) {
             return;
         }
@@ -962,7 +1068,7 @@ impl RunMetaIndex {
         {
             self.remote_workers.insert(worker.to_string());
         }
-        let NetflowIds { ids, gaps } = netflow_ids(store, global, &record.id);
+        let NetflowIds { ids, gaps } = ids;
         self.landing_gaps.extend(gaps);
         for id in ids {
             self.map
@@ -1428,12 +1534,40 @@ pub fn run_scoped_flows_and_dropped_with(
     extra_ledger_flows: Vec<FlowRecord>,
     extra_dropped: u64,
 ) -> (Vec<FlowRecord>, u64) {
+    let (tree, _) = netflow_tree(global_dir, store, run_id);
+    run_scoped_flows_from_tree(
+        reader,
+        store,
+        run_id,
+        workspace,
+        global_dir,
+        range,
+        extra_ledger_flows,
+        extra_dropped,
+        tree,
+    )
+}
+
+/// [`run_scoped_flows_and_dropped_with`] over an id walk the caller
+/// already did — run scope needs the same [`netflow_tree`] for its gaps
+/// and capture states, and walks it once (`collect_run_netflow`).
+#[allow(clippy::too_many_arguments)]
+fn run_scoped_flows_from_tree(
+    reader: &dyn LedgerReader,
+    store: &RunStore,
+    run_id: &str,
+    workspace: &StdPath,
+    global_dir: &StdPath,
+    range: &rupu_netflow::ledger::TimeRange,
+    extra_ledger_flows: Vec<FlowRecord>,
+    extra_dropped: u64,
+    tree: RunTree,
+) -> (Vec<FlowRecord>, u64) {
     let mut all: Vec<FlowRecord> = extra_ledger_flows
         .into_iter()
         .filter(|f| range.contains(f.ts))
         .collect();
     let mut dropped = extra_dropped;
-    let (tree, _) = netflow_tree(global_dir, store, run_id);
     for id in &tree.ids {
         for ledger_path in resolve_ledger_paths(workspace, global_dir, id) {
             let (f, d) = reader.flows_in_range(&ledger_path, range);
@@ -1476,7 +1610,11 @@ fn collect_run_netflow(
     remote: (Vec<FlowRecord>, u64, Vec<IncompleteSource>),
 ) -> NetflowResponse {
     let (remote_flows, remote_dropped, incomplete) = remote;
-    let (merged, dropped) = run_scoped_flows_and_dropped_with(
+    // One id walk for the whole response: the ledger read, the run's
+    // attribution, its landing gaps and its capture states all use it.
+    let (tree, gaps) = netflow_tree(global_dir, store, run_id);
+    let ids = tree.ids.clone();
+    let (merged, dropped) = run_scoped_flows_from_tree(
         reader,
         store,
         run_id,
@@ -1485,6 +1623,7 @@ fn collect_run_netflow(
         range,
         remote_flows,
         remote_dropped,
+        tree,
     );
     // Every flow at run scope folds into THIS run (the whole point of
     // `netflow_ids`), so attribution is the run's own record; a
@@ -1492,7 +1631,14 @@ fn collect_run_netflow(
     // than failing the read (the ledger may still be perfectly readable).
     let mut meta = RunMetaIndex::default();
     if let Ok(record) = store.load(run_id) {
-        meta.insert_run(global_dir, store, &record);
+        meta.insert_run_with(
+            global_dir,
+            &record,
+            NetflowIds {
+                ids: ids.clone(),
+                gaps: gaps.clone(),
+            },
+        );
     }
     let table = load_asn_table(cache);
     let tagged: Vec<(String, FlowRecord)> = merged
@@ -1503,7 +1649,6 @@ fn collect_run_netflow(
         build_filtered_response(tagged, &meta, dropped, table.as_deref(), range, filters);
     // The remote host's own refusal first, then every placed unit whose
     // netflow did not land here whole (spec 2026-10-14 §N4).
-    let NetflowIds { ids, gaps } = netflow_ids(store, global_dir, run_id);
     resp.incomplete = incomplete;
     resp.incomplete.extend(gaps);
     // One entry list per ledger file: `summarize_capture` applies
@@ -4916,6 +5061,156 @@ mod tests {
             &parse_filters(&None, &None, &None, &None),
         );
         assert_eq!(explorer.incomplete, resp.incomplete);
+    }
+
+    // ── Roster and landing reads go through the parse cache ────────────────
+    //
+    // Project and global scope fold every run through `netflow_tree`, which
+    // reads the run's roster and each candidate's landing record. Those
+    // reads must cost a `stat` per request once the file is unchanged, not
+    // an `open` (CP load-time rule) — the same `FileCache` contract
+    // `RunStore::list` keeps for `run.json`.
+
+    #[test]
+    fn an_unchanged_roster_and_landing_are_served_from_the_cache() {
+        let global = tempfile::TempDir::new().unwrap();
+        let landed = flow(FlowId::from(81u128), None, "api.landed.example");
+        let store = landed_fixture(global.path(), global.path(), &landed);
+        let caches = RecordCaches::with_settle(std::time::Duration::ZERO);
+
+        let (first_tree, first_gaps) = netflow_tree_in(&caches, global.path(), &store, "run_wf");
+        assert_eq!(
+            caches.roster.len(),
+            1,
+            "run_wf's roster is cached after the first walk"
+        );
+        assert_eq!(
+            caches.landing.len(),
+            2,
+            "run_u0's and run_u1's landing records are cached; run_wf's and run_u2's \
+             missing ones cost a stat each and are not entries"
+        );
+
+        let roster_before = caches.roster_of(&store.root, "run_wf");
+        let landing_before = caches
+            .landing_of(&global.path().join("runs"), "run_u1")
+            .expect("run_u1 landed");
+        let (second_tree, second_gaps) = netflow_tree_in(&caches, global.path(), &store, "run_wf");
+        assert_eq!(first_tree.ids, second_tree.ids);
+        assert_eq!(first_gaps, second_gaps);
+        assert!(
+            Arc::ptr_eq(&roster_before, &caches.roster_of(&store.root, "run_wf")),
+            "an unchanged roster is the cached parse, not a re-read"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &landing_before,
+                &caches
+                    .landing_of(&global.path().join("runs"), "run_u1")
+                    .expect("run_u1 still landed")
+            ),
+            "an unchanged landing record is the cached parse, not a re-read"
+        );
+        assert_eq!(caches.roster.len(), 1);
+        assert_eq!(caches.landing.len(), 2);
+    }
+
+    #[test]
+    fn a_changed_roster_or_landing_is_picked_up_by_the_next_walk() {
+        let global = tempfile::TempDir::new().unwrap();
+        let landed = flow(FlowId::from(82u128), None, "api.landed.example");
+        let store = landed_fixture(global.path(), global.path(), &landed);
+        let caches = RecordCaches::with_settle(std::time::Duration::ZERO);
+        let runs = global.path().join("runs");
+
+        let (_, gaps) = netflow_tree_in(&caches, global.path(), &store, "run_wf");
+        assert_eq!(gaps.len(), 2, "sanity: run_u0 partial, run_u2 pending");
+
+        // run_u2's stream lands complete: the record appears where a stat
+        // found nothing before.
+        let u2 = flow(FlowId::from(83u128), None, "api.u2.example");
+        land(
+            global.path(),
+            "run_u2",
+            "host_b",
+            &[("run_u2", &u2)],
+            true,
+            None,
+        );
+        // run_u0's partial copy is replaced by a complete one (the next
+        // terminal pull after a host-side resume): same path, new bytes.
+        land(
+            global.path(),
+            "run_u0",
+            "host_a",
+            &[("run_u0", &u2)],
+            true,
+            None,
+        );
+        // A fourth attempt joins the roster after the first walk.
+        roster(&store, "run_wf", "run_u3", "host_c");
+
+        let (tree, gaps) = netflow_tree_in(&caches, global.path(), &store, "run_wf");
+        assert!(
+            tree.ids.contains(&"run_u3".to_string()),
+            "the appended roster line is read: {:?}",
+            tree.ids
+        );
+        assert_eq!(
+            gaps.len(),
+            1,
+            "run_u0 and run_u2 landed complete; only run_u3 is pending: {gaps:?}"
+        );
+        assert!(gaps[0].reason.contains("run_u3"));
+        assert!(caches.run_landed_complete(&runs, "run_u0"));
+        assert!(caches.run_landed_complete(&runs, "run_u2"));
+        assert!(!caches.run_landed_complete(&runs, "run_u3"));
+    }
+
+    #[test]
+    fn a_malformed_landing_or_roster_reads_as_absent_and_is_cached_that_way() {
+        let global = tempfile::TempDir::new().unwrap();
+        let store = RunStore::new(global.path().join("runs"));
+        store
+            .create(seed_record("run_wf", "wf", global.path()), "x: 1\n")
+            .unwrap();
+        roster(&store, "run_wf", "run_u1", "host_a");
+        // A good line, then garbage: the roster keeps the good one
+        // (`read_roster` semantics).
+        let roster_path = rupu_netflow::land::roster_path(&store.root, "run_wf");
+        let mut bytes = std::fs::read(&roster_path).unwrap();
+        bytes.extend_from_slice(b"not json\n");
+        std::fs::write(&roster_path, &bytes).unwrap();
+        let landing_path = rupu_netflow::land::landing_record_path(&store.root, "run_u1");
+        std::fs::create_dir_all(landing_path.parent().unwrap()).unwrap();
+        std::fs::write(&landing_path, b"{\"v\":1,\"status\":\"nope\"").unwrap();
+
+        let caches = RecordCaches::with_settle(std::time::Duration::ZERO);
+        let (tree, gaps) = netflow_tree_in(&caches, global.path(), &store, "run_wf");
+        assert!(tree.ids.contains(&"run_u1".to_string()));
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!(
+            gaps[0].reason.contains("not collected yet"),
+            "a malformed record reads as no record: {}",
+            gaps[0].reason
+        );
+        assert!(!caches.run_landed_complete(&store.root, "run_u1"));
+        assert_eq!(
+            caches.landing.len(),
+            1,
+            "the malformed record is cached as absent, so it costs no open next time"
+        );
+        assert_eq!(caches.roster.len(), 1);
+        let before = caches.landing_of(&store.root, "run_u1");
+        assert!(before.is_none());
+        let bytes = std::fs::read(&roster_path).unwrap();
+        let parsed = parse_roster(&bytes);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].unit_run_id, "run_u1");
+        assert!(
+            parse_roster(&[0xff, 0xfe]).is_empty(),
+            "a non-UTF-8 roster reads empty, as `read_roster` does"
+        );
     }
 }
 
