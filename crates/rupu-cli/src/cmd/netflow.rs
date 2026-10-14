@@ -597,7 +597,8 @@ pub(crate) struct PrunedLedger {
 ///   appending to the same ledgers — unless it is `Running`/`Pending` with
 ///   a recorded runner pid that is dead (an orphan the reaper will
 ///   finalize). Its id expands to its steps', fan-out units' and
-///   sub-agents' ids ([`rupu_cp::api::netflow::run_and_unit_ids`]);
+///   sub-agents' ids, plus every ledger a placed unit landed here
+///   ([`rupu_cp::api::netflow::netflow_ids`]);
 /// - a standalone `rupu run` whose `<run_id>.meta.json` (project or global
 ///   transcripts dir) records a pid that is alive — the run writes its
 ///   `run.json` only when it ends, so the metadata pid is its one liveness
@@ -632,7 +633,7 @@ pub(crate) fn live_ledger_ids(
             if rec.status.is_terminal() || orphaned {
                 continue;
             }
-            live.extend(rupu_cp::api::netflow::run_and_unit_ids(store, &rec.id));
+            live.extend(rupu_cp::api::netflow::netflow_ids(store, global, &rec.id).ids);
         }
     }
 
