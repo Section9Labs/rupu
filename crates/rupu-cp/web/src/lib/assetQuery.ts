@@ -70,7 +70,7 @@ export function assetFields(assets: AssetRow[]): RowField<AssetRow>[] {
   return [
     field('profile', 'exact', (a) => a.profile, profiles, 'Profile', 'profile:network', Layers, { facet: true }),
     field('kind', 'exact', (a) => [a.sub_kind, a.kind], kinds, 'Kind', 'kind:service', Shapes, { aliases: ['type'], facet: (a) => a.sub_kind }),
-    field('depth', 'ordered', (a) => a.depth, depths, 'Depth', 'depth:exploited · depth>=tested', Gauge, { facet: true }),
+    field('depth', 'ordered', (a) => a.depth, depths, 'Depth', 'depth:exploited · depth>=tested', Gauge, { facet: true, order: DEPTH_ORDER }),
     field('host', 'contains', (a) => strCoord(a, 'host'), [], 'Host', 'host:38.104. (contains)', Server, { facet: true }),
     field('port', 'exact', (a) => (coord(a, 'port') != null ? String(coord(a, 'port')) : undefined), [], 'Port', 'port:3389', EthernetPort),
     field('proto', 'exact', (a) => strCoord(a, 'proto'), protos, 'Proto', 'proto:tcp', Waypoints, { facet: true }),

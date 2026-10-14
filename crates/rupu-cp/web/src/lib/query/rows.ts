@@ -32,6 +32,9 @@ export interface RowField<Row> extends QueryField {
   facet?: boolean | ((row: Row) => RowValue);
   /** Bare words search this field, as `contains`. */
   text?: boolean;
+  /** An `ordered` field's rank ladder, low to high, when its `values` (what
+   *  the field accepts) also hold values outside it, which never compare. */
+  order?: readonly string[];
 }
 
 export type Facets = Record<string, FacetValue[]>;
@@ -103,7 +106,8 @@ function valueHit<Row>(field: RowField<Row>, have: string[], raw: string, op: Te
       return xs.some((x) => x === v || (byRole && roleWordOf(x) === v));
     }
     case 'ordered': {
-      const ladder = field.values.map((x) => x.toLowerCase());
+      if (op === 'eq') return xs.includes(v);
+      const ladder = (field.order ?? field.values).map((x) => x.toLowerCase());
       const want = ladder.indexOf(v);
       return want >= 0 && xs.some((x) => ladder.includes(x) && compare(ladder.indexOf(x), want, op));
     }

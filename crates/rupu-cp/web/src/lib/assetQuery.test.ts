@@ -58,6 +58,12 @@ describe('filterAssets', () => {
     expect(ids(run('depth>=tested').rows)).toEqual(['h1', 's1', 's2']);
     expect(ids(run('depth:exploited').rows)).toEqual(['s2']);
   });
+  it('never ranks a rung outside the known ladder', () => {
+    const odd = [...ASSETS, A({ id: 'x1', profile: 'network', sub_kind: 'host', depth: 'weird' })];
+    const fields = assetFields(odd);
+    expect(ids(filterAssets(odd, 'depth>=tested', fields).rows)).toEqual(['h1', 's1', 's2']);
+    expect(ids(filterAssets(odd, 'depth:weird', fields).rows)).toEqual(['x1']);
+  });
   it('supports negation and AND of terms', () => {
     expect(ids(run('-kind:host').rows)).toEqual(['m1', 's1', 's2']);
     expect(ids(run('profile:network depth>=tested').rows)).toEqual(['h1', 's1', 's2']);
