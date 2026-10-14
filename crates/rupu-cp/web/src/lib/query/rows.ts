@@ -9,6 +9,7 @@ import { parseQuery, type Term } from '../findingQuery/grammar';
 import type { QueryField } from '../findingQuery/fields';
 import { roleWordOf } from '../messages';
 import type { FacetValue } from '../../components/query/suggest';
+import { admitsSince, admitsUntil, parseRfc3339, parseTimeValue, type TimeValue } from './time';
 
 export type RowValue = string | number | boolean | null | undefined | readonly (string | number | boolean | null | undefined)[];
 
@@ -19,8 +20,10 @@ export type RowValue = string | number | boolean | null | undefined | readonly (
  *   with the grammar's `severity` kind, the field takes `>=` and friends.
  * - `address`: a message-space address; a value with no `#` also names every
  *   address with that role word (`pipit` is `pipit#1` and `pipit#20`).
- * - `since`, `until`: `get` returns an ISO timestamp; the value is a relative
- *   time (`30m`, `12h`, `7d`, `2w`) or an ISO date or date-time.
+ * - `since`, `until`: `get` returns an RFC 3339 timestamp; the value is a
+ *   `time` (`./time.ts`): a span back from now (`30m`, `12h`, `7d`, `2w`), a
+ *   UTC date (its whole day) or an RFC 3339 time, the same rules the server
+ *   applies.
  */
 export type MatchMode = 'exact' | 'contains' | 'prefix' | 'ordered' | 'address' | 'since' | 'until';
 
@@ -54,26 +57,6 @@ export interface FilterOptions<Row> {
 export function rowStrings(v: RowValue): string[] {
   const xs: readonly unknown[] = Array.isArray(v) ? v : [v];
   return xs.filter((x) => x !== null && x !== undefined && x !== '').map((x) => String(x));
-}
-
-const UNIT_MS: Record<string, number> = { m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 };
-
-/** The instant a `since` / `until` value names, or null when it names none. A
- *  bare date starts at local midnight; `until` one runs to that day's end. */
-export function parseTime(value: string, mode: 'since' | 'until', now: number): number | null {
-  const v = value.trim();
-  const rel = /^(\d+)([mhdw])$/i.exec(v);
-  if (rel) return now - Number(rel[1]) * UNIT_MS[rel[2].toLowerCase()];
-  const day = /^(\d{4})-(\d{2})-(\d{2})$/.exec(v);
-  if (day) {
-    const [y, m, d] = [Number(day[1]), Number(day[2]) - 1, Number(day[3])];
-    const start = new Date(y, m, d);
-    if (start.getFullYear() !== y || start.getMonth() !== m || start.getDate() !== d) return null;
-    return mode === 'since' ? start.getTime() : new Date(y, m, d + 1).getTime() - 1;
-  }
-  if (!/^\d{4}-\d{2}-\d{2}T/.test(v)) return null;
-  const t = Date.parse(v);
-  return Number.isNaN(t) ? null : t;
 }
 
 function compare(have: number, want: number, op: Term['op']): boolean {
@@ -133,17 +116,17 @@ function termPred<Row>(
     };
   }
   if (field.match === 'since' || field.match === 'until') {
-    const mode = field.match;
-    const at: number[] = [];
+    const admits = field.match === 'since' ? admitsSince : admitsUntil;
+    const bounds: TimeValue[] = [];
     for (const v of t.values) {
-      const ms = parseTime(v, mode, now);
-      if (ms === null) return `\`${v}\` is not a time (e.g. 7d, 12h, 2026-10-01)`;
-      at.push(ms);
+      const b = parseTimeValue(v);
+      if (b === null) return `\`${v}\` is not a time (expected 30m, 12h, 7d, 2w, 2026-10-01 or an RFC 3339 time)`;
+      bounds.push(b);
     }
     return (r) =>
       rowStrings(field.get(r)).some((x) => {
-        const ts = Date.parse(x);
-        return !Number.isNaN(ts) && at.some((ms) => (mode === 'since' ? ts >= ms : ts <= ms));
+        const ts = parseRfc3339(x);
+        return ts !== null && bounds.some((b) => admits(b, ts, now));
       });
   }
   return (r) => {
@@ -153,8 +136,9 @@ function termPred<Row>(
 }
 
 /**
- * Filter `rows` by `q`. A query that doesn't parse filters nothing and comes
- * back as the error (the QueryBar shows its chip in red). A time value that
+ * Filter `rows` by `q`. A query that doesn't parse (a bad time on a `time`
+ * field included) filters nothing and comes back as the error (the QueryBar
+ * shows its chip in red). A time value on a field not declared `time` that
  * names no time matches no row and comes back as the error.
  */
 export function filterRows<Row>(
@@ -198,9 +182,18 @@ export function rowFacets<Row>(rows: readonly Row[], fields: readonly RowField<R
 type FieldInit<Row> = Omit<RowField<Row>, 'aliases' | 'kind' | 'values'> & Partial<Pick<RowField<Row>, 'aliases' | 'kind' | 'values'>>;
 
 /** A field with the grammar's defaults: no aliases, `severity` kind for an
- *  `ordered` field, `enum` for one with a closed value set, else `text`. */
+ *  `ordered` field, `time` for a `since` / `until` one, `enum` for one with a
+ *  closed value set, else `text`. */
 export function rowField<Row>(f: FieldInit<Row>): RowField<Row> {
   const values = f.values ?? [];
-  const kind = f.kind ?? (f.match === 'ordered' ? 'severity' : values.length > 0 ? 'enum' : 'text');
+  const kind =
+    f.kind ??
+    (f.match === 'ordered'
+      ? 'severity'
+      : f.match === 'since' || f.match === 'until'
+        ? 'time'
+        : values.length > 0
+          ? 'enum'
+          : 'text');
   return { ...f, aliases: f.aliases ?? [], kind, values };
 }

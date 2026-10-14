@@ -206,3 +206,49 @@ mod tests {
         );
     }
 }
+
+/// The time half of the web lockstep: the same fixture the web's
+/// `lib/query/time.lockstep.test.ts` runs. Fix the parser, never the
+/// fixture, unless the spec changed.
+#[cfg(test)]
+mod lockstep {
+    use super::*;
+
+    #[derive(serde::Deserialize)]
+    struct Fixture {
+        now: String,
+        values: Vec<ValueCase>,
+        bounds: Vec<BoundCase>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ValueCase {
+        v: String,
+        normalized: Option<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct BoundCase {
+        v: String,
+        ts: String,
+        since: bool,
+        until: bool,
+    }
+
+    #[test]
+    fn time_values_match_the_shared_fixture() {
+        let f: Fixture =
+            serde_json::from_str(include_str!("../tests/fixtures/time_values.json")).unwrap();
+        let now = parse_timestamp(&f.now).unwrap();
+        for c in &f.values {
+            assert_eq!(normalize(&c.v).ok(), c.normalized, "{:?}", c.v);
+        }
+        for c in &f.bounds {
+            let bound = TimeValue::parse(&c.v).unwrap();
+            let ts = parse_timestamp(&c.ts);
+            let since = ts.is_some_and(|t| bound.admits_since(t, now));
+            let until = ts.is_some_and(|t| bound.admits_until(t, now));
+            assert_eq!((since, until), (c.since, c.until), "{:?} vs {:?}", c.v, c.ts);
+        }
+    }
+}
