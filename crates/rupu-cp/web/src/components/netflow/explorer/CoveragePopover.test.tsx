@@ -45,6 +45,22 @@ describe('CoveragePopover', () => {
     expect(screen.getByText(/capture unavailable on this run: lsof not permitted/i)).toBeInTheDocument();
   });
 
+  it('names the whole launch tree and its capture state at agentiflow scope', () => {
+    render(
+      <CoveragePopover
+        scope="agentiflow"
+        droppedTotal={0}
+        capture={{ state: 'unavailable', reason: 'lsof not permitted', notes: [] }}
+      />,
+    );
+    const pill = screen.getByRole('button', { name: /coverage & gaps/i });
+    expect(pill).toHaveTextContent(/subprocess capture unavailable/i);
+    fireEvent.click(pill);
+    expect(screen.getByText(/the lead and every run it launched, at any depth/i)).toBeInTheDocument();
+    expect(screen.getByText(/runs on a remote host \(host: or distribute:\) keeps its flows on that host/i)).toBeInTheDocument();
+    expect(screen.queryByText(/sub-agents this run dispatched/i)).not.toBeInTheDocument();
+  });
+
   it('carries the fidelity legend from FIDELITY_TITLE for all four levels', () => {
     render(<CoveragePopover scope="global" droppedTotal={0} />);
     fireEvent.click(screen.getByRole('button', { name: /coverage & gaps/i }));

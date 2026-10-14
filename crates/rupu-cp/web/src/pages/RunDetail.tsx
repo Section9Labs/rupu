@@ -48,6 +48,7 @@ import AutoflowPanel from '../components/AutoflowPanel';
 import CyclesTab from '../components/run/CyclesTab';
 import ChildrenPanel from '../components/run/ChildrenPanel';
 import NetflowExplorer from '../components/netflow/explorer/NetflowExplorer';
+import { spanWindow } from '../lib/netflow';
 import { buildRunGraphModel, collectWarnings, type GraphNode, type RunGraphModel } from '../lib/runGraphModel';
 import { layoutGraph, type Pos } from '../lib/graphLayout';
 import { absoluteTime } from '../lib/time';
@@ -69,18 +70,6 @@ import { parseCallHash, useToolCallAnchor } from '../lib/toolCallAnchor';
 const MAX_EVENTS = 2000;
 
 type Tab = 'transcript' | 'events' | 'findings' | 'children' | 'cycles' | 'netflow' | 'messages';
-
-/** Padding around the run's own span for the Network tab's default
- *  window (the approved mockup's ±5 minutes) — see the render-site
- *  comment for why the exact span would silently truncate. */
-const RUN_SPAN_PAD_MS = 5 * 60_000;
-
-/** `iso` shifted by `deltaMs`; returns the input unchanged when it
- *  doesn't parse (the server enforces its own bounds either way). */
-function padIso(iso: string, deltaMs: number): string {
-  const t = Date.parse(iso);
-  return Number.isNaN(t) ? iso : new Date(t + deltaMs).toISOString();
-}
 
 /**
  * A single selection cursor that the whole tab panel follows. `unitIndex` is an
@@ -1523,10 +1512,7 @@ export default function RunDetail() {
               key={run.id}
               scope="run"
               runId={run.id}
-              initialWindow={{
-                from: padIso(run.started_at, -RUN_SPAN_PAD_MS),
-                to: run.finished_at ? padIso(run.finished_at, RUN_SPAN_PAD_MS) : undefined,
-              }}
+              initialWindow={spanWindow(run.started_at, run.finished_at)}
             />
           </div>
         )}

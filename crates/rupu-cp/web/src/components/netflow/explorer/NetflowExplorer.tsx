@@ -22,6 +22,7 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import {
+  fetchAgentiflowNetflow,
   fetchGlobalNetflow,
   fetchNetflowExplorer,
   fetchProjectNetflow,
@@ -53,9 +54,11 @@ export interface NetflowExplorerProps {
   projectId?: string;
   /** Required at `run` scope. */
   runId?: string;
-  /** Run scope: the run's own span, applied as the initial window (the
-   *  server still echoes whatever it actually enforced). An unfinished
-   *  run passes no `to`, leaving the upper bound open. */
+  /** Required at `agentiflow` scope. */
+  agentiflowId?: string;
+  /** Run and agentiflow scope: the run's own span, applied as the initial
+   *  window (the server still echoes whatever it actually enforced). An
+   *  unfinished run passes no `to`, leaving the upper bound open. */
   initialWindow?: { from?: string; to?: string };
 }
 
@@ -81,11 +84,17 @@ function toggleIn(list: string[], key: string): string[] {
   return list.includes(key) ? list.filter((k) => k !== key) : [...list, key];
 }
 
-export function NetflowExplorer({ scope, projectId, runId, initialWindow }: NetflowExplorerProps) {
+export function NetflowExplorer({
+  scope,
+  projectId,
+  runId,
+  agentiflowId,
+  initialWindow,
+}: NetflowExplorerProps) {
   const [range, setRange] = useState<TimeRangeValue>(() =>
     initialWindow && (initialWindow.from || initialWindow.to)
       ? { preset: 'custom', from: initialWindow.from, to: initialWindow.to }
-      : scope === 'run'
+      : scope === 'run' || scope === 'agentiflow'
         ? { preset: 'all' }
         : presetValue('24h', new Date()),
   );
@@ -108,9 +117,11 @@ export function NetflowExplorer({ scope, projectId, runId, initialWindow }: Netf
   const scopeParam =
     scope === 'run' && runId
       ? `run:${runId}`
-      : scope === 'project' && projectId
-        ? `project:${projectId}`
-        : undefined;
+      : scope === 'agentiflow' && agentiflowId
+        ? `agentiflow:${agentiflowId}`
+        : scope === 'project' && projectId
+          ? `project:${projectId}`
+          : undefined;
 
   // The aggregates and the flows list load independently: each section
   // renders as soon as its own response arrives. Previous data stays on
@@ -136,7 +147,7 @@ export function NetflowExplorer({ scope, projectId, runId, initialWindow }: Netf
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scope, projectId, runId, range, filters]);
+  }, [scope, projectId, runId, agentiflowId, range, filters]);
 
   useEffect(() => {
     let cancelled = false;
@@ -147,9 +158,11 @@ export function NetflowExplorer({ scope, projectId, runId, initialWindow }: Netf
     const flowsFetch =
       scope === 'run' && runId
         ? fetchRunNetflow(runId, q, f)
-        : scope === 'project' && projectId
-          ? fetchProjectNetflow(projectId, q, f)
-          : fetchGlobalNetflow(q, f);
+        : scope === 'agentiflow' && agentiflowId
+          ? fetchAgentiflowNetflow(agentiflowId, q, f)
+          : scope === 'project' && projectId
+            ? fetchProjectNetflow(projectId, q, f)
+            : fetchGlobalNetflow(q, f);
     flowsFetch
       .then((fl) => {
         if (cancelled) return;
@@ -165,7 +178,7 @@ export function NetflowExplorer({ scope, projectId, runId, initialWindow }: Netf
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scope, projectId, runId, range, filters]);
+  }, [scope, projectId, runId, agentiflowId, range, filters]);
 
   const orgLabels = useMemo(() => {
     const m = new Map<string, string>();
