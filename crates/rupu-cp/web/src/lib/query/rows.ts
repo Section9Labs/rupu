@@ -186,14 +186,41 @@ type FieldInit<Row> = Omit<RowField<Row>, 'aliases' | 'kind' | 'values'> & Parti
  *  closed value set, else `text`. */
 export function rowField<Row>(f: FieldInit<Row>): RowField<Row> {
   const values = f.values ?? [];
-  const kind =
-    f.kind ??
-    (f.match === 'ordered'
-      ? 'severity'
-      : f.match === 'since' || f.match === 'until'
-        ? 'time'
-        : values.length > 0
-          ? 'enum'
-          : 'text');
-  return { ...f, aliases: f.aliases ?? [], kind, values };
+  return { ...f, aliases: f.aliases ?? [], kind: f.kind ?? defaultKind(f.match, values), values };
+}
+
+function defaultKind(match: MatchMode, values: readonly string[]): QueryField['kind'] {
+  if (match === 'ordered') return 'severity';
+  if (match === 'since' || match === 'until') return 'time';
+  return values.length > 0 ? 'enum' : 'text';
+}
+
+/**
+ * A field of a list the server filters (`?q=`): the grammar spec, the
+ * QueryBar's presentation, and how the server matches it — no getter, since
+ * the page never filters these rows itself. Each such registry is pinned to
+ * the server's by `crates/rupu-cp/tests/fixtures/list_query/<list>.fields.json`.
+ */
+export interface ServerField extends QueryField {
+  match: MatchMode;
+  /** Bare words search this field. */
+  text: boolean;
+  /** The server counts its values (`?facets=1`). */
+  facet: boolean;
+}
+
+type ServerFieldInit = Omit<ServerField, 'aliases' | 'kind' | 'values' | 'text' | 'facet'> &
+  Partial<Pick<ServerField, 'aliases' | 'kind' | 'values' | 'text' | 'facet'>>;
+
+/** A server field with `rowField`'s grammar defaults, not text, no facet. */
+export function serverField(f: ServerFieldInit): ServerField {
+  const values = f.values ?? [];
+  return {
+    ...f,
+    aliases: f.aliases ?? [],
+    kind: f.kind ?? defaultKind(f.match, values),
+    values,
+    text: f.text ?? false,
+    facet: f.facet ?? false,
+  };
 }
