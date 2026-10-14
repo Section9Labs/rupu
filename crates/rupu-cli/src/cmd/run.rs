@@ -48,7 +48,8 @@ pub struct Args {
     /// For `<platform>:<owner>/<repo>` targets: clone into this
     /// directory instead of the default `./<repo>/`. The directory
     /// must not already exist (refuse-by-default — pass an explicit
-    /// path you own). Mutually exclusive with `--tmp`.
+    /// path you own), except on `--continue`, which reuses the original
+    /// run's checkout there. Mutually exclusive with `--tmp`.
     #[arg(long, value_name = "PATH", conflicts_with = "tmp")]
     pub into: Option<std::path::PathBuf>,
     /// For `<platform>:<owner>/<repo>` targets: clone into a
@@ -106,7 +107,8 @@ pub struct Args {
     pub engagement_profiles: Vec<String>,
     /// A skill this run may load, on top of the agent's own; repeat the flag
     /// for several. A coordinator passes a workflow step's `skills:` this
-    /// way. `--continue` keeps the continued run's unless these are given.
+    /// way. `--continue` keeps the continued run's unless this is given,
+    /// which replaces the whole list.
     #[arg(long = "skill", value_name = "SKILL")]
     pub skills: Vec<String>,
     /// A skill whose body goes in this run's system prompt; repeat the flag
@@ -136,15 +138,18 @@ pub struct Args {
     pub messaging_tools: Vec<String>,
     /// Continue an interrupted run of this agent from its transcript instead
     /// of starting fresh: the earlier conversation is rebuilt and the agent
-    /// is told it was interrupted. A run that had already finished prints
-    /// its recorded answer without calling the model. Run it from the same
-    /// project as the original run. With `--model` or `--provider`, a run
-    /// that failed on a provider-side outcome (a refusal, say) is continued
-    /// too, on that model.
+    /// is told it was interrupted. Every flag and the target the original
+    /// run was launched with are restored (recorded as `RunStart.launch_args`);
+    /// a flag given here replaces only its own setting. A repo target reuses
+    /// the checkout the original run cloned. A run that had already finished
+    /// prints its recorded answer without calling the model. Run it from the
+    /// same directory as the original run. With `--model` or `--provider`, a
+    /// run that failed on a provider-side outcome (a refusal, say) is
+    /// continued too, on that model.
     #[arg(
         long = "continue",
         value_name = "AGENT_RUN_ID",
-        conflicts_with_all = ["target", "prompt", "prompt_flag", "into", "tmp"]
+        conflicts_with_all = ["prompt", "prompt_flag"]
     )]
     pub continue_from: Option<String>,
     /// Model for this run, overriding the agent's `model:` and the config
@@ -158,6 +163,239 @@ pub struct Args {
     /// Set when another run launched this one (`--launch-*`, hidden).
     #[command(flatten)]
     pub launch: crate::cmd::launch_link::LaunchLinkArgs,
+    /// The arguments this invocation named on its command line, which a
+    /// `--continue` keeps over the ones it restores. Filled by
+    /// [`parse_launch_args`]; an `Args` built in code names none.
+    #[arg(skip)]
+    pub explicit: Explicit,
+}
+
+/// The clap ids of the arguments a `rupu run` command line named.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Explicit(std::collections::BTreeSet<String>);
+
+impl Explicit {
+    fn of(matches: &clap::ArgMatches) -> Self {
+        Self(
+            matches
+                .ids()
+                .filter(|id| {
+                    matches!(
+                        matches.value_source(id.as_str()),
+                        Some(clap::parser::ValueSource::CommandLine)
+                    )
+                })
+                .map(|id| id.as_str().to_string())
+                .collect(),
+        )
+    }
+
+    fn has(&self, id: &str) -> bool {
+        self.0.contains(id)
+    }
+}
+
+/// The `rupu run` arguments that reproduce `args` (the tokens after `run`),
+/// recorded as `RunStart.launch_args` for `--continue` to restore: `run_id`
+/// is the run's own, and the prompt, `--continue` and a `target` that is not
+/// a run target (the prompt's leading words) are left out.
+///
+/// It names every field of [`Args`] with no `..`, as [`restore_launch`]
+/// does, so a new flag fails to compile until it is rendered here too.
+fn launch_argv(args: &Args, run_id: &str) -> Vec<String> {
+    use clap::ValueEnum;
+    let Args {
+        agent,
+        target,
+        prompt: _,
+        prompt_flag: _,
+        mode,
+        no_stream,
+        view,
+        into,
+        tmp,
+        run_id: _,
+        codename,
+        message_space,
+        participant,
+        findings_profile,
+        engagement_profiles,
+        skills,
+        preload_skills,
+        skill_bundle,
+        continue_from: _,
+        model,
+        provider,
+        launch:
+            crate::cmd::launch_link::LaunchLinkArgs {
+                launch_depth,
+                launch_ceiling,
+                parent_run,
+                root_run,
+                usage_root,
+                launch_agents,
+                launch_workflows,
+                launch_actions,
+                launch_no_messaging,
+            },
+        explicit: _,
+    } = args;
+    let path = |p: &std::path::PathBuf| p.display().to_string();
+    let names = |n: &crate::cmd::launch_link::Names| n.0.join(",");
+    let mut out = vec![agent.clone()];
+    out.extend(
+        target
+            .iter()
+            .filter(|t| crate::run_target::parse_run_target(t).is_ok())
+            .cloned(),
+    );
+    let values = [
+        ("run-id", Some(run_id.to_string())),
+        ("mode", mode.clone()),
+        (
+            "view",
+            view.and_then(|v| v.to_possible_value())
+                .map(|v| v.get_name().to_string()),
+        ),
+        ("into", into.as_ref().map(path)),
+        ("codename", codename.as_ref().map(ToString::to_string)),
+        ("message-space", message_space.as_ref().map(path)),
+        ("participant", participant.clone()),
+        ("findings-profile", findings_profile.map(|p| p.to_string())),
+        ("skill-bundle", skill_bundle.clone()),
+        ("model", model.clone()),
+        ("provider", provider.clone()),
+        ("launch-depth", launch_depth.map(|d| d.to_string())),
+        (
+            "launch-ceiling",
+            launch_ceiling.map(|m| m.as_str().to_string()),
+        ),
+        ("parent-run", parent_run.clone()),
+        ("root-run", root_run.clone()),
+        ("usage-root", usage_root.as_ref().map(path)),
+        ("launch-agents", launch_agents.as_ref().map(names)),
+        ("launch-workflows", launch_workflows.as_ref().map(names)),
+        ("launch-actions", launch_actions.as_ref().map(names)),
+    ];
+    let lists = [
+        ("engagement-profile", engagement_profiles),
+        ("skill", skills),
+        ("preload-skill", preload_skills),
+    ];
+    for (flag, v) in values {
+        out.extend(v.map(|v| format!("--{flag}={v}")));
+    }
+    for (flag, list) in lists {
+        out.extend(list.iter().map(|v| format!("--{flag}={v}")));
+    }
+    for (flag, on) in [
+        ("no-stream", no_stream),
+        ("tmp", tmp),
+        ("launch-no-messaging", launch_no_messaging),
+    ] {
+        if *on {
+            out.push(format!("--{flag}"));
+        }
+    }
+    out
+}
+
+/// A `--continue` invocation (`now`) over the command the continued run
+/// recorded: each setting comes from `now` when its command line named it,
+/// else from `recorded`. The run id, `--continue` and the prompt are always
+/// `now`'s (the rebuilt conversation holds the prompt). A setting spelled by
+/// several flags takes them all from one side: the clone destination
+/// (`--into` / `--tmp`), the message space (`--message-space` /
+/// `--participant`) and the launch link (`--launch-*`).
+///
+/// It names every field of [`Args`] with no `..`, as [`launch_argv`] does,
+/// so a new flag fails to compile until its merge is decided here.
+fn restore_launch(recorded: Args, now: Args) -> Args {
+    fn pick<T>(given: bool, now: T, recorded: T) -> T {
+        if given {
+            now
+        } else {
+            recorded
+        }
+    }
+    let Args {
+        agent,
+        target,
+        prompt,
+        prompt_flag,
+        mode,
+        no_stream,
+        view,
+        into,
+        tmp,
+        run_id,
+        codename,
+        message_space,
+        participant,
+        findings_profile,
+        engagement_profiles,
+        skills,
+        preload_skills,
+        skill_bundle,
+        continue_from,
+        model,
+        provider,
+        launch,
+        explicit,
+    } = now;
+    let given = |id: &str| explicit.has(id);
+    let dest = given("into") || given("tmp");
+    let space = given("message_space") || given("participant");
+    let linked = [
+        "launch_depth",
+        "launch_ceiling",
+        "parent_run",
+        "root_run",
+        "usage_root",
+        "launch_agents",
+        "launch_workflows",
+        "launch_actions",
+        "launch_no_messaging",
+    ]
+    .into_iter()
+    .any(given);
+    Args {
+        agent,
+        target: pick(given("target"), target, recorded.target),
+        prompt,
+        prompt_flag,
+        mode: pick(given("mode"), mode, recorded.mode),
+        no_stream: pick(given("no_stream"), no_stream, recorded.no_stream),
+        view: pick(given("view"), view, recorded.view),
+        into: pick(dest, into, recorded.into),
+        tmp: pick(dest, tmp, recorded.tmp),
+        run_id,
+        codename: pick(given("codename"), codename, recorded.codename),
+        message_space: pick(space, message_space, recorded.message_space),
+        participant: pick(space, participant, recorded.participant),
+        findings_profile: pick(
+            given("findings_profile"),
+            findings_profile,
+            recorded.findings_profile,
+        ),
+        engagement_profiles: pick(
+            given("engagement_profiles"),
+            engagement_profiles,
+            recorded.engagement_profiles,
+        ),
+        skills: pick(given("skills"), skills, recorded.skills),
+        preload_skills: pick(
+            given("preload_skills"),
+            preload_skills,
+            recorded.preload_skills,
+        ),
+        skill_bundle: pick(given("skill_bundle"), skill_bundle, recorded.skill_bundle),
+        continue_from,
+        model: pick(given("model"), model, recorded.model),
+        provider: pick(given("provider"), provider, recorded.provider),
+        launch: pick(linked, launch, recorded.launch),
+        explicit,
+    }
 }
 
 fn parse_findings_profile(s: &str) -> Result<rupu_coverage::FindingProfile, String> {
@@ -342,8 +580,12 @@ struct LaunchParser {
 /// <agent> …` parse (agent-first AND flag-first both work, since `Args`
 /// is plain `clap::Args`, not a subcommand).
 pub fn parse_launch_args(argv: Vec<String>) -> Result<Args, clap::Error> {
-    LaunchParser::try_parse_from(std::iter::once("rupu run".to_string()).chain(argv))
-        .map(|wrapper| wrapper.args)
+    use clap::{CommandFactory, FromArgMatches};
+    let matches = LaunchParser::command()
+        .try_get_matches_from(std::iter::once("rupu run".to_string()).chain(argv))?;
+    let mut args = LaunchParser::from_arg_matches(&matches)?.args;
+    args.explicit = Explicit::of(&matches);
+    Ok(args)
 }
 
 /// Standalone parser for just the `resume` control action's flags,
@@ -709,14 +951,61 @@ struct RunListReport {
 }
 
 pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
-    // Both-or-neither, refused before anything is touched.
-    let space =
-        space_pair(&args)?.map(|(dir, participant)| (dir.to_path_buf(), participant.to_string()));
     let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
 
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
+    let transcripts = paths::transcripts_dir(&global, project_root.as_deref());
+
+    // `--continue <agent_run_id>` restores the command the continued run was
+    // launched with (its `RunStart.launch_args`), under the flags this one
+    // names. A run recorded before the field, or a sub-agent's (which has no
+    // command), restores nothing; its launch skills and skill bundle are
+    // carried over instead.
+    let prev_path = match args.continue_from.as_deref() {
+        Some(prev) => Some(continued_transcript(&global, &transcripts, prev)?),
+        None => None,
+    };
+    let recorded = match &prev_path {
+        Some(path) => rupu_agent::continuation::launch_args(path)?,
+        None => Vec::new(),
+    };
+    let restored = !recorded.is_empty();
+    let mut args = if restored {
+        let prev = args.continue_from.clone().unwrap_or_default();
+        let recorded = parse_launch_args(recorded)
+            .map_err(|e| anyhow::anyhow!("run {prev}'s recorded command does not parse: {e}"))?;
+        restore_launch(recorded, args)
+    } else {
+        args
+    };
+    // The run the launch skills came from, so a failure to resolve them
+    // says where they came from.
+    let mut skills_carried_from: Option<String> = None;
+    if let (Some(prev), Some(path)) = (args.continue_from.clone(), &prev_path) {
+        let carried = if restored {
+            (!args.explicit.has("skills") && !args.skills.is_empty())
+                || (!args.explicit.has("preload_skills") && !args.preload_skills.is_empty())
+        } else {
+            carry_unrecorded(&global, &prev, path, &mut args)?
+        };
+        if carried {
+            skills_carried_from = Some(prev);
+        }
+    }
+    if let (Some(prev), Some(target)) = (&args.continue_from, &args.target) {
+        if crate::run_target::parse_run_target(target).is_err() {
+            anyhow::bail!(
+                "--continue {prev} takes no prompt (`{target}` is not a run target): \
+                 the continued conversation already holds it"
+            );
+        }
+    }
+
+    // Both-or-neither, refused before anything is touched.
+    let space =
+        space_pair(&args)?.map(|(dir, participant)| (dir.to_path_buf(), participant.to_string()));
 
     // Load the agent (project shadows global). `load_agent` takes the
     // parent of `agents/`, so pass `<global>` and `<project_root>`
@@ -725,10 +1014,13 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     // `<project_root>/.rupu`.
     let project_agents_parent = project_root.as_ref().map(|p| p.join(".rupu"));
     //
-    // The shipped skills (`--skill-bundle`, else the bundle of the run being
-    // continued) overlay the installed ones, so they are known before the
-    // agent's `skills:` are checked.
-    let skill_bundle = skill_bundle_manifest(&global, &args)?;
+    // The shipped skills (`--skill-bundle`) overlay the installed ones, so
+    // they are known before the agent's `skills:` are checked.
+    let skill_bundle = args
+        .skill_bundle
+        .as_deref()
+        .map(|json| parse_skill_bundle(json, "--skill-bundle"))
+        .transpose()?;
     let skill_overlay = match &skill_bundle {
         Some(m) => rupu_skills::ship::overlay_for(&rupu_skills::ship::cache_dir(&global), m)?,
         None => Vec::new(),
@@ -796,9 +1088,9 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             ),
         ),
     };
-    let transcripts = paths::transcripts_dir(&global, project_root.as_deref());
     paths::ensure_dir(&transcripts)?;
     let transcript_path = transcripts.join(format!("{run_id}.jsonl"));
+    let launch_args = launch_argv(&args, &run_id);
 
     // Every `rupu run` streams its coverage to a run-scoped file so a
     // coordinator can collect a placed unit's findings (spec
@@ -809,35 +1101,15 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     // from its transcript (recover-on-interrupt spec §1). Same transcripts
     // dir as the new run, so run it from the same project.
     //
-    // With `--model`/`--provider`, a run that failed on an outcome is
-    // continued too (`prepare_recovery_continuation`); the third element is
-    // that outcome, `None` for an interrupted run.
-    //
-    // A continued run keeps the skills its launch gave the run it continues
-    // (`--skill` / `--preload-skill`), unless this launch names its own.
-    let mut launch_skills = (args.skills.clone(), args.preload_skills.clone());
-    // The run these launch skills were carried from, so a failure to
-    // resolve them says where they came from.
-    let mut skills_carried_from: Option<String> = None;
-    let mut resume_from: Option<ResumeFrom> = match args.continue_from.as_deref() {
+    // With `--model`/`--provider` on this command line, a run that failed on
+    // an outcome is continued too (`prepare_recovery_continuation`); the
+    // third element is that outcome, `None` for an interrupted run.
+    let launch_skills = (args.skills.clone(), args.preload_skills.clone());
+    let mut resume_from: Option<ResumeFrom> = match args.continue_from.as_deref().zip(prev_path) {
         None => None,
-        Some(prev) => {
+        Some((prev, prev_path)) => {
             use rupu_agent::continuation::{
                 prepare_continuation, prepare_recovery_continuation, transcript_agent, Continuation,
-            };
-            // A sub-agent's transcript lives under the run that dispatched
-            // it (`<runs>/<parent>/sub/<sub_id>/`), wherever that is.
-            let prev_path = if prev.starts_with("sub_") {
-                rupu_orchestrator::RunStore::new(global.join("runs"))
-                    .find_sub_run(prev)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "no sub-run `{prev}` under {}",
-                            global.join("runs").display()
-                        )
-                    })?
-            } else {
-                transcripts.join(format!("{prev}.jsonl"))
             };
             // The runner truncates its transcript when it starts, so a
             // `--run-id` that already has one would wipe it — the run
@@ -853,13 +1125,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             if prev_agent != spec.name {
                 anyhow::bail!("run {prev} was agent `{prev_agent}`, not `{}`", spec.name);
             }
-            if args.skills.is_empty() && args.preload_skills.is_empty() {
-                launch_skills = rupu_agent::continuation::launch_skills(&prev_path)?;
-                if !launch_skills.0.is_empty() || !launch_skills.1.is_empty() {
-                    skills_carried_from = Some(prev.to_string());
-                }
-            }
-            let prepared = if args.model.is_some() || args.provider.is_some() {
+            let prepared = if args.explicit.has("model") || args.explicit.has("provider") {
                 prepare_recovery_continuation(&prev_path)?
             } else {
                 prepare_continuation(&prev_path)?
@@ -907,11 +1173,6 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     // "nothing recorded". Written after the `--continue` checks, which must
     // not touch a run's files before they pass.
     start_coverage_stream(&coverage_stream, &run_id);
-    if let Some(m) = &skill_bundle {
-        let dir = global.join("runs").join(&run_id);
-        paths::ensure_dir(&dir)?;
-        std::fs::write(dir.join(SKILL_BUNDLE_FILE), serde_json::to_vec(m)?)?;
-    }
 
     // Netflow capture. Two destinations: this run's own ledger FILE
     // (`<run_id>.jsonl`, rooted at the project when one already has a
@@ -1031,6 +1292,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             findings_profile: args.findings_profile,
             skills: launch_skills.0.clone(),
             preload_skills: launch_skills.1.clone(),
+            launch_args,
             skill_overlay,
             messaging: args.messaging().resolve()?,
             ..Default::default()
@@ -1102,15 +1364,26 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                 };
                 let (_account, conn) = scm_registry.repo_for(&r, Some(pwd.as_path()), None)?;
 
-                let (dest, guard) = resolve_clone_dest(&pwd, repo, args.into.as_deref(), args.tmp)?;
-                // Brief progress line on stderr so the user knows where the
-                // clone is landing — the LineStreamPrinter rail has already
-                // printed `▶ <agent>` on stdout and we don't want to break
-                // its visual flow with a clone-progress line in the middle.
-                eprintln!("  cloning {}/{} → {}", owner, repo, dest.display());
-                conn.clone_to(&r, &dest).await?;
-                _clone_guard = guard;
-                dest
+                let continuing = args.continue_from.is_some();
+                if let Some(dest) =
+                    continued_checkout(&pwd, repo, args.into.as_deref(), args.tmp, continuing)
+                {
+                    eprintln!("  reusing {}/{} at {}", owner, repo, dest.display());
+                    _clone_guard = None;
+                    dest
+                } else {
+                    let (dest, guard) =
+                        resolve_clone_dest(&pwd, repo, args.into.as_deref(), args.tmp)?;
+                    // Brief progress line on stderr so the user knows where
+                    // the clone is landing — the LineStreamPrinter rail has
+                    // already printed `▶ <agent>` on stdout and we don't want
+                    // to break its visual flow with a clone-progress line in
+                    // the middle.
+                    eprintln!("  cloning {}/{} → {}", owner, repo, dest.display());
+                    conn.clone_to(&r, &dest).await?;
+                    _clone_guard = guard;
+                    dest
+                }
             }
             _ => {
                 _clone_guard = None;
@@ -1606,40 +1879,71 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     body_result
 }
 
-/// The file in a run's directory holding its `--skill-bundle` manifest, so
-/// `--continue` runs with the same shipped skills.
+/// The file in which a run recorded before `RunStart.launch_args` kept its
+/// `--skill-bundle` manifest, for `--continue`. A run records it in its
+/// command now.
 const SKILL_BUNDLE_FILE: &str = "skill_bundle.json";
 
-/// The manifest this run resolves shipped skills against: `--skill-bundle`,
-/// else (on `--continue`) the one the continued run recorded. A sub-run has
-/// none.
-fn skill_bundle_manifest(
+/// A `--skill-bundle` manifest; `from` names where it came from in an error.
+fn parse_skill_bundle(
+    json: &str,
+    from: &str,
+) -> anyhow::Result<rupu_skills::ship::SkillBundleManifest> {
+    let m: rupu_skills::ship::SkillBundleManifest = serde_json::from_str(json)
+        .map_err(|e| anyhow::anyhow!("{from}: not a skill manifest: {e}"))?;
+    m.validate().map_err(|e| anyhow::anyhow!("{from}: {e}"))?;
+    Ok(m)
+}
+
+/// What `--continue` carries over from a run with no recorded command (one
+/// recorded before `RunStart.launch_args`, or a sub-agent's) into this run's
+/// command, which it then records: the skill bundle the run saved, unless
+/// this launch passes one (a sub-run has none), and its launch skills,
+/// unless this launch names its own. `true` when skills were carried.
+fn carry_unrecorded(
     global: &Path,
-    args: &Args,
-) -> anyhow::Result<Option<rupu_skills::ship::SkillBundleManifest>> {
+    prev: &str,
+    transcript: &Path,
+    args: &mut Args,
+) -> anyhow::Result<bool> {
     use anyhow::Context;
-    let parse = |json: &str, from: &str| -> anyhow::Result<_> {
-        let m: rupu_skills::ship::SkillBundleManifest = serde_json::from_str(json)
-            .map_err(|e| anyhow::anyhow!("{from}: not a skill manifest: {e}"))?;
-        m.validate().map_err(|e| anyhow::anyhow!("{from}: {e}"))?;
-        Ok(m)
-    };
-    if let Some(json) = &args.skill_bundle {
-        return parse(json, "--skill-bundle").map(Some);
+    if args.skill_bundle.is_none() && !prev.starts_with("sub_") {
+        let file = global.join("runs").join(prev).join(SKILL_BUNDLE_FILE);
+        args.skill_bundle = match std::fs::read_to_string(&file) {
+            Ok(json) => {
+                parse_skill_bundle(&json, &file.display().to_string())?;
+                Some(json)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e).with_context(|| format!("reading {}", file.display())),
+        };
     }
-    let Some(prev) = args
-        .continue_from
-        .as_deref()
-        .filter(|p| !p.starts_with("sub_"))
-    else {
-        return Ok(None);
-    };
-    let file = global.join("runs").join(prev).join(SKILL_BUNDLE_FILE);
-    match std::fs::read_to_string(&file) {
-        Ok(json) => parse(&json, &file.display().to_string()).map(Some),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("reading {}", file.display())),
+    if !args.skills.is_empty() || !args.preload_skills.is_empty() {
+        return Ok(false);
     }
+    (args.skills, args.preload_skills) = rupu_agent::continuation::launch_skills(transcript)?;
+    Ok(!args.skills.is_empty() || !args.preload_skills.is_empty())
+}
+
+/// The transcript of the run `--continue <prev>` continues: a sub-agent's
+/// lives under the run that dispatched it (`<runs>/<parent>/sub/<sub_id>/`),
+/// wherever that is; any other is in this project's transcripts dir.
+fn continued_transcript(
+    global: &Path,
+    transcripts: &Path,
+    prev: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    if !prev.starts_with("sub_") {
+        return Ok(transcripts.join(format!("{prev}.jsonl")));
+    }
+    rupu_orchestrator::RunStore::new(global.join("runs"))
+        .find_sub_run(prev)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no sub-run `{prev}` under {}",
+                global.join("runs").display()
+            )
+        })
 }
 
 /// `skills` / `preload_skills` entries as the `rupu run` flags that name
@@ -1834,10 +2138,7 @@ pub(crate) fn resolve_clone_dest(
         let path = td.path().to_path_buf();
         return Ok((path, Some(td)));
     }
-    let dest = match into {
-        Some(p) => p.to_path_buf(),
-        None => cwd.join(repo),
-    };
+    let dest = clone_path(cwd, repo, into);
     if dest.exists() {
         anyhow::bail!(
             "{} already exists; pass `--into <dir>` to clone elsewhere, \
@@ -1846,6 +2147,27 @@ pub(crate) fn resolve_clone_dest(
         );
     }
     Ok((dest, None))
+}
+
+/// Where a persistent clone lands: `into`, else `cwd/<repo>`.
+fn clone_path(cwd: &Path, repo: &str, into: Option<&Path>) -> std::path::PathBuf {
+    into.map_or_else(|| cwd.join(repo), Path::to_path_buf)
+}
+
+/// The checkout a continued run reuses instead of cloning: the one its
+/// original run cloned, at the destination its restored `--into` (or the
+/// default `./<repo>/`) names, when it is still there. `--tmp` clones afresh,
+/// as the original did. A fresh run reuses nothing: [`resolve_clone_dest`]
+/// refuses an existing destination.
+fn continued_checkout(
+    cwd: &Path,
+    repo: &str,
+    into: Option<&Path>,
+    tmp: bool,
+    continuing: bool,
+) -> Option<std::path::PathBuf> {
+    let dest = clone_path(cwd, repo, into);
+    (continuing && !tmp && dest.exists()).then_some(dest)
 }
 
 /// A `rupu run` agent's running spend, accumulated from the transcript
@@ -2478,5 +2800,186 @@ mod resolve_clone_dest_tests {
         assert!(guard.is_none());
         std::fs::create_dir(&target).unwrap();
         assert!(resolve_clone_dest(tmp.path(), "rupu", Some(&target), false).is_err());
+    }
+}
+
+#[cfg(test)]
+mod continue_restore_tests {
+    use super::{continued_checkout, launch_argv, parse_launch_args, restore_launch, Args};
+
+    fn parse(argv: &[&str]) -> Args {
+        parse_launch_args(argv.iter().map(|s| s.to_string()).collect()).unwrap()
+    }
+
+    /// An original command with every kind of flag, in the order
+    /// [`launch_argv`] renders them.
+    const RECORDED: &[&str] = &[
+        "a",
+        "github:owner/repo",
+        "--run-id=run_1",
+        "--mode=bypass",
+        "--view=full",
+        "--into=/work/repo",
+        "--codename=cobalt-harbor/heron#1",
+        "--message-space=/spaces/run_p/messages",
+        "--participant=heron#1",
+        "--findings-profile=summary",
+        "--skill-bundle={}",
+        "--model=claude-opus-4-7",
+        "--provider=anthropic",
+        "--launch-depth=1",
+        "--launch-ceiling=readonly",
+        "--parent-run=run_p",
+        "--root-run=run_r",
+        "--usage-root=/runs/run_r/usage.jsonl",
+        "--launch-agents=a,b",
+        "--launch-workflows=",
+        "--launch-actions=scm.prs.get",
+        "--engagement-profile=network",
+        "--engagement-profile=binary",
+        "--skill=x",
+        "--skill=z",
+        "--preload-skill=p",
+        "--no-stream",
+        "--launch-no-messaging",
+    ];
+
+    /// The original command as launched, with its prompt.
+    fn recorded() -> Args {
+        parse(&[RECORDED, &["--prompt", "the original prompt"]].concat())
+    }
+
+    #[test]
+    fn launch_argv_renders_every_flag_but_the_prompt() {
+        assert_eq!(launch_argv(&recorded(), "run_1"), RECORDED);
+    }
+
+    #[test]
+    fn launch_argv_leaves_out_a_target_that_is_the_prompt() {
+        let args = parse(&["a", "fix the bug", "--mode", "readonly"]);
+        assert_eq!(
+            launch_argv(&args, "run_9"),
+            ["a", "--run-id=run_9", "--mode=readonly"]
+        );
+    }
+
+    #[test]
+    fn a_recorded_command_parses_back_to_itself() {
+        let again = parse(RECORDED);
+        assert_eq!(launch_argv(&again, "run_1"), RECORDED);
+    }
+
+    #[test]
+    fn a_bare_continue_restores_every_flag() {
+        let now = parse(&["a", "--continue", "run_1", "--run-id", "run_2"]);
+        let merged = restore_launch(recorded(), now);
+        let expected: Vec<&str> = RECORDED
+            .iter()
+            .map(|t| {
+                if *t == "--run-id=run_1" {
+                    "--run-id=run_2"
+                } else {
+                    t
+                }
+            })
+            .collect();
+        assert_eq!(launch_argv(&merged, "run_2"), expected);
+        assert_eq!(merged.run_id.as_deref(), Some("run_2"));
+        assert_eq!(merged.continue_from.as_deref(), Some("run_1"));
+        assert_eq!(merged.prompt, None);
+        assert_eq!(merged.prompt_flag, None);
+    }
+
+    #[test]
+    fn a_flag_on_the_continue_replaces_only_its_own_setting() {
+        let now = parse(&[
+            "a",
+            "--continue",
+            "run_1",
+            "--model",
+            "claude-sonnet-4-6",
+            "--skill",
+            "y",
+        ]);
+        let merged = restore_launch(recorded(), now);
+        // The skill list is replaced, not appended to; the preload stays.
+        let expected: Vec<&str> = RECORDED
+            .iter()
+            .filter(|t| **t != "--skill=z")
+            .map(|t| match *t {
+                "--run-id=run_1" => "--run-id=run_2",
+                "--model=claude-opus-4-7" => "--model=claude-sonnet-4-6",
+                "--skill=x" => "--skill=y",
+                t => t,
+            })
+            .collect();
+        assert_eq!(launch_argv(&merged, "run_2"), expected);
+    }
+
+    #[test]
+    fn every_flag_given_on_the_continue_wins() {
+        let given = [
+            "a",
+            "github:other/repo",
+            "--run-id=run_2",
+            "--mode=readonly",
+            "--view=focused",
+            "--codename=amber-reef/lynx#2",
+            "--message-space=/spaces/run_q/messages",
+            "--participant=lynx#2",
+            "--findings-profile=full",
+            "--skill-bundle=[]",
+            "--model=m2",
+            "--provider=openai",
+            "--launch-depth=2",
+            "--launch-ceiling=ask",
+            "--parent-run=run_q",
+            "--root-run=run_s",
+            "--launch-agents=c",
+            "--launch-workflows=w",
+            "--engagement-profile=web",
+            "--skill=s",
+            "--preload-skill=q",
+            "--tmp",
+        ];
+        let now = parse(&[&given[..], &["--continue", "run_1"]].concat());
+        let merged = restore_launch(recorded(), now);
+        // A switch has no "off" spelling, so the recorded `--no-stream`
+        // stays; `--launch-no-messaging` goes with the rest of the link.
+        let mut expected = given.to_vec();
+        expected.insert(expected.len() - 1, "--no-stream");
+        assert_eq!(launch_argv(&merged, "run_2"), expected);
+    }
+
+    #[test]
+    fn a_continue_reuses_the_checkout_its_original_run_cloned() {
+        let cwd = tempfile::tempdir().unwrap();
+        let into = cwd.path().join("elsewhere");
+        let default = cwd.path().join("repo");
+        // Nothing there yet: clone.
+        assert_eq!(
+            continued_checkout(cwd.path(), "repo", None, false, true),
+            None
+        );
+        std::fs::create_dir(&default).unwrap();
+        std::fs::create_dir(&into).unwrap();
+        assert_eq!(
+            continued_checkout(cwd.path(), "repo", None, false, true),
+            Some(default)
+        );
+        assert_eq!(
+            continued_checkout(cwd.path(), "repo", Some(&into), false, true),
+            Some(into.clone())
+        );
+        // A fresh run never reuses (`resolve_clone_dest` refuses), and
+        // `--tmp` clones afresh as the original did.
+        assert_eq!(
+            continued_checkout(cwd.path(), "repo", None, false, false),
+            None
+        );
+        assert_eq!(
+            continued_checkout(cwd.path(), "repo", Some(&into), true, true),
+            None
+        );
     }
 }

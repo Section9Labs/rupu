@@ -942,7 +942,13 @@ from that turn may be partially applied, so the agent re-checks before going
 on). The new run's transcript links back to the old one rather than copying
 it. If the run had actually finished, its recorded answer is printed without
 calling the model; a run that failed can't be continued — start it fresh.
-Run the command from the same project as the original run. A sub-agent's
+The run's command is restored too: its repo target and every flag it was
+launched with (mode, model, provider, findings profile, engagement, skills and
+the rest, recorded as `launch_args` on its transcript's `run_start`). A flag
+given on the continue replaces only its own setting, and a repeatable flag
+(`--skill`, `--engagement-profile`) replaces its whole list. A repo target
+reuses the checkout the original run cloned when it is still there (`--tmp`
+clones afresh). Run the command from the same directory as the original run. A sub-agent's
 `sub_…` id works too: rupu finds its transcript under the run that dispatched
 it. The new run needs
 its own run id: a `--run-id` that already has a transcript (the run being
@@ -959,6 +965,7 @@ Its conversation is intact, so it can be continued on another model:
     rupu run <agent> --continue <agent_run_id> --model <model> [--provider <provider>]
 
 The agent is told the earlier attempt stopped and why, and which model it is
-continuing on. `--model` and `--provider` override the agent's own `model:` /
+continuing on. Only a `--model` or `--provider` given on the continue does
+this: the ones a bare `--continue` restores do not. `--model` and `--provider` override the agent's own `model:` /
 `provider:` for any `rupu run`, not only a continuation. A run that failed for
 another reason (max turns, say) still can't be continued this way.
