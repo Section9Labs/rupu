@@ -1,7 +1,7 @@
 // Agents library — read-only list of agent files discovered by the control
 // plane. Each row links to /agents/:name for the full system prompt.
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Plus, Sparkles } from 'lucide-react';
 import { api, scopeSelectorFor, type AgentSummary } from '../lib/api';
@@ -20,6 +20,8 @@ import { formatTokens, formatCost } from '../lib/usage';
 import { relativeTime } from '../lib/time';
 import { cn } from '../lib/cn';
 import { useInfiniteScroll } from '../lib/useInfiniteScroll';
+import { ListQueryBar, NoMatches, useFilteredRows, useListQuery } from '../components/query/ListQueryBar';
+import { AGENT_FIELDS } from '../lib/query/lists/agents';
 
 const STEP = 20;
 
@@ -104,7 +106,10 @@ export default function Agents() {
 
   const columns = agentColumns(setLaunchingAgent, handleStartSession, handleDelete);
 
-  const sorted = (agents ?? []).slice().sort((a, b) => a.name.localeCompare(b.name));
+  const [q, setQ] = useListQuery();
+  const all = useMemo(() => (agents ?? []).slice().sort((a, b) => a.name.localeCompare(b.name)), [agents]);
+  const { rows: sorted, error: queryError, facets } = useFilteredRows(all, q, AGENT_FIELDS);
+  useEffect(() => setVisible(STEP), [q]);
   const shown = sorted.slice(0, visible);
   const { sentinelRef } = useInfiniteScroll({
     hasMore: visible < sorted.length,
@@ -139,7 +144,7 @@ export default function Agents() {
         <div className="py-16 flex items-center justify-center">
           <Spinner label="Loading agents…" />
         </div>
-      ) : sorted.length === 0 ? (
+      ) : all.length === 0 ? (
         <EmptyState
           icon={<Sparkles size={20} />}
           title="No agents found"
@@ -152,31 +157,48 @@ export default function Agents() {
         />
       ) : (
         <section>
-          <div className="mb-4 rounded-xl border border-border bg-panel/50 p-4">
-            <UsageBarChart
-              bars={sorted.map((a) => ({
-                id: a.name,
-                label: a.name,
-                input_tokens: a.usage?.input_tokens ?? 0,
-                output_tokens: a.usage?.output_tokens ?? 0,
-                cached_tokens: a.usage?.cached_tokens ?? 0,
-                cost_usd: a.usage?.cost_usd ?? null,
-                to: `/agents/${encodeURIComponent(a.name)}`,
-              }))}
-            />
-          </div>
-          <SectionHeader tone="muted" label="Agents" count={sorted.length} />
-          <SortableTable<AgentSummary>
-            columns={columns}
-            rows={shown}
-            rowKey={(a) => a.name}
-            rowHref={(a) => `/agents/${encodeURIComponent(a.name)}`}
-            initialSort={{ key: 'name', dir: 'asc' }}
+          <ListQueryBar
+            value={q}
+            onChange={setQ}
+            fields={AGENT_FIELDS}
+            facets={facets}
+            total={all.length}
+            shown={sorted.length}
+            error={queryError}
+            label="Filter agents"
+            placeholder="Filter agents… e.g. provider:anthropic tool:bash has:load_error"
           />
-          {sorted.length > visible && (
-            <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
-              scroll for more
-            </div>
+          {sorted.length === 0 ? (
+            <NoMatches noun="agents" />
+          ) : (
+            <>
+              <div className="mb-4 rounded-xl border border-border bg-panel/50 p-4">
+                <UsageBarChart
+                  bars={sorted.map((a) => ({
+                    id: a.name,
+                    label: a.name,
+                    input_tokens: a.usage?.input_tokens ?? 0,
+                    output_tokens: a.usage?.output_tokens ?? 0,
+                    cached_tokens: a.usage?.cached_tokens ?? 0,
+                    cost_usd: a.usage?.cost_usd ?? null,
+                    to: `/agents/${encodeURIComponent(a.name)}`,
+                  }))}
+                />
+              </div>
+              <SectionHeader tone="muted" label="Agents" count={sorted.length} />
+              <SortableTable<AgentSummary>
+                columns={columns}
+                rows={shown}
+                rowKey={(a) => a.name}
+                rowHref={(a) => `/agents/${encodeURIComponent(a.name)}`}
+                initialSort={{ key: 'name', dir: 'asc' }}
+              />
+              {sorted.length > visible && (
+                <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
+                  scroll for more
+                </div>
+              )}
+            </>
           )}
         </section>
       )}

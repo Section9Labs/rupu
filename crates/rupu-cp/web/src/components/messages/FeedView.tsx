@@ -12,7 +12,7 @@ import { foldDirectives, KIND_FILTERS } from '../../lib/messages';
 import { filterMessages, MESSAGE_FIELDS, messageFacets } from '../../lib/messageQuery';
 import { soleValues, withTerm } from '../../lib/findingQuery/shortcut';
 import { cn } from '../../lib/cn';
-import { QueryBar } from '../query/QueryBar';
+import { ListQueryBar } from '../query/ListQueryBar';
 import { useWindowVirtualRows } from '../lists/useWindowVirtualRows';
 import { DirectivesPanel } from './DirectivesPanel';
 import { MessageRow } from './MessageRow';
@@ -120,7 +120,7 @@ export function FeedView({ participants, messages, legacy, query, onQuery, openI
   const directives = useMemo(() => foldDirectives(messages), [messages]);
   const byId = useMemo(() => new Map(messages.map((m) => [m.id, m])), [messages]);
   const facets = useMemo(() => messageFacets(messages, participants), [messages, participants]);
-  const { rows } = useMemo(() => filterMessages(messages, query, participants), [messages, query, participants]);
+  const { rows, error: queryError } = useMemo(() => filterMessages(messages, query, participants), [messages, query, participants]);
   const items = useMemo(() => buildItems(rows), [rows]);
   const involving = soleValues(query, MESSAGE_FIELDS, 'involving');
   const keys = useMemo(() => items.map((it) => it.key), [items]);
@@ -180,11 +180,15 @@ export function FeedView({ participants, messages, legacy, query, onQuery, openI
           </div>
           {toolbar}
         </div>
-        <QueryBar
+        <ListQueryBar
           value={query}
           onChange={onQuery}
           fields={MESSAGE_FIELDS}
           facets={facets}
+          total={messages.length}
+          shown={rows.length}
+          error={queryError}
+          className="mb-0"
           label="Filter messages"
           placeholder="Filter messages… e.g. from:pipit kind:direct is:undelivered"
         />

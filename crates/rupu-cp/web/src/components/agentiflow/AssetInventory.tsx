@@ -12,7 +12,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Network, Globe, Code, Binary, Boxes, Server, Plug, Route, FileCode, Package, FunctionSquare, RefreshCw, ChevronRight, ChevronDown, TriangleAlert, type LucideIcon } from 'lucide-react';
 import { api, apiErrorMessage, type AssetRow } from '../../lib/api';
-import { QueryBar } from '../query/QueryBar';
+import { ListQueryBar, NoMatches } from '../query/ListQueryBar';
 import { assetFields, assetFacets, filterAssets, DEPTH_TONE, depthRank } from '../../lib/assetQuery';
 import { Badge } from '../ui/Badge';
 import { Button } from '../ui/Button';
@@ -284,7 +284,7 @@ export default function AssetInventory({ wsId, target, emptyHint }: { wsId?: str
   const unique = useMemo(() => Array.from(new Map((assets ?? []).map((a) => [a.id, a])).values()), [assets]);
   const fields = useMemo(() => assetFields(unique), [unique]);
   const facets = useMemo(() => assetFacets(unique), [unique]);
-  const { rows } = useMemo(() => filterAssets(unique, q, fields), [unique, q, fields]);
+  const { rows, error: queryError } = useMemo(() => filterAssets(unique, q, fields), [unique, q, fields]);
 
   const byProfile = useMemo(() => {
     const m = new Map<string, AssetRow[]>();
@@ -311,17 +311,21 @@ export default function AssetInventory({ wsId, target, emptyHint }: { wsId?: str
 
   return (
     <div className="space-y-3">
-      <QueryBar
+      <ListQueryBar
         value={q}
         onChange={setQ}
         fields={fields}
         facets={facets}
+        total={unique.length}
+        shown={rows.length}
+        error={queryError}
+        className="mb-0"
         label="Filter assets"
         placeholder="Filter assets… e.g. kind:service depth>=tested host:38.104."
       />
       <div className="flex items-center justify-between">
         <span className="text-note tabular-nums text-ink-dim">
-          {q.trim() ? `${rows.length} of ${unique.length}` : unique.length} assets · {byProfile.length} {byProfile.length === 1 ? 'profile' : 'profiles'}
+          {rows.length} assets · {byProfile.length} {byProfile.length === 1 ? 'profile' : 'profiles'}
         </span>
         <Button variant="secondary" onClick={() => load()} className="gap-1.5">
           <RefreshCw size={12} className={cn(loading && 'animate-spin')} />
@@ -331,7 +335,7 @@ export default function AssetInventory({ wsId, target, emptyHint }: { wsId?: str
       {byProfile.map(([profile, profAssets]) => (
         <ProfileSection key={profile} profile={profile} assets={profAssets} />
       ))}
-      {rows.length === 0 && <p className="rounded-xl border border-border bg-panel px-4 py-8 text-center text-sm text-ink-dim">No assets match the filter.</p>}
+      {rows.length === 0 && <NoMatches noun="assets" />}
     </div>
   );
 }

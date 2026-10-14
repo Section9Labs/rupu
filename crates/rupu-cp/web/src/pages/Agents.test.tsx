@@ -6,7 +6,7 @@
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
-import { render, screen, cleanup, waitFor } from '@testing-library/react';
+import { render, screen, cleanup, waitFor, fireEvent } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { api, type AgentSummary } from '../lib/api';
 
@@ -90,5 +90,53 @@ describe('Agents under a customer scope', () => {
 
     await waitFor(() => expect(screen.getByText('reviewer')).toBeInTheDocument());
     expect(screen.getByRole('note')).toHaveTextContent('Run counts and spend here cover every customer.');
+  });
+});
+
+describe('Agents query line', () => {
+  const ROWS: AgentSummary[] = [
+    { name: 'reviewer', scope: 'global', provider: 'anthropic', tools: ['bash'], usage: USAGE, run_count: 2 },
+    { name: 'my-project-fixer', scope: 'my-project', provider: 'openai', tools: ['bash', 'grep'], usage: USAGE, run_count: 0 },
+    { name: 'broken', scope: 'global', provider: 'anthropic', usage: USAGE, run_count: 0, load_error: 'unknown tool `bsh`' },
+  ];
+  const names = () =>
+    screen
+      .getAllByRole('row')
+      .slice(1)
+      .map((r) => r.querySelector('td')?.textContent ?? '');
+
+  it('narrows the table to the query in ?q=', async () => {
+    vi.spyOn(api, 'getAgents').mockResolvedValue(ROWS);
+    render(
+      <MemoryRouter initialEntries={['/agents?q=provider:anthropic -has:load_error']}>
+        {withCustomerScope(<Agents />)}
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(names()).toEqual(['revieweranthropic']));
+    expect(screen.getByTestId('query-count')).toHaveTextContent('1 of 3');
+  });
+
+  it('narrows the table as a query is typed and committed', async () => {
+    vi.spyOn(api, 'getAgents').mockResolvedValue(ROWS);
+    render(
+      <MemoryRouter initialEntries={['/agents']}>
+        {withCustomerScope(<Agents />)}
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(names()).toHaveLength(3));
+    const input = screen.getByRole('combobox', { name: 'Filter agents' });
+    fireEvent.change(input, { target: { value: 'tool:grep' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    await waitFor(() => expect(names()).toEqual(['my-project-fixeropenai']));
+  });
+
+  it('says so when the query keeps nothing', async () => {
+    vi.spyOn(api, 'getAgents').mockResolvedValue(ROWS);
+    render(
+      <MemoryRouter initialEntries={['/agents?q=nothing-like-this']}>
+        {withCustomerScope(<Agents />)}
+      </MemoryRouter>,
+    );
+    expect(await screen.findByText('No agents match the filter.')).toBeInTheDocument();
   });
 });
