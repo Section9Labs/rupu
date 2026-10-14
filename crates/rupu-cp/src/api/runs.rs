@@ -862,10 +862,11 @@ pub struct RunListRow {
 /// The autoflow a run was launched by, from its `run_envelope.json`:
 /// `Some(Some(_))` for an autoflow run (its `issue_ref` the envelope's claim
 /// id, else the record's `issue_ref`), `Some(None)` for a run whose envelope
-/// names no autoflow or a local run that recorded no envelope (runs from
-/// before envelopes existed), and `None` — the row carries no key — for a
-/// mirrored worker run whose envelope this store may not hold, or an
-/// unreadable envelope (logged).
+/// names no autoflow or that recorded no envelope at all — every autoflow
+/// launch writes one, so a run without one was not launched by an autoflow
+/// (runs from before envelopes, CP-dispatched node runs; a `worker_id` says
+/// nothing here: local CLI runs record one too) — and `None`, the row
+/// carrying no key, only for an unreadable envelope (logged).
 pub fn autoflow_of(
     r: &RunRecord,
     store: &rupu_orchestrator::runs::RunStore,
@@ -875,8 +876,7 @@ pub fn autoflow_of(
             issue_ref: a.claim_id.clone().or_else(|| r.issue_ref.clone()),
             ..Default::default()
         })),
-        Ok(None) if r.worker_id.is_none() => Some(None),
-        Ok(None) => None,
+        Ok(None) => Some(None),
         Err(e) => {
             tracing::warn!(run_id = %r.id, error = %e, "run envelope unreadable; autoflow unknown");
             None
@@ -4161,16 +4161,18 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn mirrored_run_without_envelope_omits_the_key() {
+    fn run_with_a_worker_id_and_no_envelope_is_not_autoflow() {
+        // Local CLI runs record a worker id too: without an envelope (which
+        // every autoflow launch writes) the run is not an autoflow run, and
+        // the host must not read as unable to report it.
         let tmp = tempfile::TempDir::new().unwrap();
         let s = test_state(&tmp);
-        let mut rec = terminal_record("run_mirror");
-        rec.worker_id = Some("node_a".into());
+        let mut rec = terminal_record("run_worker");
+        rec.worker_id = Some("worker_local_cli".into());
         s.run_store.create(rec, "name: x\n").unwrap();
-        assert!(!listed(&s, "run_mirror")
-            .as_object()
-            .unwrap()
-            .contains_key("autoflow"));
+        let v = listed(&s, "run_worker");
+        assert!(v.as_object().unwrap().contains_key("autoflow"));
+        assert_eq!(v["autoflow"], serde_json::Value::Null);
     }
 
     #[test]

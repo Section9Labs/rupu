@@ -104,8 +104,9 @@ also serves `/api/runs` to an HTTP peer's coordinator) and `rupu run list`
 - Claims are read once per listing from the local claim store.
 - Built in one place (a `RunListRow` helper) and used by every producer: the
   CP's local listing, `rupu run list`, and any connector that builds rows
-  coordinator-side from a mirror (tunnel). Where a mirror doesn't hold the
-  envelope, the row omits the key rather than claim `null`.
+  coordinator-side from a mirror (tunnel). A run with no envelope is `null`:
+  every autoflow launch writes one (a `worker_id` is no hint — local CLI runs
+  record one too). Only an unreadable envelope omits the key.
 
 ### `GET /api/runs/autoflows/runs`
 
