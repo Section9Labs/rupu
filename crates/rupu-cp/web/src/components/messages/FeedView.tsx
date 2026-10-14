@@ -1,12 +1,18 @@
-// What the Messages tab shows for one page of a space: participants, kind
-// toggles, pinned directives, the legacy note, and the rows with day
-// dividers. Pure over its props; `MessageFeed` feeds it from the API.
+// What the Messages tab shows for one page of a space: participants, the
+// query bar and kind pills, pinned directives, the legacy note, and the rows
+// with day dividers. Filtering is one query (`lib/messageQuery`); the
+// participant chips and kind pills are shortcuts that toggle an `involving:`
+// or `kind:` term in it. Pure over its props; `MessageFeed` feeds it from the
+// API and holds the query.
 
 import { useEffect, useLayoutEffect, useMemo, useRef, type ReactNode } from 'react';
 import { History } from 'lucide-react';
 import type { SpaceMessage, SpaceParticipant } from '../../lib/api';
-import { foldDirectives, KIND_FILTERS, passes, type FeedFilter, type KindFilter } from '../../lib/messages';
+import { foldDirectives, KIND_FILTERS } from '../../lib/messages';
+import { filterMessages, MESSAGE_FIELDS, messageFacets } from '../../lib/messageQuery';
+import { soleValues, withTerm } from '../../lib/findingQuery/shortcut';
 import { cn } from '../../lib/cn';
+import { QueryBar } from '../query/QueryBar';
 import { useWindowVirtualRows } from '../lists/useWindowVirtualRows';
 import { DirectivesPanel } from './DirectivesPanel';
 import { MessageRow } from './MessageRow';
@@ -14,12 +20,11 @@ import { ParticipantsBar } from './ParticipantsBar';
 
 export type FeedItem = { type: 'divider'; key: string; label: string } | { type: 'msg'; key: string; m: SpaceMessage };
 
-/** The visible rows, oldest first, with a divider at each new day. */
-export function buildItems(messages: SpaceMessage[], filter: FeedFilter): FeedItem[] {
+/** The rows, oldest first, with a divider at each new day. */
+export function buildItems(messages: SpaceMessage[]): FeedItem[] {
   const items: FeedItem[] = [];
   let prevDay: string | null = null;
   for (const m of messages) {
-    if (!passes(m, filter)) continue;
     const day = new Date(m.ts).toDateString();
     if (day !== prevDay) {
       items.push({ type: 'divider', key: `d-${m.id}`, label: new Date(m.ts).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' }) });
@@ -40,22 +45,26 @@ export function DayDivider({ label }: { label: string }) {
   );
 }
 
-export function KindToggles({ messages, kinds, onToggle }: { messages: SpaceMessage[]; kinds: ReadonlySet<KindFilter>; onToggle: (k: KindFilter) => void }) {
+const sameSet = (a: readonly string[], b: readonly string[]) => a.length === b.length && a.every((x) => b.includes(x));
+
+/** Kind pills: each one selects its kinds in the query, counted over the whole log. */
+export function KindPills({ messages, query, onQuery }: { messages: SpaceMessage[]; query: string; onQuery: (q: string) => void }) {
+  const sole = soleValues(query, MESSAGE_FIELDS, 'kind');
   return (
     <div className="inline-flex flex-wrap items-center gap-1">
       {KIND_FILTERS.map((k) => {
         const n = messages.filter((m) => k.kinds.includes(m.kind)).length;
-        const on = kinds.has(k.key);
+        const on = sole !== null && sameSet(sole, k.kinds);
         return (
           <button
             type="button"
             key={k.key}
             aria-pressed={on}
             data-testid={`kind-${k.key}`}
-            onClick={() => onToggle(k.key)}
+            onClick={() => onQuery(withTerm(query, MESSAGE_FIELDS, 'kind', on ? null : k.kinds))}
             className={cn(
               'rounded-full border px-2 py-0.5 text-meta font-medium transition-colors',
-              on ? 'border-brand-500/50 bg-brand-50 text-brand-700' : 'border-border text-ink-mute line-through decoration-ink-mute/40 hover:text-ink',
+              on ? 'border-brand-500/50 bg-brand-50 text-brand-700' : 'border-border text-ink-dim hover:text-ink',
             )}
           >
             {k.label} <span className="tabular-nums opacity-70">{n}</span>
@@ -93,9 +102,9 @@ export interface FeedViewProps {
   participants: SpaceParticipant[];
   messages: SpaceMessage[];
   legacy: boolean;
-  filter: FeedFilter;
-  onToggleKind: (k: KindFilter) => void;
-  onInvolving: (address: string | null) => void;
+  /** The filter, in the message query language. */
+  query: string;
+  onQuery: (q: string) => void;
   /** How to open the sender's transcript at a message, when it can be. */
   openInTranscript?: (m: SpaceMessage) => (() => void) | null;
   /** The `#msg-` anchor: scrolled to and highlighted. */
@@ -106,11 +115,14 @@ export interface FeedViewProps {
   footer?: ReactNode;
 }
 
-export function FeedView({ participants, messages, legacy, filter, onToggleKind, onInvolving, openInTranscript, highlightId, toolbar, footer }: FeedViewProps) {
+export function FeedView({ participants, messages, legacy, query, onQuery, openInTranscript, highlightId, toolbar, footer }: FeedViewProps) {
   const addresses = useMemo(() => participants.map((p) => p.address), [participants]);
   const directives = useMemo(() => foldDirectives(messages), [messages]);
   const byId = useMemo(() => new Map(messages.map((m) => [m.id, m])), [messages]);
-  const items = useMemo(() => buildItems(messages, filter), [messages, filter]);
+  const facets = useMemo(() => messageFacets(messages, participants), [messages, participants]);
+  const { rows } = useMemo(() => filterMessages(messages, query, participants), [messages, query, participants]);
+  const items = useMemo(() => buildItems(rows), [rows]);
+  const involving = soleValues(query, MESSAGE_FIELDS, 'involving');
   const keys = useMemo(() => items.map((it) => it.key), [items]);
   const anchor = highlightId && keys.includes(highlightId) ? highlightId : null;
   const win = useWindowVirtualRows<HTMLDivElement, HTMLDivElement>(keys, keys.length > WINDOW_THRESHOLD, anchor);
@@ -160,17 +172,29 @@ export function FeedView({ participants, messages, legacy, filter, onToggleKind,
       <div className="flex flex-col gap-2 rounded-xl border border-border bg-panel px-3 py-2 shadow-card">
         <div className="flex items-start gap-2">
           <div className="min-w-0 flex-1">
-            <ParticipantsBar participants={participants} involving={filter.involving} onInvolving={onInvolving} />
+            <ParticipantsBar
+              participants={participants}
+              involving={involving?.length === 1 ? involving[0] : null}
+              onInvolving={(address) => onQuery(withTerm(query, MESSAGE_FIELDS, 'involving', address ? [address] : null))}
+            />
           </div>
           {toolbar}
         </div>
-        <KindToggles messages={messages} kinds={filter.kinds} onToggle={onToggleKind} />
+        <QueryBar
+          value={query}
+          onChange={onQuery}
+          fields={MESSAGE_FIELDS}
+          facets={facets}
+          label="Filter messages"
+          placeholder="Filter messages… e.g. from:pipit kind:direct is:undelivered"
+        />
+        <KindPills messages={messages} query={query} onQuery={onQuery} />
       </div>
       {legacy && <LegacyNote />}
       <DirectivesPanel directives={directives} addresses={addresses} />
       <div data-testid="feed-rows" className="rounded-xl border border-border bg-panel px-2 py-1 shadow-card">
         {items.length === 0 ? (
-          <p className="px-2 py-6 text-center text-meta text-ink-mute">{messages.length === 0 ? 'No messages yet.' : 'No messages match these filters.'}</p>
+          <p className="px-2 py-6 text-center text-meta text-ink-mute">{query.trim() && messages.length > 0 ? 'No messages match the filter.' : 'No messages yet.'}</p>
         ) : (
           <div ref={win.bodyRef}>
             {win.slots.map((slot) =>

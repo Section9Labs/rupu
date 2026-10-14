@@ -30,7 +30,8 @@ import {
 } from '../lib/api';
 import { SEVERITY_STYLE, type Severity } from '../lib/severity';
 import { FINDING_FIELDS } from '../lib/findingQuery/fields';
-import { parseQuery, tokenize } from '../lib/findingQuery/grammar';
+import { parseQuery } from '../lib/findingQuery/grammar';
+import { soleValues, withTerm } from '../lib/findingQuery/shortcut';
 import { BulkTagBar } from '../components/findings/BulkTagBar';
 import { ExportReportButton } from '../components/findings/ExportReportButton';
 import { FindingMetrics } from '../components/findings/FindingMetrics';
@@ -68,26 +69,6 @@ function mergeTagResults(rs: TagAcrossResult[]): TagAcrossResult {
 
 function sevTone(key: string, value: string): string | null {
   return key === 'severity' && (SEVS as string[]).includes(value) ? SEVERITY_STYLE[value as Severity].pill : null;
-}
-
-/** The severity a lone, positive `severity:<x>` token selects (the active tile). */
-function activeSeverity(q: string): Severity | null {
-  const p = parseQuery(q, FINDING_FIELDS);
-  if (!p.ok) return null;
-  const sev = p.terms.filter((t) => t.key === 'severity');
-  return sev.length === 1 && !sev[0].neg && sev[0].op === 'eq' && sev[0].values.length === 1
-    ? (sev[0].values[0] as Severity)
-    : null;
-}
-
-/** `q` with every severity token removed, then `severity:<sev>` added (null = none). */
-function withSeverity(q: string, sev: Severity | null): string {
-  const t = tokenize(q);
-  const kept = (t.ok ? t.tokens.map((x) => x.text) : []).filter((raw) => {
-    const p = parseQuery(raw, FINDING_FIELDS);
-    return !(p.ok && p.terms[0]?.key === 'severity');
-  });
-  return [...kept, ...(sev ? [`severity:${sev}`] : [])].join(' ');
 }
 
 export default function Findings({ customer: fixedCustomer }: { customer?: string } = {}) {
@@ -287,7 +268,9 @@ export default function Findings({ customer: fixedCustomer }: { customer?: strin
     return summary;
   };
 
-  const active = activeSeverity(q);
+  // The active tile: a lone, positive `severity:<x>` token.
+  const sole = soleValues(q, FINDING_FIELDS, 'severity');
+  const active = sole?.length === 1 ? (sole[0] as Severity) : null;
   // A fetch for this query is in flight (the last answer was for another).
   const loading = data === null && !localError && !error;
   const noneAtAll = !q && data !== null && tileSummary.total === 0 && data.findings.length === 0;
@@ -327,7 +310,7 @@ export default function Findings({ customer: fixedCustomer }: { customer?: strin
             <FindingMetrics
               summary={tileSummary}
               active={active}
-              onSelect={(sev) => setQ(withSeverity(q, sev === active ? null : sev))}
+              onSelect={(sev) => setQ(withTerm(q, FINDING_FIELDS, 'severity', sev && sev !== active ? [sev] : null))}
             />
           )}
 

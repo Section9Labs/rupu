@@ -1,6 +1,6 @@
 // Pure helpers over a message space's log (spec F1c): how each log kind is
 // shown, what an undelivered reason means to the operator, receipts, the
-// directive fold, the composer's recipient groups and the feed filters.
+// directive fold, the composer's recipient groups and the feed's kind pills.
 // No React; the components in `components/messages/` render what this says.
 
 import { roleBadge } from './codename';
@@ -188,7 +188,7 @@ export function defaultRecipient(route: MessageRoute): string {
 
 // --- filters ---------------------------------------------------------------
 
-/** The feed's kind toggles; a directive and its retraction share one. */
+/** The feed's kind pills; a directive and its retraction share one. */
 export type KindFilter = 'post' | 'direct' | 'broadcast' | 'operator' | 'directive';
 
 export const KIND_FILTERS: { key: KindFilter; label: string; kinds: MessageKind[] }[] = [
@@ -198,28 +198,6 @@ export const KIND_FILTERS: { key: KindFilter; label: string; kinds: MessageKind[
   { key: 'operator', label: 'Operator', kinds: ['operator'] },
   { key: 'directive', label: 'Directives', kinds: ['directive', 'retract'] },
 ];
-
-export interface FeedFilter {
-  kinds: ReadonlySet<KindFilter>;
-  /** Only messages from or to this participant. */
-  involving: string | null;
-}
-
-export const ALL_KINDS: ReadonlySet<KindFilter> = new Set(KIND_FILTERS.map((k) => k.key));
-
-function filterOf(kind: MessageKind): KindFilter {
-  return kind === 'retract' ? 'directive' : kind;
-}
-
-/** Whether `address` sent `m`, or `m` reached it. */
-export function involves(m: SpaceMessage, address: string): boolean {
-  return m.from === address || m.to === address || m.delivery.resolved.includes(address);
-}
-
-export function passes(m: SpaceMessage, f: FeedFilter): boolean {
-  if (!f.kinds.has(filterOf(m.kind))) return false;
-  return f.involving === null || involves(m, f.involving);
-}
 
 // --- the log, as the client holds it --------------------------------------
 

@@ -6,7 +6,7 @@
 import { useMemo, useState } from 'react';
 import { RefreshCw } from 'lucide-react';
 import type { MessageRoute, SpaceMessage } from '../../lib/api';
-import { ALL_KINDS, defaultRecipient, recipientGroups, type FeedFilter, type KindFilter } from '../../lib/messages';
+import { defaultRecipient, recipientGroups } from '../../lib/messages';
 import type { MessageSpace } from '../../lib/useMessageSpace';
 import { cn } from '../../lib/cn';
 import { Button } from '../ui/Button';
@@ -29,7 +29,8 @@ export interface MessageFeedProps {
 }
 
 export default function MessageFeed({ route, space, notLiveReason, workflow = false, openInTranscript, highlightId }: MessageFeedProps) {
-  const [filter, setFilter] = useState<FeedFilter>({ kinds: ALL_KINDS, involving: null });
+  // Local, not `?q=`: the run detail page's Findings tab owns that param.
+  const [query, setQuery] = useState('');
   const groups = useMemo(() => recipientGroups(route, space.participants, workflow), [route, space.participants, workflow]);
 
   if (space.status === 'loading' || (space.status === 'ready' && space.space === 'present' && !space.loaded && space.log.messages.length === 0)) {
@@ -47,22 +48,13 @@ export default function MessageFeed({ route, space, notLiveReason, workflow = fa
     return <EmptyState title="No message space" hint="Nothing has been said in this run, and nothing in it can be reached." />;
   }
 
-  const toggle = (k: KindFilter) =>
-    setFilter((f) => {
-      const kinds = new Set(f.kinds);
-      if (kinds.has(k)) kinds.delete(k);
-      else kinds.add(k);
-      return { ...f, kinds };
-    });
-
   return (
     <FeedView
       participants={space.participants}
       messages={space.log.messages}
       legacy={space.legacy}
-      filter={filter}
-      onToggleKind={toggle}
-      onInvolving={(involving) => setFilter((f) => ({ ...f, involving }))}
+      query={query}
+      onQuery={setQuery}
       openInTranscript={openInTranscript}
       highlightId={highlightId}
       toolbar={
