@@ -476,3 +476,103 @@ async fn flows_list_cross_filters_server_side_and_attributes_rows() {
     .unwrap();
     assert_eq!(body["flows"].as_array().unwrap().len(), 2, "{body}");
 }
+
+#[tokio::test]
+async fn a_not_param_excludes_its_keys_from_the_flows_and_the_aggregates() {
+    let global = tempfile::TempDir::new().unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    seed_project(&global, &project);
+    let addr = serve(new_state(global.path())).await;
+
+    let get = |path: String| async move {
+        reqwest::get(format!("http://{addr}{path}"))
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()
+    };
+
+    let body = get("/api/netflow?not_workflow=review-wf".into()).await;
+    let hosts: Vec<&str> = body["flows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["host"].as_str().unwrap())
+        .collect();
+    assert_eq!(hosts, ["iptoasn.com"], "{body}");
+
+    let body = get("/api/netflow/explorer?not_host=api.anthropic.com:443".into()).await;
+    assert_eq!(body["kpis"]["flows"], 1, "{body}");
+    assert_eq!(body["exclusions_applied"], true, "{body}");
+
+    let body = get("/api/netflow/explorer".into()).await;
+    assert!(body.get("exclusions_applied").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn latest_names_the_run_with_flows_that_started_last() {
+    let global = tempfile::TempDir::new().unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    seed_project(&global, &project);
+    let ws_id = rupu_workspace::upsert(
+        &rupu_workspace::WorkspaceStore {
+            root: global.path().join("workspaces"),
+        },
+        project.path(),
+    )
+    .unwrap()
+    .id;
+    let addr = serve(new_state(global.path())).await;
+
+    // `run-a` (a record: started at 50s, finished at 2000s) and the
+    // record-less `orphan-run` (one flow at 500s, so its span is 500s to
+    // 500s): the orphan started last.
+    let orphan = serde_json::json!({
+        "latest": {
+            "run_id": null,
+            "workflow": null,
+            "started_at": "1970-01-01T00:08:20Z",
+            "finished_at": "1970-01-01T00:08:20Z",
+        }
+    });
+    for path in [
+        "/api/netflow/latest".to_string(),
+        format!("/api/netflow/latest?scope=project:{ws_id}"),
+    ] {
+        let body: serde_json::Value = reqwest::get(format!("http://{addr}{path}"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body, orphan, "{path}");
+    }
+
+    std::fs::remove_file(
+        NetflowPaths::for_run(&project.path().join(".rupu/netflow"), "orphan-run").flows,
+    )
+    .unwrap();
+    let body: serde_json::Value = reqwest::get(format!("http://{addr}/api/netflow/latest"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "latest": {
+                "run_id": "run-a",
+                "workflow": "review-wf",
+                "started_at": "1970-01-01T00:00:50Z",
+                "finished_at": "1970-01-01T00:33:20Z",
+            }
+        })
+    );
+
+    let resp = reqwest::get(format!("http://{addr}/api/netflow/latest?scope=run:run-a"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}

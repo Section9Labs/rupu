@@ -254,7 +254,12 @@ GET /api/netflow                          # every flow
 GET /api/netflow/explorer?scope=run:<id>|project:<id>   # the explorer's aggregates (no scope = global)
 GET /api/netflow/graph                    # the topology graph
 GET /api/netflow/index                    # index size, budget and evictions
+GET /api/netflow/latest?scope=project:<id>   # the latest run with flows (no scope = global)
 ```
+
+Every read but the graph takes `workflow`, `origin`, `org` and `host` (keys to
+keep) and `not_workflow`, `not_origin`, `not_org` and `not_host` (keys to
+leave out), each a comma-separated list.
 
 ---
 

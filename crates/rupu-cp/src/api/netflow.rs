@@ -97,6 +97,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/netflow/graph", get(get_netflow_graph))
         .route("/api/netflow/explorer", get(get_netflow_explorer))
         .route("/api/netflow/index", get(get_netflow_index))
+        .route("/api/netflow/latest", get(get_netflow_latest))
 }
 
 /// Run `f` — a synchronous ledger/transcript/ASN-table read — on the tokio
@@ -349,6 +350,98 @@ async fn get_netflow_index(
     State(state): State<AppState>,
 ) -> Json<crate::netflow_index::IndexStatus> {
     Json(index_for(&state).status())
+}
+
+/// `GET /api/netflow/latest?scope=` — scope is `project:<id>` or absent
+/// for global.
+#[derive(Debug, Deserialize)]
+pub struct LatestQuery {
+    pub scope: Option<String>,
+}
+
+/// The most recently started run that recorded flows in a scope.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct LatestRun {
+    /// `None` for a ledger no run record accounts for (a standalone agent
+    /// run): its span is then its own first to last flow.
+    pub run_id: Option<String>,
+    pub workflow: Option<String>,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    /// `None` while the run is still going.
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LatestResponse {
+    pub latest: Option<LatestRun>,
+}
+
+/// The run behind the scope ledger with flows whose run started last. A
+/// ledger no record accounts for counts as a run spanning its own flows.
+fn latest_run(summaries: &[ScopeSummary], meta: &RunMetaIndex) -> Option<LatestRun> {
+    summaries
+        .iter()
+        .filter(|(_, _, s)| s.flow_count > 0)
+        .filter_map(|(id, _, s)| match meta.attribution(id) {
+            (Some(run), workflow) => meta.run_spans.get(&run).map(|span| LatestRun {
+                run_id: Some(run.clone()),
+                workflow,
+                started_at: span.start,
+                finished_at: span.end,
+            }),
+            (None, _) => Some(LatestRun {
+                run_id: None,
+                workflow: None,
+                started_at: s.min_ts?,
+                finished_at: s.max_ts,
+            }),
+        })
+        .max_by_key(|r| r.started_at)
+}
+
+/// `GET /api/netflow/latest?scope=project:<id>` (or no scope: global) —
+/// the most recent run with flows, from the netflow index's summaries and
+/// the scope's run records. The Network page opens on its span (or the
+/// last hour, whichever is shorter) when the query names no window.
+async fn get_netflow_latest(
+    State(state): State<AppState>,
+    Query(q): Query<LatestQuery>,
+) -> ApiResult<Json<LatestResponse>> {
+    let store = Arc::clone(&state.run_store);
+    let global_dir = state.global_dir.clone();
+    let index = index_for(&state);
+    let latest = match q.scope.as_deref() {
+        Some(scope) => {
+            let Some(project_id) = scope.strip_prefix("project:") else {
+                return Err(ApiError::bad_request(format!(
+                    "scope `{scope}`: expected project:<id>, or no scope for global"
+                )));
+            };
+            let workspace = workspace_for_project(&state, project_id)?;
+            run_blocking(move || {
+                let meta = project_run_meta(&global_dir, &store, &workspace);
+                let files = project_ledger_files(&meta, &workspace, &global_dir);
+                latest_run(&scope_summaries(&index, &files), &meta)
+            })
+            .await?
+        }
+        None => {
+            let meta_cache = Arc::clone(&state.run_meta_cache);
+            run_blocking(move || {
+                let files = global_ledger_files(&global_dir);
+                let summaries = scope_summaries(&index, &files);
+                let ledger_ids = summaries
+                    .iter()
+                    .filter(|(_, _, s)| s.flow_count > 0)
+                    .map(|(id, _, _)| id.clone())
+                    .collect();
+                let meta = global_run_meta_cached(&meta_cache, &global_dir, &store, &ledger_ids);
+                latest_run(&summaries, &meta)
+            })
+            .await?
+        }
+    };
+    Ok(Json(LatestResponse { latest }))
 }
 
 /// Read every local ledger into the index once, so the first Network page
@@ -828,6 +921,8 @@ fn own_ids(store: &RunStore, run_id: &str) -> Vec<String> {
 pub(crate) struct RunMetaIndex {
     map: HashMap<String, (String, String)>,
     spans: Vec<RunSpan>,
+    /// Each root run's span, by the run id `map` attributes to.
+    run_spans: HashMap<String, RunSpan>,
     /// Registered non-local hosts that in-scope runs actually EXECUTED on.
     ///
     /// A run placed on a remote host keeps its netflow ledger there. Run
@@ -865,10 +960,12 @@ impl RunMetaIndex {
                 .entry(id)
                 .or_insert_with(|| (record.id.clone(), record.workflow_name.clone()));
         }
-        self.spans.push(RunSpan {
+        let span = RunSpan {
             start: record.started_at,
             end: record.finished_at,
-        });
+        };
+        self.spans.push(span);
+        self.run_spans.insert(record.id.clone(), span);
     }
 
     /// Map `ledger_id` to a run and workflow label that no `RunStore`
@@ -887,6 +984,8 @@ impl RunMetaIndex {
             (run_label.to_string(), workflow_label.to_string()),
         );
         self.spans.push(RunSpan { start, end });
+        self.run_spans
+            .insert(run_label.to_string(), RunSpan { start, end });
     }
 
     fn attribution(&self, ledger_id: &str) -> (Option<String>, Option<String>) {
@@ -1881,7 +1980,7 @@ async fn get_project_netflow(
 ) -> ApiResult<Json<NetflowResponse>> {
     maybe_refresh_asn(&netflow_config(&state), &state.asn_cache);
     let range = parse_time_range(&q.from, &q.to)?;
-    let filters = parse_filters(&q.workflow, &q.origin, &q.org, &q.host);
+    let filters = q.filters();
     let workspace = workspace_for_project(&state, &project_id)?;
     let cache = Arc::clone(&state.asn_cache);
     let store = Arc::clone(&state.run_store);
@@ -1907,7 +2006,7 @@ async fn get_global_netflow(
 ) -> ApiResult<Json<NetflowResponse>> {
     maybe_refresh_asn(&netflow_config(&state), &state.asn_cache);
     let range = parse_time_range(&q.from, &q.to)?;
-    let filters = parse_filters(&q.workflow, &q.origin, &q.org, &q.host);
+    let filters = q.filters();
     let global_dir = state.global_dir.clone();
     let store = Arc::clone(&state.run_store);
     let cache = Arc::clone(&state.asn_cache);
@@ -1978,6 +2077,26 @@ pub struct TimeRangeQuery {
     pub origin: Option<String>,
     pub org: Option<String>,
     pub host: Option<String>,
+    /// The exclusion lists, same encoding: a flow whose key is listed never
+    /// passes (`ExplorerFilters::not_*`).
+    pub not_workflow: Option<String>,
+    pub not_origin: Option<String>,
+    pub not_org: Option<String>,
+    pub not_host: Option<String>,
+}
+
+impl TimeRangeQuery {
+    fn filters(&self) -> ExplorerFilters {
+        parse_filters(
+            [&self.workflow, &self.origin, &self.org, &self.host],
+            [
+                &self.not_workflow,
+                &self.not_origin,
+                &self.not_org,
+                &self.not_host,
+            ],
+        )
+    }
 }
 
 /// Split one comma-separated filter param into its keys, dropping empty
@@ -1999,16 +2118,18 @@ fn split_filter(raw: &Option<String>) -> Vec<String> {
 /// share a struct (`serde_urlencoded` flatten limitation, see
 /// [`GraphQuery`]'s doc comment).
 fn parse_filters(
-    workflow: &Option<String>,
-    origin: &Option<String>,
-    org: &Option<String>,
-    host: &Option<String>,
+    [workflow, origin, org, host]: [&Option<String>; 4],
+    [not_workflow, not_origin, not_org, not_host]: [&Option<String>; 4],
 ) -> ExplorerFilters {
     ExplorerFilters {
         workflows: split_filter(workflow),
         origins: split_filter(origin),
         orgs: split_filter(org),
         hosts: split_filter(host),
+        not_workflows: split_filter(not_workflow),
+        not_origins: split_filter(not_origin),
+        not_orgs: split_filter(not_org),
+        not_hosts: split_filter(not_host),
     }
 }
 
@@ -2167,6 +2288,24 @@ pub struct ExplorerQuery {
     pub origin: Option<String>,
     pub org: Option<String>,
     pub host: Option<String>,
+    pub not_workflow: Option<String>,
+    pub not_origin: Option<String>,
+    pub not_org: Option<String>,
+    pub not_host: Option<String>,
+}
+
+impl ExplorerQuery {
+    fn filters(&self) -> ExplorerFilters {
+        parse_filters(
+            [&self.workflow, &self.origin, &self.org, &self.host],
+            [
+                &self.not_workflow,
+                &self.not_origin,
+                &self.not_org,
+                &self.not_host,
+            ],
+        )
+    }
 }
 
 /// Everything the explorer surface renders, computed server-side in one
@@ -2196,6 +2335,12 @@ pub struct ExplorerResponse {
     /// See [`NetflowResponse::incomplete`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub incomplete: Vec<IncompleteSource>,
+    /// Set when the request carried exclusions (`not_*`) and this build
+    /// applied them. A proxying coordinator refuses a response that lacks
+    /// it for a request that had them: a peer older than the exclusions
+    /// ignores the params and would answer unfiltered.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exclusions_applied: bool,
 }
 
 /// Assemble every explorer view from one scope's flows. `scope_flows` is
@@ -2242,6 +2387,7 @@ pub(crate) fn build_explorer_response(
         // Builders serve local data; a caller that also read a remote
         // source records any gap on the returned value.
         incomplete: Vec::new(),
+        exclusions_applied: filters.has_exclusions(),
     }
 }
 
@@ -2347,6 +2493,7 @@ pub(crate) fn indexed_explorer(
         asn_loaded: table.is_some(),
         window: WindowEcho::from(range),
         incomplete: Vec::new(),
+        exclusions_applied: filters.has_exclusions(),
     }
 }
 
@@ -2363,7 +2510,7 @@ async fn get_netflow_explorer(
 ) -> ApiResult<Json<ExplorerResponse>> {
     maybe_refresh_asn(&netflow_config(&state), &state.asn_cache);
     let range = parse_time_range(&q.from, &q.to)?;
-    let filters = parse_filters(&q.workflow, &q.origin, &q.org, &q.host);
+    let filters = q.filters();
     if let Some(run_id) = q.scope.as_deref().and_then(|s| s.strip_prefix("run:")) {
         let resp = explorer_run_scope(&state, run_id, &range, &filters).await?;
         Ok(Json(resp))
@@ -2779,12 +2926,18 @@ async fn explorer_from_host(
         }
         other => crate::api::runs::host_read_error(host_id, other),
     })?;
-    serde_json::from_value(value).map_err(|e| {
+    let resp: ExplorerResponse = serde_json::from_value(value).map_err(|e| {
         ApiError::internal(format!(
             "host {host_id} returned an explorer response this build cannot read ({e}); \
              the remote CP is likely older than this one"
         ))
-    })
+    })?;
+    if filters.has_exclusions() && !resp.exclusions_applied {
+        return Err(ApiError::not_available(format!(
+            "host {host_id} can't exclude netflow keys (a `-` term); upgrade rupu there"
+        )));
+    }
+    Ok(resp)
 }
 
 /// Proxy `GET /api/runs/:id/netflow` to a resolved host. Mirrors
@@ -2950,6 +3103,10 @@ fn filter_query_parts(filters: &ExplorerFilters) -> Vec<String> {
         join("origin", &filters.origins),
         join("org", &filters.orgs),
         join("host", &filters.hosts),
+        join("not_workflow", &filters.not_workflows),
+        join("not_origin", &filters.not_origins),
+        join("not_org", &filters.not_orgs),
+        join("not_host", &filters.not_hosts),
     ]
     .into_iter()
     .flatten()
@@ -3004,7 +3161,7 @@ async fn get_agentiflow_netflow(
 ) -> ApiResult<Json<NetflowResponse>> {
     maybe_refresh_asn(&netflow_config(&s), &s.asn_cache);
     let range = parse_time_range(&q.from, &q.to)?;
-    let filters = parse_filters(&q.workflow, &q.origin, &q.org, &q.host);
+    let filters = q.filters();
     let af_id = id.clone();
     let resp = run_blocking(move || {
         let scope = agentiflow_netflow_scope(&s, &af_id)?;
@@ -3039,7 +3196,7 @@ async fn get_run_netflow(
 ) -> ApiResult<Json<NetflowResponse>> {
     maybe_refresh_asn(&netflow_config(&s), &s.asn_cache);
     let range = parse_time_range(&q.from, &q.to)?;
-    let filters = parse_filters(&q.workflow, &q.origin, &q.org, &q.host);
+    let filters = q.filters();
     match resolve_run_location(&s, &run_id).await {
         RunLocation::Global => {
             let run = s
@@ -3292,6 +3449,10 @@ mod tests {
             },
             ExplorerFilters {
                 orgs: vec!["as64500".into()],
+                ..Default::default()
+            },
+            ExplorerFilters {
+                not_hosts: vec!["a.com:443".into()],
                 ..Default::default()
             },
         ];

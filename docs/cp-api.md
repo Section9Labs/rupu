@@ -503,7 +503,12 @@ header naming hosts whose rows couldn't be attributed — see
 
 Netflow reads take `from` / `to` (inclusive RFC 3339) and comma-separated
 dimension filters `workflow`, `origin`, `org` and `host`. Here `host` filters
-by **remote endpoint** (`host:port`), not by registered rupu host.
+by **remote endpoint** (`host:port`), not by registered rupu host. Each
+dimension has an exclusion list too, `not_workflow`, `not_origin`, `not_org`
+and `not_host`: a flow whose key is listed is left out. An explorer response
+built with exclusions says `exclusions_applied: true`; for a run on an HTTP
+host older than the exclusions, the explorer answers 501 rather than relay an
+unfiltered view.
 
 | Method | Path | Purpose | Notes |
 |--------|------|---------|-------|
@@ -513,6 +518,7 @@ by **remote endpoint** (`host:port`), not by registered rupu host.
 | GET | `/api/netflow/graph` | Source → endpoint graph (`GraphView`). | `scope` (`run:<id>`, `project:<id>`, absent = global), `from`, `to`. Dimension filters are not applied. |
 | GET | `/api/netflow/explorer` | Explorer aggregates: sankey, timeline, histogram, KPIs. | `scope` plus the filters above. |
 | GET | `/api/netflow/index` | Resident netflow index status (size, budget, evictions). | |
+| GET | `/api/netflow/latest` | The most recently started run with flows: `{latest: {run_id, workflow, started_at, finished_at} \| null}`. | `scope` (`project:<id>`, absent = global; anything else is a 400). A ledger no run record accounts for counts as a run spanning its own flows (`run_id: null`). `finished_at` is null while the run is live. The Network page opens on this run's span or the last hour, whichever is shorter. |
 
 ## Projects and code
 

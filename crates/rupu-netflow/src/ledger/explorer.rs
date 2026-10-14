@@ -135,7 +135,8 @@ pub fn origin_key(origin: &Origin) -> String {
 
 /// The active cross-filter sets, one per topology dimension plus the
 /// endpoint set the timeline/org-cards toggle. Empty set = dimension
-/// unfiltered.
+/// unfiltered. Each dimension also has an exclusion set (`not_*`): a flow
+/// whose key is in it never passes, whatever the inclusion set says.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExplorerFilters {
     pub workflows: Vec<String>,
@@ -143,6 +144,10 @@ pub struct ExplorerFilters {
     pub orgs: Vec<String>,
     /// `host:port` strings, matched exactly against [`ExplorerFlow::endpoint_key`].
     pub hosts: Vec<String>,
+    pub not_workflows: Vec<String>,
+    pub not_origins: Vec<String>,
+    pub not_orgs: Vec<String>,
+    pub not_hosts: Vec<String>,
 }
 
 /// The dimension a per-column aggregate deliberately does NOT filter by —
@@ -164,6 +169,15 @@ impl ExplorerFilters {
             && self.origins.is_empty()
             && self.orgs.is_empty()
             && self.hosts.is_empty()
+            && !self.has_exclusions()
+    }
+
+    /// Whether any dimension excludes a key.
+    pub fn has_exclusions(&self) -> bool {
+        !(self.not_workflows.is_empty()
+            && self.not_origins.is_empty()
+            && self.not_orgs.is_empty()
+            && self.not_hosts.is_empty())
     }
 
     /// Whether `f` passes every active filter, optionally skipping one
@@ -200,14 +214,25 @@ impl ExplorerFilters {
         if self.is_empty() {
             return true;
         }
-        let dim = |skip_this: SkipDim, set: &[String], key: &dyn Fn() -> String| {
-            skip == Some(skip_this) || set.is_empty() || set.contains(&key())
+        let dim = |skip_this: SkipDim, set: &[String], not: &[String], key: &dyn Fn() -> String| {
+            if skip == Some(skip_this) || (set.is_empty() && not.is_empty()) {
+                return true;
+            }
+            let k = key();
+            (set.is_empty() || set.contains(&k)) && !not.contains(&k)
         };
-        dim(SkipDim::Workflow, &self.workflows, &|| {
-            workflow_key_of(workflow).to_string()
-        }) && dim(SkipDim::Origin, &self.origins, &|| origin_key(origin))
-            && dim(SkipDim::Org, &self.orgs, &|| org_key_of(asn))
-            && dim(SkipDim::Host, &self.hosts, &|| endpoint_key_of(host, port))
+        dim(
+            SkipDim::Workflow,
+            &self.workflows,
+            &self.not_workflows,
+            &|| workflow_key_of(workflow).to_string(),
+        ) && dim(SkipDim::Origin, &self.origins, &self.not_origins, &|| {
+            origin_key(origin)
+        }) && dim(SkipDim::Org, &self.orgs, &self.not_orgs, &|| {
+            org_key_of(asn)
+        }) && dim(SkipDim::Host, &self.hosts, &self.not_hosts, &|| {
+            endpoint_key_of(host, port)
+        })
     }
 }
 
@@ -1195,6 +1220,7 @@ mod tests {
             origins: vec!["provider:anthropic".into()],
             orgs: vec!["as13335".into()],
             hosts: vec!["api.anthropic.com:443".into()],
+            ..Default::default()
         };
         assert!(hit.passes(&f, None));
 
@@ -1204,6 +1230,32 @@ mod tests {
         };
         assert!(!miss.passes(&f, None));
         assert!(miss.passes(&f, Some(SkipDim::Workflow)));
+    }
+
+    #[test]
+    fn an_excluded_key_never_passes_and_its_own_dimension_skips_it() {
+        let f = anthropic(1, 100, true);
+        let excluded = ExplorerFilters {
+            not_origins: vec!["provider:anthropic".into()],
+            ..Default::default()
+        };
+        assert!(excluded.has_exclusions());
+        assert!(!excluded.is_empty());
+        assert!(!excluded.passes(&f, None));
+        assert!(excluded.passes(&f, Some(SkipDim::Origin)));
+
+        let other = ExplorerFilters {
+            not_hosts: vec!["api.github.com:443".into()],
+            ..Default::default()
+        };
+        assert!(other.passes(&f, None));
+
+        let both = ExplorerFilters {
+            workflows: vec!["review".into()],
+            not_workflows: vec!["review".into()],
+            ..Default::default()
+        };
+        assert!(!both.passes(&f, None));
     }
 
     fn xf(
