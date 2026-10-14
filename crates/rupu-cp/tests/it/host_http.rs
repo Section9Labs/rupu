@@ -2,11 +2,12 @@
 
 use futures_util::StreamExt as _;
 use rupu_cp::host::{
-    connector::{HostConnector, HostConnectorError, RunKind, RunListQuery},
+    connector::{HostConnector, HostConnectorError, NetflowLanding, RunKind, RunListQuery},
     dashboard_summary::DashboardRange,
     http::HttpHostConnector,
 };
 use rupu_cp::launcher::LaunchRequest;
+use rupu_netflow::land::LandingStatus;
 
 /// A fresh in-process CP state rooted in `tmp` (default pricing, no launchers).
 fn cp_state(tmp: &tempfile::TempDir) -> rupu_cp::state::AppState {
@@ -1590,6 +1591,287 @@ async fn unit_coverage_refuses_a_remote_with_no_host_info_route() {
         "{err:?}"
     );
     stream.assert_hits(0);
+}
+
+// ── Remote netflow transport, Task 6: netflow stream over HTTP ───────────────
+
+/// A root run's stream as the host's `rupu run` writes it (spec 2026-10-14
+/// §N1): one `begin` line, then ledger lines tagged with their ledger id.
+fn netflow_stream_body(run_id: &str) -> Vec<u8> {
+    let begin = serde_json::json!({"kind": "begin", "v": 1, "run_id": run_id});
+    let line = serde_json::json!({
+        "kind": "line",
+        "ledger": run_id,
+        "line": {"type": "dropped", "count": 1, "ts": "2026-10-14T00:00:00Z"},
+    });
+    format!("{begin}\n{line}\n").into_bytes()
+}
+
+/// Seed `<global>/runs/<run_id>/netflow.jsonl` on the remote CP.
+fn seed_netflow_stream(state: &rupu_cp::state::AppState, run_id: &str, body: &[u8]) {
+    let p = rupu_netflow::stream::stream_path(&state.run_store.root, run_id);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, body).unwrap();
+}
+
+#[tokio::test]
+async fn netflow_stream_endpoint_serves_the_runs_stream() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = cp_state(&tmp);
+    let body = netflow_stream_body("run_H1");
+    seed_netflow_stream(&state, "run_H1", &body);
+    let addr = serve_cp(state).await;
+
+    #[allow(clippy::disallowed_methods)]
+    let ok = reqwest::get(format!("http://{addr}/api/runs/run_H1/netflow/stream"))
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+    assert_eq!(
+        ok.headers().get("content-type").unwrap(),
+        "application/x-ndjson"
+    );
+    assert_eq!(ok.bytes().await.unwrap().as_ref(), body.as_slice());
+
+    // A run that wrote none: 200, empty body.
+    #[allow(clippy::disallowed_methods)]
+    let none = reqwest::get(format!("http://{addr}/api/runs/run_NONE/netflow/stream"))
+        .await
+        .unwrap();
+    assert_eq!(none.status(), 200);
+    assert!(none.bytes().await.unwrap().is_empty());
+
+    #[allow(clippy::disallowed_methods)]
+    let bad = reqwest::get(format!("http://{addr}/api/runs/not-a-run/netflow/stream"))
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+}
+
+/// A stream that exists but cannot be read is the server's problem: 500.
+#[tokio::test]
+async fn netflow_stream_endpoint_reports_an_unreadable_stream_as_a_server_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = cp_state(&tmp);
+    // `netflow.jsonl` is a directory: it exists, `read` fails, NotFound it is not.
+    let p = rupu_netflow::stream::stream_path(&state.run_store.root, "run_H3");
+    std::fs::create_dir_all(&p).unwrap();
+    let addr = serve_cp(state).await;
+
+    #[allow(clippy::disallowed_methods)]
+    let unreadable = reqwest::get(format!("http://{addr}/api/runs/run_H3/netflow/stream"))
+        .await
+        .unwrap();
+    assert_eq!(unreadable.status(), 500);
+}
+
+#[tokio::test]
+async fn land_run_netflow_fetches_and_lands_complete_on_a_terminal_run() {
+    let remote = tempfile::tempdir().unwrap();
+    let state = cp_state(&remote);
+    seed_netflow_stream(&state, "run_H1", &netflow_stream_body("run_H1"));
+    let addr = serve_cp(state).await;
+
+    let coord = tempfile::tempdir().unwrap();
+    let coord_runs_root = coord.path().join("runs");
+    let c = HttpHostConnector::new(format!("http://{addr}"), None);
+    let landing = c
+        .land_run_netflow("run_H1", true, &coord_runs_root)
+        .await
+        .unwrap();
+    assert_eq!(
+        landing,
+        NetflowLanding::Landed(LandingStatus::Complete),
+        "{landing:?}"
+    );
+
+    let rec = rupu_netflow::land::read_landing_record(&coord_runs_root, "run_H1").unwrap();
+    assert_eq!(rec.status, LandingStatus::Complete);
+    assert_eq!(rec.reason, None);
+    assert_eq!(rec.ledgers, vec!["run_H1".to_string()]);
+    assert_eq!(rec.host, format!("http://{addr}"));
+    let landed = coord.path().join("netflow").join("run_H1.jsonl");
+    let text = std::fs::read_to_string(&landed).unwrap();
+    assert_eq!(text.lines().count(), 1, "{text}");
+    assert!(text.contains("\"type\":\"dropped\""), "{text}");
+}
+
+#[tokio::test]
+async fn land_run_netflow_on_a_snapshot_lands_partial() {
+    let remote = tempfile::tempdir().unwrap();
+    let state = cp_state(&remote);
+    seed_netflow_stream(&state, "run_H1", &netflow_stream_body("run_H1"));
+    let addr = serve_cp(state).await;
+
+    let coord = tempfile::tempdir().unwrap();
+    let coord_runs_root = coord.path().join("runs");
+    let c = HttpHostConnector::new(format!("http://{addr}"), None);
+    let landing = c
+        .land_run_netflow("run_H1", false, &coord_runs_root)
+        .await
+        .unwrap();
+    assert_eq!(landing, NetflowLanding::Landed(LandingStatus::Partial));
+
+    let rec = rupu_netflow::land::read_landing_record(&coord_runs_root, "run_H1").unwrap();
+    assert_eq!(rec.status, LandingStatus::Partial);
+    assert!(
+        rec.reason
+            .as_deref()
+            .is_some_and(|r| r.contains("before the unit finished")),
+        "{rec:?}"
+    );
+    // The ledgers it had still land.
+    assert_eq!(rec.ledgers, vec!["run_H1".to_string()]);
+    assert!(coord.path().join("netflow").join("run_H1.jsonl").is_file());
+}
+
+/// A remote that never streamed (no `begin` line) is `unavailable`, never
+/// "no flows".
+#[tokio::test]
+async fn land_run_netflow_records_a_stream_without_begin_as_unavailable() {
+    let remote = tempfile::tempdir().unwrap();
+    let state = cp_state(&remote);
+    let addr = serve_cp(state).await;
+
+    let coord = tempfile::tempdir().unwrap();
+    let coord_runs_root = coord.path().join("runs");
+    let c = HttpHostConnector::new(format!("http://{addr}"), None);
+    let landing = c
+        .land_run_netflow("run_H1", true, &coord_runs_root)
+        .await
+        .unwrap();
+    assert_eq!(landing, NetflowLanding::Landed(LandingStatus::Unavailable));
+    let rec = rupu_netflow::land::read_landing_record(&coord_runs_root, "run_H1").unwrap();
+    assert_eq!(
+        rec.reason.as_deref(),
+        Some(rupu_netflow::land::NO_BEGIN_REASON)
+    );
+    assert!(rec.ledgers.is_empty());
+}
+
+/// An older remote answers unknown /api paths with the SPA (200 HTML), so the
+/// feature is checked first; a peer without it is recorded `unavailable`.
+#[tokio::test]
+async fn a_peer_without_the_feature_is_recorded_unavailable() {
+    let server = httpmock::MockServer::start_async().await;
+    server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(200)
+            .json_body(serde_json::json!({"version": "0.70.0", "features": []}));
+    });
+    let spa = server.mock(|when, then| {
+        when.method("GET").path("/api/runs/run_H1/netflow/stream");
+        then.status(200).body("<!doctype html>");
+    });
+
+    let coord = tempfile::tempdir().unwrap();
+    let coord_runs_root = coord.path().join("runs");
+    let c = HttpHostConnector::new(server.base_url(), None);
+    let landing = c
+        .land_run_netflow("run_H1", true, &coord_runs_root)
+        .await
+        .unwrap();
+    assert_eq!(landing, NetflowLanding::Landed(LandingStatus::Unavailable));
+    spa.assert_hits(0);
+
+    let rec = rupu_netflow::land::read_landing_record(&coord_runs_root, "run_H1").unwrap();
+    assert_eq!(rec.status, LandingStatus::Unavailable);
+    assert_eq!(rec.host, server.base_url());
+    assert!(
+        rec.reason
+            .as_deref()
+            .is_some_and(|r| r.contains("run.netflow_stream")
+                && r.contains("this unit's netflow cannot be collected")),
+        "{rec:?}"
+    );
+    assert!(rec.ledgers.is_empty());
+    assert!(!coord.path().join("netflow").exists());
+}
+
+/// A fetch that fails in transit (the peer dropped the connection) is also
+/// `unavailable`, with the transport error as its reason.
+#[tokio::test]
+async fn land_run_netflow_records_a_failed_fetch_as_unavailable() {
+    let server = httpmock::MockServer::start_async().await;
+    server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(200)
+            .json_body(host_info_with(&["run.netflow_stream"]));
+    });
+    server.mock(|when, then| {
+        when.method("GET").path("/api/runs/run_H1/netflow/stream");
+        then.status(500).body("boom");
+    });
+
+    let coord = tempfile::tempdir().unwrap();
+    let coord_runs_root = coord.path().join("runs");
+    let c = HttpHostConnector::new(server.base_url(), None);
+    let landing = c
+        .land_run_netflow("run_H1", true, &coord_runs_root)
+        .await
+        .unwrap();
+    assert_eq!(landing, NetflowLanding::Landed(LandingStatus::Unavailable));
+    let rec = rupu_netflow::land::read_landing_record(&coord_runs_root, "run_H1").unwrap();
+    assert!(
+        rec.reason.as_deref().is_some_and(|r| r.contains("500")),
+        "{rec:?}"
+    );
+}
+
+/// An invalid id never reaches the network and never writes a record.
+#[tokio::test]
+async fn land_run_netflow_refuses_an_invalid_run_id() {
+    let server = httpmock::MockServer::start_async().await;
+    let info = server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(200)
+            .json_body(host_info_with(&["run.netflow_stream"]));
+    });
+    let coord = tempfile::tempdir().unwrap();
+    let coord_runs_root = coord.path().join("runs");
+    let c = HttpHostConnector::new(server.base_url(), None);
+    let err = c
+        .land_run_netflow("../x", true, &coord_runs_root)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HostConnectorError::Invalid(_)), "{err:?}");
+    info.assert_hits(0);
+    assert!(!coord_runs_root.exists());
+}
+
+/// A later complete landing replaces a snapshot's partial record; a partial
+/// read after a complete one never downgrades it.
+#[tokio::test]
+async fn land_run_netflow_never_downgrades_a_complete_record() {
+    let remote = tempfile::tempdir().unwrap();
+    let state = cp_state(&remote);
+    seed_netflow_stream(&state, "run_H1", &netflow_stream_body("run_H1"));
+    let addr = serve_cp(state).await;
+
+    let coord = tempfile::tempdir().unwrap();
+    let coord_runs_root = coord.path().join("runs");
+    let c = HttpHostConnector::new(format!("http://{addr}"), None);
+    assert_eq!(
+        c.land_run_netflow("run_H1", false, &coord_runs_root)
+            .await
+            .unwrap(),
+        NetflowLanding::Landed(LandingStatus::Partial)
+    );
+    assert_eq!(
+        c.land_run_netflow("run_H1", true, &coord_runs_root)
+            .await
+            .unwrap(),
+        NetflowLanding::Landed(LandingStatus::Complete)
+    );
+    assert_eq!(
+        c.land_run_netflow("run_H1", false, &coord_runs_root)
+            .await
+            .unwrap(),
+        NetflowLanding::Landed(LandingStatus::Complete),
+        "a snapshot after a complete landing keeps the complete record"
+    );
+    let rec = rupu_netflow::land::read_landing_record(&coord_runs_root, "run_H1").unwrap();
+    assert_eq!(rec.status, LandingStatus::Complete);
 }
 
 // ── Remote findings Plan B, Task 3: artifact blobs over HTTP ─────────────────

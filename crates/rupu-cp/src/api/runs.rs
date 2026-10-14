@@ -29,6 +29,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/runs/:id/usage", get(get_run_usage))
         .route("/api/runs/:id/autoflow", get(get_run_autoflow))
         .route("/api/runs/:id/coverage", get(get_run_coverage))
+        .route("/api/runs/:id/netflow/stream", get(get_run_netflow_stream))
         .route("/api/runs/:id/approve", post(approve_run))
         .route("/api/runs/:id/reject", post(reject_run))
         .route("/api/runs/:id/cancel", post(cancel_run))
@@ -52,6 +53,32 @@ async fn get_run_coverage(
             HostConnectorError::Invalid(m) => ApiError::bad_request(m),
             other => ApiError::internal(other.to_string()),
         })?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
+        bytes,
+    )
+        .into_response())
+}
+
+/// `GET /api/runs/:id/netflow/stream` — the run's netflow stream as this
+/// host wrote it (`runs/<id>/netflow.jsonl`, spec
+/// 2026-10-14-rupu-remote-netflow-transport-design.md §N2), for a
+/// coordinator landing a placed unit's ledgers. 200 with an empty body when
+/// the run wrote none. Distinct from `/api/runs/:id/netflow` (`api/netflow.rs`),
+/// which serves this host's processed view of the same flows.
+async fn get_run_netflow_stream(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    if !crate::host::connector::valid_run_id(&id) {
+        return Err(ApiError::bad_request(format!("invalid run id {id:?}")));
+    }
+    let path = rupu_netflow::stream::stream_path(&s.run_store.root, &id);
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(ApiError::internal(e.to_string())),
+    };
     Ok((
         [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
         bytes,
