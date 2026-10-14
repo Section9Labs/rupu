@@ -3065,6 +3065,15 @@ export const api = {
     );
     return res.children;
   },
+  /** One unit's final answer, fetched on demand — the units list omits it
+   *  (it can be multi-KB / a whole transcript read). `null` = no answer. */
+  async getAgentiflowUnitOutput(id: string, unitId: string, signal?: AbortSignal): Promise<string | null> {
+    const res = await request<{ output: string | null }>(
+      `/api/agentiflows/${encodeURIComponent(id)}/units/${encodeURIComponent(unitId)}/output`,
+      { signal },
+    );
+    return res.output;
+  },
   getSessionUsageTimeline(id: string, opts?: { host?: string }): Promise<UsageTimelinePoint[]> {
     const qs = opts?.host ? `?host=${encodeURIComponent(opts.host)}` : '';
     return request<UsageTimelinePoint[]>(`/api/sessions/${encodeURIComponent(id)}/usage-timeline${qs}`);

@@ -358,7 +358,7 @@ export default function AgentiflowDetail() {
         ) : (
           <ul className="divide-y divide-border border-t border-border">
             {detail.units.map((u) => (
-              <UnitRow key={u.unit_id} unit={u} />
+              <UnitRow key={u.unit_id} unit={u} afId={id} />
             ))}
           </ul>
         )}
@@ -578,12 +578,33 @@ function BudgetBody({ detail }: { detail: AgentiflowDetailData }) {
 // Fleet
 // ---------------------------------------------------------------------------
 
-function UnitRow({ unit }: { unit: AgentiflowUnit }) {
+function UnitRow({ unit, afId }: { unit: AgentiflowUnit; afId: string }) {
   const { status } = unit;
-  // A unit's final answer (`done`) or failure (`failed`) — can be several KB,
-  // so collapsed until asked for.
-  const body = status.state === 'failed' ? status.error : status.output;
-  const bodyLabel = status.state === 'failed' ? 'error' : 'output';
+  const isFailed = status.state === 'failed';
+  const bodyLabel = isFailed ? 'error' : 'output';
+  // Failure text is cheap and comes inline. A `done` unit's answer can be
+  // several KB (a whole transcript read for a W7 unit), so the list omits it
+  // and we fetch it the first time the row is expanded. A legacy unit still
+  // carries its answer inline, so there is nothing to fetch.
+  const inline = isFailed ? status.error : status.output;
+  const lazy = !isFailed && status.state === 'done' && inline == null;
+  const [fetched, setFetched] = useState<string | null | undefined>(undefined);
+  const [fetching, setFetching] = useState(false);
+  const [fetchErr, setFetchErr] = useState<string | null>(null);
+  const loadOutput = useCallback(() => {
+    if (!lazy || fetched !== undefined || fetching) return;
+    setFetching(true);
+    setFetchErr(null);
+    api
+      .getAgentiflowUnitOutput(afId, unit.unit_id)
+      .then((o) => setFetched(o))
+      .catch((e) => setFetchErr(apiErrorMessage(e)))
+      .finally(() => setFetching(false));
+  }, [lazy, fetched, fetching, afId, unit.unit_id]);
+  const body = inline ?? fetched ?? null;
+  // Show the expander when there is text inline, or a done unit whose answer
+  // we can fetch.
+  const hasBody = inline != null || lazy;
   return (
     <li className="px-4 py-2.5">
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
@@ -613,17 +634,30 @@ function UnitRow({ unit }: { unit: AgentiflowUnit }) {
           )}
         </span>
       </div>
-      {body && (
-        <details className="mt-1.5 group">
+      {hasBody && (
+        <details
+          className="mt-1.5 group"
+          onToggle={(e) => {
+            if (e.currentTarget.open) loadOutput();
+          }}
+        >
           <summary className="cursor-pointer select-none text-note text-ink-dim hover:text-ink">{bodyLabel}</summary>
-          <pre
-            className={cn(
-              'mt-1.5 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-bg p-2 font-mono text-note',
-              status.state === 'failed' ? 'text-err' : 'text-ink',
-            )}
-          >
-            {body}
-          </pre>
+          {fetching && fetched === undefined ? (
+            <p className="mt-1.5 text-note text-ink-mute">Loading output…</p>
+          ) : fetchErr ? (
+            <p className="mt-1.5 text-note text-err">{fetchErr}</p>
+          ) : body != null ? (
+            <pre
+              className={cn(
+                'mt-1.5 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-bg p-2 font-mono text-note',
+                isFailed ? 'text-err' : 'text-ink',
+              )}
+            >
+              {body}
+            </pre>
+          ) : (
+            <p className="mt-1.5 text-note text-ink-mute">No output recorded.</p>
+          )}
         </details>
       )}
     </li>
