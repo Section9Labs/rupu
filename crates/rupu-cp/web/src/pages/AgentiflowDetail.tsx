@@ -30,6 +30,7 @@ import { useMessageSpace } from '../lib/useMessageSpace';
 import EngagementFindings from '../components/agentiflow/EngagementFindings';
 import TranscriptBrowser, { type Selection as TranscriptSelection } from '../components/agentiflow/TranscriptBrowser';
 import AgentiflowEventFeed from '../components/agentiflow/AgentiflowEventFeed';
+import NetflowExplorer from '../components/netflow/explorer/NetflowExplorer';
 import { Segmented } from '../components/ui/Segmented';
 import { Badge } from '../components/ui/Badge';
 import { Button } from '../components/ui/Button';
@@ -42,6 +43,7 @@ import { absoluteTime, durationBetween, relativeTime } from '../lib/time';
 import { formatDuration } from '../lib/duration';
 import { formatCost, formatTokens } from '../lib/usage';
 import { shortId } from '../lib/shortId';
+import { spanWindow } from '../lib/netflow';
 import {
   STOP_TONE_BADGE,
   STOP_TONE_TEXT,
@@ -59,11 +61,12 @@ import {
 
 const POLL_MS = 5000;
 
-type AfTab = 'flow' | 'assets' | 'findings' | 'messages' | 'transcript' | 'events';
+type AfTab = 'flow' | 'assets' | 'findings' | 'network' | 'messages' | 'transcript' | 'events';
 const TABS: { value: AfTab; label: string }[] = [
   { value: 'flow', label: 'Flow' },
   { value: 'assets', label: 'Assets' },
   { value: 'findings', label: 'Findings' },
+  { value: 'network', label: 'Network' },
   { value: 'messages', label: 'Messages' },
   { value: 'transcript', label: 'Transcript' },
   { value: 'events', label: 'Events' },
@@ -386,6 +389,17 @@ export default function AgentiflowDetail() {
       {tab === 'findings' && (
         <Panel title="Findings" meta={<span className="text-meta text-ink-mute">verified by this engagement</span>}>
           <EngagementFindings runId={record.id} live={running} />
+        </Panel>
+      )}
+
+      {tab === 'network' && (
+        <Panel title="Network" meta={<span className="text-meta text-ink-mute">egress across the fleet</span>}>
+          <NetflowExplorer
+            key={record.id}
+            scope="agentiflow"
+            agentiflowId={record.id}
+            initialWindow={spanWindow(record.started_at, record.ended_at)}
+          />
         </Panel>
       )}
 

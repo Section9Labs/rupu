@@ -578,16 +578,21 @@ fn unit_status_dto(status: UnitStatus) -> UnitStatusDto {
     }
 }
 
+/// The transcript a launched child wrote: the one its ledger line names,
+/// else where a `rupu run` of its id writes one.
+fn child_transcript(s: &AppState, started: &rupu_launch::ledger::Started) -> Option<PathBuf> {
+    started
+        .transcript
+        .clone()
+        .filter(|p| p.is_file())
+        .or_else(|| unit_transcript(s, &started.run_id))
+}
+
 /// A child the flow's launcher recorded in `children.jsonl` (W7), as a unit.
 fn ledger_unit(s: &AppState, e: rupu_launch::ledger::ChildEntry) -> UnitDto {
     let state = e.state();
     let f = e.finished.as_ref();
-    let transcript = e
-        .started
-        .transcript
-        .clone()
-        .filter(|p| p.is_file())
-        .or_else(|| unit_transcript(s, &e.started.run_id));
+    let transcript = child_transcript(s, &e.started);
     let output = match state {
         rupu_tools::ChildState::Done => transcript
             .as_deref()
@@ -631,6 +636,41 @@ fn read_units(s: &AppState, run_dir: &std::path::Path) -> Vec<UnitDto> {
     units
 }
 
+/// Every run an agentiflow's launch tree holds below its lead, and every
+/// transcript the flow wrote.
+pub(crate) struct FlowRuns {
+    /// Each legacy unit, then each child the flow's launcher recorded and,
+    /// down the tree, every child those launched.
+    pub run_ids: Vec<String>,
+    /// The lead's rounds, then each of those runs' (a workflow child's are
+    /// its steps').
+    pub transcripts: Vec<PathBuf>,
+}
+
+pub(crate) fn flow_runs(s: &AppState, run_dir: &std::path::Path) -> FlowRuns {
+    let mut runs = FlowRuns {
+        run_ids: Vec::new(),
+        transcripts: read_lead_transcripts(run_dir)
+            .into_iter()
+            .map(|t| PathBuf::from(t.path))
+            .collect(),
+    };
+    for u in units_on_disk(run_dir) {
+        runs.transcripts.extend(unit_transcript(s, &u.unit_id));
+        runs.run_ids.push(u.unit_id);
+    }
+    for started in rupu_launch::identity::launch_tree(&s.global_dir, run_dir) {
+        match started.kind {
+            rupu_tools::ChildKind::Workflow => runs.transcripts.extend(
+                crate::usage::run_transcript_paths(&s.run_store, &started.run_id),
+            ),
+            _ => runs.transcripts.extend(child_transcript(s, &started)),
+        }
+        runs.run_ids.push(started.run_id);
+    }
+    runs
+}
+
 fn read_legacy_units(s: &AppState, run_dir: &std::path::Path) -> Vec<UnitDto> {
     units_on_disk(run_dir)
         .into_iter()
@@ -659,9 +699,6 @@ fn read_legacy_units(s: &AppState, run_dir: &std::path::Path) -> Vec<UnitDto> {
         .collect()
 }
 
-/// Assemble the detail for `id`, or `None` when no such run directory has a
-/// record. A record that exists but cannot be parsed is an error, not a 404:
-/// the run is there, its state of record is unreadable.
 /// Resolve the [`AssetScopeDto`] for the run in `run_dir` (id `af_id`): the
 /// lead's workspace comes from its first-round `RunStart`, and the coverage
 /// target is `target_id(workspace_path, af_id)` (the flow's id is its scope
@@ -670,6 +707,19 @@ fn read_legacy_units(s: &AppState, run_dir: &std::path::Path) -> Vec<UnitDto> {
 /// no registered path for; callers then leave the Assets tab unscoped-but-safe
 /// rather than showing every workspace's assets.
 fn asset_scope(s: &AppState, run_dir: &std::path::Path, af_id: &str) -> Option<AssetScopeDto> {
+    let ws = flow_workspace(s, run_dir)?;
+    Some(AssetScopeDto {
+        target_id: rupu_coverage::target_id(std::path::Path::new(&ws.path), af_id),
+        ws_id: ws.id,
+    })
+}
+
+/// The workspace the flow ran in: the one its first lead round's `RunStart`
+/// names, when this CP has it registered.
+pub(crate) fn flow_workspace(
+    s: &AppState,
+    run_dir: &std::path::Path,
+) -> Option<rupu_workspace::Workspace> {
     let lead = read_lead_transcripts(run_dir).into_iter().next()?;
     let ws_id = match rupu_transcript::JsonlReader::iter(std::path::Path::new(&lead.path))
         .ok()?
@@ -678,19 +728,18 @@ fn asset_scope(s: &AppState, run_dir: &std::path::Path, af_id: &str) -> Option<A
         Ok(rupu_transcript::Event::RunStart { workspace_id, .. }) => workspace_id,
         _ => return None,
     };
-    let ws = rupu_workspace::WorkspaceStore {
+    rupu_workspace::WorkspaceStore {
         root: s.global_dir.join("workspaces"),
     }
     .list()
     .ok()?
     .into_iter()
-    .find(|w| w.id == ws_id)?;
-    Some(AssetScopeDto {
-        ws_id,
-        target_id: rupu_coverage::target_id(std::path::Path::new(&ws.path), af_id),
-    })
+    .find(|w| w.id == ws_id)
 }
 
+/// Assemble the detail for `id`, or `None` when no such run directory has a
+/// record. A record that exists but cannot be parsed is an error, not a 404:
+/// the run is there, its state of record is unreadable.
 fn load_detail(s: &AppState, id: &str) -> ApiResult<Option<AgentiflowDetail>> {
     let run_dir = agentiflow_dir(&s.global_dir).join(id);
     let mut record = match AgentiflowRecord::read(&run_dir) {

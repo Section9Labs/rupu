@@ -1,13 +1,13 @@
 // @vitest-environment jsdom
 // AgentiflowDetail — header + goals + budget (always shown) plus the tabbed
-// Flow (graph + fleet) / Findings / Assets / Messages / Transcript / Events
+// Flow (graph + fleet) / Assets / Findings / Network / Messages / Transcript / Events
 // views over one GET /api/agentiflows/:id. TranscriptPanel is mocked (heavy;
 // its own tests); the Findings/Assets/Messages tabs fetch on open and aren't
 // exercised here.
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
-import { render, screen, cleanup, within, fireEvent } from '@testing-library/react';
+import { render, screen, cleanup, within, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { api, ApiError, type AgentiflowDetail as Detail } from '../lib/api';
 
@@ -20,7 +20,20 @@ vi.mock('../components/TranscriptPanel', () => ({
   ),
 }));
 
+const { fetchAgentiflowNetflow, fetchNetflowExplorer } = vi.hoisted(() => ({
+  fetchAgentiflowNetflow: vi.fn(),
+  fetchNetflowExplorer: vi.fn(),
+}));
+vi.mock('../lib/netflow', async () => {
+  const actual = await vi.importActual<typeof import('../lib/netflow')>('../lib/netflow');
+  return { ...actual, fetchAgentiflowNetflow, fetchNetflowExplorer };
+});
+
 import AgentiflowDetail from './AgentiflowDetail';
+import {
+  emptyFlowsResponse,
+  populatedExplorerResponse,
+} from '../components/netflow/explorer/explorerFixtures';
 
 afterEach(() => {
   cleanup();
@@ -173,6 +186,22 @@ describe('AgentiflowDetail', () => {
     expect(screen.getByText('Engagement started')).toBeInTheDocument();
     expect(screen.getByText('Engagement stopped')).toBeInTheDocument();
     expect(screen.getByText('provider: API error 401')).toBeInTheDocument();
+  });
+
+  it('loads the engagement span of the whole flow on the Network tab', async () => {
+    vi.spyOn(api, 'getAgentiflow').mockResolvedValue(DETAIL);
+    fetchNetflowExplorer.mockResolvedValue(populatedExplorerResponse());
+    fetchAgentiflowNetflow.mockResolvedValue(emptyFlowsResponse());
+    renderDetail();
+    expect(await screen.findByRole('heading', { name: 'rupu-self-review' })).toBeInTheDocument();
+    expect(fetchNetflowExplorer).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Network' }));
+    const window = { from: '2026-10-07T15:02:08.000Z', to: '2026-10-07T15:12:09.000Z' };
+    await waitFor(() =>
+      expect(fetchNetflowExplorer).toHaveBeenCalledWith('agentiflow:af_01ABC', window, undefined),
+    );
+    expect(fetchAgentiflowNetflow).toHaveBeenCalledWith('af_01ABC', window, undefined);
   });
 
   it('falls back to the record alone without a definition snapshot', async () => {
