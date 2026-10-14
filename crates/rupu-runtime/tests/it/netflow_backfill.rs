@@ -166,3 +166,35 @@ fn a_backfill_restores_only_lost_flows_with_their_completions_and_loss_count() {
         ]
     );
 }
+
+/// A coordinator-launched run's backfilled lines reach its netflow stream
+/// too (spec 2026-10-14 remote netflow transport §N1): a remote coordinator
+/// lands the stream, never the host's ledger, so a line the backfill writes
+/// only to the ledger would never arrive.
+#[test]
+fn a_backfill_tees_its_lines_into_the_runs_stream() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stream = rupu_netflow::stream::stream_path(&tmp.path().join("runs"), "run_root");
+    rupu_netflow::stream::write_stream_begin(&stream, "run_root").unwrap();
+    let paths = NetflowPaths::for_run(&tmp.path().join("netflow"), "run_b").with_stream(Some(
+        rupu_netflow::NetflowStream {
+            path: stream.clone(),
+            ledger_id: "run_b".into(),
+        },
+    ));
+    let transcript = tmp.path().join("run_b.jsonl");
+    append_to_transcript(&transcript, flow(FlowId::from_parts(2, 1), "lost.example"));
+    assert_eq!(
+        rupu_runtime::netflow::backfill_ledger(&paths, &transcript).unwrap(),
+        1
+    );
+    let parsed = rupu_netflow::land::parse_stream(&std::fs::read(&stream).unwrap());
+    assert!(parsed.begin_seen);
+    assert_eq!(parsed.malformed, 0);
+    let teed = &parsed.ledgers["run_b"];
+    assert_eq!(teed.len(), 1, "{teed:?}");
+    assert!(teed[0].contains("lost.example"));
+    // the stream carries exactly the ledger's bytes
+    let ledger = std::fs::read_to_string(&paths.flows).unwrap();
+    assert_eq!(ledger.trim_end(), teed[0]);
+}

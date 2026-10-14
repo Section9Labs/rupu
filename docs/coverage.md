@@ -608,8 +608,8 @@ rupu findings export [--id <fnd_…>]… [--project <ws_id|path>] [--run <run_id
 The document format is `--to` (default `md`), not `--format`: `--format` is
 rupu's global output flag (`table`, `json`, `csv`) and has nothing to shape here.
 Filters combine: a finding must pass all of them. `--severity` keeps that
-severity and worse. `--run` keeps findings declared by that run and its
-sub-runs. `--cwe` compares CWE numbers: `CWE-79` (or `cwe-79`, or `79`) keeps
+severity and worse. `--run` keeps findings declared by that run (or
+agentiflow) and everything that ran under it. `--cwe` compares CWE numbers: `CWE-79` (or `cwe-79`, or `79`) keeps
 findings whose report lists CWE-79, whose concern is CWE-79
 (`cwe-top25-2023:cwe-79-xss`) or, when the concern names no CWE, whose first
 MITRE reference URL is CWE-79 (`https://cwe.mitre.org/data/definitions/79.html`),
@@ -1159,7 +1159,7 @@ other than `severity`, or with several values), `unclosed_quote`, `bad_quote`.
 | `agent` | agent name or codename, case-insensitive |
 | `workflow` | workflow name, case-insensitive (CLI and control plane only) |
 | `file` | path prefix |
-| `run` | run id; the CLI and control plane also match the run's sub-runs |
+| `run` | run or agentiflow id; the CLI and control plane also match everything that ran under it (steps, units, launched children, down the tree) |
 | `id` | finding id |
 
 `project:` and `workflow:` need provenance, which only the CLI and control

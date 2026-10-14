@@ -317,6 +317,9 @@ struct Caller {
     ceiling: PermissionMode,
     prompter: Option<Arc<dyn Prompter>>,
     coverage_stream: Option<PathBuf>,
+    /// The caller's netflow stream (spec 2026-10-14 remote netflow
+    /// transport §N1): a sub-agent tees into it under its own ledger id.
+    netflow_stream: Option<rupu_netflow::NetflowStream>,
     engagement: Vec<String>,
     generator: Option<Arc<dyn WorkflowGenerator>>,
     /// The directory of the run at the root of its launch tree.
@@ -338,6 +341,7 @@ impl Caller {
             ceiling: permission.ceiling,
             prompter: permission.prompter,
             coverage_stream: ctx.services.coverage_stream.clone(),
+            netflow_stream: ctx.services.netflow_stream.clone(),
             engagement: ctx
                 .services
                 .findings
@@ -886,6 +890,7 @@ impl RunLauncher {
                         .clone()
                         .map(UsageLedger::open),
                     coverage_stream: from.coverage_stream.clone(),
+                    netflow_stream: from.netflow_stream.clone(),
                 },
             },
             run_id: child.run_id.clone(),

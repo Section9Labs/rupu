@@ -3516,11 +3516,11 @@ export const api = {
    * (no such session) · 409 (session stopped) · 501 (read-only deploy, or a
    * remote host that predates `session.skills`).
    */
-  sendSessionMessage(id: string, prompt: string, host?: string, skills?: string[]): Promise<{ run_id: string }> {
+  sendSessionMessage(id: string, prompt: string, host?: string): Promise<{ run_id: string }> {
     const qs = host ? `?host=${encodeURIComponent(host)}` : '';
     return request<{ run_id: string }>(`/api/sessions/${encodeURIComponent(id)}/send${qs}`, {
       method: 'POST',
-      body: JSON.stringify({ prompt, skills: skillKeys({ skills }).skills }),
+      body: JSON.stringify({ prompt }),
     });
   },
   /** Archive an active session (hides it from the active list). */

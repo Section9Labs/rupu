@@ -71,6 +71,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use rupu_netflow::land::{LandingRecord, LandingStatus, RosterLine};
 use rupu_netflow::{
     global_netflow_dir, is_per_run_ledger_path,
     ledger::explorer::{
@@ -80,6 +81,7 @@ use rupu_netflow::{
     project_local_netflow_dir, AsnInfo, AsnTable, FlowId, FlowRecord, NetflowPaths,
 };
 use rupu_orchestrator::runs::{RunRecord, RunStore};
+use rupu_runtime::file_cache::FileCache;
 use rupu_transcript::{Event as TranscriptEvent, JsonlReader};
 use rupu_workspace::WorkspaceStore;
 use serde::{Deserialize, Serialize};
@@ -725,8 +727,9 @@ fn resolve_ledger_paths(workspace: &StdPath, global_dir: &StdPath, id: &str) -> 
 /// names an ancestor can't loop. Most ids launched nothing, and their walk
 /// is one failed open of a missing `children.jsonl`.
 ///
-/// `pub` so `rupu netflow prune` protects every ledger a live run owns
-/// with the same id walk the read side uses.
+/// This is the inner walk of [`netflow_ids`], which every read path and
+/// `rupu netflow prune` call; nothing else should walk ids through this
+/// function alone, because it cannot see what a remote unit landed.
 pub fn run_and_unit_ids(global: &StdPath, store: &RunStore, run_id: &str) -> Vec<String> {
     run_tree(global, store, run_id).ids
 }
@@ -804,6 +807,193 @@ fn own_ids(store: &RunStore, run_id: &str) -> Vec<String> {
     ids
 }
 
+/// Every ledger id a run's netflow reads, plus what is known to be missing.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct NetflowIds {
+    /// Deduplicated, sorted ledger-file ids.
+    pub ids: Vec<String>,
+    /// A remote unit whose netflow did not arrive whole, one entry each.
+    pub gaps: Vec<IncompleteSource>,
+}
+
+/// Every ledger id a run's netflow reads, plus what is known to be missing
+/// (spec 2026-10-14 §N4): [`run_and_unit_ids`], the workflow run's roster of
+/// placed unit attempts, and each id's landing record — whose `ledgers` add
+/// a remote unit's own sub-agent and child ledgers, and whose status (or
+/// absence, for a roster unit) becomes an [`IncompleteSource`].
+///
+/// `pub` so `rupu netflow prune` protects every ledger a live run owns
+/// with the same id walk the read side uses.
+pub fn netflow_ids(store: &RunStore, global_dir: &StdPath, run_id: &str) -> NetflowIds {
+    let (tree, gaps) = netflow_tree(global_dir, store, run_id);
+    NetflowIds {
+        ids: tree.ids,
+        gaps,
+    }
+}
+
+/// [`netflow_ids`] keeping [`run_tree`]'s launched-children transcripts,
+/// for the read paths that merge them (one walk, not two).
+pub(crate) fn netflow_tree(
+    global_dir: &StdPath,
+    store: &RunStore,
+    run_id: &str,
+) -> (RunTree, Vec<IncompleteSource>) {
+    netflow_tree_in(record_caches(), global_dir, store, run_id)
+}
+
+/// [`netflow_tree`] reading its roster and landing records through
+/// `caches` (production: the process-wide [`record_caches`]).
+fn netflow_tree_in(
+    caches: &RecordCaches,
+    global_dir: &StdPath,
+    store: &RunStore,
+    run_id: &str,
+) -> (RunTree, Vec<IncompleteSource>) {
+    let runs = global_dir.join("runs");
+    let mut tree = run_tree(global_dir, store, run_id);
+    let roster = caches.roster_of(&store.root, run_id);
+    let roster_hosts: HashMap<&str, &str> = roster
+        .iter()
+        .map(|l| (l.unit_run_id.as_str(), l.host.as_str()))
+        .collect();
+    tree.ids
+        .extend(roster.iter().map(|l| l.unit_run_id.clone()));
+    let mut gaps = Vec::new();
+    let mut landed = Vec::new();
+    // Only a roster unit or the run itself (a wholly placed run) can carry a
+    // landing record — never read one per step id: every stat counts at
+    // project/global scope (CP load-time rule), and an open far more.
+    let mut candidates: Vec<&str> = roster_hosts.keys().copied().collect();
+    candidates.sort_unstable();
+    candidates.insert(0, run_id);
+    candidates.dedup();
+    for id in candidates {
+        match caches.landing_of(&runs, id) {
+            Some(r) => {
+                landed.extend(r.ledgers.iter().cloned());
+                if r.status != LandingStatus::Complete {
+                    let what = if r.status == LandingStatus::Partial {
+                        "may be incomplete"
+                    } else {
+                        "was not collected"
+                    };
+                    gaps.push(IncompleteSource {
+                        host_id: r.host.clone(),
+                        reason: format!(
+                            "netflow from unit run {id} {what}: {}",
+                            r.reason.clone().unwrap_or_default()
+                        ),
+                    });
+                }
+            }
+            None => {
+                if let Some(host) = roster_hosts.get(id) {
+                    gaps.push(IncompleteSource {
+                        host_id: (*host).to_string(),
+                        reason: format!("netflow from unit run {id} was not collected yet"),
+                    });
+                }
+            }
+        }
+    }
+    tree.ids.extend(landed);
+    tree.ids.retain(|i| !i.is_empty());
+    tree.ids.sort();
+    tree.ids.dedup();
+    (tree, gaps)
+}
+
+/// True when a run's own landing record is complete — a wholly placed run
+/// whose ledgers are all local now and needs no live fetch.
+pub fn run_landed_complete(global_dir: &StdPath, run_id: &str) -> bool {
+    record_caches().run_landed_complete(&global_dir.join("runs"), run_id)
+}
+
+// ── Roster and landing-record parse cache ───────────────────────────────
+
+/// The per-run netflow records every scope's id walk ([`netflow_tree`])
+/// reads: a workflow run's roster of placed unit attempts
+/// (`netflow.units.jsonl`) and each candidate's landing record
+/// (`netflow.landing.json`). Project and global scope fold EVERY run in
+/// their stores through that walk on every request, so these are parsed
+/// once and re-validated by `stat` ([`FileCache`], the contract
+/// `RunStore::list` keeps for `run.json`): an unchanged file costs a stat,
+/// a missing one costs a stat and no entry, and a rewritten or appended
+/// one is re-read. Semantics match `rupu_netflow::land::{read_roster,
+/// read_landing_record}` exactly — a malformed roster line is skipped, a
+/// malformed record reads as `None` — and a malformed record is cached
+/// as absent so it, too, costs no open next time.
+pub(crate) struct RecordCaches {
+    roster: FileCache<Vec<RosterLine>>,
+    landing: FileCache<Option<Arc<LandingRecord>>>,
+}
+
+impl RecordCaches {
+    /// A cache that keeps parses of files unchanged for `settle` (tests;
+    /// production uses [`FileCache`]'s default window).
+    fn with_settle(settle: std::time::Duration) -> Self {
+        Self {
+            roster: FileCache::with_settle(settle),
+            landing: FileCache::with_settle(settle),
+        }
+    }
+
+    /// Every roster line of `workflow_run_id` (malformed lines skipped);
+    /// empty when the roster does not exist or cannot be read.
+    fn roster_of(&self, runs_root: &StdPath, workflow_run_id: &str) -> Arc<Vec<RosterLine>> {
+        let path = rupu_netflow::land::roster_path(runs_root, workflow_run_id);
+        self.roster
+            .read(&path, |bytes| {
+                Ok::<_, std::convert::Infallible>(parse_roster(bytes))
+            })
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    }
+
+    /// `run_id`'s landing record; `None` when absent, unreadable or
+    /// malformed.
+    fn landing_of(&self, runs_root: &StdPath, run_id: &str) -> Option<Arc<LandingRecord>> {
+        let path = rupu_netflow::land::landing_record_path(runs_root, run_id);
+        self.landing
+            .read(&path, |bytes| {
+                Ok::<_, std::convert::Infallible>(
+                    serde_json::from_slice::<LandingRecord>(bytes)
+                        .ok()
+                        .map(Arc::new),
+                )
+            })
+            .ok()
+            .flatten()
+            .and_then(|cached| (*cached).clone())
+    }
+
+    /// True when `run_id`'s own landing record is complete.
+    fn run_landed_complete(&self, runs_root: &StdPath, run_id: &str) -> bool {
+        self.landing_of(runs_root, run_id)
+            .is_some_and(|r| r.status == LandingStatus::Complete)
+    }
+}
+
+/// The process-wide [`RecordCaches`]: every netflow read path (CP
+/// endpoints, `rupu netflow show|prune`) walks the same run directories.
+fn record_caches() -> &'static RecordCaches {
+    static CACHES: OnceLock<RecordCaches> = OnceLock::new();
+    CACHES.get_or_init(|| RecordCaches::with_settle(rupu_runtime::file_cache::SETTLE))
+}
+
+/// `rupu_netflow::land::read_roster`'s parse over bytes already read: a
+/// non-UTF-8 file reads empty, a malformed line is skipped.
+fn parse_roster(bytes: &[u8]) -> Vec<RosterLine> {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<RosterLine>(l).ok())
+        .collect()
+}
+
 // ── Explorer attribution (run/workflow per ledger id) ───────────────────
 
 /// Ledger-file id → (root run id, workflow name) for every run this
@@ -828,16 +1018,22 @@ fn own_ids(store: &RunStore, run_id: &str) -> Vec<String> {
 pub(crate) struct RunMetaIndex {
     map: HashMap<String, (String, String)>,
     spans: Vec<RunSpan>,
-    /// Registered non-local hosts that in-scope runs actually EXECUTED on.
+    /// Registered non-local hosts that in-scope runs actually EXECUTED on
+    /// and whose netflow has NOT landed here whole.
     ///
-    /// A run placed on a remote host keeps its netflow ledger there. Run
-    /// scope reads that host directly (see `worker_host_flows`), but
-    /// project/global scope unions ledger DIRECTORIES on this machine and
-    /// has no per-run fetch — so those flows are simply absent. Recording
-    /// which hosts they belong to is what lets those scopes SAY so
+    /// A run placed on a remote host keeps its netflow ledger there until
+    /// its stream lands (spec 2026-10-14 §N2–N3). Run scope reads that host
+    /// directly meanwhile (see `worker_host_flows`), but project/global
+    /// scope unions ledger DIRECTORIES on this machine and has no per-run
+    /// fetch — so those flows are simply absent. Recording which hosts
+    /// they belong to is what lets those scopes SAY so
     /// (`scope_gap_from_workers`) instead of serving a short total that
-    /// looks complete.
+    /// looks complete. A run whose own landing record is `complete` is
+    /// read from its local copies and is not recorded here.
     remote_workers: std::collections::BTreeSet<String>,
+    /// What [`netflow_ids`] reported missing for every run folded in: a
+    /// placed unit whose stream was short, unavailable or never collected.
+    landing_gaps: Vec<IncompleteSource>,
     /// Root run ids already folded in — the same run RECORD can appear in
     /// both the global store and a project-local one, and pushing its
     /// span twice would double-count it in the active-runs strip.
@@ -850,6 +1046,17 @@ impl RunMetaIndex {
     /// from" rule) into the index. A run id already folded is skipped
     /// entirely (see `seen_runs`).
     fn insert_run(&mut self, global: &StdPath, store: &RunStore, record: &RunRecord) {
+        if self.seen_runs.contains(&record.id) {
+            return;
+        }
+        let ids = netflow_ids(store, global, &record.id);
+        self.insert_run_with(global, record, ids);
+    }
+
+    /// [`insert_run`](Self::insert_run) with the record's [`netflow_ids`]
+    /// already walked — run scope computes them once for its ledger read,
+    /// its gaps and its capture states, and folds the same walk in here.
+    fn insert_run_with(&mut self, global: &StdPath, record: &RunRecord, ids: NetflowIds) {
         if !self.seen_runs.insert(record.id.clone()) {
             return;
         }
@@ -857,10 +1064,13 @@ impl RunMetaIndex {
             .worker_id
             .as_deref()
             .filter(|w| !w.is_empty() && *w != "local")
+            .filter(|_| !run_landed_complete(global, &record.id))
         {
             self.remote_workers.insert(worker.to_string());
         }
-        for id in run_and_unit_ids(global, store, &record.id) {
+        let NetflowIds { ids, gaps } = ids;
+        self.landing_gaps.extend(gaps);
+        for id in ids {
             self.map
                 .entry(id)
                 .or_insert_with(|| (record.id.clone(), record.workflow_name.clone()));
@@ -1021,11 +1231,16 @@ fn global_run_meta(global_dir: &StdPath, global_store: &RunStore) -> RunMetaInde
 
 /// One run directory's cheap change stamp: its name plus the mtimes of
 /// its `run.json` (rewritten on every status/span change — `write_atomic`
-/// replaces the file, so the mtime always moves) and `step_results.jsonl`
-/// (appended per completed step). `None` when the file doesn't exist —
+/// replaces the file, so the mtime always moves), `step_results.jsonl`
+/// (appended per completed step), `netflow.units.jsonl` (appended per
+/// placed unit attempt) and `netflow.landing.json` (replaced when a
+/// remote unit's netflow lands — spec 2026-10-14 §N4 requires a new
+/// landing to invalidate the memo). `None` when the file doesn't exist —
 /// distinct from "not statted".
 type RunDirStamp = (
     std::ffi::OsString,
+    Option<std::time::SystemTime>,
+    Option<std::time::SystemTime>,
     Option<std::time::SystemTime>,
     Option<std::time::SystemTime>,
 );
@@ -1036,7 +1251,7 @@ type RunDirStamp = (
 /// order-independent of `read_dir`/`HashSet` iteration.
 type GlobalStoreFingerprint = Vec<(PathBuf, Vec<RunDirStamp>)>;
 
-/// Stamp one store root: one `read_dir` plus two `stat`s per run
+/// Stamp one store root: one `read_dir` plus four `stat`s per run
 /// directory — no file is opened, read, or parsed, which is the entire
 /// point (compare [`project_run_meta`]'s cost accounting for what
 /// the full walk does per run). A missing root stamps as an empty list,
@@ -1056,6 +1271,8 @@ fn store_fingerprint(root: &StdPath) -> Vec<RunDirStamp> {
             entry.file_name(),
             mtime(dir.join("run.json")),
             mtime(dir.join("step_results.jsonl")),
+            mtime(dir.join(rupu_netflow::land::ROSTER_FILE)),
+            mtime(dir.join(rupu_netflow::land::LANDING_FILE)),
         ));
     }
     stamps.sort();
@@ -1317,12 +1534,40 @@ pub fn run_scoped_flows_and_dropped_with(
     extra_ledger_flows: Vec<FlowRecord>,
     extra_dropped: u64,
 ) -> (Vec<FlowRecord>, u64) {
+    let (tree, _) = netflow_tree(global_dir, store, run_id);
+    run_scoped_flows_from_tree(
+        reader,
+        store,
+        run_id,
+        workspace,
+        global_dir,
+        range,
+        extra_ledger_flows,
+        extra_dropped,
+        tree,
+    )
+}
+
+/// [`run_scoped_flows_and_dropped_with`] over an id walk the caller
+/// already did — run scope needs the same [`netflow_tree`] for its gaps
+/// and capture states, and walks it once (`collect_run_netflow`).
+#[allow(clippy::too_many_arguments)]
+fn run_scoped_flows_from_tree(
+    reader: &dyn LedgerReader,
+    store: &RunStore,
+    run_id: &str,
+    workspace: &StdPath,
+    global_dir: &StdPath,
+    range: &rupu_netflow::ledger::TimeRange,
+    extra_ledger_flows: Vec<FlowRecord>,
+    extra_dropped: u64,
+    tree: RunTree,
+) -> (Vec<FlowRecord>, u64) {
     let mut all: Vec<FlowRecord> = extra_ledger_flows
         .into_iter()
         .filter(|f| range.contains(f.ts))
         .collect();
     let mut dropped = extra_dropped;
-    let tree = run_tree(global_dir, store, run_id);
     for id in &tree.ids {
         for ledger_path in resolve_ledger_paths(workspace, global_dir, id) {
             let (f, d) = reader.flows_in_range(&ledger_path, range);
@@ -1365,7 +1610,11 @@ fn collect_run_netflow(
     remote: (Vec<FlowRecord>, u64, Vec<IncompleteSource>),
 ) -> NetflowResponse {
     let (remote_flows, remote_dropped, incomplete) = remote;
-    let (merged, dropped) = run_scoped_flows_and_dropped_with(
+    // One id walk for the whole response: the ledger read, the run's
+    // attribution, its landing gaps and its capture states all use it.
+    let (tree, gaps) = netflow_tree(global_dir, store, run_id);
+    let ids = tree.ids.clone();
+    let (merged, dropped) = run_scoped_flows_from_tree(
         reader,
         store,
         run_id,
@@ -1374,14 +1623,22 @@ fn collect_run_netflow(
         range,
         remote_flows,
         remote_dropped,
+        tree,
     );
     // Every flow at run scope folds into THIS run (the whole point of
-    // `run_and_unit_ids`), so attribution is the run's own record; a
+    // `netflow_ids`), so attribution is the run's own record; a
     // record that fails to load leaves run/workflow unattributed rather
     // than failing the read (the ledger may still be perfectly readable).
     let mut meta = RunMetaIndex::default();
     if let Ok(record) = store.load(run_id) {
-        meta.insert_run(global_dir, store, &record);
+        meta.insert_run_with(
+            global_dir,
+            &record,
+            NetflowIds {
+                ids: ids.clone(),
+                gaps: gaps.clone(),
+            },
+        );
     }
     let table = load_asn_table(cache);
     let tagged: Vec<(String, FlowRecord)> = merged
@@ -1390,11 +1647,14 @@ fn collect_run_netflow(
         .collect();
     let mut resp =
         build_filtered_response(tagged, &meta, dropped, table.as_deref(), range, filters);
+    // The remote host's own refusal first, then every placed unit whose
+    // netflow did not land here whole (spec 2026-10-14 §N4).
     resp.incomplete = incomplete;
+    resp.incomplete.extend(gaps);
     // One entry list per ledger file: `summarize_capture` applies
     // latest-wins within a ledger but lets any ledger's `unavailable` win.
     let mut ledgers = Vec::new();
-    for id in run_and_unit_ids(global_dir, store, run_id) {
+    for id in ids {
         for ledger_path in resolve_ledger_paths(workspace, global_dir, &id) {
             ledgers.push(reader.capture_states(&ledger_path));
         }
@@ -1417,8 +1677,11 @@ struct AgentiflowNetflowScope {
     /// key in `meta`.
     tag: String,
     /// Every ledger id to union: the flow's own and each run in its launch
-    /// tree, each expanded through [`run_and_unit_ids`].
+    /// tree, each expanded through [`netflow_ids`].
     ids: Vec<String>,
+    /// What [`netflow_ids`] reported missing across those runs: a placed
+    /// unit whose netflow was short, unavailable or never collected.
+    gaps: Vec<IncompleteSource>,
     transcripts: Vec<PathBuf>,
     /// Where the flow ran, for [`resolve_ledger_paths`].
     workspace: PathBuf,
@@ -1436,10 +1699,12 @@ fn agentiflow_netflow_scope(s: &AppState, id: &str) -> Option<AgentiflowNetflowS
     let runs = crate::api::agentiflows::flow_runs(s, &run_dir);
     let mut transcripts = runs.transcripts;
     let mut ids = Vec::new();
+    let mut gaps = Vec::new();
     for run_id in std::iter::once(id).chain(runs.run_ids.iter().map(String::as_str)) {
-        let tree = run_tree(&s.global_dir, &s.run_store, run_id);
+        let (tree, tree_gaps) = netflow_tree(&s.global_dir, &s.run_store, run_id);
         ids.extend(tree.ids);
         transcripts.extend(tree.child_transcripts);
+        gaps.extend(tree_gaps);
     }
     ids.sort();
     ids.dedup();
@@ -1456,6 +1721,7 @@ fn agentiflow_netflow_scope(s: &AppState, id: &str) -> Option<AgentiflowNetflowS
     Some(AgentiflowNetflowScope {
         tag: id.to_string(),
         ids,
+        gaps,
         transcripts,
         workspace: crate::api::agentiflows::flow_workspace(s, &run_dir)
             .map_or_else(|| s.workspace_dir.clone(), |w| PathBuf::from(w.path)),
@@ -1508,6 +1774,7 @@ fn collect_agentiflow_netflow(
         range,
         filters,
     );
+    resp.incomplete = scope.gaps.clone();
     let ledgers: Vec<_> = scope
         .ids
         .iter()
@@ -1533,14 +1800,16 @@ fn build_agentiflow_explorer(
     let (tagged, dropped) = agentiflow_flows_and_dropped(reader, scope, global_dir, &unbounded);
     let table = load_asn_table(cache);
     let flows = to_explorer_flows(tagged, &scope.meta, table.as_deref());
-    build_explorer_response(
+    let mut resp = build_explorer_response(
         &flows,
         dropped,
         &scope.meta.spans,
         table.is_some(),
         range,
         filters,
-    )
+    );
+    resp.incomplete = scope.gaps.clone();
+    resp
 }
 
 /// A registered workspace store, rooted at `<global_dir>/workspaces/` —
@@ -1844,11 +2113,19 @@ fn canonicalize_or_self(path: &StdPath) -> PathBuf {
 /// hosts is the difference between an understated total and a knowingly
 /// understated one.
 ///
+/// A run whose netflow stream LANDED here whole is no gap: its ledgers
+/// are local copies now and the directory union reads them. What stays
+/// declared is a wholly placed run without a complete landing (the worker
+/// gaps) and every placed unit whose landing record says short,
+/// unavailable or not collected yet (`RunMetaIndex::landing_gaps`, from
+/// [`netflow_ids`]), deduplicated by host and reason.
+///
 /// Empty when no in-scope run executed remotely — the common single-machine
 /// case declares nothing, so this never becomes a banner people learn to
 /// ignore.
 fn scope_gap_from_workers(meta: &RunMetaIndex) -> Vec<IncompleteSource> {
-    meta.remote_workers
+    let mut out: Vec<IncompleteSource> = meta
+        .remote_workers
         .iter()
         .map(|host_id| IncompleteSource {
             host_id: host_id.clone(),
@@ -1857,7 +2134,17 @@ fn scope_gap_from_workers(meta: &RunMetaIndex) -> Vec<IncompleteSource> {
                      Open one of those runs to see its own flows."
                 .to_string(),
         })
-        .collect()
+        .collect();
+    let mut seen: std::collections::HashSet<(String, String)> = out
+        .iter()
+        .map(|g| (g.host_id.clone(), g.reason.clone()))
+        .collect();
+    for gap in &meta.landing_gaps {
+        if seen.insert((gap.host_id.clone(), gap.reason.clone())) {
+            out.push(gap.clone());
+        }
+    }
+    out
 }
 
 /// `GET /api/projects/:id/netflow` — every flow attributable to a
@@ -2463,8 +2750,9 @@ async fn explorer_run_scope(
                 .load(run_id)
                 .map_err(|e| run_not_found_or_internal(run_id, e))?;
             // See `get_run_netflow`'s `Global` branch: a placed run's ledger
-            // lives on the host that executed it.
-            let (remote_flows, remote_dropped, incomplete) = worker_host_flows(s, &run).await;
+            // lives on the host that executed it until its stream lands here.
+            let (remote_flows, remote_dropped, incomplete) =
+                remote_flows_unless_landed(s, &run).await?;
             let store = Arc::clone(&s.run_store);
             let rid = run_id.to_string();
             let workspace = run.workspace_path.clone();
@@ -2506,7 +2794,7 @@ async fn explorer_run_scope(
         RunLocation::ProjectLocal { path } => {
             let (remote_flows, remote_dropped, incomplete) =
                 match RunStore::new(path.join(".rupu").join("runs")).load(run_id) {
-                    Ok(run) => worker_host_flows(s, &run).await,
+                    Ok(run) => remote_flows_unless_landed(s, &run).await?,
                     Err(_) => (Vec::new(), 0, Vec::new()),
                 };
             let rid = run_id.to_string();
@@ -2700,6 +2988,33 @@ async fn worker_host_flows(
             incomplete(e.to_string())
         }
     }
+}
+
+/// [`worker_host_flows`] unless the run's netflow stream has already landed
+/// here whole (spec 2026-10-14 §N4): a wholly placed run with a `complete`
+/// landing record is read entirely from its local copies, so the host is
+/// not asked. A run still in progress, or one whose landing is missing,
+/// partial or unavailable, keeps today's live fetch (and its honest
+/// `incomplete` when the host cannot answer).
+///
+/// The record check is a file read, so it runs on the blocking pool like
+/// every other disk read in this module.
+async fn remote_flows_unless_landed(
+    s: &AppState,
+    run: &rupu_orchestrator::runs::RunRecord,
+) -> ApiResult<(Vec<FlowRecord>, u64, Vec<IncompleteSource>)> {
+    let placed = run
+        .worker_id
+        .as_deref()
+        .is_some_and(|h| !h.is_empty() && h != "local");
+    if placed {
+        let global_dir = s.global_dir.clone();
+        let rid = run.id.clone();
+        if run_blocking(move || run_landed_complete(&global_dir, &rid)).await? {
+            return Ok((Vec::new(), 0, Vec::new()));
+        }
+    }
+    Ok(worker_host_flows(s, run).await)
 }
 
 /// The attribution index for a host-sourced run.
@@ -3046,10 +3361,11 @@ async fn get_run_netflow(
                 .run_store
                 .load(&run_id)
                 .map_err(|e| run_not_found_or_internal(&run_id, e))?;
-            // A run placed on a remote host keeps its ledger THERE; only
-            // its transcript is mirrored back. Read the owning host too, or
-            // this returns an empty set that reads as "no network calls".
-            let remote = worker_host_flows(&s, &run).await;
+            // A run placed on a remote host keeps its ledger THERE until its
+            // stream lands here; only its transcript is mirrored back
+            // meanwhile. Read the owning host too, or this returns an empty
+            // set that reads as "no network calls".
+            let remote = remote_flows_unless_landed(&s, &run).await?;
             let store = Arc::clone(&s.run_store);
             let rid = run_id.clone();
             let workspace = run.workspace_path.clone();
@@ -3076,7 +3392,7 @@ async fn get_run_netflow(
             // Same rule as the `Global` branch: a project-local record can
             // still name a remote worker.
             let remote = match RunStore::new(path.join(".rupu").join("runs")).load(&run_id) {
-                Ok(run) => worker_host_flows(&s, &run).await,
+                Ok(run) => remote_flows_unless_landed(&s, &run).await?,
                 Err(_) => (Vec::new(), 0, Vec::new()),
             };
             let rid = run_id.clone();
@@ -4302,6 +4618,599 @@ mod tests {
             "a known-unknown id must be served from cache, not rebuilt every request"
         );
         assert_eq!(first.attribution("orphan-run"), (None, None));
+    }
+
+    // ── Landed remote netflow (spec 2026-10-14 §N4) ─────────────────────────
+    //
+    // A placed unit's netflow stream lands on the coordinator as ordinary
+    // ledgers under `<global>/netflow/`, plus a landing record under the
+    // unit's run directory; the workflow run keeps a roster of every placed
+    // unit attempt. The read side's id walk (`netflow_ids`) folds both in,
+    // and anything short or missing becomes an `IncompleteSource`.
+
+    use rupu_netflow::land::{append_roster_line, land_and_record, RosterLine};
+
+    /// A host-side stream: a `begin` line for `run_id`, then one `line`
+    /// per (ledger id, flow), exactly as the host's writer tees them.
+    fn stream_for(run_id: &str, lines: &[(&str, &FlowRecord)]) -> Vec<u8> {
+        let mut text = format!("{{\"kind\":\"begin\",\"v\":1,\"run_id\":\"{run_id}\"}}\n");
+        for (ledger, f) in lines {
+            let line = serde_json::json!({
+                "kind": "line",
+                "ledger": ledger,
+                "line": rupu_netflow::record::LedgerLine::Flow(Box::new((*f).clone())),
+            });
+            text.push_str(&line.to_string());
+            text.push('\n');
+        }
+        text.into_bytes()
+    }
+
+    /// Land `run_id`'s stream from `host` under `<global>/runs`, the way
+    /// every transport's lander does.
+    fn land(
+        global: &std::path::Path,
+        run_id: &str,
+        host: &str,
+        lines: &[(&str, &FlowRecord)],
+        complete: bool,
+        reason: Option<&str>,
+    ) -> rupu_netflow::land::LandingRecord {
+        land_and_record(
+            &global.join("runs"),
+            run_id,
+            host,
+            Some(&stream_for(run_id, lines)),
+            complete,
+            reason.map(str::to_string),
+        )
+        .unwrap()
+    }
+
+    fn roster(store: &RunStore, run_id: &str, unit: &str, host: &str) {
+        append_roster_line(
+            &store.root,
+            run_id,
+            &RosterLine {
+                unit_run_id: unit.into(),
+                host: host.into(),
+                step_id: "s1".into(),
+                index: Some(0),
+            },
+        )
+        .unwrap();
+    }
+
+    /// The shared fixture: workflow run `run_wf` (executed here) whose
+    /// `for_each` step placed three unit attempts — `run_u0` on `host_a`
+    /// (a failed first attempt, landed partial), `run_u1` on `host_a` (the
+    /// final attempt the item record keeps, landed complete with a
+    /// sub-agent ledger `sub_k` carrying `landed_flow`) and `run_u2` on
+    /// `host_b` (never landed). Returns the global store.
+    fn landed_fixture(
+        global: &std::path::Path,
+        workspace: &std::path::Path,
+        landed_flow: &FlowRecord,
+    ) -> RunStore {
+        let store = RunStore::new(global.join("runs"));
+        store
+            .create(seed_record("run_wf", "wf", workspace), "x: 1\n")
+            .unwrap();
+        store
+            .append_step_result(
+                "run_wf",
+                &rupu_orchestrator::runs::StepResultRecord {
+                    run_outcome: None,
+                    step_id: "s1".into(),
+                    run_id: String::new(),
+                    transcript_path: workspace.join("s1.jsonl"),
+                    output: String::new(),
+                    success: true,
+                    skipped: false,
+                    rendered_prompt: String::new(),
+                    kind: rupu_orchestrator::runs::StepKind::ForEach,
+                    items: vec![rupu_orchestrator::runs::ItemResultRecord {
+                        index: 0,
+                        item: serde_json::json!("target-a"),
+                        sub_id: "s1[0]".into(),
+                        rendered_prompt: String::new(),
+                        run_id: "run_u1".into(),
+                        transcript_path: workspace.join("u1.jsonl"),
+                        output: String::new(),
+                        success: true,
+                        is_fixer: false,
+                        codename: None,
+                        error: None,
+                        cause: None,
+                    }],
+                    findings: vec![],
+                    iterations: 0,
+                    resolved: true,
+                    finished_at: chrono::Utc::now(),
+                    loop_iteration: None,
+                    host: None,
+                    codename: None,
+                    cause: None,
+                    error: None,
+                },
+            )
+            .unwrap();
+        roster(&store, "run_wf", "run_u0", "host_a");
+        roster(&store, "run_wf", "run_u1", "host_a");
+        roster(&store, "run_wf", "run_u2", "host_b");
+
+        let own = flow(FlowId::from(11u128), None, "api.anthropic.com");
+        let rec = land(
+            global,
+            "run_u1",
+            "host_a",
+            &[("run_u1", &own), ("sub_k", landed_flow)],
+            true,
+            None,
+        );
+        assert_eq!(rec.status, rupu_netflow::land::LandingStatus::Complete);
+        let first_attempt = flow(FlowId::from(12u128), None, "api.anthropic.com");
+        let rec = land(
+            global,
+            "run_u0",
+            "host_a",
+            &[("run_u0", &first_attempt)],
+            false,
+            Some("snapshot"),
+        );
+        assert_eq!(rec.status, rupu_netflow::land::LandingStatus::Partial);
+        store
+    }
+
+    fn gap_for<'a>(gaps: &'a [IncompleteSource], host: &str) -> &'a IncompleteSource {
+        gaps.iter()
+            .find(|g| g.host_id == host)
+            .unwrap_or_else(|| panic!("no gap names host {host}: {gaps:?}"))
+    }
+
+    #[test]
+    fn landed_unit_ledgers_join_the_run_and_its_gaps_are_listed() {
+        let global = tempfile::TempDir::new().unwrap();
+        let landed = flow(FlowId::from(21u128), None, "api.landed.example");
+        let store = landed_fixture(global.path(), global.path(), &landed);
+
+        let NetflowIds { ids, gaps } = netflow_ids(&store, global.path(), "run_wf");
+
+        for expected in ["run_wf", "run_u1", "sub_k", "run_u0", "run_u2"] {
+            assert!(
+                ids.contains(&expected.to_string()),
+                "{expected} must be among the run's ledger ids: {ids:?}"
+            );
+        }
+        assert_eq!(
+            gaps.len(),
+            2,
+            "one gap per unit that did not land whole: {gaps:?}"
+        );
+        let partial = gap_for(&gaps, "host_a");
+        assert!(
+            partial.reason.contains("run_u0") && partial.reason.contains("snapshot"),
+            "the partial landing names its unit and carries its reason: {}",
+            partial.reason
+        );
+        let pending = gap_for(&gaps, "host_b");
+        assert!(
+            pending.reason.contains("run_u2") && pending.reason.contains("not collected yet"),
+            "a roster unit with no record is pending, not silently whole: {}",
+            pending.reason
+        );
+    }
+
+    #[test]
+    fn a_wholly_placed_run_with_a_complete_landing_needs_no_live_fetch() {
+        let global = tempfile::TempDir::new().unwrap();
+        let store = RunStore::new(global.path().join("runs"));
+        let run = placed_run("run_p", "host_ssh", global.path());
+        store.create(run.clone(), "x: 1\n").unwrap();
+        let own = flow(FlowId::from(31u128), None, "api.anthropic.com");
+        let step = flow(FlowId::from(32u128), None, "api.github.com");
+        land(
+            global.path(),
+            "run_p",
+            "host_ssh",
+            &[("run_p", &own), ("run_step", &step)],
+            true,
+            None,
+        );
+
+        assert!(run_landed_complete(global.path(), "run_p"));
+
+        let mut meta = RunMetaIndex::default();
+        meta.insert_run(global.path(), &store, &run);
+        assert!(
+            meta.remote_workers.is_empty(),
+            "a run whose ledgers landed whole is no longer a scope gap"
+        );
+        assert_eq!(
+            meta.attribution("run_step"),
+            (Some("run_p".into()), Some("wf".into())),
+            "the landed step ledger is attributed to the placed run"
+        );
+        assert!(scope_gap_from_workers(&meta).is_empty());
+    }
+
+    /// The mirror case for the test above: a placed run whose landing is
+    /// NOT complete (here: none at all) still names its host at project
+    /// and global scope, exactly as before landing existed.
+    #[test]
+    fn a_wholly_placed_run_without_a_landing_is_still_a_scope_gap() {
+        let global = tempfile::TempDir::new().unwrap();
+        let store = RunStore::new(global.path().join("runs"));
+        let run = placed_run("run_p", "host_ssh", global.path());
+        store.create(run.clone(), "x: 1\n").unwrap();
+
+        assert!(!run_landed_complete(global.path(), "run_p"));
+        let mut meta = RunMetaIndex::default();
+        meta.insert_run(global.path(), &store, &run);
+        let gaps = scope_gap_from_workers(&meta);
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].host_id, "host_ssh");
+    }
+
+    #[tokio::test]
+    async fn run_scope_reads_landed_ledgers_and_reports_gaps() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // `run_wf` executed here, so `worker_host_flows` never asks a host;
+        // an unconfigured stub answers `Unsupported` if anything did.
+        let conn: Arc<dyn crate::host::connector::HostConnector> =
+            Arc::new(crate::host::connector::testing::StubConnector {
+                run_netflow: None,
+                ..Default::default()
+            });
+        let s = state_with_host(&tmp, "host_b", conn);
+        // Keep the handler's background ASN refresh off the network.
+        s.config.write().unwrap().netflow.asn_auto_refresh = false;
+        let landed = flow(FlowId::from(41u128), None, "api.landed.example");
+        let _store = landed_fixture(tmp.path(), tmp.path(), &landed);
+
+        let Json(resp) = get_run_netflow(
+            State(s),
+            Path("run_wf".into()),
+            Query(serde_json::from_value(serde_json::json!({})).unwrap()),
+        )
+        .await
+        .expect("the run's netflow reads");
+
+        assert!(
+            resp.flows.iter().any(|v| v.flow.id == landed.id),
+            "the sub-agent ledger a remote unit landed is read at run scope: {:?}",
+            resp.flows.iter().map(|v| &v.flow.host).collect::<Vec<_>>()
+        );
+        let pending = gap_for(&resp.incomplete, "host_b");
+        assert!(
+            pending.reason.contains("not collected yet"),
+            "{}",
+            pending.reason
+        );
+        assert!(
+            gap_for(&resp.incomplete, "host_a")
+                .reason
+                .contains("snapshot"),
+            "the partial landing is listed too: {:?}",
+            resp.incomplete
+        );
+    }
+
+    #[test]
+    fn project_and_global_scope_attribute_landed_ledgers_and_list_gaps() {
+        let global = tempfile::TempDir::new().unwrap();
+        let workspace = global.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let landed = flow(FlowId::from(51u128), None, "api.landed.example");
+        let store = landed_fixture(global.path(), &workspace, &landed);
+
+        for (scope, meta) in [
+            (
+                "project",
+                project_run_meta(global.path(), &store, &workspace),
+            ),
+            ("global", global_run_meta(global.path(), &store)),
+        ] {
+            assert_eq!(
+                meta.attribution("sub_k"),
+                (Some("run_wf".into()), Some("wf".into())),
+                "{scope} scope attributes the landed sub-agent ledger to its run"
+            );
+            assert_eq!(
+                meta.attribution("run_u0"),
+                (Some("run_wf".into()), Some("wf".into())),
+                "{scope} scope attributes the failed first attempt's ledger too"
+            );
+            let gaps = scope_gap_from_workers(&meta);
+            assert!(
+                gap_for(&gaps, "host_b")
+                    .reason
+                    .contains("not collected yet"),
+                "{scope} scope lists the pending unit: {gaps:?}"
+            );
+            assert!(
+                gap_for(&gaps, "host_a").reason.contains("snapshot"),
+                "{scope} scope lists the partial landing: {gaps:?}"
+            );
+            assert_eq!(
+                gaps.len(),
+                2,
+                "{scope}: no worker gap for a run executed here"
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_landing_invalidates_the_run_meta_cache() {
+        let global = tempfile::TempDir::new().unwrap();
+        let store = RunStore::new(global.path().join("runs"));
+        store
+            .create(seed_record("run-a", "review-wf", global.path()), "x: 1\n")
+            .unwrap();
+
+        let cache = RunMetaCache::default();
+        let before = global_store_fingerprint(global.path(), &store);
+        let first = global_run_meta_cached(&cache, global.path(), &store, &ids(&["run-a"]));
+        assert_eq!(first.attribution("sub_z"), (None, None), "sanity");
+
+        // A placed unit of run-a lands after the cache warmed: a roster
+        // line and a landing record, no change to run.json or
+        // step_results.jsonl.
+        roster(&store, "run-a", "run_u9", "host_a");
+        let own = flow(FlowId::from(61u128), None, "api.anthropic.com");
+        let sub = flow(FlowId::from(62u128), None, "api.github.com");
+        land(
+            global.path(),
+            "run_u9",
+            "host_a",
+            &[("run_u9", &own), ("sub_z", &sub)],
+            true,
+            None,
+        );
+
+        let after = global_store_fingerprint(global.path(), &store);
+        assert_ne!(
+            before, after,
+            "a roster line or a landing must move the fingerprint"
+        );
+        let second = global_run_meta_cached(&cache, global.path(), &store, &ids(&["run-a"]));
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "a new landing must rebuild the index even though every requested id was accounted for"
+        );
+        assert_eq!(
+            second.attribution("sub_z"),
+            (Some("run-a".into()), Some("review-wf".into())),
+            "the rebuilt index attributes the landed sub-agent ledger"
+        );
+    }
+
+    #[test]
+    fn agentiflow_scope_lists_landing_gaps() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = crate::state::AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        )
+        .with_workspace_dir(tmp.path().to_path_buf());
+        let landed = flow(FlowId::from(71u128), None, "api.landed.example");
+        let _store = landed_fixture(tmp.path(), tmp.path(), &landed);
+
+        // An agentiflow whose (legacy) unit is the workflow run `run_wf`.
+        let af_id = "af_01TESTNETFLOWGAPS";
+        let run_dir = rupu_agentiflow::agentiflow_dir(tmp.path()).join(af_id);
+        rupu_agentiflow::AgentiflowRecord {
+            id: af_id.into(),
+            name: "flow".into(),
+            engagement_profiles: vec!["code".into()],
+            trigger: rupu_runtime::RunTriggerSource::Agentiflow,
+            status: "completed".into(),
+            stop_reason: Some("goals_met".into()),
+            rounds: 1,
+            goals: vec![],
+            started_at: chrono::DateTime::from_timestamp(50, 0).unwrap(),
+            ended_at: Some(chrono::DateTime::from_timestamp(2_000, 0).unwrap()),
+            codename: None,
+            spent_usd: None,
+            spent_tokens: 0,
+            runner_pid: None,
+        }
+        .write(&run_dir)
+        .unwrap();
+        let unit = run_dir.join("units").join("run_wf");
+        std::fs::create_dir_all(&unit).unwrap();
+        std::fs::write(
+            unit.join("unit.json"),
+            r#"{"run_id":"run_wf","agent":"web-assess","kind":"workflow",
+               "participant":"web-assess#1","started_at":"2026-10-06T00:00:00+00:00",
+               "status":{"state":"done","success":true,"output":"ok"}}"#,
+        )
+        .unwrap();
+
+        let scope = agentiflow_netflow_scope(&s, af_id).expect("the agentiflow resolves");
+        assert!(
+            scope.ids.contains(&"sub_k".to_string()),
+            "the flow's ids include what its workflow unit landed: {:?}",
+            scope.ids
+        );
+        let resp = collect_agentiflow_netflow(
+            &DirectReader,
+            &scope,
+            tmp.path(),
+            &s.asn_cache,
+            &rupu_netflow::ledger::TimeRange::unbounded(),
+            &parse_filters(&None, &None, &None, &None),
+        );
+        assert!(
+            resp.flows.iter().any(|v| v.flow.id == landed.id),
+            "the landed ledger is read at agentiflow scope"
+        );
+        assert!(
+            gap_for(&resp.incomplete, "host_b")
+                .reason
+                .contains("not collected yet"),
+            "{:?}",
+            resp.incomplete
+        );
+        let explorer = build_agentiflow_explorer(
+            &DirectReader,
+            &scope,
+            tmp.path(),
+            &s.asn_cache,
+            &rupu_netflow::ledger::TimeRange::unbounded(),
+            &parse_filters(&None, &None, &None, &None),
+        );
+        assert_eq!(explorer.incomplete, resp.incomplete);
+    }
+
+    // ── Roster and landing reads go through the parse cache ────────────────
+    //
+    // Project and global scope fold every run through `netflow_tree`, which
+    // reads the run's roster and each candidate's landing record. Those
+    // reads must cost a `stat` per request once the file is unchanged, not
+    // an `open` (CP load-time rule) — the same `FileCache` contract
+    // `RunStore::list` keeps for `run.json`.
+
+    #[test]
+    fn an_unchanged_roster_and_landing_are_served_from_the_cache() {
+        let global = tempfile::TempDir::new().unwrap();
+        let landed = flow(FlowId::from(81u128), None, "api.landed.example");
+        let store = landed_fixture(global.path(), global.path(), &landed);
+        let caches = RecordCaches::with_settle(std::time::Duration::ZERO);
+
+        let (first_tree, first_gaps) = netflow_tree_in(&caches, global.path(), &store, "run_wf");
+        assert_eq!(
+            caches.roster.len(),
+            1,
+            "run_wf's roster is cached after the first walk"
+        );
+        assert_eq!(
+            caches.landing.len(),
+            2,
+            "run_u0's and run_u1's landing records are cached; run_wf's and run_u2's \
+             missing ones cost a stat each and are not entries"
+        );
+
+        let roster_before = caches.roster_of(&store.root, "run_wf");
+        let landing_before = caches
+            .landing_of(&global.path().join("runs"), "run_u1")
+            .expect("run_u1 landed");
+        let (second_tree, second_gaps) = netflow_tree_in(&caches, global.path(), &store, "run_wf");
+        assert_eq!(first_tree.ids, second_tree.ids);
+        assert_eq!(first_gaps, second_gaps);
+        assert!(
+            Arc::ptr_eq(&roster_before, &caches.roster_of(&store.root, "run_wf")),
+            "an unchanged roster is the cached parse, not a re-read"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &landing_before,
+                &caches
+                    .landing_of(&global.path().join("runs"), "run_u1")
+                    .expect("run_u1 still landed")
+            ),
+            "an unchanged landing record is the cached parse, not a re-read"
+        );
+        assert_eq!(caches.roster.len(), 1);
+        assert_eq!(caches.landing.len(), 2);
+    }
+
+    #[test]
+    fn a_changed_roster_or_landing_is_picked_up_by_the_next_walk() {
+        let global = tempfile::TempDir::new().unwrap();
+        let landed = flow(FlowId::from(82u128), None, "api.landed.example");
+        let store = landed_fixture(global.path(), global.path(), &landed);
+        let caches = RecordCaches::with_settle(std::time::Duration::ZERO);
+        let runs = global.path().join("runs");
+
+        let (_, gaps) = netflow_tree_in(&caches, global.path(), &store, "run_wf");
+        assert_eq!(gaps.len(), 2, "sanity: run_u0 partial, run_u2 pending");
+
+        // run_u2's stream lands complete: the record appears where a stat
+        // found nothing before.
+        let u2 = flow(FlowId::from(83u128), None, "api.u2.example");
+        land(
+            global.path(),
+            "run_u2",
+            "host_b",
+            &[("run_u2", &u2)],
+            true,
+            None,
+        );
+        // run_u0's partial copy is replaced by a complete one (the next
+        // terminal pull after a host-side resume): same path, new bytes.
+        land(
+            global.path(),
+            "run_u0",
+            "host_a",
+            &[("run_u0", &u2)],
+            true,
+            None,
+        );
+        // A fourth attempt joins the roster after the first walk.
+        roster(&store, "run_wf", "run_u3", "host_c");
+
+        let (tree, gaps) = netflow_tree_in(&caches, global.path(), &store, "run_wf");
+        assert!(
+            tree.ids.contains(&"run_u3".to_string()),
+            "the appended roster line is read: {:?}",
+            tree.ids
+        );
+        assert_eq!(
+            gaps.len(),
+            1,
+            "run_u0 and run_u2 landed complete; only run_u3 is pending: {gaps:?}"
+        );
+        assert!(gaps[0].reason.contains("run_u3"));
+        assert!(caches.run_landed_complete(&runs, "run_u0"));
+        assert!(caches.run_landed_complete(&runs, "run_u2"));
+        assert!(!caches.run_landed_complete(&runs, "run_u3"));
+    }
+
+    #[test]
+    fn a_malformed_landing_or_roster_reads_as_absent_and_is_cached_that_way() {
+        let global = tempfile::TempDir::new().unwrap();
+        let store = RunStore::new(global.path().join("runs"));
+        store
+            .create(seed_record("run_wf", "wf", global.path()), "x: 1\n")
+            .unwrap();
+        roster(&store, "run_wf", "run_u1", "host_a");
+        // A good line, then garbage: the roster keeps the good one
+        // (`read_roster` semantics).
+        let roster_path = rupu_netflow::land::roster_path(&store.root, "run_wf");
+        let mut bytes = std::fs::read(&roster_path).unwrap();
+        bytes.extend_from_slice(b"not json\n");
+        std::fs::write(&roster_path, &bytes).unwrap();
+        let landing_path = rupu_netflow::land::landing_record_path(&store.root, "run_u1");
+        std::fs::create_dir_all(landing_path.parent().unwrap()).unwrap();
+        std::fs::write(&landing_path, b"{\"v\":1,\"status\":\"nope\"").unwrap();
+
+        let caches = RecordCaches::with_settle(std::time::Duration::ZERO);
+        let (tree, gaps) = netflow_tree_in(&caches, global.path(), &store, "run_wf");
+        assert!(tree.ids.contains(&"run_u1".to_string()));
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!(
+            gaps[0].reason.contains("not collected yet"),
+            "a malformed record reads as no record: {}",
+            gaps[0].reason
+        );
+        assert!(!caches.run_landed_complete(&store.root, "run_u1"));
+        assert_eq!(
+            caches.landing.len(),
+            1,
+            "the malformed record is cached as absent, so it costs no open next time"
+        );
+        assert_eq!(caches.roster.len(), 1);
+        let before = caches.landing_of(&store.root, "run_u1");
+        assert!(before.is_none());
+        let bytes = std::fs::read(&roster_path).unwrap();
+        let parsed = parse_roster(&bytes);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].unit_run_id, "run_u1");
+        assert!(
+            parse_roster(&[0xff, 0xfe]).is_empty(),
+            "a non-UTF-8 roster reads empty, as `read_roster` does"
+        );
     }
 }
 

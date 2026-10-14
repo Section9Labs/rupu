@@ -66,14 +66,20 @@ impl RunNetflow {
 /// continues with transcript-only capture. Capture must never break a run.
 /// [`RunNetflow::finish`] copies what the ledger missed from the transcript
 /// once the run is over.
+///
+/// `stream` is the coordinator-launched root's netflow stream this run tees
+/// every ledger line into — backfilled lines included (spec 2026-10-14
+/// remote netflow transport §N1; [`stream_for`] / [`link_stream`] resolve
+/// it), `None` to write the ledger alone.
 pub fn for_run(
     global: &Path,
     project_root: Option<&Path>,
     run_id: &str,
     transcript_path: &Path,
+    stream: Option<rupu_netflow::NetflowStream>,
 ) -> RunNetflow {
     let netflow_dir = rupu_netflow::netflow_dir(global, project_root);
-    let paths = rupu_netflow::NetflowPaths::for_run(&netflow_dir, run_id);
+    let paths = rupu_netflow::NetflowPaths::for_run(&netflow_dir, run_id).with_stream(stream);
     let mut sinks: Vec<Arc<dyn rupu_netflow::FlowSink>> = vec![Arc::new(
         rupu_transcript::TranscriptSink::new(transcript_path.to_path_buf()),
     )];
@@ -262,6 +268,18 @@ impl Appender<'_> {
             }
         };
         file.write_all(&self.buf)?;
+        // A coordinator-launched run's backfilled lines reach its stream
+        // too, or a remote coordinator would never see them (spec
+        // 2026-10-14 §N1). Best-effort, like every stream write.
+        if let Some(stream) = &self.paths.stream {
+            if let Err(e) = rupu_netflow::stream::append_stream_raw_lines(
+                &stream.path,
+                &stream.ledger_id,
+                &self.buf,
+            ) {
+                tracing::warn!(error = %e, "netflow stream write of backfilled lines failed; a coordinator will see this run's flows as partial");
+            }
+        }
         self.buf.clear();
         Ok(())
     }
@@ -333,5 +351,82 @@ fn for_each_line(path: &Path, mut f: impl FnMut(&[u8])) -> std::io::Result<()> {
             return Ok(());
         }
         f(&line);
+    }
+}
+
+/// The stream a run tees into when `<root_run_dir>/netflow.jsonl` has been
+/// begun by a coordinator-launched root (spec §N1); `None` otherwise — a
+/// root that doesn't tee (a terminal `rupu run`, an agentiflow) has no
+/// begun stream, so nothing beneath it tees either.
+pub fn stream_for(root_run_dir: &Path, ledger_id: &str) -> Option<rupu_netflow::NetflowStream> {
+    let path = root_run_dir.join(rupu_netflow::NETFLOW_STREAM_FILE);
+    rupu_netflow::stream::stream_has_begin(&path).then(|| rupu_netflow::NetflowStream {
+        path,
+        ledger_id: ledger_id.to_string(),
+    })
+}
+
+/// A process child's stream: its root's run directory is the directory of
+/// the root's usage ledger its link carries.
+pub fn link_stream(
+    link: &crate::argv::LaunchLink,
+    ledger_id: &str,
+) -> Option<rupu_netflow::NetflowStream> {
+    let dir = link.usage_root.as_deref()?.parent()?;
+    stream_for(dir, ledger_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_for_is_some_only_once_the_root_has_begun() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("runs").join("run_root");
+        assert_eq!(stream_for(&root, "run_step"), None, "no file");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("netflow.jsonl"), "").unwrap();
+        assert_eq!(stream_for(&root, "run_step"), None, "no begin line");
+        rupu_netflow::stream::write_stream_begin(&root.join("netflow.jsonl"), "run_root").unwrap();
+        assert_eq!(
+            stream_for(&root, "run_step"),
+            Some(rupu_netflow::NetflowStream {
+                path: root.join("netflow.jsonl"),
+                ledger_id: "run_step".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn link_stream_follows_the_usage_root_into_the_roots_run_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("runs").join("run_root");
+        let link = crate::argv::LaunchLink {
+            depth: 1,
+            ceiling: rupu_tools::PermissionMode::Bypass,
+            parent_run: "run_root".into(),
+            root_run: "run_root".into(),
+            usage_root: Some(root.join("usage.jsonl")),
+            agents: Vec::new(),
+            workflows: Vec::new(),
+            actions: None,
+            no_messaging: false,
+        };
+        assert_eq!(link_stream(&link, "run_child"), None, "root never began");
+        rupu_netflow::stream::write_stream_begin(&root.join("netflow.jsonl"), "run_root").unwrap();
+        assert_eq!(
+            link_stream(&link, "run_child").map(|s| s.path),
+            Some(root.join("netflow.jsonl"))
+        );
+        let unrooted = crate::argv::LaunchLink {
+            usage_root: None,
+            ..link
+        };
+        assert_eq!(
+            link_stream(&unrooted, "run_child"),
+            None,
+            "no usage root, no stream"
+        );
     }
 }
