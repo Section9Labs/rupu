@@ -436,6 +436,9 @@ struct SessionRecord {
     agent_system_prompt: String,
     #[serde(default)]
     agent_tools: Option<Vec<String>>,
+    /// The agent's `messaging:` key (spec F1d D4), frozen with its tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    messaging: Option<bool>,
     max_turns: u32,
     permission_mode: String,
     no_stream: bool,
@@ -1831,6 +1834,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         model,
         agent_system_prompt,
         agent_tools: spec.tools.clone(),
+        messaging: spec.messaging,
         max_turns: spec.max_turns.unwrap_or(50),
         permission_mode: mode_str,
         no_stream: args.no_stream,
@@ -8200,6 +8204,7 @@ fn session_agent_spec(
         thinking_display: session.thinking_display,
         dispatchable_agents: session.dispatchable_agents.clone(),
         dispatchable_workflows: session.dispatchable_workflows.clone(),
+        messaging: session.messaging,
         concerns: session.concerns.clone(),
         max_tokens: session.max_tokens,
         context_window_tokens: session.context_window_tokens,
@@ -11355,6 +11360,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             agent_system_prompt: "You are a test agent.".into(),
             agent_tools: Some(vec!["read_file".into()]),
+            messaging: None,
             max_turns: 50,
             permission_mode: "bypass".into(),
             no_stream: false,

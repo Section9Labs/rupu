@@ -189,6 +189,117 @@ impl StepFactory for Factory {
     }
 }
 
+const WF_OFF: &str = r#"
+name: hush
+messaging: false
+steps:
+  - id: a
+    agent: talker
+    prompt: say hi
+"#;
+
+/// Every step runs `talker`, whose `tools:` names `msg.send`, on a provider
+/// that records its requests.
+struct OffFactory {
+    global: PathBuf,
+    requests: Arc<Mutex<Vec<LlmRequest>>>,
+}
+
+#[async_trait]
+impl StepFactory for OffFactory {
+    async fn launch_for_step(
+        &self,
+        request: rupu_orchestrator::StepRequest,
+    ) -> Result<rupu_orchestrator::StepLaunch, rupu_runtime::assembly::AssembleError> {
+        rupu_orchestrator::testing::MockRun {
+            agent_name: request.agent_name.clone(),
+            agent_tools: Some(vec!["read_file".into(), "msg.send".into()]),
+            provider: Box::new(Paced {
+                inner: MockProvider::new(vec![text("hi")]),
+                turn: 0,
+                before: Vec::new(),
+                seen: Arc::clone(&self.requests),
+            }),
+            assembler: Some(rupu_orchestrator::testing::assembler_at(&self.global)),
+            ..Default::default()
+        }
+        .launch(request)
+    }
+}
+
+/// Spec F1d D2, D5: a workflow's `messaging: false` leaves its steps no
+/// messaging tool, and one the agent names is reported through a
+/// `tool_unavailable` notice, never dropped silently.
+#[tokio::test]
+async fn workflow_messaging_false_turns_its_steps_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    let global = tmp.path().join("home");
+    let workspace = tmp.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let requests: Arc<Mutex<Vec<LlmRequest>>> = Arc::default();
+    let wf = Workflow::parse(WF_OFF).unwrap();
+    let store = Arc::new(RunStore::new(global.join("runs")));
+    let opts = OrchestratorRunOpts {
+        run_step: Default::default(),
+        workflow: wf,
+        inputs: Default::default(),
+        workspace_id: "ws_hush".into(),
+        workspace_path: workspace.clone(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(OffFactory {
+            global: global.clone(),
+            requests: Arc::clone(&requests),
+        }),
+        event: None,
+        run_store: Some(store),
+        workflow_yaml: Some(WF_OFF.into()),
+        resume_from: None,
+        issue: None,
+        issue_ref: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: None,
+        action_services: None,
+        pause: None,
+        naming: None,
+    };
+    let res = run_workflow(opts).await.unwrap();
+    assert!(res.step_results.iter().all(|s| s.success), "{:#?}", res.step_results);
+
+    let requests = requests.lock().unwrap().clone();
+    let tools: Vec<&str> = requests[0].tools.iter().map(|t| t.name.as_str()).collect();
+    assert!(tools.contains(&"read_file"), "{tools:?}");
+    assert!(
+        !tools
+            .iter()
+            .any(|t| t.starts_with("board.") || t.starts_with("msg.")),
+        "{tools:?}"
+    );
+    let notices: Vec<String> = res
+        .step_results
+        .iter()
+        .flat_map(|s| events(&s.transcript_path))
+        .filter_map(|e| match e {
+            rupu_transcript::Event::Notice { kind, message } if kind == "tool_unavailable" => {
+                Some(message)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        notices,
+        ["tool \"msg.send\" is not available in this run: it needs message_bus, which this run does not provide"]
+    );
+    assert!(
+        file_has(
+            space(&global).map(|s| s.join("participants.jsonl")),
+            "\"talker\""
+        ),
+        "the step joined the space all the same (F1b)"
+    );
+}
+
 pub(crate) fn events(path: &Path) -> Vec<rupu_transcript::Event> {
     rupu_transcript::JsonlReader::iter(path)
         .unwrap()

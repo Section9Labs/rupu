@@ -11,6 +11,7 @@
 //! [`defaults_for`]. Building `AgentRunOpts` by hand outside this module is
 //! refused by the `no_hand_built_run_opts` test.
 
+mod messaging;
 mod origin;
 mod pins;
 mod spec;
@@ -18,6 +19,7 @@ mod spec;
 pub use origin::{
     defaults_for, CoverageStream, Origin, OriginDefaults, ParentRun, UnitKey, UsageRoot,
 };
+pub use messaging::{MessagingGrant, OffReason};
 pub use pins::PinRule;
 pub use spec::{LaunchServices, LaunchSpec, Overrides, WorkspaceBinding};
 
@@ -37,13 +39,6 @@ use crate::provider_factory::{
     self, AgentProviderSettings, FactoryError, OpenAiCompatibleParams, ProviderConfig,
 };
 use crate::usage_ledger::UsageLedger;
-
-/// A run's bus on its message space, and whether the run takes part.
-struct SpaceBus {
-    bus: Arc<rupu_fleet::Bus>,
-    /// Offered the messaging tools.
-    takes_part: bool,
-}
 
 /// What a [`RunAssembler`] is built from: the config a process (or one root
 /// run) runs under and the resources its runs share.
@@ -561,6 +556,10 @@ impl RunAssembler {
     pub async fn assemble(&self, mut spec: LaunchSpec) -> Result<AssembledRun, AssembleError> {
         let d = defaults_for(&spec.origin);
         let cfg = &self.ctx.config;
+        let messaging = MessagingGrant::resolve(&spec, d.origin_grant.as_ref());
+        if let MessagingGrant::Off(why) = &messaging {
+            tracing::debug!(run = %spec.run_id, ?why, "messaging off");
+        }
 
         // Before anything that needs cleaning up.
         let skills = match spec.services.skills.take() {
@@ -674,8 +673,11 @@ impl RunAssembler {
         };
 
         let (ledger, coverage_stream) = self.root_ledger_and_stream(&spec.origin, &spec.run_id);
-        let (launch, connector_cap) =
-            self.launch_scope(&spec, ledger.as_ref().map(|l| l.path().to_path_buf()));
+        let (launch, connector_cap) = self.launch_scope(
+            &spec,
+            ledger.as_ref().map(|l| l.path().to_path_buf()),
+            !messaging.takes_part(),
+        );
         // A process child (or a run under one) also copies each call to the
         // launch tree's root ledger, for a budget over the tree (L5); its own
         // ledger stays what every report reads.
@@ -704,8 +706,7 @@ impl RunAssembler {
             None => PermissionPolicy::new(spec.mode, spec.prompter.clone()),
         };
 
-        let space = self.message_space(&spec);
-        let message_bus = space.as_ref().map(|s| Arc::clone(&s.bus));
+        let message_bus = self.message_space(&spec);
         let findings =
             self.ctx
                 .findings
@@ -742,10 +743,7 @@ impl RunAssembler {
                 customer: self.ctx.customer.clone(),
                 // The agent loop sets it from the permission policy.
                 prompter: None,
-                message_bus: space
-                    .as_ref()
-                    .filter(|s| s.takes_part)
-                    .map(|s| Arc::clone(&s.bus)),
+                message_bus: message_bus.clone().filter(|_| messaging.takes_part()),
                 message_space: message_bus.clone(),
                 run_status: spec.services.run_status.clone(),
                 catalog: spec
@@ -779,6 +777,7 @@ impl RunAssembler {
             connector_cap: connector_cap.as_deref(),
             concerns: concerns.is_some(),
             origin: d.origin_grant.as_ref(),
+            messaging: messaging.ambient().as_ref(),
             tool_context: &tool_context,
             alias_scope: d.alias_scope,
         });
@@ -936,31 +935,16 @@ impl RunAssembler {
 impl RunAssembler {
     /// The run's bus on its message space (spec F1a): the one the site
     /// handed it (an agentiflow's lead and units, a child sharing its
-    /// parent's), else one on its origin's own space. It takes part — is
-    /// offered the messaging tools — when it was handed one, its workflow
-    /// sets `messaging:`, or its agent names a messaging tool (not through
-    /// `*`); otherwise the bus is where its children and the operator reach
-    /// it, receive-only.
-    fn message_space(&self, spec: &LaunchSpec) -> Option<SpaceBus> {
+    /// parent's), else one on its origin's own space. Whether the run takes
+    /// part — is offered the messaging tools — is [`MessagingGrant`]'s call
+    /// (spec F1d); either way the bus is where its children and the
+    /// operator reach it.
+    fn message_space(&self, spec: &LaunchSpec) -> Option<Arc<rupu_fleet::Bus>> {
         if let Some(bus) = &spec.services.message_bus {
-            return Some(SpaceBus {
-                bus: Arc::clone(bus),
-                takes_part: true,
-            });
+            return Some(Arc::clone(bus));
         }
         let space =
             crate::services::messaging::space_dir(&self.ctx.global, &spec.origin, &spec.run_id)?;
-        let workflow = matches!(
-            spec.origin,
-            Origin::WorkflowStep {
-                messaging: Some(_),
-                ..
-            }
-        );
-        let named = spec.agent.tools.as_deref().is_some_and(|tools| {
-            rupu_tools::ToolCatalog::builtin()
-                .names_service(tools, rupu_tools::Service::MessageBus)
-        });
         let address =
             crate::services::messaging::address_of(spec.codename.as_deref(), &spec.run_id);
         let bus = rupu_fleet::Bus::open(&space, address)
@@ -970,20 +954,19 @@ impl RunAssembler {
             Origin::SessionTurn { .. } => bus.staying(),
             _ => bus,
         };
-        Some(SpaceBus {
-            bus: Arc::new(bus),
-            takes_part: workflow || named,
-        })
+        Some(Arc::new(bus))
     }
 
     /// What the run `spec` may launch and where its children are recorded
     /// (W7 §3.4), and the connector cap its grant is narrowed by. A child's
     /// caps are what its parent may launch — in process the parent's own
-    /// scope, across one the `--launch-*` link.
+    /// scope, across one the `--launch-*` link. `messaging_off` is the
+    /// run's own (spec F1d D6), which its children inherit.
     fn launch_scope(
         &self,
         spec: &LaunchSpec,
         usage_root: Option<PathBuf>,
+        messaging_off: bool,
     ) -> (LaunchScope, Option<Vec<String>>) {
         let flow_dir = match &spec.origin {
             Origin::FlowLead { flow_dir, .. } | Origin::FlowUnit { flow_dir, .. } => {
@@ -1049,6 +1032,7 @@ impl RunAssembler {
                 usage_root,
                 rollup_root,
                 flow,
+                messaging_off,
             },
             connector_cap,
         )

@@ -149,16 +149,17 @@ async fn a_subagent_shares_the_space_in_process() {
     assert!(!child.live);
 }
 
-/// A parent that takes no part in messaging (no messaging tools) still has
-/// a space its children meet it in: what the child sends `parent` reaches
-/// the parent.
+/// Spec F1d D1: a sub-agent whose agent file says nothing about messaging
+/// sends `msg.send to: parent`, and a parent that takes no part in messaging
+/// itself still has a space its children meet it in: the message is in its
+/// inbox for its next model call.
 #[tokio::test]
 #[serial]
 async fn a_parent_without_messaging_tools_hears_its_child() {
     let home = Home::new();
     home.agent(
         "reporter",
-        "provider: anthropic\nmodel: claude-sonnet-4-6\nmaxTurns: 3\ntools: [msg.send]",
+        "provider: anthropic\nmodel: claude-sonnet-4-6\nmaxTurns: 3\ntools: [read_file]",
     );
     let l = home.launcher(config(), None);
     let _m = MockScript::set(

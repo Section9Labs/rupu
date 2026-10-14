@@ -71,22 +71,31 @@ fn started() -> DateTime<Utc> {
 
 /// One round, then the ceiling stops the flow.
 fn def() -> AgentiflowDef {
-    AgentiflowDef::parse_str(
+    def_with("")
+}
+
+fn def_with(extra: &str) -> AgentiflowDef {
+    AgentiflowDef::parse_str(&format!(
         "name: parity\n\
          lead: lead\n\
          engagement_profiles: [network]\n\
          goals:\n  \
            - id: any-finding\n    \
              objective: \"Record at least one finding.\"\n    \
-             target: { findings: {}, count_gte: 1 }\n\
-         scope: { authorized: true }\n\
-         pool: { agents: [lead, recon] }\n\
-         round: { ceiling: { rounds: 1 } }\n",
-    )
+             target: {{ findings: {{}}, count_gte: 1 }}\n\
+         scope: {{ authorized: true }}\n\
+         pool: {{ agents: [lead, recon] }}\n\
+         round: {{ ceiling: {{ rounds: 1 }} }}\n\
+         {extra}"
+    ))
     .unwrap()
 }
 
 fn lead_toolset(lead_tools: &str) -> Value {
+    lead_toolset_of(def(), lead_tools)
+}
+
+fn lead_toolset_of(def: AgentiflowDef, lead_tools: &str) -> Value {
     let tmp = tempfile::tempdir().unwrap();
     let global = tmp.path().join("global");
     let workspace = tmp.path().join("ws");
@@ -108,7 +117,7 @@ fn lead_toolset(lead_tools: &str) -> Value {
         }),
     };
     run_agentiflow(RunAgentiflowOpts {
-        def: def(),
+        def,
         workspace: workspace.clone(),
         global: global.clone(),
         active: active(),
@@ -239,6 +248,35 @@ async fn unit_toolset(unit_frontmatter: &str) -> Value {
         .result
         .expect("runs");
     toolset(&captured)
+}
+
+/// Spec F1d D3: an agentiflow's `messaging: false` leaves its lead no
+/// `board.*` / `msg.send`, the rest of its coordination set intact. Absent,
+/// the lead's list is today's (the snapshot above).
+#[test]
+fn agentiflow_messaging_false_strips_the_leads_messaging_tools() {
+    let names: Vec<String> = lead_toolset_of(def_with("messaging: false\n"), "[read_file]")
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        !names
+            .iter()
+            .any(|n| n.starts_with("board.") || n.starts_with("msg.")),
+        "{names:?}"
+    );
+    for kept in ["read_file", "goal.status", "budget.status", "dispatch", "agents.list"] {
+        assert!(names.iter().any(|n| n == kept), "{kept} in {names:?}");
+    }
+    let on: Vec<String> = lead_toolset_of(def_with("messaging: true\n"), "[read_file]")
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(on.iter().any(|n| n == "board.directive"), "{on:?}");
 }
 
 #[test]

@@ -22,6 +22,9 @@ pub struct RunGrantInputs<'a> {
     /// The grant the run's origin carries (an agentiflow lead's or unit's
     /// coordination set, `origin:flow_lead` / `origin:flow_unit`).
     pub origin: Option<&'a AmbientGrant>,
+    /// The run's messaging tools (spec F1d, `ambient:messaging_default` /
+    /// `ambient:workflow_messaging`); `None` when its messaging is off.
+    pub messaging: Option<&'a AmbientGrant>,
     /// The run's identity, workspace and services.
     pub tool_context: &'a ToolContext,
     pub alias_scope: AliasScope,
@@ -55,6 +58,9 @@ pub fn resolve_run_grant(inputs: RunGrantInputs<'_>) -> Result<ResolvedGrant, Gr
     }
     if let Some(origin) = inputs.origin {
         ambient.push(origin.clone());
+    }
+    if let Some(messaging) = inputs.messaging {
+        ambient.push(messaging.clone());
     }
     let grant = catalog.resolve_grant(GrantInputs {
         declared: inputs.declared,
@@ -94,6 +100,7 @@ pub fn with_grant(
         connector_cap: None,
         concerns: opts.concerns.is_some(),
         origin: None,
+        messaging: None,
         tool_context: &opts.tool_context,
         alias_scope: opts.alias_scope,
     })?;

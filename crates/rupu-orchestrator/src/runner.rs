@@ -503,8 +503,8 @@ pub struct StepRequest {
     pub transcript_path: PathBuf,
     /// The step's `tool_audit` live-view hook.
     pub on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-    /// The workflow's `messaging:` tools ([`Workflow::messaging_tools`]).
-    pub messaging: Option<Vec<&'static str>>,
+    /// The workflow's `messaging:` key ([`Workflow::messaging_switch`]).
+    pub messaging: rupu_tools::MessagingSwitch,
 }
 
 impl StepRequest {
@@ -7585,7 +7585,7 @@ async fn run_on_reject_chain(
                 run_id: step_run_id.to_string(),
                 workflow_run_id: ledger_run_id(opts, run_id),
                 workflow_name: opts.workflow.name.clone(),
-                messaging: opts.workflow.messaging_tools(),
+                messaging: opts.workflow.messaging_switch(),
                 unit: None,
                 workspace: step_workspace(opts),
                 transcript_path: transcript_path.clone(),
@@ -8417,7 +8417,7 @@ async fn run_linear_step(
                     run_id: run_id.clone(),
                     workflow_run_id: ledger_run_id(opts, workflow_run_id),
                     workflow_name: opts.workflow.name.clone(),
-                    messaging: opts.workflow.messaging_tools(),
+                    messaging: opts.workflow.messaging_switch(),
                     unit: None,
                     workspace: step_workspace(opts),
                     transcript_path: transcript_path.clone(),
@@ -9212,7 +9212,7 @@ async fn run_fanout_step(
         let unit_counters = Arc::new(crate::usage_ledger::UnitTokenCounters::default());
         let unit_ledger_run_id = ledger_run_id(opts, &workflow_run_id);
         let workflow_name = opts.workflow.name.clone();
-        let messaging = opts.workflow.messaging_tools();
+        let messaging = opts.workflow.messaging_switch();
         let dispatcher_for_task = unit_dispatcher.clone();
         let pause_for_task = unit_pause.clone();
         // The step's ONE packed workspace, shared with this unit when sync
@@ -9997,7 +9997,7 @@ async fn run_parallel_step(
         let counters = Arc::new(crate::usage_ledger::UnitTokenCounters::default());
         let unit_ledger_run_id = ledger_run_id(opts, workflow_run_id);
         let workflow_name = opts.workflow.name.clone();
-        let messaging = opts.workflow.messaging_tools();
+        let messaging = opts.workflow.messaging_switch();
         let codename = opts
             .naming
             .as_ref()
@@ -11102,7 +11102,7 @@ async fn dispatch_fixer(
             run_id: run_id.clone(),
             workflow_run_id: ledger_run_id(opts, workflow_run_id),
             workflow_name: opts.workflow.name.clone(),
-            messaging: opts.workflow.messaging_tools(),
+            messaging: opts.workflow.messaging_switch(),
             unit: Some(UnitKey {
                 index: unit_index,
                 key: Some(unit_key.clone()),
@@ -11256,7 +11256,7 @@ async fn run_panel_iteration(
         let counters = Arc::new(crate::usage_ledger::UnitTokenCounters::default());
         let unit_ledger_run_id = ledger_run_id(opts, &workflow_run_id);
         let workflow_name = opts.workflow.name.clone();
-        let messaging = opts.workflow.messaging_tools();
+        let messaging = opts.workflow.messaging_switch();
 
         handles.push(tokio::spawn(async move {
             let _permit = permit_sem

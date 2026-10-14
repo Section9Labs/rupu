@@ -13,6 +13,7 @@
 //! `runner::run_panel_step`).
 
 use rupu_coverage::ConcernsBlock;
+use rupu_tools::MessagingSwitch;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
@@ -1276,11 +1277,11 @@ pub struct Workflow {
     /// [`loop_internal_edges`], [`collapsed_graph_edges`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub loops: BTreeMap<String, LoopDef>,
-    /// Messaging for every agent step and unit (spec F1a §7): `true` grants
-    /// the board and `msg.send` ([`rupu_tools::WORKFLOW_MESSAGING`]),
-    /// `{ tools: [...] }` the message-space tools named, both as
-    /// `ambient:workflow_messaging`; set, the steps share the run's message
-    /// space. Children a step launches get only what their own `tools:` asks.
+    /// Messaging for every agent step and unit (spec F1d D2). Absent: the
+    /// default set ([`rupu_tools::WORKFLOW_MESSAGING`], as
+    /// `ambient:messaging_default`). `true`: the same set, `{ tools: [...] }`
+    /// the message-space tools named, both as `ambient:workflow_messaging`.
+    /// `false`: off for every step and unit and everything they launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub messaging: Option<Messaging>,
     pub steps: Vec<Step>,
@@ -1290,7 +1291,7 @@ pub struct Workflow {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Messaging {
-    /// `messaging: true` (or `false`, which is no messaging).
+    /// `messaging: true` (the default set) or `false` (off).
     On(bool),
     /// `messaging: { tools: [board.post, msg.send] }`.
     Tools {
@@ -1300,16 +1301,21 @@ pub enum Messaging {
 }
 
 impl Workflow {
-    /// The message-space tools every agent step is granted, canonical;
-    /// `None` when the workflow has no `messaging:` (or `messaging: false`).
-    /// Valid by construction: [`Workflow::parse`] checks the names.
-    pub fn messaging_tools(&self) -> Option<Vec<&'static str>> {
-        match self.messaging.as_ref()? {
-            Messaging::On(false) => None,
-            Messaging::On(true) => Some(rupu_tools::WORKFLOW_MESSAGING.to_vec()),
-            Messaging::Tools { tools } => rupu_tools::ToolCatalog::builtin()
+    /// What the `messaging:` key asks for every agent step and unit (spec
+    /// F1d D2): the default when absent, off for `false`, else the tools,
+    /// canonical. Valid by construction: [`Workflow::parse`] checks the
+    /// names.
+    pub fn messaging_switch(&self) -> MessagingSwitch {
+        match self.messaging.as_ref() {
+            None => MessagingSwitch::Default,
+            Some(Messaging::On(false)) => MessagingSwitch::Off,
+            Some(Messaging::On(true)) => {
+                MessagingSwitch::Tools(rupu_tools::WORKFLOW_MESSAGING.to_vec())
+            }
+            Some(Messaging::Tools { tools }) => rupu_tools::ToolCatalog::builtin()
                 .resolve_messaging(tools)
-                .ok(),
+                .map(MessagingSwitch::Tools)
+                .unwrap_or_default(),
         }
     }
 

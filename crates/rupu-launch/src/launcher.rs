@@ -391,12 +391,14 @@ impl Caller {
             agents: id.launch.agents.clone(),
             workflows: id.launch.workflows.clone(),
             actions: id.launch.connector_cap.clone(),
+            no_messaging: id.launch.messaging_off,
         }
     }
 
     /// The mode and link a child runs at: this caller's for a new one; for
     /// one launched before as `was`, no wider than it ran then (the lower
-    /// ceiling, the caps both allow, the deeper depth).
+    /// ceiling, the caps both allow, the deeper depth, messaging off if
+    /// either says so).
     fn bounds(
         &self,
         kind: ChildKind,
@@ -419,6 +421,7 @@ impl Caller {
                     (Some(a), Some(b)) => Some(both(&a, b)),
                     (a, b) => a.or_else(|| b.clone()),
                 },
+                no_messaging: now.no_messaging || then.no_messaging,
                 ..now
             }),
             (link, _) => link,

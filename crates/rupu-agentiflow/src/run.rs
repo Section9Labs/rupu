@@ -771,6 +771,7 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                     &rupu_runtime::Origin::FlowLead {
                         flow_id: id.clone(),
                         flow_dir: run_dir.clone(),
+                        messaging_off: def.messaging_off(),
                     },
                     false,
                 )
@@ -959,6 +960,7 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 run_status: Some(run_status),
                 catalog: Some(catalog),
                 collectors,
+                messaging_off: def.messaging_off(),
             };
             let driver = match RunAgentLeadDriver::new(lead_cfg, lead.provider) {
                 Ok(d) => d,

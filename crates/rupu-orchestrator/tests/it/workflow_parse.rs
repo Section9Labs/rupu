@@ -1,4 +1,5 @@
 use rupu_orchestrator::{is_approval_gate, TimeoutAction, Workflow};
+use rupu_tools::MessagingSwitch;
 
 // `actions:` entries must name a real MCP catalog tool (validated by
 // `validate_step_actions`, `workflow.rs`) — this fixture predates that
@@ -1595,17 +1596,24 @@ fn messaging_key_grants_the_message_space_tools() {
             "name: w\n{messaging}\nsteps:\n  - id: s\n    agent: a\n    prompt: p\n"
         ))
     };
-    assert_eq!(wf("").unwrap().messaging_tools(), None);
-    assert_eq!(wf("messaging: false").unwrap().messaging_tools(), None);
     assert_eq!(
-        wf("messaging: true").unwrap().messaging_tools(),
-        Some(rupu_tools::WORKFLOW_MESSAGING.to_vec())
+        wf("").unwrap().messaging_switch(),
+        MessagingSwitch::Default,
+        "spec F1d D2: absent is the default set"
+    );
+    assert_eq!(
+        wf("messaging: false").unwrap().messaging_switch(),
+        MessagingSwitch::Off
+    );
+    assert_eq!(
+        wf("messaging: true").unwrap().messaging_switch(),
+        MessagingSwitch::Tools(rupu_tools::WORKFLOW_MESSAGING.to_vec())
     );
     assert_eq!(
         wf("messaging: { tools: [board.read, msg.*] }")
             .unwrap()
-            .messaging_tools(),
-        Some(vec!["board.read", "msg.send"])
+            .messaging_switch(),
+        MessagingSwitch::Tools(vec!["board.read", "msg.send"])
     );
     for bad in ["read_file", "*", "board.pots"] {
         let err = wf(&format!("messaging: {{ tools: [{bad:?}] }}")).unwrap_err();

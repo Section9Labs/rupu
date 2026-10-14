@@ -20,6 +20,7 @@ fn link(agents: &[&str]) -> LaunchLink {
         agents: agents.iter().map(|s| s.to_string()).collect(),
         workflows: Vec::new(),
         actions: None,
+        no_messaging: false,
     }
 }
 

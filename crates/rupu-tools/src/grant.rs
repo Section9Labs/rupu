@@ -164,8 +164,9 @@ impl AmbientGrant {
     }
 }
 
-/// What a workflow's `messaging: true` grants every agent step and unit
-/// (spec F1a §7): the board and `msg.send`, without the authority tools.
+/// The messaging tools every run with a message space gets by default (spec
+/// F1d D1), and what a workflow's `messaging: true` grants its steps (spec
+/// F1a §7): the board and `msg.send`, without the authority tools.
 pub const WORKFLOW_MESSAGING: &[&str] = &[
     "board.claim",
     "board.release",
@@ -183,6 +184,31 @@ impl AmbientGrant {
             reason: GrantReason::Ambient("workflow_messaging"),
         }
     }
+
+    /// The default (`ambient:messaging_default`, spec F1d D1): what a run in
+    /// a message space gets when nothing names or turns off its messaging.
+    pub fn messaging_default() -> Self {
+        Self {
+            tools: WORKFLOW_MESSAGING.to_vec(),
+            reason: GrantReason::Ambient("messaging_default"),
+        }
+    }
+}
+
+/// What a workflow's `messaging:` key asks for its agent steps and units
+/// (spec F1d D2), carried on the step's origin. Absent is the default set,
+/// `true` or `{ tools: [...] }` the tools it names, `false` off for the
+/// steps and everything they launch.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum MessagingSwitch {
+    /// No key: the default (`ambient:messaging_default`).
+    #[default]
+    Default,
+    /// `messaging: true` or `{ tools: [...] }`: these, canonical, as
+    /// `ambient:workflow_messaging`.
+    Tools(Vec<&'static str>),
+    /// `messaging: false`.
+    Off,
 }
 
 /// The services a run provides. A tool is offered only when every service
@@ -420,6 +446,11 @@ pub enum GrantError {
          (scm/issues) tools, so it would have no effect"
     )]
     NotConnector { name: String },
+    /// A `tools:` entry names a messaging tool in an agent whose
+    /// `messaging: false` turns them off (spec F1d D4): the file contradicts
+    /// itself.
+    #[error("\"{name}\" in tools: is a messaging tool, but the agent sets messaging: false")]
+    MessagingOff { name: String },
 }
 
 fn suggestion_suffix(s: &Option<String>) -> String {
@@ -518,20 +549,23 @@ impl ToolCatalog {
         Ok(out)
     }
 
-    /// Whether `declared` asks for a tool that needs `service` by name: an
-    /// exact name, an alias or its `ns.*` — never through `*`, which asks
-    /// for whatever the run happens to provide.
-    pub fn names_service(&self, declared: &[String], service: Service) -> bool {
-        declared.iter().any(|n| {
-            if matches!(n.trim(), "*" | "core.*") {
-                return false;
-            }
-            match self.expand(n, AliasScope::Everywhere, "tools:") {
-                Ok(Expansion::Exact(d)) => d.needs.contains(&service),
-                Ok(Expansion::Wildcard(ds)) => ds.iter().any(|d| d.needs.contains(&service)),
-                Err(_) => false,
-            }
-        })
+    /// The first `declared` entry that asks for a tool needing `service` by
+    /// name: an exact name, an alias or its `ns.*` — never `*`, which asks
+    /// for whatever the run happens to provide. `None` when none does.
+    pub fn naming_service<'a>(&self, declared: &'a [String], service: Service) -> Option<&'a str> {
+        declared
+            .iter()
+            .find(|n| {
+                if matches!(n.trim(), "*" | "core.*") {
+                    return false;
+                }
+                match self.expand(n, AliasScope::Everywhere, "tools:") {
+                    Ok(Expansion::Exact(d)) => d.needs.contains(&service),
+                    Ok(Expansion::Wildcard(ds)) => ds.iter().any(|d| d.needs.contains(&service)),
+                    Err(_) => false,
+                }
+            })
+            .map(String::as_str)
     }
 
     /// Compute what an agent may call (§3 of the W2 card).

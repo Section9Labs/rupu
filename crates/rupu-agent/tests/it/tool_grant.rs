@@ -420,6 +420,7 @@ fn an_unknown_name_fails_the_grant_before_any_run() {
         step_actions: &[],
         concerns: false,
         origin: None,
+        messaging: None,
         connector_cap: None,
         tool_context: &ctx,
         alias_scope: Default::default(),
@@ -461,4 +462,45 @@ fn unknown_tool_fails_load() {
         .map(|c| c.name.clone().unwrap())
         .collect();
     assert_eq!(failed, vec!["typo".to_string()]);
+}
+
+/// Spec F1d D4: `messaging: false` with a messaging tool in `tools:` (by
+/// name, alias or `board.*`) is a load error; without one it loads, and
+/// `messaging: true` or no key loads with the tool named.
+#[test]
+fn messaging_off_with_a_messaging_tool_fails_load() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let agents = tmp.path().join("agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    let write = |name: &str, frontmatter: &str| {
+        std::fs::write(
+            agents.join(format!("{name}.md")),
+            format!("---\nname: {name}\n{frontmatter}\n---\nhi\n"),
+        )
+        .unwrap();
+    };
+    write("exact", "messaging: false\ntools: [read_file, msg.send]");
+    write("wild", "messaging: false\ntools: [board.*]");
+    write("quiet", "messaging: false\ntools: [read_file, \"*\"]");
+    write("loud", "messaging: true\ntools: [msg.send]");
+    write("plain", "tools: [msg.send]");
+
+    assert_eq!(
+        rupu_agent::load_agent(tmp.path(), None, "exact")
+            .unwrap_err()
+            .to_string(),
+        "agent `exact`: \"msg.send\" in tools: is a messaging tool, but the agent sets messaging: false"
+    );
+    assert_eq!(
+        rupu_agent::load_agent(tmp.path(), None, "wild")
+            .unwrap_err()
+            .to_string(),
+        "agent `wild`: \"board.*\" in tools: is a messaging tool, but the agent sets messaging: false"
+    );
+    let quiet = rupu_agent::load_agent(tmp.path(), None, "quiet").unwrap();
+    assert!(quiet.messaging_off());
+    for name in ["loud", "plain"] {
+        let spec = rupu_agent::load_agent(tmp.path(), None, name).unwrap();
+        assert!(!spec.messaging_off(), "{name}");
+    }
 }

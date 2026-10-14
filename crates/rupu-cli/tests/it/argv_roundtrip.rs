@@ -69,9 +69,14 @@ fn links() -> Vec<LaunchLink> {
         agents: vec!["recon".into(), "exploit".into()],
         workflows: vec!["sweep".into()],
         actions: Some(vec!["issues.get".into()]),
+        no_messaging: false,
     };
     vec![
         base.clone(),
+        LaunchLink {
+            no_messaging: true,
+            ..base.clone()
+        },
         LaunchLink {
             depth: 1,
             ceiling: PermissionMode::Bypass,

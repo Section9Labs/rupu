@@ -34,7 +34,8 @@ pub enum AgentLoadError {
         #[source]
         source: AgentSpecParseError,
     },
-    /// The agent's `tools:` names a tool no catalog tool answers to.
+    /// The agent's `tools:` names a tool no catalog tool answers to, or a
+    /// messaging tool under `messaging: false` (spec F1d D4).
     #[error("agent `{agent}`: {source}")]
     UnknownTool {
         agent: String,

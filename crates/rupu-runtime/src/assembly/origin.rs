@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rupu_tools::{AliasScope, AmbientGrant, RunIdentity, Surface};
+use rupu_tools::{AliasScope, AmbientGrant, MessagingSwitch, RunIdentity, Surface};
 
 use crate::usage_ledger::{LedgerTag, UsageLedger};
 
@@ -26,10 +26,10 @@ pub enum Origin {
         /// The findings scope the run reports under, when not the
         /// workflow's name (an agentiflow-launched workflow unit).
         scope_override: Option<String>,
-        /// The workflow's `messaging:` tools (spec F1a §7), granted to the
-        /// step as `ambient:workflow_messaging`; `Some` also makes the step
-        /// join the run's message space.
-        messaging: Option<Vec<&'static str>>,
+        /// The workflow's `messaging:` key (spec F1d D2): the default set,
+        /// the tools it names (`ambient:workflow_messaging`), or off for the
+        /// step and everything it launches.
+        messaging: MessagingSwitch,
     },
     /// An in-process child started by `dispatch {kind: subagent}` (or a
     /// legacy `dispatch_agent`).
@@ -41,7 +41,13 @@ pub enum Origin {
         session_dir: PathBuf,
     },
     /// An agentiflow lead round.
-    FlowLead { flow_id: String, flow_dir: PathBuf },
+    FlowLead {
+        flow_id: String,
+        flow_dir: PathBuf,
+        /// The agentiflow's `messaging: false` (spec F1d D3): the lead gets
+        /// no messaging tool, and its units inherit off through its cap.
+        messaging_off: bool,
+    },
     /// `rupu run --fleet-run-dir <flow_dir> --fleet-participant <p>`: a unit
     /// that joins an agentiflow.
     FlowUnit {
@@ -150,7 +156,7 @@ pub fn defaults_for(origin: &Origin) -> OriginDefaults {
             unit,
             step_actions,
             scope_override,
-            messaging,
+            messaging: _,
         } => OriginDefaults {
             surface: Surface::Workflow,
             scope_name: Some(
@@ -172,7 +178,7 @@ pub fn defaults_for(origin: &Origin) -> OriginDefaults {
             scm: true,
             launcher: true,
             catalog: true,
-            origin_grant: messaging.clone().map(AmbientGrant::workflow_messaging),
+            origin_grant: None,
             admission: true,
         },
         // A child reports where its parent does (R4) and is charged to the
@@ -212,7 +218,9 @@ pub fn defaults_for(origin: &Origin) -> OriginDefaults {
             origin_grant: None,
             admission: true,
         },
-        Origin::FlowLead { flow_id, flow_dir } => OriginDefaults {
+        Origin::FlowLead {
+            flow_id, flow_dir, ..
+        } => OriginDefaults {
             surface: Surface::Agentiflow,
             scope_name: Some(flow_id.clone()),
             step_id: None,

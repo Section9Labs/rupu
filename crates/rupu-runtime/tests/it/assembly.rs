@@ -10,7 +10,7 @@ use rupu_runtime::assembly::{
     RunAssembler, UnitKey,
 };
 use rupu_runtime::usage_ledger::{LedgerRow, UsageLedger};
-use rupu_tools::{PermissionMode, RunIdentity, Surface};
+use rupu_tools::{MessagingSwitch, PermissionMode, RunIdentity, Surface};
 use serde::Serialize;
 use serial_test::serial;
 
@@ -85,7 +85,7 @@ fn origins(home: &Home) -> Vec<(&'static str, Origin)> {
                 }),
                 step_actions: vec!["issues.*".into()],
                 scope_override: None,
-                messaging: None,
+                messaging: MessagingSwitch::Default,
             },
         ),
         (
@@ -106,6 +106,7 @@ fn origins(home: &Home) -> Vec<(&'static str, Origin)> {
             Origin::FlowLead {
                 flow_id: "af_1".into(),
                 flow_dir: home.global().join("agentiflows").join("af_1"),
+                messaging_off: false,
             },
         ),
         (
@@ -117,6 +118,32 @@ fn origins(home: &Home) -> Vec<(&'static str, Origin)> {
             },
         ),
     ]
+}
+
+/// What a run's owner hands it: a lead its bus and status, a fleet unit its
+/// bus, a sub-agent a sibling bus on its parent's space (the launcher's job;
+/// a run of these origins has no space of its own).
+fn hand_bus(home: &Home, l: &mut LaunchSpec, origin: &Origin) {
+    let flow_dir = home.global().join("agentiflows").join("af_1");
+    match origin {
+        Origin::FlowLead { .. } => {
+            l.services.message_bus = Some(Arc::new(rupu_fleet::Bus::open(&flow_dir, "lead")));
+            l.services.run_status = Some(Arc::new(crate::support::NoStatus));
+        }
+        Origin::FlowUnit { participant, .. } => {
+            l.services.message_bus = Some(Arc::new(rupu_fleet::Bus::open(
+                &flow_dir,
+                participant.clone(),
+            )));
+        }
+        Origin::SubAgent { .. } => {
+            l.services.message_bus = Some(Arc::new(rupu_fleet::Bus::open(
+                &home.runs().join("run_wf").join("messages"),
+                "heron>otter#1",
+            )));
+        }
+        _ => {}
+    }
 }
 
 /// What the old launch sites disagreed on, as one origin's run derives it.
@@ -159,6 +186,8 @@ struct Derived {
     grant_offers_agents_list: bool,
     /// The origin's own grant (W5 §3.4): its reason and tools.
     origin_grant: Option<String>,
+    /// Why `msg.send` is offered (spec F1d D1); `None` = messaging off.
+    messaging: Option<String>,
     narrowed: Vec<String>,
 }
 
@@ -215,6 +244,7 @@ fn derived(home: &Home, origin: &Origin, run: &AssembledRun) -> Derived {
         origin_grant: defaults_for(origin)
             .origin_grant
             .map(|g| format!("{}: {}", g.reason, g.tools.join(" "))),
+        messaging: o.grant.entry("msg.send").map(|e| e.reasons_string()),
         narrowed: o.grant.narrowed.iter().map(|n| n.to_string()).collect(),
     }
 }
@@ -251,6 +281,7 @@ async fn origin_matrix() {
     for (name, origin) in origins(&home) {
         let mut l = launch(&home, spec.clone(), origin.clone(), &format!("run_{name}"));
         l.services.launcher = Some(Arc::new(crate::support::NoLaunch));
+        hand_bus(&home, &mut l, &origin);
         if matches!(origin, Origin::SubAgent { .. }) {
             l.ceiling = Some(PermissionMode::Ask);
         }
@@ -276,24 +307,11 @@ async fn star_parity_per_origin() {
         &home,
         "provider: anthropic\nmodel: claude-sonnet-4-6\ntools: [\"*\"]",
     );
-    let flow_dir = home.global().join("agentiflows").join("af_1");
     let mut rows = std::collections::BTreeMap::new();
     for (name, origin) in origins(&home) {
         let mut l = launch(&home, spec.clone(), origin.clone(), &format!("run_{name}"));
         l.services.launcher = Some(Arc::new(crate::support::NoLaunch));
-        match &origin {
-            Origin::FlowLead { .. } => {
-                l.services.message_bus = Some(Arc::new(rupu_fleet::Bus::open(&flow_dir, "lead")));
-                l.services.run_status = Some(Arc::new(crate::support::NoStatus));
-            }
-            Origin::FlowUnit { participant, .. } => {
-                l.services.message_bus = Some(Arc::new(rupu_fleet::Bus::open(
-                    &flow_dir,
-                    participant.clone(),
-                )));
-            }
-            _ => {}
-        }
+        hand_bus(&home, &mut l, &origin);
         let _m = MockScript::set(DONE);
         let run = assembler.assemble(l).await.expect("assembles");
         let grant = &run.opts.grant;
@@ -519,6 +537,7 @@ async fn a_launch_link_carries_depth_ceiling_caps_and_the_usage_root() {
         agents: vec!["inner".into()],
         workflows: vec![],
         actions: Some(vec!["issues.get".into()]),
+        no_messaging: false,
     });
     let _m = MockScript::set(DONE);
     let run = assembler.assemble(l).await.unwrap();
@@ -576,6 +595,7 @@ async fn a_flow_pool_is_the_allowlist_and_children_inherit_it() {
         Origin::FlowLead {
             flow_id: "af_1".into(),
             flow_dir: flow_dir.clone(),
+            messaging_off: false,
         },
         "af_1",
     );
@@ -620,22 +640,28 @@ async fn a_flow_pool_is_the_allowlist_and_children_inherit_it() {
     assert_eq!(child_id.launch.flow.as_deref(), Some(flow_dir.as_path()));
 }
 
+/// The run's space, its bus behind the tools, and whether `msg.send` is
+/// offered.
+fn messaging_of(run: &AssembledRun) -> (bool, bool, bool) {
+    let s = &run.opts.tool_context.services;
+    (
+        s.message_space.is_some(),
+        s.message_bus.is_some(),
+        run.opts.grant.offers("msg.send"),
+    )
+}
+
 /// Every run with a space joins it as it starts, so the operator can reach
-/// it (F1b); it is offered the messaging tools only when it takes part
-/// (spec F1a FD1): its agent names one. The log waits for a first message.
+/// it (F1b), and is offered the messaging tools by default (spec F1d D1):
+/// `*` alone, or no `tools:` at all, gets them as `ambient:messaging_default`.
+/// An agent's `messaging: false` leaves it in the space receive-only (D4).
+/// The log waits for a first message.
 #[tokio::test]
 #[serial]
-async fn every_run_joins_its_space_and_takes_part_only_when_asked() {
+async fn every_run_joins_its_space_and_takes_part_unless_opted_out() {
     let home = Home::new();
     let assembler = home.assembler(config());
-    let tools = |run: &rupu_runtime::assembly::AssembledRun| {
-        let s = &run.opts.tool_context.services;
-        (
-            s.message_space.is_some(),
-            s.message_bus.is_some(),
-            run.opts.grant.offers("msg.send"),
-        )
-    };
+    let tools = messaging_of;
     let joined = |run: &rupu_runtime::assembly::AssembledRun, run_id: &str| {
         let bus = run
             .opts
@@ -655,20 +681,274 @@ async fn every_run_joins_its_space_and_takes_part_only_when_asked() {
         assert!(!bus.log_path().exists(), "{run_id}: no message yet, no log");
     };
 
-    let quiet = agent(&home, "provider: anthropic\nmodel: claude-sonnet-4-6\ntools: ['*']");
+    let star = agent(&home, "provider: anthropic\nmodel: claude-sonnet-4-6\ntools: ['*']");
     let _m = MockScript::set(DONE);
+    let run = assembler
+        .assemble(launch(&home, star, Origin::Standalone, "run_star"))
+        .await
+        .unwrap();
+    assert_eq!(tools(&run), (true, true, true), "`*` takes part by default");
+    assert_eq!(
+        run.opts.grant.entry("msg.send").unwrap().reasons_string(),
+        "declared:*,ambient:messaging_default"
+    );
+    joined(&run, "run_star");
+
+    let default = agent(&home, "provider: anthropic\nmodel: claude-sonnet-4-6");
+    let run = assembler
+        .assemble(launch(&home, default, Origin::Standalone, "run_default"))
+        .await
+        .unwrap();
+    assert_eq!(tools(&run), (true, true, true), "no `tools:` takes part too");
+    for tool in rupu_tools::WORKFLOW_MESSAGING {
+        assert_eq!(
+            run.opts.grant.entry(tool).unwrap().reasons_string(),
+            "ambient:messaging_default",
+            "{tool}"
+        );
+    }
+    assert!(!run.opts.grant.offers("board.directive"), "never the authority tools");
+    joined(&run, "run_default");
+
+    let quiet = agent(
+        &home,
+        "provider: anthropic\nmodel: claude-sonnet-4-6\nmessaging: false\ntools: ['*']",
+    );
     let run = assembler
         .assemble(launch(&home, quiet, Origin::Standalone, "run_quiet"))
         .await
         .unwrap();
-    assert_eq!(tools(&run), (true, false, false), "`*` alone never takes part");
+    assert_eq!(tools(&run), (true, false, false), "`messaging: false` is receive-only");
+    assert!(run.opts.grant.unavailable.is_empty(), "nothing named, no notice");
+    assert!(run.opts.identity().launch.messaging_off);
     joined(&run, "run_quiet");
+}
 
-    let named = agent(&home, "provider: anthropic\nmodel: claude-sonnet-4-6\ntools: [msg.send]");
-    let run = assembler
-        .assemble(launch(&home, named, Origin::Standalone, "run_named"))
+/// Spec F1d D4, D5: an agent's `messaging: false` wins under every origin,
+/// a handed bus and an origin grant included. The lead keeps the rest of its
+/// coordination set.
+#[tokio::test]
+#[serial]
+async fn agent_messaging_off_wins_under_every_origin() {
+    let home = Home::new();
+    let assembler = RunAssembler::new(home.context(config()));
+    let spec = agent(
+        &home,
+        "provider: anthropic\nmodel: claude-sonnet-4-6\nmessaging: false\ntools: [\"*\"]",
+    );
+    for (name, origin) in origins(&home) {
+        let mut l = launch(&home, spec.clone(), origin.clone(), &format!("run_{name}"));
+        l.services.launcher = Some(Arc::new(crate::support::NoLaunch));
+        hand_bus(&home, &mut l, &origin);
+        let _m = MockScript::set(DONE);
+        let run = assembler.assemble(l).await.expect("assembles");
+        assert_eq!(messaging_of(&run), (true, false, false), "{name}");
+        let offered: Vec<&str> = run
+            .opts
+            .grant
+            .entries
+            .keys()
+            .copied()
+            .filter(|t| t.starts_with("board.") || t.starts_with("msg."))
+            .collect();
+        assert!(offered.is_empty(), "{name}: {offered:?}");
+        assert!(run.opts.identity().launch.messaging_off, "{name}");
+        if matches!(origin, Origin::FlowLead { .. }) {
+            assert!(run.opts.grant.offers("goal.status"), "the lead keeps its status tools");
+        }
+    }
+}
+
+/// Spec F1d D2, D5, D6: a workflow's `messaging: false` reaches its steps
+/// (a tool the agent names is reported unavailable, never silently dropped)
+/// and the sub-agents they launch, which never have more than their parent.
+/// `{ tools: [...] }` grants only those, as `ambient:workflow_messaging`.
+#[tokio::test]
+#[serial]
+async fn workflow_messaging_off_reaches_the_steps_children() {
+    let home = Home::new();
+    let assembler = home.assembler(config());
+    let step_origin = |messaging| Origin::WorkflowStep {
+        workflow_run_id: "run_wf".into(),
+        workflow_name: "review".into(),
+        step_id: "assess".into(),
+        unit: None,
+        step_actions: Vec::new(),
+        scope_override: None,
+        messaging,
+    };
+    let naming = agent(
+        &home,
+        "provider: anthropic\nmodel: claude-sonnet-4-6\ntools: [read_file, msg.send]",
+    );
+    let _m = MockScript::set(DONE);
+    let step = assembler
+        .assemble(launch(
+            &home,
+            naming.clone(),
+            step_origin(MessagingSwitch::Off),
+            "run_step_off",
+        ))
         .await
         .unwrap();
-    assert_eq!(tools(&run), (true, true, true));
-    joined(&run, "run_named");
+    assert_eq!(messaging_of(&step), (true, false, false));
+    assert_eq!(
+        step.opts
+            .grant
+            .unavailable
+            .iter()
+            .map(|u| (u.tool, u.missing.clone()))
+            .collect::<Vec<_>>(),
+        vec![("msg.send", vec![rupu_tools::Service::MessageBus])]
+    );
+    assert!(step.opts.identity().launch.messaging_off);
+
+    let star = agent(&home, "provider: anthropic\nmodel: claude-sonnet-4-6\ntools: ['*']");
+    let mut c = launch(
+        &home,
+        star.clone(),
+        Origin::SubAgent {
+            parent: ParentRun {
+                identity: Arc::clone(&step.opts.tool_context.identity),
+                usage: None,
+                coverage_stream: None,
+            },
+        },
+        "run_step_off_child",
+    );
+    let parent_bus = step.opts.tool_context.services.message_space.clone().unwrap();
+    c.services.message_bus = Some(Arc::new(parent_bus.sibling("assess>otter#1")));
+    let child = assembler.assemble(c).await.unwrap();
+    assert_eq!(messaging_of(&child), (true, false, false), "the cap reaches a sub-agent");
+    assert!(child.opts.identity().launch.messaging_off, "and its children's cap");
+
+    let on = assembler
+        .assemble(launch(
+            &home,
+            star,
+            step_origin(MessagingSwitch::Default),
+            "run_step_on",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(messaging_of(&on), (true, true, true));
+    assert_eq!(
+        on.opts.grant.entry("msg.send").unwrap().reasons_string(),
+        "declared:*,ambient:messaging_default"
+    );
+    assert!(!on.opts.identity().launch.messaging_off);
+
+    let some = assembler
+        .assemble(launch(
+            &home,
+            agent(&home, "provider: anthropic\nmodel: claude-sonnet-4-6\ntools: [read_file]"),
+            step_origin(MessagingSwitch::Tools(vec!["board.post", "msg.send"])),
+            "run_step_some",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(messaging_of(&some), (true, true, true));
+    assert_eq!(
+        some.opts.grant.entry("msg.send").unwrap().reasons_string(),
+        "ambient:workflow_messaging"
+    );
+    assert!(!some.opts.grant.offers("board.claim"), "only the tools named");
+}
+
+/// Spec F1d D6: a process child launched by an opted-out run reads
+/// `--launch-no-messaging` and has messaging off, whatever its agent says.
+#[tokio::test]
+#[serial]
+async fn a_process_child_of_an_opted_out_run_has_messaging_off() {
+    let home = Home::new();
+    let assembler = home.assembler(config());
+    let spec = agent(&home, "provider: anthropic\nmodel: claude-sonnet-4-6\ntools: [msg.send]");
+    let link = |no_messaging| rupu_runtime::argv::LaunchLink {
+        depth: 1,
+        ceiling: PermissionMode::Bypass,
+        parent_run: "run_parent".into(),
+        root_run: "run_parent".into(),
+        usage_root: None,
+        agents: vec![],
+        workflows: vec![],
+        actions: None,
+        no_messaging,
+    };
+    let mut l = launch(&home, spec.clone(), Origin::Standalone, "run_child_off");
+    l.link = Some(link(true));
+    let _m = MockScript::set(DONE);
+    let off = assembler.assemble(l).await.unwrap();
+    assert_eq!(messaging_of(&off), (true, false, false));
+    assert_eq!(
+        off.opts.grant.unavailable.iter().map(|u| u.tool).collect::<Vec<_>>(),
+        vec!["msg.send"]
+    );
+    assert!(off.opts.identity().launch.messaging_off);
+
+    let mut l = launch(&home, spec, Origin::Standalone, "run_child_on");
+    l.link = Some(link(false));
+    let on = assembler.assemble(l).await.unwrap();
+    assert_eq!(messaging_of(&on), (true, true, true));
+    assert!(!on.opts.identity().launch.messaging_off);
+}
+
+/// Spec F1d D3: an agentiflow's `messaging: false` turns the lead's
+/// messaging off, its status and roster tools stay, and a unit launched
+/// under its cap is off too.
+#[tokio::test]
+#[serial]
+async fn agentiflow_messaging_off_reaches_lead_and_units() {
+    let home = Home::new();
+    let assembler = home.assembler(config());
+    let flow_dir = home.global().join("agentiflows").join("af_1");
+    let star = agent(&home, "provider: anthropic\nmodel: claude-sonnet-4-6\ntools: ['*']");
+    let mut l = launch(
+        &home,
+        star.clone(),
+        Origin::FlowLead {
+            flow_id: "af_1".into(),
+            flow_dir: flow_dir.clone(),
+            messaging_off: true,
+        },
+        "af_1",
+    );
+    l.services.launcher = Some(Arc::new(crate::support::NoLaunch));
+    l.services.message_bus = Some(Arc::new(rupu_fleet::Bus::open(&flow_dir, "lead")));
+    l.services.run_status = Some(Arc::new(crate::support::NoStatus));
+    let _m = MockScript::set(DONE);
+    let lead = assembler.assemble(l).await.unwrap();
+    assert_eq!(messaging_of(&lead), (true, false, false));
+    for tool in ["board.directive", "board.retract", "board.post", "msg.send"] {
+        assert!(!lead.opts.grant.offers(tool), "{tool}");
+    }
+    for tool in ["goal.status", "budget.status", "agents.list", "dispatch"] {
+        assert!(lead.opts.grant.offers(tool), "{tool}");
+    }
+    assert!(lead.opts.identity().launch.messaging_off);
+
+    let mut u = launch(
+        &home,
+        star,
+        Origin::FlowUnit {
+            flow_id: "af_1".into(),
+            flow_dir: flow_dir.clone(),
+            participant: "probe#1".into(),
+        },
+        "run_unit",
+    );
+    u.services.message_bus = Some(Arc::new(rupu_fleet::Bus::open(&flow_dir, "probe#1")));
+    u.link = Some(rupu_runtime::argv::LaunchLink {
+        depth: 1,
+        ceiling: PermissionMode::Bypass,
+        parent_run: "af_1".into(),
+        root_run: "af_1".into(),
+        usage_root: None,
+        agents: vec![],
+        workflows: vec![],
+        actions: None,
+        no_messaging: lead.opts.identity().launch.messaging_off,
+    });
+    let unit = assembler.assemble(u).await.unwrap();
+    assert_eq!(messaging_of(&unit), (true, false, false));
+    assert!(!unit.opts.grant.offers("board.claim"));
 }
