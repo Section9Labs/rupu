@@ -128,7 +128,7 @@ parameters on top of that.
   `X-Rupu-Hosts-Unfilterable` (`<host>:<field>`, any other field). A `q`
   that doesn't parse is a 400 `{error, token, code, start, end}` (token
   index and char span). Time fields (`since`, `until`) take `30m`, `12h`,
-  `7d`, `2w` (back from now), a UTC date (`2026-10-01`, the whole day) or an
+  `7d`, `2w` (back from now, at most 10000 years), a UTC date (`2026-10-01`, the whole day) or an
   RFC 3339 time. Each list's fields, with their kind, values and match mode,
   are in `crates/rupu-cp/tests/fixtures/list_query/<list>.fields.json`:
 
