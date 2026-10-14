@@ -646,6 +646,11 @@ pub fn tag_findings_across(
 ///
 /// Without (2), the Findings tab shows nothing for an in-progress run even
 /// though the findings are already on disk.
+///
+/// Every run the launch tree under `parent` holds (W7 `children.jsonl`
+/// ledgers, as the Children tab walks them) is in the set too: the agents a
+/// run dispatched and, for an agentiflow (`af_…`, not a [`RunStore`] run),
+/// its units and theirs.
 pub fn resolve_run_scope(store: &RunStore, parent: &str) -> HashSet<String> {
     let mut set = HashSet::new();
     set.insert(parent.to_string());
@@ -655,7 +660,31 @@ pub fn resolve_run_scope(store: &RunStore, parent: &str) -> HashSet<String> {
     for id in sub_run_ids_from_events(store, parent) {
         set.insert(id);
     }
+    for child in launch_tree(store, parent) {
+        set.insert(child.run_id);
+    }
     set
+}
+
+fn launch_tree(store: &RunStore, parent: &str) -> Vec<crate::api::children::ChildDto> {
+    use crate::api::children;
+    // `parent` is a query value and becomes a directory name below.
+    let is_id = !parent.is_empty()
+        && parent
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !is_id {
+        return Vec::new();
+    }
+    if !parent.starts_with("af_") {
+        return children::children_of(store, parent);
+    }
+    // The run store is `<global>/runs`; agentiflows sit beside it.
+    let Some(global) = store.root.parent() else {
+        return Vec::new();
+    };
+    let flow_dir = rupu_agentiflow::agentiflow_dir(global).join(parent);
+    children::with_descendants(store, children::ledger_units(&flow_dir, parent))
 }
 
 /// Sub-run ids recovered from the parent's `events.jsonl` (written live). Each
@@ -2600,6 +2629,68 @@ mod tests {
             "in-flight unit sub-run id must be recovered from events (was: {scope:?})"
         );
         assert!(scope.contains("run_recon"));
+    }
+
+    fn started_line(handle: &str, run_id: &str) -> rupu_launch::ledger::LedgerLine {
+        rupu_launch::ledger::LedgerLine::Started(rupu_launch::ledger::Started::new(
+            handle,
+            rupu_tools::ChildKind::Agent,
+            "recon",
+            run_id,
+            1,
+            1,
+        ))
+    }
+
+    /// An agentiflow's units are W7 children in its own `children.jsonl`,
+    /// and their findings carry the unit's run id: the flow's scope holds
+    /// every unit and what each unit launched in turn.
+    #[test]
+    fn resolve_run_scope_holds_an_agentiflows_units_and_their_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        let flow = rupu_agentiflow::agentiflow_dir(tmp.path()).join("af_flow");
+        rupu_launch::ledger::append(&flow, &started_line("u1", "run_unit1"));
+        rupu_launch::ledger::append(&flow, &started_line("u2", "run_unit2"));
+        rupu_launch::ledger::append(
+            &store.root.join("run_unit1"),
+            &started_line("c1", "run_grandchild"),
+        );
+
+        let scope = resolve_run_scope(&store, "af_flow");
+        let mut got: Vec<&str> = scope.iter().map(String::as_str).collect();
+        got.sort_unstable();
+        assert_eq!(got, ["af_flow", "run_grandchild", "run_unit1", "run_unit2"]);
+    }
+
+    /// A standalone run's dispatched agents are in its scope.
+    #[test]
+    fn resolve_run_scope_holds_a_runs_dispatched_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        rupu_launch::ledger::append(
+            &store.root.join("run_solo"),
+            &started_line("c1", "run_child"),
+        );
+
+        let scope = resolve_run_scope(&store, "run_solo");
+        let mut got: Vec<&str> = scope.iter().map(String::as_str).collect();
+        got.sort_unstable();
+        assert_eq!(got, ["run_child", "run_solo"]);
+    }
+
+    /// A run id that isn't one never names a directory to read.
+    #[test]
+    fn resolve_run_scope_reads_no_ledger_for_a_path_like_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        rupu_launch::ledger::append(
+            &tmp.path().join("elsewhere"),
+            &started_line("c1", "run_leak"),
+        );
+
+        let scope = resolve_run_scope(&store, "../elsewhere");
+        assert_eq!(scope.into_iter().collect::<Vec<_>>(), ["../elsewhere"]);
     }
 
     /// Nested sub-run transcript layout (`.../<sub_id>/transcript.jsonl`)
