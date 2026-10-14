@@ -4,6 +4,11 @@
 //! walk finds the unit's landed ledgers — or the gap where they should be —
 //! even when the coordinator dies before the unit ends. A `host: local` step
 //! adds no line: its ledgers are already here.
+//!
+//! Also here: a run's before-terminal hooks (`RunStore::add_before_terminal`),
+//! which the runner runs once, before the run's record turns terminal, and
+//! never at a pause — what a workflow root's launcher uses to finish the
+//! root's own netflow before a coordinator pulls its stream.
 
 use async_trait::async_trait;
 use rupu_agent::RunError;
@@ -12,8 +17,9 @@ use rupu_orchestrator::runner::{
     run_workflow, OrchestratorRunOpts, StepFactory, UnitCoverage, UnitDispatch, UnitDispatcher,
     UnitFailure, UnitOutcome, WorkspaceDelta,
 };
-use rupu_orchestrator::{RunStore, Workflow};
+use rupu_orchestrator::{RunStatus, RunStore, Workflow};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 struct PanicFactory;
@@ -207,4 +213,138 @@ async fn a_run_without_a_store_keeps_no_roster_and_still_completes() {
     assert!(result.run_id.is_empty());
     assert_eq!(dispatcher.dispatched.lock().unwrap().len(), 5);
     assert!(read_roster(&tmp.path().join("runs"), "").is_empty());
+}
+
+/// One placed step, so the run ends without building any agent locally.
+const PLACED_ONLY: &str = r#"
+name: w
+steps:
+  - id: s
+    agent: sec
+    prompt: p
+    host: host_a
+"#;
+
+/// The placed step, then a gate nobody approves: the run parks.
+const PLACED_THEN_GATE: &str = r#"
+name: w
+steps:
+  - id: s
+    agent: sec
+    prompt: p
+    host: host_a
+  - id: gate
+    approval:
+      prompt: "ok?"
+"#;
+
+fn stored_opts(
+    yaml: &str,
+    tmp: &std::path::Path,
+    store: Arc<RunStore>,
+    run_id: &str,
+) -> OrchestratorRunOpts {
+    OrchestratorRunOpts {
+        run_step: Default::default(),
+        workflow: Workflow::parse(yaml).unwrap(),
+        inputs: BTreeMap::new(),
+        workspace_id: "ws_nf".into(),
+        workspace_path: tmp.to_path_buf(),
+        transcript_dir: tmp.join("transcripts"),
+        factory: Arc::new(PanicFactory),
+        event: None,
+        issue: None,
+        issue_ref: None,
+        run_store: Some(store),
+        workflow_yaml: Some(yaml.to_string()),
+        resume_from: None,
+        run_id_override: Some(run_id.to_string()),
+        strict_templates: false,
+        event_sink: None,
+        unit_dispatcher: Some(Arc::new(Recording::default())),
+        action_services: None,
+        pause: None,
+        naming: None,
+    }
+}
+
+/// A hook that counts its runs and keeps the run's status as it found it.
+fn counting_hook(
+    store: Arc<RunStore>,
+    run_id: &str,
+) -> (
+    rupu_orchestrator::runs::BeforeTerminal,
+    Arc<AtomicUsize>,
+    Arc<Mutex<Option<RunStatus>>>,
+) {
+    let fired = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(Mutex::new(None));
+    let run_id = run_id.to_string();
+    let hook: rupu_orchestrator::runs::BeforeTerminal = Box::new({
+        let (fired, seen) = (Arc::clone(&fired), Arc::clone(&seen));
+        move || {
+            Box::pin(async move {
+                fired.fetch_add(1, Ordering::SeqCst);
+                *seen.lock().unwrap() = Some(store.load(&run_id).unwrap().status);
+            })
+        }
+    });
+    (hook, fired, seen)
+}
+
+#[tokio::test]
+async fn a_before_terminal_hook_runs_once_before_the_record_turns_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let run_id = "run_hooked";
+    let (hook, fired, seen) = counting_hook(Arc::clone(&store), run_id);
+    store.add_before_terminal(run_id, hook);
+
+    let opts = stored_opts(PLACED_ONLY, tmp.path(), Arc::clone(&store), run_id);
+    let result = run_workflow(opts).await.expect("the workflow runs");
+    assert_eq!(result.run_id, run_id);
+
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        1,
+        "the hook runs exactly once"
+    );
+    assert_eq!(
+        *seen.lock().unwrap(),
+        Some(RunStatus::Running),
+        "the hook sees the run before its record turned terminal"
+    );
+    assert_eq!(store.load(run_id).unwrap().status, RunStatus::Completed);
+    assert!(
+        store.take_before_terminal(run_id).is_empty(),
+        "a hook that ran is not registered any more"
+    );
+}
+
+#[tokio::test]
+async fn a_before_terminal_hook_waits_through_a_gate_park() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let run_id = "run_parked";
+    let (hook, fired, _seen) = counting_hook(Arc::clone(&store), run_id);
+    store.add_before_terminal(run_id, hook);
+
+    let opts = stored_opts(PLACED_THEN_GATE, tmp.path(), Arc::clone(&store), run_id);
+    let result = run_workflow(opts).await.expect("the workflow parks");
+    assert!(result.awaiting.is_some(), "the run parked at the gate");
+    assert_eq!(
+        store.load(run_id).unwrap().status,
+        RunStatus::AwaitingApproval
+    );
+
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        0,
+        "a parked run has not ended: its launcher still records into it"
+    );
+    assert_eq!(
+        store.take_before_terminal(run_id).len(),
+        1,
+        "the hook stays registered for the pass that ends the run"
+    );
 }
