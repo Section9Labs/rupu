@@ -1,0 +1,22 @@
+{
+  "agent_started": "activity",
+  "attempt_resumed": "activity",
+  "dispatch_completed": "activity",
+  "panel_round": "activity",
+  "run_completed": "activity",
+  "run_failed": "error",
+  "run_paused": "activity",
+  "run_resumed": "activity",
+  "run_started": "activity",
+  "step_awaiting_approval": "await",
+  "step_completed": "activity",
+  "step_failed": "error",
+  "step_paused": "activity",
+  "step_resumed": "activity",
+  "step_skipped": "activity",
+  "step_started": "activity",
+  "step_warning": "warning",
+  "step_working": "activity",
+  "unit_completed": "activity",
+  "unit_started": "activity"
+}

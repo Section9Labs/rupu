@@ -6,6 +6,7 @@
 //! registries are checked against too.
 
 pub mod agent_runs;
+pub mod events;
 pub mod sessions;
 pub mod workflow_runs;
 
@@ -53,6 +54,21 @@ impl ListQuery {
 
     pub fn matches(&self, row: &Value) -> Result<bool, Unreportable> {
         rupu_query::matches(row, &self.parsed, self.fields, self.now)
+    }
+
+    /// Whether `row` matches the query's terms on `keys` alone (every other
+    /// term is left out).
+    pub fn matches_on(&self, row: &Value, keys: &[&str]) -> Result<bool, Unreportable> {
+        let only = ParsedQuery {
+            terms: self
+                .parsed
+                .terms
+                .iter()
+                .filter(|t| keys.contains(&t.key))
+                .cloned()
+                .collect(),
+        };
+        rupu_query::matches(row, &only, self.fields, self.now)
     }
 
     /// Whether any term, negated or not, reads `key`.
@@ -458,7 +474,10 @@ mod tests {
         let merged = filter_merged(rows, &f, |_| true, false);
         assert_eq!(merged.rows.len(), 1);
         assert_eq!(
-            merged.headers().get("x-rupu-hosts-without-customer").unwrap(),
+            merged
+                .headers()
+                .get("x-rupu-hosts-without-customer")
+                .unwrap(),
             "old"
         );
     }
