@@ -6,7 +6,7 @@
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
-import { render, screen, cleanup, waitFor, fireEvent } from '@testing-library/react';
+import { render, screen, cleanup, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { api, type AgentSummary } from '../lib/api';
 
@@ -22,6 +22,7 @@ vi.mock('../components/charts/UsageBarChart', () => ({
 }));
 
 import Agents from './Agents';
+import { commitQuery, firstCells } from '../components/query/queryTestUtils';
 import { scopedEntry, withCustomerScope } from '../lib/customerScopeTestUtils';
 
 afterEach(() => {
@@ -99,11 +100,6 @@ describe('Agents query line', () => {
     { name: 'my-project-fixer', scope: 'my-project', provider: 'openai', tools: ['bash', 'grep'], usage: USAGE, run_count: 0 },
     { name: 'broken', scope: 'global', provider: 'anthropic', usage: USAGE, run_count: 0, load_error: 'unknown tool `bsh`' },
   ];
-  const names = () =>
-    screen
-      .getAllByRole('row')
-      .slice(1)
-      .map((r) => r.querySelector('td')?.textContent ?? '');
 
   it('narrows the table to the query in ?q=', async () => {
     vi.spyOn(api, 'getAgents').mockResolvedValue(ROWS);
@@ -112,7 +108,7 @@ describe('Agents query line', () => {
         {withCustomerScope(<Agents />)}
       </MemoryRouter>,
     );
-    await waitFor(() => expect(names()).toEqual(['revieweranthropic']));
+    await waitFor(() => expect(firstCells()).toEqual(['revieweranthropic']));
     expect(screen.getByTestId('query-count')).toHaveTextContent('1 of 3');
   });
 
@@ -123,11 +119,9 @@ describe('Agents query line', () => {
         {withCustomerScope(<Agents />)}
       </MemoryRouter>,
     );
-    await waitFor(() => expect(names()).toHaveLength(3));
-    const input = screen.getByRole('combobox', { name: 'Filter agents' });
-    fireEvent.change(input, { target: { value: 'tool:grep' } });
-    fireEvent.keyDown(input, { key: 'Enter' });
-    await waitFor(() => expect(names()).toEqual(['my-project-fixeropenai']));
+    await waitFor(() => expect(firstCells()).toHaveLength(3));
+    commitQuery('Filter agents', 'tool:grep');
+    await waitFor(() => expect(firstCells()).toEqual(['my-project-fixeropenai']));
   });
 
   it('says so when the query keeps nothing', async () => {
