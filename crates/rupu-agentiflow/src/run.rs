@@ -23,8 +23,9 @@
 //!
 //! `log.jsonl`, `board/` and `mailboxes/` are created lazily by the stores on
 //! first write.
-//! The lead reaches them through always-on `board.*` / `msg.send` tools and
-//! reads them back each turn through the inbox / standing-directive collectors.
+//! The lead reaches them through its `board.*` / `msg.send` tools (unless the
+//! agentiflow sets `messaging: false`) and reads them back each turn
+//! through the inbox / standing-directive collectors.
 //!
 //! The lead's configured base transcript path is `lead/transcript.jsonl`; the
 //! driver writes one file per round beside it (`transcript.r0.jsonl`, ...)

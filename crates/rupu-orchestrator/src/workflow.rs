@@ -1315,7 +1315,7 @@ impl Workflow {
             Some(Messaging::Tools { tools }) => rupu_tools::ToolCatalog::builtin()
                 .resolve_messaging(tools)
                 .map(MessagingSwitch::Tools)
-                .unwrap_or_default(),
+                .unwrap_or(MessagingSwitch::Off),
         }
     }
 

@@ -138,7 +138,7 @@ steps:
 ```
 
 A workflow's `messaging: false` turns it off for every agent step and unit, and for every
-child they launch. An autoflow is a workflow with an `autoflow:` block, so the same key is its
+child they launch. Placed units are the exception: the key does not reach them (see above). An autoflow is a workflow with an `autoflow:` block, so the same key is its
 opt-out. `messaging: true` is the default set, written down. `messaging: { tools: [board.post,
 board.read, msg.send] }` grants only the tools named, recorded in each step's `tool_grant` as
 `ambient:workflow_messaging`. Only `board.*` and `msg.*` tools are accepted.
@@ -152,8 +152,9 @@ since it contradicts itself.
 
 Off is inherited. A run whose messaging is off launches every child with it off: a sub-agent
 through its parent's launch scope, a process child through the internal `--launch-no-messaging`
-flag, a workflow child too, although it is a root of its own. A child never has more than its
-parent.
+flag, a workflow child too, although it is a root of its own. A child of a run whose messaging
+is off has it off. Narrowing is not inherited: a child of a step with `messaging: { tools: [...] }`
+gets the default set.
 
 When a run's messaging is off, a messaging tool its agent names in `tools:` is not offered. The
 run's transcript says so with a `tool_unavailable` notice. Nothing is dropped silently.

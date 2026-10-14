@@ -606,15 +606,18 @@ struct SessionRecord {
 impl SessionRecord {
     /// The newest record version this rupu reads. A record is written at
     /// [`Self::written_version`].
-    const VERSION: u32 = 2;
+    const VERSION: u32 = 3;
 
-    /// 2 for a record that carries skills, which a rupu that predates them
-    /// would drop on its next write; else 1, so those rupus keep reading it.
+    /// The lowest version a rupu must understand to keep the record whole on
+    /// its next write: 3 for an agent's `messaging: false`, 2 for skills,
+    /// else 1, so older rupus keep reading what they can't damage.
     fn written_version(&self) -> u32 {
         let skills = !self.skill_index.is_empty()
             || self.skill_prompt.is_some()
             || !self.loaded_skills.is_empty();
-        if skills {
+        if self.messaging == Some(false) {
+            3
+        } else if skills {
             2
         } else {
             1

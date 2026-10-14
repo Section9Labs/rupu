@@ -422,6 +422,23 @@ async fn a_record_with_skills_is_written_as_version_2() {
     assert_eq!(version(&without.session_id), 1);
 }
 
+/// A record whose agent sets `messaging: false` is written as version 3, so
+/// a rupu that predates F1d refuses it instead of dropping the opt-out on
+/// its next write.
+#[tokio::test]
+async fn a_record_with_messaging_off_is_written_as_version_3() {
+    let _guard = crate::test_support::ENV_LOCK.lock().await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (global, mut record) =
+        skill_session(&tmp, "ses_messaging_off01", &agent(""), &[], &[]).await;
+    record.messaging = Some(false);
+    write_session(&global, SessionScope::Active, &record).unwrap();
+    let path = session_record_path(&global, SessionScope::Active, &record.session_id);
+    let v: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(v["version"], 3);
+    assert_eq!(v["messaging"], false);
+}
+
 /// A record a newer rupu wrote is refused, so this one never writes it back
 /// without the fields it doesn't know.
 #[tokio::test]
