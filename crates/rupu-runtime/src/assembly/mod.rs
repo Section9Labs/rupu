@@ -1272,6 +1272,34 @@ pub async fn resolve_operator_skills(
     .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))
 }
 
+/// The skills an operator's `prompt` invokes with leading `/skill` tokens
+/// ([`rupu_skills::resolve_slash`]), resolved against `dirs` and `held` as
+/// [`resolve_operator_skills`] resolves `--skill` entries, and the prompt
+/// after them. A prompt that starts with no `/` reads no skills directory.
+pub async fn resolve_slash_skills(
+    dirs: &rupu_skills::LayerDirs,
+    held: &[rupu_skills::FrozenSkill],
+    prompt: &str,
+) -> Result<rupu_skills::SlashTurn, AssembleError> {
+    if !prompt.trim_start().starts_with('/') {
+        return Ok(rupu_skills::SlashTurn {
+            invoked: Vec::new(),
+            prompt: prompt.to_owned(),
+        });
+    }
+    let (dirs, held, prompt) = (dirs.clone(), held.to_vec(), prompt.to_owned());
+    tokio::task::spawn_blocking(move || {
+        let failed = |source: rupu_agent::SkillCheckError| AssembleError::Skills {
+            source,
+            looked_in: dirs.clone(),
+        };
+        let catalog = rupu_skills::SkillCatalog::discover(&dirs).map_err(|e| failed(e.into()))?;
+        rupu_skills::resolve_slash(&catalog, &held, &prompt).map_err(|e| failed(e.into()))
+    })
+    .await
+    .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))
+}
+
 /// Discover the layers and resolve `requests` against them (blocking IO).
 fn resolve_run_skills(
     dirs: rupu_skills::LayerDirs,
