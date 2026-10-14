@@ -367,12 +367,13 @@ async fn rebuild_opts_from_disk(
     // needs it, which is the same "drop the local handle, let the last
     // sink holder's drop close the channel" pattern every other in-run
     // sink build in this crate relies on.
-    let (netflow_sink, _netflow_handle) = crate::netflow_sink::for_run(
+    let _netflow = crate::netflow_sink::for_run(
         &global,
         project_root.as_deref(),
         run_id,
         &transcripts.join(format!("{run_id}.jsonl")),
     );
+    let netflow_sink = _netflow.sink.clone();
     let mcp_registry =
         Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg, netflow_sink).await);
 

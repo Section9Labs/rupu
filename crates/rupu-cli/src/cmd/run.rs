@@ -893,8 +893,9 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     // `shutdown()`, so the writer task's own periodic ticker is the
     // primary safety net, but a clean CLI exit should still flush
     // promptly rather than rely on that ticker's multi-second cadence).
-    let (netflow_sink, netflow_handle) =
+    let netflow =
         crate::netflow_sink::for_run(&global, project_root.as_deref(), &run_id, &transcript_path);
+    let netflow_sink = netflow.sink.clone();
 
     // Everything below that can generate outbound HTTP (provider build,
     // SCM registry discovery, repo clone, the agent run itself) is wrapped
@@ -1552,9 +1553,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     // for long-running daemons like `rupu cp serve`, not a substitute for
     // this for a one-shot CLI process that may exit within milliseconds
     // of the ticker's last check.
-    if let Some(handle) = netflow_handle {
-        handle.shutdown().await;
-    }
+    netflow.finish().await;
 
     body_result
 }

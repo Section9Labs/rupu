@@ -7760,12 +7760,13 @@ async fn run_compact_request(
     // `request.transcript_path`, RunStart/RunComplete below), so its sink
     // must not outlive it. See `crate::netflow_sink::for_run`'s doc
     // comment for the "one sink per run, never per daemon" rule.
-    let (netflow_sink, netflow_handle) = crate::netflow_sink::for_run(
+    let netflow = crate::netflow_sink::for_run(
         global,
         session.project_root.as_deref(),
         &request.run_id,
         &request.transcript_path,
     );
+    let netflow_sink = netflow.sink.clone();
 
     let provider_config = provider_factory::ProviderConfig::for_agent(
         &session.provider_name,
@@ -7840,9 +7841,7 @@ async fn run_compact_request(
                 RunStatus::Ok,
                 None,
             )?;
-            if let Some(h) = netflow_handle {
-                h.shutdown().await;
-            }
+            netflow.finish().await;
             return Ok(());
         }
     };
@@ -7869,9 +7868,7 @@ async fn run_compact_request(
             RunStatus::Ok,
             None,
         )?;
-        if let Some(h) = netflow_handle {
-            h.shutdown().await;
-        }
+        netflow.finish().await;
         return Ok(());
     }
 
@@ -8040,9 +8037,7 @@ async fn run_compact_request(
         }
     }
 
-    if let Some(h) = netflow_handle {
-        h.shutdown().await;
-    }
+    netflow.finish().await;
     Ok(())
 }
 
@@ -8303,12 +8298,13 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
     // reintroduce exactly the "first turn wins" defect this plan removes.
     // Must be built before the SCM registry / provider below so both take
     // this turn's real sink rather than a `NullSink` placeholder.
-    let (netflow_sink, netflow_handle) = crate::netflow_sink::for_run(
+    let netflow = crate::netflow_sink::for_run(
         &global,
         session.project_root.as_deref(),
         &args.run_id,
         &transcript_path,
     );
+    let netflow_sink = netflow.sink.clone();
 
     // Everything below that can fail via `?` is wrapped in this block so
     // the netflow-handle shutdown after it runs on BOTH the success and
@@ -8756,9 +8752,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
     // comment: the writer task's periodic ticker is a safety net, not a
     // substitute, for a worker process that may exit shortly after this
     // turn completes.
-    if let Some(handle) = netflow_handle {
-        handle.shutdown().await;
-    }
+    netflow.finish().await;
     body_result
 }
 
