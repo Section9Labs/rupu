@@ -1,4 +1,4 @@
-import { Users, X } from 'lucide-react';
+import { Users } from 'lucide-react';
 import type { SpaceParticipant } from '../../lib/api';
 import { hexA, identityOf } from '../../lib/messages';
 import { cn } from '../../lib/cn';
@@ -6,7 +6,7 @@ import { useThemeMode } from '../codename/useThemeMode';
 import { Avatar } from './Avatar';
 
 /** Everyone in the space, live first. Clicking one filters the feed to the
- *  messages involving it; clicking it again (or ×) clears the filter. */
+ *  messages involving it (an `involving:` term); clicking it again clears it. */
 export function ParticipantsBar({
   participants,
   involving,
@@ -49,12 +49,6 @@ export function ParticipantsBar({
           </button>
         );
       })}
-      {involving && (
-        <button type="button" onClick={() => onInvolving(null)} className="inline-flex items-center gap-0.5 text-meta text-ink-mute hover:text-ink">
-          <X size={11} />
-          involving {involving}
-        </button>
-      )}
     </div>
   );
 }

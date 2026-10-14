@@ -1,6 +1,6 @@
 // Shared severity pill, used across the coverage concern tabs. Colour-coded off
-// the canonical SEVERITY_STYLE ramp so it matches FindingRow / FindingCard
-// (previously every severity rendered the same gray).
+// the canonical SEVERITY_STYLE ramp (previously every severity rendered the
+// same gray).
 import { SEVERITY_STYLE, type Severity } from '../../lib/severity';
 
 const FALLBACK = 'bg-surface text-ink-mute ring-border';

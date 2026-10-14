@@ -2682,6 +2682,35 @@ mod tests {
     /// too: a unit's sub-agent, a launched workflow's steps, a unit of that
     /// workflow still running, and a child one of its steps launched.
     #[test]
+    /// A child a resumed step continued under the same handle declared
+    /// findings under each of its runs: both are in the scope.
+    fn resolve_run_scope_holds_every_run_of_a_continued_child() {
+        use rupu_launch::ledger::{append, LedgerLine, Started};
+        use rupu_tools::ChildKind;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        std::fs::create_dir_all(store.root.join("run_wf")).unwrap();
+        let rows: String = ["step_a1", "step_a2"]
+            .iter()
+            .map(|a| {
+                format!(
+                    "{{\"step_id\":\"scan\",\"run_id\":\"{a}\",\"transcript_path\":\"/t\",\"output\":\"\",\"success\":true,\"skipped\":false,\"rendered_prompt\":\"go\",\"finished_at\":\"2026-10-12T00:00:00Z\"}}\n"
+                )
+            })
+            .collect();
+        std::fs::write(store.root.join("run_wf").join("step_results.jsonl"), rows).unwrap();
+        for (attempt, child) in [("step_a1", "run_c1"), ("step_a2", "run_c2")] {
+            append(
+                &store.root.join(attempt),
+                &LedgerLine::Started(Started::new("ch_1", ChildKind::Agent, "recon", child, 1, 1)),
+            );
+        }
+        let scope = resolve_run_scope(tmp.path(), &store, "run_wf");
+        assert!(scope.contains("run_c1"), "{scope:?}");
+        assert!(scope.contains("run_c2"), "{scope:?}");
+    }
+
+    #[test]
     fn resolve_run_scope_covers_everything_under_an_agentiflow() {
         use rupu_launch::ledger::{append, LedgerLine, Started};
         use rupu_tools::ChildKind;

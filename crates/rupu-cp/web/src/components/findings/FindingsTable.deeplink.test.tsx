@@ -1,8 +1,7 @@
 // @vitest-environment jsdom
-// FindingsTable location-cell deep-link — Task 9's second consumer. Unlike
-// FindingRow (only rendered by RunDetail's Findings tab), FindingsTable is
-// what actually backs the global Findings page, ProjectFindingsTab, and
-// CoverageDetail's findings list (post-#403 SortableTable migration). A row's
+// FindingsTable location-cell deep-link. FindingsTable backs every findings
+// list (FindingsExplorer's global, project, run and agentiflow views, and
+// CoverageDetail's findings list). A row's
 // own `ws_id` (FindingOut) wins; the table-level `wsId` prop is the fallback
 // used by CoverageDetail, whose findings are plain FindingRecords with no
 // per-row ws_id. Absent both, the location stays a plain, non-interactive

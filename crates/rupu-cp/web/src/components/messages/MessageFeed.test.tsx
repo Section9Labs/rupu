@@ -7,7 +7,6 @@ import { EMPTY_LOG, withMessages } from '../../lib/messages';
 import { useMessageSpace, type MessageSpace } from '../../lib/useMessageSpace';
 import MessageFeed from './MessageFeed';
 import { FeedView } from './FeedView';
-import { ALL_KINDS } from '../../lib/messages';
 import { MESSAGES, PARTICIPANTS, RUN_ID } from './fixtures';
 
 afterEach(() => {
@@ -37,6 +36,8 @@ function space(over: Partial<MessageSpace> = {}): MessageSpace {
 }
 
 const row = (id: string) => document.getElementById(`msg-${id}`) as HTMLElement;
+const shown = () => [...document.querySelectorAll<HTMLElement>('[data-msg-id]')].map((e) => e.dataset.msgId);
+const chips = () => screen.queryAllByRole('button', { name: /^Remove / }).map((b) => b.getAttribute('aria-label')!.slice('Remove '.length));
 
 describe('MessageFeed renders every kind', () => {
   it('gives each log kind its own treatment', () => {
@@ -66,22 +67,52 @@ describe('MessageFeed renders every kind', () => {
     expect(within(panel).getByTestId('directive')).toHaveTextContent('retracted by heron');
   });
 
-  it('filters by kind and by participant', () => {
+  it('a kind pill selects only its kinds, and clicking it again clears it', () => {
     render(<MessageFeed route="runs" space={space()} workflow />);
-    fireEvent.click(screen.getByTestId('kind-direct'));
-    expect(row('msg_01JQ8MA003')).toBeNull();
-    expect(row('msg_01JQ8MA001')).not.toBeNull();
-    fireEvent.click(screen.getByTestId('kind-direct'));
-    expect(row('msg_01JQ8MA003')).not.toBeNull();
+    const pill = screen.getByTestId('kind-direct');
+    expect(pill).toHaveTextContent('Direct 2');
+    fireEvent.click(pill);
+    expect(pill).toHaveAttribute('aria-pressed', 'true');
+    expect(shown()).toEqual(['msg_01JQ8MA003', 'msg_01JQ8MA006']);
+    expect(chips()).toEqual(['kind: direct']);
 
+    // Directives covers a directive and its retraction; it replaces the kind term.
+    fireEvent.click(screen.getByTestId('kind-directive'));
+    expect(pill).toHaveAttribute('aria-pressed', 'false');
+    expect(shown()).toEqual(['msg_01JQ8MA002', 'msg_01JQ8MA008']);
+
+    fireEvent.click(screen.getByTestId('kind-directive'));
+    expect(shown()).toHaveLength(MESSAGES.length);
+    expect(chips()).toEqual([]);
+  });
+
+  it('a participant chip filters to messages involving it; clicking again clears', () => {
+    render(<MessageFeed route="runs" space={space()} workflow />);
     const otter = screen.getAllByTestId('participant').find((b) => b.textContent?.includes('otter'))!;
     fireEvent.click(otter);
-    // otter sent msg_009 and was reached by msg_001 / 004 / 005 / 007; not by heron's DM to lynx#1.
-    expect(row('msg_01JQ8MA009')).not.toBeNull();
-    expect(row('msg_01JQ8MA001')).not.toBeNull();
-    expect(row('msg_01JQ8MA003')).toBeNull();
+    expect(otter).toHaveAttribute('aria-pressed', 'true');
+    expect(chips()).toEqual(['involving: otter']);
+    // otter sent 009 and was reached by 001, 002, 004, 005, 007, 008; not by heron's DM to lynx#1 (003) or lynx#1's to role:crawler (006).
+    expect(shown()).toEqual(['msg_01JQ8MA001', 'msg_01JQ8MA002', 'msg_01JQ8MA004', 'msg_01JQ8MA005', 'msg_01JQ8MA007', 'msg_01JQ8MA008', 'msg_01JQ8MA009']);
     fireEvent.click(otter);
-    expect(row('msg_01JQ8MA003')).not.toBeNull();
+    expect(otter).toHaveAttribute('aria-pressed', 'false');
+    expect(shown()).toHaveLength(MESSAGES.length);
+  });
+
+  it('typing a query filters, and a pill joins it', () => {
+    render(<MessageFeed route="runs" space={space()} workflow />);
+    const input = screen.getByLabelText('Filter messages');
+    fireEvent.change(input, { target: { value: 'from:lynx' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(chips()).toEqual(['from: lynx']);
+    expect(shown()).toEqual(['msg_01JQ8MA004', 'msg_01JQ8MA005', 'msg_01JQ8MA006']);
+
+    fireEvent.click(screen.getByTestId('kind-direct'));
+    expect(shown()).toEqual(['msg_01JQ8MA006']);
+
+    fireEvent.change(input, { target: { value: 'gateway' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(screen.getByTestId('feed-rows')).toHaveTextContent('No messages match the filter.');
   });
 
   it('notes a pre-log agentiflow', () => {
@@ -215,9 +246,8 @@ describe('windowing', () => {
         participants={PARTICIPANTS}
         messages={many}
         legacy={false}
-        filter={{ kinds: ALL_KINDS, involving: null }}
-        onToggleKind={() => {}}
-        onInvolving={() => {}}
+        query=""
+        onQuery={() => {}}
       />,
     );
     const mounted = document.querySelectorAll('[data-msg-id]').length;

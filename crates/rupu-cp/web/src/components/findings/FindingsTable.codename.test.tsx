@@ -1,14 +1,12 @@
 // @vitest-environment jsdom
-// Findings surfaces show the declaring agent's codename: FindingsTable (global /
-// project / coverage) gets an "Agent" column; the per-run FindingRow shows it
-// inline. Derived (legacy) names render muted.
+// Findings surfaces show the declaring agent's codename: FindingsTable (every
+// findings list) gets an "Agent" column. Derived (legacy) names render muted.
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect } from 'vitest';
 import { render, screen, cleanup } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { FindingsTable } from './FindingsTable';
-import FindingRow from './FindingRow';
 import type { FindingOut, FindingRecord } from '../../lib/api';
 
 afterEach(cleanup);
@@ -51,14 +49,6 @@ describe('FindingsTable — agent column', () => {
   });
 });
 
-describe('FindingRow — codename', () => {
-  it('shows the declaring agent codename', () => {
-    render(<MemoryRouter><FindingRow finding={out} /></MemoryRouter>);
-    expect(screen.getByText('heron#3')).toBeInTheDocument();
-    expect(screen.getByText('cobalt-harbor')).toBeInTheDocument();
-  });
-});
-
 describe('findings — agent / provider / model', () => {
   const withIdent: FindingOut = {
     ...out,
@@ -67,11 +57,6 @@ describe('findings — agent / provider / model', () => {
 
   it('FindingsTable shows agent · provider/model next to the codename', () => {
     render(<MemoryRouter><FindingsTable findings={[withIdent]} showProvenance /></MemoryRouter>);
-    expect(screen.getByText('heron#3 · sec-reviewer · anthropic/claude-sonnet-4-6')).toBeInTheDocument();
-  });
-
-  it('FindingRow shows agent · provider/model next to the codename', () => {
-    render(<MemoryRouter><FindingRow finding={withIdent} /></MemoryRouter>);
     expect(screen.getByText('heron#3 · sec-reviewer · anthropic/claude-sonnet-4-6')).toBeInTheDocument();
   });
 

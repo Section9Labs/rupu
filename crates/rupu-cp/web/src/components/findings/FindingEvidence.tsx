@@ -1,8 +1,8 @@
-// Evidence panel for a finding — rationale / code excerpt / references. Lifted
-// out of FindingRow so it can be reused as the `renderDetail` body of the
-// shared SortableTable-based findings list. Renders a muted fallback when a
-// finding carries no evidence (the expand chevron is always present on
-// expandable tables, so an empty panel would otherwise be confusing).
+// Evidence panel for a finding — rationale / code excerpt / references: the
+// `renderDetail` body of the shared SortableTable-based findings list. Renders
+// a muted fallback when a finding carries no evidence (the expand chevron is
+// always present on expandable tables, so an empty panel would otherwise be
+// confusing).
 //
 // The rationale is agent-written markdown (backticks, paragraphs, fenced
 // blocks), rendered through the transcript's Markdown component — the same

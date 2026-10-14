@@ -1,15 +1,16 @@
 // @vitest-environment jsdom
-// ProjectFindingsTab — interactive severity filter scoped to one project.
-// api.getFindings is spied to return a mixed-severity page + matching summary;
-// the metric tiles + every row render, clicking the "High" tile narrows the
-// list to high-severity rows, and clicking the "Total" tile brings every row
-// back.
+// ProjectFindingsTab — the findings explorer scoped to one project.
+// api.getFindings is a fake server over a mixed-severity page that honours a
+// lone `severity:<x>` token, as the real one does: the metric tiles + every
+// row render, clicking the "High" tile asks for `severity:high` within the
+// project, and clicking the "Total" tile brings every row back.
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, fireEvent, cleanup, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { api, type FindingOut, type FindingsResponse } from '../../lib/api';
+import { api, type FindingOut } from '../../lib/api';
+import { findingsServer } from '../findings/findingsTestUtils';
 import ProjectFindingsTab from './ProjectFindingsTab';
 
 afterEach(() => {
@@ -37,20 +38,15 @@ function finding(id: string, severity: string, summary: string): FindingOut {
 }
 
 // Backend pre-sorts critical → info; mirror that here.
-const RESP: FindingsResponse = {
-  facets: {},
-  tags_unavailable: [],
-  findings: [
-    finding('f-crit', 'critical', 'Critical SQL injection'),
-    finding('f-high', 'high', 'High auth bypass'),
-    finding('f-med', 'medium', 'Medium info leak'),
-  ],
-  summary: { total: 3, critical: 1, high: 1, medium: 1, low: 0, info: 0 },
-};
+const ROWS: FindingOut[] = [
+  finding('f-crit', 'critical', 'Critical SQL injection'),
+  finding('f-high', 'high', 'High auth bypass'),
+  finding('f-med', 'medium', 'Medium info leak'),
+];
 
 describe('ProjectFindingsTab', () => {
   it('renders tiles + rows, filters by High, then restores via re-click', async () => {
-    vi.spyOn(api, 'getFindings').mockResolvedValue(RESP);
+    const spy = vi.spyOn(api, 'getFindings').mockImplementation(findingsServer(ROWS));
 
     render(
       <MemoryRouter>
@@ -71,13 +67,16 @@ describe('ProjectFindingsTab', () => {
 
     // Click "high" → only the high-severity row remains.
     fireEvent.click(highTile);
+    await waitFor(() => expect(spy).toHaveBeenLastCalledWith({ wsId: 'x', q: 'severity:high' }));
+    await waitFor(() => expect(screen.queryByText('Critical SQL injection')).not.toBeInTheDocument());
     expect(screen.getByText('High auth bypass')).toBeInTheDocument();
     expect(screen.queryByText('Critical SQL injection')).not.toBeInTheDocument();
     expect(screen.queryByText('Medium info leak')).not.toBeInTheDocument();
 
     // Click the Total tile → filter clears, all rows return.
     fireEvent.click(screen.getByRole('button', { name: 'Filter by Total' }));
-    expect(screen.getByText('Critical SQL injection')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText('Critical SQL injection')).toBeInTheDocument());
+    expect(spy).toHaveBeenLastCalledWith({ wsId: 'x' });
     expect(screen.getByText('High auth bypass')).toBeInTheDocument();
     expect(screen.getByText('Medium info leak')).toBeInTheDocument();
   });
@@ -85,10 +84,7 @@ describe('ProjectFindingsTab', () => {
 
 describe('ProjectFindingsTab — export report', () => {
   it('exports the severity-filtered rows, scoped to the project', async () => {
-    vi.spyOn(api, 'getFindings').mockResolvedValue({
-      ...RESP,
-      findings: RESP.findings.map((f) => ({ ...f, profile: 'full' as const })),
-    });
+    vi.spyOn(api, 'getFindings').mockImplementation(findingsServer(ROWS.map((f) => ({ ...f, profile: 'full' as const }))));
     const exportSpy = vi.spyOn(api, 'exportFindings').mockResolvedValue(new Blob(['x']));
     render(
       <MemoryRouter>
@@ -98,6 +94,7 @@ describe('ProjectFindingsTab — export report', () => {
     await waitFor(() => expect(screen.getByText('High auth bypass')).toBeInTheDocument());
 
     fireEvent.click(screen.getByRole('button', { name: 'Filter by high' }));
+    await waitFor(() => expect(screen.queryByText('Critical SQL injection')).not.toBeInTheDocument());
     fireEvent.click(screen.getByRole('button', { name: 'Export report' }));
     const dialog = screen.getByRole('dialog');
     expect(within(dialog).getByLabelText('Title')).toHaveValue('proj findings report');
@@ -110,7 +107,7 @@ describe('ProjectFindingsTab — export report', () => {
   });
 
   it('is disabled when the severity filter leaves no rows', async () => {
-    vi.spyOn(api, 'getFindings').mockResolvedValue(RESP);
+    vi.spyOn(api, 'getFindings').mockImplementation(findingsServer(ROWS));
     render(
       <MemoryRouter>
         <ProjectFindingsTab wsId="x" />
@@ -118,7 +115,7 @@ describe('ProjectFindingsTab — export report', () => {
     );
     await waitFor(() => expect(screen.getByText('High auth bypass')).toBeInTheDocument());
     fireEvent.click(screen.getByRole('button', { name: 'Filter by low' }));
-    expect(screen.getByText('No low findings.')).toBeInTheDocument();
+    await screen.findByText('No findings match `severity:low`.');
     expect(screen.getByRole('button', { name: 'Export report' })).toBeDisabled();
   });
 });
