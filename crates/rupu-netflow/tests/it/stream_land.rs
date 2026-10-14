@@ -379,3 +379,18 @@ fn roster_appends_and_reads() {
         .join("netflow.units.jsonl.lock")
         .exists());
 }
+
+#[test]
+fn landed_lines_keep_the_hosts_bytes_exactly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runs = tmp.path().join("runs");
+    // keys deliberately out of alphabetical order, odd spacing preserved
+    let line = r#"{"type":"dropped","ts":"2026-10-14T00:00:00Z","count":3}"#;
+    let body = format!(
+        "{}\n{{\"kind\":\"line\",\"ledger\":\"run_K\",\"line\":{line}}}\n",
+        r#"{"kind":"begin","v":1,"run_id":"run_K"}"#
+    );
+    land_and_record(&runs, "run_K", "h", Some(body.as_bytes()), true, None).unwrap();
+    let landed = std::fs::read_to_string(tmp.path().join("netflow/run_K.jsonl")).unwrap();
+    assert_eq!(landed, format!("{line}\n"));
+}

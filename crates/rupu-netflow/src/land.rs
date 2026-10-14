@@ -52,14 +52,6 @@ pub struct ParsedStream {
     pub unsafe_ids: usize,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct LandReport {
-    pub begin_seen: bool,
-    pub ledgers: Vec<String>,
-    pub malformed: usize,
-    pub unsafe_ids: usize,
-}
-
 /// A ledger id that is safe as a file name: 1–128 chars of `[A-Za-z0-9_-]`.
 pub fn is_safe_ledger_id(id: &str) -> bool {
     !id.is_empty()
@@ -67,6 +59,18 @@ pub fn is_safe_ledger_id(id: &str) -> bool {
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// One stream line as written, keeping a `line` entry's ledger line as its
+/// original text so it lands byte-for-byte.
+#[derive(Deserialize)]
+struct RawEntry<'a> {
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    ledger: Option<String>,
+    #[serde(default, borrow)]
+    line: Option<&'a serde_json::value::RawValue>,
 }
 
 /// Split `bytes` into ledgers. A `begin` line must be the first non-empty
@@ -83,16 +87,14 @@ pub fn parse_stream(bytes: &[u8]) -> ParsedStream {
             continue;
         }
         let was_first = std::mem::replace(&mut first, false);
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+        let Ok(entry) = serde_json::from_str::<RawEntry<'_>>(raw) else {
             out.malformed += 1;
             continue;
         };
-        match v.get("kind").and_then(|k| k.as_str()) {
+        match entry.kind.as_deref() {
             Some("begin") if was_first => out.begin_seen = true,
             Some("line") => {
-                let (Some(ledger), Some(line)) =
-                    (v.get("ledger").and_then(|l| l.as_str()), v.get("line"))
-                else {
+                let (Some(ledger), Some(line)) = (entry.ledger.as_deref(), entry.line) else {
                     out.malformed += 1;
                     continue;
                 };
@@ -100,10 +102,11 @@ pub fn parse_stream(bytes: &[u8]) -> ParsedStream {
                     out.unsafe_ids += 1;
                     continue;
                 }
+                // The line's own bytes, as the host's ledger holds them.
                 out.ledgers
                     .entry(ledger.to_string())
                     .or_default()
-                    .push(line.to_string());
+                    .push(line.get().to_string());
             }
             _ => out.malformed += 1,
         }

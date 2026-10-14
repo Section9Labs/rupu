@@ -1697,6 +1697,23 @@ async fn land_run_netflow_fetches_and_lands_complete_on_a_terminal_run() {
 }
 
 #[tokio::test]
+async fn a_registry_built_connector_names_its_host_id_in_the_landing() {
+    let remote = tempfile::tempdir().unwrap();
+    let state = cp_state(&remote);
+    seed_netflow_stream(&state, "run_H1", &netflow_stream_body("run_H1"));
+    let addr = serve_cp(state).await;
+
+    let coord = tempfile::tempdir().unwrap();
+    let coord_runs_root = coord.path().join("runs");
+    let c = HttpHostConnector::new(format!("http://{addr}"), None).with_host_id("host_peer");
+    c.land_run_netflow("run_H1", true, &coord_runs_root)
+        .await
+        .unwrap();
+    let rec = rupu_netflow::land::read_landing_record(&coord_runs_root, "run_H1").unwrap();
+    assert_eq!(rec.host, "host_peer");
+}
+
+#[tokio::test]
 async fn land_run_netflow_on_a_snapshot_lands_partial() {
     let remote = tempfile::tempdir().unwrap();
     let state = cp_state(&remote);

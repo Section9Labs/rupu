@@ -62,6 +62,10 @@ pub struct HttpHostConnector {
     /// The shipped skills this remote confirmed it holds — see
     /// [`HostConnector::ship_skills`].
     ship_memo: ShipMemo,
+    /// The registry id this connector was built for ([`Self::with_host_id`]);
+    /// what a netflow landing record names as its host. `None` for a bare
+    /// connector, which names its base URL instead.
+    host_id: Option<String>,
 }
 
 /// What `/api/host/info` said about the remote.
@@ -127,7 +131,15 @@ impl HttpHostConnector {
             artifact_idle: ARTIFACT_PULL_IDLE_TIMEOUT,
             features_seen: std::sync::Mutex::new(None),
             ship_memo: ShipMemo::default(),
+            host_id: None,
         }
+    }
+
+    /// Name the registry host this connector serves, so what it records (a
+    /// netflow landing's `host`) carries the id every other view uses.
+    pub fn with_host_id(mut self, host_id: impl Into<String>) -> Self {
+        self.host_id = Some(host_id.into());
+        self
     }
 
     /// Like [`Self::new`], but bounds every request's connect + total time to
@@ -164,6 +176,7 @@ impl HttpHostConnector {
             artifact_idle: ARTIFACT_PULL_IDLE_TIMEOUT,
             features_seen: std::sync::Mutex::new(None),
             ship_memo: ShipMemo::default(),
+            host_id: None,
         }
     }
 
@@ -867,7 +880,7 @@ impl HostConnector for HttpHostConnector {
         let (runs_root, run_id, host) = (
             runs_root.to_path_buf(),
             run_id.to_string(),
-            self.base_url.clone(),
+            self.host_id.clone().unwrap_or_else(|| self.base_url.clone()),
         );
         let rec = tokio::task::spawn_blocking(move || match fetched {
             Ok(bytes) => rupu_netflow::land::land_and_record(
