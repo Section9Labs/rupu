@@ -152,6 +152,9 @@ struct FileOffsets {
     /// `coverage.jsonl` — the run's coverage stream. Only ever advanced on a
     /// tunnel connection whose CP advertised `mirror.coverage`.
     coverage: u64,
+    /// `netflow.jsonl` — the run's netflow stream. Only ever advanced on a
+    /// tunnel connection whose CP advertised `mirror.netflow`.
+    netflow: u64,
 }
 
 /// One bucket result stream's cursor (events, step_results, ...): how far into
@@ -182,13 +185,16 @@ struct BucketStreams {
     unit_checkpoints: BucketStream,
     usage: BucketStream,
     coverage: BucketStream,
+    /// `netflow.jsonl` — the run's netflow stream (spec 2026-10-14 §N2):
+    /// `netflow.<seq:04>.jsonl` result objects.
+    netflow: BucketStream,
     /// Terminal passes each referenced artifact blob (by sha256) has failed;
     /// see [`upload_referenced_artifacts`].
     artifact_failures: HashMap<String, u32>,
 }
 
 impl BucketStreams {
-    /// Upload every stream's new lines. All five are attempted even when one
+    /// Upload every stream's new lines. All six are attempted even when one
     /// fails; returns `true` only when nothing is left unsent.
     async fn upload_all(&mut self, bucket: &dyn Bucket, rid: &str, run_dir: &Path) -> bool {
         let mut landed = true;
@@ -216,8 +222,8 @@ impl BucketStreams {
             &mut self.unit_checkpoints,
         )
         .await;
-        // No capability gate on usage / coverage: an older CP's poller skips
-        // the unknown `usage.*` / `coverage.*` keys.
+        // No capability gate on usage / coverage / netflow: an older CP's
+        // poller skips the unknown `usage.*` / `coverage.*` / `netflow.*` keys.
         landed &= upload_usage_ledger(bucket, rid, run_dir, &mut self.usage).await;
         landed &= upload_new_lines(
             bucket,
@@ -225,6 +231,14 @@ impl BucketStreams {
             "coverage",
             &coverage_path(run_dir),
             &mut self.coverage,
+        )
+        .await;
+        landed &= upload_new_lines(
+            bucket,
+            rid,
+            "netflow",
+            &netflow_path(run_dir),
+            &mut self.netflow,
         )
         .await;
         landed
@@ -555,6 +569,9 @@ async fn connect_and_run_with(
     // one unless this is set.
     let mirror_coverage =
         welcome_advertises(&welcome_frame, rupu_cp::node::protocol::CAP_MIRROR_COVERAGE);
+    // Same rule for `ArtifactFile::Netflow` frames (the run's netflow stream).
+    let mirror_netflow =
+        welcome_advertises(&welcome_frame, rupu_cp::node::protocol::CAP_MIRROR_NETFLOW);
     eprintln!("connected ✓ (authenticated as {node_id})");
     info!(node_id = %node_id, "node: authenticated (Welcome received)");
 
@@ -654,6 +671,15 @@ async fn connect_and_run_with(
                 mirror_coverage,
             )
             .await;
+            // netflow.jsonl — the same gate, for `mirror.netflow`.
+            ship_netflow(
+                &mut sink,
+                rid,
+                &run_dir,
+                &mut state.offsets.netflow,
+                mirror_netflow,
+            )
+            .await;
             // run.json — check for terminal status.
             if let Some((status, body)) = read_terminal_status(&run_dir.join("run.json")) {
                 // A ledger row can land between the drain above and this
@@ -676,6 +702,16 @@ async fn connect_and_run_with(
                     &run_dir,
                     &mut state.offsets.coverage,
                     mirror_coverage,
+                )
+                .await;
+                // Final netflow drain, for the same reason: the CP lands the
+                // stream on the terminal run.json, so every line must precede it.
+                ship_netflow(
+                    &mut sink,
+                    rid,
+                    &run_dir,
+                    &mut state.offsets.netflow,
+                    mirror_netflow,
                 )
                 .await;
                 send_artifact(&mut sink, rid, ArtifactFile::RunJson, body).await;
@@ -725,6 +761,7 @@ async fn connect_and_run_with(
                                     unit_checkpoints: 0,
                                     usage: 0,
                                     coverage: 0,
+                                    netflow: 0,
                                 },
                             },
                         );
@@ -759,6 +796,14 @@ async fn connect_and_run_with(
                         &runs_root.join(&run_id),
                         &mut state.offsets.coverage,
                         mirror_coverage,
+                    )
+                    .await;
+                    ship_netflow(
+                        &mut sink,
+                        &run_id,
+                        &runs_root.join(&run_id),
+                        &mut state.offsets.netflow,
+                        mirror_netflow,
                     )
                     .await;
                     let cancelled_frame = Frame::RunFinished {
@@ -1667,6 +1712,39 @@ async fn ship_coverage<S>(
     }
     for line in drain_coverage(run_dir, offset) {
         send_artifact(sink, run_id, ArtifactFile::Coverage, line).await;
+    }
+}
+
+/// A run's netflow stream: `runs/<id>/netflow.jsonl` (spec 2026-10-14 §N1).
+fn netflow_path(run_dir: &Path) -> std::path::PathBuf {
+    run_dir.join(rupu_netflow::stream::STREAM_FILE)
+}
+
+/// Send the run's new netflow stream lines to the CP as
+/// `ArtifactFile::Netflow` frames — the one place the tunnel does it (the
+/// routine drain, the terminal drain before `run.json` / `RunFinished`, and
+/// the cancel drain all call this). Not a `ship_coverage` over another path:
+/// that function's frame kind is fixed.
+///
+/// `mirror_netflow` is the capability gate (the CP's `Welcome` advertised
+/// `mirror.netflow`); when it is `false` an older CP could not parse the
+/// frame, so nothing is sent AND `*offset` does not move — the stream is not
+/// consumed. Offsets make repeat calls exact-once: a later call sends only
+/// what was appended since, and a trailing partial line is held back.
+async fn ship_netflow<S>(
+    sink: &mut S,
+    run_id: &str,
+    run_dir: &Path,
+    offset: &mut u64,
+    mirror_netflow: bool,
+) where
+    S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    if !mirror_netflow {
+        return;
+    }
+    for line in drain_new_lines(&netflow_path(run_dir), offset) {
+        send_artifact(sink, run_id, ArtifactFile::Netflow, line).await;
     }
 }
 
@@ -2672,6 +2750,7 @@ mod tests {
             unit_checkpoints: 0,
             usage: 0,
             coverage: 0,
+            netflow: 0,
         }
     }
 
@@ -3017,6 +3096,102 @@ mod tests {
             ["usage.0000.jsonl", "run.json", "finished"]
         );
         assert_eq!(streams.usage.seq, 1);
+    }
+
+    /// The run's netflow stream (`runs/<id>/netflow.jsonl`, spec 2026-10-14
+    /// §N2) rides the terminal hold like every other stream: its chunks are
+    /// `netflow.<seq:04>.jsonl` result objects put BEFORE the terminal
+    /// `run.json` and the `finished` marker, so the CP's landing at `finish`
+    /// sees the whole copy. A line appended after the routine drain is the
+    /// next chunk, exactly once.
+    #[tokio::test]
+    async fn bucket_terminal_pass_uploads_netflow_chunks_before_finished() {
+        let dir = tempdir().unwrap();
+        let stream = netflow_path(dir.path());
+        let begin = "{\"kind\":\"begin\",\"v\":1,\"run_id\":\"run_NF\"}\n";
+        let l1 = "{\"kind\":\"line\",\"ledger\":\"run_NF\",\"line\":{\"type\":\"dropped\",\"count\":1}}\n";
+        std::fs::write(&stream, format!("{begin}{l1}")).unwrap();
+        let bucket = RecordingBucket::default();
+        let mut streams = BucketStreams::default();
+
+        // Routine drain earlier in the pass.
+        assert!(streams.upload_all(&bucket, "run_NF", dir.path()).await);
+        // The run writes its final line, then the terminal run.json.
+        let l2 = "{\"kind\":\"line\",\"ledger\":\"sub_NFa\",\"line\":{\"type\":\"dropped\",\"count\":2}}\n";
+        append(&stream, l2);
+        assert!(
+            finish_bucket_run(
+                &bucket,
+                "run_NF",
+                dir.path(),
+                dir.path(),
+                &mut streams,
+                RUN_JSON,
+                "completed",
+            )
+            .await
+        );
+
+        let ops = bucket.landed();
+        let keys: Vec<&str> = ops.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "netflow.0000.jsonl",
+                "netflow.0001.jsonl",
+                "run.json",
+                "finished"
+            ],
+            "{ops:?}"
+        );
+        assert_eq!(ops[0].1, format!("{begin}{l1}"));
+        assert_eq!(ops[1].1, l2, "only the late line");
+        assert_eq!(streams.netflow.seq, 2);
+
+        // A failing netflow put holds the marker: the chunk would be lost for
+        // good once the CP stops reading a finished run.
+        let dir = tempdir().unwrap();
+        std::fs::write(netflow_path(dir.path()), begin).unwrap();
+        let failing = RecordingBucket::failing("netflow");
+        let mut streams = BucketStreams::default();
+        assert!(
+            !finish_bucket_run(
+                &failing,
+                "run_NF2",
+                dir.path(),
+                dir.path(),
+                &mut streams,
+                RUN_JSON,
+                "completed",
+            )
+            .await
+        );
+        assert!(
+            !failing.landed_keys().iter().any(|k| k == "finished"),
+            "{:?}",
+            failing.landed_keys()
+        );
+        failing.set_failing(None);
+        assert!(
+            finish_bucket_run(
+                &failing,
+                "run_NF2",
+                dir.path(),
+                dir.path(),
+                &mut streams,
+                RUN_JSON,
+                "completed",
+            )
+            .await
+        );
+        assert_eq!(
+            failing.landed_keys(),
+            ["netflow.0000.jsonl", "run.json", "finished"]
+        );
+        assert_eq!(
+            failing.landed_body("netflow.0000.jsonl").as_deref(),
+            Some(begin)
+        );
     }
 
     /// A stream whose last upload fails must NOT get the `finished` marker (the
@@ -5022,6 +5197,22 @@ mod tests {
                 })
                 .collect()
         }
+
+        /// Every frame sent, as `(run_id, line)` — asserting each one is a
+        /// `Frame::Artifact { file: Netflow, .. }`.
+        fn netflow_frames(&self) -> Vec<(String, String)> {
+            self.0
+                .iter()
+                .map(|m| match parse_frame(m).unwrap() {
+                    Frame::Artifact {
+                        run_id,
+                        file: ArtifactFile::Netflow,
+                        line,
+                    } => (run_id, line),
+                    other => panic!("expected a netflow artifact frame, got {other:?}"),
+                })
+                .collect()
+        }
     }
 
     fn append(path: &Path, text: &str) {
@@ -5112,6 +5303,54 @@ mod tests {
             ["a", "b", "c", "d"],
             "each line exactly once, in order"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // ship_netflow: the run's netflow stream, gated on `mirror.netflow`
+    // ------------------------------------------------------------------
+
+    /// A CP that never advertised `mirror.netflow` can't parse the frame:
+    /// nothing is sent and the offset stays put. To a capable CP every line
+    /// of `runs/<id>/netflow.jsonl` ships as an `ArtifactFile::Netflow` frame,
+    /// and a later call ships only what was appended since.
+    #[tokio::test]
+    async fn ship_netflow_sends_frames_only_when_the_cp_advertised_it() {
+        let run_dir = tempdir().unwrap();
+        let stream = netflow_path(run_dir.path());
+        assert_eq!(stream, run_dir.path().join("netflow.jsonl"));
+        let begin = r#"{"kind":"begin","v":1,"run_id":"run_1"}"#;
+        let l1 = r#"{"kind":"line","ledger":"run_1","line":{"type":"dropped","count":1}}"#;
+        let l2 = r#"{"kind":"line","ledger":"sub_1a","line":{"type":"dropped","count":2}}"#;
+        append(&stream, &format!("{begin}\n{l1}\n{l2}\n"));
+        let mut sink = VecSink::default();
+        let mut off = 0u64;
+
+        ship_netflow(&mut sink, "run_1", run_dir.path(), &mut off, false).await;
+        assert!(sink.0.is_empty(), "no frame to an incapable CP");
+        assert_eq!(
+            off, 0,
+            "nothing consumed that a capable connection could send"
+        );
+
+        ship_netflow(&mut sink, "run_1", run_dir.path(), &mut off, true).await;
+        assert_eq!(
+            sink.netflow_frames(),
+            vec![
+                ("run_1".to_string(), begin.to_string()),
+                ("run_1".to_string(), l1.to_string()),
+                ("run_1".to_string(), l2.to_string()),
+            ]
+        );
+        assert_eq!(off, std::fs::metadata(&stream).unwrap().len());
+
+        // The run wrote one more line: exactly one new frame.
+        let l3 = r#"{"kind":"line","ledger":"run_1","line":{"type":"dropped","count":3}}"#;
+        append(&stream, &format!("{l3}\n"));
+        ship_netflow(&mut sink, "run_1", run_dir.path(), &mut off, true).await;
+        let frames = sink.netflow_frames();
+        assert_eq!(frames.len(), 4, "{frames:?}");
+        assert_eq!(frames[3], ("run_1".to_string(), l3.to_string()));
+        assert_eq!(off, std::fs::metadata(&stream).unwrap().len());
     }
 
     /// `peek_new_lines` reads without committing; `drain_new_lines` is the

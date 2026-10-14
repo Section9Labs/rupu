@@ -299,6 +299,178 @@ async fn mirror_create_append_finish_round_trip() {
     );
 }
 
+/// A node's netflow stream frames (spec 2026-10-14 §N2) go over a real
+/// tunnel: `ArtifactFile::Netflow` lines, then the terminal `run.json`, then
+/// `RunFinished`. The CP's read pump mirrors them in order and the mirror
+/// lands the stream when the run turns terminal: a `complete` landing record
+/// naming the node, and each ledger split into `<global>/netflow/<id>.jsonl`.
+#[tokio::test]
+async fn netflow_frames_land_when_the_run_finishes() {
+    use rupu_cp::node::mirror::NodeMirror;
+    use rupu_cp::node::protocol::{ArtifactFile, RunSpec, RunSpecKind};
+    use rupu_netflow::land::{read_landing_record, LandingStatus};
+    use rupu_orchestrator::{RunStatus, RunStore};
+    use rupu_workspace::{enroll_node, HostStore};
+    use std::collections::BTreeMap;
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let host_store = HostStore {
+        root: dir.path().join("hosts"),
+    };
+    let (host, token) = enroll_node(&host_store, "netflow-node").unwrap();
+    let nid = match &host.transport {
+        rupu_workspace::HostTransport::Tunnel { node_id } => node_id.clone(),
+        _ => panic!("expected Tunnel transport"),
+    };
+    let (addr, _registry) = spawn_cp_with_state(dir.path()).await;
+
+    // The run the node is about to report on, as the CP's dispatcher would
+    // have created it: in the CP's store, owned by this node.
+    let run_store = Arc::new(RunStore::new(dir.path().join("runs")));
+    let run_id = "run_NETFLOWTUNNEL01";
+    NodeMirror::new(Arc::clone(&run_store))
+        .create_run(
+            run_id,
+            &nid,
+            &RunSpec {
+                skill_bundle: None,
+                kind: RunSpecKind::Agent,
+                name: "a".to_string(),
+                inputs: BTreeMap::new(),
+                prompt: None,
+                mode: None,
+                target: None,
+                findings_profile: None,
+                engagement_profiles: Vec::new(),
+                skills: Vec::new(),
+                preload_skills: Vec::new(),
+                codename: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/node/connect"))
+        .await
+        .expect("WS connect failed");
+    send_frame(
+        &mut ws,
+        &Frame::Hello {
+            node_id: nid.clone(),
+            auth: rupu_cp::node::Auth::Token { token },
+            rupu_version: "9.9.9".to_string(),
+            capabilities: rupu_cp::node::protocol::node_capabilities(),
+        },
+    )
+    .await;
+    let welcome = tokio::time::timeout(std::time::Duration::from_secs(5), recv_frame(&mut ws))
+        .await
+        .expect("timed out waiting for Welcome")
+        .expect("connection closed before Welcome");
+    match &welcome {
+        Frame::Welcome { capabilities } => assert!(
+            capabilities
+                .iter()
+                .any(|c| c == rupu_cp::node::protocol::CAP_MIRROR_NETFLOW),
+            "the node sends netflow frames only to a CP that advertised mirror.netflow: {capabilities:?}"
+        ),
+        other => panic!("expected Welcome, got {other:?}"),
+    }
+
+    let begin = format!(r#"{{"kind":"begin","v":1,"run_id":"{run_id}"}}"#);
+    let own = r#"{"type":"dropped","count":1,"ts":"2026-10-14T00:00:00Z"}"#;
+    let sub = r#"{"type":"dropped","count":2,"ts":"2026-10-14T00:00:01Z"}"#;
+    let lines = [
+        begin,
+        format!(r#"{{"kind":"line","ledger":"{run_id}","line":{own}}}"#),
+        format!(r#"{{"kind":"line","ledger":"sub_NETFLOWTUNNEL01a","line":{sub}}}"#),
+    ];
+    for line in &lines {
+        send_frame(
+            &mut ws,
+            &Frame::Artifact {
+                run_id: run_id.to_string(),
+                file: ArtifactFile::Netflow,
+                line: line.clone(),
+            },
+        )
+        .await;
+    }
+    let mut terminal = run_store.load(run_id).unwrap();
+    terminal.status = RunStatus::Completed;
+    send_frame(
+        &mut ws,
+        &Frame::Artifact {
+            run_id: run_id.to_string(),
+            file: ArtifactFile::RunJson,
+            line: serde_json::to_string(&terminal).unwrap(),
+        },
+    )
+    .await;
+    send_frame(
+        &mut ws,
+        &Frame::RunFinished {
+            run_id: run_id.to_string(),
+            status: "completed".to_string(),
+        },
+    )
+    .await;
+
+    // The read pump lands the stream as it mirrors the terminal run.json;
+    // wait (bounded) for the record to appear.
+    let record = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(r) = read_landing_record(&run_store.root, run_id) {
+                break r;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the netflow stream never landed");
+    assert_eq!(record.status, LandingStatus::Complete, "{record:?}");
+    assert_eq!(record.host, nid);
+    assert_eq!(record.reason, None);
+    assert_eq!(
+        record.ledgers,
+        vec![run_id.to_string(), "sub_NETFLOWTUNNEL01a".to_string()]
+    );
+
+    // The mirrored copy is whole, and each ledger landed under its own id
+    // with the raw ledger lines.
+    assert_eq!(
+        std::fs::read_to_string(run_store.root.join(run_id).join("netflow.jsonl")).unwrap(),
+        format!("{}\n{}\n{}\n", lines[0], lines[1], lines[2])
+    );
+    // (The lander carries each line as a `serde_json::Value`, so its key
+    // order may differ from the wire's; compare the JSON, not the bytes.)
+    let landed_lines = |name: &str| -> Vec<serde_json::Value> {
+        std::fs::read_to_string(dir.path().join("netflow").join(name))
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    };
+    let json = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+    assert_eq!(landed_lines(&format!("{run_id}.jsonl")), vec![json(own)]);
+    assert_eq!(landed_lines("sub_NETFLOWTUNNEL01a.jsonl"), vec![json(sub)]);
+
+    // And the run itself finished through the same pump.
+    let finished = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let rec = run_store.load(run_id).unwrap();
+            if rec.finished_at.is_some() {
+                break rec;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("RunFinished never applied");
+    assert_eq!(finished.status, RunStatus::Completed);
+}
+
 /// A node's usage ledger lines land verbatim in the run's `usage.jsonl`
 /// (`RunStore::usage_ledger_path`) — the file the CP's live usage fold reads.
 #[tokio::test]
@@ -1251,14 +1423,22 @@ async fn ws_valid_hello_receives_welcome_and_is_online() {
         "Welcome must advertise usage_ledger, got {response:?}"
     );
     // The Welcome advertises what this CP can parse, so a node knows it may
-    // send `ArtifactFile::Coverage` frames.
+    // send `ArtifactFile::Coverage` and `ArtifactFile::Netflow` frames.
     match response {
-        Frame::Welcome { capabilities } => assert!(
-            capabilities
-                .iter()
-                .any(|c| c == rupu_cp::node::protocol::CAP_MIRROR_COVERAGE),
-            "Welcome must advertise mirror.coverage, got {capabilities:?}"
-        ),
+        Frame::Welcome { capabilities } => {
+            assert!(
+                capabilities
+                    .iter()
+                    .any(|c| c == rupu_cp::node::protocol::CAP_MIRROR_COVERAGE),
+                "Welcome must advertise mirror.coverage, got {capabilities:?}"
+            );
+            assert!(
+                capabilities
+                    .iter()
+                    .any(|c| c == rupu_cp::node::protocol::CAP_MIRROR_NETFLOW),
+                "Welcome must advertise mirror.netflow, got {capabilities:?}"
+            );
+        }
         other => panic!("expected Welcome, got {other:?}"),
     }
 
