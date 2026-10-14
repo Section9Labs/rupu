@@ -376,6 +376,9 @@ pub struct LeadConfig {
     /// broadcasts, operator messages included, and the board's standing
     /// directives). Shared `Arc`s, cloned into every round's launch.
     pub collectors: Vec<Arc<dyn rupu_agent::TurnCollector>>,
+    /// The agentiflow's `messaging: false` (spec F1d D3): the lead gets no
+    /// messaging tool and its units inherit off.
+    pub messaging_off: bool,
 }
 
 /// The `run_agent`-backed lead: each [`LeadDriver::run_round`] is one
@@ -677,6 +680,7 @@ impl RunAgentLeadDriver {
             origin: Origin::FlowLead {
                 flow_id: self.cfg.run_id.clone(),
                 flow_dir: self.cfg.flow_dir.clone(),
+                messaging_off: self.cfg.messaging_off,
             },
             run_id: self.cfg.run_id.clone(),
             transcript_path,
@@ -1080,6 +1084,7 @@ mod tests {
             run_status: None,
             catalog: None,
             collectors: Vec::new(),
+            messaging_off: false,
         }
     }
 

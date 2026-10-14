@@ -162,8 +162,9 @@ impl WorkflowRun {
 
 /// What a launched child takes from the run that started it, across the
 /// process boundary (spec W7 §3.4, D18): `--launch-depth`,
-/// `--launch-ceiling`, `--parent-run`, `--root-run`, `--usage-root`, and the
-/// caps `--launch-agents=` / `--launch-workflows=` / `--launch-actions=`.
+/// `--launch-ceiling`, `--parent-run`, `--root-run`, `--usage-root`, the
+/// caps `--launch-agents=` / `--launch-workflows=` / `--launch-actions=` and
+/// `--launch-no-messaging`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LaunchLink {
     /// The child's depth (its parent's + 1).
@@ -184,6 +185,10 @@ pub struct LaunchLink {
     /// The connector tools the parent was narrowed to; `None` = not
     /// narrowed (an empty list allows none).
     pub actions: Option<Vec<String>>,
+    /// The parent's messaging is off, so the child's is too (spec F1d D6):
+    /// `--launch-no-messaging`. Absent in a ledger written before it.
+    #[serde(default)]
+    pub no_messaging: bool,
 }
 
 /// Which workflow a [`WorkflowRun`] runs.
@@ -678,6 +683,9 @@ impl Args {
         if let Some(a) = &l.actions {
             self.push(format!("--launch-actions={}", a.join(",")));
         }
+        if l.no_messaging {
+            self.push("--launch-no-messaging");
+        }
     }
 }
 
@@ -1097,6 +1105,7 @@ mod tests {
             agents: vec!["a".into(), "b".into()],
             workflows: vec![],
             actions: Some(vec![]),
+            no_messaging: false,
         });
         assert_eq!(
             strs(&RunArgv::Agent(run)),
@@ -1120,5 +1129,32 @@ mod tests {
                 "--launch-actions=",
             ]
         );
+    }
+
+    /// Spec F1d D6: a parent whose messaging is off passes
+    /// `--launch-no-messaging`; one whose messaging is on passes nothing.
+    #[test]
+    fn a_launch_link_renders_no_messaging_only_when_off() {
+        let link = |no_messaging| LaunchLink {
+            depth: 1,
+            ceiling: PermissionMode::Bypass,
+            parent_run: "run_p".into(),
+            root_run: "run_p".into(),
+            usage_root: None,
+            agents: vec![],
+            workflows: vec![],
+            actions: None,
+            no_messaging,
+        };
+        let mut off = AgentRun::new("recon", "run_1");
+        off.launch = Some(link(true));
+        let args = strs(&RunArgv::Agent(off));
+        assert_eq!(args.last().map(String::as_str), Some("--launch-no-messaging"));
+        assert_eq!(args.iter().filter(|a| a.starts_with("--launch-no")).count(), 1);
+        let mut on = AgentRun::new("recon", "run_1");
+        on.launch = Some(link(false));
+        assert!(!strs(&RunArgv::Agent(on))
+            .iter()
+            .any(|a| a == "--launch-no-messaging"));
     }
 }

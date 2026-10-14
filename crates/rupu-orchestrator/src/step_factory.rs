@@ -233,7 +233,7 @@ steps:
             },
             transcript_path: global.join(format!("{step}.jsonl")),
             on_tool_call: None,
-            messaging: None,
+            messaging: rupu_tools::MessagingSwitch::Default,
         }
     }
 

@@ -474,8 +474,26 @@ fn messaging_grants_resolve_to_bus_tools_only() {
     assert!(cat.resolve_messaging(&names(&["board.pots"])).is_err());
 
     use rupu_tools::Service::MessageBus;
-    assert!(cat.names_service(&names(&["read_file", "msg.send"]), MessageBus));
-    assert!(cat.names_service(&names(&["board.*"]), MessageBus));
-    assert!(!cat.names_service(&names(&["*"]), MessageBus));
-    assert!(!cat.names_service(&names(&["core.*", "scm.*"]), MessageBus));
+    assert_eq!(
+        cat.naming_service(&names(&["read_file", "msg.send"]), MessageBus),
+        Some("msg.send")
+    );
+    assert_eq!(
+        cat.naming_service(&names(&["board.*"]), MessageBus),
+        Some("board.*")
+    );
+    assert_eq!(cat.naming_service(&names(&["*"]), MessageBus), None);
+    assert_eq!(
+        cat.naming_service(&names(&["core.*", "scm.*"]), MessageBus),
+        None
+    );
+}
+
+/// F1d D1: the default messaging grant is the workflow set under its own
+/// reason, so a `tool_grant` tells a default apart from a workflow's key.
+#[test]
+fn messaging_default_is_the_workflow_set() {
+    let g = AmbientGrant::messaging_default();
+    assert_eq!(g.tools, rupu_tools::WORKFLOW_MESSAGING);
+    assert_eq!(g.reason.to_string(), "ambient:messaging_default");
 }

@@ -115,6 +115,7 @@ round:
 | `round.lead_max_turns` | no | Turns the lead may take per round. Default `50`, minimum `1` |
 | `round.ceiling` | no | `{ rounds?, wall_clock? }`: a hard end to the run |
 | `trigger` | no | Accepted and stored, not acted on (section 10) |
+| `messaging` | no | `false` turns the messaging tools (`board.*`, `msg.send`) off for the lead and every unit; the operator still reaches them ([messaging.md](messaging.md#turning-it-off)). Default on |
 
 Unknown keys are rejected.
 

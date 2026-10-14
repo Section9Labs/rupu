@@ -138,6 +138,8 @@ struct Frontmatter {
     /// `dispatch {kind: workflow}`.
     #[serde(default, rename = "dispatchableWorkflows")]
     dispatchable_workflows: Option<Vec<String>>,
+    #[serde(default)]
+    messaging: Option<bool>,
     /// Coverage concerns block. When present, the runner flattens the
     /// catalog, writes a snapshot to `.rupu/coverage/<target>/catalog.yaml`,
     /// injects the 4 coverage tools, and prepends the catalog to the
@@ -213,6 +215,9 @@ pub struct AgentSpec {
     /// Per-agent allowlist of the workflows this agent can start with
     /// `dispatch {kind: workflow}`.
     pub dispatchable_workflows: Option<Vec<String>>,
+    /// `messaging:` frontmatter (spec F1d D4): `Some(false)` turns the
+    /// messaging tools off wherever this agent runs.
+    pub messaging: Option<bool>,
     /// Coverage concerns block parsed from `concerns:` frontmatter.
     pub concerns: Option<ConcernsBlock>,
     /// Optional agent pin for the per-request output-token cap, overriding the
@@ -280,6 +285,7 @@ impl AgentSpec {
             thinking_display: fm.thinking_display,
             dispatchable_agents: fm.dispatchable_agents,
             dispatchable_workflows: fm.dispatchable_workflows,
+            messaging: fm.messaging,
             concerns: fm.concerns,
             max_tokens: fm.max_tokens,
             context_window_tokens: fm.context_window_tokens,
@@ -304,10 +310,25 @@ impl AgentSpec {
     /// only — whether a run can serve a tool is the run's question. A typo
     /// is an error with a did-you-mean, never a silently missing tool.
     pub fn validate_tools(&self) -> Result<(), rupu_tools::GrantError> {
-        match &self.tools {
-            Some(tools) => rupu_tools::ToolCatalog::builtin().validate_names(tools),
-            None => Ok(()),
+        let Some(tools) = &self.tools else {
+            return Ok(());
+        };
+        let catalog = rupu_tools::ToolCatalog::builtin();
+        catalog.validate_names(tools)?;
+        if self.messaging_off() {
+            if let Some(name) = catalog.naming_service(tools, rupu_tools::Service::MessageBus) {
+                return Err(rupu_tools::GrantError::MessagingOff {
+                    name: name.to_string(),
+                });
+            }
         }
+        Ok(())
+    }
+
+    /// Whether `messaging: false` turns this agent's messaging tools off
+    /// (spec F1d D4).
+    pub fn messaging_off(&self) -> bool {
+        self.messaging == Some(false)
     }
 
     pub fn declares_skills(&self) -> bool {

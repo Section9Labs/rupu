@@ -174,6 +174,10 @@ pub struct LaunchScope {
     /// flow's board.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flow: Option<PathBuf>,
+    /// This run's messaging is off (spec F1d D6): its children's is too. A
+    /// child never has more than its parent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub messaging_off: bool,
 }
 
 /// An agentiflow's pool: the agents and workflows its runs may launch.

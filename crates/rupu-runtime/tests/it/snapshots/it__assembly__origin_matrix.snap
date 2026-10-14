@@ -40,6 +40,7 @@ flow_lead:
   grant_offers_issues_create: true
   grant_offers_agents_list: true
   origin_grant: "origin:flow_lead: board.claim board.release board.post board.read board.directive board.retract msg.send goal.status goal.coverage budget.status agents.list agents.get workflows.list workflows.get catalog.search findings.report dispatch join workflows.generate"
+  messaging: "declared:*,origin:flow_lead"
   narrowed: []
 flow_unit:
   surface: agentiflow
@@ -79,6 +80,7 @@ flow_unit:
   grant_offers_issues_create: true
   grant_offers_agents_list: true
   origin_grant: "origin:flow_unit: board.claim board.release board.post board.read msg.send"
+  messaging: "declared:*,origin:flow_unit"
   narrowed: []
 session_turn:
   surface: session
@@ -118,6 +120,7 @@ session_turn:
   grant_offers_issues_create: true
   grant_offers_agents_list: true
   origin_grant: ~
+  messaging: "declared:*,ambient:messaging_default"
   narrowed: []
 standalone:
   surface: agent
@@ -157,6 +160,7 @@ standalone:
   grant_offers_issues_create: true
   grant_offers_agents_list: true
   origin_grant: ~
+  messaging: "declared:*,ambient:messaging_default"
   narrowed: []
 sub_agent:
   surface: workflow
@@ -195,6 +199,7 @@ sub_agent:
   grant_offers_issues_create: true
   grant_offers_agents_list: true
   origin_grant: ~
+  messaging: "declared:*,ambient:messaging_default"
   narrowed: []
 workflow_step:
   surface: workflow
@@ -234,6 +239,7 @@ workflow_step:
   grant_offers_issues_create: true
   grant_offers_agents_list: true
   origin_grant: ~
+  messaging: "declared:*,ambient:messaging_default"
   narrowed:
     - github.workflows_dispatch
     - gitlab.pipeline_trigger

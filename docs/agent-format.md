@@ -73,6 +73,7 @@ Everything after the closing `---` is the system prompt.
 | `outputSchema` | object (inline YAML) | no | none | JSON Schema for Anthropic structured outputs; only takes effect with `outputFormat: json` |
 | `dispatchableAgents` | array\<string\> | no | none (no dispatch) | Allowlist of agent names this agent may start with `dispatch` (kinds `subagent` and `agent`, and the legacy `dispatch_agent` / `dispatch_agents_parallel`) |
 | `dispatchableWorkflows` | array\<string\> | no | none | Allowlist of workflow names this agent may start with `dispatch {kind: workflow}` (and the legacy `run_workflow`) |
+| `messaging` | bool | no | `true` | `false` turns the messaging tools (`board.*`, `msg.send`) off for this agent wherever it runs; naming one in `tools:` as well is a load error (see [messaging.md](messaging.md#turning-it-off)) |
 | `concerns` | object | no | none | Coverage-concerns block; injects the coverage tools + catalog into the system prompt |
 | `findingsProfile` | `full` \| `summary` | no | `full` | Findings contract for `findings.report`; a workflow step's `findings_profile` or the workflow's `defaults.findings_profile` overrides it |
 | `fallbacks` | array of `{model, provider?}` | no | `[recovery].fallbacks` from config, else none | Ordered fallback models tried when a reply cannot be used (a refusal, say). Wins over the config table; not merged with it. See [response-outcomes.md](response-outcomes.md#3-configuring-fallbacks) |
@@ -431,6 +432,10 @@ Allowlist of agent names this agent may start with `dispatch`, as a `subagent` o
 ### `dispatchableWorkflows`
 
 Allowlist of workflow names this agent may start with `dispatch {kind: workflow}` (and the legacy `run_workflow`). Omit it to allow none; a call naming a workflow then fails with `workflow_not_dispatchable`. It follows the same pool and parent-cap rules as `dispatchableAgents`. A workflow child must also only run agents this agent may dispatch.
+
+### `messaging`
+
+Every run with a message space is offered `board.claim`, `board.release`, `board.post`, `board.read` and `msg.send` by default. `messaging: false` turns them off for this agent wherever it runs: as a standalone run, a workflow step, a sub-agent, a session's agent or an agentiflow's lead or unit. The run is still in its space, so the operator and its children reach it, and every child it launches has messaging off too. A file that sets `messaging: false` and also names a messaging tool in `tools:` (by name, alias or `board.*` / `msg.*`) fails to load. See [messaging.md](messaging.md#turning-it-off).
 
 ### `concerns`
 

@@ -1,7 +1,8 @@
 //! The hidden `--launch-*` flags a parent run passes a process child (spec
 //! W7 D18): its depth, permission ceiling, parent and root, the root's usage
-//! ledger, and the caps on what it may launch and which connector tools it
-//! may call. Rendered by `rupu_runtime::argv::LaunchLink`.
+//! ledger, the caps on what it may launch and which connector tools it may
+//! call, and whether its messaging is off (spec F1d D6). Rendered by
+//! `rupu_runtime::argv::LaunchLink`.
 
 use std::path::PathBuf;
 
@@ -71,6 +72,10 @@ pub struct LaunchLinkArgs {
     /// The connector tools the parent was narrowed to. Internal.
     #[arg(long = "launch-actions", hide = true, value_name = "NAMES", value_parser = parse_names, requires = "launch_depth")]
     pub launch_actions: Option<Names>,
+    /// The parent's messaging is off, so this run's is too (spec F1d D6).
+    /// Internal.
+    #[arg(long = "launch-no-messaging", hide = true, requires = "launch_depth")]
+    pub launch_no_messaging: bool,
 }
 
 impl LaunchLinkArgs {
@@ -88,6 +93,7 @@ impl LaunchLinkArgs {
             agents: self.launch_agents.clone().unwrap_or_default().0,
             workflows: self.launch_workflows.clone().unwrap_or_default().0,
             actions: self.launch_actions.clone().map(|n| n.0),
+            no_messaging: self.launch_no_messaging,
         })
     }
 }

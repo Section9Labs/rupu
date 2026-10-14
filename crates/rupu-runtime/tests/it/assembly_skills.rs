@@ -3,6 +3,7 @@
 //! offers `skills.load`; a run never starts without a skill it was given.
 
 use rupu_runtime::assembly::{AssembleError, Origin};
+use rupu_tools::MessagingSwitch;
 use rupu_transcript::{Event, SkillIndexEntry};
 use serial_test::serial;
 
@@ -934,7 +935,7 @@ async fn a_workflow_step_run_gets_its_agents_skills() {
         unit: None,
         step_actions: Vec::new(),
         scope_override: None,
-        messaging: None,
+        messaging: MessagingSwitch::Default,
     };
     let l = launch(&home, spec, origin, "run_wf_step");
     let path = l.transcript_path.clone();

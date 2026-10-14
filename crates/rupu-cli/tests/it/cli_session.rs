@@ -464,7 +464,7 @@ fn make_newer(home: &std::path::Path, root: &str, session_id: &str) -> Vec<u8> {
     let path = home.join(root).join(session_id).join("session.json");
     let mut payload: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    payload["version"] = 3.into();
+    payload["version"] = 4.into();
     payload["from_the_future"] = "kept".into();
     std::fs::write(&path, serde_json::to_vec_pretty(&payload).unwrap()).unwrap();
     std::fs::read(&path).unwrap()
@@ -514,7 +514,7 @@ async fn session_list_shows_a_newer_record_and_never_writes_it() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("session ses_newer01 was written by a newer rupu (record version 3)"),
+        stderr.contains("session ses_newer01 was written by a newer rupu (record version 4)"),
         "{stderr}"
     );
     assert_eq!(
@@ -558,7 +558,7 @@ async fn session_prune_skips_a_newer_record() {
         .success()
         .stdout(predicate::str::contains("ses_newer02").not())
         .stderr(predicate::str::contains(
-            "session ses_newer02 was written by a newer rupu (record version 3)",
+            "session ses_newer02 was written by a newer rupu (record version 4)",
         ));
     assert_eq!(
         std::fs::read(home.join("sessions-archive/ses_newer02/session.json")).unwrap(),

@@ -246,6 +246,39 @@ async fn a_process_child_carries_the_parents_ceiling() {
     );
 }
 
+/// Spec F1d D6: a parent whose messaging is off starts its process children
+/// (an agent, a workflow) with `--launch-no-messaging`; one whose messaging
+/// is on passes no such flag.
+#[tokio::test]
+#[serial]
+async fn messaging_off_is_a_launch_cap() {
+    for (off, kind, name) in [
+        (true, ChildKind::Agent, "helper"),
+        (true, ChildKind::Workflow, "sweep"),
+        (false, ChildKind::Agent, "helper"),
+    ] {
+        let home = kinds_home();
+        let backend = Arc::new(ScriptedProcesses::done("x"));
+        let l = home.launcher_with(home.assembler(config()), backend.clone(), None);
+        let mut ctx = parent_ctx(&home, PermissionMode::Bypass);
+        Arc::make_mut(&mut ctx.identity).launch.messaging_off = off;
+        run(&l, &ctx, request(kind, name, Some("go"))).await;
+        let argv = &backend.spawned()[0].argv;
+        let link = match argv {
+            RunArgv::Agent(r) => r.launch.clone(),
+            RunArgv::Workflow(w) => w.launch.clone(),
+            other => panic!("{other:?}"),
+        }
+        .unwrap();
+        assert_eq!(link.no_messaging, off, "{kind:?}");
+        let flagged = argv
+            .to_args()
+            .iter()
+            .any(|a| a.to_string_lossy() == "--launch-no-messaging");
+        assert_eq!(flagged, off, "{kind:?}: {:?}", argv.to_args());
+    }
+}
+
 /// §6.5: a workflow child's step agent declares `dispatchableAgents:
 /// [outsider]`, but its parent's cap (passed as `--launch-agents`) excludes
 /// it, so the step can't dispatch `outsider`.
@@ -282,7 +315,7 @@ async fn allowlist_inherited() {
                 unit: None,
                 step_actions: Vec::new(),
                 scope_override: None,
-                messaging: None,
+                messaging: rupu_tools::MessagingSwitch::Default,
             },
             run_id: "run_step".into(),
             transcript_path: home.root().join("step.jsonl"),

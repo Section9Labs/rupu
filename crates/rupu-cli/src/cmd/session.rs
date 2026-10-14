@@ -436,6 +436,9 @@ struct SessionRecord {
     agent_system_prompt: String,
     #[serde(default)]
     agent_tools: Option<Vec<String>>,
+    /// The agent's `messaging:` key (spec F1d D4), frozen with its tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    messaging: Option<bool>,
     max_turns: u32,
     permission_mode: String,
     no_stream: bool,
@@ -603,15 +606,18 @@ struct SessionRecord {
 impl SessionRecord {
     /// The newest record version this rupu reads. A record is written at
     /// [`Self::written_version`].
-    const VERSION: u32 = 2;
+    const VERSION: u32 = 3;
 
-    /// 2 for a record that carries skills, which a rupu that predates them
-    /// would drop on its next write; else 1, so those rupus keep reading it.
+    /// The lowest version a rupu must understand to keep the record whole on
+    /// its next write: 3 for an agent's `messaging: false`, 2 for skills,
+    /// else 1, so older rupus keep reading what they can't damage.
     fn written_version(&self) -> u32 {
         let skills = !self.skill_index.is_empty()
             || self.skill_prompt.is_some()
             || !self.loaded_skills.is_empty();
-        if skills {
+        if self.messaging == Some(false) {
+            3
+        } else if skills {
             2
         } else {
             1
@@ -1831,6 +1837,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         model,
         agent_system_prompt,
         agent_tools: spec.tools.clone(),
+        messaging: spec.messaging,
         max_turns: spec.max_turns.unwrap_or(50),
         permission_mode: mode_str,
         no_stream: args.no_stream,
@@ -8200,6 +8207,7 @@ fn session_agent_spec(
         thinking_display: session.thinking_display,
         dispatchable_agents: session.dispatchable_agents.clone(),
         dispatchable_workflows: session.dispatchable_workflows.clone(),
+        messaging: session.messaging,
         concerns: session.concerns.clone(),
         max_tokens: session.max_tokens,
         context_window_tokens: session.context_window_tokens,
@@ -11355,6 +11363,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             agent_system_prompt: "You are a test agent.".into(),
             agent_tools: Some(vec!["read_file".into()]),
+            messaging: None,
             max_turns: 50,
             permission_mode: "bypass".into(),
             no_stream: false,

@@ -22,6 +22,10 @@ pub struct AgentiflowDef {
     pub round: Option<RoundConfig>,
     #[serde(default)]
     pub trigger: Option<String>,
+    /// `messaging: false` turns the messaging tools off for the lead and
+    /// every unit (spec F1d D3). Absent or `true` is the default.
+    #[serde(default)]
+    pub messaging: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +166,12 @@ pub struct Ceiling {
 impl AgentiflowDef {
     pub fn parse_str(s: &str) -> Result<Self, crate::error::AgentiflowError> {
         Ok(serde_yaml::from_str(s)?)
+    }
+
+    /// Whether `messaging: false` turns the lead's and every unit's
+    /// messaging tools off (spec F1d D3).
+    pub fn messaging_off(&self) -> bool {
+        self.messaging == Some(false)
     }
 
     /// Resolve `engagement_profiles` against `registry` into the active set

@@ -74,8 +74,8 @@ pub use descriptor::{Alias, AliasScope, Effect, Service, ToolDescriptor, ACTION_
 pub use edit_file::EditFileTool;
 pub use glob::GlobTool;
 pub use grant::{
-    AmbientGrant, GrantEntry, GrantError, GrantInputs, GrantReason, ResolvedGrant, ServiceSet,
-    Unavailable, DEFAULT_GRANT, WORKFLOW_MESSAGING,
+    AmbientGrant, GrantEntry, GrantError, GrantInputs, GrantReason, MessagingSwitch,
+    ResolvedGrant, ServiceSet, Unavailable, DEFAULT_GRANT, WORKFLOW_MESSAGING,
 };
 pub use grep::GrepTool;
 pub use permission::{

@@ -716,7 +716,8 @@ mod tests {
                 g,
                 &Origin::FlowLead {
                     flow_id: "af".into(),
-                    flow_dir: "/g/agentiflows/af".into()
+                    flow_dir: "/g/agentiflows/af".into(),
+                    messaging_off: false,
                 },
                 "af"
             ),
