@@ -128,8 +128,8 @@ was sent, delivered messages included.
 
 ## Turning it off
 
-Messaging is on by default. A workflow, an agentiflow, an agent file and `rupu run --no-messaging`
-turn it off, and off wins over everything else.
+Messaging is on by default. A workflow, an agentiflow, an agent file and
+`rupu run --no-messaging` turn it off, and off wins over everything else.
 
 ```yaml
 name: quiet-review

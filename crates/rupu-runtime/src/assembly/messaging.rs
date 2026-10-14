@@ -37,9 +37,9 @@ pub enum OffReason {
 
 impl MessagingGrant {
     /// Resolve `spec`'s messaging. Off when its agent, its workflow, its
-    /// agentiflow, its parent or its launch (`--no-messaging`) says off. Else its workflow's tools, a flow
-    /// origin's (the messaging tools of `origin_grant`, which the grant
-    /// already carries) or the default (D1).
+    /// agentiflow, its parent or its launch (`--no-messaging`) says off.
+    /// Else its workflow's tools, a flow origin's (the messaging tools of
+    /// `origin_grant`, which the grant already carries) or the default (D1).
     pub fn resolve(spec: &LaunchSpec, origin_grant: Option<&AmbientGrant>) -> Self {
         if spec.agent.messaging_off() {
             return Self::Off(OffReason::Agent);
