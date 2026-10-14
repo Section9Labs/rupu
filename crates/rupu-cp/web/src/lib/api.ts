@@ -643,7 +643,11 @@ export interface AutoflowAttempt {
  *  history event id. */
 export type AutoflowRunRow = RunListRow & {
   attempt?: AutoflowAttempt;
-  /** On attempt rows: whether `id` names a run that exists (click opens it). */
+  /** Attempt rows only. `false` when `id` is a run id with no run record (the
+   *  server sends it; a click opens `/runs/:id`, which renders an unpersisted
+   *  run from history). Absent when `id` is a history event id (that row
+   *  expands in place). Never `true`: an attempt whose run was recorded is
+   *  listed as the run row instead. */
   run_recorded?: boolean;
 };
 

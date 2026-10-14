@@ -1,22 +1,16 @@
 // @vitest-environment jsdom
-// AutoflowRuns (Runs tab) — canonical run-table column order
-// (table-standardization follow-up, I1 + I4): Status leads, then Subject
-// (Workflow) → ID (Run) → the Source region (Event, Issue Ref, Worker — kept
-// contiguous immediately after ID, per-page columns) → Host → usage → the
-// newly-wired Turns/Duration (I4). Pure reorder plus the new columns — see
-// AutoflowRuns.test.tsx for behavioral coverage.
-//
-// One deliberate deviation from the canonical order: Started sits second,
-// right after Status, not last (#642). This is the table a wall of CYCLE
-// FAILED rows is read on, and the first question about a failure is WHEN —
-// as the trailing column it sat past the horizontal scroll.
+// AutoflowRuns — the Workflows column order (spec 2026-10-14, CP autoflow
+// runs as one table): `WORKFLOW_RUN_COLUMNS` with Issue after Workflow, a
+// leading expand column (an attempt with no run to open expands in place)
+// and the trailing row-actions column. An attempt row never ran, so its
+// usage, Turns and Duration are dashes, never a fabricated zero.
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { api } from '../../lib/api';
-import type { AutoflowEventRow, HostView } from '../../lib/api';
+import type { AutoflowRunRow, HostView } from '../../lib/api';
 import AutoflowRuns from './AutoflowRuns';
 import { withCustomerScope } from '../../lib/customerScopeTestUtils';
 
@@ -33,58 +27,63 @@ const LOCAL_HOST: HostView = {
   active_run_count: 0,
 };
 
-const EVENT: AutoflowEventRow = {
-  event_id: 'evt-1',
-  cycle_id: 'cyc-1',
-  at: '2026-06-01T00:00:00Z',
-  kind: 'run_launched',
-  workflow: 'fix-issue',
-  run_id: 'run-9',
+const RUN: AutoflowRunRow = {
+  id: 'run-9',
+  workflow_name: 'fix-issue',
   status: 'completed',
-  worker_name: 'worker-1',
+  started_at: '2026-06-01T00:00:00Z',
+  finished_at: '2026-06-01T00:02:00Z',
+  trigger: 'event',
   turns: 4,
   duration_ms: 120_000,
-  usage: {
-    input_tokens: 100,
-    output_tokens: 50,
-    cached_tokens: 0,
-    total_tokens: 150,
-    cost_usd: null,
-    priced: false,
-    runs: 1,
-  },
+  codename: 'cobalt-harbor/heron',
+  codename_derived: false,
   host_id: 'local',
+  usage: { input_tokens: 100, output_tokens: 50, cached_tokens: 0, total_tokens: 150, cost_usd: null, priced: false, runs: 1 },
+  autoflow: { issue_ref: 'github:acme/widgets/issues/42', issue_display_ref: 'acme/widgets#42' },
 };
 
-describe('AutoflowRuns — canonical column order + Turns/Duration (I4)', () => {
-  it('renders headers as Status, Started, Workflow, Run, Event, Issue Ref, Worker, Host, In, Out, Cached, Cost, Turns, Duration', async () => {
-    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST]);
-    vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([EVENT]);
-    vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
+/** The server's attempt row: zero usage, `finished_at` = `started_at`. */
+const ATTEMPT: AutoflowRunRow = {
+  ...RUN,
+  id: 'afe_1',
+  status: 'failed',
+  started_at: '2026-06-01T00:10:00Z',
+  finished_at: '2026-06-01T00:10:00Z',
+  turns: 0,
+  duration_ms: null,
+  usage: { input_tokens: 0, output_tokens: 0, cached_tokens: 0, total_tokens: 0, cost_usd: null, priced: false, runs: 0 },
+  attempt: { detail: 'dispatch failed', cycle_id: 'cyc_1', worker: 'local', claim_status: 'retry_backoff' },
+};
 
-    const { container } = render(
-      <MemoryRouter>
-        {withCustomerScope(<AutoflowRuns />)}
-      </MemoryRouter>,
-    );
+function stubPage(rows: AutoflowRunRow[]) {
+  vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST]);
+  vi.spyOn(api, 'getAutoflowRunList').mockResolvedValue(rows);
+  vi.spyOn(api, 'getAutoflowProblems').mockResolvedValue([]);
+}
 
+function renderPage() {
+  return render(
+    <MemoryRouter>
+      {withCustomerScope(<AutoflowRuns />, { customers: [] })}
+    </MemoryRouter>,
+  );
+}
+
+describe('AutoflowRuns — the Workflows column order', () => {
+  it('renders headers as Status, Workflow, Issue, Run, Trigger, Host, In, Out, Cached, Cost, Turns, Duration, Started', async () => {
+    stubPage([RUN]);
+    const { container } = renderPage();
     await waitFor(() => expect(screen.getByText('fix-issue')).toBeInTheDocument());
 
-    const headers = Array.from(container.querySelectorAll('thead th')).map(
-      (th) => th.textContent?.trim() ?? '',
-    );
+    const headers = Array.from(container.querySelectorAll('thead th')).map((th) => th.textContent?.trim() ?? '');
     expect(headers).toEqual([
-      // Leading expand/collapse chevron column (`renderDetail` is wired for
-      // `cycle_failed`'s detail row) — reserved on every row, header is
-      // unlabeled.
-      '',
+      '', // leading expand column (an attempt with no run expands in place)
       'Status',
-      'Started', // second, not last — see the header comment (#642)
       'Workflow',
+      'Issue',
       'Run',
-      'Event',
-      'Issue Ref',
-      'Worker',
+      'Trigger',
       'Host',
       'In',
       'Out',
@@ -92,29 +91,21 @@ describe('AutoflowRuns — canonical column order + Turns/Duration (I4)', () => 
       'Cost',
       'Turns',
       'Duration',
-      '', // trailing row-actions column (unlabeled) — Task 3
+      'Started',
+      '', // trailing row-actions column
     ]);
   });
 
-  it('renders Turns and Duration for a run-bearing event, blank (not zero) when absent', async () => {
-    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST]);
-    vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([
-      EVENT,
-      { ...EVENT, event_id: 'evt-2', run_id: 'run-10', turns: null, duration_ms: null },
-    ]);
-    vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
-
-    render(
-      <MemoryRouter>
-        {withCustomerScope(<AutoflowRuns />)}
-      </MemoryRouter>,
-    );
-
+  it('renders Turns and Duration for a run; dashes, not zeros, on an attempt', async () => {
+    stubPage([RUN, ATTEMPT]);
+    renderPage();
     await waitFor(() => expect(screen.getAllByText('fix-issue').length).toBe(2));
 
     expect(screen.getByText('4')).toBeInTheDocument();
     expect(screen.getByText('2m 0s')).toBeInTheDocument();
-    // Absent turns/duration render an em-dash, never a fabricated "0".
+    // The attempt's zero-filled usage and its equal start/finish stamps never
+    // show as "0" tokens or a "0ms" duration.
     expect(screen.queryAllByText('0').length).toBe(0);
+    expect(screen.queryByText('0ms')).not.toBeInTheDocument();
   });
 });
