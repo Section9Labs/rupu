@@ -5,6 +5,7 @@ use rupu_runtime::WorkerRecord;
 use std::path::PathBuf;
 use thiserror::Error;
 use tracing::warn;
+use ulid::Ulid;
 
 #[derive(Debug, Error)]
 pub enum WorkerStoreError {
@@ -46,14 +47,27 @@ impl WorkerStore {
         self.ensure_root()?;
         let path = self.record_path(&record.worker_id);
         let body = toml::to_string(record)?;
-        let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, body).map_err(|e| WorkerStoreError::Io {
-            action: format!("write {}", tmp.display()),
-            source: e,
+        // Per-write-unique temp name. Concurrent `rupu run` processes often
+        // share a worker_id (e.g. the standalone default `worker_local_cli`),
+        // so a fixed `<id>.toml.tmp` makes them collide: one process's rename
+        // consumes the temp another is about to rename, and that second rename
+        // fails with ENOENT ("No such file or directory"). A ULID per write
+        // gives each writer its own temp; the final rename onto `<id>.toml`
+        // stays atomic (last writer wins, each body is a complete record).
+        let tmp = path.with_extension(format!("toml.{}.tmp", Ulid::new()));
+        std::fs::write(&tmp, body).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            WorkerStoreError::Io {
+                action: format!("write {}", tmp.display()),
+                source: e,
+            }
         })?;
-        std::fs::rename(&tmp, &path).map_err(|e| WorkerStoreError::Io {
-            action: format!("rename {} -> {}", tmp.display(), path.display()),
-            source: e,
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            WorkerStoreError::Io {
+                action: format!("rename {} -> {}", tmp.display(), path.display()),
+                source: e,
+            }
         })?;
         Ok(())
     }
@@ -142,5 +156,55 @@ mod tests {
         let loaded = store.load(&worker.worker_id).unwrap().unwrap();
         assert_eq!(loaded, worker);
         assert_eq!(store.list().unwrap(), vec![worker]);
+    }
+
+    #[test]
+    fn concurrent_saves_of_the_same_worker_id_do_not_race() {
+        // Regression: many `rupu run` processes register the same worker_id at
+        // once. With a fixed `<id>.toml.tmp` they stomped each other's temp and
+        // the rename failed with ENOENT. A unique temp per write must let every
+        // concurrent save succeed and leave no temp behind.
+        use std::sync::Arc;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(WorkerStore {
+            root: tmp.path().join("workers"),
+        });
+        let rec = |last_seen: String| WorkerRecord {
+            version: WorkerRecord::VERSION,
+            worker_id: "worker_local_cli".into(),
+            kind: WorkerKind::Cli,
+            name: "n".into(),
+            host: "h".into(),
+            capabilities: WorkerCapabilities {
+                backends: vec![],
+                scm_hosts: vec![],
+                permission_modes: vec![],
+            },
+            registered_at: "2026-10-14T00:00:00Z".into(),
+            last_seen_at: last_seen,
+        };
+        let handles: Vec<_> = (0..16)
+            .map(|i| {
+                let s = Arc::clone(&store);
+                let r = rec(format!("2026-10-14T00:00:{i:02}Z"));
+                std::thread::spawn(move || s.save(&r))
+            })
+            .collect();
+        for h in handles {
+            h.join()
+                .unwrap()
+                .expect("a concurrent save must not fail with ENOENT");
+        }
+        assert!(store.load("worker_local_cli").unwrap().is_some());
+        let leftover_temps: Vec<_> = std::fs::read_dir(&store.root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("tmp"))
+            .map(|e| e.path())
+            .collect();
+        assert!(
+            leftover_temps.is_empty(),
+            "temp files left behind: {leftover_temps:?}"
+        );
     }
 }
