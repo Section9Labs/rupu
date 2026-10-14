@@ -244,6 +244,55 @@ async fn collect_coverage(
     }
 }
 
+/// Collect a unit's netflow (spec 2026-10-14 §N3) and say what is missing:
+/// `None` when nothing needs saying. The connector lands the stream, or says
+/// its mirror does (`ByMirror`) or that nothing needs landing (`NotNeeded`,
+/// local); the landing record under `runs_root` then says what arrived.
+/// `terminal` is false for a snapshot read (a poll error after the run was
+/// observed, the wall timeout). The message never names the host:
+/// `prefix_host` adds it, as for every placed-unit warning.
+async fn collect_netflow(
+    conn: &Arc<dyn HostConnector>,
+    run_id: &str,
+    terminal: bool,
+    runs_root: &Path,
+) -> Option<String> {
+    use rupu_cp::host::connector::NetflowLanding;
+    use rupu_netflow::land::{read_landing_record, LandingStatus};
+    let landing = match conn.land_run_netflow(run_id, terminal, runs_root).await {
+        Ok(l) => l,
+        Err(e) => return Some(format!("netflow from this unit was not collected: {e}")),
+    };
+    if landing == NetflowLanding::NotNeeded {
+        return None;
+    }
+    let (root, id) = (runs_root.to_path_buf(), run_id.to_string());
+    let record = tokio::task::spawn_blocking(move || read_landing_record(&root, &id))
+        .await
+        .ok()
+        .flatten();
+    match record {
+        None => Some(if terminal {
+            "netflow from this unit was not collected yet".to_string()
+        } else {
+            "netflow from this unit was not collected yet: the unit had not finished when the \
+             coordinator stopped waiting"
+                .to_string()
+        }),
+        Some(r) => match r.status {
+            LandingStatus::Complete => None,
+            LandingStatus::Partial => Some(format!(
+                "netflow from this unit may be incomplete: {}",
+                r.reason.unwrap_or_default()
+            )),
+            LandingStatus::Unavailable => Some(format!(
+                "netflow from this unit was not collected: {}",
+                r.reason.unwrap_or_default()
+            )),
+        },
+    }
+}
+
 // ── Workspace-delta bridge ──────────────────────────────────────────────────
 //
 // The orchestrator's `WorkspaceDelta` is opaque: `payload` is whatever the
@@ -309,6 +358,10 @@ pub struct FleetUnitDispatcher {
     /// The workflow's project root, whose `.rupu/` is the project layer a
     /// unit's agent and skills are resolved in.
     project: Option<PathBuf>,
+    /// The coordinator's run store root (`<global>/runs`), where a unit's
+    /// netflow landing record is read (spec 2026-10-14 §N3). Defaults to
+    /// `<global>/runs`; `with_runs_root` sets the store's actual root.
+    runs_root: PathBuf,
 }
 
 impl FleetUnitDispatcher {
@@ -316,9 +369,17 @@ impl FleetUnitDispatcher {
     pub fn new(registry: Arc<HostRegistry>, global: PathBuf, project: Option<PathBuf>) -> Self {
         Self {
             resolver: Resolver::Registry(registry),
+            runs_root: global.join("runs"),
             global,
             project,
         }
+    }
+
+    /// Read netflow landing records under `runs_root` (the coordinator
+    /// `RunStore`'s root) instead of the default `<global>/runs`.
+    pub fn with_runs_root(mut self, runs_root: PathBuf) -> Self {
+        self.runs_root = runs_root;
+        self
     }
 
     /// Seam constructor for tests: always uses `conn`, skipping registry lookup.
@@ -329,6 +390,7 @@ impl FleetUnitDispatcher {
     ) -> Self {
         Self {
             resolver: Resolver::Fixed(conn),
+            runs_root: global.join("runs"),
             global,
             project,
         }
@@ -608,8 +670,14 @@ impl FleetUnitDispatcher {
                     // so the stream is Partial and the runner says so.
                     let why = format!("the coordinator's poll of the run failed ({e})");
                     let coverage = collect_coverage(conn, &run_id, Some(&why)).await;
+                    // Likewise a snapshot for its netflow: what lands later is
+                    // the mirror's business, and the record says so.
+                    let warnings = collect_netflow(conn, &run_id, false, &self.runs_root)
+                        .await
+                        .into_iter()
+                        .collect();
                     return Err(UnitFailure {
-                        warnings: Vec::new(),
+                        warnings,
                         error: host_err_to_run_err(e),
                         coverage,
                     });
@@ -640,6 +708,13 @@ impl FleetUnitDispatcher {
                 // delta so a delta error below still carries it. Partial when
                 // the transport cannot confirm the copy is whole.
                 let coverage = collect_coverage(conn, &run_id, None).await;
+                // And its netflow (spec 2026-10-14 §N3), after the mirror was
+                // joined: a mirroring transport lands from that mirror. A gap
+                // is a warning on whichever outcome follows, never a failure.
+                let warnings: Vec<String> = collect_netflow(conn, &run_id, true, &self.runs_root)
+                    .await
+                    .into_iter()
+                    .collect();
 
                 let output = run["final_output"].as_str().unwrap_or("").to_string();
                 let success = status == "completed";
@@ -661,7 +736,7 @@ impl FleetUnitDispatcher {
                             Ok(b) => b,
                             Err(e) => {
                                 return Err(UnitFailure {
-                                    warnings: Vec::new(),
+                                    warnings,
                                     error: host_err_to_run_err(e),
                                     coverage,
                                 })
@@ -671,7 +746,7 @@ impl FleetUnitDispatcher {
                             Ok(d) => d,
                             Err(e) => {
                                 return Err(UnitFailure {
-                                    warnings: Vec::new(),
+                                    warnings,
                                     error: host_err_to_run_err(e),
                                     coverage,
                                 })
@@ -687,7 +762,7 @@ impl FleetUnitDispatcher {
                 };
 
                 return Ok(UnitOutcome {
-                    warnings: Vec::new(),
+                    warnings,
                     output,
                     success,
                     error,
@@ -735,9 +810,19 @@ impl FleetUnitDispatcher {
             )
             .await
         };
+        // Its netflow by the same rule: a snapshot landing for a run the host
+        // showed, nothing for one it never did.
+        let warnings = if never_started {
+            Vec::new()
+        } else {
+            collect_netflow(conn, &run_id, false, &self.runs_root)
+                .await
+                .into_iter()
+                .collect()
+        };
 
         Err(UnitFailure {
-            warnings: Vec::new(),
+            warnings,
             error: RunError::Provider(match (never_started, last_startup_err) {
                 // Never started: the run was launched but the host never showed
                 // any sign of it. Say that, rather than "timed out polling" — the
@@ -855,10 +940,16 @@ impl UnitDispatcher for FleetUnitDispatcher {
             Ok(None) => self.launch_and_wait(&conn, unit, host, None).await,
             Err(e) => Err(e.into()),
         };
-        let warnings: Vec<String> = warnings.iter().map(|w| prefix_host(host, w)).collect();
+        // Every warning names the host: the ones built here (skills) and the
+        // ones `launch_and_wait` collected (netflow). `prefix_host` is
+        // idempotent, so one already named is left alone.
+        let prefixed =
+            |ws: Vec<String>| -> Vec<String> { ws.iter().map(|w| prefix_host(host, w)).collect() };
+        let warnings = prefixed(warnings);
         match result {
             Ok(mut outcome) => {
                 outcome.error = outcome.error.map(|e| prefix_host(host, &e));
+                outcome.warnings = prefixed(std::mem::take(&mut outcome.warnings));
                 outcome.warnings.extend(warnings);
                 Ok(outcome)
             }
@@ -866,6 +957,7 @@ impl UnitDispatcher for FleetUnitDispatcher {
                 if let RunError::Provider(m) = &failure.error {
                     failure.error = RunError::Provider(prefix_host(host, m));
                 }
+                failure.warnings = prefixed(std::mem::take(&mut failure.warnings));
                 failure.warnings.extend(warnings);
                 Err(failure)
             }
@@ -1004,6 +1096,7 @@ pub fn build_dispatcher_if_needed(
         return None;
     }
 
+    let runs_root = run_store.root.clone();
     let node_registry = Arc::new(rupu_cp::node::NodeRegistry::new());
     let node_mirror = Arc::new(rupu_cp::node::NodeMirror::new(Arc::clone(&run_store)));
     let local = rupu_cp::host::local::LocalHostConnector::new(
@@ -1028,11 +1121,14 @@ pub fn build_dispatcher_if_needed(
         )),
     );
 
-    Some(Arc::new(FleetUnitDispatcher::new(
-        Arc::new(registry),
-        global.to_path_buf(),
-        project_root.map(Path::to_path_buf),
-    )))
+    Some(Arc::new(
+        FleetUnitDispatcher::new(
+            Arc::new(registry),
+            global.to_path_buf(),
+            project_root.map(Path::to_path_buf),
+        )
+        .with_runs_root(runs_root),
+    ))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1099,6 +1195,15 @@ mod tests {
         shipped: std::sync::Mutex<Vec<Vec<String>>>,
         /// When set, `launch_agent` fails as an unreachable host would.
         launch_error: Option<&'static str>,
+        /// What `land_run_netflow` answers; `None` ⇒ `NotNeeded` (local).
+        netflow: Option<rupu_cp::host::connector::NetflowLanding>,
+        /// The landing record `land_run_netflow` writes before it answers,
+        /// standing in for the transport's mirror having landed the stream.
+        netflow_record: Option<rupu_netflow::land::LandingRecord>,
+        /// When set, `land_run_netflow` fails as an unreachable host would.
+        netflow_fails: bool,
+        /// The `terminal` flag of every `land_run_netflow` call, in order.
+        netflow_calls: std::sync::Mutex<Vec<bool>>,
     }
 
     /// What a fake's `ship_skills` answers.
@@ -1134,6 +1239,10 @@ mod tests {
                 ship: ShipScript::Answer(rupu_cp::host::skill_ship::ShipOutcome::NotNeeded),
                 shipped: Default::default(),
                 launch_error: None,
+                netflow: None,
+                netflow_record: None,
+                netflow_fails: false,
+                netflow_calls: Default::default(),
             }
         }
 
@@ -1176,6 +1285,10 @@ mod tests {
                 ship: ShipScript::Answer(rupu_cp::host::skill_ship::ShipOutcome::NotNeeded),
                 shipped: Default::default(),
                 launch_error: None,
+                netflow: None,
+                netflow_record: None,
+                netflow_fails: false,
+                netflow_calls: Default::default(),
             }
         }
 
@@ -1335,11 +1448,24 @@ mod tests {
         }
         async fn land_run_netflow(
             &self,
-            _run_id: &str,
-            _terminal: bool,
-            _runs_root: &std::path::Path,
+            run_id: &str,
+            terminal: bool,
+            runs_root: &std::path::Path,
         ) -> Result<rupu_cp::host::connector::NetflowLanding, HostConnectorError> {
-            Ok(rupu_cp::host::connector::NetflowLanding::NotNeeded)
+            self.calls.lock().unwrap().push("land_run_netflow");
+            self.netflow_calls.lock().unwrap().push(terminal);
+            if self.netflow_fails {
+                return Err(HostConnectorError::Unreachable("down".into()));
+            }
+            if let Some(record) = &self.netflow_record {
+                let path = rupu_netflow::land::landing_record_path(runs_root, run_id);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, serde_json::to_vec(record).unwrap()).unwrap();
+            }
+            Ok(self
+                .netflow
+                .clone()
+                .unwrap_or(rupu_cp::host::connector::NetflowLanding::NotNeeded))
         }
         async fn unit_coverage(
             &self,
@@ -2656,6 +2782,8 @@ steps:
     struct StageOkPollNeverTerminalConnector {
         staged_dir: &'static str,
         discard_called_with: std::sync::Mutex<Option<String>>,
+        /// The `terminal` flag `land_run_netflow` was last called with.
+        netflow_terminal: std::sync::Mutex<Option<bool>>,
     }
 
     impl StageOkPollNeverTerminalConnector {
@@ -2663,6 +2791,7 @@ steps:
             Self {
                 staged_dir,
                 discard_called_with: std::sync::Mutex::new(None),
+                netflow_terminal: std::sync::Mutex::new(None),
             }
         }
     }
@@ -2740,10 +2869,14 @@ steps:
         async fn land_run_netflow(
             &self,
             _run_id: &str,
-            _terminal: bool,
+            terminal: bool,
             _runs_root: &std::path::Path,
         ) -> Result<rupu_cp::host::connector::NetflowLanding, HostConnectorError> {
-            Ok(rupu_cp::host::connector::NetflowLanding::NotNeeded)
+            // A mirroring transport (SSH): the record would come from its
+            // mirror, which a run the coordinator stopped watching never
+            // reaches, so none is written here.
+            *self.netflow_terminal.lock().unwrap() = Some(terminal);
+            Ok(rupu_cp::host::connector::NetflowLanding::ByMirror)
         }
         async fn unit_coverage(
             &self,
@@ -3808,6 +3941,230 @@ steps:
         );
         let out = d.dispatch_unit(make_unit(), "h").await.unwrap();
         assert_eq!(out.error.as_deref(), Some("host h: boom"));
+    }
+
+    // ── Netflow collection (spec 2026-10-14 §N3) ──────────────────────────────
+    //
+    // After every post-launch outcome the dispatcher asks the connector to
+    // land the unit's netflow and reads the landing record; what is missing
+    // becomes a warning the runner emits as a `StepWarning`. The host prefix
+    // is added by `prefix_host`, like every other placed-unit warning.
+
+    fn netflow_warnings(warnings: &[String]) -> Vec<&String> {
+        warnings.iter().filter(|w| w.contains("netflow")).collect()
+    }
+
+    fn landing_record(
+        status: rupu_netflow::land::LandingStatus,
+        reason: Option<&str>,
+    ) -> rupu_netflow::land::LandingRecord {
+        rupu_netflow::land::LandingRecord {
+            v: 1,
+            host: "h1".into(),
+            status,
+            reason: reason.map(str::to_string),
+            ledgers: vec!["run_x".into()],
+            at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_complete_landing_adds_no_warning() {
+        let g = tempfile::tempdir().unwrap();
+        let mut fake = FakeConnector::completed();
+        fake.netflow = Some(rupu_cp::host::connector::NetflowLanding::ByMirror);
+        fake.netflow_record = Some(landing_record(
+            rupu_netflow::land::LandingStatus::Complete,
+            None,
+        ));
+        let conn = Arc::new(fake);
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            g.path().to_path_buf(),
+            None,
+        );
+        let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
+        assert!(out.success);
+        assert!(
+            netflow_warnings(&out.warnings).is_empty(),
+            "{:?}",
+            out.warnings
+        );
+        // Asked once, after the run was seen terminal — and after the mirror
+        // was joined, since a mirroring transport lands from its mirror.
+        assert_eq!(*conn.netflow_calls.lock().unwrap(), vec![true]);
+        let calls = conn.calls.lock().unwrap();
+        let mirror = calls.iter().position(|c| *c == "await_run_mirror").unwrap();
+        let land = calls.iter().position(|c| *c == "land_run_netflow").unwrap();
+        assert!(mirror < land, "{calls:?}");
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_landing_is_a_step_warning() {
+        let g = tempfile::tempdir().unwrap();
+        let mut fake = FakeConnector::completed();
+        fake.netflow = Some(rupu_cp::host::connector::NetflowLanding::ByMirror);
+        fake.netflow_record = Some(landing_record(
+            rupu_netflow::land::LandingStatus::Unavailable,
+            Some("the host did not stream its netflow"),
+        ));
+        // The record lives under the coordinator store's root, which the
+        // production wiring sets (`build_dispatcher_if_needed`), not under
+        // `<global>/runs`.
+        let store = tempfile::tempdir().unwrap();
+        let d = FleetUnitDispatcher::from_connector(Arc::new(fake), g.path().to_path_buf(), None)
+            .with_runs_root(store.path().to_path_buf());
+        let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
+        assert!(out.success, "a netflow gap never fails the unit");
+        let w = netflow_warnings(&out.warnings);
+        assert_eq!(w.len(), 1, "{:?}", out.warnings);
+        assert_eq!(
+            w[0],
+            "host h1: netflow from this unit was not collected: the host did not stream its netflow"
+        );
+        assert!(rupu_netflow::land::landing_record_path(store.path(), "run_x").exists());
+        assert!(!g.path().join("runs").exists());
+    }
+
+    #[tokio::test]
+    async fn a_partial_landing_warns_that_it_may_be_incomplete() {
+        let g = tempfile::tempdir().unwrap();
+        let mut fake = FakeConnector::failed();
+        fake.netflow = Some(rupu_cp::host::connector::NetflowLanding::ByMirror);
+        fake.netflow_record = Some(landing_record(
+            rupu_netflow::land::LandingStatus::Partial,
+            Some("2 malformed netflow stream line(s) skipped"),
+        ));
+        let d = FleetUnitDispatcher::from_connector(Arc::new(fake), g.path().to_path_buf(), None);
+        // A failed unit's netflow is still collected, and still warned about.
+        let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
+        assert!(!out.success);
+        let w = netflow_warnings(&out.warnings);
+        assert_eq!(w.len(), 1, "{:?}", out.warnings);
+        assert_eq!(
+            w[0],
+            "host h1: netflow from this unit may be incomplete: 2 malformed netflow stream \
+             line(s) skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mirrored_unit_with_no_record_yet_is_a_warning() {
+        let g = tempfile::tempdir().unwrap();
+        let mut fake = FakeConnector::completed();
+        fake.netflow = Some(rupu_cp::host::connector::NetflowLanding::ByMirror);
+        let d = FleetUnitDispatcher::from_connector(Arc::new(fake), g.path().to_path_buf(), None);
+        let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
+        let w = netflow_warnings(&out.warnings);
+        assert_eq!(w.len(), 1, "{:?}", out.warnings);
+        assert_eq!(
+            w[0],
+            "host h1: netflow from this unit was not collected yet"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_landing_call_is_a_warning() {
+        let g = tempfile::tempdir().unwrap();
+        let mut fake = FakeConnector::completed();
+        fake.netflow_fails = true;
+        let d = FleetUnitDispatcher::from_connector(Arc::new(fake), g.path().to_path_buf(), None);
+        let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
+        assert!(out.success, "a netflow gap never fails the unit");
+        let w = netflow_warnings(&out.warnings);
+        assert_eq!(w.len(), 1, "{:?}", out.warnings);
+        assert!(
+            w[0].starts_with("host h1: netflow from this unit was not collected: "),
+            "{:?}",
+            w[0]
+        );
+        assert!(w[0].contains("down"), "{:?}", w[0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_poll_timeout_asks_for_a_snapshot_landing() {
+        let g = tempfile::tempdir().unwrap();
+        let conn = Arc::new(StageOkPollNeverTerminalConnector::new("/stage/nf"));
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            g.path().to_path_buf(),
+            None,
+        );
+        let err = d.dispatch_unit(make_unit(), "h1").await.unwrap_err();
+        assert!(err.error.to_string().contains("timed out"));
+        assert_eq!(
+            *conn.netflow_terminal.lock().unwrap(),
+            Some(false),
+            "a wall timeout is a snapshot read: the unit may still be running"
+        );
+        let w = netflow_warnings(&err.warnings);
+        assert_eq!(w.len(), 1, "{:?}", err.warnings);
+        assert_eq!(
+            w[0],
+            "host h1: netflow from this unit was not collected yet: the unit had not finished \
+             when the coordinator stopped waiting"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_poll_error_after_the_run_was_seen_asks_for_a_snapshot_landing() {
+        let g = tempfile::tempdir().unwrap();
+        let mut fake = FakeConnector::completed_after_non_terminal_polls(1);
+        fake.poll_error_after_running = true;
+        fake.netflow = Some(rupu_cp::host::connector::NetflowLanding::ByMirror);
+        let conn = Arc::new(fake);
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            g.path().to_path_buf(),
+            None,
+        );
+        let err = d.dispatch_unit(make_unit(), "h1").await.unwrap_err();
+        assert_eq!(*conn.netflow_calls.lock().unwrap(), vec![false]);
+        let w = netflow_warnings(&err.warnings);
+        assert_eq!(w.len(), 1, "{:?}", err.warnings);
+        assert!(w[0].contains("had not finished"), "{:?}", w[0]);
+    }
+
+    /// A run the host never showed has nothing to land, and saying so on top
+    /// of "never started" would mislead: no landing call, no netflow warning.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_that_never_started_is_not_asked_for_netflow() {
+        let g = tempfile::tempdir().unwrap();
+        let mut fake = FakeConnector::completed_after_startup_delay(u32::MAX);
+        fake.netflow = Some(rupu_cp::host::connector::NetflowLanding::ByMirror);
+        let conn = Arc::new(fake);
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            g.path().to_path_buf(),
+            None,
+        );
+        let err = d.dispatch_unit(make_unit(), "h1").await.unwrap_err();
+        assert!(err.error.to_string().contains("never registered"));
+        assert!(conn.netflow_calls.lock().unwrap().is_empty());
+        assert!(
+            netflow_warnings(&err.warnings).is_empty(),
+            "{:?}",
+            err.warnings
+        );
+    }
+
+    #[tokio::test]
+    async fn a_local_unit_never_warns() {
+        let g = tempfile::tempdir().unwrap();
+        // `netflow: None` ⇒ the connector answers `NotNeeded`, as local does.
+        let conn = Arc::new(FakeConnector::completed());
+        let d = FleetUnitDispatcher::from_connector(
+            Arc::clone(&conn) as Arc<dyn HostConnector>,
+            g.path().to_path_buf(),
+            None,
+        );
+        let out = d.dispatch_unit(make_unit(), "local").await.unwrap();
+        assert_eq!(*conn.netflow_calls.lock().unwrap(), vec![true]);
+        assert!(
+            netflow_warnings(&out.warnings).is_empty(),
+            "{:?}",
+            out.warnings
+        );
     }
 
     #[test]
