@@ -27,10 +27,12 @@ the operator can reach it while it runs. The log itself is created by the first 
 run that continues another (`rupu run --continue`) keeps that run's space, so it reads what
 was left in its inbox.
 
-A run takes part in its space, and is offered the messaging tools, when its agent names one in
-`tools:` or its workflow sets `messaging:`. Any other run is in the space receive-only: the
-operator's messages reach it, its children meet it there, and what they send `parent` reaches
-it before its next model call.
+Every run with a space is offered the messaging tools by default: `board.claim`, `board.release`,
+`board.post`, `board.read` and `msg.send`, recorded in its `tool_grant` as
+`ambient:messaging_default`. A workflow, an agentiflow or an agent file can turn them off
+([Turning it off](#turning-it-off)). A run whose messaging is off is still in the space,
+receive-only: the operator's messages reach it, its children meet it there, and what they send
+`parent` reaches it before its next model call.
 
 ```
 <space>/
@@ -46,7 +48,8 @@ started by `dispatch`) join it. A `workflow` child is a root of its own and gets
 space. There is no messaging between roots.
 
 Placed units (`host:` / `distribute:`) run on another machine and are not in the
-coordinator's space. A workflow's `messaging:` key does not reach them.
+coordinator's space. Each runs as a standalone `rupu run` on its host, with a space of its own
+there and the default tools. A workflow's `messaging:` key does not reach them.
 
 ## Participants and addresses
 
@@ -121,33 +124,44 @@ A standing directive is recorded once, when the participant first sees it, not e
 Continuing a run (`rupu run --continue`, resuming a workflow) rebuilds exactly what the model
 was sent, delivered messages included.
 
-## Turning it on in a workflow
+## Turning it off
+
+Messaging is on by default. Three places turn it off, and off wins over everything else.
 
 ```yaml
-name: parallel-review
-messaging: true          # board.claim/release/post/read and msg.send for every agent step
+name: quiet-review
+messaging: false         # no messaging tool for any step or unit, or anything they launch
 steps:
   - id: review
-    max_parallel: 2
-    parallel:
-      - id: api
-        agent: reviewer
-        prompt: Review crates/rupu-cp. Tell role:reviewer what you find that crosses crates.
-      - id: core
-        agent: reviewer
-        prompt: Review crates/rupu-runtime. Tell role:reviewer what you find that crosses crates.
+    agent: reviewer
+    prompt: Review crates/rupu-cp.
 ```
 
-`messaging: { tools: [board.post, board.read, msg.send] }` grants only the tools named. Only
-`board.*` and `msg.*` tools are accepted. The grant is recorded in each step's `tool_grant`
-as `ambient:workflow_messaging`. It covers the workflow's own agent steps and units, not the
-children they launch: a child gets the tools its own `tools:` names.
+A workflow's `messaging: false` turns it off for every agent step and unit, and for every
+child they launch. An autoflow is a workflow with an `autoflow:` block, so the same key is its
+opt-out. `messaging: true` is the default set, written down. `messaging: { tools: [board.post,
+board.read, msg.send] }` grants only the tools named, recorded in each step's `tool_grant` as
+`ambient:workflow_messaging`. Only `board.*` and `msg.*` tools are accepted.
 
-An agent can also opt in itself by naming a messaging tool in `tools:` (by name, alias or
-`board.*` / `msg.*`; `*` alone doesn't). It takes part in the space of whatever run it is in.
+An agentiflow's definition takes `messaging: false` too: neither its lead nor any unit gets a
+messaging tool. The lead keeps its status, roster and launch tools.
 
-A lead-shaped step is just an agent granted `dispatch`, `board.directive` and `msg.send`. Its
-children join the workflow's space, see its directives, and can message `parent`.
+An agent file's `messaging: false` turns it off for that agent wherever it runs. The same file
+naming a messaging tool in `tools:` (by name, alias or `board.*` / `msg.*`) is a load error,
+since it contradicts itself.
+
+Off is inherited. A run whose messaging is off launches every child with it off: a sub-agent
+through its parent's launch scope, a process child through the internal `--launch-no-messaging`
+flag, a workflow child too, although it is a root of its own. A child never has more than its
+parent.
+
+When a run's messaging is off, a messaging tool its agent names in `tools:` is not offered. The
+run's transcript says so with a `tool_unavailable` notice. Nothing is dropped silently.
+
+`*` still never grants `board.directive` and `board.retract`. An agent gets them by naming them
+(or `board.*`), and an agentiflow lead has them. A lead-shaped step is just an agent granted
+`dispatch`, `board.directive` and `msg.send`. Its children join the workflow's space, see its
+directives, and can message `parent`.
 
 ## The operator
 

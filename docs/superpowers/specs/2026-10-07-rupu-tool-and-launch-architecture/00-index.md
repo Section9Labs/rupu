@@ -3,7 +3,7 @@
 - **Date:** 2026-10-07
 - **Status:** draft, for matt's review
 - **Kind:** re-architecture. Functionally neutral except for the bugs it fixes on purpose, listed in §3.
-- **Followed by:** the feature work this session was opened for. It is specced here too, against the post-refactor architecture: [F1](F1-messaging-everywhere.md) messaging for every run kind (F1a/F1b/F1c).
+- **Followed by:** the feature work this session was opened for. It is specced here too, against the post-refactor architecture: [F1](F1-messaging-everywhere.md) messaging for every run kind (F1a/F1b/F1c/F1d).
 
 ## How to read this spec
 
@@ -21,6 +21,7 @@
 | [F1a-message-space-and-delivery.md](F1a-message-space-and-delivery.md) | (feature) message space per root, canonical log, participants + addresses, one writer API, delivery + receipts, `Message`/`Injected` transcript events, workflow `messaging:` key | F1a |
 | [F1b-operator-participant.md](F1b-operator-participant.md) | (feature) the operator messages anyone in any run; steering folded in; `rupu message` CLI; CP API; remote-host contract | F1b |
 | [F1c-messages-ui.md](F1c-messages-ui.md) | (feature, GUI) the Messages tab for runs/sessions/flows showing every kind; composer; messages as transcript bubbles | F1c |
+| [F1d-messaging-by-default.md](F1d-messaging-by-default.md) | (feature) messaging on by default for every run with a space (`ambient:messaging_default`); `messaging: false` on a workflow, an agentiflow or an agent file opts out; off is a launch cap children inherit | F1d |
 
 Each W-file stands on its own. It has scope, design, the files it touches, what it deletes, acceptance tests and its dependencies. One card is one session is one PR.
 
