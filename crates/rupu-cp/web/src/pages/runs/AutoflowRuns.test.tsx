@@ -144,10 +144,23 @@ describe('AutoflowRuns — one table', () => {
     expect(screen.queryByRole('button', { name: 'Expand row' })).not.toBeInTheDocument();
   });
 
-  it('clicking a workflow name refetches narrowed to it, shown as a removable chip', async () => {
+  it('a run row\'s workflow cell is the keyboard-focusable link to the run', async () => {
+    stub([RUN]);
+    const { container } = renderPage();
+    await waitFor(() => expect(screen.getByText('fix-issue')).toBeInTheDocument());
+    // Every cell of a run row links to the run; only the subject cell is in
+    // the tab order (the others are mouse-only), and that must be Workflow.
+    const focusable = Array.from(container.querySelectorAll('a[href="/runs/run-9"]')).filter(
+      (a) => a.getAttribute('tabindex') !== '-1',
+    );
+    expect(focusable).toHaveLength(1);
+    expect(focusable[0]).toHaveTextContent('fix-issue');
+  });
+
+  it('the filter button next to a workflow refetches narrowed to it, shown as a removable chip', async () => {
     stub([RUN]);
     renderPage();
-    fireEvent.click(await screen.findByRole('button', { name: 'fix-issue' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Show only fix-issue runs' }));
     await waitFor(() =>
       expect((api.getAutoflowRunList as Mock).mock.calls.some((c) => c[0]?.workflow === 'fix-issue')).toBe(true),
     );

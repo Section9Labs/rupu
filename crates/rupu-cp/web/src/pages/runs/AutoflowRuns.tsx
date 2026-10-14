@@ -29,7 +29,7 @@
 // lists none while scoped; the page says so in one line.
 
 import { useCallback, useState } from 'react';
-import { RefreshCw, X } from 'lucide-react';
+import { ListFilter, RefreshCw, X } from 'lucide-react';
 import { api, type AutoflowRunRow } from '../../lib/api';
 import SortableTable, { type Column } from '../../components/lists/SortableTable';
 import { WORKFLOW_RUN_COLUMNS } from '../../components/runs/workflowRunColumns';
@@ -209,37 +209,47 @@ export default function AutoflowRuns() {
     }
   }
 
-  // The Workflows columns, with the Workflow column swapped for one whose name
-  // narrows the table (and carries an attempt's error), and an Issue column
-  // after it. Both render their own controls/links, so they are unwrapped
-  // (`interactive`) cells rather than part of the row link.
+  // The Workflows columns, with the Workflow column swapped for one that also
+  // carries an attempt's error, a filter button after it, and an Issue
+  // column. The Workflow cell stays the row's link (the table's subject, so
+  // keyboard users reach the run); the filter and the issue links render
+  // their own controls, so those cells are `interactive`.
   const workflowColumn: Column<AutoflowRunRow> = {
     key: 'workflow',
     header: 'Workflow',
     subject: true,
     sortable: true,
-    interactive: true,
     sortValue: (r) => r.workflow_name,
     titleValue: (r) => r.workflow_name,
     render: (r) => (
       <>
         <span className="inline-flex items-center gap-2">
           {r.codename && <CrewChip crew={parseCodename(r.codename).crew} derived={r.codename_derived} />}
-          <button
-            type="button"
-            className="text-sm font-medium text-ink hover:underline"
-            title={`Only ${r.workflow_name}`}
-            onClick={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              setWorkflow(r.workflow_name);
-            }}
-          >
-            {r.workflow_name}
-          </button>
+          <span className="text-sm font-medium text-ink">{r.workflow_name}</span>
         </span>
         {r.attempt?.detail && <div className="text-note text-err truncate">{r.attempt.detail}</div>}
       </>
+    ),
+  };
+  const filterColumn: Column<AutoflowRunRow> = {
+    key: 'only',
+    header: '',
+    fit: true,
+    interactive: true,
+    render: (r) => (
+      <button
+        type="button"
+        className="rounded p-1 text-ink-mute hover:bg-surface-hover hover:text-ink"
+        aria-label={`Show only ${r.workflow_name} runs`}
+        title={`Show only ${r.workflow_name} runs`}
+        onClick={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          setWorkflow(r.workflow_name);
+        }}
+      >
+        <ListFilter size={12} />
+      </button>
     ),
   };
   const issueColumn: Column<AutoflowRunRow> = {
@@ -330,7 +340,7 @@ export default function AutoflowRuns() {
 
   const customers = useRunCustomers(!customer && !archived ? rows.map((r) => r.customer) : []);
   const baseColumns = (WORKFLOW_RUN_COLUMNS as Column<AutoflowRunRow>[]).flatMap((c) =>
-    c.key === 'workflow' ? [workflowColumn, issueColumn] : [dashForAttempts(c)],
+    c.key === 'workflow' ? [workflowColumn, filterColumn, issueColumn] : [dashForAttempts(c)],
   );
   const columns: Column<AutoflowRunRow>[] = [
     ...withCustomerColumn(baseColumns, customers, rows, !customer && !archived),

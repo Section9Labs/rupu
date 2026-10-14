@@ -71,7 +71,7 @@ function renderPage() {
 }
 
 describe('AutoflowRuns — the Workflows column order', () => {
-  it('renders headers as Status, Workflow, Issue, Run, Trigger, Host, In, Out, Cached, Cost, Turns, Duration, Started', async () => {
+  it('renders headers as Status, Workflow, (filter), Issue, Run, Trigger, Host, In, Out, Cached, Cost, Turns, Duration, Started', async () => {
     stubPage([RUN]);
     const { container } = renderPage();
     await waitFor(() => expect(screen.getByText('fix-issue')).toBeInTheDocument());
@@ -81,6 +81,7 @@ describe('AutoflowRuns — the Workflows column order', () => {
       '', // leading expand column (an attempt with no run expands in place)
       'Status',
       'Workflow',
+      '', // "show only this workflow" filter button
       'Issue',
       'Run',
       'Trigger',
