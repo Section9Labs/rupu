@@ -6,6 +6,7 @@ import { MemoryRouter, useLocation } from 'react-router-dom';
 import { api, ApiError, type CustomerRow, type CustomerScope, type ProjectRow } from '../../lib/api';
 import * as scopeLib from '../../lib/customerScope';
 import Customers from './Customers';
+import { commitQuery } from '../../components/query/queryTestUtils';
 
 const USAGE = {
   input_tokens: 0,
@@ -101,9 +102,9 @@ function Where() {
   return <div data-testid="where">{l.pathname + l.search}</div>;
 }
 
-function mount() {
+function mount(entry = '/customers') {
   return render(
-    <MemoryRouter initialEntries={['/customers']}>
+    <MemoryRouter initialEntries={[entry]}>
       <Customers />
       <Where />
     </MemoryRouter>,
@@ -263,29 +264,37 @@ describe('Customers page', () => {
     ).toBeInTheDocument();
   });
 
-  it('status views are derived from one list: no refetch, archived count on Active', async () => {
+  it('is: picks active (the default) or archived customers from one list, with no refetch', async () => {
     const OLD = row({ slug: 'old', name: 'Old Co', archived: true });
     getCustomers.mockResolvedValue([ACME, OLD]);
     mount();
     await screen.findByText('Acme Corp');
     expect(screen.queryByText('Old Co')).toBeNull();
     expect(within(screen.getByTestId('tile-customers')).getByText('1 archived')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: 'Archived' }));
-    expect(screen.getByText('Old Co')).toBeInTheDocument();
+    commitQuery('Filter customers', 'is:archived');
+    await screen.findByText('Old Co');
     expect(screen.queryByText('Acme Corp')).toBeNull();
-    fireEvent.click(screen.getByRole('button', { name: 'All' }));
-    expect(screen.getByText('Acme Corp')).toBeInTheDocument();
-    expect(screen.getByText('Old Co')).toBeInTheDocument();
+    expect(screen.getByTestId('query-count')).toHaveTextContent('1 of 2');
+    commitQuery('Filter customers', 'is:active');
+    expect(await screen.findByText('No customers match the filter.')).toBeInTheDocument();
     expect(getCustomers).toHaveBeenCalledTimes(1);
   });
 
-  it('range refetches with range, showing loading instead of stale rows', async () => {
+  it('is:active,archived lists every customer', async () => {
+    const OLD = row({ slug: 'old', name: 'Old Co', archived: true });
+    getCustomers.mockResolvedValue([ACME, OLD]);
+    mount('/customers?q=is:active,archived');
+    await screen.findByText('Old Co');
+    expect(screen.getByText('Acme Corp')).toBeInTheDocument();
+  });
+
+  it('range: refetches with that range, showing loading instead of stale rows', async () => {
     mount();
     await screen.findByText('Acme Corp');
     let resolve!: (r: CustomerRow[]) => void;
     getCustomers.mockReturnValue(new Promise((r) => (resolve = r)));
-    fireEvent.click(screen.getByRole('button', { name: '7d' }));
-    expect(getCustomers).toHaveBeenLastCalledWith({ archived: true, range: '7d' });
+    commitQuery('Filter customers', 'range:7d');
+    await waitFor(() => expect(getCustomers).toHaveBeenLastCalledWith({ archived: true, range: '7d' }));
     expect(screen.queryByText('Acme Corp')).toBeNull();
     expect(screen.getByText('Loading customers…')).toBeInTheDocument();
     resolve([GLOBEX]);
@@ -294,16 +303,30 @@ describe('Customers page', () => {
     expect(screen.queryByText('Acme Corp')).toBeNull();
   });
 
-  it('filter narrows rows by name or slug', async () => {
+  it('range: in the URL is the first fetch, and is not a row filter', async () => {
+    mount('/customers?q=range:all');
+    await screen.findByText('Acme Corp');
+    expect(getCustomers.mock.calls).toEqual([[{ archived: true, range: 'all' }]]);
+    expect(bodyRows()).toHaveLength(3);
+  });
+
+  it('the query narrows rows by name or slug, and the tiles follow it', async () => {
     mount();
     await screen.findByText('Acme Corp');
-    fireEvent.change(screen.getByPlaceholderText('Filter customers…'), { target: { value: 'glob' } });
-    expect(bodyRows()).toHaveLength(1);
+    commitQuery('Filter customers', 'glob');
+    await waitFor(() => expect(bodyRows()).toHaveLength(1));
     expect(screen.getByText('Globex')).toBeInTheDocument();
-    fireEvent.change(screen.getByPlaceholderText('Filter customers…'), { target: { value: 'zzz' } });
-    expect(screen.getByText(/No customers match/)).toBeInTheDocument();
+    expect(within(screen.getByTestId('tile-cost')).getByText('$10.00')).toBeInTheDocument();
+    commitQuery('Filter customers', 'zzz');
+    expect(await screen.findByText('No customers match the filter.')).toBeInTheDocument();
     // The unassigned footer stays even with no table.
     expect(screen.getByRole('link', { name: /Review unassigned/ })).toBeInTheDocument();
+  });
+
+  it('narrows to the query in ?q=', async () => {
+    mount('/customers?q=has:findings');
+    await waitFor(() => expect(bodyRows()).toHaveLength(1));
+    expect(within(bodyRows()[0]).getByText('Acme Corp')).toBeInTheDocument();
   });
 
   it('footer counts unassigned projects and its link sets scope none', async () => {

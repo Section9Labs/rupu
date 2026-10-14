@@ -3,8 +3,7 @@
 // reads it with `skillsProject` and strips it before filtering).
 import { CircleCheck, FileText, FolderGit2, Layers, Link, ShieldCheck, Sparkles } from 'lucide-react';
 import type { SkillRow } from '../../api';
-import { soleValues, withTerm } from '../../findingQuery/shortcut';
-import { parseQuery } from '../../findingQuery/grammar';
+import { controlTerm } from '../control';
 import { rowField, type RowField } from '../rows';
 
 function skillFlags(s: SkillRow): string[] {
@@ -28,12 +27,6 @@ export const SKILL_FIELDS: RowField<SkillRow>[] = [
 /** The project a query lists (`null` for the global layer alone), the query
  *  without its `project:` terms, and why its `project:` can't be used. */
 export function skillsProject(q: string): { project: string | null; rest: string; error: string | null } {
-  const p = parseQuery(q, SKILL_FIELDS);
-  const rest = withTerm(q, SKILL_FIELDS, 'project', null);
-  if (!p.ok || !p.terms.some((t) => t.key === 'project')) return { project: null, rest: p.ok ? rest : q, error: null };
-  const sole = soleValues(q, SKILL_FIELDS, 'project');
-  if (sole === null || sole.length !== 1) {
-    return { project: null, rest, error: 'project: names one project, whose skills list next to the global ones' };
-  }
-  return { project: sole[0], rest, error: null };
+  const t = controlTerm(q, SKILL_FIELDS, 'project', 'project: names one project, whose skills list next to the global ones');
+  return { project: t.value, rest: t.rest, error: t.error };
 }
