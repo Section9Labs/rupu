@@ -1,10 +1,11 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
-import { render, screen, cleanup, waitFor, fireEvent, within } from '@testing-library/react';
+import { render, screen, cleanup, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { api, ApiError, type ProjectRow, type SkillRow } from '../lib/api';
 import Skills from './Skills';
+import { commitQuery, firstCells } from '../components/query/queryTestUtils';
 
 afterEach(() => {
   cleanup();
@@ -32,9 +33,9 @@ function listing(skills: SkillRow[], warnings: string[] = []) {
 
 const PROJECT = { ws_id: 'w1', name: 'acme', path: '/src/acme' } as ProjectRow;
 
-function mount() {
+function mount(entry = '/library?tab=skills') {
   return render(
-    <MemoryRouter initialEntries={['/library?tab=skills']}>
+    <MemoryRouter initialEntries={[entry]}>
       <Skills />
     </MemoryRouter>,
   );
@@ -77,7 +78,7 @@ describe('Skills list', () => {
     expect(await screen.findByText('rupu skill install <source>')).toBeInTheDocument();
   });
 
-  it('the project selector lists that project’s layer and links project rows with ws_id', async () => {
+  it('a project: term lists that project’s layer and links project rows with ws_id', async () => {
     vi.spyOn(api, 'getProjects').mockResolvedValue([PROJECT]);
     const getSkills = vi.spyOn(api, 'getSkillsListing').mockImplementation(async (wsId?: string) =>
       listing(wsId === 'w1' ? [row({}), row({ name: 'notes', layer: 'project' })] : [row({})]),
@@ -86,13 +87,36 @@ describe('Skills list', () => {
     mount();
 
     await waitFor(() => expect(getSkills).toHaveBeenCalledWith(undefined));
-    const select = await screen.findByLabelText('Project');
-    await waitFor(() => expect(within(select).getByText('acme')).toBeInTheDocument());
-    fireEvent.change(select, { target: { value: 'w1' } });
+    await screen.findByText('pdf');
+    commitQuery('Filter skills', 'project:ACME');
 
     await waitFor(() => expect(getSkills).toHaveBeenLastCalledWith('w1'));
     const notes = await screen.findByText('notes');
     expect(notes.closest('a')).toHaveAttribute('href', '/skills/project/notes?ws_id=w1');
+    expect(firstCells()).toEqual(['notes', 'pdf']);
+  });
+
+  it('a project: in the URL fetches only that project’s listing, then filters it', async () => {
+    vi.spyOn(api, 'getProjects').mockResolvedValue([PROJECT]);
+    const getSkills = vi.spyOn(api, 'getSkillsListing').mockImplementation(async (wsId?: string) =>
+      listing(wsId === 'w1' ? [row({}), row({ name: 'notes', layer: 'project' }), row({ name: 'ocr', layer: 'project', status: 'invalid' })] : [row({})]),
+    );
+
+    mount('/library?tab=skills&q=project:acme layer:project -status:invalid');
+
+    await waitFor(() => expect(firstCells()).toEqual(['notes']));
+    expect(getSkills.mock.calls).toEqual([['w1']]);
+    expect(screen.getByTestId('query-count')).toHaveTextContent('1 of 3');
+  });
+
+  it('a project: naming no project lists nothing and says so', async () => {
+    vi.spyOn(api, 'getProjects').mockResolvedValue([PROJECT]);
+    vi.spyOn(api, 'getSkillsListing').mockResolvedValue(listing([row({})]));
+
+    mount('/library?tab=skills&q=project:nope');
+
+    expect(await screen.findByText('no project named `nope`')).toBeInTheDocument();
+    expect(screen.getByText('No skills match the filter.')).toBeInTheDocument();
   });
 
   it('shows a load failure in an error banner', async () => {
