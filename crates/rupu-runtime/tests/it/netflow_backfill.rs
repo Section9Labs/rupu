@@ -101,7 +101,7 @@ async fn a_run_end_copies_a_transcript_only_flow_into_the_ledger_once() {
 }
 
 #[test]
-fn a_backfill_skips_flows_the_ledger_has_and_mends_a_torn_tail() {
+fn a_backfill_skips_flows_the_ledger_has_keeps_their_completions_and_mends_a_torn_tail() {
     let dir = tempfile::tempdir().unwrap();
     let paths = NetflowPaths::for_run(&dir.path().join("netflow"), "run_x");
     paths.ensure_dir().unwrap();
@@ -112,7 +112,18 @@ fn a_backfill_skips_flows_the_ledger_has_and_mends_a_torn_tail() {
         "kept.example",
     ))))
     .unwrap();
-    std::fs::write(&paths.flows, format!("{line}\n{{\"type\":\"flow\",\"id\"")).unwrap();
+    // The lost flow's line was dropped but its completion got through.
+    let complete = serde_json::to_string(&rupu_netflow::LedgerLine::Complete {
+        id: lost,
+        bytes_in: 4096,
+        duration_ms: 250,
+    })
+    .unwrap();
+    std::fs::write(
+        &paths.flows,
+        format!("{line}\n{complete}\n{{\"type\":\"flow\",\"id\""),
+    )
+    .unwrap();
     let transcript = dir.path().join("run_x.jsonl");
     append_to_transcript(&transcript, flow(kept, "kept-transcript-copy.example"));
     append_to_transcript(&transcript, flow(lost, "lost.example"));
@@ -121,16 +132,26 @@ fn a_backfill_skips_flows_the_ledger_has_and_mends_a_torn_tail() {
         rupu_runtime::netflow::backfill_ledger(&paths, &transcript).unwrap(),
         1
     );
+    let flows: Vec<(String, String, Option<u64>, Option<u64>)> =
+        rupu_netflow::ledger::read_flows(&paths.flows)
+            .unwrap()
+            .into_iter()
+            .map(|f| (f.id.to_string(), f.host, f.bytes_in, f.duration_ms))
+            .collect();
     assert_eq!(
-        ledger_hosts(&paths.flows),
+        flows,
         vec![
             (
                 "00000000010000000000000001".to_string(),
-                "kept.example".to_string()
+                "kept.example".to_string(),
+                Some(64),
+                None
             ),
             (
                 "00000000010000000000000002".to_string(),
-                "lost.example".to_string()
+                "lost.example".to_string(),
+                Some(4096),
+                Some(250)
             ),
         ]
     );

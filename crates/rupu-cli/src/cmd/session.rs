@@ -7767,61 +7767,88 @@ async fn run_compact_request(
         &request.transcript_path,
     );
     let netflow_sink = netflow.sink.clone();
+    let body: anyhow::Result<()> = async {
 
-    let provider_config = provider_factory::ProviderConfig::for_agent(
-        &session.provider_name,
-        &cfg.providers,
-        provider_factory::AgentProviderSettings {
-            oauth_prefix: session.anthropic_oauth_prefix,
-            prompt_cache: session.anthropic_prompt_cache,
-        },
-        Some(cfg.recovery.server_side_fallback),
-    );
-    let (_resolved_auth, mut provider) = provider_factory::build_for_provider_with_config(
-        &session.provider_name,
-        &session.model,
-        session.auth_mode,
-        &resolver,
-        &provider_config,
-        netflow_sink,
-    )
-    .await?;
+        let provider_config = provider_factory::ProviderConfig::for_agent(
+            &session.provider_name,
+            &cfg.providers,
+            provider_factory::AgentProviderSettings {
+                oauth_prefix: session.anthropic_oauth_prefix,
+                prompt_cache: session.anthropic_prompt_cache,
+            },
+            Some(cfg.recovery.server_side_fallback),
+        );
+        let (_resolved_auth, mut provider) = provider_factory::build_for_provider_with_config(
+            &session.provider_name,
+            &session.model,
+            session.auth_mode,
+            &resolver,
+            &provider_config,
+            netflow_sink,
+        )
+        .await?;
 
-    // Determine the mode string for the transcript RunStart event.
-    let run_mode = match session.permission_mode.as_str() {
-        "ask" => RunMode::Ask,
-        "readonly" => RunMode::Readonly,
-        _ => RunMode::Bypass,
-    };
+        // Determine the mode string for the transcript RunStart event.
+        let run_mode = match session.permission_mode.as_str() {
+            "ask" => RunMode::Ask,
+            "readonly" => RunMode::Readonly,
+            _ => RunMode::Bypass,
+        };
 
-    let mut writer = JsonlWriter::create(&request.transcript_path)?;
-    let started_at = Utc::now();
-    writer.write(&TranscriptEvent::RunStart {
-        run_id: request.run_id.clone(),
-        workspace_id: session.workspace_id.clone(),
-        agent: session.agent_name.clone(),
-        provider: session.provider_name.clone(),
-        model: session.model.clone(),
-        started_at,
-        mode: run_mode,
-        // TODO(Task 2, transcript fidelity plan 1): schema/system_prompt.
-        schema: None,
-        system_prompt: None,
-        codename: None,
-        customer: session.customer.clone(),
-        launch_skills: Vec::new(),
-        launch_preload_skills: Vec::new(),
-    })?;
-    writer.flush()?;
+        let mut writer = JsonlWriter::create(&request.transcript_path)?;
+        let started_at = Utc::now();
+        writer.write(&TranscriptEvent::RunStart {
+            run_id: request.run_id.clone(),
+            workspace_id: session.workspace_id.clone(),
+            agent: session.agent_name.clone(),
+            provider: session.provider_name.clone(),
+            model: session.model.clone(),
+            started_at,
+            mode: run_mode,
+            // TODO(Task 2, transcript fidelity plan 1): schema/system_prompt.
+            schema: None,
+            system_prompt: None,
+            codename: None,
+            customer: session.customer.clone(),
+            launch_skills: Vec::new(),
+            launch_preload_skills: Vec::new(),
+        })?;
+        writer.flush()?;
 
-    // Guard: too few messages or no input limit known — nothing to compact.
-    let compact_threshold = match session.compaction_threshold(None) {
-        Some(t) => t,
-        None => {
-            let msg = "[compact skipped: this session's model limits are unknown and it has no contextWindowTokens]".to_string();
-            writer.write(&TranscriptEvent::AssistantDelta {
-                content: msg.clone(),
-            })?;
+        // Guard: too few messages or no input limit known — nothing to compact.
+        let compact_threshold = match session.compaction_threshold(None) {
+            Some(t) => t,
+            None => {
+                let msg = "[compact skipped: this session's model limits are unknown and it has no contextWindowTokens]".to_string();
+                writer.write(&TranscriptEvent::AssistantDelta {
+                    content: msg.clone(),
+                })?;
+                writer.write(&TranscriptEvent::RunComplete {
+                    run_id: request.run_id.clone(),
+                    status: RunStatus::Ok,
+                    total_tokens: 0,
+                    duration_ms: (Utc::now() - started_at).num_milliseconds().max(0) as u64,
+                    error: None,
+                    outcome: None,
+                })?;
+                writer.flush()?;
+                finalize_compact_run(
+                    global,
+                    scope,
+                    session_id,
+                    &mut session,
+                    request,
+                    &started_at,
+                    RunStatus::Ok,
+                    None,
+                )?;
+                return Ok(());
+            }
+        };
+
+        if session.message_history.len() < 4 {
+            let msg = "[compact skipped: fewer than 4 messages in history]".to_string();
+            writer.write(&TranscriptEvent::AssistantDelta { content: msg })?;
             writer.write(&TranscriptEvent::RunComplete {
                 run_id: request.run_id.clone(),
                 status: RunStatus::Ok,
@@ -7841,204 +7868,179 @@ async fn run_compact_request(
                 RunStatus::Ok,
                 None,
             )?;
-            netflow.finish().await;
             return Ok(());
         }
-    };
 
-    if session.message_history.len() < 4 {
-        let msg = "[compact skipped: fewer than 4 messages in history]".to_string();
-        writer.write(&TranscriptEvent::AssistantDelta { content: msg })?;
-        writer.write(&TranscriptEvent::RunComplete {
-            run_id: request.run_id.clone(),
-            status: RunStatus::Ok,
-            total_tokens: 0,
-            duration_ms: (Utc::now() - started_at).num_milliseconds().max(0) as u64,
-            error: None,
-            outcome: None,
-        })?;
-        writer.flush()?;
-        finalize_compact_run(
-            global,
-            scope,
-            session_id,
-            &mut session,
-            request,
-            &started_at,
-            RunStatus::Ok,
-            None,
-        )?;
-        netflow.finish().await;
-        return Ok(());
-    }
+        // Derive last_input_tokens the same way the CLI `compact` command does.
+        let total_chars: usize = session
+            .message_history
+            .iter()
+            .map(|m| {
+                m.content
+                    .iter()
+                    .map(|b| match b {
+                        rupu_providers::types::ContentBlock::Text { text } => text.len(),
+                        rupu_providers::types::ContentBlock::ToolUse { name, input, .. } => {
+                            name.len() + input.to_string().len()
+                        }
+                        rupu_providers::types::ContentBlock::ToolResult { content, .. } => {
+                            content.len()
+                        }
+                        rupu_providers::types::ContentBlock::Reasoning { raw, .. } => {
+                            // raw is what goes on the wire (thinking text + signature);
+                            // text is only a display summary and is None when display
+                            // is "omitted".
+                            raw.to_string().len()
+                        }
+                        rupu_providers::types::ContentBlock::Unknown { .. }
+                        | rupu_providers::types::ContentBlock::Fallback { .. } => 0,
+                    })
+                    .sum::<usize>()
+            })
+            .sum();
+        let last_input_tokens: u32 = session
+            .active_transcript_path
+            .as_ref()
+            .or(session.last_transcript_path.as_ref())
+            .and_then(|p| last_turn_input_tokens(p))
+            .filter(|&t| t > 0)
+            .unwrap_or_else(|| (total_chars / 2).max(1) as u32);
 
-    // Derive last_input_tokens the same way the CLI `compact` command does.
-    let total_chars: usize = session
-        .message_history
-        .iter()
-        .map(|m| {
-            m.content
-                .iter()
-                .map(|b| match b {
-                    rupu_providers::types::ContentBlock::Text { text } => text.len(),
-                    rupu_providers::types::ContentBlock::ToolUse { name, input, .. } => {
-                        name.len() + input.to_string().len()
-                    }
-                    rupu_providers::types::ContentBlock::ToolResult { content, .. } => {
-                        content.len()
-                    }
-                    rupu_providers::types::ContentBlock::Reasoning { raw, .. } => {
-                        // raw is what goes on the wire (thinking text + signature);
-                        // text is only a display summary and is None when display
-                        // is "omitted".
-                        raw.to_string().len()
-                    }
-                    rupu_providers::types::ContentBlock::Unknown { .. }
-                    | rupu_providers::types::ContentBlock::Fallback { .. } => 0,
-                })
-                .sum::<usize>()
-        })
-        .sum();
-    let last_input_tokens: u32 = session
-        .active_transcript_path
-        .as_ref()
-        .or(session.last_transcript_path.as_ref())
-        .and_then(|p| last_turn_input_tokens(p))
-        .filter(|&t| t > 0)
-        .unwrap_or_else(|| (total_chars / 2).max(1) as u32);
-
-    let before = session.message_history.len();
-    // The summary, with the session's loaded skills put back; a re-attach
-    // that can't read the skills fails the request like a failed summary,
-    // leaving the history as it was.
-    let compacted = match rupu_agent::compact_messages(
-        &session.message_history,
-        provider.as_mut(),
-        &session.model,
-        compact_threshold,
-        last_input_tokens,
-    )
-    .await
-    {
-        Ok(Some(outcome)) => {
-            // The summariser call is billed: record it in this pseudo-run's
-            // own transcript (as a `purpose: compaction` usage, never a turn).
-            writer.write(&compaction_usage_event(
-                &session.provider_name,
-                &session.model,
-                &outcome.usage,
-            ))?;
-            let summarized = outcome.summarized_messages;
-            let mut messages = outcome.messages;
-            let input = session.effective_context_window();
-            match reattach_session_skills(global, &session, &mut messages, input).await {
-                Ok(reattach) => Ok(Some((summarized, messages, reattach))),
-                Err(e) => Err(format!("re-attach the session's loaded skills: {e}")),
-            }
-        }
-        Ok(None) => Ok(None),
-        Err(e) => {
-            // A rejected summary was billed: record it in this pseudo-run's
-            // transcript like a successful compaction's usage.
-            if let rupu_agent::CompactionError::Rejected { usage, .. } = &e {
+        let before = session.message_history.len();
+        // The summary, with the session's loaded skills put back; a re-attach
+        // that can't read the skills fails the request like a failed summary,
+        // leaving the history as it was.
+        let compacted = match rupu_agent::compact_messages(
+            &session.message_history,
+            provider.as_mut(),
+            &session.model,
+            compact_threshold,
+            last_input_tokens,
+        )
+        .await
+        {
+            Ok(Some(outcome)) => {
+                // The summariser call is billed: record it in this pseudo-run's
+                // own transcript (as a `purpose: compaction` usage, never a turn).
                 writer.write(&compaction_usage_event(
                     &session.provider_name,
                     &session.model,
-                    usage,
+                    &outcome.usage,
                 ))?;
-            }
-            Err(e.to_string())
-        }
-    };
-    match compacted {
-        Ok(Some((summarized, messages, reattach))) => {
-            if let Some((events, loaded)) = reattach {
-                for event in &events {
-                    writer.write(event)?;
+                let summarized = outcome.summarized_messages;
+                let mut messages = outcome.messages;
+                let input = session.effective_context_window();
+                match reattach_session_skills(global, &session, &mut messages, input).await {
+                    Ok(reattach) => Ok(Some((summarized, messages, reattach))),
+                    Err(e) => Err(format!("re-attach the session's loaded skills: {e}")),
                 }
-                session.loaded_skills = loaded;
             }
-            session.message_history = messages;
-            // Same reasoning as the offline `rupu session compact` path: the
-            // compaction pseudo-transcript this function writes does NOT
-            // reconstruct to the summarized history (it replays to an empty
-            // conversation), so the next turn must never reference it.
-            session.history_source_transcript = None;
-            let after = session.message_history.len();
-            let content = format!(
-                "[context compacted: summarized {} messages; {} → {} kept]\n",
-                summarized, before, after
-            );
-            writer.write(&TranscriptEvent::AssistantDelta { content })?;
-            writer.write(&TranscriptEvent::RunComplete {
-                run_id: request.run_id.clone(),
-                status: RunStatus::Ok,
-                total_tokens: 0,
-                duration_ms: (Utc::now() - started_at).num_milliseconds().max(0) as u64,
-                error: None,
-                outcome: None,
-            })?;
-            writer.flush()?;
-            finalize_compact_run(
-                global,
-                scope,
-                session_id,
-                &mut session,
-                request,
-                &started_at,
-                RunStatus::Ok,
-                None,
-            )?;
+            Ok(None) => Ok(None),
+            Err(e) => {
+                // A rejected summary was billed: record it in this pseudo-run's
+                // transcript like a successful compaction's usage.
+                if let rupu_agent::CompactionError::Rejected { usage, .. } = &e {
+                    writer.write(&compaction_usage_event(
+                        &session.provider_name,
+                        &session.model,
+                        usage,
+                    ))?;
+                }
+                Err(e.to_string())
+            }
+        };
+        match compacted {
+            Ok(Some((summarized, messages, reattach))) => {
+                if let Some((events, loaded)) = reattach {
+                    for event in &events {
+                        writer.write(event)?;
+                    }
+                    session.loaded_skills = loaded;
+                }
+                session.message_history = messages;
+                // Same reasoning as the offline `rupu session compact` path: the
+                // compaction pseudo-transcript this function writes does NOT
+                // reconstruct to the summarized history (it replays to an empty
+                // conversation), so the next turn must never reference it.
+                session.history_source_transcript = None;
+                let after = session.message_history.len();
+                let content = format!(
+                    "[context compacted: summarized {} messages; {} → {} kept]\n",
+                    summarized, before, after
+                );
+                writer.write(&TranscriptEvent::AssistantDelta { content })?;
+                writer.write(&TranscriptEvent::RunComplete {
+                    run_id: request.run_id.clone(),
+                    status: RunStatus::Ok,
+                    total_tokens: 0,
+                    duration_ms: (Utc::now() - started_at).num_milliseconds().max(0) as u64,
+                    error: None,
+                    outcome: None,
+                })?;
+                writer.flush()?;
+                finalize_compact_run(
+                    global,
+                    scope,
+                    session_id,
+                    &mut session,
+                    request,
+                    &started_at,
+                    RunStatus::Ok,
+                    None,
+                )?;
+            }
+            Ok(None) => {
+                writer.write(&TranscriptEvent::AssistantDelta {
+                    content: "[compact: history is too short or already compact]\n".to_string(),
+                })?;
+                writer.write(&TranscriptEvent::RunComplete {
+                    run_id: request.run_id.clone(),
+                    status: RunStatus::Ok,
+                    total_tokens: 0,
+                    duration_ms: (Utc::now() - started_at).num_milliseconds().max(0) as u64,
+                    error: None,
+                    outcome: None,
+                })?;
+                writer.flush()?;
+                finalize_compact_run(
+                    global,
+                    scope,
+                    session_id,
+                    &mut session,
+                    request,
+                    &started_at,
+                    RunStatus::Ok,
+                    None,
+                )?;
+            }
+            Err(err_str) => {
+                writer.write(&TranscriptEvent::RunComplete {
+                    run_id: request.run_id.clone(),
+                    status: RunStatus::Error,
+                    total_tokens: 0,
+                    duration_ms: (Utc::now() - started_at).num_milliseconds().max(0) as u64,
+                    error: Some(err_str.clone()),
+                    outcome: None,
+                })?;
+                writer.flush()?;
+                finalize_compact_run(
+                    global,
+                    scope,
+                    session_id,
+                    &mut session,
+                    request,
+                    &started_at,
+                    RunStatus::Error,
+                    Some(err_str),
+                )?;
+            }
         }
-        Ok(None) => {
-            writer.write(&TranscriptEvent::AssistantDelta {
-                content: "[compact: history is too short or already compact]\n".to_string(),
-            })?;
-            writer.write(&TranscriptEvent::RunComplete {
-                run_id: request.run_id.clone(),
-                status: RunStatus::Ok,
-                total_tokens: 0,
-                duration_ms: (Utc::now() - started_at).num_milliseconds().max(0) as u64,
-                error: None,
-                outcome: None,
-            })?;
-            writer.flush()?;
-            finalize_compact_run(
-                global,
-                scope,
-                session_id,
-                &mut session,
-                request,
-                &started_at,
-                RunStatus::Ok,
-                None,
-            )?;
-        }
-        Err(err_str) => {
-            writer.write(&TranscriptEvent::RunComplete {
-                run_id: request.run_id.clone(),
-                status: RunStatus::Error,
-                total_tokens: 0,
-                duration_ms: (Utc::now() - started_at).num_milliseconds().max(0) as u64,
-                error: Some(err_str.clone()),
-                outcome: None,
-            })?;
-            writer.flush()?;
-            finalize_compact_run(
-                global,
-                scope,
-                session_id,
-                &mut session,
-                request,
-                &started_at,
-                RunStatus::Error,
-                Some(err_str),
-            )?;
-        }
-    }
 
+        Ok(())
+    }
+    .await;
     netflow.finish().await;
-    Ok(())
+    body
 }
 
 /// Update session bookkeeping after a compact pseudo-turn completes.

@@ -11,7 +11,7 @@
 //! registry that outlives every run, self-update/login traffic), pass
 //! `Arc::new(rupu_netflow::NullSink)` instead.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -105,11 +105,12 @@ pub fn for_run(
 /// the whole ledger before appending makes a second call, or a later run
 /// under the same id over the same transcript, append nothing.
 ///
-/// The transcript copy is the flow as it was first recorded: a streamed
-/// body's final size and duration were only ever in the ledger's
-/// `complete` line, which is gone with the line it completes. A ledger
-/// whose last line is torn (a writer killed mid-line) gets a newline first,
-/// so the torn line stays the only bad one.
+/// The transcript copy is the flow as it was first recorded. A streamed
+/// body's final size and duration are only in the ledger's `complete` (or
+/// `socket_complete`) line: one that reached the ledger without its flow
+/// line is appended again after the flow, and one that was lost too stays
+/// lost. A ledger whose last line is torn (a writer killed mid-line) gets
+/// a newline first, so the torn line stays the only bad one.
 ///
 /// A run can record hundreds of thousands of flows, so both files are
 /// first read for flow ids only, and the transcript is read a second time,
@@ -128,69 +129,115 @@ pub fn backfill_ledger(
         return Ok(0);
     }
     let mut torn = false;
+    let mut patches: HashMap<rupu_netflow::FlowId, Vec<Vec<u8>>> = HashMap::new();
     for_each_line(&paths.flows, |line| {
         torn = line.last() != Some(&b'\n');
-        if let Ok(LedgerIdLine {
-            kind: LedgerKind::Flow,
-            id: Some(id),
-        }) = serde_json::from_slice(line)
-        {
-            wanted.remove(&id);
+        let Ok(LedgerIdLine { kind, id: Some(id) }) = serde_json::from_slice(line) else {
+            return;
+        };
+        match kind {
+            LedgerKind::Flow => {
+                wanted.remove(&id);
+                patches.remove(&id);
+            }
+            LedgerKind::Complete | LedgerKind::SocketComplete if wanted.contains(&id) => {
+                let mut patch = line.to_vec();
+                if patch.last() != Some(&b'\n') {
+                    patch.push(b'\n');
+                }
+                patches.entry(id).or_default().push(patch);
+            }
+            _ => {}
         }
     })?;
     if wanted.is_empty() {
         return Ok(0);
     }
-    let mut ledger: Option<std::io::BufWriter<std::fs::File>> = None;
+    let mut ledger = Appender {
+        paths,
+        torn,
+        file: None,
+        buf: Vec::new(),
+    };
     let mut added = 0;
     let mut failed = None;
     for_each_line(transcript, |line| {
-        if failed.is_some() || !transcript_flow_id(line).is_some_and(|id| wanted.remove(&id)) {
+        if failed.is_some() {
             return;
         }
+        let Some(id) = transcript_flow_id(line).filter(|id| wanted.remove(id)) else {
+            return;
+        };
         let Ok(rupu_transcript::Event::NetFlow { flow }) = serde_json::from_slice(line) else {
             return;
         };
-        if let Err(e) = append_flow(&mut ledger, paths, torn, flow) {
-            failed = Some(e);
-            return;
+        match ledger.push(flow, patches.remove(&id).unwrap_or_default()) {
+            Ok(()) => added += 1,
+            Err(e) => failed = Some(e),
         }
-        added += 1;
     })?;
     if let Some(e) = failed {
         return Err(e);
     }
-    if let Some(mut ledger) = ledger {
-        ledger.flush()?;
-    }
+    ledger.flush()?;
     Ok(added)
 }
 
-/// Append `flow` as a ledger `flow` line, opening the ledger on the first
-/// one (after a newline when its last line is torn).
-fn append_flow(
-    ledger: &mut Option<std::io::BufWriter<std::fs::File>>,
-    paths: &rupu_netflow::NetflowPaths,
+/// Appends backfilled lines to a ledger, opened on the first one (after a
+/// newline when its last line is torn). Lines go out in writes of whole
+/// lines only, so another writer appending to the same ledger (an
+/// agentiflow's launch sink beside its rounds') can't land inside one.
+struct Appender<'a> {
+    paths: &'a rupu_netflow::NetflowPaths,
     torn: bool,
-    flow: Box<rupu_netflow::FlowRecord>,
-) -> std::io::Result<()> {
-    let w = match ledger {
-        Some(w) => w,
-        None => {
-            paths.ensure_dir()?;
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&paths.flows)?;
-            let w = ledger.insert(std::io::BufWriter::with_capacity(1 << 16, file));
-            if torn {
-                w.write_all(b"\n")?;
-            }
-            w
+    file: Option<std::fs::File>,
+    buf: Vec<u8>,
+}
+
+impl Appender<'_> {
+    const FLUSH_AT: usize = 1 << 16;
+
+    /// `flow` as a `flow` line, then the `complete` / `socket_complete`
+    /// lines for it the ledger already had: a reader folds one into the
+    /// flow line before it, and these came before no flow line.
+    fn push(
+        &mut self,
+        flow: Box<rupu_netflow::FlowRecord>,
+        patches: Vec<Vec<u8>>,
+    ) -> std::io::Result<()> {
+        serde_json::to_writer(&mut self.buf, &rupu_netflow::LedgerLine::Flow(flow))?;
+        self.buf.push(b'\n');
+        for patch in patches {
+            self.buf.extend_from_slice(&patch);
         }
-    };
-    serde_json::to_writer(&mut *w, &rupu_netflow::LedgerLine::Flow(flow))?;
-    w.write_all(b"\n")
+        if self.buf.len() >= Self::FLUSH_AT {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let file = match &mut self.file {
+            Some(file) => file,
+            None => {
+                self.paths.ensure_dir()?;
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.paths.flows)?;
+                if self.torn {
+                    file.write_all(b"\n")?;
+                }
+                self.file.insert(file)
+            }
+        };
+        file.write_all(&self.buf)?;
+        self.buf.clear();
+        Ok(())
+    }
 }
 
 /// A ledger line read for its flow id only.
@@ -206,6 +253,8 @@ struct LedgerIdLine {
 #[serde(rename_all = "snake_case")]
 enum LedgerKind {
     Flow,
+    Complete,
+    SocketComplete,
     #[serde(other)]
     Other,
 }
