@@ -434,6 +434,14 @@ impl HostConnector for LocalHostConnector {
     }
 
     /// The run's own file: once the run is terminal, every line it wrote.
+    async fn land_run_netflow(
+        &self,
+        _run_id: &str,
+        _terminal: bool,
+        _runs_root: &std::path::Path,
+    ) -> Result<crate::host::connector::NetflowLanding, HostConnectorError> {
+        Ok(crate::host::connector::NetflowLanding::NotNeeded)
+    }
     async fn unit_coverage(
         &self,
         run_id: &str,

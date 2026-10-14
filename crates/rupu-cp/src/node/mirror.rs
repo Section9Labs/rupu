@@ -274,6 +274,9 @@ impl NodeMirror {
             ArtifactFile::Coverage => {
                 append_line(&self.coverage_path(run_id), line)?;
             }
+            ArtifactFile::Netflow => {
+                append_line(&self.netflow_path(run_id), line)?;
+            }
             ArtifactFile::RunJson => {
                 // Parse the node's run.json.  Re-pin the CP-local identity /
                 // location fields from the record that `create_run` persisted
@@ -299,6 +302,12 @@ impl NodeMirror {
                 incoming.resume_claimed_at = None;
                 incoming.resume_claimed_by = None;
                 incoming.resume_mode = None;
+                // Spec 2026-10-14 §N3: the landing record exists before the
+                // mirrored status flips to terminal, so a dispatcher that
+                // sees the run end through `get_run` finds it.
+                if incoming.status.is_terminal() {
+                    self.land_netflow_if_terminal(run_id, node_id);
+                }
                 self.run_store.update(&incoming)?;
             }
         }
@@ -509,6 +518,109 @@ impl NodeMirror {
             .unwrap_or(false)
     }
 
+    /// `<global>/runs/<run_id>/netflow.jsonl` — the mirrored copy of the
+    /// run's netflow stream (spec 2026-10-14 §N1).
+    pub fn netflow_path(&self, run_id: &str) -> PathBuf {
+        rupu_netflow::stream::stream_path(&self.run_store.root, run_id)
+    }
+
+    /// `netflow.jsonl.partial`: written by an SSH terminal pull whose copy
+    /// was not confirmed whole, holding the reason; removed by a whole one.
+    fn netflow_partial_marker(&self, run_id: &str) -> PathBuf {
+        let mut p = self.netflow_path(run_id).into_os_string();
+        p.push(".partial");
+        PathBuf::from(p)
+    }
+
+    /// Replace the mirrored netflow stream with `body` (SSH's terminal
+    /// pull). When `complete` is false a `netflow.jsonl.partial` marker
+    /// holding `reason` says the copy was not confirmed whole; when true the
+    /// marker is removed. Same ownership check as [`Self::append`]; like
+    /// every mirror write, it runs on the blocking pool.
+    pub async fn replace_netflow(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        body: &str,
+        complete: bool,
+        reason: Option<String>,
+    ) -> Result<(), MirrorError> {
+        let (run_id, node_id, body) = (run_id.to_owned(), node_id.to_owned(), body.to_owned());
+        self.off_runtime(move |m| {
+            m.replace_netflow_blocking(&run_id, &node_id, &body, complete, reason)
+        })
+        .await
+    }
+
+    fn replace_netflow_blocking(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        body: &str,
+        complete: bool,
+        reason: Option<String>,
+    ) -> Result<(), MirrorError> {
+        validate_run_id(run_id)?;
+        let existing = self.run_store.load(run_id)?;
+        if existing.worker_id.as_deref() != Some(node_id) {
+            return Err(MirrorError::WrongNode(run_id.to_string()));
+        }
+        let path = self.netflow_path(run_id);
+        let marker = self.netflow_partial_marker(run_id);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let tmp = path.with_file_name(format!("netflow.jsonl.{}.tmp", ulid::Ulid::new()));
+        if let Err(e) = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, &path)) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        if complete {
+            match std::fs::remove_file(&marker) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        } else {
+            std::fs::write(&marker, reason.unwrap_or_default().as_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Land the run's mirrored netflow stream once its run turns terminal
+    /// (spec 2026-10-14 §N3): complete unless an SSH `.partial` marker says
+    /// otherwise; `unavailable` when no stream arrived. Best-effort: a
+    /// failure is logged and the run's terminal update proceeds (the missing
+    /// record reads as "not collected"). A run that already landed complete
+    /// is left alone, so a bucket poller re-mirroring `run.json` every tick
+    /// costs one small read.
+    fn land_netflow_if_terminal(&self, run_id: &str, node_id: &str) {
+        use rupu_netflow::land::{land_and_record, read_landing_record, LandingStatus};
+        let root = &self.run_store.root;
+        if read_landing_record(root, run_id).is_some_and(|r| r.status == LandingStatus::Complete) {
+            return;
+        }
+        let stream = std::fs::read(self.netflow_path(run_id)).ok();
+        let partial = std::fs::read_to_string(self.netflow_partial_marker(run_id)).ok();
+        let complete = partial.is_none();
+        let reason = partial.map(|r| {
+            if r.trim().is_empty() {
+                "the copy was not confirmed whole".to_string()
+            } else {
+                r
+            }
+        });
+        if let Err(e) = land_and_record(root, run_id, node_id, stream.as_deref(), complete, reason)
+        {
+            tracing::warn!(
+                run_id,
+                node_id,
+                error = %e,
+                "netflow landing failed; the run's flows will read as not collected"
+            );
+        }
+    }
+
     /// Transition `run_id` to `status` and set `finished_at = now()`.
     ///
     /// Only the node that created the run (identified by `node_id`) may
@@ -566,6 +678,7 @@ impl NodeMirror {
         record.finished_at = Some(Utc::now());
         record.active_step_id = None;
         record.active_step_transcript_path = None;
+        self.land_netflow_if_terminal(run_id, node_id);
         self.run_store.update(&record)?;
         self.synthesize_transcript_step_result(&record);
         Ok(())
@@ -700,6 +813,291 @@ fn parse_status(s: &str) -> RunStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn agent_spec() -> crate::node::protocol::RunSpec {
+        crate::node::protocol::RunSpec {
+            skill_bundle: None,
+            kind: crate::node::protocol::RunSpecKind::Agent,
+            name: "a".into(),
+            inputs: Default::default(),
+            prompt: None,
+            mode: None,
+            target: None,
+            findings_profile: None,
+            engagement_profiles: Vec::new(),
+            skills: Vec::new(),
+            preload_skills: Vec::new(),
+            codename: None,
+        }
+    }
+
+    /// A mirror over `<tmp>/runs` with one run owned by `node_id`.
+    async fn mirror_with_run(
+        tmp: &std::path::Path,
+        run_id: &str,
+        node_id: &str,
+    ) -> (
+        NodeMirror,
+        std::sync::Arc<rupu_orchestrator::runs::RunStore>,
+    ) {
+        let store = std::sync::Arc::new(rupu_orchestrator::runs::RunStore::new(tmp.join("runs")));
+        let mirror = NodeMirror::new(std::sync::Arc::clone(&store));
+        mirror
+            .create_run(run_id, node_id, &agent_spec())
+            .await
+            .unwrap();
+        (mirror, store)
+    }
+
+    #[tokio::test]
+    async fn netflow_frames_append_and_land_before_the_run_turns_terminal() {
+        use rupu_netflow::land::{read_landing_record, LandingStatus};
+        let tmp = tempfile::tempdir().unwrap();
+        let (mirror, run_store) = mirror_with_run(tmp.path(), "run_N1", "node_a").await;
+        let begin = r#"{"kind":"begin","v":1,"run_id":"run_N1"}"#;
+        let line = r#"{"kind":"line","ledger":"run_N1","line":{"type":"dropped","count":1,"ts":"2026-10-14T00:00:00Z"}}"#;
+        let sub = r#"{"kind":"line","ledger":"sub_N1a","line":{"type":"dropped","count":2,"ts":"2026-10-14T00:00:01Z"}}"#;
+        mirror
+            .append("run_N1", "node_a", ArtifactFile::Netflow, begin)
+            .await
+            .unwrap();
+        mirror
+            .append("run_N1", "node_a", ArtifactFile::Netflow, line)
+            .await
+            .unwrap();
+        mirror
+            .append("run_N1", "node_a", ArtifactFile::Netflow, sub)
+            .await
+            .unwrap();
+        assert!(mirror.netflow_path("run_N1").exists());
+        assert_eq!(
+            std::fs::read_to_string(mirror.netflow_path("run_N1")).unwrap(),
+            format!("{begin}\n{line}\n{sub}\n")
+        );
+        assert!(matches!(
+            mirror
+                .append("run_N1", "node_b", ArtifactFile::Netflow, line)
+                .await,
+            Err(MirrorError::WrongNode(_))
+        ));
+        // No landing yet: the run is still running.
+        assert!(read_landing_record(&run_store.root, "run_N1").is_none());
+        let mut rec = run_store.load("run_N1").unwrap();
+        rec.status = rupu_orchestrator::runs::RunStatus::Running;
+        mirror
+            .append(
+                "run_N1",
+                "node_a",
+                ArtifactFile::RunJson,
+                &serde_json::to_string(&rec).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            read_landing_record(&run_store.root, "run_N1").is_none(),
+            "a non-terminal run.json lands nothing"
+        );
+        // The terminal run.json lands first.
+        rec.status = rupu_orchestrator::runs::RunStatus::Completed;
+        mirror
+            .append(
+                "run_N1",
+                "node_a",
+                ArtifactFile::RunJson,
+                &serde_json::to_string(&rec).unwrap(),
+            )
+            .await
+            .unwrap();
+        let landed = read_landing_record(&run_store.root, "run_N1").unwrap();
+        assert_eq!(landed.status, LandingStatus::Complete);
+        assert_eq!(landed.host, "node_a");
+        assert_eq!(
+            landed.ledgers,
+            vec!["run_N1".to_string(), "sub_N1a".to_string()]
+        );
+        let global = run_store.root.parent().unwrap();
+        assert!(global.join("netflow/run_N1.jsonl").exists());
+        assert!(global.join("netflow/sub_N1a.jsonl").exists());
+        assert_eq!(
+            run_store.load("run_N1").unwrap().status,
+            rupu_orchestrator::runs::RunStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_without_a_stream_records_unavailable() {
+        use rupu_netflow::land::{read_landing_record, LandingStatus, NOT_STREAMED_REASON};
+        let tmp = tempfile::tempdir().unwrap();
+        let (mirror, run_store) = mirror_with_run(tmp.path(), "run_N2", "node_a").await;
+        mirror
+            .finish("run_N2", "node_a", "completed")
+            .await
+            .unwrap();
+        let r = read_landing_record(&run_store.root, "run_N2").unwrap();
+        assert_eq!(r.status, LandingStatus::Unavailable);
+        assert_eq!(r.reason.as_deref(), Some(NOT_STREAMED_REASON));
+        assert_eq!(r.host, "node_a");
+        assert!(r.ledgers.is_empty());
+        assert!(!run_store.root.parent().unwrap().join("netflow").exists());
+        assert_eq!(
+            run_store.load("run_N2").unwrap().status,
+            rupu_orchestrator::runs::RunStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_with_a_begun_stream_lands_complete() {
+        use rupu_netflow::land::{read_landing_record, LandingStatus};
+        let tmp = tempfile::tempdir().unwrap();
+        let (mirror, run_store) = mirror_with_run(tmp.path(), "run_N5", "node_a").await;
+        mirror
+            .append(
+                "run_N5",
+                "node_a",
+                ArtifactFile::Netflow,
+                r#"{"kind":"begin","v":1,"run_id":"run_N5"}"#,
+            )
+            .await
+            .unwrap();
+        mirror.finish("run_N5", "node_a", "failed").await.unwrap();
+        let r = read_landing_record(&run_store.root, "run_N5").unwrap();
+        assert_eq!((r.status, r.reason), (LandingStatus::Complete, None));
+        assert!(r.ledgers.is_empty(), "a run with no flows lands no ledger");
+    }
+
+    #[tokio::test]
+    async fn an_ssh_partial_copy_lands_partial() {
+        use rupu_netflow::land::{read_landing_record, LandingStatus};
+        let tmp = tempfile::tempdir().unwrap();
+        let (mirror, run_store) = mirror_with_run(tmp.path(), "run_N3", "host_ssh").await;
+        let body = "{\"kind\":\"begin\",\"v\":1,\"run_id\":\"run_N3\"}\n";
+        mirror
+            .replace_netflow(
+                "run_N3",
+                "host_ssh",
+                body,
+                false,
+                Some("the host's run.json was not terminal".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(mirror.netflow_path("run_N3")).unwrap(),
+            body
+        );
+        assert!(matches!(
+            mirror
+                .replace_netflow("run_N3", "node_x", body, true, None)
+                .await,
+            Err(MirrorError::WrongNode(_))
+        ));
+        assert!(matches!(
+            mirror
+                .replace_netflow("../escape", "host_ssh", body, true, None)
+                .await,
+            Err(MirrorError::InvalidRunId(_))
+        ));
+        mirror
+            .finish("run_N3", "host_ssh", "completed")
+            .await
+            .unwrap();
+        let r = read_landing_record(&run_store.root, "run_N3").unwrap();
+        assert_eq!(r.status, LandingStatus::Partial);
+        assert!(r.reason.unwrap().contains("not terminal"));
+        let run_dir = mirror
+            .netflow_path("run_N3")
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let leftovers: Vec<_> = std::fs::read_dir(&run_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[tokio::test]
+    async fn a_whole_ssh_copy_clears_the_partial_marker_and_lands_complete() {
+        use rupu_netflow::land::{read_landing_record, LandingStatus};
+        let tmp = tempfile::tempdir().unwrap();
+        let (mirror, run_store) = mirror_with_run(tmp.path(), "run_N4", "host_ssh").await;
+        let body = "{\"kind\":\"begin\",\"v\":1,\"run_id\":\"run_N4\"}\n";
+        mirror
+            .replace_netflow("run_N4", "host_ssh", body, false, Some("short".into()))
+            .await
+            .unwrap();
+        assert!(mirror.netflow_partial_marker("run_N4").exists());
+        mirror
+            .replace_netflow("run_N4", "host_ssh", body, true, None)
+            .await
+            .unwrap();
+        assert!(!mirror.netflow_partial_marker("run_N4").exists());
+        mirror
+            .finish("run_N4", "host_ssh", "completed")
+            .await
+            .unwrap();
+        let r = read_landing_record(&run_store.root, "run_N4").unwrap();
+        assert_eq!((r.status, r.reason), (LandingStatus::Complete, None));
+    }
+
+    #[tokio::test]
+    async fn re_mirroring_terminal_run_json_does_not_re_land_a_complete_copy() {
+        use rupu_netflow::land::{read_landing_record, LandingStatus};
+        let tmp = tempfile::tempdir().unwrap();
+        let (mirror, run_store) = mirror_with_run(tmp.path(), "run_N6", "node_a").await;
+        for l in [
+            r#"{"kind":"begin","v":1,"run_id":"run_N6"}"#,
+            r#"{"kind":"line","ledger":"run_N6","line":{"type":"dropped","count":1,"ts":"2026-10-14T00:00:00Z"}}"#,
+        ] {
+            mirror
+                .append("run_N6", "node_a", ArtifactFile::Netflow, l)
+                .await
+                .unwrap();
+        }
+        let mut rec = run_store.load("run_N6").unwrap();
+        rec.status = rupu_orchestrator::runs::RunStatus::Completed;
+        let terminal = serde_json::to_string(&rec).unwrap();
+        mirror
+            .append("run_N6", "node_a", ArtifactFile::RunJson, &terminal)
+            .await
+            .unwrap();
+        let first = read_landing_record(&run_store.root, "run_N6").unwrap();
+        assert_eq!(first.status, LandingStatus::Complete);
+        let ledger = run_store
+            .root
+            .parent()
+            .unwrap()
+            .join("netflow/run_N6.jsonl");
+        let mtime = std::fs::metadata(&ledger).unwrap().modified().unwrap();
+        // Make a re-landing observable: a later stream line would land if
+        // the poller's next tick re-landed the complete copy.
+        mirror
+            .append(
+                "run_N6",
+                "node_a",
+                ArtifactFile::Netflow,
+                r#"{"kind":"line","ledger":"run_N6","line":{"type":"dropped","count":9,"ts":"2026-10-14T00:00:02Z"}}"#,
+            )
+            .await
+            .unwrap();
+        mirror
+            .append("run_N6", "node_a", ArtifactFile::RunJson, &terminal)
+            .await
+            .unwrap();
+        mirror
+            .finish("run_N6", "node_a", "completed")
+            .await
+            .unwrap();
+        let again = read_landing_record(&run_store.root, "run_N6").unwrap();
+        assert_eq!(again, first, "the record is untouched (`at` equal)");
+        assert_eq!(
+            std::fs::metadata(&ledger).unwrap().modified().unwrap(),
+            mtime,
+            "the landed ledger was not rewritten"
+        );
+        assert_eq!(std::fs::read_to_string(&ledger).unwrap().lines().count(), 1);
+    }
 
     #[tokio::test]
     async fn coverage_lines_append_and_replace_is_authoritative() {

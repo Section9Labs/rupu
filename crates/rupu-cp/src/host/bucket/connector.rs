@@ -455,6 +455,14 @@ impl HostConnector for BucketHostConnector {
     /// writes its finished marker only after every coverage upload landed,
     /// and the poll that finishes the run here lists after reading the
     /// marker.
+    async fn land_run_netflow(
+        &self,
+        _run_id: &str,
+        _terminal: bool,
+        _runs_root: &std::path::Path,
+    ) -> Result<crate::host::connector::NetflowLanding, HostConnectorError> {
+        Ok(crate::host::connector::NetflowLanding::ByMirror)
+    }
     async fn unit_coverage(
         &self,
         run_id: &str,

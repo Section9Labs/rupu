@@ -827,6 +827,16 @@ impl HostConnector for HttpHostConnector {
 
     /// GET the remote CP's own local file. Complete once the run is terminal:
     /// the remote serves the file its `rupu run` wrote, not a copy in transit.
+    async fn land_run_netflow(
+        &self,
+        _run_id: &str,
+        _terminal: bool,
+        _runs_root: &std::path::Path,
+    ) -> Result<crate::host::connector::NetflowLanding, HostConnectorError> {
+        Err(HostConnectorError::Unsupported(
+            "netflow stream collection over HTTP is not implemented".into(),
+        ))
+    }
     async fn unit_coverage(
         &self,
         run_id: &str,

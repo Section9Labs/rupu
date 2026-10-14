@@ -25,7 +25,8 @@ use crate::{
     host::connector::{
         blocking_host, mirror_stream_run_events, read_transcript_file, CoverageRead,
         EventByteStream, FeedGuard, HostCapabilities, HostConnector, HostConnectorError, HostInfo,
-        OperatorMessageRequest, RunKind, RunListQuery, RunStartEvidence, MAX_WORKSPACE_BYTES,
+        NetflowLanding, OperatorMessageRequest, RunKind, RunListQuery, RunStartEvidence,
+        MAX_WORKSPACE_BYTES,
     },
     host::skill_ship::{
         prefixed, ref_arg, ship_through, ShipMemo, ShipOutcome, SkillBundle, Transfer,
@@ -3463,6 +3464,14 @@ impl HostConnector for SshHostConnector {
     /// replaced it with the host's file after the run was terminal (see
     /// [`pump_catch_up_ledgers`]). Otherwise it is what the tail delivered,
     /// which can miss the last lines.
+    async fn land_run_netflow(
+        &self,
+        _run_id: &str,
+        _terminal: bool,
+        _runs_root: &std::path::Path,
+    ) -> Result<NetflowLanding, HostConnectorError> {
+        Ok(NetflowLanding::ByMirror)
+    }
     async fn unit_coverage(&self, run_id: &str) -> Result<CoverageRead, HostConnectorError> {
         // The mark BEFORE the bytes: it is written only after the
         // authoritative replace landed, so bytes read after seeing it are that
