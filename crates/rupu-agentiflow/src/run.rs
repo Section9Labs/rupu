@@ -599,8 +599,9 @@ impl LeadDriver for RecordingLead<'_> {
 /// # Budget enforcement
 ///
 /// Every dimension is enforced. Spend is metered by a [`LedgerUsageSource`]
-/// that folds the lead's `<run dir>/usage.jsonl` and each launched unit's
-/// `<global>/runs/<unit id>/usage.jsonl`, once per round:
+/// that folds the flow's own `<run dir>/usage.jsonl` once per round — the
+/// lead's rows plus every launched unit's `rollup` copies, which each unit
+/// process writes there besides its own ledger (deduped by row id):
 ///
 /// - `budget.tokens` counts billable (input + output) tokens;
 /// - `budget.usd` prices them through [`RunAgentiflowOpts::pricing`] per
@@ -608,10 +609,9 @@ impl LeadDriver for RecordingLead<'_> {
 ///   model is priceable. Otherwise the cap is dropped (it would read `$0`
 ///   forever), a warning says so, and `budget.tokens` / `budget.wall_clock` /
 ///   `budget.rounds` still apply. A unit on an unpriced model contributes `$0`
-///   (warned once when first seen) while its tokens still count.
-///
-/// The fold undercounts a unit's `dispatch_agent` sub-agents (see
-/// `usage.rs`), so a cap can trip later than the true spend.
+///   (warned once when first seen) while its tokens still count — so a usd cap
+///   can under-count real spend when a dispatched unit runs a model nothing
+///   prices. `rupu agentiflow status` names those models.
 ///
 /// The lead's `budget.status` tool reads the same meter, enforced budget and
 /// clock the envelope does (see [`BudgetProbe`]), so it reports exactly what

@@ -53,4 +53,6 @@ pub use rupu_launch::proc::{
     coordinator_alive, kill_group, pid_is_running, terminate_group, terminate_pid,
 };
 pub use status::{BudgetProbe, FlowStatus};
-pub use usage::{fold_tokens, LedgerUsageSource, TokenTotals, Tokens};
+pub use usage::{
+    fold_tokens, price_ledgers, LedgerUsageSource, PricedSpend, TokenTotals, Tokens, UnpricedModel,
+};

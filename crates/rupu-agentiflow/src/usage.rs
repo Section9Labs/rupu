@@ -136,6 +136,61 @@ fn fold_file(path: &Path, seen: &mut HashSet<String>, totals: &mut TokenTotals) 
     }
 }
 
+/// A `(provider, model)` bucket that spent billable tokens but has no price,
+/// so its spend is counted as `$0` against a `budget.usd` cap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnpricedModel {
+    pub provider: String,
+    pub model: String,
+    /// Billable (input + output) tokens this bucket spent, uncounted by usd.
+    pub tokens: u64,
+}
+
+/// A priced read of folded usage: the USD cost of the buckets that have a
+/// price, the billable token total, and every bucket that carried billable
+/// tokens with no price. A non-empty `unpriced` means a `budget.usd` cap
+/// cannot bound that spend (it reads as `$0`), which the operator-facing
+/// surfaces surface as a loud "not enforced" signal rather than a silent zero.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PricedSpend {
+    pub usd: f64,
+    pub tokens: u64,
+    /// `(provider, model)` buckets with billable tokens and no price, in
+    /// sorted (`BTreeMap`) order so the report is deterministic.
+    pub unpriced: Vec<UnpricedModel>,
+}
+
+/// Fold `paths` (deduped by row id, tolerant of unreadable or half-written
+/// lines) and price the result through `pricing`.
+///
+/// This is the one place that turns folded tokens into USD and names the
+/// unpriced models, shared by the budget meter ([`LedgerUsageSource`]) and the
+/// `rupu agentiflow status` report so the two can never disagree about what a
+/// model costs or whether it is priced at all.
+pub fn price_ledgers(paths: &[PathBuf], pricing: &PricingConfig) -> PricedSpend {
+    price_totals(&fold_tokens(paths), pricing)
+}
+
+/// Price already-folded totals. See [`price_ledgers`].
+pub(crate) fn price_totals(totals: &TokenTotals, pricing: &PricingConfig) -> PricedSpend {
+    let mut out = PricedSpend {
+        tokens: totals.total.billable(),
+        ..PricedSpend::default()
+    };
+    for ((provider, model), t) in &totals.by_model {
+        match lookup(pricing, provider, model, "") {
+            Some(p) => out.usd += p.cost_usd(t.input, t.output, t.cached, t.cache_write),
+            None if t.billable() > 0 => out.unpriced.push(UnpricedModel {
+                provider: provider.clone(),
+                model: model.clone(),
+                tokens: t.billable(),
+            }),
+            None => {}
+        }
+    }
+    out
+}
+
 /// Whether `provider` / `model` has a USD price under `pricing` (a user
 /// `[pricing.<provider>."<model>"]` entry or the built-in table).
 ///
@@ -187,15 +242,11 @@ impl LedgerUsageSource {
     /// The USD cost of `totals`: each `(provider, model)` bucket priced on its
     /// own, summed; an unpriced bucket adds `0`.
     fn price(&self, totals: &TokenTotals) -> f64 {
-        let mut usd = 0.0;
-        for ((provider, model), t) in &totals.by_model {
-            match lookup(&self.pricing, provider, model, "") {
-                Some(p) => usd += p.cost_usd(t.input, t.output, t.cached, t.cache_write),
-                None if t.billable() > 0 => self.warn_unpriced_once(provider, model),
-                None => {}
-            }
+        let priced = price_totals(totals, &self.pricing);
+        for m in &priced.unpriced {
+            self.warn_unpriced_once(&m.provider, &m.model);
         }
-        usd
+        priced.usd
     }
 
     fn warn_unpriced_once(&self, provider: &str, model: &str) {
@@ -567,6 +618,55 @@ mod tests {
             src.spent_tokens(),
             1_000_000 + 200_000 + 500_000 + 14_000_000
         );
+    }
+
+    #[test]
+    fn price_ledgers_names_every_unpriced_model_that_spent_billable_tokens() {
+        let rig = Rig::new();
+        // One priced bucket, and two unpriced ones (fake model ids no built-in
+        // vendor price can match), plus a cache-only bucket (zero billable)
+        // that must NOT be named.
+        write_ledger(
+            &rig.lead_usage,
+            &[
+                row("01A", "priced", "m", 1_000_000, 200_000, 0, 0),
+                row("01B", "acme", "red-5", 3_000_000, 1_000_000, 0, 0),
+                row("01C", "acme", "blue-9", 500_000, 0, 0, 0),
+                row("01D", "ghost", "cache-only", 0, 0, 0, 7_000),
+            ],
+        );
+
+        let got = price_ledgers(std::slice::from_ref(&rig.lead_usage), &test_pricing());
+
+        let price = test_pricing().models["priced"]["m"];
+        let want_usd = price.cost_usd(1_000_000, 200_000, 0, 0);
+        assert!((got.usd - want_usd).abs() < 1e-9, "{} vs {want_usd}", got.usd);
+        assert_eq!(got.tokens, 1_200_000 + 4_000_000 + 500_000);
+        // Deterministic (BTreeMap) order; the cache-only bucket is absent.
+        assert_eq!(
+            got.unpriced,
+            vec![
+                UnpricedModel {
+                    provider: "acme".into(),
+                    model: "blue-9".into(),
+                    tokens: 500_000,
+                },
+                UnpricedModel {
+                    provider: "acme".into(),
+                    model: "red-5".into(),
+                    tokens: 4_000_000,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn price_ledgers_with_everything_priced_names_nothing() {
+        let rig = Rig::new();
+        write_ledger(&rig.lead_usage, &[row("01A", "priced", "m", 1000, 100, 0, 0)]);
+        let got = price_ledgers(std::slice::from_ref(&rig.lead_usage), &test_pricing());
+        assert!(got.usd > 0.0);
+        assert!(got.unpriced.is_empty());
     }
 
     #[test]
